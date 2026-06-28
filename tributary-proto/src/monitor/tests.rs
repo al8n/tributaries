@@ -815,7 +815,7 @@ fn moved_to_at_deadline_does_not_pair() {
 /// and rescans the new location, instead of leaving children pinned to the old
 /// parent/name edge.
 #[test]
-fn watched_dir_rename_drops_stale_subtree_and_rescans() {
+fn watched_dir_rename_drops_stale_subtree_and_rearms_destination() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -864,17 +864,98 @@ fn watched_dir_rename_drops_stale_subtree_and_rescans() {
       && e.kind().moved_from() == Some(&loc(&["d"]))),
     "the directory rename itself is reported"
   );
-  assert!(
-    events
-      .iter()
-      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
-    "the relocated subtree is rescanned under its new path"
-  );
   assert!(!m.is_watched(w_d), "old dir node dropped");
   assert!(!m.is_watched(w_g), "grandchild node dropped too");
   let actions = drain_actions(&mut m);
   assert!(actions.iter().any(|a| a.as_unwatch() == Some(w_d)));
   assert!(actions.iter().any(|a| a.as_unwatch() == Some(w_g)));
+  assert!(
+    actions
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("e")))),
+    "the renamed directory's destination is re-armed with a fresh watch, \
+     not merely Rescanned — Monitor coverage is rebuilt"
+  );
+}
+
+/// A *paired* MovedTo replacement (a watched sibling renamed onto a freed slot)
+/// must also re-arm the destination — not only a fresh Created replacement. The
+/// paired path used to emit Moved without installing the destination's watch.
+#[test]
+fn paired_moved_to_into_freed_slot_installs_watch() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Watch two sibling directories, "d" and "x".
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("x"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let w_x = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_x, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // "d" moves out (eager-dropped, slot freed), then "x" is renamed onto "d".
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("x"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(11),
+  );
+  let _ = drain_actions(&mut m); // Unwatch(w_d), Unwatch(w_x)
+  let _ = drain_events(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("d"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_moved()
+      && e.location() == &loc(&["d"])
+      && e.kind().moved_from() == Some(&loc(&["x"]))),
+    "x -> d is reported as a move"
+  );
+  let actions = drain_actions(&mut m);
+  let w_d2 = actions.iter().find_map(|a| {
+    a.as_watch()
+      .filter(|w| w.target() == &WatchTarget::child(root, seg("d")))
+      .map(|w| w.id())
+  });
+  assert!(
+    w_d2.is_some(),
+    "the paired destination d is re-armed with a fresh watch"
+  );
+  assert_ne!(
+    w_d2,
+    Some(w_d),
+    "it is a new watch, not the dropped original"
+  );
 }
 
 /// After a watched directory is renamed, a child record still tagged to the old
@@ -913,9 +994,25 @@ fn record_under_renamed_watched_dir_never_uses_stale_path() {
     at(11),
   );
   let _ = drain_events(&mut m);
-  let _ = drain_actions(&mut m); // the subtree-drop Unwatch(w_d)
+  // The paired move drops the stale "d" subtree AND re-arms a fresh watch for the
+  // destination "e": coverage is rebuilt in the Monitor, not merely signaled.
+  let actions = drain_actions(&mut m);
+  assert!(actions.iter().any(|a| a.as_unwatch() == Some(w_d)));
+  let w_e = actions
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(root, seg("e")))
+        .map(|w| w.id())
+    })
+    .expect("the renamed directory's destination is re-armed");
   assert!(!m.is_watched(w_d));
+  m.on_watch_result(w_e, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
 
+  // A record still tagged to the dropped OLD watch reconstructs nothing — never
+  // the stale path.
   m.on_os_record(
     OsRecord::new(w_d, RecordKind::Created).with_name(seg("f.txt")),
     at(12),
@@ -925,17 +1022,7 @@ fn record_under_renamed_watched_dir_never_uses_stale_path() {
     "a record on the dropped old watch yields nothing (never the stale path)"
   );
 
-  // Re-establishing the watch under the new name yields the correct path.
-  m.on_os_record(
-    OsRecord::new(root, RecordKind::Created)
-      .with_name(seg("e"))
-      .with_is_dir(true),
-    at(13),
-  );
-  let w_e = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_e, Ok(()));
-  let _ = drain_actions(&mut m);
-  let _ = drain_events(&mut m);
+  // A record on the re-armed destination watch reconstructs the correct new path.
   m.on_os_record(
     OsRecord::new(w_e, RecordKind::Created).with_name(seg("f.txt")),
     at(14),
