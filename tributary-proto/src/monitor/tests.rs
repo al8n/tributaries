@@ -1586,9 +1586,11 @@ fn pending_move_purged_on_unregister_root() {
   );
 }
 
-/// Invariant (b): an `Ignored` teardown of the source's watch purges its half.
+/// Invariant (b): a narrow teardown of the source's watch leaves the half in place
+/// (a destination could still arrive), but the liveness guard means it never emits
+/// a stale `Removed` once its source is gone.
 #[test]
-fn pending_move_purged_on_ignored_teardown() {
+fn dead_source_half_emits_no_removed_after_teardown() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -1602,17 +1604,26 @@ fn pending_move_purged_on_ignored_teardown() {
   );
   assert_eq!(m.poll_timeout(), Some(at(10) + DEFAULT_MOVE_WINDOW));
 
+  // `Ignored` on the root drops it (the half's `from_parent`). The half is NOT
+  // purged by the narrow drop — it lingers, still timer-armed...
   m.on_os_record(OsRecord::new(root, RecordKind::Ignored), at(11));
   assert_eq!(
     m.poll_timeout(),
-    None,
-    "the torn-down watch's half is purged"
+    Some(at(10) + DEFAULT_MOVE_WINDOW),
+    "the half lingers (pairable), not purged by a narrow drop"
   );
 
+  // ...but at timeout the liveness guard suppresses its `Removed` (source gone),
+  // and the half is removed from the map (timer clears).
   m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
   assert!(
     drain_events(&mut m).iter().all(|e| !e.kind().is_removed()),
-    "no Removed resurrected for the torn-down watch"
+    "no stale Removed for the torn-down source"
+  );
+  assert_eq!(
+    m.poll_timeout(),
+    None,
+    "the dead half is gone after timeout"
   );
 }
 
@@ -1797,10 +1808,11 @@ fn watched_dir_replacement_survives_timeout() {
   );
 }
 
-/// Invariant (b), `from_parent` subtree branch: renaming a watched directory
-/// drops its subtree, purging a half whose source lived inside it.
+/// Invariant (b): renaming a watched directory drops its subtree; a half whose
+/// source lived inside it lingers (pairable) but, with its source gone, emits no
+/// stale `Removed` at timeout.
 #[test]
-fn pending_move_purged_on_move_driven_subtree_drop() {
+fn move_driven_subtree_drop_leaves_no_stale_removed() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -1842,17 +1854,20 @@ fn pending_move_purged_on_move_driven_subtree_drop() {
       .with_is_dir(true),
     at(12),
   );
+  // The inner half (under the now-dropped w_d) lingers, still timer-armed — a
+  // narrow drop does not purge it.
   assert_eq!(
     m.poll_timeout(),
-    None,
-    "the inner half was purged with the dropped subtree"
+    Some(at(10) + DEFAULT_MOVE_WINDOW),
+    "the inner half lingers after the subtree drop"
   );
-  let _ = drain_events(&mut m); // the d→e Moved + Rescan(e)
+  let _ = drain_events(&mut m); // the d→e Moved (+ destination re-arm)
 
+  // At timeout the guard suppresses its `Removed` (source w_d gone).
   m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
   assert!(
     drain_events(&mut m).is_empty(),
-    "no Removed resurrected for the relocated child"
+    "no stale Removed for the relocated child's dead source"
   );
 }
 
@@ -1917,9 +1932,9 @@ fn reused_cookie_after_teardown_pairs_fresh() {
       .with_cookie(cookie(5)),
     at(10),
   );
-  // Tear "d" down; the (scope 1, cookie 5) half is purged.
+  // Tear "d" down. The (scope 1, cookie 5) half lingers (narrow drop ≠ purge), but
+  // its source w_d is gone, so it is dead — the guard will discard it on reuse.
   m.on_os_record(OsRecord::new(w_d, RecordKind::Ignored), at(11));
-  assert_eq!(m.poll_timeout(), None);
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1946,5 +1961,150 @@ fn reused_cookie_after_teardown_pairs_fresh() {
       .iter()
       .all(|e| e.kind().moved_from() != Some(&loc(&["d", "inner"]))),
     "the purged half never resurfaces"
+  );
+}
+
+// ── Centralized slot reconciliation: the R6 coverage cases ──
+
+/// Remove-then-create at the same slot: the `Removed` must drop the old watch so a
+/// following `Created` is NOT mistaken for a duplicate and is freshly watched.
+#[test]
+fn removed_then_created_at_same_slot_rewatches_replacement() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Watch dir "d".
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // "d" is removed (reconcile Gone → drops the watch), then a new dir "d" is created.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(2),
+  );
+  assert!(!m.is_watched(w_d), "Removed drops the old slot watch");
+  let _ = drain_actions(&mut m); // Unwatch(w_d)
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(3),
+  );
+  let w_d2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the replacement directory is freshly watched, not skipped as a duplicate");
+  assert_ne!(w_d2, w_d, "a new watch, not the dropped original");
+  m.on_watch_result(w_d2, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // The replacement is genuinely covered.
+  m.on_os_record(
+    OsRecord::new(w_d2, RecordKind::Created).with_name(seg("child")),
+    at(4),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["d", "child"])),
+    "a record under the replacement resolves to d/child"
+  );
+}
+
+/// An `Ok` enumerate entry of unknown kind is emitted but never watched (the
+/// descending-backend `is_dir` contract), while a `Dir` entry in the same result is.
+#[test]
+fn enumerate_unknown_kind_entry_is_not_watched() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_enumerate(
+    ReqId::new(NonZeroU64::new(1).unwrap()),
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("known"), FileKind::Dir),
+      DirEntry::new(seg("mystery"), FileKind::Unknown),
+    ]),
+  );
+
+  // Both are reported as Created.
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2);
+  assert!(events.iter().all(|e| e.kind().is_created()));
+
+  // Only the known directory is watched; the unknown-kind entry is not.
+  let actions = drain_actions(&mut m);
+  assert_eq!(actions.len(), 1, "exactly one watch — for the known dir");
+  assert_eq!(
+    actions[0].as_watch().unwrap().target(),
+    &WatchTarget::child(root, seg("known"))
+  );
+}
+
+/// A child move-half pending under a parent dir survives a NARROW teardown of the
+/// parent and still pairs when its destination arrives at a surviving slot.
+#[test]
+fn child_move_half_survives_parent_teardown_and_still_pairs() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Watch dir "p".
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("p"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_p = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_p, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A child "f" inside "p" starts a rename (source half under w_p).
+  m.on_os_record(
+    OsRecord::new(w_p, RecordKind::MovedFrom)
+      .with_name(seg("f"))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  // "p" is torn down (narrow drop) BEFORE the destination arrives. The half lingers
+  // (not purged) and stays pairable.
+  m.on_os_record(OsRecord::new(w_p, RecordKind::Ignored), at(11));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // The destination arrives at the still-watched root with the same (scope, cookie):
+  // it pairs into a Moved — the source was NOT lost to the parent teardown.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("g"))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_moved() && e.location() == &loc(&["g"])),
+    "the child move still pairs across the parent's narrow teardown"
   );
 }
