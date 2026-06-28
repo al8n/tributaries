@@ -640,8 +640,12 @@ fn capability_switch_yields_same_changes() {
 // ── Move pairing must validate scope + deadline, not cookie alone ──
 
 /// Two disjoint roots can be on separate backend instances whose cookies collide.
-/// A `MovedFrom` in one scope must never pair with a `MovedTo` in another: the
-/// source resolves as `Removed`, the destination as `Created`, with no bogus move.
+/// A `MovedFrom` in one scope must never pair with a `MovedTo` in another. With
+/// the composite `(scope, cookie)` key the cross-scope destination cannot even
+/// *consume* the source half: the destination resolves as `Created` in its own
+/// scope immediately, while the source stays pending and resolves as `Removed`
+/// only on its own deadline (it is not forced to `Removed` early — its real
+/// same-scope destination may still arrive within the window).
 #[test]
 fn cross_scope_move_with_shared_cookie_does_not_pair() {
   let mut m = per_dir();
@@ -663,19 +667,31 @@ fn cross_scope_move_with_shared_cookie_does_not_pair() {
   );
 
   let events = drain_events(&mut m);
-  assert_eq!(events.len(), 2, "no bogus pair across roots");
-  assert!(events.iter().all(|e| !e.kind().is_moved()));
-  assert!(
-    events
-      .iter()
-      .any(|e| e.kind().is_removed() && e.scope() == scope(1) && e.location() == &loc(&["x"])),
-    "source resolves as Removed in its own scope"
+  assert_eq!(
+    events.len(),
+    1,
+    "the cross-scope destination cannot consume the source"
   );
   assert!(
-    events
-      .iter()
-      .any(|e| e.kind().is_created() && e.scope() == scope(2) && e.location() == &loc(&["y"])),
+    events[0].kind().is_created()
+      && events[0].scope() == scope(2)
+      && events[0].location() == &loc(&["y"]),
     "destination resolves as Created in its own scope"
+  );
+  assert_eq!(
+    m.poll_timeout(),
+    Some(at(10) + DEFAULT_MOVE_WINDOW),
+    "scope 1's source half is still pending, not consumed"
+  );
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(
+    events[0].kind().is_removed()
+      && events[0].scope() == scope(1)
+      && events[0].location() == &loc(&["x"]),
+    "source resolves as Removed in its own scope on its own deadline"
   );
 }
 
@@ -1205,4 +1221,354 @@ fn identical_pending_moves_still_coalesce() {
     .filter(|e| e.kind().is_moved())
     .count();
   assert_eq!(moved, 1, "truly identical moves are deduped");
+}
+
+// ── Pending moves keyed by (scope, cookie); purged on every teardown ──
+
+/// Invariant (a)+(d): an unrelated cross-scope half sharing the cookie does not
+/// consume the source, so the CORRECT same-scope destination — arriving after it,
+/// still inside the window — pairs in-scope.
+#[test]
+fn same_scope_destination_pairs_after_unrelated_cross_scope_half() {
+  let mut m = per_dir();
+  let root1 = live_root(&mut m, scope(1));
+  let root2 = live_root(&mut m, scope(2));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root1, RecordKind::MovedFrom)
+      .with_name(seg("x"))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  // Unrelated half in scope 2 reuses cookie 7: a fresh Created, not a consumer of
+  // scope 1's still-pending source.
+  m.on_os_record(
+    OsRecord::new(root2, RecordKind::MovedTo)
+      .with_name(seg("y"))
+      .with_cookie(cookie(7)),
+    at(11),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(
+    events[0].kind().is_created()
+      && events[0].scope() == scope(2)
+      && events[0].location() == &loc(&["y"])
+  );
+
+  // Scope 1's real destination arrives later, still inside the window: pairs.
+  m.on_os_record(
+    OsRecord::new(root1, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_moved());
+  assert_eq!(events[0].scope(), scope(1));
+  assert_eq!(events[0].location(), &loc(&["z"]));
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["x"])));
+  assert_eq!(
+    m.poll_timeout(),
+    None,
+    "the in-scope pair consumed the half"
+  );
+}
+
+/// Invariant (d): identical cookies in two scopes are fully isolated — neither
+/// MovedFrom displaces the other; each times out to `Removed` in its own scope.
+#[test]
+fn cross_scope_moved_from_halves_are_isolated_and_each_times_out() {
+  let mut m = per_dir();
+  let root1 = live_root(&mut m, scope(1));
+  let root2 = live_root(&mut m, scope(2));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root1, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root2, RecordKind::MovedFrom)
+      .with_name(seg("b"))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "both halves stashed, neither displaced"
+  );
+  assert_eq!(m.poll_timeout(), Some(at(10) + DEFAULT_MOVE_WINDOW));
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2, "each unpaired source times out on its own");
+  assert!(events.iter().all(|e| e.kind().is_removed()));
+  assert!(
+    events
+      .iter()
+      .any(|e| e.scope() == scope(1) && e.location() == &loc(&["a"]))
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.scope() == scope(2) && e.location() == &loc(&["b"]))
+  );
+}
+
+/// Invariant (b): `unregister_root` purges the whole scope's pending halves, so
+/// the clock advancing past the deadline resurrects no `Removed`.
+#[test]
+fn pending_move_purged_on_unregister_root() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("gone"))
+      .with_cookie(cookie(1)),
+    at(10),
+  );
+  assert_eq!(m.poll_timeout(), Some(at(10) + DEFAULT_MOVE_WINDOW));
+
+  m.unregister_root(scope(1));
+  assert_eq!(m.poll_timeout(), None, "the scope's pending half is purged");
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_removed()),
+    "no Removed resurrected for the unregistered scope"
+  );
+}
+
+/// Invariant (b): an `Ignored` teardown of the source's watch purges its half.
+#[test]
+fn pending_move_purged_on_ignored_teardown() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("gone"))
+      .with_cookie(cookie(1)),
+    at(10),
+  );
+  assert_eq!(m.poll_timeout(), Some(at(10) + DEFAULT_MOVE_WINDOW));
+
+  m.on_os_record(OsRecord::new(root, RecordKind::Ignored), at(11));
+  assert_eq!(
+    m.poll_timeout(),
+    None,
+    "the torn-down watch's half is purged"
+  );
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_removed()),
+    "no Removed resurrected for the torn-down watch"
+  );
+}
+
+/// Invariant (b), `from_watch` branch: a watch-install failure that drops the
+/// moved directory's own watch purges the half whose source IS that watch, even
+/// though the source's parent (the root) survives.
+#[test]
+fn pending_move_purged_on_watch_failure_drop() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Watched dir "d" created; its child watch is pending install.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  let _ = drain_events(&mut m);
+
+  // "d" is renamed away before its install resolves: the half records from_watch.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert_eq!(m.poll_timeout(), Some(at(10) + DEFAULT_MOVE_WINDOW));
+
+  m.on_watch_result(w_d, Err(WatchError::Gone));
+  assert_eq!(
+    m.poll_timeout(),
+    None,
+    "the dropped source watch's half is purged"
+  );
+  let _ = drain_events(&mut m); // the coverage-loss Rescan for "d"
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "no Removed resurrected for the dropped subtree"
+  );
+}
+
+/// Invariant (b), `from_parent` subtree branch: renaming a watched directory
+/// drops its subtree, purging a half whose source lived inside it.
+#[test]
+fn pending_move_purged_on_move_driven_subtree_drop() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A child inside "d" starts a rename: its source half is recorded under w_d.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::MovedFrom)
+      .with_name(seg("f"))
+      .with_cookie(cookie(2)),
+    at(10),
+  );
+  assert_eq!(m.poll_timeout(), Some(at(10) + DEFAULT_MOVE_WINDOW));
+
+  // "d" itself is renamed: the paired move drops w_d's subtree, purging the
+  // inner half whose parent was w_d.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert_eq!(
+    m.poll_timeout(),
+    None,
+    "the inner half was purged with the dropped subtree"
+  );
+  let _ = drain_events(&mut m); // the d→e Moved + Rescan(e)
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "no Removed resurrected for the relocated child"
+  );
+}
+
+/// Invariant (c): a cookie reused after its half timed out cannot synthesize a
+/// stale `Moved` — the prior half is gone, so the destination is a fresh Created.
+#[test]
+fn reused_cookie_after_timeout_does_not_resolve_stale_half() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_removed() && events[0].location() == &loc(&["a"]));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(5)),
+    at(300),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(
+    events[0].kind().is_created(),
+    "no stale Moved from the expired half"
+  );
+  assert_eq!(events[0].location(), &loc(&["b"]));
+}
+
+/// Invariant (c): a cookie reused after its half was purged by a teardown pairs
+/// fresh and never resurfaces the purged source.
+#[test]
+fn reused_cookie_after_teardown_pairs_fresh() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A source half keyed (scope 1, cookie 5) inside the watched dir "d".
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::MovedFrom)
+      .with_name(seg("inner"))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  // Tear "d" down; the (scope 1, cookie 5) half is purged.
+  m.on_os_record(OsRecord::new(w_d, RecordKind::Ignored), at(11));
+  assert_eq!(m.poll_timeout(), None);
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Reusing cookie 5 at the root pairs fresh, not against the purged half.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("x"))
+      .with_cookie(cookie(5)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("y"))
+      .with_cookie(cookie(5)),
+    at(13),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_moved());
+  assert_eq!(events[0].location(), &loc(&["y"]));
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["x"])));
+  assert!(
+    events
+      .iter()
+      .all(|e| e.kind().moved_from() != Some(&loc(&["d", "inner"]))),
+    "the purged half never resurfaces"
+  );
 }

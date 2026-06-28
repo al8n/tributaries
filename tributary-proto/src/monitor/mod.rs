@@ -39,18 +39,29 @@ struct WatchNode {
 /// A pending [`RecordKind::MovedFrom`] awaiting its matching
 /// [`RecordKind::MovedTo`].
 ///
-/// It carries enough to validate a candidate pair before consuming it: the source
-/// `scope` (a destination in a different scope must not pair), the `deadline` past
-/// which the half resolves on its own, and — when the moved object is itself a
-/// watched directory — that directory's `from_watch`, so a completed pair can drop
-/// the now-stale subtree instead of reconstructing paths through a dead edge.
+/// It carries enough to validate a candidate pair before consuming it *and* to
+/// purge it when its source disappears. `scope` and `deadline` bound pairing in
+/// space and time. `from_parent` (the watch the `MovedFrom` arrived on) and —
+/// when the moved object is itself a watched directory — `from_watch` locate the
+/// source in the watch tree: a teardown of that scope/subtree must discard this
+/// half (invariant b) rather than let it later time out into a `Removed` for a
+/// path that no longer exists, and a completed pair drops the now-stale
+/// `from_watch` subtree instead of reconstructing paths through a dead edge.
 #[derive(Debug, Clone)]
 struct PendingMove {
   from: Location,
   scope: ScopeId,
   deadline: Instant,
+  from_parent: WatchId,
   from_watch: Option<WatchId>,
 }
+
+/// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
+/// backend instance, and disjoint roots may live on separate instances whose
+/// cookies collide, so the cookie is namespaced by its [`ScopeId`]: a destination
+/// may consume a source only under the identical composite key (invariant d). The
+/// tuple derives `Ord` from both components, so it keys a `BTreeMap`.
+type PendingKey = (ScopeId, MoveCookie);
 
 /// A delivery-dedup key: a change is suppressed only if an identical one is still
 /// queued. Two changes are "identical" when they share a scope, location, kind
@@ -97,7 +108,17 @@ pub struct Monitor {
   child_index: BTreeMap<(WatchId, Segment), WatchId>,
   roots: BTreeMap<ScopeId, WatchId>,
   pending_enumerate: BTreeMap<ReqId, WatchId>,
-  pending_moves: BTreeMap<MoveCookie, PendingMove>,
+  /// Half-resolved renames awaiting their destination, keyed by `(scope, cookie)`.
+  ///
+  /// Four lifecycle invariants hold, each enforced at the site noted:
+  /// (a) a half pairs only with a same-scope destination before its deadline
+  /// (`on_moved_to`); (b) no half outlives the teardown of its scope/subtree —
+  /// every `drop_subtree` purges the halves whose source it removed
+  /// (`purge_pending_moves`); (c) a cookie reused after a timeout or teardown
+  /// cannot resolve a stale half, because that half was already removed
+  /// (consumed, expired, or purged) before the reuse; (d) cross-scope identical
+  /// cookies are isolated by the composite key (`on_moved_from` / `on_moved_to`).
+  pending_moves: BTreeMap<PendingKey, PendingMove>,
 
   actions: VecDeque<Action>,
   events: VecDeque<Change>,
@@ -322,16 +343,23 @@ impl Monitor {
   /// directory, its now-stale watch subtree is dropped).
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn handle_timeout(&mut self, now: Instant) {
-    let expired: std::vec::Vec<MoveCookie> = self
+    let expired: std::vec::Vec<PendingKey> = self
       .pending_moves
       .iter()
       .filter(|(_, pending)| now.reached(pending.deadline))
-      .map(|(cookie, _)| *cookie)
+      .map(|(key, _)| *key)
       .collect();
 
-    for cookie in expired {
-      if let Some(pending) = self.pending_moves.remove(&cookie) {
-        self.resolve_lost_source(pending.scope, pending.from, pending.from_watch);
+    for key in expired {
+      if let Some(pending) = self.pending_moves.remove(&key) {
+        // Invariants (b)/(c), defense in depth: a half whose scope/subtree was
+        // torn down was already purged, so the source parent here is normally
+        // live. Should one ever survive (its parent gone), it is now removed
+        // above and must NOT resurrect a `Removed` for a path that no longer
+        // exists — only a half whose source is still watched resolves.
+        if self.is_watched(pending.from_parent) {
+          self.resolve_lost_source(pending.scope, pending.from, pending.from_watch);
+        }
       }
     }
   }
@@ -372,6 +400,7 @@ impl Monitor {
 
   fn on_moved_from(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) {
     let from = self.record_location(rec);
+    let from_parent = rec.watch();
     let from_watch = rec
       .name()
       .and_then(|name| self.child_watch(rec.watch(), name));
@@ -381,12 +410,14 @@ impl Monitor {
           from,
           scope,
           deadline: now + self.move_window,
+          from_parent,
           from_watch,
         };
-        // A cookie that already has a pending half is ambiguous (a reused or
-        // cross-root colliding cookie): the displaced half can no longer be
-        // paired, so resolve it on its own rather than silently overwriting it.
-        if let Some(displaced) = self.pending_moves.insert(cookie, pending) {
+        // Invariant (d): the cookie is namespaced by scope, so only a *same-scope*
+        // reused/colliding cookie collides on this composite key. The displaced
+        // half can no longer be paired, so it resolves on its own rather than
+        // being silently overwritten.
+        if let Some(displaced) = self.pending_moves.insert((scope, cookie), pending) {
           self.resolve_lost_source(displaced.scope, displaced.from, displaced.from_watch);
         }
       }
@@ -398,12 +429,13 @@ impl Monitor {
     let to = self.record_location(rec);
     match rec
       .cookie()
-      .and_then(|cookie| self.pending_moves.remove(&cookie))
+      .and_then(|cookie| self.pending_moves.remove(&(scope, cookie)))
     {
-      // A half pairs only with a destination in its own scope and only before its
-      // window elapses; otherwise the two are unrelated (a cross-root cookie
-      // collision) or the source already stranded (a late destination).
-      Some(pending) if pending.scope == scope && !now.reached(pending.deadline) => {
+      // Invariants (a)+(d): the composite key restricts the lookup to a same-scope
+      // half, so a cross-scope cookie collision never matches here (it resolves as
+      // a fresh `Created` via the `None` arm). A matched half pairs only before its
+      // window elapses; past it the source already stranded (a late destination).
+      Some(pending) if !now.reached(pending.deadline) => {
         self.resolve_paired_move(scope, to, pending);
       }
       Some(pending) => {
@@ -517,6 +549,7 @@ impl Monitor {
   }
 
   fn drop_subtree(&mut self, root: WatchId) {
+    let mut removed = BTreeSet::new();
     let mut stack = std::vec::Vec::new();
     stack.push(root);
     while let Some(id) = stack.pop() {
@@ -537,9 +570,31 @@ impl Monitor {
         } else if let (Some(parent), Some(name)) = (node.parent, node.name) {
           self.child_index.remove(&(parent, name));
         }
+        removed.insert(id);
         self.actions.push_back(Action::Unwatch(id));
       }
     }
+    self.purge_pending_moves(&removed);
+  }
+
+  /// Invariant (b): no pending move-half outlives the teardown of its
+  /// scope/subtree. A half whose source lived under any node in `removed` can
+  /// never pair (its source is gone) and must not later time out into a `Removed`
+  /// for a dead path, so it is discarded with the subtree. A whole-root
+  /// `unregister_root` removes every node of the scope, so this purges all of that
+  /// scope's halves; a narrower drop purges only the halves whose source — its
+  /// parent `from_parent`, or its own `from_watch` when it was a watched directory
+  /// — was removed.
+  fn purge_pending_moves(&mut self, removed: &BTreeSet<WatchId>) {
+    if removed.is_empty() || self.pending_moves.is_empty() {
+      return;
+    }
+    self.pending_moves.retain(|_, pending| {
+      !removed.contains(&pending.from_parent)
+        && pending
+          .from_watch
+          .is_none_or(|watch| !removed.contains(&watch))
+    });
   }
 
   fn record_location(&self, rec: &OsRecord) -> Location {
