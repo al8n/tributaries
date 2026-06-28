@@ -44,18 +44,18 @@ struct WatchNode {
 /// space and time. `from_parent` (the watch the `MovedFrom` arrived on) anchors
 /// the half in the watch tree: a teardown of that subtree must discard this half
 /// (invariant b) rather than let it later time out into a `Removed` for a path
-/// that no longer exists. `source_was_watched_dir` records that the moved object
-/// was itself a watched directory whose subtree was *eager-dropped* the moment it
-/// moved away (see [`Monitor::on_moved_from`]) — so a completed pair re-establishes
-/// coverage at the destination with a `Rescan` instead of leaving the old watch
-/// stranded and blocking a replacement at the source path.
+/// that no longer exists.
+///
+/// A watched-directory source is *eager-dropped* the moment it moves away (see
+/// [`Monitor::on_moved_from`]), so the half holds no reference to it; coverage at
+/// a rename's destination is re-armed from the `MovedTo` record, exactly like a
+/// fresh directory creation.
 #[derive(Debug, Clone)]
 struct PendingMove {
   from: Location,
   scope: ScopeId,
   deadline: Instant,
   from_parent: WatchId,
-  source_was_watched_dir: bool,
 }
 
 /// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
@@ -410,11 +410,11 @@ impl Monitor {
     // `(parent, name)` slot and subtree NOW, before recording the half. This lets a
     // replacement arriving at the same path during the pending window install its
     // own watch (the slot is no longer occupied by a stale entry), and stops the
-    // dead watch from delivering records for a path the object has left. Its
-    // identity travels in the half as `source_was_watched_dir`, not a live watch.
-    // Dropping before the insert also means this drop's `purge_pending_moves` runs
-    // while the new half is not yet present, so it cannot purge the half we record.
-    let source_was_watched_dir = from_watch.is_some();
+    // dead watch from delivering records for a path the object has left. Coverage
+    // at a rename's destination is re-armed later from the `MovedTo` record, so the
+    // half need not reference the dropped source. Dropping before the insert also
+    // means this drop's `purge_pending_moves` runs while the new half is not yet
+    // present, so it cannot purge the half we record.
     if let Some(src) = from_watch {
       self.drop_subtree(src);
     }
@@ -425,7 +425,6 @@ impl Monitor {
           scope,
           deadline: now + self.move_window,
           from_parent,
-          source_was_watched_dir,
         };
         // Invariant (d): the cookie is namespaced by scope, so only a *same-scope*
         // reused/colliding cookie collides on this composite key. The displaced
@@ -450,7 +449,7 @@ impl Monitor {
       // a fresh `Created` via the `None` arm). A matched half pairs only before its
       // window elapses; past it the source already stranded (a late destination).
       Some(pending) if !now.reached(pending.deadline) => {
-        self.resolve_paired_move(scope, to, pending);
+        self.resolve_paired_move(scope, to, rec, pending);
       }
       Some(pending) => {
         self.resolve_lost_source(pending.scope, pending.from);
@@ -460,20 +459,24 @@ impl Monitor {
     }
   }
 
-  /// Resolves a validated rename pair into a single [`ChangeKind::Moved`].
-  fn resolve_paired_move(&mut self, scope: ScopeId, to: Location, pending: PendingMove) {
+  /// Resolves a validated rename pair into a single [`ChangeKind::Moved`], then
+  /// re-arms coverage at the destination.
+  fn resolve_paired_move(
+    &mut self,
+    scope: ScopeId,
+    to: Location,
+    rec: &OsRecord,
+    pending: PendingMove,
+  ) {
     // TODO(§6): full O(1) edge reparenting of a moved watched directory lands with
-    // the inotify sub-machine. Until then a watched directory's rename is coverage
-    // loss handled in two parts: its stale subtree was already dropped at
-    // `on_moved_from` (eager-drop), and the pair re-establishes coverage at the
-    // destination with a `Rescan` — so a child path is never reconstructed through a
-    // stale parent/name edge, and the source slot was already freed for a replacement.
-    if pending.source_was_watched_dir {
-      self.emit(scope, to.clone(), ChangeKind::Moved(pending.from));
-      self.emit_rescan(scope, to);
-    } else {
-      self.emit(scope, to, ChangeKind::Moved(pending.from));
-    }
+    // the inotify sub-machine. Until then a renamed directory's source subtree was
+    // already dropped at `on_moved_from`, and its destination is re-armed here like
+    // a fresh creation: `descend_into` installs the destination's watch (whose
+    // enumerate rediscovers the contents not carried over). This re-establishes
+    // Monitor coverage in the watch tree — a consumer `Rescan` alone would not
+    // repopulate it, so a paired directory destination would otherwise be unwatched.
+    self.emit(scope, to, ChangeKind::Moved(pending.from));
+    self.descend_into(scope, rec);
   }
 
   /// Resolves a source half that found no destination: the object left this
@@ -485,10 +488,19 @@ impl Monitor {
   }
 
   /// Emits a [`ChangeKind::Created`] for an object that appeared at `location`,
-  /// descending into it when the core descends and it is a directory. Shared by a
-  /// plain create and an unpaired move destination — both are "a fresh object".
+  /// then descends into it (see [`Self::descend_into`]). Used for a plain create
+  /// and an unpaired move destination — both are "a fresh object".
   fn emit_created_descending(&mut self, scope: ScopeId, rec: &OsRecord, location: Location) {
     self.emit(scope, location, ChangeKind::Created);
+    self.descend_into(scope, rec);
+  }
+
+  /// Installs a watch for the directory object named by `rec`, when the core
+  /// descends per-directory. Shared by every path at which a directory newly
+  /// occupies a slot — a create, an unpaired move destination, or a paired rename
+  /// destination — so coverage is armed uniformly however the directory arrived.
+  /// (`install_child` is idempotent, so re-arming an already-watched slot is safe.)
+  fn descend_into(&mut self, scope: ScopeId, rec: &OsRecord) {
     if rec.is_dir().unwrap_or(false)
       && self.descends()
       && let Some(name) = rec.name()
