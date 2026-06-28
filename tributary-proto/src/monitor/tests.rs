@@ -952,7 +952,7 @@ fn record_under_renamed_watched_dir_never_uses_stale_path() {
 /// A watched directory moved out of the tree (unpaired source) drops its subtree
 /// on timeout, not just emitting `Removed`.
 #[test]
-fn watched_dir_moved_out_drops_subtree_on_timeout() {
+fn watched_dir_moved_out_eager_dropped_then_removed_on_timeout() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -976,7 +976,11 @@ fn watched_dir_moved_out_drops_subtree_on_timeout() {
       .with_is_dir(true),
     at(10),
   );
-  assert!(m.is_watched(w_d), "still watched within the pairing window");
+  assert!(
+    !m.is_watched(w_d),
+    "a moved-out watched dir is eager-dropped at MovedFrom — its slot is freed \
+     immediately for any replacement, not held until the window elapses"
+  );
 
   m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
   let events = drain_events(&mut m);
@@ -1376,17 +1380,18 @@ fn pending_move_purged_on_ignored_teardown() {
   );
 }
 
-/// Invariant (b), `from_watch` branch: a watch-install failure that drops the
-/// moved directory's own watch purges the half whose source IS that watch, even
-/// though the source's parent (the root) survives.
+/// The seam Codex pinned: a watched directory moved out must free its `(parent,
+/// name)` slot at once, so a *replacement* arriving at the same path during the
+/// pending window installs its own watch instead of being silently skipped by the
+/// idempotent descent (the stale entry would otherwise still occupy the slot).
 #[test]
-fn pending_move_purged_on_watch_failure_drop() {
+fn watched_dir_moved_out_then_replaced_installs_new_watch() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
-  // Watched dir "d" created; its child watch is pending install.
+  // Watch "d" (live).
   m.on_os_record(
     OsRecord::new(root, RecordKind::Created)
       .with_name(seg("d"))
@@ -1394,9 +1399,11 @@ fn pending_move_purged_on_watch_failure_drop() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
-  // "d" is renamed away before its install resolves: the half records from_watch.
+  // "d" is moved out (a paired rename is in flight).
   m.on_os_record(
     OsRecord::new(root, RecordKind::MovedFrom)
       .with_name(seg("d"))
@@ -1404,20 +1411,153 @@ fn pending_move_purged_on_watch_failure_drop() {
       .with_is_dir(true),
     at(10),
   );
-  assert_eq!(m.poll_timeout(), Some(at(10) + DEFAULT_MOVE_WINDOW));
-
-  m.on_watch_result(w_d, Err(WatchError::Gone));
-  assert_eq!(
-    m.poll_timeout(),
-    None,
-    "the dropped source watch's half is purged"
-  );
-  let _ = drain_events(&mut m); // the coverage-loss Rescan for "d"
-
-  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
   assert!(
-    drain_events(&mut m).is_empty(),
-    "no Removed resurrected for the dropped subtree"
+    !m.is_watched(w_d),
+    "the moved-out dir's watch is eager-dropped"
+  );
+  let _ = drain_actions(&mut m); // Unwatch(w_d)
+  let _ = drain_events(&mut m);
+
+  // Before the cookie resolves, a DIFFERENT directory is created at the same path.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(11),
+  );
+  let w_d2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("a watch is installed for the replacement directory");
+  assert_ne!(w_d2, w_d, "the replacement gets its own fresh watch");
+  m.on_watch_result(w_d2, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // The replacement is genuinely covered: a child record resolves to the correct
+  // path, proving recursive coverage was not lost.
+  m.on_os_record(
+    OsRecord::new(w_d2, RecordKind::Created).with_name(seg("child")),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["d", "child"])),
+    "a record under the replacement resolves to d/child, not lost"
+  );
+}
+
+/// The original's rename pairing must not disturb a replacement installed at the
+/// freed slot during the window.
+#[test]
+fn watched_dir_replacement_survives_pairing() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(11),
+  );
+  let w_d2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("replacement watched");
+  m.on_watch_result(w_d2, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // The original "d" finishes its rename to "e" within the window.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let _ = drain_events(&mut m);
+
+  assert!(
+    m.is_watched(w_d2),
+    "the replacement watch survives the original's pairing"
+  );
+  assert!(!m.is_watched(w_d), "the moved-out original stays dropped");
+}
+
+/// The original's timeout (unpaired) must not disturb a replacement installed at
+/// the freed slot.
+#[test]
+fn watched_dir_replacement_survives_timeout() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(11),
+  );
+  let w_d2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("replacement watched");
+  m.on_watch_result(w_d2, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // The original never paired; its window elapses. It resolves to a Removed for
+  // the original object (an interim imprecision the §6 identity model refines),
+  // but the replacement's coverage is untouched.
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  let _ = drain_events(&mut m);
+  assert!(
+    m.is_watched(w_d2),
+    "the replacement watch survives the original's timeout"
   );
 }
 
