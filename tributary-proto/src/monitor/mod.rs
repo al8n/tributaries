@@ -72,6 +72,20 @@ type PendingKey = (ScopeId, MoveCookie);
 /// collapsing into a single move; for every other kind the source slot is `None`.
 type DedupKey = (ScopeId, Location, u8, Option<Location>);
 
+/// What now occupies a child slot, as reported by a slot-changing record. `Dir`
+/// is the only kind the core descends into (and thus watches per-directory);
+/// `File` and `Gone` both mean the slot must hold no watch. Consumed by
+/// [`Monitor::reconcile_slot`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotOccupant {
+  /// A directory: watch it (per-directory backends descend into it).
+  Dir,
+  /// A non-directory file: never watched.
+  File,
+  /// The slot's object was removed: drop any watch it had.
+  Gone,
+}
+
 /// The primitive-agnostic top half of the `tributaries` state machine.
 ///
 /// `Monitor` owns everything the design says must be written once and shared
@@ -114,12 +128,15 @@ pub struct Monitor {
   ///
   /// Four lifecycle invariants hold, each enforced at the site noted:
   /// (a) a half pairs only with a same-scope destination before its deadline
-  /// (`on_moved_to`); (b) no half outlives the teardown of its scope/subtree —
-  /// every `drop_subtree` purges the halves whose source it removed
-  /// (`purge_pending_moves`); (c) a cookie reused after a timeout or teardown
-  /// cannot resolve a stale half, because that half was already removed
-  /// (consumed, expired, or purged) before the reuse; (d) cross-scope identical
-  /// cookies are isolated by the composite key (`on_moved_from` / `on_moved_to`).
+  /// (`on_moved_to`); (b) a half whose source is no longer watched never emits a
+  /// stale `Removed` — every stored-half resolution routes through the liveness
+  /// guard in `resolve_stored_half`, and a whole-scope `unregister_root` purges its
+  /// halves outright (`purge_scope_pending_moves`); a narrow subtree drop instead
+  /// leaves the half *pairable*, since its destination may still arrive at a
+  /// surviving slot in the scope; (c) a cookie reused after its half timed out or
+  /// went dead resolves fresh — the prior half was consumed, expired, or
+  /// guard-discarded; (d) cross-scope identical cookies are isolated by the
+  /// composite key (`on_moved_from` / `on_moved_to`).
   pending_moves: BTreeMap<PendingKey, PendingMove>,
 
   actions: VecDeque<Action>,
@@ -223,6 +240,12 @@ impl Monitor {
   pub fn unregister_root(&mut self, scope: ScopeId) {
     if let Some(root) = self.roots.remove(&scope) {
       self.drop_subtree(root);
+      // Whole-scope teardown: no destination in this scope can ever validly arrive,
+      // so its pending move halves can never pair — purge them all (invariant b).
+      // A *narrow* subtree drop does NOT purge (the `MovedTo` may still arrive at a
+      // surviving destination in the scope); the `handle_timeout` liveness guard
+      // suppresses a stale `Removed` for a half whose source parent was dropped.
+      self.purge_scope_pending_moves(scope);
     }
   }
 
@@ -235,7 +258,7 @@ impl Monitor {
 
     match rec.kind() {
       RecordKind::Created => self.on_created(scope, &rec),
-      RecordKind::Removed => self.emit_child(scope, &rec, ChangeKind::Removed),
+      RecordKind::Removed => self.on_removed(scope, &rec),
       RecordKind::Modified => self.emit_child(scope, &rec, ChangeKind::Modified),
       RecordKind::Attrib => self.emit_child(scope, &rec, ChangeKind::Modified),
       RecordKind::MovedFrom => self.on_moved_from(scope, &rec, now),
@@ -267,9 +290,16 @@ impl Monitor {
     for entry in res.entries() {
       let location = self.child_location(dir, entry.name());
       self.emit(scope, location, ChangeKind::Created);
-      if entry.is_dir() && self.descends() {
-        self.install_child(dir, scope, entry.name().clone(), true);
-      }
+      // The enumerate `is_dir` contract mirrors the record `is_dir` contract: only
+      // a known directory is descended into (an `Unknown`-kind entry is treated as a
+      // non-directory, never watched). A cold enumerate is discovery, not a replace,
+      // so an already-watched slot is reused (`replaced = false`).
+      let occupant = if entry.is_dir() {
+        SlotOccupant::Dir
+      } else {
+        SlotOccupant::File
+      };
+      self.reconcile_slot(dir, scope, entry.name(), occupant, false);
     }
   }
 
@@ -354,14 +384,7 @@ impl Monitor {
 
     for key in expired {
       if let Some(pending) = self.pending_moves.remove(&key) {
-        // Invariants (b)/(c), defense in depth: a half whose scope/subtree was
-        // torn down was already purged, so the source parent here is normally
-        // live. Should one ever survive (its parent gone), it is now removed
-        // above and must NOT resurrect a `Removed` for a path that no longer
-        // exists — only a half whose source is still watched resolves.
-        if self.is_watched(pending.from_parent) {
-          self.resolve_lost_source(pending.scope, pending.from);
-        }
+        self.resolve_stored_half(pending);
       }
     }
   }
@@ -397,7 +420,22 @@ impl Monitor {
     // before its enumerate is processed must escalate to a subtree Rescan. The
     // dirty-window tracking lands with the inotify sub-machine.
     let location = self.record_location(rec);
-    self.emit_created_descending(scope, rec, location);
+    self.emit(scope, location, ChangeKind::Created);
+    if let Some(name) = rec.name() {
+      // A create is discovery, not a replace: an occupied slot is a duplicate
+      // (an enumerate racing the live `Created`), so reuse it (`replaced = false`).
+      self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), false);
+    }
+  }
+
+  fn on_removed(&mut self, scope: ScopeId, rec: &OsRecord) {
+    let location = self.record_location(rec);
+    self.emit(scope, location, ChangeKind::Removed);
+    if let Some(name) = rec.name() {
+      // The slot's object is gone: drop any watch that covered it, so a later
+      // create at the same name is not mistaken for a duplicate of the old object.
+      self.reconcile_slot(rec.watch(), scope, name, SlotOccupant::Gone, false);
+    }
   }
 
   fn on_moved_from(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) {
@@ -431,9 +469,11 @@ impl Monitor {
         // half can no longer be paired, so it resolves on its own rather than
         // being silently overwritten.
         if let Some(displaced) = self.pending_moves.insert((scope, cookie), pending) {
-          self.resolve_lost_source(displaced.scope, displaced.from);
+          self.resolve_stored_half(displaced);
         }
       }
+      // A no-cookie source is resolved immediately; its `from_parent` is `rec.watch()`,
+      // which is live by construction (`scope_of` succeeded), so no guard is needed.
       None => self.resolve_lost_source(scope, from),
     }
   }
@@ -449,22 +489,40 @@ impl Monitor {
       // a fresh `Created` via the `None` arm). A matched half pairs only before its
       // window elapses; past it the source already stranded (a late destination).
       Some(pending) if !now.reached(pending.deadline) => {
-        // A validated rename: emit the move, then re-arm coverage at the
-        // destination (a moved-in directory must be watched at its new path).
+        // A validated rename: emit the move (coverage re-armed below).
         self.emit(scope, to, ChangeKind::Moved(pending.from));
-        self.rearm_destination(scope, rec);
       }
       Some(pending) => {
-        // Late destination: the source already stranded into a `Removed`. Treat
-        // the arrival as a fresh object moved into the slot.
-        self.resolve_lost_source(pending.scope, pending.from);
+        // Late destination (past the window): the source stranded. Resolve it into a
+        // `Removed` (guarded — a dead source emits nothing), and treat the arrival as
+        // a fresh object moved into the slot.
+        self.resolve_stored_half(pending);
         self.emit(scope, to, ChangeKind::Created);
-        self.rearm_destination(scope, rec);
       }
       None => {
         self.emit(scope, to, ChangeKind::Created);
-        self.rearm_destination(scope, rec);
       }
+    }
+    // A `MovedTo` brings a definitively-NEW object to the slot (`replaced = true`),
+    // so any stale watch there is dropped before re-arming. Runs for every arm, so
+    // coverage at the destination is reconciled however the move resolved.
+    if let Some(name) = rec.name() {
+      self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+    }
+  }
+
+  /// Resolves a *stored* pending half (one taken from `pending_moves` — at timeout,
+  /// on cookie-collision displacement, or as a past-window late destination) into a
+  /// [`ChangeKind::Removed`] — but only if its source is still watched.
+  ///
+  /// A narrow subtree drop deliberately leaves a half pairable (its destination may
+  /// still arrive), so a half whose `from_parent` was since torn down can linger.
+  /// Such a half is dead — its source path no longer exists — and must NOT emit a
+  /// stale `Removed`, however it later leaves the map. This single liveness guard
+  /// covers every stored-half resolution site (invariants b/c).
+  fn resolve_stored_half(&mut self, pending: PendingMove) {
+    if self.is_watched(pending.from_parent) {
+      self.resolve_lost_source(pending.scope, pending.from);
     }
   }
 
@@ -476,56 +534,67 @@ impl Monitor {
     self.emit(scope, from, ChangeKind::Removed);
   }
 
-  /// Emits a [`ChangeKind::Created`] for an object that appeared at `location`,
-  /// then descends into it (see [`Self::descend_into`]). Used for a plain create;
-  /// a move destination emits its own change and uses [`Self::rearm_destination`].
-  fn emit_created_descending(&mut self, scope: ScopeId, rec: &OsRecord, location: Location) {
-    self.emit(scope, location, ChangeKind::Created);
-    self.descend_into(scope, rec);
-  }
-
-  /// Installs a watch for a directory `Created` at the slot named by `rec`, when
-  /// the core descends per-directory. Idempotent: a `Created` on an already-watched
-  /// slot is a duplicate-discovery race (a real replace arrives as `Removed` then
-  /// `Created`, freeing the slot first), so the existing watch is reused.
+  /// The single point of truth for "the watch at `(parent, name)` matches the
+  /// slot's current occupant". EVERY record that can change a slot's occupant —
+  /// [`Created`](Self::on_created), every [`MovedTo`](Self::on_moved_to),
+  /// [`Removed`](Self::on_removed), and each [`enumerate`](Self::on_enumerate)
+  /// entry — routes through here, so directory coverage cannot be lost by a missed
+  /// per-record path (this centralization replaces the per-handler coverage
+  /// decisions that let stale-slot bugs recur).
   ///
-  /// Only `is_dir() == Some(true)` descends. A descending backend is required to
-  /// report directory-ness for a directory appearance — inotify always does, via
-  /// `IN_ISDIR` — so `Some(false)` and `None` are both "not a directory to descend
-  /// into" (treating an unknown kind as a directory would Rescan on every file). A
-  /// move destination uses [`Self::rearm_destination`] (replace, not reuse).
-  fn descend_into(&mut self, scope: ScopeId, rec: &OsRecord) {
-    if rec.is_dir() == Some(true)
-      && self.descends()
-      && let Some(name) = rec.name()
-    {
-      self.install_child(rec.watch(), scope, name.clone(), true);
-    }
-  }
-
-  /// Re-arms coverage at a move destination. A `MovedTo` brings a *fresh* object to
-  /// `(parent, name)`, so any watch already in that slot belongs to a DIFFERENT,
-  /// now-stale object — drop it (a file may even replace a watched directory) — then
-  /// watch the arrival if it is a directory. This rebuilds Monitor coverage in the
-  /// watch tree; a consumer `Rescan` alone would not repopulate it, and the
-  /// idempotent [`Self::descend_into`] would wrongly keep the stale occupant.
+  /// `replaced` distinguishes the two ways a directory comes to occupy a slot:
+  /// - **move-in** (`true`): the arrival is a definitively-new object, so any watch
+  ///   already in the slot is a different, now-stale object and is dropped before
+  ///   re-arming (a file may even replace a watched directory).
+  /// - **discovery** (`false`): a create/enumerate of an already-watched slot is a
+  ///   duplicate race (a true replace arrives as `Removed` then `Created`, which
+  ///   frees the slot first), so the existing watch is reused — [`install_child`]
+  ///   is idempotent.
   ///
-  /// The directory-ness contract matches [`Self::descend_into`]: only
-  /// `is_dir() == Some(true)` is watched. TODO(§6): full O(1) edge reparenting of a
-  /// moved watched directory lands with the inotify sub-machine; until then the
-  /// destination is re-armed afresh (its enumerate rediscovers the contents).
-  fn rearm_destination(&mut self, scope: ScopeId, rec: &OsRecord) {
+  /// A `File`/`Gone` occupant always drops any stale watch. Only [`SlotOccupant::Dir`]
+  /// is watched: a descending backend must report directory-ness for a directory
+  /// appearance (inotify does, via `IN_ISDIR`), so an unknown kind maps to `File`
+  /// and is not watched (Rescanning every unknown would fire on every file). A
+  /// no-op when the core does not descend (kernel-recursive: no per-directory
+  /// watches to manage).
+  ///
+  /// [`install_child`]: Self::install_child
+  fn reconcile_slot(
+    &mut self,
+    parent: WatchId,
+    scope: ScopeId,
+    name: &Segment,
+    occupant: SlotOccupant,
+    replaced: bool,
+  ) {
     if !self.descends() {
       return;
     }
-    let Some(name) = rec.name() else {
-      return;
-    };
-    if let Some(stale) = self.child_watch(rec.watch(), name) {
-      self.drop_subtree(stale);
+    match occupant {
+      SlotOccupant::Dir => {
+        if replaced && let Some(stale) = self.child_watch(parent, name) {
+          self.drop_subtree(stale);
+        }
+        self.install_child(parent, scope, name.clone(), true);
+      }
+      SlotOccupant::File | SlotOccupant::Gone => {
+        if let Some(stale) = self.child_watch(parent, name) {
+          self.drop_subtree(stale);
+        }
+      }
     }
+  }
+
+  /// Maps a record's reported directory-ness to a [`SlotOccupant`]. Only a known
+  /// directory (`is_dir() == Some(true)`) is a `Dir`; `Some(false)` and `None` are
+  /// both `File` (the descending-backend `is_dir` contract — see [`reconcile_slot`]).
+  ///
+  /// [`reconcile_slot`]: Self::reconcile_slot
+  fn record_occupant(rec: &OsRecord) -> SlotOccupant {
     if rec.is_dir() == Some(true) {
-      self.install_child(rec.watch(), scope, name.clone(), true);
+      SlotOccupant::Dir
+    } else {
+      SlotOccupant::File
     }
   }
 
@@ -618,24 +687,22 @@ impl Monitor {
         self.actions.push_back(Action::Unwatch(id));
       }
     }
-    self.purge_pending_moves(&removed);
+    // NOTE: a narrow subtree drop deliberately does NOT purge pending move halves.
+    // A half whose source parent was dropped may still pair: its `MovedTo` can
+    // arrive at a still-watched destination in the same scope. Keeping it pairable
+    // preserves the move; the `handle_timeout` liveness guard (`is_watched(
+    // from_parent)`) suppresses the stale `Removed` if no destination ever comes.
+    // Whole-scope teardown purges instead — see `unregister_root` /
+    // `purge_scope_pending_moves`.
   }
 
-  /// Invariant (b): no pending move-half outlives the teardown of its
-  /// scope/subtree. A half whose parent watch is in `removed` can never pair (its
-  /// source location is gone) and must not later time out into a `Removed` for a
-  /// dead path, so it is discarded with the subtree. A whole-root
-  /// `unregister_root` removes every node of the scope, so this purges all of that
-  /// scope's halves; a narrower drop purges only the halves anchored at a removed
-  /// `from_parent`. (A watched-directory source's own subtree is never an anchor
-  /// here — it was eager-dropped at `on_moved_from`, so only the parent remains.)
-  fn purge_pending_moves(&mut self, removed: &BTreeSet<WatchId>) {
-    if removed.is_empty() || self.pending_moves.is_empty() {
-      return;
-    }
+  /// Drops every pending move half belonging to `scope`. Called only on whole-scope
+  /// teardown ([`unregister_root`](Self::unregister_root)), where no destination in
+  /// the scope can ever validly arrive, so no half can pair (invariant b).
+  fn purge_scope_pending_moves(&mut self, scope: ScopeId) {
     self
       .pending_moves
-      .retain(|_, pending| !removed.contains(&pending.from_parent));
+      .retain(|(half_scope, _), _| *half_scope != scope);
   }
 
   fn record_location(&self, rec: &OsRecord) -> Location {
