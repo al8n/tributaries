@@ -958,6 +958,155 @@ fn paired_moved_to_into_freed_slot_installs_watch() {
   );
 }
 
+/// A paired MovedTo that overwrites a DIFFERENT watched directory at the slot must
+/// replace the stale watch, not idempotently keep it (which would leave the new
+/// directory's coverage on a dead watch).
+#[test]
+fn paired_moved_to_over_watched_dir_replaces_watch() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Watch two sibling directories "a" and "b".
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("b"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let w_b = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_b, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // "b" is renamed onto "a", overwriting the watched "a".
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("b"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_actions(&mut m); // Unwatch(w_b) from the source eager-drop
+  let _ = drain_events(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+
+  // The stale "a" watch is dropped and a fresh one installed for the new "a".
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions.iter().any(|a| a.as_unwatch() == Some(w_a)),
+    "the stale destination watch is dropped"
+  );
+  let w_a2 = actions.iter().find_map(|a| {
+    a.as_watch()
+      .filter(|w| w.target() == &WatchTarget::child(root, seg("a")))
+      .map(|w| w.id())
+  });
+  assert!(w_a2.is_some(), "a fresh watch is installed for the new a");
+  assert_ne!(w_a2, Some(w_a), "it is a new watch, not the stale original");
+  assert!(!m.is_watched(w_a), "the stale original is gone");
+}
+
+/// A file moved onto a watched directory's slot drops the stale directory watch
+/// (the slot's object changed) and installs nothing — a file is not descended into.
+#[test]
+fn moved_to_file_over_watched_dir_drops_stale_watch() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // An unpaired MovedTo of a FILE lands on the watched "d" slot.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("d"))
+      .with_cookie(cookie(9))
+      .with_is_dir(false),
+    at(10),
+  );
+
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions.iter().any(|a| a.as_unwatch() == Some(w_d)),
+    "the stale directory watch is dropped"
+  );
+  assert!(
+    actions.iter().all(|a| a.as_watch().is_none()),
+    "no new watch is installed for a file destination"
+  );
+  assert!(!m.is_watched(w_d));
+}
+
+/// Contract (the descending backend reports directory-ness for directory
+/// appearances — inotify via `IN_ISDIR`): a record with unknown kind
+/// (`is_dir() == None`) is treated as a non-directory — emitted, but never
+/// descended into and never Rescanned (which would fire on every file).
+#[test]
+fn unknown_kind_record_does_not_descend_or_rescan() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A `Created` with `is_dir` unset (None).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("u")),
+    at(1),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_created());
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "unknown kind neither descends (no watch) nor Rescans"
+  );
+
+  // The same for an unpaired MovedTo of unknown kind.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("v"))
+      .with_cookie(cookie(7)),
+    at(2),
+  );
+  let events = drain_events(&mut m);
+  assert!(events.iter().any(|e| e.kind().is_created()));
+  assert!(
+    events.iter().all(|e| !e.kind().is_rescan()),
+    "no Rescan for an unknown-kind destination"
+  );
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "no watch for an unknown-kind destination"
+  );
+}
+
 /// After a watched directory is renamed, a child record still tagged to the old
 /// watch must never reconstruct the stale path; re-arming under the new name
 /// reconstructs the correct path.
