@@ -1,0 +1,26 @@
+[package]
+name = "tributary-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/al8n/watershed"
+documentation = "https://docs.rs/tributary-proto"
+description = "Pure Sans-I/O state machine (the brain) for the tributaries filesystem-notification stack."
+categories = ["filesystem", "no-std", "no-std::no-alloc"]
+keywords = ["filesystem", "notify", "sans-io", "no_std"]
+
+[features]
+default = ["std"]
+std = []
+alloc = []
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
