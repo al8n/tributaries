@@ -41,19 +41,21 @@ struct WatchNode {
 ///
 /// It carries enough to validate a candidate pair before consuming it *and* to
 /// purge it when its source disappears. `scope` and `deadline` bound pairing in
-/// space and time. `from_parent` (the watch the `MovedFrom` arrived on) and —
-/// when the moved object is itself a watched directory — `from_watch` locate the
-/// source in the watch tree: a teardown of that scope/subtree must discard this
-/// half (invariant b) rather than let it later time out into a `Removed` for a
-/// path that no longer exists, and a completed pair drops the now-stale
-/// `from_watch` subtree instead of reconstructing paths through a dead edge.
+/// space and time. `from_parent` (the watch the `MovedFrom` arrived on) anchors
+/// the half in the watch tree: a teardown of that subtree must discard this half
+/// (invariant b) rather than let it later time out into a `Removed` for a path
+/// that no longer exists. `source_was_watched_dir` records that the moved object
+/// was itself a watched directory whose subtree was *eager-dropped* the moment it
+/// moved away (see [`Monitor::on_moved_from`]) — so a completed pair re-establishes
+/// coverage at the destination with a `Rescan` instead of leaving the old watch
+/// stranded and blocking a replacement at the source path.
 #[derive(Debug, Clone)]
 struct PendingMove {
   from: Location,
   scope: ScopeId,
   deadline: Instant,
   from_parent: WatchId,
-  from_watch: Option<WatchId>,
+  source_was_watched_dir: bool,
 }
 
 /// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
@@ -339,8 +341,8 @@ impl Monitor {
   }
 
   /// Advances time, resolving move halves whose pairing window has elapsed: an
-  /// unpaired source becomes a [`ChangeKind::Removed`] (and, if it was a watched
-  /// directory, its now-stale watch subtree is dropped).
+  /// unpaired source becomes a [`ChangeKind::Removed`] (a watched-directory
+  /// source's subtree was already dropped when it moved away, in `on_moved_from`).
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn handle_timeout(&mut self, now: Instant) {
     let expired: std::vec::Vec<PendingKey> = self
@@ -358,7 +360,7 @@ impl Monitor {
         // above and must NOT resurrect a `Removed` for a path that no longer
         // exists — only a half whose source is still watched resolves.
         if self.is_watched(pending.from_parent) {
-          self.resolve_lost_source(pending.scope, pending.from, pending.from_watch);
+          self.resolve_lost_source(pending.scope, pending.from);
         }
       }
     }
@@ -404,6 +406,18 @@ impl Monitor {
     let from_watch = rec
       .name()
       .and_then(|name| self.child_watch(rec.watch(), name));
+    // Eager-drop a watched-directory source the moment it moves away: free its
+    // `(parent, name)` slot and subtree NOW, before recording the half. This lets a
+    // replacement arriving at the same path during the pending window install its
+    // own watch (the slot is no longer occupied by a stale entry), and stops the
+    // dead watch from delivering records for a path the object has left. Its
+    // identity travels in the half as `source_was_watched_dir`, not a live watch.
+    // Dropping before the insert also means this drop's `purge_pending_moves` runs
+    // while the new half is not yet present, so it cannot purge the half we record.
+    let source_was_watched_dir = from_watch.is_some();
+    if let Some(src) = from_watch {
+      self.drop_subtree(src);
+    }
     match rec.cookie() {
       Some(cookie) => {
         let pending = PendingMove {
@@ -411,17 +425,17 @@ impl Monitor {
           scope,
           deadline: now + self.move_window,
           from_parent,
-          from_watch,
+          source_was_watched_dir,
         };
         // Invariant (d): the cookie is namespaced by scope, so only a *same-scope*
         // reused/colliding cookie collides on this composite key. The displaced
         // half can no longer be paired, so it resolves on its own rather than
         // being silently overwritten.
         if let Some(displaced) = self.pending_moves.insert((scope, cookie), pending) {
-          self.resolve_lost_source(displaced.scope, displaced.from, displaced.from_watch);
+          self.resolve_lost_source(displaced.scope, displaced.from);
         }
       }
-      None => self.resolve_lost_source(scope, from, from_watch),
+      None => self.resolve_lost_source(scope, from),
     }
   }
 
@@ -439,7 +453,7 @@ impl Monitor {
         self.resolve_paired_move(scope, to, pending);
       }
       Some(pending) => {
-        self.resolve_lost_source(pending.scope, pending.from, pending.from_watch);
+        self.resolve_lost_source(pending.scope, pending.from);
         self.emit_created_descending(scope, rec, to);
       }
       None => self.emit_created_descending(scope, rec, to),
@@ -449,27 +463,25 @@ impl Monitor {
   /// Resolves a validated rename pair into a single [`ChangeKind::Moved`].
   fn resolve_paired_move(&mut self, scope: ScopeId, to: Location, pending: PendingMove) {
     // TODO(§6): full O(1) edge reparenting of a moved watched directory lands with
-    // the inotify sub-machine. Until then a watched directory's rename is handled
-    // as coverage loss — drop the now-stale subtree and Rescan its new location —
-    // so a child path is never reconstructed through a stale parent/name edge.
-    match pending.from_watch.filter(|src| self.is_watched(*src)) {
-      Some(src) => {
-        self.emit(scope, to.clone(), ChangeKind::Moved(pending.from));
-        self.drop_subtree(src);
-        self.emit_rescan(scope, to);
-      }
-      None => self.emit(scope, to, ChangeKind::Moved(pending.from)),
+    // the inotify sub-machine. Until then a watched directory's rename is coverage
+    // loss handled in two parts: its stale subtree was already dropped at
+    // `on_moved_from` (eager-drop), and the pair re-establishes coverage at the
+    // destination with a `Rescan` — so a child path is never reconstructed through a
+    // stale parent/name edge, and the source slot was already freed for a replacement.
+    if pending.source_was_watched_dir {
+      self.emit(scope, to.clone(), ChangeKind::Moved(pending.from));
+      self.emit_rescan(scope, to);
+    } else {
+      self.emit(scope, to, ChangeKind::Moved(pending.from));
     }
   }
 
   /// Resolves a source half that found no destination: the object left this
-  /// location, so emit a [`ChangeKind::Removed`] and, when it was a watched
-  /// directory, drop its now-stale watch subtree.
-  fn resolve_lost_source(&mut self, scope: ScopeId, from: Location, from_watch: Option<WatchId>) {
+  /// location, so emit a [`ChangeKind::Removed`]. A watched-directory source had
+  /// its now-stale watch subtree dropped already at `on_moved_from` (eager-drop),
+  /// so there is nothing more to tear down here.
+  fn resolve_lost_source(&mut self, scope: ScopeId, from: Location) {
     self.emit(scope, from, ChangeKind::Removed);
-    if let Some(src) = from_watch.filter(|src| self.is_watched(*src)) {
-      self.drop_subtree(src);
-    }
   }
 
   /// Emits a [`ChangeKind::Created`] for an object that appeared at `location`,
@@ -578,23 +590,20 @@ impl Monitor {
   }
 
   /// Invariant (b): no pending move-half outlives the teardown of its
-  /// scope/subtree. A half whose source lived under any node in `removed` can
-  /// never pair (its source is gone) and must not later time out into a `Removed`
-  /// for a dead path, so it is discarded with the subtree. A whole-root
+  /// scope/subtree. A half whose parent watch is in `removed` can never pair (its
+  /// source location is gone) and must not later time out into a `Removed` for a
+  /// dead path, so it is discarded with the subtree. A whole-root
   /// `unregister_root` removes every node of the scope, so this purges all of that
-  /// scope's halves; a narrower drop purges only the halves whose source — its
-  /// parent `from_parent`, or its own `from_watch` when it was a watched directory
-  /// — was removed.
+  /// scope's halves; a narrower drop purges only the halves anchored at a removed
+  /// `from_parent`. (A watched-directory source's own subtree is never an anchor
+  /// here — it was eager-dropped at `on_moved_from`, so only the parent remains.)
   fn purge_pending_moves(&mut self, removed: &BTreeSet<WatchId>) {
     if removed.is_empty() || self.pending_moves.is_empty() {
       return;
     }
-    self.pending_moves.retain(|_, pending| {
-      !removed.contains(&pending.from_parent)
-        && pending
-          .from_watch
-          .is_none_or(|watch| !removed.contains(&watch))
-    });
+    self
+      .pending_moves
+      .retain(|_, pending| !removed.contains(&pending.from_parent));
   }
 
   fn record_location(&self, rec: &OsRecord) -> Location {
