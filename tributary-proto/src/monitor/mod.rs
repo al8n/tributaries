@@ -449,34 +449,23 @@ impl Monitor {
       // a fresh `Created` via the `None` arm). A matched half pairs only before its
       // window elapses; past it the source already stranded (a late destination).
       Some(pending) if !now.reached(pending.deadline) => {
-        self.resolve_paired_move(scope, to, rec, pending);
+        // A validated rename: emit the move, then re-arm coverage at the
+        // destination (a moved-in directory must be watched at its new path).
+        self.emit(scope, to, ChangeKind::Moved(pending.from));
+        self.rearm_destination(scope, rec);
       }
       Some(pending) => {
+        // Late destination: the source already stranded into a `Removed`. Treat
+        // the arrival as a fresh object moved into the slot.
         self.resolve_lost_source(pending.scope, pending.from);
-        self.emit_created_descending(scope, rec, to);
+        self.emit(scope, to, ChangeKind::Created);
+        self.rearm_destination(scope, rec);
       }
-      None => self.emit_created_descending(scope, rec, to),
+      None => {
+        self.emit(scope, to, ChangeKind::Created);
+        self.rearm_destination(scope, rec);
+      }
     }
-  }
-
-  /// Resolves a validated rename pair into a single [`ChangeKind::Moved`], then
-  /// re-arms coverage at the destination.
-  fn resolve_paired_move(
-    &mut self,
-    scope: ScopeId,
-    to: Location,
-    rec: &OsRecord,
-    pending: PendingMove,
-  ) {
-    // TODO(§6): full O(1) edge reparenting of a moved watched directory lands with
-    // the inotify sub-machine. Until then a renamed directory's source subtree was
-    // already dropped at `on_moved_from`, and its destination is re-armed here like
-    // a fresh creation: `descend_into` installs the destination's watch (whose
-    // enumerate rediscovers the contents not carried over). This re-establishes
-    // Monitor coverage in the watch tree — a consumer `Rescan` alone would not
-    // repopulate it, so a paired directory destination would otherwise be unwatched.
-    self.emit(scope, to, ChangeKind::Moved(pending.from));
-    self.descend_into(scope, rec);
   }
 
   /// Resolves a source half that found no destination: the object left this
@@ -488,23 +477,54 @@ impl Monitor {
   }
 
   /// Emits a [`ChangeKind::Created`] for an object that appeared at `location`,
-  /// then descends into it (see [`Self::descend_into`]). Used for a plain create
-  /// and an unpaired move destination — both are "a fresh object".
+  /// then descends into it (see [`Self::descend_into`]). Used for a plain create;
+  /// a move destination emits its own change and uses [`Self::rearm_destination`].
   fn emit_created_descending(&mut self, scope: ScopeId, rec: &OsRecord, location: Location) {
     self.emit(scope, location, ChangeKind::Created);
     self.descend_into(scope, rec);
   }
 
-  /// Installs a watch for the directory object named by `rec`, when the core
-  /// descends per-directory. Shared by every path at which a directory newly
-  /// occupies a slot — a create, an unpaired move destination, or a paired rename
-  /// destination — so coverage is armed uniformly however the directory arrived.
-  /// (`install_child` is idempotent, so re-arming an already-watched slot is safe.)
+  /// Installs a watch for a directory `Created` at the slot named by `rec`, when
+  /// the core descends per-directory. Idempotent: a `Created` on an already-watched
+  /// slot is a duplicate-discovery race (a real replace arrives as `Removed` then
+  /// `Created`, freeing the slot first), so the existing watch is reused.
+  ///
+  /// Only `is_dir() == Some(true)` descends. A descending backend is required to
+  /// report directory-ness for a directory appearance — inotify always does, via
+  /// `IN_ISDIR` — so `Some(false)` and `None` are both "not a directory to descend
+  /// into" (treating an unknown kind as a directory would Rescan on every file). A
+  /// move destination uses [`Self::rearm_destination`] (replace, not reuse).
   fn descend_into(&mut self, scope: ScopeId, rec: &OsRecord) {
-    if rec.is_dir().unwrap_or(false)
+    if rec.is_dir() == Some(true)
       && self.descends()
       && let Some(name) = rec.name()
     {
+      self.install_child(rec.watch(), scope, name.clone(), true);
+    }
+  }
+
+  /// Re-arms coverage at a move destination. A `MovedTo` brings a *fresh* object to
+  /// `(parent, name)`, so any watch already in that slot belongs to a DIFFERENT,
+  /// now-stale object — drop it (a file may even replace a watched directory) — then
+  /// watch the arrival if it is a directory. This rebuilds Monitor coverage in the
+  /// watch tree; a consumer `Rescan` alone would not repopulate it, and the
+  /// idempotent [`Self::descend_into`] would wrongly keep the stale occupant.
+  ///
+  /// The directory-ness contract matches [`Self::descend_into`]: only
+  /// `is_dir() == Some(true)` is watched. TODO(§6): full O(1) edge reparenting of a
+  /// moved watched directory lands with the inotify sub-machine; until then the
+  /// destination is re-armed afresh (its enumerate rediscovers the contents).
+  fn rearm_destination(&mut self, scope: ScopeId, rec: &OsRecord) {
+    if !self.descends() {
+      return;
+    }
+    let Some(name) = rec.name() else {
+      return;
+    };
+    if let Some(stale) = self.child_watch(rec.watch(), name) {
+      self.drop_subtree(stale);
+    }
+    if rec.is_dir() == Some(true) {
       self.install_child(rec.watch(), scope, name.clone(), true);
     }
   }
