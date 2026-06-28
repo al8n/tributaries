@@ -636,3 +636,573 @@ fn capability_switch_yields_same_changes() {
 
   assert_eq!(run(per_dir()), run(kernel_recursive()));
 }
+
+// ── Move pairing must validate scope + deadline, not cookie alone ──
+
+/// Two disjoint roots can be on separate backend instances whose cookies collide.
+/// A `MovedFrom` in one scope must never pair with a `MovedTo` in another: the
+/// source resolves as `Removed`, the destination as `Created`, with no bogus move.
+#[test]
+fn cross_scope_move_with_shared_cookie_does_not_pair() {
+  let mut m = per_dir();
+  let root1 = live_root(&mut m, scope(1));
+  let root2 = live_root(&mut m, scope(2));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root1, RecordKind::MovedFrom)
+      .with_name(seg("x"))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root2, RecordKind::MovedTo)
+      .with_name(seg("y"))
+      .with_cookie(cookie(7)),
+    at(11),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2, "no bogus pair across roots");
+  assert!(events.iter().all(|e| !e.kind().is_moved()));
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_removed() && e.scope() == scope(1) && e.location() == &loc(&["x"])),
+    "source resolves as Removed in its own scope"
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.scope() == scope(2) && e.location() == &loc(&["y"])),
+    "destination resolves as Created in its own scope"
+  );
+}
+
+/// A reused / colliding cookie that displaces a still-pending source half must not
+/// silently drop the displaced half — it resolves on its own, and the survivor
+/// still pairs.
+#[test]
+fn duplicate_moved_from_cookie_resolves_displaced_half() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("b"))
+      .with_cookie(cookie(5)),
+    at(11),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    1,
+    "the displaced half is not silently dropped"
+  );
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("c"))
+      .with_cookie(cookie(5)),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_moved());
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["b"])));
+  assert_eq!(events[0].location(), &loc(&["c"]));
+}
+
+/// A destination arriving after the window — before any `handle_timeout` fired —
+/// must resolve as `Created`, not pair into a stale `Moved`.
+#[test]
+fn expired_moved_to_becomes_created_not_moved() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("old"))
+      .with_cookie(cookie(8)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("new"))
+      .with_cookie(cookie(8)),
+    at(200),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2);
+  assert!(events.iter().all(|e| !e.kind().is_moved()));
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_removed() && e.location() == &loc(&["old"]))
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["new"]))
+  );
+}
+
+/// The deadline is the exclusive upper bound: a destination at exactly the
+/// deadline is already expired (consistent with `handle_timeout`'s `reached`).
+#[test]
+fn moved_to_at_deadline_does_not_pair() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("old"))
+      .with_cookie(cookie(1)),
+    at(0),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("new"))
+      .with_cookie(cookie(1)),
+    at(0) + DEFAULT_MOVE_WINDOW,
+  );
+
+  let events = drain_events(&mut m);
+  assert!(events.iter().all(|e| !e.kind().is_moved()));
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["new"]))
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_removed() && e.location() == &loc(&["old"]))
+  );
+}
+
+// ── A renamed watched directory must not keep stale-path coverage ──
+
+/// Renaming a watched directory drops its now-stale watch subtree (recursively)
+/// and rescans the new location, instead of leaving children pinned to the old
+/// parent/name edge.
+#[test]
+fn watched_dir_rename_drops_stale_subtree_and_rescans() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created)
+      .with_name(seg("g"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let w_g = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_g, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  assert!(m.is_watched(w_d) && m.is_watched(w_g));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_moved()
+      && e.location() == &loc(&["e"])
+      && e.kind().moved_from() == Some(&loc(&["d"]))),
+    "the directory rename itself is reported"
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
+    "the relocated subtree is rescanned under its new path"
+  );
+  assert!(!m.is_watched(w_d), "old dir node dropped");
+  assert!(!m.is_watched(w_g), "grandchild node dropped too");
+  let actions = drain_actions(&mut m);
+  assert!(actions.iter().any(|a| a.as_unwatch() == Some(w_d)));
+  assert!(actions.iter().any(|a| a.as_unwatch() == Some(w_g)));
+}
+
+/// After a watched directory is renamed, a child record still tagged to the old
+/// watch must never reconstruct the stale path; re-arming under the new name
+/// reconstructs the correct path.
+#[test]
+fn record_under_renamed_watched_dir_never_uses_stale_path() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m); // the subtree-drop Unwatch(w_d)
+  assert!(!m.is_watched(w_d));
+
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created).with_name(seg("f.txt")),
+    at(12),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a record on the dropped old watch yields nothing (never the stale path)"
+  );
+
+  // Re-establishing the watch under the new name yields the correct path.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("e"))
+      .with_is_dir(true),
+    at(13),
+  );
+  let w_e = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_e, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  m.on_os_record(
+    OsRecord::new(w_e, RecordKind::Created).with_name(seg("f.txt")),
+    at(14),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert_eq!(
+    events[0].location(),
+    &loc(&["e", "f.txt"]),
+    "child resolves under the new path"
+  );
+}
+
+/// A watched directory moved out of the tree (unpaired source) drops its subtree
+/// on timeout, not just emitting `Removed`.
+#[test]
+fn watched_dir_moved_out_drops_subtree_on_timeout() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert!(m.is_watched(w_d), "still watched within the pairing window");
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["d"]));
+  assert!(
+    !m.is_watched(w_d),
+    "moved-out watched dir's subtree is dropped"
+  );
+  let actions = drain_actions(&mut m);
+  assert!(actions.iter().any(|a| a.as_unwatch() == Some(w_d)));
+}
+
+// ── Every non-success watch result is coverage loss ──
+
+fn watch_failure_is_coverage_loss(err: WatchError) {
+  let mut m = per_dir();
+  let _root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  m.on_enumerate(
+    ReqId::new(NonZeroU64::new(1).unwrap()),
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  let child_id = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  let _ = drain_events(&mut m);
+
+  m.on_watch_result(child_id, Err(err));
+  assert!(
+    !m.is_watched(child_id),
+    "a refused watch is not believed-watched"
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["sub"]));
+  let actions = drain_actions(&mut m);
+  assert!(actions.iter().any(|a| a.as_unwatch() == Some(child_id)));
+}
+
+#[test]
+fn permission_watch_failure_is_coverage_loss() {
+  watch_failure_is_coverage_loss(WatchError::Permission);
+}
+
+#[test]
+fn io_watch_failure_is_coverage_loss() {
+  watch_failure_is_coverage_loss(WatchError::Io);
+}
+
+/// `NoSpace` now also drops the refused node (was: left registered) so a caller
+/// never believes the subtree is watched.
+#[test]
+fn no_space_watch_result_drops_node() {
+  let mut m = per_dir();
+  let root = m.register_root(scope(1), Interest::all());
+  let _ = drain_actions(&mut m);
+  m.on_watch_result(root, Err(WatchError::NoSpace));
+  assert!(
+    !m.is_watched(root),
+    "a refused root is dropped, not left registered"
+  );
+  assert!(drain_events(&mut m).iter().any(|e| e.kind().is_rescan()));
+  let actions = drain_actions(&mut m);
+  assert!(actions.iter().any(|a| a.as_unwatch() == Some(root)));
+}
+
+/// `NotFound` now also emits a `Rescan` (was: silent drop).
+#[test]
+fn not_found_watch_result_drops_and_rescans() {
+  let mut m = per_dir();
+  let _root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  m.on_enumerate(
+    ReqId::new(NonZeroU64::new(1).unwrap()),
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  let child_id = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  let _ = drain_events(&mut m);
+
+  m.on_watch_result(child_id, Err(WatchError::NotFound));
+  assert!(!m.is_watched(child_id));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["sub"]));
+}
+
+// ── Descent is idempotent via the child index ──
+
+/// A cold enumerate racing a live `Created` for one path installs a single child
+/// watch and delivers the change once.
+#[test]
+fn racing_descent_installs_one_child_watch() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_enumerate(
+    ReqId::new(NonZeroU64::new(1).unwrap()),
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("sub"))
+      .with_is_dir(true),
+    at(5),
+  );
+
+  let actions = drain_actions(&mut m);
+  let sub_watches = actions
+    .iter()
+    .filter(|a| {
+      a.as_watch()
+        .map(|c| c.target() == &WatchTarget::child(root, seg("sub")))
+        .unwrap_or(false)
+    })
+    .count();
+  assert_eq!(sub_watches, 1, "one watch per path despite the race");
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "the Created is not double-delivered");
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["sub"]));
+}
+
+/// Dropping a child watch removes it from the child index in lockstep, so a later
+/// descent for the same `(parent, name)` re-arms with a fresh watch.
+#[test]
+fn dropped_child_watch_can_be_reinstalled() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("sub"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w1 = drain_actions(&mut m)[0].as_watch().unwrap().id();
+
+  m.on_os_record(OsRecord::new(w1, RecordKind::Ignored), at(2));
+  assert!(!m.is_watched(w1));
+  let _ = drain_actions(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("sub"))
+      .with_is_dir(true),
+    at(3),
+  );
+  let acts = drain_actions(&mut m);
+  assert_eq!(acts.len(), 1, "re-descent re-arms the path");
+  let w2 = acts[0].as_watch().unwrap().id();
+  assert_ne!(w1, w2);
+  assert!(m.is_watched(w2));
+}
+
+// ── Move dedup must distinguish distinct sources ──
+
+/// Two renames to one destination with different sources are both delivered (the
+/// later one is not coalesced away by a source-blind dedup key).
+#[test]
+fn two_moves_to_one_destination_keep_distinct_sources() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("dest"))
+      .with_cookie(cookie(1)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("b"))
+      .with_cookie(cookie(2)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("dest"))
+      .with_cookie(cookie(2)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  let moved: Vec<&Change> = events.iter().filter(|e| e.kind().is_moved()).collect();
+  assert_eq!(moved.len(), 2, "the later move is not coalesced away");
+  assert!(moved.iter().all(|e| e.location() == &loc(&["dest"])));
+  let froms: Vec<&Location> = moved.iter().filter_map(|e| e.kind().moved_from()).collect();
+  assert!(froms.contains(&&loc(&["a"])));
+  assert!(froms.contains(&&loc(&["b"])));
+}
+
+/// Truly identical queued moves still coalesce (the dedup is tightened, not
+/// removed).
+#[test]
+fn identical_pending_moves_still_coalesce() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1)),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(1)),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(2)),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(2)),
+    at(4),
+  );
+
+  let moved = drain_events(&mut m)
+    .iter()
+    .filter(|e| e.kind().is_moved())
+    .count();
+  assert_eq!(moved, 1, "truly identical moves are deduped");
+}

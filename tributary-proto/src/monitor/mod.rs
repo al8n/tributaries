@@ -37,19 +37,27 @@ struct WatchNode {
 }
 
 /// A pending [`RecordKind::MovedFrom`] awaiting its matching
-/// [`RecordKind::MovedTo`], with the deadline past which it is resolved alone.
+/// [`RecordKind::MovedTo`].
+///
+/// It carries enough to validate a candidate pair before consuming it: the source
+/// `scope` (a destination in a different scope must not pair), the `deadline` past
+/// which the half resolves on its own, and — when the moved object is itself a
+/// watched directory — that directory's `from_watch`, so a completed pair can drop
+/// the now-stale subtree instead of reconstructing paths through a dead edge.
 #[derive(Debug, Clone)]
 struct PendingMove {
   from: Location,
   scope: ScopeId,
   deadline: Instant,
+  from_watch: Option<WatchId>,
 }
 
-/// A delivery-dedup key: a change is suppressed if an identical one is still
-/// queued. Two changes are "identical" when they share a scope, location, and
-/// kind discriminant — enough to make a cold-start `Created` idempotent against a
-/// concurrent live `Created` for the same path.
-type DedupKey = (ScopeId, Location, u8);
+/// A delivery-dedup key: a change is suppressed only if an identical one is still
+/// queued. Two changes are "identical" when they share a scope, location, kind
+/// discriminant, and — for a [`ChangeKind::Moved`] — the same source location.
+/// Carrying the source keeps two distinct renames to one destination from
+/// collapsing into a single move; for every other kind the source slot is `None`.
+type DedupKey = (ScopeId, Location, u8, Option<Location>);
 
 /// The primitive-agnostic top half of the `tributaries` state machine.
 ///
@@ -83,6 +91,10 @@ pub struct Monitor {
   change_ids: Sequence,
 
   nodes: BTreeMap<WatchId, WatchNode>,
+  /// `(parent, name) -> child watch`, kept in lockstep with `nodes`, so descent
+  /// is idempotent (one watch per path) and a moved watched directory is
+  /// detectable in O(log n).
+  child_index: BTreeMap<(WatchId, Segment), WatchId>,
   roots: BTreeMap<ScopeId, WatchId>,
   pending_enumerate: BTreeMap<ReqId, WatchId>,
   pending_moves: BTreeMap<MoveCookie, PendingMove>,
@@ -103,6 +115,7 @@ impl Monitor {
       req_ids: Sequence::new(),
       change_ids: Sequence::new(),
       nodes: BTreeMap::new(),
+      child_index: BTreeMap::new(),
       roots: BTreeMap::new(),
       pending_enumerate: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
@@ -244,11 +257,12 @@ impl Monitor {
   /// armed strictly before readdir" is a state-machine invariant, so the
   /// enumerate is only ever queued *after* this success.
   ///
-  /// On [`WatchError::NoSpace`] the scope is degraded: rather than silently
-  /// blinding the subtree, a [`ChangeKind::Rescan`] is emitted for the scope so
-  /// the consumer re-enumerates. On [`WatchError::NotFound`] /
-  /// [`WatchError::Gone`] the node is dropped (the target vanished before the
-  /// watch took).
+  /// Every non-success result is treated as coverage loss: the node and its
+  /// subtree are dropped and a [`ChangeKind::Rescan`] is emitted for the affected
+  /// location, so a caller never believes a subtree is watched when the kernel
+  /// refused the watch. This covers all [`WatchError`] variants uniformly — a
+  /// watch-limit refusal, a permission denial, a vanished target, or any other
+  /// I/O failure — none may leave a node registered-but-not-live and silent.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn on_watch_result(&mut self, id: WatchId, res: Result<(), WatchError>) {
     let Some(node) = self.nodes.get_mut(&id) else {
@@ -266,13 +280,12 @@ impl Monitor {
           self.actions.push_back(Action::enumerate(req, id));
         }
       }
-      Err(WatchError::NoSpace) => {
+      // Reconstruct the location while the node still exists, then drop it: a
+      // failed install — for any reason — must not leave a silent blind spot.
+      Err(_) => {
         self.emit_rescan(scope, self.location_of(id));
-      }
-      Err(WatchError::NotFound | WatchError::Gone) => {
         self.drop_subtree(id);
       }
-      Err(WatchError::Permission | WatchError::Io) => {}
     }
   }
 
@@ -305,7 +318,8 @@ impl Monitor {
   }
 
   /// Advances time, resolving move halves whose pairing window has elapsed: an
-  /// unpaired source becomes a [`ChangeKind::Removed`].
+  /// unpaired source becomes a [`ChangeKind::Removed`] (and, if it was a watched
+  /// directory, its now-stale watch subtree is dropped).
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn handle_timeout(&mut self, now: Instant) {
     let expired: std::vec::Vec<MoveCookie> = self
@@ -317,7 +331,7 @@ impl Monitor {
 
     for cookie in expired {
       if let Some(pending) = self.pending_moves.remove(&cookie) {
-        self.emit(pending.scope, pending.from, ChangeKind::Removed);
+        self.resolve_lost_source(pending.scope, pending.from, pending.from_watch);
       }
     }
   }
@@ -349,62 +363,93 @@ impl Monitor {
   }
 
   fn on_created(&mut self, scope: ScopeId, rec: &OsRecord) {
-    self.emit_child(scope, rec, ChangeKind::Created);
     // TODO(§6): set the create-descend dirty flag — records hitting the new dir
     // before its enumerate is processed must escalate to a subtree Rescan. The
     // dirty-window tracking lands with the inotify sub-machine.
-    let is_dir = rec.is_dir().unwrap_or(false);
-    if is_dir
-      && self.descends()
-      && let Some(name) = rec.name()
-    {
-      self.install_child(rec.watch(), scope, name.clone(), true);
-    }
+    let location = self.record_location(rec);
+    self.emit_created_descending(scope, rec, location);
   }
 
   fn on_moved_from(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) {
     let from = self.record_location(rec);
+    let from_watch = rec
+      .name()
+      .and_then(|name| self.child_watch(rec.watch(), name));
     match rec.cookie() {
       Some(cookie) => {
-        self.pending_moves.insert(
-          cookie,
-          PendingMove {
-            from,
-            scope,
-            deadline: now + self.move_window,
-          },
-        );
+        let pending = PendingMove {
+          from,
+          scope,
+          deadline: now + self.move_window,
+          from_watch,
+        };
+        // A cookie that already has a pending half is ambiguous (a reused or
+        // cross-root colliding cookie): the displaced half can no longer be
+        // paired, so resolve it on its own rather than silently overwriting it.
+        if let Some(displaced) = self.pending_moves.insert(cookie, pending) {
+          self.resolve_lost_source(displaced.scope, displaced.from, displaced.from_watch);
+        }
       }
-      None => {
-        self.emit(scope, from, ChangeKind::Removed);
-      }
+      None => self.resolve_lost_source(scope, from, from_watch),
     }
   }
 
   fn on_moved_to(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) {
     let to = self.record_location(rec);
-    let paired = rec
+    match rec
       .cookie()
-      .and_then(|cookie| self.pending_moves.remove(&cookie));
-    match paired {
+      .and_then(|cookie| self.pending_moves.remove(&cookie))
+    {
+      // A half pairs only with a destination in its own scope and only before its
+      // window elapses; otherwise the two are unrelated (a cross-root cookie
+      // collision) or the source already stranded (a late destination).
+      Some(pending) if pending.scope == scope && !now.reached(pending.deadline) => {
+        self.resolve_paired_move(scope, to, pending);
+      }
       Some(pending) => {
-        // TODO(§6): when the moved object is a watched directory, reparent its
-        // subtree edge in place (O(1)) instead of relying on re-arming. The
-        // parent-relative tree makes this a single edge change; it lands with
-        // the inotify sub-machine.
-        self.emit(scope, to, ChangeKind::Moved(pending.from));
+        self.resolve_lost_source(pending.scope, pending.from, pending.from_watch);
+        self.emit_created_descending(scope, rec, to);
       }
-      None => {
-        let _ = now;
-        self.emit(scope, to, ChangeKind::Created);
-        let is_dir = rec.is_dir().unwrap_or(false);
-        if is_dir
-          && self.descends()
-          && let Some(name) = rec.name()
-        {
-          self.install_child(rec.watch(), scope, name.clone(), true);
-        }
+      None => self.emit_created_descending(scope, rec, to),
+    }
+  }
+
+  /// Resolves a validated rename pair into a single [`ChangeKind::Moved`].
+  fn resolve_paired_move(&mut self, scope: ScopeId, to: Location, pending: PendingMove) {
+    // TODO(§6): full O(1) edge reparenting of a moved watched directory lands with
+    // the inotify sub-machine. Until then a watched directory's rename is handled
+    // as coverage loss — drop the now-stale subtree and Rescan its new location —
+    // so a child path is never reconstructed through a stale parent/name edge.
+    match pending.from_watch.filter(|src| self.is_watched(*src)) {
+      Some(src) => {
+        self.emit(scope, to.clone(), ChangeKind::Moved(pending.from));
+        self.drop_subtree(src);
+        self.emit_rescan(scope, to);
       }
+      None => self.emit(scope, to, ChangeKind::Moved(pending.from)),
+    }
+  }
+
+  /// Resolves a source half that found no destination: the object left this
+  /// location, so emit a [`ChangeKind::Removed`] and, when it was a watched
+  /// directory, drop its now-stale watch subtree.
+  fn resolve_lost_source(&mut self, scope: ScopeId, from: Location, from_watch: Option<WatchId>) {
+    self.emit(scope, from, ChangeKind::Removed);
+    if let Some(src) = from_watch.filter(|src| self.is_watched(*src)) {
+      self.drop_subtree(src);
+    }
+  }
+
+  /// Emits a [`ChangeKind::Created`] for an object that appeared at `location`,
+  /// descending into it when the core descends and it is a directory. Shared by a
+  /// plain create and an unpaired move destination — both are "a fresh object".
+  fn emit_created_descending(&mut self, scope: ScopeId, rec: &OsRecord, location: Location) {
+    self.emit(scope, location, ChangeKind::Created);
+    if rec.is_dir().unwrap_or(false)
+      && self.descends()
+      && let Some(name) = rec.name()
+    {
+      self.install_child(rec.watch(), scope, name.clone(), true);
     }
   }
 
@@ -445,6 +490,13 @@ impl Monitor {
   }
 
   fn install_child(&mut self, parent: WatchId, scope: ScopeId, name: Segment, is_dir: bool) {
+    // Descent is idempotent: a cold enumerate racing a live `Created` (or
+    // duplicate create records) must not mint a second watch for one path, or
+    // every record under it would be delivered twice. Reuse any pending-or-live
+    // child watch already covering `(parent, name)`.
+    if self.child_index.contains_key(&(parent, name.clone())) {
+      return;
+    }
     let id = WatchId::new(self.watch_ids.mint());
     self.nodes.insert(
       id,
@@ -456,6 +508,7 @@ impl Monitor {
         live: false,
       },
     );
+    self.child_index.insert((parent, name.clone()), id);
     self.actions.push_back(Action::watch(
       id,
       crate::action::WatchTarget::child(parent, name),
@@ -476,8 +529,13 @@ impl Monitor {
       stack.extend(children);
 
       if let Some(node) = self.nodes.remove(&id) {
+        // Keep the child index in lockstep with the node map: a removed child must
+        // leave both, or a later descent would skip re-arming it (stale index) and
+        // a path could resolve through a dropped node.
         if node.parent.is_none() {
           self.roots.remove(&node.scope);
+        } else if let (Some(parent), Some(name)) = (node.parent, node.name) {
+          self.child_index.remove(&(parent, name));
         }
         self.actions.push_back(Action::Unwatch(id));
       }
@@ -493,6 +551,11 @@ impl Monitor {
 
   fn child_location(&self, parent: WatchId, name: &Segment) -> Location {
     self.location_of(parent).child(name.clone())
+  }
+
+  /// The watch covering `(parent, name)`, pending or live, if any.
+  fn child_watch(&self, parent: WatchId, name: &Segment) -> Option<WatchId> {
+    self.child_index.get(&(parent, name.clone())).copied()
   }
 
   fn location_of(&self, id: WatchId) -> Location {
@@ -528,10 +591,15 @@ impl Monitor {
   }
 
   fn dedup_key(change: &Change) -> DedupKey {
+    let from = match change.kind() {
+      ChangeKind::Moved(from) => Some(from.clone()),
+      _ => None,
+    };
     (
       change.scope(),
       change.location().clone(),
       Self::kind_tag(change.kind()),
+      from,
     )
   }
 
