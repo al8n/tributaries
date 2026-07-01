@@ -265,6 +265,12 @@ pub enum Action {
   /// Install a watch.
   Watch(WatchCommand),
   /// Remove a previously-installed watch.
+  ///
+  /// May target a watch the driver has not yet acknowledged through
+  /// [`on_watch_result`](crate::Monitor::on_watch_result): a pending child watch
+  /// can be dropped before its install completes (a parent teardown, or a
+  /// moved-away source). The driver must treat an `Unwatch` of a handle it never
+  /// bound to a kernel watch as a no-op.
   Unwatch(WatchId),
   /// Read a watched directory's entries.
   Enumerate(EnumerateCommand),
