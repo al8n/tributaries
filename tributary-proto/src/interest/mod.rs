@@ -84,7 +84,11 @@ impl Interest {
     self.ondir
   }
 
-  /// Whether this interest subscribes to nothing.
+  /// Whether this interest subscribes to no events.
+  ///
+  /// [`ondir`](Self::ondir) is deliberately excluded: it is a target-class
+  /// modifier (directory-vs-file routing), not an event subscription, so an
+  /// interest with only `ondir` set still subscribes to nothing and is empty.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_empty(&self) -> bool {
     !(self.created || self.removed || self.modified || self.moved || self.attrib)

@@ -5,9 +5,10 @@
 /// Reported back through [`on_watch_result`](crate::Monitor::on_watch_result).
 /// Feeding this back is **mandatory**: without it the core would believe a watch
 /// is live when the kernel refused it (e.g. `ENOSPC`), leaving a silent blind
-/// spot. This is a coded classification, not this crate's own error type — the
-/// core dispatches on it (a [`NoSpace`](Self::NoSpace) drives the degrade path,
-/// a [`Gone`](Self::Gone) drops the node), so each kind is its own variant.
+/// spot. It is a coded classification the core dispatches on (a
+/// [`NoSpace`](Self::NoSpace) drives the degrade path, a [`Gone`](Self::Gone)
+/// drops the node), so each kind is its own variant; it implements
+/// [`core::error::Error`] so it composes as the `Err` of a driver's `Result`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WatchError {
@@ -74,6 +75,8 @@ impl core::fmt::Display for WatchError {
     f.write_str(self.as_str())
   }
 }
+
+impl core::error::Error for WatchError {}
 
 #[cfg(test)]
 mod tests;

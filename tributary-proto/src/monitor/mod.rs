@@ -22,6 +22,13 @@ use crate::{
 /// creation).
 pub const DEFAULT_MOVE_WINDOW: Duration = Duration::from_millis(100);
 
+/// How many times a rescan re-arm enumerate that cannot fully reconcile a directory
+/// (a `Partial` or `Failed` read) is retried before the Monitor escalates to a
+/// `Rescan` for that subtree — so a permanently-unreadable directory cannot spin a
+/// fixpoint-draining driver. Per-directory backoff / degraded state is a later
+/// refinement; this bound keeps the foundation from looping.
+const REARM_MAX_RETRIES: u8 = 2;
+
 /// One node in the parent-relative watch tree.
 ///
 /// Paths are reconstructed by walking `parent` links to a root, so a node stores
@@ -40,22 +47,28 @@ struct WatchNode {
 /// [`RecordKind::MovedTo`].
 ///
 /// It carries enough to validate a candidate pair before consuming it *and* to
-/// purge it when its source disappears. `scope` and `deadline` bound pairing in
-/// space and time. `from_parent` (the watch the `MovedFrom` arrived on) anchors
-/// the half in the watch tree: a teardown of that subtree must discard this half
-/// (invariant b) rather than let it later time out into a `Removed` for a path
-/// that no longer exists.
+/// resolve it when its source disappears. `scope` and `deadline` bound pairing in
+/// space and time. The source is anchored by its slot `(from_parent, from_name)`
+/// rather than an eager path: the location is reconstructed on use, so if the
+/// source's own ancestor is reparented mid-window the resolved path follows it.
+/// `from_parent` (the watch the `MovedFrom` arrived on) also gates liveness: a
+/// teardown of that subtree discards this half (invariant b) rather than let it
+/// later time out into a `Removed` for a path that no longer exists.
 ///
-/// A watched-directory source is *eager-dropped* the moment it moves away (see
-/// [`Monitor::on_moved_from`]), so the half holds no reference to it; coverage at
-/// a rename's destination is re-armed from the `MovedTo` record, exactly like a
-/// fresh directory creation.
+/// `held` is a watched-directory source's own subtree, detached from its old
+/// `(parent, name)` slot but kept alive across the pairing window so a paired
+/// `MovedTo` can [`reparent`](Monitor::reparent) it in O(1) — its descendants
+/// follow their unchanged parent links, with no re-enumerate and no per-descendant
+/// `Created`. Detaching frees the old path for a replacement to install its own
+/// watch; an unpaired move tears the held subtree down when its window elapses.
+/// `None` for a non-directory (unwatched) source.
 #[derive(Debug, Clone)]
 struct PendingMove {
-  from: Location,
+  from_parent: WatchId,
+  from_name: Segment,
   scope: ScopeId,
   deadline: Instant,
-  from_parent: WatchId,
+  held: Option<WatchId>,
 }
 
 /// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
@@ -124,6 +137,19 @@ pub struct Monitor {
   child_index: BTreeMap<(WatchId, Segment), WatchId>,
   roots: BTreeMap<ScopeId, WatchId>,
   pending_enumerate: BTreeMap<ReqId, WatchId>,
+  /// Enumerate requests issued as part of a rescan re-arm: their results reconcile
+  /// coverage (arm newly-appeared directories, prune vanished ones) WITHOUT emitting
+  /// `Created` — the consumer already has the `Rescan` and re-scans content itself.
+  rearm_reqs: BTreeSet<ReqId>,
+  /// Watches whose post-arm enumerate must continue a rescan re-arm, so the whole
+  /// re-armed subtree stays `Created`-suppressed, not merely its top level.
+  rearming: BTreeSet<WatchId>,
+  /// Directories with a rescan re-arm enumerate currently outstanding — one at a time
+  /// each, so repeated overflows and cascades coalesce onto it instead of stacking.
+  rearm_dirs: BTreeSet<WatchId>,
+  /// Per-directory count of consecutive incomplete (partial/failed) re-arm reads,
+  /// bounding retries at [`REARM_MAX_RETRIES`] before escalating to a `Rescan`.
+  rearm_attempts: BTreeMap<WatchId, u8>,
   /// Half-resolved renames awaiting their destination, keyed by `(scope, cookie)`.
   ///
   /// Four lifecycle invariants hold, each enforced at the site noted:
@@ -158,6 +184,10 @@ impl Monitor {
       child_index: BTreeMap::new(),
       roots: BTreeMap::new(),
       pending_enumerate: BTreeMap::new(),
+      rearm_reqs: BTreeSet::new(),
+      rearming: BTreeSet::new(),
+      rearm_dirs: BTreeSet::new(),
+      rearm_attempts: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
       actions: VecDeque::new(),
       events: VecDeque::new(),
@@ -275,6 +305,7 @@ impl Monitor {
     let Some(dir) = self.pending_enumerate.remove(&req) else {
       return;
     };
+    let rearm = self.rearm_reqs.remove(&req);
     let Some(&WatchNode { scope, live, .. }) = self.nodes.get(&dir) else {
       return;
     };
@@ -282,11 +313,29 @@ impl Monitor {
       return;
     }
 
+    if rearm {
+      // This outstanding re-arm request is resolved (a retry re-registers it).
+      self.rearm_dirs.remove(&dir);
+    }
+
     if res.forces_rescan() {
-      self.emit_rescan(scope, self.location_of(dir));
+      // An incomplete read (`Partial` or `Failed`), in EITHER mode: reconcile what is
+      // visible, cascade the re-arm into every currently-known child (a partial
+      // listing may omit a still-present one whose subtree gained a gap-created
+      // descendant), emit a `Rescan` for the content the read could not report, and
+      // bounded-retry to complete the watch set.
+      self.handle_incomplete_enumerate(dir, scope, &res);
       return;
     }
 
+    if rearm {
+      // A complete re-arm: prune vanished, arm new, cascade — without emitting Created.
+      self.rearm_attempts.remove(&dir);
+      self.rearm_enumerate(dir, scope, &res);
+      return;
+    }
+
+    // A complete cold enumerate: discovery — emit Created and install per-directory.
     for entry in res.entries() {
       let location = self.child_location(dir, entry.name());
       self.emit(scope, location, ChangeKind::Created);
@@ -300,6 +349,143 @@ impl Monitor {
         SlotOccupant::File
       };
       self.reconcile_slot(dir, scope, entry.name(), occupant, false);
+    }
+  }
+
+  /// Handles an incomplete enumerate (`Partial` or `Failed`) of `dir`, in either the
+  /// discovery or re-arm mode. It never prunes (the listing is incomplete): it arms any
+  /// newly-visible directory, cascades the re-arm into EVERY currently-known child
+  /// directory (a partial listing may omit a still-present one whose subtree gained a
+  /// gap-created descendant), emits a `Rescan` so the consumer refreshes the content
+  /// the read could not report, and retries a bounded number of times before letting
+  /// the `Rescan` stand — so a permanently-unreadable directory cannot spin the driver.
+  fn handle_incomplete_enumerate(&mut self, dir: WatchId, scope: ScopeId, res: &EnumerateResult) {
+    // Reconcile every VISIBLE entry (a `Failed` read surfaces none): install or keep a
+    // directory (marking a freshly-installed one for re-arm), and — for a directory
+    // that the listing now positively reports as a non-directory — drop the stale watch
+    // so it can't keep attributing events or block a later real directory at that name.
+    // Never prune OMITTED names (the listing is incomplete). No `Created` — the `Rescan`
+    // below refreshes consumer content.
+    for entry in res.entries() {
+      let occupant = if entry.is_dir() {
+        SlotOccupant::Dir
+      } else {
+        SlotOccupant::File
+      };
+      self.reconcile_slot(dir, scope, entry.name(), occupant, false);
+      if entry.is_dir()
+        && let Some(child) = self.child_watch(dir, entry.name())
+        && self.nodes.get(&child).is_some_and(|node| !node.live)
+      {
+        self.rearming.insert(child);
+      }
+    }
+    // Cascade the re-arm into EVERY currently-known child directory, on Partial AND
+    // Failed: a Partial listing may omit a still-present child, and a persistently
+    // Failed read never re-reads at all — so a gap-created descendant under a known
+    // child would otherwise stay unwatched. `inherit_rearm`/`start_rearm` coalesce, so
+    // this cannot stack duplicate work across the bounded retries.
+    let known: std::vec::Vec<WatchId> = self
+      .child_index
+      .iter()
+      .filter(|((parent, _), _)| *parent == dir)
+      .map(|(_, &child)| child)
+      .collect();
+    for child in known {
+      self.inherit_rearm(child);
+    }
+    // A watched directory mid-move is DETACHED from `child_index` for its pairing
+    // window (its live subtree is held in `pending_moves`), so the cascade above misses
+    // it — yet its subtree can still gain a gap-created descendant. Re-arm every held
+    // move-source subtree whose source parent is this directory.
+    let held: std::vec::Vec<WatchId> = self
+      .pending_moves
+      .values()
+      .filter(|pending| pending.from_parent == dir)
+      .filter_map(|pending| pending.held)
+      .collect();
+    for child in held {
+      self.inherit_rearm(child);
+    }
+    self.emit_rescan(scope, self.location_of(dir));
+    let attempts = self.rearm_attempts.get(&dir).copied().unwrap_or(0);
+    if attempts < REARM_MAX_RETRIES {
+      self.rearm_attempts.insert(dir, attempts + 1);
+      self.start_rearm(dir);
+    } else {
+      self.rearm_attempts.remove(&dir);
+    }
+  }
+
+  /// Queues an [`Action::Enumerate`] for `dir`, tagging it as a rescan re-arm when
+  /// `rearm` so its result reconciles coverage without emitting `Created`.
+  fn queue_enumerate(&mut self, dir: WatchId, rearm: bool) {
+    let req = self.next_req_id();
+    self.pending_enumerate.insert(req, dir);
+    if rearm {
+      self.rearm_reqs.insert(req);
+    }
+    self.actions.push_back(Action::enumerate(req, dir));
+  }
+
+  /// Begins (or continues) a rescan re-arm of `dir`, coalesced: queues a re-arm
+  /// enumerate only if one is not already outstanding for it, so repeated overflows
+  /// and cascade re-arms cannot stack duplicate requests. A no-op on a non-descending
+  /// backend or a `dir` that is not live.
+  fn start_rearm(&mut self, dir: WatchId) {
+    if self.descends()
+      && self.nodes.get(&dir).is_some_and(|node| node.live)
+      && self.rearm_dirs.insert(dir)
+    {
+      self.queue_enumerate(dir, true);
+    }
+  }
+
+  /// Transfers a re-arm obligation onto `watch` — a watch that has just replaced a
+  /// mid-re-arm one. Re-arms it now if it is already live; otherwise marks it so its
+  /// post-arm enumerate continues the re-arm, since `start_rearm` is a no-op on a
+  /// not-yet-live watch and a pending target's obligation must survive until it arms.
+  fn inherit_rearm(&mut self, watch: WatchId) {
+    if self.nodes.get(&watch).is_some_and(|node| node.live) {
+      self.start_rearm(watch);
+    } else {
+      self.rearming.insert(watch);
+    }
+  }
+
+  /// Rebuilds `dir`'s direct children against a COMPLETE fresh enumerate during a
+  /// rescan re-arm — all without emitting `Created` (the consumer re-scans content off
+  /// the `Rescan`). This is the second half of the overflow dual obligation: re-walk to
+  /// re-arm the proto's own watch set, so a subtree created during the overflow gap is
+  /// not left unwatched. Incomplete reads route to
+  /// [`handle_incomplete_enumerate`](Self::handle_incomplete_enumerate) instead.
+  ///
+  /// Overflow can hide a same-name delete+recreate, and the primitive-agnostic Monitor
+  /// carries no identity (`dev_ino`) to tell a replacement from the original — so it
+  /// conservatively drops EVERY existing child watch (pruning vanished names and
+  /// replacing present ones alike) and installs a fresh watch for each present
+  /// directory, marked to continue the re-arm so its subtree rebuilds recursively.
+  /// Detecting a same-name replacement *without* this rebuild needs the wd-reuse /
+  /// inode identity the inotify sub-machine supplies (§6); until then, rebuilding the
+  /// affected children on overflow is the safe choice.
+  fn rearm_enumerate(&mut self, dir: WatchId, scope: ScopeId, res: &EnumerateResult) {
+    let existing: std::vec::Vec<WatchId> = self
+      .child_index
+      .iter()
+      .filter(|((parent, _), _)| *parent == dir)
+      .map(|(_, &child)| child)
+      .collect();
+    for child in existing {
+      self.drop_subtree(child);
+    }
+    for entry in res.entries() {
+      if !entry.is_dir() {
+        continue;
+      }
+      self.install_child(dir, scope, entry.name().clone(), true);
+      if let Some(fresh) = self.child_watch(dir, entry.name()) {
+        self.rearming.insert(fresh);
+      }
     }
   }
 
@@ -328,9 +514,14 @@ impl Monitor {
       Ok(()) => {
         node.live = true;
         if is_dir && self.descends() {
-          let req = self.next_req_id();
-          self.pending_enumerate.insert(req, id);
-          self.actions.push_back(Action::enumerate(req, id));
+          // Continue a rescan re-arm into this freshly-armed directory if it was
+          // installed as part of one (coalesced); otherwise a normal discovery
+          // enumerate.
+          if self.rearming.remove(&id) {
+            self.start_rearm(id);
+          } else {
+            self.queue_enumerate(id, false);
+          }
         }
       }
       // Reconstruct the location while the node still exists, then drop it: a
@@ -343,7 +534,8 @@ impl Monitor {
   }
 
   /// Turns a notification-queue overflow into a [`ChangeKind::Rescan`] covering
-  /// exactly the affected scope, so nothing is silently lost.
+  /// exactly the affected scope AND reconciles the proto's own watch set for it, so
+  /// nothing is silently lost and no post-overflow subtree is left unwatched.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn on_overflow(&mut self, scope: Scope, _now: Instant) {
     match scope {
@@ -351,23 +543,33 @@ impl Monitor {
         let roots: std::vec::Vec<(ScopeId, WatchId)> =
           self.roots.iter().map(|(s, w)| (*s, *w)).collect();
         for (scope_id, root) in roots {
-          self.emit_rescan(scope_id, self.location_of(root));
+          self.rescan_and_rearm(scope_id, root);
         }
       }
       Scope::Root(scope_id) => {
-        let location = self
-          .roots
-          .get(&scope_id)
-          .map(|root| self.location_of(*root))
-          .unwrap_or_default();
-        self.emit_rescan(scope_id, location);
+        // Only a registered scope has a watch set to reconcile; an overflow
+        // reported for an unregistered or already-torn-down scope is dropped
+        // rather than emitting a Rescan for a scope the Monitor no longer covers
+        // (the `Subtree` arm below guards symmetrically via `scope_of`).
+        if let Some(&root) = self.roots.get(&scope_id) {
+          self.rescan_and_rearm(scope_id, root);
+        }
       }
       Scope::Subtree(watch) => {
         if let Some(scope_id) = self.scope_of(watch) {
-          self.emit_rescan(scope_id, self.location_of(watch));
+          self.rescan_and_rearm(scope_id, watch);
         }
       }
     }
+  }
+
+  /// Emits an overflow [`ChangeKind::Rescan`] for a scope AND re-enumerates `dir` in
+  /// re-arm mode ([`rearm_enumerate`](Self::rearm_enumerate)) so directories created
+  /// during the overflow gap are re-armed and vanished ones pruned — both halves of
+  /// the dual obligation. A no-op re-arm on a non-descending backend or a dead `dir`.
+  fn rescan_and_rearm(&mut self, scope: ScopeId, dir: WatchId) {
+    self.emit_rescan(scope, self.location_of(dir));
+    self.start_rearm(dir);
   }
 
   /// Advances time, resolving move halves whose pairing window has elapsed: an
@@ -439,30 +641,26 @@ impl Monitor {
   }
 
   fn on_moved_from(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) {
-    let from = self.record_location(rec);
     let from_parent = rec.watch();
-    let from_watch = rec
+    let src = rec
       .name()
       .and_then(|name| self.child_watch(rec.watch(), name));
-    // Eager-drop a watched-directory source the moment it moves away: free its
-    // `(parent, name)` slot and subtree NOW, before recording the half. This lets a
-    // replacement arriving at the same path during the pending window install its
-    // own watch (the slot is no longer occupied by a stale entry), and stops the
-    // dead watch from delivering records for a path the object has left. Coverage
-    // at a rename's destination is re-armed later from the `MovedTo` record, so the
-    // half need not reference the dropped source. Dropping before the insert also
-    // means this drop's `purge_pending_moves` runs while the new half is not yet
-    // present, so it cannot purge the half we record.
-    if let Some(src) = from_watch {
-      self.drop_subtree(src);
-    }
-    match rec.cookie() {
-      Some(cookie) => {
+    match (rec.cookie(), rec.name()) {
+      (Some(cookie), Some(name)) => {
+        // Detach a watched-directory source from its old `(parent, name)` slot the
+        // moment it moves away, but KEEP its subtree: a paired `MovedTo` reparents it
+        // in O(1) (descendants follow for free), and until then detaching has already
+        // freed the old path for a replacement to install its own watch. An unpaired
+        // half tears the held subtree down when it resolves (`resolve_stored_half`).
+        if let Some(src) = src {
+          self.detach_child(src);
+        }
         let pending = PendingMove {
-          from,
+          from_parent,
+          from_name: name.clone(),
           scope,
           deadline: now + self.move_window,
-          from_parent,
+          held: src,
         };
         // Invariant (d): the cookie is namespaced by scope, so only a *same-scope*
         // reused/colliding cookie collides on this composite key. The displaced
@@ -472,9 +670,16 @@ impl Monitor {
           self.resolve_stored_half(displaced);
         }
       }
-      // A no-cookie source is resolved immediately; its `from_parent` is `rec.watch()`,
-      // which is live by construction (`scope_of` succeeded), so no guard is needed.
-      None => self.resolve_lost_source(scope, from),
+      // A no-cookie (or degenerate nameless) source can never pair: tear its subtree
+      // down now and emit the `Removed`. `from_parent` is `rec.watch()`, live by
+      // construction (`scope_of` succeeded), so no liveness guard is needed.
+      _ => {
+        if let Some(src) = src {
+          self.drop_subtree(src);
+        }
+        let from = self.record_location(rec);
+        self.resolve_lost_source(scope, from);
+      }
     }
   }
 
@@ -489,25 +694,65 @@ impl Monitor {
       // a fresh `Created` via the `None` arm). A matched half pairs only before its
       // window elapses; past it the source already stranded (a late destination).
       Some(pending) if !now.reached(pending.deadline) => {
-        // A validated rename: emit the move (coverage re-armed below).
-        self.emit(scope, to, ChangeKind::Moved(pending.from));
+        match (rec.name(), pending.held) {
+          // Held directory: attempt the O(1) reparent and emit the pairing only once
+          // it succeeds — a `Moved` must never precede a rejected/aborted reparent.
+          (Some(name), Some(src)) => {
+            if self.can_reparent(src, rec.watch()) && self.reparent(src, rec.watch(), name.clone())
+            {
+              self.emit_pair(scope, to, &pending);
+            } else {
+              // Not reparentable: a dead or cyclic held source, or a reparent that
+              // aborted because the held source sat inside the (now torn-down)
+              // destination. Tear down any surviving held subtree; reconcile the
+              // destination as a fresh move-in if its parent survived, else escalate
+              // with a `Rescan` — never a `Moved` into a path we no longer cover.
+              if self.is_watched(src) {
+                self.drop_subtree(src);
+              }
+              if self.is_watched(rec.watch()) {
+                self.emit_pair(scope, to, &pending);
+                self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+              } else {
+                self.emit_rescan(scope, to);
+              }
+            }
+          }
+          // Non-directory (or unwatched) source: emit the pairing and reconcile the slot.
+          (Some(name), None) => {
+            self.emit_pair(scope, to, &pending);
+            self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+          }
+          (None, held) => {
+            if let Some(src) = held {
+              self.drop_subtree(src);
+            }
+            self.emit_pair(scope, to, &pending);
+          }
+        }
       }
       Some(pending) => {
-        // Late destination (past the window): the source stranded. Resolve it into a
-        // `Removed` (guarded — a dead source emits nothing), and treat the arrival as
-        // a fresh object moved into the slot.
+        // Late destination (past the window): the source stranded. Resolve it (drops
+        // the held subtree, emits a guarded `Removed`). Then treat the arrival as a
+        // fresh object — but only if the destination parent survived that teardown (a
+        // cyclic/descendant late destination sits inside the held source, so dropping
+        // it removes `rec.watch()`); otherwise escalate with a `Rescan`.
         self.resolve_stored_half(pending);
-        self.emit(scope, to, ChangeKind::Created);
+        if self.is_watched(rec.watch()) {
+          self.emit(scope, to, ChangeKind::Created);
+          if let Some(name) = rec.name() {
+            self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+          }
+        } else {
+          self.emit_rescan(scope, to);
+        }
       }
       None => {
         self.emit(scope, to, ChangeKind::Created);
+        if let Some(name) = rec.name() {
+          self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+        }
       }
-    }
-    // A `MovedTo` brings a definitively-NEW object to the slot (`replaced = true`),
-    // so any stale watch there is dropped before re-arming. Runs for every arm, so
-    // coverage at the destination is reconciled however the move resolved.
-    if let Some(name) = rec.name() {
-      self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
     }
   }
 
@@ -520,10 +765,115 @@ impl Monitor {
   /// Such a half is dead — its source path no longer exists — and must NOT emit a
   /// stale `Removed`, however it later leaves the map. This single liveness guard
   /// covers every stored-half resolution site (invariants b/c).
+  ///
+  /// A held source subtree — kept only to enable an O(1) reparent — never paired, so
+  /// it is torn down here (a no-op if a `from_parent` teardown already reclaimed it
+  /// through the parent-link walk).
   fn resolve_stored_half(&mut self, pending: PendingMove) {
-    if self.is_watched(pending.from_parent) {
-      self.resolve_lost_source(pending.scope, pending.from);
+    if let Some(src) = pending.held {
+      self.drop_subtree(src);
     }
+    if self.is_watched(pending.from_parent) {
+      let from = self.pending_from(&pending);
+      self.resolve_lost_source(pending.scope, from);
+    }
+  }
+
+  /// The current source location of a pending half, reconstructed from its slot
+  /// `(from_parent, from_name)` so it tracks any reparent of the source's ancestor.
+  fn pending_from(&self, pending: &PendingMove) -> Location {
+    self.child_location(pending.from_parent, &pending.from_name)
+  }
+
+  /// Emits the outcome of a paired `MovedTo`: a `Moved` when the source is still
+  /// anchored, otherwise a fresh `Created`. Liveness is checked *now*, not snapshotted
+  /// earlier — a reparent can have dropped `from_parent` (its destination slot may be
+  /// the source's own parent), and a `Moved` reconstructed off a dropped parent would
+  /// carry a wrong from-path.
+  fn emit_pair(&mut self, scope: ScopeId, to: Location, pending: &PendingMove) {
+    if self.is_watched(pending.from_parent) {
+      let from = self.pending_from(pending);
+      self.emit(scope, to, ChangeKind::Moved(from));
+    } else {
+      self.emit(scope, to, ChangeKind::Created);
+    }
+  }
+
+  /// Detaches a child watch from its `(parent, name)` slot without tearing down its
+  /// subtree. The node stays in `nodes` (still attributing records, at its pre-move
+  /// path) so a paired [`MovedTo`](Self::on_moved_to) can [`reparent`](Self::reparent)
+  /// it; freeing the slot lets a replacement at the old path install its own watch.
+  fn detach_child(&mut self, child: WatchId) {
+    if let Some(node) = self.nodes.get(&child)
+      && let (Some(parent), Some(name)) = (node.parent, node.name.clone())
+    {
+      self.child_index.remove(&(parent, name));
+    }
+  }
+
+  /// Reparents a held subtree onto a new `(parent, name)` edge in O(1): re-keys the
+  /// node and its child-index entry. Descendants follow their unchanged parent links,
+  /// so their paths reconstruct through the new location with no re-enumerate and no
+  /// per-descendant `Created`. Any stale watch already occupying the destination is a
+  /// different, now-replaced object and is torn down first — and its in-flight re-arm
+  /// obligation (if any) transfers to the reparented subtree, so a raced overflow
+  /// re-arm is not lost.
+  ///
+  /// Returns whether the re-key happened. It does NOT if dropping the stale
+  /// destination also removed `child` — the adversarial case where the held source sat
+  /// inside the destination slot — leaving nothing to re-key; the caller escalates.
+  /// The caller is responsible for the acyclic precondition ([`can_reparent`]).
+  ///
+  /// [`can_reparent`]: Self::can_reparent
+  fn reparent(&mut self, child: WatchId, new_parent: WatchId, new_name: Segment) -> bool {
+    let mut inherit_rearm = false;
+    if let Some(stale) = self.child_watch(new_parent, &new_name)
+      && stale != child
+    {
+      // The replaced destination may be mid-re-arm — either enumerating (`rearm_dirs`)
+      // or armed-and-pending its re-arm enumerate (`rearming`). Either way the
+      // obligation must pass to the reparented subtree, not vanish with the drop.
+      inherit_rearm = self.rearm_dirs.contains(&stale) || self.rearming.contains(&stale);
+      self.drop_subtree(stale);
+    }
+    // Dropping the stale destination can have removed `child` itself (the held source
+    // sat inside that slot). Only re-key when both endpoints survive.
+    if !self.is_watched(child) || !self.is_watched(new_parent) {
+      return false;
+    }
+    if let Some(node) = self.nodes.get_mut(&child) {
+      node.parent = Some(new_parent);
+      node.name = Some(new_name.clone());
+    }
+    self.child_index.insert((new_parent, new_name), child);
+    if inherit_rearm {
+      self.inherit_rearm(child);
+    }
+    true
+  }
+
+  /// Whether `child`'s subtree may be reparented under `new_parent`: both must be
+  /// live and the move must be acyclic — `new_parent` may be neither `child` itself
+  /// nor any node within `child`'s subtree, or path reconstruction would loop.
+  fn can_reparent(&self, child: WatchId, new_parent: WatchId) -> bool {
+    self.is_watched(child)
+      && self.is_watched(new_parent)
+      && new_parent != child
+      && !self.is_descendant(new_parent, child)
+  }
+
+  /// Whether `maybe_descendant` lies within `ancestor`'s subtree, walking parent
+  /// links to a root. Bounded by the node count so a malformed tree cannot loop.
+  fn is_descendant(&self, maybe_descendant: WatchId, ancestor: WatchId) -> bool {
+    let mut cursor = Some(maybe_descendant);
+    for _ in 0..=self.nodes.len() {
+      match cursor {
+        Some(id) if id == ancestor => return true,
+        Some(id) => cursor = self.nodes.get(&id).and_then(|node| node.parent),
+        None => break,
+      }
+    }
+    false
   }
 
   /// Resolves a source half that found no destination: the object left this
@@ -572,10 +922,18 @@ impl Monitor {
     }
     match occupant {
       SlotOccupant::Dir => {
+        // Replacing a mid-re-arm watch must not lose its re-arm obligation: capture it
+        // before the drop and pass it to the fresh watch, so a subtree being re-armed
+        // during an overflow stays covered when a move-in replaces its slot.
+        let mut inherit = false;
         if replaced && let Some(stale) = self.child_watch(parent, name) {
+          inherit = self.rearm_dirs.contains(&stale) || self.rearming.contains(&stale);
           self.drop_subtree(stale);
         }
         self.install_child(parent, scope, name.clone(), true);
+        if inherit && let Some(fresh) = self.child_watch(parent, name) {
+          self.inherit_rearm(fresh);
+        }
       }
       SlotOccupant::File | SlotOccupant::Gone => {
         if let Some(stale) = self.child_watch(parent, name) {
@@ -680,10 +1038,18 @@ impl Monitor {
         // a path could resolve through a dropped node.
         if node.parent.is_none() {
           self.roots.remove(&node.scope);
-        } else if let (Some(parent), Some(name)) = (node.parent, node.name) {
+        } else if let (Some(parent), Some(name)) = (node.parent, node.name)
+          // Clear the slot only if it still points to THIS node: a detached-and-held
+          // move source keeps its old `(parent, name)`, and a replacement may have
+          // taken that slot since — dropping the stale source must not orphan it.
+          && self.child_index.get(&(parent, name.clone())) == Some(&id)
+        {
           self.child_index.remove(&(parent, name));
         }
         removed.insert(id);
+        self.rearming.remove(&id);
+        self.rearm_dirs.remove(&id);
+        self.rearm_attempts.remove(&id);
         self.actions.push_back(Action::Unwatch(id));
       }
     }
@@ -724,7 +1090,13 @@ impl Monitor {
   fn location_of(&self, id: WatchId) -> Location {
     let mut segments = std::vec::Vec::new();
     let mut cursor = Some(id);
-    while let Some(current) = cursor {
+    // Bounded by the node count: reparent guards keep the tree acyclic, but a walk
+    // that never reaches a root would otherwise loop — a path cannot exceed the
+    // number of live nodes.
+    for _ in 0..self.nodes.len() {
+      let Some(current) = cursor else {
+        break;
+      };
       let Some(node) = self.nodes.get(&current) else {
         break;
       };
