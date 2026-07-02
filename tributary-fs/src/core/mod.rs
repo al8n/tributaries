@@ -37,13 +37,6 @@ mod tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ProbeId(u64);
 
-impl ProbeId {
-  /// The raw correlation value.
-  pub(crate) const fn get(self) -> u64 {
-    self.0
-  }
-}
-
 /// What an executed probe (an `lstat` of one path) found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {

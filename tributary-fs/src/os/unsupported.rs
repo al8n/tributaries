@@ -33,6 +33,8 @@ impl SourceHandle {
   }
 
   /// The resume point minted so far.
+  // Journal resume is deferred surface; minted, not yet consumed.
+  #[allow(dead_code)]
   pub(crate) fn resume_token(&self) -> Option<ResumeToken> {
     match *self {}
   }
