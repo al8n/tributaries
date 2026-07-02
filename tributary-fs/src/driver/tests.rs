@@ -178,7 +178,7 @@ async fn watch(rig: &Rig, root: &str) -> ScopeId {
     })
     .await
     .unwrap();
-  on_reply.await.unwrap().expect("watch succeeds")
+  on_reply.await.unwrap().expect("watch succeeds").0
 }
 
 fn ev(path: &str, flags: FsEventFlags, event_id: u64, file_id: u64) -> RawOsEvent {

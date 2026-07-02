@@ -165,6 +165,8 @@ pub(crate) struct SourceHandle {
   queue: Option<DispatchRetained<DispatchQueue>>,
   shared: Arc<CallbackShared>,
   roots: Vec<PathBuf>,
+  // Read only by the deferred journal-resume surface.
+  #[allow(dead_code)]
   device_uuid: Option<[u8; 16]>,
 }
 
@@ -177,6 +179,8 @@ impl SourceHandle {
   }
 
   /// The resume point minted so far, if the journal ids are still valid.
+  // Journal resume is deferred surface; minted, not yet consumed.
+  #[allow(dead_code)]
   pub(crate) fn resume_token(&self) -> Option<ResumeToken> {
     if self.shared.ids_wrapped.load(Ordering::Acquire) {
       return None;

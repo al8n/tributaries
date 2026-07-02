@@ -30,6 +30,10 @@ macro_rules! flag_predicate {
   };
 }
 
+// The complete header flag vocabulary is declared even where the driver does
+// not yet consult it (own-event marking, hardlink and clone classes are
+// deferred surface), and the raw-word accessors serve the test suites.
+#[allow(dead_code)]
 impl FsEventFlags {
   /// Wraps a raw flag word.
   #[inline]

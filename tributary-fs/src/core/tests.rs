@@ -1,6 +1,5 @@
 use super::*;
 use std::time::Duration;
-use tributary_proto::ChangeKind;
 
 const WINDOW: Duration = Duration::from_millis(100);
 
