@@ -41,6 +41,9 @@ jobs:
         run: |
           tokeit --lang rust
       - name: Upload total loc to GitHub Gist
+        # Skipped on forks / when the gist token is not configured, so the run does
+        # not fail on a missing secret.
+        if: ${{ secrets.GIST_PAT != '' }}
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GIST_PAT }}
@@ -51,7 +54,7 @@ jobs:
             await github.rest.gists.update({
               gist_id: gistId,
               files: {
-                "template-rs": {
+                "tributaries": {
                   content: output
                 }
               }
