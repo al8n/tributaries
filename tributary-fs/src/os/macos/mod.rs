@@ -1,0 +1,244 @@
+//! The macOS FSEvents backend.
+//!
+//! One native `FSEventStream` per spawn, callbacks on a private serial
+//! dispatch queue, full decode inside the callback (only owned Rust data ever
+//! crosses the channel), and a teardown that is provably callback-free before
+//! any state is released: the serial queue totally orders a synchronous
+//! Stop+Invalidate block against every callback, and the context release hook
+//! ties the shared state's lifetime to the stream itself by refcount.
+
+mod decode;
+mod ffi;
+#[cfg(test)]
+mod tests;
+
+use std::{
+  fs, io,
+  os::unix::fs::MetadataExt,
+  path::PathBuf,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+  },
+};
+
+use dispatch2::{DispatchQueue, DispatchRetained};
+use objc2_core_services::{
+  FSEventStreamInvalidate, FSEventStreamRef, FSEventStreamRelease, FSEventStreamStop,
+  kFSEventStreamEventIdSinceNow,
+};
+
+use super::{EventReceiver, MAX_EXCLUSIONS, ResumeToken, SourceConfig, SourceError, SourceMessage};
+
+/// The state the event callback reads. Owned jointly by the [`SourceHandle`]
+/// and — via the context release hook — by the stream itself, so it outlives
+/// whichever dies last.
+pub(super) struct CallbackShared {
+  /// The callback's non-blocking transmit end.
+  pub(super) sender: async_channel::Sender<SourceMessage>,
+  /// Turns the callback into a no-op the moment teardown begins (belt; the
+  /// on-queue Stop+Invalidate barrier is the suspenders).
+  pub(super) stopped: AtomicBool,
+  /// Set after a callback panic; the stream delivers nothing further.
+  pub(super) poisoned: AtomicBool,
+  /// Latched when data had to be dropped (a full channel, an undecodable
+  /// entry); drained by the next callback or the handle's
+  /// [`take_overflow`](SourceHandle::take_overflow).
+  pub(super) overflowed: AtomicBool,
+  /// Highest journal event id seen while in sync. Zero means none: id zero
+  /// itself (the `ROOT_CHANGED` marker) is never recorded, and ids arriving
+  /// with a lost-sync flag do not advance it.
+  pub(super) last_good: AtomicU64,
+  /// The journal's id counter wrapped; every stored id is invalid for resume.
+  pub(super) ids_wrapped: AtomicBool,
+}
+
+/// The raw stream pointer.
+///
+/// Control calls (`SetDispatchQueue`/`Start`/`Stop`/`Invalidate`/`Release`)
+/// have no thread affinity — the dispatch-queue delivery model decouples the
+/// callback venue from the control venue — so the pointer may move between
+/// threads. Deliberately NOT `Sync`: every use is `&mut`/consuming.
+#[derive(Clone, Copy)]
+struct StreamPtr(FSEventStreamRef);
+
+// SAFETY: see the type docs — FSEvents control calls are venue-agnostic, and
+// the handle serializes all uses.
+unsafe impl Send for StreamPtr {}
+
+/// The spawn entry point of the FSEvents backend.
+pub(crate) struct Source;
+
+impl Source {
+  /// Creates, schedules, and starts one FSEvents stream over
+  /// `config.roots`, delivering decoded batches on the returned receiver.
+  ///
+  /// On any partial failure the stream is invalidated and released before the
+  /// error returns: a handle existing means created + scheduled + started.
+  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, EventReceiver), SourceError> {
+    if config.roots.is_empty() {
+      return Err(SourceError::NoRoots);
+    }
+    if config.exclusions.len() > MAX_EXCLUSIONS {
+      return Err(SourceError::TooManyExclusions {
+        supplied: config.exclusions.len(),
+      });
+    }
+
+    // Resolve every root through realpath AND the same CoreFoundation
+    // filesystem-representation transform the event decode uses, so prefix
+    // comparison can never drift on Unicode normalization (FSEvents reports
+    // decomposed bytes) or on a symlinked root (watching the symlink itself
+    // would deliver nothing).
+    let mut roots = Vec::with_capacity(config.roots.len());
+    for root in &config.roots {
+      let canonical = fs::canonicalize(root).map_err(|source| SourceError::RootUnavailable {
+        root: root.clone(),
+        source,
+      })?;
+      let canonical =
+        ffi::fs_representation_of(&canonical).ok_or_else(|| SourceError::RootUnavailable {
+          root: root.clone(),
+          source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the path has no filesystem representation",
+          ),
+        })?;
+      roots.push(canonical);
+    }
+    let root_dev = fs::metadata(&roots[0])
+      .map_err(|source| SourceError::RootUnavailable {
+        root: roots[0].clone(),
+        source,
+      })?
+      .dev() as libc::dev_t;
+
+    let (sender, receiver) = async_channel::bounded(config.channel_capacity.get());
+    let shared = Arc::new(CallbackShared {
+      sender,
+      stopped: AtomicBool::new(false),
+      poisoned: AtomicBool::new(false),
+      overflowed: AtomicBool::new(false),
+      last_good: AtomicU64::new(0),
+      ids_wrapped: AtomicBool::new(false),
+    });
+
+    let queue = DispatchQueue::new("tributary-fs.fsevents", None);
+    #[cfg(debug_assertions)]
+    ffi::mark_stream_queue(&queue);
+
+    let since = config
+      .since
+      .map(|token| token.last_good())
+      .unwrap_or(kFSEventStreamEventIdSinceNow);
+    let stream = ffi::create_scheduled_stream(&shared, &roots, since, config.latency, &queue)?;
+
+    if !config.exclusions.is_empty() && !ffi::set_exclusions(stream.0, &config.exclusions) {
+      ffi::invalidate_and_release(stream.0);
+      return Err(SourceError::ExclusionRejected);
+    }
+
+    if !ffi::start(stream.0) {
+      ffi::invalidate_and_release(stream.0);
+      return Err(SourceError::StartFailed);
+    }
+
+    let device_uuid = ffi::device_uuid(root_dev);
+    Ok((
+      SourceHandle {
+        stream: Some(stream),
+        queue: Some(queue),
+        shared,
+        roots,
+        device_uuid,
+      },
+      receiver,
+    ))
+  }
+}
+
+/// A live FSEvents stream. Dropping it tears the stream down; prefer
+/// [`shutdown`](Self::shutdown) at an orderly exit.
+pub(crate) struct SourceHandle {
+  /// `None` once torn down — teardown runs exactly once.
+  stream: Option<StreamPtr>,
+  queue: Option<DispatchRetained<DispatchQueue>>,
+  shared: Arc<CallbackShared>,
+  roots: Vec<PathBuf>,
+  device_uuid: Option<[u8; 16]>,
+}
+
+impl SourceHandle {
+  /// Drains the overflow latch: whether data was dropped since the last call.
+  /// The receiver observing a full channel guarantees at least one more
+  /// message follows, so a post-receive drain can never miss the signal.
+  pub(crate) fn take_overflow(&self) -> bool {
+    self.shared.overflowed.swap(false, Ordering::AcqRel)
+  }
+
+  /// The resume point minted so far, if the journal ids are still valid.
+  pub(crate) fn resume_token(&self) -> Option<ResumeToken> {
+    if self.shared.ids_wrapped.load(Ordering::Acquire) {
+      return None;
+    }
+    match self.shared.last_good.load(Ordering::Acquire) {
+      0 => None,
+      id => Some(ResumeToken::new(id, self.device_uuid)),
+    }
+  }
+
+  /// The canonicalized (realpath + filesystem-representation) roots the
+  /// stream watches — the byte-exact prefixes event paths arrive under.
+  pub(crate) fn roots(&self) -> &[PathBuf] {
+    &self.roots
+  }
+
+  /// Quiesces and destroys the stream. Blocks for at most the tail of one
+  /// in-flight callback batch. Must not be called from the stream's own
+  /// dispatch queue (structurally impossible for consumers; debug-asserted).
+  pub(crate) fn shutdown(mut self) {
+    self.teardown();
+  }
+
+  fn teardown(&mut self) {
+    let Some(stream) = self.stream.take() else {
+      return;
+    };
+    self.shared.stopped.store(true, Ordering::Release);
+    let queue = self
+      .queue
+      .take()
+      .expect("the queue lives exactly as long as the stream");
+    #[cfg(debug_assertions)]
+    ffi::debug_assert_off_stream_queue();
+    // The private queue is serial, so this block is totally ordered against
+    // every callback: when exec_sync returns no callback is running, Stop has
+    // unregistered the client, and Invalidate has unscheduled the stream —
+    // none will run again.
+    queue.exec_sync(move || {
+      // Rebind the whole wrapper so the closure captures the Send type, not
+      // the raw pointer field (disjoint closure capture would otherwise).
+      let stream = stream;
+      // SAFETY: the stream is live (teardown runs once) and Stop→Invalidate
+      // is the header-mandated order for a scheduled stream.
+      unsafe {
+        FSEventStreamStop(stream.0);
+        FSEventStreamInvalidate(stream.0);
+      }
+    });
+    // Drops the create-time refcount. Deallocation — whenever the framework
+    // performs it — runs the context release hook, which frees the stream's
+    // strong count on the shared state; the handle's own Arc keeps the state
+    // alive meanwhile, so freeing is safe regardless of timing.
+    //
+    // SAFETY: this pairs with the implicit +1 from FSEventStreamCreate.
+    unsafe { FSEventStreamRelease(stream.0) };
+    drop(queue);
+  }
+}
+
+impl Drop for SourceHandle {
+  fn drop(&mut self) {
+    self.teardown();
+  }
+}

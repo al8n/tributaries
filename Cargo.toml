@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tributary-proto"]
+members = ["tributary-fs", "tributary-proto"]
 
 [workspace.package]
 version = "0.1.0"
