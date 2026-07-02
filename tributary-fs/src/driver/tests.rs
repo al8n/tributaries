@@ -238,7 +238,10 @@ async fn watch(rig: &Rig, root: &str) -> ScopeId {
     })
     .await
     .unwrap();
-  on_reply.await.unwrap().expect("watch succeeds").0
+  let grant = on_reply.await.unwrap().expect("watch succeeds");
+  let scope = grant.scope();
+  grant.defuse();
+  scope
 }
 
 fn ev(path: &str, flags: FsEventFlags, event_id: u64, file_id: u64) -> RawOsEvent {
@@ -615,6 +618,136 @@ async fn lagged_root_death_delivers_the_terminal_rescan() {
   assert!(second.epoch() > first.epoch());
   // The teardown runs on the blocking pool in real time; give its thread
   // scheduler slices instead of trusting one paused-time sleep.
+  for _ in 0..100 {
+    if rig.fs.shutdowns() == 1 {
+      break;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncommitted_watch_grant_unwinds_the_stream() {
+  let rig = rig_with_capacity(64);
+
+  // The reply receiver stays ALIVE while the driver spawns the stream and
+  // sends the grant — then drops without ever being polled, the shape of a
+  // watch() future cancelled after the reply landed. The unread grant must
+  // unwind the stream it owns.
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/r"),
+      interest: tributary_proto::Interest::all(),
+      reply,
+    })
+    .await
+    .unwrap();
+  for _ in 0..50 {
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  drop(on_reply);
+
+  for _ in 0..100 {
+    if rig.fs.shutdowns() == 1 {
+      break;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(
+    rig.fs.shutdowns(),
+    1,
+    "a delivered-but-never-polled grant unwinds its stream"
+  );
+}
+
+#[tokio::test(start_paused = true)]
+async fn control_overflow_discards_queued_data() {
+  let rig = rig_with_capacity(64);
+  let _scope = watch(&rig, "/r").await;
+  let tap = rig.fs.tap("/r");
+
+  // Batches queue on data, then the loss signal lands on control. The driver
+  // may legally process a batch that wins the select BEFORE it observes the
+  // control message — but once the covering Rescan is minted, nothing from
+  // these pre-loss batches may follow it.
+  for (id, name) in [(1u64, "/r/a"), (2, "/r/b"), (3, "/r/c")] {
+    tap
+      .send(SourceMessage::Batch(vec![ev(
+        name,
+        FsEventFlags::ITEM_CREATED,
+        id,
+        id,
+      )]))
+      .await
+      .unwrap();
+  }
+  rig
+    .fs
+    .control_tap("/r")
+    .send(SourceMessage::Overflow)
+    .await
+    .unwrap();
+
+  let mut seen = Vec::new();
+  while let Ok(Ok((_, change))) =
+    tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
+  {
+    seen.push(change);
+  }
+  let rescan_at = seen
+    .iter()
+    .position(|c| c.kind().is_rescan())
+    .expect("the loss surfaced as a Rescan");
+  assert!(
+    seen[rescan_at + 1..].iter().all(|c| c.kind().is_rescan()),
+    "no pre-loss batch event may follow the covering Rescan: {seen:?}"
+  );
+}
+
+#[tokio::test(start_paused = true)]
+async fn fatal_discards_queued_data() {
+  let rig = rig_with_capacity(64);
+  let _scope = watch(&rig, "/r").await;
+  let tap = rig.fs.tap("/r");
+
+  for (id, name) in [(1u64, "/r/a"), (2, "/r/b")] {
+    tap
+      .send(SourceMessage::Batch(vec![ev(
+        name,
+        FsEventFlags::ITEM_CREATED,
+        id,
+        id,
+      )]))
+      .await
+      .unwrap();
+  }
+  rig
+    .fs
+    .control_tap("/r")
+    .send(SourceMessage::Fatal(SourceError::CallbackPanic))
+    .await
+    .unwrap();
+
+  let mut seen = Vec::new();
+  while let Ok(Ok((_, change))) =
+    tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
+  {
+    seen.push(change);
+  }
+  let rescan_at = seen
+    .iter()
+    .position(|c| c.kind().is_rescan())
+    .expect("death surfaced as the terminal Rescan");
+  assert!(
+    seen[rescan_at + 1..].iter().all(|c| c.kind().is_rescan()),
+    "no pre-death batch event may follow the terminal Rescan: {seen:?}"
+  );
   for _ in 0..100 {
     if rig.fs.shutdowns() == 1 {
       break;
