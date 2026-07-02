@@ -315,4 +315,6 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: ${{ github.repository }}
-          fail_ci_if_error: true
+          # Coverage upload is advisory: a missing token or a transient upload hiccup
+          # must not fail the whole CI run.
+          fail_ci_if_error: false

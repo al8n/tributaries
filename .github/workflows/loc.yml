@@ -24,6 +24,10 @@ on:
 jobs:
   loc:
     runs-on: ubuntu-latest
+    # Mapped to an env var so the upload step's `if:` can gate on it — the `secrets`
+    # context is not available in `if:` conditions.
+    env:
+      GIST_PAT: ${{ secrets.GIST_PAT }}
     steps:
       - uses: actions/checkout@v7
 
@@ -43,10 +47,10 @@ jobs:
       - name: Upload total loc to GitHub Gist
         # Skipped on forks / when the gist token is not configured, so the run does
         # not fail on a missing secret.
-        if: ${{ secrets.GIST_PAT != '' }}
+        if: ${{ env.GIST_PAT != '' }}
         uses: actions/github-script@v9
         with:
-          github-token: ${{ secrets.GIST_PAT }}
+          github-token: ${{ env.GIST_PAT }}
           script: |
             const fs = require('fs');
             const output = fs.readFileSync('tokeit.json', 'utf8');
