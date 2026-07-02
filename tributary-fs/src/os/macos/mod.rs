@@ -45,6 +45,10 @@ pub(super) struct CallbackShared {
   /// entry); drained by the next callback or the handle's
   /// [`take_overflow`](SourceHandle::take_overflow).
   pub(super) overflowed: AtomicBool,
+  /// Latched when the stream died (a callback panic); drained by the
+  /// handle's [`take_fatal`](SourceHandle::take_fatal). The reliable twin of
+  /// the in-band `Fatal` message, which a full channel can drop.
+  pub(super) fatal: AtomicBool,
   /// Highest journal event id seen while in sync. Zero means none: id zero
   /// itself (the `ROOT_CHANGED` marker) is never recorded, and ids arriving
   /// with a lost-sync flag do not advance it.
@@ -119,6 +123,7 @@ impl Source {
       stopped: AtomicBool::new(false),
       poisoned: AtomicBool::new(false),
       overflowed: AtomicBool::new(false),
+      fatal: AtomicBool::new(false),
       last_good: AtomicU64::new(0),
       ids_wrapped: AtomicBool::new(false),
     });
@@ -176,6 +181,14 @@ impl SourceHandle {
   /// message follows, so a post-receive drain can never miss the signal.
   pub(crate) fn take_overflow(&self) -> bool {
     self.shared.overflowed.swap(false, Ordering::AcqRel)
+  }
+
+  /// Drains the fatal latch: whether the stream died (a callback panic)
+  /// since the last call. Reliable where the in-band `Fatal` message is not:
+  /// that message drops on a full channel, and a full channel guarantees
+  /// queued messages whose receipt triggers this drain.
+  pub(crate) fn take_fatal(&self) -> bool {
+    self.shared.fatal.swap(false, Ordering::AcqRel)
   }
 
   /// The resume point minted so far, if the journal ids are still valid.

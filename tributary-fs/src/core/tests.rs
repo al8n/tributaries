@@ -864,3 +864,83 @@ fn history_done_is_swallowed() {
   );
   assert!(emits(&drain(&mut core)).is_empty());
 }
+
+#[test]
+fn lag_entry_purges_the_scopes_queued_emits() {
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 10),
+      ev("/r/b", flags(&[FsEventFlags::ITEM_CREATED]), 2, 11),
+      ev("/r/c", flags(&[FsEventFlags::ITEM_CREATED]), 3, 12),
+    ],
+    at(1),
+  );
+
+  // Deliver only the first queued emit; the rest stay queued behind it.
+  let first = core.poll_effect();
+  assert!(
+    matches!(first, Some(Effect::Emit { .. })),
+    "the first change is offered: {first:?}"
+  );
+  core.on_delivery(scope, Delivery::Refused, at(2));
+
+  // Everything still queued was dominated the moment the refusal minted the
+  // Rescan; the only emit left offerable is that Rescan itself.
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
+    "the queued ordinary emits are purged: {effects:?}"
+  );
+  assert!(
+    emitted[0].kind().is_rescan(),
+    "the parked dominating Rescan is the sole offer"
+  );
+
+  // Accepting it ends the lag; later changes flow again.
+  core.on_delivery(scope, Delivery::Accepted, at(3));
+  core.on_batch(
+    scope,
+    vec![ev("/r/d", flags(&[FsEventFlags::ITEM_CREATED]), 4, 13)],
+    at(4),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(emitted.len(), 1);
+  assert!(emitted[0].kind().is_created());
+}
+
+#[test]
+fn teardown_flushes_a_parked_rescan() {
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 10)],
+    at(1),
+  );
+  let first = core.poll_effect();
+  assert!(matches!(first, Some(Effect::Emit { .. })));
+  core.on_delivery(scope, Delivery::Refused, at(2));
+
+  // The root dies while the scope is lagged: the terminal Rescan replaces the
+  // parked one, and the teardown must still surface it — a consumer that
+  // never learns its coverage ended is the silent-loss failure mode.
+  core.on_source_fatal(scope, at(3));
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
+    "the parked terminal Rescan is flushed at teardown: {effects:?}"
+  );
+  assert!(emitted[0].kind().is_rescan());
+  assert!(
+    effects
+      .iter()
+      .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+    "the dead stream is torn down"
+  );
+}

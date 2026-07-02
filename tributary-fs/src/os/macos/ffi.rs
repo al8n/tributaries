@@ -64,19 +64,8 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
     return;
   }
   let outcome = catch_unwind(AssertUnwindSafe(|| {
-    // Surface a previously latched drop before newer data, so loss is
-    // observed in order. Re-latch if the channel is still full.
-    if shared.overflowed.swap(false, Ordering::AcqRel)
-      && shared.sender.try_send(SourceMessage::Overflow).is_err()
-    {
-      shared.overflowed.store(true, Ordering::Release);
-    }
-
     // SAFETY: forwarded verbatim from the callback contract.
     let batch = unsafe { decode::decode_batch(num_events, event_paths, event_flags, event_ids) };
-    if batch.lossy {
-      shared.overflowed.store(true, Ordering::Release);
-    }
     for event in &batch.events {
       if event.flags.event_ids_wrapped() {
         shared.ids_wrapped.store(true, Ordering::Release);
@@ -85,21 +74,24 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
         shared.last_good.fetch_max(event.event_id, Ordering::AcqRel);
       }
     }
-    if !batch.events.is_empty() {
-      match shared.sender.try_send(SourceMessage::Batch(batch.events)) {
-        Ok(()) => {}
-        Err(async_channel::TrySendError::Full(_)) => {
-          // Never block the dispatch queue: drop the batch, latch the loss.
-          shared.overflowed.store(true, Ordering::Release);
-        }
-        Err(async_channel::TrySendError::Closed(_)) => {}
+    // Never block the dispatch queue: the forwarding protocol drops on a full
+    // channel and latches, with every latch guaranteed a later wake.
+    crate::os::fsevent::forward_batch(&shared.overflowed, batch.events, batch.lossy, |msg| {
+      match shared.sender.try_send(msg) {
+        Ok(()) => crate::os::fsevent::SendOutcome::Sent,
+        Err(async_channel::TrySendError::Full(_)) => crate::os::fsevent::SendOutcome::Full,
+        Err(async_channel::TrySendError::Closed(_)) => crate::os::fsevent::SendOutcome::Closed,
       }
-    }
+    });
   }));
   if outcome.is_err() {
     // A decode bug must not abort the host process; poison the stream and
-    // report in-band instead.
+    // report in-band instead. The latch is the reliable half: a full channel
+    // can drop the message, and a poisoned callback sends nothing further —
+    // the driver drains the latch after every receive and at shutdown, and a
+    // dropped-on-full message guarantees queued messages to receive.
     shared.poisoned.store(true, Ordering::Release);
+    shared.fatal.store(true, Ordering::Release);
     let _ = shared
       .sender
       .try_send(SourceMessage::Fatal(SourceError::CallbackPanic));
