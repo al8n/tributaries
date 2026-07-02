@@ -58,6 +58,20 @@ fn location_push_and_child_descend() {
 }
 
 #[test]
+fn location_join_appends_suffix_segments() {
+  let base = Location::from_segments([Segment::new("a")]);
+  let suffix = Location::from_segments([Segment::new("b"), Segment::new("c")]);
+  let joined = base.join(&suffix);
+  assert_eq!(
+    joined.segments(),
+    &[Segment::new("a"), Segment::new("b"), Segment::new("c")]
+  );
+  assert_eq!(joined.name(), Some(&Segment::new("c")));
+  assert_eq!(joined.clone().join(&Location::new()), joined);
+  assert_eq!(Location::new().join(&suffix), suffix);
+}
+
+#[test]
 fn location_from_iter() {
   let loc: Location = vec![Segment::new("x"), Segment::new("y")]
     .into_iter()

@@ -7,7 +7,7 @@
 
 use crate::{
   id::{Identity, MoveCookie, WatchId},
-  path::Segment,
+  path::{Location, Segment},
 };
 use std::vec::Vec;
 
@@ -380,37 +380,48 @@ impl EnumerateResult {
 /// [`WatchId`] it arrived on, so the core attributes it to a disjoint root in
 /// O(1) without consulting any path index.
 ///
-/// A record addresses the watch itself (a self-event, `name: None`) or one DIRECT
-/// child of the watched directory (`name: Some`). Per-directory backends — the
-/// engine this foundation drives — always satisfy that shape: every event arrives on
-/// the watch of its immediate parent. A kernel-recursive backend (FSEvents,
-/// fanotify-FILESYSTEM) instead reports arbitrarily deep paths on one root watch;
-/// the record shape for those (a root-relative location rather than a single
-/// segment) is designed alongside their drivers, where the real path/identity
-/// vocabulary is known — until then a kernel-recursive `Monitor` only ingests
-/// depth-one records.
+/// A record addresses the watch itself (a self-event, `target: None`) or an
+/// object below the watched directory by a watch-relative [`Location`]
+/// (`target: Some`). How deep that location may reach is the backend's
+/// addressing contract:
+///
+/// - A **per-directory** backend (inotify, fanotify-inode) always produces the
+///   depth-one shape — exactly one segment, the affected DIRECT child — because
+///   every event arrives on the watch of its immediate parent. A descending
+///   `Monitor` enforces this: a deeper record is a driver bug and escalates to a
+///   `Rescan` of the arrival watch rather than being mis-attributed.
+/// - A **kernel-recursive** backend (FSEvents, fanotify-FILESYSTEM) reports
+///   arbitrarily deep paths on its one root watch; its driver lowers each full
+///   path to the root-relative remainder and feeds it as a multi-segment
+///   `target`.
+///
+/// A self-event kind ([`RecordKind::is_self_event`]) never carries a target;
+/// that combination also escalates to a `Rescan` instead of guessing which
+/// object it meant.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OsRecord {
   watch: WatchId,
   kind: RecordKind,
-  name: Option<Segment>,
+  target: Option<Location>,
   is_dir: Option<bool>,
   cookie: Option<MoveCookie>,
   node: Option<Identity>,
 }
 
 impl OsRecord {
-  /// Builds a record for `kind` arriving on `watch`, with no child name, unknown
-  /// directory-ness, no move cookie, and no object identity.
+  /// Builds a record for `kind` arriving on `watch`, with no target (a
+  /// self-event shape), unknown directory-ness, no move cookie, and no object
+  /// identity.
   ///
-  /// Use the `with_*` builders to attach a child name, the directory flag, a
-  /// move-pairing cookie, or the affected object's identity.
+  /// Use the `with_*` builders to attach the affected child's name (or a deeper
+  /// kernel-recursive target), the directory flag, a move-pairing cookie, or the
+  /// affected object's identity.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(watch: WatchId, kind: RecordKind) -> Self {
     Self {
       watch,
       kind,
-      name: None,
+      target: None,
       is_dir: None,
       cookie: None,
       node: None,
@@ -429,11 +440,33 @@ impl OsRecord {
     self.kind
   }
 
-  /// The affected child's name, or `None` when the event targets the watched
-  /// object itself (a self-event).
+  /// The affected object's watch-relative location, or `None` when the event
+  /// targets the watched object itself (a self-event). One segment on a
+  /// per-directory backend; possibly deeper on a kernel-recursive one.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn name(&self) -> Option<&Segment> {
-    self.name.as_ref()
+  pub const fn target(&self) -> Option<&Location> {
+    self.target.as_ref()
+  }
+
+  /// The affected DIRECT child's name — `Some` iff the record addresses exactly
+  /// one segment below its watch (the depth-one shape every per-directory
+  /// backend produces). A deeper kernel-recursive target yields `None`; use
+  /// [`target`](Self::target) for the full form.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn name(&self) -> Option<&Segment> {
+    match &self.target {
+      Some(target) if target.len() == 1 => target.name(),
+      _ => None,
+    }
+  }
+
+  /// How many segments below its watch this record addresses (0 = self-event).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn depth(&self) -> usize {
+    match self.target.as_ref() {
+      Some(target) => target.len(),
+      None => 0,
+    }
   }
 
   /// Whether the affected object is a directory, when the backend reported it
@@ -457,11 +490,23 @@ impl OsRecord {
     self.node
   }
 
-  /// Returns this record with the affected child's name set.
+  /// Returns this record addressing one DIRECT child of its watch — the
+  /// depth-one shape. See [`with_target`](Self::with_target) for the deeper
+  /// kernel-recursive form.
   #[cfg_attr(not(tarpaulin), inline(always))]
   #[must_use]
   pub fn with_name(mut self, name: Segment) -> Self {
-    self.name = Some(name);
+    self.target = Some(Location::from_segments([name]));
+    self
+  }
+
+  /// Returns this record with its full watch-relative target location set. Only
+  /// a kernel-recursive monitor accepts a target deeper than one segment (see
+  /// the type-level addressing contract).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub fn with_target(mut self, target: Location) -> Self {
+    self.target = Some(target);
     self
   }
 

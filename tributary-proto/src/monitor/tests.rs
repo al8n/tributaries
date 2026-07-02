@@ -3,6 +3,7 @@ use crate::{
   action::WatchTarget,
   path::Segment,
   record::{DirEntry, FileKind, IoClass},
+  scope::SubtreeScope,
 };
 use core::num::NonZeroU64;
 use std::{vec, vec::Vec};
@@ -451,7 +452,7 @@ fn overflow_subtree_rescans_that_subtree() {
   let root = live_root(&mut m, scope(1));
   let _ = drain_events(&mut m);
 
-  m.on_overflow(Scope::Subtree(root), at(5));
+  m.on_overflow(Scope::subtree_of(root), at(5));
   let events = drain_events(&mut m);
   assert_eq!(events.len(), 1);
   assert!(events[0].kind().is_rescan());
@@ -3558,7 +3559,7 @@ fn random_op_storm_holds_invariants_and_terminates() {
           }
           m.on_os_record(rec, now);
         }
-        3 => m.on_overflow(scopes[(rng() as usize) % scopes.len()], now),
+        3 => m.on_overflow(scopes[(rng() as usize) % scopes.len()].clone(), now),
         4 => m.handle_timeout(at(step + 1 + rng() % 400)),
         _ => {
           let w = watches[(rng() as usize) % watches.len()];
@@ -3952,7 +3953,7 @@ fn subtree_overflow_on_a_held_source_is_fenced() {
   let _ = drain_events(&mut m);
 
   // A subtree overflow on the held source: fenced — no stale-path Rescan.
-  m.on_overflow(Scope::Subtree(w_d), at(11));
+  m.on_overflow(Scope::subtree_of(w_d), at(11));
   assert!(
     drain_events(&mut m).is_empty(),
     "a subtree overflow on a held source emits no stale-path Rescan"
@@ -4928,4 +4929,391 @@ fn move_create_move_same_paths_is_not_coalesced() {
     "the second rename into /b is delivered — the intervening create at /a breaks dedup"
   );
   assert_eq!(created, 1, "the create at /a is delivered once");
+}
+
+/// A kernel-recursive backend reports arbitrarily deep paths on its one root watch;
+/// the record's multi-segment target must land the change at the joined location,
+/// with no descent and no actions.
+#[test]
+fn deep_created_record_emits_at_joined_location() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a", "b", "new.txt"]))
+      .with_is_dir(false),
+    at(10),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["a", "b", "new.txt"]));
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "a kernel-recursive monitor never descends"
+  );
+}
+
+#[test]
+fn deep_removed_and_modified_records_emit_at_joined_location() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed).with_target(loc(&["a", "b"])),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["a", "c.txt"])),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Attrib).with_target(loc(&["a", "d.txt"])),
+    at(3),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 3);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a", "b"]));
+  assert!(events[1].kind().is_modified());
+  assert_eq!(events[1].location(), &loc(&["a", "c.txt"]));
+  assert!(events[2].kind().is_modified());
+  assert_eq!(events[2].location(), &loc(&["a", "d.txt"]));
+  assert!(drain_actions(&mut m).is_empty());
+}
+
+/// The FSEvents shape: two deep halves sharing a driver-minted cookie (the file id)
+/// pair into a single `Moved` inside the window — source before destination.
+#[test]
+fn deep_move_pair_within_window_emits_single_moved() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "old"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "an in-window source half stays pending"
+  );
+  assert!(
+    m.poll_timeout().is_some(),
+    "the pairing window arms a timer"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["b", "sub", "new"]))
+      .with_cookie(cookie(7)),
+    at(20),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["a", "old"])));
+  assert_eq!(events[0].location(), &loc(&["b", "sub", "new"]));
+  assert!(drain_actions(&mut m).is_empty());
+  assert_eq!(
+    m.poll_timeout(),
+    None,
+    "the consumed half disarms the timer"
+  );
+}
+
+#[test]
+fn deep_moved_from_unpaired_times_out_to_removed() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "gone"]))
+      .with_cookie(cookie(3)),
+    at(10),
+  );
+  assert!(drain_events(&mut m).is_empty());
+
+  m.handle_timeout(at(500));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a", "gone"]));
+}
+
+#[test]
+fn deep_moved_to_without_pending_is_created() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["x", "arrived"]))
+      .with_cookie(cookie(9)),
+    at(10),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["x", "arrived"]));
+}
+
+#[test]
+fn deep_cookieless_moved_from_resolves_immediately() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom).with_target(loc(&["a", "b", "c"])),
+    at(10),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a", "b", "c"]));
+  assert_eq!(m.poll_timeout(), None, "a cookie-less half never waits");
+}
+
+/// A depth-one record under a kernel-recursive monitor still works via the same
+/// target vocabulary (the with_name sugar).
+#[test]
+fn depth_one_record_still_works_under_kernel_recursive() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("top.txt")),
+    at(10),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert_eq!(events[0].location(), &loc(&["top.txt"]));
+}
+
+/// A descending monitor's addressing contract is depth-one; a deeper record is a
+/// driver bug and escalates to a Rescan + re-arm of the arrival watch, never a
+/// mis-attributed delivery.
+#[test]
+fn deep_record_on_descending_monitor_escalates_rescan() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["a", "b"])),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(root)),
+    "the escalation re-arms the arrival watch"
+  );
+}
+
+/// A self-event kind never carries a target; the malformed combination escalates to
+/// a Rescan instead of invalidating the root off a record that addressed a child.
+#[test]
+fn self_event_with_target_escalates_rescan_not_invalidation() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MoveSelf).with_target(loc(&["a"])),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert!(
+    m.is_watched(root),
+    "a malformed self-event must not tear down the root"
+  );
+}
+
+/// FSEvents `MustScanSubDirs` for a deep directory: the located subtree overflow
+/// lands the Rescan at the descent under the root watch — targeted, not whole-root —
+/// and re-arms nothing on a kernel-recursive backend.
+#[test]
+fn located_subtree_overflow_rescans_at_descent_kernel_recursive() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a", "b"]));
+  assert_eq!(events[0].scope(), scope(1));
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "kernel-recursive: the re-arm half is a no-op"
+  );
+
+  // A second located overflow strictly advances the scope's epoch.
+  let first = events[0].epoch();
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(6),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].epoch() > first, "every overflow bumps the epoch");
+}
+
+/// On a descending backend a located overflow re-arms from the nearest watch — the
+/// descent has no watch of its own — while the Rescan still lands at the descent.
+#[test]
+fn located_subtree_overflow_rearms_from_watch_when_descending() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["deep"])).into(),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["deep"]));
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(root)),
+    "the re-arm starts from the nearest watch"
+  );
+}
+
+#[test]
+fn located_overflow_on_unknown_watch_is_dropped() {
+  let mut m = kernel_recursive();
+  let _root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    Scope::subtree_of(WatchId::new(NonZeroU64::new(999).unwrap())),
+    at(5),
+  );
+  assert!(drain_events(&mut m).is_empty());
+}
+
+/// The kernel-recursive twin of the op storm: deep multi-segment targets, located
+/// subtree overflows, root self-events — the FSEvents-shaped input space. The
+/// Monitor must hold its invariants, never descend (no child watches, no
+/// enumerates), and drain to a fixpoint under every schedule.
+#[test]
+fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
+  for seed in 1..=64u64 {
+    let mut m = kernel_recursive();
+    let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(7);
+    let mut rng = || {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      s
+    };
+
+    let roots = [
+      m.register_root(scope(1), Interest::all()),
+      m.register_root(scope(2), Interest::all()),
+    ];
+    while m.poll_action().is_some() {}
+    m.on_watch_result(roots[0], Ok(()));
+    m.on_watch_result(roots[1], Ok(()));
+
+    let names = [seg("a"), seg("b"), seg("c")];
+    let kinds = [
+      RecordKind::Created,
+      RecordKind::Removed,
+      RecordKind::Modified,
+      RecordKind::MovedFrom,
+      RecordKind::MovedTo,
+    ];
+
+    for step in 0..300u64 {
+      while let Some(action) = m.poll_action() {
+        assert!(
+          matches!(action, Action::Unwatch(_)),
+          "a kernel-recursive monitor queues no descent work: {action:?}"
+        );
+      }
+      while m.poll_event().is_some() {}
+      m.assert_invariants();
+
+      let now = at(step + 1);
+      let root = roots[(rng() as usize) % roots.len()];
+      match rng() % 5 {
+        0 | 1 => {
+          let kind = kinds[(rng() as usize) % kinds.len()];
+          let depth = 1 + (rng() as usize) % 3;
+          let target = Location::from_segments(
+            (0..depth).map(|_| names[(rng() as usize) % names.len()].clone()),
+          );
+          let mut rec = OsRecord::new(root, kind)
+            .with_target(target)
+            .with_is_dir(rng() % 2 == 0);
+          if kind.is_move_half() && rng() % 4 != 0 {
+            rec = rec.with_cookie(cookie(1 + rng() % 3));
+          }
+          m.on_os_record(rec, now);
+        }
+        2 => {
+          let sc = match rng() % 3 {
+            0 => Scope::Root(scope(1 + rng() % 2)),
+            1 => Scope::subtree_of(root),
+            _ => {
+              let depth = 1 + (rng() as usize) % 2;
+              let descent = Location::from_segments(
+                (0..depth).map(|_| names[(rng() as usize) % names.len()].clone()),
+              );
+              SubtreeScope::new(root).with_descent(descent).into()
+            }
+          };
+          m.on_overflow(sc, now);
+        }
+        3 => m.handle_timeout(at(step + 1 + rng() % 400)),
+        _ => {
+          let kind = [
+            RecordKind::MoveSelf,
+            RecordKind::DeleteSelf,
+            RecordKind::Ignored,
+          ][(rng() as usize) % 3];
+          m.on_os_record(OsRecord::new(root, kind), now);
+        }
+      }
+    }
+
+    let mut guard = 0u32;
+    while m.poll_action().is_some() {
+      guard += 1;
+      assert!(
+        guard < 100_000,
+        "the kernel-recursive Monitor drains to a fixpoint (seed {seed})"
+      );
+    }
+    m.assert_invariants();
+  }
 }

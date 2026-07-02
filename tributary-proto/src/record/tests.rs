@@ -1,5 +1,5 @@
 use super::*;
-use crate::path::Segment;
+use crate::path::{Location, Segment};
 use core::num::NonZeroU64;
 use std::{string::ToString, vec};
 
@@ -133,6 +133,8 @@ fn os_record_minimal_has_no_optionals() {
   assert_eq!(r.watch(), watch(5));
   assert_eq!(r.kind(), RecordKind::Modified);
   assert_eq!(r.name(), None);
+  assert_eq!(r.target(), None);
+  assert_eq!(r.depth(), 0);
   assert_eq!(r.is_dir(), None);
   assert_eq!(r.cookie(), None);
 }
@@ -143,6 +145,7 @@ fn os_record_builders_attach_optionals() {
     .with_name(Segment::new("child"))
     .with_is_dir(true);
   assert_eq!(r.name(), Some(&Segment::new("child")));
+  assert_eq!(r.depth(), 1);
   assert_eq!(r.is_dir(), Some(true));
   assert_eq!(r.cookie(), None);
 
@@ -151,4 +154,18 @@ fn os_record_builders_attach_optionals() {
     .with_cookie(cookie(0xABCD));
   assert_eq!(moved.cookie(), Some(cookie(0xABCD)));
   assert!(moved.kind().is_move_half());
+}
+
+#[test]
+fn os_record_deep_target_reports_no_direct_name() {
+  let target = Location::from_segments([Segment::new("a"), Segment::new("b")]);
+  let deep = OsRecord::new(watch(5), RecordKind::Created).with_target(target.clone());
+  assert_eq!(deep.target(), Some(&target));
+  assert_eq!(deep.depth(), 2);
+  assert_eq!(deep.name(), None, "a deep target has no direct-child name");
+
+  let one = OsRecord::new(watch(5), RecordKind::Created)
+    .with_target(Location::from_segments([Segment::new("only")]));
+  assert_eq!(one.name(), Some(&Segment::new("only")));
+  assert_eq!(one.depth(), 1);
 }

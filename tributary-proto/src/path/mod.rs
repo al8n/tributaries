@@ -136,6 +136,15 @@ impl Location {
     self.0.push(segment);
     self
   }
+
+  /// Returns this location extended with every segment of `suffix`, descending
+  /// through it (builder form).
+  #[cfg_attr(not(tarpaulin), inline)]
+  #[must_use]
+  pub fn join(mut self, suffix: &Location) -> Self {
+    self.0.extend(suffix.0.iter().cloned());
+    self
+  }
 }
 
 impl Default for Location {

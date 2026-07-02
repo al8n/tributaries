@@ -6,6 +6,23 @@ All notable changes to this workspace are documented here. The format is based o
 
 ## [Unreleased]
 
+### Added
+
+- **`tributary-proto`** — the kernel-recursive addressing vocabulary the FSEvents
+  driver (`tributary-fs`) lowers into:
+  - `OsRecord` now addresses its object by a watch-relative multi-segment
+    `target` `Location` (`with_target`); the depth-one `with_name` shape stays
+    the enforced contract for descending backends, and a violating record — a
+    deep target on a descending monitor, or a self-event kind carrying any
+    target — escalates to a `Rescan` of the arrival watch instead of being
+    mis-attributed;
+  - `Scope::Subtree` carries a `SubtreeScope` (nearest watch + descent), so a
+    targeted deep overflow (FSEvents `MustScanSubDirs`) rescans exactly the
+    affected directory rather than the whole root;
+  - `Location::join` appends one location to another;
+  - a kernel-recursive seeded storm (deep targets, located overflows, root
+    self-events) alongside the existing per-directory storm.
+
 ## [0.1.0]
 
 ### Added

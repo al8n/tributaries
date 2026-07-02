@@ -96,7 +96,7 @@ struct WatchNode {
 ///
 /// It carries enough to validate a candidate pair before consuming it *and* to
 /// resolve it when its source disappears. `scope` and `deadline` bound pairing in
-/// space and time. The source is anchored by its slot `(from_parent, from_name)`
+/// space and time. The source is anchored by its slot `(from_parent, from)`
 /// rather than an eager path: the location is reconstructed on use, so if the
 /// source's own ancestor is reparented mid-window the resolved path follows it.
 /// `from_parent` (the watch the `MovedFrom` arrived on) also gates liveness: a
@@ -113,7 +113,9 @@ struct WatchNode {
 #[derive(Debug, Clone)]
 struct PendingMove {
   from_parent: WatchId,
-  from_name: Segment,
+  /// The source's watch-relative location under `from_parent` — one segment on a
+  /// per-directory backend, possibly deeper on a kernel-recursive one.
+  from: Location,
   scope: ScopeId,
   deadline: Instant,
   held: Option<WatchId>,
@@ -386,6 +388,24 @@ impl Monitor {
     let Some(scope) = self.scope_of(rec.watch()) else {
       return;
     };
+
+    // Addressing-contract enforcement, never silent: a descending monitor ingests
+    // only depth-one records (a deeper target has no per-directory watch to anchor
+    // it), and a self-event kind carries no target at all. A violating record is a
+    // driver bug; recover by rescanning-and-rearming the arrival watch — the
+    // no-silent-loss escape — rather than mis-attributing the event. On a held
+    // (mid-move) subtree that Rescan would land at the stale pre-move path, so the
+    // recovery routes through the hold instead, like every other held activity.
+    let depth = rec.depth();
+    if (depth > 1 && self.descends()) || (depth > 0 && rec.kind().is_self_event()) {
+      if let Some(source) = self.in_held_subtree(rec.watch()) {
+        self.dirtied_holds.insert(source);
+        self.mark_enumerate_dirty(rec.watch());
+      } else {
+        self.rescan_and_rearm(scope, rec.watch());
+      }
+      return;
+    }
 
     // A record on a detached-and-held move source (or anything in its still-attached
     // subtree) would act on the stale PRE-move path — a scope-fence violation. Fence it:
@@ -814,17 +834,24 @@ impl Monitor {
           self.dirty_held_sources(Some(scope_id));
         }
       }
-      Scope::Subtree(watch) => {
+      Scope::Subtree(sub) => {
         // A subtree overflow on a held source (or a node in its subtree) would `Rescan`
         // and re-arm at the stale PRE-move path, just like a record would. Fence it the
         // same way: mark the enclosing hold dirtied and dirty the watch's outstanding
         // enumerate, then leave the pairing reparent to `Rescan`/re-arm the real
         // destination. Only a non-held subtree rescans-and-rearms in place.
+        let watch = sub.watch();
         if let Some(source) = self.in_held_subtree(watch) {
           self.dirtied_holds.insert(source);
           self.mark_enumerate_dirty(watch);
         } else if let Some(scope_id) = self.scope_of(watch) {
-          self.rescan_and_rearm(scope_id, watch);
+          // The Rescan lands at the located directory (the watch's own location plus
+          // the descent). The re-arm starts from the nearest watch: the descent has no
+          // watch of its own — it is deep only on a kernel-recursive backend, whose
+          // re-arm is a no-op anyway — and a descending backend's re-arm cascade
+          // covers the descent from the watch.
+          self.emit_rescan(scope_id, self.location_of(watch).join(sub.descent()));
+          self.start_rearm(watch);
         }
       }
     }
@@ -943,11 +970,13 @@ impl Monitor {
 
   fn on_moved_from(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) {
     let from_parent = rec.watch();
+    // Only a depth-one source can name a per-directory child watch; a deeper
+    // (kernel-recursive) source has no child watches to detach.
     let src = rec
       .name()
       .and_then(|name| self.child_watch(rec.watch(), name));
-    match (rec.cookie(), rec.name()) {
-      (Some(cookie), Some(name)) => {
+    match (rec.cookie(), rec.target()) {
+      (Some(cookie), Some(target)) => {
         // Detach a watched-directory source from its old `(parent, name)` slot the
         // moment it moves away, but KEEP its subtree: a paired `MovedTo` reparents it
         // in O(1) (descendants follow for free), and until then detaching has already
@@ -961,7 +990,7 @@ impl Monitor {
         }
         let pending = PendingMove {
           from_parent,
-          from_name: name.clone(),
+          from: target.clone(),
           scope,
           deadline: now + self.move_window,
           held: src,
@@ -1174,9 +1203,9 @@ impl Monitor {
   }
 
   /// The current source location of a pending half, reconstructed from its slot
-  /// `(from_parent, from_name)` so it tracks any reparent of the source's ancestor.
+  /// `(from_parent, from)` so it tracks any reparent of the source's ancestor.
   fn pending_from(&self, pending: &PendingMove) -> Location {
-    self.child_location(pending.from_parent, &pending.from_name)
+    self.location_of(pending.from_parent).join(&pending.from)
   }
 
   /// Emits the outcome of a paired `MovedTo`: a `Moved` when the source is still
@@ -1673,8 +1702,8 @@ impl Monitor {
   }
 
   fn record_location(&self, rec: &OsRecord) -> Location {
-    match rec.name() {
-      Some(name) => self.child_location(rec.watch(), name),
+    match rec.target() {
+      Some(target) => self.location_of(rec.watch()).join(target),
       None => self.location_of(rec.watch()),
     }
   }
