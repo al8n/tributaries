@@ -6,7 +6,7 @@
 //! struct, an FSEvents flag word, or a `dirent`.
 
 use crate::{
-  id::{MoveCookie, WatchId},
+  id::{Identity, MoveCookie, WatchId},
   path::Segment,
 };
 use std::vec::Vec;
@@ -248,13 +248,21 @@ impl core::fmt::Display for IoClass {
 pub struct DirEntry {
   name: Segment,
   kind: FileKind,
+  node: Option<Identity>,
 }
 
 impl DirEntry {
-  /// Builds an entry from a canonical name and its kind.
+  /// Builds an entry from a canonical name and its kind, with no object identity.
+  ///
+  /// Use [`with_node`](Self::with_node) to attach the identity the driver read for this
+  /// entry; without it the core treats a same-name reappearance conservatively.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(name: Segment, kind: FileKind) -> Self {
-    Self { name, kind }
+    Self {
+      name,
+      kind,
+      node: None,
+    }
   }
 
   /// The entry's canonical name.
@@ -269,11 +277,26 @@ impl DirEntry {
     self.kind
   }
 
+  /// The entry's object identity, if the driver could supply one. The core uses it to
+  /// tell a same-name replacement from a survivor when re-arming (see [`Identity`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn node(&self) -> Option<Identity> {
+    self.node
+  }
+
   /// Whether the entry is a directory (the core descends into these when not
   /// kernel-recursive).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_dir(&self) -> bool {
     self.kind.is_dir()
+  }
+
+  /// Returns this entry with its object [`Identity`] set.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_node(mut self, node: Identity) -> Self {
+    self.node = Some(node);
+    self
   }
 }
 
@@ -352,14 +375,15 @@ pub struct OsRecord {
   name: Option<Segment>,
   is_dir: Option<bool>,
   cookie: Option<MoveCookie>,
+  node: Option<Identity>,
 }
 
 impl OsRecord {
   /// Builds a record for `kind` arriving on `watch`, with no child name, unknown
-  /// directory-ness, and no move cookie.
+  /// directory-ness, no move cookie, and no object identity.
   ///
-  /// Use the `with_*` builders to attach a child name, the directory flag, or a
-  /// move-pairing cookie.
+  /// Use the `with_*` builders to attach a child name, the directory flag, a
+  /// move-pairing cookie, or the affected object's identity.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(watch: WatchId, kind: RecordKind) -> Self {
     Self {
@@ -368,6 +392,7 @@ impl OsRecord {
       name: None,
       is_dir: None,
       cookie: None,
+      node: None,
     }
   }
 
@@ -403,6 +428,14 @@ impl OsRecord {
     self.cookie
   }
 
+  /// The affected child object's identity, if the driver could supply one. Lets the core
+  /// install a watch tagged with its object identity, so a later re-arm can tell a
+  /// same-name replacement from a survivor (see [`Identity`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn node(&self) -> Option<Identity> {
+    self.node
+  }
+
   /// Returns this record with the affected child's name set.
   #[cfg_attr(not(tarpaulin), inline(always))]
   #[must_use]
@@ -424,6 +457,14 @@ impl OsRecord {
   #[must_use]
   pub const fn with_cookie(mut self, cookie: MoveCookie) -> Self {
     self.cookie = Some(cookie);
+    self
+  }
+
+  /// Returns this record with the affected child object's [`Identity`] set.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_node(mut self, node: Identity) -> Self {
+    self.node = Some(node);
     self
   }
 }
