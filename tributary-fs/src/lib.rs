@@ -8,15 +8,18 @@
 //! behind a platform-neutral seam.
 //!
 //! The consumer-facing watcher API is not exposed yet; the crate currently
-//! provides the OS seam and its test suites.
+//! provides the OS seam, the sans-I/O driver core, the async driver task,
+//! and their test suites.
 //!
 //! [`tributary-proto`]: tributary_proto
 
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
-// The seam's in-crate consumers (the driver task and the public watcher) sit
-// above this layer; until they land, only the test suites exercise it.
+// The public watcher facade (the crate's consumer surface) sits above this
+// machinery; until it lands, only the test suites exercise the top layer.
 #![allow(dead_code, unused_imports)]
 
+mod core;
+mod driver;
 mod os;
