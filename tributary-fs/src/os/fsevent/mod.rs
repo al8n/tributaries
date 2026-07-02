@@ -10,7 +10,7 @@ use std::{
   sync::atomic::{AtomicBool, Ordering},
 };
 
-use super::SourceMessage;
+use super::{SourceError, SourceMessage};
 
 /// The raw flag word of one FSEvents event.
 ///
@@ -207,6 +207,26 @@ impl FsEventFlags {
   pub(crate) const fn lost_sync(self) -> bool {
     self.user_dropped() || self.kernel_dropped()
   }
+
+  /// The bits a rename word may carry and still be trusted as *only* a
+  /// rename: the rename verb plus pure type hints. Any other bit means the
+  /// window coalesced additional operations into the word.
+  const PURE_RENAME: u32 = Self::ITEM_RENAMED.0
+    | Self::ITEM_IS_FILE.0
+    | Self::ITEM_IS_DIR.0
+    | Self::ITEM_IS_SYMLINK.0
+    | Self::ITEM_IS_HARDLINK.0
+    | Self::ITEM_IS_LAST_HARDLINK.0;
+
+  /// Whether this word is a rename and NOTHING but a rename (type hints
+  /// aside). Only a pure rename half may take the no-probe pairing fast
+  /// path: a word also carrying create/remove/modify/attrib bits is an
+  /// ambiguous coalescing and must be grounded by a probe, or the extra
+  /// operation would be silently dropped.
+  #[inline]
+  pub(crate) const fn is_pure_rename(self) -> bool {
+    self.item_renamed() && self.0 & !Self::PURE_RENAME == 0
+  }
 }
 
 /// One decoded FSEvents event.
@@ -267,49 +287,68 @@ pub(crate) enum SendOutcome {
   Closed,
 }
 
-/// Forwards one decoded callback batch, upholding the wake invariant: **every
-/// latched loss has a guaranteed later wake**, so the driver's post-receive
-/// latch drain can never miss a signal.
+/// Forwards one decoded callback batch: data on the bounded channel, loss on
+/// the control channel.
 ///
-/// Case by case:
-/// - a previously latched loss is surfaced as an `Overflow` *before* newer
-///   data, so loss is observed in order; a full channel re-latches it (the
-///   wake is then the ≥ capacity messages already queued);
-/// - a lossy decode with **no** batch to send gets its own immediate
-///   `Overflow` — nothing else would ever wake the driver for it (an
-///   all-undecodable callback previously latched silently);
-/// - a lossy decode **with** a batch latches and lets the batch itself be the
-///   wake;
-/// - a full channel dropping the batch latches (wake: the queued messages).
+/// Loss is an IN-BAND control message, never a latch a wake must later drain:
+/// the control channel is unbounded, so [`signal_loss`] cannot fail for lack
+/// of capacity, and the dedup flag bounds it to one in-flight `Overflow` per
+/// acknowledgement — there is no interleaving in which a loss is recorded
+/// with no message left to observe it (the latch-and-wake protocol this
+/// replaces had exactly that hole, three review rounds running).
 ///
-/// A closed channel never re-latches: the receiver is gone, so there is no
-/// one left to wake.
-pub(crate) fn forward_batch<S>(
-  overflowed: &AtomicBool,
+/// A batch dropped on a full data channel and an undecodable entry both
+/// degrade to the same `Overflow`; a closed data channel means the receiver
+/// is gone and nothing is signaled.
+pub(crate) fn forward_batch<D, C>(
+  overflow_pending: &AtomicBool,
   events: Vec<RawOsEvent>,
   lossy: bool,
-  mut send: S,
+  mut send_data: D,
+  send_control: C,
 ) where
-  S: FnMut(SourceMessage) -> SendOutcome,
+  D: FnMut(SourceMessage) -> SendOutcome,
+  C: FnOnce(SourceMessage) -> bool,
 {
-  if overflowed.swap(false, Ordering::AcqRel) && send(SourceMessage::Overflow) == SendOutcome::Full
-  {
-    overflowed.store(true, Ordering::Release);
-  }
-  if events.is_empty() {
-    if lossy && send(SourceMessage::Overflow) == SendOutcome::Full {
-      overflowed.store(true, Ordering::Release);
+  let mut lost = lossy;
+  if !events.is_empty() {
+    match send_data(SourceMessage::Batch(events)) {
+      SendOutcome::Sent => {}
+      SendOutcome::Full => lost = true,
+      SendOutcome::Closed => return,
     }
-    return;
   }
-  match send(SourceMessage::Batch(events)) {
-    SendOutcome::Sent => {
-      if lossy {
-        overflowed.store(true, Ordering::Release);
-      }
-    }
-    SendOutcome::Full => overflowed.store(true, Ordering::Release),
-    SendOutcome::Closed => {}
+  if lost {
+    signal_loss(overflow_pending, send_control);
+  }
+}
+
+/// Sends one deduplicated `Overflow` on the control channel.
+///
+/// The flag's false→true transition elects exactly one sender; it stays set
+/// until the driver acknowledges the message (resetting the flag), so at most
+/// one `Overflow` is ever in flight — losses meanwhile are covered by it,
+/// since the driver's rescan reads current state. `send` returning `false`
+/// means the control receiver is gone; the flag is restored so a future
+/// generation is not muted.
+pub(crate) fn signal_loss<C>(overflow_pending: &AtomicBool, send: C)
+where
+  C: FnOnce(SourceMessage) -> bool,
+{
+  if !overflow_pending.swap(true, Ordering::AcqRel) && !send(SourceMessage::Overflow) {
+    overflow_pending.store(false, Ordering::Release);
+  }
+}
+
+/// Sends the stream's one terminal `Fatal` on the control channel, at most
+/// once ever. Unbounded control means the send cannot fail for capacity; the
+/// flag makes later panics no-ops.
+pub(crate) fn signal_fatal_once<C>(fatal_sent: &AtomicBool, err: SourceError, send: C)
+where
+  C: FnOnce(SourceMessage) -> bool,
+{
+  if !fatal_sent.swap(true, Ordering::AcqRel) {
+    let _ = send(SourceMessage::Fatal(err));
   }
 }
 

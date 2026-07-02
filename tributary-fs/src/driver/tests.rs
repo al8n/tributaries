@@ -3,7 +3,7 @@ use std::{
   num::{NonZeroU64, NonZeroUsize},
   sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
   },
   time::Duration,
 };
@@ -24,10 +24,13 @@ struct FakeNode {
 #[derive(Default)]
 struct FakeState {
   nodes: Mutex<std::collections::HashMap<PathBuf, FakeNode>>,
-  /// Injection ends for spawned sources, keyed by root.
+  /// Data injection ends for spawned sources, keyed by root.
   taps: Mutex<std::collections::HashMap<PathBuf, async_channel::Sender<SourceMessage>>>,
-  /// Per-root fatal latches, so tests can arm the latch-only death path.
-  fatals: Mutex<std::collections::HashMap<PathBuf, Arc<AtomicBool>>>,
+  /// Control (Overflow/Fatal) injection ends, keyed by root.
+  controls: Mutex<std::collections::HashMap<PathBuf, async_channel::Sender<SourceMessage>>>,
+  /// Overflow acknowledgements per root, so tests can assert the dedup
+  /// re-arm protocol runs.
+  acks: Mutex<std::collections::HashMap<PathBuf, Arc<AtomicUsize>>>,
   shutdowns: AtomicUsize,
 }
 
@@ -82,37 +85,50 @@ impl FakeFs {
     self.state.shutdowns.load(Ordering::SeqCst)
   }
 
-  /// Arms the fatal latch of the source spawned for `root`.
-  fn arm_fatal(&self, root: &str) {
+  /// The control-channel injection end of `root`'s source.
+  fn control_tap(&self, root: &str) -> async_channel::Sender<SourceMessage> {
     self
       .state
-      .fatals
+      .controls
       .lock()
       .unwrap()
       .get(&PathBuf::from(root))
       .expect("a source was spawned for the root")
-      .store(true, Ordering::SeqCst);
+      .clone()
   }
 
-  /// Drops the injection end of `root`'s source, disconnecting its receiver.
+  /// How many processed Overflows the driver acknowledged for `root`.
+  fn overflow_acks(&self, root: &str) -> usize {
+    self
+      .state
+      .acks
+      .lock()
+      .unwrap()
+      .get(&PathBuf::from(root))
+      .expect("a source was spawned for the root")
+      .load(Ordering::SeqCst)
+  }
+
+  /// Drops both injection ends of `root`'s source, disconnecting it.
   fn disconnect(&self, root: &str) {
     self.state.taps.lock().unwrap().remove(&PathBuf::from(root));
+    self
+      .state
+      .controls
+      .lock()
+      .unwrap()
+      .remove(&PathBuf::from(root));
   }
 }
 
 struct FakeHandle {
-  overflow: Arc<AtomicBool>,
-  fatal: Arc<AtomicBool>,
+  acks: Arc<AtomicUsize>,
   shutdowns: Arc<FakeState>,
 }
 
 impl SourceControl for FakeHandle {
-  fn take_overflow(&self) -> bool {
-    self.overflow.swap(false, Ordering::AcqRel)
-  }
-
-  fn take_fatal(&self) -> bool {
-    self.fatal.swap(false, Ordering::AcqRel)
+  fn overflow_processed(&self) {
+    self.acks.fetch_add(1, Ordering::SeqCst);
   }
 
   fn shutdown(self) {
@@ -133,23 +149,34 @@ impl FsOps for FakeFs {
     }
     let (tx, rx) = async_channel::bounded(config.channel_capacity.get());
     self.state.taps.lock().unwrap().insert(root.clone(), tx);
-    let fatal = Arc::new(AtomicBool::new(false));
+    let (control_tx, control_rx) = async_channel::unbounded();
     self
       .state
-      .fatals
+      .controls
       .lock()
       .unwrap()
-      .insert(root.clone(), Arc::clone(&fatal));
+      .insert(root.clone(), control_tx);
+    let acks = Arc::new(AtomicUsize::new(0));
+    self
+      .state
+      .acks
+      .lock()
+      .unwrap()
+      .insert(root.clone(), Arc::clone(&acks));
     Ok(SpawnedSource {
       handle: FakeHandle {
-        overflow: Arc::new(AtomicBool::new(false)),
-        fatal,
+        acks,
         shutdowns: Arc::clone(&self.state),
       },
-      receiver: rx,
+      channels: SourceChannels {
+        data: rx,
+        control: control_rx,
+      },
       meta: RootMeta {
         root,
         root_dev: self.root_dev,
+        mounts: Vec::new(),
+        mounts_authoritative: true,
       },
     })
   }
@@ -335,10 +362,23 @@ async fn overflow_message_becomes_one_epoch_bumped_rescan() {
     .unwrap();
   let (_, first) = next_event(&rig).await;
 
-  tap.send(SourceMessage::Overflow).await.unwrap();
+  rig
+    .fs
+    .control_tap("/r")
+    .send(SourceMessage::Overflow)
+    .await
+    .unwrap();
   let (_, rescan) = next_event(&rig).await;
   assert!(rescan.kind().is_rescan());
   assert!(rescan.epoch() > first.epoch());
+  // The driver acknowledged the signal, re-arming the source's dedup.
+  for _ in 0..100 {
+    if rig.fs.overflow_acks("/r") == 1 {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert_eq!(rig.fs.overflow_acks("/r"), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -385,7 +425,7 @@ async fn fatal_source_rescans_and_tears_down() {
   let _scope = watch(&rig, "/r").await;
   rig
     .fs
-    .tap("/r")
+    .control_tap("/r")
     .send(SourceMessage::Fatal(SourceError::CallbackPanic))
     .await
     .unwrap();
@@ -447,16 +487,16 @@ async fn watch_of_a_missing_root_fails_typed() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn fatal_latch_alone_invalidates_the_root() {
-  let rig = rig_with_capacity(64);
+async fn control_fatal_wakes_the_driver_with_no_data_traffic() {
+  let rig = rig_with_capacity(1);
   let _scope = watch(&rig, "/r").await;
+  let tap = rig.fs.tap("/r");
 
-  // The in-band Fatal message was "dropped": only the latch records the
-  // death. Any later message wakes the post-receive latch drain.
-  rig.fs.arm_fatal("/r");
-  rig
-    .fs
-    .tap("/r")
+  // Fill the DATA channel completely (capacity-1 event channel plus the
+  // capacity-8 os channel behind it can hold traffic, but the point is the
+  // control channel is independent): the Fatal rides control and wakes the
+  // driver even though nothing further arrives on data.
+  tap
     .send(SourceMessage::Batch(vec![ev(
       "/r/x",
       FsEventFlags::ITEM_CREATED,
@@ -465,16 +505,60 @@ async fn fatal_latch_alone_invalidates_the_root() {
     )]))
     .await
     .unwrap();
+  rig
+    .fs
+    .control_tap("/r")
+    .send(SourceMessage::Fatal(SourceError::CallbackPanic))
+    .await
+    .unwrap();
 
   let (_, first) = next_event(&rig).await;
   assert!(first.kind().is_created());
   let (_, second) = next_event(&rig).await;
   assert!(
     second.kind().is_rescan(),
-    "the latched death surfaces as the terminal Rescan"
+    "the in-band death surfaces as the terminal Rescan"
   );
-  tokio::time::sleep(Duration::from_millis(100)).await;
+  for _ in 0..100 {
+    if rig.fs.shutdowns() == 1 {
+      break;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
   assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
+}
+
+#[tokio::test(start_paused = true)]
+async fn orphaned_watch_reply_tears_the_stream_down() {
+  let rig = rig_with_capacity(64);
+
+  // The watch() future was cancelled: its reply receiver is gone before the
+  // spawn completes. The driver must not leave the fresh stream unowned.
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  drop(on_reply);
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/r"),
+      interest: tributary_proto::Interest::all(),
+      reply,
+    })
+    .await
+    .unwrap();
+
+  for _ in 0..100 {
+    if rig.fs.shutdowns() == 1 {
+      break;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(
+    rig.fs.shutdowns(),
+    1,
+    "an unowned stream is torn down immediately"
+  );
 }
 
 #[tokio::test(start_paused = true)]
