@@ -1,7 +1,7 @@
 //! The consumer-facing change vocabulary the core emits.
 
 use crate::{
-  id::{ChangeId, ScopeId},
+  id::{ChangeId, Epoch, ScopeId},
   path::Location,
 };
 
@@ -92,27 +92,37 @@ impl core::fmt::Display for ChangeKind {
 /// One normalized, deduped change the core hands to the consumer.
 ///
 /// Every change is born tagged with its disjoint root ([`scope`](Self::scope))
-/// so attribution is O(1), and stamped with a unique [`ChangeId`] that is the
-/// dedup / identity key. `watershed::Event<L>` wraps this, mapping the
-/// canonical [`Location`] to the consumer's location type.
+/// so attribution is O(1), stamped with a unique [`ChangeId`] that is the
+/// dedup / identity key, and carries the scope's reconciliation [`epoch`](Self::epoch)
+/// — the generation the consumer uses to decide whether a [`Rescan`](ChangeKind::Rescan)
+/// obliges a re-enumeration. `watershed::Event<L>` wraps this, mapping the canonical
+/// [`Location`] to the consumer's location type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Change {
   id: ChangeId,
   scope: ScopeId,
   location: Location,
   kind: ChangeKind,
+  epoch: Epoch,
 }
 
 impl Change {
-  /// Builds a change. The core mints [`id`](Self::id) and tags
-  /// [`scope`](Self::scope) from the originating watch.
+  /// Builds a change. The core mints [`id`](Self::id), tags [`scope`](Self::scope) from
+  /// the originating watch, and stamps the scope's current [`epoch`](Self::epoch).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(id: ChangeId, scope: ScopeId, location: Location, kind: ChangeKind) -> Self {
+  pub const fn new(
+    id: ChangeId,
+    scope: ScopeId,
+    location: Location,
+    kind: ChangeKind,
+    epoch: Epoch,
+  ) -> Self {
     Self {
       id,
       scope,
       location,
       kind,
+      epoch,
     }
   }
 
@@ -126,6 +136,16 @@ impl Change {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn scope(&self) -> ScopeId {
     self.scope
+  }
+
+  /// The scope's reconciliation generation at the time this change was emitted.
+  ///
+  /// A [`Rescan`](ChangeKind::Rescan) always carries a generation strictly greater than
+  /// any earlier change for its scope; a consumer holding state up to some `Epoch` that
+  /// receives a `Rescan` at a greater one must re-enumerate. See [`Epoch`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
   }
 
   /// The change's location, relative to its watched root.

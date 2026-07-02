@@ -96,6 +96,54 @@ proto_id! {
   MoveCookie
 }
 
+/// A per-scope monotonic reconciliation generation, stamped on every [`Change`](crate::Change).
+///
+/// The [`Monitor`](crate::Monitor) bumps a scope's `Epoch` on every reconciliation
+/// trigger — a queue overflow, a failed or partial enumerate, a refused watch, a moved
+/// root — BEFORE emitting that scope's [`Rescan`](crate::ChangeKind::Rescan), so the
+/// `Rescan` carries a strictly greater generation than any change the consumer has
+/// already acted on. A consumer that has processed a scope up to some `Epoch` and then
+/// receives a `Rescan` at a greater one must re-enumerate the scope and adopt the new
+/// `Epoch` as its floor. This is the no-silent-loss contract: it makes the
+/// unwatch→rewatch window during a re-arm harmless (a mutation there rides a generation
+/// the `Rescan` dominates), without requiring any ordering between the action and event
+/// queues — which the sans-I/O split cannot provide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Epoch(u64);
+
+impl Epoch {
+  /// The generation of a scope before any reconciliation trigger.
+  pub const START: Self = Self(0);
+
+  /// Wraps a raw generation value. Exists for the driver's bookkeeping and for tests;
+  /// the [`Monitor`](crate::Monitor) advances epochs itself.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(value: u64) -> Self {
+    Self(value)
+  }
+
+  /// The raw generation value.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_u64(&self) -> u64 {
+    self.0
+  }
+
+  /// The next generation. Saturating, so a scope that somehow reached [`u64::MAX`] stays
+  /// there rather than wrapping back into a stale, dominated generation.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn next(self) -> Self {
+    Self(self.0.saturating_add(1))
+  }
+}
+
+impl core::fmt::Display for Epoch {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    core::fmt::Display::fmt(&self.0, f)
+  }
+}
+
 /// A monotonic minter of [`NonZeroU64`] handle values, starting at 1.
 ///
 /// Handles are never reused: reuse would reintroduce the ABA misattribution the

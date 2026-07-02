@@ -8,7 +8,7 @@ use crate::{
   capabilities::Capabilities,
   change::{Change, ChangeKind},
   error::WatchError,
-  id::{ChangeId, MoveCookie, ReqId, ScopeId, Sequence, WatchId},
+  id::{ChangeId, Epoch, MoveCookie, ReqId, ScopeId, Sequence, WatchId},
   interest::Interest,
   path::{Location, Segment},
   record::{EnumerateResult, OsRecord, RecordKind},
@@ -176,6 +176,10 @@ pub struct Monitor {
   /// detectable in O(log n).
   child_index: BTreeMap<(WatchId, Segment), WatchId>,
   roots: BTreeMap<ScopeId, WatchId>,
+  /// Per-scope reconciliation generation. Bumped on every reconciliation trigger before
+  /// that scope's `Rescan` is emitted; stamped on every emitted [`Change`]. Absent means
+  /// [`Epoch::START`]. See [`Epoch`] for the no-silent-loss contract this underwrites.
+  scope_epochs: BTreeMap<ScopeId, Epoch>,
   /// Maps an outstanding enumerate request to the directory it reads. The node's
   /// [`NodeState::Enumerating`] carries the same `req` as the forward check, so a
   /// superseded result (whose node has moved on) is dropped rather than reconciled;
@@ -215,6 +219,7 @@ impl Monitor {
       nodes: BTreeMap::new(),
       child_index: BTreeMap::new(),
       roots: BTreeMap::new(),
+      scope_epochs: BTreeMap::new(),
       pending_enumerate: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
       actions: VecDeque::new(),
@@ -1023,13 +1028,35 @@ impl Monitor {
     self.emit(scope, location, kind);
   }
 
+  /// The scope's current reconciliation generation ([`Epoch::START`] if never bumped).
+  fn epoch_of(&self, scope: ScopeId) -> Epoch {
+    self
+      .scope_epochs
+      .get(&scope)
+      .copied()
+      .unwrap_or(Epoch::START)
+  }
+
+  /// Advances a scope's reconciliation generation and returns the new value. Called on
+  /// every reconciliation trigger (through [`emit_rescan`](Self::emit_rescan)), so the
+  /// `Rescan` — and every change emitted after it — carries a generation that strictly
+  /// dominates whatever the consumer acted on before the trigger.
+  fn bump_epoch(&mut self, scope: ScopeId) -> Epoch {
+    let next = self.epoch_of(scope).next();
+    self.scope_epochs.insert(scope, next);
+    next
+  }
+
   fn emit_rescan(&mut self, scope: ScopeId, location: Location) {
+    // A `Rescan` IS the reconciliation trigger: bump the generation FIRST so the Rescan,
+    // and every later change for this scope, strictly dominates what the consumer holds.
+    self.bump_epoch(scope);
     self.emit(scope, location, ChangeKind::Rescan);
   }
 
   fn emit(&mut self, scope: ScopeId, location: Location, kind: ChangeKind) {
     let id = self.next_change_id();
-    let change = Change::new(id, scope, location, kind);
+    let change = Change::new(id, scope, location, kind, self.epoch_of(scope));
     let key = Self::dedup_key(&change);
     if self.pending_keys.insert(key) {
       self.events.push_back(change);

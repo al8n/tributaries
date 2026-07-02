@@ -3190,3 +3190,75 @@ fn overflow_rearm_replaces_same_name_directory() {
     .expect("a fresh watch is issued for the replacement");
   assert_ne!(w_a2, w_a, "not the reused stale watch");
 }
+
+/// Every change carries its scope's reconciliation epoch, and a `Rescan` bumps the epoch
+/// so it — and every later change — strictly dominates what the consumer already holds.
+/// This is the no-silent-loss floor: a mutation in a re-arm's unwatch→rewatch window
+/// rides a generation the `Rescan` dominates, with no ordering between the queues.
+#[test]
+fn changes_carry_epoch_and_rescan_bumps_it() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // A pre-overflow change carries the scope's base generation.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(false),
+    at(1),
+  );
+  let base = drain_events(&mut m)
+    .into_iter()
+    .find(|e| e.kind().is_created())
+    .expect("created a")
+    .epoch();
+
+  // An overflow `Rescan` bumps the generation strictly past that change.
+  m.on_overflow(Scope::Root(scope(1)), at(2));
+  let rescan = drain_events(&mut m)
+    .into_iter()
+    .find(|e| e.kind().is_rescan())
+    .expect("overflow rescan")
+    .epoch();
+  assert!(
+    rescan > base,
+    "the Rescan dominates the pre-overflow change"
+  );
+
+  // A change after the overflow rides a generation at least the Rescan's, so the Rescan
+  // the consumer acts on is never dominated by an unseen later mutation.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("b"))
+      .with_is_dir(false),
+    at(3),
+  );
+  let after = drain_events(&mut m)
+    .into_iter()
+    .find(|e| e.kind().is_created())
+    .expect("created b")
+    .epoch();
+  assert!(
+    after >= rescan,
+    "a post-overflow change is not dominated below the Rescan"
+  );
+
+  // The generation is per-scope: a second scope is unaffected by scope 1's bump.
+  let other = live_root_idle(&mut m, scope(2));
+  m.on_os_record(
+    OsRecord::new(other, RecordKind::Created)
+      .with_name(seg("c"))
+      .with_is_dir(false),
+    at(4),
+  );
+  let other_epoch = drain_events(&mut m)
+    .into_iter()
+    .find(|e| e.kind().is_created())
+    .expect("created c")
+    .epoch();
+  assert_eq!(
+    other_epoch,
+    Epoch::START,
+    "a fresh scope starts at the base generation"
+  );
+}
