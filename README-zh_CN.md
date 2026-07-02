@@ -23,11 +23,13 @@
 
 ## Crates
 
+crate 划分沿用 quinn/quinn-proto 模式：一个纯协议 crate，加一个承载所有 OS
+交互的伞形 crate。
+
 | crate | 状态 | 职责 |
 |---|---|---|
 | [`tributary-proto`](tributary-proto) | 基础完成 | 纯 `no_std` Sans-I/O 状态机（“大脑”）：与后端无关的 `Monitor` —— watch 树、按 scope 的 reconciliation epoch、驱动提供的对象 identity、覆盖/投递 interest 分离、move 归一化、溢出 re-arm |
-| `tributaries` | 规划中 | `std` 驱动 crate：inotify、fanotify、FSEvents 后端，为 `Monitor` 提供输入并执行其动作 |
-| `watershed` | 规划中 | 面向使用者的变更监视 API |
+| `tributaries` | 规划中 | `std` 伞形 crate：inotify、fanotify、FSEvents 驱动为 `Monitor` 提供输入并执行其动作，其上再提供面向使用者的 watcher API |
 
 ## 设计
 

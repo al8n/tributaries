@@ -24,11 +24,13 @@ degradation — and thin per-OS drivers that only perform I/O.
 
 ## Crates
 
+The split follows quinn/quinn-proto: a pure protocol crate, and one umbrella
+crate holding everything that touches the OS.
+
 | crate | status | role |
 |---|---|---|
 | [`tributary-proto`](tributary-proto) | foundation complete | the pure `no_std` Sans-I/O state machine (the *brain*): the primitive-agnostic `Monitor` — watch tree, per-scope reconciliation epochs, driver-sourced object identity, coverage/delivery interest split, move normalization, overflow re-arm |
-| `tributaries` | planned | the `std` driver crate: inotify, fanotify, and FSEvents backends feeding the `Monitor` and executing its actions |
-| `watershed` | planned | the consumer-facing change-monitor API on top |
+| `tributaries` | planned | the `std` umbrella crate: the inotify, fanotify, and FSEvents drivers feeding the `Monitor`, and the consumer-facing watcher API on top |
 
 ## Design
 
