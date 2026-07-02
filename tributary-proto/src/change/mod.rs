@@ -95,8 +95,9 @@ impl core::fmt::Display for ChangeKind {
 /// so attribution is O(1), stamped with a unique [`ChangeId`] that is the
 /// dedup / identity key, and carries the scope's reconciliation [`epoch`](Self::epoch)
 /// — the generation the consumer uses to decide whether a [`Rescan`](ChangeKind::Rescan)
-/// obliges a re-enumeration. `watershed::Event<L>` wraps this, mapping the canonical
-/// [`Location`] to the consumer's location type.
+/// obliges a re-enumeration. The `tributaries` umbrella crate wraps this in its
+/// consumer event type, mapping the canonical [`Location`] to the consumer's
+/// location type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Change {
   id: ChangeId,

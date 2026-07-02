@@ -9,9 +9,10 @@
 //! anchors), and `wd`-reuse / ABA misattribution.
 //!
 //! [`ScopeId`] (a disjoint watched root) is *not* proto-minted — it is supplied
-//! by the layer above (`watershed`, which subsumes overlapping scopes into
-//! disjoint roots). [`MoveCookie`] is the backend-agnostic pairing token for a
-//! rename (an inotify cookie, an FSEvents file id).
+//! by the layer above (the `tributaries` umbrella crate, which subsumes
+//! overlapping scopes into disjoint roots). [`MoveCookie`] is the
+//! backend-agnostic pairing token for a rename (an inotify cookie, an FSEvents
+//! file id).
 
 use core::num::NonZeroU64;
 
