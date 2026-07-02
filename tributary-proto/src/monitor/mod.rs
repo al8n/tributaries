@@ -41,6 +41,11 @@ struct WatchNode {
   scope: ScopeId,
   is_dir: bool,
   live: bool,
+  /// The set of watches whose `parent` is this node — the adjacency dual of `parent`.
+  /// A detached-and-held move source stays here (its `parent` is unchanged) even though
+  /// it has left `child_index`, so a subtree walk reaches it in O(children) without an
+  /// O(N) scan of the whole node map.
+  children: BTreeSet<WatchId>,
 }
 
 /// A pending [`RecordKind::MovedFrom`] awaiting its matching
@@ -253,6 +258,7 @@ impl Monitor {
         scope,
         is_dir: true,
         live: false,
+        children: BTreeSet::new(),
       },
     );
     self.roots.insert(scope, id);
@@ -380,31 +386,19 @@ impl Monitor {
         self.rearming.insert(child);
       }
     }
-    // Cascade the re-arm into EVERY currently-known child directory, on Partial AND
-    // Failed: a Partial listing may omit a still-present child, and a persistently
-    // Failed read never re-reads at all — so a gap-created descendant under a known
-    // child would otherwise stay unwatched. `inherit_rearm`/`start_rearm` coalesce, so
-    // this cannot stack duplicate work across the bounded retries.
-    let known: std::vec::Vec<WatchId> = self
-      .child_index
-      .iter()
-      .filter(|((parent, _), _)| *parent == dir)
-      .map(|(_, &child)| child)
-      .collect();
-    for child in known {
-      self.inherit_rearm(child);
-    }
-    // A watched directory mid-move is DETACHED from `child_index` for its pairing
-    // window (its live subtree is held in `pending_moves`), so the cascade above misses
-    // it — yet its subtree can still gain a gap-created descendant. Re-arm every held
-    // move-source subtree whose source parent is this directory.
-    let held: std::vec::Vec<WatchId> = self
-      .pending_moves
-      .values()
-      .filter(|pending| pending.from_parent == dir)
-      .filter_map(|pending| pending.held)
-      .collect();
-    for child in held {
+    // Cascade the re-arm into EVERY child of `dir` — those in a name-slot AND any
+    // detached-and-held move source (mid-move, out of `child_index` but still in the
+    // adjacency set at its pre-move parent). A Partial listing may omit a still-present
+    // child, and a persistently-Failed read never re-reads at all, so a gap-created
+    // descendant under any child would otherwise stay unwatched. `inherit_rearm` /
+    // `start_rearm` coalesce, so this cannot stack duplicate work across the bounded
+    // retries.
+    let children: std::vec::Vec<WatchId> = self
+      .nodes
+      .get(&dir)
+      .map(|node| node.children.iter().copied().collect())
+      .unwrap_or_default();
+    for child in children {
       self.inherit_rearm(child);
     }
     self.emit_rescan(scope, self.location_of(dir));
@@ -470,13 +464,16 @@ impl Monitor {
   /// affected children on overflow is the safe choice.
   fn rearm_enumerate(&mut self, dir: WatchId, scope: ScopeId, res: &EnumerateResult) {
     let existing: std::vec::Vec<WatchId> = self
-      .child_index
-      .iter()
-      .filter(|((parent, _), _)| *parent == dir)
-      .map(|(_, &child)| child)
-      .collect();
+      .nodes
+      .get(&dir)
+      .map(|node| node.children.iter().copied().collect())
+      .unwrap_or_default();
     for child in existing {
-      self.drop_subtree(child);
+      // A detached-and-held move source is not in its name-slot; it must survive the
+      // rebuild to be reparented by its pending MovedTo, so drop only slot occupants.
+      if self.is_slot_child(dir, child) {
+        self.drop_subtree(child);
+      }
     }
     for entry in res.entries() {
       if !entry.is_dir() {
@@ -841,9 +838,19 @@ impl Monitor {
     if !self.is_watched(child) || !self.is_watched(new_parent) {
       return false;
     }
+    // Move `child` between adjacency sets to track its new parent link.
+    let old_parent = self.nodes.get(&child).and_then(|node| node.parent);
+    if let Some(old) = old_parent
+      && let Some(old_node) = self.nodes.get_mut(&old)
+    {
+      old_node.children.remove(&child);
+    }
     if let Some(node) = self.nodes.get_mut(&child) {
       node.parent = Some(new_parent);
       node.name = Some(new_name.clone());
+    }
+    if let Some(parent_node) = self.nodes.get_mut(&new_parent) {
+      parent_node.children.insert(child);
     }
     self.child_index.insert((new_parent, new_name), child);
     if inherit_rearm {
@@ -1009,8 +1016,12 @@ impl Monitor {
         scope,
         is_dir,
         live: false,
+        children: BTreeSet::new(),
       },
     );
+    if let Some(parent_node) = self.nodes.get_mut(&parent) {
+      parent_node.children.insert(id);
+    }
     self.child_index.insert((parent, name.clone()), id);
     self.actions.push_back(Action::watch(
       id,
@@ -1020,38 +1031,42 @@ impl Monitor {
   }
 
   fn drop_subtree(&mut self, root: WatchId) {
-    let mut removed = BTreeSet::new();
     let mut stack = std::vec::Vec::new();
     stack.push(root);
     while let Some(id) = stack.pop() {
-      let children: std::vec::Vec<WatchId> = self
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.parent == Some(id))
-        .map(|(child, _)| *child)
-        .collect();
-      stack.extend(children);
-
-      if let Some(node) = self.nodes.remove(&id) {
-        // Keep the child index in lockstep with the node map: a removed child must
-        // leave both, or a later descent would skip re-arming it (stale index) and
-        // a path could resolve through a dropped node.
-        if node.parent.is_none() {
-          self.roots.remove(&node.scope);
-        } else if let (Some(parent), Some(name)) = (node.parent, node.name)
-          // Clear the slot only if it still points to THIS node: a detached-and-held
-          // move source keeps its old `(parent, name)`, and a replacement may have
-          // taken that slot since — dropping the stale source must not orphan it.
+      let Some(node) = self.nodes.remove(&id) else {
+        continue;
+      };
+      // Descend via the adjacency set — O(subtree), not an O(N) scan of every node for
+      // each popped one. A held (detached) source under `id` is in `children` too, so a
+      // torn-down parent reclaims its held child here.
+      stack.extend(node.children.iter().copied());
+      // Keep the child index in lockstep with the node map: a removed child must leave
+      // both, or a later descent would skip re-arming it (stale index) and a path could
+      // resolve through a dropped node.
+      if node.parent.is_none() {
+        self.roots.remove(&node.scope);
+      } else {
+        if let Some(parent) = node.parent
+          && let Some(parent_node) = self.nodes.get_mut(&parent)
+        {
+          // Detach from the parent's adjacency set (a no-op if the parent is itself
+          // mid-drop and already gone).
+          parent_node.children.remove(&id);
+        }
+        // Clear the slot only if it still points to THIS node: a detached-and-held move
+        // source keeps its old `(parent, name)`, and a replacement may have taken that
+        // slot since — dropping the stale source must not orphan it.
+        if let (Some(parent), Some(name)) = (node.parent, node.name)
           && self.child_index.get(&(parent, name.clone())) == Some(&id)
         {
           self.child_index.remove(&(parent, name));
         }
-        removed.insert(id);
-        self.rearming.remove(&id);
-        self.rearm_dirs.remove(&id);
-        self.rearm_attempts.remove(&id);
-        self.actions.push_back(Action::Unwatch(id));
       }
+      self.rearming.remove(&id);
+      self.rearm_dirs.remove(&id);
+      self.rearm_attempts.remove(&id);
+      self.actions.push_back(Action::Unwatch(id));
     }
     // NOTE: a narrow subtree drop deliberately does NOT purge pending move halves.
     // A half whose source parent was dropped may still pair: its `MovedTo` can
@@ -1085,6 +1100,17 @@ impl Monitor {
   /// The watch covering `(parent, name)`, pending or live, if any.
   fn child_watch(&self, parent: WatchId, name: &Segment) -> Option<WatchId> {
     self.child_index.get(&(parent, name.clone())).copied()
+  }
+
+  /// Whether `child` currently occupies its name-slot under `parent` (i.e. `child_index`
+  /// points to it). False for a detached-and-held move source, which stays in the
+  /// parent's adjacency set but leaves `child_index` for the pairing window.
+  fn is_slot_child(&self, parent: WatchId, child: WatchId) -> bool {
+    self
+      .nodes
+      .get(&child)
+      .and_then(|node| node.name.clone())
+      .is_some_and(|name| self.child_index.get(&(parent, name)) == Some(&child))
   }
 
   fn location_of(&self, id: WatchId) -> Location {
