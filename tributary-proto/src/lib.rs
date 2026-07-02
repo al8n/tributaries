@@ -13,11 +13,15 @@
 //! The [`Monitor`] is the primitive-agnostic *top half*: it owns the
 //! proto-minted handle registries ([`WatchId`], [`ReqId`], [`ChangeId`]), the
 //! parent-relative watch tree (so paths are reconstructed by walking to a root),
-//! delivery dedup, move normalization, overflow → [`ChangeKind::Rescan`], and
-//! emission. A [`PrimitiveMachine`] is the per-primitive *sub-machine* seam that
-//! supplies a backend's static [`Capabilities`]; whether the core descends
-//! per-directory or leans on a kernel-recursive watch is gated by
-//! [`Capabilities::kernel_recursive`].
+//! delivery dedup, move normalization, overflow → [`ChangeKind::Rescan`],
+//! emission, and — given the object [`Identity`] the driver supplies — whether a
+//! same-name reappearance is the same object. Backend-specific behavior enters only
+//! as *data*, never as a trait the engine is generic over: the static
+//! [`Capabilities`] a monitor is built with (whether the core descends per-directory
+//! or leans on a kernel-recursive watch is gated by
+//! [`Capabilities::kernel_recursive`]) and the optional [`Identity`] carried on each
+//! record and entry. The concrete per-backend driver — the syscalls, the
+//! `WatchId` ↔ raw-handle table, identity sourcing — lives in the `tributaries` crate.
 //!
 //! # Driver contract
 //!
@@ -45,7 +49,6 @@ pub mod change;
 pub mod error;
 pub mod id;
 pub mod interest;
-pub mod machine;
 pub mod monitor;
 pub mod path;
 pub mod record;
@@ -65,7 +68,6 @@ pub use change::{Change, ChangeKind};
 pub use error::WatchError;
 pub use id::{ChangeId, Epoch, Identity, MoveCookie, ReqId, ScopeId, WatchId};
 pub use interest::Interest;
-pub use machine::PrimitiveMachine;
 pub use monitor::Monitor;
 pub use path::{Location, Segment};
 pub use record::{DirEntry, EnumerateResult, FileKind, IoClass, OsRecord, RecordKind};
