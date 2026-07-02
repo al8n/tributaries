@@ -29,6 +29,40 @@ pub const DEFAULT_MOVE_WINDOW: Duration = Duration::from_millis(100);
 /// refinement; this bound keeps the foundation from looping.
 const REARM_MAX_RETRIES: u8 = 2;
 
+/// Which enumerate a watch has outstanding: a cold discovery read (emits `Created`
+/// for each entry) or a rescan re-arm read (reconciles coverage, `Created`-suppressed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnumKind {
+  /// Discovery of a freshly-armed directory — each entry is a new `Created`.
+  Cold,
+  /// A rescan re-arm — reconcile the watch set without emitting `Created`.
+  Rearm,
+}
+
+/// The coverage lifecycle of one watched directory. Exactly one variant holds at a
+/// time, which is what replaces the four hand-synchronized side-tables
+/// (`rearm_dirs` / `rearming` / `rearm_attempts` / `rearm_reqs`) plus the `live`
+/// flag: a node cannot both owe a re-arm and have one outstanding, because those are
+/// distinct variants rather than independent set memberships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeState {
+  /// The `Action::Watch` is queued but not yet acknowledged. `rearm` records that the
+  /// post-arm enumerate must continue a rescan re-arm (the old `rearming` membership),
+  /// so it is `Created`-suppressed rather than a cold discovery.
+  Arming { rearm: bool },
+  /// Live (armed), with no enumerate outstanding.
+  Live,
+  /// Live, with an enumerate outstanding under `req`. `kind` selects discovery vs
+  /// re-arm handling of the result; `attempts` counts consecutive incomplete re-arm
+  /// reads toward [`REARM_MAX_RETRIES`]. Accepting a result requires the node to still
+  /// name the arriving `req`, so a superseded read is dropped rather than reconciled.
+  Enumerating {
+    req: ReqId,
+    kind: EnumKind,
+    attempts: u8,
+  },
+}
+
 /// One node in the parent-relative watch tree.
 ///
 /// Paths are reconstructed by walking `parent` links to a root, so a node stores
@@ -40,7 +74,8 @@ struct WatchNode {
   name: Option<Segment>,
   scope: ScopeId,
   is_dir: bool,
-  live: bool,
+  /// The coverage lifecycle: pending-arm, live-idle, or enumerating (see [`NodeState`]).
+  state: NodeState,
   /// The set of watches whose `parent` is this node — the adjacency dual of `parent`.
   /// A detached-and-held move source stays here (its `parent` is unchanged) even though
   /// it has left `child_index`, so a subtree walk reaches it in O(children) without an
@@ -141,20 +176,12 @@ pub struct Monitor {
   /// detectable in O(log n).
   child_index: BTreeMap<(WatchId, Segment), WatchId>,
   roots: BTreeMap<ScopeId, WatchId>,
+  /// Maps an outstanding enumerate request to the directory it reads. The node's
+  /// [`NodeState::Enumerating`] carries the same `req` as the forward check, so a
+  /// superseded result (whose node has moved on) is dropped rather than reconciled;
+  /// the whole re-arm coalescing/retry state that used to live in four side-tables is
+  /// now the node's [`NodeState`].
   pending_enumerate: BTreeMap<ReqId, WatchId>,
-  /// Enumerate requests issued as part of a rescan re-arm: their results reconcile
-  /// coverage (arm newly-appeared directories, prune vanished ones) WITHOUT emitting
-  /// `Created` — the consumer already has the `Rescan` and re-scans content itself.
-  rearm_reqs: BTreeSet<ReqId>,
-  /// Watches whose post-arm enumerate must continue a rescan re-arm, so the whole
-  /// re-armed subtree stays `Created`-suppressed, not merely its top level.
-  rearming: BTreeSet<WatchId>,
-  /// Directories with a rescan re-arm enumerate currently outstanding — one at a time
-  /// each, so repeated overflows and cascades coalesce onto it instead of stacking.
-  rearm_dirs: BTreeSet<WatchId>,
-  /// Per-directory count of consecutive incomplete (partial/failed) re-arm reads,
-  /// bounding retries at [`REARM_MAX_RETRIES`] before escalating to a `Rescan`.
-  rearm_attempts: BTreeMap<WatchId, u8>,
   /// Half-resolved renames awaiting their destination, keyed by `(scope, cookie)`.
   ///
   /// Four lifecycle invariants hold, each enforced at the site noted:
@@ -189,10 +216,6 @@ impl Monitor {
       child_index: BTreeMap::new(),
       roots: BTreeMap::new(),
       pending_enumerate: BTreeMap::new(),
-      rearm_reqs: BTreeSet::new(),
-      rearming: BTreeSet::new(),
-      rearm_dirs: BTreeSet::new(),
-      rearm_attempts: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
       actions: VecDeque::new(),
       events: VecDeque::new(),
@@ -257,7 +280,7 @@ impl Monitor {
         name: None,
         scope,
         is_dir: true,
-        live: false,
+        state: NodeState::Arming { rearm: false },
         children: BTreeSet::new(),
       },
     );
@@ -311,50 +334,53 @@ impl Monitor {
     let Some(dir) = self.pending_enumerate.remove(&req) else {
       return;
     };
-    let rearm = self.rearm_reqs.remove(&req);
-    let Some(&WatchNode { scope, live, .. }) = self.nodes.get(&dir) else {
-      return;
+    // Accept the result only if `dir` still awaits THIS request. A node that was dropped
+    // or whose read was superseded (re-armed, its slot rebuilt) has moved on — a stale
+    // result must not reconcile against it. This is the gap the old `pending_enumerate`
+    // + liveness pair could not close: the request identity now lives on the node.
+    let (kind, attempts, scope) = match self.nodes.get(&dir) {
+      Some(WatchNode {
+        state:
+          NodeState::Enumerating {
+            req: r,
+            kind,
+            attempts,
+          },
+        scope,
+        ..
+      }) if *r == req => (*kind, *attempts, *scope),
+      _ => return,
     };
-    if !live {
-      return;
-    }
-
-    if rearm {
-      // This outstanding re-arm request is resolved (a retry re-registers it).
-      self.rearm_dirs.remove(&dir);
-    }
+    // The read resolved: the node leaves `Enumerating`.
+    self.set_state(dir, NodeState::Live);
 
     if res.forces_rescan() {
       // An incomplete read (`Partial` or `Failed`), in EITHER mode: reconcile what is
-      // visible, cascade the re-arm into every currently-known child (a partial
-      // listing may omit a still-present one whose subtree gained a gap-created
-      // descendant), emit a `Rescan` for the content the read could not report, and
-      // bounded-retry to complete the watch set.
-      self.handle_incomplete_enumerate(dir, scope, &res);
+      // visible, cascade the re-arm into every child, emit a `Rescan` for the content
+      // the read could not report, and bounded-retry to complete the watch set.
+      self.handle_incomplete_enumerate(dir, scope, &res, attempts);
       return;
     }
 
-    if rearm {
-      // A complete re-arm: prune vanished, arm new, cascade — without emitting Created.
-      self.rearm_attempts.remove(&dir);
-      self.rearm_enumerate(dir, scope, &res);
-      return;
-    }
-
-    // A complete cold enumerate: discovery — emit Created and install per-directory.
-    for entry in res.entries() {
-      let location = self.child_location(dir, entry.name());
-      self.emit(scope, location, ChangeKind::Created);
-      // The enumerate `is_dir` contract mirrors the record `is_dir` contract: only
-      // a known directory is descended into (an `Unknown`-kind entry is treated as a
-      // non-directory, never watched). A cold enumerate is discovery, not a replace,
-      // so an already-watched slot is reused (`replaced = false`).
-      let occupant = if entry.is_dir() {
-        SlotOccupant::Dir
-      } else {
-        SlotOccupant::File
-      };
-      self.reconcile_slot(dir, scope, entry.name(), occupant, false);
+    match kind {
+      // A complete re-arm: prune vanished, arm new, cascade — without emitting `Created`.
+      EnumKind::Rearm => self.rearm_enumerate(dir, scope, &res),
+      // A complete cold enumerate: discovery — emit `Created` and install per-directory.
+      EnumKind::Cold => {
+        for entry in res.entries() {
+          let location = self.child_location(dir, entry.name());
+          self.emit(scope, location, ChangeKind::Created);
+          // Only a known directory is descended into (an `Unknown`-kind entry is a
+          // non-directory, never watched). A cold enumerate is discovery, not a replace,
+          // so an already-watched slot is reused (`replaced = false`).
+          let occupant = if entry.is_dir() {
+            SlotOccupant::Dir
+          } else {
+            SlotOccupant::File
+          };
+          self.reconcile_slot(dir, scope, entry.name(), occupant, false);
+        }
+      }
     }
   }
 
@@ -365,13 +391,19 @@ impl Monitor {
   /// gap-created descendant), emits a `Rescan` so the consumer refreshes the content
   /// the read could not report, and retries a bounded number of times before letting
   /// the `Rescan` stand — so a permanently-unreadable directory cannot spin the driver.
-  fn handle_incomplete_enumerate(&mut self, dir: WatchId, scope: ScopeId, res: &EnumerateResult) {
+  fn handle_incomplete_enumerate(
+    &mut self,
+    dir: WatchId,
+    scope: ScopeId,
+    res: &EnumerateResult,
+    attempts: u8,
+  ) {
     // Reconcile every VISIBLE entry (a `Failed` read surfaces none): install or keep a
-    // directory (marking a freshly-installed one for re-arm), and — for a directory
-    // that the listing now positively reports as a non-directory — drop the stale watch
-    // so it can't keep attributing events or block a later real directory at that name.
-    // Never prune OMITTED names (the listing is incomplete). No `Created` — the `Rescan`
-    // below refreshes consumer content.
+    // directory, and — for a name the listing now positively reports as a non-directory
+    // — drop the stale watch so it can't keep attributing events or block a later real
+    // directory there. Never prune OMITTED names (the listing is incomplete). No
+    // `Created` — the `Rescan` below refreshes consumer content. A freshly-installed
+    // child is picked up by the cascade that follows (it is now in the adjacency set).
     for entry in res.entries() {
       let occupant = if entry.is_dir() {
         SlotOccupant::Dir
@@ -379,12 +411,6 @@ impl Monitor {
         SlotOccupant::File
       };
       self.reconcile_slot(dir, scope, entry.name(), occupant, false);
-      if entry.is_dir()
-        && let Some(child) = self.child_watch(dir, entry.name())
-        && self.nodes.get(&child).is_some_and(|node| !node.live)
-      {
-        self.rearming.insert(child);
-      }
     }
     // Cascade the re-arm into EVERY child of `dir` — those in a name-slot AND any
     // detached-and-held move source (mid-move, out of `child_index` but still in the
@@ -402,48 +428,59 @@ impl Monitor {
       self.inherit_rearm(child);
     }
     self.emit_rescan(scope, self.location_of(dir));
-    let attempts = self.rearm_attempts.get(&dir).copied().unwrap_or(0);
     if attempts < REARM_MAX_RETRIES {
-      self.rearm_attempts.insert(dir, attempts + 1);
-      self.start_rearm(dir);
-    } else {
-      self.rearm_attempts.remove(&dir);
+      // Retry as a re-arm read (`Created`-suppressed); the count carries on the node so a
+      // permanently-unreadable directory escalates to the standing `Rescan` after a
+      // bounded number of tries rather than spinning the driver.
+      self.queue_enumerate(dir, EnumKind::Rearm, attempts + 1);
     }
+    // else: retries exhausted — the node stays `Live` and the `Rescan` stands. (S3 turns
+    // this into a recovering `Degraded` state re-attempted on the next reconcile trigger.)
   }
 
-  /// Queues an [`Action::Enumerate`] for `dir`, tagging it as a rescan re-arm when
-  /// `rearm` so its result reconciles coverage without emitting `Created`.
-  fn queue_enumerate(&mut self, dir: WatchId, rearm: bool) {
+  /// Queues an [`Action::Enumerate`] for `dir` and moves it to
+  /// [`NodeState::Enumerating`] under the fresh request, recording `kind` (discovery vs
+  /// re-arm) and the carried retry `attempts`.
+  fn queue_enumerate(&mut self, dir: WatchId, kind: EnumKind, attempts: u8) {
     let req = self.next_req_id();
     self.pending_enumerate.insert(req, dir);
-    if rearm {
-      self.rearm_reqs.insert(req);
-    }
+    self.set_state(
+      dir,
+      NodeState::Enumerating {
+        req,
+        kind,
+        attempts,
+      },
+    );
     self.actions.push_back(Action::enumerate(req, dir));
   }
 
-  /// Begins (or continues) a rescan re-arm of `dir`, coalesced: queues a re-arm
-  /// enumerate only if one is not already outstanding for it, so repeated overflows
-  /// and cascade re-arms cannot stack duplicate requests. A no-op on a non-descending
-  /// backend or a `dir` that is not live.
+  /// Begins a rescan re-arm of `dir`, coalesced. Only a live, idle directory
+  /// ([`NodeState::Live`]) starts a read: a node already enumerating absorbs the trigger
+  /// (one read at a time, so repeated overflows and cascades cannot stack requests), and
+  /// a pending or dead one has nothing to read yet — a pending one's post-arm enumerate
+  /// carries the obligation instead. A no-op on a non-descending backend.
   fn start_rearm(&mut self, dir: WatchId) {
     if self.descends()
-      && self.nodes.get(&dir).is_some_and(|node| node.live)
-      && self.rearm_dirs.insert(dir)
+      && matches!(
+        self.nodes.get(&dir).map(|node| node.state),
+        Some(NodeState::Live)
+      )
     {
-      self.queue_enumerate(dir, true);
+      self.queue_enumerate(dir, EnumKind::Rearm, 0);
     }
   }
 
   /// Transfers a re-arm obligation onto `watch` — a watch that has just replaced a
-  /// mid-re-arm one. Re-arms it now if it is already live; otherwise marks it so its
-  /// post-arm enumerate continues the re-arm, since `start_rearm` is a no-op on a
-  /// not-yet-live watch and a pending target's obligation must survive until it arms.
+  /// mid-re-arm one, or a surviving child cascaded during an incomplete parent read.
   fn inherit_rearm(&mut self, watch: WatchId) {
-    if self.nodes.get(&watch).is_some_and(|node| node.live) {
-      self.start_rearm(watch);
-    } else {
-      self.rearming.insert(watch);
+    match self.nodes.get(&watch).map(|node| node.state) {
+      // Live and idle: begin the re-arm now.
+      Some(NodeState::Live) => self.start_rearm(watch),
+      // Still arming: its post-arm enumerate must continue the re-arm, so mark it.
+      Some(NodeState::Arming { .. }) => self.set_state(watch, NodeState::Arming { rearm: true }),
+      // Already enumerating (obligation in flight) or dead — nothing to transfer.
+      _ => {}
     }
   }
 
@@ -481,7 +518,7 @@ impl Monitor {
       }
       self.install_child(dir, scope, entry.name().clone(), true);
       if let Some(fresh) = self.child_watch(dir, entry.name()) {
-        self.rearming.insert(fresh);
+        self.inherit_rearm(fresh);
       }
     }
   }
@@ -509,15 +546,15 @@ impl Monitor {
 
     match res {
       Ok(()) => {
-        node.live = true;
+        let rearm = matches!(node.state, NodeState::Arming { rearm: true });
+        node.state = NodeState::Live;
         if is_dir && self.descends() {
           // Continue a rescan re-arm into this freshly-armed directory if it was
-          // installed as part of one (coalesced); otherwise a normal discovery
-          // enumerate.
-          if self.rearming.remove(&id) {
+          // installed as part of one; otherwise a normal discovery enumerate.
+          if rearm {
             self.start_rearm(id);
           } else {
-            self.queue_enumerate(id, false);
+            self.queue_enumerate(id, EnumKind::Cold, 0);
           }
         }
       }
@@ -827,10 +864,10 @@ impl Monitor {
     if let Some(stale) = self.child_watch(new_parent, &new_name)
       && stale != child
     {
-      // The replaced destination may be mid-re-arm — either enumerating (`rearm_dirs`)
-      // or armed-and-pending its re-arm enumerate (`rearming`). Either way the
-      // obligation must pass to the reparented subtree, not vanish with the drop.
-      inherit_rearm = self.rearm_dirs.contains(&stale) || self.rearming.contains(&stale);
+      // The replaced destination may carry a re-arm obligation (a pending arm that will
+      // re-arm, or an outstanding re-arm read). Either way it must pass to the reparented
+      // subtree, not vanish with the drop.
+      inherit_rearm = self.has_rearm_obligation(stale);
       self.drop_subtree(stale);
     }
     // Dropping the stale destination can have removed `child` itself (the held source
@@ -934,7 +971,7 @@ impl Monitor {
         // during an overflow stays covered when a move-in replaces its slot.
         let mut inherit = false;
         if replaced && let Some(stale) = self.child_watch(parent, name) {
-          inherit = self.rearm_dirs.contains(&stale) || self.rearming.contains(&stale);
+          inherit = self.has_rearm_obligation(stale);
           self.drop_subtree(stale);
         }
         self.install_child(parent, scope, name.clone(), true);
@@ -1015,7 +1052,7 @@ impl Monitor {
         name: Some(name.clone()),
         scope,
         is_dir,
-        live: false,
+        state: NodeState::Arming { rearm: false },
         children: BTreeSet::new(),
       },
     );
@@ -1063,9 +1100,6 @@ impl Monitor {
           self.child_index.remove(&(parent, name));
         }
       }
-      self.rearming.remove(&id);
-      self.rearm_dirs.remove(&id);
-      self.rearm_attempts.remove(&id);
       self.actions.push_back(Action::Unwatch(id));
     }
     // NOTE: a narrow subtree drop deliberately does NOT purge pending move halves.
@@ -1111,6 +1145,42 @@ impl Monitor {
       .get(&child)
       .and_then(|node| node.name.clone())
       .is_some_and(|name| self.child_index.get(&(parent, name)) == Some(&child))
+  }
+
+  /// Whether a watch carries an unfulfilled rescan re-arm obligation — a pending arm
+  /// that will re-arm (`Arming { rearm: true }`) or an outstanding re-arm read
+  /// (`Enumerating { kind: Rearm }`) — so it can be transferred to a replacement watch.
+  fn has_rearm_obligation(&self, id: WatchId) -> bool {
+    matches!(
+      self.nodes.get(&id).map(|node| node.state),
+      Some(
+        NodeState::Arming { rearm: true }
+          | NodeState::Enumerating {
+            kind: EnumKind::Rearm,
+            ..
+          }
+      )
+    )
+  }
+
+  /// Sets a node's [`NodeState`], if it is still registered.
+  fn set_state(&mut self, id: WatchId, state: NodeState) {
+    if let Some(node) = self.nodes.get_mut(&id) {
+      node.state = state;
+    }
+  }
+
+  /// Whether `dir` has a rescan re-arm read outstanding — the successor to the old
+  /// `rearm_dirs` membership, for white-box tests.
+  #[cfg(test)]
+  fn is_rearm_enumerating(&self, dir: WatchId) -> bool {
+    matches!(
+      self.nodes.get(&dir).map(|node| node.state),
+      Some(NodeState::Enumerating {
+        kind: EnumKind::Rearm,
+        ..
+      })
+    )
   }
 
   fn location_of(&self, id: WatchId) -> Location {
