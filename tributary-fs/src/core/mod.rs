@@ -16,7 +16,7 @@
 //! rescan. Loss is never silent.
 
 use std::{
-  collections::{BTreeMap, VecDeque},
+  collections::{BTreeMap, BTreeSet, VecDeque},
   num::NonZeroU64,
   path::{Path, PathBuf},
   time::Duration,
@@ -123,11 +123,14 @@ struct Item {
 }
 
 /// A batch whose items are being resolved; fed to the Monitor only once every
-/// probe has answered, so per-root input order is preserved.
+/// probe has answered, so per-root input order is preserved. `trailing`
+/// inputs (a covering rescan for an ambiguous rename group) apply after every
+/// item, so whatever the items degraded to is dominated.
 #[derive(Debug)]
 struct PendingBatch {
   items: Vec<Item>,
   awaiting: usize,
+  trailing: Vec<Planned>,
 }
 
 /// Per-root batch parking: while a batch has probes in flight, later batches
@@ -154,6 +157,10 @@ enum ProbePurpose {
     file_id: Option<NonZeroU64>,
     target: Option<Location>,
     path: PathBuf,
+    /// Whether the half may mint a pairing cookie at all — `false` for a
+    /// member of an ambiguous same-fileID group, whose shared id must not
+    /// pair anything.
+    allow_cookie: bool,
   },
   /// A `RootChanged` needed the root's existence to pick the death signal.
   RootAlive { item: usize },
@@ -203,6 +210,16 @@ enum Attempt {
   },
 }
 
+/// A torn-down scope's terminal `Rescan`, retried until the consumer accepts
+/// it. Teardown ends the OS stream immediately, but the one change covering
+/// everything the dead scope dropped must survive refusals — a plain queued
+/// emit is one-shot, with no scope state left to re-park it on a full channel.
+#[derive(Debug)]
+struct DyingDelivery {
+  change: Change,
+  attempt: Attempt,
+}
+
 /// One watched root's driver-side state.
 #[derive(Debug)]
 struct ScopeState {
@@ -239,6 +256,10 @@ pub(crate) struct DriverCore {
   watch_scopes: BTreeMap<WatchId, ScopeId>,
   probes: BTreeMap<ProbeId, ProbeCtx>,
   effects: VecDeque<Effect>,
+  /// Terminal `Rescan`s of torn-down scopes, each retried until accepted.
+  /// Scope handles are never reused, so a dead scope's key cannot collide
+  /// with a live one.
+  dying: BTreeMap<ScopeId, DyingDelivery>,
   scope_seq: u64,
   probe_seq: u64,
 }
@@ -259,6 +280,7 @@ impl DriverCore {
       watch_scopes: BTreeMap::new(),
       probes: BTreeMap::new(),
       effects: VecDeque::new(),
+      dying: BTreeMap::new(),
       scope_seq: 0,
       probe_seq: 0,
     }
@@ -396,6 +418,25 @@ impl DriverCore {
   /// Feeds the outcome of one attempted [`Effect::Emit`].
   pub(crate) fn on_delivery(&mut self, scope: ScopeId, delivery: Delivery, now: Instant) {
     let Some(state) = self.scopes.get_mut(&scope) else {
+      // A dead scope: the outcome belongs to its retryable terminal `Rescan`
+      // iff that offer is the one in flight — the driver reports each emit
+      // synchronously, so an ordinary post-teardown emit and the dying offer
+      // are never in flight together. An ordinary emit's refusal is covered
+      // by the dying `Rescan` itself and needs no bookkeeping.
+      if let Some(entry) = self.dying.get_mut(&scope)
+        && matches!(entry.attempt, Attempt::InFlight(_))
+      {
+        match delivery {
+          Delivery::Accepted => {
+            self.dying.remove(&scope);
+          }
+          Delivery::Refused => {
+            entry.attempt = Attempt::Spent {
+              retry_at: now + DELIVERY_RETRY,
+            };
+          }
+        }
+      }
       return;
     };
     match (delivery, &mut state.lag) {
@@ -447,12 +488,20 @@ impl DriverCore {
         *attempt = Attempt::Idle;
       }
     }
+    for entry in self.dying.values_mut() {
+      if let Attempt::Spent { retry_at } = entry.attempt
+        && now.reached(retry_at)
+      {
+        entry.attempt = Attempt::Idle;
+      }
+    }
     self.drain_monitor();
   }
 
   /// Dequeues the next I/O obligation, if any. A scope lagging with a parked
-  /// `Rescan` offers that delivery here once per attempt; a refusal re-arms
-  /// through the retry timer, never synchronously.
+  /// `Rescan` — or a torn-down scope whose terminal `Rescan` is still owed —
+  /// offers that delivery here once per attempt; a refusal re-arms through
+  /// the retry timer, never synchronously.
   pub(crate) fn poll_effect(&mut self) -> Option<Effect> {
     if let Some(effect) = self.effects.pop_front() {
       return Some(effect);
@@ -467,6 +516,15 @@ impl DriverCore {
         return Some(Effect::Emit {
           scope: *scope,
           change: change.clone(),
+        });
+      }
+    }
+    for (scope, entry) in self.dying.iter_mut() {
+      if matches!(entry.attempt, Attempt::Idle) {
+        entry.attempt = Attempt::InFlight(entry.change.epoch());
+        return Some(Effect::Emit {
+          scope: *scope,
+          change: entry.change.clone(),
         });
       }
     }
@@ -487,6 +545,10 @@ impl DriverCore {
         } => Some(*retry_at),
         _ => None,
       })
+      .chain(self.dying.values().filter_map(|entry| match entry.attempt {
+        Attempt::Spent { retry_at } => Some(retry_at),
+        _ => None,
+      }))
       .min();
     match (self.monitor.poll_timeout(), retry) {
       (Some(monitor), Some(retry)) => Some(if monitor.reached(retry) {
@@ -526,11 +588,18 @@ impl DriverCore {
   fn apply(monitor: &mut Monitor, batch: PendingBatch, now: Instant) {
     for item in batch.items {
       for planned in item.planned {
-        match planned {
-          Planned::Rec(rec) => monitor.on_os_record(rec, now),
-          Planned::Over(scope) => monitor.on_overflow(scope, now),
-        }
+        Self::feed(monitor, planned, now);
       }
+    }
+    for planned in batch.trailing {
+      Self::feed(monitor, planned, now);
+    }
+  }
+
+  fn feed(monitor: &mut Monitor, planned: Planned, now: Instant) {
+    match planned {
+      Planned::Rec(rec) => monitor.on_os_record(rec, now),
+      Planned::Over(scope) => monitor.on_overflow(scope, now),
     }
   }
 
@@ -583,10 +652,23 @@ impl DriverCore {
       }
     }
     let mut paired: BTreeMap<usize, Planned> = BTreeMap::new();
+    // Members of a group whose shared fileID is ambiguous — a chain or
+    // coalesced reuse (more than two entries), or a device the id cannot be
+    // trusted on (fileIDs are device-scoped). None of them may mint a cookie:
+    // each degrades through the cookie-less probe path, and the whole group
+    // is covered by one trailing located rescan so no mis-read is silent.
+    let mut suppressed: BTreeSet<usize> = BTreeSet::new();
+    let mut trailing: Vec<Planned> = Vec::new();
     for (fid, group) in &rename_groups {
-      if let [a, b] = group.as_slice()
-        && events[*a].path != events[*b].path
-      {
+      let pairable = match group.as_slice() {
+        [a, b] => {
+          events[*a].path != events[*b].path
+            && cookie_for(state, &events[*a].path, Some(*fid), None).is_some()
+            && cookie_for(state, &events[*b].path, Some(*fid), None).is_some()
+        }
+        _ => false,
+      };
+      if let ([a, b], true) = (group.as_slice(), pairable) {
         let (from_idx, to_idx) = if events[*a].event_id <= events[*b].event_id {
           (*a, *b)
         } else {
@@ -608,6 +690,13 @@ impl DriverCore {
           paired.insert(from_slot, from);
           paired.insert(to_slot, to);
         }
+      } else if group.len() > 1 {
+        suppressed.extend(group.iter().copied());
+        trailing.push(Self::covering_rescan(
+          state,
+          scope,
+          group.iter().map(|idx| &events[*idx].path),
+        ));
       }
     }
 
@@ -621,7 +710,7 @@ impl DriverCore {
         });
         continue;
       }
-      match self.plan_event(state, scope, idx, ev) {
+      match self.plan_event(state, scope, idx, ev, !suppressed.contains(&idx)) {
         ItemPlan::Immediate(planned) => items.push(Item {
           planned,
           probe: None,
@@ -636,7 +725,49 @@ impl DriverCore {
         }
       }
     }
-    PendingBatch { items, awaiting }
+    PendingBatch {
+      items,
+      awaiting,
+      trailing,
+    }
+  }
+
+  /// One rescan covering an ambiguous same-fileID rename group: the deepest
+  /// common ancestor of the members' parents, clamped to the whole root when
+  /// any member falls outside it.
+  fn covering_rescan<'a>(
+    state: &ScopeState,
+    scope: ScopeId,
+    paths: impl Iterator<Item = &'a PathBuf>,
+  ) -> Planned {
+    let mut prefix: Option<Vec<Segment>> = None;
+    for path in paths {
+      let parent = match lower(state, path) {
+        Lowered::Target(location) => {
+          let mut segments = location.segments().to_vec();
+          segments.pop();
+          segments
+        }
+        Lowered::Root => Vec::new(),
+        Lowered::Outside => return Planned::Over(Scope::Root(scope)),
+      };
+      prefix = Some(match prefix {
+        None => parent,
+        Some(acc) => acc
+          .iter()
+          .zip(parent.iter())
+          .take_while(|(a, b)| a == b)
+          .map(|(a, _)| a.clone())
+          .collect(),
+      });
+    }
+    let descent = prefix.unwrap_or_default();
+    let target = if descent.is_empty() {
+      None
+    } else {
+      Some(Location::from_segments(descent))
+    };
+    Planned::Over(located(state.watch, target))
   }
 
   /// Plans one non-paired event. See the design's grounding table: flags are
@@ -648,6 +779,7 @@ impl DriverCore {
     scope: ScopeId,
     idx: usize,
     ev: &RawOsEvent,
+    allow_cookie: bool,
   ) -> ItemPlan {
     let flags = ev.flags;
     if flags.history_done() {
@@ -692,6 +824,7 @@ impl DriverCore {
           file_id: ev.file_id,
           target,
           path: ev.path.clone(),
+          allow_cookie,
         },
       );
       return ItemPlan::Await {
@@ -853,15 +986,21 @@ impl DriverCore {
         file_id,
         target,
         path,
+        allow_cookie,
       } => {
         let planned = match outcome {
           // Gone: the source half of a move out of (or within) the tree. The
           // fileID cookie lets a destination half pair inside the Monitor's
           // window; without one the Monitor degrades it to a removal now.
+          // Cookie trust follows the identity rule: a device-scoped id off
+          // the root device (or suppressed by group ambiguity) never pairs.
           ProbeOutcome::Missing => {
+            let cookie = allow_cookie
+              .then(|| cookie_for(state, &path, file_id, None))
+              .flatten();
             let mut rec = record_with(state, RecordKind::MovedFrom, target, None, None);
-            if let Some(fid) = file_id {
-              rec = rec.with_cookie(MoveCookie::new(fid));
+            if let Some(cookie) = cookie {
+              rec = rec.with_cookie(cookie);
             }
             vec![Planned::Rec(rec)]
           }
@@ -875,7 +1014,9 @@ impl DriverCore {
             dev,
           } => {
             learn_device(state, &path, dev);
-            let cookie = file_id.or(probed);
+            let cookie = allow_cookie
+              .then(|| cookie_for(state, &path, file_id.or(probed), Some(dev)))
+              .flatten();
             let node = mint(state, &path, probed, Some(dev));
             let mut rec = record_with(
               state,
@@ -884,8 +1025,8 @@ impl DriverCore {
               Some(kind.is_dir()),
               node,
             );
-            if let Some(fid) = cookie {
-              rec = rec.with_cookie(MoveCookie::new(fid));
+            if let Some(cookie) = cookie {
+              rec = rec.with_cookie(cookie);
             }
             let mut planned = vec![Planned::Rec(rec)];
             if kind.is_dir() {
@@ -906,6 +1047,18 @@ impl DriverCore {
   /// dominated, and always survive.
   fn purge_scope_emits(effects: &mut VecDeque<Effect>, scope: ScopeId) {
     effects.retain(|effect| !matches!(effect, Effect::Emit { scope: s, .. } if *s == scope));
+  }
+
+  /// Removes and returns the LAST queued `Rescan` emit for `scope`, if any —
+  /// the terminal covering change a teardown keeps retryable.
+  fn extract_last_rescan(effects: &mut VecDeque<Effect>, scope: ScopeId) -> Option<Change> {
+    let idx = effects.iter().rposition(|effect| {
+      matches!(effect, Effect::Emit { scope: s, change } if *s == scope && change.kind().is_rescan())
+    })?;
+    match effects.remove(idx) {
+      Some(Effect::Emit { change, .. }) => Some(change),
+      _ => None,
+    }
   }
 
   fn mint_probe(&mut self, scope: ScopeId, purpose: ProbePurpose) -> ProbeId {
@@ -950,19 +1103,33 @@ impl DriverCore {
         }
         tributary_proto::Action::Unwatch(watch) => {
           if let Some(scope) = self.watch_scopes.remove(&watch) {
-            if let Some(state) = self.scopes.remove(&scope) {
-              // A lagged scope's parked Rescan is the only signal covering
-              // its dropped events; the teardown must still surface it
-              // (best-effort at delivery, like every post-teardown change) —
-              // silently discarding it would end a dead root's scope without
-              // the consumer ever learning coverage was lost.
-              if let LagState::Lagged {
-                parked: Some(change),
-                ..
-              } = state.lag
-              {
-                self.effects.push_back(Effect::Emit { scope, change });
-              }
+            // The scope's terminal `Rescan` — parked by lag, or still queued
+            // as a plain effect — is the only signal covering whatever the
+            // dead scope dropped, and it must survive refusals: a queued
+            // emit is one-shot (a refusal finds no scope state to re-park
+            // it), so the newest terminal `Rescan` moves into the dying set
+            // and retries until the consumer accepts it. Ordinary queued
+            // emits stay best-effort — each is dominated by that `Rescan`.
+            let parked = self
+              .scopes
+              .remove(&scope)
+              .and_then(|state| match state.lag {
+                LagState::Lagged { parked, .. } => parked,
+                LagState::Normal => None,
+              });
+            let queued = Self::extract_last_rescan(&mut self.effects, scope);
+            let terminal = match (parked, queued) {
+              (Some(a), Some(b)) => Some(if b.epoch() > a.epoch() { b } else { a }),
+              (a, b) => a.or(b),
+            };
+            if let Some(change) = terminal {
+              self.dying.insert(
+                scope,
+                DyingDelivery {
+                  change,
+                  attempt: Attempt::Idle,
+                },
+              );
             }
             self.probes.retain(|_, ctx| ctx.scope != scope);
             self.effects.push_back(Effect::TeardownStream { scope });
@@ -1073,14 +1240,33 @@ fn mint(
   dev: Option<u64>,
 ) -> Option<Identity> {
   let fid = file_id?;
+  device_trusted(state, path, dev).then(|| Identity::new(fid))
+}
+
+/// The move cookie for a rename half at `path`, under the same device trust
+/// as [`mint`]: a fileID is device-scoped, so a cookie minted for an object
+/// off the root device could pair two different objects into a fabricated
+/// move — corruption with no covering rescan.
+fn cookie_for(
+  state: &ScopeState,
+  path: &Path,
+  file_id: Option<NonZeroU64>,
+  dev: Option<u64>,
+) -> Option<MoveCookie> {
+  let fid = file_id?;
+  device_trusted(state, path, dev).then(|| MoveCookie::new(fid))
+}
+
+/// Whether `path`'s objects live on the scope's root device, as far as the
+/// core can tell: an event-side caller passes `dev: None` (trusted iff no
+/// foreign-mount prefix covers the path), a probe-side caller passes the
+/// stat-read device (authoritative).
+fn device_trusted(state: &ScopeState, path: &Path, dev: Option<u64>) -> bool {
   match (dev, state.root_dev) {
-    (Some(dev), Some(root_dev)) if dev != root_dev => return None,
+    (Some(dev), Some(root_dev)) if dev != root_dev => return false,
     _ => {}
   }
-  if state.mounts.iter().any(|m| path.starts_with(m)) {
-    return None;
-  }
-  Some(Identity::new(fid))
+  !state.mounts.iter().any(|m| path.starts_with(m))
 }
 
 /// Records a probed foreign-device path as a mount prefix, so later
