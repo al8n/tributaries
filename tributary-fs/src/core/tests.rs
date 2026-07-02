@@ -944,3 +944,216 @@ fn teardown_flushes_a_parked_rescan() {
     "the dead stream is torn down"
   );
 }
+
+#[test]
+fn terminal_rescan_retries_until_accepted() {
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 10)],
+    at(1),
+  );
+  assert!(matches!(core.poll_effect(), Some(Effect::Emit { .. })));
+  core.on_delivery(scope, Delivery::Refused, at(2));
+
+  // The root dies while the scope is lagged: the terminal Rescan is offered
+  // after the teardown is dispatched.
+  core.on_source_fatal(scope, at(3));
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(emitted.len(), 1, "{effects:?}");
+  assert!(emitted[0].kind().is_rescan());
+
+  // Refused again: the scope state is gone, but the terminal Rescan is not —
+  // it re-arms on the retry timer and is re-offered until accepted.
+  core.on_delivery(scope, Delivery::Refused, at(4));
+  assert!(
+    emits(&drain(&mut core)).is_empty(),
+    "no synchronous re-offer for a dead scope either"
+  );
+  let retry = core
+    .poll_timeout()
+    .expect("the dying delivery arms the retry timer");
+  core.on_timeout(retry);
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(emitted.len(), 1, "the terminal Rescan retries: {effects:?}");
+  assert!(emitted[0].kind().is_rescan());
+
+  core.on_delivery(scope, Delivery::Accepted, at(60));
+  assert!(
+    emits(&drain(&mut core)).is_empty(),
+    "accepted: nothing owed"
+  );
+  assert_eq!(core.poll_timeout(), None, "no timer stays armed");
+}
+
+#[test]
+fn root_death_rescan_survives_refusal_after_teardown() {
+  let (mut core, scope) = live_core();
+  // A Normal (never-lagged) scope dies: the terminal Rescan is a queued
+  // effect at teardown time and must still be retryable, not one-shot.
+  core.on_source_fatal(scope, at(1));
+  let offered = loop {
+    match core.poll_effect() {
+      Some(Effect::Emit { change, .. }) => break change,
+      Some(_) => continue,
+      None => panic!("a terminal Rescan is owed"),
+    }
+  };
+  assert!(offered.kind().is_rescan());
+
+  core.on_delivery(scope, Delivery::Refused, at(2));
+  let retry = core
+    .poll_timeout()
+    .expect("the refusal arms a retry for the dead scope");
+  core.on_timeout(retry);
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(emitted.len(), 1, "{effects:?}");
+  assert!(emitted[0].kind().is_rescan());
+
+  core.on_delivery(scope, Delivery::Accepted, at(60));
+  assert_eq!(core.poll_timeout(), None);
+}
+
+#[test]
+fn same_fileid_chain_degrades_under_a_covering_rescan() {
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/x/a", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 42),
+      ev("/r/x/b", flags(&[FsEventFlags::ITEM_RENAMED]), 2, 42),
+      ev("/r/x/c", flags(&[FsEventFlags::ITEM_RENAMED]), 3, 42),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 3, "an ambiguous group probes every member");
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(reqs[1].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[2].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "an ambiguous chain never fabricates a Moved: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_rescan() && c.location() == &loc(&["x"])),
+    "the group is covered by one located Rescan: {emitted:?}"
+  );
+  assert_eq!(
+    core.poll_timeout(),
+    None,
+    "no cookie half is left pending a pair"
+  );
+}
+
+#[test]
+fn cross_device_fileid_collision_never_pairs() {
+  let (mut core, scope) = live_core();
+  // Learn the foreign prefix first (a mounted volume under the root).
+  core.on_batch(
+    scope,
+    vec![ev(
+      "/r/vol",
+      flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_MODIFIED]),
+      1,
+      5,
+    )],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  core.on_probe_result(
+    reqs[0].0,
+    ProbeOutcome::Present {
+      kind: FileKind::Dir,
+      file_id: NonZeroU64::new(5),
+      dev: 99,
+    },
+    at(2),
+  );
+  let _ = drain(&mut core);
+
+  // The same fileID on both devices in one batch: one under the mount, one
+  // native. Device-scoped ids must never pre-pair them.
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/vol/twin", flags(&[FsEventFlags::ITEM_RENAMED]), 10, 77),
+      ev("/r/native", flags(&[FsEventFlags::ITEM_RENAMED]), 11, 77),
+    ],
+    at(3),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2, "a device-ambiguous pair never pre-pairs");
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(4));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(77),
+      dev: 1,
+    },
+    at(4),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "device-scoped ids never fabricate a move: {emitted:?}"
+  );
+  assert!(
+    emitted.iter().any(|c| c.kind().is_rescan()),
+    "the ambiguous group is covered by a Rescan: {emitted:?}"
+  );
+  assert_eq!(
+    core.poll_timeout(),
+    None,
+    "no cookie was minted for either half"
+  );
+}
+
+#[test]
+fn foreign_device_singleton_rename_half_gets_no_cookie() {
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![ev("/r/alien", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 88)],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  core.on_probe_result(
+    reqs[0].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(88),
+      dev: 7,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(emitted.len(), 1, "{effects:?}");
+  assert!(
+    emitted[0].kind().is_created(),
+    "a foreign-device destination half degrades to Created"
+  );
+  assert_eq!(
+    core.poll_timeout(),
+    None,
+    "no cookie: nothing waits to pair"
+  );
+}

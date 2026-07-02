@@ -491,3 +491,52 @@ async fn disconnected_source_is_a_dead_stream() {
   tokio::time::sleep(Duration::from_millis(100)).await;
   assert_eq!(rig.fs.shutdowns(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn lagged_root_death_delivers_the_terminal_rescan() {
+  let rig = rig_with_capacity(1);
+  let _scope = watch(&rig, "/r").await;
+  let tap = rig.fs.tap("/r");
+
+  // The first change fills the capacity-1 channel; the second refusal parks
+  // a dominating Rescan while the channel is still full.
+  for (id, name) in [(1u64, "/r/a"), (2, "/r/b")] {
+    tap
+      .send(SourceMessage::Batch(vec![ev(
+        name,
+        FsEventFlags::ITEM_CREATED,
+        id,
+        id,
+      )]))
+      .await
+      .unwrap();
+  }
+  tokio::time::sleep(Duration::from_millis(100)).await;
+
+  // The root dies while the scope is lagged and the channel is full: the
+  // terminal Rescan must survive every refusal and land once the consumer
+  // finally drains. Every sender must drop for the receiver to disconnect —
+  // including this test's own tap clone.
+  drop(tap);
+  rig.fs.disconnect("/r");
+  tokio::time::sleep(Duration::from_millis(500)).await;
+
+  let (_, first) = next_event(&rig).await;
+  assert!(first.kind().is_created());
+  let (_, second) = next_event(&rig).await;
+  assert!(
+    second.kind().is_rescan(),
+    "the terminal Rescan is never lost: {second:?}"
+  );
+  assert!(second.epoch() > first.epoch());
+  // The teardown runs on the blocking pool in real time; give its thread
+  // scheduler slices instead of trusting one paused-time sleep.
+  for _ in 0..100 {
+    if rig.fs.shutdowns() == 1 {
+      break;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
+}
