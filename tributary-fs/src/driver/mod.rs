@@ -19,7 +19,7 @@ use tributary_proto::{Change, Instant, Interest, ScopeId};
 
 use crate::{
   core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome, RootMeta},
-  os::{EventReceiver, Source, SourceConfig, SourceError, SourceHandle, SourceMessage},
+  os::{Source, SourceChannels, SourceConfig, SourceError, SourceHandle, SourceMessage},
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -84,8 +84,8 @@ pub(crate) enum Command {
 pub(crate) struct SpawnedSource<H> {
   /// The live stream handle.
   pub(crate) handle: H,
-  /// The stream's decoded-batch receiver.
-  pub(crate) receiver: EventReceiver,
+  /// The stream's data + control receivers.
+  pub(crate) channels: SourceChannels,
   /// What the spawn learned about the root.
   pub(crate) meta: RootMeta,
 }
@@ -105,24 +105,17 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
 /// The control surface of a live stream handle.
 pub(crate) trait SourceControl: Send + 'static {
-  /// Drains the source's overflow latch.
-  fn take_overflow(&self) -> bool;
-
-  /// Drains the source's fatal latch (a dead stream whose in-band `Fatal`
-  /// message may have been dropped by a full channel).
-  fn take_fatal(&self) -> bool;
+  /// Acknowledges a processed in-band `Overflow`, re-arming the source's
+  /// dedup so the next loss sends a fresh one.
+  fn overflow_processed(&self);
 
   /// Quiesces and destroys the stream (blocking, bounded).
   fn shutdown(self);
 }
 
 impl SourceControl for SourceHandle {
-  fn take_overflow(&self) -> bool {
-    SourceHandle::take_overflow(self)
-  }
-
-  fn take_fatal(&self) -> bool {
-    SourceHandle::take_fatal(self)
+  fn overflow_processed(&self) {
+    SourceHandle::overflow_processed(self);
   }
 
   fn shutdown(self) {
@@ -138,16 +131,28 @@ impl FsOps for RealFs {
   type Handle = SourceHandle;
 
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
-    let (handle, receiver) = Source::spawn(config)?;
+    let (handle, channels) = Source::spawn(config)?;
     let root = handle.roots().first().cloned().unwrap_or_default();
     let root_dev = root_device(&root).map_err(|source| SourceError::RootUnavailable {
       root: root.clone(),
       source,
     })?;
+    // Seed the device-boundary table from the LIVE mount table: an unseeded
+    // table is blind to already-mounted volumes, and event-side identity
+    // trust must never be presumed off blindness.
+    let (mounts, mounts_authoritative) = match crate::os::mounts_under(&root) {
+      Some(mounts) => (mounts, true),
+      None => (Vec::new(), false),
+    };
     Ok(SpawnedSource {
       handle,
-      receiver,
-      meta: RootMeta { root, root_dev },
+      channels,
+      meta: RootMeta {
+        root,
+        root_dev,
+        mounts,
+        mounts_authoritative,
+      },
     })
   }
 
@@ -303,13 +308,30 @@ pub(crate) async fn run<R, F>(
               handles.insert(scope, spawned.handle);
               os.push(
                 spawned
-                  .receiver
+                  .channels
+                  .data
                   .map(move |msg| (scope, Some(msg)))
                   .chain(futures_util::stream::once(async move { (scope, None) }))
                   .boxed(),
               );
-              if let Some(reply) = watch_replies.remove(&scope) {
-                let _ = reply.send(Ok((scope, canonical_root)));
+              // Control carries only Overflow/Fatal; its end needs no marker
+              // (stream death is the DATA stream's end, and both close
+              // together at teardown).
+              os.push(
+                spawned
+                  .channels
+                  .control
+                  .map(move |msg| (scope, Some(msg)))
+                  .boxed(),
+              );
+              let owned = watch_replies
+                .remove(&scope)
+                .is_some_and(|reply| reply.send(Ok((scope, canonical_root))).is_ok());
+              if !owned {
+                // The watch() future was cancelled: nobody holds the handle,
+                // so the just-spawned stream would leak until close. Tear it
+                // down as an immediate unwatch.
+                core.on_unwatch(scope);
               }
             }
             Err(err) => {
@@ -332,27 +354,24 @@ pub(crate) async fn run<R, F>(
         if let Some((scope, msg)) = msg {
           match msg {
             Some(SourceMessage::Batch(events)) => core.on_batch(scope, events, now()),
-            Some(SourceMessage::Overflow) => core.on_root_overflow(scope, now()),
+            Some(SourceMessage::Overflow) => {
+              // Acknowledge BEFORE acting: a loss racing the acknowledgement
+              // either rides a fresh message or is covered by the rescan
+              // this triggers.
+              if let Some(handle) = handles.get(&scope) {
+                handle.overflow_processed();
+              }
+              core.on_root_overflow(scope, now());
+            }
             Some(SourceMessage::Fatal(_)) => core.on_source_fatal(scope, now()),
-            // The receiver disconnected while the stream should still be
-            // live: the source died without managing to say so (its sender
-            // dropped) — a dead stream, not a teardown of ours (that path
-            // removes the handle before the disconnect can arrive).
+            // The data receiver disconnected while the stream should still
+            // be live: the source died without managing to say so (its
+            // sender dropped) — a dead stream, not a teardown of ours (that
+            // path removes the handle before the disconnect can arrive).
             None => {
               if handles.contains_key(&scope) {
                 core.on_source_fatal(scope, now());
               }
-            }
-          }
-          // Latch drains follow EVERY message of the scope: a full channel
-          // dropped a batch (or the Fatal message itself), and the messages
-          // that made it full are exactly the wake for these swaps.
-          if let Some(handle) = handles.get(&scope) {
-            if handle.take_overflow() {
-              core.on_root_overflow(scope, now());
-            }
-            if handle.take_fatal() {
-              core.on_source_fatal(scope, now());
             }
           }
         }
@@ -361,19 +380,10 @@ pub(crate) async fn run<R, F>(
   };
 
   // Orderly shutdown: quiesce every stream, drain what already arrived, and
-  // deliver what fits — the final drain is documented best-effort.
+  // deliver what fits — the final drain is documented best-effort (loss and
+  // death signals are in-band messages, so anything undrained here is part
+  // of that same best-effort remainder).
   let mut open: Vec<ScopeId> = handles.keys().copied().collect();
-  for scope in &open {
-    let Some(handle) = handles.get(scope) else {
-      continue;
-    };
-    if handle.take_overflow() {
-      core.on_root_overflow(*scope, now());
-    }
-    if handle.take_fatal() {
-      core.on_source_fatal(*scope, now());
-    }
-  }
   for (scope, handle) in std::mem::take(&mut handles) {
     on_scope_dead(scope);
     let tx = op_tx.clone();

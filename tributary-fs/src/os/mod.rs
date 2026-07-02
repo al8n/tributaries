@@ -1,11 +1,13 @@
 //! The platform seam between the async driver and the OS watch primitive.
 //!
 //! Every platform module exposes the same surface: [`Source::spawn`] starts the
-//! native watch and hands back a [`SourceHandle`] plus an [`EventReceiver`] of
-//! [`SourceMessage`]s. The OS-callback side never blocks: every loss path — a
-//! full channel, an undecodable payload — degrades to an overflow signal (an
-//! in-band [`SourceMessage::Overflow`] or the handle's latch), never to a
-//! silently dropped event.
+//! native watch and hands back a [`SourceHandle`] plus the [`SourceChannels`]
+//! it reports on. The OS-callback side never blocks, and loss is IN-BAND: data
+//! rides a bounded channel, while `Overflow`/`Fatal` ride a tiny unbounded
+//! control channel whose sends cannot fail for capacity — so a loss signal can
+//! never be recorded without a message left to observe it. The dedup flag in
+//! the callback state bounds the control channel to one in-flight `Overflow`
+//! per driver acknowledgement.
 
 use std::{io, num::NonZeroUsize, path::PathBuf, time::Duration};
 
@@ -14,12 +16,12 @@ pub(crate) mod fsevent;
 #[cfg(all(target_os = "macos", not(miri)))]
 mod macos;
 #[cfg(all(target_os = "macos", not(miri)))]
-pub(crate) use macos::{Source, SourceHandle};
+pub(crate) use macos::{Source, SourceHandle, mounts_under};
 
 #[cfg(any(not(target_os = "macos"), miri))]
 mod unsupported;
 #[cfg(any(not(target_os = "macos"), miri))]
-pub(crate) use unsupported::{Source, SourceHandle};
+pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
 
 pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
 
@@ -61,16 +63,30 @@ impl SourceConfig {
 #[derive(Debug)]
 pub(crate) enum SourceMessage {
   /// One callback invocation's decoded events; the batch boundary is
-  /// preserved (it is the natural rename-pairing window).
+  /// preserved (it is the natural rename-pairing window). Rides the bounded
+  /// data channel.
   Batch(Vec<RawOsEvent>),
-  /// Transport-level loss: a batch was dropped on a full channel, or an event
-  /// could not be decoded. The receiver must treat the source's subtrees as
-  /// needing a rescan.
+  /// Transport-level loss: a batch was dropped on a full data channel, or an
+  /// event could not be decoded. Rides the unbounded control channel; the
+  /// receiver must treat the source's subtrees as needing a rescan and then
+  /// acknowledge via [`SourceHandle::overflow_processed`], re-arming the
+  /// dedup for the next loss.
   Overflow,
-  /// The stream is dead and will deliver nothing more. The driver reacts to
-  /// the death itself (root invalidation); the carried class is diagnostic
-  /// surface for a future health-reporting channel.
+  /// The stream is dead and will deliver nothing more (sent at most once, on
+  /// the control channel). The driver reacts to the death itself (root
+  /// invalidation); the carried class is diagnostic surface for a future
+  /// health-reporting channel.
   Fatal(#[allow(dead_code)] SourceError),
+}
+
+/// The two receivers of one spawned source.
+#[derive(Debug)]
+pub(crate) struct SourceChannels {
+  /// Decoded batches, bounded by the configured capacity.
+  pub(crate) data: EventReceiver,
+  /// `Overflow`/`Fatal` signals, unbounded (and dedup-bounded in practice to
+  /// one in-flight `Overflow` plus one terminal `Fatal`).
+  pub(crate) control: EventReceiver,
 }
 
 /// Why a platform source could not start, or died.

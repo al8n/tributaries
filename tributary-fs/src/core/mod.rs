@@ -63,6 +63,13 @@ pub(crate) struct RootMeta {
   pub(crate) root: PathBuf,
   /// The device the root lives on.
   pub(crate) root_dev: u64,
+  /// The mount points already living strictly under the root at spawn.
+  pub(crate) mounts: Vec<PathBuf>,
+  /// Whether `mounts` came from an authoritative read of the live mount
+  /// table. `false` means the table could not be read: device boundaries are
+  /// then UNKNOWN, and event-side identity/cookie trust is refused rather
+  /// than presumed (probe-carried device evidence still decides).
+  pub(crate) mounts_authoritative: bool,
 }
 
 /// One I/O obligation the driver task must execute for the core.
@@ -161,6 +168,9 @@ enum ProbePurpose {
     /// member of an ambiguous same-fileID group, whose shared id must not
     /// pair anything.
     allow_cookie: bool,
+    /// The word also carried content/attrib bits; a surviving object then
+    /// owes a grounded `Modified` alongside the move half.
+    content_changed: bool,
   },
   /// A `RootChanged` needed the root's existence to pick the death signal.
   RootAlive { item: usize },
@@ -228,9 +238,14 @@ struct ScopeState {
   /// Canonicalized root bytes — known once the stream spawned.
   root: Option<PathBuf>,
   root_dev: Option<u64>,
-  /// Foreign-device prefixes discovered under the root (mounts, firmlinks);
-  /// tiny in practice, so a linear scan beats indexing.
+  /// Foreign-device prefixes under the root: seeded from the live mount
+  /// table at spawn, then maintained by Mount/Unmount events and probed
+  /// devices. Tiny in practice, so a linear scan beats indexing.
   mounts: Vec<PathBuf>,
+  /// Whether `mounts` was seeded authoritatively at spawn. Without it, a
+  /// path not covered by a known mount prefix proves nothing (the table
+  /// started blind), so event-side device trust is refused.
+  mounts_authoritative: bool,
   lag: LagState,
   park: Park,
   /// The journal id counter wrapped; any minted resume token is invalid.
@@ -300,6 +315,7 @@ impl DriverCore {
         root: None,
         root_dev: None,
         mounts: Vec::new(),
+        mounts_authoritative: false,
         lag: LagState::Normal,
         park: Park::default(),
         resume_poisoned: false,
@@ -328,6 +344,8 @@ impl DriverCore {
       Ok(meta) => {
         state.root = Some(meta.root);
         state.root_dev = Some(meta.root_dev);
+        state.mounts = meta.mounts;
+        state.mounts_authoritative = meta.mounts_authoritative;
         self.monitor.on_watch_result(watch, Ok(()));
       }
       Err(err) => {
@@ -635,17 +653,11 @@ impl DriverCore {
     // destination, so the lower event id is the source half.
     let mut rename_groups: BTreeMap<NonZeroU64, Vec<usize>> = BTreeMap::new();
     for (idx, ev) in events.iter().enumerate() {
-      // Only a plain rename half may pre-pair; any control flag routes the
-      // event through the full grounding table instead.
-      let special = ev.flags.root_changed()
-        || ev.flags.lost_sync()
-        || ev.flags.must_scan_subdirs()
-        || ev.flags.event_ids_wrapped()
-        || ev.flags.history_done()
-        || ev.flags.mount()
-        || ev.flags.unmount();
-      if ev.flags.item_renamed()
-        && !special
+      // Only a PURE rename word may pre-pair: a word also carrying
+      // create/remove/modify/attrib (or any control) bits is an ambiguous
+      // coalescing, and trusting it as just-a-rename would silently drop the
+      // extra operation — it routes through the probing grounding table.
+      if ev.flags.is_pure_rename()
         && let Some(fid) = ev.file_id
       {
         rename_groups.entry(fid).or_default().push(idx);
@@ -816,6 +828,12 @@ impl DriverCore {
       }
     };
 
+    let modified = flags.item_modified();
+    let attrib = flags.item_inode_meta_mod()
+      || flags.item_change_owner()
+      || flags.item_xattr_mod()
+      || flags.item_finder_info_mod();
+
     if flags.item_renamed() {
       let probe = self.mint_probe(
         scope,
@@ -825,6 +843,7 @@ impl DriverCore {
           target,
           path: ev.path.clone(),
           allow_cookie,
+          content_changed: modified || attrib,
         },
       );
       return ItemPlan::Await {
@@ -835,11 +854,6 @@ impl DriverCore {
 
     let created = flags.item_created();
     let removed = flags.item_removed();
-    let modified = flags.item_modified();
-    let attrib = flags.item_inode_meta_mod()
-      || flags.item_change_owner()
-      || flags.item_xattr_mod()
-      || flags.item_finder_info_mod();
     match u8::from(created) + u8::from(removed) + u8::from(modified) + u8::from(attrib) {
       0 => {
         // A flag-less event means "something changed at this directory" with
@@ -987,6 +1001,7 @@ impl DriverCore {
         target,
         path,
         allow_cookie,
+        content_changed,
       } => {
         let planned = match outcome {
           // Gone: the source half of a move out of (or within) the tree. The
@@ -1029,6 +1044,20 @@ impl DriverCore {
               rec = rec.with_cookie(cookie);
             }
             let mut planned = vec![Planned::Rec(rec)];
+            if content_changed {
+              // The word coalesced a content/attrib change with the rename;
+              // the survivor owes that truth alongside the move (existence
+              // subsumes any coalesced create/remove bits, but a content
+              // change is invisible to existence).
+              let rec = record_with(
+                state,
+                RecordKind::Modified,
+                target.clone(),
+                Some(kind.is_dir()),
+                node,
+              );
+              planned.push(Planned::Rec(rec));
+            }
             if kind.is_dir() {
               planned.push(Planned::Over(located(state.watch, target)));
             }
@@ -1257,16 +1286,21 @@ fn cookie_for(
   device_trusted(state, path, dev).then(|| MoveCookie::new(fid))
 }
 
-/// Whether `path`'s objects live on the scope's root device, as far as the
-/// core can tell: an event-side caller passes `dev: None` (trusted iff no
-/// foreign-mount prefix covers the path), a probe-side caller passes the
-/// stat-read device (authoritative).
+/// Whether `path`'s objects provably live on the scope's root device.
+///
+/// A probe-side caller passes the stat-read device — direct evidence that
+/// decides alone. An event-side caller passes `dev: None`, and unknown is
+/// UNTRUSTED by default: absence from the mount table only proves anything
+/// when the table was seeded authoritatively at spawn (an unseeded table is
+/// merely blind to already-mounted volumes, which is exactly how a foreign
+/// fileID gets promoted into a fabricated move).
 fn device_trusted(state: &ScopeState, path: &Path, dev: Option<u64>) -> bool {
   match (dev, state.root_dev) {
-    (Some(dev), Some(root_dev)) if dev != root_dev => return false,
-    _ => {}
+    (Some(dev), Some(root_dev)) => return dev == root_dev,
+    (Some(_), None) => return false,
+    (None, _) => {}
   }
-  !state.mounts.iter().any(|m| path.starts_with(m))
+  state.mounts_authoritative && !state.mounts.iter().any(|m| path.starts_with(m))
 }
 
 /// Records a probed foreign-device path as a mount prefix, so later
