@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/al8n/watershed"
-homepage = "https://github.com/al8n/watershed"
+repository = "https://github.com/al8n/tributaries"
+homepage = "https://github.com/al8n/tributaries"
 
 [workspace.dependencies]
 

@@ -1,13 +1,13 @@
 <div align="center">
-<h1>watershed</h1>
+<h1>tributaries</h1>
 </div>
 <div align="center">
 
-跨平台文件系统变更监视器，构建在一套从零实现的 Sans-I/O 通知栈之上。
+从零实现的跨平台 Sans-I/O 文件系统通知栈。
 
-[<img alt="github" src="https://img.shields.io/badge/github-al8n/watershed-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/al8n/watershed/ci.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
-[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/al8n/watershed?style=for-the-badge&logo=codecov" height="22">][codecov-url]
+[<img alt="github" src="https://img.shields.io/badge/github-al8n/tributaries-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/al8n/tributaries/ci.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/al8n/tributaries?style=for-the-badge&logo=codecov" height="22">][codecov-url]
 <img alt="license" src="https://img.shields.io/badge/License-Apache%202.0/MIT-blue.svg?style=for-the-badge" height="22">
 
 [English][en-url] | 简体中文
@@ -16,8 +16,8 @@
 
 ## 概览
 
-`watershed` 监视文件系统目录树，输出归一化、去重且不静默丢失的变更流。它不是对
-现有 watcher 的包装，而是 quinn 式的架构：一个纯状态机内核承担所有易错逻辑
+`tributaries` 监视文件系统目录树，输出归一化、去重且不静默丢失的变更流。它不是
+对现有 watcher 的包装，而是 quinn 式的架构：一个纯状态机内核承担所有易错逻辑
 （递归、重命名配对、队列溢出、watch 上限降级），各操作系统只保留极薄的 I/O
 驱动层。
 
@@ -27,7 +27,7 @@
 |---|---|---|
 | [`tributary-proto`](tributary-proto) | 基础完成 | 纯 `no_std` Sans-I/O 状态机（“大脑”）：与后端无关的 `Monitor` —— watch 树、按 scope 的 reconciliation epoch、驱动提供的对象 identity、覆盖/投递 interest 分离、move 归一化、溢出 re-arm |
 | `tributaries` | 规划中 | `std` 驱动 crate：inotify、fanotify、FSEvents 后端，为 `Monitor` 提供输入并执行其动作 |
-| `watershed` | 规划中 | 面向使用者的 watcher API |
+| `watershed` | 规划中 | 面向使用者的变更监视 API |
 
 ## 设计
 
@@ -43,13 +43,13 @@
 
 ## License
 
-`watershed` 以 MIT 与 Apache License (Version 2.0) 双许可发布。
+`tributaries` 以 MIT 与 Apache License (Version 2.0) 双许可发布。
 
 详见 [LICENSE-APACHE](LICENSE-APACHE)、[LICENSE-MIT](LICENSE-MIT)。
 
 Copyright (c) 2026 Al Liu.
 
-[Github-url]: https://github.com/al8n/watershed/
-[CI-url]: https://github.com/al8n/watershed/actions/workflows/ci.yml
-[codecov-url]: https://app.codecov.io/gh/al8n/watershed/
-[en-url]: https://github.com/al8n/watershed/tree/main/README.md
+[Github-url]: https://github.com/al8n/tributaries/
+[CI-url]: https://github.com/al8n/tributaries/actions/workflows/ci.yml
+[codecov-url]: https://app.codecov.io/gh/al8n/tributaries/
+[en-url]: https://github.com/al8n/tributaries/tree/main/README.md
