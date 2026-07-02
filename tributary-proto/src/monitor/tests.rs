@@ -1868,10 +1868,10 @@ fn dead_source_half_emits_no_removed_after_teardown() {
   );
 }
 
-/// The seam Codex pinned: a watched directory moved out must free its `(parent,
-/// name)` slot at once, so a *replacement* arriving at the same path during the
-/// pending window installs its own watch instead of being silently skipped by the
-/// idempotent descent (the stale entry would otherwise still occupy the slot).
+/// A watched directory moved out must free its `(parent, name)` slot at once, so a
+/// *replacement* arriving at the same path during the pending window installs its own
+/// watch instead of being silently skipped by the idempotent descent (the stale entry
+/// would otherwise still occupy the slot).
 #[test]
 fn watched_dir_moved_out_then_replaced_installs_new_watch() {
   let mut m = per_dir();
@@ -2061,8 +2061,8 @@ fn watched_dir_replacement_survives_timeout() {
   let _ = drain_events(&mut m);
 
   // The original never paired; its window elapses. It resolves to a Removed for
-  // the original object (an interim imprecision the §6 identity model refines),
-  // but the replacement's coverage is untouched.
+  // the original object (an imprecision a future identity-aware resolution could
+  // refine), but the replacement's coverage is untouched.
   m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
   let _ = drain_events(&mut m);
   assert!(
@@ -2232,7 +2232,7 @@ fn reused_cookie_after_teardown_pairs_fresh() {
   );
 }
 
-// ── Centralized slot reconciliation: the R6 coverage cases ──
+// ── Centralized slot reconciliation: coverage cases ──
 
 /// Remove-then-create at the same slot: the `Removed` must drop the old watch so a
 /// following `Created` is NOT mistaken for a duplicate and is freshly watched.
@@ -2386,7 +2386,7 @@ fn child_move_half_survives_parent_teardown_and_resolves_created() {
   );
 }
 
-// ── Adversarial move/re-arm regressions ──
+// ── Move / re-arm edge cases ──
 
 /// A held (watched-directory) source whose `from_parent` is torn down before the
 /// paired `MovedTo` arrives must not reparent a dropped watch: the destination
@@ -2482,9 +2482,9 @@ fn held_dir_source_with_torn_down_parent_resolves_created() {
   );
 }
 
-/// An adversarial move pair that would reparent a directory under its own subtree is
-/// rejected: the held source is dropped, no watch is orphaned under the (now-dead)
-/// destination parent, and path reconstruction does not loop.
+/// A move pair that would reparent a directory under its own subtree is rejected: the
+/// held source is dropped, no watch is orphaned under the (now-dead) destination
+/// parent, and path reconstruction does not loop.
 #[test]
 fn cyclic_reparent_pair_is_rejected_without_corruption() {
   let mut m = per_dir();
@@ -2621,7 +2621,7 @@ fn overflow_rearm_reissues_on_failed_enumerate() {
   );
 }
 
-/// An adversarial pair moving a directory onto its own ancestor's slot (`root/a/d` →
+/// A pair moving a directory onto its own ancestor's slot (`root/a/d` →
 /// `root/a`) must not leave `child_index` pointing at a removed node: the reparent
 /// aborts (dropping the stale ancestor takes the held child with it), so the
 /// destination is reconciled with a FRESH watch, not a dead one.

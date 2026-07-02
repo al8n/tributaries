@@ -10,5 +10,3 @@
 //! several anchors) stay below the core.
 //!
 //! This module is a placeholder for that backend profile.
-
-// TODO: the inotify driver lives in the `tributaries` crate; see docs/2026-06-28-tributaries-design.md §6.

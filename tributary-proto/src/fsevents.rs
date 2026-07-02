@@ -8,5 +8,3 @@
 //! `KernelDropped` to an overflow the [`Monitor`](crate::Monitor) turns into a rescan.
 //!
 //! This module is a placeholder for that backend profile.
-
-// TODO: the FSEvents driver lives in the `tributaries` crate; see docs/2026-06-28-tributaries-design.md §7.

@@ -663,14 +663,12 @@ impl Monitor {
   /// not left unwatched. Incomplete reads route to
   /// [`handle_incomplete_enumerate`](Self::handle_incomplete_enumerate) instead.
   ///
-  /// Overflow can hide a same-name delete+recreate, and the primitive-agnostic Monitor
-  /// carries no identity (`dev_ino`) to tell a replacement from the original — so it
-  /// conservatively drops EVERY existing child watch (pruning vanished names and
-  /// replacing present ones alike) and installs a fresh watch for each present
-  /// directory, marked to continue the re-arm so its subtree rebuilds recursively.
-  /// Detecting a same-name replacement *without* this rebuild needs the wd-reuse /
-  /// inode identity the inotify sub-machine supplies (§6); until then, rebuilding the
-  /// affected children on overflow is the safe choice.
+  /// Overflow can hide a same-name delete+recreate, so this diffs the retained watch
+  /// set against the fresh listing by object identity: a child whose identity is
+  /// confirmed unchanged keeps its watch (re-armed downward to catch new grandchildren),
+  /// while one whose name vanished, whose identity changed, or whose identity cannot be
+  /// confirmed is dropped and its slot rebuilt. Absent any identity this degrades to
+  /// rebuilding every affected child — the safe default.
   fn rearm_enumerate(&mut self, dir: WatchId, scope: ScopeId, res: &EnumerateResult) {
     // Index the fresh listing's directories by name → identity.
     let present: BTreeMap<Segment, Option<Identity>> = res
@@ -1227,7 +1225,7 @@ impl Monitor {
   /// re-arm is not lost.
   ///
   /// Returns whether the re-key happened. It does NOT if dropping the stale
-  /// destination also removed `child` — the adversarial case where the held source sat
+  /// destination also removed `child` — the case where the held source sat
   /// inside the destination slot — leaving nothing to re-key; the caller escalates.
   /// The caller is responsible for the acyclic precondition ([`can_reparent`]).
   ///

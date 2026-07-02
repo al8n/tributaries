@@ -73,7 +73,7 @@ proto_id! {
 proto_id! {
   /// The dedup / identity key stamped on every emitted [`Change`](crate::Change).
   ///
-  /// The core dedups deliveries by this key; it is also the seam for the M2
+  /// The core dedups deliveries by this key; it is also the seam for a future
   /// at-least-once delivery story.
   ChangeId
 }
