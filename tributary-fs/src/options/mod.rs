@@ -1,0 +1,190 @@
+//! Configuration for a [`Watcher`](crate::Watcher).
+
+use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
+
+#[cfg(test)]
+mod tests;
+
+/// Configuration for a [`Watcher`](crate::Watcher).
+///
+/// [`new`](Self::new) returns the defaults; every knob has a `with_*` builder,
+/// a `set_*` mutator, and a read accessor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatcherOptions {
+  latency: Duration,
+  move_window: Duration,
+  event_capacity: NonZeroUsize,
+  os_batch_capacity: NonZeroUsize,
+  exclusions: Vec<PathBuf>,
+}
+
+impl WatcherOptions {
+  /// The default OS event-coalescing latency (10 ms — watchman's shipped
+  /// default; raising it trades delivery lag for fewer kernel drops under
+  /// churn).
+  pub const DEFAULT_LATENCY: Duration = Duration::from_millis(10);
+
+  /// The default rename-pairing window (comfortably above what the default
+  /// latency makes physically necessary; see
+  /// [`effective_move_window`](Self::effective_move_window)).
+  pub const DEFAULT_MOVE_WINDOW: Duration = Duration::from_millis(150);
+
+  /// The default capacity of the event channel handed to the consumer, in
+  /// events.
+  pub const DEFAULT_EVENT_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
+
+  /// The default per-root capacity of the OS-callback channel, in callback
+  /// batches.
+  pub const DEFAULT_OS_BATCH_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
+  /// The most exclusion directories the OS honors per root
+  /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
+  pub const MAX_EXCLUSIONS: usize = crate::os::MAX_EXCLUSIONS;
+
+  /// The default options.
+  #[inline]
+  pub const fn new() -> Self {
+    Self {
+      latency: Self::DEFAULT_LATENCY,
+      move_window: Self::DEFAULT_MOVE_WINDOW,
+      event_capacity: Self::DEFAULT_EVENT_CAPACITY,
+      os_batch_capacity: Self::DEFAULT_OS_BATCH_CAPACITY,
+      exclusions: Vec::new(),
+    }
+  }
+
+  /// The OS event-coalescing latency.
+  #[inline]
+  pub const fn latency(&self) -> Duration {
+    self.latency
+  }
+
+  /// Returns these options with the OS event-coalescing latency set.
+  #[inline]
+  #[must_use]
+  pub const fn with_latency(mut self, latency: Duration) -> Self {
+    self.latency = latency;
+    self
+  }
+
+  /// Sets the OS event-coalescing latency.
+  #[inline]
+  pub const fn set_latency(&mut self, latency: Duration) -> &mut Self {
+    self.latency = latency;
+    self
+  }
+
+  /// The requested rename-pairing window. The window actually armed is
+  /// [`effective_move_window`](Self::effective_move_window).
+  #[inline]
+  pub const fn move_window(&self) -> Duration {
+    self.move_window
+  }
+
+  /// Returns these options with the rename-pairing window set.
+  #[inline]
+  #[must_use]
+  pub const fn with_move_window(mut self, move_window: Duration) -> Self {
+    self.move_window = move_window;
+    self
+  }
+
+  /// Sets the rename-pairing window.
+  #[inline]
+  pub const fn set_move_window(&mut self, move_window: Duration) -> &mut Self {
+    self.move_window = move_window;
+    self
+  }
+
+  /// The rename-pairing window actually armed: the two halves of one rename
+  /// can legally arrive one latency window apart, so the effective window
+  /// never falls below `2 × latency + 50 ms` of scheduling margin.
+  #[inline]
+  pub fn effective_move_window(&self) -> Duration {
+    self
+      .move_window
+      .max(self.latency * 2 + Duration::from_millis(50))
+  }
+
+  /// The capacity of the event channel handed to the consumer, in events.
+  ///
+  /// A full channel never blocks the driver: the affected scope's epoch is
+  /// bumped and a single dominating `Rescan` is parked until it fits (see
+  /// [`Event::epoch`](crate::Event::epoch) for the consumer contract).
+  #[inline]
+  pub const fn event_capacity(&self) -> NonZeroUsize {
+    self.event_capacity
+  }
+
+  /// Returns these options with the consumer event-channel capacity set.
+  #[inline]
+  #[must_use]
+  pub const fn with_event_capacity(mut self, event_capacity: NonZeroUsize) -> Self {
+    self.event_capacity = event_capacity;
+    self
+  }
+
+  /// Sets the consumer event-channel capacity.
+  #[inline]
+  pub const fn set_event_capacity(&mut self, event_capacity: NonZeroUsize) -> &mut Self {
+    self.event_capacity = event_capacity;
+    self
+  }
+
+  /// The per-root capacity of the OS-callback channel, in callback batches.
+  ///
+  /// A full channel never blocks the OS callback: the batch is dropped and
+  /// surfaces as a `Rescan` through the overflow machinery.
+  #[inline]
+  pub const fn os_batch_capacity(&self) -> NonZeroUsize {
+    self.os_batch_capacity
+  }
+
+  /// Returns these options with the per-root OS-callback capacity set.
+  #[inline]
+  #[must_use]
+  pub const fn with_os_batch_capacity(mut self, os_batch_capacity: NonZeroUsize) -> Self {
+    self.os_batch_capacity = os_batch_capacity;
+    self
+  }
+
+  /// Sets the per-root OS-callback capacity.
+  #[inline]
+  pub const fn set_os_batch_capacity(&mut self, os_batch_capacity: NonZeroUsize) -> &mut Self {
+    self.os_batch_capacity = os_batch_capacity;
+    self
+  }
+
+  /// The load-shedding exclusion directories applied to every root, as a
+  /// slice.
+  ///
+  /// Purely an optimization (at most [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS),
+  /// enforced at [`Watcher::new`](crate::Watcher::new)); correctness never
+  /// depends on them.
+  #[inline]
+  pub fn exclusions_slice(&self) -> &[PathBuf] {
+    self.exclusions.as_slice()
+  }
+
+  /// Returns these options with the exclusion directories set.
+  #[inline]
+  #[must_use]
+  pub fn with_exclusions(mut self, exclusions: Vec<PathBuf>) -> Self {
+    self.exclusions = exclusions;
+    self
+  }
+
+  /// Sets the exclusion directories.
+  #[inline]
+  pub fn set_exclusions(&mut self, exclusions: Vec<PathBuf>) -> &mut Self {
+    self.exclusions = exclusions;
+    self
+  }
+}
+
+impl Default for WatcherOptions {
+  #[inline]
+  fn default() -> Self {
+    Self::new()
+  }
+}

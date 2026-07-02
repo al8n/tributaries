@@ -19,6 +19,7 @@ smol = ["agnostic-lite/smol"]
 agnostic-lite = { version = "0.6", features = ["time"] }
 async-channel = "2"
 futures-channel = "0.3"
+futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = [
   "std",
   "async-await-macro",
@@ -27,7 +28,13 @@ thiserror = "2"
 tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
+tokio = { version = "1", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "test-util",
+  "time",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 dispatch2 = "0.3"

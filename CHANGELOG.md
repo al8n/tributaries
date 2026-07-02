@@ -23,6 +23,27 @@ All notable changes to this workspace are documented here. The format is based o
   - a kernel-recursive seeded storm (deep targets, located overflows, root
     self-events) alongside the existing per-directory storm.
 
+- **`tributary-fs`** — the first source crate: the `std`, async filesystem
+  driver over the `Monitor`, with macOS FSEvents as the first backend.
+  - `os::macos`: one kernel-recursive `FSEventStream` per watched root
+    (`UseExtendedData` file ids, `NoDefer`, `WatchRoot`, private serial
+    dispatch-queue delivery), every unsafe platform call confined to one
+    cfg-gated module — decode-in-callback to owned batches, `Arc`-via-release-
+    hook context ownership, `dispatch_sync(Stop; Invalidate)` teardown
+    quiescence, `catch_unwind` panic containment, and an overflow latch so a
+    full channel degrades to a rescan instead of a lost event.
+  - a sans-I/O driver core: FSEvents flags are grounded against `lstat` truth
+    (never trusted as verbs), renames classify by file id into the Monitor's
+    cookie-pairing window, kernel loss clamps to located subtree rescans, and
+    a lagging consumer costs one epoch-dominating parked `Rescan` — loss is
+    structurally never silent.
+  - the runtime-agnostic consumer surface: `Watcher<R: RuntimeLite>`
+    (`TokioWatcher`/`SmolWatcher` aliases), `WatcherOptions`, `Event` with
+    absolute + root-relative paths and the epoch/rescan contract, disjoint-root
+    enforcement, orderly `close()`; watching means "changes from now on".
+  - macOS integration suite (convergence-style, real FSEvents) atop the
+    hermetic fake-filesystem loop tests and the pure sans-I/O core tests.
+
 ## [0.1.0]
 
 ### Added

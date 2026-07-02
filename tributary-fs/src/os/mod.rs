@@ -67,14 +67,21 @@ pub(crate) enum SourceMessage {
   /// could not be decoded. The receiver must treat the source's subtrees as
   /// needing a rescan.
   Overflow,
-  /// The stream is dead and will deliver nothing more.
-  Fatal(SourceError),
+  /// The stream is dead and will deliver nothing more. The driver reacts to
+  /// the death itself (root invalidation); the carried class is diagnostic
+  /// surface for a future health-reporting channel.
+  Fatal(#[allow(dead_code)] SourceError),
 }
 
-/// Why a source could not start, or died.
+/// Why a platform source could not start, or died.
+///
+/// Surfaced publicly through
+/// [`WatchRootError::Source`](crate::WatchRootError::Source): everything after
+/// a root is live arrives as in-band events, so this is the only backend error
+/// shape a consumer ever sees.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub(crate) enum SourceError {
+pub enum SourceError {
   /// This platform has no watch backend (or the build cannot run FFI).
   #[error("filesystem watching is not supported on this platform")]
   Unsupported,
@@ -119,6 +126,9 @@ pub(crate) struct ResumeToken {
   device_uuid: Option<[u8; 16]>,
 }
 
+// Journal resume is deferred surface: sources mint tokens from day one so the
+// capability can land without a redesign, but nothing consumes them yet.
+#[allow(dead_code)]
 impl ResumeToken {
   /// Builds a token from a last-good event id and its device UUID.
   pub(crate) const fn new(last_good: u64, device_uuid: Option<[u8; 16]>) -> Self {

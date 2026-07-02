@@ -50,6 +50,11 @@ impl DriverConfig {
   }
 }
 
+/// The reply channel of one `Command::Watch`: the scope plus the canonical
+/// root path event paths will arrive under.
+pub(crate) type WatchReply =
+  futures_channel::oneshot::Sender<Result<(ScopeId, PathBuf), SourceError>>;
+
 /// One command from the watcher facade to its driver task.
 pub(crate) enum Command {
   /// Watch a new root; resolves once the native stream is live.
@@ -58,8 +63,9 @@ pub(crate) enum Command {
     root: PathBuf,
     /// The delivery interest for the new scope.
     interest: Interest,
-    /// Resolved with the scope handle once the stream is live.
-    reply: futures_channel::oneshot::Sender<Result<ScopeId, SourceError>>,
+    /// Resolved once the stream is live, with the scope handle and the
+    /// canonical root path event paths will arrive under.
+    reply: WatchReply,
   },
   /// Stop watching a root; resolves once its stream is torn down.
   Unwatch {
@@ -217,17 +223,18 @@ pub(crate) async fn run<R, F>(
   let mut core = DriverCore::new(config.effective_move_window());
   let origin = R::now();
   let now = move || Instant::from_origin(R::now().duration_since(origin));
-  let (op_tx, op_rx) = async_channel::bounded::<OpResult<F::Handle>>(64);
+  // Unbounded so the blocking pool reports results with a plain `try_send`
+  // (`send_blocking` does not exist on wasm builds, where async-channel has no
+  // blocking API); the op volume is already bounded by outstanding operations
+  // — one spawn/teardown per root plus one probe per parked batch item.
+  let (op_tx, op_rx) = async_channel::unbounded::<OpResult<F::Handle>>();
   let mut os: SelectAll<futures_util::stream::BoxStream<'static, (ScopeId, SourceMessage)>> =
     SelectAll::new();
   // The guard keeps the SelectAll from ever emptying: an empty SelectAll
   // reports termination, which would spin the loop's stream arm.
   os.push(futures_util::stream::pending().boxed());
   let mut handles: BTreeMap<ScopeId, F::Handle> = BTreeMap::new();
-  let mut watch_replies: BTreeMap<
-    ScopeId,
-    futures_channel::oneshot::Sender<Result<ScopeId, SourceError>>,
-  > = BTreeMap::new();
+  let mut watch_replies: BTreeMap<ScopeId, WatchReply> = BTreeMap::new();
   let mut unwatch_replies: BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>> =
     BTreeMap::new();
 
@@ -279,11 +286,12 @@ pub(crate) async fn run<R, F>(
         match res.expect("the driver holds a sender") {
           OpResult::Spawned { scope, result } => match result {
             Ok(spawned) => {
+              let canonical_root = spawned.meta.root.clone();
               core.on_stream_spawned(scope, Ok(spawned.meta));
               handles.insert(scope, spawned.handle);
               os.push(spawned.receiver.map(move |msg| (scope, msg)).boxed());
               if let Some(reply) = watch_replies.remove(&scope) {
-                let _ = reply.send(Ok(scope));
+                let _ = reply.send(Ok((scope, canonical_root)));
               }
             }
             Err(err) => {
@@ -331,7 +339,7 @@ pub(crate) async fn run<R, F>(
     let tx = op_tx.clone();
     R::spawn_blocking_detach(move || {
       handle.shutdown();
-      let _ = tx.send_blocking(OpResult::TornDown { scope });
+      let _ = tx.try_send(OpResult::TornDown { scope });
     });
   }
   let drain = async {
@@ -391,7 +399,7 @@ fn execute_effects<R, F>(
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {
           let result = ops.spawn_source(source_config);
-          let _ = tx.send_blocking(OpResult::Spawned { scope, result });
+          let _ = tx.try_send(OpResult::Spawned { scope, result });
         });
       }
       Effect::TeardownStream { scope } => {
@@ -399,7 +407,7 @@ fn execute_effects<R, F>(
           let tx = op_tx.clone();
           R::spawn_blocking_detach(move || {
             handle.shutdown();
-            let _ = tx.send_blocking(OpResult::TornDown { scope });
+            let _ = tx.try_send(OpResult::TornDown { scope });
           });
         } else if let Some(reply) = unwatch_replies.remove(&scope) {
           // No stream ever existed (a failed spawn); the unwatch is complete.
@@ -411,7 +419,7 @@ fn execute_effects<R, F>(
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {
           let outcome = ops.probe(&path);
-          let _ = tx.send_blocking(OpResult::Probed { probe, outcome });
+          let _ = tx.try_send(OpResult::Probed { probe, outcome });
         });
       }
       Effect::Emit { scope, change } => match events.try_send((scope, change)) {
