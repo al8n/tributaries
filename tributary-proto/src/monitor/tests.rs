@@ -3377,3 +3377,160 @@ fn overflow_rearm_rebuilds_a_watch_whose_identity_changed() {
     .expect("a fresh watch for the replacement");
   assert_ne!(w_a2, w_a, "a new watch for the new object");
 }
+
+/// A slot-changing record that races a directory's outstanding enumerate dirties it, so
+/// the possibly-stale listing is re-read (a `Rescan` + retry) rather than trusted — the
+/// create-descend window, where an enumerate snapshot could re-arm a since-removed child.
+#[test]
+fn record_racing_an_enumerate_forces_a_rescan() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // root → d (dir): install and arm it, leaving its cold enumerate outstanding (unfed).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("watch d");
+  m.on_watch_result(w_d, Ok(()));
+  let d_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d cold enumerate");
+  let _ = drain_events(&mut m);
+
+  // A Removed record for a child of d races that read.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Removed)
+      .with_name(seg("x"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let _ = drain_events(&mut m);
+
+  // The read returns a stale snapshot still listing "x"; because a record raced it, the
+  // Monitor emits a Rescan rather than trusting the listing as a clean discovery.
+  m.on_enumerate(
+    d_req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("x"), FileKind::Dir)]),
+  );
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "a raced (dirty) enumerate emits a Rescan"
+  );
+}
+
+/// Deterministic fuzz: drive many random input schedules against the Monitor, asserting
+/// the structural invariants after every step (via [`Monitor::assert_invariants`]) and
+/// that the machine never panics and always drains to a fixpoint in bounded steps. This
+/// is the property-test floor — a seeded xorshift generator keeps it reproducible without
+/// a `proptest` dependency (which the `no_std` feature matrix would fight).
+#[test]
+fn random_op_storm_holds_invariants_and_terminates() {
+  for seed in 1..=64u64 {
+    let mut m = per_dir();
+    let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345);
+    let mut rng = || {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      s
+    };
+
+    let mut watches = std::vec![
+      m.register_root(scope(1), Interest::all()),
+      m.register_root(scope(2), Interest::all()),
+    ];
+    let mut reqs: std::vec::Vec<ReqId> = std::vec::Vec::new();
+    let names = [seg("a"), seg("b"), seg("c")];
+    let scopes = [Scope::Root(scope(1)), Scope::Root(scope(2))];
+    let kinds = [
+      RecordKind::Created,
+      RecordKind::Removed,
+      RecordKind::Modified,
+      RecordKind::MovedFrom,
+      RecordKind::MovedTo,
+    ];
+
+    for step in 0..300u64 {
+      // Absorb the Monitor's outputs into the driver's queues, then check invariants.
+      while let Some(action) = m.poll_action() {
+        match action {
+          Action::Watch(w) => watches.push(w.id()),
+          Action::Enumerate(e) => reqs.push(e.req()),
+          _ => {}
+        }
+      }
+      while m.poll_event().is_some() {}
+      m.assert_invariants();
+
+      let now = at(step + 1);
+      match rng() % 6 {
+        0 => {
+          let w = watches[(rng() as usize) % watches.len()];
+          let res = if rng() % 8 == 0 {
+            Err(WatchError::Io)
+          } else {
+            Ok(())
+          };
+          m.on_watch_result(w, res);
+        }
+        1 => {
+          if !reqs.is_empty() {
+            let req = reqs.swap_remove((rng() as usize) % reqs.len());
+            let mut entries = std::vec::Vec::new();
+            for n in &names {
+              if rng() % 2 == 0 {
+                let kind = if rng() % 2 == 0 {
+                  FileKind::Dir
+                } else {
+                  FileKind::File
+                };
+                entries.push(DirEntry::new(n.clone(), kind));
+              }
+            }
+            let res = match rng() % 5 {
+              0 => EnumerateResult::Failed(IoClass::Io),
+              1 => EnumerateResult::Partial(entries),
+              _ => EnumerateResult::Ok(entries),
+            };
+            m.on_enumerate(req, res);
+          }
+        }
+        2 => {
+          let w = watches[(rng() as usize) % watches.len()];
+          let kind = kinds[(rng() as usize) % kinds.len()];
+          let mut rec = OsRecord::new(w, kind)
+            .with_name(names[(rng() as usize) % names.len()].clone())
+            .with_is_dir(rng() % 2 == 0);
+          if kind.is_move_half() {
+            rec = rec.with_cookie(cookie(1 + rng() % 3));
+          }
+          m.on_os_record(rec, now);
+        }
+        3 => m.on_overflow(scopes[(rng() as usize) % scopes.len()], now),
+        4 => m.handle_timeout(at(step + 1 + rng() % 400)),
+        _ => {
+          let w = watches[(rng() as usize) % watches.len()];
+          m.on_os_record(OsRecord::new(w, RecordKind::Ignored), now);
+        }
+      }
+    }
+
+    // Every schedule drains to a fixpoint in a bounded number of steps.
+    let mut guard = 0u32;
+    while m.poll_action().is_some() {
+      guard += 1;
+      assert!(
+        guard < 100_000,
+        "the Monitor drains to a fixpoint (seed {seed})"
+      );
+    }
+    m.assert_invariants();
+  }
+}
