@@ -15,6 +15,10 @@ fn cookie(n: u64) -> MoveCookie {
   MoveCookie::new(NonZeroU64::new(n).unwrap())
 }
 
+fn ident(n: u64) -> Identity {
+  Identity::new(NonZeroU64::new(n).unwrap())
+}
+
 fn at(ms: u64) -> Instant {
   Instant::from_origin(Duration::from_millis(ms))
 }
@@ -3261,4 +3265,115 @@ fn changes_carry_epoch_and_rescan_bumps_it() {
     Epoch::START,
     "a fresh scope starts at the base generation"
   );
+}
+
+/// Sets up a root with one live child directory "a" carrying object identity `id`.
+fn root_with_identified_child(m: &mut Monitor, id: Identity) -> (WatchId, WatchId) {
+  let root = live_root_idle(m, scope(1));
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true)
+      .with_node(id),
+    at(1),
+  );
+  let w_a = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(root, seg("a")))
+        .map(|w| w.id())
+    })
+    .expect("watch for a");
+  m.on_watch_result(w_a, Ok(()));
+  let a_boot = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_a).map(|e| e.req()))
+    .expect("a bootstrap enumerate");
+  m.on_enumerate(a_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+  (root, w_a)
+}
+
+/// A complete re-arm KEEPS a watch whose object identity is confirmed unchanged: no
+/// Unwatch/Watch churn, and the survivor is re-armed downward to catch new grandchildren.
+#[test]
+fn overflow_rearm_keeps_a_watch_whose_identity_survives() {
+  let mut m = per_dir();
+  let (root, w_a) = root_with_identified_child(&mut m, ident(100));
+
+  m.on_overflow(Scope::Root(scope(1)), at(5));
+  let _ = drain_events(&mut m);
+  let root_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("root re-arm");
+
+  // The re-arm reports "a" with the SAME identity — the object survived the overflow.
+  m.on_enumerate(
+    root_req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("a"), FileKind::Dir).with_node(ident(100)),
+    ]),
+  );
+  let actions = drain_actions(&mut m);
+  assert!(m.is_watched(w_a), "the watch survives — same identity");
+  assert!(
+    !actions.iter().any(|a| a.as_unwatch() == Some(w_a)),
+    "the surviving watch is kept, not torn down and rebuilt"
+  );
+  assert!(
+    m.is_rearm_enumerating(w_a),
+    "the survivor is re-armed to catch gap-created grandchildren"
+  );
+}
+
+/// A complete re-arm REBUILDS a watch whose object identity changed — a same-name
+/// replacement the overflow hid — dropping the stale watch and issuing a fresh one.
+#[test]
+fn overflow_rearm_rebuilds_a_watch_whose_identity_changed() {
+  let mut m = per_dir();
+  let (root, w_a) = root_with_identified_child(&mut m, ident(100));
+
+  m.on_overflow(Scope::Root(scope(1)), at(5));
+  let _ = drain_events(&mut m);
+  let root_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("root re-arm");
+
+  // The re-arm reports "a" with a DIFFERENT identity — deleted and recreated in the gap.
+  m.on_enumerate(
+    root_req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("a"), FileKind::Dir).with_node(ident(200)),
+    ]),
+  );
+  let actions = drain_actions(&mut m);
+  assert!(
+    !m.is_watched(w_a),
+    "the stale watch is dropped — identity changed"
+  );
+  assert!(
+    actions.iter().any(|a| a.as_unwatch() == Some(w_a)),
+    "the replaced object's watch is unwatched"
+  );
+  let w_a2 = actions
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(root, seg("a")))
+        .map(|w| w.id())
+    })
+    .expect("a fresh watch for the replacement");
+  assert_ne!(w_a2, w_a, "a new watch for the new object");
 }

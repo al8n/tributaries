@@ -96,6 +96,51 @@ proto_id! {
   MoveCookie
 }
 
+/// An opaque, backend-supplied identity for a filesystem object appearance.
+///
+/// Minted by the DRIVER (not the core, unlike [`WatchId`] / [`ReqId`] / [`ChangeId`])
+/// from whatever its backend can cheaply supply: a hash of `(dev, ino)` from a `statx`
+/// on Linux, an FSEvents file id, a fanotify FID. The core never interprets the bits —
+/// it only compares them for equality: two equal `Identity`s denote the same underlying
+/// object, two different ones distinct objects. It is opaque precisely so no backend-ism
+/// (a raw `dev_ino`, a `wd`) leaks into the core, the same discipline that fronts an
+/// inotify `wd` with a [`WatchId`].
+///
+/// Identity is always optional on the wire — [`OsRecord`](crate::OsRecord) and
+/// [`DirEntry`](crate::DirEntry) carry `Option<Identity>` — because availability is
+/// per-object and per-moment (a `statx` can race a delete; a network filesystem can lose
+/// FID encoding for one subtree). `None` means "unknown", and the core then
+/// conservatively treats any same-name reappearance as a possible replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Identity(NonZeroU64);
+
+impl Identity {
+  /// Wraps a raw non-zero identity value minted by the driver.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(value: NonZeroU64) -> Self {
+    Self(value)
+  }
+
+  /// The non-zero value backing this identity.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn get(&self) -> NonZeroU64 {
+    self.0
+  }
+
+  /// The raw [`u64`] value of this identity.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_u64(&self) -> u64 {
+    self.0.get()
+  }
+}
+
+impl core::fmt::Display for Identity {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    core::fmt::Display::fmt(&self.0, f)
+  }
+}
+
 /// A per-scope monotonic reconciliation generation, stamped on every [`Change`](crate::Change).
 ///
 /// The [`Monitor`](crate::Monitor) bumps a scope's `Epoch` on every reconciliation

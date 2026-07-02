@@ -8,7 +8,7 @@ use crate::{
   capabilities::Capabilities,
   change::{Change, ChangeKind},
   error::WatchError,
-  id::{ChangeId, Epoch, MoveCookie, ReqId, ScopeId, Sequence, WatchId},
+  id::{ChangeId, Epoch, Identity, MoveCookie, ReqId, ScopeId, Sequence, WatchId},
   interest::Interest,
   path::{Location, Segment},
   record::{EnumerateResult, OsRecord, RecordKind},
@@ -74,6 +74,10 @@ struct WatchNode {
   name: Option<Segment>,
   scope: ScopeId,
   is_dir: bool,
+  /// The object identity this watch was installed for, if the driver supplied one.
+  /// Compared against a fresh enumerate's entry identities during a re-arm to keep a
+  /// surviving watch versus rebuild a same-name replacement (see [`Identity`]).
+  identity: Option<Identity>,
   /// The coverage lifecycle: pending-arm, live-idle, or enumerating (see [`NodeState`]).
   state: NodeState,
   /// The set of watches whose `parent` is this node — the adjacency dual of `parent`.
@@ -285,6 +289,7 @@ impl Monitor {
         name: None,
         scope,
         is_dir: true,
+        identity: None,
         state: NodeState::Arming { rearm: false },
         children: BTreeSet::new(),
       },
@@ -383,7 +388,7 @@ impl Monitor {
           } else {
             SlotOccupant::File
           };
-          self.reconcile_slot(dir, scope, entry.name(), occupant, false);
+          self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
         }
       }
     }
@@ -415,7 +420,7 @@ impl Monitor {
       } else {
         SlotOccupant::File
       };
-      self.reconcile_slot(dir, scope, entry.name(), occupant, false);
+      self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
     }
     // Cascade the re-arm into EVERY child of `dir` — those in a name-slot AND any
     // detached-and-held move source (mid-move, out of `child_index` but still in the
@@ -505,25 +510,52 @@ impl Monitor {
   /// inode identity the inotify sub-machine supplies (§6); until then, rebuilding the
   /// affected children on overflow is the safe choice.
   fn rearm_enumerate(&mut self, dir: WatchId, scope: ScopeId, res: &EnumerateResult) {
+    // Index the fresh listing's directories by name → identity.
+    let present: BTreeMap<Segment, Option<Identity>> = res
+      .entries()
+      .iter()
+      .filter(|entry| entry.is_dir())
+      .map(|entry| (entry.name().clone(), entry.node()))
+      .collect();
+    // Diff the retained watch set against it. An in-slot child whose object identity is
+    // confirmed still present SURVIVES — its watch is kept and only re-armed downward to
+    // catch new grandchildren. One whose name vanished, whose identity changed (a
+    // same-name replacement), or whose identity cannot be confirmed is dropped. With no
+    // identity available this degrades to the conservative rebuild-everything path.
     let existing: std::vec::Vec<WatchId> = self
       .nodes
       .get(&dir)
       .map(|node| node.children.iter().copied().collect())
       .unwrap_or_default();
     for child in existing {
-      // A detached-and-held move source is not in its name-slot; it must survive the
-      // rebuild to be reparented by its pending MovedTo, so drop only slot occupants.
-      if self.is_slot_child(dir, child) {
+      // A detached-and-held move source is not in its name-slot; leave it to be
+      // reparented by its pending MovedTo rather than rebuilt.
+      if !self.is_slot_child(dir, child) {
+        continue;
+      }
+      let name = self.nodes.get(&child).and_then(|node| node.name.clone());
+      let survives = name
+        .as_ref()
+        .and_then(|name| present.get(name).copied())
+        .is_some_and(|fresh| self.identity_matches(child, fresh));
+      if survives {
+        self.inherit_rearm(child);
+      } else {
         self.drop_subtree(child);
       }
     }
+    // Install a fresh watch for every present directory now lacking one (a survivor keeps
+    // its own; this covers vanished-then-new, replaced, and genuinely new names), marked
+    // to continue the re-arm so its subtree rebuilds recursively.
     for entry in res.entries() {
       if !entry.is_dir() {
         continue;
       }
-      self.install_child(dir, scope, entry.name().clone(), true);
-      if let Some(fresh) = self.child_watch(dir, entry.name()) {
-        self.inherit_rearm(fresh);
+      if self.child_watch(dir, entry.name()).is_none() {
+        self.install_child(dir, scope, entry.name().clone(), true, entry.node());
+        if let Some(fresh) = self.child_watch(dir, entry.name()) {
+          self.inherit_rearm(fresh);
+        }
       }
     }
   }
@@ -665,7 +697,14 @@ impl Monitor {
     if let Some(name) = rec.name() {
       // A create is discovery, not a replace: an occupied slot is a duplicate
       // (an enumerate racing the live `Created`), so reuse it (`replaced = false`).
-      self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), false);
+      self.reconcile_slot(
+        rec.watch(),
+        scope,
+        name,
+        Self::record_occupant(rec),
+        false,
+        rec.node(),
+      );
     }
   }
 
@@ -675,7 +714,14 @@ impl Monitor {
     if let Some(name) = rec.name() {
       // The slot's object is gone: drop any watch that covered it, so a later
       // create at the same name is not mistaken for a duplicate of the old object.
-      self.reconcile_slot(rec.watch(), scope, name, SlotOccupant::Gone, false);
+      self.reconcile_slot(
+        rec.watch(),
+        scope,
+        name,
+        SlotOccupant::Gone,
+        false,
+        rec.node(),
+      );
     }
   }
 
@@ -751,7 +797,14 @@ impl Monitor {
               }
               if self.is_watched(rec.watch()) {
                 self.emit_pair(scope, to, &pending);
-                self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+                self.reconcile_slot(
+                  rec.watch(),
+                  scope,
+                  name,
+                  Self::record_occupant(rec),
+                  true,
+                  rec.node(),
+                );
               } else {
                 self.emit_rescan(scope, to);
               }
@@ -760,7 +813,14 @@ impl Monitor {
           // Non-directory (or unwatched) source: emit the pairing and reconcile the slot.
           (Some(name), None) => {
             self.emit_pair(scope, to, &pending);
-            self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+            self.reconcile_slot(
+              rec.watch(),
+              scope,
+              name,
+              Self::record_occupant(rec),
+              true,
+              rec.node(),
+            );
           }
           (None, held) => {
             if let Some(src) = held {
@@ -780,7 +840,14 @@ impl Monitor {
         if self.is_watched(rec.watch()) {
           self.emit(scope, to, ChangeKind::Created);
           if let Some(name) = rec.name() {
-            self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+            self.reconcile_slot(
+              rec.watch(),
+              scope,
+              name,
+              Self::record_occupant(rec),
+              true,
+              rec.node(),
+            );
           }
         } else {
           self.emit_rescan(scope, to);
@@ -789,7 +856,14 @@ impl Monitor {
       None => {
         self.emit(scope, to, ChangeKind::Created);
         if let Some(name) = rec.name() {
-          self.reconcile_slot(rec.watch(), scope, name, Self::record_occupant(rec), true);
+          self.reconcile_slot(
+            rec.watch(),
+            scope,
+            name,
+            Self::record_occupant(rec),
+            true,
+            rec.node(),
+          );
         }
       }
     }
@@ -965,21 +1039,29 @@ impl Monitor {
     name: &Segment,
     occupant: SlotOccupant,
     replaced: bool,
+    identity: Option<Identity>,
   ) {
     if !self.descends() {
       return;
     }
     match occupant {
       SlotOccupant::Dir => {
+        // Replace the incumbent watch when the caller says so (a definitively-new
+        // move-in), OR when identity reveals a same-name replacement (the slot holds a
+        // watch of a known-different object). An unknown identity on either side never
+        // forces a replace — discovery of an already-watched slot stays a reuse.
+        let existing = self.child_watch(parent, name);
+        let replace =
+          replaced || existing.is_some_and(|stale| self.identity_differs(stale, identity));
         // Replacing a mid-re-arm watch must not lose its re-arm obligation: capture it
         // before the drop and pass it to the fresh watch, so a subtree being re-armed
         // during an overflow stays covered when a move-in replaces its slot.
         let mut inherit = false;
-        if replaced && let Some(stale) = self.child_watch(parent, name) {
+        if replace && let Some(stale) = existing {
           inherit = self.has_rearm_obligation(stale);
           self.drop_subtree(stale);
         }
-        self.install_child(parent, scope, name.clone(), true);
+        self.install_child(parent, scope, name.clone(), true, identity);
         if inherit && let Some(fresh) = self.child_watch(parent, name) {
           self.inherit_rearm(fresh);
         }
@@ -989,6 +1071,28 @@ impl Monitor {
           self.drop_subtree(stale);
         }
       }
+    }
+  }
+
+  /// Whether `watch`'s installed identity and `other` are both known and unequal — the
+  /// positive signal of a same-name replacement. Unknown on either side is NOT "differs":
+  /// identity is optional, and absent it the core reconciles conservatively (reuse on
+  /// discovery, rebuild on a re-arm) rather than guessing.
+  fn identity_differs(&self, watch: WatchId, other: Option<Identity>) -> bool {
+    match (self.nodes.get(&watch).and_then(|node| node.identity), other) {
+      (Some(installed), Some(fresh)) => installed != fresh,
+      _ => false,
+    }
+  }
+
+  /// Whether `watch`'s installed identity and `other` are both known and EQUAL — a
+  /// positive confirmation that the object at a name survived a re-arm unchanged, so its
+  /// watch can be kept rather than rebuilt. Unknown on either side is NOT a match (the
+  /// re-arm then rebuilds conservatively).
+  fn identity_matches(&self, watch: WatchId, other: Option<Identity>) -> bool {
+    match (self.nodes.get(&watch).and_then(|node| node.identity), other) {
+      (Some(installed), Some(fresh)) => installed == fresh,
+      _ => false,
     }
   }
 
@@ -1063,7 +1167,14 @@ impl Monitor {
     }
   }
 
-  fn install_child(&mut self, parent: WatchId, scope: ScopeId, name: Segment, is_dir: bool) {
+  fn install_child(
+    &mut self,
+    parent: WatchId,
+    scope: ScopeId,
+    name: Segment,
+    is_dir: bool,
+    identity: Option<Identity>,
+  ) {
     // Descent is idempotent: a cold enumerate racing a live `Created` (or
     // duplicate create records) must not mint a second watch for one path, or
     // every record under it would be delivered twice. Reuse any pending-or-live
@@ -1079,6 +1190,7 @@ impl Monitor {
         name: Some(name.clone()),
         scope,
         is_dir,
+        identity,
         state: NodeState::Arming { rearm: false },
         children: BTreeSet::new(),
       },
