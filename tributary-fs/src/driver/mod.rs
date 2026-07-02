@@ -40,13 +40,12 @@ pub(crate) struct DriverConfig {
 }
 
 impl DriverConfig {
-  /// The rename window actually armed: the two halves of one rename can
-  /// legally arrive one latency window apart, so the pairing window must
-  /// cover two of them plus scheduling margin.
+  /// The rename window actually armed — the same total derivation the public
+  /// options expose (see [`WatcherOptions::effective_move_window`]).
+  ///
+  /// [`WatcherOptions::effective_move_window`]: crate::WatcherOptions::effective_move_window
   pub(crate) fn effective_move_window(&self) -> Duration {
-    self
-      .move_window
-      .max(self.latency * 2 + Duration::from_millis(50))
+    crate::options::derive_move_window(self.move_window, self.latency)
   }
 }
 
@@ -109,6 +108,10 @@ pub(crate) trait SourceControl: Send + 'static {
   /// Drains the source's overflow latch.
   fn take_overflow(&self) -> bool;
 
+  /// Drains the source's fatal latch (a dead stream whose in-band `Fatal`
+  /// message may have been dropped by a full channel).
+  fn take_fatal(&self) -> bool;
+
   /// Quiesces and destroys the stream (blocking, bounded).
   fn shutdown(self);
 }
@@ -116,6 +119,10 @@ pub(crate) trait SourceControl: Send + 'static {
 impl SourceControl for SourceHandle {
   fn take_overflow(&self) -> bool {
     SourceHandle::take_overflow(self)
+  }
+
+  fn take_fatal(&self) -> bool {
+    SourceHandle::take_fatal(self)
   }
 
   fn shutdown(self) {
@@ -216,6 +223,7 @@ pub(crate) async fn run<R, F>(
   ops: F,
   commands: async_channel::Receiver<Command>,
   events: async_channel::Sender<(ScopeId, Change)>,
+  on_scope_dead: impl Fn(ScopeId) + Send + Sync + 'static,
 ) where
   R: RuntimeLite,
   F: FsOps,
@@ -228,8 +236,11 @@ pub(crate) async fn run<R, F>(
   // blocking API); the op volume is already bounded by outstanding operations
   // — one spawn/teardown per root plus one probe per parked batch item.
   let (op_tx, op_rx) = async_channel::unbounded::<OpResult<F::Handle>>();
-  let mut os: SelectAll<futures_util::stream::BoxStream<'static, (ScopeId, SourceMessage)>> =
-    SelectAll::new();
+  // `None` marks a source's receiver disconnecting — the end-of-stream fact
+  // itself, which a dropped sender would otherwise erase silently.
+  let mut os: SelectAll<
+    futures_util::stream::BoxStream<'static, (ScopeId, Option<SourceMessage>)>,
+  > = SelectAll::new();
   // The guard keeps the SelectAll from ever emptying: an empty SelectAll
   // reports termination, which would spin the loop's stream arm.
   os.push(futures_util::stream::pending().boxed());
@@ -247,6 +258,7 @@ pub(crate) async fn run<R, F>(
       &mut handles,
       &events,
       &mut unwatch_replies,
+      &on_scope_dead,
       &now,
     );
 
@@ -289,7 +301,13 @@ pub(crate) async fn run<R, F>(
               let canonical_root = spawned.meta.root.clone();
               core.on_stream_spawned(scope, Ok(spawned.meta));
               handles.insert(scope, spawned.handle);
-              os.push(spawned.receiver.map(move |msg| (scope, msg)).boxed());
+              os.push(
+                spawned
+                  .receiver
+                  .map(move |msg| (scope, Some(msg)))
+                  .chain(futures_util::stream::once(async move { (scope, None) }))
+                  .boxed(),
+              );
               if let Some(reply) = watch_replies.remove(&scope) {
                 let _ = reply.send(Ok((scope, canonical_root)));
               }
@@ -313,14 +331,29 @@ pub(crate) async fn run<R, F>(
       msg = os.next() => {
         if let Some((scope, msg)) = msg {
           match msg {
-            SourceMessage::Batch(events) => {
-              core.on_batch(scope, events, now());
-              if handles.get(&scope).is_some_and(SourceControl::take_overflow) {
-                core.on_root_overflow(scope, now());
+            Some(SourceMessage::Batch(events)) => core.on_batch(scope, events, now()),
+            Some(SourceMessage::Overflow) => core.on_root_overflow(scope, now()),
+            Some(SourceMessage::Fatal(_)) => core.on_source_fatal(scope, now()),
+            // The receiver disconnected while the stream should still be
+            // live: the source died without managing to say so (its sender
+            // dropped) — a dead stream, not a teardown of ours (that path
+            // removes the handle before the disconnect can arrive).
+            None => {
+              if handles.contains_key(&scope) {
+                core.on_source_fatal(scope, now());
               }
             }
-            SourceMessage::Overflow => core.on_root_overflow(scope, now()),
-            SourceMessage::Fatal(_) => core.on_source_fatal(scope, now()),
+          }
+          // Latch drains follow EVERY message of the scope: a full channel
+          // dropped a batch (or the Fatal message itself), and the messages
+          // that made it full are exactly the wake for these swaps.
+          if let Some(handle) = handles.get(&scope) {
+            if handle.take_overflow() {
+              core.on_root_overflow(scope, now());
+            }
+            if handle.take_fatal() {
+              core.on_source_fatal(scope, now());
+            }
           }
         }
       },
@@ -331,11 +364,18 @@ pub(crate) async fn run<R, F>(
   // deliver what fits — the final drain is documented best-effort.
   let mut open: Vec<ScopeId> = handles.keys().copied().collect();
   for scope in &open {
-    if handles.get(scope).is_some_and(SourceControl::take_overflow) {
+    let Some(handle) = handles.get(scope) else {
+      continue;
+    };
+    if handle.take_overflow() {
       core.on_root_overflow(*scope, now());
+    }
+    if handle.take_fatal() {
+      core.on_source_fatal(*scope, now());
     }
   }
   for (scope, handle) in std::mem::take(&mut handles) {
+    on_scope_dead(scope);
     let tx = op_tx.clone();
     R::spawn_blocking_detach(move || {
       handle.shutdown();
@@ -366,6 +406,7 @@ pub(crate) async fn run<R, F>(
     &mut handles,
     &events,
     &mut unwatch_replies,
+    &on_scope_dead,
     &now,
   );
   if let Some(reply) = close_reply {
@@ -383,6 +424,7 @@ fn execute_effects<R, F>(
   handles: &mut BTreeMap<ScopeId, F::Handle>,
   events: &async_channel::Sender<(ScopeId, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
+  on_scope_dead: &(impl Fn(ScopeId) + Send + Sync),
   now: &impl Fn() -> Instant,
 ) where
   R: RuntimeLite,
@@ -403,6 +445,10 @@ fn execute_effects<R, F>(
         });
       }
       Effect::TeardownStream { scope } => {
+        // Every scope end — explicit unwatch, root death, stream fatal —
+        // funnels through this effect: tell the layer above, so a dead root
+        // stops participating in its liveness checks.
+        on_scope_dead(scope);
         if let Some(handle) = handles.remove(&scope) {
           let tx = op_tx.clone();
           R::spawn_blocking_detach(move || {

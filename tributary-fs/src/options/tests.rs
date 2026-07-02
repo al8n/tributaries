@@ -52,3 +52,25 @@ fn effective_move_window_never_falls_below_the_latency_floor() {
   let opts = opts.with_move_window(Duration::from_secs(1));
   assert_eq!(opts.effective_move_window(), Duration::from_secs(1));
 }
+
+#[test]
+fn effective_move_window_is_total_for_extreme_inputs() {
+  let extreme = WatcherOptions::new().with_latency(Duration::MAX);
+  assert_eq!(
+    extreme.effective_move_window(),
+    MAX_MOVE_WINDOW,
+    "the derivation saturates and caps instead of panicking"
+  );
+
+  let huge_window = WatcherOptions::new().with_move_window(Duration::MAX);
+  assert_eq!(huge_window.effective_move_window(), MAX_MOVE_WINDOW);
+
+  let sane = WatcherOptions::new()
+    .with_latency(Duration::from_millis(100))
+    .with_move_window(Duration::from_millis(10));
+  assert_eq!(
+    sane.effective_move_window(),
+    Duration::from_millis(250),
+    "the floor stays 2 x latency + 50ms for ordinary inputs"
+  );
+}

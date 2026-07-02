@@ -257,3 +257,38 @@ async fn close_quiesces() {
     .expect("close confirmed");
   let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewatch_after_root_death_succeeds() {
+  let outer = scratch_root("rewatch");
+  let root = outer.join("watched");
+  std::fs::create_dir_all(&root).expect("create watched root");
+
+  let mut w = watcher();
+  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+  std::fs::remove_dir_all(&root).expect("delete the watched root");
+  let seen = wait_for(&mut w, |e| e.root() == handle && e.is_rescan()).await;
+  assert!(seen.is_some(), "the root's death surfaced");
+
+  // The dead root's registry entry must stop blocking a fresh watch of the
+  // recreated path; the driver's teardown propagates asynchronously, so poll.
+  std::fs::create_dir_all(&root).expect("recreate the root");
+  let deadline = std::time::Instant::now() + DEADLINE;
+  let rewatched = loop {
+    match w.watch(&root, Interest::all()).await {
+      Ok(handle) => break handle,
+      Err(err) if err.is_overlaps() => {
+        assert!(
+          std::time::Instant::now() < deadline,
+          "the dead root kept blocking a fresh watch: {err:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+      }
+      Err(err) => panic!("unexpected watch failure: {err:?}"),
+    }
+  };
+  assert_ne!(rewatched, handle, "a fresh scope for the recreated root");
+
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&outer);
+}

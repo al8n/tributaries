@@ -4,7 +4,13 @@
 //! every platform, including under miri. The unsafe CoreFoundation decode in
 //! `os::macos` reduces each event to these types as early as possible.
 
-use std::{num::NonZeroU64, path::PathBuf};
+use std::{
+  num::NonZeroU64,
+  path::PathBuf,
+  sync::atomic::{AtomicBool, Ordering},
+};
+
+use super::SourceMessage;
 
 /// The raw flag word of one FSEvents event.
 ///
@@ -246,6 +252,64 @@ pub(crate) fn path_from_fs_repr(bytes: &[u8]) -> Option<PathBuf> {
     Some(PathBuf::from(
       String::from_utf8_lossy(&bytes[..end]).into_owned(),
     ))
+  }
+}
+
+/// A non-blocking send's outcome, reduced to the two facts the forwarding
+/// protocol dispatches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+  /// The message was accepted.
+  Sent,
+  /// The channel was full; the message was dropped.
+  Full,
+  /// The receiver is gone; nothing will be read again.
+  Closed,
+}
+
+/// Forwards one decoded callback batch, upholding the wake invariant: **every
+/// latched loss has a guaranteed later wake**, so the driver's post-receive
+/// latch drain can never miss a signal.
+///
+/// Case by case:
+/// - a previously latched loss is surfaced as an `Overflow` *before* newer
+///   data, so loss is observed in order; a full channel re-latches it (the
+///   wake is then the ≥ capacity messages already queued);
+/// - a lossy decode with **no** batch to send gets its own immediate
+///   `Overflow` — nothing else would ever wake the driver for it (an
+///   all-undecodable callback previously latched silently);
+/// - a lossy decode **with** a batch latches and lets the batch itself be the
+///   wake;
+/// - a full channel dropping the batch latches (wake: the queued messages).
+///
+/// A closed channel never re-latches: the receiver is gone, so there is no
+/// one left to wake.
+pub(crate) fn forward_batch<S>(
+  overflowed: &AtomicBool,
+  events: Vec<RawOsEvent>,
+  lossy: bool,
+  mut send: S,
+) where
+  S: FnMut(SourceMessage) -> SendOutcome,
+{
+  if overflowed.swap(false, Ordering::AcqRel) && send(SourceMessage::Overflow) == SendOutcome::Full
+  {
+    overflowed.store(true, Ordering::Release);
+  }
+  if events.is_empty() {
+    if lossy && send(SourceMessage::Overflow) == SendOutcome::Full {
+      overflowed.store(true, Ordering::Release);
+    }
+    return;
+  }
+  match send(SourceMessage::Batch(events)) {
+    SendOutcome::Sent => {
+      if lossy {
+        overflowed.store(true, Ordering::Release);
+      }
+    }
+    SendOutcome::Full => overflowed.store(true, Ordering::Release),
+    SendOutcome::Closed => {}
   }
 }
 

@@ -26,6 +26,8 @@ struct FakeState {
   nodes: Mutex<std::collections::HashMap<PathBuf, FakeNode>>,
   /// Injection ends for spawned sources, keyed by root.
   taps: Mutex<std::collections::HashMap<PathBuf, async_channel::Sender<SourceMessage>>>,
+  /// Per-root fatal latches, so tests can arm the latch-only death path.
+  fatals: Mutex<std::collections::HashMap<PathBuf, Arc<AtomicBool>>>,
   shutdowns: AtomicUsize,
 }
 
@@ -79,16 +81,38 @@ impl FakeFs {
   fn shutdowns(&self) -> usize {
     self.state.shutdowns.load(Ordering::SeqCst)
   }
+
+  /// Arms the fatal latch of the source spawned for `root`.
+  fn arm_fatal(&self, root: &str) {
+    self
+      .state
+      .fatals
+      .lock()
+      .unwrap()
+      .get(&PathBuf::from(root))
+      .expect("a source was spawned for the root")
+      .store(true, Ordering::SeqCst);
+  }
+
+  /// Drops the injection end of `root`'s source, disconnecting its receiver.
+  fn disconnect(&self, root: &str) {
+    self.state.taps.lock().unwrap().remove(&PathBuf::from(root));
+  }
 }
 
 struct FakeHandle {
   overflow: Arc<AtomicBool>,
+  fatal: Arc<AtomicBool>,
   shutdowns: Arc<FakeState>,
 }
 
 impl SourceControl for FakeHandle {
   fn take_overflow(&self) -> bool {
     self.overflow.swap(false, Ordering::AcqRel)
+  }
+
+  fn take_fatal(&self) -> bool {
+    self.fatal.swap(false, Ordering::AcqRel)
   }
 
   fn shutdown(self) {
@@ -109,9 +133,17 @@ impl FsOps for FakeFs {
     }
     let (tx, rx) = async_channel::bounded(config.channel_capacity.get());
     self.state.taps.lock().unwrap().insert(root.clone(), tx);
+    let fatal = Arc::new(AtomicBool::new(false));
+    self
+      .state
+      .fatals
+      .lock()
+      .unwrap()
+      .insert(root.clone(), Arc::clone(&fatal));
     Ok(SpawnedSource {
       handle: FakeHandle {
         overflow: Arc::new(AtomicBool::new(false)),
+        fatal,
         shutdowns: Arc::clone(&self.state),
       },
       receiver: rx,
@@ -159,6 +191,7 @@ fn rig_with_capacity(event_capacity: usize) -> Rig {
     fs.clone(),
     cmd_rx,
     ev_tx,
+    |_| {},
   ));
   Rig {
     fs,
@@ -337,6 +370,13 @@ async fn lagged_consumer_gets_the_dominating_rescan() {
     "everything dropped while lagged is covered by the parked Rescan"
   );
   assert!(second.epoch() > first.epoch());
+  // The dropped ordinary events are covered, never replayed: nothing may
+  // arrive after the Rescan that was produced before it.
+  let third = tokio::time::timeout(Duration::from_millis(200), rig.events.recv()).await;
+  assert!(
+    third.is_err(),
+    "an ordinary event escaped past its dominating Rescan: {third:?}"
+  );
 }
 
 #[tokio::test(start_paused = true)]
@@ -404,4 +444,50 @@ async fn watch_of_a_missing_root_fails_typed() {
     .unwrap();
   let err = on_reply.await.unwrap().unwrap_err();
   assert!(matches!(err, SourceError::RootUnavailable { .. }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fatal_latch_alone_invalidates_the_root() {
+  let rig = rig_with_capacity(64);
+  let _scope = watch(&rig, "/r").await;
+
+  // The in-band Fatal message was "dropped": only the latch records the
+  // death. Any later message wakes the post-receive latch drain.
+  rig.fs.arm_fatal("/r");
+  rig
+    .fs
+    .tap("/r")
+    .send(SourceMessage::Batch(vec![ev(
+      "/r/x",
+      FsEventFlags::ITEM_CREATED,
+      1,
+      3,
+    )]))
+    .await
+    .unwrap();
+
+  let (_, first) = next_event(&rig).await;
+  assert!(first.kind().is_created());
+  let (_, second) = next_event(&rig).await;
+  assert!(
+    second.kind().is_rescan(),
+    "the latched death surfaces as the terminal Rescan"
+  );
+  tokio::time::sleep(Duration::from_millis(100)).await;
+  assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
+}
+
+#[tokio::test(start_paused = true)]
+async fn disconnected_source_is_a_dead_stream() {
+  let rig = rig_with_capacity(64);
+  let _scope = watch(&rig, "/r").await;
+
+  // The source's sender vanishes without a Fatal — the receiver disconnect
+  // itself must be treated as the death signal.
+  rig.fs.disconnect("/r");
+
+  let (_, change) = next_event(&rig).await;
+  assert!(change.kind().is_rescan());
+  tokio::time::sleep(Duration::from_millis(100)).await;
+  assert_eq!(rig.fs.shutdowns(), 1);
 }
