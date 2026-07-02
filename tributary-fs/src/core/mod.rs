@@ -418,6 +418,10 @@ impl DriverCore {
           parked: None,
           attempt: Attempt::Idle,
         };
+        // Everything this scope already queued is dominated by the Rescan
+        // being minted below; delivering any of it after the refusal would
+        // put an ordinary event ahead of the Rescan that covers the drop.
+        Self::purge_scope_emits(&mut self.effects, scope);
         self.monitor.on_overflow(Scope::Root(scope), now);
         self.drain_monitor();
       }
@@ -896,6 +900,14 @@ impl DriverCore {
     }
   }
 
+  /// Drops every queued [`Effect::Emit`] belonging to `scope`. Called exactly
+  /// when the scope's queued deliveries become dominated (lag entry): the
+  /// non-emit effects (spawns, teardowns, probes) are obligations, never
+  /// dominated, and always survive.
+  fn purge_scope_emits(effects: &mut VecDeque<Effect>, scope: ScopeId) {
+    effects.retain(|effect| !matches!(effect, Effect::Emit { scope: s, .. } if *s == scope));
+  }
+
   fn mint_probe(&mut self, scope: ScopeId, purpose: ProbePurpose) -> ProbeId {
     self.probe_seq += 1;
     let probe = ProbeId(self.probe_seq);
@@ -938,7 +950,20 @@ impl DriverCore {
         }
         tributary_proto::Action::Unwatch(watch) => {
           if let Some(scope) = self.watch_scopes.remove(&watch) {
-            self.scopes.remove(&scope);
+            if let Some(state) = self.scopes.remove(&scope) {
+              // A lagged scope's parked Rescan is the only signal covering
+              // its dropped events; the teardown must still surface it
+              // (best-effort at delivery, like every post-teardown change) —
+              // silently discarding it would end a dead root's scope without
+              // the consumer ever learning coverage was lost.
+              if let LagState::Lagged {
+                parked: Some(change),
+                ..
+              } = state.lag
+              {
+                self.effects.push_back(Effect::Emit { scope, change });
+              }
+            }
             self.probes.retain(|_, ctx| ctx.scope != scope);
             self.effects.push_back(Effect::TeardownStream { scope });
           }

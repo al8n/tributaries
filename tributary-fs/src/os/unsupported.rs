@@ -32,6 +32,11 @@ impl SourceHandle {
     match *self {}
   }
 
+  /// Drains the fatal latch.
+  pub(crate) fn take_fatal(&self) -> bool {
+    match *self {}
+  }
+
   /// The resume point minted so far.
   // Journal resume is deferred surface; minted, not yet consumed.
   #[allow(dead_code)]

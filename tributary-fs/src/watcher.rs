@@ -137,11 +137,28 @@ impl<R: RuntimeLite> Watcher<R> {
     };
     let (command_tx, command_rx) = async_channel::bounded(16);
     let (event_tx, event_rx) = async_channel::bounded(options.event_capacity().get());
-    R::spawn_detach(run::<R, RealFs>(config, RealFs, command_rx, event_tx));
+    let roots = Arc::new(RwLock::new(RootSet::default()));
+    // The driver reports every scope end (unwatch, root death, stream fatal)
+    // back into the registry, so a dead root stops blocking a fresh watch of
+    // the same path while its entry keeps assembling trailing events.
+    let registry = Arc::clone(&roots);
+    let on_scope_dead = move |scope: ScopeId| {
+      let mut set = registry.write().unwrap_or_else(PoisonError::into_inner);
+      if let Some(entry) = set.entries.get_mut(&scope) {
+        entry.live = false;
+      }
+    };
+    R::spawn_detach(run::<R, RealFs>(
+      config,
+      RealFs,
+      command_rx,
+      event_tx,
+      on_scope_dead,
+    ));
     Ok(Self {
       commands: command_tx,
       events: futures_util::StreamExt::boxed(event_rx),
-      roots: Arc::new(RwLock::new(RootSet::default())),
+      roots,
       _runtime: PhantomData,
     })
   }
@@ -268,7 +285,16 @@ impl<R: RuntimeLite> Watcher<R> {
         }
         Ok(())
       }
-      Ok(false) => Err(UnwatchError::UnknownRoot),
+      Ok(false) => {
+        // The driver no longer knows the scope — it already tore the root
+        // down (root death raced this call). Reconcile a stale live entry so
+        // the dead path stops blocking a fresh watch.
+        let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = set.entries.get_mut(&root.scope()) {
+          entry.live = false;
+        }
+        Err(UnwatchError::UnknownRoot)
+      }
       Err(_) => Err(UnwatchError::Closed),
     }
   }

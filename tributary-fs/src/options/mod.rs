@@ -5,6 +5,26 @@ use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 #[cfg(test)]
 mod tests;
 
+/// The ceiling on the derived rename-pairing window. Deadline arithmetic
+/// downstream (`now + window`) must stay finite for the process lifetime, and
+/// a pairing window beyond a day is a configuration mistake, not a wish to be
+/// honored.
+pub(crate) const MAX_MOVE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The one derivation of the armed rename-pairing window, shared by the
+/// public options and the driver config so the two can never drift: at least
+/// `2 × latency + 50 ms`, saturating on extreme inputs, capped at
+/// [`MAX_MOVE_WINDOW`].
+pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Duration {
+  move_window
+    .max(
+      latency
+        .saturating_mul(2)
+        .saturating_add(Duration::from_millis(50)),
+    )
+    .min(MAX_MOVE_WINDOW)
+}
+
 /// Configuration for a [`Watcher`](crate::Watcher).
 ///
 /// [`new`](Self::new) returns the defaults; every knob has a `with_*` builder,
@@ -99,11 +119,14 @@ impl WatcherOptions {
   /// The rename-pairing window actually armed: the two halves of one rename
   /// can legally arrive one latency window apart, so the effective window
   /// never falls below `2 × latency + 50 ms` of scheduling margin.
+  ///
+  /// Total for every input: the derivation saturates instead of overflowing,
+  /// and the result is capped at one day — deadline arithmetic downstream
+  /// must stay finite, and a pairing window beyond that is a configuration
+  /// mistake, not a wish to be honored.
   #[inline]
   pub fn effective_move_window(&self) -> Duration {
-    self
-      .move_window
-      .max(self.latency * 2 + Duration::from_millis(50))
+    derive_move_window(self.move_window, self.latency)
   }
 
   /// The capacity of the event channel handed to the consumer, in events.
