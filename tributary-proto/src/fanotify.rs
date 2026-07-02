@@ -9,5 +9,3 @@
 //! `fsid+handle → path` map.
 //!
 //! This module is a placeholder for that backend profile.
-
-// TODO: the fanotify-FILESYSTEM driver lives in the `tributaries` crate; see docs/2026-06-28-tributaries-design.md §6b.
