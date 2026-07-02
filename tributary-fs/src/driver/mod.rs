@@ -49,10 +49,80 @@ impl DriverConfig {
   }
 }
 
-/// The reply channel of one `Command::Watch`: the scope plus the canonical
-/// root path event paths will arrive under.
-pub(crate) type WatchReply =
-  futures_channel::oneshot::Sender<Result<(ScopeId, PathBuf), SourceError>>;
+/// The reply channel of one `Command::Watch`, carrying a [`WatchGrant`] on
+/// success.
+pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant, SourceError>>;
+
+/// The successful payload of a watch reply: ownership of the just-spawned
+/// stream, armed to unwind.
+///
+/// A oneshot send succeeding only proves the receiver was alive — not that
+/// the `watch()` future will ever poll the value out. Until
+/// [`defuse`](Self::defuse) — called only after the watcher has inserted the
+/// registry entry — dropping the grant (a cancelled future, a dropped
+/// receiver) asks the driver to unwatch the scope, so no live stream is ever
+/// left without an owner. This is the commit half of a two-phase handoff;
+/// the unwind funnels into the driver's normal unwatch path (teardown,
+/// `on_scope_dead`, registry reconciliation).
+pub(crate) struct WatchGrant {
+  scope: ScopeId,
+  root: PathBuf,
+  unwind: async_channel::Sender<ScopeId>,
+  armed: bool,
+}
+
+impl WatchGrant {
+  /// Mints an armed grant. The driver is the only production caller; tests
+  /// mint grants to pin the unwind contract.
+  pub(crate) const fn new(
+    scope: ScopeId,
+    root: PathBuf,
+    unwind: async_channel::Sender<ScopeId>,
+  ) -> Self {
+    Self {
+      scope,
+      root,
+      unwind,
+      armed: true,
+    }
+  }
+
+  /// The granted scope.
+  pub(crate) const fn scope(&self) -> ScopeId {
+    self.scope
+  }
+
+  /// The canonical root path the scope's event paths arrive under.
+  pub(crate) fn root(&self) -> &Path {
+    &self.root
+  }
+
+  /// Commits the grant: the caller now owns the stream through its registry,
+  /// and dropping the grant no longer unwinds it.
+  pub(crate) fn defuse(mut self) {
+    self.armed = false;
+  }
+}
+
+impl Drop for WatchGrant {
+  fn drop(&mut self) {
+    if self.armed {
+      // Unbounded and driver-held: this send only fails when the driver is
+      // gone, whose own exit path already reclaimed every stream.
+      let _ = self.unwind.try_send(self.scope);
+    }
+  }
+}
+
+impl core::fmt::Debug for WatchGrant {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("WatchGrant")
+      .field("scope", &self.scope)
+      .field("root", &self.root)
+      .field("armed", &self.armed)
+      .finish_non_exhaustive()
+  }
+}
 
 /// One command from the watcher facade to its driver task.
 pub(crate) enum Command {
@@ -101,6 +171,27 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// `lstat`s one path (blocking).
   fn probe(&self, path: &Path) -> ProbeOutcome;
+}
+
+/// A live scope's stream handle plus a drain tap on its data channel, kept so
+/// a control-message dominance drain can discard the batches queued behind a
+/// loss or death signal.
+struct LiveSource<H> {
+  handle: H,
+  data: async_channel::Receiver<SourceMessage>,
+}
+
+impl<H> LiveSource<H> {
+  /// Discards every batch currently queued on the data channel. Everything
+  /// drained here was queued BEHIND the control signal being processed (the
+  /// callback is serial per source), and each discarded batch is covered by
+  /// the epoch-bumped `Rescan` that signal is about to become — delivering
+  /// one afterwards would put a stale record under the post-rescan epoch.
+  /// This is the lag protocol's own dominance logic applied at the source
+  /// boundary.
+  fn drain_data(&self) {
+    while self.data.try_recv().is_ok() {}
+  }
 }
 
 /// The control surface of a live stream handle.
@@ -249,10 +340,14 @@ pub(crate) async fn run<R, F>(
   // The guard keeps the SelectAll from ever emptying: an empty SelectAll
   // reports termination, which would spin the loop's stream arm.
   os.push(futures_util::stream::pending().boxed());
-  let mut handles: BTreeMap<ScopeId, F::Handle> = BTreeMap::new();
+  let mut handles: BTreeMap<ScopeId, LiveSource<F::Handle>> = BTreeMap::new();
   let mut watch_replies: BTreeMap<ScopeId, WatchReply> = BTreeMap::new();
   let mut unwatch_replies: BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>> =
     BTreeMap::new();
+  // Uncommitted watch grants unwind through here (see `WatchGrant`); the
+  // driver keeps a sender so grants can always be minted, which is fine —
+  // exit is driven by the COMMAND channel, and this receiver merely pends.
+  let (unwind_tx, unwind_rx) = async_channel::unbounded::<ScopeId>();
 
   let close_reply = loop {
     execute_effects::<R, F>(
@@ -305,7 +400,16 @@ pub(crate) async fn run<R, F>(
             Ok(spawned) => {
               let canonical_root = spawned.meta.root.clone();
               core.on_stream_spawned(scope, Ok(spawned.meta));
-              handles.insert(scope, spawned.handle);
+              handles.insert(
+                scope,
+                LiveSource {
+                  handle: spawned.handle,
+                  // A tap clone of the data channel: messages go to whichever
+                  // receiver takes them, so the dominance drain steals queued
+                  // batches straight out from under the select stream.
+                  data: spawned.channels.data.clone(),
+                },
+              );
               os.push(
                 spawned
                   .channels
@@ -324,13 +428,28 @@ pub(crate) async fn run<R, F>(
                   .map(move |msg| (scope, Some(msg)))
                   .boxed(),
               );
-              let owned = watch_replies
-                .remove(&scope)
-                .is_some_and(|reply| reply.send(Ok((scope, canonical_root))).is_ok());
+              let owned = match watch_replies.remove(&scope) {
+                Some(reply) => {
+                  let grant = WatchGrant::new(scope, canonical_root, unwind_tx.clone());
+                  match reply.send(Ok(grant)) {
+                    Ok(()) => true,
+                    Err(payload) => {
+                      // The receiver is already gone; unwind synchronously
+                      // rather than through the grant's Drop.
+                      if let Ok(grant) = payload {
+                        grant.defuse();
+                      }
+                      false
+                    }
+                  }
+                }
+                None => false,
+              };
               if !owned {
-                // The watch() future was cancelled: nobody holds the handle,
-                // so the just-spawned stream would leak until close. Tear it
-                // down as an immediate unwatch.
+                // The watch() future was cancelled before the reply could
+                // hand ownership over: tear the just-spawned stream down as
+                // an immediate unwatch. (Cancellation AFTER a successful
+                // send is the grant's unwind.)
                 core.on_unwatch(scope);
               }
             }
@@ -349,6 +468,15 @@ pub(crate) async fn run<R, F>(
           }
         }
       },
+      unwound = unwind_rx.recv().fuse() => {
+        // An uncommitted grant dropped (a watch() future cancelled after its
+        // reply was sent but before it was polled): unwind through the
+        // normal unwatch path so the stream, the registry, and the core all
+        // reconcile.
+        if let Ok(scope) = unwound {
+          core.on_unwatch(scope);
+        }
+      },
       _ = timer => core.on_timeout(now()),
       msg = os.next() => {
         if let Some((scope, msg)) = msg {
@@ -357,17 +485,30 @@ pub(crate) async fn run<R, F>(
             Some(SourceMessage::Overflow) => {
               // Acknowledge BEFORE acting: a loss racing the acknowledgement
               // either rides a fresh message or is covered by the rescan
-              // this triggers.
-              if let Some(handle) = handles.get(&scope) {
-                handle.overflow_processed();
+              // this triggers. Then the dominance drain — data and control
+              // ride separate channels, so batches queued BEFORE this signal
+              // could otherwise be selected AFTER the Rescan it becomes and
+              // land stale records under the post-rescan epoch.
+              if let Some(live) = handles.get(&scope) {
+                live.handle.overflow_processed();
+                live.drain_data();
               }
               core.on_root_overflow(scope, now());
             }
-            Some(SourceMessage::Fatal(_)) => core.on_source_fatal(scope, now()),
+            Some(SourceMessage::Fatal(_)) => {
+              // Same dominance drain: nothing queued behind the death signal
+              // may deliver after the terminal Rescan it produces.
+              if let Some(live) = handles.get(&scope) {
+                live.drain_data();
+              }
+              core.on_source_fatal(scope, now());
+            }
             // The data receiver disconnected while the stream should still
             // be live: the source died without managing to say so (its
             // sender dropped) — a dead stream, not a teardown of ours (that
-            // path removes the handle before the disconnect can arrive).
+            // path removes the handle before the disconnect can arrive). No
+            // drain is needed: the end marker only fires after the select
+            // stream yielded everything the channel held.
             None => {
               if handles.contains_key(&scope) {
                 core.on_source_fatal(scope, now());
@@ -384,11 +525,11 @@ pub(crate) async fn run<R, F>(
   // death signals are in-band messages, so anything undrained here is part
   // of that same best-effort remainder).
   let mut open: Vec<ScopeId> = handles.keys().copied().collect();
-  for (scope, handle) in std::mem::take(&mut handles) {
+  for (scope, live) in std::mem::take(&mut handles) {
     on_scope_dead(scope);
     let tx = op_tx.clone();
     R::spawn_blocking_detach(move || {
-      handle.shutdown();
+      live.handle.shutdown();
       let _ = tx.try_send(OpResult::TornDown { scope });
     });
   }
@@ -431,7 +572,7 @@ fn execute_effects<R, F>(
   ops: &F,
   config: &DriverConfig,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
-  handles: &mut BTreeMap<ScopeId, F::Handle>,
+  handles: &mut BTreeMap<ScopeId, LiveSource<F::Handle>>,
   events: &async_channel::Sender<(ScopeId, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
   on_scope_dead: &(impl Fn(ScopeId) + Send + Sync),
@@ -459,10 +600,10 @@ fn execute_effects<R, F>(
         // funnels through this effect: tell the layer above, so a dead root
         // stops participating in its liveness checks.
         on_scope_dead(scope);
-        if let Some(handle) = handles.remove(&scope) {
+        if let Some(live) = handles.remove(&scope) {
           let tx = op_tx.clone();
           R::spawn_blocking_detach(move || {
-            handle.shutdown();
+            live.handle.shutdown();
             let _ = tx.try_send(OpResult::TornDown { scope });
           });
         } else if let Some(reply) = unwatch_replies.remove(&scope) {

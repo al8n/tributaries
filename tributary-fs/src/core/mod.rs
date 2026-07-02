@@ -642,67 +642,52 @@ impl DriverCore {
 
   /// Compiles one raw batch into planned Monitor inputs, minting probes for
   /// everything a flag word alone cannot ground.
+  ///
+  /// Rename pairing is probe-grounded per half — there is no same-batch
+  /// no-probe fast path. Each half's probe establishes existence AND the
+  /// authoritative device that decides its cookie, and the pairing itself is
+  /// the Monitor's `(scope, cookie)` window. The cost is one `lstat` per
+  /// rename half on the blocking pool, accepted by design: an event-side
+  /// pre-pair must trust device facts it cannot observe, which is exactly how
+  /// a fabricated cross-device move happens.
   fn compile(
     &mut self,
     state: &mut ScopeState,
     scope: ScopeId,
     events: Vec<RawOsEvent>,
   ) -> PendingBatch {
-    // Same-batch rename pairing: exactly two renamed events sharing a fileID
-    // are one within-tree rename; the journal orders source before
-    // destination, so the lower event id is the source half.
+    // Mount/unmount trust mutations apply BEFORE anything in the batch is
+    // classified: a rename sharing its batch with the MOUNT that makes its
+    // path foreign must already see the updated table (the gone-path cookie
+    // decision reads it — a probe cannot supply a device for a path that no
+    // longer exists).
+    for ev in &events {
+      if ev.flags.mount() || ev.flags.unmount() {
+        apply_mount_trust(state, ev);
+      }
+    }
+    // Same-fileID grouping decides chain SUPPRESSION only. A group larger
+    // than a pair is a chain or coalesced reuse: existence probes see only
+    // the FINAL state of several operations, so its members never mint the
+    // shared cookie and the whole group is covered by one trailing located
+    // rescan. A pair or a singleton needs no belt — its probes ground each
+    // half completely, and the Monitor's displacement semantics keep even a
+    // mis-ordered pair a safe degrade.
     let mut rename_groups: BTreeMap<NonZeroU64, Vec<usize>> = BTreeMap::new();
     for (idx, ev) in events.iter().enumerate() {
-      // Only a PURE rename word may pre-pair: a word also carrying
-      // create/remove/modify/attrib (or any control) bits is an ambiguous
-      // coalescing, and trusting it as just-a-rename would silently drop the
-      // extra operation — it routes through the probing grounding table.
+      // Only a PURE rename word groups: a word also carrying
+      // create/remove/modify/attrib bits routes through the probing grounding
+      // table with its extra operation surfaced.
       if ev.flags.is_pure_rename()
         && let Some(fid) = ev.file_id
       {
         rename_groups.entry(fid).or_default().push(idx);
       }
     }
-    let mut paired: BTreeMap<usize, Planned> = BTreeMap::new();
-    // Members of a group whose shared fileID is ambiguous — a chain or
-    // coalesced reuse (more than two entries), or a device the id cannot be
-    // trusted on (fileIDs are device-scoped). None of them may mint a cookie:
-    // each degrades through the cookie-less probe path, and the whole group
-    // is covered by one trailing located rescan so no mis-read is silent.
     let mut suppressed: BTreeSet<usize> = BTreeSet::new();
     let mut trailing: Vec<Planned> = Vec::new();
-    for (fid, group) in &rename_groups {
-      let pairable = match group.as_slice() {
-        [a, b] => {
-          events[*a].path != events[*b].path
-            && cookie_for(state, &events[*a].path, Some(*fid), None).is_some()
-            && cookie_for(state, &events[*b].path, Some(*fid), None).is_some()
-        }
-        _ => false,
-      };
-      if let ([a, b], true) = (group.as_slice(), pairable) {
-        let (from_idx, to_idx) = if events[*a].event_id <= events[*b].event_id {
-          (*a, *b)
-        } else {
-          (*b, *a)
-        };
-        let cookie = MoveCookie::new(*fid);
-        let (from_slot, to_slot) = (from_idx.min(to_idx), from_idx.max(to_idx));
-        if let (Some(from), Some(to)) = (
-          self.plan_move_half(
-            state,
-            RecordKind::MovedFrom,
-            &events[from_idx],
-            Some(cookie),
-          ),
-          self.plan_move_half(state, RecordKind::MovedTo, &events[to_idx], Some(cookie)),
-        ) {
-          // The source half must reach the Monitor before its destination:
-          // roles follow the event ids, feed positions take the earlier slot.
-          paired.insert(from_slot, from);
-          paired.insert(to_slot, to);
-        }
-      } else if group.len() > 1 {
+    for group in rename_groups.values() {
+      if group.len() > 2 {
         suppressed.extend(group.iter().copied());
         trailing.push(Self::covering_rescan(
           state,
@@ -715,13 +700,6 @@ impl DriverCore {
     let mut items = Vec::with_capacity(events.len());
     let mut awaiting = 0usize;
     for (idx, ev) in events.iter().enumerate() {
-      if let Some(planned) = paired.remove(&idx) {
-        items.push(Item {
-          planned: vec![planned],
-          probe: None,
-        });
-        continue;
-      }
       match self.plan_event(state, scope, idx, ev, !suppressed.contains(&idx)) {
         ItemPlan::Immediate(planned) => items.push(Item {
           planned,
@@ -909,46 +887,12 @@ impl DriverCore {
       }
       Lowered::Root => vec![Planned::Over(Scope::Root(scope))],
       Lowered::Target(location) => {
-        if ev.flags.mount() {
-          if !state.mounts.iter().any(|m| m == &ev.path) {
-            state.mounts.push(ev.path.clone());
-          }
-        } else {
-          state.mounts.retain(|m| m != &ev.path);
-        }
+        // The trust mutation already ran in `compile`'s pre-scan; the volume
+        // change here plans only the coverage obligation it creates.
         vec![Planned::Over(located(state.watch, Some(location)))]
       }
       Lowered::Outside => vec![Planned::Over(Scope::Root(scope))],
     }
-  }
-
-  /// Plans one half of a same-batch rename pair. `None` when the path cannot
-  /// be lowered — the caller then leaves both halves to the singleton path.
-  fn plan_move_half(
-    &mut self,
-    state: &mut ScopeState,
-    kind: RecordKind,
-    ev: &RawOsEvent,
-    cookie: Option<MoveCookie>,
-  ) -> Option<Planned> {
-    let target = match lower(state, &ev.path) {
-      Lowered::Target(location) => Some(location),
-      // A rename half naming the root or an outside path is not a pairable
-      // child move; fall back to the singleton probe path.
-      Lowered::Root | Lowered::Outside => return None,
-    };
-    let mut rec = record_from_event(
-      state,
-      kind,
-      target,
-      dir_hint(ev.flags),
-      ev.file_id,
-      &ev.path,
-    );
-    if let Some(cookie) = cookie {
-      rec = rec.with_cookie(cookie);
-    }
-    Some(Planned::Rec(rec))
   }
 
   /// Resolves one probe's plan. Returns the item index and its planned inputs.
@@ -1301,6 +1245,23 @@ fn device_trusted(state: &ScopeState, path: &Path, dev: Option<u64>) -> bool {
     (None, _) => {}
   }
   state.mounts_authoritative && !state.mounts.iter().any(|m| path.starts_with(m))
+}
+
+/// Applies one mount/unmount event's device-trust mutation. Runs in
+/// `compile`'s pre-scan — strictly before any of the batch's items are
+/// classified — so a same-batch rename under the just-mounted volume already
+/// sees the foreign prefix when its cookie trust is decided.
+fn apply_mount_trust(state: &mut ScopeState, ev: &RawOsEvent) {
+  if !matches!(lower(state, &ev.path), Lowered::Target(_)) {
+    return;
+  }
+  if ev.flags.mount() {
+    if !state.mounts.iter().any(|m| m == &ev.path) {
+      state.mounts.push(ev.path.clone());
+    }
+  } else {
+    state.mounts.retain(|m| m != &ev.path);
+  }
 }
 
 /// Records a probed foreign-device path as a mount prefix, so later

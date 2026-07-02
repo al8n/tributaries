@@ -245,8 +245,10 @@ impl<R: RuntimeLite> Watcher<R> {
     // Reserve the root before the round-trip so a concurrent overlapping
     // `watch` cannot also pass the disjointness check. The guard's Drop
     // releases the reservation on every exit — including this future being
-    // cancelled at either await below (the driver side then tears down an
-    // orphaned stream when its reply finds no receiver).
+    // cancelled at either await below. An orphaned stream cannot outlive a
+    // cancellation on either side of the reply: a reply finding no receiver
+    // is torn down by the driver directly, and a delivered-but-never-polled
+    // reply unwinds through its `WatchGrant`.
     let reservation = Reservation::take(&self.roots, canonical.clone())?;
 
     let (reply, response) = futures_channel::oneshot::channel();
@@ -262,18 +264,23 @@ impl<R: RuntimeLite> Watcher<R> {
       return Err(WatchRootError::Closed);
     }
     match response.await {
-      Ok(Ok((scope, live_root))) => {
+      Ok(Ok(grant)) => {
+        let scope = grant.scope();
         let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
         set.entries.insert(
           scope,
           RootEntry {
-            path: Arc::new(live_root),
+            path: Arc::new(grant.root().to_path_buf()),
             live: true,
           },
         );
         drop(set);
-        // Only now may the reservation lift: the entry above covers the path.
+        // Only now may the reservation lift and the grant commit: the entry
+        // above covers the path, so the stream has an owner. (Everything from
+        // the await's resolution to here is synchronous — there is no
+        // cancellation point between insert and defuse.)
         drop(reservation);
+        grant.defuse();
         Ok(RootHandle::new(scope))
       }
       Ok(Err(err)) => Err(WatchRootError::Source(err)),

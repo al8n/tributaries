@@ -229,7 +229,7 @@ fn probe_failure_escalates_located_rescan() {
 }
 
 #[test]
-fn same_batch_rename_pair_emits_single_moved() {
+fn same_batch_rename_pair_grounds_by_probes_into_single_moved() {
   let (mut core, scope) = live_core();
   core.on_batch(
     scope,
@@ -249,15 +249,26 @@ fn same_batch_rename_pair_emits_single_moved() {
     ],
     at(1),
   );
-  let effects = drain(&mut core);
-  assert!(
-    probes(&effects).is_empty(),
-    "a same-batch pair needs no probe"
+  // No pre-pairing exists: every rename half probes, and the probes' device
+  // evidence decides the cookies that let the Monitor pair them.
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2, "both halves of a same-batch pair probe");
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
   );
+  let effects = drain(&mut core);
   let emitted = emits(&effects);
   assert_eq!(emitted.len(), 1, "{effects:?}");
   assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "old"])));
   assert_eq!(emitted[0].location(), &loc(&["b", "new"]));
+  assert_eq!(core.poll_timeout(), None, "pairing consumed both halves");
 }
 
 #[test]
@@ -1166,13 +1177,21 @@ fn cross_device_fileid_collision_never_pairs() {
     "device-scoped ids never fabricate a move: {emitted:?}"
   );
   assert!(
-    emitted.iter().any(|c| c.kind().is_rescan()),
-    "the ambiguous group is covered by a Rescan: {emitted:?}"
+    emitted
+      .iter()
+      .any(|c| c.kind().is_removed() && c.location() == &loc(&["vol", "twin"])),
+    "the foreign vanished half degrades to Removed: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_created() && c.location() == &loc(&["native"])),
+    "the native surviving half degrades to Created: {emitted:?}"
   );
   assert_eq!(
     core.poll_timeout(),
     None,
-    "no cookie was minted for either half"
+    "no half is left pending a pair the devices forbid"
   );
 }
 
@@ -1381,5 +1400,58 @@ fn blind_mount_table_suppresses_the_pairing_fast_path() {
       .iter()
       .any(|c| c.kind().is_created() && c.location() == &loc(&["new"])),
     "{emitted:?}"
+  );
+}
+
+#[test]
+fn mount_in_batch_blocks_same_batch_rename_trust() {
+  let (mut core, scope) = live_core();
+  // The MOUNT and a colliding-fileID pure-rename pair arrive in ONE batch:
+  // the trust mutation must be visible before any cookie decision — the
+  // vanished half under the just-mounted volume is decided event-side (a
+  // gone path has no device to stat).
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/vol", flags(&[FsEventFlags::MOUNT]), 1, 0),
+      ev("/r/vol/twin", flags(&[FsEventFlags::ITEM_RENAMED]), 2, 77),
+      ev("/r/native", flags(&[FsEventFlags::ITEM_RENAMED]), 3, 77),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2, "both halves probe; nothing pre-pairs");
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(77),
+      dev: 1,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "a same-batch mount never lets device-scoped ids pair: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_rescan() && c.location() == &loc(&["vol"])),
+    "the mount's own located rescan still lands: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_removed() && c.location() == &loc(&["vol", "twin"])),
+    "the foreign half degrades cookie-less: {emitted:?}"
+  );
+  assert_eq!(
+    core.poll_timeout(),
+    None,
+    "the foreign half minted no cookie to wait on"
   );
 }
