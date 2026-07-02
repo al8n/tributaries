@@ -63,7 +63,7 @@ pub use action::{
 pub use capabilities::Capabilities;
 pub use change::{Change, ChangeKind};
 pub use error::WatchError;
-pub use id::{ChangeId, MoveCookie, ReqId, ScopeId, WatchId};
+pub use id::{ChangeId, Epoch, MoveCookie, ReqId, ScopeId, WatchId};
 pub use interest::Interest;
 pub use machine::PrimitiveMachine;
 pub use monitor::Monitor;

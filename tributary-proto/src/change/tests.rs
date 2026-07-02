@@ -54,16 +54,24 @@ fn change_projects_fields() {
     scope(2),
     loc(&["src", "lib.rs"]),
     ChangeKind::Modified,
+    Epoch::new(7),
   );
   assert_eq!(c.id(), change_id(1));
   assert_eq!(c.scope(), scope(2));
   assert_eq!(c.location(), &loc(&["src", "lib.rs"]));
   assert!(c.kind().is_modified());
+  assert_eq!(c.epoch(), Epoch::new(7));
 }
 
 #[test]
 fn rescan_change_carries_scope() {
-  let c = Change::new(change_id(5), scope(3), Location::new(), ChangeKind::Rescan);
+  let c = Change::new(
+    change_id(5),
+    scope(3),
+    Location::new(),
+    ChangeKind::Rescan,
+    Epoch::START,
+  );
   assert!(c.kind().is_rescan());
   assert_eq!(c.scope(), scope(3));
   assert!(c.location().is_empty());
