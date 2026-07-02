@@ -71,6 +71,21 @@ fn live_root(m: &mut Monitor, s: ScopeId) -> WatchId {
   root
 }
 
+/// A registered root, armed AND past its bootstrap enumerate — i.e. `Live` and idle,
+/// the realistic precondition for a subsequent overflow or move (a single outstanding
+/// read at a time, so a re-arm on a still-enumerating root would coalesce).
+fn live_root_idle(m: &mut Monitor, s: ScopeId) -> WatchId {
+  let root = live_root(m, s);
+  let boot = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+  root
+}
+
 #[test]
 fn new_reports_capabilities_and_descent() {
   let m = per_dir();
@@ -2684,9 +2699,7 @@ fn overflow_rearm_quiesces_after_persistent_failure() {
 #[test]
 fn overflow_rearm_obligation_transfers_across_reparent() {
   let mut m = per_dir();
-  let root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
-  let _ = drain_events(&mut m);
+  let root = live_root_idle(&mut m, scope(1));
 
   // root → d (watched, live).
   m.on_os_record(
@@ -2697,6 +2710,11 @@ fn overflow_rearm_obligation_transfers_across_reparent() {
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
   m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap enumerate");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2826,9 +2844,7 @@ fn late_cyclic_moved_to_does_not_reconcile_under_dead_parent() {
 #[test]
 fn inherited_rearm_survives_a_pending_reparented_source() {
   let mut m = per_dir();
-  let root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
-  let _ = drain_events(&mut m);
+  let root = live_root_idle(&mut m, scope(1));
 
   // "d" is created and its watch is queued but NOT yet acknowledged — it is pending.
   m.on_os_record(
@@ -2916,7 +2932,7 @@ fn partial_rearm_rearms_a_child_omitted_from_the_listing() {
     "a partial read does not prune the omitted child"
   );
   assert!(
-    m.rearm_dirs.contains(&w_a),
+    m.is_rearm_enumerating(w_a),
     "the omitted-but-known child is re-armed via the cascade"
   );
 }
@@ -2950,7 +2966,7 @@ fn cold_partial_enumerate_arms_visible_and_retries() {
     "an incomplete cold read emits a Rescan"
   );
   assert!(
-    m.rearm_dirs.contains(&root),
+    m.is_rearm_enumerating(root),
     "root is re-armed to complete the read"
   );
 }
@@ -3070,9 +3086,7 @@ fn partial_rearm_drops_a_dir_replaced_by_a_file() {
 #[test]
 fn failed_rearm_reaches_detached_held_move_source() {
   let mut m = per_dir();
-  let root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
-  let _ = drain_events(&mut m);
+  let root = live_root_idle(&mut m, scope(1));
 
   // root → d (watched, live).
   m.on_os_record(
@@ -3083,6 +3097,11 @@ fn failed_rearm_reaches_detached_held_move_source() {
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
   m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap enumerate");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
