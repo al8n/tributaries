@@ -634,16 +634,21 @@ fn overflow_on_kernel_recursive_does_not_rearm() {
 }
 
 #[test]
-fn delete_self_on_root_emits_removed() {
+fn delete_self_on_root_emits_removed_and_invalidates() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_events(&mut m);
 
   m.on_os_record(OsRecord::new(root, RecordKind::DeleteSelf), at(1));
   let events = drain_events(&mut m);
-  assert_eq!(events.len(), 1);
+  // The deletion delivers, and — since the scope's coverage just ended — the
+  // no-silent-loss Rescan follows it (dominating by epoch).
+  assert_eq!(events.len(), 2);
   assert!(events[0].kind().is_removed());
   assert!(events[0].location().is_empty());
+  assert!(events[1].kind().is_rescan());
+  assert!(events[1].epoch() > events[0].epoch());
+  assert!(!m.is_watched(root), "the dead root's tree is invalidated");
 }
 
 #[test]
@@ -1805,27 +1810,44 @@ fn pending_move_purged_on_unregister_root() {
   );
 }
 
-/// Invariant (b): a narrow teardown of the source's watch leaves the half in place
-/// (a destination could still arrive), but the liveness guard means it never emits
-/// a stale `Removed` once its source is gone.
+/// Invariant (b): a NARROW teardown of the source's watch (a non-root — a root
+/// teardown is a whole-scope invalidation that purges the halves) leaves the half in
+/// place (a destination could still arrive at a surviving slot), but the liveness
+/// guard means it never emits a stale `Removed` once its source is gone.
 #[test]
 fn dead_source_half_emits_no_removed_after_teardown() {
   let mut m = per_dir();
-  let root = live_root(&mut m, scope(1));
+  let root = live_root_idle(&mut m, scope(1));
+
+  // root → p (watched, live): the half's source parent, torn down narrowly below.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("p"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_p = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_p, Ok(()));
+  let p_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_p).map(|e| e.req()))
+    .expect("p bootstrap");
+  m.on_enumerate(p_boot, EnumerateResult::Ok(std::vec::Vec::new()));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
   m.on_os_record(
-    OsRecord::new(root, RecordKind::MovedFrom)
+    OsRecord::new(w_p, RecordKind::MovedFrom)
       .with_name(seg("gone"))
       .with_cookie(cookie(1)),
     at(10),
   );
   assert_eq!(m.poll_timeout(), Some(at(10) + DEFAULT_MOVE_WINDOW));
 
-  // `Ignored` on the root drops it (the half's `from_parent`). The half is NOT
-  // purged by the narrow drop — it lingers, still timer-armed...
-  m.on_os_record(OsRecord::new(root, RecordKind::Ignored), at(11));
+  // `Ignored` on p drops it (the half's `from_parent`). The half is NOT purged by
+  // the narrow drop — it lingers, still timer-armed...
+  m.on_os_record(OsRecord::new(w_p, RecordKind::Ignored), at(11));
+  let _ = drain_events(&mut m);
   assert_eq!(
     m.poll_timeout(),
     Some(at(10) + DEFAULT_MOVE_WINDOW),
@@ -2416,7 +2438,8 @@ fn held_dir_source_with_torn_down_parent_resolves_created() {
   let _ = drain_events(&mut m);
 
   // The destination arrives at the surviving root: no reparent of the dropped w_d —
-  // a fresh Created with a fresh watch, and nothing tied to the dead subtree.
+  // a fresh Created with a fresh watch, nothing tied to the dead subtree, and a
+  // destination Rescan (the dead source's interval was covered by no watch).
   m.on_os_record(
     OsRecord::new(root, RecordKind::MovedTo)
       .with_name(seg("g"))
@@ -2425,10 +2448,14 @@ fn held_dir_source_with_torn_down_parent_resolves_created() {
     at(12),
   );
   let events = drain_events(&mut m);
-  assert_eq!(events.len(), 1);
+  assert_eq!(events.len(), 2);
   assert!(
     events[0].kind().is_created() && events[0].location() == &loc(&["g"]),
     "a fresh Created, not a Moved off a dead parent"
+  );
+  assert!(
+    events[1].kind().is_rescan() && events[1].location() == &loc(&["g"]),
+    "the failed carry-over re-scans the destination"
   );
   let actions = drain_actions(&mut m);
   let w_g = actions
@@ -2508,11 +2535,20 @@ fn cyclic_reparent_pair_is_rejected_without_corruption() {
   assert!(!m.is_watched(w_d), "the held source is torn down");
   assert!(!m.is_watched(w_sub), "its subtree went with it");
   // A rejected cyclic pair escalates with a Rescan — never a bogus Moved into a path
-  // the Monitor no longer covers.
+  // the Monitor no longer covers — and the Rescan points at the scope ROOT: the
+  // destination path died with the held subtree, so a location reconstructed through
+  // it would be the stale pre-move path.
   let events = drain_events(&mut m);
   assert!(
     events.iter().any(|e| e.kind().is_rescan()) && events.iter().all(|e| !e.kind().is_moved()),
     "cyclic pair emits a Rescan, not a Moved"
+  );
+  assert!(
+    events
+      .iter()
+      .filter(|e| e.kind().is_rescan())
+      .all(|e| e.location().is_empty()),
+    "the escalation Rescan targets the scope root, not a stale held path"
   );
   let actions = drain_actions(&mut m);
   assert!(
@@ -2831,6 +2867,13 @@ fn late_cyclic_moved_to_does_not_reconcile_under_dead_parent() {
   assert!(
     events.iter().any(|e| e.kind().is_rescan()),
     "a late cyclic destination escalates with a Rescan"
+  );
+  assert!(
+    events
+      .iter()
+      .filter(|e| e.kind().is_rescan())
+      .all(|e| e.location().is_empty()),
+    "the escalation Rescan targets the scope root, not a stale held path"
   );
   let actions = drain_actions(&mut m);
   assert!(
@@ -3455,6 +3498,8 @@ fn random_op_storm_holds_invariants_and_terminates() {
       RecordKind::Modified,
       RecordKind::MovedFrom,
       RecordKind::MovedTo,
+      RecordKind::MoveSelf,
+      RecordKind::DeleteSelf,
     ];
 
     for step in 0..300u64 {
@@ -3533,4 +3578,1354 @@ fn random_op_storm_holds_invariants_and_terminates() {
     }
     m.assert_invariants();
   }
+}
+
+/// A record on a detached-and-held move source is suppressed (not delivered at the stale
+/// pre-move path); because the hold was dirtied, the pairing reparent re-scans the
+/// destination to recover the change.
+#[test]
+fn held_source_suppresses_stale_path_events() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // root → d (watched, live).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap enumerate");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // "d" moves away — detached and held for the pairing window.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(&mut m);
+
+  // A modification on the held source during the window: suppressed — no stale-path event.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Modified).with_name(seg("f")),
+    at(11),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a record on a held source is not delivered at the stale path"
+  );
+
+  // The move pairs to "e": the move is delivered, and the dirtied hold re-scans it.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_moved()),
+    "the move is delivered"
+  );
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "the dirtied hold re-scans the destination to recover the suppressed change"
+  );
+}
+
+/// A root self-move emits a `Rescan` AND invalidates the stale root tree, so a later
+/// record on the moved-away root is ignored rather than delivered at the old root path.
+#[test]
+fn root_self_move_invalidates_the_stale_tree() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(OsRecord::new(root, RecordKind::MoveSelf), at(1));
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "a moved root emits a Rescan"
+  );
+  assert!(!m.is_watched(root), "the stale root tree is invalidated");
+
+  // A later record on the moved-away root is ignored — no false event at the old path.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("x"))
+      .with_is_dir(false),
+    at(2),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "records on the invalidated root are ignored"
+  );
+}
+
+/// A move-in landing inside a held source's subtree is fenced like any other record: it
+/// must not reconstruct a Created/Moved at the stale pre-move path, and it dirties the
+/// hold so the pairing reparent re-scans. Only the source's OWN pairing gets through.
+#[test]
+fn move_in_to_a_held_source_is_fenced() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap enumerate");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // "d" is held after its MovedFrom.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(&mut m);
+
+  // An UNRELATED object moves into d (a MovedTo on w_d whose cookie pairs nothing): fenced.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::MovedTo)
+      .with_name(seg("x"))
+      .with_cookie(cookie(9))
+      .with_is_dir(true),
+    at(11),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a move-in inside a held source is fenced, not delivered at the stale path"
+  );
+
+  // Pairing d → e: the dirtied hold re-scans the destination.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "the dirtied hold re-scans on pairing"
+  );
+}
+
+/// A held source's in-flight enumerate returning WHILE it is still held is dropped (not
+/// delivered at the stale pre-move path); coverage is recovered when the pairing reparent
+/// re-arms the reparented source at its real destination.
+#[test]
+fn held_source_recovers_coverage_on_pairing() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // root → d: install and arm, but leave d's cold enumerate outstanding (unfed).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let d_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d cold enumerate");
+  let _ = drain_events(&mut m);
+
+  // d moves away (held) while its cold enumerate is still in flight.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(&mut m);
+
+  // A directory "g" is created under the held d: suppressed, dirtying the hold.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created)
+      .with_name(seg("g"))
+      .with_is_dir(true),
+    at(11),
+  );
+  let _ = drain_events(&mut m);
+
+  // d's cold enumerate returns WHILE d is still held — even listing "g", it is dropped,
+  // never delivered at the stale path.
+  m.on_enumerate(
+    d_req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Dir)]),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a held directory's enumerate is not delivered at the stale pre-move path"
+  );
+
+  // Pairing d → e recovers coverage: the reparented source is re-armed (rediscovers "g").
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert!(
+    m.is_rearm_enumerating(w_d),
+    "the dirtied hold re-arms the reparented source to recover coverage"
+  );
+}
+
+/// A create→remove→create for one path, batched before the consumer drains, delivers all
+/// three transitions: the intervening remove is not coalesced away, so the consumer does
+/// not converge to "absent" for an object that in fact exists.
+#[test]
+fn create_remove_create_is_not_coalesced() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  for kind in [
+    RecordKind::Created,
+    RecordKind::Removed,
+    RecordKind::Created,
+  ] {
+    m.on_os_record(OsRecord::new(root, kind).with_name(seg("x")), at(1));
+  }
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    3,
+    "all three transitions are delivered, not coalesced to create+remove"
+  );
+  assert!(events[0].kind().is_created());
+  assert!(events[1].kind().is_removed());
+  assert!(events[2].kind().is_created());
+}
+
+/// A held (still-pending) source whose watch install FAILS does not Rescan at its stale
+/// pre-move path — the failure dirties the hold instead, and pairing/timeout resolves the
+/// real path.
+#[test]
+fn held_pending_source_watch_failure_is_fenced() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // "d" is created; its watch is queued but NOT yet acknowledged (pending).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  let _ = drain_events(&mut m);
+
+  // "d" moves away while still pending → held.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(&mut m);
+
+  // The delayed watch result for the held pending source errors: no stale-path Rescan.
+  m.on_watch_result(w_d, Err(WatchError::Gone));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a held pending source's watch failure emits no stale-path Rescan"
+  );
+}
+
+/// A root overflow during a hold dirties the held source, so when the move pairs the
+/// reparented source is re-armed — rebuilding any destination coverage the overflow's
+/// temporary watch had that the reparent drops.
+#[test]
+fn root_overflow_during_hold_rearms_the_paired_source() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap enumerate");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // "d" is held after its MovedFrom.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(&mut m);
+
+  // A root overflow dirties the held source (its re-arm may build temp destination
+  // coverage the reparent will drop).
+  m.on_overflow(Scope::Root(scope(1)), at(11));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // d pairs to e: the dirtied hold re-arms the reparented source, rebuilding coverage.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert!(
+    m.is_rearm_enumerating(w_d),
+    "the root overflow dirtied the hold, so pairing re-arms the moved-in source"
+  );
+}
+
+/// A subtree overflow targeting a held move source is fenced like a record: it does not
+/// Rescan at the stale pre-move path, but dirties the hold so the pairing reparent
+/// re-scans the real destination.
+#[test]
+fn subtree_overflow_on_a_held_source_is_fenced() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap enumerate");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // "d" is held after its MovedFrom.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(&mut m);
+
+  // A subtree overflow on the held source: fenced — no stale-path Rescan.
+  m.on_overflow(Scope::Subtree(w_d), at(11));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a subtree overflow on a held source emits no stale-path Rescan"
+  );
+
+  // Pairing d → e: the dirtied hold re-scans the destination.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "the dirtied hold re-scans on pairing"
+  );
+}
+
+/// A watch that arms WHILE held enumerates coverage-only even if the move pairs (clearing
+/// the hold) before the read returns: a pre-existing destination child must not surface as
+/// a false Created after the move.
+#[test]
+fn held_origin_enumerate_stays_coverage_only_across_pairing() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // "d" is created; its watch is queued but NOT yet acknowledged (pending).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  let _ = drain_events(&mut m);
+
+  // "d" moves away while still pending → held.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(&mut m);
+
+  // d's watch NOW arms while held: its post-arm enumerate is queued coverage-only.
+  m.on_watch_result(w_d, Ok(()));
+  let d_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d post-arm enumerate");
+
+  // The move pairs (d → e), clearing the hold, BEFORE d's enumerate returns.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+  let _ = drain_events(&mut m);
+
+  // d's enumerate returns listing a PRE-EXISTING child "c": it must not surface as Created.
+  m.on_enumerate(
+    d_req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("c"), FileKind::Dir)]),
+  );
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_created()),
+    "a held-origin enumerate stays coverage-only across pairing — no false Created"
+  );
+}
+
+/// A `Modified`-only registration still maintains coverage: the backend watch is
+/// subscribed to the structural kinds (the coverage mask), a new directory is still
+/// discovered and armed, unrequested `Created` changes are filtered from delivery, and
+/// requested `Modified` changes under the discovered subtree ARE delivered.
+#[test]
+fn modified_only_interest_keeps_coverage_and_filters_delivery() {
+  let mut m = per_dir();
+  let mask = Interest::new().with_modified();
+  let root = m.register_root(scope(1), mask);
+  // The installed watch subscribes to the coverage superset, not the bare request.
+  let installed = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().filter(|w| w.id() == root).map(|w| w.mask()))
+    .expect("root watch");
+  assert!(
+    installed.created() && installed.removed() && installed.moved() && installed.ondir(),
+    "the backend mask is coverage-augmented with the structural kinds"
+  );
+  assert!(installed.modified(), "the requested kind is kept");
+  m.on_watch_result(root, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A new directory is created: NOT delivered (Created unrequested), but STILL armed.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "an unrequested Created is filtered from delivery"
+  );
+  let w_d = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the new directory is still armed — coverage is delivery-independent");
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap enumerate");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A Modified under the discovered subtree IS delivered (the requested kind)…
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Modified).with_name(seg("f")),
+    at(2),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "the requested Modified is delivered");
+  assert!(events[0].kind().is_modified());
+
+  // …while an Attrib (a different flag, same Change kind) is not.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Attrib).with_name(seg("f")),
+    at(3),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "an unrequested Attrib is filtered even though it maps to a Modified change"
+  );
+}
+
+/// The `Rescan` no-silent-loss escape is always delivered, even to a scope registered
+/// with an empty interest — a consumer that asked for nothing still must learn its
+/// view is stale.
+#[test]
+fn rescan_bypasses_the_delivery_filter() {
+  let mut m = per_dir();
+  let root = m.register_root(scope(1), Interest::new());
+  m.on_watch_result(root, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(Scope::Root(scope(1)), at(1));
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "Rescan is delivered regardless of the registered interest"
+  );
+}
+
+/// Move-derived deliveries honor the `ondir` modifier when the moved object's class is
+/// known: without `ondir`, a directory's paired rename and an unpaired directory move's
+/// timeout `Removed` are both suppressed — while a FILE move still delivers, and the
+/// directory coverage (detach + reparent) is interest-independent.
+#[test]
+fn directory_move_deliveries_honor_ondir() {
+  let mut m = per_dir();
+  // Everything except dir-targeted delivery.
+  let mask = Interest::all().maybe_ondir(false);
+  let root = m.register_root(scope(1), mask);
+  m.on_watch_result(root, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A directory child is created (delivery suppressed by !ondir) and armed.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("dir armed despite suppressed delivery");
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A paired DIRECTORY rename: no Moved delivered, but the reparent still happens.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_moved()),
+    "a directory rename is not delivered without ondir"
+  );
+  assert!(m.is_watched(w_d), "the reparent (coverage) still happened");
+
+  // A FILE move still delivers (target class Some(false) passes the modifier)…
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("f"))
+      .with_cookie(cookie(2))
+      .with_is_dir(false),
+    at(4),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("g"))
+      .with_cookie(cookie(2))
+      .with_is_dir(false),
+    at(5),
+  );
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_moved()),
+    "a file move is delivered"
+  );
+
+  // …and an unpaired DIRECTORY move's timeout Removed is suppressed.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("e"))
+      .with_cookie(cookie(3))
+      .with_is_dir(true),
+    at(6),
+  );
+  let _ = drain_events(&mut m);
+  m.handle_timeout(at(500));
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_removed()),
+    "an unpaired directory move's timeout Removed is suppressed without ondir"
+  );
+}
+
+/// A LATE `MovedTo` whose directory flag is omitted still classifies by the recovered
+/// pending half: the stranded source was a held watched directory, so without `ondir`
+/// neither its `Removed` nor the late arrival's `Created` is delivered — the class is
+/// proven, not unknown.
+#[test]
+fn late_destination_uses_the_pending_halfs_class_for_ondir() {
+  let mut m = per_dir();
+  let mask = Interest::all().maybe_ondir(false);
+  let root = m.register_root(scope(1), mask);
+  m.on_watch_result(root, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A directory child is created (suppressed delivery) and armed.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("dir armed");
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // "d" moves away (held), and its destination arrives LATE with NO directory flag.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  let _ = drain_events(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1)),
+    at(400),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the pending half proves the class: neither Removed nor Created delivers without ondir"
+  );
+  // …and COVERAGE also uses the proven class: the late destination is a directory, so
+  // it is watched despite the record's omitted flag (delivery and reconciliation must
+  // agree, or the moved directory would sit inside the tree silently unwatched).
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("e")))),
+    "the late directory destination is re-watched using the pending half's class"
+  );
+}
+
+/// A paired move whose SOURCE half omitted the directory flag but whose DESTINATION half
+/// reports a directory resolves with ONE class on both planes: without `ondir` the
+/// `Moved` is suppressed (delivery), while the destination is still reconciled — and
+/// watched — as a directory (coverage).
+#[test]
+fn paired_move_uses_one_class_for_delivery_and_coverage() {
+  let mut m = per_dir();
+  let mask = Interest::all().maybe_ondir(false);
+  let root = m.register_root(scope(1), mask);
+  m.on_watch_result(root, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // The source half carries NO flag (an unwatched name, so the tree proves nothing)…
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1)),
+    at(1),
+  );
+  // …and the destination half positively reports a directory.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_moved()),
+    "the resolution class is a directory, so without ondir the Moved is suppressed"
+  );
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("b")))),
+    "coverage uses the SAME class: the directory destination is watched"
+  );
+}
+
+/// `DeleteSelf` tears the reporting watch down immediately: a replacement created at
+/// the same slot before the trailing `Ignored` gets a FRESH watch instead of reusing
+/// the dead one (which the `Ignored` would then tear down, leaving it unwatched).
+#[test]
+fn delete_self_frees_the_slot_for_a_replacement() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // The directory is deleted: its own DeleteSelf arrives BEFORE the parent-side record
+  // or the trailing Ignored, and tears the watch down.
+  m.on_os_record(OsRecord::new(w_d, RecordKind::DeleteSelf), at(2));
+  assert!(
+    !m.is_watched(w_d),
+    "DeleteSelf tears the reporting watch down"
+  );
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A replacement directory is created at the same name: it gets a FRESH watch.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(3),
+  );
+  let w_d2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(root, seg("d")))
+        .map(|w| w.id())
+    })
+    .expect("the replacement is freshly watched");
+  assert_ne!(w_d2, w_d, "a new watch, not the dead one");
+
+  // The old watch's trailing Ignored is a no-op — it must not clobber the replacement.
+  m.on_os_record(OsRecord::new(w_d, RecordKind::Ignored), at(4));
+  assert!(
+    m.is_watched(w_d2),
+    "the stale Ignored does not tear down the replacement"
+  );
+}
+
+/// A root deletion under a FILTERED interest still signals: the interest-filtered
+/// `Removed` is suppressed, but the coverage loss is never silent — an unconditional,
+/// epoch-bumping `Rescan` is delivered before the scope's watch tree is invalidated.
+#[test]
+fn root_delete_self_rescans_despite_a_filtered_interest() {
+  let mut m = per_dir();
+  // Modified-only, and no dir-target delivery at all.
+  let mask = Interest::new().with_modified();
+  let root = m.register_root(scope(1), mask);
+  m.on_watch_result(root, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let before = m.epoch_of(scope(1));
+
+  m.on_os_record(OsRecord::new(root, RecordKind::DeleteSelf), at(1));
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().all(|e| !e.kind().is_removed()),
+    "the Removed itself is filtered by the registered interest"
+  );
+  let rescan = events
+    .iter()
+    .find(|e| e.kind().is_rescan())
+    .expect("the coverage loss is signalled by an unfiltered Rescan");
+  assert!(rescan.epoch() > before, "the Rescan bumps the scope epoch");
+  assert!(!m.is_watched(root), "the scope's tree is invalidated");
+}
+
+/// A root torn down by the kernel with no preceding record (`Ignored` without a
+/// `DeleteSelf`/`MoveSelf` — an unmount, an external watch removal) also signals with
+/// the unconditional `Rescan`: no parent watch exists to report the loss.
+#[test]
+fn root_ignored_rescans_before_invalidation() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(OsRecord::new(root, RecordKind::Ignored), at(1));
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "a kernel-side root teardown signals with a Rescan"
+  );
+  assert!(!m.is_watched(root), "the scope's tree is invalidated");
+}
+
+/// Root invalidation purges the scope's pending move halves: a stale FILE half from the
+/// dead root generation must not pair with a same-cookie destination in a re-registered
+/// generation of the same `ScopeId` — where its stale class would reconcile a real
+/// directory as a file and leave the new subtree silently unwatched.
+#[test]
+fn root_invalidation_purges_pending_moves_across_generations() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // A FILE source half goes pending in the old generation…
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("f"))
+      .with_cookie(cookie(1))
+      .with_is_dir(false),
+    at(1),
+  );
+  // …then the root is torn down (unmount-style Ignored) and the scope re-registered.
+  m.on_os_record(OsRecord::new(root, RecordKind::Ignored), at(2));
+  let _ = drain_events(&mut m);
+  let root2 = m.register_root(scope(1), Interest::all());
+  m.on_watch_result(root2, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root2)
+        .map(|e| e.req())
+    })
+    .expect("new generation bootstrap");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A DIRECTORY MovedTo with the SAME cookie arrives in the new generation, in-window:
+  // the stale half was purged, so this resolves as a fresh Created — classed by its own
+  // record — and the directory is watched.
+  m.on_os_record(
+    OsRecord::new(root2, RecordKind::MovedTo)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_created()) && events.iter().all(|e| !e.kind().is_moved()),
+    "the stale cross-generation half does not pair — the arrival is a fresh Created"
+  );
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root2, seg("d")))),
+    "the directory destination is watched with its own class, not the stale file class"
+  );
+}
+
+/// A lingering FILE half (its source parent narrowly torn down — invariant (b) keeps it
+/// pairable) must not demote a same-cookie DIRECTORY destination: the record is the
+/// newer observation, so its positive class wins the join — the arrival delivers and
+/// the directory is watched.
+#[test]
+fn stale_file_half_does_not_demote_a_directory_destination() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // root → p (watched, live).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("p"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_p = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_p, Ok(()));
+  let p_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_p).map(|e| e.req()))
+    .expect("p bootstrap");
+  m.on_enumerate(p_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A FILE source half under p, then p is narrowly torn down (the half lingers).
+  m.on_os_record(
+    OsRecord::new(w_p, RecordKind::MovedFrom)
+      .with_name(seg("f"))
+      .with_cookie(cookie(1))
+      .with_is_dir(false),
+    at(10),
+  );
+  m.on_os_record(OsRecord::new(w_p, RecordKind::Ignored), at(11));
+  let _ = drain_events(&mut m);
+
+  // A same-cookie DIRECTORY MovedTo under the live root, in-window: the dead-source
+  // pairing delivers a fresh Created, and the record's positive directory class wins
+  // the join — the destination is watched, not silently demoted by the stale half.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_created()),
+    "the dead-source pairing delivers a fresh Created"
+  );
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("d")))),
+    "the directory destination is watched — the stale file class does not demote it"
+  );
+}
+
+/// A held source whose watch install FAILS mid-hold still pairs — and because the O(1)
+/// carry-over is impossible (the source died), the pairing re-scans the destination in
+/// addition to rewatching it: the failure-to-arm interval was seen by no one, and the
+/// dirty marker alone cannot survive the source's teardown.
+#[test]
+fn pairing_after_held_source_watch_failure_rescans_the_destination() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // "d" is created; its watch is queued but NOT yet acknowledged (pending).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  let _ = drain_events(&mut m);
+
+  // "d" moves away while still pending → held…
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(&mut m);
+
+  // …and its delayed watch install FAILS (fenced: no stale-path Rescan), dropping it.
+  m.on_watch_result(w_d, Err(WatchError::Gone));
+  assert!(drain_events(&mut m).is_empty());
+
+  // The same-cookie destination arrives in-window under the live root: the pairing
+  // delivers, the destination is rewatched, AND re-scanned — the failed-arm interval
+  // was covered by no watch.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "the destination is re-scanned after a failed carry-over"
+  );
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("e")))),
+    "the destination is rewatched"
+  );
+}
+
+/// The trailing non-root `MoveSelf` of a normal in-tree rename (kernel order: MovedFrom,
+/// MovedTo, MoveSelf) is a no-op: the node was already reparented, so it must not disturb
+/// the carried-over coverage — the subtree stays watched and delivers at its NEW path.
+#[test]
+fn trailing_move_self_does_not_disturb_a_reparented_subtree() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Kernel-ordered rename: MovedFrom, MovedTo, then the moved dir's own MoveSelf.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(OsRecord::new(w_d, RecordKind::MoveSelf), at(4));
+  let _ = drain_events(&mut m);
+
+  // The reparented watch is intact and delivers at the NEW path.
+  assert!(
+    m.is_watched(w_d),
+    "MoveSelf does not tear down the reparented node"
+  );
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created).with_name(seg("c")),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert_eq!(
+    events[0].location(),
+    &loc(&["e", "c"]),
+    "delivery reconstructs through the NEW path"
+  );
+}
+
+/// A `MoveSelf` arriving mid-hold (after the parent-side MovedFrom, before the pairing
+/// MovedTo) neither breaks the pending reparent nor leaks a stale-path event: the held
+/// fence covers the window and the pairing still lands the subtree at its destination.
+#[test]
+fn move_self_mid_hold_preserves_the_pending_reparent() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_d, Ok(()));
+  let d_boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    .expect("d bootstrap");
+  m.on_enumerate(d_boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  // The moved dir's own MoveSelf lands mid-hold; a delivering record follows it.
+  m.on_os_record(OsRecord::new(w_d, RecordKind::MoveSelf), at(3));
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Modified).with_name(seg("f")),
+    at(3),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "no stale-path delivery from the held window"
+  );
+
+  // The pairing still reparents the held subtree (with the dirtied-hold Rescan).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(4),
+  );
+  assert!(m.is_watched(w_d), "the held subtree reparented");
+  assert!(
+    drain_events(&mut m)
+      .iter()
+      .any(|e| e.kind().is_moved() || e.kind().is_rescan()),
+    "the pairing delivers"
+  );
+}
+
+/// An overflow racing an OUTSTANDING cold enumerate must not be absorbed by it: the
+/// pre-overflow snapshot is dirtied, so its result is handled untrusted (reconcile +
+/// re-arm retry) and a directory created during the gap — omitted from the stale
+/// listing — still ends up armed.
+#[test]
+fn overflow_during_cold_enumerate_preserves_the_rearm_obligation() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+  // The bootstrap cold enumerate is queued but its result has NOT arrived yet.
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("bootstrap enumerate");
+
+  // Overflow strikes while that read is in flight.
+  m.on_overflow(Scope::Root(scope(1)), at(1));
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "the overflow Rescan is delivered"
+  );
+
+  // The pre-overflow snapshot returns clean — but OMITS the gap-created directory "g".
+  // Dirtied, it is not trusted: a re-arm retry is queued instead of a clean discovery.
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let retry = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the dirtied read is followed by a re-arm retry");
+  let _ = drain_events(&mut m);
+
+  // The retry sees the post-overflow truth: "g" exists, and it is armed.
+  m.on_enumerate(
+    retry,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Dir)]),
+  );
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("g")))),
+    "the gap-created directory is armed by the preserved re-arm obligation"
+  );
+}
+
+/// A fresh re-arm trigger coalescing onto an in-flight read whose retry budget is
+/// EXHAUSTED still gets its retry: the bounded ceiling is per obligation, so the
+/// trigger resets the carried attempts — otherwise the new obligation dies with the
+/// old counter and a gap-created directory stays unwatched.
+#[test]
+fn rearm_trigger_on_an_exhausted_read_still_retries() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // Drive the re-arm to its final retry: overflow, then REARM_MAX_RETRIES failures.
+  m.on_overflow(Scope::Root(scope(1)), at(1));
+  let _ = drain_events(&mut m);
+  let mut req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("re-arm read");
+  for _ in 0..REARM_MAX_RETRIES {
+    m.on_enumerate(req, EnumerateResult::Failed(IoClass::Io));
+    let _ = drain_events(&mut m);
+    req = drain_actions(&mut m)
+      .iter()
+      .find_map(|a| a.as_enumerate().map(|e| e.req()))
+      .expect("bounded retry");
+  }
+
+  // The FINAL retry is in flight (attempts at the ceiling) when a fresh overflow lands.
+  m.on_overflow(Scope::Root(scope(1)), at(2));
+  let _ = drain_events(&mut m);
+
+  // The final read completes with a stale listing omitting the gap-created "g": the
+  // fresh obligation's reset budget queues another retry rather than dying at the
+  // ceiling…
+  m.on_enumerate(req, EnumerateResult::Ok(std::vec::Vec::new()));
+  let retry = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the fresh trigger still gets a post-trigger retry");
+  let _ = drain_events(&mut m);
+
+  // …and the retry arms "g".
+  m.on_enumerate(
+    retry,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Dir)]),
+  );
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("g")))),
+    "the gap-created directory is armed"
+  );
+}
+
+/// Create → move-away-from-that-path → create, batched before drain, delivers BOTH
+/// creates: a queued `Moved` touches its SOURCE path too, so it breaks the dedup of a
+/// later create at that path (a destination-only scan would drop the second create).
+#[test]
+fn create_move_from_same_path_create_is_not_coalesced() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  // Created /a
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("a")),
+    at(1),
+  );
+  // Move a → b (a file move; pairs into a single Moved(/b from /a)).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1)),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(1)),
+    at(1),
+  );
+  // Created /a again — must NOT be coalesced against the first create (the move left /a).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("a")),
+    at(1),
+  );
+
+  let events = drain_events(&mut m);
+  let created = events.iter().filter(|e| e.kind().is_created()).count();
+  let moved = events.iter().filter(|e| e.kind().is_moved()).count();
+  assert_eq!(
+    created, 2,
+    "both creates at /a are delivered — the move's source touch breaks the dedup"
+  );
+  assert_eq!(moved, 1, "the a→b move is delivered once");
+}
+
+/// Move → create-at-that-source → move (same paths), batched before drain, delivers BOTH
+/// moves: the NEW move touches its source too, so the intervening create at that source
+/// breaks its adjacency with the earlier identical move (the symmetric touched-set).
+#[test]
+fn move_create_move_same_paths_is_not_coalesced() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  // move a → b
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1)),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(1)),
+    at(1),
+  );
+  // create a (the source path is repopulated)
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("a")),
+    at(1),
+  );
+  // move a → b again (a fresh rename of the recreated /a) — must NOT coalesce with the first
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(2)),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(2)),
+    at(1),
+  );
+
+  let events = drain_events(&mut m);
+  let moved = events.iter().filter(|e| e.kind().is_moved()).count();
+  let created = events.iter().filter(|e| e.kind().is_created()).count();
+  assert_eq!(
+    moved, 2,
+    "the second rename into /b is delivered — the intervening create at /a breaks dedup"
+  );
+  assert_eq!(created, 1, "the create at /a is delivered once");
 }

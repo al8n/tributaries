@@ -105,6 +105,17 @@ pub enum RecordKind {
   /// [`MovedFrom`](Self::MovedFrom) by [`cookie`](OsRecord::cookie).
   MovedTo,
   /// The watched object itself was moved (inotify `IN_MOVE_SELF`).
+  ///
+  /// The driver contract requires records from one backend queue to arrive in
+  /// kernel order, so a non-root `MoveSelf` always FOLLOWS its parent-side
+  /// [`MovedFrom`](Self::MovedFrom) (and, for an in-tree rename, the paired
+  /// [`MovedTo`](Self::MovedTo)) — the same ordering the move-cookie pairing
+  /// window already depends on. By the time it arrives, the core has either
+  /// detached-and-held the source (fencing its stale path) or reparented it
+  /// (its path is current), so a non-root `MoveSelf` carries no new
+  /// information; a parent-side record lost to a queue overflow is healed by
+  /// the overflow's own `Rescan` + watch-set re-arm, which prunes the vacated
+  /// slot.
   MoveSelf,
   /// The watched object itself was deleted (inotify `IN_DELETE_SELF`).
   DeleteSelf,
@@ -368,6 +379,16 @@ impl EnumerateResult {
 /// This is the only event shape the core ingests. Every record carries the
 /// [`WatchId`] it arrived on, so the core attributes it to a disjoint root in
 /// O(1) without consulting any path index.
+///
+/// A record addresses the watch itself (a self-event, `name: None`) or one DIRECT
+/// child of the watched directory (`name: Some`). Per-directory backends — the
+/// engine this foundation drives — always satisfy that shape: every event arrives on
+/// the watch of its immediate parent. A kernel-recursive backend (FSEvents,
+/// fanotify-FILESYSTEM) instead reports arbitrarily deep paths on one root watch;
+/// the record shape for those (a root-relative location rather than a single
+/// segment) is designed alongside their drivers, where the real path/identity
+/// vocabulary is known — until then a kernel-recursive `Monitor` only ingests
+/// depth-one records.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OsRecord {
   watch: WatchId,
