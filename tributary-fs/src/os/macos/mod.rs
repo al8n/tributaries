@@ -28,27 +28,30 @@ use objc2_core_services::{
   kFSEventStreamEventIdSinceNow,
 };
 
-use super::{EventReceiver, MAX_EXCLUSIONS, ResumeToken, SourceConfig, SourceError, SourceMessage};
+use super::{
+  MAX_EXCLUSIONS, ResumeToken, SourceChannels, SourceConfig, SourceError, SourceMessage,
+};
 
 /// The state the event callback reads. Owned jointly by the [`SourceHandle`]
 /// and — via the context release hook — by the stream itself, so it outlives
 /// whichever dies last.
 pub(super) struct CallbackShared {
-  /// The callback's non-blocking transmit end.
-  pub(super) sender: async_channel::Sender<SourceMessage>,
+  /// The callback's non-blocking data transmit end (bounded).
+  pub(super) data: async_channel::Sender<SourceMessage>,
+  /// The loss/death transmit end (unbounded — a control send cannot fail for
+  /// capacity, which is what makes loss signaling in-band and infallible).
+  pub(super) control: async_channel::Sender<SourceMessage>,
   /// Turns the callback into a no-op the moment teardown begins (belt; the
   /// on-queue Stop+Invalidate barrier is the suspenders).
   pub(super) stopped: AtomicBool,
   /// Set after a callback panic; the stream delivers nothing further.
   pub(super) poisoned: AtomicBool,
-  /// Latched when data had to be dropped (a full channel, an undecodable
-  /// entry); drained by the next callback or the handle's
-  /// [`take_overflow`](SourceHandle::take_overflow).
-  pub(super) overflowed: AtomicBool,
-  /// Latched when the stream died (a callback panic); drained by the
-  /// handle's [`take_fatal`](SourceHandle::take_fatal). The reliable twin of
-  /// the in-band `Fatal` message, which a full channel can drop.
-  pub(super) fatal: AtomicBool,
+  /// Dedup for the in-band `Overflow`: set while one rides the control
+  /// channel unacknowledged, reset by
+  /// [`overflow_processed`](SourceHandle::overflow_processed).
+  pub(super) overflow_pending: AtomicBool,
+  /// The terminal `Fatal` was sent; later panics are no-ops.
+  pub(super) fatal_sent: AtomicBool,
   /// Highest journal event id seen while in sync. Zero means none: id zero
   /// itself (the `ROOT_CHANGED` marker) is never recorded, and ids arriving
   /// with a lost-sync flag do not advance it.
@@ -75,11 +78,12 @@ pub(crate) struct Source;
 
 impl Source {
   /// Creates, schedules, and starts one FSEvents stream over
-  /// `config.roots`, delivering decoded batches on the returned receiver.
+  /// `config.roots`, delivering decoded batches (and in-band loss/death
+  /// signals) on the returned channels.
   ///
   /// On any partial failure the stream is invalidated and released before the
   /// error returns: a handle existing means created + scheduled + started.
-  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, EventReceiver), SourceError> {
+  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, SourceChannels), SourceError> {
     if config.roots.is_empty() {
       return Err(SourceError::NoRoots);
     }
@@ -117,13 +121,15 @@ impl Source {
       })?
       .dev() as libc::dev_t;
 
-    let (sender, receiver) = async_channel::bounded(config.channel_capacity.get());
+    let (data_tx, data_rx) = async_channel::bounded(config.channel_capacity.get());
+    let (control_tx, control_rx) = async_channel::unbounded();
     let shared = Arc::new(CallbackShared {
-      sender,
+      data: data_tx,
+      control: control_tx,
       stopped: AtomicBool::new(false),
       poisoned: AtomicBool::new(false),
-      overflowed: AtomicBool::new(false),
-      fatal: AtomicBool::new(false),
+      overflow_pending: AtomicBool::new(false),
+      fatal_sent: AtomicBool::new(false),
       last_good: AtomicU64::new(0),
       ids_wrapped: AtomicBool::new(false),
     });
@@ -157,9 +163,42 @@ impl Source {
         roots,
         device_uuid,
       },
-      receiver,
+      SourceChannels {
+        data: data_rx,
+        control: control_rx,
+      },
     ))
   }
+}
+
+/// The mount points strictly under `root`, read from the live mount table
+/// (`getmntinfo`). `None` means the table could not be read — the caller must
+/// then treat device boundaries as UNKNOWN rather than absent. Each mount
+/// path is run through the same filesystem-representation transform as event
+/// paths, so prefix comparison cannot drift on Unicode normalization.
+pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<PathBuf>> {
+  use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+  let mut raw: *mut libc::statfs = std::ptr::null_mut();
+  // SAFETY: getmntinfo hands back a process-managed buffer of `count`
+  // entries; MNT_NOWAIT avoids blocking on unresponsive filesystems.
+  let count = unsafe { libc::getmntinfo(&mut raw, libc::MNT_NOWAIT) };
+  if count <= 0 || raw.is_null() {
+    return None;
+  }
+  // SAFETY: getmntinfo initialized exactly `count` entries at `raw`.
+  let entries = unsafe { std::slice::from_raw_parts(raw, count as usize) };
+  let mut mounts = Vec::new();
+  for entry in entries {
+    let name = &entry.f_mntonname;
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    let bytes: Vec<u8> = name[..len].iter().map(|&c| c as u8).collect();
+    let path = PathBuf::from(OsStr::from_bytes(&bytes));
+    let path = ffi::fs_representation_of(&path).unwrap_or(path);
+    if path.starts_with(root) && path.as_path() != root {
+      mounts.push(path);
+    }
+  }
+  Some(mounts)
 }
 
 /// A live FSEvents stream. Dropping it tears the stream down; prefer
@@ -176,19 +215,12 @@ pub(crate) struct SourceHandle {
 }
 
 impl SourceHandle {
-  /// Drains the overflow latch: whether data was dropped since the last call.
-  /// The receiver observing a full channel guarantees at least one more
-  /// message follows, so a post-receive drain can never miss the signal.
-  pub(crate) fn take_overflow(&self) -> bool {
-    self.shared.overflowed.swap(false, Ordering::AcqRel)
-  }
-
-  /// Drains the fatal latch: whether the stream died (a callback panic)
-  /// since the last call. Reliable where the in-band `Fatal` message is not:
-  /// that message drops on a full channel, and a full channel guarantees
-  /// queued messages whose receipt triggers this drain.
-  pub(crate) fn take_fatal(&self) -> bool {
-    self.shared.fatal.swap(false, Ordering::AcqRel)
+  /// Acknowledges a processed in-band `Overflow`, re-arming the dedup so the
+  /// next loss sends a fresh one. Call BEFORE acting on the overflow: a loss
+  /// racing the acknowledgement then either rides the new message or is
+  /// covered by the rescan about to run.
+  pub(crate) fn overflow_processed(&self) {
+    self.shared.overflow_pending.store(false, Ordering::Release);
   }
 
   /// The resume point minted so far, if the journal ids are still valid.

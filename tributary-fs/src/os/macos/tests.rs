@@ -182,7 +182,8 @@ fn smoke_stream_reports_create_modify_rename_remove() {
   let dir = unique_dir("smoke");
   let mut config = SourceConfig::new(vec![dir.clone()]);
   config.latency = Duration::from_millis(20);
-  let (handle, rx) = Source::spawn(config).expect("spawn stream");
+  let (handle, channels) = Source::spawn(config).expect("spawn stream");
+  let rx = channels.data;
   assert_eq!(handle.roots(), std::slice::from_ref(&dir));
 
   let a = dir.join("a.txt");
@@ -245,18 +246,19 @@ fn smoke_stream_reports_create_modify_rename_remove() {
   fs::remove_dir_all(&dir).ok();
 }
 
-/// A full channel must never block the dispatch queue: the batch is dropped
-/// and the loss latched, surfacing as an Overflow message or via the handle.
+/// A full data channel must never block the dispatch queue: the batch is
+/// dropped and the loss rides the control channel as exactly one in-band
+/// `Overflow` until it is acknowledged.
 #[test]
-fn full_channel_latches_overflow_instead_of_blocking() {
+fn full_channel_signals_one_inband_overflow() {
   let dir = unique_dir("overflow");
   let mut config = SourceConfig::new(vec![dir.clone()]);
   config.latency = Duration::from_millis(1);
   config.channel_capacity = NonZeroUsize::new(1).expect("nonzero");
-  let (handle, rx) = Source::spawn(config).expect("spawn stream");
+  let (handle, channels) = Source::spawn(config).expect("spawn stream");
 
   // Waves spaced past the latency window force multiple callbacks while
-  // nothing receives, so the 1-slot channel must overflow.
+  // nothing receives, so the 1-slot data channel must overflow.
   for wave in 0..10 {
     for i in 0..5 {
       fs::write(dir.join(format!("w{wave}-f{i}")), b"x").expect("churn");
@@ -264,12 +266,47 @@ fn full_channel_latches_overflow_instead_of_blocking() {
     thread::sleep(Duration::from_millis(30));
   }
 
-  let (_, saw_overflow_message) = recv_until(&rx, DEADLINE, |_| false);
-  let latched = handle.take_overflow();
+  let end = Instant::now() + DEADLINE;
+  loop {
+    match channels.control.try_recv() {
+      Ok(SourceMessage::Overflow) => break,
+      Ok(other) => panic!("unexpected control message: {other:?}"),
+      Err(_) => {
+        assert!(
+          Instant::now() < end,
+          "dropped batches must surface as an in-band Overflow"
+        );
+        thread::sleep(Duration::from_millis(10));
+      }
+    }
+  }
   assert!(
-    saw_overflow_message || latched,
-    "dropped batches must surface as an overflow signal"
+    channels.control.try_recv().is_err(),
+    "an unacknowledged Overflow dedups further losses"
   );
+  // Acknowledge, drain the stale backlog, and lose again: a fresh signal.
+  handle.overflow_processed();
+  while channels.data.try_recv().is_ok() {}
+  for wave in 0..10 {
+    for i in 0..5 {
+      fs::write(dir.join(format!("again{wave}-f{i}")), b"x").expect("churn");
+    }
+    thread::sleep(Duration::from_millis(30));
+  }
+  let end = Instant::now() + DEADLINE;
+  loop {
+    match channels.control.try_recv() {
+      Ok(SourceMessage::Overflow) => break,
+      Ok(other) => panic!("unexpected control message: {other:?}"),
+      Err(_) => {
+        assert!(
+          Instant::now() < end,
+          "an acknowledged signal re-arms for the next loss"
+        );
+        thread::sleep(Duration::from_millis(10));
+      }
+    }
+  }
   handle.shutdown();
   fs::remove_dir_all(&dir).ok();
 }
@@ -286,7 +323,8 @@ fn stress_teardown_under_churn() {
   let dir = unique_dir("stress");
 
   for i in 0..iterations {
-    let (handle, rx) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn stream");
+    let (handle, channels) =
+      Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn stream");
     let stop = Arc::new(AtomicBool::new(false));
     let churn = {
       let stop = Arc::clone(&stop);
@@ -313,8 +351,8 @@ fn stress_teardown_under_churn() {
     match i % 3 {
       0 => handle.shutdown(),
       1 => {
-        // Receiver first: callbacks observe a closed channel mid-flight.
-        drop(rx);
+        // Receivers first: callbacks observe closed channels mid-flight.
+        drop(channels);
         thread::sleep(Duration::from_micros(500));
         handle.shutdown();
       }

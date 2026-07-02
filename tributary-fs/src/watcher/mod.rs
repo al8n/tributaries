@@ -21,6 +21,9 @@ use crate::{
   os::SourceError,
 };
 
+#[cfg(all(test, feature = "tokio"))]
+mod tests;
+
 /// An opaque handle to one watched root of a [`Watcher`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RootHandle(ScopeId);
@@ -68,6 +71,43 @@ impl RootSet {
       .chain(self.pending.iter().map(PathBuf::as_path))
       .find(|existing| candidate.starts_with(existing) || existing.starts_with(candidate))
       .map(Path::to_path_buf)
+  }
+}
+
+/// A pending-root reservation, held across `watch`'s awaits. Dropping it —
+/// on success, failure, OR a cancelled future — releases the reservation, so
+/// an abandoned `watch` can never leave a permanent overlap blocker. On
+/// success the real `RootEntry` is inserted BEFORE the guard drops, so the
+/// path is covered continuously.
+struct Reservation {
+  roots: Arc<RwLock<RootSet>>,
+  path: PathBuf,
+}
+
+impl Reservation {
+  /// Reserves `path`, or reports the covering root when it overlaps.
+  fn take(roots: &Arc<RwLock<RootSet>>, path: PathBuf) -> Result<Self, WatchRootError> {
+    let mut set = roots.write().unwrap_or_else(PoisonError::into_inner);
+    if let Some(existing) = set.overlap_of(&path) {
+      return Err(WatchRootError::Overlaps { path, existing });
+    }
+    set.pending.push(path.clone());
+    drop(set);
+    Ok(Self {
+      roots: Arc::clone(roots),
+      path,
+    })
+  }
+}
+
+impl Drop for Reservation {
+  fn drop(&mut self) {
+    self
+      .roots
+      .write()
+      .unwrap_or_else(PoisonError::into_inner)
+      .pending
+      .retain(|pending| pending != &self.path);
   }
 }
 
@@ -203,42 +243,27 @@ impl<R: RuntimeLite> Watcher<R> {
     }
 
     // Reserve the root before the round-trip so a concurrent overlapping
-    // `watch` cannot also pass the disjointness check.
-    {
-      let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-      if let Some(existing) = set.overlap_of(&canonical) {
-        return Err(WatchRootError::Overlaps {
-          path: canonical,
-          existing,
-        });
-      }
-      set.pending.push(canonical.clone());
-    }
-    let unreserve = |roots: &Arc<RwLock<RootSet>>| {
-      roots
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .pending
-        .retain(|pending| pending != &canonical);
-    };
+    // `watch` cannot also pass the disjointness check. The guard's Drop
+    // releases the reservation on every exit — including this future being
+    // cancelled at either await below (the driver side then tears down an
+    // orphaned stream when its reply finds no receiver).
+    let reservation = Reservation::take(&self.roots, canonical.clone())?;
 
     let (reply, response) = futures_channel::oneshot::channel();
     let sent = self
       .commands
       .send(Command::Watch {
-        root: canonical.clone(),
+        root: canonical,
         interest,
         reply,
       })
       .await;
     if sent.is_err() {
-      unreserve(&self.roots);
       return Err(WatchRootError::Closed);
     }
     match response.await {
       Ok(Ok((scope, live_root))) => {
         let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-        set.pending.retain(|pending| pending != &canonical);
         set.entries.insert(
           scope,
           RootEntry {
@@ -246,16 +271,13 @@ impl<R: RuntimeLite> Watcher<R> {
             live: true,
           },
         );
+        drop(set);
+        // Only now may the reservation lift: the entry above covers the path.
+        drop(reservation);
         Ok(RootHandle::new(scope))
       }
-      Ok(Err(err)) => {
-        unreserve(&self.roots);
-        Err(WatchRootError::Source(err))
-      }
-      Err(_) => {
-        unreserve(&self.roots);
-        Err(WatchRootError::Closed)
-      }
+      Ok(Err(err)) => Err(WatchRootError::Source(err)),
+      Err(_) => Err(WatchRootError::Closed),
     }
   }
 

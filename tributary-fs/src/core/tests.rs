@@ -62,9 +62,30 @@ fn live_core() -> (DriverCore, ScopeId) {
     Ok(RootMeta {
       root: PathBuf::from("/r"),
       root_dev: 1,
+      mounts: Vec::new(),
+      mounts_authoritative: true,
     }),
   );
   assert!(drain(&mut core).is_empty(), "a spawned KR root is silent");
+  (core, scope)
+}
+
+/// A live core whose mount table could NOT be read at spawn: device
+/// boundaries are unknown, so event-side identity/cookie trust is refused.
+fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
+  let mut core = DriverCore::new(WINDOW);
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let _ = drain(&mut core);
+  core.on_stream_spawned(
+    scope,
+    Ok(RootMeta {
+      root: PathBuf::from("/r"),
+      root_dev: 1,
+      mounts: Vec::new(),
+      mounts_authoritative: false,
+    }),
+  );
+  assert!(drain(&mut core).is_empty());
   (core, scope)
 }
 
@@ -752,6 +773,7 @@ fn identity_minting_respects_devices_and_mounts() {
     root: Some(PathBuf::from("/r")),
     root_dev: Some(1),
     mounts: vec![PathBuf::from("/r/vol")],
+    mounts_authoritative: true,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -768,6 +790,34 @@ fn identity_minting_respects_devices_and_mounts() {
     "a foreign-mount prefix never mints"
   );
   assert!(mint(&state, Path::new("/r/a"), None, Some(1)).is_none());
+}
+
+#[test]
+fn blind_mount_table_refuses_event_side_trust() {
+  let state = ScopeState {
+    watch: WatchId::new(NonZeroU64::new(1).unwrap()),
+    requested: PathBuf::from("/r"),
+    root: Some(PathBuf::from("/r")),
+    root_dev: Some(1),
+    mounts: Vec::new(),
+    mounts_authoritative: false,
+    lag: LagState::Normal,
+    park: Park::default(),
+    resume_poisoned: false,
+  };
+  let fid = NonZeroU64::new(7);
+  assert!(
+    mint(&state, Path::new("/r/a"), fid, None).is_none(),
+    "an unseeded table proves nothing about devices"
+  );
+  assert!(
+    cookie_for(&state, Path::new("/r/a"), fid, None).is_none(),
+    "no event-side cookie without authoritative device evidence"
+  );
+  assert!(
+    mint(&state, Path::new("/r/a"), fid, Some(1)).is_some(),
+    "probe-carried device evidence still decides"
+  );
 }
 
 #[test]
@@ -1155,5 +1205,181 @@ fn foreign_device_singleton_rename_half_gets_no_cookie() {
     core.poll_timeout(),
     None,
     "no cookie: nothing waits to pair"
+  );
+}
+
+#[test]
+fn impure_rename_words_never_take_the_pairing_fast_path() {
+  let (mut core, scope) = live_core();
+  // Two halves share a fileID, but the destination word coalesced a content
+  // change: trusting it as just-a-rename would drop the Modified silently.
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/old", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 42),
+      ev(
+        "/r/new",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_MODIFIED]),
+        2,
+        42,
+      ),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(
+    reqs.len(),
+    2,
+    "a coalesced word forces both halves through probes"
+  );
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_modified() && c.location() == &loc(&["new"])),
+    "the coalesced content change is surfaced: {emitted:?}"
+  );
+  assert!(
+    emitted.iter().any(|c| c.kind().moved_from().is_some()),
+    "the rename itself still pairs through the cookie window: {emitted:?}"
+  );
+}
+
+#[test]
+fn rename_coalesced_with_create_and_remove_grounds_by_existence() {
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![
+      ev(
+        "/r/gone",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_REMOVED]),
+        1,
+        7,
+      ),
+      ev(
+        "/r/here",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_CREATED]),
+        2,
+        8,
+      ),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2);
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(8),
+      dev: 1,
+    },
+    at(2),
+  );
+  core.on_timeout(at(400));
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_removed() && c.location() == &loc(&["gone"])),
+    "a vanished impure half degrades to Removed: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_created() && c.location() == &loc(&["here"])),
+    "a surviving impure half degrades to Created: {emitted:?}"
+  );
+}
+
+#[test]
+fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
+  let mut core = DriverCore::new(WINDOW);
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let _ = drain(&mut core);
+  // The volume was ALREADY mounted at spawn: only the seeded table knows.
+  core.on_stream_spawned(
+    scope,
+    Ok(RootMeta {
+      root: PathBuf::from("/r"),
+      root_dev: 1,
+      mounts: vec![PathBuf::from("/r/vol")],
+      mounts_authoritative: true,
+    }),
+  );
+  let _ = drain(&mut core);
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/vol/twin", flags(&[FsEventFlags::ITEM_RENAMED]), 10, 77),
+      ev("/r/native", flags(&[FsEventFlags::ITEM_RENAMED]), 11, 77),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(
+    reqs.len(),
+    2,
+    "a pre-mounted foreign volume never pre-pairs by fileID"
+  );
+}
+
+#[test]
+fn blind_mount_table_suppresses_the_pairing_fast_path() {
+  let (mut core, scope) = live_core_blind_mounts();
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/old", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 42),
+      ev("/r/new", flags(&[FsEventFlags::ITEM_RENAMED]), 2, 42),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(
+    reqs.len(),
+    2,
+    "no authoritative device evidence, no fast pairing"
+  );
+  // Existence probes still converge the halves — with cookies refused, the
+  // survivor is a Created and the vanished half a Removed.
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  core.on_timeout(at(400));
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_removed() && c.location() == &loc(&["old"])),
+    "{emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_created() && c.location() == &loc(&["new"])),
+    "{emitted:?}"
   );
 }

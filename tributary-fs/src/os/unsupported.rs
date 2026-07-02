@@ -2,19 +2,25 @@
 //! execute foreign calls: spawning always fails with
 //! [`SourceError::Unsupported`], so a handle can never exist.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::{EventReceiver, ResumeToken, SourceConfig, SourceError};
+use super::{ResumeToken, SourceChannels, SourceConfig, SourceError};
 
 /// The spawn entry point of the stub backend.
 pub(crate) struct Source;
 
 impl Source {
   /// Always fails: there is nothing to watch with on this platform.
-  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, EventReceiver), SourceError> {
+  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, SourceChannels), SourceError> {
     let _ = config;
     Err(SourceError::Unsupported)
   }
+}
+
+/// The mount table cannot be read on a platform with no backend.
+pub(crate) fn mounts_under(root: &Path) -> Option<Vec<PathBuf>> {
+  let _ = root;
+  None
 }
 
 /// Uninhabited: spawning never succeeds, so no handle value can exist and
@@ -27,13 +33,8 @@ impl SourceHandle {
     match self {}
   }
 
-  /// Drains the overflow latch.
-  pub(crate) fn take_overflow(&self) -> bool {
-    match *self {}
-  }
-
-  /// Drains the fatal latch.
-  pub(crate) fn take_fatal(&self) -> bool {
+  /// Acknowledges a processed in-band `Overflow`.
+  pub(crate) fn overflow_processed(&self) {
     match *self {}
   }
 

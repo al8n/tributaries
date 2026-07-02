@@ -75,97 +75,179 @@ mod forward {
     }
   }
 
-  /// Runs `forward_batch` against a scripted channel, returning what was sent
-  /// and the latch's final state.
+  /// Runs `forward_batch` against scripted channels, returning what each
+  /// channel accepted and the dedup flag's final state.
   fn run(
-    latched: bool,
+    pending: bool,
     events: Vec<RawOsEvent>,
     lossy: bool,
-    outcomes: &[SendOutcome],
-  ) -> (Vec<&'static str>, bool) {
-    let overflowed = AtomicBool::new(latched);
-    let mut sent = Vec::new();
-    let mut script = outcomes.iter().copied();
-    forward_batch(&overflowed, events, lossy, |msg| {
-      let outcome = script.next().expect("the script covers every send");
-      if outcome == SendOutcome::Sent {
-        sent.push(match msg {
-          SourceMessage::Batch(_) => "batch",
-          SourceMessage::Overflow => "overflow",
-          SourceMessage::Fatal(_) => "fatal",
-        });
-      }
-      outcome
+    data_outcomes: &[SendOutcome],
+    control_open: bool,
+  ) -> (Vec<&'static str>, Vec<&'static str>, bool) {
+    let overflow_pending = AtomicBool::new(pending);
+    let mut data_sent = Vec::new();
+    let mut control_sent = Vec::new();
+    let mut script = data_outcomes.iter().copied();
+    forward_batch(
+      &overflow_pending,
+      events,
+      lossy,
+      |msg| {
+        let outcome = script.next().expect("the script covers every data send");
+        if outcome == SendOutcome::Sent {
+          data_sent.push(label(&msg));
+        }
+        outcome
+      },
+      |msg| {
+        if control_open {
+          control_sent.push(label(&msg));
+        }
+        control_open
+      },
+    );
+    (
+      data_sent,
+      control_sent,
+      overflow_pending.load(Ordering::Acquire),
+    )
+  }
+
+  fn label(msg: &SourceMessage) -> &'static str {
+    match msg {
+      SourceMessage::Batch(_) => "batch",
+      SourceMessage::Overflow => "overflow",
+      SourceMessage::Fatal(_) => "fatal",
+    }
+  }
+
+  #[test]
+  fn all_undecodable_callback_signals_one_overflow() {
+    let (data, control, pending) = run(false, Vec::new(), true, &[], true);
+    assert!(data.is_empty());
+    assert_eq!(control, ["overflow"], "loss rides the control channel");
+    assert!(pending, "the signal stays pending until acknowledged");
+  }
+
+  #[test]
+  fn lossy_batch_sends_data_and_one_overflow() {
+    let (data, control, pending) = run(false, vec![raw("/r/a")], true, &[SendOutcome::Sent], true);
+    assert_eq!(data, ["batch"]);
+    assert_eq!(control, ["overflow"]);
+    assert!(pending);
+  }
+
+  #[test]
+  fn dropped_batch_signals_one_overflow() {
+    let (data, control, pending) = run(false, vec![raw("/r/a")], false, &[SendOutcome::Full], true);
+    assert!(data.is_empty());
+    assert_eq!(control, ["overflow"]);
+    assert!(pending);
+  }
+
+  #[test]
+  fn pending_signal_dedups_further_losses() {
+    let (data, control, pending) = run(true, Vec::new(), true, &[], true);
+    assert!(data.is_empty());
+    assert!(
+      control.is_empty(),
+      "an unacknowledged Overflow already covers this loss"
+    );
+    assert!(pending);
+  }
+
+  #[test]
+  fn acknowledged_signal_rearms() {
+    let overflow_pending = AtomicBool::new(false);
+    let mut sent = 0usize;
+    signal_loss(&overflow_pending, |_| {
+      sent += 1;
+      true
     });
-    (sent, overflowed.load(Ordering::Acquire))
+    // The driver acknowledges (resets) — the next loss signals afresh.
+    overflow_pending.store(false, Ordering::Release);
+    signal_loss(&overflow_pending, |_| {
+      sent += 1;
+      true
+    });
+    assert_eq!(sent, 2);
   }
 
   #[test]
-  fn all_undecodable_callback_sends_an_immediate_overflow() {
-    let (sent, latched) = run(false, Vec::new(), true, &[SendOutcome::Sent]);
-    assert_eq!(
-      sent,
-      ["overflow"],
-      "a lossy empty batch must wake the driver"
-    );
-    assert!(!latched);
+  fn closed_data_channel_signals_nothing() {
+    let (data, control, pending) =
+      run(false, vec![raw("/r/a")], true, &[SendOutcome::Closed], true);
+    assert!(data.is_empty());
+    assert!(control.is_empty(), "no receiver is left to signal");
+    assert!(!pending);
   }
 
   #[test]
-  fn all_undecodable_callback_relatches_on_a_full_channel() {
-    let (sent, latched) = run(false, Vec::new(), true, &[SendOutcome::Full]);
-    assert!(sent.is_empty());
+  fn closed_control_channel_restores_the_dedup() {
+    let (data, control, pending) = run(false, Vec::new(), true, &[], false);
+    assert!(data.is_empty());
+    assert!(control.is_empty());
     assert!(
-      latched,
-      "the full channel guarantees queued batches as the wake"
+      !pending,
+      "a dead control receiver must not mute a future generation"
     );
   }
 
   #[test]
-  fn lossy_batch_latches_and_the_batch_is_the_wake() {
-    let (sent, latched) = run(false, vec![raw("/r/a")], true, &[SendOutcome::Sent]);
-    assert_eq!(sent, ["batch"]);
+  fn fatal_signals_at_most_once() {
+    let fatal_sent = AtomicBool::new(false);
+    let mut sent = 0usize;
+    signal_fatal_once(&fatal_sent, SourceError::CallbackPanic, |_| {
+      sent += 1;
+      true
+    });
+    signal_fatal_once(&fatal_sent, SourceError::CallbackPanic, |_| {
+      sent += 1;
+      true
+    });
+    assert_eq!(sent, 1, "the terminal Fatal is once-ever");
+  }
+}
+
+mod pure_rename {
+  use super::*;
+
+  #[test]
+  fn type_hints_keep_a_rename_pure() {
+    for extra in [
+      0,
+      FsEventFlags::ITEM_IS_FILE.bits(),
+      FsEventFlags::ITEM_IS_DIR.bits(),
+      FsEventFlags::ITEM_IS_SYMLINK.bits(),
+      FsEventFlags::ITEM_IS_HARDLINK.bits(),
+      FsEventFlags::ITEM_IS_LAST_HARDLINK.bits(),
+    ] {
+      let word = FsEventFlags::new(FsEventFlags::ITEM_RENAMED.bits() | extra);
+      assert!(word.is_pure_rename(), "{word:?}");
+    }
+  }
+
+  #[test]
+  fn any_extra_operation_makes_a_rename_impure() {
+    for extra in [
+      FsEventFlags::ITEM_CREATED.bits(),
+      FsEventFlags::ITEM_REMOVED.bits(),
+      FsEventFlags::ITEM_MODIFIED.bits(),
+      FsEventFlags::ITEM_INODE_META_MOD.bits(),
+      FsEventFlags::ITEM_XATTR_MOD.bits(),
+      FsEventFlags::ITEM_CHANGE_OWNER.bits(),
+      FsEventFlags::ITEM_FINDER_INFO_MOD.bits(),
+      FsEventFlags::ITEM_CLONED.bits(),
+      FsEventFlags::OWN_EVENT.bits(),
+      FsEventFlags::MUST_SCAN_SUBDIRS.bits(),
+      FsEventFlags::ROOT_CHANGED.bits(),
+    ] {
+      let word = FsEventFlags::new(FsEventFlags::ITEM_RENAMED.bits() | extra);
+      assert!(!word.is_pure_rename(), "{word:?}");
+    }
     assert!(
-      latched,
-      "the driver drains the latch after receiving the batch"
+      !FsEventFlags::ITEM_MODIFIED.is_pure_rename(),
+      "a non-rename word is never a pure rename"
     );
-  }
-
-  #[test]
-  fn dropped_batch_latches() {
-    let (sent, latched) = run(false, vec![raw("/r/a")], false, &[SendOutcome::Full]);
-    assert!(sent.is_empty());
-    assert!(latched);
-  }
-
-  #[test]
-  fn prior_latch_surfaces_before_newer_data() {
-    let (sent, latched) = run(
-      true,
-      vec![raw("/r/a")],
-      false,
-      &[SendOutcome::Sent, SendOutcome::Sent],
-    );
-    assert_eq!(sent, ["overflow", "batch"], "loss is observed in order");
-    assert!(!latched);
-  }
-
-  #[test]
-  fn prior_latch_relatches_on_a_full_channel() {
-    let (sent, latched) = run(true, Vec::new(), false, &[SendOutcome::Full]);
-    assert!(sent.is_empty());
-    assert!(latched);
-  }
-
-  #[test]
-  fn closed_channel_never_relatches() {
-    let (sent, latched) = run(
-      true,
-      vec![raw("/r/a")],
-      true,
-      &[SendOutcome::Closed, SendOutcome::Closed],
-    );
-    assert!(sent.is_empty());
-    assert!(!latched, "no receiver is left to wake");
   }
 }

@@ -21,7 +21,7 @@ use objc2_core_services::{
   kFSEventStreamCreateFlagUseExtendedData, kFSEventStreamCreateFlagWatchRoot,
 };
 
-use super::{CallbackShared, SourceError, SourceMessage, StreamPtr, decode};
+use super::{CallbackShared, SourceError, StreamPtr, decode};
 
 /// The stream configuration this backend always runs with: CF-typed extended
 /// data (the only source of per-event inodes; requires `FileEvents`),
@@ -74,27 +74,29 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
         shared.last_good.fetch_max(event.event_id, Ordering::AcqRel);
       }
     }
-    // Never block the dispatch queue: the forwarding protocol drops on a full
-    // channel and latches, with every latch guaranteed a later wake.
-    crate::os::fsevent::forward_batch(&shared.overflowed, batch.events, batch.lossy, |msg| {
-      match shared.sender.try_send(msg) {
+    // Never block the dispatch queue: data drops on a full channel and the
+    // loss rides the unbounded control channel in-band — a control send
+    // cannot fail for capacity, so no loss can go unobserved.
+    crate::os::fsevent::forward_batch(
+      &shared.overflow_pending,
+      batch.events,
+      batch.lossy,
+      |msg| match shared.data.try_send(msg) {
         Ok(()) => crate::os::fsevent::SendOutcome::Sent,
         Err(async_channel::TrySendError::Full(_)) => crate::os::fsevent::SendOutcome::Full,
         Err(async_channel::TrySendError::Closed(_)) => crate::os::fsevent::SendOutcome::Closed,
-      }
-    });
+      },
+      |msg| shared.control.try_send(msg).is_ok(),
+    );
   }));
   if outcome.is_err() {
     // A decode bug must not abort the host process; poison the stream and
-    // report in-band instead. The latch is the reliable half: a full channel
-    // can drop the message, and a poisoned callback sends nothing further —
-    // the driver drains the latch after every receive and at shutdown, and a
-    // dropped-on-full message guarantees queued messages to receive.
+    // report the death in-band. The control channel is unbounded, so the one
+    // terminal Fatal cannot be dropped for capacity.
     shared.poisoned.store(true, Ordering::Release);
-    shared.fatal.store(true, Ordering::Release);
-    let _ = shared
-      .sender
-      .try_send(SourceMessage::Fatal(SourceError::CallbackPanic));
+    crate::os::fsevent::signal_fatal_once(&shared.fatal_sent, SourceError::CallbackPanic, |msg| {
+      shared.control.try_send(msg).is_ok()
+    });
   }
 }
 
