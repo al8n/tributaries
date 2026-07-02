@@ -57,11 +57,20 @@ async fn cancelled_watch_releases_its_reservation() {
   match cmd {
     Command::Watch { reply, root, .. } => {
       assert_eq!(root, std::fs::canonicalize(&dir).unwrap());
+      let (unwind_tx, unwind_rx) = async_channel::unbounded();
+      let scope = ScopeId::new(1.try_into().unwrap());
       assert!(
         reply
-          .send(Ok((ScopeId::new(1.try_into().unwrap()), root)))
+          .send(Ok(crate::driver::WatchGrant::new(scope, root, unwind_tx)))
           .is_err(),
         "the cancelled caller cannot receive the reply"
+      );
+      // The failed send dropped the still-armed grant, which unwinds its
+      // scope back to the driver.
+      assert_eq!(
+        unwind_rx.try_recv().ok(),
+        Some(scope),
+        "an undeliverable grant unwinds its scope"
       );
     }
     _ => panic!("expected the watch command"),
