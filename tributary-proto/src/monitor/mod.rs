@@ -56,10 +56,14 @@ enum NodeState {
   /// re-arm handling of the result; `attempts` counts consecutive incomplete re-arm
   /// reads toward [`REARM_MAX_RETRIES`]. Accepting a result requires the node to still
   /// name the arriving `req`, so a superseded read is dropped rather than reconciled.
+  /// `dirty` records that a slot-changing record raced this read: the listing is then a
+  /// possibly-stale snapshot (it may re-arm a since-removed child), so the result is not
+  /// trusted — it is handled like an incomplete read (`Rescan` + retry).
   Enumerating {
     req: ReqId,
     kind: EnumKind,
     attempts: u8,
+    dirty: bool,
   },
 }
 
@@ -325,6 +329,16 @@ impl Monitor {
       return;
     };
 
+    // A slot-changing record for a directory whose enumerate is still outstanding races
+    // that read: dirty it, so its snapshot — which may list a since-removed child or miss
+    // a just-created one — is re-read rather than trusted (the create-descend window).
+    if matches!(
+      rec.kind(),
+      RecordKind::Created | RecordKind::Removed | RecordKind::MovedFrom | RecordKind::MovedTo
+    ) {
+      self.mark_enumerate_dirty(rec.watch());
+    }
+
     match rec.kind() {
       RecordKind::Created => self.on_created(scope, &rec),
       RecordKind::Removed => self.on_removed(scope, &rec),
@@ -348,26 +362,29 @@ impl Monitor {
     // or whose read was superseded (re-armed, its slot rebuilt) has moved on — a stale
     // result must not reconcile against it. This is the gap the old `pending_enumerate`
     // + liveness pair could not close: the request identity now lives on the node.
-    let (kind, attempts, scope) = match self.nodes.get(&dir) {
+    let (kind, attempts, dirty, scope) = match self.nodes.get(&dir) {
       Some(WatchNode {
         state:
           NodeState::Enumerating {
             req: r,
             kind,
             attempts,
+            dirty,
           },
         scope,
         ..
-      }) if *r == req => (*kind, *attempts, *scope),
+      }) if *r == req => (*kind, *attempts, *dirty, *scope),
       _ => return,
     };
     // The read resolved: the node leaves `Enumerating`.
     self.set_state(dir, NodeState::Live);
 
-    if res.forces_rescan() {
-      // An incomplete read (`Partial` or `Failed`), in EITHER mode: reconcile what is
-      // visible, cascade the re-arm into every child, emit a `Rescan` for the content
-      // the read could not report, and bounded-retry to complete the watch set.
+    if res.forces_rescan() || dirty {
+      // An incomplete read (`Partial` / `Failed`), OR a complete read a slot-changing
+      // record raced (`dirty`) so its listing is a possibly-stale snapshot: in either
+      // case reconcile what is visible, cascade the re-arm into every child, emit a
+      // `Rescan` for the content the read cannot be trusted to report, and bounded-retry
+      // to complete the watch set from a fresh read.
       self.handle_incomplete_enumerate(dir, scope, &res, attempts);
       return;
     }
@@ -444,8 +461,11 @@ impl Monitor {
       // bounded number of tries rather than spinning the driver.
       self.queue_enumerate(dir, EnumKind::Rearm, attempts + 1);
     }
-    // else: retries exhausted — the node stays `Live` and the `Rescan` stands. (S3 turns
-    // this into a recovering `Degraded` state re-attempted on the next reconcile trigger.)
+    // else: retries exhausted — the node stays `Live` and the `Rescan` stands. It is
+    // re-attempted the next time a reconciliation trigger for its scope re-arms it (a
+    // fresh overflow, or an ancestor's incomplete read cascading down). A dedicated
+    // degraded state with its own backoff timer, so a transiently-unreadable directory
+    // self-heals without waiting for the next trigger, is a later refinement.
   }
 
   /// Queues an [`Action::Enumerate`] for `dir` and moves it to
@@ -460,6 +480,7 @@ impl Monitor {
         req,
         kind,
         attempts,
+        dirty: false,
       },
     );
     self.actions.push_back(Action::enumerate(req, dir));
@@ -1309,6 +1330,17 @@ impl Monitor {
     }
   }
 
+  /// Marks `watch`'s outstanding enumerate as dirtied by a racing slot-changing record,
+  /// so its listing is treated as a stale snapshot when it returns. A no-op unless
+  /// `watch` is currently [`NodeState::Enumerating`].
+  fn mark_enumerate_dirty(&mut self, watch: WatchId) {
+    if let Some(node) = self.nodes.get_mut(&watch)
+      && let NodeState::Enumerating { dirty, .. } = &mut node.state
+    {
+      *dirty = true;
+    }
+  }
+
   /// Whether `dir` has a rescan re-arm read outstanding — the successor to the old
   /// `rearm_dirs` membership, for white-box tests.
   #[cfg(test)]
@@ -1320,6 +1352,77 @@ impl Monitor {
         ..
       })
     )
+  }
+
+  /// Asserts the Monitor's core structural invariants. Run after every input in the
+  /// property tests to turn silent corruption into an immediate counterexample.
+  #[cfg(test)]
+  fn assert_invariants(&self) {
+    let n = self.nodes.len();
+    // `child_index` agrees with the node it points at, and that node sits in its
+    // parent's adjacency set (name-slot ⊆ adjacency).
+    for ((parent, name), child) in &self.child_index {
+      let node = self
+        .nodes
+        .get(child)
+        .expect("child_index points at a live node");
+      assert_eq!(
+        node.parent,
+        Some(*parent),
+        "child_index parent matches node.parent"
+      );
+      assert_eq!(
+        node.name.as_ref(),
+        Some(name),
+        "child_index name matches node.name"
+      );
+      assert!(
+        self
+          .nodes
+          .get(parent)
+          .is_some_and(|p| p.children.contains(child)),
+        "a child_index child is in its parent's adjacency set"
+      );
+    }
+    for (id, node) in &self.nodes {
+      // Adjacency is the exact dual of the parent link.
+      for child in &node.children {
+        assert_eq!(
+          self.nodes.get(child).and_then(|c| c.parent),
+          Some(*id),
+          "an adjacency child's parent is this node"
+        );
+      }
+      if let Some(parent) = node.parent {
+        assert!(
+          self
+            .nodes
+            .get(&parent)
+            .is_some_and(|p| p.children.contains(id)),
+          "a node is in its parent's adjacency set"
+        );
+      }
+      // Every outstanding enumerate request maps back through `pending_enumerate`.
+      if let NodeState::Enumerating { req, .. } = node.state {
+        assert_eq!(
+          self.pending_enumerate.get(&req),
+          Some(id),
+          "an Enumerating node's request is registered to it"
+        );
+      }
+      // Acyclicity: the parent walk reaches a root within the node count.
+      let mut cursor = node.parent;
+      for _ in 0..=n {
+        match cursor {
+          Some(cur) => cursor = self.nodes.get(&cur).and_then(|c| c.parent),
+          None => break,
+        }
+      }
+      assert!(
+        cursor.is_none(),
+        "the parent walk terminates (the tree is acyclic)"
+      );
+    }
   }
 
   fn location_of(&self, id: WatchId) -> Location {
