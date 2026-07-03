@@ -124,6 +124,19 @@ struct PendingMove {
   /// A held source is definitionally a watched directory; otherwise this is whatever
   /// the source record reported.
   is_dir: Option<bool>,
+  /// Whether subtree activity interleaved with this half's pairing window: a record or
+  /// located overflow whose location mutual-prefixes the pending source landed while
+  /// the half was parked. Such activity described a REPLACEMENT at the source, which
+  /// the eventual resolution (a `Moved` reparenting the consumer's tree, or a
+  /// `Removed`) contradicts — so a dirty half's resolution emits covering `Rescan`s.
+  ///
+  /// Only set for UNHELD halves (`held: None` — kernel-recursive sources and
+  /// per-directory file sources). A held source's subtree fences its records outright
+  /// (suppression, because held paths reconstruct STALE through the detached tree) and
+  /// recovers through [`dirtied_holds`](Monitor::dirtied_holds); an unheld source has
+  /// no stale-path hazard — its interleaved records carry their own current-path truth
+  /// — so they DELIVER, and this flag only adds the covering re-read instruction.
+  dirty: bool,
 }
 
 /// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
@@ -443,6 +456,43 @@ impl Monitor {
         self.mark_enumerate_dirty(rec.watch());
         return;
       }
+    }
+
+    // Latent (not-yet-consumer-visible) transitions live in exactly TWO stores: the
+    // event queue, whose dedup fences interleavings by the mutual-prefix touch relation
+    // (`would_coalesce`), and `pending_moves`, whose parked halves queue NOTHING — so
+    // interleaved subtree activity is invisible to the queue-based relation and must be
+    // fenced here. (`held_sources` is the descending-profile fence over this same store;
+    // every other container holds obligations or bookkeeping, not transitions: `actions`
+    // carries watch/enumerate work, `NodeState::Enumerating` an outstanding read whose
+    // result reconciles coverage, `scope_epochs`/`dirtied_holds` markers.) A surviving
+    // record whose location mutual-prefixes a parked UNHELD source is an ancestor-or-
+    // descendant transition inside that pairing window: it DELIVERS (its path is its
+    // own current truth — contrast the held fence's suppression above), and the half is
+    // marked dirty so its resolution emits covering `Rescan`s.
+    //
+    // Three transitions are NOT unseen and do not mark: a `MovedTo`'s OWN pairing half
+    // (the window's resolution, not an interleaved fact); self-events (a root teardown
+    // purges the scope's halves behind its unconditional `Rescan`, and a non-root
+    // teardown silences anchored halves through the resolution liveness guard — the
+    // tree tells those stories itself); and halves anchored inside the subtree a
+    // parent-side cookieed `MovedFrom` is about to detach-and-hold — the tree CARRIES
+    // that move, so the half's source reconstructs through the reparent and stays
+    // current rather than contradicted.
+    if !rec.kind().is_self_event() {
+      let record_loc = self.record_location(&rec);
+      let exclude = match rec.kind() {
+        RecordKind::MovedTo => rec.cookie(),
+        _ => None,
+      };
+      let carried = if rec.kind().is_moved_from() && rec.cookie().is_some() {
+        rec
+          .name()
+          .and_then(|name| self.child_watch(rec.watch(), name))
+      } else {
+        None
+      };
+      self.dirty_pending_sources_touching(scope, &record_loc, exclude, carried);
     }
 
     // A slot-changing record for a directory whose enumerate is still outstanding races
@@ -822,6 +872,10 @@ impl Monitor {
         let roots: std::vec::Vec<(ScopeId, WatchId)> =
           self.roots.iter().map(|(s, w)| (*s, *w)).collect();
         for (scope_id, root) in roots {
+          // A whole-scope loss is a transition anywhere under the root, so every
+          // unheld pending half's window was interleaved (the root location prefixes
+          // every source).
+          self.dirty_pending_sources_touching(scope_id, &Location::new(), None, None);
           self.rescan_and_rearm(scope_id, root);
         }
         // The root re-arm may build temporary destination coverage for a held source's
@@ -835,6 +889,7 @@ impl Monitor {
         // rather than emitting a Rescan for a scope the Monitor no longer covers
         // (the `Subtree` arm below guards symmetrically via `scope_of`).
         if let Some(&root) = self.roots.get(&scope_id) {
+          self.dirty_pending_sources_touching(scope_id, &Location::new(), None, None);
           self.rescan_and_rearm(scope_id, root);
           self.dirty_held_sources(Some(scope_id));
         }
@@ -854,8 +909,11 @@ impl Monitor {
           // the descent). The re-arm starts from the nearest watch: the descent has no
           // watch of its own — it is deep only on a kernel-recursive backend, whose
           // re-arm is a no-op anyway — and a descending backend's re-arm cascade
-          // covers the descent from the watch.
-          self.emit_rescan(scope_id, self.location_of(watch).join(sub.descent()));
+          // covers the descent from the watch. A located loss is also an interleaved
+          // transition for any pending half it mutual-prefixes.
+          let at = self.location_of(watch).join(sub.descent());
+          self.dirty_pending_sources_touching(scope_id, &at, None, None);
+          self.emit_rescan(scope_id, at);
           self.start_rearm(watch);
         }
       }
@@ -878,6 +936,65 @@ impl Monitor {
       })
       .collect();
     self.dirtied_holds.extend(held);
+  }
+
+  /// Marks dirty every UNHELD pending move half of `scope` whose reconstructed source
+  /// location mutual-prefixes `loc` — the pending-store half of the latent-transition
+  /// fence (see the inventory note in [`on_os_record`](Self::on_os_record)). The source
+  /// is reconstructed on use ([`pending_from`](Self::pending_from)), so a mid-window
+  /// reparent of the source's ancestor is followed rather than indexed stale. Halves
+  /// whose `from_parent` is no longer watched are skipped: their location cannot be
+  /// reconstructed, and the resolution liveness guard silences them entirely, so a
+  /// dirty flag could never surface. `exclude` names a half the caller is about to
+  /// resolve (a pairing `MovedTo`'s own cookie); `carried` names a watch whose subtree
+  /// the caller's own machinery is detaching-and-holding — halves anchored at or under
+  /// it follow that move through the tree and are not marked.
+  fn dirty_pending_sources_touching(
+    &mut self,
+    scope: ScopeId,
+    loc: &Location,
+    exclude: Option<MoveCookie>,
+    carried: Option<WatchId>,
+  ) {
+    let keys: std::vec::Vec<PendingKey> = self
+      .pending_moves
+      .iter()
+      .filter(|((half_scope, cookie), pending)| {
+        *half_scope == scope
+          && Some(*cookie) != exclude
+          && pending.held.is_none()
+          && !pending.dirty
+          && self.is_watched(pending.from_parent)
+          && !carried.is_some_and(|held| {
+            pending.from_parent == held || self.is_descendant(pending.from_parent, held)
+          })
+          && Self::locations_touch(&self.pending_from(pending), loc)
+      })
+      .map(|(key, _)| *key)
+      .collect();
+    for key in keys {
+      if let Some(pending) = self.pending_moves.get_mut(&key) {
+        pending.dirty = true;
+      }
+    }
+  }
+
+  /// Emits the covering `Rescan`s a DIRTY paired half owes at resolution: the
+  /// interleaved facts described a replacement at the source, and the just-emitted
+  /// `Moved`'s application at the consumer contradicts them — both the vacated source
+  /// and the populated destination need the re-read instruction. The source side
+  /// routes through the same liveness rule as every stored-half resolution (a dead
+  /// `from_parent` cannot reconstruct a live source path); the destination is where
+  /// the pairing record just arrived, live by construction.
+  fn rescan_dirty_pair(&mut self, scope: ScopeId, pending: &PendingMove, to: &Location) {
+    if !pending.dirty {
+      return;
+    }
+    if self.is_watched(pending.from_parent) {
+      let from = self.pending_from(pending);
+      self.emit_rescan(scope, from);
+    }
+    self.emit_rescan(scope, to.clone());
   }
 
   /// Emits an overflow [`ChangeKind::Rescan`] for a scope AND re-enumerates `dir` in
@@ -1006,6 +1123,7 @@ impl Monitor {
           } else {
             rec.is_dir()
           },
+          dirty: false,
         };
         // Invariant (d): the cookie is namespaced by scope, so only a *same-scope*
         // reused/colliding cookie collides on this composite key. The displaced
@@ -1111,7 +1229,8 @@ impl Monitor {
           }
           // Non-directory (or unwatched) source: emit the pairing and reconcile the slot.
           (Some(name), None) => {
-            self.emit_pair(scope, to, &pending, class);
+            self.emit_pair(scope, to.clone(), &pending, class);
+            self.rescan_dirty_pair(scope, &pending, &to);
             self.reconcile_slot(
               rec.watch(),
               scope,
@@ -1125,7 +1244,8 @@ impl Monitor {
             if let Some(src) = held {
               self.drop_subtree(src);
             }
-            self.emit_pair(scope, to, &pending, class);
+            self.emit_pair(scope, to.clone(), &pending, class);
+            self.rescan_dirty_pair(scope, &pending, &to);
           }
         }
       }
@@ -1203,7 +1323,14 @@ impl Monitor {
     }
     if self.is_watched(pending.from_parent) {
       let from = self.pending_from(&pending);
-      self.resolve_lost_source(pending.scope, from, pending.is_dir);
+      self.resolve_lost_source(pending.scope, from.clone(), pending.is_dir);
+      // A dirty half's window saw interleaved subtree activity whose facts the
+      // stranded-source `Removed` above contradicts: cover the source with a re-read
+      // instruction, under the same liveness guard (a dead `from_parent` has no live
+      // source path to rescan — and nothing to contradict).
+      if pending.dirty {
+        self.emit_rescan(pending.scope, from);
+      }
     }
   }
 
@@ -1589,8 +1716,13 @@ impl Monitor {
   /// Whether a change of `kind` at `location` would coalesce into the most-recent
   /// still-queued change touching it — the ONE dedup decision, applied by
   /// [`emit`](Self::emit) and consulted by [`emit_rescan`](Self::emit_rescan) before
-  /// the epoch bump. A pure read of the event queue: consecutive calls with an
-  /// unchanged queue return the same answer.
+  /// the epoch bump. A pure read of the event queue and the pending-move store:
+  /// consecutive calls with both unchanged return the same answer.
+  ///
+  /// A parked move half queues NOTHING, so an in-window ancestor transition is
+  /// invisible to the queue scan alone — a change touching a pending source is
+  /// therefore never coalescible (the pending-store side of the latent-transition
+  /// fence; suppression-reducing only, like every widening of the relation).
   ///
   /// Coalesce only an ADJACENT duplicate: suppress iff the most-recent still-queued
   /// change TOUCHING any location this change touches is identical. A change touches its
@@ -1636,6 +1768,17 @@ impl Monitor {
     touched.push(&key.1);
     if let Some(source) = key.3.as_ref() {
       touched.push(source);
+    }
+    let pending_blocks = self.pending_moves.iter().any(|((half_scope, _), pending)| {
+      *half_scope == scope && self.is_watched(pending.from_parent) && {
+        let source = self.pending_from(pending);
+        touched
+          .iter()
+          .any(|&loc| Self::locations_touch(&source, loc))
+      }
+    });
+    if pending_blocks {
+      return false;
     }
     self
       .events
@@ -1952,6 +2095,14 @@ impl Monitor {
       assert!(
         self.held_sources.contains(dirtied),
         "a dirtied hold is a held source"
+      );
+    }
+    // The two dirty mechanisms partition by hold: a held half recovers through
+    // `dirtied_holds`, an unheld half through its own flag — never both.
+    for pending in self.pending_moves.values() {
+      assert!(
+        !(pending.dirty && pending.held.is_some()),
+        "a dirty pending half is unheld"
       );
     }
   }

@@ -5641,3 +5641,218 @@ fn sibling_event_keeps_ordinary_coalescing() {
   assert!(events[1].kind().is_modified());
   assert_eq!(events[1].location(), &loc(&["b", "g"]));
 }
+
+/// A record interleaved with a pending move window and touching its source is a latent
+/// ancestor transition the queue-based dedup cannot see: it delivers (its path is its
+/// own truth), and the half's resolution owes covering Rescans at both sides.
+#[test]
+fn kr_interleaved_descendant_fact_dirties_the_pending_move() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["a", "new.txt"])),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4, "created, moved, and two covering rescans");
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["a", "new.txt"]));
+  assert_eq!(events[1].kind().moved_from(), Some(&loc(&["a"])));
+  assert_eq!(events[1].location(), &loc(&["c"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["a"]));
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["c"]));
+  // Each covering Rescan announces its own bump, dominating the interleaved fact.
+  assert!(events[2].epoch() > events[0].epoch());
+  assert!(events[3].epoch() > events[2].epoch());
+}
+
+/// A located overflow inside the pending window is the same latent transition through
+/// the loss path: its own Rescan delivers immediately, and the pairing still owes the
+/// covering pair.
+#[test]
+fn kr_interleaved_located_overflow_dirties_the_pending_move() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "sub"]))
+      .into(),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a", "sub"]));
+  assert_eq!(events[1].kind().moved_from(), Some(&loc(&["a"])));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["a"]));
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["c"]));
+}
+
+/// An unpaired dirty half still owes the source-side cover when it strands: the
+/// interleaved fact described a replacement the timeout's Removed contradicts.
+#[test]
+fn kr_dirty_unpaired_source_times_out_to_removed_and_rescan() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["a", "x"])),
+    at(11),
+  );
+  m.handle_timeout(at(500));
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 3);
+  assert!(events[0].kind().is_created());
+  assert!(events[1].kind().is_removed());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["a"]));
+  assert!(events[2].epoch() > events[1].epoch());
+}
+
+/// The fence is precise: a pending window with only hierarchy-unrelated interleavings
+/// pairs into a bare Moved — no covering Rescans.
+#[test]
+fn kr_clean_pending_window_pairs_without_rescans() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["b", "y"])),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2, "sibling activity adds no covering rescans");
+  assert!(events[0].kind().is_created());
+  assert!(events[1].kind().moved_from().is_some());
+}
+
+/// The descending-profile sibling: a FILE source has no child watch, so its half is
+/// unheld exactly like a kernel-recursive source — the same fence covers it for free.
+#[test]
+fn per_dir_file_source_pending_window_dirties() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("f"))
+      .with_cookie(cookie(9)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("f")),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("g"))
+      .with_cookie(cookie(9)),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4);
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["f"]));
+  assert_eq!(events[1].kind().moved_from(), Some(&loc(&["f"])));
+  assert_eq!(events[1].location(), &loc(&["g"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["f"]));
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["g"]));
+}
+
+/// The dedup side of the fence: identical adjacent Rescans normally coalesce, but a
+/// pending source touching them is a latent transition the queue cannot show — the
+/// second loss must deliver its own covering Rescan and epoch.
+#[test]
+fn pending_source_blocks_rescan_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["a"])).into(),
+    at(5),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["a"])).into(),
+    at(11),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    2,
+    "the second identical loss is not coalescible across a pending source"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+  assert!(events[1].epoch() > events[0].epoch());
+}
