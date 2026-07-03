@@ -6541,3 +6541,298 @@ fn under_hold_suppression_alone_stays_destination_only() {
     "no spurious source cover without a source-slot touch"
   );
 }
+
+/// One kernel-recursive-constructed Monitor hosts a DESCENDING scope alongside a KR
+/// scope: the descending root bootstraps a cold enumerate on arming, the KR root does
+/// not — the per-root profile, not the constructor default, governs each.
+#[test]
+fn mixed_profiles_descend_independently() {
+  let mut m = kernel_recursive();
+  let desc = Capabilities::new().with_supports_push().with_native_move();
+  let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
+  let r2 = m.register_root(scope(2), Interest::all());
+  m.on_watch_result(r1, Ok(()));
+  m.on_watch_result(r2, Ok(()));
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(r1)),
+    "the descending scope bootstraps a cold enumerate"
+  );
+  assert!(
+    !actions
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(r2)),
+    "the kernel-recursive scope never enumerates"
+  );
+}
+
+/// A Created directory record installs a child watch only in the descending scope;
+/// the KR scope delivers the change without any descent work.
+#[test]
+fn per_scope_profile_gates_descent_on_records() {
+  let mut m = kernel_recursive();
+  let desc = Capabilities::new().with_supports_push().with_native_move();
+  let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
+  let r2 = m.register_root(scope(2), Interest::all());
+  m.on_watch_result(r1, Ok(()));
+  m.on_watch_result(r2, Ok(()));
+  // Settle the descending root's bootstrap read so the record below is post-discovery.
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == r1).map(|e| e.req()))
+    .expect("descending bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(vec![]));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(r1, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(r2, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(r1, seg("d")))),
+    "the descending scope descends into the created directory"
+  );
+  assert_eq!(
+    actions
+      .iter()
+      .filter(|a| a.as_watch().is_some() || a.as_enumerate().is_some())
+      .count(),
+    1,
+    "the KR scope queues no descent work"
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2, "both scopes deliver the Created");
+}
+
+/// A root overflow re-arms (enumerates) the descending scope but is Rescan-only for
+/// the KR scope — the dual obligation honors the per-root profile.
+#[test]
+fn overflow_rearm_respects_scope_profile() {
+  let mut m = kernel_recursive();
+  let desc = Capabilities::new().with_supports_push().with_native_move();
+  let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
+  let r2 = m.register_root(scope(2), Interest::all());
+  m.on_watch_result(r1, Ok(()));
+  m.on_watch_result(r2, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == r1).map(|e| e.req()))
+    .expect("descending bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(vec![]));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(Scope::Root(scope(1)), at(5));
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(r1)),
+    "the descending scope's overflow re-arms its watch set"
+  );
+  m.on_overflow(Scope::Root(scope(2)), at(6));
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "the KR scope's overflow queues no re-arm"
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2);
+  assert!(events.iter().all(|e| e.kind().is_rescan()));
+}
+
+/// The mixed-profile twin of the two single-profile storms: ONE Monitor hosts a
+/// DESCENDING scope and a KERNEL-RECURSIVE scope simultaneously. The descending
+/// scope's driver loop services watch installs and enumerates; the KR scope feeds
+/// deep targets and located overflows. Invariants hold after every step, descent
+/// work only ever references the descending scope's watches, the delivered-epoch
+/// ceiling holds per scope, and the machine drains to a fixpoint.
+#[test]
+fn mixed_profile_storm_holds_invariants_and_terminates() {
+  for seed in 1..=64u64 {
+    let mut m = kernel_recursive();
+    let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(41);
+    let mut rng = || {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      s
+    };
+
+    let desc_caps = Capabilities::new().with_supports_push().with_native_move();
+    let desc_root = m.register_root_with_profile(scope(1), Interest::all(), desc_caps);
+    let mut cur_desc_root = desc_root;
+    let kr_root = m.register_root(scope(2), Interest::all());
+    let mut desc_watches = std::vec![desc_root];
+    let mut reqs: std::vec::Vec<ReqId> = std::vec::Vec::new();
+    while m.poll_action().is_some() {}
+    m.on_watch_result(desc_root, Ok(()));
+    m.on_watch_result(kr_root, Ok(()));
+
+    let names = [seg("a"), seg("b"), seg("c")];
+    let kinds = [
+      RecordKind::Created,
+      RecordKind::Removed,
+      RecordKind::Modified,
+      RecordKind::MovedFrom,
+      RecordKind::MovedTo,
+    ];
+    let mut rescan_ceiling: std::collections::BTreeMap<ScopeId, Epoch> =
+      std::collections::BTreeMap::new();
+
+    for step in 0..300u64 {
+      while let Some(action) = m.poll_action() {
+        match action {
+          Action::Watch(w) => {
+            // Descent work may only ever target the descending scope.
+            if let crate::action::WatchTarget::Child { .. } = w.target() {
+              assert_eq!(
+                m.scope_of(w.id()),
+                Some(scope(1)),
+                "child watches only in the descending scope (seed {seed})"
+              );
+            }
+            desc_watches.push(w.id());
+          }
+          Action::Enumerate(e) => {
+            assert_eq!(
+              m.scope_of(e.dir()),
+              Some(scope(1)),
+              "enumerates only in the descending scope (seed {seed})"
+            );
+            reqs.push(e.req());
+          }
+          _ => {}
+        }
+      }
+      if step % 5 == 0 {
+        while let Some(change) = m.poll_event() {
+          let ceiling = rescan_ceiling.entry(change.scope()).or_insert(Epoch::START);
+          if change.kind().is_rescan() {
+            assert!(change.epoch() > *ceiling, "rescan advances (seed {seed})");
+            *ceiling = change.epoch();
+          } else {
+            assert!(
+              change.epoch() <= *ceiling,
+              "no unannounced epoch (seed {seed})"
+            );
+          }
+        }
+      }
+      m.assert_invariants();
+
+      let now = at(step + 1);
+      match rng() % 7 {
+        0 => {
+          let w = desc_watches[(rng() as usize) % desc_watches.len()];
+          let res = if rng() % 8 == 0 {
+            Err(WatchError::NoSpace)
+          } else {
+            Ok(())
+          };
+          m.on_watch_result(w, res);
+        }
+        1 => {
+          if !reqs.is_empty() {
+            let req = reqs.swap_remove((rng() as usize) % reqs.len());
+            let mut entries = std::vec::Vec::new();
+            for n in &names {
+              if rng() % 2 == 0 {
+                let kind = if rng() % 2 == 0 {
+                  FileKind::Dir
+                } else {
+                  FileKind::File
+                };
+                entries.push(DirEntry::new(n.clone(), kind));
+              }
+            }
+            let res = match rng() % 5 {
+              0 => EnumerateResult::Failed(IoClass::Io),
+              1 => EnumerateResult::Partial(entries),
+              _ => EnumerateResult::Ok(entries),
+            };
+            m.on_enumerate(req, res);
+          }
+        }
+        2 => {
+          // Depth-one record on a descending-scope watch.
+          let w = desc_watches[(rng() as usize) % desc_watches.len()];
+          let kind = kinds[(rng() as usize) % kinds.len()];
+          let mut rec = OsRecord::new(w, kind)
+            .with_name(names[(rng() as usize) % names.len()].clone())
+            .with_is_dir(rng() % 2 == 0);
+          if kind.is_move_half() && rng() % 4 != 0 {
+            rec = rec.with_cookie(cookie(1 + rng() % 3));
+          }
+          m.on_os_record(rec, now);
+        }
+        3 => {
+          // Deep multi-segment record on the KR root.
+          let kind = kinds[(rng() as usize) % kinds.len()];
+          let depth = 1 + (rng() as usize) % 3;
+          let target = Location::from_segments(
+            (0..depth).map(|_| names[(rng() as usize) % names.len()].clone()),
+          );
+          let mut rec = OsRecord::new(kr_root, kind)
+            .with_target(target)
+            .with_is_dir(rng() % 2 == 0);
+          if kind.is_move_half() && rng() % 4 != 0 {
+            rec = rec.with_cookie(cookie(10 + rng() % 3));
+          }
+          m.on_os_record(rec, now);
+        }
+        4 => {
+          let sc = match rng() % 3 {
+            0 => Scope::Root(scope(1 + rng() % 2)),
+            1 => Scope::subtree_of(if rng() % 2 == 0 { desc_root } else { kr_root }),
+            _ => {
+              let descent = Location::from_segments(
+                (0..1 + (rng() as usize) % 2)
+                  .map(|_| names[(rng() as usize) % names.len()].clone()),
+              );
+              SubtreeScope::new(kr_root).with_descent(descent).into()
+            }
+          };
+          m.on_overflow(sc, now);
+        }
+        5 => m.handle_timeout(at(step + 1 + rng() % 400)),
+        _ => {
+          let kind = [
+            RecordKind::MoveSelf,
+            RecordKind::DeleteSelf,
+            RecordKind::Ignored,
+          ][(rng() as usize) % 3];
+          let root = if rng() % 2 == 0 { desc_root } else { kr_root };
+          m.on_os_record(OsRecord::new(root, kind), now);
+        }
+      }
+      // The descending root may die mid-storm (Ignored/DeleteSelf); re-register the
+      // scope with the SAME profile — tracking the CURRENT root so exactly one live
+      // registration per scope exists, per the API contract.
+      if m.scope_of(cur_desc_root).is_none() && rng() % 2 == 0 {
+        cur_desc_root = m.register_root_with_profile(scope(1), Interest::all(), desc_caps);
+        desc_watches.push(cur_desc_root);
+      }
+    }
+
+    let mut guard = 0u32;
+    while m.poll_action().is_some() {
+      guard += 1;
+      assert!(guard < 100_000, "fixpoint (seed {seed})");
+    }
+    m.assert_invariants();
+  }
+}

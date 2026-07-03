@@ -224,6 +224,13 @@ pub struct Monitor {
   /// `Modified`-only registration would starve the tree of the very records that
   /// discover new directories, silently losing coverage.
   scope_interests: BTreeMap<ScopeId, Interest>,
+  /// The capability profile each scope was registered with — which backend behavior
+  /// (descend-per-directory vs kernel-recursive) governs that root's machinery. One
+  /// Monitor can host mixed profiles (a driver selecting backends per root). Written on
+  /// EVERY registration — the plain [`register_root`](Self::register_root) stores the
+  /// constructor default — so a stale profile cannot leak across a scope's
+  /// re-registration. Read through [`scope_descends`](Self::scope_descends).
+  scope_profiles: BTreeMap<ScopeId, Capabilities>,
   /// Maps an outstanding enumerate request to the directory it reads. The node's
   /// [`NodeState::Enumerating`] carries the same `req` as the forward check, so a
   /// superseded result (whose node has moved on) is dropped rather than reconciled;
@@ -274,6 +281,7 @@ impl Monitor {
       roots: BTreeMap::new(),
       scope_epochs: BTreeMap::new(),
       scope_interests: BTreeMap::new(),
+      scope_profiles: BTreeMap::new(),
       pending_enumerate: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
       held_sources: BTreeSet::new(),
@@ -302,11 +310,25 @@ impl Monitor {
     self
   }
 
-  /// Whether the core descends per-directory (the backend is not
-  /// kernel-recursive).
+  /// Whether the core descends per-directory under the CONSTRUCTOR-DEFAULT
+  /// profile (the backend is not kernel-recursive). A scope registered with its
+  /// own profile ([`register_root_with_profile`](Self::register_root_with_profile))
+  /// is governed by that profile instead, per scope.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn descends(&self) -> bool {
     !self.capabilities.kernel_recursive()
+  }
+
+  /// Whether `scope`'s registered profile descends per-directory, falling back to
+  /// the constructor default for a scope with no stored profile (one that was
+  /// never registered, or whose changes are resolving after invalidation).
+  fn scope_descends(&self, scope: ScopeId) -> bool {
+    !self
+      .scope_profiles
+      .get(&scope)
+      .copied()
+      .unwrap_or(self.capabilities)
+      .kernel_recursive()
   }
 
   /// Whether a watch handle is currently registered (live or pending).
@@ -337,6 +359,23 @@ impl Monitor {
   /// and emission narrows delivery back to `mask`. `Rescan` is never filtered.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn register_root(&mut self, scope: ScopeId, mask: Interest) -> WatchId {
+    self.register_root_with_profile(scope, mask, self.capabilities)
+  }
+
+  /// Registers a new disjoint watched root governed by its OWN capability
+  /// profile, overriding the constructor default for this scope only.
+  ///
+  /// This is how one Monitor hosts mixed backends: a driver selecting per root
+  /// (a kernel-recursive fanotify mark on one filesystem, per-directory inotify
+  /// on another) registers each root with the profile its backend satisfies.
+  /// Everything else matches [`register_root`](Self::register_root).
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn register_root_with_profile(
+    &mut self,
+    scope: ScopeId,
+    mask: Interest,
+    caps: Capabilities,
+  ) -> WatchId {
     let id = WatchId::new(self.watch_ids.mint());
     self.nodes.insert(
       id,
@@ -352,6 +391,7 @@ impl Monitor {
     );
     self.roots.insert(scope, id);
     self.scope_interests.insert(scope, mask);
+    self.scope_profiles.insert(scope, caps);
     self.actions.push_back(Action::watch(
       id,
       crate::action::WatchTarget::Root(scope),
@@ -401,6 +441,7 @@ impl Monitor {
       // suppresses a stale `Removed` for a half whose source parent was dropped.
       self.purge_scope_pending_moves(scope);
       self.scope_interests.remove(&scope);
+      self.scope_profiles.remove(&scope);
     }
   }
 
@@ -419,7 +460,7 @@ impl Monitor {
     // (mid-move) subtree that Rescan would land at the stale pre-move path, so the
     // recovery routes through the hold instead, like every other held activity.
     let depth = rec.depth();
-    if (depth > 1 && self.descends()) || (depth > 0 && rec.kind().is_self_event()) {
+    if (depth > 1 && self.scope_descends(scope)) || (depth > 0 && rec.kind().is_self_event()) {
       if let Some(source) = self.in_held_subtree(rec.watch()) {
         self.dirtied_holds.insert(source);
         self.mark_enumerate_dirty(rec.watch());
@@ -698,9 +739,12 @@ impl Monitor {
   /// what is visible, then a re-arm retry) instead of being swallowed as a clean read
   /// whose listing may omit everything the trigger is about. A pending or dead node has
   /// nothing to read yet — a pending one's post-arm enumerate carries the obligation.
-  /// A no-op on a non-descending backend.
+  /// A no-op on a non-descending scope (or a dead `dir`).
   fn start_rearm(&mut self, dir: WatchId) {
-    if !self.descends() {
+    let Some(scope) = self.scope_of(dir) else {
+      return;
+    };
+    if !self.scope_descends(scope) {
       return;
     }
     match self.nodes.get(&dir).map(|node| node.state) {
@@ -830,7 +874,7 @@ impl Monitor {
           return;
         };
         node.state = NodeState::Live;
-        if is_dir && self.descends() {
+        if is_dir && self.scope_descends(scope) {
           // Continue a rescan re-arm into this freshly-armed directory if it was installed
           // as part of one — OR if it arms while in a held subtree: a held-origin read must
           // stay coverage-only (Created-suppressed) even if the move pairs and clears the
@@ -1611,7 +1655,7 @@ impl Monitor {
     replaced: bool,
     identity: Option<Identity>,
   ) {
-    if !self.descends() {
+    if !self.scope_descends(scope) {
       return;
     }
     match occupant {
@@ -2191,11 +2235,15 @@ impl Monitor {
         "a pending_enumerate request maps to a live node that names it"
       );
     }
-    // Every registered root has a stored delivery interest.
+    // Every registered root has a stored delivery interest and capability profile.
     for scope in self.roots.keys() {
       assert!(
         self.scope_interests.contains_key(scope),
         "a registered root's scope has a delivery interest"
+      );
+      assert!(
+        self.scope_profiles.contains_key(scope),
+        "a registered root's scope has a capability profile"
       );
     }
     // A held source is a live node; a dirtied hold is a held source.
