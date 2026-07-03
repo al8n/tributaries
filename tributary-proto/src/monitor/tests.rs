@@ -5260,7 +5260,12 @@ fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
           "a kernel-recursive monitor queues no descent work: {action:?}"
         );
       }
-      while m.poll_event().is_some() {}
+      // Batched draining: the queue legally accumulates changes across several
+      // inputs, so the adjacency dedup must stay sound under it (subtree-aware
+      // Rescan touching, not just point equality).
+      if step % 5 == 0 {
+        while m.poll_event().is_some() {}
+      }
       m.assert_invariants();
 
       let now = at(step + 1);
@@ -5316,4 +5321,110 @@ fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
     }
     m.assert_invariants();
   }
+}
+
+/// A second same-location loss after an intervening in-subtree event delivers its own
+/// Rescan: that loss can hide changes ordered after the event, so coalescing it into
+/// the pre-event Rescan would leave the consumer with no coverage marker after the
+/// possibly-stale event — and with a scope epoch no delivered Rescan carries.
+#[test]
+fn repeated_overflow_around_descendant_event_delivers_both_rescans() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(Scope::Root(scope(1)), at(1));
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["x"])),
+    at(2),
+  );
+  m.on_overflow(Scope::Root(scope(1)), at(3));
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    3,
+    "rescan, created, rescan — nothing coalesced"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert!(events[1].kind().is_created());
+  assert!(events[2].kind().is_rescan());
+  assert!(
+    events[2].epoch() > events[0].epoch(),
+    "the trailing loss carries its own delivered generation"
+  );
+}
+
+/// An event OUTSIDE the rescanned subtree is unaffected by that Rescan's coverage, so
+/// it does not break the coalescing of identical located Rescans around it.
+#[test]
+fn out_of_subtree_event_keeps_rescan_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["a"])).into(),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["b", "f"])),
+    at(2),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["a"])).into(),
+    at(3),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    2,
+    "an event outside the rescanned subtree keeps the coalescing"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  assert!(events[1].kind().is_modified());
+}
+
+/// Truly-adjacent identical Rescans still coalesce: no covered event separates the
+/// two losses, so one delivered instruction stands for both.
+#[test]
+fn adjacent_identical_rescans_still_coalesce() {
+  let mut m = kernel_recursive();
+  let _root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(Scope::Root(scope(1)), at(1));
+  m.on_overflow(Scope::Root(scope(1)), at(2));
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+}
+
+/// The prefix relation holds on the queued side too: a create after a queued ancestor
+/// Rescan is a fresh post-rescan transition, never a duplicate of the same-slot create
+/// that preceded the Rescan.
+#[test]
+fn queued_ancestor_rescan_breaks_point_event_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["x"])),
+    at(1),
+  );
+  m.on_overflow(Scope::Root(scope(1)), at(2));
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["x"])),
+    at(3),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 3);
+  assert!(events[0].kind().is_created());
+  assert!(events[1].kind().is_rescan());
+  assert!(events[2].kind().is_created());
 }
