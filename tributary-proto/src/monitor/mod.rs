@@ -128,14 +128,18 @@ struct PendingMove {
   /// located overflow whose location mutual-prefixes the pending source landed while
   /// the half was parked. Such activity described a REPLACEMENT at the source, which
   /// the eventual resolution (a `Moved` reparenting the consumer's tree, or a
-  /// `Removed`) contradicts — so a dirty half's resolution emits covering `Rescan`s.
+  /// `Removed`) contradicts — so a dirty half's resolution emits covering `Rescan`s
+  /// at the source and, for a pair, the destination.
   ///
-  /// Only set for UNHELD halves (`held: None` — kernel-recursive sources and
-  /// per-directory file sources). A held source's subtree fences its records outright
-  /// (suppression, because held paths reconstruct STALE through the detached tree) and
-  /// recovers through [`dirtied_holds`](Monitor::dirtied_holds); an unheld source has
-  /// no stale-path hazard — its interleaved records carry their own current-path truth
-  /// — so they DELIVER, and this flag only adds the covering re-read instruction.
+  /// Applies to held and unheld halves alike, and is ORTHOGONAL to
+  /// [`dirtied_holds`](Monitor::dirtied_holds): that marker records content SUPPRESSED
+  /// under a held source's detached subtree (paths through the hold reconstruct stale,
+  /// so its records are fenced and recover with a destination rescan + re-arm at
+  /// pairing). This flag records transitions at the half's SOURCE SLOT — activity that
+  /// DELIVERED at the vacated path, which is outside the detached subtree and has no
+  /// stale-path hazard. A held half whose slot was reoccupied owes the vacated path a
+  /// source-side cover that no destination rescan provides, so a held half can carry
+  /// both markers, each producing its own covers.
   dirty: bool,
 }
 
@@ -466,10 +470,11 @@ impl Monitor {
     // every other container holds obligations or bookkeeping, not transitions: `actions`
     // carries watch/enumerate work, `NodeState::Enumerating` an outstanding read whose
     // result reconciles coverage, `scope_epochs`/`dirtied_holds` markers.) A surviving
-    // record whose location mutual-prefixes a parked UNHELD source is an ancestor-or-
-    // descendant transition inside that pairing window: it DELIVERS (its path is its
-    // own current truth — contrast the held fence's suppression above), and the half is
-    // marked dirty so its resolution emits covering `Rescan`s.
+    // record whose location mutual-prefixes a parked source — held or unheld — is an
+    // ancestor-or-descendant transition inside that pairing window: it DELIVERS (its
+    // path is its own current truth; the held fence's suppression above guards paths
+    // through a DETACHED subtree, and a half's vacated source slot lies outside it),
+    // and the half is marked dirty so its resolution emits covering `Rescan`s.
     //
     // Three transitions are NOT unseen and do not mark: a `MovedTo`'s OWN pairing half
     // (the window's resolution, not an interleaved fact); self-events (a root teardown
@@ -938,17 +943,18 @@ impl Monitor {
     self.dirtied_holds.extend(held);
   }
 
-  /// Marks dirty every UNHELD pending move half of `scope` whose reconstructed source
-  /// location mutual-prefixes `loc` — the pending-store half of the latent-transition
-  /// fence (see the inventory note in [`on_os_record`](Self::on_os_record)). The source
-  /// is reconstructed on use ([`pending_from`](Self::pending_from)), so a mid-window
-  /// reparent of the source's ancestor is followed rather than indexed stale. Halves
-  /// whose `from_parent` is no longer watched are skipped: their location cannot be
-  /// reconstructed, and the resolution liveness guard silences them entirely, so a
-  /// dirty flag could never surface. `exclude` names a half the caller is about to
-  /// resolve (a pairing `MovedTo`'s own cookie); `carried` names a watch whose subtree
-  /// the caller's own machinery is detaching-and-holding — halves anchored at or under
-  /// it follow that move through the tree and are not marked.
+  /// Marks dirty every pending move half of `scope` — held or unheld — whose
+  /// reconstructed source location mutual-prefixes `loc`: the pending-store half of the
+  /// latent-transition fence (see the inventory note in
+  /// [`on_os_record`](Self::on_os_record)). The source is reconstructed on use
+  /// ([`pending_from`](Self::pending_from)), so a mid-window reparent of the source's
+  /// ancestor is followed rather than indexed stale. Halves whose `from_parent` is no
+  /// longer watched are skipped: their location cannot be reconstructed, and the
+  /// resolution liveness guard silences them entirely, so a dirty flag could never
+  /// surface. `exclude` names a half the caller is about to resolve (a pairing
+  /// `MovedTo`'s own cookie); `carried` names a watch whose subtree the caller's own
+  /// machinery is detaching-and-holding — halves anchored at or under it follow that
+  /// move through the tree and are not marked.
   fn dirty_pending_sources_touching(
     &mut self,
     scope: ScopeId,
@@ -962,7 +968,6 @@ impl Monitor {
       .filter(|((half_scope, cookie), pending)| {
         *half_scope == scope
           && Some(*cookie) != exclude
-          && pending.held.is_none()
           && !pending.dirty
           && self.is_watched(pending.from_parent)
           && !carried.is_some_and(|held| {
@@ -1016,16 +1021,18 @@ impl Monitor {
   /// `Removed` from `from`) and is only marked. Strict descendants, by contrast,
   /// are contents of the moved subtree itself and genuinely travel to `to`.
   ///
-  /// Every matched half also becomes dirty (through the store's per-hold marker):
-  /// the ancestor move is a transition its window absorbed — a half parked after the
-  /// resolving `MovedFrom` was marked by no record, and even a marked one now owes
-  /// its covers at resolution. A rewritten half whose anchor is not a prefix of `to`
-  /// cannot re-express its suffix against that anchor (a cross-directory
-  /// per-directory replacement); it keeps the stale suffix and the marker alone
-  /// covers — its resolution rescans the source it emits at, and the resolved
-  /// pair's own dirty covers handle the relocated side.
+  /// Every matched half also becomes dirty: the ancestor move is a transition its
+  /// window absorbed — a half parked after the resolving `MovedFrom` was marked by no
+  /// record, and even a marked one now owes its covers at resolution. Heldness does
+  /// not change this — the touch is to the half's SOURCE slot, so the source-side
+  /// cover must come from its own flag; a held half's hold marker would cover only
+  /// the destination (see [`PendingMove::dirty`]). A rewritten half whose anchor is
+  /// not a prefix of `to` cannot re-express its suffix against that anchor (a
+  /// cross-directory per-directory replacement); it keeps the stale suffix and the
+  /// flag alone covers — its resolution rescans the source it emits at, and the
+  /// resolved pair's own dirty covers handle the relocated side.
   fn reanchor_pending_sources(&mut self, scope: ScopeId, from: &Location, to: &Location) {
-    let matched: std::vec::Vec<(PendingKey, Option<Location>, Option<WatchId>)> = self
+    let matched: std::vec::Vec<(PendingKey, Option<Location>)> = self
       .pending_moves
       .iter()
       .filter(|((half_scope, _), pending)| {
@@ -1050,22 +1057,15 @@ impl Monitor {
             )
           })
         };
-        Some((*key, rewritten, pending.held))
+        Some((*key, rewritten))
       })
       .collect();
-    for (key, rewritten, held) in matched {
-      if let Some(src) = held {
-        // A held half recovers through its hold marker, keeping the dirty ⇒ unheld
-        // partition intact.
-        self.dirtied_holds.insert(src);
-      }
+    for (key, rewritten) in matched {
       if let Some(pending) = self.pending_moves.get_mut(&key) {
         if let Some(from) = rewritten {
           pending.from = from;
         }
-        if pending.held.is_none() {
-          pending.dirty = true;
-        }
+        pending.dirty = true;
       }
     }
   }
@@ -1267,6 +1267,10 @@ impl Monitor {
               if let Some(from) = resolved_from.as_ref() {
                 self.reanchor_pending_sources(scope, from, &to);
               }
+              // A source-slot touch during the hold (a delivered replacement at the
+              // vacated path) covers through the half's own flag — source AND
+              // destination — independent of the under-hold suppression below.
+              self.rescan_dirty_pair(scope, &pending, &to);
               if dirtied {
                 // Records under the moved subtree were suppressed at the stale path:
                 // re-scan the destination and re-arm the subtree to recover them.
@@ -1287,6 +1291,10 @@ impl Monitor {
                 if let Some(from) = resolved_from.as_ref() {
                   self.reanchor_pending_sources(scope, from, &to);
                 }
+                // A source-slot touch during the hold still owes its source-side
+                // cover here (the destination side coalesces with the unconditional
+                // rescan below).
+                self.rescan_dirty_pair(scope, &pending, &to);
                 // The O(1) carry-over failed, so the moved subtree's interval is
                 // uncovered BY CONSTRUCTION — whatever happened between the source
                 // dying (a failed install, a raced teardown) and the fresh destination
@@ -2201,14 +2209,6 @@ impl Monitor {
       assert!(
         self.held_sources.contains(dirtied),
         "a dirtied hold is a held source"
-      );
-    }
-    // The two dirty mechanisms partition by hold: a held half recovers through
-    // `dirtied_holds`, an unheld half through its own flag — never both.
-    for pending in self.pending_moves.values() {
-      assert!(
-        !(pending.dirty && pending.held.is_some()),
-        "a dirty pending half is unheld"
       );
     }
   }
