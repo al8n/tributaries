@@ -125,12 +125,20 @@ impl Source {
         })?;
       roots.push(canonical);
     }
-    let root_dev = fs::metadata(&roots[0])
-      .map_err(|source| SourceError::RootUnavailable {
+    let root_meta = fs::metadata(&roots[0]).map_err(|source| SourceError::RootUnavailable {
+      root: roots[0].clone(),
+      source,
+    })?;
+    // The kind recheck belongs to the same pre-start barrier as the device
+    // and mount reads: canonicalization already re-resolved the root, so a
+    // path retargeted from a directory to a file since the caller's own
+    // check must fail here, before any stream exists.
+    if !root_meta.is_dir() {
+      return Err(SourceError::NotADirectory {
         root: roots[0].clone(),
-        source,
-      })?
-      .dev() as libc::dev_t;
+      });
+    }
+    let root_dev = root_meta.dev() as libc::dev_t;
     // The mount seed and device UUID are part of the pre-start barrier: taken
     // here they cannot postdate any event. The seed is trust-reducing only —
     // a mount in the read→start gap would be in neither the seed nor the

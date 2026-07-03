@@ -275,6 +275,14 @@ impl FsOps for FakeFs {
       .get(&requested)
       .cloned()
       .unwrap_or(requested);
+    // The kind recheck of the pre-start barrier: the FINAL root must be a
+    // directory, exactly as the real backend asserts after its own
+    // re-canonicalization.
+    if let Some(node) = self.state.nodes.lock().unwrap().get(&root)
+      && !node.kind.is_dir()
+    {
+      return Err(SourceError::NotADirectory { root });
+    }
     // The pre-start barrier, mirrored from the real backend: the metadata is
     // sealed strictly before the source becomes injectable (`stream_live`),
     // and the mount seed claims no authority (the driver's birth refresh

@@ -476,7 +476,16 @@ pub(crate) async fn run<R, F>(
             Err(err) => {
               core.on_stream_spawned(scope, Err(clone_error(&err)));
               if let Some(pending) = watch_replies.remove(&scope) {
-                let _ = pending.reply.send(Err(WatchRootError::Source(err)));
+                // A spawn-side kind rejection keeps the public contract's
+                // vocabulary: the caller asked to watch a directory and the
+                // final root is not one.
+                let reply = match err {
+                  SourceError::NotADirectory { root } => {
+                    WatchRootError::NotADirectory { path: root }
+                  }
+                  err => WatchRootError::Source(err),
+                };
+                let _ = pending.reply.send(Err(reply));
               }
             }
           }},
@@ -709,6 +718,7 @@ fn clone_error(err: &SourceError) -> SourceError {
     },
     SourceError::Unsupported => SourceError::Unsupported,
     SourceError::NoRoots => SourceError::NoRoots,
+    SourceError::NotADirectory { root } => SourceError::NotADirectory { root: root.clone() },
     SourceError::TooManyExclusions { supplied } => SourceError::TooManyExclusions {
       supplied: *supplied,
     },

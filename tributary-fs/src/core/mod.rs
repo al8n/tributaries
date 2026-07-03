@@ -164,10 +164,13 @@ struct PendingBatch {
   /// every one of the batch's classification and cookie decisions has run
   /// (the monotone-within-batch rule).
   deferred_unmounts: Vec<PathBuf>,
-  /// fileIDs a `Present` rename probe bound to the root device in THIS batch
-  /// — the contemporaneous evidence a vanished partner's cookie grant
-  /// requires at settlement.
-  evidenced: BTreeSet<NonZeroU64>,
+  /// fileIDs a `Present` rename probe bound to the root device in THIS batch,
+  /// each with the partner path that carried the proof — the contemporaneous
+  /// evidence a vanished partner's cookie grant requires at settlement.
+  /// Evidence exists only under the temporal bind: the partner's EVENT word
+  /// carried the same fileID its probe observed (a probe-only fileID proves
+  /// what occupies the path NOW, not what the batch's events were about).
+  evidenced: BTreeMap<NonZeroU64, PathBuf>,
 }
 
 /// Per-root batch parking: while a batch has probes in flight, later batches
@@ -451,7 +454,7 @@ impl DriverCore {
     let BatchPayload { events, permit } = payload;
     let mut batch = self.compile(&mut state, scope, events);
     batch.permit = Some(permit);
-    let fed = Self::settle_if_ready(&mut self.monitor, &mut state, batch, now);
+    let fed = Self::settle_if_ready(&mut self.monitor, &mut state, scope, batch, now);
     self.scopes.insert(scope, state);
     if fed {
       self.pump_queued(scope, now);
@@ -478,8 +481,8 @@ impl DriverCore {
     let resolved = Self::resolve(&mut state, ctx.purpose, outcome);
     let mut fed = false;
     if let Some(batch) = state.park.active.as_mut() {
-      if let Some(fid) = resolved.evidences {
-        batch.evidenced.insert(fid);
+      if let Some((fid, partner)) = resolved.evidences {
+        batch.evidenced.insert(fid, partner);
       }
       if let Some(slot) = batch.items.get_mut(resolved.item) {
         slot.planned = resolved.planned;
@@ -489,7 +492,7 @@ impl DriverCore {
       }
       if batch.awaiting == 0 {
         let batch = state.park.active.take().expect("just observed Some");
-        Self::settle(&mut self.monitor, &mut state, batch, now);
+        Self::settle(&mut self.monitor, &mut state, scope, batch, now);
         fed = true;
       }
     }
@@ -760,11 +763,12 @@ impl DriverCore {
   fn settle_if_ready(
     monitor: &mut Monitor,
     state: &mut ScopeState,
+    scope: ScopeId,
     batch: PendingBatch,
     now: Instant,
   ) -> bool {
     if batch.awaiting == 0 {
-      Self::settle(monitor, state, batch, now);
+      Self::settle(monitor, state, scope, batch, now);
       true
     } else {
       state.park.active = Some(batch);
@@ -772,8 +776,14 @@ impl DriverCore {
     }
   }
 
-  fn settle(monitor: &mut Monitor, state: &mut ScopeState, mut batch: PendingBatch, now: Instant) {
-    Self::grant_evidenced_cookies(state, &mut batch);
+  fn settle(
+    monitor: &mut Monitor,
+    state: &mut ScopeState,
+    scope: ScopeId,
+    mut batch: PendingBatch,
+    now: Instant,
+  ) {
+    Self::grant_evidenced_cookies(state, scope, &mut batch);
     let deferred = std::mem::take(&mut batch.deferred_unmounts);
     for item in batch.items {
       for planned in item.planned {
@@ -789,30 +799,54 @@ impl DriverCore {
   }
 
   /// Grants a vanished rename half its pairing cookie at settlement, under
-  /// BOTH proofs the fabrication class demands: a same-batch partner's probe
-  /// bound the fileID to the root device (contemporaneous evidence — the
-  /// vanished path itself cannot be statted), and the vanished path lies
-  /// under no foreign prefix of the still-monotone, still-authoritative
-  /// table (a collision from a just-mounted or just-unmounted volume fails
-  /// here). Cross-batch vanished sources never cookie — the Monitor degrades
-  /// them to a removal, the documented pairing cost.
-  fn grant_evidenced_cookies(state: &ScopeState, batch: &mut PendingBatch) {
+  /// ALL the proofs the fabrication class demands: a same-batch partner's
+  /// probe bound the fileID to the root device AND that partner's event word
+  /// carried the same fileID (the temporal bind — see
+  /// [`PendingBatch::evidenced`]), and the vanished path lies under no
+  /// foreign prefix of the still-monotone, still-authoritative table (a
+  /// collision from a just-mounted or just-unmounted volume fails here).
+  /// Cross-batch vanished sources never cookie — the Monitor degrades them
+  /// to a removal, the documented pairing cost.
+  ///
+  /// The residual is inode reuse INSIDE one batch: FSEvents supplies no
+  /// rename token, so an object deleted and an unrelated object recycling
+  /// its inode within the same batch can satisfy every proof above and
+  /// mis-pair. That cannot be distinguished from a real rename event-side,
+  /// so every granted pair also queues one covering located rescan at the
+  /// pair's deepest common ancestor — a mis-pair is then recoverable, never
+  /// silent.
+  fn grant_evidenced_cookies(state: &ScopeState, scope: ScopeId, batch: &mut PendingBatch) {
+    let evidenced = std::mem::take(&mut batch.evidenced);
+    let mut covers: Vec<Planned> = Vec::new();
     for item in &mut batch.items {
       let Some((fid, path)) = item.cookie_candidate.take() else {
         continue;
       };
-      if !batch.evidenced.contains(&fid) || !device_trusted(state, &path, None) {
+      let Some(partner) = evidenced.get(&fid) else {
+        continue;
+      };
+      if !device_trusted(state, &path, None) {
         continue;
       }
+      let mut granted = false;
       for planned in &mut item.planned {
         if let Planned::Rec(rec) = planned
           && rec.kind().is_moved_from()
           && rec.cookie().is_none()
         {
           *rec = rec.clone().with_cookie(MoveCookie::new(fid));
+          granted = true;
         }
       }
+      if granted {
+        covers.push(Self::covering_rescan(
+          state,
+          scope,
+          [&path, partner].into_iter(),
+        ));
+      }
     }
+    batch.trailing.extend(covers);
   }
 
   fn feed(monitor: &mut Monitor, planned: Planned, now: Instant) {
@@ -834,7 +868,7 @@ impl DriverCore {
       };
       let mut batch = self.compile(&mut state, scope, events);
       batch.permit = Some(permit);
-      let fed = Self::settle_if_ready(&mut self.monitor, &mut state, batch, now);
+      let fed = Self::settle_if_ready(&mut self.monitor, &mut state, scope, batch, now);
       self.scopes.insert(scope, state);
       if !fed {
         return;
@@ -930,7 +964,7 @@ impl DriverCore {
       awaiting,
       trailing,
       deferred_unmounts,
-      evidenced: BTreeSet::new(),
+      evidenced: BTreeMap::new(),
       permit: None,
     }
   }
@@ -1237,10 +1271,15 @@ impl DriverCore {
             Resolved {
               item,
               planned,
-              // A cookie minted here IS the live root-device proof: publish
-              // the PROBED inode so a vanished same-batch partner is granted
-              // only against evidence for the object actually seen on disk.
-              evidences: cookie.is_some().then_some(probed).flatten(),
+              // Evidence needs the TEMPORAL BIND on top of the cookie's own
+              // rules: the event word must have carried the same fileID the
+              // probe observed. A probe-only fileID proves what occupies the
+              // path now — not which object the batch's events were about —
+              // so it may cookie this present half but never vouch for a
+              // vanished partner (that pair degrades to Removed + Created).
+              evidences: (cookie.is_some() && file_id == probed)
+                .then(|| probed.map(|fid| (fid, path.clone())))
+                .flatten(),
               candidate: None,
             }
           }
@@ -1325,7 +1364,13 @@ impl DriverCore {
             // it), so the newest terminal `Rescan` moves into the dying set
             // and retries until the consumer accepts it. Ordinary queued
             // emits stay best-effort — each is dominated by that `Rescan`.
-            let parked = self.scopes.remove(&scope).and_then(|state| {
+            //
+            // A NEVER-LIVE scope promotes nothing: its caller got Err, not a
+            // handle, so there is no consumer view to cover (the route_event
+            // fence already kept its changes out of the effect queue).
+            let removed = self.scopes.remove(&scope);
+            let live = removed.as_ref().is_some_and(|state| state.root.is_some());
+            let parked = removed.and_then(|state| {
               let root = state.delivery_root();
               match state.lag {
                 LagState::Lagged { parked, .. } => parked.map(|change| (root, change)),
@@ -1333,11 +1378,15 @@ impl DriverCore {
               }
             });
             let queued = Self::extract_last_rescan(&mut self.effects, scope);
+            debug_assert!(
+              live || (parked.is_none() && queued.is_none()),
+              "a never-live scope emits nothing to promote"
+            );
             let terminal = match (parked, queued) {
               (Some(a), Some(b)) => Some(if b.1.epoch() > a.1.epoch() { b } else { a }),
               (a, b) => a.or(b),
             };
-            if let Some((root, change)) = terminal {
+            if live && let Some((root, change)) = terminal {
               self.dying.insert(
                 scope,
                 DyingDelivery {
@@ -1378,6 +1427,15 @@ impl DriverCore {
       }
       return;
     };
+    // NEVER-LIVE FENCE: a scope whose stream never spawned (spawn failure,
+    // final-root rejection) owes the consumer nothing — watch() resolves Err
+    // and the caller never received the handle these changes would carry.
+    // The Monitor's own failure Rescan for such a root is internal
+    // bookkeeping, not public coverage; delivering it would tell a consumer
+    // to rescan a root that was never watched.
+    if state.root.is_none() {
+      return;
+    }
     match &mut state.lag {
       LagState::Normal => {
         let root = state.delivery_root();
@@ -1410,8 +1468,10 @@ struct Resolved {
   item: usize,
   planned: Vec<Planned>,
   /// A fileID this probe bound to the root device (a cookied `Present`
-  /// rename half) — settlement evidence for a vanished partner.
-  evidences: Option<NonZeroU64>,
+  /// rename half whose EVENT word carried the same fileID the probe
+  /// observed), with the partner path that carried the proof — settlement
+  /// evidence for a vanished partner.
+  evidences: Option<(NonZeroU64, PathBuf)>,
   /// A vanished half's grant candidacy (see [`Item::cookie_candidate`]).
   candidate: Option<(NonZeroU64, PathBuf)>,
 }
