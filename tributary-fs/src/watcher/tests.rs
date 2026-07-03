@@ -325,6 +325,73 @@ mod lifecycle {
     let _ = std::fs::remove_dir_all(&dir_b);
   }
 
+  /// A root retargeted from a directory to a regular FILE between the
+  /// reservation and the spawn is a typed pre-live rejection: no stream ever
+  /// exists, no event ever surfaces, and other watches are untouched.
+  #[tokio::test(start_paused = true)]
+  async fn retargeted_root_to_file_is_rejected_before_live() {
+    let (dir, canonical) = scratch("retarget-to-file");
+    let fs = FakeFs::new(1);
+    fs.put(&canonical, FileKind::Dir, 1);
+    let plain = PathBuf::from("/retargeted-plain-file");
+    fs.put(&plain, FileKind::File, 2);
+    fs.remap_spawn_root(&canonical, &plain);
+    let mut watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let err = watcher
+      .watch(&dir, Interest::all())
+      .await
+      .expect_err("a file root is rejected");
+    match err {
+      WatchRootError::NotADirectory { path } => {
+        assert_eq!(path, plain, "the FINAL root is reported");
+      }
+      other => panic!("expected NotADirectory, got {other:?}"),
+    }
+    assert_eq!(fs.spawns(), 0, "no stream ever went live");
+    assert_eq!(watcher.registry_len(), 0);
+    assert!(
+      tokio::time::timeout(Duration::from_secs(2), watcher.next())
+        .await
+        .is_err(),
+      "a never-live scope produces no events"
+    );
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A plain spawn failure is equally event-silent end to end: the caller
+  /// gets Err, and the Monitor's internal failure rescan for the never-live
+  /// root is fenced at the core — nothing reaches the stream, not even
+  /// through the dying retry.
+  #[tokio::test(start_paused = true)]
+  async fn failed_watch_produces_no_events() {
+    let (dir, _canonical) = scratch("spawn-fails");
+    let fs = FakeFs::new(1);
+    // The canonical root is never registered as a fake node: the spawn fails
+    // with RootUnavailable (the fake's pre-start half of the lifecycle).
+    let mut watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let err = watcher
+      .watch(&dir, Interest::all())
+      .await
+      .expect_err("the spawn fails");
+    assert!(matches!(err, WatchRootError::Source(_)), "{err:?}");
+    assert_eq!(watcher.registry_len(), 0);
+    assert!(
+      tokio::time::timeout(Duration::from_secs(2), watcher.next())
+        .await
+        .is_err(),
+      "a failed watch delivers nothing"
+    );
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   /// A retargeted-but-disjoint final root goes live under the FINAL path:
   /// the registry, the handle, and event assembly all carry what is actually
   /// watched.

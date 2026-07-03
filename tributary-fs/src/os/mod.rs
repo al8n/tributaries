@@ -129,6 +129,15 @@ pub enum SourceError {
     #[source]
     source: io::Error,
   },
+  /// The FINAL canonical root is not a directory. The backend re-resolves the
+  /// root at spawn, so a path retargeted to a regular file between the
+  /// watcher's own check and the pre-start barrier is caught here — a
+  /// recursive stream must never be committed for a non-directory.
+  #[error("watch root {} is not a directory", root.display())]
+  NotADirectory {
+    /// The final canonical root the spawn resolved.
+    root: PathBuf,
+  },
   /// More exclusion paths than the OS honors were supplied.
   #[error("{supplied} exclusion paths exceed the OS limit of {MAX_EXCLUSIONS}")]
   TooManyExclusions {
