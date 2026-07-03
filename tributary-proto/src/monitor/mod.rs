@@ -1535,9 +1535,10 @@ impl Monitor {
   }
 
   /// Advances a scope's reconciliation generation and returns the new value. Called on
-  /// every reconciliation trigger (through [`emit_rescan`](Self::emit_rescan)), so the
-  /// `Rescan` — and every change emitted after it — carries a generation that strictly
-  /// dominates whatever the consumer acted on before the trigger.
+  /// every non-coalesced reconciliation trigger (through
+  /// [`emit_rescan`](Self::emit_rescan)), so the `Rescan` — and every change emitted
+  /// after it — carries a generation that strictly dominates whatever the consumer
+  /// acted on before the trigger.
   fn bump_epoch(&mut self, scope: ScopeId) -> Epoch {
     let next = self.epoch_of(scope).next();
     self.scope_epochs.insert(scope, next);
@@ -1547,6 +1548,15 @@ impl Monitor {
   fn emit_rescan(&mut self, scope: ScopeId, location: Location) {
     // A `Rescan` IS the reconciliation trigger: bump the generation FIRST so the Rescan,
     // and every later change for this scope, strictly dominates what the consumer holds.
+    // But the coalesce is decided BEFORE the bump: a trigger whose Rescan would coalesce
+    // into a still-queued identical one adds no new instruction — the queued
+    // (undelivered) Rescan's single generation stands for the whole contiguous loss run
+    // — and skipping the bump keeps the public epoch contract exact: no delivered change
+    // ever carries a generation that no delivered Rescan announced. The decision is a
+    // pure read of the event queue, so `emit` re-running it below cannot disagree.
+    if self.would_coalesce(scope, &location, &ChangeKind::Rescan) {
+      return;
+    }
     self.bump_epoch(scope);
     self.emit(scope, location, ChangeKind::Rescan);
   }
@@ -1568,35 +1578,54 @@ impl Monitor {
     if !wanted {
       return;
     }
+    if self.would_coalesce(scope, &location, &kind) {
+      return;
+    }
     let id = self.next_change_id();
     let change = Change::new(id, scope, location, kind, self.epoch_of(scope));
-    let key = Self::dedup_key(&change);
-    // Coalesce only an ADJACENT duplicate: suppress iff the most-recent still-queued
-    // change TOUCHING any location this change touches is identical. A change touches its
-    // destination; a `Moved(from)` ALSO touches its source — and this holds on BOTH sides
-    // of the comparison. So create→remove→create keeps all three (the remove differs), and
-    // move(/a→/b)→create(/a)→move(/a→/b) keeps both moves (the intervening create at the
-    // moves' source /a breaks their adjacency).
-    //
-    // A `Rescan`'s coverage is a whole SUBTREE, not a point, so its touching is
-    // prefix-wide on both sides: a queued change inside a new Rescan's subtree breaks the
-    // coalescing chain (rescan→create(child)→rescan keeps both rescans — the second may
-    // cover a loss ordered after that create), and a queued Rescan touches any new change
-    // inside ITS subtree (create→rescan→create keeps both creates as distinct pre- and
-    // post-rescan transitions). Only truly-adjacent identical Rescans coalesce, which
-    // stays sound despite each trigger's epoch bump: no covered event separates them,
-    // both losses precede the survivor's delivery-time re-read, and `dedup_key` ignores
-    // the epoch precisely so one delivered instruction can stand for both.
-    //
-    // A queue-wide key set — or a one-sided, destination-only scan — would drop a real
-    // transition and mis-converge the consumer.
-    let new_is_rescan = change.kind().is_rescan();
+    self.events.push_back(change);
+  }
+
+  /// Whether a change of `kind` at `location` would coalesce into the most-recent
+  /// still-queued change touching it — the ONE dedup decision, applied by
+  /// [`emit`](Self::emit) and consulted by [`emit_rescan`](Self::emit_rescan) before
+  /// the epoch bump. A pure read of the event queue: consecutive calls with an
+  /// unchanged queue return the same answer.
+  ///
+  /// Coalesce only an ADJACENT duplicate: suppress iff the most-recent still-queued
+  /// change TOUCHING any location this change touches is identical. A change touches its
+  /// destination; a `Moved(from)` ALSO touches its source — and this holds on BOTH sides
+  /// of the comparison. So create→remove→create keeps all three (the remove differs), and
+  /// move(/a→/b)→create(/a)→move(/a→/b) keeps both moves (the intervening create at the
+  /// moves' source /a breaks their adjacency).
+  ///
+  /// A `Rescan`'s coverage is a whole SUBTREE, not a point, so its touching is
+  /// prefix-wide on both sides: a queued change inside a new Rescan's subtree breaks the
+  /// coalescing chain (rescan→create(child)→rescan keeps both rescans — the second may
+  /// cover a loss ordered after that create), and a queued Rescan touches any new change
+  /// inside ITS subtree (create→rescan→create keeps both creates as distinct pre- and
+  /// post-rescan transitions). Only truly-adjacent identical Rescans coalesce, which is
+  /// sound because nothing the earlier Rescan covers separates them: both losses precede
+  /// the survivor's delivery-time re-read, the coalesced trigger never bumps the
+  /// generation (see `emit_rescan`), and `dedup_key` ignores the epoch precisely so one
+  /// delivered instruction can stand for the run.
+  ///
+  /// A queue-wide key set — or a one-sided, destination-only scan — would drop a real
+  /// transition and mis-converge the consumer.
+  fn would_coalesce(&self, scope: ScopeId, location: &Location, kind: &ChangeKind) -> bool {
+    let key: DedupKey = (
+      scope,
+      location.clone(),
+      Self::kind_tag(kind),
+      kind.moved_from().cloned(),
+    );
+    let new_is_rescan = kind.is_rescan();
     let mut touched: std::vec::Vec<&Location> = std::vec::Vec::with_capacity(2);
     touched.push(&key.1);
     if let Some(source) = key.3.as_ref() {
       touched.push(source);
     }
-    let duplicate = self
+    self
       .events
       .iter()
       .rev()
@@ -1614,10 +1643,7 @@ impl Monitor {
           })
         }
       })
-      .is_some_and(|queued| Self::dedup_key(queued) == key);
-    if !duplicate {
-      self.events.push_back(change);
-    }
+      .is_some_and(|queued| Self::dedup_key(queued) == key)
   }
 
   fn install_child(

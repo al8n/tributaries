@@ -72,6 +72,10 @@ struct FakeState {
   /// releases — the close-versus-in-flight-spawn cells need a spawn that is
   /// dispatched but not yet returned.
   spawn_hold: Mutex<Option<HoldGate>>,
+  /// When set, `spawn_source` parks AFTER its fake stream went live but
+  /// before it returns — the real backend's post-live metadata phase, where a
+  /// wedged spawn already owns a live native stream that close must count.
+  post_live_hold: Mutex<Option<HoldGate>>,
   /// When set, `SourceControl::shutdown` parks until the gate releases — the
   /// close-versus-wedged-teardown cell needs a teardown whose handle has
   /// already moved into the call, where no Drop backstop can exist.
@@ -239,6 +243,14 @@ impl FakeFs {
     *self.state.teardown_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
+
+  /// Holds every subsequent spawn AFTER its stream goes live but before the
+  /// spawn returns — the post-live metadata phase of the real backend.
+  pub(crate) fn hold_spawns_post_live(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.post_live_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
 }
 
 /// Releases work parked by [`FakeFs::hold_spawns`] / [`FakeFs::hold_teardowns`].
@@ -364,6 +376,17 @@ impl FsOps for FakeFs {
       .push(FakeSource { sender, transport });
     self.state.spawn_order.lock().unwrap().push("stream_live");
     self.state.spawns.fetch_add(1, Ordering::SeqCst);
+    // The post-live wedge parks HERE — the stream is live and injectable, the
+    // spawn has not returned, and no handle exists yet for any backstop:
+    // exactly the phase the close accounting must count as non-quiescent.
+    let post_live = self.state.post_live_hold.lock().unwrap().clone();
+    if let Some(gate) = post_live {
+      let (held, cvar) = &*gate;
+      let mut parked = held.lock().unwrap();
+      while *parked {
+        parked = cvar.wait(parked).unwrap();
+      }
+    }
     // An armed replacement lands now — after the stream went live, before the
     // revalidation — the deterministic capture→start race.
     if let Some((path, node)) = self.state.replace_at_live.lock().unwrap().take() {

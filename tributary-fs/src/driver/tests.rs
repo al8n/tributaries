@@ -915,9 +915,9 @@ async fn close_settles_an_in_flight_spawn_failure() {
 }
 
 /// A blocking pool wedged past the grace must not hang close forever: the
-/// reply goes out with the spawn still pending (the documented residual), and
-/// the orphan handle's Drop remains the reclamation backstop once the wedge
-/// clears.
+/// reply reports the spawn still pending — a wedged spawn is never treated as
+/// quiescent — and the orphan handle's Drop remains the reclamation backstop
+/// once the wedge clears.
 #[tokio::test]
 async fn close_grace_bounds_a_wedged_spawn_and_drop_reclaims_it() {
   let rig = rig_with_capacity(64);
@@ -942,14 +942,24 @@ async fn close_grace_bounds_a_wedged_spawn_and_drop_reclaims_it() {
     .await
     .unwrap();
 
-  tokio::time::timeout(Duration::from_secs(5), on_close)
+  let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
     .await
     .expect("close resolves at the grace boundary")
-    .expect("the driver confirms the close");
+    .expect("the driver replied");
+  assert_eq!(
+    pending, 1,
+    "a wedged spawn is reported — the driver cannot see which phase it \
+     wedged in, so it never claims quiescence over one"
+  );
   assert_eq!(
     rig.fs.shutdowns(),
     0,
     "the wedged spawn has not produced a stream yet"
+  );
+  assert_eq!(
+    rig.fs.spawns(),
+    0,
+    "the wedge parked before the stream went live"
   );
 
   // The wedge clears after close: the orphan completes, its op message finds
@@ -963,6 +973,67 @@ async fn close_grace_bounds_a_wedged_spawn_and_drop_reclaims_it() {
     rig.fs.shutdowns(),
     1,
     "the Drop backstop reclaimed the orphan"
+  );
+}
+
+/// A spawn wedged AFTER its stream went live — the backend's post-live
+/// metadata phase — already owns a live native stream, so close must count it
+/// as non-quiescent; once the wedge clears, the undeliverable result's handle
+/// Drop reclaims the stream.
+#[tokio::test]
+async fn close_counts_a_post_live_wedged_spawn_as_non_quiescent() {
+  let rig = rig_with_capacity(64);
+  rig.fs.put("/r", FileKind::Dir, 1);
+  let gate = rig.fs.hold_spawns_post_live();
+
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/r"),
+      interest: tributary_proto::Interest::all(),
+      reply,
+    })
+    .await
+    .unwrap();
+  drop(on_reply);
+
+  // Wait until the fake stream is genuinely live inside the parked spawn.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while rig.fs.spawns() == 0 && std::time::Instant::now() < deadline {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(rig.fs.spawns(), 1, "the stream went live inside the spawn");
+
+  let (close_reply, on_close) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Close { reply: close_reply })
+    .await
+    .unwrap();
+
+  let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    .await
+    .expect("close resolves at the grace boundary")
+    .expect("the driver replied");
+  assert_eq!(pending, 1, "the live-but-unreturned spawn is counted");
+  assert_eq!(
+    rig.fs.shutdowns(),
+    0,
+    "the live stream is genuinely unreclaimed at reply time"
+  );
+
+  // The wedge clears: the result finds the op channel closed and the handle's
+  // Drop reclaims the live stream.
+  gate.release();
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while rig.fs.shutdowns() == 0 && std::time::Instant::now() < deadline {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(
+    rig.fs.shutdowns(),
+    1,
+    "the Drop backstop reclaimed the stream"
   );
 }
 
