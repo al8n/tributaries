@@ -35,7 +35,9 @@ use tributary_proto::{
   OsRecord, RecordKind, Scope, ScopeId, Segment, SubtreeScope, WatchError, WatchId,
 };
 
-use crate::os::{FsEventFlags, RawOsEvent, SourceError};
+use crate::os::{
+  BatchPayload, FsEventFlags, RawOsEvent, RootMeta, SourceError, fsevent::BudgetPermit,
+};
 
 #[cfg(test)]
 mod tests;
@@ -62,22 +64,6 @@ pub(crate) enum ProbeOutcome {
   },
   /// The probe failed (permission, I/O); existence is unknowable.
   Failed,
-}
-
-/// What the blocking spawn of a native source learned about its root.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RootMeta {
-  /// The canonicalized root — the byte-exact prefix event paths arrive under.
-  pub(crate) root: PathBuf,
-  /// The device the root lives on.
-  pub(crate) root_dev: u64,
-  /// The mount points already living strictly under the root at spawn.
-  pub(crate) mounts: Vec<PathBuf>,
-  /// Whether `mounts` came from an authoritative read of the live mount
-  /// table. `false` means the table could not be read: device boundaries are
-  /// then UNKNOWN, and event-side identity/cookie trust is refused rather
-  /// than presumed (probe-carried device evidence still decides).
-  pub(crate) mounts_authoritative: bool,
 }
 
 /// One I/O obligation the driver task must execute for the core.
@@ -167,6 +153,12 @@ struct PendingBatch {
   items: Vec<Item>,
   awaiting: usize,
   trailing: Vec<Planned>,
+  /// The batch's transport budget slot, held for as long as the compiled
+  /// items are retained: parked memory then counts against the same budget
+  /// that bounds the queue, so a stuck probe back-pressures the callback
+  /// instead of growing the park unbudgeted. Dropped when the batch settles
+  /// or is discarded (loss flush, scope teardown) — RAII, every path.
+  permit: Option<BudgetPermit>,
   /// Unmount trust-removals deferred to the batch's settlement: removing a
   /// foreign prefix only ever INCREASES trust, so it must not happen before
   /// every one of the batch's classification and cookie decisions has run
@@ -179,11 +171,14 @@ struct PendingBatch {
 }
 
 /// Per-root batch parking: while a batch has probes in flight, later batches
-/// queue behind it rather than overtaking it.
+/// queue behind it rather than overtaking it. Both the active batch and every
+/// queued payload keep holding their transport budget slot (see
+/// [`BatchPayload`]), so the park's memory is bounded by the same budget as
+/// the queue's.
 #[derive(Debug, Default)]
 struct Park {
   active: Option<PendingBatch>,
-  queued: VecDeque<Vec<RawOsEvent>>,
+  queued: VecDeque<BatchPayload>,
 }
 
 /// Why a probe was issued, and how to plan its resolution.
@@ -421,23 +416,34 @@ impl DriverCore {
     self.drain_monitor();
   }
 
-  /// Feeds one decoded callback batch for `scope`.
-  pub(crate) fn on_batch(&mut self, scope: ScopeId, events: Vec<RawOsEvent>, now: Instant) {
+  /// Feeds one decoded callback batch for `scope`, taking the whole payload:
+  /// the budget slot rides with the events for as long as the core retains
+  /// them (parked active or queued), so parked memory stays inside the
+  /// transport budget and a stuck probe back-pressures the callback.
+  pub(crate) fn on_batch(&mut self, scope: ScopeId, payload: BatchPayload, now: Instant) {
     let Some(mut state) = self.scopes.remove(&scope) else {
       return;
     };
     if state.park.active.is_some() {
-      state.park.queued.push_back(events);
+      state.park.queued.push_back(payload);
       self.scopes.insert(scope, state);
       return;
     }
-    let batch = self.compile(&mut state, scope, events);
+    let BatchPayload { events, permit } = payload;
+    let mut batch = self.compile(&mut state, scope, events);
+    batch.permit = Some(permit);
     let fed = Self::settle_if_ready(&mut self.monitor, &mut state, batch, now);
     self.scopes.insert(scope, state);
     if fed {
       self.pump_queued(scope, now);
     }
     self.drain_monitor();
+  }
+
+  /// Test entry taking bare events under a detached budget slot.
+  #[cfg(test)]
+  pub(crate) fn on_batch_events(&mut self, scope: ScopeId, events: Vec<RawOsEvent>, now: Instant) {
+    self.on_batch(scope, BatchPayload::detached(events), now);
   }
 
   /// Feeds one probe's outcome; a completed batch (and any batches queued
@@ -795,11 +801,12 @@ impl DriverCore {
       let Some(mut state) = self.scopes.remove(&scope) else {
         return;
       };
-      let Some(events) = state.park.queued.pop_front() else {
+      let Some(BatchPayload { events, permit }) = state.park.queued.pop_front() else {
         self.scopes.insert(scope, state);
         return;
       };
-      let batch = self.compile(&mut state, scope, events);
+      let mut batch = self.compile(&mut state, scope, events);
+      batch.permit = Some(permit);
       let fed = Self::settle_if_ready(&mut self.monitor, &mut state, batch, now);
       self.scopes.insert(scope, state);
       if !fed {
@@ -897,6 +904,7 @@ impl DriverCore {
       trailing,
       deferred_unmounts,
       evidenced: BTreeSet::new(),
+      permit: None,
     }
   }
 

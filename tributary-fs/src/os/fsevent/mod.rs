@@ -346,6 +346,16 @@ impl BudgetPermit {
   }
 }
 
+impl BudgetPermit {
+  /// A permit against a private, standalone counter — for tests that need a
+  /// payload without a live [`TransportState`]. Dropping it balances its own
+  /// counter and nothing else.
+  #[cfg(test)]
+  pub(crate) fn detached() -> Self {
+    Self(Arc::new(AtomicUsize::new(1)))
+  }
+}
+
 impl Drop for BudgetPermit {
   fn drop(&mut self) {
     self.0.fetch_sub(1, Ordering::AcqRel);
@@ -354,12 +364,29 @@ impl Drop for BudgetPermit {
 
 /// One callback invocation's decoded events plus the budget slot they occupy.
 /// The batch boundary is preserved (it is the natural rename-pairing window).
+///
+/// The slot covers the batch's WHOLE retention, not just its queue residency:
+/// the driver hands the payload to the core intact, so events parked behind
+/// in-flight probes keep holding their permit until the batch settles or is
+/// discarded — a stuck probe therefore back-pressures the callback into the
+/// ordered loss degrade instead of letting parked memory grow unbudgeted.
 #[derive(Debug)]
 pub(crate) struct BatchPayload {
   /// The decoded events, in callback order.
   pub(crate) events: Vec<RawOsEvent>,
   /// The budget slot; released when the payload drops.
   pub(crate) permit: BudgetPermit,
+}
+
+impl BatchPayload {
+  /// A payload holding a detached permit — for tests without a transport.
+  #[cfg(test)]
+  pub(crate) fn detached(events: Vec<RawOsEvent>) -> Self {
+    Self {
+      events,
+      permit: BudgetPermit::detached(),
+    }
+  }
 }
 
 /// The RAII acknowledgement riding an `Overflow` message: dropping it —

@@ -171,6 +171,7 @@ mod transport {
       if chooser.take() {
         model.step_driver();
       }
+      assert_permit_accounting(&model, &transport);
       match *op {
         CbOp::Batch { events, lossy } => {
           if lossy {
@@ -206,8 +207,27 @@ mod transport {
         }
       }
     }
-    while model.step_driver() {}
+    while model.step_driver() {
+      assert_permit_accounting(&model, &transport);
+    }
     (model, transport, losses)
+  }
+
+  /// The permit-accounting invariant, checked at every quiescent point of a
+  /// schedule (this model consumes payloads on processing, so live payloads
+  /// are exactly the queued batches): `in_flight` equals the batches whose
+  /// permits are still alive — the budget neither leaks nor double-returns.
+  fn assert_permit_accounting(model: &Model, transport: &TransportState) {
+    let queued_batches = model
+      .queue
+      .iter()
+      .filter(|(_, msg)| matches!(msg, SourceMessage::Batch(_)))
+      .count();
+    assert_eq!(
+      transport.in_flight(),
+      queued_batches,
+      "in_flight tracks live payloads exactly"
+    );
   }
 
   /// The invariants every schedule must satisfy at quiescence. Together they

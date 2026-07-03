@@ -35,6 +35,27 @@ pub(crate) use fsevent::{BatchPayload, FsEventFlags, OverflowAck, RawOsEvent};
 /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
 pub(crate) const MAX_EXCLUSIONS: usize = 8;
 
+/// What a source's spawn learned about its root — finalized strictly BEFORE
+/// the stream can enqueue its first event, so this metadata is a safe
+/// authority for every message the source ever delivers. A snapshot taken
+/// after start could postdate events already queued (a foreign submount that
+/// events and vanishes in that window would be trusted off blindness), so the
+/// seam forbids it: only [`Source::spawn`] mints a `RootMeta`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootMeta {
+  /// The canonicalized root — the byte-exact prefix event paths arrive under.
+  pub(crate) root: PathBuf,
+  /// The device the root lives on.
+  pub(crate) root_dev: u64,
+  /// The mount points already living strictly under the root at spawn.
+  pub(crate) mounts: Vec<PathBuf>,
+  /// Whether `mounts` came from an authoritative read of the live mount
+  /// table. `false` means the table could not be read: device boundaries are
+  /// then UNKNOWN, and event-side identity/cookie trust is refused rather
+  /// than presumed (probe-carried device evidence still decides).
+  pub(crate) mounts_authoritative: bool,
+}
+
 /// Everything a platform source needs to start watching.
 #[derive(Debug, Clone)]
 pub(crate) struct SourceConfig {
