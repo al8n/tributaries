@@ -58,6 +58,38 @@ fn location_push_and_child_descend() {
 }
 
 #[test]
+fn location_join_appends_suffix_segments() {
+  let base = Location::from_segments([Segment::new("a")]);
+  let suffix = Location::from_segments([Segment::new("b"), Segment::new("c")]);
+  let joined = base.join(&suffix);
+  assert_eq!(
+    joined.segments(),
+    &[Segment::new("a"), Segment::new("b"), Segment::new("c")]
+  );
+  assert_eq!(joined.name(), Some(&Segment::new("c")));
+  assert_eq!(joined.clone().join(&Location::new()), joined);
+  assert_eq!(Location::new().join(&suffix), suffix);
+}
+
+#[test]
+fn location_starts_with_is_prefix_inclusive() {
+  let root = Location::new();
+  let a = Location::from_segments([Segment::new("a")]);
+  let ab = Location::from_segments([Segment::new("a"), Segment::new("b")]);
+  let b = Location::from_segments([Segment::new("b")]);
+
+  assert!(a.starts_with(&root), "everything starts with the root");
+  assert!(a.starts_with(&a), "every location starts with itself");
+  assert!(ab.starts_with(&a));
+  assert!(
+    !a.starts_with(&ab),
+    "a prefix never starts with its extension"
+  );
+  assert!(!b.starts_with(&a));
+  assert!(root.starts_with(&root));
+}
+
+#[test]
 fn location_from_iter() {
   let loc: Location = vec![Segment::new("x"), Segment::new("y")]
     .into_iter()

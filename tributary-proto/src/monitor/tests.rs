@@ -3,6 +3,7 @@ use crate::{
   action::WatchTarget,
   path::Segment,
   record::{DirEntry, FileKind, IoClass},
+  scope::SubtreeScope,
 };
 use core::num::NonZeroU64;
 use std::{vec, vec::Vec};
@@ -451,7 +452,7 @@ fn overflow_subtree_rescans_that_subtree() {
   let root = live_root(&mut m, scope(1));
   let _ = drain_events(&mut m);
 
-  m.on_overflow(Scope::Subtree(root), at(5));
+  m.on_overflow(Scope::subtree_of(root), at(5));
   let events = drain_events(&mut m);
   assert_eq!(events.len(), 1);
   assert!(events[0].kind().is_rescan());
@@ -3558,7 +3559,7 @@ fn random_op_storm_holds_invariants_and_terminates() {
           }
           m.on_os_record(rec, now);
         }
-        3 => m.on_overflow(scopes[(rng() as usize) % scopes.len()], now),
+        3 => m.on_overflow(scopes[(rng() as usize) % scopes.len()].clone(), now),
         4 => m.handle_timeout(at(step + 1 + rng() % 400)),
         _ => {
           let w = watches[(rng() as usize) % watches.len()];
@@ -3952,7 +3953,7 @@ fn subtree_overflow_on_a_held_source_is_fenced() {
   let _ = drain_events(&mut m);
 
   // A subtree overflow on the held source: fenced — no stale-path Rescan.
-  m.on_overflow(Scope::Subtree(w_d), at(11));
+  m.on_overflow(Scope::subtree_of(w_d), at(11));
   assert!(
     drain_events(&mut m).is_empty(),
     "a subtree overflow on a held source emits no stale-path Rescan"
@@ -4928,4 +4929,1615 @@ fn move_create_move_same_paths_is_not_coalesced() {
     "the second rename into /b is delivered — the intervening create at /a breaks dedup"
   );
   assert_eq!(created, 1, "the create at /a is delivered once");
+}
+
+/// A kernel-recursive backend reports arbitrarily deep paths on its one root watch;
+/// the record's multi-segment target must land the change at the joined location,
+/// with no descent and no actions.
+#[test]
+fn deep_created_record_emits_at_joined_location() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a", "b", "new.txt"]))
+      .with_is_dir(false),
+    at(10),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["a", "b", "new.txt"]));
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "a kernel-recursive monitor never descends"
+  );
+}
+
+#[test]
+fn deep_removed_and_modified_records_emit_at_joined_location() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed).with_target(loc(&["a", "b"])),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["a", "c.txt"])),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Attrib).with_target(loc(&["a", "d.txt"])),
+    at(3),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 3);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a", "b"]));
+  assert!(events[1].kind().is_modified());
+  assert_eq!(events[1].location(), &loc(&["a", "c.txt"]));
+  assert!(events[2].kind().is_modified());
+  assert_eq!(events[2].location(), &loc(&["a", "d.txt"]));
+  assert!(drain_actions(&mut m).is_empty());
+}
+
+/// The FSEvents shape: two deep halves sharing a driver-minted cookie (the file id)
+/// pair into a single `Moved` inside the window — source before destination.
+#[test]
+fn deep_move_pair_within_window_emits_single_moved() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "old"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "an in-window source half stays pending"
+  );
+  assert!(
+    m.poll_timeout().is_some(),
+    "the pairing window arms a timer"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["b", "sub", "new"]))
+      .with_cookie(cookie(7)),
+    at(20),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["a", "old"])));
+  assert_eq!(events[0].location(), &loc(&["b", "sub", "new"]));
+  assert!(drain_actions(&mut m).is_empty());
+  assert_eq!(
+    m.poll_timeout(),
+    None,
+    "the consumed half disarms the timer"
+  );
+}
+
+#[test]
+fn deep_moved_from_unpaired_times_out_to_removed() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "gone"]))
+      .with_cookie(cookie(3)),
+    at(10),
+  );
+  assert!(drain_events(&mut m).is_empty());
+
+  m.handle_timeout(at(500));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a", "gone"]));
+}
+
+#[test]
+fn deep_moved_to_without_pending_is_created() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["x", "arrived"]))
+      .with_cookie(cookie(9)),
+    at(10),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["x", "arrived"]));
+}
+
+#[test]
+fn deep_cookieless_moved_from_resolves_immediately() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom).with_target(loc(&["a", "b", "c"])),
+    at(10),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a", "b", "c"]));
+  assert_eq!(m.poll_timeout(), None, "a cookie-less half never waits");
+}
+
+/// A depth-one record under a kernel-recursive monitor still works via the same
+/// target vocabulary (the with_name sugar).
+#[test]
+fn depth_one_record_still_works_under_kernel_recursive() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("top.txt")),
+    at(10),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert_eq!(events[0].location(), &loc(&["top.txt"]));
+}
+
+/// A descending monitor's addressing contract is depth-one; a deeper record is a
+/// driver bug and escalates to a Rescan + re-arm of the arrival watch, never a
+/// mis-attributed delivery.
+#[test]
+fn deep_record_on_descending_monitor_escalates_rescan() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["a", "b"])),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(root)),
+    "the escalation re-arms the arrival watch"
+  );
+}
+
+/// A self-event kind never carries a target; the malformed combination escalates to
+/// a Rescan instead of invalidating the root off a record that addressed a child.
+#[test]
+fn self_event_with_target_escalates_rescan_not_invalidation() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MoveSelf).with_target(loc(&["a"])),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert!(
+    m.is_watched(root),
+    "a malformed self-event must not tear down the root"
+  );
+}
+
+/// FSEvents `MustScanSubDirs` for a deep directory: the located subtree overflow
+/// lands the Rescan at the descent under the root watch — targeted, not whole-root —
+/// and re-arms nothing on a kernel-recursive backend.
+#[test]
+fn located_subtree_overflow_rescans_at_descent_kernel_recursive() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a", "b"]));
+  assert_eq!(events[0].scope(), scope(1));
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "kernel-recursive: the re-arm half is a no-op"
+  );
+
+  // A second located overflow strictly advances the scope's epoch.
+  let first = events[0].epoch();
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(6),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].epoch() > first, "every overflow bumps the epoch");
+}
+
+/// On a descending backend a located overflow re-arms from the nearest watch — the
+/// descent has no watch of its own — while the Rescan still lands at the descent.
+#[test]
+fn located_subtree_overflow_rearms_from_watch_when_descending() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["deep"])).into(),
+    at(5),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["deep"]));
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(root)),
+    "the re-arm starts from the nearest watch"
+  );
+}
+
+#[test]
+fn located_overflow_on_unknown_watch_is_dropped() {
+  let mut m = kernel_recursive();
+  let _root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    Scope::subtree_of(WatchId::new(NonZeroU64::new(999).unwrap())),
+    at(5),
+  );
+  assert!(drain_events(&mut m).is_empty());
+}
+
+/// The kernel-recursive twin of the op storm: deep multi-segment targets, located
+/// subtree overflows, root self-events — the FSEvents-shaped input space. The
+/// Monitor must hold its invariants, never descend (no child watches, no
+/// enumerates), and drain to a fixpoint under every schedule.
+#[test]
+fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
+  for seed in 1..=64u64 {
+    let mut m = kernel_recursive();
+    let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(7);
+    let mut rng = || {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      s
+    };
+
+    let roots = [
+      m.register_root(scope(1), Interest::all()),
+      m.register_root(scope(2), Interest::all()),
+    ];
+    while m.poll_action().is_some() {}
+    m.on_watch_result(roots[0], Ok(()));
+    m.on_watch_result(roots[1], Ok(()));
+
+    let names = [seg("a"), seg("b"), seg("c")];
+    let kinds = [
+      RecordKind::Created,
+      RecordKind::Removed,
+      RecordKind::Modified,
+      RecordKind::MovedFrom,
+      RecordKind::MovedTo,
+    ];
+    // The delivered-epoch contract, asserted over every drained change: an
+    // ordinary change never carries a generation greater than the latest
+    // DELIVERED Rescan's for its scope, and each delivered Rescan strictly
+    // advances that ceiling — no generation exists that no Rescan announced.
+    let mut rescan_ceiling: std::collections::BTreeMap<ScopeId, Epoch> =
+      std::collections::BTreeMap::new();
+    let mut drain_checked = |m: &mut Monitor, seed: u64| {
+      while let Some(change) = m.poll_event() {
+        let ceiling = rescan_ceiling.entry(change.scope()).or_insert(Epoch::START);
+        if change.kind().is_rescan() {
+          assert!(
+            change.epoch() > *ceiling,
+            "each delivered Rescan strictly advances its scope's generation (seed {seed})"
+          );
+          *ceiling = change.epoch();
+        } else {
+          assert!(
+            change.epoch() <= *ceiling,
+            "an ordinary change never outruns the delivered Rescan ceiling (seed {seed})"
+          );
+        }
+      }
+    };
+
+    for step in 0..300u64 {
+      while let Some(action) = m.poll_action() {
+        assert!(
+          matches!(action, Action::Unwatch(_)),
+          "a kernel-recursive monitor queues no descent work: {action:?}"
+        );
+      }
+      // Batched draining: the queue legally accumulates changes across several
+      // inputs, so the adjacency dedup must stay sound under it (subtree-aware
+      // Rescan touching, not just point equality).
+      if step % 5 == 0 {
+        drain_checked(&mut m, seed);
+      }
+      m.assert_invariants();
+
+      let now = at(step + 1);
+      let root = roots[(rng() as usize) % roots.len()];
+      match rng() % 5 {
+        0 | 1 => {
+          let kind = kinds[(rng() as usize) % kinds.len()];
+          let depth = 1 + (rng() as usize) % 3;
+          let target = Location::from_segments(
+            (0..depth).map(|_| names[(rng() as usize) % names.len()].clone()),
+          );
+          let mut rec = OsRecord::new(root, kind)
+            .with_target(target)
+            .with_is_dir(rng() % 2 == 0);
+          if kind.is_move_half() && rng() % 4 != 0 {
+            rec = rec.with_cookie(cookie(1 + rng() % 3));
+          }
+          m.on_os_record(rec, now);
+        }
+        2 => {
+          let sc = match rng() % 3 {
+            0 => Scope::Root(scope(1 + rng() % 2)),
+            1 => Scope::subtree_of(root),
+            _ => {
+              let depth = 1 + (rng() as usize) % 2;
+              let descent = Location::from_segments(
+                (0..depth).map(|_| names[(rng() as usize) % names.len()].clone()),
+              );
+              SubtreeScope::new(root).with_descent(descent).into()
+            }
+          };
+          m.on_overflow(sc, now);
+        }
+        3 => m.handle_timeout(at(step + 1 + rng() % 400)),
+        _ => {
+          let kind = [
+            RecordKind::MoveSelf,
+            RecordKind::DeleteSelf,
+            RecordKind::Ignored,
+          ][(rng() as usize) % 3];
+          m.on_os_record(OsRecord::new(root, kind), now);
+        }
+      }
+    }
+
+    drain_checked(&mut m, seed);
+    let mut guard = 0u32;
+    while m.poll_action().is_some() {
+      guard += 1;
+      assert!(
+        guard < 100_000,
+        "the kernel-recursive Monitor drains to a fixpoint (seed {seed})"
+      );
+    }
+    m.assert_invariants();
+  }
+}
+
+/// A second same-location loss after an intervening in-subtree event delivers its own
+/// Rescan: that loss can hide changes ordered after the event, so coalescing it into
+/// the pre-event Rescan would leave the consumer with no coverage marker after the
+/// possibly-stale event — and with a scope epoch no delivered Rescan carries.
+#[test]
+fn repeated_overflow_around_descendant_event_delivers_both_rescans() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(Scope::Root(scope(1)), at(1));
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["x"])),
+    at(2),
+  );
+  m.on_overflow(Scope::Root(scope(1)), at(3));
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    3,
+    "rescan, created, rescan — nothing coalesced"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert!(events[1].kind().is_created());
+  assert!(events[2].kind().is_rescan());
+  assert!(
+    events[2].epoch() > events[0].epoch(),
+    "the trailing loss carries its own delivered generation"
+  );
+}
+
+/// An event OUTSIDE the rescanned subtree is unaffected by that Rescan's coverage, so
+/// it does not break the coalescing of identical located Rescans around it.
+#[test]
+fn out_of_subtree_event_keeps_rescan_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["a"])).into(),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["b", "f"])),
+    at(2),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["a"])).into(),
+    at(3),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    2,
+    "an event outside the rescanned subtree keeps the coalescing"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  assert!(events[1].kind().is_modified());
+}
+
+/// Truly-adjacent identical Rescans still coalesce: no covered event separates the
+/// two losses, so one delivered instruction stands for both — and because the
+/// coalesce is decided BEFORE the trigger's epoch bump, the scope's generation IS
+/// the delivered Rescan's, so a following ordinary change carries an announced
+/// generation, never a hidden one.
+#[test]
+fn adjacent_identical_rescans_still_coalesce() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(Scope::Root(scope(1)), at(1));
+  m.on_overflow(Scope::Root(scope(1)), at(2));
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(
+    m.epoch_of(scope(1)),
+    events[0].epoch(),
+    "the coalesced trigger never advanced the scope past its delivered Rescan"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["x"])),
+    at(3),
+  );
+  let after = drain_events(&mut m);
+  assert_eq!(after.len(), 1);
+  assert!(after[0].kind().is_created());
+  assert_eq!(
+    after[0].epoch(),
+    events[0].epoch(),
+    "a change after coalesced losses carries the delivered Rescan's generation"
+  );
+}
+
+/// The prefix relation holds on the queued side too: a create after a queued ancestor
+/// Rescan is a fresh post-rescan transition, never a duplicate of the same-slot create
+/// that preceded the Rescan.
+#[test]
+fn queued_ancestor_rescan_breaks_point_event_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["x"])),
+    at(1),
+  );
+  m.on_overflow(Scope::Root(scope(1)), at(2));
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["x"])),
+    at(3),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 3);
+  assert!(events[0].kind().is_created());
+  assert!(events[1].kind().is_rescan());
+  assert!(events[2].kind().is_created());
+}
+
+/// An ancestor transition invalidates the state a descendant Rescan's re-read
+/// established, so it breaks the coalescing of identical descendant Rescans — the
+/// ancestor direction of the mutual-prefix touch relation.
+#[test]
+fn ancestor_transition_breaks_descendant_rescan_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_target(loc(&["a"]))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a"]))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(4),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    4,
+    "rescan, removed, created, rescan — nothing coalesced"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["a", "b"]));
+  assert!(
+    events[3].epoch() > events[0].epoch(),
+    "the post-ancestor loss carries its own delivered generation"
+  );
+}
+
+/// A move whose SOURCE is an ancestor of the rescanned subtree is an ancestor
+/// transition too — the source side of the mutual-prefix relation.
+#[test]
+fn ancestor_move_breaks_descendant_rescan_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(9))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(9))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(4),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 3, "rescan, moved, rescan — nothing coalesced");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[1].kind().moved_from(), Some(&loc(&["a"])));
+  assert!(events[2].kind().is_rescan());
+}
+
+/// The ancestor direction protects ordinary changes too: an ancestor swap makes a
+/// same-slot re-create a DISTINCT transition, not a duplicate — suppressing it would
+/// silently lose the child under the recreated parent with no covering Rescan.
+#[test]
+fn ancestor_transition_breaks_ordinary_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a", "b"]))
+      .with_is_dir(true),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_target(loc(&["a"]))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a"]))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a", "b"]))
+      .with_is_dir(true),
+    at(4),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    4,
+    "created, removed, created, created — the re-created child delivers"
+  );
+  assert!(events[3].kind().is_created());
+  assert_eq!(events[3].location(), &loc(&["a", "b"]));
+}
+
+/// Sibling-subtree interleavings stay coalescible: a transition in an unrelated
+/// subtree cannot affect this location's object, and a suppressed duplicate of a
+/// state fact leaves the consumer at the same final state.
+#[test]
+fn sibling_event_keeps_ordinary_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["a", "f"])),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["b", "g"])),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["a", "f"])),
+    at(3),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    2,
+    "the sibling-separated duplicate Modified coalesces"
+  );
+  assert!(events[0].kind().is_modified());
+  assert!(events[1].kind().is_modified());
+  assert_eq!(events[1].location(), &loc(&["b", "g"]));
+}
+
+/// A record interleaved with a pending move window and touching its source is a latent
+/// ancestor transition the queue-based dedup cannot see: it delivers (its path is its
+/// own truth), and the half's resolution owes covering Rescans at both sides.
+#[test]
+fn kr_interleaved_descendant_fact_dirties_the_pending_move() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["a", "new.txt"])),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4, "created, moved, and two covering rescans");
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["a", "new.txt"]));
+  assert_eq!(events[1].kind().moved_from(), Some(&loc(&["a"])));
+  assert_eq!(events[1].location(), &loc(&["c"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["a"]));
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["c"]));
+  // Each covering Rescan announces its own bump, dominating the interleaved fact.
+  assert!(events[2].epoch() > events[0].epoch());
+  assert!(events[3].epoch() > events[2].epoch());
+}
+
+/// A located overflow inside the pending window is the same latent transition through
+/// the loss path: its own Rescan delivers immediately, and the pairing still owes the
+/// covering pair.
+#[test]
+fn kr_interleaved_located_overflow_dirties_the_pending_move() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "sub"]))
+      .into(),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4);
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a", "sub"]));
+  assert_eq!(events[1].kind().moved_from(), Some(&loc(&["a"])));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["a"]));
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["c"]));
+}
+
+/// An unpaired dirty half still owes the source-side cover when it strands: the
+/// interleaved fact described a replacement the timeout's Removed contradicts.
+#[test]
+fn kr_dirty_unpaired_source_times_out_to_removed_and_rescan() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["a", "x"])),
+    at(11),
+  );
+  m.handle_timeout(at(500));
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 3);
+  assert!(events[0].kind().is_created());
+  assert!(events[1].kind().is_removed());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["a"]));
+  assert!(events[2].epoch() > events[1].epoch());
+}
+
+/// The fence is precise: a pending window with only hierarchy-unrelated interleavings
+/// pairs into a bare Moved — no covering Rescans.
+#[test]
+fn kr_clean_pending_window_pairs_without_rescans() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["b", "y"])),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2, "sibling activity adds no covering rescans");
+  assert!(events[0].kind().is_created());
+  assert!(events[1].kind().moved_from().is_some());
+}
+
+/// The descending-profile sibling: a FILE source has no child watch, so its half is
+/// unheld exactly like a kernel-recursive source — the same fence covers it for free.
+#[test]
+fn per_dir_file_source_pending_window_dirties() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("f"))
+      .with_cookie(cookie(9)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("f")),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("g"))
+      .with_cookie(cookie(9)),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4);
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["f"]));
+  assert_eq!(events[1].kind().moved_from(), Some(&loc(&["f"])));
+  assert_eq!(events[1].location(), &loc(&["g"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["f"]));
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["g"]));
+}
+
+/// The dedup side of the fence: identical adjacent Rescans normally coalesce, but a
+/// pending source touching them is a latent transition the queue cannot show — the
+/// second loss must deliver its own covering Rescan and epoch.
+#[test]
+fn pending_source_blocks_rescan_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["a"])).into(),
+    at(5),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root).with_descent(loc(&["a"])).into(),
+    at(11),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    2,
+    "the second identical loss is not coalescible across a pending source"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+  assert!(events[1].epoch() > events[0].epoch());
+}
+
+/// A kernel-recursive pending half re-anchors under a resolved ancestor move — the
+/// deep-suffix analogue of the tree carrying per-directory halves through a reparent:
+/// its eventual Moved emits from the post-move path, and its covers land there too.
+#[test]
+fn kr_pending_half_reanchors_under_a_resolved_ancestor_move() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c", "d"]))
+      .with_cookie(cookie(5)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4, "two moves and the inner pair's covers");
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["a"])));
+  assert_eq!(events[0].location(), &loc(&["z"]));
+  assert_eq!(
+    events[1].kind().moved_from(),
+    Some(&loc(&["z", "b"])),
+    "the inner half's source follows the resolved ancestor move"
+  );
+  assert_eq!(events[1].location(), &loc(&["c", "d"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["z", "b"]));
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["c", "d"]));
+}
+
+/// The unpaired variant: a re-anchored half strands, and its Removed + cover land at
+/// the post-move path rather than the path the consumer no longer holds.
+#[test]
+fn kr_reanchored_unpaired_half_times_out_at_the_post_move_path() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  let _ = drain_events(&mut m);
+
+  m.handle_timeout(at(500));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["z", "b"]));
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["z", "b"]));
+}
+
+/// Nested ancestor moves compose: each resolution rewrites the still-pending half, so
+/// the innermost object's eventual pairing emits from the fully-relocated path.
+#[test]
+fn kr_nested_ancestor_moves_compose_on_a_pending_half() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b", "c"]))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["z", "b"]))
+      .with_cookie(cookie(9)),
+    at(13),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["w"]))
+      .with_cookie(cookie(9)),
+    at(14),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["q"]))
+      .with_cookie(cookie(5)),
+    at(15),
+  );
+
+  let events = drain_events(&mut m);
+  let moves: Vec<(Location, Location)> = events
+    .iter()
+    .filter_map(|e| {
+      e.kind()
+        .moved_from()
+        .map(|from| (from.clone(), e.location().clone()))
+    })
+    .collect();
+  assert_eq!(
+    moves,
+    vec![
+      (loc(&["a"]), loc(&["z"])),
+      (loc(&["z", "b"]), loc(&["w"])),
+      (loc(&["w", "c"]), loc(&["q"])),
+    ],
+    "each resolution rewrites the still-pending suffix"
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["w", "c"])),
+    "the innermost half covers at its fully-relocated source"
+  );
+}
+
+/// A half parked BETWEEN an ancestor's two halves is marked by no record — the
+/// re-anchor itself must dirty it, so its resolution still covers.
+#[test]
+fn kr_half_parked_between_ancestor_halves_reanchors_dirty() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(5)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  // The ancestor pair was dirtied by the inner MovedFrom record, so it covers both
+  // sides; the inner half was marked by the re-anchor itself and covers at its
+  // post-move source.
+  assert_eq!(events.len(), 6);
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["a"])));
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["z"]));
+  assert_eq!(events[3].kind().moved_from(), Some(&loc(&["z", "b"])));
+  assert_eq!(events[3].location(), &loc(&["c"]));
+  assert!(events[4].kind().is_rescan());
+  assert_eq!(events[4].location(), &loc(&["z", "b"]));
+  assert!(events[5].kind().is_rescan());
+  assert_eq!(events[5].location(), &loc(&["c"]));
+}
+
+/// A stranded ancestor's Removed is itself a subtree transition: a half parked under
+/// it (marked by no record) is dirtied by the resolution, so its own later Removed
+/// carries a cover instead of landing silently under an already-dropped tree.
+#[test]
+fn kr_stranded_ancestor_removal_dirties_halves_underneath() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(3)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(11),
+  );
+  m.handle_timeout(at(500));
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+  assert!(events[2].kind().is_removed());
+  assert_eq!(events[2].location(), &loc(&["a", "b"]));
+  assert!(
+    events[3].kind().is_rescan(),
+    "the inner half was dirtied by the ancestor's stranded resolution"
+  );
+  assert_eq!(events[3].location(), &loc(&["a", "b"]));
+}
+
+/// A path names different objects over time: a REPLACEMENT half parked at the exact
+/// source of a later-resolving pair belongs to the successor object, so the pair's
+/// re-anchor must not relocate it — it stays at the vacated path (dirty) and its own
+/// pairing emits from there, never from the departed object's destination.
+#[test]
+fn kr_same_source_replacement_half_is_not_reanchored() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(9)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["w"]))
+      .with_cookie(cookie(9)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  let moves: Vec<(Location, Location)> = events
+    .iter()
+    .filter_map(|e| {
+      e.kind()
+        .moved_from()
+        .map(|from| (from.clone(), e.location().clone()))
+    })
+    .collect();
+  assert_eq!(
+    moves,
+    vec![(loc(&["a"]), loc(&["z"])), (loc(&["a"]), loc(&["w"])),],
+    "the replacement pairs from the vacated path, not the original's destination"
+  );
+  assert!(
+    events
+      .iter()
+      .filter(|e| e.kind().is_rescan() && e.location() == &loc(&["w"]))
+      .count()
+      == 1,
+    "the replacement's covers land at its own destination"
+  );
+}
+
+/// The timeout variant of the same-source replacement: its stranded Removed and
+/// cover land at the vacated path the consumer still holds, never at the departed
+/// object's destination.
+#[test]
+fn kr_same_source_replacement_half_times_out_at_the_vacated_path() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(9)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  let _ = drain_events(&mut m);
+
+  m.handle_timeout(at(500));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(
+    events[0].location(),
+    &loc(&["a"]),
+    "the stranded replacement resolves at the vacated path, never the original's destination"
+  );
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+}
+
+/// A strict descendant and an exact-source half in one window each follow their own
+/// rule: the descendant travels with the moved subtree, the same-path successor stays.
+#[test]
+fn kr_strict_descendant_reanchors_while_exact_source_stays() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(9),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(9)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(5)),
+    at(13),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["w"]))
+      .with_cookie(cookie(9)),
+    at(14),
+  );
+
+  let events = drain_events(&mut m);
+  let moves: Vec<(Location, Location)> = events
+    .iter()
+    .filter_map(|e| {
+      e.kind()
+        .moved_from()
+        .map(|from| (from.clone(), e.location().clone()))
+    })
+    .collect();
+  assert_eq!(
+    moves,
+    vec![
+      (loc(&["a"]), loc(&["z"])),
+      (loc(&["z", "b"]), loc(&["c"])),
+      (loc(&["a"]), loc(&["w"])),
+    ],
+    "the descendant follows the subtree; the successor keeps the vacated path"
+  );
+}
+
+/// The per-directory instance of the same boundary: a replacement half anchored at
+/// the SAME unmoved parent reconstructs exactly the resolved source, and must not be
+/// rewritten under the departed object's destination.
+#[test]
+fn per_dir_same_source_replacement_half_is_not_reanchored() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(9)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("w"))
+      .with_cookie(cookie(9)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  let moves: Vec<(Location, Location)> = events
+    .iter()
+    .filter_map(|e| {
+      e.kind()
+        .moved_from()
+        .map(|from| (from.clone(), e.location().clone()))
+    })
+    .collect();
+  assert_eq!(
+    moves,
+    vec![(loc(&["a"]), loc(&["z"])), (loc(&["a"]), loc(&["w"])),],
+    "the per-directory successor half keeps the vacated path"
+  );
+}
+
+/// A held source whose vacated slot is reoccupied and vacated again (a replacement
+/// watched directory moving out under its own cookie) covers the source path when
+/// each half resolves: the interleaved facts at the slot contradict the applied
+/// moves, and a destination-only rescan cannot repair the vacated path.
+#[test]
+fn held_source_replacement_covers_the_vacated_path() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a, Ok(()));
+  let _ = drain_actions(&mut m);
+
+  // The original watched dir moves out: its half parks held.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  // A replacement watched dir reoccupies the vacated slot, then moves out too.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(11),
+  );
+  let w_a2 = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a2, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(12),
+  );
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(13),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("w"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(14),
+  );
+
+  let events = drain_events(&mut m);
+  let shape: Vec<(bool, Location)> = events
+    .iter()
+    .map(|e| (e.kind().is_rescan(), e.location().clone()))
+    .collect();
+  assert_eq!(
+    shape,
+    vec![
+      (false, loc(&["z"])),
+      (true, loc(&["a"])),
+      (true, loc(&["z"])),
+      (false, loc(&["w"])),
+      (true, loc(&["a"])),
+      (true, loc(&["w"])),
+    ],
+    "each held resolution covers the vacated source AND its destination"
+  );
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["a"])));
+  assert_eq!(events[3].kind().moved_from(), Some(&loc(&["a"])));
+  let rescan_epochs: Vec<Epoch> = events
+    .iter()
+    .filter(|e| e.kind().is_rescan())
+    .map(|e| e.epoch())
+    .collect();
+  assert!(
+    rescan_epochs.windows(2).all(|w| w[0] < w[1]),
+    "every delivered cover announces its own bump"
+  );
+}
+
+/// The strand variant: the replacement's held half times out after the original's
+/// pair touched it — the `Removed` at the vacated path carries a covering `Rescan`
+/// there, exactly as an unheld dirty half would.
+#[test]
+fn held_source_replacement_strand_covers_the_vacated_path() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(11),
+  );
+  let w_a2 = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a2, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(12),
+  );
+  // The original pairs away; its resolution touches the replacement's parked half.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(13),
+  );
+  let _ = drain_events(&mut m);
+
+  m.handle_timeout(at(12) + DEFAULT_MOVE_WINDOW);
+  let events = drain_events(&mut m);
+  let shape: Vec<(bool, Location)> = events
+    .iter()
+    .map(|e| (e.kind().is_rescan(), e.location().clone()))
+    .collect();
+  assert_eq!(
+    shape,
+    vec![(false, loc(&["a"])), (true, loc(&["a"]))],
+    "the stranded replacement resolves Removed at the vacated path, covered"
+  );
+  assert!(events[0].kind().is_removed());
+}
+
+/// Precision pin: suppression UNDER a held subtree alone (no activity at the
+/// vacated source slot) still recovers destination-only — the source-side cover is
+/// owed exclusively to source-slot touches, never to under-hold content.
+#[test]
+fn under_hold_suppression_alone_stays_destination_only() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  // A record ON the detached subtree: fenced (suppressed), dirtying the hold.
+  m.on_os_record(
+    OsRecord::new(w_a, RecordKind::Created).with_name(seg("x")),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  let rescans: Vec<&Location> = events
+    .iter()
+    .filter(|e| e.kind().is_rescan())
+    .map(|e| e.location())
+    .collect();
+  assert_eq!(
+    rescans,
+    vec![&loc(&["z"])],
+    "under-hold suppression recovers at the destination only"
+  );
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["a"])),
+    "no spurious source cover without a source-slot touch"
+  );
 }

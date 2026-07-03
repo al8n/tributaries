@@ -1,4 +1,5 @@
 use super::*;
+use crate::path::{Location, Segment};
 use core::num::NonZeroU64;
 
 fn scope_id(n: u64) -> ScopeId {
@@ -30,9 +31,24 @@ fn root_predicates_and_accessor() {
 
 #[test]
 fn subtree_predicates_and_accessor() {
-  let s = Scope::Subtree(watch_id(8));
+  let s = Scope::subtree_of(watch_id(8));
   assert!(s.is_subtree());
   assert!(!s.is_root());
-  assert_eq!(s.subtree(), Some(watch_id(8)));
   assert_eq!(s.root(), None);
+
+  let sub = s.subtree().unwrap();
+  assert_eq!(sub.watch(), watch_id(8));
+  assert!(sub.descent().is_empty());
+}
+
+#[test]
+fn subtree_with_descent_locates_a_deep_directory() {
+  let descent = Location::from_segments([Segment::new("a"), Segment::new("b")]);
+  let sub = SubtreeScope::new(watch_id(3)).with_descent(descent.clone());
+  assert_eq!(sub.watch(), watch_id(3));
+  assert_eq!(sub.descent(), &descent);
+
+  let s: Scope = sub.into();
+  assert!(s.is_subtree());
+  assert_eq!(s.subtree().unwrap().descent().len(), 2);
 }

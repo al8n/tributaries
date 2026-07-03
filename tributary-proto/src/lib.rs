@@ -71,5 +71,5 @@ pub use interest::Interest;
 pub use monitor::Monitor;
 pub use path::{Location, Segment};
 pub use record::{DirEntry, EnumerateResult, FileKind, IoClass, OsRecord, RecordKind};
-pub use scope::Scope;
+pub use scope::{Scope, SubtreeScope};
 pub use time::Instant;
