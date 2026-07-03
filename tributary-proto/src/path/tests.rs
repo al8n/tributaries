@@ -72,6 +72,24 @@ fn location_join_appends_suffix_segments() {
 }
 
 #[test]
+fn location_starts_with_is_prefix_inclusive() {
+  let root = Location::new();
+  let a = Location::from_segments([Segment::new("a")]);
+  let ab = Location::from_segments([Segment::new("a"), Segment::new("b")]);
+  let b = Location::from_segments([Segment::new("b")]);
+
+  assert!(a.starts_with(&root), "everything starts with the root");
+  assert!(a.starts_with(&a), "every location starts with itself");
+  assert!(ab.starts_with(&a));
+  assert!(
+    !a.starts_with(&ab),
+    "a prefix never starts with its extension"
+  );
+  assert!(!b.starts_with(&a));
+  assert!(root.starts_with(&root));
+}
+
+#[test]
 fn location_from_iter() {
   let loc: Location = vec![Segment::new("x"), Segment::new("y")]
     .into_iter()
