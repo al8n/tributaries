@@ -147,6 +147,10 @@ impl FakeFs {
 
   /// Injects one decoded batch through the REAL forwarding protocol (budget
   /// permit, in-order loss degrade and all).
+  ///
+  /// Event paths are the backend's wire form: '/'-separated on every host
+  /// (build them from literals, never `PathBuf::join`, whose host separator
+  /// breaks the byte-level root-prefix lowering on Windows).
   pub(crate) fn send_batch(&self, root: impl AsRef<Path>, events: Vec<RawOsEvent>) {
     let (sender, transport) = self.source_of(root);
     crate::os::fsevent::forward_batch(&transport, events, false, |msg| {
