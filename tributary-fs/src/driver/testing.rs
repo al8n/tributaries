@@ -36,7 +36,7 @@ pub(crate) struct FakeNode {
 /// state, so test injections run the production forwarding protocol.
 struct FakeSource {
   sender: async_channel::Sender<SourceMessage>,
-  transport: Arc<crate::os::fsevent::TransportState>,
+  transport: Arc<crate::os::transport::TransportState>,
 }
 
 #[derive(Default)]
@@ -135,7 +135,7 @@ impl FakeFs {
     root: impl AsRef<Path>,
   ) -> (
     async_channel::Sender<SourceMessage>,
-    Arc<crate::os::fsevent::TransportState>,
+    Arc<crate::os::transport::TransportState>,
   ) {
     let sources = self.state.sources.lock().unwrap();
     let source = sources
@@ -153,7 +153,7 @@ impl FakeFs {
   /// breaks the byte-level root-prefix lowering on Windows).
   pub(crate) fn send_batch(&self, root: impl AsRef<Path>, events: Vec<RawOsEvent>) {
     let (sender, transport) = self.source_of(root);
-    crate::os::fsevent::forward_batch(&transport, events, false, |msg| {
+    crate::os::transport::forward_batch(&transport, events, false, |msg| {
       sender.try_send(msg).is_ok()
     });
   }
@@ -162,7 +162,7 @@ impl FakeFs {
   /// the queue as an in-order `Overflow`.
   pub(crate) fn send_lossy(&self, root: impl AsRef<Path>) {
     let (sender, transport) = self.source_of(root);
-    crate::os::fsevent::forward_batch(&transport, Vec::new(), true, |msg| {
+    crate::os::transport::forward_batch(&transport, Vec::new(), true, |msg| {
       sender.try_send(msg).is_ok()
     });
   }
@@ -170,7 +170,7 @@ impl FakeFs {
   /// Injects the stream's terminal `Fatal`.
   pub(crate) fn send_fatal(&self, root: impl AsRef<Path>) {
     let (sender, transport) = self.source_of(root);
-    crate::os::fsevent::signal_fatal_once(&transport, SourceError::CallbackPanic, |msg| {
+    crate::os::transport::signal_fatal_once(&transport, SourceError::CallbackPanic, |msg| {
       sender.try_send(msg).is_ok()
     });
   }
@@ -367,7 +367,7 @@ impl FsOps for FakeFs {
     });
     self.state.spawn_order.lock().unwrap().push("meta_sealed");
     let (sender, receiver) = async_channel::unbounded();
-    let transport = Arc::new(crate::os::fsevent::TransportState::new(
+    let transport = Arc::new(crate::os::transport::TransportState::new(
       config.channel_capacity.get(),
     ));
     self

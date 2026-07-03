@@ -36,7 +36,7 @@ use tributary_proto::{
 };
 
 use crate::os::{
-  BatchPayload, FsEventFlags, RawOsEvent, RootMeta, SourceError, fsevent::BudgetPermit,
+  BatchPayload, FsEventFlags, RawOsEvent, RootMeta, SourceError, transport::BudgetPermit,
 };
 
 #[cfg(test)]
