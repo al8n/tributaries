@@ -21,8 +21,8 @@ use crate::{
   os::{RawOsEvent, RootMeta, SourceConfig, SourceError, SourceMessage},
 };
 
-/// A parked-spawn gate: the held flag plus its wakeup.
-type SpawnGate = Arc<(Mutex<bool>, Condvar)>;
+/// A parked-work gate: the held flag plus its wakeup.
+type HoldGate = Arc<(Mutex<bool>, Condvar)>;
 
 /// One fake filesystem object.
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +63,11 @@ struct FakeState {
   /// When set, `spawn_source` parks on the blocking pool until the gate
   /// releases — the close-versus-in-flight-spawn cells need a spawn that is
   /// dispatched but not yet returned.
-  spawn_hold: Mutex<Option<SpawnGate>>,
+  spawn_hold: Mutex<Option<HoldGate>>,
+  /// When set, `SourceControl::shutdown` parks until the gate releases — the
+  /// close-versus-wedged-teardown cell needs a teardown whose handle has
+  /// already moved into the call, where no Drop backstop can exist.
+  teardown_hold: Mutex<Option<HoldGate>>,
 }
 
 /// A fake platform: sources are channels the test injects into through the
@@ -199,19 +203,27 @@ impl FakeFs {
 
   /// Holds every subsequent spawn on the blocking pool until the returned
   /// gate is released.
-  pub(crate) fn hold_spawns(&self) -> SpawnRelease {
-    let gate: SpawnGate = Arc::new((Mutex::new(true), Condvar::new()));
+  pub(crate) fn hold_spawns(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
     *self.state.spawn_hold.lock().unwrap() = Some(Arc::clone(&gate));
-    SpawnRelease { gate }
+    HoldRelease { gate }
+  }
+
+  /// Holds every subsequent `shutdown` on the blocking pool until the
+  /// returned gate is released.
+  pub(crate) fn hold_teardowns(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.teardown_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
   }
 }
 
-/// Releases spawns parked by [`FakeFs::hold_spawns`].
-pub(crate) struct SpawnRelease {
-  gate: SpawnGate,
+/// Releases work parked by [`FakeFs::hold_spawns`] / [`FakeFs::hold_teardowns`].
+pub(crate) struct HoldRelease {
+  gate: HoldGate,
 }
 
-impl SpawnRelease {
+impl HoldRelease {
   pub(crate) fn release(&self) {
     let (held, cvar) = &*self.gate;
     *held.lock().unwrap() = false;
@@ -226,6 +238,17 @@ pub(crate) struct FakeHandle {
 
 impl SourceControl for FakeHandle {
   fn shutdown(mut self) {
+    // The wedge gate parks INSIDE the call, after the handle moved in —
+    // exactly the phase where no Drop backstop can exist. Drop itself never
+    // waits, or a failing test would hang its own teardown.
+    let gate = self.state.teardown_hold.lock().unwrap().clone();
+    if let Some(gate) = gate {
+      let (held, cvar) = &*gate;
+      let mut parked = held.lock().unwrap();
+      while *parked {
+        parked = cvar.wait(parked).unwrap();
+      }
+    }
     self.shut = true;
     self.state.shutdowns.fetch_add(1, Ordering::SeqCst);
   }

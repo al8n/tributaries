@@ -2046,6 +2046,149 @@ fn fileid_reuse_within_batch_is_covered() {
   );
 }
 
+/// Two present partners evidencing one fileID (a pure pair plus an ungrouped
+/// impure half) make the grant ambiguous: the Monitor would pair the cookie
+/// with whichever destination feeds first, while a single-representative
+/// cover — chosen by probe completion order — could point at the other.
+/// Ambiguity suppresses the cookie entirely, and one cover spans the source
+/// and EVERY evidenced partner.
+#[test]
+fn ambiguous_grant_partners_suppress_the_cookie_under_one_cover() {
+  let (mut core, scope) = live_core();
+  core.on_batch_events(
+    scope,
+    vec![
+      ev(
+        "/r/d/gone",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        10,
+        42,
+      ),
+      ev(
+        "/r/d/x",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        11,
+        42,
+      ),
+      // Impure word: ungrouped (no chain suppression), probe-grounded, and —
+      // when present with the event fileID its probe confirms — a second
+      // evidence entry for 42.
+      ev(
+        "/r/d/y",
+        flags(&[
+          FsEventFlags::ITEM_RENAMED,
+          FsEventFlags::ITEM_MODIFIED,
+          FsEventFlags::ITEM_IS_FILE,
+        ]),
+        12,
+        42,
+      ),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 3);
+  let by_path = |p: &str| {
+    reqs
+      .iter()
+      .find(|(_, path)| path == Path::new(p))
+      .expect("a probe per half")
+      .0
+  };
+  // Probes answer OUT of event order: completion order must not decide
+  // anything about the grant or its cover.
+  for path in ["/r/d/y", "/r/d/x"] {
+    core.on_probe_result(
+      by_path(path),
+      ProbeOutcome::Present {
+        kind: FileKind::File,
+        file_id: NonZeroU64::new(42),
+        dev: 1,
+      },
+      at(2),
+    );
+  }
+  core.on_probe_result(by_path("/r/d/gone"), ProbeOutcome::Missing, at(2));
+  let emitted_effects = drain(&mut core);
+  let emitted = emits(&emitted_effects);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "an ambiguous grant must not pair anything: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_rescan() && c.location() == &loc(&["d"])),
+    "one cover spans the source and every evidenced partner: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_removed() && c.location() == &loc(&["d", "gone"])),
+    "the vanished half degrades to its cookie-less removal: {emitted:?}"
+  );
+}
+
+/// The single-partner happy path is untouched by the ambiguity fence, and is
+/// itself completion-order independent: the partner probe answering first
+/// changes nothing about the pairing or the cover.
+#[test]
+fn single_partner_grant_is_probe_order_independent() {
+  let (mut core, scope) = live_core();
+  core.on_batch_events(
+    scope,
+    vec![
+      ev(
+        "/r/d/gone",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        10,
+        42,
+      ),
+      ev(
+        "/r/d/new",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        11,
+        42,
+      ),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2);
+  let by_path = |p: &str| {
+    reqs
+      .iter()
+      .find(|(_, path)| path == Path::new(p))
+      .expect("a probe per half")
+      .0
+  };
+  // Destination probe completes before the source's.
+  core.on_probe_result(
+    by_path("/r/d/new"),
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  core.on_probe_result(by_path("/r/d/gone"), ProbeOutcome::Missing, at(2));
+  let emitted_effects = drain(&mut core);
+  let emitted = emits(&emitted_effects);
+  assert!(
+    emitted.iter().any(|c| {
+      c.kind().moved_from() == Some(&loc(&["d", "gone"])) && c.location() == &loc(&["d", "new"])
+    }),
+    "the unambiguous pair still becomes one move: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_rescan() && c.location() == &loc(&["d"])),
+    "its cover names the actually-paired destination's ancestor: {emitted:?}"
+  );
+}
+
 /// A spawn failure never surfaces publicly: the caller got Err instead of a
 /// handle, so the Monitor's internal failure rescan for the root must not be
 /// delivered — not even through the dying retry.

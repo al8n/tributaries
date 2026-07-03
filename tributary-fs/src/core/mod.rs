@@ -165,12 +165,15 @@ struct PendingBatch {
   /// (the monotone-within-batch rule).
   deferred_unmounts: Vec<PathBuf>,
   /// fileIDs a `Present` rename probe bound to the root device in THIS batch,
-  /// each with the partner path that carried the proof — the contemporaneous
+  /// each with EVERY partner path that carried the proof — the contemporaneous
   /// evidence a vanished partner's cookie grant requires at settlement.
   /// Evidence exists only under the temporal bind: the partner's EVENT word
   /// carried the same fileID its probe observed (a probe-only fileID proves
   /// what occupies the path NOW, not what the batch's events were about).
-  evidenced: BTreeMap<NonZeroU64, PathBuf>,
+  /// All partners are kept, not a representative: a grant demands exactly one
+  /// (see [`DriverCore::grant_evidenced_cookies`]), and probe completion
+  /// order must not decide which partner a cover points at.
+  evidenced: BTreeMap<NonZeroU64, Vec<PathBuf>>,
 }
 
 /// Per-root batch parking: while a batch has probes in flight, later batches
@@ -482,7 +485,7 @@ impl DriverCore {
     let mut fed = false;
     if let Some(batch) = state.park.active.as_mut() {
       if let Some((fid, partner)) = resolved.evidences {
-        batch.evidenced.insert(fid, partner);
+        batch.evidenced.entry(fid).or_default().push(partner);
       }
       if let Some(slot) = batch.items.get_mut(resolved.item) {
         slot.planned = resolved.planned;
@@ -822,12 +825,29 @@ impl DriverCore {
       let Some((fid, path)) = item.cookie_candidate.take() else {
         continue;
       };
-      let Some(partner) = evidenced.get(&fid) else {
+      let Some(partners) = evidenced.get(&fid) else {
         continue;
       };
+      // The unambiguous-partner rule: a grant demands EXACTLY ONE evidenced
+      // partner. With two or more, the Monitor would pair the granted cookie
+      // with whichever destination feeds first while a one-partner cover
+      // could point at another — the recovery the cover exists to guarantee
+      // would miss the real destination. Ambiguity is a degrade, not an
+      // error: no cookie (the vanished half resolves as its removal, the
+      // present halves as creations) under one cover spanning the source and
+      // every evidenced partner.
+      if partners.len() != 1 {
+        covers.push(Self::covering_rescan(
+          state,
+          scope,
+          core::iter::once(&path).chain(partners.iter()),
+        ));
+        continue;
+      }
       if !device_trusted(state, &path, None) {
         continue;
       }
+      let partner = &partners[0];
       let mut granted = false;
       for planned in &mut item.planned {
         if let Planned::Rec(rec) = planned
