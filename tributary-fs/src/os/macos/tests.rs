@@ -27,8 +27,9 @@ fn unique_dir(tag: &str) -> PathBuf {
   dir.canonicalize().expect("canonicalize test dir")
 }
 
-/// Drains batches until `done` says the log suffices or the deadline passes;
-/// returns every event seen plus whether an Overflow message arrived.
+/// Drains the queue until `done` says the log suffices or the deadline
+/// passes; returns every event seen plus whether an Overflow arrived (its
+/// ack drops here, re-arming the dedup as the driver would).
 fn recv_until(
   rx: &EventReceiver,
   deadline: Duration,
@@ -39,8 +40,8 @@ fn recv_until(
   let mut overflow = false;
   while !done(&seen) && Instant::now() < end {
     match rx.try_recv() {
-      Ok(SourceMessage::Batch(events)) => seen.extend(events),
-      Ok(SourceMessage::Overflow) => overflow = true,
+      Ok(SourceMessage::Batch(payload)) => seen.extend(payload.events),
+      Ok(SourceMessage::Overflow(_ack)) => overflow = true,
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
       Err(async_channel::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
       Err(async_channel::TryRecvError::Closed) => break,
@@ -182,8 +183,7 @@ fn smoke_stream_reports_create_modify_rename_remove() {
   let dir = unique_dir("smoke");
   let mut config = SourceConfig::new(vec![dir.clone()]);
   config.latency = Duration::from_millis(20);
-  let (handle, channels) = Source::spawn(config).expect("spawn stream");
-  let rx = channels.data;
+  let (handle, rx) = Source::spawn(config).expect("spawn stream");
   assert_eq!(handle.roots(), std::slice::from_ref(&dir));
 
   let a = dir.join("a.txt");
@@ -246,19 +246,19 @@ fn smoke_stream_reports_create_modify_rename_remove() {
   fs::remove_dir_all(&dir).ok();
 }
 
-/// A full data channel must never block the dispatch queue: the batch is
-/// dropped and the loss rides the control channel as exactly one in-band
-/// `Overflow` until it is acknowledged.
+/// An exhausted batch budget must never block the dispatch queue: the batch
+/// is dropped and the loss rides the SAME queue as exactly one in-order
+/// `Overflow`, whose ack re-arms the dedup for the next loss.
 #[test]
-fn full_channel_signals_one_inband_overflow() {
+fn over_budget_batches_signal_one_inband_overflow() {
   let dir = unique_dir("overflow");
   let mut config = SourceConfig::new(vec![dir.clone()]);
   config.latency = Duration::from_millis(1);
   config.channel_capacity = NonZeroUsize::new(1).expect("nonzero");
-  let (handle, channels) = Source::spawn(config).expect("spawn stream");
+  let (handle, rx) = Source::spawn(config).expect("spawn stream");
 
   // Waves spaced past the latency window force multiple callbacks while
-  // nothing receives, so the 1-slot data channel must overflow.
+  // nothing receives, so the 1-batch budget must overflow.
   for wave in 0..10 {
     for i in 0..5 {
       fs::write(dir.join(format!("w{wave}-f{i}")), b"x").expect("churn");
@@ -266,11 +266,13 @@ fn full_channel_signals_one_inband_overflow() {
     thread::sleep(Duration::from_millis(30));
   }
 
+  // Hold the ack: while it lives, further losses are deduped onto it.
   let end = Instant::now() + DEADLINE;
-  loop {
-    match channels.control.try_recv() {
-      Ok(SourceMessage::Overflow) => break,
-      Ok(other) => panic!("unexpected control message: {other:?}"),
+  let ack = loop {
+    match rx.try_recv() {
+      Ok(SourceMessage::Overflow(ack)) => break ack,
+      Ok(SourceMessage::Batch(_)) => {}
+      Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
       Err(_) => {
         assert!(
           Instant::now() < end,
@@ -279,14 +281,22 @@ fn full_channel_signals_one_inband_overflow() {
         thread::sleep(Duration::from_millis(10));
       }
     }
+  };
+  for wave in 0..5 {
+    for i in 0..5 {
+      fs::write(dir.join(format!("held{wave}-f{i}")), b"x").expect("churn");
+    }
+    thread::sleep(Duration::from_millis(30));
   }
-  assert!(
-    channels.control.try_recv().is_err(),
-    "an unacknowledged Overflow dedups further losses"
-  );
-  // Acknowledge, drain the stale backlog, and lose again: a fresh signal.
-  handle.overflow_processed();
-  while channels.data.try_recv().is_ok() {}
+  while let Ok(msg) = rx.try_recv() {
+    assert!(
+      matches!(msg, SourceMessage::Batch(_)),
+      "an unacknowledged Overflow dedups further losses: {msg:?}"
+    );
+  }
+
+  // Acknowledge (drop the ack) and lose again: a fresh signal.
+  drop(ack);
   for wave in 0..10 {
     for i in 0..5 {
       fs::write(dir.join(format!("again{wave}-f{i}")), b"x").expect("churn");
@@ -295,9 +305,10 @@ fn full_channel_signals_one_inband_overflow() {
   }
   let end = Instant::now() + DEADLINE;
   loop {
-    match channels.control.try_recv() {
-      Ok(SourceMessage::Overflow) => break,
-      Ok(other) => panic!("unexpected control message: {other:?}"),
+    match rx.try_recv() {
+      Ok(SourceMessage::Overflow(_)) => break,
+      Ok(SourceMessage::Batch(_)) => {}
+      Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
       Err(_) => {
         assert!(
           Instant::now() < end,
@@ -323,8 +334,7 @@ fn stress_teardown_under_churn() {
   let dir = unique_dir("stress");
 
   for i in 0..iterations {
-    let (handle, channels) =
-      Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn stream");
+    let (handle, rx) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn stream");
     let stop = Arc::new(AtomicBool::new(false));
     let churn = {
       let stop = Arc::clone(&stop);
@@ -351,8 +361,8 @@ fn stress_teardown_under_churn() {
     match i % 3 {
       0 => handle.shutdown(),
       1 => {
-        // Receivers first: callbacks observe closed channels mid-flight.
-        drop(channels);
+        // Receiver first: callbacks observe the closed queue mid-flight.
+        drop(rx);
         thread::sleep(Duration::from_micros(500));
         handle.shutdown();
       }

@@ -74,28 +74,21 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
         shared.last_good.fetch_max(event.event_id, Ordering::AcqRel);
       }
     }
-    // Never block the dispatch queue: data drops on a full channel and the
-    // loss rides the unbounded control channel in-band — a control send
-    // cannot fail for capacity, so no loss can go unobserved.
-    crate::os::fsevent::forward_batch(
-      &shared.overflow_pending,
-      batch.events,
-      batch.lossy,
-      |msg| match shared.data.try_send(msg) {
-        Ok(()) => crate::os::fsevent::SendOutcome::Sent,
-        Err(async_channel::TrySendError::Full(_)) => crate::os::fsevent::SendOutcome::Full,
-        Err(async_channel::TrySendError::Closed(_)) => crate::os::fsevent::SendOutcome::Closed,
-      },
-      |msg| shared.control.try_send(msg).is_ok(),
-    );
+    // Never block the dispatch queue: an over-budget batch is dropped and the
+    // loss rides the SAME ordered queue in-band — the queue is unbounded, so
+    // a signal send cannot fail for capacity and cannot overtake the batches
+    // it postdates.
+    crate::os::fsevent::forward_batch(&shared.transport, batch.events, batch.lossy, |msg| {
+      shared.queue.try_send(msg).is_ok()
+    });
   }));
   if outcome.is_err() {
     // A decode bug must not abort the host process; poison the stream and
-    // report the death in-band. The control channel is unbounded, so the one
-    // terminal Fatal cannot be dropped for capacity.
+    // report the death in-band. The queue is unbounded, so the one terminal
+    // Fatal cannot be dropped for capacity.
     shared.poisoned.store(true, Ordering::Release);
-    crate::os::fsevent::signal_fatal_once(&shared.fatal_sent, SourceError::CallbackPanic, |msg| {
-      shared.control.try_send(msg).is_ok()
+    crate::os::fsevent::signal_fatal_once(&shared.transport, SourceError::CallbackPanic, |msg| {
+      shared.queue.try_send(msg).is_ok()
     });
   }
 }

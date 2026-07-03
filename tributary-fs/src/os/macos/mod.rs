@@ -29,29 +29,23 @@ use objc2_core_services::{
 };
 
 use super::{
-  MAX_EXCLUSIONS, ResumeToken, SourceChannels, SourceConfig, SourceError, SourceMessage,
+  EventReceiver, MAX_EXCLUSIONS, ResumeToken, SourceConfig, SourceError, fsevent::TransportState,
 };
 
 /// The state the event callback reads. Owned jointly by the [`SourceHandle`]
 /// and — via the context release hook — by the stream itself, so it outlives
 /// whichever dies last.
 pub(super) struct CallbackShared {
-  /// The callback's non-blocking data transmit end (bounded).
-  pub(super) data: async_channel::Sender<SourceMessage>,
-  /// The loss/death transmit end (unbounded — a control send cannot fail for
-  /// capacity, which is what makes loss signaling in-band and infallible).
-  pub(super) control: async_channel::Sender<SourceMessage>,
+  /// The source's single ordered queue (unbounded; the transport budget
+  /// bounds its memory).
+  pub(super) queue: async_channel::Sender<super::SourceMessage>,
+  /// The batch budget and signal dedups.
+  pub(super) transport: TransportState,
   /// Turns the callback into a no-op the moment teardown begins (belt; the
   /// on-queue Stop+Invalidate barrier is the suspenders).
   pub(super) stopped: AtomicBool,
   /// Set after a callback panic; the stream delivers nothing further.
   pub(super) poisoned: AtomicBool,
-  /// Dedup for the in-band `Overflow`: set while one rides the control
-  /// channel unacknowledged, reset by
-  /// [`overflow_processed`](SourceHandle::overflow_processed).
-  pub(super) overflow_pending: AtomicBool,
-  /// The terminal `Fatal` was sent; later panics are no-ops.
-  pub(super) fatal_sent: AtomicBool,
   /// Highest journal event id seen while in sync. Zero means none: id zero
   /// itself (the `ROOT_CHANGED` marker) is never recorded, and ids arriving
   /// with a lost-sync flag do not advance it.
@@ -78,12 +72,12 @@ pub(crate) struct Source;
 
 impl Source {
   /// Creates, schedules, and starts one FSEvents stream over
-  /// `config.roots`, delivering decoded batches (and in-band loss/death
-  /// signals) on the returned channels.
+  /// `config.roots`, delivering decoded batches and in-band loss/death
+  /// signals on the returned queue, in source order.
   ///
   /// On any partial failure the stream is invalidated and released before the
   /// error returns: a handle existing means created + scheduled + started.
-  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, SourceChannels), SourceError> {
+  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, EventReceiver), SourceError> {
     if config.roots.is_empty() {
       return Err(SourceError::NoRoots);
     }
@@ -121,15 +115,12 @@ impl Source {
       })?
       .dev() as libc::dev_t;
 
-    let (data_tx, data_rx) = async_channel::bounded(config.channel_capacity.get());
-    let (control_tx, control_rx) = async_channel::unbounded();
+    let (queue_tx, queue_rx) = async_channel::unbounded();
     let shared = Arc::new(CallbackShared {
-      data: data_tx,
-      control: control_tx,
+      queue: queue_tx,
+      transport: TransportState::new(config.channel_capacity.get()),
       stopped: AtomicBool::new(false),
       poisoned: AtomicBool::new(false),
-      overflow_pending: AtomicBool::new(false),
-      fatal_sent: AtomicBool::new(false),
       last_good: AtomicU64::new(0),
       ids_wrapped: AtomicBool::new(false),
     });
@@ -163,10 +154,7 @@ impl Source {
         roots,
         device_uuid,
       },
-      SourceChannels {
-        data: data_rx,
-        control: control_rx,
-      },
+      queue_rx,
     ))
   }
 }
@@ -215,14 +203,6 @@ pub(crate) struct SourceHandle {
 }
 
 impl SourceHandle {
-  /// Acknowledges a processed in-band `Overflow`, re-arming the dedup so the
-  /// next loss sends a fresh one. Call BEFORE acting on the overflow: a loss
-  /// racing the acknowledgement then either rides the new message or is
-  /// covered by the rescan about to run.
-  pub(crate) fn overflow_processed(&self) {
-    self.shared.overflow_pending.store(false, Ordering::Release);
-  }
-
   /// The resume point minted so far, if the journal ids are still valid.
   // Journal resume is deferred surface; minted, not yet consumed.
   #[allow(dead_code)]
