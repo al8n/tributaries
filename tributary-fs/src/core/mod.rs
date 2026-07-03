@@ -1598,6 +1598,21 @@ fn cookie_for(state: &ScopeState, file_id: Option<NonZeroU64>, dev: u64) -> Opti
 /// when the table was seeded authoritatively at spawn (an unseeded table is
 /// merely blind to already-mounted volumes, which is exactly how a foreign
 /// fileID gets promoted into a fabricated move).
+///
+/// The prefix comparison here is byte-based, and on a case-insensitive volume
+/// a spelling-aliased path could MISS a stored mount prefix — the trust-
+/// increasing direction. That miss is contained by what the table's answer
+/// may still reach: cookies never come from the table (`cookie_for` requires
+/// probe-read device evidence, and every probe carries the real device
+/// regardless of spelling); the vanished-half grant uses the table only as a
+/// VETO on top of partner probe evidence, and every grant that fires queues a
+/// covering located `Rescan`, so an evaded veto degrades to a covered
+/// mis-pair, never a silent one; event-side `mint` identity is consumed by
+/// the Monitor only through descent machinery, which a kernel-recursive
+/// backend never engages. The spellings themselves also share one origin —
+/// mount prefixes (`getfsstat`) and event paths both carry the kernel's VFS
+/// form through the same filesystem-representation transform — so an aliased
+/// miss requires the kernel reporting two spellings for one mount point.
 fn device_trusted(state: &ScopeState, path: &Path, dev: Option<u64>) -> bool {
   match (dev, state.root_dev) {
     (Some(dev), Some(root_dev)) => return dev == root_dev,
