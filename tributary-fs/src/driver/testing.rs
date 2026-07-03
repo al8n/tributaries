@@ -18,7 +18,7 @@ use tributary_proto::{FileKind, ScopeId};
 use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
 use crate::{
   core::ProbeOutcome,
-  os::{RawOsEvent, RootMeta, SourceConfig, SourceError, SourceMessage},
+  os::{RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError, SourceMessage},
 };
 
 /// A parked-work gate: the held flag plus its wakeup.
@@ -42,7 +42,11 @@ struct FakeSource {
 #[derive(Default)]
 struct FakeState {
   nodes: Mutex<HashMap<PathBuf, FakeNode>>,
-  sources: Mutex<HashMap<PathBuf, FakeSource>>,
+  /// Every source spawned for a root, oldest first. A Vec, not a slot: two
+  /// concurrent spawns of one root must not clobber each other — dropping the
+  /// earlier sender would fabricate a source death (a spurious end marker)
+  /// for a scope whose stream the driver still owns.
+  sources: Mutex<HashMap<PathBuf, Vec<FakeSource>>>,
   shutdowns: AtomicUsize,
   spawns: AtomicUsize,
   /// Mount-table refreshes served, plus the configured answer (`None` = an
@@ -128,6 +132,7 @@ impl FakeFs {
     let sources = self.state.sources.lock().unwrap();
     let source = sources
       .get(root.as_ref())
+      .and_then(|spawned| spawned.last())
       .expect("a source was spawned for the root");
     (source.sender.clone(), Arc::clone(&source.transport))
   }
@@ -309,11 +314,38 @@ impl FsOps for FakeFs {
     // The pre-start barrier, mirrored from the real backend: the metadata is
     // sealed strictly before the source becomes injectable (`stream_live`),
     // and the mount seed claims no authority (the driver's birth refresh
-    // installs it).
+    // installs it). Identity aliasing is driven through `put`: two paths
+    // sharing one `(dev, ino)` ARE one object, exactly like case-aliased
+    // spellings on a real insensitive volume; an ancestor put with a live
+    // root's identity exercises the containment cells. A final root the test
+    // never put gets a synthetic identity that can collide with nothing.
+    let identity = {
+      let nodes = self.state.nodes.lock().unwrap();
+      nodes
+        .get(&root)
+        .map(|node| RootIdentity::new(node.dev, node.ino))
+        .unwrap_or_else(|| {
+          RootIdentity::new(
+            u64::MAX,
+            self.state.spawns.load(Ordering::SeqCst) as u64 + 1,
+          )
+        })
+    };
+    let ancestors = {
+      let nodes = self.state.nodes.lock().unwrap();
+      root
+        .ancestors()
+        .skip(1)
+        .filter_map(|ancestor| nodes.get(ancestor))
+        .map(|node| RootIdentity::new(node.dev, node.ino))
+        .collect()
+    };
     let meta = RootMeta {
       root: root.clone(),
       root_dev: self.root_dev,
       mounts: self.state.spawn_mounts.lock().unwrap().clone(),
+      identity,
+      ancestors,
     };
     self.state.spawn_order.lock().unwrap().push("meta_sealed");
     let (sender, receiver) = async_channel::unbounded();
@@ -325,7 +357,9 @@ impl FsOps for FakeFs {
       .sources
       .lock()
       .unwrap()
-      .insert(root, FakeSource { sender, transport });
+      .entry(root)
+      .or_default()
+      .push(FakeSource { sender, transport });
     self.state.spawn_order.lock().unwrap().push("stream_live");
     self.state.spawns.fetch_add(1, Ordering::SeqCst);
     Ok(SpawnedSource {
@@ -365,11 +399,24 @@ impl FsOps for FakeFs {
 pub(crate) struct NullRegistry;
 
 impl ScopeRegistry for NullRegistry {
-  fn scope_live(&self, _scope: ScopeId, _root: &Path) {}
+  fn scope_live(
+    &self,
+    _scope: ScopeId,
+    _root: &Path,
+    _identity: RootIdentity,
+    _ancestors: &[RootIdentity],
+  ) {
+  }
 
   fn scope_dead(&self, _scope: ScopeId) {}
 
-  fn final_root_conflict(&self, _final_root: &Path, _reserved: Option<&Path>) -> Option<PathBuf> {
+  fn final_root_conflict(
+    &self,
+    _final_root: &Path,
+    _identity: RootIdentity,
+    _ancestors: &[RootIdentity],
+    _reserved: Option<&Path>,
+  ) -> Option<PathBuf> {
     None
   }
 }
@@ -394,7 +441,13 @@ impl RecordingRegistry {
 }
 
 impl ScopeRegistry for RecordingRegistry {
-  fn scope_live(&self, scope: ScopeId, root: &Path) {
+  fn scope_live(
+    &self,
+    scope: ScopeId,
+    root: &Path,
+    _identity: RootIdentity,
+    _ancestors: &[RootIdentity],
+  ) {
     self
       .state
       .lock()
@@ -407,7 +460,13 @@ impl ScopeRegistry for RecordingRegistry {
     self.state.lock().unwrap().1.push(scope);
   }
 
-  fn final_root_conflict(&self, _final_root: &Path, _reserved: Option<&Path>) -> Option<PathBuf> {
+  fn final_root_conflict(
+    &self,
+    _final_root: &Path,
+    _identity: RootIdentity,
+    _ancestors: &[RootIdentity],
+    _reserved: Option<&Path>,
+  ) -> Option<PathBuf> {
     None
   }
 }

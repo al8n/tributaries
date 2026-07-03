@@ -24,7 +24,9 @@ fn pending_of(watcher: &Watcher<TokioRuntime>) -> Vec<PathBuf> {
     .read()
     .unwrap_or_else(PoisonError::into_inner)
     .pending
-    .clone()
+    .iter()
+    .map(|reserved| reserved.path.clone())
+    .collect()
 }
 
 /// A real directory to canonicalize against (watch() stats its root before
@@ -116,6 +118,44 @@ async fn foreign_handle_is_rejected_without_touching_the_victim() {
     "a foreign handle must not reach the victim's driver"
   );
   assert_eq!(victim.root_path(foreign), None);
+}
+
+/// Reservation-time identity: two spellings of one object collide at `take`
+/// (the first reserver wins deterministically), a live entry blocks an
+/// aliased reservation the same way, and an unknown identity still passes
+/// disjoint bytes — the driver's final check is the authority then.
+#[test]
+fn reservations_collide_on_object_identity() {
+  use crate::os::RootIdentity;
+  let roots = Arc::new(RwLock::new(RootSet::default()));
+  let id = RootIdentity::new(1, 42);
+  let first =
+    Reservation::take(&roots, PathBuf::from("/spelling/One"), Some(id)).expect("first spelling");
+  let err = Reservation::take(&roots, PathBuf::from("/spelling/one"), Some(id))
+    .expect_err("one object, two spellings");
+  assert!(
+    matches!(err, WatchRootError::Overlaps { existing, .. } if existing.as_path() == Path::new("/spelling/One"))
+  );
+  drop(first);
+
+  roots
+    .write()
+    .unwrap_or_else(PoisonError::into_inner)
+    .entries
+    .insert(
+      ScopeId::new(1.try_into().unwrap()),
+      RootEntry {
+        path: Arc::new(PathBuf::from("/live/Root")),
+        identity: id,
+        ancestors: Vec::new().into(),
+      },
+    );
+  let err = Reservation::take(&roots, PathBuf::from("/live/root"), Some(id))
+    .expect_err("aliases a live root");
+  assert!(
+    matches!(err, WatchRootError::Overlaps { existing, .. } if existing.as_path() == Path::new("/live/Root"))
+  );
+  assert!(Reservation::take(&roots, PathBuf::from("/elsewhere"), None).is_ok());
 }
 
 /// Same-watcher handles for scopes the registry does not know answer `None`
@@ -295,10 +335,15 @@ mod lifecycle {
         }
         // The future drops here — cancellation mid-await.
       }
-      settle(|| fs.spawns() == fs.shutdowns() && watcher.registry_len() == 0).await;
+      // Wait for the cancelled pipeline to have RUN, not merely for balanced
+      // counters: `spawns == shutdowns` is vacuously true at 0 == 0 before
+      // the driver even receives the command, and a fresh watch admitted that
+      // early races the cancelled scope's spawn of the same root.
+      settle(|| fs.spawns() == 1 && fs.shutdowns() == 1 && watcher.registry_len() == 0).await;
+      assert_eq!(fs.spawns(), 1, "the cancelled watch's stream spawned");
       assert_eq!(
-        fs.spawns(),
         fs.shutdowns(),
+        1,
         "no orphan stream survives a cancelled watch (wait_for_grant={wait_for_grant})"
       );
       assert_eq!(watcher.registry_len(), 0);
@@ -354,6 +399,136 @@ mod lifecycle {
       watcher.root_path(victim).as_deref(),
       Some(canon_a.as_path())
     );
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+  }
+
+  /// Two spellings of ONE object (the fake gives two paths one `(dev, ino)`,
+  /// exactly a case alias on an insensitive volume): every byte comparison
+  /// passes, and the driver's identity check still collides them — the
+  /// rejected stream is torn down and the victim is untouched.
+  #[tokio::test(start_paused = true)]
+  async fn aliased_final_roots_collide_by_identity() {
+    let (dir_a, canon_a) = scratch("alias-victim");
+    let (dir_b, canon_b) = scratch("alias-imposter");
+    let fs = FakeFs::new(1);
+    fs.put(&canon_a, FileKind::Dir, 10);
+    fs.put(&canon_b, FileKind::Dir, 10);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let victim = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+    let err = watcher
+      .watch(&dir_b, Interest::all())
+      .await
+      .expect_err("one object, two spellings");
+    match err {
+      WatchRootError::Overlaps { existing, .. } => assert_eq!(existing, canon_a),
+      other => panic!("expected Overlaps, got {other:?}"),
+    }
+    settle(|| fs.shutdowns() == fs.spawns() - 1).await;
+    assert_eq!(watcher.registry_len(), 1);
+    assert_eq!(
+      watcher.root_path(victim).as_deref(),
+      Some(canon_a.as_path())
+    );
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+  }
+
+  /// New-inside-existing across spellings: the new root's ancestor chain
+  /// carries the live root's identity (its parent IS the live root, however
+  /// spelled), so containment collides where bytes cannot.
+  #[tokio::test(start_paused = true)]
+  async fn aliased_ancestor_makes_the_new_root_nested() {
+    let (dir_a, canon_a) = scratch("contain-victim");
+    let (base, canon_base) = scratch("contain-base");
+    let sub = base.join("sub");
+    std::fs::create_dir_all(&sub).expect("create nested dir");
+    let canon_sub = std::fs::canonicalize(&sub).expect("canonicalize");
+    let fs = FakeFs::new(1);
+    fs.put(&canon_a, FileKind::Dir, 20);
+    fs.put(&canon_sub, FileKind::Dir, 21);
+    // The nested root's parent shares the live root's identity — an alias.
+    fs.put(&canon_base, FileKind::Dir, 20);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let _victim = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+    let err = watcher
+      .watch(&sub, Interest::all())
+      .await
+      .expect_err("nested under an alias of the live root");
+    match err {
+      WatchRootError::Overlaps { existing, .. } => assert_eq!(existing, canon_a),
+      other => panic!("expected Overlaps, got {other:?}"),
+    }
+    assert_eq!(watcher.registry_len(), 1);
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// Existing-inside-new across spellings: the new root's identity appears in
+  /// a live root's ancestor chain — the new root CONTAINS the live one under
+  /// a different spelling.
+  #[tokio::test(start_paused = true)]
+  async fn aliased_new_root_contains_a_live_root() {
+    let (base, canon_base) = scratch("outer-base");
+    let sub = base.join("sub");
+    std::fs::create_dir_all(&sub).expect("create nested dir");
+    let canon_sub = std::fs::canonicalize(&sub).expect("canonicalize");
+    let (dir_x, canon_x) = scratch("outer-imposter");
+    let fs = FakeFs::new(1);
+    fs.put(&canon_base, FileKind::Dir, 30);
+    fs.put(&canon_sub, FileKind::Dir, 31);
+    // The newcomer shares the live root's PARENT identity — it contains it.
+    fs.put(&canon_x, FileKind::Dir, 30);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let _victim = watcher.watch(&sub, Interest::all()).await.expect("watch");
+    let err = watcher
+      .watch(&dir_x, Interest::all())
+      .await
+      .expect_err("contains the live root under an alias");
+    match err {
+      WatchRootError::Overlaps { existing, .. } => assert_eq!(existing, canon_sub),
+      other => panic!("expected Overlaps, got {other:?}"),
+    }
+    assert_eq!(watcher.registry_len(), 1);
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&dir_x);
+  }
+
+  /// Distinct identities under disjoint bytes stay admitted — the negative
+  /// control for every identity cell above.
+  #[tokio::test(start_paused = true)]
+  async fn distinct_identities_stay_disjoint() {
+    let (dir_a, canon_a) = scratch("distinct-a");
+    let (dir_b, canon_b) = scratch("distinct-b");
+    let fs = FakeFs::new(1);
+    fs.put(&canon_a, FileKind::Dir, 40);
+    fs.put(&canon_b, FileKind::Dir, 41);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let _a = watcher
+      .watch(&dir_a, Interest::all())
+      .await
+      .expect("watch a");
+    let _b = watcher
+      .watch(&dir_b, Interest::all())
+      .await
+      .expect("watch b");
+    assert_eq!(watcher.registry_len(), 2);
 
     watcher.close().await.expect("close");
     let _ = std::fs::remove_dir_all(&dir_a);

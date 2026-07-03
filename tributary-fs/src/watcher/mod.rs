@@ -21,7 +21,7 @@ use crate::{
   error::{BuildError, CloseError, UnwatchError, WatchRootError},
   event::Event,
   options::WatcherOptions,
-  os::SourceError,
+  os::{RootIdentity, SourceError},
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -62,6 +62,24 @@ impl RootHandle {
   }
 }
 
+/// One live root's registry record: its canonical path plus the object
+/// identities disjointness is decided on (the root's own and every strict
+/// ancestor's), captured at the spawn barrier.
+#[derive(Debug)]
+struct RootEntry {
+  path: Arc<PathBuf>,
+  identity: RootIdentity,
+  ancestors: Arc<[RootIdentity]>,
+}
+
+/// One in-flight `watch`'s reservation record: the watcher-side canonical
+/// path plus the identity its pre-flight stat observed (`None` off-unix).
+#[derive(Debug)]
+struct PendingRoot {
+  path: PathBuf,
+  identity: Option<RootIdentity>,
+}
+
 /// The watcher-side registry of live roots, keyed by scope. Entries exist
 /// exactly while their root is watched: every scope end (unwatch, root death,
 /// stream fatal, close) removes its entry, so the registry is bounded by the
@@ -74,23 +92,39 @@ impl RootHandle {
 /// (and owns the `pending` reservations, which no one else writes).
 #[derive(Debug, Default)]
 struct RootSet {
-  entries: BTreeMap<ScopeId, Arc<PathBuf>>,
+  entries: BTreeMap<ScopeId, RootEntry>,
   /// Roots with a `watch` in flight, reserved so two concurrent overlapping
   /// `watch` calls cannot both pass the disjointness check.
-  pending: Vec<PathBuf>,
+  pending: Vec<PendingRoot>,
 }
 
 impl RootSet {
   /// The already-covered root (live or pending) that overlaps `candidate`, if
-  /// any. Two roots overlap when either contains the other.
-  fn overlap_of(&self, candidate: &Path) -> Option<PathBuf> {
+  /// any. Two roots overlap when either contains the other by bytes — or when
+  /// they are one object under two spellings (`identity` equality), which
+  /// byte comparison cannot see on case- or normalization-insensitive
+  /// volumes. Ancestor containment across spellings needs the candidate's
+  /// ancestor identities, which only the spawn barrier reads: the driver's
+  /// [`ScopeRegistry::final_root_conflict`] settles those before anything
+  /// goes live.
+  fn overlap_of(&self, candidate: &Path, identity: Option<RootIdentity>) -> Option<PathBuf> {
+    let live = self.entries.values().find(|entry| {
+      candidate.starts_with(entry.path.as_path())
+        || entry.path.starts_with(candidate)
+        || Some(entry.identity) == identity
+    });
+    if let Some(entry) = live {
+      return Some(entry.path.as_ref().clone());
+    }
     self
-      .entries
-      .values()
-      .map(|path| path.as_path())
-      .chain(self.pending.iter().map(PathBuf::as_path))
-      .find(|existing| candidate.starts_with(existing) || existing.starts_with(candidate))
-      .map(Path::to_path_buf)
+      .pending
+      .iter()
+      .find(|reserved| {
+        candidate.starts_with(&reserved.path)
+          || reserved.path.starts_with(candidate)
+          || (identity.is_some() && reserved.identity == identity)
+      })
+      .map(|reserved| reserved.path.clone())
   }
 }
 
@@ -101,9 +135,22 @@ struct RegistryWriter {
 }
 
 impl ScopeRegistry for RegistryWriter {
-  fn scope_live(&self, scope: ScopeId, root: &Path) {
+  fn scope_live(
+    &self,
+    scope: ScopeId,
+    root: &Path,
+    identity: RootIdentity,
+    ancestors: &[RootIdentity],
+  ) {
     let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-    set.entries.insert(scope, Arc::new(root.to_path_buf()));
+    set.entries.insert(
+      scope,
+      RootEntry {
+        path: Arc::new(root.to_path_buf()),
+        identity,
+        ancestors: ancestors.into(),
+      },
+    );
   }
 
   fn scope_dead(&self, scope: ScopeId) {
@@ -111,24 +158,37 @@ impl ScopeRegistry for RegistryWriter {
     set.entries.remove(&scope);
   }
 
-  fn final_root_conflict(&self, final_root: &Path, reserved: Option<&Path>) -> Option<PathBuf> {
+  fn final_root_conflict(
+    &self,
+    final_root: &Path,
+    identity: RootIdentity,
+    ancestors: &[RootIdentity],
+    reserved: Option<&Path>,
+  ) -> Option<PathBuf> {
     let set = self.roots.read().unwrap_or_else(PoisonError::into_inner);
+    let live = set.entries.values().find(|entry| {
+      final_root.starts_with(entry.path.as_path())
+        || entry.path.starts_with(final_root)
+        || entry.identity == identity
+        || ancestors.contains(&entry.identity)
+        || entry.ancestors.contains(&identity)
+    });
+    if let Some(entry) = live {
+      return Some(entry.path.as_ref().clone());
+    }
     set
-      .entries
-      .values()
-      .map(|path| path.as_path())
-      .chain(
-        set
-          .pending
-          .iter()
-          .map(PathBuf::as_path)
-          // A reservation holds at most one entry per path (an overlapping
-          // second take is rejected), so skipping by equality skips exactly
-          // the checking watch's own.
-          .filter(|path| Some(*path) != reserved),
-      )
-      .find(|existing| final_root.starts_with(existing) || existing.starts_with(final_root))
-      .map(Path::to_path_buf)
+      .pending
+      .iter()
+      // A reservation holds at most one entry per path (an overlapping
+      // second take is rejected), so skipping by equality skips exactly
+      // the checking watch's own.
+      .filter(|pending| Some(pending.path.as_path()) != reserved)
+      .find(|pending| {
+        final_root.starts_with(&pending.path)
+          || pending.path.starts_with(final_root)
+          || pending.identity == Some(identity)
+      })
+      .map(|pending| pending.path.clone())
   }
 }
 
@@ -143,19 +203,30 @@ impl ScopeRegistry for RegistryWriter {
 /// re-canonicalizes during spawn — the driver's final-root check
 /// ([`ScopeRegistry::final_root_conflict`]) is the authority on what actually
 /// goes live.
+#[derive(Debug)]
 struct Reservation {
   roots: Arc<RwLock<RootSet>>,
   path: PathBuf,
 }
 
 impl Reservation {
-  /// Reserves `path`, or reports the covering root when it overlaps.
-  fn take(roots: &Arc<RwLock<RootSet>>, path: PathBuf) -> Result<Self, WatchRootError> {
+  /// Reserves `path`, or reports the covering root when it overlaps. The
+  /// pre-flight identity lets two concurrent spelling-aliased `watch` calls
+  /// collide right here — the first reserver wins deterministically — instead
+  /// of both spending a spawn to lose at the driver's final check.
+  fn take(
+    roots: &Arc<RwLock<RootSet>>,
+    path: PathBuf,
+    identity: Option<RootIdentity>,
+  ) -> Result<Self, WatchRootError> {
     let mut set = roots.write().unwrap_or_else(PoisonError::into_inner);
-    if let Some(existing) = set.overlap_of(&path) {
+    if let Some(existing) = set.overlap_of(&path, identity) {
       return Err(WatchRootError::Overlaps { path, existing });
     }
-    set.pending.push(path.clone());
+    set.pending.push(PendingRoot {
+      path: path.clone(),
+      identity,
+    });
     drop(set);
     Ok(Self {
       roots: Arc::clone(roots),
@@ -171,7 +242,7 @@ impl Drop for Reservation {
       .write()
       .unwrap_or_else(PoisonError::into_inner)
       .pending
-      .retain(|pending| pending != &self.path);
+      .retain(|pending| pending.path != self.path);
   }
 }
 
@@ -334,12 +405,11 @@ impl<R: RuntimeLite> Watcher<R> {
         })
       }
     })?;
-    let is_dir = std::fs::metadata(&canonical)
-      .map(|meta| meta.is_dir())
-      .unwrap_or(false);
-    if !is_dir {
+    let meta = std::fs::metadata(&canonical).ok();
+    if !meta.as_ref().is_some_and(|meta| meta.is_dir()) {
       return Err(WatchRootError::NotADirectory { path: canonical });
     }
+    let identity = meta.as_ref().and_then(identity_of);
 
     // Reserve the root before the round-trip so a concurrent overlapping
     // `watch` cannot also pass the disjointness check. The guard's Drop
@@ -348,7 +418,7 @@ impl<R: RuntimeLite> Watcher<R> {
     // cancellation on either side of the reply: a reply finding no receiver
     // is torn down by the driver directly, and a delivered-but-never-polled
     // reply unwinds through its `WatchGrant`.
-    let reservation = Reservation::take(&self.roots, canonical.clone())?;
+    let reservation = Reservation::take(&self.roots, canonical.clone(), identity)?;
 
     let (reply, response) = futures_channel::oneshot::channel();
     let sent = self
@@ -458,7 +528,7 @@ impl<R: RuntimeLite> Watcher<R> {
       .unwrap_or_else(PoisonError::into_inner)
       .entries
       .get(&root.scope())
-      .map(|path| path.as_ref().clone())
+      .map(|entry| entry.path.as_ref().clone())
   }
 
   /// The number of registry entries — live roots only, by construction.
@@ -518,6 +588,21 @@ impl<R: RuntimeLite> Watcher<R> {
   /// assemble.
   fn assemble(&self, scope: ScopeId, root_path: &Path, change: &Change) -> Event {
     Event::from_change(RootHandle::new(self.instance, scope), root_path, change)
+  }
+}
+
+/// The stat-read object identity of a root, deciding disjointness where byte
+/// forms cannot (spelling aliases on case-insensitive volumes).
+fn identity_of(meta: &std::fs::Metadata) -> Option<RootIdentity> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    Some(RootIdentity::new(meta.dev(), meta.ino()))
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = meta;
+    None
   }
 }
 

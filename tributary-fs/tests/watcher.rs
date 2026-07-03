@@ -147,6 +147,98 @@ async fn overlapping_roots_are_rejected() {
   let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The last component with its ASCII case swapped — a second spelling of the
+/// SAME object on the default case-insensitive APFS. `None` when the volume
+/// is case-sensitive (the spellings are then genuinely different names, and
+/// identity-based disjointness has nothing to prove).
+fn case_alias_of(path: &Path) -> Option<PathBuf> {
+  use std::os::unix::fs::MetadataExt;
+  let name = path.file_name()?.to_str()?;
+  let swapped: String = name
+    .chars()
+    .map(|c| {
+      if c.is_ascii_lowercase() {
+        c.to_ascii_uppercase()
+      } else {
+        c.to_ascii_lowercase()
+      }
+    })
+    .collect();
+  if swapped == name {
+    return None;
+  }
+  let alias = path.with_file_name(swapped);
+  let original = std::fs::metadata(path).ok()?;
+  let aliased = std::fs::metadata(&alias).ok()?;
+  ((original.dev(), original.ino()) == (aliased.dev(), aliased.ino())).then_some(alias)
+}
+
+/// Root disjointness is decided by object identity, so a case-swapped
+/// spelling of a watched root — or a path nested through one — is rejected
+/// exactly like the canonical spelling, while a genuinely distinct sibling is
+/// admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn case_aliased_roots_are_rejected_on_insensitive_volumes() {
+  let root = scratch_root("caseal");
+  let Some(alias) = case_alias_of(&root) else {
+    eprintln!("skipping: the volume is case-sensitive");
+    return;
+  };
+  std::fs::create_dir_all(root.join("sub")).expect("create subdir");
+
+  let w = watcher();
+  let _held = w
+    .watch(&root, Interest::all())
+    .await
+    .expect("watch original");
+
+  let err = w
+    .watch(&alias, Interest::all())
+    .await
+    .expect_err("one subtree, two spellings");
+  assert!(err.is_overlaps(), "got {err:?}");
+
+  let err = w
+    .watch(alias.join("sub"), Interest::all())
+    .await
+    .expect_err("nested through the aliased spelling");
+  assert!(err.is_overlaps(), "got {err:?}");
+
+  let sibling = scratch_root("caseal-sib");
+  let _distinct = w
+    .watch(&sibling, Interest::all())
+    .await
+    .expect("a distinct sibling is admitted");
+
+  let _ = std::fs::remove_dir_all(&root);
+  let _ = std::fs::remove_dir_all(&sibling);
+}
+
+/// Two concurrent watches of one object under different spellings admit
+/// exactly one winner (the reservation-time identity makes the collision
+/// deterministic).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_case_aliased_watches_admit_exactly_one() {
+  let root = scratch_root("caserace");
+  let Some(alias) = case_alias_of(&root) else {
+    eprintln!("skipping: the volume is case-sensitive");
+    return;
+  };
+
+  let w = watcher();
+  let (a, b) = tokio::join!(
+    w.watch(&root, Interest::all()),
+    w.watch(&alias, Interest::all())
+  );
+  assert_eq!(
+    u8::from(a.is_ok()) + u8::from(b.is_ok()),
+    1,
+    "exactly one spelling wins: {a:?} / {b:?}"
+  );
+
+  let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_and_non_directory_roots_are_rejected() {
   let root = scratch_root("badroots");

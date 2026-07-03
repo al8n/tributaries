@@ -64,6 +64,8 @@ fn live_core() -> (DriverCore, ScopeId) {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(1, 1),
+      ancestors: Vec::new(),
     }),
   );
   let effects = drain(&mut core);
@@ -89,6 +91,8 @@ fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(1, 1),
+      ancestors: Vec::new(),
     }),
   );
   let _ = drain(&mut core);
@@ -1339,6 +1343,8 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: vec![PathBuf::from("/r/vol")],
+      identity: crate::os::RootIdentity::new(1, 1),
+      ancestors: Vec::new(),
     }),
   );
   let _ = drain(&mut core);
@@ -1373,6 +1379,8 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(1, 1),
+      ancestors: Vec::new(),
     }),
   );
   assert_eq!(
@@ -1453,6 +1461,8 @@ fn a_loss_racing_the_birth_refresh_rearms_it_once() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(1, 1),
+      ancestors: Vec::new(),
     }),
   );
   assert_eq!(
@@ -1795,6 +1805,8 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: vec![PathBuf::from("/r/vol")],
+      identity: crate::os::RootIdentity::new(1, 1),
+      ancestors: Vec::new(),
     }),
   );
   let _ = drain(&mut core);
@@ -2323,6 +2335,8 @@ mod lowering {
         root: PathBuf::from("/"),
         root_dev: 1,
         mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
       }),
     );
     let _ = drain(&mut core);
