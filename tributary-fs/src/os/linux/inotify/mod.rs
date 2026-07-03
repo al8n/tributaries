@@ -1,10 +1,10 @@
-//! The inotify backend's pure half: wire decode and `wd` attribution.
-//!
-//! Everything here runs on every host and under miri — the fd, the reader
-//! thread, and the syscalls arrive with the Source layer, which consumes
-//! these tables.
+//! The inotify backend: pure wire decode and `wd` attribution (run on every
+//! host and under miri), plus the reader thread that owns the per-root fd
+//! (Linux, non-miri only).
 
 pub(crate) mod decode;
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) mod reader;
 pub(crate) mod table;
 
 #[cfg(test)]

@@ -764,6 +764,10 @@ fn clone_error(err: &SourceError) -> SourceError {
     },
     SourceError::ExclusionRejected => SourceError::ExclusionRejected,
     SourceError::CreateFailed => SourceError::CreateFailed,
+    SourceError::InstanceLimit => SourceError::InstanceLimit,
+    SourceError::ReadFailed { source } => SourceError::ReadFailed {
+      source: std::io::Error::new(source.kind(), source.kind().to_string()),
+    },
     SourceError::StartFailed => SourceError::StartFailed,
     SourceError::CallbackPanic => SourceError::CallbackPanic,
   }

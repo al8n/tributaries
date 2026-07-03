@@ -197,6 +197,18 @@ pub enum SourceError {
   /// The OS could not create the event stream.
   #[error("the OS could not create the event stream")]
   CreateFailed,
+  /// The per-user watch-instance ceiling was hit (`EMFILE`: the process fd
+  /// limit or `fs.inotify.max_user_instances` — one instance per root is the
+  /// overflow-isolation trade).
+  #[error("the per-user watch-instance limit was reached")]
+  InstanceLimit,
+  /// The stream's read loop failed; the stream is dead.
+  #[error("reading the event stream failed")]
+  ReadFailed {
+    /// The underlying read failure.
+    #[source]
+    source: io::Error,
+  },
   /// The OS could not start the event stream.
   #[error("the OS could not start the event stream")]
   StartFailed,
