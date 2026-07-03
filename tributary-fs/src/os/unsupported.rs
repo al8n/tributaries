@@ -4,14 +4,18 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{EventReceiver, ResumeToken, SourceConfig, SourceError};
+use super::{EventReceiver, ResumeToken, RootMeta, SourceConfig, SourceError};
 
 /// The spawn entry point of the stub backend.
 pub(crate) struct Source;
 
 impl Source {
-  /// Always fails: there is nothing to watch with on this platform.
-  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, EventReceiver), SourceError> {
+  /// Always fails: there is nothing to watch with on this platform. The
+  /// signature still carries the [`RootMeta`] contract — a spawn finalizes
+  /// its root metadata before the stream can enqueue its first event.
+  pub(crate) fn spawn(
+    config: SourceConfig,
+  ) -> Result<(SourceHandle, EventReceiver, RootMeta), SourceError> {
     let _ = config;
     Err(SourceError::Unsupported)
   }
@@ -37,11 +41,6 @@ impl SourceHandle {
   // Journal resume is deferred surface; minted, not yet consumed.
   #[allow(dead_code)]
   pub(crate) fn resume_token(&self) -> Option<ResumeToken> {
-    match *self {}
-  }
-
-  /// The canonicalized roots the stream watches.
-  pub(crate) fn roots(&self) -> &[PathBuf] {
     match *self {}
   }
 }

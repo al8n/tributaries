@@ -183,8 +183,12 @@ fn smoke_stream_reports_create_modify_rename_remove() {
   let dir = unique_dir("smoke");
   let mut config = SourceConfig::new(vec![dir.clone()]);
   config.latency = Duration::from_millis(20);
-  let (handle, rx) = Source::spawn(config).expect("spawn stream");
-  assert_eq!(handle.roots(), std::slice::from_ref(&dir));
+  let (handle, rx, meta) = Source::spawn(config).expect("spawn stream");
+  assert!(
+    meta.mounts_authoritative,
+    "the live mount table seeds the meta"
+  );
+  assert_eq!(meta.root, dir, "the meta carries the canonical root");
 
   let a = dir.join("a.txt");
   fs::write(&a, b"one").expect("create a");
@@ -255,7 +259,11 @@ fn over_budget_batches_signal_one_inband_overflow() {
   let mut config = SourceConfig::new(vec![dir.clone()]);
   config.latency = Duration::from_millis(1);
   config.channel_capacity = NonZeroUsize::new(1).expect("nonzero");
-  let (handle, rx) = Source::spawn(config).expect("spawn stream");
+  let (handle, rx, meta) = Source::spawn(config).expect("spawn stream");
+  assert!(
+    meta.mounts_authoritative,
+    "the live mount table seeds the meta"
+  );
 
   // Waves spaced past the latency window force multiple callbacks while
   // nothing receives, so the 1-batch budget must overflow.
@@ -334,7 +342,8 @@ fn stress_teardown_under_churn() {
   let dir = unique_dir("stress");
 
   for i in 0..iterations {
-    let (handle, rx) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn stream");
+    let (handle, rx, _meta) =
+      Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn stream");
     let stop = Arc::new(AtomicBool::new(false));
     let churn = {
       let stop = Arc::clone(&stop);
