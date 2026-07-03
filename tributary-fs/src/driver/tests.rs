@@ -32,6 +32,10 @@ struct FakeState {
   /// re-arm protocol runs.
   acks: Mutex<std::collections::HashMap<PathBuf, Arc<AtomicUsize>>>,
   shutdowns: AtomicUsize,
+  /// Mount-table refreshes served, plus the configured answer (`None` = an
+  /// authoritative empty table).
+  refreshes: AtomicUsize,
+  refresh_answer: Mutex<Option<(Vec<PathBuf>, bool)>>,
 }
 
 /// A fake platform: sources are channel pairs the test injects into, probes
@@ -83,6 +87,10 @@ impl FakeFs {
 
   fn shutdowns(&self) -> usize {
     self.state.shutdowns.load(Ordering::SeqCst)
+  }
+
+  fn refreshes(&self) -> usize {
+    self.state.refreshes.load(Ordering::SeqCst)
   }
 
   /// The control-channel injection end of `root`'s source.
@@ -191,6 +199,17 @@ impl FsOps for FakeFs {
       None => ProbeOutcome::Missing,
     }
   }
+
+  fn refresh_mounts(&self, _root: &Path) -> (Vec<PathBuf>, bool) {
+    self.state.refreshes.fetch_add(1, Ordering::SeqCst);
+    self
+      .state
+      .refresh_answer
+      .lock()
+      .unwrap()
+      .clone()
+      .unwrap_or((Vec::new(), true))
+  }
 }
 
 struct Rig {
@@ -292,12 +311,14 @@ async fn watch_spawns_a_stream_and_events_flow() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cross_batch_rename_pairs_through_probes() {
+async fn cross_batch_rename_degrades_to_remove_plus_create() {
   let rig = rig_with_capacity(64);
   let _scope = watch(&rig, "/r").await;
   let tap = rig.fs.tap("/r");
 
-  // Source half: the path is already gone.
+  // Source half: the path is already gone. A vanished path has no
+  // contemporaneous device evidence and no same-batch partner, so it never
+  // mints a cookie — the documented cross-batch pairing cost.
   rig.fs.remove("/r/a/old");
   tap
     .send(SourceMessage::Batch(vec![ev(
@@ -308,7 +329,12 @@ async fn cross_batch_rename_pairs_through_probes() {
     )]))
     .await
     .unwrap();
-  // Destination half in a later batch: the path exists.
+  let (_, change) = next_event(&rig).await;
+  assert!(change.kind().is_removed());
+  assert_eq!(change.location(), &loc(&["a", "old"]));
+
+  // Destination half in a later batch: the path exists, finds no pending
+  // source, and arrives as a fresh object.
   rig.fs.put("/r/b/new", FileKind::File, 42);
   tap
     .send(SourceMessage::Batch(vec![ev(
@@ -319,9 +345,8 @@ async fn cross_batch_rename_pairs_through_probes() {
     )]))
     .await
     .unwrap();
-
   let (_, change) = next_event(&rig).await;
-  assert_eq!(change.kind().moved_from(), Some(&loc(&["a", "old"])));
+  assert!(change.kind().is_created());
   assert_eq!(change.location(), &loc(&["b", "new"]));
 }
 
@@ -342,7 +367,7 @@ async fn unpaired_source_half_expires_to_removed() {
     .await
     .unwrap();
 
-  // Paused time auto-advances through the pairing window to the timer.
+  // No cookie, no pairing window: the vanished half resolves immediately.
   let (_, change) = next_event(&rig).await;
   assert!(change.kind().is_removed());
   assert_eq!(change.location(), &loc(&["a", "left"]));
@@ -756,4 +781,45 @@ async fn fatal_discards_queued_data() {
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
   assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
+}
+
+#[tokio::test(start_paused = true)]
+async fn overflow_refreshes_mount_trust_and_pairing_resumes() {
+  let rig = rig_with_capacity(64);
+  let _scope = watch(&rig, "/r").await;
+  let tap = rig.fs.tap("/r");
+
+  rig
+    .fs
+    .control_tap("/r")
+    .send(SourceMessage::Overflow)
+    .await
+    .unwrap();
+  let (_, rescan) = next_event(&rig).await;
+  assert!(rescan.kind().is_rescan());
+
+  // The loss revoked device trust and requested a mount-table refresh from
+  // the blocking pool; wait for the fake platform to serve it.
+  for _ in 0..200 {
+    if rig.fs.refreshes() >= 1 {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert_eq!(rig.fs.refreshes(), 1, "one refresh per loss, coalesced");
+
+  // With the refreshed table installed, a same-batch rename pair grounds
+  // into a single Moved again — trust round-tripped end to end.
+  rig.fs.remove("/r/a/old");
+  rig.fs.put("/r/b/new", FileKind::File, 42);
+  tap
+    .send(SourceMessage::Batch(vec![
+      ev("/r/a/old", renamed(), 10, 42),
+      ev("/r/b/new", renamed(), 11, 42),
+    ]))
+    .await
+    .unwrap();
+  let (_, change) = next_event(&rig).await;
+  assert_eq!(change.kind().moved_from(), Some(&loc(&["a", "old"])));
+  assert_eq!(change.location(), &loc(&["b", "new"]));
 }
