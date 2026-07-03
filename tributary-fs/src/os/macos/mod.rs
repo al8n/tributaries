@@ -76,19 +76,24 @@ impl Source {
   /// `config.roots`, delivering decoded batches and in-band loss/death
   /// signals on the returned queue, in source order.
   ///
-  /// Every trust- and lifecycle-bearing fact in the returned [`RootMeta`] —
-  /// the canonical root bytes, the root device, the mount seed, the device
-  /// UUID — is read strictly BEFORE the stream starts, so the metadata cannot
-  /// postdate any event the queue will ever carry, and no fallible metadata
-  /// path exists after start (a root dying post-start surfaces only through
-  /// the normal event-side death lifecycle). Staleness across the read→start
-  /// gap is handled per datum: the mount seed claims no authority (see
-  /// [`RootMeta`] — the driver's post-live refresh installs it); `root_dev`
-  /// anchors probe-evidence comparisons, and a root object replaced across
-  /// devices in the gap only makes that evidence mismatch — failing closed —
-  /// while the root-death lifecycle governs the replacement itself; the
-  /// device UUID is advisory (resume tokens are minted, never yet consumed);
-  /// exclusions only ever reduce coverage.
+  /// Trust- and lifecycle-bearing metadata follows the BRACKET rule: capture
+  /// before start, prove after live. The canonical root bytes, the root
+  /// identity, the root device, the mount seed, and the device UUID are read
+  /// strictly BEFORE the stream starts, so nothing can postdate an event the
+  /// queue will ever carry; once the stream is LIVE the root is re-statted,
+  /// and the spawn commits only if the object — its `(dev, ino)` and its
+  /// directory-ness — is unchanged, so the stream anchor, the registry
+  /// identity, and every disjointness decision provably name one object
+  /// across start. A mismatch tears the just-started stream down and rejects
+  /// before anything reaches the caller. Per datum: the mount seed claims no
+  /// authority (see [`RootMeta`] — the driver's post-live refresh installs
+  /// it); the root device is re-proven by the same post-live stat (identity
+  /// equality includes it); the device UUID is advisory (resume tokens are
+  /// minted, never yet consumed); exclusions only ever reduce coverage; the
+  /// ancestor identities are read strictly AFTER the stream is live, so any
+  /// ancestor change past that read fires the stream's own root-changed
+  /// death (`WatchRoot` covers every ancestor) instead of leaving a live
+  /// scope's containment chain silently stale.
   ///
   /// On any partial failure the stream is invalidated and released before the
   /// error returns: a handle existing means created + scheduled + started.
@@ -140,19 +145,6 @@ impl Source {
     }
     let root_dev = root_meta.dev() as libc::dev_t;
     let identity = super::RootIdentity::new(root_meta.dev(), root_meta.ino());
-    // The ancestor identities feed root-disjointness containment: byte
-    // comparison cannot see that two spellings reach one object on a
-    // case-insensitive volume, but `(dev, ino)` can. Read inside the same
-    // pre-start barrier; canonicalize already traversed every component, so a
-    // failing ancestor stat is the same class as a failing root stat.
-    let mut ancestors = Vec::new();
-    for ancestor in roots[0].ancestors().skip(1) {
-      let meta = fs::metadata(ancestor).map_err(|source| SourceError::RootUnavailable {
-        root: ancestor.to_path_buf(),
-        source,
-      })?;
-      ancestors.push(super::RootIdentity::new(meta.dev(), meta.ino()));
-    }
     // The mount seed and device UUID are part of the pre-start barrier: taken
     // here they cannot postdate any event. The seed is trust-reducing only —
     // a mount in the read→start gap would be in neither the seed nor the
@@ -190,6 +182,61 @@ impl Source {
       return Err(SourceError::StartFailed);
     }
 
+    // From here the stream is live, so failures tear it down through the one
+    // proven teardown path (the handle) before rejecting.
+    let handle = SourceHandle {
+      stream: Some(stream),
+      queue: Some(queue),
+      shared,
+      device_uuid,
+    };
+
+    // The post-live half of the identity bracket: an object that still
+    // matches the pre-start capture while the stream is delivering matched
+    // it across the entire capture→start gap — the stream anchor and the
+    // registry identity provably name one object.
+    let live = match fs::metadata(&roots[0]) {
+      Ok(meta) => meta,
+      Err(source) => {
+        handle.shutdown();
+        return Err(SourceError::RootUnavailable {
+          root: roots[0].clone(),
+          source,
+        });
+      }
+    };
+    if !live.is_dir() {
+      handle.shutdown();
+      return Err(SourceError::NotADirectory {
+        root: roots[0].clone(),
+      });
+    }
+    if super::RootIdentity::new(live.dev(), live.ino()) != identity {
+      handle.shutdown();
+      return Err(SourceError::RootReplaced {
+        root: roots[0].clone(),
+      });
+    }
+    // The ancestor identities feed root-disjointness containment: byte
+    // comparison cannot see that two spellings reach one object on a
+    // case-insensitive volume, but `(dev, ino)` can. Read strictly AFTER the
+    // stream is live, so the chain reflects the delivering stream's world;
+    // any ancestor change past this read fires the root-changed death path
+    // (`WatchRoot` covers every ancestor) rather than going silently stale.
+    let mut ancestors = Vec::new();
+    for ancestor in roots[0].ancestors().skip(1) {
+      match fs::metadata(ancestor) {
+        Ok(meta) => ancestors.push(super::RootIdentity::new(meta.dev(), meta.ino())),
+        Err(source) => {
+          handle.shutdown();
+          return Err(SourceError::RootUnavailable {
+            root: ancestor.to_path_buf(),
+            source,
+          });
+        }
+      }
+    }
+
     let meta = RootMeta {
       root: roots[0].clone(),
       root_dev: root_dev as u64,
@@ -197,16 +244,7 @@ impl Source {
       identity,
       ancestors,
     };
-    Ok((
-      SourceHandle {
-        stream: Some(stream),
-        queue: Some(queue),
-        shared,
-        device_uuid,
-      },
-      queue_rx,
-      meta,
-    ))
+    Ok((handle, queue_rx, meta))
   }
 }
 
