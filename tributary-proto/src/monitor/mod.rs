@@ -997,6 +997,65 @@ impl Monitor {
     self.emit_rescan(scope, to.clone());
   }
 
+  /// Re-anchors every pending half of `scope` whose reconstructed source lies within
+  /// a just-resolved pair's source subtree (`from`), rewriting its stored suffix so
+  /// it reconstructs under the destination (`to`) — the anchor-relative analogue of
+  /// the tree carrying a held subtree's halves through [`reparent`](Self::reparent).
+  /// The two mechanisms cannot double-apply: this runs after the reparent, and a
+  /// tree-carried half already reconstructs under `to`, so its source no longer
+  /// starts with `from` and it does not match here. It matches exactly the halves
+  /// whose ANCHOR did not move — a kernel-recursive deep suffix under the root
+  /// watch, or a same-path replacement half anchored at the source's parent.
+  ///
+  /// Every matched half also becomes dirty (through the store's per-hold marker):
+  /// the ancestor move is a transition its window absorbed — a half parked after the
+  /// resolving `MovedFrom` was marked by no record, and even a marked one now owes
+  /// its covers at the post-move path. A matched half whose anchor is not a prefix
+  /// of `to` cannot re-express its suffix against that anchor (a cross-directory
+  /// per-directory replacement); it keeps the stale suffix and the marker alone
+  /// covers — its resolution rescans the source it emits at, and the resolved
+  /// pair's own dirty covers handle the relocated side.
+  fn reanchor_pending_sources(&mut self, scope: ScopeId, from: &Location, to: &Location) {
+    let matched: std::vec::Vec<(PendingKey, Option<Location>, Option<WatchId>)> = self
+      .pending_moves
+      .iter()
+      .filter(|((half_scope, _), pending)| {
+        *half_scope == scope && self.is_watched(pending.from_parent)
+      })
+      .filter_map(|(key, pending)| {
+        let source = self.pending_from(pending);
+        if !source.starts_with(from) {
+          return None;
+        }
+        let anchor = self.location_of(pending.from_parent);
+        let rewritten = to.starts_with(&anchor).then(|| {
+          Location::from_segments(
+            to.segments()[anchor.len()..]
+              .iter()
+              .chain(&source.segments()[from.len()..])
+              .cloned(),
+          )
+        });
+        Some((*key, rewritten, pending.held))
+      })
+      .collect();
+    for (key, rewritten, held) in matched {
+      if let Some(src) = held {
+        // A held half recovers through its hold marker, keeping the dirty ⇒ unheld
+        // partition intact.
+        self.dirtied_holds.insert(src);
+      }
+      if let Some(pending) = self.pending_moves.get_mut(&key) {
+        if let Some(from) = rewritten {
+          pending.from = from;
+        }
+        if pending.held.is_none() {
+          pending.dirty = true;
+        }
+      }
+    }
+  }
+
   /// Emits an overflow [`ChangeKind::Rescan`] for a scope AND re-enumerates `dir` in
   /// re-arm mode ([`rearm_enumerate`](Self::rearm_enumerate)) so directories created
   /// during the overflow gap are re-armed and vanished ones pruned — both halves of
@@ -1169,6 +1228,15 @@ impl Monitor {
         // narrowly torn down, paired by a reused cookie) demote a real directory
         // destination to an unwatched file slot — silent coverage loss.
         let class = rec.is_dir().or(pending.is_dir);
+        // The source path this pairing relocates, captured while the half is intact:
+        // other halves parked under it must re-anchor once the `Moved` is emitted.
+        // `from_parent` is the source's (old) parent — never inside the moved subtree —
+        // so this reconstruction is stable across the reparent below. An unanchored
+        // half emits `Created`, not `Moved` (see `emit_pair`): nothing relocates, so
+        // there is nothing to re-anchor under.
+        let resolved_from = self
+          .is_watched(pending.from_parent)
+          .then(|| self.pending_from(&pending));
         match (rec.name(), pending.held) {
           // Held directory: attempt the O(1) reparent and emit the pairing only once
           // it succeeds — a `Moved` must never precede a rejected/aborted reparent.
@@ -1181,14 +1249,15 @@ impl Monitor {
             let dirtied = self.dirtied_holds.remove(&src);
             if self.can_reparent(src, rec.watch()) && self.reparent(src, rec.watch(), name.clone())
             {
+              self.emit_pair(scope, to.clone(), &pending, class);
+              if let Some(from) = resolved_from.as_ref() {
+                self.reanchor_pending_sources(scope, from, &to);
+              }
               if dirtied {
                 // Records under the moved subtree were suppressed at the stale path:
                 // re-scan the destination and re-arm the subtree to recover them.
-                self.emit_pair(scope, to.clone(), &pending, class);
                 self.emit_rescan(scope, to);
                 self.inherit_rearm(src);
-              } else {
-                self.emit_pair(scope, to, &pending, class);
               }
             } else {
               // Not reparentable: a dead or cyclic held source, or a reparent that
@@ -1201,6 +1270,9 @@ impl Monitor {
               }
               if self.is_watched(rec.watch()) {
                 self.emit_pair(scope, to.clone(), &pending, class);
+                if let Some(from) = resolved_from.as_ref() {
+                  self.reanchor_pending_sources(scope, from, &to);
+                }
                 // The O(1) carry-over failed, so the moved subtree's interval is
                 // uncovered BY CONSTRUCTION — whatever happened between the source
                 // dying (a failed install, a raced teardown) and the fresh destination
@@ -1222,7 +1294,12 @@ impl Monitor {
                 // The destination parent died with the held subtree (it sat inside it),
                 // so the precomputed `to` reconstructed through the detached source and
                 // is a STALE pre-move path. Escalate at the scope root — the one
-                // location still known live — never at a path we no longer cover.
+                // location still known live — never at a path we no longer cover. The
+                // root Rescan is a scope-wide transition like a whole-scope loss:
+                // every parked half (either store) resolves AFTER it and must cover,
+                // or its stale facts would land post-rescan uninstructed.
+                self.dirty_pending_sources_touching(scope, &Location::new(), None, None);
+                self.dirty_held_sources(Some(scope));
                 self.emit_rescan(scope, Location::new());
               }
             }
@@ -1230,6 +1307,9 @@ impl Monitor {
           // Non-directory (or unwatched) source: emit the pairing and reconcile the slot.
           (Some(name), None) => {
             self.emit_pair(scope, to.clone(), &pending, class);
+            if let Some(from) = resolved_from.as_ref() {
+              self.reanchor_pending_sources(scope, from, &to);
+            }
             self.rescan_dirty_pair(scope, &pending, &to);
             self.reconcile_slot(
               rec.watch(),
@@ -1245,6 +1325,9 @@ impl Monitor {
               self.drop_subtree(src);
             }
             self.emit_pair(scope, to.clone(), &pending, class);
+            if let Some(from) = resolved_from.as_ref() {
+              self.reanchor_pending_sources(scope, from, &to);
+            }
             self.rescan_dirty_pair(scope, &pending, &to);
           }
         }
@@ -1282,7 +1365,10 @@ impl Monitor {
         } else {
           // Resolving the stranded source dropped the destination parent (a cyclic late
           // destination sits inside the held subtree), so the precomputed `to` is a
-          // stale pre-move path — escalate at the scope root instead.
+          // stale pre-move path — escalate at the scope root instead, marking both
+          // parked stores as for any scope-wide transition (see the in-window twin).
+          self.dirty_pending_sources_touching(scope, &Location::new(), None, None);
+          self.dirty_held_sources(Some(scope));
           self.emit_rescan(scope, Location::new());
         }
       }
@@ -1329,8 +1415,14 @@ impl Monitor {
       // instruction, under the same liveness guard (a dead `from_parent` has no live
       // source path to rescan — and nothing to contradict).
       if pending.dirty {
-        self.emit_rescan(pending.scope, from);
+        self.emit_rescan(pending.scope, from.clone());
       }
+      // The `Removed` just delivered is itself a subtree transition: a half parked
+      // UNDER this source (one that arrived after this half's own `MovedFrom` marked
+      // the store, so no record ever touched it) would otherwise resolve against a
+      // tree the consumer has already dropped. Mark, don't rewrite — a removal
+      // relocates nothing.
+      self.dirty_pending_sources_touching(pending.scope, &from, None, None);
     }
   }
 

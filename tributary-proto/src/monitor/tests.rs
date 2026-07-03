@@ -5856,3 +5856,252 @@ fn pending_source_blocks_rescan_coalescing() {
   assert_eq!(events[1].location(), &loc(&["a"]));
   assert!(events[1].epoch() > events[0].epoch());
 }
+
+/// A kernel-recursive pending half re-anchors under a resolved ancestor move — the
+/// deep-suffix analogue of the tree carrying per-directory halves through a reparent:
+/// its eventual Moved emits from the post-move path, and its covers land there too.
+#[test]
+fn kr_pending_half_reanchors_under_a_resolved_ancestor_move() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c", "d"]))
+      .with_cookie(cookie(5)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4, "two moves and the inner pair's covers");
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["a"])));
+  assert_eq!(events[0].location(), &loc(&["z"]));
+  assert_eq!(
+    events[1].kind().moved_from(),
+    Some(&loc(&["z", "b"])),
+    "the inner half's source follows the resolved ancestor move"
+  );
+  assert_eq!(events[1].location(), &loc(&["c", "d"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["z", "b"]));
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["c", "d"]));
+}
+
+/// The unpaired variant: a re-anchored half strands, and its Removed + cover land at
+/// the post-move path rather than the path the consumer no longer holds.
+#[test]
+fn kr_reanchored_unpaired_half_times_out_at_the_post_move_path() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  let _ = drain_events(&mut m);
+
+  m.handle_timeout(at(500));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["z", "b"]));
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["z", "b"]));
+}
+
+/// Nested ancestor moves compose: each resolution rewrites the still-pending half, so
+/// the innermost object's eventual pairing emits from the fully-relocated path.
+#[test]
+fn kr_nested_ancestor_moves_compose_on_a_pending_half() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b", "c"]))
+      .with_cookie(cookie(5)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["z", "b"]))
+      .with_cookie(cookie(9)),
+    at(13),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["w"]))
+      .with_cookie(cookie(9)),
+    at(14),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["q"]))
+      .with_cookie(cookie(5)),
+    at(15),
+  );
+
+  let events = drain_events(&mut m);
+  let moves: Vec<(Location, Location)> = events
+    .iter()
+    .filter_map(|e| {
+      e.kind()
+        .moved_from()
+        .map(|from| (from.clone(), e.location().clone()))
+    })
+    .collect();
+  assert_eq!(
+    moves,
+    vec![
+      (loc(&["a"]), loc(&["z"])),
+      (loc(&["z", "b"]), loc(&["w"])),
+      (loc(&["w", "c"]), loc(&["q"])),
+    ],
+    "each resolution rewrites the still-pending suffix"
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["w", "c"])),
+    "the innermost half covers at its fully-relocated source"
+  );
+}
+
+/// A half parked BETWEEN an ancestor's two halves is marked by no record — the
+/// re-anchor itself must dirty it, so its resolution still covers.
+#[test]
+fn kr_half_parked_between_ancestor_halves_reanchors_dirty() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(5)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  // The ancestor pair was dirtied by the inner MovedFrom record, so it covers both
+  // sides; the inner half was marked by the re-anchor itself and covers at its
+  // post-move source.
+  assert_eq!(events.len(), 6);
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["a"])));
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+  assert!(events[2].kind().is_rescan());
+  assert_eq!(events[2].location(), &loc(&["z"]));
+  assert_eq!(events[3].kind().moved_from(), Some(&loc(&["z", "b"])));
+  assert_eq!(events[3].location(), &loc(&["c"]));
+  assert!(events[4].kind().is_rescan());
+  assert_eq!(events[4].location(), &loc(&["z", "b"]));
+  assert!(events[5].kind().is_rescan());
+  assert_eq!(events[5].location(), &loc(&["c"]));
+}
+
+/// A stranded ancestor's Removed is itself a subtree transition: a half parked under
+/// it (marked by no record) is dirtied by the resolution, so its own later Removed
+/// carries a cover instead of landing silently under an already-dropped tree.
+#[test]
+fn kr_stranded_ancestor_removal_dirties_halves_underneath() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(3)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(11),
+  );
+  m.handle_timeout(at(500));
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 4);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+  assert!(events[2].kind().is_removed());
+  assert_eq!(events[2].location(), &loc(&["a", "b"]));
+  assert!(
+    events[3].kind().is_rescan(),
+    "the inner half was dirtied by the ancestor's stranded resolution"
+  );
+  assert_eq!(events[3].location(), &loc(&["a", "b"]));
+}
