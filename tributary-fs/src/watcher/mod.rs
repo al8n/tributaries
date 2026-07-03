@@ -5,7 +5,10 @@ use std::{
   marker::PhantomData,
   path::{Path, PathBuf},
   pin::Pin,
-  sync::{Arc, PoisonError, RwLock},
+  sync::{
+    Arc, PoisonError, RwLock,
+    atomic::{AtomicU64, Ordering},
+  },
   task::{Context, Poll},
 };
 
@@ -24,36 +27,49 @@ use crate::{
 #[cfg(all(test, feature = "tokio"))]
 mod tests;
 
+/// Mints one id per [`Watcher`], branding its handles (see [`RootHandle`]).
+static WATCHER_INSTANCES: AtomicU64 = AtomicU64::new(1);
+
 /// An opaque handle to one watched root of a [`Watcher`].
+///
+/// A handle is a capability scoped to the watcher that issued it: scope ids
+/// are minted per driver instance, so two watchers routinely share the same
+/// numeric scope. Every handle therefore also carries its watcher's instance
+/// brand, and using it with any other watcher is rejected
+/// ([`UnwatchError::UnknownRoot`] / a `None` path) instead of silently
+/// addressing that watcher's unrelated root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RootHandle(ScopeId);
+pub struct RootHandle {
+  instance: u64,
+  scope: ScopeId,
+}
 
 impl RootHandle {
-  /// Wraps a driver-minted scope.
-  pub(crate) const fn new(scope: ScopeId) -> Self {
-    Self(scope)
+  /// Wraps a driver-minted scope under the issuing watcher's brand.
+  pub(crate) const fn new(instance: u64, scope: ScopeId) -> Self {
+    Self { instance, scope }
   }
 
   /// The underlying scope id (the value [`Event`]s of this root carry).
   #[inline]
   pub const fn scope(&self) -> ScopeId {
-    self.0
+    self.scope
+  }
+
+  /// The issuing watcher's brand.
+  pub(crate) const fn instance(&self) -> u64 {
+    self.instance
   }
 }
 
-/// One registered root: the canonical path events arrive under, and whether
-/// the root is still live (dead roots keep their path so trailing events can
-/// still be assembled, but stop participating in overlap checks).
-#[derive(Debug)]
-struct RootEntry {
-  path: Arc<PathBuf>,
-  live: bool,
-}
-
-/// The watcher-side registry of roots, shared with the event-assembly path.
+/// The watcher-side registry of live roots, keyed by scope. Entries exist
+/// exactly while their root is watched: every scope end (unwatch, root death,
+/// stream fatal, close) removes its entry, so the registry is bounded by the
+/// number of LIVE roots — deliveries carry their own root path, so nothing
+/// here is needed to assemble trailing events of a dead scope.
 #[derive(Debug, Default)]
 struct RootSet {
-  entries: BTreeMap<ScopeId, RootEntry>,
+  entries: BTreeMap<ScopeId, Arc<PathBuf>>,
   /// Roots with a `watch` in flight, reserved so two concurrent overlapping
   /// `watch` calls cannot both pass the disjointness check.
   pending: Vec<PathBuf>,
@@ -66,8 +82,7 @@ impl RootSet {
     self
       .entries
       .values()
-      .filter(|entry| entry.live)
-      .map(|entry| entry.path.as_path())
+      .map(|path| path.as_path())
       .chain(self.pending.iter().map(PathBuf::as_path))
       .find(|existing| candidate.starts_with(existing) || existing.starts_with(candidate))
       .map(Path::to_path_buf)
@@ -140,10 +155,12 @@ impl Drop for Reservation {
 /// [`close`](Self::close), without anyone to confirm it to. Prefer `close()`
 /// in orderly programs — it awaits the teardown.
 pub struct Watcher<R: RuntimeLite> {
+  /// This watcher's handle brand (see [`RootHandle`]).
+  instance: u64,
   commands: async_channel::Sender<Command>,
   // Boxed: async-channel's `Receiver` embeds a pinned listener (it is not
   // `Unpin`), and boxing it keeps `Watcher` itself `Unpin` for consumers.
-  events: futures_util::stream::BoxStream<'static, (ScopeId, Change)>,
+  events: futures_util::stream::BoxStream<'static, (ScopeId, Arc<PathBuf>, Change)>,
   roots: Arc<RwLock<RootSet>>,
   _runtime: PhantomData<R>,
 }
@@ -178,15 +195,14 @@ impl<R: RuntimeLite> Watcher<R> {
     let (command_tx, command_rx) = async_channel::bounded(16);
     let (event_tx, event_rx) = async_channel::bounded(options.event_capacity().get());
     let roots = Arc::new(RwLock::new(RootSet::default()));
-    // The driver reports every scope end (unwatch, root death, stream fatal)
-    // back into the registry, so a dead root stops blocking a fresh watch of
-    // the same path while its entry keeps assembling trailing events.
+    // The driver reports every scope end (unwatch, root death, stream fatal,
+    // close) back into the registry, which RECLAIMS the entry outright: the
+    // dead path stops blocking a fresh watch immediately, and trailing
+    // events need nothing here — every delivery carries its own root path.
     let registry = Arc::clone(&roots);
     let on_scope_dead = move |scope: ScopeId| {
       let mut set = registry.write().unwrap_or_else(PoisonError::into_inner);
-      if let Some(entry) = set.entries.get_mut(&scope) {
-        entry.live = false;
-      }
+      set.entries.remove(&scope);
     };
     R::spawn_detach(run::<R, RealFs>(
       config,
@@ -196,6 +212,7 @@ impl<R: RuntimeLite> Watcher<R> {
       on_scope_dead,
     ));
     Ok(Self {
+      instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
       events: futures_util::StreamExt::boxed(event_rx),
       roots,
@@ -267,13 +284,9 @@ impl<R: RuntimeLite> Watcher<R> {
       Ok(Ok(grant)) => {
         let scope = grant.scope();
         let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-        set.entries.insert(
-          scope,
-          RootEntry {
-            path: Arc::new(grant.root().to_path_buf()),
-            live: true,
-          },
-        );
+        set
+          .entries
+          .insert(scope, Arc::new(grant.root().to_path_buf()));
         drop(set);
         // Only now may the reservation lift and the grant commit: the entry
         // above covers the path, so the stream has an owner. (Everything from
@@ -281,7 +294,7 @@ impl<R: RuntimeLite> Watcher<R> {
         // cancellation point between insert and defuse.)
         drop(reservation);
         grant.defuse();
-        Ok(RootHandle::new(scope))
+        Ok(RootHandle::new(self.instance, scope))
       }
       Ok(Err(err)) => Err(WatchRootError::Source(err)),
       Err(_) => Err(WatchRootError::Closed),
@@ -294,9 +307,15 @@ impl<R: RuntimeLite> Watcher<R> {
   /// # Errors
   ///
   /// - [`UnwatchError::UnknownRoot`] when the handle does not name a live
-  ///   root (never watched, already unwatched, or torn down by root death);
+  ///   root of THIS watcher (never watched, already unwatched, torn down by
+  ///   root death, or issued by a different watcher);
   /// - [`UnwatchError::Closed`] when the watcher is already closed.
   pub async fn unwatch(&self, root: RootHandle) -> Result<(), UnwatchError> {
+    // A foreign handle must be rejected before anything is sent: its scope
+    // number can name THIS watcher's unrelated root.
+    if root.instance() != self.instance {
+      return Err(UnwatchError::UnknownRoot);
+    }
     let (reply, response) = futures_channel::oneshot::channel();
     self
       .commands
@@ -307,36 +326,38 @@ impl<R: RuntimeLite> Watcher<R> {
       .await
       .map_err(|_| UnwatchError::Closed)?;
     match response.await {
-      Ok(true) => {
-        let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = set.entries.get_mut(&root.scope()) {
-          entry.live = false;
-        }
-        Ok(())
-      }
-      Ok(false) => {
-        // The driver no longer knows the scope — it already tore the root
-        // down (root death raced this call). Reconcile a stale live entry so
-        // the dead path stops blocking a fresh watch.
-        let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = set.entries.get_mut(&root.scope()) {
-          entry.live = false;
-        }
-        Err(UnwatchError::UnknownRoot)
-      }
+      // The registry entry is reclaimed by the driver's scope-dead signal;
+      // nothing to reconcile here on either outcome.
+      Ok(true) => Ok(()),
+      Ok(false) => Err(UnwatchError::UnknownRoot),
       Err(_) => Err(UnwatchError::Closed),
     }
   }
 
-  /// The canonical path of a watched root, if the handle names one.
+  /// The canonical path of a watched root, if the handle names a live root
+  /// of this watcher.
   pub fn root_path(&self, root: RootHandle) -> Option<PathBuf> {
+    if root.instance() != self.instance {
+      return None;
+    }
     self
       .roots
       .read()
       .unwrap_or_else(PoisonError::into_inner)
       .entries
       .get(&root.scope())
-      .map(|entry| entry.path.as_ref().clone())
+      .map(|path| path.as_ref().clone())
+  }
+
+  /// The number of registry entries — live roots only, by construction.
+  #[cfg(test)]
+  pub(crate) fn registry_len(&self) -> usize {
+    self
+      .roots
+      .read()
+      .unwrap_or_else(PoisonError::into_inner)
+      .entries
+      .len()
   }
 
   /// The next event, or `None` once the watcher is closed and drained.
@@ -363,18 +384,12 @@ impl<R: RuntimeLite> Watcher<R> {
     response.await.map_err(|_| CloseError::Stopped)
   }
 
-  /// Wraps a scope-stamped change into the consumer event, if the scope is
-  /// still known.
-  fn assemble(&self, scope: ScopeId, change: &Change) -> Option<Event> {
-    let root_path = {
-      let set = self.roots.read().unwrap_or_else(PoisonError::into_inner);
-      set.entries.get(&scope).map(|entry| Arc::clone(&entry.path))
-    }?;
-    Some(Event::from_change(
-      RootHandle::new(scope),
-      root_path.as_path(),
-      change,
-    ))
+  /// Wraps a scope-stamped change into the consumer event. Deliveries carry
+  /// their own root path, so assembly is total — a dead, already-reclaimed
+  /// scope's trailing changes (above all its terminal `Rescan`) still
+  /// assemble.
+  fn assemble(&self, scope: ScopeId, root_path: &Path, change: &Change) -> Event {
+    Event::from_change(RootHandle::new(self.instance, scope), root_path, change)
   }
 }
 
@@ -383,18 +398,12 @@ impl<R: RuntimeLite> Stream for Watcher<R> {
 
   fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
     let this = self.get_mut();
-    loop {
-      match this.events.as_mut().poll_next(cx) {
-        Poll::Ready(Some((scope, change))) => {
-          // A change for a scope the registry no longer knows cannot be
-          // assembled into a path; skip it and keep polling.
-          if let Some(event) = this.assemble(scope, &change) {
-            return Poll::Ready(Some(event));
-          }
-        }
-        Poll::Ready(None) => return Poll::Ready(None),
-        Poll::Pending => return Poll::Pending,
+    match this.events.as_mut().poll_next(cx) {
+      Poll::Ready(Some((scope, root, change))) => {
+        Poll::Ready(Some(this.assemble(scope, root.as_path(), &change)))
       }
+      Poll::Ready(None) => Poll::Ready(None),
+      Poll::Pending => Poll::Pending,
     }
   }
 }

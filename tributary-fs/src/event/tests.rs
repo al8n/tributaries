@@ -16,7 +16,7 @@ fn change(kind: ChangeKind, location: Location) -> Change {
 }
 
 fn root() -> RootHandle {
-  RootHandle::new(ScopeId::new(NonZeroU64::new(1).unwrap()))
+  RootHandle::new(1, ScopeId::new(NonZeroU64::new(1).unwrap()))
 }
 
 fn loc(parts: &[&str]) -> Location {

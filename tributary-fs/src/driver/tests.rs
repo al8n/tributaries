@@ -215,7 +215,7 @@ impl FsOps for FakeFs {
 struct Rig {
   fs: FakeFs,
   commands: async_channel::Sender<Command>,
-  events: async_channel::Receiver<(ScopeId, Change)>,
+  events: async_channel::Receiver<(ScopeId, Arc<PathBuf>, Change)>,
 }
 
 fn config() -> DriverConfig {
@@ -277,10 +277,11 @@ fn renamed() -> FsEventFlags {
 }
 
 async fn next_event(rig: &Rig) -> (ScopeId, Change) {
-  tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
+  let (scope, _root, change) = tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
     .await
     .expect("an event arrives")
-    .expect("the stream is open")
+    .expect("the stream is open");
+  (scope, change)
 }
 
 fn loc(parts: &[&str]) -> Location {
@@ -720,7 +721,7 @@ async fn control_overflow_discards_queued_data() {
     .unwrap();
 
   let mut seen = Vec::new();
-  while let Ok(Ok((_, change))) =
+  while let Ok(Ok((_, _, change))) =
     tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
   {
     seen.push(change);
@@ -760,7 +761,7 @@ async fn fatal_discards_queued_data() {
     .unwrap();
 
   let mut seen = Vec::new();
-  while let Ok(Ok((_, change))) =
+  while let Ok(Ok((_, _, change))) =
     tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
   {
     seen.push(change);
@@ -799,11 +800,11 @@ async fn overflow_refreshes_mount_trust_and_pairing_resumes() {
   assert!(rescan.kind().is_rescan());
 
   // The loss revoked device trust and requested a mount-table refresh from
-  // the blocking pool; wait for the fake platform to serve it.
-  for _ in 0..200 {
-    if rig.fs.refreshes() >= 1 {
-      break;
-    }
+  // the blocking pool. That pool runs on REAL threads outside the paused
+  // runtime, so the wait must be bounded by the real clock — a fixed yield
+  // count loses the race whenever the machine is loaded.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while rig.fs.refreshes() < 1 && std::time::Instant::now() < deadline {
     tokio::task::yield_now().await;
   }
   assert_eq!(rig.fs.refreshes(), 1, "one refresh per loss, coalesced");
@@ -822,4 +823,71 @@ async fn overflow_refreshes_mount_trust_and_pairing_resumes() {
   let (_, change) = next_event(&rig).await;
   assert_eq!(change.kind().moved_from(), Some(&loc(&["a", "old"])));
   assert_eq!(change.location(), &loc(&["b", "new"]));
+}
+
+/// Every delivery carries the canonical root it assembles under, so the
+/// consumer never needs a registry entry — a reclaimed scope's trailing
+/// changes still name their absolute paths.
+#[tokio::test(start_paused = true)]
+async fn deliveries_carry_the_canonical_root() {
+  let rig = rig_with_capacity(64);
+  let scope = watch(&rig, "/r").await;
+
+  rig
+    .fs
+    .tap("/r")
+    .send(SourceMessage::Batch(vec![ev(
+      "/r/carried.txt",
+      FsEventFlags::new(FsEventFlags::ITEM_CREATED.bits() | FsEventFlags::ITEM_IS_FILE.bits()),
+      1,
+      10,
+    )]))
+    .await
+    .unwrap();
+
+  let (got_scope, root, change) = tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
+    .await
+    .expect("an event arrives")
+    .expect("the stream is open");
+  assert_eq!(got_scope, scope);
+  assert_eq!(root.as_path(), Path::new("/r"));
+  assert!(change.kind().is_created());
+}
+
+/// The scope-dead signal fires exactly once per stream teardown, naming the
+/// dead scope — the reclamation contract the watcher registry builds on.
+#[tokio::test(start_paused = true)]
+async fn scope_dead_signal_fires_once_per_teardown() {
+  let fs = FakeFs::new(1);
+  fs.put("/r", FileKind::Dir, 1);
+  let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  let (ev_tx, _ev_rx) = async_channel::bounded(64);
+  let dead: Arc<Mutex<Vec<ScopeId>>> = Arc::new(Mutex::new(Vec::new()));
+  let recorder = Arc::clone(&dead);
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    config(),
+    fs.clone(),
+    cmd_rx,
+    ev_tx,
+    move |scope| recorder.lock().unwrap().push(scope),
+  ));
+  let rig = Rig {
+    fs,
+    commands: cmd_tx,
+    events: async_channel::bounded(1).1,
+  };
+
+  let scope = watch(&rig, "/r").await;
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Unwatch { scope, reply })
+    .await
+    .unwrap();
+  assert!(on_reply.await.unwrap(), "the unwatch resolves");
+  assert_eq!(
+    dead.lock().unwrap().as_slice(),
+    &[scope],
+    "exactly one scope-dead signal, naming the dead scope"
+  );
 }
