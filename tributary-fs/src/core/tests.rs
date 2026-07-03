@@ -2502,3 +2502,45 @@ fn stuck_probe_backpressures_the_callback_through_the_park() {
     "the loss flush returns every parked slot"
   );
 }
+
+/// One kernel batch can carry loss, an ordinary event, and loss again; the delivered
+/// sequence keeps a covering rescan AFTER the possibly-stale event — the trailing loss
+/// is never coalesced into the leading one.
+#[test]
+fn repeated_in_batch_loss_keeps_a_trailing_covering_rescan() {
+  let (mut core, scope) = live_core();
+  core.on_batch_events(
+    scope,
+    vec![
+      ev("/r", FsEventFlags::MUST_SCAN_SUBDIRS, 1, 0),
+      ev(
+        "/r/x",
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        2,
+        11,
+      ),
+      ev("/r", FsEventFlags::MUST_SCAN_SUBDIRS, 3, 0),
+    ],
+    at(10),
+  );
+
+  let effects = drain(&mut core);
+  let changes = emits(&effects);
+  let created_at = changes
+    .iter()
+    .position(|c| c.kind().is_created())
+    .expect("the grounded create is delivered");
+  let trailing_rescan = changes
+    .iter()
+    .rposition(|c| c.kind().is_rescan())
+    .expect("a covering rescan is delivered");
+  assert!(
+    trailing_rescan > created_at,
+    "a covering rescan follows the possibly-stale event"
+  );
+  assert_eq!(
+    changes.iter().filter(|c| c.kind().is_rescan()).count(),
+    2,
+    "each loss keeps its own covering rescan"
+  );
+}

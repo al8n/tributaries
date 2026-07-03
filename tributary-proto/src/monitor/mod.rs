@@ -174,8 +174,13 @@ enum SlotOccupant {
 /// [`handle_timeout`](Self::handle_timeout)) and drains outputs to a fixpoint
 /// after each ([`poll_action`](Self::poll_action),
 /// [`poll_event`](Self::poll_event)), arming a timer for
-/// [`poll_timeout`](Self::poll_timeout). No method performs I/O or reads a clock;
-/// time always arrives as a `now` argument.
+/// [`poll_timeout`](Self::poll_timeout). Draining after every input minimizes
+/// latency, but it is a discipline, not a soundness precondition: a driver may
+/// feed several inputs (a whole decoded kernel batch) before draining — the
+/// queued changes coalesce only across adjacency that respects every
+/// intervening transition, including subtree-wide adjacency for `Rescan`s. No
+/// method performs I/O or reads a clock; time always arrives as a `now`
+/// argument.
 #[derive(Debug)]
 pub struct Monitor {
   capabilities: Capabilities,
@@ -1571,8 +1576,21 @@ impl Monitor {
     // destination; a `Moved(from)` ALSO touches its source — and this holds on BOTH sides
     // of the comparison. So create→remove→create keeps all three (the remove differs), and
     // move(/a→/b)→create(/a)→move(/a→/b) keeps both moves (the intervening create at the
-    // moves' source /a breaks their adjacency). A queue-wide key set — or a one-sided,
-    // destination-only scan — would drop a real transition and mis-converge the consumer.
+    // moves' source /a breaks their adjacency).
+    //
+    // A `Rescan`'s coverage is a whole SUBTREE, not a point, so its touching is
+    // prefix-wide on both sides: a queued change inside a new Rescan's subtree breaks the
+    // coalescing chain (rescan→create(child)→rescan keeps both rescans — the second may
+    // cover a loss ordered after that create), and a queued Rescan touches any new change
+    // inside ITS subtree (create→rescan→create keeps both creates as distinct pre- and
+    // post-rescan transitions). Only truly-adjacent identical Rescans coalesce, which
+    // stays sound despite each trigger's epoch bump: no covered event separates them,
+    // both losses precede the survivor's delivery-time re-read, and `dedup_key` ignores
+    // the epoch precisely so one delivered instruction can stand for both.
+    //
+    // A queue-wide key set — or a one-sided, destination-only scan — would drop a real
+    // transition and mis-converge the consumer.
+    let new_is_rescan = change.kind().is_rescan();
     let mut touched: std::vec::Vec<&Location> = std::vec::Vec::with_capacity(2);
     touched.push(&key.1);
     if let Some(source) = key.3.as_ref() {
@@ -1585,9 +1603,15 @@ impl Monitor {
       .find(|queued| {
         queued.scope() == scope && {
           let queued_source = queued.kind().moved_from();
-          touched
-            .iter()
-            .any(|&loc| queued.location() == loc || queued_source == Some(loc))
+          let queued_is_rescan = queued.kind().is_rescan();
+          touched.iter().any(|&loc| {
+            queued.location() == loc
+              || queued_source == Some(loc)
+              || (new_is_rescan
+                && (queued.location().starts_with(loc)
+                  || queued_source.is_some_and(|src| src.starts_with(loc))))
+              || (queued_is_rescan && loc.starts_with(queued.location()))
+          })
         }
       })
       .is_some_and(|queued| Self::dedup_key(queued) == key);
