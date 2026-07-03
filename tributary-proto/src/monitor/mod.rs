@@ -1595,23 +1595,36 @@ impl Monitor {
   /// Coalesce only an ADJACENT duplicate: suppress iff the most-recent still-queued
   /// change TOUCHING any location this change touches is identical. A change touches its
   /// destination; a `Moved(from)` ALSO touches its source — and this holds on BOTH sides
-  /// of the comparison. So create→remove→create keeps all three (the remove differs), and
-  /// move(/a→/b)→create(/a)→move(/a→/b) keeps both moves (the intervening create at the
-  /// moves' source /a breaks their adjacency).
+  /// of the comparison.
   ///
-  /// A `Rescan`'s coverage is a whole SUBTREE, not a point, so its touching is
-  /// prefix-wide on both sides: a queued change inside a new Rescan's subtree breaks the
-  /// coalescing chain (rescan→create(child)→rescan keeps both rescans — the second may
-  /// cover a loss ordered after that create), and a queued Rescan touches any new change
-  /// inside ITS subtree (create→rescan→create keeps both creates as distinct pre- and
-  /// post-rescan transitions). Only truly-adjacent identical Rescans coalesce, which is
-  /// sound because nothing the earlier Rescan covers separates them: both losses precede
-  /// the survivor's delivery-time re-read, the coalesced trigger never bumps the
-  /// generation (see `emit_rescan`), and `dedup_key` ignores the epoch precisely so one
-  /// delivered instruction can stand for the run.
+  /// Locations touch by HIERARCHY, not equality: two locations touch iff either is a
+  /// prefix of the other ([`locations_touch`](Self::locations_touch)). Every change's
+  /// meaning depends on its whole ancestor path — an ancestor transition can remove or
+  /// replace the subtree that gives the location its object — and a `Rescan`'s coverage
+  /// is its whole subtree, so relatedness runs in BOTH directions and the touch relation
+  /// is mutual-prefix; there is no third direction. Concretely:
+  /// rescan→create(child)→rescan keeps both rescans (the second may cover a loss ordered
+  /// after that create); rescan(/a/b)→removed(/a)→created(/a)→rescan(/a/b) keeps both
+  /// rescans (the ancestor swap invalidated the first re-read);
+  /// create(/a/b)→removed(/a)→created(/a)→create(/a/b) keeps both creates (suppressing
+  /// the second would silently lose /a/b under the recreated parent);
+  /// create→remove→create at one location keeps all three; and
+  /// move(/a→/b)→create(/a)→move(/a→/b) keeps both moves. Only hierarchy-UNRELATED
+  /// (sibling-subtree) interleavings coalesce across, which is sound: a sibling
+  /// transition cannot affect this location's object, and a suppressed duplicate of a
+  /// state fact leaves the consumer at the same final state.
   ///
-  /// A queue-wide key set — or a one-sided, destination-only scan — would drop a real
-  /// transition and mis-converge the consumer.
+  /// Truly-adjacent identical Rescans still coalesce: nothing the earlier Rescan covers
+  /// separates them, both losses precede the survivor's delivery-time re-read, the
+  /// coalesced trigger never bumps the generation (see `emit_rescan`), and `dedup_key`
+  /// ignores the epoch precisely so one delivered instruction can stand for the run.
+  ///
+  /// Widening the touch relation only ever turns suppress into deliver: an identical
+  /// queued candidate shares the exact location (mutual-prefix includes equality), so a
+  /// wider relation merely inserts additional NON-identical stoppers ahead of it in the
+  /// scan — and extra Rescans or re-delivered state facts are always legal, silence is
+  /// not. A queue-wide key set — or a one-sided, destination-only scan — would drop a
+  /// real transition and mis-converge the consumer.
   fn would_coalesce(&self, scope: ScopeId, location: &Location, kind: &ChangeKind) -> bool {
     let key: DedupKey = (
       scope,
@@ -1619,7 +1632,6 @@ impl Monitor {
       Self::kind_tag(kind),
       kind.moved_from().cloned(),
     );
-    let new_is_rescan = kind.is_rescan();
     let mut touched: std::vec::Vec<&Location> = std::vec::Vec::with_capacity(2);
     touched.push(&key.1);
     if let Some(source) = key.3.as_ref() {
@@ -1632,18 +1644,19 @@ impl Monitor {
       .find(|queued| {
         queued.scope() == scope && {
           let queued_source = queued.kind().moved_from();
-          let queued_is_rescan = queued.kind().is_rescan();
           touched.iter().any(|&loc| {
-            queued.location() == loc
-              || queued_source == Some(loc)
-              || (new_is_rescan
-                && (queued.location().starts_with(loc)
-                  || queued_source.is_some_and(|src| src.starts_with(loc))))
-              || (queued_is_rescan && loc.starts_with(queued.location()))
+            Self::locations_touch(queued.location(), loc)
+              || queued_source.is_some_and(|src| Self::locations_touch(src, loc))
           })
         }
       })
       .is_some_and(|queued| Self::dedup_key(queued) == key)
+  }
+
+  /// Hierarchical relatedness for the dedup's touch relation: either location lies
+  /// within the other's subtree (prefix-inclusive, so equal locations touch).
+  fn locations_touch(a: &Location, b: &Location) -> bool {
+    a.starts_with(b) || b.starts_with(a)
   }
 
   fn install_child(

@@ -5473,3 +5473,171 @@ fn queued_ancestor_rescan_breaks_point_event_coalescing() {
   assert!(events[1].kind().is_rescan());
   assert!(events[2].kind().is_created());
 }
+
+/// An ancestor transition invalidates the state a descendant Rescan's re-read
+/// established, so it breaks the coalescing of identical descendant Rescans — the
+/// ancestor direction of the mutual-prefix touch relation.
+#[test]
+fn ancestor_transition_breaks_descendant_rescan_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_target(loc(&["a"]))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a"]))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(4),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    4,
+    "rescan, removed, created, rescan — nothing coalesced"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert!(events[3].kind().is_rescan());
+  assert_eq!(events[3].location(), &loc(&["a", "b"]));
+  assert!(
+    events[3].epoch() > events[0].epoch(),
+    "the post-ancestor loss carries its own delivered generation"
+  );
+}
+
+/// A move whose SOURCE is an ancestor of the rescanned subtree is an ancestor
+/// transition too — the source side of the mutual-prefix relation.
+#[test]
+fn ancestor_move_breaks_descendant_rescan_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(9))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(9))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_overflow(
+    SubtreeScope::new(root)
+      .with_descent(loc(&["a", "b"]))
+      .into(),
+    at(4),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 3, "rescan, moved, rescan — nothing coalesced");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[1].kind().moved_from(), Some(&loc(&["a"])));
+  assert!(events[2].kind().is_rescan());
+}
+
+/// The ancestor direction protects ordinary changes too: an ancestor swap makes a
+/// same-slot re-create a DISTINCT transition, not a duplicate — suppressing it would
+/// silently lose the child under the recreated parent with no covering Rescan.
+#[test]
+fn ancestor_transition_breaks_ordinary_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a", "b"]))
+      .with_is_dir(true),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_target(loc(&["a"]))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a"]))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_target(loc(&["a", "b"]))
+      .with_is_dir(true),
+    at(4),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    4,
+    "created, removed, created, created — the re-created child delivers"
+  );
+  assert!(events[3].kind().is_created());
+  assert_eq!(events[3].location(), &loc(&["a", "b"]));
+}
+
+/// Sibling-subtree interleavings stay coalescible: a transition in an unrelated
+/// subtree cannot affect this location's object, and a suppressed duplicate of a
+/// state fact leaves the consumer at the same final state.
+#[test]
+fn sibling_event_keeps_ordinary_coalescing() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["a", "f"])),
+    at(1),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["b", "g"])),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Modified).with_target(loc(&["a", "f"])),
+    at(3),
+  );
+
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    2,
+    "the sibling-separated duplicate Modified coalesces"
+  );
+  assert!(events[0].kind().is_modified());
+  assert!(events[1].kind().is_modified());
+  assert_eq!(events[1].location(), &loc(&["b", "g"]));
+}
