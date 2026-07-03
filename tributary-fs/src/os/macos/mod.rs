@@ -81,7 +81,14 @@ impl Source {
   /// UUID — is read strictly BEFORE the stream starts, so the metadata cannot
   /// postdate any event the queue will ever carry, and no fallible metadata
   /// path exists after start (a root dying post-start surfaces only through
-  /// the normal event-side death lifecycle).
+  /// the normal event-side death lifecycle). Staleness across the read→start
+  /// gap is handled per datum: the mount seed claims no authority (see
+  /// [`RootMeta`] — the driver's post-live refresh installs it); `root_dev`
+  /// anchors probe-evidence comparisons, and a root object replaced across
+  /// devices in the gap only makes that evidence mismatch — failing closed —
+  /// while the root-death lifecycle governs the replacement itself; the
+  /// device UUID is advisory (resume tokens are minted, never yet consumed);
+  /// exclusions only ever reduce coverage.
   ///
   /// On any partial failure the stream is invalidated and released before the
   /// error returns: a handle existing means created + scheduled + started.
@@ -125,13 +132,10 @@ impl Source {
       })?
       .dev() as libc::dev_t;
     // The mount seed and device UUID are part of the pre-start barrier: taken
-    // here they cannot postdate any event, so the seed's authority is safe
-    // for the stream's whole life (post-loss staleness is handled separately,
-    // by the refresh protocol).
-    let (mounts, mounts_authoritative) = match mounts_under(&roots[0]) {
-      Some(mounts) => (mounts, true),
-      None => (Vec::new(), false),
-    };
+    // here they cannot postdate any event. The seed is trust-reducing only —
+    // a mount in the read→start gap would be in neither the seed nor the
+    // event stream, so authority waits for the driver's post-live refresh.
+    let mounts = mounts_under(&roots[0]).unwrap_or_default();
     let device_uuid = ffi::device_uuid(root_dev);
 
     let (queue_tx, queue_rx) = async_channel::unbounded();
@@ -168,7 +172,6 @@ impl Source {
       root: roots[0].clone(),
       root_dev: root_dev as u64,
       mounts,
-      mounts_authoritative,
     };
     Ok((
       SourceHandle {

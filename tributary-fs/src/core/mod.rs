@@ -406,13 +406,32 @@ impl DriverCore {
         state.root = Some(Arc::new(meta.root));
         state.root_dev = Some(meta.root_dev);
         state.mounts = meta.mounts;
-        state.mounts_authoritative = meta.mounts_authoritative;
+        // Born closed: the seed was read before the stream started, so a
+        // mount appearing in that gap is in neither the seed nor the event
+        // stream — the seed can only REDUCE trust. Authority arrives with
+        // this birth refresh, whose post-live read the stream orders against
+        // every later mount transition; until it installs, event-side
+        // identity and cookies fail closed (the non-authoritative default).
+        Self::arm_refresh(&mut self.effects, scope, state);
         self.monitor.on_watch_result(watch, Ok(()));
       }
       Err(err) => {
         self.monitor.on_watch_result(watch, Err(watch_error(&err)));
       }
     }
+    self.drain_monitor();
+  }
+
+  /// The driver refused the spawned stream before it went live: its FINAL
+  /// canonical root overlapped a root this watcher already covers (the
+  /// backend re-canonicalizes, so a spawn can resolve somewhere the
+  /// reservation did not). The scope ends exactly like a failed spawn.
+  pub(crate) fn on_spawn_rejected(&mut self, scope: ScopeId) {
+    let Some(state) = self.scopes.get(&scope) else {
+      return;
+    };
+    let watch = state.watch;
+    self.monitor.on_watch_result(watch, Err(WatchError::Gone));
     self.drain_monitor();
   }
 
@@ -502,12 +521,20 @@ impl DriverCore {
   /// mount table; repeated losses coalesce onto one outstanding refresh.
   fn trust_lost(effects: &mut VecDeque<Effect>, scope: ScopeId, state: &mut ScopeState) {
     state.mounts_authoritative = false;
+    Self::arm_refresh(effects, scope, state);
+  }
+
+  /// Arms one mount-table refresh for `scope`, coalescing onto an outstanding
+  /// one: a refresh raced by a newer arming re-runs once (`refresh_stale`)
+  /// instead of stacking effects. Serves both the birth refresh (authority is
+  /// never presumed at spawn) and every post-loss re-read.
+  fn arm_refresh(effects: &mut VecDeque<Effect>, scope: ScopeId, state: &mut ScopeState) {
     if state.refresh_pending {
       state.refresh_stale = true;
       return;
     }
-    // No canonical root yet means no live stream, so nothing was lost; the
-    // spawn's own seed installs the first table.
+    // No canonical root means no live stream: nothing to read yet, and the
+    // spawn arm re-arms once the root installs.
     let Some(root) = state.root.clone() else {
       return;
     };
