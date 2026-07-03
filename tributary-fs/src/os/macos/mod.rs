@@ -243,6 +243,7 @@ impl Source {
       mounts,
       identity,
       ancestors,
+      backend: super::BackendKind::FsEvents,
     };
     Ok((handle, queue_rx, meta))
   }

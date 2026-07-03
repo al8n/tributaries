@@ -223,11 +223,20 @@ mod smoke {
     dir
   }
 
-  fn recv_batch(rx: &crate::os::transport::EventReceiver<RawLinuxEvent>) -> Vec<RawLinuxEvent> {
+  fn recv_batch(rx: &crate::os::EventReceiver) -> Vec<RawLinuxEvent> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
       match rx.try_recv() {
-        Ok(SourceMessage::Batch(payload)) => return payload.events,
+        Ok(SourceMessage::Batch(payload)) => {
+          return payload
+            .events
+            .into_iter()
+            .map(|ev| match ev {
+              crate::os::SourceEvent::Linux(ev) => ev,
+              other => panic!("an inotify source only emits Linux records: {other:?}"),
+            })
+            .collect();
+        }
         Ok(_) => continue,
         Err(_) => std::thread::sleep(Duration::from_millis(20)),
       }

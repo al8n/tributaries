@@ -78,7 +78,12 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
     // loss rides the SAME ordered queue in-band — the queue is unbounded, so
     // a signal send cannot fail for capacity and cannot overtake the batches
     // it postdates.
-    crate::os::transport::forward_batch(&shared.transport, batch.events, batch.lossy, |msg| {
+    let events = batch
+      .events
+      .into_iter()
+      .map(crate::os::SourceEvent::FsEvents)
+      .collect();
+    crate::os::transport::forward_batch(&shared.transport, events, batch.lossy, |msg| {
       shared.queue.try_send(msg).is_ok()
     });
   }));

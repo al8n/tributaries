@@ -23,7 +23,7 @@
 //! read of the live table is installed.
 
 use std::{
-  collections::{BTreeMap, BTreeSet, VecDeque},
+  collections::{BTreeMap, VecDeque},
   num::NonZeroU64,
   path::{Path, PathBuf},
   sync::Arc,
@@ -31,13 +31,17 @@ use std::{
 };
 
 use tributary_proto::{
-  Capabilities, Change, FileKind, Identity, Instant, Interest, Location, Monitor, MoveCookie,
-  OsRecord, RecordKind, Scope, ScopeId, Segment, SubtreeScope, WatchError, WatchId,
+  Capabilities, Change, DirEntry, EnumerateResult, FileKind, Identity, Instant, Interest, IoClass,
+  Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope, ScopeId, Segment,
+  SubtreeScope, WatchError, WatchId,
 };
 
 use crate::os::{
-  BatchPayload, FsEventFlags, RawOsEvent, RootMeta, SourceError, transport::BudgetPermit,
+  BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootMeta, SourceError, SourceEvent,
+  linux::WatchOutcome, transport::BudgetPermit,
 };
+
+mod compile;
 
 #[cfg(test)]
 mod tests;
@@ -100,6 +104,37 @@ pub(crate) enum Effect {
     root: Arc<PathBuf>,
     /// The change to deliver.
     change: Change,
+  },
+  /// Install a kernel watch for one directory the Monitor descended into,
+  /// reporting the outcome through
+  /// [`on_watch_installed`](DriverCore::on_watch_installed).
+  AddWatch {
+    /// The Monitor watch being armed.
+    watch: WatchId,
+    /// The already-armed parent watch (its anchor roots the open).
+    parent: WatchId,
+    /// The child's name under the parent.
+    name: Segment,
+    /// The child's absolute path — the parent's path joined with the name;
+    /// executors and fakes address the object by it.
+    path: Arc<PathBuf>,
+  },
+  /// Remove one per-directory kernel watch the Monitor dropped. Fire-and-
+  /// forget: the Monitor's unwatch carries no result contract, and a wd the
+  /// removal never reached is reclaimed when the scope's stream closes.
+  RemoveWatch {
+    /// The Monitor watch being disarmed.
+    watch: WatchId,
+  },
+  /// Read one directory (blocking readdir + per-entry stat), reporting the
+  /// raw listing through [`on_enumerated`](DriverCore::on_enumerated).
+  Enumerate {
+    /// The correlation id the result must echo.
+    req: ReqId,
+    /// The directory's watch.
+    watch: WatchId,
+    /// The directory's absolute path.
+    path: Arc<PathBuf>,
   },
   /// Re-read the live mount table strictly under `root` (blocking) and feed
   /// the result back through
@@ -277,6 +312,9 @@ struct DyingDelivery {
 #[derive(Debug)]
 struct ScopeState {
   watch: WatchId,
+  /// The backend lowering profile registration intended; the spawned
+  /// source's [`RootMeta`] must agree.
+  profile: BackendKind,
   requested: PathBuf,
   /// Canonicalized root bytes — known once the stream spawned. Shared so
   /// every delivery can carry it without copying.
@@ -334,6 +372,13 @@ pub(crate) struct DriverCore {
   monitor: Monitor,
   scopes: BTreeMap<ScopeId, ScopeState>,
   watch_scopes: BTreeMap<WatchId, ScopeId>,
+  /// Every live watch's absolute path (the root's canonical path; a child's
+  /// = its parent's joined with its name) — how descending effects address
+  /// objects. Same order of growth as the Monitor's own tree.
+  watch_paths: BTreeMap<WatchId, Arc<PathBuf>>,
+  /// Outstanding enumerate requests: the scope whose state mints entry
+  /// identities when the raw listing returns, plus the read directory.
+  enum_reqs: BTreeMap<ReqId, (ScopeId, Arc<PathBuf>)>,
   probes: BTreeMap<ProbeId, ProbeCtx>,
   effects: VecDeque<Effect>,
   /// Terminal `Rescan`s of torn-down scopes, each retried until accepted.
@@ -347,17 +392,14 @@ pub(crate) struct DriverCore {
 impl DriverCore {
   /// Builds a core whose Monitor pairs renames within `move_window`.
   pub(crate) fn new(move_window: Duration) -> Self {
-    let mut monitor = Monitor::new(
-      Capabilities::new()
-        .with_supports_push()
-        .with_native_move()
-        .with_kernel_recursive(),
-    );
+    let mut monitor = Monitor::new(caps_for(BackendKind::FsEvents));
     monitor.set_move_window(move_window);
     Self {
       monitor,
       scopes: BTreeMap::new(),
       watch_scopes: BTreeMap::new(),
+      watch_paths: BTreeMap::new(),
+      enum_reqs: BTreeMap::new(),
       probes: BTreeMap::new(),
       effects: VecDeque::new(),
       dying: BTreeMap::new(),
@@ -368,14 +410,22 @@ impl DriverCore {
 
   /// Registers a new watched root, returning its scope handle. Queues the
   /// [`Effect::SpawnStream`] that starts the native source.
-  pub(crate) fn on_watch(&mut self, root: PathBuf, interest: Interest) -> ScopeId {
+  pub(crate) fn on_watch(
+    &mut self,
+    root: PathBuf,
+    interest: Interest,
+    profile: BackendKind,
+  ) -> ScopeId {
     self.scope_seq += 1;
     let scope = ScopeId::new(NonZeroU64::new(self.scope_seq).expect("sequence starts at one"));
-    let watch = self.monitor.register_root(scope, interest);
+    let watch = self
+      .monitor
+      .register_root_with_profile(scope, interest, caps_for(profile));
     self.scopes.insert(
       scope,
       ScopeState {
         watch,
+        profile,
         requested: root,
         root: None,
         root_dev: None,
@@ -409,7 +459,13 @@ impl DriverCore {
     let watch = state.watch;
     match res {
       Ok(meta) => {
-        state.root = Some(Arc::new(meta.root));
+        debug_assert!(
+          profile_of(meta.backend) == state.profile,
+          "the spawned backend must match the registered profile"
+        );
+        let root = Arc::new(meta.root);
+        self.watch_paths.insert(watch, Arc::clone(&root));
+        state.root = Some(root);
         state.root_dev = Some(meta.root_dev);
         state.mounts = meta.mounts;
         // Born closed: the seed was read before the stream started, so a
@@ -441,6 +497,73 @@ impl DriverCore {
     self.drain_monitor();
   }
 
+  /// Feeds one descending arm's outcome. An [`Aliased`](WatchOutcome::Aliased)
+  /// anchor maps to a successful watch-result exactly like a fresh install:
+  /// the wd table fans the shared kernel watch's events out to every anchor,
+  /// so the anchor's coverage is real — the Monitor proceeds to its cold
+  /// enumerate and the inventory is correct.
+  pub(crate) fn on_watch_installed(&mut self, watch: WatchId, outcome: WatchOutcome) {
+    let res = match outcome {
+      WatchOutcome::Installed(_) | WatchOutcome::Aliased(_) => Ok(()),
+      WatchOutcome::Failed(err) => Err(err),
+    };
+    self.monitor.on_watch_result(watch, res);
+    self.drain_monitor();
+  }
+
+  /// Feeds one raw directory listing back for the enumerate that requested
+  /// it, minting each entry's identity through the SAME policy the probe path
+  /// uses (enumerate-side identity is the authority; a foreign-device entry
+  /// mints `None`). A foreign-device DIRECTORY is lowered as
+  /// [`FileKind::Other`]: the mount boundary is the scope boundary, so the
+  /// Monitor must not descend it — the entry still delivers, the subtree
+  /// beyond the boundary is deliberately outside coverage (the settled
+  /// single-device policy).
+  pub(crate) fn on_enumerated(&mut self, req: ReqId, raw: RawEnumerate) {
+    let Some((scope, dir)) = self.enum_reqs.remove(&req) else {
+      return;
+    };
+    let res = match raw {
+      RawEnumerate::Failed(class) => EnumerateResult::Failed(class),
+      RawEnumerate::Listed { entries, complete } => {
+        let Some(state) = self.scopes.get(&scope) else {
+          return;
+        };
+        let mut listed = Vec::with_capacity(entries.len());
+        let mut lossy = false;
+        for entry in entries {
+          let Ok(name) = core::str::from_utf8(&entry.name) else {
+            // A non-UTF-8 name cannot become a `Segment` (the documented v1
+            // limitation): degrade the listing to Partial so the Monitor's
+            // bounded retry + standing Rescan cover the unrepresentable
+            // entry rather than silently omitting it.
+            lossy = true;
+            continue;
+          };
+          let path = dir.join(name);
+          let node = mint(state, &path, NonZeroU64::new(entry.ino), Some(entry.dev));
+          let kind = if entry.kind.is_dir() && state.root_dev != Some(entry.dev) {
+            FileKind::Other
+          } else {
+            entry.kind
+          };
+          let mut dir_entry = DirEntry::new(Segment::new(name), kind);
+          if let Some(node) = node {
+            dir_entry = dir_entry.with_node(node);
+          }
+          listed.push(dir_entry);
+        }
+        if complete && !lossy {
+          EnumerateResult::Ok(listed)
+        } else {
+          EnumerateResult::Partial(listed)
+        }
+      }
+    };
+    self.monitor.on_enumerate(req, res);
+    self.drain_monitor();
+  }
+
   /// Feeds one decoded callback batch for `scope`, taking the whole payload:
   /// the budget slot rides with the events for as long as the core retains
   /// them (parked active or queued), so parked memory stays inside the
@@ -465,9 +588,22 @@ impl DriverCore {
     self.drain_monitor();
   }
 
-  /// Test entry taking bare events under a detached budget slot.
+  /// Test entry taking bare FSEvents records under a detached budget slot.
   #[cfg(test)]
   pub(crate) fn on_batch_events(&mut self, scope: ScopeId, events: Vec<RawOsEvent>, now: Instant) {
+    let events = events.into_iter().map(SourceEvent::FsEvents).collect();
+    self.on_batch(scope, BatchPayload::detached(events), now);
+  }
+
+  /// Test entry taking bare attributed inotify records.
+  #[cfg(test)]
+  pub(crate) fn on_inotify_events(
+    &mut self,
+    scope: ScopeId,
+    events: Vec<crate::os::linux::RawLinuxEvent>,
+    now: Instant,
+  ) {
+    let events = events.into_iter().map(SourceEvent::Linux).collect();
     self.on_batch(scope, BatchPayload::detached(events), now);
   }
 
@@ -763,6 +899,52 @@ impl DriverCore {
   /// feeds the Monitor in item order, then applies the deferred unmount
   /// trust-removals (the monotone rule's late edge). Parks instead when
   /// probes are still outstanding.
+  /// Lowers one raw batch per the scope's backend profile. The FSEvents path
+  /// probe-grounds ambiguity; the inotify path is direct. A payload variant
+  /// that disagrees with the profile is a seam bug — its events degrade to a
+  /// root rescan rather than a wrong lowering.
+  fn compile(
+    &mut self,
+    state: &mut ScopeState,
+    scope: ScopeId,
+    events: Vec<SourceEvent>,
+  ) -> PendingBatch {
+    match state.profile {
+      BackendKind::FsEvents => {
+        let mut fsevents = Vec::with_capacity(events.len());
+        let mut mismatched = false;
+        for ev in events {
+          match ev {
+            SourceEvent::FsEvents(ev) => fsevents.push(ev),
+            SourceEvent::Linux(_) => mismatched = true,
+          }
+        }
+        let mut batch = self.compile_fsevents(state, scope, fsevents);
+        if mismatched {
+          debug_assert!(false, "a Linux event reached an FSEvents scope");
+          batch.trailing.push(Planned::Over(Scope::Root(scope)));
+        }
+        batch
+      }
+      BackendKind::Inotify => {
+        let mut linux = Vec::with_capacity(events.len());
+        let mut mismatched = false;
+        for ev in events {
+          match ev {
+            SourceEvent::Linux(ev) => linux.push(ev),
+            SourceEvent::FsEvents(_) => mismatched = true,
+          }
+        }
+        let mut batch = self.compile_inotify(state, scope, linux);
+        if mismatched {
+          debug_assert!(false, "an FSEvents event reached an inotify scope");
+          batch.trailing.push(Planned::Over(Scope::Root(scope)));
+        }
+        batch
+      }
+    }
+  }
+
   fn settle_if_ready(
     monitor: &mut Monitor,
     state: &mut ScopeState,
@@ -896,99 +1078,6 @@ impl DriverCore {
     }
   }
 
-  /// Compiles one raw batch into planned Monitor inputs, minting probes for
-  /// everything a flag word alone cannot ground.
-  ///
-  /// Rename pairing is probe-grounded per half — there is no same-batch
-  /// no-probe fast path. Each half's probe establishes existence AND the
-  /// authoritative device that decides its cookie, and the pairing itself is
-  /// the Monitor's `(scope, cookie)` window. The cost is one `lstat` per
-  /// rename half on the blocking pool, accepted by design: an event-side
-  /// pre-pair must trust device facts it cannot observe, which is exactly how
-  /// a fabricated cross-device move happens.
-  fn compile(
-    &mut self,
-    state: &mut ScopeState,
-    scope: ScopeId,
-    events: Vec<RawOsEvent>,
-  ) -> PendingBatch {
-    // Device-trust mutations are MONOTONE WITHIN THE BATCH. A mount ADD only
-    // ever reduces trust, so it applies before anything is classified — a
-    // rename sharing its batch with the MOUNT that makes its path foreign
-    // must already see the prefix. An unmount REMOVE only ever increases
-    // trust, so it is deferred to the batch's settlement, strictly after
-    // every classification and cookie decision (including probe resolutions
-    // and the vanished-half grant): a rename coalesced just before its
-    // volume unmounted still fails closed.
-    let mut deferred_unmounts: Vec<PathBuf> = Vec::new();
-    for ev in &events {
-      if ev.flags.mount() {
-        apply_mount_add(state, ev);
-      } else if ev.flags.unmount() && matches!(lower(state, &ev.path), Lowered::Target(_)) {
-        deferred_unmounts.push(ev.path.clone());
-      }
-    }
-    // Same-fileID grouping decides chain SUPPRESSION only. A group larger
-    // than a pair is a chain or coalesced reuse: existence probes see only
-    // the FINAL state of several operations, so its members never mint the
-    // shared cookie and the whole group is covered by one trailing located
-    // rescan. A pair or a singleton needs no belt — its probes ground each
-    // half completely, and the Monitor's displacement semantics keep even a
-    // mis-ordered pair a safe degrade.
-    let mut rename_groups: BTreeMap<NonZeroU64, Vec<usize>> = BTreeMap::new();
-    for (idx, ev) in events.iter().enumerate() {
-      // Only a PURE rename word groups: a word also carrying
-      // create/remove/modify/attrib bits routes through the probing grounding
-      // table with its extra operation surfaced.
-      if ev.flags.is_pure_rename()
-        && let Some(fid) = ev.file_id
-      {
-        rename_groups.entry(fid).or_default().push(idx);
-      }
-    }
-    let mut suppressed: BTreeSet<usize> = BTreeSet::new();
-    let mut trailing: Vec<Planned> = Vec::new();
-    for group in rename_groups.values() {
-      if group.len() > 2 {
-        suppressed.extend(group.iter().copied());
-        trailing.push(Self::covering_rescan(
-          state,
-          scope,
-          group.iter().map(|idx| &events[*idx].path),
-        ));
-      }
-    }
-
-    let mut items = Vec::with_capacity(events.len());
-    let mut awaiting = 0usize;
-    for (idx, ev) in events.iter().enumerate() {
-      match self.plan_event(state, scope, idx, ev, !suppressed.contains(&idx)) {
-        ItemPlan::Immediate(planned) => items.push(Item {
-          planned,
-          probe: None,
-          cookie_candidate: None,
-        }),
-        ItemPlan::Await { probe, path } => {
-          awaiting += 1;
-          self.effects.push_back(Effect::Probe { probe, path });
-          items.push(Item {
-            planned: Vec::new(),
-            probe: Some(probe),
-            cookie_candidate: None,
-          });
-        }
-      }
-    }
-    PendingBatch {
-      items,
-      awaiting,
-      trailing,
-      deferred_unmounts,
-      evidenced: BTreeMap::new(),
-      permit: None,
-    }
-  }
-
   /// One rescan covering an ambiguous same-fileID rename group: the deepest
   /// common ancestor of the members' parents, clamped to the whole root when
   /// any member falls outside it.
@@ -1025,148 +1114,6 @@ impl DriverCore {
       Some(Location::from_segments(descent))
     };
     Planned::Over(located(state.watch, target))
-  }
-
-  /// Plans one non-paired event. See the design's grounding table: flags are
-  /// hints; a single-verb word maps directly, everything ambiguous probes,
-  /// and everything un-groundable escalates to a located rescan.
-  fn plan_event(
-    &mut self,
-    state: &mut ScopeState,
-    scope: ScopeId,
-    idx: usize,
-    ev: &RawOsEvent,
-    allow_cookie: bool,
-  ) -> ItemPlan {
-    let flags = ev.flags;
-    if flags.history_done() {
-      return ItemPlan::Immediate(Vec::new());
-    }
-    if flags.root_changed() {
-      let probe = self.mint_probe(scope, ProbePurpose::RootAlive { item: idx });
-      let path = state
-        .root
-        .as_deref()
-        .cloned()
-        .unwrap_or_else(|| state.requested.clone());
-      return ItemPlan::Await { probe, path };
-    }
-    if flags.event_ids_wrapped() {
-      state.resume_poisoned = true;
-      Self::trust_lost(&mut self.effects, scope, state);
-      return ItemPlan::Immediate(vec![Planned::Over(Scope::Root(scope))]);
-    }
-    if flags.lost_sync() {
-      Self::trust_lost(&mut self.effects, scope, state);
-      return ItemPlan::Immediate(vec![Planned::Over(Scope::Root(scope))]);
-    }
-    if flags.must_scan_subdirs() {
-      // Kernel-side loss like the drops above: the coalesced-away window may
-      // have carried a mount transition. Synthesized coverage rescans (an
-      // appeared directory, a chain belt) lose no events and do NOT revoke.
-      Self::trust_lost(&mut self.effects, scope, state);
-      return ItemPlan::Immediate(vec![Planned::Over(Self::clamp(state, scope, &ev.path))]);
-    }
-    if flags.mount() || flags.unmount() {
-      return ItemPlan::Immediate(self.plan_mount(state, scope, ev));
-    }
-
-    let lowered = lower(state, &ev.path);
-    let target = match lowered {
-      Lowered::Root => None,
-      Lowered::Target(location) => Some(location),
-      Lowered::Outside => {
-        return ItemPlan::Immediate(vec![Planned::Over(Scope::Root(scope))]);
-      }
-    };
-
-    let modified = flags.item_modified();
-    let attrib = flags.item_inode_meta_mod()
-      || flags.item_change_owner()
-      || flags.item_xattr_mod()
-      || flags.item_finder_info_mod();
-
-    if flags.item_renamed() {
-      let probe = self.mint_probe(
-        scope,
-        ProbePurpose::Rename {
-          item: idx,
-          file_id: ev.file_id,
-          target,
-          path: ev.path.clone(),
-          allow_cookie,
-          content_changed: modified || attrib,
-        },
-      );
-      return ItemPlan::Await {
-        probe,
-        path: ev.path.clone(),
-      };
-    }
-
-    let created = flags.item_created();
-    let removed = flags.item_removed();
-    match u8::from(created) + u8::from(removed) + u8::from(modified) + u8::from(attrib) {
-      0 => {
-        // A flag-less event means "something changed at this directory" with
-        // no per-item detail: only a located rescan is honest.
-        let over = Planned::Over(located(state.watch, target));
-        ItemPlan::Immediate(vec![over])
-      }
-      1 => {
-        let kind = if created {
-          RecordKind::Created
-        } else if removed {
-          RecordKind::Removed
-        } else if modified {
-          RecordKind::Modified
-        } else {
-          RecordKind::Attrib
-        };
-        let rec = record_from_event(state, kind, target, dir_hint(flags), ev.file_id, &ev.path);
-        ItemPlan::Immediate(vec![Planned::Rec(rec)])
-      }
-      _ => {
-        let probe = self.mint_probe(
-          scope,
-          ProbePurpose::Ambiguous {
-            item: idx,
-            flags,
-            target,
-            path: ev.path.clone(),
-          },
-        );
-        ItemPlan::Await {
-          probe,
-          path: ev.path.clone(),
-        }
-      }
-    }
-  }
-
-  /// Plans a mount-table update plus the located rescan the volume change
-  /// obliges; an unmount of the root itself is the scope's death.
-  fn plan_mount(
-    &mut self,
-    state: &mut ScopeState,
-    scope: ScopeId,
-    ev: &RawOsEvent,
-  ) -> Vec<Planned> {
-    match lower(state, &ev.path) {
-      Lowered::Root if ev.flags.unmount() => {
-        vec![Planned::Rec(OsRecord::new(
-          state.watch,
-          RecordKind::Ignored,
-        ))]
-      }
-      Lowered::Root => vec![Planned::Over(Scope::Root(scope))],
-      Lowered::Target(location) => {
-        // The trust mutation already ran in `compile`'s pre-scan; the volume
-        // change here plans only the coverage obligation it creates.
-        vec![Planned::Over(located(state.watch, Some(location)))]
-      }
-      Lowered::Outside => vec![Planned::Over(Scope::Root(scope))],
-    }
   }
 
   /// Resolves one probe's plan.
@@ -1371,11 +1318,42 @@ impl DriverCore {
               .map(|state| state.requested.clone())
               .unwrap_or_default();
             self.effects.push_back(Effect::SpawnStream { scope, root });
-          } else {
-            debug_assert!(false, "a kernel-recursive monitor never descends");
+          } else if let Some(child) = cmd.target().as_child() {
+            let parent = child.parent();
+            let (Some(&scope), Some(parent_path)) = (
+              self.watch_scopes.get(&parent),
+              self.watch_paths.get(&parent),
+            ) else {
+              debug_assert!(false, "a child watch descends from a known parent");
+              continue;
+            };
+            let name = child.name().clone();
+            let path = Arc::new(parent_path.join(name.as_str()));
+            self.watch_scopes.insert(cmd.id(), scope);
+            self.watch_paths.insert(cmd.id(), Arc::clone(&path));
+            self.effects.push_back(Effect::AddWatch {
+              watch: cmd.id(),
+              parent,
+              name,
+              path,
+            });
           }
         }
         tributary_proto::Action::Unwatch(watch) => {
+          let is_root = self
+            .watch_scopes
+            .get(&watch)
+            .and_then(|scope| self.scopes.get(scope))
+            .is_some_and(|state| state.watch == watch);
+          if !is_root {
+            // A per-directory child watch the Monitor dropped: disarm it and
+            // forget its addressing. Fire-and-forget — the unwatch carries no
+            // result contract, and an unreached wd dies with the stream.
+            self.watch_scopes.remove(&watch);
+            self.watch_paths.remove(&watch);
+            self.effects.push_back(Effect::RemoveWatch { watch });
+            continue;
+          }
           if let Some(scope) = self.watch_scopes.remove(&watch) {
             // The scope's terminal `Rescan` — parked by lag, or still queued
             // as a plain effect — is the only signal covering whatever the
@@ -1417,14 +1395,38 @@ impl DriverCore {
               );
             }
             self.probes.retain(|_, ctx| ctx.scope != scope);
+            let dead: Vec<WatchId> = self
+              .watch_scopes
+              .iter()
+              .filter(|(_, s)| **s == scope)
+              .map(|(w, _)| *w)
+              .collect();
+            for watch in dead {
+              self.watch_scopes.remove(&watch);
+              self.watch_paths.remove(&watch);
+            }
+            self.watch_paths.remove(&watch);
+            self.enum_reqs.retain(|_, (s, _)| *s != scope);
             self.effects.push_back(Effect::TeardownStream { scope });
           }
         }
+        tributary_proto::Action::Enumerate(cmd) => {
+          let watch = cmd.dir();
+          let (Some(&scope), Some(path)) =
+            (self.watch_scopes.get(&watch), self.watch_paths.get(&watch))
+          else {
+            debug_assert!(false, "an enumerate reads a known directory");
+            continue;
+          };
+          self.enum_reqs.insert(cmd.req(), (scope, Arc::clone(path)));
+          self.effects.push_back(Effect::Enumerate {
+            req: cmd.req(),
+            watch,
+            path: Arc::clone(path),
+          });
+        }
         other => {
-          debug_assert!(
-            false,
-            "a kernel-recursive monitor requests no reads: {other:?}"
-          );
+          debug_assert!(false, "the Monitor requests no other work: {other:?}");
         }
       }
     }
@@ -1700,6 +1702,50 @@ fn path_bytes(path: &Path) -> &[u8] {
   {
     path.as_os_str().to_str().map_or(&[][..], str::as_bytes)
   }
+}
+
+/// The Monitor capability profile a backend registers with.
+fn caps_for(backend: BackendKind) -> Capabilities {
+  let caps = Capabilities::new().with_supports_push().with_native_move();
+  match backend {
+    BackendKind::FsEvents => caps.with_kernel_recursive(),
+    BackendKind::Inotify => caps,
+  }
+}
+
+/// The lowering profile a spawned backend implies (today the two are the same
+/// enum; the indirection keeps the assert site honest if they ever diverge).
+fn profile_of(backend: BackendKind) -> BackendKind {
+  backend
+}
+
+/// One raw directory entry as the executor read it — name bytes and stat
+/// facts only; the CORE mints the proto `DirEntry` (identity policy needs the
+/// scope's device-trust state, which an executor never holds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawDirEntry {
+  /// The entry's name, as raw bytes (non-UTF-8 degrades the listing).
+  pub(crate) name: Vec<u8>,
+  /// The entry's kind.
+  pub(crate) kind: FileKind,
+  /// The device the entry lives on.
+  pub(crate) dev: u64,
+  /// The entry's inode number (0 = unknown).
+  pub(crate) ino: u64,
+}
+
+/// One raw enumerate outcome from the executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RawEnumerate {
+  /// The directory was read; `complete` is false when the read was cut short.
+  Listed {
+    /// The entries read.
+    entries: Vec<RawDirEntry>,
+    /// Whether the listing covered the whole directory.
+    complete: bool,
+  },
+  /// The directory could not be read.
+  Failed(IoClass),
 }
 
 /// Maps a spawn failure to the Monitor's watch-error vocabulary.

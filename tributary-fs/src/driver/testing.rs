@@ -13,12 +13,16 @@ use std::{
   },
 };
 
-use tributary_proto::{FileKind, ScopeId};
+use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 
 use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
 use crate::{
-  core::ProbeOutcome,
-  os::{RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError, SourceMessage},
+  core::{ProbeOutcome, RawDirEntry, RawEnumerate},
+  os::{
+    BackendKind, RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError, SourceEvent,
+    SourceMessage,
+    linux::{RawLinuxEvent, WatchOutcome},
+  },
 };
 
 /// A parked-work gate: the held flag plus its wakeup.
@@ -39,7 +43,6 @@ struct FakeSource {
   transport: Arc<crate::os::transport::TransportState>,
 }
 
-#[derive(Default)]
 struct FakeState {
   nodes: Mutex<HashMap<PathBuf, FakeNode>>,
   /// Every source spawned for a root, oldest first. A Vec, not a slot: two
@@ -80,6 +83,59 @@ struct FakeState {
   /// close-versus-wedged-teardown cell needs a teardown whose handle has
   /// already moved into the call, where no Drop backstop can exist.
   teardown_hold: Mutex<Option<HoldGate>>,
+  /// The backend the next spawn's `RootMeta` claims (and thus the lowering
+  /// profile the core confirms).
+  spawn_backend: Mutex<BackendKind>,
+  /// Per-directory arms executed, in call order.
+  arms: Mutex<Vec<(WatchId, PathBuf)>>,
+  /// Per-directory disarms executed.
+  disarms: Mutex<Vec<WatchId>>,
+  /// Enumerates executed, in call order.
+  enumerates: Mutex<Vec<(WatchId, PathBuf)>>,
+  /// Paths whose next arm fails with the given error (persistent).
+  watch_failures: Mutex<HashMap<PathBuf, tributary_proto::WatchError>>,
+  /// Paths whose arms resolve `Aliased` (the EEXIST fan-out outcome).
+  watch_aliases: Mutex<HashMap<PathBuf, i32>>,
+  /// Injected listings served before the default readdir, per path.
+  enumerate_answers: Mutex<HashMap<PathBuf, std::collections::VecDeque<RawEnumerate>>>,
+  /// When set, `enumerate` parks until the gate releases (the
+  /// close-versus-in-flight-enumerate cell).
+  enumerate_hold: Mutex<Option<HoldGate>>,
+  /// When set, `add_watch` parks until the gate releases (the
+  /// close-versus-in-flight-arm cell).
+  arm_hold: Mutex<Option<HoldGate>>,
+  /// The synthetic kernel-watch-descriptor sequence.
+  wd_seq: AtomicUsize,
+}
+
+impl Default for FakeState {
+  fn default() -> Self {
+    Self {
+      nodes: Mutex::default(),
+      sources: Mutex::default(),
+      shutdowns: AtomicUsize::new(0),
+      spawns: AtomicUsize::new(0),
+      refreshes: AtomicUsize::new(0),
+      refresh_answer: Mutex::default(),
+      spawn_mounts: Mutex::default(),
+      spawn_remaps: Mutex::default(),
+      replace_at_live: Mutex::default(),
+      spawn_order: Mutex::default(),
+      spawn_hold: Mutex::default(),
+      post_live_hold: Mutex::default(),
+      teardown_hold: Mutex::default(),
+      spawn_backend: Mutex::new(BackendKind::FsEvents),
+      arms: Mutex::default(),
+      disarms: Mutex::default(),
+      enumerates: Mutex::default(),
+      watch_failures: Mutex::default(),
+      watch_aliases: Mutex::default(),
+      enumerate_answers: Mutex::default(),
+      enumerate_hold: Mutex::default(),
+      arm_hold: Mutex::default(),
+      wd_seq: AtomicUsize::new(0),
+    }
+  }
 }
 
 /// A fake platform: sources are channels the test injects into through the
@@ -152,6 +208,18 @@ impl FakeFs {
   /// (build them from literals, never `PathBuf::join`, whose host separator
   /// breaks the byte-level root-prefix lowering on Windows).
   pub(crate) fn send_batch(&self, root: impl AsRef<Path>, events: Vec<RawOsEvent>) {
+    let events = events.into_iter().map(SourceEvent::FsEvents).collect();
+    self.send_source_batch(root, events);
+  }
+
+  /// Injects one decoded, anchor-attributed inotify batch through the same
+  /// forwarding protocol.
+  pub(crate) fn send_inotify_batch(&self, root: impl AsRef<Path>, events: Vec<RawLinuxEvent>) {
+    let events = events.into_iter().map(SourceEvent::Linux).collect();
+    self.send_source_batch(root, events);
+  }
+
+  fn send_source_batch(&self, root: impl AsRef<Path>, events: Vec<SourceEvent>) {
     let (sender, transport) = self.source_of(root);
     crate::os::transport::forward_batch(&transport, events, false, |msg| {
       sender.try_send(msg).is_ok()
@@ -254,6 +322,89 @@ impl FakeFs {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
     *self.state.post_live_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
+  }
+}
+
+impl FakeFs {
+  /// The backend the next spawns claim (and thus the profile the core runs).
+  pub(crate) fn spawn_backend(&self, backend: BackendKind) {
+    *self.state.spawn_backend.lock().unwrap() = backend;
+  }
+
+  /// Fails every arm of `path` with `err` (persistent until replaced).
+  pub(crate) fn fail_watch_at(&self, path: impl AsRef<Path>, err: tributary_proto::WatchError) {
+    self
+      .state
+      .watch_failures
+      .lock()
+      .unwrap()
+      .insert(path.as_ref().to_path_buf(), err);
+  }
+
+  /// Resolves every arm of `path` as `Aliased` — the EEXIST fan-out outcome.
+  pub(crate) fn alias_watch_at(&self, path: impl AsRef<Path>) {
+    let wd = self.state.wd_seq.fetch_add(1, Ordering::SeqCst) as i32 + 1;
+    self
+      .state
+      .watch_aliases
+      .lock()
+      .unwrap()
+      .insert(path.as_ref().to_path_buf(), wd);
+  }
+
+  /// Serves `answer` for the next enumerate of `path`, before the default
+  /// readdir of the fake tree.
+  pub(crate) fn enumerate_answer(&self, path: impl AsRef<Path>, answer: RawEnumerate) {
+    self
+      .state
+      .enumerate_answers
+      .lock()
+      .unwrap()
+      .entry(path.as_ref().to_path_buf())
+      .or_default()
+      .push_back(answer);
+  }
+
+  /// Holds every subsequent enumerate until released (the close-versus-
+  /// in-flight-enumerate cell).
+  pub(crate) fn hold_enumerates(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.enumerate_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
+  /// Holds every subsequent arm until released (the close-versus-in-flight-
+  /// arm cell).
+  pub(crate) fn hold_arms(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.arm_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
+  /// Per-directory arms executed so far.
+  pub(crate) fn arms(&self) -> Vec<(WatchId, PathBuf)> {
+    self.state.arms.lock().unwrap().clone()
+  }
+
+  /// Per-directory disarms executed so far.
+  pub(crate) fn disarms(&self) -> Vec<WatchId> {
+    self.state.disarms.lock().unwrap().clone()
+  }
+
+  /// Enumerates executed so far.
+  pub(crate) fn enumerates(&self) -> Vec<(WatchId, PathBuf)> {
+    self.state.enumerates.lock().unwrap().clone()
+  }
+
+  fn park_on(&self, hold: &Mutex<Option<HoldGate>>) {
+    let gate = hold.lock().unwrap().clone();
+    if let Some(gate) = gate {
+      let (held, cvar) = &*gate;
+      let mut parked = held.lock().unwrap();
+      while *parked {
+        parked = cvar.wait(parked).unwrap();
+      }
+    }
   }
 }
 
@@ -451,6 +602,7 @@ impl FsOps for FakeFs {
       mounts: self.state.spawn_mounts.lock().unwrap().clone(),
       identity,
       ancestors,
+      backend: *self.state.spawn_backend.lock().unwrap(),
     };
     Ok(SpawnedSource {
       handle: FakeHandle {
@@ -482,6 +634,77 @@ impl FsOps for FakeFs {
       .unwrap()
       .clone()
       .unwrap_or((Vec::new(), true))
+  }
+
+  fn add_watch(
+    &self,
+    watch: WatchId,
+    _parent: WatchId,
+    path: &Path,
+    _name: &Segment,
+  ) -> WatchOutcome {
+    self.park_on(&self.state.arm_hold);
+    self
+      .state
+      .arms
+      .lock()
+      .unwrap()
+      .push((watch, path.to_path_buf()));
+    if let Some(err) = self.state.watch_failures.lock().unwrap().get(path) {
+      return WatchOutcome::Failed(*err);
+    }
+    if let Some(wd) = self.state.watch_aliases.lock().unwrap().get(path) {
+      return WatchOutcome::Aliased(*wd);
+    }
+    let wd = self.state.wd_seq.fetch_add(1, Ordering::SeqCst) as i32 + 1;
+    WatchOutcome::Installed(wd)
+  }
+
+  fn remove_watch(&self, watch: WatchId) {
+    self.state.disarms.lock().unwrap().push(watch);
+  }
+
+  fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {
+    self.park_on(&self.state.enumerate_hold);
+    self
+      .state
+      .enumerates
+      .lock()
+      .unwrap()
+      .push((watch, path.to_path_buf()));
+    if let Some(answer) = self
+      .state
+      .enumerate_answers
+      .lock()
+      .unwrap()
+      .get_mut(path)
+      .and_then(|queue| queue.pop_front())
+    {
+      return answer;
+    }
+    // The default honest readdir of the fake tree: direct children of `path`.
+    let nodes = self.state.nodes.lock().unwrap();
+    if !nodes.get(path).is_some_and(|node| node.kind.is_dir()) {
+      return RawEnumerate::Failed(IoClass::NotFound);
+    }
+    let mut entries = Vec::new();
+    for (candidate, node) in nodes.iter() {
+      if candidate.parent() == Some(path) {
+        let Some(name) = candidate.file_name() else {
+          continue;
+        };
+        entries.push(RawDirEntry {
+          name: name.as_encoded_bytes().to_vec(),
+          kind: node.kind,
+          dev: node.dev,
+          ino: node.ino,
+        });
+      }
+    }
+    RawEnumerate::Listed {
+      entries,
+      complete: true,
+    }
   }
 }
 
