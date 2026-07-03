@@ -185,8 +185,8 @@ fn smoke_stream_reports_create_modify_rename_remove() {
   config.latency = Duration::from_millis(20);
   let (handle, rx, meta) = Source::spawn(config).expect("spawn stream");
   assert!(
-    meta.mounts_authoritative,
-    "the live mount table seeds the meta"
+    meta.mounts.is_empty(),
+    "a fresh tempdir has no submounts to seed"
   );
   assert_eq!(meta.root, dir, "the meta carries the canonical root");
 
@@ -261,8 +261,8 @@ fn over_budget_batches_signal_one_inband_overflow() {
   config.channel_capacity = NonZeroUsize::new(1).expect("nonzero");
   let (handle, rx, meta) = Source::spawn(config).expect("spawn stream");
   assert!(
-    meta.mounts_authoritative,
-    "the live mount table seeds the meta"
+    meta.mounts.is_empty(),
+    "a fresh tempdir has no submounts to seed"
   );
 
   // Waves spaced past the latency window force multiple callbacks while
