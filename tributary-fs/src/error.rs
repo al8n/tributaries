@@ -133,14 +133,17 @@ pub enum CloseError {
   /// torn down externally); streams are still reclaimed at process exit.
   #[error("the driver stopped before confirming the shutdown")]
   Stopped,
-  /// The close grace expired with stream teardowns still executing on the
-  /// blocking pool. Unlike a pending spawn — whose dropped result still tears
-  /// its stream down — a pending teardown already moved its handle into the
-  /// wedged shutdown call, so nothing can reclaim that stream until the call
-  /// returns: quiescence is NOT proven, and the OS reclaims at process exit.
-  #[error("{pending} stream teardown(s) still executing when the close grace expired")]
+  /// The close grace expired with stream work still executing on the blocking
+  /// pool: teardowns still inside their `shutdown` calls, or spawns that may
+  /// already own a live stream (the backend starts the stream and then
+  /// performs post-live metadata reads inside the same call). Neither proves
+  /// quiescence at reply time. Their reclamation stories differ: a wedged
+  /// teardown's stream is unreachable until the call returns (the OS reclaims
+  /// at process exit), while a wedged spawn's stream is reclaimed by its
+  /// undeliverable result dropping the handle once the wedge clears.
+  #[error("{pending} stream operation(s) still executing when the close grace expired")]
   NotQuiesced {
-    /// How many teardowns were still executing at grace expiry.
+    /// How many spawns and teardowns were still executing at grace expiry.
     pending: usize,
   },
 }

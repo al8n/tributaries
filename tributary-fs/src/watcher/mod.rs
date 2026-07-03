@@ -554,18 +554,21 @@ impl<R: RuntimeLite> Watcher<R> {
   /// once the driver has quiesced. The final drain into a full event buffer
   /// is best-effort, and quiescence is bounded by a ~1 s grace: a blocking
   /// pool wedged past it no longer holds the close. `Ok` PROVES every native
-  /// stream was torn down; a spawn wedged past the grace is the one accepted
-  /// residual (its dropped result still runs the teardown when it eventually
-  /// returns).
+  /// stream was torn down — a spawn or teardown wedged past the grace is
+  /// reported, never papered over (a wedged spawn may already own a live
+  /// stream: the backend starts it and then runs post-live metadata reads
+  /// inside the same call).
   ///
   /// # Errors
   ///
   /// [`CloseError::Stopped`] when the driver stopped before confirming (a
   /// panic or an external teardown) — including when the close command
   /// cannot be delivered at all — and [`CloseError::NotQuiesced`] when
-  /// stream teardowns were still executing at grace expiry — those streams
-  /// stay live until their wedged calls return; the OS reclaims at process
-  /// exit either way.
+  /// stream spawns or teardowns were still executing at grace expiry — those
+  /// streams stay live until their wedged calls return (a wedged spawn's
+  /// stream self-reclaims via its dropped result once the wedge clears; a
+  /// wedged teardown's is unreachable until the call returns); the OS
+  /// reclaims at process exit either way.
   pub async fn close(self) -> Result<(), CloseError> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self.commands.send(Command::Close { reply }).await.is_err() {
