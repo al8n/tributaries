@@ -7,7 +7,7 @@
 //! delivery by `try_send`), and feeds each outcome straight back in.
 
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, BTreeSet},
   num::NonZeroUsize,
   path::{Path, PathBuf},
   sync::Arc,
@@ -314,6 +314,13 @@ pub(crate) async fn run<R, F>(
   // reports termination, which would spin the loop's stream arm.
   os.push(futures_util::stream::pending().boxed());
   let mut handles: BTreeMap<ScopeId, F::Handle> = BTreeMap::new();
+  // Blocking-pool work that owns — or is about to own — a native stream:
+  // spawns dispatched but not yet returned, teardowns dispatched but not yet
+  // confirmed. Close quiesces BOTH alongside the live handles: a spawn still
+  // in flight can otherwise start a native source after the close reply, and
+  // an unconfirmed teardown is a stream still winding down.
+  let mut pending_spawns: BTreeSet<ScopeId> = BTreeSet::new();
+  let mut pending_teardowns: BTreeSet<ScopeId> = BTreeSet::new();
   let mut watch_replies: BTreeMap<ScopeId, WatchReply> = BTreeMap::new();
   let mut unwatch_replies: BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>> =
     BTreeMap::new();
@@ -329,6 +336,8 @@ pub(crate) async fn run<R, F>(
       &config,
       &op_tx,
       &mut handles,
+      &mut pending_spawns,
+      &mut pending_teardowns,
       &events,
       &mut unwatch_replies,
       &registry,
@@ -369,7 +378,9 @@ pub(crate) async fn run<R, F>(
       },
       res = op_rx.recv().fuse() => {
         match res.expect("the driver holds a sender") {
-          OpResult::Spawned { scope, result } => match result {
+          OpResult::Spawned { scope, result } => {
+            pending_spawns.remove(&scope);
+            match result {
             Ok(spawned) => {
               let canonical_root = spawned.meta.root.clone();
               core.on_stream_spawned(scope, Ok(spawned.meta));
@@ -420,7 +431,7 @@ pub(crate) async fn run<R, F>(
                 let _ = reply.send(Err(err));
               }
             }
-          },
+          }},
           OpResult::Probed { probe, outcome } => core.on_probe_result(probe, outcome, now()),
           OpResult::MountsRefreshed {
             scope,
@@ -428,6 +439,7 @@ pub(crate) async fn run<R, F>(
             authoritative,
           } => core.on_mounts_refreshed(scope, mounts, authoritative),
           OpResult::TornDown { scope } => {
+            pending_teardowns.remove(&scope);
             if let Some(reply) = unwatch_replies.remove(&scope) {
               let _ = reply.send(true);
             }
@@ -477,13 +489,18 @@ pub(crate) async fn run<R, F>(
     }
   };
 
-  // Orderly shutdown: quiesce every stream, drain what already arrived, and
-  // deliver what fits — the final drain is documented best-effort (loss and
-  // death signals are in-band messages, so anything undrained here is part
-  // of that same best-effort remainder).
-  let mut open: Vec<ScopeId> = handles.keys().copied().collect();
+  // Orderly shutdown: quiesce every stream — the live handles AND the
+  // blocking-pool work still capable of producing one (`pending_spawns`,
+  // `pending_teardowns`) — then drain what already arrived and deliver what
+  // fits. The final event drain is documented best-effort (loss and death
+  // signals are in-band messages, so anything undrained here is part of that
+  // same best-effort remainder). Uncommitted grants racing this close need no
+  // unwind processing: their scopes were either swept here (live handle) or
+  // settle below as late spawns; the unread unwind message dies with its
+  // channel.
   for (scope, handle) in std::mem::take(&mut handles) {
     registry.scope_dead(scope);
+    pending_teardowns.insert(scope);
     let tx = op_tx.clone();
     R::spawn_blocking_detach(move || {
       handle.shutdown();
@@ -491,10 +508,10 @@ pub(crate) async fn run<R, F>(
     });
   }
   let drain = async {
-    while !open.is_empty() {
+    while !(pending_teardowns.is_empty() && pending_spawns.is_empty()) {
       match op_rx.recv().await {
         Ok(OpResult::TornDown { scope }) => {
-          open.retain(|s| *s != scope);
+          pending_teardowns.remove(&scope);
           if let Some(reply) = unwatch_replies.remove(&scope) {
             let _ = reply.send(true);
           }
@@ -505,11 +522,29 @@ pub(crate) async fn run<R, F>(
           mounts,
           authoritative,
         }) => core.on_mounts_refreshed(scope, mounts, authoritative),
-        Ok(OpResult::Spawned { .. }) => {}
+        // A spawn that raced the close: the stream is live but has no owner —
+        // tear it down INSIDE the close accounting (the handle's Drop is only
+        // the backstop past the grace) and hold the close reply for its
+        // confirmation. Its scope never went registry-live, so there is no
+        // entry to reclaim; a failed spawn just settles its slot.
+        Ok(OpResult::Spawned { scope, result }) => {
+          pending_spawns.remove(&scope);
+          if let Ok(spawned) = result {
+            pending_teardowns.insert(scope);
+            let tx = op_tx.clone();
+            R::spawn_blocking_detach(move || {
+              spawned.handle.shutdown();
+              let _ = tx.try_send(OpResult::TornDown { scope });
+            });
+          }
+        }
         Err(_) => break,
       }
     }
   };
+  // Grace expiry with work still pending means a wedged blocking pool: the
+  // close reply goes out anyway (a wedged pool must not hang close forever),
+  // and a still-pending spawn's handle Drop remains the reclamation backstop.
   let _ = R::timeout(Duration::from_secs(1), drain).await;
   execute_effects::<R, F>(
     &mut core,
@@ -517,6 +552,8 @@ pub(crate) async fn run<R, F>(
     &config,
     &op_tx,
     &mut handles,
+    &mut pending_spawns,
+    &mut pending_teardowns,
     &events,
     &mut unwatch_replies,
     &registry,
@@ -535,6 +572,8 @@ fn execute_effects<R, F>(
   config: &DriverConfig,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
   handles: &mut BTreeMap<ScopeId, F::Handle>,
+  pending_spawns: &mut BTreeSet<ScopeId>,
+  pending_teardowns: &mut BTreeSet<ScopeId>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
   registry: &impl ScopeRegistry,
@@ -546,6 +585,7 @@ fn execute_effects<R, F>(
   while let Some(effect) = core.poll_effect() {
     match effect {
       Effect::SpawnStream { scope, root } => {
+        pending_spawns.insert(scope);
         let mut source_config = SourceConfig::new(vec![root]);
         source_config.exclusions = config.exclusions.clone();
         source_config.latency = config.latency;
@@ -563,6 +603,7 @@ fn execute_effects<R, F>(
         // root stops participating in liveness checks immediately.
         registry.scope_dead(scope);
         if let Some(handle) = handles.remove(&scope) {
+          pending_teardowns.insert(scope);
           let tx = op_tx.clone();
           R::spawn_blocking_detach(move || {
             handle.shutdown();

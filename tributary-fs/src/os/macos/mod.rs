@@ -184,23 +184,49 @@ impl Source {
 }
 
 /// The mount points strictly under `root`, read from the live mount table
-/// (`getmntinfo`). `None` means the table could not be read — the caller must
+/// (`getfsstat`). `None` means the table could not be read — the caller must
 /// then treat device boundaries as UNKNOWN rather than absent. Each mount
 /// path is run through the same filesystem-representation transform as event
 /// paths, so prefix comparison cannot drift on Unicode normalization.
 pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<PathBuf>> {
   use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
-  let mut raw: *mut libc::statfs = std::ptr::null_mut();
-  // SAFETY: getmntinfo hands back a process-managed buffer of `count`
-  // entries; MNT_NOWAIT avoids blocking on unresponsive filesystems.
-  let count = unsafe { libc::getmntinfo(&mut raw, libc::MNT_NOWAIT) };
-  if count <= 0 || raw.is_null() {
-    return None;
-  }
-  // SAFETY: getmntinfo initialized exactly `count` entries at `raw`.
-  let entries = unsafe { std::slice::from_raw_parts(raw, count as usize) };
+  // getfsstat into an owned buffer: the getmntinfo convenience wrapper hands
+  // out one shared per-process buffer and is not thread-safe — concurrent
+  // spawns raced it into spurious failures. MNT_NOWAIT avoids blocking on
+  // unresponsive filesystems.
+  let mut capacity = {
+    // SAFETY: a null buffer asks only for the mounted-filesystem count.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count < 0 {
+      return None;
+    }
+    count as usize + 8
+  };
+  let entries = loop {
+    let mut buf: Vec<libc::statfs> = Vec::with_capacity(capacity);
+    let bytes = (capacity * size_of::<libc::statfs>()) as libc::c_int;
+    // SAFETY: `buf` has room for `capacity` entries totalling `bytes`;
+    // getfsstat initializes and reports how many entries it wrote.
+    let written = unsafe { libc::getfsstat(buf.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+    if written < 0 {
+      return None;
+    }
+    let written = written as usize;
+    if written < capacity {
+      // SAFETY: getfsstat initialized exactly `written` entries.
+      unsafe { buf.set_len(written) };
+      break buf;
+    }
+    // A full buffer may be a truncated view (mounts appeared since sizing):
+    // grow and re-read, bounded — fail closed rather than trust a possibly
+    // partial table.
+    capacity *= 2;
+    if capacity > 4096 {
+      return None;
+    }
+  };
   let mut mounts = Vec::new();
-  for entry in entries {
+  for entry in &entries {
     let name = &entry.f_mntonname;
     let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
     let bytes: Vec<u8> = name[..len].iter().map(|&c| c as u8).collect();
