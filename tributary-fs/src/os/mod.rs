@@ -1,13 +1,19 @@
 //! The platform seam between the async driver and the OS watch primitive.
 //!
 //! Every platform module exposes the same surface: [`Source::spawn`] starts the
-//! native watch and hands back a [`SourceHandle`] plus the [`SourceChannels`]
-//! it reports on. The OS-callback side never blocks, and loss is IN-BAND: data
-//! rides a bounded channel, while `Overflow`/`Fatal` ride a tiny unbounded
-//! control channel whose sends cannot fail for capacity — so a loss signal can
-//! never be recorded without a message left to observe it. The dedup flag in
-//! the callback state bounds the control channel to one in-flight `Overflow`
-//! per driver acknowledgement.
+//! native watch and hands back a [`SourceHandle`] plus the ONE ordered queue
+//! it reports on. `Batch`, `Overflow`, and `Fatal` all ride that single
+//! unbounded FIFO, so per-source ordering between data and the loss/death
+//! signals covering it holds by construction, and a signal send can never
+//! fail for capacity — a loss can never be recorded without a message left to
+//! observe it, and no signal can overtake the batches it postdates. Memory is
+//! bounded not by the queue but by the batch budget
+//! ([`fsevent::TransportState`]): an over-budget batch is dropped at the
+//! callback and degrades to the same in-order `Overflow`.
+//!
+//! Of the queue the seam assumes exactly three properties — FIFO delivery,
+//! unbounded capacity, and a `Closed` signal once the receiver is gone — all
+//! of which `async_channel::unbounded` provides.
 
 use std::{io, num::NonZeroUsize, path::PathBuf, time::Duration};
 
@@ -23,7 +29,7 @@ mod unsupported;
 #[cfg(any(not(target_os = "macos"), miri))]
 pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
 
-pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
+pub(crate) use fsevent::{BatchPayload, FsEventFlags, OverflowAck, RawOsEvent};
 
 /// The most exclusion directories one native stream honors
 /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
@@ -59,34 +65,21 @@ impl SourceConfig {
   }
 }
 
-/// One message from the OS callback to the driver task.
+/// One message from the OS callback to the driver task, on the source's
+/// single ordered queue.
 #[derive(Debug)]
 pub(crate) enum SourceMessage {
-  /// One callback invocation's decoded events; the batch boundary is
-  /// preserved (it is the natural rename-pairing window). Rides the bounded
-  /// data channel.
-  Batch(Vec<RawOsEvent>),
-  /// Transport-level loss: a batch was dropped on a full data channel, or an
-  /// event could not be decoded. Rides the unbounded control channel; the
-  /// receiver must treat the source's subtrees as needing a rescan and then
-  /// acknowledge via [`SourceHandle::overflow_processed`], re-arming the
-  /// dedup for the next loss.
-  Overflow,
-  /// The stream is dead and will deliver nothing more (sent at most once, on
-  /// the control channel). The driver reacts to the death itself (root
-  /// invalidation); the carried class is diagnostic surface for a future
-  /// health-reporting channel.
+  /// One callback invocation's decoded events, holding their budget slot.
+  Batch(BatchPayload),
+  /// Transport-level loss AT THIS QUEUE POSITION: a batch was dropped over
+  /// budget, or an event could not be decoded. The receiver treats the
+  /// source's subtrees as needing a rescan; dropping the carried
+  /// [`OverflowAck`] (before acting) re-arms the dedup for the next loss.
+  Overflow(OverflowAck),
+  /// The stream is dead and will deliver nothing more (sent at most once).
+  /// The driver reacts to the death itself (root invalidation); the carried
+  /// class is diagnostic surface for a future health-reporting channel.
   Fatal(#[allow(dead_code)] SourceError),
-}
-
-/// The two receivers of one spawned source.
-#[derive(Debug)]
-pub(crate) struct SourceChannels {
-  /// Decoded batches, bounded by the configured capacity.
-  pub(crate) data: EventReceiver,
-  /// `Overflow`/`Fatal` signals, unbounded (and dedup-bounded in practice to
-  /// one in-flight `Overflow` plus one terminal `Fatal`).
-  pub(crate) control: EventReceiver,
 }
 
 /// Why a platform source could not start, or died.

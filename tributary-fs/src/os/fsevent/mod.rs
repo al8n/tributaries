@@ -7,7 +7,10 @@
 use std::{
   num::NonZeroU64,
   path::PathBuf,
-  sync::atomic::{AtomicBool, Ordering},
+  sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+  },
 };
 
 use super::{SourceError, SourceMessage};
@@ -275,79 +278,162 @@ pub(crate) fn path_from_fs_repr(bytes: &[u8]) -> Option<PathBuf> {
   }
 }
 
-/// A non-blocking send's outcome, reduced to the two facts the forwarding
-/// protocol dispatches on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SendOutcome {
-  /// The message was accepted.
-  Sent,
-  /// The channel was full; the message was dropped.
-  Full,
-  /// The receiver is gone; nothing will be read again.
-  Closed,
+/// The transport-side state one source's callback owns: the batch budget and
+/// the two signal dedups.
+///
+/// Every message of a source — `Batch`, `Overflow`, `Fatal` — rides ONE
+/// unbounded FIFO queue, so per-source ordering between data and the signals
+/// covering it holds by construction (there is no second lane to race) and a
+/// signal send can never fail for capacity. The queue being unbounded, memory
+/// is bounded here instead: a batch may enqueue only under a [`BudgetPermit`],
+/// and the dedups keep at most one `Overflow` (per acknowledgement) and one
+/// `Fatal` (ever) in flight.
+#[derive(Debug)]
+pub(crate) struct TransportState {
+  /// Batches currently enqueued (or being processed); the budget cap bounds
+  /// the queue's memory since the queue itself is unbounded.
+  in_flight: Arc<AtomicUsize>,
+  /// The most batches allowed in flight at once.
+  budget: usize,
+  /// One `Overflow` is enqueued and not yet acknowledged; further losses are
+  /// covered by it (the rescan it becomes reads current state).
+  overflow_pending: Arc<AtomicBool>,
+  /// The terminal `Fatal` was sent; later failures are no-ops.
+  fatal_sent: AtomicBool,
 }
 
-/// Forwards one decoded callback batch: data on the bounded channel, loss on
-/// the control channel.
+impl TransportState {
+  /// A fresh transport allowing `budget` batches in flight.
+  pub(crate) fn new(budget: usize) -> Self {
+    Self {
+      in_flight: Arc::new(AtomicUsize::new(0)),
+      budget,
+      overflow_pending: Arc::new(AtomicBool::new(false)),
+      fatal_sent: AtomicBool::new(false),
+    }
+  }
+
+  /// Batches currently holding a permit (in the queue or being processed).
+  #[cfg(test)]
+  pub(crate) fn in_flight(&self) -> usize {
+    self.in_flight.load(Ordering::Acquire)
+  }
+
+  /// Whether an unacknowledged `Overflow` is in flight.
+  #[cfg(test)]
+  pub(crate) fn overflow_pending(&self) -> bool {
+    self.overflow_pending.load(Ordering::Acquire)
+  }
+}
+
+/// The RAII budget slot one enqueued batch holds; dropping it — after
+/// processing, on a discarded payload, in a shutdown drain, anywhere —
+/// returns the slot, so the budget cannot leak on any path.
+#[derive(Debug)]
+pub(crate) struct BudgetPermit(Arc<AtomicUsize>);
+
+impl BudgetPermit {
+  /// Claims a slot, or `None` when the budget is exhausted.
+  fn acquire(transport: &TransportState) -> Option<Self> {
+    let cap = transport.budget;
+    transport
+      .in_flight
+      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n < cap).then_some(n + 1)
+      })
+      .ok()?;
+    Some(Self(Arc::clone(&transport.in_flight)))
+  }
+}
+
+impl Drop for BudgetPermit {
+  fn drop(&mut self) {
+    self.0.fetch_sub(1, Ordering::AcqRel);
+  }
+}
+
+/// One callback invocation's decoded events plus the budget slot they occupy.
+/// The batch boundary is preserved (it is the natural rename-pairing window).
+#[derive(Debug)]
+pub(crate) struct BatchPayload {
+  /// The decoded events, in callback order.
+  pub(crate) events: Vec<RawOsEvent>,
+  /// The budget slot; released when the payload drops.
+  pub(crate) permit: BudgetPermit,
+}
+
+/// The RAII acknowledgement riding an `Overflow` message: dropping it —
+/// normally by the driver just before it acts on the loss, but equally by a
+/// refused send or a shutdown drain — re-arms the dedup so the next loss
+/// signals afresh. A loss racing the acknowledgement either elects a fresh
+/// message or is covered by the rescan the acknowledged one is about to
+/// become.
+#[derive(Debug)]
+pub(crate) struct OverflowAck(Arc<AtomicBool>);
+
+impl Drop for OverflowAck {
+  fn drop(&mut self) {
+    self.0.store(false, Ordering::Release);
+  }
+}
+
+/// Forwards one decoded callback batch onto the source's single ordered
+/// queue.
 ///
-/// Loss is an IN-BAND control message, never a latch a wake must later drain:
-/// the control channel is unbounded, so [`signal_loss`] cannot fail for lack
-/// of capacity, and the dedup flag bounds it to one in-flight `Overflow` per
-/// acknowledgement — there is no interleaving in which a loss is recorded
-/// with no message left to observe it (the latch-and-wake protocol this
-/// replaces had exactly that hole, three review rounds running).
+/// `send` returning `false` means the receiver is gone (the queue is
+/// unbounded, so capacity is never the reason); nothing further is signaled —
+/// a refused `Overflow` is dropped by the send itself, and its
+/// [`OverflowAck`] resets the dedup so a future generation is not muted.
 ///
-/// A batch dropped on a full data channel and an undecodable entry both
-/// degrade to the same `Overflow`; a closed data channel means the receiver
-/// is gone and nothing is signaled.
-pub(crate) fn forward_batch<D, C>(
-  overflow_pending: &AtomicBool,
+/// A batch over budget and an undecodable entry both degrade to the same
+/// in-order `Overflow`.
+pub(crate) fn forward_batch<S>(
+  transport: &TransportState,
   events: Vec<RawOsEvent>,
   lossy: bool,
-  mut send_data: D,
-  send_control: C,
+  mut send: S,
 ) where
-  D: FnMut(SourceMessage) -> SendOutcome,
-  C: FnOnce(SourceMessage) -> bool,
+  S: FnMut(SourceMessage) -> bool,
 {
   let mut lost = lossy;
   if !events.is_empty() {
-    match send_data(SourceMessage::Batch(events)) {
-      SendOutcome::Sent => {}
-      SendOutcome::Full => lost = true,
-      SendOutcome::Closed => return,
+    match BudgetPermit::acquire(transport) {
+      Some(permit) => {
+        if !send(SourceMessage::Batch(BatchPayload { events, permit })) {
+          return;
+        }
+      }
+      None => lost = true,
     }
   }
   if lost {
-    signal_loss(overflow_pending, send_control);
+    signal_loss(transport, send);
   }
 }
 
-/// Sends one deduplicated `Overflow` on the control channel.
+/// Enqueues one deduplicated `Overflow`.
 ///
-/// The flag's false→true transition elects exactly one sender; it stays set
-/// until the driver acknowledges the message (resetting the flag), so at most
-/// one `Overflow` is ever in flight — losses meanwhile are covered by it,
-/// since the driver's rescan reads current state. `send` returning `false`
-/// means the control receiver is gone; the flag is restored so a future
-/// generation is not muted.
-pub(crate) fn signal_loss<C>(overflow_pending: &AtomicBool, send: C)
+/// The dedup's false→true transition elects exactly one sender; the flag
+/// stays set until the message's [`OverflowAck`] drops (the driver
+/// acknowledging, a refused send, a drain), so at most one `Overflow` is ever
+/// in flight and losses meanwhile are covered by it.
+pub(crate) fn signal_loss<S>(transport: &TransportState, mut send: S)
 where
-  C: FnOnce(SourceMessage) -> bool,
+  S: FnMut(SourceMessage) -> bool,
 {
-  if !overflow_pending.swap(true, Ordering::AcqRel) && !send(SourceMessage::Overflow) {
-    overflow_pending.store(false, Ordering::Release);
+  if !transport.overflow_pending.swap(true, Ordering::AcqRel) {
+    let ack = OverflowAck(Arc::clone(&transport.overflow_pending));
+    // A refused send drops the message here, whose ack re-arms the dedup.
+    let _ = send(SourceMessage::Overflow(ack));
   }
 }
 
-/// Sends the stream's one terminal `Fatal` on the control channel, at most
-/// once ever. Unbounded control means the send cannot fail for capacity; the
-/// flag makes later panics no-ops.
-pub(crate) fn signal_fatal_once<C>(fatal_sent: &AtomicBool, err: SourceError, send: C)
+/// Enqueues the stream's one terminal `Fatal`, at most once ever.
+pub(crate) fn signal_fatal_once<S>(transport: &TransportState, err: SourceError, mut send: S)
 where
-  C: FnOnce(SourceMessage) -> bool,
+  S: FnMut(SourceMessage) -> bool,
 {
-  if !fatal_sent.swap(true, Ordering::AcqRel) {
+  if !transport.fatal_sent.swap(true, Ordering::AcqRel) {
     let _ = send(SourceMessage::Fatal(err));
   }
 }

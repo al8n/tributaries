@@ -1855,3 +1855,153 @@ fn vanished_half_grant_keys_on_probed_inode() {
   assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "gone"])));
   assert_eq!(emitted[0].location(), &loc(&["b", "kept"]));
 }
+
+mod lowering {
+  use super::*;
+
+  fn state_with_root(root: &str) -> ScopeState {
+    ScopeState {
+      watch: WatchId::new(NonZeroU64::new(99).unwrap()),
+      requested: PathBuf::from(root),
+      root: Some(Arc::new(PathBuf::from(root))),
+      root_dev: Some(1),
+      mounts: Vec::new(),
+      mounts_authoritative: true,
+      refresh_pending: false,
+      refresh_stale: false,
+      lag: LagState::Normal,
+      park: Park::default(),
+      resume_poisoned: false,
+    }
+  }
+
+  enum Expect {
+    Root,
+    Target(&'static [&'static str]),
+    Outside,
+  }
+
+  /// The lowering property table over root and path edge shapes — above all
+  /// the filesystem root `/`, the one canonical root that ends with the
+  /// separator (its descendants strip to a bare remainder).
+  #[test]
+  fn lowering_covers_root_and_prefix_edge_cases() {
+    let cases: &[(&str, &str, Expect)] = &[
+      ("/", "/", Expect::Root),
+      ("/", "/tmp", Expect::Target(&["tmp"])),
+      ("/", "/tmp/a", Expect::Target(&["tmp", "a"])),
+      ("/", "//tmp//x", Expect::Target(&["tmp", "x"])),
+      ("/a", "/a", Expect::Root),
+      ("/a", "/a/b", Expect::Target(&["b"])),
+      ("/a", "/a/b/c", Expect::Target(&["b", "c"])),
+      ("/a", "/ab", Expect::Outside),
+      ("/a", "/b/c", Expect::Outside),
+      ("/a", "/", Expect::Outside),
+      ("/a/b", "/a/b/c/d", Expect::Target(&["c", "d"])),
+      ("/a/b", "/a/bc", Expect::Outside),
+      ("/a/b", "/a/b/", Expect::Root),
+    ];
+    for (root, path, expect) in cases {
+      let state = state_with_root(root);
+      match (lower(&state, Path::new(path)), expect) {
+        (Lowered::Root, Expect::Root) => {}
+        (Lowered::Target(got), Expect::Target(parts)) => {
+          assert_eq!(got, loc(parts), "root {root} path {path}");
+        }
+        (Lowered::Outside, Expect::Outside) => {}
+        (got, _) => {
+          let shape = match got {
+            Lowered::Root => "Root".to_string(),
+            Lowered::Target(l) => format!("Target({l:?})"),
+            Lowered::Outside => "Outside".to_string(),
+          };
+          panic!("root {root} path {path}: unexpected {shape}");
+        }
+      }
+    }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn non_utf8_segments_lower_outside() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let state = state_with_root("/r");
+    let path = PathBuf::from(OsStr::from_bytes(b"/r/\xC3\x28"));
+    assert!(matches!(lower(&state, &path), Lowered::Outside));
+  }
+
+  /// A scope rooted at the filesystem root grounds its descendants as
+  /// LOCATED events — not whole-root rescans (the pre-fix behavior made a
+  /// `/` root unusable).
+  #[test]
+  fn filesystem_root_scope_grounds_descendants_located() {
+    let mut core = DriverCore::new(WINDOW);
+    let scope = core.on_watch(PathBuf::from("/"), Interest::all());
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/"),
+        root_dev: 1,
+        mounts: Vec::new(),
+        mounts_authoritative: true,
+      }),
+    );
+    let _ = drain(&mut core);
+
+    core.on_batch(
+      scope,
+      vec![ev(
+        "/tmp/x.txt",
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        1,
+        10,
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert!(emitted[0].kind().is_created());
+    assert_eq!(
+      emitted[0].location(),
+      &loc(&["tmp", "x.txt"]),
+      "a / root lowers descendants to located events"
+    );
+
+    // A deep MustScanSubDirs clamps to a LOCATED subtree rescan, not the root.
+    core.on_batch(
+      scope,
+      vec![ev("/tmp", flags(&[FsEventFlags::MUST_SCAN_SUBDIRS]), 2, 0)],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(
+      emitted
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["tmp"])),
+      "{emitted:?}"
+    );
+
+    // A mount transition under / records located coverage, not a root wipe.
+    core.on_batch(
+      scope,
+      vec![ev(
+        "/Volumes/usb",
+        flags(&[FsEventFlags::MOUNT, FsEventFlags::ITEM_IS_DIR]),
+        3,
+        0,
+      )],
+      at(3),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(
+      emitted
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["Volumes", "usb"])),
+      "{emitted:?}"
+    );
+  }
+}

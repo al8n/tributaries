@@ -153,3 +153,149 @@ async fn registry_reclaims_on_unwatch_cycles() {
   }
   watcher.close().await.expect("close");
 }
+
+mod lifecycle {
+  use super::*;
+  use crate::driver::testing::FakeFs;
+  use agnostic_lite::tokio::TokioRuntime;
+  use std::time::Duration;
+  use tributary_proto::FileKind;
+
+  fn scratch(tag: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+      "tributary-fs-lifecycle-{}-{tag}",
+      std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let canonical = std::fs::canonicalize(&dir).expect("canonicalize");
+    (dir, canonical)
+  }
+
+  /// Gives the driver and blocking pool scheduler slices under paused time.
+  async fn settle(mut done: impl FnMut() -> bool) {
+    for _ in 0..200 {
+      if done() {
+        return;
+      }
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  }
+
+  /// The R7 registry race cell, end to end: the source dies after the grant
+  /// was delivered but before `watch()` polls it out. The single-writer
+  /// registry saw live-then-dead in driver order; the late commit yields a
+  /// dead-on-arrival handle, and the path is immediately re-watchable.
+  #[tokio::test(start_paused = true)]
+  async fn death_before_the_grant_poll_yields_a_dead_on_arrival_handle() {
+    let (dir, canonical) = scratch("doa");
+    let fs = FakeFs::new(1);
+    fs.put(&canonical, FileKind::Dir, 1);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let mut fut = Box::pin(watcher.watch(&dir, Interest::all()));
+    assert!(futures_util::poll!(fut.as_mut()).is_pending());
+    // The driver spawned the stream and recorded the scope live BEFORE the
+    // grant could reach this future.
+    settle(|| watcher.registry_len() == 1).await;
+    assert_eq!(watcher.registry_len(), 1);
+
+    // The source dies while the grant sits undelivered in the oneshot.
+    fs.disconnect(&canonical);
+    settle(|| watcher.registry_len() == 0 && fs.shutdowns() == 1).await;
+    assert_eq!(watcher.registry_len(), 0, "the driver reclaimed the entry");
+
+    // The late poll still commits — into a dead-on-arrival handle.
+    let handle = loop {
+      match futures_util::poll!(fut.as_mut()) {
+        std::task::Poll::Ready(res) => break res.expect("the grant commits"),
+        std::task::Poll::Pending => {
+          tokio::task::yield_now().await;
+          tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+      }
+    };
+    drop(fut);
+    assert_eq!(watcher.root_path(handle), None);
+    assert!(matches!(
+      watcher.unwatch(handle).await,
+      Err(UnwatchError::UnknownRoot)
+    ));
+
+    // No overlap blocker survives: the same path watches afresh.
+    let fresh = watcher
+      .watch(&dir, Interest::all())
+      .await
+      .expect("re-watch succeeds");
+    assert_eq!(
+      watcher.root_path(fresh).as_deref(),
+      Some(canonical.as_path())
+    );
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Cancellation at each await boundary of `watch()` — before the grant
+  /// exists and with it delivered-but-unpolled — leaves no reservation, no
+  /// orphan stream, and no registry entry, and the path watches afresh.
+  #[tokio::test(start_paused = true)]
+  async fn cancellation_at_every_await_point_leaves_consistent_state() {
+    for wait_for_grant in [false, true] {
+      let (dir, canonical) = scratch(if wait_for_grant {
+        "cancel-late"
+      } else {
+        "cancel-early"
+      });
+      let fs = FakeFs::new(1);
+      fs.put(&canonical, FileKind::Dir, 1);
+      let watcher =
+        Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+      {
+        let mut fut = Box::pin(watcher.watch(&dir, Interest::all()));
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+        if wait_for_grant {
+          settle(|| watcher.registry_len() == 1).await;
+        }
+        // The future drops here — cancellation mid-await.
+      }
+      settle(|| fs.spawns() == fs.shutdowns() && watcher.registry_len() == 0).await;
+      assert_eq!(
+        fs.spawns(),
+        fs.shutdowns(),
+        "no orphan stream survives a cancelled watch (wait_for_grant={wait_for_grant})"
+      );
+      assert_eq!(watcher.registry_len(), 0);
+
+      let handle = watcher
+        .watch(&dir, Interest::all())
+        .await
+        .expect("a fresh watch succeeds");
+      watcher.unwatch(handle).await.expect("unwatch");
+      watcher.close().await.expect("close");
+      let _ = std::fs::remove_dir_all(&dir);
+    }
+  }
+
+  /// The hermetic twin of the real-FS registry-cycles test: entries exist
+  /// exactly while their root is live, on every platform.
+  #[tokio::test(start_paused = true)]
+  async fn registry_reclaims_on_unwatch_cycles_hermetic() {
+    let (dir, canonical) = scratch("cycles");
+    let fs = FakeFs::new(1);
+    fs.put(&canonical, FileKind::Dir, 1);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+    for _ in 0..8 {
+      let handle = watcher.watch(&dir, Interest::all()).await.expect("watch");
+      assert_eq!(watcher.registry_len(), 1);
+      watcher.unwatch(handle).await.expect("unwatch");
+      settle(|| watcher.registry_len() == 0).await;
+      assert_eq!(watcher.registry_len(), 0, "unwatch reclaims the entry");
+      assert_eq!(watcher.root_path(handle), None);
+    }
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+}

@@ -1,216 +1,15 @@
-use super::*;
+use super::{testing::*, *};
 use std::{
+  collections::BTreeSet,
   num::{NonZeroU64, NonZeroUsize},
-  sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-  },
+  sync::Arc,
   time::Duration,
 };
 
 use agnostic_lite::tokio::TokioRuntime;
-use tributary_proto::{FileKind, Location, Segment};
+use tributary_proto::{Epoch, FileKind, Location, Segment};
 
 use crate::os::{FsEventFlags, RawOsEvent};
-
-/// One fake filesystem object.
-#[derive(Debug, Clone, Copy)]
-struct FakeNode {
-  kind: FileKind,
-  ino: u64,
-  dev: u64,
-}
-
-#[derive(Default)]
-struct FakeState {
-  nodes: Mutex<std::collections::HashMap<PathBuf, FakeNode>>,
-  /// Data injection ends for spawned sources, keyed by root.
-  taps: Mutex<std::collections::HashMap<PathBuf, async_channel::Sender<SourceMessage>>>,
-  /// Control (Overflow/Fatal) injection ends, keyed by root.
-  controls: Mutex<std::collections::HashMap<PathBuf, async_channel::Sender<SourceMessage>>>,
-  /// Overflow acknowledgements per root, so tests can assert the dedup
-  /// re-arm protocol runs.
-  acks: Mutex<std::collections::HashMap<PathBuf, Arc<AtomicUsize>>>,
-  shutdowns: AtomicUsize,
-  /// Mount-table refreshes served, plus the configured answer (`None` = an
-  /// authoritative empty table).
-  refreshes: AtomicUsize,
-  refresh_answer: Mutex<Option<(Vec<PathBuf>, bool)>>,
-}
-
-/// A fake platform: sources are channel pairs the test injects into, probes
-/// consult an in-memory map — the driver loop runs unmodified.
-#[derive(Clone, Default)]
-struct FakeFs {
-  state: Arc<FakeState>,
-  root_dev: u64,
-}
-
-impl FakeFs {
-  fn new(root_dev: u64) -> Self {
-    Self {
-      state: Arc::new(FakeState::default()),
-      root_dev,
-    }
-  }
-
-  fn put(&self, path: &str, kind: FileKind, ino: u64) {
-    self.state.nodes.lock().unwrap().insert(
-      PathBuf::from(path),
-      FakeNode {
-        kind,
-        ino,
-        dev: self.root_dev,
-      },
-    );
-  }
-
-  fn remove(&self, path: &str) {
-    self
-      .state
-      .nodes
-      .lock()
-      .unwrap()
-      .remove(&PathBuf::from(path));
-  }
-
-  fn tap(&self, root: &str) -> async_channel::Sender<SourceMessage> {
-    self
-      .state
-      .taps
-      .lock()
-      .unwrap()
-      .get(&PathBuf::from(root))
-      .expect("a source was spawned for the root")
-      .clone()
-  }
-
-  fn shutdowns(&self) -> usize {
-    self.state.shutdowns.load(Ordering::SeqCst)
-  }
-
-  fn refreshes(&self) -> usize {
-    self.state.refreshes.load(Ordering::SeqCst)
-  }
-
-  /// The control-channel injection end of `root`'s source.
-  fn control_tap(&self, root: &str) -> async_channel::Sender<SourceMessage> {
-    self
-      .state
-      .controls
-      .lock()
-      .unwrap()
-      .get(&PathBuf::from(root))
-      .expect("a source was spawned for the root")
-      .clone()
-  }
-
-  /// How many processed Overflows the driver acknowledged for `root`.
-  fn overflow_acks(&self, root: &str) -> usize {
-    self
-      .state
-      .acks
-      .lock()
-      .unwrap()
-      .get(&PathBuf::from(root))
-      .expect("a source was spawned for the root")
-      .load(Ordering::SeqCst)
-  }
-
-  /// Drops both injection ends of `root`'s source, disconnecting it.
-  fn disconnect(&self, root: &str) {
-    self.state.taps.lock().unwrap().remove(&PathBuf::from(root));
-    self
-      .state
-      .controls
-      .lock()
-      .unwrap()
-      .remove(&PathBuf::from(root));
-  }
-}
-
-struct FakeHandle {
-  acks: Arc<AtomicUsize>,
-  shutdowns: Arc<FakeState>,
-}
-
-impl SourceControl for FakeHandle {
-  fn overflow_processed(&self) {
-    self.acks.fetch_add(1, Ordering::SeqCst);
-  }
-
-  fn shutdown(self) {
-    self.shutdowns.shutdowns.fetch_add(1, Ordering::SeqCst);
-  }
-}
-
-impl FsOps for FakeFs {
-  type Handle = FakeHandle;
-
-  fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
-    let root = config.roots.first().cloned().ok_or(SourceError::NoRoots)?;
-    if !self.state.nodes.lock().unwrap().contains_key(&root) {
-      return Err(SourceError::RootUnavailable {
-        root,
-        source: std::io::Error::from(std::io::ErrorKind::NotFound),
-      });
-    }
-    let (tx, rx) = async_channel::bounded(config.channel_capacity.get());
-    self.state.taps.lock().unwrap().insert(root.clone(), tx);
-    let (control_tx, control_rx) = async_channel::unbounded();
-    self
-      .state
-      .controls
-      .lock()
-      .unwrap()
-      .insert(root.clone(), control_tx);
-    let acks = Arc::new(AtomicUsize::new(0));
-    self
-      .state
-      .acks
-      .lock()
-      .unwrap()
-      .insert(root.clone(), Arc::clone(&acks));
-    Ok(SpawnedSource {
-      handle: FakeHandle {
-        acks,
-        shutdowns: Arc::clone(&self.state),
-      },
-      channels: SourceChannels {
-        data: rx,
-        control: control_rx,
-      },
-      meta: RootMeta {
-        root,
-        root_dev: self.root_dev,
-        mounts: Vec::new(),
-        mounts_authoritative: true,
-      },
-    })
-  }
-
-  fn probe(&self, path: &Path) -> ProbeOutcome {
-    match self.state.nodes.lock().unwrap().get(path) {
-      Some(node) => ProbeOutcome::Present {
-        kind: node.kind,
-        file_id: NonZeroU64::new(node.ino),
-        dev: node.dev,
-      },
-      None => ProbeOutcome::Missing,
-    }
-  }
-
-  fn refresh_mounts(&self, _root: &Path) -> (Vec<PathBuf>, bool) {
-    self.state.refreshes.fetch_add(1, Ordering::SeqCst);
-    self
-      .state
-      .refresh_answer
-      .lock()
-      .unwrap()
-      .clone()
-      .unwrap_or((Vec::new(), true))
-  }
-}
 
 struct Rig {
   fs: FakeFs,
@@ -228,6 +27,10 @@ fn config() -> DriverConfig {
 }
 
 fn rig_with_capacity(event_capacity: usize) -> Rig {
+  rig_with(event_capacity, NullRegistry)
+}
+
+fn rig_with(event_capacity: usize, registry: impl ScopeRegistry) -> Rig {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
@@ -237,7 +40,7 @@ fn rig_with_capacity(event_capacity: usize) -> Rig {
     fs.clone(),
     cmd_rx,
     ev_tx,
-    |_| {},
+    registry,
   ));
   Rig {
     fs,
@@ -272,6 +75,14 @@ fn ev(path: &str, flags: FsEventFlags, event_id: u64, file_id: u64) -> RawOsEven
   }
 }
 
+fn created() -> FsEventFlags {
+  FsEventFlags::new(FsEventFlags::ITEM_CREATED.bits() | FsEventFlags::ITEM_IS_FILE.bits())
+}
+
+fn removed() -> FsEventFlags {
+  FsEventFlags::new(FsEventFlags::ITEM_REMOVED.bits() | FsEventFlags::ITEM_IS_FILE.bits())
+}
+
 fn renamed() -> FsEventFlags {
   FsEventFlags::new(FsEventFlags::ITEM_RENAMED.bits() | FsEventFlags::ITEM_IS_FILE.bits())
 }
@@ -288,6 +99,17 @@ fn loc(parts: &[&str]) -> Location {
   Location::from_segments(parts.iter().map(|p| Segment::new(*p)))
 }
 
+/// Gives the blocking pool real-clock scheduler slices under paused time.
+async fn settle(mut done: impl FnMut() -> bool) {
+  for _ in 0..200 {
+    if done() {
+      return;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+}
+
 #[tokio::test(start_paused = true)]
 async fn watch_spawns_a_stream_and_events_flow() {
   let rig = rig_with_capacity(64);
@@ -295,15 +117,7 @@ async fn watch_spawns_a_stream_and_events_flow() {
 
   rig
     .fs
-    .tap("/r")
-    .send(SourceMessage::Batch(vec![ev(
-      "/r/a/new.txt",
-      FsEventFlags::new(FsEventFlags::ITEM_CREATED.bits() | FsEventFlags::ITEM_IS_FILE.bits()),
-      1,
-      10,
-    )]))
-    .await
-    .unwrap();
+    .send_batch("/r", vec![ev("/r/a/new.txt", created(), 1, 10)]);
 
   let (got_scope, change) = next_event(&rig).await;
   assert_eq!(got_scope, scope);
@@ -315,21 +129,14 @@ async fn watch_spawns_a_stream_and_events_flow() {
 async fn cross_batch_rename_degrades_to_remove_plus_create() {
   let rig = rig_with_capacity(64);
   let _scope = watch(&rig, "/r").await;
-  let tap = rig.fs.tap("/r");
 
   // Source half: the path is already gone. A vanished path has no
   // contemporaneous device evidence and no same-batch partner, so it never
   // mints a cookie — the documented cross-batch pairing cost.
   rig.fs.remove("/r/a/old");
-  tap
-    .send(SourceMessage::Batch(vec![ev(
-      "/r/a/old",
-      renamed(),
-      10,
-      42,
-    )]))
-    .await
-    .unwrap();
+  rig
+    .fs
+    .send_batch("/r", vec![ev("/r/a/old", renamed(), 10, 42)]);
   let (_, change) = next_event(&rig).await;
   assert!(change.kind().is_removed());
   assert_eq!(change.location(), &loc(&["a", "old"]));
@@ -337,15 +144,9 @@ async fn cross_batch_rename_degrades_to_remove_plus_create() {
   // Destination half in a later batch: the path exists, finds no pending
   // source, and arrives as a fresh object.
   rig.fs.put("/r/b/new", FileKind::File, 42);
-  tap
-    .send(SourceMessage::Batch(vec![ev(
-      "/r/b/new",
-      renamed(),
-      11,
-      42,
-    )]))
-    .await
-    .unwrap();
+  rig
+    .fs
+    .send_batch("/r", vec![ev("/r/b/new", renamed(), 11, 42)]);
   let (_, change) = next_event(&rig).await;
   assert!(change.kind().is_created());
   assert_eq!(change.location(), &loc(&["b", "new"]));
@@ -358,15 +159,7 @@ async fn unpaired_source_half_expires_to_removed() {
   rig.fs.remove("/r/a/left");
   rig
     .fs
-    .tap("/r")
-    .send(SourceMessage::Batch(vec![ev(
-      "/r/a/left",
-      renamed(),
-      10,
-      7,
-    )]))
-    .await
-    .unwrap();
+    .send_batch("/r", vec![ev("/r/a/left", renamed(), 10, 7)]);
 
   // No cookie, no pairing window: the vanished half resolves immediately.
   let (_, change) = next_event(&rig).await;
@@ -378,54 +171,26 @@ async fn unpaired_source_half_expires_to_removed() {
 async fn overflow_message_becomes_one_epoch_bumped_rescan() {
   let rig = rig_with_capacity(64);
   let _scope = watch(&rig, "/r").await;
-  let tap = rig.fs.tap("/r");
 
-  tap
-    .send(SourceMessage::Batch(vec![ev(
-      "/r/x",
-      FsEventFlags::ITEM_CREATED,
-      1,
-      3,
-    )]))
-    .await
-    .unwrap();
+  rig.fs.send_batch("/r", vec![ev("/r/x", created(), 1, 3)]);
   let (_, first) = next_event(&rig).await;
 
-  rig
-    .fs
-    .control_tap("/r")
-    .send(SourceMessage::Overflow)
-    .await
-    .unwrap();
+  rig.fs.send_lossy("/r");
   let (_, rescan) = next_event(&rig).await;
   assert!(rescan.kind().is_rescan());
   assert!(rescan.epoch() > first.epoch());
-  // The driver acknowledged the signal, re-arming the source's dedup.
-  for _ in 0..100 {
-    if rig.fs.overflow_acks("/r") == 1 {
-      break;
-    }
-    tokio::task::yield_now().await;
-  }
-  assert_eq!(rig.fs.overflow_acks("/r"), 1);
+  // The driver dropped the message's ack, re-arming the source's dedup.
+  settle(|| !rig.fs.overflow_pending("/r")).await;
+  assert!(!rig.fs.overflow_pending("/r"));
 }
 
 #[tokio::test(start_paused = true)]
 async fn lagged_consumer_gets_the_dominating_rescan() {
   let rig = rig_with_capacity(1);
   let _scope = watch(&rig, "/r").await;
-  let tap = rig.fs.tap("/r");
 
   for (id, name) in [(1u64, "/r/a"), (2, "/r/b"), (3, "/r/c")] {
-    tap
-      .send(SourceMessage::Batch(vec![ev(
-        name,
-        FsEventFlags::ITEM_CREATED,
-        id,
-        id,
-      )]))
-      .await
-      .unwrap();
+    rig.fs.send_batch("/r", vec![ev(name, created(), id, id)]);
   }
   // Let the driver churn: the first change fills the capacity-1 channel, the
   // rest refuse and park a dominating Rescan.
@@ -452,16 +217,11 @@ async fn lagged_consumer_gets_the_dominating_rescan() {
 async fn fatal_source_rescans_and_tears_down() {
   let rig = rig_with_capacity(64);
   let _scope = watch(&rig, "/r").await;
-  rig
-    .fs
-    .control_tap("/r")
-    .send(SourceMessage::Fatal(SourceError::CallbackPanic))
-    .await
-    .unwrap();
+  rig.fs.send_fatal("/r");
 
   let (_, change) = next_event(&rig).await;
   assert!(change.kind().is_rescan());
-  tokio::time::sleep(Duration::from_millis(100)).await;
+  settle(|| rig.fs.shutdowns() == 1).await;
   assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
 }
 
@@ -515,47 +275,90 @@ async fn watch_of_a_missing_root_fails_typed() {
   assert!(matches!(err, SourceError::RootUnavailable { .. }));
 }
 
+/// The queue is the source's one ordered lane: batches enqueued BEFORE a loss
+/// signal deliver before the Rescan it becomes, and nothing from them may
+/// follow it — ordering by construction, no drain, no barrier.
 #[tokio::test(start_paused = true)]
-async fn control_fatal_wakes_the_driver_with_no_data_traffic() {
-  let rig = rig_with_capacity(1);
+async fn queued_data_delivers_before_a_later_loss_signal() {
+  let rig = rig_with_capacity(64);
   let _scope = watch(&rig, "/r").await;
-  let tap = rig.fs.tap("/r");
 
-  // Fill the DATA channel completely (capacity-1 event channel plus the
-  // capacity-8 os channel behind it can hold traffic, but the point is the
-  // control channel is independent): the Fatal rides control and wakes the
-  // driver even though nothing further arrives on data.
-  tap
-    .send(SourceMessage::Batch(vec![ev(
-      "/r/x",
-      FsEventFlags::ITEM_CREATED,
-      1,
-      3,
-    )]))
-    .await
-    .unwrap();
-  rig
-    .fs
-    .control_tap("/r")
-    .send(SourceMessage::Fatal(SourceError::CallbackPanic))
-    .await
-    .unwrap();
+  for (id, name) in [(1u64, "/r/a"), (2, "/r/b"), (3, "/r/c")] {
+    rig.fs.send_batch("/r", vec![ev(name, created(), id, id)]);
+  }
+  rig.fs.send_lossy("/r");
 
-  let (_, first) = next_event(&rig).await;
-  assert!(first.kind().is_created());
-  let (_, second) = next_event(&rig).await;
+  let mut seen = Vec::new();
+  while let Ok(Ok((_, _, change))) =
+    tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
+  {
+    seen.push(change);
+  }
+  let names: Vec<String> = seen
+    .iter()
+    .map(|c| {
+      if c.kind().is_rescan() {
+        "rescan".to_string()
+      } else {
+        c.location()
+          .name()
+          .map(|s| s.as_str().to_string())
+          .unwrap_or_default()
+      }
+    })
+    .collect();
+  assert_eq!(
+    names,
+    ["a", "b", "c", "rescan"],
+    "queued data precedes the loss signal, in source order"
+  );
+}
+
+/// Same ordering pin for the terminal signal: batches before the Fatal
+/// deliver, then the terminal Rescan, then teardown.
+#[tokio::test(start_paused = true)]
+async fn fatal_follows_queued_data_in_order() {
+  let rig = rig_with_capacity(64);
+  let _scope = watch(&rig, "/r").await;
+
+  for (id, name) in [(1u64, "/r/a"), (2, "/r/b")] {
+    rig.fs.send_batch("/r", vec![ev(name, created(), id, id)]);
+  }
+  rig.fs.send_fatal("/r");
+
+  let mut seen = Vec::new();
+  while let Ok(Ok((_, _, change))) =
+    tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
+  {
+    seen.push(change);
+  }
   assert!(
-    second.kind().is_rescan(),
+    seen.len() >= 3 && seen[0].kind().is_created() && seen[1].kind().is_created(),
+    "data queued before the death delivers first: {seen:?}"
+  );
+  assert!(
+    seen[2..].iter().all(|c| c.kind().is_rescan()),
+    "the terminal Rescan follows in order: {seen:?}"
+  );
+  settle(|| rig.fs.shutdowns() == 1).await;
+  assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
+}
+
+/// The in-band Fatal needs no data traffic to wake the driver: the queue IS
+/// the wake.
+#[tokio::test(start_paused = true)]
+async fn fatal_wakes_the_driver_with_no_data_traffic() {
+  let rig = rig_with_capacity(64);
+  let _scope = watch(&rig, "/r").await;
+  rig.fs.send_fatal("/r");
+
+  let (_, change) = next_event(&rig).await;
+  assert!(
+    change.kind().is_rescan(),
     "the in-band death surfaces as the terminal Rescan"
   );
-  for _ in 0..100 {
-    if rig.fs.shutdowns() == 1 {
-      break;
-    }
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-  }
-  assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
+  settle(|| rig.fs.shutdowns() == 1).await;
+  assert_eq!(rig.fs.shutdowns(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -576,13 +379,7 @@ async fn orphaned_watch_reply_tears_the_stream_down() {
     .await
     .unwrap();
 
-  for _ in 0..100 {
-    if rig.fs.shutdowns() == 1 {
-      break;
-    }
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-  }
+  settle(|| rig.fs.shutdowns() == 1).await;
   assert_eq!(
     rig.fs.shutdowns(),
     1,
@@ -601,7 +398,7 @@ async fn disconnected_source_is_a_dead_stream() {
 
   let (_, change) = next_event(&rig).await;
   assert!(change.kind().is_rescan());
-  tokio::time::sleep(Duration::from_millis(100)).await;
+  settle(|| rig.fs.shutdowns() == 1).await;
   assert_eq!(rig.fs.shutdowns(), 1);
 }
 
@@ -609,28 +406,17 @@ async fn disconnected_source_is_a_dead_stream() {
 async fn lagged_root_death_delivers_the_terminal_rescan() {
   let rig = rig_with_capacity(1);
   let _scope = watch(&rig, "/r").await;
-  let tap = rig.fs.tap("/r");
 
   // The first change fills the capacity-1 channel; the second refusal parks
   // a dominating Rescan while the channel is still full.
   for (id, name) in [(1u64, "/r/a"), (2, "/r/b")] {
-    tap
-      .send(SourceMessage::Batch(vec![ev(
-        name,
-        FsEventFlags::ITEM_CREATED,
-        id,
-        id,
-      )]))
-      .await
-      .unwrap();
+    rig.fs.send_batch("/r", vec![ev(name, created(), id, id)]);
   }
   tokio::time::sleep(Duration::from_millis(100)).await;
 
   // The root dies while the scope is lagged and the channel is full: the
   // terminal Rescan must survive every refusal and land once the consumer
-  // finally drains. Every sender must drop for the receiver to disconnect —
-  // including this test's own tap clone.
-  drop(tap);
+  // finally drains.
   rig.fs.disconnect("/r");
   tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -642,15 +428,7 @@ async fn lagged_root_death_delivers_the_terminal_rescan() {
     "the terminal Rescan is never lost: {second:?}"
   );
   assert!(second.epoch() > first.epoch());
-  // The teardown runs on the blocking pool in real time; give its thread
-  // scheduler slices instead of trusting one paused-time sleep.
-  for _ in 0..100 {
-    if rig.fs.shutdowns() == 1 {
-      break;
-    }
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-  }
+  settle(|| rig.fs.shutdowns() == 1).await;
   assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
 }
 
@@ -672,19 +450,14 @@ async fn uncommitted_watch_grant_unwinds_the_stream() {
     })
     .await
     .unwrap();
+  settle(|| rig.fs.spawns() == 1).await;
   for _ in 0..50 {
     tokio::task::yield_now().await;
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
   drop(on_reply);
 
-  for _ in 0..100 {
-    if rig.fs.shutdowns() == 1 {
-      break;
-    }
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-  }
+  settle(|| rig.fs.shutdowns() == 1).await;
   assert_eq!(
     rig.fs.shutdowns(),
     1,
@@ -693,116 +466,17 @@ async fn uncommitted_watch_grant_unwinds_the_stream() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn control_overflow_discards_queued_data() {
-  let rig = rig_with_capacity(64);
-  let _scope = watch(&rig, "/r").await;
-  let tap = rig.fs.tap("/r");
-
-  // Batches queue on data, then the loss signal lands on control. The driver
-  // may legally process a batch that wins the select BEFORE it observes the
-  // control message — but once the covering Rescan is minted, nothing from
-  // these pre-loss batches may follow it.
-  for (id, name) in [(1u64, "/r/a"), (2, "/r/b"), (3, "/r/c")] {
-    tap
-      .send(SourceMessage::Batch(vec![ev(
-        name,
-        FsEventFlags::ITEM_CREATED,
-        id,
-        id,
-      )]))
-      .await
-      .unwrap();
-  }
-  rig
-    .fs
-    .control_tap("/r")
-    .send(SourceMessage::Overflow)
-    .await
-    .unwrap();
-
-  let mut seen = Vec::new();
-  while let Ok(Ok((_, _, change))) =
-    tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
-  {
-    seen.push(change);
-  }
-  let rescan_at = seen
-    .iter()
-    .position(|c| c.kind().is_rescan())
-    .expect("the loss surfaced as a Rescan");
-  assert!(
-    seen[rescan_at + 1..].iter().all(|c| c.kind().is_rescan()),
-    "no pre-loss batch event may follow the covering Rescan: {seen:?}"
-  );
-}
-
-#[tokio::test(start_paused = true)]
-async fn fatal_discards_queued_data() {
-  let rig = rig_with_capacity(64);
-  let _scope = watch(&rig, "/r").await;
-  let tap = rig.fs.tap("/r");
-
-  for (id, name) in [(1u64, "/r/a"), (2, "/r/b")] {
-    tap
-      .send(SourceMessage::Batch(vec![ev(
-        name,
-        FsEventFlags::ITEM_CREATED,
-        id,
-        id,
-      )]))
-      .await
-      .unwrap();
-  }
-  rig
-    .fs
-    .control_tap("/r")
-    .send(SourceMessage::Fatal(SourceError::CallbackPanic))
-    .await
-    .unwrap();
-
-  let mut seen = Vec::new();
-  while let Ok(Ok((_, _, change))) =
-    tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
-  {
-    seen.push(change);
-  }
-  let rescan_at = seen
-    .iter()
-    .position(|c| c.kind().is_rescan())
-    .expect("death surfaced as the terminal Rescan");
-  assert!(
-    seen[rescan_at + 1..].iter().all(|c| c.kind().is_rescan()),
-    "no pre-death batch event may follow the terminal Rescan: {seen:?}"
-  );
-  for _ in 0..100 {
-    if rig.fs.shutdowns() == 1 {
-      break;
-    }
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-  }
-  assert_eq!(rig.fs.shutdowns(), 1, "the dead stream is torn down");
-}
-
-#[tokio::test(start_paused = true)]
 async fn overflow_refreshes_mount_trust_and_pairing_resumes() {
   let rig = rig_with_capacity(64);
   let _scope = watch(&rig, "/r").await;
-  let tap = rig.fs.tap("/r");
 
-  rig
-    .fs
-    .control_tap("/r")
-    .send(SourceMessage::Overflow)
-    .await
-    .unwrap();
+  rig.fs.send_lossy("/r");
   let (_, rescan) = next_event(&rig).await;
   assert!(rescan.kind().is_rescan());
 
   // The loss revoked device trust and requested a mount-table refresh from
   // the blocking pool. That pool runs on REAL threads outside the paused
-  // runtime, so the wait must be bounded by the real clock — a fixed yield
-  // count loses the race whenever the machine is loaded.
+  // runtime, so the wait must be bounded by the real clock.
   let deadline = std::time::Instant::now() + Duration::from_secs(10);
   while rig.fs.refreshes() < 1 && std::time::Instant::now() < deadline {
     tokio::task::yield_now().await;
@@ -813,13 +487,13 @@ async fn overflow_refreshes_mount_trust_and_pairing_resumes() {
   // into a single Moved again — trust round-tripped end to end.
   rig.fs.remove("/r/a/old");
   rig.fs.put("/r/b/new", FileKind::File, 42);
-  tap
-    .send(SourceMessage::Batch(vec![
+  rig.fs.send_batch(
+    "/r",
+    vec![
       ev("/r/a/old", renamed(), 10, 42),
       ev("/r/b/new", renamed(), 11, 42),
-    ]))
-    .await
-    .unwrap();
+    ],
+  );
   let (_, change) = next_event(&rig).await;
   assert_eq!(change.kind().moved_from(), Some(&loc(&["a", "old"])));
   assert_eq!(change.location(), &loc(&["b", "new"]));
@@ -835,15 +509,7 @@ async fn deliveries_carry_the_canonical_root() {
 
   rig
     .fs
-    .tap("/r")
-    .send(SourceMessage::Batch(vec![ev(
-      "/r/carried.txt",
-      FsEventFlags::new(FsEventFlags::ITEM_CREATED.bits() | FsEventFlags::ITEM_IS_FILE.bits()),
-      1,
-      10,
-    )]))
-    .await
-    .unwrap();
+    .send_batch("/r", vec![ev("/r/carried.txt", created(), 1, 10)]);
 
   let (got_scope, root, change) = tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
     .await
@@ -854,30 +520,21 @@ async fn deliveries_carry_the_canonical_root() {
   assert!(change.kind().is_created());
 }
 
-/// The scope-dead signal fires exactly once per stream teardown, naming the
-/// dead scope — the reclamation contract the watcher registry builds on.
+/// The single-writer lifecycle contract: the driver records a scope live
+/// (before its grant can reach the watcher) and dead (once per teardown), in
+/// program order on one task.
 #[tokio::test(start_paused = true)]
-async fn scope_dead_signal_fires_once_per_teardown() {
-  let fs = FakeFs::new(1);
-  fs.put("/r", FileKind::Dir, 1);
-  let (cmd_tx, cmd_rx) = async_channel::bounded(16);
-  let (ev_tx, _ev_rx) = async_channel::bounded(64);
-  let dead: Arc<Mutex<Vec<ScopeId>>> = Arc::new(Mutex::new(Vec::new()));
-  let recorder = Arc::clone(&dead);
-  tokio::spawn(run::<TokioRuntime, FakeFs>(
-    config(),
-    fs.clone(),
-    cmd_rx,
-    ev_tx,
-    move |scope| recorder.lock().unwrap().push(scope),
-  ));
-  let rig = Rig {
-    fs,
-    commands: cmd_tx,
-    events: async_channel::bounded(1).1,
-  };
+async fn registry_sees_live_then_dead_in_order() {
+  let registry = RecordingRegistry::default();
+  let rig = rig_with(64, registry.clone());
 
   let scope = watch(&rig, "/r").await;
+  assert_eq!(
+    registry.live(),
+    [(scope, PathBuf::from("/r"))],
+    "the entry was live before the grant resolved"
+  );
+
   let (reply, on_reply) = futures_channel::oneshot::channel();
   rig
     .commands
@@ -886,8 +543,198 @@ async fn scope_dead_signal_fires_once_per_teardown() {
     .unwrap();
   assert!(on_reply.await.unwrap(), "the unwatch resolves");
   assert_eq!(
-    dead.lock().unwrap().as_slice(),
-    &[scope],
+    registry.dead(),
+    [scope],
     "exactly one scope-dead signal, naming the dead scope"
   );
+}
+
+/// The R7 registry race cell, driver-level: the source dies AFTER the grant
+/// was sent but BEFORE the caller polls it. Both registry transitions ran on
+/// the driver in order (live, then dead); the late commit just yields a
+/// dead-on-arrival handle, and the path is immediately re-watchable.
+#[tokio::test(start_paused = true)]
+async fn death_between_grant_send_and_poll_leaves_a_consistent_registry() {
+  let registry = RecordingRegistry::default();
+  let rig = rig_with(64, registry.clone());
+
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/r"),
+      interest: tributary_proto::Interest::all(),
+      reply,
+    })
+    .await
+    .unwrap();
+  // The grant resolves — the registry entry is already live.
+  let grant = on_reply.await.unwrap().expect("watch succeeds");
+  let scope = grant.scope();
+  assert_eq!(registry.live(), [(scope, PathBuf::from("/r"))]);
+
+  // The source dies before the caller "polls" (commits) the grant.
+  rig.fs.disconnect("/r");
+  settle(|| registry.dead() == [scope]).await;
+  assert_eq!(registry.dead(), [scope], "the driver reclaimed the entry");
+  assert_eq!(rig.fs.shutdowns(), 1);
+
+  // The late commit is a dead-on-arrival handle; nothing unwinds twice.
+  grant.defuse();
+  settle(|| rig.fs.shutdowns() == 1).await;
+  assert_eq!(rig.fs.shutdowns(), 1, "no double teardown");
+
+  // The path is free: a fresh watch succeeds.
+  let scope2 = watch(&rig, "/r").await;
+  assert_ne!(scope2, scope, "a fresh scope for the re-watch");
+}
+
+fn xorshift(s: &mut u64) -> u64 {
+  *s ^= *s << 13;
+  *s ^= *s >> 17;
+  *s ^= *s << 5;
+  *s
+}
+
+/// The standing end-to-end no-silent-loss storm — the one property every
+/// historical finding violated: under random mutations, decode losses, budget
+/// pressure, and a lagging consumer, the view reconstructed from delivered
+/// events (honoring Rescans as re-reads) converges to the tree, with
+/// per-scope epochs monotone. `TRIBUTARY_FS_STORM_SEEDS` scales the seed
+/// count (64 in CI; run 1024 nightly).
+#[tokio::test(start_paused = true)]
+async fn storm_no_silent_loss_converges() {
+  let seeds: u64 = std::env::var("TRIBUTARY_FS_STORM_SEEDS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(64);
+  for seed in 1..=seeds {
+    storm_seed(seed).await;
+  }
+}
+
+async fn storm_seed(seed: u64) {
+  let rig = rig_with_capacity(4);
+  let _scope = watch(&rig, "/r").await;
+  let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(1);
+  let mut next_ino = 100u64;
+  let mut next_id = 1u64;
+  let mut live: Vec<(PathBuf, u64)> = Vec::new();
+  let mut view: BTreeSet<PathBuf> = BTreeSet::new();
+  let mut last_epoch: Option<Epoch> = None;
+
+  for _ in 0..30 {
+    let mut events = Vec::new();
+    match xorshift(&mut s) % 4 {
+      0 | 1 => {
+        next_ino += 1;
+        let path = PathBuf::from(format!("/r/f{next_ino}"));
+        rig.fs.put(&path, FileKind::File, next_ino);
+        next_id += 1;
+        events.push(ev(path.to_str().unwrap(), created(), next_id, next_ino));
+        live.push((path, next_ino));
+      }
+      2 if !live.is_empty() => {
+        let i = (xorshift(&mut s) as usize) % live.len();
+        let (path, ino) = live.swap_remove(i);
+        rig.fs.remove(&path);
+        next_id += 1;
+        events.push(ev(path.to_str().unwrap(), removed(), next_id, ino));
+      }
+      3 if !live.is_empty() => {
+        let i = (xorshift(&mut s) as usize) % live.len();
+        let (old, ino) = live.swap_remove(i);
+        next_ino += 1;
+        let new = PathBuf::from(format!("/r/g{next_ino}"));
+        rig.fs.remove(&old);
+        rig.fs.put(&new, FileKind::File, ino);
+        next_id += 1;
+        events.push(ev(old.to_str().unwrap(), renamed(), next_id, ino));
+        next_id += 1;
+        events.push(ev(new.to_str().unwrap(), renamed(), next_id, ino));
+        live.push((new, ino));
+      }
+      _ => continue,
+    }
+    // Perturb: one in six batches is lost at decode — the mutation happened,
+    // only its report vanished, and the in-order loss signal must cover it.
+    if xorshift(&mut s).is_multiple_of(6) {
+      rig.fs.send_lossy("/r");
+    } else {
+      rig.fs.send_batch("/r", events);
+    }
+    // A sometimes-lagging consumer: drain a few events only occasionally.
+    if xorshift(&mut s).is_multiple_of(3) {
+      for _ in 0..(xorshift(&mut s) % 4) {
+        match tokio::time::timeout(Duration::from_millis(100), rig.events.recv()).await {
+          Ok(Ok((_, root, change))) => {
+            apply(&rig, &mut view, &mut last_epoch, &root, &change);
+          }
+          _ => break,
+        }
+      }
+    }
+  }
+
+  // Mutations stop; give pairing windows and probes time, then drain to
+  // quiescence.
+  for _ in 0..50 {
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+  }
+  while let Ok(Ok((_, root, change))) =
+    tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
+  {
+    apply(&rig, &mut view, &mut last_epoch, &root, &change);
+  }
+
+  let tree = rig.fs.files_under("/r");
+  assert_eq!(
+    view, tree,
+    "seed {seed}: the reconstructed view converges to the tree"
+  );
+}
+
+fn apply(
+  rig: &Rig,
+  view: &mut BTreeSet<PathBuf>,
+  last_epoch: &mut Option<Epoch>,
+  root: &Path,
+  change: &Change,
+) {
+  if let Some(prev) = *last_epoch {
+    assert!(
+      change.epoch() >= prev,
+      "per-scope epochs are monotone: {prev:?} then {:?}",
+      change.epoch()
+    );
+  }
+  *last_epoch = Some(change.epoch());
+  let abs = |l: &Location| {
+    let mut p = root.to_path_buf();
+    for seg in l.segments() {
+      p.push(seg.as_str());
+    }
+    p
+  };
+  match change.kind() {
+    tributary_proto::ChangeKind::Created => {
+      view.insert(abs(change.location()));
+    }
+    tributary_proto::ChangeKind::Removed => {
+      view.remove(&abs(change.location()));
+    }
+    tributary_proto::ChangeKind::Moved(from) => {
+      view.remove(&abs(from));
+      view.insert(abs(change.location()));
+    }
+    tributary_proto::ChangeKind::Modified => {}
+    tributary_proto::ChangeKind::Rescan => {
+      // A delivered Rescan is a re-read of current state under its location.
+      let at = abs(change.location());
+      view.retain(|p| !p.starts_with(&at));
+      view.extend(rig.fs.files_under(&at));
+    }
+    _ => {}
+  }
 }
