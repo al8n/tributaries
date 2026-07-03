@@ -137,6 +137,9 @@ jobs:
           - macos-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
+    # The macOS leg runs tributary-fs's real-FSEvents integration suite;
+    # a wedged kernel stream must fail the job, not idle out the runner.
+    timeout-minutes: 45
     steps:
     - uses: actions/checkout@v7
     - name: Cache cargo build and registry
