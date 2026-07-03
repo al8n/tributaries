@@ -29,7 +29,8 @@ use objc2_core_services::{
 };
 
 use super::{
-  EventReceiver, MAX_EXCLUSIONS, ResumeToken, SourceConfig, SourceError, fsevent::TransportState,
+  EventReceiver, MAX_EXCLUSIONS, ResumeToken, RootMeta, SourceConfig, SourceError,
+  fsevent::TransportState,
 };
 
 /// The state the event callback reads. Owned jointly by the [`SourceHandle`]
@@ -75,9 +76,18 @@ impl Source {
   /// `config.roots`, delivering decoded batches and in-band loss/death
   /// signals on the returned queue, in source order.
   ///
+  /// Every trust- and lifecycle-bearing fact in the returned [`RootMeta`] —
+  /// the canonical root bytes, the root device, the mount seed, the device
+  /// UUID — is read strictly BEFORE the stream starts, so the metadata cannot
+  /// postdate any event the queue will ever carry, and no fallible metadata
+  /// path exists after start (a root dying post-start surfaces only through
+  /// the normal event-side death lifecycle).
+  ///
   /// On any partial failure the stream is invalidated and released before the
   /// error returns: a handle existing means created + scheduled + started.
-  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, EventReceiver), SourceError> {
+  pub(crate) fn spawn(
+    config: SourceConfig,
+  ) -> Result<(SourceHandle, EventReceiver, RootMeta), SourceError> {
     if config.roots.is_empty() {
       return Err(SourceError::NoRoots);
     }
@@ -114,6 +124,15 @@ impl Source {
         source,
       })?
       .dev() as libc::dev_t;
+    // The mount seed and device UUID are part of the pre-start barrier: taken
+    // here they cannot postdate any event, so the seed's authority is safe
+    // for the stream's whole life (post-loss staleness is handled separately,
+    // by the refresh protocol).
+    let (mounts, mounts_authoritative) = match mounts_under(&roots[0]) {
+      Some(mounts) => (mounts, true),
+      None => (Vec::new(), false),
+    };
+    let device_uuid = ffi::device_uuid(root_dev);
 
     let (queue_tx, queue_rx) = async_channel::unbounded();
     let shared = Arc::new(CallbackShared {
@@ -145,16 +164,21 @@ impl Source {
       return Err(SourceError::StartFailed);
     }
 
-    let device_uuid = ffi::device_uuid(root_dev);
+    let meta = RootMeta {
+      root: roots[0].clone(),
+      root_dev: root_dev as u64,
+      mounts,
+      mounts_authoritative,
+    };
     Ok((
       SourceHandle {
         stream: Some(stream),
         queue: Some(queue),
         shared,
-        roots,
         device_uuid,
       },
       queue_rx,
+      meta,
     ))
   }
 }
@@ -196,7 +220,6 @@ pub(crate) struct SourceHandle {
   stream: Option<StreamPtr>,
   queue: Option<DispatchRetained<DispatchQueue>>,
   shared: Arc<CallbackShared>,
-  roots: Vec<PathBuf>,
   // Read only by the deferred journal-resume surface.
   #[allow(dead_code)]
   device_uuid: Option<[u8; 16]>,
@@ -214,12 +237,6 @@ impl SourceHandle {
       0 => None,
       id => Some(ResumeToken::new(id, self.device_uuid)),
     }
-  }
-
-  /// The canonicalized (realpath + filesystem-representation) roots the
-  /// stream watches — the byte-exact prefixes event paths arrive under.
-  pub(crate) fn roots(&self) -> &[PathBuf] {
-    &self.roots
   }
 
   /// Quiesces and destroys the stream. Blocks for at most the tail of one

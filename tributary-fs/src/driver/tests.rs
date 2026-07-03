@@ -738,3 +738,61 @@ fn apply(
     _ => {}
   }
 }
+
+/// The spawn contract: a source's `RootMeta` is sealed strictly BEFORE its
+/// stream can enqueue an event, so trust-bearing metadata can never postdate
+/// a message on the queue. The fake mirrors the real backend's pre-start
+/// barrier and records the order; a regression that seeds after the stream
+/// goes live fails here.
+#[tokio::test(start_paused = true)]
+async fn spawn_seals_root_meta_before_the_stream_goes_live() {
+  let rig = rig_with_capacity(64);
+  watch(&rig, "/r").await;
+  assert_eq!(
+    rig.fs.spawn_order(),
+    vec!["meta_sealed", "stream_live"],
+    "the metadata barrier precedes stream liveness"
+  );
+}
+
+/// A submount present at spawn lands in the pre-start seed and vetoes trust
+/// for its whole prefix from the first event on — even if the volume vanishes
+/// immediately after (its unmount travels in-band and is applied late, per
+/// the monotone rule); nothing can event before the seed exists.
+#[tokio::test(start_paused = true)]
+async fn spawn_seed_carries_a_preexisting_submount() {
+  let fs = FakeFs::new(1);
+  fs.put("/r", FileKind::Dir, 1);
+  fs.seed_mounts(vec![PathBuf::from("/r/vol")]);
+  let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  let (ev_tx, ev_rx) = async_channel::bounded(64);
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    config(),
+    fs.clone(),
+    cmd_rx,
+    ev_tx,
+    NullRegistry,
+  ));
+  let rig = Rig {
+    fs,
+    commands: cmd_tx,
+    events: ev_rx,
+  };
+  watch(&rig, "/r").await;
+
+  // A colliding same-fileID rename pair spanning the seeded submount: the
+  // foreign half's prefix is vetoed by the seed, so no Moved can fabricate.
+  rig.fs.put("/r/dst", FileKind::File, 7);
+  rig.fs.send_batch(
+    "/r",
+    vec![
+      ev("/r/vol/src", renamed(), 10, 7),
+      ev("/r/dst", renamed(), 11, 7),
+    ],
+  );
+  let (_, change) = next_event(&rig).await;
+  assert!(
+    !change.kind().is_moved(),
+    "a seeded foreign prefix never pairs: {change:?}"
+  );
+}

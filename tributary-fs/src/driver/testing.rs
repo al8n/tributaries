@@ -17,8 +17,8 @@ use tributary_proto::{FileKind, ScopeId};
 
 use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
 use crate::{
-  core::{ProbeOutcome, RootMeta},
-  os::{RawOsEvent, SourceConfig, SourceError, SourceMessage},
+  core::ProbeOutcome,
+  os::{RawOsEvent, RootMeta, SourceConfig, SourceError, SourceMessage},
 };
 
 /// One fake filesystem object.
@@ -46,6 +46,13 @@ struct FakeState {
   /// authoritative empty table).
   refreshes: AtomicUsize,
   refresh_answer: Mutex<Option<(Vec<PathBuf>, bool)>>,
+  /// Mount prefixes the next spawn seeds its `RootMeta` with.
+  spawn_mounts: Mutex<Vec<PathBuf>>,
+  /// The spawn contract's observable order: `meta_sealed` must strictly
+  /// precede `stream_live`, mirroring the real backend's pre-start barrier —
+  /// a fake that seeded metadata after its stream went live would let the
+  /// hermetic suites pass against an ordering the platform forbids.
+  spawn_order: Mutex<Vec<&'static str>>,
 }
 
 /// A fake platform: sources are channels the test injects into through the
@@ -158,6 +165,17 @@ impl FakeFs {
   pub(crate) fn refreshes(&self) -> usize {
     self.state.refreshes.load(Ordering::SeqCst)
   }
+
+  /// Configures the mount prefixes the next spawn seeds its `RootMeta` with.
+  pub(crate) fn seed_mounts(&self, mounts: Vec<PathBuf>) {
+    *self.state.spawn_mounts.lock().unwrap() = mounts;
+  }
+
+  /// The recorded spawn-contract order (`meta_sealed` / `stream_live` per
+  /// spawn, in call order).
+  pub(crate) fn spawn_order(&self) -> Vec<&'static str> {
+    self.state.spawn_order.lock().unwrap().clone()
+  }
 }
 
 pub(crate) struct FakeHandle {
@@ -175,12 +193,23 @@ impl FsOps for FakeFs {
 
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
     let root = config.roots.first().cloned().ok_or(SourceError::NoRoots)?;
+    // A root vanished before start is a clean spawn failure — the pre-start
+    // half of the lifecycle contract (post-start deaths travel in-band).
     if !self.state.nodes.lock().unwrap().contains_key(&root) {
       return Err(SourceError::RootUnavailable {
         root,
         source: std::io::Error::from(std::io::ErrorKind::NotFound),
       });
     }
+    // The pre-start barrier, mirrored from the real backend: the metadata is
+    // sealed strictly before the source becomes injectable (`stream_live`).
+    let meta = RootMeta {
+      root: root.clone(),
+      root_dev: self.root_dev,
+      mounts: self.state.spawn_mounts.lock().unwrap().clone(),
+      mounts_authoritative: true,
+    };
+    self.state.spawn_order.lock().unwrap().push("meta_sealed");
     let (sender, receiver) = async_channel::unbounded();
     let transport = Arc::new(crate::os::fsevent::TransportState::new(
       config.channel_capacity.get(),
@@ -190,19 +219,15 @@ impl FsOps for FakeFs {
       .sources
       .lock()
       .unwrap()
-      .insert(root.clone(), FakeSource { sender, transport });
+      .insert(root, FakeSource { sender, transport });
+    self.state.spawn_order.lock().unwrap().push("stream_live");
     self.state.spawns.fetch_add(1, Ordering::SeqCst);
     Ok(SpawnedSource {
       handle: FakeHandle {
         state: Arc::clone(&self.state),
       },
       receiver,
-      meta: RootMeta {
-        root,
-        root_dev: self.root_dev,
-        mounts: Vec::new(),
-        mounts_authoritative: true,
-      },
+      meta,
     })
   }
 

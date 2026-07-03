@@ -96,7 +96,7 @@ fn loc(parts: &[&str]) -> Location {
 #[test]
 fn single_verb_flags_ground_directly() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev(
@@ -132,7 +132,7 @@ fn single_verb_flags_ground_directly() {
 #[test]
 fn flagless_event_escalates_located_rescan() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/dirty", FsEventFlags::new(0), 1, 0)],
     at(1),
@@ -147,7 +147,7 @@ fn flagless_event_escalates_located_rescan() {
 #[test]
 fn multi_verb_word_probes_and_grounds_on_present() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/x",
@@ -188,7 +188,7 @@ fn multi_verb_word_probes_and_grounds_on_present() {
 #[test]
 fn multi_verb_word_grounds_missing_as_removed() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/x",
@@ -209,7 +209,7 @@ fn multi_verb_word_grounds_missing_as_removed() {
 #[test]
 fn probe_failure_escalates_located_rescan() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/denied",
@@ -231,7 +231,7 @@ fn probe_failure_escalates_located_rescan() {
 #[test]
 fn same_batch_rename_pair_grounds_by_probes_into_single_moved() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev(
@@ -274,7 +274,7 @@ fn same_batch_rename_pair_grounds_by_probes_into_single_moved() {
 #[test]
 fn lone_vanished_rename_half_degrades_to_immediate_removal() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/a/left",
@@ -301,7 +301,7 @@ fn lone_vanished_rename_half_degrades_to_immediate_removal() {
 #[test]
 fn cross_batch_vanished_source_degrades_to_remove_plus_create() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/a/old", flags(&[FsEventFlags::ITEM_RENAMED]), 10, 42)],
     at(1),
@@ -316,7 +316,7 @@ fn cross_batch_vanished_source_degrades_to_remove_plus_create() {
     "no same-batch partner evidence: the vanished source resolves now"
   );
 
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/b/new", flags(&[FsEventFlags::ITEM_RENAMED]), 11, 42)],
     at(10),
@@ -344,7 +344,7 @@ fn cross_batch_vanished_source_degrades_to_remove_plus_create() {
 #[test]
 fn appeared_directory_move_in_creates_and_rescans_subtree() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/incoming",
@@ -381,7 +381,7 @@ fn appeared_directory_move_in_creates_and_rescans_subtree() {
 #[test]
 fn cookieless_rename_half_degrades_immediately() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/anon", flags(&[FsEventFlags::ITEM_RENAMED]), 10, 0)],
     at(1),
@@ -405,7 +405,7 @@ fn cookieless_rename_half_degrades_immediately() {
 #[test]
 fn parked_root_queues_later_batches_in_order() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/first",
@@ -419,7 +419,7 @@ fn parked_root_queues_later_batches_in_order() {
   assert_eq!(reqs.len(), 1);
 
   // A later batch must not overtake the parked one.
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/second", flags(&[FsEventFlags::ITEM_CREATED]), 2, 6)],
     at(2),
@@ -448,7 +448,7 @@ fn parked_root_queues_later_batches_in_order() {
 #[test]
 fn root_overflow_drops_parked_work_under_the_rescan() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/pending",
@@ -475,7 +475,7 @@ fn root_overflow_drops_parked_work_under_the_rescan() {
 #[test]
 fn must_scan_subdirs_clamps_to_descent_or_root() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/deep/dir", FsEventFlags::MUST_SCAN_SUBDIRS, 1, 0)],
     at(1),
@@ -487,7 +487,7 @@ fn must_scan_subdirs_clamps_to_descent_or_root() {
   assert_eq!(emitted[0].location(), &loc(&["deep", "dir"]));
 
   // Hierarchical coalescing can put the path ABOVE the root (even "/").
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/", FsEventFlags::MUST_SCAN_SUBDIRS, 2, 0)],
     at(2),
@@ -506,7 +506,7 @@ fn must_scan_subdirs_clamps_to_descent_or_root() {
 #[test]
 fn drops_and_id_wrap_rescan_the_whole_root() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/",
@@ -522,7 +522,7 @@ fn drops_and_id_wrap_rescan_the_whole_root() {
   assert!(emitted[0].kind().is_rescan());
   assert!(!core.resume_poisoned(scope));
 
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/", FsEventFlags::EVENT_IDS_WRAPPED, 2, 0)],
     at(2),
@@ -538,7 +538,7 @@ fn drops_and_id_wrap_rescan_the_whole_root() {
 #[test]
 fn root_changed_missing_is_delete_self() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r", FsEventFlags::ROOT_CHANGED, 0, 0)],
     at(1),
@@ -567,7 +567,7 @@ fn root_changed_missing_is_delete_self() {
 #[test]
 fn root_changed_present_is_move_self() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r", FsEventFlags::ROOT_CHANGED, 0, 0)],
     at(1),
@@ -599,7 +599,7 @@ fn root_changed_present_is_move_self() {
 #[test]
 fn unmount_at_root_ends_the_scope() {
   let (mut core, scope) = live_core();
-  core.on_batch(scope, vec![ev("/r", FsEventFlags::UNMOUNT, 1, 0)], at(1));
+  core.on_batch_events(scope, vec![ev("/r", FsEventFlags::UNMOUNT, 1, 0)], at(1));
   let effects = drain(&mut core);
   let emitted = emits(&effects);
   assert_eq!(emitted.len(), 1);
@@ -614,7 +614,7 @@ fn unmount_at_root_ends_the_scope() {
 #[test]
 fn mount_under_root_rescans_and_degrades_identity() {
   let (mut core, scope) = live_core();
-  core.on_batch(scope, vec![ev("/r/vol", FsEventFlags::MOUNT, 1, 0)], at(1));
+  core.on_batch_events(scope, vec![ev("/r/vol", FsEventFlags::MOUNT, 1, 0)], at(1));
   let effects = drain(&mut core);
   let emitted = emits(&effects);
   assert_eq!(emitted.len(), 1);
@@ -673,7 +673,7 @@ fn unwatch_tears_down_and_silences_the_scope() {
       .iter()
       .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
   );
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/late", flags(&[FsEventFlags::ITEM_CREATED]), 9, 9)],
     at(5),
@@ -687,7 +687,7 @@ fn unwatch_tears_down_and_silences_the_scope() {
 #[test]
 fn consumer_lag_parks_one_dominating_rescan() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 3)],
     at(1),
@@ -701,7 +701,7 @@ fn consumer_lag_parks_one_dominating_rescan() {
   // The consumer refused it: the core bumps the epoch and parks the Rescan.
   core.on_delivery(scope, Delivery::Refused, at(2));
   // Changes produced while lagged are dominated and dropped.
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/b", flags(&[FsEventFlags::ITEM_CREATED]), 2, 4)],
     at(3),
@@ -729,7 +729,7 @@ fn consumer_lag_parks_one_dominating_rescan() {
 
   // Accepted: the scope returns to normal flow.
   core.on_delivery(scope, Delivery::Accepted, at(40));
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/c", flags(&[FsEventFlags::ITEM_CREATED]), 3, 5)],
     at(41),
@@ -743,7 +743,7 @@ fn consumer_lag_parks_one_dominating_rescan() {
 #[test]
 fn newer_rescan_replaces_the_parked_one() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 3)],
     at(1),
@@ -770,7 +770,7 @@ fn newer_rescan_replaces_the_parked_one() {
   assert!(emitted[0].epoch() > offered);
 
   core.on_delivery(scope, Delivery::Accepted, at(5));
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/d", flags(&[FsEventFlags::ITEM_CREATED]), 9, 9)],
     at(6),
@@ -844,7 +844,7 @@ fn blind_mount_table_refuses_event_side_trust() {
 #[test]
 fn probed_foreign_device_is_learned_as_a_mount() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/vol/x",
@@ -876,7 +876,7 @@ fn probed_foreign_device_is_learned_as_a_mount() {
 #[test]
 fn outside_and_invalid_paths_escalate_to_root_rescan() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/elsewhere/x",
@@ -893,7 +893,7 @@ fn outside_and_invalid_paths_escalate_to_root_rescan() {
   assert_eq!(emitted[0].location(), &Location::new());
 
   // A prefix that matches mid-component is NOT under the root.
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/rextra/x", flags(&[FsEventFlags::ITEM_CREATED]), 2, 6)],
     at(2),
@@ -908,7 +908,7 @@ fn non_utf8_segment_escalates_to_root_rescan() {
   use std::{ffi::OsString, os::unix::ffi::OsStringExt};
   let (mut core, scope) = live_core();
   let path = PathBuf::from(OsString::from_vec(b"/r/\xff\xfe".to_vec()));
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![RawOsEvent {
       path,
@@ -928,7 +928,7 @@ fn non_utf8_segment_escalates_to_root_rescan() {
 #[test]
 fn history_done_is_swallowed() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/x", FsEventFlags::HISTORY_DONE, 1, 0)],
     at(1),
@@ -939,7 +939,7 @@ fn history_done_is_swallowed() {
 #[test]
 fn lag_entry_purges_the_scopes_queued_emits() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 10),
@@ -973,7 +973,7 @@ fn lag_entry_purges_the_scopes_queued_emits() {
 
   // Accepting it ends the lag; later changes flow again.
   core.on_delivery(scope, Delivery::Accepted, at(3));
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/d", flags(&[FsEventFlags::ITEM_CREATED]), 4, 13)],
     at(4),
@@ -987,7 +987,7 @@ fn lag_entry_purges_the_scopes_queued_emits() {
 #[test]
 fn teardown_flushes_a_parked_rescan() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 10)],
     at(1),
@@ -1019,7 +1019,7 @@ fn teardown_flushes_a_parked_rescan() {
 #[test]
 fn terminal_rescan_retries_until_accepted() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 10)],
     at(1),
@@ -1091,7 +1091,7 @@ fn root_death_rescan_survives_refusal_after_teardown() {
 #[test]
 fn same_fileid_chain_degrades_under_a_covering_rescan() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/x/a", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 42),
@@ -1136,7 +1136,7 @@ fn same_fileid_chain_degrades_under_a_covering_rescan() {
 fn cross_device_fileid_collision_never_pairs() {
   let (mut core, scope) = live_core();
   // Learn the foreign prefix first (a mounted volume under the root).
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/vol",
@@ -1160,7 +1160,7 @@ fn cross_device_fileid_collision_never_pairs() {
 
   // The same fileID on both devices in one batch: one under the mount, one
   // native. Device-scoped ids must never pre-pair them.
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/vol/twin", flags(&[FsEventFlags::ITEM_RENAMED]), 10, 77),
@@ -1208,7 +1208,7 @@ fn cross_device_fileid_collision_never_pairs() {
 #[test]
 fn foreign_device_singleton_rename_half_gets_no_cookie() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r/alien", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 88)],
     at(1),
@@ -1242,7 +1242,7 @@ fn impure_rename_words_never_take_the_pairing_fast_path() {
   let (mut core, scope) = live_core();
   // Two halves share a fileID, but the destination word coalesced a content
   // change: trusting it as just-a-rename would drop the Modified silently.
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/old", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 42),
@@ -1288,7 +1288,7 @@ fn impure_rename_words_never_take_the_pairing_fast_path() {
 #[test]
 fn rename_coalesced_with_create_and_remove_grounds_by_existence() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev(
@@ -1351,7 +1351,7 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
     }),
   );
   let _ = drain(&mut core);
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/vol/twin", flags(&[FsEventFlags::ITEM_RENAMED]), 10, 77),
@@ -1370,7 +1370,7 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
 #[test]
 fn blind_mount_table_suppresses_the_pairing_fast_path() {
   let (mut core, scope) = live_core_blind_mounts();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/old", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 42),
@@ -1420,7 +1420,7 @@ fn mount_in_batch_blocks_same_batch_rename_trust() {
   // the trust mutation must be visible before any cookie decision — the
   // vanished half under the just-mounted volume is decided event-side (a
   // gone path has no device to stat).
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/vol", flags(&[FsEventFlags::MOUNT]), 1, 0),
@@ -1477,7 +1477,7 @@ fn refresh_requests(effects: &[Effect]) -> usize {
 /// root device) and returns the emitted changes — `Moved` under healthy
 /// trust, `Removed`+`Created` while trust is closed.
 fn feed_pair(core: &mut DriverCore, scope: ScopeId, ids: (u64, u64), fid: u64) -> Vec<Change> {
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/a/old", flags(&[FsEventFlags::ITEM_RENAMED]), ids.0, fid),
@@ -1567,7 +1567,7 @@ fn failed_refresh_keeps_trust_closed() {
 fn refresh_union_keeps_learned_foreign_prefixes() {
   let (mut core, scope) = live_core();
   // A probe learns a foreign-device prefix.
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/vol/x",
@@ -1606,7 +1606,7 @@ fn kernel_loss_flags_revoke_trust_but_coverage_rescans_do_not() {
   // MustScanSubDirs is kernel-side loss: the coalesced-away window may have
   // carried a mount transition.
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/deep",
@@ -1620,7 +1620,7 @@ fn kernel_loss_flags_revoke_trust_but_coverage_rescans_do_not() {
 
   // An id wrap is a loss signal too.
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev("/r", flags(&[FsEventFlags::EVENT_IDS_WRAPPED]), 1, 0)],
     at(1),
@@ -1630,7 +1630,7 @@ fn kernel_loss_flags_revoke_trust_but_coverage_rescans_do_not() {
   // A synthesized coverage rescan (an appeared directory) loses no events
   // and must NOT thrash the trust table.
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![ev(
       "/r/incoming",
@@ -1675,7 +1675,7 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
   );
   let _ = drain(&mut core);
 
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/vol", flags(&[FsEventFlags::UNMOUNT]), 1, 0),
@@ -1722,7 +1722,7 @@ fn vanished_half_grant_requires_partner_evidence() {
   // The destination probes onto a FOREIGN device: no cookie, no evidence —
   // so the vanished source is never granted its cookie either.
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev("/r/a/old", flags(&[FsEventFlags::ITEM_RENAMED]), 10, 42),
@@ -1757,7 +1757,7 @@ fn vanished_half_grant_requires_partner_evidence() {
 #[test]
 fn replaced_path_between_callback_and_probe_never_cookies() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev(
@@ -1819,7 +1819,7 @@ fn replaced_path_between_callback_and_probe_never_cookies() {
 #[test]
 fn vanished_half_grant_keys_on_probed_inode() {
   let (mut core, scope) = live_core();
-  core.on_batch(
+  core.on_batch_events(
     scope,
     vec![
       ev(
@@ -1949,7 +1949,7 @@ mod lowering {
     );
     let _ = drain(&mut core);
 
-    core.on_batch(
+    core.on_batch_events(
       scope,
       vec![ev(
         "/tmp/x.txt",
@@ -1970,7 +1970,7 @@ mod lowering {
     );
 
     // A deep MustScanSubDirs clamps to a LOCATED subtree rescan, not the root.
-    core.on_batch(
+    core.on_batch_events(
       scope,
       vec![ev("/tmp", flags(&[FsEventFlags::MUST_SCAN_SUBDIRS]), 2, 0)],
       at(2),
@@ -1985,7 +1985,7 @@ mod lowering {
     );
 
     // A mount transition under / records located coverage, not a root wipe.
-    core.on_batch(
+    core.on_batch_events(
       scope,
       vec![ev(
         "/Volumes/usb",
@@ -2004,4 +2004,108 @@ mod lowering {
       "{emitted:?}"
     );
   }
+}
+
+/// A stuck probe must not let parked batches escape the transport budget: the
+/// payload's permit rides through the park (active AND queued), so once the
+/// budget is exhausted the callback's acquire fails, the excess batch degrades
+/// to an ordered `Overflow`, and the loss flush returns every slot.
+#[test]
+fn stuck_probe_backpressures_the_callback_through_the_park() {
+  use crate::os::{
+    SourceMessage,
+    fsevent::{TransportState, forward_batch},
+  };
+
+  let (mut core, scope) = live_core();
+  let transport = TransportState::new(2);
+  let mut queue: Vec<SourceMessage> = Vec::new();
+
+  // Batch 1: a rename half needs a probe — the batch parks, slot retained.
+  forward_batch(
+    &transport,
+    vec![ev(
+      "/r/a",
+      flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+      10,
+      7,
+    )],
+    false,
+    |msg| {
+      queue.push(msg);
+      true
+    },
+  );
+  let SourceMessage::Batch(payload) = queue.remove(0) else {
+    panic!("batch 1 rides the queue");
+  };
+  core.on_batch(scope, payload, at(1));
+  let effects = drain(&mut core);
+  assert_eq!(probes(&effects).len(), 1, "the rename half probes");
+  assert_eq!(
+    transport.in_flight(),
+    1,
+    "the parked active batch holds its slot"
+  );
+
+  // Batch 2 queues behind the park, still holding its slot.
+  forward_batch(
+    &transport,
+    vec![ev(
+      "/r/b",
+      flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+      11,
+      8,
+    )],
+    false,
+    |msg| {
+      queue.push(msg);
+      true
+    },
+  );
+  let SourceMessage::Batch(payload) = queue.remove(0) else {
+    panic!("batch 2 rides the queue");
+  };
+  core.on_batch(scope, payload, at(2));
+  assert!(drain(&mut core).is_empty(), "a queued batch feeds nothing");
+  assert_eq!(
+    transport.in_flight(),
+    2,
+    "the queued parked batch holds its slot too"
+  );
+
+  // Batch 3: the budget is exhausted — dropped at the callback, degraded to
+  // the in-order Overflow.
+  forward_batch(
+    &transport,
+    vec![ev(
+      "/r/c",
+      flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+      12,
+      9,
+    )],
+    false,
+    |msg| {
+      queue.push(msg);
+      true
+    },
+  );
+  let SourceMessage::Overflow(ack) = queue.remove(0) else {
+    panic!("the over-budget batch degrades to an Overflow");
+  };
+  assert!(queue.is_empty(), "the dropped batch itself never rides");
+
+  // The driver's protocol: drop the ack, then feed the loss.
+  drop(ack);
+  core.on_root_overflow(scope, at(3));
+  let effects = drain(&mut core);
+  assert!(
+    emits(&effects).iter().any(|c| c.kind().is_rescan()),
+    "the loss becomes a covering Rescan"
+  );
+  assert_eq!(
+    transport.in_flight(),
+    0,
+    "the loss flush returns every parked slot"
+  );
 }

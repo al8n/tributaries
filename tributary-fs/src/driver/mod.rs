@@ -19,8 +19,8 @@ use futures_util::{FutureExt, StreamExt, stream::SelectAll};
 use tributary_proto::{Change, Instant, Interest, ScopeId};
 
 use crate::{
-  core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome, RootMeta},
-  os::{EventReceiver, Source, SourceConfig, SourceError, SourceHandle, SourceMessage},
+  core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome},
+  os::{EventReceiver, RootMeta, Source, SourceConfig, SourceError, SourceHandle, SourceMessage},
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -209,28 +209,15 @@ impl FsOps for RealFs {
   type Handle = SourceHandle;
 
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
-    let (handle, receiver) = Source::spawn(config)?;
-    let root = handle.roots().first().cloned().unwrap_or_default();
-    let root_dev = root_device(&root).map_err(|source| SourceError::RootUnavailable {
-      root: root.clone(),
-      source,
-    })?;
-    // Seed the device-boundary table from the LIVE mount table: an unseeded
-    // table is blind to already-mounted volumes, and event-side identity
-    // trust must never be presumed off blindness.
-    let (mounts, mounts_authoritative) = match crate::os::mounts_under(&root) {
-      Some(mounts) => (mounts, true),
-      None => (Vec::new(), false),
-    };
+    // The spawn itself mints the RootMeta — canonical root, device, and the
+    // mount seed are all finalized BEFORE the stream starts delivering, so
+    // the metadata is a safe authority for every event on the queue; deriving
+    // any of it here, after start, could postdate events already enqueued.
+    let (handle, receiver, meta) = Source::spawn(config)?;
     Ok(SpawnedSource {
       handle,
       receiver,
-      meta: RootMeta {
-        root,
-        root_dev,
-        mounts,
-        mounts_authoritative,
-      },
+      meta,
     })
   }
 
@@ -260,20 +247,6 @@ impl FsOps for RealFs {
       Some(mounts) => (mounts, true),
       None => (Vec::new(), false),
     }
-  }
-}
-
-fn root_device(root: &Path) -> std::io::Result<u64> {
-  let meta = std::fs::metadata(root)?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::MetadataExt;
-    Ok(meta.dev())
-  }
-  #[cfg(not(unix))]
-  {
-    let _ = meta;
-    Ok(0)
   }
 }
 
@@ -474,12 +447,10 @@ pub(crate) async fn run<R, F>(
       msg = os.next() => {
         if let Some((scope, msg)) = msg {
           match msg {
-            Some(SourceMessage::Batch(payload)) => {
-              let crate::os::BatchPayload { events, permit } = payload;
-              core.on_batch(scope, events, now());
-              // The budget slot returns only once its batch is consumed.
-              drop(permit);
-            }
+            // The payload travels whole: its budget slot is released by the
+            // core exactly when the batch settles or is discarded, so parked
+            // events stay inside the transport budget.
+            Some(SourceMessage::Batch(payload)) => core.on_batch(scope, payload, now()),
             // The queue is the source's ONE ordered lane, so everything the
             // signal postdates was already handled above it — no drain, no
             // barrier, nothing to reason about. Dropping the ack BEFORE
