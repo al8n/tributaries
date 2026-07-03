@@ -5,9 +5,10 @@ use agnostic_lite::tokio::TokioRuntime;
 /// platform), so registration protocols are observable in isolation.
 fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>) {
   let (command_tx, command_rx) = async_channel::bounded(16);
-  let (_event_tx, event_rx) = async_channel::bounded::<(ScopeId, Change)>(4);
+  let (_event_tx, event_rx) = async_channel::bounded::<(ScopeId, Arc<PathBuf>, Change)>(4);
   (
     Watcher {
+      instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
       events: futures_util::StreamExt::boxed(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
@@ -93,4 +94,62 @@ async fn dropped_before_first_poll_reserves_nothing() {
   drop(watcher.watch(&dir, Interest::all()));
   assert!(pending_of(&watcher).is_empty());
   let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A handle is a capability scoped to its issuing watcher: a foreign handle
+/// is rejected outright — before any command is sent — so it can never tear
+/// down the victim watcher's unrelated root that shares the scope number.
+#[tokio::test]
+async fn foreign_handle_is_rejected_without_touching_the_victim() {
+  let (victim, commands) = manual_watcher();
+  let foreign = RootHandle::new(
+    victim.instance + 1,
+    ScopeId::new(core::num::NonZeroU64::new(1).unwrap()),
+  );
+
+  assert!(matches!(
+    victim.unwatch(foreign).await,
+    Err(UnwatchError::UnknownRoot)
+  ));
+  assert!(
+    commands.try_recv().is_err(),
+    "a foreign handle must not reach the victim's driver"
+  );
+  assert_eq!(victim.root_path(foreign), None);
+}
+
+/// Same-watcher handles for scopes the registry does not know answer `None`
+/// without erroring elsewhere — the negative control for the brand check.
+#[tokio::test]
+async fn unknown_scope_of_own_instance_has_no_path() {
+  let (watcher, _commands) = manual_watcher();
+  let handle = RootHandle::new(
+    watcher.instance,
+    ScopeId::new(core::num::NonZeroU64::new(7).unwrap()),
+  );
+  assert_eq!(watcher.root_path(handle), None);
+}
+
+/// The registry holds exactly the LIVE roots: every unwatch reclaims its
+/// entry (the driver's scope-dead signal), so repeated cycles cannot grow it.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn registry_reclaims_on_unwatch_cycles() {
+  let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
+  let dir = scratch_dir("reclaim");
+  for _ in 0..8 {
+    let handle = watcher
+      .watch(&dir, tributary_proto::Interest::all())
+      .await
+      .expect("watch");
+    assert_eq!(watcher.registry_len(), 1);
+    watcher.unwatch(handle).await.expect("unwatch");
+    assert_eq!(watcher.registry_len(), 0, "unwatch reclaims the entry");
+    assert_eq!(
+      watcher.root_path(handle),
+      None,
+      "a reclaimed handle no longer names a root"
+    );
+  }
+  watcher.close().await.expect("close");
 }

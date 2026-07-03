@@ -26,6 +26,7 @@ use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
   num::NonZeroU64,
   path::{Path, PathBuf},
+  sync::Arc,
   time::Duration,
 };
 
@@ -106,6 +107,11 @@ pub(crate) enum Effect {
   Emit {
     /// The scope the change belongs to.
     scope: ScopeId,
+    /// The canonical root the change's location is relative to. Deliveries
+    /// carry their own root so consumer-side assembly never depends on a
+    /// registry entry — a dead scope's trailing changes (above all its
+    /// terminal `Rescan`) still assemble after the scope is reclaimed.
+    root: Arc<PathBuf>,
     /// The change to deliver.
     change: Change,
   },
@@ -118,7 +124,7 @@ pub(crate) enum Effect {
     /// The scope whose device-trust table went stale.
     scope: ScopeId,
     /// The canonical root to enumerate mounts under.
-    root: PathBuf,
+    root: Arc<PathBuf>,
   },
 }
 
@@ -260,6 +266,10 @@ enum Attempt {
 struct DyingDelivery {
   change: Change,
   attempt: Attempt,
+  /// The dead scope's canonical root, retained so the terminal delivery (and
+  /// any straggler routed through the dying entry) still assembles after the
+  /// scope state — and the consumer-side registry entry — are gone.
+  root: Arc<PathBuf>,
 }
 
 /// One watched root's driver-side state.
@@ -267,8 +277,9 @@ struct DyingDelivery {
 struct ScopeState {
   watch: WatchId,
   requested: PathBuf,
-  /// Canonicalized root bytes — known once the stream spawned.
-  root: Option<PathBuf>,
+  /// Canonicalized root bytes — known once the stream spawned. Shared so
+  /// every delivery can carry it without copying.
+  root: Option<Arc<PathBuf>>,
   root_dev: Option<u64>,
   /// Foreign-device prefixes under the root: seeded from the live mount
   /// table at spawn, then maintained by Mount/Unmount events and probed
@@ -291,6 +302,18 @@ struct ScopeState {
   park: Park,
   /// The journal id counter wrapped; any minted resume token is invalid.
   resume_poisoned: bool,
+}
+
+impl ScopeState {
+  /// The root every delivery of this scope carries: the canonical root once
+  /// the stream spawned, else the consumer-supplied path (the defensive floor
+  /// for a scope that dies before its spawn result lands).
+  fn delivery_root(&self) -> Arc<PathBuf> {
+    self
+      .root
+      .clone()
+      .unwrap_or_else(|| Arc::new(self.requested.clone()))
+  }
 }
 
 /// Where a path fell relative to its scope root.
@@ -385,7 +408,7 @@ impl DriverCore {
     let watch = state.watch;
     match res {
       Ok(meta) => {
-        state.root = Some(meta.root);
+        state.root = Some(Arc::new(meta.root));
         state.root_dev = Some(meta.root_dev);
         state.mounts = meta.mounts;
         state.mounts_authoritative = meta.mounts_authoritative;
@@ -626,6 +649,13 @@ impl DriverCore {
       return Some(effect);
     }
     for (scope, state) in self.scopes.iter_mut() {
+      let root = match &state.lag {
+        LagState::Lagged {
+          parked: Some(_),
+          attempt: Attempt::Idle,
+        } => state.delivery_root(),
+        _ => continue,
+      };
       if let LagState::Lagged {
         parked: Some(change),
         attempt: attempt @ Attempt::Idle,
@@ -634,6 +664,7 @@ impl DriverCore {
         *attempt = Attempt::InFlight(change.epoch());
         return Some(Effect::Emit {
           scope: *scope,
+          root,
           change: change.clone(),
         });
       }
@@ -643,6 +674,7 @@ impl DriverCore {
         entry.attempt = Attempt::InFlight(entry.change.epoch());
         return Some(Effect::Emit {
           scope: *scope,
+          root: Arc::clone(&entry.root),
           change: entry.change.clone(),
         });
       }
@@ -925,7 +957,8 @@ impl DriverCore {
       let probe = self.mint_probe(scope, ProbePurpose::RootAlive { item: idx });
       let path = state
         .root
-        .clone()
+        .as_deref()
+        .cloned()
         .unwrap_or_else(|| state.requested.clone());
       return ItemPlan::Await { probe, path };
     }
@@ -1126,9 +1159,16 @@ impl DriverCore {
             dev,
           } => {
             learn_device(state, &path, dev);
-            let pairing_id = file_id.or(probed);
-            let cookie = allow_cookie
-              .then(|| cookie_for(state, pairing_id, dev))
+            // Identity binding: the cookie and its published evidence derive
+            // from the PROBED inode exclusively — the probe is what carries
+            // the device proof. An event id that disagrees with the probe
+            // means the path was replaced between the callback and the
+            // lstat: the batch's view of this path is stale, so no cookie
+            // may bridge the two objects, and the located rescan below
+            // re-grounds whatever occupies the path now.
+            let stale = matches!((file_id, probed), (Some(event), Some(live)) if event != live);
+            let cookie = (allow_cookie && !stale)
+              .then(|| cookie_for(state, probed, dev))
               .flatten();
             let node = mint(state, &path, probed, Some(dev));
             let mut rec = record_with(
@@ -1156,16 +1196,16 @@ impl DriverCore {
               );
               planned.push(Planned::Rec(rec));
             }
-            if kind.is_dir() {
+            if kind.is_dir() || stale {
               planned.push(Planned::Over(located(state.watch, target)));
             }
             Resolved {
               item,
               planned,
               // A cookie minted here IS the live root-device proof: publish
-              // it so a vanished same-batch partner sharing this fileID can
-              // be granted its half at settlement.
-              evidences: cookie.is_some().then_some(pairing_id).flatten(),
+              // the PROBED inode so a vanished same-batch partner is granted
+              // only against evidence for the object actually seen on disk.
+              evidences: cookie.is_some().then_some(probed).flatten(),
               candidate: None,
             }
           }
@@ -1185,14 +1225,18 @@ impl DriverCore {
     effects.retain(|effect| !matches!(effect, Effect::Emit { scope: s, .. } if *s == scope));
   }
 
-  /// Removes and returns the LAST queued `Rescan` emit for `scope`, if any —
-  /// the terminal covering change a teardown keeps retryable.
-  fn extract_last_rescan(effects: &mut VecDeque<Effect>, scope: ScopeId) -> Option<Change> {
+  /// Removes and returns the LAST queued `Rescan` emit for `scope` (with the
+  /// root it was queued to deliver under), if any — the terminal covering
+  /// change a teardown keeps retryable.
+  fn extract_last_rescan(
+    effects: &mut VecDeque<Effect>,
+    scope: ScopeId,
+  ) -> Option<(Arc<PathBuf>, Change)> {
     let idx = effects.iter().rposition(|effect| {
-      matches!(effect, Effect::Emit { scope: s, change } if *s == scope && change.kind().is_rescan())
+      matches!(effect, Effect::Emit { scope: s, change, .. } if *s == scope && change.kind().is_rescan())
     })?;
     match effects.remove(idx) {
-      Some(Effect::Emit { change, .. }) => Some(change),
+      Some(Effect::Emit { root, change, .. }) => Some((root, change)),
       _ => None,
     }
   }
@@ -1246,24 +1290,25 @@ impl DriverCore {
             // it), so the newest terminal `Rescan` moves into the dying set
             // and retries until the consumer accepts it. Ordinary queued
             // emits stay best-effort — each is dominated by that `Rescan`.
-            let parked = self
-              .scopes
-              .remove(&scope)
-              .and_then(|state| match state.lag {
-                LagState::Lagged { parked, .. } => parked,
+            let parked = self.scopes.remove(&scope).and_then(|state| {
+              let root = state.delivery_root();
+              match state.lag {
+                LagState::Lagged { parked, .. } => parked.map(|change| (root, change)),
                 LagState::Normal => None,
-              });
+              }
+            });
             let queued = Self::extract_last_rescan(&mut self.effects, scope);
             let terminal = match (parked, queued) {
-              (Some(a), Some(b)) => Some(if b.epoch() > a.epoch() { b } else { a }),
+              (Some(a), Some(b)) => Some(if b.1.epoch() > a.1.epoch() { b } else { a }),
               (a, b) => a.or(b),
             };
-            if let Some(change) = terminal {
+            if let Some((root, change)) = terminal {
               self.dying.insert(
                 scope,
                 DyingDelivery {
                   change,
                   attempt: Attempt::Idle,
+                  root,
                 },
               );
             }
@@ -1284,13 +1329,29 @@ impl DriverCore {
   fn route_event(&mut self, change: Change) {
     let scope = change.scope();
     let Some(state) = self.scopes.get_mut(&scope) else {
-      // A change for a scope torn down in the same drain still delivers —
-      // over-delivery is the safe direction.
-      self.effects.push_back(Effect::Emit { scope, change });
+      // A change for a scope torn down in the same drain still delivers when
+      // its root is still nameable (the dying entry keeps it) — over-delivery
+      // is the safe direction. Without a dying entry the dead scope owes no
+      // coverage, and a straggler with no assignable root is dropped rather
+      // than misattributed.
+      if let Some(entry) = self.dying.get(&scope) {
+        self.effects.push_back(Effect::Emit {
+          scope,
+          root: Arc::clone(&entry.root),
+          change,
+        });
+      }
       return;
     };
     match &mut state.lag {
-      LagState::Normal => self.effects.push_back(Effect::Emit { scope, change }),
+      LagState::Normal => {
+        let root = state.delivery_root();
+        self.effects.push_back(Effect::Emit {
+          scope,
+          root,
+          change,
+        });
+      }
       LagState::Lagged { parked, .. } => {
         if change.kind().is_rescan() {
           // The newest dominating Rescan wins; everything else the scope

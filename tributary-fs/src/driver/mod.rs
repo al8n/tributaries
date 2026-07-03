@@ -10,6 +10,7 @@ use std::{
   collections::BTreeMap,
   num::NonZeroUsize,
   path::{Path, PathBuf},
+  sync::Arc,
   time::Duration,
 };
 
@@ -334,7 +335,7 @@ pub(crate) async fn run<R, F>(
   config: DriverConfig,
   ops: F,
   commands: async_channel::Receiver<Command>,
-  events: async_channel::Sender<(ScopeId, Change)>,
+  events: async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   on_scope_dead: impl Fn(ScopeId) + Send + Sync + 'static,
 ) where
   R: RuntimeLite,
@@ -599,7 +600,7 @@ fn execute_effects<R, F>(
   config: &DriverConfig,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
   handles: &mut BTreeMap<ScopeId, LiveSource<F::Handle>>,
-  events: &async_channel::Sender<(ScopeId, Change)>,
+  events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
   on_scope_dead: &(impl Fn(ScopeId) + Send + Sync),
   now: &impl Fn() -> Instant,
@@ -657,7 +658,11 @@ fn execute_effects<R, F>(
           });
         });
       }
-      Effect::Emit { scope, change } => match events.try_send((scope, change)) {
+      Effect::Emit {
+        scope,
+        root,
+        change,
+      } => match events.try_send((scope, root, change)) {
         Ok(()) => core.on_delivery(scope, Delivery::Accepted, now()),
         Err(async_channel::TrySendError::Full(_)) => {
           core.on_delivery(scope, Delivery::Refused, now());
