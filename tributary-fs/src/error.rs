@@ -133,6 +133,16 @@ pub enum CloseError {
   /// torn down externally); streams are still reclaimed at process exit.
   #[error("the driver stopped before confirming the shutdown")]
   Stopped,
+  /// The close grace expired with stream teardowns still executing on the
+  /// blocking pool. Unlike a pending spawn — whose dropped result still tears
+  /// its stream down — a pending teardown already moved its handle into the
+  /// wedged shutdown call, so nothing can reclaim that stream until the call
+  /// returns: quiescence is NOT proven, and the OS reclaims at process exit.
+  #[error("{pending} stream teardown(s) still executing when the close grace expired")]
+  NotQuiesced {
+    /// How many teardowns were still executing at grace expiry.
+    pending: usize,
+  },
 }
 
 impl CloseError {
@@ -140,5 +150,11 @@ impl CloseError {
   #[inline]
   pub const fn is_stopped(&self) -> bool {
     matches!(self, Self::Stopped)
+  }
+
+  /// Whether this is [`NotQuiesced`](Self::NotQuiesced).
+  #[inline]
+  pub const fn is_not_quiesced(&self) -> bool {
+    matches!(self, Self::NotQuiesced { .. })
   }
 }

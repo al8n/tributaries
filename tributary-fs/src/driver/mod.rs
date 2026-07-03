@@ -152,8 +152,9 @@ pub(crate) enum Command {
   },
   /// Orderly shutdown; resolves when every stream is torn down.
   Close {
-    /// Resolved when the driver has quiesced.
-    reply: futures_channel::oneshot::Sender<()>,
+    /// Resolved with the number of teardowns still wedged past the close
+    /// grace — 0 means native-stream quiescence was proven.
+    reply: futures_channel::oneshot::Sender<usize>,
   },
 }
 
@@ -600,8 +601,15 @@ pub(crate) async fn run<R, F>(
     }
   };
   // Grace expiry with work still pending means a wedged blocking pool: the
-  // close reply goes out anyway (a wedged pool must not hang close forever),
-  // and a still-pending spawn's handle Drop remains the reclamation backstop.
+  // close reply goes out anyway (a wedged pool must not hang close forever).
+  // The two residuals differ, and the reply reports the difference: a
+  // still-pending SPAWN self-reclaims (its undeliverable result drops with
+  // the channel and the handle's Drop runs the teardown), but a still-pending
+  // TEARDOWN already moved its handle INTO the wedged shutdown call — nothing
+  // can reclaim that stream until the call returns, so close must not claim
+  // quiescence. One shared grace for both: a wedged FFI teardown rarely
+  // unwedges with more time, so a longer teardown window would only delay
+  // the honest signal.
   let _ = R::timeout(Duration::from_secs(1), drain).await;
   execute_effects::<R, F>(
     &mut core,
@@ -617,7 +625,7 @@ pub(crate) async fn run<R, F>(
     &now,
   );
   if let Some(reply) = close_reply {
-    let _ = reply.send(());
+    let _ = reply.send(pending_teardowns.len());
   }
 }
 
