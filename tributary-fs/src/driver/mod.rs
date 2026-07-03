@@ -756,6 +756,7 @@ fn clone_error(err: &SourceError) -> SourceError {
     SourceError::Unsupported => SourceError::Unsupported,
     SourceError::NoRoots => SourceError::NoRoots,
     SourceError::NotADirectory { root } => SourceError::NotADirectory { root: root.clone() },
+    SourceError::RootReplaced { root } => SourceError::RootReplaced { root: root.clone() },
     SourceError::TooManyExclusions { supplied } => SourceError::TooManyExclusions {
       supplied: *supplied,
     },

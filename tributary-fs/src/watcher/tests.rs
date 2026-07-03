@@ -37,6 +37,21 @@ fn scratch_dir(tag: &str) -> PathBuf {
   dir
 }
 
+/// Close cannot claim quiescence it never observed: a close command that
+/// cannot even be delivered means the driver stopped — with whatever
+/// spawn/teardown work it held unobserved — so the caller gets `Stopped`,
+/// never `Ok`.
+#[tokio::test]
+async fn close_reports_stopped_when_the_driver_is_gone() {
+  let (watcher, command_rx) = manual_watcher();
+  drop(command_rx);
+  let err = watcher
+    .close()
+    .await
+    .expect_err("an unacknowledged close is not quiescence");
+  assert!(err.is_stopped(), "{err:?}");
+}
+
 #[tokio::test]
 async fn cancelled_watch_releases_its_reservation() {
   let (watcher, commands) = manual_watcher();
@@ -566,6 +581,53 @@ mod lifecycle {
         .await
         .is_err(),
       "a never-live scope produces no events"
+    );
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The identity bracket: a root whose OBJECT is swapped between the
+  /// metadata capture and the stream going live — same bytes, different
+  /// `(dev, ino)` — is rejected post-live, the just-started stream torn
+  /// down, and nothing goes live to the caller. The new object itself
+  /// remains watchable: the bracket rejected a race, not the root.
+  #[tokio::test(start_paused = true)]
+  async fn replaced_root_between_seal_and_live_is_rejected() {
+    let (dir, canonical) = scratch("replaced-at-live");
+    let fs = FakeFs::new(1);
+    fs.put(&canonical, FileKind::Dir, 1);
+    fs.replace_at_live(&canonical, FileKind::Dir, 99);
+    let mut watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let err = watcher
+      .watch(&dir, Interest::all())
+      .await
+      .expect_err("the swapped object is rejected");
+    match err {
+      WatchRootError::Source(crate::SourceError::RootReplaced { root }) => {
+        assert_eq!(root, canonical, "the FINAL root is reported");
+      }
+      other => panic!("expected RootReplaced, got {other:?}"),
+    }
+    assert_eq!(fs.spawns(), 1, "the stream went live before the bracket");
+    assert_eq!(fs.shutdowns(), 1, "the just-live stream was torn down");
+    assert_eq!(watcher.registry_len(), 0);
+    assert!(
+      tokio::time::timeout(Duration::from_secs(2), watcher.next())
+        .await
+        .is_err(),
+      "a never-live scope produces no events"
+    );
+
+    let handle = watcher
+      .watch(&dir, Interest::all())
+      .await
+      .expect("the new object registers cleanly");
+    assert_eq!(
+      watcher.root_path(handle).as_deref(),
+      Some(canonical.as_path())
     );
 
     watcher.close().await.expect("close");

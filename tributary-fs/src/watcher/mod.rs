@@ -561,16 +561,20 @@ impl<R: RuntimeLite> Watcher<R> {
   /// # Errors
   ///
   /// [`CloseError::Stopped`] when the driver stopped before confirming (a
-  /// panic or an external teardown), and [`CloseError::NotQuiesced`] when
+  /// panic or an external teardown) — including when the close command
+  /// cannot be delivered at all — and [`CloseError::NotQuiesced`] when
   /// stream teardowns were still executing at grace expiry — those streams
   /// stay live until their wedged calls return; the OS reclaims at process
   /// exit either way.
   pub async fn close(self) -> Result<(), CloseError> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self.commands.send(Command::Close { reply }).await.is_err() {
-      // The driver already exited through its orderly drop path.
+      // The receiver vanished while this watcher still held a sender: the
+      // driver stopped (a panic, an external abort) without acknowledging
+      // this close, and whatever spawn/teardown work it held went
+      // unobserved — that is not proof of quiescence.
       self.driver_gone();
-      return Ok(());
+      return Err(CloseError::Stopped);
     }
     match response.await {
       Ok(0) => Ok(()),

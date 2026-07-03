@@ -763,19 +763,20 @@ fn apply(
   }
 }
 
-/// The spawn contract: a source's `RootMeta` is sealed strictly BEFORE its
-/// stream can enqueue an event, so trust-bearing metadata can never postdate
-/// a message on the queue. The fake mirrors the real backend's pre-start
-/// barrier and records the order; a regression that seeds after the stream
-/// goes live fails here.
+/// The spawn contract's full observable order: a source's `RootMeta` is
+/// sealed strictly BEFORE its stream can enqueue an event (trust-bearing
+/// metadata can never postdate a message on the queue), and the root is
+/// revalidated strictly AFTER the stream is live — the identity bracket's
+/// post-live half — before the spawn returns. A regression that seeds after
+/// liveness, or commits without revalidating, fails here.
 #[tokio::test(start_paused = true)]
 async fn spawn_seals_root_meta_before_the_stream_goes_live() {
   let rig = rig_with_capacity(64);
   watch(&rig, "/r").await;
   assert_eq!(
     rig.fs.spawn_order(),
-    vec!["meta_sealed", "stream_live"],
-    "the metadata barrier precedes stream liveness"
+    vec!["meta_sealed", "stream_live", "root_revalidated"],
+    "the metadata barrier precedes liveness; the identity bracket follows it"
   );
 }
 
