@@ -50,6 +50,7 @@ fn rig_with(event_capacity: usize, registry: impl ScopeRegistry) -> Rig {
 }
 
 async fn watch(rig: &Rig, root: &str) -> ScopeId {
+  let before = rig.fs.refreshes();
   let (reply, on_reply) = futures_channel::oneshot::channel();
   rig
     .commands
@@ -63,6 +64,21 @@ async fn watch(rig: &Rig, root: &str) -> ScopeId {
   let grant = on_reply.await.unwrap().expect("watch succeeds");
   let scope = grant.scope();
   grant.defuse();
+  // A scope is born trust-closed; its birth refresh runs on the real-thread
+  // blocking pool. Wait it out so every test starts from installed trust —
+  // once the result is queued, the biased select consumes it before any
+  // batch a test injects afterwards. Real-clock bound: the pool runs outside
+  // the paused runtime.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while rig.fs.refreshes() <= before && std::time::Instant::now() < deadline {
+    tokio::task::yield_now().await;
+  }
+  assert!(rig.fs.refreshes() > before, "the birth refresh ran");
+  // The counter increments inside the pool thread an instant before its
+  // result is queued; a few yields let that send land.
+  for _ in 0..8 {
+    tokio::task::yield_now().await;
+  }
   scope
 }
 
@@ -272,7 +288,10 @@ async fn watch_of_a_missing_root_fails_typed() {
     .await
     .unwrap();
   let err = on_reply.await.unwrap().unwrap_err();
-  assert!(matches!(err, SourceError::RootUnavailable { .. }));
+  assert!(matches!(
+    err,
+    WatchRootError::Source(SourceError::RootUnavailable { .. })
+  ));
 }
 
 /// The queue is the source's one ordered lane: batches enqueued BEFORE a loss
@@ -470,6 +489,7 @@ async fn overflow_refreshes_mount_trust_and_pairing_resumes() {
   let rig = rig_with_capacity(64);
   let _scope = watch(&rig, "/r").await;
 
+  assert_eq!(rig.fs.refreshes(), 1, "the birth refresh already ran");
   rig.fs.send_lossy("/r");
   let (_, rescan) = next_event(&rig).await;
   assert!(rescan.kind().is_rescan());
@@ -478,10 +498,14 @@ async fn overflow_refreshes_mount_trust_and_pairing_resumes() {
   // the blocking pool. That pool runs on REAL threads outside the paused
   // runtime, so the wait must be bounded by the real clock.
   let deadline = std::time::Instant::now() + Duration::from_secs(10);
-  while rig.fs.refreshes() < 1 && std::time::Instant::now() < deadline {
+  while rig.fs.refreshes() < 2 && std::time::Instant::now() < deadline {
     tokio::task::yield_now().await;
   }
-  assert_eq!(rig.fs.refreshes(), 1, "one refresh per loss, coalesced");
+  assert_eq!(
+    rig.fs.refreshes(),
+    2,
+    "one refresh per loss, coalesced, on top of the birth refresh"
+  );
 
   // With the refreshed table installed, a same-batch rename pair grounds
   // into a single Moved again — trust round-tripped end to end.

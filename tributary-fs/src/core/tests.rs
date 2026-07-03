@@ -48,7 +48,8 @@ fn probes(effects: &[Effect]) -> Vec<(ProbeId, PathBuf)> {
     .collect()
 }
 
-/// A core with one live scope rooted at `/r` on device 1.
+/// A core with one live scope rooted at `/r` on device 1, its birth refresh
+/// fed (an authoritative empty table): event-side trust is open.
 fn live_core() -> (DriverCore, ScopeId) {
   let mut core = DriverCore::new(WINDOW);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
@@ -63,15 +64,21 @@ fn live_core() -> (DriverCore, ScopeId) {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: Vec::new(),
-      mounts_authoritative: true,
     }),
   );
-  assert!(drain(&mut core).is_empty(), "a spawned KR root is silent");
+  let effects = drain(&mut core);
+  assert_eq!(
+    refresh_requests(&effects),
+    1,
+    "a spawned scope is born closed and arms its birth refresh: {effects:?}"
+  );
+  core.on_mounts_refreshed(scope, Vec::new(), true);
+  assert!(drain(&mut core).is_empty(), "a refreshed KR root is silent");
   (core, scope)
 }
 
-/// A live core whose mount table could NOT be read at spawn: device
-/// boundaries are unknown, so event-side identity/cookie trust is refused.
+/// A live core whose birth refresh could NOT read the mount table: device
+/// boundaries stay unknown, so event-side identity/cookie trust is refused.
 fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
   let mut core = DriverCore::new(WINDOW);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
@@ -82,9 +89,10 @@ fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: Vec::new(),
-      mounts_authoritative: false,
     }),
   );
+  let _ = drain(&mut core);
+  core.on_mounts_refreshed(scope, Vec::new(), false);
   assert!(drain(&mut core).is_empty());
   (core, scope)
 }
@@ -1340,17 +1348,19 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
   let mut core = DriverCore::new(WINDOW);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
   let _ = drain(&mut core);
-  // The volume was ALREADY mounted at spawn: only the seeded table knows.
+  // The volume was ALREADY mounted at spawn: only the seeded table knows —
+  // and the union keeps the seed even when the birth refresh (racing an
+  // unmount, say) no longer lists it.
   core.on_stream_spawned(
     scope,
     Ok(RootMeta {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: vec![PathBuf::from("/r/vol")],
-      mounts_authoritative: true,
     }),
   );
   let _ = drain(&mut core);
+  core.on_mounts_refreshed(scope, Vec::new(), true);
   core.on_batch_events(
     scope,
     vec![
@@ -1365,6 +1375,135 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
     2,
     "a pre-mounted foreign volume never pre-pairs by fileID"
   );
+}
+
+#[test]
+fn birth_window_refuses_cookies_until_the_refresh_installs() {
+  // A mount can appear between the spawn's seed read and stream start,
+  // landing in neither the seed nor the event stream — so a scope is born
+  // trust-closed, and only the post-live birth refresh installs authority.
+  let mut core = DriverCore::new(WINDOW);
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let _ = drain(&mut core);
+  core.on_stream_spawned(
+    scope,
+    Ok(RootMeta {
+      root: PathBuf::from("/r"),
+      root_dev: 1,
+      mounts: Vec::new(),
+    }),
+  );
+  assert_eq!(
+    refresh_requests(&drain(&mut core)),
+    1,
+    "the spawn arms the birth refresh"
+  );
+
+  // A rename lands while the birth window is still closed: the vanished
+  // half's cookie grant needs the table, which cannot yet prove root-device.
+  core.on_batch_events(
+    scope,
+    vec![
+      ev("/r/old", flags(&[FsEventFlags::ITEM_RENAMED]), 1, 42),
+      ev("/r/new", flags(&[FsEventFlags::ITEM_RENAMED]), 2, 42),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2);
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  core.on_timeout(at(400));
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "no Moved may pair inside the closed birth window: {emitted:?}"
+  );
+
+  // The birth refresh installs; the same shape now grounds into one Moved.
+  core.on_mounts_refreshed(scope, Vec::new(), true);
+  core.on_batch_events(
+    scope,
+    vec![
+      ev("/r/old2", flags(&[FsEventFlags::ITEM_RENAMED]), 3, 43),
+      ev("/r/new2", flags(&[FsEventFlags::ITEM_RENAMED]), 4, 43),
+    ],
+    at(500),
+  );
+  let reqs = probes(&drain(&mut core));
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(501));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(43),
+      dev: 1,
+    },
+    at(501),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().moved_from() == Some(&loc(&["old2"])) && c.location() == &loc(&["new2"])),
+    "installed trust pairs the same shape: {emitted:?}"
+  );
+}
+
+#[test]
+fn a_loss_racing_the_birth_refresh_rearms_it_once() {
+  let mut core = DriverCore::new(WINDOW);
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let _ = drain(&mut core);
+  core.on_stream_spawned(
+    scope,
+    Ok(RootMeta {
+      root: PathBuf::from("/r"),
+      root_dev: 1,
+      mounts: Vec::new(),
+    }),
+  );
+  assert_eq!(
+    refresh_requests(&drain(&mut core)),
+    1,
+    "birth refresh armed"
+  );
+
+  // A loss overlaps the in-flight birth refresh: it coalesces (no second
+  // effect), marking the outstanding read stale instead.
+  core.on_root_overflow(scope, at(1));
+  assert_eq!(
+    refresh_requests(&drain(&mut core)),
+    0,
+    "a racing loss coalesces onto the outstanding refresh"
+  );
+
+  // The stale read's result is discarded and exactly one re-read arms.
+  core.on_mounts_refreshed(scope, Vec::new(), true);
+  assert_eq!(
+    refresh_requests(&drain(&mut core)),
+    1,
+    "the stale result re-arms exactly once"
+  );
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(
+    !state.mounts_authoritative,
+    "trust stays closed until a post-loss read installs"
+  );
+
+  core.on_mounts_refreshed(scope, Vec::new(), true);
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(state.mounts_authoritative, "the fresh read installs");
 }
 
 #[test]
@@ -1670,10 +1809,10 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       mounts: vec![PathBuf::from("/r/vol")],
-      mounts_authoritative: true,
     }),
   );
   let _ = drain(&mut core);
+  core.on_mounts_refreshed(scope, vec![PathBuf::from("/r/vol")], true);
 
   core.on_batch_events(
     scope,
@@ -1944,10 +2083,10 @@ mod lowering {
         root: PathBuf::from("/"),
         root_dev: 1,
         mounts: Vec::new(),
-        mounts_authoritative: true,
       }),
     );
     let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, Vec::new(), true);
 
     core.on_batch_events(
       scope,

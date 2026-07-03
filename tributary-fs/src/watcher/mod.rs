@@ -110,6 +110,26 @@ impl ScopeRegistry for RegistryWriter {
     let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
     set.entries.remove(&scope);
   }
+
+  fn final_root_conflict(&self, final_root: &Path, reserved: Option<&Path>) -> Option<PathBuf> {
+    let set = self.roots.read().unwrap_or_else(PoisonError::into_inner);
+    set
+      .entries
+      .values()
+      .map(|path| path.as_path())
+      .chain(
+        set
+          .pending
+          .iter()
+          .map(PathBuf::as_path)
+          // A reservation holds at most one entry per path (an overlapping
+          // second take is rejected), so skipping by equality skips exactly
+          // the checking watch's own.
+          .filter(|path| Some(*path) != reserved),
+      )
+      .find(|existing| final_root.starts_with(existing) || existing.starts_with(final_root))
+      .map(Path::to_path_buf)
+  }
 }
 
 /// A pending-root reservation, held across `watch`'s awaits. Dropping it —
@@ -117,6 +137,12 @@ impl ScopeRegistry for RegistryWriter {
 /// an abandoned `watch` can never leave a permanent overlap blocker. On
 /// success the real `RootEntry` is inserted BEFORE the guard drops, so the
 /// path is covered continuously.
+///
+/// The reserved path is ADVISORY: it holds the watcher-side canonical form,
+/// which mutually excludes concurrent `watch` calls, but the backend
+/// re-canonicalizes during spawn — the driver's final-root check
+/// ([`ScopeRegistry::final_root_conflict`]) is the authority on what actually
+/// goes live.
 struct Reservation {
   roots: Arc<RwLock<RootSet>>,
   path: PathBuf,
@@ -286,7 +312,10 @@ impl<R: RuntimeLite> Watcher<R> {
   /// - [`WatchRootError::NotFound`] / [`WatchRootError::NotADirectory`] when
   ///   the root cannot serve as a watch target;
   /// - [`WatchRootError::Overlaps`] when it is not disjoint from an
-  ///   already-watched root (subsumption is the layer above's job);
+  ///   already-watched root (subsumption is the layer above's job). The check
+  ///   binds to the FINAL canonical root: a path retargeted between this call
+  ///   and the stream spawn is revalidated by the driver, so the disjointness
+  ///   invariant holds for what is actually watched;
   /// - [`WatchRootError::Source`] when the platform stream could not start;
   /// - [`WatchRootError::Closed`] when the watcher is already closed.
   pub async fn watch(
@@ -347,7 +376,7 @@ impl<R: RuntimeLite> Watcher<R> {
         grant.defuse();
         Ok(RootHandle::new(self.instance, scope))
       }
-      Ok(Err(err)) => Err(WatchRootError::Source(err)),
+      Ok(Err(err)) => Err(err),
       Err(_) => {
         self.driver_gone();
         Err(WatchRootError::Closed)

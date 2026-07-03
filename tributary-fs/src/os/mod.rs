@@ -36,24 +36,26 @@ pub(crate) use fsevent::{BatchPayload, FsEventFlags, OverflowAck, RawOsEvent};
 pub(crate) const MAX_EXCLUSIONS: usize = 8;
 
 /// What a source's spawn learned about its root — finalized strictly BEFORE
-/// the stream can enqueue its first event, so this metadata is a safe
-/// authority for every message the source ever delivers. A snapshot taken
-/// after start could postdate events already queued (a foreign submount that
-/// events and vanishes in that window would be trusted off blindness), so the
-/// seam forbids it: only [`Source::spawn`] mints a `RootMeta`.
+/// the stream can enqueue its first event, so nothing here can postdate a
+/// message the source delivers, and no fallible metadata path exists after
+/// start. Only [`Source::spawn`] mints a `RootMeta`.
+///
+/// The mount seed is deliberately NOT an authority: a mount appearing between
+/// the seed read and stream start lands in neither the seed nor the event
+/// stream, so a pre-start snapshot can never prove a path is root-device. The
+/// seed only ever REDUCES trust (its prefixes are foreign) and steers probes;
+/// authority is installed exclusively by the driver's post-live mount refresh,
+/// whose read the live stream orders against every later mount transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootMeta {
   /// The canonicalized root — the byte-exact prefix event paths arrive under.
   pub(crate) root: PathBuf,
   /// The device the root lives on.
   pub(crate) root_dev: u64,
-  /// The mount points already living strictly under the root at spawn.
+  /// The trust-reducing mount seed: mount points observed strictly under the
+  /// root before the stream started (empty when the table could not be read —
+  /// either way, event-side trust stays closed until the post-live refresh).
   pub(crate) mounts: Vec<PathBuf>,
-  /// Whether `mounts` came from an authoritative read of the live mount
-  /// table. `false` means the table could not be read: device boundaries are
-  /// then UNKNOWN, and event-side identity/cookie trust is refused rather
-  /// than presumed (probe-carried device evidence still decides).
-  pub(crate) mounts_authoritative: bool,
 }
 
 /// Everything a platform source needs to start watching.

@@ -51,6 +51,10 @@ struct FakeState {
   refresh_answer: Mutex<Option<(Vec<PathBuf>, bool)>>,
   /// Mount prefixes the next spawn seeds its `RootMeta` with.
   spawn_mounts: Mutex<Vec<PathBuf>>,
+  /// Requested-root → final-root remaps, mirroring the backend's own
+  /// re-canonicalization (a symlink retargeted between reservation and
+  /// spawn): the spawned `RootMeta` carries the FINAL root.
+  spawn_remaps: Mutex<HashMap<PathBuf, PathBuf>>,
   /// The spawn contract's observable order: `meta_sealed` must strictly
   /// precede `stream_live`, mirroring the real backend's pre-start barrier —
   /// a fake that seeded metadata after its stream went live would let the
@@ -184,6 +188,15 @@ impl FakeFs {
     self.state.spawn_order.lock().unwrap().clone()
   }
 
+  /// Remaps a requested root to a different final root at spawn, mirroring
+  /// the backend's re-canonicalization.
+  pub(crate) fn remap_spawn_root(&self, requested: impl AsRef<Path>, actual: impl AsRef<Path>) {
+    self.state.spawn_remaps.lock().unwrap().insert(
+      requested.as_ref().to_path_buf(),
+      actual.as_ref().to_path_buf(),
+    );
+  }
+
   /// Holds every subsequent spawn on the blocking pool until the returned
   /// gate is released.
   pub(crate) fn hold_spawns(&self) -> SpawnRelease {
@@ -243,22 +256,33 @@ impl FsOps for FakeFs {
         parked = cvar.wait(parked).unwrap();
       }
     }
-    let root = config.roots.first().cloned().ok_or(SourceError::NoRoots)?;
+    let requested = config.roots.first().cloned().ok_or(SourceError::NoRoots)?;
     // A root vanished before start is a clean spawn failure — the pre-start
     // half of the lifecycle contract (post-start deaths travel in-band).
-    if !self.state.nodes.lock().unwrap().contains_key(&root) {
+    if !self.state.nodes.lock().unwrap().contains_key(&requested) {
       return Err(SourceError::RootUnavailable {
-        root,
+        root: requested,
         source: std::io::Error::from(std::io::ErrorKind::NotFound),
       });
     }
+    // The backend re-canonicalizes at spawn; a configured remap mirrors a
+    // root retargeted between the watcher's reservation and this point.
+    let root = self
+      .state
+      .spawn_remaps
+      .lock()
+      .unwrap()
+      .get(&requested)
+      .cloned()
+      .unwrap_or(requested);
     // The pre-start barrier, mirrored from the real backend: the metadata is
-    // sealed strictly before the source becomes injectable (`stream_live`).
+    // sealed strictly before the source becomes injectable (`stream_live`),
+    // and the mount seed claims no authority (the driver's birth refresh
+    // installs it).
     let meta = RootMeta {
       root: root.clone(),
       root_dev: self.root_dev,
       mounts: self.state.spawn_mounts.lock().unwrap().clone(),
-      mounts_authoritative: true,
     };
     self.state.spawn_order.lock().unwrap().push("meta_sealed");
     let (sender, receiver) = async_channel::unbounded();
@@ -313,6 +337,10 @@ impl ScopeRegistry for NullRegistry {
   fn scope_live(&self, _scope: ScopeId, _root: &Path) {}
 
   fn scope_dead(&self, _scope: ScopeId) {}
+
+  fn final_root_conflict(&self, _final_root: &Path, _reserved: Option<&Path>) -> Option<PathBuf> {
+    None
+  }
 }
 
 /// The recorded transitions: scopes gone live (with their roots) and dead.
@@ -346,5 +374,9 @@ impl ScopeRegistry for RecordingRegistry {
 
   fn scope_dead(&self, scope: ScopeId) {
     self.state.lock().unwrap().1.push(scope);
+  }
+
+  fn final_root_conflict(&self, _final_root: &Path, _reserved: Option<&Path>) -> Option<PathBuf> {
+    None
   }
 }

@@ -20,6 +20,7 @@ use tributary_proto::{Change, Instant, Interest, ScopeId};
 
 use crate::{
   core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome},
+  error::WatchRootError,
   os::{EventReceiver, RootMeta, Source, SourceConfig, SourceError, SourceHandle, SourceMessage},
 };
 
@@ -54,7 +55,15 @@ impl DriverConfig {
 
 /// The reply channel of one `Command::Watch`, carrying a [`WatchGrant`] on
 /// success.
-pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant, SourceError>>;
+pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant, WatchRootError>>;
+
+/// One watch awaiting its spawn result: the reply channel plus the root the
+/// watcher reserved, so the final-root revalidation can exclude this watch's
+/// own reservation from the conflict check.
+struct PendingWatch {
+  requested: PathBuf,
+  reply: WatchReply,
+}
 
 /// The successful payload of a watch reply: ownership of the just-spawned
 /// stream, armed to unwind.
@@ -170,6 +179,14 @@ pub(crate) trait ScopeRegistry: Send + Sync + 'static {
   /// `scope` ended (unwatch, root death, stream fatal, close); its entry is
   /// reclaimed.
   fn scope_dead(&self, scope: ScopeId);
+
+  /// The live or reserved root that overlaps `final_root`, ignoring the one
+  /// reservation at `reserved` (the checking watch's own). The backend
+  /// re-canonicalizes during spawn, so disjointness must hold for the FINAL
+  /// root — the reservation only ever vouched for the form the watcher knew —
+  /// and the driver, as the registry's single writer, checks it immediately
+  /// before the scope goes live.
+  fn final_root_conflict(&self, final_root: &Path, reserved: Option<&Path>) -> Option<PathBuf>;
 }
 
 /// The blocking-pool side of the platform: spawn, teardown, and stat. A
@@ -321,7 +338,7 @@ pub(crate) async fn run<R, F>(
   // an unconfirmed teardown is a stream still winding down.
   let mut pending_spawns: BTreeSet<ScopeId> = BTreeSet::new();
   let mut pending_teardowns: BTreeSet<ScopeId> = BTreeSet::new();
-  let mut watch_replies: BTreeMap<ScopeId, WatchReply> = BTreeMap::new();
+  let mut watch_replies: BTreeMap<ScopeId, PendingWatch> = BTreeMap::new();
   let mut unwatch_replies: BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>> =
     BTreeMap::new();
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
@@ -361,8 +378,9 @@ pub(crate) async fn run<R, F>(
     futures_util::select_biased! {
       cmd = commands.recv().fuse() => match cmd {
         Ok(Command::Watch { root, interest, reply }) => {
+          let requested = root.clone();
           let scope = core.on_watch(root, interest);
-          watch_replies.insert(scope, reply);
+          watch_replies.insert(scope, PendingWatch { requested, reply });
         }
         Ok(Command::Unwatch { scope, reply }) => {
           if handles.contains_key(&scope) || watch_replies.contains_key(&scope) {
@@ -383,52 +401,82 @@ pub(crate) async fn run<R, F>(
             match result {
             Ok(spawned) => {
               let canonical_root = spawned.meta.root.clone();
-              core.on_stream_spawned(scope, Ok(spawned.meta));
-              handles.insert(scope, spawned.handle);
-              os.push(
-                spawned
-                  .receiver
-                  .map(move |msg| (scope, Some(msg)))
-                  .chain(futures_util::stream::once(async move { (scope, None) }))
-                  .boxed(),
-              );
-              // The registry learns the scope is live BEFORE the grant can
-              // reach the watcher: both registry transitions then execute on
-              // this task in program order, so a death signal processed
-              // later can never be overtaken by this insert — the
-              // insert-after-remove race has no actors left to run it. A
-              // scope dying before the caller polls its grant simply yields
-              // a dead-on-arrival handle.
-              registry.scope_live(scope, &canonical_root);
-              let owned = match watch_replies.remove(&scope) {
-                Some(reply) => {
-                  let grant = WatchGrant::new(scope, canonical_root, unwind_tx.clone());
-                  match reply.send(Ok(grant)) {
-                    Ok(()) => true,
-                    Err(payload) => {
-                      // The receiver is already gone; unwind synchronously
-                      // rather than through the grant's Drop.
-                      if let Ok(grant) = payload {
-                        grant.defuse();
+              let pending = watch_replies.remove(&scope);
+              // FINAL-ROOT REVALIDATION: the backend re-canonicalizes during
+              // spawn, so the root the stream actually watches can differ
+              // from the path the watcher reserved (a symlink retargeted, a
+              // directory replaced mid-flight). The reservation vouched only
+              // for the form it held; this check — on the registry's single
+              // writer, immediately before the scope would go live — is the
+              // authority on the final root's disjointness.
+              if let Some(existing) = registry.final_root_conflict(
+                &canonical_root,
+                pending.as_ref().map(|p| p.requested.as_path()),
+              ) {
+                // Never goes live: tear the fresh stream down inside the
+                // pending accounting and end the scope like a failed spawn.
+                pending_teardowns.insert(scope);
+                let tx = op_tx.clone();
+                let handle = spawned.handle;
+                R::spawn_blocking_detach(move || {
+                  handle.shutdown();
+                  let _ = tx.try_send(OpResult::TornDown { scope });
+                });
+                core.on_spawn_rejected(scope);
+                if let Some(pending) = pending {
+                  let _ = pending.reply.send(Err(WatchRootError::Overlaps {
+                    path: canonical_root,
+                    existing,
+                  }));
+                }
+              } else {
+                core.on_stream_spawned(scope, Ok(spawned.meta));
+                handles.insert(scope, spawned.handle);
+                os.push(
+                  spawned
+                    .receiver
+                    .map(move |msg| (scope, Some(msg)))
+                    .chain(futures_util::stream::once(async move { (scope, None) }))
+                    .boxed(),
+                );
+                // The registry learns the scope is live BEFORE the grant can
+                // reach the watcher: both registry transitions then execute on
+                // this task in program order, so a death signal processed
+                // later can never be overtaken by this insert — the
+                // insert-after-remove race has no actors left to run it. A
+                // scope dying before the caller polls its grant simply yields
+                // a dead-on-arrival handle.
+                registry.scope_live(scope, &canonical_root);
+                let owned = match pending {
+                  Some(pending) => {
+                    let grant = WatchGrant::new(scope, canonical_root, unwind_tx.clone());
+                    match pending.reply.send(Ok(grant)) {
+                      Ok(()) => true,
+                      Err(payload) => {
+                        // The receiver is already gone; unwind synchronously
+                        // rather than through the grant's Drop.
+                        if let Ok(grant) = payload {
+                          grant.defuse();
+                        }
+                        false
                       }
-                      false
                     }
                   }
+                  None => false,
+                };
+                if !owned {
+                  // The watch() future was cancelled before the reply could
+                  // hand ownership over: tear the just-spawned stream down as
+                  // an immediate unwatch. (Cancellation AFTER a successful
+                  // send is the grant's unwind.)
+                  core.on_unwatch(scope);
                 }
-                None => false,
-              };
-              if !owned {
-                // The watch() future was cancelled before the reply could
-                // hand ownership over: tear the just-spawned stream down as
-                // an immediate unwatch. (Cancellation AFTER a successful
-                // send is the grant's unwind.)
-                core.on_unwatch(scope);
               }
             }
             Err(err) => {
               core.on_stream_spawned(scope, Err(clone_error(&err)));
-              if let Some(reply) = watch_replies.remove(&scope) {
-                let _ = reply.send(Err(err));
+              if let Some(pending) = watch_replies.remove(&scope) {
+                let _ = pending.reply.send(Err(WatchRootError::Source(err)));
               }
             }
           }},

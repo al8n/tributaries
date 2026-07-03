@@ -278,6 +278,98 @@ mod lifecycle {
     }
   }
 
+  /// The backend re-canonicalizes at spawn: a root retargeted onto an
+  /// already-watched tree between the reservation and the spawn must be
+  /// rejected by the driver's final-root check — the fresh stream torn down,
+  /// the existing watch untouched.
+  #[tokio::test(start_paused = true)]
+  async fn retargeted_root_overlapping_an_existing_watch_is_rejected() {
+    let (dir_a, canon_a) = scratch("retarget-victim");
+    let (dir_b, canon_b) = scratch("retarget-mover");
+    let fs = FakeFs::new(1);
+    fs.put(&canon_a, FileKind::Dir, 1);
+    fs.put(&canon_b, FileKind::Dir, 2);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let victim = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+    let spawned_before = fs.spawns();
+
+    // Between B's reservation and its spawn, the path retargets INTO A's
+    // watched tree (the fake mirrors the backend's re-canonicalization).
+    fs.remap_spawn_root(&canon_b, canon_a.join("sub"));
+    let err = watcher
+      .watch(&dir_b, Interest::all())
+      .await
+      .expect_err("the final root overlaps");
+    match err {
+      WatchRootError::Overlaps { path, existing } => {
+        assert_eq!(path, canon_a.join("sub"), "the FINAL root is reported");
+        assert_eq!(existing, canon_a);
+      }
+      other => panic!("expected Overlaps, got {other:?}"),
+    }
+    // The rejected stream never went live and was torn down inside the
+    // driver's accounting; the victim is untouched.
+    settle(|| fs.shutdowns() == fs.spawns() - 1).await;
+    assert_eq!(fs.spawns(), spawned_before + 1);
+    assert_eq!(fs.shutdowns(), fs.spawns() - 1, "only the victim survives");
+    assert_eq!(watcher.registry_len(), 1);
+    assert_eq!(
+      watcher.root_path(victim).as_deref(),
+      Some(canon_a.as_path())
+    );
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+  }
+
+  /// A retargeted-but-disjoint final root goes live under the FINAL path:
+  /// the registry, the handle, and event assembly all carry what is actually
+  /// watched.
+  #[tokio::test(start_paused = true)]
+  async fn retargeted_root_disjoint_goes_live_under_the_final_root() {
+    let (dir, canonical) = scratch("retarget-disjoint");
+    let fs = FakeFs::new(1);
+    fs.put(&canonical, FileKind::Dir, 1);
+    let final_root = PathBuf::from("/retargeted-final");
+    fs.put(&final_root, FileKind::Dir, 2);
+    fs.remap_spawn_root(&canonical, &final_root);
+    let mut watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let handle = watcher.watch(&dir, Interest::all()).await.expect("watch");
+    assert_eq!(
+      watcher.root_path(handle).as_deref(),
+      Some(final_root.as_path()),
+      "the registry holds the final root"
+    );
+
+    let file = final_root.join("a.txt");
+    fs.put(&file, FileKind::File, 9);
+    fs.send_batch(
+      &final_root,
+      vec![crate::os::RawOsEvent {
+        path: file.clone(),
+        flags: crate::os::FsEventFlags::new(
+          crate::os::FsEventFlags::ITEM_CREATED.bits()
+            | crate::os::FsEventFlags::ITEM_IS_FILE.bits(),
+        ),
+        event_id: 1,
+        file_id: std::num::NonZeroU64::new(9),
+      }],
+    );
+    let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+      .await
+      .expect("an event arrives")
+      .expect("the stream is open");
+    assert_eq!(event.path(), file.as_path(), "assembly uses the final root");
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   /// The hermetic twin of the real-FS registry-cycles test: entries exist
   /// exactly while their root is live, on every platform.
   #[tokio::test(start_paused = true)]
