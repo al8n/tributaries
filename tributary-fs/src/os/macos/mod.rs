@@ -139,6 +139,20 @@ impl Source {
       });
     }
     let root_dev = root_meta.dev() as libc::dev_t;
+    let identity = super::RootIdentity::new(root_meta.dev(), root_meta.ino());
+    // The ancestor identities feed root-disjointness containment: byte
+    // comparison cannot see that two spellings reach one object on a
+    // case-insensitive volume, but `(dev, ino)` can. Read inside the same
+    // pre-start barrier; canonicalize already traversed every component, so a
+    // failing ancestor stat is the same class as a failing root stat.
+    let mut ancestors = Vec::new();
+    for ancestor in roots[0].ancestors().skip(1) {
+      let meta = fs::metadata(ancestor).map_err(|source| SourceError::RootUnavailable {
+        root: ancestor.to_path_buf(),
+        source,
+      })?;
+      ancestors.push(super::RootIdentity::new(meta.dev(), meta.ino()));
+    }
     // The mount seed and device UUID are part of the pre-start barrier: taken
     // here they cannot postdate any event. The seed is trust-reducing only —
     // a mount in the read→start gap would be in neither the seed nor the
@@ -180,6 +194,8 @@ impl Source {
       root: roots[0].clone(),
       root_dev: root_dev as u64,
       mounts,
+      identity,
+      ancestors,
     };
     Ok((
       SourceHandle {

@@ -21,7 +21,10 @@ use tributary_proto::{Change, Instant, Interest, ScopeId};
 use crate::{
   core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome},
   error::WatchRootError,
-  os::{EventReceiver, RootMeta, Source, SourceConfig, SourceError, SourceHandle, SourceMessage},
+  os::{
+    EventReceiver, RootIdentity, RootMeta, Source, SourceConfig, SourceError, SourceHandle,
+    SourceMessage,
+  },
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -174,8 +177,16 @@ pub(crate) struct SpawnedSource<H> {
 /// insert-after-remove interleaving between the two transitions cannot exist.
 /// The watcher only reads.
 pub(crate) trait ScopeRegistry: Send + Sync + 'static {
-  /// `scope`'s stream is live; its event paths arrive under `root`.
-  fn scope_live(&self, scope: ScopeId, root: &Path);
+  /// `scope`'s stream is live; its event paths arrive under `root`, whose
+  /// object identity and ancestor identities the registry retains for the
+  /// disjointness checks of later watches.
+  fn scope_live(
+    &self,
+    scope: ScopeId,
+    root: &Path,
+    identity: RootIdentity,
+    ancestors: &[RootIdentity],
+  );
 
   /// `scope` ended (unwatch, root death, stream fatal, close); its entry is
   /// reclaimed.
@@ -187,7 +198,20 @@ pub(crate) trait ScopeRegistry: Send + Sync + 'static {
   /// root — the reservation only ever vouched for the form the watcher knew —
   /// and the driver, as the registry's single writer, checks it immediately
   /// before the scope goes live.
-  fn final_root_conflict(&self, final_root: &Path, reserved: Option<&Path>) -> Option<PathBuf>;
+  ///
+  /// Overlap is decided by byte containment AND by object identity — equality
+  /// with a live root, the new root's ancestor chain containing a live root
+  /// (new-inside-existing), or a live root's ancestor chain containing the new
+  /// identity (existing-inside-new) — so spelling aliases on case- or
+  /// normalization-insensitive volumes cannot admit two watches over one
+  /// subtree.
+  fn final_root_conflict(
+    &self,
+    final_root: &Path,
+    identity: RootIdentity,
+    ancestors: &[RootIdentity],
+    reserved: Option<&Path>,
+  ) -> Option<PathBuf>;
 }
 
 /// The blocking-pool side of the platform: spawn, teardown, and stat. A
@@ -402,6 +426,8 @@ pub(crate) async fn run<R, F>(
             match result {
             Ok(spawned) => {
               let canonical_root = spawned.meta.root.clone();
+              let identity = spawned.meta.identity;
+              let ancestors = spawned.meta.ancestors.clone();
               let pending = watch_replies.remove(&scope);
               // FINAL-ROOT REVALIDATION: the backend re-canonicalizes during
               // spawn, so the root the stream actually watches can differ
@@ -409,9 +435,12 @@ pub(crate) async fn run<R, F>(
               // directory replaced mid-flight). The reservation vouched only
               // for the form it held; this check — on the registry's single
               // writer, immediately before the scope would go live — is the
-              // authority on the final root's disjointness.
+              // authority on the final root's disjointness, and it compares
+              // object identities so a spelling alias cannot slip past it.
               if let Some(existing) = registry.final_root_conflict(
                 &canonical_root,
+                identity,
+                &ancestors,
                 pending.as_ref().map(|p| p.requested.as_path()),
               ) {
                 // Never goes live: tear the fresh stream down inside the
@@ -447,7 +476,7 @@ pub(crate) async fn run<R, F>(
                 // insert-after-remove race has no actors left to run it. A
                 // scope dying before the caller polls its grant simply yields
                 // a dead-on-arrival handle.
-                registry.scope_live(scope, &canonical_root);
+                registry.scope_live(scope, &canonical_root, identity, &ancestors);
                 let owned = match pending {
                   Some(pending) => {
                     let grant = WatchGrant::new(scope, canonical_root, unwind_tx.clone());

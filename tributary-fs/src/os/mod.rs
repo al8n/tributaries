@@ -35,6 +35,27 @@ pub(crate) use fsevent::{BatchPayload, FsEventFlags, OverflowAck, RawOsEvent};
 /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
 pub(crate) const MAX_EXCLUSIONS: usize = 8;
 
+/// A filesystem object's identity: its `(device, inode)` pair.
+///
+/// Two paths name the same object iff their identities are equal — a
+/// comparison no byte form can stand in for on volumes where several
+/// spellings (case aliases, Unicode-normalization aliases) reach one object.
+/// On a case-SENSITIVE volume two spellings are genuinely different objects
+/// with different inodes, so identity comparison is volume-correct by
+/// construction, with no case-fold tables and no volume-capability lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct RootIdentity {
+  dev: u64,
+  ino: u64,
+}
+
+impl RootIdentity {
+  /// Wraps a stat-read `(device, inode)` pair.
+  pub(crate) const fn new(dev: u64, ino: u64) -> Self {
+    Self { dev, ino }
+  }
+}
+
 /// What a source's spawn learned about its root — finalized strictly BEFORE
 /// the stream can enqueue its first event, so nothing here can postdate a
 /// message the source delivers, and no fallible metadata path exists after
@@ -56,6 +77,13 @@ pub(crate) struct RootMeta {
   /// root before the stream started (empty when the table could not be read —
   /// either way, event-side trust stays closed until the post-live refresh).
   pub(crate) mounts: Vec<PathBuf>,
+  /// The root object's identity — what root disjointness is decided on
+  /// (spelling-aliased paths share it; distinct objects never do).
+  pub(crate) identity: RootIdentity,
+  /// The identities of every strict ancestor of the canonical root, so
+  /// containment ("is this root inside that one, under ANY spelling") is
+  /// answerable by pure membership tests with no further syscalls.
+  pub(crate) ancestors: Vec<RootIdentity>,
 }
 
 /// Everything a platform source needs to start watching.
