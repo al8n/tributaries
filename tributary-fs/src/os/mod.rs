@@ -27,28 +27,60 @@ mod macos;
 #[cfg(all(target_os = "macos", not(miri)))]
 pub(crate) use macos::{Source, SourceHandle, mounts_under};
 
-#[cfg(any(not(target_os = "macos"), miri))]
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) use linux::{Source, SourceHandle, mounts_under};
+
+#[cfg(any(not(any(target_os = "macos", target_os = "linux")), miri))]
 mod unsupported;
-#[cfg(any(not(target_os = "macos"), miri))]
+#[cfg(any(not(any(target_os = "macos", target_os = "linux")), miri))]
 pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
 
 pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
 
-/// The platform's decoded event payload — the `E` every generic transport
-/// type is instantiated at below, so the driver and core name exactly ONE
-/// per-cfg event type. Each backend's decode produces this; Linux lands its
-/// own alongside its backend.
-pub(crate) type PlatformEvent = fsevent::RawOsEvent;
+/// Which watch primitive a spawned source is backed by. Carried on
+/// [`RootMeta`] so the core confirms the per-scope lowering profile the
+/// registration intended; the fanotify variant joins when that backend lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendKind {
+  /// macOS FSEvents — kernel-recursive; flag words are hints.
+  FsEvents,
+  /// Linux inotify — per-directory (descending); precise verbs.
+  Inotify,
+}
 
-/// One producer batch of [`PlatformEvent`]s plus its budget slot.
-pub(crate) type BatchPayload = transport::BatchPayload<PlatformEvent>;
+/// The ONE seam payload every source reports: each backend wraps its own
+/// decode into this at forward time, so the queue, the driver, and the core
+/// name a single event type on every platform — and the hermetic suites can
+/// inject either backend's events on any host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceEvent {
+  /// One decoded FSEvents record.
+  FsEvents(RawOsEvent),
+  /// One decoded, anchor-attributed Linux record.
+  Linux(linux::RawLinuxEvent),
+}
+
+impl From<RawOsEvent> for SourceEvent {
+  fn from(value: RawOsEvent) -> Self {
+    Self::FsEvents(value)
+  }
+}
+
+impl From<linux::RawLinuxEvent> for SourceEvent {
+  fn from(value: linux::RawLinuxEvent) -> Self {
+    Self::Linux(value)
+  }
+}
+
+/// One producer batch of [`SourceEvent`]s plus its budget slot.
+pub(crate) type BatchPayload = transport::BatchPayload<SourceEvent>;
 
 /// One message from the OS producer to the driver task, on the source's
 /// single ordered queue.
-pub(crate) type SourceMessage = transport::SourceMessage<PlatformEvent>;
+pub(crate) type SourceMessage = transport::SourceMessage<SourceEvent>;
 
 /// The driver's receiving end of a source's messages.
-pub(crate) type EventReceiver = transport::EventReceiver<PlatformEvent>;
+pub(crate) type EventReceiver = transport::EventReceiver<SourceEvent>;
 
 /// The most exclusion directories one native stream honors
 /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
@@ -106,6 +138,9 @@ pub(crate) struct RootMeta {
   /// containment ("is this root inside that one, under ANY spelling") is
   /// answerable by pure membership tests with no further syscalls.
   pub(crate) ancestors: Vec<RootIdentity>,
+  /// The primitive backing this source — the core confirms its per-scope
+  /// lowering profile against it.
+  pub(crate) backend: BackendKind,
 }
 
 /// Everything a platform source needs to start watching.
@@ -116,12 +151,17 @@ pub(crate) struct SourceConfig {
   // Only a real backend's spawn reads the roots and the resume point; the
   // stub rejects the whole config unread, so backend-less builds see the
   // fields as dead. Gating them would fracture the seam type.
-  #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
+  #[cfg_attr(
+    not(all(any(target_os = "macos", target_os = "linux"), not(miri))),
+    allow(dead_code)
+  )]
   pub(crate) roots: Vec<PathBuf>,
   /// Load-shedding exclusion directories (at most [`MAX_EXCLUSIONS`]);
   /// correctness never depends on them.
   pub(crate) exclusions: Vec<PathBuf>,
   /// Resume point from a previous stream generation; `None` = live-only.
+  // Only the FSEvents backend consumes resume points today (inotify has no
+  // journal to resume from), so every other build sees the field as dead.
   #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
   pub(crate) since: Option<ResumeToken>,
   /// The OS event-coalescing latency.

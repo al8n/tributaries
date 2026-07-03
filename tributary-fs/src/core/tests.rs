@@ -52,7 +52,7 @@ fn probes(effects: &[Effect]) -> Vec<(ProbeId, PathBuf)> {
 /// fed (an authoritative empty table): event-side trust is open.
 fn live_core() -> (DriverCore, ScopeId) {
   let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let effects = drain(&mut core);
   assert!(
     matches!(effects.as_slice(), [Effect::SpawnStream { root, .. }] if root == Path::new("/r")),
@@ -66,6 +66,7 @@ fn live_core() -> (DriverCore, ScopeId) {
       mounts: Vec::new(),
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
+      backend: BackendKind::FsEvents,
     }),
   );
   let effects = drain(&mut core);
@@ -83,7 +84,7 @@ fn live_core() -> (DriverCore, ScopeId) {
 /// boundaries stay unknown, so event-side identity/cookie trust is refused.
 fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
   let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(
     scope,
@@ -93,6 +94,7 @@ fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
       mounts: Vec::new(),
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
+      backend: BackendKind::FsEvents,
     }),
   );
   let _ = drain(&mut core);
@@ -776,6 +778,7 @@ fn newer_rescan_replaces_the_parked_one() {
 fn identity_minting_respects_devices_and_mounts() {
   let state = ScopeState {
     watch: WatchId::new(NonZeroU64::new(1).unwrap()),
+    profile: BackendKind::FsEvents,
     requested: PathBuf::from("/r"),
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
@@ -805,6 +808,7 @@ fn identity_minting_respects_devices_and_mounts() {
 fn blind_mount_table_refuses_event_side_trust() {
   let state = ScopeState {
     watch: WatchId::new(NonZeroU64::new(1).unwrap()),
+    profile: BackendKind::FsEvents,
     requested: PathBuf::from("/r"),
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
@@ -1332,7 +1336,7 @@ fn rename_coalesced_with_create_and_remove_grounds_by_existence() {
 #[test]
 fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
   let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   // The volume was ALREADY mounted at spawn: only the seeded table knows —
   // and the union keeps the seed even when the birth refresh (racing an
@@ -1345,6 +1349,7 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
       mounts: vec![PathBuf::from("/r/vol")],
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
+      backend: BackendKind::FsEvents,
     }),
   );
   let _ = drain(&mut core);
@@ -1371,7 +1376,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
   // landing in neither the seed nor the event stream — so a scope is born
   // trust-closed, and only the post-live birth refresh installs authority.
   let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(
     scope,
@@ -1381,6 +1386,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
       mounts: Vec::new(),
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
+      backend: BackendKind::FsEvents,
     }),
   );
   assert_eq!(
@@ -1453,7 +1459,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
 #[test]
 fn a_loss_racing_the_birth_refresh_rearms_it_once() {
   let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(
     scope,
@@ -1463,6 +1469,7 @@ fn a_loss_racing_the_birth_refresh_rearms_it_once() {
       mounts: Vec::new(),
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
+      backend: BackendKind::FsEvents,
     }),
   );
   assert_eq!(
@@ -1797,7 +1804,7 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
   // The volume was known at spawn; a rename coalesces into the SAME batch as
   // the volume's unmount, with a root-device object colliding on the fileID.
   let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(
     scope,
@@ -1807,6 +1814,7 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
       mounts: vec![PathBuf::from("/r/vol")],
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
+      backend: BackendKind::FsEvents,
     }),
   );
   let _ = drain(&mut core);
@@ -2207,7 +2215,7 @@ fn single_partner_grant_is_probe_order_independent() {
 #[test]
 fn spawn_failure_emits_nothing_public() {
   let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(scope, Err(SourceError::StartFailed));
   let effects = drain(&mut core);
@@ -2234,7 +2242,7 @@ fn spawn_failure_emits_nothing_public() {
 #[test]
 fn spawn_rejection_emits_nothing_public() {
   let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_spawn_rejected(scope);
   let effects = drain(&mut core);
@@ -2253,6 +2261,7 @@ mod lowering {
   fn state_with_root(root: &str) -> ScopeState {
     ScopeState {
       watch: WatchId::new(NonZeroU64::new(99).unwrap()),
+      profile: BackendKind::FsEvents,
       requested: PathBuf::from(root),
       root: Some(Arc::new(PathBuf::from(root))),
       root_dev: Some(1),
@@ -2327,7 +2336,7 @@ mod lowering {
   #[test]
   fn filesystem_root_scope_grounds_descendants_located() {
     let mut core = DriverCore::new(WINDOW);
-    let scope = core.on_watch(PathBuf::from("/"), Interest::all());
+    let scope = core.on_watch(PathBuf::from("/"), Interest::all(), BackendKind::FsEvents);
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -2337,6 +2346,7 @@ mod lowering {
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
       }),
     );
     let _ = drain(&mut core);
@@ -2406,7 +2416,7 @@ mod lowering {
 #[test]
 fn stuck_probe_backpressures_the_callback_through_the_park() {
   use crate::os::{
-    SourceMessage,
+    SourceEvent, SourceMessage,
     transport::{TransportState, forward_batch},
   };
 
@@ -2417,12 +2427,12 @@ fn stuck_probe_backpressures_the_callback_through_the_park() {
   // Batch 1: a rename half needs a probe — the batch parks, slot retained.
   forward_batch(
     &transport,
-    vec![ev(
+    vec![SourceEvent::FsEvents(ev(
       "/r/a",
       flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
       10,
       7,
-    )],
+    ))],
     false,
     |msg| {
       queue.push(msg);
@@ -2444,12 +2454,12 @@ fn stuck_probe_backpressures_the_callback_through_the_park() {
   // Batch 2 queues behind the park, still holding its slot.
   forward_batch(
     &transport,
-    vec![ev(
+    vec![SourceEvent::FsEvents(ev(
       "/r/b",
       flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
       11,
       8,
-    )],
+    ))],
     false,
     |msg| {
       queue.push(msg);
@@ -2471,12 +2481,12 @@ fn stuck_probe_backpressures_the_callback_through_the_park() {
   // the in-order Overflow.
   forward_batch(
     &transport,
-    vec![ev(
+    vec![SourceEvent::FsEvents(ev(
       "/r/c",
       flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
       12,
       9,
-    )],
+    ))],
     false,
     |msg| {
       queue.push(msg);
@@ -2543,4 +2553,363 @@ fn repeated_in_batch_loss_keeps_a_trailing_covering_rescan() {
     2,
     "each loss keeps its own covering rescan"
   );
+}
+
+mod descending {
+  //! The inotify (descending) profile: the Monitor descends per directory,
+  //! and the core executes its watch/enumerate vocabulary as effects.
+
+  use super::*;
+  use crate::{
+    core::{RawDirEntry, RawEnumerate},
+    os::linux::{RawInotifyEvent, RawLinuxEvent, inotify::decode::InotifyMask},
+  };
+  use tributary_proto::WatchError;
+
+  fn entry(name: &str, kind: FileKind, dev: u64, ino: u64) -> RawDirEntry {
+    RawDirEntry {
+      name: name.as_bytes().to_vec(),
+      kind,
+      dev,
+      ino,
+    }
+  }
+
+  fn listed(entries: Vec<RawDirEntry>) -> RawEnumerate {
+    RawEnumerate::Listed {
+      entries,
+      complete: true,
+    }
+  }
+
+  const IN_CREATE: u32 = 0x0000_0100;
+  const IN_DELETE: u32 = 0x0000_0200;
+  const IN_MOVED_FROM: u32 = 0x0000_0040;
+  const IN_MOVED_TO: u32 = 0x0000_0080;
+  const IN_ISDIR: u32 = 0x4000_0000;
+  const IN_IGNORED: u32 = 0x0000_8000;
+
+  fn inotify(anchors: &[WatchId], mask: u32, cookie: u32, name: Option<&[u8]>) -> RawLinuxEvent {
+    RawLinuxEvent::Inotify {
+      anchors: anchors.to_vec(),
+      event: RawInotifyEvent {
+        wd: 1,
+        mask: InotifyMask(mask),
+        cookie,
+        name: name.map(|n| n.to_vec()),
+      },
+    }
+  }
+
+  /// Registration under the descending profile spawns the stream, and the
+  /// spawn result cold-enumerates the root — the dormant vocabulary is live.
+  fn live_descending() -> (DriverCore, ScopeId, ReqId, WatchId) {
+    let mut core = DriverCore::new(WINDOW);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let effects = drain(&mut core);
+    assert!(
+      matches!(effects.as_slice(), [Effect::SpawnStream { root, .. }] if root == Path::new("/r")),
+      "registration spawns the stream: {effects:?}"
+    );
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let effects = drain(&mut core);
+    let (req, watch) = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, watch, path } if path.as_path() == Path::new("/r") => {
+          Some((*req, *watch))
+        }
+        _ => None,
+      })
+      .expect("a descending root cold-enumerates after arming");
+    core.on_mounts_refreshed(scope, Vec::new(), true);
+    let _ = drain(&mut core);
+    (core, scope, req, watch)
+  }
+
+  #[test]
+  fn descending_registration_cold_enumerates_the_root() {
+    let (_core, _scope, _req, _watch) = live_descending();
+  }
+
+  #[test]
+  fn cold_listing_installs_children_and_emits_inventory() {
+    let (mut core, _scope, req, _root) = live_descending();
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry("a.txt", FileKind::File, 1, 10),
+        entry("sub", FileKind::Dir, 1, 11),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let created: Vec<&Change> = emits(&effects);
+    assert_eq!(created.len(), 2, "cold inventory delivers: {effects:?}");
+    let add = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the discovered directory is armed");
+    // The arm's success continues the descent: the child cold-enumerates.
+    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    let effects = drain(&mut core);
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/sub")
+      )),
+      "the armed child cold-enumerates: {effects:?}"
+    );
+  }
+
+  #[test]
+  fn aliased_outcome_is_coverage() {
+    let (mut core, _scope, req, _root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, .. } => Some(*watch),
+        _ => None,
+      })
+      .expect("arm queued");
+    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Aliased(7));
+    let effects = drain(&mut core);
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::Enumerate { .. })),
+      "an aliased anchor is covered coverage — the descent continues: {effects:?}"
+    );
+  }
+
+  #[test]
+  fn watch_failure_drops_and_rescans() {
+    let (mut core, _scope, req, _root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, .. } => Some(*watch),
+        _ => None,
+      })
+      .expect("arm queued");
+    core.on_watch_installed(
+      add,
+      crate::os::linux::WatchOutcome::Failed(WatchError::NoSpace),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "a refused arm is never a silent blind spot: {effects:?}"
+    );
+  }
+
+  #[test]
+  fn partial_listing_rescans_and_retries() {
+    let (mut core, _scope, req, root) = live_descending();
+    core.on_enumerated(
+      req,
+      RawEnumerate::Listed {
+        entries: vec![entry("a.txt", FileKind::File, 1, 10)],
+        complete: false,
+      },
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "an incomplete listing rescans: {effects:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { watch, .. } if *watch == root
+      )),
+      "and retries the read: {effects:?}"
+    );
+  }
+
+  #[test]
+  fn foreign_device_directory_is_not_descended() {
+    let (mut core, _scope, req, _root) = live_descending();
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry("vol", FileKind::Dir, 2, 20),
+        entry("here", FileKind::Dir, 1, 21),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let armed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::AddWatch { path, .. } => Some(path.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      armed,
+      vec![Path::new("/r/here")],
+      "the mount boundary is the scope boundary — a foreign-device directory \
+       is delivered but never descended: {effects:?}"
+    );
+  }
+
+  #[test]
+  fn inotify_events_lower_depth_one_with_native_cookies() {
+    let (mut core, scope, req, root) = live_descending();
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(&[root], IN_CREATE | IN_ISDIR, 0, Some(b"d")),
+        inotify(&[root], IN_MOVED_FROM, 7, Some(b"old")),
+        inotify(&[root], IN_MOVED_TO, 7, Some(b"new")),
+        inotify(&[root], IN_DELETE, 0, Some(b"gone")),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|c| c.kind().is_created() && c.location() == &loc(&["d"])),
+      "created lowers depth-one: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|c| c.kind().moved_from() == Some(&loc(&["old"])) && c.location() == &loc(&["new"])),
+      "native cookies pair in the Monitor window: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|c| c.kind().is_removed() && c.location() == &loc(&["gone"])),
+      "removed lowers: {changes:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/d")
+      )),
+      "a created directory descends: {effects:?}"
+    );
+  }
+
+  #[test]
+  fn anchor_fanout_duplicates_records_per_alias() {
+    let (mut core, scope, req, root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, .. } => Some(*watch),
+        _ => None,
+      })
+      .expect("arm queued");
+    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    let _ = drain(&mut core);
+    // One kernel record attributed to BOTH anchors: each gets its own copy.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root, add], IN_CREATE, 0, Some(b"x"))],
+      at(2),
+    );
+    let changes: Vec<Location> = emits(&drain(&mut core))
+      .iter()
+      .map(|c| c.location().clone())
+      .collect();
+    assert!(
+      changes.contains(&loc(&["x"])),
+      "root anchor copy: {changes:?}"
+    );
+    assert!(
+      changes.contains(&loc(&["sub", "x"])),
+      "aliased anchor copy: {changes:?}"
+    );
+  }
+
+  #[test]
+  fn non_utf8_name_escalates_a_located_rescan() {
+    let (mut core, scope, req, root) = live_descending();
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root], IN_CREATE, 0, Some(&[0xFF, 0xFE]))],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes.iter().any(|c| c.kind().is_rescan()),
+      "an unrepresentable name re-reads its directory — never silent: {changes:?}"
+    );
+  }
+
+  #[test]
+  fn ignored_resolves_the_anchor() {
+    let (mut core, scope, req, _root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, .. } => Some(*watch),
+        _ => None,
+      })
+      .expect("arm queued");
+    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    let _ = drain(&mut core);
+    core.on_inotify_events(scope, vec![inotify(&[add], IN_IGNORED, 0, None)], at(3));
+    let effects = drain(&mut core);
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::RemoveWatch { watch } if *watch == add)),
+      "the kernel teardown disarms the dropped child: {effects:?}"
+    );
+  }
+
+  #[test]
+  fn non_utf8_listing_entry_degrades_to_partial() {
+    let (mut core, _scope, req, root) = live_descending();
+    core.on_enumerated(
+      req,
+      listed(vec![RawDirEntry {
+        name: vec![0xFF, 0xFE],
+        kind: FileKind::File,
+        dev: 1,
+        ino: 30,
+      }]),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "an unrepresentable entry cannot be silently omitted: {effects:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { watch, .. } if *watch == root
+      )),
+      "the degraded listing retries: {effects:?}"
+    );
+  }
 }

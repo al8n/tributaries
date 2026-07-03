@@ -16,14 +16,16 @@ use std::{
 
 use agnostic_lite::{RuntimeLite, time::Instant as _};
 use futures_util::{FutureExt, StreamExt, stream::SelectAll};
-use tributary_proto::{Change, Instant, Interest, ScopeId};
+use tributary_proto::{
+  Change, Instant, Interest, IoClass, ReqId, ScopeId, Segment, WatchError, WatchId,
+};
 
 use crate::{
-  core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome},
+  core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate},
   error::WatchRootError,
   os::{
-    EventReceiver, RootIdentity, RootMeta, Source, SourceConfig, SourceError, SourceHandle,
-    SourceMessage,
+    BackendKind, EventReceiver, RootIdentity, RootMeta, Source, SourceConfig, SourceError,
+    SourceHandle, SourceMessage, linux::WatchOutcome,
   },
 };
 
@@ -44,6 +46,20 @@ pub(crate) struct DriverConfig {
   pub(crate) os_batch_capacity: NonZeroUsize,
   /// Load-shedding exclusion directories applied to every root.
   pub(crate) exclusions: Vec<PathBuf>,
+  /// The backend lowering profile every root registers with. Fixed per
+  /// platform until per-root selection lands with the fanotify backend.
+  pub(crate) profile: BackendKind,
+}
+
+impl DriverConfig {
+  /// The platform's native backend profile.
+  pub(crate) fn platform_profile() -> BackendKind {
+    if cfg!(target_os = "linux") {
+      BackendKind::Inotify
+    } else {
+      BackendKind::FsEvents
+    }
+  }
 }
 
 impl DriverConfig {
@@ -229,6 +245,19 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// Re-reads the live mount table strictly under `root` (blocking),
   /// returning the mount prefixes and whether the read was authoritative.
   fn refresh_mounts(&self, root: &Path) -> (Vec<PathBuf>, bool);
+
+  /// Installs a per-directory kernel watch for `watch` at `path` (blocking).
+  /// Reached only under a descending profile.
+  fn add_watch(&self, watch: WatchId, parent: WatchId, path: &Path, name: &Segment)
+  -> WatchOutcome;
+
+  /// Removes a per-directory kernel watch (blocking, fire-and-forget).
+  fn remove_watch(&self, watch: WatchId);
+
+  /// Reads one directory — entries with their stat facts (blocking). Reached
+  /// only under a descending profile; `watch` addresses the directory object
+  /// for executors that resolve anchors rather than paths.
+  fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate;
 }
 
 /// The control surface of a live stream handle.
@@ -241,6 +270,50 @@ impl SourceControl for SourceHandle {
   fn shutdown(self) {
     SourceHandle::shutdown(self);
   }
+}
+
+/// Maps an enumerate open failure to the Monitor's `IoClass` vocabulary.
+fn io_class(err: &std::io::Error) -> IoClass {
+  match err.kind() {
+    std::io::ErrorKind::NotFound => IoClass::NotFound,
+    std::io::ErrorKind::PermissionDenied => IoClass::Permission,
+    _ => IoClass::Io,
+  }
+}
+
+/// The proto file kind of a stat file type (symlinks are never followed).
+fn kind_of(kind: &std::fs::FileType) -> tributary_proto::FileKind {
+  if kind.is_dir() {
+    tributary_proto::FileKind::Dir
+  } else if kind.is_symlink() {
+    tributary_proto::FileKind::Symlink
+  } else if kind.is_file() {
+    tributary_proto::FileKind::File
+  } else {
+    tributary_proto::FileKind::Other
+  }
+}
+
+#[cfg(unix)]
+fn dev_of(meta: &std::fs::Metadata) -> u64 {
+  use std::os::unix::fs::MetadataExt;
+  meta.dev()
+}
+
+#[cfg(not(unix))]
+fn dev_of(_meta: &std::fs::Metadata) -> u64 {
+  0
+}
+
+#[cfg(unix)]
+fn ino_of(meta: &std::fs::Metadata) -> u64 {
+  use std::os::unix::fs::MetadataExt;
+  meta.ino()
+}
+
+#[cfg(not(unix))]
+fn ino_of(_meta: &std::fs::Metadata) -> u64 {
+  0
 }
 
 /// The real platform: `Source::spawn` + `lstat`.
@@ -290,6 +363,51 @@ impl FsOps for RealFs {
       None => (Vec::new(), false),
     }
   }
+  // The descending executors are wired by the Linux integration stage: they
+  // route through the live source's control path (the reader owns the fd and
+  // the wd table). No released platform reaches them before then — the
+  // FSEvents profile is kernel-recursive and emits neither effect — so the
+  // honest interim is a typed refusal, never a silent success.
+  fn add_watch(
+    &self,
+    _watch: WatchId,
+    _parent: WatchId,
+    _path: &Path,
+    _name: &Segment,
+  ) -> WatchOutcome {
+    WatchOutcome::Failed(WatchError::Io)
+  }
+
+  fn remove_watch(&self, _watch: WatchId) {}
+
+  fn enumerate(&self, _watch: WatchId, path: &Path) -> RawEnumerate {
+    let dir = match std::fs::read_dir(path) {
+      Ok(dir) => dir,
+      Err(err) => return RawEnumerate::Failed(io_class(&err)),
+    };
+    let mut entries = Vec::new();
+    let mut complete = true;
+    for entry in dir {
+      let Ok(entry) = entry else {
+        // The read was cut short mid-directory; what was seen still
+        // reconciles, and the incomplete flag drives the Monitor's retry.
+        complete = false;
+        break;
+      };
+      let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+        // A raced-away entry: the listing no longer reflects one name.
+        complete = false;
+        continue;
+      };
+      entries.push(RawDirEntry {
+        name: entry.file_name().as_encoded_bytes().to_vec(),
+        kind: kind_of(&meta.file_type()),
+        dev: dev_of(&meta),
+        ino: ino_of(&meta),
+      });
+    }
+    RawEnumerate::Listed { entries, complete }
+  }
 }
 
 fn inode_of(meta: &std::fs::Metadata) -> (Option<std::num::NonZeroU64>, u64) {
@@ -322,6 +440,14 @@ enum OpResult<H> {
   },
   TornDown {
     scope: ScopeId,
+  },
+  WatchInstalled {
+    watch: WatchId,
+    outcome: WatchOutcome,
+  },
+  Enumerated {
+    req: ReqId,
+    raw: RawEnumerate,
   },
 }
 
@@ -404,7 +530,7 @@ pub(crate) async fn run<R, F>(
       cmd = commands.recv().fuse() => match cmd {
         Ok(Command::Watch { root, interest, reply }) => {
           let requested = root.clone();
-          let scope = core.on_watch(root, interest);
+          let scope = core.on_watch(root, interest, config.profile);
           watch_replies.insert(scope, PendingWatch { requested, reply });
         }
         Ok(Command::Unwatch { scope, reply }) => {
@@ -525,7 +651,13 @@ pub(crate) async fn run<R, F>(
             mounts,
             authoritative,
           } => core.on_mounts_refreshed(scope, mounts, authoritative),
-          OpResult::TornDown { scope } => {
+          OpResult::WatchInstalled { watch, outcome } => {
+          core.on_watch_installed(watch, outcome);
+        }
+        OpResult::Enumerated { req, raw } => {
+          core.on_enumerated(req, raw);
+        }
+        OpResult::TornDown { scope } => {
             pending_teardowns.remove(&scope);
             if let Some(reply) = unwatch_replies.remove(&scope) {
               let _ = reply.send(true);
@@ -604,6 +736,10 @@ pub(crate) async fn run<R, F>(
           }
         }
         Ok(OpResult::Probed { probe, outcome }) => core.on_probe_result(probe, outcome, now()),
+        Ok(OpResult::WatchInstalled { watch, outcome }) => {
+          core.on_watch_installed(watch, outcome);
+        }
+        Ok(OpResult::Enumerated { req, raw }) => core.on_enumerated(req, raw),
         Ok(OpResult::MountsRefreshed {
           scope,
           mounts,
@@ -709,6 +845,43 @@ fn execute_effects<R, F>(
           // No stream ever existed (a failed spawn); the unwatch is complete.
           let _ = reply.send(true);
         }
+      }
+      Effect::AddWatch {
+        watch,
+        parent,
+        name,
+        path,
+      } => {
+        // Droppable at close, unlike spawns and teardowns: a result that
+        // never lands leaves the Monitor node Arming, and the node dies with
+        // its scope. The kernel watch (if the arm did install one) is not
+        // leaked either — every wd on the source's fd is reclaimed when the
+        // scope's stream teardown closes that fd. No pending-set entry.
+        let ops = ops.clone();
+        let tx = op_tx.clone();
+        R::spawn_blocking_detach(move || {
+          let outcome = ops.add_watch(watch, parent, &path, &name);
+          let _ = tx.try_send(OpResult::WatchInstalled { watch, outcome });
+        });
+      }
+      Effect::RemoveWatch { watch } => {
+        // Fire-and-forget by contract; droppable at close for the same
+        // fd-reclamation reason as AddWatch.
+        let ops = ops.clone();
+        R::spawn_blocking_detach(move || {
+          ops.remove_watch(watch);
+        });
+      }
+      Effect::Enumerate { req, watch, path } => {
+        // Droppable at close: a listing that never lands leaves the Monitor
+        // node Enumerating; the scope teardown clears its pending request.
+        // No OS resource is held by a readdir.
+        let ops = ops.clone();
+        let tx = op_tx.clone();
+        R::spawn_blocking_detach(move || {
+          let raw = ops.enumerate(watch, &path);
+          let _ = tx.try_send(OpResult::Enumerated { req, raw });
+        });
       }
       Effect::Probe { probe, path } => {
         let ops = ops.clone();

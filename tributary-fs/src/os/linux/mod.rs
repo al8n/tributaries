@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 
 use tributary_proto::WatchId;
 
-use inotify::{decode::RawInotifyEvent, table::WdTable};
+pub(crate) use inotify::decode::RawInotifyEvent;
+use inotify::table::WdTable;
 
 /// The decoded Linux event payload — the platform's transport `E` once the
 /// seam flips. The fanotify arm joins when that backend lands.
@@ -189,11 +190,28 @@ pub(crate) fn mounts_under(root: &Path) -> Option<Vec<PathBuf>> {
   Some(parse_mountinfo(&content, root))
 }
 
+/// How an arm resolved. Ungated: the sans-I/O core consumes this on every
+/// host (an [`Aliased`](WatchOutcome::Aliased) anchor is covered coverage —
+/// the wd table fans events to it — so the core maps it to a successful
+/// watch-result exactly like a fresh install).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchOutcome {
+  /// A fresh kernel watch was installed.
+  Installed(i32),
+  /// The inode was already watched (`EEXIST` under `IN_MASK_CREATE`); the
+  /// anchor was registered onto the existing `wd`.
+  Aliased(i32),
+  /// The arm failed; the caller feeds this to the Monitor's watch-result.
+  // `Failed`, not the plan sketch's `Err`: a variant named `Err` reads as
+  // the `Result` constructor at every match site.
+  Failed(tributary_proto::WatchError),
+}
+
 // The descending core (and the container smoke suites) consume the Source;
 // until the seam flips the lib build sees the re-export as unused.
 #[cfg(all(target_os = "linux", not(miri)))]
 #[allow(unused_imports)]
-pub(crate) use source::{AnchorRequest, ArmReply, Source, SourceHandle, WatchOutcome};
+pub(crate) use source::{AnchorRequest, ArmReply, Source, SourceHandle};
 
 #[cfg(all(target_os = "linux", not(miri)))]
 mod source {
@@ -214,14 +232,11 @@ mod source {
 
   use super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
-    RawLinuxEvent, fs_type_is_remote, mounts_under,
+    WatchOutcome, fs_type_is_remote, mounts_under,
   };
   use crate::os::MAX_EXCLUSIONS;
 
   use super::inotify::reader::{self, Control, ReaderShared};
-
-  /// The driver's receiving end of an inotify source's messages.
-  pub(crate) type LinuxEventReceiver = transport::EventReceiver<RawLinuxEvent>;
 
   /// One arm request: install a kernel watch for `watch` on the directory
   /// named by `name` under `parent` (`None` = `name` is the absolute canonical
@@ -235,20 +250,6 @@ mod source {
     pub(crate) parent: Option<OwnedFd>,
     /// The child's name under `parent`, or the absolute root path.
     pub(crate) name: OsString,
-  }
-
-  /// How an arm resolved.
-  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-  pub(crate) enum WatchOutcome {
-    /// A fresh kernel watch was installed.
-    Installed(i32),
-    /// The inode was already watched (`EEXIST` under `IN_MASK_CREATE`); the
-    /// anchor was registered onto the existing `wd`.
-    Aliased(i32),
-    /// The arm failed; the caller feeds this to the Monitor's watch-result.
-    // `Failed`, not the plan sketch's `Err`: a variant named `Err` reads as
-    // the `Result` constructor at every match site.
-    Failed(WatchError),
   }
 
   /// An arm's reply: the outcome plus, on success, the target's transient
@@ -278,7 +279,7 @@ mod source {
     /// committed.
     pub(crate) fn spawn(
       config: SourceConfig,
-    ) -> Result<(SourceHandle, LinuxEventReceiver, RootMeta), SourceError> {
+    ) -> Result<(SourceHandle, super::super::EventReceiver, RootMeta), SourceError> {
       if config.roots.is_empty() {
         return Err(SourceError::NoRoots);
       }
@@ -375,6 +376,7 @@ mod source {
         mounts,
         identity,
         ancestors,
+        backend: super::super::BackendKind::Inotify,
       };
       Ok((handle, queue_rx, meta))
     }

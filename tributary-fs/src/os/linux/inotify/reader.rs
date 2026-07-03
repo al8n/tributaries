@@ -21,7 +21,7 @@ use tributary_proto::{WatchError, WatchId};
 use super::{
   super::{
     super::{SourceError, transport},
-    AnchorRequest, ArmReply, RawLinuxEvent, WatchOutcome, attribute_events,
+    AnchorRequest, ArmReply, WatchOutcome, attribute_events,
   },
   decode::{self, WATCH_MASK},
   table::{DrainDecision, WdTable},
@@ -30,7 +30,7 @@ use super::{
 /// What the reader shares with the handle side.
 pub(crate) struct ReaderShared {
   /// The source's single ordered queue.
-  pub(crate) queue: async_channel::Sender<transport::SourceMessage<RawLinuxEvent>>,
+  pub(crate) queue: async_channel::Sender<crate::os::SourceMessage>,
   /// The batch budget and signal dedups.
   pub(crate) transport: transport::TransportState,
 }
@@ -185,9 +185,14 @@ fn drain_events(fd: &OwnedFd, buf: &mut [u8], table: &mut WdTable, shared: &Read
     }
     let decoded = decode::decode_events(&buf[..n as usize]);
     let attributed = attribute_events(decoded.events, table);
+    let events = attributed
+      .events
+      .into_iter()
+      .map(crate::os::SourceEvent::Linux)
+      .collect();
     transport::forward_batch(
       &shared.transport,
-      attributed.events,
+      events,
       decoded.lossy || attributed.lost,
       |msg| shared.queue.try_send(msg).is_ok(),
     );

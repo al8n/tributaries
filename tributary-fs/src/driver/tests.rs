@@ -23,6 +23,7 @@ fn config() -> DriverConfig {
     move_window: Duration::from_millis(100),
     os_batch_capacity: NonZeroUsize::new(8).unwrap(),
     exclusions: Vec::new(),
+    profile: BackendKind::FsEvents,
   }
 }
 
@@ -1075,4 +1076,306 @@ async fn close_reports_a_wedged_teardown_instead_of_quiescence() {
     1,
     "the wedged call completes once released"
   );
+}
+
+mod descending {
+  //! The descending (inotify-profile) loop, end to end on the fake platform.
+
+  use super::*;
+  use crate::os::linux::{RawInotifyEvent, RawLinuxEvent, inotify::decode::InotifyMask};
+
+  fn inotify_config() -> DriverConfig {
+    DriverConfig {
+      profile: BackendKind::Inotify,
+      ..config()
+    }
+  }
+
+  fn inotify_rig() -> Rig {
+    let fs = FakeFs::new(1);
+    fs.put("/r", FileKind::Dir, 1);
+    fs.spawn_backend(BackendKind::Inotify);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      inotify_config(),
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      NullRegistry,
+    ));
+    Rig {
+      fs,
+      commands: cmd_tx,
+      events: ev_rx,
+    }
+  }
+
+  fn attributed(anchors: &[tributary_proto::WatchId], mask: u32, name: &[u8]) -> RawLinuxEvent {
+    RawLinuxEvent::Inotify {
+      anchors: anchors.to_vec(),
+      event: RawInotifyEvent {
+        wd: 1,
+        mask: InotifyMask(mask),
+        cookie: 0,
+        name: Some(name.to_vec()),
+      },
+    }
+  }
+
+  const IN_CREATE: u32 = 0x0000_0100;
+
+  /// Registration → root arm at spawn → cold enumerate against the fake tree
+  /// → discovered directory armed → its own enumerate → the inventory reaches
+  /// the consumer. The whole dormant vocabulary, driven by the real loop.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn descending_watch_inventories_and_descends() {
+    let rig = inotify_rig();
+    rig.fs.put("/r/a.txt", FileKind::File, 10);
+    rig.fs.put("/r/sub", FileKind::Dir, 11);
+    rig.fs.put("/r/sub/inner.txt", FileKind::File, 12);
+    let _scope = watch(&rig, "/r").await;
+
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..3 {
+      let (_scope, change) = next_event(&rig).await;
+      if change.kind().is_created() {
+        seen.insert(change.location().clone());
+      }
+    }
+    assert!(seen.contains(&loc(&["a.txt"])), "{seen:?}");
+    assert!(seen.contains(&loc(&["sub"])), "{seen:?}");
+    assert!(seen.contains(&loc(&["sub", "inner.txt"])), "{seen:?}");
+    settle(|| {
+      rig
+        .fs
+        .enumerates()
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r/sub"))
+    })
+    .await;
+    let arms = rig.fs.arms();
+    assert!(
+      arms
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r/sub")),
+      "the discovered directory was armed: {arms:?}"
+    );
+  }
+
+  /// A live inotify record injected through the real transport reaches the
+  /// consumer as a depth-one change on the right anchor.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn live_inotify_records_flow() {
+    let rig = inotify_rig();
+    let _scope = watch(&rig, "/r").await;
+    // The root's Monitor watch is the first minted id under this scope; the
+    // arm recording carries it.
+    settle(|| !rig.fs.enumerates().is_empty()).await;
+    let root_watch = rig
+      .fs
+      .enumerates()
+      .first()
+      .map(|(watch, _)| *watch)
+      .expect("the root enumerated");
+    rig.fs.put("/r/new.txt", FileKind::File, 20);
+    rig
+      .fs
+      .send_inotify_batch("/r", vec![attributed(&[root_watch], IN_CREATE, b"new.txt")]);
+    loop {
+      let (_scope, change) = next_event(&rig).await;
+      if change.kind().is_created() && change.location() == &loc(&["new.txt"]) {
+        break;
+      }
+    }
+  }
+
+  /// A kernel IN_IGNORED for a child anchor resolves it end to end: the
+  /// Monitor drops the node and the executor is told to disarm it.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn kernel_teardown_disarms_the_child() {
+    let rig = inotify_rig();
+    rig.fs.put("/r/sub", FileKind::Dir, 11);
+    let _scope = watch(&rig, "/r").await;
+    settle(|| {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r/sub"))
+    })
+    .await;
+    let child = rig
+      .fs
+      .arms()
+      .iter()
+      .find(|(_, p)| p == std::path::Path::new("/r/sub"))
+      .map(|(watch, _)| *watch)
+      .expect("child armed");
+    const IN_IGNORED: u32 = 0x0000_8000;
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![RawLinuxEvent::Inotify {
+        anchors: vec![child],
+        event: RawInotifyEvent {
+          wd: 2,
+          mask: InotifyMask(IN_IGNORED),
+          cookie: 0,
+          name: None,
+        },
+      }],
+    );
+    settle(|| rig.fs.disarms().contains(&child)).await;
+  }
+
+  /// Close with an enumerate parked on the blocking pool: the listing is
+  /// droppable (no OS resource — the Monitor node dies with its scope), so
+  /// close resolves quiescent without waiting for it.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_with_in_flight_enumerate_is_quiescent() {
+    let rig = inotify_rig();
+    let hold = rig.fs.hold_enumerates();
+    let _scope = watch(&rig, "/r").await;
+    settle(|| !rig.fs.enumerates().is_empty() || rig.fs.spawns() > 0).await;
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig.commands.send(Command::Close { reply }).await.unwrap();
+    let quiesced = on_reply.await.expect("close replies");
+    assert_eq!(quiesced, 0, "an in-flight enumerate never blocks close");
+    hold.release();
+  }
+
+  /// Close with an arm parked on the blocking pool: equally droppable — the
+  /// wd (if the arm did install one) is reclaimed when the scope's stream
+  /// teardown closes the source fd.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_with_in_flight_arm_is_quiescent() {
+    let rig = inotify_rig();
+    rig.fs.put("/r/sub", FileKind::Dir, 11);
+    let hold = rig.fs.hold_arms();
+    let _scope = watch(&rig, "/r").await;
+    // Wait until the cold listing queued the child arm (now parked).
+    settle(|| !rig.fs.enumerates().is_empty()).await;
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig.commands.send(Command::Close { reply }).await.unwrap();
+    let quiesced = on_reply.await.expect("close replies");
+    assert_eq!(quiesced, 0, "an in-flight arm never blocks close");
+    hold.release();
+  }
+
+  /// The tree-equality storm under the descending profile: the fake driver
+  /// services enumerates against the fake tree, arms fail sporadically, and
+  /// listings degrade — the consumer's reconstructed view still converges.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn descending_storm_converges() {
+    let seeds: u64 = std::env::var("TRIBUTARY_FS_STORM_SEEDS")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(8);
+    for seed in 1..=seeds {
+      descending_storm_seed(seed).await;
+    }
+  }
+
+  async fn descending_storm_seed(seed: u64) {
+    let rig = inotify_rig();
+    let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(7);
+    let mut next_ino = 100u64;
+    for i in 0..(1 + xorshift(&mut s) % 3) {
+      rig.fs.put(format!("/r/d{i}"), FileKind::Dir, 50 + i);
+    }
+    let _scope = watch(&rig, "/r").await;
+    let mut view: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut last_epoch: Option<Epoch> = None;
+    let mut live: Vec<PathBuf> = Vec::new();
+
+    for _ in 0..24 {
+      match xorshift(&mut s) % 6 {
+        0 | 1 => {
+          next_ino += 1;
+          let dir = if xorshift(&mut s).is_multiple_of(2) {
+            "/r"
+          } else {
+            "/r/d0"
+          };
+          let path = PathBuf::from(format!("{dir}/f{next_ino}"));
+          rig.fs.put(&path, FileKind::File, next_ino);
+          live.push(path);
+          // The mutation's report is a loss: the in-order signal must cover
+          // it (the descending re-arm enumerates the tree back into view).
+          rig.fs.send_lossy("/r");
+        }
+        2 if !live.is_empty() => {
+          let i = (xorshift(&mut s) as usize) % live.len();
+          let path = live.swap_remove(i);
+          rig.fs.remove(&path);
+          rig.fs.send_lossy("/r");
+        }
+        3 => {
+          // A degraded (Partial) listing races the next re-arm; the bounded
+          // retry re-reads the honest tree.
+          rig.fs.enumerate_answer(
+            "/r",
+            crate::core::RawEnumerate::Listed {
+              entries: Vec::new(),
+              complete: false,
+            },
+          );
+          rig.fs.send_lossy("/r");
+        }
+        4 => {
+          // A sporadic arm failure: the Monitor drops the subtree and
+          // rescans; the next re-arm (fresh default outcome) recovers it.
+          rig
+            .fs
+            .fail_watch_at("/r/d0", tributary_proto::WatchError::NoSpace);
+          rig.fs.send_lossy("/r");
+        }
+        _ => {
+          rig.fs.send_lossy("/r");
+        }
+      }
+      // Sometimes-lagging consumer.
+      if xorshift(&mut s).is_multiple_of(3) {
+        for _ in 0..(xorshift(&mut s) % 4) {
+          match tokio::time::timeout(Duration::from_millis(100), rig.events.recv()).await {
+            Ok(Ok((_, root, change))) => {
+              apply_descending(&rig, &mut view, &mut last_epoch, &root, &change);
+            }
+            _ => break,
+          }
+        }
+      }
+      tokio::task::yield_now().await;
+    }
+    // Heal the sporadic arm failure and settle.
+    rig.fs.alias_watch_at("/r/d0");
+    rig.fs.send_lossy("/r");
+    for _ in 0..25 {
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    while let Ok(Ok((_, root, change))) =
+      tokio::time::timeout(Duration::from_millis(200), rig.events.recv()).await
+    {
+      apply_descending(&rig, &mut view, &mut last_epoch, &root, &change);
+    }
+    let tree = rig.fs.files_under("/r");
+    assert_eq!(
+      view, tree,
+      "seed {seed}: the reconstructed view converges to the tree"
+    );
+  }
+
+  /// The KR storm's reconstruction, with one descending addition: a `Rescan`
+  /// re-reads the fake tree under its location (cold inventories then
+  /// re-deliver what the re-read missed — extra `Created`s are idempotent).
+  fn apply_descending(
+    rig: &Rig,
+    view: &mut BTreeSet<PathBuf>,
+    last_epoch: &mut Option<Epoch>,
+    root: &Path,
+    change: &Change,
+  ) {
+    apply(rig, view, last_epoch, root, change);
+  }
 }

@@ -40,7 +40,12 @@ fn recv_until(
   let mut overflow = false;
   while !done(&seen) && Instant::now() < end {
     match rx.try_recv() {
-      Ok(SourceMessage::Batch(payload)) => seen.extend(payload.events),
+      Ok(SourceMessage::Batch(payload)) => {
+        seen.extend(payload.events.into_iter().map(|ev| match ev {
+          crate::os::SourceEvent::FsEvents(ev) => ev,
+          other => panic!("a mac source only emits FSEvents records: {other:?}"),
+        }));
+      }
       Ok(SourceMessage::Overflow(_ack)) => overflow = true,
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
       Err(async_channel::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),

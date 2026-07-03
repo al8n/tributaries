@@ -311,6 +311,7 @@ impl<R: RuntimeLite> Watcher<R> {
       move_window: options.move_window(),
       os_batch_capacity: options.os_batch_capacity(),
       exclusions: options.exclusions_slice().to_vec(),
+      profile: DriverConfig::platform_profile(),
     };
     Self::spawn_with(options, config, RealFs)
   }
@@ -352,6 +353,7 @@ impl<R: RuntimeLite> Watcher<R> {
       move_window: options.move_window(),
       os_batch_capacity: options.os_batch_capacity(),
       exclusions: options.exclusions_slice().to_vec(),
+      profile: DriverConfig::platform_profile(),
     };
     Self::spawn_with(options, config, ops)
   }
