@@ -171,6 +171,10 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// `lstat`s one path (blocking).
   fn probe(&self, path: &Path) -> ProbeOutcome;
+
+  /// Re-reads the live mount table strictly under `root` (blocking),
+  /// returning the mount prefixes and whether the read was authoritative.
+  fn refresh_mounts(&self, root: &Path) -> (Vec<PathBuf>, bool);
 }
 
 /// A live scope's stream handle plus a drain tap on its data channel, kept so
@@ -267,6 +271,13 @@ impl FsOps for RealFs {
       Err(_) => ProbeOutcome::Failed,
     }
   }
+
+  fn refresh_mounts(&self, root: &Path) -> (Vec<PathBuf>, bool) {
+    match crate::os::mounts_under(root) {
+      Some(mounts) => (mounts, true),
+      None => (Vec::new(), false),
+    }
+  }
 }
 
 fn root_device(root: &Path) -> std::io::Result<u64> {
@@ -305,6 +316,11 @@ enum OpResult<H> {
   Probed {
     probe: ProbeId,
     outcome: ProbeOutcome,
+  },
+  MountsRefreshed {
+    scope: ScopeId,
+    mounts: Vec<PathBuf>,
+    authoritative: bool,
   },
   TornDown {
     scope: ScopeId,
@@ -461,6 +477,11 @@ pub(crate) async fn run<R, F>(
             }
           },
           OpResult::Probed { probe, outcome } => core.on_probe_result(probe, outcome, now()),
+          OpResult::MountsRefreshed {
+            scope,
+            mounts,
+            authoritative,
+          } => core.on_mounts_refreshed(scope, mounts, authoritative),
           OpResult::TornDown { scope } => {
             if let Some(reply) = unwatch_replies.remove(&scope) {
               let _ = reply.send(true);
@@ -543,6 +564,11 @@ pub(crate) async fn run<R, F>(
           }
         }
         Ok(OpResult::Probed { probe, outcome }) => core.on_probe_result(probe, outcome, now()),
+        Ok(OpResult::MountsRefreshed {
+          scope,
+          mounts,
+          authoritative,
+        }) => core.on_mounts_refreshed(scope, mounts, authoritative),
         Ok(OpResult::Spawned { .. }) => {}
         Err(_) => break,
       }
@@ -617,6 +643,18 @@ fn execute_effects<R, F>(
         R::spawn_blocking_detach(move || {
           let outcome = ops.probe(&path);
           let _ = tx.try_send(OpResult::Probed { probe, outcome });
+        });
+      }
+      Effect::RefreshMounts { scope, root } => {
+        let ops = ops.clone();
+        let tx = op_tx.clone();
+        R::spawn_blocking_detach(move || {
+          let (mounts, authoritative) = ops.refresh_mounts(&root);
+          let _ = tx.try_send(OpResult::MountsRefreshed {
+            scope,
+            mounts,
+            authoritative,
+          });
         });
       }
       Effect::Emit { scope, change } => match events.try_send((scope, change)) {

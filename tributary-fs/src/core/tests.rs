@@ -272,7 +272,7 @@ fn same_batch_rename_pair_grounds_by_probes_into_single_moved() {
 }
 
 #[test]
-fn singleton_rename_probes_move_out_then_times_out() {
+fn lone_vanished_rename_half_degrades_to_immediate_removal() {
   let (mut core, scope) = live_core();
   core.on_batch(
     scope,
@@ -287,25 +287,19 @@ fn singleton_rename_probes_move_out_then_times_out() {
   let reqs = probes(&drain(&mut core));
   assert_eq!(reqs.len(), 1);
   core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
-  assert!(
-    emits(&drain(&mut core)).is_empty(),
-    "an in-window source half stays pending"
-  );
-  let deadline = core
-    .poll_timeout()
-    .expect("the pairing window arms a timer");
-  assert!(at(2).reached(deadline) || !at(2).reached(deadline));
-
-  core.on_timeout(at(200));
+  // A vanished path has no contemporaneous device evidence and no same-batch
+  // partner evidenced its fileID, so no cookie is minted: the Monitor
+  // resolves the half immediately instead of holding a pairing window.
   let effects = drain(&mut core);
   let emitted = emits(&effects);
-  assert_eq!(emitted.len(), 1);
+  assert_eq!(emitted.len(), 1, "{effects:?}");
   assert!(emitted[0].kind().is_removed());
   assert_eq!(emitted[0].location(), &loc(&["a", "left"]));
+  assert_eq!(core.poll_timeout(), None, "no cookie, no window");
 }
 
 #[test]
-fn singleton_rename_halves_pair_across_batches() {
+fn cross_batch_vanished_source_degrades_to_remove_plus_create() {
   let (mut core, scope) = live_core();
   core.on_batch(
     scope,
@@ -314,7 +308,13 @@ fn singleton_rename_halves_pair_across_batches() {
   );
   let reqs = probes(&drain(&mut core));
   core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
-  assert!(emits(&drain(&mut core)).is_empty());
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(emitted.len(), 1);
+  assert!(
+    emitted[0].kind().is_removed(),
+    "no same-batch partner evidence: the vanished source resolves now"
+  );
 
   core.on_batch(
     scope,
@@ -334,9 +334,11 @@ fn singleton_rename_halves_pair_across_batches() {
   let effects = drain(&mut core);
   let emitted = emits(&effects);
   assert_eq!(emitted.len(), 1, "{effects:?}");
-  assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "old"])));
+  assert!(
+    emitted[0].kind().is_created(),
+    "the destination half finds no pending source and arrives fresh"
+  );
   assert_eq!(emitted[0].location(), &loc(&["b", "new"]));
-  assert_eq!(core.poll_timeout(), None, "pairing consumed the half");
 }
 
 #[test]
@@ -785,6 +787,8 @@ fn identity_minting_respects_devices_and_mounts() {
     root_dev: Some(1),
     mounts: vec![PathBuf::from("/r/vol")],
     mounts_authoritative: true,
+    refresh_pending: false,
+    refresh_stale: false,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -812,6 +816,8 @@ fn blind_mount_table_refuses_event_side_trust() {
     root_dev: Some(1),
     mounts: Vec::new(),
     mounts_authoritative: false,
+    refresh_pending: false,
+    refresh_stale: false,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -822,8 +828,12 @@ fn blind_mount_table_refuses_event_side_trust() {
     "an unseeded table proves nothing about devices"
   );
   assert!(
-    cookie_for(&state, Path::new("/r/a"), fid, None).is_none(),
-    "no event-side cookie without authoritative device evidence"
+    cookie_for(&state, fid, 2).is_none(),
+    "a cookie needs live root-device probe evidence"
+  );
+  assert!(
+    cookie_for(&state, fid, 1).is_some(),
+    "root-device probe evidence mints regardless of the table"
   );
   assert!(
     mint(&state, Path::new("/r/a"), fid, Some(1)).is_some(),
@@ -1454,4 +1464,288 @@ fn mount_in_batch_blocks_same_batch_rename_trust() {
     None,
     "the foreign half minted no cookie to wait on"
   );
+}
+
+fn refresh_requests(effects: &[Effect]) -> usize {
+  effects
+    .iter()
+    .filter(|e| matches!(e, Effect::RefreshMounts { .. }))
+    .count()
+}
+
+/// Feeds one same-batch rename pair (gone source, present destination on the
+/// root device) and returns the emitted changes — `Moved` under healthy
+/// trust, `Removed`+`Created` while trust is closed.
+fn feed_pair(core: &mut DriverCore, scope: ScopeId, ids: (u64, u64), fid: u64) -> Vec<Change> {
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/a/old", flags(&[FsEventFlags::ITEM_RENAMED]), ids.0, fid),
+      ev("/r/b/new", flags(&[FsEventFlags::ITEM_RENAMED]), ids.1, fid),
+    ],
+    at(ids.0),
+  );
+  let reqs = probes(&drain(core));
+  assert_eq!(reqs.len(), 2);
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(ids.0 + 1));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(fid),
+      dev: 1,
+    },
+    at(ids.0 + 1),
+  );
+  emits(&drain(core)).into_iter().cloned().collect()
+}
+
+#[test]
+fn loss_revokes_mount_trust_and_requests_one_refresh() {
+  let (mut core, scope) = live_core();
+  core.on_root_overflow(scope, at(1));
+  let effects = drain(&mut core);
+  assert_eq!(
+    refresh_requests(&effects),
+    1,
+    "a loss signal requests exactly one mount refresh: {effects:?}"
+  );
+  assert!(
+    emits(&effects).iter().any(|c| c.kind().is_rescan()),
+    "the overflow's own rescan still lands"
+  );
+
+  // While the refresh is outstanding, trust is closed: the vanished half of
+  // a same-batch pair cannot be granted its cookie, so the pair degrades.
+  let emitted = feed_pair(&mut core, scope, (10, 11), 42);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "no pairing while device trust is revoked: {emitted:?}"
+  );
+
+  // Further losses coalesce onto the outstanding refresh.
+  core.on_root_overflow(scope, at(20));
+  assert_eq!(refresh_requests(&drain(&mut core)), 0, "coalesced");
+
+  // The refresh landed after the second loss: its snapshot is stale, so it
+  // is discarded and exactly one more refresh runs.
+  core.on_mounts_refreshed(scope, Vec::new(), true);
+  assert_eq!(refresh_requests(&drain(&mut core)), 1, "stale re-arm");
+  let emitted = feed_pair(&mut core, scope, (30, 31), 43);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "still closed until a current refresh installs"
+  );
+
+  // A current refresh restores authority; pairing resumes.
+  core.on_mounts_refreshed(scope, Vec::new(), true);
+  assert_eq!(refresh_requests(&drain(&mut core)), 0);
+  let emitted = feed_pair(&mut core, scope, (40, 41), 44);
+  assert_eq!(emitted.len(), 1, "{emitted:?}");
+  assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "old"])));
+}
+
+#[test]
+fn failed_refresh_keeps_trust_closed() {
+  let (mut core, scope) = live_core();
+  core.on_root_overflow(scope, at(1));
+  let _ = drain(&mut core);
+  core.on_mounts_refreshed(scope, Vec::new(), false);
+  assert_eq!(
+    refresh_requests(&drain(&mut core)),
+    0,
+    "a failed refresh does not spin"
+  );
+  let emitted = feed_pair(&mut core, scope, (10, 11), 42);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "an unreadable mount table proves nothing: {emitted:?}"
+  );
+}
+
+#[test]
+fn refresh_union_keeps_learned_foreign_prefixes() {
+  let (mut core, scope) = live_core();
+  // A probe learns a foreign-device prefix.
+  core.on_batch(
+    scope,
+    vec![ev(
+      "/r/vol/x",
+      flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_MODIFIED]),
+      1,
+      5,
+    )],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  core.on_probe_result(
+    reqs[0].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(5),
+      dev: 9,
+    },
+    at(2),
+  );
+  let _ = drain(&mut core);
+
+  core.on_root_overflow(scope, at(3));
+  let _ = drain(&mut core);
+  // The fresh snapshot does not list the learned prefix (it is not a real
+  // mount point); the union must keep it — replacement would re-trust a
+  // known-foreign subtree.
+  core.on_mounts_refreshed(scope, vec![PathBuf::from("/r/other")], true);
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(state.mounts_authoritative);
+  assert!(state.mounts.iter().any(|m| m == Path::new("/r/vol/x")));
+  assert!(state.mounts.iter().any(|m| m == Path::new("/r/other")));
+}
+
+#[test]
+fn kernel_loss_flags_revoke_trust_but_coverage_rescans_do_not() {
+  // MustScanSubDirs is kernel-side loss: the coalesced-away window may have
+  // carried a mount transition.
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![ev(
+      "/r/deep",
+      flags(&[FsEventFlags::MUST_SCAN_SUBDIRS, FsEventFlags::USER_DROPPED]),
+      1,
+      0,
+    )],
+    at(1),
+  );
+  assert_eq!(refresh_requests(&drain(&mut core)), 1);
+
+  // An id wrap is a loss signal too.
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![ev("/r", flags(&[FsEventFlags::EVENT_IDS_WRAPPED]), 1, 0)],
+    at(1),
+  );
+  assert_eq!(refresh_requests(&drain(&mut core)), 1);
+
+  // A synthesized coverage rescan (an appeared directory) loses no events
+  // and must NOT thrash the trust table.
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![ev(
+      "/r/incoming",
+      flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_DIR]),
+      10,
+      42,
+    )],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  core.on_probe_result(
+    reqs[0].0,
+    ProbeOutcome::Present {
+      kind: FileKind::Dir,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  assert_eq!(
+    refresh_requests(&drain(&mut core)),
+    0,
+    "an appeared directory is coverage, not loss"
+  );
+}
+
+#[test]
+fn same_batch_unmount_keeps_colliding_rename_foreign() {
+  // The volume was known at spawn; a rename coalesces into the SAME batch as
+  // the volume's unmount, with a root-device object colliding on the fileID.
+  let mut core = DriverCore::new(WINDOW);
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let _ = drain(&mut core);
+  core.on_stream_spawned(
+    scope,
+    Ok(RootMeta {
+      root: PathBuf::from("/r"),
+      root_dev: 1,
+      mounts: vec![PathBuf::from("/r/vol")],
+      mounts_authoritative: true,
+    }),
+  );
+  let _ = drain(&mut core);
+
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/vol", flags(&[FsEventFlags::UNMOUNT]), 1, 0),
+      ev("/r/vol/twin", flags(&[FsEventFlags::ITEM_RENAMED]), 2, 77),
+      ev("/r/native", flags(&[FsEventFlags::ITEM_RENAMED]), 3, 77),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2);
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(77),
+      dev: 1,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "the unmount's trust-removal is deferred past the batch, so the gone \
+     half under the old volume stays foreign: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_removed() && c.location() == &loc(&["vol", "twin"]))
+  );
+
+  // The removal applies at settlement: the NEXT batch sees the prefix gone.
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(
+    !state.mounts.iter().any(|m| m == Path::new("/r/vol")),
+    "post-batch, the unmounted prefix leaves the table"
+  );
+}
+
+#[test]
+fn vanished_half_grant_requires_partner_evidence() {
+  // The destination probes onto a FOREIGN device: no cookie, no evidence —
+  // so the vanished source is never granted its cookie either.
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![
+      ev("/r/a/old", flags(&[FsEventFlags::ITEM_RENAMED]), 10, 42),
+      ev("/r/b/new", flags(&[FsEventFlags::ITEM_RENAMED]), 11, 42),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 2,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "no root-device evidence, no grant: {emitted:?}"
+  );
+  assert_eq!(core.poll_timeout(), None, "nothing waits on a cookie");
 }

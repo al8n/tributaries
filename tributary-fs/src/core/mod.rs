@@ -14,6 +14,13 @@
 //! verb is minted from an ambiguous word — truth is established by a
 //! [`Probe`](Effect::Probe) and anything un-groundable escalates to a located
 //! rescan. Loss is never silent.
+//!
+//! Device trust is fail-closed: every move cookie derives from contemporaneous
+//! probe evidence (a live `dev == root_dev` read, or a same-batch partner's
+//! probe binding the fileID to the root device), the mount table only ever
+//! VETOES trust — its mutations are monotone within a batch (adds early,
+//! removals late) — and any loss signal revokes its authority until a fresh
+//! read of the live table is installed.
 
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -102,6 +109,17 @@ pub(crate) enum Effect {
     /// The change to deliver.
     change: Change,
   },
+  /// Re-read the live mount table strictly under `root` (blocking) and feed
+  /// the result back through
+  /// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed): a loss signal
+  /// may have swallowed a mount transition, so the table's authority is
+  /// revoked until this fresh read installs.
+  RefreshMounts {
+    /// The scope whose device-trust table went stale.
+    scope: ScopeId,
+    /// The canonical root to enumerate mounts under.
+    root: PathBuf,
+  },
 }
 
 /// The outcome of one attempted [`Effect::Emit`].
@@ -127,6 +145,11 @@ enum Planned {
 struct Item {
   planned: Vec<Planned>,
   probe: Option<ProbeId>,
+  /// A vanished rename half's cookie candidacy `(fileID, source path)`:
+  /// granted at settlement iff a same-batch partner's probe evidenced the
+  /// fileID on the root device AND the vanished path itself lies under no
+  /// foreign prefix of the still-monotone table.
+  cookie_candidate: Option<(NonZeroU64, PathBuf)>,
 }
 
 /// A batch whose items are being resolved; fed to the Monitor only once every
@@ -138,6 +161,15 @@ struct PendingBatch {
   items: Vec<Item>,
   awaiting: usize,
   trailing: Vec<Planned>,
+  /// Unmount trust-removals deferred to the batch's settlement: removing a
+  /// foreign prefix only ever INCREASES trust, so it must not happen before
+  /// every one of the batch's classification and cookie decisions has run
+  /// (the monotone-within-batch rule).
+  deferred_unmounts: Vec<PathBuf>,
+  /// fileIDs a `Present` rename probe bound to the root device in THIS batch
+  /// — the contemporaneous evidence a vanished partner's cookie grant
+  /// requires at settlement.
+  evidenced: BTreeSet<NonZeroU64>,
 }
 
 /// Per-root batch parking: while a batch has probes in flight, later batches
@@ -242,10 +274,19 @@ struct ScopeState {
   /// table at spawn, then maintained by Mount/Unmount events and probed
   /// devices. Tiny in practice, so a linear scan beats indexing.
   mounts: Vec<PathBuf>,
-  /// Whether `mounts` was seeded authoritatively at spawn. Without it, a
-  /// path not covered by a known mount prefix proves nothing (the table
-  /// started blind), so event-side device trust is refused.
+  /// Whether `mounts` is backed by an authoritative read of the live mount
+  /// table (the spawn seed, or a post-loss refresh). Without it, a path not
+  /// covered by a known mount prefix proves nothing (the table is blind), so
+  /// event-side device trust is refused. Revoked by every loss signal — a
+  /// dropped window may have carried a mount transition.
   mounts_authoritative: bool,
+  /// An [`Effect::RefreshMounts`] is outstanding; repeated loss signals
+  /// coalesce onto it instead of stacking effects.
+  refresh_pending: bool,
+  /// A loss signal arrived while a refresh was in flight: that snapshot may
+  /// predate the newly-lost window, so its result is discarded and one more
+  /// refresh re-arms.
+  refresh_stale: bool,
   lag: LagState,
   park: Park,
   /// The journal id counter wrapped; any minted resume token is invalid.
@@ -316,6 +357,8 @@ impl DriverCore {
         root_dev: None,
         mounts: Vec::new(),
         mounts_authoritative: false,
+        refresh_pending: false,
+        refresh_stale: false,
         lag: LagState::Normal,
         park: Park::default(),
         resume_poisoned: false,
@@ -366,7 +409,7 @@ impl DriverCore {
       return;
     }
     let batch = self.compile(&mut state, scope, events);
-    let fed = Self::feed_if_ready(&mut self.monitor, &mut state, batch, now);
+    let fed = Self::settle_if_ready(&mut self.monitor, &mut state, batch, now);
     self.scopes.insert(scope, state);
     if fed {
       self.pump_queued(scope, now);
@@ -384,18 +427,21 @@ impl DriverCore {
       return;
     };
     let scope = ctx.scope;
-    let item = Self::resolve(&mut state, ctx.purpose, outcome);
+    let resolved = Self::resolve(&mut state, ctx.purpose, outcome);
     let mut fed = false;
     if let Some(batch) = state.park.active.as_mut() {
-      let (idx, planned) = item;
-      if let Some(slot) = batch.items.get_mut(idx) {
-        slot.planned = planned;
+      if let Some(fid) = resolved.evidences {
+        batch.evidenced.insert(fid);
+      }
+      if let Some(slot) = batch.items.get_mut(resolved.item) {
+        slot.planned = resolved.planned;
         slot.probe = None;
+        slot.cookie_candidate = resolved.candidate;
         batch.awaiting = batch.awaiting.saturating_sub(1);
       }
       if batch.awaiting == 0 {
         let batch = state.park.active.take().expect("just observed Some");
-        Self::apply(&mut self.monitor, batch, now);
+        Self::settle(&mut self.monitor, &mut state, batch, now);
         fed = true;
       }
     }
@@ -415,9 +461,64 @@ impl DriverCore {
     };
     state.park.active = None;
     state.park.queued.clear();
+    Self::trust_lost(&mut self.effects, scope, state);
     self.probes.retain(|_, ctx| ctx.scope != scope);
     self.monitor.on_overflow(Scope::Root(scope), now);
     self.drain_monitor();
+  }
+
+  /// Fails device trust closed after a loss signal: the dropped window may
+  /// have carried a mount transition, so the table can no longer prove a path
+  /// is root-device. Authority returns only with a fresh read of the live
+  /// mount table; repeated losses coalesce onto one outstanding refresh.
+  fn trust_lost(effects: &mut VecDeque<Effect>, scope: ScopeId, state: &mut ScopeState) {
+    state.mounts_authoritative = false;
+    if state.refresh_pending {
+      state.refresh_stale = true;
+      return;
+    }
+    // No canonical root yet means no live stream, so nothing was lost; the
+    // spawn's own seed installs the first table.
+    let Some(root) = state.root.clone() else {
+      return;
+    };
+    state.refresh_pending = true;
+    effects.push_back(Effect::RefreshMounts { scope, root });
+  }
+
+  /// Feeds the blocking mount-table refresh a loss signal requested.
+  pub(crate) fn on_mounts_refreshed(
+    &mut self,
+    scope: ScopeId,
+    mounts: Vec<PathBuf>,
+    authoritative: bool,
+  ) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    state.refresh_pending = false;
+    if state.refresh_stale {
+      // A newer loss overlapped this read: its snapshot may predate that
+      // window, so it is discarded and one more refresh runs.
+      state.refresh_stale = false;
+      Self::trust_lost(&mut self.effects, scope, state);
+      return;
+    }
+    if !authoritative {
+      // The live table could not be read; trust stays closed (probe-carried
+      // device evidence still decides everything it can).
+      return;
+    }
+    // UNION, never replacement: an existing entry is either a still-real
+    // mount (a later unmount event removes it) or a probed foreign-device
+    // prefix the snapshot cannot know about — keeping both only ever reduces
+    // trust, the safe direction.
+    for mount in mounts {
+      if !state.mounts.iter().any(|m| m == &mount) {
+        state.mounts.push(mount);
+      }
+    }
+    state.mounts_authoritative = true;
   }
 
   /// Feeds a dead-stream signal: the scope's coverage ended with no parent
@@ -587,15 +688,18 @@ impl DriverCore {
       .is_some_and(|state| state.resume_poisoned)
   }
 
-  /// Applies a fully-resolved batch to the Monitor in item order.
-  fn feed_if_ready(
+  /// Settles a fully-resolved batch: grants evidenced vanished-half cookies,
+  /// feeds the Monitor in item order, then applies the deferred unmount
+  /// trust-removals (the monotone rule's late edge). Parks instead when
+  /// probes are still outstanding.
+  fn settle_if_ready(
     monitor: &mut Monitor,
     state: &mut ScopeState,
     batch: PendingBatch,
     now: Instant,
   ) -> bool {
     if batch.awaiting == 0 {
-      Self::apply(monitor, batch, now);
+      Self::settle(monitor, state, batch, now);
       true
     } else {
       state.park.active = Some(batch);
@@ -603,7 +707,9 @@ impl DriverCore {
     }
   }
 
-  fn apply(monitor: &mut Monitor, batch: PendingBatch, now: Instant) {
+  fn settle(monitor: &mut Monitor, state: &mut ScopeState, mut batch: PendingBatch, now: Instant) {
+    Self::grant_evidenced_cookies(state, &mut batch);
+    let deferred = std::mem::take(&mut batch.deferred_unmounts);
     for item in batch.items {
       for planned in item.planned {
         Self::feed(monitor, planned, now);
@@ -611,6 +717,36 @@ impl DriverCore {
     }
     for planned in batch.trailing {
       Self::feed(monitor, planned, now);
+    }
+    for path in deferred {
+      state.mounts.retain(|m| m != &path);
+    }
+  }
+
+  /// Grants a vanished rename half its pairing cookie at settlement, under
+  /// BOTH proofs the fabrication class demands: a same-batch partner's probe
+  /// bound the fileID to the root device (contemporaneous evidence — the
+  /// vanished path itself cannot be statted), and the vanished path lies
+  /// under no foreign prefix of the still-monotone, still-authoritative
+  /// table (a collision from a just-mounted or just-unmounted volume fails
+  /// here). Cross-batch vanished sources never cookie — the Monitor degrades
+  /// them to a removal, the documented pairing cost.
+  fn grant_evidenced_cookies(state: &ScopeState, batch: &mut PendingBatch) {
+    for item in &mut batch.items {
+      let Some((fid, path)) = item.cookie_candidate.take() else {
+        continue;
+      };
+      if !batch.evidenced.contains(&fid) || !device_trusted(state, &path, None) {
+        continue;
+      }
+      for planned in &mut item.planned {
+        if let Planned::Rec(rec) = planned
+          && rec.kind().is_moved_from()
+          && rec.cookie().is_none()
+        {
+          *rec = rec.clone().with_cookie(MoveCookie::new(fid));
+        }
+      }
     }
   }
 
@@ -632,7 +768,7 @@ impl DriverCore {
         return;
       };
       let batch = self.compile(&mut state, scope, events);
-      let fed = Self::feed_if_ready(&mut self.monitor, &mut state, batch, now);
+      let fed = Self::settle_if_ready(&mut self.monitor, &mut state, batch, now);
       self.scopes.insert(scope, state);
       if !fed {
         return;
@@ -656,14 +792,20 @@ impl DriverCore {
     scope: ScopeId,
     events: Vec<RawOsEvent>,
   ) -> PendingBatch {
-    // Mount/unmount trust mutations apply BEFORE anything in the batch is
-    // classified: a rename sharing its batch with the MOUNT that makes its
-    // path foreign must already see the updated table (the gone-path cookie
-    // decision reads it — a probe cannot supply a device for a path that no
-    // longer exists).
+    // Device-trust mutations are MONOTONE WITHIN THE BATCH. A mount ADD only
+    // ever reduces trust, so it applies before anything is classified — a
+    // rename sharing its batch with the MOUNT that makes its path foreign
+    // must already see the prefix. An unmount REMOVE only ever increases
+    // trust, so it is deferred to the batch's settlement, strictly after
+    // every classification and cookie decision (including probe resolutions
+    // and the vanished-half grant): a rename coalesced just before its
+    // volume unmounted still fails closed.
+    let mut deferred_unmounts: Vec<PathBuf> = Vec::new();
     for ev in &events {
-      if ev.flags.mount() || ev.flags.unmount() {
-        apply_mount_trust(state, ev);
+      if ev.flags.mount() {
+        apply_mount_add(state, ev);
+      } else if ev.flags.unmount() && matches!(lower(state, &ev.path), Lowered::Target(_)) {
+        deferred_unmounts.push(ev.path.clone());
       }
     }
     // Same-fileID grouping decides chain SUPPRESSION only. A group larger
@@ -704,6 +846,7 @@ impl DriverCore {
         ItemPlan::Immediate(planned) => items.push(Item {
           planned,
           probe: None,
+          cookie_candidate: None,
         }),
         ItemPlan::Await { probe, path } => {
           awaiting += 1;
@@ -711,6 +854,7 @@ impl DriverCore {
           items.push(Item {
             planned: Vec::new(),
             probe: Some(probe),
+            cookie_candidate: None,
           });
         }
       }
@@ -719,6 +863,8 @@ impl DriverCore {
       items,
       awaiting,
       trailing,
+      deferred_unmounts,
+      evidenced: BTreeSet::new(),
     }
   }
 
@@ -785,12 +931,18 @@ impl DriverCore {
     }
     if flags.event_ids_wrapped() {
       state.resume_poisoned = true;
+      Self::trust_lost(&mut self.effects, scope, state);
       return ItemPlan::Immediate(vec![Planned::Over(Scope::Root(scope))]);
     }
     if flags.lost_sync() {
+      Self::trust_lost(&mut self.effects, scope, state);
       return ItemPlan::Immediate(vec![Planned::Over(Scope::Root(scope))]);
     }
     if flags.must_scan_subdirs() {
+      // Kernel-side loss like the drops above: the coalesced-away window may
+      // have carried a mount transition. Synthesized coverage rescans (an
+      // appeared directory, a chain belt) lose no events and do NOT revoke.
+      Self::trust_lost(&mut self.effects, scope, state);
       return ItemPlan::Immediate(vec![Planned::Over(Self::clamp(state, scope, &ev.path))]);
     }
     if flags.mount() || flags.unmount() {
@@ -895,12 +1047,8 @@ impl DriverCore {
     }
   }
 
-  /// Resolves one probe's plan. Returns the item index and its planned inputs.
-  fn resolve(
-    state: &mut ScopeState,
-    purpose: ProbePurpose,
-    outcome: ProbeOutcome,
-  ) -> (usize, Vec<Planned>) {
+  /// Resolves one probe's plan.
+  fn resolve(state: &mut ScopeState, purpose: ProbePurpose, outcome: ProbeOutcome) -> Resolved {
     match purpose {
       ProbePurpose::RootAlive { item } => {
         let kind = match outcome {
@@ -909,7 +1057,7 @@ impl DriverCore {
           // the registered path no longer names the watched object.
           ProbeOutcome::Present { .. } | ProbeOutcome::Failed => RecordKind::MoveSelf,
         };
-        (item, vec![Planned::Rec(OsRecord::new(state.watch, kind))])
+        Resolved::plain(item, vec![Planned::Rec(OsRecord::new(state.watch, kind))])
       }
       ProbePurpose::Ambiguous {
         item,
@@ -937,7 +1085,7 @@ impl DriverCore {
           }
           ProbeOutcome::Failed => vec![Planned::Over(located(state.watch, target))],
         };
-        (item, planned)
+        Resolved::plain(item, planned)
       }
       ProbePurpose::Rename {
         item,
@@ -947,21 +1095,26 @@ impl DriverCore {
         allow_cookie,
         content_changed,
       } => {
-        let planned = match outcome {
-          // Gone: the source half of a move out of (or within) the tree. The
-          // fileID cookie lets a destination half pair inside the Monitor's
-          // window; without one the Monitor degrades it to a removal now.
-          // Cookie trust follows the identity rule: a device-scoped id off
-          // the root device (or suppressed by group ambiguity) never pairs.
+        match outcome {
+          // Gone: the source half of a move out of (or within) the tree. A
+          // vanished path has NO contemporaneous device evidence — the mount
+          // table cannot prove which device it WAS on — so no cookie is
+          // minted here. Settlement grants one iff a same-batch partner's
+          // probe binds this fileID to the root device; otherwise the
+          // Monitor degrades the half to an immediate removal (cross-batch
+          // vanished sources never pair — the documented cost).
           ProbeOutcome::Missing => {
-            let cookie = allow_cookie
-              .then(|| cookie_for(state, &path, file_id, None))
-              .flatten();
-            let mut rec = record_with(state, RecordKind::MovedFrom, target, None, None);
-            if let Some(cookie) = cookie {
-              rec = rec.with_cookie(cookie);
+            let candidate = allow_cookie
+              .then_some(file_id)
+              .flatten()
+              .map(|fid| (fid, path.clone()));
+            let rec = record_with(state, RecordKind::MovedFrom, target, None, None);
+            Resolved {
+              item,
+              planned: vec![Planned::Rec(rec)],
+              evidences: None,
+              candidate,
             }
-            vec![Planned::Rec(rec)]
           }
           // Exists: the destination half. An appeared DIRECTORY delivers no
           // events for the children it arrived with, so the record is paired
@@ -973,8 +1126,9 @@ impl DriverCore {
             dev,
           } => {
             learn_device(state, &path, dev);
+            let pairing_id = file_id.or(probed);
             let cookie = allow_cookie
-              .then(|| cookie_for(state, &path, file_id.or(probed), Some(dev)))
+              .then(|| cookie_for(state, pairing_id, dev))
               .flatten();
             let node = mint(state, &path, probed, Some(dev));
             let mut rec = record_with(
@@ -1005,11 +1159,20 @@ impl DriverCore {
             if kind.is_dir() {
               planned.push(Planned::Over(located(state.watch, target)));
             }
-            planned
+            Resolved {
+              item,
+              planned,
+              // A cookie minted here IS the live root-device proof: publish
+              // it so a vanished same-batch partner sharing this fileID can
+              // be granted its half at settlement.
+              evidences: cookie.is_some().then_some(pairing_id).flatten(),
+              candidate: None,
+            }
           }
-          ProbeOutcome::Failed => vec![Planned::Over(located(state.watch, target))],
-        };
-        (item, planned)
+          ProbeOutcome::Failed => {
+            Resolved::plain(item, vec![Planned::Over(located(state.watch, target))])
+          }
+        }
       }
     }
   }
@@ -1145,6 +1308,29 @@ enum ItemPlan {
   Await { probe: ProbeId, path: PathBuf },
 }
 
+/// One probe's resolution: the item it grounds, its planned inputs, and its
+/// contribution to the batch's cookie-evidence exchange.
+struct Resolved {
+  item: usize,
+  planned: Vec<Planned>,
+  /// A fileID this probe bound to the root device (a cookied `Present`
+  /// rename half) — settlement evidence for a vanished partner.
+  evidences: Option<NonZeroU64>,
+  /// A vanished half's grant candidacy (see [`Item::cookie_candidate`]).
+  candidate: Option<(NonZeroU64, PathBuf)>,
+}
+
+impl Resolved {
+  fn plain(item: usize, planned: Vec<Planned>) -> Self {
+    Self {
+      item,
+      planned,
+      evidences: None,
+      candidate: None,
+    }
+  }
+}
+
 /// Builds a record with identity minted from the event-side fileID.
 fn record_from_event(
   state: &ScopeState,
@@ -1216,18 +1402,16 @@ fn mint(
   device_trusted(state, path, dev).then(|| Identity::new(fid))
 }
 
-/// The move cookie for a rename half at `path`, under the same device trust
-/// as [`mint`]: a fileID is device-scoped, so a cookie minted for an object
-/// off the root device could pair two different objects into a fabricated
-/// move — corruption with no covering rescan.
-fn cookie_for(
-  state: &ScopeState,
-  path: &Path,
-  file_id: Option<NonZeroU64>,
-  dev: Option<u64>,
-) -> Option<MoveCookie> {
+/// The move cookie for a rename half, minted ONLY from contemporaneous probe
+/// evidence: `dev` is the device a probe just read for the object. fileIDs
+/// are device-scoped, so any cookie without live root-device proof could pair
+/// two different objects into a fabricated move — corruption with no covering
+/// rescan. The mount table never grants a cookie; it can only veto one (the
+/// vanished-half grant in [`DriverCore::grant_evidenced_cookies`] requires a
+/// partner's probe evidence AND a clean table).
+fn cookie_for(state: &ScopeState, file_id: Option<NonZeroU64>, dev: u64) -> Option<MoveCookie> {
   let fid = file_id?;
-  device_trusted(state, path, dev).then(|| MoveCookie::new(fid))
+  (state.root_dev == Some(dev)).then(|| MoveCookie::new(fid))
 }
 
 /// Whether `path`'s objects provably live on the scope's root device.
@@ -1247,20 +1431,17 @@ fn device_trusted(state: &ScopeState, path: &Path, dev: Option<u64>) -> bool {
   state.mounts_authoritative && !state.mounts.iter().any(|m| path.starts_with(m))
 }
 
-/// Applies one mount/unmount event's device-trust mutation. Runs in
-/// `compile`'s pre-scan — strictly before any of the batch's items are
-/// classified — so a same-batch rename under the just-mounted volume already
-/// sees the foreign prefix when its cookie trust is decided.
-fn apply_mount_trust(state: &mut ScopeState, ev: &RawOsEvent) {
+/// Applies one MOUNT event's trust-reducing prefix add. Runs in `compile`'s
+/// pre-scan — strictly before any of the batch's items are classified — so a
+/// same-batch rename under the just-mounted volume already sees the foreign
+/// prefix. The trust-increasing dual (an unmount's removal) is deferred to
+/// settlement instead: see the monotone-within-batch rule in `compile`.
+fn apply_mount_add(state: &mut ScopeState, ev: &RawOsEvent) {
   if !matches!(lower(state, &ev.path), Lowered::Target(_)) {
     return;
   }
-  if ev.flags.mount() {
-    if !state.mounts.iter().any(|m| m == &ev.path) {
-      state.mounts.push(ev.path.clone());
-    }
-  } else {
-    state.mounts.retain(|m| m != &ev.path);
+  if !state.mounts.iter().any(|m| m == &ev.path) {
+    state.mounts.push(ev.path.clone());
   }
 }
 
