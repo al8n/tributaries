@@ -30,7 +30,7 @@ use objc2_core_services::{
 
 use super::{
   EventReceiver, MAX_EXCLUSIONS, ResumeToken, RootMeta, SourceConfig, SourceError,
-  fsevent::TransportState,
+  transport::TransportState,
 };
 
 /// The state the event callback reads. Owned jointly by the [`SourceHandle`]

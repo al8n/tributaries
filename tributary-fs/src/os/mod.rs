@@ -8,7 +8,7 @@
 //! fail for capacity — a loss can never be recorded without a message left to
 //! observe it, and no signal can overtake the batches it postdates. Memory is
 //! bounded not by the queue but by the batch budget
-//! (`fsevent::TransportState`, compiled only where a backend drives it): an
+//! (`transport::TransportState`, compiled only where a backend drives it): an
 //! over-budget batch is dropped at the callback and degrades to the same
 //! in-order `Overflow`.
 //!
@@ -19,6 +19,7 @@
 use std::{io, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 pub(crate) mod fsevent;
+pub(crate) mod transport;
 
 #[cfg(all(target_os = "macos", not(miri)))]
 mod macos;
@@ -30,7 +31,23 @@ mod unsupported;
 #[cfg(any(not(target_os = "macos"), miri))]
 pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
 
-pub(crate) use fsevent::{BatchPayload, FsEventFlags, OverflowAck, RawOsEvent};
+pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
+
+/// The platform's decoded event payload — the `E` every generic transport
+/// type is instantiated at below, so the driver and core name exactly ONE
+/// per-cfg event type. Each backend's decode produces this; Linux lands its
+/// own alongside its backend.
+pub(crate) type PlatformEvent = fsevent::RawOsEvent;
+
+/// One producer batch of [`PlatformEvent`]s plus its budget slot.
+pub(crate) type BatchPayload = transport::BatchPayload<PlatformEvent>;
+
+/// One message from the OS producer to the driver task, on the source's
+/// single ordered queue.
+pub(crate) type SourceMessage = transport::SourceMessage<PlatformEvent>;
+
+/// The driver's receiving end of a source's messages.
+pub(crate) type EventReceiver = transport::EventReceiver<PlatformEvent>;
 
 /// The most exclusion directories one native stream honors
 /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
@@ -123,28 +140,6 @@ impl SourceConfig {
       channel_capacity: NonZeroUsize::new(64).expect("64 is nonzero"),
     }
   }
-}
-
-/// One message from the OS callback to the driver task, on the source's
-/// single ordered queue.
-// Only a platform backend (or the protocol suites under test) constructs
-// messages — the stub platform has none — so a backend-less lib build sees
-// the variants as never built. The driver consumes every variant on all
-// platforms; cfg-gating them would fracture that match.
-#[cfg_attr(not(any(all(target_os = "macos", not(miri)), test)), allow(dead_code))]
-#[derive(Debug)]
-pub(crate) enum SourceMessage {
-  /// One callback invocation's decoded events, holding their budget slot.
-  Batch(BatchPayload),
-  /// Transport-level loss AT THIS QUEUE POSITION: a batch was dropped over
-  /// budget, or an event could not be decoded. The receiver treats the
-  /// source's subtrees as needing a rescan; dropping the carried
-  /// [`OverflowAck`] (before acting) re-arms the dedup for the next loss.
-  Overflow(OverflowAck),
-  /// The stream is dead and will deliver nothing more (sent at most once).
-  /// The driver reacts to the death itself (root invalidation); the carried
-  /// class is diagnostic surface for a future health-reporting channel.
-  Fatal(#[allow(dead_code)] SourceError),
 }
 
 /// Why a platform source could not start, or died.
@@ -241,6 +236,3 @@ impl ResumeToken {
     self.device_uuid
   }
 }
-
-/// The driver's receiving end of a source's messages.
-pub(crate) type EventReceiver = async_channel::Receiver<SourceMessage>;

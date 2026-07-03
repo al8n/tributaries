@@ -78,7 +78,7 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
     // loss rides the SAME ordered queue in-band — the queue is unbounded, so
     // a signal send cannot fail for capacity and cannot overtake the batches
     // it postdates.
-    crate::os::fsevent::forward_batch(&shared.transport, batch.events, batch.lossy, |msg| {
+    crate::os::transport::forward_batch(&shared.transport, batch.events, batch.lossy, |msg| {
       shared.queue.try_send(msg).is_ok()
     });
   }));
@@ -87,7 +87,7 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
     // report the death in-band. The queue is unbounded, so the one terminal
     // Fatal cannot be dropped for capacity.
     shared.poisoned.store(true, Ordering::Release);
-    crate::os::fsevent::signal_fatal_once(&shared.transport, SourceError::CallbackPanic, |msg| {
+    crate::os::transport::signal_fatal_once(&shared.transport, SourceError::CallbackPanic, |msg| {
       shared.queue.try_send(msg).is_ok()
     });
   }

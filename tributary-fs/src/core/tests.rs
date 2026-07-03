@@ -2407,7 +2407,7 @@ mod lowering {
 fn stuck_probe_backpressures_the_callback_through_the_park() {
   use crate::os::{
     SourceMessage,
-    fsevent::{TransportState, forward_batch},
+    transport::{TransportState, forward_batch},
   };
 
   let (mut core, scope) = live_core();
