@@ -166,6 +166,15 @@ pub enum SourceError {
     /// The final canonical root the spawn resolved.
     root: PathBuf,
   },
+  /// The root OBJECT changed between the pre-start metadata capture and the
+  /// stream going live: the path kept its bytes but now names a different
+  /// `(dev, ino)`. The just-started stream was torn down — committing it
+  /// would anchor coverage and registry identity to two different objects.
+  #[error("watch root {} was replaced while the stream was starting", root.display())]
+  RootReplaced {
+    /// The final canonical root whose object changed.
+    root: PathBuf,
+  },
   /// More exclusion paths than the OS honors were supplied.
   #[error("{supplied} exclusion paths exceed the OS limit of {MAX_EXCLUSIONS}")]
   TooManyExclusions {

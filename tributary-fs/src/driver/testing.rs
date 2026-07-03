@@ -59,6 +59,10 @@ struct FakeState {
   /// re-canonicalization (a symlink retargeted between reservation and
   /// spawn): the spawned `RootMeta` carries the FINAL root.
   spawn_remaps: Mutex<HashMap<PathBuf, PathBuf>>,
+  /// A node written the instant the next fake stream goes live — the
+  /// deterministic form of an object swapped inside the real backend's
+  /// metadata-capture→start gap. The post-live revalidation must catch it.
+  replace_at_live: Mutex<Option<(PathBuf, FakeNode)>>,
   /// The spawn contract's observable order: `meta_sealed` must strictly
   /// precede `stream_live`, mirroring the real backend's pre-start barrier —
   /// a fake that seeded metadata after its stream went live would let the
@@ -197,6 +201,20 @@ impl FakeFs {
     self.state.spawn_order.lock().unwrap().clone()
   }
 
+  /// Arms a node replacement applied the instant the next spawn's stream
+  /// goes live, racing the sealed metadata exactly like a real object swap in
+  /// the capture→start gap.
+  pub(crate) fn replace_at_live(&self, path: impl AsRef<Path>, kind: FileKind, ino: u64) {
+    *self.state.replace_at_live.lock().unwrap() = Some((
+      path.as_ref().to_path_buf(),
+      FakeNode {
+        kind,
+        ino,
+        dev: self.root_dev,
+      },
+    ));
+  }
+
   /// Remaps a requested root to a different final root at spawn, mirroring
   /// the backend's re-canonicalization.
   pub(crate) fn remap_spawn_root(&self, requested: impl AsRef<Path>, actual: impl AsRef<Path>) {
@@ -319,18 +337,78 @@ impl FsOps for FakeFs {
     // spellings on a real insensitive volume; an ancestor put with a live
     // root's identity exercises the containment cells. A final root the test
     // never put gets a synthetic identity that can collide with nothing.
-    let identity = {
+    let sealed = {
       let nodes = self.state.nodes.lock().unwrap();
       nodes
         .get(&root)
         .map(|node| RootIdentity::new(node.dev, node.ino))
-        .unwrap_or_else(|| {
-          RootIdentity::new(
-            u64::MAX,
-            self.state.spawns.load(Ordering::SeqCst) as u64 + 1,
-          )
-        })
     };
+    let identity = sealed.unwrap_or_else(|| {
+      RootIdentity::new(
+        u64::MAX,
+        self.state.spawns.load(Ordering::SeqCst) as u64 + 1,
+      )
+    });
+    self.state.spawn_order.lock().unwrap().push("meta_sealed");
+    let (sender, receiver) = async_channel::unbounded();
+    let transport = Arc::new(crate::os::fsevent::TransportState::new(
+      config.channel_capacity.get(),
+    ));
+    self
+      .state
+      .sources
+      .lock()
+      .unwrap()
+      .entry(root.clone())
+      .or_default()
+      .push(FakeSource { sender, transport });
+    self.state.spawn_order.lock().unwrap().push("stream_live");
+    self.state.spawns.fetch_add(1, Ordering::SeqCst);
+    // An armed replacement lands now — after the stream went live, before the
+    // revalidation — the deterministic capture→start race.
+    if let Some((path, node)) = self.state.replace_at_live.lock().unwrap().take() {
+      self.state.nodes.lock().unwrap().insert(path, node);
+    }
+    // The post-live half of the identity bracket, mirrored from the real
+    // backend: the root must still be the sealed object (and a directory);
+    // otherwise the just-live fake stream is torn down before spawn returns.
+    self
+      .state
+      .spawn_order
+      .lock()
+      .unwrap()
+      .push("root_revalidated");
+    let live = {
+      let nodes = self.state.nodes.lock().unwrap();
+      nodes.get(&root).map(|node| (node.kind, node.ino, node.dev))
+    };
+    let reject = match (sealed, live) {
+      // The synthetic-identity convention: a root the test never put stays
+      // absent — unchanged absence is a consistent bracket, not a vanish.
+      (None, None) => None,
+      (Some(_), None) => Some(SourceError::RootUnavailable {
+        root: root.clone(),
+        source: std::io::Error::new(
+          std::io::ErrorKind::NotFound,
+          "the root vanished before the stream went live",
+        ),
+      }),
+      (_, Some((kind, _, _))) if !kind.is_dir() => {
+        Some(SourceError::NotADirectory { root: root.clone() })
+      }
+      (_, Some((_, ino, dev))) if RootIdentity::new(dev, ino) != identity => {
+        Some(SourceError::RootReplaced { root: root.clone() })
+      }
+      (_, Some(_)) => None,
+    };
+    if let Some(err) = reject {
+      if let Some(spawned) = self.state.sources.lock().unwrap().get_mut(&root) {
+        spawned.pop();
+      }
+      self.state.shutdowns.fetch_add(1, Ordering::SeqCst);
+      return Err(err);
+    }
+    // Ancestor identities read after the stream is live, like the backend.
     let ancestors = {
       let nodes = self.state.nodes.lock().unwrap();
       root
@@ -347,21 +425,6 @@ impl FsOps for FakeFs {
       identity,
       ancestors,
     };
-    self.state.spawn_order.lock().unwrap().push("meta_sealed");
-    let (sender, receiver) = async_channel::unbounded();
-    let transport = Arc::new(crate::os::fsevent::TransportState::new(
-      config.channel_capacity.get(),
-    ));
-    self
-      .state
-      .sources
-      .lock()
-      .unwrap()
-      .entry(root)
-      .or_default()
-      .push(FakeSource { sender, transport });
-    self.state.spawn_order.lock().unwrap().push("stream_live");
-    self.state.spawns.fetch_add(1, Ordering::SeqCst);
     Ok(SpawnedSource {
       handle: FakeHandle {
         state: Arc::clone(&self.state),
