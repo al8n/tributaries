@@ -630,15 +630,17 @@ pub(crate) async fn run<R, F>(
     }
   };
   // Grace expiry with work still pending means a wedged blocking pool: the
-  // close reply goes out anyway (a wedged pool must not hang close forever).
-  // The two residuals differ, and the reply reports the difference: a
-  // still-pending SPAWN self-reclaims (its undeliverable result drops with
-  // the channel and the handle's Drop runs the teardown), but a still-pending
-  // TEARDOWN already moved its handle INTO the wedged shutdown call — nothing
-  // can reclaim that stream until the call returns, so close must not claim
-  // quiescence. One shared grace for both: a wedged FFI teardown rarely
-  // unwedges with more time, so a longer teardown window would only delay
-  // the honest signal.
+  // close reply goes out anyway (a wedged pool must not hang close forever),
+  // and it reports EVERY pending set — quiescence cannot be claimed while
+  // either is non-empty. A still-pending TEARDOWN already moved its handle
+  // INTO the wedged shutdown call, so nothing can reclaim that stream until
+  // the call returns. A still-pending SPAWN may ALREADY OWN A LIVE STREAM —
+  // the backend starts it and then performs post-live metadata reads inside
+  // the same call — and only self-reclaims once the wedge clears (its
+  // undeliverable result drops and the handle's Drop runs the teardown), so
+  // it is just as non-quiescent at reply time. One shared grace for both: a
+  // wedged FFI call rarely unwedges with more time, so a longer window would
+  // only delay the honest signal.
   let _ = R::timeout(Duration::from_secs(1), drain).await;
   execute_effects::<R, F>(
     &mut core,
@@ -654,7 +656,7 @@ pub(crate) async fn run<R, F>(
     &now,
   );
   if let Some(reply) = close_reply {
-    let _ = reply.send(pending_teardowns.len());
+    let _ = reply.send(pending_teardowns.len() + pending_spawns.len());
   }
 }
 

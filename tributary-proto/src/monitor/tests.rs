@@ -5252,6 +5252,29 @@ fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
       RecordKind::MovedFrom,
       RecordKind::MovedTo,
     ];
+    // The delivered-epoch contract, asserted over every drained change: an
+    // ordinary change never carries a generation greater than the latest
+    // DELIVERED Rescan's for its scope, and each delivered Rescan strictly
+    // advances that ceiling — no generation exists that no Rescan announced.
+    let mut rescan_ceiling: std::collections::BTreeMap<ScopeId, Epoch> =
+      std::collections::BTreeMap::new();
+    let mut drain_checked = |m: &mut Monitor, seed: u64| {
+      while let Some(change) = m.poll_event() {
+        let ceiling = rescan_ceiling.entry(change.scope()).or_insert(Epoch::START);
+        if change.kind().is_rescan() {
+          assert!(
+            change.epoch() > *ceiling,
+            "each delivered Rescan strictly advances its scope's generation (seed {seed})"
+          );
+          *ceiling = change.epoch();
+        } else {
+          assert!(
+            change.epoch() <= *ceiling,
+            "an ordinary change never outruns the delivered Rescan ceiling (seed {seed})"
+          );
+        }
+      }
+    };
 
     for step in 0..300u64 {
       while let Some(action) = m.poll_action() {
@@ -5264,7 +5287,7 @@ fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
       // inputs, so the adjacency dedup must stay sound under it (subtree-aware
       // Rescan touching, not just point equality).
       if step % 5 == 0 {
-        while m.poll_event().is_some() {}
+        drain_checked(&mut m, seed);
       }
       m.assert_invariants();
 
@@ -5311,6 +5334,7 @@ fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
       }
     }
 
+    drain_checked(&mut m, seed);
     let mut guard = 0u32;
     while m.poll_action().is_some() {
       guard += 1;
@@ -5388,11 +5412,14 @@ fn out_of_subtree_event_keeps_rescan_coalescing() {
 }
 
 /// Truly-adjacent identical Rescans still coalesce: no covered event separates the
-/// two losses, so one delivered instruction stands for both.
+/// two losses, so one delivered instruction stands for both — and because the
+/// coalesce is decided BEFORE the trigger's epoch bump, the scope's generation IS
+/// the delivered Rescan's, so a following ordinary change carries an announced
+/// generation, never a hidden one.
 #[test]
 fn adjacent_identical_rescans_still_coalesce() {
   let mut m = kernel_recursive();
-  let _root = live_root(&mut m, scope(1));
+  let root = live_root(&mut m, scope(1));
   let _ = drain_events(&mut m);
 
   m.on_overflow(Scope::Root(scope(1)), at(1));
@@ -5401,6 +5428,24 @@ fn adjacent_identical_rescans_still_coalesce() {
   let events = drain_events(&mut m);
   assert_eq!(events.len(), 1);
   assert!(events[0].kind().is_rescan());
+  assert_eq!(
+    m.epoch_of(scope(1)),
+    events[0].epoch(),
+    "the coalesced trigger never advanced the scope past its delivered Rescan"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_target(loc(&["x"])),
+    at(3),
+  );
+  let after = drain_events(&mut m);
+  assert_eq!(after.len(), 1);
+  assert!(after[0].kind().is_created());
+  assert_eq!(
+    after[0].epoch(),
+    events[0].epoch(),
+    "a change after coalesced losses carries the delivered Rescan's generation"
+  );
 }
 
 /// The prefix relation holds on the queued side too: a create after a queued ancestor
