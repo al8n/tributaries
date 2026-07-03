@@ -27,7 +27,7 @@ use super::SourceError;
 // mirrors that consumer's exact cfg so a build with no backend carries none of
 // it, while the interleaving/protocol suites compile it everywhere under test
 // (including miri).
-#[cfg(any(all(target_os = "macos", not(miri)), test))]
+#[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
 #[derive(Debug)]
 pub(crate) struct TransportState {
   /// Batches currently enqueued (or being processed); the budget cap bounds
@@ -42,7 +42,7 @@ pub(crate) struct TransportState {
   fatal_sent: AtomicBool,
 }
 
-#[cfg(any(all(target_os = "macos", not(miri)), test))]
+#[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
 impl TransportState {
   /// A fresh transport allowing `budget` batches in flight.
   pub(crate) fn new(budget: usize) -> Self {
@@ -73,7 +73,7 @@ impl TransportState {
 #[derive(Debug)]
 pub(crate) struct BudgetPermit(Arc<AtomicUsize>);
 
-#[cfg(any(all(target_os = "macos", not(miri)), test))]
+#[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
 impl BudgetPermit {
   /// Claims a slot, or `None` when the budget is exhausted.
   fn acquire(transport: &TransportState) -> Option<Self> {
@@ -152,7 +152,10 @@ impl Drop for OverflowAck {
 // messages — the stub platform has none — so a backend-less lib build sees
 // the variants as never built. The driver consumes every variant on all
 // platforms; cfg-gating them would fracture that match.
-#[cfg_attr(not(any(all(target_os = "macos", not(miri)), test)), allow(dead_code))]
+#[cfg_attr(
+  not(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test)),
+  allow(dead_code)
+)]
 #[derive(Debug)]
 pub(crate) enum SourceMessage<E> {
   /// One producer invocation's decoded events, holding their budget slot.
@@ -181,7 +184,7 @@ pub(crate) type EventReceiver<E> = async_channel::Receiver<SourceMessage<E>>;
 ///
 /// A batch over budget and an undecodable entry both degrade to the same
 /// in-order `Overflow`.
-#[cfg(any(all(target_os = "macos", not(miri)), test))]
+#[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
 pub(crate) fn forward_batch<E, S>(
   transport: &TransportState,
   events: Vec<E>,
@@ -212,7 +215,7 @@ pub(crate) fn forward_batch<E, S>(
 /// stays set until the message's [`OverflowAck`] drops (the driver
 /// acknowledging, a refused send, a drain), so at most one `Overflow` is ever
 /// in flight and losses meanwhile are covered by it.
-#[cfg(any(all(target_os = "macos", not(miri)), test))]
+#[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
 pub(crate) fn signal_loss<E, S>(transport: &TransportState, mut send: S)
 where
   S: FnMut(SourceMessage<E>) -> bool,
@@ -225,7 +228,7 @@ where
 }
 
 /// Enqueues the stream's one terminal `Fatal`, at most once ever.
-#[cfg(any(all(target_os = "macos", not(miri)), test))]
+#[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
 pub(crate) fn signal_fatal_once<E, S>(transport: &TransportState, err: SourceError, mut send: S)
 where
   S: FnMut(SourceMessage<E>) -> bool,

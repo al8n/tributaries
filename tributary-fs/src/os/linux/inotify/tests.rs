@@ -197,3 +197,145 @@ mod table {
     assert!(t.anchors(99).is_empty());
   }
 }
+
+/// Live-kernel smoke: compiled by the Linux-target lint gate on every host,
+/// RUN by the container harness (`ci/linux-verify.sh`) and the CI Linux legs.
+#[cfg(all(target_os = "linux", not(miri)))]
+mod smoke {
+  use std::{ffi::OsString, fs, num::NonZeroU64, time::Duration};
+
+  use tributary_proto::WatchId;
+
+  use crate::os::{
+    SourceConfig,
+    linux::{AnchorRequest, RawLinuxEvent, Source, WatchOutcome},
+    transport::SourceMessage,
+  };
+
+  fn watch(n: u64) -> WatchId {
+    WatchId::new(NonZeroU64::new(n).unwrap())
+  }
+
+  fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tributary-inotify-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+  }
+
+  fn recv_batch(rx: &crate::os::transport::EventReceiver<RawLinuxEvent>) -> Vec<RawLinuxEvent> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+      match rx.try_recv() {
+        Ok(SourceMessage::Batch(payload)) => return payload.events,
+        Ok(_) => continue,
+        Err(_) => std::thread::sleep(Duration::from_millis(20)),
+      }
+    }
+    panic!("no batch within the deadline");
+  }
+
+  #[test]
+  fn spawn_seals_meta_and_arms_through_the_control_path() {
+    let dir = scratch("spawn");
+    let (handle, rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    // The barrier sealed the canonical root before any watch existed; nothing
+    // can have been delivered yet.
+    assert_eq!(meta.root, fs::canonicalize(&dir).unwrap());
+    assert!(
+      rx.is_empty(),
+      "no watch armed at spawn, so nothing delivered"
+    );
+
+    let reply = handle.add_watch(AnchorRequest {
+      watch: watch(1),
+      parent: None,
+      name: OsString::from(meta.root.as_os_str()),
+    });
+    let wd = match reply.outcome {
+      WatchOutcome::Installed(wd) => wd,
+      other => panic!("root arm failed: {other:?}"),
+    };
+    assert!(wd >= 0);
+    assert!(reply.anchor.is_some(), "the transient anchor comes back");
+
+    fs::write(dir.join("a.txt"), b"x").unwrap();
+    let events = recv_batch(&rx);
+    let (anchors, raw) = events[0].as_inotify().unwrap();
+    assert_eq!(anchors, &[watch(1)]);
+    assert_eq!(raw.name.as_deref(), Some(b"a.txt".as_slice()));
+
+    handle.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn arming_the_same_inode_twice_aliases() {
+    let dir = scratch("alias");
+    let (handle, _rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+
+    let first = handle.add_watch(AnchorRequest {
+      watch: watch(1),
+      parent: None,
+      name: OsString::from(meta.root.as_os_str()),
+    });
+    let WatchOutcome::Installed(wd) = first.outcome else {
+      panic!("first arm: {:?}", first.outcome);
+    };
+    let second = handle.add_watch(AnchorRequest {
+      watch: watch(2),
+      parent: None,
+      name: OsString::from(meta.root.as_os_str()),
+    });
+    assert_eq!(second.outcome, WatchOutcome::Aliased(wd));
+
+    handle.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn missing_target_maps_to_not_found() {
+    let dir = scratch("enoent");
+    let (handle, _rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let reply = handle.add_watch(AnchorRequest {
+      watch: watch(1),
+      parent: None,
+      name: OsString::from(meta.root.join("absent").as_os_str()),
+    });
+    assert_eq!(
+      reply.outcome,
+      WatchOutcome::Failed(tributary_proto::WatchError::NotFound)
+    );
+    handle.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn remove_watch_drains_through_ignored() {
+    let dir = scratch("drain");
+    let (handle, rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let reply = handle.add_watch(AnchorRequest {
+      watch: watch(1),
+      parent: None,
+      name: OsString::from(meta.root.as_os_str()),
+    });
+    assert!(matches!(reply.outcome, WatchOutcome::Installed(_)));
+
+    handle.remove_watch(watch(1));
+    // The self-induced teardown's IGNORED erases silently; later filesystem
+    // activity must not be attributed.
+    fs::write(dir.join("late.txt"), b"x").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    while let Ok(msg) = rx.try_recv() {
+      if let SourceMessage::Batch(payload) = msg {
+        assert!(
+          payload.events.is_empty(),
+          "no attribution after the drain: {:?}",
+          payload.events
+        );
+      }
+    }
+    handle.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+  }
+}
