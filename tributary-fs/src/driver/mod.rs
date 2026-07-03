@@ -24,8 +24,8 @@ use crate::{
   core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate},
   error::WatchRootError,
   os::{
-    BackendKind, EventReceiver, RootIdentity, RootMeta, Source, SourceConfig, SourceError,
-    SourceHandle, SourceMessage, linux::WatchOutcome,
+    BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, Source, SourceConfig,
+    SourceError, SourceHandle, SourceMessage, linux::WatchOutcome,
   },
 };
 
@@ -82,6 +82,54 @@ pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant,
 struct PendingWatch {
   requested: PathBuf,
   reply: WatchReply,
+}
+
+/// A registration grant held between a descending spawn's success and its
+/// ROOT watch-result: the stream is live but covers nothing until the root's
+/// kernel watch arms, and the public contract dates delivery from the grant.
+struct DeferredGrant {
+  pending: PendingWatch,
+  /// The final canonical root (what the grant hands the caller).
+  root: PathBuf,
+}
+
+/// Commits one successful registration: hands the caller the armed-to-unwind
+/// grant. `false` means the watch() future was already gone — the caller
+/// unwinds the scope.
+fn commit_grant(
+  pending: PendingWatch,
+  scope: ScopeId,
+  root: PathBuf,
+  unwind_tx: &async_channel::Sender<ScopeId>,
+) -> bool {
+  let grant = WatchGrant::new(scope, root, unwind_tx.clone());
+  match pending.reply.send(Ok(grant)) {
+    Ok(()) => true,
+    Err(payload) => {
+      // The receiver is already gone; unwind synchronously rather than
+      // through the grant's Drop.
+      if let Ok(grant) = payload {
+        grant.defuse();
+      }
+      false
+    }
+  }
+}
+
+/// Lowers a failed ROOT arm to the registration vocabulary: the caller asked
+/// to watch a directory that was validated at spawn, so an arm failure is a
+/// race (the object vanished) or an environment limit.
+fn arm_grant_error(err: WatchError, requested: PathBuf, root: PathBuf) -> WatchRootError {
+  match err {
+    WatchError::NotFound | WatchError::Gone => WatchRootError::NotFound { path: requested },
+    err => WatchRootError::Source(SourceError::RootUnavailable {
+      root,
+      source: std::io::Error::other(format!(
+        "the root watch could not be armed ({})",
+        err.as_str()
+      )),
+    }),
+  }
 }
 
 /// The successful payload of a watch reply: ownership of the just-spawned
@@ -246,13 +294,32 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// returning the mount prefixes and whether the read was authoritative.
   fn refresh_mounts(&self, root: &Path) -> (Vec<PathBuf>, bool);
 
+  /// Attaches the arm/disarm port of `scope`'s freshly spawned source, so the
+  /// descending executors can route to its reader. A no-op for executors
+  /// (fakes) that answer arms themselves.
+  fn attach_scope(&self, scope: ScopeId, port: ScopePort) {
+    let _ = (scope, port);
+  }
+
+  /// Detaches `scope`'s port (and any transient state keyed under it) at
+  /// stream teardown.
+  fn detach_scope(&self, scope: ScopeId) {
+    let _ = scope;
+  }
+
   /// Installs a per-directory kernel watch for `watch` at `path` (blocking).
   /// Reached only under a descending profile.
-  fn add_watch(&self, watch: WatchId, parent: WatchId, path: &Path, name: &Segment)
-  -> WatchOutcome;
+  fn add_watch(
+    &self,
+    scope: ScopeId,
+    watch: WatchId,
+    parent: WatchId,
+    path: &Path,
+    name: &Segment,
+  ) -> WatchOutcome;
 
   /// Removes a per-directory kernel watch (blocking, fire-and-forget).
-  fn remove_watch(&self, watch: WatchId);
+  fn remove_watch(&self, scope: ScopeId, watch: WatchId);
 
   /// Reads one directory — entries with their stat facts (blocking). Reached
   /// only under a descending profile; `watch` addresses the directory object
@@ -264,11 +331,22 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 pub(crate) trait SourceControl: Send + 'static {
   /// Quiesces and destroys the stream (blocking, bounded).
   fn shutdown(self);
+
+  /// The clonable arm/disarm port of this source, `Inert` when the backend
+  /// carries no arm traffic (kernel-recursive sources, fakes).
+  fn scope_port(&self) -> ScopePort {
+    ScopePort::Inert
+  }
 }
 
 impl SourceControl for SourceHandle {
   fn shutdown(self) {
     SourceHandle::shutdown(self);
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn scope_port(&self) -> ScopePort {
+    ScopePort::Inotify(self.port())
   }
 }
 
@@ -317,8 +395,27 @@ fn ino_of(_meta: &std::fs::Metadata) -> u64 {
 }
 
 /// The real platform: `Source::spawn` + `lstat`.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RealFs;
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RealFs {
+  /// Per-scope arm/disarm ports of live descending sources, attached at
+  /// spawn success and detached at stream teardown. Kernel-recursive scopes
+  /// attach `Inert` and never route arm traffic.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  ports: std::sync::Arc<std::sync::RwLock<BTreeMap<ScopeId, ScopePort>>>,
+  /// Transient `O_PATH` anchors returned by arms (keyed by the globally
+  /// unique watch, valued with the owning scope for teardown reclamation),
+  /// held only until the watch's cold enumerate consumes them
+  /// (anchor-relative readdir), so fd usage stays O(in-flight operations) —
+  /// never O(tree).
+  #[cfg(all(target_os = "linux", not(miri)))]
+  anchors: std::sync::Arc<std::sync::Mutex<BTreeMap<WatchId, (ScopeId, std::os::fd::OwnedFd)>>>,
+}
+
+impl RealFs {
+  pub(crate) fn new() -> Self {
+    Self::default()
+  }
+}
 
 impl FsOps for RealFs {
   type Handle = SourceHandle;
@@ -363,13 +460,78 @@ impl FsOps for RealFs {
       None => (Vec::new(), false),
     }
   }
-  // The descending executors are wired by the Linux integration stage: they
-  // route through the live source's control path (the reader owns the fd and
-  // the wd table). No released platform reaches them before then — the
-  // FSEvents profile is kernel-recursive and emits neither effect — so the
-  // honest interim is a typed refusal, never a silent success.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn attach_scope(&self, scope: ScopeId, port: ScopePort) {
+    self.ports.write().unwrap().insert(scope, port);
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn detach_scope(&self, scope: ScopeId) {
+    self.ports.write().unwrap().remove(&scope);
+    // In-flight transient anchors of the dead scope close here; their
+    // enumerates (if any still land) fall back to path-based listing.
+    self
+      .anchors
+      .lock()
+      .unwrap()
+      .retain(|_, (anchor_scope, _)| *anchor_scope != scope);
+  }
+
+  // Arm/disarm route through the live source's control path (the reader owns
+  // the fd and the wd table). A scope with no attached port — a
+  // kernel-recursive source, or an arm racing its own stream teardown —
+  // answers the honest typed refusal, never a silent success.
+  #[cfg(all(target_os = "linux", not(miri)))]
   fn add_watch(
     &self,
+    scope: ScopeId,
+    watch: WatchId,
+    parent: WatchId,
+    path: &Path,
+    name: &Segment,
+  ) -> WatchOutcome {
+    let _ = name;
+    let Some(ScopePort::Inotify(port)) = self.ports.read().unwrap().get(&scope).cloned() else {
+      return WatchOutcome::Failed(WatchError::Gone);
+    };
+    // Prefer the parent's still-held transient anchor (object-correct even
+    // across a parent rename); a consumed anchor falls back to the absolute
+    // path with ENOENT honesty — the Monitor's NotFound path re-arms. The
+    // root is its own parent, and `openat(anchor, name)` cannot re-open the
+    // anchor itself — the root always arms by absolute path.
+    let parent_anchor = if parent == watch {
+      None
+    } else {
+      self
+        .anchors
+        .lock()
+        .unwrap()
+        .get(&parent)
+        .and_then(|(_, fd)| fd.try_clone().ok())
+    };
+    let request = match parent_anchor {
+      Some(fd) => crate::os::linux::AnchorRequest {
+        watch,
+        parent: Some(fd),
+        name: std::ffi::OsString::from(name.as_str()),
+      },
+      None => crate::os::linux::AnchorRequest {
+        watch,
+        parent: None,
+        name: path.as_os_str().to_os_string(),
+      },
+    };
+    let reply = port.add_watch(request);
+    if let Some(anchor) = reply.anchor {
+      self.anchors.lock().unwrap().insert(watch, (scope, anchor));
+    }
+    reply.outcome
+  }
+
+  #[cfg(not(all(target_os = "linux", not(miri))))]
+  fn add_watch(
+    &self,
+    _scope: ScopeId,
     _watch: WatchId,
     _parent: WatchId,
     _path: &Path,
@@ -378,36 +540,66 @@ impl FsOps for RealFs {
     WatchOutcome::Failed(WatchError::Io)
   }
 
-  fn remove_watch(&self, _watch: WatchId) {}
-
-  fn enumerate(&self, _watch: WatchId, path: &Path) -> RawEnumerate {
-    let dir = match std::fs::read_dir(path) {
-      Ok(dir) => dir,
-      Err(err) => return RawEnumerate::Failed(io_class(&err)),
-    };
-    let mut entries = Vec::new();
-    let mut complete = true;
-    for entry in dir {
-      let Ok(entry) = entry else {
-        // The read was cut short mid-directory; what was seen still
-        // reconciles, and the incomplete flag drives the Monitor's retry.
-        complete = false;
-        break;
-      };
-      let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-        // A raced-away entry: the listing no longer reflects one name.
-        complete = false;
-        continue;
-      };
-      entries.push(RawDirEntry {
-        name: entry.file_name().as_encoded_bytes().to_vec(),
-        kind: kind_of(&meta.file_type()),
-        dev: dev_of(&meta),
-        ino: ino_of(&meta),
-      });
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn remove_watch(&self, scope: ScopeId, watch: WatchId) {
+    self.anchors.lock().unwrap().remove(&watch);
+    if let Some(ScopePort::Inotify(port)) = self.ports.read().unwrap().get(&scope).cloned() {
+      port.remove_watch(watch);
     }
-    RawEnumerate::Listed { entries, complete }
   }
+
+  #[cfg(not(all(target_os = "linux", not(miri))))]
+  fn remove_watch(&self, _scope: ScopeId, _watch: WatchId) {}
+
+  fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {
+    // Consume the watch's transient anchor when one is still held: the
+    // listing then reads THROUGH the armed object (/proc re-opens an O_PATH
+    // fd), immune to a rename between the arm and this read. The anchor
+    // closes on scope exit either way — fd usage stays O(in-flight).
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+      use std::os::fd::AsRawFd;
+      let anchor = self.anchors.lock().unwrap().remove(&watch);
+      if let Some((_, anchor)) = anchor {
+        let via = PathBuf::from(format!("/proc/self/fd/{}", anchor.as_raw_fd()));
+        let listed = list_dir(&via);
+        drop(anchor);
+        return listed;
+      }
+    }
+    let _ = watch;
+    list_dir(path)
+  }
+}
+
+/// One blocking readdir + per-entry lstat, lowered to raw stat facts.
+fn list_dir(path: &Path) -> RawEnumerate {
+  let dir = match std::fs::read_dir(path) {
+    Ok(dir) => dir,
+    Err(err) => return RawEnumerate::Failed(io_class(&err)),
+  };
+  let mut entries = Vec::new();
+  let mut complete = true;
+  for entry in dir {
+    let Ok(entry) = entry else {
+      // The read was cut short mid-directory; what was seen still
+      // reconciles, and the incomplete flag drives the Monitor's retry.
+      complete = false;
+      break;
+    };
+    let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+      // A raced-away entry: the listing no longer reflects one name.
+      complete = false;
+      continue;
+    };
+    entries.push(RawDirEntry {
+      name: entry.file_name().as_encoded_bytes().to_vec(),
+      kind: kind_of(&meta.file_type()),
+      dev: dev_of(&meta),
+      ino: ino_of(&meta),
+    });
+  }
+  RawEnumerate::Listed { entries, complete }
 }
 
 fn inode_of(meta: &std::fs::Metadata) -> (Option<std::num::NonZeroU64>, u64) {
@@ -490,6 +682,12 @@ pub(crate) async fn run<R, F>(
   let mut pending_spawns: BTreeSet<ScopeId> = BTreeSet::new();
   let mut pending_teardowns: BTreeSet<ScopeId> = BTreeSet::new();
   let mut watch_replies: BTreeMap<ScopeId, PendingWatch> = BTreeMap::new();
+  // Descending-profile grants held between spawn success and the ROOT's
+  // watch-result: the spawned source starts with no watches, so "live" — the
+  // moment the public contract starts promising delivery — is the root arm,
+  // not the fd. A grant here resolves at `WatchInstalled`, at stream
+  // teardown (the scope died first), or by dropping at close (`Closed`).
+  let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
   let mut unwatch_replies: BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>> =
     BTreeMap::new();
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
@@ -508,6 +706,7 @@ pub(crate) async fn run<R, F>(
       &mut pending_teardowns,
       &events,
       &mut unwatch_replies,
+      &mut deferred_grants,
       &registry,
       &now,
     );
@@ -587,6 +786,10 @@ pub(crate) async fn run<R, F>(
                 }
               } else {
                 core.on_stream_spawned(scope, Ok(spawned.meta));
+                // The arm/disarm port attaches before any effect of this
+                // spawn can execute, so a descending root's first AddWatch
+                // always finds its scope routed.
+                ops.attach_scope(scope, spawned.handle.scope_port());
                 handles.insert(scope, spawned.handle);
                 os.push(
                   spawned
@@ -603,29 +806,38 @@ pub(crate) async fn run<R, F>(
                 // scope dying before the caller polls its grant simply yields
                 // a dead-on-arrival handle.
                 registry.scope_live(scope, &canonical_root, identity, &ancestors);
-                let owned = match pending {
-                  Some(pending) => {
-                    let grant = WatchGrant::new(scope, canonical_root, unwind_tx.clone());
-                    match pending.reply.send(Ok(grant)) {
-                      Ok(()) => true,
-                      Err(payload) => {
-                        // The receiver is already gone; unwind synchronously
-                        // rather than through the grant's Drop.
-                        if let Ok(grant) = payload {
-                          grant.defuse();
-                        }
-                        false
-                      }
+                match config.profile {
+                  // Descending: the stream is live but covers NOTHING until
+                  // the root's kernel watch arms; the grant defers to the
+                  // root's watch-result so the public "from resolve, every
+                  // change is delivered" bracket holds.
+                  BackendKind::Inotify => {
+                    if let Some(pending) = pending {
+                      deferred_grants.insert(scope, DeferredGrant {
+                        pending,
+                        root: canonical_root,
+                      });
+                    } else {
+                      // The watch() future was already cancelled: immediate
+                      // unwatch, exactly like a refused inline grant.
+                      core.on_unwatch(scope);
                     }
                   }
-                  None => false,
-                };
-                if !owned {
-                  // The watch() future was cancelled before the reply could
-                  // hand ownership over: tear the just-spawned stream down as
-                  // an immediate unwatch. (Cancellation AFTER a successful
-                  // send is the grant's unwind.)
-                  core.on_unwatch(scope);
+                  BackendKind::FsEvents => {
+                    let owned = match pending {
+                      Some(pending) => {
+                        commit_grant(pending, scope, canonical_root, &unwind_tx)
+                      }
+                      None => false,
+                    };
+                    if !owned {
+                      // The watch() future was cancelled before the reply
+                      // could hand ownership over: tear the just-spawned
+                      // stream down as an immediate unwatch. (Cancellation
+                      // AFTER a successful send is the grant's unwind.)
+                      core.on_unwatch(scope);
+                    }
+                  }
                 }
               }
             }
@@ -652,6 +864,28 @@ pub(crate) async fn run<R, F>(
             authoritative,
           } => core.on_mounts_refreshed(scope, mounts, authoritative),
           OpResult::WatchInstalled { watch, outcome } => {
+          // A deferred registration grant riding on this arm resolves FIRST,
+          // so a failed root arm answers the caller before the core's
+          // teardown effects run (which would otherwise answer it again). A
+          // deferred scope has no children yet (nothing enumerates before
+          // the root is live), so any arm landing on it IS the root's.
+          let deferred_scope = core
+            .scope_of_watch(watch)
+            .filter(|scope| deferred_grants.contains_key(scope));
+          if let Some(scope) = deferred_scope {
+            let DeferredGrant { pending, root } =
+              deferred_grants.remove(&scope).expect("scope found above");
+            match outcome {
+              WatchOutcome::Installed(_) | WatchOutcome::Aliased(_) => {
+                if !commit_grant(pending, scope, root, &unwind_tx) {
+                  core.on_unwatch(scope);
+                }
+              }
+              WatchOutcome::Failed(err) => {
+                let _ = pending.reply.send(Err(arm_grant_error(err, pending.requested, root)));
+              }
+            }
+          }
           core.on_watch_installed(watch, outcome);
         }
         OpResult::Enumerated { req, raw } => {
@@ -788,6 +1022,7 @@ pub(crate) async fn run<R, F>(
     &mut pending_teardowns,
     &events,
     &mut unwatch_replies,
+    &mut deferred_grants,
     &registry,
     &now,
   );
@@ -808,6 +1043,7 @@ fn execute_effects<R, F>(
   pending_teardowns: &mut BTreeSet<ScopeId>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
+  deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
 ) where
@@ -832,8 +1068,20 @@ fn execute_effects<R, F>(
       Effect::TeardownStream { scope } => {
         // Every scope end — explicit unwatch, root death, stream fatal —
         // funnels through this effect: reclaim the registry entry, so a dead
-        // root stops participating in liveness checks immediately.
+        // root stops participating in liveness checks immediately. The arm
+        // port detaches with it (late arms answer the typed refusal), and a
+        // registration still waiting on its root arm resolves as a failure
+        // (the scope died before coverage ever started).
         registry.scope_dead(scope);
+        ops.detach_scope(scope);
+        if let Some(DeferredGrant { pending, root }) = deferred_grants.remove(&scope) {
+          let _ = pending
+            .reply
+            .send(Err(WatchRootError::Source(SourceError::RootUnavailable {
+              root,
+              source: std::io::Error::other("the source died before the root watch armed"),
+            })));
+        }
         if let Some(handle) = handles.remove(&scope) {
           pending_teardowns.insert(scope);
           let tx = op_tx.clone();
@@ -847,6 +1095,7 @@ fn execute_effects<R, F>(
         }
       }
       Effect::AddWatch {
+        scope,
         watch,
         parent,
         name,
@@ -860,16 +1109,16 @@ fn execute_effects<R, F>(
         let ops = ops.clone();
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {
-          let outcome = ops.add_watch(watch, parent, &path, &name);
+          let outcome = ops.add_watch(scope, watch, parent, &path, &name);
           let _ = tx.try_send(OpResult::WatchInstalled { watch, outcome });
         });
       }
-      Effect::RemoveWatch { watch } => {
+      Effect::RemoveWatch { scope, watch } => {
         // Fire-and-forget by contract; droppable at close for the same
         // fd-reclamation reason as AddWatch.
         let ops = ops.clone();
         R::spawn_blocking_detach(move || {
-          ops.remove_watch(watch);
+          ops.remove_watch(scope, watch);
         });
       }
       Effect::Enumerate { req, watch, path } => {

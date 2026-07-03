@@ -48,6 +48,21 @@ pub(crate) enum BackendKind {
   Inotify,
 }
 
+/// The clonable arm/disarm port of one scope's live source, extracted at
+/// spawn time so the blocking-pool executors can reach the reader without
+/// holding the (teardown-owning) handle. Kernel-recursive backends have no
+/// arm traffic and report [`Inert`](Self::Inert); a descending executor
+/// meeting `Inert` answers a typed failure — the honest impossible-arm
+/// outcome — never a silent success.
+#[derive(Debug, Clone)]
+pub(crate) enum ScopePort {
+  /// A live inotify reader's control port.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  Inotify(linux::ControlPort),
+  /// No arm traffic is possible (kernel-recursive source, or a fake).
+  Inert,
+}
+
 /// The ONE seam payload every source reports: each backend wraps its own
 /// decode into this at forward time, so the queue, the driver, and the core
 /// name a single event type on every platform — and the hermetic suites can

@@ -225,9 +225,13 @@ fn arm(fd: &OwnedFd, table: &mut WdTable, request: AnchorRequest) -> ArmReply {
   };
 
   let proc_path = format!("/proc/self/fd/{}\0", anchor.as_raw_fd());
+  // The /proc entry is itself a symlink to the anchored object, so the add
+  // must follow exactly that one link. Symlink safety is already enforced —
+  // `open_anchor` opened with `O_NOFOLLOW|O_DIRECTORY`, so the object behind
+  // the anchor is a real directory, never a link.
+  let mask = WATCH_MASK & !decode::IN_DONT_FOLLOW;
   // SAFETY: proc_path is NUL-terminated; the fd is the reader's own instance.
-  let wd =
-    unsafe { libc::inotify_add_watch(fd.as_raw_fd(), proc_path.as_ptr().cast(), WATCH_MASK) };
+  let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), proc_path.as_ptr().cast(), mask) };
   if wd >= 0 {
     table.register(wd, request.watch);
     return ArmReply {
@@ -246,7 +250,7 @@ fn arm(fd: &OwnedFd, table: &mut WdTable, request: AnchorRequest) -> ArmReply {
       libc::inotify_add_watch(
         fd.as_raw_fd(),
         proc_path.as_ptr().cast(),
-        WATCH_MASK & !decode::IN_MASK_CREATE,
+        mask & !decode::IN_MASK_CREATE,
       )
     };
     if wd >= 0 {

@@ -1251,9 +1251,14 @@ mod descending {
   async fn close_with_in_flight_arm_is_quiescent() {
     let rig = inotify_rig();
     rig.fs.put("/r/sub", FileKind::Dir, 11);
-    let hold = rig.fs.hold_arms();
+    // The ROOT arm must complete — registration resolves on it — so gate the
+    // cold listing instead, and only then gate arms: the child arm the
+    // released listing queues is the one that parks.
+    let enum_hold = rig.fs.hold_enumerates();
     let _scope = watch(&rig, "/r").await;
-    // Wait until the cold listing queued the child arm (now parked).
+    let hold = rig.fs.hold_arms();
+    enum_hold.release();
+    // Wait until the cold listing landed (the child arm it queued is parked).
     settle(|| !rig.fs.enumerates().is_empty()).await;
     let (reply, on_reply) = futures_channel::oneshot::channel();
     rig.commands.send(Command::Close { reply }).await.unwrap();

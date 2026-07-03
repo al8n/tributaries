@@ -109,6 +109,8 @@ pub(crate) enum Effect {
   /// reporting the outcome through
   /// [`on_watch_installed`](DriverCore::on_watch_installed).
   AddWatch {
+    /// The scope whose live source executes the arm.
+    scope: ScopeId,
     /// The Monitor watch being armed.
     watch: WatchId,
     /// The already-armed parent watch (its anchor roots the open).
@@ -123,6 +125,8 @@ pub(crate) enum Effect {
   /// forget: the Monitor's unwatch carries no result contract, and a wd the
   /// removal never reached is reclaimed when the scope's stream closes.
   RemoveWatch {
+    /// The scope whose live source executes the disarm.
+    scope: ScopeId,
     /// The Monitor watch being disarmed.
     watch: WatchId,
   },
@@ -463,9 +467,10 @@ impl DriverCore {
           profile_of(meta.backend) == state.profile,
           "the spawned backend must match the registered profile"
         );
+        let backend = meta.backend;
         let root = Arc::new(meta.root);
         self.watch_paths.insert(watch, Arc::clone(&root));
-        state.root = Some(root);
+        state.root = Some(Arc::clone(&root));
         state.root_dev = Some(meta.root_dev);
         state.mounts = meta.mounts;
         // Born closed: the seed was read before the stream started, so a
@@ -475,7 +480,29 @@ impl DriverCore {
         // every later mount transition; until it installs, event-side
         // identity and cookies fail closed (the non-authoritative default).
         Self::arm_refresh(&mut self.effects, scope, state);
-        self.monitor.on_watch_result(watch, Ok(()));
+        match backend {
+          // Kernel-recursive: the live stream IS the root's coverage, so the
+          // spawn doubles as the root's watch-result.
+          BackendKind::FsEvents => self.monitor.on_watch_result(watch, Ok(())),
+          // Descending: the source starts with NO watches (nothing may be
+          // delivered before the Monitor's own watch flow runs), so the
+          // root's kernel watch is armed through the same effect path as
+          // every descendant — its watch-result arrives via
+          // [`on_watch_installed`](Self::on_watch_installed).
+          BackendKind::Inotify => {
+            let name = root
+              .file_name()
+              .and_then(|name| name.to_str())
+              .unwrap_or("/");
+            self.effects.push_back(Effect::AddWatch {
+              scope,
+              watch,
+              parent: watch,
+              name: Segment::new(name),
+              path: root,
+            });
+          }
+        }
       }
       Err(err) => {
         self.monitor.on_watch_result(watch, Err(watch_error(&err)));
@@ -502,6 +529,13 @@ impl DriverCore {
   /// the wd table fans the shared kernel watch's events out to every anchor,
   /// so the anchor's coverage is real — the Monitor proceeds to its cold
   /// enumerate and the inventory is correct.
+  /// The scope a watch belongs to, while the watch is tracked. The driver
+  /// uses this to route a root arm's outcome to its deferred registration
+  /// grant.
+  pub(crate) fn scope_of_watch(&self, watch: WatchId) -> Option<ScopeId> {
+    self.watch_scopes.get(&watch).copied()
+  }
+
   pub(crate) fn on_watch_installed(&mut self, watch: WatchId, outcome: WatchOutcome) {
     let res = match outcome {
       WatchOutcome::Installed(_) | WatchOutcome::Aliased(_) => Ok(()),
@@ -1332,6 +1366,7 @@ impl DriverCore {
             self.watch_scopes.insert(cmd.id(), scope);
             self.watch_paths.insert(cmd.id(), Arc::clone(&path));
             self.effects.push_back(Effect::AddWatch {
+              scope,
               watch: cmd.id(),
               parent,
               name,
@@ -1349,9 +1384,11 @@ impl DriverCore {
             // A per-directory child watch the Monitor dropped: disarm it and
             // forget its addressing. Fire-and-forget — the unwatch carries no
             // result contract, and an unreached wd dies with the stream.
-            self.watch_scopes.remove(&watch);
+            let scope = self.watch_scopes.remove(&watch);
             self.watch_paths.remove(&watch);
-            self.effects.push_back(Effect::RemoveWatch { watch });
+            if let Some(scope) = scope {
+              self.effects.push_back(Effect::RemoveWatch { scope, watch });
+            }
             continue;
           }
           if let Some(scope) = self.watch_scopes.remove(&watch) {

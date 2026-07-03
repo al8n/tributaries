@@ -160,6 +160,36 @@ jobs:
     - name: Run test
       run: cargo hack test --feature-powerset --exclude-no-default-features
 
+  linux-integration:
+    name: linux-integration
+    runs-on: ubuntu-latest
+    # Real-inotify convergence suites; a wedged kernel queue must fail the
+    # job, not idle out the runner.
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v7
+    - name: Cache cargo build and registry
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-linux-integration-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-linux-integration-
+    - name: Install Rust
+      run: rustup update stable --no-self-update && rustup default stable
+    - name: Integration (unprivileged)
+      # The privileged cells self-probe and skip loudly here. Single-threaded
+      # by the suite's contract (the sysctl cells shrink namespace-global
+      # inotify limits).
+      run: cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1
+    - name: Integration (privileged)
+      # sudo unlocks the sysctl overflow/watch-limit cells and the bind-mount
+      # aliasing cell; the tests snapshot and restore every knob they touch.
+      run: sudo -E env "PATH=$PATH" cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1
+
   sanitizer:
     name: sanitizer
     runs-on: ubuntu-latest
