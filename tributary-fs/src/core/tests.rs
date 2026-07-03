@@ -783,7 +783,7 @@ fn identity_minting_respects_devices_and_mounts() {
   let state = ScopeState {
     watch: WatchId::new(NonZeroU64::new(1).unwrap()),
     requested: PathBuf::from("/r"),
-    root: Some(PathBuf::from("/r")),
+    root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
     mounts: vec![PathBuf::from("/r/vol")],
     mounts_authoritative: true,
@@ -812,7 +812,7 @@ fn blind_mount_table_refuses_event_side_trust() {
   let state = ScopeState {
     watch: WatchId::new(NonZeroU64::new(1).unwrap()),
     requested: PathBuf::from("/r"),
-    root: Some(PathBuf::from("/r")),
+    root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
     mounts: Vec::new(),
     mounts_authoritative: false,
@@ -1748,4 +1748,110 @@ fn vanished_half_grant_requires_partner_evidence() {
     "no root-device evidence, no grant: {emitted:?}"
   );
   assert_eq!(core.poll_timeout(), None, "nothing waits on a cookie");
+}
+
+/// The path was replaced between the FSEvents callback and the lstat: the
+/// event carried inode 42 but the probe read 99. No cookie may bridge the two
+/// objects — the pair degrades and the stale view is covered by a located
+/// rescan, never a fabricated `Moved`.
+#[test]
+fn replaced_path_between_callback_and_probe_never_cookies() {
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![
+      ev(
+        "/r/a/old",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        10,
+        42,
+      ),
+      ev(
+        "/r/b/new",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        11,
+        42,
+      ),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2);
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(99),
+      dev: 1,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "a mismatched probe identity must never pair: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_removed() && c.location() == &loc(&["a", "old"])),
+    "the vanished half degrades to a removal: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_created() && c.location() == &loc(&["b", "new"])),
+    "the surviving half degrades to a creation: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_rescan() && c.location() == &loc(&["b", "new"])),
+    "the stale path view is covered by a located rescan: {emitted:?}"
+  );
+}
+
+/// Grant evidence derives from the probed inode, not the event word: a
+/// partner whose EVENT carried no fileID still evidences its probed inode,
+/// and that alone grants the vanished half's cookie.
+#[test]
+fn vanished_half_grant_keys_on_probed_inode() {
+  let (mut core, scope) = live_core();
+  core.on_batch(
+    scope,
+    vec![
+      ev(
+        "/r/a/gone",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        10,
+        42,
+      ),
+      ev(
+        "/r/b/kept",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        11,
+        0,
+      ),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2);
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(emitted.len(), 1, "{emitted:?}");
+  assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "gone"])));
+  assert_eq!(emitted[0].location(), &loc(&["b", "kept"]));
 }
