@@ -273,9 +273,17 @@ fn same_batch_rename_pair_grounds_by_probes_into_single_moved() {
   );
   let effects = drain(&mut core);
   let emitted = emits(&effects);
-  assert_eq!(emitted.len(), 1, "{effects:?}");
+  assert_eq!(emitted.len(), 2, "{effects:?}");
   assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "old"])));
   assert_eq!(emitted[0].location(), &loc(&["b", "new"]));
+  // FSEvents has no rename token, so an evidence-granted pair always wears
+  // its covering rescan (here at the halves' deepest common ancestor — the
+  // root): a same-batch inode reuse that satisfied every proof would
+  // mis-pair, and the cover is what keeps that recoverable.
+  assert!(
+    emitted[1].kind().is_rescan() && emitted[1].location() == &loc(&[]),
+    "{emitted:?}"
+  );
   assert_eq!(core.poll_timeout(), None, "pairing consumed both halves");
 }
 
@@ -642,32 +650,6 @@ fn source_fatal_invalidates_the_root() {
     effects
       .iter()
       .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
-  );
-}
-
-#[test]
-fn spawn_failure_rescans_and_tears_down() {
-  let mut core = DriverCore::new(WINDOW);
-  let scope = core.on_watch(PathBuf::from("/gone"), Interest::all());
-  let _ = drain(&mut core);
-  core.on_stream_spawned(
-    scope,
-    Err(SourceError::RootUnavailable {
-      root: PathBuf::from("/gone"),
-      source: std::io::Error::from(std::io::ErrorKind::NotFound),
-    }),
-  );
-  let effects = drain(&mut core);
-  let emitted = emits(&effects);
-  assert_eq!(emitted.len(), 1);
-  assert!(
-    emitted[0].kind().is_rescan(),
-    "a refused install is never silent"
-  );
-  assert!(
-    effects
-      .iter()
-      .any(|e| matches!(e, Effect::TeardownStream { .. })),
   );
 }
 
@@ -1676,12 +1658,16 @@ fn loss_revokes_mount_trust_and_requests_one_refresh() {
     "still closed until a current refresh installs"
   );
 
-  // A current refresh restores authority; pairing resumes.
+  // A current refresh restores authority; pairing resumes (the granted pair
+  // carries its covering rescan alongside the Moved).
   core.on_mounts_refreshed(scope, Vec::new(), true);
   assert_eq!(refresh_requests(&drain(&mut core)), 0);
   let emitted = feed_pair(&mut core, scope, (40, 41), 44);
-  assert_eq!(emitted.len(), 1, "{emitted:?}");
   assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "old"])));
+  assert!(
+    emitted.iter().any(|c| c.kind().is_rescan()),
+    "the granted pair wears its cover: {emitted:?}"
+  );
 }
 
 #[test]
@@ -1952,11 +1938,13 @@ fn replaced_path_between_callback_and_probe_never_cookies() {
   );
 }
 
-/// Grant evidence derives from the probed inode, not the event word: a
-/// partner whose EVENT carried no fileID still evidences its probed inode,
-/// and that alone grants the vanished half's cookie.
+/// A probe-only fileID establishes NO grant evidence: the probe proves what
+/// occupies the path NOW, not which object the batch's events were about, so
+/// a partner whose EVENT word carried no fileID cannot vouch for a vanished
+/// half. The pair degrades to a removal plus a creation — never a `Moved`
+/// bridging two unproven objects.
 #[test]
-fn vanished_half_grant_keys_on_probed_inode() {
+fn probe_only_fileid_establishes_no_grant_evidence() {
   let (mut core, scope) = live_core();
   core.on_batch_events(
     scope,
@@ -1990,9 +1978,118 @@ fn vanished_half_grant_keys_on_probed_inode() {
   );
   let effects = drain(&mut core);
   let emitted = emits(&effects);
-  assert_eq!(emitted.len(), 1, "{emitted:?}");
-  assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "gone"])));
-  assert_eq!(emitted[0].location(), &loc(&["b", "kept"]));
+  assert!(
+    emitted.iter().all(|c| c.kind().moved_from().is_none()),
+    "a probe-only fileID must not vouch for a vanished partner: {emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_removed() && c.location() == &loc(&["a", "gone"])),
+    "{emitted:?}"
+  );
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_created() && c.location() == &loc(&["b", "kept"])),
+    "{emitted:?}"
+  );
+  assert_eq!(core.poll_timeout(), None, "no grant, no pairing window");
+}
+
+/// The grant's honest residual, pinned: an inode recycled WITHIN one batch
+/// satisfies every proof the machinery can demand (FSEvents supplies no
+/// rename token), so the mis-pair itself cannot be prevented event-side —
+/// but it is never silent: the granted pair's covering rescan lands at the
+/// halves' deepest common ancestor and re-grounds whatever really happened.
+#[test]
+fn fileid_reuse_within_batch_is_covered() {
+  let (mut core, scope) = live_core();
+  core.on_batch_events(
+    scope,
+    vec![
+      ev(
+        "/r/a/gone",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        10,
+        42,
+      ),
+      ev(
+        "/r/a/sub/unrelated",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        11,
+        42,
+      ),
+    ],
+    at(1),
+  );
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 2);
+  core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+  core.on_probe_result(
+    reqs[1].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert!(
+    emitted
+      .iter()
+      .any(|c| c.kind().is_rescan() && c.location() == &loc(&["a"])),
+    "whatever the reuse paired into is covered at the deepest common \
+     ancestor: {emitted:?}"
+  );
+}
+
+/// A spawn failure never surfaces publicly: the caller got Err instead of a
+/// handle, so the Monitor's internal failure rescan for the root must not be
+/// delivered — not even through the dying retry.
+#[test]
+fn spawn_failure_emits_nothing_public() {
+  let mut core = DriverCore::new(WINDOW);
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let _ = drain(&mut core);
+  core.on_stream_spawned(scope, Err(SourceError::StartFailed));
+  let effects = drain(&mut core);
+  assert!(
+    emits(&effects).is_empty(),
+    "a never-live scope owes no public coverage: {effects:?}"
+  );
+  assert!(
+    effects
+      .iter()
+      .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+    "{effects:?}"
+  );
+  assert_eq!(core.poll_timeout(), None, "no dying delivery waits");
+  core.on_timeout(at(10_000));
+  assert!(
+    emits(&drain(&mut core)).is_empty(),
+    "nothing to retry for a never-live scope"
+  );
+}
+
+/// The final-root rejection path is equally silent — the same never-live
+/// fence covers a scope the driver refused before it went live.
+#[test]
+fn spawn_rejection_emits_nothing_public() {
+  let mut core = DriverCore::new(WINDOW);
+  let scope = core.on_watch(PathBuf::from("/r"), Interest::all());
+  let _ = drain(&mut core);
+  core.on_spawn_rejected(scope);
+  let effects = drain(&mut core);
+  assert!(
+    emits(&effects).is_empty(),
+    "a rejected scope owes no public coverage: {effects:?}"
+  );
+  assert_eq!(core.poll_timeout(), None);
+  core.on_timeout(at(10_000));
+  assert!(emits(&drain(&mut core)).is_empty());
 }
 
 mod lowering {

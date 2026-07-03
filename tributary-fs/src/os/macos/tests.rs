@@ -165,6 +165,17 @@ fn spawn_rejects_bad_configurations() {
     .unwrap_err();
   assert!(matches!(err, SourceError::RootUnavailable { .. }));
 
+  // The pre-start barrier rechecks the FINAL root's kind: a regular file —
+  // however the caller's own check was raced — must never get a stream.
+  let kind_dir = unique_dir("kind");
+  let plain = kind_dir.join("plain.txt");
+  fs::write(&plain, b"x").expect("write file");
+  let err = Source::spawn(SourceConfig::new(vec![plain]))
+    .map(|_| ())
+    .unwrap_err();
+  assert!(matches!(err, SourceError::NotADirectory { .. }));
+  fs::remove_dir_all(&kind_dir).ok();
+
   let dir = unique_dir("config");
   let mut config = SourceConfig::new(vec![dir.clone()]);
   config.exclusions = (0..9).map(|i| dir.join(format!("x{i}"))).collect();
