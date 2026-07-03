@@ -2601,8 +2601,10 @@ mod descending {
     }
   }
 
-  /// Registration under the descending profile spawns the stream, and the
-  /// spawn result cold-enumerates the root — the dormant vocabulary is live.
+  /// Registration under the descending profile spawns the stream; the spawn
+  /// result arms the ROOT through the same effect path as every descendant
+  /// (the source starts with no watches), and the arm's success
+  /// cold-enumerates the root — the dormant vocabulary is live.
   fn live_descending() -> (DriverCore, ScopeId, ReqId, WatchId) {
     let mut core = DriverCore::new(WINDOW);
     let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
@@ -2623,6 +2625,20 @@ mod descending {
       }),
     );
     let effects = drain(&mut core);
+    let root_watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if path.as_path() == Path::new("/r") && watch == parent => Some(*watch),
+        _ => None,
+      })
+      .expect("the spawned descending root arms through the effect path");
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    let effects = drain(&mut core);
     let (req, watch) = effects
       .iter()
       .find_map(|e| match e {
@@ -2632,6 +2648,7 @@ mod descending {
         _ => None,
       })
       .expect("a descending root cold-enumerates after arming");
+    assert_eq!(watch, root_watch, "the enumerate reads the armed root");
     core.on_mounts_refreshed(scope, Vec::new(), true);
     let _ = drain(&mut core);
     (core, scope, req, watch)
@@ -2882,7 +2899,7 @@ mod descending {
     assert!(
       effects
         .iter()
-        .any(|e| matches!(e, Effect::RemoveWatch { watch } if *watch == add)),
+        .any(|e| matches!(e, Effect::RemoveWatch { watch, .. } if *watch == add)),
       "the kernel teardown disarms the dropped child: {effects:?}"
     );
   }

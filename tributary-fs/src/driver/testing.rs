@@ -638,6 +638,7 @@ impl FsOps for FakeFs {
 
   fn add_watch(
     &self,
+    _scope: ScopeId,
     watch: WatchId,
     _parent: WatchId,
     path: &Path,
@@ -660,7 +661,7 @@ impl FsOps for FakeFs {
     WatchOutcome::Installed(wd)
   }
 
-  fn remove_watch(&self, watch: WatchId) {
+  fn remove_watch(&self, _scope: ScopeId, watch: WatchId) {
     self.state.disarms.lock().unwrap().push(watch);
   }
 

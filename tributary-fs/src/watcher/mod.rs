@@ -313,7 +313,7 @@ impl<R: RuntimeLite> Watcher<R> {
       exclusions: options.exclusions_slice().to_vec(),
       profile: DriverConfig::platform_profile(),
     };
-    Self::spawn_with(options, config, RealFs)
+    Self::spawn_with(options, config, RealFs::new())
   }
 
   /// Builds the watcher around `ops` — the seam the hermetic lifecycle tests
@@ -353,7 +353,11 @@ impl<R: RuntimeLite> Watcher<R> {
       move_window: options.move_window(),
       os_batch_capacity: options.os_batch_capacity(),
       exclusions: options.exclusions_slice().to_vec(),
-      profile: DriverConfig::platform_profile(),
+      // The hermetic lifecycle suites drive the backend-agnostic scope
+      // machinery over the KR profile with FSEvents-shaped payloads,
+      // regardless of host — the descending profile has its own driver
+      // suites. Pinning here keeps them host-independent.
+      profile: crate::os::BackendKind::FsEvents,
     };
     Self::spawn_with(options, config, ops)
   }

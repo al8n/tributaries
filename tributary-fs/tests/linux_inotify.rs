@@ -1,0 +1,372 @@
+//! End-to-end integration through the public API against real inotify.
+//!
+//! Real-kernel timing is nondeterministic, so every assertion is
+//! convergence-style: wait (bounded) until the expected fact is observed;
+//! extra events — coalesced kinds, additional `Rescan`s — are always legal.
+//!
+//! The privileged cells (queue overflow, watch-limit exhaustion, bind-mount
+//! aliasing) self-probe and skip loudly without `CAP_SYS_ADMIN`; the
+//! `inotify-priv` suite of `ci/linux-verify.sh` (or `sudo -E` in CI) unlocks
+//! them.
+//!
+//! ALWAYS run this binary with `--test-threads=1` (the verify script and CI
+//! do): the sysctl cells shrink the user namespace's inotify limits, which
+//! would starve any event-flow test running concurrently.
+
+#![cfg(all(target_os = "linux", feature = "tokio"))]
+
+use std::{
+  path::{Path, PathBuf},
+  sync::atomic::{AtomicU32, Ordering},
+  time::Duration,
+};
+
+use tributary_fs::{Event, Interest, TokioWatcher, WatcherOptions};
+
+/// Generous ceiling for one expected observation; CI runners are slow.
+const DEADLINE: Duration = Duration::from_secs(20);
+
+/// A fresh scratch root under `TMPDIR` (the container mounts a tmpfs there,
+/// keeping every test on container-native paths), canonicalized so event
+/// paths and expectations share one byte form.
+fn scratch_root(tag: &str) -> PathBuf {
+  static COUNTER: AtomicU32 = AtomicU32::new(0);
+  let dir = std::env::temp_dir()
+    .canonicalize()
+    .expect("canonicalize temp dir")
+    .join(format!(
+      "tributary-fs-it-{}-{}-{}",
+      tag,
+      std::process::id(),
+      COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+  std::fs::create_dir_all(&dir).expect("create scratch root");
+  dir
+}
+
+fn watcher() -> TokioWatcher {
+  TokioWatcher::new(WatcherOptions::new()).expect("build watcher")
+}
+
+/// Waits until an event satisfying `pred` arrives, or the deadline lapses.
+async fn wait_for(
+  watcher: &mut TokioWatcher,
+  mut pred: impl FnMut(&Event) -> bool,
+) -> Option<Event> {
+  tokio::time::timeout(DEADLINE, async {
+    while let Some(event) = watcher.next().await {
+      if pred(&event) {
+        return Some(event);
+      }
+    }
+    None
+  })
+  .await
+  .ok()
+  .flatten()
+}
+
+/// An event "covers" a path when it names it directly or is a `Rescan` at the
+/// path or one of its ancestors (a rescan obliges re-enumeration below it).
+fn covers(event: &Event, path: &Path) -> bool {
+  if event.path() == path {
+    return true;
+  }
+  event.is_rescan() && path.starts_with(event.path())
+}
+
+/// Snapshot-and-set one `/proc/sys` knob; `None` = unwritable (unprivileged).
+fn sysctl_swap(knob: &str, value: &str) -> Option<String> {
+  let path = format!("/proc/sys/{knob}");
+  let old = std::fs::read_to_string(&path).ok()?.trim().to_string();
+  std::fs::write(&path, value).ok()?;
+  Some(old)
+}
+
+fn sysctl_restore(knob: &str, value: &str) {
+  let _ = std::fs::write(format!("/proc/sys/{knob}"), value);
+}
+
+/// Loud self-probe for the privileged cells.
+fn privileged_or_skip(cell: &str) -> bool {
+  match sysctl_swap("fs/inotify/max_queued_events", "16384") {
+    Some(old) => {
+      sysctl_restore("fs/inotify/max_queued_events", &old);
+      true
+    }
+    None => {
+      eprintln!("SKIP {cell}: needs CAP_SYS_ADMIN (run via linux-verify.sh inotify-priv)");
+      false
+    }
+  }
+}
+
+/// Suite 1 (§6.3): create/modify/remove churn converges through the
+/// descending profile — every mutated path ends covered. Both facts are
+/// collected in ONE pass over the stream (waiting twice would discard the
+/// events the second wait needs).
+#[tokio::test]
+async fn churn_converges() {
+  let root = scratch_root("churn");
+  let mut w = watcher();
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  std::fs::create_dir_all(root.join("a/b")).unwrap();
+  std::fs::write(root.join("a/b/one.txt"), b"1").unwrap();
+  std::fs::write(root.join("top.txt"), b"t").unwrap();
+  std::fs::remove_file(root.join("top.txt")).unwrap();
+
+  let deep = root.join("a/b/one.txt");
+  let top = root.join("top.txt");
+  let mut saw_deep = false;
+  let mut saw_top = false;
+  let _ = tokio::time::timeout(DEADLINE, async {
+    while let Some(event) = w.next().await {
+      saw_deep |= covers(&event, &deep);
+      saw_top |= covers(&event, &top);
+      if saw_deep && saw_top {
+        break;
+      }
+    }
+  })
+  .await;
+  assert!(saw_deep, "the deep create is observed after descent");
+  assert!(saw_top, "the top-level churn is observed");
+}
+
+/// Suite 2: native cookie pairing — a same-directory rename surfaces as one
+/// `Moved` (kernel cookies pair inside the Monitor's window; no settle logic
+/// exists driver-side).
+#[tokio::test]
+async fn rename_pairs_into_moved() {
+  let root = scratch_root("rename");
+  std::fs::write(root.join("old.txt"), b"x").unwrap();
+  let mut w = watcher();
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
+
+  let from = root.join("old.txt");
+  let to = root.join("new.txt");
+  let moved = wait_for(&mut w, |e| {
+    e.kind().moved().is_some_and(|m| m.from() == from) && e.path() == to
+  })
+  .await;
+  assert!(moved.is_some(), "the same-dir rename pairs into one Moved");
+
+  // Cross-directory pairing needs BOTH directories armed at rename time
+  // (the kernel reports each half on its own watched parent — an unarmed
+  // destination honestly degrades to Removed + the enumerate's Created).
+  // Prove `sub`'s watch is live first: an event for a file inside it can
+  // only arrive after the arm.
+  std::fs::create_dir(root.join("sub")).unwrap();
+  std::fs::write(root.join("sub/probe.txt"), b"p").unwrap();
+  let probe = root.join("sub/probe.txt");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &probe)).await.is_some(),
+    "the created directory arms and its content surfaces"
+  );
+
+  std::fs::rename(root.join("new.txt"), root.join("sub/into.txt")).unwrap();
+  let to2 = root.join("sub/into.txt");
+  assert!(
+    wait_for(&mut w, |e| e.kind().moved().is_some() && e.path() == to2)
+      .await
+      .is_some(),
+    "the cross-dir rename pairs into one Moved"
+  );
+}
+
+/// Suite 3: `IN_IGNORED` teardown — a kernel-removed watched directory
+/// resolves (`Removed` covered) and its siblings keep flowing.
+#[tokio::test]
+async fn kernel_teardown_resolves_and_siblings_flow() {
+  let root = scratch_root("ignored");
+  std::fs::create_dir(root.join("gone")).unwrap();
+  std::fs::create_dir(root.join("stays")).unwrap();
+  let mut w = watcher();
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  std::fs::remove_dir(root.join("gone")).unwrap();
+  let gone = root.join("gone");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &gone)).await.is_some(),
+    "the removed watched directory is observed"
+  );
+
+  std::fs::write(root.join("stays/alive.txt"), b"y").unwrap();
+  let alive = root.join("stays/alive.txt");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &alive)).await.is_some(),
+    "siblings keep delivering after a kernel-side teardown"
+  );
+}
+
+/// Suite 3b: self-induced teardown — after `unwatch` acknowledges, churn
+/// produces nothing (bounded quiet-window assertion).
+#[tokio::test]
+async fn unwatch_quiesces() {
+  let root = scratch_root("unwatch");
+  let mut w = watcher();
+  let h = w.watch(&root, Interest::all()).await.expect("watch");
+  w.unwatch(h).await.expect("unwatch");
+
+  std::fs::write(root.join("after.txt"), b"z").unwrap();
+  let got = tokio::time::timeout(Duration::from_secs(2), w.next()).await;
+  assert!(
+    !matches!(got, Ok(Some(_))),
+    "no event may arrive after unwatch acknowledged"
+  );
+}
+
+/// Suite 4: the wd follows the inode — a watched directory renamed within the
+/// root keeps its coverage (the Monitor's O(1) reparent, end to end against
+/// the real kernel).
+#[tokio::test]
+async fn moved_directory_keeps_coverage() {
+  let root = scratch_root("reparent");
+  std::fs::create_dir(root.join("before")).unwrap();
+  let mut w = watcher();
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  std::fs::rename(root.join("before"), root.join("after")).unwrap();
+  std::fs::write(root.join("after/inside.txt"), b"i").unwrap();
+
+  let inside = root.join("after/inside.txt");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &inside)).await.is_some(),
+    "a file created under the moved directory is observed at its new path"
+  );
+}
+
+/// Suite 5 (privileged): deterministic queue overflow — a 16-slot kernel
+/// queue plus a rename storm forces `IN_Q_OVERFLOW`, which must surface as an
+/// epoch-bumped `Rescan`, never silence.
+#[tokio::test]
+async fn queue_overflow_surfaces_as_rescan() {
+  if !privileged_or_skip("queue_overflow_surfaces_as_rescan") {
+    return;
+  }
+  let old = sysctl_swap("fs/inotify/max_queued_events", "16").expect("shrink queue");
+  let root = scratch_root("overflow");
+  let mut w = watcher();
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  let mut observed = false;
+  'bursts: for burst in 0..3 {
+    for i in 0..400 {
+      let a = root.join(format!("f-{burst}-{i}-a"));
+      let b = root.join(format!("f-{burst}-{i}-b"));
+      std::fs::write(&a, b"x").unwrap();
+      std::fs::rename(&a, &b).unwrap();
+      std::fs::remove_file(&b).unwrap();
+    }
+    if wait_for(&mut w, |e| e.is_rescan()).await.is_some() {
+      observed = true;
+      break 'bursts;
+    }
+  }
+  sysctl_restore("fs/inotify/max_queued_events", &old);
+  assert!(observed, "a forced kernel overflow surfaces as a Rescan");
+}
+
+/// Suite 6 (privileged): watch-limit exhaustion — `ENOSPC` mid-descent lands
+/// on the Monitor's `NoSpace` path: honest `Rescan`, no silence, no panic,
+/// and the watcher survives.
+#[tokio::test]
+async fn watch_limit_exhaustion_is_honest() {
+  if !privileged_or_skip("watch_limit_exhaustion_is_honest") {
+    return;
+  }
+  let root = scratch_root("nospace");
+  for i in 0..12 {
+    std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+  }
+  let old = sysctl_swap("fs/inotify/max_user_watches", "8").expect("shrink watches");
+
+  let mut w = watcher();
+  let watched = w.watch(&root, Interest::all()).await;
+  let honest = match watched {
+    // The descent hit the ceiling after the root armed: coverage loss must
+    // surface as a Rescan.
+    Ok(_) => wait_for(&mut w, |e| e.is_rescan()).await.is_some(),
+    // Or the ceiling hit the root arm itself: a typed error is equally
+    // honest.
+    Err(_) => true,
+  };
+  sysctl_restore("fs/inotify/max_user_watches", &old);
+  assert!(honest, "watch exhaustion surfaces as Rescan or typed error");
+}
+
+/// Suite 7 (privileged): wd aliasing — a bind mount inside the root makes two
+/// anchors share one inode (`EEXIST` under `IN_MASK_CREATE` → alias fan-out);
+/// a write through one spelling is observed under both.
+#[tokio::test]
+async fn bind_mount_aliases_fan_out() {
+  if !privileged_or_skip("bind_mount_aliases_fan_out") {
+    return;
+  }
+  let root = scratch_root("alias");
+  std::fs::create_dir(root.join("a")).unwrap();
+  std::fs::create_dir(root.join("b")).unwrap();
+  let status = std::process::Command::new("mount")
+    .arg("--bind")
+    .arg(root.join("a"))
+    .arg(root.join("b"))
+    .status()
+    .expect("run mount");
+  if !status.success() {
+    eprintln!("SKIP bind_mount_aliases_fan_out: bind mount refused");
+    return;
+  }
+
+  let mut w = watcher();
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+  std::fs::write(root.join("a/shared.txt"), b"s").unwrap();
+
+  let via_a = root.join("a/shared.txt");
+  let via_b = root.join("b/shared.txt");
+  let mut seen_a = false;
+  let mut seen_b = false;
+  let _ = tokio::time::timeout(DEADLINE, async {
+    while let Some(event) = w.next().await {
+      seen_a |= covers(&event, &via_a);
+      seen_b |= covers(&event, &via_b);
+      if seen_a && seen_b {
+        break;
+      }
+    }
+  })
+  .await;
+  let _ = std::process::Command::new("umount")
+    .arg(root.join("b"))
+    .status();
+  assert!(
+    seen_a && seen_b,
+    "one write fans out to both aliased anchors (a: {seen_a}, b: {seen_b})"
+  );
+}
+
+/// §7's documented limitation, pinned end to end: a non-UTF-8 name cannot
+/// become a `Segment`, so it escalates to a covering located `Rescan` —
+/// coverage-honest, never a panic, never silence.
+#[tokio::test]
+async fn non_utf8_name_escalates_to_rescan() {
+  use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+  let root = scratch_root("nonutf8");
+  let mut w = watcher();
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  let weird = root.join(OsStr::from_bytes(&[0xFF, 0xFE, b'x']));
+  std::fs::write(&weird, b"?").unwrap();
+
+  // The covering Rescan lands at the parent directory (or an ancestor, up to
+  // the root itself) — anywhere that obliges re-reading the affected region.
+  assert!(
+    wait_for(&mut w, |e| e.is_rescan()
+      && (e.path().starts_with(&root) || root.starts_with(e.path())))
+    .await
+    .is_some(),
+    "an undeliverable name surfaces as a covering Rescan"
+  );
+}

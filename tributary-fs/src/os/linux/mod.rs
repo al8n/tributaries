@@ -7,12 +7,12 @@
 //! reader thread, and the syscalls) is `cfg(all(target_os = "linux",
 //! not(miri)))`.
 //!
-//! The platform seam still selects the `unsupported` stub on Linux: the
-//! driver's lowering speaks [`RawOsEvent`](super::RawOsEvent) until the
-//! descending core lands, at which point `PlatformEvent` rebinds to
-//! [`RawLinuxEvent`] and the seam flips here.
-// The descending core is this module's consumer; until it lands the Source
-// layer is exercised only by its own suites (the container runs them live).
+//! On Linux the platform seam selects this module's [`Source`]: events cross
+//! the driver's queue as [`RawLinuxEvent`]s inside the unified
+//! [`SourceEvent`](super::SourceEvent) payload, and the driver routes arm
+//! traffic to the reader through the scope's [`ControlPort`].
+// The fanotify backend (L4) consumes the remaining reserved surface; the
+// container suites exercise the parts a macOS host build cannot reach.
 #![allow(dead_code)]
 
 pub(crate) mod inotify;
@@ -211,7 +211,7 @@ pub(crate) enum WatchOutcome {
 // until the seam flips the lib build sees the re-export as unused.
 #[cfg(all(target_os = "linux", not(miri)))]
 #[allow(unused_imports)]
-pub(crate) use source::{AnchorRequest, ArmReply, Source, SourceHandle};
+pub(crate) use source::{AnchorRequest, ArmReply, ControlPort, Source, SourceHandle};
 
 #[cfg(all(target_os = "linux", not(miri)))]
 mod source {
@@ -329,8 +329,10 @@ mod source {
       let thread = reader::start(fd, wake_rx, control_rx, Arc::clone(&shared));
 
       let handle = SourceHandle {
-        control: control_tx,
-        wake: wake_tx,
+        port: ControlPort {
+          control: control_tx,
+          wake: Arc::new(wake_tx),
+        },
         thread: Some(thread),
       };
 
@@ -403,19 +405,22 @@ mod source {
     Ok(fs_type_is_remote(buf.f_type as i64))
   }
 
-  /// A live inotify source. Dropping it tears the reader down; prefer
-  /// [`shutdown`](Self::shutdown) at an orderly exit.
-  pub(crate) struct SourceHandle {
+  /// The clonable arm/disarm port of a live source: the control channel plus
+  /// its wake pipe. Executors on the blocking pool hold one of these per
+  /// scope, so arm traffic never needs the (non-clonable, teardown-owning)
+  /// [`SourceHandle`] itself.
+  #[derive(Debug, Clone)]
+  pub(crate) struct ControlPort {
     control: mpsc::Sender<Control>,
-    wake: OwnedFd,
-    thread: Option<JoinHandle<()>>,
+    wake: Arc<OwnedFd>,
   }
 
-  impl SourceHandle {
+  impl ControlPort {
     /// Installs (or aliases) a kernel watch for the request's Monitor watch.
     /// Executed by the reader thread — the fd and the `wd` table are
     /// single-threaded by construction. Blocks until the reader replies;
-    /// callers run it on the blocking pool.
+    /// callers run it on the blocking pool. A dead reader answers `Failed(Io)`
+    /// — the scope's stream death carries the real signal.
     pub(crate) fn add_watch(&self, request: AnchorRequest) -> ArmReply {
       let (reply_tx, reply_rx) = mpsc::sync_channel(1);
       if self
@@ -454,6 +459,30 @@ mod source {
         let _ = reply_rx.recv();
       }
     }
+  }
+
+  /// A live inotify source. Dropping it tears the reader down; prefer
+  /// [`shutdown`](Self::shutdown) at an orderly exit.
+  pub(crate) struct SourceHandle {
+    port: ControlPort,
+    thread: Option<JoinHandle<()>>,
+  }
+
+  impl SourceHandle {
+    /// A clonable arm/disarm port onto this source's reader.
+    pub(crate) fn port(&self) -> ControlPort {
+      self.port.clone()
+    }
+
+    /// Installs (or aliases) a kernel watch. See [`ControlPort::add_watch`].
+    pub(crate) fn add_watch(&self, request: AnchorRequest) -> ArmReply {
+      self.port.add_watch(request)
+    }
+
+    /// Removes `anchor` from attribution. See [`ControlPort::remove_watch`].
+    pub(crate) fn remove_watch(&self, anchor: WatchId) {
+      self.port.remove_watch(anchor)
+    }
 
     /// Stops the reader and closes the instance. The reader exits at its next
     /// wake, so this blocks for at most one in-flight read + decode.
@@ -465,8 +494,8 @@ mod source {
       let Some(thread) = self.thread.take() else {
         return;
       };
-      let _ = self.control.send(Control::Shutdown);
-      reader::wake(&self.wake);
+      let _ = self.port.control.send(Control::Shutdown);
+      reader::wake(&self.port.wake);
       let _ = thread.join();
     }
   }
