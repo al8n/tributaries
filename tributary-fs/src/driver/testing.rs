@@ -8,7 +8,7 @@ use std::{
   num::NonZeroU64,
   path::{Path, PathBuf},
   sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicUsize, Ordering},
   },
 };
@@ -20,6 +20,9 @@ use crate::{
   core::ProbeOutcome,
   os::{RawOsEvent, RootMeta, SourceConfig, SourceError, SourceMessage},
 };
+
+/// A parked-spawn gate: the held flag plus its wakeup.
+type SpawnGate = Arc<(Mutex<bool>, Condvar)>;
 
 /// One fake filesystem object.
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +56,10 @@ struct FakeState {
   /// a fake that seeded metadata after its stream went live would let the
   /// hermetic suites pass against an ordering the platform forbids.
   spawn_order: Mutex<Vec<&'static str>>,
+  /// When set, `spawn_source` parks on the blocking pool until the gate
+  /// releases — the close-versus-in-flight-spawn cells need a spawn that is
+  /// dispatched but not yet returned.
+  spawn_hold: Mutex<Option<SpawnGate>>,
 }
 
 /// A fake platform: sources are channels the test injects into through the
@@ -176,15 +183,48 @@ impl FakeFs {
   pub(crate) fn spawn_order(&self) -> Vec<&'static str> {
     self.state.spawn_order.lock().unwrap().clone()
   }
+
+  /// Holds every subsequent spawn on the blocking pool until the returned
+  /// gate is released.
+  pub(crate) fn hold_spawns(&self) -> SpawnRelease {
+    let gate: SpawnGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.spawn_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    SpawnRelease { gate }
+  }
+}
+
+/// Releases spawns parked by [`FakeFs::hold_spawns`].
+pub(crate) struct SpawnRelease {
+  gate: SpawnGate,
+}
+
+impl SpawnRelease {
+  pub(crate) fn release(&self) {
+    let (held, cvar) = &*self.gate;
+    *held.lock().unwrap() = false;
+    cvar.notify_all();
+  }
 }
 
 pub(crate) struct FakeHandle {
   state: Arc<FakeState>,
+  shut: bool,
 }
 
 impl SourceControl for FakeHandle {
-  fn shutdown(self) {
+  fn shutdown(mut self) {
+    self.shut = true;
     self.state.shutdowns.fetch_add(1, Ordering::SeqCst);
+  }
+}
+
+impl Drop for FakeHandle {
+  fn drop(&mut self) {
+    // The real handle's Drop backstop, mirrored: an owner that never called
+    // shutdown still reclaims the stream.
+    if !self.shut {
+      self.state.shutdowns.fetch_add(1, Ordering::SeqCst);
+    }
   }
 }
 
@@ -192,6 +232,17 @@ impl FsOps for FakeFs {
   type Handle = FakeHandle;
 
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
+    // The hold gate parks the whole spawn — before any outcome is decided —
+    // so a test can race close() against a spawn that is dispatched but not
+    // yet returned.
+    let hold = self.state.spawn_hold.lock().unwrap().clone();
+    if let Some(gate) = hold {
+      let (held, cvar) = &*gate;
+      let mut parked = held.lock().unwrap();
+      while *parked {
+        parked = cvar.wait(parked).unwrap();
+      }
+    }
     let root = config.roots.first().cloned().ok_or(SourceError::NoRoots)?;
     // A root vanished before start is a clean spawn failure — the pre-start
     // half of the lifecycle contract (post-start deaths travel in-band).
@@ -225,6 +276,7 @@ impl FsOps for FakeFs {
     Ok(SpawnedSource {
       handle: FakeHandle {
         state: Arc::clone(&self.state),
+        shut: false,
       },
       receiver,
       meta,

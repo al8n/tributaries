@@ -449,9 +449,13 @@ impl<R: RuntimeLite> Watcher<R> {
     futures_util::StreamExt::next(self).await
   }
 
-  /// Closes the watcher: tears every native stream down, drains what already
-  /// arrived, and resolves once the driver has quiesced. The final drain into
-  /// a full event buffer is best-effort.
+  /// Closes the watcher: tears every native stream down — including streams
+  /// still being spawned or torn down on the blocking pool, which are settled
+  /// inside the close accounting — drains what already arrived, and resolves
+  /// once the driver has quiesced. The final drain into a full event buffer
+  /// is best-effort, and quiescence is bounded by a ~1 s grace: a blocking
+  /// pool wedged past it no longer holds the close, and a still-pending
+  /// stream's own handle drop remains the reclamation backstop.
   ///
   /// # Errors
   ///
