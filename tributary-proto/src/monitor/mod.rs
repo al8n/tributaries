@@ -997,21 +997,30 @@ impl Monitor {
     self.emit_rescan(scope, to.clone());
   }
 
-  /// Re-anchors every pending half of `scope` whose reconstructed source lies within
-  /// a just-resolved pair's source subtree (`from`), rewriting its stored suffix so
-  /// it reconstructs under the destination (`to`) — the anchor-relative analogue of
-  /// the tree carrying a held subtree's halves through [`reparent`](Self::reparent).
-  /// The two mechanisms cannot double-apply: this runs after the reparent, and a
-  /// tree-carried half already reconstructs under `to`, so its source no longer
-  /// starts with `from` and it does not match here. It matches exactly the halves
-  /// whose ANCHOR did not move — a kernel-recursive deep suffix under the root
-  /// watch, or a same-path replacement half anchored at the source's parent.
+  /// Re-anchors every pending half of `scope` whose reconstructed source lies
+  /// STRICTLY within a just-resolved pair's source subtree (`from`), rewriting its
+  /// stored suffix so it reconstructs under the destination (`to`) — the
+  /// anchor-relative analogue of the tree carrying a held subtree's halves through
+  /// [`reparent`](Self::reparent). The two mechanisms cannot double-apply: this runs
+  /// after the reparent, and a tree-carried half already reconstructs under `to`, so
+  /// its source no longer starts with `from` and it does not match here. It matches
+  /// exactly the halves whose ANCHOR did not move — a kernel-recursive deep suffix
+  /// under the root watch, or a per-directory half anchored at an unmoved parent.
+  ///
+  /// The strict/exact boundary is an object-identity line. A path names different
+  /// objects over time, and every resolution site removes the resolving half from
+  /// the store before this walk runs — so a half still parked with source EXACTLY
+  /// equal to `from` postdates the resolving `MovedFrom` and names the SUCCESSOR
+  /// object that reoccupied the vacated path. Its departure happened at `from`, not
+  /// at the departed object's destination: it keeps its suffix (resolving `Moved`/
+  /// `Removed` from `from`) and is only marked. Strict descendants, by contrast,
+  /// are contents of the moved subtree itself and genuinely travel to `to`.
   ///
   /// Every matched half also becomes dirty (through the store's per-hold marker):
   /// the ancestor move is a transition its window absorbed — a half parked after the
   /// resolving `MovedFrom` was marked by no record, and even a marked one now owes
-  /// its covers at the post-move path. A matched half whose anchor is not a prefix
-  /// of `to` cannot re-express its suffix against that anchor (a cross-directory
+  /// its covers at resolution. A rewritten half whose anchor is not a prefix of `to`
+  /// cannot re-express its suffix against that anchor (a cross-directory
   /// per-directory replacement); it keeps the stale suffix and the marker alone
   /// covers — its resolution rescans the source it emits at, and the resolved
   /// pair's own dirty covers handle the relocated side.
@@ -1027,15 +1036,20 @@ impl Monitor {
         if !source.starts_with(from) {
           return None;
         }
-        let anchor = self.location_of(pending.from_parent);
-        let rewritten = to.starts_with(&anchor).then(|| {
-          Location::from_segments(
-            to.segments()[anchor.len()..]
-              .iter()
-              .chain(&source.segments()[from.len()..])
-              .cloned(),
-          )
-        });
+        let rewritten = if source == *from {
+          // The successor at the vacated path: mark, never relocate.
+          None
+        } else {
+          let anchor = self.location_of(pending.from_parent);
+          to.starts_with(&anchor).then(|| {
+            Location::from_segments(
+              to.segments()[anchor.len()..]
+                .iter()
+                .chain(&source.segments()[from.len()..])
+                .cloned(),
+            )
+          })
+        };
         Some((*key, rewritten, pending.held))
       })
       .collect();

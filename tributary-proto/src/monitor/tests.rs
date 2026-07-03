@@ -6105,3 +6105,220 @@ fn kr_stranded_ancestor_removal_dirties_halves_underneath() {
   );
   assert_eq!(events[3].location(), &loc(&["a", "b"]));
 }
+
+/// A path names different objects over time: a REPLACEMENT half parked at the exact
+/// source of a later-resolving pair belongs to the successor object, so the pair's
+/// re-anchor must not relocate it — it stays at the vacated path (dirty) and its own
+/// pairing emits from there, never from the departed object's destination.
+#[test]
+fn kr_same_source_replacement_half_is_not_reanchored() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(9)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["w"]))
+      .with_cookie(cookie(9)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  let moves: Vec<(Location, Location)> = events
+    .iter()
+    .filter_map(|e| {
+      e.kind()
+        .moved_from()
+        .map(|from| (from.clone(), e.location().clone()))
+    })
+    .collect();
+  assert_eq!(
+    moves,
+    vec![(loc(&["a"]), loc(&["z"])), (loc(&["a"]), loc(&["w"])),],
+    "the replacement pairs from the vacated path, not the original's destination"
+  );
+  assert!(
+    events
+      .iter()
+      .filter(|e| e.kind().is_rescan() && e.location() == &loc(&["w"]))
+      .count()
+      == 1,
+    "the replacement's covers land at its own destination"
+  );
+}
+
+/// The timeout variant of the same-source replacement: its stranded Removed and
+/// cover land at the vacated path the consumer still holds, never at the departed
+/// object's destination.
+#[test]
+fn kr_same_source_replacement_half_times_out_at_the_vacated_path() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(9)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  let _ = drain_events(&mut m);
+
+  m.handle_timeout(at(500));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2);
+  assert!(events[0].kind().is_removed());
+  assert_eq!(
+    events[0].location(),
+    &loc(&["a"]),
+    "the stranded replacement resolves at the vacated path, never the original's destination"
+  );
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &loc(&["a"]));
+}
+
+/// A strict descendant and an exact-source half in one window each follow their own
+/// rule: the descendant travels with the moved subtree, the same-path successor stays.
+#[test]
+fn kr_strict_descendant_reanchors_while_exact_source_stays() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "b"]))
+      .with_cookie(cookie(5)),
+    at(9),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a"]))
+      .with_cookie(cookie(9)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["z"]))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["c"]))
+      .with_cookie(cookie(5)),
+    at(13),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["w"]))
+      .with_cookie(cookie(9)),
+    at(14),
+  );
+
+  let events = drain_events(&mut m);
+  let moves: Vec<(Location, Location)> = events
+    .iter()
+    .filter_map(|e| {
+      e.kind()
+        .moved_from()
+        .map(|from| (from.clone(), e.location().clone()))
+    })
+    .collect();
+  assert_eq!(
+    moves,
+    vec![
+      (loc(&["a"]), loc(&["z"])),
+      (loc(&["z", "b"]), loc(&["c"])),
+      (loc(&["a"]), loc(&["w"])),
+    ],
+    "the descendant follows the subtree; the successor keeps the vacated path"
+  );
+}
+
+/// The per-directory instance of the same boundary: a replacement half anchored at
+/// the SAME unmoved parent reconstructs exactly the resolved source, and must not be
+/// rewritten under the departed object's destination.
+#[test]
+fn per_dir_same_source_replacement_half_is_not_reanchored() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(9)),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(7)),
+    at(12),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("w"))
+      .with_cookie(cookie(9)),
+    at(13),
+  );
+
+  let events = drain_events(&mut m);
+  let moves: Vec<(Location, Location)> = events
+    .iter()
+    .filter_map(|e| {
+      e.kind()
+        .moved_from()
+        .map(|from| (from.clone(), e.location().clone()))
+    })
+    .collect();
+  assert_eq!(
+    moves,
+    vec![(loc(&["a"]), loc(&["z"])), (loc(&["a"]), loc(&["w"])),],
+    "the per-directory successor half keeps the vacated path"
+  );
+}
