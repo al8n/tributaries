@@ -1518,6 +1518,11 @@ fn learn_device(state: &mut ScopeState, path: &Path, dev: u64) {
 }
 
 /// Lowers an absolute event path to its place under the scope root.
+///
+/// Canonical roots never carry a trailing separator except the filesystem
+/// root `/` itself (both `fs::canonicalize` and the spawn-side transform
+/// guarantee it), so `/` is the one root whose descendants strip to a bare
+/// remainder.
 fn lower(state: &ScopeState, path: &Path) -> Lowered {
   let Some(root) = state.root.as_deref() else {
     return Lowered::Outside;
@@ -1530,6 +1535,9 @@ fn lower(state: &ScopeState, path: &Path) -> Lowered {
   let rest = match rest {
     [] => return Lowered::Root,
     [b'/', tail @ ..] => tail,
+    // The root "/" already ends with the separator, so its descendants
+    // arrive without a leading one ("/tmp/a" strips to "tmp/a").
+    tail if root_bytes == b"/" => tail,
     // The prefix matched mid-component (root "/a/b" vs path "/a/bc").
     _ => return Lowered::Outside,
   };

@@ -17,7 +17,7 @@ use futures_core::Stream;
 use tributary_proto::{Change, Interest, ScopeId};
 
 use crate::{
-  driver::{Command, DriverConfig, RealFs, run},
+  driver::{Command, DriverConfig, RealFs, ScopeRegistry, run},
   error::{BuildError, CloseError, UnwatchError, WatchRootError},
   event::Event,
   options::WatcherOptions,
@@ -67,6 +67,11 @@ impl RootHandle {
 /// stream fatal, close) removes its entry, so the registry is bounded by the
 /// number of LIVE roots — deliveries carry their own root path, so nothing
 /// here is needed to assemble trailing events of a dead scope.
+///
+/// `entries` has ONE writer: the driver task, through [`RegistryWriter`] —
+/// scope-live and scope-dead execute on that single task in program order, so
+/// an insert can never race a removal. The watcher side only reads entries
+/// (and owns the `pending` reservations, which no one else writes).
 #[derive(Debug, Default)]
 struct RootSet {
   entries: BTreeMap<ScopeId, Arc<PathBuf>>,
@@ -86,6 +91,24 @@ impl RootSet {
       .chain(self.pending.iter().map(PathBuf::as_path))
       .find(|existing| candidate.starts_with(existing) || existing.starts_with(candidate))
       .map(Path::to_path_buf)
+  }
+}
+
+/// The driver task's write end of the registry — the SOLE mutator of
+/// `RootSet::entries` (see the single-writer note on [`RootSet`]).
+struct RegistryWriter {
+  roots: Arc<RwLock<RootSet>>,
+}
+
+impl ScopeRegistry for RegistryWriter {
+  fn scope_live(&self, scope: ScopeId, root: &Path) {
+    let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
+    set.entries.insert(scope, Arc::new(root.to_path_buf()));
+  }
+
+  fn scope_dead(&self, scope: ScopeId) {
+    let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
+    set.entries.remove(&scope);
   }
 }
 
@@ -192,25 +215,26 @@ impl<R: RuntimeLite> Watcher<R> {
       os_batch_capacity: options.os_batch_capacity(),
       exclusions: options.exclusions_slice().to_vec(),
     };
+    Self::spawn_with(options, config, RealFs)
+  }
+
+  /// Builds the watcher around `ops` — the seam the hermetic lifecycle tests
+  /// drive with a fake filesystem; production always passes [`RealFs`].
+  fn spawn_with(
+    options: WatcherOptions,
+    config: DriverConfig,
+    ops: impl crate::driver::FsOps,
+  ) -> Result<Self, BuildError> {
     let (command_tx, command_rx) = async_channel::bounded(16);
     let (event_tx, event_rx) = async_channel::bounded(options.event_capacity().get());
     let roots = Arc::new(RwLock::new(RootSet::default()));
-    // The driver reports every scope end (unwatch, root death, stream fatal,
-    // close) back into the registry, which RECLAIMS the entry outright: the
-    // dead path stops blocking a fresh watch immediately, and trailing
-    // events need nothing here — every delivery carries its own root path.
-    let registry = Arc::clone(&roots);
-    let on_scope_dead = move |scope: ScopeId| {
-      let mut set = registry.write().unwrap_or_else(PoisonError::into_inner);
-      set.entries.remove(&scope);
+    // The registry's entries are written only by the driver task: live at
+    // spawn (before the grant is sent), dead at every teardown — one writer,
+    // program order, no insert/remove race. This side only reads.
+    let registry = RegistryWriter {
+      roots: Arc::clone(&roots),
     };
-    R::spawn_detach(run::<R, RealFs>(
-      config,
-      RealFs,
-      command_rx,
-      event_tx,
-      on_scope_dead,
-    ));
+    R::spawn_detach(run::<R, _>(config, ops, command_rx, event_tx, registry));
     Ok(Self {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
@@ -220,6 +244,21 @@ impl<R: RuntimeLite> Watcher<R> {
     })
   }
 
+  /// A watcher over a fake platform, for hermetic lifecycle tests.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn new_with(
+    options: WatcherOptions,
+    ops: impl crate::driver::FsOps,
+  ) -> Result<Self, BuildError> {
+    let config = DriverConfig {
+      latency: options.latency(),
+      move_window: options.move_window(),
+      os_batch_capacity: options.os_batch_capacity(),
+      exclusions: options.exclusions_slice().to_vec(),
+    };
+    Self::spawn_with(options, config, ops)
+  }
+
   /// Watches `root`, resolving once the native stream is live. From that
   /// moment every change under the root is delivered per `interest`
   /// (`Rescan`s are always delivered).
@@ -227,6 +266,20 @@ impl<R: RuntimeLite> Watcher<R> {
   /// The root is canonicalized first (a symlinked root would otherwise
   /// observe nothing), which performs a few blocking metadata syscalls
   /// inline.
+  ///
+  /// # A handle can be dead on arrival
+  ///
+  /// The returned handle names a root that was live when the stream started —
+  /// but a root can die (be deleted, unmount, the stream fail) at any moment,
+  /// including between the stream going live and this call resolving. Such a
+  /// handle is indistinguishable from one whose root died right after
+  /// `watch()` returned, which no design can prevent: [`root_path`] answers
+  /// `None`, [`unwatch`] answers [`UnknownRoot`], and the root's terminal
+  /// [`Rescan`](crate::EventKind::Rescan) is still delivered.
+  ///
+  /// [`root_path`]: Self::root_path
+  /// [`unwatch`]: Self::unwatch
+  /// [`UnknownRoot`]: UnwatchError::UnknownRoot
   ///
   /// # Errors
   ///
@@ -278,26 +331,27 @@ impl<R: RuntimeLite> Watcher<R> {
       })
       .await;
     if sent.is_err() {
+      self.driver_gone();
       return Err(WatchRootError::Closed);
     }
     match response.await {
       Ok(Ok(grant)) => {
+        // The driver inserted the registry entry BEFORE sending this grant
+        // (and removes it at every teardown — one writer, program order), so
+        // the path is covered continuously while the reservation still
+        // holds: defusing is the whole commit. A scope that died in the
+        // window since simply hands back a dead-on-arrival handle (see the
+        // method docs).
         let scope = grant.scope();
-        let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-        set
-          .entries
-          .insert(scope, Arc::new(grant.root().to_path_buf()));
-        drop(set);
-        // Only now may the reservation lift and the grant commit: the entry
-        // above covers the path, so the stream has an owner. (Everything from
-        // the await's resolution to here is synchronous — there is no
-        // cancellation point between insert and defuse.)
         drop(reservation);
         grant.defuse();
         Ok(RootHandle::new(self.instance, scope))
       }
       Ok(Err(err)) => Err(WatchRootError::Source(err)),
-      Err(_) => Err(WatchRootError::Closed),
+      Err(_) => {
+        self.driver_gone();
+        Err(WatchRootError::Closed)
+      }
     }
   }
 
@@ -317,21 +371,50 @@ impl<R: RuntimeLite> Watcher<R> {
       return Err(UnwatchError::UnknownRoot);
     }
     let (reply, response) = futures_channel::oneshot::channel();
-    self
+    if self
       .commands
       .send(Command::Unwatch {
         scope: root.scope(),
         reply,
       })
       .await
-      .map_err(|_| UnwatchError::Closed)?;
+      .is_err()
+    {
+      self.driver_gone();
+      return Err(UnwatchError::Closed);
+    }
     match response.await {
       // The registry entry is reclaimed by the driver's scope-dead signal;
       // nothing to reconcile here on either outcome.
       Ok(true) => Ok(()),
-      Ok(false) => Err(UnwatchError::UnknownRoot),
-      Err(_) => Err(UnwatchError::Closed),
+      Ok(false) => {
+        // The driver never knew the scope, so its single-writer registry
+        // cannot still hold an entry for it.
+        debug_assert!(
+          !self
+            .roots
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .contains_key(&root.scope()),
+          "an unknown scope must have no registry entry"
+        );
+        Err(UnwatchError::UnknownRoot)
+      }
+      Err(_) => {
+        self.driver_gone();
+        Err(UnwatchError::Closed)
+      }
     }
+  }
+
+  /// The driver is gone (its command channel closed without an orderly
+  /// confirmation): clear the read view so the registry is empty-and-honest
+  /// rather than frozen at its last state. The single-writer rule is intact —
+  /// there is no writer left to race.
+  fn driver_gone(&self) {
+    let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
+    set.entries.clear();
   }
 
   /// The canonical path of a watched root, if the handle names a live root
@@ -379,9 +462,16 @@ impl<R: RuntimeLite> Watcher<R> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self.commands.send(Command::Close { reply }).await.is_err() {
       // The driver already exited through its orderly drop path.
+      self.driver_gone();
       return Ok(());
     }
-    response.await.map_err(|_| CloseError::Stopped)
+    match response.await {
+      Ok(()) => Ok(()),
+      Err(_) => {
+        self.driver_gone();
+        Err(CloseError::Stopped)
+      }
+    }
   }
 
   /// Wraps a scope-stamped change into the consumer event. Deliveries carry

@@ -4,14 +4,14 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{ResumeToken, SourceChannels, SourceConfig, SourceError};
+use super::{EventReceiver, ResumeToken, SourceConfig, SourceError};
 
 /// The spawn entry point of the stub backend.
 pub(crate) struct Source;
 
 impl Source {
   /// Always fails: there is nothing to watch with on this platform.
-  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, SourceChannels), SourceError> {
+  pub(crate) fn spawn(config: SourceConfig) -> Result<(SourceHandle, EventReceiver), SourceError> {
     let _ = config;
     Err(SourceError::Unsupported)
   }
@@ -31,11 +31,6 @@ impl SourceHandle {
   /// Tears the (nonexistent) stream down.
   pub(crate) fn shutdown(self) {
     match self {}
-  }
-
-  /// Acknowledges a processed in-band `Overflow`.
-  pub(crate) fn overflow_processed(&self) {
-    match *self {}
   }
 
   /// The resume point minted so far.
