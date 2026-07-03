@@ -96,7 +96,7 @@ struct WatchNode {
 ///
 /// It carries enough to validate a candidate pair before consuming it *and* to
 /// resolve it when its source disappears. `scope` and `deadline` bound pairing in
-/// space and time. The source is anchored by its slot `(from_parent, from_name)`
+/// space and time. The source is anchored by its slot `(from_parent, from)`
 /// rather than an eager path: the location is reconstructed on use, so if the
 /// source's own ancestor is reparented mid-window the resolved path follows it.
 /// `from_parent` (the watch the `MovedFrom` arrived on) also gates liveness: a
@@ -113,7 +113,9 @@ struct WatchNode {
 #[derive(Debug, Clone)]
 struct PendingMove {
   from_parent: WatchId,
-  from_name: Segment,
+  /// The source's watch-relative location under `from_parent` — one segment on a
+  /// per-directory backend, possibly deeper on a kernel-recursive one.
+  from: Location,
   scope: ScopeId,
   deadline: Instant,
   held: Option<WatchId>,
@@ -122,6 +124,23 @@ struct PendingMove {
   /// A held source is definitionally a watched directory; otherwise this is whatever
   /// the source record reported.
   is_dir: Option<bool>,
+  /// Whether subtree activity interleaved with this half's pairing window: a record or
+  /// located overflow whose location mutual-prefixes the pending source landed while
+  /// the half was parked. Such activity described a REPLACEMENT at the source, which
+  /// the eventual resolution (a `Moved` reparenting the consumer's tree, or a
+  /// `Removed`) contradicts — so a dirty half's resolution emits covering `Rescan`s
+  /// at the source and, for a pair, the destination.
+  ///
+  /// Applies to held and unheld halves alike, and is ORTHOGONAL to
+  /// [`dirtied_holds`](Monitor::dirtied_holds): that marker records content SUPPRESSED
+  /// under a held source's detached subtree (paths through the hold reconstruct stale,
+  /// so its records are fenced and recover with a destination rescan + re-arm at
+  /// pairing). This flag records transitions at the half's SOURCE SLOT — activity that
+  /// DELIVERED at the vacated path, which is outside the detached subtree and has no
+  /// stale-path hazard. A held half whose slot was reoccupied owes the vacated path a
+  /// source-side cover that no destination rescan provides, so a held half can carry
+  /// both markers, each producing its own covers.
+  dirty: bool,
 }
 
 /// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
@@ -172,8 +191,13 @@ enum SlotOccupant {
 /// [`handle_timeout`](Self::handle_timeout)) and drains outputs to a fixpoint
 /// after each ([`poll_action`](Self::poll_action),
 /// [`poll_event`](Self::poll_event)), arming a timer for
-/// [`poll_timeout`](Self::poll_timeout). No method performs I/O or reads a clock;
-/// time always arrives as a `now` argument.
+/// [`poll_timeout`](Self::poll_timeout). Draining after every input minimizes
+/// latency, but it is a discipline, not a soundness precondition: a driver may
+/// feed several inputs (a whole decoded kernel batch) before draining — the
+/// queued changes coalesce only across adjacency that respects every
+/// intervening transition, including subtree-wide adjacency for `Rescan`s. No
+/// method performs I/O or reads a clock; time always arrives as a `now`
+/// argument.
 #[derive(Debug)]
 pub struct Monitor {
   capabilities: Capabilities,
@@ -387,6 +411,24 @@ impl Monitor {
       return;
     };
 
+    // Addressing-contract enforcement, never silent: a descending monitor ingests
+    // only depth-one records (a deeper target has no per-directory watch to anchor
+    // it), and a self-event kind carries no target at all. A violating record is a
+    // driver bug; recover by rescanning-and-rearming the arrival watch — the
+    // no-silent-loss escape — rather than mis-attributing the event. On a held
+    // (mid-move) subtree that Rescan would land at the stale pre-move path, so the
+    // recovery routes through the hold instead, like every other held activity.
+    let depth = rec.depth();
+    if (depth > 1 && self.descends()) || (depth > 0 && rec.kind().is_self_event()) {
+      if let Some(source) = self.in_held_subtree(rec.watch()) {
+        self.dirtied_holds.insert(source);
+        self.mark_enumerate_dirty(rec.watch());
+      } else {
+        self.rescan_and_rearm(scope, rec.watch());
+      }
+      return;
+    }
+
     // A record on a detached-and-held move source (or anything in its still-attached
     // subtree) would act on the stale PRE-move path — a scope-fence violation. Fence it:
     // suppress the record, mark the hold dirtied so the pairing reparent re-scans the
@@ -418,6 +460,44 @@ impl Monitor {
         self.mark_enumerate_dirty(rec.watch());
         return;
       }
+    }
+
+    // Latent (not-yet-consumer-visible) transitions live in exactly TWO stores: the
+    // event queue, whose dedup fences interleavings by the mutual-prefix touch relation
+    // (`would_coalesce`), and `pending_moves`, whose parked halves queue NOTHING — so
+    // interleaved subtree activity is invisible to the queue-based relation and must be
+    // fenced here. (`held_sources` is the descending-profile fence over this same store;
+    // every other container holds obligations or bookkeeping, not transitions: `actions`
+    // carries watch/enumerate work, `NodeState::Enumerating` an outstanding read whose
+    // result reconciles coverage, `scope_epochs`/`dirtied_holds` markers.) A surviving
+    // record whose location mutual-prefixes a parked source — held or unheld — is an
+    // ancestor-or-descendant transition inside that pairing window: it DELIVERS (its
+    // path is its own current truth; the held fence's suppression above guards paths
+    // through a DETACHED subtree, and a half's vacated source slot lies outside it),
+    // and the half is marked dirty so its resolution emits covering `Rescan`s.
+    //
+    // Three transitions are NOT unseen and do not mark: a `MovedTo`'s OWN pairing half
+    // (the window's resolution, not an interleaved fact); self-events (a root teardown
+    // purges the scope's halves behind its unconditional `Rescan`, and a non-root
+    // teardown silences anchored halves through the resolution liveness guard — the
+    // tree tells those stories itself); and halves anchored inside the subtree a
+    // parent-side cookieed `MovedFrom` is about to detach-and-hold — the tree CARRIES
+    // that move, so the half's source reconstructs through the reparent and stays
+    // current rather than contradicted.
+    if !rec.kind().is_self_event() {
+      let record_loc = self.record_location(&rec);
+      let exclude = match rec.kind() {
+        RecordKind::MovedTo => rec.cookie(),
+        _ => None,
+      };
+      let carried = if rec.kind().is_moved_from() && rec.cookie().is_some() {
+        rec
+          .name()
+          .and_then(|name| self.child_watch(rec.watch(), name))
+      } else {
+        None
+      };
+      self.dirty_pending_sources_touching(scope, &record_loc, exclude, carried);
     }
 
     // A slot-changing record for a directory whose enumerate is still outstanding races
@@ -797,6 +877,10 @@ impl Monitor {
         let roots: std::vec::Vec<(ScopeId, WatchId)> =
           self.roots.iter().map(|(s, w)| (*s, *w)).collect();
         for (scope_id, root) in roots {
+          // A whole-scope loss is a transition anywhere under the root, so every
+          // unheld pending half's window was interleaved (the root location prefixes
+          // every source).
+          self.dirty_pending_sources_touching(scope_id, &Location::new(), None, None);
           self.rescan_and_rearm(scope_id, root);
         }
         // The root re-arm may build temporary destination coverage for a held source's
@@ -810,21 +894,32 @@ impl Monitor {
         // rather than emitting a Rescan for a scope the Monitor no longer covers
         // (the `Subtree` arm below guards symmetrically via `scope_of`).
         if let Some(&root) = self.roots.get(&scope_id) {
+          self.dirty_pending_sources_touching(scope_id, &Location::new(), None, None);
           self.rescan_and_rearm(scope_id, root);
           self.dirty_held_sources(Some(scope_id));
         }
       }
-      Scope::Subtree(watch) => {
+      Scope::Subtree(sub) => {
         // A subtree overflow on a held source (or a node in its subtree) would `Rescan`
         // and re-arm at the stale PRE-move path, just like a record would. Fence it the
         // same way: mark the enclosing hold dirtied and dirty the watch's outstanding
         // enumerate, then leave the pairing reparent to `Rescan`/re-arm the real
         // destination. Only a non-held subtree rescans-and-rearms in place.
+        let watch = sub.watch();
         if let Some(source) = self.in_held_subtree(watch) {
           self.dirtied_holds.insert(source);
           self.mark_enumerate_dirty(watch);
         } else if let Some(scope_id) = self.scope_of(watch) {
-          self.rescan_and_rearm(scope_id, watch);
+          // The Rescan lands at the located directory (the watch's own location plus
+          // the descent). The re-arm starts from the nearest watch: the descent has no
+          // watch of its own — it is deep only on a kernel-recursive backend, whose
+          // re-arm is a no-op anyway — and a descending backend's re-arm cascade
+          // covers the descent from the watch. A located loss is also an interleaved
+          // transition for any pending half it mutual-prefixes.
+          let at = self.location_of(watch).join(sub.descent());
+          self.dirty_pending_sources_touching(scope_id, &at, None, None);
+          self.emit_rescan(scope_id, at);
+          self.start_rearm(watch);
         }
       }
     }
@@ -846,6 +941,133 @@ impl Monitor {
       })
       .collect();
     self.dirtied_holds.extend(held);
+  }
+
+  /// Marks dirty every pending move half of `scope` — held or unheld — whose
+  /// reconstructed source location mutual-prefixes `loc`: the pending-store half of the
+  /// latent-transition fence (see the inventory note in
+  /// [`on_os_record`](Self::on_os_record)). The source is reconstructed on use
+  /// ([`pending_from`](Self::pending_from)), so a mid-window reparent of the source's
+  /// ancestor is followed rather than indexed stale. Halves whose `from_parent` is no
+  /// longer watched are skipped: their location cannot be reconstructed, and the
+  /// resolution liveness guard silences them entirely, so a dirty flag could never
+  /// surface. `exclude` names a half the caller is about to resolve (a pairing
+  /// `MovedTo`'s own cookie); `carried` names a watch whose subtree the caller's own
+  /// machinery is detaching-and-holding — halves anchored at or under it follow that
+  /// move through the tree and are not marked.
+  fn dirty_pending_sources_touching(
+    &mut self,
+    scope: ScopeId,
+    loc: &Location,
+    exclude: Option<MoveCookie>,
+    carried: Option<WatchId>,
+  ) {
+    let keys: std::vec::Vec<PendingKey> = self
+      .pending_moves
+      .iter()
+      .filter(|((half_scope, cookie), pending)| {
+        *half_scope == scope
+          && Some(*cookie) != exclude
+          && !pending.dirty
+          && self.is_watched(pending.from_parent)
+          && !carried.is_some_and(|held| {
+            pending.from_parent == held || self.is_descendant(pending.from_parent, held)
+          })
+          && Self::locations_touch(&self.pending_from(pending), loc)
+      })
+      .map(|(key, _)| *key)
+      .collect();
+    for key in keys {
+      if let Some(pending) = self.pending_moves.get_mut(&key) {
+        pending.dirty = true;
+      }
+    }
+  }
+
+  /// Emits the covering `Rescan`s a DIRTY paired half owes at resolution: the
+  /// interleaved facts described a replacement at the source, and the just-emitted
+  /// `Moved`'s application at the consumer contradicts them — both the vacated source
+  /// and the populated destination need the re-read instruction. The source side
+  /// routes through the same liveness rule as every stored-half resolution (a dead
+  /// `from_parent` cannot reconstruct a live source path); the destination is where
+  /// the pairing record just arrived, live by construction.
+  fn rescan_dirty_pair(&mut self, scope: ScopeId, pending: &PendingMove, to: &Location) {
+    if !pending.dirty {
+      return;
+    }
+    if self.is_watched(pending.from_parent) {
+      let from = self.pending_from(pending);
+      self.emit_rescan(scope, from);
+    }
+    self.emit_rescan(scope, to.clone());
+  }
+
+  /// Re-anchors every pending half of `scope` whose reconstructed source lies
+  /// STRICTLY within a just-resolved pair's source subtree (`from`), rewriting its
+  /// stored suffix so it reconstructs under the destination (`to`) — the
+  /// anchor-relative analogue of the tree carrying a held subtree's halves through
+  /// [`reparent`](Self::reparent). The two mechanisms cannot double-apply: this runs
+  /// after the reparent, and a tree-carried half already reconstructs under `to`, so
+  /// its source no longer starts with `from` and it does not match here. It matches
+  /// exactly the halves whose ANCHOR did not move — a kernel-recursive deep suffix
+  /// under the root watch, or a per-directory half anchored at an unmoved parent.
+  ///
+  /// The strict/exact boundary is an object-identity line. A path names different
+  /// objects over time, and every resolution site removes the resolving half from
+  /// the store before this walk runs — so a half still parked with source EXACTLY
+  /// equal to `from` postdates the resolving `MovedFrom` and names the SUCCESSOR
+  /// object that reoccupied the vacated path. Its departure happened at `from`, not
+  /// at the departed object's destination: it keeps its suffix (resolving `Moved`/
+  /// `Removed` from `from`) and is only marked. Strict descendants, by contrast,
+  /// are contents of the moved subtree itself and genuinely travel to `to`.
+  ///
+  /// Every matched half also becomes dirty: the ancestor move is a transition its
+  /// window absorbed — a half parked after the resolving `MovedFrom` was marked by no
+  /// record, and even a marked one now owes its covers at resolution. Heldness does
+  /// not change this — the touch is to the half's SOURCE slot, so the source-side
+  /// cover must come from its own flag; a held half's hold marker would cover only
+  /// the destination (see [`PendingMove::dirty`]). A rewritten half whose anchor is
+  /// not a prefix of `to` cannot re-express its suffix against that anchor (a
+  /// cross-directory per-directory replacement); it keeps the stale suffix and the
+  /// flag alone covers — its resolution rescans the source it emits at, and the
+  /// resolved pair's own dirty covers handle the relocated side.
+  fn reanchor_pending_sources(&mut self, scope: ScopeId, from: &Location, to: &Location) {
+    let matched: std::vec::Vec<(PendingKey, Option<Location>)> = self
+      .pending_moves
+      .iter()
+      .filter(|((half_scope, _), pending)| {
+        *half_scope == scope && self.is_watched(pending.from_parent)
+      })
+      .filter_map(|(key, pending)| {
+        let source = self.pending_from(pending);
+        if !source.starts_with(from) {
+          return None;
+        }
+        let rewritten = if source == *from {
+          // The successor at the vacated path: mark, never relocate.
+          None
+        } else {
+          let anchor = self.location_of(pending.from_parent);
+          to.starts_with(&anchor).then(|| {
+            Location::from_segments(
+              to.segments()[anchor.len()..]
+                .iter()
+                .chain(&source.segments()[from.len()..])
+                .cloned(),
+            )
+          })
+        };
+        Some((*key, rewritten))
+      })
+      .collect();
+    for (key, rewritten) in matched {
+      if let Some(pending) = self.pending_moves.get_mut(&key) {
+        if let Some(from) = rewritten {
+          pending.from = from;
+        }
+        pending.dirty = true;
+      }
+    }
   }
 
   /// Emits an overflow [`ChangeKind::Rescan`] for a scope AND re-enumerates `dir` in
@@ -943,11 +1165,13 @@ impl Monitor {
 
   fn on_moved_from(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) {
     let from_parent = rec.watch();
+    // Only a depth-one source can name a per-directory child watch; a deeper
+    // (kernel-recursive) source has no child watches to detach.
     let src = rec
       .name()
       .and_then(|name| self.child_watch(rec.watch(), name));
-    match (rec.cookie(), rec.name()) {
-      (Some(cookie), Some(name)) => {
+    match (rec.cookie(), rec.target()) {
+      (Some(cookie), Some(target)) => {
         // Detach a watched-directory source from its old `(parent, name)` slot the
         // moment it moves away, but KEEP its subtree: a paired `MovedTo` reparents it
         // in O(1) (descendants follow for free), and until then detaching has already
@@ -961,7 +1185,7 @@ impl Monitor {
         }
         let pending = PendingMove {
           from_parent,
-          from_name: name.clone(),
+          from: target.clone(),
           scope,
           deadline: now + self.move_window,
           held: src,
@@ -972,6 +1196,7 @@ impl Monitor {
           } else {
             rec.is_dir()
           },
+          dirty: false,
         };
         // Invariant (d): the cookie is namespaced by scope, so only a *same-scope*
         // reused/colliding cookie collides on this composite key. The displaced
@@ -1017,6 +1242,15 @@ impl Monitor {
         // narrowly torn down, paired by a reused cookie) demote a real directory
         // destination to an unwatched file slot — silent coverage loss.
         let class = rec.is_dir().or(pending.is_dir);
+        // The source path this pairing relocates, captured while the half is intact:
+        // other halves parked under it must re-anchor once the `Moved` is emitted.
+        // `from_parent` is the source's (old) parent — never inside the moved subtree —
+        // so this reconstruction is stable across the reparent below. An unanchored
+        // half emits `Created`, not `Moved` (see `emit_pair`): nothing relocates, so
+        // there is nothing to re-anchor under.
+        let resolved_from = self
+          .is_watched(pending.from_parent)
+          .then(|| self.pending_from(&pending));
         match (rec.name(), pending.held) {
           // Held directory: attempt the O(1) reparent and emit the pairing only once
           // it succeeds — a `Moved` must never precede a rejected/aborted reparent.
@@ -1029,14 +1263,19 @@ impl Monitor {
             let dirtied = self.dirtied_holds.remove(&src);
             if self.can_reparent(src, rec.watch()) && self.reparent(src, rec.watch(), name.clone())
             {
+              self.emit_pair(scope, to.clone(), &pending, class);
+              if let Some(from) = resolved_from.as_ref() {
+                self.reanchor_pending_sources(scope, from, &to);
+              }
+              // A source-slot touch during the hold (a delivered replacement at the
+              // vacated path) covers through the half's own flag — source AND
+              // destination — independent of the under-hold suppression below.
+              self.rescan_dirty_pair(scope, &pending, &to);
               if dirtied {
                 // Records under the moved subtree were suppressed at the stale path:
                 // re-scan the destination and re-arm the subtree to recover them.
-                self.emit_pair(scope, to.clone(), &pending, class);
                 self.emit_rescan(scope, to);
                 self.inherit_rearm(src);
-              } else {
-                self.emit_pair(scope, to, &pending, class);
               }
             } else {
               // Not reparentable: a dead or cyclic held source, or a reparent that
@@ -1049,6 +1288,13 @@ impl Monitor {
               }
               if self.is_watched(rec.watch()) {
                 self.emit_pair(scope, to.clone(), &pending, class);
+                if let Some(from) = resolved_from.as_ref() {
+                  self.reanchor_pending_sources(scope, from, &to);
+                }
+                // A source-slot touch during the hold still owes its source-side
+                // cover here (the destination side coalesces with the unconditional
+                // rescan below).
+                self.rescan_dirty_pair(scope, &pending, &to);
                 // The O(1) carry-over failed, so the moved subtree's interval is
                 // uncovered BY CONSTRUCTION — whatever happened between the source
                 // dying (a failed install, a raced teardown) and the fresh destination
@@ -1070,14 +1316,23 @@ impl Monitor {
                 // The destination parent died with the held subtree (it sat inside it),
                 // so the precomputed `to` reconstructed through the detached source and
                 // is a STALE pre-move path. Escalate at the scope root — the one
-                // location still known live — never at a path we no longer cover.
+                // location still known live — never at a path we no longer cover. The
+                // root Rescan is a scope-wide transition like a whole-scope loss:
+                // every parked half (either store) resolves AFTER it and must cover,
+                // or its stale facts would land post-rescan uninstructed.
+                self.dirty_pending_sources_touching(scope, &Location::new(), None, None);
+                self.dirty_held_sources(Some(scope));
                 self.emit_rescan(scope, Location::new());
               }
             }
           }
           // Non-directory (or unwatched) source: emit the pairing and reconcile the slot.
           (Some(name), None) => {
-            self.emit_pair(scope, to, &pending, class);
+            self.emit_pair(scope, to.clone(), &pending, class);
+            if let Some(from) = resolved_from.as_ref() {
+              self.reanchor_pending_sources(scope, from, &to);
+            }
+            self.rescan_dirty_pair(scope, &pending, &to);
             self.reconcile_slot(
               rec.watch(),
               scope,
@@ -1091,7 +1346,11 @@ impl Monitor {
             if let Some(src) = held {
               self.drop_subtree(src);
             }
-            self.emit_pair(scope, to, &pending, class);
+            self.emit_pair(scope, to.clone(), &pending, class);
+            if let Some(from) = resolved_from.as_ref() {
+              self.reanchor_pending_sources(scope, from, &to);
+            }
+            self.rescan_dirty_pair(scope, &pending, &to);
           }
         }
       }
@@ -1128,7 +1387,10 @@ impl Monitor {
         } else {
           // Resolving the stranded source dropped the destination parent (a cyclic late
           // destination sits inside the held subtree), so the precomputed `to` is a
-          // stale pre-move path — escalate at the scope root instead.
+          // stale pre-move path — escalate at the scope root instead, marking both
+          // parked stores as for any scope-wide transition (see the in-window twin).
+          self.dirty_pending_sources_touching(scope, &Location::new(), None, None);
+          self.dirty_held_sources(Some(scope));
           self.emit_rescan(scope, Location::new());
         }
       }
@@ -1169,14 +1431,27 @@ impl Monitor {
     }
     if self.is_watched(pending.from_parent) {
       let from = self.pending_from(&pending);
-      self.resolve_lost_source(pending.scope, from, pending.is_dir);
+      self.resolve_lost_source(pending.scope, from.clone(), pending.is_dir);
+      // A dirty half's window saw interleaved subtree activity whose facts the
+      // stranded-source `Removed` above contradicts: cover the source with a re-read
+      // instruction, under the same liveness guard (a dead `from_parent` has no live
+      // source path to rescan — and nothing to contradict).
+      if pending.dirty {
+        self.emit_rescan(pending.scope, from.clone());
+      }
+      // The `Removed` just delivered is itself a subtree transition: a half parked
+      // UNDER this source (one that arrived after this half's own `MovedFrom` marked
+      // the store, so no record ever touched it) would otherwise resolve against a
+      // tree the consumer has already dropped. Mark, don't rewrite — a removal
+      // relocates nothing.
+      self.dirty_pending_sources_touching(pending.scope, &from, None, None);
     }
   }
 
   /// The current source location of a pending half, reconstructed from its slot
-  /// `(from_parent, from_name)` so it tracks any reparent of the source's ancestor.
+  /// `(from_parent, from)` so it tracks any reparent of the source's ancestor.
   fn pending_from(&self, pending: &PendingMove) -> Location {
-    self.child_location(pending.from_parent, &pending.from_name)
+    self.location_of(pending.from_parent).join(&pending.from)
   }
 
   /// Emits the outcome of a paired `MovedTo`: a `Moved` when the source is still
@@ -1501,9 +1776,10 @@ impl Monitor {
   }
 
   /// Advances a scope's reconciliation generation and returns the new value. Called on
-  /// every reconciliation trigger (through [`emit_rescan`](Self::emit_rescan)), so the
-  /// `Rescan` — and every change emitted after it — carries a generation that strictly
-  /// dominates whatever the consumer acted on before the trigger.
+  /// every non-coalesced reconciliation trigger (through
+  /// [`emit_rescan`](Self::emit_rescan)), so the `Rescan` — and every change emitted
+  /// after it — carries a generation that strictly dominates whatever the consumer
+  /// acted on before the trigger.
   fn bump_epoch(&mut self, scope: ScopeId) -> Epoch {
     let next = self.epoch_of(scope).next();
     self.scope_epochs.insert(scope, next);
@@ -1513,6 +1789,15 @@ impl Monitor {
   fn emit_rescan(&mut self, scope: ScopeId, location: Location) {
     // A `Rescan` IS the reconciliation trigger: bump the generation FIRST so the Rescan,
     // and every later change for this scope, strictly dominates what the consumer holds.
+    // But the coalesce is decided BEFORE the bump: a trigger whose Rescan would coalesce
+    // into a still-queued identical one adds no new instruction — the queued
+    // (undelivered) Rescan's single generation stands for the whole contiguous loss run
+    // — and skipping the bump keeps the public epoch contract exact: no delivered change
+    // ever carries a generation that no delivered Rescan announced. The decision is a
+    // pure read of the event queue, so `emit` re-running it below cannot disagree.
+    if self.would_coalesce(scope, &location, &ChangeKind::Rescan) {
+      return;
+    }
     self.bump_epoch(scope);
     self.emit(scope, location, ChangeKind::Rescan);
   }
@@ -1534,37 +1819,101 @@ impl Monitor {
     if !wanted {
       return;
     }
+    if self.would_coalesce(scope, &location, &kind) {
+      return;
+    }
     let id = self.next_change_id();
     let change = Change::new(id, scope, location, kind, self.epoch_of(scope));
-    let key = Self::dedup_key(&change);
-    // Coalesce only an ADJACENT duplicate: suppress iff the most-recent still-queued
-    // change TOUCHING any location this change touches is identical. A change touches its
-    // destination; a `Moved(from)` ALSO touches its source — and this holds on BOTH sides
-    // of the comparison. So create→remove→create keeps all three (the remove differs), and
-    // move(/a→/b)→create(/a)→move(/a→/b) keeps both moves (the intervening create at the
-    // moves' source /a breaks their adjacency). A queue-wide key set — or a one-sided,
-    // destination-only scan — would drop a real transition and mis-converge the consumer.
+    self.events.push_back(change);
+  }
+
+  /// Whether a change of `kind` at `location` would coalesce into the most-recent
+  /// still-queued change touching it — the ONE dedup decision, applied by
+  /// [`emit`](Self::emit) and consulted by [`emit_rescan`](Self::emit_rescan) before
+  /// the epoch bump. A pure read of the event queue and the pending-move store:
+  /// consecutive calls with both unchanged return the same answer.
+  ///
+  /// A parked move half queues NOTHING, so an in-window ancestor transition is
+  /// invisible to the queue scan alone — a change touching a pending source is
+  /// therefore never coalescible (the pending-store side of the latent-transition
+  /// fence; suppression-reducing only, like every widening of the relation).
+  ///
+  /// Coalesce only an ADJACENT duplicate: suppress iff the most-recent still-queued
+  /// change TOUCHING any location this change touches is identical. A change touches its
+  /// destination; a `Moved(from)` ALSO touches its source — and this holds on BOTH sides
+  /// of the comparison.
+  ///
+  /// Locations touch by HIERARCHY, not equality: two locations touch iff either is a
+  /// prefix of the other ([`locations_touch`](Self::locations_touch)). Every change's
+  /// meaning depends on its whole ancestor path — an ancestor transition can remove or
+  /// replace the subtree that gives the location its object — and a `Rescan`'s coverage
+  /// is its whole subtree, so relatedness runs in BOTH directions and the touch relation
+  /// is mutual-prefix; there is no third direction. Concretely:
+  /// rescan→create(child)→rescan keeps both rescans (the second may cover a loss ordered
+  /// after that create); rescan(/a/b)→removed(/a)→created(/a)→rescan(/a/b) keeps both
+  /// rescans (the ancestor swap invalidated the first re-read);
+  /// create(/a/b)→removed(/a)→created(/a)→create(/a/b) keeps both creates (suppressing
+  /// the second would silently lose /a/b under the recreated parent);
+  /// create→remove→create at one location keeps all three; and
+  /// move(/a→/b)→create(/a)→move(/a→/b) keeps both moves. Only hierarchy-UNRELATED
+  /// (sibling-subtree) interleavings coalesce across, which is sound: a sibling
+  /// transition cannot affect this location's object, and a suppressed duplicate of a
+  /// state fact leaves the consumer at the same final state.
+  ///
+  /// Truly-adjacent identical Rescans still coalesce: nothing the earlier Rescan covers
+  /// separates them, both losses precede the survivor's delivery-time re-read, the
+  /// coalesced trigger never bumps the generation (see `emit_rescan`), and `dedup_key`
+  /// ignores the epoch precisely so one delivered instruction can stand for the run.
+  ///
+  /// Widening the touch relation only ever turns suppress into deliver: an identical
+  /// queued candidate shares the exact location (mutual-prefix includes equality), so a
+  /// wider relation merely inserts additional NON-identical stoppers ahead of it in the
+  /// scan — and extra Rescans or re-delivered state facts are always legal, silence is
+  /// not. A queue-wide key set — or a one-sided, destination-only scan — would drop a
+  /// real transition and mis-converge the consumer.
+  fn would_coalesce(&self, scope: ScopeId, location: &Location, kind: &ChangeKind) -> bool {
+    let key: DedupKey = (
+      scope,
+      location.clone(),
+      Self::kind_tag(kind),
+      kind.moved_from().cloned(),
+    );
     let mut touched: std::vec::Vec<&Location> = std::vec::Vec::with_capacity(2);
     touched.push(&key.1);
     if let Some(source) = key.3.as_ref() {
       touched.push(source);
     }
-    let duplicate = self
+    let pending_blocks = self.pending_moves.iter().any(|((half_scope, _), pending)| {
+      *half_scope == scope && self.is_watched(pending.from_parent) && {
+        let source = self.pending_from(pending);
+        touched
+          .iter()
+          .any(|&loc| Self::locations_touch(&source, loc))
+      }
+    });
+    if pending_blocks {
+      return false;
+    }
+    self
       .events
       .iter()
       .rev()
       .find(|queued| {
         queued.scope() == scope && {
           let queued_source = queued.kind().moved_from();
-          touched
-            .iter()
-            .any(|&loc| queued.location() == loc || queued_source == Some(loc))
+          touched.iter().any(|&loc| {
+            Self::locations_touch(queued.location(), loc)
+              || queued_source.is_some_and(|src| Self::locations_touch(src, loc))
+          })
         }
       })
-      .is_some_and(|queued| Self::dedup_key(queued) == key);
-    if !duplicate {
-      self.events.push_back(change);
-    }
+      .is_some_and(|queued| Self::dedup_key(queued) == key)
+  }
+
+  /// Hierarchical relatedness for the dedup's touch relation: either location lies
+  /// within the other's subtree (prefix-inclusive, so equal locations touch).
+  fn locations_touch(a: &Location, b: &Location) -> bool {
+    a.starts_with(b) || b.starts_with(a)
   }
 
   fn install_child(
@@ -1673,8 +2022,8 @@ impl Monitor {
   }
 
   fn record_location(&self, rec: &OsRecord) -> Location {
-    match rec.name() {
-      Some(name) => self.child_location(rec.watch(), name),
+    match rec.target() {
+      Some(target) => self.location_of(rec.watch()).join(target),
       None => self.location_of(rec.watch()),
     }
   }

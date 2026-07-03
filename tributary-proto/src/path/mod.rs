@@ -136,6 +136,23 @@ impl Location {
     self.0.push(segment);
     self
   }
+
+  /// Returns this location extended with every segment of `suffix`, descending
+  /// through it (builder form).
+  #[cfg_attr(not(tarpaulin), inline)]
+  #[must_use]
+  pub fn join(mut self, suffix: &Location) -> Self {
+    self.0.extend(suffix.0.iter().cloned());
+    self
+  }
+
+  /// Whether this location lies within `prefix`'s subtree — `prefix` names this
+  /// location itself or one of its ancestors (prefix-inclusive: every location
+  /// starts with itself, and everything starts with the empty root location).
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn starts_with(&self, prefix: &Location) -> bool {
+    self.0.len() >= prefix.0.len() && self.0[..prefix.0.len()] == prefix.0[..]
+  }
 }
 
 impl Default for Location {
