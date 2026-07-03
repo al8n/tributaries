@@ -796,3 +796,147 @@ async fn spawn_seed_carries_a_preexisting_submount() {
     "a seeded foreign prefix never pairs: {change:?}"
   );
 }
+
+/// A spawn already dispatched to the blocking pool is invisible to `handles`;
+/// close must hold its reply until the late stream is torn down inside the
+/// close accounting. Real time: the ~1 s grace must not fire before the
+/// pending-spawn check is exercised.
+#[tokio::test]
+async fn close_waits_for_an_in_flight_spawn_and_tears_it_down() {
+  let rig = rig_with_capacity(64);
+  let gate = rig.fs.hold_spawns();
+
+  // A watch whose future is cancelled right after the command is sent: the
+  // spawn is in flight with nobody left to take ownership.
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/r"),
+      interest: tributary_proto::Interest::all(),
+      reply,
+    })
+    .await
+    .unwrap();
+  drop(on_reply);
+
+  let (close_reply, mut on_close) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Close { reply: close_reply })
+    .await
+    .unwrap();
+
+  tokio::time::sleep(Duration::from_millis(50)).await;
+  assert!(
+    (&mut on_close).now_or_never().is_none(),
+    "close must wait for the in-flight spawn"
+  );
+
+  gate.release();
+  tokio::time::timeout(Duration::from_secs(5), on_close)
+    .await
+    .expect("close resolves once the late spawn settles")
+    .expect("the driver confirms the close");
+  assert_eq!(rig.fs.spawns(), 1, "the late spawn completed");
+  assert_eq!(
+    rig.fs.shutdowns(),
+    1,
+    "the late stream was torn down inside the close accounting"
+  );
+}
+
+/// The failed twin: a spawn racing close that returns an error just settles
+/// its accounting slot — close resolves with no stream ever live.
+#[tokio::test]
+async fn close_settles_an_in_flight_spawn_failure() {
+  let rig = rig_with_capacity(64);
+  let gate = rig.fs.hold_spawns();
+
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/r"),
+      interest: tributary_proto::Interest::all(),
+      reply,
+    })
+    .await
+    .unwrap();
+  drop(on_reply);
+
+  let (close_reply, mut on_close) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Close { reply: close_reply })
+    .await
+    .unwrap();
+
+  tokio::time::sleep(Duration::from_millis(50)).await;
+  assert!(
+    (&mut on_close).now_or_never().is_none(),
+    "close must wait for the in-flight spawn"
+  );
+
+  // The root vanishes while the spawn is parked: releasing the gate fails it.
+  rig.fs.remove("/r");
+  gate.release();
+  tokio::time::timeout(Duration::from_secs(5), on_close)
+    .await
+    .expect("close resolves once the failed spawn settles")
+    .expect("the driver confirms the close");
+  assert_eq!(rig.fs.spawns(), 0, "the spawn failed");
+  assert_eq!(rig.fs.shutdowns(), 0, "no stream ever existed");
+}
+
+/// A blocking pool wedged past the grace must not hang close forever: the
+/// reply goes out with the spawn still pending (the documented residual), and
+/// the orphan handle's Drop remains the reclamation backstop once the wedge
+/// clears.
+#[tokio::test]
+async fn close_grace_bounds_a_wedged_spawn_and_drop_reclaims_it() {
+  let rig = rig_with_capacity(64);
+  let gate = rig.fs.hold_spawns();
+
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/r"),
+      interest: tributary_proto::Interest::all(),
+      reply,
+    })
+    .await
+    .unwrap();
+  drop(on_reply);
+
+  let (close_reply, on_close) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Close { reply: close_reply })
+    .await
+    .unwrap();
+
+  tokio::time::timeout(Duration::from_secs(5), on_close)
+    .await
+    .expect("close resolves at the grace boundary")
+    .expect("the driver confirms the close");
+  assert_eq!(
+    rig.fs.shutdowns(),
+    0,
+    "the wedged spawn has not produced a stream yet"
+  );
+
+  // The wedge clears after close: the orphan completes, its op message finds
+  // the channel closed, and the handle's Drop reclaims the stream.
+  gate.release();
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while rig.fs.shutdowns() == 0 && std::time::Instant::now() < deadline {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(
+    rig.fs.shutdowns(),
+    1,
+    "the Drop backstop reclaimed the orphan"
+  );
+}
