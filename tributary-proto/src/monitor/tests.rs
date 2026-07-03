@@ -6322,3 +6322,222 @@ fn per_dir_same_source_replacement_half_is_not_reanchored() {
     "the per-directory successor half keeps the vacated path"
   );
 }
+
+/// A held source whose vacated slot is reoccupied and vacated again (a replacement
+/// watched directory moving out under its own cookie) covers the source path when
+/// each half resolves: the interleaved facts at the slot contradict the applied
+/// moves, and a destination-only rescan cannot repair the vacated path.
+#[test]
+fn held_source_replacement_covers_the_vacated_path() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a, Ok(()));
+  let _ = drain_actions(&mut m);
+
+  // The original watched dir moves out: its half parks held.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  // A replacement watched dir reoccupies the vacated slot, then moves out too.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(11),
+  );
+  let w_a2 = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a2, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(12),
+  );
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(13),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("w"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(14),
+  );
+
+  let events = drain_events(&mut m);
+  let shape: Vec<(bool, Location)> = events
+    .iter()
+    .map(|e| (e.kind().is_rescan(), e.location().clone()))
+    .collect();
+  assert_eq!(
+    shape,
+    vec![
+      (false, loc(&["z"])),
+      (true, loc(&["a"])),
+      (true, loc(&["z"])),
+      (false, loc(&["w"])),
+      (true, loc(&["a"])),
+      (true, loc(&["w"])),
+    ],
+    "each held resolution covers the vacated source AND its destination"
+  );
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["a"])));
+  assert_eq!(events[3].kind().moved_from(), Some(&loc(&["a"])));
+  let rescan_epochs: Vec<Epoch> = events
+    .iter()
+    .filter(|e| e.kind().is_rescan())
+    .map(|e| e.epoch())
+    .collect();
+  assert!(
+    rescan_epochs.windows(2).all(|w| w[0] < w[1]),
+    "every delivered cover announces its own bump"
+  );
+}
+
+/// The strand variant: the replacement's held half times out after the original's
+/// pair touched it — the `Removed` at the vacated path carries a covering `Rescan`
+/// there, exactly as an unheld dirty half would.
+#[test]
+fn held_source_replacement_strand_covers_the_vacated_path() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(11),
+  );
+  let w_a2 = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a2, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(12),
+  );
+  // The original pairs away; its resolution touches the replacement's parked half.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(13),
+  );
+  let _ = drain_events(&mut m);
+
+  m.handle_timeout(at(12) + DEFAULT_MOVE_WINDOW);
+  let events = drain_events(&mut m);
+  let shape: Vec<(bool, Location)> = events
+    .iter()
+    .map(|e| (e.kind().is_rescan(), e.location().clone()))
+    .collect();
+  assert_eq!(
+    shape,
+    vec![(false, loc(&["a"])), (true, loc(&["a"]))],
+    "the stranded replacement resolves Removed at the vacated path, covered"
+  );
+  assert!(events[0].kind().is_removed());
+}
+
+/// Precision pin: suppression UNDER a held subtree alone (no activity at the
+/// vacated source slot) still recovers destination-only — the source-side cover is
+/// owed exclusively to source-slot touches, never to under-hold content.
+#[test]
+fn under_hold_suppression_alone_stays_destination_only() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.on_watch_result(w_a, Ok(()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  // A record ON the detached subtree: fenced (suppressed), dirtying the hold.
+  m.on_os_record(
+    OsRecord::new(w_a, RecordKind::Created).with_name(seg("x")),
+    at(11),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("z"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+
+  let events = drain_events(&mut m);
+  let rescans: Vec<&Location> = events
+    .iter()
+    .filter(|e| e.kind().is_rescan())
+    .map(|e| e.location())
+    .collect();
+  assert_eq!(
+    rescans,
+    vec![&loc(&["z"])],
+    "under-hold suppression recovers at the destination only"
+  );
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["a"])),
+    "no spurious source cover without a source-slot touch"
+  );
+}
