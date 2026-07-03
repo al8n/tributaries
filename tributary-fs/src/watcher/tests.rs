@@ -236,6 +236,41 @@ mod lifecycle {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
+  /// The public close contract is honest: `Ok` proves quiescence, so a
+  /// teardown wedged past the grace — whose handle already moved into the
+  /// blocking call, beyond any Drop backstop — surfaces as `NotQuiesced`
+  /// rather than a false confirmation.
+  #[tokio::test]
+  async fn close_is_honest_about_a_wedged_teardown() {
+    let (dir, canonical) = scratch("wedged-close");
+    let fs = FakeFs::new(1);
+    fs.put(&canonical, FileKind::Dir, 1);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+    let _handle = watcher
+      .watch(&dir, Interest::all())
+      .await
+      .expect("watch goes live");
+
+    let gate = fs.hold_teardowns();
+    let err = watcher
+      .close()
+      .await
+      .expect_err("quiescence was not proven");
+    assert!(
+      err.is_not_quiesced(),
+      "a wedged teardown must not read as quiescent: {err:?}"
+    );
+
+    gate.release();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fs.shutdowns() == 0 && std::time::Instant::now() < deadline {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(fs.shutdowns(), 1, "the wedged call completes once released");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   /// Cancellation at each await boundary of `watch()` — before the grant
   /// exists and with it delivered-but-unpolled — leaves no reservation, no
   /// orphan stream, and no registry entry, and the path watches afresh.

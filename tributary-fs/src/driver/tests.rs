@@ -964,3 +964,43 @@ async fn close_grace_bounds_a_wedged_spawn_and_drop_reclaims_it() {
     "the Drop backstop reclaimed the orphan"
   );
 }
+
+/// A teardown wedged past the grace is the residual close must NOT paper
+/// over: the handle already moved into the wedged shutdown call, so no Drop
+/// backstop exists until it returns — the reply carries the pending count
+/// instead of claiming quiescence.
+#[tokio::test]
+async fn close_reports_a_wedged_teardown_instead_of_quiescence() {
+  let rig = rig_with_capacity(64);
+  rig.fs.put("/r", FileKind::Dir, 1);
+  let _scope = watch(&rig, "/r").await;
+  let gate = rig.fs.hold_teardowns();
+
+  let (close_reply, on_close) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Close { reply: close_reply })
+    .await
+    .unwrap();
+
+  let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    .await
+    .expect("close resolves at the grace boundary")
+    .expect("the driver replied");
+  assert_eq!(
+    pending, 1,
+    "the wedged teardown is reported, not papered over"
+  );
+  assert_eq!(rig.fs.shutdowns(), 0, "the stream is genuinely still live");
+
+  gate.release();
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while rig.fs.shutdowns() == 0 && std::time::Instant::now() < deadline {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(
+    rig.fs.shutdowns(),
+    1,
+    "the wedged call completes once released"
+  );
+}
