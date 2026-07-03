@@ -685,7 +685,11 @@ mod lifecycle {
       "the registry holds the final root"
     );
 
-    let file = final_root.join("a.txt");
+    // Wire paths mirror what a backend delivers: '/'-separated bytes on every
+    // host. PathBuf::join would use the HOST separator, and on Windows (where
+    // only the hermetic suites run) the byte-level root-prefix lowering would
+    // classify the event as outside the root.
+    let file = PathBuf::from("/retargeted-final/a.txt");
     fs.put(&file, FileKind::File, 9);
     fs.send_batch(
       &final_root,
