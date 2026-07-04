@@ -33,6 +33,15 @@ fn real_dir_fid(path: &std::path::Path, fsid: [u8; 8]) -> Option<Fid> {
   handle_fid_at(fd.as_fd(), fsid)
 }
 
+/// Rebuilds a `Fid` with the same handle bytes but a DIFFERENT `fsid` — the
+/// btrfs shape where the kernel's per-superblock event fsid diverges from the
+/// `statfs` per-subvolume fsid for the SAME object. Used to hand a reopen gate a
+/// request FID whose fsid differs from the seed `statfs` fsid, proving the gate
+/// keys on the handle alone (a full-`Fid` compare would falsely reject it).
+fn with_fsid(fsid: [u8; 8]) -> impl Fn(Fid) -> Fid {
+  move |fid| Fid::new(fsid, Box::from(fid.handle()))
+}
+
 /// A root that cannot export a file handle is a FATAL seed/reseed failure, never
 /// an empty successful seed: the root anchor is the base every admitted path
 /// resolves against, so without it the map admits nothing. A nonexistent path
@@ -107,9 +116,9 @@ fn walk_error_folds_to_io_for_the_reseed_path() {
 }
 
 /// The pure reopened-vs-expected gate ([`handles_match`]) — the FID-verification
-/// decision extracted so its policy is row-tested without a live fd. A reopened
-/// handle equal to the expected is a match; an unequal handle, and a `None`
-/// (reopened object exports no handle), are both mismatches: a PATH-reopen whose
+/// decision extracted so its policy is row-tested without a live fd. It compares
+/// HANDLE BYTES only: an equal handle is a match; an unequal handle, and a `None`
+/// (reopened object exports no handle), are both mismatches. A PATH-reopen whose
 /// identity the request fixed (the live-reseed root vs the spawn anchor, a pending
 /// move-in subtree vs its learned FID) must not seed/reseed the map unless the
 /// object it reopened is provably the expected one.
@@ -117,16 +126,41 @@ fn walk_error_folds_to_io_for_the_reseed_path() {
 fn handles_match_only_on_an_equal_reopened_handle() {
   let expected = some_fid(1);
   assert!(
-    handles_match(Some(&expected), &expected),
+    handles_match(Some(expected.handle()), expected.handle()),
     "an equal reopened handle is a match — the reopen landed on the expected object"
   );
   assert!(
-    !handles_match(Some(&some_fid(2)), &expected),
+    !handles_match(Some(some_fid(2).handle()), expected.handle()),
     "a different reopened handle is a mismatch — a same-superblock replacement, rejected"
   );
   assert!(
-    !handles_match(None, &expected),
+    !handles_match(None, expected.handle()),
     "a reopened object that exports no handle is a mismatch, never a silent match"
+  );
+}
+
+/// The gate keys on HANDLE BYTES alone, so identical handles carrying DIFFERENT
+/// fsids MATCH — the finding's exact shape. `expected` here is an event-style FID
+/// (the kernel's per-superblock fsid) and the reopened FID a walk-style one (the
+/// `statfs` per-subvolume fsid on btrfs); the SAME directory is stamped with
+/// different fsids on each side, yet its handle is identical, so a genuine
+/// moved-in directory must not be rejected as a replacement. Conversely a
+/// different handle sharing one fsid is still a mismatch: fsid is never part of
+/// the decision, in either direction.
+#[test]
+fn handles_match_ignores_fsid_matching_the_map_key() {
+  let handle = Box::<[u8]>::from(&[1u8, 2, 3][..]);
+  let walk_fsid = Fid::new([0u8; 8], handle.clone());
+  let event_fsid = Fid::new([9u8; 8], handle.clone());
+  assert!(
+    handles_match(Some(walk_fsid.handle()), event_fsid.handle()),
+    "identical handles with different fsids MATCH — the btrfs event-vs-statfs \
+     divergence must not reject the genuine object"
+  );
+  let same_fsid_other_handle = Fid::new([9u8; 8], Box::from(&[1u8, 2, 4][..]));
+  assert!(
+    !handles_match(Some(same_fsid_other_handle.handle()), event_fsid.handle()),
+    "a different handle is a mismatch even sharing an fsid — fsid never gates the decision"
   );
 }
 
@@ -176,8 +210,12 @@ fn reseed_root_fid_mismatch_is_rootgone_without_seeding() {
 
 /// The reseed-root gate's MATCHING-FID row on a real filesystem: `seed_walk` handed
 /// the root's REAL FID as `expected` proceeds normally — the gate passes and the
-/// root anchor is seeded. Guards against the verification over-rejecting the genuine
-/// root (a false-positive that would turn every real reseed into a fatal).
+/// root anchor is seeded. `expected` carries an EVENT-STYLE fsid that differs from
+/// the seed `statfs` fsid the walk passes, exercising the same handle-only rule the
+/// btrfs divergence forces at the subtree gate: the anchor is matched by handle
+/// bytes, never fsid, so the reseed does not falsely fatal when the two fsids
+/// diverge. Also guards against the verification over-rejecting the genuine root (a
+/// false-positive that would turn every real reseed into a fatal).
 #[test]
 fn reseed_root_fid_match_seeds_normally() {
   use std::os::unix::fs::MetadataExt;
@@ -190,7 +228,9 @@ fn reseed_root_fid_match_seeds_normally() {
     return;
   };
   let root_dev = meta.dev();
-  let Some(expected) = real_dir_fid(&root, [0u8; 8]) else {
+  // The expected anchor's fsid is event-style ([9; 8]); the walk seeds with the
+  // statfs fsid ([0; 8]). On a handle-only gate the divergence is irrelevant.
+  let Some(expected) = real_dir_fid(&root, [0u8; 8]).map(with_fsid([9u8; 8])) else {
     let _ = std::fs::remove_dir_all(&root);
     eprintln!("SKIP reseed_root_fid_match_seeds_normally: temp root exports no handle");
     return;
@@ -249,10 +289,15 @@ fn subtree_fid_mismatch_is_incomplete_without_seeding() {
   );
 }
 
-/// The move-in subtree gate's MATCHING-FID row on a real filesystem: `subtree_walk`
-/// handed the subtree's REAL FID as `subtree_fid` proceeds normally — the
-/// descendants map under it. Guards the verification against over-rejecting the
-/// genuine moved dir.
+/// The move-in subtree gate's MATCHING-FID row on a real filesystem, in the
+/// finding's exact shape: `subtree_fid` is the EVENT FID (its fsid stamped by the
+/// kernel per-superblock), while the walk seeds with the `statfs` per-subvolume
+/// fsid — the btrfs divergence. On the handle-only gate the two fsids being
+/// unequal is IRRELEVANT: the walk PROCEEDS and maps the descendants under the
+/// event FID. A full-`Fid` compare would falsely reject this genuine moved-in
+/// directory → false `Incomplete` → retry → false FATAL on a valid scope. Guards
+/// the verification against both over-rejecting the genuine moved dir AND
+/// re-importing fsid into the trust decision.
 #[test]
 fn subtree_fid_match_seeds_descendants() {
   use std::os::unix::fs::MetadataExt;
@@ -266,19 +311,25 @@ fn subtree_fid_match_seeds_descendants() {
     return;
   };
   let root_dev = meta.dev();
-  let Some(subtree_fid) = real_dir_fid(&subtree, [0u8; 8]) else {
+  // The learned FID carries an EVENT-style fsid ([9; 8]); the walk seeds with the
+  // statfs fsid ([0; 8]). The reopened object's real handle equals this FID's
+  // handle, so a handle-only gate matches despite the diverging fsids.
+  let Some(subtree_fid) = real_dir_fid(&subtree, [0u8; 8]).map(with_fsid([9u8; 8])) else {
     let _ = std::fs::remove_dir_all(&subtree);
     eprintln!("SKIP subtree_fid_match_seeds_descendants: temp fs exports no handle");
     return;
   };
   let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev);
   let _ = std::fs::remove_dir_all(&subtree);
-  let entries = result.expect("the genuine subtree passes the FID gate and seeds descendants");
+  let entries = result.expect(
+    "the genuine subtree passes the handle-only FID gate and seeds descendants, even with an \
+     event fsid diverging from the statfs fsid",
+  );
   assert!(
     entries
       .iter()
       .any(|e| e.name == std::ffi::OsStr::new("child") && e.parent.as_ref() == Some(&subtree_fid)),
-    "the matching-FID subtree walk mapped the descendant under the moved dir's FID"
+    "the matching-FID subtree walk mapped the descendant under the moved dir's event FID"
   );
 }
 
