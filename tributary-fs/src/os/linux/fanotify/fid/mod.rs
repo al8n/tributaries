@@ -130,6 +130,18 @@ impl FanMask {
 /// `Fid`s name the same object appearance, and a hash is never substituted for
 /// the comparison (a collision would fabricate identity — the class the exact
 /// intern table exists to kill).
+///
+/// Value-equality of a `Fid` is NOT object identity across fsid SOURCES. The
+/// derived `PartialEq` includes `fsid`, but the same object can carry different
+/// fsids depending on where the `Fid` was built: the kernel stamps events with a
+/// per-superblock fsid, while `statfs` on a btrfs subvolume reports a
+/// per-subvolume id, so a walk-built FID and an event-built FID for the SAME
+/// directory compare UNEQUAL. Object identity — for admission, interning, and
+/// every reopen-gate trust decision — is therefore the HANDLE BYTES alone
+/// ([`handle`](Self::handle)), which are unique within the mark's single
+/// superblock; the `fsid` is decode-side data (it makes a decoded FID's byte-form
+/// match the wire) and must never gate a trust decision. Trust sites take
+/// `handle()` bytes, not a whole `Fid`, so this is enforced by construction.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Fid {
   fsid: [u8; 8],

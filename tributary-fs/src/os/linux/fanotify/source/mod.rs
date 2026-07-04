@@ -922,20 +922,32 @@ fn handle_fid_at(dirfd: BorrowedFd<'_>, fsid: [u8; 8]) -> Option<Fid> {
 /// the intended object, and only this equality tells the two apart.
 ///
 /// The compare is delegated to the pure [`handles_match`] so the "non-encodable
-/// handle counts as a mismatch" policy is row-tested without a live fd. Both FIDs
-/// carry the SAME `fsid` (the caller's superblock id), so equality reduces to the
-/// handle bytes — the unique-within-a-superblock identity the map keys on.
+/// handle counts as a mismatch" policy is row-tested without a live fd. The
+/// decision is HANDLE BYTES ONLY — matching the [`FidMap`](super::map::FidMap)'s
+/// admission/intern semantics, which key on the handle alone because a handle is
+/// unique within the mark's single superblock. The `fsid` is used only to BUILD
+/// the reopened FID's byte-form (so `handle_fid_at` names the pinned object) and
+/// never reaches the comparison: `expected` may be an EVENT FID whose fsid the
+/// kernel stamped per-superblock, while the reopen's fsid comes from the seed
+/// `statfs` per-subvolume — the documented btrfs divergence — so comparing fsids
+/// would falsely reject a genuine object. `handles_match` takes `&[u8]`, not a
+/// `Fid`, so no fsid can enter the trust decision by construction.
 fn reopened_matches(dirfd: BorrowedFd<'_>, fsid: [u8; 8], expected: &Fid) -> bool {
-  handles_match(handle_fid_at(dirfd, fsid).as_ref(), expected)
+  let reopened = handle_fid_at(dirfd, fsid);
+  handles_match(reopened.as_ref().map(Fid::handle), expected.handle())
 }
 
-/// The pure reopened-vs-expected decision: `true` only when the reopened object
-/// exported a handle (`Some`) that equals `expected`. A `None` (the reopened
-/// object exports no handle) is a MISMATCH — the reopened path is not the object
-/// the request fixed, so it must not seed/reseed the map — never silently treated
-/// as a match. Extracted so the FID-verification gate is row-testable like
-/// [`classify_walk_skip`], with no live fd.
-fn handles_match(reopened: Option<&Fid>, expected: &Fid) -> bool {
+/// The pure reopened-vs-expected decision over HANDLE BYTES: `true` only when the
+/// reopened object exported a handle (`Some`) whose bytes equal `expected`. A
+/// `None` (the reopened object exports no handle) is a MISMATCH — the reopened
+/// path is not the object the request fixed, so it must not seed/reseed the map —
+/// never silently treated as a match. The comparison is handle-bytes-only,
+/// mirroring the map's key (unique within the mark's superblock); it takes
+/// `&[u8]` rather than `&Fid` so an fsid can never enter the trust decision (see
+/// [`reopened_matches`] and the `Fid` type docs on why value-equality is not
+/// object identity across fsid sources). Extracted so the FID-verification gate is
+/// row-testable like [`classify_walk_skip`], with no live fd.
+fn handles_match(reopened: Option<&[u8]>, expected: &[u8]) -> bool {
   reopened == Some(expected)
 }
 
