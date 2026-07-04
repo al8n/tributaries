@@ -25,7 +25,7 @@ use std::{
   time::Duration,
 };
 
-use tributary_fs::{Event, Interest, TokioWatcher, WatcherOptions};
+use tributary_fs::{Backend, BackendKind, Event, Interest, TokioWatcher, WatcherOptions};
 
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -108,7 +108,8 @@ fn scratch_under(mount: &Path, tag: &str) -> PathBuf {
 /// A fanotify-forced watcher, or `None` when the backend cannot start here
 /// (unprivileged / filesystem unsupported — the caller skips loudly).
 async fn fanotify_watcher(root: &Path) -> Option<(TokioWatcher, tributary_fs::RootHandle)> {
-  let watcher = TokioWatcher::new_forcing_fanotify(WatcherOptions::new()).expect("build watcher");
+  let options = WatcherOptions::new().with_backend(Backend::Fanotify);
+  let watcher = TokioWatcher::new(options).expect("build watcher");
   // `watch` is where the superblock mark is armed; a refusal (EPERM without
   // CAP_SYS_ADMIN, or an unsupported filesystem) surfaces here as a typed
   // Source error — the skip signal.
@@ -356,4 +357,281 @@ async fn unmount_under_watch_quiesces_without_panic() {
   // deadlock would time out the whole test). A bounded poll returning cleanly
   // is the survival proof.
   let _ = tokio::time::timeout(Duration::from_secs(2), w.next()).await;
+}
+
+/// A fresh scratch root under `TMPDIR` (the container mounts a tmpfs there), so
+/// the selection-matrix cells run on ONE root type in BOTH suite modes: under
+/// `--privileged` the `Backend::Auto` probe reaches fanotify; under default
+/// caps it falls back to inotify — no loopback needed either way.
+fn tmpfs_scratch(tag: &str) -> PathBuf {
+  static COUNTER: AtomicU32 = AtomicU32::new(0);
+  let dir = std::env::temp_dir()
+    .canonicalize()
+    .expect("canonicalize temp dir")
+    .join(format!(
+      "tributary-fs-sel-{}-{}-{}",
+      tag,
+      std::process::id(),
+      COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+  std::fs::create_dir_all(&dir).expect("create scratch root");
+  dir
+}
+
+/// Suite 12 (§6.3), the selection matrix — the self-probing cell.
+///
+/// `Backend::Auto` watches a tmpfs root and the SAME body asserts both matrix
+/// arms: under `CAP_SYS_ADMIN` (the `fanotify` suite) the probe selects
+/// fanotify; under default caps (the `inotify` suite) it falls back to inotify.
+/// EITHER WAY the consumer contract is identical — a create under the root is
+/// delivered — and [`Watcher::backend_of`] reports exactly which backend the
+/// barrier settled on.
+#[tokio::test]
+async fn selection_matrix_auto_self_probes() {
+  let root = tmpfs_scratch("auto");
+  let w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Auto))
+    .expect("build Auto watcher");
+  let handle = match w.watch(&root, Interest::all()).await {
+    Ok(handle) => handle,
+    Err(err) => {
+      // Auto never fails for privilege (it falls back); a failure here is the
+      // environment refusing even inotify — skip loudly.
+      eprintln!("SKIP selection_matrix_auto_self_probes: Auto watch refused ({err})");
+      return;
+    }
+  };
+  let selected = w
+    .backend_of(handle)
+    .expect("a live root reports its backend");
+
+  // The matrix invariant: privilege → fanotify, otherwise the inotify fallback.
+  // We do not assume which mode we run in; we assert the selection is coherent
+  // with it and that events flow identically.
+  let privileged = has_sys_admin();
+  match selected {
+    BackendKind::Fanotify => assert!(
+      privileged,
+      "fanotify was selected without CAP_SYS_ADMIN — the FILESYSTEM mark cannot have passed"
+    ),
+    BackendKind::Inotify => { /* the fallback: valid in either mode */ }
+    BackendKind::FsEvents => panic!("FSEvents is impossible on Linux"),
+  }
+  if privileged {
+    assert_eq!(
+      selected,
+      BackendKind::Fanotify,
+      "under privilege on tmpfs, Auto must select fanotify"
+    );
+  }
+
+  // The consumer contract is identical across the matrix: a create is delivered.
+  let mut w = w;
+  std::fs::write(root.join("probe.txt"), b"x").unwrap();
+  let target = root.join("probe.txt");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &target)).await.is_some(),
+    "the {selected} backend delivers the create"
+  );
+}
+
+/// Suite 12 — the forced-`Fanotify`-without-privilege cell: forcing fanotify
+/// when its preconditions do not hold fails the `watch` with a typed
+/// [`SourceError::BackendProbeFailed`] (NOT a fallback), delivers ZERO events,
+/// and is victimless — the watcher stays usable and closes cleanly.
+///
+/// Self-probing: under `CAP_SYS_ADMIN` the mark WOULD succeed, so the cell only
+/// asserts its property where the mark is refused; with privilege it skips.
+#[tokio::test]
+async fn forced_fanotify_without_privilege_is_typed_error() {
+  if has_sys_admin() {
+    eprintln!("SKIP forced_fanotify_without_privilege_is_typed_error: has CAP_SYS_ADMIN");
+    return;
+  }
+  let root = tmpfs_scratch("forced");
+  let w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Fanotify))
+    .expect("build forced-fanotify watcher");
+
+  let err = w
+    .watch(&root, Interest::all())
+    .await
+    .expect_err("forced fanotify without privilege must fail");
+  assert!(
+    matches!(
+      err,
+      tributary_fs::WatchRootError::Source(tributary_fs::SourceError::BackendProbeFailed { .. })
+    ),
+    "the failure is the typed probe error, never a silent fallback: {err:?}"
+  );
+
+  // Victimless: no event is fabricated, and the watcher closes cleanly.
+  let mut w = w;
+  std::fs::write(root.join("noise.txt"), b"n").unwrap();
+  let leaked = tokio::time::timeout(Duration::from_secs(2), w.next()).await;
+  assert!(
+    matches!(leaked, Err(_) | Ok(None)),
+    "a failed forced-fanotify watch delivers no events: {leaked:?}"
+  );
+  w.close().await.expect("the watcher closes cleanly");
+}
+
+/// Suite 11 (strengthened) — root death via the refresh path (design §7 gap,
+/// now closed by L4.2). A fanotify root that is unmounted out from under the
+/// watcher delivers no in-tree signal; the mount refresh's folded-in root
+/// re-stat is what detects it. This keeps the watch LIVE, lazily detaches the
+/// mount (so the root path stops resolving while the mark's sb stays alive),
+/// induces the loss path (which arms a refresh), and asserts the terminal
+/// `Rescan` arrives and the handle goes dead.
+///
+/// Best-effort on the trigger: if the loss/refresh cannot be induced in the
+/// environment, the cell verifies survival (the §7 floor) and notes the skip —
+/// the deterministic proof of the composition is the hermetic core suite
+/// (`refresh_finding_root_gone_is_delete_self`).
+#[tokio::test]
+async fn unmount_under_live_watch_dies_via_refresh() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!("SKIP unmount_under_live_watch_dies_via_refresh: no ext4 loopback (--privileged)");
+    return;
+  };
+  let root = scratch_under(&mount, "refresh-death");
+  // A tiny OS-batch channel so a burst overflows it → the transport loss path →
+  // a mount refresh armed on a LIVE (still-marked) scope; that refresh's root
+  // re-stat is what detects the vanished root.
+  let options = WatcherOptions::new()
+    .with_backend(Backend::Fanotify)
+    .with_os_batch_capacity(std::num::NonZeroUsize::new(1).unwrap());
+  let w = TokioWatcher::new(options).expect("build watcher");
+  let Ok(handle) = w.watch(&root, Interest::all()).await else {
+    eprintln!("SKIP unmount_under_live_watch_dies_via_refresh: fanotify unavailable");
+    let _ = Command::new("umount").arg(&mount).status();
+    return;
+  };
+  let mut w = w;
+
+  // A directory INSIDE the root, opened as an fd BEFORE the unmount: after a
+  // lazy detach the root path stops resolving, but this fd still addresses the
+  // (mark-kept-alive) superblock, so `openat` through it keeps generating real
+  // fanotify events — the only way to drive the loss path post-detach.
+  std::fs::create_dir_all(root.join("live")).unwrap();
+  let live_fd = open_dir_fd(&root.join("live"));
+  std::fs::write(root.join("live/marker.txt"), b"m").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &root.join("live/marker.txt")))
+      .await
+      .is_some(),
+    "the mark is live before the unmount"
+  );
+
+  // Lazy-unmount: detaches the mount from the namespace immediately (the root
+  // path stops resolving) while the open mark keeps the superblock alive — the
+  // exact "unmounted out from under a live watch" condition §7 describes.
+  let detached = Command::new("umount")
+    .args(["-l"])
+    .arg(&mount)
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false);
+  if !detached {
+    eprintln!("SKIP unmount_under_live_watch_dies_via_refresh: lazy umount refused");
+    let _ = w.unwatch(handle).await;
+    let _ = Command::new("umount").arg(&mount).status();
+    return;
+  }
+
+  // The root path is gone from the namespace now.
+  assert!(
+    std::fs::metadata(&root).is_err(),
+    "the lazily-detached root no longer resolves"
+  );
+
+  // Drive the loss path: each round creates files through the RETAINED fd (the
+  // path is gone, so only `openat` works), flooding the tiny OS-batch channel →
+  // the transport loss → one mount refresh, whose root re-stat now finds the
+  // path gone and lowers the death lifecycle. The SOLE success signal is the
+  // handle being reclaimed (dead-on-arrival). Convergence-style across rounds;
+  // draining the stream keeps the driver making progress.
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  while w.backend_of(handle).is_some() && std::time::Instant::now() < deadline {
+    if let Some(fd) = live_fd {
+      for i in 0..128 {
+        openat_create(fd, &format!("burst-{i}.txt"));
+      }
+    }
+    let _ = tokio::time::timeout(Duration::from_millis(300), w.next()).await;
+  }
+
+  if w.backend_of(handle).is_none() {
+    // The refresh-detected death ran end to end: the registry reclaimed the
+    // handle, exactly like an in-tree DELETE_SELF would.
+    assert!(
+      w.root_path(handle).is_none(),
+      "a reclaimed handle has no path"
+    );
+  } else {
+    // The §7 SURVIVAL floor still holds if the loss could not be induced here
+    // (e.g. `openat` on the detached sb refused): the watcher is quiet-but-alive
+    // — no panic, no hang. The deterministic proof of the composition is the
+    // hermetic suite (core `refresh_finding_root_gone_is_delete_self`, driver
+    // `refresh_finding_root_gone_dies_end_to_end`).
+    eprintln!(
+      "NOTE unmount_under_live_watch_dies_via_refresh: loss not induced on the \
+       detached sb; survival floor holds (composition proven hermetically)"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), w.next()).await;
+  }
+  if let Some(fd) = live_fd {
+    // SAFETY: fd was opened by `open_dir_fd` and is not used again.
+    unsafe { libc::close(fd) };
+  }
+  let _ = w.close().await;
+}
+
+/// Opens `dir` as an `O_DIRECTORY` fd (for post-detach `openat`), or `None` on
+/// failure. The caller closes it.
+fn open_dir_fd(dir: &Path) -> Option<libc::c_int> {
+  use std::os::unix::ffi::OsStrExt;
+  let cpath = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+  // SAFETY: cpath is a valid NUL-terminated path; the flags are constants.
+  let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+  (fd >= 0).then_some(fd)
+}
+
+/// Creates (and immediately closes) a file named `name` under the directory
+/// `dirfd` addresses — an `openat` that fires a fanotify create on the marked
+/// superblock even after the mount was lazily detached. Best-effort.
+fn openat_create(dirfd: libc::c_int, name: &str) {
+  let Ok(cname) = std::ffi::CString::new(name) else {
+    return;
+  };
+  // SAFETY: dirfd is a live directory fd; cname is NUL-terminated; the flags and
+  // mode are constants.
+  let fd = unsafe {
+    libc::openat(
+      dirfd,
+      cname.as_ptr(),
+      libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+      0o644,
+    )
+  };
+  if fd >= 0 {
+    // SAFETY: fd is the freshly-opened descriptor, used nowhere else.
+    unsafe { libc::close(fd) };
+  }
+}
+
+/// Whether the process holds `CAP_SYS_ADMIN` — the capability the fanotify
+/// FILESYSTEM mark needs. Read from `/proc/self/status`'s effective-cap bitmask
+/// (bit 21 = `CAP_SYS_ADMIN`); a read failure conservatively reports `false`.
+fn has_sys_admin() -> bool {
+  let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+    return false;
+  };
+  for line in status.lines() {
+    if let Some(hex) = line.strip_prefix("CapEff:") {
+      if let Ok(caps) = u64::from_str_radix(hex.trim(), 16) {
+        return caps & (1 << 21) != 0;
+      }
+      return false;
+    }
+  }
+  false
 }

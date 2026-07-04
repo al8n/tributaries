@@ -21,10 +21,13 @@ use tributary_proto::{
 };
 
 use crate::{
-  core::{Delivery, DriverCore, Effect, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate},
+  core::{
+    Delivery, DriverCore, Effect, MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate,
+    RootLiveness,
+  },
   error::WatchRootError,
   os::{
-    BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, Source, SourceConfig,
+    Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, Source, SourceConfig,
     SourceError, SourceHandle, SourceMessage, linux::WatchOutcome,
   },
 };
@@ -46,9 +49,20 @@ pub(crate) struct DriverConfig {
   pub(crate) os_batch_capacity: NonZeroUsize,
   /// Load-shedding exclusion directories applied to every root.
   pub(crate) exclusions: Vec<PathBuf>,
-  /// The backend lowering profile every root registers with. Fixed per
-  /// platform until per-root selection lands with the fanotify backend.
+  /// The backend lowering profile every root registers with — the PROVISIONAL
+  /// Monitor profile (the platform's descending default on Linux). Under
+  /// [`Backend::Auto`] the spawn barrier probes and the core adopts the
+  /// resolved backend's profile at [`on_stream_spawned`]; a forced backend
+  /// makes this the final profile.
+  ///
+  /// [`on_stream_spawned`]: DriverCore::on_stream_spawned
   pub(crate) profile: BackendKind,
+  /// The per-root backend SELECTION the spawn barrier honors: [`Backend::Auto`]
+  /// probes and falls back, the explicit variants pin the choice (a forced
+  /// [`Backend::Fanotify`] surfaces a typed error instead of falling back).
+  /// Ignored on macOS. The Monitor profile above is provisional until this
+  /// resolves.
+  pub(crate) backend: Backend,
 }
 
 impl DriverConfig {
@@ -243,13 +257,16 @@ pub(crate) struct SpawnedSource<H> {
 pub(crate) trait ScopeRegistry: Send + Sync + 'static {
   /// `scope`'s stream is live; its event paths arrive under `root`, whose
   /// object identity and ancestor identities the registry retains for the
-  /// disjointness checks of later watches.
+  /// disjointness checks of later watches. `backend` is the primitive the
+  /// spawn barrier selected — the capability report a later `backend_of` query
+  /// reads back.
   fn scope_live(
     &self,
     scope: ScopeId,
     root: &Path,
     identity: RootIdentity,
     ancestors: &[RootIdentity],
+    backend: BackendKind,
   );
 
   /// `scope` ended (unwatch, root death, stream fatal, close); its entry is
@@ -290,9 +307,12 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// `lstat`s one path (blocking).
   fn probe(&self, path: &Path) -> ProbeOutcome;
 
-  /// Re-reads the live mount table strictly under `root` (blocking),
-  /// returning the mount prefixes and whether the read was authoritative.
-  fn refresh_mounts(&self, root: &Path) -> (Vec<PathBuf>, bool);
+  /// Re-reads the live mount table strictly under `root` AND re-stats the root
+  /// itself (blocking): the mount prefixes, whether the read was authoritative,
+  /// and the root's liveness. The root re-stat rides the mount refresh so a
+  /// kernel-recursive backend's root death (unmount/replace — no in-tree signal)
+  /// is caught at the refresh cadence without any new timer or effect.
+  fn refresh_mounts(&self, root: &Path) -> MountRefresh;
 
   /// Attaches the arm/disarm port of `scope`'s freshly spawned source, so the
   /// descending executors can route to its reader. A no-op for executors
@@ -454,10 +474,24 @@ impl FsOps for RealFs {
     }
   }
 
-  fn refresh_mounts(&self, root: &Path) -> (Vec<PathBuf>, bool) {
-    match crate::os::mounts_under(root) {
+  fn refresh_mounts(&self, root: &Path) -> MountRefresh {
+    let (mounts, authoritative) = match crate::os::mounts_under(root) {
       Some(mounts) => (mounts, true),
       None => (Vec::new(), false),
+    };
+    // The root re-stat rides the same blocking call: `symlink_metadata` so a
+    // root retargeted to a symlink is a replacement, not a follow. A vanished
+    // root is `Missing` (DeleteSelf); any other failure is `Unreadable`
+    // (MoveSelf) — the exact `RootChanged`-probe mapping.
+    let root_liveness = match std::fs::symlink_metadata(root) {
+      Ok(meta) => RootLiveness::Present(RootIdentity::new(dev_of(&meta), ino_of(&meta))),
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => RootLiveness::Missing,
+      Err(_) => RootLiveness::Unreadable,
+    };
+    MountRefresh {
+      mounts,
+      authoritative,
+      root: root_liveness,
     }
   }
   #[cfg(all(target_os = "linux", not(miri)))]
@@ -627,8 +661,7 @@ enum OpResult<H> {
   },
   MountsRefreshed {
     scope: ScopeId,
-    mounts: Vec<PathBuf>,
-    authoritative: bool,
+    refresh: MountRefresh,
   },
   TornDown {
     scope: ScopeId,
@@ -753,6 +786,7 @@ pub(crate) async fn run<R, F>(
               let canonical_root = spawned.meta.root.clone();
               let identity = spawned.meta.identity;
               let ancestors = spawned.meta.ancestors.clone();
+              let backend = spawned.meta.backend;
               let pending = watch_replies.remove(&scope);
               // FINAL-ROOT REVALIDATION: the backend re-canonicalizes during
               // spawn, so the root the stream actually watches can differ
@@ -805,8 +839,8 @@ pub(crate) async fn run<R, F>(
                 // insert-after-remove race has no actors left to run it. A
                 // scope dying before the caller polls its grant simply yields
                 // a dead-on-arrival handle.
-                registry.scope_live(scope, &canonical_root, identity, &ancestors);
-                match config.profile {
+                registry.scope_live(scope, &canonical_root, identity, &ancestors, backend);
+                match backend {
                   // Descending: the stream is live but covers NOTHING until
                   // the root's kernel watch arms; the grant defers to the
                   // root's watch-result so the public "from resolve, every
@@ -861,11 +895,9 @@ pub(crate) async fn run<R, F>(
             }
           }},
           OpResult::Probed { probe, outcome } => core.on_probe_result(probe, outcome, now()),
-          OpResult::MountsRefreshed {
-            scope,
-            mounts,
-            authoritative,
-          } => core.on_mounts_refreshed(scope, mounts, authoritative),
+          OpResult::MountsRefreshed { scope, refresh } => {
+            core.on_mounts_refreshed(scope, refresh, now())
+          }
           OpResult::WatchInstalled { watch, outcome } => {
           // A deferred registration grant riding on this arm resolves FIRST,
           // so a failed root arm answers the caller before the core's
@@ -977,11 +1009,9 @@ pub(crate) async fn run<R, F>(
           core.on_watch_installed(watch, outcome);
         }
         Ok(OpResult::Enumerated { req, raw }) => core.on_enumerated(req, raw),
-        Ok(OpResult::MountsRefreshed {
-          scope,
-          mounts,
-          authoritative,
-        }) => core.on_mounts_refreshed(scope, mounts, authoritative),
+        Ok(OpResult::MountsRefreshed { scope, refresh }) => {
+          core.on_mounts_refreshed(scope, refresh, now())
+        }
         // A spawn that raced the close: the stream is live but has no owner —
         // tear it down INSIDE the close accounting (the handle's Drop is only
         // the backstop past the grace) and hold the close reply for its
@@ -1061,10 +1091,11 @@ fn execute_effects<R, F>(
         source_config.exclusions = config.exclusions.clone();
         source_config.latency = config.latency;
         source_config.channel_capacity = config.os_batch_capacity;
-        // The spawn selector follows the registered lowering profile: a
-        // `Fanotify` profile spawns the fanotify source, everything else
-        // inotify. (macOS ignores the selector — FSEvents is its one backend.)
-        source_config.backend = crate::os::Backend::for_profile(config.profile);
+        // The spawn selector carries the consumer's backend choice straight to
+        // the barrier: `Backend::Auto` probes and falls back, a forced backend
+        // pins it (and surfaces a typed error rather than falling back).
+        // (macOS ignores the selector — FSEvents is its one backend.)
+        source_config.backend = config.backend;
         let ops = ops.clone();
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {
@@ -1151,12 +1182,8 @@ fn execute_effects<R, F>(
         let ops = ops.clone();
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {
-          let (mounts, authoritative) = ops.refresh_mounts(&root);
-          let _ = tx.try_send(OpResult::MountsRefreshed {
-            scope,
-            mounts,
-            authoritative,
-          });
+          let refresh = ops.refresh_mounts(&root);
+          let _ = tx.try_send(OpResult::MountsRefreshed { scope, refresh });
         });
       }
       Effect::Emit {
@@ -1198,6 +1225,7 @@ fn clone_error(err: &SourceError) -> SourceError {
       source: std::io::Error::new(source.kind(), source.kind().to_string()),
     },
     SourceError::StartFailed => SourceError::StartFailed,
+    SourceError::BackendProbeFailed { stage } => SourceError::BackendProbeFailed { stage: *stage },
     SourceError::CallbackPanic => SourceError::CallbackPanic,
   }
 }

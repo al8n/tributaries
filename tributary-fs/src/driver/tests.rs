@@ -24,6 +24,7 @@ fn config() -> DriverConfig {
     os_batch_capacity: NonZeroUsize::new(8).unwrap(),
     exclusions: Vec::new(),
     profile: BackendKind::FsEvents,
+    backend: Backend::Auto,
   }
 }
 
@@ -524,6 +525,39 @@ async fn overflow_refreshes_mount_trust_and_pairing_resumes() {
   assert_eq!(change.location(), &loc(&["b", "new"]));
 }
 
+/// Root-death via the refresh path (design §7 gap, closed by L4.2): a refresh
+/// whose folded-in root re-stat finds the root GONE lowers the death lifecycle
+/// end to end — the terminal `Rescan` is delivered and the driver reclaims the
+/// registry entry — with no new timer or effect (the loss-armed refresh is the
+/// same one mount trust rides). The kernel-recursive backends' only unmount
+/// detection.
+#[tokio::test(start_paused = true)]
+async fn refresh_finding_root_gone_dies_end_to_end() {
+  let registry = RecordingRegistry::default();
+  let rig = rig_with(64, registry.clone());
+  let scope = watch(&rig, "/r").await;
+  assert_eq!(rig.fs.refreshes(), 1, "the birth refresh already ran");
+
+  // Arm the next refresh to report the root GONE, then induce the loss path
+  // that runs it (the loss revokes trust and arms one refresh).
+  rig.fs.set_root_liveness(RootLiveness::Missing);
+  rig.fs.send_lossy("/r");
+
+  // The loss itself yields the standing Rescan; the refresh-detected death then
+  // ends the scope with its terminal Rescan and reclaims the entry.
+  settle(|| registry.dead() == [scope]).await;
+  assert_eq!(
+    registry.dead(),
+    [scope],
+    "the refresh-detected death reclaimed the registry entry"
+  );
+  assert_eq!(
+    rig.fs.shutdowns(),
+    1,
+    "the dead root's stream was torn down"
+  );
+}
+
 /// Every delivery carries the canonical root it assembles under, so the
 /// consumer never needs a registry entry — a reclaimed scope's trailing
 /// changes still name their absolute paths.
@@ -556,7 +590,7 @@ async fn registry_sees_live_then_dead_in_order() {
   let scope = watch(&rig, "/r").await;
   assert_eq!(
     registry.live(),
-    [(scope, PathBuf::from("/r"))],
+    [(scope, PathBuf::from("/r"), BackendKind::FsEvents)],
     "the entry was live before the grant resolved"
   );
 
@@ -596,7 +630,10 @@ async fn death_between_grant_send_and_poll_leaves_a_consistent_registry() {
   // The grant resolves — the registry entry is already live.
   let grant = on_reply.await.unwrap().expect("watch succeeds");
   let scope = grant.scope();
-  assert_eq!(registry.live(), [(scope, PathBuf::from("/r"))]);
+  assert_eq!(
+    registry.live(),
+    [(scope, PathBuf::from("/r"), BackendKind::FsEvents)]
+  );
 
   // The source dies before the caller "polls" (commits) the grant.
   rig.fs.disconnect("/r");

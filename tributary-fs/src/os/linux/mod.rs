@@ -18,9 +18,16 @@
 pub(crate) mod fanotify;
 pub(crate) mod inotify;
 
+#[cfg(all(target_os = "linux", not(miri)))]
+mod probe;
+
 #[cfg(test)]
 mod tests;
 
+// `Path`/`PathBuf` back the mountinfo parser and `mounts_under`, both gated to
+// unix-or-test; a non-unix lib target (wasm) compiles neither, so the import
+// rides the same gate to stay warning-clean on the cross legs.
+#[cfg(any(unix, test))]
 use std::path::{Path, PathBuf};
 
 use tributary_proto::WatchId;
@@ -240,20 +247,65 @@ pub(crate) struct Source;
 
 #[cfg(all(target_os = "linux", not(miri)))]
 impl Source {
-  /// Spawns the source for `config.backend`. inotify is the default; fanotify
-  /// is reachable only through an explicit request (no `Backend::Auto` yet).
+  /// Spawns the source `config.backend` selects, running the `Backend::Auto`
+  /// probe (design §5) inside this pre-start barrier when asked.
+  ///
+  /// - [`Backend::Inotify`](super::Backend::Inotify) skips the probe and spawns
+  ///   inotify directly.
+  /// - [`Backend::Fanotify`](super::Backend::Fanotify) runs the probe and, on
+  ///   any failing stage, returns the typed
+  ///   [`BackendProbeFailed`](super::SourceError::BackendProbeFailed) rather
+  ///   than falling back.
+  /// - [`Backend::Auto`](super::Backend::Auto) runs the probe and, on any
+  ///   failing stage, falls back to inotify.
+  ///
+  /// A passing probe leaves the fanotify instance CREATED and its superblock
+  /// mark INSTALLED; that fd is handed straight to the fanotify source, which
+  /// reuses it — the mark is never installed twice.
   pub(crate) fn spawn(
     config: super::SourceConfig,
   ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
     match config.backend {
-      super::Backend::Inotify => {
-        let (handle, rx, meta) = inotify_source::Source::spawn(config)?;
-        Ok((SourceHandle::Inotify(handle), rx, meta))
-      }
-      super::Backend::Fanotify => {
-        let (handle, rx, meta) = fanotify::Source::spawn(config)?;
+      super::Backend::Inotify => Self::spawn_inotify(config),
+      super::Backend::Fanotify => Self::spawn_probed(config, false),
+      super::Backend::Auto => Self::spawn_probed(config, true),
+    }
+  }
+
+  /// The inotify branch (no probe).
+  fn spawn_inotify(
+    config: super::SourceConfig,
+  ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
+    let (handle, rx, meta) = inotify_source::Source::spawn(config)?;
+    Ok((SourceHandle::Inotify(handle), rx, meta))
+  }
+
+  /// The probed branch, shared by `Auto` and forced `Fanotify`: canonicalize
+  /// once, run the fanotify precondition probe, and either spawn fanotify
+  /// reusing the probed fd, or handle the failure per `fall_back`.
+  fn spawn_probed(
+    config: super::SourceConfig,
+    fall_back: bool,
+  ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
+    if config.roots.is_empty() {
+      return Err(super::SourceError::NoRoots);
+    }
+    let supplied = &config.roots[0];
+    let canonical =
+      std::fs::canonicalize(supplied).map_err(|source| super::SourceError::RootUnavailable {
+        root: supplied.clone(),
+        source,
+      })?;
+
+    match probe::probe_fanotify(&canonical) {
+      Ok(probed) => {
+        let (handle, rx, meta) = fanotify::Source::spawn(config, canonical, probed.fd)?;
         Ok((SourceHandle::Fanotify(handle), rx, meta))
       }
+      // Auto falls through to the universal backend; a forced `Fanotify` never
+      // silently downgrades — it surfaces which precondition failed.
+      Err(_) if fall_back => Self::spawn_inotify(config),
+      Err(stage) => Err(probe::probe_error(stage)),
     }
   }
 }

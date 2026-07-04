@@ -58,8 +58,15 @@ case "$SUITE" in
     ;;
   # Single-threaded by contract: the privileged cells shrink the user
   # namespace's inotify sysctls, which would starve concurrent event tests.
+  #
+  # The linux_fanotify binary also runs here under DEFAULT caps: its loopback
+  # cells self-skip (no privilege), but the selection-matrix cell exercises the
+  # `Backend::Auto` FALLBACK arm (probe fails without CAP_SYS_ADMIN → inotify)
+  # and the forced-`Fanotify`-without-privilege typed-error cell — the default-
+  # caps half of suite 12 the privileged `fanotify` suite cannot reach.
   inotify)
-    run_default 'cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1'
+    run_default 'cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1 \
+      && cargo test -p tributary-fs --all-features --test linux_fanotify -- --test-threads=1'
     ;;
   inotify-priv)
     run_priv 'cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1'

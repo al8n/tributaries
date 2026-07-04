@@ -14,6 +14,18 @@
 //! carrying paths already resolved against the map and identity already
 //! interned — the compile path only lowers each absolute path to its
 //! root-relative form.
+//!
+//! Root death (unmount / replace) carries NO in-tree fanotify signal — an
+//! unmounted `FAN_MARK_FILESYSTEM` superblock stays alive under the mark and the
+//! fd simply goes quiet (design §7, container-validated). Detection is instead
+//! the mount refresh's folded-in root re-stat (`FsOps::refresh_mounts` →
+//! `MountRefresh.root`), compared against the barrier identity in
+//! `DriverCore::on_mounts_refreshed`: a missing/replaced root lowers the same
+//! `DeleteSelf`/`MoveSelf` death lifecycle a macOS `RootChanged` probe uses. The
+//! refresh runs at scope birth and on every loss signal, so **that cadence is
+//! the honest detection latency** — no timer, no new effect; an unmount with no
+//! following loss is seen at the next loss-armed refresh, and the watcher stays
+//! quiet-but-alive until then.
 
 pub(crate) mod fid;
 pub(crate) mod map;
@@ -213,7 +225,7 @@ fn os_name(name: &[u8]) -> std::ffi::OsString {
 /// `FAN_CLASS_NOTIF` is `0x0` (the notification class is the flag word's
 /// default), so it contributes no bits and is omitted from the OR.
 #[cfg(all(target_os = "linux", not(miri)))]
-const FAN_INIT_FLAGS: u32 = 0x0000_0200 // FAN_REPORT_FID
+pub(super) const FAN_INIT_FLAGS: u32 = 0x0000_0200 // FAN_REPORT_FID
   | 0x0000_0400 // FAN_REPORT_DIR_FID  (half of DFID_NAME)
   | 0x0000_0800 // FAN_REPORT_NAME     (half of DFID_NAME)
   | 0x0000_1000; // FAN_REPORT_TARGET_FID
@@ -221,7 +233,7 @@ const FAN_INIT_FLAGS: u32 = 0x0000_0200 // FAN_REPORT_FID
 /// The mark mask armed on the superblock (design §4.1): every dirent verb plus
 /// the self-events and `FAN_ONDIR` so directory events are reported.
 #[cfg(all(target_os = "linux", not(miri)))]
-const FAN_MARK_MASK: u64 = fid::FAN_CREATE
+pub(super) const FAN_MARK_MASK: u64 = fid::FAN_CREATE
   | fid::FAN_DELETE
   | fid::FAN_MODIFY
   | fid::FAN_ATTRIB

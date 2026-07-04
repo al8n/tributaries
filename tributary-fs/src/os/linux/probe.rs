@@ -1,0 +1,150 @@
+//! The `Backend::Auto` selection probe (design §5), executed inside the
+//! pre-start barrier — once per root, before any stream goes live, never
+//! retried.
+//!
+//! The probe is the fanotify-FILESYSTEM precondition test AND its bootstrap:
+//! on success it leaves the fanotify instance already created and the
+//! superblock mark already installed, and hands that live fd back so the
+//! fanotify source reuses it (no second `fanotify_init`, no double mark).
+//! Selection:
+//!
+//! - `Backend::Auto` runs the probe and falls back to inotify at the first
+//!   failing stage.
+//! - `Backend::Fanotify` runs the same probe but surfaces the first failure as
+//!   a typed [`SourceError::BackendProbeFailed`] instead of falling back.
+//! - `Backend::Inotify` skips the probe entirely.
+//!
+//! Probe order (design §5, container-validated correction embedded): an
+//! unprivileged `fanotify_init` WITH the FID flags succeeds on modern kernels,
+//! so the `FAN_MARK_FILESYSTEM` mark — not the init — is the real privilege
+//! discriminator (it is what returns `EPERM` without `CAP_SYS_ADMIN`).
+
+use std::{
+  io,
+  os::{
+    fd::{AsRawFd, FromRawFd, OwnedFd},
+    unix::ffi::OsStrExt,
+  },
+  path::Path,
+};
+
+use super::{
+  super::{ProbeStage, SourceError},
+  fanotify::{FAN_INIT_FLAGS, FAN_MARK_MASK},
+};
+
+/// A live fanotify instance whose superblock mark is already installed — the
+/// probe's success artifact, reused by the fanotify source's spawn so the mark
+/// is never installed twice.
+pub(crate) struct ProbedFanotify {
+  /// The created, `FAN_MARK_FILESYSTEM`-marked fanotify fd.
+  pub(crate) fd: OwnedFd,
+}
+
+/// Runs the fanotify precondition probe on the canonical root (design §5 rows
+/// 2–5; row 1, the statfs locality allowlist, is the barrier step each source
+/// already runs). On success the returned fd is init'd AND marked — the
+/// fanotify source reuses it. On failure the [`ProbeStage`] names the first
+/// stage that failed; the caller decides fall-back vs typed error.
+///
+/// Every fd opened here is closed before returning on any failure path — a
+/// probe never leaks the instance it was testing.
+pub(crate) fn probe_fanotify(root: &Path) -> Result<ProbedFanotify, ProbeStage> {
+  // Row 2/3: create the instance with the full composite. EINVAL/EPERM here is
+  // the kernel/filesystem being too old, or the class being unavailable.
+  let fd = create_instance().map_err(|()| ProbeStage::Init)?;
+
+  // Row 4 — THE discriminator: the FILESYSTEM mark. Unprivileged init with FID
+  // flags succeeds on modern kernels; this is what returns EPERM without
+  // CAP_SYS_ADMIN (container-validated). The fd drops (closing the instance) on
+  // failure via the early return.
+  if mark_filesystem(&fd, root).is_err() {
+    return Err(ProbeStage::Mark);
+  }
+
+  // Row 5: the root must be handle-exportable, or the FID map cannot be seeded.
+  if !root_exports_handle(root) {
+    return Err(ProbeStage::Handle);
+  }
+
+  Ok(ProbedFanotify { fd })
+}
+
+/// Maps a probe failure to the forced-`Fanotify` spawn error (design §5: a
+/// forced backend surfaces the failure typed rather than falling back).
+pub(crate) fn probe_error(stage: ProbeStage) -> SourceError {
+  SourceError::BackendProbeFailed { stage }
+}
+
+/// Row 2/3: `fanotify_init` with the golden composite. `Err(())` on any
+/// refusal — the probe only needs "did it work", not the errno.
+fn create_instance() -> Result<OwnedFd, ()> {
+  // SAFETY: plain syscall; the returned fd is owned exclusively here.
+  let fd = unsafe {
+    libc::fanotify_init(
+      FAN_INIT_FLAGS | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
+      (libc::O_RDONLY | libc::O_LARGEFILE) as libc::c_uint,
+    )
+  };
+  if fd < 0 {
+    return Err(());
+  }
+  // SAFETY: fd is a fresh, owned descriptor.
+  Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Row 4: `FAN_MARK_ADD | FAN_MARK_FILESYSTEM` with the dirent + self-event
+/// mask. `Err(())` on any refusal (EPERM is the privilege discriminator).
+fn mark_filesystem(fd: &OwnedFd, root: &Path) -> Result<(), ()> {
+  let Ok(cpath) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
+    return Err(());
+  };
+  // SAFETY: cpath is NUL-terminated; fd is the owned fanotify instance.
+  let rc = unsafe {
+    libc::fanotify_mark(
+      fd.as_raw_fd(),
+      libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
+      FAN_MARK_MASK,
+      libc::AT_FDCWD,
+      cpath.as_ptr(),
+    )
+  };
+  if rc != 0 { Err(()) } else { Ok(()) }
+}
+
+/// Row 5: whether the root's filesystem can encode a file handle for it —
+/// `name_to_handle_at` succeeding (or reporting a too-small buffer, which still
+/// proves handle support). A hard `EOPNOTSUPP` means no FID identity.
+fn root_exports_handle(root: &Path) -> bool {
+  let Ok(cpath) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
+    return false;
+  };
+  // A minimal handle buffer: the call fails with EOVERFLOW when the real handle
+  // is larger, which STILL proves the filesystem exports handles (the seeding
+  // walk over-allocates properly). Only EOPNOTSUPP means no handle support.
+  let prefix = std::mem::size_of::<libc::file_handle>();
+  let cap = libc::MAX_HANDLE_SZ as usize;
+  let words = prefix.div_ceil(8) + cap.div_ceil(8) + 1;
+  let mut storage = vec![0u64; words];
+  let mut mount_id: libc::c_int = 0;
+  let handle = storage.as_mut_ptr().cast::<libc::file_handle>();
+  // SAFETY: storage is 8-aligned and sized for the fixed prefix plus
+  // MAX_HANDLE_SZ opaque bytes; this write stays within it.
+  unsafe {
+    (*handle).handle_bytes = cap as libc::c_uint;
+  }
+  // SAFETY: handle points at a correctly-sized, aligned file_handle; cpath is
+  // NUL-terminated; mount_id is a valid out-param.
+  let rc =
+    unsafe { libc::name_to_handle_at(libc::AT_FDCWD, cpath.as_ptr(), handle, &mut mount_id, 0) };
+  if rc == 0 {
+    return true;
+  }
+  // EOVERFLOW (buffer too small) still proves handle support; only a hard
+  // "operation not supported" (or a vanished root, caught later by the
+  // identity bracket) means no export.
+  !matches!(
+    io::Error::last_os_error().raw_os_error(),
+    Some(libc::EOPNOTSUPP)
+  )
+}

@@ -17,7 +17,7 @@ use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 
 use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
 use crate::{
-  core::{ProbeOutcome, RawDirEntry, RawEnumerate},
+  core::{MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
   os::{
     BackendKind, RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError, SourceEvent,
     SourceMessage,
@@ -56,6 +56,10 @@ struct FakeState {
   /// authoritative empty table).
   refreshes: AtomicUsize,
   refresh_answer: Mutex<Option<(Vec<PathBuf>, bool)>>,
+  /// Overrides the root-liveness a refresh reports, so the hermetic suites can
+  /// drive the root-death-via-refresh path (`None` = derive from the tree: the
+  /// root's live identity, or `Missing` when it is gone).
+  root_liveness: Mutex<Option<RootLiveness>>,
   /// Mount prefixes the next spawn seeds its `RootMeta` with.
   spawn_mounts: Mutex<Vec<PathBuf>>,
   /// Requested-root → final-root remaps, mirroring the backend's own
@@ -117,6 +121,7 @@ impl Default for FakeState {
       spawns: AtomicUsize::new(0),
       refreshes: AtomicUsize::new(0),
       refresh_answer: Mutex::default(),
+      root_liveness: Mutex::default(),
       spawn_mounts: Mutex::default(),
       spawn_remaps: Mutex::default(),
       replace_at_live: Mutex::default(),
@@ -269,6 +274,13 @@ impl FakeFs {
   /// Configures the mount prefixes the next spawn seeds its `RootMeta` with.
   pub(crate) fn seed_mounts(&self, mounts: Vec<PathBuf>) {
     *self.state.spawn_mounts.lock().unwrap() = mounts;
+  }
+
+  /// Forces every subsequent refresh to report `liveness` as the root's state,
+  /// driving the root-death-via-refresh path (`RootLiveness::Missing` /
+  /// `Unreadable` for a death; a mismatched `Present` for a replacement).
+  pub(crate) fn set_root_liveness(&self, liveness: RootLiveness) {
+    *self.state.root_liveness.lock().unwrap() = Some(liveness);
   }
 
   /// The recorded spawn-contract order (`meta_sealed` / `stream_live` per
@@ -625,15 +637,32 @@ impl FsOps for FakeFs {
     }
   }
 
-  fn refresh_mounts(&self, _root: &Path) -> (Vec<PathBuf>, bool) {
+  fn refresh_mounts(&self, root: &Path) -> MountRefresh {
     self.state.refreshes.fetch_add(1, Ordering::SeqCst);
-    self
+    let (mounts, authoritative) = self
       .state
       .refresh_answer
       .lock()
       .unwrap()
       .clone()
-      .unwrap_or((Vec::new(), true))
+      .unwrap_or((Vec::new(), true));
+    // Root liveness: an explicit override drives the death path directly;
+    // otherwise it derives from the tree — the root's live identity, or
+    // `Missing` once it has been removed — mirroring the real re-stat.
+    let root_liveness = self.state.root_liveness.lock().unwrap().or_else(|| {
+      self
+        .state
+        .nodes
+        .lock()
+        .unwrap()
+        .get(root)
+        .map(|node| RootLiveness::Present(RootIdentity::new(node.dev, node.ino)))
+    });
+    MountRefresh {
+      mounts,
+      authoritative,
+      root: root_liveness.unwrap_or(RootLiveness::Missing),
+    }
   }
 
   fn add_watch(
@@ -719,6 +748,7 @@ impl ScopeRegistry for NullRegistry {
     _root: &Path,
     _identity: RootIdentity,
     _ancestors: &[RootIdentity],
+    _backend: BackendKind,
   ) {
   }
 
@@ -735,8 +765,9 @@ impl ScopeRegistry for NullRegistry {
   }
 }
 
-/// The recorded transitions: scopes gone live (with their roots) and dead.
-type Transitions = (Vec<(ScopeId, PathBuf)>, Vec<ScopeId>);
+/// The recorded transitions: scopes gone live (with their roots and selected
+/// backend) and dead.
+type Transitions = (Vec<(ScopeId, PathBuf, BackendKind)>, Vec<ScopeId>);
 
 /// A registry that records every transition, for lifecycle assertions.
 #[derive(Clone, Default)]
@@ -745,7 +776,7 @@ pub(crate) struct RecordingRegistry {
 }
 
 impl RecordingRegistry {
-  pub(crate) fn live(&self) -> Vec<(ScopeId, PathBuf)> {
+  pub(crate) fn live(&self) -> Vec<(ScopeId, PathBuf, BackendKind)> {
     self.state.lock().unwrap().0.clone()
   }
 
@@ -761,13 +792,14 @@ impl ScopeRegistry for RecordingRegistry {
     root: &Path,
     _identity: RootIdentity,
     _ancestors: &[RootIdentity],
+    backend: BackendKind,
   ) {
     self
       .state
       .lock()
       .unwrap()
       .0
-      .push((scope, root.to_path_buf()));
+      .push((scope, root.to_path_buf(), backend));
   }
 
   fn scope_dead(&self, scope: ScopeId) {
