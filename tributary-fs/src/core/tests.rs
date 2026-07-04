@@ -3607,6 +3607,150 @@ mod kernel_recursive_fanotify {
       "the loss path still arms a refresh regardless of the tick"
     );
   }
+
+  /// Death survives a stale completion: a SECOND liveness tick fires before the
+  /// FIRST refresh returns, marking the outstanding read stale — and that read
+  /// then comes back with the root GONE. The death evidence must STILL be
+  /// emitted, because root-liveness is evaluated before the stale gate, so a
+  /// stale completion never discards a terminal verdict. With an interval
+  /// shorter than refresh latency EVERY completion is stale, so a stale-gated
+  /// death check would let the quiet unmount stay live indefinitely.
+  #[test]
+  fn stale_refresh_finding_root_gone_still_dies() {
+    let (mut core, scope) = live_fanotify();
+    // First tick: arms the refresh (now in flight) and re-arms the deadline.
+    core.on_timeout(at(30_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "the first tick armed the refresh"
+    );
+    // Second tick BEFORE the first refresh returns: it coalesces onto the
+    // outstanding read (no new effect) and marks it stale.
+    core.on_timeout(at(60_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      0,
+      "a tick mid-refresh coalesces — exactly one outstanding refresh"
+    );
+    // The stale read finally returns with the root GONE (the quiet unmount).
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Missing,
+      },
+      at(60_001),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(
+      emitted.len(),
+      2,
+      "a stale completion still delivers the death lifecycle: {effects:?}"
+    );
+    assert!(emitted[0].kind().is_removed(), "a gone root is a Removed");
+    assert!(
+      emitted[1].kind().is_rescan(),
+      "the stale-completion death is never silent"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead root's stream tears down even though the read was stale: {effects:?}"
+    );
+  }
+
+  /// The same discarded-evidence shape reached via a LOSS (a backed-up pool /
+  /// overlapping loss window), not a second tick: a loss overlaps the in-flight
+  /// liveness refresh, marking it stale, and the read returns the root REPLACED
+  /// (`Unreadable`). The MoveSelf death still lowers.
+  #[test]
+  fn loss_stale_refresh_finding_root_replaced_still_dies() {
+    let (mut core, scope) = live_fanotify();
+    core.on_timeout(at(30_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "the tick armed a refresh"
+    );
+    // A loss overlaps the outstanding refresh: it coalesces and marks it stale.
+    core.on_root_overflow(scope, at(30_500));
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      0,
+      "the overlapping loss coalesces onto the outstanding refresh"
+    );
+    // The stale read returns UNREADABLE (root moved out from under the mark).
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Unreadable,
+      },
+      at(31_000),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(
+      emitted.len(),
+      1,
+      "a replaced root rescans (no Removed): {effects:?}"
+    );
+    assert!(
+      emitted[0].kind().is_rescan(),
+      "the stale-completion MoveSelf still lowers its terminal rescan"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead scope tears down"
+    );
+  }
+
+  /// The original stale purpose stays pinned: a stale refresh whose root is
+  /// still ALIVE discards its (possibly superseded) mount-set and re-arms one
+  /// fresh read, keeping device trust closed — the mount-table gate the stale
+  /// flag actually exists for is untouched by moving the death check ahead of it.
+  #[test]
+  fn stale_refresh_of_a_live_root_still_discards_the_mount_set() {
+    let (mut core, scope) = live_fanotify();
+    core.on_timeout(at(30_000));
+    let _ = drain(&mut core);
+    // A loss overlaps the refresh, marking it stale.
+    core.on_root_overflow(scope, at(30_500));
+    let _ = drain(&mut core);
+    // The stale read returns ALIVE but carries a mount it must NOT install (the
+    // snapshot may predate the lost window).
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: vec![PathBuf::from("/r/stale-vol")],
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+      },
+      at(31_000),
+    );
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "a stale-but-alive completion re-arms exactly one fresh read"
+    );
+    let state = core.scopes.get(&scope).expect("scope is live");
+    assert!(
+      !state.mounts_authoritative,
+      "the superseded snapshot does not restore authority"
+    );
+    assert!(
+      !state.mounts.iter().any(|m| m == Path::new("/r/stale-vol")),
+      "the superseded mount-set is discarded, not installed"
+    );
+  }
 }
 
 /// `Backend::Auto` resolves the backend only once the source has spawned, so

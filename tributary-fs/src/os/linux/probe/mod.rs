@@ -41,8 +41,8 @@ pub(crate) struct ProbedFanotify {
 }
 
 /// Runs the fanotify precondition probe on the canonical root (design §5 rows
-/// 2–5; row 1, the statfs locality allowlist, is the barrier step each source
-/// already runs). On success the returned fd is init'd AND marked — the
+/// 2–5; row 1, the statfs locality allowlist, is the shared gate the dispatcher
+/// runs once before selection). On success the returned fd is init'd AND marked — the
 /// fanotify source reuses it. On failure the [`ProbeStage`] names the first
 /// stage that failed; the caller decides fall-back vs typed error.
 ///
