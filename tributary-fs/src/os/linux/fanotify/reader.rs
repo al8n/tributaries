@@ -4,21 +4,31 @@
 //! kernel-recursive), only reads and a shutdown wake.
 //!
 //! Wakeup mirrors the inotify reader: the thread blocks in `poll` over the
-//! fanotify fd and a private pipe; shutdown writes one byte to the pipe. A
-//! `FAN_Q_OVERFLOW` marker (or a truncated/malformed record) degrades to the
-//! ordered loss signal; a read error or a panic degrades to the terminal
-//! `Fatal` exactly once, then the thread exits.
+//! fanotify fd and a per-root [`WakeState`] eventfd; shutdown increments the
+//! eventfd. Because the ONLY sender is shutdown (and it wakes unconditionally),
+//! no wake elision applies here, but the park/guard/drain shape is shared with
+//! the inotify reader for one wakeup story. A `FAN_Q_OVERFLOW` marker (or a
+//! truncated/malformed record) degrades to the ordered loss signal; a read
+//! error or a panic degrades to the terminal `Fatal` exactly once, then the
+//! thread exits.
 
 use std::{
-  io,
-  os::fd::{AsRawFd, FromRawFd, OwnedFd},
+  os::fd::OwnedFd,
   panic::{AssertUnwindSafe, catch_unwind},
   sync::{Arc, mpsc},
   thread::JoinHandle,
 };
 
+use rustix::{
+  event::{PollFd, PollFlags, poll},
+  io::Errno,
+};
+
 use super::{
-  super::super::{SourceError, transport},
+  super::{
+    super::{SourceError, transport},
+    wake::WakeState,
+  },
   Admission, admit,
   fid::decode_events,
   map::FidMap,
@@ -37,29 +47,11 @@ pub(crate) enum Control {
   Shutdown,
 }
 
-/// Creates the wakeup pipe: `(write, read)` ends.
-pub(crate) fn wake_pipe() -> Result<(OwnedFd, OwnedFd), SourceError> {
-  let mut fds = [0 as libc::c_int; 2];
-  // SAFETY: fds is a valid two-slot buffer; pipe2 fills it on success.
-  if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-    return Err(SourceError::CreateFailed);
-  }
-  // SAFETY: both fds are fresh, owned descriptors.
-  Ok(unsafe { (OwnedFd::from_raw_fd(fds[1]), OwnedFd::from_raw_fd(fds[0])) })
-}
-
-/// Wakes the reader (one byte on the pipe; a full pipe already guarantees a
-/// pending wake).
-pub(crate) fn wake(pipe_write: &OwnedFd) {
-  // SAFETY: writes one byte from a valid buffer to an owned fd.
-  let _ = unsafe { libc::write(pipe_write.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-}
-
-/// Starts the reader thread. The fd, the wake pipe's read end, and the seeded
-/// `FidMap` live and die with it.
+/// Starts the reader thread. The fd, the wake eventfd, and the seeded `FidMap`
+/// live and die with it.
 pub(crate) fn start(
   fd: OwnedFd,
-  wake_rx: OwnedFd,
+  wake: Arc<WakeState>,
   control: mpsc::Receiver<Control>,
   map: FidMap,
   shared: Arc<ReaderShared>,
@@ -69,7 +61,7 @@ pub(crate) fn start(
     .spawn(move || {
       let mut map = map;
       let outcome = catch_unwind(AssertUnwindSafe(|| {
-        run(&fd, &wake_rx, &control, &mut map, &shared);
+        run(&fd, &wake, &control, &mut map, &shared);
       }));
       if outcome.is_err() {
         signal_fatal(&shared, SourceError::CallbackPanic);
@@ -86,7 +78,7 @@ fn signal_fatal(shared: &ReaderShared, err: SourceError) {
 
 fn run(
   fd: &OwnedFd,
-  wake_rx: &OwnedFd,
+  wake: &WakeState,
   control: &mpsc::Receiver<Control>,
   map: &mut FidMap,
   shared: &ReaderShared,
@@ -95,37 +87,41 @@ fn run(
   // records with names); 64 KiB holds a dense read of them.
   let mut buf = vec![0u8; 64 * 1024];
   loop {
-    let mut fds = [
-      libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-      },
-      libc::pollfd {
-        fd: wake_rx.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-      },
-    ];
-    // SAFETY: fds is a valid two-entry pollfd array.
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-    if rc < 0 {
-      let err = io::Error::last_os_error();
-      if err.kind() == io::ErrorKind::Interrupted {
-        continue;
-      }
-      signal_fatal(shared, SourceError::ReadFailed { source: err });
+    // Announce the intent to block, then re-check for shutdown before polling
+    // (the lost-wakeup guard — see `WakeState`; a shutdown enqueued before the
+    // fence is visible here).
+    wake.arm_park();
+    if matches!(control.try_recv(), Ok(Control::Shutdown)) {
       return;
     }
+    let event = wake.event_fd();
+    let mut fds = [
+      PollFd::new(fd, PollFlags::IN),
+      PollFd::new(&event, PollFlags::IN),
+    ];
+    match poll(&mut fds, None) {
+      Ok(_) => {}
+      Err(Errno::INTR) => {
+        wake.unpark();
+        continue;
+      }
+      Err(err) => {
+        wake.unpark();
+        signal_fatal(shared, SourceError::ReadFailed { source: err.into() });
+        return;
+      }
+    }
+    let source_ready = fds[0].revents().contains(PollFlags::IN);
+    let event_ready = fds[1].revents().contains(PollFlags::IN);
+    wake.unpark();
 
-    if fds[1].revents & libc::POLLIN != 0 {
-      drain_pipe(wake_rx);
+    if event_ready {
+      wake.drain();
       if matches!(control.try_recv(), Ok(Control::Shutdown)) {
         return;
       }
     }
-
-    if fds[0].revents & libc::POLLIN != 0 && !drain_events(fd, &mut buf, map, shared) {
+    if source_ready && !drain_events(fd, &mut buf, map, shared) {
       return;
     }
   }
@@ -135,23 +131,20 @@ fn run(
 /// one batch. Returns `false` when the stream died (fatal already signaled).
 fn drain_events(fd: &OwnedFd, buf: &mut [u8], map: &mut FidMap, shared: &ReaderShared) -> bool {
   loop {
-    // SAFETY: reads into an exclusively-borrowed buffer of the given length.
-    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-      let err = io::Error::last_os_error();
-      return match err.kind() {
-        io::ErrorKind::WouldBlock => true,
-        io::ErrorKind::Interrupted => continue,
-        _ => {
-          signal_fatal(shared, SourceError::ReadFailed { source: err });
-          false
-        }
-      };
-    }
+    let n = match rustix::io::read(fd, &mut *buf) {
+      Ok(n) => n,
+      // `EAGAIN` and `EWOULDBLOCK` are the same errno on Linux.
+      Err(Errno::AGAIN) => return true,
+      Err(Errno::INTR) => continue,
+      Err(err) => {
+        signal_fatal(shared, SourceError::ReadFailed { source: err.into() });
+        return false;
+      }
+    };
     if n == 0 {
       return true;
     }
-    let decoded = decode_events(&buf[..n as usize]);
+    let decoded = decode_events(&buf[..n]);
     // Admission is the superblock-firehose filter: an event whose directory
     // FID is unknown is provably outside the root and dropped without loss.
     let mut events = Vec::with_capacity(decoded.events.len());
@@ -165,16 +158,5 @@ fn drain_events(fd: &OwnedFd, buf: &mut [u8], map: &mut FidMap, shared: &ReaderS
     transport::forward_batch(&shared.transport, events, decoded.lossy, |msg| {
       shared.queue.try_send(msg).is_ok()
     });
-  }
-}
-
-fn drain_pipe(wake_rx: &OwnedFd) {
-  let mut sink = [0u8; 64];
-  loop {
-    // SAFETY: reads into a local buffer from the owned pipe fd.
-    let n = unsafe { libc::read(wake_rx.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) };
-    if n <= 0 {
-      return;
-    }
   }
 }

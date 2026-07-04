@@ -25,6 +25,7 @@ use super::{
   super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
     mounts_under,
+    wake::WakeState,
   },
   fid::Fid,
   map::{FidMap, SeedEntry},
@@ -94,13 +95,13 @@ impl Source {
       transport: transport::TransportState::new(config.channel_capacity.get()),
     });
 
-    let (wake_tx, wake_rx) = reader::wake_pipe()?;
+    let wake = WakeState::new()?;
     let (control_tx, control_rx) = mpsc::channel();
-    let thread = reader::start(fd, wake_rx, control_rx, map, Arc::clone(&shared));
+    let thread = reader::start(fd, Arc::clone(&wake), control_rx, map, Arc::clone(&shared));
 
     let handle = SourceHandle {
       control: control_tx,
-      wake: Arc::new(wake_tx),
+      wake,
       thread: Some(thread),
     };
 
@@ -151,10 +152,16 @@ impl Source {
   }
 }
 
-/// Reads `path`'s superblock `f_fsid` bytes — the event-FID scope, copied raw
-/// so seed FIDs match event FIDs byte-for-byte. The `f_type` allowlist gate the
+/// Reads `path`'s superblock `f_fsid` bytes — the event-FID scope, laid out so
+/// seed FIDs match event FIDs byte-for-byte. The `f_type` allowlist gate the
 /// inotify sibling runs is unnecessary here: the probe's FILESYSTEM mark already
 /// refused any filesystem that cannot export handles (a remote/virtual fs).
+///
+/// Stays on libc `statfs`: rustix's `StatFs` keeps `f_fsid` behind a private
+/// field with no accessor, so the FID-seeding fsid — like the sibling
+/// `name_to_handle_at` handle read — cannot be sourced through it. This whole
+/// FID-seed path is the libc side of the two-style boundary (see the module
+/// docs on `os::linux`).
 fn superblock_fsid(path: &Path) -> Result<[u8; 8], SourceError> {
   let cpath = cstring(path)?;
   let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
@@ -172,8 +179,8 @@ fn superblock_fsid(path: &Path) -> Result<[u8; 8], SourceError> {
 
 /// Copies a `statfs.f_fsid` (an 8-byte `__kernel_fsid_t`) to a byte array —
 /// the kernel embeds the identical id in every event's FID record, so the
-/// bytes must be taken verbatim (the field's inner type is private, hence the
-/// raw copy).
+/// bytes must be taken verbatim (the field's inner array is private on glibc,
+/// hence the raw copy).
 fn fsid_bytes(fsid: &libc::fsid_t) -> [u8; 8] {
   const _: () = assert!(std::mem::size_of::<libc::fsid_t>() == 8);
   let mut out = [0u8; 8];
@@ -304,7 +311,7 @@ fn cstring(path: &Path) -> Result<CString, SourceError> {
 /// [`shutdown`](Self::shutdown) at an orderly exit.
 pub(crate) struct SourceHandle {
   control: mpsc::Sender<Control>,
-  wake: Arc<OwnedFd>,
+  wake: Arc<WakeState>,
   thread: Option<JoinHandle<()>>,
 }
 
@@ -320,7 +327,7 @@ impl SourceHandle {
       return;
     };
     let _ = self.control.send(Control::Shutdown);
-    reader::wake(&self.wake);
+    self.wake.wake();
     let _ = thread.join();
   }
 }
