@@ -164,6 +164,7 @@ fn reservations_collide_on_object_identity() {
         identity: id,
         ancestors: Vec::new().into(),
         backend: BackendKind::FsEvents,
+        stats: None,
       },
     );
   let err = Reservation::take(&roots, PathBuf::from("/live/root"), Some(id))
@@ -184,6 +185,90 @@ async fn unknown_scope_of_own_instance_has_no_path() {
     ScopeId::new(core::num::NonZeroU64::new(7).unwrap()),
   );
   assert_eq!(watcher.root_path(handle), None);
+}
+
+/// `backend_stats` is gated exactly like `backend_of` and populated only for a
+/// fanotify root: a non-fanotify (FSEvents) live root has no admission map and
+/// reports `None`; a fanotify root reports a snapshot of its live counters; and a
+/// handle that names no live root of this watcher (unknown, or foreign) reports
+/// `None`.
+#[tokio::test]
+async fn backend_stats_is_fanotify_only_and_gated() {
+  let (watcher, _commands) = manual_watcher();
+  let id = RootIdentity::new(1, 1);
+
+  // A live FSEvents root (scope 1): no admission map, so no stats.
+  let fsevents = ScopeId::new(core::num::NonZeroU64::new(1).unwrap());
+  // A live fanotify root (scope 2): a shared stats handle the reader would write.
+  let fanotify = ScopeId::new(core::num::NonZeroU64::new(2).unwrap());
+  let shared = std::sync::Arc::new(crate::os::BackendStatsShared::default());
+  {
+    let mut set = watcher
+      .roots
+      .write()
+      .unwrap_or_else(PoisonError::into_inner);
+    set.entries.insert(
+      fsevents,
+      RootEntry {
+        path: Arc::new(PathBuf::from("/fse")),
+        identity: id,
+        ancestors: Vec::new().into(),
+        backend: BackendKind::FsEvents,
+        stats: None,
+      },
+    );
+    set.entries.insert(
+      fanotify,
+      RootEntry {
+        path: Arc::new(PathBuf::from("/fan")),
+        identity: RootIdentity::new(2, 2),
+        ancestors: Vec::new().into(),
+        backend: BackendKind::Fanotify,
+        stats: Some(Arc::clone(&shared)),
+      },
+    );
+  }
+
+  let fse_handle = RootHandle::new(watcher.instance, fsevents);
+  let fan_handle = RootHandle::new(watcher.instance, fanotify);
+  assert_eq!(
+    watcher.backend_stats(fse_handle),
+    None,
+    "an FSEvents root keeps no admission map — no stats"
+  );
+
+  // Simulate the reader publishing some counters, then snapshot.
+  shared.set_map(42, 7);
+  shared.add_memo(9, 3);
+  shared.record_reseed();
+  shared.record_walk(1234);
+  let stats = watcher
+    .backend_stats(fan_handle)
+    .expect("a fanotify root exposes stats");
+  assert_eq!(stats.directories(), 42);
+  assert_eq!(stats.memo_generation(), 7);
+  assert_eq!(stats.memo_hits(), 9);
+  assert_eq!(stats.memo_misses(), 3);
+  assert_eq!(stats.reseeds(), 1);
+  assert_eq!(stats.seed_walk_last_micros(), 1234);
+  assert_eq!(stats.seed_walk_count(), 1);
+  // The snapshot is a copy, not a live view: a later write does not mutate it.
+  shared.set_map(100, 8);
+  assert_eq!(stats.directories(), 42, "the snapshot froze the counters");
+
+  // An unknown scope of this watcher, and a foreign-branded handle, both report
+  // `None` — the same gating as `backend_of`.
+  let unknown = RootHandle::new(
+    watcher.instance,
+    ScopeId::new(core::num::NonZeroU64::new(99).unwrap()),
+  );
+  assert_eq!(watcher.backend_stats(unknown), None);
+  let foreign = RootHandle::new(watcher.instance.wrapping_add(1), fanotify);
+  assert_eq!(
+    watcher.backend_stats(foreign),
+    None,
+    "a foreign-branded handle never reads this watcher's stats"
+  );
 }
 
 /// The registry holds exactly the LIVE roots: every unwatch reclaims its

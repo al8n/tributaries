@@ -29,6 +29,9 @@ fn config() -> DriverConfig {
     // tick, and the fake spawns never resolve fanotify); a fanotify-specific
     // driver test overrides it.
     root_liveness_interval: Duration::from_secs(30),
+    // Inert for the fake spawns (no fanotify admission map); a real fanotify
+    // spawn threads this into its SourceConfig.
+    max_map_directories: None,
   }
 }
 

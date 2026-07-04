@@ -3342,7 +3342,7 @@ mod descending {
 mod kernel_recursive_fanotify {
   //! The fanotify (kernel-recursive) profile: one superblock mark covers the
   //! whole root, so the Monitor never descends. Records are precise verbs
-  //! lowered to root-relative targets with interned-FID identity, and
+  //! lowered to root-relative targets with NO node identity (design §4.9), and
   //! `FAN_RENAME` pairs atomically through a minted counter cookie.
 
   use super::*;
@@ -3356,7 +3356,6 @@ mod kernel_recursive_fanotify {
       },
     },
   };
-  use std::num::NonZeroU64;
 
   /// A live fanotify scope rooted at `/r`: the KR spawn doubles as the root's
   /// watch-result, and the birth refresh installs authoritative (empty) trust.
@@ -3391,11 +3390,10 @@ mod kernel_recursive_fanotify {
     (core, scope)
   }
 
-  fn dirent(mask: u64, path: &str, identity: Option<u64>) -> RawLinuxEvent {
+  fn dirent(mask: u64, path: &str) -> RawLinuxEvent {
     RawLinuxEvent::Fanotify(AdmittedEvent {
       mask: FanMask::new(mask),
       path: Some(PathBuf::from(path)),
-      identity: identity.and_then(NonZeroU64::new),
       rename: None,
     })
   }
@@ -3414,10 +3412,10 @@ mod kernel_recursive_fanotify {
       &mut core,
       scope,
       vec![
-        dirent(FAN_CREATE, "/r/a/new.txt", Some(10)),
-        dirent(FAN_DELETE, "/r/a/gone.txt", None),
-        dirent(FAN_MODIFY, "/r/a/hot.txt", Some(11)),
-        dirent(FAN_ATTRIB, "/r/a/meta.txt", Some(12)),
+        dirent(FAN_CREATE, "/r/a/new.txt"),
+        dirent(FAN_DELETE, "/r/a/gone.txt"),
+        dirent(FAN_MODIFY, "/r/a/hot.txt"),
+        dirent(FAN_ATTRIB, "/r/a/meta.txt"),
       ],
     );
     let effects = drain(&mut core);
@@ -3446,11 +3444,9 @@ mod kernel_recursive_fanotify {
       vec![RawLinuxEvent::Fanotify(AdmittedEvent {
         mask: FanMask::new(FAN_RENAME),
         path: None,
-        identity: None,
         rename: Some(AdmittedRename {
           old_path: PathBuf::from("/r/old.txt"),
           new_path: PathBuf::from("/r/sub/new.txt"),
-          identity: NonZeroU64::new(20),
         }),
       })],
     );
@@ -3482,33 +3478,6 @@ mod kernel_recursive_fanotify {
     );
   }
 
-  /// The moved object's interned identity rides BOTH halves of the rename onto
-  /// the Monitor records — it lives on the rename half, not on the (always
-  /// `None`) top-level event identity, so the lowering must read it from there.
-  #[test]
-  fn rename_records_carry_the_moved_object_node() {
-    let (mut core, scope) = live_fanotify();
-    let nodes = core.compiled_fanotify_nodes(
-      scope,
-      vec![AdmittedEvent {
-        mask: FanMask::new(FAN_RENAME),
-        path: None,
-        identity: None,
-        rename: Some(AdmittedRename {
-          old_path: PathBuf::from("/r/old.txt"),
-          new_path: PathBuf::from("/r/sub/new.txt"),
-          identity: NonZeroU64::new(77),
-        }),
-      }],
-    );
-    let expected = Some(tributary_proto::Identity::new(NonZeroU64::new(77).unwrap()));
-    assert_eq!(
-      nodes,
-      vec![expected, expected],
-      "both the MovedFrom and MovedTo carry the rename half's interned identity"
-    );
-  }
-
   /// Two renames in one batch mint DISTINCT cookies, so their halves never
   /// cross-pair — each is its own Moved.
   #[test]
@@ -3521,21 +3490,17 @@ mod kernel_recursive_fanotify {
         RawLinuxEvent::Fanotify(AdmittedEvent {
           mask: FanMask::new(FAN_RENAME),
           path: None,
-          identity: None,
           rename: Some(AdmittedRename {
             old_path: PathBuf::from("/r/a.txt"),
             new_path: PathBuf::from("/r/b.txt"),
-            identity: None,
           }),
         }),
         RawLinuxEvent::Fanotify(AdmittedEvent {
           mask: FanMask::new(FAN_RENAME),
           path: None,
-          identity: None,
           rename: Some(AdmittedRename {
             old_path: PathBuf::from("/r/c.txt"),
             new_path: PathBuf::from("/r/d.txt"),
-            identity: None,
           }),
         }),
       ],
@@ -3566,7 +3531,6 @@ mod kernel_recursive_fanotify {
       vec![RawLinuxEvent::Fanotify(AdmittedEvent {
         mask: FanMask::new(FAN_DELETE_SELF | FAN_ONDIR),
         path: Some(PathBuf::from("/r")),
-        identity: Some(NonZeroU64::new(1).unwrap()),
         rename: None,
       })],
     );
@@ -3591,7 +3555,7 @@ mod kernel_recursive_fanotify {
     feed(
       &mut core,
       scope,
-      vec![dirent(FAN_CREATE | FAN_ONDIR, "/r/newdir", Some(30))],
+      vec![dirent(FAN_CREATE | FAN_ONDIR, "/r/newdir")],
     );
     let effects = drain(&mut core);
     let emitted = emits(&effects);
@@ -3930,7 +3894,6 @@ mod auto_selection {
       fid::{FAN_CREATE, FanMask},
     },
   };
-  use std::num::NonZeroU64;
 
   /// Provisional descending profile (the Linux platform default under Auto),
   /// but the probe resolved FANOTIFY: the core adopts the kernel-recursive
@@ -3974,7 +3937,6 @@ mod auto_selection {
     let event = RawLinuxEvent::Fanotify(AdmittedEvent {
       mask: FanMask::new(FAN_CREATE),
       path: Some(PathBuf::from("/r/deep/child.txt")),
-      identity: NonZeroU64::new(9),
       rename: None,
     });
     core.on_batch(

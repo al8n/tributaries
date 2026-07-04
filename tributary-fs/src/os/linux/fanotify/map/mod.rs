@@ -1,5 +1,4 @@
-//! The per-root FID map: the superblock-firehose filter AND the identity
-//! intern table.
+//! The per-root FID map: the superblock-firehose filter — admission only.
 //!
 //! `FAN_MARK_FILESYSTEM` scopes to the whole superblock, so the stream carries
 //! every event on the filesystem — including outside the watched root and via
@@ -8,6 +7,20 @@
 //! directory handle is provably outside the root and dropped. New in-root
 //! directories enter through their own create events (the child's
 //! `FAN_REPORT_TARGET_FID`, learned here); a loss reseeds the whole map.
+//!
+//! # Admission is the map's only job; identity is deliberately absent
+//!
+//! The map records directory membership and resolves paths — nothing else.
+//! There is no identity intern table (design §4.9): under the kernel-recursive
+//! Monitor profile record identity is INERT — the sole consumer,
+//! `Monitor::reconcile_slot`, early-returns for a non-descending scope (there
+//! are no per-directory child watches to re-arm), and the atomic `FAN_RENAME`
+//! pair carries its own old+new addressing rather than leaning on a node
+//! identity. Interning would only have added a directory→id table that grows
+//! with the tree (and unboundedly under file churn if files were interned) for
+//! a value nothing reads, so fanotify records attach NO node identity — exactly
+//! as the FSEvents kernel-recursive lowering attaches none. File identity, where
+//! a descending profile needs it, stays enumerate-sourced on inotify.
 //!
 //! # Handle-keyed, never fsid-keyed
 //!
@@ -28,41 +41,31 @@
 //! directory rename updates ONE node's `(parent, name)` and every descendant's
 //! resolved path follows automatically, with no per-node rewrite. A departure
 //! (delete / rename-out) walks the `children` adjacency to prune the WHOLE
-//! subtree from both the admission map and the intern table in O(subtree) — so a
-//! populated move-out drops every descendant's id at once, rather than leaking
-//! them until each lingering node happens to miss admission (the lazy per-miss
-//! eviction only ever reaped `dirs`, never `ids`). The lazy `admit`-miss eviction
-//! remains as a belt for any residual orphan a parent-chain break still leaves.
+//! subtree in O(subtree) — so a populated move-out drops every descendant at
+//! once, rather than leaking them until each lingering node happens to miss
+//! admission. The lazy `admit`-miss eviction remains as a belt for any residual
+//! orphan a parent-chain break still leaves.
 //!
-//! # Identity: directory-only, O(live directories)
+//! The bound is O(LIVE directories under the root): a departed directory (and
+//! every descendant, via the `children` adjacency) is dropped on `forget`, and
+//! files never enter the map at all.
 //!
-//! The map is ALSO the identity table: `intern` mints exact, sequential ids for
-//! handles — never a hash of the handle (a collision would fabricate identity,
-//! the class the exact table exists to kill), and the handle already embeds a
-//! generation counter, making this stronger identity than `(dev, ino)`.
+//! # Generation counter for the reader's batch memo
 //!
-//! ONLY DIRECTORY handles are interned. Directory handles are already required
-//! for admission, so interning them is free; ordinary FILE events attach no
-//! identity, because under the kernel-recursive Monitor profile record identity
-//! is INERT — the sole consumer, `Monitor::reconcile_slot`, early-returns for a
-//! non-descending scope (there are no per-directory child watches to re-arm), and
-//! the atomic `FAN_RENAME` pair carries its own old+new addressing rather than
-//! leaning on identity. Interning every file target FID would grow this table
-//! unboundedly under create/delete churn (OOM), so it is confined to directories.
-//!
-//! The bound is therefore O(LIVE directories under the root). An id is pruned
-//! when its directory is forgotten (delete / rename-out) — AND every descendant's
-//! id with it, via the `children` adjacency, so a populated departure prunes the
-//! whole subtree's identities at once. A departed-and-returned directory (or
-//! descendant) mints a FRESH identity, which the Monitor reads as a replacement —
-//! the conservative, safe direction (identity inequality drives a re-observe,
-//! never a false survivor). Reseed preserves every live directory's id (the
-//! admission structure is rebuilt while the intern table is retained), so identity
-//! is stable across a covered loss for directories that persisted through it.
+//! Every mutation (`seed`, `learn`, `forget`, `reseed`, an orphan eviction)
+//! bumps a monotone [`generation`](Self::generation). The single-threaded reader
+//! caches admitted `(dir-handle → path)` resolutions WITHIN one read batch (the
+//! rename-storm win: many events under few directories), tagging each cached
+//! entry with the generation it was resolved at. Because ANY mutation bumps the
+//! counter, a cached entry whose generation no longer matches the map's is a
+//! miss and is re-resolved — so the memo survives the mutations `admit` itself
+//! performs mid-batch without ever serving a stale path. The counter lives here
+//! (not the memo) so invalidation is a single comparison with no scattered
+//! cache-clearing; the memo itself lives in the reader.
 //!
 //! The map is single-threaded: the reader owns it and both mutates (learn on
-//! create, forget on delete/rename, reseed on loss) and reads (admit/intern) it
-//! between reads, exactly as the inotify reader owns its `wd` table.
+//! create, forget on delete/rename, reseed on loss) and reads (admit) it between
+//! reads, exactly as the inotify reader owns its `wd` table.
 //!
 //! # Completeness invariant
 //!
@@ -88,7 +91,6 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
   ffi::{OsStr, OsString},
-  num::NonZeroU64,
   path::{Path, PathBuf},
 };
 
@@ -147,9 +149,9 @@ struct DirNode {
   name: OsString,
   /// The handle keys of this directory's immediate child directories. Maintained
   /// as the exact inverse of every child's `parent` link (insert/learn adds,
-  /// forget/re-parent moves) so `forget` can walk and prune a departed subtree
-  /// from BOTH `dirs` and `ids` — the O(subtree) departure the lazy per-miss
-  /// eviction alone cannot deliver for the intern table.
+  /// forget/re-parent moves) so `forget` can walk and prune a departed subtree in
+  /// one O(subtree) pass — the eager departure the lazy per-miss eviction alone
+  /// cannot deliver.
   children: BTreeSet<HandleKey>,
   /// Whether this directory was learned via a move-IN and its descendant walk
   /// has not yet completed. A move-in learns the top node before the reader runs
@@ -163,33 +165,82 @@ struct DirNode {
   pending_walk: bool,
 }
 
-/// The per-root FID map. Directory membership is the admission filter; the
-/// interned ids are the exact object identities.
+/// A snapshot of the map's live footprint for the operator-facing stats
+/// accessor: the number of admitted directories and the current mutation
+/// generation (the batch memo's invalidation token).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MapStats {
+  pub(crate) directories: usize,
+  pub(crate) memo_generation: u64,
+}
+
+/// The per-root FID map: directory membership is the whole admission filter.
 #[derive(Debug, Default)]
 pub(crate) struct FidMap {
   /// The admitted directories: `handle → parent-relative node`. Membership
   /// decides admission; the parent chain resolves an event's path against the
   /// root.
   dirs: BTreeMap<HandleKey, DirNode>,
-  /// The exact identity intern table: `handle → sequential id`, DIRECTORIES only
-  /// (file target FIDs are never interned — see the module docs on why file
-  /// identity is inert under the kernel-recursive profile). Bounded by the live
-  /// directory count: an entry is dropped on `forget` and re-minted fresh should
-  /// the directory reappear, and it survives a reseed so a persisting directory
-  /// keeps its id across a covered loss.
-  ids: BTreeMap<HandleKey, NonZeroU64>,
-  /// The next identity to hand out. Sequential and exact — a fresh handle gets
-  /// a fresh id, never a hash of its bytes.
-  next_id: u64,
+  /// A monotone counter bumped on every mutation, so the reader's per-batch
+  /// admission memo can tag each cached path with the map state it was resolved
+  /// against and treat a generation mismatch as a miss (see the module docs).
+  generation: u64,
+  /// The ceiling on directory nodes (design §4.9): `None` is uncapped. A live
+  /// `learn` growing the map past it is a terminal condition the reader signals
+  /// fatal — a capped map that silently stopped learning is the silent-loss
+  /// shape. The seed/reseed walks enforce the same cap up front (an over-cap tree
+  /// is fanotify-unviable), so this only guards live growth.
+  max_directories: Option<usize>,
 }
 
 impl FidMap {
-  /// An empty map, ready to be seeded.
+  /// An empty, uncapped map, ready to be seeded.
   pub(crate) fn new() -> Self {
     Self {
       dirs: BTreeMap::new(),
-      ids: BTreeMap::new(),
-      next_id: 1,
+      generation: 0,
+      max_directories: None,
+    }
+  }
+
+  /// An empty map with the directory cap the options requested (design §4.9;
+  /// `None` = uncapped).
+  pub(crate) fn with_capacity(max_directories: Option<usize>) -> Self {
+    Self {
+      max_directories,
+      ..Self::new()
+    }
+  }
+
+  /// The current mutation generation — the token the reader's batch memo tags its
+  /// cached resolutions with. Bumped by every mutation, so a memo entry whose
+  /// generation differs from this is stale and must be re-resolved.
+  pub(crate) fn generation(&self) -> u64 {
+    self.generation
+  }
+
+  /// Bumps the generation, invalidating every batch-memo entry tagged against a
+  /// prior state. Called by each mutation.
+  fn bump(&mut self) {
+    self.generation = self.generation.wrapping_add(1);
+  }
+
+  /// Whether the map holds MORE directory nodes than the cap allows (never true
+  /// when uncapped). The reader polls this after a live `learn` and signals fatal
+  /// when it trips: a capped map that keeps eventing while silently refusing to
+  /// learn new directories would drop their events as outside-root forever.
+  pub(crate) fn over_capacity(&self) -> bool {
+    self
+      .max_directories
+      .is_some_and(|cap| self.dirs.len() > cap)
+  }
+
+  /// A snapshot of the map's live footprint, for the operator-facing stats
+  /// accessor.
+  pub(crate) fn stats(&self) -> MapStats {
+    MapStats {
+      directories: self.dirs.len(),
+      memo_generation: self.generation,
     }
   }
 
@@ -210,10 +261,10 @@ impl FidMap {
   /// membership + a parent walk, no fsid compare and no syscall.
   ///
   /// An orphaned directory is EVICTED here: once its walk fails to reach the
-  /// root, its stale node AND any still-attached descendants are pruned from both
-  /// `dirs` and `ids` so nothing resolves again and no id leaks. This is a belt —
-  /// `forget` already prunes a departed subtree eagerly via the adjacency — for
-  /// any residual orphan a break in the parent chain still leaves behind.
+  /// root, its stale node AND any still-attached descendants are pruned so
+  /// nothing resolves again. This is a belt — `forget` already prunes a departed
+  /// subtree eagerly via the adjacency — for any residual orphan a break in the
+  /// parent chain still leaves behind.
   pub(crate) fn admit(&mut self, fid: &Fid) -> Option<PathBuf> {
     match self.resolve(fid.handle()) {
       Some(path) => Some(path),
@@ -225,12 +276,12 @@ impl FidMap {
   }
 
   /// Evicts an orphan (a node whose parent chain no longer reaches the root) and
-  /// its still-attached descendants from both maps, unlinking it from its parent
-  /// (a no-op when the parent is already gone). A node ABSENT from the map — the
-  /// hot firehose-drop path, an unknown handle provably outside the root — is left
-  /// untouched after the single membership check, so the drop stays cheap. Belt for
-  /// the lazy path: `forget` prunes eagerly, so this only fires on a residual
-  /// orphan.
+  /// its still-attached descendants, unlinking it from its parent (a no-op when
+  /// the parent is already gone). A node ABSENT from the map — the hot
+  /// firehose-drop path, an unknown handle provably outside the root — is left
+  /// untouched after the single membership check, so the drop stays cheap (and the
+  /// generation does not bump). Belt for the lazy path: `forget` prunes eagerly,
+  /// so this only fires on a residual orphan.
   fn evict_orphan(&mut self, handle: &[u8]) {
     let key: HandleKey = handle.into();
     let Some(node) = self.dirs.get(&key) else {
@@ -252,21 +303,6 @@ impl FidMap {
   /// pre-existing descendants the seed walk never saw — those must be walked in.
   pub(crate) fn contains(&self, fid: &Fid) -> bool {
     self.dirs.contains_key(fid.handle())
-  }
-
-  /// The exact, stable identity of a DIRECTORY `fid`, minted sequentially on
-  /// first sight and returned unchanged until the directory is forgotten. Never a
-  /// hash of the handle. Called only for directory handles (self-events, seeded
-  /// and learned directories) — file target FIDs are never interned, keeping the
-  /// table O(live directories).
-  pub(crate) fn intern(&mut self, fid: &Fid) -> NonZeroU64 {
-    if let Some(id) = self.ids.get(fid.handle()) {
-      return *id;
-    }
-    let id = NonZeroU64::new(self.next_id).expect("identity counter starts at one");
-    self.next_id += 1;
-    self.ids.insert(fid.handle().into(), id);
-    id
   }
 
   /// Records a newly-created in-root directory so its own later events admit.
@@ -340,17 +376,12 @@ impl FidMap {
     }
   }
 
-  /// Drops a directory AND its whole subtree from admission and the intern table
-  /// on its delete or rename-out, walking the `children` adjacency so every
-  /// departed descendant's id is pruned in the SAME O(subtree) step — not left to
-  /// leak until each hits a lazy admission miss (which only ever touched `dirs`,
-  /// never `ids`). Pruning bounds the intern table at O(live directories); an id
-  /// is safe to drop because nothing mints it again unless the SAME handle
-  /// reappears (the same object — the handle embeds a generation counter), and a
-  /// departed-and-returned directory minting a fresh id is the conservative
-  /// direction: the Monitor treats identity inequality as a replacement, never a
-  /// false survivor. The forgotten node is also unlinked from its parent's
-  /// `children`, keeping the adjacency the exact inverse of the parent links.
+  /// Drops a directory AND its whole subtree from admission on its delete or
+  /// rename-out, walking the `children` adjacency so every departed descendant is
+  /// pruned in the SAME O(subtree) step — not left to leak until each hits a lazy
+  /// admission miss. This bounds the map at O(live directories). The forgotten
+  /// node is also unlinked from its parent's `children`, keeping the adjacency the
+  /// exact inverse of the parent links.
   pub(crate) fn forget(&mut self, fid: &Fid) {
     let key: HandleKey = fid.handle().into();
     if let Some(node) = self.dirs.get(&key)
@@ -363,47 +394,41 @@ impl FidMap {
   }
 
   /// Removes `root` and every directory reachable through the `children`
-  /// adjacency from BOTH `dirs` and `ids`. Iterative (an explicit stack, no
-  /// recursion-depth bound on a deep subtree) and bounded by the subtree's node
-  /// count. The starting node is assumed already unlinked from its parent by the
-  /// caller.
+  /// adjacency. Iterative (an explicit stack, no recursion-depth bound on a deep
+  /// subtree) and bounded by the subtree's node count. The starting node is
+  /// assumed already unlinked from its parent by the caller. Bumps the generation
+  /// only when a node was actually removed, so a no-op prune (an unknown handle)
+  /// leaves the batch memo valid.
   fn prune_subtree(&mut self, root: HandleKey) {
     let mut stack = vec![root];
+    let mut removed = false;
     while let Some(key) = stack.pop() {
-      self.ids.remove(&key);
       if let Some(node) = self.dirs.remove(&key) {
+        removed = true;
         stack.extend(node.children);
       }
+    }
+    if removed {
+      self.bump();
     }
   }
 
   /// Rebuilds the admission structure from a fresh full walk after a loss, then
   /// swaps it in — the simplest correct prune. Directories that vanished during
   /// the loss window are gone (the fresh walk did not observe them); directories
-  /// the firehose missed during the window are present (the walk did).
-  ///
-  /// A directory that PERSISTED through the loss keeps its interned id (it is
-  /// re-inserted by the fresh seed, and `intern` returns the existing id for a
-  /// known handle) — identity stays stable across a covered loss. A directory that
-  /// VANISHED during the loss has its id pruned here: the loss ate its delete
-  /// event, so `forget` never ran, and leaving its id would leak the table past
-  /// O(live directories). The prune keeps live ids and drops only departed ones,
-  /// so a reappearance still mints a fresh identity (the conservative direction).
-  /// A `FAN_Q_OVERFLOW` (or any lossy decode) funnels here so a covered overflow
-  /// can never become permanent blindness.
+  /// the firehose missed during the window are present (the walk did). A
+  /// `FAN_Q_OVERFLOW` (or any lossy decode) funnels here so a covered overflow can
+  /// never become permanent blindness.
   ///
   /// The `children` adjacency is rebuilt from the fresh walk: `dirs.clear()` drops
   /// every stale node, and the walk emits parents before children (DFS), so each
   /// `insert_dir` links the child under an already-present parent — the adjacency
-  /// is consistent by construction after the swap.
+  /// is consistent by construction after the swap. The clear-then-rebuild bumps
+  /// the generation, so any batch-memo entry from before the reseed misses.
   pub(crate) fn reseed(&mut self, entries: impl IntoIterator<Item = SeedEntry>) {
     self.dirs.clear();
+    self.bump();
     self.seed(entries);
-    // Drop ids for directories the fresh walk did not re-observe (vanished across
-    // the loss). Live directories were just re-seeded, so they survive the retain
-    // with their ids intact.
-    let dirs = &self.dirs;
-    self.ids.retain(|handle, _| dirs.contains_key(handle));
   }
 
   /// Whether `fid` is an admitted directory whose ancestry still reaches the
@@ -418,14 +443,6 @@ impl FidMap {
   #[cfg(test)]
   pub(crate) fn dir_count(&self) -> usize {
     self.dirs.len()
-  }
-
-  /// The number of interned identities — the intern table's footprint. Bounded by
-  /// the live directory count (file target FIDs are never interned, and a
-  /// forgotten directory's id is pruned), so churn of files leaves it unchanged.
-  #[cfg(test)]
-  pub(crate) fn interned_count(&self) -> usize {
-    self.ids.len()
   }
 
   /// Asserts the `children` adjacency is the exact inverse of the parent links
@@ -512,9 +529,7 @@ impl FidMap {
   /// already-admitted parent. The [`assert_adjacency`](Self::assert_adjacency)
   /// checker pins the resulting invariant in tests.
   fn insert_dir(&mut self, entry: SeedEntry, pending_walk: bool) {
-    // Interning on insert keeps a directory's admission and its identity minted
-    // together, so an admitted directory always has a stable id.
-    self.intern(&entry.fid);
+    self.bump();
     let key: HandleKey = entry.fid.handle().into();
     let parent = entry.parent.map(|fid| fid.handle().into());
 

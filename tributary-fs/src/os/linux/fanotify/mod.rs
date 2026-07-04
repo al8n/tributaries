@@ -11,9 +11,10 @@
 //! event ever reaches the seam: an unknown handle is provably outside the root
 //! and dropped. Admitted events cross the driver's queue as
 //! [`AdmittedEvent`]s inside [`RawLinuxEvent::Fanotify`](super::RawLinuxEvent),
-//! carrying paths already resolved against the map and identity already
-//! interned — the compile path only lowers each absolute path to its
-//! root-relative form.
+//! carrying paths already resolved against the map — the compile path only
+//! lowers each absolute path to its root-relative form. No node identity rides
+//! with them: under the kernel-recursive profile record identity is inert
+//! (design §4.9), exactly as the FSEvents lowering attaches none.
 //!
 //! Root UNMOUNT carries NO in-tree fanotify signal — an unmounted
 //! `FAN_MARK_FILESYSTEM` superblock stays alive under the mark and the fd simply
@@ -41,41 +42,100 @@ pub(crate) mod map;
 #[cfg(test)]
 mod tests;
 
-use std::{num::NonZeroU64, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
 
-use fid::RenameInfo;
 pub(crate) use fid::{FanMask, RawFanotifyEvent};
+use fid::{Fid, RenameInfo};
 use map::FidMap;
 
-/// One `FAN_RENAME`'s two admitted halves: each resolved absolute path plus its
-/// interned identity. Both halves are always present (the kernel reports the
-/// atomic pair in one event), so the lowering emits adjacent
-/// `MovedFrom`/`MovedTo` with no pairing window.
+/// One `FAN_RENAME`'s two admitted halves: each resolved absolute path. Both
+/// halves are always present (the kernel reports the atomic pair in one event),
+/// so the lowering emits adjacent `MovedFrom`/`MovedTo` with no pairing window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdmittedRename {
   /// The source's absolute path (old directory + old name).
   pub(crate) old_path: PathBuf,
   /// The destination's absolute path (new directory + new name).
   pub(crate) new_path: PathBuf,
-  /// The moved object's interned identity (stable across the rename — the FID
-  /// is the object's, not the directory's).
-  pub(crate) identity: Option<NonZeroU64>,
 }
 
 /// One fanotify event after admission: its mask, the affected object's absolute
-/// path (resolved from the directory FID + name against the [`FidMap`]), the
-/// object's interned identity, and — for a rename — the atomic pair.
+/// path (resolved from the directory FID + name against the [`FidMap`]), and —
+/// for a rename — the atomic pair. No node identity: under the kernel-recursive
+/// profile record identity is inert (design §4.9).
 ///
-/// A single-object dirent event carries `path` + `identity`; a `FAN_RENAME`
-/// carries `rename` and leaves the single-object fields empty; a self-event
+/// A single-object dirent event carries `path`; a `FAN_RENAME` carries `rename`
+/// and leaves the single-object fields empty; a self-event
 /// (`DELETE_SELF`/`MOVE_SELF`) whose object is the admitted directory carries
 /// that directory's `path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdmittedEvent {
   pub(crate) mask: FanMask,
   pub(crate) path: Option<PathBuf>,
-  pub(crate) identity: Option<NonZeroU64>,
   pub(crate) rename: Option<AdmittedRename>,
+}
+
+/// A per-read-batch admission memo (design §4.9): caches the ADMITTED
+/// `(directory handle → resolved absolute path)` of the events in one
+/// [`decode_events`](fid::decode_events) buffer, the storm win when many events
+/// address few directories (a rename storm under one parent).
+///
+/// Soundness rests on the [`FidMap`]'s generation counter. Each cached entry is
+/// tagged with the map generation it was resolved against; a lookup is a hit only
+/// when the tag still equals the map's current generation. Because EVERY map
+/// mutation (`learn`/`forget`/`reseed`/an orphan eviction) bumps that counter,
+/// any mutation `admit` performs mid-batch invalidates the whole memo by making
+/// every prior tag stale — so the memo can never serve a path the map has since
+/// re-parented or pruned. The reader is single-threaded and owns both the map and
+/// the memo, so no other writer exists; a fresh `MemoBatch` is used per buffer, so
+/// it is also cleared at batch end by construction.
+pub(crate) struct MemoBatch {
+  /// The admitted `directory handle → (generation, resolved path)` cache. A miss
+  /// (an out-of-root directory) is never inserted, so the memo stays bounded by
+  /// the distinct in-root directories the batch touched.
+  entries: BTreeMap<Box<[u8]>, (u64, PathBuf)>,
+  /// How many lookups were served from the cache — an operator-facing counter.
+  pub(crate) hits: u64,
+  /// How many lookups fell through to a fresh [`FidMap::admit`] (a cold directory
+  /// or a stale-generation entry).
+  pub(crate) misses: u64,
+}
+
+impl MemoBatch {
+  /// A fresh, empty memo for one read batch.
+  pub(crate) fn new() -> Self {
+    Self {
+      entries: BTreeMap::new(),
+      hits: 0,
+      misses: 0,
+    }
+  }
+
+  /// Resolves a directory FID to its admitted path THROUGH the memo. A cached
+  /// entry whose generation still matches the map's is returned directly (a hit);
+  /// otherwise the lookup falls to [`FidMap::admit`] (which resolves-or-evicts and
+  /// may itself bump the generation), and a resolved path is cached under the
+  /// map's post-lookup generation. A miss (`None`) is not cached — the next event
+  /// under that handle re-checks membership, honoring a later `learn` of it.
+  fn admit(&mut self, map: &mut FidMap, fid: &Fid) -> Option<PathBuf> {
+    let generation = map.generation();
+    if let Some((tagged, path)) = self.entries.get(fid.handle())
+      && *tagged == generation
+    {
+      self.hits += 1;
+      return Some(path.clone());
+    }
+    self.misses += 1;
+    let path = map.admit(fid)?;
+    // `admit` may have evicted an orphan on a miss and bumped the generation, but
+    // this is the hit branch (a path resolved), which mutates nothing — so the
+    // post-call generation still equals the one captured above and correctly tags
+    // the entry.
+    self
+      .entries
+      .insert(fid.handle().into(), (map.generation(), path.clone()));
+    Some(path)
+  }
 }
 
 /// The result of admitting one decoded event against the map.
@@ -110,19 +170,20 @@ pub(crate) enum Admission {
 }
 
 /// Admits one decoded event against the per-root map: resolves its directory
-/// FID(s) to path(s), interns the object identity, and self-maintains the map
-/// (learn on a directory create, forget on a directory delete/rename-out).
-/// PURE — the reader calls this single-threaded between reads; the FFI side
-/// owns nothing but the fd and the seeding walk.
+/// FID(s) to path(s) — through the batch [`MemoBatch`] — and self-maintains the
+/// map (learn on a directory create, forget on a directory delete/rename-out).
+/// PURE — the reader calls this single-threaded between reads; the FFI side owns
+/// nothing but the fd and the seeding walk. No node identity is produced;
+/// admission is membership + path resolution only (design §4.9).
 ///
 /// Membership is the whole filter: a `dir_fid` absent from the map is outside
 /// the watched root and dropped. Renames admit if EITHER end is in-root (a
 /// move into or out of the tree is still the tree's business); an in-root end
 /// resolves fully, an out-of-root end resolves to `None` and the lowering
 /// treats the half as a boundary crossing.
-pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
+pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent, memo: &mut MemoBatch) -> Admission {
   if let Some(rename) = &event.rename {
-    return admit_rename(map, event, rename);
+    return admit_rename(map, event, rename, memo);
   }
 
   let Some(dir_fid) = &event.dir_fid else {
@@ -131,37 +192,25 @@ pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
     // test membership on, the event cannot be placed under the root.
     return Admission::Drop;
   };
-  let Some(dir_path) = map.admit(dir_fid) else {
+  let Some(dir_path) = memo.admit(map, dir_fid) else {
     return Admission::Drop;
   };
 
   let mask = event.mask;
   // A self-event (the admitted directory itself deleted or moved) carries no
-  // child name and resolves to the directory's own path and identity.
+  // child name and resolves to the directory's own path.
   if (mask.delete_self() || mask.move_self()) && event.name.is_none() {
-    let identity = Some(map.intern(dir_fid));
     if mask.delete_self() {
       map.forget(dir_fid);
     }
     return Admission::Admit(AdmittedEvent {
       mask,
       path: Some(dir_path),
-      identity,
       rename: None,
     });
   }
 
   let path = event.name.as_ref().map(|name| join_name(&dir_path, name));
-  // Identity is DIRECTORY-only: interning file target FIDs would grow the map's
-  // intern table unboundedly under file churn (the O(directories) bound), and
-  // file identity is inert under the kernel-recursive Monitor profile anyway
-  // (`reconcile_slot` discards it for a non-descending scope — no per-directory
-  // child watch to re-arm). A non-directory target attaches `None`.
-  let identity = if mask.ondir() {
-    event.target_fid.as_ref().map(|fid| map.intern(fid))
-  } else {
-    None
-  };
 
   // Self-maintenance: a new in-root directory enters the map via its own
   // create's TARGET_FID; a removed one is forgotten so its stale handle stops
@@ -181,14 +230,12 @@ pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
   Admission::Admit(AdmittedEvent {
     mask,
     path,
-    identity,
     rename: None,
   })
 }
 
-/// Admits a `FAN_RENAME`: resolves both directory FIDs, self-maintains the map
-/// for a moved DIRECTORY, and interns the moved object's identity when it is a
-/// directory (a file target attaches none — see [`admit`]).
+/// Admits a `FAN_RENAME`: resolves both directory FIDs and self-maintains the map
+/// for a moved DIRECTORY (no identity — see [`admit`]).
 ///
 /// The four move flavors — keyed on whether the destination parent is in-root
 /// and whether the MOVED OBJECT itself was already a known directory (the
@@ -210,9 +257,14 @@ pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
 /// - **move-out of an already-unknown subtree** (moved dir unknown, destination
 ///   outside): nothing to maintain; only the in-root SOURCE end resolves, and the
 ///   move admits as a boundary crossing.
-fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo) -> Admission {
-  let old_dir = map.admit(&rename.old_dir);
-  let new_dir = map.admit(&rename.new_dir);
+fn admit_rename(
+  map: &mut FidMap,
+  event: &RawFanotifyEvent,
+  rename: &RenameInfo,
+  memo: &mut MemoBatch,
+) -> Admission {
+  let old_dir = memo.admit(map, &rename.old_dir);
+  let new_dir = memo.admit(map, &rename.new_dir);
   if old_dir.is_none() && new_dir.is_none() {
     // Both ends outside the root: a rename elsewhere on the superblock.
     return Admission::Drop;
@@ -227,26 +279,12 @@ fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo)
     .map(|dir| join_name(dir, &rename.new_name))
     .unwrap_or_else(|| PathBuf::from(&os_name(&rename.new_name)));
 
-  // A directory move maintains admission and, for a DIRECTORY target, its
-  // identity. Identity is directory-only (a file move attaches `None`): file
-  // identity is inert under the kernel-recursive profile and interning file
-  // targets would leak the intern table under churn.
   let moved_fid = event.target_fid.as_ref();
-  let identity = if event.mask.ondir() {
-    moved_fid.map(|fid| map.intern(fid))
-  } else {
-    None
-  };
 
   let event = AdmittedEvent {
     mask: event.mask,
     path: None,
-    identity: None,
-    rename: Some(AdmittedRename {
-      old_path,
-      new_path,
-      identity,
-    }),
+    rename: Some(AdmittedRename { old_path, new_path }),
   };
 
   if event.mask.ondir()
@@ -258,11 +296,10 @@ fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo)
       // Read it BEFORE `learn` overwrites the node.
       let was_in_root = map.contains(fid);
       if was_in_root {
-        // In-root re-parent: the moved object keeps its handle (and thus its
-        // interned id), so `learn` overwrites its node in place — identity is
-        // STABLE across the rename, and its already-mapped descendants follow via
-        // the updated parent link. No id-pruning forget (the object did not
-        // depart), and no walk (its descendants are already mapped).
+        // In-root re-parent: `learn` overwrites the node in place, and its
+        // already-mapped descendants follow via the updated parent link. No
+        // pruning forget (the object did not depart), and no walk (its
+        // descendants are already mapped).
         map.learn(&rename.new_dir, &rename.new_name, Some(fid));
       } else {
         // Moved IN from outside: learn the top as a `pending_walk` node (so a
@@ -279,9 +316,8 @@ fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo)
         };
       }
     } else {
-      // Moved OUT of the root: drop admission AND the interned id (departed). A
-      // later move back is a fresh move-in — walked in, minting fresh identity —
-      // the conservative direction.
+      // Moved OUT of the root: drop admission (departed). A later move back is a
+      // fresh move-in — walked in — the conservative direction.
       map.forget(fid);
     }
   }

@@ -823,32 +823,6 @@ impl DriverCore {
     self.on_batch(scope, BatchPayload::detached(events), now);
   }
 
-  /// Compiles a fanotify batch and returns each planned record's object
-  /// identity, so a test can pin that a lowering carries the node the admission
-  /// layer interned all the way onto the Monitor records (a `Moved`'s stable FID
-  /// identity in particular, which lives on the rename half, not the event).
-  #[cfg(test)]
-  pub(crate) fn compiled_fanotify_nodes(
-    &mut self,
-    scope: ScopeId,
-    events: Vec<crate::os::linux::fanotify::AdmittedEvent>,
-  ) -> Vec<Option<Identity>> {
-    let Some(mut state) = self.scopes.remove(&scope) else {
-      return Vec::new();
-    };
-    let batch = self.compile_fanotify(&mut state, scope, events);
-    self.scopes.insert(scope, state);
-    batch
-      .items
-      .iter()
-      .flat_map(|item| item.planned.iter())
-      .filter_map(|planned| match planned {
-        Planned::Rec(rec) => Some(rec.node()),
-        Planned::Over(_) => None,
-      })
-      .collect()
-  }
-
   /// Feeds one probe's outcome; a completed batch (and any batches queued
   /// behind it) is then fed to the Monitor in order.
   pub(crate) fn on_probe_result(&mut self, probe: ProbeId, outcome: ProbeOutcome, now: Instant) {

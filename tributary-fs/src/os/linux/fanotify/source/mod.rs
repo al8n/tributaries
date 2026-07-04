@@ -124,10 +124,11 @@ pub(crate) enum FanotifySpawn {
 
 /// The internal spawn outcome, mapped to [`FanotifySpawn`] at the boundary. A
 /// `SourceError` flows in through `?` unchanged; only the walk's viability miss
-/// carries the config back for the dispatcher to fall back on.
+/// carries the config back for the dispatcher to fall back on — boxed, so the
+/// `Err` variant this rides in stays small (the config is several `Vec`s wide).
 enum SpawnFailure {
   Error(SourceError),
-  NotViable(SourceConfig),
+  NotViable(Box<SourceConfig>),
 }
 
 impl From<SourceError> for SpawnFailure {
@@ -172,7 +173,7 @@ impl Source {
     match Self::try_spawn(config, canonical, fd, root_fd) {
       Ok((handle, rx, meta)) => FanotifySpawn::Started(handle, rx, meta),
       Err(SpawnFailure::Error(err)) => FanotifySpawn::Error(err),
-      Err(SpawnFailure::NotViable(config)) => FanotifySpawn::NotViable(config),
+      Err(SpawnFailure::NotViable(config)) => FanotifySpawn::NotViable(*config),
     }
   }
 
@@ -245,8 +246,9 @@ impl Source {
       root_dev,
       root_mnt_id,
       root_fid,
+      max_directories: config.max_map_directories,
     };
-    let mut map = FidMap::new();
+    let mut map = FidMap::with_capacity(config.max_map_directories);
     // The SPAWN seed roots at the pin (a dup of it, consumed by the descent), so
     // the root level never re-resolves `canonical` after the mark went live. The
     // live reseed inside the reader has no pin to inherit and re-opens the path
@@ -256,7 +258,7 @@ impl Source {
     let seed = reseed.seed_at_fd(root_fd).map_err(|err| match err {
       // The tree is not fully walkable: fanotify is not viable. Hand `config`
       // back so the dispatcher can fall back (Auto) or type the error (forced).
-      WalkError::Incomplete(_) => SpawnFailure::NotViable(config.clone()),
+      WalkError::Incomplete(_) => SpawnFailure::NotViable(Box::new(config.clone())),
       WalkError::RootGone(source) => SpawnFailure::Error(SourceError::RootUnavailable {
         root: canonical.clone(),
         source,
@@ -264,10 +266,12 @@ impl Source {
     })?;
     map.seed(seed);
 
+    let stats = Arc::new(super::super::super::BackendStatsShared::default());
     let (queue_tx, queue_rx) = async_channel::unbounded();
     let shared = Arc::new(ReaderShared {
       queue: queue_tx,
       transport: transport::TransportState::new(config.channel_capacity.get()),
+      stats: Arc::clone(&stats),
     });
 
     let wake = WakeState::new()?;
@@ -285,6 +289,7 @@ impl Source {
       control: control_tx,
       wake,
       thread: Some(thread),
+      stats,
     };
 
     // The post-live half of the identity bracket, TWO complementary signals now
@@ -442,6 +447,12 @@ pub(crate) struct ReseedContext {
   /// replaced-at-path root becomes a failed reseed (retry → blind → fatal) rather
   /// than the map silently rebinding to the replacement tree.
   root_fid: Fid,
+  /// The admission-map directory cap (design §4.9); `None` = uncapped. A walk that
+  /// would map more directories than this stops with a cap
+  /// [`WalkError::Incomplete`], which the spawn folds to `NotViable` and the
+  /// reseed folds to the terminal `Fatal` — never a multi-gigabyte map built
+  /// blind.
+  max_directories: Option<usize>,
 }
 
 impl ReseedContext {
@@ -473,6 +484,7 @@ impl ReseedContext {
       self.root_dev,
       self.root_mnt_id,
       &self.root_fid,
+      self.max_directories,
     )
     .map_err(WalkError::into_io)
   }
@@ -496,6 +508,7 @@ impl ReseedContext {
       self.fsid,
       self.root_dev,
       self.root_mnt_id,
+      self.max_directories,
     )
   }
 
@@ -526,6 +539,7 @@ impl ReseedContext {
       self.fsid,
       self.root_dev,
       self.root_mnt_id,
+      self.max_directories,
     )
     .map_err(WalkError::into_io)
   }
@@ -658,6 +672,7 @@ fn seed_walk(
   root_dev: u64,
   root_mnt_id: Option<u64>,
   expected: &Fid,
+  max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
   // handle and its children both come from this fd, never a re-resolved name. A
@@ -675,7 +690,7 @@ fn seed_walk(
       "the watched root was replaced at its path (reopened handle does not match the spawn root)",
     )));
   }
-  seed_from_fd(root_fd, root, fsid, root_dev, root_mnt_id)
+  seed_from_fd(root_fd, root, fsid, root_dev, root_mnt_id, max_directories)
 }
 
 /// Seeds the map from an ALREADY-PINNED root fd, producing a [`SeedEntry`] per
@@ -724,6 +739,7 @@ fn seed_from_fd(
   fsid: [u8; 8],
   root_dev: u64,
   root_mnt_id: Option<u64>,
+  max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The root anchor is load-bearing: without its handle the map has no base to
   // resolve any path against, so its absence is a spawn/reseed failure, never an
@@ -736,7 +752,15 @@ fn seed_from_fd(
     )));
   };
   let mut seed = vec![SeedEntry::root(root_fid.clone(), root)];
-  descend(root_fd, root_fid, fsid, root_dev, root_mnt_id, &mut seed)?;
+  descend(
+    root_fd,
+    root_fid,
+    fsid,
+    root_dev,
+    root_mnt_id,
+    max_directories,
+    &mut seed,
+  )?;
   Ok(seed)
 }
 
@@ -774,6 +798,7 @@ fn subtree_walk(
   fsid: [u8; 8],
   root_dev: u64,
   root_mnt_id: Option<u64>,
+  max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The moved directory is still in-map and pending its walk, so pinning it must
   // succeed: any failure (a vanish/shape-change included) is a coverage hole, not
@@ -799,6 +824,7 @@ fn subtree_walk(
     fsid,
     root_dev,
     root_mnt_id,
+    max_directories,
     &mut seed,
   )?;
   Ok(seed)
@@ -863,12 +889,23 @@ struct WalkDir {
 /// classified: a vanish/shape-change (`ENOENT`/`ELOOP`/`ENOTDIR`) is a benign race
 /// skipped, anything else on an existing in-root directory aborts as
 /// [`WalkError::Incomplete`].
+///
+/// # Directory cap
+///
+/// When `max_directories` is set (design §4.9), the walk aborts with a cap
+/// [`WalkError::Incomplete`] the moment `seed` would exceed it — fenced BEFORE the
+/// oversized inventory is built, so a huge tree never materializes a
+/// multi-gigabyte `Vec`. The spawn folds that to `NotViable` (fall back / typed
+/// error) and the reseed to the terminal `Fatal`, matching the walk-completeness
+/// taxonomy. The moved-in subtree walk shares the fence; its additive total is
+/// re-checked exactly by the reader once the descendants land.
 fn descend(
   root_fd: OwnedFd,
   root_fid: Fid,
   fsid: [u8; 8],
   root_dev: u64,
   root_mnt_id: Option<u64>,
+  max_directories: Option<usize>,
   seed: &mut Vec<SeedEntry>,
 ) -> Result<(), WalkError> {
   let root_reader = Dir::new(root_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
@@ -1003,6 +1040,14 @@ fn descend(
     if !visited.insert(fid.handle().into()) {
       continue;
     }
+    // The directory cap (design §4.9), fenced BEFORE the push so an oversized tree
+    // never builds a multi-gigabyte inventory: an over-cap walk is fanotify-unviable
+    // (spawn falls back / types the error; a reseed escalates to fatal).
+    if max_directories.is_some_and(|cap| seed.len() >= cap) {
+      return Err(WalkError::Incomplete(io::Error::other(
+        "the fanotify seed walk exceeded the directory cap; the tree is too large to map",
+      )));
+    }
     seed.push(SeedEntry::child(
       fid.clone(),
       level.fid.clone(),
@@ -1084,9 +1129,17 @@ pub(crate) struct SourceHandle {
   control: mpsc::Sender<Control>,
   wake: Arc<WakeState>,
   thread: Option<JoinHandle<()>>,
+  /// The live stats the reader writes; the driver clones this into the registry
+  /// so [`Watcher::backend_stats`](crate::Watcher::backend_stats) can snapshot it.
+  stats: Arc<super::super::super::BackendStatsShared>,
 }
 
 impl SourceHandle {
+  /// The clonable handle to this source's live stats.
+  pub(crate) fn backend_stats(&self) -> Arc<super::super::super::BackendStatsShared> {
+    Arc::clone(&self.stats)
+  }
+
   /// Stops the reader and closes the instance. The reader exits at its next
   /// wake, so this blocks for at most one in-flight read + decode.
   pub(crate) fn shutdown(mut self) {

@@ -71,41 +71,70 @@ fn admit_ignores_fsid_divergence() {
   );
 }
 
-/// Interned ids are sequential, exact, and stable: the same handle always
-/// returns the same id, distinct handles never collide, re-interning is
-/// idempotent — and interning keys on the handle, so a divergent fsid does not
-/// mint a second id for the same object.
+/// The generation counter — the reader batch memo's invalidation token — bumps
+/// on every MUTATION but never on a plain resolving `admit` (the memo caches
+/// resolutions, so a resolve must not invalidate the memo). This is the
+/// no-identity contract's replacement surface: there is no intern table to pin;
+/// the only observable map state beyond membership is the mutation generation.
 #[test]
-fn intern_is_sequential_and_stable() {
-  let mut map = FidMap::new();
-  let a = map.intern(&fid(10));
-  let b = map.intern(&fid(20));
-  assert_ne!(a, b, "distinct handles get distinct ids");
-  assert_eq!(map.intern(&fid(10)), a, "the same handle is stable");
-  assert_eq!(map.intern(&fid(20)), b);
-  // A third distinct handle advances the counter (sequential, not hashed).
-  let c = map.intern(&fid(30));
-  assert_ne!(c, a);
-  assert_ne!(c, b);
-  // The same handle under a different fsid is the SAME object (btrfs): its id
-  // is unchanged.
+fn admit_does_not_bump_generation_but_mutations_do() {
+  let mut map = seeded();
+  let g0 = map.generation();
+  // Repeated resolving admits never bump — a hot firehose of in-root events
+  // leaves the memo valid.
+  assert_eq!(map.admit(&fid(1)), Some(PathBuf::from("/root")));
+  assert_eq!(map.admit(&fid(2)), Some(PathBuf::from("/root/sub")));
+  assert_eq!(map.generation(), g0, "resolving admits do not mutate");
+  // A clean firehose-drop (unknown handle, absent from the map) also leaves the
+  // generation untouched — nothing was evicted.
+  assert_eq!(map.admit(&fid(99)), None);
   assert_eq!(
-    map.intern(&fid_other_fsid(10)),
-    a,
-    "a divergent fsid does not fork identity"
+    map.generation(),
+    g0,
+    "an unknown-handle drop does not mutate"
   );
+
+  // A learn bumps.
+  map.learn(&fid(2), b"new", Some(&fid(3)));
+  let g1 = map.generation();
+  assert_ne!(g1, g0, "learn bumps the generation");
+  // A forget bumps.
+  map.forget(&fid(3));
+  let g2 = map.generation();
+  assert_ne!(g2, g1, "forget bumps the generation");
+  // A reseed bumps.
+  map.reseed([SeedEntry::root(fid(1), Path::new("/root"))]);
+  assert_ne!(map.generation(), g2, "reseed bumps the generation");
 }
 
-/// Seeding a directory also interns it, so an admitted directory always has a
-/// stable identity that matches a later explicit `intern`.
+/// A `forget` of an UNKNOWN handle is a no-op that mutates nothing and so does
+/// NOT bump the generation — a spurious bump would needlessly miss the reader's
+/// batch memo, and the eager prune found nothing to remove.
 #[test]
-fn seeding_interns_the_directory() {
+fn forget_of_unknown_handle_does_not_bump() {
   let mut map = seeded();
-  let root_id = map.intern(&fid(1));
-  let sub_id = map.intern(&fid(2));
-  assert_ne!(root_id, sub_id);
-  assert_eq!(map.intern(&fid(1)), root_id);
-  assert_eq!(map.intern(&fid(2)), sub_id);
+  let g = map.generation();
+  map.forget(&fid(99));
+  assert_eq!(
+    map.generation(),
+    g,
+    "forgetting an absent handle is a no-op"
+  );
+  assert_eq!(map.dir_count(), 2, "and removes nothing");
+}
+
+/// Seeding admits every entry and bumps the generation per inserted directory
+/// (the seed is a mutation the memo must observe).
+#[test]
+fn seeding_admits_and_bumps() {
+  let empty = FidMap::new();
+  let g0 = empty.generation();
+  let map = seeded();
+  assert!(
+    map.generation() > g0,
+    "a seed of two dirs advanced the generation"
+  );
+  assert_eq!(map.dir_count(), 2);
 }
 
 /// `learn` admits a newly-created in-root directory under its parent's path,
@@ -193,17 +222,12 @@ fn learn_rejects_non_component_names() {
   assert_eq!(map.dir_count(), 2, "no non-component name is admitted");
 }
 
-/// `forget` drops a directory from BOTH admission and the intern table (delete /
-/// rename-out): pruning the id bounds the table at O(live directories). A
-/// departed-and-returned directory mints a FRESH identity — the conservative
-/// direction (the Monitor reads inequality as a replacement, never a false
-/// survivor), and safe because only the SAME handle (the same object) could ever
-/// re-mint the old id.
+/// `forget` drops a directory from admission (delete / rename-out). A
+/// departed-and-returned directory simply re-enters through its own later
+/// create/rename event; there is no identity to preserve or discard.
 #[test]
-fn forget_prunes_admission_and_identity() {
+fn forget_drops_admission() {
   let mut map = seeded();
-  let sub_id = map.intern(&fid(2));
-  assert_eq!(map.interned_count(), 2, "root + sub interned");
   map.forget(&fid(2));
   assert_eq!(
     map.admit(&fid(2)),
@@ -211,16 +235,10 @@ fn forget_prunes_admission_and_identity() {
     "forgotten directory stops admitting"
   );
   assert_eq!(map.dir_count(), 1);
-  assert_eq!(
-    map.interned_count(),
-    1,
-    "the forgotten directory's id is pruned — only the root remains interned"
-  );
-  assert_ne!(
-    map.intern(&fid(2)),
-    sub_id,
-    "a returned directory mints a new identity, never reuses the departed id"
-  );
+  // A later learn of the same handle re-admits it — the map holds membership,
+  // nothing more.
+  map.learn(&fid(1), b"sub", Some(&fid(2)));
+  assert_eq!(map.admit(&fid(2)), Some(PathBuf::from("/root/sub")));
 }
 
 /// An in-root directory rename RE-PARENTS the one node IN PLACE (the real
@@ -240,24 +258,17 @@ fn in_root_rename_reparents_the_whole_subtree() {
     SeedEntry::child(fid(4), fid(1), OsString::from("b")),
   ]);
   assert_eq!(map.admit(&fid(3)), Some(PathBuf::from("/root/a/child")));
-  let child_id = map.intern(&fid(3));
 
   // Rename /root/a → /root/b/a: re-parent `a` under `b` IN PLACE (learn, no
   // forget) — exactly the in-root re-parent `admit_rename` performs.
   map.learn(&fid(4), b"a", Some(&fid(2)));
 
-  // The moved dir AND its pre-seeded child both resolve under the NEW path, and
-  // the child kept its identity (it never departed).
+  // The moved dir AND its pre-seeded child both resolve under the NEW path.
   assert_eq!(map.admit(&fid(2)), Some(PathBuf::from("/root/b/a")));
   assert_eq!(
     map.admit(&fid(3)),
     Some(PathBuf::from("/root/b/a/child")),
     "the descendant follows the parent's rename with no rewrite"
-  );
-  assert_eq!(
-    map.intern(&fid(3)),
-    child_id,
-    "an in-root re-parent preserves the descendant's identity (no fork)"
   );
   map.assert_adjacency();
 
@@ -327,12 +338,10 @@ fn move_in_then_out_tracks_admission() {
 }
 
 /// A populated move-out (`forget` of a directory with descendants) prunes the
-/// WHOLE subtree from BOTH the admission map and the intern table in one step, via
-/// the `children` adjacency — the O(subtree) departure. Dropping only the top would
-/// leak every descendant's id: the lazy admission miss only ever reaped `dirs`,
-/// never `ids`, so the intern table would grow past O(live directories).
+/// WHOLE subtree in one O(subtree) step, via the `children` adjacency — not left
+/// to leak until each lingering node hits a lazy admission miss.
 #[test]
-fn move_out_prunes_the_whole_subtree_from_both_maps() {
+fn move_out_prunes_the_whole_subtree() {
   let mut map = FidMap::new();
   // /root plus a 4-directory subtree under /root/a: a → b → c, and a sibling
   // /root/a/d — so `a` has a descendant fan-out to prune.
@@ -344,17 +353,11 @@ fn move_out_prunes_the_whole_subtree_from_both_maps() {
     SeedEntry::child(fid(5), fid(2), OsString::from("d")),
   ]);
   assert_eq!(map.dir_count(), 5);
-  assert_eq!(map.interned_count(), 5, "every seeded dir is interned");
   map.assert_adjacency();
 
   // Move /root/a out of the root: forget it. The whole subtree (a, b, c, d) goes.
   map.forget(&fid(2));
   assert_eq!(map.dir_count(), 1, "only the root survives");
-  assert_eq!(
-    map.interned_count(),
-    1,
-    "the departed subtree's four ids are all pruned at once — no leak"
-  );
   for tag in 2..=5u8 {
     assert_eq!(
       map.admit(&fid(tag)),
@@ -363,18 +366,6 @@ fn move_out_prunes_the_whole_subtree_from_both_maps() {
     );
   }
   map.assert_adjacency();
-
-  // Fresh-identity-on-return holds for DESCENDANTS too: a returned descendant
-  // mints a new id, never the pruned one.
-  let mut fresh = FidMap::new();
-  fresh.seed([SeedEntry::root(fid(1), Path::new("/root"))]);
-  let first = fresh.intern(&fid(4));
-  fresh.forget(&fid(4));
-  assert_ne!(
-    fresh.intern(&fid(4)),
-    first,
-    "a departed descendant mints a fresh identity on return"
-  );
 }
 
 /// The lazy `admit`-miss eviction remains as a belt: an `admit` on an unknown
@@ -396,11 +387,11 @@ fn admit_miss_on_unknown_handle_is_a_clean_drop() {
 
 /// The reseed rebuilds the admission structure from a fresh walk and swaps it
 /// in: a directory the firehose dropped during a loss window (never learned) is
-/// admitted after the reseed re-observes it, a directory that vanished is pruned,
-/// and a directory that PERSISTED keeps its interned identity — while a vanished
-/// directory's id is pruned so the intern table stays O(live directories).
+/// admitted after the reseed re-observes it, and a directory that vanished is
+/// pruned. The reseed bumps the generation, so the reader's batch memo (from
+/// before the loss) misses.
 #[test]
-fn reseed_preserves_live_ids_and_prunes_vanished() {
+fn reseed_rebuilds_admission_and_bumps() {
   let mut map = FidMap::new();
   // /root, /root/sub, /root/keep — three seeded directories.
   map.seed([
@@ -408,11 +399,7 @@ fn reseed_preserves_live_ids_and_prunes_vanished() {
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
     SeedEntry::child(fid(3), fid(1), OsString::from("keep")),
   ]);
-  // Identities minted before the loss.
-  let root_id = map.intern(&fid(1));
-  let keep_id = map.intern(&fid(3));
-  let sub_id = map.intern(&fid(2));
-  assert_eq!(map.interned_count(), 3);
+  let before = map.generation();
   // During the loss, /root/sub was removed and /root/fresh (fid 7, with a child
   // fid 8) was created; /root/keep persisted — the firehose missed all of it.
   assert_eq!(
@@ -428,6 +415,10 @@ fn reseed_preserves_live_ids_and_prunes_vanished() {
     SeedEntry::child(fid(7), fid(1), OsString::from("fresh")),
     SeedEntry::child(fid(8), fid(7), OsString::from("deep")),
   ]);
+  assert!(
+    map.generation() > before,
+    "the reseed advanced the generation"
+  );
 
   // The reseed rebuilt the adjacency from the fresh walk (parents before
   // children), so the dual links are consistent after the swap.
@@ -441,27 +432,7 @@ fn reseed_preserves_live_ids_and_prunes_vanished() {
     None,
     "a vanished dir is gone after reseed"
   );
-  // The intern table now holds exactly the four LIVE directories (root, keep,
-  // fresh, deep) — the vanished sub's id was pruned, never leaked.
-  assert_eq!(
-    map.interned_count(),
-    4,
-    "reseed pruned the vanished dir's id and kept the four live ones"
-  );
-  // Live directories keep their identities across the reseed.
-  assert_eq!(map.intern(&fid(1)), root_id, "the root keeps its id");
-  assert_eq!(
-    map.intern(&fid(3)),
-    keep_id,
-    "a directory that persisted through the loss keeps its id"
-  );
-  // The intern table is bounded by the LIVE directory count: the vanished dir's
-  // id was pruned, so re-interning it mints a fresh id (never the departed one).
-  assert_ne!(
-    map.intern(&fid(2)),
-    sub_id,
-    "a vanished directory's id is pruned; a reappearance mints fresh"
-  );
+  assert_eq!(map.admit(&fid(3)), Some(PathBuf::from("/root/keep")));
 }
 
 /// An unknown handle is dropped even when it shares the root's superblock — the
@@ -476,6 +447,57 @@ fn unknown_handle_dropped_is_the_firehose_filter() {
     );
   }
   assert!(!map.contains_dir(&fid_same_sb(100)));
+}
+
+/// The directory cap (design §4.9): `over_capacity` is false while the map is at
+/// or under the cap and true the moment a live `learn` grows it past — the
+/// tripwire the reader signals fatal on. An uncapped map is never over capacity.
+#[test]
+fn over_capacity_trips_when_a_learn_exceeds_the_cap() {
+  // Cap of two directories: the root plus one child fit exactly.
+  let mut map = FidMap::with_capacity(Some(2));
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+  ]);
+  assert!(
+    !map.over_capacity(),
+    "two dirs at a cap of two is within budget"
+  );
+  // A live create of a THIRD directory pushes the map over its cap.
+  map.learn(&fid(2), b"third", Some(&fid(3)));
+  assert!(
+    map.over_capacity(),
+    "a learn growing the map to three dirs trips a cap of two"
+  );
+  // Forgetting one brings it back under.
+  map.forget(&fid(3));
+  assert!(!map.over_capacity(), "back within budget after a forget");
+
+  // An uncapped map never trips, however large it grows.
+  let mut uncapped = FidMap::new();
+  uncapped.seed([SeedEntry::root(fid(1), Path::new("/root"))]);
+  for tag in 2..50u8 {
+    uncapped.learn(&fid(1), &[tag], Some(&fid(tag)));
+  }
+  assert!(!uncapped.over_capacity(), "an uncapped map never trips");
+}
+
+/// `stats` reports the live directory count and the current generation — the
+/// snapshot the reader publishes for `Watcher::backend_stats`.
+#[test]
+fn stats_reports_directories_and_generation() {
+  let mut map = seeded();
+  let s0 = map.stats();
+  assert_eq!(s0.directories, 2);
+  assert_eq!(s0.memo_generation, map.generation());
+  map.learn(&fid(2), b"more", Some(&fid(3)));
+  let s1 = map.stats();
+  assert_eq!(s1.directories, 3, "the count tracks a learn");
+  assert!(
+    s1.memo_generation > s0.memo_generation,
+    "the reported generation advances with a mutation"
+  );
 }
 
 /// `learn_moved_in` marks the top as `pending_walk`, and `pending_walk_target`

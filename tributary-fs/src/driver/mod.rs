@@ -68,6 +68,10 @@ pub(crate) struct DriverConfig {
   /// unmount — which emits no kernel signal and no loss — is still detected.
   /// [`Duration::ZERO`] disables the tick.
   pub(crate) root_liveness_interval: Duration,
+  /// The fanotify admission-map directory cap (design §4.9); `None` = uncapped.
+  /// Threaded into each fanotify spawn's `SourceConfig`; ignored by inotify and
+  /// macOS.
+  pub(crate) max_map_directories: Option<usize>,
 }
 
 impl DriverConfig {
@@ -272,6 +276,7 @@ pub(crate) trait ScopeRegistry: Send + Sync + 'static {
     identity: RootIdentity,
     ancestors: &[RootIdentity],
     backend: BackendKind,
+    stats: Option<crate::os::BackendStatsHandle>,
   );
 
   /// `scope` ended (unwatch, root death, stream fatal, close); its entry is
@@ -417,6 +422,14 @@ pub(crate) trait SourceControl: Send + 'static {
   fn scope_port(&self) -> ScopePort {
     ScopePort::Inert
   }
+
+  /// The source's live stats handle, `Some` only for a fanotify source (every
+  /// other backend has no pollable internals — design §4.9). The driver threads
+  /// it into the registry so [`Watcher::backend_stats`](crate::Watcher::backend_stats)
+  /// can snapshot it per root.
+  fn backend_stats(&self) -> Option<crate::os::BackendStatsHandle> {
+    None
+  }
 }
 
 impl SourceControl for SourceHandle {
@@ -427,6 +440,11 @@ impl SourceControl for SourceHandle {
   #[cfg(all(target_os = "linux", not(miri)))]
   fn scope_port(&self) -> ScopePort {
     SourceHandle::scope_port(self)
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn backend_stats(&self) -> Option<crate::os::BackendStatsHandle> {
+    SourceHandle::backend_stats(self)
   }
 }
 
@@ -1014,6 +1032,10 @@ pub(crate) async fn run<R, F>(
                 // spawn can execute, so a descending root's first AddWatch
                 // always finds its scope routed.
                 ops.attach_scope(scope, spawned.handle.scope_port());
+                // The live stats handle (fanotify only) is captured before the
+                // handle is stored, so the registry can hand a `backend_stats`
+                // query the same counters the reader writes.
+                let stats = spawned.handle.backend_stats();
                 handles.insert(scope, spawned.handle);
                 os.push(
                   spawned
@@ -1029,7 +1051,7 @@ pub(crate) async fn run<R, F>(
                 // insert-after-remove race has no actors left to run it. A
                 // scope dying before the caller polls its grant simply yields
                 // a dead-on-arrival handle.
-                registry.scope_live(scope, &canonical_root, identity, &ancestors, backend);
+                registry.scope_live(scope, &canonical_root, identity, &ancestors, backend, stats);
                 match backend {
                   // Descending: the stream is live but covers NOTHING until
                   // the root's kernel watch arms; the grant defers to the
@@ -1291,6 +1313,7 @@ fn execute_effects<R, F>(
         // pins it (and surfaces a typed error rather than falling back).
         // (macOS ignores the selector — FSEvents is its one backend.)
         source_config.backend = config.backend;
+        source_config.max_map_directories = config.max_map_directories;
         let ops = ops.clone();
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {

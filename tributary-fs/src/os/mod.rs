@@ -48,9 +48,10 @@ pub enum BackendKind {
   FsEvents,
   /// Linux inotify — per-directory (descending); precise verbs, unprivileged.
   Inotify,
-  /// Linux fanotify-FILESYSTEM — kernel-recursive; precise verbs, interned-FID
-  /// identity. Privileged (`CAP_SYS_ADMIN`); selected by `Backend::Auto` when
-  /// its preconditions hold, or forced by [`Backend::Fanotify`].
+  /// Linux fanotify-FILESYSTEM — kernel-recursive; precise verbs, membership-only
+  /// admission (no node identity — design §4.9). Privileged (`CAP_SYS_ADMIN`);
+  /// selected by `Backend::Auto` when its preconditions hold, or forced by
+  /// [`Backend::Fanotify`].
   Fanotify,
 }
 
@@ -78,6 +79,153 @@ impl core::fmt::Display for BackendKind {
     f.write_str(self.as_str())
   }
 }
+
+/// A lightweight, pollable snapshot of one backend's live internals — the
+/// observability the operator owes a tripwire on (design §4.9). Surfaced per
+/// watched root by
+/// [`Watcher::backend_stats`](crate::Watcher::backend_stats); only the fanotify
+/// backend populates it (every other backend has no equivalent state), so a
+/// non-fanotify root reports `None` rather than a zeroed struct.
+///
+/// A snapshot, not a live handle: each accessor returns the value at the moment
+/// the query read the backend's counters. `#[non_exhaustive]` so more counters
+/// can land without a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BackendStats {
+  directories: usize,
+  memo_generation: u64,
+  seed_walk_last_micros: u64,
+  seed_walk_count: u64,
+  reseeds: u64,
+  memo_hits: u64,
+  memo_misses: u64,
+}
+
+impl BackendStats {
+  /// The number of directories currently in the fanotify admission map — its
+  /// live O(directories) footprint (design §4.9: ~250 B/dir, so ~2.5–4 GB at
+  /// 10 M directories).
+  #[must_use]
+  pub const fn directories(&self) -> usize {
+    self.directories
+  }
+
+  /// The admission map's mutation generation — the batch memo's invalidation
+  /// token, monotone across the map's lifetime (a coarse mutation counter).
+  #[must_use]
+  pub const fn memo_generation(&self) -> u64 {
+    self.memo_generation
+  }
+
+  /// Microseconds the LAST seed or reseed walk took (0 before the first walk) —
+  /// the map-rebuild cost the operator sizes the directory cap against.
+  #[must_use]
+  pub const fn seed_walk_last_micros(&self) -> u64 {
+    self.seed_walk_last_micros
+  }
+
+  /// How many seed/reseed walks have completed (the spawn seed plus every
+  /// loss-triggered reseed and moved-in subtree walk).
+  #[must_use]
+  pub const fn seed_walk_count(&self) -> u64 {
+    self.seed_walk_count
+  }
+
+  /// How many loss-triggered map reseeds have run — a rescan-pressure signal.
+  #[must_use]
+  pub const fn reseeds(&self) -> u64 {
+    self.reseeds
+  }
+
+  /// Cumulative batch-memo hits: admitted directory resolutions served from the
+  /// per-batch cache rather than a fresh map walk.
+  #[must_use]
+  pub const fn memo_hits(&self) -> u64 {
+    self.memo_hits
+  }
+
+  /// Cumulative batch-memo misses: resolutions that fell through to the map
+  /// (a cold directory, or a stale entry after a same-batch mutation).
+  #[must_use]
+  pub const fn memo_misses(&self) -> u64 {
+    self.memo_misses
+  }
+}
+
+/// The shared, atomic backing store the fanotify reader writes and the watcher
+/// snapshots — the live counters behind [`BackendStats`]. Kept OS-agnostic
+/// (pure atomics, no FFI) so the cross-platform watcher can read it, and behind
+/// an `Arc` so the reader thread and the registry entry share one instance. A
+/// non-fanotify backend never mints one, so its [`backend_stats`] is `None`.
+///
+/// [`backend_stats`]: crate::driver::SourceControl::backend_stats
+#[derive(Debug, Default)]
+pub(crate) struct BackendStatsShared {
+  directories: core::sync::atomic::AtomicUsize,
+  memo_generation: core::sync::atomic::AtomicU64,
+  seed_walk_last_micros: core::sync::atomic::AtomicU64,
+  seed_walk_count: core::sync::atomic::AtomicU64,
+  reseeds: core::sync::atomic::AtomicU64,
+  memo_hits: core::sync::atomic::AtomicU64,
+  memo_misses: core::sync::atomic::AtomicU64,
+}
+
+// Only the fanotify reader (cfg linux, not miri) writes these; the setters are
+// dead on every other build, but gating them would fracture the shared type.
+#[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
+impl BackendStatsShared {
+  /// A consistent-enough snapshot for an operator poll. The counters are read
+  /// `Relaxed` and independently, so a snapshot may straddle a reader update
+  /// (e.g. `memo_hits` newer than `directories`); for tripwire observability
+  /// that skew is immaterial, and no store here gates a correctness decision.
+  pub(crate) fn snapshot(&self) -> BackendStats {
+    use core::sync::atomic::Ordering::Relaxed;
+    BackendStats {
+      directories: self.directories.load(Relaxed),
+      memo_generation: self.memo_generation.load(Relaxed),
+      seed_walk_last_micros: self.seed_walk_last_micros.load(Relaxed),
+      seed_walk_count: self.seed_walk_count.load(Relaxed),
+      reseeds: self.reseeds.load(Relaxed),
+      memo_hits: self.memo_hits.load(Relaxed),
+      memo_misses: self.memo_misses.load(Relaxed),
+    }
+  }
+
+  /// Publishes the map's live footprint (its directory count and generation)
+  /// after a batch or a walk.
+  pub(crate) fn set_map(&self, directories: usize, memo_generation: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    self.directories.store(directories, Relaxed);
+    self.memo_generation.store(memo_generation, Relaxed);
+  }
+
+  /// Records one completed seed/reseed walk's duration and bumps the walk count.
+  pub(crate) fn record_walk(&self, micros: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    self.seed_walk_last_micros.store(micros, Relaxed);
+    self.seed_walk_count.fetch_add(1, Relaxed);
+  }
+
+  /// Bumps the loss-triggered reseed counter.
+  pub(crate) fn record_reseed(&self) {
+    self
+      .reseeds
+      .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+  }
+
+  /// Adds one batch's memo hit/miss tallies to the cumulative counters.
+  pub(crate) fn add_memo(&self, hits: u64, misses: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    self.memo_hits.fetch_add(hits, Relaxed);
+    self.memo_misses.fetch_add(misses, Relaxed);
+  }
+}
+
+/// The clonable handle the driver threads from a live source into the registry
+/// so [`Watcher::backend_stats`](crate::Watcher::backend_stats) can snapshot it.
+/// `Some` only for a fanotify source.
+pub(crate) type BackendStatsHandle = std::sync::Arc<BackendStatsShared>;
 
 /// The Linux watch primitive a [`Watcher`](crate::Watcher) should use for each
 /// root, chosen through [`WatcherOptions::backend`](crate::WatcherOptions::backend).
@@ -297,6 +445,13 @@ pub(crate) struct SourceConfig {
   // Only the linux backend reads this; every other build sees it as dead.
   #[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
   pub(crate) backend: Backend,
+  /// The fanotify admission-map directory cap (design §4.9); `None` = uncapped.
+  /// A seed/reseed walk that would exceed it makes fanotify unviable (fall back
+  /// under `Backend::Auto`, typed error when forced); a live create/move-in
+  /// growing the map past it kills the scope (never OOM). Only the fanotify
+  /// backend reads it.
+  #[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
+  pub(crate) max_map_directories: Option<usize>,
 }
 
 impl SourceConfig {
@@ -310,6 +465,7 @@ impl SourceConfig {
       latency: Duration::from_millis(10),
       channel_capacity: NonZeroUsize::new(64).expect("64 is nonzero"),
       backend: Backend::Auto,
+      max_map_directories: None,
     }
   }
 }

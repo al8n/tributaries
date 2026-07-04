@@ -21,7 +21,7 @@ use crate::{
   error::{BuildError, CloseError, UnwatchError, WatchRootError},
   event::Event,
   options::WatcherOptions,
-  os::{BackendKind, RootIdentity, SourceError},
+  os::{BackendKind, BackendStats, RootIdentity, SourceError},
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -65,13 +65,15 @@ impl RootHandle {
 /// One live root's registry record: its canonical path plus the object
 /// identities disjointness is decided on (the root's own and every strict
 /// ancestor's), captured at the spawn barrier, plus the backend the barrier
-/// selected (what [`Watcher::backend_of`] reports).
+/// selected (what [`Watcher::backend_of`] reports) and — for a fanotify root —
+/// the live stats handle [`Watcher::backend_stats`] snapshots.
 #[derive(Debug)]
 struct RootEntry {
   path: Arc<PathBuf>,
   identity: RootIdentity,
   ancestors: Arc<[RootIdentity]>,
   backend: BackendKind,
+  stats: Option<crate::os::BackendStatsHandle>,
 }
 
 /// One in-flight `watch`'s reservation record: the watcher-side canonical
@@ -144,6 +146,7 @@ impl ScopeRegistry for RegistryWriter {
     identity: RootIdentity,
     ancestors: &[RootIdentity],
     backend: BackendKind,
+    stats: Option<crate::os::BackendStatsHandle>,
   ) {
     let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
     set.entries.insert(
@@ -153,6 +156,7 @@ impl ScopeRegistry for RegistryWriter {
         identity,
         ancestors: ancestors.into(),
         backend,
+        stats,
       },
     );
   }
@@ -318,6 +322,7 @@ impl<R: RuntimeLite> Watcher<R> {
       profile: DriverConfig::platform_profile(),
       backend: options.backend(),
       root_liveness_interval: options.root_liveness_interval(),
+      max_map_directories: options.max_map_directories(),
     };
     Self::spawn_with(options, config, RealFs::new())
   }
@@ -368,6 +373,7 @@ impl<R: RuntimeLite> Watcher<R> {
       // the selection knob is inert here.
       backend: options.backend(),
       root_liveness_interval: options.root_liveness_interval(),
+      max_map_directories: options.max_map_directories(),
     };
     Self::spawn_with(options, config, ops)
   }
@@ -563,6 +569,31 @@ impl<R: RuntimeLite> Watcher<R> {
       .entries
       .get(&root.scope())
       .map(|entry| entry.backend)
+  }
+
+  /// A pollable snapshot of a watched root's backend internals (design §4.9):
+  /// the fanotify admission map's size and generation, its seed/reseed walk
+  /// timings and count, and the batch-memo hit/miss tallies. `None` unless the
+  /// handle names a LIVE fanotify root of this watcher — a non-fanotify backend
+  /// keeps no such state, and a handle that never named a live root (never
+  /// watched, already gone, or foreign) reports `None` just as
+  /// [`backend_of`](Self::backend_of) does.
+  ///
+  /// A snapshot, not a live view: the returned [`BackendStats`] holds the counter
+  /// values at the moment of the call. Poll it to watch the map grow or the memo
+  /// hit rate move; it costs one read-lock and a handful of atomic loads.
+  pub fn backend_stats(&self, root: RootHandle) -> Option<BackendStats> {
+    if root.instance() != self.instance {
+      return None;
+    }
+    self
+      .roots
+      .read()
+      .unwrap_or_else(PoisonError::into_inner)
+      .entries
+      .get(&root.scope())
+      .and_then(|entry| entry.stats.as_ref())
+      .map(|stats| stats.snapshot())
   }
 
   /// The number of registry entries — live roots only, by construction.
