@@ -3,9 +3,25 @@ use std::io;
 use rustix::io::Errno;
 
 use super::{
-  WalkError, WalkSkip, classify_walk_skip, handle_fid_at, handles_match, seed_walk, subtree_walk,
+  WalkError, WalkSkip, classify_walk_skip, handle_fid_at, handles_match, seed_from_fd, seed_walk,
+  subtree_walk,
 };
 use crate::os::linux::fanotify::fid::Fid;
+
+/// Opens `path` as a pinned directory `OwnedFd` the same no-symlink way the walk
+/// does, for the tests that feed [`seed_from_fd`] a real root fd directly. `None`
+/// when the open fails (the caller skips loudly).
+fn open_dir_fd(path: &std::path::Path) -> Option<std::os::fd::OwnedFd> {
+  use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+  openat2(
+    rustix::fs::CWD,
+    path,
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+    Mode::empty(),
+    ResolveFlags::NO_SYMLINKS,
+  )
+  .ok()
+}
 
 /// A throwaway FID whose handle bytes are the given tag — a stand-in the walk's
 /// FID-verification gate rejects when it does not equal a reopened object's true
@@ -53,7 +69,7 @@ fn root_without_a_handle_is_a_fatal_seed_failure() {
   let missing = std::path::Path::new("/tributary-fs-nonexistent-root-for-seed-walk");
   // The open fails (ENOENT) before the FID check is reached, so any expected FID
   // will do — the point is the RootGone class, not the mismatch.
-  let result = seed_walk(missing, [0u8; 8], 0, None, &some_fid(1), None);
+  let result = seed_walk(missing, [0u8; 8], 0, &some_fid(1), None);
   assert!(
     matches!(result, Err(WalkError::RootGone(_))),
     "a root with no encodable handle fails the walk as RootGone, not an empty seed"
@@ -199,7 +215,7 @@ fn reseed_root_fid_mismatch_is_rootgone_without_seeding() {
   // A DELIBERATELY WRONG anchor: the real root will never encode to these bytes,
   // so the reopen-verification must reject it.
   let wrong = some_fid(0xEE);
-  let result = seed_walk(&root, [0u8; 8], root_dev, None, &wrong, None);
+  let result = seed_walk(&root, [0u8; 8], root_dev, &wrong, None);
   let _ = std::fs::remove_dir_all(&root);
   assert!(
     matches!(result, Err(WalkError::RootGone(_))),
@@ -235,7 +251,7 @@ fn reseed_root_fid_match_seeds_normally() {
     eprintln!("SKIP reseed_root_fid_match_seeds_normally: temp root exports no handle");
     return;
   };
-  let result = seed_walk(&root, [0u8; 8], root_dev, None, &expected, None);
+  let result = seed_walk(&root, [0u8; 8], root_dev, &expected, None);
   let _ = std::fs::remove_dir_all(&root);
   let entries = result.expect("the genuine root passes the FID gate and seeds");
   // The root anchor plus its `sub` child — the gate did not block the real root.
@@ -280,7 +296,7 @@ fn subtree_fid_mismatch_is_incomplete_without_seeding() {
   }
   // A wrong learned FID: the real reopened subtree will not encode to these bytes.
   let wrong = some_fid(0xAB);
-  let result = subtree_walk(&subtree, &wrong, [0u8; 8], root_dev, None, None);
+  let result = subtree_walk(&subtree, &wrong, [0u8; 8], root_dev, None);
   let _ = std::fs::remove_dir_all(&subtree);
   assert!(
     matches!(result, Err(WalkError::Incomplete(_))),
@@ -319,7 +335,7 @@ fn subtree_fid_match_seeds_descendants() {
     eprintln!("SKIP subtree_fid_match_seeds_descendants: temp fs exports no handle");
     return;
   };
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None, None);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
   let _ = std::fs::remove_dir_all(&subtree);
   let entries = result.expect(
     "the genuine subtree passes the handle-only FID gate and seeds descendants, even with an \
@@ -383,7 +399,7 @@ fn unreadable_child_makes_the_real_walk_incomplete() {
     );
     return;
   };
-  let result = seed_walk(&root, [0u8; 8], root_dev, None, &expected, None);
+  let result = seed_walk(&root, [0u8; 8], root_dev, &expected, None);
   // Restore permissions BEFORE asserting so cleanup always succeeds.
   let _ = std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755));
   let _ = std::fs::remove_dir_all(&root);
@@ -431,7 +447,7 @@ fn subtree_walk_maps_descendants_not_the_root() {
     return;
   };
 
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None, None);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
   let _ = std::fs::remove_dir_all(&subtree);
   let entries = match result {
     Ok(entries) => entries,
@@ -509,7 +525,7 @@ fn subtree_walk_unreadable_descendant_is_incomplete() {
     return;
   }
 
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None, None);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
   let _ = std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755));
   let _ = std::fs::remove_dir_all(&subtree);
   match result {
@@ -534,7 +550,7 @@ fn subtree_walk_on_missing_path_is_incomplete_not_empty() {
   ));
   let _ = std::fs::remove_dir_all(&missing);
   let subtree_fid = Fid::new([7; 8], Box::from(&[7u8][..]));
-  match subtree_walk(&missing, &subtree_fid, [0u8; 8], 0, None, None) {
+  match subtree_walk(&missing, &subtree_fid, [0u8; 8], 0, None) {
     Err(WalkError::Incomplete(err)) => {
       assert_eq!(
         err.kind(),
@@ -578,20 +594,158 @@ fn seed_walk_over_the_directory_cap_is_incomplete() {
   };
 
   // A cap of two cannot hold four directories: the walk aborts as Incomplete.
-  let capped = seed_walk(&root, [0u8; 8], root_dev, None, &expected, Some(2));
+  let capped = seed_walk(&root, [0u8; 8], root_dev, &expected, Some(2));
   assert!(
     matches!(capped, Err(WalkError::Incomplete(_))),
     "a tree exceeding the directory cap is Incomplete (fanotify not viable), not a partial seed"
   );
 
   // A generous cap seeds the whole tree.
-  let ok = seed_walk(&root, [0u8; 8], root_dev, None, &expected, Some(1000));
+  let ok = seed_walk(&root, [0u8; 8], root_dev, &expected, Some(1000));
   let _ = std::fs::remove_dir_all(&root);
   let entries = ok.expect("a generous cap seeds the whole tree");
   assert_eq!(
     entries.len(),
     4,
     "root + three subdirectories seed under a cap that comfortably holds them"
+  );
+}
+
+/// The descent fences children against the mount frame it is HANDED, and the live
+/// path-reopen walks hand it the frame they re-read from the reopened root fd — so
+/// a same-object re-mount fences descendants on the NEW frame, not a stale one.
+/// Exercised at the `seed_from_fd` seam: fed the root fd's OWN fresh mount id, a
+/// same-mount child is descended; fed a STALE frame (a spawn-captured id after the
+/// root moved mounts), the identical child reads as a boundary and is skipped. This
+/// is the re-mount shape without a privileged bind — the container `remount` cell
+/// proves the reopen-recompute end to end.
+#[test]
+fn seed_from_fd_fences_on_the_handed_mount_frame_not_a_stale_one() {
+  use std::os::{fd::AsFd, unix::fs::MetadataExt};
+
+  let root = std::env::temp_dir().join(format!("tributary-fs-fence-frame-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(root.join("child")).expect("create a walkable root + child");
+  let Ok(meta) = std::fs::metadata(&root) else {
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+  let root_dev = meta.dev();
+  let Some(root_fd) = open_dir_fd(&root) else {
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!(
+      "SKIP seed_from_fd_fences_on_the_handed_mount_frame_not_a_stale_one: cannot open root"
+    );
+    return;
+  };
+  // The root fd's TRUE current frame — what the reopen recompute reads and hands
+  // the descent. A filesystem that reports no mount id degrades to the device belt
+  // (no frame to make stale), so this cell cannot exercise the fence: skip loudly.
+  let Some(fresh) = crate::os::linux::root_mount_id(root_fd.as_fd()) else {
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!(
+      "SKIP seed_from_fd_fences_on_the_handed_mount_frame_not_a_stale_one: no mount id reported"
+    );
+    return;
+  };
+
+  // Handed the FRESH frame the reopen reads from the fd, the same-mount child is
+  // descended: root anchor + the child.
+  let with_fresh = seed_from_fd(
+    open_dir_fd(&root).expect("re-open root for the fresh-frame walk"),
+    &root,
+    [0u8; 8],
+    root_dev,
+    Some(fresh),
+    None,
+  );
+  let fresh_entries = match with_fresh {
+    Ok(entries) => entries,
+    // A temp fs that cannot export handles fails on the child — then this
+    // environment cannot exercise the descent, so skip.
+    Err(_) => {
+      let _ = std::fs::remove_dir_all(&root);
+      eprintln!(
+        "SKIP seed_from_fd_fences_on_the_handed_mount_frame_not_a_stale_one: temp fs exports no \
+         handle"
+      );
+      return;
+    }
+  };
+  assert!(
+    fresh_entries
+      .iter()
+      .any(|e| e.name == std::ffi::OsStr::new("child") && e.parent.is_some()),
+    "the fresh reopen frame descends the same-mount child"
+  );
+
+  // Handed a STALE frame (a spawn-captured id from before the root moved mounts), the
+  // identical child now differs from the fence and is skipped — the silent blindness
+  // the reopen-recompute avoids by reading the frame from the current fd.
+  let stale = fresh.wrapping_add(1);
+  let with_stale = seed_from_fd(root_fd, &root, [0u8; 8], root_dev, Some(stale), None)
+    .expect("the stale-frame walk still seeds the root anchor, just skips the child");
+  let _ = std::fs::remove_dir_all(&root);
+  assert!(
+    !with_stale
+      .iter()
+      .any(|e| e.name == std::ffi::OsStr::new("child")),
+    "a STALE fence frame marks the same-mount child a boundary and skips it — which is \
+     why the reopen-recompute reads the frame from the current fd"
+  );
+  assert!(
+    with_stale.iter().any(|e| e.parent.is_none()),
+    "the root anchor is still seeded under either frame"
+  );
+}
+
+/// The move-in subtree walk fences on the REMAINING budget the reader threads, not
+/// the full cap: a `budget` smaller than the subtree's descendant count aborts
+/// `Incomplete` (folding to the reader's retry-then-fatal) rather than mapping past
+/// it, while a generous/`None` budget maps every descendant. This is the additive
+/// half of the cap taxonomy — a near-cap map hands the walk `cap - len`, so a
+/// populated move-in never allocates a whole extra cap before the reader's fatal.
+#[test]
+fn subtree_walk_fences_on_the_remaining_budget() {
+  use std::os::unix::fs::MetadataExt;
+
+  let subtree = std::env::temp_dir().join(format!(
+    "tributary-fs-subtree-budget-{}",
+    std::process::id()
+  ));
+  // subtree/{a, b, c} — three descendant directories.
+  let _ = std::fs::remove_dir_all(&subtree);
+  std::fs::create_dir_all(subtree.join("a")).expect("create descendant a");
+  std::fs::create_dir_all(subtree.join("b")).expect("descendant b");
+  std::fs::create_dir_all(subtree.join("c")).expect("descendant c");
+  let Ok(meta) = std::fs::metadata(&subtree) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    return;
+  };
+  let root_dev = meta.dev();
+  let Some(subtree_fid) = real_dir_fid(&subtree, [0u8; 8]) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    eprintln!("SKIP subtree_walk_fences_on_the_remaining_budget: temp fs exports no handle");
+    return;
+  };
+
+  // A budget of one cannot hold three descendants: the additive walk aborts before
+  // mapping past the room left — never a partial over-budget seed.
+  let capped = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, Some(1));
+  assert!(
+    matches!(capped, Err(WalkError::Incomplete(_))),
+    "a subtree exceeding the remaining budget is Incomplete (blind → fatal), not a partial seed"
+  );
+
+  // A generous budget maps all three descendants (the moved dir itself is not
+  // re-emitted, so exactly the three children).
+  let ok = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, Some(1000));
+  let _ = std::fs::remove_dir_all(&subtree);
+  let entries = ok.expect("a generous budget maps every descendant");
+  assert_eq!(
+    entries.len(),
+    3,
+    "all three descendant directories map under a budget that comfortably holds them"
   );
 }
 

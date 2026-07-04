@@ -700,10 +700,21 @@ impl FsOps for FakeFs {
         .get(root)
         .map(|node| RootLiveness::Present(RootIdentity::new(node.dev, node.ino)))
     });
+    // The root's current mount frame, read from the tree node beside its liveness —
+    // mirroring the real executor's path re-read, so a test that re-mounts the root
+    // node (a fresh `mnt_id`, unchanged identity) drives the frame-refresh path.
+    let root_mnt_id = self
+      .state
+      .nodes
+      .lock()
+      .unwrap()
+      .get(root)
+      .and_then(|node| node.mnt_id);
     MountRefresh {
       mounts,
       authoritative,
       root: root_liveness.unwrap_or(RootLiveness::Missing),
+      root_mnt_id,
     }
   }
 

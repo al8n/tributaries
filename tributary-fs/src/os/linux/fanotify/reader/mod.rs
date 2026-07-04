@@ -224,9 +224,29 @@ fn drain_events(
         // NOT a benign empty walk. Auto's next `watch()` then lands on inotify,
         // which re-enumerates; a silent blind subtree is never left behind.
         Admission::AdmitAndSeed { event, moved_fid } => {
+          // `admit` already learned the moved-in TOP (the walk maps only its
+          // descendants), so check the cap on that learn FIRST — before the walk —
+          // exactly as the `Admit` arm checks its own learn. If the top alone
+          // breached the cap the walk must not run at all.
+          if map.over_capacity() {
+            signal_fatal(
+              shared,
+              SourceError::ReadFailed {
+                source: cap_exceeded_error(),
+              },
+            );
+            return false;
+          }
+          // Fence the walk to the REMAINING budget, not the full cap: the map is
+          // near-cap (the top just landed), and passing the full cap as the descend
+          // budget would let a populated move-in allocate up to a whole extra `cap`
+          // of descendants before the additive check below fired. `cap - len` is the
+          // room actually left; the walk aborts the moment it would exceed it, so the
+          // map never grows past the cap mid-walk. Uncapped stays `None`.
+          let budget = map.remaining_capacity();
           let started = std::time::Instant::now();
           let outcome = seed_moved_in_subtree(map, &moved_fid, |subtree, subtree_fid| {
-            reseed.walk_subtree(subtree, subtree_fid)
+            reseed.walk_subtree(subtree, subtree_fid, budget)
           });
           shared.stats.record_walk(walk_micros(started));
           if matches!(outcome, SeedOutcome::Blind) {
@@ -238,9 +258,10 @@ fn drain_events(
             );
             return false;
           }
-          // The moved-in subtree may have grown the map past its cap (the walk
-          // fenced its own production, but the additive total is caught here) —
-          // the same terminal a live create over the cap hits.
+          // The belt: the walk fenced its own production to the remaining budget, so
+          // this only fires on the exact cap boundary — the same terminal a live
+          // create over the cap hits. A move-in that cannot fit is the cap doing its
+          // job; fatal is the honest terminal.
           if map.over_capacity() {
             signal_fatal(
               shared,

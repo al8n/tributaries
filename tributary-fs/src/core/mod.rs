@@ -123,6 +123,17 @@ pub(crate) struct MountRefresh {
   /// check (no new timer, no new effect: the refresh already runs at birth and
   /// on every loss).
   pub(crate) root: RootLiveness,
+  /// The root's CURRENT mount id, re-read at the refresh cadence. A same-object
+  /// re-mount of the root (unmount + re-bind: identity unchanged, so the death
+  /// gate passes) lands the root on a NEW mount, and the descent boundary
+  /// [`crosses_mount_boundary`] fences children against the scope's captured
+  /// `root_mnt_id` — so without refreshing it, every descendant on the new mount
+  /// would read as a boundary and lower non-descendable until the next re-watch.
+  /// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) adopts a `Some`
+  /// value once the root is confirmed alive-and-present. `None` (below Linux 5.8,
+  /// the mask bit unset, or a non-Linux/fake source that reports no frame) leaves
+  /// the captured value intact — a transient read miss never drops a known frame.
+  pub(crate) root_mnt_id: Option<u64>,
 }
 
 /// One I/O obligation the driver task must execute for the core.
@@ -387,13 +398,18 @@ struct ScopeState {
   /// every delivery can carry it without copying.
   root: Option<Arc<PathBuf>>,
   root_dev: Option<u64>,
-  /// The root's MOUNT id, captured at the spawn barrier — the descent boundary
-  /// the enumerate lowering fences on. A child directory on a different mount
-  /// (even the SAME device, as a `mount --bind` of a same-superblock directory
-  /// produces) is lowered non-descendable, closing the same-device bind breach
-  /// the `root_dev` check alone cannot. `None` when the barrier could not read it
-  /// (below Linux 5.8, or a non-Linux/fake source), and then the device check
-  /// governs alone — the honest degrade.
+  /// The root's MOUNT id — the descent boundary the enumerate lowering fences on.
+  /// A child directory on a different mount (even the SAME device, as a
+  /// `mount --bind` of a same-superblock directory produces) is lowered
+  /// non-descendable, closing the same-device bind breach the `root_dev` check
+  /// alone cannot. Captured at the spawn barrier AND re-read on every alive mount
+  /// refresh: a same-object re-mount of the root (unmount + re-bind, identity
+  /// unchanged) moves it to a new mount, so a frozen value would fence every
+  /// descendant on the new mount as a boundary until re-watch — the refresh keeps
+  /// it current (`on_mounts_refreshed` adopts a fresh `Some`). `None` when neither
+  /// the barrier nor a refresh could read it (below Linux 5.8, or a
+  /// non-Linux/fake source), and then the device check governs alone — the honest
+  /// degrade.
   root_mnt_id: Option<u64>,
   /// The root object's identity, captured at the spawn barrier. The mount
   /// refresh re-stats the root and compares against this: a `Missing` or
@@ -953,6 +969,22 @@ impl DriverCore {
       self.monitor.on_os_record(OsRecord::new(watch, kind), now);
       self.drain_monitor();
       return;
+    }
+
+    // The root is alive AND unchanged: adopt its freshly re-read mount frame. A
+    // same-object re-mount (unmount + re-bind at the same path) keeps the root's
+    // `(dev, ino)`, so the death gate above passed, yet the root now lives on a
+    // DIFFERENT mount — and the enumerate boundary fences children against this
+    // captured `root_mnt_id`, so a stale frame would lower every descendant on the
+    // new mount non-descendable until the next re-watch. Refreshing it here (the
+    // one place the inotify side re-resolves the root, folded into the same re-stat
+    // as the death check) keeps the descent fence relative to the mount the root
+    // actually lives on now. Done before the stale gate: the re-stat observed the
+    // current frame regardless of whether the mount TABLE snapshot is stale. Only a
+    // `Some` read is adopted — a transient mnt-id read miss (`None`) must not drop a
+    // known frame to the device belt.
+    if let Some(mnt_id) = refresh.root_mnt_id {
+      state.root_mnt_id = Some(mnt_id);
     }
 
     // The root is alive past the death gate. The stale gate now governs ONLY the
