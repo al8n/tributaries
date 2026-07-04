@@ -101,7 +101,7 @@ pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
     // test membership on, the event cannot be placed under the root.
     return Admission::Drop;
   };
-  let Some(dir_path) = map.admit(dir_fid).map(std::path::Path::to_path_buf) else {
+  let Some(dir_path) = map.admit(dir_fid) else {
     return Admission::Drop;
   };
 
@@ -152,8 +152,8 @@ pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
 /// interns the moved object's identity from whichever end supplies a target
 /// FID.
 fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo) -> Admission {
-  let old_dir = map.admit(&rename.old_dir).map(std::path::Path::to_path_buf);
-  let new_dir = map.admit(&rename.new_dir).map(std::path::Path::to_path_buf);
+  let old_dir = map.admit(&rename.old_dir);
+  let new_dir = map.admit(&rename.new_dir);
   if old_dir.is_none() && new_dir.is_none() {
     // Both ends outside the root: a rename elsewhere on the superblock.
     return Admission::Drop;

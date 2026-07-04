@@ -32,6 +32,7 @@ use super::{
   Admission, admit,
   fid::decode_events,
   map::FidMap,
+  source::ReseedContext,
 };
 
 /// What the reader shares with the handle side: the ordered queue and the
@@ -47,27 +48,30 @@ pub(crate) enum Control {
   Shutdown,
 }
 
-/// Starts the reader thread. The fd, the wake eventfd, and the seeded `FidMap`
-/// live and die with it.
+/// Starts the reader thread. The fd, the wake eventfd, the seeded `FidMap`, and
+/// the reseed context live and die with it. A spawn failure (thread or memory
+/// exhaustion) is a typed [`SourceError::StartFailed`] on the never-live path —
+/// no events, the probed fd closed as the returned closure drops.
 pub(crate) fn start(
   fd: OwnedFd,
   wake: Arc<WakeState>,
   control: mpsc::Receiver<Control>,
   map: FidMap,
+  reseed: ReseedContext,
   shared: Arc<ReaderShared>,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>, SourceError> {
   std::thread::Builder::new()
     .name("tributary-fs.fanotify".into())
     .spawn(move || {
       let mut map = map;
       let outcome = catch_unwind(AssertUnwindSafe(|| {
-        run(&fd, &wake, &control, &mut map, &shared);
+        run(&fd, &wake, &control, &mut map, &reseed, &shared);
       }));
       if outcome.is_err() {
         signal_fatal(&shared, SourceError::CallbackPanic);
       }
     })
-    .expect("spawning the fanotify reader thread")
+    .map_err(|_| SourceError::StartFailed)
 }
 
 fn signal_fatal(shared: &ReaderShared, err: SourceError) {
@@ -81,6 +85,7 @@ fn run(
   wake: &WakeState,
   control: &mpsc::Receiver<Control>,
   map: &mut FidMap,
+  reseed: &ReseedContext,
   shared: &ReaderShared,
 ) {
   // fanotify events are large (a metadata header plus variable-length FID
@@ -121,7 +126,7 @@ fn run(
         return;
       }
     }
-    if source_ready && !drain_events(fd, &mut buf, map, shared) {
+    if source_ready && !drain_events(fd, &mut buf, map, reseed, shared) {
       return;
     }
   }
@@ -129,7 +134,13 @@ fn run(
 
 /// Reads the instance until `EAGAIN`, admitting and forwarding each buffer as
 /// one batch. Returns `false` when the stream died (fatal already signaled).
-fn drain_events(fd: &OwnedFd, buf: &mut [u8], map: &mut FidMap, shared: &ReaderShared) -> bool {
+fn drain_events(
+  fd: &OwnedFd,
+  buf: &mut [u8],
+  map: &mut FidMap,
+  reseed: &ReseedContext,
+  shared: &ReaderShared,
+) -> bool {
   loop {
     let n = match rustix::io::read(fd, &mut *buf) {
       Ok(n) => n,
@@ -145,8 +156,10 @@ fn drain_events(fd: &OwnedFd, buf: &mut [u8], map: &mut FidMap, shared: &ReaderS
       return true;
     }
     let decoded = decode_events(&buf[..n]);
-    // Admission is the superblock-firehose filter: an event whose directory
-    // FID is unknown is provably outside the root and dropped without loss.
+    // Admission is the superblock-firehose filter: an event whose directory FID
+    // is unknown is provably outside the root and dropped without loss. That
+    // silent drop is BY DESIGN — the filter working — and is distinct from the
+    // staleness a loss induces, which the reseed below repairs.
     let mut events = Vec::with_capacity(decoded.events.len());
     for event in &decoded.events {
       if let Admission::Admit(admitted) = admit(map, event) {
@@ -154,6 +167,18 @@ fn drain_events(fd: &OwnedFd, buf: &mut [u8], map: &mut FidMap, shared: &ReaderS
           crate::os::linux::RawLinuxEvent::Fanotify(admitted),
         ));
       }
+    }
+    // A lossy batch (a `FAN_Q_OVERFLOW` marker, or a truncated/one-sided
+    // record) means create/rename updates were lost — the map is now blind to
+    // directories born in the loss window, and future events under them would
+    // drop as outside-root FOREVER. Rebuild the map from a fresh walk BEFORE
+    // signaling loss downstream, so the reseeded sight is live by the time the
+    // consumer's rescan re-enumerates. The walk is synchronous between reads
+    // (overflow is rare, the walk is bounded by the root's directory count).
+    if decoded.lossy
+      && let Ok(entries) = reseed.walk()
+    {
+      map.reseed(entries);
     }
     transport::forward_batch(&shared.transport, events, decoded.lossy, |msg| {
       shared.queue.try_send(msg).is_ok()

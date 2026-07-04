@@ -231,6 +231,52 @@ async fn rename_pairs_into_one_moved() {
   );
 }
 
+/// Suite 9 (extended): a directory rename re-parents its descendants. Rename a
+/// POPULATED directory, then touch a PRE-EXISTING descendant of it — the event
+/// must arrive under the NEW directory path. This exercises the parent-relative
+/// FID map end to end: the descendant's admission resolves through the moved
+/// parent's updated link, never a stale absolute path.
+#[tokio::test]
+async fn dir_rename_reparents_descendant_paths() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!("SKIP dir_rename_reparents_descendant_paths: no ext4 loopback (needs --privileged)");
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "reparent");
+  // A populated directory tree exists BEFORE the watch, so its descendants are
+  // seeded (not learned): root/a/child/, holding a file.
+  std::fs::create_dir_all(root.join("a/child")).unwrap();
+  std::fs::write(root.join("a/child/leaf.txt"), b"seed").unwrap();
+  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+    return;
+  };
+
+  // Rename the populated directory a → b (both ends in-root). Its whole subtree
+  // must follow to the new path via the parent-relative map.
+  std::fs::rename(root.join("a"), root.join("b")).unwrap();
+
+  // Touch a PRE-EXISTING descendant through its NEW path. The write's event
+  // must resolve under root/b/child, proving the descendant re-parented.
+  let new_leaf = root.join("b/child/leaf.txt");
+  std::fs::write(&new_leaf, b"after-rename").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &new_leaf)).await.is_some(),
+    "a pre-existing descendant resolves under the renamed directory's new path"
+  );
+
+  // The consumer converges: a create of a brand-new file under the moved
+  // directory also lands at the new path (self-maintenance and seeding agree).
+  let fresh = root.join("b/child/fresh.txt");
+  std::fs::write(&fresh, b"new").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &fresh)).await.is_some(),
+    "a fresh create under the renamed directory also resolves at the new path"
+  );
+}
+
 /// Suite 10: the superblock firehose is filtered. Churn OUTSIDE the watched
 /// root but on the SAME superblock must produce ZERO events for the watched
 /// root — admission is dir-FID membership, never fsid comparison.
