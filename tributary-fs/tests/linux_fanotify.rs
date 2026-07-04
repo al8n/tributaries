@@ -1632,6 +1632,19 @@ async fn bind_mount_of_outside_dir_is_a_boundary() {
   let _ = w.close().await;
 }
 
+// The live-walk mount-frame regression (a re-mounted root: same object, new mount
+// id) is proven HERMETICALLY, not here — see
+// `os::linux::fanotify::source::tests::seed_from_fd_fences_on_the_handed_mount_frame_not_a_stale_one`
+// (the descent fences on the frame the walk hands it, which the live path-reopen
+// walks now re-read fresh from the reopened fd) plus the real-fs `seed_walk` /
+// `subtree_walk` descent cells (a correct fresh frame is what lets them descend at
+// all). A container reproduction is not reliable: the only post-re-mount live reopen
+// is the loss RESEED (a move-in cannot reach a re-mounted root — a rename across the
+// mount boundary fails `EXDEV`), a loss is non-deterministic to provoke, and the
+// handle-keyed admission map keeps delivering a pre-existing descendant's events
+// straight from the spawn map until a reseed actually rebuilds it — so absent a
+// provoked loss there is nothing for a container cell to observe.
+
 /// A `mount --bind` of the watched root onto a directory INSIDE itself is a cycle:
 /// the bind exposes the whole root again beneath `root/sub/loop`, and it shares the
 /// root's mount id (a self-bind), so the mount fence does NOT stop it — only the

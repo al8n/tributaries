@@ -483,6 +483,60 @@ fn over_capacity_trips_when_a_learn_exceeds_the_cap() {
   assert!(!uncapped.over_capacity(), "an uncapped map never trips");
 }
 
+/// `remaining_capacity` is `cap - len`, saturating at zero, and `None` when
+/// uncapped — the room the reader threads into a move-in subtree walk as its
+/// budget so an additive walk fences on what is actually left, never a full extra
+/// cap. Rows: uncapped, room-left, exactly-at-cap, and over-cap (saturating).
+#[test]
+fn remaining_capacity_is_the_saturating_room_left() {
+  // Uncapped: no ceiling to subtract against.
+  let mut uncapped = FidMap::new();
+  uncapped.seed([SeedEntry::root(fid(1), Path::new("/root"))]);
+  assert_eq!(
+    uncapped.remaining_capacity(),
+    None,
+    "an uncapped map reports no budget ceiling"
+  );
+
+  // Cap of five, three directories in: two rooms left.
+  let mut map = FidMap::with_capacity(Some(5));
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("a")),
+    SeedEntry::child(fid(3), fid(1), OsString::from("b")),
+  ]);
+  assert_eq!(
+    map.remaining_capacity(),
+    Some(2),
+    "cap 5 with 3 dirs leaves room for 2 more"
+  );
+
+  // Grow to exactly the cap: zero room left, but NOT yet over capacity.
+  map.learn(&fid(1), b"c", Some(&fid(4)));
+  map.learn(&fid(1), b"d", Some(&fid(5)));
+  assert_eq!(
+    map.remaining_capacity(),
+    Some(0),
+    "a map at its cap reports zero room"
+  );
+  assert!(
+    !map.over_capacity(),
+    "at the cap is within budget, not over"
+  );
+
+  // Push one past the cap: the room saturates at zero rather than underflowing.
+  map.learn(&fid(1), b"e", Some(&fid(6)));
+  assert_eq!(
+    map.remaining_capacity(),
+    Some(0),
+    "an over-cap map saturates the room at zero, never underflows"
+  );
+  assert!(
+    map.over_capacity(),
+    "six dirs over a cap of five is over capacity"
+  );
+}
+
 /// `stats` reports the live directory count and the current generation — the
 /// snapshot the reader publishes for `Watcher::backend_stats`.
 #[test]

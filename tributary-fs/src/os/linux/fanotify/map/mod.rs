@@ -235,6 +235,18 @@ impl FidMap {
       .is_some_and(|cap| self.dirs.len() > cap)
   }
 
+  /// The number of MORE directory nodes the cap still admits: `cap - len`,
+  /// saturating at zero so an already-over-cap map reports no room. `None` when
+  /// uncapped (no ceiling to subtract against). The reader threads this into a
+  /// move-in subtree walk as the walk's own directory budget, so an additive walk
+  /// fences on the room ACTUALLY LEFT rather than the full cap — a near-cap map
+  /// then never allocates a whole extra cap of descendants before the fatal.
+  pub(crate) fn remaining_capacity(&self) -> Option<usize> {
+    self
+      .max_directories
+      .map(|cap| cap.saturating_sub(self.dirs.len()))
+  }
+
   /// A snapshot of the map's live footprint, for the operator-facing stats
   /// accessor.
   pub(crate) fn stats(&self) -> MapStats {

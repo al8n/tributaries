@@ -482,7 +482,6 @@ impl ReseedContext {
       &self.root,
       self.fsid,
       self.root_dev,
-      self.root_mnt_id,
       &self.root_fid,
       self.max_directories,
     )
@@ -502,6 +501,11 @@ impl ReseedContext {
   /// `io::Error`-folding [`walk`](Self::walk).
   fn seed_at_fd(&self, root_fd: BorrowedFd<'_>) -> Result<Vec<SeedEntry>, WalkError> {
     let root_fd = root_fd.try_clone_to_owned().map_err(WalkError::RootGone)?;
+    // The spawn passes the CAPTURED `root_mnt_id` (unlike the reseed/subtree walks,
+    // which re-read it from the fd they reopened): it was read from THIS very pin at
+    // spawn, so the frame and the fd are the same object with no path resolved
+    // between them — the fresh read would return an identical value. No re-mount
+    // race can exist across a single pin, so nothing is stale to refresh here.
     seed_from_fd(
       root_fd,
       &self.root,
@@ -528,20 +532,21 @@ impl ReseedContext {
   /// the `io::Error` the reader escalates through the reseed shape (retry once →
   /// blind → fatal). Bounded by the moved subtree's directory count — the honest
   /// cost of admitting a foreign populated directory.
+  ///
+  /// `budget` is the directory ceiling for THIS walk — the room the map still has
+  /// (`cap - len`), NOT the full cap: an additive move-in into a near-cap map must
+  /// fence on what is actually left, else it could allocate a whole extra `cap` of
+  /// descendants before the reader's additive over-cap check fired. `None` =
+  /// uncapped. The reader computes it from the map after the moved-in top is
+  /// learned; the spawn/reseed walks pass the full cap instead, since they seed a
+  /// FRESH (empty) map.
   pub(crate) fn walk_subtree(
     &self,
     subtree: &Path,
     subtree_fid: &Fid,
+    budget: Option<usize>,
   ) -> io::Result<Vec<SeedEntry>> {
-    subtree_walk(
-      subtree,
-      subtree_fid,
-      self.fsid,
-      self.root_dev,
-      self.root_mnt_id,
-      self.max_directories,
-    )
-    .map_err(WalkError::into_io)
+    subtree_walk(subtree, subtree_fid, self.fsid, self.root_dev, budget).map_err(WalkError::into_io)
   }
 }
 
@@ -670,7 +675,6 @@ fn seed_walk(
   root: &Path,
   fsid: [u8; 8],
   root_dev: u64,
-  root_mnt_id: Option<u64>,
   expected: &Fid,
   max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
@@ -690,7 +694,17 @@ fn seed_walk(
       "the watched root was replaced at its path (reopened handle does not match the spawn root)",
     )));
   }
-  seed_from_fd(root_fd, root, fsid, root_dev, root_mnt_id, max_directories)
+  // Fence descendants against the REOPENED root's CURRENT mount frame, read from
+  // the fd just verified — NOT the spawn frame. Our identity semantics say the same
+  // object (handle-equal, which the gate above just proved) IS the root, so if that
+  // object was unmounted and re-bound at the same path its mount id is fresh, and
+  // the fresh id is the correct boundary: every descendant now lives under the NEW
+  // mount, so fencing on the STALE spawn id would mark them all boundaries and skip
+  // them, silently blinding a re-mounted tree. A `None` read (the mnt-id bit unset
+  // — not expected on the 5.17 floor) degrades to `descend`'s device belt. Zero
+  // extra opens: the read rides the fd already held.
+  let fence_mnt_id = root_mount_id(root_fd.as_fd());
+  seed_from_fd(root_fd, root, fsid, root_dev, fence_mnt_id, max_directories)
 }
 
 /// Seeds the map from an ALREADY-PINNED root fd, producing a [`SeedEntry`] per
@@ -710,6 +724,13 @@ fn seed_walk(
 /// nothing about the seed depends on a re-resolvable name — the objects-not-paths
 /// invariant (module docs) holds from the very first object; `root` is used only
 /// as the map's stored root-anchor path, never re-opened here.
+///
+/// `fence_mnt_id` is the mount frame descendants are fenced against — decided by
+/// the CALLER from the `root_fd` it holds, never a value captured elsewhere: the
+/// spawn passes the frame read from the pin (the same object, no path between), and
+/// the reseed/subtree walks re-read it from the fd they just reopened-and-verified,
+/// so a re-mount of the same object at the same path fences on its NEW frame rather
+/// than a stale one. `None` (the mnt-id read missed) degrades to the device belt.
 ///
 /// Completeness is a fanotify PRECONDITION, not a best-effort target. An admitted
 /// event resolves its directory FID against this map; a directory the walk failed
@@ -738,7 +759,7 @@ fn seed_from_fd(
   root: &Path,
   fsid: [u8; 8],
   root_dev: u64,
-  root_mnt_id: Option<u64>,
+  fence_mnt_id: Option<u64>,
   max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The root anchor is load-bearing: without its handle the map has no base to
@@ -757,7 +778,7 @@ fn seed_from_fd(
     root_fid,
     fsid,
     root_dev,
-    root_mnt_id,
+    fence_mnt_id,
     max_directories,
     &mut seed,
   )?;
@@ -797,8 +818,7 @@ fn subtree_walk(
   subtree_fid: &Fid,
   fsid: [u8; 8],
   root_dev: u64,
-  root_mnt_id: Option<u64>,
-  max_directories: Option<usize>,
+  budget: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The moved directory is still in-map and pending its walk, so pinning it must
   // succeed: any failure (a vanish/shape-change included) is a coverage hole, not
@@ -817,14 +837,21 @@ fn subtree_walk(
       "the moved-in subtree path was replaced (reopened handle does not match the moved dir's fid)",
     )));
   }
+  // Fence descendants against the moved dir's CURRENT mount frame, read from the
+  // fd just verified — never a frame captured elsewhere. The moved subtree is the
+  // reference here (its own contents descend under it), and it is the object the
+  // reopen landed on, so the fresh read is the correct boundary. `None` (the read
+  // missed the mnt-id bit — shouldn't happen on the 5.17 floor) degrades to the
+  // device belt, exactly as `descend`'s fallback does.
+  let fence_mnt_id = root_mount_id(subtree_fd.as_fd());
   let mut seed = Vec::new();
   descend(
     subtree_fd,
     subtree_fid.clone(),
     fsid,
     root_dev,
-    root_mnt_id,
-    max_directories,
+    fence_mnt_id,
+    budget,
     &mut seed,
   )?;
   Ok(seed)
@@ -855,7 +882,7 @@ struct WalkDir {
 ///
 /// # Mount boundary
 ///
-/// A child whose MOUNT id differs from `root_mnt_id` is a submount — a different
+/// A child whose MOUNT id differs from `fence_mnt_id` is a submount — a different
 /// mount the sb mark never reports on — and is skipped exactly as a foreign-device
 /// child is (not seeded, not descended). The mount id is the primary fence: a
 /// `mount --bind` of a same-superblock directory shares `root_dev`, so the device
@@ -863,7 +890,12 @@ struct WalkDir {
 /// admission map (later events on the alias would then deliver as in-root — the
 /// scope-fence breach). The `root_dev` belt is kept: a different device is always a
 /// boundary and needs no extra `statx`, and it still governs when the kernel does
-/// not report a mount id (`root_mnt_id` / the child's is `None`).
+/// not report a mount id (`fence_mnt_id` / the child's is `None`).
+///
+/// `fence_mnt_id` is the frame of the walk's OWN root object (read from the pinned
+/// fd by the caller), so a re-mount of that object at the same path fences its
+/// children against the CURRENT mount rather than a spawn-captured one — the
+/// descent is always relative to the frame the root actually lives on now.
 ///
 /// # Cycle guard
 ///
@@ -890,22 +922,25 @@ struct WalkDir {
 /// skipped, anything else on an existing in-root directory aborts as
 /// [`WalkError::Incomplete`].
 ///
-/// # Directory cap
+/// # Directory budget
 ///
-/// When `max_directories` is set (design §4.9), the walk aborts with a cap
-/// [`WalkError::Incomplete`] the moment `seed` would exceed it — fenced BEFORE the
-/// oversized inventory is built, so a huge tree never materializes a
-/// multi-gigabyte `Vec`. The spawn folds that to `NotViable` (fall back / typed
-/// error) and the reseed to the terminal `Fatal`, matching the walk-completeness
-/// taxonomy. The moved-in subtree walk shares the fence; its additive total is
-/// re-checked exactly by the reader once the descendants land.
+/// `budget` is the ceiling on entries THIS descent may push (design §4.9): the
+/// walk aborts with a cap [`WalkError::Incomplete`] the moment `seed` would exceed
+/// it — fenced BEFORE the oversized inventory is built, so a huge tree never
+/// materializes a multi-gigabyte `Vec`. The spawn/reseed pass the FULL cap (they
+/// seed a fresh empty map), while the moved-in subtree walk passes the REMAINING
+/// room (`cap - map.len()`, an additive walk into a near-cap map): threading the
+/// room left keeps a populated move-in from allocating a whole extra cap before the
+/// reader's additive check. `None` = uncapped. The spawn folds an over-budget abort
+/// to `NotViable` (fall back / typed error) and the reseed/move-in to the terminal
+/// `Fatal`, matching the walk-completeness taxonomy.
 fn descend(
   root_fd: OwnedFd,
   root_fid: Fid,
   fsid: [u8; 8],
   root_dev: u64,
-  root_mnt_id: Option<u64>,
-  max_directories: Option<usize>,
+  fence_mnt_id: Option<u64>,
+  budget: Option<usize>,
   seed: &mut Vec<SeedEntry>,
 ) -> Result<(), WalkError> {
   let root_reader = Dir::new(root_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
@@ -1001,11 +1036,14 @@ fn descend(
     // This is what the device belt cannot catch: a `mount --bind` of a
     // same-superblock directory shares `root_dev`, so without this a foreign subtree
     // would be descended and its handles seeded (later events on the outside alias
-    // then delivering as in-root). When either mount id is unavailable
-    // (`root_mnt_id`/the child's is `None` — below 5.8, or `stx_mask` unset) the
+    // then delivering as in-root). `fence_mnt_id` is the walk root's OWN frame (the
+    // caller read it from the pinned/reopened root fd), so this compares each child
+    // against the mount the root lives on RIGHT NOW — a re-mounted root fences its
+    // children on the new frame, not a stale one. When either mount id is unavailable
+    // (`fence_mnt_id`/the child's is `None` — below 5.8, or `stx_mask` unset) the
     // fence declines and the device belt alone governs, never skipping a genuine
     // in-root directory on a mount-id read miss.
-    if let (Some(root_mnt), Some(child_mnt)) = (root_mnt_id, root_mount_id(child_fd.as_fd()))
+    if let (Some(root_mnt), Some(child_mnt)) = (fence_mnt_id, root_mount_id(child_fd.as_fd()))
       && root_mnt != child_mnt
     {
       continue;
@@ -1040,12 +1078,15 @@ fn descend(
     if !visited.insert(fid.handle().into()) {
       continue;
     }
-    // The directory cap (design §4.9), fenced BEFORE the push so an oversized tree
-    // never builds a multi-gigabyte inventory: an over-cap walk is fanotify-unviable
-    // (spawn falls back / types the error; a reseed escalates to fatal).
-    if max_directories.is_some_and(|cap| seed.len() >= cap) {
+    // The directory budget (design §4.9), fenced BEFORE the push so an oversized
+    // tree never builds a multi-gigabyte inventory: an over-budget walk is
+    // fanotify-unviable (spawn falls back / types the error; a reseed or an additive
+    // move-in escalates to fatal). `budget` is the full cap for a fresh spawn/reseed
+    // seed and the room actually left (`cap - map.len()`) for an additive move-in
+    // subtree, so this fence trips at the map's true ceiling in both cases.
+    if budget.is_some_and(|budget| seed.len() >= budget) {
       return Err(WalkError::Incomplete(io::Error::other(
-        "the fanotify seed walk exceeded the directory cap; the tree is too large to map",
+        "the fanotify seed walk exceeded the directory budget; the tree is too large to map",
       )));
     }
     seed.push(SeedEntry::child(

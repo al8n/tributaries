@@ -60,6 +60,8 @@ fn alive_refresh(mounts: Vec<PathBuf>, authoritative: bool) -> MountRefresh {
     mounts,
     authoritative,
     root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+    // No frame change exercised: the captured `root_mnt_id` stays intact.
+    root_mnt_id: None,
   }
 }
 
@@ -649,6 +651,7 @@ fn refresh_finding_root_gone_is_delete_self() {
       mounts: Vec::new(),
       authoritative: true,
       root: RootLiveness::Missing,
+      root_mnt_id: None,
     },
     at(5),
   );
@@ -681,6 +684,7 @@ fn refresh_finding_root_replaced_is_move_self() {
         mounts: Vec::new(),
         authoritative: true,
         root,
+        root_mnt_id: None,
       },
       at(5),
     );
@@ -713,6 +717,7 @@ fn refresh_finding_root_alive_only_updates_trust() {
       mounts: vec![PathBuf::from("/r/vol")],
       authoritative: true,
       root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+      root_mnt_id: None,
     },
     at(5),
   );
@@ -3193,6 +3198,165 @@ mod descending {
     );
   }
 
+  /// A same-object RE-MOUNT of the root (unmount + re-bind: `(dev, ino)` unchanged,
+  /// so the refresh's death gate passes, but the root now lives on a NEW mount)
+  /// updates the scope's descent-fence frame through `on_mounts_refreshed` — so
+  /// after the refresh a child on the NEW mount is descended and one on the OLD
+  /// frame is fenced. Without the frame refresh, every descendant on the re-mounted
+  /// root would read as a boundary (its mount id differs from the frozen spawn one)
+  /// and lower non-descendable until re-watch — the inotify-side shape of the
+  /// fanotify live-walk staleness (design §7).
+  #[test]
+  fn root_remount_refreshes_the_descent_fence_frame() {
+    // Spawn on mount 42, then cold-enumerate the root: a `sub` on mount 42 (same
+    // frame) is descended and armed; a `bound42on77` on mount 77 is a boundary. This
+    // is the BASELINE frame (42) before the re-mount.
+    let (mut core, scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry_on_mount("sub", FileKind::Dir, 1, 20, 42),
+        entry_on_mount("bound_on_77", FileKind::Dir, 1, 21, 77),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let sub_arm = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the same-frame (42) child is descended before the re-mount");
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/bound_on_77")
+      )),
+      "a mount-77 child is a boundary while the scope frame is 42: {effects:?}"
+    );
+
+    // The root is UNMOUNTED and RE-BOUND at the same path: identity `(1, 1)` is
+    // unchanged (the death gate passes), but it now lives on mount 77. The refresh
+    // carries the fresh frame, and the core adopts it.
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+        root_mnt_id: Some(77),
+      },
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // Arm the `sub` child so it cold-enumerates — a fresh enumerate that fences its
+    // entries against the scope's NOW-updated frame (77). The enumerated directory
+    // is `/r/sub`, but `crosses_mount_boundary` always fences on the SCOPE root's
+    // frame, so this reads the refreshed value.
+    core.on_watch_installed(sub_arm, crate::os::linux::WatchOutcome::Installed(2));
+    let req2 = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/sub") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed child cold-enumerates after the re-mount refresh");
+
+    // Under the NEW frame (77): a child on mount 77 is now DESCENDED, and one back on
+    // the OLD frame (42) is now the boundary — the fence flipped with the refresh.
+    core.on_enumerated(
+      req2,
+      listed(vec![
+        entry_on_mount("now_in_root", FileKind::Dir, 1, 30, 77),
+        entry_on_mount("now_boundary", FileKind::Dir, 1, 31, 42),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let armed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::AddWatch { path, .. } => Some(path.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      armed,
+      vec![Path::new("/r/sub/now_in_root")],
+      "after the same-object re-mount refresh, the scope frame is 77: a mount-77 child \
+       descends and a mount-42 (old-frame) child is fenced — the frame followed the \
+       re-mount: {effects:?}"
+    );
+  }
+
+  /// A transient mnt-id read MISS on a refresh (`root_mnt_id: None`) must NOT drop
+  /// the scope's known frame to the device belt: a captured `Some(42)` survives, so
+  /// the mount-id fence keeps working across a refresh that momentarily could not
+  /// read the frame. Guards the "only adopt a `Some`" rule in `on_mounts_refreshed`.
+  #[test]
+  fn refresh_with_no_frame_keeps_the_captured_one() {
+    let (mut core, scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![entry_on_mount("sub", FileKind::Dir, 1, 20, 42)]),
+    );
+    let sub_arm = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the same-frame child is descended and armed");
+
+    // A refresh that could not read the root's mount id (below 5.8, a mask miss): the
+    // frame is left intact, NOT dropped.
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+        root_mnt_id: None,
+      },
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // The next enumerate still fences on the captured frame (42): a mount-77 child is
+    // still a boundary (the fence did not degrade to device-only).
+    core.on_watch_installed(sub_arm, crate::os::linux::WatchOutcome::Installed(2));
+    let req2 = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/sub") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed child cold-enumerates");
+    core.on_enumerated(
+      req2,
+      listed(vec![entry_on_mount(
+        "still_boundary",
+        FileKind::Dir,
+        1,
+        30,
+        77,
+      )]),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/sub/still_boundary")
+      )),
+      "a None-frame refresh kept the captured frame (42), so a mount-77 child is still \
+       fenced — a transient read miss never drops a known frame: {effects:?}"
+    );
+  }
+
   #[test]
   fn inotify_events_lower_depth_one_with_native_cookies() {
     let (mut core, scope, req, root) = live_descending();
@@ -3673,6 +3837,7 @@ mod kernel_recursive_fanotify {
         mounts: Vec::new(),
         authoritative: true,
         root: RootLiveness::Missing,
+        root_mnt_id: None,
       },
       at(30_001),
     );
@@ -3767,6 +3932,7 @@ mod kernel_recursive_fanotify {
         mounts: Vec::new(),
         authoritative: true,
         root: RootLiveness::Missing,
+        root_mnt_id: None,
       },
       at(60_001),
     );
@@ -3818,6 +3984,7 @@ mod kernel_recursive_fanotify {
         mounts: Vec::new(),
         authoritative: true,
         root: RootLiveness::Unreadable,
+        root_mnt_id: None,
       },
       at(31_000),
     );
@@ -3860,6 +4027,7 @@ mod kernel_recursive_fanotify {
         mounts: vec![PathBuf::from("/r/stale-vol")],
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+        root_mnt_id: None,
       },
       at(31_000),
     );

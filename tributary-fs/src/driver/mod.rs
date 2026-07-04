@@ -646,10 +646,18 @@ impl FsOps for RealFs {
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => RootLiveness::Missing,
       Err(_) => RootLiveness::Unreadable,
     };
+    // Re-read the root's CURRENT mount frame beside the liveness re-stat: a
+    // same-object re-mount keeps `(dev, ino)` (so the liveness check above passes)
+    // but moves the root to a new mount, and the core adopts this to keep the
+    // enumerate descent fence relative to that new mount. A path read at the refresh
+    // cadence — inotify's mnt id is a best-effort belt (`None` below 5.8), so this
+    // rides the existing root re-resolution rather than opening a fresh fd.
+    let root_mnt_id = mnt_id_of(root);
     MountRefresh {
       mounts,
       authoritative,
       root: root_liveness,
+      root_mnt_id,
     }
   }
   #[cfg(all(target_os = "linux", not(miri)))]
