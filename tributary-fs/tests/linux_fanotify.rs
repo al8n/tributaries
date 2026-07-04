@@ -277,6 +277,133 @@ async fn dir_rename_reparents_descendant_paths() {
   );
 }
 
+/// Suite 9 (boundary move-in) — the completeness invariant at the rename site. A
+/// POPULATED directory created OUTSIDE the watched root (same superblock) is
+/// `mv`'d INTO the root; fanotify synthesizes no per-descendant creates for the
+/// rename, so unless the reader walks the moved subtree in, a mutation of a
+/// PRE-EXISTING nested descendant would hit an unmapped FID and drop as
+/// outside-root. The property: after the move-in, touching a pre-existing nested
+/// descendant file is DELIVERED, path-correct under the new location.
+#[tokio::test]
+async fn move_in_populated_dir_delivers_descendant_events() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!(
+      "SKIP move_in_populated_dir_delivers_descendant_events: no ext4 loopback (--privileged)"
+    );
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "movein");
+  // A sibling staging area on the SAME superblock but OUTSIDE the watched root,
+  // so its subtree is never seeded by the spawn walk.
+  let outside = scratch_under(&mount, "movein-src");
+  // A populated tree built OUTSIDE the root: outside/incoming/nested/deep.txt.
+  let src = outside.join("incoming");
+  std::fs::create_dir_all(src.join("nested")).unwrap();
+  std::fs::write(src.join("nested/deep.txt"), b"seed").unwrap();
+
+  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+    return;
+  };
+  // Prove the mark is live before the boundary move.
+  std::fs::write(root.join("alive.txt"), b"a").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &root.join("alive.txt")))
+      .await
+      .is_some(),
+    "the mark is live before the move-in"
+  );
+
+  // Move the populated directory INTO the root: root/incoming now holds the
+  // pre-existing nested/deep.txt the spawn walk never saw.
+  std::fs::rename(&src, root.join("incoming")).unwrap();
+
+  // Mutate the PRE-EXISTING nested descendant through its NEW path. Without the
+  // move-in subtree walk, root/incoming/nested is an unmapped directory and this
+  // event drops as outside-root; with it, the event is delivered path-correct.
+  let deep = root.join("incoming/nested/deep.txt");
+  std::fs::write(&deep, b"after-move-in").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
+    "a pre-existing nested descendant of a moved-in directory is observed under its new path"
+  );
+  let _ = w.close().await;
+}
+
+/// Suite 9 (boundary move-out twin) — a POPULATED in-root directory `mv`'d OUT of
+/// the root stops admitting its descendants: after the move-out, mutating its old
+/// nested descendant delivers NO event and never emits a stale in-root path. The
+/// parent-relative representation re-parents the top onto an absent parent, so
+/// every descendant's walk breaks and evicts lazily.
+#[tokio::test]
+async fn move_out_populated_dir_stops_descendant_events() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!(
+      "SKIP move_out_populated_dir_stops_descendant_events: no ext4 loopback (--privileged)"
+    );
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "moveout");
+  let outside = scratch_under(&mount, "moveout-dst");
+  // A populated tree built INSIDE the root BEFORE the watch, so it is seeded:
+  // root/leaving/nested/deep.txt.
+  let inside = root.join("leaving");
+  std::fs::create_dir_all(inside.join("nested")).unwrap();
+  std::fs::write(inside.join("nested/deep.txt"), b"seed").unwrap();
+
+  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+    return;
+  };
+  // Prove the seeded descendant is live IN-ROOT before the move-out.
+  let in_root_deep = inside.join("nested/deep.txt");
+  std::fs::write(&in_root_deep, b"before-move-out").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &in_root_deep))
+      .await
+      .is_some(),
+    "the seeded descendant is observed while still in-root"
+  );
+
+  // Move the populated directory OUT of the root, then mutate its old descendant
+  // at the NEW (out-of-root) location.
+  let moved = outside.join("leaving");
+  std::fs::rename(&inside, &moved).unwrap();
+  let moved_deep = moved.join("nested/deep.txt");
+  std::fs::write(&moved_deep, b"after-move-out").unwrap();
+
+  // The move-out of `leaving` itself is a legitimate boundary event (the in-root
+  // source end lowers to a located rescan / a self-event on the moved directory),
+  // so an event NAMING `leaving` is expected and allowed. What must NOT leak is a
+  // DESCENDANT event: after the move-out, the seeded `leaving/nested` subtree
+  // stops admitting, so mutating `nested/deep.txt` at either the stale old path or
+  // the new out-of-root path delivers nothing. The breach is a path reaching into
+  // the `nested` descendant (strictly deeper than the moved directory).
+  let old_nested = inside.join("nested");
+  let new_nested = moved.join("nested");
+  let breach = tokio::time::timeout(Duration::from_secs(3), async {
+    while let Some(event) = w.next().await {
+      let path = event.path().to_path_buf();
+      if path.starts_with(&old_nested) || path.starts_with(&new_nested) {
+        return Some(path);
+      }
+    }
+    None
+  })
+  .await
+  .ok()
+  .flatten();
+  assert!(
+    breach.is_none(),
+    "a moved-out directory's descendant leaked an event: {breach:?}"
+  );
+  let _ = w.close().await;
+}
+
 /// Suite 10: the superblock firehose is filtered. Churn OUTSIDE the watched
 /// root but on the SAME superblock must produce ZERO events for the watched
 /// root — admission is dir-FID membership, never fsid comparison.

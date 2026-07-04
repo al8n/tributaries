@@ -162,10 +162,35 @@ fn drain_events(
     // staleness a loss induces, which the reseed below repairs.
     let mut events = Vec::with_capacity(decoded.events.len());
     for event in &decoded.events {
-      if let Admission::Admit(admitted) = admit(map, event) {
-        events.push(crate::os::SourceEvent::Linux(
-          crate::os::linux::RawLinuxEvent::Fanotify(admitted),
-        ));
+      match admit(map, event) {
+        Admission::Admit(admitted) => events.push(fanotify_event(admitted)),
+        // A directory moved IN from outside the root: walk its pre-existing
+        // descendants into the map BEFORE forwarding the move, so any later event
+        // in this same batch under those descendants already admits. A walk that
+        // goes blind (retry included) is the same silent-loss shape a failed
+        // reseed is, so it escalates to the terminal `Fatal` here — the moved
+        // subtree is only partially admitted, and Auto's next `watch()` lands on
+        // inotify.
+        Admission::AdmitAndSeed {
+          event,
+          moved_in,
+          moved_fid,
+        } => {
+          if matches!(
+            seed_moved_in_subtree(map, || reseed.walk_subtree(&moved_in, &moved_fid)),
+            SeedOutcome::Blind
+          ) {
+            signal_fatal(
+              shared,
+              SourceError::ReadFailed {
+                source: moved_in_blind_error(),
+              },
+            );
+            return false;
+          }
+          events.push(fanotify_event(event));
+        }
+        Admission::Drop => {}
       }
     }
     // A lossy batch (a `FAN_Q_OVERFLOW` marker, or a truncated/one-sided
@@ -228,6 +253,52 @@ where
 fn reseed_blind_error() -> std::io::Error {
   std::io::Error::other(
     "the fanotify FID map could not be reseeded after a loss; the source is blind",
+  )
+}
+
+/// Wraps one admitted event for the driver queue.
+fn fanotify_event(admitted: super::AdmittedEvent) -> crate::os::SourceEvent {
+  crate::os::SourceEvent::Linux(crate::os::linux::RawLinuxEvent::Fanotify(admitted))
+}
+
+/// Whether walking a moved-in subtree into the map succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedOutcome {
+  /// The subtree walk succeeded (first try or the single retry); its descendant
+  /// directories were inserted into the map.
+  Seeded,
+  /// The walk failed twice: the moved-in subtree is only partially mapped, so the
+  /// source is blind under it. The caller escalates to the terminal `Fatal`.
+  Blind,
+}
+
+/// Walks a moved-in directory's pre-existing descendants into `map`, mirroring
+/// [`reseed_map`]'s retry-then-escalate policy: the walk runs once, retries once
+/// on failure, and a second failure concedes [`SeedOutcome::Blind`]. Pure over the
+/// walk closure so the policy is testable without a live fd. On success the
+/// entries are ADDED to the map (the moved directory itself is already learned;
+/// these are its descendants), keeping the completeness invariant at the
+/// boundary-move site.
+fn seed_moved_in_subtree<W>(map: &mut FidMap, mut walk: W) -> SeedOutcome
+where
+  W: FnMut() -> std::io::Result<Vec<SeedEntry>>,
+{
+  for _ in 0..2 {
+    if let Ok(entries) = walk() {
+      map.seed(entries);
+      return SeedOutcome::Seeded;
+    }
+  }
+  SeedOutcome::Blind
+}
+
+/// The error a blinding moved-in subtree walk escalates through the terminal
+/// `Fatal`: a foreign populated directory arrived but its descendants could not
+/// be mapped, so events under them would drop as outside-root forever — the
+/// silent-loss shape, refused honestly.
+fn moved_in_blind_error() -> std::io::Error {
+  std::io::Error::other(
+    "a directory moved into the watched root could not be walked; its subtree is blind",
   )
 }
 

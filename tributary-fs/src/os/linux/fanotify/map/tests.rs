@@ -125,6 +125,42 @@ fn learn_admits_new_child_directory() {
   assert_eq!(map.dir_count(), 3);
 }
 
+/// `contains` is a pure membership query — no path resolution, no orphan
+/// eviction (unlike `admit`): a seeded directory is contained, an unknown one is
+/// not, and an ORPHANED-but-not-yet-evicted node still reports contained (its
+/// node lingers until an `admit` miss reaps it). This is the move-flavor
+/// discriminator, so it must reflect raw storage, not reachability.
+#[test]
+fn contains_is_raw_membership_without_eviction() {
+  let mut map = FidMap::new();
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("a")),
+    SeedEntry::child(fid(3), fid(2), OsString::from("child")),
+  ]);
+  assert!(map.contains(&fid(1)), "the root is contained");
+  assert!(map.contains(&fid(2)), "a seeded child is contained");
+  assert!(
+    !map.contains(&fid(99)),
+    "an unknown handle is not contained"
+  );
+
+  // Orphan the child by forgetting its parent: the child's NODE still exists
+  // (lazy eviction), so `contains` still reports it even though it no longer
+  // resolves. `contains` is storage membership, deliberately distinct from
+  // `admit`'s reachability.
+  map.forget(&fid(2));
+  assert!(
+    map.contains(&fid(3)),
+    "an orphaned node is still stored until an admit miss evicts it"
+  );
+  assert_eq!(map.admit(&fid(3)), None, "yet it no longer resolves");
+  assert!(
+    !map.contains(&fid(3)),
+    "the admit miss evicted the orphan, so contains now agrees"
+  );
+}
+
 /// `learn` under an unknown parent is a no-op: a create outside the watched
 /// root must not enter the map.
 #[test]
