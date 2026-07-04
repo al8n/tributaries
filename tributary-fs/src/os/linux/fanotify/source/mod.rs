@@ -313,14 +313,16 @@ impl ReseedContext {
   /// for every descendant directory, each linked to its parent — the moved
   /// directory's pre-existing contents the seed walk never saw. The moved
   /// directory itself is NOT re-emitted (the caller already learned it); only its
-  /// descendants are produced.
+  /// descendants are produced. `subtree` is the moved dir's CURRENT path, resolved
+  /// through the map by the reader (an intervening in-root rename may have
+  /// re-parented it since admission).
   ///
-  /// Same completeness rule and single-device boundary as [`seed_walk`]: a
-  /// vanished entry is a benign race skipped, any other failure on an EXISTING
-  /// in-root directory is incompleteness. Incompleteness folds to the `io::Error`
-  /// the reader escalates through the reseed shape (retry once → blind → fatal),
-  /// so a partially-walked moved-in subtree kills the scope rather than leaving it
-  /// silently blind. Bounded by the moved subtree's directory count — the honest
+  /// Same completeness rule and single-device boundary as [`seed_walk`], but with
+  /// NO benign vanished-race at the top: the moved dir is still in-map and pending
+  /// its walk, so a `NotFound` opening it is a coverage hole (no rename-out ran),
+  /// not an empty subtree — every failure is [`WalkError::Incomplete`], folding to
+  /// the `io::Error` the reader escalates through the reseed shape (retry once →
+  /// blind → fatal). Bounded by the moved subtree's directory count — the honest
   /// cost of admitting a foreign populated directory.
   pub(crate) fn walk_subtree(
     &self,
@@ -447,22 +449,26 @@ fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>
 /// discovered directory to its parent, so the top descendants hang off
 /// `subtree_fid` directly. Same completeness rule and single-device boundary as
 /// [`seed_walk`].
+///
+/// `subtree` is the moved directory's CURRENT path, resolved through the map by
+/// the reader at execution time — the node is still in-map and `pending_walk`, so
+/// a `NotFound` opening it is NOT a benign empty walk but a coverage hole: no
+/// rename-out was processed (the single-threaded reader would have forgotten it
+/// first), so the directory should be present and readable. It is therefore
+/// classified like any in-root directory — `NotFound` included is `Incomplete`,
+/// folding to the reader's retry-once-then-blind→fatal escalation — rather than
+/// swallowed as an empty subtree that would leave the moved dir's descendants
+/// blind forever.
 fn subtree_walk(
   subtree: &Path,
   subtree_fid: &Fid,
   fsid: [u8; 8],
   root_dev: u64,
 ) -> Result<Vec<SeedEntry>, WalkError> {
-  // The moved directory was just learned, so it exists; opening it for descent
-  // is the same completeness rule as any child — a vanish is a race (nothing
-  // descended, an empty subtree), anything else is a blind subtree.
-  let reader = match fs::read_dir(subtree) {
-    Ok(reader) => reader,
-    Err(err) => match classify_walk_skip(&err) {
-      WalkSkip::VanishedRace => return Ok(Vec::new()),
-      WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
-    },
-  };
+  // The moved directory is still in-map and pending its walk, so opening it must
+  // succeed: a failure (NotFound included) is a coverage hole, not a race —
+  // Incomplete, escalated through the reader's retry-then-fatal.
+  let reader = fs::read_dir(subtree).map_err(WalkError::Incomplete)?;
   let mut seed = Vec::new();
   descend(
     reader,
@@ -539,16 +545,24 @@ fn descend(
         }
         // The directory exists on the root device (just stat'd), so a failure to
         // encode its handle leaves it un-admittable: an in-root blind subtree.
-        // `encode_handle` loses the errno, so a re-stat disambiguates a genuine
-        // vanish (race, skip) from an existing-but-unexportable dir (incomplete).
+        // `encode_handle` loses the errno, so a re-stat disambiguates the cause —
+        // but the re-stat error is itself classified, exactly like every other
+        // per-entry failure: only a `NotFound` re-stat is a benign vanish (skip),
+        // while an `EACCES` (or any other) re-stat is an existing-but-inaccessible
+        // directory the walk cannot map — Incomplete, not a silent skip.
         let Some(fid) = handle_fid(&path, fsid) else {
-          if fs::symlink_metadata(&path).is_err() {
-            continue;
+          match fs::symlink_metadata(&path) {
+            // The object vanished between the stat and the re-stat: a race, skip.
+            Err(err) if classify_walk_skip(&err) == WalkSkip::VanishedRace => continue,
+            // The object still exists (or the re-stat failed for a non-vanish
+            // reason): an in-root directory the walk cannot handle-encode.
+            _ => {
+              return Err(WalkError::Incomplete(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an in-root directory does not export a file handle",
+              )));
+            }
           }
-          return Err(WalkError::Incomplete(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "an in-root directory does not export a file handle",
-          )));
         };
         seed.push(SeedEntry::child(fid.clone(), parent_fid.clone(), name));
         // The child is admitted; failing to open it for descent hides ITS

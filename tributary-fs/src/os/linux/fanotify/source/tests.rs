@@ -53,6 +53,31 @@ fn classify_walk_skip_only_notfound_is_a_race() {
   );
 }
 
+/// The handle-encode-failure re-stat routes its error through `classify_walk_skip`
+/// rather than treating EVERY error as a benign vanish. This pins the branch's
+/// decision to the classifier's contract — an `ENOENT` re-stat is a race (the
+/// object genuinely vanished between the stat and the re-stat, so skip), while an
+/// `EACCES` (or any other) re-stat is an existing-but-inaccessible in-root
+/// directory the walk cannot handle-encode → `Incomplete`, consistent with the
+/// walk's own non-`NotFound`-is-incomplete rule for every other per-entry failure.
+#[test]
+fn handle_encode_restat_classifies_eacces_as_incomplete() {
+  // The ENOENT re-stat branch: a vanished object is a race the walk skips.
+  assert_eq!(
+    classify_walk_skip(&io::Error::from(io::ErrorKind::NotFound)),
+    WalkSkip::VanishedRace,
+    "an ENOENT re-stat after a handle-encode failure is a benign vanish"
+  );
+  // The EACCES re-stat branch: the directory still exists but is inaccessible — an
+  // in-root coverage hole, not a silent skip.
+  assert_eq!(
+    classify_walk_skip(&io::Error::from_raw_os_error(libc::EACCES)),
+    WalkSkip::Incomplete,
+    "an EACCES re-stat after a handle-encode failure is an in-root incompleteness, \
+     not a swallowed skip"
+  );
+}
+
 /// `WalkError` folds both classes to the `io::Error` the reseed path escalates
 /// through its terminal blind→fatal, so a live reseed over an unwalkable tree
 /// composes with the existing `ReseedOutcome::Blind` machinery unchanged.
@@ -221,6 +246,37 @@ fn subtree_walk_unreadable_descendant_is_incomplete() {
     Err(WalkError::Incomplete(_)) => {}
     Err(WalkError::RootGone(_)) => unreachable!("subtree_walk never reports RootGone"),
     Ok(_) => panic!("an unreadable descendant in a moved-in subtree must make the walk Incomplete"),
+  }
+}
+
+/// `subtree_walk` on a MISSING path is `Incomplete`, NOT a benign empty walk. The
+/// reader resolves the moved dir's current path through the map and only calls this
+/// while the node is still in-map and `pending_walk` — so a `NotFound` means no
+/// rename-out was processed (the single-threaded reader would have forgotten it
+/// first) and the directory should be present. Swallowing it as an empty subtree is
+/// exactly the burst hole that would leave a re-moved populated dir's descendants
+/// blind forever. It folds to the reader's retry-once-then-blind→fatal.
+#[test]
+fn subtree_walk_on_missing_path_is_incomplete_not_empty() {
+  let missing = std::env::temp_dir().join(format!(
+    "tributary-fs-subtree-walk-missing-{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&missing);
+  let subtree_fid = Fid::new([7; 8], Box::from(&[7u8][..]));
+  match subtree_walk(&missing, &subtree_fid, [0u8; 8], 0) {
+    Err(WalkError::Incomplete(err)) => {
+      assert_eq!(
+        err.kind(),
+        io::ErrorKind::NotFound,
+        "the incompleteness carries the NotFound that opening the missing dir raised"
+      );
+    }
+    Err(WalkError::RootGone(_)) => unreachable!("subtree_walk never reports RootGone"),
+    Ok(entries) => panic!(
+      "a missing moved-in subtree path must be Incomplete, not an empty walk (got {} entries)",
+      entries.len()
+    ),
   }
 }
 

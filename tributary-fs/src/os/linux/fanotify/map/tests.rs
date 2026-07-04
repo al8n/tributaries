@@ -125,11 +125,11 @@ fn learn_admits_new_child_directory() {
   assert_eq!(map.dir_count(), 3);
 }
 
-/// `contains` is a pure membership query — no path resolution, no orphan
-/// eviction (unlike `admit`): a seeded directory is contained, an unknown one is
-/// not, and an ORPHANED-but-not-yet-evicted node still reports contained (its
-/// node lingers until an `admit` miss reaps it). This is the move-flavor
-/// discriminator, so it must reflect raw storage, not reachability.
+/// `contains` is a pure membership query — no path resolution, no eviction
+/// (unlike `admit`): a seeded directory is contained, an unknown one is not, and
+/// the query neither resolves nor mutates. This is the move-flavor discriminator
+/// (checked on the moved object's own FID, always a directly-stored node), so it
+/// must reflect raw storage, not reachability.
 #[test]
 fn contains_is_raw_membership_without_eviction() {
   let mut map = FidMap::new();
@@ -140,25 +140,26 @@ fn contains_is_raw_membership_without_eviction() {
   ]);
   assert!(map.contains(&fid(1)), "the root is contained");
   assert!(map.contains(&fid(2)), "a seeded child is contained");
+  assert!(map.contains(&fid(3)), "a seeded grandchild is contained");
   assert!(
     !map.contains(&fid(99)),
     "an unknown handle is not contained"
   );
+  // `contains` did not mutate the map — the count is unchanged (no eviction).
+  assert_eq!(map.dir_count(), 3, "contains does not evict");
+  map.assert_adjacency();
 
-  // Orphan the child by forgetting its parent: the child's NODE still exists
-  // (lazy eviction), so `contains` still reports it even though it no longer
-  // resolves. `contains` is storage membership, deliberately distinct from
-  // `admit`'s reachability.
+  // `forget` of the parent prunes the WHOLE subtree eagerly (adjacency walk), so
+  // the grandchild is gone from storage at once — `contains` reflects that
+  // immediately, with no lingering orphan for a later `admit` miss to reap.
   map.forget(&fid(2));
-  assert!(
-    map.contains(&fid(3)),
-    "an orphaned node is still stored until an admit miss evicts it"
-  );
-  assert_eq!(map.admit(&fid(3)), None, "yet it no longer resolves");
+  assert!(!map.contains(&fid(2)), "the forgotten node is gone");
   assert!(
     !map.contains(&fid(3)),
-    "the admit miss evicted the orphan, so contains now agrees"
+    "the forget pruned the descendant too — no lingering orphan"
   );
+  assert_eq!(map.admit(&fid(3)), None, "and it no longer resolves");
+  map.assert_adjacency();
 }
 
 /// `learn` under an unknown parent is a no-op: a create outside the watched
@@ -222,10 +223,12 @@ fn forget_prunes_admission_and_identity() {
   );
 }
 
-/// A directory rename (re-parent under a NEW in-root parent, or a rename in
-/// place) updates ONE node's `(parent, name)`, and every descendant's resolved
-/// path follows automatically through the parent walk — no per-descendant
-/// rewrite.
+/// An in-root directory rename RE-PARENTS the one node IN PLACE (the real
+/// `admit_rename` path calls `learn` only — no `forget`, since the object did not
+/// depart), and every descendant's resolved path follows automatically through
+/// the parent walk with no per-descendant rewrite. Re-parenting in place must
+/// PRESERVE the moved dir's descendants (they move with it) and keep the `children`
+/// adjacency consistent under both parents.
 #[test]
 fn in_root_rename_reparents_the_whole_subtree() {
   let mut map = FidMap::new();
@@ -237,18 +240,36 @@ fn in_root_rename_reparents_the_whole_subtree() {
     SeedEntry::child(fid(4), fid(1), OsString::from("b")),
   ]);
   assert_eq!(map.admit(&fid(3)), Some(PathBuf::from("/root/a/child")));
+  let child_id = map.intern(&fid(3));
 
-  // Rename /root/a → /root/b/a: forget the moved dir, relearn it under `b`.
-  map.forget(&fid(2));
+  // Rename /root/a → /root/b/a: re-parent `a` under `b` IN PLACE (learn, no
+  // forget) — exactly the in-root re-parent `admit_rename` performs.
   map.learn(&fid(4), b"a", Some(&fid(2)));
 
-  // The moved dir AND its pre-seeded child both resolve under the NEW path.
+  // The moved dir AND its pre-seeded child both resolve under the NEW path, and
+  // the child kept its identity (it never departed).
   assert_eq!(map.admit(&fid(2)), Some(PathBuf::from("/root/b/a")));
   assert_eq!(
     map.admit(&fid(3)),
     Some(PathBuf::from("/root/b/a/child")),
     "the descendant follows the parent's rename with no rewrite"
   );
+  assert_eq!(
+    map.intern(&fid(3)),
+    child_id,
+    "an in-root re-parent preserves the descendant's identity (no fork)"
+  );
+  map.assert_adjacency();
+
+  // Now forget the re-parented `a`: its child prunes with it, from the NEW
+  // location, proving the adjacency followed the re-parent.
+  map.forget(&fid(2));
+  assert_eq!(
+    map.admit(&fid(3)),
+    None,
+    "the descendant prunes with its re-parented ancestor"
+  );
+  map.assert_adjacency();
 }
 
 /// A directory renamed OUT of the root leaves its descendants un-admitting:
@@ -275,6 +296,7 @@ fn move_out_of_root_orphans_the_subtree() {
     None,
     "the descendant no longer reaches the root and does not admit"
   );
+  map.assert_adjacency();
 }
 
 /// A move INTO the root then straight back OUT: the subtree admits while in,
@@ -304,21 +326,72 @@ fn move_in_then_out_tracks_admission() {
   );
 }
 
-/// An orphaned directory is evicted on its admission miss, so the stale node is
-/// not retained indefinitely.
+/// A populated move-out (`forget` of a directory with descendants) prunes the
+/// WHOLE subtree from BOTH the admission map and the intern table in one step, via
+/// the `children` adjacency — the O(subtree) departure. Dropping only the top would
+/// leak every descendant's id: the lazy admission miss only ever reaped `dirs`,
+/// never `ids`, so the intern table would grow past O(live directories).
 #[test]
-fn orphaned_node_is_evicted_on_miss() {
+fn move_out_prunes_the_whole_subtree_from_both_maps() {
   let mut map = FidMap::new();
+  // /root plus a 4-directory subtree under /root/a: a → b → c, and a sibling
+  // /root/a/d — so `a` has a descendant fan-out to prune.
   map.seed([
     SeedEntry::root(fid(1), Path::new("/root")),
     SeedEntry::child(fid(2), fid(1), OsString::from("a")),
-    SeedEntry::child(fid(3), fid(2), OsString::from("child")),
+    SeedEntry::child(fid(3), fid(2), OsString::from("b")),
+    SeedEntry::child(fid(4), fid(3), OsString::from("c")),
+    SeedEntry::child(fid(5), fid(2), OsString::from("d")),
   ]);
+  assert_eq!(map.dir_count(), 5);
+  assert_eq!(map.interned_count(), 5, "every seeded dir is interned");
+  map.assert_adjacency();
+
+  // Move /root/a out of the root: forget it. The whole subtree (a, b, c, d) goes.
   map.forget(&fid(2));
-  assert_eq!(map.dir_count(), 2, "root + orphaned child still stored");
-  // The miss on the orphan evicts it.
-  assert_eq!(map.admit(&fid(3)), None);
-  assert_eq!(map.dir_count(), 1, "the orphan was evicted at its miss");
+  assert_eq!(map.dir_count(), 1, "only the root survives");
+  assert_eq!(
+    map.interned_count(),
+    1,
+    "the departed subtree's four ids are all pruned at once — no leak"
+  );
+  for tag in 2..=5u8 {
+    assert_eq!(
+      map.admit(&fid(tag)),
+      None,
+      "no descendant resolves after the move-out"
+    );
+  }
+  map.assert_adjacency();
+
+  // Fresh-identity-on-return holds for DESCENDANTS too: a returned descendant
+  // mints a new id, never the pruned one.
+  let mut fresh = FidMap::new();
+  fresh.seed([SeedEntry::root(fid(1), Path::new("/root"))]);
+  let first = fresh.intern(&fid(4));
+  fresh.forget(&fid(4));
+  assert_ne!(
+    fresh.intern(&fid(4)),
+    first,
+    "a departed descendant mints a fresh identity on return"
+  );
+}
+
+/// The lazy `admit`-miss eviction remains as a belt: an `admit` on an unknown
+/// handle returns `None` and mutates nothing harmful (it never panics and never
+/// resolves), so the firehose-drop path stays cheap even though `forget` now
+/// prunes departed subtrees eagerly.
+#[test]
+fn admit_miss_on_unknown_handle_is_a_clean_drop() {
+  let mut map = seeded();
+  let before = map.dir_count();
+  assert_eq!(map.admit(&fid(99)), None, "an unknown handle drops");
+  assert_eq!(
+    map.dir_count(),
+    before,
+    "a clean miss leaves the map unchanged"
+  );
+  map.assert_adjacency();
 }
 
 /// The reseed rebuilds the admission structure from a fresh walk and swaps it
@@ -356,6 +429,9 @@ fn reseed_preserves_live_ids_and_prunes_vanished() {
     SeedEntry::child(fid(8), fid(7), OsString::from("deep")),
   ]);
 
+  // The reseed rebuilt the adjacency from the fresh walk (parents before
+  // children), so the dual links are consistent after the swap.
+  map.assert_adjacency();
   // The previously-unknown directories now admit.
   assert_eq!(map.admit(&fid(7)), Some(PathBuf::from("/root/fresh")));
   assert_eq!(map.admit(&fid(8)), Some(PathBuf::from("/root/fresh/deep")));
@@ -400,4 +476,96 @@ fn unknown_handle_dropped_is_the_firehose_filter() {
     );
   }
   assert!(!map.contains_dir(&fid_same_sb(100)));
+}
+
+/// `learn_moved_in` marks the top as `pending_walk`, and `pending_walk_target`
+/// reports its CURRENT resolved path plus the pending flag — the reader's
+/// deferred-walk lookup. An ordinary `learn` (a mkdir) is NOT pending: its
+/// contents are empty by construction, so no walk is owed.
+#[test]
+fn learn_moved_in_marks_pending_walk() {
+  let mut map = seeded();
+  // A directory moved in under /root/sub, learned as a pending-walk top.
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
+  assert_eq!(
+    map.pending_walk_target(&fid(5)),
+    Some((PathBuf::from("/root/sub/arrived"), true)),
+    "a moved-in top resolves to its current path and is pending its walk"
+  );
+  // An ordinary create (mkdir) is empty by construction — never pending.
+  map.learn(&fid(2), b"mkdir", Some(&fid(6)));
+  assert_eq!(
+    map.pending_walk_target(&fid(6)),
+    Some((PathBuf::from("/root/sub/mkdir"), false)),
+    "a mkdir owes no walk"
+  );
+  // An unknown FID has no target.
+  assert_eq!(map.pending_walk_target(&fid(99)), None);
+}
+
+/// `clear_pending_walk` discharges the obligation once the walk completes, so a
+/// later `NotFound` at the path is again a benign race (the node no longer owes
+/// descendants).
+#[test]
+fn clear_pending_walk_discharges_the_obligation() {
+  let mut map = seeded();
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
+  assert_eq!(map.pending_walk_target(&fid(5)).map(|(_, p)| p), Some(true));
+  map.clear_pending_walk(&fid(5));
+  assert_eq!(
+    map.pending_walk_target(&fid(5)).map(|(_, p)| p),
+    Some(false),
+    "the walk obligation is discharged"
+  );
+  // Clearing an absent node is a no-op (does not panic).
+  map.clear_pending_walk(&fid(99));
+}
+
+/// The burst scenario at the MAP layer: a populated dir moved IN to /root/a
+/// (learned pending) then re-parented in-root to /root/b in the SAME batch.
+/// `pending_walk_target` must report the CURRENT path (/root/b, through the updated
+/// parent link), NOT the stale admission-time /root/a — so the deferred walk
+/// resolves the moved dir where it actually is and maps its descendants.
+#[test]
+fn pending_walk_target_follows_an_in_root_reparent() {
+  let mut map = FidMap::new();
+  // /root with two in-root parents a and b already present.
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("a")),
+    SeedEntry::child(fid(3), fid(1), OsString::from("b")),
+  ]);
+  // Event 1 of the batch: a populated dir (fid 9) moved in under /root/a, learned
+  // as a pending-walk top. Its deferred walk has NOT run yet.
+  map.learn_moved_in(&fid(2), b"moved", &fid(9));
+  assert_eq!(
+    map.pending_walk_target(&fid(9)),
+    Some((PathBuf::from("/root/a/moved"), true))
+  );
+  // Event 2 of the SAME batch: /root/a/moved re-parented in-root to /root/b/moved
+  // (an in-root rename → learn re-parents in place, keeping it known and pending).
+  map.learn(&fid(3), b"moved", Some(&fid(9)));
+  // The deferred walk, run AFTER both events, must resolve the CURRENT path.
+  assert_eq!(
+    map.pending_walk_target(&fid(9)),
+    Some((PathBuf::from("/root/b/moved"), true)),
+    "the walk target follows the in-root re-parent — not the stale /root/a"
+  );
+  map.assert_adjacency();
+}
+
+/// A `forget` (rename-out / delete) of a `pending_walk` top CANCELS its walk: the
+/// node is gone, so `pending_walk_target` returns `None` and the reader treats the
+/// walk as cancelled (a departed subtree owes nothing).
+#[test]
+fn forget_cancels_a_pending_walk() {
+  let mut map = seeded();
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
+  assert!(map.pending_walk_target(&fid(5)).is_some());
+  map.forget(&fid(5));
+  assert_eq!(
+    map.pending_walk_target(&fid(5)),
+    None,
+    "forgetting the moved-in top cancels its pending walk"
+  );
 }

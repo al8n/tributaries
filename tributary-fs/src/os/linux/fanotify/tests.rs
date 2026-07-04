@@ -233,9 +233,11 @@ fn rename_into_root_admits_with_resolved_destination() {
 /// A DIRECTORY moved IN from outside the root (its own FID unknown to the map,
 /// destination parent in-root) returns [`Admission::AdmitAndSeed`]: the moved
 /// directory carries pre-existing descendants the seed walk never saw, so the
-/// reader must walk its subtree in. The request names the moved directory's NEW
-/// resolved path and its own FID (the parent link for the walked descendants),
-/// and the moved directory is already learned (its own later events admit).
+/// reader must walk its subtree in. The request carries ONLY the moved
+/// directory's FID (not a captured path — the reader resolves the current path
+/// through the map at walk time), and the moved directory is already learned AND
+/// marked `pending_walk` (its own later events admit; a `NotFound` at its resolved
+/// path during the walk is an incompleteness, not a benign empty walk).
 #[test]
 fn dir_move_in_from_outside_requests_a_subtree_walk() {
   let mut map = seeded();
@@ -254,19 +256,9 @@ fn dir_move_in_from_outside_requests_a_subtree_walk() {
       new_name: b"arrived".to_vec(),
     }),
   };
-  let Admission::AdmitAndSeed {
-    event,
-    moved_in,
-    moved_fid,
-  } = admit(&mut map, &ev)
-  else {
+  let Admission::AdmitAndSeed { event, moved_fid } = admit(&mut map, &ev) else {
     panic!("a populated dir moved in from outside must request a subtree walk");
   };
-  assert_eq!(
-    moved_in,
-    PathBuf::from("/root/sub/arrived"),
-    "the walk is rooted at the moved directory's new path"
-  );
   assert_eq!(
     moved_fid,
     fid(9),
@@ -277,11 +269,12 @@ fn dir_move_in_from_outside_requests_a_subtree_walk() {
     PathBuf::from("/root/sub/arrived"),
     "the forwarded move still carries the destination path"
   );
-  // The moved directory itself is learned; its own later events resolve.
+  // The moved directory itself is learned as a pending-walk top; the reader will
+  // resolve its CURRENT path through the map at walk time.
   assert_eq!(
-    map.admit(&fid(9)),
-    Some(PathBuf::from("/root/sub/arrived")),
-    "the moved directory itself is admitted after the move-in"
+    map.pending_walk_target(&fid(9)),
+    Some((PathBuf::from("/root/sub/arrived"), true)),
+    "the moved directory is admitted and pending its subtree walk"
   );
 }
 
@@ -364,6 +357,77 @@ fn dir_move_out_then_back_in_re_walks() {
     matches!(admit(&mut map, &back), Admission::AdmitAndSeed { .. }),
     "a move back in from outside re-requests the subtree walk"
   );
+}
+
+/// A populated directory moved IN to /root/a then IMMEDIATELY renamed in-root to
+/// /root/b in the SAME batch, driven through the admit seam. The first admit learns
+/// the moved dir pending (its deferred walk not yet run); the second admit is an
+/// in-root re-parent (the dir is now KNOWN) that must KEEP it pending and re-parent
+/// it, so the still-owed walk resolves the CURRENT path /root/b — NOT the stale
+/// /root/a — and maps the descendants. Without the pending flag and current-path
+/// resolution, the walk would see the already-vanished /root/a as an empty success
+/// and the second rename would see a known FID and skip the walk, leaving the
+/// descendants blind forever.
+#[test]
+fn burst_move_in_then_in_root_rename_keeps_walk_pending_at_current_path() {
+  let mut map = FidMap::new();
+  // /root with two in-root destination parents a and b.
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("a")),
+    SeedEntry::child(fid(3), fid(1), OsString::from("b")),
+  ]);
+  // Event 1: populated dir fid(9) moved IN from outside under /root/a.
+  let move_in = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(9)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(90),
+      old_name: b"moved".to_vec(),
+      new_dir: fid(2),
+      new_name: b"moved".to_vec(),
+    }),
+  };
+  assert!(
+    matches!(admit(&mut map, &move_in), Admission::AdmitAndSeed { .. }),
+    "the move-in requests a subtree walk"
+  );
+  assert_eq!(
+    map.pending_walk_target(&fid(9)),
+    Some((PathBuf::from("/root/a/moved"), true)),
+    "after event 1 the moved dir is pending at /root/a"
+  );
+
+  // Event 2 (SAME batch, BEFORE the deferred walk runs): /root/a/moved renamed
+  // in-root to /root/b/moved. The dir is now KNOWN, so this is an in-root
+  // re-parent — a plain Admit, no second walk requested.
+  let in_root = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(9)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(2),
+      old_name: b"moved".to_vec(),
+      new_dir: fid(3),
+      new_name: b"moved".to_vec(),
+    }),
+  };
+  assert!(
+    matches!(admit(&mut map, &in_root), Admission::Admit(_)),
+    "the in-root re-parent of the now-known dir needs no second walk"
+  );
+  // The still-owed walk (requested by event 1) now resolves the CURRENT path —
+  // the re-parent moved it to /root/b, and the flag stayed set so the reader will
+  // walk it there rather than skip it.
+  assert_eq!(
+    map.pending_walk_target(&fid(9)),
+    Some((PathBuf::from("/root/b/moved"), true)),
+    "the deferred walk target followed the in-root re-parent to /root/b and stays pending"
+  );
+  map.assert_adjacency();
 }
 
 /// A FILE moved in from outside (non-directory target) never requests a subtree
