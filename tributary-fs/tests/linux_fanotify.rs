@@ -604,6 +604,179 @@ async fn unmount_under_live_watch_dies_via_refresh() {
   let _ = w.close().await;
 }
 
+/// Sets `path`'s permission bits (raw `chmod`), returning whether it succeeded.
+fn chmod(path: &Path, mode: u32) -> bool {
+  use std::os::unix::fs::PermissionsExt;
+  std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).is_ok()
+}
+
+/// Whether THIS process cannot read `dir` — i.e. an `EACCES`-style walk failure
+/// would genuinely fire. Root with `CAP_DAC_OVERRIDE` (the usual privileged
+/// container identity) reads a `chmod 000` directory regardless, so a walk-
+/// incompleteness cell can only assert its property where this returns `true`;
+/// elsewhere it skips loudly (the unprivileged CI leg and non-root devs hit it).
+fn dir_is_unreadable(dir: &Path) -> bool {
+  std::fs::read_dir(dir).is_err()
+}
+
+/// Suite 12 (walk-completeness selection precondition, design §5 `Walk` row).
+///
+/// A `chmod 000` subdirectory the walker cannot enter makes the seed walk
+/// INCOMPLETE — fanotify's admission map would be born blind to that subtree, so
+/// fanotify is not viable. Under `Backend::Auto` the spawn falls back to inotify
+/// (which surfaces an unreadable directory natively through its per-directory
+/// arms), and events under OTHER (readable) subtrees still flow. Self-probing:
+/// where the process reads the 000 dir anyway (root + `CAP_DAC_OVERRIDE`), the
+/// incompleteness cannot arise, so the cell skips loudly.
+#[tokio::test]
+async fn auto_falls_back_to_inotify_on_unwalkable_subtree() {
+  let root = tmpfs_scratch("walk-fallback");
+  // Two subtrees: one readable (events must flow through it), one made
+  // unreadable so the walk cannot complete.
+  let readable = root.join("readable");
+  let blocked = root.join("blocked");
+  std::fs::create_dir_all(readable.join("inner")).unwrap();
+  std::fs::create_dir_all(&blocked).unwrap();
+  if !chmod(&blocked, 0o000) {
+    eprintln!("SKIP auto_falls_back_to_inotify_on_unwalkable_subtree: chmod refused");
+    return;
+  }
+  if !dir_is_unreadable(&blocked) {
+    // Root with DAC_OVERRIDE reads it anyway — the walk would complete, so the
+    // fallback cannot be exercised here.
+    let _ = chmod(&blocked, 0o755);
+    eprintln!(
+      "SKIP auto_falls_back_to_inotify_on_unwalkable_subtree: the 000 subdir is readable \
+       (root/CAP_DAC_OVERRIDE) — run the default-caps/unprivileged leg to exercise the fallback"
+    );
+    return;
+  }
+
+  let w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Auto))
+    .expect("build Auto watcher");
+  let handle = match w.watch(&root, Interest::all()).await {
+    Ok(handle) => handle,
+    Err(err) => {
+      let _ = chmod(&blocked, 0o755);
+      panic!("Auto must not fail on an unwalkable subtree — it falls back: {err:?}");
+    }
+  };
+  let selected = w
+    .backend_of(handle)
+    .expect("a live root reports its backend");
+  assert_eq!(
+    selected,
+    BackendKind::Inotify,
+    "an unwalkable in-root subtree makes fanotify not viable — Auto falls back to inotify"
+  );
+
+  // Events under the READABLE subtree still flow (the fallback backend is live).
+  let mut w = w;
+  let target = readable.join("inner/created.txt");
+  std::fs::write(&target, b"x").unwrap();
+  let flowed = wait_for(&mut w, |e| covers(e, &target)).await.is_some();
+  // Restore before asserting so a failure still leaves the tree removable.
+  let _ = chmod(&blocked, 0o755);
+  assert!(
+    flowed,
+    "after the inotify fallback, a create under a readable subtree is delivered"
+  );
+  let _ = w.close().await;
+}
+
+/// Suite 12 — the forced-`Fanotify` half of the walk-completeness precondition:
+/// an unwalkable subtree makes forced `Fanotify` fail with a typed
+/// [`SourceError::BackendProbeFailed`] (the `Walk` stage), NOT a fallback and NOT
+/// a live-but-blind source. Needs `CAP_SYS_ADMIN` for the mark to pass the probe
+/// (so the walk stage is even reached) AND the 000 dir to be unreadable to this
+/// process — a combination only an unusual environment provides, so the cell
+/// skips loudly whenever either does not hold.
+#[tokio::test]
+async fn forced_fanotify_typed_error_on_unwalkable_subtree() {
+  if !has_sys_admin() {
+    eprintln!("SKIP forced_fanotify_typed_error_on_unwalkable_subtree: no CAP_SYS_ADMIN");
+    return;
+  }
+  let root = tmpfs_scratch("walk-forced");
+  let blocked = root.join("blocked");
+  std::fs::create_dir_all(&blocked).unwrap();
+  if !chmod(&blocked, 0o000) || !dir_is_unreadable(&blocked) {
+    let _ = chmod(&blocked, 0o755);
+    eprintln!(
+      "SKIP forced_fanotify_typed_error_on_unwalkable_subtree: the 000 subdir is readable \
+       (CAP_SYS_ADMIN implies DAC_OVERRIDE) — the walk stage cannot be forced to fail here"
+    );
+    return;
+  }
+
+  let w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Fanotify))
+    .expect("build forced-fanotify watcher");
+  let result = w.watch(&root, Interest::all()).await;
+  let _ = chmod(&blocked, 0o755);
+  let err = result.expect_err("forced fanotify on an unwalkable tree must fail");
+  assert!(
+    matches!(
+      err,
+      tributary_fs::WatchRootError::Source(tributary_fs::SourceError::BackendProbeFailed { .. })
+    ),
+    "an unwalkable subtree surfaces the typed viability error, never a blind source: {err:?}"
+  );
+  w.close().await.expect("the watcher closes cleanly");
+}
+
+/// Churn smoke: a long create/delete churn of FILES under a watched root must not
+/// grow unbounded memory — the intern table is directory-bounded (file target
+/// FIDs are never interned). This drives thousands of file create/deletes and
+/// asserts the watcher stays live and responsive (a leak of one id per file would
+/// be observable as growth; the property under test is that the source keeps
+/// converging with a bounded map). Runs on whichever backend `Auto` selects; the
+/// map bound is the fanotify concern, and inotify has no such table.
+#[tokio::test]
+async fn file_churn_keeps_a_bounded_map() {
+  let root = tmpfs_scratch("churn");
+  let w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Auto))
+    .expect("build Auto watcher");
+  let Ok(handle) = w.watch(&root, Interest::all()).await else {
+    eprintln!("SKIP file_churn_keeps_a_bounded_map: watch refused");
+    return;
+  };
+  let selected = w.backend_of(handle).expect("live backend");
+  let mut w = w;
+
+  // A marker proves the stream is live before the churn.
+  std::fs::write(root.join("start.txt"), b"s").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &root.join("start.txt")))
+      .await
+      .is_some(),
+    "the {selected} stream is live before the churn"
+  );
+
+  // Churn: many DISTINCT files created then deleted. Under fanotify each create
+  // carries a target FID that must NOT be interned; a per-file id leak would
+  // grow the map's intern table without bound.
+  for i in 0..3000 {
+    let f = root.join(format!("churn-{i}.txt"));
+    std::fs::write(&f, b"c").unwrap();
+    std::fs::remove_file(&f).unwrap();
+    // Drain opportunistically so the reader makes progress and the channel does
+    // not back up (this is a liveness smoke, not a delivery assertion).
+    if i % 256 == 0 {
+      let _ = tokio::time::timeout(Duration::from_millis(1), w.next()).await;
+    }
+  }
+
+  // The source is still live and responsive after the churn: a fresh create is
+  // delivered. A blown-up map (OOM) or a dead reader would fail this.
+  let after = root.join("after-churn.txt");
+  std::fs::write(&after, b"a").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &after)).await.is_some(),
+    "the {selected} source stays live and responsive after a heavy file churn"
+  );
+  let _ = w.close().await;
+}
+
 /// Whether the process holds `CAP_SYS_ADMIN` — the capability the fanotify
 /// FILESYSTEM mark needs. Read from `/proc/self/status`'s effective-cap bitmask
 /// (bit 21 = `CAP_SYS_ADMIN`); a read failure conservatively reports `false`.

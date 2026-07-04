@@ -33,6 +33,37 @@ use super::{
 };
 use crate::os::MAX_EXCLUSIONS;
 
+/// The outcome of a fanotify spawn attempt. Separated from a plain `Result` so
+/// the dispatcher can tell a fanotify VIABILITY failure (the tree is not fully
+/// walkable — fall back under `Backend::Auto`, typed error under forced
+/// `Fanotify`) from a genuine error that both selections propagate.
+pub(crate) enum FanotifySpawn {
+  /// The source started: its handle, receiver, and root metadata.
+  Started(SourceHandle, super::super::super::EventReceiver, RootMeta),
+  /// A genuine spawn failure (root vanished, memory/thread exhaustion, …) — both
+  /// `Auto` and forced `Fanotify` surface it unchanged.
+  Error(SourceError),
+  /// fanotify is not viable for this root: the seed walk found an existing in-root
+  /// directory it could not map (design §5 `Walk` stage). `config` is handed back
+  /// so `Backend::Auto` can fall back to inotify; forced `Fanotify` turns this
+  /// into [`SourceError::BackendProbeFailed`] with [`ProbeStage::Walk`].
+  NotViable(SourceConfig),
+}
+
+/// The internal spawn outcome, mapped to [`FanotifySpawn`] at the boundary. A
+/// `SourceError` flows in through `?` unchanged; only the walk's viability miss
+/// carries the config back for the dispatcher to fall back on.
+enum SpawnFailure {
+  Error(SourceError),
+  NotViable(SourceConfig),
+}
+
+impl From<SourceError> for SpawnFailure {
+  fn from(err: SourceError) -> Self {
+    Self::Error(err)
+  }
+}
+
 /// The spawn entry point of the fanotify backend.
 pub(crate) struct Source;
 
@@ -49,52 +80,77 @@ impl Source {
   /// the reader is live — a root replaced across the gap is torn down and
   /// rejected, never committed. `canonical` and `fd` are the probe's outputs;
   /// this never re-canonicalizes or re-marks.
+  ///
+  /// The seed walk is the last fanotify precondition: a tree with an existing
+  /// in-root directory it cannot map returns [`FanotifySpawn::NotViable`] (design
+  /// §5 `Walk` stage) rather than a live-but-blind source — the caller falls back
+  /// to inotify (`Auto`) or surfaces a typed error (forced `Fanotify`).
   pub(crate) fn spawn(
     config: SourceConfig,
     canonical: std::path::PathBuf,
     fd: OwnedFd,
-  ) -> Result<(SourceHandle, super::super::super::EventReceiver, RootMeta), SourceError> {
+  ) -> FanotifySpawn {
+    match Self::try_spawn(config, canonical, fd) {
+      Ok((handle, rx, meta)) => FanotifySpawn::Started(handle, rx, meta),
+      Err(SpawnFailure::Error(err)) => FanotifySpawn::Error(err),
+      Err(SpawnFailure::NotViable(config)) => FanotifySpawn::NotViable(config),
+    }
+  }
+
+  fn try_spawn(
+    config: SourceConfig,
+    canonical: std::path::PathBuf,
+    fd: OwnedFd,
+  ) -> Result<(SourceHandle, super::super::super::EventReceiver, RootMeta), SpawnFailure> {
     if config.exclusions.len() > MAX_EXCLUSIONS {
-      return Err(SourceError::TooManyExclusions {
+      return Err(SpawnFailure::Error(SourceError::TooManyExclusions {
         supplied: config.exclusions.len(),
-      });
+      }));
     }
 
     // The dispatcher's shared locality gate (design §5 row 1) already refused a
     // remote/virtual root, and the probe's FILESYSTEM mark proved the fs is
     // handle- and superblock-mark-capable; this statfs only reads the `f_fsid`
     // the seed FIDs must match byte-for-byte.
-    let fsid = superblock_fsid(&canonical)?;
+    let fsid = superblock_fsid(&canonical).map_err(SpawnFailure::Error)?;
 
-    let meta = fs::metadata(&canonical).map_err(|source| SourceError::RootUnavailable {
-      root: canonical.clone(),
-      source,
+    let meta = fs::metadata(&canonical).map_err(|source| {
+      SpawnFailure::Error(SourceError::RootUnavailable {
+        root: canonical.clone(),
+        source,
+      })
     })?;
     if !meta.is_dir() {
-      return Err(SourceError::NotADirectory { root: canonical });
+      return Err(SpawnFailure::Error(SourceError::NotADirectory {
+        root: canonical,
+      }));
     }
     let root_dev = meta.dev();
     let identity = RootIdentity::new(meta.dev(), meta.ino());
     let mounts = mounts_under(&canonical).unwrap_or_default();
 
     // Seed the map by walking the root: every directory's FID (built from the
-    // superblock fsid + its file handle) admits its own later events. A read
-    // failure mid-walk is not fatal — the directory simply stays unseeded and a
-    // later reseed re-observes it — but a root that cannot be walked at all is
-    // an honest spawn failure. The same walk inputs ride into the reader as the
-    // reseed context: a loss rebuilds the map from a fresh walk.
+    // superblock fsid + its file handle) admits its own later events. The walk is
+    // a fanotify PRECONDITION — an existing in-root directory it cannot map is a
+    // viability failure (fall back / typed error), NOT a live-but-blind source —
+    // while a vanished root is a benign race reported as root-unavailable. The
+    // same walk inputs ride into the reader as the reseed context: a loss rebuilds
+    // the map from a fresh walk, and there an unmappable tree escalates to Fatal.
     let reseed = ReseedContext {
       root: canonical.clone(),
       fsid,
       root_dev,
     };
     let mut map = FidMap::new();
-    let seed = reseed
-      .walk()
-      .map_err(|source| SourceError::RootUnavailable {
+    let seed = reseed.walk_typed().map_err(|err| match err {
+      // The tree is not fully walkable: fanotify is not viable. Hand `config`
+      // back so the dispatcher can fall back (Auto) or type the error (forced).
+      WalkError::Incomplete(_) => SpawnFailure::NotViable(config.clone()),
+      WalkError::RootGone(source) => SpawnFailure::Error(SourceError::RootUnavailable {
         root: canonical.clone(),
         source,
-      })?;
+      }),
+    })?;
     map.seed(seed);
 
     let (queue_tx, queue_rx) = async_channel::unbounded();
@@ -127,19 +183,23 @@ impl Source {
       Ok(live) => live,
       Err(source) => {
         handle.shutdown();
-        return Err(SourceError::RootUnavailable {
+        return Err(SpawnFailure::Error(SourceError::RootUnavailable {
           root: canonical,
           source,
-        });
+        }));
       }
     };
     if !live.is_dir() {
       handle.shutdown();
-      return Err(SourceError::NotADirectory { root: canonical });
+      return Err(SpawnFailure::Error(SourceError::NotADirectory {
+        root: canonical,
+      }));
     }
     if RootIdentity::new(live.dev(), live.ino()) != identity {
       handle.shutdown();
-      return Err(SourceError::RootReplaced { root: canonical });
+      return Err(SpawnFailure::Error(SourceError::RootReplaced {
+        root: canonical,
+      }));
     }
     let mut ancestors = Vec::new();
     for ancestor in canonical.ancestors().skip(1) {
@@ -147,10 +207,10 @@ impl Source {
         Ok(meta) => ancestors.push(RootIdentity::new(meta.dev(), meta.ino())),
         Err(source) => {
           handle.shutdown();
-          return Err(SourceError::RootUnavailable {
+          return Err(SpawnFailure::Error(SourceError::RootUnavailable {
             root: ancestor.to_path_buf(),
             source,
-          });
+          }));
         }
       }
     }
@@ -230,8 +290,79 @@ impl ReseedContext {
   /// by the directory count under the root; overflow is rare, so paying a full
   /// walk to restore the map's sight is the honest cost of never going
   /// permanently blind after a covered loss.
+  ///
+  /// Any [`WalkError`] — a vanished root, an unreadable subtree — folds into the
+  /// `io::Error` the reseed path escalates: `reseed_map` retries once, then a
+  /// second failure is `ReseedOutcome::Blind` → terminal `Fatal`. The
+  /// completeness rule is thus identical at spawn and reseed; only the spawn path
+  /// gets to distinguish "not viable, fall back" from "genuinely gone".
   pub(crate) fn walk(&self) -> io::Result<Vec<SeedEntry>> {
+    seed_walk(&self.root, self.fsid, self.root_dev).map_err(WalkError::into_io)
+  }
+
+  /// The spawn-time walk, keeping the [`WalkError`] class so the dispatcher can
+  /// tell an unwalkable tree (fanotify not viable → fall back / typed error) from
+  /// a vanished root (root-unavailable). Only the pre-live spawn calls this; the
+  /// live reseed uses the `io::Error`-folding [`walk`](Self::walk).
+  fn walk_typed(&self) -> Result<Vec<SeedEntry>, WalkError> {
     seed_walk(&self.root, self.fsid, self.root_dev)
+  }
+}
+
+/// How a per-entry walk failure is classified. fanotify's admission model needs
+/// a COMPLETE directory map (an admitted event resolves its directory FID against
+/// the map; a directory absent from the map drops its events as outside-root with
+/// NO loss signal), so the walk cannot silently skip an existing in-root
+/// directory. The two classes are handled oppositely, so they are named
+/// explicitly rather than folded into a bare skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkSkip {
+  /// The object vanished between the parent's readdir and this step (`ENOENT`):
+  /// a benign race. The parent map entry exists, so if it is recreated its own
+  /// create event re-learns it; the walk skips it and proceeds.
+  VanishedRace,
+  /// An EXISTING in-root directory could not be read or handle-encoded (`EACCES`
+  /// and every non-`ENOENT` failure): the map would be born blind to that
+  /// subtree. The walk cannot complete, so fanotify is not viable for this root.
+  Incomplete,
+}
+
+/// Classifies a per-entry walk failure. `ENOENT` (`NotFound`) is the only benign
+/// class — a directory a prior readdir listed but that vanished before this step
+/// is a race, not a coverage hole. Every other failure (permission, I/O, an
+/// unexportable handle on an object that still exists) leaves an in-root subtree
+/// unmapped, which fanotify's membership admission cannot tolerate.
+fn classify_walk_skip(err: &io::Error) -> WalkSkip {
+  if err.kind() == io::ErrorKind::NotFound {
+    WalkSkip::VanishedRace
+  } else {
+    WalkSkip::Incomplete
+  }
+}
+
+/// Why the seed walk stopped, when it did not complete. The reseed path folds
+/// both into the terminal blind→fatal escalation (`reseed_map` retries once, then
+/// `ReseedOutcome::Blind` → `Fatal`); the spawn path distinguishes them so a race
+/// is a benign root-unavailable retry while an unwalkable tree is a fanotify
+/// viability failure (`Backend::Auto` → inotify, forced `Fanotify` → typed).
+#[derive(Debug)]
+pub(crate) enum WalkError {
+  /// The ROOT itself vanished or cannot export a handle. Without the root anchor
+  /// the map admits nothing (every path resolves against it), so this is a hard
+  /// spawn failure — but a race the caller reports as root-unavailable, not a
+  /// fanotify-unviable verdict (the probe already proved the root exportable).
+  RootGone(io::Error),
+  /// An EXISTING in-root descendant could not be walked or handle-encoded, so the
+  /// tree is not fully mappable: fanotify is not viable for this root.
+  Incomplete(io::Error),
+}
+
+impl WalkError {
+  /// The underlying failure, so the reseed path can escalate it unchanged.
+  fn into_io(self) -> io::Error {
+    match self {
+      Self::RootGone(err) | Self::Incomplete(err) => err,
+    }
   }
 }
 
@@ -241,37 +372,45 @@ impl ReseedContext {
 /// (`st_dev != root_dev`) is not descended: an sb mark never crosses it, so its
 /// subtree lives on a different superblock and never delivers on this fd.
 ///
-/// Two failure tiers, deliberately distinct:
+/// Completeness is a fanotify PRECONDITION, not a best-effort target. An admitted
+/// event resolves its directory FID against this map; a directory the walk failed
+/// to enter is absent, so ITS events drop as outside-root forever with no loss
+/// signal — the source goes "healthy" with a blind subtree. So every skip is
+/// classified ([`classify_walk_skip`]):
 ///
-/// - A failure to encode the ROOT's own handle is FATAL — an `Err`. Without the
-///   root anchor the map admits NOTHING (every path resolves against it), so a
-///   walk that skipped the root would seed an empty map: a live source that
-///   drops every event as outside-root. The probe already proved the root is
-///   handle-exportable, so this is a race (the root vanished between probe and
-///   walk); on a reseed it likewise escalates rather than going silently blind.
-/// - A per-DESCENDANT handle-read failure is skipped (with its subtree) — a
-///   reseed or the self-maintaining create stream re-observes it; a vanished dir
-///   mid-walk is benign.
+/// - A `VanishedRace` skip (`ENOENT` on an entry a prior readdir listed) is
+///   benign and dropped: the parent's map entry exists, so a recreation re-learns
+///   the child from its own create event.
+/// - An `Incomplete` skip (any non-`ENOENT` failure on an EXISTING in-root
+///   directory — permission, I/O, an unexportable handle) aborts the walk with
+///   [`WalkError::Incomplete`]: the tree is not fully mappable, so fanotify is not
+///   viable for this root.
+/// - A failure to encode the ROOT's own handle is [`WalkError::RootGone`]: the
+///   root anchor is load-bearing, but the probe already proved the root
+///   exportable, so its absence is a race reported as root-unavailable.
 ///
-/// The same walk seeds the map at spawn AND reseeds it after a loss: both need
-/// the identical parent-linked directory inventory.
-fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> io::Result<Vec<SeedEntry>> {
+/// The same walk seeds the map at spawn AND reseeds it after a loss; the reseed
+/// path folds every `WalkError` into its terminal blind→fatal escalation (see
+/// [`ReseedContext::walk`]), so an unreadable subtree that survives the reseed's
+/// single retry kills the scope rather than leaving it silently blind.
+fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>, WalkError> {
   let mut seed = Vec::new();
   // The root anchor is load-bearing: without it the map has no base to resolve
   // any path against, so its absence is a spawn/reseed failure, never an empty
   // success.
   let Some(root_fid) = handle_fid(root, fsid) else {
-    return Err(io::Error::new(
+    return Err(WalkError::RootGone(io::Error::new(
       io::ErrorKind::Unsupported,
       "the watched root does not export a file handle",
-    ));
+    )));
   };
   seed.push(SeedEntry::root(root_fid.clone(), root));
-  // The root must be readable to seed anything; deeper read failures degrade to
-  // a smaller seed, not a spawn failure. Explicit stacks keep the walk
-  // iterative (no recursion depth bound on a deep tree); `parents` carries each
-  // open reader's directory FID so a discovered child links to it.
-  let mut pending = vec![fs::read_dir(root)?];
+  // The root must be readable to seed anything; a root that cannot be opened is
+  // a race reported as root-unavailable (the probe already read it). Explicit
+  // stacks keep the walk iterative (no recursion depth bound on a deep tree);
+  // `parents` carries each open reader's directory FID so a discovered child
+  // links to it.
+  let mut pending = vec![fs::read_dir(root).map_err(WalkError::RootGone)?];
   let mut parents = vec![(root.to_path_buf(), root_fid)];
 
   while let Some(reader) = pending.last_mut() {
@@ -281,10 +420,22 @@ fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> io::Result<Vec<SeedEn
         pending.pop();
         parents.pop();
       }
-      Some(Err(_)) => continue,
+      // A readdir iteration error names an entry the directory listed but could
+      // not stat: a vanished entry is a race (skip), anything else is a coverage
+      // hole in an in-root directory (abort).
+      Some(Err(err)) => match classify_walk_skip(&err) {
+        WalkSkip::VanishedRace => continue,
+        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
+      },
       Some(Ok(entry)) => {
-        let Ok(file_type) = entry.file_type() else {
-          continue;
+        // `file_type` on a `DirEntry` may re-stat (no cached type); a failure is
+        // classified like any other per-entry skip.
+        let file_type = match entry.file_type() {
+          Ok(file_type) => file_type,
+          Err(err) => match classify_walk_skip(&err) {
+            WalkSkip::VanishedRace => continue,
+            WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
+          },
         };
         if !file_type.is_dir() {
           continue;
@@ -292,20 +443,45 @@ fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> io::Result<Vec<SeedEn
         let name = entry.file_name();
         let path = parent_path.join(&name);
         // Single-device descent: a directory on another device is a mount
-        // point — a different superblock this mark never reports on.
-        let on_root_dev = fs::symlink_metadata(&path)
-          .map(|meta| meta.dev() == root_dev)
-          .unwrap_or(false);
-        if !on_root_dev {
+        // point — a different superblock this mark never reports on. A stat
+        // failure here is NOT a mount boundary (the old code conflated the two
+        // via `unwrap_or(false)`); it is a per-entry skip, classified.
+        let meta = match fs::symlink_metadata(&path) {
+          Ok(meta) => meta,
+          Err(err) => match classify_walk_skip(&err) {
+            WalkSkip::VanishedRace => continue,
+            WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
+          },
+        };
+        if meta.dev() != root_dev {
           continue;
         }
+        // The directory exists on the root device (just stat'd), so a failure to
+        // encode its handle leaves it un-admittable: an in-root blind subtree.
+        // `encode_handle` loses the errno, so a re-stat disambiguates a genuine
+        // vanish (race, skip) from an existing-but-unexportable dir (incomplete).
         let Some(fid) = handle_fid(&path, fsid) else {
-          continue;
+          if fs::symlink_metadata(&path).is_err() {
+            continue;
+          }
+          return Err(WalkError::Incomplete(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "an in-root directory does not export a file handle",
+          )));
         };
         seed.push(SeedEntry::child(fid.clone(), parent_fid.clone(), name));
-        if let Ok(reader) = fs::read_dir(&path) {
-          pending.push(reader);
-          parents.push((path, fid));
+        // The child is admitted; failing to open it for descent hides ITS
+        // children, so the same completeness rule applies — a vanish is a race,
+        // anything else aborts.
+        match fs::read_dir(&path) {
+          Ok(reader) => {
+            pending.push(reader);
+            parents.push((path, fid));
+          }
+          Err(err) => match classify_walk_skip(&err) {
+            WalkSkip::VanishedRace => continue,
+            WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
+          },
         }
       }
     }

@@ -350,16 +350,32 @@ impl Source {
   /// The probed branch, shared by `Auto` and forced `Fanotify`: run the fanotify
   /// precondition probe on the dispatcher's `canonical` root and either spawn
   /// fanotify reusing the probed fd, or handle the failure per `fall_back`.
+  ///
+  /// The seed walk is the last precondition and can only be judged AFTER the
+  /// probe hands over the marked fd (it reuses that root), so a tree the walk
+  /// cannot fully map surfaces as [`FanotifySpawn::NotViable`] here — folded into
+  /// the same fall-back-vs-typed-error decision the probe stages use (the design
+  /// §5 `Walk` row). A genuine spawn error (a vanished root, resource exhaustion)
+  /// is propagated by BOTH selections: inotify could not start on it either.
   fn spawn_probed(
     config: super::SourceConfig,
     canonical: PathBuf,
     fall_back: bool,
   ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
     match probe::probe_fanotify(&canonical) {
-      Ok(probed) => {
-        let (handle, rx, meta) = fanotify::Source::spawn(config, canonical, probed.fd)?;
-        Ok((SourceHandle::Fanotify(handle), rx, meta))
-      }
+      Ok(probed) => match fanotify::Source::spawn(config, canonical.clone(), probed.fd) {
+        fanotify::FanotifySpawn::Started(handle, rx, meta) => {
+          Ok((SourceHandle::Fanotify(handle), rx, meta))
+        }
+        fanotify::FanotifySpawn::Error(err) => Err(err),
+        // The tree is not fully mappable (design §5 `Walk` stage): Auto falls back
+        // to inotify (its per-directory arms surface an unreadable directory
+        // natively); a forced `Fanotify` surfaces the typed viability error.
+        fanotify::FanotifySpawn::NotViable(config) if fall_back => {
+          Self::spawn_inotify(config, canonical)
+        }
+        fanotify::FanotifySpawn::NotViable(_) => Err(probe::probe_error(super::ProbeStage::Walk)),
+      },
       // Auto falls through to the universal backend; a forced `Fanotify` never
       // silently downgrades — it surfaces which precondition failed.
       Err(_) if fall_back => Self::spawn_inotify(config, canonical),

@@ -32,15 +32,29 @@
 //! descendant whose ancestry no longer reaches the root simply misses admission
 //! (its stale node is dropped on that miss).
 //!
-//! # Identity, never recycled
+//! # Identity: directory-only, O(live directories)
 //!
 //! The map is ALSO the identity table: `intern` mints exact, sequential ids for
 //! handles — never a hash of the handle (a collision would fabricate identity,
 //! the class the exact table exists to kill), and the handle already embeds a
-//! generation counter, making this stronger identity than `(dev, ino)`. The
-//! intern table SURVIVES a reseed (identities are stable for the scope's life);
-//! only the admission structure is rebuilt. Memory is O(directories under the
-//! root) — file identity stays enumerate-sourced, never retained here.
+//! generation counter, making this stronger identity than `(dev, ino)`.
+//!
+//! ONLY DIRECTORY handles are interned. Directory handles are already required
+//! for admission, so interning them is free; ordinary FILE events attach no
+//! identity, because under the kernel-recursive Monitor profile record identity
+//! is INERT — the sole consumer, `Monitor::reconcile_slot`, early-returns for a
+//! non-descending scope (there are no per-directory child watches to re-arm), and
+//! the atomic `FAN_RENAME` pair carries its own old+new addressing rather than
+//! leaning on identity. Interning every file target FID would grow this table
+//! unboundedly under create/delete churn (OOM), so it is confined to directories.
+//!
+//! The bound is therefore O(LIVE directories under the root). An id is pruned
+//! when its directory is forgotten (delete / rename-out): a departed-and-returned
+//! directory mints a FRESH identity, which the Monitor reads as a replacement —
+//! the conservative, safe direction (identity inequality drives a re-observe,
+//! never a false survivor). Reseed preserves every live directory's id (the
+//! admission structure is rebuilt while the intern table is retained), so identity
+//! is stable across a covered loss for directories that persisted through it.
 //!
 //! The map is single-threaded: the reader owns it and both mutates (learn on
 //! create, forget on delete/rename, reseed on loss) and reads (admit/intern) it
@@ -113,9 +127,12 @@ pub(crate) struct FidMap {
   /// decides admission; the parent chain resolves an event's path against the
   /// root.
   dirs: BTreeMap<HandleKey, DirNode>,
-  /// The exact identity intern table: `handle → sequential id`. Spans every
-  /// handle ever interned (directories AND file targets), so one object always
-  /// maps to one id for the scope's life — and it SURVIVES a reseed.
+  /// The exact identity intern table: `handle → sequential id`, DIRECTORIES only
+  /// (file target FIDs are never interned — see the module docs on why file
+  /// identity is inert under the kernel-recursive profile). Bounded by the live
+  /// directory count: an entry is dropped on `forget` and re-minted fresh should
+  /// the directory reappear, and it survives a reseed so a persisting directory
+  /// keeps its id across a covered loss.
   ids: BTreeMap<HandleKey, NonZeroU64>,
   /// The next identity to hand out. Sequential and exact — a fresh handle gets
   /// a fresh id, never a hash of its bytes.
@@ -161,8 +178,11 @@ impl FidMap {
     }
   }
 
-  /// The exact, stable identity of `fid`, minted sequentially on first sight
-  /// and returned unchanged forever after. Never a hash of the handle.
+  /// The exact, stable identity of a DIRECTORY `fid`, minted sequentially on
+  /// first sight and returned unchanged until the directory is forgotten. Never a
+  /// hash of the handle. Called only for directory handles (self-events, seeded
+  /// and learned directories) — file target FIDs are never interned, keeping the
+  /// table O(live directories).
   pub(crate) fn intern(&mut self, fid: &Fid) -> NonZeroU64 {
     if let Some(id) = self.ids.get(fid.handle()) {
       return *id;
@@ -196,26 +216,42 @@ impl FidMap {
     ));
   }
 
-  /// Drops a directory from admission on its delete or rename-out. Its interned
-  /// id is retained (identities are never recycled — a later stale record for
-  /// the same handle keeps its old identity rather than colliding with a fresh
-  /// object's), so only membership is forgotten. Descendants are NOT touched:
-  /// their parent link now points at an absent handle, so their walk fails and
-  /// they evict lazily at their next admission miss.
+  /// Drops a directory from admission AND from the intern table on its delete or
+  /// rename-out. Pruning the id bounds the table at O(live directories); the id
+  /// is safe to drop because nothing mints it again unless the SAME handle
+  /// reappears (the same object — the handle embeds a generation counter), and a
+  /// departed-and-returned directory minting a fresh id is the conservative
+  /// direction: the Monitor treats identity inequality as a replacement, never a
+  /// false survivor. Descendants are NOT touched: their parent link now points at
+  /// an absent handle, so their walk fails and they evict lazily at their next
+  /// admission miss (and re-mint their own ids only if re-observed).
   pub(crate) fn forget(&mut self, fid: &Fid) {
     self.dirs.remove(fid.handle());
+    self.ids.remove(fid.handle());
   }
 
   /// Rebuilds the admission structure from a fresh full walk after a loss, then
   /// swaps it in — the simplest correct prune. Directories that vanished during
   /// the loss window are gone (the fresh walk did not observe them); directories
-  /// the firehose missed during the window are present (the walk did). The
-  /// intern table is untouched, so every identity stays stable across the
-  /// reseed. A `FAN_Q_OVERFLOW` (or any lossy decode) funnels here so a covered
-  /// overflow can never become permanent blindness.
+  /// the firehose missed during the window are present (the walk did).
+  ///
+  /// A directory that PERSISTED through the loss keeps its interned id (it is
+  /// re-inserted by the fresh seed, and `intern` returns the existing id for a
+  /// known handle) — identity stays stable across a covered loss. A directory that
+  /// VANISHED during the loss has its id pruned here: the loss ate its delete
+  /// event, so `forget` never ran, and leaving its id would leak the table past
+  /// O(live directories). The prune keeps live ids and drops only departed ones,
+  /// so a reappearance still mints a fresh identity (the conservative direction).
+  /// A `FAN_Q_OVERFLOW` (or any lossy decode) funnels here so a covered overflow
+  /// can never become permanent blindness.
   pub(crate) fn reseed(&mut self, entries: impl IntoIterator<Item = SeedEntry>) {
     self.dirs.clear();
     self.seed(entries);
+    // Drop ids for directories the fresh walk did not re-observe (vanished across
+    // the loss). Live directories were just re-seeded, so they survive the retain
+    // with their ids intact.
+    let dirs = &self.dirs;
+    self.ids.retain(|handle, _| dirs.contains_key(handle));
   }
 
   /// Whether `fid` is an admitted directory whose ancestry still reaches the
@@ -230,6 +266,14 @@ impl FidMap {
   #[cfg(test)]
   pub(crate) fn dir_count(&self) -> usize {
     self.dirs.len()
+  }
+
+  /// The number of interned identities — the intern table's footprint. Bounded by
+  /// the live directory count (file target FIDs are never interned, and a
+  /// forgotten directory's id is pruned), so churn of files leaves it unchanged.
+  #[cfg(test)]
+  pub(crate) fn interned_count(&self) -> usize {
+    self.ids.len()
   }
 
   /// Resolves a directory handle to its absolute path by walking parent links
