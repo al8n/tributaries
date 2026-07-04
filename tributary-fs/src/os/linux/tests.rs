@@ -109,12 +109,35 @@ fn mountinfo_unescapes_octal_fields() {
   assert_eq!(mounts, vec![std::path::PathBuf::from("/mnt/with space")]);
 }
 
+/// The shared locality gate's decision function — the pure kernel the linux
+/// spawn dispatcher runs ONCE before backend selection (so Auto, forced
+/// Fanotify, and forced Inotify all refuse a denied magic identically, and no
+/// denied root ever reaches the fanotify probe or its spawn). Every denylisted
+/// magic must refuse; representative local filesystems must pass.
 #[test]
 fn remote_fs_magics_are_refused_and_local_ones_pass() {
-  assert!(fs_type_is_remote(0x6969), "NFS");
-  assert!(fs_type_is_remote(0xFF53_4D42), "CIFS");
-  assert!(fs_type_is_remote(0x6573_5546), "FUSE");
+  // The whole denylist (each `REMOTE_FS_MAGICS` entry) must be refused — a gap
+  // here is a filesystem that would go live blind to other hosts' writes.
+  for (magic, name) in [
+    (0x6969_i64, "NFS"),
+    (0x517B, "SMB"),
+    (0xFE53_4D42, "SMB2"),
+    (0xFF53_4D42, "CIFS"),
+    (0x6573_5546, "FUSE"),
+    (0x0102_1997, "9P"),
+    (0x5346_414F, "AFS"),
+    (0x7375_7245, "CODA"),
+    (0x00C3_6400, "CEPH"),
+    (0x564C, "NCP"),
+  ] {
+    assert!(fs_type_is_remote(magic), "{name} must be refused");
+  }
+  // Representative local/native filesystems must pass unchanged.
   assert!(!fs_type_is_remote(0xEF53), "ext4 is local");
   assert!(!fs_type_is_remote(0x0102_1994), "tmpfs is local");
   assert!(!fs_type_is_remote(0x9123_683E), "btrfs is local");
+  assert!(
+    !fs_type_is_remote(0x794C_7630),
+    "overlayfs is local (a probe refusal, not a locality one)"
+  );
 }

@@ -940,22 +940,19 @@ impl DriverCore {
       return;
     };
     state.refresh_pending = false;
-    if state.refresh_stale {
-      // A newer loss overlapped this read: its snapshot may predate that
-      // window, so it is discarded and one more refresh runs. The root-death
-      // check waits for that fresh read too — its liveness view is equally
-      // stale, and a genuine death survives to be seen there.
-      state.refresh_stale = false;
-      Self::trust_lost(&mut self.effects, scope, state);
-      return;
-    }
 
-    // Root-death check first: a dead root's mounts are moot, and the death
-    // lowers through the SAME self-event path a `RootChanged` probe uses —
-    // terminal Removed + Rescan, then the scope's registry reclamation. Only a
-    // barrier-known identity can be compared (an off-unix fake has none).
+    // Root-liveness FIRST, unconditionally — BEFORE the stale gate. A dead root
+    // is terminal: mount-set staleness is irrelevant to it (a root that vanished
+    // at the read's snapshot vanished, full stop), so the death evidence must
+    // never be discarded by a stale flag. Under an interval shorter than refresh
+    // latency (or a backed-up pool) EVERY completion is stale-marked, so gating
+    // the death check on `!stale` would let a quiet unmount stay live forever —
+    // the exact hole the tick exists to close. The death lowers through the SAME
+    // self-event path a `RootChanged` probe uses (terminal Removed/Rescan, then
+    // registry reclamation). Only a barrier-known identity can be compared (an
+    // off-unix fake has none).
     let death = state.identity.and_then(|expected| match refresh.root {
-      // Present and unchanged: alive, continue to the mount union.
+      // Present and unchanged: alive, continue to the mount table below.
       RootLiveness::Present(live) if live == expected => None,
       // Present but a different object, or unreadable: the path no longer names
       // the watched object — MoveSelf, exactly as a `RootChanged` probe
@@ -970,9 +967,22 @@ impl DriverCore {
       return;
     }
 
-    // The root is alive past the death gate: (re)arm its liveness tick — this
-    // seeds it at the birth refresh and re-seeds it after every later refresh,
-    // regardless of whether the mount table itself could be read below.
+    // The root is alive past the death gate. The stale gate now governs ONLY the
+    // mount-TABLE install + authority restore (its actual purpose): a newer loss
+    // overlapped this read, so its snapshot may predate the lost window — the
+    // table is discarded and one more refresh runs, keeping device trust closed.
+    // Liveness is already settled above, so a stale-but-alive completion does not
+    // touch it here (the re-armed refresh, or the next tick, re-seeds the
+    // deadline).
+    if state.refresh_stale {
+      state.refresh_stale = false;
+      Self::trust_lost(&mut self.effects, scope, state);
+      return;
+    }
+
+    // Alive and current: (re)arm the liveness tick — the birth refresh seeds it
+    // and every later refresh re-seeds it, regardless of whether the mount table
+    // itself could be read below.
     Self::arm_liveness(state, interval, now);
 
     if !refresh.authoritative {

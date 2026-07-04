@@ -301,30 +301,15 @@ impl Source {
   /// A passing probe leaves the fanotify instance CREATED and its superblock
   /// mark INSTALLED; that fd is handed straight to the fanotify source, which
   /// reuses it — the mark is never installed twice.
+  ///
+  /// Canonicalization and the locality/remote refusal (design §5 row 1) run
+  /// HERE, once, before any backend is selected: a network/virtual filesystem
+  /// reports only local VFS activity, so every backend must refuse it
+  /// identically. Centralizing the gate ahead of the Auto probe is what stops a
+  /// remote fs that happens to accept a `FAN_MARK_FILESYSTEM` mark and export
+  /// handles from passing the probe and going live blind to other hosts' writes.
   pub(crate) fn spawn(
     config: super::SourceConfig,
-  ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
-    match config.backend {
-      super::Backend::Inotify => Self::spawn_inotify(config),
-      super::Backend::Fanotify => Self::spawn_probed(config, false),
-      super::Backend::Auto => Self::spawn_probed(config, true),
-    }
-  }
-
-  /// The inotify branch (no probe).
-  fn spawn_inotify(
-    config: super::SourceConfig,
-  ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
-    let (handle, rx, meta) = inotify_source::Source::spawn(config)?;
-    Ok((SourceHandle::Inotify(handle), rx, meta))
-  }
-
-  /// The probed branch, shared by `Auto` and forced `Fanotify`: canonicalize
-  /// once, run the fanotify precondition probe, and either spawn fanotify
-  /// reusing the probed fd, or handle the failure per `fall_back`.
-  fn spawn_probed(
-    config: super::SourceConfig,
-    fall_back: bool,
   ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
     if config.roots.is_empty() {
       return Err(super::SourceError::NoRoots);
@@ -335,7 +320,41 @@ impl Source {
         root: supplied.clone(),
         source,
       })?;
+    if is_remote_fs(&canonical)? {
+      return Err(super::SourceError::RootUnavailable {
+        root: canonical,
+        source: std::io::Error::new(
+          std::io::ErrorKind::Unsupported,
+          "network and virtual filesystems deliver no reliable events",
+        ),
+      });
+    }
 
+    match config.backend {
+      super::Backend::Inotify => Self::spawn_inotify(config, canonical),
+      super::Backend::Fanotify => Self::spawn_probed(config, canonical, false),
+      super::Backend::Auto => Self::spawn_probed(config, canonical, true),
+    }
+  }
+
+  /// The inotify branch (no probe). `canonical` is the dispatcher's already
+  /// canonicalized, already locality-checked root.
+  fn spawn_inotify(
+    config: super::SourceConfig,
+    canonical: PathBuf,
+  ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
+    let (handle, rx, meta) = inotify_source::Source::spawn(config, canonical)?;
+    Ok((SourceHandle::Inotify(handle), rx, meta))
+  }
+
+  /// The probed branch, shared by `Auto` and forced `Fanotify`: run the fanotify
+  /// precondition probe on the dispatcher's `canonical` root and either spawn
+  /// fanotify reusing the probed fd, or handle the failure per `fall_back`.
+  fn spawn_probed(
+    config: super::SourceConfig,
+    canonical: PathBuf,
+    fall_back: bool,
+  ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
     match probe::probe_fanotify(&canonical) {
       Ok(probed) => {
         let (handle, rx, meta) = fanotify::Source::spawn(config, canonical, probed.fd)?;
@@ -343,10 +362,23 @@ impl Source {
       }
       // Auto falls through to the universal backend; a forced `Fanotify` never
       // silently downgrades — it surfaces which precondition failed.
-      Err(_) if fall_back => Self::spawn_inotify(config),
+      Err(_) if fall_back => Self::spawn_inotify(config, canonical),
       Err(stage) => Err(probe::probe_error(stage)),
     }
   }
+}
+
+/// Whether the filesystem holding `path` is a refused remote/virtual kind — the
+/// shared locality gate every backend passes through the dispatcher (design §5
+/// row 1). `StatFs.f_type` is the same `__fsword_t` field the denylist keys on
+/// (`REMOTE_FS_MAGICS`), so the magic-number comparison is unchanged.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn is_remote_fs(path: &Path) -> Result<bool, super::SourceError> {
+  let stat = rustix::fs::statfs(path).map_err(|err| super::SourceError::RootUnavailable {
+    root: path.to_path_buf(),
+    source: err.into(),
+  })?;
+  Ok(fs_type_is_remote(stat.f_type as i64))
 }
 
 /// A live Linux source, one variant per backend. Dropping it tears the reader
@@ -412,7 +444,7 @@ mod inotify_source {
 
   use std::{
     ffi::OsString,
-    fs, io,
+    fs,
     os::{fd::OwnedFd, unix::fs::MetadataExt},
     sync::{Arc, mpsc},
     thread::JoinHandle,
@@ -422,7 +454,7 @@ mod inotify_source {
 
   use super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
-    ExpectedObject, WatchOutcome, fs_type_is_remote, mounts_under,
+    ExpectedObject, WatchOutcome, mounts_under,
     wake::WakeState,
   };
   use crate::os::MAX_EXCLUSIONS;
@@ -467,37 +499,19 @@ mod inotify_source {
     /// delivered (and nothing missed) before the Monitor's own watch flow
     /// runs.
     ///
-    /// Barrier order mirrors the macOS bracket: refuse remote/virtual
-    /// filesystems, canonicalize, capture the root identity and mount seed
-    /// strictly before the fd exists, then re-stat once the reader is live —
-    /// a root replaced across the gap is torn down and rejected, never
-    /// committed.
+    /// `canonical` is the dispatcher's already canonicalized, already
+    /// locality-checked root (design §5 row 1 runs once, before selection). The
+    /// remaining barrier work mirrors the macOS bracket: capture the root
+    /// identity and mount seed strictly before the fd exists, then re-stat once
+    /// the reader is live — a root replaced across the gap is torn down and
+    /// rejected, never committed.
     pub(crate) fn spawn(
       config: SourceConfig,
+      canonical: std::path::PathBuf,
     ) -> Result<(SourceHandle, super::super::EventReceiver, RootMeta), SourceError> {
-      if config.roots.is_empty() {
-        return Err(SourceError::NoRoots);
-      }
       if config.exclusions.len() > MAX_EXCLUSIONS {
         return Err(SourceError::TooManyExclusions {
           supplied: config.exclusions.len(),
-        });
-      }
-
-      let supplied = &config.roots[0];
-      let canonical =
-        fs::canonicalize(supplied).map_err(|source| SourceError::RootUnavailable {
-          root: supplied.clone(),
-          source,
-        })?;
-
-      if is_remote_fs(&canonical)? {
-        return Err(SourceError::RootUnavailable {
-          root: canonical,
-          source: io::Error::new(
-            io::ErrorKind::Unsupported,
-            "network and virtual filesystems deliver no reliable events",
-          ),
         });
       }
 
@@ -577,17 +591,6 @@ mod inotify_source {
       };
       Ok((handle, queue_rx, meta))
     }
-  }
-
-  /// Whether the filesystem holding `path` is a refused remote/virtual kind.
-  /// `StatFs.f_type` is the same `__fsword_t` field the denylist keys on
-  /// (`REMOTE_FS_MAGICS`), so the magic-number comparison is unchanged.
-  fn is_remote_fs(path: &std::path::Path) -> Result<bool, SourceError> {
-    let stat = rustix::fs::statfs(path).map_err(|err| SourceError::RootUnavailable {
-      root: path.to_path_buf(),
-      source: err.into(),
-    })?;
-    Ok(fs_type_is_remote(stat.f_type as i64))
   }
 
   /// The clonable arm/disarm port of a live source: the control channel plus

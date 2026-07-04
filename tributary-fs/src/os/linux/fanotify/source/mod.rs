@@ -60,9 +60,10 @@ impl Source {
       });
     }
 
-    // The probed FILESYSTEM mark already proved the filesystem is handle- and
-    // superblock-mark-capable (a remote/virtual fs fails the mark probe); this
-    // statfs only reads the `f_fsid` the seed FIDs must match byte-for-byte.
+    // The dispatcher's shared locality gate (design §5 row 1) already refused a
+    // remote/virtual root, and the probe's FILESYSTEM mark proved the fs is
+    // handle- and superblock-mark-capable; this statfs only reads the `f_fsid`
+    // the seed FIDs must match byte-for-byte.
     let fsid = superblock_fsid(&canonical)?;
 
     let meta = fs::metadata(&canonical).map_err(|source| SourceError::RootUnavailable {
@@ -167,9 +168,9 @@ impl Source {
 }
 
 /// Reads `path`'s superblock `f_fsid` bytes — the event-FID scope, laid out so
-/// seed FIDs match event FIDs byte-for-byte. The `f_type` allowlist gate the
-/// inotify sibling runs is unnecessary here: the probe's FILESYSTEM mark already
-/// refused any filesystem that cannot export handles (a remote/virtual fs).
+/// seed FIDs match event FIDs byte-for-byte. The locality `f_type` refusal is
+/// not repeated here: the dispatcher runs it once, before backend selection
+/// (design §5 row 1), so a remote/virtual root never reaches this spawn.
 ///
 /// Stays on libc `statfs`: rustix's `StatFs` keeps `f_fsid` behind a private
 /// field with no accessor, so the FID-seeding fsid — like the sibling
