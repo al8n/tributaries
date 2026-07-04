@@ -40,6 +40,13 @@ pub(crate) const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 /// The subject of the event is a directory.
 pub(crate) const FAN_ONDIR: u64 = 0x4000_0000;
 
+/// `EOVERFLOW` (Linux `asm-generic`): `name_to_handle_at`'s "your buffer was too
+/// small" answer, returned AFTER it establishes a handle exists and writes the
+/// required byte count back into `handle_bytes`. Restated locally so this pure
+/// module carries no libc dependency; the FFI layer cross-asserts it against
+/// libc. Errno-only, never a mask bit, hence its distance from the `FAN_*` set.
+pub(crate) const EOVERFLOW: i32 = 75;
+
 /// A record carrying a bare FID (the affected object's own handle, e.g. the
 /// child's `FAN_REPORT_TARGET_FID` on a create).
 pub(crate) const FAN_EVENT_INFO_TYPE_FID: u8 = 1;
@@ -356,6 +363,39 @@ fn decode_fid_record(payload: &[u8], has_name: bool) -> Option<FidRecord> {
   };
 
   Some(FidRecord { fid, name })
+}
+
+/// What to do after one `name_to_handle_at` attempt, given its return code, its
+/// errno on failure, and whether the buffer was ALREADY grown once by a prior
+/// `EOVERFLOW`. Pure so the per-errno decision is testable without a live
+/// syscall — the FFI wrapper supplies the raw outcome and executes the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandleAttempt {
+  /// `rc == 0`: the handle is fully encoded at the buffer's `handle_bytes`.
+  Encoded,
+  /// `EOVERFLOW` on the FIRST try: the kernel wrote the required size into
+  /// `handle_bytes` and proved a handle exists — grow the buffer to that size
+  /// and retry exactly once.
+  Grow,
+  /// The filesystem cannot encode a handle for this object: any errno other
+  /// than `EOVERFLOW`, OR a SECOND `EOVERFLOW` (the kernel asking to grow again
+  /// after already sizing the buffer to its own reported requirement — a lying
+  /// kernel, treated as failure rather than looped on).
+  Unsupported,
+}
+
+/// The pure `name_to_handle_at` outcome → next-action decision. `EOVERFLOW`
+/// (and only `EOVERFLOW`) proves a handle exists; the first one asks to grow,
+/// a second is a broken kernel. `rc == 0` is the encoded handle; every other
+/// errno is a non-exporting (or transient/permission) failure.
+pub(crate) fn classify_handle_attempt(rc: i32, errno: Option<i32>, grown: bool) -> HandleAttempt {
+  if rc == 0 {
+    return HandleAttempt::Encoded;
+  }
+  match (errno == Some(EOVERFLOW), grown) {
+    (true, false) => HandleAttempt::Grow,
+    _ => HandleAttempt::Unsupported,
+  }
 }
 
 #[cfg(test)]

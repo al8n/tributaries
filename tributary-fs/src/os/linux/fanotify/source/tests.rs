@@ -35,6 +35,16 @@ mod libc_cross_assert {
   }
 
   #[test]
+  fn eoverflow_matches_libc() {
+    assert_eq!(
+      fid::EOVERFLOW,
+      libc::EOVERFLOW,
+      "the locally-restated EOVERFLOW must track libc so the handle-sizing retry \
+       fires on the real errno"
+    );
+  }
+
+  #[test]
   fn info_record_tags_match_libc() {
     assert_eq!(fid::FAN_EVENT_INFO_TYPE_FID, libc::FAN_EVENT_INFO_TYPE_FID);
     assert_eq!(

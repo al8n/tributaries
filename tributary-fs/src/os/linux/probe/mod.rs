@@ -20,7 +20,6 @@
 //! discriminator (it is what returns `EPERM` without `CAP_SYS_ADMIN`).
 
 use std::{
-  io,
   os::{
     fd::{AsRawFd, FromRawFd, OwnedFd},
     unix::ffi::OsStrExt,
@@ -112,55 +111,21 @@ fn mark_filesystem(fd: &OwnedFd, root: &Path) -> Result<(), ()> {
   if rc != 0 { Err(()) } else { Ok(()) }
 }
 
-/// Row 5: whether the root's filesystem can encode a file handle for it. ONLY
-/// two outcomes prove handle support: `name_to_handle_at` succeeding (`rc == 0`),
-/// or failing with `EOVERFLOW` — the "your buffer was too small" answer, which
-/// the kernel returns AFTER establishing that a handle exists. The buffer here
-/// is already `MAX_HANDLE_SZ`, so `EOVERFLOW` is not expected, but accepting it
-/// keeps the row honest against any oversized-handle filesystem.
+/// Row 5: whether the root's filesystem can actually encode a file handle for
+/// it — the FID map's seeding precondition. This runs the SAME dynamically-sized
+/// [`encode_handle`](super::fanotify::encode_handle) the seed walk uses, so the
+/// probe's success is the real handle round-trip succeeding at the filesystem's
+/// TRUE handle size, not a weaker "an EOVERFLOW proves a handle exists" signal:
+/// an oversized-handle filesystem (larger than `MAX_HANDLE_SZ`) answered
+/// `EOVERFLOW` before, which the old row accepted as proof — yet the fixed-buffer
+/// seed then failed to encode and turned the whole spawn fatal. Retrying at the
+/// kernel-reported size in both places keeps the probe and the seed in lockstep.
 ///
-/// Every OTHER errno fails the probe. `EOPNOTSUPP` is the filesystem plainly not
-/// exporting handles, but `EACCES`/`ESTALE`/`ENOENT`/`EINVAL`/`ENOMEM` and the
-/// rest do NOT prove support — treating them as success (the earlier behavior)
-/// let a transient or permission failure admit a root the FID map could never
-/// seed, producing a live source that then drops everything as outside-root.
-/// A failed row falls to inotify under `Auto`, or surfaces the typed probe-stage
-/// error under forced `Fanotify`.
+/// A failure here (a non-exporting filesystem, a permission/transient error, or
+/// the double-`EOVERFLOW` broken-kernel case) falls to inotify under `Auto`, or
+/// surfaces the typed probe-stage error under forced `Fanotify` — never a
+/// live-but-empty source (an admitted root the FID map can never seed, which
+/// would drop every event as outside-root).
 fn root_exports_handle(root: &Path) -> bool {
-  let Ok(cpath) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
-    return false;
-  };
-  let prefix = std::mem::size_of::<libc::file_handle>();
-  let cap = libc::MAX_HANDLE_SZ as usize;
-  let words = prefix.div_ceil(8) + cap.div_ceil(8) + 1;
-  let mut storage = vec![0u64; words];
-  let mut mount_id: libc::c_int = 0;
-  let handle = storage.as_mut_ptr().cast::<libc::file_handle>();
-  // SAFETY: storage is 8-aligned and sized for the fixed prefix plus
-  // MAX_HANDLE_SZ opaque bytes; this write stays within it.
-  unsafe {
-    (*handle).handle_bytes = cap as libc::c_uint;
-  }
-  // SAFETY: handle points at a correctly-sized, aligned file_handle; cpath is
-  // NUL-terminated; mount_id is a valid out-param.
-  let rc =
-    unsafe { libc::name_to_handle_at(libc::AT_FDCWD, cpath.as_ptr(), handle, &mut mount_id, 0) };
-  let errno = (rc != 0)
-    .then(|| io::Error::last_os_error().raw_os_error())
-    .flatten();
-  handle_support_proven(rc, errno)
+  super::fanotify::encode_handle(root).is_some()
 }
-
-/// The pure `name_to_handle_at` outcome → "handle support proven" decision, so
-/// the per-errno rows are testable without a live syscall. Support is proven ONLY
-/// by `rc == 0` or a failure whose errno is `EOVERFLOW`; every other errno fails
-/// the row.
-fn handle_support_proven(rc: libc::c_int, errno: Option<libc::c_int>) -> bool {
-  if rc == 0 {
-    return true;
-  }
-  errno == Some(libc::EOVERFLOW)
-}
-
-#[cfg(test)]
-mod tests;

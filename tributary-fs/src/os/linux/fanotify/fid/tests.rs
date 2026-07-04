@@ -1,7 +1,8 @@
 use super::{
-  DecodeOutcome, FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_EVENT_INFO_TYPE_DFID_NAME,
+  DecodeOutcome, EOVERFLOW, FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_EVENT_INFO_TYPE_DFID_NAME,
   FAN_EVENT_INFO_TYPE_FID, FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
-  FAN_ONDIR, FAN_Q_OVERFLOW, FAN_RENAME, Fid, decode_events,
+  FAN_ONDIR, FAN_Q_OVERFLOW, FAN_RENAME, Fid, HandleAttempt, classify_handle_attempt,
+  decode_events,
 };
 
 /// One `struct file_handle`: `handle_bytes` (u32), `handle_type` (i32), then
@@ -244,4 +245,73 @@ fn fid_equality_is_byte_exact() {
   assert_ne!(a, b, "same fsid, different handle = different object");
   assert_ne!(a, c, "different fsid = different object");
   assert_eq!(a, a2, "identical bytes = same object");
+}
+
+/// The `name_to_handle_at` dynamic-sizing decision table (the sole errno logic
+/// behind both the `Backend::Auto` probe's row 5 and the seed/reseed walk's
+/// handle read). `rc == 0` is the encoded handle; the FIRST `EOVERFLOW` proves a
+/// handle exists and asks to grow; every other errno is unsupported.
+#[test]
+fn handle_attempt_decision_table() {
+  // Success at the first try — encoded, regardless of a stale errno.
+  assert_eq!(
+    classify_handle_attempt(0, None, false),
+    HandleAttempt::Encoded
+  );
+  assert_eq!(
+    classify_handle_attempt(0, Some(EOVERFLOW), false),
+    HandleAttempt::Encoded,
+    "rc == 0 is success even if last_os_error still reads a stale EOVERFLOW"
+  );
+
+  // First EOVERFLOW: the buffer was too small but a handle exists — grow once.
+  assert_eq!(
+    classify_handle_attempt(-1, Some(EOVERFLOW), false),
+    HandleAttempt::Grow
+  );
+
+  // Success AT the retry (rc == 0 after having grown) still encodes.
+  assert_eq!(
+    classify_handle_attempt(0, None, true),
+    HandleAttempt::Encoded,
+    "the grown retry succeeding is a normal encode"
+  );
+
+  // A SECOND EOVERFLOW (already grown to the kernel's own reported size): a
+  // lying kernel — fail rather than loop forever.
+  assert_eq!(
+    classify_handle_attempt(-1, Some(EOVERFLOW), true),
+    HandleAttempt::Unsupported,
+    "a double EOVERFLOW is a broken kernel, never a second grow"
+  );
+
+  // Every other errno fails the row, grown or not — a non-exporting filesystem
+  // (EOPNOTSUPP) or a transient/permission failure is NOT handle support, so it
+  // must never admit a root the FID map cannot seed.
+  for errno in [
+    libc::EOPNOTSUPP,
+    libc::EACCES,
+    libc::ESTALE,
+    libc::ENOENT,
+    libc::EINVAL,
+    libc::ENOMEM,
+    libc::EPERM,
+  ] {
+    assert_eq!(
+      classify_handle_attempt(-1, Some(errno), false),
+      HandleAttempt::Unsupported,
+      "errno {errno} must not prove handle support"
+    );
+    assert_eq!(
+      classify_handle_attempt(-1, Some(errno), true),
+      HandleAttempt::Unsupported,
+      "errno {errno} after a grow is still unsupported"
+    );
+  }
+
+  // A failure with no decodable errno also fails the row.
+  assert_eq!(
+    classify_handle_attempt(-1, None, false),
+    HandleAttempt::Unsupported
+  );
 }
