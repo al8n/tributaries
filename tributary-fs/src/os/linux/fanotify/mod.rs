@@ -337,26 +337,74 @@ pub(super) const FAN_MARK_MASK: u64 = fid::FAN_CREATE
   | fid::FAN_MOVE_SELF
   | fid::FAN_ONDIR;
 
-/// Encodes `path`'s NFS-style file handle via `name_to_handle_at`, DYNAMICALLY
-/// sizing the buffer: `struct file_handle` is a flexible-array type, and a
-/// filesystem whose handle exceeds the initial `MAX_HANDLE_SZ` request answers
-/// `EOVERFLOW` with the true size written back into `handle_bytes` — so a single
-/// fixed buffer would turn an oversized-handle filesystem (which CAN export
-/// handles) into a spurious "unsupported". The loop grows to the reported size
-/// and retries exactly once; a second `EOVERFLOW` is a lying kernel and fails.
+/// Encodes `path`'s NFS-style file handle via `name_to_handle_at(AT_FDCWD,
+/// path)`. The PATH-based encoder, kept for the pre-live single-shot callers
+/// that have no fd to pin — the `Backend::Auto` probe (which runs on the
+/// canonical root before any stream is live). The live seed/reseed WALK must
+/// never resolve a name after the mark goes live (a same-superblock swap could
+/// redirect it outside the root — the objects-not-paths invariant on
+/// [`source`]), so it uses the fd-relative [`encode_handle_at`] on an
+/// already-pinned directory fd instead.
 ///
-/// Returns the FID handle bytes — `handle_type` (native-endian) followed by the
-/// opaque bytes — byte-identical to the event-side decode, so a seed FID matches
-/// the kernel's event FIDs exactly. `None` when the filesystem cannot encode a
-/// handle for this object (a non-exporting fs, a permission/transient failure,
-/// or the double-`EOVERFLOW` broken-kernel case). Shared by the seed/reseed walk
-/// (which wraps it into a [`fid::Fid`]) and the `Backend::Auto` probe (whose
-/// success is this same round-trip succeeding at the true size).
+/// See [`encode_handle_sized`] for the dynamic `EOVERFLOW`-retry sizing and the
+/// returned byte layout.
 #[cfg(all(target_os = "linux", not(miri)))]
 pub(super) fn encode_handle(path: &std::path::Path) -> Option<std::boxed::Box<[u8]>> {
   use std::os::unix::ffi::OsStrExt;
 
   let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+  // SAFETY: cpath lives for this call; AT_FDCWD is a valid dirfd; no AT_EMPTY_PATH
+  // means the path name (not the dirfd) is resolved, from the cwd.
+  unsafe { encode_handle_sized(libc::AT_FDCWD, cpath.as_ptr(), 0) }
+}
+
+/// Encodes the file handle of the directory `dirfd` ITSELF via
+/// `name_to_handle_at(dirfd, "", AT_EMPTY_PATH)` — the fd-relative encoder the
+/// live walk uses. Because it names no path, no post-live name resolution can
+/// redirect it: the handle is taken from exactly the object the caller pinned
+/// (opened `O_NOFOLLOW` and fstat-verified on the root device), so a foreign
+/// directory swapped in for a listed name can never have its handle seed the
+/// admission map (the scope-fence invariant on [`source`]). Same dynamic
+/// `EOVERFLOW`-retry sizing and byte layout as [`encode_handle`].
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(super) fn encode_handle_at(
+  dirfd: std::os::fd::BorrowedFd<'_>,
+) -> Option<std::boxed::Box<[u8]>> {
+  use std::os::fd::AsRawFd;
+
+  // SAFETY: the empty C string literal lives for the call; `dirfd` is a live open
+  // directory fd (the caller pins it before this); AT_EMPTY_PATH makes the call
+  // operate on `dirfd` directly rather than resolving a name under it.
+  unsafe { encode_handle_sized(dirfd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH) }
+}
+
+/// The shared `name_to_handle_at` core, DYNAMICALLY sizing the buffer: `struct
+/// file_handle` is a flexible-array type, and a filesystem whose handle exceeds
+/// the initial `MAX_HANDLE_SZ` request answers `EOVERFLOW` with the true size
+/// written back into `handle_bytes` — so a single fixed buffer would turn an
+/// oversized-handle filesystem (which CAN export handles) into a spurious
+/// "unsupported". The loop grows to the reported size and retries exactly once;
+/// a second `EOVERFLOW` is a lying kernel and fails.
+///
+/// `dirfd`/`cpath`/`at_flags` are passed straight to `name_to_handle_at`: the
+/// path encoder passes `(AT_FDCWD, path, 0)`, the fd encoder passes `(fd, "",
+/// AT_EMPTY_PATH)`. Returns the FID handle bytes — `handle_type` (native-endian)
+/// followed by the opaque bytes — byte-identical to the event-side decode, so a
+/// seed FID matches the kernel's event FIDs exactly. `None` when the filesystem
+/// cannot encode a handle for this object (a non-exporting fs, a
+/// permission/transient failure, or the double-`EOVERFLOW` broken-kernel case).
+///
+/// # Safety
+///
+/// `cpath` must be a valid NUL-terminated pointer that stays live for the call,
+/// and `dirfd` must be `AT_FDCWD` or a valid open directory fd matching
+/// `at_flags` (an empty path requires `AT_EMPTY_PATH`).
+#[cfg(all(target_os = "linux", not(miri)))]
+unsafe fn encode_handle_sized(
+  dirfd: libc::c_int,
+  cpath: *const libc::c_char,
+  at_flags: libc::c_int,
+) -> Option<std::boxed::Box<[u8]>> {
   let prefix = std::mem::size_of::<libc::file_handle>();
   // Start at MAX_HANDLE_SZ (the common case fits in one try); a larger handle
   // grows the buffer to the kernel-reported size on the single retry below.
@@ -376,9 +424,9 @@ pub(super) fn encode_handle(path: &std::path::Path) -> Option<std::boxed::Box<[u
       (*handle).handle_bytes = cap as libc::c_uint;
     }
     // SAFETY: handle points at a correctly-sized, aligned file_handle; cpath is
-    // NUL-terminated; mount_id is a valid out-param.
-    let rc =
-      unsafe { libc::name_to_handle_at(libc::AT_FDCWD, cpath.as_ptr(), handle, &mut mount_id, 0) };
+    // a valid NUL-terminated pointer for `at_flags`; mount_id is a valid
+    // out-param; dirfd is AT_FDCWD or a live directory fd (caller contract).
+    let rc = unsafe { libc::name_to_handle_at(dirfd, cpath, handle, &mut mount_id, at_flags) };
     let errno = (rc != 0)
       .then(|| std::io::Error::last_os_error().raw_os_error())
       .flatten();
