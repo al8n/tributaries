@@ -11,6 +11,25 @@
 //! the driver's queue as [`RawLinuxEvent`]s inside the unified
 //! [`SourceEvent`](super::SourceEvent) payload, and the driver routes arm
 //! traffic to the reader through the scope's [`ControlPort`].
+//!
+//! # Two FFI styles, one boundary
+//!
+//! The syscalls split into two families, and the split is deliberate:
+//!
+//! - **rustix (io-safe, owned/borrowed fds)** for everything it covers — the
+//!   inotify instance and watches ([`rustix::fs::inotify`]), the `poll` and
+//!   `eventfd` wakeup ([`rustix::event`]), the transient `O_PATH` anchor opens
+//!   ([`rustix::fs::openat`]), and the `statfs` filesystem-type gate that refuses
+//!   remote/virtual roots (reads the public `f_type`), plus the reads on the
+//!   source fds ([`rustix::io::read`]). Errors surface as [`rustix::io::Errno`],
+//!   mapped to the crate's [`WatchError`](tributary_proto::WatchError)/
+//!   [`SourceError`] taxonomy exactly as the raw errnos were.
+//! - **raw libc** for the syscalls rustix v1.1 does NOT expose: ALL of fanotify
+//!   (`fanotify_init`/`fanotify_mark` — no rustix coverage), the file-handle pair
+//!   (`name_to_handle_at`/`open_by_handle_at` — the FID seeding walk), AND the
+//!   fanotify seed's `statfs` fsid read (rustix keeps `StatFs::f_fsid` behind a
+//!   private field with no accessor, so the FID scope cannot be read through it).
+//!   These keep their `unsafe` blocks and `io::Error::last_os_error` handling.
 // The fanotify backend (L4) consumes the remaining reserved surface; the
 // container suites exercise the parts a macOS host build cannot reach.
 #![allow(dead_code)]
@@ -20,6 +39,9 @@ pub(crate) mod inotify;
 
 #[cfg(all(target_os = "linux", not(miri)))]
 mod probe;
+
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) mod wake;
 
 #[cfg(test)]
 mod tests;
@@ -236,6 +258,9 @@ pub(crate) enum WatchOutcome {
 // re-export as unused.
 #[cfg(all(target_os = "linux", not(miri)))]
 #[allow(unused_imports)]
+pub(crate) use inotify::reader::ControlOp;
+#[cfg(all(target_os = "linux", not(miri)))]
+#[allow(unused_imports)]
 pub(crate) use inotify_source::{AnchorRequest, ArmReply, ControlPort};
 
 /// The Linux spawn dispatcher: routes to the requested per-root backend. The
@@ -384,10 +409,11 @@ mod inotify_source {
   use super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
     WatchOutcome, fs_type_is_remote, mounts_under,
+    wake::WakeState,
   };
   use crate::os::MAX_EXCLUSIONS;
 
-  use super::inotify::reader::{self, Control, ReaderShared};
+  use super::inotify::reader::{self, Control, ControlOp, ReaderShared};
 
   /// One arm request: install a kernel watch for `watch` on the directory
   /// named by `name` under `parent` (`None` = `name` is the absolute canonical
@@ -475,14 +501,14 @@ mod inotify_source {
       });
 
       let fd = reader::create_instance()?;
-      let (wake_tx, wake_rx) = reader::wake_pipe()?;
+      let wake = WakeState::new()?;
       let (control_tx, control_rx) = mpsc::channel();
-      let thread = reader::start(fd, wake_rx, control_rx, Arc::clone(&shared));
+      let thread = reader::start(fd, Arc::clone(&wake), control_rx, Arc::clone(&shared));
 
       let handle = SourceHandle {
         port: ControlPort {
           control: control_tx,
-          wake: Arc::new(wake_tx),
+          wake,
         },
         thread: Some(thread),
       };
@@ -536,80 +562,92 @@ mod inotify_source {
   }
 
   /// Whether the filesystem holding `path` is a refused remote/virtual kind.
+  /// `StatFs.f_type` is the same `__fsword_t` field the denylist keys on
+  /// (`REMOTE_FS_MAGICS`), so the magic-number comparison is unchanged.
   fn is_remote_fs(path: &std::path::Path) -> Result<bool, SourceError> {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = path.as_os_str().as_bytes();
-    let cpath = std::ffi::CString::new(bytes).map_err(|_| SourceError::RootUnavailable {
+    let stat = rustix::fs::statfs(path).map_err(|err| SourceError::RootUnavailable {
       root: path.to_path_buf(),
-      source: io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"),
+      source: err.into(),
     })?;
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: cpath is a valid NUL-terminated path and buf is a zeroed
-    // statfs the call fully initializes on success.
-    let rc = unsafe { libc::statfs(cpath.as_ptr(), &mut buf) };
-    if rc != 0 {
-      return Err(SourceError::RootUnavailable {
-        root: path.to_path_buf(),
-        source: io::Error::last_os_error(),
-      });
-    }
-    Ok(fs_type_is_remote(buf.f_type as i64))
+    Ok(fs_type_is_remote(stat.f_type as i64))
   }
 
   /// The clonable arm/disarm port of a live source: the control channel plus
-  /// its wake pipe. Executors on the blocking pool hold one of these per
+  /// its wake state. Executors on the blocking pool hold one of these per
   /// scope, so arm traffic never needs the (non-clonable, teardown-owning)
   /// [`SourceHandle`] itself.
   #[derive(Debug, Clone)]
   pub(crate) struct ControlPort {
     control: mpsc::Sender<Control>,
-    wake: Arc<OwnedFd>,
+    wake: Arc<WakeState>,
   }
 
   impl ControlPort {
-    /// Installs (or aliases) a kernel watch for the request's Monitor watch.
-    /// Executed by the reader thread — the fd and the `wd` table are
-    /// single-threaded by construction. Blocks until the reader replies;
+    /// Sends one batch of arms/disarms and returns the arms' outcomes in order
+    /// (index-aligned to the `Arm` entries — disarms produce no reply). One
+    /// message, one potential wake, N results: the reader executes the whole
+    /// batch in a single pass between reads. Blocks until the reader replies;
     /// callers run it on the blocking pool. A dead reader answers `Failed(Io)`
-    /// — the scope's stream death carries the real signal.
-    pub(crate) fn add_watch(&self, request: AnchorRequest) -> ArmReply {
+    /// for every arm — the scope's stream death carries the real signal.
+    ///
+    /// Enqueue-then-conditional-wake is the wake-elision contract: the message
+    /// lands on the channel BEFORE [`WakeState::wake_if_parked`] checks the
+    /// park flag, so a reader about to block cannot miss it (the lost-wakeup
+    /// argument lives on [`WakeState`]).
+    pub(crate) fn batch(&self, ops: Vec<ControlOp>) -> Vec<ArmReply> {
+      let arm_count = ops
+        .iter()
+        .filter(|op| matches!(op, ControlOp::Arm(_)))
+        .count();
       let (reply_tx, reply_rx) = mpsc::sync_channel(1);
       if self
         .control
-        .send(Control::AddWatch {
-          request,
+        .send(Control::Batch {
+          ops,
           reply: reply_tx,
         })
         .is_err()
       {
-        return ArmReply {
+        return dead_replies(arm_count);
+      }
+      self.wake.wake_if_parked();
+      reply_rx.recv().unwrap_or_else(|_| dead_replies(arm_count))
+    }
+
+    /// Installs (or aliases) one kernel watch. A single-entry [`batch`]; the
+    /// smoke suites arm one watch at a time.
+    ///
+    /// [`batch`]: Self::batch
+    #[cfg(test)]
+    pub(crate) fn add_watch(&self, request: AnchorRequest) -> ArmReply {
+      self
+        .batch(vec![ControlOp::Arm(request)])
+        .into_iter()
+        .next()
+        .unwrap_or(ArmReply {
           outcome: WatchOutcome::Failed(WatchError::Io),
           anchor: None,
-        };
-      }
-      reader::wake(&self.wake);
-      reply_rx.recv().unwrap_or(ArmReply {
-        outcome: WatchOutcome::Failed(WatchError::Io),
-        anchor: None,
-      })
+        })
     }
 
     /// Removes `anchor` from attribution, issuing the kernel removal when the
-    /// last alias drains. Blocks until the reader acknowledges.
+    /// last alias drains. A single-entry [`batch`].
+    ///
+    /// [`batch`]: Self::batch
+    #[cfg(test)]
     pub(crate) fn remove_watch(&self, anchor: WatchId) {
-      let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-      if self
-        .control
-        .send(Control::RemoveWatch {
-          anchor,
-          reply: reply_tx,
-        })
-        .is_ok()
-      {
-        reader::wake(&self.wake);
-        let _ = reply_rx.recv();
-      }
+      let _ = self.batch(vec![ControlOp::Disarm(anchor)]);
     }
+  }
+
+  /// A reader-is-dead reply for every arm in a batch that never landed.
+  fn dead_replies(arm_count: usize) -> Vec<ArmReply> {
+    (0..arm_count)
+      .map(|_| ArmReply {
+        outcome: WatchOutcome::Failed(WatchError::Io),
+        anchor: None,
+      })
+      .collect()
   }
 
   /// A live inotify source. Dropping it tears the reader down; prefer
@@ -626,11 +664,13 @@ mod inotify_source {
     }
 
     /// Installs (or aliases) a kernel watch. See [`ControlPort::add_watch`].
+    #[cfg(test)]
     pub(crate) fn add_watch(&self, request: AnchorRequest) -> ArmReply {
       self.port.add_watch(request)
     }
 
     /// Removes `anchor` from attribution. See [`ControlPort::remove_watch`].
+    #[cfg(test)]
     pub(crate) fn remove_watch(&self, anchor: WatchId) {
       self.port.remove_watch(anchor)
     }
@@ -646,7 +686,7 @@ mod inotify_source {
         return;
       };
       let _ = self.port.control.send(Control::Shutdown);
-      reader::wake(&self.port.wake);
+      self.port.wake.wake();
       let _ = thread.join();
     }
   }

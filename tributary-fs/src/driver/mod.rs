@@ -295,6 +295,26 @@ pub(crate) trait ScopeRegistry: Send + Sync + 'static {
   ) -> Option<PathBuf>;
 }
 
+/// One arm or disarm collected from a single effect-drain cycle. The driver
+/// groups these per scope and dispatches each scope's run as ONE batch — one
+/// control message, one potential reader wake for N arms — while keeping each
+/// arm's individual reply (an [`Arm`](Self::Arm) still yields one
+/// [`WatchInstalled`](OpResult::WatchInstalled)). Emission order is preserved
+/// inside the batch so a disarm and a later re-arm of the same slot apply in
+/// the order the core produced them.
+pub(crate) enum ControlRequest {
+  /// Install a per-directory watch for `watch` (arming `parent`'s child
+  /// `name`, addressed by absolute `path`).
+  Arm {
+    watch: WatchId,
+    parent: WatchId,
+    name: Segment,
+    path: Arc<PathBuf>,
+  },
+  /// Remove `watch`'s per-directory watch (fire-and-forget; no reply).
+  Disarm { watch: WatchId },
+}
+
 /// The blocking-pool side of the platform: spawn, teardown, and stat. A
 /// test implementation runs the whole driver loop against a fake filesystem.
 pub(crate) trait FsOps: Clone + Send + Sync + 'static {
@@ -340,6 +360,32 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// Removes a per-directory kernel watch (blocking, fire-and-forget).
   fn remove_watch(&self, scope: ScopeId, watch: WatchId);
+
+  /// Executes one scope's batch of arms/disarms (blocking) and returns each
+  /// arm's outcome, in order. The default runs them one-by-one through
+  /// [`add_watch`](Self::add_watch)/[`remove_watch`](Self::remove_watch) — the
+  /// right shape for a fake with no transport; the real inotify source
+  /// overrides it to ship the whole batch as ONE control message so N arms cost
+  /// at most one reader wake.
+  fn batch_control(
+    &self,
+    scope: ScopeId,
+    requests: Vec<ControlRequest>,
+  ) -> Vec<(WatchId, WatchOutcome)> {
+    let mut outcomes = Vec::new();
+    for request in requests {
+      match request {
+        ControlRequest::Arm {
+          watch,
+          parent,
+          name,
+          path,
+        } => outcomes.push((watch, self.add_watch(scope, watch, parent, &path, &name))),
+        ControlRequest::Disarm { watch } => self.remove_watch(scope, watch),
+      }
+    }
+    outcomes
+  }
 
   /// Reads one directory — entries with their stat facts (blocking). Reached
   /// only under a descending profile; `watch` addresses the directory object
@@ -435,6 +481,44 @@ impl RealFs {
   pub(crate) fn new() -> Self {
     Self::default()
   }
+
+  /// Builds one arm request, resolving the parent's still-held transient anchor
+  /// so the open is object-correct even across a parent rename. A consumed (or
+  /// never-held) anchor falls back to the absolute path with ENOENT honesty —
+  /// the Monitor's NotFound path re-arms. The root is its own parent, and
+  /// `openat(anchor, name)` cannot re-open the anchor itself, so the root
+  /// always arms by absolute path.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn build_arm_request(
+    &self,
+    watch: WatchId,
+    parent: WatchId,
+    path: &Path,
+    name: &Segment,
+  ) -> crate::os::linux::AnchorRequest {
+    let parent_anchor = if parent == watch {
+      None
+    } else {
+      self
+        .anchors
+        .lock()
+        .unwrap()
+        .get(&parent)
+        .and_then(|(_, fd)| fd.try_clone().ok())
+    };
+    match parent_anchor {
+      Some(fd) => crate::os::linux::AnchorRequest {
+        watch,
+        parent: Some(fd),
+        name: std::ffi::OsString::from(name.as_str()),
+      },
+      None => crate::os::linux::AnchorRequest {
+        watch,
+        parent: None,
+        name: path.as_os_str().to_os_string(),
+      },
+    }
+  }
 }
 
 impl FsOps for RealFs {
@@ -524,42 +608,20 @@ impl FsOps for RealFs {
     path: &Path,
     name: &Segment,
   ) -> WatchOutcome {
-    let _ = name;
-    let Some(ScopePort::Inotify(port)) = self.ports.read().unwrap().get(&scope).cloned() else {
-      return WatchOutcome::Failed(WatchError::Gone);
-    };
-    // Prefer the parent's still-held transient anchor (object-correct even
-    // across a parent rename); a consumed anchor falls back to the absolute
-    // path with ENOENT honesty — the Monitor's NotFound path re-arms. The
-    // root is its own parent, and `openat(anchor, name)` cannot re-open the
-    // anchor itself — the root always arms by absolute path.
-    let parent_anchor = if parent == watch {
-      None
-    } else {
-      self
-        .anchors
-        .lock()
-        .unwrap()
-        .get(&parent)
-        .and_then(|(_, fd)| fd.try_clone().ok())
-    };
-    let request = match parent_anchor {
-      Some(fd) => crate::os::linux::AnchorRequest {
-        watch,
-        parent: Some(fd),
-        name: std::ffi::OsString::from(name.as_str()),
-      },
-      None => crate::os::linux::AnchorRequest {
-        watch,
-        parent: None,
-        name: path.as_os_str().to_os_string(),
-      },
-    };
-    let reply = port.add_watch(request);
-    if let Some(anchor) = reply.anchor {
-      self.anchors.lock().unwrap().insert(watch, (scope, anchor));
-    }
-    reply.outcome
+    self
+      .batch_control(
+        scope,
+        vec![ControlRequest::Arm {
+          watch,
+          parent,
+          name: name.clone(),
+          path: Arc::new(path.to_path_buf()),
+        }],
+      )
+      .into_iter()
+      .next()
+      .map(|(_, outcome)| outcome)
+      .unwrap_or(WatchOutcome::Failed(WatchError::Gone))
   }
 
   #[cfg(not(all(target_os = "linux", not(miri))))]
@@ -576,14 +638,77 @@ impl FsOps for RealFs {
 
   #[cfg(all(target_os = "linux", not(miri)))]
   fn remove_watch(&self, scope: ScopeId, watch: WatchId) {
-    self.anchors.lock().unwrap().remove(&watch);
-    if let Some(ScopePort::Inotify(port)) = self.ports.read().unwrap().get(&scope).cloned() {
-      port.remove_watch(watch);
-    }
+    self.batch_control(scope, vec![ControlRequest::Disarm { watch }]);
   }
 
   #[cfg(not(all(target_os = "linux", not(miri))))]
   fn remove_watch(&self, _scope: ScopeId, _watch: WatchId) {}
+
+  // The batched arm path IS the real inotify arm path: even a single arm goes
+  // through it, so anchor bookkeeping and the control envelope live in exactly
+  // one place. The whole batch becomes ONE `Control::Batch` message, so a drain
+  // cycle that produces N arms wakes the reader at most once.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn batch_control(
+    &self,
+    scope: ScopeId,
+    requests: Vec<ControlRequest>,
+  ) -> Vec<(WatchId, WatchOutcome)> {
+    use crate::os::linux::ControlOp;
+
+    let Some(ScopePort::Inotify(port)) = self.ports.read().unwrap().get(&scope).cloned() else {
+      // No live descending port (a kernel-recursive source, or an arm racing
+      // its own stream teardown): every arm answers the honest typed refusal,
+      // and disarms — whose kernel watches die with the closing fd — no-op.
+      return requests
+        .iter()
+        .filter_map(|request| match request {
+          ControlRequest::Arm { watch, .. } => {
+            Some((*watch, WatchOutcome::Failed(WatchError::Gone)))
+          }
+          ControlRequest::Disarm { .. } => None,
+        })
+        .collect();
+    };
+
+    // Build the control ops in emission order, remembering each arm's watch so
+    // the reader's index-aligned replies map back to their outcomes. Disarms
+    // drop the watch's transient anchor here (the reader issues the kernel
+    // removal).
+    let mut ops = Vec::with_capacity(requests.len());
+    let mut arm_watches = Vec::new();
+    for request in requests {
+      match request {
+        ControlRequest::Arm {
+          watch,
+          parent,
+          name,
+          path,
+        } => {
+          ops.push(ControlOp::Arm(
+            self.build_arm_request(watch, parent, &path, &name),
+          ));
+          arm_watches.push(watch);
+        }
+        ControlRequest::Disarm { watch } => {
+          self.anchors.lock().unwrap().remove(&watch);
+          ops.push(ControlOp::Disarm(watch));
+        }
+      }
+    }
+
+    let replies = port.batch(ops);
+    // Store each arm's returned transient anchor (held until its cold enumerate
+    // consumes it) and pair its outcome with its watch.
+    let mut outcomes = Vec::with_capacity(arm_watches.len());
+    for (watch, reply) in arm_watches.into_iter().zip(replies) {
+      if let Some(anchor) = reply.anchor {
+        self.anchors.lock().unwrap().insert(watch, (scope, anchor));
+      }
+      outcomes.push((watch, reply.outcome));
+    }
+    outcomes
+  }
 
   fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {
     // Consume the watch's transient anchor when one is still held: the
@@ -1083,6 +1208,11 @@ fn execute_effects<R, F>(
   R: RuntimeLite,
   F: FsOps,
 {
+  // Arms/disarms from this whole drain, grouped by scope: dispatched as one
+  // batch per scope AFTER the drain, so a cycle that arms N directories sends
+  // one control message (one potential reader wake) instead of N. Non-control
+  // effects still dispatch inline in emission order.
+  let mut control_batches: BTreeMap<ScopeId, Vec<ControlRequest>> = BTreeMap::new();
   while let Some(effect) = core.poll_effect() {
     match effect {
       Effect::SpawnStream { scope, root } => {
@@ -1144,20 +1274,24 @@ fn execute_effects<R, F>(
         // its scope. The kernel watch (if the arm did install one) is not
         // leaked either — every wd on the source's fd is reclaimed when the
         // scope's stream teardown closes that fd. No pending-set entry.
-        let ops = ops.clone();
-        let tx = op_tx.clone();
-        R::spawn_blocking_detach(move || {
-          let outcome = ops.add_watch(scope, watch, parent, &path, &name);
-          let _ = tx.try_send(OpResult::WatchInstalled { watch, outcome });
-        });
+        // Collected here and dispatched as part of the scope's batch below.
+        control_batches
+          .entry(scope)
+          .or_default()
+          .push(ControlRequest::Arm {
+            watch,
+            parent,
+            name,
+            path,
+          });
       }
       Effect::RemoveWatch { scope, watch } => {
         // Fire-and-forget by contract; droppable at close for the same
-        // fd-reclamation reason as AddWatch.
-        let ops = ops.clone();
-        R::spawn_blocking_detach(move || {
-          ops.remove_watch(scope, watch);
-        });
+        // fd-reclamation reason as AddWatch. Batched with this scope's arms.
+        control_batches
+          .entry(scope)
+          .or_default()
+          .push(ControlRequest::Disarm { watch });
       }
       Effect::Enumerate { req, watch, path } => {
         // Droppable at close: a listing that never lands leaves the Monitor
@@ -1200,6 +1334,20 @@ fn execute_effects<R, F>(
         Err(async_channel::TrySendError::Closed(_)) => {}
       },
     }
+  }
+
+  // Dispatch each scope's collected arms/disarms as ONE batch on the blocking
+  // pool: the source ships it as a single control message (one potential reader
+  // wake for the whole batch), and each arm still feeds back its own
+  // `WatchInstalled`. Disarms are fire-and-forget (no reply).
+  for (scope, requests) in control_batches {
+    let ops = ops.clone();
+    let tx = op_tx.clone();
+    R::spawn_blocking_detach(move || {
+      for (watch, outcome) in ops.batch_control(scope, requests) {
+        let _ = tx.try_send(OpResult::WatchInstalled { watch, outcome });
+      }
+    });
   }
 }
 

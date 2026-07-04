@@ -3,25 +3,36 @@
 //! construction — control requests travel over a channel and are executed
 //! between reads, never concurrently with them.
 //!
-//! Wakeup: the thread blocks in `poll` over the inotify fd and the read end
-//! of a private pipe; control senders (and shutdown) write one byte to the
-//! pipe after queuing, so the reader observes every request promptly without
-//! busy-waiting.
+//! Wakeup: the thread blocks in `poll` over the inotify fd and a per-root
+//! [`WakeState`] eventfd. Control senders enqueue first, then wake the eventfd
+//! only when the reader is parked (see [`WakeState`]'s lost-wakeup argument),
+//! so a busy reader takes no wake syscalls and a batch of N arms costs at most
+//! one wake. Arms arrive batched (one [`Control::Batch`] per driver effect-drain
+//! per scope) and are processed in a single pass between reads.
 
 use std::{
-  io,
-  os::fd::{AsRawFd, FromRawFd, OwnedFd},
+  os::fd::{AsFd, AsRawFd, OwnedFd},
   panic::{AssertUnwindSafe, catch_unwind},
   sync::{Arc, mpsc},
   thread::JoinHandle,
 };
 
+use rustix::{
+  event::{PollFd, PollFlags, poll},
+  fs::{
+    OFlags,
+    inotify::{self, WatchFlags},
+    openat,
+  },
+  io::Errno,
+};
 use tributary_proto::{WatchError, WatchId};
 
 use super::{
   super::{
     super::{SourceError, transport},
     AnchorRequest, ArmReply, WatchOutcome, attribute_events,
+    wake::WakeState,
   },
   decode::{self, WATCH_MASK},
   table::{DrainDecision, WdTable},
@@ -35,60 +46,49 @@ pub(crate) struct ReaderShared {
   pub(crate) transport: transport::TransportState,
 }
 
-/// One control request, executed by the reader between reads.
+/// One arm or disarm inside a control batch. Emission order is preserved: a
+/// disarm and a later re-arm of the same slot mutate the `wd` table in the same
+/// order the core produced them.
+pub(crate) enum ControlOp {
+  /// Install (or alias) a kernel watch for `request.watch`.
+  Arm(AnchorRequest),
+  /// Drop `anchor` from attribution (kernel removal when its last alias
+  /// drains).
+  Disarm(WatchId),
+}
+
+/// One control request executed by the reader between reads. Arms/disarms are
+/// batched — one message per effect-drain cycle per scope — so N arms cost one
+/// enqueue and at most one wake; each arm still gets its own reply slot.
 pub(crate) enum Control {
-  AddWatch {
-    request: AnchorRequest,
-    reply: mpsc::SyncSender<ArmReply>,
-  },
-  RemoveWatch {
-    anchor: WatchId,
-    reply: mpsc::SyncSender<()>,
+  /// A batch of arms/disarms in emission order, with one reply carrying the
+  /// arms' outcomes (index-aligned to the `Arm` entries, in order).
+  Batch {
+    ops: Vec<ControlOp>,
+    reply: mpsc::SyncSender<Vec<ArmReply>>,
   },
   Shutdown,
 }
 
 /// Creates the per-root inotify instance.
 pub(crate) fn create_instance() -> Result<OwnedFd, SourceError> {
-  // SAFETY: plain syscall; the returned fd is owned exclusively here.
-  let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-  if fd < 0 {
-    let err = io::Error::last_os_error();
-    return Err(match err.raw_os_error() {
-      // EMFILE is both the per-process fd ceiling and the per-uid
-      // `fs.inotify.max_user_instances` ceiling — the typed spawn error the
-      // per-root-instance topology trades for its overflow isolation.
-      Some(libc::EMFILE) => SourceError::InstanceLimit,
-      _ => SourceError::CreateFailed,
-    });
-  }
-  // SAFETY: fd is a fresh, owned descriptor.
-  Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+  inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).map_err(|err| {
+    // EMFILE is both the per-process fd ceiling and the per-uid
+    // `fs.inotify.max_user_instances` ceiling — the typed spawn error the
+    // per-root-instance topology trades for its overflow isolation.
+    if err == Errno::MFILE {
+      SourceError::InstanceLimit
+    } else {
+      SourceError::CreateFailed
+    }
+  })
 }
 
-/// Creates the wakeup pipe: `(write, read)` ends.
-pub(crate) fn wake_pipe() -> Result<(OwnedFd, OwnedFd), SourceError> {
-  let mut fds = [0 as libc::c_int; 2];
-  // SAFETY: fds is a valid two-slot buffer; pipe2 fills it on success.
-  if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-    return Err(SourceError::CreateFailed);
-  }
-  // SAFETY: both fds are fresh, owned descriptors.
-  Ok(unsafe { (OwnedFd::from_raw_fd(fds[1]), OwnedFd::from_raw_fd(fds[0])) })
-}
-
-/// Wakes the reader (one byte on the pipe; a full pipe already guarantees a
-/// pending wake).
-pub(crate) fn wake(pipe_write: &OwnedFd) {
-  // SAFETY: writes one byte from a valid buffer to an owned fd.
-  let _ = unsafe { libc::write(pipe_write.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-}
-
-/// Starts the reader thread. The fd, the wake pipe's read end, and the `wd`
-/// table live and die with it.
+/// Starts the reader thread. The fd, the wake eventfd, and the `wd` table live
+/// and die with it.
 pub(crate) fn start(
   fd: OwnedFd,
-  wake_rx: OwnedFd,
+  wake: Arc<WakeState>,
   control: mpsc::Receiver<Control>,
   shared: Arc<ReaderShared>,
 ) -> JoinHandle<()> {
@@ -96,7 +96,7 @@ pub(crate) fn start(
     .name("tributary-fs.inotify".into())
     .spawn(move || {
       let outcome = catch_unwind(AssertUnwindSafe(|| {
-        run(&fd, &wake_rx, &control, &shared);
+        run(&fd, &wake, &control, &shared);
       }));
       if outcome.is_err() {
         signal_fatal(&shared, SourceError::CallbackPanic);
@@ -111,54 +111,72 @@ fn signal_fatal(shared: &ReaderShared, err: SourceError) {
   });
 }
 
-fn run(fd: &OwnedFd, wake_rx: &OwnedFd, control: &mpsc::Receiver<Control>, shared: &ReaderShared) {
+fn run(fd: &OwnedFd, wake: &WakeState, control: &mpsc::Receiver<Control>, shared: &ReaderShared) {
   let mut table = WdTable::new();
   // Sized for a dense read: watchman's batch scale (16k events of header
   // size) is far past what one wake needs; 64 KiB covers the deepest names.
   let mut buf = vec![0u8; 64 * 1024];
   loop {
+    // Announce the intent to block, then re-drain control BEFORE polling: a
+    // sender that enqueued before our fence is guaranteed visible here (the
+    // lost-wakeup guard — see `WakeState`). Draining anything means we service
+    // it and loop without ever blocking on a non-empty queue.
+    wake.arm_park();
+    if drain_control(fd, &mut table, control) {
+      return; // Shutdown observed in the guard drain.
+    }
+    // A quiet re-check found nothing pending; commit to the block. Only the
+    // eventfd (a sender's wake) or source data returns us.
+    let event = wake.event_fd();
     let mut fds = [
-      libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-      },
-      libc::pollfd {
-        fd: wake_rx.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-      },
+      PollFd::new(fd, PollFlags::IN),
+      PollFd::new(&event, PollFlags::IN),
     ];
-    // SAFETY: fds is a valid two-entry pollfd array.
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-    if rc < 0 {
-      let err = io::Error::last_os_error();
-      if err.kind() == io::ErrorKind::Interrupted {
+    match poll(&mut fds, None) {
+      Ok(_) => {}
+      Err(Errno::INTR) => {
+        wake.unpark();
         continue;
       }
-      signal_fatal(shared, SourceError::ReadFailed { source: err });
-      return;
-    }
-
-    if fds[1].revents & libc::POLLIN != 0 {
-      drain_pipe(wake_rx);
-      loop {
-        match control.try_recv() {
-          Ok(Control::AddWatch { request, reply }) => {
-            let _ = reply.send(arm(fd, &mut table, request));
-          }
-          Ok(Control::RemoveWatch { anchor, reply }) => {
-            disarm(fd, &mut table, anchor);
-            let _ = reply.send(());
-          }
-          Ok(Control::Shutdown) => return,
-          Err(_) => break,
-        }
+      Err(err) => {
+        wake.unpark();
+        signal_fatal(shared, SourceError::ReadFailed { source: err.into() });
+        return;
       }
     }
+    let source_ready = fds[0].revents().contains(PollFlags::IN);
+    let event_ready = fds[1].revents().contains(PollFlags::IN);
+    wake.unpark();
 
-    if fds[0].revents & libc::POLLIN != 0 && !drain_events(fd, &mut buf, &mut table, shared) {
+    if event_ready {
+      wake.drain();
+      if drain_control(fd, &mut table, control) {
+        return;
+      }
+    }
+    if source_ready && !drain_events(fd, &mut buf, &mut table, shared) {
       return;
+    }
+  }
+}
+
+/// Drains every pending control message, executing each batch in one pass.
+/// Returns `true` when a shutdown was observed (the caller then exits).
+fn drain_control(fd: &OwnedFd, table: &mut WdTable, control: &mpsc::Receiver<Control>) -> bool {
+  loop {
+    match control.try_recv() {
+      Ok(Control::Batch { ops, reply }) => {
+        let mut replies = Vec::new();
+        for op in ops {
+          match op {
+            ControlOp::Arm(request) => replies.push(arm(fd, table, request)),
+            ControlOp::Disarm(anchor) => disarm(fd, table, anchor),
+          }
+        }
+        let _ = reply.send(replies);
+      }
+      Ok(Control::Shutdown) => return true,
+      Err(_) => return false,
     }
   }
 }
@@ -167,23 +185,20 @@ fn run(fd: &OwnedFd, wake_rx: &OwnedFd, control: &mpsc::Receiver<Control>, share
 /// Returns `false` when the stream died (fatal already signaled).
 fn drain_events(fd: &OwnedFd, buf: &mut [u8], table: &mut WdTable, shared: &ReaderShared) -> bool {
   loop {
-    // SAFETY: reads into an exclusively-borrowed buffer of the given length.
-    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-      let err = io::Error::last_os_error();
-      return match err.kind() {
-        io::ErrorKind::WouldBlock => true,
-        io::ErrorKind::Interrupted => continue,
-        _ => {
-          signal_fatal(shared, SourceError::ReadFailed { source: err });
-          false
-        }
-      };
-    }
+    let n = match rustix::io::read(fd, &mut *buf) {
+      Ok(n) => n,
+      // `EAGAIN` and `EWOULDBLOCK` are the same errno on Linux.
+      Err(Errno::AGAIN) => return true,
+      Err(Errno::INTR) => continue,
+      Err(err) => {
+        signal_fatal(shared, SourceError::ReadFailed { source: err.into() });
+        return false;
+      }
+    };
     if n == 0 {
       return true;
     }
-    let decoded = decode::decode_events(&buf[..n as usize]);
+    let decoded = decode::decode_events(&buf[..n]);
     let attributed = attribute_events(decoded.events, table);
     let events = attributed
       .events
@@ -199,17 +214,6 @@ fn drain_events(fd: &OwnedFd, buf: &mut [u8], table: &mut WdTable, shared: &Read
   }
 }
 
-fn drain_pipe(wake_rx: &OwnedFd) {
-  let mut sink = [0u8; 64];
-  loop {
-    // SAFETY: reads into a local buffer from the owned pipe fd.
-    let n = unsafe { libc::read(wake_rx.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) };
-    if n <= 0 {
-      return;
-    }
-  }
-}
-
 /// Executes one arm on the reader's own fd: open the target through the
 /// parent anchor (object-correct — a parent rename cannot retarget the add),
 /// install through `/proc/self/fd/N`, and map `EEXIST` to the aliasing path.
@@ -218,97 +222,95 @@ fn arm(fd: &OwnedFd, table: &mut WdTable, request: AnchorRequest) -> ArmReply {
     Ok(anchor) => anchor,
     Err(err) => {
       return ArmReply {
-        outcome: WatchOutcome::Failed(errno_to_watch_error(&err)),
+        outcome: WatchOutcome::Failed(errno_to_watch_error(err)),
         anchor: None,
       };
     }
   };
 
-  let proc_path = format!("/proc/self/fd/{}\0", anchor.as_raw_fd());
+  let proc_path = format!("/proc/self/fd/{}", anchor.as_raw_fd());
   // The /proc entry is itself a symlink to the anchored object, so the add
   // must follow exactly that one link. Symlink safety is already enforced —
-  // `open_anchor` opened with `O_NOFOLLOW|O_DIRECTORY`, so the object behind
-  // the anchor is a real directory, never a link.
-  let mask = WATCH_MASK & !decode::IN_DONT_FOLLOW;
-  // SAFETY: proc_path is NUL-terminated; the fd is the reader's own instance.
-  let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), proc_path.as_ptr().cast(), mask) };
-  if wd >= 0 {
-    table.register(wd, request.watch);
-    return ArmReply {
-      outcome: WatchOutcome::Installed(wd),
-      anchor: Some(anchor),
-    };
-  }
-
-  let err = io::Error::last_os_error();
-  if err.raw_os_error() == Some(libc::EEXIST) {
+  // `open_anchor` opened with `NOFOLLOW|DIRECTORY`, so the object behind the
+  // anchor is a real directory, never a link.
+  let mask = WatchFlags::from_bits_retain(WATCH_MASK & !decode::IN_DONT_FOLLOW);
+  match inotify::add_watch(fd, proc_path.as_str(), mask) {
+    Ok(wd) => {
+      table.register(wd, request.watch);
+      ArmReply {
+        outcome: WatchOutcome::Installed(wd),
+        anchor: Some(anchor),
+      }
+    }
     // The inode is already watched. `IN_MASK_CREATE` refuses to say WHICH wd,
     // so re-add without it: the mask is identical, making the update a no-op
     // that returns the existing wd for the alias registration.
-    // SAFETY: same arguments as above minus the create guard.
-    let wd = unsafe {
-      libc::inotify_add_watch(
-        fd.as_raw_fd(),
-        proc_path.as_ptr().cast(),
-        mask & !decode::IN_MASK_CREATE,
-      )
-    };
-    if wd >= 0 {
-      table.alias(wd, request.watch);
-      return ArmReply {
-        outcome: WatchOutcome::Aliased(wd),
-        anchor: Some(anchor),
-      };
+    Err(Errno::EXIST) => {
+      let mask = WatchFlags::from_bits_retain(mask.bits() & !decode::IN_MASK_CREATE);
+      match inotify::add_watch(fd, proc_path.as_str(), mask) {
+        Ok(wd) => {
+          table.alias(wd, request.watch);
+          ArmReply {
+            outcome: WatchOutcome::Aliased(wd),
+            anchor: Some(anchor),
+          }
+        }
+        Err(err) => ArmReply {
+          outcome: WatchOutcome::Failed(errno_to_watch_error(err)),
+          anchor: None,
+        },
+      }
     }
-  }
-  ArmReply {
-    outcome: WatchOutcome::Failed(errno_to_watch_error(&io::Error::last_os_error())),
-    anchor: None,
+    Err(err) => ArmReply {
+      outcome: WatchOutcome::Failed(errno_to_watch_error(err)),
+      anchor: None,
+    },
   }
 }
 
 /// Opens the arm target as a transient `O_PATH` anchor.
-fn open_anchor(request: &AnchorRequest) -> io::Result<OwnedFd> {
-  use std::os::unix::ffi::OsStrExt;
-  let name = std::ffi::CString::new(request.name.as_bytes())
-    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains a NUL byte"))?;
-  let dirfd = request
-    .parent
-    .as_ref()
-    .map(|fd| fd.as_raw_fd())
-    .unwrap_or(libc::AT_FDCWD);
-  let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
-  // SAFETY: name is NUL-terminated; dirfd is a live anchor (or AT_FDCWD).
-  let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags) };
-  if fd < 0 {
-    return Err(io::Error::last_os_error());
+fn open_anchor(request: &AnchorRequest) -> Result<OwnedFd, Errno> {
+  let dirfd = request.parent.as_ref().map(|fd| fd.as_fd());
+  let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC;
+  // `openat` with a `None` dirfd is `AT_FDCWD` in rustix; the root arms by its
+  // absolute canonical path, a child arms relative to its parent's anchor.
+  match dirfd {
+    Some(dirfd) => openat(
+      dirfd,
+      request.name.as_os_str(),
+      flags,
+      rustix::fs::Mode::empty(),
+    ),
+    None => openat(
+      rustix::fs::CWD,
+      request.name.as_os_str(),
+      flags,
+      rustix::fs::Mode::empty(),
+    ),
   }
-  // SAFETY: fd is a fresh, owned descriptor.
-  Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Removes `anchor` from attribution, issuing the kernel removal when the
-/// last alias drains. `rm_watch` errors are ignored deliberately: the kernel
-/// auto-removes a watch whose object was deleted (its `IN_IGNORED` is already
-/// queued), making `EINVAL` here a benign race, and the table entry drains
-/// through that `IN_IGNORED` either way.
+/// last alias drains. `remove_watch` errors are ignored deliberately: the
+/// kernel auto-removes a watch whose object was deleted (its `IN_IGNORED` is
+/// already queued), making `EINVAL` here a benign race, and the table entry
+/// drains through that `IN_IGNORED` either way.
 fn disarm(fd: &OwnedFd, table: &mut WdTable, anchor: WatchId) {
   if let DrainDecision::RemoveWd(wd) = table.begin_drain(anchor) {
-    // SAFETY: plain syscall on the reader's own fd.
-    let _ = unsafe { libc::inotify_rm_watch(fd.as_raw_fd(), wd) };
+    let _ = inotify::remove_watch(fd, wd);
   }
 }
 
-/// Maps an arm-time errno to the Monitor's watch-result taxonomy.
-fn errno_to_watch_error(err: &io::Error) -> WatchError {
-  match err.raw_os_error() {
-    Some(libc::ENOENT) => WatchError::NotFound,
+/// Maps an arm-time [`Errno`] to the Monitor's watch-result taxonomy.
+fn errno_to_watch_error(err: Errno) -> WatchError {
+  match err {
+    Errno::NOENT => WatchError::NotFound,
     // The slot's object stopped being a directory between the caller's
     // enumerate and this arm — the directory the Monitor meant is gone.
-    Some(libc::ENOTDIR) => WatchError::Gone,
-    Some(libc::EACCES) | Some(libc::EPERM) => WatchError::Permission,
+    Errno::NOTDIR => WatchError::Gone,
+    Errno::ACCESS | Errno::PERM => WatchError::Permission,
     // fs.inotify.max_user_watches exhausted.
-    Some(libc::ENOSPC) => WatchError::NoSpace,
+    Errno::NOSPC => WatchError::NoSpace,
     _ => WatchError::Io,
   }
 }
