@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+  ffi::OsString,
+  path::{Path, PathBuf},
+};
 
 use super::{
   Admission, admit,
@@ -16,8 +19,8 @@ fn fid(tag: u8) -> Fid {
 fn seeded() -> FidMap {
   let mut map = FidMap::new();
   map.seed([
-    SeedEntry::new(fid(1), PathBuf::from("/root")),
-    SeedEntry::new(fid(2), PathBuf::from("/root/sub")),
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
   ]);
   map
 }
@@ -167,6 +170,87 @@ fn rename_into_root_admits_with_resolved_destination() {
   };
   let rename = admitted.rename.expect("rename info");
   assert_eq!(rename.new_path, PathBuf::from("/root/sub/arrived.txt"));
+}
+
+/// A directory `FAN_RENAME` within the root re-parents the moved directory's
+/// whole subtree: after the rename, a pre-seeded descendant's own event
+/// resolves under the NEW path — the parent-relative map, not a stale absolute
+/// one. (`/root/sub` renamed to `/root/moved`; a child under it follows.)
+#[test]
+fn dir_rename_reparents_descendants() {
+  let mut map = FidMap::new();
+  // /root, /root/sub (fid 2), /root/sub/child (fid 3, pre-seeded).
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+    SeedEntry::child(fid(3), fid(2), OsString::from("child")),
+  ]);
+
+  // Rename the directory fid(2) from /root/sub to /root/moved (same parent,
+  // new name). The moved object's own FID is target_fid; both ends in-root.
+  let rename = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(2)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(1),
+      old_name: b"sub".to_vec(),
+      new_dir: fid(1),
+      new_name: b"moved".to_vec(),
+    }),
+  };
+  assert!(matches!(admit(&mut map, &rename), Admission::Admit(_)));
+
+  // A later modify on the PRE-SEEDED child resolves under the new parent path.
+  let child_event = dirent(FAN_MODIFY, fid(3), b"leaf.txt", None);
+  let Admission::Admit(admitted) = admit(&mut map, &child_event) else {
+    panic!("the descendant must still admit after the parent rename");
+  };
+  assert_eq!(
+    admitted.path.as_deref(),
+    Some(Path::new("/root/moved/child/leaf.txt")),
+    "the descendant resolves under the renamed parent, not the stale path"
+  );
+}
+
+/// A directory moved OUT of the root stops admitting its descendants: after the
+/// move-out, a pre-seeded child's event does NOT admit — no stale in-root path
+/// is emitted for out-of-root activity.
+#[test]
+fn dir_move_out_of_root_stops_descendant_admission() {
+  let mut map = FidMap::new();
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+    SeedEntry::child(fid(3), fid(2), OsString::from("child")),
+  ]);
+
+  // Move /root/sub OUT to an out-of-root directory (fid 90, not in the map):
+  // the destination end does not admit, so only the old admission is dropped.
+  let rename = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(2)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(1),
+      old_name: b"sub".to_vec(),
+      new_dir: fid(90),
+      new_name: b"sub".to_vec(),
+    }),
+  };
+  // The rename still admits (the old end is in-root — a move across the
+  // boundary is the tree's business), but the map self-maintenance detaches
+  // the subtree.
+  assert!(matches!(admit(&mut map, &rename), Admission::Admit(_)));
+
+  // A later event on the pre-seeded descendant is now outside the root.
+  let child_event = dirent(FAN_MODIFY, fid(3), b"leaf.txt", None);
+  assert!(
+    matches!(admit(&mut map, &child_event), Admission::Drop),
+    "a descendant of a moved-out directory no longer admits"
+  );
 }
 
 /// An attrib event on a file in an admitted directory resolves its path with no

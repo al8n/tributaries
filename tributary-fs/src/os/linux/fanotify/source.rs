@@ -78,12 +78,19 @@ impl Source {
 
     // Seed the map by walking the root: every directory's FID (built from the
     // superblock fsid + its file handle) admits its own later events. A read
-    // failure mid-walk is not fatal — the directory simply stays unseeded and
-    // a later rescan heals it — but a root that cannot be walked at all is an
-    // honest spawn failure.
+    // failure mid-walk is not fatal — the directory simply stays unseeded and a
+    // later reseed re-observes it — but a root that cannot be walked at all is
+    // an honest spawn failure. The same walk inputs ride into the reader as the
+    // reseed context: a loss rebuilds the map from a fresh walk.
+    let reseed = ReseedContext {
+      root: canonical.clone(),
+      fsid,
+      root_dev,
+    };
     let mut map = FidMap::new();
-    let seed =
-      seed_walk(&canonical, fsid, root_dev).map_err(|source| SourceError::RootUnavailable {
+    let seed = reseed
+      .walk()
+      .map_err(|source| SourceError::RootUnavailable {
         root: canonical.clone(),
         source,
       })?;
@@ -97,7 +104,14 @@ impl Source {
 
     let wake = WakeState::new()?;
     let (control_tx, control_rx) = mpsc::channel();
-    let thread = reader::start(fd, Arc::clone(&wake), control_rx, map, Arc::clone(&shared));
+    let thread = reader::start(
+      fd,
+      Arc::clone(&wake),
+      control_rx,
+      map,
+      reseed,
+      Arc::clone(&shared),
+    )?;
 
     let handle = SourceHandle {
       control: control_tx,
@@ -196,25 +210,58 @@ fn fsid_bytes(fsid: &libc::fsid_t) -> [u8; 8] {
   out
 }
 
-/// Walks `root` breadth-first, producing a [`SeedEntry`] per directory on the
-/// root device — every one an admitted directory. A mount boundary
-/// (`st_dev != root_dev`) is not descended: an sb mark never crosses it, so
-/// its subtree lives on a different superblock and never delivers on this fd.
-/// A per-directory handle-read failure is skipped (a rescan heals it); only a
-/// failure to open the root itself is fatal.
+/// The inputs the seeding walk needs, carried into the reader so a loss can
+/// rebuild the map from a fresh walk. The reader owns one of these and reruns
+/// [`walk`](Self::walk) on every `FAN_Q_OVERFLOW` / lossy decode.
+pub(crate) struct ReseedContext {
+  /// The canonical watched root — the walk's starting point and root anchor.
+  root: std::path::PathBuf,
+  /// The superblock fsid stamped into every seed FID (kept only so seed FIDs
+  /// are byte-identical to a spawn seed; admission never compares it).
+  fsid: [u8; 8],
+  /// The root device — the single-device descent boundary (a sub-mount lives on
+  /// a different superblock this mark never reports on).
+  root_dev: u64,
+}
+
+impl ReseedContext {
+  /// Walks the root and returns its parent-linked directory inventory. Bounded
+  /// by the directory count under the root; overflow is rare, so paying a full
+  /// walk to restore the map's sight is the honest cost of never going
+  /// permanently blind after a covered loss.
+  pub(crate) fn walk(&self) -> io::Result<Vec<SeedEntry>> {
+    seed_walk(&self.root, self.fsid, self.root_dev)
+  }
+}
+
+/// Walks `root` depth-first, producing a [`SeedEntry`] per directory on the
+/// root device — every one an admitted directory, each carrying its parent FID
+/// so the map builds the parent-relative structure directly. A mount boundary
+/// (`st_dev != root_dev`) is not descended: an sb mark never crosses it, so its
+/// subtree lives on a different superblock and never delivers on this fd. A
+/// per-directory handle-read failure is skipped (a reseed re-observes it); only
+/// a failure to open the root itself is fatal.
+///
+/// The same walk seeds the map at spawn AND reseeds it after a loss: both need
+/// the identical parent-linked directory inventory.
 fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> io::Result<Vec<SeedEntry>> {
   let mut seed = Vec::new();
-  if let Some(fid) = handle_fid(root, fsid) {
-    seed.push(SeedEntry::new(fid, root.to_path_buf()));
-  }
-  // The root must be readable to seed anything; deeper read failures degrade
-  // to a smaller seed, not a spawn failure. An explicit stack keeps the walk
-  // iterative (no recursion depth bound on a deep tree).
+  // A directory with no readable handle cannot anchor its children's parent
+  // links, so it is skipped along with its subtree; the root failing to export
+  // a handle is caught by the probe, never here.
+  let Some(root_fid) = handle_fid(root, fsid) else {
+    return Ok(seed);
+  };
+  seed.push(SeedEntry::root(root_fid.clone(), root));
+  // The root must be readable to seed anything; deeper read failures degrade to
+  // a smaller seed, not a spawn failure. Explicit stacks keep the walk
+  // iterative (no recursion depth bound on a deep tree); `parents` carries each
+  // open reader's directory FID so a discovered child links to it.
   let mut pending = vec![fs::read_dir(root)?];
-  let mut parents = vec![root.to_path_buf()];
+  let mut parents = vec![(root.to_path_buf(), root_fid)];
 
   while let Some(reader) = pending.last_mut() {
-    let parent = parents.last().expect("a parent per reader").clone();
+    let (parent_path, parent_fid) = parents.last().expect("a parent per reader").clone();
     match reader.next() {
       None => {
         pending.pop();
@@ -228,7 +275,8 @@ fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> io::Result<Vec<SeedEn
         if !file_type.is_dir() {
           continue;
         }
-        let path = parent.join(entry.file_name());
+        let name = entry.file_name();
+        let path = parent_path.join(&name);
         // Single-device descent: a directory on another device is a mount
         // point — a different superblock this mark never reports on.
         let on_root_dev = fs::symlink_metadata(&path)
@@ -237,12 +285,13 @@ fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> io::Result<Vec<SeedEn
         if !on_root_dev {
           continue;
         }
-        if let Some(fid) = handle_fid(&path, fsid) {
-          seed.push(SeedEntry::new(fid, path.clone()));
-        }
+        let Some(fid) = handle_fid(&path, fsid) else {
+          continue;
+        };
+        seed.push(SeedEntry::child(fid.clone(), parent_fid.clone(), name));
         if let Ok(reader) = fs::read_dir(&path) {
           pending.push(reader);
-          parents.push(path);
+          parents.push((path, fid));
         }
       }
     }

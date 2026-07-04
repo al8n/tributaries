@@ -85,13 +85,15 @@ pub(crate) fn create_instance() -> Result<OwnedFd, SourceError> {
 }
 
 /// Starts the reader thread. The fd, the wake eventfd, and the `wd` table live
-/// and die with it.
+/// and die with it. A spawn failure (thread or memory exhaustion) is a typed
+/// [`SourceError::StartFailed`] on the never-live path — the instance fd closes
+/// as the returned closure drops, and no watch was armed.
 pub(crate) fn start(
   fd: OwnedFd,
   wake: Arc<WakeState>,
   control: mpsc::Receiver<Control>,
   shared: Arc<ReaderShared>,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>, SourceError> {
   std::thread::Builder::new()
     .name("tributary-fs.inotify".into())
     .spawn(move || {
@@ -102,7 +104,7 @@ pub(crate) fn start(
         signal_fatal(&shared, SourceError::CallbackPanic);
       }
     })
-    .expect("spawning the reader thread")
+    .map_err(|_| SourceError::StartFailed)
 }
 
 fn signal_fatal(shared: &ReaderShared, err: SourceError) {

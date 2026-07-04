@@ -503,7 +503,7 @@ mod inotify_source {
       let fd = reader::create_instance()?;
       let wake = WakeState::new()?;
       let (control_tx, control_rx) = mpsc::channel();
-      let thread = reader::start(fd, Arc::clone(&wake), control_rx, Arc::clone(&shared));
+      let thread = reader::start(fd, Arc::clone(&wake), control_rx, Arc::clone(&shared))?;
 
       let handle = SourceHandle {
         port: ControlPort {
