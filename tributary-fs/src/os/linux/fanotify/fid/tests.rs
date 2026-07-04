@@ -214,7 +214,11 @@ fn unknown_info_record_is_skipped() {
 }
 
 /// A `FAN_Q_OVERFLOW` marker carries no FID and marks the batch lossy while
-/// still advancing past its (info-less) event.
+/// still advancing past its (info-less) event. DECODE keeps any post-marker event
+/// in `events` — that is decode's contract, NOT delivery: the reader treats a
+/// lossy decode as an ordering barrier and drops the whole buffer's events behind
+/// the `Overflow` (see the reader's `process_decoded`), so a post-marker event is
+/// decoded here but never forwarded.
 #[test]
 fn overflow_marker_is_lossy_and_skipped() {
   let overflow = event(FAN_Q_OVERFLOW, &[]);
@@ -229,7 +233,11 @@ fn overflow_marker_is_lossy_and_skipped() {
   buf.extend(good);
   let DecodeOutcome { events, lossy } = decode_events(&buf);
   assert!(lossy, "overflow is a loss signal");
-  assert_eq!(events.len(), 1, "the following intact event still decodes");
+  assert_eq!(
+    events.len(),
+    1,
+    "the following intact event still DECODES (the reader drops it behind the barrier)"
+  );
   assert!(events[0].mask.created());
 }
 

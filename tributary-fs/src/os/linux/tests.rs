@@ -51,7 +51,16 @@ fn overflow_sentinel_marks_lost_and_is_not_forwarded() {
     &mut table,
   );
   assert!(batch.lost);
-  assert_eq!(batch.events.len(), 1, "the sentinel itself is not an event");
+  // ATTRIBUTION drops only the sentinel itself and still attributes the following
+  // record — that is attribution's contract. The reader then holds the loss as an
+  // ordering barrier and drops the WHOLE attributed batch behind the `Overflow`
+  // (see `forward_attributed`), so this post-sentinel event is attributed here but
+  // never forwarded.
+  assert_eq!(
+    batch.events.len(),
+    1,
+    "the sentinel itself is not an event (the reader drops the rest behind the barrier)"
+  );
 }
 
 #[test]
