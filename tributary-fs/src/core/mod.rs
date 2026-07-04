@@ -38,7 +38,8 @@ use tributary_proto::{
 
 use crate::os::{
   BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootMeta, SourceError, SourceEvent,
-  linux::WatchOutcome, transport::BudgetPermit,
+  linux::{RawLinuxEvent, WatchOutcome},
+  transport::BudgetPermit,
 };
 
 mod compile;
@@ -391,6 +392,11 @@ pub(crate) struct DriverCore {
   dying: BTreeMap<ScopeId, DyingDelivery>,
   scope_seq: u64,
   probe_seq: u64,
+  /// A monotone counter minting move cookies for `FAN_RENAME` pairs. fanotify
+  /// reports each rename atomically (both halves in one event), so the cookie
+  /// only needs to pair the two records emitted adjacently — a fresh counter
+  /// per rename suffices and never clashes across renames.
+  cookie_seq: u64,
 }
 
 impl DriverCore {
@@ -409,7 +415,14 @@ impl DriverCore {
       dying: BTreeMap::new(),
       scope_seq: 0,
       probe_seq: 0,
+      cookie_seq: 0,
     }
+  }
+
+  /// Mints the next `FAN_RENAME` pairing cookie.
+  fn next_cookie(&mut self) -> MoveCookie {
+    self.cookie_seq += 1;
+    MoveCookie::new(NonZeroU64::new(self.cookie_seq).expect("cookie counter starts at one"))
   }
 
   /// Registers a new watched root, returning its scope handle. Queues the
@@ -482,8 +495,11 @@ impl DriverCore {
         Self::arm_refresh(&mut self.effects, scope, state);
         match backend {
           // Kernel-recursive: the live stream IS the root's coverage, so the
-          // spawn doubles as the root's watch-result.
-          BackendKind::FsEvents => self.monitor.on_watch_result(watch, Ok(())),
+          // spawn doubles as the root's watch-result. fanotify's one
+          // superblock mark covers the whole root exactly like FSEvents.
+          BackendKind::FsEvents | BackendKind::Fanotify => {
+            self.monitor.on_watch_result(watch, Ok(()))
+          }
           // Descending: the source starts with NO watches (nothing may be
           // delivered before the Monitor's own watch flow runs), so the
           // root's kernel watch is armed through the same effect path as
@@ -965,13 +981,31 @@ impl DriverCore {
         let mut mismatched = false;
         for ev in events {
           match ev {
-            SourceEvent::Linux(ev) => linux.push(ev),
-            SourceEvent::FsEvents(_) => mismatched = true,
+            SourceEvent::Linux(RawLinuxEvent::Inotify { anchors, event }) => {
+              linux.push(RawLinuxEvent::Inotify { anchors, event });
+            }
+            _ => mismatched = true,
           }
         }
         let mut batch = self.compile_inotify(state, scope, linux);
         if mismatched {
-          debug_assert!(false, "an FSEvents event reached an inotify scope");
+          debug_assert!(false, "a non-inotify event reached an inotify scope");
+          batch.trailing.push(Planned::Over(Scope::Root(scope)));
+        }
+        batch
+      }
+      BackendKind::Fanotify => {
+        let mut fanotify = Vec::with_capacity(events.len());
+        let mut mismatched = false;
+        for ev in events {
+          match ev {
+            SourceEvent::Linux(RawLinuxEvent::Fanotify(admitted)) => fanotify.push(admitted),
+            _ => mismatched = true,
+          }
+        }
+        let mut batch = self.compile_fanotify(state, scope, fanotify);
+        if mismatched {
+          debug_assert!(false, "a non-fanotify event reached a fanotify scope");
           batch.trailing.push(Planned::Over(Scope::Root(scope)));
         }
         batch
@@ -1745,7 +1779,9 @@ fn path_bytes(path: &Path) -> &[u8] {
 fn caps_for(backend: BackendKind) -> Capabilities {
   let caps = Capabilities::new().with_supports_push().with_native_move();
   match backend {
-    BackendKind::FsEvents => caps.with_kernel_recursive(),
+    // Both kernel-recursive backends register the KR profile: one native
+    // stream covers the whole root, so the Monitor never descends.
+    BackendKind::FsEvents | BackendKind::Fanotify => caps.with_kernel_recursive(),
     BackendKind::Inotify => caps,
   }
 }

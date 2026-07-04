@@ -346,7 +346,7 @@ impl SourceControl for SourceHandle {
 
   #[cfg(all(target_os = "linux", not(miri)))]
   fn scope_port(&self) -> ScopePort {
-    ScopePort::Inotify(self.port())
+    SourceHandle::scope_port(self)
   }
 }
 
@@ -823,7 +823,10 @@ pub(crate) async fn run<R, F>(
                       core.on_unwatch(scope);
                     }
                   }
-                  BackendKind::FsEvents => {
+                  // Kernel-recursive: the live stream IS the coverage, so the
+                  // grant commits inline. fanotify's superblock mark covers the
+                  // whole root exactly like FSEvents.
+                  BackendKind::FsEvents | BackendKind::Fanotify => {
                     let owned = match pending {
                       Some(pending) => {
                         commit_grant(pending, scope, canonical_root, &unwind_tx)
@@ -1058,6 +1061,10 @@ fn execute_effects<R, F>(
         source_config.exclusions = config.exclusions.clone();
         source_config.latency = config.latency;
         source_config.channel_capacity = config.os_batch_capacity;
+        // The spawn selector follows the registered lowering profile: a
+        // `Fanotify` profile spawns the fanotify source, everything else
+        // inotify. (macOS ignores the selector — FSEvents is its one backend.)
+        source_config.backend = crate::os::Backend::for_profile(config.profile);
         let ops = ops.clone();
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {

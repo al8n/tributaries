@@ -316,6 +316,30 @@ impl<R: RuntimeLite> Watcher<R> {
     Self::spawn_with(options, config, RealFs::new())
   }
 
+  /// Builds a watcher that forces the fanotify-FILESYSTEM backend for every
+  /// root — the explicit test/config path pending `Backend::Auto` (L4.2).
+  /// Requires `CAP_SYS_ADMIN`; a root whose filesystem cannot support the
+  /// superblock mark fails its `watch` with a typed [`WatchRootError::Source`].
+  ///
+  /// Hidden from the public API surface: `Backend::Auto` and
+  /// `WatcherOptions.backend` are the supported selection path once they land.
+  #[doc(hidden)]
+  #[cfg(target_os = "linux")]
+  pub fn new_forcing_fanotify(options: WatcherOptions) -> Result<Self, BuildError> {
+    let supplied = options.exclusions_slice().len();
+    if supplied > WatcherOptions::MAX_EXCLUSIONS {
+      return Err(BuildError::TooManyExclusions { supplied });
+    }
+    let config = DriverConfig {
+      latency: options.latency(),
+      move_window: options.move_window(),
+      os_batch_capacity: options.os_batch_capacity(),
+      exclusions: options.exclusions_slice().to_vec(),
+      profile: crate::os::BackendKind::Fanotify,
+    };
+    Self::spawn_with(options, config, RealFs::new())
+  }
+
   /// Builds the watcher around `ops` — the seam the hermetic lifecycle tests
   /// drive with a fake filesystem; production always passes [`RealFs`].
   fn spawn_with(

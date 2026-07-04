@@ -14,8 +14,8 @@
 #                  (privileged cells self-probe and skip loudly)
 #   inotify-priv - the same binary under --privileged: unlocks the sysctl
 #                  overflow/watch-limit cells and the bind-mount aliasing cell
-#   fanotify     - the fanotify integration suite, --privileged (lands at L4;
-#                  until then this runs the full default battery privileged)
+#   fanotify     - the fanotify integration suite, --privileged (ext4 loopback
+#                  the tests build inside the container; cells self-skip loudly)
 #   all          - the full battery, --privileged
 #   shell        - interactive shell, --privileged (debugging)
 #
@@ -64,13 +64,15 @@ case "$SUITE" in
   inotify-priv)
     run_priv 'cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1'
     ;;
+  # Single-threaded by contract: the tests mount and unmount a shared ext4
+  # loopback, which concurrent tests would race.
   fanotify)
-    run_priv 'cargo test -p tributary-fs --all-features --test linux_fanotify 2>/dev/null \
-      || cargo test -p tributary-fs --all-features'
+    run_priv 'cargo test -p tributary-fs --all-features --test linux_fanotify -- --test-threads=1'
     ;;
   all)
     run_priv 'cargo test -p tributary-fs --all-features --lib \
       && cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1 \
+      && cargo test -p tributary-fs --all-features --test linux_fanotify -- --test-threads=1 \
       && cargo test -p tributary-fs --all-features --doc \
       && cargo test -p tributary-proto'
     ;;

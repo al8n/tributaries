@@ -39,13 +39,44 @@ pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
 
 /// Which watch primitive a spawned source is backed by. Carried on
 /// [`RootMeta`] so the core confirms the per-scope lowering profile the
-/// registration intended; the fanotify variant joins when that backend lands.
+/// registration intended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendKind {
   /// macOS FSEvents — kernel-recursive; flag words are hints.
   FsEvents,
   /// Linux inotify — per-directory (descending); precise verbs.
   Inotify,
+  /// Linux fanotify-FILESYSTEM — kernel-recursive; precise verbs, interned-FID
+  /// identity. Privileged (`CAP_SYS_ADMIN`); not auto-selected yet
+  /// (`Backend::Auto` lands in L4.2), only via an explicit request.
+  // Only a Linux build constructs it (the fanotify source's RootMeta, the
+  // forced-fanotify test path); a non-Linux host has no fanotify at all.
+  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+  Fanotify,
+}
+
+/// The Linux watch primitive a spawn should use. `Backend::Auto` selection is
+/// L4.2; today the driver always requests [`Inotify`](Self::Inotify), and
+/// [`Fanotify`](Self::Fanotify) is reachable only through an explicit
+/// test/config path. macOS ignores this — FSEvents is its one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+  /// inotify — per-directory, unprivileged.
+  Inotify,
+  /// fanotify-FILESYSTEM — kernel-recursive, privileged.
+  Fanotify,
+}
+
+impl Backend {
+  /// The Linux spawn selector a lowering profile implies: a `Fanotify` profile
+  /// spawns the fanotify source, every other profile inotify (FSEvents never
+  /// reaches a Linux spawn, so it maps to the harmless default).
+  pub(crate) const fn for_profile(profile: BackendKind) -> Self {
+    match profile {
+      BackendKind::Fanotify => Self::Fanotify,
+      BackendKind::FsEvents | BackendKind::Inotify => Self::Inotify,
+    }
+  }
 }
 
 /// The clonable arm/disarm port of one scope's live source, extracted at
@@ -183,10 +214,18 @@ pub(crate) struct SourceConfig {
   pub(crate) latency: Duration,
   /// Capacity of the callback→driver channel, in callback batches.
   pub(crate) channel_capacity: NonZeroUsize,
+  /// Which Linux primitive to spawn. Ignored on macOS (FSEvents is the one
+  /// backend); on Linux the driver sets [`Backend::Inotify`] until per-root
+  /// `Backend::Auto` selection lands (L4.2), with [`Backend::Fanotify`]
+  /// reachable through an explicit test/config path.
+  // Only the linux backend reads this; every other build sees it as dead.
+  #[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
+  pub(crate) backend: Backend,
 }
 
 impl SourceConfig {
-  /// A live-only configuration watching `roots` with the crate defaults.
+  /// A live-only configuration watching `roots` with the crate defaults
+  /// (inotify on Linux).
   pub(crate) fn new(roots: Vec<PathBuf>) -> Self {
     Self {
       roots,
@@ -194,6 +233,7 @@ impl SourceConfig {
       since: None,
       latency: Duration::from_millis(10),
       channel_capacity: NonZeroUsize::new(64).expect("64 is nonzero"),
+      backend: Backend::Inotify,
     }
   }
 }

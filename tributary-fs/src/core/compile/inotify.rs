@@ -23,7 +23,12 @@ impl DriverCore {
   ) -> PendingBatch {
     let mut items = Vec::with_capacity(events.len());
     for ev in events {
-      let RawLinuxEvent::Inotify { anchors, event } = ev;
+      // The dispatch only ever routes inotify events here; a fanotify event
+      // would be a seam bug (`compile` asserts it and covers the batch with a
+      // root rescan), so skip it rather than mis-lower.
+      let RawLinuxEvent::Inotify { anchors, event } = ev else {
+        continue;
+      };
       items.push(Item {
         planned: plan_inotify(state, scope, &anchors, &event),
         probe: None,
