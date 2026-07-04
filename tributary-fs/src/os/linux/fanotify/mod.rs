@@ -337,35 +337,17 @@ pub(super) const FAN_MARK_MASK: u64 = fid::FAN_CREATE
   | fid::FAN_MOVE_SELF
   | fid::FAN_ONDIR;
 
-/// Encodes `path`'s NFS-style file handle via `name_to_handle_at(AT_FDCWD,
-/// path)`. The PATH-based encoder, kept for the pre-live single-shot callers
-/// that have no fd to pin — the `Backend::Auto` probe (which runs on the
-/// canonical root before any stream is live). The live seed/reseed WALK must
-/// never resolve a name after the mark goes live (a same-superblock swap could
-/// redirect it outside the root — the objects-not-paths invariant on
-/// [`source`]), so it uses the fd-relative [`encode_handle_at`] on an
-/// already-pinned directory fd instead.
-///
-/// See [`encode_handle_sized`] for the dynamic `EOVERFLOW`-retry sizing and the
-/// returned byte layout.
-#[cfg(all(target_os = "linux", not(miri)))]
-pub(super) fn encode_handle(path: &std::path::Path) -> Option<std::boxed::Box<[u8]>> {
-  use std::os::unix::ffi::OsStrExt;
-
-  let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-  // SAFETY: cpath lives for this call; AT_FDCWD is a valid dirfd; no AT_EMPTY_PATH
-  // means the path name (not the dirfd) is resolved, from the cwd.
-  unsafe { encode_handle_sized(libc::AT_FDCWD, cpath.as_ptr(), 0) }
-}
-
 /// Encodes the file handle of the directory `dirfd` ITSELF via
-/// `name_to_handle_at(dirfd, "", AT_EMPTY_PATH)` — the fd-relative encoder the
-/// live walk uses. Because it names no path, no post-live name resolution can
-/// redirect it: the handle is taken from exactly the object the caller pinned
-/// (opened `O_NOFOLLOW` and fstat-verified on the root device), so a foreign
-/// directory swapped in for a listed name can never have its handle seed the
-/// admission map (the scope-fence invariant on [`source`]). Same dynamic
-/// `EOVERFLOW`-retry sizing and byte layout as [`encode_handle`].
+/// `name_to_handle_at(dirfd, "", AT_EMPTY_PATH)` — the fd-relative encoder every
+/// caller uses (the pre-live `Backend::Auto` probe on the pinned root, and the
+/// live seed/reseed walk on each pinned directory). Because it names no path, no
+/// name resolution can redirect it: the handle is taken from exactly the object
+/// the caller pinned (opened `O_NOFOLLOW`/`RESOLVE_NO_SYMLINKS` and
+/// fstat-verified), so neither a swap of the root path at spawn nor a foreign
+/// directory swapped in for a listed name post-live can have its handle seed the
+/// admission map (the scope-fence invariant on [`source`]). See
+/// [`encode_handle_sized`] for the dynamic `EOVERFLOW`-retry sizing and the
+/// returned byte layout.
 #[cfg(all(target_os = "linux", not(miri)))]
 pub(super) fn encode_handle_at(
   dirfd: std::os::fd::BorrowedFd<'_>,

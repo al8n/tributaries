@@ -52,6 +52,15 @@ mod tests;
 #[cfg(any(unix, test))]
 use std::path::{Path, PathBuf};
 
+// The spawn dispatcher pins the root as an fd and grounds every live-state
+// decision on it; the fd traits and `openat2`/`fstatfs` flags ride the same
+// FFI-Source gate as `Source::spawn` itself.
+#[cfg(all(target_os = "linux", not(miri)))]
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+#[cfg(all(target_os = "linux", not(miri)))]
+use rustix::fs::OFlags;
+
 use tributary_proto::WatchId;
 
 pub(crate) use fanotify::AdmittedEvent;
@@ -302,12 +311,35 @@ impl Source {
   /// mark INSTALLED; that fd is handed straight to the fanotify source, which
   /// reuses it — the mark is never installed twice.
   ///
-  /// Canonicalization and the locality/remote refusal (design §5 row 1) run
-  /// HERE, once, before any backend is selected: a network/virtual filesystem
-  /// reports only local VFS activity, so every backend must refuse it
-  /// identically. Centralizing the gate ahead of the Auto probe is what stops a
-  /// remote fs that happens to accept a `FAN_MARK_FILESYSTEM` mark and export
-  /// handles from passing the probe and going live blind to other hosts' writes.
+  /// # One pin, all live state grounded on it
+  ///
+  /// Right after canonicalization the root is PINNED as a single fd
+  /// ([`pin_root`]: `openat2` with `RESOLVE_NO_SYMLINKS`, which fails rather than
+  /// redirecting if a symlink was swapped in at ANY component after the
+  /// canonicalize). Every decision that commits live kernel state then grounds on
+  /// that fd, never on the pathname again:
+  ///
+  /// - the locality/remote gate (design §5 row 1) is [`fstatfs`](rustix::fs::fstatfs)
+  ///   on the pin — a network/virtual filesystem reports only local VFS activity,
+  ///   so every backend refuses it identically, and a transient mount/symlink swap
+  ///   can no longer smuggle a remote fs past the gate;
+  /// - the fanotify `FAN_MARK_FILESYSTEM` mark is installed fd-relative on the pin
+  ///   (`fanotify_mark(ffd, …, pin_fd, NULL)`), so it marks the superblock of the
+  ///   object the pin refers to — a path swap for THIS one call can no longer mark
+  ///   the wrong superblock and leave the kernel listening elsewhere;
+  /// - the root identity, the seed fsid, the FID seed walk's root, and the
+  ///   post-live liveness re-stat all read the pin.
+  ///
+  /// Centralizing this ahead of selection is what stops a remote fs that happens
+  /// to accept a mark and export handles from going live blind, and stops a
+  /// same-path swap from anchoring a live source on an object other than the one
+  /// the gate and identity vouched for.
+  ///
+  /// The pin's lifetime is exactly this call: it is held while the gate, probe
+  /// (mark + handle), and backend spawn commit, then dropped on return. Nothing
+  /// retains it — the fanotify reader owns the marked instance fd (a distinct
+  /// descriptor), and the mark keeps the superblock scoped with no live root fd
+  /// needed.
   pub(crate) fn spawn(
     config: super::SourceConfig,
   ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
@@ -320,7 +352,8 @@ impl Source {
         root: supplied.clone(),
         source,
       })?;
-    if is_remote_fs(&canonical)? {
+    let root_fd = pin_root(&canonical)?;
+    if root_is_remote(&root_fd, &canonical)? {
       return Err(super::SourceError::RootUnavailable {
         root: canonical,
         source: std::io::Error::new(
@@ -331,25 +364,29 @@ impl Source {
     }
 
     match config.backend {
-      super::Backend::Inotify => Self::spawn_inotify(config, canonical),
-      super::Backend::Fanotify => Self::spawn_probed(config, canonical, false),
-      super::Backend::Auto => Self::spawn_probed(config, canonical, true),
+      super::Backend::Inotify => Self::spawn_inotify(config, canonical, root_fd.as_fd()),
+      super::Backend::Fanotify => Self::spawn_probed(config, canonical, root_fd.as_fd(), false),
+      super::Backend::Auto => Self::spawn_probed(config, canonical, root_fd.as_fd(), true),
     }
   }
 
   /// The inotify branch (no probe). `canonical` is the dispatcher's already
-  /// canonicalized, already locality-checked root.
+  /// canonicalized, already locality-checked root, and `root_fd` its pin — the
+  /// inotify barrier reads its root identity from the pin (the same grounded
+  /// object the gate vouched for), while its per-directory ARMS stay protected by
+  /// their own `expected`-`(dev, ino)` open-then-verify.
   fn spawn_inotify(
     config: super::SourceConfig,
     canonical: PathBuf,
+    root_fd: BorrowedFd<'_>,
   ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
-    let (handle, rx, meta) = inotify_source::Source::spawn(config, canonical)?;
+    let (handle, rx, meta) = inotify_source::Source::spawn(config, canonical, root_fd)?;
     Ok((SourceHandle::Inotify(handle), rx, meta))
   }
 
   /// The probed branch, shared by `Auto` and forced `Fanotify`: run the fanotify
-  /// precondition probe on the dispatcher's `canonical` root and either spawn
-  /// fanotify reusing the probed fd, or handle the failure per `fall_back`.
+  /// precondition probe on the dispatcher's pinned root and either spawn fanotify
+  /// reusing the probed fd, or handle the failure per `fall_back`.
   ///
   /// The seed walk is the last precondition and can only be judged AFTER the
   /// probe hands over the marked fd (it reuses that root), so a tree the walk
@@ -360,10 +397,11 @@ impl Source {
   fn spawn_probed(
     config: super::SourceConfig,
     canonical: PathBuf,
+    root_fd: BorrowedFd<'_>,
     fall_back: bool,
   ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
-    match probe::probe_fanotify(&canonical) {
-      Ok(probed) => match fanotify::Source::spawn(config, canonical.clone(), probed.fd) {
+    match probe::probe_fanotify(root_fd) {
+      Ok(probed) => match fanotify::Source::spawn(config, canonical.clone(), probed.fd, root_fd) {
         fanotify::FanotifySpawn::Started(handle, rx, meta) => {
           Ok((SourceHandle::Fanotify(handle), rx, meta))
         }
@@ -372,29 +410,119 @@ impl Source {
         // to inotify (its per-directory arms surface an unreadable directory
         // natively); a forced `Fanotify` surfaces the typed viability error.
         fanotify::FanotifySpawn::NotViable(config) if fall_back => {
-          Self::spawn_inotify(config, canonical)
+          Self::spawn_inotify(config, canonical, root_fd)
         }
         fanotify::FanotifySpawn::NotViable(_) => Err(probe::probe_error(super::ProbeStage::Walk)),
       },
       // Auto falls through to the universal backend; a forced `Fanotify` never
       // silently downgrades — it surfaces which precondition failed.
-      Err(_) if fall_back => Self::spawn_inotify(config, canonical),
+      Err(_) if fall_back => Self::spawn_inotify(config, canonical, root_fd),
       Err(stage) => Err(probe::probe_error(stage)),
     }
   }
 }
 
-/// Whether the filesystem holding `path` is a refused remote/virtual kind — the
-/// shared locality gate every backend passes through the dispatcher (design §5
-/// row 1). `StatFs.f_type` is the same `__fsword_t` field the denylist keys on
-/// (`REMOTE_FS_MAGICS`), so the magic-number comparison is unchanged.
+/// Pins the canonical root as one directory fd, the single object every later
+/// live-state decision grounds on (design §5, the objects-not-paths spawn
+/// discipline). Uses `openat2` with `RESOLVE_NO_SYMLINKS` so a symlink swapped in
+/// at ANY component after `canonicalize` fails the open (`ELOOP`) rather than
+/// redirecting the pin to a different object — the gate, the mark, the identity,
+/// and the seed then cannot be aimed anywhere but the object this open resolved.
+/// `O_DIRECTORY` refuses a root retargeted to a non-directory; `O_RDONLY` lets the
+/// fanotify seed walk `readdir` the same fd; `O_CLOEXEC` keeps it from leaking.
+///
+/// A vanished root is [`RootUnavailable`](super::SourceError::RootUnavailable) and
+/// a symlink-swapped root fails the same way — both benign races the caller
+/// surfaces typed, never a source committed on the wrong object.
+///
+/// `openat2` landed in Linux 5.6; inotify's floor predates it, so this open is
+/// the one place the dispatcher needs the syscall for BOTH backends. It is
+/// present on every kernel either backend runs on.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn is_remote_fs(path: &Path) -> Result<bool, super::SourceError> {
-  let stat = rustix::fs::statfs(path).map_err(|err| super::SourceError::RootUnavailable {
-    root: path.to_path_buf(),
+fn pin_root(canonical: &Path) -> Result<OwnedFd, super::SourceError> {
+  rustix::fs::openat2(
+    rustix::fs::CWD,
+    canonical,
+    OFlags::RDONLY
+      .union(OFlags::DIRECTORY)
+      .union(OFlags::NOFOLLOW)
+      .union(OFlags::CLOEXEC),
+    rustix::fs::Mode::empty(),
+    rustix::fs::ResolveFlags::NO_SYMLINKS,
+  )
+  .map_err(|err| super::SourceError::RootUnavailable {
+    root: canonical.to_path_buf(),
+    source: err.into(),
+  })
+}
+
+/// Whether the pinned root lives on a refused remote/virtual filesystem — the
+/// shared locality gate every backend passes through the dispatcher (design §5
+/// row 1), read from the PINNED fd so a mount/symlink swap cannot smuggle a
+/// remote fs past it (a path `statfs` here would race the same window the mark
+/// once did). `StatFs.f_type` is the same `__fsword_t` field the denylist keys on
+/// (`REMOTE_FS_MAGICS`), so the magic-number comparison is unchanged.
+///
+/// The seed fsid the fanotify FID map needs is a SEPARATE `fstatfs` on the same
+/// pin (rustix hides `StatFs::f_fsid` behind a private field, so the fsid must be
+/// read through libc — the documented two-style boundary). The two reads cannot
+/// disagree about which object they saw: both name the pin, and no path is
+/// resolved in either, so no swap can land between them.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn root_is_remote(root_fd: &OwnedFd, canonical: &Path) -> Result<bool, super::SourceError> {
+  let stat = rustix::fs::fstatfs(root_fd).map_err(|err| super::SourceError::RootUnavailable {
+    root: canonical.to_path_buf(),
     source: err.into(),
   })?;
   Ok(fs_type_is_remote(stat.f_type as i64))
+}
+
+/// The identities of every strict ancestor of the canonical root — the
+/// containment evidence `final_root_conflict` decides root disjointness on
+/// (is this root inside a live one, or a live one inside it, under ANY spelling).
+/// Shared by both Linux backends' post-live bracket.
+///
+/// Each ancestor is PINNED before its identity is read: `openat2` with
+/// `RESOLVE_NO_SYMLINKS` and `O_PATH | O_NOFOLLOW | O_DIRECTORY` (the same
+/// object-grounding the arm anchors use), then `fstat` on that fd — never a bare
+/// path stat. `canonicalize` left the ancestor chain symlink-free, so the
+/// no-symlink open succeeds on the honest chain and fails (`ELOOP`) only if a
+/// symlink was swapped in for an ancestor after canonicalization, which is
+/// surfaced as [`RootUnavailable`](super::SourceError::RootUnavailable) rather than
+/// silently recording a swapped-in object's identity as an ancestor. `O_PATH`
+/// needs only search permission (like the previous `metadata`), so a normal
+/// search-but-not-read ancestor still resolves.
+///
+/// Grounding this matters because the identities gate a TRUST decision (admitting
+/// or refusing a second overlapping watch); a corrupted ancestor could only ever
+/// mis-decide THAT — never redirect the live source, whose object is the pin — but
+/// the objects-not-paths discipline still leaves no path-stat feeding a trust
+/// decision unpinned.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn ancestor_identities(canonical: &Path) -> Result<Vec<super::RootIdentity>, super::SourceError> {
+  let mut ancestors = Vec::new();
+  for ancestor in canonical.ancestors().skip(1) {
+    let fd = rustix::fs::openat2(
+      rustix::fs::CWD,
+      ancestor,
+      OFlags::PATH
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::CLOEXEC),
+      rustix::fs::Mode::empty(),
+      rustix::fs::ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|err| super::SourceError::RootUnavailable {
+      root: ancestor.to_path_buf(),
+      source: err.into(),
+    })?;
+    let stat = rustix::fs::fstat(&fd).map_err(|err| super::SourceError::RootUnavailable {
+      root: ancestor.to_path_buf(),
+      source: err.into(),
+    })?;
+    ancestors.push(super::RootIdentity::new(stat.st_dev, stat.st_ino));
+  }
+  Ok(ancestors)
 }
 
 /// A live Linux source, one variant per backend. Dropping it tears the reader
@@ -461,7 +589,10 @@ mod inotify_source {
   use std::{
     ffi::OsString,
     fs,
-    os::{fd::OwnedFd, unix::fs::MetadataExt},
+    os::{
+      fd::{BorrowedFd, OwnedFd},
+      unix::fs::MetadataExt,
+    },
     sync::{Arc, mpsc},
     thread::JoinHandle,
   };
@@ -470,7 +601,7 @@ mod inotify_source {
 
   use super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
-    ExpectedObject, WatchOutcome, mounts_under,
+    ExpectedObject, WatchOutcome, ancestor_identities, mounts_under,
     wake::WakeState,
   };
   use crate::os::MAX_EXCLUSIONS;
@@ -516,14 +647,22 @@ mod inotify_source {
     /// runs.
     ///
     /// `canonical` is the dispatcher's already canonicalized, already
-    /// locality-checked root (design §5 row 1 runs once, before selection). The
-    /// remaining barrier work mirrors the macOS bracket: capture the root
-    /// identity and mount seed strictly before the fd exists, then re-stat once
-    /// the reader is live — a root replaced across the gap is torn down and
-    /// rejected, never committed.
+    /// locality-checked root (design §5 row 1 runs once, before selection), and
+    /// `root_fd` the dispatcher's PINNED root — the same object the shared gate
+    /// vouched for. The barrier reads the root identity from that pin
+    /// (object-grounded, not a path stat), captures the mount seed strictly before
+    /// the fd exists, then re-stats once the reader is live — a root replaced
+    /// across the gap is torn down and rejected, never committed.
+    ///
+    /// The inotify ARMS do not consume this pin: each per-directory arm opens its
+    /// own transient `O_PATH` anchor and verifies the opened object still carries
+    /// the enumerate-time `expected` `(dev, ino)` before installing, so the root
+    /// arm is protected by that open-then-verify regardless of this fd's lifetime
+    /// (which ends when the dispatcher's `spawn` returns).
     pub(crate) fn spawn(
       config: SourceConfig,
       canonical: std::path::PathBuf,
+      root_fd: BorrowedFd<'_>,
     ) -> Result<(SourceHandle, super::super::EventReceiver, RootMeta), SourceError> {
       if config.exclusions.len() > MAX_EXCLUSIONS {
         return Err(SourceError::TooManyExclusions {
@@ -531,15 +670,16 @@ mod inotify_source {
         });
       }
 
-      let meta = fs::metadata(&canonical).map_err(|source| SourceError::RootUnavailable {
+      // Identity from the PIN (fstat): the registry anchors on exactly the object
+      // the gate saw, never an object a path stat could be redirected to. The pin's
+      // `O_DIRECTORY` already refused a non-directory root, so no `is_dir` recheck
+      // is needed here.
+      let stat = rustix::fs::fstat(root_fd).map_err(|err| SourceError::RootUnavailable {
         root: canonical.clone(),
-        source,
+        source: err.into(),
       })?;
-      if !meta.is_dir() {
-        return Err(SourceError::NotADirectory { root: canonical });
-      }
-      let root_dev = meta.dev();
-      let identity = RootIdentity::new(meta.dev(), meta.ino());
+      let root_dev = stat.st_dev;
+      let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
       let mounts = mounts_under(&canonical).unwrap_or_default();
 
       let (queue_tx, queue_rx) = async_channel::unbounded();
@@ -561,10 +701,27 @@ mod inotify_source {
         thread: Some(thread),
       };
 
-      // The post-live half of the identity bracket: nothing is watched yet,
-      // but the re-stat proves the object survived the barrier→reader gap, so
-      // the registry identity and the (about-to-be-armed) stream anchor name
-      // one object.
+      // The post-live half of the identity bracket, two complementary signals
+      // (the fanotify sibling documents the split in full):
+      //   - the PINNED-fd re-stat proves the seeded/identified object survived the
+      //     barrier→reader gap (same-object liveness);
+      //   - the PATH re-stat proves the path still resolves to that object
+      //     (replaced-at-path — the distinct question `RootReplaced` names, which
+      //     the driver's path-re-resolving refresh must reject up front).
+      let pinned = match rustix::fs::fstat(root_fd) {
+        Ok(pinned) => pinned,
+        Err(err) => {
+          handle.shutdown();
+          return Err(SourceError::RootUnavailable {
+            root: canonical,
+            source: err.into(),
+          });
+        }
+      };
+      if RootIdentity::new(pinned.st_dev, pinned.st_ino) != identity {
+        handle.shutdown();
+        return Err(SourceError::RootReplaced { root: canonical });
+      }
       let live = match fs::metadata(&canonical) {
         Ok(live) => live,
         Err(source) => {
@@ -583,19 +740,13 @@ mod inotify_source {
         handle.shutdown();
         return Err(SourceError::RootReplaced { root: canonical });
       }
-      let mut ancestors = Vec::new();
-      for ancestor in canonical.ancestors().skip(1) {
-        match fs::metadata(ancestor) {
-          Ok(meta) => ancestors.push(RootIdentity::new(meta.dev(), meta.ino())),
-          Err(source) => {
-            handle.shutdown();
-            return Err(SourceError::RootUnavailable {
-              root: ancestor.to_path_buf(),
-              source,
-            });
-          }
+      let ancestors = match ancestor_identities(&canonical) {
+        Ok(ancestors) => ancestors,
+        Err(err) => {
+          handle.shutdown();
+          return Err(err);
         }
-      }
+      };
 
       let meta = RootMeta {
         root: canonical,
