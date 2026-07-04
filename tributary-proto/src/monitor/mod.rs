@@ -1704,6 +1704,17 @@ impl Monitor {
     }
   }
 
+  /// The object identity a watch was installed for, if the driver supplied one.
+  ///
+  /// The driver reads this back when arming the watch's kernel watch: the open
+  /// resolves by path (or an anchor chain), and the object it lands on must match
+  /// this identity before the watch is installed — otherwise a rename between the
+  /// enumerate that discovered the object and the arm would install the watch on a
+  /// DIFFERENT object while the Monitor keeps the old identity (misattribution).
+  pub fn node_identity(&self, watch: WatchId) -> Option<Identity> {
+    self.nodes.get(&watch).and_then(|node| node.identity)
+  }
+
   /// Whether `watch`'s installed identity and `other` are both known and unequal — the
   /// positive signal of a same-name replacement. Unknown on either side is NOT "differs":
   /// identity is optional, and absent it the core reconciles conservatively (reuse on

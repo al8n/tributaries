@@ -191,6 +191,83 @@ mod table {
     assert!(!t.contains(7));
   }
 
+  /// A `wd`-reuse race: a fresh install lands on a `wd` whose tombstone still
+  /// awaits its stale `IN_IGNORED`. Registering must revive the entry as a fresh
+  /// live generation, and the stale IGNORED must be ABSORBED — it clears the
+  /// remnant without erasing the new anchor (which would silently drop a live
+  /// watch, the exact loss this generation-correctness prevents).
+  #[test]
+  fn register_onto_draining_survives_the_stale_ignored() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    assert!(t.contains(7), "the tombstone awaits its IGNORED");
+
+    // The kernel recycled wd 7 for a brand-new watch before the old IGNORED
+    // landed.
+    t.register(7, watch(2));
+    assert_eq!(
+      t.anchors(7),
+      &[watch(2)],
+      "the fresh install replaces the tombstone with a live entry"
+    );
+
+    // The OLD incarnation's IGNORED arrives: it is absorbed, not honored.
+    let fanned = t.on_ignored(7);
+    assert!(
+      fanned.is_empty(),
+      "the stale IGNORED fans to nobody (it belonged to the drained watch)"
+    );
+    assert_eq!(
+      t.anchors(7),
+      &[watch(2)],
+      "the new anchor survives the stale IGNORED"
+    );
+
+    // The new watch's own eventual IGNORED erases legitimately.
+    let fanned = t.on_ignored(7);
+    assert_eq!(
+      fanned,
+      vec![watch(2)],
+      "the live watch's own IGNORED erases"
+    );
+    assert!(!t.contains(7));
+  }
+
+  /// A PLAIN draining entry (no reuse) still erases on its IGNORED — the reuse
+  /// handling must not change the ordinary self-induced teardown.
+  #[test]
+  fn plain_drain_still_erases_on_ignored() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    let fanned = t.on_ignored(7);
+    assert!(
+      fanned.is_empty(),
+      "a self-drained watch fans nothing at IGNORED"
+    );
+    assert!(!t.contains(7), "the plain drain's IGNORED erases the entry");
+  }
+
+  /// The kernel contract guarantees exactly one final `IN_IGNORED` per `wd`, so a
+  /// SECOND IGNORED after a reuse-absorbed one cannot happen — but if it did, it
+  /// erases legitimately rather than corrupting state.
+  #[test]
+  fn second_ignored_after_reuse_erases() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    t.register(7, watch(2));
+
+    // First IGNORED: absorbed as the stale remnant.
+    assert!(t.on_ignored(7).is_empty());
+    assert_eq!(t.anchors(7), &[watch(2)]);
+
+    // A (contract-impossible) second IGNORED erases the live entry.
+    assert_eq!(t.on_ignored(7), vec![watch(2)]);
+    assert!(!t.contains(7));
+  }
+
   #[test]
   fn unknown_wd_attributes_to_nobody() {
     let t = WdTable::new();
@@ -208,9 +285,19 @@ mod smoke {
 
   use crate::os::{
     SourceConfig,
-    linux::{AnchorRequest, RawLinuxEvent, Source, WatchOutcome},
+    linux::{AnchorRequest, ExpectedObject, RawLinuxEvent, Source, WatchOutcome},
     transport::SourceMessage,
   };
+
+  /// The `(dev, ino)` of `path`, for building an `ExpectedObject` an arm confirms.
+  fn ident(path: &std::path::Path) -> ExpectedObject {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path).expect("stat");
+    ExpectedObject {
+      dev: meta.dev(),
+      ino: NonZeroU64::new(meta.ino()).expect("a real inode is non-zero"),
+    }
+  }
 
   fn watch(n: u64) -> WatchId {
     WatchId::new(NonZeroU64::new(n).unwrap())
@@ -260,6 +347,7 @@ mod smoke {
       watch: watch(1),
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
+      expected: None,
     });
     let wd = match reply.outcome {
       WatchOutcome::Installed(wd) => wd,
@@ -287,6 +375,7 @@ mod smoke {
       watch: watch(1),
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
+      expected: None,
     });
     let WatchOutcome::Installed(wd) = first.outcome else {
       panic!("first arm: {:?}", first.outcome);
@@ -295,9 +384,63 @@ mod smoke {
       watch: watch(2),
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
+      expected: None,
     });
     assert_eq!(second.outcome, WatchOutcome::Aliased(wd));
 
+    handle.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  /// An arm carrying the CORRECT expected identity installs: the opened object
+  /// is the one the enumerate saw.
+  #[test]
+  fn arm_with_matching_identity_installs() {
+    let dir = scratch("verify-ok");
+    let (handle, _rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let reply = handle.add_watch(AnchorRequest {
+      watch: watch(1),
+      parent: None,
+      name: OsString::from(meta.root.as_os_str()),
+      expected: Some(ident(&meta.root)),
+    });
+    assert!(
+      matches!(reply.outcome, WatchOutcome::Installed(_)),
+      "a matching identity arms: {:?}",
+      reply.outcome
+    );
+    handle.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  /// An arm whose expected identity does NOT match the object at the path is
+  /// refused as `Gone` — the object was replaced between the enumerate and the
+  /// arm, and installing the watch on the new object would misattribute. The
+  /// Monitor's drop+rescan then heals. A fresh scratch directory's real identity
+  /// stands in for "some other object", forced to differ by bumping the inode.
+  #[test]
+  fn arm_with_mismatched_identity_is_gone() {
+    let dir = scratch("verify-mismatch");
+    let (handle, _rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let mut wrong = ident(&meta.root);
+    // A different inode: the name now points at another object than the enumerate
+    // recorded.
+    wrong.ino = NonZeroU64::new(wrong.ino.get() ^ 0xFFFF_FFFF).expect("still non-zero");
+    let reply = handle.add_watch(AnchorRequest {
+      watch: watch(1),
+      parent: None,
+      name: OsString::from(meta.root.as_os_str()),
+      expected: Some(wrong),
+    });
+    assert_eq!(
+      reply.outcome,
+      WatchOutcome::Failed(tributary_proto::WatchError::Gone),
+      "a replaced object is refused, not silently mis-armed"
+    );
+    assert!(
+      reply.anchor.is_none(),
+      "a refused arm returns no transient anchor"
+    );
     handle.shutdown();
     let _ = fs::remove_dir_all(&dir);
   }
@@ -310,6 +453,7 @@ mod smoke {
       watch: watch(1),
       parent: None,
       name: OsString::from(meta.root.join("absent").as_os_str()),
+      expected: None,
     });
     assert_eq!(
       reply.outcome,
@@ -327,6 +471,7 @@ mod smoke {
       watch: watch(1),
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
+      expected: None,
     });
     assert!(matches!(reply.outcome, WatchOutcome::Installed(_)));
 

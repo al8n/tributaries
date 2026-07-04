@@ -22,8 +22,8 @@ use tributary_proto::{
 
 use crate::{
   core::{
-    Delivery, DriverCore, Effect, MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate,
-    RootLiveness,
+    Delivery, DriverCore, Effect, ExpectedObject, MountRefresh, ProbeId, ProbeOutcome, RawDirEntry,
+    RawEnumerate, RootLiveness,
   },
   error::WatchRootError,
   os::{
@@ -304,12 +304,15 @@ pub(crate) trait ScopeRegistry: Send + Sync + 'static {
 /// the order the core produced them.
 pub(crate) enum ControlRequest {
   /// Install a per-directory watch for `watch` (arming `parent`'s child
-  /// `name`, addressed by absolute `path`).
+  /// `name`, addressed by absolute `path`). `expected` is the `(dev, ino)` the
+  /// opened object must still have before the watch installs (the enumerate→arm
+  /// rename guard); `None` leaves the arm unverified.
   Arm {
     watch: WatchId,
     parent: WatchId,
     name: Segment,
     path: Arc<PathBuf>,
+    expected: Option<ExpectedObject>,
   },
   /// Remove `watch`'s per-directory watch (fire-and-forget; no reply).
   Disarm { watch: WatchId },
@@ -348,7 +351,8 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   }
 
   /// Installs a per-directory kernel watch for `watch` at `path` (blocking).
-  /// Reached only under a descending profile.
+  /// Reached only under a descending profile. `expected` is the object the arm
+  /// must confirm the open lands on (the enumerate→arm rename guard).
   fn add_watch(
     &self,
     scope: ScopeId,
@@ -356,6 +360,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
     parent: WatchId,
     path: &Path,
     name: &Segment,
+    expected: Option<ExpectedObject>,
   ) -> WatchOutcome;
 
   /// Removes a per-directory kernel watch (blocking, fire-and-forget).
@@ -380,7 +385,11 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
           parent,
           name,
           path,
-        } => outcomes.push((watch, self.add_watch(scope, watch, parent, &path, &name))),
+          expected,
+        } => outcomes.push((
+          watch,
+          self.add_watch(scope, watch, parent, &path, &name, expected),
+        )),
         ControlRequest::Disarm { watch } => self.remove_watch(scope, watch),
       }
     }
@@ -488,6 +497,13 @@ impl RealFs {
   /// the Monitor's NotFound path re-arms. The root is its own parent, and
   /// `openat(anchor, name)` cannot re-open the anchor itself, so the root
   /// always arms by absolute path.
+  ///
+  /// The path fallback is exactly why `expected` matters: an absolute-path open
+  /// can land on a DIFFERENT object if a rename slipped in after the enumerate,
+  /// so the reader confirms the opened fd's `(dev, ino)` against `expected`
+  /// before installing the watch (the anchor-chain open is already object-pinned
+  /// through `/proc/self/fd`, but the fallback is not — and it is the common case
+  /// once the cold enumerate has consumed the parent anchor).
   #[cfg(all(target_os = "linux", not(miri)))]
   fn build_arm_request(
     &self,
@@ -495,7 +511,12 @@ impl RealFs {
     parent: WatchId,
     path: &Path,
     name: &Segment,
+    expected: Option<ExpectedObject>,
   ) -> crate::os::linux::AnchorRequest {
+    let expected = expected.map(|e| crate::os::linux::ExpectedObject {
+      dev: e.dev,
+      ino: e.ino,
+    });
     let parent_anchor = if parent == watch {
       None
     } else {
@@ -511,11 +532,13 @@ impl RealFs {
         watch,
         parent: Some(fd),
         name: std::ffi::OsString::from(name.as_str()),
+        expected,
       },
       None => crate::os::linux::AnchorRequest {
         watch,
         parent: None,
         name: path.as_os_str().to_os_string(),
+        expected,
       },
     }
   }
@@ -607,6 +630,7 @@ impl FsOps for RealFs {
     parent: WatchId,
     path: &Path,
     name: &Segment,
+    expected: Option<ExpectedObject>,
   ) -> WatchOutcome {
     self
       .batch_control(
@@ -616,6 +640,7 @@ impl FsOps for RealFs {
           parent,
           name: name.clone(),
           path: Arc::new(path.to_path_buf()),
+          expected,
         }],
       )
       .into_iter()
@@ -632,6 +657,7 @@ impl FsOps for RealFs {
     _parent: WatchId,
     _path: &Path,
     _name: &Segment,
+    _expected: Option<ExpectedObject>,
   ) -> WatchOutcome {
     WatchOutcome::Failed(WatchError::Io)
   }
@@ -684,9 +710,10 @@ impl FsOps for RealFs {
           parent,
           name,
           path,
+          expected,
         } => {
           ops.push(ControlOp::Arm(
-            self.build_arm_request(watch, parent, &path, &name),
+            self.build_arm_request(watch, parent, &path, &name, expected),
           ));
           arm_watches.push(watch);
         }
@@ -1268,6 +1295,7 @@ fn execute_effects<R, F>(
         parent,
         name,
         path,
+        expected,
       } => {
         // Droppable at close, unlike spawns and teardowns: a result that
         // never lands leaves the Monitor node Arming, and the node dies with
@@ -1283,6 +1311,7 @@ fn execute_effects<R, F>(
             parent,
             name,
             path,
+            expected,
           });
       }
       Effect::RemoveWatch { scope, watch } => {

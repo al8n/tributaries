@@ -214,6 +214,16 @@ impl RootIdentity {
   pub(crate) const fn new(dev: u64, ino: u64) -> Self {
     Self { dev, ino }
   }
+
+  /// The device the identified object lives on.
+  pub(crate) const fn dev(&self) -> u64 {
+    self.dev
+  }
+
+  /// The identified object's inode.
+  pub(crate) const fn ino(&self) -> u64 {
+    self.ino
+  }
 }
 
 /// What a source's spawn learned about its root — finalized strictly BEFORE

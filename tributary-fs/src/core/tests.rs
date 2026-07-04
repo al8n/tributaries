@@ -3185,6 +3185,33 @@ mod kernel_recursive_fanotify {
     );
   }
 
+  /// The moved object's interned identity rides BOTH halves of the rename onto
+  /// the Monitor records — it lives on the rename half, not on the (always
+  /// `None`) top-level event identity, so the lowering must read it from there.
+  #[test]
+  fn rename_records_carry_the_moved_object_node() {
+    let (mut core, scope) = live_fanotify();
+    let nodes = core.compiled_fanotify_nodes(
+      scope,
+      vec![AdmittedEvent {
+        mask: FanMask::new(FAN_RENAME),
+        path: None,
+        identity: None,
+        rename: Some(AdmittedRename {
+          old_path: PathBuf::from("/r/old.txt"),
+          new_path: PathBuf::from("/r/sub/new.txt"),
+          identity: NonZeroU64::new(77),
+        }),
+      }],
+    );
+    let expected = Some(tributary_proto::Identity::new(NonZeroU64::new(77).unwrap()));
+    assert_eq!(
+      nodes,
+      vec![expected, expected],
+      "both the MovedFrom and MovedTo carry the rename half's interned identity"
+    );
+  }
+
   /// Two renames in one batch mint DISTINCT cookies, so their halves never
   /// cross-pair — each is its own Moved.
   #[test]

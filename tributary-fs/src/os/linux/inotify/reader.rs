@@ -31,7 +31,7 @@ use tributary_proto::{WatchError, WatchId};
 use super::{
   super::{
     super::{SourceError, transport},
-    AnchorRequest, ArmReply, WatchOutcome, attribute_events,
+    AnchorRequest, ArmReply, ExpectedObject, WatchOutcome, attribute_events,
     wake::WakeState,
   },
   decode::{self, WATCH_MASK},
@@ -218,7 +218,8 @@ fn drain_events(fd: &OwnedFd, buf: &mut [u8], table: &mut WdTable, shared: &Read
 
 /// Executes one arm on the reader's own fd: open the target through the
 /// parent anchor (object-correct — a parent rename cannot retarget the add),
-/// install through `/proc/self/fd/N`, and map `EEXIST` to the aliasing path.
+/// confirm the opened object is the one the enumerate saw, install through
+/// `/proc/self/fd/N`, and map `EEXIST` to the aliasing path.
 fn arm(fd: &OwnedFd, table: &mut WdTable, request: AnchorRequest) -> ArmReply {
   let anchor = match open_anchor(&request) {
     Ok(anchor) => anchor,
@@ -229,6 +230,21 @@ fn arm(fd: &OwnedFd, table: &mut WdTable, request: AnchorRequest) -> ArmReply {
       };
     }
   };
+
+  // Object-correctness: an absolute-path open (the common case, once the cold
+  // enumerate consumed the parent anchor) can land on a DIFFERENT object if a
+  // rename slipped in after the enumerate. `fstat` the opened `O_PATH` fd and
+  // require the `(dev, ino)` the enumerate read — a mismatch means the name now
+  // points at another object, so the arm is refused as `Gone` and the Monitor's
+  // tested drop+rescan heals. An anchor-chain open is already object-pinned
+  // through `/proc/self/fd`, but confirming it too costs one `fstat` and closes
+  // the window uniformly.
+  if !object_matches(&anchor, request.expected) {
+    return ArmReply {
+      outcome: WatchOutcome::Failed(WatchError::Gone),
+      anchor: None,
+    };
+  }
 
   let proc_path = format!("/proc/self/fd/{}", anchor.as_raw_fd());
   // The /proc entry is itself a symlink to the anchored object, so the add
@@ -267,6 +283,22 @@ fn arm(fd: &OwnedFd, table: &mut WdTable, request: AnchorRequest) -> ArmReply {
       outcome: WatchOutcome::Failed(errno_to_watch_error(err)),
       anchor: None,
     },
+  }
+}
+
+/// Whether the opened anchor is the object the enumerate saw. An `expected` of
+/// `None` is unverified (identity was unavailable at enumerate time) and passes.
+/// An `fstat` failure is treated as a mismatch: the object the arm would install
+/// on cannot be confirmed, so refusing (→ `Gone` → rescan) is the honest choice.
+/// `fstat` on an `O_PATH` fd reads the pinned object's `(dev, ino)` — exactly the
+/// object the watch would attach to.
+fn object_matches(anchor: &OwnedFd, expected: Option<ExpectedObject>) -> bool {
+  let Some(expected) = expected else {
+    return true;
+  };
+  match rustix::fs::fstat(anchor) {
+    Ok(stat) => stat.st_dev == expected.dev && stat.st_ino == expected.ino.get(),
+    Err(_) => false,
   }
 }
 

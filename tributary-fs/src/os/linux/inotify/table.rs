@@ -10,6 +10,15 @@
 //! exactly once), and the entry itself survives — draining — until the queued
 //! `IN_IGNORED` is consumed: `IN_IGNORED` is the guaranteed final event for a
 //! `wd` and therefore the authoritative erase point ([`WdTable::on_ignored`]).
+//!
+//! Generation safety across `wd` reuse: the kernel's cyclic `wd` allocator makes
+//! reuse of a still-draining `wd` remote (~2³¹ arms), but the table stays correct
+//! on its own regardless. Registering onto a draining `wd` REPLACES the tombstone
+//! with a fresh live entry AND records that one stale `IN_IGNORED` is still queued
+//! for the OLD watch — the next `IN_IGNORED` clears that pending mark WITHOUT
+//! erasing the new live anchor set (which would silently drop a live watch). The
+//! `IN_IGNORED` after that (impossible under the kernel's one-final-event
+//! contract, but not assumed) erases legitimately.
 
 use std::collections::BTreeMap;
 
@@ -26,12 +35,18 @@ pub(crate) enum DrainDecision {
   KeepWd,
 }
 
-/// One `wd`'s bookkeeping: the anchors still attributing, and whether the
-/// kernel-side removal was already issued.
+/// One `wd`'s bookkeeping: the anchors still attributing, whether the
+/// kernel-side removal was already issued, and how many stale `IN_IGNORED`s from
+/// a previous (drained) incarnation of this `wd` are still queued ahead of this
+/// live entry.
 #[derive(Debug, Default)]
 struct WdEntry {
   live: Vec<WatchId>,
   draining: bool,
+  /// Stale `IN_IGNORED`s a previous incarnation left queued. Registering onto a
+  /// draining `wd` bumps this so the next IGNORED clears the tombstone remnant
+  /// WITHOUT erasing this fresh live set. Non-zero only across a `wd`-reuse race.
+  pending_stale_ignored: u32,
 }
 
 /// The `wd ↔ anchors` table (attribution below the core, per the proto's
@@ -49,14 +64,34 @@ impl WdTable {
   }
 
   /// Records a freshly-installed kernel watch backing `anchor`.
+  ///
+  /// Registering onto a DRAINING `wd` (a fresh install landed on a `wd` whose
+  /// tombstone still awaits its `IN_IGNORED`) is a `wd`-reuse race: the tombstone
+  /// is replaced with a fresh live entry and the stale IGNORED is remembered
+  /// (`pending_stale_ignored`) so it clears the remnant rather than erasing the
+  /// new anchor. A live entry just appends.
   pub(crate) fn register(&mut self, wd: i32, anchor: WatchId) {
-    self.entries.entry(wd).or_default().live.push(anchor);
+    let entry = self.entries.entry(wd).or_default();
+    if entry.draining {
+      // The old incarnation's IGNORED is still queued; step out of draining into
+      // a fresh live generation and mark that one IGNORED must be absorbed.
+      entry.draining = false;
+      entry.live.clear();
+      entry.pending_stale_ignored = entry.pending_stale_ignored.saturating_add(1);
+    }
+    entry.live.push(anchor);
     self.by_anchor.insert(anchor, wd);
   }
 
   /// Records an additional anchor onto an EXISTING `wd` — the `EEXIST`
-  /// aliasing path (one inode reached through two names).
+  /// aliasing path (one inode reached through two names). `EEXIST` is returned
+  /// by the kernel only for a LIVE watch, so the target entry is never draining
+  /// here; the shared `register` path handles it either way.
   pub(crate) fn alias(&mut self, wd: i32, anchor: WatchId) {
+    debug_assert!(
+      self.entries.get(&wd).is_some_and(|entry| !entry.draining),
+      "EEXIST aliasing targets a live kernel watch, never a draining tombstone"
+    );
     self.register(wd, anchor);
   }
 
@@ -100,7 +135,18 @@ impl WdTable {
   /// anchors that were still live (kernel-initiated teardown fans an
   /// `Ignored` record out to each); empty when the teardown was self-induced
   /// and the anchors already drained.
+  ///
+  /// A STALE IGNORED left over from a drained incarnation this `wd` was reused
+  /// for is absorbed instead of erasing: it clears one `pending_stale_ignored`
+  /// and leaves the fresh live set (and its `by_anchor` links) intact, so a
+  /// live watch that reused the `wd` is never silently dropped.
   pub(crate) fn on_ignored(&mut self, wd: i32) -> Vec<WatchId> {
+    if let Some(entry) = self.entries.get_mut(&wd)
+      && entry.pending_stale_ignored > 0
+    {
+      entry.pending_stale_ignored -= 1;
+      return Vec::new();
+    }
     let Some(entry) = self.entries.remove(&wd) else {
       return Vec::new();
     };

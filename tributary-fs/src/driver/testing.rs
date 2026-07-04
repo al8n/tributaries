@@ -17,7 +17,7 @@ use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 
 use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
 use crate::{
-  core::{MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
+  core::{ExpectedObject, MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
   os::{
     BackendKind, RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError, SourceEvent,
     SourceMessage,
@@ -672,6 +672,7 @@ impl FsOps for FakeFs {
     _parent: WatchId,
     path: &Path,
     _name: &Segment,
+    expected: Option<ExpectedObject>,
   ) -> WatchOutcome {
     self.park_on(&self.state.arm_hold);
     self
@@ -682,6 +683,19 @@ impl FsOps for FakeFs {
       .push((watch, path.to_path_buf()));
     if let Some(err) = self.state.watch_failures.lock().unwrap().get(path) {
       return WatchOutcome::Failed(*err);
+    }
+    // Object-correctness, modeled: the real reader fstats the opened anchor and
+    // refuses a mismatch. The fake compares the arm's expected `(dev, ino)`
+    // against the object currently at `path` in the fake tree — an object
+    // replaced between the enumerate and this arm is refused as `Gone`, driving
+    // the same drop+rescan heal.
+    if let Some(expected) = expected {
+      let current = self.state.nodes.lock().unwrap().get(path).copied();
+      let matches =
+        current.is_some_and(|node| node.dev == expected.dev && node.ino == expected.ino.get());
+      if !matches {
+        return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
+      }
     }
     if let Some(wd) = self.state.watch_aliases.lock().unwrap().get(path) {
       return WatchOutcome::Aliased(*wd);

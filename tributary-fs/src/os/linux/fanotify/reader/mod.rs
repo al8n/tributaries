@@ -31,7 +31,7 @@ use super::{
   },
   Admission, admit,
   fid::decode_events,
-  map::FidMap,
+  map::{FidMap, SeedEntry},
   source::ReseedContext,
 };
 
@@ -175,13 +175,61 @@ fn drain_events(
     // signaling loss downstream, so the reseeded sight is live by the time the
     // consumer's rescan re-enumerates. The walk is synchronous between reads
     // (overflow is rare, the walk is bounded by the root's directory count).
-    if decoded.lossy
-      && let Ok(entries) = reseed.walk()
-    {
-      map.reseed(entries);
+    //
+    // A walk that fails leaves the map permanently blind — a stale-but-running
+    // source is the silent-loss shape this whole stack exists to prevent — so
+    // the failure is escalated honestly, not swallowed.
+    if decoded.lossy && matches!(reseed_map(map, || reseed.walk()), ReseedOutcome::Blind) {
+      signal_fatal(
+        shared,
+        SourceError::ReadFailed {
+          source: reseed_blind_error(),
+        },
+      );
+      return false;
     }
     transport::forward_batch(&shared.transport, events, decoded.lossy, |msg| {
       shared.queue.try_send(msg).is_ok()
     });
   }
 }
+
+/// Whether a loss-triggered reseed restored the map's sight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReseedOutcome {
+  /// The walk succeeded (on the first try or the single retry) and the map was
+  /// rebuilt.
+  Reseeded,
+  /// The walk failed twice: the map is stale and the source is blind. The caller
+  /// escalates to the terminal `Fatal` rather than run on permanently.
+  Blind,
+}
+
+/// Rebuilds `map` from a fresh walk after a loss, retrying ONCE on failure
+/// before conceding blindness. Pure over the walk closure so the
+/// retry-then-escalate policy is testable without a live fd: a walk that fails
+/// twice returns [`ReseedOutcome::Blind`]; any success reseeds and returns
+/// [`ReseedOutcome::Reseeded`]. The immediate retry absorbs a transient failure
+/// (a directory momentarily unreadable mid-walk) without killing the scope.
+fn reseed_map<W>(map: &mut FidMap, mut walk: W) -> ReseedOutcome
+where
+  W: FnMut() -> std::io::Result<Vec<SeedEntry>>,
+{
+  for _ in 0..2 {
+    if let Ok(entries) = walk() {
+      map.reseed(entries);
+      return ReseedOutcome::Reseeded;
+    }
+  }
+  ReseedOutcome::Blind
+}
+
+/// The error a blinding reseed failure escalates through the terminal `Fatal`.
+fn reseed_blind_error() -> std::io::Error {
+  std::io::Error::other(
+    "the fanotify FID map could not be reseeded after a loss; the source is blind",
+  )
+}
+
+#[cfg(test)]
+mod tests;
