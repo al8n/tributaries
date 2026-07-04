@@ -1523,6 +1523,185 @@ async fn file_churn_keeps_a_bounded_map() {
   let _ = w.close().await;
 }
 
+/// Bind-mounts `src` at `dst` (both must already exist), returning a guard that
+/// unmounts on drop — so a `--test-threads=1` run never leaks a bind even when the
+/// test body panics (the guard's `Drop` runs on unwind). `None` when the bind is
+/// refused (no privilege / no mount support — the caller skips loudly).
+fn bind_mount(src: &Path, dst: &Path) -> Option<BindGuard> {
+  let status = Command::new("mount")
+    .arg("--bind")
+    .arg(src)
+    .arg(dst)
+    .status();
+  if !status.map(|s| s.success()).unwrap_or(false) {
+    return None;
+  }
+  Some(BindGuard {
+    at: dst.to_path_buf(),
+  })
+}
+
+/// Unmounts a bind on drop, best-effort but retried lazily (a still-busy bind is
+/// caught on the next umount attempt). Keeps a `--test-threads=1` fanotify run from
+/// leaving stray binds under the shared loopback for a later test to trip over.
+struct BindGuard {
+  at: PathBuf,
+}
+
+impl Drop for BindGuard {
+  fn drop(&mut self) {
+    // `-l` (lazy) so a bind still referenced by an fd detaches once quiescent,
+    // rather than wedging the ephemeral container's teardown.
+    let _ = Command::new("umount").arg("-l").arg(&self.at).status();
+  }
+}
+
+/// A `mount --bind` of an OUTSIDE-root directory (same superblock, SAME device) at
+/// a point INSIDE the watched root is a mount boundary the seed walk must NOT
+/// descend: the bind shares the root's device, so a device-only fence would descend
+/// across it and seed the outside subtree into the admission map — then churn on the
+/// outside origin would deliver as in-root (a scope-fence breach). The mount-id
+/// fence skips the bind exactly as a submount, so churn on the origin produces ZERO
+/// in-root delivery and nothing under the bind point ever surfaces.
+#[tokio::test]
+async fn bind_mount_of_outside_dir_is_a_boundary() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!("SKIP bind_mount_of_outside_dir_is_a_boundary: no ext4 loopback (--privileged)");
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "bind-boundary");
+  // An OUTSIDE-root directory on the same superblock (same device as the root),
+  // holding a pre-existing nested subtree, and the in-root mount point the bind
+  // lands on — both created BEFORE the watch so the seed walk sees the bind.
+  let origin = scratch_under(&mount, "bind-boundary-origin");
+  std::fs::create_dir_all(origin.join("nested")).unwrap();
+  let bind_point = root.join("bound");
+  std::fs::create_dir_all(&bind_point).unwrap();
+  let Some(_bind) = bind_mount(&origin, &bind_point) else {
+    eprintln!("SKIP bind_mount_of_outside_dir_is_a_boundary: bind mount refused (--privileged)");
+    return;
+  };
+
+  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+    return;
+  };
+  // The mark is live before the churn (an in-root sibling create flows).
+  std::fs::write(root.join("alive.txt"), b"a").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &root.join("alive.txt")))
+      .await
+      .is_some(),
+    "the mark is live before the bind-boundary churn"
+  );
+
+  // Churn hard on the OUTSIDE origin (its subtree the bind exposes at `bound`). If
+  // the walk had descended the bind, the origin's directories would be in the map
+  // and this churn would deliver — as either the origin path OR the in-root bind
+  // path. The mount-id fence never seeded them, so none may.
+  for i in 0..200 {
+    let via_origin = origin.join("nested").join(format!("o-{i}.txt"));
+    std::fs::write(&via_origin, b"n").unwrap();
+    std::fs::remove_file(&via_origin).unwrap();
+    let via_bind = bind_point.join("nested").join(format!("b-{i}.txt"));
+    std::fs::write(&via_bind, b"n").unwrap();
+    std::fs::remove_file(&via_bind).unwrap();
+  }
+
+  // No event may name anything under the outside origin OR under the in-root bind
+  // point — an admitted bind subtree would leak either form.
+  let breach = tokio::time::timeout(Duration::from_secs(3), async {
+    while let Some(event) = w.next().await {
+      let path = event.path().to_path_buf();
+      if path.starts_with(&origin) || path.starts_with(&bind_point) {
+        return Some(path);
+      }
+    }
+    None
+  })
+  .await
+  .ok()
+  .flatten();
+  assert!(
+    breach.is_none(),
+    "a same-device bind of an outside directory into the root leaked an event (the walk \
+     descended across the mount boundary): {breach:?}"
+  );
+  let _ = w.close().await;
+}
+
+/// A `mount --bind` of the watched root onto a directory INSIDE itself is a cycle:
+/// the bind exposes the whole root again beneath `root/sub/loop`, and it shares the
+/// root's mount id (a self-bind), so the mount fence does NOT stop it — only the
+/// walk's per-run visited-handle guard bounds it. The property is TERMINATION: the
+/// spawn's seed walk completes (the watcher starts, or skips loudly on an
+/// unwalkable-tree fallback), never hanging or recursing without bound.
+#[tokio::test]
+async fn ancestor_self_bind_cycle_terminates() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!("SKIP ancestor_self_bind_cycle_terminates: no ext4 loopback (--privileged)");
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "self-bind-cycle");
+  let loop_point = root.join("sub/loop");
+  std::fs::create_dir_all(&loop_point).unwrap();
+  // Bind the ROOT onto a directory inside itself: `root/sub/loop` now re-exposes
+  // the whole root (including `sub/loop` again — an unbounded descent without the
+  // visited-handle guard).
+  let Some(_bind) = bind_mount(&root, &loop_point) else {
+    eprintln!("SKIP ancestor_self_bind_cycle_terminates: bind mount refused (--privileged)");
+    return;
+  };
+
+  // The property is that spawn TERMINATES — the seed walk's cycle guard bounds the
+  // self-bind rather than looping forever. Wrap the whole watch in a deadline:
+  // unbounded recursion would hang here and trip the timeout, whereas the cycle
+  // guard returns promptly whether the walk mapped the tree (watcher live) or hit
+  // the viability fallback.
+  let started = tokio::time::timeout(DEADLINE, async {
+    let options = WatcherOptions::new().with_backend(Backend::Fanotify);
+    let watcher = TokioWatcher::new(options).expect("build watcher");
+    let outcome = watcher.watch(&root, Interest::all()).await;
+    (watcher, outcome)
+  })
+  .await;
+  match started {
+    Ok((watcher, Ok(_handle))) => {
+      // The walk terminated and mapped the tree — the cycle guard bounded the
+      // self-bind. Live and responsive, AND the tree is intact: a create under the
+      // pre-existing `sub` directory resolves to its true root-relative path
+      // `sub/nested.txt`. A re-parented root anchor (the bug the guard's
+      // skip-entirely ordering avoids: re-seeding the re-encountered root under
+      // `sub/loop` would overwrite its `parent == None` anchor) would resolve this
+      // path wrong or drop it.
+      let mut w = watcher;
+      let nested = root.join("sub/nested.txt");
+      std::fs::write(&nested, b"a").unwrap();
+      assert!(
+        wait_for(&mut w, |e| covers(e, &nested)).await.is_some(),
+        "the self-bind cycle walk terminated, the source is live, and the root \
+         anchor's tree is intact (a nested create resolves under the true root)"
+      );
+      let _ = w.close().await;
+    }
+    Ok((_watcher, Err(err))) => {
+      // An honest fallback (an unwalkable tree under the cycle → NotViable, or a
+      // typed error under forced Fanotify) is also acceptable — the point is that
+      // spawn RETURNED rather than hanging.
+      eprintln!("self-bind cycle walk terminated with an honest error (no hang): {err}");
+    }
+    Err(_) => panic!(
+      "the self-bind cycle made spawn hang — the seed walk recursed without bound (the \
+       visited-handle guard is missing or ineffective)"
+    ),
+  }
+}
+
 /// Whether the process holds `CAP_SYS_ADMIN` — the capability the fanotify
 /// FILESYSTEM mark needs. Read from `/proc/self/status`'s effective-cap bitmask
 /// (bit 21 = `CAP_SYS_ADMIN`); a read failure conservatively reports `false`.

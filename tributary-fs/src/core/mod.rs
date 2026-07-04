@@ -387,6 +387,14 @@ struct ScopeState {
   /// every delivery can carry it without copying.
   root: Option<Arc<PathBuf>>,
   root_dev: Option<u64>,
+  /// The root's MOUNT id, captured at the spawn barrier — the descent boundary
+  /// the enumerate lowering fences on. A child directory on a different mount
+  /// (even the SAME device, as a `mount --bind` of a same-superblock directory
+  /// produces) is lowered non-descendable, closing the same-device bind breach
+  /// the `root_dev` check alone cannot. `None` when the barrier could not read it
+  /// (below Linux 5.8, or a non-Linux/fake source), and then the device check
+  /// governs alone — the honest degrade.
+  root_mnt_id: Option<u64>,
   /// The root object's identity, captured at the spawn barrier. The mount
   /// refresh re-stats the root and compares against this: a `Missing` or
   /// mismatched read is a root death, lowered through the same self-event path
@@ -561,6 +569,7 @@ impl DriverCore {
         requested: root,
         root: None,
         root_dev: None,
+        root_mnt_id: None,
         identity: None,
         mounts: Vec::new(),
         mounts_authoritative: false,
@@ -610,6 +619,7 @@ impl DriverCore {
         self.watch_paths.insert(watch, Arc::clone(&root));
         state.root = Some(Arc::clone(&root));
         state.root_dev = Some(meta.root_dev);
+        state.root_mnt_id = meta.root_mnt_id;
         state.identity = Some(meta.identity);
         state.mounts = meta.mounts;
         // Born closed: the seed was read before the stream started, so a
@@ -716,11 +726,15 @@ impl DriverCore {
   /// Feeds one raw directory listing back for the enumerate that requested
   /// it, minting each entry's identity through the SAME policy the probe path
   /// uses (enumerate-side identity is the authority; a foreign-device entry
-  /// mints `None`). A foreign-device DIRECTORY is lowered as
-  /// [`FileKind::Other`]: the mount boundary is the scope boundary, so the
-  /// Monitor must not descend it — the entry still delivers, the subtree
-  /// beyond the boundary is deliberately outside coverage (the settled
-  /// single-device policy).
+  /// mints `None`). A DIRECTORY across the scope's MOUNT boundary — a differing
+  /// mount id, or (as a belt, and when the mount id is unavailable) a differing
+  /// device — is lowered as [`FileKind::Other`]: the mount boundary is the scope
+  /// boundary, so the Monitor must not descend it — the entry still delivers, the
+  /// subtree beyond the boundary is deliberately outside coverage. The mount-id
+  /// fence catches a `mount --bind` of a same-DEVICE directory the device check
+  /// alone would descend across (the same breach the fanotify walk closes with the
+  /// same fence); the device belt still governs when either mount id is unknown
+  /// (the honest below-5.8 degrade).
   pub(crate) fn on_enumerated(&mut self, req: ReqId, raw: RawEnumerate) {
     let Some((scope, dir)) = self.enum_reqs.remove(&req) else {
       return;
@@ -744,7 +758,7 @@ impl DriverCore {
           };
           let path = dir.join(name);
           let node = mint(state, &path, NonZeroU64::new(entry.ino), Some(entry.dev));
-          let kind = if entry.kind.is_dir() && state.root_dev != Some(entry.dev) {
+          let kind = if entry.kind.is_dir() && crosses_mount_boundary(state, &entry) {
             FileKind::Other
           } else {
             entry.kind
@@ -1943,6 +1957,36 @@ fn mint(
   device_trusted(state, path, dev).then(|| Identity::new(fid))
 }
 
+/// Whether an enumerated directory `entry` sits across the scope's MOUNT
+/// boundary and so must not be descended (lowered to [`FileKind::Other`]).
+///
+/// Two independent fences, either one a boundary:
+///
+/// - **the device belt** — `entry.dev != root_dev`. A different device is a
+///   different superblock, always a boundary, and needs no mount id. Kept even
+///   when mount ids are known (a different device cannot share the root's mount, so
+///   this only ever agrees with the mount fence, but it costs nothing and is the
+///   sole fence when a mount id is unavailable).
+/// - **the mount fence** — the child's mount id differs from the root's, when BOTH
+///   are known. This is the fence the device belt CANNOT provide: a `mount --bind`
+///   of a same-superblock directory shares the root's device, so only a differing
+///   mount id marks it a boundary.
+///
+/// When either mount id is unknown (the executor could not read one — below Linux
+/// 5.8, the `stx_mask` bit unset, or a non-Linux/fake source), the device belt
+/// alone governs — the honest degrade to the settled single-device policy, never
+/// over-fencing a genuine in-root directory on a mount-id read miss. An unknown
+/// ROOT device (`None`, an off-unix fake) leaves the belt inert; with no mount id
+/// either, nothing crosses — the fake tree is one scope.
+fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
+  let device_boundary = matches!(state.root_dev, Some(root_dev) if entry.dev != root_dev);
+  let mount_boundary = matches!(
+    (state.root_mnt_id, entry.mnt_id),
+    (Some(root_mnt), Some(entry_mnt)) if root_mnt != entry_mnt
+  );
+  device_boundary || mount_boundary
+}
+
 /// The move cookie for a rename half, minted ONLY from contemporaneous probe
 /// evidence: `dev` is the device a probe just read for the object. fileIDs
 /// are device-scoped, so any cookie without live root-device proof could pair
@@ -2103,6 +2147,13 @@ pub(crate) struct RawDirEntry {
   pub(crate) dev: u64,
   /// The entry's inode number (0 = unknown).
   pub(crate) ino: u64,
+  /// The entry's MOUNT id (from `statx(STATX_MNT_ID)`), or `None` when the
+  /// executor could not read it (a pre-5.8 kernel, the mask bit unset, or a
+  /// non-Linux/fake executor). The core fences descent on a differing mount id —
+  /// a `mount --bind` of a same-device directory shares [`dev`](Self::dev), so
+  /// the device alone cannot mark it a boundary. `None` falls back to the device
+  /// check (the honest below-5.8 degrade).
+  pub(crate) mnt_id: Option<u64>,
 }
 
 /// One raw enumerate outcome from the executor.

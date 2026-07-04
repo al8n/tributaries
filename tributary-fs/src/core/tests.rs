@@ -78,6 +78,7 @@ fn live_core() -> (DriverCore, ScopeId) {
     Ok(RootMeta {
       root: PathBuf::from("/r"),
       root_dev: 1,
+      root_mnt_id: None,
       mounts: Vec::new(),
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
@@ -106,6 +107,7 @@ fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
     Ok(RootMeta {
       root: PathBuf::from("/r"),
       root_dev: 1,
+      root_mnt_id: None,
       mounts: Vec::new(),
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
@@ -887,6 +889,7 @@ fn identity_minting_respects_devices_and_mounts() {
     requested: PathBuf::from("/r"),
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
+    root_mnt_id: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
     mounts: vec![PathBuf::from("/r/vol")],
     mounts_authoritative: true,
@@ -920,6 +923,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     requested: PathBuf::from("/r"),
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
+    root_mnt_id: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
     mounts: Vec::new(),
     mounts_authoritative: false,
@@ -1457,6 +1461,7 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
     Ok(RootMeta {
       root: PathBuf::from("/r"),
       root_dev: 1,
+      root_mnt_id: None,
       mounts: vec![PathBuf::from("/r/vol")],
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
@@ -1494,6 +1499,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
     Ok(RootMeta {
       root: PathBuf::from("/r"),
       root_dev: 1,
+      root_mnt_id: None,
       mounts: Vec::new(),
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
@@ -1577,6 +1583,7 @@ fn a_loss_racing_the_birth_refresh_rearms_it_once() {
     Ok(RootMeta {
       root: PathBuf::from("/r"),
       root_dev: 1,
+      root_mnt_id: None,
       mounts: Vec::new(),
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
@@ -1926,6 +1933,7 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
     Ok(RootMeta {
       root: PathBuf::from("/r"),
       root_dev: 1,
+      root_mnt_id: None,
       mounts: vec![PathBuf::from("/r/vol")],
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
@@ -2384,6 +2392,7 @@ mod lowering {
       requested: PathBuf::from(root),
       root: Some(Arc::new(PathBuf::from(root))),
       root_dev: Some(1),
+      root_mnt_id: None,
       identity: Some(crate::os::RootIdentity::new(1, 1)),
       mounts: Vec::new(),
       mounts_authoritative: true,
@@ -2395,6 +2404,68 @@ mod lowering {
       publicly_live: true,
       liveness_deadline: None,
     }
+  }
+
+  /// The pure mount-boundary decision the enumerate lowering fences on. The mount
+  /// id is the PRIMARY fence (a same-device bind is caught by a differing mount id);
+  /// the device is the belt that governs when a mount id is unknown on either side.
+  #[test]
+  fn crosses_mount_boundary_truth_table() {
+    fn raw(dev: u64, mnt_id: Option<u64>) -> RawDirEntry {
+      RawDirEntry {
+        name: b"x".to_vec(),
+        kind: FileKind::Dir,
+        dev,
+        ino: 9,
+        mnt_id,
+      }
+    }
+    let mut both_known = state_with_root("/r");
+    both_known.root_dev = Some(1);
+    both_known.root_mnt_id = Some(42);
+    // Both mount ids known: the mount id alone decides — a same-device bind on a
+    // different mount IS a boundary; a same-mount child is not.
+    assert!(
+      crosses_mount_boundary(&both_known, &raw(1, Some(77))),
+      "a same-device child on a different mount is a boundary (the bind breach)"
+    );
+    assert!(
+      !crosses_mount_boundary(&both_known, &raw(1, Some(42))),
+      "a same-mount child is in-root even though a separate device would not be"
+    );
+    assert!(
+      crosses_mount_boundary(&both_known, &raw(2, Some(42))),
+      "a different device is still a boundary even when the mount id happens to match"
+    );
+    // Child mount id unknown (below 5.8 / mask unset): the device belt governs.
+    assert!(
+      !crosses_mount_boundary(&both_known, &raw(1, None)),
+      "a same-device child with an unknown mount id is NOT over-fenced — the belt governs"
+    );
+    assert!(
+      crosses_mount_boundary(&both_known, &raw(2, None)),
+      "a foreign-device child with an unknown mount id is a boundary by the belt"
+    );
+    // Root mount id unknown (the whole scope has no mount id): device belt only.
+    let mut root_unknown = state_with_root("/r");
+    root_unknown.root_dev = Some(1);
+    root_unknown.root_mnt_id = None;
+    assert!(
+      !crosses_mount_boundary(&root_unknown, &raw(1, Some(77))),
+      "with the root mount id unknown, a same-device child is in-root regardless of its mount id"
+    );
+    assert!(
+      crosses_mount_boundary(&root_unknown, &raw(2, Some(77))),
+      "with the root mount id unknown, the device belt still fences a foreign device"
+    );
+    // Root device unknown (an off-unix fake): never a boundary — one scope.
+    let mut dev_unknown = state_with_root("/r");
+    dev_unknown.root_dev = None;
+    dev_unknown.root_mnt_id = None;
+    assert!(
+      !crosses_mount_boundary(&dev_unknown, &raw(2, Some(77))),
+      "with an unknown root device (off-unix fake), nothing crosses the boundary"
+    );
   }
 
   enum Expect {
@@ -2465,6 +2536,7 @@ mod lowering {
       Ok(RootMeta {
         root: PathBuf::from("/"),
         root_dev: 1,
+        root_mnt_id: None,
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),
@@ -2694,6 +2766,21 @@ mod descending {
       kind,
       dev,
       ino,
+      mnt_id: None,
+    }
+  }
+
+  /// An enumerated entry on the root's DEVICE but a differing MOUNT id — a
+  /// `mount --bind` of a same-superblock directory, the boundary the device check
+  /// alone misses. The scope's `root_mnt_id` must be set (see `live_descending_mnt`)
+  /// for the fence to fire.
+  fn entry_on_mount(name: &str, kind: FileKind, dev: u64, ino: u64, mnt_id: u64) -> RawDirEntry {
+    RawDirEntry {
+      name: name.as_bytes().to_vec(),
+      kind,
+      dev,
+      ino,
+      mnt_id: Some(mnt_id),
     }
   }
 
@@ -2728,6 +2815,16 @@ mod descending {
   /// (the source starts with no watches), and the arm's success
   /// cold-enumerates the root — the dormant vocabulary is live.
   fn live_descending() -> (DriverCore, ScopeId, ReqId, WatchId) {
+    live_descending_with(None)
+  }
+
+  /// Like [`live_descending`] but with the scope's root MOUNT id set, so the
+  /// enumerate lowering fences a same-device child on a different mount (a bind).
+  fn live_descending_mnt(root_mnt_id: u64) -> (DriverCore, ScopeId, ReqId, WatchId) {
+    live_descending_with(Some(root_mnt_id))
+  }
+
+  fn live_descending_with(root_mnt_id: Option<u64>) -> (DriverCore, ScopeId, ReqId, WatchId) {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
     let effects = drain(&mut core);
@@ -2740,6 +2837,7 @@ mod descending {
       Ok(RootMeta {
         root: PathBuf::from("/r"),
         root_dev: 1,
+        root_mnt_id,
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),
@@ -2869,6 +2967,7 @@ mod descending {
       Ok(RootMeta {
         root: PathBuf::from(root),
         root_dev: 1,
+        root_mnt_id: None,
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),
@@ -3035,6 +3134,66 @@ mod descending {
   }
 
   #[test]
+  fn same_device_bind_on_a_different_mount_is_not_descended() {
+    // The bind breach the device check alone misses: `bound` shares the root's
+    // DEVICE (1) but sits on a DIFFERENT mount id (77) — a `mount --bind` of a
+    // same-superblock directory. The mount-id fence lowers it non-descendable while
+    // `here` (same mount, 42) is descended.
+    let (mut core, _scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry_on_mount("bound", FileKind::Dir, 1, 20, 77),
+        entry_on_mount("here", FileKind::Dir, 1, 21, 42),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let armed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::AddWatch { path, .. } => Some(path.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      armed,
+      vec![Path::new("/r/here")],
+      "a same-device directory on a DIFFERENT mount (a bind) is fenced by mount id, \
+       never descended, though its device equals the root's: {effects:?}"
+    );
+  }
+
+  #[test]
+  fn mount_id_unknown_falls_back_to_the_device_check() {
+    // The honest below-5.8 degrade: the scope reports a root mount id (42), but the
+    // executor could not read the child's (`mnt_id: None`). The fence declines and
+    // the DEVICE belt governs — a same-device child is descended (not over-fenced on
+    // a mount-id read miss), a foreign-device one is not.
+    let (mut core, _scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry("same_dev", FileKind::Dir, 1, 20),
+        entry("foreign_dev", FileKind::Dir, 2, 21),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let armed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::AddWatch { path, .. } => Some(path.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      armed,
+      vec![Path::new("/r/same_dev")],
+      "with the child mount id unknown, the device belt alone decides: the \
+       same-device child is descended, the foreign-device one is not: {effects:?}"
+    );
+  }
+
+  #[test]
   fn inotify_events_lower_depth_one_with_native_cookies() {
     let (mut core, scope, req, root) = live_descending();
     core.on_enumerated(req, listed(Vec::new()));
@@ -3162,6 +3321,7 @@ mod descending {
         kind: FileKind::File,
         dev: 1,
         ino: 30,
+        mnt_id: None,
       }]),
     );
     let effects = drain(&mut core);
@@ -3213,6 +3373,7 @@ mod kernel_recursive_fanotify {
       Ok(RootMeta {
         root: PathBuf::from("/r"),
         root_dev: 1,
+        root_mnt_id: None,
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),
@@ -3451,6 +3612,7 @@ mod kernel_recursive_fanotify {
       Ok(RootMeta {
         root: PathBuf::from("/r"),
         root_dev: 1,
+        root_mnt_id: None,
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),
@@ -3579,6 +3741,7 @@ mod kernel_recursive_fanotify {
       Ok(RootMeta {
         root: PathBuf::from("/r"),
         root_dev: 1,
+        root_mnt_id: None,
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),
@@ -3784,6 +3947,7 @@ mod auto_selection {
       Ok(RootMeta {
         root: PathBuf::from("/r"),
         root_dev: 1,
+        root_mnt_id: None,
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),
@@ -3843,6 +4007,7 @@ mod auto_selection {
       Ok(RootMeta {
         root: PathBuf::from("/r"),
         root_dev: 1,
+        root_mnt_id: None,
         mounts: Vec::new(),
         identity: crate::os::RootIdentity::new(1, 1),
         ancestors: Vec::new(),

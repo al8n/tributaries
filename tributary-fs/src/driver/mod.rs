@@ -474,6 +474,34 @@ fn ino_of(_meta: &std::fs::Metadata) -> u64 {
   0
 }
 
+/// The MOUNT id of the object at `path` (symlink not followed), via
+/// `statx(STATX_MNT_ID)` on Linux — the descent boundary the core fences on. A
+/// `mount --bind` of a same-device directory shares its origin's device, so the
+/// mount id is what marks it a boundary the per-entry device alone cannot.
+///
+/// `None` when the kernel did not report it (below Linux 5.8 where the field is
+/// absent, `statx` unavailable below 4.11, or the `stx_mask` bit unset) or off
+/// Linux (no mount-id notion) — the core then falls back to the device check. The
+/// path is resolved the same way as the entry's `symlink_metadata`, so an anchor
+/// (`/proc/self/fd/N`) enumerate reads the mount id THROUGH the pinned fd too.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn mnt_id_of(path: &Path) -> Option<u64> {
+  use rustix::fs::{AtFlags, StatxFlags, statx};
+  let stx = statx(
+    rustix::fs::CWD,
+    path,
+    AtFlags::SYMLINK_NOFOLLOW,
+    StatxFlags::MNT_ID,
+  )
+  .ok()?;
+  (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id)
+}
+
+#[cfg(not(all(target_os = "linux", not(miri))))]
+fn mnt_id_of(_path: &Path) -> Option<u64> {
+  None
+}
+
 /// The real platform: `Source::spawn` + `lstat`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RealFs {
@@ -778,7 +806,8 @@ fn list_dir(path: &Path) -> RawEnumerate {
       complete = false;
       break;
     };
-    let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+    let entry_path = entry.path();
+    let Ok(meta) = std::fs::symlink_metadata(&entry_path) else {
       // A raced-away entry: the listing no longer reflects one name.
       complete = false;
       continue;
@@ -788,6 +817,7 @@ fn list_dir(path: &Path) -> RawEnumerate {
       kind: kind_of(&meta.file_type()),
       dev: dev_of(&meta),
       ino: ino_of(&meta),
+      mnt_id: mnt_id_of(&entry_path),
     });
   }
   RawEnumerate::Listed { entries, complete }

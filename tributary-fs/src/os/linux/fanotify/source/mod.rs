@@ -43,9 +43,11 @@
 //! > against the spawn anchor [`ReseedContext::root_fid`]; a pending move-in subtree
 //! > against the moved dir's learned FID); or (c) INDUCTIVELY VERIFIED VIA ITS
 //! > PARENT CHAIN (a per-child walk open is a single-component `openat` NOFOLLOW
-//! > from an already-verified parent fd, its `st_dev` fenced to the root device —
-//! > verified parent + single-component NOFOLLOW open + device check = verified
-//! > child).
+//! > from an already-verified parent fd, fenced to the root MOUNT by its mount id
+//! > — device as a belt — verified parent + single-component NOFOLLOW open + mount
+//! > fence = verified child; a bind of a same-device directory the device belt
+//! > alone would admit is caught by the mount-id fence, and a bind onto an ancestor
+//! > by the walk's per-run visited-handle cycle guard).
 //!
 //! The per-child case (c) records the CURRENT object at `(parent, name)`: if a
 //! same-name replacement lands between the `readdir` listing and the child open,
@@ -59,6 +61,7 @@
 //! recording the current object is the honest outcome.
 
 use std::{
+  collections::BTreeSet,
   fs, io,
   os::{
     fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
@@ -77,7 +80,7 @@ use rustix::{
 use super::{
   super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
-    mounts_under,
+    mounts_under, root_mount_id,
     wake::WakeState,
   },
   fid::Fid,
@@ -203,6 +206,11 @@ impl Source {
       })
     })?;
     let root_dev = stat.st_dev;
+    // The root's mount id, read once from the PIN — the descent boundary every
+    // walk fences on. Captured here beside the device so a live reseed carries the
+    // same fence the spawn walk used, and threaded through the walk contexts like
+    // `root_dev`.
+    let root_mnt_id = root_mount_id(root_fd);
     let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
     let mounts = mounts_under(&canonical).unwrap_or_default();
 
@@ -235,6 +243,7 @@ impl Source {
       root: canonical.clone(),
       fsid,
       root_dev,
+      root_mnt_id,
       root_fid,
     };
     let mut map = FidMap::new();
@@ -341,6 +350,7 @@ impl Source {
     let meta = RootMeta {
       root: canonical,
       root_dev,
+      root_mnt_id,
       mounts,
       identity,
       ancestors,
@@ -408,9 +418,21 @@ pub(crate) struct ReseedContext {
   /// The superblock fsid stamped into every seed FID (kept only so seed FIDs
   /// are byte-identical to a spawn seed; admission never compares it).
   fsid: [u8; 8],
-  /// The root device — the single-device descent boundary (a sub-mount lives on
-  /// a different superblock this mark never reports on).
+  /// The root device — a descent boundary belt (a sub-mount on a different
+  /// superblock lives on a different device this mark never reports on). A
+  /// DIFFERENT device is always a boundary, so this needs no `statx`; but it is
+  /// not SUFFICIENT — a `mount --bind` of a same-superblock directory shares the
+  /// device, so [`root_mnt_id`](Self::root_mnt_id) is the primary fence and this
+  /// is the cheap belt beneath it.
   root_dev: u64,
+  /// The root's MOUNT id (from `statx(root_fd, STATX_MNT_ID)` at spawn) — the
+  /// primary descent boundary. The mount id differs across ANY mount, including a
+  /// bind of a same-device directory the `root_dev` belt cannot catch, so a child
+  /// whose mount id differs is a boundary the walk skips exactly as it skips a
+  /// foreign device. `None` when the kernel did not report it (below 5.8, or the
+  /// `stx_mask` bit unset) — impossible on the 5.17 fanotify floor but handled:
+  /// with `None` the fence falls back to the `root_dev` belt alone.
+  root_mnt_id: Option<u64>,
   /// The spawn root's FID, captured from the PIN at spawn. A live reseed re-opens
   /// the root by PATH (the spawn pin is long dropped), and one
   /// `FAN_MARK_FILESYSTEM` mark covers the WHOLE superblock — so a same-superblock
@@ -445,7 +467,14 @@ impl ReseedContext {
   /// root BY PATH — will reject it and kill the scope regardless; a fatal now is
   /// that same death, sooner and without the map ever rebinding to the replacement.
   pub(crate) fn walk(&self) -> io::Result<Vec<SeedEntry>> {
-    seed_walk(&self.root, self.fsid, self.root_dev, &self.root_fid).map_err(WalkError::into_io)
+    seed_walk(
+      &self.root,
+      self.fsid,
+      self.root_dev,
+      self.root_mnt_id,
+      &self.root_fid,
+    )
+    .map_err(WalkError::into_io)
   }
 
   /// The spawn-time seed, rooted at the dispatcher's PINNED root fd rather than a
@@ -461,7 +490,13 @@ impl ReseedContext {
   /// `io::Error`-folding [`walk`](Self::walk).
   fn seed_at_fd(&self, root_fd: BorrowedFd<'_>) -> Result<Vec<SeedEntry>, WalkError> {
     let root_fd = root_fd.try_clone_to_owned().map_err(WalkError::RootGone)?;
-    seed_from_fd(root_fd, &self.root, self.fsid, self.root_dev)
+    seed_from_fd(
+      root_fd,
+      &self.root,
+      self.fsid,
+      self.root_dev,
+      self.root_mnt_id,
+    )
   }
 
   /// Walks the subtree rooted at `subtree` (a directory MOVED IN from outside the
@@ -485,7 +520,14 @@ impl ReseedContext {
     subtree: &Path,
     subtree_fid: &Fid,
   ) -> io::Result<Vec<SeedEntry>> {
-    subtree_walk(subtree, subtree_fid, self.fsid, self.root_dev).map_err(WalkError::into_io)
+    subtree_walk(
+      subtree,
+      subtree_fid,
+      self.fsid,
+      self.root_dev,
+      self.root_mnt_id,
+    )
+    .map_err(WalkError::into_io)
   }
 }
 
@@ -614,6 +656,7 @@ fn seed_walk(
   root: &Path,
   fsid: [u8; 8],
   root_dev: u64,
+  root_mnt_id: Option<u64>,
   expected: &Fid,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
@@ -632,15 +675,19 @@ fn seed_walk(
       "the watched root was replaced at its path (reopened handle does not match the spawn root)",
     )));
   }
-  seed_from_fd(root_fd, root, fsid, root_dev)
+  seed_from_fd(root_fd, root, fsid, root_dev, root_mnt_id)
 }
 
 /// Seeds the map from an ALREADY-PINNED root fd, producing a [`SeedEntry`] per
-/// directory on the root device — every one an admitted directory, each carrying
+/// directory on the root mount — every one an admitted directory, each carrying
 /// its parent FID so the map builds the parent-relative structure directly. A
-/// mount boundary (`st_dev != root_dev`) is not descended: an sb mark never
-/// crosses it, so its subtree lives on a different superblock and never delivers
-/// on this fd.
+/// mount boundary (a child whose MOUNT id differs from the root's, or — as a belt
+/// — whose device differs) is not descended: an sb mark never crosses a mount, so
+/// the submount's subtree lives elsewhere and never delivers on this fd. The mount
+/// id is the primary fence because a `mount --bind` of a same-superblock directory
+/// shares the device (the device belt alone would descend across it and seed an
+/// out-of-root alias into the admission map — a scope-fence breach, since later
+/// events on that alias would then deliver as in-root).
 ///
 /// The root fd is the object every seed grounds on — the SPAWN passes the
 /// dispatcher's pin (the gate/mark/identity object), the live reseed passes a
@@ -676,6 +723,7 @@ fn seed_from_fd(
   root: &Path,
   fsid: [u8; 8],
   root_dev: u64,
+  root_mnt_id: Option<u64>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The root anchor is load-bearing: without its handle the map has no base to
   // resolve any path against, so its absence is a spawn/reseed failure, never an
@@ -688,7 +736,7 @@ fn seed_from_fd(
     )));
   };
   let mut seed = vec![SeedEntry::root(root_fid.clone(), root)];
-  descend(root_fd, root_fid, fsid, root_dev, &mut seed)?;
+  descend(root_fd, root_fid, fsid, root_dev, root_mnt_id, &mut seed)?;
   Ok(seed)
 }
 
@@ -698,7 +746,7 @@ fn seed_from_fd(
 /// descent starts INSIDE it (from the pinned fd this opens) and links every
 /// discovered directory to its parent, so the top descendants hang off
 /// `subtree_fid` directly. Same completeness rule, pinned-object discipline, and
-/// single-device boundary as [`seed_walk`].
+/// mount boundary (mount-id fence + device belt) as [`seed_walk`].
 ///
 /// `subtree` is the moved directory's CURRENT path, resolved through the map by
 /// the reader at execution time — the node is still in-map and `pending_walk`, so
@@ -725,6 +773,7 @@ fn subtree_walk(
   subtree_fid: &Fid,
   fsid: [u8; 8],
   root_dev: u64,
+  root_mnt_id: Option<u64>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The moved directory is still in-map and pending its walk, so pinning it must
   // succeed: any failure (a vanish/shape-change included) is a coverage hole, not
@@ -744,7 +793,14 @@ fn subtree_walk(
     )));
   }
   let mut seed = Vec::new();
-  descend(subtree_fd, subtree_fid.clone(), fsid, root_dev, &mut seed)?;
+  descend(
+    subtree_fd,
+    subtree_fid.clone(),
+    fsid,
+    root_dev,
+    root_mnt_id,
+    &mut seed,
+  )?;
   Ok(seed)
 }
 
@@ -762,7 +818,7 @@ struct WalkDir {
 }
 
 /// The shared iterative descent: reads `root_fd` (an already-pinned, already-FID'd
-/// directory) and every directory below it on `root_dev`, pushing a
+/// directory) and every directory below it on the root MOUNT, pushing a
 /// [`SeedEntry::child`] per discovered directory into `seed`. FULLY FD-RELATIVE —
 /// no path is ever reconstructed: each level holds its directory fd, children are
 /// read from it, and each child is opened `openat(parent_fd, name, O_NOFOLLOW |
@@ -770,6 +826,35 @@ struct WalkDir {
 /// directory for a symlink therefore fails the open (`ELOOP`/`ENOTDIR`) and is
 /// skipped as a race — the foreign target is never descended and its handle never
 /// seeds the map (the scope-fence invariant).
+///
+/// # Mount boundary
+///
+/// A child whose MOUNT id differs from `root_mnt_id` is a submount — a different
+/// mount the sb mark never reports on — and is skipped exactly as a foreign-device
+/// child is (not seeded, not descended). The mount id is the primary fence: a
+/// `mount --bind` of a same-superblock directory shares `root_dev`, so the device
+/// belt alone would descend across it and seed an out-of-root alias into the
+/// admission map (later events on the alias would then deliver as in-root — the
+/// scope-fence breach). The `root_dev` belt is kept: a different device is always a
+/// boundary and needs no extra `statx`, and it still governs when the kernel does
+/// not report a mount id (`root_mnt_id` / the child's is `None`).
+///
+/// # Cycle guard
+///
+/// A bind mount pointing at an ancestor or at the root itself has the SAME mount
+/// id as its target, so the mount fence does not stop it — and following it would
+/// recurse forever (or re-walk a diamond of binds repeatedly). A per-run set of
+/// visited directory handles bounds the walk: a child whose handle is already
+/// visited THIS run is skipped ENTIRELY — neither re-seeded nor re-descended. The
+/// object was already seeded when first reached, so its own events already admit
+/// through that node; re-seeding it would re-parent that one node (the map is keyed
+/// by handle) onto the second path, corrupting an ancestor's — or the root anchor's
+/// — place in the tree. The set is walk-transient (dropped when the descent
+/// returns), NOT the admission map, so a legitimately-re-appearing directory in a
+/// later walk is unaffected. A handle is the object's exact identity (it embeds a
+/// generation counter), so a directory reachable two ways is covered once at its
+/// first-seen path, while a same-name REPLACEMENT (a different object, different
+/// handle) is not falsely skipped.
 ///
 /// An explicit stack keeps the walk iterative (no recursion-depth bound on a deep
 /// tree). fd usage is O(DEPTH) live at once — the descent stack holds one open
@@ -783,9 +868,15 @@ fn descend(
   root_fid: Fid,
   fsid: [u8; 8],
   root_dev: u64,
+  root_mnt_id: Option<u64>,
   seed: &mut Vec<SeedEntry>,
 ) -> Result<(), WalkError> {
   let root_reader = Dir::new(root_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
+  // The handles walked THIS run — the cycle/diamond guard. Seeded with the root so
+  // a bind pointing back at the root is caught. Transient: dropped on return, never
+  // the admission map.
+  let mut visited: BTreeSet<Box<[u8]>> = BTreeSet::new();
+  visited.insert(root_fid.handle().into());
   let mut stack = vec![WalkDir {
     reader: root_reader,
     fid: root_fid,
@@ -847,11 +938,11 @@ fn descend(
     };
 
     // `fstat` the OPENED fd — the object the walk actually pinned, immune to any
-    // post-listing swap. `st_dev` is the single-device descent boundary (a
-    // directory on another device is a mount point on a different superblock this
-    // mark never reports on), and `st_mode` confirms it is truly a directory
-    // (making `d_type` advisory only — a filesystem could report `DT_DIR` for an
-    // object `O_DIRECTORY` still opened, but `fstat` is authoritative).
+    // post-listing swap. `st_dev` is the descent-boundary belt (a directory on
+    // another device is a mount point on a different superblock this mark never
+    // reports on), and `st_mode` confirms it is truly a directory (making `d_type`
+    // advisory only — a filesystem could report `DT_DIR` for an object
+    // `O_DIRECTORY` still opened, but `fstat` is authoritative).
     let stat = match fstat(&child_fd) {
       Ok(stat) => stat,
       Err(err) => match classify_walk_skip(err) {
@@ -863,8 +954,23 @@ fn descend(
     // `Stat` declares them so explicitly, the 64-bit `c_ulong`/`c_uint` aliases
     // resolve to the same), so the comparisons need no conversion.
     if stat.st_dev != root_dev {
-      // A mount boundary: a different superblock, not descended. `O_DIRECTORY`
-      // already guaranteed it is a directory, so this is purely the device fence.
+      // A mount boundary (the cheap belt): a different device is always a different
+      // superblock, not descended. `O_DIRECTORY` already guaranteed it is a
+      // directory, so this is purely the device fence.
+      continue;
+    }
+    // The PRIMARY mount fence: a child on a different MOUNT is a submount the mark
+    // never reports on — skipped exactly as the device belt skips a foreign device.
+    // This is what the device belt cannot catch: a `mount --bind` of a
+    // same-superblock directory shares `root_dev`, so without this a foreign subtree
+    // would be descended and its handles seeded (later events on the outside alias
+    // then delivering as in-root). When either mount id is unavailable
+    // (`root_mnt_id`/the child's is `None` — below 5.8, or `stx_mask` unset) the
+    // fence declines and the device belt alone governs, never skipping a genuine
+    // in-root directory on a mount-id read miss.
+    if let (Some(root_mnt), Some(child_mnt)) = (root_mnt_id, root_mount_id(child_fd.as_fd()))
+      && root_mnt != child_mnt
+    {
       continue;
     }
     if stat.st_mode & S_IFMT != S_IFDIR {
@@ -885,6 +991,18 @@ fn descend(
         "an in-root directory does not export a file handle",
       )));
     };
+    // The cycle/diamond guard: a bind pointing at an ancestor or the root has the
+    // SAME handle as its target (the mount fence above cannot catch a same-mount
+    // self-bind), so descending it would loop forever. A handle already visited THIS
+    // run was already seeded when first reached — its own events therefore already
+    // admit through that node. Re-seeding it here would re-parent that node onto this
+    // second path (the map is keyed by handle: one directory is one node, and
+    // `insert_dir` overwrites the parent link), corrupting an ancestor's — or the
+    // root anchor's — place in the tree. So a repeat sighting is skipped ENTIRELY:
+    // neither re-seeded nor re-descended. `insert` returns false when already present.
+    if !visited.insert(fid.handle().into()) {
+      continue;
+    }
     seed.push(SeedEntry::child(
       fid.clone(),
       level.fid.clone(),
