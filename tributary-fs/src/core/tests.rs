@@ -2930,3 +2930,237 @@ mod descending {
     );
   }
 }
+
+mod kernel_recursive_fanotify {
+  //! The fanotify (kernel-recursive) profile: one superblock mark covers the
+  //! whole root, so the Monitor never descends. Records are precise verbs
+  //! lowered to root-relative targets with interned-FID identity, and
+  //! `FAN_RENAME` pairs atomically through a minted counter cookie.
+
+  use super::*;
+  use crate::os::linux::{
+    RawLinuxEvent,
+    fanotify::{
+      AdmittedEvent, AdmittedRename,
+      fid::{
+        FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_MODIFY, FAN_ONDIR, FAN_RENAME,
+        FanMask,
+      },
+    },
+  };
+  use std::num::NonZeroU64;
+
+  /// A live fanotify scope rooted at `/r`: the KR spawn doubles as the root's
+  /// watch-result, and the birth refresh installs authoritative (empty) trust.
+  fn live_fanotify() -> (DriverCore, ScopeId) {
+    let mut core = DriverCore::new(WINDOW);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let effects = drain(&mut core);
+    assert!(
+      matches!(effects.as_slice(), [Effect::SpawnStream { root, .. }] if root == Path::new("/r")),
+      "registration spawns the stream: {effects:?}"
+    );
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      1,
+      "a spawned KR scope is born closed and arms its birth refresh: {effects:?}"
+    );
+    core.on_mounts_refreshed(scope, Vec::new(), true);
+    assert!(drain(&mut core).is_empty(), "a refreshed KR root is silent");
+    (core, scope)
+  }
+
+  fn dirent(mask: u64, path: &str, identity: Option<u64>) -> RawLinuxEvent {
+    RawLinuxEvent::Fanotify(AdmittedEvent {
+      mask: FanMask::new(mask),
+      path: Some(PathBuf::from(path)),
+      identity: identity.and_then(NonZeroU64::new),
+      rename: None,
+    })
+  }
+
+  fn feed(core: &mut DriverCore, scope: ScopeId, events: Vec<RawLinuxEvent>) {
+    let events = events.into_iter().map(SourceEvent::Linux).collect();
+    core.on_batch(scope, BatchPayload::detached(events), at(1));
+  }
+
+  /// A create/delete/modify/attrib batch lowers to one record each, addressed
+  /// by the root-relative target with the interned identity attached.
+  #[test]
+  fn precise_verbs_lower_to_root_relative_records() {
+    let (mut core, scope) = live_fanotify();
+    feed(
+      &mut core,
+      scope,
+      vec![
+        dirent(FAN_CREATE, "/r/a/new.txt", Some(10)),
+        dirent(FAN_DELETE, "/r/a/gone.txt", None),
+        dirent(FAN_MODIFY, "/r/a/hot.txt", Some(11)),
+        dirent(FAN_ATTRIB, "/r/a/meta.txt", Some(12)),
+      ],
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 4, "{effects:?}");
+    assert!(emitted[0].kind().is_created());
+    assert_eq!(emitted[0].location(), &loc(&["a", "new.txt"]));
+    assert!(emitted[1].kind().is_removed());
+    assert_eq!(emitted[1].location(), &loc(&["a", "gone.txt"]));
+    assert!(emitted[2].kind().is_modified());
+    assert!(
+      emitted[3].kind().is_modified(),
+      "attrib conflates into modified at the change level"
+    );
+  }
+
+  /// A `FAN_RENAME` (both directory FIDs and both names in one event) lowers to
+  /// a SINGLE `Moved` through the Monitor: the minted counter cookie pairs the
+  /// adjacent `MovedFrom`/`MovedTo` with no window and no probe.
+  #[test]
+  fn rename_pairs_into_one_moved() {
+    let (mut core, scope) = live_fanotify();
+    feed(
+      &mut core,
+      scope,
+      vec![RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(FAN_RENAME),
+        path: None,
+        identity: None,
+        rename: Some(AdmittedRename {
+          old_path: PathBuf::from("/r/old.txt"),
+          new_path: PathBuf::from("/r/sub/new.txt"),
+          identity: NonZeroU64::new(20),
+        }),
+      })],
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    let moved: Vec<&Change> = emitted
+      .iter()
+      .filter(|c| c.kind().is_moved())
+      .copied()
+      .collect();
+    assert_eq!(
+      moved.len(),
+      1,
+      "the atomic rename is one Moved: {effects:?}"
+    );
+    assert_eq!(
+      moved[0].location(),
+      &loc(&["sub", "new.txt"]),
+      "destination"
+    );
+    assert_eq!(
+      moved[0].kind().moved_from(),
+      Some(&loc(&["old.txt"])),
+      "source paired with no window"
+    );
+    assert!(
+      emitted.iter().all(|c| !c.kind().is_removed()),
+      "a paired rename never degrades to a bare removal: {effects:?}"
+    );
+  }
+
+  /// Two renames in one batch mint DISTINCT cookies, so their halves never
+  /// cross-pair — each is its own Moved.
+  #[test]
+  fn distinct_renames_get_distinct_cookies() {
+    let (mut core, scope) = live_fanotify();
+    feed(
+      &mut core,
+      scope,
+      vec![
+        RawLinuxEvent::Fanotify(AdmittedEvent {
+          mask: FanMask::new(FAN_RENAME),
+          path: None,
+          identity: None,
+          rename: Some(AdmittedRename {
+            old_path: PathBuf::from("/r/a.txt"),
+            new_path: PathBuf::from("/r/b.txt"),
+            identity: None,
+          }),
+        }),
+        RawLinuxEvent::Fanotify(AdmittedEvent {
+          mask: FanMask::new(FAN_RENAME),
+          path: None,
+          identity: None,
+          rename: Some(AdmittedRename {
+            old_path: PathBuf::from("/r/c.txt"),
+            new_path: PathBuf::from("/r/d.txt"),
+            identity: None,
+          }),
+        }),
+      ],
+    );
+    let effects = drain(&mut core);
+    let moved: Vec<&Change> = emits(&effects)
+      .into_iter()
+      .filter(|c| c.kind().is_moved())
+      .collect();
+    assert_eq!(
+      moved.len(),
+      2,
+      "two independent renames, two Moveds: {effects:?}"
+    );
+    let dests: Vec<&Location> = moved.iter().map(|c| c.location()).collect();
+    assert!(dests.contains(&&loc(&["b.txt"])));
+    assert!(dests.contains(&&loc(&["d.txt"])));
+  }
+
+  /// A `DELETE_SELF` on the ROOT object is the scope's death — the same
+  /// Ignored lifecycle the FSEvents unmount uses: a terminal `Rescan`.
+  #[test]
+  fn root_delete_self_is_scope_death() {
+    let (mut core, scope) = live_fanotify();
+    feed(
+      &mut core,
+      scope,
+      vec![RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(FAN_DELETE_SELF | FAN_ONDIR),
+        path: Some(PathBuf::from("/r")),
+        identity: Some(NonZeroU64::new(1).unwrap()),
+        rename: None,
+      })],
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "root death surfaces as a terminal Rescan: {effects:?}"
+    );
+    // The scope tore down: its stream is destroyed.
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead root's stream is torn down: {effects:?}"
+    );
+  }
+
+  /// A directory create carries the directory flag through to the record.
+  #[test]
+  fn directory_create_flags_is_dir() {
+    let (mut core, scope) = live_fanotify();
+    feed(
+      &mut core,
+      scope,
+      vec![dirent(FAN_CREATE | FAN_ONDIR, "/r/newdir", Some(30))],
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1);
+    assert!(emitted[0].kind().is_created());
+    assert_eq!(emitted[0].location(), &loc(&["newdir"]));
+  }
+}

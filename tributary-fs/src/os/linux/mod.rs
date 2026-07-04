@@ -15,6 +15,7 @@
 // container suites exercise the parts a macOS host build cannot reach.
 #![allow(dead_code)]
 
+pub(crate) mod fanotify;
 pub(crate) mod inotify;
 
 #[cfg(test)]
@@ -24,18 +25,22 @@ use std::path::{Path, PathBuf};
 
 use tributary_proto::WatchId;
 
+pub(crate) use fanotify::AdmittedEvent;
 pub(crate) use inotify::decode::RawInotifyEvent;
 use inotify::table::WdTable;
 
 /// The decoded Linux event payload — the platform's transport `E` once the
-/// seam flips. The fanotify arm joins when that backend lands.
+/// seam flips.
 ///
-/// Seam contract: attribution happens AT DECODE — the reader resolves each
+/// Seam contract: resolution happens AT DECODE, single-threaded in the
+/// reader that owns the backend's attribution state. inotify attributes each
 /// record's `wd` through its [`WdTable`] while the table is still in lockstep
 /// with the record stream, so events cross the channel already carrying every
 /// Monitor watch they address ([`anchors`](Self::Inotify::anchors), one per
-/// alias of the underlying inode). The core fans the record out per anchor;
-/// it never sees a `wd`.
+/// alias of the underlying inode). fanotify admits by directory-FID membership
+/// against its per-root map (the superblock-firehose filter) and crosses the
+/// channel already path-resolved and identity-interned. The core never sees a
+/// `wd` or a raw FID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RawLinuxEvent {
   /// One decoded inotify record with its resolved anchors.
@@ -45,6 +50,9 @@ pub(crate) enum RawLinuxEvent {
     /// The decoded kernel record.
     event: RawInotifyEvent,
   },
+  /// One admitted fanotify event: path-resolved against the root's FID map,
+  /// with the object's identity already interned.
+  Fanotify(AdmittedEvent),
 }
 
 impl RawLinuxEvent {
@@ -52,6 +60,15 @@ impl RawLinuxEvent {
   pub(crate) fn as_inotify(&self) -> Option<(&[WatchId], &RawInotifyEvent)> {
     match self {
       Self::Inotify { anchors, event } => Some((anchors.as_slice(), event)),
+      Self::Fanotify(_) => None,
+    }
+  }
+
+  /// The admitted event, if this is a fanotify event.
+  pub(crate) fn as_fanotify(&self) -> Option<&AdmittedEvent> {
+    match self {
+      Self::Fanotify(event) => Some(event),
+      Self::Inotify { .. } => None,
     }
   }
 }
@@ -207,14 +224,96 @@ pub(crate) enum WatchOutcome {
   Failed(tributary_proto::WatchError),
 }
 
-// The descending core (and the container smoke suites) consume the Source;
-// until the seam flips the lib build sees the re-export as unused.
+// The descending core (and the container smoke suites) reach the inotify arm
+// controls through the seam; until the seam flips the lib build sees the
+// re-export as unused.
 #[cfg(all(target_os = "linux", not(miri)))]
 #[allow(unused_imports)]
-pub(crate) use source::{AnchorRequest, ArmReply, ControlPort, Source, SourceHandle};
+pub(crate) use inotify_source::{AnchorRequest, ArmReply, ControlPort};
+
+/// The Linux spawn dispatcher: routes to the requested per-root backend. The
+/// seam names one `Source`/`SourceHandle` per platform, so both Linux
+/// primitives hide behind these — the driver never learns which one it got
+/// beyond [`RootMeta::backend`](super::RootMeta).
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) struct Source;
 
 #[cfg(all(target_os = "linux", not(miri)))]
-mod source {
+impl Source {
+  /// Spawns the source for `config.backend`. inotify is the default; fanotify
+  /// is reachable only through an explicit request (no `Backend::Auto` yet).
+  pub(crate) fn spawn(
+    config: super::SourceConfig,
+  ) -> Result<(SourceHandle, super::EventReceiver, super::RootMeta), super::SourceError> {
+    match config.backend {
+      super::Backend::Inotify => {
+        let (handle, rx, meta) = inotify_source::Source::spawn(config)?;
+        Ok((SourceHandle::Inotify(handle), rx, meta))
+      }
+      super::Backend::Fanotify => {
+        let (handle, rx, meta) = fanotify::Source::spawn(config)?;
+        Ok((SourceHandle::Fanotify(handle), rx, meta))
+      }
+    }
+  }
+}
+
+/// A live Linux source, one variant per backend. Dropping it tears the reader
+/// down; prefer [`shutdown`](Self::shutdown) at an orderly exit.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) enum SourceHandle {
+  /// A live inotify source (descending; has arm traffic).
+  Inotify(inotify_source::SourceHandle),
+  /// A live fanotify source (kernel-recursive; no arm traffic).
+  Fanotify(fanotify::SourceHandle),
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+impl SourceHandle {
+  /// Stops the reader and closes the instance.
+  pub(crate) fn shutdown(self) {
+    match self {
+      Self::Inotify(handle) => handle.shutdown(),
+      Self::Fanotify(handle) => handle.shutdown(),
+    }
+  }
+
+  /// The clonable arm/disarm port: the inotify control port, or `Inert` for
+  /// the kernel-recursive fanotify source (no per-directory arming).
+  pub(crate) fn scope_port(&self) -> super::ScopePort {
+    match self {
+      Self::Inotify(handle) => super::ScopePort::Inotify(handle.port()),
+      Self::Fanotify(_) => super::ScopePort::Inert,
+    }
+  }
+
+  /// Installs (or aliases) a kernel watch on the inotify source. The
+  /// kernel-recursive fanotify source has no arming and answers the honest
+  /// typed refusal — the driver routes arms through [`scope_port`](Self::scope_port),
+  /// so this is exercised only by the inotify smoke tests.
+  #[cfg(test)]
+  pub(crate) fn add_watch(&self, request: AnchorRequest) -> ArmReply {
+    match self {
+      Self::Inotify(handle) => handle.add_watch(request),
+      Self::Fanotify(_) => ArmReply {
+        outcome: WatchOutcome::Failed(tributary_proto::WatchError::Io),
+        anchor: None,
+      },
+    }
+  }
+
+  /// Removes an anchor from the inotify source's attribution; a no-op on the
+  /// arming-less fanotify source.
+  #[cfg(test)]
+  pub(crate) fn remove_watch(&self, anchor: WatchId) {
+    if let Self::Inotify(handle) = self {
+      handle.remove_watch(anchor);
+    }
+  }
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+mod inotify_source {
   //! The inotify Source: the per-root fd, its reader thread, and the spawn
   //! barrier. Watches are NOT armed at spawn — the driver arms the root (and
   //! every descendant) through the control path, so arm handling is uniform
