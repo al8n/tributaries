@@ -166,18 +166,36 @@ fn drain_events(
         Admission::Admit(admitted) => events.push(fanotify_event(admitted)),
         // A directory moved IN from outside the root: walk its pre-existing
         // descendants into the map BEFORE forwarding the move, so any later event
-        // in this same batch under those descendants already admits. A walk that
-        // goes blind (retry included) is the same silent-loss shape a failed
-        // reseed is, so it escalates to the terminal `Fatal` here — the moved
-        // subtree is only partially admitted, and Auto's next `watch()` lands on
-        // inotify.
-        Admission::AdmitAndSeed {
-          event,
-          moved_in,
-          moved_fid,
-        } => {
+        // in this same batch under those descendants already admits.
+        //
+        // The walk's starting path is resolved through the map (`seed_moved_in_
+        // subtree` → `pending_walk_target`), NOT captured at admission — an
+        // in-root rename that this reader has already processed would have
+        // re-parented the pending node, and the walk must follow it.
+        //
+        // Walk-cancellation soundness (the batch-ordering argument): this reader
+        // is single-threaded and processes the batch IN ORDER, and the map lookup
+        // gates the walk. So at walk time the map reflects EXACTLY the events up to
+        // and including this one:
+        //  - if a rename-OUT / delete of the moved dir had been processed, it would
+        //    have `forget`-ten (and pruned) the node — `pending_walk_target` returns
+        //    `None`, the walk is CANCELLED (a departed subtree owes nothing);
+        //  - if an in-root rename of it had been processed, the node is re-parented
+        //    and STILL pending (the flag is preserved across a re-parent), so the
+        //    walk rebases to the new path;
+        //  - otherwise the node is present and pending at its move-in destination.
+        // Therefore a `NotFound` at the resolved path means NO removal was processed
+        // by this reader, yet the directory is gone on disk (a later event in this
+        // same batch — the burst — already hit disk but not the reader). That is a
+        // genuine coverage hole, so the walk classifies it `Incomplete` and, after
+        // the single retry, escalates to the terminal `Fatal` (blind → fatal) —
+        // NOT a benign empty walk. Auto's next `watch()` then lands on inotify,
+        // which re-enumerates; a silent blind subtree is never left behind.
+        Admission::AdmitAndSeed { event, moved_fid } => {
           if matches!(
-            seed_moved_in_subtree(map, || reseed.walk_subtree(&moved_in, &moved_fid)),
+            seed_moved_in_subtree(map, &moved_fid, |subtree, subtree_fid| {
+              reseed.walk_subtree(subtree, subtree_fid)
+            }),
             SeedOutcome::Blind
           ) {
             signal_fatal(
@@ -264,28 +282,60 @@ fn fanotify_event(admitted: super::AdmittedEvent) -> crate::os::SourceEvent {
 /// Whether walking a moved-in subtree into the map succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeedOutcome {
-  /// The subtree walk succeeded (first try or the single retry); its descendant
-  /// directories were inserted into the map.
+  /// The subtree walk succeeded (first try or the single retry, its descendant
+  /// directories inserted) — OR the walk was CANCELLED because the moved dir was
+  /// forgotten/orphaned before it ran, or an intervening event already cleared its
+  /// pending flag (nothing owed). Both leave the map complete.
   Seeded,
   /// The walk failed twice: the moved-in subtree is only partially mapped, so the
   /// source is blind under it. The caller escalates to the terminal `Fatal`.
   Blind,
 }
 
-/// Walks a moved-in directory's pre-existing descendants into `map`, mirroring
-/// [`reseed_map`]'s retry-then-escalate policy: the walk runs once, retries once
-/// on failure, and a second failure concedes [`SeedOutcome::Blind`]. Pure over the
-/// walk closure so the policy is testable without a live fd. On success the
-/// entries are ADDED to the map (the moved directory itself is already learned;
-/// these are its descendants), keeping the completeness invariant at the
-/// boundary-move site.
-fn seed_moved_in_subtree<W>(map: &mut FidMap, mut walk: W) -> SeedOutcome
+/// Walks a moved-in directory's pre-existing descendants into `map`, resolving
+/// the directory's CURRENT path through the map before each attempt (an in-root
+/// rename in the same batch may have re-parented it since admission) and mirroring
+/// [`reseed_map`]'s retry-then-escalate policy: the walk runs once,
+/// retries once on failure, and a second failure concedes [`SeedOutcome::Blind`].
+///
+/// The map lookup gates the walk:
+///
+/// - the moved dir is GONE (forgotten/orphaned by an intervening event before the
+///   walk ran): the walk is CANCELLED — a departed subtree owes nothing —
+///   returning [`SeedOutcome::Seeded`];
+/// - its `pending_walk` flag is already CLEAR (an intervening event completed the
+///   obligation): likewise cancelled;
+/// - otherwise walk from the resolved current path. A `NotFound` there is
+///   `Incomplete` (the node is still in-map and pending, so no rename-out was
+///   processed — a missing dir is a genuine hole, not a race), which folds to the
+///   retry-then-blind policy.
+///
+/// On a successful walk the entries are ADDED (the moved dir itself is already
+/// learned) and its pending flag is cleared, keeping the completeness invariant at
+/// the boundary-move site. The `walk` closure is the only fd-touching part, so the
+/// resolve/gate/retry policy is testable over a real map with a stub walk.
+fn seed_moved_in_subtree<W>(
+  map: &mut FidMap,
+  moved_fid: &super::fid::Fid,
+  mut walk: W,
+) -> SeedOutcome
 where
-  W: FnMut() -> std::io::Result<Vec<SeedEntry>>,
+  W: FnMut(&std::path::Path, &super::fid::Fid) -> std::io::Result<Vec<SeedEntry>>,
 {
   for _ in 0..2 {
-    if let Ok(entries) = walk() {
+    // Resolve the moved dir's CURRENT path and pending state each attempt: an
+    // intervening event may have re-parented, cleared, or removed it.
+    let Some((subtree, pending)) = map.pending_walk_target(moved_fid) else {
+      // Forgotten/orphaned before the walk ran: a departed subtree owes nothing.
+      return SeedOutcome::Seeded;
+    };
+    if !pending {
+      // An intervening event already discharged the walk obligation.
+      return SeedOutcome::Seeded;
+    }
+    if let Ok(entries) = walk(&subtree, moved_fid) {
       map.seed(entries);
+      map.clear_pending_walk(moved_fid);
       return SeedOutcome::Seeded;
     }
   }

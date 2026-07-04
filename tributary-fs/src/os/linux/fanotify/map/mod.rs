@@ -22,15 +22,17 @@
 //!
 //! # Parent-relative paths, never absolute
 //!
-//! Each directory stores its own name plus a link to its PARENT's handle, and a
-//! path resolves by walking those links up to the root anchor. This mirrors the
-//! Monitor's watch tree: a directory rename updates ONE node's `(parent, name)`
-//! and every descendant's resolved path follows automatically, with no per-node
-//! rewrite. A rename OUT of the root re-parents the moved directory onto an
-//! absent (non-admitted) parent — the walk then fails and the whole subtree
-//! stops admitting naturally. Eviction is lazy: the rename is O(1), and a
-//! descendant whose ancestry no longer reaches the root simply misses admission
-//! (its stale node is dropped on that miss).
+//! Each directory stores its own name, a link to its PARENT's handle, AND the
+//! set of its immediate children (the dual link). A path resolves by walking the
+//! parent links up to the root anchor. This mirrors the Monitor's watch tree: a
+//! directory rename updates ONE node's `(parent, name)` and every descendant's
+//! resolved path follows automatically, with no per-node rewrite. A departure
+//! (delete / rename-out) walks the `children` adjacency to prune the WHOLE
+//! subtree from both the admission map and the intern table in O(subtree) — so a
+//! populated move-out drops every descendant's id at once, rather than leaking
+//! them until each lingering node happens to miss admission (the lazy per-miss
+//! eviction only ever reaped `dirs`, never `ids`). The lazy `admit`-miss eviction
+//! remains as a belt for any residual orphan a parent-chain break still leaves.
 //!
 //! # Identity: directory-only, O(live directories)
 //!
@@ -49,8 +51,10 @@
 //! unboundedly under create/delete churn (OOM), so it is confined to directories.
 //!
 //! The bound is therefore O(LIVE directories under the root). An id is pruned
-//! when its directory is forgotten (delete / rename-out): a departed-and-returned
-//! directory mints a FRESH identity, which the Monitor reads as a replacement —
+//! when its directory is forgotten (delete / rename-out) — AND every descendant's
+//! id with it, via the `children` adjacency, so a populated departure prunes the
+//! whole subtree's identities at once. A departed-and-returned directory (or
+//! descendant) mints a FRESH identity, which the Monitor reads as a replacement —
 //! the conservative, safe direction (identity inequality drives a re-observe,
 //! never a false survivor). Reseed preserves every live directory's id (the
 //! admission structure is rebuilt while the intern table is retained), so identity
@@ -82,7 +86,7 @@
 //! and the move-in walk preserve it as directories arrive.
 
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, BTreeSet},
   ffi::{OsStr, OsString},
   num::NonZeroU64,
   path::{Path, PathBuf},
@@ -129,8 +133,11 @@ impl SeedEntry {
   }
 }
 
-/// One admitted directory: its parent link and its own name. A path resolves by
-/// walking `parent` up to the root anchor (`parent == None`).
+/// One admitted directory: its parent link, its own name, and its immediate
+/// children. A path resolves by walking `parent` up to the root anchor
+/// (`parent == None`); the `children` set is the dual link the Monitor's watch
+/// tree keeps, so a departure can prune the WHOLE subtree in O(subtree) rather
+/// than leaking descendant ids until each hits a lazy admission miss.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DirNode {
   /// The parent directory's handle key, or `None` for the root anchor.
@@ -138,6 +145,22 @@ struct DirNode {
   /// This directory's name under its parent; for the root anchor, its absolute
   /// path.
   name: OsString,
+  /// The handle keys of this directory's immediate child directories. Maintained
+  /// as the exact inverse of every child's `parent` link (insert/learn adds,
+  /// forget/re-parent moves) so `forget` can walk and prune a departed subtree
+  /// from BOTH `dirs` and `ids` — the O(subtree) departure the lazy per-miss
+  /// eviction alone cannot deliver for the intern table.
+  children: BTreeSet<HandleKey>,
+  /// Whether this directory was learned via a move-IN and its descendant walk
+  /// has not yet completed. A move-in learns the top node before the reader runs
+  /// the subtree walk; the walk resolves the node's CURRENT path through the map
+  /// at execution time (an intervening in-root rename may have re-parented it),
+  /// and clears this flag on completion. While set, a `NotFound` at the resolved
+  /// path is an incompleteness (blind → fatal), NOT a benign empty walk: the node
+  /// still being in-map proves no rename-out was processed (the single-threaded
+  /// reader would have forgotten it first), so a missing directory is a genuine
+  /// coverage hole rather than a moved-away race.
+  pending_walk: bool,
 }
 
 /// The per-root FID map. Directory membership is the admission filter; the
@@ -176,7 +199,7 @@ impl FidMap {
   /// per dir); the map only records what it produced.
   pub(crate) fn seed(&mut self, entries: impl IntoIterator<Item = SeedEntry>) {
     for entry in entries {
-      self.insert_dir(entry);
+      self.insert_dir(entry, false);
     }
   }
 
@@ -187,16 +210,38 @@ impl FidMap {
   /// membership + a parent walk, no fsid compare and no syscall.
   ///
   /// An orphaned directory is EVICTED here: once its walk fails to reach the
-  /// root, the stale node is dropped so it never resolves again (lazy eviction
-  /// — the O(1) move-out left it for this miss to clean up).
+  /// root, its stale node AND any still-attached descendants are pruned from both
+  /// `dirs` and `ids` so nothing resolves again and no id leaks. This is a belt —
+  /// `forget` already prunes a departed subtree eagerly via the adjacency — for
+  /// any residual orphan a break in the parent chain still leaves behind.
   pub(crate) fn admit(&mut self, fid: &Fid) -> Option<PathBuf> {
     match self.resolve(fid.handle()) {
       Some(path) => Some(path),
       None => {
-        self.dirs.remove(fid.handle());
+        self.evict_orphan(fid.handle());
         None
       }
     }
+  }
+
+  /// Evicts an orphan (a node whose parent chain no longer reaches the root) and
+  /// its still-attached descendants from both maps, unlinking it from its parent
+  /// (a no-op when the parent is already gone). A node ABSENT from the map — the
+  /// hot firehose-drop path, an unknown handle provably outside the root — is left
+  /// untouched after the single membership check, so the drop stays cheap. Belt for
+  /// the lazy path: `forget` prunes eagerly, so this only fires on a residual
+  /// orphan.
+  fn evict_orphan(&mut self, handle: &[u8]) {
+    let key: HandleKey = handle.into();
+    let Some(node) = self.dirs.get(&key) else {
+      return;
+    };
+    if let Some(parent) = node.parent.clone()
+      && let Some(parent_node) = self.dirs.get_mut(&parent)
+    {
+      parent_node.children.remove(&key);
+    }
+    self.prune_subtree(key);
   }
 
   /// Whether `fid` is a stored directory handle, WITHOUT resolving its path or
@@ -231,6 +276,28 @@ impl FidMap {
   /// ignored. A `child_fid` of `None` (a create with no target FID) cannot
   /// self-maintain and is skipped — the eventual admission comes from a reseed.
   pub(crate) fn learn(&mut self, dir_fid: &Fid, name: &[u8], child_fid: Option<&Fid>) {
+    self.learn_inner(dir_fid, name, child_fid, false);
+  }
+
+  /// Learns a directory MOVED IN from outside the root (or re-parented onto a new
+  /// in-root parent) as a move-in top, marking it `pending_walk` so the reader's
+  /// subtree walk knows a `NotFound` at its resolved path is an incompleteness,
+  /// not a benign empty walk. Same admission rule as [`learn`]: the destination
+  /// parent must already be in-root, else the move is outside the root and
+  /// ignored. Used only when the moved object was NOT already a known directory
+  /// (an in-root re-parent of an already-mapped dir uses [`learn`] — its
+  /// descendants are already mapped, so no walk and no pending flag).
+  pub(crate) fn learn_moved_in(&mut self, dir_fid: &Fid, name: &[u8], child_fid: &Fid) {
+    self.learn_inner(dir_fid, name, Some(child_fid), true);
+  }
+
+  fn learn_inner(
+    &mut self,
+    dir_fid: &Fid,
+    name: &[u8],
+    child_fid: Option<&Fid>,
+    pending_walk: bool,
+  ) {
     let Some(child_fid) = child_fid else {
       return;
     };
@@ -240,25 +307,74 @@ impl FidMap {
     let Some(name) = os_name(name) else {
       return;
     };
-    self.insert_dir(SeedEntry::child(
-      child_fid.clone(),
-      dir_fid.clone(),
-      name.as_os_str().to_os_string(),
-    ));
+    self.insert_dir(
+      SeedEntry::child(
+        child_fid.clone(),
+        dir_fid.clone(),
+        name.as_os_str().to_os_string(),
+      ),
+      pending_walk,
+    );
   }
 
-  /// Drops a directory from admission AND from the intern table on its delete or
-  /// rename-out. Pruning the id bounds the table at O(live directories); the id
+  /// Resolves a move-in top's CURRENT path through the map (its parent chain,
+  /// which an intervening in-root rename may have re-parented since the move was
+  /// admitted) for the reader's deferred subtree walk. The returned flag is the
+  /// node's `pending_walk` state: `true` means the walk still owes descendants
+  /// (a `NotFound` there is an incompleteness), `false` means an intervening
+  /// event already cleared it (a queued re-run is a no-op the reader can skip).
+  /// `None` when the node is gone (forgotten/orphaned before the walk ran — the
+  /// reader cancels the walk).
+  pub(crate) fn pending_walk_target(&self, fid: &Fid) -> Option<(PathBuf, bool)> {
+    let pending = self.dirs.get(fid.handle())?.pending_walk;
+    let path = self.resolve(fid.handle())?;
+    Some((path, pending))
+  }
+
+  /// Clears a move-in top's `pending_walk` flag once its subtree walk completes,
+  /// so a later `NotFound` at its path is again a benign vanished-race (the walk
+  /// no longer owes descendants). A no-op if the node is gone.
+  pub(crate) fn clear_pending_walk(&mut self, fid: &Fid) {
+    if let Some(node) = self.dirs.get_mut(fid.handle()) {
+      node.pending_walk = false;
+    }
+  }
+
+  /// Drops a directory AND its whole subtree from admission and the intern table
+  /// on its delete or rename-out, walking the `children` adjacency so every
+  /// departed descendant's id is pruned in the SAME O(subtree) step — not left to
+  /// leak until each hits a lazy admission miss (which only ever touched `dirs`,
+  /// never `ids`). Pruning bounds the intern table at O(live directories); an id
   /// is safe to drop because nothing mints it again unless the SAME handle
   /// reappears (the same object — the handle embeds a generation counter), and a
   /// departed-and-returned directory minting a fresh id is the conservative
   /// direction: the Monitor treats identity inequality as a replacement, never a
-  /// false survivor. Descendants are NOT touched: their parent link now points at
-  /// an absent handle, so their walk fails and they evict lazily at their next
-  /// admission miss (and re-mint their own ids only if re-observed).
+  /// false survivor. The forgotten node is also unlinked from its parent's
+  /// `children`, keeping the adjacency the exact inverse of the parent links.
   pub(crate) fn forget(&mut self, fid: &Fid) {
-    self.dirs.remove(fid.handle());
-    self.ids.remove(fid.handle());
+    let key: HandleKey = fid.handle().into();
+    if let Some(node) = self.dirs.get(&key)
+      && let Some(parent) = node.parent.clone()
+      && let Some(parent_node) = self.dirs.get_mut(&parent)
+    {
+      parent_node.children.remove(&key);
+    }
+    self.prune_subtree(key);
+  }
+
+  /// Removes `root` and every directory reachable through the `children`
+  /// adjacency from BOTH `dirs` and `ids`. Iterative (an explicit stack, no
+  /// recursion-depth bound on a deep subtree) and bounded by the subtree's node
+  /// count. The starting node is assumed already unlinked from its parent by the
+  /// caller.
+  fn prune_subtree(&mut self, root: HandleKey) {
+    let mut stack = vec![root];
+    while let Some(key) = stack.pop() {
+      self.ids.remove(&key);
+      if let Some(node) = self.dirs.remove(&key) {
+        stack.extend(node.children);
+      }
+    }
   }
 
   /// Rebuilds the admission structure from a fresh full walk after a loss, then
@@ -275,6 +391,11 @@ impl FidMap {
   /// so a reappearance still mints a fresh identity (the conservative direction).
   /// A `FAN_Q_OVERFLOW` (or any lossy decode) funnels here so a covered overflow
   /// can never become permanent blindness.
+  ///
+  /// The `children` adjacency is rebuilt from the fresh walk: `dirs.clear()` drops
+  /// every stale node, and the walk emits parents before children (DFS), so each
+  /// `insert_dir` links the child under an already-present parent — the adjacency
+  /// is consistent by construction after the swap.
   pub(crate) fn reseed(&mut self, entries: impl IntoIterator<Item = SeedEntry>) {
     self.dirs.clear();
     self.seed(entries);
@@ -305,6 +426,38 @@ impl FidMap {
   #[cfg(test)]
   pub(crate) fn interned_count(&self) -> usize {
     self.ids.len()
+  }
+
+  /// Asserts the `children` adjacency is the exact inverse of the parent links
+  /// (mirroring the Monitor's `assert_invariants`): every node listed in a
+  /// parent's `children` exists and names that parent, and every node's parent
+  /// (when present) lists it back. A drift here is a maintenance-site bug — a
+  /// missing dual link would leave a departed subtree un-pruned.
+  #[cfg(test)]
+  pub(crate) fn assert_adjacency(&self) {
+    for (key, node) in &self.dirs {
+      for child in &node.children {
+        let child_node = self
+          .dirs
+          .get(child)
+          .expect("a child in an adjacency set must exist as a node");
+        assert_eq!(
+          child_node.parent.as_deref(),
+          Some(&key[..]),
+          "a node in a parent's children set must name that parent"
+        );
+      }
+      if let Some(parent) = &node.parent {
+        let parent_node = self
+          .dirs
+          .get(parent)
+          .expect("a node's parent must exist as a node");
+        assert!(
+          parent_node.children.contains(key),
+          "a node's parent must list it as a child"
+        );
+      }
+    }
   }
 
   /// Resolves a directory handle to its absolute path by walking parent links
@@ -339,16 +492,66 @@ impl FidMap {
     }
   }
 
-  fn insert_dir(&mut self, entry: SeedEntry) {
+  /// Inserts (or re-parents in place) one directory node, maintaining the parent
+  /// `children` adjacency both ways. `pending_walk` marks a move-in top whose
+  /// descendant walk has not yet run. A key already present is a RE-PARENT (an
+  /// in-root rename overwriting the node): its existing `children` are preserved
+  /// (they move with it via the parent link, not by rewrite) and it is unlinked
+  /// from its old parent before being linked under the new one.
+  ///
+  /// A re-parent PRESERVES an existing `pending_walk` (the requested flag is OR-ed
+  /// with it): an in-root rename of a move-in top that has NOT yet been walked
+  /// (`learn`, requesting `false`) must not discharge the outstanding obligation —
+  /// the deferred walk still owes the descendants, now at the re-parented path.
+  /// Clearing it here would drop the walk and re-open the burst hole (a moved-in
+  /// populated dir renamed again in-root before its walk runs, then left blind).
+  ///
+  /// The parent link only lands in the parent's `children` if the parent is
+  /// already present — every producer honors this: a walk emits parents before
+  /// children (DFS), and `learn`/`learn_moved_in` insert a single child under an
+  /// already-admitted parent. The [`assert_adjacency`](Self::assert_adjacency)
+  /// checker pins the resulting invariant in tests.
+  fn insert_dir(&mut self, entry: SeedEntry, pending_walk: bool) {
     // Interning on insert keeps a directory's admission and its identity minted
     // together, so an admitted directory always has a stable id.
     self.intern(&entry.fid);
+    let key: HandleKey = entry.fid.handle().into();
     let parent = entry.parent.map(|fid| fid.handle().into());
+
+    // A re-parent overwrites an existing node: unlink it from its old parent,
+    // carry its existing children across, and OR-in its outstanding pending_walk
+    // so an in-root rename never discharges a not-yet-run move-in walk.
+    let existing = self.dirs.get(&key).map(|node| {
+      (
+        node.parent.clone(),
+        node.children.clone(),
+        node.pending_walk,
+      )
+    });
+    if let Some((old_parent, _, _)) = &existing
+      && *old_parent != parent
+      && let Some(old_parent) = old_parent
+      && let Some(old) = self.dirs.get_mut(old_parent)
+    {
+      old.children.remove(&key);
+    }
+
+    if let Some(parent) = &parent
+      && let Some(parent_node) = self.dirs.get_mut(parent)
+    {
+      parent_node.children.insert(key.clone());
+    }
+    let (children, pending_walk) = match existing {
+      Some((_, children, was_pending)) => (children, pending_walk || was_pending),
+      None => (BTreeSet::new(), pending_walk),
+    };
     self.dirs.insert(
-      entry.fid.handle().into(),
+      key,
       DirNode {
         parent,
         name: entry.name,
+        children,
+        pending_walk,
       },
     );
   }

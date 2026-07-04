@@ -332,6 +332,66 @@ async fn move_in_populated_dir_delivers_descendant_events() {
   let _ = w.close().await;
 }
 
+/// Suite 9 (boundary move-in, burst) — a populated directory `mv`'d INTO the root
+/// then IMMEDIATELY `mv`'d again in-root, with NO wait between the two renames, so
+/// the reader may see both in one batch BEFORE the move-in subtree walk runs. The
+/// pre-fix hole: the first walk read the already-vanished first destination as an
+/// empty success, and the second (in-root) rename saw the now-known FID and
+/// skipped the walk — leaving the moved directory's pre-existing descendants blind
+/// FOREVER, with no loss signal.
+///
+/// Best-effort by nature (the batch boundary is timing-dependent): the property is
+/// COVERAGE-HONESTY, not a specific delivery. Either the descendant event is
+/// delivered directly (the walk rebased to the final destination) OR a `Rescan`
+/// covering it arrives (the reader classified the stale walk as incomplete and
+/// escalated, so the consumer re-enumerates and finds the descendant) — both are
+/// accepted by `covers`. Only the silent-drop the fix removes would time out here.
+#[tokio::test]
+async fn burst_move_in_then_reparent_is_coverage_honest() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!(
+      "SKIP burst_move_in_then_reparent_is_coverage_honest: no ext4 loopback (--privileged)"
+    );
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "burst");
+  let outside = scratch_under(&mount, "burst-src");
+  // A populated tree built OUTSIDE the root: outside/incoming/nested/deep.txt.
+  let src = outside.join("incoming");
+  std::fs::create_dir_all(src.join("nested")).unwrap();
+  std::fs::write(src.join("nested/deep.txt"), b"seed").unwrap();
+
+  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+    return;
+  };
+  std::fs::write(root.join("alive.txt"), b"a").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &root.join("alive.txt")))
+      .await
+      .is_some(),
+    "the mark is live before the burst"
+  );
+
+  // The burst: move IN to root/a, then IMMEDIATELY in-root to root/b — no wait, so
+  // both renames may land in one read batch before the deferred walk runs.
+  std::fs::rename(&src, root.join("a")).unwrap();
+  std::fs::rename(root.join("a"), root.join("b")).unwrap();
+
+  // Mutate the pre-existing nested descendant under its FINAL path. The event must
+  // be delivered OR covered by a rescan — never silently dropped.
+  let deep = root.join("b/nested/deep.txt");
+  std::fs::write(&deep, b"after-burst").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
+    "after a move-in-then-reparent burst, a nested descendant is delivered or rescan-covered — \
+     never silently blind"
+  );
+  let _ = w.close().await;
+}
+
 /// Suite 9 (boundary move-out twin) — a POPULATED in-root directory `mv`'d OUT of
 /// the root stops admitting its descendants: after the move-out, mutating its old
 /// nested descendant delivers NO event and never emits a stale in-root path. The

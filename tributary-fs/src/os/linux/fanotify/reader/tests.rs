@@ -82,16 +82,20 @@ fn double_failure_is_blind() {
 
 /// A moved-in subtree walk that succeeds on the FIRST try ADDS its descendant
 /// directories to the map (never clears it — the moved dir and everything else
-/// already present stay) and reports `Seeded` — the completeness-restoring path
-/// at the boundary-move site.
+/// already present stay), clears the moved dir's `pending_walk`, and reports
+/// `Seeded` — the completeness-restoring path at the boundary-move site. The walk
+/// closure receives the moved dir's CURRENT resolved path (not a captured one).
 #[test]
 fn subtree_walk_success_adds_descendants() {
   let mut map = seeded_with_sub();
-  // The moved directory `arrived` (fid 5) was already learned under /root/sub;
-  // the walk discovers its pre-existing descendant `deep` (fid 6).
-  map.learn(&fid(2), b"arrived", Some(&fid(5)));
+  // The moved directory `arrived` (fid 5) was learned under /root/sub as a
+  // pending-walk top; the walk discovers its pre-existing descendant `deep`
+  // (fid 6).
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
   let before = map.dir_count();
-  let outcome = seed_moved_in_subtree(&mut map, || {
+  let seen_path = Cell::new(None);
+  let outcome = seed_moved_in_subtree(&mut map, &fid(5), |subtree, _| {
+    seen_path.set(Some(subtree.to_path_buf()));
     Ok(vec![SeedEntry::child(
       fid(6),
       fid(5),
@@ -99,6 +103,11 @@ fn subtree_walk_success_adds_descendants() {
     )])
   });
   assert_eq!(outcome, SeedOutcome::Seeded);
+  assert_eq!(
+    seen_path.take(),
+    Some(std::path::PathBuf::from("/root/sub/arrived")),
+    "the walk ran from the moved dir's current resolved path"
+  );
   assert_eq!(
     map.dir_count(),
     before + 1,
@@ -109,6 +118,11 @@ fn subtree_walk_success_adds_descendants() {
     Some(std::path::PathBuf::from("/root/sub/arrived/deep")),
     "the walked descendant now admits under the moved directory"
   );
+  assert_eq!(
+    map.pending_walk_target(&fid(5)).map(|(_, p)| p),
+    Some(false),
+    "the pending_walk flag is cleared once the walk completes"
+  );
 }
 
 /// A transient walk failure is absorbed by the single immediate retry (mirroring
@@ -117,9 +131,9 @@ fn subtree_walk_success_adds_descendants() {
 #[test]
 fn subtree_walk_retry_absorbs_a_transient_failure() {
   let mut map = seeded_with_sub();
-  map.learn(&fid(2), b"arrived", Some(&fid(5)));
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
   let calls = Cell::new(0u32);
-  let outcome = seed_moved_in_subtree(&mut map, || {
+  let outcome = seed_moved_in_subtree(&mut map, &fid(5), |_, _| {
     calls.set(calls.get() + 1);
     if calls.get() == 1 {
       Err(io::Error::other("transient"))
@@ -148,9 +162,9 @@ fn subtree_walk_retry_absorbs_a_transient_failure() {
 #[test]
 fn subtree_walk_double_failure_is_blind() {
   let mut map = seeded_with_sub();
-  map.learn(&fid(2), b"arrived", Some(&fid(5)));
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
   let calls = Cell::new(0u32);
-  let outcome = seed_moved_in_subtree(&mut map, || {
+  let outcome = seed_moved_in_subtree(&mut map, &fid(5), |_, _| {
     calls.set(calls.get() + 1);
     Err::<Vec<SeedEntry>, io::Error>(io::Error::other("still failing"))
   });
@@ -163,5 +177,88 @@ fn subtree_walk_double_failure_is_blind() {
   assert!(
     map.contains(&fid(5)),
     "the moved directory itself stays learned — only its subtree is missing"
+  );
+  assert_eq!(
+    map.pending_walk_target(&fid(5)).map(|(_, p)| p),
+    Some(true),
+    "a blinding walk leaves the flag set — the obligation was never discharged"
+  );
+}
+
+/// If the moved-in top is FORGOTTEN (rename-out / delete by an intervening event)
+/// before its deferred walk runs, the walk is CANCELLED: `pending_walk_target`
+/// returns `None`, so `seed_moved_in_subtree` reports `Seeded` WITHOUT calling the
+/// walk closure — a departed subtree owes nothing.
+#[test]
+fn walk_is_cancelled_when_the_moved_dir_was_forgotten() {
+  let mut map = seeded_with_sub();
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
+  // An intervening event forgot the moved dir before the walk ran.
+  map.forget(&fid(5));
+  let calls = Cell::new(0u32);
+  let outcome = seed_moved_in_subtree(&mut map, &fid(5), |_, _| {
+    calls.set(calls.get() + 1);
+    Ok(Vec::new())
+  });
+  assert_eq!(
+    outcome,
+    SeedOutcome::Seeded,
+    "a cancelled walk is not blind"
+  );
+  assert_eq!(calls.get(), 0, "the walk closure never ran");
+}
+
+/// If an intervening event already CLEARED the moved dir's `pending_walk` (the
+/// obligation was discharged elsewhere), the deferred walk is a no-op: `Seeded`
+/// with no closure call. The dedup-by-node guard against a redundant re-walk.
+#[test]
+fn walk_is_skipped_when_no_longer_pending() {
+  let mut map = seeded_with_sub();
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
+  map.clear_pending_walk(&fid(5));
+  let calls = Cell::new(0u32);
+  let outcome = seed_moved_in_subtree(&mut map, &fid(5), |_, _| {
+    calls.set(calls.get() + 1);
+    Ok(Vec::new())
+  });
+  assert_eq!(outcome, SeedOutcome::Seeded);
+  assert_eq!(calls.get(), 0, "an already-discharged walk does not re-run");
+}
+
+/// The burst scenario at the READER layer: a populated dir moved in to
+/// /root/sub/arrived (learned pending) then re-parented in-root to /root/other in
+/// the SAME batch, BEFORE the deferred walk runs. The walk must resolve the
+/// CURRENT path (/root/other/arrived) through the map — not the stale
+/// admission-time /root/sub/arrived — and map the descendant there. A stale
+/// captured path would `read_dir` a nonexistent location.
+#[test]
+fn deferred_walk_resolves_current_path_after_reparent() {
+  let mut map = seeded_with_sub();
+  // A second in-root parent /root/other for the re-parent destination.
+  map.learn(&fid(1), b"other", Some(&fid(3)));
+  // Event 1: populated dir (fid 5) moved in under /root/sub, learned pending.
+  map.learn_moved_in(&fid(2), b"arrived", &fid(5));
+  // Event 2 (same batch): re-parented in-root to /root/other/arrived.
+  map.learn(&fid(3), b"arrived", Some(&fid(5)));
+  // The deferred walk resolves the moved dir where it ACTUALLY is now.
+  let seen_path = Cell::new(None);
+  let outcome = seed_moved_in_subtree(&mut map, &fid(5), |subtree, _| {
+    seen_path.set(Some(subtree.to_path_buf()));
+    Ok(vec![SeedEntry::child(
+      fid(6),
+      fid(5),
+      std::ffi::OsString::from("deep"),
+    )])
+  });
+  assert_eq!(outcome, SeedOutcome::Seeded);
+  assert_eq!(
+    seen_path.take(),
+    Some(std::path::PathBuf::from("/root/other/arrived")),
+    "the walk followed the in-root re-parent to the current path"
+  );
+  assert_eq!(
+    map.admit(&fid(6)),
+    Some(std::path::PathBuf::from("/root/other/arrived/deep")),
+    "the descendant is mapped under the moved dir's CURRENT location"
   );
 }
