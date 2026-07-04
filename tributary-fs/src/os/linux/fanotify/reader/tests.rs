@@ -1,13 +1,76 @@
 use std::{cell::Cell, io, path::Path};
 
-use super::{ReseedOutcome, SeedOutcome, reseed_map, seed_moved_in_subtree};
-use crate::os::linux::fanotify::{
-  fid::Fid,
-  map::{FidMap, SeedEntry},
+use super::{ReseedOutcome, SeedOutcome, process_decoded, reseed_map, seed_moved_in_subtree};
+use crate::os::{
+  BackendStatsShared, SourceMessage,
+  linux::fanotify::{
+    fid::{DecodeOutcome, FAN_MODIFY, FanMask, Fid, RawFanotifyEvent},
+    map::{FidMap, SeedEntry},
+  },
+  transport::TransportState,
 };
 
 fn fid(tag: u8) -> Fid {
   Fid::new([tag; 8], Box::from(&[tag][..]))
+}
+
+/// A `FAN_MODIFY` event on child `name` under directory `dir_fid` — the simplest
+/// admissible shape: if `dir_fid` is in the map it resolves to `<dir>/<name>` and
+/// would forward as a Batch entry, so it is the suffix event the barrier must drop.
+fn modify_under(dir_fid: Fid, name: &[u8]) -> RawFanotifyEvent {
+  RawFanotifyEvent {
+    mask: FanMask::new(FAN_MODIFY),
+    dir_fid: Some(dir_fid),
+    target_fid: None,
+    name: Some(name.to_vec()),
+    rename: None,
+  }
+}
+
+/// The kind of each message a `process_decoded` call put on the queue, captured
+/// in order — enough to assert the barrier (no `Batch` ahead of the `Overflow`).
+#[derive(Debug, PartialEq, Eq)]
+enum Sent {
+  Batch(usize),
+  Overflow,
+  Fatal,
+}
+
+/// Runs `process_decoded` over `decoded` against `map`, capturing what it forwards
+/// (in order) and how many times each walk closure ran. The reseed walk returns
+/// `reseed`; a `None` reseed models a walk that fails every attempt (→ blind).
+fn run_process(
+  map: &mut FidMap,
+  decoded: DecodeOutcome,
+  reseed: Option<Vec<SeedEntry>>,
+) -> (Vec<Sent>, bool, u32) {
+  let stats = BackendStatsShared::default();
+  let transport = TransportState::new(8);
+  let sent = std::cell::RefCell::new(Vec::new());
+  let reseeds = Cell::new(0u32);
+  let alive = process_decoded(
+    decoded,
+    map,
+    &stats,
+    &transport,
+    || {
+      reseeds.set(reseeds.get() + 1);
+      match &reseed {
+        Some(entries) => Ok(entries.clone()),
+        None => Err(io::Error::other("reseed walk fails")),
+      }
+    },
+    |_, _, _| Ok(Vec::new()),
+    |msg| {
+      sent.borrow_mut().push(match msg {
+        SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
+        SourceMessage::Overflow(_) => Sent::Overflow,
+        SourceMessage::Fatal(_) => Sent::Fatal,
+      });
+      true
+    },
+  );
+  (sent.into_inner(), alive, reseeds.get())
 }
 
 fn one_entry_walk() -> Vec<SeedEntry> {
@@ -260,5 +323,68 @@ fn deferred_walk_resolves_current_path_after_reparent() {
     map.admit(&fid(6)),
     Some(std::path::PathBuf::from("/root/other/arrived/deep")),
     "the descendant is mapped under the moved dir's CURRENT location"
+  );
+}
+
+/// The reviewer's exact regression, at the seam: a LOSSY buffer whose suffix is an
+/// event under an in-root FID (which would resolve to a path and forward as a Batch
+/// entry) must forward NO Batch — only the `Overflow` — and must reseed first. The
+/// suffix path could be STALE (a rename lost in the window), so delivering it ahead
+/// of the covering rescan is the wrong-path hole this barrier closes. Decode keeps
+/// the post-marker event in `.events` (its own contract); the reader drops it here.
+#[test]
+fn lossy_buffer_forwards_only_the_overflow_after_reseeding() {
+  let mut map = seeded_with_sub();
+  // A suffix event under /root/sub (fid 2, in-map): it WOULD admit to /root/sub/f.
+  let decoded = DecodeOutcome {
+    events: vec![modify_under(fid(2), b"f")],
+    lossy: true,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  assert!(alive, "a reseeded loss keeps the stream live");
+  assert_eq!(reseeds, 1, "the loss reseeded the map before signaling");
+  assert_eq!(
+    sent,
+    vec![Sent::Overflow],
+    "the barrier: no Batch precedes the Overflow — the suffix event is dropped"
+  );
+}
+
+/// A CLEAN buffer forwards its admitted events as one Batch and NO Overflow, and
+/// never reseeds — the barrier branch is not on the happy path.
+#[test]
+fn clean_buffer_forwards_the_batch_and_never_reseeds() {
+  let mut map = seeded_with_sub();
+  let decoded = DecodeOutcome {
+    events: vec![modify_under(fid(2), b"f"), modify_under(fid(1), b"g")],
+    lossy: false,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  assert!(alive);
+  assert_eq!(reseeds, 0, "a clean buffer never triggers a reseed");
+  assert_eq!(
+    sent,
+    vec![Sent::Batch(2)],
+    "both admitted events ride one Batch, no Overflow"
+  );
+}
+
+/// A lossy buffer whose reseed walk fails every attempt escalates to the terminal
+/// `Fatal` (blind → fatal) and forwards NEITHER a Batch nor an Overflow — a
+/// stale-but-running source is the silent-loss shape the whole stack refuses.
+#[test]
+fn lossy_buffer_with_a_blinding_reseed_is_fatal_only() {
+  let mut map = seeded_with_sub();
+  let decoded = DecodeOutcome {
+    events: vec![modify_under(fid(2), b"f")],
+    lossy: true,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, None);
+  assert!(!alive, "a blind reseed kills the stream");
+  assert_eq!(reseeds, 2, "the reseed retried once, then conceded blind");
+  assert_eq!(
+    sent,
+    vec![Sent::Fatal],
+    "no Batch and no Overflow — the terminal Fatal is the only signal"
   );
 }

@@ -201,19 +201,55 @@ fn drain_events(fd: &OwnedFd, buf: &mut [u8], table: &mut WdTable, shared: &Read
       return true;
     }
     let decoded = decode::decode_events(&buf[..n]);
+    // Attribution still runs on a lossy buffer so the `wd` table stays accurate
+    // (an `IN_IGNORED` in it must still consume its entry); its EVENTS are dropped
+    // by the barrier inside `forward_attributed`.
     let attributed = attribute_events(decoded.events, table);
-    let events = attributed
+    forward_attributed(&shared.transport, attributed, decoded.lossy, |msg| {
+      shared.queue.try_send(msg).is_ok()
+    });
+  }
+}
+
+/// Forwards one attributed buffer onto the queue via `send`, holding the loss
+/// ordering barrier. Pure over the send closure — the only queue-touching part —
+/// so the barrier is testable over a real [`AttributedBatch`] with a capturing
+/// sender.
+///
+/// Loss is an ordering barrier. A lossy buffer (an `IN_Q_OVERFLOW` sentinel or a
+/// truncated record) is a mix of records around an UNKNOWN loss window: the
+/// sentinel names no position, so the records decoded AFTER it in the same buffer
+/// are attributed through the `wd` table as usual — and a `wd` pins its inode
+/// (object-stable), so it still names the right OBJECT — but the PATH the Monitor
+/// reports comes from the anchor's RECORDED path, which a rename lost in the window
+/// (`IN_MOVED_FROM`/`IN_MOVED_TO`) makes STALE. Forwarded in a Batch ahead of the
+/// loss signal, that wrong path reaches the consumer BEFORE the covering rescan
+/// corrects it — the same stale-attribution hole the fanotify reader closes. So
+/// deliver NO events from a lossy buffer: the covering rescan (epoch bump +
+/// re-enumerate + re-arm) already owes the consumer the full truth for everything
+/// this buffer could have said, so delivering none of it is strictly honest, at the
+/// cost of a few droppable pre-loss records the rescan re-covers. Signal ONLY the
+/// loss — empty events + lossy makes [`transport::forward_batch`] enqueue the
+/// `Overflow` alone, so nothing from the lossy buffer precedes it.
+fn forward_attributed<S>(
+  transport: &transport::TransportState,
+  attributed: super::super::AttributedBatch,
+  decode_lossy: bool,
+  send: S,
+) where
+  S: FnMut(crate::os::SourceMessage) -> bool,
+{
+  let lost = decode_lossy || attributed.lost;
+  let events = if lost {
+    Vec::new()
+  } else {
+    attributed
       .events
       .into_iter()
       .map(crate::os::SourceEvent::Linux)
-      .collect();
-    transport::forward_batch(
-      &shared.transport,
-      events,
-      decoded.lossy || attributed.lost,
-      |msg| shared.queue.try_send(msg).is_ok(),
-    );
-  }
+      .collect()
+  };
+  transport::forward_batch(transport, events, lost, send);
 }
 
 /// Executes one arm on the reader's own fd: open the target through the
@@ -373,5 +409,116 @@ mod libc_cross_assert {
     assert_eq!(decode::IN_DONT_FOLLOW, libc::IN_DONT_FOLLOW);
     assert_eq!(decode::IN_EXCL_UNLINK, libc::IN_EXCL_UNLINK);
     assert_eq!(decode::IN_MASK_CREATE, libc::IN_MASK_CREATE);
+  }
+}
+
+/// The loss ordering barrier at the reader seam: a lossy buffer forwards ONLY the
+/// `Overflow`, never a Batch of the records that trailed the sentinel (whose paths
+/// a lost rename could make stale) — the inotify twin of the fanotify barrier.
+#[cfg(test)]
+mod barrier {
+  use core::num::NonZeroU64;
+
+  use tributary_proto::WatchId;
+
+  use crate::os::{
+    SourceMessage,
+    linux::{
+      attribute_events,
+      inotify::{
+        decode::{IN_CREATE, IN_MOVED_FROM, IN_Q_OVERFLOW, InotifyMask, RawInotifyEvent},
+        table::WdTable,
+      },
+    },
+    transport::TransportState,
+  };
+
+  fn watch(n: u64) -> WatchId {
+    WatchId::new(NonZeroU64::new(n).unwrap())
+  }
+
+  fn event(wd: i32, mask: u32, name: Option<&[u8]>) -> RawInotifyEvent {
+    RawInotifyEvent {
+      wd,
+      mask: InotifyMask(mask),
+      cookie: 0,
+      name: name.map(<[u8]>::to_vec),
+    }
+  }
+
+  /// The kind of each message the forward put on the queue, in order.
+  #[derive(Debug, PartialEq, Eq)]
+  enum Sent {
+    Batch(usize),
+    Overflow,
+  }
+
+  /// Attributes `records` against a table holding one live `wd`, then runs the
+  /// reader's `forward_attributed` over the result, capturing what it forwards.
+  fn run(records: Vec<RawInotifyEvent>, decode_lossy: bool) -> Vec<Sent> {
+    let mut table = WdTable::new();
+    table.register(3, watch(1));
+    let attributed = attribute_events(records, &mut table);
+    let transport = TransportState::new(8);
+    let sent = std::cell::RefCell::new(Vec::new());
+    super::forward_attributed(&transport, attributed, decode_lossy, |msg| {
+      sent.borrow_mut().push(match msg {
+        SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
+        SourceMessage::Overflow(_) => Sent::Overflow,
+        SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
+      });
+      true
+    });
+    sent.into_inner()
+  }
+
+  /// An `IN_Q_OVERFLOW` sentinel followed by an attributable record: the reader
+  /// drops the trailing record (its path could be stale after a lost rename) and
+  /// forwards ONLY the Overflow — no Batch precedes it.
+  #[test]
+  fn overflow_then_record_forwards_only_the_overflow() {
+    let sent = run(
+      vec![
+        event(-1, IN_Q_OVERFLOW, None),
+        // A live rename half whose reported path rides the anchor's recorded
+        // path — exactly what a lost rename in the window would make wrong.
+        event(3, IN_MOVED_FROM, Some(b"x")),
+      ],
+      false,
+    );
+    assert_eq!(
+      sent,
+      vec![Sent::Overflow],
+      "the barrier: the post-sentinel record is dropped, no Batch precedes the Overflow"
+    );
+  }
+
+  /// A decode-level loss (a truncated tail, `decode_lossy`) applies the same
+  /// barrier even with no overflow sentinel in the attributed records.
+  #[test]
+  fn decode_loss_forwards_only_the_overflow() {
+    let sent = run(vec![event(3, IN_CREATE, Some(b"x"))], true);
+    assert_eq!(
+      sent,
+      vec![Sent::Overflow],
+      "a decode loss drops the batch too"
+    );
+  }
+
+  /// A clean buffer forwards its attributed records as one Batch and no Overflow.
+  #[test]
+  fn clean_buffer_forwards_the_batch() {
+    let sent = run(
+      vec![
+        event(3, IN_CREATE, Some(b"a")),
+        event(3, IN_CREATE, Some(b"b")),
+      ],
+      false,
+    );
+    assert_eq!(
+      sent,
+      vec![Sent::Batch(2)],
+      "both records ride one Batch, no Overflow"
+    );
   }
 }
