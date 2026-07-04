@@ -1,5 +1,7 @@
 use std::io;
 
+use rustix::io::Errno;
+
 use super::{WalkError, WalkSkip, classify_walk_skip, seed_walk, subtree_walk};
 use crate::os::linux::fanotify::fid::Fid;
 
@@ -19,63 +21,48 @@ fn root_without_a_handle_is_a_fatal_seed_failure() {
   );
 }
 
-/// The walk-skip classifier is the completeness decision, extracted pure so the
-/// two classes are row-tested without a live filesystem: ONLY `NotFound`
-/// (`ENOENT`) is a benign vanished-race skip; every other failure — permission,
-/// I/O, unsupported — is an in-root coverage hole that makes the tree
-/// `Incomplete` (fanotify not viable).
+/// The walk-skip classifier is the completeness decision, extracted pure so its
+/// classes are row-tested without a live filesystem. The benign vanish/shape-change
+/// set is exactly `{ENOENT, ELOOP, ENOTDIR}`: a directory a prior readdir listed
+/// that VANISHED (`ENOENT`), was SWAPPED FOR A SYMLINK — so the `O_NOFOLLOW` open
+/// refuses it (`ELOOP`) — or was SWAPPED FOR A NON-DIRECTORY — so the `O_DIRECTORY`
+/// open refuses it (`ENOTDIR`) — is a race, not a coverage hole. Crucially the
+/// symlink-swap case (`ELOOP`/`ENOTDIR`) is the scope-fence race: it is what a
+/// same-superblock swap of an in-root directory for a symlink pointing OUTSIDE the
+/// root produces, and classifying it a race is what keeps the foreign target out
+/// of the map. Every OTHER failure — permission, I/O, unsupported — is an in-root
+/// coverage hole that makes the tree `Incomplete` (fanotify not viable).
 #[test]
-fn classify_walk_skip_only_notfound_is_a_race() {
-  assert_eq!(
-    classify_walk_skip(&io::Error::from(io::ErrorKind::NotFound)),
-    WalkSkip::VanishedRace,
-    "a vanished entry is a benign race the walk skips"
-  );
-  for kind in [
-    io::ErrorKind::PermissionDenied,
-    io::ErrorKind::Unsupported,
-    io::ErrorKind::Other,
-    io::ErrorKind::InvalidInput,
+fn classify_walk_skip_vanish_and_shape_change_are_races() {
+  for (errno, label) in [
+    (Errno::NOENT, "a vanished entry (ENOENT)"),
+    (Errno::LOOP, "a listed dir swapped for a symlink (ELOOP)"),
+    (
+      Errno::NOTDIR,
+      "a listed dir swapped for a non-directory (ENOTDIR)",
+    ),
   ] {
     assert_eq!(
-      classify_walk_skip(&io::Error::from(kind)),
-      WalkSkip::Incomplete,
-      "{kind:?} on an existing in-root directory is an incompleteness, not a race"
+      classify_walk_skip(errno),
+      WalkSkip::VanishedRace,
+      "{label} is a benign shape-change race the walk skips — never a foreign admission"
     );
   }
-  // A raw errno (EACCES) — the exact chmod-000-subdirectory case — surfaces as
-  // PermissionDenied and is classified Incomplete: under Auto the spawn falls
-  // back to inotify, under forced Fanotify it is a typed viability error.
-  assert_eq!(
-    classify_walk_skip(&io::Error::from_raw_os_error(libc::EACCES)),
-    WalkSkip::Incomplete,
-    "an EACCES child directory makes the walk incomplete (the container fallback case)"
-  );
-}
-
-/// The handle-encode-failure re-stat routes its error through `classify_walk_skip`
-/// rather than treating EVERY error as a benign vanish. This pins the branch's
-/// decision to the classifier's contract — an `ENOENT` re-stat is a race (the
-/// object genuinely vanished between the stat and the re-stat, so skip), while an
-/// `EACCES` (or any other) re-stat is an existing-but-inaccessible in-root
-/// directory the walk cannot handle-encode → `Incomplete`, consistent with the
-/// walk's own non-`NotFound`-is-incomplete rule for every other per-entry failure.
-#[test]
-fn handle_encode_restat_classifies_eacces_as_incomplete() {
-  // The ENOENT re-stat branch: a vanished object is a race the walk skips.
-  assert_eq!(
-    classify_walk_skip(&io::Error::from(io::ErrorKind::NotFound)),
-    WalkSkip::VanishedRace,
-    "an ENOENT re-stat after a handle-encode failure is a benign vanish"
-  );
-  // The EACCES re-stat branch: the directory still exists but is inaccessible — an
-  // in-root coverage hole, not a silent skip.
-  assert_eq!(
-    classify_walk_skip(&io::Error::from_raw_os_error(libc::EACCES)),
-    WalkSkip::Incomplete,
-    "an EACCES re-stat after a handle-encode failure is an in-root incompleteness, \
-     not a swallowed skip"
-  );
+  // Every non-vanish/shape-change failure on an existing in-root directory is an
+  // incompleteness: under Auto the spawn falls back to inotify, under forced
+  // Fanotify it is a typed viability error.
+  for (errno, label) in [
+    (Errno::ACCESS, "EACCES (the chmod-000 subdirectory case)"),
+    (Errno::IO, "EIO"),
+    (Errno::PERM, "EPERM"),
+    (Errno::NOMEM, "ENOMEM"),
+  ] {
+    assert_eq!(
+      classify_walk_skip(errno),
+      WalkSkip::Incomplete,
+      "{label} on an existing in-root directory is an incompleteness, not a race"
+    );
+  }
 }
 
 /// `WalkError` folds both classes to the `io::Error` the reseed path escalates

@@ -8,17 +8,41 @@
 //! under the root simply never delivers events on this fd — its subtree is a
 //! different superblock. The seed still installs (born-closed, refreshed
 //! post-live) so the identity/device model the KR core shares stays honest.
+//!
+//! # Objects, not paths: the scope-fence invariant
+//!
+//! The mark covers the whole superblock, so the FID map is the ONLY thing that
+//! keeps an out-of-root directory's events from delivering as in-root: a foreign
+//! directory handle that seeds into the admission map admits every later event
+//! under that outside subtree forever, with no loss signal — an over-admission
+//! breach. The map is therefore kept honest by a hard rule: POST-LIVE, the walk
+//! never trusts a reconstructed pathname. Every directory whose handle enters the
+//! map is first PINNED as an fd — opened `O_NOFOLLOW` (a swapped-in symlink fails
+//! rather than redirecting) and fstat-verified on the root device — and its
+//! handle is encoded from that pinned fd (`name_to_handle_at(fd, "",
+//! AT_EMPTY_PATH)`), never from a name a same-superblock swap could retarget
+//! after a `readdir` listed it. The descent reads each directory's children from
+//! its pinned fd and opens each child relative to it (`openat(parent_fd, name,
+//! O_NOFOLLOW)`), so a listed entry swapped for a symlink to an outside-root
+//! directory can never be descended or handle-encoded — the open fails, the entry
+//! is skipped, and no foreign FID is admitted. The walk-root open uses `openat2`
+//! with `RESOLVE_NO_SYMLINKS` (kernel floor argued on [`open_walk_dir`]).
 
 use std::{
   ffi::CString,
   fs, io,
   os::{
-    fd::OwnedFd,
+    fd::{AsFd, BorrowedFd, OwnedFd},
     unix::{ffi::OsStrExt, fs::MetadataExt},
   },
   path::Path,
   sync::{Arc, mpsc},
   thread::JoinHandle,
+};
+
+use rustix::{
+  fs::{Dir, Mode, OFlags, ResolveFlags, fstat, openat, openat2},
+  io::Errno,
 };
 
 use super::{
@@ -32,6 +56,22 @@ use super::{
   reader::{self, Control, ReaderShared},
 };
 use crate::os::MAX_EXCLUSIONS;
+
+/// The `st_mode` type-bits mask (`S_IFMT`) and the directory type (`S_IFDIR`):
+/// `st_mode & S_IFMT == S_IFDIR` is the directory confirmation the pinned-fd
+/// `fstat` reads, making a `readdir` `d_type` advisory only.
+const S_IFMT: u32 = libc::S_IFMT;
+const S_IFDIR: u32 = libc::S_IFDIR;
+
+/// The open flags for a directory pinned during the walk: read-only so the fd
+/// can `readdir` (an `O_PATH` fd cannot), `O_DIRECTORY` so a non-directory fails
+/// fast, `O_NOFOLLOW` so a symlink swapped in for a listed name fails rather than
+/// redirecting outside the root, and `O_CLOEXEC` so a walk fd never leaks across
+/// an exec.
+const WALK_DIR_FLAGS: OFlags = OFlags::RDONLY
+  .union(OFlags::DIRECTORY)
+  .union(OFlags::NOFOLLOW)
+  .union(OFlags::CLOEXEC);
 
 /// The outcome of a fanotify spawn attempt. Separated from a plain `Result` so
 /// the dispatcher can tell a fanotify VIABILITY failure (the tree is not fully
@@ -341,26 +381,38 @@ impl ReseedContext {
 /// explicitly rather than folded into a bare skip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalkSkip {
-  /// The object vanished between the parent's readdir and this step (`ENOENT`):
-  /// a benign race. The parent map entry exists, so if it is recreated its own
-  /// create event re-learns it; the walk skips it and proceeds.
+  /// The object is no longer a plain in-root directory the walk can pin: it
+  /// vanished (`ENOENT`), or the name a prior `readdir` listed now resolves to a
+  /// symlink or non-directory (`ELOOP`/`ENOTDIR` from the `O_NOFOLLOW |
+  /// O_DIRECTORY` open). All three mean the object CHANGED SHAPE between the
+  /// listing and this step — a benign race, not a coverage hole: the parent map
+  /// entry exists, so any in-root object that later takes that name arrives
+  /// through its own create/rename event and is learned then. Skip and proceed.
   VanishedRace,
-  /// An EXISTING in-root directory could not be read or handle-encoded (`EACCES`
-  /// and every non-`ENOENT` failure): the map would be born blind to that
-  /// subtree. The walk cannot complete, so fanotify is not viable for this root.
+  /// An EXISTING in-root directory could not be pinned, read, or handle-encoded
+  /// (`EACCES`, I/O, and every failure that is NOT a vanish/shape-change): the
+  /// map would be born blind to that subtree. The walk cannot complete, so
+  /// fanotify is not viable for this root.
   Incomplete,
 }
 
-/// Classifies a per-entry walk failure. `ENOENT` (`NotFound`) is the only benign
-/// class — a directory a prior readdir listed but that vanished before this step
-/// is a race, not a coverage hole. Every other failure (permission, I/O, an
-/// unexportable handle on an object that still exists) leaves an in-root subtree
-/// unmapped, which fanotify's membership admission cannot tolerate.
-fn classify_walk_skip(err: &io::Error) -> WalkSkip {
-  if err.kind() == io::ErrorKind::NotFound {
-    WalkSkip::VanishedRace
-  } else {
-    WalkSkip::Incomplete
+/// Classifies a per-entry walk failure from the raw [`Errno`] the pinning open,
+/// fstat, or handle-encode returned. The vanish/shape-change set — `ENOENT`
+/// (gone), `ELOOP` (the `O_NOFOLLOW` open refused a now-symlink final
+/// component), and `ENOTDIR` (the `O_DIRECTORY` open refused a now-non-directory)
+/// — is the ONLY benign class: a name a prior `readdir` listed as a directory
+/// that no longer opens as one is a race between the listing and this step, so
+/// the entry is skipped rather than seeded. Crucially, `ELOOP`/`ENOTDIR` is
+/// exactly what a same-superblock swap of a listed directory for a symlink (even
+/// one pointing OUTSIDE the root) produces, and treating it as a race is what
+/// keeps that foreign target from ever being descended or handle-encoded (the
+/// scope-fence invariant on the module docs). Every other failure (permission,
+/// I/O, an unexportable handle on an object that still exists) leaves an in-root
+/// subtree unmapped, which fanotify's membership admission cannot tolerate.
+fn classify_walk_skip(err: Errno) -> WalkSkip {
+  match err {
+    Errno::NOENT | Errno::LOOP | Errno::NOTDIR => WalkSkip::VanishedRace,
+    _ => WalkSkip::Incomplete,
   }
 }
 
@@ -390,11 +442,50 @@ impl WalkError {
   }
 }
 
+/// Opens the walk-root path `root` as a pinned directory fd for the descent —
+/// the ONLY entry point that starts from a path rather than an inherited parent
+/// fd, so it carries the whole no-escape burden. Uses `openat2` with
+/// `RESOLVE_NO_SYMLINKS`, which forbids traversing ANY symlink in `root` (even a
+/// mid-path ancestor swapped in after canonicalization): a swap cannot redirect
+/// the open, it fails instead. Every subsequent directory in the descent is
+/// opened `openat(parent_fd, single_component, O_NOFOLLOW)` — a single non-`..`
+/// name under a held fd cannot escape and `O_NOFOLLOW` blocks a symlink final
+/// component — so `RESOLVE_NO_SYMLINKS` on this one path open plus the per-child
+/// opens give kernel-enforced no-escape end to end.
+///
+/// `RESOLVE_NO_SYMLINKS` rather than `RESOLVE_BENEATH`: `root` and the reader's
+/// resolved subtree path are ABSOLUTE (canonical / map-resolved), and `BENEATH`
+/// rejects an absolute path — it fences a RELATIVE resolution beneath a dirfd,
+/// which the per-child `openat`s already are. `NO_SYMLINKS` is the primitive that
+/// fences an absolute open.
+///
+/// # Kernel floor
+///
+/// `openat2` landed in Linux 5.6; the fanotify-FILESYSTEM backend requires 5.17
+/// (design §4, the `FAN_REPORT_TARGET_FID` / `FAN_RENAME` floor), so on every
+/// kernel that reaches this walk `openat2` is unconditionally present — no
+/// classified fallback is needed. A pre-5.6 kernel could never have started this
+/// source.
+fn open_walk_dir(root: &Path) -> Result<OwnedFd, Errno> {
+  openat2(
+    rustix::fs::CWD,
+    root,
+    WALK_DIR_FLAGS,
+    Mode::empty(),
+    ResolveFlags::NO_SYMLINKS,
+  )
+}
+
 /// Walks `root` depth-first, producing a [`SeedEntry`] per directory on the
 /// root device — every one an admitted directory, each carrying its parent FID
 /// so the map builds the parent-relative structure directly. A mount boundary
 /// (`st_dev != root_dev`) is not descended: an sb mark never crosses it, so its
 /// subtree lives on a different superblock and never delivers on this fd.
+///
+/// The root is opened as a PINNED fd ([`open_walk_dir`]) and its handle is
+/// encoded from that fd, so nothing about the seed depends on a re-resolvable
+/// name — the objects-not-paths invariant (module docs) holds from the very first
+/// object.
 ///
 /// Completeness is a fanotify PRECONDITION, not a best-effort target. An admitted
 /// event resolves its directory FID against this map; a directory the walk failed
@@ -402,197 +493,248 @@ impl WalkError {
 /// signal — the source goes "healthy" with a blind subtree. So every skip is
 /// classified ([`classify_walk_skip`]):
 ///
-/// - A `VanishedRace` skip (`ENOENT` on an entry a prior readdir listed) is
-///   benign and dropped: the parent's map entry exists, so a recreation re-learns
-///   the child from its own create event.
-/// - An `Incomplete` skip (any non-`ENOENT` failure on an EXISTING in-root
-///   directory — permission, I/O, an unexportable handle) aborts the walk with
+/// - A `VanishedRace` skip (`ENOENT`/`ELOOP`/`ENOTDIR` on an entry a prior readdir
+///   listed as a directory) is benign and dropped: the object vanished or changed
+///   shape, and the parent's map entry exists, so any in-root object later taking
+///   that name is learned from its own create/rename event.
+/// - An `Incomplete` skip (any other failure on an EXISTING in-root directory —
+///   permission, I/O, an unexportable handle) aborts the walk with
 ///   [`WalkError::Incomplete`]: the tree is not fully mappable, so fanotify is not
 ///   viable for this root.
-/// - A failure to encode the ROOT's own handle is [`WalkError::RootGone`]: the
-///   root anchor is load-bearing, but the probe already proved the root
-///   exportable, so its absence is a race reported as root-unavailable.
+/// - A failure to OPEN or handle-encode the ROOT itself is [`WalkError::RootGone`]:
+///   the root anchor is load-bearing, but the probe already proved the root
+///   openable and exportable, so its absence is a race reported as root-unavailable.
 ///
 /// The same walk seeds the map at spawn AND reseeds it after a loss; the reseed
 /// path folds every `WalkError` into its terminal blind→fatal escalation (see
 /// [`ReseedContext::walk`]), so an unreadable subtree that survives the reseed's
 /// single retry kills the scope rather than leaving it silently blind.
 fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>, WalkError> {
-  // The root anchor is load-bearing: without it the map has no base to resolve
-  // any path against, so its absence is a spawn/reseed failure, never an empty
-  // success.
-  let Some(root_fid) = handle_fid(root, fsid) else {
+  // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
+  // handle and its children both come from this fd, never a re-resolved name. A
+  // failure to open it is a race reported as root-unavailable (the probe already
+  // opened it).
+  let root_fd = open_walk_dir(root).map_err(|err| WalkError::RootGone(err.into()))?;
+  // The root anchor is load-bearing: without its handle the map has no base to
+  // resolve any path against, so its absence is a spawn/reseed failure, never an
+  // empty success. Encoded from the pinned fd, so it names exactly the object we
+  // opened.
+  let Some(root_fid) = handle_fid_at(root_fd.as_fd(), fsid) else {
     return Err(WalkError::RootGone(io::Error::new(
       io::ErrorKind::Unsupported,
       "the watched root does not export a file handle",
     )));
   };
-  // The root must be readable to seed anything; a root that cannot be opened is
-  // a race reported as root-unavailable (the probe already read it).
-  let reader = fs::read_dir(root).map_err(WalkError::RootGone)?;
   let mut seed = vec![SeedEntry::root(root_fid.clone(), root)];
-  descend(
-    reader,
-    root.to_path_buf(),
-    root_fid,
-    fsid,
-    root_dev,
-    &mut seed,
-  )?;
+  descend(root_fd, root_fid, fsid, root_dev, &mut seed)?;
   Ok(seed)
 }
 
 /// Walks the descendants of a directory MOVED IN from outside the root and
 /// already learned under `subtree_fid`, returning a [`SeedEntry::child`] per
 /// descendant directory. The moved directory itself is not re-emitted; the
-/// descent starts inside it (opening it for the first `read_dir`) and links every
+/// descent starts INSIDE it (from the pinned fd this opens) and links every
 /// discovered directory to its parent, so the top descendants hang off
-/// `subtree_fid` directly. Same completeness rule and single-device boundary as
-/// [`seed_walk`].
+/// `subtree_fid` directly. Same completeness rule, pinned-object discipline, and
+/// single-device boundary as [`seed_walk`].
 ///
 /// `subtree` is the moved directory's CURRENT path, resolved through the map by
 /// the reader at execution time — the node is still in-map and `pending_walk`, so
-/// a `NotFound` opening it is NOT a benign empty walk but a coverage hole: no
-/// rename-out was processed (the single-threaded reader would have forgotten it
-/// first), so the directory should be present and readable. It is therefore
-/// classified like any in-root directory — `NotFound` included is `Incomplete`,
-/// folding to the reader's retry-once-then-blind→fatal escalation — rather than
-/// swallowed as an empty subtree that would leave the moved dir's descendants
-/// blind forever.
+/// a `NotFound`/`ELOOP`/`ENOTDIR` opening it is NOT a benign empty walk but a
+/// coverage hole: no rename-out was processed (the single-threaded reader would
+/// have forgotten it first), so the directory should be present and openable as a
+/// directory. It is therefore all classified `Incomplete`, folding to the
+/// reader's retry-once-then-blind→fatal escalation — rather than swallowed as an
+/// empty subtree that would leave the moved dir's descendants blind forever.
 fn subtree_walk(
   subtree: &Path,
   subtree_fid: &Fid,
   fsid: [u8; 8],
   root_dev: u64,
 ) -> Result<Vec<SeedEntry>, WalkError> {
-  // The moved directory is still in-map and pending its walk, so opening it must
-  // succeed: a failure (NotFound included) is a coverage hole, not a race —
-  // Incomplete, escalated through the reader's retry-then-fatal.
-  let reader = fs::read_dir(subtree).map_err(WalkError::Incomplete)?;
+  // The moved directory is still in-map and pending its walk, so pinning it must
+  // succeed: any failure (a vanish/shape-change included) is a coverage hole, not
+  // a race — Incomplete, escalated through the reader's retry-then-fatal. Pinned
+  // as an fd so the descent never re-resolves the moved dir's name (which an
+  // in-root rename in the same batch could have made point elsewhere).
+  let subtree_fd = open_walk_dir(subtree).map_err(|err| WalkError::Incomplete(err.into()))?;
   let mut seed = Vec::new();
-  descend(
-    reader,
-    subtree.to_path_buf(),
-    subtree_fid.clone(),
-    fsid,
-    root_dev,
-    &mut seed,
-  )?;
+  descend(subtree_fd, subtree_fid.clone(), fsid, root_dev, &mut seed)?;
   Ok(seed)
 }
 
-/// The shared iterative descent: reads `reader` (an already-opened directory at
-/// `parent_path`, FID `parent_fid`) and every directory below it on `root_dev`,
-/// pushing a [`SeedEntry::child`] per discovered directory into `seed`. Explicit
-/// stacks keep the walk iterative (no recursion depth bound on a deep tree);
-/// `parents` carries each open reader's directory FID so a discovered child links
-/// to it. Every per-entry failure is classified — a `NotFound` vanish is a benign
-/// race skipped, anything else on an existing in-root directory aborts as
+/// One open directory in the descent: the pinned fd (the descent reads its
+/// children from it and opens each child relative to it) and its FID (a
+/// discovered child links to it). Holding the fd through its children's
+/// processing is what keeps a listed name from being re-resolved into a foreign
+/// object.
+struct WalkDir {
+  /// The `Dir` reader over the pinned directory fd — owns the one fd for this
+  /// level and yields its entries.
+  reader: Dir,
+  /// This directory's FID, the parent link for every child discovered here.
+  fid: Fid,
+}
+
+/// The shared iterative descent: reads `root_fd` (an already-pinned, already-FID'd
+/// directory) and every directory below it on `root_dev`, pushing a
+/// [`SeedEntry::child`] per discovered directory into `seed`. FULLY FD-RELATIVE —
+/// no path is ever reconstructed: each level holds its directory fd, children are
+/// read from it, and each child is opened `openat(parent_fd, name, O_NOFOLLOW |
+/// O_DIRECTORY | O_RDONLY | O_CLOEXEC)`. A same-superblock swap of a listed
+/// directory for a symlink therefore fails the open (`ELOOP`/`ENOTDIR`) and is
+/// skipped as a race — the foreign target is never descended and its handle never
+/// seeds the map (the scope-fence invariant).
+///
+/// An explicit stack keeps the walk iterative (no recursion-depth bound on a deep
+/// tree). fd usage is O(DEPTH) live at once — the descent stack holds one open
+/// directory fd per level from the root down to the deepest currently-open branch,
+/// released as each level is exhausted, never O(tree). Every per-entry failure is
+/// classified: a vanish/shape-change (`ENOENT`/`ELOOP`/`ENOTDIR`) is a benign race
+/// skipped, anything else on an existing in-root directory aborts as
 /// [`WalkError::Incomplete`].
 fn descend(
-  reader: fs::ReadDir,
-  parent_path: std::path::PathBuf,
-  parent_fid: Fid,
+  root_fd: OwnedFd,
+  root_fid: Fid,
   fsid: [u8; 8],
   root_dev: u64,
   seed: &mut Vec<SeedEntry>,
 ) -> Result<(), WalkError> {
-  let mut pending = vec![reader];
-  let mut parents = vec![(parent_path, parent_fid)];
+  let root_reader = Dir::new(root_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
+  let mut stack = vec![WalkDir {
+    reader: root_reader,
+    fid: root_fid,
+  }];
 
-  while let Some(reader) = pending.last_mut() {
-    let (parent_path, parent_fid) = parents.last().expect("a parent per reader").clone();
-    match reader.next() {
-      None => {
-        pending.pop();
-        parents.pop();
-      }
-      // A readdir iteration error names an entry the directory listed but could
-      // not stat: a vanished entry is a race (skip), anything else is a coverage
-      // hole in an in-root directory (abort).
-      Some(Err(err)) => match classify_walk_skip(&err) {
+  while let Some(level) = stack.last_mut() {
+    let Some(entry) = level.reader.read() else {
+      // The directory is exhausted: drop its fd and pop back to its parent.
+      stack.pop();
+      continue;
+    };
+    // A readdir iteration error is an in-root directory the walk cannot finish
+    // reading: a vanish/shape-change is a race (skip), anything else is a
+    // coverage hole (abort).
+    let entry = match entry {
+      Ok(entry) => entry,
+      Err(err) => match classify_walk_skip(err) {
         WalkSkip::VanishedRace => continue,
-        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
+        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err.into())),
       },
-      Some(Ok(entry)) => {
-        // `file_type` on a `DirEntry` may re-stat (no cached type); a failure is
-        // classified like any other per-entry skip.
-        let file_type = match entry.file_type() {
-          Ok(file_type) => file_type,
-          Err(err) => match classify_walk_skip(&err) {
-            WalkSkip::VanishedRace => continue,
-            WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
-          },
-        };
-        if !file_type.is_dir() {
-          continue;
-        }
-        let name = entry.file_name();
-        let path = parent_path.join(&name);
-        // Single-device descent: a directory on another device is a mount
-        // point — a different superblock this mark never reports on. A stat
-        // failure here is NOT a mount boundary (the old code conflated the two
-        // via `unwrap_or(false)`); it is a per-entry skip, classified.
-        let meta = match fs::symlink_metadata(&path) {
-          Ok(meta) => meta,
-          Err(err) => match classify_walk_skip(&err) {
-            WalkSkip::VanishedRace => continue,
-            WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
-          },
-        };
-        if meta.dev() != root_dev {
-          continue;
-        }
-        // The directory exists on the root device (just stat'd), so a failure to
-        // encode its handle leaves it un-admittable: an in-root blind subtree.
-        // `encode_handle` loses the errno, so a re-stat disambiguates the cause —
-        // but the re-stat error is itself classified, exactly like every other
-        // per-entry failure: only a `NotFound` re-stat is a benign vanish (skip),
-        // while an `EACCES` (or any other) re-stat is an existing-but-inaccessible
-        // directory the walk cannot map — Incomplete, not a silent skip.
-        let Some(fid) = handle_fid(&path, fsid) else {
-          match fs::symlink_metadata(&path) {
-            // The object vanished between the stat and the re-stat: a race, skip.
-            Err(err) if classify_walk_skip(&err) == WalkSkip::VanishedRace => continue,
-            // The object still exists (or the re-stat failed for a non-vanish
-            // reason): an in-root directory the walk cannot handle-encode.
-            _ => {
-              return Err(WalkError::Incomplete(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "an in-root directory does not export a file handle",
-              )));
-            }
-          }
-        };
-        seed.push(SeedEntry::child(fid.clone(), parent_fid.clone(), name));
-        // The child is admitted; failing to open it for descent hides ITS
-        // children, so the same completeness rule applies — a vanish is a race,
-        // anything else aborts.
-        match fs::read_dir(&path) {
-          Ok(reader) => {
-            pending.push(reader);
-            parents.push((path, fid));
-          }
-          Err(err) => match classify_walk_skip(&err) {
-            WalkSkip::VanishedRace => continue,
-            WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
-          },
-        }
-      }
+    };
+
+    let name = entry.file_name();
+    // `.`/`..` are yielded by the raw directory read (unlike `std::fs::read_dir`)
+    // and must be dropped: `openat(parent_fd, "..")` would climb OUT of the pinned
+    // subtree, and `openat(parent_fd, ".")` would re-open the parent and loop.
+    if name == c"." || name == c".." {
+      continue;
     }
+    // `d_type` is ADVISORY: a filesystem may report `DT_UNKNOWN`, and a stale
+    // cache can name a swapped object's OLD type — never trusted for admission.
+    // A definitively-non-directory, non-unknown entry is skipped without an open
+    // (a file/symlink/socket the walk does not descend, exactly as before); a
+    // `Directory` or `Unknown` entry is verified by the authoritative pinning
+    // open below, whose `fstat` on the opened fd — not `d_type` — confirms the
+    // type.
+    let advisory = entry.file_type();
+    if advisory != rustix::fs::FileType::Directory && advisory != rustix::fs::FileType::Unknown {
+      continue;
+    }
+
+    // Pin the child: open it relative to the PARENT fd with `O_NOFOLLOW |
+    // O_DIRECTORY`. A vanished entry fails `ENOENT`, a name now resolving to a
+    // symlink fails `ELOOP`, a name now a non-directory fails `ENOTDIR` — all
+    // three the benign shape-change race. A swap for a symlink pointing outside
+    // the root fails here too (`ELOOP`), so its target is never opened, stat'd, or
+    // handle-encoded. Any other error (permission, I/O) on an existing in-root
+    // directory is Incomplete.
+    let parent_fd = level
+      .reader
+      .fd()
+      .map_err(|err| WalkError::Incomplete(err.into()))?;
+    let child_fd = match openat(parent_fd, name, WALK_DIR_FLAGS, Mode::empty()) {
+      Ok(fd) => fd,
+      Err(err) => match classify_walk_skip(err) {
+        WalkSkip::VanishedRace => continue,
+        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err.into())),
+      },
+    };
+
+    // `fstat` the OPENED fd — the object the walk actually pinned, immune to any
+    // post-listing swap. `st_dev` is the single-device descent boundary (a
+    // directory on another device is a mount point on a different superblock this
+    // mark never reports on), and `st_mode` confirms it is truly a directory
+    // (making `d_type` advisory only — a filesystem could report `DT_DIR` for an
+    // object `O_DIRECTORY` still opened, but `fstat` is authoritative).
+    let stat = match fstat(&child_fd) {
+      Ok(stat) => stat,
+      Err(err) => match classify_walk_skip(err) {
+        WalkSkip::VanishedRace => continue,
+        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err.into())),
+      },
+    };
+    // `st_dev`/`st_mode` are `u64`/`u32` on every Linux target (the 32-bit
+    // `Stat` declares them so explicitly, the 64-bit `c_ulong`/`c_uint` aliases
+    // resolve to the same), so the comparisons need no conversion.
+    if stat.st_dev != root_dev {
+      // A mount boundary: a different superblock, not descended. `O_DIRECTORY`
+      // already guaranteed it is a directory, so this is purely the device fence.
+      continue;
+    }
+    if stat.st_mode & S_IFMT != S_IFDIR {
+      // Structurally impossible after an `O_DIRECTORY` open succeeded (the kernel
+      // would have returned `ENOTDIR`), but the map must never admit a
+      // non-directory handle, so a lying stat is skipped as a race rather than
+      // seeded.
+      continue;
+    }
+
+    // Encode the handle FROM THE PINNED fd (`AT_EMPTY_PATH`), never from a name a
+    // swap could retarget: the directory exists on the root device (just fstat'd
+    // the fd), so a failure to encode leaves it un-admittable — an in-root blind
+    // subtree — which is Incomplete, not a silent skip.
+    let Some(fid) = handle_fid_at(child_fd.as_fd(), fsid) else {
+      return Err(WalkError::Incomplete(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "an in-root directory does not export a file handle",
+      )));
+    };
+    seed.push(SeedEntry::child(
+      fid.clone(),
+      level.fid.clone(),
+      os_name(name),
+    ));
+    // Descend: reuse the SAME pinned fd for the child's directory read (the fd was
+    // opened `O_RDONLY`, so it can `readdir`; the handle and stat already came from
+    // it — one open per directory, not two). A failure to build the reader hides
+    // the child's own children, so it is Incomplete like any in-root read failure.
+    let reader = Dir::new(child_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
+    stack.push(WalkDir { reader, fid });
   }
   Ok(())
 }
 
-/// Reads `path`'s file handle via the shared dynamically-sized
-/// [`encode_handle`](super::encode_handle) and pairs it with the superblock
-/// `fsid` into a [`Fid`] whose byte-form matches the kernel's event FIDs exactly
-/// (`handle` = type word + opaque bytes). `None` when the filesystem cannot
-/// encode a handle for this object — including a handle too large for even the
-/// grown buffer, which `encode_handle` resolves by retrying at the
-/// kernel-reported size rather than failing on the fixed `MAX_HANDLE_SZ`.
-fn handle_fid(path: &Path, fsid: [u8; 8]) -> Option<Fid> {
-  super::encode_handle(path).map(|handle| Fid::new(fsid, handle))
+/// Encodes the file handle of the directory pinned by `dirfd` via the shared
+/// dynamically-sized [`encode_handle_at`](super::encode_handle_at) and pairs it
+/// with the superblock `fsid` into a [`Fid`] whose byte-form matches the kernel's
+/// event FIDs exactly (`handle` = type word + opaque bytes). Fd-relative
+/// (`AT_EMPTY_PATH`) so the handle is taken from exactly the object the walk
+/// pinned — never a name a same-superblock swap could redirect after a `readdir`
+/// listed it. `None` when the filesystem cannot encode a handle for this object,
+/// including a handle too large for even the grown buffer (which `encode_handle_at`
+/// resolves by retrying at the kernel-reported size).
+fn handle_fid_at(dirfd: BorrowedFd<'_>, fsid: [u8; 8]) -> Option<Fid> {
+  super::encode_handle_at(dirfd).map(|handle| Fid::new(fsid, handle))
+}
+
+/// Interprets a raw directory-entry `CStr` name as an `OsString` for a
+/// [`SeedEntry`]. The bytes pass through verbatim on unix (a directory entry name
+/// is opaque bytes), so the seed name matches what the kernel reports for the same
+/// object in events.
+fn os_name(name: &std::ffi::CStr) -> std::ffi::OsString {
+  use std::os::unix::ffi::OsStrExt;
+  std::ffi::OsStr::from_bytes(name.to_bytes()).to_os_string()
 }
 
 /// A NUL-terminated C string for a path, or a typed spawn error on an embedded

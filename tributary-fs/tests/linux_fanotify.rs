@@ -521,6 +521,200 @@ async fn superblock_firehose_is_filtered() {
   );
 }
 
+/// Suite 10 (scope-fence, static) — a symlink PLACED INSIDE the watched root
+/// before the watch, pointing at an outside-root same-superblock directory, must
+/// never make the seed walk admit that outside directory. The walk pins every
+/// directory as an `O_NOFOLLOW` fd and reads/opens children fd-relative, so a
+/// symlink is never followed and the outside target's FID never seeds the map —
+/// churn inside the outside directory (reached through the in-root symlink or
+/// directly) produces ZERO events for the watched root.
+///
+/// This is the deterministic guard for the objects-not-paths invariant; the
+/// racing twin below exercises the swap-after-listing window the fd-relative walk
+/// closes.
+#[tokio::test]
+async fn in_root_symlink_to_outside_dir_is_never_admitted() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!(
+      "SKIP in_root_symlink_to_outside_dir_is_never_admitted: no ext4 loopback (--privileged)"
+    );
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "symlink-fence");
+  // An outside-root directory on the SAME superblock, holding a pre-existing
+  // nested subtree the walk must never learn.
+  let outside = scratch_under(&mount, "symlink-fence-target");
+  std::fs::create_dir_all(outside.join("nested")).unwrap();
+  // A symlink INSIDE the root pointing at that outside directory, placed BEFORE
+  // the watch so the seed walk encounters it as a listed entry.
+  let link = root.join("into-outside");
+  std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+    return;
+  };
+  // Prove the mark is live before the churn.
+  std::fs::write(root.join("alive.txt"), b"a").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &root.join("alive.txt")))
+      .await
+      .is_some(),
+    "the mark is live before the symlink-fence churn"
+  );
+
+  // Churn hard inside the OUTSIDE directory — both directly and through the
+  // in-root symlink path. If the walk had followed the symlink and admitted the
+  // outside subtree, these would deliver as in-root; the fd-relative walk never
+  // admitted it, so none may.
+  for i in 0..200 {
+    let direct = outside.join("nested").join(format!("d-{i}.txt"));
+    std::fs::write(&direct, b"n").unwrap();
+    std::fs::remove_file(&direct).unwrap();
+    // Also mutate via the in-root symlink path: writing `root/into-outside/x`
+    // resolves (through the symlink) to the outside directory. The EVENT the
+    // kernel reports is keyed on the outside directory's FID, which is unmapped,
+    // so it must drop — never surface under the in-root symlink path.
+    let via_link = link.join(format!("l-{i}.txt"));
+    std::fs::write(&via_link, b"n").unwrap();
+    std::fs::remove_file(&via_link).unwrap();
+  }
+
+  // No event may name anything under the outside directory OR under the in-root
+  // symlink path (an admitted outside subtree would leak either form).
+  let breach = tokio::time::timeout(Duration::from_secs(3), async {
+    while let Some(event) = w.next().await {
+      let path = event.path().to_path_buf();
+      if path.starts_with(&outside) || path.starts_with(&link) {
+        return Some(path);
+      }
+    }
+    None
+  })
+  .await
+  .ok()
+  .flatten();
+  assert!(
+    breach.is_none(),
+    "an in-root symlink to an outside directory leaked an event (the walk followed it): {breach:?}"
+  );
+  let _ = w.close().await;
+}
+
+/// Suite 10 (scope-fence, RACE) — the reviewer's best-effort: a seed walk over a
+/// deep in-root tree racing a swap loop that repeatedly `mv`s an in-root directory
+/// away and drops a symlink to an OUTSIDE-root same-superblock directory in its
+/// place. The pre-fix hole classified an entry by `d_type`, then did every later
+/// step (`symlink_metadata`, `name_to_handle_at`, `read_dir`) by RECONSTRUCTED
+/// PATHNAME — so a swap landing AFTER the classification redirected the handle
+/// read and the descent OUTSIDE the root, seeding a foreign directory FID; since
+/// the FILESYSTEM mark covers the whole superblock, every later event under that
+/// outside subtree then delivered as in-root. The fd-relative walk pins each
+/// directory `O_NOFOLLOW` and opens children relative to the parent fd, so a
+/// swapped-in symlink fails the open (`ELOOP`/`ENOTDIR`) and its target is never
+/// descended.
+///
+/// Best-effort by nature (winning the swap window is timing-dependent): the
+/// property is SCOPE-FENCE HONESTY, asserted after the churn settles. A genuinely
+/// raced walk either skipped the swapped entry (fd-relative — the honest outcome)
+/// or, had it gone incomplete, escalated to fatal → Auto's next `watch` re-selects
+/// — both leave NO foreign admission. So the assertion is one-sided: churn inside
+/// the outside directory after the walk settles must deliver ZERO in-root events
+/// naming it. Only the silent foreign admission the fix removes would surface one.
+#[tokio::test]
+async fn racing_swap_to_outside_dir_never_admits_foreign_subtree() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!(
+      "SKIP racing_swap_to_outside_dir_never_admits_foreign_subtree: no ext4 loopback (--privileged)"
+    );
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  // The outside-root target the swap loop points its symlinks at, with a
+  // pre-existing nested subtree that must never become in-root.
+  let outside = scratch_under(&mount, "race-target");
+  std::fs::create_dir_all(outside.join("nested")).unwrap();
+
+  // Run several racing attempts: each builds a fresh deep in-root tree, then
+  // spawns a swap loop (mv the mid-tree directory away + symlink the outside dir
+  // in its place) WHILE the watch's seed walk runs. Winning the window is
+  // probabilistic, so repeat — any single admission would be caught.
+  for attempt in 0..8u32 {
+    let root = scratch_under(&mount, &format!("race-{attempt}"));
+    // A deep tree so the walk spends time descending: root/a/b/c/d/e with a
+    // `swap` directory partway down that the loop yanks.
+    let deep = root.join("a/b/c/d/e");
+    std::fs::create_dir_all(&deep).unwrap();
+    let swap = root.join("a/b/swap");
+    std::fs::create_dir_all(swap.join("inner")).unwrap();
+    let moved_away = root.join("a/b/swap-moved");
+    let target = outside.clone();
+
+    // The swap loop: repeatedly rename `swap` away and drop a symlink to the
+    // outside dir in its place, then restore — churning the exact directory the
+    // walk may be about to classify-then-path-resolve. Clone the paths into the
+    // thread so `swap` stays available for the post-join cleanup below.
+    let swap_in_thread = swap.clone();
+    let swap_thread = std::thread::spawn(move || {
+      for _ in 0..400 {
+        let _ = std::fs::rename(&swap_in_thread, &moved_away);
+        let _ = std::os::unix::fs::symlink(&target, &swap_in_thread);
+        // Undo so the tree is walkable again for the next attempt's shape.
+        let _ = std::fs::remove_file(&swap_in_thread);
+        let _ = std::fs::rename(&moved_away, &swap_in_thread);
+      }
+    });
+
+    // Start the watch DURING the swap churn (its seed walk races the loop).
+    let watcher = fanotify_watcher(&root).await;
+    let _ = swap_thread.join();
+    let Some((mut w, _h)) = watcher else {
+      // fanotify unavailable — the whole cell can only run privileged.
+      return;
+    };
+
+    // Let the swap settle to a stable state and prove the mark is live.
+    let _ = std::fs::remove_file(&swap);
+    let _ = std::fs::create_dir_all(swap.join("inner"));
+    std::fs::write(root.join("alive.txt"), b"a").unwrap();
+    let _ = wait_for(&mut w, |e| covers(e, &root.join("alive.txt"))).await;
+
+    // Now churn inside the OUTSIDE directory. If any racing swap had seeded the
+    // outside dir's FID into the map, these would deliver as in-root under the
+    // swapped path — the silent foreign admission the fix removes.
+    for i in 0..100 {
+      let f = outside.join("nested").join(format!("r-{attempt}-{i}.txt"));
+      std::fs::write(&f, b"n").unwrap();
+      std::fs::remove_file(&f).unwrap();
+    }
+
+    let breach = tokio::time::timeout(Duration::from_secs(2), async {
+      while let Some(event) = w.next().await {
+        let path = event.path().to_path_buf();
+        // A leak is an event whose path reaches into the outside directory — the
+        // foreign subtree that must never have been admitted. (Events naming the
+        // in-root `swap` path itself are legitimate: it is a real in-root object.)
+        if path.starts_with(&outside) {
+          return Some(path);
+        }
+      }
+      None
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(
+      breach.is_none(),
+      "a racing swap seeded a foreign outside subtree (attempt {attempt}): {breach:?}"
+    );
+    let _ = w.close().await;
+  }
+}
+
 /// Suite 11: unmount under watch (design §7 limitation, container-validated).
 ///
 /// A `FAN_MARK_FILESYSTEM` watcher receives NO kernel signal when its
