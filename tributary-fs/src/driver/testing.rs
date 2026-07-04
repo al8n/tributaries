@@ -806,6 +806,7 @@ impl ScopeRegistry for NullRegistry {
     _identity: RootIdentity,
     _ancestors: &[RootIdentity],
     _backend: BackendKind,
+    _stats: Option<crate::os::BackendStatsHandle>,
   ) {
   }
 
@@ -850,6 +851,7 @@ impl ScopeRegistry for RecordingRegistry {
     _identity: RootIdentity,
     _ancestors: &[RootIdentity],
     backend: BackendKind,
+    _stats: Option<crate::os::BackendStatsHandle>,
   ) {
     self
       .state

@@ -1,5 +1,5 @@
 //! The fanotify lowering: precise verbs on a kernel-recursive stream, lowered
-//! to root-relative targets with interned-FID identity.
+//! to root-relative targets.
 //!
 //! Everything the FSEvents path needs a probe for, fanotify already knows:
 //! events are precise verbs (never OR'd hints), so there are NO grounding
@@ -7,14 +7,16 @@
 //! immediate). A `FAN_RENAME` arrives atomically — both directory FIDs and
 //! both names in ONE event — so the driver mints a counter cookie and emits
 //! `MovedFrom`/`MovedTo` adjacently, with no pairing window and no
-//! classification. Object identity is the map's interned FID id (exact,
-//! sequential, generation-embedding — stronger than `(dev, ino)`), fed to the
-//! Monitor via `with_node`. `MOVE_SELF`/`DELETE_SELF` at the root is the
+//! classification. Records carry NO node identity: under the kernel-recursive
+//! profile record identity is inert (design §4.9 — `Monitor::reconcile_slot`
+//! early-returns for a non-descending scope, and `FAN_RENAME` carries its own
+//! atomic addressing), so the lowering attaches none, exactly as the FSEvents
+//! kernel-recursive lowering does. `MOVE_SELF`/`DELETE_SELF` at the root is the
 //! scope's death, exactly the FSEvents unmount lifecycle.
 
 use std::{collections::BTreeMap, path::Path, vec::Vec};
 
-use tributary_proto::{Identity, OsRecord, RecordKind, Scope};
+use tributary_proto::{OsRecord, RecordKind, Scope};
 
 use crate::os::linux::fanotify::AdmittedEvent;
 
@@ -59,17 +61,7 @@ impl DriverCore {
   ) -> Vec<Planned> {
     let mask = event.mask;
     if let Some(rename) = &event.rename {
-      // The moved object's stable identity lives on the rename half (the FID is
-      // the object's, not the directory's); `event.identity` is `None` for a
-      // rename, so passing it would strip both records of the node identity the
-      // admission layer already interned.
-      return self.plan_rename(
-        state,
-        scope,
-        &rename.old_path,
-        &rename.new_path,
-        rename.identity,
-      );
+      return self.plan_rename(state, scope, &rename.old_path, &rename.new_path);
     }
 
     let Some(path) = &event.path else {
@@ -114,9 +106,6 @@ impl DriverCore {
     if let Some(location) = target {
       rec = rec.with_target(location);
     }
-    if let Some(node) = identity(event.identity) {
-      rec = rec.with_node(node);
-    }
     vec![Planned::Rec(rec)]
   }
 
@@ -131,7 +120,6 @@ impl DriverCore {
     scope: ScopeId,
     old_path: &Path,
     new_path: &Path,
-    node: Option<std::num::NonZeroU64>,
   ) -> Vec<Planned> {
     let old = lower(state, old_path);
     let new = lower(state, new_path);
@@ -146,17 +134,12 @@ impl DriverCore {
     match (old, new) {
       (Lowered::Target(from), Lowered::Target(to)) => {
         let cookie = self.next_cookie();
-        let node = identity(node);
-        let mut from_rec = OsRecord::new(state.watch, RecordKind::MovedFrom)
+        let from_rec = OsRecord::new(state.watch, RecordKind::MovedFrom)
           .with_target(from)
           .with_cookie(cookie);
-        let mut to_rec = OsRecord::new(state.watch, RecordKind::MovedTo)
+        let to_rec = OsRecord::new(state.watch, RecordKind::MovedTo)
           .with_target(to)
           .with_cookie(cookie);
-        if let Some(node) = node {
-          from_rec = from_rec.with_node(node);
-          to_rec = to_rec.with_node(node);
-        }
         vec![Planned::Rec(from_rec), Planned::Rec(to_rec)]
       }
       // One end is outside the root: a move across the boundary. Cover the
@@ -185,11 +168,4 @@ fn verb(event: &AdmittedEvent) -> Option<RecordKind> {
   } else {
     None
   }
-}
-
-/// Wraps an interned FID id as a proto [`Identity`]. The map already
-/// guarantees a non-zero, exact, sequential id — never a hash — so this is a
-/// direct wrap with no device-trust gate (the handle IS the object).
-fn identity(id: Option<std::num::NonZeroU64>) -> Option<Identity> {
-  id.map(Identity::new)
 }

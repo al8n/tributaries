@@ -53,7 +53,7 @@ fn root_without_a_handle_is_a_fatal_seed_failure() {
   let missing = std::path::Path::new("/tributary-fs-nonexistent-root-for-seed-walk");
   // The open fails (ENOENT) before the FID check is reached, so any expected FID
   // will do — the point is the RootGone class, not the mismatch.
-  let result = seed_walk(missing, [0u8; 8], 0, None, &some_fid(1));
+  let result = seed_walk(missing, [0u8; 8], 0, None, &some_fid(1), None);
   assert!(
     matches!(result, Err(WalkError::RootGone(_))),
     "a root with no encodable handle fails the walk as RootGone, not an empty seed"
@@ -199,7 +199,7 @@ fn reseed_root_fid_mismatch_is_rootgone_without_seeding() {
   // A DELIBERATELY WRONG anchor: the real root will never encode to these bytes,
   // so the reopen-verification must reject it.
   let wrong = some_fid(0xEE);
-  let result = seed_walk(&root, [0u8; 8], root_dev, None, &wrong);
+  let result = seed_walk(&root, [0u8; 8], root_dev, None, &wrong, None);
   let _ = std::fs::remove_dir_all(&root);
   assert!(
     matches!(result, Err(WalkError::RootGone(_))),
@@ -235,7 +235,7 @@ fn reseed_root_fid_match_seeds_normally() {
     eprintln!("SKIP reseed_root_fid_match_seeds_normally: temp root exports no handle");
     return;
   };
-  let result = seed_walk(&root, [0u8; 8], root_dev, None, &expected);
+  let result = seed_walk(&root, [0u8; 8], root_dev, None, &expected, None);
   let _ = std::fs::remove_dir_all(&root);
   let entries = result.expect("the genuine root passes the FID gate and seeds");
   // The root anchor plus its `sub` child — the gate did not block the real root.
@@ -280,7 +280,7 @@ fn subtree_fid_mismatch_is_incomplete_without_seeding() {
   }
   // A wrong learned FID: the real reopened subtree will not encode to these bytes.
   let wrong = some_fid(0xAB);
-  let result = subtree_walk(&subtree, &wrong, [0u8; 8], root_dev, None);
+  let result = subtree_walk(&subtree, &wrong, [0u8; 8], root_dev, None, None);
   let _ = std::fs::remove_dir_all(&subtree);
   assert!(
     matches!(result, Err(WalkError::Incomplete(_))),
@@ -319,7 +319,7 @@ fn subtree_fid_match_seeds_descendants() {
     eprintln!("SKIP subtree_fid_match_seeds_descendants: temp fs exports no handle");
     return;
   };
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None, None);
   let _ = std::fs::remove_dir_all(&subtree);
   let entries = result.expect(
     "the genuine subtree passes the handle-only FID gate and seeds descendants, even with an \
@@ -383,7 +383,7 @@ fn unreadable_child_makes_the_real_walk_incomplete() {
     );
     return;
   };
-  let result = seed_walk(&root, [0u8; 8], root_dev, None, &expected);
+  let result = seed_walk(&root, [0u8; 8], root_dev, None, &expected, None);
   // Restore permissions BEFORE asserting so cleanup always succeeds.
   let _ = std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755));
   let _ = std::fs::remove_dir_all(&root);
@@ -431,7 +431,7 @@ fn subtree_walk_maps_descendants_not_the_root() {
     return;
   };
 
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None, None);
   let _ = std::fs::remove_dir_all(&subtree);
   let entries = match result {
     Ok(entries) => entries,
@@ -509,7 +509,7 @@ fn subtree_walk_unreadable_descendant_is_incomplete() {
     return;
   }
 
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None, None);
   let _ = std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755));
   let _ = std::fs::remove_dir_all(&subtree);
   match result {
@@ -534,7 +534,7 @@ fn subtree_walk_on_missing_path_is_incomplete_not_empty() {
   ));
   let _ = std::fs::remove_dir_all(&missing);
   let subtree_fid = Fid::new([7; 8], Box::from(&[7u8][..]));
-  match subtree_walk(&missing, &subtree_fid, [0u8; 8], 0, None) {
+  match subtree_walk(&missing, &subtree_fid, [0u8; 8], 0, None, None) {
     Err(WalkError::Incomplete(err)) => {
       assert_eq!(
         err.kind(),
@@ -548,6 +548,51 @@ fn subtree_walk_on_missing_path_is_incomplete_not_empty() {
       entries.len()
     ),
   }
+}
+
+/// The directory cap (design §4.9) on a real tree: a `seed_walk` whose cap is
+/// SMALLER than the tree's directory count aborts as [`WalkError::Incomplete`]
+/// (the fanotify-not-viable class the spawn folds to `NotViable` and the reseed to
+/// fatal — never a multi-gigabyte map built blind), while a generous cap seeds the
+/// whole tree. The cap is fenced during the descent, so the oversized inventory is
+/// never materialized.
+#[test]
+fn seed_walk_over_the_directory_cap_is_incomplete() {
+  use std::os::unix::fs::MetadataExt;
+
+  let root = std::env::temp_dir().join(format!("tributary-fs-cap-walk-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&root);
+  // Root + three subdirectories = four directories total.
+  std::fs::create_dir_all(root.join("a")).expect("create a walkable root");
+  std::fs::create_dir_all(root.join("b")).expect("subdir b");
+  std::fs::create_dir_all(root.join("c")).expect("subdir c");
+  let Ok(meta) = std::fs::metadata(&root) else {
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+  let root_dev = meta.dev();
+  let Some(expected) = real_dir_fid(&root, [0u8; 8]) else {
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("SKIP seed_walk_over_the_directory_cap_is_incomplete: temp root exports no handle");
+    return;
+  };
+
+  // A cap of two cannot hold four directories: the walk aborts as Incomplete.
+  let capped = seed_walk(&root, [0u8; 8], root_dev, None, &expected, Some(2));
+  assert!(
+    matches!(capped, Err(WalkError::Incomplete(_))),
+    "a tree exceeding the directory cap is Incomplete (fanotify not viable), not a partial seed"
+  );
+
+  // A generous cap seeds the whole tree.
+  let ok = seed_walk(&root, [0u8; 8], root_dev, None, &expected, Some(1000));
+  let _ = std::fs::remove_dir_all(&root);
+  let entries = ok.expect("a generous cap seeds the whole tree");
+  assert_eq!(
+    entries.len(),
+    4,
+    "root + three subdirectories seed under a cap that comfortably holds them"
+  );
 }
 
 /// The pure `FAN_*` constants and info-record tags restate the kernel ABI; this

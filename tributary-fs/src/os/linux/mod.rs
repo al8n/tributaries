@@ -574,6 +574,15 @@ impl SourceHandle {
     }
   }
 
+  /// The source's live stats handle: `Some` for a fanotify source (the reader's
+  /// counters), `None` for inotify (no pollable admission map — design §4.9).
+  pub(crate) fn backend_stats(&self) -> Option<super::BackendStatsHandle> {
+    match self {
+      Self::Inotify(_) => None,
+      Self::Fanotify(handle) => Some(handle.backend_stats()),
+    }
+  }
+
   /// Installs (or aliases) a kernel watch on the inotify source. The
   /// kernel-recursive fanotify source has no arming and answers the honest
   /// typed refusal — the driver routes arms through [`scope_port`](Self::scope_port),

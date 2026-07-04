@@ -40,6 +40,7 @@ pub struct WatcherOptions {
   exclusions: Vec<PathBuf>,
   backend: Backend,
   root_liveness_interval: Duration,
+  max_map_directories: Option<usize>,
 }
 
 impl WatcherOptions {
@@ -78,6 +79,10 @@ impl WatcherOptions {
   /// [`root_liveness_interval`](Self::root_liveness_interval).
   pub const DEFAULT_ROOT_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
 
+  /// The default fanotify admission-map directory cap: [`None`] — uncapped. See
+  /// [`max_map_directories`](Self::max_map_directories) for the memory table.
+  pub const DEFAULT_MAX_MAP_DIRECTORIES: Option<usize> = None;
+
   /// The default options.
   #[inline]
   pub const fn new() -> Self {
@@ -89,6 +94,7 @@ impl WatcherOptions {
       exclusions: Vec::new(),
       backend: Self::DEFAULT_BACKEND,
       root_liveness_interval: Self::DEFAULT_ROOT_LIVENESS_INTERVAL,
+      max_map_directories: Self::DEFAULT_MAX_MAP_DIRECTORIES,
     }
   }
 
@@ -291,6 +297,46 @@ impl WatcherOptions {
     root_liveness_interval: Duration,
   ) -> &mut Self {
     self.root_liveness_interval = root_liveness_interval;
+    self
+  }
+
+  /// The fanotify admission-map directory cap — the ceiling on directories the
+  /// per-root FID map holds; [`None`] (the default) is uncapped.
+  ///
+  /// The fanotify map is O(LIVE directories): roughly ~250 bytes per directory,
+  /// so ~2.5–4 GB at 10 million directories (and a seed walk taking minutes) —
+  /// the huge-dedicated-tree archetype that wants either a tuned cap or inotify
+  /// (which carries its own per-directory kernel costs). Setting the cap trades
+  /// coverage of a tree that large for a bounded footprint:
+  ///
+  /// - at SEED/reseed WALK time a tree exceeding the cap makes fanotify unviable —
+  ///   under [`Backend::Auto`] the barrier falls back to inotify, under a forced
+  ///   [`Backend::Fanotify`] it is a typed
+  ///   [`WatchRootError::Source`](crate::WatchRootError::Source);
+  /// - at LIVE learn time a create/move-in growing the map past the cap ends the
+  ///   scope with a terminal [`Rescan`](crate::EventKind::Rescan) — a capped map
+  ///   that silently stopped learning would drop events under the unlearned
+  ///   directories forever, so the honest terminal is death, never silent loss.
+  ///
+  /// Ignored by inotify and by macOS (neither keeps a fanotify-style admission
+  /// map).
+  #[inline]
+  pub const fn max_map_directories(&self) -> Option<usize> {
+    self.max_map_directories
+  }
+
+  /// Returns these options with the fanotify admission-map directory cap set.
+  #[inline]
+  #[must_use]
+  pub const fn with_max_map_directories(mut self, max_map_directories: Option<usize>) -> Self {
+    self.max_map_directories = max_map_directories;
+    self
+  }
+
+  /// Sets the fanotify admission-map directory cap.
+  #[inline]
+  pub const fn set_max_map_directories(&mut self, max_map_directories: Option<usize>) -> &mut Self {
+    self.max_map_directories = max_map_directories;
     self
   }
 }

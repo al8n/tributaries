@@ -26,20 +26,23 @@ use rustix::{
 
 use super::{
   super::{
-    super::{SourceError, transport},
+    super::{BackendStatsShared, SourceError, transport},
     wake::WakeState,
   },
-  Admission, admit,
+  Admission, MemoBatch, admit,
   fid::decode_events,
   map::{FidMap, SeedEntry},
   source::ReseedContext,
 };
 
-/// What the reader shares with the handle side: the ordered queue and the
-/// transport budget/dedups.
+/// What the reader shares with the handle side: the ordered queue, the
+/// transport budget/dedups, and the live stats the operator polls.
 pub(crate) struct ReaderShared {
   pub(crate) queue: async_channel::Sender<crate::os::SourceMessage>,
   pub(crate) transport: transport::TransportState,
+  /// The atomic stats the reader writes (map size, walk timings, memo tallies)
+  /// and [`Watcher::backend_stats`](crate::Watcher::backend_stats) snapshots.
+  pub(crate) stats: std::sync::Arc<BackendStatsShared>,
 }
 
 /// One control request. fanotify has no arm traffic, so shutdown is the only
@@ -60,6 +63,12 @@ pub(crate) fn start(
   reseed: ReseedContext,
   shared: Arc<ReaderShared>,
 ) -> Result<JoinHandle<()>, SourceError> {
+  // Publish the seeded map's footprint before the reader blocks, so a poll
+  // before the first event still sees the true directory count.
+  let seeded = map.stats();
+  shared
+    .stats
+    .set_map(seeded.directories, seeded.memo_generation);
   std::thread::Builder::new()
     .name("tributary-fs.fanotify".into())
     .spawn(move || {
@@ -160,10 +169,33 @@ fn drain_events(
     // is unknown is provably outside the root and dropped without loss. That
     // silent drop is BY DESIGN — the filter working — and is distinct from the
     // staleness a loss induces, which the reseed below repairs.
+    //
+    // The batch memo (design §4.9) caches admitted directory resolutions FOR THIS
+    // buffer only: the reader is single-threaded and the map is queue-ordered, so
+    // a cached path is sound until the next map mutation, which bumps the map's
+    // generation and thus invalidates the memo. A fresh memo per buffer clears it
+    // at batch end by construction.
+    let mut memo = MemoBatch::new();
     let mut events = Vec::with_capacity(decoded.events.len());
     for event in &decoded.events {
-      match admit(map, event) {
-        Admission::Admit(admitted) => events.push(fanotify_event(admitted)),
+      match admit(map, event, &mut memo) {
+        Admission::Admit(admitted) => {
+          // A live create/move-in may have grown the map past its cap (design
+          // §4.9). A capped map that keeps eventing while silently refusing to
+          // learn new directories is the silent-loss shape — events under the
+          // unlearned directory would drop as outside-root forever — so it is a
+          // terminal condition, escalated to `Fatal` rather than run on blind.
+          if map.over_capacity() {
+            signal_fatal(
+              shared,
+              SourceError::ReadFailed {
+                source: cap_exceeded_error(),
+              },
+            );
+            return false;
+          }
+          events.push(fanotify_event(admitted));
+        }
         // A directory moved IN from outside the root: walk its pre-existing
         // descendants into the map BEFORE forwarding the move, so any later event
         // in this same batch under those descendants already admits.
@@ -192,16 +224,28 @@ fn drain_events(
         // NOT a benign empty walk. Auto's next `watch()` then lands on inotify,
         // which re-enumerates; a silent blind subtree is never left behind.
         Admission::AdmitAndSeed { event, moved_fid } => {
-          if matches!(
-            seed_moved_in_subtree(map, &moved_fid, |subtree, subtree_fid| {
-              reseed.walk_subtree(subtree, subtree_fid)
-            }),
-            SeedOutcome::Blind
-          ) {
+          let started = std::time::Instant::now();
+          let outcome = seed_moved_in_subtree(map, &moved_fid, |subtree, subtree_fid| {
+            reseed.walk_subtree(subtree, subtree_fid)
+          });
+          shared.stats.record_walk(walk_micros(started));
+          if matches!(outcome, SeedOutcome::Blind) {
             signal_fatal(
               shared,
               SourceError::ReadFailed {
                 source: moved_in_blind_error(),
+              },
+            );
+            return false;
+          }
+          // The moved-in subtree may have grown the map past its cap (the walk
+          // fenced its own production, but the additive total is caught here) —
+          // the same terminal a live create over the cap hits.
+          if map.over_capacity() {
+            signal_fatal(
+              shared,
+              SourceError::ReadFailed {
+                source: cap_exceeded_error(),
               },
             );
             return false;
@@ -222,15 +266,28 @@ fn drain_events(
     // A walk that fails leaves the map permanently blind — a stale-but-running
     // source is the silent-loss shape this whole stack exists to prevent — so
     // the failure is escalated honestly, not swallowed.
-    if decoded.lossy && matches!(reseed_map(map, || reseed.walk()), ReseedOutcome::Blind) {
-      signal_fatal(
-        shared,
-        SourceError::ReadFailed {
-          source: reseed_blind_error(),
-        },
-      );
-      return false;
+    if decoded.lossy {
+      shared.stats.record_reseed();
+      let started = std::time::Instant::now();
+      let outcome = reseed_map(map, || reseed.walk());
+      shared.stats.record_walk(walk_micros(started));
+      if matches!(outcome, ReseedOutcome::Blind) {
+        signal_fatal(
+          shared,
+          SourceError::ReadFailed {
+            source: reseed_blind_error(),
+          },
+        );
+        return false;
+      }
     }
+    // Publish this batch's memo tallies and the map's post-batch footprint, so an
+    // operator poll reflects the current admission map and memo hit rate.
+    shared.stats.add_memo(memo.hits, memo.misses);
+    let map_stats = map.stats();
+    shared
+      .stats
+      .set_map(map_stats.directories, map_stats.memo_generation);
     transport::forward_batch(&shared.transport, events, decoded.lossy, |msg| {
       shared.queue.try_send(msg).is_ok()
     });
@@ -272,6 +329,22 @@ fn reseed_blind_error() -> std::io::Error {
   std::io::Error::other(
     "the fanotify FID map could not be reseeded after a loss; the source is blind",
   )
+}
+
+/// The error a live map growing past its directory cap escalates through the
+/// terminal `Fatal` (design §4.9): a capped map that keeps eventing while
+/// silently refusing to learn new directories would drop their events as
+/// outside-root forever — the silent-loss shape, refused honestly.
+fn cap_exceeded_error() -> std::io::Error {
+  std::io::Error::other(
+    "the fanotify FID map exceeded its directory cap on a live create/move-in; the source cannot keep learning",
+  )
+}
+
+/// A completed walk's duration in whole microseconds, saturating so a pathological
+/// clock can never wrap the counter.
+fn walk_micros(started: std::time::Instant) -> u64 {
+  started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
 }
 
 /// Wraps one admitted event for the driver queue.

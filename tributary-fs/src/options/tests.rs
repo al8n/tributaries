@@ -22,6 +22,11 @@ fn default_delegates_to_new() {
     WatcherOptions::DEFAULT_ROOT_LIVENESS_INTERVAL
   );
   assert_eq!(opts.root_liveness_interval(), Duration::from_secs(30));
+  assert_eq!(
+    opts.max_map_directories(),
+    WatcherOptions::DEFAULT_MAX_MAP_DIRECTORIES
+  );
+  assert_eq!(opts.max_map_directories(), None, "uncapped by default");
 }
 
 #[test]
@@ -33,7 +38,8 @@ fn builders_and_setters_agree() {
     .with_os_batch_capacity(NonZeroUsize::new(4).unwrap())
     .with_exclusions(vec![PathBuf::from("/tmp/skip")])
     .with_backend(Backend::Fanotify)
-    .with_root_liveness_interval(Duration::from_secs(5));
+    .with_root_liveness_interval(Duration::from_secs(5))
+    .with_max_map_directories(Some(100_000));
 
   let mut set = WatcherOptions::new();
   set
@@ -43,12 +49,14 @@ fn builders_and_setters_agree() {
     .set_os_batch_capacity(NonZeroUsize::new(4).unwrap())
     .set_exclusions(vec![PathBuf::from("/tmp/skip")])
     .set_backend(Backend::Fanotify)
-    .set_root_liveness_interval(Duration::from_secs(5));
+    .set_root_liveness_interval(Duration::from_secs(5))
+    .set_max_map_directories(Some(100_000));
 
   assert_eq!(built, set);
   assert_eq!(built.exclusions_slice().len(), 1);
   assert_eq!(built.backend(), Backend::Fanotify);
   assert_eq!(built.root_liveness_interval(), Duration::from_secs(5));
+  assert_eq!(built.max_map_directories(), Some(100_000));
 }
 
 #[test]

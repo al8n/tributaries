@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{
-  Admission, admit,
+  Admission, MemoBatch, admit,
   fid::{
     FAN_ATTRIB, FAN_CREATE, FAN_DELETE_SELF, FAN_MODIFY, FAN_ONDIR, FAN_RENAME, FanMask, Fid,
     RawFanotifyEvent, RenameInfo,
@@ -14,6 +14,13 @@ use super::{
 
 fn fid(tag: u8) -> Fid {
   Fid::new([tag; 8], Box::from(&[tag][..]))
+}
+
+/// Admits a single event through a fresh one-shot memo — the per-event shape most
+/// of these row tests use (the batch-spanning memo has its own suite below).
+/// Returns the [`Admission`] so the caller can match its arm.
+fn admit_one(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
+  admit(map, event, &mut MemoBatch::new())
 }
 
 fn seeded() -> FidMap {
@@ -36,72 +43,62 @@ fn dirent(mask: u64, dir_fid: Fid, name: &[u8], target: Option<Fid>) -> RawFanot
 }
 
 /// A FILE create inside an admitted directory resolves to the child's absolute
-/// path but attaches NO identity even when the kernel supplied a target FID:
-/// identity is directory-only (interning file targets would grow the map's
-/// intern table unboundedly under churn), and file identity is inert under the
-/// kernel-recursive Monitor profile regardless.
+/// path — the whole admitted form under the KR profile. Records carry no node
+/// identity (design §4.9), so there is nothing beyond the path to assert.
 #[test]
-fn file_create_resolves_path_with_no_identity() {
+fn file_create_resolves_path() {
   let mut map = seeded();
   let ev = dirent(FAN_CREATE, fid(2), b"file.txt", Some(fid(7)));
-  let Admission::Admit(admitted) = admit(&mut map, &ev) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
     panic!("in-root create must admit");
   };
   assert_eq!(
     admitted.path.as_deref(),
     Some(Path::new("/root/sub/file.txt"))
   );
-  assert!(
-    admitted.identity.is_none(),
-    "a file target FID is never interned — identity is directory-only"
-  );
 }
 
-/// A DIRECTORY create resolves its path AND interns the directory's target FID
-/// as the record identity (directory handles are already required for admission,
-/// so interning them is free and bounded by the directory count).
+/// A DIRECTORY create resolves its path exactly like a file create — no identity
+/// is attached to either (the no-identity contract, design §4.9). The directory's
+/// membership self-maintenance is covered by
+/// [`directory_create_is_learned`](directory_create_is_learned).
 #[test]
-fn directory_create_resolves_path_and_identity() {
+fn directory_create_resolves_path() {
   let mut map = seeded();
   let ev = dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"newdir", Some(fid(7)));
-  let Admission::Admit(admitted) = admit(&mut map, &ev) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
     panic!("in-root directory create must admit");
   };
   assert_eq!(
     admitted.path.as_deref(),
     Some(Path::new("/root/sub/newdir"))
   );
-  assert_eq!(
-    admitted.identity,
-    Some(map.intern(&fid(7))),
-    "a directory target FID is interned as the record identity"
-  );
 }
 
-/// Neither a file modify nor a file attrib carrying a target FID mints an
-/// identity — the intern table never grows on file events, the whole point of
-/// the O(directories) bound. A create/delete churn of files therefore leaves the
-/// table untouched.
+/// A long churn of DISTINCT file target FIDs never grows the map — files are not
+/// admitted directories, so they never enter it. This is the O(live directories)
+/// bound the no-identity model rests on: the memo-generation stays put because
+/// a plain file event mutates nothing.
 #[test]
-fn file_events_never_intern_their_target() {
+fn file_event_churn_never_grows_the_map() {
   let mut map = seeded();
-  // A long churn of DISTINCT file target FIDs on file (non-ONDIR) events.
+  let generation = map.generation();
   for tag in 20..120u8 {
     let modify = dirent(FAN_MODIFY, fid(2), b"f.txt", Some(fid(tag)));
-    let Admission::Admit(admitted) = admit(&mut map, &modify) else {
-      panic!("in-root file modify must admit");
-    };
     assert!(
-      admitted.identity.is_none(),
-      "a file modify never interns its target FID"
+      matches!(admit_one(&mut map, &modify), Admission::Admit(_)),
+      "in-root file modify must admit"
     );
   }
-  // The intern table still holds only the two seeded directories: no file target
-  // ever entered it.
   assert_eq!(
-    map.interned_count(),
+    map.dir_count(),
     2,
-    "file-event churn left the intern table at O(live directories)"
+    "file-event churn left the map at the two seeded directories"
+  );
+  assert_eq!(
+    map.generation(),
+    generation,
+    "a file event mutates nothing, so the generation is unchanged"
   );
 }
 
@@ -111,7 +108,7 @@ fn file_events_never_intern_their_target() {
 fn admit_drops_unknown_directory() {
   let mut map = seeded();
   let ev = dirent(FAN_MODIFY, fid(99), b"elsewhere", None);
-  assert!(matches!(admit(&mut map, &ev), Admission::Drop));
+  assert!(matches!(admit_one(&mut map, &ev), Admission::Drop));
 }
 
 /// A directory create self-maintains the map: the new directory's own later
@@ -120,10 +117,10 @@ fn admit_drops_unknown_directory() {
 fn directory_create_is_learned() {
   let mut map = seeded();
   let ev = dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"newdir", Some(fid(3)));
-  let _ = admit(&mut map, &ev);
+  let _ = admit_one(&mut map, &ev);
   // A modify inside the newly-learned directory now admits.
   let inside = dirent(FAN_MODIFY, fid(3), b"inside.txt", None);
-  let Admission::Admit(admitted) = admit(&mut map, &inside) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &inside) else {
     panic!("the learned directory must admit its own events");
   };
   assert_eq!(
@@ -144,7 +141,7 @@ fn delete_self_resolves_and_forgets() {
     name: None,
     rename: None,
   };
-  let Admission::Admit(admitted) = admit(&mut map, &ev) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
     panic!("delete-self on an admitted directory must admit");
   };
   assert_eq!(admitted.path.as_deref(), Some(Path::new("/root/sub")));
@@ -152,11 +149,12 @@ fn delete_self_resolves_and_forgets() {
 }
 
 /// A FILE `FAN_RENAME` with both ends in-root resolves both absolute paths in
-/// one event — the atomic pair, no window — with NO identity (a file target is
-/// never interned).
+/// one event — the atomic pair, no window. The admitted rename carries only the
+/// two paths (no identity — design §4.9), and a file rename mutates nothing.
 #[test]
-fn file_rename_resolves_both_ends_without_identity() {
+fn file_rename_resolves_both_ends() {
   let mut map = seeded();
+  let generation = map.generation();
   let ev = RawFanotifyEvent {
     mask: FanMask::new(FAN_RENAME),
     dir_fid: None,
@@ -169,20 +167,16 @@ fn file_rename_resolves_both_ends_without_identity() {
       new_name: b"b.txt".to_vec(),
     }),
   };
-  let Admission::Admit(admitted) = admit(&mut map, &ev) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
     panic!("an in-root rename must admit");
   };
   let rename = admitted.rename.expect("rename info");
   assert_eq!(rename.old_path, PathBuf::from("/root/a.txt"));
   assert_eq!(rename.new_path, PathBuf::from("/root/sub/b.txt"));
-  assert!(
-    rename.identity.is_none(),
-    "a file rename target FID is never interned"
-  );
   assert_eq!(
-    map.interned_count(),
-    2,
-    "a file rename left the intern table at the two seeded directories"
+    map.generation(),
+    generation,
+    "a file rename left the map (and its two seeded directories) unchanged"
   );
 }
 
@@ -203,7 +197,7 @@ fn rename_outside_root_is_dropped() {
       new_name: b"y".to_vec(),
     }),
   };
-  assert!(matches!(admit(&mut map, &ev), Admission::Drop));
+  assert!(matches!(admit_one(&mut map, &ev), Admission::Drop));
 }
 
 /// A rename INTO the root (source outside, destination in-root) admits, with
@@ -223,7 +217,7 @@ fn rename_into_root_admits_with_resolved_destination() {
       new_name: b"arrived.txt".to_vec(),
     }),
   };
-  let Admission::Admit(admitted) = admit(&mut map, &ev) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
     panic!("a rename into the root must admit");
   };
   let rename = admitted.rename.expect("rename info");
@@ -256,7 +250,7 @@ fn dir_move_in_from_outside_requests_a_subtree_walk() {
       new_name: b"arrived".to_vec(),
     }),
   };
-  let Admission::AdmitAndSeed { event, moved_fid } = admit(&mut map, &ev) else {
+  let Admission::AdmitAndSeed { event, moved_fid } = admit_one(&mut map, &ev) else {
     panic!("a populated dir moved in from outside must request a subtree walk");
   };
   assert_eq!(
@@ -305,7 +299,7 @@ fn in_root_dir_rename_requests_no_walk() {
     }),
   };
   assert!(
-    matches!(admit(&mut map, &ev), Admission::Admit(_)),
+    matches!(admit_one(&mut map, &ev), Admission::Admit(_)),
     "an in-root rename of an already-mapped directory needs no subtree walk"
   );
   assert_eq!(
@@ -336,7 +330,7 @@ fn dir_move_out_then_back_in_re_walks() {
       new_name: b"sub".to_vec(),
     }),
   };
-  assert!(matches!(admit(&mut map, &out), Admission::Admit(_)));
+  assert!(matches!(admit_one(&mut map, &out), Admission::Admit(_)));
   assert!(!map.contains_dir(&fid(2)), "the moved-out dir is forgotten");
 
   // Move it back IN under /root (the root fid(1) is in-root): now unknown, so it
@@ -354,7 +348,7 @@ fn dir_move_out_then_back_in_re_walks() {
     }),
   };
   assert!(
-    matches!(admit(&mut map, &back), Admission::AdmitAndSeed { .. }),
+    matches!(admit_one(&mut map, &back), Admission::AdmitAndSeed { .. }),
     "a move back in from outside re-requests the subtree walk"
   );
 }
@@ -391,7 +385,10 @@ fn burst_move_in_then_in_root_rename_keeps_walk_pending_at_current_path() {
     }),
   };
   assert!(
-    matches!(admit(&mut map, &move_in), Admission::AdmitAndSeed { .. }),
+    matches!(
+      admit_one(&mut map, &move_in),
+      Admission::AdmitAndSeed { .. }
+    ),
     "the move-in requests a subtree walk"
   );
   assert_eq!(
@@ -416,7 +413,7 @@ fn burst_move_in_then_in_root_rename_keeps_walk_pending_at_current_path() {
     }),
   };
   assert!(
-    matches!(admit(&mut map, &in_root), Admission::Admit(_)),
+    matches!(admit_one(&mut map, &in_root), Admission::Admit(_)),
     "the in-root re-parent of the now-known dir needs no second walk"
   );
   // The still-owed walk (requested by event 1) now resolves the CURRENT path —
@@ -449,7 +446,7 @@ fn file_move_in_requests_no_walk() {
     }),
   };
   assert!(
-    matches!(admit(&mut map, &ev), Admission::Admit(_)),
+    matches!(admit_one(&mut map, &ev), Admission::Admit(_)),
     "a file move-in carries no descendants, so no walk"
   );
 }
@@ -482,11 +479,11 @@ fn dir_rename_reparents_descendants() {
       new_name: b"moved".to_vec(),
     }),
   };
-  assert!(matches!(admit(&mut map, &rename), Admission::Admit(_)));
+  assert!(matches!(admit_one(&mut map, &rename), Admission::Admit(_)));
 
   // A later modify on the PRE-SEEDED child resolves under the new parent path.
   let child_event = dirent(FAN_MODIFY, fid(3), b"leaf.txt", None);
-  let Admission::Admit(admitted) = admit(&mut map, &child_event) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &child_event) else {
     panic!("the descendant must still admit after the parent rename");
   };
   assert_eq!(
@@ -496,19 +493,17 @@ fn dir_rename_reparents_descendants() {
   );
 }
 
-/// An in-root directory rename PRESERVES the moved directory's identity: the same
-/// object keeps its interned id across the move (the re-parent overwrites its node
-/// in place rather than pruning-then-re-minting), so the Monitor never mistakes a
-/// renamed directory for a replacement.
+/// An in-root directory rename RE-PARENTS the moved directory in place (the map
+/// keeps its membership node, so its descendants follow via the parent link) and
+/// resolves the pair's paths. No identity rides the rename (design §4.9).
 #[test]
-fn dir_rename_in_root_preserves_identity() {
+fn dir_rename_in_root_reparents_and_keeps_membership() {
   let mut map = FidMap::new();
   map.seed([
     SeedEntry::root(fid(1), Path::new("/root")),
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+    SeedEntry::child(fid(3), fid(2), OsString::from("child")),
   ]);
-  let before = map.intern(&fid(2));
-  let count_before = map.interned_count();
 
   let rename = RawFanotifyEvent {
     mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
@@ -522,38 +517,37 @@ fn dir_rename_in_root_preserves_identity() {
       new_name: b"moved".to_vec(),
     }),
   };
-  let Admission::Admit(admitted) = admit(&mut map, &rename) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &rename) else {
     panic!("an in-root directory rename must admit");
   };
+  let rename = admitted.rename.expect("rename info");
+  assert_eq!(rename.old_path, PathBuf::from("/root/sub"));
+  assert_eq!(rename.new_path, PathBuf::from("/root/moved"));
+  // The moved directory keeps its membership node under the new name, and its
+  // pre-seeded child resolves under the re-parented path — no per-node rewrite.
+  assert_eq!(map.admit(&fid(2)), Some(PathBuf::from("/root/moved")));
   assert_eq!(
-    admitted.rename.and_then(|r| r.identity),
-    Some(before),
-    "the rename reports the moved directory's stable identity"
+    map.admit(&fid(3)),
+    Some(PathBuf::from("/root/moved/child")),
+    "the descendant follows the in-root rename"
   );
   assert_eq!(
-    map.intern(&fid(2)),
-    before,
-    "the renamed directory keeps its interned id — no fork across the move"
-  );
-  assert_eq!(
-    map.interned_count(),
-    count_before,
-    "an in-root rename does not grow the intern table"
+    map.dir_count(),
+    3,
+    "an in-root rename does not grow the map"
   );
 }
 
-/// A directory moved OUT of the root has its identity PRUNED (it departed the
-/// map), bounding the intern table at the live directory count. A later move back
-/// would mint a fresh id — the conservative direction the Monitor reads as a
-/// replacement.
+/// A directory moved OUT of the root is FORGOTTEN (it departed the map), bounding
+/// the map at the live directory count. A later move back re-enters through its
+/// own move-in event — the map holds only membership.
 #[test]
-fn dir_move_out_prunes_identity() {
+fn dir_move_out_forgets_the_directory() {
   let mut map = FidMap::new();
   map.seed([
     SeedEntry::root(fid(1), Path::new("/root")),
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
   ]);
-  let departed = map.intern(&fid(2));
 
   let rename = RawFanotifyEvent {
     mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
@@ -567,19 +561,13 @@ fn dir_move_out_prunes_identity() {
       new_name: b"sub".to_vec(),
     }),
   };
-  assert!(matches!(admit(&mut map, &rename), Admission::Admit(_)));
+  assert!(matches!(admit_one(&mut map, &rename), Admission::Admit(_)));
   assert_eq!(
-    map.interned_count(),
+    map.dir_count(),
     1,
-    "the departed directory's id was pruned — only the root remains"
+    "the departed directory was forgotten — only the root remains"
   );
-  // A reappearance mints a FRESH id (identity discontinuity for a
-  // departed-and-returned directory — the safe direction).
-  assert_ne!(
-    map.intern(&fid(2)),
-    departed,
-    "a returned directory mints a new identity"
-  );
+  assert_eq!(map.admit(&fid(2)), None, "and it no longer admits");
 }
 
 /// A directory moved OUT of the root stops admitting its descendants: after the
@@ -611,26 +599,169 @@ fn dir_move_out_of_root_stops_descendant_admission() {
   // The rename still admits (the old end is in-root — a move across the
   // boundary is the tree's business), but the map self-maintenance detaches
   // the subtree.
-  assert!(matches!(admit(&mut map, &rename), Admission::Admit(_)));
+  assert!(matches!(admit_one(&mut map, &rename), Admission::Admit(_)));
 
   // A later event on the pre-seeded descendant is now outside the root.
   let child_event = dirent(FAN_MODIFY, fid(3), b"leaf.txt", None);
   assert!(
-    matches!(admit(&mut map, &child_event), Admission::Drop),
+    matches!(admit_one(&mut map, &child_event), Admission::Drop),
     "a descendant of a moved-out directory no longer admits"
   );
 }
 
-/// An attrib event on a file in an admitted directory resolves its path with no
-/// identity when the kernel reported no target FID (the file's identity stays
-/// enumerate-sourced).
+/// An attrib event on a file in an admitted directory resolves its path — the
+/// whole admitted form (no identity, design §4.9).
 #[test]
-fn attrib_without_target_fid_has_no_identity() {
+fn attrib_resolves_its_path() {
   let mut map = seeded();
   let ev = dirent(FAN_ATTRIB, fid(1), b"meta.txt", None);
-  let Admission::Admit(admitted) = admit(&mut map, &ev) else {
+  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
     panic!("must admit");
   };
   assert_eq!(admitted.path.as_deref(), Some(Path::new("/root/meta.txt")));
-  assert!(admitted.identity.is_none());
+}
+
+/// The batch admission memo (design §4.9): the reader shares ONE [`MemoBatch`]
+/// across a read buffer, so a second event under an already-resolved directory
+/// hits the cache, while a map MUTATION between two events bumps the generation
+/// and forces the second to miss — the generation-tagged soundness argument.
+mod batch_memo {
+  use super::*;
+
+  /// Two events under the SAME directory in one batch: the first resolves the
+  /// directory against the map (a miss that fills the cache), the second is served
+  /// from the memo (a hit) — the rename-storm win.
+  #[test]
+  fn second_event_under_same_dir_hits() {
+    let mut map = seeded();
+    let mut memo = MemoBatch::new();
+    // Two file modifies under /root/sub (dir fid 2), no mutation between them.
+    let a = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
+    let b = dirent(FAN_MODIFY, fid(2), b"b.txt", None);
+    assert!(matches!(
+      admit(&mut map, &a, &mut memo),
+      Admission::Admit(_)
+    ));
+    assert_eq!((memo.hits, memo.misses), (0, 1), "the first is a cold miss");
+    assert!(matches!(
+      admit(&mut map, &b, &mut memo),
+      Admission::Admit(_)
+    ));
+    assert_eq!(
+      (memo.hits, memo.misses),
+      (1, 1),
+      "the second under the same dir is a memo hit"
+    );
+  }
+
+  /// A mutation between two events under the same directory (a `learn` of a new
+  /// child) bumps the map generation, so a lookup AFTER the mutation finds its
+  /// pre-mutation tag stale and re-resolves — a miss. The memo can never serve a
+  /// path the map mutated out from under it.
+  ///
+  /// The ordering within one `admit` matters: the directory lookup runs BEFORE any
+  /// learn/forget the event performs, so the learning event itself still HITS its
+  /// directory (its entry was tagged current at lookup time); only the NEXT event's
+  /// lookup sees the post-learn generation and misses.
+  #[test]
+  fn a_learn_between_events_invalidates_the_memo() {
+    let mut map = seeded();
+    let mut memo = MemoBatch::new();
+    // Event 1: a file modify under /root/sub — a cold miss that fills dir fid 2.
+    let modify = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
+    assert!(matches!(
+      admit(&mut map, &modify, &mut memo),
+      Admission::Admit(_)
+    ));
+    assert_eq!((memo.hits, memo.misses), (0, 1));
+    // Event 2: a DIRECTORY create under /root/sub. Its dir-fid-2 lookup runs first
+    // (a HIT — still current), THEN the learn bumps the generation.
+    let mkdir = dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"newdir", Some(fid(3)));
+    assert!(matches!(
+      admit(&mut map, &mkdir, &mut memo),
+      Admission::Admit(_)
+    ));
+    assert_eq!(
+      (memo.hits, memo.misses),
+      (1, 1),
+      "the learning event still hits its directory — the lookup precedes its mutation"
+    );
+    // Event 3: another modify under /root/sub. Its memo entry was tagged BEFORE the
+    // learn, so the stale generation forces a re-resolve — a miss, not a hit.
+    let modify2 = dirent(FAN_MODIFY, fid(2), b"b.txt", None);
+    assert!(matches!(
+      admit(&mut map, &modify2, &mut memo),
+      Admission::Admit(_)
+    ));
+    assert_eq!(
+      (memo.hits, memo.misses),
+      (1, 2),
+      "the post-learn lookup re-resolves: the learn invalidated the pre-learn entry"
+    );
+  }
+
+  /// A `forget` (rename-out / delete of a directory) likewise invalidates the memo
+  /// via the generation bump: a later event that would otherwise hit misses.
+  #[test]
+  fn a_forget_invalidates_the_memo() {
+    let mut map = FidMap::new();
+    map.seed([
+      SeedEntry::root(fid(1), Path::new("/root")),
+      SeedEntry::child(fid(2), fid(1), OsString::from("a")),
+      SeedEntry::child(fid(3), fid(1), OsString::from("b")),
+    ]);
+    let mut memo = MemoBatch::new();
+    // Fill the memo for dir fid 1 (the root) via an event under it.
+    let under_root = dirent(FAN_MODIFY, fid(1), b"x.txt", None);
+    assert!(matches!(
+      admit(&mut map, &under_root, &mut memo),
+      Admission::Admit(_)
+    ));
+    // Delete directory /root/b (a DELETE_SELF forgets it) — a mutation.
+    let delete_b = RawFanotifyEvent {
+      mask: FanMask::new(super::FAN_DELETE_SELF | FAN_ONDIR),
+      dir_fid: Some(fid(3)),
+      target_fid: None,
+      name: None,
+      rename: None,
+    };
+    assert!(matches!(
+      admit(&mut map, &delete_b, &mut memo),
+      Admission::Admit(_)
+    ));
+    // Another event under the root: the pre-forget memo entry is stale → miss.
+    let under_root2 = dirent(FAN_MODIFY, fid(1), b"y.txt", None);
+    assert!(matches!(
+      admit(&mut map, &under_root2, &mut memo),
+      Admission::Admit(_)
+    ));
+    assert_eq!(memo.hits, 0, "the forget invalidated the root's memo entry");
+  }
+
+  /// A fresh memo (a new read batch) starts empty — the reader builds one per
+  /// buffer, so the memo is cleared at batch end by construction and a resolution
+  /// in one batch never leaks into the next.
+  #[test]
+  fn a_fresh_batch_memo_starts_cold() {
+    let mut map = seeded();
+    let modify = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
+    // Batch 1 resolves dir fid 2 (a miss that fills batch 1's memo).
+    let mut first = MemoBatch::new();
+    assert!(matches!(
+      admit(&mut map, &modify, &mut first),
+      Admission::Admit(_)
+    ));
+    assert_eq!((first.hits, first.misses), (0, 1));
+    // Batch 2 (a new buffer) starts cold: the same directory misses again.
+    let mut second = MemoBatch::new();
+    assert!(matches!(
+      admit(&mut map, &modify, &mut second),
+      Admission::Admit(_)
+    ));
+    assert_eq!(
+      (second.hits, second.misses),
+      (0, 1),
+      "a new batch memo does not inherit the prior batch's entries"
+    );
+  }
 }
