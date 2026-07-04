@@ -1,6 +1,7 @@
 use std::io;
 
-use super::{WalkError, WalkSkip, classify_walk_skip, seed_walk};
+use super::{WalkError, WalkSkip, classify_walk_skip, seed_walk, subtree_walk};
+use crate::os::linux::fanotify::fid::Fid;
 
 /// A root that cannot export a file handle is a FATAL seed/reseed failure, never
 /// an empty successful seed: the root anchor is the base every admitted path
@@ -116,6 +117,110 @@ fn unreadable_child_makes_the_real_walk_incomplete() {
       );
     }
     Ok(_) => panic!("an unreadable in-root child directory must make the walk Incomplete"),
+  }
+}
+
+/// The real subtree walk over a populated directory (a stand-in for a directory
+/// MOVED IN from outside the root) produces a [`SeedEntry`] per DESCENDANT
+/// directory, each linked to its parent, and does NOT re-emit the subtree root
+/// itself (the caller already learned it). The `fsid`/`root_dev` are read from the
+/// real temp tree so the single-device descent stays inside it.
+#[test]
+fn subtree_walk_maps_descendants_not_the_root() {
+  use std::os::unix::fs::MetadataExt;
+
+  let subtree =
+    std::env::temp_dir().join(format!("tributary-fs-subtree-walk-{}", std::process::id()));
+  // subtree/{child/{grand/}, leaf.txt} — two descendant DIRECTORIES and a file.
+  let grand = subtree.join("child/grand");
+  let _ = std::fs::remove_dir_all(&subtree);
+  std::fs::create_dir_all(&grand).expect("create the descendant dirs");
+  std::fs::write(subtree.join("leaf.txt"), b"x").expect("create a file");
+  let Ok(meta) = std::fs::metadata(&subtree) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    return;
+  };
+  let root_dev = meta.dev();
+  // A stand-in FID for the already-learned moved directory; its bytes are
+  // irrelevant to the descent (only the seed entries' parent links are checked).
+  let subtree_fid = Fid::new([7; 8], Box::from(&[7u8][..]));
+
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev);
+  let _ = std::fs::remove_dir_all(&subtree);
+  let entries = match result {
+    Ok(entries) => entries,
+    // A temp filesystem that cannot export handles fails as Incomplete on the
+    // first descendant — then this environment cannot exercise the mapping, skip.
+    Err(WalkError::Incomplete(_)) => {
+      eprintln!("SKIP subtree_walk_maps_descendants_not_the_root: temp fs exports no handles");
+      return;
+    }
+    Err(WalkError::RootGone(_)) => unreachable!("subtree_walk never reports RootGone"),
+  };
+  // Two descendant directories (child, grand); the file and the subtree root are
+  // NOT entries.
+  assert_eq!(
+    entries.len(),
+    2,
+    "exactly the two descendant directories are mapped, not the root or the file"
+  );
+  // The top descendant links to the subtree root FID (the moved directory).
+  assert!(
+    entries
+      .iter()
+      .any(|e| e.name == std::ffi::OsStr::new("child") && e.parent.as_ref() == Some(&subtree_fid)),
+    "the top descendant hangs off the moved directory's FID"
+  );
+  // Every entry is a child (none is a root anchor).
+  assert!(
+    entries.iter().all(|e| e.parent.is_some()),
+    "no entry is a root anchor — the moved directory itself is not re-emitted"
+  );
+}
+
+/// An unreadable descendant inside a moved-in subtree makes the subtree walk
+/// INCOMPLETE, the same completeness rule the seed walk enforces — a foreign
+/// populated directory with a blind sub-subtree cannot be admitted half-mapped.
+/// Self-probing exactly like `unreadable_child_makes_the_real_walk_incomplete`.
+#[test]
+fn subtree_walk_unreadable_descendant_is_incomplete() {
+  use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+  let subtree = std::env::temp_dir().join(format!(
+    "tributary-fs-subtree-walk-blocked-{}",
+    std::process::id()
+  ));
+  let blocked = subtree.join("blocked");
+  let _ = std::fs::remove_dir_all(&subtree);
+  std::fs::create_dir_all(&blocked).expect("create the descendant dir");
+  let Ok(meta) = std::fs::metadata(&subtree) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    return;
+  };
+  let root_dev = meta.dev();
+  let subtree_fid = Fid::new([7; 8], Box::from(&[7u8][..]));
+
+  if std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).is_err() {
+    let _ = std::fs::remove_dir_all(&subtree);
+    return;
+  }
+  if std::fs::read_dir(&blocked).is_ok() {
+    let _ = std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&subtree);
+    eprintln!(
+      "SKIP subtree_walk_unreadable_descendant_is_incomplete: the 000 dir is readable \
+       (root/CAP_DAC_OVERRIDE)"
+    );
+    return;
+  }
+
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev);
+  let _ = std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755));
+  let _ = std::fs::remove_dir_all(&subtree);
+  match result {
+    Err(WalkError::Incomplete(_)) => {}
+    Err(WalkError::RootGone(_)) => unreachable!("subtree_walk never reports RootGone"),
+    Ok(_) => panic!("an unreadable descendant in a moved-in subtree must make the walk Incomplete"),
   }
 }
 

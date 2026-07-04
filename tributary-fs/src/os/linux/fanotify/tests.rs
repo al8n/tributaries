@@ -230,6 +230,166 @@ fn rename_into_root_admits_with_resolved_destination() {
   assert_eq!(rename.new_path, PathBuf::from("/root/sub/arrived.txt"));
 }
 
+/// A DIRECTORY moved IN from outside the root (its own FID unknown to the map,
+/// destination parent in-root) returns [`Admission::AdmitAndSeed`]: the moved
+/// directory carries pre-existing descendants the seed walk never saw, so the
+/// reader must walk its subtree in. The request names the moved directory's NEW
+/// resolved path and its own FID (the parent link for the walked descendants),
+/// and the moved directory is already learned (its own later events admit).
+#[test]
+fn dir_move_in_from_outside_requests_a_subtree_walk() {
+  let mut map = seeded();
+  // fid(9) — a directory that lived OUTSIDE the watched root, so it is unknown to
+  // the seeded map — moves under /root/sub as `arrived`.
+  assert!(!map.contains_dir(&fid(9)), "the moved dir starts unknown");
+  let ev = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(9)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(90),
+      old_name: b"arrived".to_vec(),
+      new_dir: fid(2),
+      new_name: b"arrived".to_vec(),
+    }),
+  };
+  let Admission::AdmitAndSeed {
+    event,
+    moved_in,
+    moved_fid,
+  } = admit(&mut map, &ev)
+  else {
+    panic!("a populated dir moved in from outside must request a subtree walk");
+  };
+  assert_eq!(
+    moved_in,
+    PathBuf::from("/root/sub/arrived"),
+    "the walk is rooted at the moved directory's new path"
+  );
+  assert_eq!(
+    moved_fid,
+    fid(9),
+    "the walk hangs descendants off the moved FID"
+  );
+  assert_eq!(
+    event.rename.expect("rename info").new_path,
+    PathBuf::from("/root/sub/arrived"),
+    "the forwarded move still carries the destination path"
+  );
+  // The moved directory itself is learned; its own later events resolve.
+  assert_eq!(
+    map.admit(&fid(9)),
+    Some(PathBuf::from("/root/sub/arrived")),
+    "the moved directory itself is admitted after the move-in"
+  );
+}
+
+/// An IN-ROOT directory rename (the moved directory was ALREADY a known in-root
+/// directory, so its descendants are already mapped) returns a plain
+/// [`Admission::Admit`] — NO subtree walk. The completeness invariant is met by
+/// the parent-relative re-parent, not by a walk.
+#[test]
+fn in_root_dir_rename_requests_no_walk() {
+  let mut map = FidMap::new();
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+    // A second in-root parent to receive the moved directory.
+    SeedEntry::child(fid(4), fid(1), OsString::from("dest")),
+  ]);
+  let ev = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
+    dir_fid: None,
+    // The moved directory fid(2) is already in-root (known) — an in-root rename.
+    target_fid: Some(fid(2)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(1),
+      old_name: b"sub".to_vec(),
+      new_dir: fid(4),
+      new_name: b"sub".to_vec(),
+    }),
+  };
+  assert!(
+    matches!(admit(&mut map, &ev), Admission::Admit(_)),
+    "an in-root rename of an already-mapped directory needs no subtree walk"
+  );
+  assert_eq!(
+    map.admit(&fid(2)),
+    Some(PathBuf::from("/root/dest/sub")),
+    "the moved directory re-parents under the new in-root parent"
+  );
+}
+
+/// A directory moved OUT then straight back IN re-walks: the move-out forgets it
+/// (the fresh-identity direction), so on the way back it is UNKNOWN again — a
+/// move-in, which re-requests the subtree walk. Its descendants are re-seeded
+/// with fresh identities, never reusing the departed ones (forget prunes the id,
+/// so a reappearance mints anew — the conservative direction).
+#[test]
+fn dir_move_out_then_back_in_re_walks() {
+  let mut map = seeded();
+  // Move fid(2) (in-root /root/sub) OUT to an out-of-root parent: forgotten.
+  let out = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(2)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(1),
+      old_name: b"sub".to_vec(),
+      new_dir: fid(90),
+      new_name: b"sub".to_vec(),
+    }),
+  };
+  assert!(matches!(admit(&mut map, &out), Admission::Admit(_)));
+  assert!(!map.contains_dir(&fid(2)), "the moved-out dir is forgotten");
+
+  // Move it back IN under /root (the root fid(1) is in-root): now unknown, so it
+  // is a move-in and re-requests the walk.
+  let back = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(2)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(90),
+      old_name: b"sub".to_vec(),
+      new_dir: fid(1),
+      new_name: b"sub".to_vec(),
+    }),
+  };
+  assert!(
+    matches!(admit(&mut map, &back), Admission::AdmitAndSeed { .. }),
+    "a move back in from outside re-requests the subtree walk"
+  );
+}
+
+/// A FILE moved in from outside (non-directory target) never requests a subtree
+/// walk — only directories carry descendants. The move admits plainly with the
+/// destination path resolved.
+#[test]
+fn file_move_in_requests_no_walk() {
+  let mut map = seeded();
+  let ev = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME),
+    dir_fid: None,
+    target_fid: Some(fid(9)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(90),
+      old_name: b"f.txt".to_vec(),
+      new_dir: fid(2),
+      new_name: b"f.txt".to_vec(),
+    }),
+  };
+  assert!(
+    matches!(admit(&mut map, &ev), Admission::Admit(_)),
+    "a file move-in carries no descendants, so no walk"
+  );
+}
+
 /// A directory `FAN_RENAME` within the root re-parents the moved directory's
 /// whole subtree: after the rename, a pre-seeded descendant's own event
 /// resolves under the NEW path — the parent-relative map, not a stale absolute

@@ -307,6 +307,28 @@ impl ReseedContext {
   fn walk_typed(&self) -> Result<Vec<SeedEntry>, WalkError> {
     seed_walk(&self.root, self.fsid, self.root_dev)
   }
+
+  /// Walks the subtree rooted at `subtree` (a directory MOVED IN from outside the
+  /// root, already learned under `subtree_fid`) and returns a [`SeedEntry::child`]
+  /// for every descendant directory, each linked to its parent — the moved
+  /// directory's pre-existing contents the seed walk never saw. The moved
+  /// directory itself is NOT re-emitted (the caller already learned it); only its
+  /// descendants are produced.
+  ///
+  /// Same completeness rule and single-device boundary as [`seed_walk`]: a
+  /// vanished entry is a benign race skipped, any other failure on an EXISTING
+  /// in-root directory is incompleteness. Incompleteness folds to the `io::Error`
+  /// the reader escalates through the reseed shape (retry once → blind → fatal),
+  /// so a partially-walked moved-in subtree kills the scope rather than leaving it
+  /// silently blind. Bounded by the moved subtree's directory count — the honest
+  /// cost of admitting a foreign populated directory.
+  pub(crate) fn walk_subtree(
+    &self,
+    subtree: &Path,
+    subtree_fid: &Fid,
+  ) -> io::Result<Vec<SeedEntry>> {
+    subtree_walk(subtree, subtree_fid, self.fsid, self.root_dev).map_err(WalkError::into_io)
+  }
 }
 
 /// How a per-entry walk failure is classified. fanotify's admission model needs
@@ -394,7 +416,6 @@ impl WalkError {
 /// [`ReseedContext::walk`]), so an unreadable subtree that survives the reseed's
 /// single retry kills the scope rather than leaving it silently blind.
 fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>, WalkError> {
-  let mut seed = Vec::new();
   // The root anchor is load-bearing: without it the map has no base to resolve
   // any path against, so its absence is a spawn/reseed failure, never an empty
   // success.
@@ -404,14 +425,74 @@ fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>
       "the watched root does not export a file handle",
     )));
   };
-  seed.push(SeedEntry::root(root_fid.clone(), root));
   // The root must be readable to seed anything; a root that cannot be opened is
-  // a race reported as root-unavailable (the probe already read it). Explicit
-  // stacks keep the walk iterative (no recursion depth bound on a deep tree);
-  // `parents` carries each open reader's directory FID so a discovered child
-  // links to it.
-  let mut pending = vec![fs::read_dir(root).map_err(WalkError::RootGone)?];
-  let mut parents = vec![(root.to_path_buf(), root_fid)];
+  // a race reported as root-unavailable (the probe already read it).
+  let reader = fs::read_dir(root).map_err(WalkError::RootGone)?;
+  let mut seed = vec![SeedEntry::root(root_fid.clone(), root)];
+  descend(
+    reader,
+    root.to_path_buf(),
+    root_fid,
+    fsid,
+    root_dev,
+    &mut seed,
+  )?;
+  Ok(seed)
+}
+
+/// Walks the descendants of a directory MOVED IN from outside the root and
+/// already learned under `subtree_fid`, returning a [`SeedEntry::child`] per
+/// descendant directory. The moved directory itself is not re-emitted; the
+/// descent starts inside it (opening it for the first `read_dir`) and links every
+/// discovered directory to its parent, so the top descendants hang off
+/// `subtree_fid` directly. Same completeness rule and single-device boundary as
+/// [`seed_walk`].
+fn subtree_walk(
+  subtree: &Path,
+  subtree_fid: &Fid,
+  fsid: [u8; 8],
+  root_dev: u64,
+) -> Result<Vec<SeedEntry>, WalkError> {
+  // The moved directory was just learned, so it exists; opening it for descent
+  // is the same completeness rule as any child — a vanish is a race (nothing
+  // descended, an empty subtree), anything else is a blind subtree.
+  let reader = match fs::read_dir(subtree) {
+    Ok(reader) => reader,
+    Err(err) => match classify_walk_skip(&err) {
+      WalkSkip::VanishedRace => return Ok(Vec::new()),
+      WalkSkip::Incomplete => return Err(WalkError::Incomplete(err)),
+    },
+  };
+  let mut seed = Vec::new();
+  descend(
+    reader,
+    subtree.to_path_buf(),
+    subtree_fid.clone(),
+    fsid,
+    root_dev,
+    &mut seed,
+  )?;
+  Ok(seed)
+}
+
+/// The shared iterative descent: reads `reader` (an already-opened directory at
+/// `parent_path`, FID `parent_fid`) and every directory below it on `root_dev`,
+/// pushing a [`SeedEntry::child`] per discovered directory into `seed`. Explicit
+/// stacks keep the walk iterative (no recursion depth bound on a deep tree);
+/// `parents` carries each open reader's directory FID so a discovered child links
+/// to it. Every per-entry failure is classified — a `NotFound` vanish is a benign
+/// race skipped, anything else on an existing in-root directory aborts as
+/// [`WalkError::Incomplete`].
+fn descend(
+  reader: fs::ReadDir,
+  parent_path: std::path::PathBuf,
+  parent_fid: Fid,
+  fsid: [u8; 8],
+  root_dev: u64,
+  seed: &mut Vec<SeedEntry>,
+) -> Result<(), WalkError> {
+  let mut pending = vec![reader];
+  let mut parents = vec![(parent_path, parent_fid)];
 
   while let Some(reader) = pending.last_mut() {
     let (parent_path, parent_fid) = parents.last().expect("a parent per reader").clone();
@@ -486,7 +567,7 @@ fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>
       }
     }
   }
-  Ok(seed)
+  Ok(())
 }
 
 /// Reads `path`'s file handle via the shared dynamically-sized

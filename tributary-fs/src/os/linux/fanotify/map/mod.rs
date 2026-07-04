@@ -59,6 +59,27 @@
 //! The map is single-threaded: the reader owns it and both mutates (learn on
 //! create, forget on delete/rename, reseed on loss) and reads (admit/intern) it
 //! between reads, exactly as the inotify reader owns its `wd` table.
+//!
+//! # Completeness invariant
+//!
+//! Admission is membership, so a directory the map does not know drops ITS events
+//! as outside-root with no loss signal — a silently-blind subtree. The map is
+//! therefore kept COMPLETE by construction: a directory enters it only when its
+//! descendants are, at that moment, one of
+//!
+//! - **empty** — a `FAN_CREATE` of a directory is a `mkdir`, so the learned child
+//!   has no pre-existing contents ([`learn`](Self::learn));
+//! - **already mapped** — an in-root directory rename re-parents a subtree whose
+//!   descendants were seeded/learned before the move, and the parent-relative
+//!   representation carries them under the new path with no per-node rewrite; or
+//! - **walked** — a directory moved IN from outside the root carries pre-existing
+//!   descendants the seed walk never saw (fanotify synthesizes no per-descendant
+//!   creates for a rename), so the reader walks the moved subtree and inserts every
+//!   descendant directory before forwarding the move (the walk's incompleteness
+//!   escalates exactly as a reseed's, blind → fatal).
+//!
+//! The seed and reseed walks establish the invariant for the whole tree; `learn`
+//! and the move-in walk preserve it as directories arrive.
 
 use std::{
   collections::BTreeMap,
@@ -176,6 +197,16 @@ impl FidMap {
         None
       }
     }
+  }
+
+  /// Whether `fid` is a stored directory handle, WITHOUT resolving its path or
+  /// evicting an orphan (unlike [`admit`](Self::admit)). This is the move-flavor
+  /// discriminator: a directory rename whose moved object is already a known
+  /// directory is an in-root re-parent (its descendants are already mapped),
+  /// while an unknown moved object arrived from OUTSIDE the root carrying
+  /// pre-existing descendants the seed walk never saw — those must be walked in.
+  pub(crate) fn contains(&self, fid: &Fid) -> bool {
+    self.dirs.contains_key(fid.handle())
   }
 
   /// The exact, stable identity of a DIRECTORY `fid`, minted sequentially on

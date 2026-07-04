@@ -82,6 +82,24 @@ pub(crate) struct AdmittedEvent {
 pub(crate) enum Admission {
   /// The event addresses the watched root: forward the admitted form.
   Admit(AdmittedEvent),
+  /// A directory moved IN from outside the root: forward the admitted form AND
+  /// first walk `moved_in` (the moved directory's resolved NEW path) so its
+  /// pre-existing descendant directories enter the map. fanotify synthesizes no
+  /// per-descendant creates for a rename, so without this walk later events under
+  /// those descendants would drop as outside-root forever with no loss signal.
+  /// The moved directory itself is already learned (its own FID); only its
+  /// subtree needs seeding. The reader — which owns the walk context — runs the
+  /// walk and escalates its incompleteness exactly as a reseed's (blind → fatal).
+  AdmitAndSeed {
+    /// The move event to forward once the subtree is mapped.
+    event: AdmittedEvent,
+    /// The moved directory's resolved absolute path at its destination — the
+    /// walk's starting point.
+    moved_in: PathBuf,
+    /// The moved directory's own FID — the parent link every descendant the walk
+    /// discovers hangs from.
+    moved_fid: fid::Fid,
+  },
   /// No admitted directory FID matched — the event is provably outside the
   /// root (the superblock firehose), so it is dropped without loss.
   Drop,
@@ -165,9 +183,27 @@ pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
 }
 
 /// Admits a `FAN_RENAME`: resolves both directory FIDs, self-maintains the map
-/// for a moved DIRECTORY (re-parent in place when the destination is in-root,
-/// forget when it moved out), and interns the moved object's identity when it is
-/// a directory (a file target attaches none — see [`admit`]).
+/// for a moved DIRECTORY, and interns the moved object's identity when it is a
+/// directory (a file target attaches none — see [`admit`]).
+///
+/// The four move flavors — keyed on whether the destination parent is in-root
+/// and whether the MOVED OBJECT itself was already a known directory (the
+/// membership that says its descendants are already mapped):
+///
+/// - **in-root rename** (moved dir known, destination in-root): re-parent the one
+///   node in place; every descendant follows via the updated parent link — complete
+///   by construction, no walk.
+/// - **move-in from outside** (moved dir unknown, destination in-root): the moved
+///   directory carries pre-existing descendants the seed walk never saw, so after
+///   learning the moved dir itself this returns [`Admission::AdmitAndSeed`] — the
+///   reader walks the subtree into the map before forwarding, keeping the
+///   completeness invariant.
+/// - **move-out** (moved dir known, destination outside): forget the moved dir; its
+///   descendants' parent links now point at an absent handle, so their walks break
+///   and they evict lazily — the map stops admitting the departed subtree naturally.
+/// - **move-out of an already-unknown subtree** (moved dir unknown, destination
+///   outside): nothing to maintain; only the in-root SOURCE end resolves, and the
+///   move admits as a boundary crossing.
 fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo) -> Admission {
   let old_dir = map.admit(&rename.old_dir);
   let new_dir = map.admit(&rename.new_dir);
@@ -195,33 +231,53 @@ fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo)
   } else {
     None
   };
-  if event.mask.ondir()
-    && let Some(fid) = moved_fid
-  {
-    if new_dir.is_some() {
-      // In-root destination: re-parent by inserting under the new parent. The
-      // moved object keeps its handle (and thus its interned id), so `learn`
-      // overwrites its node in place — identity is STABLE across the rename, and
-      // its descendants follow via the updated parent link. No id-pruning forget:
-      // the object did not depart, so pruning then re-minting would fork identity.
-      map.learn(&rename.new_dir, &rename.new_name, Some(fid));
-    } else {
-      // Moved OUT of the root: drop admission AND the interned id (departed). A
-      // later move back mints a fresh identity — the conservative direction.
-      map.forget(fid);
-    }
-  }
 
-  Admission::Admit(AdmittedEvent {
+  let event = AdmittedEvent {
     mask: event.mask,
     path: None,
     identity: None,
     rename: Some(AdmittedRename {
       old_path,
-      new_path,
+      new_path: new_path.clone(),
       identity,
     }),
-  })
+  };
+
+  if event.mask.ondir()
+    && let Some(fid) = moved_fid
+  {
+    if new_dir.is_some() {
+      // The moved object was already a known directory IFF it was in-root before
+      // the move — the discriminator between the two in-root-destination flavors.
+      // Read it BEFORE `learn` overwrites the node.
+      let was_in_root = map.contains(fid);
+      // In-root destination: re-parent by inserting under the new parent. The
+      // moved object keeps its handle (and thus its interned id), so `learn`
+      // overwrites its node in place — identity is STABLE across the rename, and
+      // its already-mapped descendants follow via the updated parent link. No
+      // id-pruning forget: the object did not depart, so pruning then re-minting
+      // would fork identity.
+      map.learn(&rename.new_dir, &rename.new_name, Some(fid));
+      if !was_in_root {
+        // Moved IN from outside: its pre-existing descendants were never seeded
+        // (no per-descendant creates arrive for a rename). Hand the reader the
+        // subtree to walk in before this move is forwarded, so the map is
+        // complete by the time any later event under those descendants admits.
+        return Admission::AdmitAndSeed {
+          event,
+          moved_in: new_path,
+          moved_fid: fid.clone(),
+        };
+      }
+    } else {
+      // Moved OUT of the root: drop admission AND the interned id (departed). A
+      // later move back is a fresh move-in — walked in, minting fresh identity —
+      // the conservative direction.
+      map.forget(fid);
+    }
+  }
+
+  Admission::Admit(event)
 }
 
 /// Joins a raw fanotify child name onto its resolved directory path. A
