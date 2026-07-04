@@ -48,6 +48,17 @@ fn probes(effects: &[Effect]) -> Vec<(ProbeId, PathBuf)> {
     .collect()
 }
 
+/// A mount refresh whose root is still ALIVE at identity `(1, 1)` — the shared
+/// identity every `live_core` scope spawns with — so the mount-trust suites
+/// exercise device trust without tripping the folded-in root-death check.
+fn alive_refresh(mounts: Vec<PathBuf>, authoritative: bool) -> MountRefresh {
+  MountRefresh {
+    mounts,
+    authoritative,
+    root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+  }
+}
+
 /// A core with one live scope rooted at `/r` on device 1, its birth refresh
 /// fed (an authoritative empty table): event-side trust is open.
 fn live_core() -> (DriverCore, ScopeId) {
@@ -75,7 +86,7 @@ fn live_core() -> (DriverCore, ScopeId) {
     1,
     "a spawned scope is born closed and arms its birth refresh: {effects:?}"
   );
-  core.on_mounts_refreshed(scope, Vec::new(), true);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
   assert!(drain(&mut core).is_empty(), "a refreshed KR root is silent");
   (core, scope)
 }
@@ -98,7 +109,7 @@ fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
     }),
   );
   let _ = drain(&mut core);
-  core.on_mounts_refreshed(scope, Vec::new(), false);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), false), at(0));
   assert!(drain(&mut core).is_empty());
   (core, scope)
 }
@@ -618,6 +629,96 @@ fn root_changed_present_is_move_self() {
   );
 }
 
+/// Root-death-via-refresh (design §7, the fanotify unmount gap): a refresh that
+/// finds the root MISSING lowers exactly like a `RootChanged`-probe resolving
+/// `Missing` — a terminal Removed + Rescan, then the scope's teardown. This is
+/// the kernel-recursive backends' only unmount/replace detection (no in-tree
+/// signal), riding the refresh cadence (birth + every loss) with no new timer.
+#[test]
+fn refresh_finding_root_gone_is_delete_self() {
+  let (mut core, scope) = live_core();
+  core.on_mounts_refreshed(
+    scope,
+    MountRefresh {
+      mounts: Vec::new(),
+      authoritative: true,
+      root: RootLiveness::Missing,
+    },
+    at(5),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(emitted.len(), 2, "{effects:?}");
+  assert!(emitted[0].kind().is_removed(), "a gone root is a Removed");
+  assert!(emitted[1].kind().is_rescan(), "root death is never silent");
+  assert!(
+    effects
+      .iter()
+      .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+    "the dead root's stream is torn down: {effects:?}"
+  );
+}
+
+/// A refresh finding the root REPLACED (present, different identity) or
+/// UNREADABLE lowers like a `RootChanged`-probe resolving `Present`/`Failed`: a
+/// terminal Rescan (no Removed) and teardown.
+#[test]
+fn refresh_finding_root_replaced_is_move_self() {
+  for root in [
+    RootLiveness::Present(crate::os::RootIdentity::new(1, 999)),
+    RootLiveness::Unreadable,
+  ] {
+    let (mut core, scope) = live_core();
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root,
+      },
+      at(5),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{root:?}: {effects:?}");
+    assert!(
+      emitted[0].kind().is_rescan(),
+      "{root:?}: a replaced/unreadable root rescans, no Removed",
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "{root:?}: the dead scope tears down",
+    );
+  }
+}
+
+/// A refresh finding the root still ALIVE (same identity) is NOT a death: the
+/// folded-in liveness check is inert on the healthy path — no emission, no
+/// teardown — and the mount trust it carries still installs (a later loss no
+/// longer re-arms once authority is back).
+#[test]
+fn refresh_finding_root_alive_only_updates_trust() {
+  let (mut core, scope) = live_core();
+  core.on_mounts_refreshed(
+    scope,
+    MountRefresh {
+      mounts: vec![PathBuf::from("/r/vol")],
+      authoritative: true,
+      root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+    },
+    at(5),
+  );
+  let effects = drain(&mut core);
+  assert!(
+    !effects
+      .iter()
+      .any(|e| matches!(e, Effect::TeardownStream { .. }) | matches!(e, Effect::Emit { .. })),
+    "an alive root neither dies nor emits: {effects:?}"
+  );
+}
+
 #[test]
 fn unmount_at_root_ends_the_scope() {
   let (mut core, scope) = live_core();
@@ -782,6 +883,7 @@ fn identity_minting_respects_devices_and_mounts() {
     requested: PathBuf::from("/r"),
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
+    identity: Some(crate::os::RootIdentity::new(1, 1)),
     mounts: vec![PathBuf::from("/r/vol")],
     mounts_authoritative: true,
     refresh_pending: false,
@@ -812,6 +914,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     requested: PathBuf::from("/r"),
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
+    identity: Some(crate::os::RootIdentity::new(1, 1)),
     mounts: Vec::new(),
     mounts_authoritative: false,
     refresh_pending: false,
@@ -1353,7 +1456,7 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
     }),
   );
   let _ = drain(&mut core);
-  core.on_mounts_refreshed(scope, Vec::new(), true);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
   core.on_batch_events(
     scope,
     vec![
@@ -1426,7 +1529,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
   );
 
   // The birth refresh installs; the same shape now grounds into one Moved.
-  core.on_mounts_refreshed(scope, Vec::new(), true);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
   core.on_batch_events(
     scope,
     vec![
@@ -1488,7 +1591,7 @@ fn a_loss_racing_the_birth_refresh_rearms_it_once() {
   );
 
   // The stale read's result is discarded and exactly one re-read arms.
-  core.on_mounts_refreshed(scope, Vec::new(), true);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
   assert_eq!(
     refresh_requests(&drain(&mut core)),
     1,
@@ -1500,7 +1603,7 @@ fn a_loss_racing_the_birth_refresh_rearms_it_once() {
     "trust stays closed until a post-loss read installs"
   );
 
-  core.on_mounts_refreshed(scope, Vec::new(), true);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
   let state = core.scopes.get(&scope).expect("scope is live");
   assert!(state.mounts_authoritative, "the fresh read installs");
 }
@@ -1667,7 +1770,7 @@ fn loss_revokes_mount_trust_and_requests_one_refresh() {
 
   // The refresh landed after the second loss: its snapshot is stale, so it
   // is discarded and exactly one more refresh runs.
-  core.on_mounts_refreshed(scope, Vec::new(), true);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
   assert_eq!(refresh_requests(&drain(&mut core)), 1, "stale re-arm");
   let emitted = feed_pair(&mut core, scope, (30, 31), 43);
   assert!(
@@ -1677,7 +1780,7 @@ fn loss_revokes_mount_trust_and_requests_one_refresh() {
 
   // A current refresh restores authority; pairing resumes (the granted pair
   // carries its covering rescan alongside the Moved).
-  core.on_mounts_refreshed(scope, Vec::new(), true);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
   assert_eq!(refresh_requests(&drain(&mut core)), 0);
   let emitted = feed_pair(&mut core, scope, (40, 41), 44);
   assert_eq!(emitted[0].kind().moved_from(), Some(&loc(&["a", "old"])));
@@ -1692,7 +1795,7 @@ fn failed_refresh_keeps_trust_closed() {
   let (mut core, scope) = live_core();
   core.on_root_overflow(scope, at(1));
   let _ = drain(&mut core);
-  core.on_mounts_refreshed(scope, Vec::new(), false);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), false), at(0));
   assert_eq!(
     refresh_requests(&drain(&mut core)),
     0,
@@ -1736,7 +1839,11 @@ fn refresh_union_keeps_learned_foreign_prefixes() {
   // The fresh snapshot does not list the learned prefix (it is not a real
   // mount point); the union must keep it — replacement would re-trust a
   // known-foreign subtree.
-  core.on_mounts_refreshed(scope, vec![PathBuf::from("/r/other")], true);
+  core.on_mounts_refreshed(
+    scope,
+    alive_refresh(vec![PathBuf::from("/r/other")], true),
+    at(0),
+  );
   let state = core.scopes.get(&scope).expect("scope is live");
   assert!(state.mounts_authoritative);
   assert!(state.mounts.iter().any(|m| m == Path::new("/r/vol/x")));
@@ -1818,7 +1925,11 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
     }),
   );
   let _ = drain(&mut core);
-  core.on_mounts_refreshed(scope, vec![PathBuf::from("/r/vol")], true);
+  core.on_mounts_refreshed(
+    scope,
+    alive_refresh(vec![PathBuf::from("/r/vol")], true),
+    at(0),
+  );
 
   core.on_batch_events(
     scope,
@@ -2265,6 +2376,7 @@ mod lowering {
       requested: PathBuf::from(root),
       root: Some(Arc::new(PathBuf::from(root))),
       root_dev: Some(1),
+      identity: Some(crate::os::RootIdentity::new(1, 1)),
       mounts: Vec::new(),
       mounts_authoritative: true,
       refresh_pending: false,
@@ -2350,7 +2462,7 @@ mod lowering {
       }),
     );
     let _ = drain(&mut core);
-    core.on_mounts_refreshed(scope, Vec::new(), true);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
 
     core.on_batch_events(
       scope,
@@ -2649,7 +2761,7 @@ mod descending {
       })
       .expect("a descending root cold-enumerates after arming");
     assert_eq!(watch, root_watch, "the enumerate reads the armed root");
-    core.on_mounts_refreshed(scope, Vec::new(), true);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
     let _ = drain(&mut core);
     (core, scope, req, watch)
   }
@@ -2977,7 +3089,7 @@ mod kernel_recursive_fanotify {
       1,
       "a spawned KR scope is born closed and arms its birth refresh: {effects:?}"
     );
-    core.on_mounts_refreshed(scope, Vec::new(), true);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
     assert!(drain(&mut core).is_empty(), "a refreshed KR root is silent");
     (core, scope)
   }
@@ -3162,5 +3274,113 @@ mod kernel_recursive_fanotify {
     assert_eq!(emitted.len(), 1);
     assert!(emitted[0].kind().is_created());
     assert_eq!(emitted[0].location(), &loc(&["newdir"]));
+  }
+}
+
+/// `Backend::Auto` resolves the backend only once the source has spawned, so
+/// the Monitor profile registered up front is PROVISIONAL. These pin the
+/// reconcile at [`DriverCore::on_stream_spawned`]: the resolved
+/// `RootMeta.backend` becomes the scope's profile before its watch-result is
+/// fed (design §5).
+mod auto_selection {
+  use super::*;
+  use crate::os::linux::{
+    RawLinuxEvent,
+    fanotify::{
+      AdmittedEvent,
+      fid::{FAN_CREATE, FanMask},
+    },
+  };
+  use std::num::NonZeroU64;
+
+  /// Provisional descending profile (the Linux platform default under Auto),
+  /// but the probe resolved FANOTIFY: the core adopts the kernel-recursive
+  /// profile — the spawn doubles as the root's watch-result (NO per-directory
+  /// AddWatch), and a subsequent fanotify event lowers root-relative, proving
+  /// the KR profile is the one now running.
+  #[test]
+  fn auto_provisional_inotify_adopts_probed_fanotify() {
+    let mut core = DriverCore::new(WINDOW);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        // The probe picked fanotify despite the provisional inotify profile.
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !effects
+        .iter()
+        .any(|e| matches!(e, Effect::AddWatch { .. }) | matches!(e, Effect::Enumerate { .. })),
+      "an adopted KR profile arms no per-directory watch: {effects:?}"
+    );
+    assert_eq!(
+      refresh_requests(&effects),
+      1,
+      "the KR scope still arms its birth refresh: {effects:?}"
+    );
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+
+    // A kernel-recursive fanotify event lowers root-relative with no
+    // per-directory arm — only possible under the adopted KR profile.
+    let event = RawLinuxEvent::Fanotify(AdmittedEvent {
+      mask: FanMask::new(FAN_CREATE),
+      path: Some(PathBuf::from("/r/deep/child.txt")),
+      identity: NonZeroU64::new(9),
+      rename: None,
+    });
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(event)]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !effects.iter().any(|e| matches!(e, Effect::AddWatch { .. })),
+      "the KR event needs no arm: {effects:?}"
+    );
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{effects:?}");
+    assert!(emitted[0].kind().is_created());
+    assert_eq!(emitted[0].location(), &loc(&["deep", "child.txt"]));
+  }
+
+  /// Provisional inotify AND the probe resolved inotify (the Auto fallback):
+  /// the profile is unchanged, so the descending flow runs — the spawn arms the
+  /// ROOT through the effect path (a per-directory AddWatch), exactly as a
+  /// forced inotify would.
+  #[test]
+  fn auto_provisional_inotify_keeps_inotify_on_fallback() {
+    let mut core = DriverCore::new(WINDOW);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { watch, parent, path, .. }
+          if path.as_path() == Path::new("/r") && watch == parent
+      )),
+      "the descending root arms through the effect path: {effects:?}"
+    );
   }
 }

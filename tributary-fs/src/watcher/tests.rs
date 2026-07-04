@@ -163,6 +163,7 @@ fn reservations_collide_on_object_identity() {
         path: Arc::new(PathBuf::from("/live/Root")),
         identity: id,
         ancestors: Vec::new().into(),
+        backend: BackendKind::FsEvents,
       },
     );
   let err = Reservation::take(&roots, PathBuf::from("/live/root"), Some(id))

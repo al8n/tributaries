@@ -13,7 +13,7 @@ use std::{
   ffi::CString,
   fs, io,
   os::{
-    fd::{AsRawFd, FromRawFd, OwnedFd},
+    fd::OwnedFd,
     unix::{ffi::OsStrExt, fs::MetadataExt},
   },
   path::Path,
@@ -24,9 +24,8 @@ use std::{
 use super::{
   super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
-    fs_type_is_remote, mounts_under,
+    mounts_under,
   },
-  FAN_INIT_FLAGS, FAN_MARK_MASK,
   fid::Fid,
   map::{FidMap, SeedEntry},
   reader::{self, Control, ReaderShared},
@@ -37,44 +36,33 @@ use crate::os::MAX_EXCLUSIONS;
 pub(crate) struct Source;
 
 impl Source {
-  /// Runs the pre-start barrier, creates the superblock mark, seeds the FID
-  /// map by walking the root, and starts the reader thread.
+  /// Seeds the FID map by walking the root and starts the reader thread, REUSING
+  /// the already-created, already-`FAN_MARK_FILESYSTEM`-marked `fd` the
+  /// `Backend::Auto` probe (design §5) handed over — the mark is never installed
+  /// twice.
   ///
-  /// Barrier order mirrors the inotify sibling (and the macOS bracket): refuse
-  /// remote/virtual filesystems, canonicalize, capture the root identity and
-  /// mount seed strictly before the fd exists, arm the mark, seed the map, then
-  /// re-stat once the reader is live — a root replaced across the gap is torn
-  /// down and rejected, never committed. Forced-fanotify precondition failures
-  /// (`fanotify_init`/`fanotify_mark` refused) surface as typed spawn errors,
-  /// never a silent fallback: `Backend::Auto` (L4.2) owns the fall-through.
+  /// The probe already ran the precondition rows (`fanotify_init`,
+  /// `fanotify_mark`, `name_to_handle_at`) on this canonical root, so the
+  /// remaining barrier work mirrors the inotify sibling (and the macOS bracket):
+  /// capture the root identity and mount seed, seed the map, then re-stat once
+  /// the reader is live — a root replaced across the gap is torn down and
+  /// rejected, never committed. `canonical` and `fd` are the probe's outputs;
+  /// this never re-canonicalizes or re-marks.
   pub(crate) fn spawn(
     config: SourceConfig,
+    canonical: std::path::PathBuf,
+    fd: OwnedFd,
   ) -> Result<(SourceHandle, super::super::super::EventReceiver, RootMeta), SourceError> {
-    if config.roots.is_empty() {
-      return Err(SourceError::NoRoots);
-    }
     if config.exclusions.len() > MAX_EXCLUSIONS {
       return Err(SourceError::TooManyExclusions {
         supplied: config.exclusions.len(),
       });
     }
 
-    let supplied = &config.roots[0];
-    let canonical = fs::canonicalize(supplied).map_err(|source| SourceError::RootUnavailable {
-      root: supplied.clone(),
-      source,
-    })?;
-
+    // The probed FILESYSTEM mark already proved the filesystem is handle- and
+    // superblock-mark-capable (a remote/virtual fs fails the mark probe); this
+    // statfs only reads the `f_fsid` the seed FIDs must match byte-for-byte.
     let fsid = superblock_fsid(&canonical)?;
-    if fs_type_is_remote(fsid.f_type) {
-      return Err(SourceError::RootUnavailable {
-        root: canonical,
-        source: io::Error::new(
-          io::ErrorKind::Unsupported,
-          "network and virtual filesystems deliver no reliable events",
-        ),
-      });
-    }
 
     let meta = fs::metadata(&canonical).map_err(|source| SourceError::RootUnavailable {
       root: canonical.clone(),
@@ -87,21 +75,17 @@ impl Source {
     let identity = RootIdentity::new(meta.dev(), meta.ino());
     let mounts = mounts_under(&canonical).unwrap_or_default();
 
-    let fd = create_instance()?;
-    mark_filesystem(&fd, &canonical)?;
-
     // Seed the map by walking the root: every directory's FID (built from the
     // superblock fsid + its file handle) admits its own later events. A read
     // failure mid-walk is not fatal — the directory simply stays unseeded and
     // a later rescan heals it — but a root that cannot be walked at all is an
     // honest spawn failure.
     let mut map = FidMap::new();
-    let seed = seed_walk(&canonical, fsid.fsid, root_dev).map_err(|source| {
-      SourceError::RootUnavailable {
+    let seed =
+      seed_walk(&canonical, fsid, root_dev).map_err(|source| SourceError::RootUnavailable {
         root: canonical.clone(),
         source,
-      }
-    })?;
+      })?;
     map.seed(seed);
 
     let (queue_tx, queue_rx) = async_channel::unbounded();
@@ -167,16 +151,11 @@ impl Source {
   }
 }
 
-/// The superblock facts one `statfs` reads: the `f_type` (allowlist gate) and
-/// the `f_fsid` bytes (the event-FID scope; copied raw so seed FIDs match
-/// event FIDs byte-for-byte).
-struct SuperblockFsid {
-  f_type: i64,
-  fsid: [u8; 8],
-}
-
-/// Reads `path`'s superblock `f_type` and `f_fsid`.
-fn superblock_fsid(path: &Path) -> Result<SuperblockFsid, SourceError> {
+/// Reads `path`'s superblock `f_fsid` bytes — the event-FID scope, copied raw
+/// so seed FIDs match event FIDs byte-for-byte. The `f_type` allowlist gate the
+/// inotify sibling runs is unnecessary here: the probe's FILESYSTEM mark already
+/// refused any filesystem that cannot export handles (a remote/virtual fs).
+fn superblock_fsid(path: &Path) -> Result<[u8; 8], SourceError> {
   let cpath = cstring(path)?;
   let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
   // SAFETY: cpath is a valid NUL-terminated path and buf is a zeroed statfs
@@ -188,10 +167,7 @@ fn superblock_fsid(path: &Path) -> Result<SuperblockFsid, SourceError> {
       source: io::Error::last_os_error(),
     });
   }
-  Ok(SuperblockFsid {
-    f_type: buf.f_type as i64,
-    fsid: fsid_bytes(&buf.f_fsid),
-  })
+  Ok(fsid_bytes(&buf.f_fsid))
 }
 
 /// Copies a `statfs.f_fsid` (an 8-byte `__kernel_fsid_t`) to a byte array —
@@ -211,64 +187,6 @@ fn fsid_bytes(fsid: &libc::fsid_t) -> [u8; 8] {
     );
   }
   out
-}
-
-/// Creates the per-root fanotify instance with the golden composite flag set
-/// (design §4.1). `FAN_REPORT_TARGET_FID` requires `FAN_REPORT_FID` — the full
-/// composite is mandatory or `fanotify_init` returns `EINVAL`.
-fn create_instance() -> Result<OwnedFd, SourceError> {
-  // SAFETY: plain syscall; the returned fd is owned exclusively here.
-  let fd = unsafe {
-    libc::fanotify_init(
-      FAN_INIT_FLAGS | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
-      (libc::O_RDONLY | libc::O_LARGEFILE) as libc::c_uint,
-    )
-  };
-  if fd < 0 {
-    let err = io::Error::last_os_error();
-    return Err(match err.raw_os_error() {
-      // An unprivileged init with FID flags SUCCEEDS on modern kernels; a
-      // refusal here is the kernel/filesystem being too old for the composite,
-      // or the process lacking the class.
-      Some(libc::EPERM) => SourceError::Unsupported,
-      Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => SourceError::Unsupported,
-      Some(libc::EMFILE) | Some(libc::ENFILE) => SourceError::InstanceLimit,
-      _ => SourceError::CreateFailed,
-    });
-  }
-  // SAFETY: fd is a fresh, owned descriptor.
-  Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// Arms the superblock mark (design §4.1): `FAN_MARK_ADD | FAN_MARK_FILESYSTEM`
-/// with the dirent + self-event mask. The FILESYSTEM mark is the real
-/// privilege discriminator — an unprivileged init succeeds, but the mark
-/// returns `EPERM` (container-validated).
-fn mark_filesystem(fd: &OwnedFd, root: &Path) -> Result<(), SourceError> {
-  let cpath = cstring(root)?;
-  // SAFETY: cpath is NUL-terminated; fd is the owned fanotify instance.
-  let rc = unsafe {
-    libc::fanotify_mark(
-      fd.as_raw_fd(),
-      libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
-      FAN_MARK_MASK,
-      libc::AT_FDCWD,
-      cpath.as_ptr(),
-    )
-  };
-  if rc != 0 {
-    let err = io::Error::last_os_error();
-    return Err(match err.raw_os_error() {
-      // The privilege discriminator: no CAP_SYS_ADMIN.
-      Some(libc::EPERM) => SourceError::Unsupported,
-      // The filesystem cannot export handles / does not support the mark.
-      Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) | Some(libc::ENODEV) | Some(libc::EXDEV) => {
-        SourceError::Unsupported
-      }
-      _ => SourceError::StartFailed,
-    });
-  }
-  Ok(())
 }
 
 /// Walks `root` breadth-first, producing a [`SeedEntry`] per directory on the

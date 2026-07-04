@@ -37,45 +37,105 @@ pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
 
 pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
 
-/// Which watch primitive a spawned source is backed by. Carried on
-/// [`RootMeta`] so the core confirms the per-scope lowering profile the
-/// registration intended.
+/// Which watch primitive a spawned source is backed by — the capability
+/// report [`Watcher::backend_of`](crate::Watcher::backend_of) surfaces for a
+/// live root. The core confirms the per-scope lowering profile the
+/// registration intended against it, and the `Backend::Auto` probe records the
+/// selection it settled on here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackendKind {
+pub enum BackendKind {
   /// macOS FSEvents — kernel-recursive; flag words are hints.
   FsEvents,
-  /// Linux inotify — per-directory (descending); precise verbs.
+  /// Linux inotify — per-directory (descending); precise verbs, unprivileged.
   Inotify,
   /// Linux fanotify-FILESYSTEM — kernel-recursive; precise verbs, interned-FID
-  /// identity. Privileged (`CAP_SYS_ADMIN`); not auto-selected yet
-  /// (`Backend::Auto` lands in L4.2), only via an explicit request.
-  // Only a Linux build constructs it (the fanotify source's RootMeta, the
-  // forced-fanotify test path); a non-Linux host has no fanotify at all.
-  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+  /// identity. Privileged (`CAP_SYS_ADMIN`); selected by `Backend::Auto` when
+  /// its preconditions hold, or forced by [`Backend::Fanotify`].
   Fanotify,
 }
 
-/// The Linux watch primitive a spawn should use. `Backend::Auto` selection is
-/// L4.2; today the driver always requests [`Inotify`](Self::Inotify), and
-/// [`Fanotify`](Self::Fanotify) is reachable only through an explicit
-/// test/config path. macOS ignores this — FSEvents is its one backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Backend {
-  /// inotify — per-directory, unprivileged.
+impl BackendKind {
+  /// The stable lowercase tag of this backend, for logs and diagnostics.
+  #[must_use]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::FsEvents => "fsevents",
+      Self::Inotify => "inotify",
+      Self::Fanotify => "fanotify",
+    }
+  }
+
+  /// Whether this backend is kernel-recursive (one mark covers the whole root),
+  /// as opposed to the descending, per-directory inotify profile.
+  #[must_use]
+  pub const fn is_kernel_recursive(&self) -> bool {
+    matches!(self, Self::FsEvents | Self::Fanotify)
+  }
+}
+
+impl core::fmt::Display for BackendKind {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+/// The Linux watch primitive a [`Watcher`](crate::Watcher) should use for each
+/// root, chosen through [`WatcherOptions::backend`](crate::WatcherOptions::backend).
+///
+/// [`Auto`](Self::Auto) is the default: the spawn barrier probes for
+/// fanotify-FILESYSTEM (privileged, kernel-recursive) and falls back to inotify
+/// (universal, unprivileged) at the first failing probe — a per-root decision
+/// made once, before the stream goes live, never retried. The two explicit
+/// variants pin the choice: [`Inotify`](Self::Inotify) skips the probe;
+/// [`Fanotify`](Self::Fanotify) runs it and surfaces the first failure as a
+/// typed spawn error rather than falling back.
+///
+/// macOS ignores this — FSEvents is its one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+  /// Probe for fanotify, fall back to inotify — the per-root default.
+  #[default]
+  Auto,
+  /// inotify — per-directory, unprivileged; the probe is skipped.
   Inotify,
-  /// fanotify-FILESYSTEM — kernel-recursive, privileged.
+  /// fanotify-FILESYSTEM — kernel-recursive, privileged; a failing precondition
+  /// is a typed spawn error, not a fallback.
   Fanotify,
 }
 
 impl Backend {
-  /// The Linux spawn selector a lowering profile implies: a `Fanotify` profile
-  /// spawns the fanotify source, every other profile inotify (FSEvents never
-  /// reaches a Linux spawn, so it maps to the harmless default).
-  pub(crate) const fn for_profile(profile: BackendKind) -> Self {
-    match profile {
-      BackendKind::Fanotify => Self::Fanotify,
-      BackendKind::FsEvents | BackendKind::Inotify => Self::Inotify,
+  /// The stable lowercase tag of this backend selection.
+  #[must_use]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Auto => "auto",
+      Self::Inotify => "inotify",
+      Self::Fanotify => "fanotify",
     }
+  }
+
+  /// Whether the selection is [`Auto`](Self::Auto) (the barrier decides).
+  #[must_use]
+  pub const fn is_auto(&self) -> bool {
+    matches!(self, Self::Auto)
+  }
+
+  /// Whether the selection forces inotify.
+  #[must_use]
+  pub const fn is_inotify(&self) -> bool {
+    matches!(self, Self::Inotify)
+  }
+
+  /// Whether the selection forces fanotify.
+  #[must_use]
+  pub const fn is_fanotify(&self) -> bool {
+    matches!(self, Self::Fanotify)
+  }
+}
+
+impl core::fmt::Display for Backend {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
   }
 }
 
@@ -147,10 +207,10 @@ pub(crate) struct RootIdentity {
 }
 
 impl RootIdentity {
-  /// Wraps a stat-read `(device, inode)` pair.
-  // Identities are read off Unix metadata (or minted by test harnesses);
-  // a platform with neither has no constructor for them.
-  #[cfg(any(unix, test))]
+  /// Wraps a stat-read `(device, inode)` pair. Identities are read off Unix
+  /// metadata or minted by test harnesses; on a platform with neither the
+  /// wrapped pair is the harmless `(0, 0)` its callers already synthesize
+  /// (`dev_of`/`ino_of`/`identity_of`), and no real stream ever mints one.
   pub(crate) const fn new(dev: u64, ino: u64) -> Self {
     Self { dev, ino }
   }
@@ -214,10 +274,9 @@ pub(crate) struct SourceConfig {
   pub(crate) latency: Duration,
   /// Capacity of the callback→driver channel, in callback batches.
   pub(crate) channel_capacity: NonZeroUsize,
-  /// Which Linux primitive to spawn. Ignored on macOS (FSEvents is the one
-  /// backend); on Linux the driver sets [`Backend::Inotify`] until per-root
-  /// `Backend::Auto` selection lands (L4.2), with [`Backend::Fanotify`]
-  /// reachable through an explicit test/config path.
+  /// Which Linux backend the spawn barrier selects. Ignored on macOS (FSEvents
+  /// is the one backend); on Linux [`Backend::Auto`] probes for fanotify and
+  /// falls back to inotify, while the explicit variants pin the choice.
   // Only the linux backend reads this; every other build sees it as dead.
   #[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
   pub(crate) backend: Backend,
@@ -225,7 +284,7 @@ pub(crate) struct SourceConfig {
 
 impl SourceConfig {
   /// A live-only configuration watching `roots` with the crate defaults
-  /// (inotify on Linux).
+  /// ([`Backend::Auto`] on Linux — probe for fanotify, fall back to inotify).
   pub(crate) fn new(roots: Vec<PathBuf>) -> Self {
     Self {
       roots,
@@ -233,8 +292,48 @@ impl SourceConfig {
       since: None,
       latency: Duration::from_millis(10),
       channel_capacity: NonZeroUsize::new(64).expect("64 is nonzero"),
-      backend: Backend::Inotify,
+      backend: Backend::Auto,
     }
+  }
+}
+
+/// Which `Backend::Auto` probe stage decided the selection (design §5, rows
+/// 2–5). Carried by [`SourceError::BackendProbeFailed`] on a forced
+/// [`Backend::Fanotify`] whose preconditions did not hold, so the caller learns
+/// exactly which one failed. A pure enum (no FFI), so it is available on every
+/// platform the error type is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProbeStage {
+  /// `fanotify_init` with the full 5.17 composite flag set was refused — the
+  /// kernel/filesystem is too old for the composite, or the process lacks the
+  /// notification class (`EINVAL`/`EPERM`).
+  Init,
+  /// The `FAN_MARK_ADD | FAN_MARK_FILESYSTEM` mark was refused — the real
+  /// privilege discriminator (`EPERM` = no `CAP_SYS_ADMIN`), or the filesystem
+  /// does not support the superblock mark (`EINVAL`/`EOPNOTSUPP`/`ENODEV`/
+  /// `EXDEV`).
+  Mark,
+  /// `name_to_handle_at` on the root was refused — the filesystem cannot export
+  /// file handles, so FID identity is impossible (`EOPNOTSUPP`).
+  Handle,
+}
+
+impl ProbeStage {
+  /// A stable tag naming the failed syscall stage.
+  #[must_use]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Init => "fanotify_init",
+      Self::Mark => "fanotify_mark(FAN_MARK_FILESYSTEM)",
+      Self::Handle => "name_to_handle_at",
+    }
+  }
+}
+
+impl core::fmt::Display for ProbeStage {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
   }
 }
 
@@ -307,6 +406,14 @@ pub enum SourceError {
   /// The OS could not start the event stream.
   #[error("the OS could not start the event stream")]
   StartFailed,
+  /// A forced [`Backend::Fanotify`] failed a precondition probe (design §5): the
+  /// named stage was refused, so the backend cannot start. `Backend::Auto`
+  /// falls back to inotify instead of surfacing this.
+  #[error("the fanotify backend is unavailable: {stage} was refused")]
+  BackendProbeFailed {
+    /// The first probe stage that failed.
+    stage: ProbeStage,
+  },
   /// The decode callback panicked; the stream is poisoned.
   #[error("the event callback panicked")]
   CallbackPanic,

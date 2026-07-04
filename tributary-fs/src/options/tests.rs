@@ -15,6 +15,8 @@ fn default_delegates_to_new() {
     WatcherOptions::DEFAULT_OS_BATCH_CAPACITY
   );
   assert!(opts.exclusions_slice().is_empty());
+  assert_eq!(opts.backend(), WatcherOptions::DEFAULT_BACKEND);
+  assert_eq!(opts.backend(), Backend::Auto);
 }
 
 #[test]
@@ -24,7 +26,8 @@ fn builders_and_setters_agree() {
     .with_move_window(Duration::from_millis(300))
     .with_event_capacity(NonZeroUsize::new(8).unwrap())
     .with_os_batch_capacity(NonZeroUsize::new(4).unwrap())
-    .with_exclusions(vec![PathBuf::from("/tmp/skip")]);
+    .with_exclusions(vec![PathBuf::from("/tmp/skip")])
+    .with_backend(Backend::Fanotify);
 
   let mut set = WatcherOptions::new();
   set
@@ -32,10 +35,12 @@ fn builders_and_setters_agree() {
     .set_move_window(Duration::from_millis(300))
     .set_event_capacity(NonZeroUsize::new(8).unwrap())
     .set_os_batch_capacity(NonZeroUsize::new(4).unwrap())
-    .set_exclusions(vec![PathBuf::from("/tmp/skip")]);
+    .set_exclusions(vec![PathBuf::from("/tmp/skip")])
+    .set_backend(Backend::Fanotify);
 
   assert_eq!(built, set);
   assert_eq!(built.exclusions_slice().len(), 1);
+  assert_eq!(built.backend(), Backend::Fanotify);
 }
 
 #[test]

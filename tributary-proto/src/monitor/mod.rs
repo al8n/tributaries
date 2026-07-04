@@ -400,6 +400,22 @@ impl Monitor {
     id
   }
 
+  /// Replaces the capability profile of an already-registered root — the narrow
+  /// window a driver uses when a per-root backend is chosen only once its source
+  /// has spawned (`Backend::Auto`: register provisionally, then adopt the
+  /// probed backend's profile before the root's watch-result is fed).
+  ///
+  /// Sound only while the root is still bootstrapping: its node has no children
+  /// and no record has been ingested, so `caps` governs only decisions still to
+  /// come (the post-arm cold enumerate, every later descent gate). A no-op for
+  /// an unregistered scope.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn reprofile_root(&mut self, scope: ScopeId, caps: Capabilities) {
+    if self.roots.contains_key(&scope) {
+      self.scope_profiles.insert(scope, caps);
+    }
+  }
+
   /// The mask actually installed on a watch: the consumer's requested interest augmented
   /// with the structural kinds the core cannot function without. Discovery and coverage
   /// maintenance need create/remove/move records — including for directory targets — no

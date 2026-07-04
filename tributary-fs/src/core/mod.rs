@@ -37,7 +37,8 @@ use tributary_proto::{
 };
 
 use crate::os::{
-  BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootMeta, SourceError, SourceEvent,
+  BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, SourceError,
+  SourceEvent,
   linux::{RawLinuxEvent, WatchOutcome},
   transport::BudgetPermit,
 };
@@ -69,6 +70,38 @@ pub(crate) enum ProbeOutcome {
   },
   /// The probe failed (permission, I/O); existence is unknowable.
   Failed,
+}
+
+/// What the mount refresh's root re-stat found — folded into every refresh so a
+/// kernel-recursive backend, which receives no in-tree signal when its root is
+/// unmounted or replaced (design §7), still detects the death at the refresh
+/// cadence (birth + every loss signal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootLiveness {
+  /// The root still stats to an object; the core compares its identity against
+  /// the barrier's to decide alive-vs-replaced.
+  Present(RootIdentity),
+  /// The root path no longer exists (lowers to `DeleteSelf`).
+  Missing,
+  /// The root could not be stat'd (permission, I/O, an unmounted-out mount
+  /// point); existence is unknowable, so it lowers to `MoveSelf` exactly like a
+  /// `RootChanged` probe that resolves `Failed`.
+  Unreadable,
+}
+
+/// One mount-table refresh result: the mount prefixes strictly under the root,
+/// whether the read was authoritative, and what the root itself re-stat'd to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountRefresh {
+  /// Mount points observed strictly under the root.
+  pub(crate) mounts: Vec<PathBuf>,
+  /// Whether the live mount table could be read (device trust returns only
+  /// with an authoritative read).
+  pub(crate) authoritative: bool,
+  /// The root's liveness at refresh time — the composition-only root-death
+  /// check (no new timer, no new effect: the refresh already runs at birth and
+  /// on every loss).
+  pub(crate) root: RootLiveness,
 }
 
 /// One I/O obligation the driver task must execute for the core.
@@ -325,6 +358,13 @@ struct ScopeState {
   /// every delivery can carry it without copying.
   root: Option<Arc<PathBuf>>,
   root_dev: Option<u64>,
+  /// The root object's identity, captured at the spawn barrier. The mount
+  /// refresh re-stats the root and compares against this: a `Missing` or
+  /// mismatched read is a root death, lowered through the same self-event path
+  /// a `RootChanged` probe uses (kernel-recursive backends have no in-tree
+  /// unmount signal, so the refresh cadence is their root-liveness check).
+  /// `None` for a scope whose barrier read no identity (off-unix fakes).
+  identity: Option<RootIdentity>,
   /// Foreign-device prefixes under the root: seeded from the live mount
   /// table at spawn, then maintained by Mount/Unmount events and probed
   /// devices. Tiny in practice, so a linear scan beats indexing.
@@ -446,6 +486,7 @@ impl DriverCore {
         requested: root,
         root: None,
         root_dev: None,
+        identity: None,
         mounts: Vec::new(),
         mounts_authoritative: false,
         refresh_pending: false,
@@ -476,15 +517,23 @@ impl DriverCore {
     let watch = state.watch;
     match res {
       Ok(meta) => {
-        debug_assert!(
-          profile_of(meta.backend) == state.profile,
-          "the spawned backend must match the registered profile"
-        );
+        // `Backend::Auto` decides the backend only once the source has spawned,
+        // so the registered profile is provisional: adopt the probed backend's
+        // profile before the root's watch-result is fed. The root node is still
+        // bootstrapping (no children, no record ingested), so re-profiling only
+        // governs decisions still to come — the post-arm enumerate and every
+        // later descent gate. A forced backend resolves to the profile it was
+        // registered with, so the reprofile is a no-op there.
         let backend = meta.backend;
+        if backend != state.profile {
+          state.profile = backend;
+          self.monitor.reprofile_root(scope, caps_for(backend));
+        }
         let root = Arc::new(meta.root);
         self.watch_paths.insert(watch, Arc::clone(&root));
         state.root = Some(Arc::clone(&root));
         state.root_dev = Some(meta.root_dev);
+        state.identity = Some(meta.identity);
         state.mounts = meta.mounts;
         // Born closed: the seed was read before the stream started, so a
         // mount appearing in that gap is in neither the seed nor the event
@@ -734,12 +783,14 @@ impl DriverCore {
     effects.push_back(Effect::RefreshMounts { scope, root });
   }
 
-  /// Feeds the blocking mount-table refresh a loss signal requested.
+  /// Feeds one mount-table refresh result: updates device trust AND checks the
+  /// root's liveness (folded into the same refresh — a kernel-recursive backend
+  /// gets no in-tree unmount signal, so this cadence is its root-death check).
   pub(crate) fn on_mounts_refreshed(
     &mut self,
     scope: ScopeId,
-    mounts: Vec<PathBuf>,
-    authoritative: bool,
+    refresh: MountRefresh,
+    now: Instant,
   ) {
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;
@@ -747,12 +798,35 @@ impl DriverCore {
     state.refresh_pending = false;
     if state.refresh_stale {
       // A newer loss overlapped this read: its snapshot may predate that
-      // window, so it is discarded and one more refresh runs.
+      // window, so it is discarded and one more refresh runs. The root-death
+      // check waits for that fresh read too — its liveness view is equally
+      // stale, and a genuine death survives to be seen there.
       state.refresh_stale = false;
       Self::trust_lost(&mut self.effects, scope, state);
       return;
     }
-    if !authoritative {
+
+    // Root-death check first: a dead root's mounts are moot, and the death
+    // lowers through the SAME self-event path a `RootChanged` probe uses —
+    // terminal Removed + Rescan, then the scope's registry reclamation. Only a
+    // barrier-known identity can be compared (an off-unix fake has none).
+    let death = state.identity.and_then(|expected| match refresh.root {
+      // Present and unchanged: alive, continue to the mount union.
+      RootLiveness::Present(live) if live == expected => None,
+      // Present but a different object, or unreadable: the path no longer names
+      // the watched object — MoveSelf, exactly as a `RootChanged` probe
+      // resolving `Present`/`Failed`.
+      RootLiveness::Present(_) | RootLiveness::Unreadable => Some(RecordKind::MoveSelf),
+      RootLiveness::Missing => Some(RecordKind::DeleteSelf),
+    });
+    if let Some(kind) = death {
+      let watch = state.watch;
+      self.monitor.on_os_record(OsRecord::new(watch, kind), now);
+      self.drain_monitor();
+      return;
+    }
+
+    if !refresh.authoritative {
       // The live table could not be read; trust stays closed (probe-carried
       // device evidence still decides everything it can).
       return;
@@ -761,7 +835,7 @@ impl DriverCore {
     // mount (a later unmount event removes it) or a probed foreign-device
     // prefix the snapshot cannot know about — keeping both only ever reduces
     // trust, the safe direction.
-    for mount in mounts {
+    for mount in refresh.mounts {
       if !state.mounts.iter().any(|m| m == &mount) {
         state.mounts.push(mount);
       }
@@ -1784,12 +1858,6 @@ fn caps_for(backend: BackendKind) -> Capabilities {
     BackendKind::FsEvents | BackendKind::Fanotify => caps.with_kernel_recursive(),
     BackendKind::Inotify => caps,
   }
-}
-
-/// The lowering profile a spawned backend implies (today the two are the same
-/// enum; the indirection keeps the assert site honest if they ever diverge).
-fn profile_of(backend: BackendKind) -> BackendKind {
-  backend
 }
 
 /// One raw directory entry as the executor read it — name bytes and stat

@@ -2,6 +2,8 @@
 
 use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 
+use crate::os::Backend;
+
 #[cfg(test)]
 mod tests;
 
@@ -36,6 +38,7 @@ pub struct WatcherOptions {
   event_capacity: NonZeroUsize,
   os_batch_capacity: NonZeroUsize,
   exclusions: Vec<PathBuf>,
+  backend: Backend,
 }
 
 impl WatcherOptions {
@@ -61,6 +64,10 @@ impl WatcherOptions {
   /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
   pub const MAX_EXCLUSIONS: usize = crate::os::MAX_EXCLUSIONS;
 
+  /// The default per-root backend selection: [`Backend::Auto`] — probe for
+  /// fanotify-FILESYSTEM, fall back to inotify (Linux; ignored on macOS).
+  pub const DEFAULT_BACKEND: Backend = Backend::Auto;
+
   /// The default options.
   #[inline]
   pub const fn new() -> Self {
@@ -70,6 +77,7 @@ impl WatcherOptions {
       event_capacity: Self::DEFAULT_EVENT_CAPACITY,
       os_batch_capacity: Self::DEFAULT_OS_BATCH_CAPACITY,
       exclusions: Vec::new(),
+      backend: Self::DEFAULT_BACKEND,
     }
   }
 
@@ -201,6 +209,34 @@ impl WatcherOptions {
   #[inline]
   pub fn set_exclusions(&mut self, exclusions: Vec<PathBuf>) -> &mut Self {
     self.exclusions = exclusions;
+    self
+  }
+
+  /// The per-root backend selection.
+  ///
+  /// On Linux, [`Backend::Auto`] (the default) probes for fanotify-FILESYSTEM
+  /// per root inside the pre-start barrier and falls back to inotify at the
+  /// first failing probe; [`Backend::Inotify`] and [`Backend::Fanotify`] pin
+  /// the choice (a forced `Fanotify` whose preconditions do not hold fails its
+  /// `watch` with a typed [`WatchRootError::Source`](crate::WatchRootError::Source),
+  /// never a silent fallback). macOS ignores this — FSEvents is its one backend.
+  #[inline]
+  pub const fn backend(&self) -> Backend {
+    self.backend
+  }
+
+  /// Returns these options with the per-root backend selection set.
+  #[inline]
+  #[must_use]
+  pub const fn with_backend(mut self, backend: Backend) -> Self {
+    self.backend = backend;
+    self
+  }
+
+  /// Sets the per-root backend selection.
+  #[inline]
+  pub const fn set_backend(&mut self, backend: Backend) -> &mut Self {
+    self.backend = backend;
     self
   }
 }

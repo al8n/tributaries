@@ -21,7 +21,7 @@ use crate::{
   error::{BuildError, CloseError, UnwatchError, WatchRootError},
   event::Event,
   options::WatcherOptions,
-  os::{RootIdentity, SourceError},
+  os::{BackendKind, RootIdentity, SourceError},
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -64,12 +64,14 @@ impl RootHandle {
 
 /// One live root's registry record: its canonical path plus the object
 /// identities disjointness is decided on (the root's own and every strict
-/// ancestor's), captured at the spawn barrier.
+/// ancestor's), captured at the spawn barrier, plus the backend the barrier
+/// selected (what [`Watcher::backend_of`] reports).
 #[derive(Debug)]
 struct RootEntry {
   path: Arc<PathBuf>,
   identity: RootIdentity,
   ancestors: Arc<[RootIdentity]>,
+  backend: BackendKind,
 }
 
 /// One in-flight `watch`'s reservation record: the watcher-side canonical
@@ -141,6 +143,7 @@ impl ScopeRegistry for RegistryWriter {
     root: &Path,
     identity: RootIdentity,
     ancestors: &[RootIdentity],
+    backend: BackendKind,
   ) {
     let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
     set.entries.insert(
@@ -149,6 +152,7 @@ impl ScopeRegistry for RegistryWriter {
         path: Arc::new(root.to_path_buf()),
         identity,
         ancestors: ancestors.into(),
+        backend,
       },
     );
   }
@@ -312,30 +316,7 @@ impl<R: RuntimeLite> Watcher<R> {
       os_batch_capacity: options.os_batch_capacity(),
       exclusions: options.exclusions_slice().to_vec(),
       profile: DriverConfig::platform_profile(),
-    };
-    Self::spawn_with(options, config, RealFs::new())
-  }
-
-  /// Builds a watcher that forces the fanotify-FILESYSTEM backend for every
-  /// root — the explicit test/config path pending `Backend::Auto` (L4.2).
-  /// Requires `CAP_SYS_ADMIN`; a root whose filesystem cannot support the
-  /// superblock mark fails its `watch` with a typed [`WatchRootError::Source`].
-  ///
-  /// Hidden from the public API surface: `Backend::Auto` and
-  /// `WatcherOptions.backend` are the supported selection path once they land.
-  #[doc(hidden)]
-  #[cfg(target_os = "linux")]
-  pub fn new_forcing_fanotify(options: WatcherOptions) -> Result<Self, BuildError> {
-    let supplied = options.exclusions_slice().len();
-    if supplied > WatcherOptions::MAX_EXCLUSIONS {
-      return Err(BuildError::TooManyExclusions { supplied });
-    }
-    let config = DriverConfig {
-      latency: options.latency(),
-      move_window: options.move_window(),
-      os_batch_capacity: options.os_batch_capacity(),
-      exclusions: options.exclusions_slice().to_vec(),
-      profile: crate::os::BackendKind::Fanotify,
+      backend: options.backend(),
     };
     Self::spawn_with(options, config, RealFs::new())
   }
@@ -382,6 +363,9 @@ impl<R: RuntimeLite> Watcher<R> {
       // regardless of host — the descending profile has its own driver
       // suites. Pinning here keeps them host-independent.
       profile: crate::os::BackendKind::FsEvents,
+      // The fake spawn pins its backend directly (`FakeFs::spawn_backend`), so
+      // the selection knob is inert here.
+      backend: options.backend(),
     };
     Self::spawn_with(options, config, ops)
   }
@@ -559,6 +543,24 @@ impl<R: RuntimeLite> Watcher<R> {
       .entries
       .get(&root.scope())
       .map(|entry| entry.path.as_ref().clone())
+  }
+
+  /// The backend the spawn barrier selected for a watched root — the capability
+  /// report for a `Backend::Auto` outcome (fanotify when the privileged probe
+  /// passed, inotify on the fallback). `None` when the handle does not name a
+  /// live root of this watcher (never watched, already gone, or foreign), which
+  /// is indistinguishable from a root that died right after `watch` returned.
+  pub fn backend_of(&self, root: RootHandle) -> Option<BackendKind> {
+    if root.instance() != self.instance {
+      return None;
+    }
+    self
+      .roots
+      .read()
+      .unwrap_or_else(PoisonError::into_inner)
+      .entries
+      .get(&root.scope())
+      .map(|entry| entry.backend)
   }
 
   /// The number of registry entries — live roots only, by construction.
