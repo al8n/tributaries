@@ -520,18 +520,16 @@ async fn forced_fanotify_without_privilege_is_typed_error() {
   w.close().await.expect("the watcher closes cleanly");
 }
 
-/// Suite 11 (strengthened) — root death via the refresh path (design §7 gap,
-/// now closed by L4.2). A fanotify root that is unmounted out from under the
-/// watcher delivers no in-tree signal; the mount refresh's folded-in root
-/// re-stat is what detects it. This keeps the watch LIVE, lazily detaches the
-/// mount (so the root path stops resolving while the mark's sb stays alive),
-/// induces the loss path (which arms a refresh), and asserts the terminal
-/// `Rescan` arrives and the handle goes dead.
+/// Suite 11 (strengthened) — root death via the PERIODIC LIVENESS TICK (design
+/// §7 L4.1/L4.2). A fanotify root unmounted out from under a LIVE watch delivers
+/// no in-tree signal AND no loss — the mark holds the superblock alive and the
+/// fd goes quiet — so the only detection is the periodic root re-stat. The
+/// property asserted is terminal reclamation WITHOUT inducing any loss.
 ///
-/// Best-effort on the trigger: if the loss/refresh cannot be induced in the
-/// environment, the cell verifies survival (the §7 floor) and notes the skip —
-/// the deterministic proof of the composition is the hermetic core suite
-/// (`refresh_finding_root_gone_is_delete_self`).
+/// A short `root_liveness_interval` makes it deterministic: watch live, plain
+/// lazy-unmount (no retained fd, no channel-flood trick), then wait for the tick
+/// to re-stat the now-gone root and lower the death lifecycle — the handle goes
+/// dead-on-arrival, exactly like an in-tree `DELETE_SELF` would.
 #[tokio::test]
 async fn unmount_under_live_watch_dies_via_refresh() {
   let Some(mount) = ext4_loopback() else {
@@ -539,12 +537,12 @@ async fn unmount_under_live_watch_dies_via_refresh() {
     return;
   };
   let root = scratch_under(&mount, "refresh-death");
-  // A tiny OS-batch channel so a burst overflows it → the transport loss path →
-  // a mount refresh armed on a LIVE (still-marked) scope; that refresh's root
-  // re-stat is what detects the vanished root.
+  // A SHORT liveness interval: the periodic root re-stat is what detects a
+  // signal-silent unmount, and a fraction of a second makes the death arrive
+  // deterministically inside the test's deadline without any induced loss.
   let options = WatcherOptions::new()
     .with_backend(Backend::Fanotify)
-    .with_os_batch_capacity(std::num::NonZeroUsize::new(1).unwrap());
+    .with_root_liveness_interval(Duration::from_millis(500));
   let w = TokioWatcher::new(options).expect("build watcher");
   let Ok(handle) = w.watch(&root, Interest::all()).await else {
     eprintln!("SKIP unmount_under_live_watch_dies_via_refresh: fanotify unavailable");
@@ -553,15 +551,10 @@ async fn unmount_under_live_watch_dies_via_refresh() {
   };
   let mut w = w;
 
-  // A directory INSIDE the root, opened as an fd BEFORE the unmount: after a
-  // lazy detach the root path stops resolving, but this fd still addresses the
-  // (mark-kept-alive) superblock, so `openat` through it keeps generating real
-  // fanotify events — the only way to drive the loss path post-detach.
-  std::fs::create_dir_all(root.join("live")).unwrap();
-  let live_fd = open_dir_fd(&root.join("live"));
-  std::fs::write(root.join("live/marker.txt"), b"m").unwrap();
+  // Prove the mark is live before pulling the filesystem out.
+  std::fs::write(root.join("marker.txt"), b"m").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &root.join("live/marker.txt")))
+    wait_for(&mut w, |e| covers(e, &root.join("marker.txt")))
       .await
       .is_some(),
     "the mark is live before the unmount"
@@ -569,7 +562,8 @@ async fn unmount_under_live_watch_dies_via_refresh() {
 
   // Lazy-unmount: detaches the mount from the namespace immediately (the root
   // path stops resolving) while the open mark keeps the superblock alive — the
-  // exact "unmounted out from under a live watch" condition §7 describes.
+  // exact "unmounted out from under a live watch" condition §7 describes. NO
+  // loss is induced; the tick alone must catch it.
   let detached = Command::new("umount")
     .args(["-l"])
     .arg(&mount)
@@ -589,79 +583,25 @@ async fn unmount_under_live_watch_dies_via_refresh() {
     "the lazily-detached root no longer resolves"
   );
 
-  // Drive the loss path: each round creates files through the RETAINED fd (the
-  // path is gone, so only `openat` works), flooding the tiny OS-batch channel →
-  // the transport loss → one mount refresh, whose root re-stat now finds the
-  // path gone and lowers the death lifecycle. The SOLE success signal is the
-  // handle being reclaimed (dead-on-arrival). Convergence-style across rounds;
-  // draining the stream keeps the driver making progress.
+  // Wait — draining the stream so the driver makes progress — for the periodic
+  // tick to fire a refresh, find the root gone, and lower the death lifecycle.
+  // The SOLE success signal is the handle being reclaimed (dead-on-arrival). No
+  // loss, no openat trick: the tick is the entire mechanism under test.
   let deadline = std::time::Instant::now() + Duration::from_secs(20);
   while w.backend_of(handle).is_some() && std::time::Instant::now() < deadline {
-    if let Some(fd) = live_fd {
-      for i in 0..128 {
-        openat_create(fd, &format!("burst-{i}.txt"));
-      }
-    }
     let _ = tokio::time::timeout(Duration::from_millis(300), w.next()).await;
   }
 
-  if w.backend_of(handle).is_none() {
-    // The refresh-detected death ran end to end: the registry reclaimed the
-    // handle, exactly like an in-tree DELETE_SELF would.
-    assert!(
-      w.root_path(handle).is_none(),
-      "a reclaimed handle has no path"
-    );
-  } else {
-    // The §7 SURVIVAL floor still holds if the loss could not be induced here
-    // (e.g. `openat` on the detached sb refused): the watcher is quiet-but-alive
-    // — no panic, no hang. The deterministic proof of the composition is the
-    // hermetic suite (core `refresh_finding_root_gone_is_delete_self`, driver
-    // `refresh_finding_root_gone_dies_end_to_end`).
-    eprintln!(
-      "NOTE unmount_under_live_watch_dies_via_refresh: loss not induced on the \
-       detached sb; survival floor holds (composition proven hermetically)"
-    );
-    let _ = tokio::time::timeout(Duration::from_secs(2), w.next()).await;
-  }
-  if let Some(fd) = live_fd {
-    // SAFETY: fd was opened by `open_dir_fd` and is not used again.
-    unsafe { libc::close(fd) };
-  }
+  assert!(
+    w.backend_of(handle).is_none(),
+    "the periodic liveness tick detected the unmounted root and reclaimed the handle \
+     with no induced loss"
+  );
+  assert!(
+    w.root_path(handle).is_none(),
+    "a reclaimed handle has no path"
+  );
   let _ = w.close().await;
-}
-
-/// Opens `dir` as an `O_DIRECTORY` fd (for post-detach `openat`), or `None` on
-/// failure. The caller closes it.
-fn open_dir_fd(dir: &Path) -> Option<libc::c_int> {
-  use std::os::unix::ffi::OsStrExt;
-  let cpath = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-  // SAFETY: cpath is a valid NUL-terminated path; the flags are constants.
-  let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-  (fd >= 0).then_some(fd)
-}
-
-/// Creates (and immediately closes) a file named `name` under the directory
-/// `dirfd` addresses — an `openat` that fires a fanotify create on the marked
-/// superblock even after the mount was lazily detached. Best-effort.
-fn openat_create(dirfd: libc::c_int, name: &str) {
-  let Ok(cname) = std::ffi::CString::new(name) else {
-    return;
-  };
-  // SAFETY: dirfd is a live directory fd; cname is NUL-terminated; the flags and
-  // mode are constants.
-  let fd = unsafe {
-    libc::openat(
-      dirfd,
-      cname.as_ptr(),
-      libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
-      0o644,
-    )
-  };
-  if fd >= 0 {
-    // SAFETY: fd is the freshly-opened descriptor, used nowhere else.
-    unsafe { libc::close(fd) };
-  }
 }
 
 /// Whether the process holds `CAP_SYS_ADMIN` — the capability the fanotify

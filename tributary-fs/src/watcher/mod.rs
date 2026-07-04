@@ -317,6 +317,7 @@ impl<R: RuntimeLite> Watcher<R> {
       exclusions: options.exclusions_slice().to_vec(),
       profile: DriverConfig::platform_profile(),
       backend: options.backend(),
+      root_liveness_interval: options.root_liveness_interval(),
     };
     Self::spawn_with(options, config, RealFs::new())
   }
@@ -366,6 +367,7 @@ impl<R: RuntimeLite> Watcher<R> {
       // The fake spawn pins its backend directly (`FakeFs::spawn_backend`), so
       // the selection knob is inert here.
       backend: options.backend(),
+      root_liveness_interval: options.root_liveness_interval(),
     };
     Self::spawn_with(options, config, ops)
   }

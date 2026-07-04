@@ -39,6 +39,7 @@ pub struct WatcherOptions {
   os_batch_capacity: NonZeroUsize,
   exclusions: Vec<PathBuf>,
   backend: Backend,
+  root_liveness_interval: Duration,
 }
 
 impl WatcherOptions {
@@ -68,6 +69,15 @@ impl WatcherOptions {
   /// fanotify-FILESYSTEM, fall back to inotify (Linux; ignored on macOS).
   pub const DEFAULT_BACKEND: Backend = Backend::Auto;
 
+  /// The default periodic root-liveness interval (30 s) — the detection-latency
+  /// bound for a signal-silent unmount. A `FAN_MARK_FILESYSTEM`-watched
+  /// superblock unmounted out from under the watch emits NO kernel signal (the
+  /// L4.1 finding), so a periodic root re-stat is its only unmount detection;
+  /// every other backend (inotify's `IN_UNMOUNT`/`IN_IGNORED`, FSEvents'
+  /// `RootChanged`) signals root death in-band and ignores this knob. See
+  /// [`root_liveness_interval`](Self::root_liveness_interval).
+  pub const DEFAULT_ROOT_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
+
   /// The default options.
   #[inline]
   pub const fn new() -> Self {
@@ -78,6 +88,7 @@ impl WatcherOptions {
       os_batch_capacity: Self::DEFAULT_OS_BATCH_CAPACITY,
       exclusions: Vec::new(),
       backend: Self::DEFAULT_BACKEND,
+      root_liveness_interval: Self::DEFAULT_ROOT_LIVENESS_INTERVAL,
     }
   }
 
@@ -237,6 +248,49 @@ impl WatcherOptions {
   #[inline]
   pub const fn set_backend(&mut self, backend: Backend) -> &mut Self {
     self.backend = backend;
+    self
+  }
+
+  /// The periodic root-liveness interval — the detection-latency bound for a
+  /// signal-silent root unmount.
+  ///
+  /// A fanotify (`FAN_MARK_FILESYSTEM`) root unmounted out from under the watch
+  /// delivers no kernel signal (the mark holds the superblock alive and the fd
+  /// goes quiet — the L4.1 finding), so the driver re-stats such a root on this
+  /// cadence and lowers its death (a terminal
+  /// [`Rescan`](crate::EventKind::Rescan) and registry reclamation) when the
+  /// path no longer names the watched object. This is the WORST-CASE latency:
+  /// an unmount is also caught immediately by any loss signal (which already
+  /// re-reads the mount table), so the tick only bounds the quiet case.
+  ///
+  /// Only signal-silent-on-unmount backends consult it — fanotify. inotify
+  /// (`IN_UNMOUNT`/`IN_IGNORED`) and FSEvents (`RootChanged`) surface root death
+  /// in-band and never arm this tick, so the knob is inert for them.
+  ///
+  /// [`Duration::ZERO`] DISABLES the tick: a quiet unmount is then observed only
+  /// at the next loss-triggered refresh (or never, if none occurs) — the
+  /// pre-L4.2 behavior, quiet-but-alive with the root observably gone on
+  /// re-access.
+  #[inline]
+  pub const fn root_liveness_interval(&self) -> Duration {
+    self.root_liveness_interval
+  }
+
+  /// Returns these options with the periodic root-liveness interval set.
+  #[inline]
+  #[must_use]
+  pub const fn with_root_liveness_interval(mut self, root_liveness_interval: Duration) -> Self {
+    self.root_liveness_interval = root_liveness_interval;
+    self
+  }
+
+  /// Sets the periodic root-liveness interval.
+  #[inline]
+  pub const fn set_root_liveness_interval(
+    &mut self,
+    root_liveness_interval: Duration,
+  ) -> &mut Self {
+    self.root_liveness_interval = root_liveness_interval;
     self
   }
 }

@@ -15,17 +15,25 @@
 //! interned — the compile path only lowers each absolute path to its
 //! root-relative form.
 //!
-//! Root death (unmount / replace) carries NO in-tree fanotify signal — an
-//! unmounted `FAN_MARK_FILESYSTEM` superblock stays alive under the mark and the
-//! fd simply goes quiet (design §7, container-validated). Detection is instead
-//! the mount refresh's folded-in root re-stat (`FsOps::refresh_mounts` →
+//! Root UNMOUNT carries NO in-tree fanotify signal — an unmounted
+//! `FAN_MARK_FILESYSTEM` superblock stays alive under the mark and the fd simply
+//! goes quiet (design §7, container-validated L4.1). Detection is the mount
+//! refresh's folded-in root re-stat (`FsOps::refresh_mounts` →
 //! `MountRefresh.root`), compared against the barrier identity in
 //! `DriverCore::on_mounts_refreshed`: a missing/replaced root lowers the same
-//! `DeleteSelf`/`MoveSelf` death lifecycle a macOS `RootChanged` probe uses. The
-//! refresh runs at scope birth and on every loss signal, so **that cadence is
-//! the honest detection latency** — no timer, no new effect; an unmount with no
-//! following loss is seen at the next loss-armed refresh, and the watcher stays
-//! quiet-but-alive until then.
+//! `DeleteSelf`/`MoveSelf` death lifecycle a macOS `RootChanged` probe uses.
+//! (An in-tree delete/replace of the ROOT object itself, by contrast, DOES
+//! arrive as `FAN_DELETE_SELF`/`FAN_MOVE_SELF`.)
+//!
+//! That refresh runs at scope birth and on every loss signal — but a QUIET
+//! unmount produces neither, so those triggers alone would never observe it.
+//! The composition therefore adds ONE timer: the periodic root-liveness tick
+//! (`WatcherOptions::root_liveness_interval`, fanotify-only — see the
+//! per-backend death-signal table in the `core` module docs), which re-stats the
+//! root on a bounded cadence so a signal-silent unmount is detected within the
+//! interval. A loss-triggered refresh still catches it immediately when one
+//! occurs; the tick only bounds the otherwise-unobservable quiet case, and
+//! `Duration::ZERO` disables it (back to quiet-but-alive until re-access fails).
 
 pub(crate) mod fid;
 pub(crate) mod map;
@@ -241,6 +249,85 @@ pub(super) const FAN_MARK_MASK: u64 = fid::FAN_CREATE
   | fid::FAN_DELETE_SELF
   | fid::FAN_MOVE_SELF
   | fid::FAN_ONDIR;
+
+/// Encodes `path`'s NFS-style file handle via `name_to_handle_at`, DYNAMICALLY
+/// sizing the buffer: `struct file_handle` is a flexible-array type, and a
+/// filesystem whose handle exceeds the initial `MAX_HANDLE_SZ` request answers
+/// `EOVERFLOW` with the true size written back into `handle_bytes` — so a single
+/// fixed buffer would turn an oversized-handle filesystem (which CAN export
+/// handles) into a spurious "unsupported". The loop grows to the reported size
+/// and retries exactly once; a second `EOVERFLOW` is a lying kernel and fails.
+///
+/// Returns the FID handle bytes — `handle_type` (native-endian) followed by the
+/// opaque bytes — byte-identical to the event-side decode, so a seed FID matches
+/// the kernel's event FIDs exactly. `None` when the filesystem cannot encode a
+/// handle for this object (a non-exporting fs, a permission/transient failure,
+/// or the double-`EOVERFLOW` broken-kernel case). Shared by the seed/reseed walk
+/// (which wraps it into a [`fid::Fid`]) and the `Backend::Auto` probe (whose
+/// success is this same round-trip succeeding at the true size).
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(super) fn encode_handle(path: &std::path::Path) -> Option<std::boxed::Box<[u8]>> {
+  use std::os::unix::ffi::OsStrExt;
+
+  let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+  let prefix = std::mem::size_of::<libc::file_handle>();
+  // Start at MAX_HANDLE_SZ (the common case fits in one try); a larger handle
+  // grows the buffer to the kernel-reported size on the single retry below.
+  let mut cap = libc::MAX_HANDLE_SZ as usize;
+  let mut grown = false;
+  loop {
+    // The backing buffer is `u64` so the pointer is 8-aligned — a `Vec<u8>` is
+    // only 1-aligned, and writing a `file_handle` (align 4) through such a
+    // pointer would be undefined behavior.
+    let words = prefix.div_ceil(8) + cap.div_ceil(8) + 1;
+    let mut storage = vec![0u64; words];
+    let mut mount_id: libc::c_int = 0;
+    let handle = storage.as_mut_ptr().cast::<libc::file_handle>();
+    // SAFETY: storage is 8-aligned and sized for the fixed prefix plus `cap`
+    // opaque bytes; this write stays within it.
+    unsafe {
+      (*handle).handle_bytes = cap as libc::c_uint;
+    }
+    // SAFETY: handle points at a correctly-sized, aligned file_handle; cpath is
+    // NUL-terminated; mount_id is a valid out-param.
+    let rc =
+      unsafe { libc::name_to_handle_at(libc::AT_FDCWD, cpath.as_ptr(), handle, &mut mount_id, 0) };
+    let errno = (rc != 0)
+      .then(|| std::io::Error::last_os_error().raw_os_error())
+      .flatten();
+    match fid::classify_handle_attempt(rc, errno, grown) {
+      fid::HandleAttempt::Encoded => {
+        // SAFETY: the call succeeded, so the prefix and `handle_bytes` opaque
+        // bytes are initialized.
+        let (handle_bytes, handle_type) =
+          unsafe { ((*handle).handle_bytes as usize, (*handle).handle_type) };
+        if handle_bytes > cap {
+          // The kernel reported success yet a length past the buffer it filled:
+          // structurally impossible, refuse rather than read out of bounds.
+          return None;
+        }
+        // SAFETY: the opaque handle begins right after the prefix and spans
+        // handle_bytes (bounded by cap above); reading it as bytes is in-range.
+        let opaque = unsafe {
+          std::slice::from_raw_parts(storage.as_ptr().cast::<u8>().add(prefix), handle_bytes)
+        };
+        let mut bytes = Vec::with_capacity(4 + opaque.len());
+        bytes.extend_from_slice(&handle_type.to_ne_bytes());
+        bytes.extend_from_slice(opaque);
+        return Some(bytes.into_boxed_slice());
+      }
+      fid::HandleAttempt::Grow => {
+        // EOVERFLOW wrote the required size back into handle_bytes; retry once
+        // at exactly that size.
+        // SAFETY: the prefix is initialized on an EOVERFLOW return (the kernel
+        // fills handle_bytes with the needed length).
+        cap = unsafe { (*handle).handle_bytes as usize };
+        grown = true;
+      }
+      fid::HandleAttempt::Unsupported => return None,
+    }
+  }
+}
 
 #[cfg(all(target_os = "linux", not(miri)))]
 pub(crate) mod reader;

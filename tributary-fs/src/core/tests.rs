@@ -2,6 +2,10 @@ use super::*;
 use std::time::Duration;
 
 const WINDOW: Duration = Duration::from_millis(100);
+/// The root-liveness tick interval the shared harness cores run with. Only a
+/// fanotify scope arms it, and the FSEvents/inotify suites never drive time
+/// this far, so it is inert everywhere except the fanotify liveness-tick suite.
+const LIVENESS: Duration = Duration::from_secs(30);
 
 fn at(ms: u64) -> Instant {
   Instant::from_origin(Duration::from_millis(ms))
@@ -62,7 +66,7 @@ fn alive_refresh(mounts: Vec<PathBuf>, authoritative: bool) -> MountRefresh {
 /// A core with one live scope rooted at `/r` on device 1, its birth refresh
 /// fed (an authoritative empty table): event-side trust is open.
 fn live_core() -> (DriverCore, ScopeId) {
-  let mut core = DriverCore::new(WINDOW);
+  let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let effects = drain(&mut core);
   assert!(
@@ -94,7 +98,7 @@ fn live_core() -> (DriverCore, ScopeId) {
 /// A live core whose birth refresh could NOT read the mount table: device
 /// boundaries stay unknown, so event-side identity/cookie trust is refused.
 fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
-  let mut core = DriverCore::new(WINDOW);
+  let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(
@@ -891,6 +895,8 @@ fn identity_minting_respects_devices_and_mounts() {
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
+    publicly_live: true,
+    liveness_deadline: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -922,6 +928,8 @@ fn blind_mount_table_refuses_event_side_trust() {
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
+    publicly_live: true,
+    liveness_deadline: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -1438,7 +1446,7 @@ fn rename_coalesced_with_create_and_remove_grounds_by_existence() {
 
 #[test]
 fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
-  let mut core = DriverCore::new(WINDOW);
+  let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   // The volume was ALREADY mounted at spawn: only the seeded table knows —
@@ -1478,7 +1486,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
   // A mount can appear between the spawn's seed read and stream start,
   // landing in neither the seed nor the event stream — so a scope is born
   // trust-closed, and only the post-live birth refresh installs authority.
-  let mut core = DriverCore::new(WINDOW);
+  let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(
@@ -1561,7 +1569,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
 
 #[test]
 fn a_loss_racing_the_birth_refresh_rearms_it_once() {
-  let mut core = DriverCore::new(WINDOW);
+  let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(
@@ -1910,7 +1918,7 @@ fn kernel_loss_flags_revoke_trust_but_coverage_rescans_do_not() {
 fn same_batch_unmount_keeps_colliding_rename_foreign() {
   // The volume was known at spawn; a rename coalesces into the SAME batch as
   // the volume's unmount, with a root-device object colliding on the fileID.
-  let mut core = DriverCore::new(WINDOW);
+  let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(
@@ -2325,7 +2333,7 @@ fn single_partner_grant_is_probe_order_independent() {
 /// delivered — not even through the dying retry.
 #[test]
 fn spawn_failure_emits_nothing_public() {
-  let mut core = DriverCore::new(WINDOW);
+  let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_stream_spawned(scope, Err(SourceError::StartFailed));
@@ -2352,7 +2360,7 @@ fn spawn_failure_emits_nothing_public() {
 /// fence covers a scope the driver refused before it went live.
 #[test]
 fn spawn_rejection_emits_nothing_public() {
-  let mut core = DriverCore::new(WINDOW);
+  let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
   let _ = drain(&mut core);
   core.on_spawn_rejected(scope);
@@ -2384,6 +2392,8 @@ mod lowering {
       lag: LagState::Normal,
       park: Park::default(),
       resume_poisoned: false,
+      publicly_live: true,
+      liveness_deadline: None,
     }
   }
 
@@ -2447,7 +2457,7 @@ mod lowering {
   /// `/` root unusable).
   #[test]
   fn filesystem_root_scope_grounds_descendants_located() {
-    let mut core = DriverCore::new(WINDOW);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = core.on_watch(PathBuf::from("/"), Interest::all(), BackendKind::FsEvents);
     let _ = drain(&mut core);
     core.on_stream_spawned(
@@ -2718,7 +2728,7 @@ mod descending {
   /// (the source starts with no watches), and the arm's success
   /// cold-enumerates the root — the dormant vocabulary is live.
   fn live_descending() -> (DriverCore, ScopeId, ReqId, WatchId) {
-    let mut core = DriverCore::new(WINDOW);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
     let effects = drain(&mut core);
     assert!(
@@ -2845,6 +2855,132 @@ mod descending {
     assert!(
       emits(&effects).iter().any(|c| c.kind().is_rescan()),
       "a refused arm is never a silent blind spot: {effects:?}"
+    );
+  }
+
+  /// Spawns a descending scope at `root` and returns it with its PENDING root
+  /// arm — the stream is live and `root` is populated, but coverage (and the
+  /// caller's deferred grant) does not begin until the root arm resolves.
+  fn spawned_with_pending_root_arm_at(core: &mut DriverCore, root: &str) -> (ScopeId, WatchId) {
+    let scope = core.on_watch(PathBuf::from(root), Interest::all(), BackendKind::Inotify);
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from(root),
+        root_dev: 1,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let root_watch = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if path.as_path() == Path::new(root) && watch == parent => Some(*watch),
+        _ => None,
+      })
+      .expect("the descending root arms through the effect path");
+    (scope, root_watch)
+  }
+
+  /// A live descending scope at `root`: spawned, root arm installed, birth
+  /// refresh fed — publicly live and delivering. Returns the scope and its root
+  /// watch (the anchor a live record attributes to).
+  fn live_descending_at(core: &mut DriverCore, root: &str) -> (ScopeId, WatchId) {
+    let (scope, root_watch) = spawned_with_pending_root_arm_at(core, root);
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    // Consume the cold enumerate the successful root arm queues.
+    let req = drain(core).iter().find_map(|e| match e {
+      Effect::Enumerate { req, watch, .. } if *watch == root_watch => Some(*req),
+      _ => None,
+    });
+    if let Some(req) = req {
+      core.on_enumerated(req, listed(Vec::new()));
+      let _ = drain(core);
+    }
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    (scope, root_watch)
+  }
+
+  /// A descending scope's ROOT ARM failing is a NEVER-LIVE end: the caller's
+  /// deferred grant resolved `Err` (the driver answers before this feeds the
+  /// core), so the Monitor's root-watch failure `Rescan` must NOT be emitted —
+  /// the fence keys on public liveness (the root arm), not on `root` being
+  /// populated at spawn. The scope tears down silently, and no dying-retry timer
+  /// promotes anything.
+  #[test]
+  fn descending_root_arm_failure_is_never_live_and_silent() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root_watch) = spawned_with_pending_root_arm_at(&mut core, "/r");
+    core.on_watch_installed(
+      root_watch,
+      crate::os::linux::WatchOutcome::Failed(WatchError::NotFound),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a failed root arm emits no public event (the deferred grant already got Err): {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the never-live scope tears down: {effects:?}"
+    );
+    assert_eq!(
+      core.poll_timeout(),
+      None,
+      "a never-live scope arms no dying-retry timer"
+    );
+    core.on_timeout(at(10_000));
+    assert!(
+      emits(&drain(&mut core)).is_empty(),
+      "nothing to retry for a never-publicly-live scope"
+    );
+  }
+
+  /// A root-arm failure while a SIBLING scope is live and emitting: the fence is
+  /// per-scope, so the live sibling delivers normally and only the failed scope
+  /// stays silent — and the failed scope promotes no dying delivery.
+  #[test]
+  fn root_arm_failure_leaves_a_live_sibling_untouched() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (live, live_root) = live_descending_at(&mut core, "/live");
+    let (failed, failed_root) = spawned_with_pending_root_arm_at(&mut core, "/r");
+    core.on_watch_installed(
+      failed_root,
+      crate::os::linux::WatchOutcome::Failed(WatchError::NotFound),
+    );
+    let _ = drain(&mut core);
+    // The live sibling still delivers a depth-one create.
+    core.on_inotify_events(
+      live,
+      vec![inotify(&[live_root], IN_CREATE, 0, Some(b"hot.txt"))],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(
+      !emitted.is_empty() && emitted.iter().all(|c| c.scope() == live),
+      "only the live sibling emits; the failed scope stays silent: {effects:?}"
+    );
+    assert!(
+      emitted
+        .iter()
+        .any(|c| c.kind().is_created() && c.location() == &loc(&["hot.txt"])),
+      "the live sibling's create is delivered: {effects:?}"
+    );
+    assert!(
+      !core.dying_contains(failed),
+      "the never-live failed scope promotes no dying delivery"
     );
   }
 
@@ -3065,7 +3201,7 @@ mod kernel_recursive_fanotify {
   /// A live fanotify scope rooted at `/r`: the KR spawn doubles as the root's
   /// watch-result, and the birth refresh installs authoritative (empty) trust.
   fn live_fanotify() -> (DriverCore, ScopeId) {
-    let mut core = DriverCore::new(WINDOW);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
     let effects = drain(&mut core);
     assert!(
@@ -3302,6 +3438,175 @@ mod kernel_recursive_fanotify {
     assert!(emitted[0].kind().is_created());
     assert_eq!(emitted[0].location(), &loc(&["newdir"]));
   }
+
+  /// A live inotify (descending) scope, spawned and root-armed, with its birth
+  /// refresh fed — the comparison peer for the liveness-tick gate. inotify's
+  /// unmount is signalled in-band (`IN_UNMOUNT`), so it must NOT arm the tick.
+  fn live_inotify() -> (DriverCore, ScopeId) {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let effects = drain(&mut core);
+    let root_watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if path.as_path() == Path::new("/r") && watch == parent => Some(*watch),
+        _ => None,
+      })
+      .expect("the descending root arms through the effect path");
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+    (core, scope)
+  }
+
+  /// The composition's one timer: a fanotify scope arms a periodic root-liveness
+  /// deadline (its birth refresh at `at(0)` seeds it at `+LIVENESS`), and the
+  /// tick coming due fires a `RefreshMounts` — the ONLY way a signal-silent
+  /// unmount is ever observed. An inotify scope, whose unmount is in-band, arms
+  /// no such deadline and fires no tick.
+  #[test]
+  fn liveness_tick_refreshes_a_fanotify_root_but_not_an_inotify_one() {
+    let (mut core, _scope) = live_fanotify();
+    assert_eq!(
+      core.poll_timeout(),
+      Some(at(30_000)),
+      "a fanotify scope arms the liveness deadline one interval past its birth refresh"
+    );
+    // Before the deadline: no tick.
+    core.on_timeout(at(29_999));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      0,
+      "the tick does not fire early"
+    );
+    // At the deadline: exactly one refresh, and the deadline re-arms.
+    core.on_timeout(at(30_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "the due tick fires the root-liveness refresh"
+    );
+    assert_eq!(
+      core.poll_timeout(),
+      Some(at(60_000)),
+      "the tick re-arms one interval out"
+    );
+
+    // inotify: no liveness deadline, so no tick ever fires.
+    let (mut core, _scope) = live_inotify();
+    assert_eq!(
+      core.poll_timeout(),
+      None,
+      "an inotify scope arms no liveness deadline (its unmount is in-band)"
+    );
+    core.on_timeout(at(1_000_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      0,
+      "an inotify scope never fires a liveness tick"
+    );
+  }
+
+  /// The tick's payoff end to end: a fanotify root unmounted with no loss (the
+  /// L4.1 quiet case) is caught when the periodic refresh finds it gone — the
+  /// refresh completion runs the same terminal Removed + Rescan + teardown a
+  /// loss-triggered refresh would, but here reached SOLELY by the tick.
+  #[test]
+  fn liveness_tick_finding_root_gone_dies_end_to_end() {
+    let (mut core, scope) = live_fanotify();
+    // The tick comes due and fires the refresh — no loss, no birth, just time.
+    core.on_timeout(at(30_000));
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      1,
+      "the tick armed the refresh: {effects:?}"
+    );
+    // The refresh executor comes back with the root GONE (the quiet unmount).
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Missing,
+      },
+      at(30_001),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 2, "{effects:?}");
+    assert!(emitted[0].kind().is_removed(), "a gone root is a Removed");
+    assert!(
+      emitted[1].kind().is_rescan(),
+      "the tick-detected death is never silent"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead root's stream tears down: {effects:?}"
+    );
+  }
+
+  /// `Duration::ZERO` disables the tick: a fanotify scope then arms NO liveness
+  /// deadline, so a quiet unmount is only ever caught by the loss-triggered
+  /// refresh (the pre-L4.2 behavior). The loss path itself is unaffected.
+  #[test]
+  fn liveness_interval_zero_disables_the_tick() {
+    let mut core = DriverCore::new(WINDOW, Duration::ZERO);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.poll_timeout(),
+      None,
+      "a zero interval arms no liveness deadline"
+    );
+    core.on_timeout(at(10_000_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      0,
+      "no tick ever fires when the interval is zero"
+    );
+    // The loss-triggered refresh still works with the tick disabled.
+    core.on_root_overflow(scope, at(1));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "the loss path still arms a refresh regardless of the tick"
+    );
+  }
 }
 
 /// `Backend::Auto` resolves the backend only once the source has spawned, so
@@ -3327,7 +3632,7 @@ mod auto_selection {
   /// the KR profile is the one now running.
   #[test]
   fn auto_provisional_inotify_adopts_probed_fanotify() {
-    let mut core = DriverCore::new(WINDOW);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
     let _ = drain(&mut core);
     core.on_stream_spawned(
@@ -3386,7 +3691,7 @@ mod auto_selection {
   /// forced inotify would.
   #[test]
   fn auto_provisional_inotify_keeps_inotify_on_fallback() {
-    let mut core = DriverCore::new(WINDOW);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
     let _ = drain(&mut core);
     core.on_stream_spawned(

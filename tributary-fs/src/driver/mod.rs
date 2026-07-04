@@ -63,6 +63,11 @@ pub(crate) struct DriverConfig {
   /// Ignored on macOS. The Monitor profile above is provisional until this
   /// resolves.
   pub(crate) backend: Backend,
+  /// The periodic root-liveness deadline for signal-silent-on-unmount backends
+  /// (fanotify): the driver re-stats such a root on this cadence so a quiet
+  /// unmount — which emits no kernel signal and no loss — is still detected.
+  /// [`Duration::ZERO`] disables the tick.
+  pub(crate) root_liveness_interval: Duration,
 }
 
 impl DriverConfig {
@@ -841,7 +846,10 @@ pub(crate) async fn run<R, F>(
   R: RuntimeLite,
   F: FsOps,
 {
-  let mut core = DriverCore::new(config.effective_move_window());
+  let mut core = DriverCore::new(
+    config.effective_move_window(),
+    config.root_liveness_interval,
+  );
   let origin = R::now();
   let now = move || Instant::from_origin(R::now().duration_since(origin));
   // Unbounded so the blocking pool reports results with a plain `try_send`

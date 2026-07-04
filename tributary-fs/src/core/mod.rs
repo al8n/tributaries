@@ -21,6 +21,27 @@
 //! VETOES trust — its mutations are monotone within a batch (adds early,
 //! removals late) — and any loss signal revokes its authority until a fresh
 //! read of the live table is installed.
+//!
+//! # Root-death signals per backend
+//!
+//! Every backend's root death — unmount, delete, or replace — must reach a
+//! trigger that runs [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed)'s
+//! death mapping or the Monitor's self-event path; the trigger differs by
+//! backend, and one backend's unmount is signal-silent, which the periodic tick
+//! ([`root_liveness_interval`](DriverCore::new)) exists to cover:
+//!
+//! | backend | root unmount trigger | in-tree delete/replace trigger |
+//! |---|---|---|
+//! | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` event | `IN_DELETE_SELF` / `IN_MOVE_SELF` event |
+//! | FSEvents (macOS) | `RootChanged` flag → root-alive probe | `RootChanged` flag → root-alive probe |
+//! | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** — no event, no hangup (the mark holds the sb alive; L4.1) → the **periodic liveness tick** re-stats the root | `FAN_DELETE_SELF` / `FAN_MOVE_SELF` event |
+//!
+//! Only fanotify's unmount emits nothing in-band, so only fanotify arms the
+//! tick (gated by [`liveness_ticked`](DriverCore::liveness_ticked)). Its in-tree
+//! self-events, and every other backend's death signal, already lower a
+//! terminal `Removed`/`Rescan` through the existing paths; the tick's role is
+//! solely to make the quiet unmount observable within a bounded latency — a
+//! loss-triggered refresh already catches it immediately when one occurs.
 
 use std::{
   collections::{BTreeMap, VecDeque},
@@ -394,6 +415,25 @@ struct ScopeState {
   park: Park,
   /// The journal id counter wrapped; any minted resume token is invalid.
   resume_poisoned: bool,
+  /// Whether public delivery has begun — the never-live fence's real fact. A
+  /// scope is publicly live once its CALLER holds a handle: for a kernel-
+  /// recursive backend that is the spawn (the live stream is the coverage, the
+  /// grant commits inline), but for a descending backend it is the ROOT ARM
+  /// SUCCESS, not the spawn — the source starts with no watches, so `root`
+  /// being populated at spawn does NOT yet mean anything is delivered. The
+  /// [`DeferredGrant`](crate::driver::DeferredGrant) dates the caller's handle
+  /// from the same root arm, so a root arm that FAILS answers the caller `Err`
+  /// and leaves this `false`: [`route_event`](DriverCore::route_event) then
+  /// drops the Monitor's internal failure `Rescan` instead of emitting a public
+  /// event for a registration no one owns.
+  publicly_live: bool,
+  /// When this scope's root is next re-stat'd for liveness, for a
+  /// signal-silent-on-unmount backend (fanotify) under a non-zero interval.
+  /// `None` for every other backend, before the root goes live, and while the
+  /// tick is disabled — the loss-triggered refresh remains its own path. Seeded
+  /// once the birth refresh confirms the root alive and re-armed by
+  /// [`on_timeout`](DriverCore::on_timeout) after each tick fires.
+  liveness_deadline: Option<Instant>,
 }
 
 impl ScopeState {
@@ -445,11 +485,18 @@ pub(crate) struct DriverCore {
   /// only needs to pair the two records emitted adjacently — a fresh counter
   /// per rename suffices and never clashes across renames.
   cookie_seq: u64,
+  /// How often a signal-silent-on-unmount scope (fanotify) re-stats its root:
+  /// the composition's one timer (see the per-backend death-signal table in the
+  /// module docs). `Duration::ZERO` disables the tick — only the loss-triggered
+  /// refresh then detects a quiet unmount. Every non-fanotify scope ignores it.
+  root_liveness_interval: Duration,
 }
 
 impl DriverCore {
-  /// Builds a core whose Monitor pairs renames within `move_window`.
-  pub(crate) fn new(move_window: Duration) -> Self {
+  /// Builds a core whose Monitor pairs renames within `move_window` and re-stats
+  /// each signal-silent scope's root every `root_liveness_interval`
+  /// (`Duration::ZERO` disables that tick).
+  pub(crate) fn new(move_window: Duration, root_liveness_interval: Duration) -> Self {
     let mut monitor = Monitor::new(caps_for(BackendKind::FsEvents));
     monitor.set_move_window(move_window);
     Self {
@@ -464,7 +511,27 @@ impl DriverCore {
       scope_seq: 0,
       probe_seq: 0,
       cookie_seq: 0,
+      root_liveness_interval,
     }
+  }
+
+  /// Whether `profile` is a backend that emits NO in-band signal when its root
+  /// is unmounted — the gate for the periodic root-liveness tick.
+  ///
+  /// The per-backend death-signal table (design §7; the module docs restate it):
+  ///
+  /// | backend | root unmount | root delete/replace in-tree | tick needed |
+  /// |---|---|---|---|
+  /// | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` | `IN_DELETE_SELF`/`IN_MOVE_SELF` | no |
+  /// | FSEvents (macOS) | `RootChanged` | `RootChanged` | no |
+  /// | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** (fd goes quiet, mark holds the sb alive — L4.1) | `FAN_DELETE_SELF`/`FAN_MOVE_SELF` | **yes** |
+  ///
+  /// Only fanotify's unmount is signal-silent, so only fanotify arms the tick;
+  /// its in-tree self-events and every other backend's death signal already
+  /// reach [`on_mounts_refreshed`](Self::on_mounts_refreshed)'s death mapping
+  /// (via a loss-triggered refresh) or the Monitor's self-event path directly.
+  const fn liveness_ticked(profile: BackendKind) -> bool {
+    matches!(profile, BackendKind::Fanotify)
   }
 
   /// Mints the next `FAN_RENAME` pairing cookie.
@@ -502,6 +569,8 @@ impl DriverCore {
         lag: LagState::Normal,
         park: Park::default(),
         resume_poisoned: false,
+        publicly_live: false,
+        liveness_deadline: None,
       },
     );
     self.watch_scopes.insert(watch, scope);
@@ -552,10 +621,12 @@ impl DriverCore {
         Self::arm_refresh(&mut self.effects, scope, state);
         match backend {
           // Kernel-recursive: the live stream IS the root's coverage, so the
-          // spawn doubles as the root's watch-result. fanotify's one
+          // spawn doubles as the root's watch-result AND the moment the caller's
+          // grant commits inline — public delivery begins here. fanotify's one
           // superblock mark covers the whole root exactly like FSEvents.
           BackendKind::FsEvents | BackendKind::Fanotify => {
-            self.monitor.on_watch_result(watch, Ok(()))
+            state.publicly_live = true;
+            self.monitor.on_watch_result(watch, Ok(()));
           }
           // Descending: the source starts with NO watches (nothing may be
           // delivered before the Monitor's own watch flow runs), so the
@@ -623,6 +694,21 @@ impl DriverCore {
       WatchOutcome::Installed(_) | WatchOutcome::Aliased(_) => Ok(()),
       WatchOutcome::Failed(err) => Err(err),
     };
+    // A descending scope's ROOT arm succeeding is the moment its coverage — and
+    // its caller's handle (the deferred grant commits on this same result) —
+    // become real: public delivery begins here, exactly like the KR spawn does
+    // inline. `watch == state.watch` is precisely the root's own watch (the root
+    // arms with `parent == watch == the scope's root watch`), so a CHILD arm
+    // never flips this. A FAILED root arm leaves `publicly_live` false, so the
+    // Monitor's ensuing failure `Rescan` is fenced out of the effect queue — the
+    // caller got `Err`, never a handle, so there is no public view to cover.
+    if res.is_ok()
+      && let Some(&scope) = self.watch_scopes.get(&watch)
+      && let Some(state) = self.scopes.get_mut(&scope)
+      && state.watch == watch
+    {
+      state.publicly_live = true;
+    }
     self.monitor.on_watch_result(watch, res);
     self.drain_monitor();
   }
@@ -826,6 +912,20 @@ impl DriverCore {
     effects.push_back(Effect::RefreshMounts { scope, root });
   }
 
+  /// (Re)arms the periodic root-liveness deadline for a signal-silent scope
+  /// whose root is live, or clears it when the tick does not apply (a non-
+  /// fanotify backend, `Duration::ZERO`, or a root not yet live). Called on
+  /// every alive mount-refresh completion so birth seeds it and each refresh
+  /// re-seeds it, and after [`on_timeout`](Self::on_timeout) fires a tick. Takes
+  /// `interval` explicitly (like [`arm_refresh`](Self::arm_refresh) takes
+  /// `effects`) so it composes with a `&mut ScopeState` borrowed out of
+  /// `self.scopes`.
+  fn arm_liveness(state: &mut ScopeState, interval: Duration, now: Instant) {
+    state.liveness_deadline =
+      (Self::liveness_ticked(state.profile) && !interval.is_zero() && state.root.is_some())
+        .then(|| now + interval);
+  }
+
   /// Feeds one mount-table refresh result: updates device trust AND checks the
   /// root's liveness (folded into the same refresh — a kernel-recursive backend
   /// gets no in-tree unmount signal, so this cadence is its root-death check).
@@ -835,6 +935,7 @@ impl DriverCore {
     refresh: MountRefresh,
     now: Instant,
   ) {
+    let interval = self.root_liveness_interval;
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;
     };
@@ -868,6 +969,11 @@ impl DriverCore {
       self.drain_monitor();
       return;
     }
+
+    // The root is alive past the death gate: (re)arm its liveness tick — this
+    // seeds it at the birth refresh and re-seeds it after every later refresh,
+    // regardless of whether the mount table itself could be read below.
+    Self::arm_liveness(state, interval, now);
 
     if !refresh.authoritative {
       // The live table could not be read; trust stays closed (probe-carried
@@ -960,8 +1066,12 @@ impl DriverCore {
     }
   }
 
-  /// Advances time: resolves rename halves whose pairing window elapsed and
-  /// re-arms refused parked deliveries whose retry deadline passed.
+  /// Advances time: resolves rename halves whose pairing window elapsed,
+  /// re-arms refused parked deliveries whose retry deadline passed, and fires
+  /// the periodic root-liveness re-stat for every signal-silent scope whose
+  /// tick came due (the ONE timer the fanotify composition adds — a quiet
+  /// unmount produces neither a birth nor a loss refresh, so without this the
+  /// death would never be observed).
   pub(crate) fn on_timeout(&mut self, now: Instant) {
     self.monitor.handle_timeout(now);
     for state in self.scopes.values_mut() {
@@ -977,6 +1087,28 @@ impl DriverCore {
         && now.reached(retry_at)
       {
         entry.attempt = Attempt::Idle;
+      }
+    }
+    // Fire due liveness ticks: each arms the existing `RefreshMounts` (whose
+    // completion runs the root-death mapping) and re-arms the deadline for the
+    // next interval. Collected first so `arm_refresh` can take `&mut effects`
+    // while each scope is mutated in turn. A refresh already in flight coalesces
+    // (arm_refresh sets `refresh_stale`), so a tick never stacks effects.
+    let interval = self.root_liveness_interval;
+    let due: Vec<ScopeId> = self
+      .scopes
+      .iter()
+      .filter_map(|(scope, state)| {
+        state
+          .liveness_deadline
+          .filter(|deadline| now.reached(*deadline))
+          .map(|_| *scope)
+      })
+      .collect();
+    for scope in due {
+      if let Some(state) = self.scopes.get_mut(&scope) {
+        Self::arm_refresh(&mut self.effects, scope, state);
+        Self::arm_liveness(state, interval, now);
       }
     }
     self.drain_monitor();
@@ -1024,9 +1156,9 @@ impl DriverCore {
     None
   }
 
-  /// The earliest instant [`on_timeout`](Self::on_timeout) has work to do:
-  /// the Monitor's pairing deadline or a parked delivery's retry, whichever
-  /// comes first.
+  /// The earliest instant [`on_timeout`](Self::on_timeout) has work to do: the
+  /// Monitor's pairing deadline, a parked delivery's retry, or a scope's next
+  /// root-liveness re-stat, whichever comes first.
   pub(crate) fn poll_timeout(&self) -> Option<Instant> {
     let retry = self
       .scopes
@@ -1042,6 +1174,12 @@ impl DriverCore {
         Attempt::Spent { retry_at } => Some(retry_at),
         _ => None,
       }))
+      .chain(
+        self
+          .scopes
+          .values()
+          .filter_map(|state| state.liveness_deadline),
+      )
       .min();
     match (self.monitor.poll_timeout(), retry) {
       (Some(monitor), Some(retry)) => Some(if monitor.reached(retry) {
@@ -1060,6 +1198,13 @@ impl DriverCore {
       .scopes
       .get(&scope)
       .is_some_and(|state| state.resume_poisoned)
+  }
+
+  /// Whether `scope` has a pending terminal `Rescan` in the dying set — a
+  /// never-live scope must never appear here.
+  #[cfg(test)]
+  pub(crate) fn dying_contains(&self, scope: ScopeId) -> bool {
+    self.dying.contains_key(&scope)
   }
 
   /// Settles a fully-resolved batch: grants evidenced vanished-half cookies,
@@ -1567,9 +1712,12 @@ impl DriverCore {
             //
             // A NEVER-LIVE scope promotes nothing: its caller got Err, not a
             // handle, so there is no consumer view to cover (the route_event
-            // fence already kept its changes out of the effect queue).
+            // fence already kept its changes out of the effect queue). The fact
+            // is `publicly_live` — a descending scope whose root arm failed
+            // populated `root` at spawn yet is not publicly live, so it must not
+            // promote a terminal `Rescan` for a registration no one owns.
             let removed = self.scopes.remove(&scope);
-            let live = removed.as_ref().is_some_and(|state| state.root.is_some());
+            let live = removed.as_ref().is_some_and(|state| state.publicly_live);
             let parked = removed.and_then(|state| {
               let root = state.delivery_root();
               match state.lag {
@@ -1651,13 +1799,16 @@ impl DriverCore {
       }
       return;
     };
-    // NEVER-LIVE FENCE: a scope whose stream never spawned (spawn failure,
-    // final-root rejection) owes the consumer nothing — watch() resolves Err
-    // and the caller never received the handle these changes would carry.
-    // The Monitor's own failure Rescan for such a root is internal
-    // bookkeeping, not public coverage; delivering it would tell a consumer
-    // to rescan a root that was never watched.
-    if state.root.is_none() {
+    // NEVER-LIVE FENCE: a scope whose public delivery never began owes the
+    // consumer nothing — its watch() resolved Err (a spawn failure, a final-root
+    // rejection, or a descending ROOT-ARM failure) and the caller never received
+    // the handle these changes would carry. The Monitor's own failure Rescan for
+    // such a root is internal bookkeeping, not public coverage; delivering it
+    // would tell a consumer to rescan a root that was never watched. The fact is
+    // `publicly_live`, NOT `root.is_some()`: a descending scope populates `root`
+    // at spawn but is not publicly live until its root arm succeeds, so a failed
+    // root arm (whose `Err` the deferred grant already delivered) is fenced here.
+    if !state.publicly_live {
       return;
     }
     match &mut state.lag {

@@ -25,6 +25,10 @@ fn config() -> DriverConfig {
     exclusions: Vec::new(),
     profile: BackendKind::FsEvents,
     backend: Backend::Auto,
+    // Inert for the FSEvents/inotify driver suites (only fanotify arms the
+    // tick, and the fake spawns never resolve fanotify); a fanotify-specific
+    // driver test overrides it.
+    root_liveness_interval: Duration::from_secs(30),
   }
 }
 
@@ -1473,5 +1477,161 @@ mod descending {
     change: &Change,
   ) {
     apply(rig, view, last_epoch, root, change);
+  }
+
+  /// An inotify rig writing transitions into `registry`, for the deferred-grant
+  /// never-live assertions.
+  fn inotify_rig_with(registry: RecordingRegistry) -> Rig {
+    let fs = FakeFs::new(1);
+    fs.put("/r", FileKind::Dir, 1);
+    fs.spawn_backend(BackendKind::Inotify);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      inotify_config(),
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      registry,
+    ));
+    Rig {
+      fs,
+      commands: cmd_tx,
+      events: ev_rx,
+    }
+  }
+
+  /// A descending scope is publicly live only once its ROOT ARM SUCCEEDS — the
+  /// deferred grant commits there, so a FAILED root arm answers the caller `Err`
+  /// and emits NOTHING. Without the deferred-aware fence the Monitor's root-watch
+  /// failure would promote a terminal `Rescan` and DELIVER it (the scope's `root`
+  /// is populated at spawn), a public event for a registration whose caller never
+  /// got a handle. Draining well past every timer deadline still yields zero
+  /// events — a never-live scope arms no dying-retry either.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn failed_root_arm_answers_err_and_emits_nothing() {
+    let registry = RecordingRegistry::default();
+    let rig = inotify_rig_with(registry.clone());
+    // The ROOT arm fails: the object vanished between the validated spawn and
+    // the (absolute-path) open.
+    rig
+      .fs
+      .fail_watch_at("/r", tributary_proto::WatchError::NotFound);
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from("/r"),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    let err = on_reply
+      .await
+      .expect("the watch replies")
+      .expect_err("a failed root arm resolves the caller Err");
+    assert!(
+      matches!(err, WatchRootError::NotFound { .. }),
+      "the arm failure lowers to the registration vocabulary: {err:?}"
+    );
+
+    // The scope went registry-live at spawn (before the arm), then dead when the
+    // failed arm tore it down — reclaimed, never lingering.
+    settle(|| !registry.dead().is_empty()).await;
+    let scope = registry
+      .live()
+      .first()
+      .map(|(scope, _, _)| *scope)
+      .expect("the scope was recorded live at spawn");
+    assert_eq!(
+      registry.dead(),
+      [scope],
+      "a failed-root-arm scope is reclaimed via scope_dead"
+    );
+
+    // ZERO public events: the never-live fence dropped the Monitor's internal
+    // failure Rescan, so nothing was ever queued. A never-live scope promotes no
+    // terminal Rescan either, so there is no dying-retry timer to leak through —
+    // draining under real-clock timeouts stays empty.
+    for _ in 0..10 {
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+      tokio::time::timeout(Duration::from_millis(200), rig.events.recv())
+        .await
+        .is_err(),
+      "a never-publicly-live scope emits no event, ever"
+    );
+  }
+
+  /// Closing while a root arm is still PENDING keeps the scope silent: the arm
+  /// never resolves, so the scope never became publicly live — the deferred grant
+  /// resolves `Err` at teardown and the fence drops any Monitor bookkeeping.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_during_pending_root_arm_stays_silent() {
+    let registry = RecordingRegistry::default();
+    let rig = inotify_rig_with(registry.clone());
+    // Hold every arm on the blocking pool: the ROOT arm parks, so the scope is
+    // spawned-and-registry-live but not yet publicly live.
+    let hold = rig.fs.hold_arms();
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from("/r"),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    // Wait until the scope is spawned (registry-live) with its root arm parked.
+    settle(|| !registry.live().is_empty()).await;
+
+    let (creply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: creply })
+      .await
+      .unwrap();
+    let _ = on_close.await.expect("close replies");
+    hold.release();
+
+    // The caller never receives a handle — the pending grant resolves to a
+    // failure (a sent `Err`, or the reply sender dropped at close, which is
+    // `Canceled`); either way it is NOT an `Ok(grant)`, so nothing went publicly
+    // live. And no public event was ever emitted.
+    let resolved = on_reply.await;
+    assert!(
+      !matches!(resolved, Ok(Ok(_))),
+      "a scope closed before its root armed never hands back a live grant: {resolved:?}"
+    );
+    assert!(
+      matches!(
+        tokio::time::timeout(Duration::from_millis(200), rig.events.recv()).await,
+        Err(_) | Ok(Err(_))
+      ),
+      "a scope closed before going publicly live emits nothing"
+    );
+  }
+
+  /// A SUCCESSFUL root arm still delivers normally — the fence opens exactly at
+  /// the arm, so the cold-inventory `Created`s (and later live records) flow.
+  /// The regression guard that the deferred-aware fence did not over-tighten.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn successful_root_arm_delivers_normally() {
+    let rig = inotify_rig();
+    rig.fs.put("/r/present.txt", FileKind::File, 10);
+    let _scope = watch(&rig, "/r").await;
+    // The cold inventory after the successful root arm reaches the consumer.
+    loop {
+      let (_scope, change) = next_event(&rig).await;
+      if change.kind().is_created() && change.location() == &loc(&["present.txt"]) {
+        break;
+      }
+    }
   }
 }

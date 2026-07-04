@@ -312,52 +312,15 @@ fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> io::Result<Vec<SeedEn
   Ok(seed)
 }
 
-/// Reads `path`'s file handle via `name_to_handle_at` and pairs it with the
-/// superblock `fsid` into a [`Fid`] whose byte-form matches the kernel's event
-/// FIDs exactly (`handle` = type word + opaque bytes). `None` when the
-/// filesystem cannot encode a handle for this object.
+/// Reads `path`'s file handle via the shared dynamically-sized
+/// [`encode_handle`](super::encode_handle) and pairs it with the superblock
+/// `fsid` into a [`Fid`] whose byte-form matches the kernel's event FIDs exactly
+/// (`handle` = type word + opaque bytes). `None` when the filesystem cannot
+/// encode a handle for this object — including a handle too large for even the
+/// grown buffer, which `encode_handle` resolves by retrying at the
+/// kernel-reported size rather than failing on the fixed `MAX_HANDLE_SZ`.
 fn handle_fid(path: &Path, fsid: [u8; 8]) -> Option<Fid> {
-  let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
-  // `struct file_handle` is a flexible-array type: a fixed prefix
-  // (handle_bytes, handle_type) followed by handle_bytes of opaque data.
-  // Over-allocate MAX_HANDLE_SZ and set the capacity field before the call.
-  // The backing buffer is `u64` so the pointer is 8-aligned — a `Vec<u8>` is
-  // only 1-aligned, and writing a `file_handle` (align 4) through such a
-  // pointer would be undefined behavior.
-  let prefix = std::mem::size_of::<libc::file_handle>();
-  let cap = libc::MAX_HANDLE_SZ as usize;
-  let words = prefix.div_ceil(8) + cap.div_ceil(8) + 1;
-  let mut storage = vec![0u64; words];
-  let mut mount_id: libc::c_int = 0;
-  let handle = storage.as_mut_ptr().cast::<libc::file_handle>();
-  // SAFETY: storage is 8-aligned and sized for the fixed prefix plus
-  // MAX_HANDLE_SZ opaque bytes; this write stays within it.
-  unsafe {
-    (*handle).handle_bytes = cap as libc::c_uint;
-  }
-  // SAFETY: handle points at a correctly-sized, aligned file_handle; cpath is
-  // NUL-terminated; mount_id is a valid out-param.
-  let rc =
-    unsafe { libc::name_to_handle_at(libc::AT_FDCWD, cpath.as_ptr(), handle, &mut mount_id, 0) };
-  if rc != 0 {
-    return None;
-  }
-  // SAFETY: the call succeeded, so the prefix and handle_bytes opaque bytes are
-  // initialized.
-  let (handle_bytes, handle_type) =
-    unsafe { ((*handle).handle_bytes as usize, (*handle).handle_type) };
-  if handle_bytes > cap {
-    return None;
-  }
-  // SAFETY: the opaque handle begins right after the prefix and spans
-  // handle_bytes (bounded by cap above); reading it as bytes is in-range.
-  let opaque =
-    unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>().add(prefix), handle_bytes) };
-
-  let mut bytes = Vec::with_capacity(4 + opaque.len());
-  bytes.extend_from_slice(&handle_type.to_ne_bytes());
-  bytes.extend_from_slice(opaque);
-  Some(Fid::new(fsid, bytes.into_boxed_slice()))
+  super::encode_handle(path).map(|handle| Fid::new(fsid, handle))
 }
 
 /// A NUL-terminated C string for a path, or a typed spawn error on an embedded

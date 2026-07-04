@@ -17,6 +17,11 @@ fn default_delegates_to_new() {
   assert!(opts.exclusions_slice().is_empty());
   assert_eq!(opts.backend(), WatcherOptions::DEFAULT_BACKEND);
   assert_eq!(opts.backend(), Backend::Auto);
+  assert_eq!(
+    opts.root_liveness_interval(),
+    WatcherOptions::DEFAULT_ROOT_LIVENESS_INTERVAL
+  );
+  assert_eq!(opts.root_liveness_interval(), Duration::from_secs(30));
 }
 
 #[test]
@@ -27,7 +32,8 @@ fn builders_and_setters_agree() {
     .with_event_capacity(NonZeroUsize::new(8).unwrap())
     .with_os_batch_capacity(NonZeroUsize::new(4).unwrap())
     .with_exclusions(vec![PathBuf::from("/tmp/skip")])
-    .with_backend(Backend::Fanotify);
+    .with_backend(Backend::Fanotify)
+    .with_root_liveness_interval(Duration::from_secs(5));
 
   let mut set = WatcherOptions::new();
   set
@@ -36,11 +42,23 @@ fn builders_and_setters_agree() {
     .set_event_capacity(NonZeroUsize::new(8).unwrap())
     .set_os_batch_capacity(NonZeroUsize::new(4).unwrap())
     .set_exclusions(vec![PathBuf::from("/tmp/skip")])
-    .set_backend(Backend::Fanotify);
+    .set_backend(Backend::Fanotify)
+    .set_root_liveness_interval(Duration::from_secs(5));
 
   assert_eq!(built, set);
   assert_eq!(built.exclusions_slice().len(), 1);
   assert_eq!(built.backend(), Backend::Fanotify);
+  assert_eq!(built.root_liveness_interval(), Duration::from_secs(5));
+}
+
+#[test]
+fn root_liveness_interval_zero_disables_the_tick() {
+  let opts = WatcherOptions::new().with_root_liveness_interval(Duration::ZERO);
+  assert_eq!(
+    opts.root_liveness_interval(),
+    Duration::ZERO,
+    "ZERO is a legal disabling value"
+  );
 }
 
 #[test]
