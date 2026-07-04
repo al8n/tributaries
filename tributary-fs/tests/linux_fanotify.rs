@@ -715,6 +715,135 @@ async fn racing_swap_to_outside_dir_never_admits_foreign_subtree() {
   }
 }
 
+/// Suite 12 (spawn pin, RACE) — the best-effort race guard for the ROOT-PATH
+/// swap the spawn pin closes. Marking the superblock via `AT_FDCWD` + the
+/// canonical root PATHNAME let a symlink swapped in at the root path for that one
+/// `fanotify_mark` call mark the WRONG superblock, and since every later check
+/// re-read the restored path, the source went live with a complete FID map for
+/// the intended root while the kernel fd listened elsewhere — no events, no
+/// overflow, no death. Pinning the root once (`openat2 RESOLVE_NO_SYMLINKS`) and
+/// marking fd-relative on the pin makes a swap in that window fail the pin typed
+/// rather than aim the mark at another superblock.
+///
+/// The property is HONESTY under the race: for every `Backend::Auto` spawn that
+/// returns a live watcher, a marker written under the watched root MUST be
+/// delivered within the deadline — OR the spawn must have failed. The one outcome
+/// the fix forbids is a live-but-listening-elsewhere source: a live handle whose
+/// root's own writes never surface. Best-effort by nature (winning the swap window
+/// is timing-dependent), so it repeats; a single blind live handle fails it.
+#[tokio::test]
+async fn racing_root_path_swap_never_goes_live_listening_elsewhere() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!(
+      "SKIP racing_root_path_swap_never_goes_live_listening_elsewhere: no ext4 loopback (--privileged)"
+    );
+    return;
+  };
+  if !has_sys_admin() {
+    // Without CAP_SYS_ADMIN Auto never reaches the fanotify mark (it falls back
+    // to inotify), so the mark-on-wrong-sb window this cell targets cannot arise.
+    eprintln!(
+      "SKIP racing_root_path_swap_never_goes_live_listening_elsewhere: no CAP_SYS_ADMIN (Auto would pick inotify)"
+    );
+    return;
+  }
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  // An OTHER local directory on the SAME superblock the swap points the root
+  // symlink at — if the mark ever landed here, writes under the true root would
+  // go silent (the blind bug).
+  let other = scratch_under(&mount, "root-swap-other");
+  std::fs::create_dir_all(&other).unwrap();
+
+  for attempt in 0..10u32 {
+    // A parent holding the root under a STABLE name the loop swaps: `parent/root`
+    // is a real directory, repeatedly renamed away and replaced by a symlink to
+    // `other`, then restored — the exact canonical-root path swap the mark once
+    // raced.
+    let parent = scratch_under(&mount, &format!("root-swap-{attempt}"));
+    let root = parent.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let moved_away = parent.join("root-moved");
+    let target = other.clone();
+    let root_in_thread = root.clone();
+
+    let swap_thread = std::thread::spawn(move || {
+      for _ in 0..300 {
+        let _ = std::fs::rename(&root_in_thread, &moved_away);
+        let _ = std::os::unix::fs::symlink(&target, &root_in_thread);
+        let _ = std::fs::remove_file(&root_in_thread);
+        let _ = std::fs::rename(&moved_away, &root_in_thread);
+      }
+    });
+
+    // Spawn Auto DURING the swap churn: its canonicalize→pin→mark sequence races
+    // the loop. Either the pin lands on the true root, or a swap makes the pin
+    // (RESOLVE_NO_SYMLINKS) refuse typed — never a mark on `other`'s superblock.
+    let watcher = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Auto))
+      .expect("build Auto watcher");
+    let watched = watcher.watch(&root, Interest::all()).await;
+    let _ = swap_thread.join();
+
+    // Restore a stable real root so the marker write and its delivery are
+    // deterministic once the churn is over.
+    let _ = std::fs::remove_file(&root);
+    let _ = std::fs::rename(parent.join("root-moved"), &root);
+    if !std::fs::metadata(&root)
+      .map(|m| m.is_dir())
+      .unwrap_or(false)
+    {
+      let _ = std::fs::remove_dir_all(&root);
+      std::fs::create_dir_all(&root).unwrap();
+    }
+
+    let handle = match watched {
+      // A live watcher MUST see its own root's writes — else it is the blind bug.
+      Ok(handle) => handle,
+      // Any typed error is the OTHER legal outcome — nothing went live, so nothing
+      // can be blind. A raced swap can surface as the pin's `RESOLVE_NO_SYMLINKS`
+      // refusal (a `Source` error) OR as `NotFound`/`NotADirectory` when the swap
+      // caught the earlier canonicalize; all are honest. The one thing forbidden is
+      // the watcher having silently died (`Closed`) — the raced spawn must fail
+      // cleanly and leave it usable.
+      Err(err) => {
+        assert!(
+          !matches!(err, tributary_fs::WatchRootError::Closed),
+          "a raced spawn must fail typed and leave the watcher usable, never Closed \
+           (attempt {attempt}): {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+        continue;
+      }
+    };
+
+    // The watcher is live. The invariant a live source must satisfy: a write under
+    // the root IT REPORTS must be delivered. If the mark had landed on `other`'s
+    // superblock (the pre-fix breach) while the reported root stayed the intended
+    // one, this write under the reported root would never surface — precisely the
+    // blindness the pin forbids. (If canonicalize legitimately resolved the root
+    // symlink to `other`, the reported root IS `other` and the write there is
+    // delivered — also correct.) `root_path` returning the intended root but its
+    // writes going silent is the exact failure signature.
+    let watched_root = watcher.root_path(handle).unwrap_or_else(|| root.clone());
+    let mut watcher = watcher;
+    let marker = watched_root.join(format!("marker-{attempt}.txt"));
+    std::fs::create_dir_all(&watched_root).unwrap();
+    std::fs::write(&marker, b"m").unwrap();
+    let delivered = wait_for(&mut watcher, |e| covers(e, &marker))
+      .await
+      .is_some();
+    assert!(
+      delivered,
+      "a live Auto watcher delivered NO event for a write under its own reported root \
+       (attempt {attempt}, reported root {watched_root:?}) — a source went live listening elsewhere"
+    );
+    let _ = watcher.close().await;
+    let _ = std::fs::remove_dir_all(&parent);
+  }
+  let _ = std::fs::remove_dir_all(&other);
+}
+
 /// Suite 11: unmount under watch (design §7 limitation, container-validated).
 ///
 /// A `FAN_MARK_FILESYSTEM` watcher receives NO kernel signal when its

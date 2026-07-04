@@ -141,3 +141,156 @@ fn remote_fs_magics_are_refused_and_local_ones_pass() {
     "overlayfs is local (a probe refusal, not a locality one)"
   );
 }
+
+/// The spawn dispatcher's root pin and the object-grounded identity reads it
+/// hands to both backends. These exercise real syscalls, so they run only on a
+/// Linux host (the container `unit` suite); the pure decode/parse cells above
+/// compile and run everywhere.
+#[cfg(all(target_os = "linux", not(miri)))]
+mod pin {
+  use std::os::unix::fs::MetadataExt;
+
+  use super::super::{ancestor_identities, pin_root, root_is_remote};
+  use crate::os::SourceError;
+
+  /// A fresh empty scratch directory under `TMPDIR`, canonicalized so the pin's
+  /// `RESOLVE_NO_SYMLINKS` open matches a symlink-free path.
+  fn scratch(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir()
+      .canonicalize()
+      .expect("canonicalize temp dir")
+      .join(format!(
+        "tributary-fs-pin-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+  }
+
+  /// The pin over a real directory succeeds and `fstat` on it reads the SAME
+  /// `(dev, ino)` a path `metadata` sees — the object-grounded identity the
+  /// dispatcher hands to both backends is the root's true identity.
+  #[test]
+  fn pin_root_grounds_identity_on_the_true_object() {
+    let dir = scratch("ident");
+    let fd = pin_root(&dir).expect("pinning a real directory succeeds");
+    let stat = rustix::fs::fstat(&fd).expect("fstat the pin");
+    let meta = std::fs::metadata(&dir).expect("stat the path");
+    assert_eq!(stat.st_dev, meta.dev(), "the pin's device is the root's");
+    assert_eq!(stat.st_ino, meta.ino(), "the pin's inode is the root's");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A root that vanished before the pin is a typed `RootUnavailable` race — the
+  /// dispatcher never commits a source on a gone root.
+  #[test]
+  fn pin_root_on_a_missing_path_is_typed() {
+    let dir = scratch("missing");
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = pin_root(&dir).expect_err("a missing root cannot be pinned");
+    assert!(
+      matches!(err, SourceError::RootUnavailable { .. }),
+      "a vanished root is a typed RootUnavailable race, not a panic: {err:?}"
+    );
+  }
+
+  /// A root retargeted to a NON-DIRECTORY fails the pin (`O_DIRECTORY` → ENOTDIR)
+  /// as a typed race — a recursive stream is never committed on a file.
+  #[test]
+  fn pin_root_on_a_non_directory_is_typed() {
+    let dir = scratch("file-parent");
+    let file = dir.join("f");
+    std::fs::write(&file, b"x").expect("create a file");
+    let err = pin_root(&file).expect_err("a non-directory root cannot be pinned");
+    assert!(
+      matches!(err, SourceError::RootUnavailable { .. }),
+      "a non-directory root is a typed refusal: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The pin's whole point: a SYMLINK at the root path is refused by
+  /// `RESOLVE_NO_SYMLINKS` (ELOOP) rather than silently followed to its target. A
+  /// symlink dropped at the canonical root after canonicalization can no longer
+  /// redirect the pin (and thus the gate, the mark, and the identity) to another
+  /// object; it fails typed instead.
+  #[test]
+  fn pin_root_refuses_a_symlink_at_the_root() {
+    let dir = scratch("symlink");
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).expect("create the real dir");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("create a symlink to it");
+    let err = pin_root(&link).expect_err("a symlink at the root must not be followed by the pin");
+    assert!(
+      matches!(err, SourceError::RootUnavailable { .. }),
+      "RESOLVE_NO_SYMLINKS refuses the symlinked root typed, never follows it: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The locality gate reads the PINNED fd: a local temp filesystem is not
+  /// refused. (The denylist itself is row-tested pure above; this asserts the
+  /// fd-relative read path wires through to the same decision.)
+  #[test]
+  fn root_is_remote_reads_the_pin_and_passes_local() {
+    let dir = scratch("local");
+    let fd = pin_root(&dir).expect("pin the local dir");
+    assert!(
+      !root_is_remote(&fd, &dir).expect("fstatfs the pin"),
+      "a local temp filesystem passes the fd-relative locality gate"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The ancestors are object-grounded (`O_PATH` + `RESOLVE_NO_SYMLINKS` + fstat)
+  /// and reproduce the parent chain's true identities — the containment evidence
+  /// disjointness decides on, with no path stat left to a swap.
+  #[test]
+  fn ancestor_identities_reproduce_the_parent_chain() {
+    let base = scratch("anc");
+    let nested = base.join("a/b");
+    std::fs::create_dir_all(&nested).expect("create a nested dir");
+    let ancestors = ancestor_identities(&nested).expect("pin and stat the ancestor chain");
+    // Each strict ancestor's identity matches a path stat of that ancestor.
+    for (ancestor, identity) in nested.ancestors().skip(1).zip(&ancestors) {
+      let meta = std::fs::metadata(ancestor).expect("stat the ancestor path");
+      assert_eq!(identity.dev(), meta.dev(), "ancestor device matches");
+      assert_eq!(identity.ino(), meta.ino(), "ancestor inode matches");
+    }
+    assert_eq!(
+      ancestors.len(),
+      nested.ancestors().skip(1).count(),
+      "every strict ancestor is pinned and identified"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// A symlink swapped in for an ANCESTOR component is refused
+  /// (`RESOLVE_NO_SYMLINKS` → ELOOP) rather than recording the swapped-in
+  /// object's identity — the ancestor chain cannot be corrupted by a mid-path
+  /// symlink swap.
+  #[test]
+  fn ancestor_identities_refuse_a_symlinked_ancestor() {
+    let base = scratch("anc-symlink");
+    let real = base.join("real");
+    std::fs::create_dir_all(real.join("leaf")).expect("create real/leaf");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink link -> real");
+    // `base/link/leaf` reaches a real directory THROUGH a symlinked ancestor
+    // (`link`). The pin over `leaf` would succeed via canonicalize, but walking
+    // the ancestors of this UN-canonicalized path must refuse the symlink hop.
+    let via_link = link.join("leaf");
+    let err = ancestor_identities(&via_link)
+      .expect_err("a symlinked ancestor must be refused, not silently identified");
+    assert!(
+      matches!(err, SourceError::RootUnavailable { .. }),
+      "a symlink swapped in for an ancestor fails the no-symlink open typed: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+  }
+}

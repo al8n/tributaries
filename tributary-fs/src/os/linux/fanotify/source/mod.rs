@@ -29,11 +29,10 @@
 //! with `RESOLVE_NO_SYMLINKS` (kernel floor argued on [`open_walk_dir`]).
 
 use std::{
-  ffi::CString,
   fs, io,
   os::{
-    fd::{AsFd, BorrowedFd, OwnedFd},
-    unix::{ffi::OsStrExt, fs::MetadataExt},
+    fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    unix::fs::MetadataExt,
   },
   path::Path,
   sync::{Arc, mpsc},
@@ -125,12 +124,19 @@ impl Source {
   /// in-root directory it cannot map returns [`FanotifySpawn::NotViable`] (design
   /// §5 `Walk` stage) rather than a live-but-blind source — the caller falls back
   /// to inotify (`Auto`) or surfaces a typed error (forced `Fanotify`).
+  ///
+  /// `root_fd` is the dispatcher's PINNED root — the same object the gate and the
+  /// mark grounded on. The seed fsid, the root identity, the seed walk's root, and
+  /// the post-live liveness re-stat all read it, never the `canonical` pathname,
+  /// so nothing the FID map commits can name an object other than the one the mark
+  /// covers.
   pub(crate) fn spawn(
     config: SourceConfig,
     canonical: std::path::PathBuf,
     fd: OwnedFd,
+    root_fd: BorrowedFd<'_>,
   ) -> FanotifySpawn {
-    match Self::try_spawn(config, canonical, fd) {
+    match Self::try_spawn(config, canonical, fd, root_fd) {
       Ok((handle, rx, meta)) => FanotifySpawn::Started(handle, rx, meta),
       Err(SpawnFailure::Error(err)) => FanotifySpawn::Error(err),
       Err(SpawnFailure::NotViable(config)) => FanotifySpawn::NotViable(config),
@@ -141,6 +147,7 @@ impl Source {
     config: SourceConfig,
     canonical: std::path::PathBuf,
     fd: OwnedFd,
+    root_fd: BorrowedFd<'_>,
   ) -> Result<(SourceHandle, super::super::super::EventReceiver, RootMeta), SpawnFailure> {
     if config.exclusions.len() > MAX_EXCLUSIONS {
       return Err(SpawnFailure::Error(SourceError::TooManyExclusions {
@@ -149,24 +156,24 @@ impl Source {
     }
 
     // The dispatcher's shared locality gate (design §5 row 1) already refused a
-    // remote/virtual root, and the probe's FILESYSTEM mark proved the fs is
-    // handle- and superblock-mark-capable; this statfs only reads the `f_fsid`
-    // the seed FIDs must match byte-for-byte.
-    let fsid = superblock_fsid(&canonical).map_err(SpawnFailure::Error)?;
+    // remote/virtual root off this SAME pin, and the probe's FILESYSTEM mark proved
+    // the fs is handle- and superblock-mark-capable; this fstatfs only reads the
+    // `f_fsid` the seed FIDs must match byte-for-byte — from the pinned fd, so it
+    // names the same superblock the gate saw, no path resolved between them.
+    let fsid = superblock_fsid(root_fd, &canonical).map_err(SpawnFailure::Error)?;
 
-    let meta = fs::metadata(&canonical).map_err(|source| {
+    // The root identity is read from the PIN (fstat), so the registry anchors on
+    // exactly the object the mark covers — not an object a path re-stat could have
+    // been redirected to. `O_DIRECTORY` at pin time already refused a non-directory
+    // root, so this cannot see one.
+    let stat = fstat(root_fd).map_err(|err| {
       SpawnFailure::Error(SourceError::RootUnavailable {
         root: canonical.clone(),
-        source,
+        source: err.into(),
       })
     })?;
-    if !meta.is_dir() {
-      return Err(SpawnFailure::Error(SourceError::NotADirectory {
-        root: canonical,
-      }));
-    }
-    let root_dev = meta.dev();
-    let identity = RootIdentity::new(meta.dev(), meta.ino());
+    let root_dev = stat.st_dev;
+    let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
     let mounts = mounts_under(&canonical).unwrap_or_default();
 
     // Seed the map by walking the root: every directory's FID (built from the
@@ -182,7 +189,11 @@ impl Source {
       root_dev,
     };
     let mut map = FidMap::new();
-    let seed = reseed.walk_typed().map_err(|err| match err {
+    // The SPAWN seed roots at the pin (a dup of it, consumed by the descent), so
+    // the root level never re-resolves `canonical` after the mark went live. The
+    // live reseed inside the reader has no pin to inherit and re-opens the path
+    // itself (`RESOLVE_NO_SYMLINKS`), the documented reseed shape.
+    let seed = reseed.seed_at_fd(root_fd).map_err(|err| match err {
       // The tree is not fully walkable: fanotify is not viable. Hand `config`
       // back so the dispatcher can fall back (Auto) or type the error (forced).
       WalkError::Incomplete(_) => SpawnFailure::NotViable(config.clone()),
@@ -216,9 +227,36 @@ impl Source {
       thread: Some(thread),
     };
 
-    // The post-live half of the identity bracket: the mark is already live, so
-    // the re-stat proves the object survived the barrier→reader gap and the
-    // registry identity names the same object the stream reports on.
+    // The post-live half of the identity bracket, TWO complementary signals now
+    // the mark is live:
+    //
+    // - The PINNED-fd re-stat (same-object liveness): fstat the very fd the mark,
+    //   seed, and identity all grounded on. It re-reads that one object and must
+    //   still equal the captured identity — proof the object the FID map seeded and
+    //   the object the mark covers are the object the registry will anchor on, with
+    //   no path resolved to be swapped.
+    // - The PATH re-stat (replaced-at-path): metadata(&canonical) then asks the
+    //   distinct question `RootReplaced` names — does the path still resolve to
+    //   that same object? A path swapped to a different object between pin and now
+    //   keeps its bytes but names another `(dev, ino)`, which the mount-refresh /
+    //   death-lifecycle machinery (which re-resolves the root BY PATH) must reject
+    //   up front rather than track a root the consumer can no longer reach by name.
+    let pinned = match fstat(root_fd) {
+      Ok(pinned) => pinned,
+      Err(err) => {
+        handle.shutdown();
+        return Err(SpawnFailure::Error(SourceError::RootUnavailable {
+          root: canonical,
+          source: err.into(),
+        }));
+      }
+    };
+    if RootIdentity::new(pinned.st_dev, pinned.st_ino) != identity {
+      handle.shutdown();
+      return Err(SpawnFailure::Error(SourceError::RootReplaced {
+        root: canonical,
+      }));
+    }
     let live = match fs::metadata(&canonical) {
       Ok(live) => live,
       Err(source) => {
@@ -241,19 +279,13 @@ impl Source {
         root: canonical,
       }));
     }
-    let mut ancestors = Vec::new();
-    for ancestor in canonical.ancestors().skip(1) {
-      match fs::metadata(ancestor) {
-        Ok(meta) => ancestors.push(RootIdentity::new(meta.dev(), meta.ino())),
-        Err(source) => {
-          handle.shutdown();
-          return Err(SpawnFailure::Error(SourceError::RootUnavailable {
-            root: ancestor.to_path_buf(),
-            source,
-          }));
-        }
+    let ancestors = match super::super::ancestor_identities(&canonical) {
+      Ok(ancestors) => ancestors,
+      Err(err) => {
+        handle.shutdown();
+        return Err(SpawnFailure::Error(err));
       }
-    }
+    };
 
     let meta = RootMeta {
       root: canonical,
@@ -267,22 +299,27 @@ impl Source {
   }
 }
 
-/// Reads `path`'s superblock `f_fsid` bytes — the event-FID scope, laid out so
-/// seed FIDs match event FIDs byte-for-byte. The locality `f_type` refusal is
-/// not repeated here: the dispatcher runs it once, before backend selection
-/// (design §5 row 1), so a remote/virtual root never reaches this spawn.
+/// Reads the PINNED root's superblock `f_fsid` bytes — the event-FID scope, laid
+/// out so seed FIDs match event FIDs byte-for-byte. Read fd-relative (libc
+/// `fstatfs` on the same fd the gate and mark grounded on), so the fsid names the
+/// same superblock the gate saw with no path resolved between them. The locality
+/// `f_type` refusal is not repeated here: the dispatcher runs it once off this
+/// pin, before backend selection (design §5 row 1), so a remote/virtual root
+/// never reaches this spawn.
 ///
-/// Stays on libc `statfs`: rustix's `StatFs` keeps `f_fsid` behind a private
+/// Stays on libc `fstatfs`: rustix's `StatFs` keeps `f_fsid` behind a private
 /// field with no accessor, so the FID-seeding fsid — like the sibling
-/// `name_to_handle_at` handle read — cannot be sourced through it. This whole
-/// FID-seed path is the libc side of the two-style boundary (see the module
-/// docs on `os::linux`).
-fn superblock_fsid(path: &Path) -> Result<[u8; 8], SourceError> {
-  let cpath = cstring(path)?;
+/// `name_to_handle_at` handle read — cannot be sourced through it. This is why
+/// the gate (rustix `fstatfs`, reads `f_type`) and the fsid (libc `fstatfs`,
+/// reads `f_fsid`) are two calls on the one pin rather than one: the documented
+/// two-style boundary (see the module docs on `os::linux`), not a race — a pin
+/// admits no swap between them. `path` is carried only to name the root in the
+/// error.
+fn superblock_fsid(root_fd: BorrowedFd<'_>, path: &Path) -> Result<[u8; 8], SourceError> {
   let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-  // SAFETY: cpath is a valid NUL-terminated path and buf is a zeroed statfs
-  // the call fully initializes on success.
-  let rc = unsafe { libc::statfs(cpath.as_ptr(), &mut buf) };
+  // SAFETY: root_fd is a live open directory fd and buf is a zeroed statfs the
+  // call fully initializes on success.
+  let rc = unsafe { libc::fstatfs(root_fd.as_raw_fd(), &mut buf) };
   if rc != 0 {
     return Err(SourceError::RootUnavailable {
       root: path.to_path_buf(),
@@ -340,12 +377,19 @@ impl ReseedContext {
     seed_walk(&self.root, self.fsid, self.root_dev).map_err(WalkError::into_io)
   }
 
-  /// The spawn-time walk, keeping the [`WalkError`] class so the dispatcher can
-  /// tell an unwalkable tree (fanotify not viable → fall back / typed error) from
-  /// a vanished root (root-unavailable). Only the pre-live spawn calls this; the
-  /// live reseed uses the `io::Error`-folding [`walk`](Self::walk).
-  fn walk_typed(&self) -> Result<Vec<SeedEntry>, WalkError> {
-    seed_walk(&self.root, self.fsid, self.root_dev)
+  /// The spawn-time seed, rooted at the dispatcher's PINNED root fd rather than a
+  /// re-resolution of the path: the root level of the walk inherits the very
+  /// object the gate, mark, and identity grounded on (a `try_clone` of the pin,
+  /// consumed by the descent), so nothing the map commits can name a different
+  /// object than the mark covers. Every directory BELOW the root is still pinned
+  /// per-child by the fd-relative descent. Keeps the [`WalkError`] class so the
+  /// dispatcher can tell an unwalkable tree (fanotify not viable → fall back /
+  /// typed error) from a vanished root (root-unavailable). Only the pre-live spawn
+  /// calls this; the live reseed re-opens the path via the `io::Error`-folding
+  /// [`walk`](Self::walk).
+  fn seed_at_fd(&self, root_fd: BorrowedFd<'_>) -> Result<Vec<SeedEntry>, WalkError> {
+    let root_fd = root_fd.try_clone_to_owned().map_err(WalkError::RootGone)?;
+    seed_from_fd(root_fd, &self.root, self.fsid, self.root_dev)
   }
 
   /// Walks the subtree rooted at `subtree` (a directory MOVED IN from outside the
@@ -476,16 +520,35 @@ fn open_walk_dir(root: &Path) -> Result<OwnedFd, Errno> {
   )
 }
 
-/// Walks `root` depth-first, producing a [`SeedEntry`] per directory on the
-/// root device — every one an admitted directory, each carrying its parent FID
-/// so the map builds the parent-relative structure directly. A mount boundary
-/// (`st_dev != root_dev`) is not descended: an sb mark never crosses it, so its
-/// subtree lives on a different superblock and never delivers on this fd.
+/// The LIVE-reseed seed walk: re-opens `root` as a pinned fd
+/// ([`open_walk_dir`], `RESOLVE_NO_SYMLINKS`) and seeds from it. The reader owns
+/// no dispatcher pin (the spawn's pin is long dropped), so a loss re-derives the
+/// root fd from the path here — still no-symlink-resolved, so a swap fails the
+/// open rather than redirecting it. The pre-live SPAWN seed instead inherits the
+/// dispatcher's pin directly ([`ReseedContext::seed_at_fd`]); both funnel into the
+/// shared [`seed_from_fd`].
+fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>, WalkError> {
+  // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
+  // handle and its children both come from this fd, never a re-resolved name. A
+  // failure to open it is a race reported as root-unavailable (the probe already
+  // opened it).
+  let root_fd = open_walk_dir(root).map_err(|err| WalkError::RootGone(err.into()))?;
+  seed_from_fd(root_fd, root, fsid, root_dev)
+}
+
+/// Seeds the map from an ALREADY-PINNED root fd, producing a [`SeedEntry`] per
+/// directory on the root device — every one an admitted directory, each carrying
+/// its parent FID so the map builds the parent-relative structure directly. A
+/// mount boundary (`st_dev != root_dev`) is not descended: an sb mark never
+/// crosses it, so its subtree lives on a different superblock and never delivers
+/// on this fd.
 ///
-/// The root is opened as a PINNED fd ([`open_walk_dir`]) and its handle is
-/// encoded from that fd, so nothing about the seed depends on a re-resolvable
-/// name — the objects-not-paths invariant (module docs) holds from the very first
-/// object.
+/// The root fd is the object every seed grounds on — the SPAWN passes the
+/// dispatcher's pin (the gate/mark/identity object), the live reseed passes a
+/// fresh no-symlink open of the path. Its handle is encoded from that fd, so
+/// nothing about the seed depends on a re-resolvable name — the objects-not-paths
+/// invariant (module docs) holds from the very first object; `root` is used only
+/// as the map's stored root-anchor path, never re-opened here.
 ///
 /// Completeness is a fanotify PRECONDITION, not a best-effort target. An admitted
 /// event resolves its directory FID against this map; a directory the walk failed
@@ -501,24 +564,24 @@ fn open_walk_dir(root: &Path) -> Result<OwnedFd, Errno> {
 ///   permission, I/O, an unexportable handle) aborts the walk with
 ///   [`WalkError::Incomplete`]: the tree is not fully mappable, so fanotify is not
 ///   viable for this root.
-/// - A failure to OPEN or handle-encode the ROOT itself is [`WalkError::RootGone`]:
-///   the root anchor is load-bearing, but the probe already proved the root
-///   openable and exportable, so its absence is a race reported as root-unavailable.
+/// - A failure to handle-encode the ROOT itself is [`WalkError::RootGone`]: the
+///   root anchor is load-bearing, but the probe already proved the root openable
+///   and exportable, so its absence is a race reported as root-unavailable.
 ///
-/// The same walk seeds the map at spawn AND reseeds it after a loss; the reseed
-/// path folds every `WalkError` into its terminal blind→fatal escalation (see
+/// The same seed runs at spawn AND reseed; the reseed path folds every
+/// `WalkError` into its terminal blind→fatal escalation (see
 /// [`ReseedContext::walk`]), so an unreadable subtree that survives the reseed's
 /// single retry kills the scope rather than leaving it silently blind.
-fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>, WalkError> {
-  // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
-  // handle and its children both come from this fd, never a re-resolved name. A
-  // failure to open it is a race reported as root-unavailable (the probe already
-  // opened it).
-  let root_fd = open_walk_dir(root).map_err(|err| WalkError::RootGone(err.into()))?;
+fn seed_from_fd(
+  root_fd: OwnedFd,
+  root: &Path,
+  fsid: [u8; 8],
+  root_dev: u64,
+) -> Result<Vec<SeedEntry>, WalkError> {
   // The root anchor is load-bearing: without its handle the map has no base to
   // resolve any path against, so its absence is a spawn/reseed failure, never an
   // empty success. Encoded from the pinned fd, so it names exactly the object we
-  // opened.
+  // pinned.
   let Some(root_fid) = handle_fid_at(root_fd.as_fd(), fsid) else {
     return Err(WalkError::RootGone(io::Error::new(
       io::ErrorKind::Unsupported,
@@ -735,15 +798,6 @@ fn handle_fid_at(dirfd: BorrowedFd<'_>, fsid: [u8; 8]) -> Option<Fid> {
 fn os_name(name: &std::ffi::CStr) -> std::ffi::OsString {
   use std::os::unix::ffi::OsStrExt;
   std::ffi::OsStr::from_bytes(name.to_bytes()).to_os_string()
-}
-
-/// A NUL-terminated C string for a path, or a typed spawn error on an embedded
-/// NUL.
-fn cstring(path: &Path) -> Result<CString, SourceError> {
-  CString::new(path.as_os_str().as_bytes()).map_err(|_| SourceError::RootUnavailable {
-    root: path.to_path_buf(),
-    source: io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"),
-  })
 }
 
 /// A live fanotify source. Dropping it tears the reader down; prefer

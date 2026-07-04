@@ -19,13 +19,7 @@
 //! so the `FAN_MARK_FILESYSTEM` mark — not the init — is the real privilege
 //! discriminator (it is what returns `EPERM` without `CAP_SYS_ADMIN`).
 
-use std::{
-  os::{
-    fd::{AsRawFd, FromRawFd, OwnedFd},
-    unix::ffi::OsStrExt,
-  },
-  path::Path,
-};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use super::{
   super::{ProbeStage, SourceError},
@@ -40,15 +34,20 @@ pub(crate) struct ProbedFanotify {
   pub(crate) fd: OwnedFd,
 }
 
-/// Runs the fanotify precondition probe on the canonical root (design §5 rows
+/// Runs the fanotify precondition probe on the PINNED root fd (design §5 rows
 /// 2–5; row 1, the statfs locality allowlist, is the shared gate the dispatcher
-/// runs once before selection). On success the returned fd is init'd AND marked — the
-/// fanotify source reuses it. On failure the [`ProbeStage`] names the first
-/// stage that failed; the caller decides fall-back vs typed error.
+/// runs once before selection). Both live-state rows ground on `root_fd`, never a
+/// pathname: the `FAN_MARK_FILESYSTEM` mark is installed fd-relative
+/// (`fanotify_mark(ffd, …, root_fd, NULL)`) so it marks the superblock of exactly
+/// the object the dispatcher pinned — a path swap for this one call can no longer
+/// mark the wrong superblock — and the handle row encodes from the same fd
+/// (`AT_EMPTY_PATH`). On success the returned fd is init'd AND marked; the
+/// fanotify source reuses it. On failure the [`ProbeStage`] names the first stage
+/// that failed; the caller decides fall-back vs typed error.
 ///
 /// Every fd opened here is closed before returning on any failure path — a
 /// probe never leaks the instance it was testing.
-pub(crate) fn probe_fanotify(root: &Path) -> Result<ProbedFanotify, ProbeStage> {
+pub(crate) fn probe_fanotify(root_fd: BorrowedFd<'_>) -> Result<ProbedFanotify, ProbeStage> {
   // Row 2/3: create the instance with the full composite. EINVAL/EPERM here is
   // the kernel/filesystem being too old, or the class being unavailable.
   let fd = create_instance().map_err(|()| ProbeStage::Init)?;
@@ -57,12 +56,14 @@ pub(crate) fn probe_fanotify(root: &Path) -> Result<ProbedFanotify, ProbeStage> 
   // flags succeeds on modern kernels; this is what returns EPERM without
   // CAP_SYS_ADMIN (container-validated). The fd drops (closing the instance) on
   // failure via the early return.
-  if mark_filesystem(&fd, root).is_err() {
+  if mark_filesystem(&fd, root_fd).is_err() {
     return Err(ProbeStage::Mark);
   }
 
   // Row 5: the root must be handle-exportable, or the FID map cannot be seeded.
-  if !root_exports_handle(root) {
+  // Encoded from the pinned fd, so the probe's success proves the SAME object the
+  // mark covers can export a handle.
+  if !root_exports_handle(root_fd) {
     return Err(ProbeStage::Handle);
   }
 
@@ -93,39 +94,44 @@ fn create_instance() -> Result<OwnedFd, ()> {
 }
 
 /// Row 4: `FAN_MARK_ADD | FAN_MARK_FILESYSTEM` with the dirent + self-event
-/// mask. `Err(())` on any refusal (EPERM is the privilege discriminator).
-fn mark_filesystem(fd: &OwnedFd, root: &Path) -> Result<(), ()> {
-  let Ok(cpath) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
-    return Err(());
-  };
-  // SAFETY: cpath is NUL-terminated; fd is the owned fanotify instance.
+/// mask, installed FD-RELATIVE on the pinned root. `Err(())` on any refusal
+/// (EPERM is the privilege discriminator).
+///
+/// A NULL pathname with a real dirfd makes `fanotify_mark` operate on the object
+/// the dirfd refers to, so the mark scopes to the superblock of exactly the
+/// object the dispatcher pinned — never a superblock a transient path swap could
+/// redirect this one call to.
+fn mark_filesystem(fd: &OwnedFd, root_fd: BorrowedFd<'_>) -> Result<(), ()> {
+  // SAFETY: fd is the owned fanotify instance; root_fd is a live directory fd;
+  // a NULL pathname with a valid dirfd marks the object the dirfd refers to.
   let rc = unsafe {
     libc::fanotify_mark(
       fd.as_raw_fd(),
       libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
       FAN_MARK_MASK,
-      libc::AT_FDCWD,
-      cpath.as_ptr(),
+      root_fd.as_raw_fd(),
+      std::ptr::null(),
     )
   };
   if rc != 0 { Err(()) } else { Ok(()) }
 }
 
-/// Row 5: whether the root's filesystem can actually encode a file handle for
-/// it — the FID map's seeding precondition. This runs the SAME dynamically-sized
-/// [`encode_handle`](super::fanotify::encode_handle) the seed walk uses, so the
-/// probe's success is the real handle round-trip succeeding at the filesystem's
-/// TRUE handle size, not a weaker "an EOVERFLOW proves a handle exists" signal:
-/// an oversized-handle filesystem (larger than `MAX_HANDLE_SZ`) answered
-/// `EOVERFLOW` before, which the old row accepted as proof — yet the fixed-buffer
-/// seed then failed to encode and turned the whole spawn fatal. Retrying at the
-/// kernel-reported size in both places keeps the probe and the seed in lockstep.
+/// Row 5: whether the PINNED root can actually encode a file handle — the FID
+/// map's seeding precondition. Runs the SAME dynamically-sized fd-relative
+/// [`encode_handle_at`](super::fanotify::encode_handle_at) the seed walk uses, on
+/// the same object the mark just covered, so the probe's success is the real
+/// handle round-trip succeeding at the filesystem's TRUE handle size, not a
+/// weaker "an EOVERFLOW proves a handle exists" signal: an oversized-handle
+/// filesystem (larger than `MAX_HANDLE_SZ`) answered `EOVERFLOW` before, which
+/// the old row accepted as proof — yet the fixed-buffer seed then failed to
+/// encode and turned the whole spawn fatal. Retrying at the kernel-reported size
+/// in both places keeps the probe and the seed in lockstep.
 ///
 /// A failure here (a non-exporting filesystem, a permission/transient error, or
 /// the double-`EOVERFLOW` broken-kernel case) falls to inotify under `Auto`, or
 /// surfaces the typed probe-stage error under forced `Fanotify` — never a
 /// live-but-empty source (an admitted root the FID map can never seed, which
 /// would drop every event as outside-root).
-fn root_exports_handle(root: &Path) -> bool {
-  super::fanotify::encode_handle(root).is_some()
+fn root_exports_handle(root_fd: BorrowedFd<'_>) -> bool {
+  super::fanotify::encode_handle_at(root_fd).is_some()
 }
