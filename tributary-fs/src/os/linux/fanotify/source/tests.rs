@@ -53,7 +53,7 @@ fn root_without_a_handle_is_a_fatal_seed_failure() {
   let missing = std::path::Path::new("/tributary-fs-nonexistent-root-for-seed-walk");
   // The open fails (ENOENT) before the FID check is reached, so any expected FID
   // will do — the point is the RootGone class, not the mismatch.
-  let result = seed_walk(missing, [0u8; 8], 0, &some_fid(1));
+  let result = seed_walk(missing, [0u8; 8], 0, None, &some_fid(1));
   assert!(
     matches!(result, Err(WalkError::RootGone(_))),
     "a root with no encodable handle fails the walk as RootGone, not an empty seed"
@@ -199,7 +199,7 @@ fn reseed_root_fid_mismatch_is_rootgone_without_seeding() {
   // A DELIBERATELY WRONG anchor: the real root will never encode to these bytes,
   // so the reopen-verification must reject it.
   let wrong = some_fid(0xEE);
-  let result = seed_walk(&root, [0u8; 8], root_dev, &wrong);
+  let result = seed_walk(&root, [0u8; 8], root_dev, None, &wrong);
   let _ = std::fs::remove_dir_all(&root);
   assert!(
     matches!(result, Err(WalkError::RootGone(_))),
@@ -235,7 +235,7 @@ fn reseed_root_fid_match_seeds_normally() {
     eprintln!("SKIP reseed_root_fid_match_seeds_normally: temp root exports no handle");
     return;
   };
-  let result = seed_walk(&root, [0u8; 8], root_dev, &expected);
+  let result = seed_walk(&root, [0u8; 8], root_dev, None, &expected);
   let _ = std::fs::remove_dir_all(&root);
   let entries = result.expect("the genuine root passes the FID gate and seeds");
   // The root anchor plus its `sub` child — the gate did not block the real root.
@@ -280,7 +280,7 @@ fn subtree_fid_mismatch_is_incomplete_without_seeding() {
   }
   // A wrong learned FID: the real reopened subtree will not encode to these bytes.
   let wrong = some_fid(0xAB);
-  let result = subtree_walk(&subtree, &wrong, [0u8; 8], root_dev);
+  let result = subtree_walk(&subtree, &wrong, [0u8; 8], root_dev, None);
   let _ = std::fs::remove_dir_all(&subtree);
   assert!(
     matches!(result, Err(WalkError::Incomplete(_))),
@@ -319,7 +319,7 @@ fn subtree_fid_match_seeds_descendants() {
     eprintln!("SKIP subtree_fid_match_seeds_descendants: temp fs exports no handle");
     return;
   };
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
   let _ = std::fs::remove_dir_all(&subtree);
   let entries = result.expect(
     "the genuine subtree passes the handle-only FID gate and seeds descendants, even with an \
@@ -383,7 +383,7 @@ fn unreadable_child_makes_the_real_walk_incomplete() {
     );
     return;
   };
-  let result = seed_walk(&root, [0u8; 8], root_dev, &expected);
+  let result = seed_walk(&root, [0u8; 8], root_dev, None, &expected);
   // Restore permissions BEFORE asserting so cleanup always succeeds.
   let _ = std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755));
   let _ = std::fs::remove_dir_all(&root);
@@ -431,7 +431,7 @@ fn subtree_walk_maps_descendants_not_the_root() {
     return;
   };
 
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
   let _ = std::fs::remove_dir_all(&subtree);
   let entries = match result {
     Ok(entries) => entries,
@@ -509,7 +509,7 @@ fn subtree_walk_unreadable_descendant_is_incomplete() {
     return;
   }
 
-  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev);
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev, None);
   let _ = std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755));
   let _ = std::fs::remove_dir_all(&subtree);
   match result {
@@ -534,7 +534,7 @@ fn subtree_walk_on_missing_path_is_incomplete_not_empty() {
   ));
   let _ = std::fs::remove_dir_all(&missing);
   let subtree_fid = Fid::new([7; 8], Box::from(&[7u8][..]));
-  match subtree_walk(&missing, &subtree_fid, [0u8; 8], 0) {
+  match subtree_walk(&missing, &subtree_fid, [0u8; 8], 0, None) {
     Err(WalkError::Incomplete(err)) => {
       assert_eq!(
         err.kind(),

@@ -1133,7 +1133,16 @@ mod descending {
   }
 
   fn inotify_rig() -> Rig {
-    let fs = FakeFs::new(1);
+    inotify_rig_fs(FakeFs::new(1))
+  }
+
+  /// A descending rig whose fake source reports a root MOUNT id, so the core
+  /// fences a same-device child on a different mount (a bind) end to end.
+  fn inotify_rig_mnt(root_mnt_id: u64) -> Rig {
+    inotify_rig_fs(FakeFs::with_root_mnt_id(1, root_mnt_id))
+  }
+
+  fn inotify_rig_fs(fs: FakeFs) -> Rig {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
@@ -1201,6 +1210,56 @@ mod descending {
         .iter()
         .any(|(_, p)| p == std::path::Path::new("/r/sub")),
       "the discovered directory was armed: {arms:?}"
+    );
+  }
+
+  /// End to end: a same-DEVICE child on a different MOUNT (a `mount --bind` of a
+  /// same-superblock directory) is lowered `Other` and never armed/descended,
+  /// while a same-mount sibling is. The device check alone would descend into the
+  /// bind (its device equals the root's) and cover an out-of-root subtree — the
+  /// mount-id fence is what closes it. Drives the whole path: the fake source
+  /// reports the root mount id, the core carries it, the enumerate lowers by it.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn descending_does_not_descend_a_same_device_bind_mount() {
+    let rig = inotify_rig_mnt(42);
+    // `bound` shares the device (1) but sits on mount 77 (a bind); `here` is on the
+    // root mount (42). Both are directories with children the walk would descend if
+    // it entered them.
+    rig.fs.put_on_mount("/r/bound", FileKind::Dir, 20, 77);
+    rig.fs.put("/r/bound/hidden.txt", FileKind::File, 21);
+    rig.fs.put("/r/here", FileKind::Dir, 22);
+    rig.fs.put("/r/here/seen.txt", FileKind::File, 23);
+    let _scope = watch(&rig, "/r").await;
+
+    // The in-root child directory `here` is enumerated (descended); the bind `bound`
+    // never is.
+    settle(|| {
+      rig
+        .fs
+        .enumerates()
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r/here"))
+    })
+    .await;
+    let enumerates = rig.fs.enumerates();
+    assert!(
+      !enumerates
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r/bound")),
+      "a same-device bind on a different mount is never descended: {enumerates:?}"
+    );
+    let arms = rig.fs.arms();
+    assert!(
+      arms
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r/here")),
+      "the same-mount child directory is armed: {arms:?}"
+    );
+    assert!(
+      !arms
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r/bound")),
+      "the bind-mount directory is delivered but never armed: {arms:?}"
     );
   }
 
@@ -1290,6 +1349,7 @@ mod descending {
           kind: FileKind::Dir,
           dev: 1,
           ino: 11,
+          mnt_id: None,
         }],
         complete: true,
       },

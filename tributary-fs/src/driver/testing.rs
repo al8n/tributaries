@@ -34,6 +34,11 @@ pub(crate) struct FakeNode {
   pub(crate) kind: FileKind,
   pub(crate) ino: u64,
   pub(crate) dev: u64,
+  /// The object's MOUNT id, mirroring the real `statx(STATX_MNT_ID)` the core
+  /// fences descent on. Defaults to the fake's `root_mnt_id` (one mount), so a
+  /// plain `put` never crosses the boundary; [`FakeFs::put_on_mount`] sets a
+  /// differing one to model a bind/submount whose device still equals the root's.
+  pub(crate) mnt_id: Option<u64>,
 }
 
 /// One spawned fake source: its queue's send end plus the REAL transport
@@ -149,6 +154,11 @@ impl Default for FakeState {
 pub(crate) struct FakeFs {
   state: Arc<FakeState>,
   root_dev: u64,
+  /// The scope root's MOUNT id, carried on `RootMeta` and defaulted onto every
+  /// `put` node. `None` (the `Default`) models a source that reports no mount id
+  /// (a pre-5.8 kernel / non-Linux backend), where the core's descent fence falls
+  /// back to the device check; a `Some` value models a mount-id-reporting source.
+  root_mnt_id: Option<u64>,
 }
 
 impl FakeFs {
@@ -156,6 +166,19 @@ impl FakeFs {
     Self {
       state: Arc::new(FakeState::default()),
       root_dev,
+      root_mnt_id: None,
+    }
+  }
+
+  /// A fake reporting a root MOUNT id — the mount-id-aware source. Nodes placed by
+  /// `put` inherit this id (one mount); [`put_on_mount`](Self::put_on_mount) places
+  /// a node on a DIFFERENT mount (a bind/submount) whose device still equals the
+  /// root's, exercising the core's mount-id descent fence the device check misses.
+  pub(crate) fn with_root_mnt_id(root_dev: u64, root_mnt_id: u64) -> Self {
+    Self {
+      state: Arc::new(FakeState::default()),
+      root_dev,
+      root_mnt_id: Some(root_mnt_id),
     }
   }
 
@@ -166,6 +189,23 @@ impl FakeFs {
         kind,
         ino,
         dev: self.root_dev,
+        mnt_id: self.root_mnt_id,
+      },
+    );
+  }
+
+  /// Places a node on the root's DEVICE but a DIFFERENT mount (`mnt_id`) — a
+  /// `mount --bind` of a same-superblock directory, the boundary the device check
+  /// alone cannot see. The core lowers such a directory to `FileKind::Other` (not
+  /// descended) via the mount-id fence.
+  pub(crate) fn put_on_mount(&self, path: impl AsRef<Path>, kind: FileKind, ino: u64, mnt_id: u64) {
+    self.state.nodes.lock().unwrap().insert(
+      path.as_ref().to_path_buf(),
+      FakeNode {
+        kind,
+        ino,
+        dev: self.root_dev,
+        mnt_id: Some(mnt_id),
       },
     );
   }
@@ -299,6 +339,7 @@ impl FakeFs {
         kind,
         ino,
         dev: self.root_dev,
+        mnt_id: self.root_mnt_id,
       },
     ));
   }
@@ -611,6 +652,7 @@ impl FsOps for FakeFs {
     let meta = RootMeta {
       root: root.clone(),
       root_dev: self.root_dev,
+      root_mnt_id: self.root_mnt_id,
       mounts: self.state.spawn_mounts.lock().unwrap().clone(),
       identity,
       ancestors,
@@ -742,6 +784,7 @@ impl FsOps for FakeFs {
           kind: node.kind,
           dev: node.dev,
           ino: node.ino,
+          mnt_id: node.mnt_id,
         });
       }
     }

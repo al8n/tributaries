@@ -4,8 +4,8 @@
 //! convergence-style: wait (bounded) until the expected fact is observed;
 //! extra events — coalesced kinds, additional `Rescan`s — are always legal.
 //!
-//! The privileged cells (queue overflow, watch-limit exhaustion, bind-mount
-//! aliasing) self-probe and skip loudly without `CAP_SYS_ADMIN`; the
+//! The privileged cells (queue overflow, watch-limit exhaustion, the bind-mount
+//! boundary) self-probe and skip loudly without `CAP_SYS_ADMIN`; the
 //! `inotify-priv` suite of `ci/linux-verify.sh` (or `sudo -E` in CI) unlocks
 //! them.
 //!
@@ -298,15 +298,23 @@ async fn watch_limit_exhaustion_is_honest() {
   assert!(honest, "watch exhaustion surfaces as Rescan or typed error");
 }
 
-/// Suite 7 (privileged): wd aliasing — a bind mount inside the root makes two
-/// anchors share one inode (`EEXIST` under `IN_MASK_CREATE` → alias fan-out);
-/// a write through one spelling is observed under both.
+/// Suite 7 (privileged): a bind mount inside the root is a MOUNT BOUNDARY, not an
+/// alias to descend. `root/b` bound from `root/a` sits on a different mount id, so
+/// the enumerate lowering marks it non-descendable — the Monitor never arms a watch
+/// under it, and a write reached through the bind spelling (`root/b/...`) surfaces
+/// only under the ORIGINAL (`root/a/...`), never a second time under `b`.
+///
+/// On Linux a directory has exactly one inode-sharing spelling per bind (hardlinked
+/// directories do not exist), so a directory bind is the only alias the EEXIST
+/// fan-out ever handled — and the mount-id fence now makes that case a uniform
+/// boundary on both backends (design-consistent), the intended change. The EEXIST
+/// alias machinery remains the belt for any NON-mount aliasing.
 #[tokio::test]
-async fn bind_mount_aliases_fan_out() {
-  if !privileged_or_skip("bind_mount_aliases_fan_out") {
+async fn bind_mount_inside_root_is_a_boundary() {
+  if !privileged_or_skip("bind_mount_inside_root_is_a_boundary") {
     return;
   }
-  let root = scratch_root("alias");
+  let root = scratch_root("bind-boundary");
   std::fs::create_dir(root.join("a")).unwrap();
   std::fs::create_dir(root.join("b")).unwrap();
   let status = std::process::Command::new("mount")
@@ -316,34 +324,45 @@ async fn bind_mount_aliases_fan_out() {
     .status()
     .expect("run mount");
   if !status.success() {
-    eprintln!("SKIP bind_mount_aliases_fan_out: bind mount refused");
+    eprintln!("SKIP bind_mount_inside_root_is_a_boundary: bind mount refused");
     return;
   }
 
   let mut w = watcher();
   let _h = w.watch(&root, Interest::all()).await.expect("watch");
-  std::fs::write(root.join("a/shared.txt"), b"s").unwrap();
-
+  // A write reached through the BIND spelling `root/b/shared.txt` lands on the same
+  // object as `root/a/shared.txt` (b is bound from a). The original `a` is watched
+  // (same mount as root); the bind `b` is a boundary and is not.
   let via_a = root.join("a/shared.txt");
   let via_b = root.join("b/shared.txt");
-  let mut seen_a = false;
-  let mut seen_b = false;
-  let _ = tokio::time::timeout(DEADLINE, async {
+  std::fs::write(&via_b, b"s").unwrap();
+
+  // The original spelling is observed — `a` is in-root and descended.
+  let saw_a = wait_for(&mut w, |e| covers(e, &via_a)).await.is_some();
+  // The bind spelling must NOT surface: `b` was fenced as a mount boundary and
+  // never armed, so no watch reports a `b/...` path. A bounded quiet window proves
+  // its absence.
+  let leaked_b = tokio::time::timeout(Duration::from_secs(3), async {
     while let Some(event) = w.next().await {
-      seen_a |= covers(&event, &via_a);
-      seen_b |= covers(&event, &via_b);
-      if seen_a && seen_b {
-        break;
+      if event.path().starts_with(root.join("b")) {
+        return true;
       }
     }
+    false
   })
-  .await;
+  .await
+  .unwrap_or(false);
   let _ = std::process::Command::new("umount")
+    .arg("-l")
     .arg(root.join("b"))
     .status();
   assert!(
-    seen_a && seen_b,
-    "one write fans out to both aliased anchors (a: {seen_a}, b: {seen_b})"
+    saw_a,
+    "the write to the bound object is observed under the original in-root spelling"
+  );
+  assert!(
+    !leaked_b,
+    "the bind point is a mount boundary — no event surfaces under its spelling"
   );
 }
 

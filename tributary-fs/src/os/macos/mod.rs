@@ -240,6 +240,9 @@ impl Source {
     let meta = RootMeta {
       root: roots[0].clone(),
       root_dev: root_dev as u64,
+      // FSEvents has no mount-id notion; the core's descent fence falls back to the
+      // device check (the settled single-device policy) on this backend.
+      root_mnt_id: None,
       mounts,
       identity,
       ancestors,

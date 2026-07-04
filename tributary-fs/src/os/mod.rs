@@ -243,6 +243,13 @@ pub(crate) struct RootMeta {
   pub(crate) root: PathBuf,
   /// The device the root lives on.
   pub(crate) root_dev: u64,
+  /// The root's MOUNT id (from `statx(STATX_MNT_ID)` on the pinned root), or
+  /// `None` when the source could not read one (below Linux 5.8 where the field
+  /// is absent, or a non-Linux backend — FSEvents has no mount id). The core
+  /// fences descent across a differing mount id: a `mount --bind` of a
+  /// same-device directory shares [`root_dev`](Self::root_dev), so the device
+  /// alone cannot mark it a boundary. `None` degrades to the device check.
+  pub(crate) root_mnt_id: Option<u64>,
   /// The trust-reducing mount seed: mount points observed strictly under the
   /// root before the stream started (empty when the table could not be read —
   /// either way, event-side trust stays closed until the post-live refresh).

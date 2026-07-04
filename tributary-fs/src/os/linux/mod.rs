@@ -525,6 +525,26 @@ fn ancestor_identities(canonical: &Path) -> Result<Vec<super::RootIdentity>, sup
   Ok(ancestors)
 }
 
+/// The MOUNT id of the pinned root, read fd-relative via
+/// `statx(root_fd, "", AT_EMPTY_PATH, STATX_MNT_ID)` — the descent boundary both
+/// backends carry on [`RootMeta`](super::RootMeta) so the core (inotify) and the
+/// seed walk (fanotify) can fence a submount by mount id rather than device. A
+/// `mount --bind` of a same-superblock directory shares the root's device, so the
+/// device alone cannot mark the boundary; the mount id differs across any mount.
+///
+/// `None` when the kernel did not report a mount id: `statx` unavailable (returns
+/// `NOSYS` below Linux 4.11), the `STATX_MNT_ID` field absent (below 5.8), or the
+/// returned `stx_mask` leaving the bit unset. inotify's kernel floor is well below
+/// 5.8, so `None` is a real path there — the core degrades to the device check
+/// (the settled single-device policy). fanotify's 5.17 floor always reports it,
+/// but `None` is still handled rather than asserted.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn root_mount_id(root_fd: BorrowedFd<'_>) -> Option<u64> {
+  use rustix::fs::{AtFlags, StatxFlags, statx};
+  let stx = statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID).ok()?;
+  (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id)
+}
+
 /// A live Linux source, one variant per backend. Dropping it tears the reader
 /// down; prefer [`shutdown`](Self::shutdown) at an orderly exit.
 #[cfg(all(target_os = "linux", not(miri)))]
@@ -601,7 +621,7 @@ mod inotify_source {
 
   use super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
-    ExpectedObject, WatchOutcome, ancestor_identities, mounts_under,
+    ExpectedObject, WatchOutcome, ancestor_identities, mounts_under, root_mount_id,
     wake::WakeState,
   };
   use crate::os::MAX_EXCLUSIONS;
@@ -679,6 +699,11 @@ mod inotify_source {
         source: err.into(),
       })?;
       let root_dev = stat.st_dev;
+      // The root's mount id from the same PIN — the core's descent boundary. inotify
+      // runs below 5.8, so this may be `None` (statx has no mount id there); the
+      // core then falls back to the device check. Read once here, carried on
+      // `RootMeta` like `root_dev`.
+      let root_mnt_id = root_mount_id(root_fd);
       let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
       let mounts = mounts_under(&canonical).unwrap_or_default();
 
@@ -751,6 +776,7 @@ mod inotify_source {
       let meta = RootMeta {
         root: canonical,
         root_dev,
+        root_mnt_id,
         mounts,
         identity,
         ancestors,
