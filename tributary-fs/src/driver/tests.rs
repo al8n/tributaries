@@ -1265,6 +1265,60 @@ mod descending {
     settle(|| rig.fs.disarms().contains(&child)).await;
   }
 
+  /// Object-correct arming, end to end on the fake platform: an object replaced
+  /// between the enumerate that discovered it and its arm is refused as `Gone`,
+  /// and the Monitor's drop+rescan heals. The enumerate reports the child at its
+  /// ORIGINAL inode (so the Monitor node carries that identity), while the object
+  /// currently at the path has a DIFFERENT inode — modeling a rename/replace that
+  /// slipped into the enumerate→arm window. The arm's identity check catches it,
+  /// so the watch never installs on the wrong object.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn arm_identity_mismatch_is_gone_and_rescans() {
+    let rig = inotify_rig();
+    // The object at /r/sub is inode 99, but the cold enumerate reports it as
+    // inode 11 (the identity the Monitor descends with).
+    rig.fs.put("/r/sub", FileKind::Dir, 99);
+    rig.fs.enumerate_answer(
+      "/r",
+      crate::core::RawEnumerate::Listed {
+        entries: vec![crate::core::RawDirEntry {
+          name: b"sub".to_vec(),
+          kind: FileKind::Dir,
+          dev: 1,
+          ino: 11,
+        }],
+        complete: true,
+      },
+    );
+    let _scope = watch(&rig, "/r").await;
+
+    // The /r/sub arm is attempted with the stale identity (11) against the live
+    // object (99): a mismatch, refused as Gone.
+    settle(|| {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r/sub"))
+    })
+    .await;
+
+    // The Monitor heals through a rescan (the dropped subtree's coverage is
+    // restored by the standing terminal reconciliation).
+    let mut saw_rescan = false;
+    for _ in 0..8 {
+      let (_scope, change) = next_event(&rig).await;
+      if change.kind().is_rescan() {
+        saw_rescan = true;
+        break;
+      }
+    }
+    assert!(
+      saw_rescan,
+      "a mismatched arm drops the subtree and rescans to heal"
+    );
+  }
+
   /// Close with an enumerate parked on the blocking pool: the listing is
   /// droppable (no OS resource — the Monitor node dies with its scope), so
   /// close resolves quiescent without waiting for it.

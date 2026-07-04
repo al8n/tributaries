@@ -236,6 +236,20 @@ pub(crate) fn mounts_under(root: &Path) -> Option<Vec<PathBuf>> {
   Some(parse_mountinfo(&content, root))
 }
 
+/// The `(dev, ino)` an arm confirms the opened object still has before
+/// installing its kernel watch — the enumerate→arm rename guard. The driver
+/// reads it from the Monitor node (a child) or the barrier meta (the root) and
+/// carries it on the arm request; the reader fstats the opened anchor and
+/// refuses to install on a mismatch.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpectedObject {
+  /// The device the object was read on.
+  pub(crate) dev: u64,
+  /// The object's inode.
+  pub(crate) ino: std::num::NonZeroU64,
+}
+
 /// How an arm resolved. Ungated: the sans-I/O core consumes this on every
 /// host (an [`Aliased`](WatchOutcome::Aliased) anchor is covered coverage —
 /// the wd table fans events to it — so the core maps it to a successful
@@ -408,7 +422,7 @@ mod inotify_source {
 
   use super::{
     super::{RootIdentity, RootMeta, SourceConfig, SourceError, transport},
-    WatchOutcome, fs_type_is_remote, mounts_under,
+    ExpectedObject, WatchOutcome, fs_type_is_remote, mounts_under,
     wake::WakeState,
   };
   use crate::os::MAX_EXCLUSIONS;
@@ -427,6 +441,10 @@ mod inotify_source {
     pub(crate) parent: Option<OwnedFd>,
     /// The child's name under `parent`, or the absolute root path.
     pub(crate) name: OsString,
+    /// The `(dev, ino)` the opened object must still have before the watch
+    /// installs — the enumerate→arm rename guard. `None` leaves the arm
+    /// unverified (identity was unavailable at enumerate time).
+    pub(crate) expected: Option<ExpectedObject>,
   }
 
   /// An arm's reply: the outcome plus, on success, the target's transient

@@ -59,12 +59,16 @@ impl DriverCore {
   ) -> Vec<Planned> {
     let mask = event.mask;
     if let Some(rename) = &event.rename {
+      // The moved object's stable identity lives on the rename half (the FID is
+      // the object's, not the directory's); `event.identity` is `None` for a
+      // rename, so passing it would strip both records of the node identity the
+      // admission layer already interned.
       return self.plan_rename(
         state,
         scope,
         &rename.old_path,
         &rename.new_path,
-        event.identity,
+        rename.identity,
       );
     }
 

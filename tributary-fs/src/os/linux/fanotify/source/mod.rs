@@ -238,19 +238,32 @@ impl ReseedContext {
 /// root device — every one an admitted directory, each carrying its parent FID
 /// so the map builds the parent-relative structure directly. A mount boundary
 /// (`st_dev != root_dev`) is not descended: an sb mark never crosses it, so its
-/// subtree lives on a different superblock and never delivers on this fd. A
-/// per-directory handle-read failure is skipped (a reseed re-observes it); only
-/// a failure to open the root itself is fatal.
+/// subtree lives on a different superblock and never delivers on this fd.
+///
+/// Two failure tiers, deliberately distinct:
+///
+/// - A failure to encode the ROOT's own handle is FATAL — an `Err`. Without the
+///   root anchor the map admits NOTHING (every path resolves against it), so a
+///   walk that skipped the root would seed an empty map: a live source that
+///   drops every event as outside-root. The probe already proved the root is
+///   handle-exportable, so this is a race (the root vanished between probe and
+///   walk); on a reseed it likewise escalates rather than going silently blind.
+/// - A per-DESCENDANT handle-read failure is skipped (with its subtree) — a
+///   reseed or the self-maintaining create stream re-observes it; a vanished dir
+///   mid-walk is benign.
 ///
 /// The same walk seeds the map at spawn AND reseeds it after a loss: both need
 /// the identical parent-linked directory inventory.
 fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> io::Result<Vec<SeedEntry>> {
   let mut seed = Vec::new();
-  // A directory with no readable handle cannot anchor its children's parent
-  // links, so it is skipped along with its subtree; the root failing to export
-  // a handle is caught by the probe, never here.
+  // The root anchor is load-bearing: without it the map has no base to resolve
+  // any path against, so its absence is a spawn/reseed failure, never an empty
+  // success.
   let Some(root_fid) = handle_fid(root, fsid) else {
-    return Ok(seed);
+    return Err(io::Error::new(
+      io::ErrorKind::Unsupported,
+      "the watched root does not export a file handle",
+    ));
   };
   seed.push(SeedEntry::root(root_fid.clone(), root));
   // The root must be readable to seed anything; deeper read failures degrade to
@@ -387,65 +400,5 @@ impl Drop for SourceHandle {
   }
 }
 
-/// The pure `FAN_*` constants and info-record tags restate the kernel ABI;
-/// this pins them to libc so they can never drift.
 #[cfg(test)]
-mod libc_cross_assert {
-  use super::super::{FAN_INIT_FLAGS, FAN_MARK_MASK, fid};
-
-  #[test]
-  fn fanotify_constants_match_libc() {
-    assert_eq!(fid::FAN_MODIFY, libc::FAN_MODIFY);
-    assert_eq!(fid::FAN_ATTRIB, libc::FAN_ATTRIB);
-    assert_eq!(fid::FAN_CREATE, libc::FAN_CREATE);
-    assert_eq!(fid::FAN_DELETE, libc::FAN_DELETE);
-    assert_eq!(fid::FAN_DELETE_SELF, libc::FAN_DELETE_SELF);
-    assert_eq!(fid::FAN_MOVE_SELF, libc::FAN_MOVE_SELF);
-    assert_eq!(fid::FAN_RENAME, libc::FAN_RENAME);
-    assert_eq!(fid::FAN_Q_OVERFLOW, libc::FAN_Q_OVERFLOW);
-    assert_eq!(fid::FAN_ONDIR, libc::FAN_ONDIR);
-  }
-
-  #[test]
-  fn info_record_tags_match_libc() {
-    assert_eq!(fid::FAN_EVENT_INFO_TYPE_FID, libc::FAN_EVENT_INFO_TYPE_FID);
-    assert_eq!(
-      fid::FAN_EVENT_INFO_TYPE_DFID_NAME,
-      libc::FAN_EVENT_INFO_TYPE_DFID_NAME
-    );
-    assert_eq!(
-      fid::FAN_EVENT_INFO_TYPE_DFID,
-      libc::FAN_EVENT_INFO_TYPE_DFID
-    );
-    assert_eq!(
-      fid::FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
-      libc::FAN_EVENT_INFO_TYPE_OLD_DFID_NAME
-    );
-    assert_eq!(
-      fid::FAN_EVENT_INFO_TYPE_NEW_DFID_NAME,
-      libc::FAN_EVENT_INFO_TYPE_NEW_DFID_NAME
-    );
-  }
-
-  #[test]
-  fn init_and_mark_flag_sets_match_the_composite() {
-    assert_eq!(
-      FAN_INIT_FLAGS,
-      libc::FAN_CLASS_NOTIF
-        | libc::FAN_REPORT_FID
-        | libc::FAN_REPORT_DFID_NAME
-        | libc::FAN_REPORT_TARGET_FID
-    );
-    assert_eq!(
-      FAN_MARK_MASK,
-      libc::FAN_CREATE
-        | libc::FAN_DELETE
-        | libc::FAN_MODIFY
-        | libc::FAN_ATTRIB
-        | libc::FAN_RENAME
-        | libc::FAN_DELETE_SELF
-        | libc::FAN_MOVE_SELF
-        | libc::FAN_ONDIR
-    );
-  }
-}
+mod tests;

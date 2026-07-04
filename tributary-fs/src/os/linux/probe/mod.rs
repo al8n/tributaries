@@ -112,16 +112,24 @@ fn mark_filesystem(fd: &OwnedFd, root: &Path) -> Result<(), ()> {
   if rc != 0 { Err(()) } else { Ok(()) }
 }
 
-/// Row 5: whether the root's filesystem can encode a file handle for it —
-/// `name_to_handle_at` succeeding (or reporting a too-small buffer, which still
-/// proves handle support). A hard `EOPNOTSUPP` means no FID identity.
+/// Row 5: whether the root's filesystem can encode a file handle for it. ONLY
+/// two outcomes prove handle support: `name_to_handle_at` succeeding (`rc == 0`),
+/// or failing with `EOVERFLOW` — the "your buffer was too small" answer, which
+/// the kernel returns AFTER establishing that a handle exists. The buffer here
+/// is already `MAX_HANDLE_SZ`, so `EOVERFLOW` is not expected, but accepting it
+/// keeps the row honest against any oversized-handle filesystem.
+///
+/// Every OTHER errno fails the probe. `EOPNOTSUPP` is the filesystem plainly not
+/// exporting handles, but `EACCES`/`ESTALE`/`ENOENT`/`EINVAL`/`ENOMEM` and the
+/// rest do NOT prove support — treating them as success (the earlier behavior)
+/// let a transient or permission failure admit a root the FID map could never
+/// seed, producing a live source that then drops everything as outside-root.
+/// A failed row falls to inotify under `Auto`, or surfaces the typed probe-stage
+/// error under forced `Fanotify`.
 fn root_exports_handle(root: &Path) -> bool {
   let Ok(cpath) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
     return false;
   };
-  // A minimal handle buffer: the call fails with EOVERFLOW when the real handle
-  // is larger, which STILL proves the filesystem exports handles (the seeding
-  // walk over-allocates properly). Only EOPNOTSUPP means no handle support.
   let prefix = std::mem::size_of::<libc::file_handle>();
   let cap = libc::MAX_HANDLE_SZ as usize;
   let words = prefix.div_ceil(8) + cap.div_ceil(8) + 1;
@@ -137,14 +145,22 @@ fn root_exports_handle(root: &Path) -> bool {
   // NUL-terminated; mount_id is a valid out-param.
   let rc =
     unsafe { libc::name_to_handle_at(libc::AT_FDCWD, cpath.as_ptr(), handle, &mut mount_id, 0) };
+  let errno = (rc != 0)
+    .then(|| io::Error::last_os_error().raw_os_error())
+    .flatten();
+  handle_support_proven(rc, errno)
+}
+
+/// The pure `name_to_handle_at` outcome → "handle support proven" decision, so
+/// the per-errno rows are testable without a live syscall. Support is proven ONLY
+/// by `rc == 0` or a failure whose errno is `EOVERFLOW`; every other errno fails
+/// the row.
+fn handle_support_proven(rc: libc::c_int, errno: Option<libc::c_int>) -> bool {
   if rc == 0 {
     return true;
   }
-  // EOVERFLOW (buffer too small) still proves handle support; only a hard
-  // "operation not supported" (or a vanished root, caught later by the
-  // identity bracket) means no export.
-  !matches!(
-    io::Error::last_os_error().raw_os_error(),
-    Some(libc::EOPNOTSUPP)
-  )
+  errno == Some(libc::EOVERFLOW)
 }
+
+#[cfg(test)]
+mod tests;

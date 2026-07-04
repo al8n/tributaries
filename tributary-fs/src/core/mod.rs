@@ -154,6 +154,14 @@ pub(crate) enum Effect {
     /// The child's absolute path — the parent's path joined with the name;
     /// executors and fakes address the object by it.
     path: Arc<PathBuf>,
+    /// The `(dev, ino)` the enumerate (or the root's barrier) read for this
+    /// object, when known. The executor opens the target by path/anchor and must
+    /// confirm the opened object matches this before installing the watch — a
+    /// rename between the enumerate and the arm would otherwise install the watch
+    /// on a different object while the Monitor keeps the stale identity. `None`
+    /// leaves the arm unverified (identity was unavailable — a foreign-device or
+    /// unrepresentable entry), exactly as the Monitor already reconciles.
+    expected: Option<ExpectedObject>,
   },
   /// Remove one per-directory kernel watch the Monitor dropped. Fire-and-
   /// forget: the Monitor's unwatch carries no result contract, and a wd the
@@ -559,12 +567,21 @@ impl DriverCore {
               .file_name()
               .and_then(|name| name.to_str())
               .unwrap_or("/");
+            // The root's barrier read its identity; the arm confirms the object
+            // did not get replaced between that read and the (absolute-path) open.
+            // The spawn barrier already brackets identity around start, but the
+            // root arm happens after — so the same confirmation applies here.
+            let expected = NonZeroU64::new(meta.identity.ino()).map(|ino| ExpectedObject {
+              dev: meta.identity.dev(),
+              ino,
+            });
             self.effects.push_back(Effect::AddWatch {
               scope,
               watch,
               parent: watch,
               name: Segment::new(name),
               path: root,
+              expected,
             });
           }
         }
@@ -704,6 +721,32 @@ impl DriverCore {
   ) {
     let events = events.into_iter().map(SourceEvent::Linux).collect();
     self.on_batch(scope, BatchPayload::detached(events), now);
+  }
+
+  /// Compiles a fanotify batch and returns each planned record's object
+  /// identity, so a test can pin that a lowering carries the node the admission
+  /// layer interned all the way onto the Monitor records (a `Moved`'s stable FID
+  /// identity in particular, which lives on the rename half, not the event).
+  #[cfg(test)]
+  pub(crate) fn compiled_fanotify_nodes(
+    &mut self,
+    scope: ScopeId,
+    events: Vec<crate::os::linux::fanotify::AdmittedEvent>,
+  ) -> Vec<Option<Identity>> {
+    let Some(mut state) = self.scopes.remove(&scope) else {
+      return Vec::new();
+    };
+    let batch = self.compile_fanotify(&mut state, scope, events);
+    self.scopes.insert(scope, state);
+    batch
+      .items
+      .iter()
+      .flat_map(|item| item.planned.iter())
+      .filter_map(|planned| match planned {
+        Planned::Rec(rec) => Some(rec.node()),
+        Planned::Over(_) => None,
+      })
+      .collect()
   }
 
   /// Feeds one probe's outcome; a completed batch (and any batches queued
@@ -1473,12 +1516,26 @@ impl DriverCore {
             let path = Arc::new(parent_path.join(name.as_str()));
             self.watch_scopes.insert(cmd.id(), scope);
             self.watch_paths.insert(cmd.id(), Arc::clone(&path));
+            // The object the enumerate discovered, so the arm can confirm the
+            // open lands on it: the Monitor node carries the entry's identity
+            // (its inode), and single-device descent means a descended child is
+            // always on the scope's root device — a foreign-device entry mints no
+            // identity and is never descended. An identity-less node leaves the
+            // arm unverified, exactly as the Monitor already reconciles.
+            let expected = self.monitor.node_identity(cmd.id()).and_then(|id| {
+              self
+                .scopes
+                .get(&scope)
+                .and_then(|state| state.root_dev)
+                .map(|dev| ExpectedObject { dev, ino: id.get() })
+            });
             self.effects.push_back(Effect::AddWatch {
               scope,
               watch: cmd.id(),
               parent,
               name,
               path,
+              expected,
             });
           }
         }
@@ -1858,6 +1915,18 @@ fn caps_for(backend: BackendKind) -> Capabilities {
     BackendKind::FsEvents | BackendKind::Fanotify => caps.with_kernel_recursive(),
     BackendKind::Inotify => caps,
   }
+}
+
+/// The `(dev, ino)` an arm must confirm the opened object still has before
+/// installing its kernel watch — the object-correctness check that closes the
+/// enumerate→arm rename window (a descended child, or the root itself). Carried
+/// on [`Effect::AddWatch`] and plumbed to the executor's open+fstat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpectedObject {
+  /// The device the object was read on.
+  pub(crate) dev: u64,
+  /// The object's inode.
+  pub(crate) ino: NonZeroU64,
 }
 
 /// One raw directory entry as the executor read it — name bytes and stat
