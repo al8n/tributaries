@@ -750,6 +750,14 @@ fn seed_walk(
 ///   root anchor is load-bearing, but the probe already proved the root openable
 ///   and exportable, so its absence is a race reported as root-unavailable.
 ///
+/// The directory cap (`max_directories`, design §4.9) fences the ANCHOR here,
+/// before it is pushed, then [`descend`] fences every child: the map may never
+/// exceed the cap, and the anchor is its first node, so a `Some(0)` cap is
+/// `Incomplete` (no map may exist) exactly as an over-cap descent is. This keeps
+/// the whole cap decision at the walk (fanotify-unviable → the spawn's `NotViable`
+/// / the reseed's fatal), never a live one-node map that only trips the
+/// [`over_capacity`](super::map::FidMap::over_capacity) fatal on its first event.
+///
 /// The same seed runs at spawn AND reseed; the reseed path folds every
 /// `WalkError` into its terminal blind→fatal escalation (see
 /// [`ReseedContext::walk`]), so an unreadable subtree that survives the reseed's
@@ -772,6 +780,19 @@ fn seed_from_fd(
       "the watched root does not export a file handle",
     )));
   };
+  // The cap fences the ANCHOR too, not just the descent's children: the map may
+  // never exceed `max_directories`, and the anchor is the first directory it
+  // holds. A `Some(0)` cap therefore admits NO map at all — seeding even the
+  // anchor would over-fill it — so it folds to `Incomplete` here (spawn →
+  // NotViable → inotify under Auto / typed error when forced; a reseed → the
+  // terminal fatal), exactly as an oversized descent does. Without this fence a
+  // zero cap would seed a live one-node map whose first admitted event trips the
+  // `over_capacity` fatal instead of the documented seed-time selection.
+  if max_directories == Some(0) {
+    return Err(WalkError::Incomplete(io::Error::other(
+      "the fanotify seed walk exceeded the directory budget; the tree is too large to map",
+    )));
+  }
   let mut seed = vec![SeedEntry::root(root_fid.clone(), root)];
   descend(
     root_fd,

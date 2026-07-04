@@ -611,6 +611,80 @@ fn seed_walk_over_the_directory_cap_is_incomplete() {
   );
 }
 
+/// A `Some(0)` cap fences the ANCHOR itself, not just the descent's children: an
+/// EMPTY root (no descendants to trip the child fence) is still `Incomplete`, since
+/// a zero cap means the map may never hold even the root anchor. This is the
+/// fanotify-unviable class the spawn folds to `NotViable` (Auto → inotify, forced →
+/// typed error) — never a live one-node map whose first event trips `over_capacity`.
+#[test]
+fn a_zero_cap_is_incomplete_even_for_an_empty_root() {
+  use std::os::unix::fs::MetadataExt;
+
+  let root = std::env::temp_dir().join(format!("tributary-fs-zero-cap-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&root);
+  // An empty root: no children exist, so ONLY the anchor fence can make this
+  // Incomplete — exactly the hole the child-only fence left open.
+  std::fs::create_dir_all(&root).expect("create an empty walkable root");
+  let Ok(meta) = std::fs::metadata(&root) else {
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+  let root_dev = meta.dev();
+  let Some(expected) = real_dir_fid(&root, [0u8; 8]) else {
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("SKIP a_zero_cap_is_incomplete_even_for_an_empty_root: temp root exports no handle");
+    return;
+  };
+
+  let capped = seed_walk(&root, [0u8; 8], root_dev, &expected, Some(0));
+  let _ = std::fs::remove_dir_all(&root);
+  assert!(
+    matches!(capped, Err(WalkError::Incomplete(_))),
+    "a zero cap admits no map at all — Incomplete (fanotify not viable) even for an empty root, \
+     never a live one-node anchor map: {capped:?}"
+  );
+}
+
+/// A `Some(1)` cap seeds EXACTLY the root anchor and lives: the anchor fits (one
+/// directory), and an empty root has no children to overflow it. This pins the
+/// boundary opposite [`a_zero_cap_is_incomplete_even_for_an_empty_root`] — the cap
+/// bounds the map INCLUSIVELY at its ceiling, so a cap equal to the anchor count is
+/// a viable one-node seed, not a rejection.
+#[test]
+fn a_cap_of_one_seeds_exactly_the_anchor_for_an_empty_root() {
+  use std::os::unix::fs::MetadataExt;
+
+  let root = std::env::temp_dir().join(format!("tributary-fs-cap-one-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).expect("create an empty walkable root");
+  let Ok(meta) = std::fs::metadata(&root) else {
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+  let root_dev = meta.dev();
+  let Some(expected) = real_dir_fid(&root, [0u8; 8]) else {
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!(
+      "SKIP a_cap_of_one_seeds_exactly_the_anchor_for_an_empty_root: temp root exports no \
+               handle"
+    );
+    return;
+  };
+
+  let ok = seed_walk(&root, [0u8; 8], root_dev, &expected, Some(1));
+  let _ = std::fs::remove_dir_all(&root);
+  let entries = ok.expect("a cap of one holds the sole root anchor of an empty root");
+  assert_eq!(
+    entries.len(),
+    1,
+    "exactly the root anchor seeds under a cap of one"
+  );
+  assert!(
+    entries[0].parent.is_none(),
+    "the single seeded entry is the root anchor (no parent)"
+  );
+}
+
 /// The descent fences children against the mount frame it is HANDED, and the live
 /// path-reopen walks hand it the frame they re-read from the reopened root fd — so
 /// a same-object re-mount fences descendants on the NEW frame, not a stale one.

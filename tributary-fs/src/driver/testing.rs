@@ -317,10 +317,33 @@ impl FakeFs {
   }
 
   /// Forces every subsequent refresh to report `liveness` as the root's state,
-  /// driving the root-death-via-refresh path (`RootLiveness::Missing` /
-  /// `Unreadable` for a death; a mismatched `Present` for a replacement).
+  /// driving the root-death-via-refresh path for the verdicts a present node cannot
+  /// express: `RootLiveness::Missing` (vanished) or `Unreadable`. An override forces
+  /// the mount frame to `None` too (the real `statx` reports no frame on a failed
+  /// stat), so it can never pair a fabricated identity with a node's frame. A
+  /// REPLACED-but-present root is driven by replacing the node instead
+  /// ([`replace_root_node`](Self::replace_root_node) / `put`), so the refresh's
+  /// single node read reports the replacement's identity AND its frame together.
   pub(crate) fn set_root_liveness(&self, liveness: RootLiveness) {
     *self.state.root_liveness.lock().unwrap() = Some(liveness);
+  }
+
+  /// Replaces the node at `root` with a new object carrying `(ino, mnt_id)` on the
+  /// root's device — the deterministic form of a replace/remount at the root path.
+  /// Because the refresh samples identity AND frame from this ONE node, a subsequent
+  /// refresh reports the REPLACED identity WITH its frame as a matched pair, never a
+  /// mix of the old identity and a new frame (the hazard the atomic `statx` sample
+  /// closes). A `mnt_id` of `None` models a source that reports no frame.
+  pub(crate) fn replace_root_node(&self, root: impl AsRef<Path>, ino: u64, mnt_id: Option<u64>) {
+    self.state.nodes.lock().unwrap().insert(
+      root.as_ref().to_path_buf(),
+      FakeNode {
+        kind: FileKind::Dir,
+        ino,
+        dev: self.root_dev,
+        mnt_id,
+      },
+    );
   }
 
   /// The recorded spawn-contract order (`meta_sealed` / `stream_live` per
@@ -688,32 +711,34 @@ impl FsOps for FakeFs {
       .unwrap()
       .clone()
       .unwrap_or((Vec::new(), true));
-    // Root liveness: an explicit override drives the death path directly;
-    // otherwise it derives from the tree — the root's live identity, or
-    // `Missing` once it has been removed — mirroring the real re-stat.
-    let root_liveness = self.state.root_liveness.lock().unwrap().or_else(|| {
-      self
-        .state
-        .nodes
-        .lock()
-        .unwrap()
-        .get(root)
-        .map(|node| RootLiveness::Present(RootIdentity::new(node.dev, node.ino)))
-    });
-    // The root's current mount frame, read from the tree node beside its liveness —
-    // mirroring the real executor's path re-read, so a test that re-mounts the root
-    // node (a fresh `mnt_id`, unchanged identity) drives the frame-refresh path.
-    let root_mnt_id = self
+    // ONE node read yields BOTH the liveness identity and the mount frame, so the
+    // fake CANNOT pair a present-and-matching verdict with a different object's
+    // frame — the mixed sample the real `statx` restructure makes impossible is
+    // impossible here too. A replaced root is modeled by REPLACING the node (`put` /
+    // [`replace_root_node`]), and this single read then reports the REPLACED identity
+    // WITH its frame, never a mix. The `root_liveness` override remains only for the
+    // verdicts a present node cannot express — `Missing` / `Unreadable` (a vanished /
+    // unreadable root) — which carry no frame (the real `statx` returns none on a
+    // failed stat), so an override forces the frame to `None` too; it never
+    // fabricates a `Present` identity divorced from the node it would pair against.
+    let sampled = self
       .state
       .nodes
       .lock()
       .unwrap()
       .get(root)
-      .and_then(|node| node.mnt_id);
+      .map(|node| (RootIdentity::new(node.dev, node.ino), node.mnt_id));
+    let (root_liveness, root_mnt_id) = match self.state.root_liveness.lock().unwrap().as_ref() {
+      Some(override_liveness) => (*override_liveness, None),
+      None => match sampled {
+        Some((identity, mnt_id)) => (RootLiveness::Present(identity), mnt_id),
+        None => (RootLiveness::Missing, None),
+      },
+    };
     MountRefresh {
       mounts,
       authoritative,
-      root: root_liveness.unwrap_or(RootLiveness::Missing),
+      root: root_liveness,
       root_mnt_id,
     }
   }

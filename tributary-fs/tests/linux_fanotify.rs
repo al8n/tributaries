@@ -1470,6 +1470,87 @@ async fn forced_fanotify_typed_error_on_unwalkable_subtree() {
   w.close().await.expect("the watcher closes cleanly");
 }
 
+/// Suite 12 — the walk-completeness precondition reached via a ZERO directory cap
+/// instead of an unreadable subtree: a `max_map_directories` of `Some(0)` means the
+/// admission map may never hold even the root anchor, so the seed walk is unviable
+/// for ANY root. Under `Backend::Auto` this forces the inotify fall-back, and events
+/// still flow through it. Unlike the 000-subdir cell, this needs no privilege games
+/// (no `chmod`, no `CAP_DAC_OVERRIDE` self-probe), so it exercises the fall-back in
+/// EVERY suite mode — including the privileged `fanotify` run where the 000 cell
+/// skips.
+#[tokio::test]
+async fn auto_falls_back_to_inotify_under_a_zero_directory_cap() {
+  let root = tmpfs_scratch("zero-cap-fallback");
+  std::fs::create_dir_all(root.join("inner")).unwrap();
+
+  let w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::Auto)
+      .with_max_map_directories(Some(0)),
+  )
+  .expect("build Auto watcher with a zero directory cap");
+  let handle = w
+    .watch(&root, Interest::all())
+    .await
+    .expect("Auto must not fail under a zero cap — it falls back to inotify");
+  let selected = w
+    .backend_of(handle)
+    .expect("a live root reports its backend");
+  assert_eq!(
+    selected,
+    BackendKind::Inotify,
+    "a zero directory cap makes fanotify unviable (no map may hold even the anchor) — Auto \
+     falls back to inotify"
+  );
+
+  // The fall-back backend is live: a create still flows (inotify keeps no map cap).
+  let mut w = w;
+  let target = root.join("inner/created.txt");
+  std::fs::write(&target, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &target)).await.is_some(),
+    "after the inotify fall-back a create is delivered — the zero cap never made a blind source"
+  );
+  let _ = w.close().await;
+}
+
+/// Suite 12 — the forced-`Fanotify` half of the zero-cap precondition: a
+/// `max_map_directories` of `Some(0)` makes forced `Fanotify` fail with the typed
+/// [`SourceError::BackendProbeFailed`] (`Walk` stage), never a fall-back and never a
+/// live one-node map whose first event trips the `over_capacity` fatal. Needs
+/// `CAP_SYS_ADMIN` so the mark passes the probe and the walk stage is reached; the
+/// zero cap then fails the walk regardless of DAC (no unreadable-dir self-probe
+/// needed), so this cell only gates on privilege.
+#[tokio::test]
+async fn forced_fanotify_typed_error_under_a_zero_directory_cap() {
+  if !has_sys_admin() {
+    eprintln!("SKIP forced_fanotify_typed_error_under_a_zero_directory_cap: no CAP_SYS_ADMIN");
+    return;
+  }
+  let root = tmpfs_scratch("zero-cap-forced");
+  std::fs::create_dir_all(&root).unwrap();
+
+  let w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::Fanotify)
+      .with_max_map_directories(Some(0)),
+  )
+  .expect("build forced-fanotify watcher with a zero directory cap");
+  let err = w
+    .watch(&root, Interest::all())
+    .await
+    .expect_err("forced fanotify under a zero cap must fail, never build a one-node map");
+  assert!(
+    matches!(
+      err,
+      tributary_fs::WatchRootError::Source(tributary_fs::SourceError::BackendProbeFailed { .. })
+    ),
+    "a zero directory cap surfaces the typed viability error, never a blind or one-node source: \
+     {err:?}"
+  );
+  w.close().await.expect("the watcher closes cleanly");
+}
+
 /// Churn smoke: a long create/delete churn of FILES under a watched root must not
 /// grow unbounded memory — the intern table is directory-bounded (file target
 /// FIDs are never interned). This drives thousands of file create/deletes and
