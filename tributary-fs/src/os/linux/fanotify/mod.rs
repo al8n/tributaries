@@ -130,7 +130,16 @@ pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
   }
 
   let path = event.name.as_ref().map(|name| join_name(&dir_path, name));
-  let identity = event.target_fid.as_ref().map(|fid| map.intern(fid));
+  // Identity is DIRECTORY-only: interning file target FIDs would grow the map's
+  // intern table unboundedly under file churn (the O(directories) bound), and
+  // file identity is inert under the kernel-recursive Monitor profile anyway
+  // (`reconcile_slot` discards it for a non-descending scope — no per-directory
+  // child watch to re-arm). A non-directory target attaches `None`.
+  let identity = if mask.ondir() {
+    event.target_fid.as_ref().map(|fid| map.intern(fid))
+  } else {
+    None
+  };
 
   // Self-maintenance: a new in-root directory enters the map via its own
   // create's TARGET_FID; a removed one is forgotten so its stale handle stops
@@ -156,9 +165,9 @@ pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
 }
 
 /// Admits a `FAN_RENAME`: resolves both directory FIDs, self-maintains the map
-/// for a moved directory (forget the old admission, learn the new one), and
-/// interns the moved object's identity from whichever end supplies a target
-/// FID.
+/// for a moved DIRECTORY (re-parent in place when the destination is in-root,
+/// forget when it moved out), and interns the moved object's identity when it is
+/// a directory (a file target attaches none — see [`admit`]).
 fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo) -> Admission {
   let old_dir = map.admit(&rename.old_dir);
   let new_dir = map.admit(&rename.new_dir);
@@ -176,17 +185,30 @@ fn admit_rename(map: &mut FidMap, event: &RawFanotifyEvent, rename: &RenameInfo)
     .map(|dir| join_name(dir, &rename.new_name))
     .unwrap_or_else(|| PathBuf::from(&os_name(&rename.new_name)));
 
-  // A directory move within/into/out of the root maintains admission: the old
-  // handle stops admitting, the new one re-enters under the destination
-  // directory (when that end is in-root and the object's FID is known).
+  // A directory move maintains admission and, for a DIRECTORY target, its
+  // identity. Identity is directory-only (a file move attaches `None`): file
+  // identity is inert under the kernel-recursive profile and interning file
+  // targets would leak the intern table under churn.
   let moved_fid = event.target_fid.as_ref();
-  let identity = moved_fid.map(|fid| map.intern(fid));
+  let identity = if event.mask.ondir() {
+    moved_fid.map(|fid| map.intern(fid))
+  } else {
+    None
+  };
   if event.mask.ondir()
     && let Some(fid) = moved_fid
   {
-    map.forget(fid);
     if new_dir.is_some() {
+      // In-root destination: re-parent by inserting under the new parent. The
+      // moved object keeps its handle (and thus its interned id), so `learn`
+      // overwrites its node in place — identity is STABLE across the rename, and
+      // its descendants follow via the updated parent link. No id-pruning forget:
+      // the object did not depart, so pruning then re-minting would fork identity.
       map.learn(&rename.new_dir, &rename.new_name, Some(fid));
+    } else {
+      // Moved OUT of the root: drop admission AND the interned id (departed). A
+      // later move back mints a fresh identity — the conservative direction.
+      map.forget(fid);
     }
   }
 
@@ -334,7 +356,7 @@ pub(crate) mod reader;
 
 #[cfg(all(target_os = "linux", not(miri)))]
 #[allow(unused_imports)]
-pub(crate) use source::{Source, SourceHandle};
+pub(crate) use source::{FanotifySpawn, Source, SourceHandle};
 
 #[cfg(all(target_os = "linux", not(miri)))]
 mod source;

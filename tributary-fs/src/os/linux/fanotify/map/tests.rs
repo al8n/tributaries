@@ -156,13 +156,17 @@ fn learn_rejects_non_component_names() {
   assert_eq!(map.dir_count(), 2, "no non-component name is admitted");
 }
 
-/// `forget` drops a directory from admission (delete / rename-out) but keeps
-/// its interned id — a stale record for the old handle keeps its old identity
-/// rather than colliding with a fresh object.
+/// `forget` drops a directory from BOTH admission and the intern table (delete /
+/// rename-out): pruning the id bounds the table at O(live directories). A
+/// departed-and-returned directory mints a FRESH identity — the conservative
+/// direction (the Monitor reads inequality as a replacement, never a false
+/// survivor), and safe because only the SAME handle (the same object) could ever
+/// re-mint the old id.
 #[test]
-fn forget_drops_admission_but_keeps_identity() {
+fn forget_prunes_admission_and_identity() {
   let mut map = seeded();
   let sub_id = map.intern(&fid(2));
+  assert_eq!(map.interned_count(), 2, "root + sub interned");
   map.forget(&fid(2));
   assert_eq!(
     map.admit(&fid(2)),
@@ -171,9 +175,14 @@ fn forget_drops_admission_but_keeps_identity() {
   );
   assert_eq!(map.dir_count(), 1);
   assert_eq!(
+    map.interned_count(),
+    1,
+    "the forgotten directory's id is pruned — only the root remains interned"
+  );
+  assert_ne!(
     map.intern(&fid(2)),
     sub_id,
-    "the identity is retained, never recycled"
+    "a returned directory mints a new identity, never reuses the departed id"
   );
 }
 
@@ -277,26 +286,36 @@ fn orphaned_node_is_evicted_on_miss() {
 }
 
 /// The reseed rebuilds the admission structure from a fresh walk and swaps it
-/// in: a directory the firehose dropped during a loss window (never learned)
-/// is admitted after the reseed re-observes it, and a directory that vanished
-/// is pruned — while every interned identity survives.
+/// in: a directory the firehose dropped during a loss window (never learned) is
+/// admitted after the reseed re-observes it, a directory that vanished is pruned,
+/// and a directory that PERSISTED keeps its interned identity — while a vanished
+/// directory's id is pruned so the intern table stays O(live directories).
 #[test]
-fn reseed_rebuilds_and_preserves_identity() {
-  let mut map = seeded();
+fn reseed_preserves_live_ids_and_prunes_vanished() {
+  let mut map = FidMap::new();
+  // /root, /root/sub, /root/keep — three seeded directories.
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+    SeedEntry::child(fid(3), fid(1), OsString::from("keep")),
+  ]);
   // Identities minted before the loss.
   let root_id = map.intern(&fid(1));
+  let keep_id = map.intern(&fid(3));
   let sub_id = map.intern(&fid(2));
+  assert_eq!(map.interned_count(), 3);
   // During the loss, /root/sub was removed and /root/fresh (fid 7, with a child
-  // fid 8) was created — the firehose missed both, so the live map is stale.
+  // fid 8) was created; /root/keep persisted — the firehose missed all of it.
   assert_eq!(
     map.admit(&fid(7)),
     None,
     "the fresh dir is unknown pre-reseed"
   );
 
-  // Reseed from the fresh walk: /root, /root/fresh, /root/fresh/deep.
+  // Reseed from the fresh walk: /root, /root/keep, /root/fresh, /root/fresh/deep.
   map.reseed([
     SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(3), fid(1), OsString::from("keep")),
     SeedEntry::child(fid(7), fid(1), OsString::from("fresh")),
     SeedEntry::child(fid(8), fid(7), OsString::from("deep")),
   ]);
@@ -304,18 +323,32 @@ fn reseed_rebuilds_and_preserves_identity() {
   // The previously-unknown directories now admit.
   assert_eq!(map.admit(&fid(7)), Some(PathBuf::from("/root/fresh")));
   assert_eq!(map.admit(&fid(8)), Some(PathBuf::from("/root/fresh/deep")));
-  // The vanished directory is pruned.
+  // The vanished directory is pruned from admission.
   assert_eq!(
     map.admit(&fid(2)),
     None,
     "a vanished dir is gone after reseed"
   );
-  // Identities are stable across the reseed (never recycled).
-  assert_eq!(map.intern(&fid(1)), root_id);
+  // The intern table now holds exactly the four LIVE directories (root, keep,
+  // fresh, deep) — the vanished sub's id was pruned, never leaked.
   assert_eq!(
+    map.interned_count(),
+    4,
+    "reseed pruned the vanished dir's id and kept the four live ones"
+  );
+  // Live directories keep their identities across the reseed.
+  assert_eq!(map.intern(&fid(1)), root_id, "the root keeps its id");
+  assert_eq!(
+    map.intern(&fid(3)),
+    keep_id,
+    "a directory that persisted through the loss keeps its id"
+  );
+  // The intern table is bounded by the LIVE directory count: the vanished dir's
+  // id was pruned, so re-interning it mints a fresh id (never the departed one).
+  assert_ne!(
     map.intern(&fid(2)),
     sub_id,
-    "even a pruned directory keeps its old identity"
+    "a vanished directory's id is pruned; a reappearance mints fresh"
   );
 }
 

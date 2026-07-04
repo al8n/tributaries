@@ -327,6 +327,16 @@ pub enum ProbeStage {
   /// `name_to_handle_at` on the root was refused — the filesystem cannot export
   /// file handles, so FID identity is impossible (`EOPNOTSUPP`).
   Handle,
+  /// The seed walk could not fully enumerate the tree under the root: an
+  /// EXISTING in-root directory could not be read or handle-encoded (`EACCES`
+  /// and friends), so the FID map would be born blind to that subtree and later
+  /// events under it would drop as outside-root with no loss signal. fanotify's
+  /// admission model requires a COMPLETE directory map, so an unwalkable tree is
+  /// a viability failure — `Backend::Auto` falls back to inotify (which surfaces
+  /// an unreadable directory natively through its per-directory arms), while a
+  /// forced [`Backend::Fanotify`] surfaces this. A directory that merely VANISHED
+  /// mid-walk (a benign race) never lands here — the walk skips it and proceeds.
+  Walk,
 }
 
 impl ProbeStage {
@@ -337,6 +347,7 @@ impl ProbeStage {
       Self::Init => "fanotify_init",
       Self::Mark => "fanotify_mark(FAN_MARK_FILESYSTEM)",
       Self::Handle => "name_to_handle_at",
+      Self::Walk => "seed-walk completeness",
     }
   }
 }
@@ -416,12 +427,14 @@ pub enum SourceError {
   /// The OS could not start the event stream.
   #[error("the OS could not start the event stream")]
   StartFailed,
-  /// A forced [`Backend::Fanotify`] failed a precondition probe (design §5): the
-  /// named stage was refused, so the backend cannot start. `Backend::Auto`
-  /// falls back to inotify instead of surfacing this.
+  /// A forced [`Backend::Fanotify`] failed a precondition (design §5): the named
+  /// stage was refused (`Init`/`Mark`/`Handle`) or the seed walk found the tree
+  /// not fully walkable (`Walk` — an existing in-root directory the map could
+  /// not admit), so the backend cannot start. `Backend::Auto` falls back to
+  /// inotify instead of surfacing this.
   #[error("the fanotify backend is unavailable: {stage} was refused")]
   BackendProbeFailed {
-    /// The first probe stage that failed.
+    /// The precondition stage that failed.
     stage: ProbeStage,
   },
   /// The decode callback panicked; the stream is poisoned.
