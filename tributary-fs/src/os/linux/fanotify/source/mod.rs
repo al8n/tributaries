@@ -27,6 +27,36 @@
 //! directory can never be descended or handle-encoded — the open fails, the entry
 //! is skipped, and no foreign FID is admitted. The walk-root open uses `openat2`
 //! with `RESOLVE_NO_SYMLINKS` (kernel floor argued on [`open_walk_dir`]).
+//!
+//! # The closing invariant: every map-mutating fd is verified
+//!
+//! `RESOLVE_NO_SYMLINKS`/`O_NOFOLLOW` stop a SYMLINK swap, but one
+//! `FAN_MARK_FILESYSTEM` mark covers the whole superblock — so a plain
+//! same-superblock DIRECTORY swapped in at a path opens and exports a handle just
+//! like the object that was there, and a symlink-fence alone would let its FID seed
+//! the map. The scope-fence therefore rests on a stronger, exhaustive rule:
+//!
+//! > Every fd whose contents mutate the map is one of — (a) DERIVED FROM THE SPAWN
+//! > PIN (the gate/mark/identity object: the seed-walk root inherits a clone of it,
+//! > and the pinned ancestors + probe all descend from it); (b) VERIFIED AGAINST A
+//! > REQUEST-FIXED EXPECTED FID before it mutates the map (the live-reseed root
+//! > against the spawn anchor [`ReseedContext::root_fid`]; a pending move-in subtree
+//! > against the moved dir's learned FID); or (c) INDUCTIVELY VERIFIED VIA ITS
+//! > PARENT CHAIN (a per-child walk open is a single-component `openat` NOFOLLOW
+//! > from an already-verified parent fd, its `st_dev` fenced to the root device —
+//! > verified parent + single-component NOFOLLOW open + device check = verified
+//! > child).
+//!
+//! The per-child case (c) records the CURRENT object at `(parent, name)`: if a
+//! same-name replacement lands between the `readdir` listing and the child open,
+//! the handle encoded from the opened fd is the REPLACEMENT's, linked under the
+//! verified parent with the correct name — which is completeness-correct, because
+//! the map's job there is to record whatever object currently bears that name, and
+//! that object's own events carry its FID. This is exactly why (c) differs from
+//! (b): the reseed-root and move-in-subtree cases have an EXPECTED identity fixed
+//! by the request (the anchor / the learned FID), so a swap there is a foreign
+//! substitution to reject; a fresh per-child listing fixes no prior identity, so
+//! recording the current object is the honest outcome.
 
 use std::{
   fs, io,
@@ -176,6 +206,24 @@ impl Source {
     let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
     let mounts = mounts_under(&canonical).unwrap_or_default();
 
+    // The root's FID — encoded from the PIN, so it names exactly the object the
+    // mark covers — is the map's anchor AND the identity a live reseed must land
+    // back on. A `FAN_MARK_FILESYSTEM` mark covers the whole superblock, so a
+    // same-superblock directory swapped in at the root PATH between spawn and a
+    // later loss would open (it is symlink-free) and export a handle just fine;
+    // only comparing that handle to this captured anchor tells the replacement
+    // apart from the true root. Captured here from the pin so a re-resolution can
+    // never launder a different object into it.
+    let Some(root_fid) = handle_fid_at(root_fd, fsid) else {
+      return Err(SpawnFailure::Error(SourceError::RootUnavailable {
+        root: canonical.clone(),
+        source: io::Error::new(
+          io::ErrorKind::Unsupported,
+          "the watched root does not export a file handle",
+        ),
+      }));
+    };
+
     // Seed the map by walking the root: every directory's FID (built from the
     // superblock fsid + its file handle) admits its own later events. The walk is
     // a fanotify PRECONDITION — an existing in-root directory it cannot map is a
@@ -187,12 +235,15 @@ impl Source {
       root: canonical.clone(),
       fsid,
       root_dev,
+      root_fid,
     };
     let mut map = FidMap::new();
     // The SPAWN seed roots at the pin (a dup of it, consumed by the descent), so
     // the root level never re-resolves `canonical` after the mark went live. The
     // live reseed inside the reader has no pin to inherit and re-opens the path
-    // itself (`RESOLVE_NO_SYMLINKS`), the documented reseed shape.
+    // itself (`RESOLVE_NO_SYMLINKS`), then verifies the reopened object's handle
+    // against `reseed.root_fid` before touching the map — the documented reseed
+    // shape.
     let seed = reseed.seed_at_fd(root_fd).map_err(|err| match err {
       // The tree is not fully walkable: fanotify is not viable. Hand `config`
       // back so the dispatcher can fall back (Auto) or type the error (forced).
@@ -360,6 +411,15 @@ pub(crate) struct ReseedContext {
   /// The root device — the single-device descent boundary (a sub-mount lives on
   /// a different superblock this mark never reports on).
   root_dev: u64,
+  /// The spawn root's FID, captured from the PIN at spawn. A live reseed re-opens
+  /// the root by PATH (the spawn pin is long dropped), and one
+  /// `FAN_MARK_FILESYSTEM` mark covers the WHOLE superblock — so a same-superblock
+  /// directory swapped in at the root path opens and exports a handle just like the
+  /// true root, and only comparing the reopened handle to THIS anchor tells them
+  /// apart. The reseed requires equality before rebinding the live map, so a
+  /// replaced-at-path root becomes a failed reseed (retry → blind → fatal) rather
+  /// than the map silently rebinding to the replacement tree.
+  root_fid: Fid,
 }
 
 impl ReseedContext {
@@ -368,25 +428,37 @@ impl ReseedContext {
   /// walk to restore the map's sight is the honest cost of never going
   /// permanently blind after a covered loss.
   ///
-  /// Any [`WalkError`] — a vanished root, an unreadable subtree — folds into the
-  /// `io::Error` the reseed path escalates: `reseed_map` retries once, then a
-  /// second failure is `ReseedOutcome::Blind` → terminal `Fatal`. The
+  /// Any [`WalkError`] — a vanished root, an unreadable subtree, a root REPLACED at
+  /// its path (the reopened object's handle no longer equals the spawn anchor) —
+  /// folds into the `io::Error` the reseed path escalates: `reseed_map` retries
+  /// once, then a second failure is `ReseedOutcome::Blind` → terminal `Fatal`. The
   /// completeness rule is thus identical at spawn and reseed; only the spawn path
   /// gets to distinguish "not viable, fall back" from "genuinely gone".
+  ///
+  /// The reopened root is verified against [`root_fid`](Self::root_fid): the spawn
+  /// pin is long gone, so this re-opens the root by PATH (`RESOLVE_NO_SYMLINKS`),
+  /// and since the mark covers the whole superblock a same-superblock directory
+  /// swapped in at the root path would open and export a handle just fine. Landing
+  /// the fatal (rather than keeping the stale map) is the honest terminal: the mark
+  /// still covers the superblock so the OLD tree may keep eventing, but the root's
+  /// path-authority is lost, and the mount/liveness refresh — which re-resolves the
+  /// root BY PATH — will reject it and kill the scope regardless; a fatal now is
+  /// that same death, sooner and without the map ever rebinding to the replacement.
   pub(crate) fn walk(&self) -> io::Result<Vec<SeedEntry>> {
-    seed_walk(&self.root, self.fsid, self.root_dev).map_err(WalkError::into_io)
+    seed_walk(&self.root, self.fsid, self.root_dev, &self.root_fid).map_err(WalkError::into_io)
   }
 
   /// The spawn-time seed, rooted at the dispatcher's PINNED root fd rather than a
   /// re-resolution of the path: the root level of the walk inherits the very
   /// object the gate, mark, and identity grounded on (a `try_clone` of the pin,
   /// consumed by the descent), so nothing the map commits can name a different
-  /// object than the mark covers. Every directory BELOW the root is still pinned
-  /// per-child by the fd-relative descent. Keeps the [`WalkError`] class so the
-  /// dispatcher can tell an unwalkable tree (fanotify not viable → fall back /
-  /// typed error) from a vanished root (root-unavailable). Only the pre-live spawn
-  /// calls this; the live reseed re-opens the path via the `io::Error`-folding
-  /// [`walk`](Self::walk).
+  /// object than the mark covers — no expected-FID check is needed because the fd
+  /// IS the pin (the `root_fid` anchor was itself encoded from it). Every directory
+  /// BELOW the root is still pinned per-child by the fd-relative descent. Keeps the
+  /// [`WalkError`] class so the dispatcher can tell an unwalkable tree (fanotify not
+  /// viable → fall back / typed error) from a vanished root (root-unavailable). Only
+  /// the pre-live spawn calls this; the live reseed re-opens the path via the
+  /// `io::Error`-folding [`walk`](Self::walk).
   fn seed_at_fd(&self, root_fd: BorrowedFd<'_>) -> Result<Vec<SeedEntry>, WalkError> {
     let root_fd = root_fd.try_clone_to_owned().map_err(WalkError::RootGone)?;
     seed_from_fd(root_fd, &self.root, self.fsid, self.root_dev)
@@ -521,18 +593,45 @@ fn open_walk_dir(root: &Path) -> Result<OwnedFd, Errno> {
 }
 
 /// The LIVE-reseed seed walk: re-opens `root` as a pinned fd
-/// ([`open_walk_dir`], `RESOLVE_NO_SYMLINKS`) and seeds from it. The reader owns
-/// no dispatcher pin (the spawn's pin is long dropped), so a loss re-derives the
-/// root fd from the path here — still no-symlink-resolved, so a swap fails the
+/// ([`open_walk_dir`], `RESOLVE_NO_SYMLINKS`), VERIFIES the reopened object's
+/// handle equals `expected` (the spawn root anchor), and seeds from it. The reader
+/// owns no dispatcher pin (the spawn's pin is long dropped), so a loss re-derives
+/// the root fd from the path here — still no-symlink-resolved, so a swap fails the
 /// open rather than redirecting it. The pre-live SPAWN seed instead inherits the
 /// dispatcher's pin directly ([`ReseedContext::seed_at_fd`]); both funnel into the
 /// shared [`seed_from_fd`].
-fn seed_walk(root: &Path, fsid: [u8; 8], root_dev: u64) -> Result<Vec<SeedEntry>, WalkError> {
+///
+/// `RESOLVE_NO_SYMLINKS` alone is NOT enough here: one `FAN_MARK_FILESYSTEM` mark
+/// covers the whole superblock, so a plain same-superblock directory swapped in at
+/// the root path (no symlink) opens fine and exports its own handle — and reseeding
+/// the LIVE admission map from it would rebind the whole scope to the replacement
+/// tree (foreign delivery, original-root events silently dropped). So the reopened
+/// handle is required to equal the spawn anchor before the descent; a mismatch is a
+/// [`WalkError::RootGone`] (the root object is gone from its path), folding to the
+/// reseed's retry-once-then-blind→fatal — the terminal the replaced-root machinery
+/// owes, never a live map bound to a foreign root.
+fn seed_walk(
+  root: &Path,
+  fsid: [u8; 8],
+  root_dev: u64,
+  expected: &Fid,
+) -> Result<Vec<SeedEntry>, WalkError> {
   // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
   // handle and its children both come from this fd, never a re-resolved name. A
   // failure to open it is a race reported as root-unavailable (the probe already
   // opened it).
   let root_fd = open_walk_dir(root).map_err(|err| WalkError::RootGone(err.into()))?;
+  // Verify the reopened object IS the spawn root before it can seed the map: a
+  // same-superblock replacement at the root path opens and exports a handle, so
+  // only this equality tells it apart from the true root. A non-encodable handle
+  // is treated identically to a mismatch — either way the reopened root is not the
+  // one the map anchors on, so it must not rebind the live map.
+  if !reopened_matches(root_fd.as_fd(), fsid, expected) {
+    return Err(WalkError::RootGone(io::Error::new(
+      io::ErrorKind::NotFound,
+      "the watched root was replaced at its path (reopened handle does not match the spawn root)",
+    )));
+  }
   seed_from_fd(root_fd, root, fsid, root_dev)
 }
 
@@ -609,6 +708,18 @@ fn seed_from_fd(
 /// directory. It is therefore all classified `Incomplete`, folding to the
 /// reader's retry-once-then-blind→fatal escalation — rather than swallowed as an
 /// empty subtree that would leave the moved dir's descendants blind forever.
+///
+/// The reopened directory's handle is VERIFIED against `subtree_fid` before the
+/// descent: the expected identity here is REQUEST-FIXED (the FID the map already
+/// learned the moved dir under), and the mark covers the whole superblock, so a
+/// plain same-superblock directory swapped in at the resolved path (no symlink,
+/// `RESOLVE_NO_SYMLINKS` does not catch it) would otherwise seed the REPLACEMENT's
+/// descendants under the moved dir's FID — foreign admission under the moved-in
+/// identity. A mismatch is `Incomplete`; on the reader's single retry the map may
+/// have processed the replacing rename and re-resolved the moved dir to its true
+/// current path (the walk re-derives the path from the map each attempt, so the
+/// retry can land on a different, correct location), and a persistent mismatch
+/// escalates to fatal rather than admitting the foreign subtree.
 fn subtree_walk(
   subtree: &Path,
   subtree_fid: &Fid,
@@ -621,6 +732,17 @@ fn subtree_walk(
   // as an fd so the descent never re-resolves the moved dir's name (which an
   // in-root rename in the same batch could have made point elsewhere).
   let subtree_fd = open_walk_dir(subtree).map_err(|err| WalkError::Incomplete(err.into()))?;
+  // Verify the pinned object IS the moved directory the map learned before linking
+  // any descendant under its FID: a same-superblock replacement at the resolved
+  // path opens and exports a handle, so only this equality keeps the replacement's
+  // descendants from seeding under the moved-in identity. A non-encodable handle is
+  // treated as a mismatch — either way this is not the object the FID names.
+  if !reopened_matches(subtree_fd.as_fd(), fsid, subtree_fid) {
+    return Err(WalkError::Incomplete(io::Error::new(
+      io::ErrorKind::NotFound,
+      "the moved-in subtree path was replaced (reopened handle does not match the moved dir's fid)",
+    )));
+  }
   let mut seed = Vec::new();
   descend(subtree_fd, subtree_fid.clone(), fsid, root_dev, &mut seed)?;
   Ok(seed)
@@ -789,6 +911,32 @@ fn descend(
 /// resolves by retrying at the kernel-reported size).
 fn handle_fid_at(dirfd: BorrowedFd<'_>, fsid: [u8; 8]) -> Option<Fid> {
   super::encode_handle_at(dirfd).map(|handle| Fid::new(fsid, handle))
+}
+
+/// Whether the object pinned by `dirfd` is the one `expected` names: encodes the
+/// pinned fd's handle ([`handle_fid_at`]) and compares. The gate on a PATH-reopen
+/// whose expected identity is fixed by the request (the live-reseed root against
+/// the spawn anchor, a pending move-in subtree against its learned FID) — because
+/// the `FAN_MARK_FILESYSTEM` mark covers the whole superblock, a same-superblock
+/// directory swapped in at the reopened path opens and exports a handle just like
+/// the intended object, and only this equality tells the two apart.
+///
+/// The compare is delegated to the pure [`handles_match`] so the "non-encodable
+/// handle counts as a mismatch" policy is row-tested without a live fd. Both FIDs
+/// carry the SAME `fsid` (the caller's superblock id), so equality reduces to the
+/// handle bytes — the unique-within-a-superblock identity the map keys on.
+fn reopened_matches(dirfd: BorrowedFd<'_>, fsid: [u8; 8], expected: &Fid) -> bool {
+  handles_match(handle_fid_at(dirfd, fsid).as_ref(), expected)
+}
+
+/// The pure reopened-vs-expected decision: `true` only when the reopened object
+/// exported a handle (`Some`) that equals `expected`. A `None` (the reopened
+/// object exports no handle) is a MISMATCH — the reopened path is not the object
+/// the request fixed, so it must not seed/reseed the map — never silently treated
+/// as a match. Extracted so the FID-verification gate is row-testable like
+/// [`classify_walk_skip`], with no live fd.
+fn handles_match(reopened: Option<&Fid>, expected: &Fid) -> bool {
+  reopened == Some(expected)
 }
 
 /// Interprets a raw directory-entry `CStr` name as an `OsString` for a

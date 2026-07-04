@@ -2,8 +2,36 @@ use std::io;
 
 use rustix::io::Errno;
 
-use super::{WalkError, WalkSkip, classify_walk_skip, seed_walk, subtree_walk};
+use super::{
+  WalkError, WalkSkip, classify_walk_skip, handle_fid_at, handles_match, seed_walk, subtree_walk,
+};
 use crate::os::linux::fanotify::fid::Fid;
+
+/// A throwaway FID whose handle bytes are the given tag — a stand-in the walk's
+/// FID-verification gate rejects when it does not equal a reopened object's true
+/// handle. `fsid` is zeroed so it matches the `[0u8; 8]` the seed-walk rows pass.
+fn some_fid(tag: u8) -> Fid {
+  Fid::new([0u8; 8], Box::from(&[tag][..]))
+}
+
+/// Encodes the REAL FID of an existing directory the same way the walk does
+/// (fd-relative `name_to_handle_at`), so a matching-FID row can hand `seed_walk`
+/// the exact anchor its reopen must equal. `None` when the temp filesystem exports
+/// no handle (the caller skips loudly, exactly like the walk rows already do).
+fn real_dir_fid(path: &std::path::Path, fsid: [u8; 8]) -> Option<Fid> {
+  use std::os::fd::AsFd;
+
+  use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+  let fd = openat2(
+    rustix::fs::CWD,
+    path,
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+    Mode::empty(),
+    ResolveFlags::NO_SYMLINKS,
+  )
+  .ok()?;
+  handle_fid_at(fd.as_fd(), fsid)
+}
 
 /// A root that cannot export a file handle is a FATAL seed/reseed failure, never
 /// an empty successful seed: the root anchor is the base every admitted path
@@ -14,7 +42,9 @@ use crate::os::linux::fanotify::fid::Fid;
 #[test]
 fn root_without_a_handle_is_a_fatal_seed_failure() {
   let missing = std::path::Path::new("/tributary-fs-nonexistent-root-for-seed-walk");
-  let result = seed_walk(missing, [0u8; 8], 0);
+  // The open fails (ENOENT) before the FID check is reached, so any expected FID
+  // will do — the point is the RootGone class, not the mismatch.
+  let result = seed_walk(missing, [0u8; 8], 0, &some_fid(1));
   assert!(
     matches!(result, Err(WalkError::RootGone(_))),
     "a root with no encodable handle fails the walk as RootGone, not an empty seed"
@@ -76,6 +106,182 @@ fn walk_error_folds_to_io_for_the_reseed_path() {
   assert_eq!(gone.into_io().kind(), io::ErrorKind::NotFound);
 }
 
+/// The pure reopened-vs-expected gate ([`handles_match`]) — the FID-verification
+/// decision extracted so its policy is row-tested without a live fd. A reopened
+/// handle equal to the expected is a match; an unequal handle, and a `None`
+/// (reopened object exports no handle), are both mismatches: a PATH-reopen whose
+/// identity the request fixed (the live-reseed root vs the spawn anchor, a pending
+/// move-in subtree vs its learned FID) must not seed/reseed the map unless the
+/// object it reopened is provably the expected one.
+#[test]
+fn handles_match_only_on_an_equal_reopened_handle() {
+  let expected = some_fid(1);
+  assert!(
+    handles_match(Some(&expected), &expected),
+    "an equal reopened handle is a match — the reopen landed on the expected object"
+  );
+  assert!(
+    !handles_match(Some(&some_fid(2)), &expected),
+    "a different reopened handle is a mismatch — a same-superblock replacement, rejected"
+  );
+  assert!(
+    !handles_match(None, &expected),
+    "a reopened object that exports no handle is a mismatch, never a silent match"
+  );
+}
+
+/// The reseed-root FID gate, exercised on a REAL filesystem: `seed_walk` over an
+/// existing, walkable root whose reopened handle does NOT equal the `expected`
+/// anchor fails [`WalkError::RootGone`] — the replaced-at-path signal the reseed
+/// folds to retry-once-then-blind→fatal — WITHOUT descending or seeding.
+/// This is the same-superblock root-replacement the pin's `RESOLVE_NO_SYMLINKS`
+/// cannot catch (no symlink involved): only the anchor equality tells the
+/// replacement from the true root. A wrong expected FID stands in for "the object
+/// at the root path is not the one the map anchors on".
+#[test]
+fn reseed_root_fid_mismatch_is_rootgone_without_seeding() {
+  use std::os::unix::fs::MetadataExt;
+
+  let root = std::env::temp_dir().join(format!(
+    "tributary-fs-reseed-mismatch-{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(root.join("sub")).expect("create a walkable root");
+  let Ok(meta) = std::fs::metadata(&root) else {
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+  let root_dev = meta.dev();
+  // Prove the root DOES export a handle (else the mismatch is indistinguishable
+  // from the non-encodable case and the cell cannot assert its property).
+  if real_dir_fid(&root, [0u8; 8]).is_none() {
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!(
+      "SKIP reseed_root_fid_mismatch_is_rootgone_without_seeding: temp root exports no handle"
+    );
+    return;
+  }
+  // A DELIBERATELY WRONG anchor: the real root will never encode to these bytes,
+  // so the reopen-verification must reject it.
+  let wrong = some_fid(0xEE);
+  let result = seed_walk(&root, [0u8; 8], root_dev, &wrong);
+  let _ = std::fs::remove_dir_all(&root);
+  assert!(
+    matches!(result, Err(WalkError::RootGone(_))),
+    "a reopened root whose handle does not equal the expected anchor is RootGone (replaced at \
+     path), never a seed of the replacement tree"
+  );
+}
+
+/// The reseed-root gate's MATCHING-FID row on a real filesystem: `seed_walk` handed
+/// the root's REAL FID as `expected` proceeds normally — the gate passes and the
+/// root anchor is seeded. Guards against the verification over-rejecting the genuine
+/// root (a false-positive that would turn every real reseed into a fatal).
+#[test]
+fn reseed_root_fid_match_seeds_normally() {
+  use std::os::unix::fs::MetadataExt;
+
+  let root = std::env::temp_dir().join(format!("tributary-fs-reseed-match-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(root.join("sub")).expect("create a walkable root");
+  let Ok(meta) = std::fs::metadata(&root) else {
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+  let root_dev = meta.dev();
+  let Some(expected) = real_dir_fid(&root, [0u8; 8]) else {
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("SKIP reseed_root_fid_match_seeds_normally: temp root exports no handle");
+    return;
+  };
+  let result = seed_walk(&root, [0u8; 8], root_dev, &expected);
+  let _ = std::fs::remove_dir_all(&root);
+  let entries = result.expect("the genuine root passes the FID gate and seeds");
+  // The root anchor plus its `sub` child — the gate did not block the real root.
+  assert!(
+    entries.iter().any(|e| e.parent.is_none()),
+    "the matching-FID walk seeded the root anchor"
+  );
+  assert!(
+    entries
+      .iter()
+      .any(|e| e.name == std::ffi::OsStr::new("sub") && e.parent.is_some()),
+    "the matching-FID walk descended into the child"
+  );
+}
+
+/// The pending move-in subtree FID gate on a real filesystem: `subtree_walk`
+/// whose reopened directory's handle does NOT equal the `subtree_fid` the map
+/// learned fails [`WalkError::Incomplete`] — folding to the reader's
+/// retry-then-fatal — WITHOUT linking any descendant under the moved-in identity.
+/// A wrong `subtree_fid` stands in for a same-superblock directory swapped in at
+/// the resolved path (whose descendants would otherwise seed under the moved dir's
+/// FID — foreign admission).
+#[test]
+fn subtree_fid_mismatch_is_incomplete_without_seeding() {
+  use std::os::unix::fs::MetadataExt;
+
+  let subtree = std::env::temp_dir().join(format!(
+    "tributary-fs-subtree-mismatch-{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&subtree);
+  std::fs::create_dir_all(subtree.join("child")).expect("create a walkable subtree");
+  let Ok(meta) = std::fs::metadata(&subtree) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    return;
+  };
+  let root_dev = meta.dev();
+  if real_dir_fid(&subtree, [0u8; 8]).is_none() {
+    let _ = std::fs::remove_dir_all(&subtree);
+    eprintln!("SKIP subtree_fid_mismatch_is_incomplete_without_seeding: temp fs exports no handle");
+    return;
+  }
+  // A wrong learned FID: the real reopened subtree will not encode to these bytes.
+  let wrong = some_fid(0xAB);
+  let result = subtree_walk(&subtree, &wrong, [0u8; 8], root_dev);
+  let _ = std::fs::remove_dir_all(&subtree);
+  assert!(
+    matches!(result, Err(WalkError::Incomplete(_))),
+    "a reopened subtree whose handle does not equal the learned FID is Incomplete, never a seed \
+     of the replacement's descendants under the moved-in identity"
+  );
+}
+
+/// The move-in subtree gate's MATCHING-FID row on a real filesystem: `subtree_walk`
+/// handed the subtree's REAL FID as `subtree_fid` proceeds normally — the
+/// descendants map under it. Guards the verification against over-rejecting the
+/// genuine moved dir.
+#[test]
+fn subtree_fid_match_seeds_descendants() {
+  use std::os::unix::fs::MetadataExt;
+
+  let subtree =
+    std::env::temp_dir().join(format!("tributary-fs-subtree-match-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&subtree);
+  std::fs::create_dir_all(subtree.join("child")).expect("create a walkable subtree");
+  let Ok(meta) = std::fs::metadata(&subtree) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    return;
+  };
+  let root_dev = meta.dev();
+  let Some(subtree_fid) = real_dir_fid(&subtree, [0u8; 8]) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    eprintln!("SKIP subtree_fid_match_seeds_descendants: temp fs exports no handle");
+    return;
+  };
+  let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev);
+  let _ = std::fs::remove_dir_all(&subtree);
+  let entries = result.expect("the genuine subtree passes the FID gate and seeds descendants");
+  assert!(
+    entries
+      .iter()
+      .any(|e| e.name == std::ffi::OsStr::new("child") && e.parent.as_ref() == Some(&subtree_fid)),
+    "the matching-FID subtree walk mapped the descendant under the moved dir's FID"
+  );
+}
+
 /// The real walk over a root whose CHILD directory this process cannot read
 /// returns [`WalkError::Incomplete`] — the seed walk itself (not just the pure
 /// classifier) refuses to seed a blind subtree. Self-probing: root with
@@ -115,7 +321,18 @@ fn unreadable_child_makes_the_real_walk_incomplete() {
     return;
   }
 
-  let result = seed_walk(&root, [0u8; 8], root_dev);
+  // Hand the walk the root's REAL FID so its reopen-verification passes and the
+  // descent reaches the unreadable child (a wrong expected FID would fail RootGone
+  // at the root, never exercising the child path this cell is about).
+  let Some(expected) = real_dir_fid(&root, [0u8; 8]) else {
+    let _ = std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!(
+      "SKIP unreadable_child_makes_the_real_walk_incomplete: the temp root exports no handle"
+    );
+    return;
+  };
+  let result = seed_walk(&root, [0u8; 8], root_dev, &expected);
   // Restore permissions BEFORE asserting so cleanup always succeeds.
   let _ = std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755));
   let _ = std::fs::remove_dir_all(&root);
@@ -153,9 +370,15 @@ fn subtree_walk_maps_descendants_not_the_root() {
     return;
   };
   let root_dev = meta.dev();
-  // A stand-in FID for the already-learned moved directory; its bytes are
-  // irrelevant to the descent (only the seed entries' parent links are checked).
-  let subtree_fid = Fid::new([7; 8], Box::from(&[7u8][..]));
+  // The moved dir's learned FID must be its REAL handle now — the subtree walk
+  // verifies the reopened directory against it before descending, so a
+  // stand-in FID would be rejected as a same-superblock replacement. Encode it the
+  // way the reader would have when it learned the move-in.
+  let Some(subtree_fid) = real_dir_fid(&subtree, [0u8; 8]) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    eprintln!("SKIP subtree_walk_maps_descendants_not_the_root: temp fs exports no handles");
+    return;
+  };
 
   let result = subtree_walk(&subtree, &subtree_fid, [0u8; 8], root_dev);
   let _ = std::fs::remove_dir_all(&subtree);
@@ -210,7 +433,16 @@ fn subtree_walk_unreadable_descendant_is_incomplete() {
     return;
   };
   let root_dev = meta.dev();
-  let subtree_fid = Fid::new([7; 8], Box::from(&[7u8][..]));
+  // The moved dir's learned FID must be the top's REAL handle so the subtree walk's
+  // reopen-verification passes and the descent reaches the unreadable
+  // `blocked` child — the intended incompleteness (a stand-in FID would fail the
+  // top-level gate instead, a different failure than this cell asserts). The top is
+  // readable, so it encodes even while `blocked` is 000.
+  let Some(subtree_fid) = real_dir_fid(&subtree, [0u8; 8]) else {
+    let _ = std::fs::remove_dir_all(&subtree);
+    eprintln!("SKIP subtree_walk_unreadable_descendant_is_incomplete: temp fs exports no handles");
+    return;
+  };
 
   if std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).is_err() {
     let _ = std::fs::remove_dir_all(&subtree);

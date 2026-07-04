@@ -844,6 +844,242 @@ async fn racing_root_path_swap_never_goes_live_listening_elsewhere() {
   let _ = std::fs::remove_dir_all(&other);
 }
 
+/// Suite 12 (reseed root pin, RACE) — the best-effort guard for a ROOT REPLACED at
+/// its path while watched. A live reseed (loss → full re-walk) re-opens the root by
+/// PATH; `RESOLVE_NO_SYMLINKS` stops a symlink swap, but a PLAIN same-superblock
+/// directory swapped in at the root path (mv the root away + mkdir the same name)
+/// opens and exports a handle just like the true root — so a reseed that did not
+/// re-verify would rebind the LIVE admission map to the REPLACEMENT tree, delivering
+/// the replacement's events as in-root and dropping the original root's forever,
+/// with no death. Verifying the reopened handle against the spawn anchor makes such
+/// a reseed a failed attempt (retry → blind → fatal), the terminal the replaced-root
+/// machinery owes.
+///
+/// The property is HONESTY under the replacement, asserted one-sided like the other
+/// race cells: after the root is replaced at its path, an event inside the
+/// REPLACEMENT tree must NEVER be delivered as in-root. The watcher may die
+/// terminally (the anchor-mismatch reseed OR the periodic liveness refresh, whose
+/// root re-stat finds a different `(dev,ino)`, lowers the death lifecycle) or keep
+/// delivering only pre-replacement truth — both are correct. The one outcome
+/// forbidden is a live handle delivering the replacement subtree's events. A short
+/// liveness interval bounds the refresh-death arm; heavy churn best-effort provokes
+/// a loss to exercise the reseed arm.
+#[tokio::test]
+async fn racing_root_replacement_never_reseeds_onto_the_replacement() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!(
+      "SKIP racing_root_replacement_never_reseeds_onto_the_replacement: no ext4 loopback (--privileged)"
+    );
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+
+  for attempt in 0..6u32 {
+    // A parent holding the watched root under a STABLE name: `parent/root`. The
+    // replacement swaps the whole directory object out (mv away + mkdir same name),
+    // so the path stays valid but names a DIFFERENT same-superblock directory.
+    let parent = scratch_under(&mount, &format!("root-replace-{attempt}"));
+    let root = parent.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // A short liveness interval so the refresh-death arm is reachable inside the
+    // deadline; the reseed arm needs only that a loss fire while replaced.
+    let options = WatcherOptions::new()
+      .with_backend(Backend::Fanotify)
+      .with_root_liveness_interval(Duration::from_millis(300));
+    let w = TokioWatcher::new(options).expect("build watcher");
+    let Ok(handle) = w.watch(&root, Interest::all()).await else {
+      eprintln!(
+        "SKIP racing_root_replacement_never_reseeds_onto_the_replacement: fanotify unavailable"
+      );
+      return;
+    };
+    let mut w = w;
+
+    // Prove the mark is live on the ORIGINAL root before the replacement.
+    std::fs::write(root.join("alive.txt"), b"a").unwrap();
+    assert!(
+      wait_for(&mut w, |e| covers(e, &root.join("alive.txt")))
+        .await
+        .is_some(),
+      "the mark is live on the original root before the replacement (attempt {attempt})"
+    );
+
+    // Replace the root object at its path: mv the original away, mkdir a fresh
+    // directory under the same name. `replacement` is a DISTINCT same-superblock
+    // directory; anything created inside it is replacement-only truth.
+    let moved_away = parent.join("root-original");
+    std::fs::rename(&root, &moved_away).unwrap();
+    std::fs::create_dir(&root).unwrap();
+
+    // Churn hard inside the REPLACEMENT to (best-effort) provoke a loss AND to give
+    // the reseed something foreign to (wrongly) admit. `replacement_marker` is the
+    // canary: if any of this ever delivers as in-root, the map rebound onto the
+    // replacement — the breach the fix removes.
+    let replacement_dir = root.join("replacement-subtree");
+    std::fs::create_dir_all(&replacement_dir).unwrap();
+    for i in 0..500 {
+      let f = replacement_dir.join(format!("noise-{i}.txt"));
+      let _ = std::fs::write(&f, b"n");
+      let _ = std::fs::remove_file(&f);
+    }
+    let replacement_marker = replacement_dir.join("canary.txt");
+    std::fs::write(&replacement_marker, b"c").unwrap();
+
+    // The one forbidden outcome: an event NAMING the replacement subtree delivered
+    // as in-root. A dead handle (stream ended / terminal) is legal; a live handle
+    // delivering only the pre-replacement `alive.txt` or a terminal `Rescan` is
+    // legal. A path reaching into `replacement-subtree` is the breach.
+    let breach = tokio::time::timeout(Duration::from_secs(3), async {
+      while let Some(event) = w.next().await {
+        let path = event.path().to_path_buf();
+        if path.starts_with(&replacement_dir) {
+          return Some(path);
+        }
+      }
+      None
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(
+      breach.is_none(),
+      "a root-replacement reseed rebound the live map onto the replacement subtree \
+       (attempt {attempt}): {breach:?}"
+    );
+
+    // The handle is either dead (the honest terminal) or still bound to the original
+    // root — never silently rebound. Both are accepted; we only forbade foreign
+    // delivery above. Clean up regardless.
+    let _ = w.unwatch(handle).await;
+    let _ = w.close().await;
+    let _ = std::fs::remove_dir_all(&parent);
+  }
+}
+
+/// Suite 12 (move-in subtree pin, RACE) — the best-effort guard for a MOVED-IN
+/// DIRECTORY REPLACED at its path before its deferred walk runs. A populated
+/// directory moved INTO the root is learned under its FID as `pending_walk`; the
+/// reader then walks
+/// its pre-existing descendants in, resolving the moved dir's CURRENT path through
+/// the map and re-opening it by PATH. `RESOLVE_NO_SYMLINKS` stops a symlink swap,
+/// but a PLAIN same-superblock directory swapped in at that resolved path (mv the
+/// moved-in dir away + mkdir the same name before the deferred walk runs) opens and
+/// exports a handle — so the pre-fix walk would seed the REPLACEMENT's PRE-EXISTING
+/// descendants under the moved dir's FID: a foreign subtree admitted under the
+/// moved-in identity, AND — because it seeds the wrong descendants — the TRUE moved
+/// dir's own pre-existing descendant left unmapped and BLIND. Verifying the reopened
+/// directory's handle against the learned FID makes such a walk `Incomplete` (→
+/// retry → fatal), so the walk either maps the genuine descendants or the scope dies
+/// and Auto re-selects — never a silent wrong-tree seed.
+///
+/// Best-effort by nature (winning the pre-walk window is timing-dependent), so it
+/// repeats, restoring the GENUINE moved dir (with its pre-existing `nested/deep.txt`)
+/// after the race so the assertion is deterministic. The property is COVERAGE
+/// HONESTY, expressed like [`burst_move_in_then_reparent_is_coverage_honest`]:
+/// mutating the true pre-existing descendant is delivered directly (the walk mapped
+/// the genuine subtree) OR a `Rescan` covers it (the walk re-opened a replacement,
+/// went `Incomplete`, and the death→re-enumerate path recovered it) — both accepted
+/// by `covers`. A pre-fix wrong-tree seed leaves the true descendant blind and never
+/// rescanned, so this times out: the exact silent foreign admission the fix removes.
+#[tokio::test]
+async fn racing_moved_in_replacement_is_coverage_honest() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!(
+      "SKIP racing_moved_in_replacement_is_coverage_honest: no ext4 loopback (--privileged)"
+    );
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+
+  for attempt in 0..8u32 {
+    let root = scratch_under(&mount, &format!("movein-replace-{attempt}"));
+    let outside = scratch_under(&mount, &format!("movein-replace-src-{attempt}"));
+    // The GENUINE populated tree built OUTSIDE the root (same superblock): its
+    // pre-existing descendant `nested/deep.txt` gets NO create event on the move-in
+    // (fanotify synthesizes none for a rename), so it is mapped ONLY if the deferred
+    // walk re-opens the true moved dir. A wrong-tree seed leaves it blind.
+    let src = outside.join("incoming");
+    std::fs::create_dir_all(src.join("nested")).unwrap();
+    std::fs::write(src.join("nested/deep.txt"), b"seed").unwrap();
+
+    let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+      // fanotify unavailable — the whole cell can only run privileged.
+      return;
+    };
+    std::fs::write(root.join("alive.txt"), b"a").unwrap();
+    assert!(
+      wait_for(&mut w, |e| covers(e, &root.join("alive.txt")))
+        .await
+        .is_some(),
+      "the mark is live before the move-in race (attempt {attempt})"
+    );
+
+    // A swap loop that (best-effort) replaces the moved-in dir at its destination
+    // path out from under the deferred subtree walk: mv the just-arrived dir away
+    // and mkdir a fresh same-superblock REPLACEMENT holding a DISTINCT pre-existing
+    // descendant, then restore the genuine dir. If the walk re-opens a replacement,
+    // the pre-fix seed would map the replacement's descendant under the moved dir's
+    // FID and miss the true `nested`; the fix's handle-verification rejects it.
+    let dest = root.join("incoming");
+    let dest_in_thread = dest.clone();
+    let stolen = root.join("incoming-stolen");
+    let stolen_in_thread = stolen.clone();
+    let swap_thread = std::thread::spawn(move || {
+      for _ in 0..200 {
+        if std::fs::rename(&dest_in_thread, &stolen_in_thread).is_ok() {
+          let _ = std::fs::create_dir(&dest_in_thread);
+          let _ = std::fs::create_dir_all(dest_in_thread.join("replacement-only"));
+          let _ = std::fs::remove_dir_all(&dest_in_thread);
+          // Restore the GENUINE moved dir so the next iteration races afresh and the
+          // post-join state converges on the true tree.
+          let _ = std::fs::rename(&stolen_in_thread, &dest_in_thread);
+        }
+      }
+    });
+
+    // Move the populated dir IN, racing the swap loop: the reader learns it pending
+    // and defers the subtree walk, which may re-open a REPLACEMENT the loop dropped.
+    let _ = std::fs::rename(&src, &dest);
+    let _ = swap_thread.join();
+
+    // Deterministically restore the GENUINE moved dir with its pre-existing
+    // descendant, wherever the race left it: the true tree may be at `incoming` or
+    // parked at `incoming-stolen`, or a replacement may sit at `incoming`. Force
+    // `incoming/nested/deep.txt` to exist as the genuine pre-existing descendant so
+    // the coverage assertion is about the true subtree, not a fresh create.
+    if std::fs::metadata(dest.join("nested/deep.txt")).is_err() {
+      let _ = std::fs::remove_dir_all(&dest);
+      if std::fs::rename(&stolen, &dest).is_err()
+        || std::fs::metadata(dest.join("nested/deep.txt")).is_err()
+      {
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(dest.join("nested")).unwrap();
+        std::fs::write(dest.join("nested/deep.txt"), b"seed").unwrap();
+      }
+    }
+    let _ = std::fs::remove_dir_all(&stolen);
+
+    // Coverage honesty of the TRUE pre-existing descendant: mutating it is delivered
+    // directly (genuine walk) OR rescan-covered (replacement re-open → Incomplete →
+    // death → re-enumerate) — never silently blind (the pre-fix wrong-tree seed).
+    let deep = dest.join("nested/deep.txt");
+    std::fs::write(&deep, b"after-race").unwrap();
+    assert!(
+      wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
+      "after a moved-in-replacement race, the true pre-existing descendant is delivered or \
+       rescan-covered — never silently blind (attempt {attempt})"
+    );
+    let _ = w.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+  }
+}
+
 /// Suite 11: unmount under watch (design §7 limitation, container-validated).
 ///
 /// A `FAN_MARK_FILESYSTEM` watcher receives NO kernel signal when its
