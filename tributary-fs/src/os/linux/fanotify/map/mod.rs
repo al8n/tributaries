@@ -264,6 +264,16 @@ impl FidMap {
     for entry in entries {
       self.insert_dir(entry, false);
     }
+    // The walk is the sole cap fence: it stops (anchor included) at the ceiling,
+    // so the vec `seed` receives already fits the cap — this map should never
+    // exceed it after a fresh seed. Pin that here so a future walk change that
+    // let an over-cap vec through would trip in tests rather than silently build
+    // a map the live `over_capacity` fatal must then catch. (`reseed` clears
+    // first, so it too seeds a fresh map against the full cap.)
+    debug_assert!(
+      !self.over_capacity(),
+      "a seed vec must already fit the directory cap: the walk fences it"
+    );
   }
 
   /// The admitted directory's path, or `None` when the handle is unknown —

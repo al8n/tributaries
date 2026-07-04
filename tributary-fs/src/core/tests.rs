@@ -3357,6 +3357,72 @@ mod descending {
     );
   }
 
+  /// Frame adoption is gated behind the identity match: a refresh whose sample is a
+  /// REPLACED root (a different `(dev, ino)`) carrying a fresh frame takes the death
+  /// path and NEVER adopts that frame. Because the executor now samples identity and
+  /// frame from ONE object, a `Present`-but-mismatched verdict IS that replacement's
+  /// own frame — adopting it would fence the live (still-original) scope's children
+  /// against the replacement's mount. `on_mounts_refreshed` evaluates the death gate
+  /// first and returns, so the frame block never runs; this pins that pairing.
+  #[test]
+  fn a_replaced_root_refresh_never_adopts_the_new_objects_frame() {
+    // Spawn on frame 42, descend a same-frame child so the scope has armed coverage
+    // and a captured frame to (not) overwrite.
+    let (mut core, scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![entry_on_mount("sub", FileKind::Dir, 1, 20, 42)]),
+    );
+    let sub_arm = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the same-frame child is descended and armed");
+    core.on_watch_installed(sub_arm, crate::os::linux::WatchOutcome::Installed(2));
+    let _ = drain(&mut core);
+
+    // The refresh's ONE sample is a REPLACED object (ino 999, was ino 1) on a new
+    // mount (77). Identity mismatch ⇒ MoveSelf death; the frame (77) rides the SAME
+    // sample but must NOT be adopted.
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 999)),
+        root_mnt_id: Some(77),
+      },
+      at(1),
+    );
+    let effects = drain(&mut core);
+
+    // A replaced root is a MoveSelf: it lowers its terminal Rescan (no Removed) and
+    // tears the stream down — the frame was never adopted because the identity did
+    // not match. A dead, torn-down scope has no live frame to observe: the teardown
+    // IS the proof the frame block never ran (it sits after the death gate, which
+    // returned first).
+    let emitted = emits(&effects);
+    assert_eq!(
+      emitted.len(),
+      1,
+      "a replaced root rescans (no Removed): {effects:?}"
+    );
+    assert!(
+      emitted[0].kind().is_rescan(),
+      "the replaced-root MoveSelf lowers its terminal rescan, never silent"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the replaced root's stream tears down rather than adopting the new frame: {effects:?}"
+    );
+  }
+
   #[test]
   fn inotify_events_lower_depth_one_with_native_cookies() {
     let (mut core, scope, req, root) = live_descending();

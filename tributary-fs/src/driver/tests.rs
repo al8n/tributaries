@@ -565,6 +565,49 @@ async fn refresh_finding_root_gone_dies_end_to_end() {
   );
 }
 
+/// The refresh samples the root's identity AND its mount frame from ONE object, so
+/// a replaced/re-mounted root can never pair the OLD identity's verdict with a NEW
+/// object's frame (the mixed sample the atomic `statx` restructure closes). The fake
+/// now reads both from one node, making the mix unrepresentable: after
+/// `replace_root_node` swaps the object at the root path, the refresh reports the
+/// REPLACED identity together with the replacement's frame — a matched pair, never a
+/// mix.
+#[tokio::test]
+async fn refresh_pairs_the_replaced_identity_with_its_own_frame() {
+  let fs = FakeFs::with_root_mnt_id(1, 42);
+  fs.put("/r", FileKind::Dir, 1);
+
+  // Baseline: the original root (ino 1) on mount 42 — identity and frame paired.
+  let before = fs.refresh_mounts(Path::new("/r"));
+  assert_eq!(
+    before.root,
+    RootLiveness::Present(RootIdentity::new(1, 1)),
+    "the original root samples its own identity"
+  );
+  assert_eq!(
+    before.root_mnt_id,
+    Some(42),
+    "the original root samples its own frame (42) from the same node"
+  );
+
+  // A replace/remount at the path: a DIFFERENT object (ino 2) on a DIFFERENT mount
+  // (77). The single-node read pairs THIS identity with THIS frame — the fake cannot
+  // emit ino-1's "matching" verdict beside mount-77's frame.
+  fs.replace_root_node("/r", 2, Some(77));
+  let after = fs.refresh_mounts(Path::new("/r"));
+  assert_eq!(
+    after.root,
+    RootLiveness::Present(RootIdentity::new(1, 2)),
+    "the replaced root reports the REPLACED identity (ino 2), not the old one"
+  );
+  assert_eq!(
+    after.root_mnt_id,
+    Some(77),
+    "the replaced root's frame (77) is paired with its OWN identity — never a mix with \
+     the old identity's verdict"
+  );
+}
+
 /// Every delivery carries the canonical root it assembles under, so the
 /// consumer never needs a registry entry — a reclaimed scope's trailing
 /// changes still name their absolute paths.

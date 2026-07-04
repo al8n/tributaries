@@ -318,6 +318,12 @@ impl WatcherOptions {
   ///   that silently stopped learning would drop events under the unlearned
   ///   directories forever, so the honest terminal is death, never silent loss.
   ///
+  /// A cap of `Some(0)` means the map may never hold even the root anchor, so the
+  /// seed walk is unviable for ANY root: under [`Backend::Auto`] this effectively
+  /// forces inotify (the fall-back path), and under a forced [`Backend::Fanotify`]
+  /// every root is the typed viability error. It is never silently normalized to a
+  /// live one-node map.
+  ///
   /// Ignored by inotify and by macOS (neither keeps a fanotify-style admission
   /// map).
   #[inline]

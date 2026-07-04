@@ -520,6 +520,59 @@ fn mnt_id_of(_path: &Path) -> Option<u64> {
   None
 }
 
+/// The root's liveness verdict AND its current mount frame from ONE `statx` sample
+/// (symlink not followed) — so the refresh pairs the identity it decides
+/// alive-vs-replaced on with the frame it adopts from the SAME object, never two
+/// separate path lookups a replace/remount could split. A single
+/// `statx(AT_FDCWD, root, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)`
+/// yields `(dev, ino)` for the liveness identity and `stx_mnt_id` for the frame in
+/// one atomic read: were these two reads (an `lstat` then a `statx`), a swap between
+/// them would let the OLD identity's "alive-and-matching" verdict adopt a DIFFERENT
+/// object's mount frame, over-/under-fencing genuine children until the next refresh
+/// healed it.
+///
+/// The frame is `Some` only when the sample's `stx_mask` reports the mount id (below
+/// Linux 5.8 the field is absent, `statx` is 4.11+ so the call itself is available
+/// on any floor either backend runs on) — a mask miss yields the identity from the
+/// SAME result with a `None` frame, so a transient miss never mispairs, it just
+/// declines the frame (the core keeps its captured one). `statx` maps to the
+/// [`RootLiveness`] taxonomy exactly as the prior `symlink_metadata` did: `ENOENT`
+/// is `Missing` (DeleteSelf), any other error is `Unreadable` (MoveSelf), success is
+/// `Present`.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
+  use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
+  match statx(
+    rustix::fs::CWD,
+    root,
+    AtFlags::SYMLINK_NOFOLLOW,
+    StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+  ) {
+    Ok(stx) => {
+      let dev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
+      let liveness = RootLiveness::Present(RootIdentity::new(dev, stx.stx_ino));
+      let frame = (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id);
+      (liveness, frame)
+    }
+    Err(rustix::io::Errno::NOENT) => (RootLiveness::Missing, None),
+    Err(_) => (RootLiveness::Unreadable, None),
+  }
+}
+
+/// The non-Linux / miri sample: `symlink_metadata` for the liveness verdict, no
+/// mount frame (no mount-id notion off Linux — the macOS refresh executor inherits
+/// this, and its core descent fences on device alone). Kept a single stat so the
+/// identity is still one object's, matching the Linux helper's atomicity.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
+  let liveness = match std::fs::symlink_metadata(root) {
+    Ok(meta) => RootLiveness::Present(RootIdentity::new(dev_of(&meta), ino_of(&meta))),
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => RootLiveness::Missing,
+    Err(_) => RootLiveness::Unreadable,
+  };
+  (liveness, None)
+}
+
 /// The real platform: `Source::spawn` + `lstat`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RealFs {
@@ -637,22 +690,19 @@ impl FsOps for RealFs {
       Some(mounts) => (mounts, true),
       None => (Vec::new(), false),
     };
-    // The root re-stat rides the same blocking call: `symlink_metadata` so a
-    // root retargeted to a symlink is a replacement, not a follow. A vanished
-    // root is `Missing` (DeleteSelf); any other failure is `Unreadable`
-    // (MoveSelf) — the exact `RootChanged`-probe mapping.
-    let root_liveness = match std::fs::symlink_metadata(root) {
-      Ok(meta) => RootLiveness::Present(RootIdentity::new(dev_of(&meta), ino_of(&meta))),
-      Err(err) if err.kind() == std::io::ErrorKind::NotFound => RootLiveness::Missing,
-      Err(_) => RootLiveness::Unreadable,
-    };
-    // Re-read the root's CURRENT mount frame beside the liveness re-stat: a
-    // same-object re-mount keeps `(dev, ino)` (so the liveness check above passes)
-    // but moves the root to a new mount, and the core adopts this to keep the
-    // enumerate descent fence relative to that new mount. A path read at the refresh
-    // cadence — inotify's mnt id is a best-effort belt (`None` below 5.8), so this
-    // rides the existing root re-resolution rather than opening a fresh fd.
-    let root_mnt_id = mnt_id_of(root);
+    // ONE sample proves liveness AND reads the mount frame: `root_liveness_and_frame`
+    // is a single `statx` (symlink not followed, so a root retargeted to a symlink is
+    // a replacement, not a follow), yielding the `(dev, ino)` the death gate decides
+    // alive-vs-replaced on AND the frame the core adopts — from the SAME object. A
+    // same-object re-mount keeps `(dev, ino)` (the death gate passes) but moves the
+    // root to a new mount; adopting the frame from the identical sample keeps the
+    // enumerate descent fence relative to that new mount without ever pairing the
+    // identity verdict with a different object's frame (a replace/remount between two
+    // separate lookups would). A `Missing` root is DeleteSelf, any other stat failure
+    // is Unreadable (MoveSelf) — the exact `RootChanged`-probe mapping; the mount id
+    // is inotify's best-effort belt (`None` below 5.8), taken from the same result's
+    // mask.
+    let (root_liveness, root_mnt_id) = root_liveness_and_frame(root);
     MountRefresh {
       mounts,
       authoritative,
