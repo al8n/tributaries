@@ -13,10 +13,14 @@
 //! name) and — for the child's own FID — a `FID` record; a `FAN_RENAME`
 //! carries the `OLD_DFID_NAME`/`NEW_DFID_NAME` pair in one event.
 //!
-//! Every length is bounds-checked against the buffer: a truncated or
-//! structurally impossible record sets `lossy` and stops, never panics or
-//! reads out of bounds. Unknown info-record types are skipped by their own
-//! `len`, so a kernel that grows the vocabulary degrades gracefully.
+//! Every length is bounds-checked against the buffer, and every wire-derived
+//! offset is advanced through checked arithmetic: a truncated or structurally
+//! impossible record sets `lossy` and stops, never panics or reads out of
+//! bounds — on 32-bit as on 64-bit. (A kernel `handle_bytes` up to `u32::MAX`
+//! would otherwise wrap `FILE_HANDLE_PREFIX + handle_bytes` past `usize` and
+//! panic on i686 before the slice bound is tested.) Unknown info-record types
+//! are skipped by their own `len`, so a kernel that grows the vocabulary
+//! degrades gracefully.
 
 use std::{boxed::Box, vec::Vec};
 
@@ -352,7 +356,13 @@ fn decode_fid_record(payload: &[u8], has_name: bool) -> Option<FidRecord> {
   let fh_prefix = fh.get(..FILE_HANDLE_PREFIX)?;
   let handle_bytes = u32::from_ne_bytes(fh_prefix[0..4].try_into().expect("4 bytes")) as usize;
   let type_bytes = &fh_prefix[4..8];
-  let opaque = fh.get(FILE_HANDLE_PREFIX..FILE_HANDLE_PREFIX + handle_bytes)?;
+  // `handle_bytes` is a kernel-supplied u32; `FILE_HANDLE_PREFIX + handle_bytes`
+  // can wrap usize on a 32-bit target and panic before the slice bound is
+  // tested, so resolve the opaque end through checked arithmetic. Both the
+  // opaque bytes and the trailing name are then taken via `get`, so an overflow
+  // or an over-long handle is a malformed FID (`None`), never a panic.
+  let handle_end = FILE_HANDLE_PREFIX.checked_add(handle_bytes)?;
+  let opaque = fh.get(FILE_HANDLE_PREFIX..handle_end)?;
 
   let mut handle = Vec::with_capacity(type_bytes.len() + opaque.len());
   handle.extend_from_slice(type_bytes);
@@ -360,7 +370,7 @@ fn decode_fid_record(payload: &[u8], has_name: bool) -> Option<FidRecord> {
   let fid = Fid::new(fsid, handle.into_boxed_slice());
 
   let name = if has_name {
-    let after = &fh[FILE_HANDLE_PREFIX + handle_bytes..];
+    let after = fh.get(handle_end..)?;
     // The name is NUL-terminated and NUL-padded up to the record's `len`; trim
     // at the first NUL. An empty name (a bare directory FID reported with the
     // DFID_NAME tag) yields `None`.
