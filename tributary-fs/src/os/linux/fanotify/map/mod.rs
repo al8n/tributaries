@@ -477,11 +477,13 @@ impl FidMap {
   }
 
   /// The admitted directory's path WITHOUT the orphan-eviction side effect of
-  /// [`admit`](Self::admit) — a read-only resolution for the admission-classifier
-  /// oracle, which must decide a FID's admittance against a fixed pre-classify map
-  /// state. `Some` exactly when [`admit`](Self::admit) would resolve it (the handle
-  /// is stored and its ancestry reaches the root).
-  #[cfg(test)]
+  /// [`admit`](Self::admit) — a read-only admittance resolution. `Some` exactly when
+  /// [`admit`](Self::admit) would resolve it (the handle is stored and its ancestry
+  /// reaches the root), so a caller can read a FID's admittance without mutating the
+  /// map. The classifier's universal multi-structural gate ([`super::classify`]) uses
+  /// it to decide an ambiguous merged mask's Lossy-vs-drop before the shape dispatch
+  /// resolves and acts, and the admission oracle to read admittance against a fixed
+  /// pre-classify map state.
   pub(crate) fn resolve_path(&self, fid: &Fid) -> Option<PathBuf> {
     self.resolve(fid.handle())
   }

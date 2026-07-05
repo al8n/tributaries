@@ -5,7 +5,8 @@ use crate::os::{
   BackendStatsShared, SourceMessage,
   linux::fanotify::{
     fid::{
-      DecodeOutcome, FAN_CREATE, FAN_DELETE, FAN_MODIFY, FAN_ONDIR, FanMask, Fid, RawFanotifyEvent,
+      DecodeOutcome, FAN_CREATE, FAN_DELETE, FAN_MODIFY, FAN_ONDIR, FAN_RENAME, FanMask, Fid,
+      RawFanotifyEvent, RenameInfo,
     },
     map::{FidMap, SeedEntry},
   },
@@ -394,6 +395,56 @@ fn merged_multi_structural_event_takes_the_barrier_and_reseeds() {
   assert!(
     !map.contains_dir(&fid(7)),
     "the merged create never learned the child its co-merged delete removed"
+  );
+}
+
+/// The rename half of the same class, driven end to end: a directory renamed AND
+/// deleted in ONE kernel-merged event (`FAN_RENAME|FAN_DELETE`, both rename halves
+/// present) is decoded intact (`lossy: false`), but classify now counts `FAN_RENAME`
+/// as a structural verb — so the merged mask is multi-structural and the universal gate
+/// routes it to `Admission::Lossy`, taking the SAME per-buffer barrier a wire loss does.
+/// A would-forward modify co-batched AHEAD of it is dropped (only the `Overflow`, no
+/// Batch), the map is reseeded rather than one-sided re-parented (fid(2) is NOT moved to
+/// /root/moved), and the stream stays live. The reader-level complement to the classify
+/// oracle for the rename-before-guard class the fix closes.
+#[test]
+fn merged_rename_delete_takes_the_barrier_and_reseeds() {
+  let mut map = seeded_with_sub();
+  let merged = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_DELETE | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(2)),
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(1),
+      old_name: b"sub".to_vec(),
+      new_dir: fid(1),
+      new_name: b"moved".to_vec(),
+    }),
+  };
+  // A would-forward modify AHEAD of the merged rename: the barrier must drop it too.
+  let decoded = DecodeOutcome {
+    events: vec![modify_under(fid(2), b"before"), merged],
+    lossy: false,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  assert!(
+    alive,
+    "the ambiguous rename+delete reseeds and keeps the stream live"
+  );
+  assert_eq!(
+    reseeds, 1,
+    "classify's Lossy took the barrier and reseeded once"
+  );
+  assert_eq!(
+    sent,
+    vec![Sent::Overflow],
+    "the barrier: only the Overflow — the merged rename AND the co-batched suffix drop"
+  );
+  assert_eq!(
+    map.admit(&fid(2)),
+    None,
+    "no one-sided re-parent survived: the reseed rebuilt from the walk, not a half-applied rename"
   );
 }
 

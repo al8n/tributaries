@@ -202,11 +202,21 @@ pub(crate) enum Admission {
   /// superblock-firehose filter — a clean drop, never a loss, so the sb's constant
   /// foreign self/attrib traffic never reseeds.
   ForeignDrop,
-  /// The action the event's mask names needs a field the event does not carry (a
-  /// named dirent with no/empty name; a directory create/delete/move/rename with no
-  /// child `target_fid`) — a missing field would silently mishandle the map, so the
-  /// buffer is lossy: the reader takes the ordered `Overflow` barrier and reseeds,
-  /// exactly as a wire-level decode loss.
+  /// The buffer must take the ordered `Overflow` barrier (reseed + covering rescan),
+  /// for one of two reasons, both decided AT the action rather than by a separate
+  /// decode matrix:
+  ///
+  /// - an ADMITTED event whose merged mask names two or more structural verbs (the
+  ///   kernel merges consecutive events for one object — a directory renamed AND
+  ///   deleted, a create+delete of one name, a delete_self+move_self of one object) is
+  ///   AMBIGUOUS: no single tree mutation is correct, and the universal gate in
+  ///   [`classify`] routes it here before any shape can apply a one-sided mutation; OR
+  /// - the single action the mask names needs a field the event does not carry (a
+  ///   named dirent with no/empty name; a directory create/delete/move/rename with no
+  ///   child `target_fid`) — a missing field would silently mishandle the map.
+  ///
+  /// Either way the reader takes the barrier and reseeds, exactly as a wire-level
+  /// decode loss.
   Lossy,
 }
 
@@ -223,8 +233,19 @@ pub(crate) enum Admission {
 /// an unrecognized shape is explicitly [`Admission::ForeignDrop`] or
 /// [`Admission::Lossy`], never a wrong forward.
 ///
-/// Resolution is UNIFORM across masks: the FIRST step resolves the addressing object
-/// and checks its admittance the SAME way for every mask, and only THEN does the mask
+/// A UNIVERSAL multi-structural gate runs FIRST, before any shape dispatch: an
+/// admitted event whose merged mask names two or more structural verbs (the kernel
+/// merges consecutive events for one object — a directory renamed AND deleted, a
+/// create+delete of one name) is ambiguous and takes the loss barrier
+/// ([`Admission::Lossy`]). This is the ONE place the ambiguity guard lives, and every
+/// shape — rename included — flows through it, so no event can reach a single-verb map
+/// mutation on an ambiguous mask BY CONSTRUCTION (not by each shape remembering to
+/// re-check). `FAN_RENAME` counts as a structural verb for this
+/// ([`FanMask::multi_structural`]), so a PURE rename (exactly one structural verb)
+/// still dispatches to [`classify_rename`] while a merged rename+delete is barred.
+///
+/// Resolution is UNIFORM across masks: past the gate, the addressing object is resolved
+/// and its admittance checked the SAME way for every mask, and only THEN does the mask
 /// select the action. There is no mask special-cased to consult a FID ahead of a
 /// membership gate, and no pre-classification `dir_fid`-absent drop — so no event
 /// whose addressing object is admitted can be dropped, for ANY mask. The three shapes:
@@ -246,6 +267,26 @@ pub(crate) fn classify(
   event: &RawFanotifyEvent,
   memo: &mut MemoBatch,
 ) -> Admission {
+  // THE UNIVERSAL multi-structural gate — the ONE place the ambiguity guard lives, and
+  // EVERY event shape passes through it before the rename-vs-dirent-vs-nameless
+  // dispatch below. A merged bitmask naming two or more structural verbs (man 7
+  // fanotify merges consecutive events for one object: a directory renamed AND deleted,
+  // a create+delete of one name, a delete_self+move_self of one object) has no single
+  // correct tree mutation — applying one verb and dropping the rest is a one-sided map
+  // mutation (a departed directory left learned; a rename's re-parent that silently
+  // drops its co-merged delete). So an ADMITTED multi-structural event takes the loss
+  // barrier (`Lossy` → reseed + covering `Overflow`) here, BY CONSTRUCTION, before any
+  // shape can reach a single-verb mutation — the rename shape included, which
+  // `FAN_RENAME`-as-a-structural-verb folds into the same count.
+  //
+  // The gate is admittance-scoped: only an event ADDRESSING an in-root object takes the
+  // barrier. A fully-foreign multi-structural event flows to the dispatch and
+  // `ForeignDrop`s through its shape's own membership gate, so the superblock firehose's
+  // constant foreign multi-structural traffic never reseeds.
+  if event.mask.multi_structural() && addresses_in_root(map, event) {
+    return Admission::Lossy;
+  }
+
   if let Some(rename) = &event.rename {
     return classify_rename(map, event, rename, memo);
   }
@@ -259,6 +300,36 @@ pub(crate) fn classify(
     Some(name) => classify_dirent(map, event, name, memo),
     None => classify_nameless(map, event, memo),
   }
+}
+
+/// Whether `event` ADDRESSES an in-root object — the uniform admittance the universal
+/// multi-structural gate in [`classify`] consults before any shape dispatch. Mirrors
+/// each shape's own membership gate EXACTLY, so the gate routes an ambiguous mask to
+/// [`Admission::Lossy`] on precisely the events their classifiers would otherwise
+/// admit, and lets a fully-foreign one fall through to its shape's
+/// [`Admission::ForeignDrop`]:
+///
+/// - a `FAN_RENAME` is admitted when EITHER directory end resolves in-root
+///   ([`classify_rename`]'s both-ends-out drop);
+/// - a NAMED event by its parent `dir_fid` ([`classify_dirent`]'s gate);
+/// - a NAME-LESS event by its self-FID — `dir_fid`, else the `FID`-only shape's
+///   `target_fid` ([`classify_nameless`]'s gate).
+///
+/// Read-only ([`FidMap::resolve_path`], not [`FidMap::admit`]): the gate must decide
+/// Lossy-vs-drop WITHOUT mutating the map before the shape dispatch resolves and acts.
+/// `resolve_path` answers `Some` exactly when `admit` would, so the boolean matches the
+/// classifiers' own gates and the gate never diverges from the dispatch it precedes.
+fn addresses_in_root(map: &FidMap, event: &RawFanotifyEvent) -> bool {
+  if let Some(rename) = &event.rename {
+    return map.resolve_path(&rename.old_dir).is_some()
+      || map.resolve_path(&rename.new_dir).is_some();
+  }
+  let addressing = if event.name.is_some() {
+    event.dir_fid.as_ref()
+  } else {
+    event.dir_fid.as_ref().or(event.target_fid.as_ref())
+  };
+  addressing.is_some_and(|fid| map.resolve_path(fid).is_some())
 }
 
 /// Classifies a NAMED event: a dirent addressing `<dir>/<name>` under its parent
@@ -282,17 +353,10 @@ fn classify_dirent(
   };
   let path = Some(join_name(&dir_path, name));
 
-  // A merged bitmask carrying two or more structural verbs (a create+delete of the
-  // same name; man 7 fanotify merges consecutive events for one object) is
-  // AMBIGUOUS — no single tree mutation is correct. The parent is in-root (gated
-  // above), so route it to the loss barrier: applying one verb (learn) while
-  // dropping the rest (the delete) would leave a departed directory learned in the
-  // map (a one-sided mutation / stale admission). The reseed + covering `Overflow`
-  // rebuild the map truthfully instead. A single-structural mask (optionally plus
-  // metadata/`ONDIR`) is unambiguous and classified below exactly as before.
-  if mask.multi_structural() {
-    return Admission::Lossy;
-  }
+  // The universal multi-structural gate in `classify` already routed an admitted
+  // ambiguous merged mask (a create+delete of the same name) to `Lossy` before this
+  // dispatch, so the parent is in-root (gated above) AND the mask names at most one
+  // structural verb here — the invariant the single-verb selection below relies on.
 
   if mask.ondir() {
     if mask.created() {
@@ -368,16 +432,13 @@ fn classify_nameless(
     return Admission::ForeignDrop;
   };
 
-  // A merged bitmask with two or more structural verbs (a delete_self+move_self of
-  // one object; man 7 fanotify merges events for one object) is AMBIGUOUS — see
-  // `classify_dirent`. Route it to the loss barrier rather than apply one self-death
-  // mutation and drop the rest. A ROOT multi-structural event reseeds too, never a
-  // one-sided root mutation: the fresh reseed walk (and the liveness tick) still
-  // observe a genuinely-departed root, so a truly-dead root is not masked, while a
-  // survivable ambiguity heals into a truthful map.
-  if mask.multi_structural() {
-    return Admission::Lossy;
-  }
+  // The universal multi-structural gate in `classify` already routed an admitted
+  // ambiguous merged mask (a delete_self+move_self of one object, or the same on the
+  // root) to `Lossy` before this dispatch, so the self-object is in-root (gated above)
+  // AND the mask names at most one structural verb here — never a one-sided self-death
+  // or root mutation from an ambiguous mask. A genuinely-departed root is still
+  // observed by the reseed walk (and the liveness tick), so routing an ambiguous root
+  // event to the barrier masks no real death.
 
   if mask.delete_self() || mask.move_self() {
     if is_root {
