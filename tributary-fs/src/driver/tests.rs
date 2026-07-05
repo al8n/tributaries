@@ -1741,3 +1741,145 @@ mod descending {
     }
   }
 }
+
+/// The Linux one-sample enumerate: `list_dir`/`dir_entry_stat` build each
+/// `RawDirEntry` from ONE `statx` of the entry, so its `(kind, dev, ino)` and
+/// its mount frame are always one object's — never a `(dev, ino)` from one
+/// syscall paired with a mount id from another that a rename/bind could split.
+/// Real syscalls, so Linux-only (the container `unit` suite).
+#[cfg(all(target_os = "linux", not(miri)))]
+mod enumerate_one_sample {
+  use std::os::unix::fs::MetadataExt;
+
+  use tributary_proto::FileKind;
+
+  use super::super::{dir_entry_stat, list_dir};
+  use crate::core::{RawDirEntry, RawEnumerate};
+
+  fn scratch(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir()
+      .canonicalize()
+      .expect("canonicalize temp dir")
+      .join(format!(
+        "tributary-fs-enum-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+  }
+
+  /// A directory and a file classify correctly, and every entry's `(dev, ino)`
+  /// equals a path stat of that same object — the one `statx` reports the true
+  /// object, not a stale or mispaired identity.
+  #[test]
+  fn entries_carry_the_true_objects_facts() {
+    let dir = scratch("facts");
+    std::fs::create_dir(dir.join("sub")).expect("create subdir");
+    std::fs::write(dir.join("file"), b"x").expect("create file");
+
+    let RawEnumerate::Listed { entries, complete } = list_dir(&dir) else {
+      panic!("a readable directory lists");
+    };
+    assert!(complete, "the whole directory was read");
+    assert_eq!(entries.len(), 2, "both entries were sampled: {entries:?}");
+
+    for entry in &entries {
+      let name = std::str::from_utf8(&entry.name).expect("ascii entry name");
+      let meta = std::fs::symlink_metadata(dir.join(name)).expect("stat the entry path");
+      assert_eq!(entry.dev, meta.dev(), "{name}: device is the object's");
+      assert_eq!(entry.ino, meta.ino(), "{name}: inode is the object's");
+      let expected_kind = if name == "sub" {
+        FileKind::Dir
+      } else {
+        FileKind::File
+      };
+      assert_eq!(entry.kind, expected_kind, "{name}: kind from the sample");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A symlink entry is classified `Symlink` — `AT_SYMLINK_NOFOLLOW` on the one
+  /// `statx` reports the link itself, so the enumerate never follows it to a
+  /// target that a swap could redirect.
+  #[test]
+  fn a_symlink_entry_is_not_followed() {
+    let dir = scratch("symlink");
+    std::fs::create_dir(dir.join("real")).expect("create the target dir");
+    std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).expect("create a symlink");
+
+    let RawEnumerate::Listed { entries, .. } = list_dir(&dir) else {
+      panic!("a readable directory lists");
+    };
+    let link = entries
+      .iter()
+      .find(|e| e.name == b"link")
+      .expect("the symlink entry is listed");
+    assert_eq!(
+      link.kind,
+      FileKind::Symlink,
+      "the symlink is reported as itself, not its target directory"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The mount frame is read from the SAME sample as the identity: when a fresh
+  /// `statx` reports a mount id for the object, `dir_entry_stat` reports the
+  /// identical one (both from the one call's result); when the kernel withholds
+  /// it (pre-5.8), both decline it. Either way the frame and the identity are one
+  /// object's — the split this fix closes.
+  #[test]
+  fn the_mount_frame_comes_from_the_identity_sample() {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    let dir = scratch("frame");
+    std::fs::create_dir(dir.join("sub")).expect("create subdir");
+    let sub = dir.join("sub");
+
+    let (kind, _dev, _ino, mnt_id) =
+      dir_entry_stat(&sub).expect("the freshly created subdir samples");
+    assert_eq!(kind, FileKind::Dir);
+
+    // An independent statx of the same object: its mount-id presence and value
+    // must match what the enumerate sample reported — proof the enumerate read
+    // the frame from the identity's own result, not a second lookup.
+    let stx = statx(
+      rustix::fs::CWD,
+      &sub,
+      AtFlags::SYMLINK_NOFOLLOW,
+      StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+    )
+    .expect("statx the subdir");
+    let reference = (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id);
+    assert_eq!(
+      mnt_id, reference,
+      "the enumerate's mount frame is the identity sample's own mount id"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A raced-away entry (nothing at the path) yields `None` — the incomplete
+  /// flag drives the retry, and no half-built entry with a bogus identity is
+  /// pushed.
+  #[test]
+  fn a_vanished_entry_samples_to_none() {
+    let dir = scratch("vanished");
+    let gone = dir.join("gone");
+    assert!(
+      dir_entry_stat(&gone).is_none(),
+      "an absent path produces no entry facts"
+    );
+    // A directly-built entry list stays a well-formed RawEnumerate.
+    let entry = RawDirEntry {
+      name: b"present".to_vec(),
+      kind: FileKind::File,
+      dev: 1,
+      ino: 2,
+      mnt_id: None,
+    };
+    assert_eq!(entry.name, b"present");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+}

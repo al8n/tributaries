@@ -267,8 +267,11 @@ fn smoke_stream_reports_create_modify_rename_remove() {
 }
 
 /// An exhausted batch budget must never block the dispatch queue: the batch
-/// is dropped and the loss rides the SAME queue as exactly one in-order
-/// `Overflow`, whose ack re-arms the dedup for the next loss.
+/// is dropped and the loss rides the SAME queue as an in-order `Overflow`. The
+/// dedup is queue-position-aware — ADJACENT losses (no batch between) collapse
+/// onto one `Overflow`, but a `Batch` that lands behind a pending signal ends
+/// its run, so a later loss elects a fresh `Overflow` behind that batch (its
+/// staleness is otherwise uncovered). Dropping the ack likewise re-arms.
 #[test]
 fn over_budget_batches_signal_one_inband_overflow() {
   let dir = unique_dir("overflow");
@@ -312,11 +315,24 @@ fn over_budget_batches_signal_one_inband_overflow() {
     }
     thread::sleep(Duration::from_millis(30));
   }
+  // The held ack's Overflow is still queue-tail-pending. Position-aware dedup:
+  // a run of losses with no batch between them collapses onto that one signal,
+  // but a Batch that lands resets the position so the NEXT loss elects afresh.
+  // So two Overflows never appear back-to-back without a Batch between them —
+  // that is the adjacent-loss dedup, now stated per queue position.
+  let mut last_was_overflow = false;
   while let Ok(msg) = rx.try_recv() {
-    assert!(
-      matches!(msg, SourceMessage::Batch(_)),
-      "an unacknowledged Overflow dedups further losses: {msg:?}"
-    );
+    match msg {
+      SourceMessage::Batch(_) => last_was_overflow = false,
+      SourceMessage::Overflow(_) => {
+        assert!(
+          !last_was_overflow,
+          "adjacent losses (no batch between) must dedup onto one Overflow"
+        );
+        last_was_overflow = true;
+      }
+      SourceMessage::Fatal(err) => panic!("stream died: {err}"),
+    }
   }
 
   // Acknowledge (drop the ack) and lose again: a fresh signal.

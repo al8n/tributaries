@@ -159,7 +159,7 @@ fn remote_fs_magics_are_refused_and_local_ones_pass() {
 mod pin {
   use std::os::unix::fs::MetadataExt;
 
-  use super::super::{ancestor_identities, pin_root, root_is_remote};
+  use super::super::{ancestor_identities, pin_root, pin_root_walk, root_is_remote};
   use crate::os::SourceError;
 
   /// A fresh empty scratch directory under `TMPDIR`, canonicalized so the pin's
@@ -299,6 +299,91 @@ mod pin {
     assert!(
       matches!(err, SourceError::RootUnavailable { .. }),
       "a symlink swapped in for an ancestor fails the no-symlink open typed: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// The pre-`openat2` fallback pin (`pin_root_walk`, the pre-5.6 floor path)
+  /// pins the SAME object the `openat2` fast path pins: the component walk and
+  /// the one-shot resolve land on one identity. This is the direct-row coverage
+  /// the finding calls for — the `ENOSYS` routing itself needs a pre-5.6 kernel
+  /// to exercise, so the walk is tested on its own here, and `pin_root` is proven
+  /// to agree with it.
+  #[test]
+  fn pin_root_walk_pins_the_same_object_as_openat2() {
+    let base = scratch("walk-ident");
+    let nested = base.join("a/b/c");
+    std::fs::create_dir_all(&nested).expect("create a nested dir");
+
+    let fast = pin_root(&nested).expect("the openat2 fast path pins");
+    let walked = pin_root_walk(&nested).expect("the component walk pins");
+    let fast_stat = rustix::fs::fstat(&fast).expect("fstat the fast pin");
+    let walked_stat = rustix::fs::fstat(&walked).expect("fstat the walked pin");
+    assert_eq!(
+      (fast_stat.st_dev, fast_stat.st_ino),
+      (walked_stat.st_dev, walked_stat.st_ino),
+      "the component walk and openat2 pin the identical object"
+    );
+    // And the walked pin's identity is the true object's.
+    let meta = std::fs::metadata(&nested).expect("stat the path");
+    assert_eq!(
+      walked_stat.st_dev,
+      meta.dev(),
+      "walked device is the root's"
+    );
+    assert_eq!(walked_stat.st_ino, meta.ino(), "walked inode is the root's");
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// A symlink at ANY component of the walked path is refused (`ELOOP`) — the
+  /// per-hop `O_NOFOLLOW` rebuilds the fast path's whole-path no-symlink
+  /// guarantee, so the fallback can never redirect the pin to a symlink's target.
+  #[test]
+  fn pin_root_walk_refuses_a_symlink_component() {
+    let base = scratch("walk-symlink");
+    let real = base.join("real");
+    std::fs::create_dir_all(real.join("leaf")).expect("create real/leaf");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink link -> real");
+    // `base/link/leaf` reaches a real directory THROUGH a symlinked component.
+    let via_link = link.join("leaf");
+    let err = pin_root_walk(&via_link)
+      .expect_err("a symlink component must be refused, not followed to its target");
+    assert!(
+      matches!(err, SourceError::RootUnavailable { .. }),
+      "a symlink component fails the per-hop no-symlink open typed: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// A missing final component is a typed `RootUnavailable` (`ENOENT`) — the walk
+  /// surfaces a vanished root exactly like the fast path, never a panic.
+  #[test]
+  fn pin_root_walk_on_a_missing_path_is_typed() {
+    let base = scratch("walk-missing");
+    let gone = base.join("nope");
+    let err = pin_root_walk(&gone).expect_err("a missing component cannot be walked");
+    assert!(
+      matches!(err, SourceError::RootUnavailable { .. }),
+      "a vanished component is a typed RootUnavailable race: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// A component swapped for a NON-DIRECTORY fails the walk (`O_DIRECTORY` →
+  /// `ENOTDIR`) typed — the fallback never pins through a file, matching the fast
+  /// path's `O_DIRECTORY` refusal.
+  #[test]
+  fn pin_root_walk_refuses_a_non_directory_component() {
+    let base = scratch("walk-file");
+    let file = base.join("f");
+    std::fs::write(&file, b"x").expect("create a file");
+    // Walking "f/child" hits a file where a directory must be.
+    let through_file = file.join("child");
+    let err = pin_root_walk(&through_file).expect_err("a non-directory component cannot be walked");
+    assert!(
+      matches!(err, SourceError::RootUnavailable { .. }),
+      "a non-directory component is a typed refusal: {err:?}"
     );
     let _ = std::fs::remove_dir_all(&base);
   }
