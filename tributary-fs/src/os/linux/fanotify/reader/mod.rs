@@ -11,6 +11,29 @@
 //! truncated/malformed record) degrades to the ordered loss signal; a read
 //! error or a panic degrades to the terminal `Fatal` exactly once, then the
 //! thread exits.
+//!
+//! # Teardown-fairness invariant
+//!
+//! Same charter as the inotify reader (no unbounded op loop defers shutdown), but
+//! the long-op sites differ — this reader has NO control batch (the mark is
+//! kernel-recursive, so shutdown is the only control message):
+//!
+//! | Long-op site                          | Verdict                             |
+//! |---------------------------------------|-------------------------------------|
+//! | Event drain (read → `EAGAIN`)         | preemptible BETWEEN reads           |
+//! | Reseed walk (`reseed_map`)            | bounded, must complete or blind→fatal |
+//! | Move-in subtree walk (`seed_moved_in_subtree`) | bounded, must complete or blind→fatal |
+//!
+//! The two walks are the bounded-must-complete case: each rebuilds (or extends) the
+//! FID map from a fresh directory enumerate, and the map swap is only sound once the
+//! walk's full inventory is in hand — interrupting one mid-flight would leave a
+//! half-built map, i.e. a silently-blind subtree, the exact class the whole stack
+//! prevents. So a shutdown landing mid-walk WAITS for the walk (checked between
+//! reads, after the current buffer's walk has finished): the walk is bounded by the
+//! root's directory count and either completes or escalates blind → fatal. Unlike
+//! the inotify batch, a walk's work cannot be failed-reply'd away — there is no
+//! per-op grant to resolve, only a map that is whole or blind. This is why the
+//! inotify intra-batch preemption has no analog here.
 
 use std::{
   os::fd::OwnedFd,

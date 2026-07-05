@@ -9,6 +9,30 @@
 //! so a busy reader takes no wake syscalls and a batch of N arms costs at most
 //! one wake. Arms arrive batched (one [`Control::Batch`] per driver effect-drain
 //! per scope) and are processed in a single pass between reads.
+//!
+//! # Teardown-fairness invariant
+//!
+//! No unbounded or long-running op loop on this reader may defer shutdown
+//! indefinitely. Every such loop yields to a pending teardown at a bounded
+//! granularity:
+//!
+//! | Long-op site                     | Verdict                              |
+//! |----------------------------------|--------------------------------------|
+//! | Event drain (read → `EAGAIN`)    | preemptible BETWEEN reads            |
+//! | Inter-message control drain      | preemptible BETWEEN messages         |
+//! | Intra-batch arm/disarm ops       | preemptible BETWEEN ops, failed-reply the tail |
+//!
+//! The last is the sharp edge: one [`Control::Batch`] can be a cold enumerate's
+//! thousands of blocking `openat`/`fstat`/`add_watch`, so [`execute_batch`] checks
+//! [`WakeState::shutdown_requested`] before each op and, on a pending teardown,
+//! stops and answers `Failed(Io)` for every un-executed arm — the caller's pending
+//! grants resolve as failures rather than blocking on a truncated reply, and the
+//! reader exits at once. A bounded op that CANNOT be safely interrupted is instead
+//! documented as must-complete: the fanotify reader's reseed / move-in subtree
+//! walks (its sibling module) rebuild the map atomically, so interrupting one would
+//! leave a half-built map (silent blindness) — shutdown waits for the walk, which
+//! is bounded by the directory count and either completes or escalates blind →
+//! fatal. This reader has no such walk; its every long op is preemptible.
 
 use std::{
   os::fd::{AsFd, AsRawFd, OwnedFd},
@@ -124,7 +148,7 @@ fn run(fd: &OwnedFd, wake: &WakeState, control: &mpsc::Receiver<Control>, shared
     // lost-wakeup guard — see `WakeState`). Draining anything means we service
     // it and loop without ever blocking on a non-empty queue.
     wake.arm_park();
-    if drain_control(fd, &mut table, control) {
+    if drain_control(fd, &mut table, control, wake) {
       return; // Shutdown observed in the guard drain.
     }
     // A quiet re-check found nothing pending; commit to the block. Only the
@@ -152,12 +176,12 @@ fn run(fd: &OwnedFd, wake: &WakeState, control: &mpsc::Receiver<Control>, shared
 
     if event_ready {
       wake.drain();
-      if drain_control(fd, &mut table, control) {
+      if drain_control(fd, &mut table, control, wake) {
         return;
       }
     }
     if source_ready {
-      match drain_events(fd, &mut buf, &mut table, control, shared) {
+      match drain_events(fd, &mut buf, &mut table, control, wake, shared) {
         DrainExit::Parked => {}
         DrainExit::Shutdown | DrainExit::Died => return,
       }
@@ -166,23 +190,86 @@ fn run(fd: &OwnedFd, wake: &WakeState, control: &mpsc::Receiver<Control>, shared
 }
 
 /// Drains every pending control message, executing each batch in one pass.
-/// Returns `true` when a shutdown was observed (the caller then exits).
-fn drain_control(fd: &OwnedFd, table: &mut WdTable, control: &mpsc::Receiver<Control>) -> bool {
+/// Returns `true` when a shutdown was observed (the caller then exits). A batch is
+/// run through [`execute_batch`], which yields to a pending teardown BETWEEN its
+/// ops — so shutdown preempts a long cold-enumerate batch mid-flight rather than
+/// only after the whole batch (the teardown-fairness invariant in the module docs).
+fn drain_control(
+  fd: &OwnedFd,
+  table: &mut WdTable,
+  control: &mpsc::Receiver<Control>,
+  wake: &WakeState,
+) -> bool {
   loop {
     match control.try_recv() {
       Ok(Control::Batch { ops, reply }) => {
-        let mut replies = Vec::new();
-        for op in ops {
-          match op {
-            ControlOp::Arm(request) => replies.push(arm(fd, table, request)),
-            ControlOp::Disarm(anchor) => disarm(fd, table, anchor),
-          }
-        }
+        let (replies, preempted) = execute_batch(fd, table, ops, || wake.shutdown_requested());
+        // Send the (executed + failed-tail) replies either way so the caller's
+        // `batch()` never blocks on a truncated reply; then, if teardown preempted
+        // mid-batch, exit as if the terminal `Shutdown` had been observed here.
         let _ = reply.send(replies);
+        if preempted {
+          return true;
+        }
       }
       Ok(Control::Shutdown) => return true,
       Err(_) => return false,
     }
+  }
+}
+
+/// Executes one control batch's ops in emission order, checking `shutdown` BEFORE
+/// each op so a teardown mid-batch preempts. With no shutdown pending the whole
+/// batch runs exactly as before (every arm gets its real reply, every disarm its
+/// kernel removal). On a pending shutdown it stops immediately and fails every
+/// UN-executed arm — the current op and the tail — with `Failed(Io)`, so the
+/// returned replies stay index-aligned to the batch's `Arm` entries (the caller's
+/// `batch()` reply contract) and the driver's pending grants resolve as failures
+/// rather than hanging. Returns the replies and whether it was preempted.
+///
+/// Pure over the `shutdown` predicate — the only teardown-observing part — so the
+/// preemption point is deterministically testable without racing a real teardown.
+fn execute_batch(
+  fd: &OwnedFd,
+  table: &mut WdTable,
+  ops: Vec<ControlOp>,
+  mut shutdown: impl FnMut() -> bool,
+) -> (Vec<ArmReply>, bool) {
+  let mut replies = Vec::new();
+  let mut ops = ops.into_iter();
+  let preempted = loop {
+    if shutdown() {
+      break true;
+    }
+    let Some(op) = ops.next() else {
+      break false;
+    };
+    match op {
+      ControlOp::Arm(request) => replies.push(arm(fd, table, request)),
+      ControlOp::Disarm(anchor) => disarm(fd, table, anchor),
+    }
+  };
+  if preempted {
+    // The shutdown check broke the loop BEFORE consuming the current op, so `ops`
+    // still holds every un-executed op. Fail each remaining arm so the reply vec
+    // covers all of the batch's `Arm` entries; disarms need no reply (and the fd is
+    // about to close, so their kernel removal is moot).
+    for op in ops {
+      if matches!(op, ControlOp::Arm(_)) {
+        replies.push(shutdown_arm_reply());
+      }
+    }
+  }
+  (replies, preempted)
+}
+
+/// The reply for an arm preempted (un-executed) by a mid-batch teardown: the same
+/// `Failed(Io)` a dead reader answers, so the driver's pending grant resolves as a
+/// failure rather than blocking on a truncated batch reply.
+fn shutdown_arm_reply() -> ArmReply {
+  ArmReply {
+    outcome: WatchOutcome::Failed(WatchError::Io),
+    anchor: None,
   }
 }
 
@@ -218,10 +305,11 @@ fn drain_events(
   buf: &mut [u8],
   table: &mut WdTable,
   control: &mpsc::Receiver<Control>,
+  wake: &WakeState,
   shared: &ReaderShared,
 ) -> DrainExit {
   loop {
-    if drain_control(fd, table, control) {
+    if drain_control(fd, table, control, wake) {
       return DrainExit::Shutdown;
     }
     let n = match rustix::io::read(fd, &mut *buf) {

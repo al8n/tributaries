@@ -144,10 +144,14 @@ mod liveness {
   use core::num::NonZeroU64;
   use std::{ffi::OsString, os::fd::OwnedFd, sync::mpsc, time::Duration};
 
-  use tributary_proto::WatchId;
+  use tributary_proto::{WatchError, WatchId};
 
   use super::super::{AnchorRequest, Control, ControlOp, DrainExit, ReaderShared, drain_events};
-  use crate::os::{SourceMessage, linux::inotify::table::WdTable, transport::TransportState};
+  use crate::os::{
+    SourceMessage,
+    linux::{WatchOutcome, inotify::table::WdTable, wake::WakeState},
+    transport::TransportState,
+  };
 
   /// An always-readable fd that never returns `EAGAIN`, standing in for a source
   /// under sustained traffic: `drain_events` reads it forever unless it observes a
@@ -180,12 +184,13 @@ mod liveness {
     let (tx, rx) = mpsc::channel();
     tx.send(Control::Shutdown).expect("enqueue shutdown");
     let (shared, _queue_rx) = reader_shared();
+    let wake = WakeState::new().expect("wake state");
 
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
       let mut table = WdTable::new();
       let mut buf = vec![0u8; 64 * 1024];
-      let exit = drain_events(&fd, &mut buf, &mut table, &rx, &shared);
+      let exit = drain_events(&fd, &mut buf, &mut table, &rx, &wake, &shared);
       let _ = done_tx.send(exit);
     });
     let exit = done_rx
@@ -205,12 +210,13 @@ mod liveness {
     let fd = never_eagain_fd();
     let (tx, rx) = mpsc::channel();
     let (shared, _queue_rx) = reader_shared();
+    let wake = WakeState::new().expect("wake state");
 
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
       let mut table = WdTable::new();
       let mut buf = vec![0u8; 64 * 1024];
-      let exit = drain_events(&fd, &mut buf, &mut table, &rx, &shared);
+      let exit = drain_events(&fd, &mut buf, &mut table, &rx, &wake, &shared);
       let _ = done_tx.send(exit);
     });
 
@@ -236,12 +242,13 @@ mod liveness {
     let fd = never_eagain_fd();
     let (tx, rx) = mpsc::channel();
     let (shared, _queue_rx) = reader_shared();
+    let wake = WakeState::new().expect("wake state");
 
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
       let mut table = WdTable::new();
       let mut buf = vec![0u8; 64 * 1024];
-      let exit = drain_events(&fd, &mut buf, &mut table, &rx, &shared);
+      let exit = drain_events(&fd, &mut buf, &mut table, &rx, &wake, &shared);
       let _ = done_tx.send(exit);
     });
 
@@ -272,5 +279,159 @@ mod liveness {
       .expect("shutdown after the arm still stops the drain");
     assert_eq!(exit, DrainExit::Shutdown);
     worker.join().expect("worker joins");
+  }
+
+  /// Teardown preempts a queued batch at the drain seam: a multi-op `Control::Batch`
+  /// (a cold enumerate's many arms) queued AHEAD of teardown. With the shutdown flag
+  /// already raised, the reader preempts the batch at its FIRST op — NONE of the arms
+  /// run (each would open its nonexistent path and answer `NotFound`; a preempted arm
+  /// answers `Io` instead) — fails every arm, and exits promptly. Proves the reader
+  /// does not execute the whole batch before observing shutdown.
+  #[test]
+  fn queued_batch_is_preempted_by_pending_shutdown() {
+    let fd = never_eagain_fd();
+    let (tx, rx) = mpsc::channel();
+    let (shared, _queue_rx) = reader_shared();
+    let wake = WakeState::new().expect("wake state");
+
+    // Queue a big batch, then raise the flag + enqueue Shutdown BEFORE the drain runs
+    // — exactly the teardown ordering (`request_shutdown` then send `Shutdown`).
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    let ops: Vec<ControlOp> = (0..64)
+      .map(|i| {
+        ControlOp::Arm(AnchorRequest {
+          watch: WatchId::new(NonZeroU64::new(i + 1).unwrap()),
+          parent: None,
+          name: OsString::from("/tributary-fs-nonexistent-arm-target"),
+          expected: None,
+        })
+      })
+      .collect();
+    tx.send(Control::Batch {
+      ops,
+      reply: reply_tx,
+    })
+    .expect("enqueue batch");
+    wake.request_shutdown();
+    tx.send(Control::Shutdown).expect("enqueue shutdown");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+      let mut table = WdTable::new();
+      let mut buf = vec![0u8; 64 * 1024];
+      let exit = drain_events(&fd, &mut buf, &mut table, &rx, &wake, &shared);
+      let _ = done_tx.send(exit);
+    });
+
+    let replies = reply_rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("the preempted batch still answers its reply, never hanging");
+    assert_eq!(replies.len(), 64, "every arm gets a reply, index-aligned");
+    assert!(
+      replies
+        .iter()
+        .all(|r| matches!(r.outcome, WatchOutcome::Failed(WatchError::Io))),
+      "a preempted batch fails every arm with Io — proving none of the 64 arms ran"
+    );
+    let exit = done_rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("the reader exits promptly on the preempted batch");
+    assert_eq!(exit, DrainExit::Shutdown);
+    worker.join().expect("worker joins");
+  }
+}
+
+/// The batch executor's preemption point, tested deterministically over an injected
+/// shutdown predicate (no real teardown race). Covers the whole class: the whole
+/// batch runs when no shutdown pends; none runs when shutdown pends up front; and a
+/// mid-batch flip executes the prefix and failed-replies the tail — all index-
+/// aligned to the batch's `Arm` entries.
+mod batch_preemption {
+  use core::num::NonZeroU64;
+  use std::{cell::Cell, ffi::OsString};
+
+  use tributary_proto::{WatchError, WatchId};
+
+  use super::super::{AnchorRequest, ControlOp, create_instance, execute_batch};
+  use crate::os::linux::{WatchOutcome, inotify::table::WdTable};
+
+  /// One arm targeting a path that never exists, so `arm` fails fast at `open_anchor`
+  /// (`NotFound`) WITHOUT touching the inotify fd — the executed-arm outcome, kept
+  /// distinct from the preempted-arm `Io`.
+  fn arm_op(n: u64) -> ControlOp {
+    ControlOp::Arm(AnchorRequest {
+      watch: WatchId::new(NonZeroU64::new(n).unwrap()),
+      parent: None,
+      name: OsString::from("/tributary-fs-nonexistent-arm-target"),
+      expected: None,
+    })
+  }
+
+  /// No shutdown pending: the whole batch executes exactly as before — every arm
+  /// gets its real reply (`NotFound` for the nonexistent target), and `preempted`
+  /// is false.
+  #[test]
+  fn whole_batch_runs_when_no_shutdown() {
+    let fd = create_instance().expect("inotify instance");
+    let mut table = WdTable::new();
+    let ops = vec![arm_op(1), arm_op(2), arm_op(3)];
+    let (replies, preempted) = execute_batch(&fd, &mut table, ops, || false);
+    assert!(!preempted);
+    assert_eq!(replies.len(), 3);
+    assert!(
+      replies
+        .iter()
+        .all(|r| matches!(r.outcome, WatchOutcome::Failed(WatchError::NotFound))),
+      "each arm actually ran (NotFound), not a preemption reply"
+    );
+  }
+
+  /// Shutdown pending BEFORE the first op: none of the arms run, every one is failed
+  /// with `Io` (distinguishable from the executed `NotFound`), and `preempted` is
+  /// true — the batch is not executed at all.
+  #[test]
+  fn no_op_runs_when_shutdown_pending_up_front() {
+    let fd = create_instance().expect("inotify instance");
+    let mut table = WdTable::new();
+    let ops = vec![arm_op(1), arm_op(2), arm_op(3)];
+    let (replies, preempted) = execute_batch(&fd, &mut table, ops, || true);
+    assert!(preempted);
+    assert_eq!(replies.len(), 3, "all three arms answered, index-aligned");
+    assert!(
+      replies
+        .iter()
+        .all(|r| matches!(r.outcome, WatchOutcome::Failed(WatchError::Io))),
+      "every arm is a preemption reply — none executed"
+    );
+  }
+
+  /// Shutdown flips mid-batch: the predicate returns false once (op 0 runs) then
+  /// true, so op 0 gets its real `NotFound` reply and the tail (ops 1, 2) are failed
+  /// with `Io`. The reply vec still covers all three arms in order.
+  #[test]
+  fn prefix_runs_then_tail_is_failed_on_mid_batch_shutdown() {
+    let fd = create_instance().expect("inotify instance");
+    let mut table = WdTable::new();
+    let ops = vec![arm_op(1), arm_op(2), arm_op(3)];
+    let calls = Cell::new(0u32);
+    let (replies, preempted) = execute_batch(&fd, &mut table, ops, || {
+      let n = calls.get();
+      calls.set(n + 1);
+      n >= 1
+    });
+    assert!(preempted);
+    assert_eq!(replies.len(), 3);
+    assert!(
+      matches!(
+        replies[0].outcome,
+        WatchOutcome::Failed(WatchError::NotFound)
+      ),
+      "op 0 executed before the flip"
+    );
+    assert!(
+      matches!(replies[1].outcome, WatchOutcome::Failed(WatchError::Io))
+        && matches!(replies[2].outcome, WatchOutcome::Failed(WatchError::Io)),
+      "the un-executed tail is failed-replied with Io"
+    );
   }
 }

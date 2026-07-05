@@ -1183,6 +1183,12 @@ mod inotify_source {
       let Some(thread) = self.thread.take() else {
         return;
       };
+      // Raise the shutdown flag BEFORE the control send, so a reader partway
+      // through a long cold-enumerate `Control::Batch` observes it between ops and
+      // preempts (failing the remaining arms) rather than executing the whole batch
+      // before it dequeues this `Shutdown`. The message + wake remain the correctness
+      // floor; the flag only makes teardown prompt under an arm storm.
+      self.port.wake.request_shutdown();
       let _ = self.port.control.send(Control::Shutdown);
       self.port.wake.wake();
       let _ = thread.join();
