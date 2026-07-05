@@ -1,6 +1,7 @@
 use super::{
-  DecodeOutcome, EOVERFLOW, FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_EVENT_INFO_TYPE_DFID_NAME,
-  FAN_EVENT_INFO_TYPE_FID, FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
+  DecodeOutcome, EOVERFLOW, FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF,
+  FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID,
+  FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, FAN_MODIFY, FAN_MOVE_SELF,
   FAN_ONDIR, FAN_Q_OVERFLOW, FAN_RENAME, Fid, HandleAttempt, classify_handle_attempt,
   decode_events,
 };
@@ -415,4 +416,210 @@ fn handle_attempt_decision_table() {
     classify_handle_attempt(-1, None, false),
     HandleAttempt::Unsupported
   );
+}
+
+/// The required-field matrix (`decode_info`): every non-rename vocabulary the
+/// composite emits must carry the fields its admission path consumes, else the
+/// buffer is `lossy` (→ ordered `Overflow` + reseed) rather than a clean event
+/// admission would silently mishandle. These rows exercise each matrix cell — the
+/// malformed side (`lossy`, no event) and its well-formed counterpart (decodes
+/// intact) — so the whole class is closed, not just the reported instance.
+mod required_field_matrix {
+  use super::*;
+
+  /// A single-event buffer: one `DFID_NAME` record (parent FID + `name`, where an
+  /// empty `name` is a lone NUL that decodes to `None`) and, when `target` is set,
+  /// the child's `FID` record — the exact record shape the composite emits.
+  fn dirent(mask: u64, name: Option<&[u8]>, target: Option<&[u8]>) -> Vec<u8> {
+    let mut info = info_record(
+      FAN_EVENT_INFO_TYPE_DFID_NAME,
+      &fid_payload(FSID_A, 1, b"dir-handle", name),
+    );
+    if let Some(target) = target {
+      info.extend(info_record(
+        FAN_EVENT_INFO_TYPE_FID,
+        &fid_payload(FSID_A, 1, target, None),
+      ));
+    }
+    event(mask, &info)
+  }
+
+  /// A self-event buffer: a bare `DFID` record (the object's own FID, no name) —
+  /// the well-formed name-less shape a `DELETE_SELF`/`MOVE_SELF` carries.
+  fn self_event(mask: u64) -> Vec<u8> {
+    event(
+      mask,
+      &info_record(
+        FAN_EVENT_INFO_TYPE_DFID,
+        &fid_payload(FSID_A, 1, b"self-handle", None),
+      ),
+    )
+  }
+
+  fn decode_one(buf: &[u8]) -> DecodeOutcome {
+    decode_events(buf)
+  }
+
+  /// An empty name (a lone NUL) on a FILE create leaves the event pathless —
+  /// admission would resolve no `<dir>/<name>` — so it is refused (lossy).
+  #[test]
+  fn empty_name_file_create_is_lossy() {
+    let DecodeOutcome { events, lossy } =
+      decode_one(&dirent(FAN_CREATE, Some(b""), Some(b"child")));
+    assert!(lossy, "an empty-name create carries no path");
+    assert!(events.is_empty());
+  }
+
+  /// An empty name on a DIRECTORY create is doubly malformed (no path AND `learn`
+  /// could not place it); refused (lossy) rather than admitted unlearned.
+  #[test]
+  fn empty_name_dir_create_is_lossy() {
+    let DecodeOutcome { events, lossy } =
+      decode_one(&dirent(FAN_CREATE | FAN_ONDIR, Some(b""), Some(b"child")));
+    assert!(lossy);
+    assert!(events.is_empty());
+  }
+
+  /// An empty name on a delete leaves no path to resolve — lossy.
+  #[test]
+  fn empty_name_delete_is_lossy() {
+    let DecodeOutcome { events, lossy } = decode_one(&dirent(FAN_DELETE, Some(b""), None));
+    assert!(lossy);
+    assert!(events.is_empty());
+  }
+
+  /// An empty name on a modify — lossy.
+  #[test]
+  fn empty_name_modify_is_lossy() {
+    let DecodeOutcome { events, lossy } = decode_one(&dirent(FAN_MODIFY, Some(b""), None));
+    assert!(lossy);
+    assert!(events.is_empty());
+  }
+
+  /// An empty name on an attrib — lossy.
+  #[test]
+  fn empty_name_attrib_is_lossy() {
+    let DecodeOutcome { events, lossy } = decode_one(&dirent(FAN_ATTRIB, Some(b""), None));
+    assert!(lossy);
+    assert!(events.is_empty());
+  }
+
+  /// A DIRECTORY create missing its `TARGET_FID` (no `FID` record) cannot be
+  /// `learn`ed into the map, so its subtree would go blind — refused (lossy), the
+  /// exact silent-loss-until-reseed edge this matrix closes.
+  #[test]
+  fn dir_create_without_target_fid_is_lossy() {
+    let DecodeOutcome { events, lossy } =
+      decode_one(&dirent(FAN_CREATE | FAN_ONDIR, Some(b"newdir"), None));
+    assert!(
+      lossy,
+      "a directory create with no child FID cannot be learned"
+    );
+    assert!(events.is_empty());
+  }
+
+  /// The kernel's object-event shape (a `DELETE_SELF`/`ATTRIB` on an object) reports
+  /// the object's OWN handle as a bare `FID` record — no `DFID`, so `dir_fid` is
+  /// `None`. This is NOT malformed: admission drops a FID-less event (the firehose
+  /// filter), and a drop is not coverage loss. Decode must leave it CLEAN, else the
+  /// superblock's constant self/attrib traffic would spuriously reseed (and, co-
+  /// batched with a real event, drop it behind the barrier — the regression this
+  /// row guards). Masks `0x404` (ATTRIB|DELETE_SELF) etc. arrive exactly this way.
+  #[test]
+  fn object_event_with_only_own_fid_is_not_lossy() {
+    for mask in [
+      FAN_DELETE_SELF | FAN_ATTRIB,
+      FAN_MOVE_SELF,
+      FAN_ATTRIB,
+      FAN_DELETE_SELF | FAN_MOVE_SELF | FAN_ATTRIB,
+    ] {
+      let buf = event(
+        mask,
+        &info_record(
+          FAN_EVENT_INFO_TYPE_FID,
+          &fid_payload(FSID_A, 1, b"self-handle", None),
+        ),
+      );
+      let DecodeOutcome { events, lossy } = decode_one(&buf);
+      assert!(
+        !lossy,
+        "a FID-less object event {mask:#x} is dropped, not lossy"
+      );
+      assert_eq!(events.len(), 1);
+      assert!(
+        events[0].dir_fid.is_none(),
+        "no DFID — admission will drop it"
+      );
+      assert!(
+        events[0].target_fid.is_some(),
+        "the object's own FID is present"
+      );
+    }
+  }
+
+  /// An event with no FIDs at all (an empty info region) is likewise not lossy: with
+  /// no directory FID it is unaddressable and admission drops it — a drop, never a
+  /// decode loss that would reseed.
+  #[test]
+  fn event_with_no_fids_is_not_lossy() {
+    let DecodeOutcome { events, lossy } = decode_one(&event(FAN_DELETE_SELF, &[]));
+    assert!(
+      !lossy,
+      "a FID-less event is dropped by admission, not lossy"
+    );
+    assert_eq!(events.len(), 1);
+    assert!(events[0].dir_fid.is_none());
+  }
+
+  /// The well-formed FILE create (dir FID + name, target present but not required
+  /// for a file) decodes intact.
+  #[test]
+  fn well_formed_file_create_decodes() {
+    let DecodeOutcome { events, lossy } =
+      decode_one(&dirent(FAN_CREATE, Some(b"file.txt"), Some(b"child")));
+    assert!(!lossy);
+    assert_eq!(events.len(), 1);
+    assert!(events[0].mask.created());
+    assert_eq!(events[0].name.as_deref(), Some(b"file.txt".as_slice()));
+  }
+
+  /// The well-formed DIRECTORY create (dir FID + name + target) decodes intact,
+  /// carrying the child FID `learn` needs.
+  #[test]
+  fn well_formed_dir_create_decodes() {
+    let DecodeOutcome { events, lossy } = decode_one(&dirent(
+      FAN_CREATE | FAN_ONDIR,
+      Some(b"newdir"),
+      Some(b"child"),
+    ));
+    assert!(!lossy);
+    assert_eq!(events.len(), 1);
+    assert!(events[0].mask.ondir());
+    assert!(events[0].target_fid.is_some(), "the child FID is present");
+  }
+
+  /// The well-formed delete/modify/attrib (dir FID + name, no target needed) each
+  /// decode intact.
+  #[test]
+  fn well_formed_named_events_decode() {
+    for mask in [FAN_DELETE, FAN_MODIFY, FAN_ATTRIB] {
+      let DecodeOutcome { events, lossy } = decode_one(&dirent(mask, Some(b"entry"), None));
+      assert!(!lossy, "a named {mask:#x} event is well-formed");
+      assert_eq!(events.len(), 1);
+      assert_eq!(events[0].name.as_deref(), Some(b"entry".as_slice()));
+    }
+  }
+
+  /// A well-formed self-event (`DELETE_SELF`/`MOVE_SELF` with a bare `DFID`, no
+  /// name) decodes intact — the one legitimately name-less class.
+  #[test]
+  fn well_formed_self_events_decode() {
+    for mask in [FAN_DELETE_SELF | FAN_ONDIR, FAN_MOVE_SELF | FAN_ONDIR] {
+      let DecodeOutcome { events, lossy } = decode_one(&self_event(mask));
+      assert!(!lossy, "a name-less self-event is well-formed");
+      assert_eq!(events.len(), 1);
+      assert!(events[0].dir_fid.is_some());
+      assert!(events[0].name.is_none(), "a self-event carries no name");
+    }
+  }
 }

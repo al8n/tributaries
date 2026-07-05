@@ -65,6 +65,16 @@ pub(crate) struct WakeState {
   /// `true` while the reader is committed to (or already inside) a blocking
   /// `poll`; senders skip the wake syscall when it reads `false`.
   parked: AtomicBool,
+  /// Set once by teardown, BEFORE the terminal `Control::Shutdown` is enqueued, so
+  /// a reader executing a long control batch (an inotify cold enumerate's thousands
+  /// of arms in ONE [`Control::Batch`](super::inotify::reader::Control)) observes it
+  /// BETWEEN ops and preempts, rather than running the whole batch before it sees
+  /// the following shutdown message. Advisory: its correctness floor is the terminal
+  /// message (channel-synchronized) plus the unconditional [`wake`](Self::wake), so
+  /// a maximally-delayed load only falls back to the existing between-message check
+  /// — never a missed teardown. Used by the inotify reader (the only one with a
+  /// control batch); the fanotify reader has no batch, so it never reads this.
+  shutdown: AtomicBool,
 }
 
 impl WakeState {
@@ -76,6 +86,7 @@ impl WakeState {
     Ok(Arc::new(Self {
       event,
       parked: AtomicBool::new(false),
+      shutdown: AtomicBool::new(false),
     }))
   }
 
@@ -123,5 +134,21 @@ impl WakeState {
   /// guarantees a pending wake.
   pub(crate) fn wake(&self) {
     let _ = rustix::io::write(&self.event, &1u64.to_ne_bytes());
+  }
+
+  /// Raises the shutdown flag so a reader mid control-batch preempts between ops.
+  /// Teardown calls this BEFORE enqueuing `Control::Shutdown` and BEFORE
+  /// [`wake`](Self::wake), so the flag is visible by the time the reader next
+  /// checks it. `Relaxed` suffices: the flag carries no data to publish, and its
+  /// correctness floor is the terminal message + unconditional wake (see the field
+  /// docs), so a delayed observation only defers to the between-message check.
+  pub(crate) fn request_shutdown(&self) {
+    self.shutdown.store(true, Ordering::Relaxed);
+  }
+
+  /// Whether teardown has requested shutdown — the inotify reader's between-ops
+  /// preemption check inside a control batch.
+  pub(crate) fn shutdown_requested(&self) -> bool {
+    self.shutdown.load(Ordering::Relaxed)
   }
 }
