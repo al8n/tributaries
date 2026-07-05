@@ -30,6 +30,28 @@
 //!   fanotify seed's `statfs` fsid read (rustix keeps `StatFs::f_fsid` behind a
 //!   private field with no accessor, so the FID scope cannot be read through it).
 //!   These keep their `unsafe` blocks and `io::Error::last_os_error` handling.
+//!
+//! # Kernel floor contract
+//!
+//! The two backends advertise two different floors, and each is honored END TO
+//! END — every syscall on a backend's spawn path is available on that backend's
+//! floor, or degrades to one that is:
+//!
+//! - **inotify: universal** (the design's first-class-primitive stance — e.g.
+//!   RHEL 8 ships 4.18). The only spawn-path calls above that floor carry a
+//!   fallback: `openat2` (5.6) degrades on `ENOSYS` to the hand-rolled
+//!   [`open_no_symlinks`] component walk — shared by BOTH the root pin
+//!   ([`pin_root`]) and the post-live ancestor identities
+//!   ([`ancestor_identities`]), so a pre-5.6 kernel pins, starts the reader, AND
+//!   reads the ancestor chain without ever hitting an unhandled `ENOSYS`; and
+//!   `statx`'s mount id (`STATX_MNT_ID`, 5.8) is always a masked read
+//!   ([`root_mount_id`] here, `statx_sample`/`frame_of` in the driver) that
+//!   yields `None`/the device fallback below the floor rather than failing.
+//!   `inotify_init` and `eventfd` are far below the floor.
+//! - **fanotify: 5.17+** (the `FAN_REPORT_TARGET_FID` / `FAN_RENAME` composite,
+//!   design §4). Every fanotify-only call — including the seed walk's `openat2`
+//!   roots in `fanotify::source` — relies on that floor and stays `openat2`-only
+//!   with no fallback: a pre-5.6 kernel could never have started the source.
 // The fanotify backend (L4) consumes the remaining reserved surface; the
 // container suites exercise the parts a macOS host build cannot reach.
 #![allow(dead_code)]
@@ -447,25 +469,33 @@ impl Source {
 /// fallback fail with `RootUnavailable` on any pre-5.6 kernel — breaking that
 /// floor while the rest of the code carries pre-5.8 `statx` fallbacks. So on
 /// `ENOSYS` (the kernel has no `openat2`) this degrades to a component-wise walk
-/// that reproduces the identical no-symlink pin by hand ([`pin_root_walk`]); the
-/// resulting fd, used only by inotify (fanotify cannot run this low), is the same
-/// object with the same downstream semantics.
+/// that reproduces the identical no-symlink pin by hand ([`open_no_symlinks`],
+/// the walker [`ancestor_identities`] shares for the same reason); the resulting
+/// fd, used only by inotify (fanotify cannot run this low), is the same object
+/// with the same `O_RDONLY | O_DIRECTORY` final flags and downstream semantics.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn pin_root(canonical: &Path) -> Result<OwnedFd, super::SourceError> {
+  let final_flags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
   match rustix::fs::openat2(
     rustix::fs::CWD,
     canonical,
-    OFlags::RDONLY
-      .union(OFlags::DIRECTORY)
-      .union(OFlags::NOFOLLOW)
-      .union(OFlags::CLOEXEC),
+    final_flags,
     rustix::fs::Mode::empty(),
     rustix::fs::ResolveFlags::NO_SYMLINKS,
   ) {
     Ok(fd) => Ok(fd),
     // No `openat2` on this kernel (pre-5.6): pin by the component walk instead.
-    // Only inotify reaches this — fanotify's 5.17 floor is far above it.
-    Err(rustix::io::Errno::NOSYS) => pin_root_walk(canonical),
+    // Only inotify reaches this — fanotify's 5.17 floor is far above it. The final
+    // component keeps `O_RDONLY | O_DIRECTORY`, matching the fast path exactly.
+    Err(rustix::io::Errno::NOSYS) => {
+      open_no_symlinks(canonical, final_flags).map_err(|err| super::SourceError::RootUnavailable {
+        root: canonical.to_path_buf(),
+        source: err.into(),
+      })
+    }
     Err(err) => Err(super::SourceError::RootUnavailable {
       root: canonical.to_path_buf(),
       source: err.into(),
@@ -473,68 +503,89 @@ fn pin_root(canonical: &Path) -> Result<OwnedFd, super::SourceError> {
   }
 }
 
-/// The pre-`openat2` pin: walks `canonical` one component at a time under held
-/// fds, so the no-symlink guarantee `RESOLVE_NO_SYMLINKS` gives in one syscall is
-/// rebuilt by hand. It opens the root anchor ("/" for an absolute canonical path,
-/// or [`CWD`](rustix::fs::CWD) as the base for a relative one) and then, for each
-/// `Normal` component, `openat(parent_fd, name, O_PATH | O_NOFOLLOW | O_DIRECTORY
-/// | O_CLOEXEC)`. `openat`'s `O_NOFOLLOW` governs the FINAL component of the path
-/// it is handed — and each hop hands exactly one component — so a symlink at ANY
-/// component fails `ELOOP`, exactly as the fast path's whole-path no-symlink open
-/// would. `canonicalize` already resolved every `.`/`..`/prefix, so a canonical
-/// path yields only a root plus `Normal` components; any other component kind is a
-/// non-canonical input and is refused.
+/// The pre-`openat2` no-symlink open, SHARED by [`pin_root`] and
+/// [`ancestor_identities`] on `ENOSYS`: walks `path` one component at a time under
+/// held fds, so the no-symlink guarantee `RESOLVE_NO_SYMLINKS` gives in one syscall
+/// is rebuilt by hand. It opens the anchor ("/" for an absolute path, or
+/// [`CWD`](rustix::fs::CWD) as the base for a relative one) and then, for each
+/// `Normal` component, `openat(parent_fd, name, …, O_NOFOLLOW | O_DIRECTORY)`.
+/// `openat`'s `O_NOFOLLOW` governs the FINAL component of the path it is handed —
+/// and each hop hands exactly one component — so a symlink at ANY component is
+/// refused rather than traversed, exactly the no-follow guarantee the fast path's
+/// whole-path `RESOLVE_NO_SYMLINKS` open gives. The refusal errno is a kernel
+/// detail: `O_NOFOLLOW | O_PATH` opens the link object itself and the accompanying
+/// `O_DIRECTORY` then rejects it (`ENOTDIR`), or the resolver refuses the link
+/// outright (`ELOOP`) — either way the link is never followed to its target.
+/// `canonicalize` already resolved every `.`/`..`/prefix, so a canonical path (or a
+/// strict ancestor of one) yields only an anchor plus `Normal` components; any other
+/// component kind is a non-canonical input and is refused (`EINVAL`).
 ///
-/// `O_PATH` (not `O_RDONLY`) is deliberate: the walk opens ancestors, which should
-/// need only search permission — the same reason [`ancestor_identities`] uses
-/// `O_PATH`. The fanotify seed walk's `readdir` never sees this fd (fanotify cannot
-/// run pre-5.6), and inotify's only reads on the pin — `fstat`, `statx`, `fstatfs`
-/// — are all legal on an `O_PATH` fd, so the downstream semantics are identical.
+/// The INTERMEDIATE hops open `O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC` —
+/// ancestors that should need only search permission — while the FINAL component
+/// opens with the caller's `final_flags`, so each caller keeps its exact permission
+/// behavior: `pin_root` ends on `O_RDONLY | O_DIRECTORY` (matching its fast path),
+/// `ancestor_identities` on `O_PATH | O_DIRECTORY` (search-only, like its `metadata`
+/// predecessor). When `path` is the anchor itself (no `Normal` components, e.g.
+/// `"/"`), the anchor open carries `final_flags` — the anchor is the final object.
 ///
-/// A vanished component is `ENOENT` → `RootUnavailable` (the caller's NotFound
-/// race); a symlinked or non-directory component is `ELOOP`/`ENOTDIR` → the same
-/// typed refusal the fast path gives — never a pin on the wrong object.
+/// Errors surface as the raw [`Errno`](rustix::io::Errno) for the caller to map onto
+/// its own `RootUnavailable` (each names the right `root`): a vanished component is
+/// `ENOENT` (the caller's NotFound race); a symlinked or non-directory component is
+/// `ELOOP`/`ENOTDIR` — the same typed refusal the fast path gives — never a pin on
+/// the wrong object.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn pin_root_walk(canonical: &Path) -> Result<OwnedFd, super::SourceError> {
+fn open_no_symlinks(path: &Path, final_flags: OFlags) -> Result<OwnedFd, rustix::io::Errno> {
   use std::path::Component;
 
   let walk_flags = OFlags::PATH
     .union(OFlags::NOFOLLOW)
     .union(OFlags::DIRECTORY)
     .union(OFlags::CLOEXEC);
-  let unavailable = |err: rustix::io::Errno| super::SourceError::RootUnavailable {
-    root: canonical.to_path_buf(),
-    source: err.into(),
-  };
 
-  let mut components = canonical.components();
-  // The base fd: the filesystem root for an absolute path, else the cwd. Opening
-  // "/" with O_NOFOLLOW is safe — "/" is never a symlink.
-  let mut current: OwnedFd = match components.clone().next() {
-    Some(Component::RootDir) => {
-      components.next();
-      rustix::fs::openat(rustix::fs::CWD, c"/", walk_flags, rustix::fs::Mode::empty())
-        .map_err(unavailable)?
-    }
-    // A relative canonical path is unusual (canonicalize yields absolute), but
-    // walk it from the cwd for completeness.
-    _ => rustix::fs::openat(rustix::fs::CWD, c".", walk_flags, rustix::fs::Mode::empty())
-      .map_err(unavailable)?,
-  };
-
+  // Collect the `Normal` components up front so the LAST hop can be opened with
+  // `final_flags` (the caller's permission) while the rest stay `O_PATH`. A
+  // non-`Normal`, non-anchor component is a non-canonical input.
+  let mut names = Vec::new();
+  let mut components = path.components();
+  let has_root = matches!(components.clone().next(), Some(Component::RootDir));
+  if has_root {
+    components.next();
+  }
   for component in components {
     let Component::Normal(name) = component else {
       // `.`/`..`/prefix cannot appear in a canonical path; reject a
       // non-canonical input rather than climb or loop.
-      return Err(super::SourceError::RootUnavailable {
-        root: canonical.to_path_buf(),
-        source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
-      });
+      return Err(rustix::io::Errno::INVAL);
     };
-    // `openat` relative to the held parent fd: the single component's
-    // O_NOFOLLOW is the per-hop no-symlink guarantee.
-    current = rustix::fs::openat(&current, name, walk_flags, rustix::fs::Mode::empty())
-      .map_err(unavailable)?;
+    names.push(name);
+  }
+
+  // The anchor fd: the filesystem root for an absolute path, else the cwd. Opening
+  // "/" with O_NOFOLLOW is safe — "/" is never a symlink. If there are no `Normal`
+  // components the anchor IS the target, so it carries `final_flags`.
+  let anchor_flags = if names.is_empty() {
+    final_flags
+  } else {
+    walk_flags
+  };
+  let anchor = if has_root { c"/" } else { c"." };
+  let mut current = rustix::fs::openat(
+    rustix::fs::CWD,
+    anchor,
+    anchor_flags,
+    rustix::fs::Mode::empty(),
+  )?;
+
+  let last = names.len().saturating_sub(1);
+  for (index, name) in names.into_iter().enumerate() {
+    // `openat` relative to the held parent fd: the single component's O_NOFOLLOW is
+    // the per-hop no-symlink guarantee. The final component uses the caller's flags.
+    let flags = if index == last {
+      final_flags
+    } else {
+      walk_flags
+    };
+    current = rustix::fs::openat(&current, name, flags, rustix::fs::Mode::empty())?;
   }
   Ok(current)
 }
@@ -576,6 +627,14 @@ fn root_is_remote(root_fd: &OwnedFd, canonical: &Path) -> Result<bool, super::So
 /// needs only search permission (like the previous `metadata`), so a normal
 /// search-but-not-read ancestor still resolves.
 ///
+/// This runs in the inotify spawn's post-live bracket AFTER the reader is live, so
+/// it shares [`pin_root`]'s kernel floor: `openat2` is pre-5.6, but inotify's floor
+/// is universal, so on `ENOSYS` each ancestor falls back to the SAME component walk
+/// [`open_no_symlinks`] the pin uses (final flags `O_PATH | O_DIRECTORY`, search
+/// permission). Without this fallback a pre-5.6 kernel would pin the root by the
+/// walk, start the reader, then die `RootUnavailable` one call later — the floor
+/// broken end to end rather than per-call-site.
+///
 /// Grounding this matters because the identities gate a TRUST decision (admitting
 /// or refusing a second overlapping watch); a corrupted ancestor could only ever
 /// mis-decide THAT — never redirect the live source, whose object is the pin — but
@@ -583,26 +642,32 @@ fn root_is_remote(root_fd: &OwnedFd, canonical: &Path) -> Result<bool, super::So
 /// decision unpinned.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn ancestor_identities(canonical: &Path) -> Result<Vec<super::RootIdentity>, super::SourceError> {
+  let final_flags = OFlags::PATH
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC);
   let mut ancestors = Vec::new();
   for ancestor in canonical.ancestors().skip(1) {
-    let fd = rustix::fs::openat2(
+    let unavailable = |err: rustix::io::Errno| super::SourceError::RootUnavailable {
+      root: ancestor.to_path_buf(),
+      source: err.into(),
+    };
+    let fd = match rustix::fs::openat2(
       rustix::fs::CWD,
       ancestor,
-      OFlags::PATH
-        .union(OFlags::NOFOLLOW)
-        .union(OFlags::DIRECTORY)
-        .union(OFlags::CLOEXEC),
+      final_flags,
       rustix::fs::Mode::empty(),
       rustix::fs::ResolveFlags::NO_SYMLINKS,
-    )
-    .map_err(|err| super::SourceError::RootUnavailable {
-      root: ancestor.to_path_buf(),
-      source: err.into(),
-    })?;
-    let stat = rustix::fs::fstat(&fd).map_err(|err| super::SourceError::RootUnavailable {
-      root: ancestor.to_path_buf(),
-      source: err.into(),
-    })?;
+    ) {
+      Ok(fd) => fd,
+      // Pre-5.6 kernel with no `openat2`: pin the ancestor by the shared component
+      // walk, same no-symlink guarantee, same `O_PATH` final flags.
+      Err(rustix::io::Errno::NOSYS) => {
+        open_no_symlinks(ancestor, final_flags).map_err(unavailable)?
+      }
+      Err(err) => return Err(unavailable(err)),
+    };
+    let stat = rustix::fs::fstat(&fd).map_err(unavailable)?;
     ancestors.push(super::RootIdentity::new(stat.st_dev, stat.st_ino));
   }
   Ok(ancestors)
