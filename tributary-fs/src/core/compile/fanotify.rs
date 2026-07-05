@@ -64,13 +64,16 @@ impl DriverCore {
       return self.plan_rename(state, scope, &rename.old_path, &rename.new_path);
     }
 
-    // classify routes an ambiguous merged mask (two or more structural verbs) to the
-    // loss barrier upstream, so a non-rename event that admitted this far names AT
-    // MOST ONE structural verb. The verb selectors below (the self-event branch and
-    // `verb`) therefore treat the mask as naming ONE action; a multi-structural mask
-    // reaching here is a classify/reader bug. In release the selectors still degrade
-    // safely — they pick the highest-priority verb, never panic — but assert the
-    // invariant in debug so a future admission regression trips a test, not the field.
+    // classify's universal multi-structural gate routes an ambiguous merged mask (two
+    // or more structural verbs, rename now counted among them) to the loss barrier
+    // upstream, so a non-rename event that admitted this far names AT MOST ONE
+    // structural verb (renames are lowered by `plan_rename` above, and a merged
+    // rename+verb never escapes the gate to reach either path). The verb selectors
+    // below (the self-event branch and `verb`) therefore treat the mask as naming ONE
+    // action; a multi-structural mask reaching here is a classify/reader bug. In
+    // release the selectors still degrade safely — they pick the highest-priority verb,
+    // never panic — but assert the invariant in debug so a future admission regression
+    // trips a test, not the field.
     debug_assert!(
       !mask.multi_structural(),
       "a multi-structural fanotify mask reached lowering; classify must route it to Lossy"
