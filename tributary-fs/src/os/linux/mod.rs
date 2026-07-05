@@ -54,8 +54,14 @@
 //!   [`open_no_symlinks`] component walk, so a 4.11–5.5 kernel still pins, starts
 //!   the reader, AND reads the ancestor chain without ever hitting an unhandled
 //!   `ENOSYS`. `statx`'s mount id (`STATX_MNT_ID`, 5.8) is a masked read
-//!   ([`root_mount_id`] here, and the driver's `stat_sample`) that yields `None`/the
-//!   device-belt fence on a 4.11–5.7 kernel rather than failing. `inotify_init` and
+//!   ([`root_mount_id`] here, and the driver's `stat_sample`) that yields `Ok(None)`
+//!   — the device-belt fence — on a 4.11–5.7 kernel rather than failing. The scope
+//!   fence rests on one invariant: **a `None` mount frame means `statx` SUCCEEDED
+//!   without the `STATX_MNT_ID` bit (a pre-5.8 belt), and NEVER that `statx`
+//!   failed.** A `statx` failure is always a spawn failure ([`require_statx`] fails
+//!   closed on EVERY error, and the mount-id capture turns `Err` into a spawn
+//!   refusal) or a walk failure — so the belt is never reached by silently
+//!   swallowing a denied `statx`, which would disable the fence. `inotify_init` and
 //!   `eventfd` are far below the floor.
 //! - **fanotify: 5.17+** (the `FAN_REPORT_TARGET_FID` / `FAN_RENAME` composite,
 //!   design §4), well above the `statx` floor, so the up-front gate never trips on
@@ -626,48 +632,78 @@ fn root_is_remote(root_fd: &OwnedFd, canonical: &Path) -> Result<bool, super::So
   Ok(fs_type_is_remote(stat.f_type as i64))
 }
 
-/// The inotify floor gate: refuses a kernel without `statx` (Linux 4.11, May
-/// 2017) up front, so the descending backend never limps below the floor it
-/// depends on. Every live-path fact the driver reports — root liveness and
-/// directory-entry identity (the driver's `stat_sample`) — is a `statx`, so a
-/// kernel that cannot run it cannot be watched honestly; probing
-/// ONCE here, on the pinned root (`statx(root_fd, "", AT_EMPTY_PATH, …)`, the same
-/// fd-relative shape [`root_mount_id`] uses), fails such a kernel with a typed
+/// The inotify floor gate: refuses a kernel that cannot RUN `statx` (Linux 4.11,
+/// May 2017) up front, so the descending backend never limps below — or beside —
+/// the floor it depends on. Every live-path fact the driver reports — root liveness
+/// and directory-entry identity (the driver's `stat_sample`) — is a `statx`, AND the
+/// mount-id scope fence ([`root_mount_id`], the same fd-relative shape) is a `statx`
+/// too, so a kernel or sandbox that cannot run it cannot be watched honestly.
+/// Probing ONCE here, on the pinned root (`statx(root_fd, "", AT_EMPTY_PATH, …)`),
+/// fails such an environment with a typed
 /// [`RootUnavailable`](super::SourceError::RootUnavailable) instead of a confusing
 /// statx-backed-`fstat` `NOSYS` surfacing arch-dependently in the identity capture
 /// (rustix's `fstat`/`lstat` are `statx`-backed on 32-bit and fall back only on
 /// `NOSYS`). fanotify's 5.17 floor is far above this, so the gate is a real path
-/// only for inotify below 4.11 — that and a `statx`-blocking seccomp policy are
-/// explicitly unsupported.
+/// only for inotify below 4.11 and for a `statx`-blocking sandbox.
 ///
-/// Only the statx-UNAVAILABLE errno set ([`statx_unavailable`]) trips the gate; a
-/// genuine `NOENT`/`EACCES`/`EPERM`/… is NOT the floor and passes through so the
-/// barrier's own stat handling surfaces it with its existing meaning.
+/// # Requiring statx means requiring it to WORK — fail closed
+///
+/// EVERY `statx` error refuses the spawn, not only the below-floor set: a successful
+/// `statx` is the ONLY way past the gate ([`statx_gate_error`] maps every errno to a
+/// typed refusal). This is load-bearing for the mount-id scope fence — a seccomp
+/// policy answering `EPERM`/`EACCES` for `statx` would otherwise let a source go LIVE
+/// while [`root_mount_id`] silently degraded to `None` and the core's
+/// `crosses_mount_boundary` fell back to the device belt, reopening the
+/// same-superblock bind-mount over-admission class the mount id exists to close. So a
+/// `statx`-blocking sandbox is explicitly UNSUPPORTED: allowlist `statx`. The errno
+/// only selects the refusal MESSAGE (the below-4.11
+/// floor text for the [`statx_unavailable`] set, the raw errno otherwise); it never
+/// selects Ok.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn require_statx(root_fd: BorrowedFd<'_>, canonical: &Path) -> Result<(), super::SourceError> {
   use rustix::fs::{AtFlags, StatxFlags, statx};
   match statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::TYPE) {
     Ok(_) => Ok(()),
-    Err(errno) if statx_unavailable(errno) => Err(super::SourceError::RootUnavailable {
-      root: canonical.to_path_buf(),
-      source: std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "the Linux backends require statx (Linux 4.11+)",
-      ),
-    }),
-    Err(_) => Ok(()),
+    Err(errno) => Err(statx_gate_error(errno, canonical)),
+  }
+}
+
+/// The typed spawn refusal for a `statx` that did not succeed on the pinned root
+/// (PURE — row-tested). The gate is fail-closed, so EVERY errno becomes a
+/// [`RootUnavailable`](super::SourceError::RootUnavailable); the errno only picks the
+/// source message. The unsupported-floor set ([`statx_unavailable`]) names the Linux
+/// 4.11 floor (a pre-4.11 kernel, or a filesystem/sandbox with no `statx` at all —
+/// `EOPNOTSUPP`), carried as an `Unsupported` I/O error; every other errno (`EPERM`
+/// and `EACCES` from a `statx`-blocking seccomp policy, `EIO`, …) surfaces as itself.
+/// Both refuse the spawn: a source must never go live with `statx` unavailable,
+/// because the mount-id scope fence structurally depends on it.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn statx_gate_error(errno: rustix::io::Errno, canonical: &Path) -> super::SourceError {
+  let source = if statx_unavailable(errno) {
+    std::io::Error::new(
+      std::io::ErrorKind::Unsupported,
+      "the Linux backends require statx (Linux 4.11+)",
+    )
+  } else {
+    errno.into()
+  };
+  super::SourceError::RootUnavailable {
+    root: canonical.to_path_buf(),
+    source,
   }
 }
 
 /// Whether a `statx` errno means the syscall is UNAVAILABLE on this kernel — the
-/// pure floor decision [`require_statx`] gates on, row-tested. `statx` landed in
-/// Linux 4.11, so an older kernel answers `NOSYS`; a filesystem or sandbox with no
-/// `statx` support can answer `EOPNOTSUPP`. Both mean "no `statx` here", which the
-/// Linux backends require. Every other errno — a real `NOENT`, `EACCES`, `EPERM`,
-/// … — keeps its meaning and passes through; `EPERM` is deliberately NOT the floor,
-/// so the gate stays narrow (a genuine permission fault is never misread as a
-/// missing syscall, and a seccomp policy that blocks `statx` is an unsupported
-/// environment, not one this gate rescues).
+/// pure MESSAGE selector [`statx_gate_error`] uses to name the floor (row-tested).
+/// `statx` landed in Linux 4.11, so an older kernel answers `NOSYS`; a filesystem or
+/// sandbox with no `statx` support at all can answer `EOPNOTSUPP`. Both mean "no
+/// `statx` here", which the Linux backends require, so both carry the below-4.11
+/// floor message. Every other errno — `EPERM`/`EACCES` (a seccomp policy that BLOCKS
+/// `statx` rather than removing it), `EIO`, … — is NOT the floor and keeps its own
+/// message. It does NOT, however, pass the gate: [`require_statx`] refuses on EVERY
+/// error (fail closed); this classifier only chooses which message the refusal
+/// carries, never whether to refuse. A `statx`-blocking seccomp profile is an
+/// unsupported environment (allowlist `statx`), not one the gate rescues.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn statx_unavailable(errno: rustix::io::Errno) -> bool {
   matches!(
@@ -745,18 +781,38 @@ fn ancestor_identities(canonical: &Path) -> Result<Vec<super::RootIdentity>, sup
 /// `mount --bind` of a same-superblock directory shares the root's device, so the
 /// device alone cannot mark the boundary; the mount id differs across any mount.
 ///
-/// `None` when the kernel did not report a mount id: the `STATX_MNT_ID` field is
-/// absent (below Linux 5.8) or the returned `stx_mask` left the bit unset; the
-/// `.ok()?` also declines any `statx` error defensively (the spawn barrier already
-/// gated the 4.11 `statx` floor, so a whole-syscall failure here is not expected).
-/// inotify's kernel floor (4.11) is below 5.8, so `None` is a real path there — the
-/// core degrades to the device check (the settled single-device policy). fanotify's
-/// 5.17 floor always reports it, but `None` is still handled rather than asserted.
+/// # `Ok(None)` is the pre-5.8 belt; `Err` is a syscall failure — never conflated
+///
+/// A SUCCESSFUL `statx` whose `stx_mask` lacks the `STATX_MNT_ID` bit returns
+/// `Ok(None)` — the legitimate device-belt degrade below Linux 5.8 (RHEL 8's 4.18,
+/// Ubuntu 20.04's 5.4), where the core's `crosses_mount_boundary` falls back to the
+/// device check (the settled single-device policy). A `statx` SYSCALL FAILURE returns
+/// `Err(errno)` and is NEVER laundered into that `None`: the spawn-time frame capture
+/// (`RootMeta.root_mnt_id`, both backends) turns it into a spawn failure, and the live
+/// reseed/subtree walks turn it into a walk failure — so a `None` mount frame ALWAYS
+/// means `statx` succeeded without the mount-id bit and NEVER means `statx` failed.
+/// The spawn barrier already gated the 4.11 `statx` floor ([`require_statx`], fail
+/// closed), so an `Err` here is not expected — but it fails closed rather than
+/// silently disabling the fence. inotify's 4.11 floor is below 5.8, so `Ok(None)` is a
+/// real path there; fanotify's 5.17 floor always reports the id, but `Ok(None)` is
+/// still handled rather than asserted.
 #[cfg(all(target_os = "linux", not(miri)))]
-pub(crate) fn root_mount_id(root_fd: BorrowedFd<'_>) -> Option<u64> {
+pub(crate) fn root_mount_id(root_fd: BorrowedFd<'_>) -> Result<Option<u64>, rustix::io::Errno> {
   use rustix::fs::{AtFlags, StatxFlags, statx};
-  let stx = statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID).ok()?;
-  (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id)
+  let stx = statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+  Ok(mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id))
+}
+
+/// The mount id a SUCCESSFUL `statx` reported, or `None` when its `stx_mask` left the
+/// `STATX_MNT_ID` bit unset (PURE — the below-5.8 belt decision, split out so it is
+/// row-testable without a live fd). This distinguishes only mask-present from
+/// mask-absent; a `statx` syscall failure never reaches here (the caller propagates it
+/// as `Err`), so a `None` from this function is ALWAYS the legitimate mask-absent belt,
+/// never a swallowed error.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn mnt_id_from_mask(stx_mask: u32, stx_mnt_id: u64) -> Option<u64> {
+  use rustix::fs::StatxFlags;
+  (stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx_mnt_id)
 }
 
 /// A live Linux source, one variant per backend. Dropping it tears the reader
@@ -923,10 +979,15 @@ mod inotify_source {
       })?;
       let root_dev = stat.st_dev;
       // The root's mount id from the same PIN — the core's descent boundary. inotify
-      // runs below 5.8, so this may be `None` (statx has no mount id there); the
-      // core then falls back to the device check. Read once here, carried on
+      // runs below 5.8, so a SUCCESSFUL read may be `None` (statx reports no mount id
+      // there) and the core falls back to the device check; a statx SYSCALL failure,
+      // by contrast, is a spawn failure — never a silent `None` that would disable the
+      // fence (the barrier already required statx to work). Read once here, carried on
       // `RootMeta` like `root_dev`.
-      let root_mnt_id = root_mount_id(root_fd);
+      let root_mnt_id = root_mount_id(root_fd).map_err(|err| SourceError::RootUnavailable {
+        root: canonical.clone(),
+        source: err.into(),
+      })?;
       let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
       let mounts = mounts_under(&canonical).unwrap_or_default();
 
