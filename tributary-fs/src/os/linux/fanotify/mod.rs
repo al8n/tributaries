@@ -282,6 +282,18 @@ fn classify_dirent(
   };
   let path = Some(join_name(&dir_path, name));
 
+  // A merged bitmask carrying two or more structural verbs (a create+delete of the
+  // same name; man 7 fanotify merges consecutive events for one object) is
+  // AMBIGUOUS — no single tree mutation is correct. The parent is in-root (gated
+  // above), so route it to the loss barrier: applying one verb (learn) while
+  // dropping the rest (the delete) would leave a departed directory learned in the
+  // map (a one-sided mutation / stale admission). The reseed + covering `Overflow`
+  // rebuild the map truthfully instead. A single-structural mask (optionally plus
+  // metadata/`ONDIR`) is unambiguous and classified below exactly as before.
+  if mask.multi_structural() {
+    return Admission::Lossy;
+  }
+
   if mask.ondir() {
     if mask.created() {
       // Learn the new child directory — REQUIRES its own FID to key the node, else
@@ -355,6 +367,17 @@ fn classify_nameless(
     // The self-object is unknown to the map — a foreign object elsewhere on the sb.
     return Admission::ForeignDrop;
   };
+
+  // A merged bitmask with two or more structural verbs (a delete_self+move_self of
+  // one object; man 7 fanotify merges events for one object) is AMBIGUOUS — see
+  // `classify_dirent`. Route it to the loss barrier rather than apply one self-death
+  // mutation and drop the rest. A ROOT multi-structural event reseeds too, never a
+  // one-sided root mutation: the fresh reseed walk (and the liveness tick) still
+  // observe a genuinely-departed root, so a truly-dead root is not masked, while a
+  // survivable ambiguity heals into a truthful map.
+  if mask.multi_structural() {
+    return Admission::Lossy;
+  }
 
   if mask.delete_self() || mask.move_self() {
     if is_root {

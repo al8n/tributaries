@@ -4,7 +4,9 @@ use super::{ReseedOutcome, SeedOutcome, process_decoded, reseed_map, seed_moved_
 use crate::os::{
   BackendStatsShared, SourceMessage,
   linux::fanotify::{
-    fid::{DecodeOutcome, FAN_CREATE, FAN_MODIFY, FAN_ONDIR, FanMask, Fid, RawFanotifyEvent},
+    fid::{
+      DecodeOutcome, FAN_CREATE, FAN_DELETE, FAN_MODIFY, FAN_ONDIR, FanMask, Fid, RawFanotifyEvent,
+    },
     map::{FidMap, SeedEntry},
   },
   transport::TransportState,
@@ -347,6 +349,51 @@ fn lossy_buffer_forwards_only_the_overflow_after_reseeding() {
     sent,
     vec![Sent::Overflow],
     "the barrier: no Batch precedes the Overflow — the suffix event is dropped"
+  );
+}
+
+/// A MERGED multi-structural event (a create+delete of the same dirent — man 7
+/// fanotify merges consecutive events for one object, and the mask is a bitmask) is
+/// SEMANTICALLY ambiguous, not wire-lossy: decode produces it intact (`lossy: false`),
+/// and classify routes it to `Admission::Lossy`, so the reader takes the SAME
+/// per-buffer barrier a wire loss takes. This drives the merged event end to end
+/// (decode outcome → classify → barrier): a would-forward event co-batched AHEAD of it
+/// is dropped (only the `Overflow` is forwarded, no Batch), the map is reseeded rather
+/// than one-sided-mutated (the merged create never learns the deleted child), and the
+/// stream stays live. The deterministic container-reality complement to the hermetic
+/// oracle — the kernel MAY merge, and however it does, the seam refuses the ambiguity.
+#[test]
+fn merged_multi_structural_event_takes_the_barrier_and_reseeds() {
+  let mut map = seeded_with_sub();
+  let merged = RawFanotifyEvent {
+    mask: FanMask::new(FAN_CREATE | FAN_DELETE | FAN_ONDIR),
+    dir_fid: Some(fid(2)),
+    target_fid: Some(fid(7)),
+    name: Some(b"merged".to_vec()),
+    rename: None,
+  };
+  // A would-forward modify AHEAD of the merged event: the barrier must drop it too.
+  let decoded = DecodeOutcome {
+    events: vec![modify_under(fid(2), b"before"), merged],
+    lossy: false,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  assert!(
+    alive,
+    "the ambiguous merge reseeds and keeps the stream live"
+  );
+  assert_eq!(
+    reseeds, 1,
+    "classify's Lossy took the barrier and reseeded once"
+  );
+  assert_eq!(
+    sent,
+    vec![Sent::Overflow],
+    "the barrier: only the Overflow — the merged event AND the co-batched suffix drop"
+  );
+  assert!(
+    !map.contains_dir(&fid(7)),
+    "the merged create never learned the child its co-merged delete removed"
   );
 }
 
