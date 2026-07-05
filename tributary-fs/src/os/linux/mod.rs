@@ -37,27 +37,31 @@
 //! END — every syscall on a backend's spawn path is available on that backend's
 //! floor, or degrades to one that is:
 //!
-//! - **inotify: universal** (the design's first-class-primitive stance — e.g.
-//!   RHEL 8 ships 4.18). The only spawn-path calls above that floor carry a
-//!   fallback: `openat2` (5.6) degrades on `ENOSYS` to the hand-rolled
-//!   [`open_no_symlinks`] component walk — shared by BOTH the root pin
-//!   ([`pin_root`]) and the post-live ancestor identities
-//!   ([`ancestor_identities`]), so a pre-5.6 kernel pins, starts the reader, AND
-//!   reads the ancestor chain without ever hitting an unhandled `ENOSYS`;
-//!   `statx`'s mount id (`STATX_MNT_ID`, 5.8) is always a masked read
-//!   ([`root_mount_id`] here — the `.ok()?` swallows a whole-syscall `NOSYS` too —
-//!   and the driver's `stat_sample`) that yields `None`/the device fallback below
-//!   the floor rather than failing; and `statx` ITSELF (4.11) — the driver's sole
-//!   live-path sample for root liveness and directory-entry facts — degrades on
-//!   `NOSYS`/seccomp `EPERM` to a single `lstat` (`stat_sample` in the driver), so a
-//!   pre-4.11 kernel keeps refresh + enumerate working (identity from that one
-//!   `lstat`, mount frame absent, the mount-id fence degrading to the device belt
-//!   crate-wide) instead of a false root death and an empty listing.
-//!   `inotify_init` and `eventfd` are far below the floor.
+//! - **inotify: Linux 4.11** — the `statx` floor, the honest minimum for the
+//!   descending backend. Every live-path fact (root liveness, directory-entry
+//!   identity) is a `statx` in the driver (`stat_sample`), so the spawn barrier
+//!   ([`Source`]) PROBES `statx` ONCE up front — a fd-relative `statx` on the
+//!   pinned root ([`require_statx`]), arch-independently — and refuses a pre-4.11
+//!   kernel (or a seccomp sandbox that blocks `statx`) with a typed
+//!   [`RootUnavailable`](super::SourceError::RootUnavailable) rather than limping
+//!   below the floor into a confusing statx-backed-`fstat` `NOSYS` deeper in the
+//!   identity capture. Linux 4.11 (May 2017) predates every supported distro
+//!   (RHEL 8 4.18, Ubuntu 18.04 4.15, Debian 10 4.19, SLES 15 4.12); a kernel below
+//!   it — and a `statx`-blocking seccomp policy — is explicitly unsupported for the
+//!   Linux backends. Above the floor, `openat2` (5.6) is only a FAST PATH: the root
+//!   pin ([`pin_root`]) and the post-live ancestor identities
+//!   ([`ancestor_identities`]) degrade on `ENOSYS` to the shared hand-rolled
+//!   [`open_no_symlinks`] component walk, so a 4.11–5.5 kernel still pins, starts
+//!   the reader, AND reads the ancestor chain without ever hitting an unhandled
+//!   `ENOSYS`. `statx`'s mount id (`STATX_MNT_ID`, 5.8) is a masked read
+//!   ([`root_mount_id`] here, and the driver's `stat_sample`) that yields `None`/the
+//!   device-belt fence on a 4.11–5.7 kernel rather than failing. `inotify_init` and
+//!   `eventfd` are far below the floor.
 //! - **fanotify: 5.17+** (the `FAN_REPORT_TARGET_FID` / `FAN_RENAME` composite,
-//!   design §4). Every fanotify-only call — including the seed walk's `openat2`
-//!   roots in `fanotify::source` — relies on that floor and stays `openat2`-only
-//!   with no fallback: a pre-5.6 kernel could never have started the source.
+//!   design §4), well above the `statx` floor, so the up-front gate never trips on
+//!   it. Every fanotify-only call — including the seed walk's `openat2` roots in
+//!   `fanotify::source` — relies on that floor and stays `openat2`-only with no
+//!   fallback: a pre-5.6 kernel could never have started the source.
 // The fanotify backend (L4) consumes the remaining reserved surface; the
 // container suites exercise the parts a macOS host build cannot reach.
 #![allow(dead_code)]
@@ -381,6 +385,12 @@ impl Source {
         source,
       })?;
     let root_fd = pin_root(&canonical)?;
+    // The kernel-floor gate (design §3): every live-path fact both backends read
+    // is a `statx`, so a kernel without it cannot honestly be watched. Probe once
+    // here — before the fstat-based identity capture, where a statx-backed `fstat`
+    // would surface a confusing `NOSYS` on 32-bit — and refuse a pre-4.11 kernel
+    // outright. fanotify's 5.17 floor never trips this.
+    require_statx(root_fd.as_fd(), &canonical)?;
     if root_is_remote(&root_fd, &canonical)? {
       return Err(super::SourceError::RootUnavailable {
         root: canonical,
@@ -469,13 +479,12 @@ impl Source {
 /// `openat2` landed in Linux 5.6. fanotify-FILESYSTEM requires 5.17, so on the
 /// fanotify path `openat2` is always present (the internal walk-root opens in
 /// `fanotify::source` rely on that same 5.17 floor and stay `openat2`-only). But
-/// **inotify's floor is universal** (per the design's first-class-primitives
-/// stance — e.g. RHEL 8 ships 4.18), well below 5.6, so an `openat2` here would
-/// have made forced [`Inotify`](super::Backend::Inotify) and `Auto`'s inotify
-/// fallback fail with `RootUnavailable` on any pre-5.6 kernel — breaking that
-/// floor while the rest of the code carries pre-5.8 `statx` fallbacks. So on
-/// `ENOSYS` (the kernel has no `openat2`) this degrades to a component-wise walk
-/// that reproduces the identical no-symlink pin by hand ([`open_no_symlinks`],
+/// **inotify's floor is Linux 4.11** (the `statx` floor the spawn barrier gates —
+/// e.g. RHEL 8 ships 4.18), well below 5.6, so an `openat2` here would have made
+/// forced [`Inotify`](super::Backend::Inotify) and `Auto`'s inotify fallback fail
+/// with `RootUnavailable` on any 4.11–5.5 kernel — breaking that floor at the pin.
+/// So on `ENOSYS` (the kernel has no `openat2`) this degrades to a component-wise
+/// walk that reproduces the identical no-symlink pin by hand ([`open_no_symlinks`],
 /// the walker [`ancestor_identities`] shares for the same reason); the resulting
 /// fd, used only by inotify (fanotify cannot run this low), is the same object
 /// with the same `O_RDONLY | O_DIRECTORY` final flags and downstream semantics.
@@ -617,6 +626,56 @@ fn root_is_remote(root_fd: &OwnedFd, canonical: &Path) -> Result<bool, super::So
   Ok(fs_type_is_remote(stat.f_type as i64))
 }
 
+/// The inotify floor gate: refuses a kernel without `statx` (Linux 4.11, May
+/// 2017) up front, so the descending backend never limps below the floor it
+/// depends on. Every live-path fact the driver reports — root liveness and
+/// directory-entry identity (the driver's `stat_sample`) — is a `statx`, so a
+/// kernel that cannot run it cannot be watched honestly; probing
+/// ONCE here, on the pinned root (`statx(root_fd, "", AT_EMPTY_PATH, …)`, the same
+/// fd-relative shape [`root_mount_id`] uses), fails such a kernel with a typed
+/// [`RootUnavailable`](super::SourceError::RootUnavailable) instead of a confusing
+/// statx-backed-`fstat` `NOSYS` surfacing arch-dependently in the identity capture
+/// (rustix's `fstat`/`lstat` are `statx`-backed on 32-bit and fall back only on
+/// `NOSYS`). fanotify's 5.17 floor is far above this, so the gate is a real path
+/// only for inotify below 4.11 — that and a `statx`-blocking seccomp policy are
+/// explicitly unsupported.
+///
+/// Only the statx-UNAVAILABLE errno set ([`statx_unavailable`]) trips the gate; a
+/// genuine `NOENT`/`EACCES`/`EPERM`/… is NOT the floor and passes through so the
+/// barrier's own stat handling surfaces it with its existing meaning.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn require_statx(root_fd: BorrowedFd<'_>, canonical: &Path) -> Result<(), super::SourceError> {
+  use rustix::fs::{AtFlags, StatxFlags, statx};
+  match statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::TYPE) {
+    Ok(_) => Ok(()),
+    Err(errno) if statx_unavailable(errno) => Err(super::SourceError::RootUnavailable {
+      root: canonical.to_path_buf(),
+      source: std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the Linux backends require statx (Linux 4.11+)",
+      ),
+    }),
+    Err(_) => Ok(()),
+  }
+}
+
+/// Whether a `statx` errno means the syscall is UNAVAILABLE on this kernel — the
+/// pure floor decision [`require_statx`] gates on, row-tested. `statx` landed in
+/// Linux 4.11, so an older kernel answers `NOSYS`; a filesystem or sandbox with no
+/// `statx` support can answer `EOPNOTSUPP`. Both mean "no `statx` here", which the
+/// Linux backends require. Every other errno — a real `NOENT`, `EACCES`, `EPERM`,
+/// … — keeps its meaning and passes through; `EPERM` is deliberately NOT the floor,
+/// so the gate stays narrow (a genuine permission fault is never misread as a
+/// missing syscall, and a seccomp policy that blocks `statx` is an unsupported
+/// environment, not one this gate rescues).
+#[cfg(all(target_os = "linux", not(miri)))]
+fn statx_unavailable(errno: rustix::io::Errno) -> bool {
+  matches!(
+    errno,
+    rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP
+  )
+}
+
 /// The identities of every strict ancestor of the canonical root — the
 /// containment evidence `final_root_conflict` decides root disjointness on
 /// (is this root inside a live one, or a live one inside it, under ANY spelling).
@@ -635,9 +694,9 @@ fn root_is_remote(root_fd: &OwnedFd, canonical: &Path) -> Result<bool, super::So
 ///
 /// This runs in the inotify spawn's post-live bracket AFTER the reader is live, so
 /// it shares [`pin_root`]'s kernel floor: `openat2` is pre-5.6, but inotify's floor
-/// is universal, so on `ENOSYS` each ancestor falls back to the SAME component walk
+/// is Linux 4.11, so on `ENOSYS` each ancestor falls back to the SAME component walk
 /// [`open_no_symlinks`] the pin uses (final flags `O_PATH | O_DIRECTORY`, search
-/// permission). Without this fallback a pre-5.6 kernel would pin the root by the
+/// permission). Without this fallback a 4.11–5.5 kernel would pin the root by the
 /// walk, start the reader, then die `RootUnavailable` one call later — the floor
 /// broken end to end rather than per-call-site.
 ///
@@ -686,13 +745,13 @@ fn ancestor_identities(canonical: &Path) -> Result<Vec<super::RootIdentity>, sup
 /// `mount --bind` of a same-superblock directory shares the root's device, so the
 /// device alone cannot mark the boundary; the mount id differs across any mount.
 ///
-/// `None` when the kernel did not report a mount id: `statx` unavailable (returns
-/// `NOSYS` below Linux 4.11 — the `.ok()?` swallows the whole-syscall failure before
-/// the mask is ever read), the `STATX_MNT_ID` field absent (below 5.8), or the
-/// returned `stx_mask` leaving the bit unset. inotify's kernel floor is well below
-/// 5.8, so `None` is a real path there — the core degrades to the device check
-/// (the settled single-device policy). fanotify's 5.17 floor always reports it,
-/// but `None` is still handled rather than asserted.
+/// `None` when the kernel did not report a mount id: the `STATX_MNT_ID` field is
+/// absent (below Linux 5.8) or the returned `stx_mask` left the bit unset; the
+/// `.ok()?` also declines any `statx` error defensively (the spawn barrier already
+/// gated the 4.11 `statx` floor, so a whole-syscall failure here is not expected).
+/// inotify's kernel floor (4.11) is below 5.8, so `None` is a real path there — the
+/// core degrades to the device check (the settled single-device policy). fanotify's
+/// 5.17 floor always reports it, but `None` is still handled rather than asserted.
 #[cfg(all(target_os = "linux", not(miri)))]
 pub(crate) fn root_mount_id(root_fd: BorrowedFd<'_>) -> Option<u64> {
   use rustix::fs::{AtFlags, StatxFlags, statx};

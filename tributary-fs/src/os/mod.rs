@@ -232,7 +232,7 @@ pub(crate) type BackendStatsHandle = std::sync::Arc<BackendStatsShared>;
 ///
 /// [`Auto`](Self::Auto) is the default: the spawn barrier probes for
 /// fanotify-FILESYSTEM (privileged, kernel-recursive) and falls back to inotify
-/// (universal, unprivileged) at the first failing probe — a per-root decision
+/// (unprivileged, the Linux 4.11 baseline) at the first failing probe — a per-root decision
 /// made once, before the stream goes live, never retried. The two explicit
 /// variants pin the choice: [`Inotify`](Self::Inotify) skips the probe;
 /// [`Fanotify`](Self::Fanotify) runs it and surfaces the first failure as a

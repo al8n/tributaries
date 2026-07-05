@@ -157,11 +157,14 @@ fn remote_fs_magics_are_refused_and_local_ones_pass() {
 /// compile and run everywhere.
 #[cfg(all(target_os = "linux", not(miri)))]
 mod pin {
-  use std::os::unix::fs::MetadataExt;
+  use std::os::{fd::AsFd, unix::fs::MetadataExt};
 
   use rustix::fs::OFlags;
 
-  use super::super::{ancestor_identities, open_no_symlinks, pin_root, root_is_remote};
+  use super::super::{
+    ancestor_identities, open_no_symlinks, pin_root, require_statx, root_is_remote,
+    statx_unavailable,
+  };
   use crate::os::{RootIdentity, SourceError};
 
   /// The `pin_root` fast path's final-component flags — `O_RDONLY | O_DIRECTORY`,
@@ -491,5 +494,47 @@ mod pin {
       "the ENOSYS ancestor walk reproduces the openat2 ancestor identities exactly"
     );
     let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// The inotify floor classifier's rows: only the statx-UNAVAILABLE errnos
+  /// (`NOSYS`, the pre-4.11 kernel, and `EOPNOTSUPP`) trip the spawn gate; a genuine
+  /// `NOENT`/`EACCES`/`EPERM`/… is NOT the floor and passes through to the barrier
+  /// with its meaning intact. `EPERM` in particular is NOT the floor — it stays a
+  /// real error rather than a below-floor refusal.
+  #[test]
+  fn statx_unavailable_classifies_only_the_floor_errnos() {
+    use rustix::io::Errno;
+    for errno in [Errno::NOSYS, Errno::OPNOTSUPP] {
+      assert!(
+        statx_unavailable(errno),
+        "{errno:?} means statx is unavailable — the below-floor spawn refusal"
+      );
+    }
+    for errno in [
+      Errno::NOENT,
+      Errno::ACCESS,
+      Errno::PERM,
+      Errno::IO,
+      Errno::NOTDIR,
+      Errno::LOOP,
+    ] {
+      assert!(
+        !statx_unavailable(errno),
+        "{errno:?} is a real error, not the floor — it must pass through to the barrier"
+      );
+    }
+  }
+
+  /// The floor gate wired through the pin: on a `statx`-capable host (every
+  /// supported kernel is 4.11+) `require_statx` on the pinned root passes, so a real
+  /// spawn is never falsely refused. The below-floor refusal itself is carried by
+  /// the classifier row above — a modern kernel cannot be made to answer `NOSYS` to
+  /// exercise the failing branch here.
+  #[test]
+  fn require_statx_passes_on_a_statx_capable_host() {
+    let dir = scratch("floor");
+    let fd = pin_root(&dir).expect("pin the local dir");
+    require_statx(fd.as_fd(), &dir).expect("statx is available on a 4.11+ host");
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }
