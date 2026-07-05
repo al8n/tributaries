@@ -3581,8 +3581,8 @@ mod kernel_recursive_fanotify {
     fanotify::{
       AdmittedEvent, AdmittedRename,
       fid::{
-        FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_MODIFY, FAN_ONDIR, FAN_RENAME,
-        FanMask,
+        FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR,
+        FAN_RENAME, FanMask,
       },
     },
   };
@@ -3750,8 +3750,10 @@ mod kernel_recursive_fanotify {
     assert!(dests.contains(&&loc(&["d.txt"])));
   }
 
-  /// A `DELETE_SELF` on the ROOT object is the scope's death — the same
-  /// Ignored lifecycle the FSEvents unmount uses: a terminal `Rescan`.
+  /// A `DELETE_SELF` on the ROOT object is the scope's death, PRESERVING the verb:
+  /// the Monitor emits the user-visible `Removed` for the vanished root AND the
+  /// terminal `Rescan` (never silent), then tears the scope down. Collapsing the
+  /// self-event to `Ignored` used to drop that `Removed`.
   #[test]
   fn root_delete_self_is_scope_death() {
     let (mut core, scope) = live_fanotify();
@@ -3765,9 +3767,16 @@ mod kernel_recursive_fanotify {
       })],
     );
     let effects = drain(&mut core);
+    let emitted = emits(&effects);
     assert!(
-      emits(&effects).iter().any(|c| c.kind().is_rescan()),
-      "root death surfaces as a terminal Rescan: {effects:?}"
+      emitted
+        .iter()
+        .any(|c| c.kind().is_removed() && c.location() == &loc(&[])),
+      "a real root deletion surfaces the user-visible Removed at the root: {effects:?}"
+    );
+    assert!(
+      emitted.iter().any(|c| c.kind().is_rescan()),
+      "root death is never silent — the terminal Rescan follows: {effects:?}"
     );
     // The scope tore down: its stream is destroyed.
     assert!(
@@ -3775,6 +3784,40 @@ mod kernel_recursive_fanotify {
         .iter()
         .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
       "the dead root's stream is torn down: {effects:?}"
+    );
+  }
+
+  /// A `MOVE_SELF` on the ROOT object is likewise the scope's death, but a moved
+  /// root's new path is unknowable — so it lowers to a terminal `Rescan` ONLY (no
+  /// Removed), then tears the scope down. This is the verb distinction the collapse
+  /// to `Ignored` erased.
+  #[test]
+  fn root_move_self_is_scope_death_rescan_only() {
+    let (mut core, scope) = live_fanotify();
+    feed(
+      &mut core,
+      scope,
+      vec![RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(FAN_MOVE_SELF | FAN_ONDIR),
+        path: Some(PathBuf::from("/r")),
+        rename: None,
+      })],
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(
+      emitted.iter().any(|c| c.kind().is_rescan()),
+      "a moved root surfaces the terminal Rescan: {effects:?}"
+    );
+    assert!(
+      emitted.iter().all(|c| !c.kind().is_removed()),
+      "a moved root carries NO Removed — its new path is unknowable: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the moved root's stream is torn down: {effects:?}"
     );
   }
 
@@ -4016,8 +4059,13 @@ mod kernel_recursive_fanotify {
       })],
     );
     let effects = drain(&mut core);
+    let emitted = emits(&effects);
     assert!(
-      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      emitted.iter().any(|c| c.kind().is_removed()),
+      "the FID-only root delete still surfaces the user-visible Removed: {effects:?}"
+    );
+    assert!(
+      emitted.iter().any(|c| c.kind().is_rescan()),
       "root death is a terminal Rescan even with the tick disabled: {effects:?}"
     );
     assert!(

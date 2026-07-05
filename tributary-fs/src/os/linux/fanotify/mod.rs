@@ -153,9 +153,10 @@ impl MemoBatch {
 pub(crate) enum Admission {
   /// An admitted event whose admission mutated NO directory node — a file
   /// (non-`ONDIR`) create/delete/modify/attrib, a non-structural directory
-  /// modify/attrib, or a directory's own name-less `MOVE_SELF` (a self-move rescan;
+  /// modify/attrib (reported as a dirent, OR name-less on the directory's own
+  /// admitted FID), or a directory's own name-less `MOVE_SELF` (a self-move rescan;
   /// the moved node is re-parented by its rename/dirent, not here). Forward the
-  /// resolved path. REQUIRES an admitted directory FID and — for a dirent — a name.
+  /// resolved path. REQUIRES an admitted addressing FID and — for a dirent — a name.
   Forward(AdmittedEvent),
   /// A new in-root child directory `learn`ed into the map (ALREADY applied), then
   /// forwarded — an `ONDIR` create. REQUIRES dir_fid (admitted) + name + the
@@ -186,13 +187,15 @@ pub(crate) enum Admission {
     seed: Option<Fid>,
   },
   /// A self-event (`DELETE_SELF`/`MOVE_SELF`) on the WATCHED ROOT object — its
-  /// self-FID (the `DFID` shape's `dir_fid`, or the `FID`-only shape's
-  /// `target_fid`) is the map's root anchor ([`FidMap::is_root`](map::FidMap::is_root)).
-  /// Forward the root's OWN path, which compile lowers to the death lifecycle
-  /// (`Ignored` → terminal Removed + Rescan). First-class and `target_fid`-aware —
-  /// checked BEFORE any firehose drop — so a FID-only root self-event (dir_fid =
-  /// None) reaches death even when the periodic liveness tick is disabled, rather
-  /// than being dropped and left forever blind (the R25 closure).
+  /// self-FID (the `DFID` shape's `dir_fid`, or the `FID`-only shape's `target_fid`)
+  /// resolves to the map's root anchor
+  /// ([`FidMap::is_root`](map::FidMap::is_root)). Forward the root's OWN path, which
+  /// compile lowers to the death lifecycle — a `DELETE_SELF` to a terminal Removed +
+  /// Rescan, a `MOVE_SELF` to a terminal Rescan. The uniform name-less resolution
+  /// consults the self-FID (the `FID`-only shape's `target_fid` included) the same way
+  /// for every mask, so a FID-only root self-event (`dir_fid = None`) reaches death
+  /// even when the periodic liveness tick is disabled, rather than being dropped and
+  /// left forever blind (the R25 closure, now the uniform resolution's root case).
   RootDeath(AdmittedEvent),
   /// Provably outside the watched root, and not a root self-event: no admitted
   /// directory FID matched (or the self-FID is unknown to the map). The
@@ -208,27 +211,36 @@ pub(crate) enum Admission {
 }
 
 /// Classifies one decoded event into its [`Admission`] action against the per-root
-/// map: resolves directory FID(s) to path(s) through the batch [`MemoBatch`], and
-/// applies the action's map self-maintenance inline (learn on a directory create,
-/// forget on a delete/move-out, re-parent on a rename). PURE — the reader calls
-/// this single-threaded between reads; the FFI side owns nothing but the fd and the
-/// seeding walk. No node identity is produced; admission is membership + path
-/// resolution only (design §4.9).
+/// map: resolves the ADDRESSING object's FID to a path through the batch
+/// [`MemoBatch`], and applies the action's map self-maintenance inline (learn on a
+/// directory create, forget on a delete/move-out, re-parent on a rename). PURE — the
+/// reader calls this single-threaded between reads; the FFI side owns nothing but the
+/// fd and the seeding walk. No node identity is produced; admission is membership +
+/// path resolution only (design §4.9).
 ///
 /// The classification is EXHAUSTIVE and TOTAL: every `(mask, field-presence,
 /// map-state)` maps to exactly one action, with no catch-all silent fall-through —
 /// an unrecognized shape is explicitly [`Admission::ForeignDrop`] or
-/// [`Admission::Lossy`], never a wrong forward. The order is deliberate:
+/// [`Admission::Lossy`], never a wrong forward.
 ///
-/// 1. a `FAN_RENAME` is its own event shape ([`classify_rename`]);
-/// 2. a name-less self-event is resolved by its SELF-FID first — a root self-event
-///    is [`Admission::RootDeath`] BEFORE any membership drop (so the FID-only shape
-///    is never wrongly dropped), a known non-root directory's own delete `forget`s
-///    it, and an unknown self-FID is [`Admission::ForeignDrop`];
-/// 3. otherwise the directory FID is the admittance gate — absent or out-of-root →
-///    [`Admission::ForeignDrop`] — after which the action's own required field
-///    (name, then `target_fid` for a directory mutation) decides forward vs
-///    [`Admission::Lossy`].
+/// Resolution is UNIFORM across masks: the FIRST step resolves the addressing object
+/// and checks its admittance the SAME way for every mask, and only THEN does the mask
+/// select the action. There is no mask special-cased to consult a FID ahead of a
+/// membership gate, and no pre-classification `dir_fid`-absent drop — so no event
+/// whose addressing object is admitted can be dropped, for ANY mask. The three shapes:
+///
+/// 1. a `FAN_RENAME` is its own event shape ([`classify_rename`], resolved from its
+///    two addressing directory FIDs);
+/// 2. a NAMED event addresses a child under its parent directory (`dir_fid`) —
+///    [`classify_dirent`];
+/// 3. a NAME-LESS event addresses its OWN object by its self-FID (the `DFID` shape's
+///    `dir_fid`, or the `FID`-only shape's `target_fid`) — [`classify_nameless`].
+///
+/// This GENERALIZES the earlier root-death-before-the-gate special case (a root
+/// self-event routing to [`Admission::RootDeath`] even in the `dir_fid = None`
+/// FID-only shape) to every mask: the root death is now just the name-less shape whose
+/// resolved self-object is the map's root anchor, and the same uniform admittance that
+/// saves it saves every other admitted-FID event too.
 pub(crate) fn classify(
   map: &mut FidMap,
   event: &RawFanotifyEvent,
@@ -238,51 +250,35 @@ pub(crate) fn classify(
     return classify_rename(map, event, rename, memo);
   }
 
-  let mask = event.mask;
-  // A name-less self-event: the object reports its OWN deletion/move, its handle
-  // arriving as a bare `DFID` (`dir_fid`) or a bare `FID` (`target_fid`). Resolve
-  // by that self-FID FIRST, before the directory-membership gate below, so a root
-  // self-event routes to death even in the FID-only shape (`dir_fid = None`) that
-  // the gate would otherwise drop.
-  if (mask.delete_self() || mask.move_self()) && event.name.is_none() {
-    let Some(self_fid) = event.dir_fid.as_ref().or(event.target_fid.as_ref()) else {
-      // No FID at all: unaddressable firehose noise.
-      return Admission::ForeignDrop;
-    };
-    let is_root = map.is_root(self_fid);
-    return match memo.admit(map, self_fid) {
-      // The watched root's own death — route to the death lifecycle.
-      Some(path) if is_root => Admission::RootDeath(self_event(mask, path)),
-      // A known non-root directory's own self-event: a delete_self is a child
-      // forget; a move_self is a self-rescan (the rename/dirent re-parents the node).
-      Some(path) => {
-        if mask.delete_self() {
-          map.forget(self_fid);
-          Admission::ForgetDir(self_event(mask, path))
-        } else {
-          Admission::Forward(self_event(mask, path))
-        }
-      }
-      // A self-FID unknown to the map — a foreign object elsewhere on the sb.
-      None => Admission::ForeignDrop,
-    };
+  // A named event addresses a CHILD under its parent directory (`dir_fid`); a
+  // name-less event addresses its OWN object by its self-FID. Either shape resolves
+  // its ADDRESSING object and checks admittance the SAME way before the mask selects
+  // an action, so no event whose addressing object is admitted is ever dropped, for
+  // any mask.
+  match event.name.as_ref() {
+    Some(name) => classify_dirent(map, event, name, memo),
+    None => classify_nameless(map, event, memo),
   }
+}
 
-  // A dirent event (or a self-event that also names a child). The directory FID is
-  // the admittance gate: absent or out-of-root, the event is provably outside the
-  // watched root — the firehose filter, a clean drop.
+/// Classifies a NAMED event: a dirent addressing `<dir>/<name>` under its parent
+/// directory. The parent's `dir_fid` is the admittance gate — absent or out-of-root,
+/// the event is provably outside the watched root, a clean firehose drop. In-root,
+/// the action's own required field (a directory create/delete/move needs the child's
+/// `target_fid`) decides forward vs [`Admission::Lossy`]; a plain file dirent needs
+/// none.
+fn classify_dirent(
+  map: &mut FidMap,
+  event: &RawFanotifyEvent,
+  name: &[u8],
+  memo: &mut MemoBatch,
+) -> Admission {
+  let mask = event.mask;
   let Some(dir_fid) = event.dir_fid.as_ref() else {
     return Admission::ForeignDrop;
   };
   let Some(dir_path) = memo.admit(map, dir_fid) else {
     return Admission::ForeignDrop;
-  };
-
-  // In-root. Every non-self dirent resolves `<dir>/<name>`, so it REQUIRES a name;
-  // an absent or empty one (decode folds an empty name to `None`) cannot address a
-  // target, so the action lacks its field → lossy.
-  let Some(name) = event.name.as_ref() else {
-    return Admission::Lossy;
   };
   let path = Some(join_name(&dir_path, name));
 
@@ -322,6 +318,68 @@ pub(crate) fn classify(
     path,
     rename: None,
   })
+}
+
+/// Classifies a NAME-LESS event: one that names no child and so addresses its OWN
+/// object. The self-FID arrives as a bare `DFID` (`dir_fid`) or a bare `FID`
+/// (`target_fid`), and is resolved the SAME way the dirent gate resolves its parent —
+/// no FID consulted ahead of the membership check, and no `dir_fid`-absent
+/// pre-drop. No addressing FID, or one out-of-root → [`Admission::ForeignDrop`];
+/// admitted, the mask selects the action:
+///
+/// - a `DELETE_SELF`/`MOVE_SELF` on the map's ROOT anchor is the watched root's own
+///   death → [`Admission::RootDeath`], reached uniformly even in the `dir_fid = None`
+///   FID-only shape the periodic liveness tick would otherwise be the sole detector
+///   of;
+/// - a `DELETE_SELF` on an admitted non-root directory `forget`s it →
+///   [`Admission::ForgetDir`]; a `MOVE_SELF` is a self-rescan that leaves the node
+///   for its rename to re-parent → [`Admission::Forward`];
+/// - a name-less `MODIFY`/`ATTRIB` is the admitted object's OWN content/metadata
+///   change → [`Admission::Forward`] of that object's path (an admitted object is
+///   never dropped — the completion of the inversion);
+/// - a name-less create/delete lost the child name it requires → [`Admission::Lossy`]
+///   (the loss barrier reseeds), never a silent drop.
+fn classify_nameless(
+  map: &mut FidMap,
+  event: &RawFanotifyEvent,
+  memo: &mut MemoBatch,
+) -> Admission {
+  let mask = event.mask;
+  // The object's own handle: a bare `DFID` (`dir_fid`) or a bare `FID`
+  // (`target_fid`), `dir_fid` first. No handle at all is unaddressable noise.
+  let Some(self_fid) = event.dir_fid.as_ref().or(event.target_fid.as_ref()) else {
+    return Admission::ForeignDrop;
+  };
+  let is_root = map.is_root(self_fid);
+  let Some(path) = memo.admit(map, self_fid) else {
+    // The self-object is unknown to the map — a foreign object elsewhere on the sb.
+    return Admission::ForeignDrop;
+  };
+
+  if mask.delete_self() || mask.move_self() {
+    if is_root {
+      // The watched root's own death — compile lowers it to the terminal lifecycle
+      // (a delete's Removed + Rescan, a move's Rescan).
+      return Admission::RootDeath(self_event(mask, path));
+    }
+    if mask.delete_self() {
+      map.forget(self_fid);
+      return Admission::ForgetDir(self_event(mask, path));
+    }
+    // A move_self does NOT forget: the node is re-parented by its rename/dirent.
+    return Admission::Forward(self_event(mask, path));
+  }
+
+  // A name-less create/delete has lost the child name it addresses through — the
+  // action's required field is absent, so the buffer is lossy rather than a silent
+  // drop of an admitted object.
+  if mask.created() || mask.removed() {
+    return Admission::Lossy;
+  }
+
+  // A name-less modify/attrib on the admitted object is that object's OWN
+  // content/metadata change — forward its own path.
+  Admission::Forward(self_event(mask, path))
 }
 
 /// Builds the admitted form of a resolved self-event (its own path, no child).

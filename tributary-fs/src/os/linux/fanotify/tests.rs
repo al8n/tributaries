@@ -1160,3 +1160,373 @@ mod batch_memo {
     );
   }
 }
+
+/// The DIFFERENTIAL CORRECTNESS ORACLE — the classifier's correctness contract.
+///
+/// [`classify`] is proven CORRECT (not merely non-panicking) against an INDEPENDENT
+/// reference derived from the SPEC, never copied from classify's control flow. The
+/// spec, in three steps:
+///
+///   1. resolve the event's ADDRESSING object — a named event addresses the child's
+///      parent (`dir_fid`); a name-less event addresses its OWN object by its self-FID
+///      (`dir_fid`, or the `FID`-only shape's `target_fid`); a rename addresses either
+///      of its two directory ends — and read that object's admittance from the map;
+///   2. an addressing object OUTSIDE the root (or none at all) is superblock firehose
+///      noise — `ForeignDrop`;
+///   3. an ADMITTED addressing object takes the action its mask dictates, and an
+///      action missing a required field is `Lossy`.
+///
+/// [`classify_oracle`] encodes exactly that, computing admittance UNIFORMLY for every
+/// mask and never mutating the map (a pure predicate, not classify's act-as-you-go
+/// machinery). So a future `classify` that re-introduced a mask special-case or a
+/// pre-classification gate dropping an admitted-FID event would DISAGREE with it. On
+/// top of agreement, two invariants are asserted DIRECTLY against the event + map,
+/// independent of BOTH classifiers:
+///
+///   (i)  no-admitted-drop — an event whose addressing object is admitted is NEVER
+///        `ForeignDrop` (the whole class: a name-less ATTRIB/MODIFY on an admitted
+///        directory, addressed only by `target_fid`, once fell to the `dir_fid == None`
+///        gate and was silently dropped);
+///   (ii) field-correctness — every forwarded (non-`Lossy`, non-`Drop`) action carries
+///        exactly the field compile consumes (a single-object action its `path`, a
+///        rename its `rename` pair), so no forward reaches compile without its target.
+///
+/// An exhaustive generator sweeps the whole small input space and asserts all three
+/// per case. This SUBSUMES the totality table's non-panic sweep: totality proved
+/// classify RETURNS for every shape; the oracle proves it returns the RIGHT action.
+mod classification_oracle {
+  use super::*;
+
+  /// The action taxonomy of [`Admission`], stripped of resolved paths — the level at
+  /// which correctness is defined (which action, and for a rename whether a move-in
+  /// walk is owed). Path BYTES are the map's resolution machinery, pinned by the
+  /// targeted row tests; the oracle audits the DECISION.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  enum Action {
+    Forward,
+    LearnDir,
+    ForgetDir,
+    /// A rename; `seed` is whether a moved-in subtree must be walked.
+    Rename {
+      seed: bool,
+    },
+    RootDeath,
+    ForeignDrop,
+    Lossy,
+  }
+
+  /// Projects a real [`Admission`] onto the action taxonomy.
+  fn action_of(admission: &Admission) -> Action {
+    match admission {
+      Admission::Forward(_) => Action::Forward,
+      Admission::LearnDir(_) => Action::LearnDir,
+      Admission::ForgetDir(_) => Action::ForgetDir,
+      Admission::Rename { seed, .. } => Action::Rename {
+        seed: seed.is_some(),
+      },
+      Admission::RootDeath(_) => Action::RootDeath,
+      Admission::ForeignDrop => Action::ForeignDrop,
+      Admission::Lossy => Action::Lossy,
+    }
+  }
+
+  /// The addressing object the SPEC resolves for a non-rename event, and its
+  /// admittance — read-only against a fixed map state, shared by the oracle and the
+  /// no-admitted-drop invariant.
+  enum Addressing {
+    /// A named event under an ADMITTED parent directory.
+    Dirent,
+    /// A name-less event whose ADMITTED self-object is the root anchor (`is_root`) or
+    /// a non-root directory.
+    SelfObject { is_root: bool },
+    /// The addressing object is a genuine outsider (out-of-root) — the firehose.
+    Foreign,
+    /// No FID at all to address by.
+    Unaddressable,
+  }
+
+  /// Resolves a non-rename event's addressing object and admittance from the SPEC: a
+  /// named event's parent is `dir_fid`; a name-less event's own object is its self-FID
+  /// (`dir_fid`, else the `FID`-only shape's `target_fid`). Admittance is a read-only
+  /// path resolution (ancestry reaches the root), never mutating the map.
+  fn addressing(map: &FidMap, event: &RawFanotifyEvent) -> Addressing {
+    match event.name.as_ref() {
+      Some(_) => match event.dir_fid.as_ref() {
+        None => Addressing::Unaddressable,
+        Some(parent) => {
+          if map.resolve_path(parent).is_some() {
+            Addressing::Dirent
+          } else {
+            Addressing::Foreign
+          }
+        }
+      },
+      None => match event.dir_fid.as_ref().or(event.target_fid.as_ref()) {
+        None => Addressing::Unaddressable,
+        Some(self_fid) => {
+          if map.resolve_path(self_fid).is_some() {
+            Addressing::SelfObject {
+              is_root: map.is_root(self_fid),
+            }
+          } else {
+            Addressing::Foreign
+          }
+        }
+      },
+    }
+  }
+
+  /// The SPEC's reference classifier: what SHOULD happen for `event` against `map`,
+  /// derived from first principles (resolve addressing → drop outsiders → action by
+  /// mask + required fields), NEVER from classify's code. Immutable — the oracle only
+  /// reads the map, so it is evaluated on the pre-classify state classify then decides
+  /// against.
+  fn classify_oracle(map: &FidMap, event: &RawFanotifyEvent) -> Action {
+    // A rename addresses two directory ends; at least one in-root admits it.
+    if let Some(rename) = &event.rename {
+      let old_in = map.resolve_path(&rename.old_dir).is_some();
+      let new_in = map.resolve_path(&rename.new_dir).is_some();
+      if !old_in && !new_in {
+        return Action::ForeignDrop;
+      }
+      if event.mask.ondir() {
+        // An ONDIR rename mutates the tree and REQUIRES the moved object's own FID.
+        let Some(moved) = event.target_fid.as_ref() else {
+          return Action::Lossy;
+        };
+        // A move IN from outside (destination in-root, moved object not yet known)
+        // owes a subtree walk; every other in-root ONDIR rename is walk-free.
+        let seed = new_in && !map.contains(moved);
+        return Action::Rename { seed };
+      }
+      return Action::Rename { seed: false };
+    }
+
+    match addressing(map, event) {
+      Addressing::Foreign | Addressing::Unaddressable => Action::ForeignDrop,
+      Addressing::Dirent => dirent_action(event),
+      Addressing::SelfObject { is_root } => nameless_action(event, is_root),
+    }
+  }
+
+  /// The action a NAMED event under an admitted parent takes: a directory
+  /// create/delete/move needs the child's `target_fid`; a file dirent or a
+  /// non-structural directory modify/attrib needs none.
+  fn dirent_action(event: &RawFanotifyEvent) -> Action {
+    let mask = event.mask;
+    if mask.ondir() {
+      if mask.created() {
+        return field_gated(event.target_fid.is_some(), Action::LearnDir);
+      }
+      if mask.removed() || mask.move_self() {
+        return field_gated(event.target_fid.is_some(), Action::ForgetDir);
+      }
+    }
+    Action::Forward
+  }
+
+  /// The action a NAME-LESS event on an admitted self-object takes: a root
+  /// self-delete/move is the root's death; a non-root self-delete forgets; a self-move
+  /// is a self-rescan; a bare modify/attrib is the object's own change; a name-less
+  /// create/delete lost the child name it requires.
+  fn nameless_action(event: &RawFanotifyEvent, is_root: bool) -> Action {
+    let mask = event.mask;
+    if mask.delete_self() || mask.move_self() {
+      if is_root {
+        return Action::RootDeath;
+      }
+      return if mask.delete_self() {
+        Action::ForgetDir
+      } else {
+        Action::Forward
+      };
+    }
+    if mask.created() || mask.removed() {
+      return Action::Lossy;
+    }
+    Action::Forward
+  }
+
+  /// An action whose required field is present, else `Lossy`.
+  fn field_gated(present: bool, action: Action) -> Action {
+    if present { action } else { Action::Lossy }
+  }
+
+  /// The oracle's map: `/root` (fid 1, the root anchor), `/root/sub` (fid 2), and
+  /// `/root/sub/child` (fid 3); fid 99 is a foreign handle outside the root.
+  fn oracle_map() -> FidMap {
+    let mut map = FidMap::new();
+    map.seed([
+      SeedEntry::root(fid(1), Path::new("/root")),
+      SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+      SeedEntry::child(fid(3), fid(2), OsString::from("child")),
+    ]);
+    map
+  }
+
+  /// Whether the event's addressing object is admitted — computed DIRECTLY from the
+  /// map, independent of both classifiers, for the no-admitted-drop invariant. A
+  /// rename is admitted when EITHER end is in-root.
+  fn addressing_admitted(map: &FidMap, event: &RawFanotifyEvent) -> bool {
+    if let Some(rename) = &event.rename {
+      return map.resolve_path(&rename.old_dir).is_some()
+        || map.resolve_path(&rename.new_dir).is_some();
+    }
+    matches!(
+      addressing(map, event),
+      Addressing::Dirent | Addressing::SelfObject { .. }
+    )
+  }
+
+  /// Asserts the three contract properties for one event against a fresh map:
+  /// AGREEMENT (classify's action == the oracle's), NO-ADMITTED-DROP (an admitted
+  /// addressing object is never dropped), and FIELD-CORRECTNESS (a forwarded action
+  /// carries the field compile consumes).
+  fn assert_contract(label: &str, event: &RawFanotifyEvent) {
+    let mut map = oracle_map();
+    // The oracle reads the PRE-classify state; classify decides against the same state
+    // (mutating as it acts). Snapshot both spec facts before classify runs.
+    let expected = classify_oracle(&map, event);
+    let admitted = addressing_admitted(&map, event);
+    let admission = classify(&mut map, event, &mut MemoBatch::new());
+    let got = action_of(&admission);
+
+    // (1) Agreement: classify selects exactly the spec's action.
+    assert_eq!(got, expected, "agreement `{label}`: {admission:?}");
+
+    // (2) No-admitted-drop: an admitted addressing object is never the firehose drop.
+    if admitted {
+      assert_ne!(
+        got,
+        Action::ForeignDrop,
+        "no-admitted-drop `{label}`: an admitted addressing object was dropped"
+      );
+    }
+
+    // (3) Field-correctness: every forwarded action carries exactly the field compile
+    // consumes — a single-object action its `path`, a rename its `rename` pair.
+    match &admission {
+      Admission::Forward(e)
+      | Admission::LearnDir(e)
+      | Admission::ForgetDir(e)
+      | Admission::RootDeath(e) => assert!(
+        e.path.is_some() && e.rename.is_none(),
+        "field-correctness `{label}`: a single-object action must carry its path: {e:?}"
+      ),
+      Admission::Rename { event, .. } => assert!(
+        event.rename.is_some() && event.path.is_none(),
+        "field-correctness `{label}`: a rename must carry both halves: {event:?}"
+      ),
+      Admission::ForeignDrop | Admission::Lossy => {}
+    }
+  }
+
+  /// The whole non-rename input space: every mask over the backend's vocabulary ×
+  /// every `dir_fid`/`target_fid` drawn from {none, root, admitted child, foreign} ×
+  /// every name shape {none, empty, present}. Empty folds to none at decode, but
+  /// feeding it here proves classify and the oracle dispatch it identically.
+  #[test]
+  fn oracle_agrees_on_every_dirent_and_self_event_shape() {
+    let masks = [
+      FAN_CREATE,
+      FAN_CREATE | FAN_ONDIR,
+      FAN_DELETE,
+      FAN_DELETE | FAN_ONDIR,
+      FAN_MODIFY,
+      FAN_MODIFY | FAN_ONDIR,
+      FAN_ATTRIB,
+      FAN_ATTRIB | FAN_ONDIR,
+      FAN_DELETE_SELF,
+      FAN_DELETE_SELF | FAN_ONDIR,
+      FAN_MOVE_SELF,
+      FAN_MOVE_SELF | FAN_ONDIR,
+      FAN_DELETE_SELF | FAN_ATTRIB,
+    ];
+    let fids = [None, Some(fid(1)), Some(fid(2)), Some(fid(99))];
+    let names: [Option<&[u8]>; 3] = [None, Some(b""), Some(b"n")];
+    let mut checked = 0u64;
+    for &mask in &masks {
+      for dir in &fids {
+        for target in &fids {
+          for &name in &names {
+            let event = RawFanotifyEvent {
+              mask: FanMask::new(mask),
+              dir_fid: dir.clone(),
+              target_fid: target.clone(),
+              name: name.map(<[u8]>::to_vec),
+              rename: None,
+            };
+            assert_contract(
+              &format!("mask={mask:#x} dir={dir:?} target={target:?} name={name:?}"),
+              &event,
+            );
+            checked += 1;
+          }
+        }
+      }
+    }
+    assert_eq!(checked, masks.len() as u64 * 4 * 4 * 3);
+  }
+
+  /// The whole rename input space: {file, ONDIR} × each directory end drawn from
+  /// {root, admitted child, foreign} × the moved object's `target_fid` drawn from
+  /// {none, root, admitted child, foreign}. Both names are present (a rename with a
+  /// missing/empty half is wire-lossy and never reaches classify).
+  #[test]
+  fn oracle_agrees_on_every_rename_shape() {
+    let masks = [FAN_RENAME, FAN_RENAME | FAN_ONDIR];
+    let dirs = [fid(1), fid(2), fid(99)];
+    let targets = [None, Some(fid(1)), Some(fid(2)), Some(fid(99))];
+    let mut checked = 0u64;
+    for &mask in &masks {
+      for old_dir in &dirs {
+        for new_dir in &dirs {
+          for target in &targets {
+            let event = RawFanotifyEvent {
+              mask: FanMask::new(mask),
+              dir_fid: None,
+              target_fid: target.clone(),
+              name: None,
+              rename: Some(RenameInfo {
+                old_dir: old_dir.clone(),
+                old_name: b"old".to_vec(),
+                new_dir: new_dir.clone(),
+                new_name: b"new".to_vec(),
+              }),
+            };
+            assert_contract(
+              &format!("rename mask={mask:#x} old={old_dir:?} new={new_dir:?} target={target:?}"),
+              &event,
+            );
+            checked += 1;
+          }
+        }
+      }
+    }
+    assert_eq!(checked, masks.len() as u64 * 3 * 3 * 4);
+  }
+
+  /// The exact class the fix closes, isolated as a targeted row: a name-less
+  /// ATTRIB/MODIFY addressed ONLY by `target_fid` (an admitted dir, or the root, with
+  /// `dir_fid = None`) is FORWARDED on the object's OWN path — never the silent
+  /// `ForeignDrop` the pre-classification `dir_fid == None` gate produced.
+  #[test]
+  fn fid_only_attrib_on_admitted_object_is_forwarded_not_dropped() {
+    for (self_fid, own_path) in [(fid(1), "/root"), (fid(2), "/root/sub")] {
+      for mask in [FAN_ATTRIB, FAN_MODIFY, FAN_ATTRIB | FAN_ONDIR] {
+        let mut map = oracle_map();
+        let event = self_fid_only(mask, self_fid.clone());
+        let admission = classify(&mut map, &event, &mut MemoBatch::new());
+        assert!(
+          matches!(admission, Admission::Forward(_)),
+          "a FID-only {mask:#x} on admitted {self_fid:?} forwards, not drops: {admission:?}"
+        );
+        assert_eq!(
+          forwarded(admission).path.as_deref(),
+          Some(Path::new(own_path)),
+          "the forward carries the admitted object's OWN path"
+        );
+      }
+    }
+  }
+}

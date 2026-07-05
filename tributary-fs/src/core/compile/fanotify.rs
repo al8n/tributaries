@@ -72,16 +72,24 @@ impl DriverCore {
       return vec![Planned::Over(Scope::Root(scope))];
     };
 
-    // A self-event on the root object is the scope's death — the same Ignored
-    // lifecycle the FSEvents unmount uses. On an inner object it duplicates the
-    // parent's dirent record; degrade it to a located rescan so nothing is
-    // ever silently dropped, but do not fabricate a second delete.
+    // A self-event on the root object is the scope's death — the same death
+    // lifecycle the FSEvents unmount uses, but PRESERVING the verb: a `DELETE_SELF`
+    // lowers to `DeleteSelf` (the Monitor's terminal Removed + Rescan), a `MOVE_SELF`
+    // to `MoveSelf` (a terminal Rescan only — a moved root's new path is unknowable,
+    // so there is no Removed). Collapsing both to `Ignored` here dropped the
+    // user-visible Removed a real root deletion owes. On an inner object it
+    // duplicates the parent's dirent record; degrade it to a located rescan so
+    // nothing is ever silently dropped, but do not fabricate a second delete.
     if mask.delete_self() || mask.move_self() {
       return match lower(state, path) {
-        Lowered::Root => vec![Planned::Rec(OsRecord::new(
-          state.watch,
-          RecordKind::Ignored,
-        ))],
+        Lowered::Root => {
+          let kind = if mask.delete_self() {
+            RecordKind::DeleteSelf
+          } else {
+            RecordKind::MoveSelf
+          };
+          vec![Planned::Rec(OsRecord::new(state.watch, kind))]
+        }
         Lowered::Target(location) => vec![Planned::Over(located(state.watch, Some(location)))],
         Lowered::Outside => vec![Planned::Over(Scope::Root(scope))],
       };

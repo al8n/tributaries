@@ -476,6 +476,16 @@ impl FidMap {
     self.admit(fid).is_some()
   }
 
+  /// The admitted directory's path WITHOUT the orphan-eviction side effect of
+  /// [`admit`](Self::admit) — a read-only resolution for the admission-classifier
+  /// oracle, which must decide a FID's admittance against a fixed pre-classify map
+  /// state. `Some` exactly when [`admit`](Self::admit) would resolve it (the handle
+  /// is stored and its ancestry reaches the root).
+  #[cfg(test)]
+  pub(crate) fn resolve_path(&self, fid: &Fid) -> Option<PathBuf> {
+    self.resolve(fid.handle())
+  }
+
   /// The number of stored directory nodes (the map's O(directories) footprint).
   /// Orphaned-but-not-yet-evicted nodes still count until their admission miss.
   #[cfg(test)]
