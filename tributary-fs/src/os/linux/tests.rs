@@ -159,8 +159,28 @@ fn remote_fs_magics_are_refused_and_local_ones_pass() {
 mod pin {
   use std::os::unix::fs::MetadataExt;
 
-  use super::super::{ancestor_identities, pin_root, pin_root_walk, root_is_remote};
-  use crate::os::SourceError;
+  use rustix::fs::OFlags;
+
+  use super::super::{ancestor_identities, open_no_symlinks, pin_root, root_is_remote};
+  use crate::os::{RootIdentity, SourceError};
+
+  /// The `pin_root` fast path's final-component flags — `O_RDONLY | O_DIRECTORY`,
+  /// the shape its `ENOSYS` walk must reproduce.
+  fn pin_final_flags() -> OFlags {
+    OFlags::RDONLY
+      .union(OFlags::DIRECTORY)
+      .union(OFlags::NOFOLLOW)
+      .union(OFlags::CLOEXEC)
+  }
+
+  /// The `ancestor_identities` final-component flags — `O_PATH | O_DIRECTORY`,
+  /// search permission only.
+  fn ancestor_final_flags() -> OFlags {
+    OFlags::PATH
+      .union(OFlags::NOFOLLOW)
+      .union(OFlags::DIRECTORY)
+      .union(OFlags::CLOEXEC)
+  }
 
   /// A fresh empty scratch directory under `TMPDIR`, canonicalized so the pin's
   /// `RESOLVE_NO_SYMLINKS` open matches a symlink-free path.
@@ -303,87 +323,172 @@ mod pin {
     let _ = std::fs::remove_dir_all(&base);
   }
 
-  /// The pre-`openat2` fallback pin (`pin_root_walk`, the pre-5.6 floor path)
-  /// pins the SAME object the `openat2` fast path pins: the component walk and
-  /// the one-shot resolve land on one identity. This is the direct-row coverage
-  /// the finding calls for — the `ENOSYS` routing itself needs a pre-5.6 kernel
-  /// to exercise, so the walk is tested on its own here, and `pin_root` is proven
-  /// to agree with it.
+  /// The pre-`openat2` fallback walk (`open_no_symlinks`, the pre-5.6 floor path)
+  /// pins the SAME object the `openat2` fast path pins, under BOTH callers' final
+  /// flags: the component walk and the one-shot resolve land on one identity
+  /// whether the final open is `pin_root`'s `O_RDONLY` or `ancestor_identities`'
+  /// `O_PATH`. The `ENOSYS` routing itself needs a pre-5.6 kernel to exercise, so the
+  /// walk is tested on its own here and `pin_root` is proven to agree with it.
   #[test]
-  fn pin_root_walk_pins_the_same_object_as_openat2() {
+  fn open_no_symlinks_pins_the_same_object_as_openat2() {
     let base = scratch("walk-ident");
     let nested = base.join("a/b/c");
     std::fs::create_dir_all(&nested).expect("create a nested dir");
 
     let fast = pin_root(&nested).expect("the openat2 fast path pins");
-    let walked = pin_root_walk(&nested).expect("the component walk pins");
     let fast_stat = rustix::fs::fstat(&fast).expect("fstat the fast pin");
-    let walked_stat = rustix::fs::fstat(&walked).expect("fstat the walked pin");
-    assert_eq!(
-      (fast_stat.st_dev, fast_stat.st_ino),
-      (walked_stat.st_dev, walked_stat.st_ino),
-      "the component walk and openat2 pin the identical object"
-    );
-    // And the walked pin's identity is the true object's.
     let meta = std::fs::metadata(&nested).expect("stat the path");
-    assert_eq!(
-      walked_stat.st_dev,
-      meta.dev(),
-      "walked device is the root's"
-    );
-    assert_eq!(walked_stat.st_ino, meta.ino(), "walked inode is the root's");
+
+    // Both final-flag shapes pin the identical object the fast path did.
+    for (label, flags) in [
+      ("O_RDONLY (pin_root)", pin_final_flags()),
+      ("O_PATH (ancestor)", ancestor_final_flags()),
+    ] {
+      let walked = open_no_symlinks(&nested, flags).expect("the component walk pins");
+      let walked_stat = rustix::fs::fstat(&walked).expect("fstat the walked pin");
+      assert_eq!(
+        (fast_stat.st_dev, fast_stat.st_ino),
+        (walked_stat.st_dev, walked_stat.st_ino),
+        "{label}: the component walk and openat2 pin the identical object"
+      );
+      assert_eq!(
+        walked_stat.st_dev,
+        meta.dev(),
+        "{label}: walked device is the root's"
+      );
+      assert_eq!(
+        walked_stat.st_ino,
+        meta.ino(),
+        "{label}: walked inode is the root's"
+      );
+    }
     let _ = std::fs::remove_dir_all(&base);
   }
 
-  /// A symlink at ANY component of the walked path is refused (`ELOOP`) — the
-  /// per-hop `O_NOFOLLOW` rebuilds the fast path's whole-path no-symlink
-  /// guarantee, so the fallback can never redirect the pin to a symlink's target.
+  /// A symlink at ANY component of the walked path is refused — the per-hop
+  /// `O_NOFOLLOW` rebuilds the fast path's whole-path no-symlink guarantee, so the
+  /// fallback can never redirect the pin to a symlink's target. Whether the symlink
+  /// is an INTERMEDIATE hop or the FINAL component, the `O_NOFOLLOW | O_DIRECTORY`
+  /// open declines to traverse it: `O_PATH | O_NOFOLLOW` opens the link object
+  /// itself and `O_DIRECTORY` then rejects it (`ENOTDIR`), or the resolver refuses
+  /// the link outright (`ELOOP`). The exact errno is a kernel detail; both are
+  /// no-follow refusals, and the positive control proves following WOULD have
+  /// reached a real directory — so the error is the refusal, not a broken link.
   #[test]
-  fn pin_root_walk_refuses_a_symlink_component() {
+  fn open_no_symlinks_refuses_a_symlink_component() {
     let base = scratch("walk-symlink");
     let real = base.join("real");
     std::fs::create_dir_all(real.join("leaf")).expect("create real/leaf");
     let link = base.join("link");
     std::os::unix::fs::symlink(&real, &link).expect("symlink link -> real");
-    // `base/link/leaf` reaches a real directory THROUGH a symlinked component.
-    let via_link = link.join("leaf");
-    let err = pin_root_walk(&via_link)
-      .expect_err("a symlink component must be refused, not followed to its target");
+
+    // Positive control: `link` and `link/leaf` DO resolve to real directories when
+    // symlinks are followed, so any refusal below is the no-follow guard firing.
     assert!(
-      matches!(err, SourceError::RootUnavailable { .. }),
-      "a symlink component fails the per-hop no-symlink open typed: {err:?}"
+      link.join("leaf").is_dir(),
+      "the symlink target chain is real"
+    );
+
+    let refusal = |errno: rustix::io::Errno| {
+      matches!(errno, rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP)
+    };
+
+    // INTERMEDIATE symlink: `base/link/leaf` reaches a real directory THROUGH the
+    // symlinked `link` — refused without following it to `real`.
+    let via_link = link.join("leaf");
+    let intermediate = open_no_symlinks(&via_link, pin_final_flags())
+      .expect_err("an intermediate symlink must be refused, not followed to its target");
+    assert!(
+      refusal(intermediate),
+      "an intermediate symlink component is refused without following it: {intermediate:?}"
+    );
+
+    // FINAL symlink: `base/link` IS the requested object — refused, never followed.
+    let final_link = open_no_symlinks(&link, pin_final_flags())
+      .expect_err("a final-component symlink must be refused, not followed");
+    assert!(
+      refusal(final_link),
+      "a final-component symlink is refused without following it: {final_link:?}"
     );
     let _ = std::fs::remove_dir_all(&base);
   }
 
-  /// A missing final component is a typed `RootUnavailable` (`ENOENT`) — the walk
-  /// surfaces a vanished root exactly like the fast path, never a panic.
+  /// A missing final component is `ENOENT` — the walk surfaces a vanished root as
+  /// the raw errno the caller maps to `RootUnavailable`, exactly like the fast path.
   #[test]
-  fn pin_root_walk_on_a_missing_path_is_typed() {
+  fn open_no_symlinks_on_a_missing_path_is_enoent() {
     let base = scratch("walk-missing");
     let gone = base.join("nope");
-    let err = pin_root_walk(&gone).expect_err("a missing component cannot be walked");
-    assert!(
-      matches!(err, SourceError::RootUnavailable { .. }),
-      "a vanished component is a typed RootUnavailable race: {err:?}"
+    let err =
+      open_no_symlinks(&gone, pin_final_flags()).expect_err("a missing component cannot be walked");
+    assert_eq!(
+      err,
+      rustix::io::Errno::NOENT,
+      "a vanished component is ENOENT (the caller's NotFound race): {err:?}"
     );
     let _ = std::fs::remove_dir_all(&base);
   }
 
   /// A component swapped for a NON-DIRECTORY fails the walk (`O_DIRECTORY` →
-  /// `ENOTDIR`) typed — the fallback never pins through a file, matching the fast
-  /// path's `O_DIRECTORY` refusal.
+  /// `ENOTDIR`) — the fallback never pins through a file, matching the fast path's
+  /// `O_DIRECTORY` refusal.
   #[test]
-  fn pin_root_walk_refuses_a_non_directory_component() {
+  fn open_no_symlinks_refuses_a_non_directory_component() {
     let base = scratch("walk-file");
     let file = base.join("f");
     std::fs::write(&file, b"x").expect("create a file");
     // Walking "f/child" hits a file where a directory must be.
     let through_file = file.join("child");
-    let err = pin_root_walk(&through_file).expect_err("a non-directory component cannot be walked");
-    assert!(
-      matches!(err, SourceError::RootUnavailable { .. }),
-      "a non-directory component is a typed refusal: {err:?}"
+    let err = open_no_symlinks(&through_file, pin_final_flags())
+      .expect_err("a non-directory component cannot be walked");
+    assert_eq!(
+      err,
+      rustix::io::Errno::NOTDIR,
+      "a non-directory component is ENOTDIR: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// The anchor-only path `"/"` (no `Normal` components) pins the filesystem root
+  /// itself: the anchor open carries `final_flags`, so the walker still returns the
+  /// target rather than tripping over an empty component list.
+  #[test]
+  fn open_no_symlinks_pins_the_root_itself() {
+    let fd = open_no_symlinks(std::path::Path::new("/"), ancestor_final_flags())
+      .expect("the filesystem root pins");
+    let stat = rustix::fs::fstat(&fd).expect("fstat the root pin");
+    let meta = std::fs::metadata("/").expect("stat /");
+    assert_eq!(stat.st_dev, meta.dev(), "the root pin's device is /'s");
+    assert_eq!(stat.st_ino, meta.ino(), "the root pin's inode is /'s");
+  }
+
+  /// The `ancestor_identities` `ENOSYS` fallback row: pinning each strict ancestor
+  /// by the shared component walk (`O_PATH` final flags) and `fstat`ing it yields
+  /// the SAME identities the `openat2` fast path records — so a pre-5.6 kernel that
+  /// pins + starts the reader also reads the ancestor chain, and the floor holds one
+  /// call past the pin instead of dying `RootUnavailable` there. The `ENOSYS` routing
+  /// itself needs a pre-5.6 kernel; this exercises the fallback body on a real chain
+  /// and proves it agrees with `ancestor_identities`.
+  #[test]
+  fn ancestor_walk_fallback_matches_openat2() {
+    let base = scratch("anc-walk");
+    let nested = base.join("a/b");
+    std::fs::create_dir_all(&nested).expect("create a nested dir");
+
+    let fast = ancestor_identities(&nested).expect("the openat2 ancestor pass");
+    let walked: Vec<_> = nested
+      .ancestors()
+      .skip(1)
+      .map(|ancestor| {
+        let fd = open_no_symlinks(ancestor, ancestor_final_flags())
+          .expect("the component walk pins the ancestor");
+        let stat = rustix::fs::fstat(&fd).expect("fstat the walked ancestor");
+        RootIdentity::new(stat.st_dev, stat.st_ino)
+      })
+      .collect();
+    assert_eq!(
+      fast, walked,
+      "the ENOSYS ancestor walk reproduces the openat2 ancestor identities exactly"
     );
     let _ = std::fs::remove_dir_all(&base);
   }
