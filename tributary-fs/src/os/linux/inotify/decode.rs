@@ -4,6 +4,12 @@
 //! The `IN_*` constants restate the kernel ABI values locally so this module
 //! carries no libc dependency; the FFI layer cross-asserts them against libc
 //! when it lands.
+//!
+//! Invariant: every wire-derived offset and length is advanced through checked
+//! arithmetic and read through `get`, so a truncated or length-overflowing
+//! record is `lossy`, never a panic — on 32-bit as on 64-bit. (A kernel `len`
+//! up to `u32::MAX` would otherwise wrap `at + HEADER + len` past `usize` and
+//! panic on i686 before the slice bound is ever tested.)
 
 /// A child object was created in the watched directory.
 pub(crate) const IN_CREATE: u32 = 0x0000_0100;
@@ -166,7 +172,19 @@ pub(crate) fn decode_events(buf: &[u8]) -> DecodeOutcome {
     let cookie = u32::from_ne_bytes(header[8..12].try_into().expect("4 bytes"));
     let len = u32::from_ne_bytes(header[12..16].try_into().expect("4 bytes")) as usize;
 
-    let Some(name_bytes) = buf.get(at + HEADER..at + HEADER + len) else {
+    // `len` is the kernel-supplied name length (a u32 widened to usize). On a
+    // 32-bit target `at + HEADER + len` can wrap usize and panic before the
+    // slice bound is ever tested, so resolve the name range through checked
+    // arithmetic: any overflow is a structurally impossible record that stops
+    // the walk lossy, exactly like an out-of-range length — never a panic.
+    let Some((name_start, name_end)) = at
+      .checked_add(HEADER)
+      .and_then(|start| start.checked_add(len).map(|end| (start, end)))
+    else {
+      lossy = true;
+      break;
+    };
+    let Some(name_bytes) = buf.get(name_start..name_end) else {
       lossy = true;
       break;
     };
@@ -188,7 +206,7 @@ pub(crate) fn decode_events(buf: &[u8]) -> DecodeOutcome {
       cookie,
       name,
     });
-    at += HEADER + len;
+    at = name_end;
   }
 
   DecodeOutcome { events, lossy }

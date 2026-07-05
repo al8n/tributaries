@@ -59,6 +59,18 @@ fn event(mask: u64, info: &[u8]) -> Vec<u8> {
 const FSID_A: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 const FSID_B: [u8; 8] = [9, 9, 9, 9, 0, 0, 0, 0];
 
+/// A `DFID_NAME` FID payload whose `file_handle.handle_bytes` field is forced
+/// to `u32::MAX` while the opaque bytes present are far shorter — a decode is
+/// impossible on any width, and `FILE_HANDLE_PREFIX + handle_bytes` overflows
+/// `usize` on a 32-bit target.
+fn fid_payload_with_absurd_handle_bytes() -> Vec<u8> {
+  let mut payload = fid_payload(FSID_A, 1, b"x", Some(b"child"));
+  // `handle_bytes` is the u32 at the start of the `file_handle`, right after the
+  // 8-byte fsid.
+  payload[8..12].copy_from_slice(&u32::MAX.to_ne_bytes());
+  payload
+}
+
 /// A create with `DFID_NAME` (the parent + child name) and a `FID` (the
 /// child's own handle, from `FAN_REPORT_TARGET_FID`) decodes both, with the
 /// name trimmed and both FIDs exact.
@@ -190,6 +202,49 @@ fn overlong_event_len_is_lossy() {
   let DecodeOutcome { events, lossy } = decode_events(&buf);
   assert!(lossy);
   assert!(events.is_empty());
+}
+
+/// A `handle_bytes` of `u32::MAX` on a short payload: `FILE_HANDLE_PREFIX +
+/// handle_bytes` overflows `usize` on a 32-bit target (i686), which would panic
+/// on the add before the slice bound is tested. `decode_fid_record` resolves it
+/// to a malformed FID — the batch is `lossy` with no events, never a panic.
+#[test]
+fn absurd_handle_bytes_alone_is_lossy_not_a_panic() {
+  let info = info_record(
+    FAN_EVENT_INFO_TYPE_DFID_NAME,
+    &fid_payload_with_absurd_handle_bytes(),
+  );
+  let buf = event(FAN_CREATE, &info);
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(lossy, "a handle length that overflows usize is lossy");
+  assert!(events.is_empty(), "the overflowing FID yields no event");
+}
+
+/// A valid event followed by one whose `handle_bytes` overflows `usize`: the
+/// intact leading event decodes, then the absurd handle stops the walk lossy —
+/// the mid-buffer form of the 32-bit overflow guard.
+#[test]
+fn absurd_handle_bytes_after_valid_event_is_lossy() {
+  let good = event(
+    FAN_CREATE,
+    &info_record(
+      FAN_EVENT_INFO_TYPE_DFID_NAME,
+      &fid_payload(FSID_A, 1, b"d", Some(b"f")),
+    ),
+  );
+  let bad = event(
+    FAN_DELETE,
+    &info_record(
+      FAN_EVENT_INFO_TYPE_DFID_NAME,
+      &fid_payload_with_absurd_handle_bytes(),
+    ),
+  );
+  let mut buf = good;
+  buf.extend(bad);
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(lossy);
+  assert_eq!(events.len(), 1, "the intact leading event survives");
+  assert!(events[0].mask.created());
 }
 
 /// An unknown info-record type (a PIDFD, a future tag) is skipped by its own

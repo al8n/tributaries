@@ -93,6 +93,26 @@ mod decode {
     assert!(lossy);
   }
 
+  /// A lone record whose header claims a `u32::MAX` name length: `at + HEADER +
+  /// len` overflows `usize` on a 32-bit target (i686), which would panic on the
+  /// add before the slice bound is ever tested. The checked arithmetic keeps it
+  /// `lossy` with no events on every pointer width — never a panic.
+  #[test]
+  fn name_len_overflow_alone_is_lossy_not_a_panic() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&7i32.to_ne_bytes()); // wd
+    buf.extend_from_slice(&super::super::decode::IN_CREATE.to_ne_bytes()); // mask
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // cookie
+    buf.extend_from_slice(&u32::MAX.to_ne_bytes()); // len: absurd, overflows on 32-bit
+
+    let DecodeOutcome { events, lossy } = decode_events(&buf);
+    assert!(lossy, "a name length that overflows usize is lossy");
+    assert!(
+      events.is_empty(),
+      "the overflowing record yields no event and stops the walk"
+    );
+  }
+
   #[test]
   fn queue_overflow_entry_decodes_with_sentinel_wd() {
     let buf = event_bytes(-1, super::super::decode::IN_Q_OVERFLOW, 0, b"", 0);
