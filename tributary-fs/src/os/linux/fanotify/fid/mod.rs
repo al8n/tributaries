@@ -277,8 +277,11 @@ fn decode_info(mask: FanMask, mut info: &[u8]) -> Option<RawFanotifyEvent> {
   let mut dir_fid = None;
   let mut target_fid = None;
   let mut name = None;
-  let mut rename_old: Option<(Fid, Vec<u8>)> = None;
-  let mut rename_new: Option<(Fid, Vec<u8>)> = None;
+  // Each rename half keeps its decoded name as `Option`: an empty name decodes to
+  // `None` (see `decode_fid_record`), and the pairing below refuses a half that
+  // carries no name rather than lowering an empty path component.
+  let mut rename_old: Option<(Fid, Option<Vec<u8>>)> = None;
+  let mut rename_new: Option<(Fid, Option<Vec<u8>>)> = None;
 
   while !info.is_empty() {
     let header = info.get(..INFO_HEADER_LEN)?;
@@ -307,11 +310,11 @@ fn decode_info(mask: FanMask, mut info: &[u8]) -> Option<RawFanotifyEvent> {
       }
       FAN_EVENT_INFO_TYPE_OLD_DFID_NAME => {
         let record = decode_fid_record(payload, true)?;
-        rename_old = Some((record.fid, record.name.unwrap_or_default()));
+        rename_old = Some((record.fid, record.name));
       }
       FAN_EVENT_INFO_TYPE_NEW_DFID_NAME => {
         let record = decode_fid_record(payload, true)?;
-        rename_new = Some((record.fid, record.name.unwrap_or_default()));
+        rename_new = Some((record.fid, record.name));
       }
       // A PIDFD, an ERROR record, or a future info type: skip it by its own
       // length. The kernel guarantees the tags we consume are self-delimited,
@@ -322,17 +325,26 @@ fn decode_info(mask: FanMask, mut info: &[u8]) -> Option<RawFanotifyEvent> {
     info = &info[record_len..];
   }
 
-  let rename = match (rename_old, rename_new) {
-    (Some((old_dir, old_name)), Some((new_dir, new_name))) => Some(RenameInfo {
-      old_dir,
-      old_name,
-      new_dir,
-      new_name,
-    }),
-    // A rename must carry BOTH halves; one alone is malformed for this
-    // vocabulary and cannot be paired.
-    (Some(_), None) | (None, Some(_)) if mask.rename() => return None,
-    _ => None,
+  // A `FAN_RENAME` must carry BOTH halves, and each half must carry a NON-EMPTY
+  // name: only then can the pair lower to an ordered `MovedFrom`/`MovedTo`. A
+  // missing half, or a present half whose name did not decode (an empty
+  // component), cannot be paired — so the whole event is refused (`None`), which
+  // marks the buffer lossy and takes the ordered `Overflow` barrier rather than
+  // silently dropping the rename or lowering an empty path component. A stray
+  // rename half WITHOUT `FAN_RENAME` set is ignored; the non-rename event decodes
+  // normally.
+  let rename = if mask.rename() {
+    match (rename_old, rename_new) {
+      (Some((old_dir, Some(old_name))), Some((new_dir, Some(new_name)))) => Some(RenameInfo {
+        old_dir,
+        old_name,
+        new_dir,
+        new_name,
+      }),
+      _ => return None,
+    }
+  } else {
+    None
   };
 
   Some(RawFanotifyEvent {

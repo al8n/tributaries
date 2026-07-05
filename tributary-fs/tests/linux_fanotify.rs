@@ -21,7 +21,10 @@
 use std::{
   path::{Path, PathBuf},
   process::Command,
-  sync::atomic::{AtomicU32, Ordering},
+  sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+  },
   time::Duration,
 };
 
@@ -1812,4 +1815,60 @@ fn has_sys_admin() -> bool {
     }
   }
   false
+}
+
+/// Reader-teardown fairness under sustained traffic (the container half of the
+/// fanotify liveness proof; the hermetic unit test pins only the top-of-loop
+/// control check). A producer churns files continuously so the fanotify fd stays
+/// readable, then the watcher is CLOSED under that load. `close()` must fully
+/// quiesce (`Ok(())`): the reader observes the shutdown between reads rather than
+/// after an `EAGAIN` the stream never yields. Without the interleaved control
+/// check the teardown `join` would wedge past the close grace and surface as
+/// `NotQuiesced`.
+#[tokio::test]
+async fn close_quiesces_under_sustained_traffic() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!("SKIP close_quiesces_under_sustained_traffic: no ext4 loopback (needs --privileged)");
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "close-load");
+  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+    return;
+  };
+
+  let stop = Arc::new(AtomicBool::new(false));
+  let producer = {
+    let root = root.clone();
+    let stop = Arc::clone(&stop);
+    std::thread::spawn(move || {
+      let mut i = 0u64;
+      while !stop.load(Ordering::Relaxed) {
+        let p = root.join(format!("churn-{}", i % 64));
+        let _ = std::fs::write(&p, b"x");
+        let _ = std::fs::remove_file(&p);
+        i = i.wrapping_add(1);
+      }
+    })
+  };
+
+  // Confirm the stream is actually flowing (the reader is under load) before
+  // tearing down, so the close races a live drain rather than an idle one.
+  assert!(
+    wait_for(&mut w, |e| e.path().starts_with(&root))
+      .await
+      .is_some(),
+    "events flow under the producer before close"
+  );
+
+  let closed = tokio::time::timeout(DEADLINE, w.close()).await;
+  stop.store(true, Ordering::Relaxed);
+  producer.join().expect("producer joins");
+  assert!(
+    matches!(closed, Ok(Ok(()))),
+    "close must fully quiesce under sustained traffic — the reader observes shutdown mid-drain, \
+     not after an EAGAIN that never comes: {closed:?}"
+  );
 }
