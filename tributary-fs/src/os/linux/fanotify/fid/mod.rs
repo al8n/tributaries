@@ -122,6 +122,36 @@ impl FanMask {
   pub(crate) const fn q_overflow(self) -> bool {
     self.0 & FAN_Q_OVERFLOW != 0
   }
+
+  /// How many DISTINCT structural verbs the mask carries — the bits that each
+  /// drive a distinct directory-tree mutation: `FAN_CREATE` (learn), `FAN_DELETE`
+  /// (forget), `FAN_DELETE_SELF`/`FAN_MOVE_SELF` (the object's own death/departure).
+  /// `FAN_MODIFY`/`FAN_ATTRIB` are metadata and `FAN_ONDIR` merely flags the subject
+  /// as a directory, so NONE of them is structural: they change content/metadata or
+  /// describe the subject, and coexist harmlessly with a structural verb (or each
+  /// other). `FAN_RENAME` is excluded because it is its own atomic event shape
+  /// ([`RenameInfo`]), dispatched before a mask ever reaches this count.
+  const fn structural_verbs(self) -> u32 {
+    self.created() as u32
+      + self.removed() as u32
+      + self.delete_self() as u32
+      + self.move_self() as u32
+  }
+
+  /// Whether the mask names TWO OR MORE distinct structural verbs. fanotify masks
+  /// are BITMASKS and the kernel MERGES consecutive events for one object (man 7
+  /// fanotify), so a single decoded event can carry several structural verbs at once
+  /// (a merged create+delete of the same dirent, a delete_self+move_self of one
+  /// object). No single tree mutation is correct for such a mask — applying one
+  /// (say, learn) and dropping the rest (the delete) would leave a departed directory
+  /// learned in the map: a one-sided mutation / stale admission. The classifier
+  /// therefore routes a multi-structural mask to the loss barrier (reseed + covering
+  /// `Overflow`) rather than mutate the map from an ambiguous verb. A mask with
+  /// exactly one structural verb (optionally plus metadata/`FAN_ONDIR`) is
+  /// unambiguous and classified normally.
+  pub(crate) const fn multi_structural(self) -> bool {
+    self.structural_verbs() >= 2
+  }
 }
 
 /// A filesystem object's exact identity: its superblock id plus an opaque

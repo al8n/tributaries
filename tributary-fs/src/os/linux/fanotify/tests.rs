@@ -1173,27 +1173,40 @@ mod batch_memo {
 ///      of its two directory ends — and read that object's admittance from the map;
 ///   2. an addressing object OUTSIDE the root (or none at all) is superblock firehose
 ///      noise — `ForeignDrop`;
-///   3. an ADMITTED addressing object takes the action its mask dictates, and an
+///   3. an ADMITTED addressing object whose mask is AMBIGUOUS — a merged bitmask with
+///      two or more distinct structural verbs (man 7 fanotify merges consecutive
+///      events for one object) — is `Lossy` (the loss barrier, never a one-sided map
+///      mutation); otherwise it takes the single action its mask dictates, and an
 ///      action missing a required field is `Lossy`.
 ///
 /// [`classify_oracle`] encodes exactly that, computing admittance UNIFORMLY for every
 /// mask and never mutating the map (a pure predicate, not classify's act-as-you-go
-/// machinery). So a future `classify` that re-introduced a mask special-case or a
-/// pre-classification gate dropping an admitted-FID event would DISAGREE with it. On
-/// top of agreement, two invariants are asserted DIRECTLY against the event + map,
-/// independent of BOTH classifiers:
+/// machinery), and re-deriving the multi-structural rule from the mask's own bits
+/// ([`multi_structural_spec`]) rather than from classify. So a future `classify` that
+/// re-introduced a mask special-case, a pre-classification gate dropping an
+/// admitted-FID event, or the single-verb priority (running one verb of a merged mask
+/// and dropping the rest) would DISAGREE with it. On top of agreement, three
+/// invariants are asserted DIRECTLY against the event + map, independent of BOTH
+/// classifiers:
 ///
-///   (i)  no-admitted-drop — an event whose addressing object is admitted is NEVER
-///        `ForeignDrop` (the whole class: a name-less ATTRIB/MODIFY on an admitted
-///        directory, addressed only by `target_fid`, once fell to the `dir_fid == None`
-///        gate and was silently dropped);
-///   (ii) field-correctness — every forwarded (non-`Lossy`, non-`Drop`) action carries
-///        exactly the field compile consumes (a single-object action its `path`, a
-///        rename its `rename` pair), so no forward reaches compile without its target.
+///   (i)   no-admitted-drop — an event whose addressing object is admitted is NEVER
+///         `ForeignDrop` (the whole class: a name-less ATTRIB/MODIFY on an admitted
+///         directory, addressed only by `target_fid`, once fell to the `dir_fid == None`
+///         gate and was silently dropped);
+///   (ii)  field-correctness — every forwarded (non-`Lossy`, non-`Drop`) action carries
+///         exactly the field compile consumes (a single-object action its `path`, a
+///         rename its `rename` pair), so no forward reaches compile without its target;
+///   (iii) no-one-sided-mutation — an admitted non-rename event whose merged mask names
+///         two or more structural verbs is `Lossy`, never a single-verb mutation that
+///         drops the other verb(s) (the merged create+delete leaving a deleted dir
+///         learned in the map — the class the single-action sweep + the mirrored model
+///         both missed).
 ///
-/// An exhaustive generator sweeps the whole small input space and asserts all three
-/// per case. This SUBSUMES the totality table's non-panic sweep: totality proved
-/// classify RETURNS for every shape; the oracle proves it returns the RIGHT action.
+/// An exhaustive generator sweeps the whole reachable mask space — the POWER SET of
+/// the subscribed action bits, so every merged bitmask appears, not just the selected
+/// single-action masks — and asserts all four per case. This SUBSUMES the totality
+/// table's non-panic sweep: totality proved classify RETURNS for every shape; the
+/// oracle proves it returns the RIGHT action.
 mod classification_oracle {
   use super::*;
 
@@ -1304,9 +1317,33 @@ mod classification_oracle {
 
     match addressing(map, event) {
       Addressing::Foreign | Addressing::Unaddressable => Action::ForeignDrop,
+      // A merged bitmask carrying two or more structural verbs is AMBIGUOUS: no
+      // single tree mutation is correct, so the SPEC routes an admitted
+      // multi-structural event to the loss barrier BEFORE the per-shape action.
+      // Derived here from the mask's own decode-level structural-bit count — never
+      // from classify — so a classify that dropped the rule (ran one verb and
+      // one-sided-mutated the map) would DISAGREE with the oracle.
+      Addressing::Dirent | Addressing::SelfObject { .. } if multi_structural_spec(event.mask) => {
+        Action::Lossy
+      }
       Addressing::Dirent => dirent_action(event),
       Addressing::SelfObject { is_root } => nameless_action(event, is_root),
     }
+  }
+
+  /// The SPEC's OWN count of distinct structural verbs — create, delete, delete_self,
+  /// move_self, each a distinct tree mutation — read from the mask's decode-level
+  /// bits, INDEPENDENT of classify's [`FanMask::multi_structural`]. `FAN_MODIFY`/
+  /// `FAN_ATTRIB` are metadata and `FAN_ONDIR` flags the subject, so none counts;
+  /// `FAN_RENAME` is its own atomic shape. Two or more is a merged bitmask the spec
+  /// routes to the loss barrier — a rule the oracle asserts from first principles so
+  /// re-deriving it here can never share classify's blind spot.
+  fn multi_structural_spec(mask: FanMask) -> bool {
+    let verbs = mask.created() as u8
+      + mask.removed() as u8
+      + mask.delete_self() as u8
+      + mask.move_self() as u8;
+    verbs >= 2
   }
 
   /// The action a NAMED event under an admitted parent takes: a directory
@@ -1419,33 +1456,75 @@ mod classification_oracle {
       ),
       Admission::ForeignDrop | Admission::Lossy => {}
     }
+
+    // (4) No-one-sided-mutation: an ADMITTED non-rename event whose merged bitmask
+    // names two or more structural verbs MUST route to the loss barrier — never a
+    // single-verb map mutation that silently drops the other verb(s) (the exact class
+    // the classify-by-action inversion + its old single-action sweep missed). Computed
+    // DIRECTLY from the event + map, independent of BOTH classifiers, so it holds even
+    // against a blind spot they might share.
+    if admitted && event.rename.is_none() && multi_structural_spec(event.mask) {
+      assert_eq!(
+        got,
+        Action::Lossy,
+        "no-one-sided-mutation `{label}`: an admitted multi-structural mask must be Lossy: {admission:?}"
+      );
+    }
   }
 
-  /// The whole non-rename input space: every mask over the backend's vocabulary ×
-  /// every `dir_fid`/`target_fid` drawn from {none, root, admitted child, foreign} ×
-  /// every name shape {none, empty, present}. Empty folds to none at decode, but
-  /// feeding it here proves classify and the oracle dispatch it identically.
+  /// The whole non-rename input space, over the POWER SET of the subscribed action
+  /// bits — every subset the kernel can deliver as a merged bitmask, not just the
+  /// selected single-action masks the earlier sweep used (the blind spot that let the
+  /// multi-structural class through: a merged create+delete or delete_self+move_self
+  /// never appeared, and the oracle's model mirrored the same single-verb priority).
+  /// The subscribed non-rename bits at the `FAN_MARK` (design §4.1) are
+  /// `FAN_CREATE|FAN_DELETE|FAN_MODIFY|FAN_ATTRIB|FAN_DELETE_SELF|FAN_MOVE_SELF|
+  /// FAN_ONDIR` (`FAN_RENAME` is its own atomic shape, swept separately), so the
+  /// power set is `2^7 = 128` masks — exhaustive over the reachable mask space. Each
+  /// mask crosses `dir_fid`/`target_fid` from {none, root, admitted child, foreign} ×
+  /// name {none, empty, present}. Empty folds to none at decode, but feeding it here
+  /// proves classify and the oracle dispatch it identically.
+  ///
+  /// Every mask subset is visited on ALL targets, so no merged bitmask escapes the
+  /// sweep. Under miri each case builds and walks a fresh `FidMap` (interpreted, no
+  /// unsafe to inspect — miri's value here is the FID parse's pointer arithmetic in the
+  /// `fid` suite, not re-checking classify's safe logic), so the full 6144-case
+  /// field cross-product would cost ~15 min. Miri therefore visits every one of the
+  /// 128 mask subsets but a REPRESENTATIVE field cross-product (admitted + foreign
+  /// object × dirent + name-less shape) — still exercising the multi-structural gate in
+  /// both `classify_dirent` and `classify_nameless` across the whole mask space — while
+  /// the host keeps the full one.
   #[test]
   fn oracle_agrees_on_every_dirent_and_self_event_shape() {
-    let masks = [
+    const SUBSCRIBED: [u64; 7] = [
       FAN_CREATE,
-      FAN_CREATE | FAN_ONDIR,
       FAN_DELETE,
-      FAN_DELETE | FAN_ONDIR,
       FAN_MODIFY,
-      FAN_MODIFY | FAN_ONDIR,
       FAN_ATTRIB,
-      FAN_ATTRIB | FAN_ONDIR,
       FAN_DELETE_SELF,
-      FAN_DELETE_SELF | FAN_ONDIR,
       FAN_MOVE_SELF,
-      FAN_MOVE_SELF | FAN_ONDIR,
-      FAN_DELETE_SELF | FAN_ATTRIB,
+      FAN_ONDIR,
     ];
+    #[cfg(not(miri))]
     let fids = [None, Some(fid(1)), Some(fid(2)), Some(fid(99))];
+    #[cfg(not(miri))]
     let names: [Option<&[u8]>; 3] = [None, Some(b""), Some(b"n")];
+    #[cfg(miri)]
+    let fids = [Some(fid(2)), Some(fid(99))];
+    #[cfg(miri)]
+    let names: [Option<&[u8]>; 2] = [None, Some(b"n")];
     let mut checked = 0u64;
-    for &mask in &masks {
+    let mut multi_structural_seen = 0u64;
+    for subset in 0u32..(1u32 << SUBSCRIBED.len()) {
+      let mut mask = 0u64;
+      for (bit, flag) in SUBSCRIBED.iter().enumerate() {
+        if subset & (1u32 << bit) != 0 {
+          mask |= *flag;
+        }
+      }
+      if FanMask::new(mask).multi_structural() {
+        multi_structural_seen += 1;
+      }
       for dir in &fids {
         for target in &fids {
           for &name in &names {
@@ -1465,7 +1544,19 @@ mod classification_oracle {
         }
       }
     }
-    assert_eq!(checked, masks.len() as u64 * 4 * 4 * 3);
+    assert_eq!(
+      checked,
+      (1u64 << SUBSCRIBED.len()) * (fids.len() * fids.len() * names.len()) as u64
+    );
+    // The power set actually EXERCISES the merged-mask class the fix closes: with 4
+    // structural bits among the 7, C(4,2)+C(4,3)+C(4,4) = 6+4+1 = 11 multi-structural
+    // combinations each appear both bare and with any of the 8 metadata/ONDIR subsets,
+    // i.e. 11 * 8 = 88 masks. A regression that shrank the sweep back toward the old
+    // single-action list would drop this below the count and trip here.
+    assert_eq!(
+      multi_structural_seen, 88,
+      "the power set must span every multi-structural merge, not just single actions"
+    );
   }
 
   /// The whole rename input space: {file, ONDIR} × each directory end drawn from
@@ -1528,5 +1619,69 @@ mod classification_oracle {
         );
       }
     }
+  }
+
+  /// The exact class THIS fix closes, isolated as targeted rows: a MERGED bitmask
+  /// carrying two or more structural verbs routes to `Lossy` (the reseed barrier),
+  /// never a single-verb map mutation that silently drops the other verb(s). Each row
+  /// also proves the map was NOT one-sided-mutated — its generation is unchanged and
+  /// the node's membership is exactly as before — so no departed directory is left
+  /// learned and no live node is spuriously forgotten from an ambiguous mask.
+  #[test]
+  fn merged_multi_structural_mask_is_lossy_never_one_sided() {
+    // Merged create+delete of the same dirent under an admitted parent: the old
+    // single-verb priority LEARNED the child and dropped the delete (`LearnDir`); now
+    // it is `Lossy` and the map is untouched — no phantom directory.
+    let mut map = oracle_map();
+    let generation = map.generation();
+    let create_delete = dirent(
+      FAN_CREATE | FAN_DELETE | FAN_ONDIR,
+      fid(2),
+      b"merged",
+      Some(fid(8)),
+    );
+    assert!(
+      matches!(classify_one(&mut map, &create_delete), Admission::Lossy),
+      "a merged create+delete dirent is ambiguous → Lossy, not a one-sided learn"
+    );
+    assert_eq!(
+      map.generation(),
+      generation,
+      "the ambiguous event mutated nothing — no phantom directory learned"
+    );
+    assert!(
+      !map.contains_dir(&fid(8)),
+      "the merged create did not learn the child its co-merged delete removed"
+    );
+
+    // Merged delete_self+move_self on an admitted NON-ROOT directory: the old priority
+    // FORGOT it (`ForgetDir`); now `Lossy`, and it stays mapped — the reseed barrier,
+    // not a one-sided forget, rebuilds the truth.
+    let mut map = oracle_map();
+    let generation = map.generation();
+    let delete_move_self = self_dfid(FAN_DELETE_SELF | FAN_MOVE_SELF | FAN_ONDIR, fid(2));
+    assert!(
+      matches!(classify_one(&mut map, &delete_move_self), Admission::Lossy),
+      "a merged delete_self+move_self is ambiguous → Lossy, not a one-sided forget"
+    );
+    assert_eq!(
+      map.generation(),
+      generation,
+      "the ambiguous self-event forgot nothing — no live node dropped from one bit"
+    );
+    assert!(
+      map.contains_dir(&fid(2)),
+      "the node is still mapped; the reseed barrier rebuilds it, not a one-sided forget"
+    );
+
+    // Merged delete_self+move_self on the ROOT is `Lossy` too — never a one-sided
+    // `RootDeath` from an ambiguous mask. A genuinely-dead root is still observed by
+    // the reseed walk / liveness tick; a survivable ambiguity heals into a truthful map.
+    let mut map = oracle_map();
+    let root_merged = self_fid_only(FAN_DELETE_SELF | FAN_MOVE_SELF, fid(1));
+    assert!(
+      matches!(classify_one(&mut map, &root_merged), Admission::Lossy),
+      "a merged root self-event is ambiguous → Lossy, not a one-sided RootDeath"
+    );
   }
 }

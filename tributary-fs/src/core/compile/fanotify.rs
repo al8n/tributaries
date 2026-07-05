@@ -64,6 +64,18 @@ impl DriverCore {
       return self.plan_rename(state, scope, &rename.old_path, &rename.new_path);
     }
 
+    // classify routes an ambiguous merged mask (two or more structural verbs) to the
+    // loss barrier upstream, so a non-rename event that admitted this far names AT
+    // MOST ONE structural verb. The verb selectors below (the self-event branch and
+    // `verb`) therefore treat the mask as naming ONE action; a multi-structural mask
+    // reaching here is a classify/reader bug. In release the selectors still degrade
+    // safely — they pick the highest-priority verb, never panic — but assert the
+    // invariant in debug so a future admission regression trips a test, not the field.
+    debug_assert!(
+      !mask.multi_structural(),
+      "a multi-structural fanotify mask reached lowering; classify must route it to Lossy"
+    );
+
     let Some(path) = &event.path else {
       // An admitted event with no resolved path carries no addressable target;
       // the admission layer never produces one, so this is a seam bug —
@@ -161,8 +173,11 @@ impl DriverCore {
   }
 }
 
-/// The record verb an admitted event's mask names, if any. fanotify verbs are
-/// precise — exactly one dirent bit is set per event for the subscribed mask.
+/// The record verb an admitted event's mask names, if any. fanotify masks are
+/// bitmasks, but classify routes an ambiguous multi-structural mask to the loss
+/// barrier upstream, so at most ONE structural verb (create or delete) reaches here;
+/// a coexisting metadata bit (modify/attrib) is subsumed by the structural verb via
+/// the priority order below, and a pure metadata mask picks its single metadata verb.
 fn verb(event: &AdmittedEvent) -> Option<RecordKind> {
   let mask = event.mask;
   if mask.created() {
