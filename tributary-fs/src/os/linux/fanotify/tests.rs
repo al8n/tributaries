@@ -6,8 +6,8 @@ use std::{
 use super::{
   Admission, MemoBatch, admit,
   fid::{
-    FAN_ATTRIB, FAN_CREATE, FAN_DELETE_SELF, FAN_MODIFY, FAN_ONDIR, FAN_RENAME, FanMask, Fid,
-    RawFanotifyEvent, RenameInfo,
+    FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_MODIFY, FAN_ONDIR, FAN_RENAME,
+    FanMask, Fid, RawFanotifyEvent, RenameInfo,
   },
   map::{FidMap, SeedEntry},
 };
@@ -146,6 +146,39 @@ fn delete_self_resolves_and_forgets() {
   };
   assert_eq!(admitted.path.as_deref(), Some(Path::new("/root/sub")));
   assert!(!map.contains_dir(&fid(2)), "the directory is forgotten");
+}
+
+/// A DIRECTORY delete reported as a PARENT dirent (`FAN_DELETE|ONDIR` with the
+/// parent's `dir_fid`, the child name, AND the child's `target_fid`) forgets the
+/// whole child subtree via that target FID — the well-formed counterpart to the
+/// decode gate that makes a targetless one lossy. The deleted directory and its
+/// descendants stop admitting, and the map returns to the pre-child count.
+#[test]
+fn directory_delete_dirent_forgets_the_subtree() {
+  let mut map = FidMap::new();
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+    SeedEntry::child(fid(3), fid(2), OsString::from("child")),
+  ]);
+  // /root/sub (fid 2) is deleted: the parent /root (fid 1) reports the dirent with
+  // the child's own FID as `target_fid`.
+  let ev = dirent(FAN_DELETE | FAN_ONDIR, fid(1), b"sub", Some(fid(2)));
+  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
+    panic!("an in-root directory delete must admit");
+  };
+  assert_eq!(admitted.path.as_deref(), Some(Path::new("/root/sub")));
+  assert_eq!(
+    map.admit(&fid(2)),
+    None,
+    "the deleted directory is forgotten"
+  );
+  assert_eq!(
+    map.admit(&fid(3)),
+    None,
+    "and its descendant prunes with it — no stale subtree left admitting"
+  );
+  assert_eq!(map.dir_count(), 1, "only the root remains");
 }
 
 /// A FILE `FAN_RENAME` with both ends in-root resolves both absolute paths in

@@ -350,6 +350,47 @@ fn lossy_buffer_forwards_only_the_overflow_after_reseeding() {
   );
 }
 
+/// The downstream half of the missing-target directory-delete class: once decode
+/// makes a targetless `FAN_DELETE|ONDIR` lossy (the decode gate is
+/// exercised in the `fid` suite), the reader reseeds — and the reseed must PRUNE the
+/// stale subtree the old lazy-only path would have left admitting forever (a deleted
+/// directory yields no further events for the lazy orphan eviction to catch). A
+/// targetless dir-delete decodes to an EMPTY, lossy buffer (`decode_info` returns
+/// `None` and stops), so this drives that exact shape and asserts the map returns to
+/// the post-delete baseline — the deleted directory and its descendant are gone, not
+/// stale.
+#[test]
+fn lossy_dir_delete_reseed_prunes_the_stale_subtree() {
+  let mut map = FidMap::new();
+  map.seed([
+    SeedEntry::root(fid(1), Path::new("/root")),
+    SeedEntry::child(fid(2), fid(1), std::ffi::OsString::from("sub")),
+    SeedEntry::child(fid(3), fid(2), std::ffi::OsString::from("child")),
+  ]);
+  assert_eq!(map.dir_count(), 3);
+  // The lossy buffer a targetless dir-delete produces: no events, only the loss. The
+  // fresh walk observes the tree AFTER /root/sub was removed — just the root remains.
+  let decoded = DecodeOutcome {
+    events: Vec::new(),
+    lossy: true,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  assert!(alive, "a reseeded loss keeps the stream live");
+  assert_eq!(reseeds, 1, "the loss reseeded the map");
+  assert_eq!(
+    sent,
+    vec![Sent::Overflow],
+    "only the Overflow barrier is forwarded"
+  );
+  assert_eq!(
+    map.dir_count(),
+    1,
+    "the reseed pruned the deleted subtree — no stale directories left admitting"
+  );
+  assert_eq!(map.admit(&fid(2)), None, "the deleted directory is gone");
+  assert_eq!(map.admit(&fid(3)), None, "and its descendant with it");
+}
+
 /// A CLEAN buffer forwards its admitted events as one Batch and NO Overflow, and
 /// never reseeds — the barrier branch is not on the happy path.
 #[test]

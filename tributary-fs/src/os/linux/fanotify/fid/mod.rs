@@ -347,16 +347,26 @@ fn decode_info(mask: FanMask, mut info: &[u8]) -> Option<RawFanotifyEvent> {
     None
   };
 
-  // The required-field matrix (see [`required_fields_present`]): a non-rename event
-  // that reaches admission must carry every field its admission/compile path
-  // consumes, else that path silently defaults or skips and loses coverage until an
-  // unrelated reseed. A violation returns `None` here, which marks the buffer lossy
-  // and takes the ordered `Overflow` barrier + reseed — the same terminal a
-  // malformed rename takes. A `FAN_RENAME` validated its own halves above, so it is
-  // exempt (its single-FID fields are unused).
-  if !mask.rename()
-    && !required_fields_present(mask, dir_fid.as_ref(), target_fid.as_ref(), name.as_deref())
-  {
+  // The name / drop-gate validation (non-rename, see [`required_fields_present`]):
+  // a named dirent must carry the name its path resolves from; a FID-less firehose
+  // object-event and a name-less self-event are exempt. A `FAN_RENAME` validated
+  // its own both-halves-non-empty rule above.
+  if !mask.rename() && !required_fields_present(mask, dir_fid.as_ref(), name.as_deref()) {
+    return None;
+  }
+
+  // The structural rule (see [`mutates_child_tree`]): ANY event whose admission
+  // mutates the directory tree on a CHILD node consumes that child's own FID
+  // (`FAN_REPORT_TARGET_FID` → `target_fid`) — `learn` a created/moved-in child,
+  // `forget`/prune a deleted/moved-out child, re-parent a renamed one. Without it
+  // the mutation silently no-ops while the event still forwards, leaving a stale
+  // (or unmapped) subtree with no loss signal, since a departed subtree yields no
+  // further events for the lazy orphan eviction to catch. Returning `None` makes
+  // the buffer lossy so the ordered `Overflow` + reseed rebuilds the map honestly.
+  // Applies uniformly to a dir create/delete/move dirent AND a dir rename; a
+  // self-event, a file (non-`ONDIR`) event, and a non-mutating dir modify/attrib
+  // mutate no child node and are exempt.
+  if mutates_child_tree(mask, name.is_some()) && target_fid.is_none() {
     return None;
   }
 
@@ -369,59 +379,96 @@ fn decode_info(mask: FanMask, mut info: &[u8]) -> Option<RawFanotifyEvent> {
   })
 }
 
-/// The fanotify required-field matrix — the completeness gate on every event this
-/// backend decodes under the `FAN_REPORT_DFID_NAME_TARGET` composite. The gate's job
-/// is narrow and exact: reject ONLY an event that admission ([`super::admit`]) would
-/// ADMIT (place under the root) yet then silently mishandle for want of a field —
-/// leaving a coverage hole with no loss signal until an unrelated reseed. On such a
-/// violation it returns `false`, [`decode_info`] yields `None`, the buffer is
-/// `lossy`, and the reader takes the ordered `Overflow` + reseed instead.
+/// Whether an event's admission MUTATES THE DIRECTORY TREE on a CHILD node — the
+/// single structural rule behind the `target_fid` requirement (see the call in
+/// [`decode_info`]). Every such mutation consumes the affected child's own FID
+/// (`FAN_REPORT_TARGET_FID` → the decoded `target_fid`):
 ///
-/// The DIRECTORY FID is the admittance GATE, not a required field. An event without
-/// one is not addressable against the map, so `admit` returns `Drop` — the
-/// superblock-firehose filter working. That covers the kernel's self-event /
-/// object-event shape, which reports the affected object's OWN handle as a
-/// `FAN_EVENT_INFO_TYPE_FID` record (→ `target_fid`, NOT a `DFID`): a `DELETE_SELF`,
-/// `MOVE_SELF`, or an `ATTRIB`/combined event on an object (masks like `0x404`
+/// - a directory **create** (`CREATE|ONDIR`) `learn`s the new child in;
+/// - a directory **delete** (`DELETE|ONDIR`) `forget`s/prunes the child subtree;
+/// - a directory **rename** (`FAN_RENAME|ONDIR`) re-parents an in-root child,
+///   walks a moved-in child's subtree, or `forget`s a moved-out child;
+/// - a directory **move** reported as a named dirent (`MOVE_SELF|ONDIR` carrying a
+///   child name) likewise `forget`s the named child.
+///
+/// Each is `FAN_ONDIR` (the subject is a directory) and identifies a CHILD — a
+/// rename by its atomic halves, the others by a `DFID_NAME` child name (which the
+/// wire pairs with the parent `dir_fid`, so a present name implies a present
+/// directory FID). When the child FID is absent the mutation cannot run, yet
+/// admission would still forward the event: the map then keeps a stale subtree (a
+/// delete/move-out that never pruned), misses a new one (a create/move-in that
+/// never learned), or resolves descendants through stale links (a rename that never
+/// re-parented) — a coverage hole with no loss signal, because a departed subtree
+/// yields no further events for the lazy orphan eviction
+/// ([`admit`](super::map::FidMap::admit)) to catch. The caller ([`decode_info`])
+/// makes such an event lossy so the ordered `Overflow` + reseed repairs it.
+///
+/// EXCLUDED, by construction, are the paths that mutate NO child node — so the rule
+/// never over-fires (a spurious reseed on firehose traffic) nor regresses the
+/// root-death lifecycle:
+///
+/// - a **self-event** (`DELETE_SELF`/`MOVE_SELF` with no child name) mutates the
+///   object's OWN node via `dir_fid`, not a child, so it needs no `target_fid`.
+///   This exclusion keeps the WATCHED ROOT's own death untouched: the root's
+///   self-event admits and lowers to the death lifecycle (or, when the kernel
+///   reports only the object's own FID with `dir_fid = None`, drops to the liveness
+///   probe) — never lossy'd, never required to carry a child FID it has none of;
+/// - a **file** (non-`ONDIR`) event never touches the directory tree;
+/// - a directory **modify/attrib** (`ONDIR` but none of create/delete/move/rename)
+///   changes content/metadata, not structure.
+///
+/// The cross-check against [`super::admit`] is exact: `admit`/`admit_rename` read
+/// `event.target_fid` ONLY on the four bullet paths above (each `if let Some(..)`),
+/// and this predicate is `true` for exactly those — so no ONDIR event that triggers
+/// a child tree mutation can reach admission without the field that mutation reads.
+fn mutates_child_tree(mask: FanMask, has_child_name: bool) -> bool {
+  if !mask.ondir() {
+    // The subject is a file; the directory tree is untouched.
+    return false;
+  }
+  if mask.rename() {
+    // A directory rename re-parents / walks-in / forgets a child directory, keyed
+    // on the moved object's own FID (`target_fid`).
+    return true;
+  }
+  if (mask.delete_self() || mask.move_self()) && !has_child_name {
+    // A name-less self-event mutates the object's OWN node (via `dir_fid`), not a
+    // child — the root-death exclusion.
+    return false;
+  }
+  // A directory create/delete/move naming a child learns or forgets that child.
+  has_child_name && (mask.created() || mask.removed() || mask.move_self())
+}
+
+/// The name / drop-gate for every NON-RENAME event this backend decodes: reject
+/// only an event admission ([`super::admit`]) would ADMIT yet then mishandle for
+/// want of the NAME its path resolves from. The orthogonal `target_fid` requirement
+/// — every directory-tree mutation — is the single structural rule in
+/// [`mutates_child_tree`], applied to renames and non-renames alike, so this gate no
+/// longer reasons about `target_fid` at all.
+///
+/// The DIRECTORY FID is the admittance GATE, not a required field: an event without
+/// one is unaddressable, so `admit` returns `Drop` — the superblock-firehose filter.
+/// That covers the kernel's object-event shape, which reports the affected object's
+/// OWN handle as a bare `FAN_EVENT_INFO_TYPE_FID` record (→ `target_fid`, NOT a
+/// `DFID`): a `DELETE_SELF`/`MOVE_SELF`/`ATTRIB` on an object (masks like `0x404`
 /// ATTRIB|DELETE_SELF) arrives with `dir_fid = None` and is dropped. A drop is not
-/// coverage loss (a departed directory is `forget`-ten via its PARENT's `FAN_DELETE`
-/// dirent, and root death is caught by the liveness probe), so decode leaves these
-/// clean — making them `lossy` would spuriously reseed on the firehose's constant
-/// object-event traffic (and, co-batched with a real event, drop it behind the
-/// barrier). Only when a directory FID IS present are the remaining fields
-/// load-bearing:
+/// coverage loss, so decode leaves it clean — making it `lossy` would spuriously
+/// reseed on the firehose's constant object-event traffic (and, co-batched with a
+/// real event, drop it behind the barrier). Only with a directory FID present is the
+/// NAME load-bearing:
 ///
-/// | Admitted event (dir_fid present)         | also require        |
-/// |------------------------------------------|---------------------|
-/// | file create (`CREATE`)                   | name                |
-/// | dir create (`CREATE\|ONDIR`)             | name, target_fid (`learn`) |
-/// | delete (`DELETE[\|ONDIR]`)               | name (¹)            |
-/// | modify (`MODIFY`), attrib (`ATTRIB`) on a named entry | name    |
-/// | self (`DELETE_SELF`/`MOVE_SELF`, no name) | nothing             |
-/// | (any event with NO dir_fid)              | nothing — admission DROPS it |
-/// | rename (`FAN_RENAME`)                     | nothing here (²)    |
+/// | Admitted event (dir_fid present)                | require |
+/// |-------------------------------------------------|---------|
+/// | create/delete/modify/attrib on a named entry    | name    |
+/// | self (`DELETE_SELF`/`MOVE_SELF`, no name)       | nothing |
+/// | (any event with NO dir_fid)                     | nothing — admission DROPS it |
+/// | rename (`FAN_RENAME`)                            | nothing here (validated separately) |
 ///
-/// ¹ A directory delete's `forget` reads `target_fid`, but its absence falls back to
-///   lazy orphan eviction ([`super::map::FidMap::admit`]) — no over-admission and no
-///   silent loss — so it is NOT required; the sole loss-bearing `target_fid` consumer
-///   is the create's `learn`, which maps a new directory in.
-/// ² A `FAN_RENAME` is validated by its own both-halves-non-empty rule in
-///   `decode_info` (folded into this matrix so all vocabulary is gated in one place);
-///   its single-FID fields are unused, so this helper is not called for it.
-///
-/// Cross-check against `admit`: `admit` reads `event.dir_fid` and handles `None` by
-/// `Drop` (the gate, above); `event.name` (a non-self admitted event resolves
-/// `<dir>/<name>`, which compile REQUIRES — validated present); and `event.target_fid`
-/// only through `if let Some(..)` — required present for the create's `learn`, and its
-/// absence provably not-loss for the delete/move `forget` (note ¹). Every field
-/// admission consumes on an ADMITTED event is thus validated present, or its absence
-/// is a legitimate drop — no consumed field is left unvalidated.
-fn required_fields_present(
-  mask: FanMask,
-  dir_fid: Option<&Fid>,
-  target_fid: Option<&Fid>,
-  name: Option<&[u8]>,
-) -> bool {
+/// A named dirent resolves `<dir>/<name>`, which compile REQUIRES, so a missing or
+/// empty name — which `decode_fid_record` folds to `None` — is a hole (`false`). A
+/// name-less self-event resolves the object's own path and is exempt.
+fn required_fields_present(mask: FanMask, dir_fid: Option<&Fid>, name: Option<&[u8]>) -> bool {
   // The directory FID is the admittance gate: without it `admit` returns `Drop`
   // (the firehose filter, or the kernel's object-event shape carrying only the
   // object's own FID as `target_fid`). A drop is not coverage loss, so there is
@@ -439,17 +486,7 @@ fn required_fields_present(
   // Every other admitted event is a dirent on a named entry (create/delete/modify/
   // attrib): admission resolves `<dir>/<name>` and compile REQUIRES that path, so a
   // missing or empty name — which `decode_fid_record` folds to `None` — is a hole.
-  if name.is_none() {
-    return false;
-  }
-  // A directory create maps a NEW directory into the admission map via `learn`,
-  // which needs the child's own FID (`FAN_REPORT_TARGET_FID`). Without it the new
-  // directory is never learned and its whole subtree drops as outside-root until an
-  // unrelated reseed — the silent-loss edge this matrix closes.
-  if mask.created() && mask.ondir() && target_fid.is_none() {
-    return false;
-  }
-  true
+  name.is_some()
 }
 
 /// Parses one FID payload: `fsid` (8 bytes) + `struct file_handle`
