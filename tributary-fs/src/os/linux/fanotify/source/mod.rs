@@ -210,8 +210,15 @@ impl Source {
     // The root's mount id, read once from the PIN — the descent boundary every
     // walk fences on. Captured here beside the device so a live reseed carries the
     // same fence the spawn walk used, and threaded through the walk contexts like
-    // `root_dev`.
-    let root_mnt_id = root_mount_id(root_fd);
+    // `root_dev`. A SUCCESSFUL read may be `None` (mask-absent belt, though the 5.17
+    // floor always reports it); a statx SYSCALL failure is a spawn failure, never a
+    // silent `None` that would disable the fence — the barrier required statx to work.
+    let root_mnt_id = root_mount_id(root_fd).map_err(|err| {
+      SpawnFailure::Error(SourceError::RootUnavailable {
+        root: canonical.clone(),
+        source: err.into(),
+      })
+    })?;
     let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
     let mounts = mounts_under(&canonical).unwrap_or_default();
 
@@ -700,10 +707,13 @@ fn seed_walk(
   // object was unmounted and re-bound at the same path its mount id is fresh, and
   // the fresh id is the correct boundary: every descendant now lives under the NEW
   // mount, so fencing on the STALE spawn id would mark them all boundaries and skip
-  // them, silently blinding a re-mounted tree. A `None` read (the mnt-id bit unset
-  // — not expected on the 5.17 floor) degrades to `descend`'s device belt. Zero
-  // extra opens: the read rides the fd already held.
-  let fence_mnt_id = root_mount_id(root_fd.as_fd());
+  // them, silently blinding a re-mounted tree. A SUCCESSFUL read with the mnt-id bit
+  // unset (`Ok(None)` — not expected on the 5.17 floor) degrades to `descend`'s
+  // device belt; a statx SYSCALL failure is `Incomplete`, never a silent belt degrade
+  // that would drop the mount fence. Zero extra opens: the read rides the fd already
+  // held.
+  let fence_mnt_id =
+    root_mount_id(root_fd.as_fd()).map_err(|err| WalkError::Incomplete(err.into()))?;
   seed_from_fd(root_fd, root, fsid, root_dev, fence_mnt_id, max_directories)
 }
 
@@ -861,10 +871,13 @@ fn subtree_walk(
   // Fence descendants against the moved dir's CURRENT mount frame, read from the
   // fd just verified — never a frame captured elsewhere. The moved subtree is the
   // reference here (its own contents descend under it), and it is the object the
-  // reopen landed on, so the fresh read is the correct boundary. `None` (the read
-  // missed the mnt-id bit — shouldn't happen on the 5.17 floor) degrades to the
-  // device belt, exactly as `descend`'s fallback does.
-  let fence_mnt_id = root_mount_id(subtree_fd.as_fd());
+  // reopen landed on, so the fresh read is the correct boundary. A SUCCESSFUL read
+  // that missed the mnt-id bit (`Ok(None)` — shouldn't happen on the 5.17 floor)
+  // degrades to the device belt, exactly as `descend`'s fallback does; a statx SYSCALL
+  // failure is `Incomplete` (like every other failure in this walk), never a silent
+  // belt degrade.
+  let fence_mnt_id =
+    root_mount_id(subtree_fd.as_fd()).map_err(|err| WalkError::Incomplete(err.into()))?;
   let mut seed = Vec::new();
   descend(
     subtree_fd,
@@ -1060,11 +1073,22 @@ fn descend(
     // then delivering as in-root). `fence_mnt_id` is the walk root's OWN frame (the
     // caller read it from the pinned/reopened root fd), so this compares each child
     // against the mount the root lives on RIGHT NOW — a re-mounted root fences its
-    // children on the new frame, not a stale one. When either mount id is unavailable
-    // (`fence_mnt_id`/the child's is `None` — below 5.8, or `stx_mask` unset) the
-    // fence declines and the device belt alone governs, never skipping a genuine
-    // in-root directory on a mount-id read miss.
-    if let (Some(root_mnt), Some(child_mnt)) = (fence_mnt_id, root_mount_id(child_fd.as_fd()))
+    // children on the new frame, not a stale one. When either mount id is a SUCCESSFUL
+    // mask-absent read (`fence_mnt_id`/the child's is `Ok(None)` — below 5.8, or
+    // `stx_mask` unset) the fence declines and the device belt alone governs, never
+    // skipping a genuine in-root directory on a mask miss. A statx SYSCALL failure on
+    // the child, by contrast, is classified like the `fstat` above
+    // ([`classify_walk_skip`]) — a vanish/shape-change race is skipped, anything else
+    // is `Incomplete` — never laundered into a belt-only admission of a child whose
+    // mount could not be read.
+    let child_mnt_id = match root_mount_id(child_fd.as_fd()) {
+      Ok(child_mnt_id) => child_mnt_id,
+      Err(err) => match classify_walk_skip(err) {
+        WalkSkip::VanishedRace => continue,
+        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err.into())),
+      },
+    };
+    if let (Some(root_mnt), Some(child_mnt)) = (fence_mnt_id, child_mnt_id)
       && root_mnt != child_mnt
     {
       continue;

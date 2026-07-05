@@ -713,9 +713,11 @@ fn seed_from_fd_fences_on_the_handed_mount_frame_not_a_stale_one() {
     return;
   };
   // The root fd's TRUE current frame — what the reopen recompute reads and hands
-  // the descent. A filesystem that reports no mount id degrades to the device belt
-  // (no frame to make stale), so this cell cannot exercise the fence: skip loudly.
-  let Some(fresh) = crate::os::linux::root_mount_id(root_fd.as_fd()) else {
+  // the descent. A filesystem that reports no mount id (a successful `Ok(None)`
+  // mask-absent read) degrades to the device belt (no frame to make stale), so this
+  // cell cannot exercise the fence: skip loudly. A statx read error is likewise not
+  // exercisable here.
+  let Ok(Some(fresh)) = crate::os::linux::root_mount_id(root_fd.as_fd()) else {
     let _ = std::fs::remove_dir_all(&root);
     eprintln!(
       "SKIP seed_from_fd_fences_on_the_handed_mount_frame_not_a_stale_one: no mount id reported"

@@ -1984,6 +1984,13 @@ fn mint(
 /// over-fencing a genuine in-root directory on a mount-id read miss. An unknown
 /// ROOT device (`None`, an off-unix fake) leaves the belt inert; with no mount id
 /// either, nothing crosses — the fake tree is one scope.
+///
+/// A `None` mount id reaching this belt is ALWAYS a legitimate mask-absent read (a
+/// SUCCESSFUL statx below 5.8, or a fake), NEVER a swallowed statx failure: on Linux
+/// the spawn barrier fails closed on any statx error (`os::linux::require_statx`) and
+/// the mount-id captures turn a statx syscall failure into a spawn/walk failure, so a
+/// statx-denied environment never goes live to feed a `None` frame here. The belt is
+/// thus only ever the honest pre-5.8 degrade, not a silently disabled fence.
 fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
   let device_boundary = matches!(state.root_dev, Some(root_dev) if entry.dev != root_dev);
   let mount_boundary = matches!(

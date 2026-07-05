@@ -162,8 +162,8 @@ mod pin {
   use rustix::fs::OFlags;
 
   use super::super::{
-    ancestor_identities, open_no_symlinks, pin_root, require_statx, root_is_remote,
-    statx_unavailable,
+    ancestor_identities, mnt_id_from_mask, open_no_symlinks, pin_root, require_statx,
+    root_is_remote, root_mount_id, statx_gate_error, statx_unavailable,
   };
   use crate::os::{RootIdentity, SourceError};
 
@@ -535,6 +535,89 @@ mod pin {
     let dir = scratch("floor");
     let fd = pin_root(&dir).expect("pin the local dir");
     require_statx(fd.as_fd(), &dir).expect("statx is available on a 4.11+ host");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The statx spawn gate is FAIL-CLOSED: EVERY errno refuses the spawn with a typed
+  /// `RootUnavailable`, so an injected statx-`EPERM` (a seccomp policy blocking
+  /// statx) can never slip past the gate and go live with the mount-id fence silently
+  /// off. The errno only selects the message — the below-4.11 floor set
+  /// (`NOSYS`/`EOPNOTSUPP`) carries the `Unsupported` floor text, every other errno
+  /// (`EPERM`/`EACCES`/`EIO`) surfaces as an ordinary spawn failure — but NEITHER
+  /// returns Ok. This is the hole the fix closes at the gate seam.
+  #[test]
+  fn statx_gate_error_fails_closed_on_every_error() {
+    use rustix::io::Errno;
+    use std::io::ErrorKind;
+    let path = std::path::Path::new("/watched/root");
+
+    // The below-floor set names the 4.11 floor (an `Unsupported` refusal).
+    for errno in [Errno::NOSYS, Errno::OPNOTSUPP] {
+      match statx_gate_error(errno, path) {
+        SourceError::RootUnavailable { source, .. } => assert_eq!(
+          source.kind(),
+          ErrorKind::Unsupported,
+          "{errno:?} is the below-4.11 floor: an Unsupported RootUnavailable"
+        ),
+        other => panic!("{errno:?} must refuse the spawn typed, got {other:?}"),
+      }
+    }
+
+    // Every OTHER statx error is an ORDINARY spawn failure (`RootUnavailable`) — NOT
+    // the floor message and NOT Ok. A statx-`EPERM` seccomp profile refuses to spawn
+    // rather than going live with the fence off.
+    for errno in [Errno::PERM, Errno::ACCESS, Errno::IO] {
+      match statx_gate_error(errno, path) {
+        SourceError::RootUnavailable { source, .. } => assert_ne!(
+          source.kind(),
+          ErrorKind::Unsupported,
+          "{errno:?} is an ordinary spawn failure, not the below-floor message"
+        ),
+        other => panic!("{errno:?} must refuse the spawn typed, got {other:?}"),
+      }
+    }
+  }
+
+  /// The mount-id mask split (PURE): a SUCCESSFUL statx whose mask lacks the
+  /// `STATX_MNT_ID` bit yields `None` (the legitimate pre-5.8 device belt), while a
+  /// present bit yields `Some(id)`. `None` therefore has exactly ONE source — a
+  /// mask-absent success — so `root_mount_id` can never launder a statx SYSCALL
+  /// failure into the belt (a failure is `Err`, propagated by the caller, never this
+  /// `None`).
+  #[test]
+  fn mnt_id_from_mask_splits_present_from_absent() {
+    use rustix::fs::StatxFlags;
+    assert_eq!(
+      mnt_id_from_mask(0, 42),
+      None,
+      "a successful statx with the MNT_ID bit unset is the pre-5.8 belt (None)"
+    );
+    assert_eq!(
+      mnt_id_from_mask(StatxFlags::MNT_ID.bits(), 42),
+      Some(42),
+      "the MNT_ID bit set reports the mount id"
+    );
+    assert_eq!(
+      mnt_id_from_mask(StatxFlags::TYPE.bits(), 42),
+      None,
+      "an unrelated mask bit does not stand in for MNT_ID — only the MNT_ID bit gates"
+    );
+  }
+
+  /// `root_mount_id` on a live pin is `Ok` — a healthy statx never yields `Err`, so
+  /// the read is the belt decision (`Some` on 5.8+, `None` below), never a
+  /// spawn-killing failure on a supported kernel. The `Err` path is the fail-closed
+  /// spawn refusal the gate row proves; here the SUCCESS path is proven to stay `Ok`
+  /// rather than the old `.ok()?` that swallowed any error into the belt.
+  #[test]
+  fn root_mount_id_reads_ok_on_a_pin() {
+    let dir = scratch("mnt-id");
+    let fd = pin_root(&dir).expect("pin the local dir");
+    let read = root_mount_id(fd.as_fd());
+    assert!(
+      read.is_ok(),
+      "a statx-capable host reads the mount id without error: {read:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
