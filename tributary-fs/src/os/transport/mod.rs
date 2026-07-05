@@ -5,8 +5,18 @@
 //! covering it holds by construction (there is no second lane to race) and a
 //! signal send can never fail for capacity. The queue being unbounded, memory
 //! is bounded here instead: a batch may enqueue only under a [`BudgetPermit`],
-//! and the dedups keep at most one `Overflow` (per acknowledgement) and one
-//! `Fatal` (ever) in flight.
+//! the overflow dedup keeps at most one `Overflow` per ADJACENT run of losses,
+//! and the `Fatal` dedup one terminal message ever.
+//!
+//! The overflow dedup is queue-position-aware, not a single latch: it
+//! collapses only losses with nothing enqueued between them. A `Batch`
+//! enqueued behind a pending `Overflow` ends that run, so a later loss elects a
+//! FRESH `Overflow` behind the batch. This is the invariant the driver relies
+//! on — every `Batch` is followed by a covering `Overflow` if any loss
+//! postdates it — because an `Overflow`'s consumption rescans state as of that
+//! queue position, and a loss that postdates an interposed batch is stale
+//! relative to it: only a second `Overflow` behind the batch covers that
+//! staleness (see [`signal_loss`] and [`forward_batch`]).
 //!
 //! The machinery is generic over the decoded event payload `E` — each backend
 //! supplies its own (`os::fsevent::RawOsEvent` on macOS); the protocol never
@@ -16,8 +26,14 @@
 
 use std::sync::{
   Arc,
-  atomic::{AtomicBool, AtomicUsize, Ordering},
+  atomic::{AtomicUsize, Ordering},
 };
+// `AtomicBool` backs only the `fatal_sent` dedup, which lives inside the
+// backend-gated `TransportState`; the always-compiled RAII types
+// (`BudgetPermit`, `OverflowAck`) use `AtomicUsize`. Gating the import to that
+// same cfg keeps a backend-less build (wasm lib) warning-clean.
+#[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
+use std::sync::atomic::AtomicBool;
 
 use super::SourceError;
 
@@ -35,9 +51,17 @@ pub(crate) struct TransportState {
   in_flight: Arc<AtomicUsize>,
   /// The most batches allowed in flight at once.
   budget: usize,
-  /// One `Overflow` is enqueued and not yet acknowledged; further losses are
-  /// covered by it (the rescan it becomes reads current state).
-  overflow_pending: Arc<AtomicBool>,
+  /// The overflow dedup generation. Its low bit is the "an `Overflow` is
+  /// pending" flag; the rest is a monotone counter advanced on every
+  /// transition. A loss elects an `Overflow` only when the flag is clear
+  /// (even); enqueuing a `Batch` while it is set advances the generation to
+  /// EVEN (a batch now trails the pending signal, so a later loss is no longer
+  /// adjacent and must elect afresh); an [`OverflowAck`] re-arms only if the
+  /// generation still holds the exact value its election set — a batch or a
+  /// newer election having advanced it makes the ack a no-op, so a stale ack
+  /// can never clear a live pending signal. This is what makes the dedup
+  /// queue-position-aware rather than a single latch.
+  overflow_gen: Arc<AtomicUsize>,
   /// The terminal `Fatal` was sent; later failures are no-ops.
   fatal_sent: AtomicBool,
 }
@@ -49,7 +73,7 @@ impl TransportState {
     Self {
       in_flight: Arc::new(AtomicUsize::new(0)),
       budget,
-      overflow_pending: Arc::new(AtomicBool::new(false)),
+      overflow_gen: Arc::new(AtomicUsize::new(0)),
       fatal_sent: AtomicBool::new(false),
     }
   }
@@ -60,10 +84,27 @@ impl TransportState {
     self.in_flight.load(Ordering::Acquire)
   }
 
-  /// Whether an unacknowledged `Overflow` is in flight.
+  /// Whether an `Overflow` is pending at the tail of the queue (the low bit of
+  /// the dedup generation) — a subsequent adjacent loss rides it.
   #[cfg(test)]
   pub(crate) fn overflow_pending(&self) -> bool {
-    self.overflow_pending.load(Ordering::Acquire)
+    self.overflow_gen.load(Ordering::Acquire) & 1 == 1
+  }
+
+  /// Ends any pending-`Overflow` run because a `Batch` now trails it: advances
+  /// the generation to the next EVEN value so a later loss elects a fresh
+  /// `Overflow` behind this batch, and the pending signal's ack — pinned to the
+  /// old odd generation — no longer re-arms (a newer election owns that). A
+  /// no-op when no `Overflow` is pending (the generation is already even).
+  ///
+  /// Called ONLY after a `Batch` actually landed on the queue: a refused send
+  /// enqueues nothing, so it must not advance the position.
+  fn batch_superseded_pending_overflow(&self) {
+    let _ = self
+      .overflow_gen
+      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+        (g & 1 == 1).then_some(g.wrapping_add(1))
+      });
   }
 }
 
@@ -137,12 +178,27 @@ impl<E> BatchPayload<E> {
 /// signals afresh. A loss racing the acknowledgement either elects a fresh
 /// message or is covered by the rescan the acknowledged one is about to
 /// become.
+///
+/// The ack is pinned to `elected` — the odd generation the election set. It
+/// re-arms (advances that odd generation to the next even) ONLY by a CAS on
+/// that exact value: if a later `Batch` superseded this signal, or a newer
+/// election advanced past it, the generation no longer matches and the drop is
+/// a no-op — so acknowledging an OLDER `Overflow` can never clear a NEWER one
+/// still pending behind an interposed batch (the position-aware guarantee).
 #[derive(Debug)]
-pub(crate) struct OverflowAck(Arc<AtomicBool>);
+pub(crate) struct OverflowAck {
+  generation: Arc<AtomicUsize>,
+  elected: usize,
+}
 
 impl Drop for OverflowAck {
   fn drop(&mut self) {
-    self.0.store(false, Ordering::Release);
+    let _ = self.generation.compare_exchange(
+      self.elected,
+      self.elected.wrapping_add(1),
+      Ordering::AcqRel,
+      Ordering::Acquire,
+    );
   }
 }
 
@@ -184,6 +240,12 @@ pub(crate) type EventReceiver<E> = async_channel::Receiver<SourceMessage<E>>;
 ///
 /// A batch over budget and an undecodable entry both degrade to the same
 /// in-order `Overflow`.
+///
+/// A batch that actually LANDS ends any pending-`Overflow` run: it advances the
+/// dedup position so a loss postdating this batch elects a fresh `Overflow`
+/// BEHIND it (the batch's own staleness is not covered by the prior signal,
+/// which rescanned as of its earlier queue position). A batch refused over
+/// budget degrades to a loss instead and does not advance the position.
 #[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
 pub(crate) fn forward_batch<E, S>(
   transport: &TransportState,
@@ -200,6 +262,9 @@ pub(crate) fn forward_batch<E, S>(
         if !send(SourceMessage::Batch(BatchPayload { events, permit })) {
           return;
         }
+        // The batch is now the tail: a pending `Overflow` no longer covers a
+        // loss that postdates this batch, so end its run.
+        transport.batch_superseded_pending_overflow();
       }
       None => lost = true,
     }
@@ -211,17 +276,28 @@ pub(crate) fn forward_batch<E, S>(
 
 /// Enqueues one deduplicated `Overflow`.
 ///
-/// The dedup's false→true transition elects exactly one sender; the flag
-/// stays set until the message's [`OverflowAck`] drops (the driver
-/// acknowledging, a refused send, a drain), so at most one `Overflow` is ever
-/// in flight and losses meanwhile are covered by it.
+/// Election is the generation's even→odd transition: it fires only when no
+/// `Overflow` is pending at the tail (the low bit is clear), so ADJACENT losses
+/// — nothing enqueued between them — collapse onto the one message. The elected
+/// generation tags the [`OverflowAck`]; the signal stays pending until that ack
+/// re-arms it (the driver acknowledging, a refused send, a drain) OR a `Batch`
+/// supersedes it. A loss postdating an interposed batch finds the low bit clear
+/// again and elects a FRESH `Overflow`, so the batch's staleness is covered.
 #[cfg(any(all(any(target_os = "macos", target_os = "linux"), not(miri)), test))]
 pub(crate) fn signal_loss<E, S>(transport: &TransportState, mut send: S)
 where
   S: FnMut(SourceMessage<E>) -> bool,
 {
-  if !transport.overflow_pending.swap(true, Ordering::AcqRel) {
-    let ack = OverflowAck(Arc::clone(&transport.overflow_pending));
+  let elected = transport
+    .overflow_gen
+    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+      (g & 1 == 0).then_some(g.wrapping_add(1))
+    });
+  if let Ok(prev) = elected {
+    let ack = OverflowAck {
+      generation: Arc::clone(&transport.overflow_gen),
+      elected: prev.wrapping_add(1),
+    };
     // A refused send drops the message here, whose ack re-arms the dedup.
     let _ = send(SourceMessage::Overflow(ack));
   }

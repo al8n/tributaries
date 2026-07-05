@@ -5,6 +5,19 @@
 //! pool's results, and every root's OS batches, executes the core's
 //! [`Effect`]s (stream spawn/teardown and probes on the blocking pool, event
 //! delivery by `try_send`), and feeds each outcome straight back in.
+//!
+//! # The one-sample rule
+//!
+//! Every fact this executor reports about a filesystem OBJECT — kind, device,
+//! inode, mount frame — comes from ONE sample of that object: a single `statx`
+//! (or `symlink_metadata`) of one path, or one `fstat` of one pinned fd. Never
+//! two path syscalls whose results are then paired, because a rename or bind
+//! toggling between them would pair one object's identity with another's frame,
+//! and the identity checks downstream (a per-directory arm confirms only
+//! `(dev, ino)`) would then admit a foreign object. The Linux enumerate, the
+//! root-liveness refresh, and the spawn barriers all obey it — see
+//! [`statx_sample`], [`root_liveness_and_frame`], and the pinned-fd reads in
+//! `os::linux`.
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -457,7 +470,10 @@ fn io_class(err: &std::io::Error) -> IoClass {
   }
 }
 
-/// The proto file kind of a stat file type (symlinks are never followed).
+/// The proto file kind of a stat file type (symlinks are never followed). Feeds
+/// the metadata-based enumerate/liveness sample; the Linux path derives the kind
+/// from its one `statx` result's `stx_mode` instead ([`dir_entry_stat`]).
+#[cfg(not(all(target_os = "linux", not(miri))))]
 fn kind_of(kind: &std::fs::FileType) -> tributary_proto::FileKind {
   if kind.is_dir() {
     tributary_proto::FileKind::Dir
@@ -470,89 +486,87 @@ fn kind_of(kind: &std::fs::FileType) -> tributary_proto::FileKind {
   }
 }
 
-#[cfg(unix)]
+// The metadata-based `(dev, ino)` extractors feed the non-Linux enumerate and
+// liveness samples; the Linux path reads both from its one `statx` result, so it
+// never calls these.
+#[cfg(all(unix, not(all(target_os = "linux", not(miri)))))]
 fn dev_of(meta: &std::fs::Metadata) -> u64 {
   use std::os::unix::fs::MetadataExt;
   meta.dev()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(all(target_os = "linux", not(miri)))))]
 fn dev_of(_meta: &std::fs::Metadata) -> u64 {
   0
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(all(target_os = "linux", not(miri)))))]
 fn ino_of(meta: &std::fs::Metadata) -> u64 {
   use std::os::unix::fs::MetadataExt;
   meta.ino()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(all(target_os = "linux", not(miri)))))]
 fn ino_of(_meta: &std::fs::Metadata) -> u64 {
   0
 }
 
-/// The MOUNT id of the object at `path` (symlink not followed), via
-/// `statx(STATX_MNT_ID)` on Linux — the descent boundary the core fences on. A
-/// `mount --bind` of a same-device directory shares its origin's device, so the
-/// mount id is what marks it a boundary the per-entry device alone cannot.
+/// ONE `statx` sample of the object at `path` (symlink not followed):
+/// `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)`.
+/// This is the sole path-syscall behind every fact a caller reads about that
+/// object — kind, device, inode, and mount frame all come from THIS result, so
+/// no fact is ever paired with another object's after a rename/bind slipped
+/// between two lookups (the one-sample rule stated on the driver module doc).
 ///
-/// `None` when the kernel did not report it (below Linux 5.8 where the field is
-/// absent, `statx` unavailable below 4.11, or the `stx_mask` bit unset) or off
-/// Linux (no mount-id notion) — the core then falls back to the device check. The
-/// path is resolved the same way as the entry's `symlink_metadata`, so an anchor
-/// (`/proc/self/fd/N`) enumerate reads the mount id THROUGH the pinned fd too.
+/// The path is resolved the same way `symlink_metadata` was, so an anchor
+/// (`/proc/self/fd/N`) enumerate reads every fact THROUGH the pinned fd too.
+/// `statx` is 4.11+, so the call is available on any floor either backend runs on.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn mnt_id_of(path: &Path) -> Option<u64> {
+fn statx_sample(path: &Path) -> Result<rustix::fs::Statx, rustix::io::Errno> {
   use rustix::fs::{AtFlags, StatxFlags, statx};
-  let stx = statx(
+  statx(
     rustix::fs::CWD,
     path,
     AtFlags::SYMLINK_NOFOLLOW,
-    StatxFlags::MNT_ID,
+    StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
   )
-  .ok()?;
+}
+
+/// The mount frame carried by a [`statx_sample`] result: `Some` only when the
+/// sample's `stx_mask` reports the mount id, so it is read from the SAME object
+/// the rest of the entry's facts came from. `None` below Linux 5.8 (the field is
+/// absent) or on a transient mask miss — the core then falls back to the device
+/// check. A `mount --bind` of a same-device directory shares the origin's device,
+/// so the mount id is what marks a boundary the device alone cannot.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn frame_of(stx: &rustix::fs::Statx) -> Option<u64> {
+  use rustix::fs::StatxFlags;
   (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id)
 }
 
-#[cfg(not(all(target_os = "linux", not(miri))))]
-fn mnt_id_of(_path: &Path) -> Option<u64> {
-  None
-}
-
-/// The root's liveness verdict AND its current mount frame from ONE `statx` sample
-/// (symlink not followed) — so the refresh pairs the identity it decides
+/// The root's liveness verdict AND its current mount frame from ONE
+/// [`statx_sample`] — so the refresh pairs the identity it decides
 /// alive-vs-replaced on with the frame it adopts from the SAME object, never two
-/// separate path lookups a replace/remount could split. A single
-/// `statx(AT_FDCWD, root, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)`
-/// yields `(dev, ino)` for the liveness identity and `stx_mnt_id` for the frame in
-/// one atomic read: were these two reads (an `lstat` then a `statx`), a swap between
+/// separate path lookups a replace/remount could split. The single sample yields
+/// `(dev, ino)` for the liveness identity and `stx_mnt_id` for the frame in one
+/// atomic read: were these two reads (an `lstat` then a `statx`), a swap between
 /// them would let the OLD identity's "alive-and-matching" verdict adopt a DIFFERENT
 /// object's mount frame, over-/under-fencing genuine children until the next refresh
 /// healed it.
 ///
-/// The frame is `Some` only when the sample's `stx_mask` reports the mount id (below
-/// Linux 5.8 the field is absent, `statx` is 4.11+ so the call itself is available
-/// on any floor either backend runs on) — a mask miss yields the identity from the
-/// SAME result with a `None` frame, so a transient miss never mispairs, it just
-/// declines the frame (the core keeps its captured one). `statx` maps to the
-/// [`RootLiveness`] taxonomy exactly as the prior `symlink_metadata` did: `ENOENT`
-/// is `Missing` (DeleteSelf), any other error is `Unreadable` (MoveSelf), success is
-/// `Present`.
+/// A mask miss yields the identity from the SAME result with a `None` frame, so a
+/// transient miss never mispairs, it just declines the frame (the core keeps its
+/// captured one). The sample maps to the [`RootLiveness`] taxonomy exactly as the
+/// prior `symlink_metadata` did: `ENOENT` is `Missing` (DeleteSelf), any other error
+/// is `Unreadable` (MoveSelf), success is `Present`.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
-  use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
-  match statx(
-    rustix::fs::CWD,
-    root,
-    AtFlags::SYMLINK_NOFOLLOW,
-    StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
-  ) {
+  use rustix::fs::makedev;
+  match statx_sample(root) {
     Ok(stx) => {
       let dev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
       let liveness = RootLiveness::Present(RootIdentity::new(dev, stx.stx_ino));
-      let frame = (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id);
-      (liveness, frame)
+      (liveness, frame_of(&stx))
     }
     Err(rustix::io::Errno::NOENT) => (RootLiveness::Missing, None),
     Err(_) => (RootLiveness::Unreadable, None),
@@ -867,7 +881,44 @@ impl FsOps for RealFs {
   }
 }
 
-/// One blocking readdir + per-entry lstat, lowered to raw stat facts.
+/// All of one directory entry's stat facts — kind, device, inode, mount frame —
+/// from a SINGLE path sample, symlink not followed. `None` is a raced-away entry
+/// (the listing no longer reflects that name).
+///
+/// On Linux this is ONE [`statx_sample`]: every fact comes from that one result,
+/// so a rename/bind toggling between two syscalls can never pair one object's
+/// `(kind, dev, ino)` with another object's mount frame — the arm downstream
+/// verifies `(dev, ino)` only, so a raced foreign bind that split the sample
+/// could otherwise be classified descendable and armed. Off Linux, one
+/// `symlink_metadata` (no mount-id notion; the core fences on device alone) —
+/// still a single object's facts.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn dir_entry_stat(entry_path: &Path) -> Option<(tributary_proto::FileKind, u64, u64, Option<u64>)> {
+  use rustix::fs::{FileType, makedev};
+  let stx = statx_sample(entry_path).ok()?;
+  let kind = match FileType::from_raw_mode(u32::from(stx.stx_mode)) {
+    FileType::Directory => tributary_proto::FileKind::Dir,
+    FileType::Symlink => tributary_proto::FileKind::Symlink,
+    FileType::RegularFile => tributary_proto::FileKind::File,
+    _ => tributary_proto::FileKind::Other,
+  };
+  let dev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
+  Some((kind, dev, stx.stx_ino, frame_of(&stx)))
+}
+
+#[cfg(not(all(target_os = "linux", not(miri))))]
+fn dir_entry_stat(entry_path: &Path) -> Option<(tributary_proto::FileKind, u64, u64, Option<u64>)> {
+  let meta = std::fs::symlink_metadata(entry_path).ok()?;
+  Some((
+    kind_of(&meta.file_type()),
+    dev_of(&meta),
+    ino_of(&meta),
+    None,
+  ))
+}
+
+/// One blocking readdir + a single per-entry stat sample, lowered to raw stat
+/// facts (see [`dir_entry_stat`] for the one-sample discipline).
 fn list_dir(path: &Path) -> RawEnumerate {
   let dir = match std::fs::read_dir(path) {
     Ok(dir) => dir,
@@ -883,17 +934,17 @@ fn list_dir(path: &Path) -> RawEnumerate {
       break;
     };
     let entry_path = entry.path();
-    let Ok(meta) = std::fs::symlink_metadata(&entry_path) else {
+    let Some((kind, dev, ino, mnt_id)) = dir_entry_stat(&entry_path) else {
       // A raced-away entry: the listing no longer reflects one name.
       complete = false;
       continue;
     };
     entries.push(RawDirEntry {
       name: entry.file_name().as_encoded_bytes().to_vec(),
-      kind: kind_of(&meta.file_type()),
-      dev: dev_of(&meta),
-      ino: ino_of(&meta),
-      mnt_id: mnt_id_of(&entry_path),
+      kind,
+      dev,
+      ino,
+      mnt_id,
     });
   }
   RawEnumerate::Listed { entries, complete }

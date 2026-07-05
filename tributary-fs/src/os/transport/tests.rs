@@ -338,6 +338,92 @@ fn ack_drop_rearms_the_dedup() {
   assert_eq!(model.queue.len(), 1, "the next loss signals afresh");
 }
 
+/// The position-aware dedup's core guarantee: a `Batch` enqueued between two
+/// losses ends the first loss's `Overflow` run, so the second loss elects a
+/// FRESH `Overflow` BEHIND the batch. Without it, the second loss's staleness
+/// (it postdates the interposed batch, which an earlier signal's rescan cannot
+/// have covered) rides no covering signal at all. Neither ack has dropped, so
+/// this exercises the batch-supersede path, not ack re-arming.
+#[test]
+fn a_batch_between_losses_elects_a_fresh_overflow_behind_it() {
+  let transport = TransportState::new(4);
+  let mut model = Model::default();
+  // loss1 → Overflow1.
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert!(transport.overflow_pending());
+  // A clean batch lands BEHIND the pending Overflow: the run ends.
+  forward_batch(&transport, vec![raw("/r/x")], false, |msg| model.send(msg));
+  assert!(
+    !transport.overflow_pending(),
+    "a landed batch supersedes the pending Overflow's run"
+  );
+  // loss2 — no ack has dropped — must elect a SECOND Overflow, not dedup.
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert!(transport.overflow_pending());
+  let kinds: Vec<&Msg> = model.queue.iter().map(|(_, m)| m).collect();
+  assert!(
+    matches!(
+      kinds.as_slice(),
+      [
+        SourceMessage::Overflow(_),
+        SourceMessage::Batch(_),
+        SourceMessage::Overflow(_)
+      ]
+    ),
+    "the batch is bracketed by two Overflows, so the batch's staleness is covered: {kinds:?}"
+  );
+  while model.step_driver() {}
+  assert!(!transport.overflow_pending(), "the drained queue re-arms");
+}
+
+/// The dedup still collapses ADJACENT losses — nothing enqueued between them —
+/// onto one message, so a burst does not flood the queue.
+#[test]
+fn adjacent_losses_still_collapse_onto_one_overflow() {
+  let transport = TransportState::new(4);
+  let mut model = Model::default();
+  for _ in 0..5 {
+    forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  }
+  let overflows = model
+    .queue
+    .iter()
+    .filter(|(_, m)| matches!(m, SourceMessage::Overflow(_)))
+    .count();
+  assert_eq!(overflows, 1, "five adjacent losses dedup onto one Overflow");
+}
+
+/// Acknowledging the FIRST Overflow while a SECOND pends behind an interposed
+/// batch must NOT clear the second's pending state: the older ack is pinned to a
+/// superseded generation, so its drop is a no-op on the live signal. This is the
+/// exact cross-buffer erasure the single-latch protocol suffered.
+#[test]
+fn acking_the_first_overflow_leaves_the_second_pending() {
+  let transport = TransportState::new(4);
+  let mut model = Model::default();
+  // loss1 → Overflow1 (pos 1); batch (pos 2); loss2 → Overflow2 (pos 3).
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  forward_batch(&transport, vec![raw("/r/x")], false, |msg| model.send(msg));
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert!(transport.overflow_pending(), "Overflow2 is pending");
+  // Process Overflow1: its ack drops (a superseded generation), and the second
+  // Overflow must STILL be pending.
+  assert!(model.step_driver(), "process Overflow1");
+  assert!(
+    transport.overflow_pending(),
+    "acking the older Overflow does not clear the newer pending one"
+  );
+  // Drain: processing Overflow2 drops its ack and finally re-arms.
+  while model.step_driver() {}
+  assert!(
+    !transport.overflow_pending(),
+    "only the current Overflow's ack re-arms the dedup"
+  );
+  // A fresh loss now signals afresh.
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert!(transport.overflow_pending());
+}
+
 #[test]
 fn budget_denial_degrades_to_an_in_order_overflow() {
   let transport = TransportState::new(1);
