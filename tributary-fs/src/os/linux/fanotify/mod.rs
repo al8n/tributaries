@@ -279,10 +279,14 @@ pub(crate) fn classify(
   // shape can reach a single-verb mutation — the rename shape included, which
   // `FAN_RENAME`-as-a-structural-verb folds into the same count.
   //
-  // The gate is admittance-scoped: only an event ADDRESSING an in-root object takes the
-  // barrier. A fully-foreign multi-structural event flows to the dispatch and
-  // `ForeignDrop`s through its shape's own membership gate, so the superblock firehose's
-  // constant foreign multi-structural traffic never reseeds.
+  // The gate is admittance-scoped, and its admittance is ACTION-AWARE: an event takes the
+  // barrier when ANY structural-verb FID it carries — the rename parents, `dir_fid`, or the
+  // moved/self `target_fid` — is in-root (`addresses_in_root`), so a merged rename+self
+  // whose only in-root FID is `target_fid` (its rename parents foreign, the moved object
+  // itself the root) is barred here rather than dropped by the rename shape's both-ends-out
+  // check. A fully-foreign multi-structural event (no carried FID in-root) flows to the
+  // dispatch and `ForeignDrop`s through its shape's own membership gate, so the superblock
+  // firehose's constant foreign multi-structural traffic never reseeds.
   if event.mask.multi_structural() && addresses_in_root(map, event) {
     return Admission::Lossy;
   }
@@ -302,34 +306,43 @@ pub(crate) fn classify(
   }
 }
 
-/// Whether `event` ADDRESSES an in-root object — the uniform admittance the universal
-/// multi-structural gate in [`classify`] consults before any shape dispatch. Mirrors
-/// each shape's own membership gate EXACTLY, so the gate routes an ambiguous mask to
-/// [`Admission::Lossy`] on precisely the events their classifiers would otherwise
-/// admit, and lets a fully-foreign one fall through to its shape's
-/// [`Admission::ForeignDrop`]:
+/// Whether `event` REACHES an in-root object by ANY structural-verb FID it carries — the
+/// ACTION-AWARE admittance the universal multi-structural gate in [`classify`] consults
+/// before any shape dispatch. Admittance for the gate is "in-root by ANY carried
+/// structural-verb FID": a merged mask names two or more structural verbs, and each verb
+/// addresses through its OWN FID, so the event touches the root when ANY of those FIDs
+/// does. It therefore enumerates EVERY FID the event carries and answers `true` if any
+/// resolves in-root:
 ///
-/// - a `FAN_RENAME` is admitted when EITHER directory end resolves in-root
-///   ([`classify_rename`]'s both-ends-out drop);
-/// - a NAMED event by its parent `dir_fid` ([`classify_dirent`]'s gate);
-/// - a NAME-LESS event by its self-FID — `dir_fid`, else the `FID`-only shape's
-///   `target_fid` ([`classify_nameless`]'s gate).
+/// - a `FAN_RENAME`'s two directory ends (`old_dir`, `new_dir`) — the rename parents;
+/// - `target_fid` — the child FID of a create/delete, AND the SELF-FID of a
+///   move-self/delete-self (the moved/dying object itself);
+/// - `dir_fid` — a named dirent's parent, or a name-less event's own self object.
+///
+/// This is a SUPERSET of each shape's own membership gate, so it never bars a shape's
+/// classifier from admitting a fully-foreign event: with no carried FID in-root the event
+/// still falls through to its shape's [`Admission::ForeignDrop`]. Crucially, a merged
+/// rename+self whose ONLY in-root FID is the moved/self `target_fid` — its rename parents
+/// both foreign — is now correctly seen in-root, so the gate routes the ambiguity to
+/// [`Admission::Lossy`] rather than letting [`classify_rename`]'s both-ends-out check drop
+/// an in-root (possibly ROOT) death. The per-shape gates ([`classify_rename`],
+/// [`classify_dirent`], [`classify_nameless`]) each check a SUBSET of these FIDs and are
+/// unchanged; only the ambiguity gate needs the action-complete union.
 ///
 /// Read-only ([`FidMap::resolve_path`], not [`FidMap::admit`]): the gate must decide
 /// Lossy-vs-drop WITHOUT mutating the map before the shape dispatch resolves and acts.
-/// `resolve_path` answers `Some` exactly when `admit` would, so the boolean matches the
-/// classifiers' own gates and the gate never diverges from the dispatch it precedes.
+/// `resolve_path` answers `Some` exactly when `admit` would.
 fn addresses_in_root(map: &FidMap, event: &RawFanotifyEvent) -> bool {
-  if let Some(rename) = &event.rename {
-    return map.resolve_path(&rename.old_dir).is_some()
-      || map.resolve_path(&rename.new_dir).is_some();
-  }
-  let addressing = if event.name.is_some() {
-    event.dir_fid.as_ref()
-  } else {
-    event.dir_fid.as_ref().or(event.target_fid.as_ref())
-  };
-  addressing.is_some_and(|fid| map.resolve_path(fid).is_some())
+  let rename_ends = event
+    .rename
+    .iter()
+    .flat_map(|rename| [&rename.old_dir, &rename.new_dir]);
+  let singles = [event.dir_fid.as_ref(), event.target_fid.as_ref()]
+    .into_iter()
+    .flatten();
+  rename_ends
+    .chain(singles)
+    .any(|fid| map.resolve_path(fid).is_some())
 }
 
 /// Classifies a NAMED event: a dirent addressing `<dir>/<name>` under its parent
