@@ -327,6 +327,22 @@ impl FidMap {
     self.dirs.contains_key(fid.handle())
   }
 
+  /// Whether `fid` is the map's ROOT ANCHOR — the one node whose parent link is
+  /// `None` (every other node names a parent). This is the root-FID knowledge the
+  /// admission classifier consults to route a self-event on the watched root to the
+  /// death lifecycle: the anchor holds the root's own handle (encoded from the spawn
+  /// pin and pinned across reseeds by the anchor-match gate), so a `DELETE_SELF`/
+  /// `MOVE_SELF` whose self-FID answers `true` here is the root's own death — even
+  /// in the FID-only shape the periodic liveness tick would otherwise be the sole
+  /// detector of. Handle-keyed like the whole map, so the kernel's per-superblock
+  /// event fsid never enters the decision (the btrfs divergence).
+  pub(crate) fn is_root(&self, fid: &Fid) -> bool {
+    self
+      .dirs
+      .get(fid.handle())
+      .is_some_and(|node| node.parent.is_none())
+  }
+
   /// Records a newly-created in-root directory so its own later events admit.
   /// Called from a `FAN_CREATE` whose subject is a directory (`FAN_ONDIR`)
   /// carrying the child's `TARGET_FID`: the parent must already be admitted

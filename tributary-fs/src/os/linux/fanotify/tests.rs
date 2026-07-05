@@ -4,10 +4,10 @@ use std::{
 };
 
 use super::{
-  Admission, MemoBatch, admit,
+  Admission, AdmittedEvent, MemoBatch, classify,
   fid::{
-    FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_MODIFY, FAN_ONDIR, FAN_RENAME,
-    FanMask, Fid, RawFanotifyEvent, RenameInfo,
+    FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR,
+    FAN_RENAME, FanMask, Fid, RawFanotifyEvent, RenameInfo,
   },
   map::{FidMap, SeedEntry},
 };
@@ -16,11 +16,10 @@ fn fid(tag: u8) -> Fid {
   Fid::new([tag; 8], Box::from(&[tag][..]))
 }
 
-/// Admits a single event through a fresh one-shot memo — the per-event shape most
-/// of these row tests use (the batch-spanning memo has its own suite below).
-/// Returns the [`Admission`] so the caller can match its arm.
-fn admit_one(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
-  admit(map, event, &mut MemoBatch::new())
+/// Classifies a single event through a fresh one-shot memo — the per-event shape
+/// most of these row tests use (the batch-spanning memo has its own suite below).
+fn classify_one(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
+  classify(map, event, &mut MemoBatch::new())
 }
 
 fn seeded() -> FidMap {
@@ -42,43 +41,99 @@ fn dirent(mask: u64, dir_fid: Fid, name: &[u8], target: Option<Fid>) -> RawFanot
   }
 }
 
-/// A FILE create inside an admitted directory resolves to the child's absolute
-/// path — the whole admitted form under the KR profile. Records carry no node
-/// identity (design §4.9), so there is nothing beyond the path to assert.
+/// A name-less self-event in the `DFID` shape — the object's own FID as `dir_fid`.
+fn self_dfid(mask: u64, dir_fid: Fid) -> RawFanotifyEvent {
+  RawFanotifyEvent {
+    mask: FanMask::new(mask),
+    dir_fid: Some(dir_fid),
+    target_fid: None,
+    name: None,
+    rename: None,
+  }
+}
+
+/// A name-less self-event in the `FID`-only shape — the object's own FID as
+/// `target_fid`, `dir_fid = None` (the R25 root-death shape).
+fn self_fid_only(mask: u64, self_fid: Fid) -> RawFanotifyEvent {
+  RawFanotifyEvent {
+    mask: FanMask::new(mask),
+    dir_fid: None,
+    target_fid: Some(self_fid),
+    name: None,
+    rename: None,
+  }
+}
+
+fn rename_ev(
+  mask: u64,
+  target: Option<Fid>,
+  old_dir: Fid,
+  old_name: &[u8],
+  new_dir: Fid,
+  new_name: &[u8],
+) -> RawFanotifyEvent {
+  RawFanotifyEvent {
+    mask: FanMask::new(mask),
+    dir_fid: None,
+    target_fid: target,
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir,
+      old_name: old_name.to_vec(),
+      new_dir,
+      new_name: new_name.to_vec(),
+    }),
+  }
+}
+
+/// The forwarded event of any admission that forwards one, else panics — the row
+/// tests assert the resolved path/rename off this.
+fn forwarded(admission: Admission) -> AdmittedEvent {
+  match admission {
+    Admission::Forward(event)
+    | Admission::LearnDir(event)
+    | Admission::ForgetDir(event)
+    | Admission::RootDeath(event)
+    | Admission::Rename { event, .. } => event,
+    other => panic!("expected a forwarded admission, got {other:?}"),
+  }
+}
+
+/// A FILE create inside an admitted directory forwards the child's absolute path —
+/// the whole admitted form under the KR profile (design §4.9), and no map mutation.
 #[test]
 fn file_create_resolves_path() {
   let mut map = seeded();
   let ev = dirent(FAN_CREATE, fid(2), b"file.txt", Some(fid(7)));
-  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
-    panic!("in-root create must admit");
-  };
+  let admission = classify_one(&mut map, &ev);
+  assert!(
+    matches!(admission, Admission::Forward(_)),
+    "a file create mutates no directory node"
+  );
   assert_eq!(
-    admitted.path.as_deref(),
+    forwarded(admission).path.as_deref(),
     Some(Path::new("/root/sub/file.txt"))
   );
 }
 
-/// A DIRECTORY create resolves its path exactly like a file create — no identity
-/// is attached to either (the no-identity contract, design §4.9). The directory's
-/// membership self-maintenance is covered by
-/// [`directory_create_is_learned`](directory_create_is_learned).
+/// A DIRECTORY create is `LearnDir`: it learns the new child, then forwards the
+/// resolved path. The child FID (`target_fid`) is REQUIRED — its absence is caught
+/// as `Lossy` in the totality table.
 #[test]
-fn directory_create_resolves_path() {
+fn directory_create_is_learn_dir() {
   let mut map = seeded();
   let ev = dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"newdir", Some(fid(7)));
-  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
-    panic!("in-root directory create must admit");
-  };
+  let admission = classify_one(&mut map, &ev);
+  assert!(matches!(admission, Admission::LearnDir(_)));
   assert_eq!(
-    admitted.path.as_deref(),
+    forwarded(admission).path.as_deref(),
     Some(Path::new("/root/sub/newdir"))
   );
 }
 
 /// A long churn of DISTINCT file target FIDs never grows the map — files are not
-/// admitted directories, so they never enter it. This is the O(live directories)
-/// bound the no-identity model rests on: the memo-generation stays put because
-/// a plain file event mutates nothing.
+/// admitted directories, so they never enter it. The memo-generation stays put
+/// because a plain file event mutates nothing (the O(live directories) bound).
 #[test]
 fn file_event_churn_never_grows_the_map() {
   let mut map = seeded();
@@ -86,14 +141,14 @@ fn file_event_churn_never_grows_the_map() {
   for tag in 20..120u8 {
     let modify = dirent(FAN_MODIFY, fid(2), b"f.txt", Some(fid(tag)));
     assert!(
-      matches!(admit_one(&mut map, &modify), Admission::Admit(_)),
-      "in-root file modify must admit"
+      matches!(classify_one(&mut map, &modify), Admission::Forward(_)),
+      "in-root file modify forwards with no mutation"
     );
   }
   assert_eq!(
     map.dir_count(),
     2,
-    "file-event churn left the map at the two seeded directories"
+    "file churn left the two seeded directories"
   );
   assert_eq!(
     map.generation(),
@@ -102,57 +157,72 @@ fn file_event_churn_never_grows_the_map() {
   );
 }
 
-/// An event whose directory FID is not in the map is provably outside the
-/// watched root — the whole superblock-firehose filter — and is dropped.
+/// An event whose directory FID is not in the map is provably outside the watched
+/// root — the whole superblock-firehose filter — and is a `ForeignDrop`.
 #[test]
-fn admit_drops_unknown_directory() {
+fn classify_drops_unknown_directory() {
   let mut map = seeded();
   let ev = dirent(FAN_MODIFY, fid(99), b"elsewhere", None);
-  assert!(matches!(admit_one(&mut map, &ev), Admission::Drop));
+  assert!(matches!(
+    classify_one(&mut map, &ev),
+    Admission::ForeignDrop
+  ));
 }
 
-/// A directory create self-maintains the map: the new directory's own later
-/// events then admit.
+/// A directory create self-maintains the map: the new directory's own later events
+/// then admit.
 #[test]
 fn directory_create_is_learned() {
   let mut map = seeded();
   let ev = dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"newdir", Some(fid(3)));
-  let _ = admit_one(&mut map, &ev);
+  assert!(matches!(
+    classify_one(&mut map, &ev),
+    Admission::LearnDir(_)
+  ));
   // A modify inside the newly-learned directory now admits.
   let inside = dirent(FAN_MODIFY, fid(3), b"inside.txt", None);
-  let Admission::Admit(admitted) = admit_one(&mut map, &inside) else {
-    panic!("the learned directory must admit its own events");
-  };
   assert_eq!(
-    admitted.path.as_deref(),
+    forwarded(classify_one(&mut map, &inside)).path.as_deref(),
     Some(Path::new("/root/sub/newdir/inside.txt"))
   );
 }
 
-/// A `DELETE_SELF` on an admitted directory resolves to that directory's own
-/// path and forgets it (its stale handle stops admitting).
+/// A `DELETE_SELF` on an admitted NON-ROOT directory is `ForgetDir`: it resolves to
+/// that directory's own path and forgets it (its stale handle stops admitting).
 #[test]
-fn delete_self_resolves_and_forgets() {
+fn delete_self_of_subdir_forgets_it() {
   let mut map = seeded();
-  let ev = RawFanotifyEvent {
-    mask: FanMask::new(FAN_DELETE_SELF | FAN_ONDIR),
-    dir_fid: Some(fid(2)),
-    target_fid: None,
-    name: None,
-    rename: None,
-  };
-  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
-    panic!("delete-self on an admitted directory must admit");
-  };
-  assert_eq!(admitted.path.as_deref(), Some(Path::new("/root/sub")));
+  let admission = classify_one(&mut map, &self_dfid(FAN_DELETE_SELF | FAN_ONDIR, fid(2)));
+  assert!(matches!(admission, Admission::ForgetDir(_)));
+  assert_eq!(
+    forwarded(admission).path.as_deref(),
+    Some(Path::new("/root/sub"))
+  );
   assert!(!map.contains_dir(&fid(2)), "the directory is forgotten");
 }
 
+/// A name-less `MOVE_SELF` on an admitted non-root directory is a self-rescan
+/// (`Forward`) that does NOT forget it — the node is re-parented by its
+/// rename/dirent, not by this self-event.
+#[test]
+fn move_self_of_subdir_forwards_without_forgetting() {
+  let mut map = seeded();
+  let admission = classify_one(&mut map, &self_dfid(FAN_MOVE_SELF | FAN_ONDIR, fid(2)));
+  assert!(matches!(admission, Admission::Forward(_)));
+  assert_eq!(
+    forwarded(admission).path.as_deref(),
+    Some(Path::new("/root/sub"))
+  );
+  assert!(
+    map.contains_dir(&fid(2)),
+    "a move-self does not forget the node — its rename re-parents it"
+  );
+}
+
 /// A DIRECTORY delete reported as a PARENT dirent (`FAN_DELETE|ONDIR` with the
-/// parent's `dir_fid`, the child name, AND the child's `target_fid`) forgets the
-/// whole child subtree via that target FID — the well-formed counterpart to the
-/// decode gate that makes a targetless one lossy. The deleted directory and its
-/// descendants stop admitting, and the map returns to the pre-child count.
+/// parent's `dir_fid`, the child name, AND the child's `target_fid`) is `ForgetDir`:
+/// it prunes the whole child subtree via that target FID. The deleted directory and
+/// its descendants stop admitting, and the map returns to the pre-child count.
 #[test]
 fn directory_delete_dirent_forgets_the_subtree() {
   let mut map = FidMap::new();
@@ -161,13 +231,13 @@ fn directory_delete_dirent_forgets_the_subtree() {
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
     SeedEntry::child(fid(3), fid(2), OsString::from("child")),
   ]);
-  // /root/sub (fid 2) is deleted: the parent /root (fid 1) reports the dirent with
-  // the child's own FID as `target_fid`.
   let ev = dirent(FAN_DELETE | FAN_ONDIR, fid(1), b"sub", Some(fid(2)));
-  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
-    panic!("an in-root directory delete must admit");
-  };
-  assert_eq!(admitted.path.as_deref(), Some(Path::new("/root/sub")));
+  let admission = classify_one(&mut map, &ev);
+  assert!(matches!(admission, Admission::ForgetDir(_)));
+  assert_eq!(
+    forwarded(admission).path.as_deref(),
+    Some(Path::new("/root/sub"))
+  );
   assert_eq!(
     map.admit(&fid(2)),
     None,
@@ -181,29 +251,17 @@ fn directory_delete_dirent_forgets_the_subtree() {
   assert_eq!(map.dir_count(), 1, "only the root remains");
 }
 
-/// A FILE `FAN_RENAME` with both ends in-root resolves both absolute paths in
-/// one event — the atomic pair, no window. The admitted rename carries only the
-/// two paths (no identity — design §4.9), and a file rename mutates nothing.
+/// A FILE `FAN_RENAME` with both ends in-root resolves both absolute paths in one
+/// event — the atomic pair, no window. It carries only the two paths (no identity —
+/// design §4.9), and a file rename mutates nothing (`seed = None`).
 #[test]
 fn file_rename_resolves_both_ends() {
   let mut map = seeded();
   let generation = map.generation();
-  let ev = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME),
-    dir_fid: None,
-    target_fid: Some(fid(8)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(1),
-      old_name: b"a.txt".to_vec(),
-      new_dir: fid(2),
-      new_name: b"b.txt".to_vec(),
-    }),
-  };
-  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
-    panic!("an in-root rename must admit");
-  };
-  let rename = admitted.rename.expect("rename info");
+  let ev = rename_ev(FAN_RENAME, Some(fid(8)), fid(1), b"a.txt", fid(2), b"b.txt");
+  let admission = classify_one(&mut map, &ev);
+  assert!(matches!(admission, Admission::Rename { seed: None, .. }));
+  let rename = forwarded(admission).rename.expect("rename info");
   assert_eq!(rename.old_path, PathBuf::from("/root/a.txt"));
   assert_eq!(rename.new_path, PathBuf::from("/root/sub/b.txt"));
   assert_eq!(
@@ -213,77 +271,60 @@ fn file_rename_resolves_both_ends() {
   );
 }
 
-/// A rename with BOTH ends outside the root is churn elsewhere on the
-/// superblock and is dropped.
+/// A rename with BOTH ends outside the root is churn elsewhere on the superblock
+/// and is a `ForeignDrop`.
 #[test]
 fn rename_outside_root_is_dropped() {
   let mut map = seeded();
-  let ev = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME),
-    dir_fid: None,
-    target_fid: None,
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(90),
-      old_name: b"x".to_vec(),
-      new_dir: fid(91),
-      new_name: b"y".to_vec(),
-    }),
-  };
-  assert!(matches!(admit_one(&mut map, &ev), Admission::Drop));
+  let ev = rename_ev(FAN_RENAME, None, fid(90), b"x", fid(91), b"y");
+  assert!(matches!(
+    classify_one(&mut map, &ev),
+    Admission::ForeignDrop
+  ));
 }
 
-/// A rename INTO the root (source outside, destination in-root) admits, with
-/// the in-root end fully resolved.
+/// A rename INTO the root (source outside, destination in-root) admits, with the
+/// in-root end fully resolved.
 #[test]
 fn rename_into_root_admits_with_resolved_destination() {
   let mut map = seeded();
-  let ev = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME),
-    dir_fid: None,
-    target_fid: Some(fid(8)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(90),
-      old_name: b"outside".to_vec(),
-      new_dir: fid(2),
-      new_name: b"arrived.txt".to_vec(),
-    }),
-  };
-  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
-    panic!("a rename into the root must admit");
-  };
-  let rename = admitted.rename.expect("rename info");
+  let ev = rename_ev(
+    FAN_RENAME,
+    Some(fid(8)),
+    fid(90),
+    b"outside",
+    fid(2),
+    b"arrived.txt",
+  );
+  let admission = classify_one(&mut map, &ev);
+  assert!(matches!(admission, Admission::Rename { seed: None, .. }));
+  let rename = forwarded(admission).rename.expect("rename info");
   assert_eq!(rename.new_path, PathBuf::from("/root/sub/arrived.txt"));
 }
 
-/// A DIRECTORY moved IN from outside the root (its own FID unknown to the map,
-/// destination parent in-root) returns [`Admission::AdmitAndSeed`]: the moved
-/// directory carries pre-existing descendants the seed walk never saw, so the
-/// reader must walk its subtree in. The request carries ONLY the moved
-/// directory's FID (not a captured path — the reader resolves the current path
-/// through the map at walk time), and the moved directory is already learned AND
-/// marked `pending_walk` (its own later events admit; a `NotFound` at its resolved
-/// path during the walk is an incompleteness, not a benign empty walk).
+/// A DIRECTORY moved IN from outside the root (its own FID unknown, destination
+/// parent in-root) is a `Rename` with `seed = Some(moved)`: the reader must walk its
+/// pre-existing descendants in. The moved directory is already learned AND marked
+/// `pending_walk`, and the seed carries ONLY the FID (the reader resolves its
+/// current path at walk time).
 #[test]
 fn dir_move_in_from_outside_requests_a_subtree_walk() {
   let mut map = seeded();
-  // fid(9) — a directory that lived OUTSIDE the watched root, so it is unknown to
-  // the seeded map — moves under /root/sub as `arrived`.
   assert!(!map.contains_dir(&fid(9)), "the moved dir starts unknown");
-  let ev = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(9)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(90),
-      old_name: b"arrived".to_vec(),
-      new_dir: fid(2),
-      new_name: b"arrived".to_vec(),
-    }),
-  };
-  let Admission::AdmitAndSeed { event, moved_fid } = admit_one(&mut map, &ev) else {
+  let ev = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(9)),
+    fid(90),
+    b"arrived",
+    fid(2),
+    b"arrived",
+  );
+  let admission = classify_one(&mut map, &ev);
+  let Admission::Rename {
+    event,
+    seed: Some(moved_fid),
+  } = admission
+  else {
     panic!("a populated dir moved in from outside must request a subtree walk");
   };
   assert_eq!(
@@ -296,8 +337,6 @@ fn dir_move_in_from_outside_requests_a_subtree_walk() {
     PathBuf::from("/root/sub/arrived"),
     "the forwarded move still carries the destination path"
   );
-  // The moved directory itself is learned as a pending-walk top; the reader will
-  // resolve its CURRENT path through the map at walk time.
   assert_eq!(
     map.pending_walk_target(&fid(9)),
     Some((PathBuf::from("/root/sub/arrived"), true)),
@@ -305,34 +344,30 @@ fn dir_move_in_from_outside_requests_a_subtree_walk() {
   );
 }
 
-/// An IN-ROOT directory rename (the moved directory was ALREADY a known in-root
-/// directory, so its descendants are already mapped) returns a plain
-/// [`Admission::Admit`] — NO subtree walk. The completeness invariant is met by
-/// the parent-relative re-parent, not by a walk.
+/// An IN-ROOT directory rename (the moved directory was ALREADY known, so its
+/// descendants are already mapped) is a `Rename` with `seed = None` — NO walk. The
+/// completeness invariant is met by the parent-relative re-parent.
 #[test]
 fn in_root_dir_rename_requests_no_walk() {
   let mut map = FidMap::new();
   map.seed([
     SeedEntry::root(fid(1), Path::new("/root")),
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
-    // A second in-root parent to receive the moved directory.
     SeedEntry::child(fid(4), fid(1), OsString::from("dest")),
   ]);
-  let ev = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    // The moved directory fid(2) is already in-root (known) — an in-root rename.
-    target_fid: Some(fid(2)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(1),
-      old_name: b"sub".to_vec(),
-      new_dir: fid(4),
-      new_name: b"sub".to_vec(),
-    }),
-  };
+  let ev = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(2)),
+    fid(1),
+    b"sub",
+    fid(4),
+    b"sub",
+  );
   assert!(
-    matches!(admit_one(&mut map, &ev), Admission::Admit(_)),
+    matches!(
+      classify_one(&mut map, &ev),
+      Admission::Rename { seed: None, .. }
+    ),
     "an in-root rename of an already-mapped directory needs no subtree walk"
   );
   assert_eq!(
@@ -342,116 +377,87 @@ fn in_root_dir_rename_requests_no_walk() {
   );
 }
 
-/// A directory moved OUT then straight back IN re-walks: the move-out forgets it
-/// (the fresh-identity direction), so on the way back it is UNKNOWN again — a
-/// move-in, which re-requests the subtree walk. Its descendants are re-seeded
-/// with fresh identities, never reusing the departed ones (forget prunes the id,
-/// so a reappearance mints anew — the conservative direction).
+/// A directory moved OUT then straight back IN re-walks: the move-out forgets it, so
+/// on the way back it is UNKNOWN again — a move-in, which re-requests the walk.
 #[test]
 fn dir_move_out_then_back_in_re_walks() {
   let mut map = seeded();
-  // Move fid(2) (in-root /root/sub) OUT to an out-of-root parent: forgotten.
-  let out = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(2)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(1),
-      old_name: b"sub".to_vec(),
-      new_dir: fid(90),
-      new_name: b"sub".to_vec(),
-    }),
-  };
-  assert!(matches!(admit_one(&mut map, &out), Admission::Admit(_)));
+  let out = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(2)),
+    fid(1),
+    b"sub",
+    fid(90),
+    b"sub",
+  );
+  assert!(matches!(
+    classify_one(&mut map, &out),
+    Admission::Rename { seed: None, .. }
+  ));
   assert!(!map.contains_dir(&fid(2)), "the moved-out dir is forgotten");
 
-  // Move it back IN under /root (the root fid(1) is in-root): now unknown, so it
-  // is a move-in and re-requests the walk.
-  let back = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(2)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(90),
-      old_name: b"sub".to_vec(),
-      new_dir: fid(1),
-      new_name: b"sub".to_vec(),
-    }),
-  };
+  let back = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(2)),
+    fid(90),
+    b"sub",
+    fid(1),
+    b"sub",
+  );
   assert!(
-    matches!(admit_one(&mut map, &back), Admission::AdmitAndSeed { .. }),
+    matches!(
+      classify_one(&mut map, &back),
+      Admission::Rename { seed: Some(_), .. }
+    ),
     "a move back in from outside re-requests the subtree walk"
   );
 }
 
 /// A populated directory moved IN to /root/a then IMMEDIATELY renamed in-root to
-/// /root/b in the SAME batch, driven through the admit seam. The first admit learns
-/// the moved dir pending (its deferred walk not yet run); the second admit is an
-/// in-root re-parent (the dir is now KNOWN) that must KEEP it pending and re-parent
-/// it, so the still-owed walk resolves the CURRENT path /root/b — NOT the stale
-/// /root/a — and maps the descendants. Without the pending flag and current-path
-/// resolution, the walk would see the already-vanished /root/a as an empty success
-/// and the second rename would see a known FID and skip the walk, leaving the
-/// descendants blind forever.
+/// /root/b in the SAME batch, driven through the classify seam. The first learns the
+/// moved dir pending; the second is an in-root re-parent that KEEPS it pending and
+/// re-parents it, so the still-owed walk resolves the CURRENT path /root/b.
 #[test]
 fn burst_move_in_then_in_root_rename_keeps_walk_pending_at_current_path() {
   let mut map = FidMap::new();
-  // /root with two in-root destination parents a and b.
   map.seed([
     SeedEntry::root(fid(1), Path::new("/root")),
     SeedEntry::child(fid(2), fid(1), OsString::from("a")),
     SeedEntry::child(fid(3), fid(1), OsString::from("b")),
   ]);
-  // Event 1: populated dir fid(9) moved IN from outside under /root/a.
-  let move_in = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(9)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(90),
-      old_name: b"moved".to_vec(),
-      new_dir: fid(2),
-      new_name: b"moved".to_vec(),
-    }),
-  };
-  assert!(
-    matches!(
-      admit_one(&mut map, &move_in),
-      Admission::AdmitAndSeed { .. }
-    ),
-    "the move-in requests a subtree walk"
+  let move_in = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(9)),
+    fid(90),
+    b"moved",
+    fid(2),
+    b"moved",
   );
+  assert!(matches!(
+    classify_one(&mut map, &move_in),
+    Admission::Rename { seed: Some(_), .. }
+  ));
   assert_eq!(
     map.pending_walk_target(&fid(9)),
     Some((PathBuf::from("/root/a/moved"), true)),
     "after event 1 the moved dir is pending at /root/a"
   );
 
-  // Event 2 (SAME batch, BEFORE the deferred walk runs): /root/a/moved renamed
-  // in-root to /root/b/moved. The dir is now KNOWN, so this is an in-root
-  // re-parent — a plain Admit, no second walk requested.
-  let in_root = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(9)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(2),
-      old_name: b"moved".to_vec(),
-      new_dir: fid(3),
-      new_name: b"moved".to_vec(),
-    }),
-  };
+  let in_root = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(9)),
+    fid(2),
+    b"moved",
+    fid(3),
+    b"moved",
+  );
   assert!(
-    matches!(admit_one(&mut map, &in_root), Admission::Admit(_)),
+    matches!(
+      classify_one(&mut map, &in_root),
+      Admission::Rename { seed: None, .. }
+    ),
     "the in-root re-parent of the now-known dir needs no second walk"
   );
-  // The still-owed walk (requested by event 1) now resolves the CURRENT path —
-  // the re-parent moved it to /root/b, and the flag stayed set so the reader will
-  // walk it there rather than skip it.
   assert_eq!(
     map.pending_walk_target(&fid(9)),
     Some((PathBuf::from("/root/b/moved"), true)),
@@ -460,75 +466,64 @@ fn burst_move_in_then_in_root_rename_keeps_walk_pending_at_current_path() {
   map.assert_adjacency();
 }
 
-/// A FILE moved in from outside (non-directory target) never requests a subtree
-/// walk — only directories carry descendants. The move admits plainly with the
-/// destination path resolved.
+/// A FILE moved in from outside (non-directory target, non-`ONDIR`) never requests a
+/// subtree walk — only directories carry descendants.
 #[test]
 fn file_move_in_requests_no_walk() {
   let mut map = seeded();
-  let ev = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME),
-    dir_fid: None,
-    target_fid: Some(fid(9)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(90),
-      old_name: b"f.txt".to_vec(),
-      new_dir: fid(2),
-      new_name: b"f.txt".to_vec(),
-    }),
-  };
+  let ev = rename_ev(
+    FAN_RENAME,
+    Some(fid(9)),
+    fid(90),
+    b"f.txt",
+    fid(2),
+    b"f.txt",
+  );
   assert!(
-    matches!(admit_one(&mut map, &ev), Admission::Admit(_)),
+    matches!(
+      classify_one(&mut map, &ev),
+      Admission::Rename { seed: None, .. }
+    ),
     "a file move-in carries no descendants, so no walk"
   );
 }
 
-/// A directory `FAN_RENAME` within the root re-parents the moved directory's
-/// whole subtree: after the rename, a pre-seeded descendant's own event
-/// resolves under the NEW path — the parent-relative map, not a stale absolute
-/// one. (`/root/sub` renamed to `/root/moved`; a child under it follows.)
+/// A directory `FAN_RENAME` within the root re-parents the moved directory's whole
+/// subtree: after the rename, a pre-seeded descendant's own event resolves under the
+/// NEW path — the parent-relative map, not a stale absolute one.
 #[test]
 fn dir_rename_reparents_descendants() {
   let mut map = FidMap::new();
-  // /root, /root/sub (fid 2), /root/sub/child (fid 3, pre-seeded).
   map.seed([
     SeedEntry::root(fid(1), Path::new("/root")),
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
     SeedEntry::child(fid(3), fid(2), OsString::from("child")),
   ]);
+  let rename = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(2)),
+    fid(1),
+    b"sub",
+    fid(1),
+    b"moved",
+  );
+  assert!(matches!(
+    classify_one(&mut map, &rename),
+    Admission::Rename { seed: None, .. }
+  ));
 
-  // Rename the directory fid(2) from /root/sub to /root/moved (same parent,
-  // new name). The moved object's own FID is target_fid; both ends in-root.
-  let rename = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(2)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(1),
-      old_name: b"sub".to_vec(),
-      new_dir: fid(1),
-      new_name: b"moved".to_vec(),
-    }),
-  };
-  assert!(matches!(admit_one(&mut map, &rename), Admission::Admit(_)));
-
-  // A later modify on the PRE-SEEDED child resolves under the new parent path.
   let child_event = dirent(FAN_MODIFY, fid(3), b"leaf.txt", None);
-  let Admission::Admit(admitted) = admit_one(&mut map, &child_event) else {
-    panic!("the descendant must still admit after the parent rename");
-  };
   assert_eq!(
-    admitted.path.as_deref(),
+    forwarded(classify_one(&mut map, &child_event))
+      .path
+      .as_deref(),
     Some(Path::new("/root/moved/child/leaf.txt")),
     "the descendant resolves under the renamed parent, not the stale path"
   );
 }
 
-/// An in-root directory rename RE-PARENTS the moved directory in place (the map
-/// keeps its membership node, so its descendants follow via the parent link) and
-/// resolves the pair's paths. No identity rides the rename (design §4.9).
+/// An in-root directory rename RE-PARENTS the moved directory in place and resolves
+/// the pair's paths. No identity rides the rename (design §4.9).
 #[test]
 fn dir_rename_in_root_reparents_and_keeps_membership() {
   let mut map = FidMap::new();
@@ -537,27 +532,19 @@ fn dir_rename_in_root_reparents_and_keeps_membership() {
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
     SeedEntry::child(fid(3), fid(2), OsString::from("child")),
   ]);
-
-  let rename = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(2)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(1),
-      old_name: b"sub".to_vec(),
-      new_dir: fid(1),
-      new_name: b"moved".to_vec(),
-    }),
-  };
-  let Admission::Admit(admitted) = admit_one(&mut map, &rename) else {
-    panic!("an in-root directory rename must admit");
-  };
-  let rename = admitted.rename.expect("rename info");
+  let rename = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(2)),
+    fid(1),
+    b"sub",
+    fid(1),
+    b"moved",
+  );
+  let admission = classify_one(&mut map, &rename);
+  assert!(matches!(admission, Admission::Rename { seed: None, .. }));
+  let rename = forwarded(admission).rename.expect("rename info");
   assert_eq!(rename.old_path, PathBuf::from("/root/sub"));
   assert_eq!(rename.new_path, PathBuf::from("/root/moved"));
-  // The moved directory keeps its membership node under the new name, and its
-  // pre-seeded child resolves under the re-parented path — no per-node rewrite.
   assert_eq!(map.admit(&fid(2)), Some(PathBuf::from("/root/moved")));
   assert_eq!(
     map.admit(&fid(3)),
@@ -571,9 +558,8 @@ fn dir_rename_in_root_reparents_and_keeps_membership() {
   );
 }
 
-/// A directory moved OUT of the root is FORGOTTEN (it departed the map), bounding
-/// the map at the live directory count. A later move back re-enters through its
-/// own move-in event — the map holds only membership.
+/// A directory moved OUT of the root is FORGOTTEN (it departed), bounding the map at
+/// the live directory count.
 #[test]
 fn dir_move_out_forgets_the_directory() {
   let mut map = FidMap::new();
@@ -581,20 +567,18 @@ fn dir_move_out_forgets_the_directory() {
     SeedEntry::root(fid(1), Path::new("/root")),
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
   ]);
-
-  let rename = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(2)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(1),
-      old_name: b"sub".to_vec(),
-      new_dir: fid(90),
-      new_name: b"sub".to_vec(),
-    }),
-  };
-  assert!(matches!(admit_one(&mut map, &rename), Admission::Admit(_)));
+  let rename = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(2)),
+    fid(1),
+    b"sub",
+    fid(90),
+    b"sub",
+  );
+  assert!(matches!(
+    classify_one(&mut map, &rename),
+    Admission::Rename { seed: None, .. }
+  ));
   assert_eq!(
     map.dir_count(),
     1,
@@ -604,8 +588,7 @@ fn dir_move_out_forgets_the_directory() {
 }
 
 /// A directory moved OUT of the root stops admitting its descendants: after the
-/// move-out, a pre-seeded child's event does NOT admit — no stale in-root path
-/// is emitted for out-of-root activity.
+/// move-out, a pre-seeded child's event no longer admits.
 #[test]
 fn dir_move_out_of_root_stops_descendant_admission() {
   let mut map = FidMap::new();
@@ -614,71 +597,471 @@ fn dir_move_out_of_root_stops_descendant_admission() {
     SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
     SeedEntry::child(fid(3), fid(2), OsString::from("child")),
   ]);
-
-  // Move /root/sub OUT to an out-of-root directory (fid 90, not in the map):
-  // the destination end does not admit, so only the old admission is dropped.
-  let rename = RawFanotifyEvent {
-    mask: FanMask::new(FAN_RENAME | FAN_ONDIR),
-    dir_fid: None,
-    target_fid: Some(fid(2)),
-    name: None,
-    rename: Some(RenameInfo {
-      old_dir: fid(1),
-      old_name: b"sub".to_vec(),
-      new_dir: fid(90),
-      new_name: b"sub".to_vec(),
-    }),
-  };
-  // The rename still admits (the old end is in-root — a move across the
-  // boundary is the tree's business), but the map self-maintenance detaches
-  // the subtree.
-  assert!(matches!(admit_one(&mut map, &rename), Admission::Admit(_)));
-
-  // A later event on the pre-seeded descendant is now outside the root.
+  let rename = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(2)),
+    fid(1),
+    b"sub",
+    fid(90),
+    b"sub",
+  );
+  assert!(matches!(
+    classify_one(&mut map, &rename),
+    Admission::Rename { seed: None, .. }
+  ));
   let child_event = dirent(FAN_MODIFY, fid(3), b"leaf.txt", None);
   assert!(
-    matches!(admit_one(&mut map, &child_event), Admission::Drop),
+    matches!(classify_one(&mut map, &child_event), Admission::ForeignDrop),
     "a descendant of a moved-out directory no longer admits"
   );
 }
 
-/// An attrib event on a file in an admitted directory resolves its path — the
-/// whole admitted form (no identity, design §4.9).
+/// An attrib event on a file in an admitted directory forwards its path — the whole
+/// admitted form (no identity, design §4.9).
 #[test]
 fn attrib_resolves_its_path() {
   let mut map = seeded();
   let ev = dirent(FAN_ATTRIB, fid(1), b"meta.txt", None);
-  let Admission::Admit(admitted) = admit_one(&mut map, &ev) else {
-    panic!("must admit");
-  };
-  assert_eq!(admitted.path.as_deref(), Some(Path::new("/root/meta.txt")));
+  let admission = classify_one(&mut map, &ev);
+  assert!(matches!(admission, Admission::Forward(_)));
+  assert_eq!(
+    forwarded(admission).path.as_deref(),
+    Some(Path::new("/root/meta.txt"))
+  );
+}
+
+/// The classification totality table — the single source of truth, exercised across
+/// every `(mask, field-presence, map-state)` shape including EVERY prior finding.
+/// Each row asserts the exact action, and a closing cartesian sweep proves the
+/// classifier is TOTAL (returns for every combination, no silent fall-through and no
+/// panic). The action's required fields ARE the validation: a missing field is
+/// `Lossy` here, not in a separate decode matrix.
+mod classification_totality {
+  use super::*;
+
+  /// The variant identity a row expects — `Rename` splits on whether a move-in walk
+  /// is owed (`seed`), the discriminator the reader keys the deferred walk on.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  enum Kind {
+    Forward,
+    LearnDir,
+    ForgetDir,
+    Rename,
+    RenameSeed,
+    RootDeath,
+    ForeignDrop,
+    Lossy,
+  }
+
+  fn kind(admission: &Admission) -> Kind {
+    match admission {
+      Admission::Forward(_) => Kind::Forward,
+      Admission::LearnDir(_) => Kind::LearnDir,
+      Admission::ForgetDir(_) => Kind::ForgetDir,
+      Admission::Rename { seed: None, .. } => Kind::Rename,
+      Admission::Rename { seed: Some(_), .. } => Kind::RenameSeed,
+      Admission::RootDeath(_) => Kind::RootDeath,
+      Admission::ForeignDrop => Kind::ForeignDrop,
+      Admission::Lossy => Kind::Lossy,
+    }
+  }
+
+  /// A fresh map per row: `/root` (fid 1, the root anchor), `/root/sub` (fid 2, a
+  /// known non-root directory), `/root/sub/child` (fid 3). fid 99 is unknown
+  /// (outside the root). Rows build their own map when they need a different shape.
+  fn deep_map() -> FidMap {
+    let mut map = FidMap::new();
+    map.seed([
+      SeedEntry::root(fid(1), Path::new("/root")),
+      SeedEntry::child(fid(2), fid(1), OsString::from("sub")),
+      SeedEntry::child(fid(3), fid(2), OsString::from("child")),
+    ]);
+    map
+  }
+
+  fn assert_row(label: &str, event: RawFanotifyEvent, expected: Kind) {
+    let mut map = deep_map();
+    let got = kind(&classify_one(&mut map, &event));
+    assert_eq!(
+      got, expected,
+      "row `{label}`: expected {expected:?}, got {got:?}"
+    );
+  }
+
+  /// Every non-rename dirent + self-event shape → its exact action, one fresh map
+  /// per row.
+  #[test]
+  fn dirent_and_self_event_rows() {
+    // In-root file dirents (no tree mutation) → Forward.
+    assert_row(
+      "file create",
+      dirent(FAN_CREATE, fid(2), b"f", Some(fid(7))),
+      Kind::Forward,
+    );
+    assert_row(
+      "file delete",
+      dirent(FAN_DELETE, fid(2), b"f", None),
+      Kind::Forward,
+    );
+    assert_row(
+      "file modify",
+      dirent(FAN_MODIFY, fid(2), b"f", None),
+      Kind::Forward,
+    );
+    assert_row(
+      "file attrib",
+      dirent(FAN_ATTRIB, fid(2), b"f", None),
+      Kind::Forward,
+    );
+    // A non-structural ONDIR modify/attrib mutates no tree node → Forward, no target.
+    assert_row(
+      "dir modify",
+      dirent(FAN_MODIFY | FAN_ONDIR, fid(2), b"d", None),
+      Kind::Forward,
+    );
+    assert_row(
+      "dir attrib",
+      dirent(FAN_ATTRIB | FAN_ONDIR, fid(2), b"d", None),
+      Kind::Forward,
+    );
+
+    // Directory create/delete WITH the child FID → LearnDir / ForgetDir.
+    assert_row(
+      "dir create + target",
+      dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"new", Some(fid(8))),
+      Kind::LearnDir,
+    );
+    assert_row(
+      "dir delete dirent + target",
+      dirent(FAN_DELETE | FAN_ONDIR, fid(2), b"child", Some(fid(3))),
+      Kind::ForgetDir,
+    );
+    // A named MOVE_SELF|ONDIR dirent (a dir move reported by the parent) forgets the
+    // named child via its target FID → ForgetDir.
+    assert_row(
+      "dir move dirent + target",
+      dirent(FAN_MOVE_SELF | FAN_ONDIR, fid(2), b"child", Some(fid(3))),
+      Kind::ForgetDir,
+    );
+
+    // R23/R24 relocation: a directory mutation MISSING its child FID, in-root → Lossy
+    // (the action needs the field). A FILE mutation needs none → Forward.
+    assert_row(
+      "dir create no target (in-root)",
+      dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"new", None),
+      Kind::Lossy,
+    );
+    assert_row(
+      "dir delete no target (in-root)",
+      dirent(FAN_DELETE | FAN_ONDIR, fid(2), b"child", None),
+      Kind::Lossy,
+    );
+    assert_row(
+      "file delete no target",
+      dirent(FAN_DELETE, fid(2), b"f", None),
+      Kind::Forward,
+    );
+
+    // A dir mutation missing its child FID whose PARENT is OUT of root → ForeignDrop
+    // (membership fails first — the firehose filter, never a spurious reseed).
+    assert_row(
+      "dir create no target (out-of-root)",
+      dirent(FAN_CREATE | FAN_ONDIR, fid(99), b"new", None),
+      Kind::ForeignDrop,
+    );
+
+    // R23 name gate: a named dirent whose name is absent/empty (decode folds empty →
+    // None) → Lossy in-root, ForeignDrop out-of-root.
+    assert_row(
+      "create empty name (in-root)",
+      RawFanotifyEvent {
+        mask: FanMask::new(FAN_CREATE),
+        dir_fid: Some(fid(2)),
+        target_fid: Some(fid(7)),
+        name: None,
+        rename: None,
+      },
+      Kind::Lossy,
+    );
+    assert_row(
+      "modify no name (out-of-root)",
+      RawFanotifyEvent {
+        mask: FanMask::new(FAN_MODIFY),
+        dir_fid: Some(fid(99)),
+        target_fid: None,
+        name: None,
+        rename: None,
+      },
+      Kind::ForeignDrop,
+    );
+
+    // The firehose: an in-root unknown directory FID, and a FID-only non-self event.
+    assert_row(
+      "unknown dir fid",
+      dirent(FAN_MODIFY, fid(99), b"x", None),
+      Kind::ForeignDrop,
+    );
+    assert_row(
+      "fid-only non-self attrib",
+      RawFanotifyEvent {
+        mask: FanMask::new(FAN_ATTRIB),
+        dir_fid: None,
+        target_fid: Some(fid(99)),
+        name: None,
+        rename: None,
+      },
+      Kind::ForeignDrop,
+    );
+
+    // Self-events on a KNOWN non-root directory: delete_self forgets (ForgetDir),
+    // move_self is a self-rescan (Forward). Both DFID and FID-only shapes.
+    assert_row(
+      "subdir delete_self (dfid)",
+      self_dfid(FAN_DELETE_SELF | FAN_ONDIR, fid(2)),
+      Kind::ForgetDir,
+    );
+    assert_row(
+      "subdir delete_self (fid-only)",
+      self_fid_only(FAN_DELETE_SELF | FAN_ONDIR, fid(2)),
+      Kind::ForgetDir,
+    );
+    assert_row(
+      "subdir move_self (dfid)",
+      self_dfid(FAN_MOVE_SELF | FAN_ONDIR, fid(2)),
+      Kind::Forward,
+    );
+    assert_row(
+      "subdir move_self (fid-only)",
+      self_fid_only(FAN_MOVE_SELF | FAN_ONDIR, fid(2)),
+      Kind::Forward,
+    );
+
+    // A self-event on an UNKNOWN (foreign) object → ForeignDrop, never a root death.
+    assert_row(
+      "foreign delete_self (dfid)",
+      self_dfid(FAN_DELETE_SELF | FAN_ONDIR, fid(99)),
+      Kind::ForeignDrop,
+    );
+    assert_row(
+      "foreign delete_self (fid-only)",
+      self_fid_only(FAN_DELETE_SELF, fid(99)),
+      Kind::ForeignDrop,
+    );
+    // A self-event with NO fid at all → ForeignDrop (unaddressable noise).
+    assert_row(
+      "self-event no fid",
+      RawFanotifyEvent {
+        mask: FanMask::new(FAN_DELETE_SELF),
+        dir_fid: None,
+        target_fid: None,
+        name: None,
+        rename: None,
+      },
+      Kind::ForeignDrop,
+    );
+  }
+
+  /// The R25 closure at the classification layer: a root self-event is `RootDeath` in
+  /// BOTH the `DFID` shape AND the `FID`-only shape (dir_fid = None) — the latter is
+  /// what the old admission dropped, leaving the root's death to the liveness tick.
+  /// The forwarded event carries the ROOT's own path, so compile lowers it to the
+  /// death lifecycle even with the tick disabled.
+  #[test]
+  fn root_self_event_is_root_death_in_both_shapes() {
+    for mask in [
+      FAN_DELETE_SELF | FAN_ONDIR,
+      FAN_MOVE_SELF | FAN_ONDIR,
+      FAN_DELETE_SELF | FAN_ATTRIB,
+    ] {
+      let mut map = deep_map();
+      let dfid = classify_one(&mut map, &self_dfid(mask, fid(1)));
+      assert!(
+        matches!(dfid, Admission::RootDeath(_)),
+        "DFID root self-event {mask:#x}"
+      );
+      assert_eq!(
+        forwarded(dfid).path.as_deref(),
+        Some(Path::new("/root")),
+        "RootDeath carries the root's own path for the death lowering"
+      );
+
+      let mut map = deep_map();
+      let fid_only = classify_one(&mut map, &self_fid_only(mask, fid(1)));
+      assert!(
+        matches!(fid_only, Admission::RootDeath(_)),
+        "FID-only root self-event {mask:#x} — the R25 shape — is RootDeath, not a drop"
+      );
+      assert_eq!(
+        forwarded(fid_only).path.as_deref(),
+        Some(Path::new("/root"))
+      );
+    }
+  }
+
+  /// Every rename shape → its exact action, keyed on which ends are in-root and
+  /// whether the moved dir is already known (the move flavor).
+  #[test]
+  fn rename_rows() {
+    // File renames (non-ONDIR) never need a target: both-in, into-root, out-of-root.
+    assert_row(
+      "file rename both-in",
+      rename_ev(FAN_RENAME, Some(fid(7)), fid(1), b"a", fid(2), b"b"),
+      Kind::Rename,
+    );
+    assert_row(
+      "file rename into-root (no target)",
+      rename_ev(FAN_RENAME, None, fid(99), b"a", fid(2), b"b"),
+      Kind::Rename,
+    );
+    assert_row(
+      "rename both-out",
+      rename_ev(FAN_RENAME, None, fid(90), b"a", fid(91), b"b"),
+      Kind::ForeignDrop,
+    );
+
+    // A directory rename WITH its target FID: in-root re-parent (known) → Rename;
+    // move-in (unknown dest-in-root) → RenameSeed; move-out (dest-out) → Rename.
+    assert_row(
+      "dir rename in-root reparent",
+      rename_ev(
+        FAN_RENAME | FAN_ONDIR,
+        Some(fid(2)),
+        fid(1),
+        b"sub",
+        fid(1),
+        b"moved",
+      ),
+      Kind::Rename,
+    );
+    assert_row(
+      "dir move-in from outside",
+      rename_ev(
+        FAN_RENAME | FAN_ONDIR,
+        Some(fid(9)),
+        fid(90),
+        b"in",
+        fid(1),
+        b"in",
+      ),
+      Kind::RenameSeed,
+    );
+    assert_row(
+      "dir move-out of root",
+      rename_ev(
+        FAN_RENAME | FAN_ONDIR,
+        Some(fid(2)),
+        fid(1),
+        b"sub",
+        fid(90),
+        b"sub",
+      ),
+      Kind::Rename,
+    );
+
+    // R24 relocation: a targetless ONDIR rename is Lossy for EVERY in-root move shape
+    // (the action needs the moved FID), but ForeignDrop when both ends are outside.
+    for (label, old_dir, new_dir) in [
+      ("targetless ondir reparent", fid(1), fid(1)),
+      ("targetless ondir move-out", fid(1), fid(90)),
+      ("targetless ondir move-in", fid(90), fid(1)),
+    ] {
+      assert_row(
+        label,
+        rename_ev(FAN_RENAME | FAN_ONDIR, None, old_dir, b"x", new_dir, b"x"),
+        Kind::Lossy,
+      );
+    }
+    assert_row(
+      "targetless ondir both-out",
+      rename_ev(FAN_RENAME | FAN_ONDIR, None, fid(90), b"x", fid(91), b"x"),
+      Kind::ForeignDrop,
+    );
+  }
+
+  /// TOTALITY: the classifier returns for EVERY combination of a mask (over the
+  /// backend's vocabulary), each field present-or-absent, and each map-state — no
+  /// combination panics or falls through. The type system guarantees an `Admission`
+  /// is returned; this sweep proves no internal `unwrap`/`expect` trips on any shape.
+  #[test]
+  fn every_combination_classifies_without_panic() {
+    let masks = [
+      FAN_CREATE,
+      FAN_DELETE,
+      FAN_MODIFY,
+      FAN_ATTRIB,
+      FAN_CREATE | FAN_ONDIR,
+      FAN_DELETE | FAN_ONDIR,
+      FAN_DELETE_SELF,
+      FAN_MOVE_SELF,
+      FAN_DELETE_SELF | FAN_ONDIR,
+      FAN_MOVE_SELF | FAN_ONDIR,
+      FAN_DELETE_SELF | FAN_ATTRIB,
+      FAN_RENAME,
+      FAN_RENAME | FAN_ONDIR,
+    ];
+    // Each candidate FID is drawn from {root anchor, known non-root, unknown} so the
+    // sweep spans every map-state the classifier branches on.
+    let fids = [Some(fid(1)), Some(fid(2)), Some(fid(99)), None];
+    let names: [Option<&[u8]>; 2] = [Some(b"n".as_slice()), None];
+    let mut classified = 0u64;
+    for &mask in &masks {
+      for dir in &fids {
+        for target in &fids {
+          for &name in &names {
+            for rename in [false, true] {
+              let mut map = deep_map();
+              let event = RawFanotifyEvent {
+                mask: FanMask::new(mask),
+                dir_fid: dir.clone(),
+                target_fid: target.clone(),
+                name: name.map(<[u8]>::to_vec),
+                rename: rename.then(|| RenameInfo {
+                  old_dir: fid(1),
+                  old_name: b"o".to_vec(),
+                  new_dir: fid(2),
+                  new_name: b"n".to_vec(),
+                }),
+              };
+              // The call itself is the totality assertion: it must return one action,
+              // never panic. `kind` additionally proves the result is a known variant.
+              let _ = kind(&classify_one(&mut map, &event));
+              classified += 1;
+            }
+          }
+        }
+      }
+    }
+    assert_eq!(
+      classified,
+      masks.len() as u64 * 4 * 4 * 2 * 2,
+      "every mask × dir × target × name × rename combination was classified"
+    );
+  }
 }
 
 /// The batch admission memo (design §4.9): the reader shares ONE [`MemoBatch`]
-/// across a read buffer, so a second event under an already-resolved directory
-/// hits the cache, while a map MUTATION between two events bumps the generation
-/// and forces the second to miss — the generation-tagged soundness argument.
+/// across a read buffer, so a second event under an already-resolved directory hits
+/// the cache, while a map MUTATION between two events bumps the generation and forces
+/// the second to miss — the generation-tagged soundness argument.
 mod batch_memo {
   use super::*;
 
-  /// Two events under the SAME directory in one batch: the first resolves the
-  /// directory against the map (a miss that fills the cache), the second is served
-  /// from the memo (a hit) — the rename-storm win.
+  /// Two events under the SAME directory in one batch: the first resolves against the
+  /// map (a miss that fills the cache), the second is served from the memo (a hit).
   #[test]
   fn second_event_under_same_dir_hits() {
     let mut map = seeded();
     let mut memo = MemoBatch::new();
-    // Two file modifies under /root/sub (dir fid 2), no mutation between them.
     let a = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
     let b = dirent(FAN_MODIFY, fid(2), b"b.txt", None);
     assert!(matches!(
-      admit(&mut map, &a, &mut memo),
-      Admission::Admit(_)
+      classify(&mut map, &a, &mut memo),
+      Admission::Forward(_)
     ));
     assert_eq!((memo.hits, memo.misses), (0, 1), "the first is a cold miss");
     assert!(matches!(
-      admit(&mut map, &b, &mut memo),
-      Admission::Admit(_)
+      classify(&mut map, &b, &mut memo),
+      Admission::Forward(_)
     ));
     assert_eq!(
       (memo.hits, memo.misses),
@@ -688,43 +1071,33 @@ mod batch_memo {
   }
 
   /// A mutation between two events under the same directory (a `learn` of a new
-  /// child) bumps the map generation, so a lookup AFTER the mutation finds its
-  /// pre-mutation tag stale and re-resolves — a miss. The memo can never serve a
-  /// path the map mutated out from under it.
-  ///
-  /// The ordering within one `admit` matters: the directory lookup runs BEFORE any
-  /// learn/forget the event performs, so the learning event itself still HITS its
-  /// directory (its entry was tagged current at lookup time); only the NEXT event's
-  /// lookup sees the post-learn generation and misses.
+  /// child) bumps the generation, so a lookup AFTER it re-resolves — a miss. The
+  /// learning event itself still HITS its directory (the lookup precedes its
+  /// mutation).
   #[test]
   fn a_learn_between_events_invalidates_the_memo() {
     let mut map = seeded();
     let mut memo = MemoBatch::new();
-    // Event 1: a file modify under /root/sub — a cold miss that fills dir fid 2.
     let modify = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
     assert!(matches!(
-      admit(&mut map, &modify, &mut memo),
-      Admission::Admit(_)
+      classify(&mut map, &modify, &mut memo),
+      Admission::Forward(_)
     ));
     assert_eq!((memo.hits, memo.misses), (0, 1));
-    // Event 2: a DIRECTORY create under /root/sub. Its dir-fid-2 lookup runs first
-    // (a HIT — still current), THEN the learn bumps the generation.
     let mkdir = dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"newdir", Some(fid(3)));
     assert!(matches!(
-      admit(&mut map, &mkdir, &mut memo),
-      Admission::Admit(_)
+      classify(&mut map, &mkdir, &mut memo),
+      Admission::LearnDir(_)
     ));
     assert_eq!(
       (memo.hits, memo.misses),
       (1, 1),
       "the learning event still hits its directory — the lookup precedes its mutation"
     );
-    // Event 3: another modify under /root/sub. Its memo entry was tagged BEFORE the
-    // learn, so the stale generation forces a re-resolve — a miss, not a hit.
     let modify2 = dirent(FAN_MODIFY, fid(2), b"b.txt", None);
     assert!(matches!(
-      admit(&mut map, &modify2, &mut memo),
-      Admission::Admit(_)
+      classify(&mut map, &modify2, &mut memo),
+      Admission::Forward(_)
     ));
     assert_eq!(
       (memo.hits, memo.misses),
@@ -733,8 +1106,8 @@ mod batch_memo {
     );
   }
 
-  /// A `forget` (rename-out / delete of a directory) likewise invalidates the memo
-  /// via the generation bump: a later event that would otherwise hit misses.
+  /// A `forget` (delete of a directory) likewise invalidates the memo via the
+  /// generation bump: a later event that would otherwise hit misses.
   #[test]
   fn a_forget_invalidates_the_memo() {
     let mut map = FidMap::new();
@@ -744,52 +1117,41 @@ mod batch_memo {
       SeedEntry::child(fid(3), fid(1), OsString::from("b")),
     ]);
     let mut memo = MemoBatch::new();
-    // Fill the memo for dir fid 1 (the root) via an event under it.
     let under_root = dirent(FAN_MODIFY, fid(1), b"x.txt", None);
     assert!(matches!(
-      admit(&mut map, &under_root, &mut memo),
-      Admission::Admit(_)
+      classify(&mut map, &under_root, &mut memo),
+      Admission::Forward(_)
     ));
     // Delete directory /root/b (a DELETE_SELF forgets it) — a mutation.
-    let delete_b = RawFanotifyEvent {
-      mask: FanMask::new(super::FAN_DELETE_SELF | FAN_ONDIR),
-      dir_fid: Some(fid(3)),
-      target_fid: None,
-      name: None,
-      rename: None,
-    };
+    let delete_b = self_dfid(FAN_DELETE_SELF | FAN_ONDIR, fid(3));
     assert!(matches!(
-      admit(&mut map, &delete_b, &mut memo),
-      Admission::Admit(_)
+      classify(&mut map, &delete_b, &mut memo),
+      Admission::ForgetDir(_)
     ));
-    // Another event under the root: the pre-forget memo entry is stale → miss.
     let under_root2 = dirent(FAN_MODIFY, fid(1), b"y.txt", None);
     assert!(matches!(
-      admit(&mut map, &under_root2, &mut memo),
-      Admission::Admit(_)
+      classify(&mut map, &under_root2, &mut memo),
+      Admission::Forward(_)
     ));
     assert_eq!(memo.hits, 0, "the forget invalidated the root's memo entry");
   }
 
-  /// A fresh memo (a new read batch) starts empty — the reader builds one per
-  /// buffer, so the memo is cleared at batch end by construction and a resolution
-  /// in one batch never leaks into the next.
+  /// A fresh memo (a new read batch) starts empty — the reader builds one per buffer,
+  /// so a resolution in one batch never leaks into the next.
   #[test]
   fn a_fresh_batch_memo_starts_cold() {
     let mut map = seeded();
     let modify = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
-    // Batch 1 resolves dir fid 2 (a miss that fills batch 1's memo).
     let mut first = MemoBatch::new();
     assert!(matches!(
-      admit(&mut map, &modify, &mut first),
-      Admission::Admit(_)
+      classify(&mut map, &modify, &mut first),
+      Admission::Forward(_)
     ));
     assert_eq!((first.hits, first.misses), (0, 1));
-    // Batch 2 (a new buffer) starts cold: the same directory misses again.
     let mut second = MemoBatch::new();
     assert!(matches!(
-      admit(&mut map, &modify, &mut second),
-      Admission::Admit(_)
+      classify(&mut map, &modify, &mut second),
+      Admission::Forward(_)
     ));
     assert_eq!(
       (second.hits, second.misses),

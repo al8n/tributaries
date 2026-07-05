@@ -138,126 +138,230 @@ impl MemoBatch {
   }
 }
 
-/// The result of admitting one decoded event against the map.
+/// The single ACTION one decoded event is classified into — the seam's single
+/// source of truth. [`classify`] consults the mask, the event's field PRESENCE,
+/// and the map (directory membership + the root anchor) to select EXACTLY one
+/// variant, and the variant's OWN required fields are the validation: an action
+/// whose field is absent is [`Lossy`](Self::Lossy) by construction, so there is no
+/// separate decode-side required-field matrix to drift out of step with the field
+/// consumers. The classifier applies each action's map self-maintenance inline
+/// (learn/forget/re-parent), so the returned event is already resolved against the
+/// post-mutation map; the reader only forwards it (and, for a move-in, walks the
+/// subtree). Decode, admission, and the death path therefore cannot disagree —
+/// every event shape resolves to one action here.
+#[derive(Debug)]
 pub(crate) enum Admission {
-  /// The event addresses the watched root: forward the admitted form.
-  Admit(AdmittedEvent),
-  /// A directory moved IN from outside the root: forward the admitted form AND
-  /// first walk the moved directory's subtree so its pre-existing descendant
-  /// directories enter the map. fanotify synthesizes no per-descendant creates for
-  /// a rename, so without this walk later events under those descendants would
-  /// drop as outside-root forever with no loss signal. The moved directory itself
-  /// is already learned (marked `pending_walk` in the map); only its subtree needs
-  /// seeding.
+  /// An admitted event whose admission mutated NO directory node — a file
+  /// (non-`ONDIR`) create/delete/modify/attrib, a non-structural directory
+  /// modify/attrib, or a directory's own name-less `MOVE_SELF` (a self-move rescan;
+  /// the moved node is re-parented by its rename/dirent, not here). Forward the
+  /// resolved path. REQUIRES an admitted directory FID and — for a dirent — a name.
+  Forward(AdmittedEvent),
+  /// A new in-root child directory `learn`ed into the map (ALREADY applied), then
+  /// forwarded — an `ONDIR` create. REQUIRES dir_fid (admitted) + name + the
+  /// child's own `target_fid` (the node key); absent → [`Lossy`](Self::Lossy),
+  /// because a create whose child cannot enter the map would blind that subtree.
+  LearnDir(AdmittedEvent),
+  /// A departed in-root directory `forget`/pruned from the map (ALREADY applied),
+  /// then forwarded — a parent-reported `DELETE|ONDIR`/move-out dirent, or a
+  /// directory's own name-less `DELETE_SELF`. REQUIRES the departing directory's
+  /// FID (a dirent's `target_fid`; a self-event's own FID); a dirent absent it →
+  /// [`Lossy`](Self::Lossy), because an un-pruned subtree resolves stale forever.
+  ForgetDir(AdmittedEvent),
+  /// A `FAN_RENAME` resolved and its map self-maintenance applied (in-root
+  /// re-parent / move-out `forget` / move-in `learn`). `seed` is the moved
+  /// directory's FID when it arrived from OUTSIDE the root and the reader must walk
+  /// its pre-existing descendants in before forwarding (`None` for an in-root
+  /// re-parent, a move-out, or a file/boundary rename). REQUIRES both halves (+
+  /// `target_fid` when `ONDIR`, else → [`Lossy`](Self::Lossy)).
   ///
-  /// The request carries the moved directory's FID, NOT a captured path: the
-  /// reader resolves the directory's CURRENT path through the map at execution
-  /// time, because an in-root rename in the SAME batch may have re-parented it
-  /// between this admission and the deferred walk. The reader — which owns the
-  /// walk context — runs the walk and escalates its incompleteness exactly as a
-  /// reseed's (blind → fatal).
-  AdmitAndSeed {
-    /// The move event to forward once the subtree is mapped.
+  /// The move-in `seed` carries the moved FID, NOT a captured path: the reader
+  /// resolves the directory's CURRENT path through the map at walk time, because an
+  /// in-root rename in the SAME batch may have re-parented it since this admission.
+  Rename {
+    /// The resolved move to forward once any subtree is mapped.
     event: AdmittedEvent,
-    /// The moved directory's own FID — both the walk-target lookup key (its
-    /// current path is resolved through the map) and the parent link every
-    /// descendant the walk discovers hangs from.
-    moved_fid: fid::Fid,
+    /// The moved directory's own FID when its subtree must be walked in (a move-IN
+    /// from outside), else `None`.
+    seed: Option<Fid>,
   },
-  /// No admitted directory FID matched — the event is provably outside the
-  /// root (the superblock firehose), so it is dropped without loss.
-  Drop,
+  /// A self-event (`DELETE_SELF`/`MOVE_SELF`) on the WATCHED ROOT object — its
+  /// self-FID (the `DFID` shape's `dir_fid`, or the `FID`-only shape's
+  /// `target_fid`) is the map's root anchor ([`FidMap::is_root`](map::FidMap::is_root)).
+  /// Forward the root's OWN path, which compile lowers to the death lifecycle
+  /// (`Ignored` → terminal Removed + Rescan). First-class and `target_fid`-aware —
+  /// checked BEFORE any firehose drop — so a FID-only root self-event (dir_fid =
+  /// None) reaches death even when the periodic liveness tick is disabled, rather
+  /// than being dropped and left forever blind (the R25 closure).
+  RootDeath(AdmittedEvent),
+  /// Provably outside the watched root, and not a root self-event: no admitted
+  /// directory FID matched (or the self-FID is unknown to the map). The
+  /// superblock-firehose filter — a clean drop, never a loss, so the sb's constant
+  /// foreign self/attrib traffic never reseeds.
+  ForeignDrop,
+  /// The action the event's mask names needs a field the event does not carry (a
+  /// named dirent with no/empty name; a directory create/delete/move/rename with no
+  /// child `target_fid`) — a missing field would silently mishandle the map, so the
+  /// buffer is lossy: the reader takes the ordered `Overflow` barrier and reseeds,
+  /// exactly as a wire-level decode loss.
+  Lossy,
 }
 
-/// Admits one decoded event against the per-root map: resolves its directory
-/// FID(s) to path(s) — through the batch [`MemoBatch`] — and self-maintains the
-/// map (learn on a directory create, forget on a directory delete/rename-out).
-/// PURE — the reader calls this single-threaded between reads; the FFI side owns
-/// nothing but the fd and the seeding walk. No node identity is produced;
-/// admission is membership + path resolution only (design §4.9).
+/// Classifies one decoded event into its [`Admission`] action against the per-root
+/// map: resolves directory FID(s) to path(s) through the batch [`MemoBatch`], and
+/// applies the action's map self-maintenance inline (learn on a directory create,
+/// forget on a delete/move-out, re-parent on a rename). PURE — the reader calls
+/// this single-threaded between reads; the FFI side owns nothing but the fd and the
+/// seeding walk. No node identity is produced; admission is membership + path
+/// resolution only (design §4.9).
 ///
-/// Membership is the whole filter: a `dir_fid` absent from the map is outside
-/// the watched root and dropped. Renames admit if EITHER end is in-root (a
-/// move into or out of the tree is still the tree's business); an in-root end
-/// resolves fully, an out-of-root end resolves to `None` and the lowering
-/// treats the half as a boundary crossing.
-pub(crate) fn admit(map: &mut FidMap, event: &RawFanotifyEvent, memo: &mut MemoBatch) -> Admission {
+/// The classification is EXHAUSTIVE and TOTAL: every `(mask, field-presence,
+/// map-state)` maps to exactly one action, with no catch-all silent fall-through —
+/// an unrecognized shape is explicitly [`Admission::ForeignDrop`] or
+/// [`Admission::Lossy`], never a wrong forward. The order is deliberate:
+///
+/// 1. a `FAN_RENAME` is its own event shape ([`classify_rename`]);
+/// 2. a name-less self-event is resolved by its SELF-FID first — a root self-event
+///    is [`Admission::RootDeath`] BEFORE any membership drop (so the FID-only shape
+///    is never wrongly dropped), a known non-root directory's own delete `forget`s
+///    it, and an unknown self-FID is [`Admission::ForeignDrop`];
+/// 3. otherwise the directory FID is the admittance gate — absent or out-of-root →
+///    [`Admission::ForeignDrop`] — after which the action's own required field
+///    (name, then `target_fid` for a directory mutation) decides forward vs
+///    [`Admission::Lossy`].
+pub(crate) fn classify(
+  map: &mut FidMap,
+  event: &RawFanotifyEvent,
+  memo: &mut MemoBatch,
+) -> Admission {
   if let Some(rename) = &event.rename {
-    return admit_rename(map, event, rename, memo);
+    return classify_rename(map, event, rename, memo);
   }
-
-  let Some(dir_fid) = &event.dir_fid else {
-    // A dirent event with no directory FID is unaddressable; a self-event's
-    // own FID also arrives here as `dir_fid`. Either way, without a handle to
-    // test membership on, the event cannot be placed under the root.
-    return Admission::Drop;
-  };
-  let Some(dir_path) = memo.admit(map, dir_fid) else {
-    return Admission::Drop;
-  };
 
   let mask = event.mask;
-  // A self-event (the admitted directory itself deleted or moved) carries no
-  // child name and resolves to the directory's own path.
+  // A name-less self-event: the object reports its OWN deletion/move, its handle
+  // arriving as a bare `DFID` (`dir_fid`) or a bare `FID` (`target_fid`). Resolve
+  // by that self-FID FIRST, before the directory-membership gate below, so a root
+  // self-event routes to death even in the FID-only shape (`dir_fid = None`) that
+  // the gate would otherwise drop.
   if (mask.delete_self() || mask.move_self()) && event.name.is_none() {
-    if mask.delete_self() {
-      map.forget(dir_fid);
-    }
-    return Admission::Admit(AdmittedEvent {
-      mask,
-      path: Some(dir_path),
-      rename: None,
-    });
+    let Some(self_fid) = event.dir_fid.as_ref().or(event.target_fid.as_ref()) else {
+      // No FID at all: unaddressable firehose noise.
+      return Admission::ForeignDrop;
+    };
+    let is_root = map.is_root(self_fid);
+    return match memo.admit(map, self_fid) {
+      // The watched root's own death — route to the death lifecycle.
+      Some(path) if is_root => Admission::RootDeath(self_event(mask, path)),
+      // A known non-root directory's own self-event: a delete_self is a child
+      // forget; a move_self is a self-rescan (the rename/dirent re-parents the node).
+      Some(path) => {
+        if mask.delete_self() {
+          map.forget(self_fid);
+          Admission::ForgetDir(self_event(mask, path))
+        } else {
+          Admission::Forward(self_event(mask, path))
+        }
+      }
+      // A self-FID unknown to the map — a foreign object elsewhere on the sb.
+      None => Admission::ForeignDrop,
+    };
   }
 
-  let path = event.name.as_ref().map(|name| join_name(&dir_path, name));
+  // A dirent event (or a self-event that also names a child). The directory FID is
+  // the admittance gate: absent or out-of-root, the event is provably outside the
+  // watched root — the firehose filter, a clean drop.
+  let Some(dir_fid) = event.dir_fid.as_ref() else {
+    return Admission::ForeignDrop;
+  };
+  let Some(dir_path) = memo.admit(map, dir_fid) else {
+    return Admission::ForeignDrop;
+  };
 
-  // Self-maintenance: a new in-root directory enters the map via its own
-  // create's TARGET_FID; a removed one is forgotten so its stale handle stops
-  // admitting.
-  if mask.ondir()
-    && let Some(name) = &event.name
-  {
+  // In-root. Every non-self dirent resolves `<dir>/<name>`, so it REQUIRES a name;
+  // an absent or empty one (decode folds an empty name to `None`) cannot address a
+  // target, so the action lacks its field → lossy.
+  let Some(name) = event.name.as_ref() else {
+    return Admission::Lossy;
+  };
+  let path = Some(join_name(&dir_path, name));
+
+  if mask.ondir() {
     if mask.created() {
-      map.learn(dir_fid, name, event.target_fid.as_ref());
-    } else if (mask.removed() || mask.move_self())
-      && let Some(child) = &event.target_fid
-    {
-      map.forget(child);
+      // Learn the new child directory — REQUIRES its own FID to key the node, else
+      // the create would forward while its subtree stays unmapped (blind).
+      let Some(child) = event.target_fid.as_ref() else {
+        return Admission::Lossy;
+      };
+      map.learn(dir_fid, name, Some(child));
+      return Admission::LearnDir(AdmittedEvent {
+        mask,
+        path,
+        rename: None,
+      });
     }
+    if mask.removed() || mask.move_self() {
+      // Forget/prune the departing child subtree — REQUIRES the child's own FID,
+      // else the departed subtree would resolve through stale links forever.
+      let Some(child) = event.target_fid.as_ref() else {
+        return Admission::Lossy;
+      };
+      map.forget(child);
+      return Admission::ForgetDir(AdmittedEvent {
+        mask,
+        path,
+        rename: None,
+      });
+    }
+    // An `ONDIR` modify/attrib changes content/metadata, not the tree — no mutation.
   }
 
-  Admission::Admit(AdmittedEvent {
+  // A file (non-`ONDIR`) dirent, or a non-structural directory modify/attrib.
+  Admission::Forward(AdmittedEvent {
     mask,
     path,
     rename: None,
   })
 }
 
-/// Admits a `FAN_RENAME`: resolves both directory FIDs and self-maintains the map
-/// for a moved DIRECTORY (no identity — see [`admit`]).
+/// Builds the admitted form of a resolved self-event (its own path, no child).
+fn self_event(mask: FanMask, path: PathBuf) -> AdmittedEvent {
+  AdmittedEvent {
+    mask,
+    path: Some(path),
+    rename: None,
+  }
+}
+
+/// Classifies a `FAN_RENAME`: resolves both directory FIDs and applies the moved
+/// DIRECTORY's map self-maintenance (no identity — see [`classify`]).
 ///
-/// The four move flavors — keyed on whether the destination parent is in-root
-/// and whether the MOVED OBJECT itself was already a known directory (the
-/// membership that says its descendants are already mapped):
+/// Membership is the filter: BOTH ends outside the root is a rename elsewhere on
+/// the superblock ([`Admission::ForeignDrop`]). With at least one end in-root, an
+/// `ONDIR` rename mutates the tree and so REQUIRES the moved object's own
+/// `target_fid` (absent → [`Admission::Lossy`], for every move shape — decode
+/// cannot know which end is in-root, but classification can, so a targetless ONDIR
+/// rename that would re-parent / walk / forget a subtree it cannot key is refused).
+/// The four move flavors, keyed on whether the destination parent is in-root and
+/// whether the MOVED OBJECT was already a known directory (its descendants already
+/// mapped):
 ///
 /// - **in-root rename** (moved dir known, destination in-root): re-parent the one
 ///   node in place; every descendant follows via the updated parent link — complete
-///   by construction, no walk.
+///   by construction, no walk (`seed = None`).
 /// - **move-in from outside** (moved dir unknown, destination in-root): the moved
 ///   directory carries pre-existing descendants the seed walk never saw, so after
-///   learning the moved dir itself as a `pending_walk` top this returns
-///   [`Admission::AdmitAndSeed`] carrying the moved FID — the reader resolves the
-///   dir's current path through the map and walks the subtree in before
-///   forwarding, keeping the completeness invariant even if a later in-root rename
-///   in the same batch re-parents the node first.
+///   learning the moved dir itself as a `pending_walk` top this returns `seed =
+///   Some(moved)` — the reader resolves the dir's current path through the map and
+///   walks the subtree in before forwarding, keeping the completeness invariant even
+///   if a later in-root rename in the same batch re-parents the node first.
 /// - **move-out** (moved dir known, destination outside): forget the moved dir; its
 ///   descendants' parent links now point at an absent handle, so their walks break
 ///   and they evict lazily — the map stops admitting the departed subtree naturally.
 /// - **move-out of an already-unknown subtree** (moved dir unknown, destination
 ///   outside): nothing to maintain; only the in-root SOURCE end resolves, and the
-///   move admits as a boundary crossing.
-fn admit_rename(
+///   move forwards as a boundary crossing.
+fn classify_rename(
   map: &mut FidMap,
   event: &RawFanotifyEvent,
   rename: &RenameInfo,
@@ -267,7 +371,7 @@ fn admit_rename(
   let new_dir = memo.admit(map, &rename.new_dir);
   if old_dir.is_none() && new_dir.is_none() {
     // Both ends outside the root: a rename elsewhere on the superblock.
-    return Admission::Drop;
+    return Admission::ForeignDrop;
   }
 
   let old_path = old_dir
@@ -279,50 +383,56 @@ fn admit_rename(
     .map(|dir| join_name(dir, &rename.new_name))
     .unwrap_or_else(|| PathBuf::from(&os_name(&rename.new_name)));
 
-  let moved_fid = event.target_fid.as_ref();
-
-  let event = AdmittedEvent {
+  let admitted = AdmittedEvent {
     mask: event.mask,
     path: None,
     rename: Some(AdmittedRename { old_path, new_path }),
   };
 
-  if event.mask.ondir()
-    && let Some(fid) = moved_fid
-  {
+  if event.mask.ondir() {
+    // An `ONDIR` rename mutates the directory tree — it REQUIRES the moved object's
+    // own FID to re-parent / walk-in / forget the node. Absent (with at least one
+    // end in-root, proven above) → the buffer is lossy, exactly as the pre-inversion
+    // decode matrix made a targetless ONDIR rename lossy — now caught AT the action.
+    let Some(moved) = event.target_fid.as_ref() else {
+      return Admission::Lossy;
+    };
     if new_dir.is_some() {
-      // The moved object was already a known directory IFF it was in-root before
-      // the move — the discriminator between the two in-root-destination flavors.
-      // Read it BEFORE `learn` overwrites the node.
-      let was_in_root = map.contains(fid);
-      if was_in_root {
+      // Destination in-root. Whether the moved object was ALREADY a known in-root
+      // directory (its descendants already mapped) splits the two flavors — read it
+      // BEFORE `learn` overwrites the node.
+      if map.contains(moved) {
         // In-root re-parent: `learn` overwrites the node in place, and its
-        // already-mapped descendants follow via the updated parent link. No
-        // pruning forget (the object did not depart), and no walk (its
-        // descendants are already mapped).
-        map.learn(&rename.new_dir, &rename.new_name, Some(fid));
-      } else {
-        // Moved IN from outside: learn the top as a `pending_walk` node (so a
-        // `NotFound` at its resolved path during the deferred walk is an
-        // incompleteness, not a benign empty walk), then hand the reader its FID
-        // to walk the pre-existing descendants in — no per-descendant creates
-        // arrive for a rename, so the map is only complete once the walk runs.
-        // The walk resolves the CURRENT path through the map, so an in-root rename
-        // later in this batch that re-parents the node is followed correctly.
-        map.learn_moved_in(&rename.new_dir, &rename.new_name, fid);
-        return Admission::AdmitAndSeed {
-          event,
-          moved_fid: fid.clone(),
+        // already-mapped descendants follow via the updated parent link — no walk.
+        map.learn(&rename.new_dir, &rename.new_name, Some(moved));
+        return Admission::Rename {
+          event: admitted,
+          seed: None,
         };
       }
-    } else {
-      // Moved OUT of the root: drop admission (departed). A later move back is a
-      // fresh move-in — walked in — the conservative direction.
-      map.forget(fid);
+      // Moved IN from outside: learn the top as a `pending_walk` node, then hand the
+      // reader its FID to walk the pre-existing descendants in (no per-descendant
+      // creates arrive for a rename, so the map is complete only once the walk runs).
+      map.learn_moved_in(&rename.new_dir, &rename.new_name, moved);
+      return Admission::Rename {
+        event: admitted,
+        seed: Some(moved.clone()),
+      };
     }
+    // Moved OUT of the root: forget the departed subtree. A later move back is a
+    // fresh move-in — walked in — the conservative direction.
+    map.forget(moved);
+    return Admission::Rename {
+      event: admitted,
+      seed: None,
+    };
   }
 
-  Admission::Admit(event)
+  // A file / boundary rename: no directory-tree mutation.
+  Admission::Rename {
+    event: admitted,
+    seed: None,
+  }
 }
 
 /// Joins a raw fanotify child name onto its resolved directory path. A

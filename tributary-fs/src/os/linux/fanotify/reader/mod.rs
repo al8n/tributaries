@@ -52,7 +52,7 @@ use super::{
     super::{BackendStatsShared, SourceError, transport},
     wake::WakeState,
   },
-  Admission, MemoBatch, admit,
+  Admission, MemoBatch, classify,
   fid::decode_events,
   map::{FidMap, SeedEntry},
   source::ReseedContext,
@@ -233,14 +233,23 @@ fn drain_events(
   }
 }
 
-/// Processes one decoded buffer: routes a lossy decode through the loss barrier
-/// and a clean decode through admission, forwarding onto the queue via `send`.
+/// Processes one decoded buffer: [`classify`]s each event into its admission
+/// action, applies the resulting map self-maintenance, and forwards the admitted
+/// events onto the queue via `send` — or routes a loss through the barrier.
 /// Returns `false` when the stream died (fatal already signaled), mirroring
 /// [`drain_events`]'s contract. Pure over the two walk closures and the send
 /// closure — the ONLY fd-touching or queue-touching parts — so the barrier and
-/// the admit/reseed/escalate policy are testable over a real [`FidMap`] with stub
-/// walks and a capturing sender, exactly as [`reseed_map`] and
+/// the classify/reseed/escalate policy are testable over a real [`FidMap`] with
+/// stub walks and a capturing sender, exactly as [`reseed_map`] and
 /// [`seed_moved_in_subtree`] already are.
+///
+/// Loss reaches the barrier two ways, both funneling to the SAME per-buffer drop:
+/// a WIRE-level loss (`decoded.lossy` — a `FAN_Q_OVERFLOW` marker, a
+/// truncated/malformed record, a structurally unpairable `FAN_RENAME`), OR a
+/// CLASSIFIED [`Admission::Lossy`] — an event whose selected action lacks a
+/// required field (a named dirent with no name; a directory create/delete/rename
+/// with no child `target_fid`). Either way the whole buffer is a barrier, so no
+/// ordinary event is delivered from it (see the barrier rationale below).
 ///
 /// `reseed_walk` rebuilds the whole map from the root (a loss); `subtree_walk`
 /// maps one moved-in directory's descendants (its resolved current path, its FID,
@@ -259,21 +268,136 @@ where
   S: FnMut(&std::path::Path, &super::fid::Fid, Option<usize>) -> std::io::Result<Vec<SeedEntry>>,
   Q: FnMut(crate::os::SourceMessage) -> bool,
 {
-  // Loss is an ordering barrier. A lossy buffer (a `FAN_Q_OVERFLOW` marker, a
-  // truncated/malformed record, or a one-sided `FAN_RENAME`) is a mix of events
-  // around an UNKNOWN loss window: the marker names no position, so the events
-  // decoded AFTER it in the same buffer would be admitted against the PRE-loss
-  // map. If the window dropped a directory rename/move-out, a suffix event under
-  // that directory's FID resolves through STALE parent links — a WRONG in-root
-  // path — and, forwarded in a Batch ahead of the loss signal, the consumer sees
-  // it BEFORE the covering rescan corrects it. So deliver NO ordinary events from
-  // a lossy buffer: drop the whole decode (pre- AND post-marker). The covering
-  // rescan already owes the consumer the full truth for everything this buffer
-  // could have said, so delivering none of it is strictly honest — no wrong paths
-  // — at the cost of a few droppable pre-loss events the rescan re-covers. Reseed
-  // the map (future admissions), then signal ONLY the loss, so nothing from the
-  // lossy buffer precedes the `Overflow` on the queue.
-  if decoded.lossy {
+  // The batch memo (design §4.9) caches admitted directory resolutions FOR THIS
+  // buffer only: the reader is single-threaded and the map is queue-ordered, so a
+  // cached path is sound until the next map mutation, which bumps the map's
+  // generation and thus invalidates the memo. A fresh memo per buffer clears it at
+  // batch end by construction.
+  let mut memo = MemoBatch::new();
+  let mut events = Vec::new();
+  // A wire-level loss skips classification entirely (its events are already
+  // suspect); a classified `Lossy` sets this mid-loop and breaks. Both take the
+  // barrier below.
+  let mut lossy = decoded.lossy;
+  if !lossy {
+    events.reserve(decoded.events.len());
+    for event in &decoded.events {
+      match classify(map, event, &mut memo) {
+        // A forwarded event whose admission mutated no growing node, OR a root
+        // self-event routed to the death lifecycle. A `LearnDir` may have grown the
+        // map past its cap (design §4.9): a capped map that keeps eventing while
+        // silently refusing to learn is the silent-loss shape, so an over-cap map is
+        // the terminal `Fatal`, not run on blind. (The check is cheap and harmless
+        // on the non-growing arms.)
+        Admission::Forward(event)
+        | Admission::LearnDir(event)
+        | Admission::ForgetDir(event)
+        | Admission::RootDeath(event) => {
+          if map.over_capacity() {
+            signal_fatal_cap(transport, &mut send);
+            return false;
+          }
+          events.push(fanotify_event(event));
+        }
+        // A `FAN_RENAME`, its map self-maintenance already applied. `seed` is the
+        // moved directory's FID when it moved IN from outside the root and its
+        // pre-existing descendants must be walked into the map BEFORE forwarding, so
+        // any later event in this same batch under those descendants already admits.
+        //
+        // The walk's starting path is resolved through the map (`seed_moved_in_
+        // subtree` → `pending_walk_target`), NOT captured at admission — an in-root
+        // rename this reader already processed would have re-parented the pending
+        // node, and the walk must follow it.
+        //
+        // Walk-cancellation soundness (the batch-ordering argument): this reader is
+        // single-threaded and processes the batch IN ORDER, and the map lookup gates
+        // the walk. So at walk time the map reflects EXACTLY the events up to and
+        // including this one:
+        //  - if a rename-OUT / delete of the moved dir had been processed, it would
+        //    have `forget`-ten (and pruned) the node — `pending_walk_target` returns
+        //    `None`, the walk is CANCELLED (a departed subtree owes nothing);
+        //  - if an in-root rename of it had been processed, the node is re-parented
+        //    and STILL pending (the flag is preserved across a re-parent), so the
+        //    walk rebases to the new path;
+        //  - otherwise the node is present and pending at its move-in destination.
+        // Therefore a `NotFound` at the resolved path means NO removal was processed
+        // by this reader, yet the directory is gone on disk (a later event in this
+        // same batch — the burst — already hit disk but not the reader). That is a
+        // genuine coverage hole, so the walk classifies it `Incomplete` and, after
+        // the single retry, escalates to the terminal `Fatal` (blind → fatal) — NOT
+        // a benign empty walk. Auto's next `watch()` then lands on inotify, which
+        // re-enumerates; a silent blind subtree is never left behind.
+        Admission::Rename { event, seed } => {
+          // The re-parent / move-in learn may have grown the map past its cap; check
+          // it FIRST — before any walk — so an over-cap learn cannot even start one.
+          if map.over_capacity() {
+            signal_fatal_cap(transport, &mut send);
+            return false;
+          }
+          if let Some(moved_fid) = seed {
+            // Fence the walk to the REMAINING budget, not the full cap: the map is
+            // near-cap (the top just landed), and passing the full cap as the
+            // descend budget would let a populated move-in allocate up to a whole
+            // extra `cap` of descendants before the additive check below fired. `cap
+            // - len` is the room actually left; the walk aborts the moment it would
+            // exceed it, so the map never grows past the cap mid-walk. Uncapped
+            // stays `None`.
+            let budget = map.remaining_capacity();
+            let started = std::time::Instant::now();
+            let outcome = seed_moved_in_subtree(map, &moved_fid, |subtree, subtree_fid| {
+              subtree_walk(subtree, subtree_fid, budget)
+            });
+            stats.record_walk(walk_micros(started));
+            if matches!(outcome, SeedOutcome::Blind) {
+              transport::signal_fatal_once(
+                transport,
+                SourceError::ReadFailed {
+                  source: moved_in_blind_error(),
+                },
+                &mut send,
+              );
+              return false;
+            }
+            // The belt: the walk fenced its own production to the remaining budget,
+            // so this only fires on the exact cap boundary — the same terminal a
+            // live create over the cap hits. A move-in that cannot fit is the cap
+            // doing its job; fatal is the honest terminal.
+            if map.over_capacity() {
+              signal_fatal_cap(transport, &mut send);
+              return false;
+            }
+          }
+          events.push(fanotify_event(event));
+        }
+        // Provably outside the watched root (the firehose filter): a clean drop, BY
+        // DESIGN — distinct from the staleness a loss induces, which the reseed
+        // below repairs.
+        Admission::ForeignDrop => {}
+        // A classified loss: the selected action lacks a required field. Take the
+        // per-buffer barrier — drop the whole buffer (any events pushed so far
+        // included), reseed, and signal only `Overflow`.
+        Admission::Lossy => {
+          lossy = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Loss is an ordering barrier. A lossy buffer is a mix of events around an
+  // UNKNOWN loss window: the marker/missing field names no position, so events
+  // around it would be admitted against a map the window may have staled. If the
+  // window dropped a directory rename/move-out, a co-batched event under that FID
+  // resolves through STALE parent links — a WRONG in-root path — and, forwarded in
+  // a Batch ahead of the loss signal, the consumer sees it BEFORE the covering
+  // rescan corrects it. So deliver NO ordinary events from a lossy buffer: drop the
+  // whole decode. The covering rescan already owes the consumer the full truth for
+  // everything this buffer could have said, so delivering none of it is strictly
+  // honest — no wrong paths — at the cost of a few droppable events the rescan
+  // re-covers. Reseed the map (future admissions), then signal ONLY the loss, so
+  // nothing from the lossy buffer precedes the `Overflow` on the queue. A partial
+  // classify's map mutations are erased by the reseed's `dirs.clear()`.
+  if lossy {
     if !reseed_after_loss(map, stats, reseed_walk, transport, &mut send) {
       return false;
     }
@@ -284,110 +408,13 @@ where
     transport::forward_batch(transport, Vec::new(), true, &mut send);
     return true;
   }
-  // Admission is the superblock-firehose filter: an event whose directory FID
-  // is unknown is provably outside the root and dropped without loss. That
-  // silent drop is BY DESIGN — the filter working — and is distinct from the
-  // staleness a loss induces, which the reseed above repairs.
-  //
-  // The batch memo (design §4.9) caches admitted directory resolutions FOR THIS
-  // buffer only: the reader is single-threaded and the map is queue-ordered, so
-  // a cached path is sound until the next map mutation, which bumps the map's
-  // generation and thus invalidates the memo. A fresh memo per buffer clears it
-  // at batch end by construction.
-  let mut memo = MemoBatch::new();
-  let mut events = Vec::with_capacity(decoded.events.len());
-  for event in &decoded.events {
-    match admit(map, event, &mut memo) {
-      Admission::Admit(admitted) => {
-        // A live create/move-in may have grown the map past its cap (design
-        // §4.9). A capped map that keeps eventing while silently refusing to
-        // learn new directories is the silent-loss shape — events under the
-        // unlearned directory would drop as outside-root forever — so it is a
-        // terminal condition, escalated to `Fatal` rather than run on blind.
-        if map.over_capacity() {
-          signal_fatal_cap(transport, &mut send);
-          return false;
-        }
-        events.push(fanotify_event(admitted));
-      }
-      // A directory moved IN from outside the root: walk its pre-existing
-      // descendants into the map BEFORE forwarding the move, so any later event
-      // in this same batch under those descendants already admits.
-      //
-      // The walk's starting path is resolved through the map (`seed_moved_in_
-      // subtree` → `pending_walk_target`), NOT captured at admission — an
-      // in-root rename that this reader has already processed would have
-      // re-parented the pending node, and the walk must follow it.
-      //
-      // Walk-cancellation soundness (the batch-ordering argument): this reader
-      // is single-threaded and processes the batch IN ORDER, and the map lookup
-      // gates the walk. So at walk time the map reflects EXACTLY the events up to
-      // and including this one:
-      //  - if a rename-OUT / delete of the moved dir had been processed, it would
-      //    have `forget`-ten (and pruned) the node — `pending_walk_target` returns
-      //    `None`, the walk is CANCELLED (a departed subtree owes nothing);
-      //  - if an in-root rename of it had been processed, the node is re-parented
-      //    and STILL pending (the flag is preserved across a re-parent), so the
-      //    walk rebases to the new path;
-      //  - otherwise the node is present and pending at its move-in destination.
-      // Therefore a `NotFound` at the resolved path means NO removal was processed
-      // by this reader, yet the directory is gone on disk (a later event in this
-      // same batch — the burst — already hit disk but not the reader). That is a
-      // genuine coverage hole, so the walk classifies it `Incomplete` and, after
-      // the single retry, escalates to the terminal `Fatal` (blind → fatal) —
-      // NOT a benign empty walk. Auto's next `watch()` then lands on inotify,
-      // which re-enumerates; a silent blind subtree is never left behind.
-      Admission::AdmitAndSeed { event, moved_fid } => {
-        // `admit` already learned the moved-in TOP (the walk maps only its
-        // descendants), so check the cap on that learn FIRST — before the walk —
-        // exactly as the `Admit` arm checks its own learn. If the top alone
-        // breached the cap the walk must not run at all.
-        if map.over_capacity() {
-          signal_fatal_cap(transport, &mut send);
-          return false;
-        }
-        // Fence the walk to the REMAINING budget, not the full cap: the map is
-        // near-cap (the top just landed), and passing the full cap as the descend
-        // budget would let a populated move-in allocate up to a whole extra `cap`
-        // of descendants before the additive check below fired. `cap - len` is the
-        // room actually left; the walk aborts the moment it would exceed it, so the
-        // map never grows past the cap mid-walk. Uncapped stays `None`.
-        let budget = map.remaining_capacity();
-        let started = std::time::Instant::now();
-        let outcome = seed_moved_in_subtree(map, &moved_fid, |subtree, subtree_fid| {
-          subtree_walk(subtree, subtree_fid, budget)
-        });
-        stats.record_walk(walk_micros(started));
-        if matches!(outcome, SeedOutcome::Blind) {
-          transport::signal_fatal_once(
-            transport,
-            SourceError::ReadFailed {
-              source: moved_in_blind_error(),
-            },
-            &mut send,
-          );
-          return false;
-        }
-        // The belt: the walk fenced its own production to the remaining budget, so
-        // this only fires on the exact cap boundary — the same terminal a live
-        // create over the cap hits. A move-in that cannot fit is the cap doing its
-        // job; fatal is the honest terminal.
-        if map.over_capacity() {
-          signal_fatal_cap(transport, &mut send);
-          return false;
-        }
-        events.push(fanotify_event(event));
-      }
-      Admission::Drop => {}
-    }
-  }
+
   // Publish this batch's memo tallies and the map's post-batch footprint, so an
   // operator poll reflects the current admission map and memo hit rate.
   stats.add_memo(memo.hits, memo.misses);
   let map_stats = map.stats();
   stats.set_map(map_stats.directories, map_stats.memo_generation);
-  // A clean buffer forwards its admitted events with no loss (the lossy buffer
-  // took the barrier branch above and never reaches here).
+  // A clean buffer forwards its admitted events with no loss.
   transport::forward_batch(transport, events, false, &mut send);
   true
 }

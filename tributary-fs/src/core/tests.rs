@@ -3966,6 +3966,68 @@ mod kernel_recursive_fanotify {
     );
   }
 
+  /// The R25 closure at the DRIVER layer, tick-INDEPENDENT: the admission classifier
+  /// turns a FID-only root self-event (`target_fid` = the root anchor, `dir_fid` =
+  /// None — the shape the pre-inversion admission DROPPED) into a `RootDeath` whose
+  /// forwarded event carries the root's OWN path, so it lowers through the SAME
+  /// terminal death lifecycle an in-tree `DELETE_SELF` uses, with NO dependence on
+  /// the periodic liveness tick. This drives that forwarded event into a scope whose
+  /// `root_liveness_interval` is `ZERO` (the tick disabled) and asserts it STILL
+  /// reaches terminal Removed + Rescan + teardown — the fix does not lean on the
+  /// tick. (The classifier half — that the FID-only shape becomes exactly this
+  /// `RootDeath(root path)`, not a drop — is pinned in the fanotify
+  /// `classification_totality` suite; the container unmount cell covers the
+  /// quiet-unmount arm the tick still bounds.)
+  #[test]
+  fn fid_only_root_death_dies_without_the_liveness_tick() {
+    let mut core = DriverCore::new(WINDOW, Duration::ZERO);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.poll_timeout(),
+      None,
+      "the tick is disabled — no liveness deadline is armed"
+    );
+
+    // The `RootDeath` admitted form the classifier produces for a FID-only root
+    // self-event: the root's OWN path, so compile lowers it to the death lifecycle.
+    feed(
+      &mut core,
+      scope,
+      vec![RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(FAN_DELETE_SELF | FAN_ONDIR),
+        path: Some(PathBuf::from("/r")),
+        rename: None,
+      })],
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "root death is a terminal Rescan even with the tick disabled: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead root's stream tears down without any tick: {effects:?}"
+    );
+  }
+
   /// Death survives a stale completion: a SECOND liveness tick fires before the
   /// FIRST refresh returns, marking the outstanding read stale — and that read
   /// then comes back with the root GONE. The death evidence must STILL be

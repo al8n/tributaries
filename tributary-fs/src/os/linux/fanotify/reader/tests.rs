@@ -4,7 +4,7 @@ use super::{ReseedOutcome, SeedOutcome, process_decoded, reseed_map, seed_moved_
 use crate::os::{
   BackendStatsShared, SourceMessage,
   linux::fanotify::{
-    fid::{DecodeOutcome, FAN_MODIFY, FanMask, Fid, RawFanotifyEvent},
+    fid::{DecodeOutcome, FAN_CREATE, FAN_MODIFY, FAN_ONDIR, FanMask, Fid, RawFanotifyEvent},
     map::{FidMap, SeedEntry},
   },
   transport::TransportState,
@@ -407,6 +407,64 @@ fn clean_buffer_forwards_the_batch_and_never_reseeds() {
     sent,
     vec![Sent::Batch(2)],
     "both admitted events ride one Batch, no Overflow"
+  );
+}
+
+/// A CLEAN buffer (`decoded.lossy == false`) whose events include a CLASSIFIED
+/// `Admission::Lossy` — a targetless in-root directory create the action cannot
+/// learn — takes the SAME per-buffer barrier a wire loss does: reseed, then forward
+/// ONLY the `Overflow`, dropping the whole buffer (the clean modify ahead of it
+/// included). This is the inversion's key property — a missing required field is a
+/// loss decided AT the action, not by a decode matrix, yet it holds the identical
+/// barrier.
+#[test]
+fn classified_lossy_event_takes_the_barrier_and_reseeds() {
+  let mut map = seeded_with_sub();
+  let dir_create_no_target = RawFanotifyEvent {
+    mask: FanMask::new(FAN_CREATE | FAN_ONDIR),
+    dir_fid: Some(fid(2)),
+    target_fid: None,
+    name: Some(b"newdir".to_vec()),
+    rename: None,
+  };
+  // A clean decode: an admissible modify FIRST, then the classified-Lossy dir-create.
+  let decoded = DecodeOutcome {
+    events: vec![modify_under(fid(2), b"f"), dir_create_no_target],
+    lossy: false,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  assert!(alive, "a reseeded classified loss keeps the stream live");
+  assert_eq!(
+    reseeds, 1,
+    "the classified loss reseeded the map before signaling"
+  );
+  assert_eq!(
+    sent,
+    vec![Sent::Overflow],
+    "the barrier: no Batch precedes the Overflow — the whole buffer is dropped"
+  );
+}
+
+/// A CLEAN buffer whose events include a `ForeignDrop` (an out-of-root FID) forwards
+/// only the admitted events as one Batch and NEVER reseeds — the firehose filter is a
+/// silent drop, distinct from a loss.
+#[test]
+fn foreign_event_is_dropped_from_a_clean_batch() {
+  let mut map = seeded_with_sub();
+  let decoded = DecodeOutcome {
+    events: vec![
+      modify_under(fid(2), b"f"),
+      modify_under(fid(99), b"elsewhere"),
+    ],
+    lossy: false,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  assert!(alive);
+  assert_eq!(reseeds, 0, "a dropped foreign event is not a loss");
+  assert_eq!(
+    sent,
+    vec![Sent::Batch(1)],
+    "only the in-root event rides the Batch; the foreign one is dropped silently"
   );
 }
 
