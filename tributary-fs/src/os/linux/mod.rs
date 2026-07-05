@@ -43,10 +43,16 @@
 //!   [`open_no_symlinks`] component walk — shared by BOTH the root pin
 //!   ([`pin_root`]) and the post-live ancestor identities
 //!   ([`ancestor_identities`]), so a pre-5.6 kernel pins, starts the reader, AND
-//!   reads the ancestor chain without ever hitting an unhandled `ENOSYS`; and
+//!   reads the ancestor chain without ever hitting an unhandled `ENOSYS`;
 //!   `statx`'s mount id (`STATX_MNT_ID`, 5.8) is always a masked read
-//!   ([`root_mount_id`] here, `statx_sample`/`frame_of` in the driver) that
-//!   yields `None`/the device fallback below the floor rather than failing.
+//!   ([`root_mount_id`] here — the `.ok()?` swallows a whole-syscall `NOSYS` too —
+//!   and the driver's `stat_sample`) that yields `None`/the device fallback below
+//!   the floor rather than failing; and `statx` ITSELF (4.11) — the driver's sole
+//!   live-path sample for root liveness and directory-entry facts — degrades on
+//!   `NOSYS`/seccomp `EPERM` to a single `lstat` (`stat_sample` in the driver), so a
+//!   pre-4.11 kernel keeps refresh + enumerate working (identity from that one
+//!   `lstat`, mount frame absent, the mount-id fence degrading to the device belt
+//!   crate-wide) instead of a false root death and an empty listing.
 //!   `inotify_init` and `eventfd` are far below the floor.
 //! - **fanotify: 5.17+** (the `FAN_REPORT_TARGET_FID` / `FAN_RENAME` composite,
 //!   design §4). Every fanotify-only call — including the seed walk's `openat2`
@@ -681,7 +687,8 @@ fn ancestor_identities(canonical: &Path) -> Result<Vec<super::RootIdentity>, sup
 /// device alone cannot mark the boundary; the mount id differs across any mount.
 ///
 /// `None` when the kernel did not report a mount id: `statx` unavailable (returns
-/// `NOSYS` below Linux 4.11), the `STATX_MNT_ID` field absent (below 5.8), or the
+/// `NOSYS` below Linux 4.11 — the `.ok()?` swallows the whole-syscall failure before
+/// the mask is ever read), the `STATX_MNT_ID` field absent (below 5.8), or the
 /// returned `stx_mask` leaving the bit unset. inotify's kernel floor is well below
 /// 5.8, so `None` is a real path there — the core degrades to the device check
 /// (the settled single-device policy). fanotify's 5.17 floor always reports it,
