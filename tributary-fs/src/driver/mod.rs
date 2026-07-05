@@ -16,8 +16,16 @@
 //! and the identity checks downstream (a per-directory arm confirms only
 //! `(dev, ino)`) would then admit a foreign object. The Linux enumerate, the
 //! root-liveness refresh, and the spawn barriers all obey it — see
-//! [`statx_sample`], [`root_liveness_and_frame`], and the pinned-fd reads in
+//! [`stat_sample`], [`root_liveness_and_frame`], and the pinned-fd reads in
 //! `os::linux`.
+//!
+//! On a kernel below the `statx` floor (4.11) the one path sample degrades from a
+//! `statx` to a single `lstat` ([`stat_sample`]): identity facts still come from
+//! ONE object, only the mount frame is DROPPED (absent, never mixed in from a
+//! second lookup), and the core fences that object on the device belt. So the rule
+//! holds unchanged — one object, one sample — and the inotify floor (well below
+//! 4.11) keeps refresh + enumerate working instead of a false root death and an
+//! empty listing.
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -472,7 +480,7 @@ fn io_class(err: &std::io::Error) -> IoClass {
 
 /// The proto file kind of a stat file type (symlinks are never followed). Feeds
 /// the metadata-based enumerate/liveness sample; the Linux path derives the kind
-/// from its one `statx` result's `stx_mode` instead ([`dir_entry_stat`]).
+/// from its one sample's raw mode instead ([`kind_of_mode`], via [`stat_sample`]).
 #[cfg(not(all(target_os = "linux", not(miri))))]
 fn kind_of(kind: &std::fs::FileType) -> tributary_proto::FileKind {
   if kind.is_dir() {
@@ -511,37 +519,117 @@ fn ino_of(_meta: &std::fs::Metadata) -> u64 {
   0
 }
 
-/// ONE `statx` sample of the object at `path` (symlink not followed):
-/// `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)`.
-/// This is the sole path-syscall behind every fact a caller reads about that
-/// object — kind, device, inode, and mount frame all come from THIS result, so
-/// no fact is ever paired with another object's after a rename/bind slipped
-/// between two lookups (the one-sample rule stated on the driver module doc).
-///
-/// The path is resolved the same way `symlink_metadata` was, so an anchor
-/// (`/proc/self/fd/N`) enumerate reads every fact THROUGH the pinned fd too.
-/// `statx` is 4.11+, so the call is available on any floor either backend runs on.
+/// Every fact one caller reads about a filesystem object, from ONE sample of that
+/// object (symlink not followed): its kind, device, inode, and mount frame. The
+/// four are always one object's — the one-sample rule (see the driver module doc)
+/// made concrete, so a rename/bind slipping between two syscalls can never pair
+/// one object's identity with another's frame.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn statx_sample(path: &Path) -> Result<rustix::fs::Statx, rustix::io::Errno> {
-  use rustix::fs::{AtFlags, StatxFlags, statx};
-  statx(
+#[derive(Debug)]
+struct StatSample {
+  kind: tributary_proto::FileKind,
+  dev: u64,
+  ino: u64,
+  /// The mount frame, `Some` only when the sample reported the mount id. Always
+  /// `None` on the `lstat` fallback (no mount id below the `statx` floor), and
+  /// `None` on a `statx` mask miss — the core then fences on the device belt.
+  frame: Option<u64>,
+}
+
+/// Whether a `statx` error means the syscall itself is UNAVAILABLE (fall back to
+/// `lstat`) or is a real error to propagate. `statx` is Linux 4.11+, so a pre-4.11
+/// kernel returns `NOSYS`; a seccomp sandbox that does not allow the syscall
+/// commonly returns `EPERM` for it (e.g. Docker's default profile answers blocked
+/// syscalls with `EPERM`). Both mean "no `statx` here" and route to the `lstat`
+/// fallback. Every other errno keeps its meaning — in particular `NOENT` (a
+/// missing object) is NOT a fallback: `lstat` of the same path would return the
+/// same `NOENT`, and the callers depend on it surfacing as-is (root `Missing`,
+/// entry raced-away).
+#[cfg(all(target_os = "linux", not(miri)))]
+enum StatxAvailability {
+  /// `statx` is absent (pre-4.11 `NOSYS`) or blocked (`EPERM`) — use `lstat`.
+  Fallback,
+  /// A genuine error to propagate with its existing meaning.
+  Real,
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+fn classify_statx_error(errno: rustix::io::Errno) -> StatxAvailability {
+  use rustix::io::Errno;
+  // A path-level `EPERM` (a real permission fault reaching `statx`) is safe to
+  // route here too: `lstat` of the same path resolves identically and re-surfaces
+  // that same `EPERM` as a real error, so nothing is masked — only a syscall
+  // blocked by seccomp is rescued, never a permission fault invented.
+  match errno {
+    Errno::NOSYS | Errno::PERM => StatxAvailability::Fallback,
+    _ => StatxAvailability::Real,
+  }
+}
+
+/// ONE sample of the object at `path` (symlink not followed): the sole path-syscall
+/// behind every fact a caller reads about that object.
+///
+/// The fast path is `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS |
+/// STATX_MNT_ID)` — kind, device, inode, AND mount frame all from THAT one result.
+/// When `statx` is unavailable ([`classify_statx_error`] — a pre-4.11 `NOSYS` or a
+/// seccomp `EPERM`) the sample degrades to ONE `lstat`, still a single object's
+/// facts, but with NO mount frame (only `STATX_MNT_ID` is lost below the `statx`
+/// floor; every other fact `lstat` carries): the one-sample rule holds because the
+/// frame is ABSENT, never mixed in from a second lookup. The core then fences that
+/// object on the device belt, exactly as it already does for a pre-5.8 mask miss —
+/// so the inotify floor (well below 4.11) keeps refresh + enumerate working end to
+/// end instead of a false root death and an empty listing.
+///
+/// The path is resolved the same way `symlink_metadata` was on both paths, so an
+/// anchor (`/proc/self/fd/N`) enumerate reads every fact THROUGH the pinned fd too.
+/// Any errno that is not a `statx`-unavailable signal (notably `NOENT`) propagates
+/// unchanged, keeping the callers' `Missing`/raced-away meanings.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn stat_sample(path: &Path) -> Result<StatSample, rustix::io::Errno> {
+  use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
+  match statx(
     rustix::fs::CWD,
     path,
     AtFlags::SYMLINK_NOFOLLOW,
     StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
-  )
+  ) {
+    Ok(stx) => Ok(StatSample {
+      kind: kind_of_mode(u32::from(stx.stx_mode)),
+      dev: makedev(stx.stx_dev_major, stx.stx_dev_minor),
+      ino: stx.stx_ino,
+      frame: (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id),
+    }),
+    Err(errno) => match classify_statx_error(errno) {
+      StatxAvailability::Fallback => lstat_sample(path),
+      StatxAvailability::Real => Err(errno),
+    },
+  }
 }
 
-/// The mount frame carried by a [`statx_sample`] result: `Some` only when the
-/// sample's `stx_mask` reports the mount id, so it is read from the SAME object
-/// the rest of the entry's facts came from. `None` below Linux 5.8 (the field is
-/// absent) or on a transient mask miss — the core then falls back to the device
-/// check. A `mount --bind` of a same-device directory shares the origin's device,
-/// so the mount id is what marks a boundary the device alone cannot.
+/// The `lstat` fallback for [`stat_sample`]: ONE `lstat` (symlink not followed)
+/// yielding kind, device, and inode from that single object, with the mount frame
+/// declined (`None`) because no mount id exists below the `statx` floor.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn frame_of(stx: &rustix::fs::Statx) -> Option<u64> {
-  use rustix::fs::StatxFlags;
-  (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id)
+fn lstat_sample(path: &Path) -> Result<StatSample, rustix::io::Errno> {
+  let stat = rustix::fs::lstat(path)?;
+  Ok(StatSample {
+    kind: kind_of_mode(stat.st_mode),
+    dev: stat.st_dev,
+    ino: stat.st_ino,
+    frame: None,
+  })
+}
+
+/// The proto file kind of a raw `st_mode`/`stx_mode` (symlinks are never followed).
+#[cfg(all(target_os = "linux", not(miri)))]
+fn kind_of_mode(mode: u32) -> tributary_proto::FileKind {
+  use rustix::fs::FileType;
+  match FileType::from_raw_mode(mode) {
+    FileType::Directory => tributary_proto::FileKind::Dir,
+    FileType::Symlink => tributary_proto::FileKind::Symlink,
+    FileType::RegularFile => tributary_proto::FileKind::File,
+    _ => tributary_proto::FileKind::Other,
+  }
 }
 
 /// The root's liveness verdict AND its current mount frame from ONE
@@ -558,16 +646,16 @@ fn frame_of(stx: &rustix::fs::Statx) -> Option<u64> {
 /// transient miss never mispairs, it just declines the frame (the core keeps its
 /// captured one). The sample maps to the [`RootLiveness`] taxonomy exactly as the
 /// prior `symlink_metadata` did: `ENOENT` is `Missing` (DeleteSelf), any other error
-/// is `Unreadable` (MoveSelf), success is `Present`.
+/// is `Unreadable` (MoveSelf), success is `Present`. A pre-4.11 kernel (no `statx`)
+/// still resolves `Present` — [`stat_sample`] samples the identity via `lstat`, so
+/// the root stays ALIVE with a `None` frame instead of a false MoveSelf death.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
-  use rustix::fs::makedev;
-  match statx_sample(root) {
-    Ok(stx) => {
-      let dev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
-      let liveness = RootLiveness::Present(RootIdentity::new(dev, stx.stx_ino));
-      (liveness, frame_of(&stx))
-    }
+  match stat_sample(root) {
+    Ok(sample) => (
+      RootLiveness::Present(RootIdentity::new(sample.dev, sample.ino)),
+      sample.frame,
+    ),
     Err(rustix::io::Errno::NOENT) => (RootLiveness::Missing, None),
     Err(_) => (RootLiveness::Unreadable, None),
   }
@@ -705,17 +793,18 @@ impl FsOps for RealFs {
       None => (Vec::new(), false),
     };
     // ONE sample proves liveness AND reads the mount frame: `root_liveness_and_frame`
-    // is a single `statx` (symlink not followed, so a root retargeted to a symlink is
-    // a replacement, not a follow), yielding the `(dev, ino)` the death gate decides
-    // alive-vs-replaced on AND the frame the core adopts — from the SAME object. A
-    // same-object re-mount keeps `(dev, ino)` (the death gate passes) but moves the
-    // root to a new mount; adopting the frame from the identical sample keeps the
-    // enumerate descent fence relative to that new mount without ever pairing the
-    // identity verdict with a different object's frame (a replace/remount between two
-    // separate lookups would). A `Missing` root is DeleteSelf, any other stat failure
-    // is Unreadable (MoveSelf) — the exact `RootChanged`-probe mapping; the mount id
-    // is inotify's best-effort belt (`None` below 5.8), taken from the same result's
-    // mask.
+    // is a single `statx` (or one `lstat` below the 4.11 floor — symlink not followed
+    // either way, so a root retargeted to a symlink is a replacement, not a follow),
+    // yielding the `(dev, ino)` the death gate decides alive-vs-replaced on AND the
+    // frame the core adopts — from the SAME object. A same-object re-mount keeps
+    // `(dev, ino)` (the death gate passes) but moves the root to a new mount; adopting
+    // the frame from the identical sample keeps the enumerate descent fence relative
+    // to that new mount without ever pairing the identity verdict with a different
+    // object's frame (a replace/remount between two separate lookups would). A
+    // `Missing` root is DeleteSelf, any other stat failure is Unreadable (MoveSelf) —
+    // the exact `RootChanged`-probe mapping; the mount id is inotify's best-effort
+    // belt (`None` below 5.8, and always `None` on the pre-4.11 `lstat` fallback),
+    // taken from the same result's mask.
     let (root_liveness, root_mnt_id) = root_liveness_and_frame(root);
     MountRefresh {
       mounts,
@@ -885,25 +974,19 @@ impl FsOps for RealFs {
 /// from a SINGLE path sample, symlink not followed. `None` is a raced-away entry
 /// (the listing no longer reflects that name).
 ///
-/// On Linux this is ONE [`statx_sample`]: every fact comes from that one result,
+/// On Linux this is ONE [`stat_sample`]: every fact comes from that one result,
 /// so a rename/bind toggling between two syscalls can never pair one object's
 /// `(kind, dev, ino)` with another object's mount frame — the arm downstream
 /// verifies `(dev, ino)` only, so a raced foreign bind that split the sample
-/// could otherwise be classified descendable and armed. Off Linux, one
-/// `symlink_metadata` (no mount-id notion; the core fences on device alone) —
-/// still a single object's facts.
+/// could otherwise be classified descendable and armed. On a pre-4.11 kernel the
+/// sample is one `lstat` (frame `None`); the enumerate still builds every entry
+/// and descent runs on the device belt. Off Linux, one `symlink_metadata` (no
+/// mount-id notion; the core fences on device alone) — still a single object's
+/// facts.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn dir_entry_stat(entry_path: &Path) -> Option<(tributary_proto::FileKind, u64, u64, Option<u64>)> {
-  use rustix::fs::{FileType, makedev};
-  let stx = statx_sample(entry_path).ok()?;
-  let kind = match FileType::from_raw_mode(u32::from(stx.stx_mode)) {
-    FileType::Directory => tributary_proto::FileKind::Dir,
-    FileType::Symlink => tributary_proto::FileKind::Symlink,
-    FileType::RegularFile => tributary_proto::FileKind::File,
-    _ => tributary_proto::FileKind::Other,
-  };
-  let dev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
-  Some((kind, dev, stx.stx_ino, frame_of(&stx)))
+  let sample = stat_sample(entry_path).ok()?;
+  Some((sample.kind, sample.dev, sample.ino, sample.frame))
 }
 
 #[cfg(not(all(target_os = "linux", not(miri))))]

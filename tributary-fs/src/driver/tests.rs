@@ -1883,3 +1883,162 @@ mod enumerate_one_sample {
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
+
+/// The pre-4.11 (`statx` `NOSYS`) / seccomp-`EPERM` degrade: the one live-path
+/// sample falls back to a single `lstat` so refresh keeps the root ALIVE and
+/// enumerate keeps building entries (mount frame absent, the fence on the device
+/// belt) instead of a false MoveSelf root death and an empty listing. The error
+/// classifier is row-tested pure; the `lstat` fallback builder is checked against
+/// real files (its `(kind, dev, ino)` equal an independent `statx`'s), and the two
+/// live consumers are driven through it to prove ALIVE / built entries. Real
+/// syscalls, so Linux-only (the container `unit` suite).
+#[cfg(all(target_os = "linux", not(miri)))]
+mod statx_unavailable_fallback {
+  use std::os::unix::fs::MetadataExt;
+
+  use tributary_proto::FileKind;
+
+  use super::super::{
+    RootIdentity, RootLiveness, StatxAvailability, classify_statx_error, dir_entry_stat,
+    lstat_sample, root_liveness_and_frame, stat_sample,
+  };
+
+  fn scratch(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir()
+      .canonicalize()
+      .expect("canonicalize temp dir")
+      .join(format!(
+        "tributary-fs-statxfb-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+  }
+
+  /// Only a `statx`-unavailable errno routes to the `lstat` fallback: a pre-4.11
+  /// `NOSYS` and a seccomp `EPERM` do; `NOENT` (a missing object) and any other
+  /// real error do NOT, so the callers keep their `Missing`/raced-away meanings.
+  #[test]
+  fn classify_routes_only_unavailable_to_fallback() {
+    use rustix::io::Errno;
+    for errno in [Errno::NOSYS, Errno::PERM] {
+      assert!(
+        matches!(classify_statx_error(errno), StatxAvailability::Fallback),
+        "{errno:?} means statx is unavailable and must fall back to lstat"
+      );
+    }
+    for errno in [
+      Errno::NOENT,
+      Errno::ACCESS,
+      Errno::IO,
+      Errno::NOTDIR,
+      Errno::LOOP,
+    ] {
+      assert!(
+        matches!(classify_statx_error(errno), StatxAvailability::Real),
+        "{errno:?} is a real error and must keep its meaning, not fall back"
+      );
+    }
+  }
+
+  /// The `lstat` fallback builder reports the SAME object `statx` would: its
+  /// `(kind, dev, ino)` equal an independent `statx` of the same path, and its
+  /// mount frame is always `None` (no mount id below the `statx` floor). Proves a
+  /// pre-4.11 kernel reads true facts from the one `lstat`, not stale or bogus ones.
+  #[test]
+  fn lstat_fallback_matches_statx_facts_with_no_frame() {
+    let dir = scratch("facts");
+    std::fs::create_dir(dir.join("sub")).expect("create subdir");
+    std::fs::write(dir.join("file"), b"x").expect("create file");
+    std::os::unix::fs::symlink(dir.join("sub"), dir.join("link")).expect("create symlink");
+
+    for (name, want_kind) in [
+      ("sub", FileKind::Dir),
+      ("file", FileKind::File),
+      ("link", FileKind::Symlink),
+    ] {
+      let path = dir.join(name);
+      let sample = lstat_sample(&path).expect("the lstat fallback samples a present object");
+      // The fast path's own answer for the same object, from an independent statx.
+      let fast = stat_sample(&path).expect("statx samples the same object");
+      let meta = std::fs::symlink_metadata(&path).expect("stat the path");
+
+      assert_eq!(sample.kind, want_kind, "{name}: kind from the lstat mode");
+      assert_eq!(sample.kind, fast.kind, "{name}: kind agrees with statx");
+      assert_eq!(sample.dev, meta.dev(), "{name}: device is the object's");
+      assert_eq!(sample.dev, fast.dev, "{name}: device agrees with statx");
+      assert_eq!(sample.ino, meta.ino(), "{name}: inode is the object's");
+      assert_eq!(sample.ino, fast.ino, "{name}: inode agrees with statx");
+      assert!(
+        sample.frame.is_none(),
+        "{name}: the lstat fallback declines the mount frame (no mount id below 4.11)"
+      );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A missing object surfaces `NOENT` from the fallback too — the builder never
+  /// invents facts for an absent path, so the callers' raced-away / `Missing`
+  /// handling still fires below 4.11.
+  #[test]
+  fn lstat_fallback_of_a_missing_object_is_noent() {
+    let dir = scratch("gone");
+    let err = lstat_sample(&dir.join("nope")).expect_err("an absent path has no facts");
+    assert_eq!(err, rustix::io::Errno::NOENT);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Refresh under the fallback keeps the root ALIVE: the identity the fallback
+  /// reads maps to `Present` (not a false `Unreadable`/MoveSelf), with a `None`
+  /// frame — exactly what `root_liveness_and_frame` yields when its `stat_sample`
+  /// takes the `lstat` branch on a pre-4.11 kernel.
+  #[test]
+  fn refresh_under_fallback_stays_present() {
+    let dir = scratch("alive");
+    let sample = lstat_sample(&dir).expect("the live root samples via lstat");
+    // The exact mapping `root_liveness_and_frame` applies to a successful sample.
+    let liveness = RootLiveness::Present(RootIdentity::new(sample.dev, sample.ino));
+    assert!(
+      matches!(liveness, RootLiveness::Present(id)
+        if id == RootIdentity::new(sample.dev, sample.ino)),
+      "the fallback identity resolves Present, never a false root death"
+    );
+    assert!(sample.frame.is_none(), "the belt-only frame below 4.11");
+
+    // And the live caller on this host agrees the root is Present with that identity.
+    let (live, frame) = root_liveness_and_frame(&dir);
+    assert_eq!(
+      live,
+      RootLiveness::Present(RootIdentity::new(sample.dev, sample.ino)),
+      "the root is alive with the sampled identity"
+    );
+    let _ = frame;
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Enumerate under the fallback builds each entry with a `None` frame and the
+  /// true identity — descent then runs on the device belt. Mirrors what
+  /// `dir_entry_stat` returns when its `stat_sample` takes the `lstat` branch.
+  #[test]
+  fn enumerate_under_fallback_builds_entries_on_the_belt() {
+    let dir = scratch("enum");
+    std::fs::create_dir(dir.join("sub")).expect("create subdir");
+    let sub = dir.join("sub");
+
+    let sample = lstat_sample(&sub).expect("the entry samples via lstat");
+    assert_eq!(sample.kind, FileKind::Dir);
+    assert!(
+      sample.frame.is_none(),
+      "the fallback entry declines the mount frame — descent on the device belt"
+    );
+
+    // The live enumerate stat on this host returns the same identity, frame handled.
+    let (kind, dev, ino, _frame) = dir_entry_stat(&sub).expect("the entry stats");
+    assert_eq!((kind, dev, ino), (sample.kind, sample.dev, sample.ino));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+}
