@@ -242,7 +242,7 @@ fn forget_drops_admission() {
 }
 
 /// An in-root directory rename RE-PARENTS the one node IN PLACE (the real
-/// `admit_rename` path calls `learn` only — no `forget`, since the object did not
+/// `classify_rename` path calls `learn` only — no `forget`, since the object did not
 /// depart), and every descendant's resolved path follows automatically through
 /// the parent walk with no per-descendant rewrite. Re-parenting in place must
 /// PRESERVE the moved dir's descendants (they move with it) and keep the `children`
@@ -260,7 +260,7 @@ fn in_root_rename_reparents_the_whole_subtree() {
   assert_eq!(map.admit(&fid(3)), Some(PathBuf::from("/root/a/child")));
 
   // Rename /root/a → /root/b/a: re-parent `a` under `b` IN PLACE (learn, no
-  // forget) — exactly the in-root re-parent `admit_rename` performs.
+  // forget) — exactly the in-root re-parent `classify_rename` performs.
   map.learn(&fid(4), b"a", Some(&fid(2)));
 
   // The moved dir AND its pre-seeded child both resolve under the NEW path.
