@@ -557,6 +557,23 @@ impl ReseedContext {
   }
 }
 
+#[cfg(test)]
+impl ReseedContext {
+  /// A placeholder context for the reader's hermetic drain tests, which observe a
+  /// pending shutdown before the first read and so never drive the walk. The
+  /// anchor identity is arbitrary because no walk runs against it.
+  pub(crate) fn for_test(root: std::path::PathBuf) -> Self {
+    Self {
+      root,
+      fsid: [0u8; 8],
+      root_dev: 0,
+      root_mnt_id: None,
+      root_fid: Fid::new([0u8; 8], Box::from(&[0u8][..])),
+      max_directories: None,
+    }
+  }
+}
+
 /// How a per-entry walk failure is classified. fanotify's admission model needs
 /// a COMPLETE directory map (an admitted event resolves its directory FID against
 /// the map; a directory absent from the map drops its events as outside-root with

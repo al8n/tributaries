@@ -171,6 +171,44 @@ fn rename_with_one_half_is_lossy() {
   assert!(events.is_empty());
 }
 
+/// A `FAN_RENAME` whose mask is set but which carries NEITHER half is refused
+/// (lossy), not silently dropped with `rename = None`: an unpairable rename must
+/// take the ordered `Overflow` barrier, never fall through as a well-formed event.
+#[test]
+fn rename_with_zero_halves_is_lossy() {
+  let buf = event(FAN_RENAME, &[]);
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(
+    lossy,
+    "a rename with no halves is malformed, not a clean event"
+  );
+  assert!(events.is_empty());
+}
+
+/// A `FAN_RENAME` half whose name decodes empty (a bare NUL) is refused: an empty
+/// name would lower to an empty path component, so a present-but-nameless half is
+/// as malformed as a missing one and takes the loss barrier rather than the
+/// `unwrap_or_default()` empty-component drop.
+#[test]
+fn rename_with_an_empty_name_half_is_lossy() {
+  let old = info_record(
+    FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
+    &fid_payload(FSID_A, 1, b"srcdir", Some(b"old.txt")),
+  );
+  // A NEW half whose name field is a lone NUL: `decode_fid_record` trims it to
+  // `None`, so the pair cannot be completed.
+  let new = info_record(
+    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME,
+    &fid_payload(FSID_B, 2, b"dstdir", Some(b"")),
+  );
+  let mut info = old;
+  info.extend(new);
+  let buf = event(FAN_RENAME, &info);
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(lossy, "a rename half with an empty name is malformed");
+  assert!(events.is_empty());
+}
+
 /// A truncated trailing event (a header cut short, or an `event_len` past the
 /// buffer) stops the walk and marks the batch lossy, never panicking. The
 /// intact leading event is kept.

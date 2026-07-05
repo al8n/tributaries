@@ -156,8 +156,11 @@ fn run(fd: &OwnedFd, wake: &WakeState, control: &mpsc::Receiver<Control>, shared
         return;
       }
     }
-    if source_ready && !drain_events(fd, &mut buf, &mut table, shared) {
-      return;
+    if source_ready {
+      match drain_events(fd, &mut buf, &mut table, control, shared) {
+        DrainExit::Parked => {}
+        DrainExit::Shutdown | DrainExit::Died => return,
+      }
     }
   }
 }
@@ -183,22 +186,56 @@ fn drain_control(fd: &OwnedFd, table: &mut WdTable, control: &mpsc::Receiver<Con
   }
 }
 
-/// Reads the instance until `EAGAIN`, forwarding each buffer as one batch.
-/// Returns `false` when the stream died (fatal already signaled).
-fn drain_events(fd: &OwnedFd, buf: &mut [u8], table: &mut WdTable, shared: &ReaderShared) -> bool {
+/// Why [`drain_events`] returned. The reader re-parks and polls only on
+/// [`Parked`](DrainExit::Parked); [`Shutdown`](DrainExit::Shutdown) and
+/// [`Died`](DrainExit::Died) both exit the reader thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainExit {
+  /// The instance drained to `EAGAIN` (or a zero-length read): re-park and poll.
+  Parked,
+  /// A `Shutdown` was observed between reads. Teardown takes PRIORITY over
+  /// further event draining, so the reader stops now rather than after `EAGAIN`.
+  Shutdown,
+  /// The stream died; the terminal `Fatal` was already signaled.
+  Died,
+}
+
+/// Reads the instance until `EAGAIN`, forwarding each buffer as one batch, while
+/// servicing control BETWEEN reads so teardown and arm traffic never wait on an
+/// `EAGAIN` that a sustained event stream keeps postponing (the reader-teardown
+/// fairness contract — the `poll` loop's own control drain is reached only after
+/// `EAGAIN`, which never comes under load). The interleaved [`drain_control`] runs
+/// each pending batch inline — a mid-drain arm/disarm mutates the `wd` table, which
+/// the NEXT decoded buffer then sees — and stops the drain immediately on a
+/// `Shutdown`, so shutdown takes priority over further event draining. Control is
+/// observed at the top of the loop, between one buffer's forward and the next read,
+/// never mid-buffer, so the per-buffer loss barrier and attribution are unchanged.
+/// Returns [`DrainExit::Died`] when the stream died (fatal already signaled),
+/// [`DrainExit::Shutdown`] on a mid-drain shutdown, and [`DrainExit::Parked`] when
+/// the instance drained clean.
+fn drain_events(
+  fd: &OwnedFd,
+  buf: &mut [u8],
+  table: &mut WdTable,
+  control: &mpsc::Receiver<Control>,
+  shared: &ReaderShared,
+) -> DrainExit {
   loop {
+    if drain_control(fd, table, control) {
+      return DrainExit::Shutdown;
+    }
     let n = match rustix::io::read(fd, &mut *buf) {
       Ok(n) => n,
       // `EAGAIN` and `EWOULDBLOCK` are the same errno on Linux.
-      Err(Errno::AGAIN) => return true,
+      Err(Errno::AGAIN) => return DrainExit::Parked,
       Err(Errno::INTR) => continue,
       Err(err) => {
         signal_fatal(shared, SourceError::ReadFailed { source: err.into() });
-        return false;
+        return DrainExit::Died;
       }
     };
     if n == 0 {
-      return true;
+      return DrainExit::Parked;
     }
     let decoded = decode::decode_events(&buf[..n]);
     // Attribution still runs on a lossy buffer so the `wd` table stays accurate
@@ -385,140 +422,5 @@ fn errno_to_watch_error(err: Errno) -> WatchError {
   }
 }
 
-/// The pure decode constants restate the kernel ABI; this pins them to libc
-/// so they can never drift.
 #[cfg(test)]
-mod libc_cross_assert {
-  use super::decode;
-
-  #[test]
-  fn decode_constants_match_libc() {
-    assert_eq!(decode::IN_CREATE, libc::IN_CREATE);
-    assert_eq!(decode::IN_DELETE, libc::IN_DELETE);
-    assert_eq!(decode::IN_DELETE_SELF, libc::IN_DELETE_SELF);
-    assert_eq!(decode::IN_MODIFY, libc::IN_MODIFY);
-    assert_eq!(decode::IN_ATTRIB, libc::IN_ATTRIB);
-    assert_eq!(decode::IN_MOVE_SELF, libc::IN_MOVE_SELF);
-    assert_eq!(decode::IN_MOVED_FROM, libc::IN_MOVED_FROM);
-    assert_eq!(decode::IN_MOVED_TO, libc::IN_MOVED_TO);
-    assert_eq!(decode::IN_UNMOUNT, libc::IN_UNMOUNT);
-    assert_eq!(decode::IN_Q_OVERFLOW, libc::IN_Q_OVERFLOW);
-    assert_eq!(decode::IN_IGNORED, libc::IN_IGNORED);
-    assert_eq!(decode::IN_ISDIR, libc::IN_ISDIR);
-    assert_eq!(decode::IN_ONLYDIR, libc::IN_ONLYDIR);
-    assert_eq!(decode::IN_DONT_FOLLOW, libc::IN_DONT_FOLLOW);
-    assert_eq!(decode::IN_EXCL_UNLINK, libc::IN_EXCL_UNLINK);
-    assert_eq!(decode::IN_MASK_CREATE, libc::IN_MASK_CREATE);
-  }
-}
-
-/// The loss ordering barrier at the reader seam: a lossy buffer forwards ONLY the
-/// `Overflow`, never a Batch of the records that trailed the sentinel (whose paths
-/// a lost rename could make stale) — the inotify twin of the fanotify barrier.
-#[cfg(test)]
-mod barrier {
-  use core::num::NonZeroU64;
-
-  use tributary_proto::WatchId;
-
-  use crate::os::{
-    SourceMessage,
-    linux::{
-      attribute_events,
-      inotify::{
-        decode::{IN_CREATE, IN_MOVED_FROM, IN_Q_OVERFLOW, InotifyMask, RawInotifyEvent},
-        table::WdTable,
-      },
-    },
-    transport::TransportState,
-  };
-
-  fn watch(n: u64) -> WatchId {
-    WatchId::new(NonZeroU64::new(n).unwrap())
-  }
-
-  fn event(wd: i32, mask: u32, name: Option<&[u8]>) -> RawInotifyEvent {
-    RawInotifyEvent {
-      wd,
-      mask: InotifyMask(mask),
-      cookie: 0,
-      name: name.map(<[u8]>::to_vec),
-    }
-  }
-
-  /// The kind of each message the forward put on the queue, in order.
-  #[derive(Debug, PartialEq, Eq)]
-  enum Sent {
-    Batch(usize),
-    Overflow,
-  }
-
-  /// Attributes `records` against a table holding one live `wd`, then runs the
-  /// reader's `forward_attributed` over the result, capturing what it forwards.
-  fn run(records: Vec<RawInotifyEvent>, decode_lossy: bool) -> Vec<Sent> {
-    let mut table = WdTable::new();
-    table.register(3, watch(1));
-    let attributed = attribute_events(records, &mut table);
-    let transport = TransportState::new(8);
-    let sent = std::cell::RefCell::new(Vec::new());
-    super::forward_attributed(&transport, attributed, decode_lossy, |msg| {
-      sent.borrow_mut().push(match msg {
-        SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
-        SourceMessage::Overflow(_) => Sent::Overflow,
-        SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
-      });
-      true
-    });
-    sent.into_inner()
-  }
-
-  /// An `IN_Q_OVERFLOW` sentinel followed by an attributable record: the reader
-  /// drops the trailing record (its path could be stale after a lost rename) and
-  /// forwards ONLY the Overflow — no Batch precedes it.
-  #[test]
-  fn overflow_then_record_forwards_only_the_overflow() {
-    let sent = run(
-      vec![
-        event(-1, IN_Q_OVERFLOW, None),
-        // A live rename half whose reported path rides the anchor's recorded
-        // path — exactly what a lost rename in the window would make wrong.
-        event(3, IN_MOVED_FROM, Some(b"x")),
-      ],
-      false,
-    );
-    assert_eq!(
-      sent,
-      vec![Sent::Overflow],
-      "the barrier: the post-sentinel record is dropped, no Batch precedes the Overflow"
-    );
-  }
-
-  /// A decode-level loss (a truncated tail, `decode_lossy`) applies the same
-  /// barrier even with no overflow sentinel in the attributed records.
-  #[test]
-  fn decode_loss_forwards_only_the_overflow() {
-    let sent = run(vec![event(3, IN_CREATE, Some(b"x"))], true);
-    assert_eq!(
-      sent,
-      vec![Sent::Overflow],
-      "a decode loss drops the batch too"
-    );
-  }
-
-  /// A clean buffer forwards its attributed records as one Batch and no Overflow.
-  #[test]
-  fn clean_buffer_forwards_the_batch() {
-    let sent = run(
-      vec![
-        event(3, IN_CREATE, Some(b"a")),
-        event(3, IN_CREATE, Some(b"b")),
-      ],
-      false,
-    );
-    assert_eq!(
-      sent,
-      vec![Sent::Batch(2)],
-      "both records ride one Batch, no Overflow"
-    );
-  }
-}
+mod tests;

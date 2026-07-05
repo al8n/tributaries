@@ -388,3 +388,66 @@ fn lossy_buffer_with_a_blinding_reseed_is_fatal_only() {
     "no Batch and no Overflow — the terminal Fatal is the only signal"
   );
 }
+
+/// Reader-teardown fairness: the drain loop observes a pending shutdown between
+/// reads, so a source that stays readable can never wedge teardown. A real fd is
+/// needed (`/dev/zero`), so this is Linux-only and off under miri; the mid-drain
+/// arrival under a live producer is covered by the container smoke.
+#[cfg(all(target_os = "linux", not(miri)))]
+mod liveness {
+  use std::{sync::mpsc, time::Duration};
+
+  use super::super::{Control, DrainExit, ReaderShared, ReseedContext, drain_events};
+  use crate::os::{BackendStatsShared, linux::fanotify::map::FidMap, transport::TransportState};
+
+  /// An always-readable fd that never returns `EAGAIN`, standing in for a source
+  /// under sustained traffic: `drain_events` reads it forever unless it observes a
+  /// control message between reads.
+  fn never_eagain_fd() -> std::os::fd::OwnedFd {
+    std::fs::File::open("/dev/zero")
+      .expect("/dev/zero opens on linux")
+      .into()
+  }
+
+  fn reader_shared() -> (
+    ReaderShared,
+    async_channel::Receiver<crate::os::SourceMessage>,
+  ) {
+    let (tx, rx) = async_channel::unbounded();
+    let shared = ReaderShared {
+      queue: tx,
+      transport: TransportState::new(8),
+      stats: std::sync::Arc::new(BackendStatsShared::default()),
+    };
+    (shared, rx)
+  }
+
+  /// A pending `Shutdown` stops the drain at the TOP of the loop, before the next
+  /// read/decode — so even against a never-`EAGAIN` fd the reader observes teardown
+  /// immediately instead of draining forever. This pins the control check AHEAD of
+  /// the read: a check placed after `process_decoded` would first read `/dev/zero`,
+  /// decode it lossy, and drive a (failing) reseed, returning `Died` — never
+  /// `Shutdown`. A watchdog bounds the assertion so a regressed check that spins
+  /// forever fails as a timeout rather than hanging the suite.
+  #[test]
+  fn pending_shutdown_stops_the_drain_before_reading() {
+    let fd = never_eagain_fd();
+    let (tx, rx) = mpsc::channel();
+    tx.send(Control::Shutdown).expect("enqueue shutdown");
+    let (shared, _queue_rx) = reader_shared();
+    let reseed = ReseedContext::for_test(std::path::PathBuf::from("/nonexistent"));
+    let mut map = FidMap::new();
+    let mut buf = vec![0u8; 64 * 1024];
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared);
+      let _ = done_tx.send(exit);
+    });
+    let exit = done_rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("the drain must observe the pending shutdown, not spin on /dev/zero");
+    assert_eq!(exit, DrainExit::Shutdown);
+    worker.join().expect("worker joins");
+  }
+}

@@ -135,34 +135,65 @@ fn run(
         return;
       }
     }
-    if source_ready && !drain_events(fd, &mut buf, map, reseed, shared) {
-      return;
+    if source_ready {
+      match drain_events(fd, &mut buf, map, reseed, control, shared) {
+        DrainExit::Parked => {}
+        DrainExit::Shutdown | DrainExit::Died => return,
+      }
     }
   }
 }
 
-/// Reads the instance until `EAGAIN`, admitting and forwarding each buffer as
-/// one batch. Returns `false` when the stream died (fatal already signaled).
+/// Why [`drain_events`] returned. The reader re-parks and polls only on
+/// [`Parked`](Self::Parked); [`Shutdown`](Self::Shutdown) and
+/// [`Died`](Self::Died) both exit the reader thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainExit {
+  /// The instance drained to `EAGAIN` (or a zero-length read): re-park and poll.
+  Parked,
+  /// A `Shutdown` was observed between reads. Teardown takes PRIORITY over
+  /// further draining, so the reader stops now rather than after `EAGAIN`.
+  Shutdown,
+  /// The stream died; the terminal `Fatal` was already signaled.
+  Died,
+}
+
+/// Reads the instance until `EAGAIN`, admitting and forwarding each buffer as one
+/// batch, while observing a pending `Shutdown` BETWEEN reads so teardown never
+/// waits on an `EAGAIN` that a sustained event stream keeps postponing (the
+/// reader-teardown fairness contract — the `poll` loop's own shutdown check is
+/// reached only after `EAGAIN`, which never comes under load). The check sits at
+/// the top of the loop, before the next read/decode, so a reseed or subtree walk
+/// from the PREVIOUS buffer has fully completed before it runs: a shutdown that
+/// lands mid-reseed quiesces cleanly at the next read boundary rather than
+/// interrupting the walk. fanotify has no arm traffic, so shutdown is the only
+/// control message. Returns [`DrainExit::Died`] when the stream died (fatal
+/// already signaled), [`DrainExit::Shutdown`] on a mid-drain shutdown, and
+/// [`DrainExit::Parked`] when the instance drained clean.
 fn drain_events(
   fd: &OwnedFd,
   buf: &mut [u8],
   map: &mut FidMap,
   reseed: &ReseedContext,
+  control: &mpsc::Receiver<Control>,
   shared: &ReaderShared,
-) -> bool {
+) -> DrainExit {
   loop {
+    if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+      return DrainExit::Shutdown;
+    }
     let n = match rustix::io::read(fd, &mut *buf) {
       Ok(n) => n,
       // `EAGAIN` and `EWOULDBLOCK` are the same errno on Linux.
-      Err(Errno::AGAIN) => return true,
+      Err(Errno::AGAIN) => return DrainExit::Parked,
       Err(Errno::INTR) => continue,
       Err(err) => {
         signal_fatal(shared, SourceError::ReadFailed { source: err.into() });
-        return false;
+        return DrainExit::Died;
       }
     };
     if n == 0 {
-      return true;
+      return DrainExit::Parked;
     }
     let decoded = decode_events(&buf[..n]);
     if !process_decoded(
@@ -174,7 +205,7 @@ fn drain_events(
       |subtree, subtree_fid, budget| reseed.walk_subtree(subtree, subtree_fid, budget),
       |msg| shared.queue.try_send(msg).is_ok(),
     ) {
-      return false;
+      return DrainExit::Died;
     }
   }
 }

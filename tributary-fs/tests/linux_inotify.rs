@@ -17,7 +17,10 @@
 
 use std::{
   path::{Path, PathBuf},
-  sync::atomic::{AtomicU32, Ordering},
+  sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+  },
   time::Duration,
 };
 
@@ -387,5 +390,52 @@ async fn non_utf8_name_escalates_to_rescan() {
     .await
     .is_some(),
     "an undeliverable name surfaces as a covering Rescan"
+  );
+}
+
+/// Reader-teardown fairness under sustained traffic (the container companion to
+/// the hermetic mid-drain unit test). A producer churns files continuously so the
+/// inotify fd stays readable, then the watcher is CLOSED under that load.
+/// `close()` must fully quiesce (`Ok(())`): the reader observes the shutdown
+/// between reads rather than after an `EAGAIN` the sustained stream never yields.
+/// Without the interleaved control check the teardown `join` would wedge past the
+/// close grace and surface as `NotQuiesced`.
+#[tokio::test]
+async fn close_quiesces_under_sustained_traffic() {
+  let root = scratch_root("close-load");
+  let mut w = watcher();
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  let stop = Arc::new(AtomicBool::new(false));
+  let producer = {
+    let root = root.clone();
+    let stop = Arc::clone(&stop);
+    std::thread::spawn(move || {
+      let mut i = 0u64;
+      while !stop.load(Ordering::Relaxed) {
+        let p = root.join(format!("churn-{}", i % 64));
+        let _ = std::fs::write(&p, b"x");
+        let _ = std::fs::remove_file(&p);
+        i = i.wrapping_add(1);
+      }
+    })
+  };
+
+  // Confirm the stream is actually flowing (the reader is under load) before
+  // tearing down, so the close races a live drain rather than an idle one.
+  assert!(
+    wait_for(&mut w, |e| e.path().starts_with(&root))
+      .await
+      .is_some(),
+    "events flow under the producer before close"
+  );
+
+  let closed = tokio::time::timeout(DEADLINE, w.close()).await;
+  stop.store(true, Ordering::Relaxed);
+  producer.join().expect("producer joins");
+  assert!(
+    matches!(closed, Ok(Ok(()))),
+    "close must fully quiesce under sustained traffic — the reader observes shutdown mid-drain, \
+     not after an EAGAIN that never comes: {closed:?}"
   );
 }
