@@ -1188,29 +1188,40 @@ mod batch_memo {
 /// pre-classification gate dropping an admitted-FID event, the single-verb priority
 /// (running one verb of a merged mask and dropping the rest), or the rename-before-gate
 /// dispatch (applying a merged rename's re-parent and dropping its co-merged delete)
-/// would DISAGREE with it. On top of agreement, three invariants are asserted DIRECTLY
-/// against the event + map, independent of BOTH classifiers:
+/// would DISAGREE with it. On top of agreement, FOUR invariants are asserted DIRECTLY
+/// against the event + map:
 ///
-///   (i)   no-admitted-drop — an event whose addressing object is admitted is NEVER
+///   (i)   no-admitted-drop — an event whose ADDRESSING OBJECT is admitted is NEVER
 ///         `ForeignDrop` (the whole class: a name-less ATTRIB/MODIFY on an admitted
 ///         directory, addressed only by `target_fid`, once fell to the `dir_fid == None`
 ///         gate and was silently dropped);
 ///   (ii)  field-correctness — every forwarded (non-`Lossy`, non-`Drop`) action carries
 ///         exactly the field compile consumes (a single-object action its `path`, a
 ///         rename its `rename` pair), so no forward reaches compile without its target;
-///   (iii) no-one-sided-mutation — an admitted event whose merged mask names two or
-///         more structural verbs (rename counted among them) is `Lossy`, never a
+///   (iii) no-one-sided-mutation — an ACTION-AWARE-admitted event whose merged mask names
+///         two or more structural verbs (rename counted among them) is `Lossy`, never a
 ///         single-verb mutation that drops the other verb(s) (a merged create+delete
 ///         leaving a deleted dir learned; a merged rename+delete applying only the
 ///         re-parent — the class R27's rename-separate sweep + the mirrored model both
-///         missed).
+///         missed);
+///   (iv)  raw-membership — the INDEPENDENT backstop: a multi-structural mask over ANY
+///         map-resident raw FID is `Lossy`, decided from RAW handle membership
+///         ([`FidMap::contains`]) over the COMPLETE set of the event's carried FIDs, reusing
+///         NEITHER admittance model. Invariants (i)–(iii) all ride an admittance helper
+///         (`addressing_object_admitted` / `addressing_admitted`), so a blind spot SHARED
+///         between classify and the spec — the rename-only admittance that ignored
+///         `target_fid`, the recurring trap of an oracle inheriting the very gap it was
+///         written from the same understanding to catch — would hide from them together;
+///         (iv) reasons over `(raw event FIDs, raw map membership)` with no
+///         shape/priority/admittance logic, so it trips on exactly that class where the
+///         others are blind.
 ///
 /// An exhaustive generator sweeps the whole reachable mask space — the POWER SET of ALL
 /// subscribed action bits, `FAN_RENAME` INCLUDED, so every merged bitmask appears with
 /// NO EXCLUDED REGION (a merged rename+delete no longer escapes the sweep the way R27's
-/// rename-separate sweep let it) — and asserts all four per case. This SUBSUMES the
-/// totality table's non-panic sweep: totality proved classify RETURNS for every shape;
-/// the oracle proves it returns the RIGHT action.
+/// rename-separate sweep let it) — and asserts all five properties (agreement + (i)–(iv))
+/// per case. This SUBSUMES the totality table's non-panic sweep: totality proved classify
+/// RETURNS for every shape; the oracle proves it returns the RIGHT action.
 mod classification_oracle {
   use super::*;
 
@@ -1302,10 +1313,14 @@ mod classification_oracle {
     // THE UNIVERSAL multi-structural gate, mirroring classify: an ADMITTED event whose
     // merged mask names two or more structural verbs — `FAN_RENAME` counted among them
     // ([`multi_structural_spec`]) — is ambiguous and takes the loss barrier BEFORE any
-    // shape dispatch. Derived from the mask's own decode-level bit count and a read-only
-    // admittance ([`addressing_admitted`]), never from classify, so a classify that
-    // dropped the universal gate — dispatched a merged rename to a one-sided re-parent,
-    // or ran one verb of a merged dirent — would DISAGREE with the oracle.
+    // shape dispatch. Admittance here is ACTION-AWARE ([`addressing_admitted`]): in-root by
+    // ANY carried structural-verb FID (the rename parents, `dir_fid`, AND the moved/self
+    // `target_fid`), so a merged rename+self whose only in-root FID is `target_fid` — its
+    // rename parents foreign — is barred here, not dropped. Derived from the mask's own
+    // decode-level bit count and a read-only admittance, never from classify, so a classify
+    // that dropped the universal gate — dispatched a merged rename to a one-sided re-parent,
+    // ran one verb of a merged dirent, or reverted to the rename-only admittance that
+    // ignored `target_fid` — would DISAGREE with the oracle.
     if multi_structural_spec(event.mask) && addressing_admitted(map, event) {
       return Action::Lossy;
     }
@@ -1413,11 +1428,39 @@ mod classification_oracle {
     map
   }
 
-  /// Whether the event's addressing object is admitted — computed DIRECTLY from the
-  /// map, independent of both classifiers, for the universal multi-structural gate in
-  /// [`classify_oracle`] and the no-admitted-drop invariant. A rename is admitted when
-  /// EITHER end is in-root.
+  /// Whether the event REACHES any in-root object by ANY structural-verb FID it carries —
+  /// the ACTION-AWARE admittance for the universal multi-structural gate in
+  /// [`classify_oracle`] and the no-one-sided-mutation invariant, mirroring classify's fixed
+  /// `addresses_in_root`. A merged mask's verbs each address through their own FID, so the
+  /// event touches the root when ANY carried FID does: the rename halves' `old_dir`/
+  /// `new_dir`, the `dir_fid`, AND the `target_fid` (the moved/self object of a rename/
+  /// self-event — the class the rename-only model, which checked only the rename parents,
+  /// missed). A read-only path resolution, never mutating the map. Enumerated INLINE (not
+  /// via [`raw_fids`]) so the independent membership invariant, which does use [`raw_fids`],
+  /// shares no enumeration with the admittance model it backstops — reinjecting this model's
+  /// blind spot cannot silently shrink that invariant's FID set too.
   fn addressing_admitted(map: &FidMap, event: &RawFanotifyEvent) -> bool {
+    let rename_ends = event
+      .rename
+      .iter()
+      .flat_map(|rename| [&rename.old_dir, &rename.new_dir]);
+    let singles = [event.dir_fid.as_ref(), event.target_fid.as_ref()]
+      .into_iter()
+      .flatten();
+    rename_ends
+      .chain(singles)
+      .any(|fid| map.resolve_path(fid).is_some())
+  }
+
+  /// Whether the event's ADDRESSING OBJECT — the directory whose event this IS — is
+  /// admitted, the concept the no-admitted-drop invariant guards: a rename addresses its
+  /// two directory ENDS (in-root when EITHER resolves); a named event its parent `dir_fid`;
+  /// a name-less event its own self-FID. A rename's moved/child `target_fid` is deliberately
+  /// NOT an addressing object here — a rename whose ends are both foreign is genuinely
+  /// foreign even if its moved FID coincides with a mapped handle, so this stays the
+  /// per-shape addressing gate, distinct from the action-aware [`addressing_admitted`] the
+  /// ambiguity gate uses.
+  fn addressing_object_admitted(map: &FidMap, event: &RawFanotifyEvent) -> bool {
     if let Some(rename) = &event.rename {
       return map.resolve_path(&rename.old_dir).is_some()
         || map.resolve_path(&rename.new_dir).is_some();
@@ -1428,24 +1471,57 @@ mod classification_oracle {
     )
   }
 
-  /// Asserts the three contract properties for one event against a fresh map:
-  /// AGREEMENT (classify's action == the oracle's), NO-ADMITTED-DROP (an admitted
-  /// addressing object is never dropped), and FIELD-CORRECTNESS (a forwarded action
-  /// carries the field compile consumes).
-  fn assert_contract(label: &str, event: &RawFanotifyEvent) {
+  /// Every raw FID the event carries — `dir_fid`, `target_fid`, and (for a rename) both
+  /// halves' `old_dir`/`new_dir`, whichever are `Some`. The COMPLETE present set, listed
+  /// with NO shape or mask reasoning, so the independent membership invariant that consumes
+  /// it cannot inherit a shape-selection blind spot (an admittance model that FORGETS a
+  /// carried FID — the rename-only gate that ignored `target_fid`). Deliberately NOT shared
+  /// with [`addressing_admitted`], so reinjecting that model's blind spot leaves this
+  /// enumeration complete and the invariant's teeth intact.
+  fn raw_fids(event: &RawFanotifyEvent) -> Vec<&Fid> {
+    let mut fids = Vec::new();
+    if let Some(dir) = event.dir_fid.as_ref() {
+      fids.push(dir);
+    }
+    if let Some(target) = event.target_fid.as_ref() {
+      fids.push(target);
+    }
+    if let Some(rename) = event.rename.as_ref() {
+      fids.push(&rename.old_dir);
+      fids.push(&rename.new_dir);
+    }
+    fids
+  }
+
+  /// Asserts the FIVE contract properties for one event against a fresh map: AGREEMENT
+  /// (classify's action == the oracle's), NO-ADMITTED-DROP (an admitted addressing object is
+  /// never dropped), FIELD-CORRECTNESS (a forwarded action carries the field compile
+  /// consumes), NO-ONE-SIDED-MUTATION (an action-aware-admitted multi-structural mask is
+  /// Lossy), and the INDEPENDENT RAW-MEMBERSHIP invariant (a multi-structural mask over any
+  /// map-resident raw FID is Lossy, checked via raw handle membership rather than either
+  /// admittance model). Returns whether the raw-membership invariant FIRED, so the sweep can
+  /// prove it is exercised, not vacuous.
+  fn assert_contract(label: &str, event: &RawFanotifyEvent) -> bool {
     let mut map = oracle_map();
     // The oracle reads the PRE-classify state; classify decides against the same state
-    // (mutating as it acts). Snapshot both spec facts before classify runs.
+    // (mutating as it acts). Snapshot every spec fact before classify runs.
     let expected = classify_oracle(&map, event);
-    let admitted = addressing_admitted(&map, event);
+    let object_admitted = addressing_object_admitted(&map, event);
+    let reaches_in_root = addressing_admitted(&map, event);
+    // The INDEPENDENT membership fact: any raw FID present on the event is a stored map
+    // node (RAW [`FidMap::contains`] — a `dirs.contains_key`, a stored node incl. the root
+    // anchor, with NO parent-walk and NO `resolve_path`/`addressing`), read against the
+    // PRE-classify map and reusing NEITHER admittance model.
+    let resident = raw_fids(event).into_iter().any(|fid| map.contains(fid));
     let admission = classify(&mut map, event, &mut MemoBatch::new());
     let got = action_of(&admission);
 
     // (1) Agreement: classify selects exactly the spec's action.
     assert_eq!(got, expected, "agreement `{label}`: {admission:?}");
 
-    // (2) No-admitted-drop: an admitted addressing object is never the firehose drop.
-    if admitted {
+    // (2) No-admitted-drop: an admitted ADDRESSING OBJECT (the rename ends / dirent parent
+    // / self-FID — NOT a rename's moved `target_fid`) is never the firehose drop.
+    if object_admitted {
       assert_ne!(
         got,
         Action::ForeignDrop,
@@ -1470,20 +1546,39 @@ mod classification_oracle {
       Admission::ForeignDrop | Admission::Lossy => {}
     }
 
-    // (4) No-one-sided-mutation: an ADMITTED event whose merged bitmask names two or
-    // more structural verbs — a rename now counted among them — MUST route to the loss
-    // barrier, never a single-verb map mutation that silently drops the other verb(s)
-    // (a merged create+delete leaving a deleted dir learned; a merged rename+delete
-    // applying only the re-parent). Computed DIRECTLY from the event + map, independent
-    // of BOTH classifiers, so it holds even against a blind spot they might share — and
-    // spans the WHOLE power set including rename, with no shape carved out.
-    if admitted && multi_structural_spec(event.mask) {
+    // (4) No-one-sided-mutation: an event that REACHES the root by any carried
+    // structural-verb FID (action-aware admittance) whose merged bitmask names two or more
+    // structural verbs — a rename counted among them — MUST route to the loss barrier, never
+    // a single-verb map mutation that silently drops the other verb(s) (a merged
+    // create+delete leaving a deleted dir learned; a merged rename+delete applying only the
+    // re-parent). Spans the WHOLE power set including rename, with no shape carved out.
+    if reaches_in_root && multi_structural_spec(event.mask) {
       assert_eq!(
         got,
         Action::Lossy,
         "no-one-sided-mutation `{label}`: an admitted multi-structural mask must be Lossy: {admission:?}"
       );
     }
+
+    // (5) INDEPENDENT raw-membership invariant — the guarantee that reuses NEITHER
+    // admittance model. If the map contains ANY raw FID the event carries ([`raw_fids`], the
+    // complete present set) via raw handle membership, and the mask is multi-structural,
+    // classify MUST take the loss barrier. Reasoning over the complete present-FID set via
+    // raw `contains` — never a shape-selected subset, never `addresses_in_root` /
+    // `addressing_admitted` — it catches the exact blind-spot class where admittance-shape
+    // reasoning ignores a carried FID (a merged rename whose only in-root FID is
+    // `target_fid`), EVEN IF classify's `addresses_in_root` and the oracle's
+    // `addressing_admitted` shared that model. This is a guarantee (4)'s model-based check
+    // cannot make: (4) rides the very admittance model a shared blind spot would corrupt.
+    let raw_membership_fired = resident && multi_structural_spec(event.mask);
+    if raw_membership_fired {
+      assert_eq!(
+        got,
+        Action::Lossy,
+        "raw-membership `{label}`: a multi-structural mask over a map-resident raw FID must be Lossy: {admission:?}"
+      );
+    }
+    raw_membership_fired
   }
 
   /// The COMPLETE input space: the POWER SET of ALL subscribed action bits — the seven
@@ -1547,6 +1642,10 @@ mod classification_oracle {
 
     let mut checked = 0u64;
     let mut multi_structural_seen = 0u64;
+    // How many cases the INDEPENDENT raw-membership invariant (5) actually asserted on —
+    // pinned below so a regression that made it vacuous (e.g. a `raw_fids` that dropped a
+    // FID slot, or a `contains` that stopped seeing the root anchor) trips the guard.
+    let mut raw_membership_fired = 0u64;
     for subset in 0u32..(1u32 << SUBSCRIBED.len()) {
       let mut mask = 0u64;
       for (bit, flag) in SUBSCRIBED.iter().enumerate() {
@@ -1575,10 +1674,10 @@ mod classification_oracle {
                   new_name: b"new".to_vec(),
                 }),
               };
-              assert_contract(
+              raw_membership_fired += assert_contract(
                 &format!("rename mask={mask:#x} old={old_dir:?} new={new_dir:?} target={target:?}"),
                 &event,
-              );
+              ) as u64;
               checked += 1;
             }
           }
@@ -1595,10 +1694,10 @@ mod classification_oracle {
                 name: name.map(<[u8]>::to_vec),
                 rename: None,
               };
-              assert_contract(
+              raw_membership_fired += assert_contract(
                 &format!("mask={mask:#x} dir={dir:?} target={target:?} name={name:?}"),
                 &event,
-              );
+              ) as u64;
               checked += 1;
             }
           }
@@ -1623,6 +1722,17 @@ mod classification_oracle {
     assert_eq!(
       multi_structural_seen, 208,
       "the rename-inclusive power set must span every multi-structural merge"
+    );
+
+    // The INDEPENDENT raw-membership invariant is NON-VACUOUSLY exercised: the sweep drives
+    // many multi-structural masks over map-resident FIDs (a rename with an in-root end or
+    // target, a dirent under an in-root parent, a self-event on an admitted object), each of
+    // which fires assertion (5). A regression that silently stopped it firing — the invariant
+    // reduced to a no-op — drops this to zero and trips here, so the backstop can never
+    // rot into a rubber stamp.
+    assert!(
+      raw_membership_fired > 0,
+      "the independent raw-membership invariant must be exercised across the sweep, not vacuous"
     );
   }
 
@@ -1746,5 +1856,52 @@ mod classification_oracle {
       Some(PathBuf::from("/root/sub")),
       "the directory stays at its original path; the reseed barrier rebuilds truth, not a half-applied rename"
     );
+  }
+
+  /// The EXACT class the action-aware admittance closes, as targeted rows: a MERGED
+  /// bitmask that is a rename co-merged with the moved object's own self-death
+  /// (`FAN_RENAME|FAN_MOVE_SELF` and `FAN_RENAME|FAN_DELETE_SELF`, both `ONDIR`) whose
+  /// rename PARENTS are both foreign but whose moved `target_fid` IS an in-root object.
+  /// The rename-only admittance saw only the foreign parents and dropped it
+  /// (`ForeignDrop`), silently losing an in-root — possibly ROOT — death instead of taking
+  /// the barrier; the action-aware gate sees the in-root `target_fid` and routes the
+  /// ambiguity to `Lossy`. Swept for target = the root anchor AND an admitted non-root
+  /// directory, and each row proves the barrier mutated nothing (the reseed rebuilds truth,
+  /// not a one-sided re-parent/forget).
+  #[test]
+  fn merged_rename_self_with_foreign_parents_but_in_root_target_is_lossy() {
+    let foreign = fid(99);
+    for mask in [
+      FAN_RENAME | FAN_MOVE_SELF | FAN_ONDIR,
+      FAN_RENAME | FAN_DELETE_SELF | FAN_ONDIR,
+    ] {
+      for target in [fid(1), fid(2)] {
+        let mut map = oracle_map();
+        let generation = map.generation();
+        let event = rename_ev(
+          mask,
+          Some(target.clone()),
+          foreign.clone(),
+          b"x",
+          foreign.clone(),
+          b"y",
+        );
+        let admission = classify_one(&mut map, &event);
+        assert!(
+          matches!(admission, Admission::Lossy),
+          "a merged rename+self with foreign parents but in-root target {target:?} (mask {mask:#x}) must be Lossy, not ForeignDrop: {admission:?}"
+        );
+        assert_eq!(
+          map.generation(),
+          generation,
+          "the ambiguous merge took the barrier before any shape acted — no one-sided mutation"
+        );
+        assert_eq!(
+          map.admit(&fid(2)),
+          Some(PathBuf::from("/root/sub")),
+          "the node is untouched; the reseed barrier rebuilds the truth"
+        );
+      }
+    }
   }
 }

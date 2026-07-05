@@ -5,8 +5,8 @@ use crate::os::{
   BackendStatsShared, SourceMessage,
   linux::fanotify::{
     fid::{
-      DecodeOutcome, FAN_CREATE, FAN_DELETE, FAN_MODIFY, FAN_ONDIR, FAN_RENAME, FanMask, Fid,
-      RawFanotifyEvent, RenameInfo,
+      DecodeOutcome, FAN_CREATE, FAN_DELETE, FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR, FAN_RENAME,
+      FanMask, Fid, RawFanotifyEvent, RenameInfo,
     },
     map::{FidMap, SeedEntry},
   },
@@ -445,6 +445,53 @@ fn merged_rename_delete_takes_the_barrier_and_reseeds() {
     map.admit(&fid(2)),
     None,
     "no one-sided re-parent survived: the reseed rebuilt from the walk, not a half-applied rename"
+  );
+}
+
+/// The rename-only-admittance class, driven end to end at the reader: a directory renamed
+/// AND self-moved in ONE kernel-merged event (`FAN_RENAME|FAN_MOVE_SELF|ONDIR`, both rename
+/// halves present) whose rename PARENTS are both foreign but whose moved `target_fid` IS the
+/// watched ROOT. The rename-only admittance saw only the foreign parents and `ForeignDrop`ped
+/// it — silently losing an in-root root-death event and leaving the root UN-reseeded; the
+/// action-aware gate sees the in-root `target_fid` and routes the ambiguity to
+/// `Admission::Lossy`, so the reader takes the SAME per-buffer barrier a wire loss does. A
+/// would-forward modify co-batched AHEAD of it is dropped (only the `Overflow`, no Batch), the
+/// map is RESEEDED (the root is not left un-reseeded), and the stream stays live. The
+/// reader-level complement to the classify oracle for the class the action-aware admittance
+/// closes.
+#[test]
+fn merged_rename_self_hidden_in_root_target_takes_the_barrier_and_reseeds() {
+  let mut map = seeded_with_sub();
+  let merged = RawFanotifyEvent {
+    mask: FanMask::new(FAN_RENAME | FAN_MOVE_SELF | FAN_ONDIR),
+    dir_fid: None,
+    target_fid: Some(fid(1)), // the ROOT — the in-root object the foreign parents hid
+    name: None,
+    rename: Some(RenameInfo {
+      old_dir: fid(90),
+      old_name: b"root".to_vec(),
+      new_dir: fid(91),
+      new_name: b"root".to_vec(),
+    }),
+  };
+  // A would-forward modify AHEAD of the merged event: the barrier must drop it too.
+  let decoded = DecodeOutcome {
+    events: vec![modify_under(fid(2), b"before"), merged],
+    lossy: false,
+  };
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  assert!(
+    alive,
+    "the ambiguous merge reseeds and keeps the stream live"
+  );
+  assert_eq!(
+    reseeds, 1,
+    "the in-root target_fid is seen, so the merge takes the barrier and reseeds — the root is not left un-reseeded"
+  );
+  assert_eq!(
+    sent,
+    vec![Sent::Overflow],
+    "the barrier: only the Overflow — the merged event AND the co-batched suffix drop"
   );
 }
 
