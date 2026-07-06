@@ -16,7 +16,9 @@
 //! `--test-threads=1` (the verify script and CI do): the loopback helper mounts
 //! and unmounts a shared filesystem, which concurrent tests would race.
 
-#![cfg(all(target_os = "linux", feature = "tokio"))]
+// not(miri): drives real fanotify/statx syscalls, an ext4 loopback, and a tokio
+// runtime — none of which miri can execute. Sans-I/O logic lives in the lib tests.
+#![cfg(all(target_os = "linux", feature = "tokio", not(miri)))]
 
 use std::{
   path::{Path, PathBuf},

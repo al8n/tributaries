@@ -36,6 +36,12 @@ tokio = { version = "1", features = [
   "time",
 ] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The watch-limit integration cell probes, via a private inotify fd, whether the
+# kernel actually enforces the `max_user_watches` shrink — some containerized
+# kernels accept (and echo back) the write yet never charge watches against it.
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 # `fs` covers inotify + openat + statfs/fstatfs + stat/statat; `event` covers
