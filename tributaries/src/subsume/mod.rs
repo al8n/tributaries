@@ -77,10 +77,13 @@ pub(crate) enum WatchOutcome<R> {
     sub: Subscription,
   },
   /// `path` is a strict ancestor of one or more existing roots, which it subsumes.
-  /// The driver must arm a wider watch at `new_root_path` (always [`Interest::all`],
-  /// design §4) **before** releasing the subsumed roots (`unwatch`), so coverage
-  /// never gaps; `commit_watch` re-points `repointed` (and adds the new `sub`) onto
-  /// it. No interest union is carried — every root is armed `Interest::all`, so a
+  /// The driver must **release the subsumed roots (`unwatch`) first, then arm** the
+  /// wider watch at `new_root_path` (always [`Interest::all`], design §4) — the lower
+  /// watcher rejects a root overlapping a live one (`Overlaps`), so the wider root
+  /// cannot be armed while a subsumed one is live. The brief coverage gap between the
+  /// two is closed by the dominating `Rescan` each re-pointed subscriber receives.
+  /// `commit_watch` re-points `repointed` (and adds the new `sub`) onto the wider
+  /// root. No interest union is carried — every root is armed `Interest::all`, so a
   /// widen never has to widen a narrower root's mask.
   Widen {
     /// The canonical path of the new, wider root (equal to the new subscription's
@@ -401,6 +404,48 @@ where
   /// The live record for `fs_root`, if any.
   pub(crate) fn entry(&self, fs_root: R) -> Option<&RootEntry> {
     self.entries.get(&fs_root)
+  }
+
+  /// Re-keys a live root from a dead handle `old` to a freshly-armed `new`, keeping its
+  /// path, subscribers, and index key — used on the **widen rollback** (design §4/§8).
+  ///
+  /// When a widen disarms the subsumed roots and then fails to bring up the wider root,
+  /// the driver re-arms each subsumed root to restore the pre-widen state. A fresh arm
+  /// yields a *new* handle (fs never reuses one), and events from it will carry that new
+  /// handle in [`root`](tributary_fs::Event::root), so the subsumer must re-point the
+  /// root's entry and every subscriber onto it or fan-out would fail to resolve them.
+  /// The root's canonical path and subscriber set are unchanged (the rollback restores,
+  /// it does not re-plan); [`iradix::unsync::Radix::insert`] overwrites the same key.
+  pub(crate) fn rekey_root(&mut self, old: R, new: R) {
+    let entry = self.entries.remove(&old).expect("re-keyed root is live");
+    self.index.insert(entry.path.as_path(), new);
+    for &sub in &entry.subscribers {
+      self
+        .subs
+        .get_mut(&sub)
+        .expect("re-keyed root's subscriber is live")
+        .root = new;
+    }
+    self.entries.insert(new, entry);
+  }
+
+  /// Force-drops the root `handle` and every subscriber riding it, returning those
+  /// subscribers so the driver can reclaim their per-subscription state (filter, epoch
+  /// ledger). The **degenerate** widen path (design §4/§8): a rollback re-arm of a
+  /// subsumed root itself failed, so that root cannot be restored and its subscribers
+  /// are terminally uncovered — the driver has signalled each a loss `Rescan`, and this
+  /// tears the dead root out of the index/entries/side-table so no later event routes to
+  /// its (never-armed) handle and the invariants (no root with a dead handle, no dangling
+  /// side-table record) still hold.
+  pub(crate) fn force_remove_root(&mut self, handle: R) -> Vec<Subscription> {
+    let Some(entry) = self.entries.remove(&handle) else {
+      return Vec::new();
+    };
+    self.index.remove(entry.path.as_path());
+    for &sub in &entry.subscribers {
+      self.subs.remove(&sub);
+    }
+    entry.subscribers
   }
 
   /// The canonical path a live subscription was registered at, if any (its entry

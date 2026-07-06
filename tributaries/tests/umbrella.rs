@@ -145,6 +145,65 @@ async fn overlapping_subscriptions_one_kernel_watch() {
   w.close().await.expect("close");
 }
 
+/// The **widen** narrow-first-then-ancestor case over the PRODUCTION armer (design §4):
+/// watch a child, then watch its ancestor. The ancestor watch is a widen — it subsumes
+/// the child's root. Because [`tributary_fs::Watcher::watch`] rejects a root overlapping
+/// a live one (`Overlaps`), the widen can only succeed by unwatching the subsumed child
+/// root BEFORE arming the wider ancestor root. This asserts (a) the ancestor watch
+/// SUCCEEDS (`Ok`, not `Overlaps`) — the regression: the pre-fix arm-before-unwatch order
+/// would have failed here against the real watcher; (b) the child subscription receives
+/// the widen dominating `Rescan`; and (c) a subsequent write under the child is delivered
+/// to BOTH subscriptions — events keep routing through the widened root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn widen_narrow_first_then_ancestor_succeeds_and_keeps_routing() {
+  let (_dir, root) = scratch("widen");
+  let child = root.join("child");
+  std::fs::create_dir_all(&child).expect("create child dir");
+
+  let mut w = watcher(TributariesOptions::new());
+
+  // Watch the NARROW child first (arms one kernel watch of /root/child).
+  let child_sub = w
+    .watch(&child, Interest::all(), Filter::all())
+    .await
+    .expect("watch the narrow child first");
+
+  // Now watch its ANCESTOR /root — a widen. Against the real watcher this succeeds ONLY
+  // because the widen unwatches /root/child before arming /root; the pre-fix
+  // arm-before-unwatch order would have been rejected `Overlaps` here.
+  let root_sub = w.watch(&root, Interest::all(), Filter::all()).await.expect(
+    "the ancestor watch widens (Ok, not Overlaps) — arms the wider root after \
+             disarming the subsumed child",
+  );
+  assert_ne!(
+    child_sub, root_sub,
+    "each watch yields its own subscription id"
+  );
+
+  // (b) The re-pointed child subscription receives the widen dominating Rescan (naming
+  // the widened root, or an ancestor of the child).
+  let saw_rescan = wait_for(&mut w, |e| {
+    e.subscription() == child_sub && e.is_rescan() && child.starts_with(e.path())
+  })
+  .await;
+  assert!(
+    saw_rescan.is_some(),
+    "the widen re-point delivers the child subscription a dominating Rescan"
+  );
+
+  // (c) A write under the child after the widen must reach BOTH subscriptions — the child
+  // (re-pointed) and the ancestor — proving events keep routing through the widened root.
+  let file = child.join("after-widen.txt");
+  std::fs::write(&file, b"payload").expect("write under child after widen");
+  let both = wait_until_all(&mut w, &[child_sub, root_sub], |e| reaches(e, &file)).await;
+  assert!(
+    both,
+    "a write under the child routes to both subscriptions through the widened root"
+  );
+
+  w.close().await.expect("close");
+}
+
 /// One raw change under the overlap of two subscriptions fans out to BOTH, each under
 /// its own subscription id (design §5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
