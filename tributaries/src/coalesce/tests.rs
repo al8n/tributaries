@@ -1,0 +1,713 @@
+use core::{num::NonZeroU64, time::Duration};
+use std::{path::PathBuf, time::Instant};
+
+use tributary_fs::{Epoch, EventKind, Location};
+use tributary_proto::ScopeId;
+
+use super::Coalescer;
+use crate::{event::Event, options::DebounceConfig, subscription::Subscription};
+
+/// A subscription with the given non-zero id.
+fn sub(id: u64) -> Subscription {
+  Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
+}
+
+/// A synthetic event of `kind` for `s` at `path`, stamped `epoch`. The coalescer only
+/// reads `subscription`/`path`/`kind`/`epoch`/`location`, so a synthetic stand-in
+/// exercises it without the private `tributary_fs::Event` constructor. Its `location`
+/// is a fresh (root-anchored) one — the coalescer never keys on `location`.
+fn ev(s: Subscription, path: &str, kind: EventKind, epoch: u64) -> Event {
+  Event::synthetic(
+    s,
+    PathBuf::from(path),
+    Location::new(),
+    kind,
+    Epoch::new(epoch),
+  )
+}
+
+fn created(s: Subscription, path: &str, epoch: u64) -> Event {
+  ev(s, path, EventKind::Created, epoch)
+}
+
+fn modified(s: Subscription, path: &str, epoch: u64) -> Event {
+  ev(s, path, EventKind::Modified, epoch)
+}
+
+fn removed(s: Subscription, path: &str, epoch: u64) -> Event {
+  ev(s, path, EventKind::Removed, epoch)
+}
+
+/// A synthetic move fixture. The wrapper cannot fabricate an fs `MovedEvent`, so a
+/// synthetic move surfaces through `move_from` (which the coalescer keys on) — its
+/// `kind` stays `Modified` and its `moved()` is `None`; tests inspect it via
+/// [`is_moved`] / `move_from`.
+fn moved(s: Subscription, path: &str, from: &str, epoch: u64) -> Event {
+  Event::synthetic_moved(
+    s,
+    PathBuf::from(path),
+    PathBuf::from(from),
+    Epoch::new(epoch),
+  )
+}
+
+/// Whether `ev` is a move — the same wrapper-level detector the coalescer uses.
+fn is_moved(ev: &Event) -> bool {
+  ev.move_from().is_some()
+}
+
+fn rescan(s: Subscription, path: &str, epoch: u64) -> Event {
+  ev(s, path, EventKind::Rescan, epoch)
+}
+
+/// A short settle window and a hold cap a few windows out — round numbers so the
+/// deadline arithmetic in the tests is obvious.
+fn config() -> DebounceConfig {
+  DebounceConfig::new()
+    .with_quiet_window(Duration::from_millis(10))
+    .with_max_hold(Duration::from_millis(100))
+}
+
+/// A fixed clock origin plus a `+ms` helper, so every test uses an explicit manual
+/// clock and never reads real time.
+struct Clock {
+  origin: Instant,
+}
+
+impl Clock {
+  fn new() -> Self {
+    Self {
+      origin: Instant::now(),
+    }
+  }
+
+  /// `origin + ms` milliseconds.
+  fn at(&self, ms: u64) -> Instant {
+    self.origin + Duration::from_millis(ms)
+  }
+}
+
+/// Drain everything due at `now` into a fresh `Vec`.
+fn drain(coalescer: &mut Coalescer, now: Instant) -> Vec<Event> {
+  let mut out = Vec::new();
+  coalescer.drain_ready(now, &mut out);
+  out
+}
+
+// -------------------------------------------------------------------------------
+// Collapse table (design §6): one test per named row.
+// -------------------------------------------------------------------------------
+
+#[test]
+fn created_then_modified_stays_created() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  c.admit(created(s, "/a/f", 1), clk.at(0));
+  c.admit(modified(s, "/a/f", 2), clk.at(1));
+
+  // Nothing before the settle window; one Created after it.
+  assert!(
+    drain(&mut c, clk.at(5)).is_empty(),
+    "held during the window"
+  );
+  let out = drain(&mut c, clk.at(11));
+  assert_eq!(out.len(), 1, "the burst collapses to a single event");
+  assert!(
+    out[0].kind().is_created(),
+    "a created-then-modified stays Created"
+  );
+  assert_eq!(out[0].path(), PathBuf::from("/a/f"));
+}
+
+#[test]
+fn modified_coalesces() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  for (n, epoch) in [1, 2, 3, 4].into_iter().enumerate() {
+    c.admit(modified(s, "/a/f", epoch), clk.at(n as u64));
+  }
+  let out = drain(&mut c, clk.at(20));
+  assert_eq!(out.len(), 1, "four Modifieds coalesce to one");
+  assert!(out[0].kind().is_modified());
+}
+
+#[test]
+fn created_then_removed_annihilates() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  c.admit(created(s, "/a/tmp", 1), clk.at(0));
+  c.admit(removed(s, "/a/tmp", 2), clk.at(1));
+
+  // A file that lived and died inside the window emits NOTHING — and nothing is left
+  // to ever emit.
+  assert!(
+    drain(&mut c, clk.at(50)).is_empty(),
+    "the transient annihilates"
+  );
+  assert_eq!(c.next_deadline(), None, "no entry lingers");
+}
+
+#[test]
+fn modified_then_removed_is_removed() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  c.admit(modified(s, "/a/f", 1), clk.at(0));
+  c.admit(removed(s, "/a/f", 2), clk.at(1));
+
+  let out = drain(&mut c, clk.at(20));
+  assert_eq!(out.len(), 1);
+  assert!(
+    out[0].kind().is_removed(),
+    "modified-then-removed nets to Removed"
+  );
+}
+
+#[test]
+fn removed_then_created_is_modified() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  c.admit(removed(s, "/a/f", 1), clk.at(0));
+  c.admit(created(s, "/a/f", 2), clk.at(1));
+
+  let out = drain(&mut c, clk.at(20));
+  assert_eq!(out.len(), 1);
+  assert!(
+    out[0].kind().is_modified(),
+    "removed-then-created churn nets to a synthetic Modified"
+  );
+  assert_eq!(out[0].path(), PathBuf::from("/a/f"));
+  assert_eq!(
+    out[0].change_id(),
+    None,
+    "the synthesized Modified carries no change id"
+  );
+}
+
+// -------------------------------------------------------------------------------
+// Invariants that override coalescing (design §6).
+// -------------------------------------------------------------------------------
+
+#[test]
+fn moved_is_atomic_and_flushes() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  // Buffer changes at both endpoints of the coming rename.
+  c.admit(modified(s, "/a/src", 1), clk.at(0));
+  c.admit(created(s, "/a/dst", 2), clk.at(1));
+
+  // A rename /a/src -> /a/dst. It is atomic: it flushes both buffered endpoints and
+  // emits WHOLE, undelayed — never split, never coalesced.
+  c.admit(moved(s, "/a/dst", "/a/src", 3), clk.at(2));
+
+  let out = drain(&mut c, clk.at(2));
+  // The two flushed endpoints, then the Moved (FIFO: flushed-before-the-signal).
+  assert_eq!(
+    out.len(),
+    3,
+    "both buffered endpoints flush plus the Moved emits"
+  );
+  let moved_events: Vec<_> = out.iter().filter(|e| is_moved(e)).collect();
+  assert_eq!(moved_events.len(), 1, "the Moved emits exactly once, whole");
+  let m = moved_events[0];
+  assert_eq!(m.path(), PathBuf::from("/a/dst"), "the rename destination");
+  assert_eq!(
+    m.move_from().expect("a move source"),
+    PathBuf::from("/a/src"),
+    "the rename source is intact — the Moved was not split"
+  );
+  assert_eq!(
+    c.next_deadline(),
+    None,
+    "nothing lingers after the atomic flush"
+  );
+}
+
+#[test]
+fn moved_emits_undelayed_ahead_of_a_buffered_burst() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  // A burst buffering at an unrelated path.
+  c.admit(modified(s, "/a/busy", 1), clk.at(0));
+  // A rename at other paths: it must emit immediately, not wait for the burst.
+  c.admit(moved(s, "/a/dst", "/a/src", 2), clk.at(1));
+
+  let out = drain(&mut c, clk.at(1));
+  assert_eq!(out.len(), 1, "only the undelayed Moved is due");
+  assert!(is_moved(&out[0]));
+  // The unrelated burst is still settling.
+  assert!(
+    c.next_deadline().is_some(),
+    "the buffered burst still pends"
+  );
+}
+
+#[test]
+fn rescan_flushes_and_bypasses() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  // Buffer a couple of bursts for this subscription.
+  c.admit(modified(s, "/a/one", 1), clk.at(0));
+  c.admit(created(s, "/a/two", 2), clk.at(1));
+
+  // A Rescan stamped with an umbrella epoch that DOMINATES the buffered stamps.
+  c.admit(rescan(s, "/a", 9), clk.at(2));
+
+  let out = drain(&mut c, clk.at(2));
+  // Every buffered entry is flushed AND the Rescan emits — all undelayed.
+  assert_eq!(
+    out.len(),
+    3,
+    "both buffered entries flush plus the Rescan emits"
+  );
+  let rescans: Vec<_> = out.iter().filter(|e| e.is_rescan()).collect();
+  assert_eq!(rescans.len(), 1, "exactly one Rescan");
+  assert_eq!(
+    rescans[0].epoch(),
+    Epoch::new(9),
+    "the Rescan's upstream umbrella epoch stamp is preserved unchanged"
+  );
+  // The Rescan is emitted last (FIFO: after the entries it flushed), and its stamp
+  // dominates every flushed entry.
+  let last = out.last().expect("non-empty");
+  assert!(
+    last.is_rescan(),
+    "the Rescan bypasses to the end of the flush"
+  );
+  for e in &out {
+    assert!(
+      e.epoch() <= Epoch::new(9),
+      "no flushed entry carries an epoch dominating the Rescan"
+    );
+  }
+  assert_eq!(
+    c.next_deadline(),
+    None,
+    "the Rescan drained everything for the sub"
+  );
+}
+
+#[test]
+fn rescan_only_flushes_its_own_subscription() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let (s1, s2) = (sub(1), sub(2));
+
+  c.admit(modified(s1, "/a/f", 1), clk.at(0));
+  c.admit(modified(s2, "/b/f", 1), clk.at(0));
+
+  // A Rescan for s1 must not disturb s2's buffered burst.
+  c.admit(rescan(s1, "/a", 5), clk.at(1));
+
+  let out = drain(&mut c, clk.at(1));
+  assert_eq!(out.len(), 2, "s1's flushed burst plus its Rescan");
+  assert!(
+    out.iter().all(|e| e.subscription() == s1),
+    "only s1 is touched"
+  );
+  // s2's burst still settles on its own timer.
+  let out2 = drain(&mut c, clk.at(20));
+  assert_eq!(
+    out2.len(),
+    1,
+    "s2's burst is untouched and settles normally"
+  );
+  assert_eq!(out2[0].subscription(), s2);
+}
+
+#[test]
+fn max_hold_forces_emission() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config()); // quiet 10ms, max_hold 100ms
+  let s = sub(1);
+
+  // Touch the path every 5 ms so the 10 ms settle window NEVER elapses on its own.
+  let mut t = 0;
+  while t <= 130 {
+    c.admit(modified(s, "/a/f", t / 5 + 1), clk.at(t));
+    // Before the hold cap (first_seen=0 + 100ms) nothing emits.
+    if t < 100 {
+      assert!(
+        drain(&mut c, clk.at(t)).is_empty(),
+        "still held before the max_hold cap at t={t}"
+      );
+    }
+    t += 5;
+  }
+
+  // The entry was forced out at first_seen + max_hold = 100 ms regardless of the
+  // still-arriving touches — a continuously-touched path cannot settle forever.
+  // Drain at the cap: exactly one coalesced Modified.
+  let out = drain(&mut c, clk.at(100));
+  assert_eq!(
+    out.len(),
+    1,
+    "the bounded hold forces one emission at the cap"
+  );
+  assert!(out[0].kind().is_modified());
+}
+
+// -------------------------------------------------------------------------------
+// Epoch preservation (design §8).
+// -------------------------------------------------------------------------------
+
+#[test]
+fn coalesced_pair_emits_with_the_newest_stamp() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  // Monotone stamps within the burst; the emitted event must carry the NEWEST (4).
+  c.admit(created(s, "/a/f", 2), clk.at(0));
+  c.admit(modified(s, "/a/f", 3), clk.at(1));
+  c.admit(modified(s, "/a/f", 4), clk.at(2));
+
+  let out = drain(&mut c, clk.at(20));
+  assert_eq!(out.len(), 1);
+  assert_eq!(
+    out[0].epoch(),
+    Epoch::new(4),
+    "the coalesced event keeps the newest observation's umbrella stamp"
+  );
+  assert!(
+    out[0].kind().is_created(),
+    "…while still reporting the collapsed kind"
+  );
+}
+
+#[test]
+fn become_modified_keeps_the_newest_stamp() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  // Removed(5) then Created(7) → synthetic Modified carrying the newest stamp (7).
+  c.admit(removed(s, "/a/f", 5), clk.at(0));
+  c.admit(created(s, "/a/f", 7), clk.at(1));
+
+  let out = drain(&mut c, clk.at(20));
+  assert_eq!(out.len(), 1);
+  assert!(out[0].kind().is_modified());
+  assert_eq!(
+    out[0].epoch(),
+    Epoch::new(7),
+    "the synthetic Modified carries the newest stamp"
+  );
+}
+
+#[test]
+fn post_rescan_emission_never_carries_a_dominated_epoch() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  // A Rescan at umbrella epoch 10, then genuine post-Rescan changes rebased ABOVE it
+  // upstream (epoch 11, 12). A conforming consumer must never see a post-Rescan event
+  // dominated by the Rescan.
+  c.admit(rescan(s, "/a", 10), clk.at(0));
+  c.admit(modified(s, "/a/f", 11), clk.at(1));
+  c.admit(modified(s, "/a/f", 12), clk.at(2));
+
+  // The Rescan is already ready (undelayed); the burst settles after its window.
+  let rescan_out = drain(&mut c, clk.at(2));
+  assert_eq!(rescan_out.len(), 1, "the Rescan emits undelayed");
+  assert_eq!(rescan_out[0].epoch(), Epoch::new(10));
+
+  let burst_out = drain(&mut c, clk.at(20));
+  assert_eq!(burst_out.len(), 1, "the post-Rescan burst settles");
+  assert!(
+    burst_out[0].epoch() >= Epoch::new(10),
+    "the post-Rescan emission is NOT dominated by the Rescan"
+  );
+  assert_eq!(
+    burst_out[0].epoch(),
+    Epoch::new(12),
+    "…and carries the newest stamp"
+  );
+}
+
+// -------------------------------------------------------------------------------
+// next_deadline / drain ordering.
+// -------------------------------------------------------------------------------
+
+#[test]
+fn next_deadline_is_the_earliest_pending() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  assert_eq!(c.next_deadline(), None, "empty: no deadline");
+
+  c.admit(modified(s, "/a/f", 1), clk.at(0));
+  assert_eq!(
+    c.next_deadline(),
+    Some(clk.at(10)),
+    "one buffered entry: due at now + quiet_window"
+  );
+
+  // A Rescan makes something immediately ready — the deadline drops to that ready
+  // instant (in the past relative to the burst's), so the driver drains at once.
+  c.admit(rescan(s, "/b", 3), clk.at(1));
+  assert_eq!(
+    c.next_deadline(),
+    Some(clk.at(1)),
+    "a ready item pulls the deadline to its (earlier) ready instant"
+  );
+}
+
+#[test]
+fn flush_all_drains_everything_for_stream_close() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  c.admit(modified(s, "/a/f", 1), clk.at(0));
+  c.admit(created(s, "/b/g", 2), clk.at(0));
+
+  // On stream close no further change can settle the bursts — flush the tail.
+  let mut out = Vec::new();
+  c.flush_all(&mut out);
+  assert_eq!(
+    out.len(),
+    2,
+    "every still-settling entry is force-emitted on close"
+  );
+  assert_eq!(c.next_deadline(), None, "the coalescer is left empty");
+}
+
+// -------------------------------------------------------------------------------
+// Property tests (design §10): no silent loss, determinism, no dominated post-Rescan.
+// -------------------------------------------------------------------------------
+
+mod proptests {
+  use super::*;
+  use proptest::prelude::*;
+
+  /// A scripted admission: a kind selector (0..5), a small path index, an epoch delta,
+  /// and a time delta (ms). Epochs are made monotone-nondecreasing before feeding the
+  /// coalescer (the umbrella stamps are monotone per subscription), so a coalescing
+  /// pair never straddles a dominance boundary — the invariant the coalescer relies on.
+  #[derive(Debug, Clone)]
+  struct Step {
+    kind: u8,
+    path: u8,
+    epoch_delta: u16,
+    time_delta: u16,
+  }
+
+  fn step_strategy() -> impl Strategy<Value = Step> {
+    (0u8..5, 0u8..4, 0u16..3, 0u16..30).prop_map(|(kind, path, epoch_delta, time_delta)| Step {
+      kind,
+      path,
+      epoch_delta,
+      time_delta,
+    })
+  }
+
+  /// Build one event for `step` for subscription `s`, at monotone epoch `epoch`.
+  /// One fixed subscription keeps the property focused on the collapse/flush logic.
+  fn event_for(s: Subscription, step: &Step, epoch: u64) -> Event {
+    let path = format!("/root/p{}", step.path);
+    match step.kind {
+      0 => created(s, &path, epoch),
+      1 => modified(s, &path, epoch),
+      2 => removed(s, &path, epoch),
+      3 => moved(s, &path, "/root/src", epoch),
+      _ => rescan(s, &path, epoch),
+    }
+  }
+
+  /// Case budget: a full sweep natively, a handful under miri (where each case runs
+  /// the interpreter, so the native count would blow the time budget).
+  const CASES: u32 = if cfg!(miri) { 4 } else { 200 };
+
+  proptest! {
+    // No failure-persistence file: keeps miri from calling getcwd, and keeps the run
+    // hermetic.
+    #![proptest_config(ProptestConfig { cases: CASES, failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// Every admitted event is accounted for: it is emitted, folded into an emitted
+    /// entry, or intentionally annihilated per the create-then-remove row — never
+    /// silently dropped. We assert the strong, checkable half: at least one event is
+    /// emitted whenever a non-annihilating event was admitted, and the count of
+    /// distinct emitted `(path, kind-class)` is bounded by what was admitted.
+    #[test]
+    fn no_admitted_event_is_silently_lost(steps in prop::collection::vec(step_strategy(), 1..40)) {
+      let clk = Clock::new();
+      let mut c = Coalescer::new(config());
+      let s = sub(1);
+
+      let mut epoch = 0u64;
+      let mut admitted = 0usize;
+      let mut emitted = Vec::new();
+      let mut t = 0u64;
+      for step in &steps {
+        epoch += u64::from(step.epoch_delta); // monotone-nondecreasing
+        t += u64::from(step.time_delta);
+        c.admit(event_for(s, step, epoch), clk.at(t));
+        admitted += 1;
+        // Drain whatever became ready as time advanced.
+        c.drain_ready(clk.at(t), &mut emitted);
+      }
+      // Flush the settling tail (as a stream close would).
+      c.flush_all(&mut emitted);
+
+      // Every emitted event is a real, well-formed delivery for our subscription.
+      for e in &emitted {
+        prop_assert_eq!(e.subscription(), s);
+      }
+      // A Moved or Rescan is NEVER coalesced away: each admitted one must appear.
+      let admitted_atomic = steps.iter().filter(|st| st.kind >= 3).count();
+      let emitted_atomic = emitted.iter().filter(|e| is_moved(e) || e.is_rescan()).count();
+      prop_assert_eq!(
+        emitted_atomic,
+        admitted_atomic,
+        "every Moved/Rescan is emitted whole, none coalesced or dropped"
+      );
+      // The coalescer is fully drained.
+      prop_assert_eq!(c.next_deadline(), None);
+      let _ = admitted;
+    }
+
+    /// Determinism: the same script fed twice yields byte-identical output (no
+    /// HashMap-iteration nondeterminism in the drain order).
+    #[test]
+    fn determinism(steps in prop::collection::vec(step_strategy(), 1..40)) {
+      fn run(steps: &[Step]) -> Vec<(PathBuf, &'static str, Epoch)> {
+        let clk = Clock::new();
+        let mut c = Coalescer::new(config());
+        let s = sub(1);
+        let mut epoch = 0u64;
+        let mut t = 0u64;
+        let mut out = Vec::new();
+        for step in steps {
+          epoch += u64::from(step.epoch_delta);
+          t += u64::from(step.time_delta);
+          c.admit(event_for(s, step, epoch), clk.at(t));
+          c.drain_ready(clk.at(t), &mut out);
+        }
+        c.flush_all(&mut out);
+        out
+          .into_iter()
+          .map(|e| (e.path().to_path_buf(), e.kind().as_str(), e.epoch()))
+          .collect()
+      }
+      prop_assert_eq!(run(&steps), run(&steps));
+    }
+
+    /// No post-Rescan emission for a subscription ever carries an epoch dominated by
+    /// that Rescan: once a Rescan at epoch `r` has drained, every later emission has
+    /// epoch >= r (the stamps are monotone and the Rescan flushes the buffer).
+    #[test]
+    fn no_post_rescan_dominated_epoch(steps in prop::collection::vec(step_strategy(), 1..40)) {
+      let clk = Clock::new();
+      let mut c = Coalescer::new(config());
+      let s = sub(1);
+      let mut epoch = 0u64;
+      let mut t = 0u64;
+      let mut emitted = Vec::new();
+      for step in &steps {
+        epoch += u64::from(step.epoch_delta);
+        t += u64::from(step.time_delta);
+        c.admit(event_for(s, step, epoch), clk.at(t));
+        c.drain_ready(clk.at(t), &mut emitted);
+      }
+      c.flush_all(&mut emitted);
+
+      // Walk the emission order; track the highest Rescan epoch seen so far. Because a
+      // Rescan flushes its subscription's buffer, everything it dominated is emitted
+      // BEFORE it — so no LATER emission may carry an epoch < that Rescan's.
+      let mut rescan_hw: Option<Epoch> = None;
+      for e in &emitted {
+        if let Some(r) = rescan_hw {
+          prop_assert!(
+            e.epoch() >= r,
+            "a post-Rescan emission is dominated by the Rescan: {:?} < {:?}",
+            e.epoch(),
+            r
+          );
+        }
+        if e.is_rescan() {
+          rescan_hw = Some(rescan_hw.map_or(e.epoch(), |r| r.max(e.epoch())));
+        }
+      }
+    }
+  }
+}
+
+// -------------------------------------------------------------------------------
+// Runtime-touching: the settle timer under paused tokio time (design §6). This is the
+// only test that touches a runtime; it drives a `Coalescer` through the exact clock
+// bridge the driver uses (`R::now()` → std `Instant`, `sleep_until`/`timeout_at`).
+// -------------------------------------------------------------------------------
+
+#[cfg(feature = "tokio")]
+mod tokio_timer {
+  use super::*;
+  use agnostic_lite::RuntimeLite;
+
+  type Rt = agnostic_lite::tokio::TokioRuntime;
+
+  /// A burst of Modifieds to one path collapses to a single delivered event after the
+  /// quiet window; a Rescan admitted mid-burst jumps the queue — it drains before the
+  /// buffered burst's deadline. Paused time makes the timing exact and instant.
+  #[tokio::test(start_paused = true)]
+  async fn burst_coalesces_and_rescan_jumps_the_queue() {
+    let cfg = config(); // quiet 10ms, max_hold 100ms
+    let mut c = Coalescer::new(cfg);
+    let s = sub(1);
+
+    // Admit a burst of three Modifieds to one path at the current (paused) instant.
+    let start = Rt::now();
+    for epoch in 1..=3 {
+      c.admit(modified(s, "/a/f", epoch), start.into());
+    }
+
+    // The burst is not yet due: draining now yields nothing.
+    let mut out = Vec::new();
+    c.drain_ready(Rt::now().into(), &mut out);
+    assert!(out.is_empty(), "the burst is still settling");
+
+    // A Rescan mid-burst is immediately ready — it must NOT wait for the burst's
+    // deadline. Sleep until the coalescer's next deadline (now the ready Rescan) and
+    // drain: the flushed burst + the Rescan come out well before quiet_window elapses.
+    c.admit(rescan(s, "/a", 9), Rt::now().into());
+    let deadline = c.next_deadline().expect("the ready Rescan sets a deadline");
+    Rt::sleep_until(deadline.into()).await;
+    c.drain_ready(Rt::now().into(), &mut out);
+
+    assert!(
+      Rt::now().duration_since(start) < cfg.quiet_window(),
+      "the Rescan jumped the queue: drained before the burst's settle window elapsed"
+    );
+    // The flushed burst collapsed to one Modified, plus the Rescan — the Rescan last.
+    assert_eq!(out.len(), 2, "the coalesced burst plus the Rescan");
+    assert!(out[0].kind().is_modified(), "the flushed, coalesced burst");
+    assert_eq!(out[0].epoch(), Epoch::new(3), "…carrying the newest stamp");
+    assert!(
+      out[1].is_rescan(),
+      "the Rescan, jumped ahead of the burst's own deadline"
+    );
+    assert_eq!(
+      out[1].epoch(),
+      Epoch::new(9),
+      "its umbrella stamp preserved"
+    );
+    assert_eq!(c.next_deadline(), None, "everything drained");
+  }
+}

@@ -13,11 +13,13 @@
 use std::{collections::VecDeque, hash::Hash, path::Path};
 
 use agnostic_lite::RuntimeLite;
-use tributary_fs::{Interest, RootHandle, Watcher, WatcherOptions};
+use tributary_fs::{Interest, RootHandle, Watcher};
 
 use crate::{
+  coalesce::Coalescer,
   error::{BuildError, CloseError, UnwatchError, WatchError},
   event::Event,
+  options::TributariesOptions,
   subscription::Subscription,
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
 };
@@ -88,14 +90,26 @@ impl<R: RuntimeLite> RootArmer for Watcher<R> {
 pub struct Tributaries<R: RuntimeLite> {
   watcher: Watcher<R>,
   subsumer: Subsumer<RootHandle>,
-  /// Fanned-out events awaiting delivery: one raw event can produce several (one
-  /// per covering subscriber), and `next` hands them out one per call.
+  /// Attributed events staged for the coalescer, or — with debounce disabled —
+  /// awaiting direct delivery. One raw event can produce several (one per covering
+  /// subscriber), and a widen queues a synthetic dominating `Rescan` per re-pointed
+  /// subscription. With no coalescer, `next` hands these out one per call; with a
+  /// coalescer, `next` drains them into it (a `Rescan` here flushes + bypasses).
   queue: VecDeque<Event>,
+  /// Coalescer output awaiting hand-off, one per `next` call — populated by draining
+  /// the coalescer on a settle-timer edge (empty and unused when debounce is off).
+  delivered: VecDeque<Event>,
   /// The per-subscription monotone-epoch ledger (design §8): stamps every delivered
   /// event in its subscription's own epoch space (rebasing on each widen) so the raw
   /// per-`ScopeId` fs epoch — which restarts at `START` on every kernel arm — never
   /// leaks as a dominance order across a re-point.
   epochs: EpochLedger,
+  /// The opt-in settle/debounce coalescer (design §6), present only when the caller
+  /// supplied a [`DebounceConfig`](crate::DebounceConfig). When [`None`], `next`
+  /// passes attributed events through untouched (zero overhead — no coalescer is
+  /// instantiated); when [`Some`], `next` admits them and delivers on the settle
+  /// timer.
+  coalescer: Option<Coalescer>,
 }
 
 impl<R: RuntimeLite> core::fmt::Debug for Tributaries<R> {
@@ -110,15 +124,22 @@ impl<R: RuntimeLite> core::fmt::Debug for Tributaries<R> {
 impl<R: RuntimeLite> Tributaries<R> {
   /// Builds a watcher, spawning the underlying `tributary-fs` driver on `R`.
   ///
+  /// Enable the opt-in settle/debounce coalescer (design §6) by setting a
+  /// [`DebounceConfig`](crate::DebounceConfig) on `options`
+  /// ([`TributariesOptions::debounce`]); absent it, events pass through untouched.
+  ///
   /// # Errors
   ///
   /// [`BuildError::Fs`] when the underlying `tributary-fs` watcher cannot be built.
-  pub fn new(options: WatcherOptions) -> Result<Self, BuildError> {
+  pub fn new(options: impl Into<TributariesOptions>) -> Result<Self, BuildError> {
+    let (watcher_options, debounce) = options.into().into_parts();
     Ok(Self {
-      watcher: Watcher::new(options)?,
+      watcher: Watcher::new(watcher_options)?,
       subsumer: Subsumer::new(),
       queue: VecDeque::new(),
+      delivered: VecDeque::new(),
       epochs: EpochLedger::new(),
+      coalescer: debounce.map(Coalescer::new),
     })
   }
 
@@ -175,43 +196,127 @@ impl<R: RuntimeLite> Tributaries<R> {
   /// Pulls from the underlying stream, resolves each raw event's root by its
   /// `root()` handle (O(1), not a radix walk), fans it out to every covering
   /// subscription (design §5), and hands the results out one per call.
+  ///
+  /// With the settle coalescer enabled (design §6) each attributed event is admitted
+  /// into it and deliveries come out on the settle timer — a burst to one path
+  /// collapses to a single event, while a [`Moved`](tributary_fs::EventKind::Moved)
+  /// stays atomic and a [`Rescan`](tributary_fs::EventKind::Rescan) jumps the queue.
+  /// Absent the coalescer, events pass through untouched.
   pub async fn next(&mut self) -> Option<Event> {
+    if self.coalescer.is_some() {
+      self.next_debounced().await
+    } else {
+      self.next_passthrough().await
+    }
+  }
+
+  /// The debounce-disabled path: fan out and deliver directly, one per call.
+  async fn next_passthrough(&mut self) -> Option<Event> {
     loop {
       if let Some(event) = self.queue.pop_front() {
         return Some(event);
       }
       let raw = self.watcher.next().await?;
-      // Disjoint field borrows: `subsumer` resolves the root/coverage, `epochs`
-      // owns the per-subscription stamp state.
-      let (subsumer, epochs, queue) = (&self.subsumer, &mut self.epochs, &mut self.queue);
-      let Some(entry) = subsumer.entry(raw.root()) else {
-        // The raw event's root has no live entry — its subscription(s) were
-        // dropped between the kernel emitting it and us routing it. Nothing to
-        // deliver; pull the next raw event.
-        continue;
-      };
-      // Fan out to every covering subscriber and stamp each delivery in that
-      // subscriber's own monotone epoch space (design §5/§8), rebasing away the raw
-      // fs epoch (which restarts per kernel arm). `raw.epoch()` is the fs epoch of
-      // this event on its current root; `set_epoch` binds the umbrella stamp.
-      let raw_epoch = raw.epoch();
-      let delivered = epochs.stamp_and_fan_out(
-        &raw,
-        raw_epoch,
-        entry,
-        |sub| subsumer.subscription_path(sub),
-        Event::subscription,
-        |mut event, stamp| {
-          event.set_epoch(stamp);
-          event
-        },
-      );
-      queue.extend(delivered);
+      let fanned = self.fan_out_raw(&raw);
+      self.queue.extend(fanned);
     }
   }
 
+  /// The debounce-enabled path (design §6): admit every attributed event into the
+  /// coalescer and deliver its output on the settle timer.
+  ///
+  /// Each iteration first hands off any already-coalesced event; else it feeds the
+  /// coalescer whatever fan-out/widen events are staged in `queue`, drains what has
+  /// come due, and — if nothing is due — races the underlying stream against the
+  /// coalescer's next deadline. A stream close force-flushes the coalesced tail so a
+  /// still-settling burst is never dropped (no-silent-loss).
+  async fn next_debounced(&mut self) -> Option<Event> {
+    loop {
+      if let Some(event) = self.delivered.pop_front() {
+        return Some(event);
+      }
+
+      // Admit every staged attributed event (fan-out results and widen Rescans) into
+      // the coalescer at the current instant, then release everything now due.
+      let now = R::now();
+      let coalescer = self
+        .coalescer
+        .as_mut()
+        .expect("debounced path holds a coalescer");
+      for event in self.queue.drain(..) {
+        coalescer.admit(event, now.into());
+      }
+      let mut ready = Vec::new();
+      coalescer.drain_ready(now.into(), &mut ready);
+      if !ready.is_empty() {
+        self.delivered.extend(ready);
+        continue;
+      }
+
+      // Nothing due yet. Race the stream against the nearest settle deadline: whichever
+      // fires first, loop and re-drain. With no deadline (the coalescer is empty) just
+      // await the stream.
+      let deadline = coalescer.next_deadline();
+      let raw = match deadline {
+        Some(at) => match R::timeout_at(at.into(), self.watcher.next()).await {
+          // The stream produced an event before the deadline: fan it out and admit it.
+          Ok(Some(raw)) => raw,
+          // The stream closed while entries were still settling: force-emit the tail.
+          Ok(None) => {
+            let mut tail = Vec::new();
+            self
+              .coalescer
+              .as_mut()
+              .expect("debounced path holds a coalescer")
+              .flush_all(&mut tail);
+            if tail.is_empty() {
+              return None;
+            }
+            self.delivered.extend(tail);
+            continue;
+          }
+          // The deadline arrived first: loop to drain the now-due entries.
+          Err(_elapsed) => continue,
+        },
+        // The coalescer is empty: nothing to time out on, just await the stream.
+        None => self.watcher.next().await?,
+      };
+      let fanned = self.fan_out_raw(&raw);
+      self.queue.extend(fanned);
+    }
+  }
+
+  /// Resolves one raw event's root and fans it out to every covering subscriber,
+  /// stamping each delivery in that subscriber's own monotone epoch space (design
+  /// §5/§8). An event whose root has no live entry (its subscription(s) were dropped
+  /// between the kernel emitting it and us routing it) fans out to nothing.
+  fn fan_out_raw(&mut self, raw: &tributary_fs::Event) -> Vec<Event> {
+    // Disjoint field borrows: `subsumer` resolves the root/coverage, `epochs` owns the
+    // per-subscription stamp state.
+    let (subsumer, epochs) = (&self.subsumer, &mut self.epochs);
+    let Some(entry) = subsumer.entry(raw.root()) else {
+      return Vec::new();
+    };
+    // `raw.epoch()` is the fs epoch of this event on its current root; `set_epoch`
+    // binds the umbrella stamp, rebasing away the raw fs epoch (which restarts per
+    // kernel arm).
+    let raw_epoch = raw.epoch();
+    epochs.stamp_and_fan_out(
+      raw,
+      raw_epoch,
+      entry,
+      |sub| subsumer.subscription_path(sub),
+      Event::subscription,
+      |mut event, stamp| {
+        event.set_epoch(stamp);
+        event
+      },
+    )
+  }
+
   /// Closes the watcher: tears the underlying `tributary-fs` watcher down and
-  /// resolves once its driver has quiesced. Buffered attributed events are dropped.
+  /// resolves once its driver has quiesced. Buffered attributed events (and any
+  /// still-settling coalescer entries) are dropped.
   ///
   /// # Errors
   ///

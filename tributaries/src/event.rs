@@ -43,24 +43,45 @@ pub struct Event {
   inner: Inner,
 }
 
-/// The event payload: either a real `tributary-fs` delivery or a `Rescan` this
-/// crate synthesized (which cannot wrap a [`tributary_fs::Event`], whose
-/// constructor is private to that crate).
+/// The event payload: either a real `tributary-fs` delivery or one this crate
+/// synthesized (which cannot wrap a [`tributary_fs::Event`], whose constructor is
+/// private to that crate).
+///
+/// Two things mint a [`Synthetic`] in production: the widen re-point's dominating
+/// [`Rescan`](EventKind::Rescan) (design §8), and the coalescer's one collapse row
+/// that yields a *fresh* kind — `Removed` then `Created` → `Modified` (design §6),
+/// where neither the buffered nor the incoming event is itself a `Modified`. Every
+/// other collapse keeps one of the two real (possibly [`Fs`](Inner::Fs)) events, so
+/// its change id survives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Inner {
   /// A raw `tributary-fs` event, retagged.
   Fs(FsEvent),
-  /// A coverage-loss `Rescan` minted at this layer (widen re-point, §8).
-  Rescan(SyntheticRescan),
+  /// An event minted at this layer (a widen `Rescan`, or a coalesced-churn
+  /// `Modified`). Its epoch lives on the outer [`Event`], in the umbrella-relative
+  /// space every delivered event is stamped in.
+  Synthetic(Synthetic),
 }
 
-/// The fields a synthetic [`Rescan`](EventKind::Rescan) needs to satisfy the same
-/// accessors a wrapped [`tributary_fs::Event`] answers. Its epoch lives on the outer
-/// [`Event`], in the umbrella-relative space every delivered event is stamped in.
+/// The fields a synthetic event needs to satisfy the same accessors a wrapped
+/// [`tributary_fs::Event`] answers: its path, root-relative location, and kind. It
+/// carries no change id (there is no underlying kernel change).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SyntheticRescan {
+struct Synthetic {
   path: PathBuf,
   location: Location,
+  kind: EventKind,
+  /// The rename source, present only for a synthetic [`Moved`](EventKind::Moved).
+  ///
+  /// A synthetic event cannot store an [`EventKind::Moved`] (its
+  /// [`MovedEvent`](tributary_fs::MovedEvent) payload has no public constructor — the
+  /// umbrella never fabricates fs vocabulary), so a synthetic move keeps its `kind` as
+  /// the closest lifecycle marker and carries its source here instead; the wrapper
+  /// reports the move through [`move_from`](Event::move_from), which the coalescer
+  /// keys on. Synthetic moves are a **test-only** construct — production moves are
+  /// always [`Fs`](Inner::Fs)-backed with a real payload — so this is `None` on every
+  /// event the crate itself mints.
+  from: Option<PathBuf>,
 }
 
 impl Event {
@@ -99,9 +120,74 @@ impl Event {
     Self {
       subscription,
       epoch,
-      inner: Inner::Rescan(SyntheticRescan {
+      inner: Inner::Synthetic(Synthetic {
         path,
         location: Location::new(),
+        kind: EventKind::Rescan,
+        from: None,
+      }),
+    }
+  }
+
+  /// Mints a synthetic event of an arbitrary `kind` at `location` under `path`,
+  /// stamped `epoch`, for `subscription`.
+  ///
+  /// The coalescer's one collapse row that yields a kind carried by *neither* of the
+  /// two collapsed events — `Removed` then `Created` → `Modified` (design §6) — mints
+  /// its result here, taking `path`/`location` from the pair (identical, since they
+  /// share a canonical path) and the newest observation's `epoch`. Every other
+  /// collapse keeps a real event, so this is the only kind the crate synthesizes
+  /// besides the widen [`Rescan`](Self::rescan). (The coalescer's tests also reach for
+  /// it to build [`Created`](EventKind::Created)/[`Modified`](EventKind::Modified)/
+  /// [`Removed`](EventKind::Removed)/[`Rescan`](EventKind::Rescan) fixtures without the
+  /// private `tributary-fs` constructor; see [`synthetic_moved`](Self::synthetic_moved)
+  /// for the move fixture.)
+  pub(crate) fn synthetic(
+    subscription: Subscription,
+    path: PathBuf,
+    location: Location,
+    kind: EventKind,
+    epoch: Epoch,
+  ) -> Self {
+    Self {
+      subscription,
+      epoch,
+      inner: Inner::Synthetic(Synthetic {
+        path,
+        location,
+        kind,
+        from: None,
+      }),
+    }
+  }
+
+  /// Mints a synthetic [`Moved`](EventKind::Moved) fixture from `from` to `path`,
+  /// stamped `epoch`, for `subscription` — a **test-only** constructor.
+  ///
+  /// A synthetic event cannot carry an [`EventKind::Moved`]: its
+  /// [`MovedEvent`](tributary_fs::MovedEvent) has no public constructor and the
+  /// umbrella never fabricates fs vocabulary. Production moves are always
+  /// [`Fs`](Inner::Fs)-backed with a real payload, so nothing in the crate mints one;
+  /// this exists only so the coalescer's sans-I/O tests can exercise the
+  /// move-is-atomic invariant. The move is surfaced through
+  /// [`move_from`](Self::move_from) (which the coalescer keys on) — its public
+  /// [`kind`](Self::kind) stays [`Modified`](EventKind::Modified) and its
+  /// [`moved`](Self::moved) is `None`, since it holds no fs payload.
+  #[cfg(test)]
+  pub(crate) fn synthetic_moved(
+    subscription: Subscription,
+    path: PathBuf,
+    from: PathBuf,
+    epoch: Epoch,
+  ) -> Self {
+    Self {
+      subscription,
+      epoch,
+      inner: Inner::Synthetic(Synthetic {
+        path,
+        location: Location::new(),
+        kind: EventKind::Modified,
+        from: Some(from),
       }),
     }
   }
@@ -120,7 +206,7 @@ impl Event {
   pub fn path(&self) -> &Path {
     match &self.inner {
       Inner::Fs(event) => event.path(),
-      Inner::Rescan(rescan) => rescan.path.as_path(),
+      Inner::Synthetic(synthetic) => synthetic.path.as_path(),
     }
   }
 
@@ -132,7 +218,7 @@ impl Event {
   pub fn location(&self) -> &Location {
     match &self.inner {
       Inner::Fs(event) => event.location(),
-      Inner::Rescan(rescan) => &rescan.location,
+      Inner::Synthetic(synthetic) => &synthetic.location,
     }
   }
 
@@ -141,7 +227,7 @@ impl Event {
   pub fn kind(&self) -> &EventKind {
     match &self.inner {
       Inner::Fs(event) => event.kind(),
-      Inner::Rescan(_) => &EventKind::Rescan,
+      Inner::Synthetic(synthetic) => &synthetic.kind,
     }
   }
 
@@ -167,14 +253,14 @@ impl Event {
 
   /// The change's unique id (monotonic per watcher), for a wrapped event.
   ///
-  /// A synthetic widen [`Rescan`](EventKind::Rescan) has no underlying kernel
-  /// change and so reports `None`; its dominance rides its [`epoch`](Self::epoch),
-  /// not a change id.
+  /// A synthetic event (a widen [`Rescan`](EventKind::Rescan), or a coalesced-churn
+  /// [`Modified`](EventKind::Modified)) has no single underlying kernel change and so
+  /// reports `None`; its dominance rides its [`epoch`](Self::epoch), not a change id.
   #[inline]
   pub fn change_id(&self) -> Option<tributary_fs::ChangeId> {
     match &self.inner {
       Inner::Fs(event) => Some(event.change_id()),
-      Inner::Rescan(_) => None,
+      Inner::Synthetic(_) => None,
     }
   }
 
@@ -183,15 +269,34 @@ impl Event {
   pub fn is_rescan(&self) -> bool {
     match &self.inner {
       Inner::Fs(event) => event.is_rescan(),
-      Inner::Rescan(_) => true,
+      Inner::Synthetic(synthetic) => synthetic.kind.is_rescan(),
     }
   }
 
   /// The rename payload, if this is a [`Moved`](EventKind::Moved).
   ///
-  /// A synthetic [`Rescan`](EventKind::Rescan) is never a move, so this is `None`.
+  /// Only a real `tributary-fs`-backed move carries a [`MovedEvent`]; an event this
+  /// crate synthesized (a widen [`Rescan`](EventKind::Rescan), or a coalesced-churn
+  /// [`Modified`](EventKind::Modified)) holds no fs payload, so this is `None` for one.
   #[inline]
   pub fn moved(&self) -> Option<&MovedEvent> {
-    self.kind().moved()
+    match &self.inner {
+      Inner::Fs(event) => event.kind().moved(),
+      Inner::Synthetic(_) => None,
+    }
+  }
+
+  /// The rename source, if this is a [`Moved`](EventKind::Moved) — the wrapper-level
+  /// move detector the coalescer keys on (design §6, move-is-atomic).
+  ///
+  /// Uniform across both representations: an [`Fs`](Inner::Fs)-backed move reads it
+  /// from its real [`MovedEvent`], and a synthetic move (test-only) from its stored
+  /// source. `Some` iff the event is a move; the destination is [`path`](Self::path).
+  #[inline]
+  pub(crate) fn move_from(&self) -> Option<&Path> {
+    match &self.inner {
+      Inner::Fs(event) => event.kind().moved().map(MovedEvent::from),
+      Inner::Synthetic(synthetic) => synthetic.from.as_deref(),
+    }
   }
 }
