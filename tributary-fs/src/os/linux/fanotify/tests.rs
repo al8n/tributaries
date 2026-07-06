@@ -6,8 +6,9 @@ use std::{
 use super::{
   Admission, AdmittedEvent, MemoBatch, classify,
   fid::{
-    FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR,
-    FAN_RENAME, FanMask, Fid, RawFanotifyEvent, RenameInfo,
+    FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_MODIFY,
+    FAN_MOVE_SELF, FAN_ONDIR, FAN_RENAME, FanMask, Fid, RawFanotifyEvent, RenameInfo,
+    decode_events,
   },
   map::{FidMap, SeedEntry},
 };
@@ -84,6 +85,56 @@ fn rename_ev(
       new_name: new_name.to_vec(),
     }),
   }
+}
+
+/// The exact `Fid` `decode_events` yields from a wire FID: the stored handle is
+/// `handle_type` (native-endian i32) followed by `opaque`, so a map seeded with
+/// this matches the decoded event's FID byte-for-byte (the map keys on the handle
+/// bytes). Lets the decode→classify rows below seed a map the decoded "." buffer
+/// then resolves against.
+fn wire_fid(fsid: [u8; 8], handle_type: i32, opaque: &[u8]) -> Fid {
+  let mut handle = handle_type.to_ne_bytes().to_vec();
+  handle.extend_from_slice(opaque);
+  Fid::new(fsid, handle.into_boxed_slice())
+}
+
+/// A one-record fanotify buffer: a single `DFID_NAME` info record (fsid + file
+/// handle + a NUL-terminated `name`) wrapped in an event of `mask` — the packed
+/// wire shape the kernel delivers a directory self-event in when it uses the "."
+/// self-name. Mirrors the layout `decode_events` parses (see the `fid` suite's
+/// builders); kept local so the decode→classify rows exercise the real decode.
+fn dfid_name_event(
+  mask: u64,
+  fsid: [u8; 8],
+  handle_type: i32,
+  opaque: &[u8],
+  name: &[u8],
+) -> Vec<u8> {
+  // struct file_handle: handle_bytes (u32) + handle_type (i32) + opaque bytes.
+  let mut fh = (opaque.len() as u32).to_ne_bytes().to_vec();
+  fh.extend_from_slice(&handle_type.to_ne_bytes());
+  fh.extend_from_slice(opaque);
+  // DFID_NAME payload: fsid + file_handle + NUL-terminated name.
+  let mut payload = fsid.to_vec();
+  payload.extend_from_slice(&fh);
+  payload.extend_from_slice(name);
+  payload.push(0);
+  // info record header: info_type (u8) + pad (u8) + record_len (u16).
+  let record_len = (4 + payload.len()) as u16;
+  let mut info = vec![FAN_EVENT_INFO_TYPE_DFID_NAME, 0];
+  info.extend_from_slice(&record_len.to_ne_bytes());
+  info.extend_from_slice(&payload);
+  // fanotify_event_metadata (24 bytes) + the info region.
+  let event_len = (24 + info.len()) as u32;
+  let mut buf = event_len.to_ne_bytes().to_vec();
+  buf.push(3); // vers
+  buf.push(0); // reserved
+  buf.extend_from_slice(&24u16.to_ne_bytes()); // metadata_len
+  buf.extend_from_slice(&mask.to_ne_bytes());
+  buf.extend_from_slice(&(-1i32).to_ne_bytes()); // fd = FAN_NOFD
+  buf.extend_from_slice(&0i32.to_ne_bytes()); // pid
+  buf.extend_from_slice(&info);
+  buf
 }
 
 /// The forwarded event of any admission that forwards one, else panics — the row
@@ -628,6 +679,72 @@ fn attrib_resolves_its_path() {
     forwarded(admission).path.as_deref(),
     Some(Path::new("/root/meta.txt"))
   );
+}
+
+/// The kernel encodes a directory's OWN self-event (`DELETE_SELF`/`MOVE_SELF`) as
+/// a `DFID_NAME` record whose name is the self-name ".". Driven decode → classify,
+/// a "." buffer for the ROOT reaches `RootDeath` on the root's OWN path (`/root`)
+/// — the terminal death lowering — never `classify_dirent`'s `<root>/.` child (a
+/// located rescan of "root/." that would delay or lose the root-death lifecycle).
+#[test]
+fn dfid_name_dot_root_self_event_reaches_root_death() {
+  const FSID: [u8; 8] = [7; 8];
+  for mask in [FAN_DELETE_SELF | FAN_ONDIR, FAN_MOVE_SELF | FAN_ONDIR] {
+    let root = wire_fid(FSID, 1, b"root-handle");
+    let mut map = FidMap::new();
+    map.seed([SeedEntry::root(root, Path::new("/root"))]);
+
+    let buf = dfid_name_event(mask, FSID, 1, b"root-handle", b".");
+    let decoded = decode_events(&buf);
+    assert!(!decoded.lossy && decoded.events.len() == 1);
+    assert!(
+      decoded.events[0].name.is_none(),
+      "decode folded the '.' self-name to the name-less self shape"
+    );
+
+    let admission = classify_one(&mut map, &decoded.events[0]);
+    assert!(
+      matches!(admission, Admission::RootDeath(_)),
+      "a '.' root self-event {mask:#x} is the root's death, not a child dirent: {admission:?}"
+    );
+    assert_eq!(
+      forwarded(admission).path.as_deref(),
+      Some(Path::new("/root")),
+      "the root death carries the root's OWN path, never /root/."
+    );
+  }
+}
+
+/// A "." `DFID_NAME` on an admitted NON-ROOT directory (a directory's own
+/// `ATTRIB`/`MODIFY`) forwards the directory's OWN path, not a bogus `<dir>/.`
+/// child — decode → classify, the sibling of the root case.
+#[test]
+fn dfid_name_dot_dir_metadata_forwards_own_path() {
+  const FSID: [u8; 8] = [7; 8];
+  for mask in [FAN_ATTRIB | FAN_ONDIR, FAN_MODIFY | FAN_ONDIR] {
+    let root = wire_fid(FSID, 1, b"root-handle");
+    let sub = wire_fid(FSID, 1, b"sub-handle");
+    let mut map = FidMap::new();
+    map.seed([
+      SeedEntry::root(root.clone(), Path::new("/root")),
+      SeedEntry::child(sub, root, OsString::from("sub")),
+    ]);
+
+    let buf = dfid_name_event(mask, FSID, 1, b"sub-handle", b".");
+    let decoded = decode_events(&buf);
+    assert!(!decoded.lossy && decoded.events.len() == 1 && decoded.events[0].name.is_none());
+
+    let admission = classify_one(&mut map, &decoded.events[0]);
+    assert!(
+      matches!(admission, Admission::Forward(_)),
+      "a '.' dir metadata event {mask:#x} forwards the dir's own path: {admission:?}"
+    );
+    assert_eq!(
+      forwarded(admission).path.as_deref(),
+      Some(Path::new("/root/sub")),
+      "dir metadata forwards the directory's OWN path, never /root/sub/."
+    );
+  }
 }
 
 /// The classification totality table — the single source of truth, exercised across

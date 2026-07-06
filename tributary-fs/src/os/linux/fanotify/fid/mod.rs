@@ -230,8 +230,12 @@ pub(crate) struct RenameInfo {
 /// supplied it, `target_fid` (the child's own FID from `FAN_REPORT_TARGET_FID`
 /// — the create self-maintenance handle). A self-event (`DELETE_SELF`,
 /// `MOVE_SELF`) carries the object's own FID as either a `dir_fid` (the `DFID`
-/// shape) or a bare `target_fid` (the `FID`-only shape). A `FAN_RENAME` carries
-/// `rename` and leaves the single-FID fields empty. Any field the wire omitted is
+/// shape) or a bare `target_fid` (the `FID`-only shape). The kernel ALSO reports
+/// a directory self-event as a `DFID_NAME` whose name is the self-name `.`;
+/// decode folds that `.` to the SAME name-less `DFID` self shape (see
+/// `decode_fid_record`), so the classifier never sees it as a `<dir>/.` child. A
+/// `FAN_RENAME` carries `rename` and leaves the single-FID fields empty. Any
+/// field the wire omitted is
 /// `None`; classification, not decode, decides whether that omission is a clean
 /// drop, a loss, or immaterial.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +358,10 @@ fn decode_info(mask: FanMask, mut info: &[u8]) -> Option<RawFanotifyEvent> {
       FAN_EVENT_INFO_TYPE_DFID_NAME => {
         let record = decode_fid_record(payload, true)?;
         dir_fid = Some(record.fid);
+        // A name-less result — an empty name, OR the kernel's "." self-name
+        // folded to `None` by `decode_fid_record` — leaves this the self shape:
+        // `dir_fid` is the object itself, which `classify` routes to its
+        // name-less self path rather than a `<dir>/.` child dirent.
         name = record.name;
       }
       FAN_EVENT_INFO_TYPE_DFID => {
@@ -440,13 +448,29 @@ fn decode_fid_record(payload: &[u8], has_name: bool) -> Option<FidRecord> {
   let name = if has_name {
     let after = fh.get(handle_end..)?;
     // The name is NUL-terminated and NUL-padded up to the record's `len`; trim
-    // at the first NUL. An empty name (a bare directory FID reported with the
-    // DFID_NAME tag) yields `None`.
+    // at the first NUL.
     let end = after.iter().position(|b| *b == 0).unwrap_or(after.len());
-    if end == 0 {
+    let bytes = &after[..end];
+    // Two byte-forms carry NO child name, and both decode to `None`:
+    //   - an EMPTY name — a bare directory FID reported under a `*_NAME` tag;
+    //   - the self-name "." — a `DFID_NAME` whose name is "." addresses the
+    //     directory OBJECT ITSELF, not a child of it (man 7 fanotify documents
+    //     "." as the self-name). A real dirent can never be named "." on Linux,
+    //     so this is unambiguous, and ONLY exactly "." is folded — never ".."
+    //     (the parent link, not a self-encoding) and never a name that merely
+    //     begins with a dot (".hidden") or contains one ("a.txt").
+    // For a `DFID_NAME` record either form yields the name-less SELF shape
+    // (`dir_fid` = the object, `name` = None), which `classify` routes to its
+    // self path — a root's `RootDeath`, a subdirectory's self-forget, or a bare
+    // modify/attrib on the object's own path — instead of a bogus `<dir>/.`
+    // child dirent. For a `FAN_RENAME` half either form leaves the half
+    // name-less, so the pairing below refuses it and the batch takes the loss
+    // barrier: a "." in a rename half is anomalous (the kernel names real moved
+    // children there), and the conservative reseed is the honest cover.
+    if matches!(bytes, [] | [b'.']) {
       None
     } else {
-      Some(after[..end].to_vec())
+      Some(bytes.to_vec())
     }
   } else {
     None
