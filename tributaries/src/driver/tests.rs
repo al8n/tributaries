@@ -10,7 +10,8 @@ use tributary_proto::{Epoch, Interest};
 use tributary_fs::WatchRootError;
 
 use super::{
-  Event, Filter, RootArmer, Subscription, Subsumer, WatchError, apply_watch, epoch::EpochLedger,
+  Event, Filter, RootArmer, Subscription, Subsumer, WatchError, WidenJournal, apply_watch,
+  epoch::EpochLedger, resume_pending_widen,
 };
 
 /// One recorded call against the fake armer, in the order it happened.
@@ -185,6 +186,10 @@ struct Harness {
   /// `Tributaries::watch` inserting the caller's filter on success.
   filters: HashMap<Subscription, Filter>,
   queue: VecDeque<Event>,
+  /// Mirrors the driver's in-flight-widen journal (design §4, cancellation safety), so a
+  /// test can simulate a dropped `watch()` future (journal set + subsumed disarmed) and
+  /// then drive `resume_pending_widen`.
+  pending_widen: Option<WidenJournal<u32>>,
   armer: FakeArmer,
 }
 
@@ -195,6 +200,7 @@ impl Harness {
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
       queue: VecDeque::new(),
+      pending_widen: None,
       armer: FakeArmer::new(),
     }
   }
@@ -205,6 +211,7 @@ impl Harness {
       &mut self.epochs,
       &mut self.filters,
       &mut self.queue,
+      &mut self.pending_widen,
       &self.armer,
       Path::new(path),
       interest,
@@ -214,6 +221,44 @@ impl Harness {
     // per-sub state the degenerate rollback path must reclaim if this sub is later lost).
     self.filters.insert(sub, Filter::all());
     Ok(sub)
+  }
+
+  /// Repairs a journaled-but-incomplete widen, mirroring `Tributaries::resume_pending_widen`
+  /// (design §4). A test simulating a dropped `watch()` future calls this after
+  /// [`journal_and_disarm_widen`](Self::journal_and_disarm_widen).
+  async fn resume(&mut self) {
+    resume_pending_widen(
+      &mut self.subsumer,
+      &mut self.epochs,
+      &mut self.filters,
+      &mut self.queue,
+      &mut self.pending_widen,
+      &self.armer,
+    )
+    .await;
+  }
+
+  /// Drives a widen of `path` to exactly the mid-transaction state a dropped `watch()`
+  /// future would leave: journal the plan, then disarm the subsumed kernel roots — but
+  /// **stop before arming the wider root** (as a `select!`/timeout cancel between the
+  /// disarm and the commit would). The subsumer's index is untouched (no commit ran), so
+  /// its subsumed `RootEntry`s and the newcomer's pending reservation stay live, exactly
+  /// as they would after a real drop. Returns the plan's subsumed handles.
+  async fn journal_and_disarm_widen(&mut self, path: &str) -> Vec<u32> {
+    let outcome = self.subsumer.plan_watch(Path::new(path), Interest::all());
+    let super::WatchOutcome::Widen { unwatch, .. } = &outcome else {
+      panic!("expected a Widen plan for {path}");
+    };
+    let unwatch = unwatch.clone();
+    // Journal BEFORE the disarms (design §4), exactly as `apply_watch` does.
+    self.pending_widen = Some(WidenJournal {
+      outcome: outcome.clone(),
+    });
+    for &old in &unwatch {
+      let _ = self.armer.disarm(old).await;
+    }
+    // Deliberately no arm/commit: the future is "dropped" here.
+    unwatch
   }
 
   /// Mirrors `Tributaries::unwatch`'s state cleanup at the harness level (no real
@@ -488,6 +533,147 @@ async fn widen_rollback_double_failure_signals_loss_and_reclaims() {
 
   // No pending reservation leaked.
   assert_eq!(h.subsumer.pending_len(), 0, "no pending reservation leaks");
+}
+
+/// The cancellation-safety journal (design §4, Finding 1): a `watch()` future dropped
+/// after the widen disarmed the subsumed roots but before it armed the wider one leaves
+/// subscribers on disarmed roots with no async cleanup — so the journal is set and the
+/// NEXT public entry point's `resume_pending_widen` must bring state back to a consistent
+/// pre-widen coverage: each disarmed subsumed root re-armed (fresh handle) and re-pointed
+/// with a dominating Rescan, no subscriber left uncovered, the newcomer's pending
+/// reservation discarded, and the journal cleared.
+#[tokio::test]
+async fn dropped_widen_after_disarm_is_repaired_on_next_call() {
+  let mut h = Harness::new();
+
+  // Two narrow roots (handles 1 and 2), each its own subscription and some history.
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c");
+  h.epochs.stamp(sb, Epoch::new(4));
+  h.epochs.stamp(sc, Epoch::new(2));
+
+  // Simulate a `watch("/a")` future dropped mid-widen: journal set + /a/b, /a/c disarmed,
+  // but the wider /a never armed and the plan never committed.
+  let subsumed = h.journal_and_disarm_widen("/a").await;
+  assert_eq!(subsumed.len(), 2, "the widen subsumed both narrow roots");
+  assert!(h.pending_widen.is_some(), "the widen is journaled");
+  // The subsumed kernel roots are disarmed — subscribers momentarily uncovered.
+  for &old in &subsumed {
+    assert!(
+      h.armer.root_path(old).is_none(),
+      "subsumed root {old} was disarmed by the dropped widen"
+    );
+  }
+  // Give the newcomer's dropped plan a visible pending reservation to prove resume clears
+  // it: exactly one plan is still pending (the /a widen the dropped future minted).
+  assert_eq!(
+    h.subsumer.pending_len(),
+    1,
+    "the dropped widen's newcomer plan is still pending"
+  );
+
+  // The next public entry point resumes the journal.
+  h.resume().await;
+
+  // Both subsumed roots are live again (re-armed onto fresh handles 4 and 5) and still
+  // serve their subscriptions — nothing uncovered.
+  let roots: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  assert_eq!(
+    roots,
+    vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
+    "the pre-widen roots are restored (re-armed); the dropped widen left no wider root"
+  );
+  assert_eq!(h.subsumer.subscription_path(sb), Some(Path::new("/a/b")));
+  assert_eq!(h.subsumer.subscription_path(sc), Some(Path::new("/a/c")));
+  // Both subscriptions are covered by a live root (fs knows their fresh handles).
+  let live_handles: Vec<u32> = h.subsumer.roots().map(|(_, handle)| handle).collect();
+  for handle in live_handles {
+    assert!(
+      h.armer.root_path(handle).is_some(),
+      "the restored root's fresh handle is live-armed"
+    );
+  }
+
+  // Each restored subscriber got a dominating Rescan (the re-arm restarted fs epochs at 0,
+  // and the disarm→re-arm window may have dropped events — no silent loss).
+  let by_sub: HashMap<Subscription, Epoch> = h
+    .queue
+    .iter()
+    .map(|ev| {
+      assert!(ev.is_rescan(), "every repair signal is a Rescan");
+      (ev.subscription(), ev.epoch())
+    })
+    .collect();
+  assert_eq!(
+    by_sub.len(),
+    2,
+    "one dominating Rescan per restored subscriber"
+  );
+  assert_eq!(
+    by_sub.get(&sb).copied(),
+    Some(Epoch::new(5)),
+    "sb's repair Rescan strictly dominates its high-water of 4"
+  );
+  assert_eq!(
+    by_sub.get(&sc).copied(),
+    Some(Epoch::new(3)),
+    "sc's repair Rescan strictly dominates its high-water of 2"
+  );
+
+  // The journal is cleared and the newcomer's pending reservation was discarded (the
+  // dropped future handed out no subscription).
+  assert!(
+    h.pending_widen.is_none(),
+    "the journal is cleared after resume"
+  );
+  assert_eq!(
+    h.subsumer.pending_len(),
+    0,
+    "resume discarded the dropped widen's pending reservation"
+  );
+
+  // Resume is a no-op the second time (idempotent): no extra arms, no extra Rescans.
+  let arms_before = h.armer.arm_count();
+  let queued_before = h.queue.len();
+  h.resume().await;
+  assert_eq!(
+    h.armer.arm_count(),
+    arms_before,
+    "a second resume arms nothing"
+  );
+  assert_eq!(
+    h.queue.len(),
+    queued_before,
+    "a second resume queues nothing"
+  );
+}
+
+/// `resume_pending_widen` is a no-op when nothing is journaled (design §4, idempotency):
+/// the common case — every entry point calls it, but almost no call has a pending widen.
+#[tokio::test]
+async fn resume_is_idempotent_when_nothing_pending() {
+  let mut h = Harness::new();
+
+  // A couple of live subscriptions and no in-flight widen.
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let sc = h.watch("/x/y", Interest::all()).await.expect("watch /x/y");
+  assert!(h.pending_widen.is_none(), "no widen is journaled");
+
+  let calls_before = h.armer.calls();
+  let queued_before = h.queue.len();
+  let roots_before: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+
+  // Resume with nothing pending — must change nothing.
+  h.resume().await;
+
+  assert!(h.pending_widen.is_none(), "still nothing journaled");
+  assert_eq!(h.armer.calls(), calls_before, "resume issued no fs calls");
+  assert_eq!(h.queue.len(), queued_before, "resume queued nothing");
+  let roots_after: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  assert_eq!(roots_after, roots_before, "the live roots are unchanged");
+  // The subscriptions are untouched and still live.
+  assert_eq!(h.subsumer.subscription_path(sb), Some(Path::new("/a/b")));
+  assert_eq!(h.subsumer.subscription_path(sc), Some(Path::new("/x/y")));
 }
 
 #[tokio::test]

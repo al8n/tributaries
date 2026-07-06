@@ -38,8 +38,12 @@
 //! # Invariants that override coalescing (design §6)
 //!
 //! - **[`Moved`](EventKind::Moved) is atomic** — a rename is never split and never
-//!   coalesced with either endpoint's other events: it flushes any buffered entry for
-//!   its source and destination paths and emits whole, undelayed.
+//!   coalesced with either endpoint's other events: it emits whole and undelayed.
+//!   Because it emits immediately (its newest-epoch stamp), it first flushes the
+//!   **whole** subscription's buffered entries (all older-epoch, like a `Rescan`), not
+//!   just its two endpoint paths — otherwise the immediate `Moved` would jump ahead of
+//!   an older buffered entry for the same subscription and the delivered epochs would
+//!   go backwards, violating the monotone per-subscription epoch contract (design §8).
 //! - **[`Rescan`](EventKind::Rescan) flushes and bypasses** — a coverage-loss signal
 //!   immediately flushes *every* buffered entry for its subscription (their content is
 //!   now suspect) and emits the `Rescan` undelayed. Its umbrella epoch stamp (assigned
@@ -152,16 +156,17 @@ impl Coalescer {
       // suspect) and emit the Rescan undelayed, its upstream epoch stamp preserved.
       self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
-    } else if let Some(from) = ev.move_from() {
-      // Moved is atomic: flush any buffered entry for its endpoint paths, then emit the
-      // rename whole and undelayed — never split, never coalesced. Detected through the
+    } else if ev.move_from().is_some() {
+      // Moved is atomic: it emits whole and *undelayed* — never split, never coalesced.
+      // Because it emits immediately (newest epoch), it must first flush the WHOLE
+      // subscription's buffered entries (all older-epoch, since admission is monotone),
+      // exactly as a Rescan does — flushing only its two endpoint paths would let the
+      // immediate Moved jump ahead of an older buffered entry for another path of the
+      // same subscription, so the delivered epochs would go backwards and violate the
+      // monotone per-subscription epoch contract (design §6/§8). Detected through the
       // wrapper-level `move_from` (uniform for fs-backed and synthetic moves), not an
       // `EventKind` match, so it needs no fs `MovedEvent` to recognize.
-      let sub = ev.subscription();
-      let from = from.to_path_buf();
-      let dest = ev.path().to_path_buf();
-      self.flush_path(&(sub, from), now);
-      self.flush_path(&(sub, dest), now);
+      self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
     } else {
       // A lifecycle change (Created / Modified / Removed): buffer it, collapsing onto
@@ -315,13 +320,6 @@ impl Coalescer {
     let settle = now.checked_add(quiet_window).unwrap_or_else(far_future);
     let cap = first_seen.checked_add(max_hold).unwrap_or_else(far_future);
     settle.min(cap)
-  }
-
-  /// Flushes the one buffered entry at `key` (if any) into the ready queue at `now`.
-  fn flush_path(&mut self, key: &Key, now: Instant) {
-    if let Some(entry) = self.buffer.remove(key) {
-      self.ready.push_back((now, entry.event));
-    }
   }
 
   /// Flushes every buffered entry for `sub` into the ready queue at `now`, in

@@ -235,23 +235,70 @@ fn moved_is_atomic_and_flushes() {
 }
 
 #[test]
-fn moved_emits_undelayed_ahead_of_a_buffered_burst() {
+fn moved_emits_undelayed_not_after_a_settle_window() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config()); // quiet 10ms
+  let s = sub(1);
+
+  // A rename with NOTHING else buffered for the subscription: it must be due at its own
+  // instant (undelayed), not after the quiet window — unlike a plain lifecycle change,
+  // which would settle for `quiet_window` first.
+  c.admit(moved(s, "/a/dst", "/a/src", 1), clk.at(0));
+
+  assert_eq!(
+    c.next_deadline(),
+    Some(clk.at(0)),
+    "a Moved is due immediately (its ready instant), not at now + quiet_window"
+  );
+  let out = drain(&mut c, clk.at(0));
+  assert_eq!(out.len(), 1, "the undelayed Moved is due at once");
+  assert!(is_moved(&out[0]));
+  assert_eq!(c.next_deadline(), None, "nothing lingers");
+}
+
+#[test]
+fn debounced_moved_flushes_subscription_buffer_preserving_epoch_order() {
   let clk = Clock::new();
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  // A burst buffering at an unrelated path.
-  c.admit(modified(s, "/a/busy", 1), clk.at(0));
-  // A rename at other paths: it must emit immediately, not wait for the burst.
+  // Buffer an older-epoch change at an UNRELATED path (neither the coming rename's
+  // source nor its destination). The pre-fix Moved path flushed only its two endpoint
+  // paths, so this entry would stay buffered and drain LATER than the immediate Moved —
+  // its epoch 1 delivered after the Moved's epoch 2, i.e. epochs going backwards.
+  c.admit(modified(s, "/a/other", 1), clk.at(0));
+
+  // A rename at other paths (epoch 2) — immediate. It must flush the whole subscription
+  // buffer first, so /a/other's epoch-1 Modified emits BEFORE the Moved.
   c.admit(moved(s, "/a/dst", "/a/src", 2), clk.at(1));
 
   let out = drain(&mut c, clk.at(1));
-  assert_eq!(out.len(), 1, "only the undelayed Moved is due");
-  assert!(is_moved(&out[0]));
-  // The unrelated burst is still settling.
+  assert_eq!(
+    out.len(),
+    2,
+    "the unrelated buffered entry is flushed alongside the immediate Moved"
+  );
+  // FIFO: the flushed older-epoch entry precedes the Moved that flushed it.
   assert!(
-    c.next_deadline().is_some(),
-    "the buffered burst still pends"
+    !is_moved(&out[0]),
+    "the flushed older-epoch buffered entry emits first"
+  );
+  assert_eq!(out[0].path(), PathBuf::from("/a/other"));
+  assert_eq!(out[0].epoch(), Epoch::new(1), "the older buffered epoch");
+  assert!(
+    is_moved(&out[1]),
+    "the immediate Moved emits after the flush"
+  );
+  assert_eq!(out[1].epoch(), Epoch::new(2), "the newer Moved epoch");
+  // The delivered epochs are monotone-nondecreasing (1 then 2), not backwards.
+  assert!(
+    out.windows(2).all(|w| w[0].epoch() <= w[1].epoch()),
+    "a debounced Moved never delivers an older buffered entry's epoch after itself"
+  );
+  assert_eq!(
+    c.next_deadline(),
+    None,
+    "the whole subscription was flushed"
   );
 }
 
@@ -610,11 +657,15 @@ mod proptests {
       prop_assert_eq!(run(&steps), run(&steps));
     }
 
-    /// No post-Rescan emission for a subscription ever carries an epoch dominated by
-    /// that Rescan: once a Rescan at epoch `r` has drained, every later emission has
-    /// epoch >= r (the stamps are monotone and the Rescan flushes the buffer).
+    /// No emission after an immediate (undelayed) one ever carries an epoch it
+    /// dominated: once an immediate emission at epoch `r` has drained — a Rescan OR a
+    /// Moved, since BOTH now flush the whole subscription buffer before emitting — every
+    /// later emission has epoch >= r. This is the per-subscription monotone-epoch
+    /// contract across ALL immediate emissions, not just Rescan (the pre-fix Moved
+    /// flushed only its two endpoint paths, so an older buffered entry for another path
+    /// could drain after the Moved and go backwards).
     #[test]
-    fn no_post_rescan_dominated_epoch(steps in prop::collection::vec(step_strategy(), 1..40)) {
+    fn no_post_immediate_dominated_epoch(steps in prop::collection::vec(step_strategy(), 1..40)) {
       let clk = Clock::new();
       let mut c = Coalescer::new(config());
       let s = sub(1);
@@ -629,21 +680,22 @@ mod proptests {
       }
       c.flush_all(&mut emitted);
 
-      // Walk the emission order; track the highest Rescan epoch seen so far. Because a
-      // Rescan flushes its subscription's buffer, everything it dominated is emitted
-      // BEFORE it — so no LATER emission may carry an epoch < that Rescan's.
-      let mut rescan_hw: Option<Epoch> = None;
+      // Walk the emission order; track the highest epoch of any immediate emission
+      // (Rescan or Moved) seen so far. Because each flushes its subscription's whole
+      // buffer, everything it dominated is emitted BEFORE it — so no LATER emission may
+      // carry an epoch < that immediate emission's.
+      let mut immediate_hw: Option<Epoch> = None;
       for e in &emitted {
-        if let Some(r) = rescan_hw {
+        if let Some(r) = immediate_hw {
           prop_assert!(
             e.epoch() >= r,
-            "a post-Rescan emission is dominated by the Rescan: {:?} < {:?}",
+            "an emission after an immediate one is dominated by it: {:?} < {:?}",
             e.epoch(),
             r
           );
         }
-        if e.is_rescan() {
-          rescan_hw = Some(rescan_hw.map_or(e.epoch(), |r| r.max(e.epoch())));
+        if e.is_rescan() || is_moved(e) {
+          immediate_hw = Some(immediate_hw.map_or(e.epoch(), |r| r.max(e.epoch())));
         }
       }
     }
