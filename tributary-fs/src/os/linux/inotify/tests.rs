@@ -1,6 +1,6 @@
 use super::{
   decode::{DecodeOutcome, InotifyMask, decode_events},
-  table::{DrainDecision, WdTable},
+  table::{Attribution, DrainDecision, WdTable},
 };
 use tributary_proto::WatchId;
 
@@ -141,16 +141,26 @@ mod decode {
 mod table {
   use super::*;
 
+  /// The anchors the table would fan a NON-IGNORED record on `wd` to, or `None`
+  /// when the `wd` is in the ambiguous reuse window (fenced to loss) — a compact
+  /// stand-in for matching [`Attribution`] at each assertion site.
+  fn attributed(t: &WdTable, wd: i32) -> Option<Vec<WatchId>> {
+    match t.attribute(wd) {
+      Attribution::Attributed(anchors) => Some(anchors.to_vec()),
+      Attribution::Ambiguous => None,
+    }
+  }
+
   #[test]
   fn register_then_ignored_erases_and_fans_out() {
     let mut t = WdTable::new();
     t.register(7, watch(1));
-    assert_eq!(t.anchors(7), &[watch(1)]);
+    assert_eq!(attributed(&t, 7), Some(vec![watch(1)]));
 
     let fanned = t.on_ignored(7);
     assert_eq!(fanned, vec![watch(1)]);
     assert!(
-      t.anchors(7).is_empty(),
+      attributed(&t, 7).is_some_and(|a| a.is_empty()),
       "IGNORED is the authoritative erase"
     );
   }
@@ -160,7 +170,7 @@ mod table {
     let mut t = WdTable::new();
     t.register(7, watch(1));
     t.alias(7, watch(2)); // the EEXIST path: same inode reached twice
-    assert_eq!(t.anchors(7), &[watch(1), watch(2)]);
+    assert_eq!(attributed(&t, 7), Some(vec![watch(1), watch(2)]));
 
     let fanned = t.on_ignored(7);
     assert_eq!(fanned, vec![watch(1), watch(2)]);
@@ -178,8 +188,8 @@ mod table {
       "a surviving alias keeps the kernel watch"
     );
     assert_eq!(
-      t.anchors(7),
-      &[watch(2)],
+      attributed(&t, 7),
+      Some(vec![watch(2)]),
       "the drained anchor stops attributing"
     );
 
@@ -224,12 +234,14 @@ mod table {
     assert!(t.contains(7), "the tombstone awaits its IGNORED");
 
     // The kernel recycled wd 7 for a brand-new watch before the old IGNORED
-    // landed.
+    // landed. The fresh install replaces the tombstone with a live entry, but
+    // the `wd` is now in the AMBIGUOUS reuse window: a non-IGNORED record here
+    // could be an OLD (drained-watch) record queued ahead of the stale IGNORED,
+    // so it is fenced to loss, never attributed to the new watch.
     t.register(7, watch(2));
-    assert_eq!(
-      t.anchors(7),
-      &[watch(2)],
-      "the fresh install replaces the tombstone with a live entry"
+    assert!(
+      matches!(t.attribute(7), Attribution::Ambiguous),
+      "a record in the reuse window is fenced, not attributed to the new watch"
     );
 
     // The OLD incarnation's IGNORED arrives: it is absorbed, not honored.
@@ -239,9 +251,9 @@ mod table {
       "the stale IGNORED fans to nobody (it belonged to the drained watch)"
     );
     assert_eq!(
-      t.anchors(7),
-      &[watch(2)],
-      "the new anchor survives the stale IGNORED"
+      attributed(&t, 7),
+      Some(vec![watch(2)]),
+      "the new anchor survives the stale IGNORED and attribution resumes"
     );
 
     // The new watch's own eventual IGNORED erases legitimately.
@@ -281,7 +293,7 @@ mod table {
 
     // First IGNORED: absorbed as the stale remnant.
     assert!(t.on_ignored(7).is_empty());
-    assert_eq!(t.anchors(7), &[watch(2)]);
+    assert_eq!(attributed(&t, 7), Some(vec![watch(2)]));
 
     // A (contract-impossible) second IGNORED erases the live entry.
     assert_eq!(t.on_ignored(7), vec![watch(2)]);
@@ -291,7 +303,79 @@ mod table {
   #[test]
   fn unknown_wd_attributes_to_nobody() {
     let t = WdTable::new();
-    assert!(t.anchors(99).is_empty());
+    assert!(attributed(&t, 99).is_some_and(|a| a.is_empty()));
+  }
+
+  /// The fence's happy path stated on its own: a NON-IGNORED record on a `wd` in
+  /// the reuse window is [`Attribution::Ambiguous`] (→ the reader's loss barrier),
+  /// the stale IGNORED then closes the window, and a post-window record on the new
+  /// anchor attributes normally. This is the exact old-CREATE-before-stale-IGNORED
+  /// ordering the kernel produces on a recycled `wd`.
+  #[test]
+  fn reuse_window_fences_records_then_resumes() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    t.register(7, watch(2)); // wd 7 recycled; watch(1)'s IGNORED still queued
+
+    // An OLD record (watch(1)'s CREATE) queued ahead of the stale IGNORED still
+    // carries wd 7 — fenced, never handed to watch(2).
+    assert_eq!(
+      attributed(&t, 7),
+      None,
+      "a record in the reuse window is ambiguous, fenced to loss"
+    );
+
+    // The stale IGNORED closes the window without erasing the new set.
+    assert!(
+      t.on_ignored(7).is_empty(),
+      "the stale IGNORED fans to nobody"
+    );
+
+    // A post-window record now attributes to the new watch normally.
+    assert_eq!(
+      attributed(&t, 7),
+      Some(vec![watch(2)]),
+      "attribution resumes for the new watch once the window closes"
+    );
+  }
+
+  /// A DOUBLE reuse: two incarnations were torn down while a third is live, so two
+  /// stale `IN_IGNORED`s are queued ahead of the new watch's events. The fence must
+  /// hold across BOTH markers — the count, not a bool, is what keeps a first IGNORED
+  /// from re-opening attribution to the wrong (second-drained) watch's records.
+  #[test]
+  fn double_reuse_fences_until_both_stale_ignoreds_drain() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    t.register(7, watch(2)); // one stale IGNORED pending
+    assert_eq!(t.begin_drain(watch(2)), DrainDecision::RemoveWd(7));
+    t.register(7, watch(3)); // two stale IGNOREDs pending
+
+    assert_eq!(
+      attributed(&t, 7),
+      None,
+      "two stale IGNOREDs pending: records are fenced"
+    );
+    // First stale IGNORED absorbed; ONE still pending, so still fenced.
+    assert!(t.on_ignored(7).is_empty());
+    assert_eq!(
+      attributed(&t, 7),
+      None,
+      "one stale IGNORED still pending: the fence holds (a bool would have lifted it)"
+    );
+    // Second stale IGNORED absorbed; the window finally closes.
+    assert!(t.on_ignored(7).is_empty());
+    assert_eq!(
+      attributed(&t, 7),
+      Some(vec![watch(3)]),
+      "both stale markers drained: attribution resumes over the new set"
+    );
+
+    // The live watch's own IGNORED still erases legitimately.
+    assert_eq!(t.on_ignored(7), vec![watch(3)]);
+    assert!(!t.contains(7));
   }
 }
 
