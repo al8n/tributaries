@@ -290,14 +290,22 @@ fn unescape_mountinfo(field: &str) -> Vec<u8> {
 /// closed trust, never toward false authority).
 #[cfg(any(unix, test))]
 pub(crate) fn parse_mountinfo(content: &str, root: &Path) -> Vec<PathBuf> {
-  use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
   let mut mounts = Vec::new();
   for line in content.lines() {
     let Some(field) = line.split_whitespace().nth(4) else {
       continue;
     };
     let bytes = unescape_mountinfo(field);
-    let path = PathBuf::from(OsStr::from_bytes(&bytes));
+    // A mount point is raw path bytes — only unix carries non-UTF-8 verbatim.
+    // The non-unix arm serves solely the cross-platform parser tests (the `test`
+    // half of the gate), whose fixtures are UTF-8, so the lossy decode matches.
+    #[cfg(unix)]
+    let path = {
+      use std::os::unix::ffi::OsStrExt;
+      PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
     if path.starts_with(root) && path.as_path() != root {
       mounts.push(path);
     }

@@ -100,6 +100,8 @@ impl TransportState {
   /// Called ONLY after a `Batch` actually landed on the queue: a refused send
   /// enqueues nothing, so it must not advance the position.
   fn batch_superseded_pending_overflow(&self) {
+    // `fetch_update` is deprecated for `try_update` (nightly), still unstable — keep it.
+    #[allow(deprecated)]
     let _ = self
       .overflow_gen
       .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
@@ -119,6 +121,8 @@ impl BudgetPermit {
   /// Claims a slot, or `None` when the budget is exhausted.
   fn acquire(transport: &TransportState) -> Option<Self> {
     let cap = transport.budget;
+    // `fetch_update` is deprecated for `try_update` (nightly), still unstable — keep it.
+    #[allow(deprecated)]
     transport
       .in_flight
       .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -288,6 +292,8 @@ pub(crate) fn signal_loss<E, S>(transport: &TransportState, mut send: S)
 where
   S: FnMut(SourceMessage<E>) -> bool,
 {
+  // `fetch_update` is deprecated for `try_update` (nightly), still unstable — keep it.
+  #[allow(deprecated)]
   let elected = transport
     .overflow_gen
     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {

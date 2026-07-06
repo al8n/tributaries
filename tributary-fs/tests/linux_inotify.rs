@@ -13,7 +13,9 @@
 //! do): the sysctl cells shrink the user namespace's inotify limits, which
 //! would starve any event-flow test running concurrently.
 
-#![cfg(all(target_os = "linux", feature = "tokio"))]
+// not(miri): drives real inotify/statx syscalls and a tokio runtime — none of
+// which miri can execute. The sans-I/O logic is covered by the lib unit tests.
+#![cfg(all(target_os = "linux", feature = "tokio", not(miri)))]
 
 use std::{
   path::{Path, PathBuf},
@@ -24,7 +26,7 @@ use std::{
   time::Duration,
 };
 
-use tributary_fs::{Event, Interest, TokioWatcher, WatcherOptions};
+use tributary_fs::{Backend, Event, Interest, TokioWatcher, WatcherOptions};
 
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -273,6 +275,43 @@ async fn queue_overflow_surfaces_as_rescan() {
   assert!(observed, "a forced kernel overflow surfaces as a Rescan");
 }
 
+/// Whether this kernel actually enforces `fs/inotify/max_user_watches`. Some
+/// containerized kernels accept the sysctl write — it even reads back as the new
+/// value — yet never charge watches against it, so an exhaustion cell can never
+/// fire. Adds watches on `dirs` to a private inotify fd: an `ENOSPC` before they
+/// are exhausted proves the limit bites; adding strictly more than `limit`
+/// without one proves it does not. Closing the fd releases every probe watch, so
+/// the real watch that follows starts from a clean budget.
+fn inotify_enforces_watch_limit(dirs: &[PathBuf], limit: usize) -> bool {
+  use std::os::unix::ffi::OsStrExt;
+  let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+  if fd < 0 {
+    return false;
+  }
+  let mut enforced = false;
+  let mut added = 0usize;
+  for dir in dirs {
+    let Ok(cpath) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+      continue;
+    };
+    let wd = unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), libc::IN_ATTRIB) };
+    if wd < 0 {
+      // A freshly-created dir yields only the watch-limit `ENOSPC` here — which is
+      // exactly the enforcement being probed for.
+      enforced = std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSPC);
+      break;
+    }
+    added += 1;
+    if added > limit {
+      break;
+    }
+  }
+  unsafe {
+    libc::close(fd);
+  }
+  enforced
+}
+
 /// Suite 6 (privileged): watch-limit exhaustion — `ENOSPC` mid-descent lands
 /// on the Monitor's `NoSpace` path: honest `Rescan`, no silence, no panic,
 /// and the watcher survives.
@@ -282,12 +321,23 @@ async fn watch_limit_exhaustion_is_honest() {
     return;
   }
   let root = scratch_root("nospace");
+  let mut dirs = Vec::new();
   for i in 0..12 {
-    std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+    let dir = root.join(format!("d{i}"));
+    std::fs::create_dir(&dir).unwrap();
+    dirs.push(dir);
   }
   let old = sysctl_swap("fs/inotify/max_user_watches", "8").expect("shrink watches");
+  // The exhaustion path is inotify-specific: `max_user_watches` does not bound the
+  // kernel-recursive fanotify backend that `Backend::Auto` selects under privilege,
+  // so pin inotify below. Then probe whether this kernel actually enforces the
+  // shrink — some containerized kernels accept and echo the write yet never charge
+  // watches against it — so a non-enforcing kernel soft-skips rather than failing
+  // on an exhaustion that could not happen.
+  let enforced = inotify_enforces_watch_limit(&dirs, 8);
 
-  let mut w = watcher();
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
   let watched = w.watch(&root, Interest::all()).await;
   let honest = match watched {
     // The descent hit the ceiling after the root armed: coverage loss must
@@ -298,6 +348,17 @@ async fn watch_limit_exhaustion_is_honest() {
     Err(_) => true,
   };
   sysctl_restore("fs/inotify/max_user_watches", &old);
+  // Only an enforcing kernel exercises the exhaustion path. Where the limit does
+  // not bite AND watching succeeded with no rescan, exhaustion never triggered —
+  // soft-skip. Whenever it WAS triggered (the limit really bites) the honesty
+  // assertion below stands unweakened: a real silent NoSpace still fails here.
+  if !enforced && !honest {
+    eprintln!(
+      "SKIP watch_limit_exhaustion_is_honest: this kernel does not enforce the \
+       max_user_watches shrink; exhaustion never triggered"
+    );
+    return;
+  }
   assert!(honest, "watch exhaustion surfaces as Rescan or typed error");
 }
 

@@ -1,10 +1,12 @@
 use super::{
-  DecodeOutcome, EOVERFLOW, FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF,
-  FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID,
-  FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, FAN_MODIFY, FAN_MOVE_SELF,
-  FAN_ONDIR, FAN_Q_OVERFLOW, FAN_RENAME, Fid, HandleAttempt, classify_handle_attempt,
-  decode_events,
+  DecodeOutcome, FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_EVENT_INFO_TYPE_DFID,
+  FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID, FAN_EVENT_INFO_TYPE_NEW_DFID_NAME,
+  FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR, FAN_Q_OVERFLOW,
+  FAN_RENAME, Fid, decode_events,
 };
+// Used only by `handle_attempt_decision_table`, itself unix-gated (libc errnos).
+#[cfg(unix)]
+use super::{EOVERFLOW, HandleAttempt, classify_handle_attempt};
 
 /// One `struct file_handle`: `handle_bytes` (u32), `handle_type` (i32), then
 /// the opaque bytes.
@@ -389,6 +391,9 @@ fn fid_equality_is_byte_exact() {
 /// behind both the `Backend::Auto` probe's row 5 and the seed/reseed walk's
 /// handle read). `rc == 0` is the encoded handle; the FIRST `EOVERFLOW` proves a
 /// handle exists and asks to grow; every other errno is unsupported.
+// The errno rows are keyed by `libc` constants (a unix-only dependency), so this
+// pure-logic table is exercised on unix only; Windows still compiles the stub.
+#[cfg(unix)]
 #[test]
 fn handle_attempt_decision_table() {
   // Success at the first try — encoded, regardless of a stale errno.

@@ -4,7 +4,9 @@
 //! convergence-style: wait (bounded) until the expected fact is observed;
 //! extra events — coalesced kinds, additional `Rescan`s — are always legal.
 
-#![cfg(all(target_os = "macos", feature = "tokio"))]
+// not(miri): drives real FSEvents and a tokio runtime — syscalls miri cannot
+// execute. The sans-I/O logic these exercise is covered by the lib unit tests.
+#![cfg(all(target_os = "macos", feature = "tokio", not(miri)))]
 
 use std::{
   path::{Path, PathBuf},
