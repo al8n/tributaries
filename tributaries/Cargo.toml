@@ -28,7 +28,7 @@ tributary-proto = { version = "0.1", path = "../tributary-proto" }
 proptest = "1"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 
 [lints]
 workspace = true

@@ -26,14 +26,27 @@
 //! keeping the live root set pairwise disjoint at all times. It is pure logic over
 //! paths and an abstract root-id, so it is exhaustively property-tested with no
 //! real filesystem, clock, or runtime.
+//!
+//! # Settle / debounce (opt-in)
+//!
+//! A caller that only cares about the *settled* state of a file — not every
+//! intermediate write of an editor-save or a `cp` — can opt into the coalescer by
+//! setting a [`DebounceConfig`] on [`TributariesOptions`]. It is a second sans-I/O
+//! state machine: it buffers attributed events per `(subscription, path)` and
+//! collapses a burst to a single emission on a settle timer, while treating a
+//! [`Moved`](EventKind::Moved) atomically and flushing on a
+//! [`Rescan`](EventKind::Rescan) so coverage loss is never held back or lost. Absent a
+//! `DebounceConfig`, events pass through untouched at zero cost.
 
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 
+mod coalesce;
 mod driver;
 mod error;
 mod event;
+mod options;
 mod route;
 mod subscription;
 pub(crate) mod subsume;
@@ -41,6 +54,7 @@ pub(crate) mod subsume;
 pub use driver::Tributaries;
 pub use error::{BuildError, CloseError, UnwatchError, WatchError};
 pub use event::Event;
+pub use options::{DebounceConfig, TributariesOptions};
 pub use subscription::Subscription;
 
 #[cfg(feature = "tokio")]
