@@ -31,13 +31,29 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 
+mod driver;
+mod error;
+mod event;
+mod route;
 mod subscription;
-// The subsumption engine is complete and fully exercised by its own tests, but its
-// non-test consumer — the async driver that turns a `WatchOutcome` into real fs
-// operations — lands in the next milestone. Until then the engine is dead code to a
-// plain library build (which `cargo hack --each-feature` performs), so allow it here;
-// the attribute is removed once the driver wires it in.
-#[allow(dead_code)]
 pub(crate) mod subsume;
 
+pub use driver::Tributaries;
+pub use error::{BuildError, CloseError, UnwatchError, WatchError};
+pub use event::Event;
 pub use subscription::Subscription;
+
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub use driver::TokioTributaries;
+
+#[cfg(feature = "smol")]
+#[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
+pub use driver::SmolTributaries;
+
+/// The event vocabulary, options, and change-id/epoch/location types are re-exported
+/// from [`tributary-fs`](tributary_fs) unchanged — this crate retags events, it does
+/// not redefine them.
+pub use tributary_fs::{
+  ChangeId, Epoch, EventKind, Interest, Location, MovedEvent, Segment, WatcherOptions,
+};

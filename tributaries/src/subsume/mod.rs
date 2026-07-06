@@ -46,16 +46,16 @@ mod tests;
 
 /// One live root's registry record.
 ///
-/// Extends the design sketch (`fs_root` + `subscribers`) with the root's canonical
-/// `path` and the `interest` currently armed on it: `path` is needed to check
-/// coverage (that every subscriber's path descends from this root) and to key the
-/// subsumption index; `interest` is the union the kernel watch currently carries,
-/// so a later widening can union it with the newcomer's without narrowing coverage
-/// a subsumed subscription relied on.
+/// The design sketch's `fs_root` is the [`entries`](Subsumer) map key — every
+/// accessor hands the entry back alongside that handle — so the record stores no
+/// redundant copy and needs no root-id type parameter. It carries the root's
+/// canonical `path` and the `interest` currently armed on it: `path` is needed to
+/// check coverage (that every subscriber's path descends from this root) and to key
+/// the subsumption index; `interest` is the union the kernel watch currently
+/// carries, so a later widening can union it with the newcomer's without narrowing
+/// coverage a subsumed subscription relied on.
 #[derive(Debug, Clone)]
-pub(crate) struct RootEntry<R> {
-  /// The disjoint fs root handle backing this entry's kernel watch.
-  pub(crate) fs_root: R,
+pub(crate) struct RootEntry {
   /// The root's canonical path (the subsumption-index key for this entry).
   pub(crate) path: PathBuf,
   /// The union interest currently armed on the kernel watch.
@@ -140,12 +140,15 @@ pub(crate) struct Subsumer<R> {
   /// Canonical-path-components → fs root handle. The disjointness / ancestor plane.
   index: iradix::unsync::Radix<OsString, R>,
   /// fs root handle → its live record. O(1); the authoritative per-root state.
-  entries: HashMap<R, RootEntry<R>>,
+  entries: HashMap<R, RootEntry>,
   /// Live subscription → the root it rides and its own canonical path.
   subs: HashMap<Subscription, SubRecord<R>>,
-  /// Canonical path stashed by `plan_watch` for the not-yet-committed subscription,
-  /// consumed by the paired `commit_watch` (the driver contract is plan→commit on
-  /// the same engine, one at a time).
+  /// Canonical paths of not-yet-committed subscriptions, keyed by the id each
+  /// `plan_watch` freshly minted. A plan stashes under its own new id, and the
+  /// paired `commit_watch` / `abort_watch` consumes exactly that id — so plans
+  /// never collide and may interleave freely; the only requirement is that every
+  /// plan is eventually committed (arm succeeded) OR aborted (arm failed), which
+  /// [`Subsumer::abort_watch`] makes enforceable rather than a bare convention.
   pending: HashMap<Subscription, PathBuf>,
   /// The next subscription id to mint. Monotonic and never reused, so a re-pointed
   /// or dropped-and-re-added subscription never aliases a live one.
@@ -270,7 +273,6 @@ where
         self.entries.insert(
           fs_root,
           RootEntry {
-            fs_root,
             path: root_path.clone(),
             interest: *interest,
             subscribers: std::vec![*sub],
@@ -308,7 +310,6 @@ where
         self.entries.insert(
           fs_root,
           RootEntry {
-            fs_root,
             path: new_root_path.clone(),
             interest: *union_interest,
             subscribers,
@@ -333,6 +334,23 @@ where
     }
   }
 
+  /// Abandons the plan `outcome` without committing it, discarding the pending
+  /// reservation `plan_watch` stashed. Call this on every path where arming the
+  /// real kernel watch failed, so the not-yet-committed subscription's pending
+  /// entry cannot leak: `plan_watch` mutated nothing committed, and no `fs_root`
+  /// was ever obtained, so dropping the reservation fully unwinds the plan.
+  ///
+  /// Idempotent per plan: consuming an already-committed (or already-aborted)
+  /// outcome's id is a no-op, so a double-abort or an abort-after-commit is safe.
+  pub(crate) fn abort_watch(&mut self, outcome: &WatchOutcome<R>) {
+    let sub = match outcome {
+      WatchOutcome::Covered { sub, .. }
+      | WatchOutcome::Widen { sub, .. }
+      | WatchOutcome::Disjoint { sub, .. } => *sub,
+    };
+    self.pending.remove(&sub);
+  }
+
   /// Removes `sub`, reporting whether its root emptied (returns `None` for an
   /// unknown subscription). Mutates immediately — no commit step is needed.
   pub(crate) fn plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<R>> {
@@ -355,7 +373,7 @@ where
   }
 
   /// The live record for `fs_root`, if any.
-  pub(crate) fn entry(&self, fs_root: R) -> Option<&RootEntry<R>> {
+  pub(crate) fn entry(&self, fs_root: R) -> Option<&RootEntry> {
     self.entries.get(&fs_root)
   }
 
@@ -365,9 +383,20 @@ where
     self.subs.get(&sub).map(|record| record.path.as_path())
   }
 
+  /// The number of not-yet-committed plans still holding a pending reservation —
+  /// the leak the plan→commit-or-abort contract must keep at zero between watches.
+  /// Consumed by the driver's arm-failure test, which needs a runtime.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn pending_len(&self) -> usize {
+    self.pending.len()
+  }
+
   /// Every live root as `(canonical path, handle)`, in deterministic canonical-path
-  /// order (for invariants and tests). Iterates the [`iradix`] index (which yields
-  /// values in key order), never the [`HashMap`], so the order is reproducible.
+  /// order. Iterates the [`iradix`] index (which yields values in key order), never
+  /// the [`HashMap`], so the order is reproducible. The disjointness / coverage
+  /// invariants are checked against this; it has no non-test consumer yet, so it is
+  /// gated to keep a plain library build free of dead code.
+  #[cfg(test)]
   pub(crate) fn roots(&self) -> impl Iterator<Item = (&Path, R)> {
     self.index.values().map(move |&handle| {
       let entry = &self.entries[&handle];
@@ -385,12 +414,15 @@ where
     Subscription::new(ScopeId::new(next))
   }
 
-  /// Consumes the canonical path `plan_watch` stashed for `sub`.
+  /// Consumes the canonical path `plan_watch` stashed under `sub`'s freshly-minted
+  /// id. A commit consumes exactly its own plan's id, so this is present unless the
+  /// plan was already aborted (arm failure) — in which case `commit_watch` must not
+  /// run for it.
   fn take_pending(&mut self, sub: Subscription) -> PathBuf {
     self
       .pending
       .remove(&sub)
-      .expect("commit_watch follows plan_watch for this subscription")
+      .expect("commit_watch consumes its own plan's pending entry (not yet aborted)")
   }
 }
 

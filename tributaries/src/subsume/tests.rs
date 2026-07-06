@@ -61,9 +61,6 @@ fn disjoint_paths_stay_separate() {
   );
   assert_eq!(s.entry(ra).unwrap().subscribers, vec![sa]);
   assert_eq!(s.entry(rb).unwrap().subscribers, vec![sb]);
-  // Each entry records its own backing handle.
-  assert_eq!(s.entry(ra).unwrap().fs_root, ra);
-  assert_eq!(s.entry(rb).unwrap().fs_root, rb);
   // The side table records each subscription's registration path.
   assert_eq!(s.subscription_path(sa), Some(Path::new("/a")));
   assert_eq!(s.subscription_path(sb), Some(Path::new("/b")));
@@ -219,6 +216,10 @@ fn run(ops: &[Op]) -> (Subsumer<u32>, HashMap<Subscription, PathBuf>) {
 }
 
 proptest! {
+  // No on-disk regression file: it would resolve the current directory (a `getcwd`
+  // syscall) at setup, which trips Miri's isolation on an otherwise sans-I/O suite.
+  #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
+
   /// (a) The live roots are pairwise disjoint (no root is an ancestor of another).
   #[test]
   fn roots_are_pairwise_disjoint(ops in proptest::collection::vec(op_strategy(), 0..40)) {
@@ -258,14 +259,13 @@ proptest! {
     }
   }
 
-  /// (c) No live root has an empty subscriber set, and each entry records its own
-  /// backing handle.
+  /// (c) No live root has an empty subscriber set, and every indexed root has an
+  /// entry (the index and the entries map stay in lockstep).
   #[test]
   fn no_zero_subscriber_root(ops in proptest::collection::vec(op_strategy(), 0..40)) {
     let (s, _live) = run(&ops);
     for (_path, handle) in s.roots() {
       let entry = s.entry(handle).expect("indexed root has an entry");
-      prop_assert_eq!(entry.fs_root, handle, "entry records a foreign handle");
       prop_assert!(!entry.subscribers.is_empty(), "root {handle} has no subscribers");
     }
   }
