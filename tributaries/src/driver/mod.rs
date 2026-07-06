@@ -217,6 +217,7 @@ impl<R: RuntimeLite> Tributaries<R> {
     let sub = apply_watch(
       &mut self.subsumer,
       &mut self.epochs,
+      &mut self.filters,
       &mut self.queue,
       &self.watcher,
       &canonical,
@@ -429,14 +430,23 @@ impl<R: RuntimeLite> Tributaries<R> {
 /// changes subsumption, the just-armed root is disarmed and the watch aborts cleanly
 /// rather than committing a mis-keyed or overlapping entry.
 ///
-/// The ordering contract (design §4): on a widen, arm the new wider root **before**
-/// releasing the subsumed roots, so coverage never gaps. If any arm fails the plan
-/// is aborted ([`Subsumer::abort_watch`]) so no pending reservation leaks. On a
-/// successful widen, a synthetic dominating [`Rescan`](tributary_fs::EventKind::Rescan)
-/// is queued for every re-pointed subscription (design §8).
+/// The ordering contract (design §4): on a widen, **unwatch the subsumed roots first,
+/// then arm the wider root** — the reverse of a naive arm-before-unwatch, which the
+/// lower watcher's disjoint-root contract makes impossible ([`Watcher::watch`] rejects
+/// a root overlapping a live one with `Overlaps`, so the wider root cannot be armed
+/// while a subsumed one is still live). The brief window between the unwatch and the arm
+/// is a coverage gap, covered by the dominating [`Rescan`](tributary_fs::EventKind::Rescan)
+/// each re-pointed subscription receives (loss-is-a-Rescan — the consumer re-enumerates
+/// the wider root). If the wider arm fails the subsumed roots are **rolled back**
+/// (re-armed, each subscriber re-pointed with its own dominating `Rescan`) and the error
+/// is returned to the newcomer's `watch`; if a rollback re-arm itself fails, the affected
+/// subscribers are signalled a loss `Rescan` and their now-uncoverable root is torn out
+/// rather than left dangling. Every path either commits or aborts
+/// ([`Subsumer::abort_watch`]) so no pending reservation leaks.
 async fn apply_watch<A: RootArmer>(
   subsumer: &mut Subsumer<A::Handle>,
   epochs: &mut EpochLedger,
+  filters: &mut HashMap<Subscription, Filter>,
   queue: &mut VecDeque<Event>,
   armer: &A,
   canonical: &Path,
@@ -481,42 +491,45 @@ async fn apply_watch<A: RootArmer>(
       sub,
     } => {
       let sub = *sub;
-      // Watch-new-before-unwatch-old (design §4): arm the wider root FIRST, so
-      // coverage never gaps in the window where both are briefly armed.
+
+      // Unwatch-old-then-arm-new (design §4): the lower watcher rejects a root that
+      // overlaps a live one (`Overlaps`), so the wider root cannot be armed while a
+      // subsumed one is still live — arm-before-unwatch is impossible. Release the
+      // subsumed *kernel* watches FIRST (the subsumer's own index is untouched here, so
+      // its RootEntries remain intact for a rollback and for `commit_watch`'s atomic
+      // index transition on success). The coverage gap this opens is closed by the
+      // dominating Rescan each re-pointed subscription receives below.
+      for old in unwatch {
+        let _ = armer.disarm(*old).await;
+      }
+
+      // Now arm the wider root — no live overlap remains to reject it. If it fails to
+      // come up (or its fs-canonical path diverges in a way that changes subsumption),
+      // the subsumed roots are already disarmed, so restore them by rolling back.
       let fs_root = match armer.arm(new_root_path, Interest::all()).await {
         Ok(fs_root) => fs_root,
         Err(err) => {
-          // The wider root never came up: abandon the plan, leaving the subsumed
-          // roots exactly as they were (untouched, still armed). No pending leak.
+          rollback_widen(subsumer, epochs, filters, queue, armer, unwatch).await;
           subsumer.abort_watch(&outcome);
           return Err(err);
         }
       };
       // Re-key onto fs's authoritative canonical path (design §4). A divergence that
       // changes which roots this widens over (or makes it covered) invalidates the
-      // plan: disarm the just-armed wider root, leave the subsumed roots untouched,
-      // and abort cleanly.
+      // plan: disarm the just-armed wider root, roll the subsumed roots back, and abort.
       let fs_path = fs_canonical_root(armer, fs_root, new_root_path);
       if !subsumer.fs_path_preserves_plan(&fs_path, unwatch) {
         let _ = armer.disarm(fs_root).await;
+        rollback_widen(subsumer, epochs, filters, queue, armer, unwatch).await;
         subsumer.abort_watch(&outcome);
         return Err(canonical_race(new_root_path, &fs_path));
       }
 
-      // The wider root is live and adopts every re-pointed subscription — commit
-      // the state transition before releasing the old roots so a concurrent event
-      // routes against the new entry.
+      // The wider root is live and adopts every re-pointed subscription. `commit_watch`
+      // drops the subsumed roots' (already-disarmed) index keys + entries and installs
+      // the wider root atomically — a pure index transition, no I/O.
       let repointed = repointed.clone();
       subsumer.commit_watch(&outcome, fs_root, &fs_path);
-
-      // Now release the subsumed roots. A failed disarm is benign: `unwatch` fails
-      // only with `UnknownRoot` (the root is already dead) or `Closed` (the watcher
-      // has stopped) — never on a still-live root — so nothing lingers live. The
-      // wider root already covers these subtrees, so coverage is intact and the
-      // subscription is established regardless.
-      for old in unwatch {
-        let _ = armer.disarm(*old).await;
-      }
 
       // Rebase each re-pointed subscription onto the new wider root (design §8): emit
       // its synthetic dominating Rescan at its high-water `.next()` and set its
@@ -524,13 +537,75 @@ async fn apply_watch<A: RootArmer>(
       // subscription's pre-widening stream while the new root's genuine events
       // (raw fs epoch 0, 1, …) stamp to hw.next()+0, +1, … — tie-or-exceeding it
       // (not dominated). Each subscription rebases from its own high-water. The Rescan
-      // names fs's canonical root path, the coordinate the consumer must re-enumerate.
+      // both names fs's canonical root path (the coordinate the consumer re-enumerates)
+      // AND closes the unwatch→arm coverage gap: any event the gap missed is caught by
+      // the re-enumeration the Rescan obliges (loss-is-a-Rescan).
       for moved in repointed {
         let rescan = epochs.repoint(moved);
         queue.push_back(Event::rescan(moved, fs_path.clone(), rescan));
       }
 
       Ok(sub)
+    }
+  }
+}
+
+/// Rolls a failed widen back: re-arms each subsumed root the widen already disarmed and
+/// re-points its subscribers onto the fresh handle, restoring the pre-widen state
+/// (design §4/§8). Called when the wider arm fails (or its fs path diverges) after the
+/// subsumed kernel watches were released — so those subtrees are momentarily uncovered
+/// and must be brought back up.
+///
+/// Each restored root's subscribers are re-pointed with a **dominating `Rescan`** each:
+/// a fresh arm restarts fs epochs at 0 (so the raw fs epoch is not a valid dominance
+/// order across the re-arm — [`EpochLedger::repoint`] rebases them), and the disarm→re-arm
+/// window may have dropped events, so the Rescan is required (no silent loss — the
+/// consumer re-enumerates the restored root). The subsumer entry is unchanged by the
+/// widen up to this point (`commit_watch` runs only on success), so each root's path and
+/// subscribers are read straight from it and re-keyed onto the new handle.
+///
+/// **Degenerate double-failure:** if a rollback re-arm ALSO fails, that root cannot be
+/// restored and its subscribers are terminally uncovered — each is signalled a loss
+/// `Rescan` (so the loss is never silent) and the dead root is torn out of the subsumer
+/// along with its subscribers' per-subscription state (filter + epoch ledger), rather
+/// than left dangling on a never-armed handle.
+async fn rollback_widen<A: RootArmer>(
+  subsumer: &mut Subsumer<A::Handle>,
+  epochs: &mut EpochLedger,
+  filters: &mut HashMap<Subscription, Filter>,
+  queue: &mut VecDeque<Event>,
+  armer: &A,
+  unwatch: &[A::Handle],
+) {
+  for &old in unwatch {
+    // The subsumer entry for `old` is still intact (no commit happened): its canonical
+    // path and subscribers are exactly the pre-widen state to restore.
+    let Some(entry) = subsumer.entry(old) else {
+      continue;
+    };
+    let root_path = entry.path.clone();
+    let subscribers = entry.subscribers.clone();
+    match armer.arm(&root_path, Interest::all()).await {
+      Ok(fresh) => {
+        // Restored: re-key the root onto the fresh handle and re-point every subscriber
+        // with its own dominating Rescan (the re-arm restarted fs epochs at 0).
+        subsumer.rekey_root(old, fresh);
+        for moved in subscribers {
+          let rescan = epochs.repoint(moved);
+          queue.push_back(Event::rescan(moved, root_path.clone(), rescan));
+        }
+      }
+      Err(_) => {
+        // Degenerate: the root cannot be restored. Signal each subscriber a loss Rescan
+        // (no silent loss), then tear the dead root out and reclaim its subscribers'
+        // per-subscription state so nothing dangles on a never-armed handle.
+        for lost in subsumer.force_remove_root(old) {
+          let rescan = epochs.repoint(lost);
+          queue.push_back(Event::rescan(lost, root_path.clone(), rescan));
+          filters.remove(&lost);
+          epochs.remove(lost);
+        }
+      }
     }
   }
 }

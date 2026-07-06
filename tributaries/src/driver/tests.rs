@@ -7,8 +7,10 @@ use std::{
 
 use tributary_proto::{Epoch, Interest};
 
+use tributary_fs::WatchRootError;
+
 use super::{
-  Event, RootArmer, Subscription, Subsumer, WatchError, apply_watch, epoch::EpochLedger,
+  Event, Filter, RootArmer, Subscription, Subsumer, WatchError, apply_watch, epoch::EpochLedger,
 };
 
 /// One recorded call against the fake armer, in the order it happened.
@@ -22,6 +24,14 @@ enum Call {
 /// (so a test can assert the widen sequence) and can be told to fail the *next*
 /// arm (so a test can drive the arm-failure unwind) — without any real filesystem
 /// or the un-constructible `RootHandle`.
+///
+/// **It enforces the lower watcher's disjoint-root contract** ([`tributary_fs::Watcher`]):
+/// arming a path that overlaps a currently-armed fake root (is an ancestor-or-descendant
+/// of it) returns [`WatchRootError::Overlaps`], exactly as production does. This is what
+/// makes the widen-ordering tests validate a *real-executable* sequence — a naive
+/// arm-before-unwatch (arming the wider root while a subsumed one is still live) would be
+/// rejected here just as it is by the real kernel watcher, so a test cannot pass against
+/// an ordering production could never run.
 struct FakeArmer {
   inner: RefCell<FakeInner>,
 }
@@ -29,8 +39,14 @@ struct FakeArmer {
 struct FakeInner {
   next_handle: u32,
   calls: Vec<Call>,
-  /// Fail the next `arm` when set, consuming the flag.
-  fail_next_arm: bool,
+  /// The arm-path of every currently-live (armed, not yet disarmed) fake root, keyed by
+  /// handle. A fresh `arm` is rejected with `Overlaps` if its path overlaps any of these
+  /// — the disjoint-root contract the real [`tributary_fs::Watcher`] enforces (design §4).
+  live: HashMap<u32, PathBuf>,
+  /// How many of the next `arm` calls to fail, decremented on each failed arm. Set to 1
+  /// to fail just the next arm, or to N to drive a rollback re-arm failure after the
+  /// wider arm already failed (the degenerate double-failure path).
+  fail_arms: u32,
   /// Each armed handle's fs-authoritative canonical path (what `root_path` reports).
   /// By default the path passed to `arm`; a `retarget` entry overrides it to model
   /// the canonicalization TOCTOU (fs reports a different path than the umbrella
@@ -50,7 +66,8 @@ impl FakeArmer {
       inner: RefCell::new(FakeInner {
         next_handle: 0,
         calls: Vec::new(),
-        fail_next_arm: false,
+        live: HashMap::new(),
+        fail_arms: 0,
         root_paths: HashMap::new(),
         retarget: HashMap::new(),
         armed_interests: Vec::new(),
@@ -58,9 +75,15 @@ impl FakeArmer {
     }
   }
 
-  /// Arm the next call fails.
+  /// The next `arm` call fails.
   fn fail_next_arm(&self) {
-    self.inner.borrow_mut().fail_next_arm = true;
+    self.inner.borrow_mut().fail_arms = 1;
+  }
+
+  /// The next `n` `arm` calls fail — to drive a rollback re-arm failure (the degenerate
+  /// double-failure path) after the wider arm already failed.
+  fn fail_arms(&self, n: u32) {
+    self.inner.borrow_mut().fail_arms = n;
   }
 
   /// Model the canonicalization TOCTOU: an `arm(planned)` records `fs` as the handle's
@@ -100,12 +123,28 @@ impl RootArmer for FakeArmer {
     let mut inner = self.inner.borrow_mut();
     inner.calls.push(Call::Arm(path.to_path_buf()));
     inner.armed_interests.push(interest);
-    if inner.fail_next_arm {
-      inner.fail_next_arm = false;
+    if inner.fail_arms > 0 {
+      inner.fail_arms -= 1;
       return Err(WatchError::Canonicalize {
         path: path.to_path_buf(),
         source: io::Error::other("injected arm failure"),
       });
+    }
+    // The disjoint-root contract (design §4): reject a path overlapping any live root —
+    // ancestor-or-descendant — with `Overlaps`, exactly as `tributary_fs::Watcher` does.
+    // This is what forces the widen to unwatch the subsumed roots BEFORE arming the
+    // wider one; an arm-before-unwatch would land here and be rejected, just like in
+    // production. (Rejection creates no handle and touches no live-set — nothing armed.)
+    if let Some(existing) = inner
+      .live
+      .values()
+      .find(|live| path.starts_with(live) || live.starts_with(path))
+      .cloned()
+    {
+      return Err(WatchError::Fs(WatchRootError::Overlaps {
+        path: path.to_path_buf(),
+        existing,
+      }));
     }
     inner.next_handle += 1;
     let handle = inner.next_handle;
@@ -116,6 +155,10 @@ impl RootArmer for FakeArmer {
       .cloned()
       .unwrap_or_else(|| path.to_path_buf());
     inner.root_paths.insert(handle, fs_path);
+    // Track the arm-path (not the retargeted fs path) for overlap: production checks the
+    // overlap in the coordinate the umbrella plans against, and the `retarget` models a
+    // separate fs-side divergence caught by the `fs_path_preserves_plan` guard, not here.
+    inner.live.insert(handle, path.to_path_buf());
     Ok(handle)
   }
 
@@ -127,6 +170,7 @@ impl RootArmer for FakeArmer {
     let mut inner = self.inner.borrow_mut();
     inner.calls.push(Call::Disarm(handle));
     inner.root_paths.remove(&handle);
+    inner.live.remove(&handle);
     Ok(())
   }
 }
@@ -135,6 +179,11 @@ impl RootArmer for FakeArmer {
 struct Harness {
   subsumer: Subsumer<u32>,
   epochs: EpochLedger,
+  /// Mirrors the driver's per-subscription filter map, so the rollback's degenerate
+  /// loss path (which reclaims a lost subscriber's filter) is exercised as it runs in
+  /// `Tributaries::watch`. A watch that succeeds records `Filter::all` here, mirroring
+  /// `Tributaries::watch` inserting the caller's filter on success.
+  filters: HashMap<Subscription, Filter>,
   queue: VecDeque<Event>,
   armer: FakeArmer,
 }
@@ -144,21 +193,27 @@ impl Harness {
     Self {
       subsumer: Subsumer::new(),
       epochs: EpochLedger::new(),
+      filters: HashMap::new(),
       queue: VecDeque::new(),
       armer: FakeArmer::new(),
     }
   }
 
   async fn watch(&mut self, path: &str, interest: Interest) -> Result<Subscription, WatchError> {
-    apply_watch(
+    let sub = apply_watch(
       &mut self.subsumer,
       &mut self.epochs,
+      &mut self.filters,
       &mut self.queue,
       &self.armer,
       Path::new(path),
       interest,
     )
-    .await
+    .await?;
+    // Mirror `Tributaries::watch`: on success record the subscription's filter (the
+    // per-sub state the degenerate rollback path must reclaim if this sub is later lost).
+    self.filters.insert(sub, Filter::all());
+    Ok(sub)
   }
 
   /// Mirrors `Tributaries::unwatch`'s state cleanup at the harness level (no real
@@ -169,10 +224,12 @@ impl Harness {
     match self.subsumer.plan_unwatch(sub) {
       None => false,
       Some(super::UnwatchOutcome::Dropped) => {
+        self.filters.remove(&sub);
         self.epochs.remove(sub);
         true
       }
       Some(super::UnwatchOutcome::RootEmptied { fs_root }) => {
+        self.filters.remove(&sub);
         self.epochs.remove(sub);
         let _ = self.armer.disarm(fs_root).await;
         true
@@ -206,28 +263,231 @@ async fn overlapping_watch_issues_one_arm() {
   );
 }
 
+/// The widen ordering (design §4), forced by the lower watcher's disjoint-root
+/// contract: [`tributary_fs::Watcher::watch`] rejects a root overlapping a live one
+/// (`Overlaps`), so the wider root **cannot** be armed while a subsumed one is live —
+/// the widen must **disarm the subsumed roots BEFORE arming the wider root**. The brief
+/// coverage gap this opens is closed by the dominating `Rescan` each re-pointed
+/// subscription receives (loss-is-a-Rescan). This asserts that real-executable order
+/// against the overlap-rejecting fake — the pre-fix arm-before-unwatch would have been
+/// rejected by the fake (as by the kernel) and never reached here.
 #[tokio::test]
-async fn widen_arms_new_before_disarming_old() {
+async fn widen_disarms_subsumed_before_arming_the_wider_root() {
   let mut h = Harness::new();
 
   // Arm the narrow root /a/b first (handle 1).
-  h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
-  // Now watch its ancestor /a — a widen: it subsumes /a/b.
+  let s_narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  // Now watch its ancestor /a — a widen: it subsumes /a/b. This SUCCEEDS only because
+  // the widen disarms /a/b before arming /a; arming /a while /a/b is live would be
+  // rejected `Overlaps` by the fake, exactly as the real watcher would reject it.
   h.watch("/a", Interest::all())
     .await
-    .expect("watch /a widens");
+    .expect("watch /a widens (subsumed /a/b disarmed first, so the wider arm is legal)");
 
-  // The wider root /a must be armed BEFORE the subsumed /a/b (handle 1) is
-  // disarmed, so coverage never gaps (design §4).
+  // The subsumed /a/b (handle 1) is disarmed FIRST, then the wider /a is armed — the
+  // reverse of a naive arm-before-unwatch (which the disjoint-root contract forbids).
   assert_eq!(
     h.armer.calls(),
     vec![
       Call::Arm(PathBuf::from("/a/b")),
-      Call::Arm(PathBuf::from("/a")),
       Call::Disarm(1),
+      Call::Arm(PathBuf::from("/a")),
     ],
-    "arm-new precedes disarm-old on a widen"
+    "disarm-subsumed precedes arm-wider on a widen (the only real-executable order)"
   );
+
+  // The single surviving root is the wider /a (the subsumed /a/b handle is gone).
+  let roots: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  assert_eq!(
+    roots,
+    vec![PathBuf::from("/a")],
+    "the widen collapses to /a"
+  );
+
+  // The re-pointed /a/b subscriber gets a dominating Rescan closing the unwatch→arm gap,
+  // naming the widened root to re-enumerate.
+  let rescans: Vec<_> = h.queue.iter().collect();
+  assert_eq!(rescans.len(), 1, "one dominating Rescan per re-pointed sub");
+  assert!(rescans[0].is_rescan(), "the re-point signal is a Rescan");
+  assert_eq!(
+    rescans[0].subscription(),
+    s_narrow,
+    "it is delivered to the re-pointed subscriber"
+  );
+  assert_eq!(
+    rescans[0].path(),
+    Path::new("/a"),
+    "the Rescan names the widened root the consumer must re-enumerate"
+  );
+}
+
+/// The widen rollback (design §4/§8): when the wider arm FAILS after the subsumed roots
+/// were disarmed, each subsumed root is re-armed (fresh handle) and its subscribers are
+/// re-pointed with a dominating Rescan, restoring the pre-widen state; the newcomer's
+/// `watch` returns the arm error and leaks no pending reservation or per-sub state.
+#[tokio::test]
+async fn widen_arm_failure_rolls_back_subsumed_roots() {
+  let mut h = Harness::new();
+
+  // Two narrow roots (handles 1 and 2), each its own subscription.
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c");
+  // Give each some history so its rollback Rescan is a strict, checkable dominance.
+  h.epochs.stamp(sb, Epoch::new(4));
+  h.epochs.stamp(sc, Epoch::new(2));
+
+  // Fail the WIDER arm: the widen disarms /a/b and /a/c, then the arm of /a fails.
+  h.armer.fail_next_arm();
+  let result = h.watch("/a", Interest::all()).await;
+  assert!(result.is_err(), "the failed wider arm surfaces the error");
+
+  // Rollback restored BOTH subsumed roots: /a/b and /a/c are re-armed (fresh handles 4
+  // and 5) after being disarmed. The call trace: arm 1,2 (setup), then disarm 1,2 +
+  // arm /a (fails, no handle) + re-arm /a/b, /a/c.
+  assert_eq!(
+    h.armer.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")), // the failed wider arm (mints no handle)
+      Call::Arm(PathBuf::from("/a/b")), // rollback re-arm
+      Call::Arm(PathBuf::from("/a/c")), // rollback re-arm
+    ],
+    "the wider arm fails after the subsumed roots are disarmed; both are re-armed"
+  );
+
+  // The two subsumed roots are live again (re-keyed onto their fresh handles), and the
+  // failed wider root /a is NOT present.
+  let roots: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  assert_eq!(
+    roots,
+    vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
+    "the pre-widen roots are restored; the failed wider root never committed"
+  );
+  // Both original subscriptions are still live and ride their restored roots.
+  assert_eq!(h.subsumer.subscription_path(sb), Some(Path::new("/a/b")));
+  assert_eq!(h.subsumer.subscription_path(sc), Some(Path::new("/a/c")));
+
+  // Each restored subscriber got a dominating Rescan (the re-arm restarted fs epochs at
+  // 0, and the disarm→re-arm window may have missed events — no silent loss).
+  let by_sub: HashMap<Subscription, Epoch> = h
+    .queue
+    .iter()
+    .map(|ev| {
+      assert!(ev.is_rescan(), "every rollback signal is a Rescan");
+      (ev.subscription(), ev.epoch())
+    })
+    .collect();
+  assert_eq!(
+    by_sub.len(),
+    2,
+    "one dominating Rescan per restored subscriber"
+  );
+  assert_eq!(
+    by_sub.get(&sb).copied(),
+    Some(Epoch::new(5)),
+    "sb's rollback Rescan strictly dominates its high-water of 4"
+  );
+  assert_eq!(
+    by_sub.get(&sc).copied(),
+    Some(Epoch::new(3)),
+    "sc's rollback Rescan strictly dominates its high-water of 2"
+  );
+
+  // No pending reservation leaked, and the newcomer established no subscription: a
+  // subsequent watch of /a/b is Covered by the restored root (one arm, no new one).
+  assert_eq!(
+    h.subsumer.pending_len(),
+    0,
+    "the aborted widen leaks no pending reservation"
+  );
+}
+
+/// The widen rollback's **degenerate** double-failure (design §4/§8): when a rollback
+/// re-arm ALSO fails, that root cannot be restored — its subscribers are signalled a
+/// loss Rescan (never silently dropped) and the dead root is torn out of the subsumer
+/// with its subscribers' per-subscription state (filter + epoch) reclaimed, so nothing
+/// dangles on a never-armed handle.
+#[tokio::test]
+async fn widen_rollback_double_failure_signals_loss_and_reclaims() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  h.epochs.stamp(sb, Epoch::new(7));
+  assert!(
+    h.filters.contains_key(&sb),
+    "sb's filter is recorded before the loss"
+  );
+
+  // Fail the next TWO arms: the wider /a arm (→ rollback), then the rollback re-arm of
+  // /a/b (→ degenerate: /a/b cannot be restored).
+  h.armer.fail_arms(2);
+  let result = h.watch("/a", Interest::all()).await;
+  assert!(result.is_err(), "the failed wider arm surfaces the error");
+
+  // Trace: setup arm /a/b, then disarm /a/b + the (failed) wider arm /a + the (failed)
+  // rollback re-arm /a/b.
+  assert_eq!(
+    h.armer.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Disarm(1),
+      Call::Arm(PathBuf::from("/a")),   // failed wider arm
+      Call::Arm(PathBuf::from("/a/b")), // failed rollback re-arm
+    ],
+    "the wider arm fails, the rollback re-arm of the sole subsumed root also fails"
+  );
+
+  // The root could not be restored, so no live root remains — /a/b was torn out.
+  assert_eq!(
+    h.subsumer.roots().count(),
+    0,
+    "the unrestorable root is torn out (not left dangling on a never-armed handle)"
+  );
+  // sb's side-table record, filter, and epoch state are all reclaimed.
+  assert_eq!(
+    h.subsumer.subscription_path(sb),
+    None,
+    "the lost subscriber's side-table record is gone"
+  );
+  assert!(
+    !h.filters.contains_key(&sb),
+    "the lost subscriber's filter is reclaimed"
+  );
+  assert_eq!(
+    h.epochs.tracked_len(),
+    (0, 0),
+    "the lost subscriber's epoch state is reclaimed"
+  );
+
+  // But the loss was NOT silent: sb received a dominating Rescan naming its root.
+  let rescans: Vec<_> = h.queue.iter().collect();
+  assert_eq!(
+    rescans.len(),
+    1,
+    "the lost subscriber is signalled exactly one loss Rescan"
+  );
+  assert!(rescans[0].is_rescan(), "the loss signal is a Rescan");
+  assert_eq!(
+    rescans[0].subscription(),
+    sb,
+    "delivered to the lost subscriber"
+  );
+  assert_eq!(
+    rescans[0].path(),
+    Path::new("/a/b"),
+    "the loss Rescan names the root whose coverage was lost"
+  );
+  assert_eq!(
+    rescans[0].epoch(),
+    Epoch::new(8),
+    "the loss Rescan strictly dominates sb's high-water of 7"
+  );
+
+  // No pending reservation leaked.
+  assert_eq!(h.subsumer.pending_len(), 0, "no pending reservation leaks");
 }
 
 #[tokio::test]
