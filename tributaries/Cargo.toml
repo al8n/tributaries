@@ -13,17 +13,22 @@ keywords = ["filesystem", "notify", "watcher", "subsume"]
 
 [features]
 # Runtime aliases mirror `tributary-fs`. The sans-I/O engines need no runtime;
-# these gate the async driver landing in later milestones.
-tokio = ["tributary-fs/tokio"]
-smol = ["tributary-fs/smol"]
+# these gate the async driver's `Tokio*`/`Smol*` aliases.
+tokio = ["tributary-fs/tokio", "agnostic-lite/tokio"]
+smol = ["tributary-fs/smol", "agnostic-lite/smol"]
 
 [dependencies]
+agnostic-lite = { version = "0.6", features = ["time"] }
 iradix = "0.3"
+thiserror = "2"
 tributary-fs = { version = "0.1", path = "../tributary-fs" }
 tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
 proptest = "1"
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
