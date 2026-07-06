@@ -326,14 +326,62 @@ fn drain_events(
       return DrainExit::Parked;
     }
     let decoded = decode::decode_events(&buf[..n]);
-    // Attribution still runs on a lossy buffer so the `wd` table stays accurate
-    // (an `IN_IGNORED` in it must still consume its entry); its EVENTS are dropped
-    // by the barrier inside `forward_attributed`.
-    let attributed = attribute_events(decoded.events, table);
-    forward_attributed(&shared.transport, attributed, decoded.lossy, |msg| {
+    attribute_and_forward(&shared.transport, table, decoded, |msg| {
       shared.queue.try_send(msg).is_ok()
     });
   }
+}
+
+/// Attributes one decoded buffer against the `wd` table, resets the table's
+/// reuse-window state on a DECODE-level loss, and forwards the result behind the loss
+/// ordering barrier. Pure over the `send` closure — the only queue-touching part — so
+/// the whole seam is testable over a real table + [`DecodeOutcome`](decode::DecodeOutcome)
+/// with a capturing sender.
+///
+/// Attribution runs even on a lossy buffer so the `wd` table stays accurate (an
+/// `IN_IGNORED` in the decoded prefix must still consume its entry); the events are
+/// then dropped by the barrier inside [`forward_attributed`].
+///
+/// # Window reset: which losses reset the wd-table, and which do not
+///
+/// The reuse fence and draining tombstone each WAIT for a future `IN_IGNORED`. A loss
+/// that BREAKS the queue ordering can drop that awaited marker, stranding the window
+/// forever (the permanent-`Ambiguous` livelock); a loss that leaves the ordering
+/// INTACT cannot. Every loss path is classified accordingly:
+///
+/// | Loss path                                    | Ordering | Window reset |
+/// |----------------------------------------------|----------|--------------|
+/// | `IN_Q_OVERFLOW` record (kernel drop)         | broken   | yes — in [`attribute_events`], in-order at the sentinel |
+/// | Decode-truncation / absurd-len / malformed   | broken   | yes — HERE, on `decoded.lossy`, after the prefix is attributed |
+/// | Ambiguous-fence (`attributed.lost`)          | intact   | no — the stale `IN_IGNORED` is still coming; the fence drains it |
+/// | Budget-refused batch (transport backpressure)| intact   | no — the buffer's markers were already consumed by attribution; only its events degrade to a covering `Overflow` |
+/// | `Fatal` (stream death)                       | terminal | no — the table dies with the reader thread |
+///
+/// So the reset is gated on `decoded.lossy` (the DECODE loss), NOT on
+/// `attributed.lost`: the latter also carries the ambiguous-fence loss, and clearing
+/// the fence before its stale `IN_IGNORED` drains would mis-attribute the reused
+/// `wd`'s old records to the new watch. A buffer that is BOTH decode-lossy and
+/// ambiguous resets — the decode loss broke the ordering regardless. The reset runs
+/// AFTER attributing the intact prefix (so any real markers it held are honored) and
+/// BEFORE forwarding the loss barrier.
+fn attribute_and_forward<S>(
+  transport: &transport::TransportState,
+  table: &mut WdTable,
+  decoded: decode::DecodeOutcome,
+  send: S,
+) where
+  S: FnMut(crate::os::SourceMessage) -> bool,
+{
+  let attributed = attribute_events(decoded.events, table);
+  if decoded.lossy {
+    // A decode-level loss dropped the tail after the break, so the queue ordering the
+    // reuse fence relies on is gone: the stale `IN_IGNORED` a reused `wd` counts down —
+    // or a draining tombstone's own final marker — may be in the dropped tail and will
+    // never arrive. Reset the windows (same body as the in-order overflow reset). Gated
+    // on the decode loss, never the ambiguous fence — see the table above.
+    table.on_loss();
+  }
+  forward_attributed(transport, attributed, decoded.lossy, send);
 }
 
 /// Forwards one attributed buffer onto the queue via `send`, holding the loss
