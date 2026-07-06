@@ -137,8 +137,9 @@ jobs:
           - macos-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
-    # The macOS leg runs tributary-fs's real-FSEvents integration suite;
-    # a wedged kernel stream must fail the job, not idle out the runner.
+    # The macOS leg runs the real-FSEvents integration suites (tributary-fs's
+    # `watcher` and tributaries' unprivileged `umbrella`); a wedged kernel stream
+    # must fail the job, not idle out the runner.
     timeout-minutes: 45
     steps:
     - uses: actions/checkout@v7

@@ -19,6 +19,7 @@ smol = ["tributary-fs/smol", "agnostic-lite/smol"]
 
 [dependencies]
 agnostic-lite = { version = "0.6", features = ["time"] }
+arc-swap = "1"
 iradix = "0.3"
 thiserror = "2"
 tributary-fs = { version = "0.1", path = "../tributary-fs" }
@@ -26,6 +27,7 @@ tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
