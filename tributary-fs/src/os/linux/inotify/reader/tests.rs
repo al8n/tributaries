@@ -184,6 +184,47 @@ mod barrier {
       "attribution resumes for the new watch once the window closes"
     );
   }
+
+  /// An `IN_Q_OVERFLOW` that lands DURING a reuse window recovers: the overflow may
+  /// have dropped the stale `IN_IGNORED` the fence was counting down, so processing
+  /// the overflow buffer resets the window — otherwise every future record on the
+  /// reused `wd` would fence to loss FOREVER (a permanent livelock under the very
+  /// overflow the covering rescan is meant to heal). The overflow buffer itself is
+  /// lossy (forwards only the `Overflow`); the NEXT record on the reused `wd` then
+  /// rides a Batch, proving the fence was cleared rather than stranded.
+  #[test]
+  fn overflow_during_reuse_window_recovers() {
+    let mut table = WdTable::new();
+    table.register(3, watch(1));
+    assert_eq!(table.begin_drain(watch(1)), DrainDecision::RemoveWd(3));
+    table.register(3, watch(2)); // wd 3 recycled; watch(1)'s IGNORED still queued
+
+    // Before the overflow the window fences records to loss.
+    let fenced = attribute_events(vec![event(3, IN_CREATE, Some(b"stale"))], &mut table);
+    assert!(
+      fenced.lost && fenced.events.is_empty(),
+      "the reuse window fences records pre-overflow"
+    );
+
+    // The overflow arrives WITHOUT the stale IGNORED (it was dropped). The buffer is
+    // lossy — only the Overflow is forwarded — and the window state is reset.
+    let over = attribute_events(vec![event(-1, IN_Q_OVERFLOW, None)], &mut table);
+    assert!(over.lost, "the overflow buffer is lossy");
+    assert_eq!(
+      forward_capture(over, false),
+      vec![Sent::Overflow],
+      "the overflow buffer forwards only the covering Overflow"
+    );
+
+    // The stale IGNORED never comes (dropped). A future record on the reused wd now
+    // attributes to the new watch and rides a Batch — the fence did not strand.
+    let live = attribute_events(vec![event(3, IN_CREATE, Some(b"real"))], &mut table);
+    assert_eq!(
+      forward_capture(live, false),
+      vec![Sent::Batch(1)],
+      "after the overflow reset the reused wd delivers — no permanent Ambiguous livelock"
+    );
+  }
 }
 
 /// Reader-teardown fairness: the drain loop services control BETWEEN reads, so a

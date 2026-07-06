@@ -162,7 +162,10 @@ pub(crate) struct AttributedBatch {
 /// only non-syscall step).
 ///
 /// - An overflow sentinel (`wd == -1`) carries no attribution: it marks the
-///   batch lost and is not forwarded — the ordered loss signal covers it.
+///   batch lost and is not forwarded — the ordered loss signal covers it. It also
+///   RESETS the table's reuse-window / draining state ([`WdTable::on_overflow`]):
+///   an overflow can drop the very `IN_IGNORED` a window awaits, so no window may
+///   outlive it (the covering rescan rebuilds the table truthfully).
 /// - `IN_IGNORED` is the `wd`'s final record: it consumes the table entry
 ///   ([`WdTable::on_ignored`]) and forwards to the anchors that were still
 ///   live (a kernel-initiated teardown); a self-induced teardown whose
@@ -182,6 +185,15 @@ pub(crate) fn attribute_events(
   let mut lost = false;
   for event in decoded {
     if event.mask.is_overflow() {
+      // The kernel dropped queued events (inotify(7)); a stale `IN_IGNORED` a reuse
+      // fence is counting down — or a draining tombstone's own final marker — may be
+      // among the dropped, so reset the wd table's window state HERE, at the
+      // sentinel's in-order position: after any in-buffer marker that preceded it,
+      // and gated strictly on a genuine overflow (never a decode-truncation or an
+      // ambiguous-fence loss, which leave the queue ordering intact). Without it a
+      // stuck fence would convert every future record on the reused `wd` to loss
+      // forever; the covering rescan this loss triggers rebuilds the table truthfully.
+      table.on_overflow();
       lost = true;
       continue;
     }

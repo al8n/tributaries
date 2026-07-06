@@ -377,6 +377,137 @@ mod table {
     assert_eq!(t.on_ignored(7), vec![watch(3)]);
     assert!(!t.contains(7));
   }
+
+  /// The stranding case: the reuse fence must NOT outlive an `IN_Q_OVERFLOW`. A
+  /// `wd` recycled onto a draining tombstone records
+  /// `pending_stale_ignored` and fences every record to [`Attribution::Ambiguous`]
+  /// until the stale `IN_IGNORED` decrements it — but an overflow can DROP that
+  /// marker (inotify(7)), so without a reset the fence stays up FOREVER, converting
+  /// every future record on the reused `wd` to loss (a permanent livelock under the
+  /// very overflow the covering rescan is meant to heal). `on_overflow` clears the
+  /// window so attribution resumes over the new set.
+  #[test]
+  fn overflow_clears_a_stuck_reuse_fence() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    t.register(7, watch(2)); // wd 7 recycled; watch(1)'s IGNORED still queued
+    assert_eq!(
+      attributed(&t, 7),
+      None,
+      "the reuse window fences records before the overflow"
+    );
+
+    // The overflow drops the stale IGNORED the fence was counting down — it will
+    // never arrive. The reset clears the window so the fence cannot strand.
+    t.on_overflow();
+    assert_eq!(
+      attributed(&t, 7),
+      Some(vec![watch(2)]),
+      "after the overflow reset the reused wd attributes to the new watch, not Ambiguous forever"
+    );
+
+    // The new watch's own eventual IGNORED still erases legitimately (the dropped
+    // stale marker never comes).
+    assert_eq!(t.on_ignored(7), vec![watch(2)]);
+    assert!(!t.contains(7));
+  }
+
+  /// A draining tombstone awaits its own `IN_IGNORED` to erase; an overflow can drop
+  /// that marker, stranding the tombstone forever (a leak, and a latent trap — a
+  /// later reuse of the `wd` would set up a fresh fence for an IGNORED that was
+  /// already dropped). `on_overflow` erases draining tombstones so the `wd` is clean
+  /// for the rescan's re-arm.
+  #[test]
+  fn overflow_resolves_a_draining_tombstone() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    assert!(t.contains(7), "the tombstone awaits its IGNORED");
+
+    // The overflow may have dropped that IGNORED; the reset erases the tombstone
+    // rather than letting it strand.
+    t.on_overflow();
+    assert!(
+      !t.contains(7),
+      "the draining tombstone is resolved, not stranded"
+    );
+
+    // A later reuse of the wd now starts a CLEAN live entry — no fence waiting on a
+    // marker that was already dropped.
+    t.register(7, watch(2));
+    assert_eq!(
+      attributed(&t, 7),
+      Some(vec![watch(2)]),
+      "the reused wd attributes immediately — the stale-marker trap is gone"
+    );
+  }
+
+  /// The compound window: a `wd` whose CURRENT incarnation has itself drained (a
+  /// draining tombstone) WHILE a stale `IN_IGNORED` from an earlier incarnation is
+  /// still pending — one overflow can drop BOTH awaited markers. The reset clears the
+  /// pending count AND erases the tombstone in a single pass.
+  #[test]
+  fn overflow_clears_pending_count_and_tombstone_together() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7)); // tombstone
+    t.register(7, watch(2)); // pending = 1, live = [watch(2)]
+    assert_eq!(t.begin_drain(watch(2)), DrainDecision::RemoveWd(7)); // live empties: draining again, pending still 1
+    assert!(t.contains(7));
+    assert_eq!(
+      attributed(&t, 7),
+      None,
+      "a still-pending stale marker fences even while the entry drains"
+    );
+
+    t.on_overflow();
+    assert!(
+      !t.contains(7),
+      "the overflow clears the pending count and erases the tombstone in one pass"
+    );
+  }
+
+  /// The overflow reset touches only WINDOW state (reuse fences + draining
+  /// tombstones): a plain live entry — and its alias fan-out — keeps attributing
+  /// across an overflow. Its events are lost for that buffer, but the `wd → anchors`
+  /// mapping is truth the rescan reconciles, never something to tear down.
+  #[test]
+  fn overflow_leaves_a_plain_live_entry_intact() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    t.alias(7, watch(2));
+
+    t.on_overflow();
+    assert_eq!(
+      attributed(&t, 7),
+      Some(vec![watch(1), watch(2)]),
+      "a live entry and its alias fan-out survive the overflow reset unchanged"
+    );
+    // Teardown still flows normally afterwards.
+    assert_eq!(t.on_ignored(7), vec![watch(1), watch(2)]);
+    assert!(!t.contains(7));
+  }
+
+  /// Overflow specificity: the reset is triggered ONLY by an `IN_Q_OVERFLOW`. A
+  /// reuse fence left untouched by any overflow still fences until its stale IGNORED
+  /// drains normally — the non-overflow fence behavior is unchanged.
+  #[test]
+  fn reuse_fence_without_overflow_still_drains_via_ignored() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    t.register(7, watch(2));
+    assert_eq!(attributed(&t, 7), None, "fenced while pending");
+
+    // No overflow: the stale IGNORED itself closes the window, exactly as before.
+    assert!(t.on_ignored(7).is_empty());
+    assert_eq!(
+      attributed(&t, 7),
+      Some(vec![watch(2)]),
+      "the fence lifts on the stale IGNORED, not on any overflow"
+    );
+  }
 }
 
 /// Live-kernel smoke: compiled by the Linux-target lint gate on every host,
