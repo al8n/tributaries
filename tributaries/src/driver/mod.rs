@@ -29,6 +29,32 @@ use crate::{
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
 };
 
+/// An in-flight widen the driver journaled before it began releasing kernel watches, so a
+/// dropped `watch()` future (a `select!`/timeout that cancels mid-transaction) can be
+/// repaired on the next public entry point (design §4, cancellation-safety journaling).
+///
+/// A widen is multi-step async I/O — it disarms N subsumed roots, then arms the wider one
+/// — and `watch()` is `&mut self async`, so a caller that drops its future between a
+/// disarm and the commit leaves subsumed roots disarmed with **no** async cleanup (Rust
+/// cannot `await` in `Drop`). The driver therefore records this journal **before the
+/// first disarm** and clears it only when the widen fully commits or fully rolls back.
+/// Every public entry point first calls [`resume_pending_widen`] to bring a journaled-but-
+/// incomplete widen back to a consistent pre-widen coverage.
+///
+/// It carries the plan [`WatchOutcome`] the widen was executing: its `unwatch` handles
+/// (the subsumed roots whose liveness resume probes), and — through the same outcome — the
+/// newcomer's pending reservation, which resume aborts ([`Subsumer::abort_watch`]) since a
+/// dropped `watch()` handed out no [`Subscription`]. The subsumed roots' paths and
+/// subscribers are read straight from the subsumer on resume (the widen commits its index
+/// transition only on success, so those [`RootEntry`](crate::subsume::RootEntry)s stay
+/// intact for the repair), so the journal need not duplicate them.
+#[derive(Debug)]
+struct WidenJournal<H> {
+  /// The widen plan being executed: `unwatch` names the subsumed roots to probe/restore,
+  /// and the whole outcome carries the newcomer's pending id for [`Subsumer::abort_watch`].
+  outcome: WatchOutcome<H>,
+}
+
 use self::epoch::EpochLedger;
 
 mod epoch;
@@ -131,6 +157,12 @@ pub struct Tributaries<R: RuntimeLite> {
   /// instantiated); when [`Some`], `next` admits them and delivers on the settle
   /// timer.
   coalescer: Option<Coalescer>,
+  /// An in-flight widen journaled before its first disarm (design §4, cancellation
+  /// safety), or [`None`] when no widen is mid-flight. Set inside
+  /// [`apply_watch`] before the subsumed kernel watches are released and cleared when
+  /// the widen commits or rolls back; a dropped `watch()` future leaves it [`Some`], and
+  /// every public entry point calls [`resume_pending_widen`] first to repair it.
+  pending_widen: Option<WidenJournal<RootHandle>>,
 }
 
 impl<R: RuntimeLite> core::fmt::Debug for Tributaries<R> {
@@ -162,6 +194,7 @@ impl<R: RuntimeLite> Tributaries<R> {
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
       coalescer: debounce.map(Coalescer::new),
+      pending_widen: None,
     })
   }
 
@@ -209,6 +242,9 @@ impl<R: RuntimeLite> Tributaries<R> {
     interest: Interest,
     filter: Filter,
   ) -> Result<Subscription, WatchError> {
+    // Repair any widen a previously-dropped `watch()` future left mid-transaction before
+    // starting our own (design §4, cancellation safety).
+    self.resume_pending_widen().await;
     let supplied = path.as_ref();
     let canonical = std::fs::canonicalize(supplied).map_err(|source| WatchError::Canonicalize {
       path: supplied.to_path_buf(),
@@ -219,6 +255,7 @@ impl<R: RuntimeLite> Tributaries<R> {
       &mut self.epochs,
       &mut self.filters,
       &mut self.queue,
+      &mut self.pending_widen,
       &self.watcher,
       &canonical,
       interest,
@@ -239,6 +276,9 @@ impl<R: RuntimeLite> Tributaries<R> {
   /// - [`UnwatchError::UnknownSubscription`] when `sub` is not live;
   /// - [`UnwatchError::Fs`] when releasing the now-empty kernel watch fails.
   pub async fn unwatch(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
+    // Repair any widen a previously-dropped `watch()` future left mid-transaction before
+    // touching subscription state (design §4, cancellation safety).
+    self.resume_pending_widen().await;
     match self.subsumer.plan_unwatch(sub) {
       None => Err(UnwatchError::UnknownSubscription),
       Some(UnwatchOutcome::Dropped) => {
@@ -269,6 +309,10 @@ impl<R: RuntimeLite> Tributaries<R> {
   /// stays atomic and a [`Rescan`](tributary_fs::EventKind::Rescan) jumps the queue.
   /// Absent the coalescer, events pass through untouched.
   pub async fn next(&mut self) -> Option<Event> {
+    // Repair any widen a previously-dropped `watch()` future left mid-transaction before
+    // draining events (design §4, cancellation safety); its restore queues the dominating
+    // Rescans the loops below then deliver.
+    self.resume_pending_widen().await;
     if self.coalescer.is_some() {
       self.next_debounced().await
     } else {
@@ -285,6 +329,7 @@ impl<R: RuntimeLite> Tributaries<R> {
       let raw = self.watcher.next().await?;
       let fanned = self.fan_out_raw(&raw);
       self.queue.extend(fanned);
+      self.retire_if_dead_root(&raw).await;
     }
   }
 
@@ -349,6 +394,7 @@ impl<R: RuntimeLite> Tributaries<R> {
       };
       let fanned = self.fan_out_raw(&raw);
       self.queue.extend(fanned);
+      self.retire_if_dead_root(&raw).await;
     }
   }
 
@@ -400,6 +446,39 @@ impl<R: RuntimeLite> Tributaries<R> {
     )
   }
 
+  /// Retires a lower root that has died, **after** its terminal signal was fanned out
+  /// (design §4, dead-root retirement). When a watched root is deleted, `tributary-fs`
+  /// tears its handle down and emits a terminal [`Rescan`](tributary_fs::EventKind::Rescan);
+  /// the fan-out above delivered that Rescan to every subscriber (so the loss is never
+  /// silent), and this then removes the now-dead root from the subsumer and reclaims its
+  /// subscribers' per-subscription state (filter + epoch ledger).
+  ///
+  /// Without this, the stale subsumer entry makes a later [`watch`](Self::watch) of the
+  /// recreated path resolve as `Covered` against a **dead** handle — the new subscription
+  /// would receive nothing, with no loss signal. Retirement lets a subsequent watch
+  /// re-arm a fresh kernel root (`Disjoint`, not `Covered`).
+  ///
+  /// The liveness probe is [`RootArmer::root_path`] returning [`None`] on a terminal
+  /// `Rescan`: `tributary-fs` clears a torn-down handle from its read view, so `root_path`
+  /// answers `None` exactly for a dead root (a live root, or a non-terminal Rescan on a
+  /// still-live root, keeps a `Some` path and is left alone). Only an fs-sourced terminal
+  /// signal reaches here — the synthetic widen/rollback Rescans are queued directly, never
+  /// pulled from the stream — so this never races an in-flight journaled widen (which is
+  /// already resumed at every entry point before a raw event is pulled).
+  async fn retire_if_dead_root(&mut self, raw: &tributary_fs::Event) {
+    // Only a terminal Rescan whose root fs no longer knows about is retired. A non-Rescan
+    // event, or a Rescan on a still-live root (overflow re-enumeration), leaves the root.
+    if !raw.is_rescan() || RootArmer::root_path(&self.watcher, raw.root()).is_some() {
+      return;
+    }
+    // Tear the dead root out and reclaim each subscriber's filter + epoch state. The
+    // terminal Rescan was already queued above, so subscribers keep their loss signal.
+    for sub in self.subsumer.force_remove_root(raw.root()) {
+      self.filters.remove(&sub);
+      self.epochs.remove(sub);
+    }
+  }
+
   /// Closes the watcher: tears the underlying `tributary-fs` watcher down and
   /// resolves once its driver has quiesced. Buffered attributed events (and any
   /// still-settling coalescer entries) are dropped.
@@ -407,8 +486,30 @@ impl<R: RuntimeLite> Tributaries<R> {
   /// # Errors
   ///
   /// [`CloseError::Fs`] when the underlying watcher cannot confirm its shutdown.
-  pub async fn close(self) -> Result<(), CloseError> {
+  pub async fn close(mut self) -> Result<(), CloseError> {
+    // Repair any widen a previously-dropped `watch()` future left mid-transaction so the
+    // subsumed roots are not torn down still-disarmed (design §4, cancellation safety).
+    // Its queued Rescans are dropped with the watcher on close, as any buffered event is.
+    self.resume_pending_widen().await;
     Ok(self.watcher.close().await?)
+  }
+
+  /// Repairs a widen a previously-dropped `watch()` future left mid-transaction, bringing
+  /// state back to a consistent pre-widen coverage (design §4, cancellation-safety
+  /// journaling). Called at the top of every public entry point ([`watch`](Self::watch),
+  /// [`next`](Self::next), [`unwatch`](Self::unwatch), [`close`](Self::close)) before it
+  /// does its own work. A no-op when nothing is journaled, and idempotent (see
+  /// [`resume_pending_widen`]).
+  async fn resume_pending_widen(&mut self) {
+    resume_pending_widen(
+      &mut self.subsumer,
+      &mut self.epochs,
+      &mut self.filters,
+      &mut self.queue,
+      &mut self.pending_widen,
+      &self.watcher,
+    )
+    .await;
   }
 }
 
@@ -443,11 +544,16 @@ impl<R: RuntimeLite> Tributaries<R> {
 /// subscribers are signalled a loss `Rescan` and their now-uncoverable root is torn out
 /// rather than left dangling. Every path either commits or aborts
 /// ([`Subsumer::abort_watch`]) so no pending reservation leaks.
+// The driver threads its per-widen state (subsumer, epoch ledger, filters, event queue,
+// cancellation journal) plus the armer and the plan inputs; bundling them into a struct
+// would only obscure the plain data-flow of a single `watch` transaction.
+#[allow(clippy::too_many_arguments)]
 async fn apply_watch<A: RootArmer>(
   subsumer: &mut Subsumer<A::Handle>,
   epochs: &mut EpochLedger,
   filters: &mut HashMap<Subscription, Filter>,
   queue: &mut VecDeque<Event>,
+  journal: &mut Option<WidenJournal<A::Handle>>,
   armer: &A,
   canonical: &Path,
   interest: Interest,
@@ -492,6 +598,16 @@ async fn apply_watch<A: RootArmer>(
     } => {
       let sub = *sub;
 
+      // Journal the widen BEFORE the first disarm (design §4, cancellation safety): if
+      // this future is dropped between a disarm and the commit/rollback below (a
+      // `select!`/timeout cancel), no async cleanup can run in `Drop`, so the next public
+      // entry point reads this journal and repairs the disarmed roots. The record carries
+      // the plan outcome, whose `unwatch` handles resume probes and whose newcomer id
+      // resume aborts. Cleared on EVERY exit path (commit or either rollback) below.
+      *journal = Some(WidenJournal {
+        outcome: outcome.clone(),
+      });
+
       // Unwatch-old-then-arm-new (design §4): the lower watcher rejects a root that
       // overlaps a live one (`Overlaps`), so the wider root cannot be armed while a
       // subsumed one is still live — arm-before-unwatch is impossible. Release the
@@ -511,6 +627,7 @@ async fn apply_watch<A: RootArmer>(
         Err(err) => {
           rollback_widen(subsumer, epochs, filters, queue, armer, unwatch).await;
           subsumer.abort_watch(&outcome);
+          *journal = None;
           return Err(err);
         }
       };
@@ -522,14 +639,17 @@ async fn apply_watch<A: RootArmer>(
         let _ = armer.disarm(fs_root).await;
         rollback_widen(subsumer, epochs, filters, queue, armer, unwatch).await;
         subsumer.abort_watch(&outcome);
+        *journal = None;
         return Err(canonical_race(new_root_path, &fs_path));
       }
 
       // The wider root is live and adopts every re-pointed subscription. `commit_watch`
       // drops the subsumed roots' (already-disarmed) index keys + entries and installs
-      // the wider root atomically — a pure index transition, no I/O.
+      // the wider root atomically — a pure index transition, no I/O. The widen has now
+      // fully committed, so the journal is cleared (no dropped-future repair is owed).
       let repointed = repointed.clone();
       subsumer.commit_watch(&outcome, fs_root, &fs_path);
+      *journal = None;
 
       // Rebase each re-pointed subscription onto the new wider root (design §8): emit
       // its synthetic dominating Rescan at its high-water `.next()` and set its
@@ -550,25 +670,12 @@ async fn apply_watch<A: RootArmer>(
   }
 }
 
-/// Rolls a failed widen back: re-arms each subsumed root the widen already disarmed and
-/// re-points its subscribers onto the fresh handle, restoring the pre-widen state
-/// (design §4/§8). Called when the wider arm fails (or its fs path diverges) after the
-/// subsumed kernel watches were released — so those subtrees are momentarily uncovered
-/// and must be brought back up.
-///
-/// Each restored root's subscribers are re-pointed with a **dominating `Rescan`** each:
-/// a fresh arm restarts fs epochs at 0 (so the raw fs epoch is not a valid dominance
-/// order across the re-arm — [`EpochLedger::repoint`] rebases them), and the disarm→re-arm
-/// window may have dropped events, so the Rescan is required (no silent loss — the
-/// consumer re-enumerates the restored root). The subsumer entry is unchanged by the
-/// widen up to this point (`commit_watch` runs only on success), so each root's path and
-/// subscribers are read straight from it and re-keyed onto the new handle.
-///
-/// **Degenerate double-failure:** if a rollback re-arm ALSO fails, that root cannot be
-/// restored and its subscribers are terminally uncovered — each is signalled a loss
-/// `Rescan` (so the loss is never silent) and the dead root is torn out of the subsumer
-/// along with its subscribers' per-subscription state (filter + epoch ledger), rather
-/// than left dangling on a never-armed handle.
+/// Rolls a failed widen back: restores every subsumed root the widen already disarmed,
+/// re-pointing its subscribers onto a fresh handle with a dominating `Rescan`, restoring
+/// the pre-widen state (design §4/§8). Called when the wider arm fails (or its fs path
+/// diverges) after the subsumed kernel watches were released — so those subtrees are
+/// momentarily uncovered and must be brought back up. Each root is restored by
+/// [`restore_subsumed_root`] (which handles the degenerate re-arm-also-fails case).
 async fn rollback_widen<A: RootArmer>(
   subsumer: &mut Subsumer<A::Handle>,
   epochs: &mut EpochLedger,
@@ -577,37 +684,114 @@ async fn rollback_widen<A: RootArmer>(
   armer: &A,
   unwatch: &[A::Handle],
 ) {
+  // Called synchronously right after the disarm loop, so every root in `unwatch` is
+  // disarmed — restore all of them unconditionally.
   for &old in unwatch {
-    // The subsumer entry for `old` is still intact (no commit happened): its canonical
-    // path and subscribers are exactly the pre-widen state to restore.
-    let Some(entry) = subsumer.entry(old) else {
-      continue;
-    };
-    let root_path = entry.path.clone();
-    let subscribers = entry.subscribers.clone();
-    match armer.arm(&root_path, Interest::all()).await {
-      Ok(fresh) => {
-        // Restored: re-key the root onto the fresh handle and re-point every subscriber
-        // with its own dominating Rescan (the re-arm restarted fs epochs at 0).
-        subsumer.rekey_root(old, fresh);
-        for moved in subscribers {
-          let rescan = epochs.repoint(moved);
-          queue.push_back(Event::rescan(moved, root_path.clone(), rescan));
-        }
+    restore_subsumed_root(subsumer, epochs, filters, queue, armer, old).await;
+  }
+}
+
+/// Restores one subsumed root a widen disarmed: re-arms it (fresh handle), re-keys the
+/// subsumer entry onto that handle, and re-points every subscriber with a dominating
+/// `Rescan` (design §4/§8). On the **degenerate** double-failure — the re-arm itself fails
+/// — the root cannot be restored, so each subscriber is signalled a loss `Rescan` and the
+/// dead root is torn out with its subscribers' per-subscription state reclaimed, rather
+/// than left dangling on a never-armed handle.
+///
+/// A no-op if `old` has no subsumer entry (already restored or never present), so it is
+/// safe to call on a root the caller is unsure about — the idempotency the
+/// [`resume_pending_widen`] repair relies on. The entry's canonical path and subscribers
+/// are read straight from the subsumer (a widen commits its index transition only on
+/// success, so a mid-widen entry is exactly the pre-widen state to restore).
+async fn restore_subsumed_root<A: RootArmer>(
+  subsumer: &mut Subsumer<A::Handle>,
+  epochs: &mut EpochLedger,
+  filters: &mut HashMap<Subscription, Filter>,
+  queue: &mut VecDeque<Event>,
+  armer: &A,
+  old: A::Handle,
+) {
+  let Some(entry) = subsumer.entry(old) else {
+    return;
+  };
+  let root_path = entry.path.clone();
+  let subscribers = entry.subscribers.clone();
+  match armer.arm(&root_path, Interest::all()).await {
+    Ok(fresh) => {
+      // Restored: re-key the root onto the fresh handle and re-point every subscriber
+      // with its own dominating Rescan (the re-arm restarted fs epochs at 0).
+      subsumer.rekey_root(old, fresh);
+      for moved in subscribers {
+        let rescan = epochs.repoint(moved);
+        queue.push_back(Event::rescan(moved, root_path.clone(), rescan));
       }
-      Err(_) => {
-        // Degenerate: the root cannot be restored. Signal each subscriber a loss Rescan
-        // (no silent loss), then tear the dead root out and reclaim its subscribers'
-        // per-subscription state so nothing dangles on a never-armed handle.
-        for lost in subsumer.force_remove_root(old) {
-          let rescan = epochs.repoint(lost);
-          queue.push_back(Event::rescan(lost, root_path.clone(), rescan));
-          filters.remove(&lost);
-          epochs.remove(lost);
-        }
+    }
+    Err(_) => {
+      // Degenerate: the root cannot be restored. Signal each subscriber a loss Rescan
+      // (no silent loss), then tear the dead root out and reclaim its subscribers'
+      // per-subscription state so nothing dangles on a never-armed handle.
+      for lost in subsumer.force_remove_root(old) {
+        let rescan = epochs.repoint(lost);
+        queue.push_back(Event::rescan(lost, root_path.clone(), rescan));
+        filters.remove(&lost);
+        epochs.remove(lost);
       }
     }
   }
+}
+
+/// Repairs a widen a dropped `watch()` future left mid-transaction, restoring a consistent
+/// pre-widen coverage (design §4, cancellation-safety journaling). Called at the top of
+/// every public entry point via [`Tributaries::resume_pending_widen`].
+///
+/// A dropped `watch()` future never handed out a [`Subscription`], so resuming to the
+/// **pre-widen** state — the subsumed roots live-armed again, each re-pointed subscriber
+/// re-enumerating via a dominating `Rescan` — leaves no subscriber uncovered and is the
+/// correct repair (the newcomer simply never happened). Concretely, if `journal` is set:
+///
+/// 1. For each subsumed root the plan named: if fs still knows it
+///    ([`RootArmer::root_path`] is `Some`), the drop happened before that disarm — leave
+///    it live. If fs no longer knows it (`None` — it was disarmed), restore it via
+///    [`restore_subsumed_root`] (re-arm + re-point with a dominating `Rescan`, or tear out
+///    + signal loss on a re-arm failure).
+/// 2. Abort the newcomer's partial plan ([`Subsumer::abort_watch`]) so its pending
+///    reservation cannot leak; the dropped future inserted no filter for it, so there is
+///    none to reclaim.
+/// 3. Clear the journal.
+///
+/// **Idempotent:** a no-op when `journal` is `None`, and — because step 1 probes each
+/// root's liveness and [`restore_subsumed_root`] no-ops an absent entry — safe to call
+/// when only some subsumed roots were disarmed, or when a prior resume already ran.
+///
+/// **Retirement interaction (design §4):** this runs at the top of `next` before any raw
+/// fs event is pulled, so a journaled widen is always resumed before dead-root retirement
+/// could observe a subsumed root's (now re-armed, fresh) handle — the two never collide.
+async fn resume_pending_widen<A: RootArmer>(
+  subsumer: &mut Subsumer<A::Handle>,
+  epochs: &mut EpochLedger,
+  filters: &mut HashMap<Subscription, Filter>,
+  queue: &mut VecDeque<Event>,
+  journal: &mut Option<WidenJournal<A::Handle>>,
+  armer: &A,
+) {
+  let Some(WidenJournal { outcome }) = journal.take() else {
+    return;
+  };
+  let WatchOutcome::Widen { unwatch, .. } = &outcome else {
+    // Only a Widen is ever journaled; a non-Widen outcome cannot occur, but clearing the
+    // journal (already taken) and returning keeps this total and non-panicking.
+    return;
+  };
+  // Restore only the subsumed roots fs no longer knows about (they were disarmed by the
+  // dropped widen); leave any still-live root (its disarm never ran) untouched.
+  for &old in unwatch {
+    if armer.root_path(old).is_none() {
+      restore_subsumed_root(subsumer, epochs, filters, queue, armer, old).await;
+    }
+  }
+  // Discard the newcomer's pending reservation: the dropped future handed out no
+  // subscription and inserted no filter, so aborting its plan fully unwinds it.
+  subsumer.abort_watch(&outcome);
 }
 
 /// Whether `interest` subscribes to a delivery of `kind` — the per-subscription

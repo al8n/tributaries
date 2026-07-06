@@ -418,6 +418,65 @@ async fn move_decomposes_across_sibling_subscriptions() {
   w.close().await.expect("close");
 }
 
+/// A deleted watched root is retired and its path can be re-watched (design §4,
+/// dead-root retirement). After the root is deleted, `tributary-fs` tears its handle
+/// down and emits a terminal `Rescan`/`Removed`; the umbrella fans that out and then
+/// retires the dead root. Recreating the path and watching it again must therefore
+/// re-arm a FRESH kernel root (not resolve `Covered` against the dead handle), and a
+/// write under the recreated root must reach the new subscription. The regression: a
+/// stale subsumer entry would make the second watch `Covered` against a dead handle, so
+/// the new subscription would receive nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_root_is_retired_and_can_be_rewatched() {
+  // An outer dir holds the watched root, so deleting the root does not delete the temp
+  // dir out from under the still-open handle, and the path can be recreated in place.
+  let (_dir, outer) = scratch("retire");
+  let root = outer.join("watched");
+  std::fs::create_dir_all(&root).expect("create the watched root");
+
+  let mut w = watcher(TributariesOptions::new());
+
+  // Watch /root (arms one kernel watch).
+  let first = w
+    .watch(&root, Interest::all(), Filter::all())
+    .await
+    .expect("watch the root");
+
+  // Delete /root: its handle is torn down and a terminal Rescan/Removed surfaces to the
+  // subscription. Draining it through `next()` is what drives retirement (the umbrella
+  // retires the dead root right after fanning the terminal signal out).
+  std::fs::remove_dir_all(&root).expect("delete the watched root");
+  let saw_terminal = wait_for(&mut w, |e| {
+    e.subscription() == first && (e.is_rescan() || (e.kind().is_removed() && reaches(e, &root)))
+  })
+  .await;
+  assert!(
+    saw_terminal.is_some(),
+    "the deleted root surfaces a terminal Rescan/Removed to its subscription"
+  );
+
+  // Recreate the path and watch it AGAIN. This must re-arm a fresh kernel root — if the
+  // dead root had not been retired, the subsumer would still hold its (dead) handle and
+  // this would resolve `Covered` against it, delivering nothing below.
+  std::fs::create_dir_all(&root).expect("recreate the watched root");
+  let second = w
+    .watch(&root, Interest::all(), Filter::all())
+    .await
+    .expect("re-watch the recreated root re-arms a fresh kernel root");
+
+  // A write under the recreated root must reach the NEW subscription (proving the fresh
+  // arm is live, not a dead handle the stale entry would have reused).
+  let file = root.join("after-rewatch.txt");
+  std::fs::write(&file, b"payload").expect("write under the recreated root");
+  let delivered = wait_for(&mut w, |e| e.subscription() == second && reaches(e, &file)).await;
+  assert!(
+    delivered.is_some(),
+    "a write under the recreated, re-armed root reaches the new subscription"
+  );
+
+  w.close().await.expect("close");
+}
+
 /// A coverage-loss `Rescan` reaches EVERY subscriber of the affected root (design §8).
 /// Deleting the watched root surfaces its terminal `Rescan` (or `Removed`) to every
 /// subscription of that root, bypassing coverage narrowing.
