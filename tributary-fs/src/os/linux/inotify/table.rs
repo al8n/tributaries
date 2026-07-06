@@ -36,6 +36,18 @@
 //! arm-enumerate already covered its initial state). Removals can stack, so
 //! `pending_stale_ignored` is a COUNT and the fence holds until the LAST stale
 //! marker drains — never a per-`wd` bool that a first IGNORED would clear early.
+//!
+//! Overflow recovery: `IN_Q_OVERFLOW` means the kernel dropped queued events
+//! (inotify(7)), so any state that WAITS for a specific future marker can have
+//! that marker among the dropped — and would then wait FOREVER. Two such windows
+//! exist: a reuse fence (`pending_stale_ignored`, counting down a stale
+//! `IN_IGNORED`) and a draining tombstone (awaiting its own final `IN_IGNORED`).
+//! [`WdTable::on_overflow`] resets BOTH — clearing every pending stale-ignored
+//! count and erasing every draining tombstone — because the covering rescan the
+//! overflow triggers (re-enumerate + re-arm) rebuilds the table truthfully.
+//! Invariant: no wd-table window may outlive an overflow. Live attribution sets
+//! are the only state that survives it — they never await a marker, so the rescan
+//! reconciles them without a reset.
 
 use std::collections::BTreeMap;
 
@@ -195,5 +207,28 @@ impl WdTable {
       self.by_anchor.remove(anchor);
     }
     entry.live
+  }
+
+  /// Resets all transient reuse-window / ordering state after an `IN_Q_OVERFLOW`.
+  ///
+  /// An overflow means the kernel dropped queued events (inotify(7)): the marker a
+  /// window is counting on — a stale `IN_IGNORED` a reuse fence decrements
+  /// ([`Self::register`]) or a draining tombstone's own final `IN_IGNORED` — may be
+  /// among the dropped, so it can NEVER arrive and the window would strand forever
+  /// (a stuck `pending_stale_ignored` fences every future record on the reused `wd`
+  /// to [`Attribution::Ambiguous`] → loss, a permanent livelock; a stranded
+  /// tombstone leaks and re-traps the `wd` on its next reuse). The overflow already
+  /// drives the covering rescan (re-enumerate + re-arm), which rebuilds the table
+  /// truthfully, so the recovery is to drop the window state: clear every
+  /// `pending_stale_ignored` and erase every draining tombstone. Live attribution
+  /// sets are left intact — they never await a marker, and the rescan reconciles
+  /// them. A draining tombstone has an empty live set and no `by_anchor` link
+  /// pointing at it (both cleared when its last anchor drained), so erasing it keeps
+  /// the reverse index consistent.
+  pub(crate) fn on_overflow(&mut self) {
+    self.entries.retain(|_wd, entry| {
+      entry.pending_stale_ignored = 0;
+      !entry.draining
+    });
   }
 }
