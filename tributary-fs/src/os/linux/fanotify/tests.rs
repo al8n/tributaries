@@ -334,6 +334,128 @@ fn rename_outside_root_is_dropped() {
   ));
 }
 
+/// The WATCHED ROOT deleted from its FOREIGN parent, reported as a pure
+/// `FAN_DELETE|FAN_ONDIR` dirent (`dir_fid` = the root's out-of-root parent, name = the
+/// root's name, `target_fid` = the root anchor itself). The dir_fid-only gate dropped this
+/// as firehose noise — losing the root's death to the liveness tick; the action-aware
+/// foreign-parent path consults `target_fid` and routes it to `RootDeath` on the root's OWN
+/// path, normalized to the `DELETE_SELF` self form compile lowers to a terminal Removed +
+/// Rescan. The map is untouched (a read-only decision).
+#[test]
+fn root_delete_from_foreign_parent_is_root_death() {
+  let mut map = seeded();
+  let generation = map.generation();
+  let ev = dirent(FAN_DELETE | FAN_ONDIR, fid(99), b"root", Some(fid(1)));
+  let admission = classify_one(&mut map, &ev);
+  assert!(
+    matches!(admission, Admission::RootDeath(_)),
+    "the root deleted from its foreign parent is RootDeath, not a firehose drop: {admission:?}"
+  );
+  let event = forwarded(admission);
+  assert_eq!(
+    event.path.as_deref(),
+    Some(Path::new("/root")),
+    "RootDeath carries the root's OWN path, never a <foreign-parent>/root child"
+  );
+  assert!(
+    event.mask.delete_self(),
+    "a dirent-reported root delete normalizes to the DELETE_SELF self form for compile"
+  );
+  assert_eq!(
+    map.generation(),
+    generation,
+    "the foreign-parent root death is a read-only decision — the map is untouched"
+  );
+}
+
+/// The WATCHED ROOT renamed/moved between two FOREIGN parents, reported as a pure
+/// `FAN_RENAME|FAN_ONDIR` whose `target_fid` is the root anchor while BOTH ends are
+/// out-of-root. The both-ends-out gate dropped it; the action-aware path routes it to
+/// `RootDeath` normalized to `MOVE_SELF` (compile's terminal Rescan — a moved root's new
+/// path is unknowable).
+#[test]
+fn root_rename_from_foreign_parents_is_root_death() {
+  let mut map = seeded();
+  let generation = map.generation();
+  let ev = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(1)),
+    fid(90),
+    b"root",
+    fid(91),
+    b"moved",
+  );
+  let admission = classify_one(&mut map, &ev);
+  assert!(
+    matches!(admission, Admission::RootDeath(_)),
+    "the root moved between two foreign parents is RootDeath, not both-ends-out ForeignDrop: {admission:?}"
+  );
+  let event = forwarded(admission);
+  assert_eq!(event.path.as_deref(), Some(Path::new("/root")));
+  assert!(
+    event.mask.move_self(),
+    "a moved root normalizes to the MOVE_SELF self form (terminal Rescan)"
+  );
+  assert_eq!(
+    map.generation(),
+    generation,
+    "the foreign-parent root move is a read-only decision — the map is untouched"
+  );
+}
+
+/// The action-aware foreign-parent path does NOT over-reach. A foreign parent whose
+/// `target_fid` is an in-map NON-ROOT directory (unreachable on a consistent tree — an
+/// in-root directory's parent is in-root) takes the LOSS BARRIER, never a guessed single
+/// mutation; a fully-foreign event (parent AND target out-of-root) still `ForeignDrop`s,
+/// so the firehose filter is intact; and a normal in-root child dirent is unchanged.
+#[test]
+fn foreign_parent_over_reaches_nothing() {
+  // Foreign parent, in-map NON-root target → the safe loss barrier, mutating nothing.
+  let mut map = seeded();
+  let generation = map.generation();
+  let non_root = dirent(FAN_DELETE | FAN_ONDIR, fid(99), b"sub", Some(fid(2)));
+  assert!(
+    matches!(classify_one(&mut map, &non_root), Admission::Lossy),
+    "a foreign parent over an in-map non-root target is the loss barrier, not a guess"
+  );
+  assert_eq!(
+    map.generation(),
+    generation,
+    "the barrier decision mutates nothing before the reseed rebuilds truth"
+  );
+
+  // Fully foreign (parent AND target out-of-root) → still the clean firehose drop.
+  let mut map = seeded();
+  let foreign = dirent(FAN_DELETE | FAN_ONDIR, fid(99), b"x", Some(fid(98)));
+  assert!(
+    matches!(classify_one(&mut map, &foreign), Admission::ForeignDrop),
+    "a fully-foreign dirent is still dropped — the superblock firehose filter"
+  );
+  let foreign_rename = rename_ev(
+    FAN_RENAME | FAN_ONDIR,
+    Some(fid(98)),
+    fid(90),
+    b"a",
+    fid(91),
+    b"b",
+  );
+  assert!(
+    matches!(
+      classify_one(&mut map, &foreign_rename),
+      Admission::ForeignDrop
+    ),
+    "a fully-foreign rename is still dropped"
+  );
+
+  // A normal in-root child directory delete (parent in-root) is unchanged → ForgetDir.
+  let mut map = seeded();
+  let child = dirent(FAN_DELETE | FAN_ONDIR, fid(1), b"sub", Some(fid(2)));
+  assert!(
+    matches!(classify_one(&mut map, &child), Admission::ForgetDir(_)),
+    "an in-root child delete still classifies by its in-root parent, untouched by the fix"
+  );
+}
+
 /// A rename INTO the root (source outside, destination in-root) admits, with the
 /// in-root end fully resolved.
 #[test]
@@ -1289,7 +1411,11 @@ mod batch_memo {
 ///      (`dir_fid`, or the `FID`-only shape's `target_fid`); a rename addresses either
 ///      of its two directory ends — and read that object's admittance from the map;
 ///   2. an addressing object OUTSIDE the root (or none at all) is superblock firehose
-///      noise — `ForeignDrop`;
+///      noise — `ForeignDrop` — UNLESS the event still carries an in-map object in its
+///      `target_fid`: the watched root deleted/moved from its own FOREIGN parent (the
+///      dirent parent, or both rename ends, out-of-root while `target_fid` = the root) is
+///      the root's terminal death (`RootDeath`), and any other in-map `target_fid` under a
+///      foreign parent takes the loss barrier — never a silent drop;
 ///   3. an ADMITTED addressing object whose mask is AMBIGUOUS — a merged bitmask with
 ///      two or more distinct structural verbs, `FAN_RENAME` counted among them (man 7
 ///      fanotify merges consecutive events for one object) — is `Lossy` (the loss
@@ -1303,10 +1429,11 @@ mod batch_memo {
 /// multi-structural rule from the mask's own bits ([`multi_structural_spec`]) rather
 /// than from classify. So a future `classify` that re-introduced a mask special-case, a
 /// pre-classification gate dropping an admitted-FID event, the single-verb priority
-/// (running one verb of a merged mask and dropping the rest), or the rename-before-gate
-/// dispatch (applying a merged rename's re-parent and dropping its co-merged delete)
-/// would DISAGREE with it. On top of agreement, FOUR invariants are asserted DIRECTLY
-/// against the event + map:
+/// (running one verb of a merged mask and dropping the rest), the rename-before-gate
+/// dispatch (applying a merged rename's re-parent and dropping its co-merged delete), or a
+/// per-shape gate that dropped a foreign-parent event still carrying the in-map root
+/// `target_fid` would DISAGREE with it. On top of agreement, FOUR invariants are asserted
+/// DIRECTLY against the event + map:
 ///
 ///   (i)   no-admitted-drop — an event whose ADDRESSING OBJECT is admitted is NEVER
 ///         `ForeignDrop` (the whole class: a name-less ATTRIB/MODIFY on an admitted
@@ -1321,17 +1448,17 @@ mod batch_memo {
 ///         leaving a deleted dir learned; a merged rename+delete applying only the
 ///         re-parent — the class R27's rename-separate sweep + the mirrored model both
 ///         missed);
-///   (iv)  raw-membership — the INDEPENDENT backstop: a multi-structural mask over ANY
-///         map-resident raw FID is `Lossy`, decided from RAW handle membership
-///         ([`FidMap::contains`]) over the COMPLETE set of the event's carried FIDs, reusing
-///         NEITHER admittance model. Invariants (i)–(iii) all ride an admittance helper
-///         (`addressing_object_admitted` / `addressing_admitted`), so a blind spot SHARED
-///         between classify and the spec — the rename-only admittance that ignored
-///         `target_fid`, the recurring trap of an oracle inheriting the very gap it was
-///         written from the same understanding to catch — would hide from them together;
-///         (iv) reasons over `(raw event FIDs, raw map membership)` with no
-///         shape/priority/admittance logic, so it trips on exactly that class where the
-///         others are blind.
+///   (iv)  raw-membership — the INDEPENDENT, UNIFORM backstop: an event carrying ANY
+///         map-resident raw FID is NEVER `ForeignDrop`, decided from RAW handle membership
+///         ([`FidMap::contains`]) over the COMPLETE set of the event's carried FIDs, gated on
+///         NO shape and NO verb count, reusing NEITHER admittance model. Invariants (i)–(iii)
+///         all ride an admittance helper (`addressing_object_admitted` / `addressing_admitted`),
+///         so a blind spot SHARED between classify and the spec — a per-shape gate that ignores
+///         a carried FID (the rename-only admittance that ignored `target_fid`; the dir_fid-only
+///         dirent gate that ignored an in-map root `target_fid`), the recurring trap of an oracle
+///         inheriting the very gap it was written to catch — would hide from them together; (iv)
+///         reasons over `(raw event FIDs, raw map membership)` with no shape/priority/admittance
+///         logic, so it trips on exactly that class where the others are blind.
 ///
 /// An exhaustive generator sweeps the whole reachable mask space — the POWER SET of ALL
 /// subscribed action bits, `FAN_RENAME` INCLUDED, so every merged bitmask appears with
@@ -1448,7 +1575,9 @@ mod classification_oracle {
       let old_in = map.resolve_path(&rename.old_dir).is_some();
       let new_in = map.resolve_path(&rename.new_dir).is_some();
       if !old_in && !new_in {
-        return Action::ForeignDrop;
+        // Both ends foreign — but the moved object may itself be the root (renamed
+        // between two foreign parents), so consult its `target_fid` before dropping.
+        return foreign_parent_action(map, event);
       }
       if event.mask.ondir() {
         // An ONDIR rename mutates the tree and REQUIRES the moved object's own FID.
@@ -1464,7 +1593,10 @@ mod classification_oracle {
     }
 
     match addressing(map, event) {
-      Addressing::Foreign | Addressing::Unaddressable => Action::ForeignDrop,
+      // A foreign/absent addressing PARENT does not drop on the parent alone: the
+      // affected `target_fid` can still be the root deleted/moved from its foreign
+      // parent (the exact class the dir_fid-only gate lost). Consult it.
+      Addressing::Foreign | Addressing::Unaddressable => foreign_parent_action(map, event),
       Addressing::Dirent => dirent_action(event),
       Addressing::SelfObject { is_root } => nameless_action(event, is_root),
     }
@@ -1531,6 +1663,37 @@ mod classification_oracle {
   /// An action whose required field is present, else `Lossy`.
   fn field_gated(present: bool, action: Action) -> Action {
     if present { action } else { Action::Lossy }
+  }
+
+  /// The SPEC action when an event's addressing PARENT(s) are foreign — a named dirent's
+  /// out-of-root/absent `dir_fid`, a name-less event's out-of-root self-FID, or a rename's
+  /// BOTH ends out-of-root. Derived from first principles, mirroring
+  /// [`super::classify_foreign_parent`]: on a consistent single-superblock tree an in-root
+  /// directory's parent is itself in-root, so the ONLY in-map object reportable under a
+  /// foreign parent is the ROOT anchor (real parent outside the watched root). A structural
+  /// death of the root reported from its foreign parent is the root's death; any other
+  /// in-map target is unreachable and takes the loss barrier rather than a guess; a foreign
+  /// or absent target is the firehose drop. Read-only against the pre-classify map.
+  fn foreign_parent_action(map: &FidMap, event: &RawFanotifyEvent) -> Action {
+    let Some(target) = event.target_fid.as_ref() else {
+      return Action::ForeignDrop;
+    };
+    if map.resolve_path(target).is_none() {
+      return Action::ForeignDrop;
+    }
+    if map.is_root(target) && root_death_verb(event.mask) {
+      return Action::RootDeath;
+    }
+    Action::Lossy
+  }
+
+  /// Whether the mask names a structural DEATH of the affected object — a removal
+  /// (`FAN_DELETE` dirent or `FAN_DELETE_SELF`) or a move (`FAN_MOVE_SELF` or a
+  /// `FAN_RENAME` relocation). A create is structural but not a death, and metadata bits
+  /// are not structural, so neither counts. Independent of classify's `root_death_mask`,
+  /// stated over the mask's own bits.
+  fn root_death_verb(mask: FanMask) -> bool {
+    mask.removed() || mask.delete_self() || mask.move_self() || mask.rename()
   }
 
   /// The oracle's map: `/root` (fid 1, the root anchor), `/root/sub` (fid 2), and
@@ -1677,22 +1840,26 @@ mod classification_oracle {
       );
     }
 
-    // (5) INDEPENDENT raw-membership invariant — the guarantee that reuses NEITHER
-    // admittance model. If the map contains ANY raw FID the event carries ([`raw_fids`], the
-    // complete present set) via raw handle membership, and the mask is multi-structural,
-    // classify MUST take the loss barrier. Reasoning over the complete present-FID set via
-    // raw `contains` — never a shape-selected subset, never `addresses_in_root` /
-    // `addressing_admitted` — it catches the exact blind-spot class where admittance-shape
-    // reasoning ignores a carried FID (a merged rename whose only in-root FID is
-    // `target_fid`), EVEN IF classify's `addresses_in_root` and the oracle's
-    // `addressing_admitted` shared that model. This is a guarantee (4)'s model-based check
-    // cannot make: (4) rides the very admittance model a shared blind spot would corrupt.
-    let raw_membership_fired = resident && multi_structural_spec(event.mask);
+    // (5) INDEPENDENT raw-membership invariant — the UNIFORM safety net, reusing NEITHER
+    // admittance model and gated on NO shape and NO verb count. If the map contains ANY raw
+    // FID the event carries ([`raw_fids`], the complete present set) via raw handle
+    // membership, then classify MUST NOT drop it as firehose noise: it must take an ADMITTED
+    // action (the proper mutation, RootDeath, or the loss barrier). Reasoning over the
+    // complete present-FID set via raw `contains` — never a shape-selected subset, never
+    // `addresses_in_root` / `addressing_admitted` — it trips on the exact blind-spot class
+    // where a per-shape gate ignores a carried FID: a SINGLE-structural dirent/rename whose
+    // parent is foreign but whose `target_fid` is the in-map root (the root deleted/moved
+    // from its foreign parent), which the dir_fid-only gate dropped. Dropping the
+    // multi_structural gate this invariant once carried is what widens it from a merged-mask
+    // check to the guarantee that closes the single-structural gap too; (4)'s model-based
+    // Lossy check still rides the admittance model a shared blind spot would corrupt, so
+    // this stays the independent backstop.
+    let raw_membership_fired = resident;
     if raw_membership_fired {
-      assert_eq!(
+      assert_ne!(
         got,
-        Action::Lossy,
-        "raw-membership `{label}`: a multi-structural mask over a map-resident raw FID must be Lossy: {admission:?}"
+        Action::ForeignDrop,
+        "raw-membership `{label}`: an event carrying a map-resident raw FID must not be dropped: {admission:?}"
       );
     }
     raw_membership_fired
@@ -1714,9 +1881,10 @@ mod classification_oracle {
   /// builds a non-rename event (`dir_fid`/`target_fid` from {none, root, admitted child,
   /// foreign} × name {none, empty, present}). Empty name folds to none at decode, but
   /// feeding it here proves classify and the oracle dispatch it identically.
-  /// [`assert_contract`] checks all four properties (agreement, no-admitted-drop,
-  /// field-correctness, and — the invariant this fix turns UNIVERSAL —
-  /// no-one-sided-mutation) per case.
+  /// [`assert_contract`] checks all FIVE properties (agreement, no-admitted-drop,
+  /// field-correctness, no-one-sided-mutation, and — the invariant THIS fix widens from a
+  /// merged-mask check to a uniform every-shape backstop — the independent raw-membership
+  /// guarantee) per case.
   ///
   /// Under miri each case builds and walks a fresh `FidMap` (interpreted, no unsafe to
   /// inspect — miri's value here is the FID parse's pointer arithmetic in the `fid`

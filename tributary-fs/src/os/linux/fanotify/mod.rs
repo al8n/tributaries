@@ -186,16 +186,18 @@ pub(crate) enum Admission {
     /// from outside), else `None`.
     seed: Option<Fid>,
   },
-  /// A self-event (`DELETE_SELF`/`MOVE_SELF`) on the WATCHED ROOT object — its
-  /// self-FID (the `DFID` shape's `dir_fid`, or the `FID`-only shape's `target_fid`)
-  /// resolves to the map's root anchor
-  /// ([`FidMap::is_root`](map::FidMap::is_root)). Forward the root's OWN path, which
-  /// compile lowers to the death lifecycle — a `DELETE_SELF` to a terminal Removed +
-  /// Rescan, a `MOVE_SELF` to a terminal Rescan. The uniform name-less resolution
-  /// consults the self-FID (the `FID`-only shape's `target_fid` included) the same way
-  /// for every mask, so a FID-only root self-event (`dir_fid = None`) reaches death
-  /// even when the periodic liveness tick is disabled, rather than being dropped and
-  /// left forever blind (the R25 closure, now the uniform resolution's root case).
+  /// The WATCHED ROOT's own terminal death, from EITHER shape it can be reported in: a
+  /// self-event (`DELETE_SELF`/`MOVE_SELF`) whose self-FID (the `DFID` shape's `dir_fid`,
+  /// or the `FID`-only shape's `target_fid`) resolves to the map's root anchor
+  /// ([`FidMap::is_root`](map::FidMap::is_root)); OR a dirent/rename reporting the root
+  /// deleted/moved FROM ITS FOREIGN PARENT (`dir_fid`, or both rename ends, out-of-root
+  /// while `target_fid` is the root — see [`classify_foreign_parent`]). Forward the root's
+  /// OWN path, restated to the self form ([`root_death_mask`]) so compile lowers it to the
+  /// death lifecycle — a delete to a terminal Removed + Rescan, a move to a terminal
+  /// Rescan. Because every carried FID is consulted the same way for every mask, a FID-only
+  /// root self-event (`dir_fid = None`) OR a foreign-parent root dirent reaches death even
+  /// when the periodic liveness tick is disabled, rather than being dropped and left
+  /// forever blind.
   RootDeath(AdmittedEvent),
   /// Provably outside the watched root, and not a root self-event: no admitted
   /// directory FID matched (or the self-FID is unknown to the map). The
@@ -346,11 +348,14 @@ fn addresses_in_root(map: &FidMap, event: &RawFanotifyEvent) -> bool {
 }
 
 /// Classifies a NAMED event: a dirent addressing `<dir>/<name>` under its parent
-/// directory. The parent's `dir_fid` is the admittance gate — absent or out-of-root,
-/// the event is provably outside the watched root, a clean firehose drop. In-root,
-/// the action's own required field (a directory create/delete/move needs the child's
-/// `target_fid`) decides forward vs [`Admission::Lossy`]; a plain file dirent needs
-/// none.
+/// directory. The parent's `dir_fid` is the primary admittance gate: in-root, the
+/// action's own required field (a directory create/delete/move needs the child's
+/// `target_fid`) decides forward vs [`Admission::Lossy`], and a plain file dirent needs
+/// none. When the parent is out-of-root or absent the event is NOT dropped on the parent
+/// alone — the named child can still be the watched root deleted/moved from its own
+/// foreign parent — so it falls to [`classify_foreign_parent`], which consults the
+/// affected object's `target_fid` (a root death → [`Admission::RootDeath`], else the
+/// clean firehose [`Admission::ForeignDrop`]).
 fn classify_dirent(
   map: &mut FidMap,
   event: &RawFanotifyEvent,
@@ -358,11 +363,16 @@ fn classify_dirent(
   memo: &mut MemoBatch,
 ) -> Admission {
   let mask = event.mask;
+  // The parent `dir_fid` is the primary gate — but out-of-root or absent, the named
+  // child can still be the WATCHED ROOT deleted/moved from its own (foreign) parent
+  // (`dir_fid` = that foreign parent, `target_fid` = the root itself). So a failed
+  // parent falls to `classify_foreign_parent` (which consults `target_fid`) rather than
+  // dropping on the parent alone and losing the root's death to the liveness tick.
   let Some(dir_fid) = event.dir_fid.as_ref() else {
-    return Admission::ForeignDrop;
+    return classify_foreign_parent(map, event);
   };
   let Some(dir_path) = memo.admit(map, dir_fid) else {
-    return Admission::ForeignDrop;
+    return classify_foreign_parent(map, event);
   };
   let path = Some(join_name(&dir_path, name));
 
@@ -412,9 +422,11 @@ fn classify_dirent(
 /// Classifies a NAME-LESS event: one that names no child and so addresses its OWN
 /// object. The self-FID arrives as a bare `DFID` (`dir_fid`) or a bare `FID`
 /// (`target_fid`), and is resolved the SAME way the dirent gate resolves its parent —
-/// no FID consulted ahead of the membership check, and no `dir_fid`-absent
-/// pre-drop. No addressing FID, or one out-of-root → [`Admission::ForeignDrop`];
-/// admitted, the mask selects the action:
+/// no FID consulted ahead of the membership check, and no `dir_fid`-absent pre-drop. No
+/// addressing FID → [`Admission::ForeignDrop`]; a self-FID out-of-root falls to
+/// [`classify_foreign_parent`] (a name-less event can still carry the root's own
+/// `target_fid` beside a foreign `dir_fid`), else — admitted — the mask selects the
+/// action:
 ///
 /// - a `DELETE_SELF`/`MOVE_SELF` on the map's ROOT anchor is the watched root's own
 ///   death → [`Admission::RootDeath`], reached uniformly even in the `dir_fid = None`
@@ -441,8 +453,10 @@ fn classify_nameless(
   };
   let is_root = map.is_root(self_fid);
   let Some(path) = memo.admit(map, self_fid) else {
-    // The self-object is unknown to the map — a foreign object elsewhere on the sb.
-    return Admission::ForeignDrop;
+    // The self-object is out-of-root — but a name-less event can still carry the
+    // root's own `target_fid` alongside a foreign `dir_fid`, so consult the other
+    // carried FID before dropping rather than blind on the first handle alone.
+    return classify_foreign_parent(map, event);
   };
 
   // The universal multi-structural gate in `classify` already routed an admitted
@@ -488,11 +502,77 @@ fn self_event(mask: FanMask, path: PathBuf) -> AdmittedEvent {
   }
 }
 
+/// The action for a structural event whose addressing PARENT(s) are foreign — a named
+/// dirent's out-of-root/absent `dir_fid`, a name-less event's out-of-root self-FID, or a
+/// rename's BOTH ends out-of-root. Each per-shape gate above checks only its OWN
+/// addressing FID, so it would drop an event that still carries an in-map object in its
+/// `target_fid`. Before honoring that drop, consult the affected object itself.
+///
+/// The reachability that makes this exact and not a guess: on a consistent
+/// single-superblock tree an in-root directory's parent is ITSELF in-root (the map is a
+/// connected subtree of the root anchor). So the ONLY in-map object that can be reported
+/// under a foreign parent is the ROOT ANCHOR — whose real parent lies OUTSIDE the watched
+/// root. Therefore:
+///
+/// - a structural DEATH (delete/move) of the root reported from its foreign parent is the
+///   root's terminal death → [`Admission::RootDeath`] on the root's own path, normalized
+///   to the self form compile lowers to the death lifecycle ([`root_death_mask`]). This is
+///   observed WITHOUT the periodic liveness tick, exactly as the self-event shape observes
+///   it;
+/// - any OTHER in-map target under a foreign parent is unreachable on a consistent tree
+///   (an in-root non-root directory cannot be reported under a foreign one), so it is
+///   never guessed into a one-sided mutation — the loss barrier ([`Admission::Lossy`])
+///   reseeds instead;
+/// - a target that is itself foreign or absent is genuinely outside the root: the clean
+///   firehose [`Admission::ForeignDrop`].
+///
+/// Read-only ([`FidMap::resolve_path`]/[`FidMap::is_root`], no mutation), so it decides
+/// against the same map state the per-shape gate just failed to resolve against.
+fn classify_foreign_parent(map: &FidMap, event: &RawFanotifyEvent) -> Admission {
+  let Some(target) = event.target_fid.as_ref() else {
+    return Admission::ForeignDrop;
+  };
+  let Some(path) = map.resolve_path(target) else {
+    return Admission::ForeignDrop;
+  };
+  if map.is_root(target)
+    && let Some(mask) = root_death_mask(event.mask)
+  {
+    return Admission::RootDeath(self_event(mask, path));
+  }
+  // In-map but not the root anchor (unreachable under a foreign parent), or the root
+  // under a non-death mask: never a single correct mutation — take the loss barrier.
+  Admission::Lossy
+}
+
+/// The self-death mask a root's structural event lowers as, or `None` when the mask
+/// names no structural death. A removal — a parent-reported `FAN_DELETE`, or the root's
+/// own `FAN_DELETE_SELF` — is the root's `DELETE_SELF` (compile's terminal Removed +
+/// Rescan); a move — a `FAN_MOVE_SELF`, or a `FAN_RENAME` relocating the root out of its
+/// parent — is its `MOVE_SELF` (terminal Rescan). The root death reported from a
+/// dirent/rename carries `FAN_DELETE`/`FAN_RENAME`, NOT the self-bit compile's death
+/// lowering keys on, so it is restated to the self form here — letting the ONE compile
+/// death path serve every reporting shape. Reached only PAST the universal
+/// multi-structural gate, so the mask names at most one structural verb and the
+/// delete/move arms cannot both apply.
+fn root_death_mask(mask: FanMask) -> Option<FanMask> {
+  if mask.removed() || mask.delete_self() {
+    Some(FanMask::new(fid::FAN_DELETE_SELF | fid::FAN_ONDIR))
+  } else if mask.move_self() || mask.rename() {
+    Some(FanMask::new(fid::FAN_MOVE_SELF | fid::FAN_ONDIR))
+  } else {
+    None
+  }
+}
+
 /// Classifies a `FAN_RENAME`: resolves both directory FIDs and applies the moved
 /// DIRECTORY's map self-maintenance (no identity — see [`classify`]).
 ///
 /// Membership is the filter: BOTH ends outside the root is a rename elsewhere on
-/// the superblock ([`Admission::ForeignDrop`]). With at least one end in-root, an
+/// the superblock — but the MOVED object may itself be the root (renamed between two
+/// foreign parents), so this falls to [`classify_foreign_parent`] (a root move →
+/// [`Admission::RootDeath`], else [`Admission::ForeignDrop`]) rather than dropping on
+/// the two ends alone. With at least one end in-root, an
 /// `ONDIR` rename mutates the tree and so REQUIRES the moved object's own
 /// `target_fid` (absent → [`Admission::Lossy`], for every move shape — decode
 /// cannot know which end is in-root, but classification can, so a targetless ONDIR
@@ -525,8 +605,10 @@ fn classify_rename(
   let old_dir = memo.admit(map, &rename.old_dir);
   let new_dir = memo.admit(map, &rename.new_dir);
   if old_dir.is_none() && new_dir.is_none() {
-    // Both ends outside the root: a rename elsewhere on the superblock.
-    return Admission::ForeignDrop;
+    // Both ends outside the root — but the MOVED object might still be the root
+    // itself (the watched root renamed between two foreign parents), so consult its
+    // `target_fid` before dropping as superblock noise.
+    return classify_foreign_parent(map, event);
   }
 
   let old_path = old_dir

@@ -4076,6 +4076,89 @@ mod kernel_recursive_fanotify {
     );
   }
 
+  /// The pure root delete-FROM-ITS-PARENT reaches terminal root death WITHOUT the liveness
+  /// tick, end to end through the admission seam AND the lowering. The kernel reports the
+  /// watched root deleted as a `FAN_DELETE|FAN_ONDIR` dirent under the root's OWN
+  /// (out-of-root) parent — `dir_fid` foreign, `target_fid` = the root. The admission
+  /// classifier's action-aware foreign-parent path turns that into a `RootDeath` on the
+  /// root's own path (never the `ForeignDrop` the dir_fid-only gate produced, which lost the
+  /// death to the tick), and the driver lowers it to the SAME terminal Removed + Rescan +
+  /// teardown an in-tree `DELETE_SELF` uses — here with `root_liveness_interval` = `ZERO`, so
+  /// no tick can be the detector. Composing `classify` with the core proves the whole path,
+  /// not just the pre-built admitted form the sibling FID-only case drives.
+  #[test]
+  fn root_delete_from_parent_dies_without_the_liveness_tick() {
+    use crate::os::linux::fanotify::{
+      Admission, MemoBatch, classify,
+      fid::{Fid, RawFanotifyEvent},
+      map::{FidMap, SeedEntry},
+    };
+
+    // The admission map holds the watched root /r as its anchor (fid 1); fid 99 is the
+    // root's out-of-root parent — foreign to the map.
+    fn seed_fid(tag: u8) -> Fid {
+      Fid::new([tag; 8], Box::from(&[tag][..]))
+    }
+    let mut map = FidMap::new();
+    map.seed([SeedEntry::root(seed_fid(1), Path::new("/r"))]);
+
+    // The pure root delete as reported by its FOREIGN parent: parent out-of-root, the
+    // affected `target_fid` the root itself.
+    let raw = RawFanotifyEvent {
+      mask: FanMask::new(FAN_DELETE | FAN_ONDIR),
+      dir_fid: Some(seed_fid(99)),
+      target_fid: Some(seed_fid(1)),
+      name: Some(b"r".to_vec()),
+      rename: None,
+    };
+    let Admission::RootDeath(admitted) = classify(&mut map, &raw, &mut MemoBatch::new()) else {
+      panic!("the root delete-from-parent must classify as RootDeath, not a firehose drop");
+    };
+
+    // Drive that admitted event into a fanotify scope whose liveness tick is DISABLED.
+    let mut core = DriverCore::new(WINDOW, Duration::ZERO);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.poll_timeout(),
+      None,
+      "the tick is disabled — no liveness deadline is armed"
+    );
+
+    feed(&mut core, scope, vec![RawLinuxEvent::Fanotify(admitted)]);
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(
+      emitted.iter().any(|c| c.kind().is_removed()),
+      "the root delete-from-parent surfaces the user-visible Removed: {effects:?}"
+    );
+    assert!(
+      emitted.iter().any(|c| c.kind().is_rescan()),
+      "root death is a terminal Rescan even with the tick disabled: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead root's stream tears down without any tick: {effects:?}"
+    );
+  }
+
   /// Death survives a stale completion: a SECOND liveness tick fires before the
   /// FIRST refresh returns, marking the outstanding read stale — and that read
   /// then comes back with the root GONE. The death evidence must STILL be
