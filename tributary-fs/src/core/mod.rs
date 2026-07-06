@@ -22,6 +22,24 @@
 //! removals late) — and any loss signal revokes its authority until a fresh
 //! read of the live table is installed.
 //!
+//! # Mount-refresh publication
+//!
+//! [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) publishes on a strict
+//! order. The root-LIVENESS verdict is acted on FIRST and unconditionally — a dead
+//! root is terminal regardless of snapshot staleness, so its death evidence is never
+//! discarded by a stale flag. Everything the snapshot then carries — the mount TABLE
+//! and the root's descent FRAME (`root_mnt_id`) — publishes ONLY when the snapshot is
+//! not stale: a stale completion (a loss or tick overlapped its read, so the snapshot
+//! may predate the lost window, and the table + frame come from that one read)
+//! publishes neither and re-arms one fresh read. So `state.root_mnt_id` is only ever
+//! the last AUTHORITATIVE frame, never a stale/pre-window one, and the frame
+//! [`crosses_mount_boundary`] consumes for enumerate descent is always authoritative.
+//! A non-stale frame CHANGE (a same-object re-mount moved the root to a different
+//! mount) then reconciles a DESCENDING scope's coverage — a rescan-and-re-arm
+//! re-checks the children the last enumerate classified under the old frame, since
+//! adopting the frame alone does not re-read them (a kernel-recursive scope never
+//! consumes the frame, so it needs no replay).
+//!
 //! # Root-death signals per backend
 //!
 //! Every backend's root death — unmount, delete, or replace — must reach a
@@ -130,9 +148,11 @@ pub(crate) struct MountRefresh {
   /// `root_mnt_id` — so without refreshing it, every descendant on the new mount
   /// would read as a boundary and lower non-descendable until the next re-watch.
   /// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) adopts a `Some`
-  /// value once the root is confirmed alive-and-present. `None` (below Linux 5.8,
-  /// the mask bit unset, or a non-Linux/fake source that reports no frame) leaves
-  /// the captured value intact — a transient read miss never drops a known frame.
+  /// value once the root is confirmed alive-and-present AND the refresh is not stale
+  /// (a stale snapshot's frame is as suspect as its mount table). `None` (below Linux
+  /// 5.8, the mask bit unset, or a non-Linux/fake source that reports no frame)
+  /// leaves the captured value intact — a transient read miss never drops a known
+  /// frame.
   pub(crate) root_mnt_id: Option<u64>,
 }
 
@@ -402,14 +422,16 @@ struct ScopeState {
   /// A child directory on a different mount (even the SAME device, as a
   /// `mount --bind` of a same-superblock directory produces) is lowered
   /// non-descendable, closing the same-device bind breach the `root_dev` check
-  /// alone cannot. Captured at the spawn barrier AND re-read on every alive mount
-  /// refresh: a same-object re-mount of the root (unmount + re-bind, identity
-  /// unchanged) moves it to a new mount, so a frozen value would fence every
-  /// descendant on the new mount as a boundary until re-watch — the refresh keeps
-  /// it current (`on_mounts_refreshed` adopts a fresh `Some`). `None` when neither
-  /// the barrier nor a refresh could read it (below Linux 5.8, or a
-  /// non-Linux/fake source), and then the device check governs alone — the honest
-  /// degrade.
+  /// alone cannot. Captured at the spawn barrier AND re-read on every alive,
+  /// NON-STALE mount refresh: a same-object re-mount of the root (unmount + re-bind,
+  /// identity unchanged) moves it to a new mount, so a frozen value would fence every
+  /// descendant on the new mount as a boundary — the refresh keeps it current
+  /// (`on_mounts_refreshed` adopts a fresh `Some`, then reconciles a descending
+  /// scope's coverage when the frame changed). Only ever the last AUTHORITATIVE frame
+  /// — a stale refresh publishes nothing here (see the module doc's mount-refresh
+  /// publication invariant). `None` when neither the barrier nor a refresh could read
+  /// it (below Linux 5.8, or a non-Linux/fake source), and then the device check
+  /// governs alone — the honest degrade.
   root_mnt_id: Option<u64>,
   /// The root object's identity, captured at the spawn barrier. The mount
   /// refresh re-stats the root and compares against this: a `Missing` or
@@ -933,6 +955,12 @@ impl DriverCore {
   /// Feeds one mount-table refresh result: updates device trust AND checks the
   /// root's liveness (folded into the same refresh — a kernel-recursive backend
   /// gets no in-tree unmount signal, so this cadence is its root-death check).
+  ///
+  /// Publication is ordered: the root-liveness verdict acts FIRST and
+  /// unconditionally (a dead root is terminal regardless of snapshot staleness);
+  /// the mount table AND the descent frame (`root_mnt_id`) publish only on a
+  /// non-stale snapshot; and a non-stale frame CHANGE reconciles a descending
+  /// scope's coverage (see the module doc's publication invariant).
   pub(crate) fn on_mounts_refreshed(
     &mut self,
     scope: ScopeId,
@@ -971,55 +999,71 @@ impl DriverCore {
       return;
     }
 
-    // The root is alive AND unchanged: adopt its freshly re-read mount frame. A
-    // same-object re-mount (unmount + re-bind at the same path) keeps the root's
-    // `(dev, ino)`, so the death gate above passed, yet the root now lives on a
-    // DIFFERENT mount — and the enumerate boundary fences children against this
-    // captured `root_mnt_id`, so a stale frame would lower every descendant on the
-    // new mount non-descendable until the next re-watch. Refreshing it here (the
-    // one place the inotify side re-resolves the root, folded into the same re-stat
-    // as the death check) keeps the descent fence relative to the mount the root
-    // actually lives on now. Done before the stale gate: the re-stat observed the
-    // current frame regardless of whether the mount TABLE snapshot is stale. Only a
-    // `Some` read is adopted — a transient mnt-id read miss (`None`) must not drop a
-    // known frame to the device belt.
-    if let Some(mnt_id) = refresh.root_mnt_id {
-      state.root_mnt_id = Some(mnt_id);
-    }
-
-    // The root is alive past the death gate. The stale gate now governs ONLY the
-    // mount-TABLE install + authority restore (its actual purpose): a newer loss
-    // overlapped this read, so its snapshot may predate the lost window — the
-    // table is discarded and one more refresh runs, keeping device trust closed.
-    // Liveness is already settled above, so a stale-but-alive completion does not
-    // touch it here (the re-armed refresh, or the next tick, re-seeds the
-    // deadline).
+    // The root is alive past the death gate. The stale gate governs EVERYTHING this
+    // snapshot carries — the mount-TABLE install below AND the descent FRAME adopted
+    // after it. A newer loss overlapped this read, so its snapshot may predate the
+    // lost window; `refresh_mounts` reads the table and re-stats the frame in ONE
+    // snapshot, so a stale table means an equally stale frame — publish neither.
+    // The table is discarded, one fresh refresh re-arms, and device trust stays
+    // closed. Liveness is already settled above (terminal regardless of stale), so a
+    // stale-but-alive completion only re-arms: the frame block and the table install
+    // below are BOTH the authoritative path.
     if state.refresh_stale {
       state.refresh_stale = false;
       Self::trust_lost(&mut self.effects, scope, state);
       return;
     }
 
+    // Non-stale: adopt the freshly re-read mount frame. A same-object re-mount
+    // (unmount + re-bind at the same path) keeps the root's `(dev, ino)`, so the
+    // death gate above passed, yet the root now lives on a DIFFERENT mount — and
+    // `crosses_mount_boundary` fences enumerate descent against this `root_mnt_id`,
+    // so a frozen frame would lower every descendant on the new mount
+    // non-descendable. Only a `Some` read is adopted: a transient mnt-id miss
+    // (`None`) must not drop a known frame to the device belt. Gated behind the stale
+    // check above, so `state.root_mnt_id` is only ever the last AUTHORITATIVE frame —
+    // the value `crosses_mount_boundary` consumes is never a stale/pre-window one.
+    let frame_changed = if let Some(mnt_id) = refresh.root_mnt_id {
+      let changed = state.root_mnt_id != Some(mnt_id);
+      state.root_mnt_id = Some(mnt_id);
+      changed
+    } else {
+      false
+    };
+
     // Alive and current: (re)arm the liveness tick — the birth refresh seeds it
     // and every later refresh re-seeds it, regardless of whether the mount table
     // itself could be read below.
     Self::arm_liveness(state, interval, now);
 
-    if !refresh.authoritative {
-      // The live table could not be read; trust stays closed (probe-carried
-      // device evidence still decides everything it can).
-      return;
-    }
-    // UNION, never replacement: an existing entry is either a still-real
-    // mount (a later unmount event removes it) or a probed foreign-device
-    // prefix the snapshot cannot know about — keeping both only ever reduces
-    // trust, the safe direction.
-    for mount in refresh.mounts {
-      if !state.mounts.iter().any(|m| m == &mount) {
-        state.mounts.push(mount);
+    if refresh.authoritative {
+      // UNION, never replacement: an existing entry is either a still-real mount (a
+      // later unmount event removes it) or a probed foreign-device prefix the
+      // snapshot cannot know about — keeping both only ever reduces trust, the safe
+      // direction. A non-authoritative read (the live table could not be read) skips
+      // this and leaves trust closed; probe-carried device evidence still decides
+      // what it can.
+      for mount in refresh.mounts {
+        if !state.mounts.iter().any(|m| m == &mount) {
+          state.mounts.push(mount);
+        }
       }
+      state.mounts_authoritative = true;
     }
-    state.mounts_authoritative = true;
+
+    // A CHANGED frame means a same-object re-mount moved the root to a different
+    // mount: every child the last enumerate already classified carries the OLD
+    // verdict — those now on the root's mount were fenced as boundaries, those left
+    // behind are boundaries now — and adopting the frame does not re-read them. Only
+    // a descending scope consumes the frame (a kernel-recursive mark covers the whole
+    // subtree, so its frame is inert), so only it needs the replay: rescan and re-arm
+    // the root under the now-authoritative frame. The loss that drove this refresh
+    // also rescans, but that rescan races AHEAD of this completion and reads the
+    // pre-adoption frame; this replay reruns it once the frame is current.
+    if frame_changed && !state.profile.is_kernel_recursive() {
+      self.monitor.on_overflow(Scope::Root(scope), now);
+      self.drain_monitor();
+    }
   }
 
   /// Feeds a dead-stream signal: the scope's coverage ended with no parent
