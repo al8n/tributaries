@@ -4514,6 +4514,59 @@ mod kernel_recursive_fanotify {
       "the KR scope still adopts the authoritative frame (inert, but kept current)"
     );
   }
+
+  /// A LIVE, NON-stale refresh whose mount table could NOT be read (a transient
+  /// `/proc/self/mountinfo` failure yields a non-authoritative read) must CLOSE a
+  /// previously-open authority — the non-authoritative counterpart to the stale
+  /// gate. Leaving it open would keep proving paths root-device by their absence
+  /// from a table that was never re-read across the mount change the refresh was
+  /// meant to reconcile. Authority re-opens only with a later authoritative read;
+  /// probe-read device evidence still decides throughout.
+  #[test]
+  fn a_live_non_authoritative_refresh_closes_a_previously_open_authority() {
+    let (mut core, scope) = live_fanotify();
+    // Birth installed authoritative (empty) trust, so absence grants event-side trust.
+    let state = core.scopes.get(&scope).expect("scope is live");
+    assert!(state.mounts_authoritative, "birth installed authority");
+    assert!(
+      device_trusted(state, Path::new("/r/a"), None),
+      "an open authoritative table trusts a path absent from it"
+    );
+
+    // A live, non-stale refresh whose live mount table could not be read.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), false), at(1));
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      0,
+      "a non-authoritative read closes authority without busy-looping a re-read: {effects:?}"
+    );
+    let state = core.scopes.get(&scope).expect("scope is live");
+    assert!(
+      !state.mounts_authoritative,
+      "the unreadable table closes the previously-open authority"
+    );
+    assert!(
+      !device_trusted(state, Path::new("/r/a"), None),
+      "closed authority no longer trusts a path by its absence from the table"
+    );
+    assert!(
+      device_trusted(state, Path::new("/r/a"), Some(1)),
+      "root-device probe evidence still trusts while authority is closed"
+    );
+
+    // A later authoritative read re-opens authority.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let state = core.scopes.get(&scope).expect("scope is live");
+    assert!(
+      state.mounts_authoritative,
+      "a later authoritative refresh re-opens authority"
+    );
+    assert!(
+      device_trusted(state, Path::new("/r/a"), None),
+      "re-opened authority trusts the absent path again"
+    );
+  }
 }
 
 /// `Backend::Auto` resolves the backend only once the source has spawned, so

@@ -40,6 +40,16 @@
 //! adopting the frame alone does not re-read them (a kernel-recursive scope never
 //! consumes the frame, so it needs no replay).
 //!
+//! The mount-TABLE half carries an authority invariant of its own: `mounts_authoritative`
+//! is true ONLY immediately after a refresh installs an authoritative table, and ANY
+//! refresh that cannot install one closes it — a STALE completion (discarded above) OR
+//! a live but NON-authoritative read (the live table could not be read). So the
+//! device-trust-by-absence check ([`device_trusted`]) consults the table ONLY while
+//! authority is open; a closed authority falls back to the conservative born-closed
+//! behavior — no absence-based trust until the next authoritative refresh re-opens it —
+//! while probe-read device evidence (`dev == root_dev`) still decides independently
+//! throughout.
+//!
 //! # Root-death signals per backend
 //!
 //! Every backend's root death — unmount, delete, or replace — must reach a
@@ -1040,15 +1050,23 @@ impl DriverCore {
       // UNION, never replacement: an existing entry is either a still-real mount (a
       // later unmount event removes it) or a probed foreign-device prefix the
       // snapshot cannot know about — keeping both only ever reduces trust, the safe
-      // direction. A non-authoritative read (the live table could not be read) skips
-      // this and leaves trust closed; probe-carried device evidence still decides
-      // what it can.
+      // direction. Probe-carried device evidence still decides what it can.
       for mount in refresh.mounts {
         if !state.mounts.iter().any(|m| m == &mount) {
           state.mounts.push(mount);
         }
       }
       state.mounts_authoritative = true;
+    } else {
+      // The live table could not be read, so this refresh installs no table — and a
+      // prior authoritative install may have left authority OPEN. Leaving it open
+      // would keep proving paths root-device by their ABSENCE from a table we just
+      // failed to re-read across the very mount change this refresh was meant to
+      // reconcile. Close it: absence from an unreadable table is not evidence of
+      // in-root-device. The trust-REDUCING learned prefixes in `state.mounts` are
+      // kept (they only ever veto trust, never grant it) for the next authoritative
+      // refresh to union onto.
+      state.mounts_authoritative = false;
     }
 
     // A CHANGED frame means a same-object re-mount moved the root to a different
