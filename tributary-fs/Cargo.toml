@@ -14,6 +14,13 @@ keywords = ["filesystem", "notify", "fsevents", "watcher"]
 [features]
 tokio = ["agnostic-lite/tokio"]
 smol = ["agnostic-lite/smol"]
+# Internal, not public API: gates the privileged real-kernel Linux integration
+# test binaries (`linux_inotify`, `linux_fanotify`), whose sysctl cells shrink
+# namespace-global inotify limits and so REQUIRE `--test-threads=1`. The generic
+# `test` job runs the feature powerset in parallel, which those cells cannot
+# tolerate, so it excludes this feature; the dedicated `linux-integration` job
+# enables it (via `--all-features`) and runs them single-threaded.
+_integration = []
 
 [dependencies]
 agnostic-lite = { version = "0.6", features = ["time"] }
@@ -77,3 +84,15 @@ all-features = true
 default-target = "aarch64-apple-darwin"
 targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+# The privileged real-kernel Linux integration suites are gated behind the
+# internal `_integration` feature (see [features]) so the generic parallel
+# `test` job skips them; they run single-threaded in the `linux-integration`
+# job. `watcher` (macOS FSEvents) stays auto-discovered and parallel-safe.
+[[test]]
+name = "linux_inotify"
+required-features = ["_integration"]
+
+[[test]]
+name = "linux_fanotify"
+required-features = ["_integration"]

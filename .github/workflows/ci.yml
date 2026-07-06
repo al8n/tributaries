@@ -158,7 +158,10 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run test
-      run: cargo hack test --feature-powerset --exclude-no-default-features
+      # `_integration` gates the privileged, single-threaded Linux integration
+      # suites (see tributary-fs/Cargo.toml); this parallel powerset run must not
+      # build or run them — the `linux-integration` job owns them.
+      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features _integration
 
   linux-integration:
     name: linux-integration
