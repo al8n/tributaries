@@ -19,6 +19,23 @@
 //! erasing the new live anchor set (which would silently drop a live watch). The
 //! `IN_IGNORED` after that (impossible under the kernel's one-final-event
 //! contract, but not assumed) erases legitimately.
+//!
+//! Attribution across the reuse window: the kernel queues a watch's final
+//! `IN_IGNORED` BEFORE the `wd` can be handed to a new `add_watch`, so the queue
+//! reads `old records…, old IN_IGNORED, new records…`. Between a reuse
+//! [`register`](WdTable::register) and the stale `IN_IGNORED` that closes it, a
+//! NON-`IN_IGNORED` record on the `wd` is therefore one of those OLD records:
+//! attributing it to the fresh anchor set would be a silent wrong-watch delivery.
+//! So while `pending_stale_ignored > 0` the `wd` is in an AMBIGUOUS window and
+//! [`attribute`](WdTable::attribute) returns [`Attribution::Ambiguous`] for every
+//! non-`IN_IGNORED` record — the reader fences it behind the loss barrier (a
+//! covering rescan re-enumerates and re-attributes truthfully) rather than
+//! guessing. Each stale `IN_IGNORED` still routes to
+//! [`on_ignored`](WdTable::on_ignored), decrementing the count; when it reaches
+//! zero the window closes and attribution resumes over the new set (whose own
+//! arm-enumerate already covered its initial state). Removals can stack, so
+//! `pending_stale_ignored` is a COUNT and the fence holds until the LAST stale
+//! marker drains — never a per-`wd` bool that a first IGNORED would clear early.
 
 use std::collections::BTreeMap;
 
@@ -33,6 +50,24 @@ pub(crate) enum DrainDecision {
   /// Live anchors remain (or the entry is already draining): the kernel watch
   /// stays.
   KeepWd,
+}
+
+/// The attribution outcome for one decoded NON-`IN_IGNORED` record on a `wd`
+/// (the `IN_IGNORED` marker itself routes through [`WdTable::on_ignored`], never
+/// here).
+#[derive(Debug)]
+pub(crate) enum Attribution<'a> {
+  /// The record fans out to these live anchors. Empty for an unknown or fully
+  /// drained `wd` — the caller skips it without loss (the core's own liveness
+  /// already dropped that watch).
+  Attributed(&'a [WatchId]),
+  /// The `wd` is in the AMBIGUOUS REUSE WINDOW: a fresh anchor set was installed
+  /// over a not-yet-drained old incarnation whose stale `IN_IGNORED` is still
+  /// queued ahead of any of the new watch's events (see the module invariant).
+  /// This record therefore belongs to the OLD watch, so attributing it to the
+  /// new set would be a silent wrong-watch delivery; the caller fences it behind
+  /// the loss barrier (a covering rescan re-attributes truthfully) instead.
+  Ambiguous,
 }
 
 /// One `wd`'s bookkeeping: the anchors still attributing, whether the
@@ -95,15 +130,21 @@ impl WdTable {
     self.register(wd, anchor);
   }
 
-  /// The anchors a record on `wd` fans out to. Empty for an unknown or fully
-  /// drained `wd` (a late record for an unwatched anchor is dropped by the
-  /// core's own liveness checks).
-  pub(crate) fn anchors(&self, wd: i32) -> &[WatchId] {
-    self
-      .entries
-      .get(&wd)
-      .map(|entry| entry.live.as_slice())
-      .unwrap_or(&[])
+  /// The attribution decision for a NON-`IN_IGNORED` record on `wd`.
+  ///
+  /// [`Attribution::Ambiguous`] while the `wd` is in the reuse window
+  /// (`pending_stale_ignored > 0`, per the module invariant): the record may
+  /// belong to the OLD incarnation queued ahead of its stale `IN_IGNORED`, so it
+  /// is fenced to loss rather than mis-attributed to the fresh set. Otherwise
+  /// [`Attribution::Attributed`] over the live anchor set — empty for an unknown
+  /// or fully drained `wd` (a late record for an unwatched anchor is dropped by
+  /// the core's own liveness checks).
+  pub(crate) fn attribute(&self, wd: i32) -> Attribution<'_> {
+    match self.entries.get(&wd) {
+      Some(entry) if entry.pending_stale_ignored > 0 => Attribution::Ambiguous,
+      Some(entry) => Attribution::Attributed(&entry.live),
+      None => Attribution::Attributed(&[]),
+    }
   }
 
   /// Whether `wd` is known at all — live or draining.

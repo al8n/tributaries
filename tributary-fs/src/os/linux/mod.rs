@@ -103,7 +103,7 @@ use tributary_proto::WatchId;
 
 pub(crate) use fanotify::AdmittedEvent;
 pub(crate) use inotify::decode::RawInotifyEvent;
-use inotify::table::WdTable;
+use inotify::table::{Attribution, WdTable};
 
 /// The decoded Linux event payload — the platform's transport `E` once the
 /// seam flips.
@@ -169,7 +169,11 @@ pub(crate) struct AttributedBatch {
 ///   anchors already drained forwards nothing.
 /// - Any other record fans out to the `wd`'s live anchors; a record on a
 ///   draining or unknown `wd` addresses a watch the core already dropped and
-///   is skipped without loss.
+///   is skipped without loss. A record on a `wd` in the REUSE WINDOW (a fresh
+///   anchor set installed over a not-yet-drained old incarnation —
+///   [`Attribution::Ambiguous`]) is instead marked lost: it may belong to the
+///   old watch, so it is fenced behind the covering rescan rather than
+///   mis-attributed to the new set.
 pub(crate) fn attribute_events(
   decoded: Vec<RawInotifyEvent>,
   table: &mut WdTable,
@@ -188,11 +192,20 @@ pub(crate) fn attribute_events(
       }
       continue;
     }
-    let anchors = table.anchors(event.wd).to_vec();
-    if anchors.is_empty() {
-      continue;
+    match table.attribute(event.wd) {
+      Attribution::Attributed([]) => continue,
+      Attribution::Attributed(anchors) => {
+        events.push(RawLinuxEvent::Inotify {
+          anchors: anchors.to_vec(),
+          event,
+        });
+      }
+      // The `wd` is in the reuse window: this record may belong to the OLD
+      // (draining) watch queued ahead of its stale `IN_IGNORED`, so fence it
+      // behind the loss barrier — the covering rescan re-attributes truthfully —
+      // rather than delivering it to the wrong (new) watch.
+      Attribution::Ambiguous => lost = true,
     }
-    events.push(RawLinuxEvent::Inotify { anchors, event });
   }
   AttributedBatch { events, lost }
 }

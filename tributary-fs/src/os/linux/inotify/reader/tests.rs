@@ -35,10 +35,12 @@ mod barrier {
   use crate::os::{
     SourceMessage,
     linux::{
-      attribute_events,
+      AttributedBatch, attribute_events,
       inotify::{
-        decode::{IN_CREATE, IN_MOVED_FROM, IN_Q_OVERFLOW, InotifyMask, RawInotifyEvent},
-        table::WdTable,
+        decode::{
+          IN_CREATE, IN_IGNORED, IN_MOVED_FROM, IN_Q_OVERFLOW, InotifyMask, RawInotifyEvent,
+        },
+        table::{DrainDecision, WdTable},
       },
     },
     transport::TransportState,
@@ -64,12 +66,9 @@ mod barrier {
     Overflow,
   }
 
-  /// Attributes `records` against a table holding one live `wd`, then runs the
-  /// reader's `forward_attributed` over the result, capturing what it forwards.
-  fn run(records: Vec<RawInotifyEvent>, decode_lossy: bool) -> Vec<Sent> {
-    let mut table = WdTable::new();
-    table.register(3, watch(1));
-    let attributed = attribute_events(records, &mut table);
+  /// Runs the reader's `forward_attributed` over an already-attributed batch,
+  /// capturing the kinds of message it forwards, in order.
+  fn forward_capture(attributed: AttributedBatch, decode_lossy: bool) -> Vec<Sent> {
     let transport = TransportState::new(8);
     let sent = std::cell::RefCell::new(Vec::new());
     super::super::forward_attributed(&transport, attributed, decode_lossy, |msg| {
@@ -81,6 +80,15 @@ mod barrier {
       true
     });
     sent.into_inner()
+  }
+
+  /// Attributes `records` against a table holding one live `wd`, then runs the
+  /// reader's `forward_attributed` over the result, capturing what it forwards.
+  fn run(records: Vec<RawInotifyEvent>, decode_lossy: bool) -> Vec<Sent> {
+    let mut table = WdTable::new();
+    table.register(3, watch(1));
+    let attributed = attribute_events(records, &mut table);
+    forward_capture(attributed, decode_lossy)
   }
 
   /// An `IN_Q_OVERFLOW` sentinel followed by an attributable record: the reader
@@ -130,6 +138,50 @@ mod barrier {
       sent,
       vec![Sent::Batch(2)],
       "both records ride one Batch, no Overflow"
+    );
+  }
+
+  /// A `wd` recycled for a new watch while the old incarnation's `IN_IGNORED` is
+  /// still queued: a record on it (an OLD record queued ahead of that stale
+  /// marker) is fenced behind the loss barrier — the reader forwards ONLY the
+  /// covering `Overflow` (the rescan re-attributes truthfully), never a Batch that
+  /// would deliver the record to the WRONG (new) watch. Once the stale IGNORED
+  /// closes the window, a fresh record on the new watch rides a Batch as usual.
+  #[test]
+  fn reused_wd_stale_record_forwards_only_the_overflow() {
+    let mut table = WdTable::new();
+    table.register(3, watch(1));
+    assert_eq!(table.begin_drain(watch(1)), DrainDecision::RemoveWd(3));
+    table.register(3, watch(2)); // wd 3 recycled; watch(1)'s IGNORED still queued
+
+    // An OLD (watch(1)) record queued ahead of the stale IGNORED. It carries wd 3
+    // but belongs to watch(1); attributing it to watch(2) would be a wrong-watch
+    // delivery, so the reuse window fences it to loss.
+    let stale = attribute_events(vec![event(3, IN_CREATE, Some(b"stale"))], &mut table);
+    assert!(
+      stale.events.is_empty(),
+      "the ambiguous record is not attributed to the new watch"
+    );
+    assert!(stale.lost, "the reuse window marks the buffer lost");
+    assert_eq!(
+      forward_capture(stale, false),
+      vec![Sent::Overflow],
+      "only the covering Overflow is forwarded — never a wrong-watch Batch"
+    );
+
+    // The stale IGNORED closes the window, fanning to nobody.
+    let ignored = attribute_events(vec![event(3, IN_IGNORED, None)], &mut table);
+    assert!(
+      ignored.events.is_empty() && !ignored.lost,
+      "the stale IGNORED is absorbed silently"
+    );
+
+    // A post-window record on the new watch attributes normally and rides a Batch.
+    let live = attribute_events(vec![event(3, IN_CREATE, Some(b"real"))], &mut table);
+    assert_eq!(
+      forward_capture(live, false),
+      vec![Sent::Batch(1)],
+      "attribution resumes for the new watch once the window closes"
     );
   }
 }
