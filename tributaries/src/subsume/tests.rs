@@ -36,7 +36,9 @@ fn watch(
     WatchOutcome::Covered { fs_root, sub } => (*fs_root, *sub),
     WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (handles.mint(), *sub),
   };
-  s.commit_watch(&outcome, fs_root);
+  // The tests use a fs-canonical path identical to the planned one (no TOCTOU), so
+  // the committed key is the planned path itself.
+  s.commit_watch(&outcome, fs_root, Path::new(path));
   (fs_root, sub)
 }
 
@@ -82,10 +84,13 @@ fn descendant_is_covered() {
     }
     other => panic!("expected Covered by /a, got {other:?}"),
   };
-  s.commit_watch(&outcome, ra);
+  s.commit_watch(&outcome, ra, Path::new("/a/b"));
 
   assert_eq!(root_paths(&s), BTreeSet::from([PathBuf::from("/a")]));
   assert_eq!(s.entry(ra).unwrap().subscribers, vec![sa, sb]);
+  // The covered subscription records its own (narrower) path and its interest.
+  assert_eq!(s.subscription_path(sb), Some(Path::new("/a/b")));
+  assert_eq!(s.subscription_interest(sb), Some(Interest::all()));
 }
 
 #[test]
@@ -117,7 +122,7 @@ fn ancestor_widens_and_repoints() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide);
+  s.commit_watch(&outcome, wide, Path::new("/a"));
 
   assert_ne!(wide, narrow);
   assert_eq!(root_paths(&s), BTreeSet::from([PathBuf::from("/a")]));
@@ -149,6 +154,72 @@ fn unwatch_last_subscriber_empties_root() {
 
   // Unknown / already-dropped subscriptions report nothing.
   assert!(s.plan_unwatch(sa).is_none());
+}
+
+/// Each subscription records its own interest in the side table (design §4): the root
+/// is armed `Interest::all`, so a heterogeneous set of subscriptions on one root each
+/// keeps its own gate. A widen re-point preserves each re-pointed sub's interest.
+#[test]
+fn side_table_records_per_subscription_interest() {
+  let mut s = Subsumer::<u32>::new();
+  let mut h = Handles::default();
+
+  let created = Interest::new().with_created();
+  let removed = Interest::new().with_removed();
+
+  // A disjoint root and a covered sub with a DIFFERENT interest.
+  let (_ra, sa) = watch(&mut s, &mut h, "/a", created);
+  let (_rb, sb) = watch(&mut s, &mut h, "/a/b", removed);
+  assert_eq!(s.subscription_interest(sa), Some(created));
+  assert_eq!(s.subscription_interest(sb), Some(removed));
+
+  // Widen over /a/x's sibling by watching /a's ancestor is not applicable; instead
+  // widen the whole tree with /: both /a's subs re-point, each keeping its interest.
+  let modified = Interest::new().with_modified();
+  let (_root, sroot) = watch(&mut s, &mut h, "/", modified);
+  assert_eq!(
+    s.subscription_interest(sa),
+    Some(created),
+    "a re-pointed sub keeps its own interest across a widen"
+  );
+  assert_eq!(s.subscription_interest(sb), Some(removed));
+  assert_eq!(s.subscription_interest(sroot), Some(modified));
+  // An unknown subscription has no interest.
+  assert_eq!(root_paths(&s), BTreeSet::from([PathBuf::from("/")]));
+}
+
+/// The fs-path TOCTOU guard (design §4): committing at a fs-canonical path is safe iff
+/// it keeps the planned subsumption — same disjointness, subsuming exactly the planned
+/// roots — and unsafe (the driver aborts) when the fs path is now covered by, or
+/// overlaps a different set of, existing roots.
+#[test]
+fn fs_path_preserves_plan_detects_subsumption_divergence() {
+  let mut s = Subsumer::<u32>::new();
+  let mut h = Handles::default();
+  let (_ra, _sa) = watch(&mut s, &mut h, "/a", Interest::all());
+
+  // A disjoint plan (unwatch empty): a fs path still disjoint from /a preserves it…
+  assert!(
+    s.fs_path_preserves_plan(Path::new("/b"), &[]),
+    "a still-disjoint fs path preserves a Disjoint plan"
+  );
+  // …but a fs path now COVERED by the existing /a does not (it should have been
+  // Covered, never a fresh arm).
+  assert!(
+    !s.fs_path_preserves_plan(Path::new("/a/x"), &[]),
+    "a fs path covered by an existing root invalidates a Disjoint plan"
+  );
+
+  // A widen plan that drained a specific root: the fs path must subsume exactly it.
+  let (rb, _sb) = watch(&mut s, &mut h, "/c/d", Interest::all());
+  assert!(
+    s.fs_path_preserves_plan(Path::new("/c"), &[rb]),
+    "a fs path subsuming exactly the planned root preserves the Widen plan"
+  );
+  assert!(
+    !s.fs_path_preserves_plan(Path::new("/c"), &[]),
+    "a fs path that now subsumes a root the plan did not drain invalidates it"
+  );
 }
 
 // ---------------------------------------------------------------------------

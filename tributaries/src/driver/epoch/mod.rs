@@ -149,6 +149,20 @@ impl EpochLedger {
       .collect()
   }
 
+  /// Forgets all per-subscription epoch state for `sub` — its `epoch_base` and
+  /// `high_water` — reclaiming both map slots.
+  ///
+  /// The driver calls this on **every** successful unwatch (both a plain drop and the
+  /// last-subscriber root-emptied case), so a `watch → stamp/repoint → unwatch` churn
+  /// cannot grow the ledger without bound. Subscription ids are minted monotonically
+  /// and never reused (the subsumer's counter), so a re-added subscription starts
+  /// fresh at [`Epoch::START`] via the absent-entry default — there is no stale state
+  /// to alias.
+  pub(crate) fn remove(&mut self, sub: Subscription) {
+    self.base.remove(&sub);
+    self.high_water.remove(&sub);
+  }
+
   /// Advances `sub`'s high-water to cover `stamp` (a stamp is always ≥ the current
   /// high-water within a root and a `Rescan` is minted strictly above it, so this is
   /// monotone; `max` guards it regardless).
@@ -158,5 +172,14 @@ impl EpochLedger {
       .entry(sub)
       .and_modify(|current| *current = (*current).max(stamp))
       .or_insert(stamp);
+  }
+
+  /// The number of subscriptions still holding `(base, high_water)` state — the leak
+  /// [`remove`](Self::remove) must keep bounded across a watch/unwatch churn. Both maps
+  /// stay in lockstep (every stamp/repoint touches both, every `remove` clears both),
+  /// asserted by the driver's churn test.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn tracked_len(&self) -> (usize, usize) {
+    (self.base.len(), self.high_water.len())
   }
 }
