@@ -3423,6 +3423,181 @@ mod descending {
     );
   }
 
+  /// A STALE refresh never publishes the descent frame. A loss overlapped the read,
+  /// so its snapshot may predate the lost window; the frame it carries is as suspect
+  /// as its mount table, and gating the adoption behind the stale check keeps
+  /// `crosses_mount_boundary` reading only an authoritative frame — the exact hole a
+  /// pre-stale-gate adoption left (an overflow re-arm consuming a discarded frame).
+  #[test]
+  fn a_stale_refresh_never_publishes_the_descent_frame() {
+    let (mut core, scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![entry_on_mount("sub", FileKind::Dir, 1, 20, 42)]),
+    );
+    let _ = drain(&mut core);
+
+    // A loss marked the outstanding refresh stale; it then completes ALIVE but
+    // carries a DIFFERENT frame (77) that must NOT be adopted.
+    core
+      .scopes
+      .get_mut(&scope)
+      .expect("scope is live")
+      .refresh_stale = true;
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+        root_mnt_id: Some(77),
+      },
+      at(1),
+    );
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "a stale completion re-arms exactly one fresh read"
+    );
+    assert_eq!(
+      core.scopes.get(&scope).expect("scope is live").root_mnt_id,
+      Some(42),
+      "a stale refresh publishes NOTHING — the captured authoritative frame survives, \
+       so an overflow re-arm can never fence current-mount children under a discarded frame"
+    );
+  }
+
+  /// Death-first ordering under the frame gate: the root-liveness verdict is
+  /// evaluated BEFORE the stale gate, so a stale refresh whose root is GONE still
+  /// dies — even though it also carries a (never-adopted) frame. Moving the frame
+  /// adoption behind the stale gate must not regress that ordering.
+  #[test]
+  fn a_stale_refresh_finding_the_root_gone_still_dies() {
+    let (mut core, scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![entry_on_mount("sub", FileKind::Dir, 1, 20, 42)]),
+    );
+    let _ = drain(&mut core);
+
+    core
+      .scopes
+      .get_mut(&scope)
+      .expect("scope is live")
+      .refresh_stale = true;
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Missing,
+        root_mnt_id: Some(77),
+      },
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(
+      emitted.len(),
+      2,
+      "a gone root still dies through the stale gate: {effects:?}"
+    );
+    assert!(emitted[0].kind().is_removed(), "a gone root is a Removed");
+    assert!(emitted[1].kind().is_rescan(), "root death is never silent");
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead root's stream tears down even under a stale completion: {effects:?}"
+    );
+  }
+
+  /// The re-arm-replay: a NON-stale refresh whose frame CHANGED (a same-object
+  /// re-mount) reconciles the children the last enumerate already classified. Adopting
+  /// the new frame keeps FUTURE enumerates correct, but a child fenced as a boundary
+  /// under the OLD frame is not re-read by the adoption alone — the frame change
+  /// rescans-and-re-arms the root so it is re-checked, closing the blind subtree the
+  /// overflow re-arm would otherwise leave (its enumerate races AHEAD of the frame
+  /// adoption and reads the pre-adoption frame).
+  #[test]
+  fn a_changed_frame_reconciles_already_classified_children() {
+    // Frame 42: `stays` (mount 42) is descended, `arrives` (mount 77) is a boundary.
+    let (mut core, scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry_on_mount("stays", FileKind::Dir, 1, 20, 42),
+        entry_on_mount("arrives", FileKind::Dir, 1, 21, 77),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let armed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::AddWatch { path, .. } => Some(path.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      armed,
+      vec![Path::new("/r/stays")],
+      "before the re-mount only the mount-42 child is descended: {effects:?}"
+    );
+
+    // The same-object re-mount moves the root to mount 77 (identity unchanged). The
+    // non-stale refresh adopts the new frame AND reconciles.
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+        root_mnt_id: Some(77),
+      },
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the frame change reconciles with a covering rescan: {effects:?}"
+    );
+    let req2 = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the frame-change reconcile re-enumerates the root under the new frame");
+
+    // The reconcile re-enumerate reads the SAME children under frame 77: `arrives`
+    // (mount 77) is now in-scope and gets watched — no blind subtree — while `stays`
+    // (mount 42) is now the boundary the re-mount left behind.
+    core.on_enumerated(
+      req2,
+      listed(vec![
+        entry_on_mount("stays", FileKind::Dir, 1, 20, 42),
+        entry_on_mount("arrives", FileKind::Dir, 1, 21, 77),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let armed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::AddWatch { path, .. } => Some(path.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert!(
+      armed.contains(&Path::new("/r/arrives")),
+      "the reconcile watches the mount-77 child fenced under the old frame — no blind \
+       subtree: {effects:?}"
+    );
+    assert!(
+      !armed.contains(&Path::new("/r/stays")),
+      "the mount-42 child the re-mount left behind is now the boundary: {effects:?}"
+    );
+  }
+
   #[test]
   fn inotify_events_lower_depth_one_with_native_cookies() {
     let (mut core, scope, req, root) = live_descending();
@@ -4303,6 +4478,40 @@ mod kernel_recursive_fanotify {
     assert!(
       !state.mounts.iter().any(|m| m == Path::new("/r/stale-vol")),
       "the superseded mount-set is discarded, not installed"
+    );
+  }
+
+  /// A kernel-recursive scope adopts a changed frame but does NOT reconcile: its one
+  /// superblock mark covers the whole subtree, so the descent frame is inert (no
+  /// per-directory coverage to rebuild). A same-object re-mount that moves the frame
+  /// must not emit a spurious rescan — the replay is a descending-scope concern only.
+  #[test]
+  fn a_kernel_recursive_frame_change_adopts_but_never_reconciles() {
+    let (mut core, scope) = live_fanotify();
+    core
+      .scopes
+      .get_mut(&scope)
+      .expect("scope is live")
+      .root_mnt_id = Some(42);
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+        root_mnt_id: Some(77),
+      },
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      effects.is_empty(),
+      "a kernel-recursive frame change triggers no reconcile: {effects:?}"
+    );
+    assert_eq!(
+      core.scopes.get(&scope).expect("scope is live").root_mnt_id,
+      Some(77),
+      "the KR scope still adopts the authoritative frame (inert, but kept current)"
     );
   }
 }
