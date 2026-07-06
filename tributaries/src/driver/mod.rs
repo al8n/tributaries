@@ -10,7 +10,11 @@
 //! covering subscription (design §5), stamped in that subscription's own monotone
 //! epoch space (design §8).
 
-use std::{collections::VecDeque, hash::Hash, path::Path};
+use std::{
+  collections::{HashMap, VecDeque},
+  hash::Hash,
+  path::Path,
+};
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{Interest, RootHandle, Watcher};
@@ -19,6 +23,7 @@ use crate::{
   coalesce::Coalescer,
   error::{BuildError, CloseError, UnwatchError, WatchError},
   event::Event,
+  filter::Filter,
   options::TributariesOptions,
   subscription::Subscription,
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
@@ -104,6 +109,13 @@ pub struct Tributaries<R: RuntimeLite> {
   /// per-`ScopeId` fs epoch — which restarts at `START` on every kernel arm — never
   /// leaks as a dominance order across a re-point.
   epochs: EpochLedger,
+  /// Each live subscription's admission [`Filter`] (design §7): the fan-out gate a
+  /// non-`Rescan` event must pass, on top of path coverage. The driver holds a clone
+  /// that **shares the swappable slot** with the [`Filter`] the caller kept from
+  /// [`watch`](Tributaries::watch), so a caller [`swap`](Filter::swap) re-scopes the
+  /// subscription live — no re-watch, and the very next event sees the new predicate.
+  /// A `Rescan` bypasses this map entirely (coverage loss is never filtered away).
+  filters: HashMap<Subscription, Filter>,
   /// The opt-in settle/debounce coalescer (design §6), present only when the caller
   /// supplied a [`DebounceConfig`](crate::DebounceConfig). When [`None`], `next`
   /// passes attributed events through untouched (zero overhead — no coalescer is
@@ -139,17 +151,44 @@ impl<R: RuntimeLite> Tributaries<R> {
       queue: VecDeque::new(),
       delivered: VecDeque::new(),
       epochs: EpochLedger::new(),
+      filters: HashMap::new(),
       coalescer: debounce.map(Coalescer::new),
     })
   }
 
-  /// Subscribes to `path` with `interest`, returning its [`Subscription`].
+  /// Subscribes to `path` with `interest` and admission `filter`, returning its
+  /// [`Subscription`].
   ///
   /// Overlapping paths are accepted: they are subsumed onto a shared kernel watch
   /// (design §4), so this never surfaces the `Overlaps` the layer below rejects.
   /// Widening an existing watch re-points the subsumed subscriptions onto the new
   /// wider root and delivers each a synthetic dominating
   /// [`Rescan`](tributary_fs::EventKind::Rescan) (design §8).
+  ///
+  /// # Filtering, and swapping it live
+  ///
+  /// `filter` is this subscription's admission gate (design §7): a non-`Rescan` event
+  /// is delivered to it only if its path covers the event **and** `filter` admits the
+  /// delivery. Pass [`Filter::all`] to admit everything. A
+  /// [`Rescan`](tributary_fs::EventKind::Rescan) always bypasses the filter — coverage
+  /// loss is never filtered away.
+  ///
+  /// The `filter` is **live-swappable**: the driver keeps a clone that shares the
+  /// swappable slot with the [`Filter`] you pass, so retaining your own handle (a
+  /// [`Filter`] is [`Clone`], and a clone shares the slot) lets you call
+  /// [`Filter::swap`] at any time to re-scope what this subscription delivers —
+  /// without a re-watch. Construct the filter, keep a clone, hand one to `watch`:
+  ///
+  /// ```no_run
+  /// # async fn ex(w: &mut tributaries::TokioTributaries) -> Result<(), Box<dyn std::error::Error>> {
+  /// use tributaries::{Filter, Interest};
+  /// let filter = Filter::new(|e| e.path().extension().is_some_and(|x| x == "rs"));
+  /// let handle = filter.clone(); // shares the slot with the one `watch` holds
+  /// let sub = w.watch("/project", Interest::all(), filter).await?;
+  /// // Later, widen what `sub` delivers — live, no re-watch:
+  /// handle.swap(|_| true);
+  /// # Ok(()) }
+  /// ```
   ///
   /// # Errors
   ///
@@ -159,13 +198,14 @@ impl<R: RuntimeLite> Tributaries<R> {
     &mut self,
     path: impl AsRef<Path>,
     interest: Interest,
+    filter: Filter,
   ) -> Result<Subscription, WatchError> {
     let supplied = path.as_ref();
     let canonical = std::fs::canonicalize(supplied).map_err(|source| WatchError::Canonicalize {
       path: supplied.to_path_buf(),
       source,
     })?;
-    apply_watch(
+    let sub = apply_watch(
       &mut self.subsumer,
       &mut self.epochs,
       &mut self.queue,
@@ -173,7 +213,12 @@ impl<R: RuntimeLite> Tributaries<R> {
       &canonical,
       interest,
     )
-    .await
+    .await?;
+    // The subscription is live: record its filter (a clone shares the caller's
+    // swappable slot, so a later `Filter::swap` re-scopes delivery live). Only
+    // recorded on success — a failed arm establishes no subscription.
+    self.filters.insert(sub, filter);
+    Ok(sub)
   }
 
   /// Drops `sub`, releasing its kernel watch once it was the last subscriber of its
@@ -186,8 +231,15 @@ impl<R: RuntimeLite> Tributaries<R> {
   pub async fn unwatch(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
     match self.subsumer.plan_unwatch(sub) {
       None => Err(UnwatchError::UnknownSubscription),
-      Some(UnwatchOutcome::Dropped) => Ok(()),
-      Some(UnwatchOutcome::RootEmptied { fs_root }) => self.watcher.disarm(fs_root).await,
+      Some(UnwatchOutcome::Dropped) => {
+        // The subscription is gone; drop its filter so the map tracks only live subs.
+        self.filters.remove(&sub);
+        Ok(())
+      }
+      Some(UnwatchOutcome::RootEmptied { fs_root }) => {
+        self.filters.remove(&sub);
+        self.watcher.disarm(fs_root).await
+      }
     }
   }
 
@@ -286,14 +338,14 @@ impl<R: RuntimeLite> Tributaries<R> {
     }
   }
 
-  /// Resolves one raw event's root and fans it out to every covering subscriber,
-  /// stamping each delivery in that subscriber's own monotone epoch space (design
-  /// §5/§8). An event whose root has no live entry (its subscription(s) were dropped
-  /// between the kernel emitting it and us routing it) fans out to nothing.
+  /// Resolves one raw event's root and fans it out to every covering, filter-admitting
+  /// subscriber, stamping each delivery in that subscriber's own monotone epoch space
+  /// (design §5/§7/§8). An event whose root has no live entry (its subscription(s) were
+  /// dropped between the kernel emitting it and us routing it) fans out to nothing.
   fn fan_out_raw(&mut self, raw: &tributary_fs::Event) -> Vec<Event> {
-    // Disjoint field borrows: `subsumer` resolves the root/coverage, `epochs` owns the
-    // per-subscription stamp state.
-    let (subsumer, epochs) = (&self.subsumer, &mut self.epochs);
+    // Disjoint field borrows: `subsumer` resolves the root/coverage, `filters` the
+    // per-subscription admission gate, `epochs` owns the per-subscription stamp state.
+    let (subsumer, filters, epochs) = (&self.subsumer, &self.filters, &mut self.epochs);
     let Some(entry) = subsumer.entry(raw.root()) else {
       return Vec::new();
     };
@@ -306,6 +358,11 @@ impl<R: RuntimeLite> Tributaries<R> {
       raw_epoch,
       entry,
       |sub| subsumer.subscription_path(sub),
+      // The filter admission gate (design §7): a covered non-`Rescan` delivery is kept
+      // only if the subscription's filter admits it. A subscription with no recorded
+      // filter (raced concurrent drop) admits nothing — it is no longer live. A
+      // `Rescan` never reaches here (fan_out bypasses the filter for it).
+      |sub, event: &Event| filters.get(&sub).is_some_and(|filter| filter.admits(event)),
       Event::subscription,
       |mut event, stamp| {
         event.set_epoch(stamp);

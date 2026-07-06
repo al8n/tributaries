@@ -100,6 +100,9 @@ impl Fixture {
       raw,
       &self.entry,
       |s| self.canonical_of(s),
+      // These tests exercise coverage + epoch rebasing, not the filter, so admit
+      // every covered delivery (the filter gate is covered in `route::tests`).
+      |_sub, _delivered| true,
       |s| *s,
       |s, stamp| (s, stamp),
     )

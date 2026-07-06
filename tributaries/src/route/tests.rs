@@ -81,11 +81,30 @@ impl Fixture {
     Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
   }
 
-  /// The subscribers `event` fans out to.
+  /// The subscribers `event` fans out to, with every subscriber's filter admitting
+  /// (so this isolates the coverage/Rescan logic from the filter gate).
   fn route(&self, event: &FakeEvent) -> Vec<Subscription> {
-    fan_out(event, &self.entry, |sub| {
-      self.paths.get(&sub).map(PathBuf::as_path)
-    })
+    fan_out(
+      event,
+      &self.entry,
+      |sub| self.paths.get(&sub).map(PathBuf::as_path),
+      |_sub, _delivered| true,
+    )
+  }
+
+  /// The subscribers `event` fans out to, admitting a delivery only when `admits`
+  /// returns `true` for its `(subscription, delivered)` — the filter gate under test.
+  fn route_filtered(
+    &self,
+    event: &FakeEvent,
+    admits: impl Fn(Subscription, &Subscription) -> bool,
+  ) -> Vec<Subscription> {
+    fan_out(
+      event,
+      &self.entry,
+      |sub| self.paths.get(&sub).map(PathBuf::as_path),
+      admits,
+    )
   }
 }
 
@@ -156,5 +175,62 @@ fn rescan_reaches_all_subscribers() {
     fx.route(&FakeEvent::rescan("/a/x")),
     vec![fx.sub(1), fx.sub(2)],
     "a Rescan bypasses coverage and reaches all subscribers"
+  );
+}
+
+#[test]
+fn filter_narrows_the_covered_set() {
+  // Root /a carries two covering subscriptions: /a and /a/b.
+  let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/b")]);
+
+  // An event under /a/b is COVERED by both, but subscription 2's filter rejects it —
+  // the filter is an additional gate that narrows the covered set (§7).
+  let admitted = fx.route_filtered(&FakeEvent::change("/a/b/c"), |sub, _| sub != fx.sub(2));
+  assert_eq!(
+    admitted,
+    vec![fx.sub(1)],
+    "the filter excludes the covering subscription that does not admit"
+  );
+
+  // With every filter admitting, both covering subscriptions receive it — proving the
+  // narrowing above was the filter, not coverage.
+  let both = fx.route_filtered(&FakeEvent::change("/a/b/c"), |_, _| true);
+  assert_eq!(both, vec![fx.sub(1), fx.sub(2)], "both cover it");
+}
+
+#[test]
+fn filter_only_sees_covered_deliveries() {
+  // Root /a carries /a and /a/b. An event at /a/x is covered only by /a; the filter
+  // must never be consulted for /a/b (it does not cover the event), so a filter that
+  // panics for /a/b proves coverage is checked FIRST.
+  let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/b")]);
+  let admitted = fx.route_filtered(&FakeEvent::change("/a/x"), |sub, _| {
+    assert_ne!(
+      sub,
+      fx.sub(2),
+      "the filter is only asked about covering subs"
+    );
+    true
+  });
+  assert_eq!(
+    admitted,
+    vec![fx.sub(1)],
+    "only the covering /a is admitted"
+  );
+}
+
+#[test]
+fn rescan_bypasses_the_filter() {
+  // Root /a carries /a and /a/b. A Rescan must reach BOTH even when every filter
+  // rejects — coverage loss is never filtered away (§7/§8). A filter that would reject
+  // everything (and must never even be consulted for a Rescan) proves the bypass.
+  let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/b")]);
+  let admitted = fx.route_filtered(&FakeEvent::rescan("/a/x"), |_, _| {
+    panic!("the filter must not be consulted for a Rescan");
+  });
+  assert_eq!(
+    admitted,
+    vec![fx.sub(1), fx.sub(2)],
+    "a Rescan bypasses the filter and reaches every subscriber"
   );
 }

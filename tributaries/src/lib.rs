@@ -17,6 +17,51 @@
 //! already lives in the Monitor and ships through [`tributary_fs::Event`];
 //! `tributaries` adds routing and consumer ergonomics, not new correctness logic.
 //!
+//! # Quick start
+//!
+//! Watch possibly-overlapping paths — each with its own [`Filter`] — optionally settle
+//! bursts with a [`DebounceConfig`], and pull the merged, attributed stream. Each event
+//! is retagged with the [`Subscription`] it belongs to, so one change under an overlap
+//! is delivered to every covering subscription under its own id.
+//!
+//! ```no_run
+//! # #[cfg(feature = "tokio")]
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! use tributaries::{DebounceConfig, Filter, Interest, TokioTributaries, TributariesOptions};
+//!
+//! // Opt into the settle coalescer (omit `.debounce(..)` for raw pass-through).
+//! let options = TributariesOptions::new().debounce(DebounceConfig::new());
+//! let mut tributaries = TokioTributaries::new(options)?;
+//!
+//! // A subscription that only reports Rust sources — the filter is live-swappable.
+//! let sources = Filter::new(|event| event.path().extension().is_some_and(|x| x == "rs"));
+//! let handle = sources.clone(); // shares the swappable slot with the one `watch` holds
+//! let project = tributaries.watch("/path/to/project", Interest::all(), sources).await?;
+//!
+//! // An OVERLAPPING watch of a subtree — accepted, never `Overlaps`: it is subsumed
+//! // onto the same kernel watch, and a change under it fans out to both subscriptions.
+//! let tests = tributaries
+//!   .watch("/path/to/project/tests", Interest::all(), Filter::all())
+//!   .await?;
+//!
+//! // Re-scope what `project` delivers at any time — no re-watch:
+//! handle.swap(|_| true);
+//!
+//! while let Some(event) = tributaries.next().await {
+//!   // `event.subscription()` is `project` or `tests`; a `Rescan` reaches every
+//!   // subscriber of the affected root regardless of filter (coverage loss).
+//!   println!(
+//!     "{} [{}]: {}",
+//!     event.kind(),
+//!     event.subscription(),
+//!     event.path().display()
+//!   );
+//!   let _ = (project, tests);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Subsumption
 //!
 //! The subsumption engine is the control plane: a sans-I/O state machine over an
@@ -46,6 +91,7 @@ mod coalesce;
 mod driver;
 mod error;
 mod event;
+mod filter;
 mod options;
 mod route;
 mod subscription;
@@ -54,6 +100,7 @@ pub(crate) mod subsume;
 pub use driver::Tributaries;
 pub use error::{BuildError, CloseError, UnwatchError, WatchError};
 pub use event::Event;
+pub use filter::Filter;
 pub use options::{DebounceConfig, TributariesOptions};
 pub use subscription::Subscription;
 

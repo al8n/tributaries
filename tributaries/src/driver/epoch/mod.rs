@@ -103,36 +103,44 @@ impl EpochLedger {
     rescan
   }
 
-  /// Fans one raw event out to its covering subscribers (design §5) and stamps each
-  /// delivery in that subscriber's own monotone epoch space (design §8).
+  /// Fans one raw event out to its covering, filter-admitting subscribers (design
+  /// §5/§7) and stamps each delivery in that subscriber's own monotone epoch space
+  /// (design §8).
   ///
-  /// Coverage is decided by the unchanged pure [`fan_out`](crate::route::fan_out):
-  /// `event` reaches exactly the subscribers of `entry` whose canonical path
-  /// (resolved by `canonical_of`) covers it, plus — for a `Rescan` — *every*
-  /// subscriber of the root. `raw` is the event's raw fs epoch; each covered
-  /// subscriber's delivery is stamped `epoch_base + raw` via [`stamp`](Self::stamp),
-  /// advancing that subscriber's high-water.
+  /// Coverage and filter admission are decided by the unchanged pure
+  /// [`fan_out`](crate::route::fan_out): `event` reaches exactly the subscribers of
+  /// `entry` whose canonical path (resolved by `canonical_of`) covers it **and** whose
+  /// filter (`admits`) admits the minted delivery, plus — for a `Rescan` — *every*
+  /// subscriber of the root, bypassing both gates. `raw` is the event's raw fs epoch;
+  /// each admitted subscriber's delivery is stamped `epoch_base + raw` via
+  /// [`stamp`](Self::stamp), advancing that subscriber's high-water. Stamping runs
+  /// *after* admission, so a filtered-out delivery never perturbs a subscription's
+  /// epoch space.
   ///
-  /// The two closures keep this shared between production and the pure test without
-  /// touching the [`RoutableEvent`] seam: `sub_of` recovers the [`Subscription`] a
-  /// [`fan_out`](crate::route::fan_out) delivery belongs to, and `stamp_into` binds
-  /// the computed stamp onto that delivery. Production's `Delivered` is
-  /// [`crate::Event`] (`sub_of` = its `subscription()`, `stamp_into` sets its epoch);
-  /// the test's is the raw [`Subscription`] (`stamp_into` pairs it with the stamp),
-  /// so routing + rebasing is exercised without the private fs event constructor.
+  /// The closures keep this shared between production and the pure test without
+  /// touching the [`RoutableEvent`] seam: `admits` is the fan-out filter gate,
+  /// `sub_of` recovers the [`Subscription`] a [`fan_out`](crate::route::fan_out)
+  /// delivery belongs to, and `stamp_into` binds the computed stamp onto that
+  /// delivery. Production's `Delivered` is [`crate::Event`] (`admits` consults the
+  /// subscription's [`Filter`](crate::Filter), `sub_of` = its `subscription()`,
+  /// `stamp_into` sets its epoch); the test's is the raw [`Subscription`] (`admits`
+  /// applies a fake predicate, `stamp_into` pairs it with the stamp), so routing +
+  /// filtering + rebasing is exercised without the private fs event constructor.
+  #[allow(clippy::too_many_arguments)]
   pub(crate) fn stamp_and_fan_out<'a, E, D>(
     &mut self,
     event: &E,
     raw: Epoch,
     entry: &RootEntry,
     canonical_of: impl Fn(Subscription) -> Option<&'a Path>,
+    admits: impl Fn(Subscription, &E::Delivered) -> bool,
     sub_of: impl Fn(&E::Delivered) -> Subscription,
     stamp_into: impl Fn(E::Delivered, Epoch) -> D,
   ) -> Vec<D>
   where
     E: RoutableEvent,
   {
-    fan_out(event, entry, canonical_of)
+    fan_out(event, entry, canonical_of, admits)
       .into_iter()
       .map(|delivered| {
         let stamp = self.stamp(sub_of(&delivered), raw);
