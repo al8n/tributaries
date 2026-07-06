@@ -2,25 +2,37 @@ use core::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use tributary_fs::Epoch;
-use tributary_proto::{Interest, ScopeId};
+use tributary_proto::ScopeId;
 
 use super::EpochLedger;
 use crate::{route::RoutableEvent, subscription::Subscription, subsume::RootEntry};
 
 /// A minimal stand-in for a raw event — the same shape `route::tests` uses, so the
 /// ledger's fan-out + stamp is exercised without the private `tributary_fs::Event`
-/// constructor. Routing reads only its path and whether it is a `Rescan`; its
-/// per-subscriber delivery is just the [`Subscription`], which the ledger then
-/// stamps.
+/// constructor. Routing reads its endpoint paths and whether it is a `Rescan`; its
+/// per-subscriber delivery is the [`Subscription`] paired with which projection it got,
+/// which the ledger then stamps — so a move test can confirm every projection of one
+/// raw move carries that subscriber's stamp.
 struct FakeEvent {
   path: PathBuf,
+  from: Option<PathBuf>,
   rescan: bool,
+}
+
+/// Which projection a subscriber received (mirrors `route::tests`), so a move test can
+/// assert the stamp lands on the right projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+  Whole,
+  MoveOut,
+  MoveIn,
 }
 
 impl FakeEvent {
   fn change(path: &str) -> Self {
     Self {
       path: PathBuf::from(path),
+      from: None,
       rescan: false,
     }
   }
@@ -28,24 +40,45 @@ impl FakeEvent {
   fn rescan(path: &str) -> Self {
     Self {
       path: PathBuf::from(path),
+      from: None,
       rescan: true,
+    }
+  }
+
+  fn moved(from: &str, to: &str) -> Self {
+    Self {
+      path: PathBuf::from(to),
+      from: Some(PathBuf::from(from)),
+      rescan: false,
     }
   }
 }
 
 impl RoutableEvent for FakeEvent {
-  type Delivered = Subscription;
+  type Delivered = (Subscription, Projection);
 
   fn path(&self) -> &Path {
     self.path.as_path()
+  }
+
+  fn move_from(&self) -> Option<&Path> {
+    self.from.as_deref()
   }
 
   fn is_rescan(&self) -> bool {
     self.rescan
   }
 
-  fn deliver(&self, sub: Subscription) -> Subscription {
-    sub
+  fn deliver(&self, sub: Subscription) -> (Subscription, Projection) {
+    (sub, Projection::Whole)
+  }
+
+  fn deliver_move_out(&self, sub: Subscription) -> (Subscription, Projection) {
+    (sub, Projection::MoveOut)
+  }
+
+  fn deliver_move_in(&self, sub: Subscription) -> (Subscription, Projection) {
+    (sub, Projection::MoveIn)
   }
 }
 
@@ -72,7 +105,6 @@ impl Fixture {
     Self {
       entry: RootEntry {
         path: PathBuf::from(root_path),
-        interest: Interest::all(),
         subscribers: subs,
       },
       paths,
@@ -95,6 +127,21 @@ impl Fixture {
     event: &FakeEvent,
     raw: Epoch,
   ) -> Vec<(Subscription, Epoch)> {
+    self
+      .deliver_projected(ledger, event, raw)
+      .into_iter()
+      .map(|(s, _projection, stamp)| (s, stamp))
+      .collect()
+  }
+
+  /// Like [`deliver`](Self::deliver) but also returns each delivery's projection, so a
+  /// move test can assert the stamp lands on the right per-endpoint projection.
+  fn deliver_projected(
+    &self,
+    ledger: &mut EpochLedger,
+    event: &FakeEvent,
+    raw: Epoch,
+  ) -> Vec<(Subscription, Projection, Epoch)> {
     ledger.stamp_and_fan_out(
       event,
       raw,
@@ -103,8 +150,8 @@ impl Fixture {
       // These tests exercise coverage + epoch rebasing, not the filter, so admit
       // every covered delivery (the filter gate is covered in `route::tests`).
       |_sub, _delivered| true,
-      |s| *s,
-      |s, stamp| (s, stamp),
+      |(s, _projection)| *s,
+      |(s, projection), stamp| (s, projection, stamp),
     )
   }
 }
@@ -307,4 +354,39 @@ fn fs_rescan_is_stamped_and_dominates_prior_stream() {
     stamp_of(s1).unwrap() > Epoch::new(1),
     "the fs Rescan's stamp dominates /a's prior stream"
   );
+}
+
+/// Every projection of one raw move carries its subscriber's umbrella stamp (design
+/// §5/§8): a move between sibling subs yields a Removed for the source-sub and a
+/// Created for the dest-sub, and each is stamped in that subscriber's own epoch space —
+/// not the raw fs epoch, and not skipped.
+#[test]
+fn move_decomposition_stamps_each_projection() {
+  let mut ledger = EpochLedger::new();
+  let (s1, s2) = (sub(1), sub(2));
+  // Two sibling subs on one root, at different high-waters so their stamps differ.
+  let fx = Fixture::new("/a", &[(1, "/a/src"), (2, "/a/dst")]);
+  fx.deliver(&mut ledger, &FakeEvent::change("/a/src/x"), Epoch::new(3)); // s1 hw = 3
+  fx.deliver(&mut ledger, &FakeEvent::change("/a/dst/x"), Epoch::new(1)); // s2 hw = 1
+
+  // A move /a/src/f -> /a/dst/f at raw fs epoch 4: source-sub gets a stamped Removed,
+  // dest-sub a stamped Created.
+  let out = fx.deliver_projected(
+    &mut ledger,
+    &FakeEvent::moved("/a/src/f", "/a/dst/f"),
+    Epoch::new(4),
+  );
+  let find = |who: Subscription| out.iter().find(|(s, _, _)| *s == who).copied();
+
+  let (_, p1, e1) = find(s1).expect("the source-sub is served");
+  assert_eq!(
+    p1,
+    Projection::MoveOut,
+    "source-sub gets the move-out Removed"
+  );
+  assert_eq!(e1, Epoch::new(4), "…stamped in s1's space (base 0 + raw 4)");
+
+  let (_, p2, e2) = find(s2).expect("the dest-sub is served");
+  assert_eq!(p2, Projection::MoveIn, "dest-sub gets the move-in Created");
+  assert_eq!(e2, Epoch::new(4), "…stamped in s2's space (base 0 + raw 4)");
 }

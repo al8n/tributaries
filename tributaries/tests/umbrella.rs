@@ -290,6 +290,75 @@ async fn debounced_burst_coalesces() {
   w.close().await.expect("close");
 }
 
+/// A move decomposes per subscriber by two-endpoint coverage (design §5): a rename
+/// within an outer watched root, between two nested subscriptions, delivers the
+/// source-only subscription a `Removed(from)` (it saw the file leave its tree) and the
+/// destination-only subscription a `Created(to)` (it saw the file arrive) — while the
+/// outer subscription covering both endpoints sees the move itself. The source-only
+/// subscription learning the file left is exactly the move-out the pre-fix fan-out
+/// silently dropped (it tested only the destination path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_decomposes_across_sibling_subscriptions() {
+  let (_dir, root) = scratch("move");
+  let src = root.join("src");
+  let dst = root.join("dst");
+  std::fs::create_dir_all(&src).expect("create src");
+  std::fs::create_dir_all(&dst).expect("create dst");
+
+  let mut w = watcher(TributariesOptions::new());
+
+  // The outer root covers BOTH endpoints; two nested subs each cover ONE. All three are
+  // subsumed onto the single /root kernel watch, so the one rename fans out to all.
+  let _outer = w
+    .watch(&root, Interest::all(), Filter::all())
+    .await
+    .expect("watch outer root");
+  let src_sub = w
+    .watch(&src, Interest::all(), Filter::all())
+    .await
+    .expect("watch src subtree");
+  let dst_sub = w
+    .watch(&dst, Interest::all(), Filter::all())
+    .await
+    .expect("watch dst subtree");
+
+  // Create then rename a file from src/ to dst/ — a within-root move.
+  let from = src.join("f.txt");
+  let to = dst.join("f.txt");
+  std::fs::write(&from, b"payload").expect("write source file");
+  // Let the create settle so the rename is observed as a move, not folded into create.
+  let _ = wait_for(&mut w, |e| e.subscription() == src_sub && reaches(e, &from)).await;
+  std::fs::rename(&from, &to).expect("rename src -> dst");
+
+  // The source-only subscription must observe the file LEFT its tree: a Removed at the
+  // source (the move-out projection), or a coverage-loss Rescan. It must NOT be silently
+  // skipped — the core assertion of the move-out fix.
+  let src_saw_departure = wait_for(&mut w, |e| {
+    e.subscription() == src_sub && (e.kind().is_removed() || e.is_rescan()) && reaches(e, &from)
+  })
+  .await;
+  assert!(
+    src_saw_departure.is_some(),
+    "the source-only subscription learns the file left its tree (move-out Removed) — \
+     never silently dropped"
+  );
+
+  // The destination-only subscription must observe the file ARRIVED: a Created at the
+  // destination (the move-in projection), or a Rescan.
+  let dst_saw_arrival = wait_for(&mut w, |e| {
+    e.subscription() == dst_sub
+      && (e.kind().is_created() || e.kind().is_modified() || e.is_rescan())
+      && reaches(e, &to)
+  })
+  .await;
+  assert!(
+    dst_saw_arrival.is_some(),
+    "the destination-only subscription sees the file arrive (move-in Created)"
+  );
+
+  w.close().await.expect("close");
+}
+
 /// A coverage-loss `Rescan` reaches EVERY subscriber of the affected root (design §8).
 /// Deleting the watched root surfaces its terminal `Rescan` (or `Removed`) to every
 /// subscription of that root, bypassing coverage narrowing.

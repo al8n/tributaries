@@ -4,16 +4,39 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use tributary_proto::{Interest, ScopeId};
+use tributary_proto::ScopeId;
 
 use super::{RootEntry, RoutableEvent, Subscription, fan_out};
 
-/// A minimal stand-in for a raw event: routing reads only its path and whether it
-/// is a `Rescan`. Its delivery is just the `Subscription` it was routed to, so a
-/// test asserts on the *set of covered subscribers* without touching the private
-/// `tributary_fs::Event` constructor.
+/// Which projection a subscriber received for one raw event — the four move
+/// decompositions (design §5) plus the whole delivery for a non-move / Rescan. Carried
+/// on the fake `Delivered` so a test can assert *which* projection each covering
+/// subscriber got, not merely that it was covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+  /// The event as-is: a non-move change, a Rescan, or a both-covering Moved.
+  Whole,
+  /// The synthesized move-out `Removed(from)` (source-only coverage).
+  MoveOut,
+  /// The synthesized move-in `Created(to)` (destination-only coverage).
+  MoveIn,
+}
+
+/// A fake delivery: the subscriber it was routed to and the projection it received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Delivered {
+  sub: Subscription,
+  projection: Projection,
+}
+
+/// A minimal stand-in for a raw event: routing reads its endpoint paths and whether it
+/// is a `Rescan`. Its delivery records the subscriber and which projection it got, so a
+/// test asserts the covered set **and** each move decomposition without touching the
+/// private `tributary_fs::Event` constructor. A `Some(from)` makes it a move whose
+/// destination is `path`.
 struct FakeEvent {
   path: PathBuf,
+  from: Option<PathBuf>,
   rescan: bool,
 }
 
@@ -21,6 +44,7 @@ impl FakeEvent {
   fn change(path: &str) -> Self {
     Self {
       path: PathBuf::from(path),
+      from: None,
       rescan: false,
     }
   }
@@ -28,24 +52,55 @@ impl FakeEvent {
   fn rescan(path: &str) -> Self {
     Self {
       path: PathBuf::from(path),
+      from: None,
       rescan: true,
+    }
+  }
+
+  /// A move from `from` to `to` (the destination is `path`).
+  fn moved(from: &str, to: &str) -> Self {
+    Self {
+      path: PathBuf::from(to),
+      from: Some(PathBuf::from(from)),
+      rescan: false,
     }
   }
 }
 
 impl RoutableEvent for FakeEvent {
-  type Delivered = Subscription;
+  type Delivered = Delivered;
 
   fn path(&self) -> &Path {
     self.path.as_path()
+  }
+
+  fn move_from(&self) -> Option<&Path> {
+    self.from.as_deref()
   }
 
   fn is_rescan(&self) -> bool {
     self.rescan
   }
 
-  fn deliver(&self, sub: Subscription) -> Subscription {
-    sub
+  fn deliver(&self, sub: Subscription) -> Delivered {
+    Delivered {
+      sub,
+      projection: Projection::Whole,
+    }
+  }
+
+  fn deliver_move_out(&self, sub: Subscription) -> Delivered {
+    Delivered {
+      sub,
+      projection: Projection::MoveOut,
+    }
+  }
+
+  fn deliver_move_in(&self, sub: Subscription) -> Delivered {
+    Delivered {
+      sub,
+      projection: Projection::MoveIn,
+    }
   }
 }
 
@@ -70,7 +125,6 @@ impl Fixture {
     Self {
       entry: RootEntry {
         path: PathBuf::from(root_path),
-        interest: Interest::all(),
         subscribers: subs,
       },
       paths,
@@ -81,9 +135,9 @@ impl Fixture {
     Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
   }
 
-  /// The subscribers `event` fans out to, with every subscriber's filter admitting
-  /// (so this isolates the coverage/Rescan logic from the filter gate).
-  fn route(&self, event: &FakeEvent) -> Vec<Subscription> {
+  /// The full deliveries `event` fans out to (subscriber + projection), every
+  /// subscriber's gate admitting — the move-decomposition assertions read this.
+  fn route_full(&self, event: &FakeEvent) -> Vec<Delivered> {
     fan_out(
       event,
       &self.entry,
@@ -92,12 +146,19 @@ impl Fixture {
     )
   }
 
+  /// The subscribers `event` fans out to, with every subscriber's gate admitting (so
+  /// this isolates the coverage/Rescan logic from the filter/interest gate).
+  fn route(&self, event: &FakeEvent) -> Vec<Subscription> {
+    self.route_full(event).into_iter().map(|d| d.sub).collect()
+  }
+
   /// The subscribers `event` fans out to, admitting a delivery only when `admits`
-  /// returns `true` for its `(subscription, delivered)` — the filter gate under test.
+  /// returns `true` for its `(subscription, delivered)` — the filter/interest gate
+  /// under test (it sees the *projected* delivery).
   fn route_filtered(
     &self,
     event: &FakeEvent,
-    admits: impl Fn(Subscription, &Subscription) -> bool,
+    admits: impl Fn(Subscription, &Delivered) -> bool,
   ) -> Vec<Subscription> {
     fan_out(
       event,
@@ -105,6 +166,9 @@ impl Fixture {
       |sub| self.paths.get(&sub).map(PathBuf::as_path),
       admits,
     )
+    .into_iter()
+    .map(|d| d.sub)
+    .collect()
   }
 }
 
@@ -232,5 +296,125 @@ fn rescan_bypasses_the_filter() {
     admitted,
     vec![fx.sub(1), fx.sub(2)],
     "a Rescan bypasses the filter and reaches every subscriber"
+  );
+}
+
+// -------------------------------------------------------------------------------
+// Moved decomposition (design §5): a move has two endpoints; each subscriber gets
+// exactly one projection from its two-endpoint coverage.
+// -------------------------------------------------------------------------------
+
+/// The projection each subscriber received, as `(id, Projection)` pairs, so a move
+/// test asserts the per-subscriber decomposition directly.
+fn projections(fx: &Fixture, event: &FakeEvent) -> Vec<(u64, Projection)> {
+  fx.route_full(event)
+    .into_iter()
+    .map(|d| (d.sub.id().as_u64(), d.projection))
+    .collect()
+}
+
+/// A subscription covering only the move SOURCE gets a move-out `Removed(from)` — it
+/// must learn the file left its tree, even though the destination is outside its watch.
+/// (The pre-fix bug tested only the destination path, so a source-only sub silently
+/// missed the move entirely.)
+#[test]
+fn move_out_delivers_removed_to_source_only_sub() {
+  // Root /a; the sub watches only /a/src. A move /a/src/f -> /a/dst/f: it covers the
+  // source, not the destination.
+  let fx = Fixture::new("/a", &[(1, "/a/src")]);
+  let out = projections(&fx, &FakeEvent::moved("/a/src/f", "/a/dst/f"));
+  assert_eq!(
+    out,
+    vec![(1, Projection::MoveOut)],
+    "a source-only sub gets the move-out Removed(from) — never silently skipped"
+  );
+}
+
+/// A subscription covering only the move DESTINATION gets a move-in `Created(to)` — the
+/// file arrived from outside its watch.
+#[test]
+fn move_in_delivers_created_to_dest_only_sub() {
+  let fx = Fixture::new("/a", &[(1, "/a/dst")]);
+  let out = projections(&fx, &FakeEvent::moved("/a/src/f", "/a/dst/f"));
+  assert_eq!(
+    out,
+    vec![(1, Projection::MoveIn)],
+    "a destination-only sub gets the move-in Created(to)"
+  );
+}
+
+/// A subscription covering BOTH endpoints gets exactly one whole `Moved` — never also a
+/// Removed/Created (structural dedup).
+#[test]
+fn move_within_one_sub_delivers_one_moved() {
+  // The sub watches all of /a, covering both /a/src/f and /a/dst/f.
+  let fx = Fixture::new("/a", &[(1, "/a")]);
+  let out = projections(&fx, &FakeEvent::moved("/a/src/f", "/a/dst/f"));
+  assert_eq!(
+    out,
+    vec![(1, Projection::Whole)],
+    "a both-covering sub gets exactly one whole Moved — dedup, no extra Removed/Created"
+  );
+}
+
+/// A move between two SIBLING subscriptions decomposes per subscriber: the source-sub
+/// gets a Removed, the dest-sub gets a Created — each sees its own side of the move.
+#[test]
+fn move_between_sibling_subs() {
+  // Root /a carries two sibling subs: /a/src and /a/dst.
+  let fx = Fixture::new("/a", &[(1, "/a/src"), (2, "/a/dst")]);
+  let out = projections(&fx, &FakeEvent::moved("/a/src/f", "/a/dst/f"));
+  assert_eq!(
+    out,
+    vec![(1, Projection::MoveOut), (2, Projection::MoveIn)],
+    "the source-sub gets a Removed, the dest-sub a Created"
+  );
+}
+
+/// A subscription covering NEITHER endpoint of a move gets nothing.
+#[test]
+fn move_covering_neither_endpoint_delivers_nothing() {
+  let fx = Fixture::new("/a", &[(1, "/a/other")]);
+  let out = projections(&fx, &FakeEvent::moved("/a/src/f", "/a/dst/f"));
+  assert!(
+    out.is_empty(),
+    "a sub covering neither endpoint gets nothing"
+  );
+}
+
+/// Dedup across a mixed subscriber set: one both-covering sub gets exactly one Moved,
+/// while narrower siblings get their single-endpoint projection — no duplicate for the
+/// both-coverer.
+#[test]
+fn move_dedup_both_covering_sub_gets_exactly_one_moved() {
+  // /a covers both endpoints; /a/src covers only the source; /a/dst only the dest.
+  let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/src"), (3, "/a/dst")]);
+  let out = projections(&fx, &FakeEvent::moved("/a/src/f", "/a/dst/f"));
+  assert_eq!(
+    out,
+    vec![
+      (1, Projection::Whole), // both endpoints → one Moved, never also Removed/Created
+      (2, Projection::MoveOut), // source only → Removed
+      (3, Projection::MoveIn), // dest only → Created
+    ],
+    "the both-covering sub gets exactly one Moved; siblings get their one-sided projection"
+  );
+}
+
+/// The filter/interest gate sees the *projected* delivery, so it can gate a move-out
+/// and a move-in independently by their projected kind (a sub with `removed` interest
+/// keeps a move-out but a `created`-only one would drop it). Here the gate rejects the
+/// move-out projection specifically, proving the projection is minted before the gate.
+#[test]
+fn move_projection_is_gated_by_the_projected_kind() {
+  let fx = Fixture::new("/a", &[(1, "/a/src"), (2, "/a/dst")]);
+  // Admit everything EXCEPT the move-out projection (as a `created`-only interest would).
+  let admitted = fx.route_filtered(&FakeEvent::moved("/a/src/f", "/a/dst/f"), |_sub, d| {
+    d.projection != Projection::MoveOut
+  });
+  assert_eq!(
+    admitted,
+    vec![fx.sub(2)],
+    "the gate drops the move-out projection; the move-in still reaches the dest-sub"
   );
 }

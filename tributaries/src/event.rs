@@ -129,6 +129,63 @@ impl Event {
     }
   }
 
+  /// Mints the **move-out** projection of a real `tributary-fs` move for
+  /// `subscription`: a synthesized [`Removed`](EventKind::Removed) at the move's
+  /// source (design §5).
+  ///
+  /// A subscriber covering only the source of a rename must learn the file **left**
+  /// its tree; it cannot see the destination (outside its watch), so the move is
+  /// projected down to a plain `Removed(from)`. The event is minted through the
+  /// [`Synthetic`] wrapper — the umbrella never fabricates fs vocabulary — carrying
+  /// the source path and its root-relative location, reconstructed from `event`.
+  ///
+  /// The epoch is seeded from the wrapped event's raw fs epoch as a provisional
+  /// stamp; the driver rebases it into `subscription`'s monotone space via
+  /// [`set_epoch`](Self::set_epoch) before delivery (design §8), exactly as for a
+  /// whole delivery.
+  pub(crate) fn move_out(subscription: Subscription, event: &FsEvent) -> Self {
+    let from = event
+      .kind()
+      .moved()
+      .expect("move_out is only minted for a Moved event")
+      .from()
+      .to_path_buf();
+    let location = source_location(event);
+    Self {
+      subscription,
+      epoch: event.epoch(),
+      inner: Inner::Synthetic(Synthetic {
+        path: from,
+        location,
+        kind: EventKind::Removed,
+        from: None,
+      }),
+    }
+  }
+
+  /// Mints the **move-in** projection of a real `tributary-fs` move for
+  /// `subscription`: a synthesized [`Created`](EventKind::Created) at the move's
+  /// destination (design §5).
+  ///
+  /// A subscriber covering only the destination of a rename must learn the file
+  /// **arrived** in its tree from outside its watch; it cannot see the source, so the
+  /// move is projected down to a plain `Created(to)`. The destination path and
+  /// location are the wrapped event's own [`path`](FsEvent::path) /
+  /// [`location`](FsEvent::location). The epoch is provisional (see
+  /// [`move_out`](Self::move_out)); the driver rebases it (design §8).
+  pub(crate) fn move_in(subscription: Subscription, event: &FsEvent) -> Self {
+    Self {
+      subscription,
+      epoch: event.epoch(),
+      inner: Inner::Synthetic(Synthetic {
+        path: event.path().to_path_buf(),
+        location: event.location().clone(),
+        kind: EventKind::Created,
+        from: None,
+      }),
+    }
+  }
+
   /// Mints a synthetic event of an arbitrary `kind` at `location` under `path`,
   /// stamped `epoch`, for `subscription`.
   ///
@@ -298,5 +355,43 @@ impl Event {
       Inner::Fs(event) => event.kind().moved().map(MovedEvent::from),
       Inner::Synthetic(synthetic) => synthetic.from.as_deref(),
     }
+  }
+}
+
+/// Reconstructs the root-relative [`Location`] of a move's **source** from its fs
+/// event, for the synthesized move-out [`Removed`](EventKind::Removed) (design §5).
+///
+/// `tributary-fs` reports a move's destination location but not its source's, and it
+/// exposes the source only as an absolute path (`MovedEvent::from`). The watched root
+/// path is recoverable without any I/O: the destination absolute path is the root
+/// joined with the destination location, so stripping the destination location's
+/// trailing components off it yields the root; the source location is then the source
+/// path relative to that root. A real within-root move has both endpoints under the
+/// root, so this strip always succeeds; if it somehow cannot (a malformed pairing),
+/// the empty (root-anchored) location is a safe, non-panicking fallback — `path()`
+/// (the absolute source) remains authoritative for coverage and coalescing.
+fn source_location(event: &FsEvent) -> Location {
+  let dest = event.path();
+  let dest_depth = event.location().len();
+  // The root is the destination path minus the destination location's own components.
+  let mut root = dest;
+  for _ in 0..dest_depth {
+    match root.parent() {
+      Some(parent) => root = parent,
+      None => return Location::new(),
+    }
+  }
+  let from = event
+    .kind()
+    .moved()
+    .map(MovedEvent::from)
+    .unwrap_or_else(|| Path::new(""));
+  match from.strip_prefix(root) {
+    Ok(rel) => Location::from_segments(
+      rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(tributary_fs::Segment::new)),
+    ),
+    Err(_) => Location::new(),
   }
 }

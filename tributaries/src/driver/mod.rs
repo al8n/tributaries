@@ -57,6 +57,11 @@ pub(crate) trait RootArmer {
     interest: Interest,
   ) -> impl Future<Output = Result<Self::Handle, WatchError>>;
 
+  /// The **authoritative canonical path** fs recorded for `handle` (the umbrella keys
+  /// its subsumption index off this, not off its own provisional canonicalization —
+  /// design §4, the TOCTOU close). `None` once the handle no longer names a live root.
+  fn root_path(&self, handle: Self::Handle) -> Option<std::path::PathBuf>;
+
   /// Releases the kernel watch named by `handle`.
   fn disarm(&self, handle: Self::Handle) -> impl Future<Output = Result<(), UnwatchError>>;
 }
@@ -66,6 +71,10 @@ impl<R: RuntimeLite> RootArmer for Watcher<R> {
 
   async fn arm(&self, path: &Path, interest: Interest) -> Result<RootHandle, WatchError> {
     Ok(self.watch(path.to_path_buf(), interest).await?)
+  }
+
+  fn root_path(&self, handle: RootHandle) -> Option<std::path::PathBuf> {
+    Watcher::root_path(self, handle)
   }
 
   async fn disarm(&self, handle: RootHandle) -> Result<(), UnwatchError> {
@@ -232,12 +241,16 @@ impl<R: RuntimeLite> Tributaries<R> {
     match self.subsumer.plan_unwatch(sub) {
       None => Err(UnwatchError::UnknownSubscription),
       Some(UnwatchOutcome::Dropped) => {
-        // The subscription is gone; drop its filter so the map tracks only live subs.
+        // The subscription is gone; drop its per-sub state (filter + epoch ledger) so
+        // both maps track only live subs — an unwatch must reclaim the epoch base and
+        // high-water too, or a watch → repoint → unwatch churn leaks them unbounded.
         self.filters.remove(&sub);
+        self.epochs.remove(sub);
         Ok(())
       }
       Some(UnwatchOutcome::RootEmptied { fs_root }) => {
         self.filters.remove(&sub);
+        self.epochs.remove(sub);
         self.watcher.disarm(fs_root).await
       }
     }
@@ -338,13 +351,20 @@ impl<R: RuntimeLite> Tributaries<R> {
     }
   }
 
-  /// Resolves one raw event's root and fans it out to every covering, filter-admitting
+  /// Resolves one raw event's root and fans it out to every covering, admitting
   /// subscriber, stamping each delivery in that subscriber's own monotone epoch space
   /// (design §5/§7/§8). An event whose root has no live entry (its subscription(s) were
   /// dropped between the kernel emitting it and us routing it) fans out to nothing.
+  ///
+  /// A [`Moved`](tributary_fs::EventKind::Moved) is decomposed per subscriber inside
+  /// [`fan_out`](crate::route::fan_out) (both endpoints → the whole move; source only →
+  /// a synthesized `Removed`; destination only → a synthesized `Created`), and the
+  /// filter + interest gate below runs against that already-projected delivery — so a
+  /// move-out is gated by `removed` interest, a move-in by `created`, a whole move by
+  /// `moved`.
   fn fan_out_raw(&mut self, raw: &tributary_fs::Event) -> Vec<Event> {
-    // Disjoint field borrows: `subsumer` resolves the root/coverage, `filters` the
-    // per-subscription admission gate, `epochs` owns the per-subscription stamp state.
+    // Disjoint field borrows: `subsumer` resolves the root/coverage/interest, `filters`
+    // the per-subscription filter, `epochs` owns the per-subscription stamp state.
     let (subsumer, filters, epochs) = (&self.subsumer, &self.filters, &mut self.epochs);
     let Some(entry) = subsumer.entry(raw.root()) else {
       return Vec::new();
@@ -358,11 +378,19 @@ impl<R: RuntimeLite> Tributaries<R> {
       raw_epoch,
       entry,
       |sub| subsumer.subscription_path(sub),
-      // The filter admission gate (design §7): a covered non-`Rescan` delivery is kept
-      // only if the subscription's filter admits it. A subscription with no recorded
-      // filter (raced concurrent drop) admits nothing — it is no longer live. A
-      // `Rescan` never reaches here (fan_out bypasses the filter for it).
-      |sub, event: &Event| filters.get(&sub).is_some_and(|filter| filter.admits(event)),
+      // The admission gate (design §5/§7): a covered non-`Rescan` projection is kept
+      // only if the subscription's **interest** admits its (projected) kind AND its
+      // **filter** admits it. Interest is a pure fan-out gate here because every root is
+      // armed `Interest::all` (design §4) — the root always carries the kind, delivery
+      // narrows it. A subscription with no recorded interest/filter (raced concurrent
+      // drop) admits nothing — no longer live. A `Rescan` never reaches here (fan_out
+      // bypasses both gates for it).
+      |sub, event: &Event| {
+        subsumer
+          .subscription_interest(sub)
+          .is_some_and(|interest| interest_admits(interest, event.kind()))
+          && filters.get(&sub).is_some_and(|filter| filter.admits(event))
+      },
       Event::subscription,
       |mut event, stamp| {
         event.set_epoch(stamp);
@@ -385,7 +413,21 @@ impl<R: RuntimeLite> Tributaries<R> {
 
 /// Plans and applies one `watch` against `armer`, threading the outcome through the
 /// sans-I/O [`Subsumer`]. Factored out of [`Tributaries::watch`] so the widen
-/// ordering and the arm-failure unwind are testable with a fake [`RootArmer`].
+/// ordering, the arm-failure unwind, and the fs-canonical re-key are testable with a
+/// fake [`RootArmer`].
+///
+/// **Roots are always armed [`Interest::all`]** (design §4): the kernel watch never
+/// narrows what it collects, so a covered/subsumed subscription can ask for any kind
+/// and the root already carries it (interest becomes a pure fan-out gate, §5). The
+/// caller's `interest` is recorded on the subscription (for that gate), not passed to
+/// the arm.
+///
+/// **The committed key is fs's, not the umbrella's** (design §4, TOCTOU close): after
+/// arming, the fs-authoritative canonical path is read from
+/// [`RootArmer::root_path`] and used as the subsumption key, so events (which are
+/// fs-canonical) always route. If that path diverges from the plan in a way that
+/// changes subsumption, the just-armed root is disarmed and the watch aborts cleanly
+/// rather than committing a mis-keyed or overlapping entry.
 ///
 /// The ordering contract (design §4): on a widen, arm the new wider root **before**
 /// releasing the subsumed roots, so coverage never gaps. If any arm fails the plan
@@ -403,32 +445,37 @@ async fn apply_watch<A: RootArmer>(
   let outcome = subsumer.plan_watch(canonical, interest);
   match &outcome {
     WatchOutcome::Covered { fs_root, sub } => {
-      // Already covered by a live root: no kernel call, just adopt the sub.
+      // Already covered by a live (Interest::all-armed) root: no kernel call. The
+      // covering root's fs path was validated when it was first armed, so the
+      // newcomer's provisional canonical path is used unchanged (commit ignores the
+      // fs-path arg for Covered).
       let (fs_root, sub) = (*fs_root, *sub);
-      subsumer.commit_watch(&outcome, fs_root);
+      subsumer.commit_watch(&outcome, fs_root, canonical);
       Ok(sub)
     }
-    WatchOutcome::Disjoint {
-      root_path,
-      interest,
-      sub,
-    } => {
+    WatchOutcome::Disjoint { root_path, sub } => {
       let sub = *sub;
-      match armer.arm(root_path, *interest).await {
-        Ok(fs_root) => {
-          subsumer.commit_watch(&outcome, fs_root);
-          Ok(sub)
-        }
+      let fs_root = match armer.arm(root_path, Interest::all()).await {
+        Ok(fs_root) => fs_root,
         Err(err) => {
           // Arm failed: abandon the plan so its pending reservation cannot leak.
           subsumer.abort_watch(&outcome);
-          Err(err)
+          return Err(err);
         }
+      };
+      // Re-key onto fs's authoritative canonical path (design §4). If it diverges in a
+      // way that changes subsumption, disarm and abort cleanly — no mis-keyed entry.
+      let fs_path = fs_canonical_root(armer, fs_root, root_path);
+      if !subsumer.fs_path_preserves_plan(&fs_path, &[]) {
+        let _ = armer.disarm(fs_root).await;
+        subsumer.abort_watch(&outcome);
+        return Err(canonical_race(root_path, &fs_path));
       }
+      subsumer.commit_watch(&outcome, fs_root, &fs_path);
+      Ok(sub)
     }
     WatchOutcome::Widen {
       new_root_path,
-      union_interest,
       repointed,
       unwatch,
       sub,
@@ -436,7 +483,7 @@ async fn apply_watch<A: RootArmer>(
       let sub = *sub;
       // Watch-new-before-unwatch-old (design §4): arm the wider root FIRST, so
       // coverage never gaps in the window where both are briefly armed.
-      let fs_root = match armer.arm(new_root_path, *union_interest).await {
+      let fs_root = match armer.arm(new_root_path, Interest::all()).await {
         Ok(fs_root) => fs_root,
         Err(err) => {
           // The wider root never came up: abandon the plan, leaving the subsumed
@@ -445,12 +492,22 @@ async fn apply_watch<A: RootArmer>(
           return Err(err);
         }
       };
+      // Re-key onto fs's authoritative canonical path (design §4). A divergence that
+      // changes which roots this widens over (or makes it covered) invalidates the
+      // plan: disarm the just-armed wider root, leave the subsumed roots untouched,
+      // and abort cleanly.
+      let fs_path = fs_canonical_root(armer, fs_root, new_root_path);
+      if !subsumer.fs_path_preserves_plan(&fs_path, unwatch) {
+        let _ = armer.disarm(fs_root).await;
+        subsumer.abort_watch(&outcome);
+        return Err(canonical_race(new_root_path, &fs_path));
+      }
 
       // The wider root is live and adopts every re-pointed subscription — commit
       // the state transition before releasing the old roots so a concurrent event
       // routes against the new entry.
       let repointed = repointed.clone();
-      subsumer.commit_watch(&outcome, fs_root);
+      subsumer.commit_watch(&outcome, fs_root, &fs_path);
 
       // Now release the subsumed roots. A failed disarm is benign: `unwatch` fails
       // only with `UnknownRoot` (the root is already dead) or `Closed` (the watcher
@@ -466,14 +523,66 @@ async fn apply_watch<A: RootArmer>(
       // `epoch_base` to that same value, so the Rescan strictly dominates the
       // subscription's pre-widening stream while the new root's genuine events
       // (raw fs epoch 0, 1, …) stamp to hw.next()+0, +1, … — tie-or-exceeding it
-      // (not dominated). Each subscription rebases from its own high-water.
+      // (not dominated). Each subscription rebases from its own high-water. The Rescan
+      // names fs's canonical root path, the coordinate the consumer must re-enumerate.
       for moved in repointed {
         let rescan = epochs.repoint(moved);
-        queue.push_back(Event::rescan(moved, new_root_path.clone(), rescan));
+        queue.push_back(Event::rescan(moved, fs_path.clone(), rescan));
       }
 
       Ok(sub)
     }
+  }
+}
+
+/// Whether `interest` subscribes to a delivery of `kind` — the per-subscription
+/// fan-out gate (design §5). Every umbrella root is armed [`Interest::all`], so this
+/// narrows *delivery* only, never the kernel watch (design §4).
+///
+/// A [`Rescan`](tributary_fs::EventKind::Rescan) is always admitted: it is a
+/// coverage-loss signal that bypasses interest (as it bypasses coverage and the
+/// filter) — though in practice a `Rescan` never reaches this gate, since
+/// [`fan_out`](crate::route::fan_out) short-circuits it. An unknown future kind
+/// (the vocabulary is `non_exhaustive`) is admitted conservatively rather than
+/// silently dropped.
+fn interest_admits(interest: Interest, kind: &tributary_fs::EventKind) -> bool {
+  match kind {
+    tributary_fs::EventKind::Created => interest.created(),
+    tributary_fs::EventKind::Modified => interest.modified(),
+    tributary_fs::EventKind::Removed => interest.removed(),
+    tributary_fs::EventKind::Moved(_) => interest.moved(),
+    tributary_fs::EventKind::Rescan => true,
+    _ => true,
+  }
+}
+
+/// The fs-authoritative canonical path for a freshly-armed root (design §4). Falls
+/// back to the planned path if fs cannot report one (the handle raced a teardown) —
+/// the planned path was the best canonicalization available, and a subsequent event
+/// under a now-dead root routes to nothing regardless.
+fn fs_canonical_root<A: RootArmer>(
+  armer: &A,
+  fs_root: A::Handle,
+  planned: &Path,
+) -> std::path::PathBuf {
+  armer
+    .root_path(fs_root)
+    .unwrap_or_else(|| planned.to_path_buf())
+}
+
+/// The error for a canonicalization TOCTOU where fs's reported root path diverged from
+/// the umbrella's provisional one in a way that changes subsumption (design §4). Framed
+/// as a canonicalize failure — it *is* a canonical-coordinate mismatch — carrying the
+/// planned path and the divergent fs path in the message so the cause is legible.
+fn canonical_race(planned: &Path, fs_path: &Path) -> WatchError {
+  WatchError::Canonicalize {
+    path: planned.to_path_buf(),
+    source: std::io::Error::other(format!(
+      "watch root's filesystem-canonical path {} diverged from the planned {} and \
+       changed subsumption; retry the watch",
+      fs_path.display(),
+      planned.display()
+    )),
   }
 }
 
