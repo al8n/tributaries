@@ -38,9 +38,10 @@ mod barrier {
       AttributedBatch, attribute_events,
       inotify::{
         decode::{
-          IN_CREATE, IN_IGNORED, IN_MOVED_FROM, IN_Q_OVERFLOW, InotifyMask, RawInotifyEvent,
+          DecodeOutcome, IN_CREATE, IN_IGNORED, IN_MOVED_FROM, IN_Q_OVERFLOW, InotifyMask,
+          RawInotifyEvent,
         },
-        table::{DrainDecision, WdTable},
+        table::{Attribution, DrainDecision, WdTable},
       },
     },
     transport::TransportState,
@@ -89,6 +90,25 @@ mod barrier {
     table.register(3, watch(1));
     let attributed = attribute_events(records, &mut table);
     forward_capture(attributed, decode_lossy)
+  }
+
+  /// Runs the reader's real `attribute_and_forward` seam — attribute → reset the
+  /// wd-table windows on a decode loss → forward behind the barrier — over `decoded`
+  /// against `table`, capturing what it forwards. Unlike `forward_capture`, the
+  /// on-decode-loss window reset is EXERCISED here (not stubbed), so this is the seam
+  /// the decode-loss stranding regression must go through.
+  fn attribute_forward_capture(table: &mut WdTable, decoded: DecodeOutcome) -> Vec<Sent> {
+    let transport = TransportState::new(8);
+    let sent = std::cell::RefCell::new(Vec::new());
+    super::super::attribute_and_forward(&transport, table, decoded, |msg| {
+      sent.borrow_mut().push(match msg {
+        SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
+        SourceMessage::Overflow(_) => Sent::Overflow,
+        SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
+      });
+      true
+    });
+    sent.into_inner()
   }
 
   /// An `IN_Q_OVERFLOW` sentinel followed by an attributable record: the reader
@@ -224,6 +244,133 @@ mod barrier {
       vec![Sent::Batch(1)],
       "after the overflow reset the reused wd delivers — no permanent Ambiguous livelock"
     );
+  }
+
+  /// THE decode-loss regression (generalizes the overflow reset): a `wd` recycled
+  /// onto a draining tombstone is in the reuse window (`pending_stale_ignored > 0`),
+  /// fencing records to loss. A read whose DECODED TAIL is lossy — a truncated /
+  /// absurd-length record stopped the walk — WITHOUT a decoded stale `IN_IGNORED`
+  /// drops the tail, which may have held the very `IN_IGNORED` the fence was counting
+  /// down. `attribute_and_forward` resets the window on the decode loss (not only on
+  /// an `IN_Q_OVERFLOW` sentinel), so a LATER record on the reused `wd` attributes to
+  /// the new watch and rides a Batch — never fences to Ambiguous FOREVER. Without the
+  /// reset this is the permanent livelock the overflow reset already closed, here for
+  /// a decode-level loss with no overflow marker.
+  #[test]
+  fn decode_loss_during_reuse_window_recovers() {
+    let mut table = WdTable::new();
+    table.register(3, watch(1));
+    assert_eq!(table.begin_drain(watch(1)), DrainDecision::RemoveWd(3));
+    table.register(3, watch(2)); // wd 3 recycled; watch(1)'s IGNORED still queued
+    assert!(
+      matches!(table.attribute(3), Attribution::Ambiguous),
+      "the reuse window fences before the decode loss"
+    );
+
+    // A read whose decoded tail is lossy: the intact prefix carries a record on the
+    // reused wd (fenced), and the dropped tail may hold the stale IGNORED. NO
+    // `IN_Q_OVERFLOW` sentinel is present, so the reset must fire on `decoded.lossy`.
+    let decoded = DecodeOutcome {
+      events: vec![event(3, IN_CREATE, Some(b"stale"))],
+      lossy: true,
+    };
+    assert_eq!(
+      attribute_forward_capture(&mut table, decoded),
+      vec![Sent::Overflow],
+      "the lossy buffer forwards only the covering Overflow"
+    );
+
+    // The stale IGNORED never comes (dropped in the truncated tail). A future record
+    // on the reused wd now attributes to the new watch — the fence did not strand.
+    let live = attribute_events(vec![event(3, IN_CREATE, Some(b"real"))], &mut table);
+    assert_eq!(
+      forward_capture(live, false),
+      vec![Sent::Batch(1)],
+      "after the decode-loss reset the reused wd delivers — no permanent Ambiguous livelock"
+    );
+  }
+
+  /// The critical distinction: the window reset fires on a DECODE loss, NOT on the
+  /// ambiguous-fence loss. A `wd` in the reuse window fences a record to loss
+  /// (`attributed.lost`) with the queue ordering INTACT — the stale `IN_IGNORED` is
+  /// still coming. `attribute_and_forward` over that CLEAN-decode buffer forwards only
+  /// the covering Overflow but must LEAVE the fence up: a later record is STILL
+  /// Ambiguous, and only the stale `IN_IGNORED` — not the fence loss — lifts it.
+  /// Resetting here would clear `pending_stale_ignored` before the stale marker drains
+  /// and mis-attribute the reused wd's OLD records to the new watch (the reuse hole
+  /// the fence exists to prevent).
+  #[test]
+  fn ambiguous_fence_without_decode_loss_does_not_reset() {
+    let mut table = WdTable::new();
+    table.register(3, watch(1));
+    assert_eq!(table.begin_drain(watch(1)), DrainDecision::RemoveWd(3));
+    table.register(3, watch(2)); // wd 3 recycled; watch(1)'s IGNORED still queued
+
+    // A fenced record on a CLEAN decode (`lossy == false`): the buffer is lost via the
+    // ambiguous fence, but the queue ordering is intact.
+    let decoded = DecodeOutcome {
+      events: vec![event(3, IN_CREATE, Some(b"stale"))],
+      lossy: false,
+    };
+    assert_eq!(
+      attribute_forward_capture(&mut table, decoded),
+      vec![Sent::Overflow],
+      "the ambiguous fence forwards only the covering Overflow"
+    );
+
+    // The fence is STILL up — the reset did NOT fire on the ambiguous loss.
+    assert!(
+      matches!(table.attribute(3), Attribution::Ambiguous),
+      "the ambiguous-fence loss must NOT reset the window — the stale IGNORED still owes"
+    );
+
+    // Only the stale IGNORED lifts the fence, and the new watch survives it.
+    assert!(
+      table.on_ignored(3).is_empty(),
+      "the stale IGNORED is absorbed"
+    );
+    match table.attribute(3) {
+      Attribution::Attributed(anchors) => assert_eq!(
+        anchors.to_vec(),
+        vec![watch(2)],
+        "the fence lifts on the stale IGNORED, not on the fence loss — no misattribution"
+      ),
+      Attribution::Ambiguous => panic!("the stale IGNORED should have lifted the fence"),
+    }
+  }
+
+  /// A buffer that is BOTH decode-lossy AND carries an ambiguous-fence record resets:
+  /// the decode loss broke the queue ordering regardless of the fence, so the window
+  /// must not survive it. Decode loss dominates — the reset is gated on
+  /// `decoded.lossy`, true here, so the fence is cleared even though the record was
+  /// also ambiguous.
+  #[test]
+  fn decode_loss_dominates_ambiguous_fence() {
+    let mut table = WdTable::new();
+    table.register(3, watch(1));
+    assert_eq!(table.begin_drain(watch(1)), DrainDecision::RemoveWd(3));
+    table.register(3, watch(2));
+
+    // The record is ambiguous (fenced) AND the decode is lossy.
+    let decoded = DecodeOutcome {
+      events: vec![event(3, IN_CREATE, Some(b"stale"))],
+      lossy: true,
+    };
+    assert_eq!(
+      attribute_forward_capture(&mut table, decoded),
+      vec![Sent::Overflow],
+      "the lossy + ambiguous buffer forwards only the covering Overflow"
+    );
+
+    // Decode loss dominates: the window is cleared, so the reused wd attributes now.
+    match table.attribute(3) {
+      Attribution::Attributed(anchors) => assert_eq!(
+        anchors.to_vec(),
+        vec![watch(2)],
+        "decode loss dominates — the window is reset even though the record was ambiguous"
+      ),
+      Attribution::Ambiguous => panic!("the decode loss must reset the window"),
+    }
   }
 }
 

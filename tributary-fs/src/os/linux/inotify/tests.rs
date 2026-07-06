@@ -384,7 +384,7 @@ mod table {
   /// until the stale `IN_IGNORED` decrements it — but an overflow can DROP that
   /// marker (inotify(7)), so without a reset the fence stays up FOREVER, converting
   /// every future record on the reused `wd` to loss (a permanent livelock under the
-  /// very overflow the covering rescan is meant to heal). `on_overflow` clears the
+  /// very overflow the covering rescan is meant to heal). `on_loss` clears the
   /// window so attribution resumes over the new set.
   #[test]
   fn overflow_clears_a_stuck_reuse_fence() {
@@ -400,7 +400,7 @@ mod table {
 
     // The overflow drops the stale IGNORED the fence was counting down — it will
     // never arrive. The reset clears the window so the fence cannot strand.
-    t.on_overflow();
+    t.on_loss();
     assert_eq!(
       attributed(&t, 7),
       Some(vec![watch(2)]),
@@ -416,7 +416,7 @@ mod table {
   /// A draining tombstone awaits its own `IN_IGNORED` to erase; an overflow can drop
   /// that marker, stranding the tombstone forever (a leak, and a latent trap — a
   /// later reuse of the `wd` would set up a fresh fence for an IGNORED that was
-  /// already dropped). `on_overflow` erases draining tombstones so the `wd` is clean
+  /// already dropped). `on_loss` erases draining tombstones so the `wd` is clean
   /// for the rescan's re-arm.
   #[test]
   fn overflow_resolves_a_draining_tombstone() {
@@ -427,7 +427,7 @@ mod table {
 
     // The overflow may have dropped that IGNORED; the reset erases the tombstone
     // rather than letting it strand.
-    t.on_overflow();
+    t.on_loss();
     assert!(
       !t.contains(7),
       "the draining tombstone is resolved, not stranded"
@@ -461,7 +461,7 @@ mod table {
       "a still-pending stale marker fences even while the entry drains"
     );
 
-    t.on_overflow();
+    t.on_loss();
     assert!(
       !t.contains(7),
       "the overflow clears the pending count and erases the tombstone in one pass"
@@ -478,7 +478,7 @@ mod table {
     t.register(7, watch(1));
     t.alias(7, watch(2));
 
-    t.on_overflow();
+    t.on_loss();
     assert_eq!(
       attributed(&t, 7),
       Some(vec![watch(1), watch(2)]),
@@ -489,23 +489,25 @@ mod table {
     assert!(!t.contains(7));
   }
 
-  /// Overflow specificity: the reset is triggered ONLY by an `IN_Q_OVERFLOW`. A
-  /// reuse fence left untouched by any overflow still fences until its stale IGNORED
-  /// drains normally — the non-overflow fence behavior is unchanged.
+  /// Loss specificity: `on_loss` is a reader decision for a DECODE-level loss (an
+  /// `IN_Q_OVERFLOW` sentinel or a decode-truncation). Absent any such loss the reset
+  /// is never called, and a reuse fence still fences until its stale IGNORED drains
+  /// normally — the non-loss fence behavior is unchanged (the ambiguous fence does
+  /// NOT reset itself).
   #[test]
-  fn reuse_fence_without_overflow_still_drains_via_ignored() {
+  fn reuse_fence_without_loss_still_drains_via_ignored() {
     let mut t = WdTable::new();
     t.register(7, watch(1));
     assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
     t.register(7, watch(2));
     assert_eq!(attributed(&t, 7), None, "fenced while pending");
 
-    // No overflow: the stale IGNORED itself closes the window, exactly as before.
+    // No loss reset: the stale IGNORED itself closes the window, exactly as before.
     assert!(t.on_ignored(7).is_empty());
     assert_eq!(
       attributed(&t, 7),
       Some(vec![watch(2)]),
-      "the fence lifts on the stale IGNORED, not on any overflow"
+      "the fence lifts on the stale IGNORED, not on any loss reset"
     );
   }
 }

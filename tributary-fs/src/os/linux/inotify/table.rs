@@ -37,17 +37,27 @@
 //! `pending_stale_ignored` is a COUNT and the fence holds until the LAST stale
 //! marker drains — never a per-`wd` bool that a first IGNORED would clear early.
 //!
-//! Overflow recovery: `IN_Q_OVERFLOW` means the kernel dropped queued events
-//! (inotify(7)), so any state that WAITS for a specific future marker can have
-//! that marker among the dropped — and would then wait FOREVER. Two such windows
-//! exist: a reuse fence (`pending_stale_ignored`, counting down a stale
-//! `IN_IGNORED`) and a draining tombstone (awaiting its own final `IN_IGNORED`).
-//! [`WdTable::on_overflow`] resets BOTH — clearing every pending stale-ignored
-//! count and erasing every draining tombstone — because the covering rescan the
-//! overflow triggers (re-enumerate + re-arm) rebuilds the table truthfully.
-//! Invariant: no wd-table window may outlive an overflow. Live attribution sets
-//! are the only state that survives it — they never await a marker, so the rescan
-//! reconciles them without a reset.
+//! Loss recovery: a DECODE-level loss breaks the queue ordering every wd-window
+//! relies on. Two shapes: an `IN_Q_OVERFLOW` sentinel — the kernel dropped queued
+//! events (inotify(7)) — and a truncated / absurd-length / malformed record that
+//! stops the decode walk early, dropping the buffer tail after it. Either way,
+//! state that WAITS for a specific future marker can have that marker among the
+//! dropped bytes — and would then wait FOREVER. Two such windows exist: a reuse
+//! fence (`pending_stale_ignored`, counting down a stale `IN_IGNORED`) and a
+//! draining tombstone (awaiting its own final `IN_IGNORED`). [`WdTable::on_loss`]
+//! resets BOTH — clearing every pending stale-ignored count and erasing every
+//! draining tombstone — because the covering rescan the loss triggers (re-enumerate
+//! + re-arm) rebuilds the table truthfully.
+//!
+//! Invariant: no wd-table window may outlive an ordering-breaking loss. Live
+//! attribution sets are the only state that survives it — they never await a
+//! marker, so the rescan reconciles them without a reset. The distinction is sharp:
+//! the reset fires on a DECODE/kernel loss (ordering broken — the awaited marker may
+//! be gone), NEVER on the AMBIGUOUS-fence loss (a record dropped by
+//! [`attribute`](WdTable::attribute) while `pending_stale_ignored > 0`). The fence
+//! loss is the fence working WITH the ordering intact; resetting there would clear
+//! `pending_stale_ignored` before the stale `IN_IGNORED` drains and re-open the
+//! reuse misattribution the fence exists to prevent.
 
 use std::collections::BTreeMap;
 
@@ -209,15 +219,17 @@ impl WdTable {
     entry.live
   }
 
-  /// Resets all transient reuse-window / ordering state after an `IN_Q_OVERFLOW`.
+  /// Resets all transient reuse-window / ordering state after a DECODE-level loss —
+  /// an `IN_Q_OVERFLOW` sentinel or a truncated / absurd-length / malformed record
+  /// that dropped the decode tail.
   ///
-  /// An overflow means the kernel dropped queued events (inotify(7)): the marker a
-  /// window is counting on — a stale `IN_IGNORED` a reuse fence decrements
+  /// Such a loss means bytes the stream would have carried are gone (inotify(7)): the
+  /// marker a window is counting on — a stale `IN_IGNORED` a reuse fence decrements
   /// ([`Self::register`]) or a draining tombstone's own final `IN_IGNORED` — may be
   /// among the dropped, so it can NEVER arrive and the window would strand forever
   /// (a stuck `pending_stale_ignored` fences every future record on the reused `wd`
   /// to [`Attribution::Ambiguous`] → loss, a permanent livelock; a stranded
-  /// tombstone leaks and re-traps the `wd` on its next reuse). The overflow already
+  /// tombstone leaks and re-traps the `wd` on its next reuse). The loss already
   /// drives the covering rescan (re-enumerate + re-arm), which rebuilds the table
   /// truthfully, so the recovery is to drop the window state: clear every
   /// `pending_stale_ignored` and erase every draining tombstone. Live attribution
@@ -225,7 +237,13 @@ impl WdTable {
   /// them. A draining tombstone has an empty live set and no `by_anchor` link
   /// pointing at it (both cleared when its last anchor drained), so erasing it keeps
   /// the reverse index consistent.
-  pub(crate) fn on_overflow(&mut self) {
+  ///
+  /// Called ONLY for a DECODE loss (the queue ordering is broken). The
+  /// ambiguous-fence loss — [`attribute`](Self::attribute) dropping a record while
+  /// `pending_stale_ignored > 0`, ordering INTACT — must NOT call this: it would
+  /// clear the fence before its stale `IN_IGNORED` drains and mis-attribute the
+  /// reused `wd`'s old records to the new watch.
+  pub(crate) fn on_loss(&mut self) {
     self.entries.retain(|_wd, entry| {
       entry.pending_stale_ignored = 0;
       !entry.draining
