@@ -5,8 +5,9 @@ use crate::os::{
   BackendStatsShared, SourceMessage,
   linux::fanotify::{
     fid::{
-      DecodeOutcome, FAN_CREATE, FAN_DELETE, FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR, FAN_RENAME,
-      FanMask, Fid, RawFanotifyEvent, RenameInfo,
+      DecodeOutcome, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_EVENT_INFO_TYPE_DFID_NAME,
+      FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR, FAN_RENAME, FanMask, Fid, RawFanotifyEvent, RenameInfo,
+      decode_events,
     },
     map::{FidMap, SeedEntry},
   },
@@ -15,6 +16,48 @@ use crate::os::{
 
 fn fid(tag: u8) -> Fid {
   Fid::new([tag; 8], Box::from(&[tag][..]))
+}
+
+/// The exact `Fid` `decode_events` yields from a wire FID (handle = `handle_type`
+/// native-endian i32 followed by `opaque`), so a map seeded with it matches the
+/// decoded event's FID — the map keys on the handle bytes.
+fn wire_fid(fsid: [u8; 8], handle_type: i32, opaque: &[u8]) -> Fid {
+  let mut handle = handle_type.to_ne_bytes().to_vec();
+  handle.extend_from_slice(opaque);
+  Fid::new(fsid, handle.into_boxed_slice())
+}
+
+/// A one-record fanotify buffer: a single `DFID_NAME` info record (fsid + file
+/// handle + a NUL-terminated `name`) in an event of `mask` — the packed wire shape
+/// the kernel delivers a directory self-event in when it uses the "." self-name.
+fn dfid_name_event(
+  mask: u64,
+  fsid: [u8; 8],
+  handle_type: i32,
+  opaque: &[u8],
+  name: &[u8],
+) -> Vec<u8> {
+  let mut fh = (opaque.len() as u32).to_ne_bytes().to_vec();
+  fh.extend_from_slice(&handle_type.to_ne_bytes());
+  fh.extend_from_slice(opaque);
+  let mut payload = fsid.to_vec();
+  payload.extend_from_slice(&fh);
+  payload.extend_from_slice(name);
+  payload.push(0);
+  let record_len = (4 + payload.len()) as u16;
+  let mut info = vec![FAN_EVENT_INFO_TYPE_DFID_NAME, 0];
+  info.extend_from_slice(&record_len.to_ne_bytes());
+  info.extend_from_slice(&payload);
+  let event_len = (24 + info.len()) as u32;
+  let mut buf = event_len.to_ne_bytes().to_vec();
+  buf.push(3); // vers
+  buf.push(0); // reserved
+  buf.extend_from_slice(&24u16.to_ne_bytes()); // metadata_len
+  buf.extend_from_slice(&mask.to_ne_bytes());
+  buf.extend_from_slice(&(-1i32).to_ne_bytes()); // fd = FAN_NOFD
+  buf.extend_from_slice(&0i32.to_ne_bytes()); // pid
+  buf.extend_from_slice(&info);
+  buf
 }
 
 /// A `FAN_MODIFY` event on child `name` under directory `dir_fid` — the simplest
@@ -630,6 +673,58 @@ fn lossy_buffer_with_a_blinding_reseed_is_fatal_only() {
     sent,
     vec![Sent::Fatal],
     "no Batch and no Overflow — the terminal Fatal is the only signal"
+  );
+}
+
+/// The kernel encodes a directory self-event as a `DFID_NAME` record whose name is
+/// the self-name ".". Driven END TO END at the reader — a REAL "." buffer decoded
+/// and pushed through `process_decoded` — a root `DELETE_SELF` reaches terminal
+/// root-death: the reader forwards the root's OWN path (`/root`, which compile
+/// lowers to the death lifecycle), NEVER the `<root>/.` child that treating the
+/// "." as a literal name would produce (a located rescan of "root/."). At the
+/// reader the FORWARDED PATH is the
+/// verdict — `/root` is the root death, `/root/.` would be the child rescan — so the
+/// buffer forwards one clean Batch on `/root` and never reseeds.
+#[test]
+fn dfid_name_dot_root_delete_reaches_root_death_at_the_reader() {
+  const FSID: [u8; 8] = [7; 8];
+  let root = wire_fid(FSID, 1, b"root-handle");
+  let mut map = FidMap::new();
+  map.seed([SeedEntry::root(root, Path::new("/root"))]);
+
+  let buf = dfid_name_event(FAN_DELETE_SELF | FAN_ONDIR, FSID, 1, b"root-handle", b".");
+  let decoded = decode_events(&buf);
+  assert!(
+    !decoded.lossy && decoded.events.len() == 1 && decoded.events[0].name.is_none(),
+    "decode folded the '.' self-name to the name-less self shape"
+  );
+
+  let stats = BackendStatsShared::default();
+  let transport = TransportState::new(8);
+  let paths = std::cell::RefCell::new(Vec::new());
+  let alive = process_decoded(
+    decoded,
+    &mut map,
+    &stats,
+    &transport,
+    || Ok(one_entry_walk()),
+    |_, _, _| Ok(Vec::new()),
+    |msg| {
+      if let SourceMessage::Batch(payload) = msg {
+        for ev in payload.events {
+          if let crate::os::SourceEvent::Linux(crate::os::linux::RawLinuxEvent::Fanotify(a)) = ev {
+            paths.borrow_mut().push(a.path);
+          }
+        }
+      }
+      true
+    },
+  );
+  assert!(alive, "a root self-event is a clean forward, not a loss");
+  assert_eq!(
+    paths.into_inner(),
+    vec![Some(std::path::PathBuf::from("/root"))],
+    "the root DELETE_SELF '.' reaches terminal root-death on /root, never a located rescan of /root/."
   );
 }
 

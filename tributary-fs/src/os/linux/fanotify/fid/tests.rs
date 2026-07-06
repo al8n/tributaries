@@ -221,6 +221,31 @@ fn rename_with_an_empty_name_half_is_lossy() {
   assert!(events.is_empty());
 }
 
+/// A `FAN_RENAME` half whose name is the self-name "." is refused (lossy), exactly
+/// as an empty-name half is. "." is a directory's OWN self-reference, never a real
+/// moved child, so a rename half carrying it is anomalous: decode folds "." to
+/// `None` (see `decode_fid_record`), the pair cannot be completed, and the batch
+/// takes the loss barrier rather than lowering a stray "." path component.
+#[test]
+fn rename_with_a_dot_name_half_is_lossy() {
+  let old = info_record(
+    FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
+    &fid_payload(FSID_A, 1, b"srcdir", Some(b"old.txt")),
+  );
+  // A NEW half whose name is the self-name ".": `decode_fid_record` folds it to
+  // `None`, so the pair cannot be completed.
+  let new = info_record(
+    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME,
+    &fid_payload(FSID_B, 2, b"dstdir", Some(b".")),
+  );
+  let mut info = old;
+  info.extend(new);
+  let buf = event(FAN_RENAME, &info);
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(lossy, "a rename half named '.' is malformed");
+  assert!(events.is_empty());
+}
+
 /// A truncated trailing event (a header cut short, or an `event_len` past the
 /// buffer) stops the walk and marks the batch lossy, never panicking. The
 /// intact leading event is kept.
@@ -646,5 +671,57 @@ mod structural_decode {
     let DecodeOutcome { events, lossy } = decode_one(&rename_event(true, Some(b"moved")));
     assert!(!lossy);
     assert!(events[0].mask.rename() && events[0].target_fid.is_some());
+  }
+
+  /// A `DFID_NAME` whose name is the self-name "." is the kernel's encoding for an
+  /// event on the directory OBJECT ITSELF (man 7 fanotify). Decode folds it to the
+  /// name-less SELF shape — `name = None`, `dir_fid` = the directory's own FID —
+  /// identical to the empty-name bare-`DFID_NAME` form, so the classifier routes it
+  /// to its self path (a root's `RootDeath`, a subdir self-forget, a bare
+  /// modify/attrib on the object's own path) instead of a bogus `<dir>/.` child.
+  #[test]
+  fn dfid_name_dot_folds_to_the_self_shape() {
+    for mask in [
+      FAN_DELETE_SELF | FAN_ONDIR,
+      FAN_MOVE_SELF | FAN_ONDIR,
+      FAN_ATTRIB | FAN_ONDIR,
+      FAN_MODIFY | FAN_ONDIR,
+    ] {
+      let DecodeOutcome { events, lossy } = decode_one(&dirent(mask, Some(b"."), None));
+      assert!(!lossy, "a '.' self-event {mask:#x} is not a WIRE loss");
+      assert_eq!(events.len(), 1);
+      assert!(
+        events[0].name.is_none(),
+        "the '.' self-name folded to None (the name-less self shape)"
+      );
+      let dir_fid = events[0]
+        .dir_fid
+        .as_ref()
+        .expect("the DFID is preserved as the self-addressing object");
+      // The stored handle is the type word (native-endian i32) then the opaque
+      // bytes — the `dirent` helper's `fid_payload(FSID_A, 1, b"dir-handle", ..)`.
+      let mut expected = 1i32.to_ne_bytes().to_vec();
+      expected.extend_from_slice(b"dir-handle");
+      assert_eq!(dir_fid.handle(), expected.as_slice());
+      assert!(events[0].target_fid.is_none());
+    }
+  }
+
+  /// ONLY exactly "." folds. A real child name — including one that merely CONTAINS
+  /// a dot ("a.txt"), BEGINS with one (".hidden"), or is the parent link ("..") — is
+  /// carried through UNCHANGED, so decode never mistakes a legitimate dirent for the
+  /// self-encoding.
+  #[test]
+  fn only_exact_dot_folds_real_child_names_pass_through() {
+    for name in [b".." as &[u8], b".hidden", b"a.txt", b"...", b".a", b"a."] {
+      let DecodeOutcome { events, lossy } = decode_one(&dirent(FAN_CREATE, Some(name), Some(b"c")));
+      assert!(!lossy);
+      assert_eq!(events.len(), 1);
+      assert_eq!(
+        events[0].name.as_deref(),
+        Some(name),
+        "a real child name is unchanged; only exactly '.' folds to the self shape"
+      );
+    }
   }
 }
