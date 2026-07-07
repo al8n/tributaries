@@ -94,6 +94,7 @@ mod event;
 mod filter;
 mod options;
 mod route;
+mod source;
 mod subscription;
 pub(crate) mod subsume;
 mod view;
@@ -103,6 +104,7 @@ pub use error::{BuildError, CloseError, UnwatchError, WatchError};
 pub use event::Event;
 pub use filter::Filter;
 pub use options::{DebounceConfig, TributariesOptions};
+pub use source::{Armed, FsSource, Source, SourceEvent};
 pub use subscription::Subscription;
 pub use view::{Snapshot, WatchView};
 
@@ -114,9 +116,10 @@ pub use driver::TokioTributaries;
 #[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
 pub use driver::SmolTributaries;
 
-/// The event vocabulary, options, and change-id/epoch/location types are re-exported
-/// from [`tributary-fs`](tributary_fs) unchanged — this crate retags events, it does
-/// not redefine them.
+/// The event vocabulary, options, root handle, and change-id/epoch/location types are
+/// re-exported from [`tributary-fs`](tributary_fs) unchanged — this crate retags events,
+/// it does not redefine them. [`RootHandle`] is the [`FsSource`] armed-root token
+/// ([`Source::Handle`]).
 pub use tributary_fs::{
-  ChangeId, Epoch, EventKind, Interest, Location, MovedEvent, Segment, WatcherOptions,
+  ChangeId, Epoch, EventKind, Interest, Location, MovedEvent, RootHandle, Segment, WatcherOptions,
 };
