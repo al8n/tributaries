@@ -1,6 +1,7 @@
 use std::{
   cell::RefCell,
   collections::{HashMap, VecDeque},
+  ffi::OsString,
   io,
   path::{Path, PathBuf},
 };
@@ -13,6 +14,14 @@ use super::{
   Event, Filter, RootArmer, Subscription, Subsumer, WatchError, WidenJournal, apply_watch,
   epoch::EpochLedger, resume_pending_widen,
 };
+
+/// A path's `OsString` components — the key form the fs subsumer uses.
+fn key(path: &str) -> Vec<OsString> {
+  Path::new(path)
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
+}
 
 /// One recorded call against the fake armer, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,18 +187,18 @@ impl RootArmer for FakeArmer {
 
 /// The driver-side state `apply_watch` threads through, bundled for the tests.
 struct Harness {
-  subsumer: Subsumer<u32>,
+  subsumer: Subsumer<OsString, (), u32>,
   epochs: EpochLedger,
   /// Mirrors the driver's per-subscription filter map, so the rollback's degenerate
   /// loss path (which reclaims a lost subscriber's filter) is exercised as it runs in
   /// `Tributaries::watch`. A watch that succeeds records `Filter::all` here, mirroring
   /// `Tributaries::watch` inserting the caller's filter on success.
-  filters: HashMap<Subscription, Filter>,
-  queue: VecDeque<Event>,
+  filters: HashMap<Subscription, Filter<OsString, ()>>,
+  queue: VecDeque<Event<OsString, ()>>,
   /// Mirrors the driver's in-flight-widen journal (design §4, cancellation safety), so a
   /// test can simulate a dropped `watch()` future (journal set + subsumed disarmed) and
   /// then drive `resume_pending_widen`.
-  pending_widen: Option<WidenJournal<u32>>,
+  pending_widen: Option<WidenJournal<OsString, u32>>,
   armer: FakeArmer,
 }
 
@@ -242,10 +251,10 @@ impl Harness {
   /// future would leave: journal the plan, then disarm the subsumed kernel roots — but
   /// **stop before arming the wider root** (as a `select!`/timeout cancel between the
   /// disarm and the commit would). The subsumer's index is untouched (no commit ran), so
-  /// its subsumed `RootEntry`s and the newcomer's pending reservation stay live, exactly
+  /// its subsumed `RootRecord`s and the newcomer's pending reservation stay live, exactly
   /// as they would after a real drop. Returns the plan's subsumed handles.
   async fn journal_and_disarm_widen(&mut self, path: &str) -> Vec<u32> {
-    let outcome = self.subsumer.plan_watch(Path::new(path), Interest::all());
+    let outcome = self.subsumer.plan_watch(&key(path), (), Interest::all());
     let super::WatchOutcome::Widen { unwatch, .. } = &outcome else {
       panic!("expected a Widen plan for {path}");
     };
@@ -342,7 +351,11 @@ async fn widen_disarms_subsumed_before_arming_the_wider_root() {
   );
 
   // The single surviving root is the wider /a (the subsumed /a/b handle is gone).
-  let roots: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  let roots: Vec<PathBuf> = h
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
   assert_eq!(
     roots,
     vec![PathBuf::from("/a")],
@@ -405,15 +418,25 @@ async fn widen_arm_failure_rolls_back_subsumed_roots() {
 
   // The two subsumed roots are live again (re-keyed onto their fresh handles), and the
   // failed wider root /a is NOT present.
-  let roots: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  let roots: Vec<PathBuf> = h
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
   assert_eq!(
     roots,
     vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
     "the pre-widen roots are restored; the failed wider root never committed"
   );
   // Both original subscriptions are still live and ride their restored roots.
-  assert_eq!(h.subsumer.subscription_path(sb), Some(Path::new("/a/b")));
-  assert_eq!(h.subsumer.subscription_path(sc), Some(Path::new("/a/c")));
+  assert_eq!(
+    h.subsumer.subscription_key(sb),
+    Some(key("/a/b").as_slice())
+  );
+  assert_eq!(
+    h.subsumer.subscription_key(sc),
+    Some(key("/a/c").as_slice())
+  );
 
   // Each restored subscriber got a dominating Rescan (the re-arm restarted fs epochs at
   // 0, and the disarm→re-arm window may have missed events — no silent loss).
@@ -493,7 +516,7 @@ async fn widen_rollback_double_failure_signals_loss_and_reclaims() {
   );
   // sb's side-table record, filter, and epoch state are all reclaimed.
   assert_eq!(
-    h.subsumer.subscription_path(sb),
+    h.subsumer.subscription_key(sb),
     None,
     "the lost subscriber's side-table record is gone"
   );
@@ -577,14 +600,24 @@ async fn dropped_widen_after_disarm_is_repaired_on_next_call() {
 
   // Both subsumed roots are live again (re-armed onto fresh handles 4 and 5) and still
   // serve their subscriptions — nothing uncovered.
-  let roots: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  let roots: Vec<PathBuf> = h
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
   assert_eq!(
     roots,
     vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
     "the pre-widen roots are restored (re-armed); the dropped widen left no wider root"
   );
-  assert_eq!(h.subsumer.subscription_path(sb), Some(Path::new("/a/b")));
-  assert_eq!(h.subsumer.subscription_path(sc), Some(Path::new("/a/c")));
+  assert_eq!(
+    h.subsumer.subscription_key(sb),
+    Some(key("/a/b").as_slice())
+  );
+  assert_eq!(
+    h.subsumer.subscription_key(sc),
+    Some(key("/a/c").as_slice())
+  );
   // Both subscriptions are covered by a live root (fs knows their fresh handles).
   let live_handles: Vec<u32> = h.subsumer.roots().map(|(_, handle)| handle).collect();
   for handle in live_handles {
@@ -661,7 +694,11 @@ async fn resume_is_idempotent_when_nothing_pending() {
 
   let calls_before = h.armer.calls();
   let queued_before = h.queue.len();
-  let roots_before: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  let roots_before: Vec<PathBuf> = h
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
 
   // Resume with nothing pending — must change nothing.
   h.resume().await;
@@ -669,11 +706,21 @@ async fn resume_is_idempotent_when_nothing_pending() {
   assert!(h.pending_widen.is_none(), "still nothing journaled");
   assert_eq!(h.armer.calls(), calls_before, "resume issued no fs calls");
   assert_eq!(h.queue.len(), queued_before, "resume queued nothing");
-  let roots_after: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  let roots_after: Vec<PathBuf> = h
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
   assert_eq!(roots_after, roots_before, "the live roots are unchanged");
   // The subscriptions are untouched and still live.
-  assert_eq!(h.subsumer.subscription_path(sb), Some(Path::new("/a/b")));
-  assert_eq!(h.subsumer.subscription_path(sc), Some(Path::new("/x/y")));
+  assert_eq!(
+    h.subsumer.subscription_key(sb),
+    Some(key("/a/b").as_slice())
+  );
+  assert_eq!(
+    h.subsumer.subscription_key(sc),
+    Some(key("/x/y").as_slice())
+  );
 }
 
 #[tokio::test]
@@ -769,7 +816,7 @@ async fn every_arm_uses_interest_all_and_records_the_sub_interest() {
   let roots: Vec<_> = h
     .subsumer
     .roots()
-    .map(|(p, handle)| (p.to_path_buf(), handle))
+    .map(|(k, handle)| (PathBuf::from_iter(k), handle))
     .collect();
   assert_eq!(
     roots.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
@@ -884,21 +931,25 @@ async fn canonical_key_uses_fs_root_path_not_the_planned_one() {
     .expect("watch /a/link");
 
   // The committed root + side-table path are fs's /a/real — the coordinate events use.
-  let roots: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  let roots: Vec<PathBuf> = h
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
   assert_eq!(
     roots,
     vec![PathBuf::from("/a/real")],
     "the root is keyed on fs's canonical path, not the planned /a/link"
   );
   assert_eq!(
-    h.subsumer.subscription_path(sub),
-    Some(Path::new("/a/real")),
-    "the subscription's coverage path is in fs's coordinate"
+    h.subsumer.subscription_key(sub),
+    Some(key("/a/real").as_slice()),
+    "the subscription's coverage key is in fs's coordinate"
   );
-  // A fs-canonical event under /a/real is covered by the subscription's /a/real path;
+  // A fs-canonical event under /a/real is covered by the subscription's /a/real key;
   // under the pre-fix /a/link key it would fail starts_with and be silently dropped.
   assert!(
-    Path::new("/a/real/child").starts_with(h.subsumer.subscription_path(sub).unwrap()),
+    key("/a/real/child").starts_with(h.subsumer.subscription_key(sub).unwrap()),
     "an fs-canonical event routes to the creating subscription (no silent drop)"
   );
 }
@@ -924,7 +975,11 @@ async fn canonical_race_that_changes_subsumption_aborts_cleanly() {
 
   // The just-armed root was disarmed (arm then disarm of handle 2), and no phantom
   // entry lingers: the only live root is still /a.
-  let roots: Vec<PathBuf> = h.subsumer.roots().map(|(p, _)| p.to_path_buf()).collect();
+  let roots: Vec<PathBuf> = h
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
   assert_eq!(
     roots,
     vec![PathBuf::from("/a")],

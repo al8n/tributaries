@@ -36,14 +36,13 @@
 //! decision is testable without constructing the fs event type (whose constructor is
 //! private to `tributary-fs`).
 
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 use tributary_fs::Epoch;
 
 use crate::{
   route::{RoutableEvent, fan_out},
   subscription::Subscription,
-  subsume::RootEntry,
 };
 
 #[cfg(test)]
@@ -108,8 +107,8 @@ impl EpochLedger {
   /// (design §8).
   ///
   /// Coverage and filter admission are decided by the unchanged pure
-  /// [`fan_out`](crate::route::fan_out): `event` reaches exactly the subscribers of
-  /// `entry` whose canonical path (resolved by `canonical_of`) covers it **and** whose
+  /// [`fan_out`](crate::route::fan_out): `event` reaches exactly the subscribers in
+  /// `subscribers` whose key (resolved by `canonical_of`) covers it **and** whose
   /// filter (`admits`) admits the minted delivery, plus — for a `Rescan` — *every*
   /// subscriber of the root, bypassing both gates. `raw` is the event's raw fs epoch;
   /// each admitted subscriber's delivery is stamped `epoch_base + raw` via
@@ -127,20 +126,21 @@ impl EpochLedger {
   /// applies a fake predicate, `stamp_into` pairs it with the stamp), so routing +
   /// filtering + rebasing is exercised without the private fs event constructor.
   #[allow(clippy::too_many_arguments)]
-  pub(crate) fn stamp_and_fan_out<'a, E, D>(
+  pub(crate) fn stamp_and_fan_out<'a, C, E, D>(
     &mut self,
     event: &E,
     raw: Epoch,
-    entry: &RootEntry,
-    canonical_of: impl Fn(Subscription) -> Option<&'a Path>,
+    subscribers: &[Subscription],
+    canonical_of: impl Fn(Subscription) -> Option<&'a [C]>,
     admits: impl Fn(Subscription, &E::Delivered) -> bool,
     sub_of: impl Fn(&E::Delivered) -> Subscription,
     stamp_into: impl Fn(E::Delivered, Epoch) -> D,
   ) -> Vec<D>
   where
-    E: RoutableEvent,
+    C: PartialEq + 'a,
+    E: RoutableEvent<C>,
   {
-    fan_out(event, entry, canonical_of, admits)
+    fan_out(event, subscribers, canonical_of, admits)
       .into_iter()
       .map(|delivered| {
         let stamp = self.stamp(sub_of(&delivered), raw);

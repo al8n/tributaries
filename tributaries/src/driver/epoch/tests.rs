@@ -1,21 +1,29 @@
 use core::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::{ffi::OsString, path::Path};
 
 use tributary_fs::Epoch;
 use tributary_proto::ScopeId;
 
 use super::EpochLedger;
-use crate::{route::RoutableEvent, subscription::Subscription, subsume::RootEntry};
+use crate::{route::RoutableEvent, subscription::Subscription};
+
+/// A path's `OsString` components — the located-key form the fs source keys on.
+fn key(path: &str) -> Vec<OsString> {
+  Path::new(path)
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
+}
 
 /// A minimal stand-in for a raw event — the same shape `route::tests` uses, so the
 /// ledger's fan-out + stamp is exercised without the private `tributary_fs::Event`
-/// constructor. Routing reads its endpoint paths and whether it is a `Rescan`; its
+/// constructor. Routing reads its endpoint keys and whether it is a `Rescan`; its
 /// per-subscriber delivery is the [`Subscription`] paired with which projection it got,
 /// which the ledger then stamps — so a move test can confirm every projection of one
 /// raw move carries that subscriber's stamp.
 struct FakeEvent {
-  path: PathBuf,
-  from: Option<PathBuf>,
+  key: Vec<OsString>,
+  from: Option<Vec<OsString>>,
   rescan: bool,
 }
 
@@ -31,7 +39,7 @@ enum Projection {
 impl FakeEvent {
   fn change(path: &str) -> Self {
     Self {
-      path: PathBuf::from(path),
+      key: key(path),
       from: None,
       rescan: false,
     }
@@ -39,7 +47,7 @@ impl FakeEvent {
 
   fn rescan(path: &str) -> Self {
     Self {
-      path: PathBuf::from(path),
+      key: key(path),
       from: None,
       rescan: true,
     }
@@ -47,21 +55,21 @@ impl FakeEvent {
 
   fn moved(from: &str, to: &str) -> Self {
     Self {
-      path: PathBuf::from(to),
-      from: Some(PathBuf::from(from)),
+      key: key(to),
+      from: Some(key(from)),
       rescan: false,
     }
   }
 }
 
-impl RoutableEvent for FakeEvent {
+impl RoutableEvent<OsString> for FakeEvent {
   type Delivered = (Subscription, Projection);
 
-  fn path(&self) -> &Path {
-    self.path.as_path()
+  fn key(&self) -> &[OsString] {
+    self.key.as_slice()
   }
 
-  fn move_from(&self) -> Option<&Path> {
+  fn move_from(&self) -> Option<&[OsString]> {
     self.from.as_deref()
   }
 
@@ -86,37 +94,35 @@ fn sub(id: u64) -> Subscription {
   Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
 }
 
-/// A root at `root_path` serving the given subscribers, each registered at its own
-/// canonical path (the two inputs `stamp_and_fan_out`'s coverage step needs).
+/// A root serving the given subscribers, each registered at its own key (the two
+/// inputs `stamp_and_fan_out`'s coverage step needs). The root path itself is
+/// immaterial — the coverage step keys on the subscribers and their own keys.
 struct Fixture {
-  entry: RootEntry,
-  paths: Vec<(Subscription, PathBuf)>,
+  subscribers: Vec<Subscription>,
+  keys: Vec<(Subscription, Vec<OsString>)>,
 }
 
 impl Fixture {
-  fn new(root_path: &str, subscribers: &[(u64, &str)]) -> Self {
+  fn new(_root_path: &str, subscribers: &[(u64, &str)]) -> Self {
     let mut subs = Vec::new();
-    let mut paths = Vec::new();
+    let mut keys = Vec::new();
     for &(id, path) in subscribers {
       let s = sub(id);
       subs.push(s);
-      paths.push((s, PathBuf::from(path)));
+      keys.push((s, key(path)));
     }
     Self {
-      entry: RootEntry {
-        path: PathBuf::from(root_path),
-        subscribers: subs,
-      },
-      paths,
+      subscribers: subs,
+      keys,
     }
   }
 
-  fn canonical_of(&self, s: Subscription) -> Option<&Path> {
+  fn canonical_of(&self, s: Subscription) -> Option<&[OsString]> {
     self
-      .paths
+      .keys
       .iter()
       .find(|(candidate, _)| *candidate == s)
-      .map(|(_, path)| path.as_path())
+      .map(|(_, k)| k.as_slice())
   }
 
   /// Fan `event` (raw fs epoch `raw`) out through `ledger`, returning each covered
@@ -145,7 +151,7 @@ impl Fixture {
     ledger.stamp_and_fan_out(
       event,
       raw,
-      &self.entry,
+      &self.subscribers,
       |s| self.canonical_of(s),
       // These tests exercise coverage + epoch rebasing, not the filter, so admit
       // every covered delivery (the filter gate is covered in `route::tests`).

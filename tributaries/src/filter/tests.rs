@@ -1,5 +1,5 @@
 use core::num::NonZeroU64;
-use std::path::PathBuf;
+use std::{ffi::OsString, path::Path};
 
 use tributary_fs::{Epoch, EventKind, Location};
 use tributary_proto::ScopeId;
@@ -12,17 +12,20 @@ fn sub(id: u64) -> Subscription {
   Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
 }
 
-/// A synthetic event of `kind` at `path` for subscription 1. A `Filter` reads only the
-/// public accessors of the concrete [`Event`], so a synthetic stand-in exercises it
-/// without the private `tributary_fs::Event` constructor.
-fn ev(path: &str, kind: EventKind) -> Event {
-  Event::synthetic(
-    sub(1),
-    PathBuf::from(path),
-    Location::new(),
-    kind,
-    Epoch::new(1),
-  )
+/// A path's `OsString` components — the located-key form the fs source keys on.
+fn key(path: &str) -> Vec<OsString> {
+  Path::new(path)
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
+}
+
+/// A synthetic event of `kind` at `path` for subscription 1, keyed on `OsString`
+/// components (the fs `C`). A `Filter` reads only the public accessors of the concrete
+/// [`Event`], so a synthetic stand-in exercises it without the private
+/// `tributary_fs::Event` constructor.
+fn ev(path: &str, kind: EventKind) -> Event<OsString, ()> {
+  Event::synthetic(sub(1), key(path), Location::new(), kind, Epoch::new(1))
 }
 
 #[test]

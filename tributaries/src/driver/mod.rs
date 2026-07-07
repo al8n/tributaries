@@ -4,29 +4,35 @@
 //! [`EpochLedger`](epoch::EpochLedger).
 //!
 //! All I/O lives here; the engines it drives (subsumption, routing, epoch rebasing)
-//! are pure. A [`Tributaries`] owns exactly one `tributary-fs` watcher and subsumes
-//! every caller subscription onto its disjoint roots, so N overlapping `watch` calls
-//! collapse to one kernel watch (design §4); each raw event fans out to every
-//! covering subscription (design §5), stamped in that subscription's own monotone
-//! epoch space (design §8).
+//! are pure and generic over the key component `C`. This local-fs driver instantiates
+//! them at `C = OsString` (a path's components), value `V = ()` (the fs source carries
+//! no per-watch value at this layer), and handle `H = RootHandle`. A [`Tributaries`]
+//! owns exactly one `tributary-fs` watcher and subsumes every caller subscription onto
+//! its disjoint roots, so N overlapping `watch` calls collapse to one kernel watch
+//! (design §4); each raw event fans out to every covering subscription (design §5),
+//! stamped in that subscription's own monotone epoch space (design §8).
 
 use std::{
   collections::{HashMap, VecDeque},
+  ffi::OsString,
   hash::Hash,
-  path::Path,
+  path::{Path, PathBuf},
+  vec::Vec,
 };
 
 use agnostic_lite::RuntimeLite;
-use tributary_fs::{Interest, RootHandle, Watcher};
+use tributary_fs::{Interest, MovedEvent, RootHandle, Watcher};
 
 use crate::{
   coalesce::Coalescer,
   error::{BuildError, CloseError, UnwatchError, WatchError},
-  event::Event,
+  event::{Event, path_components},
   filter::Filter,
   options::TributariesOptions,
+  route::RoutableEvent,
   subscription::Subscription,
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
+  view::WatchView,
 };
 
 /// An in-flight widen the driver journaled before it began releasing kernel watches, so a
@@ -44,15 +50,12 @@ use crate::{
 /// It carries the plan [`WatchOutcome`] the widen was executing: its `unwatch` handles
 /// (the subsumed roots whose liveness resume probes), and — through the same outcome — the
 /// newcomer's pending reservation, which resume aborts ([`Subsumer::abort_watch`]) since a
-/// dropped `watch()` handed out no [`Subscription`]. The subsumed roots' paths and
-/// subscribers are read straight from the subsumer on resume (the widen commits its index
-/// transition only on success, so those [`RootEntry`](crate::subsume::RootEntry)s stay
-/// intact for the repair), so the journal need not duplicate them.
+/// dropped `watch()` handed out no [`Subscription`].
 #[derive(Debug)]
-struct WidenJournal<H> {
+struct WidenJournal<C, H> {
   /// The widen plan being executed: `unwatch` names the subsumed roots to probe/restore,
   /// and the whole outcome carries the newcomer's pending id for [`Subsumer::abort_watch`].
-  outcome: WatchOutcome<H>,
+  outcome: WatchOutcome<C, H>,
 }
 
 use self::epoch::EpochLedger;
@@ -86,7 +89,7 @@ pub(crate) trait RootArmer {
   /// The **authoritative canonical path** fs recorded for `handle` (the umbrella keys
   /// its subsumption index off this, not off its own provisional canonicalization —
   /// design §4, the TOCTOU close). `None` once the handle no longer names a live root.
-  fn root_path(&self, handle: Self::Handle) -> Option<std::path::PathBuf>;
+  fn root_path(&self, handle: Self::Handle) -> Option<PathBuf>;
 
   /// Releases the kernel watch named by `handle`.
   fn disarm(&self, handle: Self::Handle) -> impl Future<Output = Result<(), UnwatchError>>;
@@ -99,7 +102,7 @@ impl<R: RuntimeLite> RootArmer for Watcher<R> {
     Ok(self.watch(path.to_path_buf(), interest).await?)
   }
 
-  fn root_path(&self, handle: RootHandle) -> Option<std::path::PathBuf> {
+  fn root_path(&self, handle: RootHandle) -> Option<PathBuf> {
     Watcher::root_path(self, handle)
   }
 
@@ -112,8 +115,9 @@ impl<R: RuntimeLite> RootArmer for Watcher<R> {
 /// out.
 ///
 /// Wraps one [`tributary_fs::Watcher`] concretely (design call A) plus the
-/// sans-I/O subsumption engine. Use the [`TokioTributaries`] / [`SmolTributaries`]
-/// aliases, or any other [`RuntimeLite`].
+/// sans-I/O subsumption engine (instantiated at `C = OsString`, `V = ()`, `H =
+/// RootHandle`). Use the [`TokioTributaries`] / [`SmolTributaries`] aliases, or any
+/// other [`RuntimeLite`].
 ///
 /// # Watching means "changes from now on"
 ///
@@ -127,42 +131,48 @@ impl<R: RuntimeLite> RootArmer for Watcher<R> {
 /// out to *every* subscriber of the affected root (design §5/§8). Widening a watch
 /// (design §4) emits a synthetic dominating `Rescan` per re-pointed subscription so
 /// a consumer re-enumerates against the new, wider root.
+///
+/// # Concurrent read plane
+///
+/// [`view`](Self::view) hands out a cheap `Clone` [`WatchView`] any thread reads
+/// wait-free for membership (`is_watched`) and attribution (`resolve`), reflecting the
+/// last committed watch-set (design §5).
 pub struct Tributaries<R: RuntimeLite> {
   watcher: Watcher<R>,
-  subsumer: Subsumer<RootHandle>,
+  subsumer: Subsumer<OsString, (), RootHandle>,
   /// Attributed events staged for the coalescer, or — with debounce disabled —
   /// awaiting direct delivery. One raw event can produce several (one per covering
   /// subscriber), and a widen queues a synthetic dominating `Rescan` per re-pointed
   /// subscription. With no coalescer, `next` hands these out one per call; with a
   /// coalescer, `next` drains them into it (a `Rescan` here flushes + bypasses).
-  queue: VecDeque<Event>,
+  queue: VecDeque<Event<OsString, ()>>,
   /// Coalescer output awaiting hand-off, one per `next` call — populated by draining
   /// the coalescer on a settle-timer edge (empty and unused when debounce is off).
-  delivered: VecDeque<Event>,
+  delivered: VecDeque<Event<OsString, ()>>,
   /// The per-subscription monotone-epoch ledger (design §8): stamps every delivered
   /// event in its subscription's own epoch space (rebasing on each widen) so the raw
   /// per-`ScopeId` fs epoch — which restarts at `START` on every kernel arm — never
   /// leaks as a dominance order across a re-point.
   epochs: EpochLedger,
   /// Each live subscription's admission [`Filter`] (design §7): the fan-out gate a
-  /// non-`Rescan` event must pass, on top of path coverage. The driver holds a clone
+  /// non-`Rescan` event must pass, on top of key coverage. The driver holds a clone
   /// that **shares the swappable slot** with the [`Filter`] the caller kept from
   /// [`watch`](Tributaries::watch), so a caller [`swap`](Filter::swap) re-scopes the
   /// subscription live — no re-watch, and the very next event sees the new predicate.
   /// A `Rescan` bypasses this map entirely (coverage loss is never filtered away).
-  filters: HashMap<Subscription, Filter>,
+  filters: HashMap<Subscription, Filter<OsString, ()>>,
   /// The opt-in settle/debounce coalescer (design §6), present only when the caller
   /// supplied a [`DebounceConfig`](crate::DebounceConfig). When [`None`], `next`
   /// passes attributed events through untouched (zero overhead — no coalescer is
   /// instantiated); when [`Some`], `next` admits them and delivers on the settle
   /// timer.
-  coalescer: Option<Coalescer>,
+  coalescer: Option<Coalescer<OsString, ()>>,
   /// An in-flight widen journaled before its first disarm (design §4, cancellation
   /// safety), or [`None`] when no widen is mid-flight. Set inside
   /// [`apply_watch`] before the subsumed kernel watches are released and cleared when
   /// the widen commits or rolls back; a dropped `watch()` future leaves it [`Some`], and
   /// every public entry point calls [`resume_pending_widen`] first to repair it.
-  pending_widen: Option<WidenJournal<RootHandle>>,
+  pending_widen: Option<WidenJournal<OsString, RootHandle>>,
 }
 
 impl<R: RuntimeLite> core::fmt::Debug for Tributaries<R> {
@@ -198,6 +208,15 @@ impl<R: RuntimeLite> Tributaries<R> {
     })
   }
 
+  /// A cheap `Clone` concurrent read handle over the watch-set (design §5): any thread
+  /// answers `is_watched` / `resolve` from it wait-free, reflecting the last committed
+  /// watch-set. See [`WatchView`].
+  #[inline]
+  #[must_use]
+  pub fn view(&self) -> WatchView<OsString, (), RootHandle> {
+    self.subsumer.view()
+  }
+
   /// Subscribes to `path` with `interest` and admission `filter`, returning its
   /// [`Subscription`].
   ///
@@ -210,7 +229,7 @@ impl<R: RuntimeLite> Tributaries<R> {
   /// # Filtering, and swapping it live
   ///
   /// `filter` is this subscription's admission gate (design §7): a non-`Rescan` event
-  /// is delivered to it only if its path covers the event **and** `filter` admits the
+  /// is delivered to it only if its key covers the event **and** `filter` admits the
   /// delivery. Pass [`Filter::all`] to admit everything. A
   /// [`Rescan`](tributary_fs::EventKind::Rescan) always bypasses the filter — coverage
   /// loss is never filtered away.
@@ -240,7 +259,7 @@ impl<R: RuntimeLite> Tributaries<R> {
     &mut self,
     path: impl AsRef<Path>,
     interest: Interest,
-    filter: Filter,
+    filter: Filter<OsString, ()>,
   ) -> Result<Subscription, WatchError> {
     // Repair any widen a previously-dropped `watch()` future left mid-transaction before
     // starting our own (design §4, cancellation safety).
@@ -304,11 +323,11 @@ impl<R: RuntimeLite> Tributaries<R> {
   /// subscription (design §5), and hands the results out one per call.
   ///
   /// With the settle coalescer enabled (design §6) each attributed event is admitted
-  /// into it and deliveries come out on the settle timer — a burst to one path
+  /// into it and deliveries come out on the settle timer — a burst to one key
   /// collapses to a single event, while a [`Moved`](tributary_fs::EventKind::Moved)
   /// stays atomic and a [`Rescan`](tributary_fs::EventKind::Rescan) jumps the queue.
   /// Absent the coalescer, events pass through untouched.
-  pub async fn next(&mut self) -> Option<Event> {
+  pub async fn next(&mut self) -> Option<Event<OsString, ()>> {
     // Repair any widen a previously-dropped `watch()` future left mid-transaction before
     // draining events (design §4, cancellation safety); its restore queues the dominating
     // Rescans the loops below then deliver.
@@ -321,7 +340,7 @@ impl<R: RuntimeLite> Tributaries<R> {
   }
 
   /// The debounce-disabled path: fan out and deliver directly, one per call.
-  async fn next_passthrough(&mut self) -> Option<Event> {
+  async fn next_passthrough(&mut self) -> Option<Event<OsString, ()>> {
     loop {
       if let Some(event) = self.queue.pop_front() {
         return Some(event);
@@ -341,7 +360,7 @@ impl<R: RuntimeLite> Tributaries<R> {
   /// come due, and — if nothing is due — races the underlying stream against the
   /// coalescer's next deadline. A stream close force-flushes the coalesced tail so a
   /// still-settling burst is never dropped (no-silent-loss).
-  async fn next_debounced(&mut self) -> Option<Event> {
+  async fn next_debounced(&mut self) -> Option<Event<OsString, ()>> {
     loop {
       if let Some(event) = self.delivered.pop_front() {
         return Some(event);
@@ -409,36 +428,40 @@ impl<R: RuntimeLite> Tributaries<R> {
   /// filter + interest gate below runs against that already-projected delivery — so a
   /// move-out is gated by `removed` interest, a move-in by `created`, a whole move by
   /// `moved`.
-  fn fan_out_raw(&mut self, raw: &tributary_fs::Event) -> Vec<Event> {
+  fn fan_out_raw(&mut self, raw: &tributary_fs::Event) -> Vec<Event<OsString, ()>> {
     // Disjoint field borrows: `subsumer` resolves the root/coverage/interest, `filters`
     // the per-subscription filter, `epochs` owns the per-subscription stamp state.
     let (subsumer, filters, epochs) = (&self.subsumer, &self.filters, &mut self.epochs);
-    let Some(entry) = subsumer.entry(raw.root()) else {
+    let Some(record) = subsumer.entry(raw.root()) else {
       return Vec::new();
     };
+    let subscribers = record.subscribers.as_slice();
+    // Adapt the raw fs event into the pure `RoutableEvent<OsString>` seam, precomputing
+    // its located key (and, for a move, its source key) in the OsString-component space
+    // the router covers over.
+    let routable = FsRoutable::new(raw);
     // `raw.epoch()` is the fs epoch of this event on its current root; `set_epoch`
     // binds the umbrella stamp, rebasing away the raw fs epoch (which restarts per
     // kernel arm).
     let raw_epoch = raw.epoch();
     epochs.stamp_and_fan_out(
-      raw,
+      &routable,
       raw_epoch,
-      entry,
-      |sub| subsumer.subscription_path(sub),
+      subscribers,
+      |sub| subsumer.subscription_key(sub),
       // The admission gate (design §5/§7): a covered non-`Rescan` projection is kept
       // only if the subscription's **interest** admits its (projected) kind AND its
       // **filter** admits it. Interest is a pure fan-out gate here because every root is
-      // armed `Interest::all` (design §4) — the root always carries the kind, delivery
-      // narrows it. A subscription with no recorded interest/filter (raced concurrent
-      // drop) admits nothing — no longer live. A `Rescan` never reaches here (fan_out
-      // bypasses both gates for it).
-      |sub, event: &Event| {
+      // armed `Interest::all` (design §4). A subscription with no recorded
+      // interest/filter (raced concurrent drop) admits nothing. A `Rescan` never
+      // reaches here (fan_out bypasses both gates for it).
+      |sub, event: &Event<OsString, ()>| {
         subsumer
           .subscription_interest(sub)
           .is_some_and(|interest| interest_admits(interest, event.kind()))
           && filters.get(&sub).is_some_and(|filter| filter.admits(event))
       },
-      Event::subscription,
+      |event: &Event<OsString, ()>| event.subscription(),
       |mut event, stamp| {
         event.set_epoch(stamp);
         event
@@ -513,6 +536,62 @@ impl<R: RuntimeLite> Tributaries<R> {
   }
 }
 
+/// The pure `RoutableEvent<OsString>` adapter over one raw fs event (design §5): it
+/// precomputes the event's located key — and, for a move, its source key — in the
+/// `OsString`-component space the router covers over, and mints each delivery by
+/// retagging the wrapped fs event. The router thus stays key-generic and I/O-free while
+/// the fs-specific key extraction lives at this one boundary.
+struct FsRoutable<'a> {
+  event: &'a tributary_fs::Event,
+  key: Vec<OsString>,
+  from: Option<Vec<OsString>>,
+}
+
+impl<'a> FsRoutable<'a> {
+  fn new(event: &'a tributary_fs::Event) -> Self {
+    let key = path_components(event.path());
+    let from = event
+      .kind()
+      .moved()
+      .map(|m| path_components(MovedEvent::from(m)));
+    Self { event, key, from }
+  }
+}
+
+impl RoutableEvent<OsString> for FsRoutable<'_> {
+  type Delivered = Event<OsString, ()>;
+
+  #[inline]
+  fn key(&self) -> &[OsString] {
+    &self.key
+  }
+
+  #[inline]
+  fn move_from(&self) -> Option<&[OsString]> {
+    self.from.as_deref()
+  }
+
+  #[inline]
+  fn is_rescan(&self) -> bool {
+    self.event.is_rescan()
+  }
+
+  #[inline]
+  fn deliver(&self, sub: Subscription) -> Event<OsString, ()> {
+    Event::from_fs(sub, self.event.clone())
+  }
+
+  #[inline]
+  fn deliver_move_out(&self, sub: Subscription) -> Event<OsString, ()> {
+    Event::move_out(sub, self.event)
+  }
+
+  #[inline]
+  fn deliver_move_in(&self, sub: Subscription) -> Event<OsString, ()> {
+    Event::move_in(sub, self.event)
+  }
+}
+
 /// Plans and applies one `watch` against `armer`, threading the outcome through the
 /// sans-I/O [`Subsumer`]. Factored out of [`Tributaries::watch`] so the widen
 /// ordering, the arm-failure unwind, and the fs-canonical re-key are testable with a
@@ -525,53 +604,50 @@ impl<R: RuntimeLite> Tributaries<R> {
 /// the arm.
 ///
 /// **The committed key is fs's, not the umbrella's** (design §4, TOCTOU close): after
-/// arming, the fs-authoritative canonical path is read from
-/// [`RootArmer::root_path`] and used as the subsumption key, so events (which are
-/// fs-canonical) always route. If that path diverges from the plan in a way that
-/// changes subsumption, the just-armed root is disarmed and the watch aborts cleanly
-/// rather than committing a mis-keyed or overlapping entry.
+/// arming, the fs-authoritative canonical path is read from [`RootArmer::root_path`]
+/// and its components used as the subsumption key, so events (which are fs-canonical)
+/// always route. If that path diverges from the plan in a way that changes subsumption,
+/// the just-armed root is disarmed and the watch aborts cleanly rather than committing
+/// a mis-keyed or overlapping entry.
 ///
 /// The ordering contract (design §4): on a widen, **unwatch the subsumed roots first,
-/// then arm the wider root** — the reverse of a naive arm-before-unwatch, which the
-/// lower watcher's disjoint-root contract makes impossible ([`Watcher::watch`] rejects
-/// a root overlapping a live one with `Overlaps`, so the wider root cannot be armed
-/// while a subsumed one is still live). The brief window between the unwatch and the arm
-/// is a coverage gap, covered by the dominating [`Rescan`](tributary_fs::EventKind::Rescan)
-/// each re-pointed subscription receives (loss-is-a-Rescan — the consumer re-enumerates
-/// the wider root). If the wider arm fails the subsumed roots are **rolled back**
-/// (re-armed, each subscriber re-pointed with its own dominating `Rescan`) and the error
-/// is returned to the newcomer's `watch`; if a rollback re-arm itself fails, the affected
-/// subscribers are signalled a loss `Rescan` and their now-uncoverable root is torn out
-/// rather than left dangling. Every path either commits or aborts
-/// ([`Subsumer::abort_watch`]) so no pending reservation leaks.
+/// then arm the wider root** — the lower watcher rejects a root overlapping a live one
+/// with `Overlaps`, so the wider root cannot be armed while a subsumed one is still
+/// live. The brief coverage gap is closed by the dominating
+/// [`Rescan`](tributary_fs::EventKind::Rescan) each re-pointed subscription receives.
+/// If the wider arm fails the subsumed roots are **rolled back** (re-armed, each
+/// subscriber re-pointed with its own dominating `Rescan`); if a rollback re-arm itself
+/// fails, the affected subscribers are signalled a loss `Rescan` and their now-uncoverable
+/// root is torn out. Every path either commits or aborts ([`Subsumer::abort_watch`]) so
+/// no pending reservation leaks.
 // The driver threads its per-widen state (subsumer, epoch ledger, filters, event queue,
 // cancellation journal) plus the armer and the plan inputs; bundling them into a struct
 // would only obscure the plain data-flow of a single `watch` transaction.
 #[allow(clippy::too_many_arguments)]
 async fn apply_watch<A: RootArmer>(
-  subsumer: &mut Subsumer<A::Handle>,
+  subsumer: &mut Subsumer<OsString, (), A::Handle>,
   epochs: &mut EpochLedger,
-  filters: &mut HashMap<Subscription, Filter>,
-  queue: &mut VecDeque<Event>,
-  journal: &mut Option<WidenJournal<A::Handle>>,
+  filters: &mut HashMap<Subscription, Filter<OsString, ()>>,
+  queue: &mut VecDeque<Event<OsString, ()>>,
+  journal: &mut Option<WidenJournal<OsString, A::Handle>>,
   armer: &A,
   canonical: &Path,
   interest: Interest,
 ) -> Result<Subscription, WatchError> {
-  let outcome = subsumer.plan_watch(canonical, interest);
+  let key = path_components(canonical);
+  let outcome = subsumer.plan_watch(&key, (), interest);
   match &outcome {
     WatchOutcome::Covered { fs_root, sub } => {
       // Already covered by a live (Interest::all-armed) root: no kernel call. The
-      // covering root's fs path was validated when it was first armed, so the
-      // newcomer's provisional canonical path is used unchanged (commit ignores the
-      // fs-path arg for Covered).
+      // covering root's key was validated when it was first armed, so the newcomer's
+      // own key is used unchanged (commit ignores the fs-key arg for Covered).
       let (fs_root, sub) = (*fs_root, *sub);
-      subsumer.commit_watch(&outcome, fs_root, canonical);
+      subsumer.commit_watch(&outcome, fs_root, &key);
       Ok(sub)
     }
-    WatchOutcome::Disjoint { root_path, sub } => {
+    WatchOutcome::Disjoint { sub, .. } => {
       let sub = *sub;
-      let fs_root = match armer.arm(root_path, Interest::all()).await {
+      let fs_root = match armer.arm(canonical, Interest::all()).await {
         Ok(fs_root) => fs_root,
         Err(err) => {
           // Arm failed: abandon the plan so its pending reservation cannot leak.
@@ -581,48 +657,46 @@ async fn apply_watch<A: RootArmer>(
       };
       // Re-key onto fs's authoritative canonical path (design §4). If it diverges in a
       // way that changes subsumption, disarm and abort cleanly — no mis-keyed entry.
-      let fs_path = fs_canonical_root(armer, fs_root, root_path);
-      if !subsumer.fs_path_preserves_plan(&fs_path, &[]) {
+      let fs_path = fs_canonical_root(armer, fs_root, canonical);
+      let fs_key = path_components(&fs_path);
+      if !subsumer.fs_path_preserves_plan(&fs_key, &[]) {
         let _ = armer.disarm(fs_root).await;
         subsumer.abort_watch(&outcome);
-        return Err(canonical_race(root_path, &fs_path));
+        return Err(canonical_race(canonical, &fs_path));
       }
-      subsumer.commit_watch(&outcome, fs_root, &fs_path);
+      subsumer.commit_watch(&outcome, fs_root, &fs_key);
       Ok(sub)
     }
     WatchOutcome::Widen {
-      new_root_path,
       repointed,
       unwatch,
       sub,
+      ..
     } => {
       let sub = *sub;
 
       // Journal the widen BEFORE the first disarm (design §4, cancellation safety): if
-      // this future is dropped between a disarm and the commit/rollback below (a
-      // `select!`/timeout cancel), no async cleanup can run in `Drop`, so the next public
-      // entry point reads this journal and repairs the disarmed roots. The record carries
-      // the plan outcome, whose `unwatch` handles resume probes and whose newcomer id
-      // resume aborts. Cleared on EVERY exit path (commit or either rollback) below.
+      // this future is dropped between a disarm and the commit/rollback below, no async
+      // cleanup can run in `Drop`, so the next public entry point reads this journal and
+      // repairs the disarmed roots. Cleared on EVERY exit path (commit or either
+      // rollback) below.
       *journal = Some(WidenJournal {
         outcome: outcome.clone(),
       });
 
       // Unwatch-old-then-arm-new (design §4): the lower watcher rejects a root that
-      // overlaps a live one (`Overlaps`), so the wider root cannot be armed while a
-      // subsumed one is still live — arm-before-unwatch is impossible. Release the
-      // subsumed *kernel* watches FIRST (the subsumer's own index is untouched here, so
-      // its RootEntries remain intact for a rollback and for `commit_watch`'s atomic
-      // index transition on success). The coverage gap this opens is closed by the
-      // dominating Rescan each re-pointed subscription receives below.
+      // overlaps a live one, so the wider root cannot be armed while a subsumed one is
+      // still live. Release the subsumed *kernel* watches FIRST (the subsumer's own
+      // index is untouched here, so `commit_watch`'s index transition stays atomic on
+      // success). The coverage gap this opens is closed by the dominating Rescan each
+      // re-pointed subscription receives below.
       for old in unwatch {
         let _ = armer.disarm(*old).await;
       }
 
-      // Now arm the wider root — no live overlap remains to reject it. If it fails to
-      // come up (or its fs-canonical path diverges in a way that changes subsumption),
-      // the subsumed roots are already disarmed, so restore them by rolling back.
-      let fs_root = match armer.arm(new_root_path, Interest::all()).await {
+      // Now arm the wider root — no live overlap remains to reject it. The new wider
+      // root's key equals the newcomer's own `canonical`.
+      let fs_root = match armer.arm(canonical, Interest::all()).await {
         Ok(fs_root) => fs_root,
         Err(err) => {
           rollback_widen(subsumer, epochs, filters, queue, armer, unwatch).await;
@@ -632,37 +706,32 @@ async fn apply_watch<A: RootArmer>(
         }
       };
       // Re-key onto fs's authoritative canonical path (design §4). A divergence that
-      // changes which roots this widens over (or makes it covered) invalidates the
-      // plan: disarm the just-armed wider root, roll the subsumed roots back, and abort.
-      let fs_path = fs_canonical_root(armer, fs_root, new_root_path);
-      if !subsumer.fs_path_preserves_plan(&fs_path, unwatch) {
+      // changes which roots this widens over (or makes it covered) invalidates the plan.
+      let fs_path = fs_canonical_root(armer, fs_root, canonical);
+      let fs_key = path_components(&fs_path);
+      if !subsumer.fs_path_preserves_plan(&fs_key, unwatch) {
         let _ = armer.disarm(fs_root).await;
         rollback_widen(subsumer, epochs, filters, queue, armer, unwatch).await;
         subsumer.abort_watch(&outcome);
         *journal = None;
-        return Err(canonical_race(new_root_path, &fs_path));
+        return Err(canonical_race(canonical, &fs_path));
       }
 
       // The wider root is live and adopts every re-pointed subscription. `commit_watch`
-      // drops the subsumed roots' (already-disarmed) index keys + entries and installs
-      // the wider root atomically — a pure index transition, no I/O. The widen has now
-      // fully committed, so the journal is cleared (no dropped-future repair is owed).
+      // drops the subsumed roots' index keys + entries and installs the wider root
+      // atomically. The widen has now fully committed, so the journal is cleared.
       let repointed = repointed.clone();
-      subsumer.commit_watch(&outcome, fs_root, &fs_path);
+      subsumer.commit_watch(&outcome, fs_root, &fs_key);
       *journal = None;
 
-      // Rebase each re-pointed subscription onto the new wider root (design §8): emit
-      // its synthetic dominating Rescan at its high-water `.next()` and set its
-      // `epoch_base` to that same value, so the Rescan strictly dominates the
-      // subscription's pre-widening stream while the new root's genuine events
-      // (raw fs epoch 0, 1, …) stamp to hw.next()+0, +1, … — tie-or-exceeding it
-      // (not dominated). Each subscription rebases from its own high-water. The Rescan
-      // both names fs's canonical root path (the coordinate the consumer re-enumerates)
-      // AND closes the unwatch→arm coverage gap: any event the gap missed is caught by
-      // the re-enumeration the Rescan obliges (loss-is-a-Rescan).
+      // Rebase each re-pointed subscription onto the new wider root (design §8): emit its
+      // synthetic dominating Rescan at its high-water `.next()` and set its `epoch_base`
+      // to that same value, so the Rescan strictly dominates the subscription's
+      // pre-widening stream while the new root's genuine events tie-or-exceed it. The
+      // Rescan names fs's canonical root key AND closes the unwatch→arm coverage gap.
       for moved in repointed {
         let rescan = epochs.repoint(moved);
-        queue.push_back(Event::rescan(moved, fs_path.clone(), rescan));
+        queue.push_back(Event::rescan(moved, fs_key.clone(), rescan));
       }
 
       Ok(sub)
@@ -673,14 +742,13 @@ async fn apply_watch<A: RootArmer>(
 /// Rolls a failed widen back: restores every subsumed root the widen already disarmed,
 /// re-pointing its subscribers onto a fresh handle with a dominating `Rescan`, restoring
 /// the pre-widen state (design §4/§8). Called when the wider arm fails (or its fs path
-/// diverges) after the subsumed kernel watches were released — so those subtrees are
-/// momentarily uncovered and must be brought back up. Each root is restored by
+/// diverges) after the subsumed kernel watches were released. Each root is restored by
 /// [`restore_subsumed_root`] (which handles the degenerate re-arm-also-fails case).
 async fn rollback_widen<A: RootArmer>(
-  subsumer: &mut Subsumer<A::Handle>,
+  subsumer: &mut Subsumer<OsString, (), A::Handle>,
   epochs: &mut EpochLedger,
-  filters: &mut HashMap<Subscription, Filter>,
-  queue: &mut VecDeque<Event>,
+  filters: &mut HashMap<Subscription, Filter<OsString, ()>>,
+  queue: &mut VecDeque<Event<OsString, ()>>,
   armer: &A,
   unwatch: &[A::Handle],
 ) {
@@ -700,22 +768,23 @@ async fn rollback_widen<A: RootArmer>(
 ///
 /// A no-op if `old` has no subsumer entry (already restored or never present), so it is
 /// safe to call on a root the caller is unsure about — the idempotency the
-/// [`resume_pending_widen`] repair relies on. The entry's canonical path and subscribers
-/// are read straight from the subsumer (a widen commits its index transition only on
-/// success, so a mid-widen entry is exactly the pre-widen state to restore).
+/// [`resume_pending_widen`] repair relies on. The entry's key and subscribers are read
+/// straight from the subsumer (a widen commits its index transition only on success, so a
+/// mid-widen entry is exactly the pre-widen state to restore).
 async fn restore_subsumed_root<A: RootArmer>(
-  subsumer: &mut Subsumer<A::Handle>,
+  subsumer: &mut Subsumer<OsString, (), A::Handle>,
   epochs: &mut EpochLedger,
-  filters: &mut HashMap<Subscription, Filter>,
-  queue: &mut VecDeque<Event>,
+  filters: &mut HashMap<Subscription, Filter<OsString, ()>>,
+  queue: &mut VecDeque<Event<OsString, ()>>,
   armer: &A,
   old: A::Handle,
 ) {
-  let Some(entry) = subsumer.entry(old) else {
+  let Some(record) = subsumer.entry(old) else {
     return;
   };
-  let root_path = entry.path.clone();
-  let subscribers = entry.subscribers.clone();
+  let root_key = record.key.clone();
+  let subscribers = record.subscribers.clone();
+  let root_path = PathBuf::from_iter(&root_key);
   match armer.arm(&root_path, Interest::all()).await {
     Ok(fresh) => {
       // Restored: re-key the root onto the fresh handle and re-point every subscriber
@@ -723,7 +792,7 @@ async fn restore_subsumed_root<A: RootArmer>(
       subsumer.rekey_root(old, fresh);
       for moved in subscribers {
         let rescan = epochs.repoint(moved);
-        queue.push_back(Event::rescan(moved, root_path.clone(), rescan));
+        queue.push_back(Event::rescan(moved, root_key.clone(), rescan));
       }
     }
     Err(_) => {
@@ -732,7 +801,7 @@ async fn restore_subsumed_root<A: RootArmer>(
       // per-subscription state so nothing dangles on a never-armed handle.
       for lost in subsumer.force_remove_root(old) {
         let rescan = epochs.repoint(lost);
-        queue.push_back(Event::rescan(lost, root_path.clone(), rescan));
+        queue.push_back(Event::rescan(lost, root_key.clone(), rescan));
         filters.remove(&lost);
         epochs.remove(lost);
       }
@@ -752,26 +821,20 @@ async fn restore_subsumed_root<A: RootArmer>(
 /// 1. For each subsumed root the plan named: if fs still knows it
 ///    ([`RootArmer::root_path`] is `Some`), the drop happened before that disarm — leave
 ///    it live. If fs no longer knows it (`None` — it was disarmed), restore it via
-///    [`restore_subsumed_root`] (re-arm + re-point with a dominating `Rescan`, or tear out
-///    + signal loss on a re-arm failure).
+///    [`restore_subsumed_root`].
 /// 2. Abort the newcomer's partial plan ([`Subsumer::abort_watch`]) so its pending
-///    reservation cannot leak; the dropped future inserted no filter for it, so there is
-///    none to reclaim.
+///    reservation cannot leak.
 /// 3. Clear the journal.
 ///
 /// **Idempotent:** a no-op when `journal` is `None`, and — because step 1 probes each
 /// root's liveness and [`restore_subsumed_root`] no-ops an absent entry — safe to call
 /// when only some subsumed roots were disarmed, or when a prior resume already ran.
-///
-/// **Retirement interaction (design §4):** this runs at the top of `next` before any raw
-/// fs event is pulled, so a journaled widen is always resumed before dead-root retirement
-/// could observe a subsumed root's (now re-armed, fresh) handle — the two never collide.
 async fn resume_pending_widen<A: RootArmer>(
-  subsumer: &mut Subsumer<A::Handle>,
+  subsumer: &mut Subsumer<OsString, (), A::Handle>,
   epochs: &mut EpochLedger,
-  filters: &mut HashMap<Subscription, Filter>,
-  queue: &mut VecDeque<Event>,
-  journal: &mut Option<WidenJournal<A::Handle>>,
+  filters: &mut HashMap<Subscription, Filter<OsString, ()>>,
+  queue: &mut VecDeque<Event<OsString, ()>>,
+  journal: &mut Option<WidenJournal<OsString, A::Handle>>,
   armer: &A,
 ) {
   let Some(WidenJournal { outcome }) = journal.take() else {
@@ -819,11 +882,7 @@ fn interest_admits(interest: Interest, kind: &tributary_fs::EventKind) -> bool {
 /// back to the planned path if fs cannot report one (the handle raced a teardown) —
 /// the planned path was the best canonicalization available, and a subsequent event
 /// under a now-dead root routes to nothing regardless.
-fn fs_canonical_root<A: RootArmer>(
-  armer: &A,
-  fs_root: A::Handle,
-  planned: &Path,
-) -> std::path::PathBuf {
+fn fs_canonical_root<A: RootArmer>(armer: &A, fs_root: A::Handle, planned: &Path) -> PathBuf {
   armer
     .root_path(fs_root)
     .unwrap_or_else(|| planned.to_path_buf())

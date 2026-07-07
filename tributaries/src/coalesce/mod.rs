@@ -1,9 +1,10 @@
 //! The opt-in settle/debounce coalescer — a pure, sans-I/O state machine (design §6).
 //!
-//! A [`Coalescer`] buffers post-attribution [`Event`]s keyed by
-//! `(Subscription, path)` and collapses a burst of changes to one canonical path into
-//! a single emission, so a consumer that only cares about the *settled* state of a
-//! file is not woken once per intermediate write. It is **pure**: it reads no clock
+//! A [`Coalescer`] buffers post-attribution [`Event`]s keyed by `(Subscription, key)`
+//! and collapses a burst of changes to one key into a single emission, so a consumer
+//! that only cares about the *settled* state of a file is not woken once per
+//! intermediate write. It is generic over the key component `C` and the caller value
+//! `V`, exactly like the [`Event`] it buffers. It is **pure**: it reads no clock
 //! and knows no runtime — every time-dependent entry point takes an explicit
 //! `now: Instant`, so it is exhaustively testable with a manual clock and zero real
 //! time. All timer I/O lives in the driver (design global constraints): the driver
@@ -55,8 +56,8 @@
 
 use std::{
   collections::{BTreeMap, VecDeque},
-  path::PathBuf,
   time::Instant,
+  vec::Vec,
 };
 
 use tributary_fs::EventKind;
@@ -66,19 +67,19 @@ use crate::{event::Event, options::DebounceConfig, subscription::Subscription};
 #[cfg(test)]
 mod tests;
 
-/// The buffer key: one coalescing slot per caller subscription and canonical path.
+/// The buffer key: one coalescing slot per caller subscription and key.
 ///
-/// Ordered (`Subscription` and `PathBuf` are both `Ord`) so the backing [`BTreeMap`]
+/// Ordered (`Subscription` and `Vec<C>` are both `Ord`) so the backing [`BTreeMap`]
 /// iterates deterministically — the design forbids `HashMap`-iteration nondeterminism
 /// in the drain order (§10).
-type Key = (Subscription, PathBuf);
+type Key<C> = (Subscription, Vec<C>);
 
 /// One buffered, still-coalescing entry: the current collapsed event plus the two
 /// deadlines that decide when it emits.
 #[derive(Debug, Clone)]
-struct Buffered {
+struct Buffered<C, V> {
   /// When the burst began — the anchor for the [`max_hold`](DebounceConfig::max_hold)
-  /// ceiling, preserved across every collapse so a continuously-touched path cannot
+  /// ceiling, preserved across every collapse so a continuously-touched key cannot
   /// reset its own hold cap.
   first_seen: Instant,
   /// When this entry is due: `min(last_seen + quiet_window, first_seen + max_hold)`.
@@ -86,7 +87,7 @@ struct Buffered {
   /// `first_seen + max_hold` cap bounds the total hold.
   emit_at: Instant,
   /// The current collapsed event, stamped with the newest observation's umbrella epoch.
-  event: Event,
+  event: Event<C, V>,
 }
 
 /// The action the [collapse table](self#the-collapse-table-design-6) dictates for a
@@ -116,21 +117,24 @@ enum Collapse {
 /// exists). See the [module docs](self) for the collapse table and the overriding
 /// invariants.
 #[derive(Debug)]
-pub(crate) struct Coalescer {
+pub(crate) struct Coalescer<C, V> {
   cfg: DebounceConfig,
-  /// The coalescing slots, one per `(subscription, path)`. A [`BTreeMap`] for a
+  /// The coalescing slots, one per `(subscription, key)`. A [`BTreeMap`] for a
   /// deterministic drain order.
-  buffer: BTreeMap<Key, Buffered>,
+  buffer: BTreeMap<Key<C>, Buffered<C, V>>,
   /// Events that must emit *immediately*, in FIFO order: [`Moved`](EventKind::Moved)
   /// whole, a [`Rescan`](EventKind::Rescan), and the buffered entries a `Moved`/`Rescan`
   /// flushed. Each is tagged with the `now` it became ready (its effective `emit_at`),
   /// so [`next_deadline`](Self::next_deadline) reports it and [`drain_ready`](Self::drain_ready)
   /// releases it. FIFO preserves "flushed entries before the signal that flushed them"
   /// and "a `Rescan` jumps the queue ahead of a still-buffering burst".
-  ready: VecDeque<(Instant, Event)>,
+  ready: VecDeque<(Instant, Event<C, V>)>,
 }
 
-impl Coalescer {
+impl<C, V> Coalescer<C, V>
+where
+  C: Ord + Clone,
+{
   /// Creates a coalescer with the given settle policy.
   pub(crate) fn new(cfg: DebounceConfig) -> Self {
     Self {
@@ -150,7 +154,7 @@ impl Coalescer {
   /// ready, or — for exactly the create-then-remove transient — intentionally
   /// annihilated. `now` must be nondecreasing across calls (the driver's monotonic
   /// clock guarantees it).
-  pub(crate) fn admit(&mut self, ev: Event, now: Instant) {
+  pub(crate) fn admit(&mut self, ev: Event<C, V>, now: Instant) {
     if ev.is_rescan() {
       // Rescan: flush every buffered entry for this subscription (their content is now
       // suspect) and emit the Rescan undelayed, its upstream epoch stamp preserved.
@@ -197,7 +201,7 @@ impl Coalescer {
   ///
   /// After this the coalescer holds only entries still settling; their deadlines are
   /// reported by [`next_deadline`](Self::next_deadline). `now` must be nondecreasing.
-  pub(crate) fn drain_ready(&mut self, now: Instant, out: &mut Vec<Event>) {
+  pub(crate) fn drain_ready(&mut self, now: Instant, out: &mut Vec<Event<C, V>>) {
     // Immediate emissions first: everything the ready queue holds is due (each was
     // enqueued with `emit_at <= its own now <= now`), and FIFO order keeps a Rescan
     // after the entries it flushed and ahead of the buffered bursts.
@@ -210,7 +214,7 @@ impl Coalescer {
       }
     }
     // Then the buffered entries that have come due, in key order (deterministic).
-    let due: Vec<Key> = self
+    let due: Vec<Key<C>> = self
       .buffer
       .iter()
       .filter(|(_, b)| b.emit_at <= now)
@@ -228,7 +232,7 @@ impl Coalescer {
   /// For stream close: once the source is drained no further change can arrive to
   /// settle a buffered burst, so the driver force-emits the coalesced tail rather than
   /// silently dropping it (no-silent-loss).
-  pub(crate) fn flush_all(&mut self, out: &mut Vec<Event>) {
+  pub(crate) fn flush_all(&mut self, out: &mut Vec<Event<C, V>>) {
     out.extend(self.ready.drain(..).map(|(_, event)| event));
     out.extend(
       std::mem::take(&mut self.buffer)
@@ -238,9 +242,9 @@ impl Coalescer {
   }
 
   /// Buffers a lifecycle event, collapsing it onto any entry already held for its
-  /// `(subscription, path)` per the [table](self#the-collapse-table-design-6).
-  fn coalesce(&mut self, ev: Event, now: Instant) {
-    let key = (ev.subscription(), ev.path().to_path_buf());
+  /// `(subscription, key)` per the [table](self#the-collapse-table-design-6).
+  fn coalesce(&mut self, ev: Event<C, V>, now: Instant) {
+    let key = (ev.subscription(), ev.key().to_vec());
     // Read the settle windows up front so recomputing the deadline does not re-borrow
     // `self` while the buffered entry is held mutably.
     let (quiet, max_hold) = (self.cfg.quiet_window(), self.cfg.max_hold());
@@ -271,10 +275,10 @@ impl Coalescer {
       }
       Collapse::BecomeModified => {
         // Removed-then-Created churn: the net is a Modified carried by neither event —
-        // mint one at the shared path/location with the newest epoch.
+        // mint one at the shared key/location with the newest epoch.
         buffered.event = Event::synthetic(
           ev.subscription(),
-          ev.path().to_path_buf(),
+          ev.key().to_vec(),
           ev.location().clone(),
           EventKind::Modified,
           ev.epoch(),
@@ -326,9 +330,9 @@ impl Coalescer {
   /// deterministic key order — a `Rescan`'s "content is now suspect, emit what we held"
   /// (design §6).
   fn flush_subscription(&mut self, sub: Subscription, now: Instant) {
-    let keys: Vec<Key> = self
+    let keys: Vec<Key<C>> = self
       .buffer
-      .range((sub, PathBuf::new())..)
+      .range((sub, Vec::new())..)
       .take_while(|((s, _), _)| *s == sub)
       .map(|(k, _)| k.clone())
       .collect();
