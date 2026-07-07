@@ -1,5 +1,9 @@
 use core::{num::NonZeroU64, time::Duration};
-use std::{path::PathBuf, time::Instant};
+use std::{
+  ffi::OsString,
+  path::{Path, PathBuf},
+  time::Instant,
+};
 
 use tributary_fs::{Epoch, EventKind, Location};
 use tributary_proto::ScopeId;
@@ -7,34 +11,39 @@ use tributary_proto::ScopeId;
 use super::Coalescer;
 use crate::{event::Event, options::DebounceConfig, subscription::Subscription};
 
+/// The delivered-event type this coalescer buffers: the fs `C = OsString`, `V = ()`.
+type Ev = Event<OsString, ()>;
+
 /// A subscription with the given non-zero id.
 fn sub(id: u64) -> Subscription {
   Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
 }
 
-/// A synthetic event of `kind` for `s` at `path`, stamped `epoch`. The coalescer only
-/// reads `subscription`/`path`/`kind`/`epoch`/`location`, so a synthetic stand-in
-/// exercises it without the private `tributary_fs::Event` constructor. Its `location`
-/// is a fresh (root-anchored) one — the coalescer never keys on `location`.
-fn ev(s: Subscription, path: &str, kind: EventKind, epoch: u64) -> Event {
-  Event::synthetic(
-    s,
-    PathBuf::from(path),
-    Location::new(),
-    kind,
-    Epoch::new(epoch),
-  )
+/// A path's `OsString` components — the located-key form the fs source keys on.
+fn key(path: &str) -> Vec<OsString> {
+  Path::new(path)
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
 }
 
-fn created(s: Subscription, path: &str, epoch: u64) -> Event {
+/// A synthetic event of `kind` for `s` at `path`, stamped `epoch`. The coalescer only
+/// reads `subscription`/`key`/`kind`/`epoch`/`location`, so a synthetic stand-in
+/// exercises it without the private `tributary_fs::Event` constructor. Its `location`
+/// is a fresh (root-anchored) one — the coalescer never keys on `location`.
+fn ev(s: Subscription, path: &str, kind: EventKind, epoch: u64) -> Ev {
+  Event::synthetic(s, key(path), Location::new(), kind, Epoch::new(epoch))
+}
+
+fn created(s: Subscription, path: &str, epoch: u64) -> Ev {
   ev(s, path, EventKind::Created, epoch)
 }
 
-fn modified(s: Subscription, path: &str, epoch: u64) -> Event {
+fn modified(s: Subscription, path: &str, epoch: u64) -> Ev {
   ev(s, path, EventKind::Modified, epoch)
 }
 
-fn removed(s: Subscription, path: &str, epoch: u64) -> Event {
+fn removed(s: Subscription, path: &str, epoch: u64) -> Ev {
   ev(s, path, EventKind::Removed, epoch)
 }
 
@@ -42,21 +51,21 @@ fn removed(s: Subscription, path: &str, epoch: u64) -> Event {
 /// synthetic move surfaces through `move_from` (which the coalescer keys on) — its
 /// `kind` stays `Modified` and its `moved()` is `None`; tests inspect it via
 /// [`is_moved`] / `move_from`.
-fn moved(s: Subscription, path: &str, from: &str, epoch: u64) -> Event {
-  Event::synthetic_moved(
-    s,
-    PathBuf::from(path),
-    PathBuf::from(from),
-    Epoch::new(epoch),
-  )
+fn moved(s: Subscription, path: &str, from: &str, epoch: u64) -> Ev {
+  Event::synthetic_moved(s, key(path), key(from), Epoch::new(epoch))
 }
 
 /// Whether `ev` is a move — the same wrapper-level detector the coalescer uses.
-fn is_moved(ev: &Event) -> bool {
+fn is_moved(ev: &Ev) -> bool {
   ev.move_from().is_some()
 }
 
-fn rescan(s: Subscription, path: &str, epoch: u64) -> Event {
+/// The move source of `ev` as a path — reconstructed from its located source key.
+fn move_from_path(ev: &Ev) -> PathBuf {
+  PathBuf::from_iter(ev.move_from().expect("a move source"))
+}
+
+fn rescan(s: Subscription, path: &str, epoch: u64) -> Ev {
   ev(s, path, EventKind::Rescan, epoch)
 }
 
@@ -88,7 +97,7 @@ impl Clock {
 }
 
 /// Drain everything due at `now` into a fresh `Vec`.
-fn drain(coalescer: &mut Coalescer, now: Instant) -> Vec<Event> {
+fn drain(coalescer: &mut Coalescer<OsString, ()>, now: Instant) -> Vec<Ev> {
   let mut out = Vec::new();
   coalescer.drain_ready(now, &mut out);
   out
@@ -223,7 +232,7 @@ fn moved_is_atomic_and_flushes() {
   let m = moved_events[0];
   assert_eq!(m.path(), PathBuf::from("/a/dst"), "the rename destination");
   assert_eq!(
-    m.move_from().expect("a move source"),
+    move_from_path(m),
     PathBuf::from("/a/src"),
     "the rename source is intact — the Moved was not split"
   );
@@ -568,7 +577,7 @@ mod proptests {
 
   /// Build one event for `step` for subscription `s`, at monotone epoch `epoch`.
   /// One fixed subscription keeps the property focused on the collapse/flush logic.
-  fn event_for(s: Subscription, step: &Step, epoch: u64) -> Event {
+  fn event_for(s: Subscription, step: &Step, epoch: u64) -> Ev {
     let path = format!("/root/p{}", step.path);
     match step.kind {
       0 => created(s, &path, epoch),

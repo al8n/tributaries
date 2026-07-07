@@ -1,12 +1,31 @@
 use std::{
   collections::{BTreeSet, HashMap, HashSet},
+  ffi::OsString,
   path::{Path, PathBuf},
+  vec::Vec,
 };
 
 use proptest::prelude::*;
 use tributary_proto::Interest;
 
 use super::{Subscription, Subsumer, UnwatchOutcome, WatchOutcome};
+
+/// The subsumer under test: fs key component `OsString`, no per-watch value, `u32`
+/// handles (the trivial stand-in for the real `tributary-fs` handle).
+type S = Subsumer<OsString, (), u32>;
+
+/// A path's `OsString` components — the key form the fs source uses.
+fn key(path: &str) -> Vec<OsString> {
+  key_of(Path::new(path))
+}
+
+/// The `OsString` components of a path.
+fn key_of(path: &Path) -> Vec<OsString> {
+  path
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
+}
 
 /// A monotonic minter of `u32` fs-root test handles — stands in for the real
 /// `tributary-fs` handle the driver obtains by arming a kernel watch.
@@ -22,34 +41,30 @@ impl Handles {
   }
 }
 
-/// A test-side driver mirroring what S2 will do: plan the watch, mint a fresh
-/// handle for a new/widened root (reuse the existing one when covered), then
-/// commit. Returns the committed root handle plus the engine-minted subscription.
-fn watch(
-  s: &mut Subsumer<u32>,
-  handles: &mut Handles,
-  path: &str,
-  interest: Interest,
-) -> (u32, Subscription) {
-  let outcome = s.plan_watch(Path::new(path), interest);
+/// A test-side driver mirroring what the real driver does: plan the watch, mint a fresh
+/// handle for a new/widened root (reuse the existing one when covered), then commit.
+/// Returns the committed root handle plus the engine-minted subscription. The tests use
+/// a fs-canonical key identical to the planned one (no TOCTOU), so the committed key is
+/// the planned one itself.
+fn watch(s: &mut S, handles: &mut Handles, path: &str, interest: Interest) -> (u32, Subscription) {
+  let k = key(path);
+  let outcome = s.plan_watch(&k, (), interest);
   let (fs_root, sub) = match &outcome {
     WatchOutcome::Covered { fs_root, sub } => (*fs_root, *sub),
     WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (handles.mint(), *sub),
   };
-  // The tests use a fs-canonical path identical to the planned one (no TOCTOU), so
-  // the committed key is the planned path itself.
-  s.commit_watch(&outcome, fs_root, Path::new(path));
+  s.commit_watch(&outcome, fs_root, &k);
   (fs_root, sub)
 }
 
-/// The canonical paths of every live root, as a set.
-fn root_paths(s: &Subsumer<u32>) -> BTreeSet<PathBuf> {
-  s.roots().map(|(p, _)| p.to_path_buf()).collect()
+/// The keys of every live root, as a set.
+fn root_keys(s: &S) -> BTreeSet<Vec<OsString>> {
+  s.roots().map(|(k, _)| k.to_vec()).collect()
 }
 
 #[test]
 fn disjoint_paths_stay_separate() {
-  let mut s = Subsumer::<u32>::new();
+  let mut s = S::new();
   let mut h = Handles::default();
 
   let (ra, sa) = watch(&mut s, &mut h, "/a", Interest::all());
@@ -57,26 +72,23 @@ fn disjoint_paths_stay_separate() {
 
   assert_ne!(ra, rb, "unrelated paths get distinct roots");
   assert_ne!(sa, sb, "each watch mints a distinct subscription");
-  assert_eq!(
-    root_paths(&s),
-    BTreeSet::from([PathBuf::from("/a"), PathBuf::from("/b")]),
-  );
+  assert_eq!(root_keys(&s), BTreeSet::from([key("/a"), key("/b")]));
   assert_eq!(s.entry(ra).unwrap().subscribers, vec![sa]);
   assert_eq!(s.entry(rb).unwrap().subscribers, vec![sb]);
-  // The side table records each subscription's registration path.
-  assert_eq!(s.subscription_path(sa), Some(Path::new("/a")));
-  assert_eq!(s.subscription_path(sb), Some(Path::new("/b")));
+  // The side table records each subscription's registration key.
+  assert_eq!(s.subscription_key(sa), Some(key("/a").as_slice()));
+  assert_eq!(s.subscription_key(sb), Some(key("/b").as_slice()));
 }
 
 #[test]
 fn descendant_is_covered() {
-  let mut s = Subsumer::<u32>::new();
+  let mut s = S::new();
   let mut h = Handles::default();
 
   let (ra, sa) = watch(&mut s, &mut h, "/a", Interest::all());
 
   // `/a/b` is already covered by `/a`: no new root, no new kernel watch.
-  let outcome = s.plan_watch(Path::new("/a/b"), Interest::all());
+  let outcome = s.plan_watch(&key("/a/b"), (), Interest::all());
   let sb = match &outcome {
     WatchOutcome::Covered { fs_root, sub } => {
       assert_eq!(*fs_root, ra, "covered by the /a root");
@@ -84,33 +96,32 @@ fn descendant_is_covered() {
     }
     other => panic!("expected Covered by /a, got {other:?}"),
   };
-  s.commit_watch(&outcome, ra, Path::new("/a/b"));
+  s.commit_watch(&outcome, ra, &key("/a/b"));
 
-  assert_eq!(root_paths(&s), BTreeSet::from([PathBuf::from("/a")]));
+  assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
   assert_eq!(s.entry(ra).unwrap().subscribers, vec![sa, sb]);
-  // The covered subscription records its own (narrower) path and its interest.
-  assert_eq!(s.subscription_path(sb), Some(Path::new("/a/b")));
+  // The covered subscription records its own (narrower) key and its interest.
+  assert_eq!(s.subscription_key(sb), Some(key("/a/b").as_slice()));
   assert_eq!(s.subscription_interest(sb), Some(Interest::all()));
 }
 
 #[test]
 fn ancestor_widens_and_repoints() {
-  let mut s = Subsumer::<u32>::new();
+  let mut s = S::new();
   let mut h = Handles::default();
 
   let (narrow, s_narrow) = watch(&mut s, &mut h, "/a/b", Interest::all());
 
   // Watching the strict ancestor `/a` subsumes `/a/b`.
-  let outcome = s.plan_watch(Path::new("/a"), Interest::all());
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
   let s_wide = match &outcome {
     WatchOutcome::Widen {
-      new_root_path,
+      new_root_key,
       repointed,
       unwatch,
       sub,
-      ..
     } => {
-      assert_eq!(new_root_path, Path::new("/a"));
+      assert_eq!(new_root_key, &key("/a"));
       assert_eq!(
         repointed,
         &vec![s_narrow],
@@ -122,19 +133,19 @@ fn ancestor_widens_and_repoints() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, Path::new("/a"));
+  s.commit_watch(&outcome, wide, &key("/a"));
 
   assert_ne!(wide, narrow);
-  assert_eq!(root_paths(&s), BTreeSet::from([PathBuf::from("/a")]));
+  assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
   // The old narrow root is gone; both subs now ride the wider root.
   assert!(s.entry(narrow).is_none());
   assert_eq!(s.entry(wide).unwrap().subscribers, vec![s_narrow, s_wide]);
-  assert_eq!(s.entry(wide).unwrap().path, PathBuf::from("/a"));
+  assert_eq!(s.entry(wide).unwrap().key, key("/a"));
 }
 
 #[test]
 fn unwatch_last_subscriber_empties_root() {
-  let mut s = Subsumer::<u32>::new();
+  let mut s = S::new();
   let mut h = Handles::default();
 
   let (ra, sa) = watch(&mut s, &mut h, "/a", Interest::all());
@@ -150,7 +161,7 @@ fn unwatch_last_subscriber_empties_root() {
     Some(UnwatchOutcome::RootEmptied { fs_root }) if fs_root == ra,
   ));
   assert!(s.entry(ra).is_none());
-  assert!(root_paths(&s).is_empty());
+  assert!(root_keys(&s).is_empty());
 
   // Unknown / already-dropped subscriptions report nothing.
   assert!(s.plan_unwatch(sa).is_none());
@@ -161,7 +172,7 @@ fn unwatch_last_subscriber_empties_root() {
 /// keeps its own gate. A widen re-point preserves each re-pointed sub's interest.
 #[test]
 fn side_table_records_per_subscription_interest() {
-  let mut s = Subsumer::<u32>::new();
+  let mut s = S::new();
   let mut h = Handles::default();
 
   let created = Interest::new().with_created();
@@ -173,8 +184,7 @@ fn side_table_records_per_subscription_interest() {
   assert_eq!(s.subscription_interest(sa), Some(created));
   assert_eq!(s.subscription_interest(sb), Some(removed));
 
-  // Widen over /a/x's sibling by watching /a's ancestor is not applicable; instead
-  // widen the whole tree with /: both /a's subs re-point, each keeping its interest.
+  // Widen the whole tree with /: both /a's subs re-point, each keeping its interest.
   let modified = Interest::new().with_modified();
   let (_root, sroot) = watch(&mut s, &mut h, "/", modified);
   assert_eq!(
@@ -184,41 +194,39 @@ fn side_table_records_per_subscription_interest() {
   );
   assert_eq!(s.subscription_interest(sb), Some(removed));
   assert_eq!(s.subscription_interest(sroot), Some(modified));
-  // An unknown subscription has no interest.
-  assert_eq!(root_paths(&s), BTreeSet::from([PathBuf::from("/")]));
+  assert_eq!(root_keys(&s), BTreeSet::from([key("/")]));
 }
 
-/// The fs-path TOCTOU guard (design §4): committing at a fs-canonical path is safe iff
-/// it keeps the planned subsumption — same disjointness, subsuming exactly the planned
-/// roots — and unsafe (the driver aborts) when the fs path is now covered by, or
+/// The fs-key TOCTOU guard (design §4): committing at a fs-canonical key is safe iff it
+/// keeps the planned subsumption — same disjointness, subsuming exactly the planned
+/// roots — and unsafe (the driver aborts) when the fs key is now covered by, or
 /// overlaps a different set of, existing roots.
 #[test]
 fn fs_path_preserves_plan_detects_subsumption_divergence() {
-  let mut s = Subsumer::<u32>::new();
+  let mut s = S::new();
   let mut h = Handles::default();
   let (_ra, _sa) = watch(&mut s, &mut h, "/a", Interest::all());
 
-  // A disjoint plan (unwatch empty): a fs path still disjoint from /a preserves it…
+  // A disjoint plan (unwatch empty): a fs key still disjoint from /a preserves it…
   assert!(
-    s.fs_path_preserves_plan(Path::new("/b"), &[]),
-    "a still-disjoint fs path preserves a Disjoint plan"
+    s.fs_path_preserves_plan(&key("/b"), &[]),
+    "a still-disjoint fs key preserves a Disjoint plan"
   );
-  // …but a fs path now COVERED by the existing /a does not (it should have been
-  // Covered, never a fresh arm).
+  // …but a fs key now COVERED by the existing /a does not (it should have been Covered).
   assert!(
-    !s.fs_path_preserves_plan(Path::new("/a/x"), &[]),
-    "a fs path covered by an existing root invalidates a Disjoint plan"
+    !s.fs_path_preserves_plan(&key("/a/x"), &[]),
+    "a fs key covered by an existing root invalidates a Disjoint plan"
   );
 
-  // A widen plan that drained a specific root: the fs path must subsume exactly it.
+  // A widen plan that drained a specific root: the fs key must subsume exactly it.
   let (rb, _sb) = watch(&mut s, &mut h, "/c/d", Interest::all());
   assert!(
-    s.fs_path_preserves_plan(Path::new("/c"), &[rb]),
-    "a fs path subsuming exactly the planned root preserves the Widen plan"
+    s.fs_path_preserves_plan(&key("/c"), &[rb]),
+    "a fs key subsuming exactly the planned root preserves the Widen plan"
   );
   assert!(
-    !s.fs_path_preserves_plan(Path::new("/c"), &[]),
-    "a fs path that now subsumes a root the plan did not drain invalidates it"
+    !s.fs_path_preserves_plan(&key("/c"), &[]),
+    "a fs key that now subsumes a root the plan did not drain invalidates it"
   );
 }
 
@@ -227,8 +235,8 @@ fn fs_path_preserves_plan_detects_subsumption_divergence() {
 // ---------------------------------------------------------------------------
 
 /// Whether `ancestor` is an ancestor of (or equal to) `descendant` in the
-/// component-wise canonical-path space (the same relation iradix keys on).
-fn is_ancestor_or_equal(ancestor: &Path, descendant: &Path) -> bool {
+/// component-wise key space (the same relation iradix keys on).
+fn is_ancestor_or_equal(ancestor: &[OsString], descendant: &[OsString]) -> bool {
   descendant.starts_with(ancestor)
 }
 
@@ -241,8 +249,8 @@ enum Op {
   Unwatch(usize),
 }
 
-/// A pool of short, overlapping absolute paths drawn from a tiny component
-/// alphabet, so watches genuinely nest and subsume rather than staying disjoint.
+/// A pool of short, overlapping absolute paths drawn from a tiny component alphabet, so
+/// watches genuinely nest and subsume rather than staying disjoint.
 fn path_strategy() -> impl Strategy<Value = PathBuf> {
   proptest::collection::vec(prop_oneof!["a", "b", "c"], 1..=4)
     .prop_map(|parts| PathBuf::from(format!("/{}", parts.join("/"))))
@@ -256,11 +264,11 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 }
 
 /// Replays `ops` against a fresh engine, returning it and the live
-/// `Subscription -> canonical path` model the script implies. Both sides agree on
-/// liveness: the model records exactly the subscription each `watch` minted and
-/// removes exactly the one each `unwatch` dropped.
-fn run(ops: &[Op]) -> (Subsumer<u32>, HashMap<Subscription, PathBuf>) {
-  let mut s = Subsumer::<u32>::new();
+/// `Subscription -> registration path` model the script implies. Both sides agree on
+/// liveness: the model records exactly the subscription each `watch` minted and removes
+/// exactly the one each `unwatch` dropped.
+fn run(ops: &[Op]) -> (S, HashMap<Subscription, PathBuf>) {
+  let mut s = S::new();
   let mut h = Handles::default();
   // Insertion-ordered so an `Unwatch(idx)` selection is deterministic.
   let mut live: Vec<(Subscription, PathBuf)> = Vec::new();
@@ -295,7 +303,7 @@ proptest! {
   #[test]
   fn roots_are_pairwise_disjoint(ops in proptest::collection::vec(op_strategy(), 0..40)) {
     let (s, _live) = run(&ops);
-    let roots: Vec<PathBuf> = s.roots().map(|(p, _)| p.to_path_buf()).collect();
+    let roots: Vec<Vec<OsString>> = s.roots().map(|(k, _)| k.to_vec()).collect();
     for (i, a) in roots.iter().enumerate() {
       for (j, b) in roots.iter().enumerate() {
         if i != j {
@@ -309,18 +317,19 @@ proptest! {
   }
 
   /// (b) Every live subscription is covered by exactly one root that is an
-  /// ancestor-or-equal of its path. The path is read from the engine's own side
-  /// table (via `subscription_path`), so this also checks the side table stays
-  /// consistent with the script across widening re-points.
+  /// ancestor-or-equal of its key. The key is read from the engine's own side table
+  /// (via `subscription_key`), so this also checks the side table stays consistent with
+  /// the script across widening re-points.
   #[test]
   fn every_sub_covered_by_exactly_one_root(ops in proptest::collection::vec(op_strategy(), 0..40)) {
     let (s, live) = run(&ops);
-    let roots: Vec<PathBuf> = s.roots().map(|(p, _)| p.to_path_buf()).collect();
+    let roots: Vec<Vec<OsString>> = s.roots().map(|(k, _)| k.to_vec()).collect();
     for (sub, expected_path) in &live {
       let recorded = s
-        .subscription_path(*sub)
-        .expect("a live subscription has a recorded path");
-      prop_assert_eq!(recorded, expected_path.as_path(), "side-table path drifted");
+        .subscription_key(*sub)
+        .expect("a live subscription has a recorded key");
+      let expected = key_of(expected_path);
+      prop_assert_eq!(recorded, expected.as_slice(), "side-table key drifted");
       let covering = roots.iter().filter(|r| is_ancestor_or_equal(r, recorded)).count();
       prop_assert_eq!(
         covering, 1,
@@ -330,25 +339,25 @@ proptest! {
     }
   }
 
-  /// (c) No live root has an empty subscriber set, and every indexed root has an
-  /// entry (the index and the entries map stay in lockstep).
+  /// (c) No live root has an empty subscriber set, and every indexed root has an entry
+  /// (the index and the reverse index stay in lockstep).
   #[test]
   fn no_zero_subscriber_root(ops in proptest::collection::vec(op_strategy(), 0..40)) {
     let (s, _live) = run(&ops);
-    for (_path, handle) in s.roots() {
+    for (_key, handle) in s.roots() {
       let entry = s.entry(handle).expect("indexed root has an entry");
       prop_assert!(!entry.subscribers.is_empty(), "root {handle} has no subscribers");
     }
   }
 
-  /// The whole live subscription set is exactly what the script implies — nothing
-  /// is dropped or duplicated across widening re-points.
+  /// The whole live subscription set is exactly what the script implies — nothing is
+  /// dropped or duplicated across widening re-points.
   #[test]
   fn live_sub_set_matches_model(ops in proptest::collection::vec(op_strategy(), 0..40)) {
     let (s, live) = run(&ops);
     let engine_subs: HashSet<Subscription> = s
       .roots()
-      .flat_map(|(_p, h)| s.entry(h).unwrap().subscribers.clone())
+      .flat_map(|(_k, h)| s.entry(h).unwrap().subscribers.clone())
       .collect();
     let model_subs: HashSet<Subscription> = live.keys().copied().collect();
     prop_assert_eq!(engine_subs, model_subs);

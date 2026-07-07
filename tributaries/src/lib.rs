@@ -96,6 +96,7 @@ mod options;
 mod route;
 mod subscription;
 pub(crate) mod subsume;
+mod view;
 
 pub use driver::Tributaries;
 pub use error::{BuildError, CloseError, UnwatchError, WatchError};
@@ -103,6 +104,7 @@ pub use event::Event;
 pub use filter::Filter;
 pub use options::{DebounceConfig, TributariesOptions};
 pub use subscription::Subscription;
+pub use view::{Snapshot, WatchView};
 
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]

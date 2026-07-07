@@ -30,9 +30,10 @@ use crate::event::Event;
 /// The boxed predicate a [`Filter`] holds: a `Send + Sync` closure over the concrete
 /// delivered [`Event`]. `Send + Sync` is mandatory — the driver swaps it across the
 /// async boundary and reads it from whatever task polls `next()`.
-type Predicate = Arc<dyn Fn(&Event) -> bool + Send + Sync>;
+type Predicate<C, V> = Arc<dyn Fn(&Event<C, V>) -> bool + Send + Sync>;
 
-/// A live-swappable admission predicate for one subscription (design §7).
+/// A live-swappable admission predicate for one subscription (design §7), over the
+/// delivered [`Event<C, V>`](Event).
 ///
 /// Constructed with [`all`](Filter::all) (admit everything — the default) or
 /// [`new`](Filter::new) (a custom predicate), and mutated in place with
@@ -45,13 +46,13 @@ type Predicate = Arc<dyn Fn(&Event) -> bool + Send + Sync>;
 /// slot: a [`swap`](Filter::swap) through any handle is observed by every holder,
 /// which is what lets the driver keep a subscription's filter while the caller keeps a
 /// handle to re-scope it live.
-pub struct Filter {
-  predicate: Arc<ArcSwap<Predicate>>,
+pub struct Filter<C, V> {
+  predicate: Arc<ArcSwap<Predicate<C, V>>>,
 }
 
-impl Filter {
+impl<C, V> Filter<C, V> {
   /// A filter that admits **every** event — the default (design §7). No predicate is
-  /// evaluated; a subscription with this filter is gated only by path coverage.
+  /// evaluated; a subscription with this filter is gated only by key coverage.
   #[inline]
   #[must_use]
   pub fn all() -> Self {
@@ -60,17 +61,17 @@ impl Filter {
 
   /// A filter admitting exactly the events for which `predicate` returns `true`.
   ///
-  /// `predicate` sees the concrete delivered [`Event`] — its
-  /// [`path`](Event::path), [`kind`](Event::kind), [`epoch`](Event::epoch), and the
-  /// rest. It must be `Send + Sync` (the driver evaluates it from the polling task and
-  /// may [`swap`](Filter::swap) it across the async boundary). A
+  /// `predicate` sees the concrete delivered [`Event`] — its [`key`](Event::key),
+  /// [`kind`](Event::kind), [`epoch`](Event::epoch), and the rest. It must be `Send +
+  /// Sync` (the driver evaluates it from the polling task and may
+  /// [`swap`](Filter::swap) it across the async boundary). A
   /// [`Rescan`](tributary_fs::EventKind::Rescan) never reaches it — coverage loss
   /// bypasses the filter (design §7/§8).
   #[inline]
   #[must_use]
-  pub fn new(predicate: impl Fn(&Event) -> bool + Send + Sync + 'static) -> Self {
+  pub fn new(predicate: impl Fn(&Event<C, V>) -> bool + Send + Sync + 'static) -> Self {
     Self {
-      predicate: Arc::new(ArcSwap::from_pointee(Arc::new(predicate) as Predicate)),
+      predicate: Arc::new(ArcSwap::from_pointee(Arc::new(predicate) as Predicate<C, V>)),
     }
   }
 
@@ -81,10 +82,10 @@ impl Filter {
   /// either the old or the new predicate, never a torn state. A handle the caller
   /// retained (or the driver holds) sees the change immediately — the slot is shared.
   #[inline]
-  pub fn swap(&self, predicate: impl Fn(&Event) -> bool + Send + Sync + 'static) {
+  pub fn swap(&self, predicate: impl Fn(&Event<C, V>) -> bool + Send + Sync + 'static) {
     self
       .predicate
-      .store(Arc::new(Arc::new(predicate) as Predicate));
+      .store(Arc::new(Arc::new(predicate) as Predicate<C, V>));
   }
 
   /// Whether this filter admits `event` — the fan-out admission gate (design §5/§7).
@@ -94,12 +95,12 @@ impl Filter {
   /// bypass is enforced at fan-out — before an event reaches here (design §7/§8).
   #[inline]
   #[must_use]
-  pub fn admits(&self, event: &Event) -> bool {
+  pub fn admits(&self, event: &Event<C, V>) -> bool {
     (self.predicate.load())(event)
   }
 }
 
-impl Clone for Filter {
+impl<C, V> Clone for Filter<C, V> {
   /// Shares the same swappable slot — a [`swap`](Filter::swap) through either handle is
   /// seen by both (the point of the shared driver/caller split; see the type docs).
   #[inline]
@@ -110,7 +111,7 @@ impl Clone for Filter {
   }
 }
 
-impl Default for Filter {
+impl<C, V> Default for Filter<C, V> {
   /// The default filter admits everything ([`Filter::all`]).
   #[inline]
   fn default() -> Self {
@@ -118,7 +119,7 @@ impl Default for Filter {
   }
 }
 
-impl core::fmt::Debug for Filter {
+impl<C, V> core::fmt::Debug for Filter<C, V> {
   /// The predicate is an opaque closure with no meaningful representation, so this
   /// reports only the type — enough to place a `Filter` in a larger `Debug` dump.
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

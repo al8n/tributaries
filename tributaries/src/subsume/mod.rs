@@ -1,108 +1,116 @@
-//! The sans-I/O overlap-subsumption engine.
+//! The sans-I/O overlap-subsumption engine, generic over the key component `C`, the
+//! caller value `V`, and the armed-root handle `H`.
 //!
-//! This is the control plane of the umbrella crate: a pure state machine that
-//! folds possibly-**overlapping** caller subscriptions into the pairwise-disjoint
-//! roots [`tributary-fs`](tributary_fs) requires. It performs **no** I/O, reads no
-//! clock, and knows nothing of any runtime — it is exhaustively property-testable
-//! over paths and an abstract root-id alone.
+//! This is the control plane of the umbrella crate: a pure state machine that folds
+//! possibly-**overlapping** caller subscriptions into the pairwise-disjoint roots the
+//! source ([`tributary-fs`](tributary_fs) for 0.1.0) requires. It performs **no** I/O,
+//! reads no clock, and knows nothing of any runtime — it is exhaustively
+//! property-testable over keys and an abstract handle alone.
 //!
 //! # Coordinate system
 //!
-//! Everything operates in one canonical-path space: the form `tributary-fs` itself
-//! reports (its own canonicalized root paths and reconstructed event paths). The
-//! engine never re-implements canonicalization; it keys off what fs already
-//! canonicalized. The subsumption index is an [`iradix`] radix keyed by a canonical
-//! path's **components** (via iradix's built-in [`Path`] key, which stores one
-//! `OsString` per component), so `/a/b` is an ancestor of `/a/b/c` but not `/a/bc`.
+//! Everything operates in one key space: a watched location is a `Vec<C>` of
+//! components, and coverage / ancestor / exact are [`iradix`] ops on `&[C]`, so `[a,
+//! b]` is an ancestor of `[a, b, c]` but not of `[a, bc]`. The fs source keys on a
+//! path's `OsString` components (`C = OsString`); a caller with a richer key
+//! instantiates `C` at its own component type.
+//!
+//! # Immutable watch-set + the concurrent read plane
+//!
+//! The authoritative watch-set is an **immutable** [`sync::Radix`](iradix::sync::Radix)
+//! keyed by `Vec<C>` and valued by [`RootRecord`]. Each control mutation opens a
+//! [`Txn`](iradix::sync::Radix::txn), applies its edits, [`commit`](iradix::sync::Txn::commit)s
+//! into the next tree, and **publishes** that tree into a shared `arc_swap` slot so
+//! every [`WatchView`](crate::WatchView) reader sees the last committed watch-set
+//! wait-free (design §5). The publish is unconditional and follows the commit, so a
+//! watch-set change is visible immediately after it commits and never before.
 //!
 //! # Plan / commit split
 //!
-//! A `watch` cannot mutate committed state up front: the real fs root handle does
-//! not exist until *after* the kernel watch is armed, and if that arming fails no
-//! state may have changed. So [`Subsumer::plan_watch`] is a pure read that returns
-//! a [`WatchOutcome`] describing the fs operations the driver must perform, and
-//! [`Subsumer::commit_watch`] applies the state transition once the real handle is
-//! known. `unwatch` needs no such split — the handle already exists — so
-//! [`Subsumer::plan_unwatch`] mutates immediately and reports whether the root
-//! emptied (so the driver can release the kernel watch).
-//!
-//! [`Path`]: std::path::Path
+//! A `watch` cannot mutate committed state up front: the real root handle does not
+//! exist until *after* the source is armed, and if that arming fails no state may have
+//! changed. So [`Subsumer::plan_watch`] is a pure read returning a [`WatchOutcome`]
+//! describing the operations the driver must perform, and [`Subsumer::commit_watch`]
+//! applies the state transition once the real handle is known. `unwatch` needs no such
+//! split — the handle already exists — so [`Subsumer::plan_unwatch`] mutates
+//! immediately and reports whether the root emptied.
 
-use core::num::NonZeroU64;
-use std::{
-  collections::HashMap,
-  ffi::OsString,
-  hash::Hash,
-  path::{Path, PathBuf},
-  vec::Vec,
-};
+use core::{hash::Hash, num::NonZeroU64};
+use std::{collections::HashMap, sync::Arc, vec::Vec};
 
+use arc_swap::ArcSwap;
+use iradix::sync::Radix;
 use tributary_proto::{Interest, ScopeId};
 
-use crate::subscription::Subscription;
+use crate::{subscription::Subscription, view::WatchView};
 
 #[cfg(test)]
 mod tests;
 
-/// One live root's registry record.
+/// The shared, wait-free-readable publication of the authoritative watch-set: an
+/// `arc_swap` slot holding the last committed immutable [`sync::Radix`](Radix). The
+/// [`Subsumer`] publishes into it after every commit; each [`WatchView`] clone reads
+/// the same slot.
+pub(crate) type Shared<C, V, H> = Arc<ArcSwap<Radix<C, RootRecord<C, V, H>>>>;
+
+/// One live root's registry record — the value stored in the subsumption radix.
 ///
-/// The design sketch's `fs_root` is the [`entries`](Subsumer) map key — every
-/// accessor hands the entry back alongside that handle — so the record stores no
-/// redundant copy and needs no root-id type parameter. It carries the root's
-/// canonical `path`, needed to check coverage (that every subscriber's path descends
-/// from this root) and to key the subsumption index.
+/// It carries the root's `key` (its radix key, kept for coverage checks and for
+/// re-keying / restore), the armed `handle`, the caller `value` returned by
+/// attribution ([`covering`](crate::WatchView::covering) reads this via
+/// `get_ancestor`), and every caller [`Subscription`] this root serves, in
+/// registration order.
 ///
 /// It stores **no** interest: every umbrella root is armed [`Interest::all`]
-/// (design §4), so the kernel watch never narrows what it collects and there is no
-/// per-root union to track. Each subscription's own interest is a fan-out gate held
-/// in its [`SubRecord`], not a property of the shared root.
+/// (design §4), so the kernel watch never narrows what it collects. Each
+/// subscription's own interest is a fan-out gate held in its [`SubRecord`].
 #[derive(Debug, Clone)]
-pub(crate) struct RootEntry {
-  /// The root's canonical path (the subsumption-index key for this entry).
-  pub(crate) path: PathBuf,
+pub(crate) struct RootRecord<C, V, H> {
+  /// The root's key (== its radix key).
+  pub(crate) key: Vec<C>,
+  /// The armed root handle.
+  pub(crate) handle: H,
+  /// The caller value attribution returns for keys this root owns (design §3).
+  pub(crate) value: V,
   /// Every caller subscription this root serves, in registration order.
   pub(crate) subscribers: Vec<Subscription>,
 }
 
-/// The plan [`Subsumer::plan_watch`] produces: which fs operations the driver must
+/// The plan [`Subsumer::plan_watch`] produces: which operations the driver must
 /// perform for one `watch`, before the state transition is committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WatchOutcome<R> {
-  /// The subtree is already watched by an existing root at or above `path`. No new
+pub(crate) enum WatchOutcome<C, H> {
+  /// The subtree is already watched by an existing root at or above the key. No new
   /// kernel watch: `commit_watch` just adds `sub` to that root's subscribers.
   Covered {
     /// The existing root handle covering the new subscription.
-    fs_root: R,
+    fs_root: H,
     /// The new subscription.
     sub: Subscription,
   },
-  /// `path` is a strict ancestor of one or more existing roots, which it subsumes.
+  /// The key is a strict ancestor of one or more existing roots, which it subsumes.
   /// The driver must **release the subsumed roots (`unwatch`) first, then arm** the
-  /// wider watch at `new_root_path` (always [`Interest::all`], design §4) — the lower
-  /// watcher rejects a root overlapping a live one (`Overlaps`), so the wider root
-  /// cannot be armed while a subsumed one is live. The brief coverage gap between the
-  /// two is closed by the dominating `Rescan` each re-pointed subscriber receives.
-  /// `commit_watch` re-points `repointed` (and adds the new `sub`) onto the wider
-  /// root. No interest union is carried — every root is armed `Interest::all`, so a
-  /// widen never has to widen a narrower root's mask.
+  /// wider watch — the lower source rejects a root overlapping a live one, so the
+  /// wider root cannot be armed while a subsumed one is live. The brief coverage gap
+  /// between the two is closed by the dominating `Rescan` each re-pointed subscriber
+  /// receives. `commit_watch` re-points `repointed` (and adds the new `sub`) onto the
+  /// wider root.
   Widen {
-    /// The canonical path of the new, wider root (equal to the new subscription's
-    /// own canonical path).
-    new_root_path: PathBuf,
+    /// The key of the new, wider root (equal to the new subscription's own key).
+    new_root_key: Vec<C>,
     /// The subscribers of every subsumed root, to re-point onto the wider root, in
     /// deterministic (root key, then registration) order.
     repointed: Vec<Subscription>,
-    /// The subsumed fs root handles the driver must release, in root-key order.
-    unwatch: Vec<R>,
+    /// The subsumed root handles the driver must release, in root-key order.
+    unwatch: Vec<H>,
     /// The new subscription.
     sub: Subscription,
   },
-  /// `path` neither is covered by nor covers any existing root. The driver arms a
-  /// fresh watch (always [`Interest::all`], design §4); `commit_watch` records the
-  /// new root once its handle is known.
+  /// The key neither is covered by nor covers any existing root. The driver arms a
+  /// fresh watch; `commit_watch` records the new root once its handle is known.
   Disjoint {
-    /// The canonical path of the fresh root (equal to the subscription's path).
-    root_path: PathBuf,
+    /// The key of the fresh root (equal to the subscription's key).
+    root_key: Vec<C>,
     /// The new subscription.
     sub: Subscription,
   },
@@ -110,72 +118,92 @@ pub(crate) enum WatchOutcome<R> {
 
 /// The result of [`Subsumer::plan_unwatch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnwatchOutcome<R> {
+pub(crate) enum UnwatchOutcome<H> {
   /// The subscription was removed; its root still serves other subscribers.
   Dropped,
-  /// The subscription was its root's last: the driver must release the kernel
-  /// watch on `fs_root` (the engine has already dropped the root's state).
+  /// The subscription was its root's last: the driver must release the kernel watch
+  /// on `fs_root` (the engine has already dropped the root's state).
   RootEmptied {
     /// The now-empty root handle to release.
-    fs_root: R,
+    fs_root: H,
   },
 }
 
-/// One subscription's side-table record: the root it currently rides, its own
-/// canonical path, and its own [`Interest`] (the §4 `Subscription ->
-/// (canonical_path, fs_root, Interest, …)` table; the `Filter` half lives in the
+/// One subscription's side-table record: the root it currently rides, its own key,
+/// and its own [`Interest`] (the §4 side table; the `Filter` half lives in the
 /// driver's swappable map). Because every root is armed [`Interest::all`], a
 /// subscription's `interest` is purely a fan-out gate (design §4/§5), not something
 /// that ever narrows the kernel watch.
 #[derive(Debug, Clone)]
-struct SubRecord<R> {
-  root: R,
-  path: PathBuf,
+struct SubRecord<C, H> {
+  root: H,
+  key: Vec<C>,
   interest: Interest,
 }
 
-/// The sans-I/O overlap-subsumption engine.
-///
-/// Generic over the opaque fs root id `R` so it is testable with a trivial handle
-/// type (e.g. `u32`); the driver instantiates it at `R = tributary_fs::RootHandle`.
-/// Maintains three coupled structures: an [`iradix`] index mapping each canonical
-/// root path to its handle (the subsumption / ancestor-query plane), a map from
-/// handle to its [`RootEntry`] (the O(1) per-root record), and a side table from
-/// each live subscription to the root it rides.
-pub(crate) struct Subsumer<R> {
-  /// Canonical-path-components → fs root handle. The disjointness / ancestor plane.
-  index: iradix::unsync::Radix<OsString, R>,
-  /// fs root handle → its live record. O(1); the authoritative per-root state.
-  entries: HashMap<R, RootEntry>,
-  /// Live subscription → the root it rides, its own canonical path, and its interest.
-  subs: HashMap<Subscription, SubRecord<R>>,
-  /// The canonical path **and interest** of not-yet-committed subscriptions, keyed by
-  /// the id each `plan_watch` freshly minted. A plan stashes under its own new id, and
-  /// the paired `commit_watch` / `abort_watch` consumes exactly that id — so plans
-  /// never collide and may interleave freely; the only requirement is that every
-  /// plan is eventually committed (arm succeeded) OR aborted (arm failed), which
-  /// [`Subsumer::abort_watch`] makes enforceable rather than a bare convention.
-  pending: HashMap<Subscription, (PathBuf, Interest)>,
-  /// The next subscription id to mint. Monotonic and never reused, so a re-pointed
-  /// or dropped-and-re-added subscription never aliases a live one.
-  next_sub: NonZeroU64,
+/// A not-yet-committed `watch`'s reservation: its key, its caller value, and its
+/// interest, stashed under the freshly-minted subscription id until the paired
+/// `commit_watch` / `abort_watch` consumes it.
+#[derive(Debug, Clone)]
+struct PendingWatch<C, V> {
+  key: Vec<C>,
+  value: V,
+  interest: Interest,
 }
 
-// `iradix::unsync::Radix` is not `Debug`; the entries map is the authoritative
-// state, so it stands in for the index (which merely mirrors its paths).
-impl<R: core::fmt::Debug> core::fmt::Debug for Subsumer<R> {
+/// The sans-I/O overlap-subsumption engine, generic over the key component `C`, the
+/// caller value `V`, and the armed-root handle `H`.
+///
+/// `H` is testable with a trivial handle type (e.g. `u32`); the driver instantiates
+/// it at `H = tributary_fs::RootHandle`. Maintains the authoritative immutable
+/// [`sync::Radix`](Radix) (`key -> record`, the subsumption / ancestor plane), a
+/// handle → key reverse index (the O(1) per-root lookup), a side table from each live
+/// subscription to the root it rides, and the shared publication slot every
+/// [`WatchView`] reads.
+pub(crate) struct Subsumer<C, V, H> {
+  /// The authoritative watch-set: `key -> record`. The disjointness / ancestor plane.
+  index: Radix<C, RootRecord<C, V, H>>,
+  /// Root handle → its radix key. The O(1) reverse lookup for [`entry`](Self::entry).
+  by_handle: HashMap<H, Vec<C>>,
+  /// Live subscription → the root it rides, its own key, and its interest.
+  subs: HashMap<Subscription, SubRecord<C, H>>,
+  /// Not-yet-committed plans, keyed by the id each `plan_watch` freshly minted. A plan
+  /// stashes under its own new id, and the paired `commit_watch` / `abort_watch`
+  /// consumes exactly that id — so plans never collide and may interleave freely; the
+  /// only requirement is that every plan is eventually committed OR aborted, which
+  /// [`abort_watch`](Self::abort_watch) makes enforceable.
+  pending: HashMap<Subscription, PendingWatch<C, V>>,
+  /// The next subscription id to mint. Monotonic and never reused, so a re-pointed or
+  /// dropped-and-re-added subscription never aliases a live one.
+  next_sub: NonZeroU64,
+  /// The shared publication slot: the last committed watch-set, republished after
+  /// every commit so every [`WatchView`] reader is wait-free and eventually
+  /// consistent (design §5).
+  shared: Shared<C, V, H>,
+}
+
+// The radix and the shared slot are not `Debug`; the side tables are the
+// authoritative per-root / per-subscription state and stand in for them.
+impl<C, V, H> core::fmt::Debug for Subsumer<C, V, H>
+where
+  C: core::fmt::Debug,
+  V: core::fmt::Debug,
+  H: core::fmt::Debug,
+{
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("Subsumer")
-      .field("entries", &self.entries)
+      .field("by_handle", &self.by_handle)
       .field("subs", &self.subs)
       .field("pending", &self.pending)
-      .finish()
+      .finish_non_exhaustive()
   }
 }
 
-impl<R> Default for Subsumer<R>
+impl<C, V, H> Default for Subsumer<C, V, H>
 where
-  R: Copy + Eq + Hash,
+  C: Ord + Clone,
+  V: Clone,
+  H: Copy + Eq + Hash,
 {
   #[inline]
   fn default() -> Self {
@@ -183,60 +211,86 @@ where
   }
 }
 
-impl<R> Subsumer<R>
+impl<C, V, H> Subsumer<C, V, H>
 where
-  R: Copy + Eq + Hash,
+  C: Ord + Clone,
+  V: Clone,
+  H: Copy + Eq + Hash,
 {
-  /// Creates an empty engine.
+  /// Creates an empty engine, seeding the shared publication slot with an empty
+  /// watch-set.
   pub(crate) fn new() -> Self {
+    let index = Radix::new();
+    let shared = Arc::new(ArcSwap::from_pointee(index.clone()));
     Self {
-      index: iradix::unsync::Radix::new(),
-      entries: HashMap::new(),
+      index,
+      by_handle: HashMap::new(),
       subs: HashMap::new(),
       pending: HashMap::new(),
       next_sub: NonZeroU64::MIN,
+      shared,
     }
   }
 
-  /// Plans a `watch` of `canonical` (already in the fs canonical-path space) with
-  /// `interest`, returning the fs operations the driver must perform. Reads only;
-  /// the state transition is applied by the paired [`commit_watch`](Self::commit_watch).
-  ///
-  /// The new subscription's id is minted from the engine's own monotonic counter,
-  /// so overlapping subscriptions never collide even when they subsume onto one
-  /// kernel watch.
-  pub(crate) fn plan_watch(&mut self, canonical: &Path, interest: Interest) -> WatchOutcome<R> {
-    let sub = self.mint_subscription();
-    self
-      .pending
-      .insert(sub, (canonical.to_path_buf(), interest));
+  /// A cheap `Clone` read handle over the shared watch-set publication (design §5):
+  /// every method is `&self`, wait-free, and reads the last committed watch-set.
+  pub(crate) fn view(&self) -> WatchView<C, V, H> {
+    WatchView::new(self.shared.clone())
+  }
 
-    // Case 1 — Covered: an existing root at or above `canonical` already watches
-    // this subtree. Disjointness guarantees at most one such ancestor, and its
-    // presence rules out any strict descendant, so this short-circuits cleanly. The
-    // covering root is already armed `Interest::all` (design §4), so it carries every
-    // kind this newcomer could ask for — the newcomer's interest is applied only as a
-    // fan-out gate, never as a demand on the shared watch.
-    if let Some(&fs_root) = self.index.get_ancestor(canonical) {
-      return WatchOutcome::Covered { fs_root, sub };
+  /// Publishes the current authoritative watch-set into the shared slot — the
+  /// **commit → publish** step run after every committed mutation (design §5). The
+  /// published tree is an O(1) structural-sharing clone.
+  fn publish(&self) {
+    self.shared.store(Arc::new(self.index.clone()));
+  }
+
+  /// Plans a `watch` of `key` carrying `value` with `interest`, returning the
+  /// operations the driver must perform. Reads only; the state transition is applied
+  /// by the paired [`commit_watch`](Self::commit_watch).
+  ///
+  /// The new subscription's id is minted from the engine's own monotonic counter, so
+  /// overlapping subscriptions never collide even when they subsume onto one root.
+  pub(crate) fn plan_watch(
+    &mut self,
+    key: &[C],
+    value: V,
+    interest: Interest,
+  ) -> WatchOutcome<C, H> {
+    let sub = self.mint_subscription();
+    self.pending.insert(
+      sub,
+      PendingWatch {
+        key: key.to_vec(),
+        value,
+        interest,
+      },
+    );
+
+    // Case 1 — Covered: an existing root at or above `key` already watches this
+    // subtree. Disjointness guarantees at most one such ancestor, and its presence
+    // rules out any strict descendant. The covering root is armed `Interest::all`
+    // (design §4), so it carries every kind this newcomer could ask for.
+    if let Some(record) = self.index.get_ancestor(key) {
+      return WatchOutcome::Covered {
+        fs_root: record.handle,
+        sub,
+      };
     }
 
-    // Case 2 — Widen: `canonical` is a strict ancestor of one or more existing
-    // roots, which it now subsumes. Collect them in canonical-path order (iradix
-    // yields strict descendants ascending), gathering their handles to release and
-    // their subscribers to re-point. No interest union is computed — every root is
-    // armed `Interest::all`, so the wider root already carries every subsumed
-    // subscription's kinds (design §4).
+    // Case 2 — Widen: `key` is a strict ancestor of one or more existing roots, which
+    // it now subsumes. Collect them in key order (iradix yields strict descendants
+    // ascending), gathering their handles to release and their subscribers to
+    // re-point. No interest union is computed — every root is armed `Interest::all`.
     let mut unwatch = Vec::new();
     let mut repointed = Vec::new();
-    for &subsumed in self.index.descendants(canonical) {
-      let entry = &self.entries[&subsumed];
-      repointed.extend_from_slice(&entry.subscribers);
-      unwatch.push(subsumed);
+    for record in self.index.descendants(key) {
+      repointed.extend_from_slice(&record.subscribers);
+      unwatch.push(record.handle);
     }
     if !unwatch.is_empty() {
       return WatchOutcome::Widen {
-        new_root_path: canonical.to_path_buf(),
+        new_root_key: key.to_vec(),
         repointed,
         unwatch,
         sub,
@@ -245,75 +299,75 @@ where
 
     // Case 3 — Disjoint: neither covered nor covering.
     WatchOutcome::Disjoint {
-      root_path: canonical.to_path_buf(),
+      root_key: key.to_vec(),
       sub,
     }
   }
 
-  /// Commits the state transition for `outcome`, binding the real `fs_root` the
-  /// driver obtained by arming the watch and keying the root at `fs_root_path` — the
-  /// **authoritative canonical path fs reports** for the armed handle
-  /// (`Watcher::root_path`), which closes the canonicalization TOCTOU (design §4): a
-  /// component that swapped between the umbrella's provisional canonicalization and
-  /// fs's would otherwise leave events prefixed by fs's path while the subsumer
-  /// recorded the umbrella's. The newcomer's own coverage path is re-keyed into the
-  /// same coordinate — for a fresh (`Disjoint`) or widened (`Widen`) root the
-  /// newcomer's canonical path *equals* the root path, so its side-table path is
-  /// simply `fs_root_path`.
+  /// Commits the state transition for `outcome`, binding the real `fs_root` the driver
+  /// obtained by arming the watch and keying the root at `fs_root_key` — the
+  /// **authoritative key the source reports** for the armed handle, which closes the
+  /// canonicalization TOCTOU (design §4). For a fresh (`Disjoint`) or widened
+  /// (`Widen`) root the newcomer's key *equals* the root key, so its side-table key is
+  /// simply `fs_root_key`.
   ///
-  /// For [`WatchOutcome::Covered`] no arm happened (the covering root was armed —
-  /// and its fs path validated — when it was first created), so `fs_root_path` is
-  /// ignored and the newcomer's provisional canonical path is used unchanged; it is
-  /// already an ancestor-or-equal descendant of the covering root's fs-canonical key.
-  ///
-  /// The driver must only pass an `fs_root_path` whose subsumption relative to the
-  /// existing roots matches the plan (same case: fresh-disjoint stays disjoint, or a
-  /// widen subsumes exactly the planned roots); a divergence is caught by the driver
-  /// before committing (it re-queries and aborts), so this method never has to
-  /// re-plan.
+  /// For [`WatchOutcome::Covered`] no arm happened (the covering root was armed — and
+  /// its key validated — when first created), so `fs_root_key` is ignored and the
+  /// newcomer's own key is used unchanged. Each committed mutation republishes the
+  /// watch-set (design §5).
   pub(crate) fn commit_watch(
     &mut self,
-    outcome: &WatchOutcome<R>,
-    fs_root: R,
-    fs_root_path: &Path,
+    outcome: &WatchOutcome<C, H>,
+    fs_root: H,
+    fs_root_key: &[C],
   ) {
     match outcome {
       WatchOutcome::Covered { sub, .. } => {
-        let (path, interest) = self.take_pending(*sub);
-        self
-          .entries
-          .get_mut(&fs_root)
-          .expect("covered root exists")
-          .subscribers
-          .push(*sub);
+        let PendingWatch { key, interest, .. } = self.take_pending(*sub);
+        let root_key = self
+          .by_handle
+          .get(&fs_root)
+          .expect("covered root is live")
+          .clone();
+        let mut txn = self.index.txn();
+        let mut record = txn.get(&root_key).expect("covered root record").clone();
+        record.subscribers.push(*sub);
+        txn.insert(root_key.as_slice(), record);
+        self.index = txn.commit();
         self.subs.insert(
           *sub,
           SubRecord {
             root: fs_root,
-            path,
+            key,
             interest,
           },
         );
+        self.publish();
       }
       WatchOutcome::Disjoint { sub, .. } => {
-        let (_planned, interest) = self.take_pending(*sub);
-        let root_path = fs_root_path.to_path_buf();
-        self.index.insert(root_path.as_path(), fs_root);
-        self.entries.insert(
-          fs_root,
-          RootEntry {
-            path: root_path.clone(),
-            subscribers: std::vec![*sub],
-          },
-        );
+        let PendingWatch {
+          value, interest, ..
+        } = self.take_pending(*sub);
+        let root_key = fs_root_key.to_vec();
+        let record = RootRecord {
+          key: root_key.clone(),
+          handle: fs_root,
+          value,
+          subscribers: std::vec![*sub],
+        };
+        let mut txn = self.index.txn();
+        txn.insert(root_key.as_slice(), record);
+        self.index = txn.commit();
+        self.by_handle.insert(fs_root, root_key.clone());
         self.subs.insert(
           *sub,
           SubRecord {
             root: fs_root,
-            path: root_path,
+            key: root_key,
             interest,
           },
         );
+        self.publish();
       }
       WatchOutcome::Widen {
         repointed,
@@ -321,29 +375,32 @@ where
         sub,
         ..
       } => {
-        let (_planned, interest) = self.take_pending(*sub);
-        let root_path = fs_root_path.to_path_buf();
+        let PendingWatch {
+          value, interest, ..
+        } = self.take_pending(*sub);
+        let root_key = fs_root_key.to_vec();
 
-        // Drop the subsumed roots' index keys and entries. Their subscribers stay
-        // live — only their owning root changes.
-        self.index.remove_descendants(root_path.as_path());
-        for old in unwatch {
-          self.entries.remove(old);
-        }
-
-        // Install the wider root, adopting every re-pointed subscriber plus the
-        // newcomer (deterministic order: subsumed subscribers first, then `sub`).
         let mut subscribers = repointed.clone();
         subscribers.push(*sub);
-        self.index.insert(root_path.as_path(), fs_root);
-        self.entries.insert(
-          fs_root,
-          RootEntry {
-            path: root_path.clone(),
-            subscribers,
-          },
-        );
+        let record = RootRecord {
+          key: root_key.clone(),
+          handle: fs_root,
+          value,
+          subscribers,
+        };
 
+        // Drop the subsumed roots' index keys and install the wider root atomically:
+        // remove every strict descendant of the wider key (exactly the subsumed set,
+        // which the driver's `fs_path_preserves_plan` guard verified), then insert.
+        let mut txn = self.index.txn();
+        txn.remove_descendants(root_key.as_slice());
+        txn.insert(root_key.as_slice(), record);
+        self.index = txn.commit();
+
+        for old in unwatch {
+          self.by_handle.remove(old);
+        }
+        self.by_handle.insert(fs_root, root_key.clone());
         for &moved in repointed {
           self
             .subs
@@ -355,23 +412,21 @@ where
           *sub,
           SubRecord {
             root: fs_root,
-            path: root_path,
+            key: root_key,
             interest,
           },
         );
+        self.publish();
       }
     }
   }
 
   /// Abandons the plan `outcome` without committing it, discarding the pending
-  /// reservation `plan_watch` stashed. Call this on every path where arming the
-  /// real kernel watch failed, so the not-yet-committed subscription's pending
-  /// entry cannot leak: `plan_watch` mutated nothing committed, and no `fs_root`
-  /// was ever obtained, so dropping the reservation fully unwinds the plan.
-  ///
-  /// Idempotent per plan: consuming an already-committed (or already-aborted)
-  /// outcome's id is a no-op, so a double-abort or an abort-after-commit is safe.
-  pub(crate) fn abort_watch(&mut self, outcome: &WatchOutcome<R>) {
+  /// reservation `plan_watch` stashed. Call this on every path where arming failed, so
+  /// the not-yet-committed subscription's pending entry cannot leak. Idempotent per
+  /// plan (consuming an already-committed or already-aborted id is a no-op). No
+  /// watch-set change committed, so nothing is republished.
+  pub(crate) fn abort_watch(&mut self, outcome: &WatchOutcome<C, H>) {
     let sub = match outcome {
       WatchOutcome::Covered { sub, .. }
       | WatchOutcome::Widen { sub, .. }
@@ -380,78 +435,95 @@ where
     self.pending.remove(&sub);
   }
 
-  /// Removes `sub`, reporting whether its root emptied (returns `None` for an
-  /// unknown subscription). Mutates immediately — no commit step is needed.
-  pub(crate) fn plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<R>> {
+  /// Removes `sub`, reporting whether its root emptied (returns `None` for an unknown
+  /// subscription). Mutates immediately and republishes — no commit step is needed.
+  pub(crate) fn plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<H>> {
     let record = self.subs.remove(&sub)?;
-    let entry = self
-      .entries
-      .get_mut(&record.root)
-      .expect("live subscription's root exists");
-    entry.subscribers.retain(|&s| s != sub);
+    let root_key = self
+      .by_handle
+      .get(&record.root)
+      .expect("live subscription's root is live")
+      .clone();
 
-    if entry.subscribers.is_empty() {
-      let emptied = self.entries.remove(&record.root).expect("just retained it");
-      self.index.remove(emptied.path.as_path());
-      Some(UnwatchOutcome::RootEmptied {
-        fs_root: record.root,
-      })
+    let mut txn = self.index.txn();
+    let mut root = txn.get(&root_key).expect("live root record").clone();
+    root.subscribers.retain(|&s| s != sub);
+    let emptied = root.subscribers.is_empty();
+    if emptied {
+      txn.remove(root_key.as_slice());
     } else {
-      Some(UnwatchOutcome::Dropped)
+      txn.insert(root_key.as_slice(), root);
     }
+    self.index = txn.commit();
+
+    let outcome = if emptied {
+      self.by_handle.remove(&record.root);
+      UnwatchOutcome::RootEmptied {
+        fs_root: record.root,
+      }
+    } else {
+      UnwatchOutcome::Dropped
+    };
+    self.publish();
+    Some(outcome)
   }
 
   /// The live record for `fs_root`, if any.
-  pub(crate) fn entry(&self, fs_root: R) -> Option<&RootEntry> {
-    self.entries.get(&fs_root)
+  pub(crate) fn entry(&self, fs_root: H) -> Option<&RootRecord<C, V, H>> {
+    let key = self.by_handle.get(&fs_root)?;
+    self.index.get(key)
   }
 
   /// Re-keys a live root from a dead handle `old` to a freshly-armed `new`, keeping its
-  /// path, subscribers, and index key — used on the **widen rollback** (design §4/§8).
-  ///
-  /// When a widen disarms the subsumed roots and then fails to bring up the wider root,
-  /// the driver re-arms each subsumed root to restore the pre-widen state. A fresh arm
-  /// yields a *new* handle (fs never reuses one), and events from it will carry that new
-  /// handle in [`root`](tributary_fs::Event::root), so the subsumer must re-point the
-  /// root's entry and every subscriber onto it or fan-out would fail to resolve them.
-  /// The root's canonical path and subscriber set are unchanged (the rollback restores,
-  /// it does not re-plan); [`iradix::unsync::Radix::insert`] overwrites the same key.
-  pub(crate) fn rekey_root(&mut self, old: R, new: R) {
-    let entry = self.entries.remove(&old).expect("re-keyed root is live");
-    self.index.insert(entry.path.as_path(), new);
-    for &sub in &entry.subscribers {
+  /// key, value, and subscribers — used on the **widen rollback** (design §4/§8). A
+  /// fresh arm yields a *new* handle (the source never reuses one), so events from it
+  /// carry that new handle; the subsumer re-points the root's record and every
+  /// subscriber onto it or fan-out would fail to resolve them. Republishes.
+  pub(crate) fn rekey_root(&mut self, old: H, new: H) {
+    let root_key = self.by_handle.remove(&old).expect("re-keyed root is live");
+    let mut txn = self.index.txn();
+    let mut record = txn.get(&root_key).expect("re-keyed root record").clone();
+    record.handle = new;
+    let subscribers = record.subscribers.clone();
+    txn.insert(root_key.as_slice(), record);
+    self.index = txn.commit();
+    for &sub in &subscribers {
       self
         .subs
         .get_mut(&sub)
         .expect("re-keyed root's subscriber is live")
         .root = new;
     }
-    self.entries.insert(new, entry);
+    self.by_handle.insert(new, root_key);
+    self.publish();
   }
 
   /// Force-drops the root `handle` and every subscriber riding it, returning those
   /// subscribers so the driver can reclaim their per-subscription state (filter, epoch
   /// ledger). The **degenerate** widen path (design §4/§8): a rollback re-arm of a
   /// subsumed root itself failed, so that root cannot be restored and its subscribers
-  /// are terminally uncovered — the driver has signalled each a loss `Rescan`, and this
-  /// tears the dead root out of the index/entries/side-table so no later event routes to
-  /// its (never-armed) handle and the invariants (no root with a dead handle, no dangling
-  /// side-table record) still hold.
-  pub(crate) fn force_remove_root(&mut self, handle: R) -> Vec<Subscription> {
-    let Some(entry) = self.entries.remove(&handle) else {
+  /// are terminally uncovered. Tears the dead root out of index / reverse-index /
+  /// side-table so no later event routes to its (never-armed) handle. Republishes.
+  pub(crate) fn force_remove_root(&mut self, handle: H) -> Vec<Subscription> {
+    let Some(root_key) = self.by_handle.remove(&handle) else {
       return Vec::new();
     };
-    self.index.remove(entry.path.as_path());
-    for &sub in &entry.subscribers {
+    let mut txn = self.index.txn();
+    let record = txn
+      .remove(root_key.as_slice())
+      .expect("force-removed root record");
+    self.index = txn.commit();
+    for &sub in &record.subscribers {
       self.subs.remove(&sub);
     }
-    entry.subscribers
+    self.publish();
+    record.subscribers
   }
 
-  /// The canonical path a live subscription was registered at, if any (its entry
-  /// in the §4 side table).
-  pub(crate) fn subscription_path(&self, sub: Subscription) -> Option<&Path> {
-    self.subs.get(&sub).map(|record| record.path.as_path())
+  /// The key a live subscription was registered at, if any (its entry in the §4 side
+  /// table).
+  pub(crate) fn subscription_key(&self, sub: Subscription) -> Option<&[C]> {
+    self.subs.get(&sub).map(|record| record.key.as_slice())
   }
 
   /// The [`Interest`] a live subscription was registered with, if any — the fan-out
@@ -461,50 +533,43 @@ where
     self.subs.get(&sub).map(|record| record.interest)
   }
 
-  /// Whether committing a fresh/widened root at `fs_root_path` would keep the same
-  /// subsumption the plan assumed against `planned_path` — used by the driver to
-  /// guard the canonicalization TOCTOU (design §4) after `Watcher::root_path` reports
-  /// fs's authoritative canonical path.
+  /// Whether committing a fresh/widened root at `fs_root_key` would keep the same
+  /// subsumption the plan assumed — used by the driver to guard the canonicalization
+  /// TOCTOU (design §4) after the source reports its authoritative key.
   ///
-  /// A commit is safe when fs's path is identical to the planned one (the common
-  /// case), or when the divergent fs path is *still* disjoint from every committed
-  /// root and subsumes exactly the roots the plan drained. Concretely: it must not be
-  /// covered by an existing root, and the set of committed roots it strictly contains
-  /// must equal `planned_unwatch`. If it diverges in a way that changes subsumption
-  /// (now covered by, or overlapping a different set of, existing roots), the driver
-  /// disarms and aborts rather than committing a mis-keyed or overlapping entry.
-  pub(crate) fn fs_path_preserves_plan(&self, fs_root_path: &Path, planned_unwatch: &[R]) -> bool {
-    // Covered by an existing root now? Then it should never have armed a fresh/wider
-    // root — the plan is invalidated.
-    if self.index.get_ancestor(fs_root_path).is_some() {
+  /// Safe when the key is not covered by an existing root, and the set of committed
+  /// roots it strictly contains equals `planned_unwatch`. A divergence that changes
+  /// subsumption (now covered, or overlapping a different set) makes the driver disarm
+  /// and abort rather than commit a mis-keyed or overlapping entry.
+  pub(crate) fn fs_path_preserves_plan(&self, fs_root_key: &[C], planned_unwatch: &[H]) -> bool {
+    if self.index.get_ancestor(fs_root_key).is_some() {
       return false;
     }
-    // The roots this fs path strictly contains must be exactly the ones the plan drained
-    // (order-insensitive), or a different overlap has appeared.
-    let now: std::collections::HashSet<R> = self.index.descendants(fs_root_path).copied().collect();
-    let planned: std::collections::HashSet<R> = planned_unwatch.iter().copied().collect();
+    let now: std::collections::HashSet<H> = self
+      .index
+      .descendants(fs_root_key)
+      .map(|record| record.handle)
+      .collect();
+    let planned: std::collections::HashSet<H> = planned_unwatch.iter().copied().collect();
     now == planned
   }
 
-  /// The number of not-yet-committed plans still holding a pending reservation —
-  /// the leak the plan→commit-or-abort contract must keep at zero between watches.
-  /// Consumed by the driver's arm-failure test, which needs a runtime.
+  /// The number of not-yet-committed plans still holding a pending reservation — the
+  /// leak the plan→commit-or-abort contract must keep at zero between watches.
   #[cfg(all(test, feature = "tokio"))]
   pub(crate) fn pending_len(&self) -> usize {
     self.pending.len()
   }
 
-  /// Every live root as `(canonical path, handle)`, in deterministic canonical-path
-  /// order. Iterates the [`iradix`] index (which yields values in key order), never
-  /// the [`HashMap`], so the order is reproducible. The disjointness / coverage
-  /// invariants are checked against this; it has no non-test consumer yet, so it is
-  /// gated to keep a plain library build free of dead code.
+  /// Every live root as `(key, handle)`, in deterministic key order. Iterates the
+  /// [`iradix`] index (values in key order), never a [`HashMap`], so the order is
+  /// reproducible.
   #[cfg(test)]
-  pub(crate) fn roots(&self) -> impl Iterator<Item = (&Path, R)> {
-    self.index.values().map(move |&handle| {
-      let entry = &self.entries[&handle];
-      (entry.path.as_path(), handle)
-    })
+  pub(crate) fn roots(&self) -> impl Iterator<Item = (&[C], H)> {
+    self
+      .index
+      .values()
+      .map(|record| (record.key.as_slice(), record.handle))
   }
 
   /// Mints the next subscription id from the engine's monotonic counter.
@@ -517,11 +582,10 @@ where
     Subscription::new(ScopeId::new(next))
   }
 
-  /// Consumes the canonical path and interest `plan_watch` stashed under `sub`'s
-  /// freshly-minted id. A commit consumes exactly its own plan's id, so this is
-  /// present unless the plan was already aborted (arm failure) — in which case
-  /// `commit_watch` must not run for it.
-  fn take_pending(&mut self, sub: Subscription) -> (PathBuf, Interest) {
+  /// Consumes the reservation `plan_watch` stashed under `sub`'s freshly-minted id. A
+  /// commit consumes exactly its own plan's id, so this is present unless the plan was
+  /// already aborted (arm failure) — in which case `commit_watch` must not run for it.
+  fn take_pending(&mut self, sub: Subscription) -> PendingWatch<C, V> {
     self
       .pending
       .remove(&sub)

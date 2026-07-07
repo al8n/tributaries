@@ -19,6 +19,7 @@
 
 use std::{
   collections::HashSet,
+  ffi::OsString,
   path::{Path, PathBuf},
   sync::atomic::{AtomicU32, Ordering},
   time::Duration,
@@ -28,6 +29,9 @@ use tempfile::TempDir;
 use tributaries::{
   DebounceConfig, Event, Filter, Interest, Subscription, TokioTributaries, TributariesOptions,
 };
+
+/// The concrete delivered-event type of the local-fs driver (`C = OsString`, `V = ()`).
+type Ev = Event<OsString, ()>;
 
 /// Generous ceiling for one expected observation; CI runners (macOS especially) are
 /// slow and FSEvents batches on its own latency timer.
@@ -60,7 +64,7 @@ fn watcher(options: TributariesOptions) -> TokioTributaries {
 }
 
 /// Waits until an event satisfying `pred` arrives, or the deadline lapses, returning it.
-async fn wait_for(w: &mut TokioTributaries, mut pred: impl FnMut(&Event) -> bool) -> Option<Event> {
+async fn wait_for(w: &mut TokioTributaries, mut pred: impl FnMut(&Ev) -> bool) -> Option<Ev> {
   tokio::time::timeout(DEADLINE, async {
     while let Some(event) = w.next().await {
       if pred(&event) {
@@ -80,7 +84,7 @@ async fn wait_for(w: &mut TokioTributaries, mut pred: impl FnMut(&Event) -> bool
 async fn wait_until_all(
   w: &mut TokioTributaries,
   wanted: &[Subscription],
-  mut pred: impl FnMut(&Event) -> bool,
+  mut pred: impl FnMut(&Ev) -> bool,
 ) -> bool {
   let mut outstanding: HashSet<Subscription> = wanted.iter().copied().collect();
   tokio::time::timeout(DEADLINE, async {
@@ -100,7 +104,7 @@ async fn wait_until_all(
 
 /// An event "reaches" `path` when it names it directly or is a `Rescan` at the path or
 /// one of its ancestors (a rescan obliges re-enumeration below it).
-fn reaches(event: &Event, path: &Path) -> bool {
+fn reaches(event: &Ev, path: &Path) -> bool {
   event.path() == path || (event.is_rescan() && path.starts_with(event.path()))
 }
 

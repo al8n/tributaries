@@ -1,12 +1,18 @@
 use core::num::NonZeroU64;
-use std::{
-  collections::HashMap,
-  path::{Path, PathBuf},
-};
+use std::{collections::HashMap, ffi::OsString, path::Path};
 
 use tributary_proto::ScopeId;
 
-use super::{RootEntry, RoutableEvent, Subscription, fan_out};
+use super::{RoutableEvent, Subscription, fan_out};
+
+/// A path's `OsString` components — the located-key form the fs source keys on, and
+/// the coordinate `fan_out` covers over.
+fn key(path: &str) -> Vec<OsString> {
+  Path::new(path)
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
+}
 
 /// Which projection a subscriber received for one raw event — the four move
 /// decompositions (design §5) plus the whole delivery for a non-move / Rescan. Carried
@@ -29,21 +35,21 @@ struct Delivered {
   projection: Projection,
 }
 
-/// A minimal stand-in for a raw event: routing reads its endpoint paths and whether it
+/// A minimal stand-in for a raw event: routing reads its endpoint keys and whether it
 /// is a `Rescan`. Its delivery records the subscriber and which projection it got, so a
 /// test asserts the covered set **and** each move decomposition without touching the
 /// private `tributary_fs::Event` constructor. A `Some(from)` makes it a move whose
-/// destination is `path`.
+/// destination is `key`.
 struct FakeEvent {
-  path: PathBuf,
-  from: Option<PathBuf>,
+  key: Vec<OsString>,
+  from: Option<Vec<OsString>>,
   rescan: bool,
 }
 
 impl FakeEvent {
   fn change(path: &str) -> Self {
     Self {
-      path: PathBuf::from(path),
+      key: key(path),
       from: None,
       rescan: false,
     }
@@ -51,30 +57,30 @@ impl FakeEvent {
 
   fn rescan(path: &str) -> Self {
     Self {
-      path: PathBuf::from(path),
+      key: key(path),
       from: None,
       rescan: true,
     }
   }
 
-  /// A move from `from` to `to` (the destination is `path`).
+  /// A move from `from` to `to` (the destination is `key`).
   fn moved(from: &str, to: &str) -> Self {
     Self {
-      path: PathBuf::from(to),
-      from: Some(PathBuf::from(from)),
+      key: key(to),
+      from: Some(key(from)),
       rescan: false,
     }
   }
 }
 
-impl RoutableEvent for FakeEvent {
+impl RoutableEvent<OsString> for FakeEvent {
   type Delivered = Delivered;
 
-  fn path(&self) -> &Path {
-    self.path.as_path()
+  fn key(&self) -> &[OsString] {
+    self.key.as_slice()
   }
 
-  fn move_from(&self) -> Option<&Path> {
+  fn move_from(&self) -> Option<&[OsString]> {
     self.from.as_deref()
   }
 
@@ -104,30 +110,28 @@ impl RoutableEvent for FakeEvent {
   }
 }
 
-/// A test root plus a side table of each subscriber's canonical path — the two
-/// inputs `fan_out` needs (the matched entry and the path resolver).
+/// A test root's subscriber list plus a side table of each subscriber's key — the two
+/// inputs `fan_out` needs (the matched root's subscribers and the key resolver).
 struct Fixture {
-  entry: RootEntry,
-  paths: HashMap<Subscription, PathBuf>,
+  subscribers: Vec<Subscription>,
+  keys: HashMap<Subscription, Vec<OsString>>,
 }
 
 impl Fixture {
-  /// A root at `root_path` whose subscribers are the given `(id, canonical path)`
-  /// pairs, in that (registration) order.
-  fn new(root_path: &str, subscribers: &[(u64, &str)]) -> Self {
+  /// A root whose subscribers are the given `(id, key path)` pairs, in that
+  /// (registration) order. The root path itself is immaterial to `fan_out` (it keys on
+  /// the subscribers and their own keys), so only the subscribers are recorded.
+  fn new(_root_path: &str, subscribers: &[(u64, &str)]) -> Self {
     let mut subs = Vec::new();
-    let mut paths = HashMap::new();
+    let mut keys = HashMap::new();
     for &(id, path) in subscribers {
       let sub = Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")));
       subs.push(sub);
-      paths.insert(sub, PathBuf::from(path));
+      keys.insert(sub, key(path));
     }
     Self {
-      entry: RootEntry {
-        path: PathBuf::from(root_path),
-        subscribers: subs,
-      },
-      paths,
+      subscribers: subs,
+      keys,
     }
   }
 
@@ -140,8 +144,8 @@ impl Fixture {
   fn route_full(&self, event: &FakeEvent) -> Vec<Delivered> {
     fan_out(
       event,
-      &self.entry,
-      |sub| self.paths.get(&sub).map(PathBuf::as_path),
+      &self.subscribers,
+      |sub| self.keys.get(&sub).map(Vec::as_slice),
       |_sub, _delivered| true,
     )
   }
@@ -162,8 +166,8 @@ impl Fixture {
   ) -> Vec<Subscription> {
     fan_out(
       event,
-      &self.entry,
-      |sub| self.paths.get(&sub).map(PathBuf::as_path),
+      &self.subscribers,
+      |sub| self.keys.get(&sub).map(Vec::as_slice),
       admits,
     )
     .into_iter()
