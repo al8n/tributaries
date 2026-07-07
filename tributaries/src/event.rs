@@ -13,9 +13,9 @@
 
 use std::vec::Vec;
 
-use tributary_fs::{ChangeId, Epoch, Event as FsEvent, EventKind, Location, MovedEvent};
+use tributary_fs::{ChangeId, Epoch, EventKind, Location, MovedEvent};
 
-use crate::subscription::Subscription;
+use crate::{source::SourceEvent, subscription::Subscription};
 
 /// One change, delivered to a caller [`Subscription`], keyed by components of type
 /// `C` and carrying the caller value type `V`.
@@ -105,6 +105,81 @@ impl<C, V> Event<C, V> {
       kind: EventKind::Rescan,
       from: None,
       location: Location::new(),
+      change_id: None,
+      value: None,
+    }
+  }
+
+  /// Retags a raw [`SourceEvent`] with the [`Subscription`] it fanned out to (design §5),
+  /// carrying its located key, kind (including a whole [`Moved`](EventKind::Moved)'s
+  /// payload), move-source key, location, and change id.
+  ///
+  /// The event is born with the source's **raw** epoch as a provisional stamp; the driver
+  /// rebases it into this subscription's monotone space via [`set_epoch`](Self::set_epoch)
+  /// before delivery (design §8), so the raw value is never observed by a caller. This is
+  /// the key-generic mint the owner's fan-out uses, over the [`Source`](crate::Source)
+  /// seam rather than a concrete filesystem event.
+  pub(crate) fn from_source<H>(subscription: Subscription, event: &SourceEvent<C, H>) -> Self
+  where
+    C: Clone,
+  {
+    Self {
+      subscription,
+      epoch: event.epoch(),
+      key: event.key().to_vec(),
+      kind: event.kind().clone(),
+      from: event.from().map(<[C]>::to_vec),
+      location: event.location().clone(),
+      change_id: Some(event.change_id()),
+      value: None,
+    }
+  }
+
+  /// Mints the **move-out** projection of a source move for `subscription`: a synthesized
+  /// [`Removed`](EventKind::Removed) at the move's source key (design §5).
+  ///
+  /// A subscriber covering only the source of a rename must learn the file **left** its
+  /// tree; it cannot see the destination, so the move is projected to a plain
+  /// `Removed(from)`. The generic source seam carries no second (source) location, so the
+  /// projection is root-anchored; its key is the authoritative signal. The epoch is
+  /// provisional (rebased by the driver, design §8).
+  pub(crate) fn source_move_out<H>(subscription: Subscription, event: &SourceEvent<C, H>) -> Self
+  where
+    C: Clone,
+  {
+    Self {
+      subscription,
+      epoch: event.epoch(),
+      key: event
+        .from()
+        .expect("move-out is only minted for a move")
+        .to_vec(),
+      kind: EventKind::Removed,
+      from: None,
+      location: Location::new(),
+      change_id: None,
+      value: None,
+    }
+  }
+
+  /// Mints the **move-in** projection of a source move for `subscription`: a synthesized
+  /// [`Created`](EventKind::Created) at the move's destination key (design §5).
+  ///
+  /// A subscriber covering only the destination of a rename must learn the file
+  /// **arrived** in its tree from outside its watch; it cannot see the source, so the move
+  /// is projected to a plain `Created(to)`. The epoch is provisional (rebased by the
+  /// driver, design §8).
+  pub(crate) fn source_move_in<H>(subscription: Subscription, event: &SourceEvent<C, H>) -> Self
+  where
+    C: Clone,
+  {
+    Self {
+      subscription,
+      epoch: event.epoch(),
+      key: event.key().to_vec(),
+      kind: EventKind::Created,
+      from: None,
+      location: event.location().clone(),
       change_id: None,
       value: None,
     }
@@ -236,79 +311,6 @@ impl<C, V> Event<C, V> {
 }
 
 impl<V> Event<std::ffi::OsString, V> {
-  /// Retags a raw `tributary-fs` event with the subscription it was routed to,
-  /// extracting its located key (the change path's components) and its fs metadata.
-  ///
-  /// The event is born carrying the wrapped event's **raw** fs epoch as a provisional
-  /// stamp; the driver immediately rebases it into this subscription's monotone space
-  /// via [`set_epoch`](Self::set_epoch) before delivery (design §8), so the raw value
-  /// is never observed by a caller.
-  pub(crate) fn from_fs(subscription: Subscription, event: FsEvent) -> Self {
-    let key = path_components(event.path());
-    let from = event
-      .kind()
-      .moved()
-      .map(|m| path_components(MovedEvent::from(m)));
-    Self {
-      subscription,
-      epoch: event.epoch(),
-      key,
-      kind: event.kind().clone(),
-      from,
-      location: event.location().clone(),
-      change_id: Some(event.change_id()),
-      value: None,
-    }
-  }
-
-  /// Mints the **move-out** projection of a real `tributary-fs` move for
-  /// `subscription`: a synthesized [`Removed`](EventKind::Removed) at the move's
-  /// source (design §5).
-  ///
-  /// A subscriber covering only the source of a rename must learn the file **left**
-  /// its tree; it cannot see the destination (outside its watch), so the move is
-  /// projected down to a plain `Removed(from)`, carrying the source key and its
-  /// reconstructed root-relative location. The epoch is provisional (rebased by the
-  /// driver, design §8).
-  pub(crate) fn move_out(subscription: Subscription, event: &FsEvent) -> Self {
-    let from = event
-      .kind()
-      .moved()
-      .expect("move_out is only minted for a Moved event")
-      .from();
-    Self {
-      subscription,
-      epoch: event.epoch(),
-      key: path_components(from),
-      kind: EventKind::Removed,
-      from: None,
-      location: source_location(event),
-      change_id: None,
-      value: None,
-    }
-  }
-
-  /// Mints the **move-in** projection of a real `tributary-fs` move for
-  /// `subscription`: a synthesized [`Created`](EventKind::Created) at the move's
-  /// destination (design §5).
-  ///
-  /// A subscriber covering only the destination of a rename must learn the file
-  /// **arrived** in its tree from outside its watch; it cannot see the source, so the
-  /// move is projected down to a plain `Created(to)`. The epoch is provisional
-  /// (rebased by the driver, design §8).
-  pub(crate) fn move_in(subscription: Subscription, event: &FsEvent) -> Self {
-    Self {
-      subscription,
-      epoch: event.epoch(),
-      key: path_components(event.path()),
-      kind: EventKind::Created,
-      from: None,
-      location: event.location().clone(),
-      change_id: None,
-      value: None,
-    }
-  }
-
   /// The change's absolute path — the fs-source convenience over [`key`](Self::key),
   /// reconstructed from the located key's `OsString` components.
   ///
@@ -331,41 +333,4 @@ pub(crate) fn path_components(path: &std::path::Path) -> Vec<std::ffi::OsString>
     .components()
     .map(|c| c.as_os_str().to_os_string())
     .collect()
-}
-
-/// Reconstructs the root-relative [`Location`] of a move's **source** from its fs
-/// event, for the synthesized move-out [`Removed`](EventKind::Removed) (design §5).
-///
-/// `tributary-fs` reports a move's destination location but not its source's, and it
-/// exposes the source only as an absolute path (`MovedEvent::from`). The watched root
-/// path is recoverable without any I/O: the destination absolute path is the root
-/// joined with the destination location, so stripping the destination location's
-/// trailing components off it yields the root; the source location is then the source
-/// path relative to that root. A real within-root move has both endpoints under the
-/// root, so this strip always succeeds; if it somehow cannot (a malformed pairing),
-/// the empty (root-anchored) location is a safe, non-panicking fallback.
-fn source_location(event: &FsEvent) -> Location {
-  use std::path::Path;
-  let dest = event.path();
-  let dest_depth = event.location().len();
-  let mut root = dest;
-  for _ in 0..dest_depth {
-    match root.parent() {
-      Some(parent) => root = parent,
-      None => return Location::new(),
-    }
-  }
-  let from = event
-    .kind()
-    .moved()
-    .map(MovedEvent::from)
-    .unwrap_or_else(|| Path::new(""));
-  match from.strip_prefix(root) {
-    Ok(rel) => Location::from_segments(
-      rel
-        .components()
-        .filter_map(|c| c.as_os_str().to_str().map(tributary_fs::Segment::new)),
-    ),
-    Err(_) => Location::new(),
-  }
 }

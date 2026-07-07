@@ -27,7 +27,17 @@
 //! ```no_run
 //! # #[cfg(feature = "tokio")]
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::{ffi::OsString, path::Path};
+//!
 //! use tributaries::{DebounceConfig, Filter, Interest, TokioTributaries, TributariesOptions};
+//!
+//! // The local-fs source keys on a path's components (the caller supplies canonical paths).
+//! fn key(path: &str) -> Vec<OsString> {
+//!   Path::new(path)
+//!     .components()
+//!     .map(|c| c.as_os_str().to_os_string())
+//!     .collect()
+//! }
 //!
 //! // Opt into the settle coalescer (omit `.debounce(..)` for raw pass-through).
 //! let options = TributariesOptions::new().debounce(DebounceConfig::new());
@@ -36,12 +46,14 @@
 //! // A subscription that only reports Rust sources — the filter is live-swappable.
 //! let sources = Filter::new(|event| event.path().extension().is_some_and(|x| x == "rs"));
 //! let handle = sources.clone(); // shares the swappable slot with the one `watch` holds
-//! let project = tributaries.watch("/path/to/project", Interest::all(), sources).await?;
+//! let project = tributaries
+//!   .watch(key("/path/to/project"), (), Interest::all(), sources)
+//!   .await?;
 //!
 //! // An OVERLAPPING watch of a subtree — accepted, never `Overlaps`: it is subsumed
 //! // onto the same kernel watch, and a change under it fans out to both subscriptions.
 //! let tests = tributaries
-//!   .watch("/path/to/project/tests", Interest::all(), Filter::all())
+//!   .watch(key("/path/to/project/tests"), (), Interest::all(), Filter::all())
 //!   .await?;
 //!
 //! // Re-scope what `project` delivers at any time — no re-watch:

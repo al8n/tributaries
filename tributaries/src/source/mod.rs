@@ -52,17 +52,17 @@ mod tests;
 ///
 /// # `Send` bounds
 ///
-/// [`next`](Self::next) — the event pump — returns a `Send` future: 0.1.0 targets tokio
-/// and smol, and the driver may pump a generic source's stream from a task spawned on
-/// their multi-threaded executors, so that future must be able to cross threads. The
-/// bound is written explicitly on the return type (rather than left implicit by
-/// `async fn`, whose futures carry no such bound), so a generic `S: Source<C>` pump is
-/// structurally spawnable — every implementor's `next` future must satisfy it.
-/// [`arm`](Self::arm) and [`disarm`](Self::disarm) run on the driver's single-writer
-/// control path, never the spawned pump, so they carry no `Send` bound (mirroring the
-/// crate's internal armer seam, and letting a source arm a watch it holds by shared
-/// reference). A fully `!Send` thread-per-core (compio) variant — pump included — is
-/// deferred to M2.
+/// **All three async methods return `Send` futures.** 0.1.0 targets tokio and smol, and
+/// the driver is a single owned task spawned on their multi-threaded executors
+/// ([`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach)) that drives arming,
+/// disarming, and the event pump inline in one `select!` loop — so *every* future the
+/// owner awaits must be able to cross threads for `run(owner)` itself to be `Send`. The
+/// bounds are written explicitly on each return type (rather than left implicit by
+/// `async fn`, whose futures carry no such bound), so a generic `S: Source<C>` owner is
+/// structurally spawnable — every implementor's futures must satisfy them. This is now
+/// unconditionally satisfiable for the fs source because [`tributary_fs::Watcher`] is
+/// `Sync` (its `watch`/`unwatch` futures are `Send`). A fully `!Send` thread-per-core
+/// (compio) variant — spawned via `spawn_local_detach` — is deferred to M2.
 pub trait Source<C> {
   /// The armed-root token a successful [`arm`](Self::arm) yields, naming the concrete
   /// watch a later [`disarm`](Self::disarm) releases and an event's
@@ -81,19 +81,38 @@ pub trait Source<C> {
   /// # Errors
   ///
   /// A [`WatchError`] when the concrete watch cannot be armed.
-  fn arm(&mut self, key: &[C]) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>>;
+  ///
+  /// Returns a `Send` future (see the `Send` bounds note on the [trait](Self)).
+  fn arm(
+    &mut self,
+    key: &[C],
+  ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> + Send;
 
   /// Releases the root named by `handle`.
   ///
   /// Best-effort: a source that cannot confirm the release (already closed, root already
   /// gone) absorbs it rather than surfacing an error, since a released root's runtime
   /// conditions reach the umbrella in-band as events, not out of band here.
-  fn disarm(&mut self, handle: Self::Handle) -> impl Future<Output = ()>;
+  ///
+  /// Returns a `Send` future (see the `Send` bounds note on the [trait](Self)).
+  fn disarm(&mut self, handle: Self::Handle) -> impl Future<Output = ()> + Send;
 
   /// The next raw change as a [`SourceEvent`], or [`None`] once the source is closed and
-  /// drained. Returns a `Send` future so the driver can pump a generic source's stream
-  /// on a spawned task (see the `Send` bounds note on the [trait](Self)).
+  /// drained. Returns a `Send` future so the owner can pump the source's stream from its
+  /// spawned task (see the `Send` bounds note on the [trait](Self)).
   fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>> + Send;
+
+  /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
+  /// or retired — a **synchronous** liveness probe (mirroring
+  /// [`tributary_fs::Watcher::root_path`], which reads a live registry snapshot without
+  /// I/O).
+  ///
+  /// The owner uses it to tell a **terminal** coverage-loss signal (the root vanished —
+  /// `root_key` is `None`, so the root is retired, freeing its index / filter / epoch
+  /// state) from an **overflow** re-enumeration (the root is still live — `root_key` is
+  /// `Some`, so the root is kept and the consumer re-enumerates). Because it is out of
+  /// band, it never races the event stream the owner drives (design §4, I4).
+  fn root_key(&self, handle: Self::Handle) -> Option<Vec<C>>;
 }
 
 /// The outcome of a successful [`Source::arm`]: the armed-root token plus the canonical
@@ -331,6 +350,16 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   async fn next(&mut self) -> Option<SourceEvent<OsString, RootHandle>> {
     let raw = self.watcher.next().await?;
     Some(SourceEvent::from_fs(&raw))
+  }
+
+  fn root_key(&self, handle: RootHandle) -> Option<Vec<OsString>> {
+    // `tributary_fs::Watcher::root_path` reads its live-root registry synchronously and
+    // answers `None` for a torn-down handle, so a terminal `Rescan` (whose root fs has
+    // forgotten) reports `None` here — exactly the dead/retired signal the owner needs.
+    self
+      .watcher
+      .root_path(handle)
+      .map(|path| path_components(&path))
   }
 }
 

@@ -55,8 +55,9 @@ pub(crate) type Shared<C, V, H> = Arc<ArcSwap<Radix<C, RootRecord<C, V, H>>>>;
 
 /// One live root's registry record — the value stored in the subsumption radix.
 ///
-/// It carries the root's `key` (its radix key, kept for coverage checks and for
-/// re-keying / restore), the armed `handle`, the caller `value` returned by
+/// It carries the root's `key` (its radix key, recovered when a dead/uncovered root's
+/// subscribers must be named a dominating loss `Rescan`), the armed `handle`, the caller
+/// `value` returned by
 /// attribution ([`covering`](crate::WatchView::covering) reads this via
 /// `get_ancestor`), and every caller [`Subscription`] this root serves, in
 /// registration order.
@@ -474,36 +475,12 @@ where
     self.index.get(key)
   }
 
-  /// Re-keys a live root from a dead handle `old` to a freshly-armed `new`, keeping its
-  /// key, value, and subscribers — used on the **widen rollback** (design §4/§8). A
-  /// fresh arm yields a *new* handle (the source never reuses one), so events from it
-  /// carry that new handle; the subsumer re-points the root's record and every
-  /// subscriber onto it or fan-out would fail to resolve them. Republishes.
-  pub(crate) fn rekey_root(&mut self, old: H, new: H) {
-    let root_key = self.by_handle.remove(&old).expect("re-keyed root is live");
-    let mut txn = self.index.txn();
-    let mut record = txn.get(&root_key).expect("re-keyed root record").clone();
-    record.handle = new;
-    let subscribers = record.subscribers.clone();
-    txn.insert(root_key.as_slice(), record);
-    self.index = txn.commit();
-    for &sub in &subscribers {
-      self
-        .subs
-        .get_mut(&sub)
-        .expect("re-keyed root's subscriber is live")
-        .root = new;
-    }
-    self.by_handle.insert(new, root_key);
-    self.publish();
-  }
-
   /// Force-drops the root `handle` and every subscriber riding it, returning those
   /// subscribers so the driver can reclaim their per-subscription state (filter, epoch
-  /// ledger). The **degenerate** widen path (design §4/§8): a rollback re-arm of a
-  /// subsumed root itself failed, so that root cannot be restored and its subscribers
-  /// are terminally uncovered. Tears the dead root out of index / reverse-index /
-  /// side-table so no later event routes to its (never-armed) handle. Republishes.
+  /// ledger) — the **dead-root retirement** (design §4, invariant I4). A watched root
+  /// died (the source tore its handle down and emitted a terminal `Rescan`, already fanned
+  /// out to every subscriber), so the dead root is torn out of index / reverse-index /
+  /// side-table and no later event routes to its dead handle. Republishes.
   pub(crate) fn force_remove_root(&mut self, handle: H) -> Vec<Subscription> {
     let Some(root_key) = self.by_handle.remove(&handle) else {
       return Vec::new();

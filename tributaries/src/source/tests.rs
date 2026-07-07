@@ -3,16 +3,19 @@ use std::ffi::OsString;
 use super::{Source, key_to_path};
 use crate::event::path_components;
 
-/// Compile-time proof that a [`Source`]'s event-pump future ([`Source::next`]) is `Send`,
-/// so the driver can pump a generic `S: Source<C>` on a task spawned on a multi-threaded
-/// tokio or smol executor. Never invoked — it only has to type-check: a regression that
-/// dropped the `Send` bound would stop `needs_send` from accepting the future and fail
-/// this build. The generic bound is the guarantee, so this holds for every implementor
-/// (including an out-of-tree custom source), not just [`FsSource`]. `arm`/`disarm` run on
-/// the single-writer control path and carry no `Send` bound, so they are not asserted.
+/// Compile-time proof that **all three** [`Source`] futures — [`arm`](Source::arm),
+/// [`disarm`](Source::disarm), and the event pump [`next`](Source::next) — are `Send`, so
+/// the owner (which drives all three inline in one `select!` loop) can be spawned via
+/// [`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach) on a multi-threaded tokio
+/// or smol executor. Never invoked — it only has to type-check: a regression that dropped
+/// a `Send` bound would stop `needs_send` from accepting that future and fail this build.
+/// The generic bound is the guarantee, so this holds for every implementor (including an
+/// out-of-tree custom source), not just [`FsSource`].
 #[allow(dead_code)]
-fn assert_source_next_send<C, S: Source<C>>(s: &mut S) {
+fn assert_source_futures_send<C, S: Source<C>>(s: &mut S, key: &[C], handle: S::Handle) {
   fn needs_send<F: Send>(_: F) {}
+  needs_send(s.arm(key));
+  needs_send(s.disarm(handle));
   needs_send(s.next());
 }
 

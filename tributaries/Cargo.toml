@@ -20,6 +20,12 @@ smol = ["tributary-fs/smol", "agnostic-lite/smol"]
 [dependencies]
 agnostic-lite = { version = "0.6", features = ["time"] }
 arc-swap = "1"
+async-channel = "2"
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = [
+  "std",
+  "async-await-macro",
+] }
 iradix = "0.3"
 thiserror = "2"
 tributary-fs = { version = "0.1", path = "../tributary-fs" }
