@@ -33,6 +33,16 @@ use tributaries::{
 /// The concrete delivered-event type of the local-fs driver (`C = OsString`, `V = ()`).
 type Ev = Event<OsString, ()>;
 
+/// A path's `OsString` components — the located key the generic `watch` takes (the fs
+/// convenience the umbrella keys on; the caller supplies canonical paths, as `scratch`
+/// does).
+fn key(path: &Path) -> Vec<OsString> {
+  path
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
+}
+
 /// Generous ceiling for one expected observation; CI runners (macOS especially) are
 /// slow and FSEvents batches on its own latency timer.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -126,11 +136,11 @@ async fn overlapping_subscriptions_one_kernel_watch() {
   // tributary-fs rejects overlapping roots, so this succeeding proves the umbrella
   // subsumed both onto the one already-armed kernel watch (design §4).
   let outer = w
-    .watch(&root, Interest::all(), Filter::all())
+    .watch(key(&root), (), Interest::all(), Filter::all())
     .await
     .expect("outer watch arms one kernel watch");
   let nested = w
-    .watch(&sub_dir, Interest::all(), Filter::all())
+    .watch(key(&sub_dir), (), Interest::all(), Filter::all())
     .await
     .expect("an overlapping nested watch is subsumed, never surfaces Overlaps");
   assert_ne!(
@@ -168,17 +178,20 @@ async fn widen_narrow_first_then_ancestor_succeeds_and_keeps_routing() {
 
   // Watch the NARROW child first (arms one kernel watch of /root/child).
   let child_sub = w
-    .watch(&child, Interest::all(), Filter::all())
+    .watch(key(&child), (), Interest::all(), Filter::all())
     .await
     .expect("watch the narrow child first");
 
   // Now watch its ANCESTOR /root — a widen. Against the real watcher this succeeds ONLY
   // because the widen unwatches /root/child before arming /root; the pre-fix
   // arm-before-unwatch order would have been rejected `Overlaps` here.
-  let root_sub = w.watch(&root, Interest::all(), Filter::all()).await.expect(
-    "the ancestor watch widens (Ok, not Overlaps) — arms the wider root after \
+  let root_sub = w
+    .watch(key(&root), (), Interest::all(), Filter::all())
+    .await
+    .expect(
+      "the ancestor watch widens (Ok, not Overlaps) — arms the wider root after \
              disarming the subsumed child",
-  );
+    );
   assert_ne!(
     child_sub, root_sub,
     "each watch yields its own subscription id"
@@ -221,11 +234,11 @@ async fn event_fans_to_both_overlapping_subs() {
   // Two overlapping subscriptions: the outer root and the nested subtree. A change under
   // the nested subtree is covered by BOTH.
   let outer = w
-    .watch(&root, Interest::all(), Filter::all())
+    .watch(key(&root), (), Interest::all(), Filter::all())
     .await
     .expect("watch outer");
   let inner = w
-    .watch(&sub_dir, Interest::all(), Filter::all())
+    .watch(key(&sub_dir), (), Interest::all(), Filter::all())
     .await
     .expect("watch nested");
 
@@ -255,14 +268,15 @@ async fn filter_narrows_delivery_on_the_real_stack() {
   // One subscription admits only `keep.log`; a second admits everything.
   let picky = w
     .watch(
-      &root,
+      key(&root),
+      (),
       Interest::all(),
       Filter::new(move |e| e.path() == wanted_for_pred),
     )
     .await
     .expect("watch with a narrowing filter");
   let permissive = w
-    .watch(&root, Interest::all(), Filter::all())
+    .watch(key(&root), (), Interest::all(), Filter::all())
     .await
     .expect("watch admitting everything");
 
@@ -315,7 +329,7 @@ async fn debounced_burst_coalesces() {
   let mut w = watcher(TributariesOptions::new().debounce(cfg));
 
   let sub = w
-    .watch(&root, Interest::all(), Filter::all())
+    .watch(key(&root), (), Interest::all(), Filter::all())
     .await
     .expect("watch with debounce");
 
@@ -373,15 +387,15 @@ async fn move_decomposes_across_sibling_subscriptions() {
   // The outer root covers BOTH endpoints; two nested subs each cover ONE. All three are
   // subsumed onto the single /root kernel watch, so the one rename fans out to all.
   let _outer = w
-    .watch(&root, Interest::all(), Filter::all())
+    .watch(key(&root), (), Interest::all(), Filter::all())
     .await
     .expect("watch outer root");
   let src_sub = w
-    .watch(&src, Interest::all(), Filter::all())
+    .watch(key(&src), (), Interest::all(), Filter::all())
     .await
     .expect("watch src subtree");
   let dst_sub = w
-    .watch(&dst, Interest::all(), Filter::all())
+    .watch(key(&dst), (), Interest::all(), Filter::all())
     .await
     .expect("watch dst subtree");
 
@@ -442,7 +456,7 @@ async fn deleted_root_is_retired_and_can_be_rewatched() {
 
   // Watch /root (arms one kernel watch).
   let first = w
-    .watch(&root, Interest::all(), Filter::all())
+    .watch(key(&root), (), Interest::all(), Filter::all())
     .await
     .expect("watch the root");
 
@@ -464,7 +478,7 @@ async fn deleted_root_is_retired_and_can_be_rewatched() {
   // this would resolve `Covered` against it, delivering nothing below.
   std::fs::create_dir_all(&root).expect("recreate the watched root");
   let second = w
-    .watch(&root, Interest::all(), Filter::all())
+    .watch(key(&root), (), Interest::all(), Filter::all())
     .await
     .expect("re-watch the recreated root re-arms a fresh kernel root");
 
@@ -499,11 +513,11 @@ async fn rescan_delivered_to_all() {
   // nested subtree. A plain change at the root would NOT reach the nested subscription,
   // but a coverage-loss Rescan must reach BOTH.
   let outer_sub = w
-    .watch(&root, Interest::all(), Filter::all())
+    .watch(key(&root), (), Interest::all(), Filter::all())
     .await
     .expect("watch root");
   let nested_sub = w
-    .watch(&nested, Interest::all(), Filter::all())
+    .watch(key(&nested), (), Interest::all(), Filter::all())
     .await
     .expect("watch nested");
 
