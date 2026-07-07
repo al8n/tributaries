@@ -1,6 +1,17 @@
 use super::*;
 use agnostic_lite::tokio::TokioRuntime;
 
+/// Locks in `Watcher<R>: Sync`: the umbrella's single-owner actor awaits the
+/// `&self` `watch`/`unwatch` futures inside a `Send` spawned owner, which
+/// holds only if `&Watcher` is `Send` — i.e. `Watcher: Sync`. Reintroducing a
+/// `!Sync` field (e.g. re-boxing `events` without `+ Sync`) fails to compile
+/// here. Never invoked; the bound is checked when the generic body compiles.
+#[allow(dead_code)]
+fn _assert_watcher_sync<R: RuntimeLite>() {
+  fn is_sync<T: Sync>() {}
+  is_sync::<Watcher<R>>();
+}
+
 /// A watcher wired to a command channel the test controls (no driver task, no
 /// platform), so registration protocols are observable in isolation.
 fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>) {
@@ -10,7 +21,7 @@ fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>)
     Watcher {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
-      events: futures_util::StreamExt::boxed(event_rx),
+      events: Box::pin(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
       _runtime: PhantomData,
     },
