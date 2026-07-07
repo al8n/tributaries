@@ -330,16 +330,41 @@ where
   /// deterministic key order — a `Rescan`'s "content is now suspect, emit what we held"
   /// (design §6).
   fn flush_subscription(&mut self, sub: Subscription, now: Instant) {
-    let keys: Vec<Key<C>> = self
+    for key in self.subscription_keys(sub) {
+      let entry = self.buffer.remove(&key).expect("key just collected");
+      self.ready.push_back((now, entry.event));
+    }
+  }
+
+  /// Drops every buffered and ready entry for `sub` — the parked-overflow-`Rescan` analog
+  /// of [`admit`](Self::admit)'s flush-on-`Rescan` (design backpressure doc).
+  ///
+  /// When the owner sheds `sub` to a **parked** dominating `Rescan` (the event channel was
+  /// full, so the `Rescan` could not be delivered inline), that `Rescan` will dominate
+  /// everything `sub` still holds here. Emitting those deltas would put a stale-epoch event
+  /// *after* the `Rescan` once it is finally delivered, so they are discarded — the
+  /// re-enumeration the `Rescan` triggers covers them. Mirrors the fs layer's
+  /// `purge_scope_emits`. (In the driver's call path the ready queue has already been
+  /// drained, so in practice only the buffer holds suspect deltas; the ready scan keeps the
+  /// operation self-contained regardless of call site.)
+  pub(crate) fn drop_subscription(&mut self, sub: Subscription) {
+    for key in self.subscription_keys(sub) {
+      self.buffer.remove(&key);
+    }
+    self.ready.retain(|(_, event)| event.subscription() != sub);
+  }
+
+  /// The buffered keys belonging to `sub`, in deterministic key order — the shared prefix
+  /// scan behind both [`flush_subscription`](Self::flush_subscription) and
+  /// [`drop_subscription`](Self::drop_subscription). `(sub, Vec::new())` is the least key
+  /// in `sub`'s range, and the take-while stops at the first key of the next subscription.
+  fn subscription_keys(&self, sub: Subscription) -> Vec<Key<C>> {
+    self
       .buffer
       .range((sub, Vec::new())..)
       .take_while(|((s, _), _)| *s == sub)
       .map(|(k, _)| k.clone())
-      .collect();
-    for key in keys {
-      let entry = self.buffer.remove(&key).expect("key just collected");
-      self.ready.push_back((now, entry.event));
-    }
+      .collect()
   }
 }
 

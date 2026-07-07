@@ -102,6 +102,35 @@ impl EpochLedger {
     rescan
   }
 
+  /// Mints a strictly-dominating [`Rescan`](tributary_fs::EventKind::Rescan) epoch for
+  /// `sub` **without rebasing its root** — the overflow shed (design backpressure doc).
+  ///
+  /// Returns `sub`'s current-high-water `.next()` and advances high-water to it, but —
+  /// unlike [`repoint`](Self::repoint) — **leaves `epoch_base` unchanged**. This is the
+  /// critical distinction from a widen re-point:
+  ///
+  /// - [`repoint`](Self::repoint) rebases `epoch_base` to `hw.next()`, which is correct
+  ///   **only for a widen onto a fresh root whose raw fs epochs restart at 0**: the new
+  ///   root's first event then stamps `hw.next() + 0`, tying the `Rescan`.
+  /// - A shed stays on the **same live root**, whose raw fs epochs keep climbing (there
+  ///   was no re-arm). Leaving `epoch_base` keeps the umbrella stamp in lockstep with
+  ///   that root: the next genuine delivery stamps `epoch_base + raw` for a `raw` strictly
+  ///   greater than every raw seen so far, so it lands **at or above** the `Rescan`
+  ///   (`hw.next()`) and is never dominated by it. Rebasing here would instead inflate
+  ///   `epoch_base` while the raw epochs continue from their old value, desynchronizing
+  ///   the stamp from the live sequence and mis-ordering later same-root deltas against
+  ///   the `Rescan`.
+  ///
+  /// The pre-shed stream (all `≤ hw`) is strictly dominated by the returned `Rescan`, and
+  /// repeated sheds are idempotent (monotone `high_water.next()`; N sheds collapse to one
+  /// dominating `Rescan` at the driver's per-subscription dirty-set).
+  pub(crate) fn shed_rescan(&mut self, sub: Subscription) -> Epoch {
+    let hw = self.high_water.get(&sub).copied().unwrap_or(Epoch::START);
+    let rescan = hw.next();
+    self.bump(sub, rescan);
+    rescan
+  }
+
   /// Fans one raw event out to its covering, filter-admitting subscribers (design
   /// §5/§7) and stamps each delivery in that subscriber's own monotone epoch space
   /// (design §8).

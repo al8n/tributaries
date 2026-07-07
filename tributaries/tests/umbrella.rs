@@ -20,6 +20,7 @@
 use std::{
   collections::HashSet,
   ffi::OsString,
+  num::NonZeroUsize,
   path::{Path, PathBuf},
   sync::atomic::{AtomicU32, Ordering},
   time::Duration,
@@ -532,6 +533,78 @@ async fn rescan_delivered_to_all() {
   assert!(
     all,
     "the coverage-loss Rescan (or root Removed) reaches every subscriber of the root"
+  );
+
+  w.close().await.expect("close");
+}
+
+/// Close-responsiveness under backpressure (design backpressure doc, invariants II/III):
+/// a **stalled consumer** (never draining `next()`) fills a tiny bounded event channel, so
+/// the owner sheds the affected subscription to a parked `Rescan`. Because the owner NEVER
+/// awaits the event channel, `close()` is still serviced promptly on the separate command
+/// mailbox — it must return within the deadline rather than deadlocking behind the full
+/// channel (the failure mode of the rejected bounded-plus-`send().await` design).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_is_responsive_while_event_channel_is_full() {
+  let (_dir, root) = scratch("close-full");
+  // A one-slot event channel, so a couple of undrained changes fill it.
+  let options =
+    TributariesOptions::new().with_event_capacity(NonZeroUsize::new(1).expect("nonzero"));
+  let w = watcher(options);
+  let _sub = w
+    .watch(key(&root), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch the root");
+
+  // Generate a burst of changes WITHOUT ever draining next(): the bounded channel fills and
+  // the owner parks Rescans — it never blocks on the channel.
+  for i in 0..50u32 {
+    std::fs::write(root.join(format!("f{i}.txt")), b"x").expect("burst write");
+  }
+  // Let the owner pump the source and fill the channel.
+  tokio::time::sleep(Duration::from_millis(300)).await;
+
+  // Close must still return promptly even though the event channel is full and undrained.
+  let closed = tokio::time::timeout(DEADLINE, w.close()).await;
+  assert!(
+    closed.is_ok(),
+    "close returned while the event channel was full — not deadlocked behind it"
+  );
+  assert!(
+    closed.expect("close within the deadline").is_ok(),
+    "close succeeded"
+  );
+}
+
+/// End-to-end backpressure recovery over the real stack (design backpressure doc, invariant
+/// I, no-silent-loss): a consumer that stalls under a tiny bounded channel and later
+/// RESUMES must receive a coverage `Rescan` for the affected subscription — the shed's
+/// dominating re-enumeration signal, so nothing lost to the overflow is silently dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_then_resumed_consumer_gets_a_rescan_no_silent_loss() {
+  let (_dir, root) = scratch("stall-resume");
+  let options =
+    TributariesOptions::new().with_event_capacity(NonZeroUsize::new(1).expect("nonzero"));
+  let mut w = watcher(options);
+  let sub = w
+    .watch(key(&root), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch the root");
+
+  // Stall: generate a burst without draining, so the one-slot channel overflows and the
+  // owner parks a dominating Rescan for the subscription.
+  for i in 0..50u32 {
+    std::fs::write(root.join(format!("f{i}.txt")), b"x").expect("burst write");
+  }
+  tokio::time::sleep(Duration::from_millis(300)).await;
+
+  // Resume draining: among the delivered events the owner must surface a Rescan for the
+  // subscription (its parked shed), so the consumer re-enumerates rather than losing the
+  // dropped deltas silently.
+  let saw_rescan = wait_for(&mut w, |e| e.subscription() == sub && e.is_rescan()).await;
+  assert!(
+    saw_rescan.is_some(),
+    "the resumed consumer receives the shed's dominating Rescan (no silent loss)"
   );
 
   w.close().await.expect("close");

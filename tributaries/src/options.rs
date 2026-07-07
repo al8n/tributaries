@@ -1,6 +1,6 @@
 //! Configuration for a [`Tributaries`](crate::Tributaries) watcher.
 
-use core::time::Duration;
+use core::{num::NonZeroUsize, time::Duration};
 
 use tributary_fs::WatcherOptions;
 
@@ -103,12 +103,14 @@ impl Default for DebounceConfig {
 /// Configuration for a [`Tributaries`](crate::Tributaries) watcher.
 ///
 /// Embeds the lower-level [`WatcherOptions`] (forwarded to the wrapped
-/// `tributary-fs` watcher) and an optional [`DebounceConfig`] enabling the settle
-/// coalescer (design §6). [`new`](Self::new) returns the defaults — the default
-/// watcher options and **no** debounce (events pass through untouched).
+/// `tributary-fs` watcher), the owner→consumer [`event_capacity`](Self::event_capacity),
+/// and an optional [`DebounceConfig`] enabling the settle coalescer (design §6).
+/// [`new`](Self::new) returns the defaults — the default watcher options, the default
+/// event capacity, and **no** debounce (events pass through untouched).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TributariesOptions {
   watcher: WatcherOptions,
+  event_capacity: NonZeroUsize,
   debounce: Option<DebounceConfig>,
 }
 
@@ -117,11 +119,20 @@ impl TributariesOptions {
   /// out of the box events pass through untouched.
   pub const DEFAULT_DEBOUNCE: Option<DebounceConfig> = None;
 
-  /// The default options: default [`WatcherOptions`], no debounce.
+  /// The default capacity of the owner→consumer event channel (1024) — the bounded
+  /// buffer the owner delivers attributed events through (design backpressure doc).
+  /// Mirrors [`WatcherOptions::DEFAULT_EVENT_CAPACITY`], generous enough to absorb
+  /// ordinary bursts in-order so per-subscription overflow-to-`Rescan` shedding stays
+  /// rare.
+  pub const DEFAULT_EVENT_CAPACITY: NonZeroUsize = WatcherOptions::DEFAULT_EVENT_CAPACITY;
+
+  /// The default options: default [`WatcherOptions`], default event capacity, no
+  /// debounce.
   #[inline]
   pub fn new() -> Self {
     Self {
       watcher: WatcherOptions::new(),
+      event_capacity: Self::DEFAULT_EVENT_CAPACITY,
       debounce: Self::DEFAULT_DEBOUNCE,
     }
   }
@@ -130,6 +141,34 @@ impl TributariesOptions {
   #[inline]
   pub const fn watcher(&self) -> &WatcherOptions {
     &self.watcher
+  }
+
+  /// The capacity of the owner→consumer event channel (design backpressure doc): the
+  /// bounded buffer [`next`](crate::Tributaries::next) drains. When it fills (a stalled
+  /// consumer), the owner sheds the affected subscription to a dominating
+  /// [`Rescan`](tributary_fs::EventKind::Rescan) rather than blocking or growing memory
+  /// without bound — so this trades buffering headroom against how eagerly a slow
+  /// consumer is asked to re-enumerate. Distinct from the wrapped watcher's own
+  /// [`event_capacity`](WatcherOptions::event_capacity), which bounds the fs layer's
+  /// channel one level down.
+  #[inline]
+  pub const fn event_capacity(&self) -> NonZeroUsize {
+    self.event_capacity
+  }
+
+  /// Returns these options with the owner→consumer event-channel capacity set.
+  #[inline]
+  #[must_use]
+  pub const fn with_event_capacity(mut self, event_capacity: NonZeroUsize) -> Self {
+    self.event_capacity = event_capacity;
+    self
+  }
+
+  /// Sets the owner→consumer event-channel capacity.
+  #[inline]
+  pub const fn set_event_capacity(&mut self, event_capacity: NonZeroUsize) -> &mut Self {
+    self.event_capacity = event_capacity;
+    self
   }
 
   /// Returns these options with the lower-level watcher options set.
@@ -169,10 +208,11 @@ impl TributariesOptions {
   }
 
   /// Consumes these options, yielding the parts the driver wires up: the lower-level
-  /// watcher options and the optional debounce policy.
+  /// watcher options, the owner→consumer event-channel capacity, and the optional
+  /// debounce policy.
   #[inline]
-  pub(crate) fn into_parts(self) -> (WatcherOptions, Option<DebounceConfig>) {
-    (self.watcher, self.debounce)
+  pub(crate) fn into_parts(self) -> (WatcherOptions, NonZeroUsize, Option<DebounceConfig>) {
+    (self.watcher, self.event_capacity, self.debounce)
   }
 }
 

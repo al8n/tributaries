@@ -546,6 +546,49 @@ fn flush_all_drains_everything_for_stream_close() {
   assert_eq!(c.next_deadline(), None, "the coalescer is left empty");
 }
 
+/// `drop_subscription` (the driver's parked-overflow-`Rescan` path, design backpressure
+/// doc) discards every buffered AND ready entry for one subscription — now dominated by the
+/// parked `Rescan` — while leaving every other subscription untouched. Unlike the inline
+/// `Rescan`/`Moved` flush, it drops rather than enqueues (the parked `Rescan` cannot be
+/// delivered inline, so re-emitting the suspect deltas would deliver a stale epoch after
+/// it).
+#[test]
+fn drop_subscription_discards_only_that_subscriptions_entries() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let (s1, s2) = (sub(1), sub(2));
+
+  // A buffered entry for s1, then a Rescan for s1 flushes it into the ready queue and
+  // enqueues itself — so s1 now holds entries in the READY queue…
+  c.admit(modified(s1, "/a/f", 1), clk.at(0));
+  c.admit(rescan(s1, "/a", 2), clk.at(0));
+  // …and a fresh buffered entry after the flush — so s1 also holds a BUFFER entry.
+  c.admit(modified(s1, "/a/h", 3), clk.at(0));
+  // An unrelated subscription's buffered entry, which the drop must not touch.
+  c.admit(modified(s2, "/b/f", 4), clk.at(0));
+  assert!(
+    c.next_deadline().is_some(),
+    "entries are pending before the drop"
+  );
+
+  // Drop s1: its buffered (/a/h) AND ready (/a/f, the Rescan) entries all vanish.
+  c.drop_subscription(s1);
+
+  let out = drain(&mut c, clk.at(1000));
+  assert_eq!(out.len(), 1, "only s2's entry survives the drop of s1");
+  assert_eq!(
+    out[0].subscription(),
+    s2,
+    "the survivor belongs to the un-dropped subscription"
+  );
+  assert_eq!(out[0].path(), Path::new("/b/f"));
+  assert_eq!(
+    c.next_deadline(),
+    None,
+    "no s1 entry lingers in the buffer or ready queue after the drop"
+  );
+}
+
 // -------------------------------------------------------------------------------
 // Property tests (design §10): no silent loss, determinism, no dominated post-Rescan.
 // -------------------------------------------------------------------------------
