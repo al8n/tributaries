@@ -1,5 +1,5 @@
 use std::{
-  collections::HashMap,
+  collections::{BTreeMap, HashMap},
   ffi::OsString,
   io,
   marker::PhantomData,
@@ -180,6 +180,19 @@ fn rescan_event(handle: u32, path: &str) -> SourceEvent<OsString, u32> {
   )
 }
 
+/// A synthetic `Modified` [`Event`] for `sub` at `path`, pre-stamped umbrella epoch
+/// `epoch` — the ready-to-deliver event the backpressure tests feed straight into
+/// [`Owner::try_emit`], the funnel that fills the bounded channel and sheds on overflow.
+fn modified_event(sub: Subscription, path: &str, epoch: u64) -> Event<OsString, ()> {
+  Event::synthetic(
+    sub,
+    key(path),
+    Location::new(),
+    EventKind::Modified,
+    Epoch::new(epoch),
+  )
+}
+
 /// Drives the owner's reconcile primitives over a [`FakeSource`], with the owner's event
 /// stream drained on demand — the sans-I/O reconcile logic exercised without a real
 /// filesystem, runtime timers, or the select loop.
@@ -197,13 +210,28 @@ impl Harness {
   }
 
   fn with_coalescer(coalescer: Option<Coalescer<OsString, ()>>) -> Self {
-    let (event_tx, event_rx) = async_channel::unbounded();
+    Self::build(coalescer, None)
+  }
+
+  /// A harness whose owner→consumer event channel is **bounded** at `capacity` — for the
+  /// backpressure tests, where a stalled consumer fills the channel and the owner sheds the
+  /// affected subscription to a parked dominating `Rescan` (design backpressure doc).
+  fn bounded(capacity: usize) -> Self {
+    Self::build(None, Some(capacity))
+  }
+
+  fn build(coalescer: Option<Coalescer<OsString, ()>>, capacity: Option<usize>) -> Self {
+    let (event_tx, event_rx) = match capacity {
+      Some(cap) => async_channel::bounded(cap),
+      None => async_channel::unbounded(),
+    };
     let (command_tx, command_rx) = async_channel::unbounded();
     let owner = Owner {
       source: FakeSource::new(),
       subsumer: Subsumer::new(),
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
+      needs_rescan: BTreeMap::new(),
       coalescer,
       commands: command_rx,
       events: event_tx,
@@ -625,7 +653,7 @@ async fn terminal_rescan_retires_root_overflow_keeps_it() {
   h.owner.epochs.stamp(sub, Epoch::new(3));
 
   // Handle 1 is live: an overflow Rescan (root_key is Some) must NOT retire it.
-  h.owner.retire_if_dead(&rescan_event(1, "/a")).await;
+  h.owner.retire_if_dead(&rescan_event(1, "/a"));
   assert_eq!(
     h.owner.subsumer.roots().count(),
     1,
@@ -638,7 +666,7 @@ async fn terminal_rescan_retires_root_overflow_keeps_it() {
 
   // The root dies out of band (root_key now None): the terminal Rescan retires it.
   h.owner.source.kill_root(1);
-  h.owner.retire_if_dead(&rescan_event(1, "/a")).await;
+  h.owner.retire_if_dead(&rescan_event(1, "/a"));
   assert_eq!(
     h.owner.subsumer.roots().count(),
     0,
@@ -684,5 +712,229 @@ async fn caller_vanished_after_commit_is_reconciled_away() {
   assert!(
     matches!(h.owner.source.calls().last(), Some(Call::Disarm(_))),
     "the committed root was disarmed by the immediate unwatch"
+  );
+}
+
+/// Backpressure (design backpressure doc, checklist #1/#4/#5): a **stalled consumer** fills
+/// the bounded event channel, so the owner sheds the affected subscription to a parked
+/// dominating `Rescan` instead of blocking or growing memory without bound. The owner never
+/// blocks (every `try_emit` returns synchronously); repeated overflow is idempotent (one
+/// parked slot, monotone epoch); and on resume the consumer receives exactly one `Rescan`
+/// whose epoch strictly dominates every event delivered before it — no silent loss.
+#[tokio::test]
+async fn stalled_consumer_parks_dominating_rescan_and_resumes() {
+  let mut h = Harness::bounded(2);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  // Drive the subscription's epoch high-water up, as genuine deliveries would.
+  for raw in 0..3 {
+    h.owner.epochs.stamp(sub, Epoch::new(raw));
+  }
+
+  // The consumer is stalled (not draining): the two-slot channel fills in-order.
+  h.owner.try_emit(modified_event(sub, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sub, "/a/f1", 1));
+  // The next delivery finds the channel full → shed to a parked dominating Rescan. The call
+  // returns synchronously (the owner never awaits the channel — no block, no unbounded
+  // growth).
+  h.owner.try_emit(modified_event(sub, "/a/f2", 2));
+  assert_eq!(
+    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    Some(Epoch::new(3)),
+    "overflow parked a Rescan minted one past the high-water (strictly dominating)"
+  );
+
+  // Further overflow while parked is SUPPRESSED and idempotent: no second Rescan is minted,
+  // the parked epoch is unchanged, and the channel is not probed again.
+  h.owner.try_emit(modified_event(sub, "/a/f3", 3));
+  assert_eq!(
+    h.owner.needs_rescan.len(),
+    1,
+    "repeated overflow collapses to one parked Rescan"
+  );
+  assert_eq!(
+    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    Some(Epoch::new(3)),
+    "the parked epoch is idempotent under repeated overflow"
+  );
+
+  // Resume: the consumer drains the two buffered (pre-overflow) deliveries.
+  let buffered = h.drain();
+  assert_eq!(
+    buffered.len(),
+    2,
+    "the pre-overflow events buffered in-order, not lost"
+  );
+  assert!(
+    buffered.iter().all(|e| !e.is_rescan()),
+    "the buffered events are the ordinary deliveries"
+  );
+
+  // On the next loop tick the owner retries the parked Rescan; now there is room.
+  h.owner.flush_pending_rescans();
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the parked Rescan was delivered on resume"
+  );
+  let resumed = h.drain();
+  assert_eq!(
+    resumed.len(),
+    1,
+    "exactly the dominating Rescan is delivered on resume"
+  );
+  let rescan = &resumed[0];
+  assert!(rescan.is_rescan(), "the shed signal is a Rescan");
+  assert_eq!(rescan.subscription(), sub, "…for the affected subscription");
+  assert_eq!(
+    rescan.path(),
+    Path::new("/a"),
+    "…naming its covered key to re-enumerate"
+  );
+  let max_delivered = buffered
+    .iter()
+    .map(Event::epoch)
+    .max()
+    .expect("two buffered events");
+  assert!(
+    rescan.epoch() > max_delivered,
+    "the shed Rescan strictly dominates every event delivered before it (no silent loss)"
+  );
+}
+
+/// Fairness (design backpressure doc): a parked overflow `Rescan` for one subscription
+/// never blocks delivery to ANOTHER. With a full channel, subscription A overflows and
+/// parks; once a slot drains, an event for subscription B flows through immediately, while a
+/// further A delivery is suppressed (dominated by A's still-parked Rescan) rather than
+/// jumping ahead of it.
+#[tokio::test]
+async fn parked_rescan_does_not_block_other_subscriptions() {
+  let mut h = Harness::bounded(1);
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let sb = h.watch("/b", Interest::all()).await.expect("watch /b");
+
+  // Fill the single slot with an A delivery, then overflow A → park A's Rescan. B untouched.
+  h.owner.try_emit(modified_event(sa, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sa, "/a/f1", 1));
+  assert!(
+    h.owner.needs_rescan.contains_key(&sa),
+    "A overflowed and parked a Rescan"
+  );
+  assert!(
+    !h.owner.needs_rescan.contains_key(&sb),
+    "B is unaffected by A's overflow"
+  );
+
+  // The consumer makes progress: drain the one buffered A delivery.
+  assert_eq!(h.drain().len(), 1, "the pre-overflow A delivery drains");
+
+  // Now a B delivery flows even though A remains parked (fairness), while a further A
+  // delivery is suppressed by A's parked Rescan (never delivered ahead of it).
+  h.owner.try_emit(modified_event(sb, "/b/f0", 0));
+  h.owner.try_emit(modified_event(sa, "/a/f2", 2));
+  let after = h.drain();
+  assert_eq!(after.len(), 1, "only B's delivery flows; A's is suppressed");
+  assert_eq!(
+    after[0].subscription(),
+    sb,
+    "the delivered event belongs to the unparked B"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sa),
+    "A stays parked until its Rescan is flushed"
+  );
+}
+
+/// Root death with no silent loss on a full channel (design backpressure doc): a watched root
+/// **dies while the event channel is full**. The run loop fans out the terminal coverage-loss
+/// `Rescan` and THEN retires the dead root, on the same source event. With the channel full
+/// the terminal Rescan is *parked*, and retirement must **keep** it (unlike a
+/// consumer-initiated unwatch, which drops it) so the resuming consumer still learns the root
+/// is gone. Regression test for the co-retire bug where `retire_if_dead` dropped the owed
+/// Rescan in the very tick it was parked, leaving the consumer permanently stale.
+#[tokio::test]
+async fn root_death_while_channel_full_keeps_owed_rescan() {
+  let mut h = Harness::bounded(2);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  // Drive the subscription's epoch high-water up, as genuine deliveries would.
+  for raw in 0..3 {
+    h.owner.epochs.stamp(sub, Epoch::new(raw));
+  }
+
+  // The consumer is stalled (not draining): the two-slot channel fills in-order.
+  h.owner.try_emit(modified_event(sub, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sub, "/a/f1", 1));
+
+  // The root dies out of band. Reproduce the run loop's same-event ordering: fan out the
+  // terminal Rescan first, then retire. The fan-out finds the channel full, so the terminal
+  // coverage-loss Rescan is shed to a parked dominating Rescan.
+  h.owner.source.kill_root(1);
+  h.owner.fan_out_and_push(&rescan_event(1, "/a"));
+  assert_eq!(
+    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    Some(Epoch::new(3)),
+    "the terminal Rescan parked (channel full), minted one past the high-water"
+  );
+
+  // Retiring the dead root frees its filter + epoch but must KEEP the parked terminal Rescan
+  // — dropping it here is the silent-loss regression this test guards.
+  h.owner.retire_if_dead(&rescan_event(1, "/a"));
+  assert_eq!(
+    h.owner.subsumer.roots().count(),
+    0,
+    "the dead root is retired"
+  );
+  assert!(
+    !h.owner.filters.contains_key(&sub),
+    "retirement frees the dead root's filter (I4)"
+  );
+  assert_eq!(
+    h.owner.epochs.tracked_len(),
+    (0, 0),
+    "retirement frees the dead root's epoch state (I4)"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "retirement KEEPS the owed terminal Rescan (no silent loss on root death)"
+  );
+
+  // Resume: the consumer drains the two buffered pre-death deliveries.
+  let buffered = h.drain();
+  assert_eq!(
+    buffered.len(),
+    2,
+    "the pre-death events buffered in-order, not lost"
+  );
+
+  // The next loop tick retries the parked Rescan; now there is room, so it is delivered.
+  h.owner.flush_pending_rescans();
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the parked terminal Rescan self-drained on resume"
+  );
+  let resumed = h.drain();
+  assert_eq!(
+    resumed.len(),
+    1,
+    "exactly the terminal Rescan is delivered on resume — the consumer is not left stale"
+  );
+  let rescan = &resumed[0];
+  assert!(rescan.is_rescan(), "the coverage-loss signal is a Rescan");
+  assert_eq!(
+    rescan.subscription(),
+    sub,
+    "…for the subscription whose root died"
+  );
+  assert_eq!(
+    rescan.path(),
+    Path::new("/a"),
+    "…naming its covered key, which the consumer re-enumerates to discover the root is gone"
+  );
+  let max_delivered = buffered
+    .iter()
+    .map(Event::epoch)
+    .max()
+    .expect("two buffered events");
+  assert!(
+    rescan.epoch() > max_delivered,
+    "the terminal Rescan strictly dominates every event delivered before it (no silent loss)"
   );
 }

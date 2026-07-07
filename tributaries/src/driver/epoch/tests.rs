@@ -396,3 +396,72 @@ fn move_decomposition_stamps_each_projection() {
   assert_eq!(p2, Projection::MoveIn, "dest-sub gets the move-in Created");
   assert_eq!(e2, Epoch::new(4), "…stamped in s2's space (base 0 + raw 4)");
 }
+
+/// The overflow shed primitive (design backpressure doc): `shed_rescan` mints a
+/// strictly-dominating `Rescan` epoch WITHOUT rebasing the subscription's base (it stays on
+/// the same live root). The `Rescan` dominates the whole pre-shed stream, and subsequent
+/// genuine deltas from that SAME root — whose raw fs epochs keep climbing (no re-arm) —
+/// stamp `base + raw` and so sort **at or above** the `Rescan`, never below it (no silent
+/// loss). This is the property `repoint`'s base-rebasing would break for a shed: rebasing
+/// is sound only for a widen onto a fresh root whose raw epochs restart at 0.
+#[test]
+fn shed_rescan_dominates_prior_stream_and_same_root_deltas_sort_at_or_above() {
+  let mut ledger = EpochLedger::new();
+  let s = sub(1);
+  let root = Fixture::new("/a", &[(1, "/a")]);
+
+  // Same-root events at raw fs epochs 0..5 stamp 0..4 (base START), driving high-water to 4.
+  let mut pre = Vec::new();
+  for raw in 0..5 {
+    let delivered = root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(raw));
+    pre.push(delivered[0].1);
+  }
+  assert_eq!(
+    pre,
+    vec![
+      Epoch::new(0),
+      Epoch::new(1),
+      Epoch::new(2),
+      Epoch::new(3),
+      Epoch::new(4),
+    ],
+    "pre-shed stamps track the raw fs epochs from base START"
+  );
+
+  // Overflow shed: the parked Rescan is minted one past the high-water (strictly dominating
+  // the whole pre-shed stream).
+  let rescan = ledger.shed_rescan(s);
+  assert_eq!(rescan, Epoch::new(5), "shed_rescan = high_water.next()");
+  assert!(
+    pre.iter().all(|&e| e < rescan),
+    "the shed Rescan strictly dominates every pre-shed delivery"
+  );
+
+  // The SAME live root keeps delivering — its raw fs epochs keep climbing (5,6,7), NOT
+  // restarting at 0 (no re-arm). Because base was NOT rebased, they stamp base + raw =
+  // 5,6,7, tying-or-exceeding the Rescan, so a conforming consumer never drops them.
+  let mut post = Vec::new();
+  for raw in 5..8 {
+    let delivered = root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(raw));
+    post.push(delivered[0].1);
+  }
+  assert_eq!(
+    post,
+    vec![Epoch::new(5), Epoch::new(6), Epoch::new(7)],
+    "same-root post-shed deltas stamp base + raw (base unchanged)"
+  );
+  assert!(
+    post.iter().all(|&e| e >= rescan),
+    "no same-root delta after the shed sorts BELOW the Rescan (the non-rebasing guarantee)"
+  );
+
+  // Repeated sheds are monotone/idempotent: a second shed mints strictly above the first
+  // and above every same-root stamp since (high-water is now 7).
+  let rescan2 = ledger.shed_rescan(s);
+  assert_eq!(
+    rescan2,
+    Epoch::new(8),
+    "a second shed mints one past the new high-water (strictly increasing)"
+  );
+  assert!(rescan2 > rescan, "sheds are monotone");
+}
