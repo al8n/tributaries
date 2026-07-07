@@ -286,12 +286,18 @@ pub struct Watcher<R: RuntimeLite> {
   /// This watcher's handle brand (see [`RootHandle`]).
   instance: u64,
   commands: async_channel::Sender<Command>,
-  // Boxed: async-channel's `Receiver` embeds a pinned listener (it is not
-  // `Unpin`), and boxing it keeps `Watcher` itself `Unpin` for consumers.
-  events: futures_util::stream::BoxStream<'static, (ScopeId, Arc<PathBuf>, Change)>,
+  events: EventStream,
   roots: Arc<RwLock<RootSet>>,
   _runtime: PhantomData<R>,
 }
+
+/// The watcher's inbound event stream: the driver's `async_channel::Receiver`,
+/// type-erased. Boxed because the `Receiver` embeds a pinned listener (it is
+/// not `Unpin`), so the `Pin<Box<…>>` keeps `Watcher` itself `Unpin` for
+/// consumers. The `+ Send + Sync` bound (the `Receiver` is both) keeps
+/// `Watcher: Sync`, hence `&Watcher: Send`.
+type EventStream =
+  Pin<Box<dyn Stream<Item = (ScopeId, Arc<PathBuf>, Change)> + Send + Sync + 'static>>;
 
 impl<R: RuntimeLite> core::fmt::Debug for Watcher<R> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -347,7 +353,7 @@ impl<R: RuntimeLite> Watcher<R> {
     Ok(Self {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
-      events: futures_util::StreamExt::boxed(event_rx),
+      events: Box::pin(event_rx),
       roots,
       _runtime: PhantomData,
     })
