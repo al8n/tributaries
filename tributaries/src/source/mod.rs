@@ -348,16 +348,18 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
       .watcher
       .watch(key_to_path(key), Interest::all())
       .await?;
-    // Adopt the filesystem-authoritative canonical path as the committed key (design §4,
-    // the TOCTOU close): events are reported in canonical coordinates, so the index must
-    // key on them. If fs cannot report one (the handle raced a teardown) fall back to the
-    // requested key — a later event under a now-dead root routes to nothing regardless.
-    let canonical_key = self
-      .watcher
-      .root_path(handle)
-      .map(|path| path_components(&path))
-      .unwrap_or_else(|| key.to_vec());
-    Ok(Armed::new(handle, canonical_key))
+    // Adopt the filesystem-authoritative canonical path as the committed key (design §4, the
+    // TOCTOU close): events are reported in canonical coordinates, so the index must key on
+    // them. A `None` here means the root was already torn down (deleted between the request and
+    // this arm completing) — a dead-on-arrival handle backing no live watch. Do NOT fall back
+    // and report it armed: best-effort release it and fail, so the source never claims a dead
+    // handle armed. Belt-and-suspenders under the driver's own arm-choke-point liveness check
+    // (invariant I2), which guarantees this for every `Source` impl regardless.
+    let Some(path) = self.watcher.root_path(handle) else {
+      let _ = self.watcher.unwatch(handle).await;
+      return Err(WatchError::DeadOnArrival);
+    };
+    Ok(Armed::new(handle, path_components(&path)))
   }
 
   async fn disarm(&mut self, handle: RootHandle) {

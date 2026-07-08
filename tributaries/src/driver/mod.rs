@@ -888,12 +888,32 @@ where
   }
 
   /// The single **arm-and-key choke point** (invariant I2): arms `key` through the
-  /// [`Source`], and adopts the source's reported **canonical key** as the committed
-  /// coordinate. Every arming path (fresh, widen) funnels through here, so no coverage
-  /// check ever runs against a provisional key.
+  /// [`Source`], validates the armed root is **live**, and adopts the source's reported
+  /// **canonical key** as the committed coordinate. Every arming path — the fresh `Disjoint`
+  /// arm, the `Widen` arm, and the [`restore_disarmed_roots`](Self::restore_disarmed_roots)
+  /// re-arm — funnels through here, so no coverage check ever runs against a provisional key
+  /// AND no dead-on-arrival handle ever becomes a committed root, for **any** [`Source`] impl.
+  ///
+  /// A successful [`Source::arm`] does **not** by itself guarantee liveness: a source may
+  /// report an arm as succeeded for a root it has **already forgotten** — one removed between
+  /// the request and the arm completing ([`FsSource`] historically fell back to the requested
+  /// key when [`root_path`](tributary_fs::Watcher::root_path) was `None`). Committing such a
+  /// dead-on-arrival handle publishes the key as watched yet backs it with **no live watch**:
+  /// changes would rely on a later terminal event instead of being streamed. So after the arm
+  /// this synchronously validates the handle through the same out-of-band [`Source::root_key`]
+  /// probe the Covered-reuse loop (Codex R12) and terminal retirement (R11) use; on a dead
+  /// handle it best-effort [`disarm`](Source::disarm)s the stray root (ignoring the result —
+  /// a source that cannot release an already-dead root absorbs it) and fails the arm with
+  /// [`WatchError::DeadOnArrival`]. Arm-time (R13) + reuse-time (R12) + terminal-time (R11)
+  /// liveness together close the handle-liveness class.
   async fn arm(&mut self, key: &[C]) -> Result<(S::Handle, Vec<C>), WatchError> {
     let armed = self.source.arm(key).await?;
-    Ok((armed.handle(), armed.canonical_key().to_vec()))
+    let handle = armed.handle();
+    if self.source.root_key(handle).is_none() {
+      self.source.disarm(handle).await;
+      return Err(WatchError::DeadOnArrival);
+    }
+    Ok((handle, armed.canonical_key().to_vec()))
   }
 
   /// Reconciles one `unwatch` (invariant I4): retires the subscription's per-source and
