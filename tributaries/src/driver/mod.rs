@@ -283,6 +283,8 @@ where
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
+      #[cfg(debug_assertions)]
+      observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<R>,
     };
     R::spawn_detach(run(owner));
@@ -506,6 +508,15 @@ where
   /// strong `Sender`, so the channel is held open only for the brief life of the grant.
   commands_weak: async_channel::WeakSender<Command<C, V>>,
   events: async_channel::Sender<Event<C, V>>,
+  /// A **debug-only** exhaustive tripwire for the generation-unique [`Source::Handle`] contract:
+  /// every handle this owner has ever observed from a successful live [`arm`](Self::arm). The arm
+  /// choke point asserts each freshly-armed handle was **never** seen before, catching ANY reuse —
+  /// a still-recorded sibling, or one already removed from the live index by unwatch or terminal
+  /// retirement (the post-retirement reuse the per-site live-index checks missed, Codex R17). It is
+  /// only ever inserted into, never pruned, so a retired-then-reused handle is still caught;
+  /// `#[cfg(debug_assertions)]` so the field, its init, and its assert add zero release-build cost.
+  #[cfg(debug_assertions)]
+  observed_handles: std::collections::HashSet<S::Handle>,
   _rt: PhantomData<R>,
 }
 
@@ -832,12 +843,8 @@ where
         }
         // A fresh arm's handle is generation-unique (see `Source::Handle`), so it is absent from the
         // reverse index and `commit_watch`'s `by_handle` insert cannot clobber a live root's entry.
-        // The debug_assert is the tripwire for a contract-violating source (Codex R15-F2).
-        debug_assert!(
-          self.subsumer.entry(handle).is_none(),
-          "Source::arm returned a handle already recorded for a different root — a \
-           generation-unique Source::Handle contract violation (see Source::Handle)"
-        );
+        // A contract-violating source is caught by the arm choke point's exhaustive observed-handle
+        // tripwire (Codex R17), which fires on ANY reuse before this commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, filter);
         Ok(sub)
@@ -884,13 +891,9 @@ where
         }
         // The wider arm's handle is generation-unique (see `Source::Handle`): it aliases none of the
         // still-recorded subsumed roots `commit_watch` is about to drop, nor any other live root, so
-        // its `by_handle` insert cannot clobber a live entry. The debug_assert catches a
-        // contract-violating source loudly in debug/test builds (Codex R15-F2).
-        debug_assert!(
-          self.subsumer.entry(handle).is_none(),
-          "Source::arm returned a handle already recorded for a different root — a \
-           generation-unique Source::Handle contract violation (see Source::Handle)"
-        );
+        // its `by_handle` insert cannot clobber a live entry. A contract-violating source is caught
+        // by the arm choke point's exhaustive observed-handle tripwire (Codex R17) before this
+        // commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, filter);
         // Rebase each re-pointed subscription onto the wider root (design §8): its
@@ -941,6 +944,12 @@ where
   /// a source that cannot release an already-dead root absorbs it) and fails the arm with
   /// [`WatchError::DeadOnArrival`]. Arm-time (R13) + reuse-time (R12) + terminal-time (R11)
   /// liveness together close the handle-liveness class.
+  ///
+  /// Because every arming path funnels through here, this is also where the **exhaustive**
+  /// generation-unique [`Source::Handle`] tripwire lives (Codex R17): a debug-only assert that the
+  /// freshly-armed, live handle was NEVER observed by this owner before. It subsumes the old
+  /// per-site live-index checks AND additionally catches reuse of a handle already removed from the
+  /// live index by unwatch or terminal retirement (see `observed_handles`).
   async fn arm(&mut self, key: &[C]) -> Result<(S::Handle, Vec<C>), WatchError> {
     let armed = self.source.arm(key).await?;
     let handle = armed.handle();
@@ -948,6 +957,21 @@ where
       self.source.disarm(handle).await;
       return Err(WatchError::DeadOnArrival);
     }
+    // The single exhaustive tripwire for the generation-unique `Source::Handle` contract (Codex
+    // R17): a freshly-armed, live handle must NEVER have been observed by this owner before. This
+    // one choke-point check subsumes the old per-site live-index `entry(handle).is_none()` asserts
+    // (Disjoint/Widen commit, restore rebind) AND additionally catches reuse of a handle already
+    // removed from the live index by unwatch or terminal retirement — which those per-site checks
+    // missed, because a stale event still carrying it could then route through the re-armed root.
+    // `HashSet::insert` returns `false` on any prior value, and the set is only added to (never
+    // pruned), so a retired-then-reused handle still trips. Debug-only: the field, this assert, and
+    // its cost all vanish in release builds.
+    #[cfg(debug_assertions)]
+    debug_assert!(
+      self.observed_handles.insert(handle),
+      "Source::arm returned a handle already observed by this owner (a reused handle, even after \
+       retirement) — a generation-unique Source::Handle contract violation; see Source::Handle"
+    );
     Ok((handle, armed.canonical_key().to_vec()))
   }
 
@@ -1029,8 +1053,9 @@ where
   ///   **generation-unique** handle by contract (see [`Source::Handle`]), so it can alias neither
   ///   `old` nor a not-yet-restored sibling still recorded here; the earlier defensive
   ///   alias-detection is gone (Codex R15 — it was incomplete, and disarming an aliased handle
-  ///   stranded an *unrelated live* root), replaced by a `debug_assert` tripwire at the rebind that
-  ///   fires loudly on a contract-violating source without corrupting release builds.
+  ///   stranded an *unrelated live* root), replaced by the arm choke point's exhaustive
+  ///   observed-handle `debug_assert` tripwire (Codex R17) that fires loudly on a contract-violating
+  ///   source without corrupting release builds.
   /// - if the re-arm **fails** (the root is genuinely dead) or its committed key **diverged** (a
   ///   canonicalization race we cannot cleanly rebind), **retire** the root through the shared
   ///   [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan): a durable
@@ -1057,19 +1082,15 @@ where
           // entry. The earlier defensive alias-detection (disarm the aliased handle + retire `old`)
           // is retired: it was incomplete AND, when the alias was an unrelated *live* root, its
           // `disarm` released that root's real source watch while its record/coverage stayed live,
-          // silently missing future changes (Codex R15-F2). A `debug_assert` is the tripwire for a
-          // contract-violating source instead. The generation-unique contract forbids reusing a
-          // handle even for a *same-key* re-arm (Codex R16): if a stale pre-disarm event still
-          // carrying `old` is queued, re-arming `old` would let it route through the re-armed root
-          // and be stamped in the new generation past the restore Rescan — so `old` must fall to the
-          // dead-root drain path, and `new_handle == old` is NOT exempt. `old` is still recorded here
-          // (the `rebind_root` below moves it), so any reused handle — sibling or `old` — trips it.
-          debug_assert!(
-            self.subsumer.entry(new_handle).is_none(),
-            "Source::arm returned an already-recorded handle — a generation-unique \
-             Source::Handle contract violation (every arm must mint a fresh generation, even for a \
-             same-key re-arm; see Source::Handle)"
-          );
+          // silently missing future changes (Codex R15-F2). The generation-unique contract also
+          // forbids reusing a handle even for a *same-key* re-arm (Codex R16): if a stale pre-disarm
+          // event still carrying `old` is queued, re-arming `old` would let it route through the
+          // re-armed root and be stamped in the new generation past the restore Rescan — so `old`
+          // must fall to the dead-root drain path, and reusing `old` is NOT exempt. Any reuse —
+          // a sibling, `old`, or a handle already removed from the live index by a prior retirement —
+          // is caught by the arm choke point's exhaustive observed-handle tripwire (Codex R17)
+          // before this rebind is ever reached.
+          //
           // Re-armed at the same coordinate with a fresh handle: rebind onto it and re-point each
           // subscriber (raw epochs restarted at zero) with a dominating Rescan.
           self.subsumer.rebind_root(old, new_handle);

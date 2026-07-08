@@ -352,6 +352,8 @@ impl Harness {
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
+      #[cfg(debug_assertions)]
+      observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<TokioRuntime>,
     };
     Self {
@@ -787,11 +789,12 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
 
 /// Codex R15-F2 regression (the failed-widen restore under the **generation-unique**
 /// [`Source::Handle`] contract): a source that re-mints a **still-recorded** sibling's handle value
-/// for a re-arm violates the contract, and the rebind choke point's `debug_assert` must catch it
-/// LOUDLY rather than silently corrupt the reverse index. Here the widen of `/a` fails and the
-/// restore of `/a/b` (old handle 1) re-arms while the source REUSES handle `2` — still recorded as
-/// the not-yet-restored sibling `/a/c`. `rebind_root(1, 2)` would overwrite `by_handle[2]` and
-/// strand `/a/c`, so the debug_assert trips first.
+/// for a re-arm violates the contract, and the arm choke point's observed-handle `debug_assert`
+/// (Codex R17) must catch it LOUDLY rather than let `rebind_root` silently corrupt the reverse
+/// index. Here the widen of `/a` fails and the restore of `/a/b` (old handle 1) re-arms while the
+/// source REUSES handle `2` — already observed when the sibling `/a/c` was armed. The re-arm trips
+/// the observed-handle assert first (`rebind_root(1, 2)` would otherwise overwrite `by_handle[2]`
+/// and strand `/a/c`).
 ///
 /// The earlier R14-F2 defensive recovery (disarm the aliased handle + retire `old`) was RETIRED
 /// (Codex R15): it was incomplete, and when the alias was an unrelated *live* root its `disarm`
@@ -801,7 +804,7 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
 /// the debug_assert is the debug/test-only tripwire for a violating one. Hence `#[should_panic]` —
 /// and `ignore`d in release builds, where `debug_assert!` is compiled out and nothing panics.
 #[tokio::test]
-#[should_panic(expected = "already-recorded handle")]
+#[should_panic(expected = "already observed by this owner")]
 #[cfg_attr(
   not(debug_assertions),
   ignore = "the debug_assert tripwire is compiled out in release builds"
@@ -812,27 +815,28 @@ async fn failed_widen_restore_reusing_a_recorded_sibling_handle_trips_the_tripwi
   let _sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
   let _sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
 
-  // The wider /a arm fails, AND the first restore re-arm (/a/b) REUSES handle 2 — still recorded as
-  // the not-yet-restored sibling /a/c. That is a generation-unique `Source::Handle` VIOLATION, so
-  // the rebind choke point's debug_assert panics on it rather than corrupt `by_handle` (R15-F2).
+  // The wider /a arm fails, AND the first restore re-arm (/a/b) REUSES handle 2 — already observed
+  // when the sibling /a/c was armed. That is a generation-unique `Source::Handle` VIOLATION, so the
+  // arm choke point's observed-handle debug_assert panics at re-arm time, before the rebind (R17).
   h.owner.source.fail_next_arm();
   h.owner.source.reuse_next_arm_handle(2);
   // Panics inside the restore, before the watch returns — the source violated the handle contract.
   let _ = h.watch("/a", Interest::all()).await;
 }
 
-/// Codex R16 regression (generation-unique contract, the SAME-key case the R15 tripwire wrongly
-/// exempted): the failed-widen restore re-arm must mint a FRESH handle even for the same key —
-/// reusing `old` is a `Source::Handle` violation, because a stale pre-disarm event still carrying
-/// `old` would then route through the re-armed root and be stamped in the new generation past the
-/// restore Rescan (a handle-ABA sibling). The R15 tripwire had `|| new_handle == old`, masking
-/// exactly this; R16 removed the exemption so a same-`old` re-arm trips the rebind debug_assert too.
+/// Codex R16 regression (generation-unique contract, the SAME-key case the original R15 rebind
+/// tripwire wrongly exempted with `|| new_handle == old`): the failed-widen restore re-arm must
+/// mint a FRESH handle even for the same key — reusing `old` is a `Source::Handle` violation,
+/// because a stale pre-disarm event still carrying `old` would then route through the re-armed root
+/// and be stamped in the new generation past the restore Rescan (a handle-ABA sibling). The
+/// exhaustive observed-handle tripwire (Codex R17) has NO same-key exemption: `old` was observed
+/// when `/a/b` was first armed, so re-arming with it trips the arm choke point's assert.
 ///
-/// Fail-on-old: with the `|| new_handle == old` exemption present, reusing `/a/b`'s own handle 1 is
-/// masked — no panic — so this `#[should_panic]` FAILS. Removing the exemption trips the assert
-/// (handle 1 is still recorded until the rebind).
+/// Fail-on-old: the retired R15 rebind assert's `|| new_handle == old` exemption masked this
+/// same-`old` reuse (no panic). The observed-handle set — which records `old` at its first arm and
+/// never prunes — has no such exemption, so a same-`old` re-arm still trips.
 #[tokio::test]
-#[should_panic(expected = "already-recorded handle")]
+#[should_panic(expected = "already observed by this owner")]
 #[cfg_attr(
   not(debug_assertions),
   ignore = "the debug_assert tripwire is compiled out in release builds"
@@ -844,12 +848,47 @@ async fn failed_widen_restore_reusing_old_handle_trips_the_tripwire() {
   let _sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
 
   // The wider /a arm fails; the first restore re-arm (/a/b) REUSES handle 1 — /a/b's OWN old handle
-  // (same-key reuse), still recorded until the rebind. Generation-unique forbids reissuing `old`, so
-  // the rebind choke point's debug_assert panics (R16) rather than let a stale `old` event route
-  // through the re-armed root.
+  // (same-key reuse), observed when /a/b was first armed. Generation-unique forbids reissuing `old`,
+  // so the arm choke point's observed-handle debug_assert panics at re-arm time (R16/R17) rather
+  // than let a stale `old` event route through the re-armed root.
   h.owner.source.fail_next_arm();
   h.owner.source.reuse_next_arm_handle(1);
   let _ = h.watch("/a", Interest::all()).await;
+}
+
+/// Codex R17 regression (the exhaustive observed-handle tripwire — the POST-RETIREMENT reuse the
+/// per-site live-index checks MISSED): a handle removed from the live index by an `unwatch` (or a
+/// terminal retirement) that a later arm REUSES is still a generation-unique `Source::Handle`
+/// violation — a stale event still carrying it would route through the re-armed root in its new
+/// generation. The retired per-site checks only asserted `entry(handle).is_none()` against the
+/// CURRENT index, so a reused post-retirement handle (absent from the index) passed them silently;
+/// the owner-level observed-handle set catches it, because the handle was observed at its first arm
+/// and the set is never pruned.
+///
+/// Fail-on-old: after the `unwatch`, handle 1 is gone from `by_handle` (`plan_unwatch` removes it on
+/// `RootEmptied`), so the reused-handle re-watch takes the `Disjoint` commit path whose retired
+/// live-index-only assert `entry(1).is_none()` would PASS — no panic, and `/b` would silently bind
+/// to the retired handle 1. The observed-handle assert trips instead, at the arm choke point.
+#[tokio::test]
+#[should_panic(expected = "already observed by this owner")]
+#[cfg_attr(
+  not(debug_assertions),
+  ignore = "the debug_assert tripwire is compiled out in release builds"
+)]
+async fn rearm_reusing_a_retired_handle_trips_the_tripwire() {
+  let mut h = Harness::new();
+
+  // Watch /a (handle 1), then unwatch it: the root is emptied, so `plan_unwatch` disarms handle 1
+  // AND removes it from the live index (`by_handle`). Handle 1 is now retired — gone from every live
+  // structure, but permanently recorded in the owner's observed-handle set.
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  h.unwatch(sa).await.expect("unwatch /a");
+
+  // Re-watch a disjoint key and force the source to REUSE the retired handle 1 — a generation-unique
+  // `Source::Handle` violation. The retired live-index check would pass (handle 1 is absent from the
+  // index after the unwatch), but the arm choke point's observed-handle debug_assert panics (R17).
+  h.owner.source.reuse_next_arm_handle(1);
+  let _ = h.watch("/b", Interest::all()).await;
 }
 
 /// Codex R13 (the ARM-choke-point liveness close, widen path): a `Widen` whose **wider** arm is
@@ -2570,6 +2609,8 @@ impl OwnerU64 {
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
+      #[cfg(debug_assertions)]
+      observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<TokioRuntime>,
     };
     Self {
