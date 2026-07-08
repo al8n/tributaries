@@ -63,15 +63,19 @@ mod tests;
 ///   or not-yet-emitted event still carries it (the hard contract on [`Handle`](Self::Handle), Codex
 ///   R15). Makes handle ABA impossible; the umbrella routes strictly by handle rather than defending
 ///   against reuse.
-/// - **Liveness of [`arm`](Self::arm) / [`disarm`](Self::disarm) / [`canonicalize_key`](Self::canonicalize_key)**
-///   — the umbrella awaits [`arm`](Self::arm)/[`disarm`](Self::disarm) (and calls the synchronous
-///   [`canonicalize_key`](Self::canonicalize_key)) while processing a **caller-initiated**
-///   `watch`/`unwatch`, running each reconcile to completion (invariant I1). These MUST make
-///   progress and resolve. A source that makes one **hang indefinitely** violates this liveness
-///   expectation: because the caller's `watch`/`unwatch` future is *also* awaiting, the caller may
-///   drop it to cancel its own wait, but the umbrella still owns the in-flight reconcile — so a
-///   wedged caller-initiated `arm`/`disarm` blocks the owner until the source honors the contract.
-///   This is the source's responsibility, not a bug the umbrella can defend against.
+/// - **Bounded [`arm`](Self::arm) / [`disarm`](Self::disarm) / [`canonicalize_key`](Self::canonicalize_key)**
+///   — the umbrella awaits [`arm`](Self::arm) and [`disarm`](Self::disarm) (and calls the synchronous
+///   [`canonicalize_key`](Self::canonicalize_key)) and runs each **to completion**, so all three MUST
+///   make progress and resolve in **bounded time**. [`arm`](Self::arm) is awaited only on a
+///   **caller-initiated** `watch`, running the reconcile to completion (invariant I1); a wedged one
+///   blocks the owner until the source honors the contract (the caller may drop its own `watch` wait,
+///   but the umbrella still owns the in-flight reconcile). [`disarm`](Self::disarm) carries the
+///   sharper **bounded-but-NOT-cancellation-safe** contract (see its docs): the umbrella never
+///   cancels an in-flight `disarm` — on the caller `unwatch`/widen/restore paths **or** the internal
+///   orphan-disarm drain — so it may hold state across polls, but it must not block indefinitely,
+///   since the owner runs it to completion rather than racing it. A source that makes any of these
+///   **hang indefinitely** violates the contract; that is the source's responsibility, not a bug the
+///   umbrella can `await`-around.
 /// - **Cancellation-safe [`next`](Self::next)** — dropping an in-flight [`next`](Self::next) future
 ///   loses and acknowledges no event (the hard contract on [`next`](Self::next)).
 ///
@@ -81,14 +85,21 @@ mod tests;
 ///   [`next`](Self::next) as one arm of a biased `select!`; a `next()` that never resolves is simply
 ///   a pending arm — the loop still services the command mailbox and `Close`.
 /// - **Close-responsiveness against INTERNAL actions (invariant II).** Owner actions that are *not*
-///   a caller-awaited `watch`/`unwatch` — a `DropOrphan` from a dropped `watch` grant (Codex
-///   R20-F1), and the source-drain teardown (Codex R19) — MUST NEVER block `Close` on source I/O.
-///   The umbrella never awaits their [`disarm`](Self::disarm) inline: it **defers** an orphan's
-///   last-subscriber disarm and drains it only while racing the command mailbox (so a `Close` always
-///   wins), and the source-drain teardown purges orphans synchronously. A wedged
-///   [`disarm`](Self::disarm) of an orphaned root therefore delays only that deferred cleanup, never
-///   `Close`. (Caller-initiated `arm`/`disarm` are the other half of the split above — bounded by
-///   the source liveness contract, not by the umbrella.)
+///   a caller-awaited `watch`/`unwatch` — a `DropOrphan` from a dropped `watch` grant and the
+///   send-failure orphan on the same path (Codex R20-F1/R21-F1), and the source-drain teardown
+///   (Codex R19) — MUST NOT block `Close` on source I/O beyond **at most one in-flight bounded
+///   [`disarm`](Self::disarm)**. The umbrella never awaits an orphan's last-subscriber disarm
+///   *inline on the command path*: it purges the orphan's owner-local state synchronously and
+///   **defers** the disarm, and the run loop then drains one deferred disarm **to completion** in its
+///   body — with a direct `.await`, never a cancellable `select!` arm — but only when the command
+///   mailbox is idle, re-checking the mailbox before each. So a queued `Close`/command is always
+///   serviced first and a **bounded** disarm delays `Close` by at most itself (the source-drain
+///   teardown likewise purges orphans synchronously, never disarming). Because a conforming
+///   [`disarm`](Self::disarm) is bounded, `Close` stays responsive; only a contract-violating
+///   **unbounded** disarm could delay it, which is out of scope — and dropping every handle tears the
+///   owner down and drops the source without awaiting these now-moot disarms. (Caller-initiated
+///   `arm`/`disarm` are the other half of the split above — bounded by the source contract, not
+///   defended against by the umbrella.)
 /// - **No stranded or corrupt state.** A committed-but-unclaimed subscription is always reconciled
 ///   away (the `WatchGrant`, invariant I1); a subscription terminal-retired while unclaimed leaves no
 ///   lingering parked `Rescan` behind (Codex R20-F2); and a deferred orphan-disarm that has not run
@@ -205,6 +216,34 @@ pub trait Source<C> {
   /// Best-effort: a source that cannot confirm the release (already closed, root already
   /// gone) absorbs it rather than surfacing an error, since a released root's runtime
   /// conditions reach the umbrella in-band as events, not out of band here.
+  ///
+  /// # `disarm` MUST be bounded — but need NOT be cancellation-safe (hard contract)
+  ///
+  /// The umbrella **awaits every `disarm` to completion and NEVER cancels an in-flight one.** Unlike
+  /// [`next`](Self::next), `disarm` is *never* one arm of a cancellable
+  /// [`select!`](futures_util::select_biased): every call site drives it with a direct `.await` — the
+  /// caller-initiated `unwatch`/widen/restore reconciles, and the owner's internal orphan-disarm
+  /// drain, which pops one deferred handle and awaits it to completion **in the run loop's body when
+  /// the command mailbox is idle**, never racing a timer or a competing arm. A `disarm` future is
+  /// therefore dropped only if the whole owner task is torn down, so an implementor may hold state
+  /// across polls freely: `disarm` does **not** have to survive mid-flight cancellation the way
+  /// [`next`](Self::next) must (dropping a half-run `disarm` and re-issuing it need not be a no-op).
+  ///
+  /// In exchange, a conforming `disarm` **MUST complete in bounded time** — it must not block
+  /// indefinitely. Because the owner runs it to completion rather than racing it, an *unbounded*
+  /// `disarm` wedges the owner on that one call; a *bounded* one upholds the guarantee below.
+  ///
+  /// The resulting **Close-responsiveness** guarantee is precise: internal orphan cleanup (a
+  /// dropped-`watch` grant — Codex R20-F1/R21-F1 — or the send-failure orphan on the same path)
+  /// never blocks [`Close`](crate::Tributaries::close) on source I/O beyond **at most one in-flight
+  /// bounded `disarm`**. The owner services `Close`/commands *between* disarms — it checks the
+  /// mailbox before each and re-checks it after — so a conforming (bounded) source keeps `Close`
+  /// responsive; only a **contract-violating unbounded** `disarm` can delay `Close`, a documented
+  /// violation out of scope for the umbrella to defend against (the same stance the generation-unique
+  /// [`Handle`](Self::Handle) and caller-initiated arm/disarm liveness take: unbounded source I/O is
+  /// the source's bug, not one the single-owner umbrella can `await`-around). Dropping every handle
+  /// never leaves the owner awaiting a disarm before its source is dropped: any still-deferred handles
+  /// are moot at teardown — the dropped owner drops the source, whose own `Drop` releases every watch.
   ///
   /// Returns a `Send` future (see the `Send` bounds note on the [trait](Self)).
   fn disarm(&mut self, handle: Self::Handle) -> impl Future<Output = ()> + Send;
