@@ -1249,6 +1249,47 @@ async fn widen_drops_buffered_coalescer_delta_so_repoint_rescan_parks_at_own_epo
   );
 }
 
+/// Codex R8 regression (design backpressure doc, no silent loss): while a subscription is PARKED
+/// (its overflow `Rescan` sits in `needs_rescan`), a later SOURCE `Rescan` for a DIFFERENT key
+/// under the same root must NOT be discarded — it is an independent coverage-loss signal. The old
+/// `try_emit` early-returned for every event of a parked sub, so the second Rescan's subtree was
+/// never re-enumerated. The fix merges it into the parked debt, widening the key to the common
+/// ancestor that covers BOTH losses.
+///
+/// Fail-on-old: with the unconditional early return (no merge), the parked key stays `/a/x` and the
+/// eventually-delivered Rescan never covers `/a/y` → the common-ancestor assertion FAILS.
+#[tokio::test]
+async fn a_source_rescan_while_parked_merges_coverage_instead_of_being_dropped() {
+  let mut h = Harness::bounded(2);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a"); // root handle 1
+  for raw in 0..3 {
+    h.owner.epochs.stamp(sub, Epoch::new(raw)); // high-water 2
+  }
+
+  // FILL both channel slots so the first source Rescan must overflow-park.
+  h.owner.try_emit(modified_event(sub, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sub, "/a/f1", 1));
+
+  // A source Rescan for /a/x overflows → parks at its own located key.
+  h.owner.fan_out_and_push(&rescan_event(1, "/a/x", 5));
+  assert_eq!(
+    h.owner.needs_rescan.get(&sub).map(|p| p.key.clone()),
+    Some(key("/a/x")),
+    "the first source Rescan parked at its own key /a/x"
+  );
+
+  // A SECOND source Rescan for a DIFFERENT key /a/y arrives while parked. It must be MERGED, not
+  // discarded: the parked key widens to the common ancestor /a, re-enumerating a superset that
+  // covers BOTH /a/x and /a/y.
+  h.owner.fan_out_and_push(&rescan_event(1, "/a/y", 6));
+  assert_eq!(
+    h.owner.needs_rescan.get(&sub).map(|p| p.key.clone()),
+    Some(key("/a")),
+    "the second source Rescan merged into the parked debt, widening the key to the common \
+     ancestor /a that covers both losses (not dropped, not left at /a/x)"
+  );
+}
+
 /// Source-drain no-silent-loss (design backpressure doc, checklist #1):
 /// a per-subscription overflow `Rescan` is **parked while the event channel is full**, then
 /// the source drains (`next` → `None`) at teardown. The owner must deliver that owed Rescan
