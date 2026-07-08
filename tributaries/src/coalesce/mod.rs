@@ -145,10 +145,12 @@ where
     }
   }
 
-  /// Admits one attributed event at logical time `now`: buffers and collapses it per
-  /// the [table](self#the-collapse-table-design-6), or — for a
-  /// [`Moved`](EventKind::Moved) or [`Rescan`](EventKind::Rescan) — applies the
-  /// overriding invariant (flush + emit whole / flush + bypass).
+  /// Admits one attributed event at logical time `now`: buffers and collapses a known
+  /// lifecycle change ([`Created`](EventKind::Created) / [`Modified`](EventKind::Modified) /
+  /// [`Removed`](EventKind::Removed)) per the [table](self#the-collapse-table-design-6), or —
+  /// for a [`Moved`](EventKind::Moved), a [`Rescan`](EventKind::Rescan), or any unknown/future
+  /// non-lifecycle kind (`EventKind` is `#[non_exhaustive]`) — applies the overriding invariant
+  /// (flush + emit whole / flush + bypass), never folding it into the lifecycle collapse table.
   ///
   /// No event is ever silently dropped: every admitted event is either buffered for
   /// later emission, folded into a buffered entry that will emit, made immediately
@@ -173,10 +175,22 @@ where
       // `EventKind` match, so it needs no fs `MovedEvent` to recognize.
       self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
-    } else {
-      // A lifecycle change (Created / Modified / Removed): buffer it, collapsing onto
+    } else if matches!(
+      ev.kind(),
+      EventKind::Created | EventKind::Modified | EventKind::Removed
+    ) {
+      // A known lifecycle change (Created / Modified / Removed): buffer it, collapsing onto
       // any entry already held for its (subscription, path).
       self.coalesce(ev, now);
+    } else {
+      // An unknown/future non-lifecycle kind: `EventKind` is #[non_exhaustive], and the collapse
+      // table only knows the three lifecycle kinds (its default arm would relabel or drop one).
+      // Do NOT buffer it — flush the subscription's buffer and emit it immediately, exactly like a
+      // Moved/Rescan, so it is delivered in-order (older buffered entries flushed ahead of it, the
+      // monotone per-subscription epoch preserved) and never collapsed under an allowed
+      // version-skew (Codex R11 F2, no silent loss).
+      self.flush_subscription(ev.subscription(), now);
+      self.ready.push_back((now, ev));
     }
   }
 
@@ -302,11 +316,11 @@ where
   ///
   /// Both are lifecycle kinds ([`Created`](EventKind::Created) /
   /// [`Modified`](EventKind::Modified) / [`Removed`](EventKind::Removed)) — a buffered
-  /// entry is only ever one of those, and [`admit`](Self::admit) dispatches
-  /// `Moved`/`Rescan` aside before reaching here. The default arm covers the four rows
-  /// whose result equals the buffered kind (`Created`/`Modified` then
-  /// `Created`/`Modified`); any non-lifecycle kind, which cannot occur, safely falls
-  /// there too.
+  /// entry is only ever one of those, and [`admit`](Self::admit) dispatches `Moved`, `Rescan`,
+  /// and any unknown/future non-lifecycle kind aside (flush-and-emit) before reaching here, so
+  /// `incoming` is a lifecycle kind too. The default arm covers the four rows whose result
+  /// equals the buffered kind (`Created`/`Modified` then `Created`/`Modified`); a non-lifecycle
+  /// kind cannot reach it, but would fall there harmlessly.
   fn collapse(buffered: &EventKind, incoming: &EventKind) -> Collapse {
     use EventKind::{Created, Modified, Removed};
     match (buffered, incoming) {

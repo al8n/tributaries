@@ -218,6 +218,21 @@ fn source_modified(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString,
   )
 }
 
+/// A raw `Removed` [`SourceEvent`] for `handle` at `path` — the user-visible NON-`Rescan`
+/// terminal event the fs layer can surface for a watched-root deletion before its terminal
+/// `Rescan`, which `retire_if_dead` must also retire a dead root on (Codex R11 F1).
+fn source_removed(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, u32> {
+  SourceEvent::new(
+    handle,
+    key(path),
+    EventKind::Removed,
+    None,
+    Location::new(),
+    Epoch::new(epoch),
+    ChangeId::new(NonZeroU64::MIN),
+  )
+}
+
 /// Drives the owner's reconcile primitives over a [`FakeSource`], with the owner's event
 /// stream drained on demand — the sans-I/O reconcile logic exercised without a real
 /// filesystem, runtime timers, or the select loop.
@@ -842,6 +857,90 @@ async fn terminal_rescan_retires_root_overflow_keeps_it() {
     h.owner.epochs.tracked_len(),
     (0, 0),
     "retirement frees the epoch state (I4)"
+  );
+}
+
+/// Codex R11 F1 regression (design §4, invariant I4): a watched root can surface its own
+/// deletion as a user-visible NON-`Rescan` terminal event (a `Removed`) that the lower fs layer
+/// FOLLOWS with a terminal `Rescan`. If `retire_if_dead` retired the dead root only on the
+/// `Rescan` (the old `!raw.is_rescan()` gate), a caller that observes the `Removed` and
+/// re-`watch`es the same path BEFORE the queued terminal `Rescan` is processed would be
+/// classified `Covered` by the STILL-RECORDED dead root — handed a subscription backed by NO live
+/// source watch, which the later `Rescan` then retires: writes under the recreated root are
+/// silently missed.
+///
+/// The fix retires a dead root (`Source::root_key` is `None`) on ANY terminal event: the `Removed`
+/// is fanned out ONCE (the consumer still sees it) and the root is force-removed from the coverage
+/// index BEFORE control returns, so the re-`watch` is `Disjoint` → a FRESH source arm.
+///
+/// Fail-on-old: with the `!raw.is_rescan()` gate the `Removed` returns `false` without retiring,
+/// the re-watch is `Covered` (no fresh arm) against the dead handle, and `arm_count` stays 1 → the
+/// `== 2` assertion FAILS.
+#[tokio::test]
+async fn dead_root_removed_before_terminal_rescan_retires_so_rewatch_rearms() {
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  h.owner.epochs.stamp(sub, Epoch::new(3));
+  assert_eq!(
+    h.owner.source.arm_count(),
+    1,
+    "the initial watch armed once"
+  );
+
+  // The root dies out of band; the fs layer surfaces the deletion as a user-visible `Removed`
+  // (root_key now `None`) BEFORE the terminal `Rescan`.
+  h.owner.source.kill_root(1);
+  let retired = h.owner.retire_if_dead(&source_removed(1, "/a", 0));
+  assert!(
+    retired,
+    "a dead root retires on the non-`Rescan` terminal event too (run loop skips its own fan-out)"
+  );
+
+  // The consumer still sees the `Removed` — fanned out EXACTLY once by `retire_if_dead`.
+  let seen = h.drain();
+  assert_eq!(
+    seen.len(),
+    1,
+    "the terminal `Removed` is fanned out exactly once"
+  );
+  assert!(seen[0].kind().is_removed(), "…and it is the `Removed`");
+  assert_eq!(
+    seen[0].subscription(),
+    sub,
+    "…delivered to the watching subscription"
+  );
+
+  // The dead root is retired NOW (on the `Removed`, before the terminal `Rescan`), so it has left
+  // the coverage index and can no longer cover a watch.
+  assert_eq!(
+    h.owner.subsumer.roots().count(),
+    0,
+    "the dead root is retired on the `Removed`, not left recorded until the `Rescan`"
+  );
+
+  // The caller re-watches the recreated path BEFORE the queued terminal `Rescan` is processed.
+  // With the dead root gone it is `Disjoint` → a FRESH source arm, not `Covered` by the dead handle.
+  let resub = h.watch("/a", Interest::all()).await.expect("re-watch /a");
+  assert_ne!(resub, sub, "the re-watch mints a fresh subscription");
+  assert_eq!(
+    h.owner.source.arm_count(),
+    2,
+    "the re-watch triggers a FRESH arm — NOT `Covered` by the dead root (fail-on-old: stays 1)"
+  );
+
+  // The re-watch rides the live re-armed handle (2), so a change under the recreated root is
+  // delivered — not silently missed as it would be if the sub were `Covered` by the dead handle.
+  h.owner.fan_out_and_push(&source_modified(2, "/a/f", 0));
+  let delivered = h.drain();
+  assert_eq!(
+    delivered.len(),
+    1,
+    "a change under the recreated root is delivered to the re-watch (not silently missed)"
+  );
+  assert_eq!(
+    delivered[0].subscription(),
+    resub,
+    "…to the fresh subscription riding the live re-armed handle"
   );
 }
 
