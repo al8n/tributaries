@@ -134,6 +134,7 @@ pub(crate) struct Coalescer<C, V> {
 impl<C, V> Coalescer<C, V>
 where
   C: Ord + Clone,
+  V: Clone,
 {
   /// Creates a coalescer with the given settle policy.
   pub(crate) fn new(cfg: DebounceConfig) -> Self {
@@ -275,14 +276,18 @@ where
       }
       Collapse::BecomeModified => {
         // Removed-then-Created churn: the net is a Modified carried by neither event —
-        // mint one at the shared key/location with the newest epoch.
-        buffered.event = Event::synthetic(
+        // mint one at the shared key/location with the newest epoch, carrying the owning
+        // subscription's baked value forward (both collapsed events share it — same
+        // subscription — so the coalesced result stays attributable).
+        let mut synthetic = Event::synthetic(
           ev.subscription(),
           ev.key().to_vec(),
           ev.location().clone(),
           EventKind::Modified,
           ev.epoch(),
         );
+        synthetic.set_value(ev.value().cloned());
+        buffered.event = synthetic;
         buffered.emit_at = Self::deadline(first_seen, now, quiet, max_hold);
       }
       Collapse::Annihilate => {
