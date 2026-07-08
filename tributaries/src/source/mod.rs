@@ -99,10 +99,11 @@ pub trait Source<C> {
   ///   another root's entry and strand it published-but-unroutable (Codex R15-F2).
   ///
   /// A conforming source therefore lets the umbrella rebind/commit onto the fresh handle
-  /// unconditionally; a `debug_assert` at each rebind/commit choke point is the tripwire for a
-  /// contract-violating source, never a release-mode recovery. [`FsSource`] satisfies the contract
-  /// structurally: its [`RootHandle`] carries a **monotonically-minted** `tributary_proto::ScopeId`
-  /// never reissued for the life of the watcher.
+  /// unconditionally; a debug-only owner-level observed-handle `debug_assert` at the single arm
+  /// choke point is the exhaustive tripwire for a contract-violating source (it catches reuse of a
+  /// handle already retired out of the live index too, Codex R17), never a release-mode recovery.
+  /// [`FsSource`] satisfies the contract structurally: its [`RootHandle`] carries a
+  /// **monotonically-minted** `tributary_proto::ScopeId` never reissued for the life of the watcher.
   type Handle: Copy + Eq + core::hash::Hash;
 
   /// Canonicalizes the caller-supplied `key` into the source's own **canonical coordinate** —
