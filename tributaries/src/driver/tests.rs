@@ -869,9 +869,11 @@ async fn terminal_rescan_retires_root_overflow_keeps_it() {
 /// source watch, which the later `Rescan` then retires: writes under the recreated root are
 /// silently missed.
 ///
-/// The fix retires a dead root (`Source::root_key` is `None`) on ANY terminal event: the `Removed`
-/// is fanned out ONCE (the consumer still sees it) and the root is force-removed from the coverage
-/// index BEFORE control returns, so the re-`watch` is `Disjoint` → a FRESH source arm.
+/// A dead root (`Source::root_key` is `None`) is retired on ANY terminal event: the `Removed`
+/// force-removes it from the coverage index BEFORE control returns, so the re-`watch` is
+/// `Disjoint` → a FRESH source arm. The `Removed` is NOT separately fanned out (Codex R12 F2) — the
+/// coverage loss is owed as the dominating terminal `Rescan` the retire parks, which re-enumerates
+/// the subtree; a redundant ordinary `Removed` would be buffered-then-dropped under debounce.
 ///
 /// Fail-on-old: with the `!raw.is_rescan()` gate the `Removed` returns `false` without retiring,
 /// the re-watch is `Covered` (no fresh arm) against the dead handle, and `arm_count` stays 1 → the
@@ -896,18 +898,15 @@ async fn dead_root_removed_before_terminal_rescan_retires_so_rewatch_rearms() {
     "a dead root retires on the non-`Rescan` terminal event too (run loop skips its own fan-out)"
   );
 
-  // The consumer still sees the `Removed` — fanned out EXACTLY once by `retire_if_dead`.
-  let seen = h.drain();
-  assert_eq!(
-    seen.len(),
-    1,
-    "the terminal `Removed` is fanned out exactly once"
+  // The `Removed` is NOT fanned out as an ordinary event (Codex R12 F2): the coverage loss is owed
+  // as the dominating terminal `Rescan` the retire parks, so nothing is delivered inline.
+  assert!(
+    h.drain().is_empty(),
+    "no ordinary terminal event is fanned out — the parked Rescan carries the coverage loss"
   );
-  assert!(seen[0].kind().is_removed(), "…and it is the `Removed`");
-  assert_eq!(
-    seen[0].subscription(),
-    sub,
-    "…delivered to the watching subscription"
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the retired subscription is owed a dominating terminal Rescan (no silent loss)"
   );
 
   // The dead root is retired NOW (on the `Removed`, before the terminal `Rescan`), so it has left
@@ -941,6 +940,173 @@ async fn dead_root_removed_before_terminal_rescan_retires_so_rewatch_rearms() {
     delivered[0].subscription(),
     resub,
     "…to the fresh subscription riding the live re-armed handle"
+  );
+}
+
+/// Codex R12 F1 regression (the STRUCTURAL close of the dead-root-coverage class): the owner loop
+/// is command-biased, so a `watch` queued while a dead root's terminal event is still pending runs
+/// FIRST — before `retire_if_dead` consumes that event and force-removes the root. Here the source
+/// has forgotten the covering root ([`Source::root_key`] is `None`) but its terminal event has NOT
+/// yet reached `retire_if_dead`, so the root is still recorded in the coverage index. A re-`watch`
+/// of a path that dead root would cover must NOT be classified `Covered` against the
+/// source-forgotten handle: `reconcile_watch` validates the covering root's liveness, retires the
+/// dead root (owing its subscriber a dominating terminal `Rescan`), re-plans, and arms a FRESH live
+/// root — so an event under that recreated root is delivered, not silently missed. Unlike the R11
+/// path (which retires eagerly on the `Removed`), this closes the window regardless of
+/// terminal-event timing: the validation happens at the `watch`, not on the pending terminal event.
+///
+/// Fail-on-old: without the `Covered` liveness validation the re-watch binds `Covered` to the dead
+/// handle, arms nothing (arm_count stays 1) and leaves the dead root recorded, so the event under
+/// the fresh handle routes to no live root → the arm-count, surviving-root, and delivery assertions
+/// FAIL.
+#[tokio::test]
+async fn covered_rewatch_validates_liveness_retires_dead_root_and_rearms() {
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  h.owner.epochs.stamp(sub, Epoch::new(3));
+  assert_eq!(
+    h.owner.source.arm_count(),
+    1,
+    "the initial watch armed once"
+  );
+
+  // The covering root dies out of band (`root_key` → None) but its terminal event has NOT yet been
+  // processed by `retire_if_dead`: the command-biased loop runs the queued re-`watch` first, with
+  // the dead root still recorded in the coverage index.
+  h.owner.source.kill_root(1);
+  assert_eq!(
+    h.owner.subsumer.roots().count(),
+    1,
+    "the dead root is still RECORDED (its terminal event has not yet retired it)"
+  );
+
+  // A re-`watch` of a path the dead root WOULD cover. The structural fix validates the covering
+  // root's liveness, finds it dead, retires it, re-plans → `Disjoint` → a FRESH arm.
+  let resub = h
+    .watch("/a/b", Interest::all())
+    .await
+    .expect("re-watch /a/b");
+  assert_ne!(resub, sub, "the re-watch mints a fresh subscription");
+  assert_eq!(
+    h.owner.source.arm_count(),
+    2,
+    "the re-watch validates liveness, retires the dead root, and arms a FRESH live root \
+     (fail-on-old: binds `Covered` to the dead handle → stays 1)"
+  );
+
+  // The dead /a root left the coverage index; only the fresh /a/b root remains — not two roots,
+  // and not the dead one still recorded.
+  let roots: Vec<Vec<OsString>> = h.owner.subsumer.roots().map(|(k, _)| k.to_vec()).collect();
+  assert_eq!(
+    roots,
+    vec![key("/a/b")],
+    "the dead /a root is retired and replaced by the fresh /a/b root (fail-on-old: /a survives)"
+  );
+
+  // The old subscriber's per-sub state is freed, and it is owed a dominating terminal Rescan — the
+  // retire-and-replan loses no coverage.
+  assert!(
+    !h.owner.filters.contains_key(&sub),
+    "the dead root's subscriber state is freed on retirement (I4)"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "…and it is owed a dominating terminal Rescan (no silent loss)"
+  );
+
+  // An event under the FRESH live root (handle 2) reaches the re-watch — the whole point: the
+  // newcomer rides a live source watch, not the dead handle.
+  h.owner.fan_out_and_push(&source_modified(2, "/a/b/f", 0));
+  let delivered = h.drain();
+  assert_eq!(
+    delivered.len(),
+    1,
+    "a change under the recreated root reaches the re-watch (fail-on-old: bound to the dead handle → 0)"
+  );
+  assert_eq!(
+    delivered[0].subscription(),
+    resub,
+    "…to the fresh subscription riding the live re-armed handle"
+  );
+}
+
+/// Codex R12 F2 regression (design §6 / backpressure doc, no silent loss): a dead root's terminal
+/// coverage loss must reach the consumer as the durable, strictly-dominating terminal `Rescan` the
+/// retire primitive parks — NOT as an ordinary `Removed` fanned through the debounce coalescer. The
+/// earlier (R11) path fanned the non-`Rescan` terminal event through `fan_out_and_push`; with
+/// debounce that admits it to the coalescer, where — depending on the settle window — it is either
+/// buffered-then-dropped by the retire's `drop_subscription` (silently losing the promised event)
+/// or surfaces as a redundant second terminal event dominated by the parked Rescan. Either way it is
+/// redundant with the dominating terminal Rescan that re-enumerates the subtree, so the fix stops
+/// fanning it out.
+///
+/// The settle window is zero, so a lifecycle event fanned through the coalescer drains at once — the
+/// visible face of the buffer-through fan-out the fix removes (a longer window would instead
+/// buffer-then-drop it, an equally-wrong silent loss that is simply not observable in the end
+/// state).
+///
+/// Fail-on-old: with `fan_out_and_push(raw)` still routing the `Removed` through the coalescer, the
+/// consumer receives that redundant `Removed` in addition to the terminal Rescan → the "nothing
+/// reaches the consumer through the coalescer" assertion FAILS.
+#[tokio::test]
+async fn dead_root_terminal_removed_under_debounce_signals_via_parked_rescan_only() {
+  // Debounce ENABLED with an immediate-settle window, so a lifecycle event fanned through the
+  // coalescer drains at once rather than buffering — making the buffer-through fan-out observable.
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_millis(0))
+    .with_max_hold(Duration::from_millis(0));
+  let mut h = Harness::with_coalescer(Some(Coalescer::new(cfg)));
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  h.owner.epochs.stamp(sub, Epoch::new(3));
+
+  // The root dies out of band; the fs surfaces the deletion as a NON-`Rescan` terminal `Removed`.
+  h.owner.source.kill_root(1);
+  let retired = h.owner.retire_if_dead(&source_removed(1, "/a", 0));
+  assert!(retired, "the dead root retires on the terminal `Removed`");
+
+  // No ordinary terminal event reaches the consumer through the coalescer (fail-on-old: the fanned
+  // `Removed` drains here under the immediate-settle window).
+  assert!(
+    h.drain().is_empty(),
+    "the dead-root terminal event is NOT fanned through the coalescer (fail-on-old: a redundant \
+     `Removed` drains)"
+  );
+  // Nothing dangles buffered in the coalescer for the retired subscription.
+  assert!(
+    h.owner
+      .coalescer
+      .as_ref()
+      .and_then(Coalescer::next_deadline)
+      .is_none(),
+    "no coalescer entry dangles for the retired subscription"
+  );
+  // The coverage loss is owed as the durable dominating terminal Rescan.
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the coverage loss is owed as a parked dominating terminal Rescan"
+  );
+
+  // It self-drains on the next flush — the consumer learns the root is gone via exactly one Rescan.
+  h.owner.flush_pending_rescans();
+  let delivered = h.drain();
+  assert_eq!(
+    delivered.len(),
+    1,
+    "exactly the terminal Rescan reaches the consumer"
+  );
+  assert!(
+    delivered[0].is_rescan(),
+    "…and it is the coverage-loss Rescan"
+  );
+  assert_eq!(
+    delivered[0].subscription(),
+    sub,
+    "…for the subscription whose root died"
+  );
+  assert_eq!(
+    delivered[0].path(),
+    Path::new("/a"),
+    "…naming its covered key, which the consumer re-enumerates to discover the root is gone"
   );
 }
 
