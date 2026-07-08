@@ -85,6 +85,12 @@ struct FakeSource {
   /// debug_assert tripwire. One-shot: consumed by the next arm that gets past the fail/overlap
   /// checks.
   reuse_next_handle: Option<u32>,
+  /// Test knob: make [`Source::disarm`] of this handle **never resolve** — park forever — so a
+  /// test can prove the source-drain teardown loop does NOT await `disarm` for a `DropOrphan`
+  /// (Codex R19). A teardown that (wrongly) drove the full `reconcile_unwatch` would reach this
+  /// last-subscriber `disarm` and hang behind a queued `Close`; the fixed teardown purges the
+  /// orphan synchronously and never calls it.
+  hang_disarm: Option<u32>,
 }
 
 impl FakeSource {
@@ -99,6 +105,7 @@ impl FakeSource {
       retarget: HashMap::new(),
       canonicalize: HashMap::new(),
       reuse_next_handle: None,
+      hang_disarm: None,
     }
   }
 
@@ -118,6 +125,12 @@ impl FakeSource {
   /// failed-widen restore's rebind debug_assert tripwire for a contract-violating source.
   fn reuse_next_arm_handle(&mut self, handle: u32) {
     self.reuse_next_handle = Some(handle);
+  }
+
+  /// Make [`Source::disarm`] of `handle` never resolve (park forever) — drives the source-drain
+  /// teardown's `DropOrphan` handling to prove it does NOT await `disarm` (Codex R19).
+  fn hang_disarm_of(&mut self, handle: u32) {
+    self.hang_disarm = Some(handle);
   }
 
   /// The next `arm` call fails.
@@ -237,6 +250,11 @@ impl Source<OsString> for FakeSource {
 
   async fn disarm(&mut self, handle: u32) {
     self.calls.push(Call::Disarm(handle));
+    if self.hang_disarm == Some(handle) {
+      // Park forever: a teardown `DropOrphan` that reached this last-subscriber `disarm` would
+      // hang, stranding a queued `Close` — the Codex R19 pre-fix behaviour the regression pins.
+      std::future::pending::<()>().await;
+    }
     self.canonical.remove(&handle);
     self.live.remove(&handle);
   }
@@ -2484,6 +2502,86 @@ async fn source_drain_retry_stays_responsive_to_close() {
   assert!(
     matches!(response.await, Ok(Ok(()))),
     "close() completes once the drain surfaced and acked its Close"
+  );
+}
+
+/// R19 regression (design driver-golden doc, invariant II — Close-responsive source drain): during
+/// source-drain teardown a queued [`DropOrphan`](super::Command::DropOrphan) must be purged WITHOUT
+/// source I/O, or its last-subscriber `source.disarm` can park the retry loop inside a slow/wedged
+/// source and strand a `Close` queued behind it. The fixed teardown purges the orphan with the
+/// NON-awaiting `purge_sub_local`, so a `Close` behind a `DropOrphan` is still surfaced promptly
+/// even when the orphan's root `disarm` never resolves.
+///
+/// The setup queues `DropOrphan(orphan)` ahead of `Close` and makes the orphan's last-subscriber
+/// `disarm` hang forever; a SEPARATE live subscription keeps a Rescan parked behind a full,
+/// held-open channel so the drain loop keeps spinning (and servicing the mailbox). The purge is
+/// keyed on the orphan alone, so the live sub's owed Rescan survives it.
+///
+/// Fail-on-old: with `DropOrphan` → `reconcile_unwatch(orphan).await`, the loop reaches the
+/// never-resolving `disarm` and parks there; the later `Close` is never read and the timeout fires.
+#[tokio::test]
+async fn source_drain_dropped_orphan_is_purged_without_blocking_close_on_disarm() {
+  let mut h = Harness::bounded(1);
+
+  // A LIVE subscription whose parked overflow Rescan keeps the drain loop spinning (its channel is
+  // filled + held open below), plus an ORPHAN on a disjoint root — the `DropOrphan` target and its
+  // own root's last subscriber, so a full `reconcile_unwatch` would drive that root's `disarm`.
+  let live = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let orphan = h.watch("/b", Interest::all()).await.expect("watch /b");
+  // Monotonic mint: /a = handle 1, /b = handle 2. Make the orphan root's release `disarm` hang, so
+  // a teardown that (wrongly) awaited it would never return.
+  h.owner.source.hang_disarm_of(2);
+
+  for raw in 0..2 {
+    h.owner.epochs.stamp(live, Epoch::new(raw));
+  }
+  // Fill the one slot and overflow → park the LIVE sub's dominating Rescan; the held receiver keeps
+  // the channel full + open, so neither the slot-freed nor the all-receivers-dropped exit can fire.
+  h.owner.try_emit(modified_event(live, "/a/f0", 0));
+  h.owner.try_emit(modified_event(live, "/a/f1", 1));
+  assert!(
+    h.owner.needs_rescan.contains_key(&live),
+    "overflow parked the live sub's Rescan; the channel is full"
+  );
+  let _held = h.events.clone(); // a receiver that never drains (keeps the channel full + open)
+
+  // Queue DropOrphan(orphan) BEFORE the Close — the ordering that, pre-fix, parks the loop inside
+  // the orphan's never-resolving `disarm` before the Close is ever read.
+  h._commands
+    .try_send(super::Command::DropOrphan(orphan))
+    .expect("enqueue the DropOrphan command");
+  let (reply, response) = futures_channel::oneshot::channel();
+  h._commands
+    .try_send(super::Command::Close { reply })
+    .expect("enqueue the Close command");
+
+  // The teardown must purge the orphan without awaiting its (never-resolving) `disarm`, then go on
+  // to surface the Close — all within the deadline.
+  let returned = tokio::time::timeout(Duration::from_secs(5), h.owner.drain_owed_before_shutdown())
+    .await
+    .expect("the teardown did NOT park inside the orphan's never-resolving disarm");
+  let close_reply = returned.expect("the mid-drain Close is surfaced to the caller to be acked");
+
+  // Ack it exactly as `run` does; the close() caller then completes.
+  close_reply.send(Ok(())).expect("ack the Close");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "close() completes once the drain surfaced and acked its Close"
+  );
+
+  // The orphan was purged SYNCHRONOUSLY — never disarmed (its `disarm` is the hung one) — while the
+  // live sub's owed Rescan (a DIFFERENT sub's `needs_rescan` entry) survived the purge untouched.
+  assert!(
+    !h.owner.source.calls().contains(&Call::Disarm(2)),
+    "the teardown purged the orphan WITHOUT awaiting its last-subscriber disarm"
+  );
+  assert!(
+    !h.owner.subsumer.view().is_watched(&key("/b")),
+    "the orphan is reconciled away (its per-sub state purged)"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&live),
+    "the live sub's owed parked Rescan survived the orphan purge"
   );
 }
 

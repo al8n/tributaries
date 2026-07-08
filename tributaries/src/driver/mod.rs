@@ -976,9 +976,41 @@ where
   }
 
   /// Reconciles one `unwatch` (invariant I4): retires the subscription's per-source and
-  /// per-subscription state, releasing the source watch once it was the root's last
-  /// subscriber.
+  /// per-subscription state through the synchronous [`purge_sub_local`](Self::purge_sub_local)
+  /// core, then — the one **awaiting** step — releases the source watch once it was the root's
+  /// last subscriber.
   async fn reconcile_unwatch(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
+    if let UnwatchOutcome::RootEmptied { fs_root } = self.purge_sub_local(sub)? {
+      // The subscription was its root's last: release the kernel watch.
+      self.source.disarm(fs_root).await;
+    }
+    Ok(())
+  }
+
+  /// The **synchronous** per-subscription reclaim at the heart of an unwatch, split out so it can
+  /// run WITHOUT the awaiting `source.disarm` a last-subscriber root release needs: purge `sub`
+  /// from the subsumer and every owner-private per-sub map — its filter, epoch ledger entry, parked
+  /// overflow Rescan, and buffered coalescer deltas — reporting whether its root emptied.
+  ///
+  /// [`reconcile_unwatch`](Self::reconcile_unwatch) drives this and then disarms an emptied root.
+  /// The source-drain teardown loop
+  /// ([`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown)) drives it for a
+  /// [`DropOrphan`](Command::DropOrphan) and **ignores** the outcome: once source drain has begun
+  /// the owner is quiescing (it publishes the empty read plane on exit and drops the source
+  /// wholesale), so per-root disarm is moot — and awaiting a slow or wedged `disarm` there would
+  /// park the teardown loop behind a queued [`Close`](Command::Close), breaking the Close-responsive
+  /// source-drain invariant (invariant II).
+  ///
+  /// Both callers reclaim `sub` as a request to **stop watching** it, so this drops its parked
+  /// overflow Rescan AND its buffered coalescer deltas alongside its filter and epoch — a
+  /// cancelled/unwatched subscription owes NO coverage-loss re-enumeration, unlike the root-death
+  /// path (`retire_if_dead`), which KEEPS the parked terminal Rescan so its owed re-enumeration
+  /// self-drains (design backpressure doc, no silent loss). Every purge here is keyed on `sub`
+  /// alone, so a still-live sibling subscription's owed parked Rescan is never dropped.
+  fn purge_sub_local(
+    &mut self,
+    sub: Subscription,
+  ) -> Result<UnwatchOutcome<S::Handle>, UnwatchError> {
     // Reject a foreign/forged handle BEFORE mutating any state: a `Subscription` minted by a
     // DIFFERENT watcher instance carries a different brand even when its `ScopeId` collides with a
     // live local subscription's (every owner mints scope ids from 1). Without this brand check the
@@ -990,25 +1022,18 @@ where
     let Some(outcome) = self.subsumer.plan_unwatch(sub) else {
       return Err(UnwatchError::UnknownSubscription);
     };
-    // Reclaim this subscription's per-sub state so a watch → repoint → unwatch churn cannot
-    // leak it. A consumer-initiated unwatch owes NO coverage-loss re-enumeration (the caller
-    // asked to stop watching), so drop its parked overflow Rescan AND its buffered coalescer
-    // deltas alongside its filter and epoch — unlike the root-death path (`retire_if_dead`),
-    // which KEEPS the parked terminal Rescan so its owed re-enumeration self-drains (design
-    // backpressure doc, no silent loss).
+    // Reclaim this subscription's per-sub state so a watch → repoint → unwatch churn cannot leak
+    // it. A stop-watching reclaim owes NO coverage-loss re-enumeration, so drop its parked overflow
+    // Rescan alongside its filter and epoch.
     self.retire_sub_state(sub);
     self.needs_rescan.remove(&sub);
-    // Purge the debounce coalescer too: a delta buffered before the unwatch would otherwise drain
+    // Purge the debounce coalescer too: a delta buffered before the reclaim would otherwise drain
     // later through `drain_coalescer_due`/`try_emit` — neither of which re-checks live-subscription
-    // membership — and deliver an event for a subscription whose `unwatch` has already resolved.
+    // membership — and deliver an event for a subscription whose watch has already gone.
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.drop_subscription(sub);
     }
-    if let UnwatchOutcome::RootEmptied { fs_root } = outcome {
-      // The subscription was its root's last: release the kernel watch.
-      self.source.disarm(fs_root).await;
-    }
-    Ok(())
+    Ok(outcome)
   }
 
   /// Frees the per-subscription driver state that is **always** reclaimed when a `sub`
@@ -1565,10 +1590,17 @@ where
           Ok(Command::Unwatch { reply, .. }) => {
             let _ = reply.send(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)));
           }
-          // A watch orphaned mid-teardown (a dropped wait's [`WatchGrant`] fired): reconcile it
-          // away like an unwatch and keep draining the owed Rescans (no silent loss).
+          // A watch orphaned mid-teardown (a dropped wait's [`WatchGrant`] fired): purge it with
+          // the NON-awaiting [`purge_sub_local`](Self::purge_sub_local) — NOT the full
+          // [`reconcile_unwatch`](Self::reconcile_unwatch), whose last-subscriber `source.disarm`
+          // could park this loop behind the queued `Close` on a slow/wedged source. The owner is
+          // already quiescing (it publishes the empty read plane on exit and drops the source
+          // wholesale), so per-root disarm is moot, and an orphan is a cancelled watch with no owed
+          // consumer delivery — its coverage is moot too. Keep draining the still-live
+          // subscriptions' owed Rescans (no silent loss) and stay free to answer `Close` at once
+          // (invariant II).
           Ok(Command::DropOrphan(sub)) => {
-            let _ = self.reconcile_unwatch(sub).await;
+            let _ = self.purge_sub_local(sub);
           }
         },
         _ = sleep => {}
