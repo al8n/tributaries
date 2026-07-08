@@ -74,6 +74,16 @@ struct FakeSource {
   /// Planned path → the divergent canonical path `arm` should report for it (the §4
   /// canonicalization TOCTOU: the source commits a different coordinate than planned).
   retarget: HashMap<PathBuf, PathBuf>,
+  /// Models [`Source::canonicalize_key`]: a caller key → its canonicalization result —
+  /// `Some(canonical)` re-keys it (a symlink/`..` resolving to a different coordinate), `None`
+  /// rejects it (the fs source's non-existent-path case). A key ABSENT here canonicalizes to
+  /// itself (identity — the already-canonical common case).
+  canonicalize: HashMap<Vec<OsString>, Option<Vec<OsString>>>,
+  /// Forces the next SUCCESSFUL `arm` to return this handle value instead of a freshly-minted
+  /// one — modelling a source that REUSES a just-disarmed handle value (a [`Source::Handle`]
+  /// no-ABA violation), so a test can drive the failed-widen restore's alias-detection guard.
+  /// One-shot: consumed by the next arm that gets past the fail/overlap checks.
+  reuse_next_handle: Option<u32>,
 }
 
 impl FakeSource {
@@ -86,7 +96,27 @@ impl FakeSource {
       fail_arms: 0,
       dead_on_arrival_arms: 0,
       retarget: HashMap::new(),
+      canonicalize: HashMap::new(),
+      reuse_next_handle: None,
     }
+  }
+
+  /// Model [`Source::canonicalize_key`] re-keying `from` onto the canonical coordinate `to`
+  /// (a symlink / `..` path resolving elsewhere).
+  fn canonicalizes_to(&mut self, from: &str, to: &str) {
+    self.canonicalize.insert(key(from), Some(key(to)));
+  }
+
+  /// Model [`Source::canonicalize_key`] REJECTING `k` (the fs source's non-existent-path case):
+  /// the driver must fail the watch rather than commit an eventless key.
+  fn cannot_canonicalize(&mut self, k: &str) {
+    self.canonicalize.insert(key(k), None);
+  }
+
+  /// Force the next successful `arm` to return `handle` (a REUSED handle value) — drives the
+  /// failed-widen restore's [`Source::Handle`] no-ABA alias-detection guard.
+  fn reuse_next_arm_handle(&mut self, handle: u32) {
+    self.reuse_next_handle = Some(handle);
   }
 
   /// The next `arm` call fails.
@@ -139,6 +169,20 @@ impl FakeSource {
 impl Source<OsString> for FakeSource {
   type Handle = u32;
 
+  fn canonicalize_key(&self, k: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    match self.canonicalize.get(k) {
+      // Re-key onto the modelled canonical coordinate.
+      Some(Some(canonical)) => Ok(canonical.clone()),
+      // A key the source cannot canonicalize (non-existent path): reject, don't commit-eventless.
+      Some(None) => Err(WatchError::Canonicalize {
+        path: k.iter().collect(),
+        source: io::Error::other("injected non-canonicalizable key"),
+      }),
+      // Absent → already canonical (identity), the common case.
+      None => Ok(k.to_vec()),
+    }
+  }
+
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
     let path: PathBuf = key.iter().collect();
     self.calls.push(Call::Arm(path.clone()));
@@ -159,8 +203,15 @@ impl Source<OsString> for FakeSource {
     {
       return Err(WatchError::Fs(WatchRootError::Overlaps { path, existing }));
     }
-    self.next_handle += 1;
-    let handle = self.next_handle;
+    // Mint a fresh monotonic handle, UNLESS a test forced this arm to reuse a specific value (a
+    // `Source::Handle` no-ABA violation) so the failed-widen restore's alias guard can be driven.
+    let handle = match self.reuse_next_handle.take() {
+      Some(forced) => forced,
+      None => {
+        self.next_handle += 1;
+        self.next_handle
+      }
+    };
     // The canonical key: the retarget override, else the requested key. Overlap tracks the
     // arm-path (the coordinate planned against); the retarget models a separate fs-side
     // divergence the `fs_path_preserves_plan` guard catches, not this overlap check.
@@ -733,6 +784,142 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
   );
 }
 
+/// Codex R14 F2 regression (design driver-golden doc, invariant I3 — the failed-widen restore's
+/// [`Source::Handle`] no-ABA hardening): when a widen fails and its restore re-arms the disarmed
+/// siblings ONE AT A TIME, a misbehaving source that hands back a re-arm handle value ALIASING a
+/// still-recorded sibling must NOT be allowed to corrupt the reverse index. Here the restore of
+/// `/a/b` (old handle 1) re-arms and the source REUSES handle `2` — still recorded as the
+/// not-yet-restored sibling `/a/c`. A bare `rebind_root(1, 2)` would overwrite `by_handle[2]`,
+/// stranding `/a/c` published-but-unroutable and mis-resolving its subscriber. The alias guard
+/// instead disarms the stray fresh watch and RETIRES `/a/b` (its subscriber owed a dominating
+/// terminal Rescan), leaving `/a/c`'s record intact so it restores cleanly on its own iteration
+/// and keeps routing to its own subscriber.
+///
+/// Fail-on-old: with the bare `rebind_root`, `by_handle[2]` is overwritten → `/a/c`'s record no
+/// longer round-trips through its handle and an event under `/a/c` routes to no live root — `sc`
+/// silently misses it. The reverse-map round-trip and delivery assertions then FAIL.
+#[tokio::test]
+async fn failed_widen_restore_rearm_aliasing_sibling_handle_does_not_corrupt_index() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The wider /a arm fails, AND the first restore re-arm (/a/b) REUSES handle 2 — aliasing the
+  // still-recorded sibling /a/c (a `Source::Handle` no-ABA violation the guard must catch).
+  h.owner.source.fail_next_arm();
+  h.owner.source.reuse_next_arm_handle(2);
+  let result = h.watch("/a", Interest::all()).await;
+  assert!(result.is_err(), "the failed wider arm surfaces the error");
+
+  // Disarm-subsumed, wider arm fails, restore /a/b re-arms to the ALIASED handle 2 → the guard
+  // disarms that stray and retires /a/b, then /a/c re-arms cleanly to a fresh handle.
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Disarm(2), // the alias guard disarms the stray re-armed handle
+      Call::Arm(PathBuf::from("/a/c")),
+    ],
+    "the aliasing re-arm is disarmed (not rebound), /a/b retired, /a/c restored"
+  );
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "the aborted widen leaks no pending reservation"
+  );
+
+  // Only /a/c remains a root — /a/b was retired by the guard, never rebound onto the aliased handle.
+  let roots: Vec<(Vec<OsString>, u32)> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, handle)| (k.to_vec(), handle))
+    .collect();
+  assert_eq!(
+    roots.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+    vec![key("/a/c")],
+    "only /a/c survives; /a/b is retired (fail-on-old: the bare rebind would leave a corrupt /a/b)"
+  );
+
+  // Reverse-map integrity: /a/c round-trips through its own handle — `by_handle` was NOT
+  // overwritten by the aliasing rebind (fail-on-old: its handle 2 resolves to /a/b).
+  let ac_handle = roots[0].1;
+  assert_eq!(
+    h.owner
+      .subsumer
+      .entry(ac_handle)
+      .map(|r| r.key.clone())
+      .as_deref(),
+    Some(key("/a/c").as_slice()),
+    "/a/c's handle resolves back to /a/c (fail-on-old: by_handle[2] overwritten → resolves to /a/b)"
+  );
+  let view = h.owner.subsumer.view();
+  assert!(
+    view.is_watched(&key("/a/c")),
+    "sc is live-and-covered again"
+  );
+  assert!(
+    !view.is_watched(&key("/a/b")),
+    "/a/b is retired — not left published-watched-but-corrupt"
+  );
+
+  // sb (retired /a/b) has its per-sub state freed; sc (restored) keeps its state.
+  assert!(
+    !h.owner.filters.contains_key(&sb),
+    "the retired /a/b subscriber's filter is freed (I4)"
+  );
+  assert!(
+    h.owner.filters.contains_key(&sc),
+    "the restored /a/c subscriber's filter is kept"
+  );
+  // No silent loss on the Rescan side: sc got a restore re-point Rescan (on the stream) and sb is
+  // owed a dominating terminal Rescan (durably parked before its state was freed). Flush the parked
+  // terminal, then drain BOTH — before fanning any delta, so neither Rescan is consumed early.
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb),
+    "the retired sb is owed a durable terminal Rescan"
+  );
+  h.owner.flush_pending_rescans();
+  let by_sub: HashMap<Subscription, Epoch> = h
+    .drain()
+    .iter()
+    .map(|ev| {
+      assert!(ev.is_rescan(), "every loss/restore signal is a Rescan");
+      (ev.subscription(), ev.epoch())
+    })
+    .collect();
+  assert_eq!(
+    by_sub.get(&sb).copied(),
+    Some(Epoch::new(5)),
+    "the retired sb's terminal Rescan strictly dominates its high-water of 4"
+  );
+  assert_eq!(
+    by_sub.get(&sc).copied(),
+    Some(Epoch::new(3)),
+    "the restored sc's re-point Rescan strictly dominates its high-water of 2"
+  );
+
+  // No silent loss on the delivery side: an event under /a/c reaches sc — its routing survived the
+  // ABA-inducing restore (fail-on-old: /a/c orphaned by the by_handle overwrite → sc misses).
+  h.owner
+    .fan_out_and_push(&source_modified(ac_handle, "/a/c/f", 0));
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|ev| ev.subscription() == sc && !ev.is_rescan()),
+    "an event under /a/c reaches sc after the ABA-guarded restore (fail-on-old: sc silently misses)"
+  );
+}
+
 /// Codex R13 (the ARM-choke-point liveness close, widen path): a `Widen` whose **wider** arm is
 /// dead-on-arrival — the source reports it armed but has already forgotten the wider root
 /// ([`Source::root_key`] is `None`) — must run the same restore the injected arm-failure does, not
@@ -967,6 +1154,105 @@ async fn canonical_race_that_changes_subsumption_aborts_cleanly() {
   assert!(
     matches!(h.owner.source.calls().last(), Some(Call::Disarm(_))),
     "the just-armed root was disarmed on abort"
+  );
+}
+
+/// Codex R14 F1 regression (design §4, invariant I2 — the Covered-path canonicalization close):
+/// a NON-canonical watch key that resolves **under an already-watched canonical root** must be
+/// canonicalized BEFORE classification, so the `Covered` subscription is committed on the
+/// **canonical** coordinate its events arrive under — not the raw key. The driver canonicalizes
+/// every key at the single choke point ([`Source::canonicalize_key`]) ahead of `plan_watch`, so
+/// the covered newcomer is keyed on `/root/b` (the resolved coordinate) and a real canonical event
+/// under `/root/b` reaches it.
+///
+/// Fail-on-old: with the raw-key Covered commit the newcomer is keyed on the non-canonical
+/// `/root/link`; a canonical `/root/b/file` event fails its ancestor match, so it is delivered
+/// NOTHING (no `Rescan` — the root is alive; only THIS subscription's key never matches). The
+/// committed-key and delivery assertions then FAIL.
+#[tokio::test]
+async fn noncanonical_covered_watch_is_canonicalized_then_receives_events() {
+  let mut h = Harness::new();
+
+  // An already-watched canonical root (handle 1).
+  let s_root = h
+    .watch("/root", Interest::all())
+    .await
+    .expect("watch /root");
+
+  // A non-canonical key under it (a symlinked child) resolving to the canonical `/root/b`.
+  h.owner.source.canonicalizes_to("/root/link", "/root/b");
+  let s_link = h
+    .watch("/root/link", Interest::all())
+    .await
+    .expect("the covered non-canonical watch is accepted (canonicalized, not rejected)");
+
+  // No fresh arm — it is Covered by /root — but it is committed on the CANONICAL coordinate.
+  assert_eq!(
+    h.owner.source.arm_count(),
+    1,
+    "the covered watch arms nothing (subsumed under /root)"
+  );
+  assert_eq!(
+    h.owner.subsumer.subscription_key(s_link),
+    Some(key("/root/b").as_slice()),
+    "the covered subscription is keyed on the source's canonical coordinate, not the raw \
+     /root/link (fail-on-old: committed verbatim as /root/link)"
+  );
+
+  // A real canonical event under /root/b reaches the covered subscription — the whole point.
+  h.owner
+    .fan_out_and_push(&source_modified(1, "/root/b/file", 0));
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|ev| ev.subscription() == s_link && !ev.is_rescan()),
+    "a canonical event under /root/b reaches the covered subscription (fail-on-old: keyed on \
+     /root/link, the canonical event fails its ancestor match → silently misses)"
+  );
+  assert!(
+    delivered
+      .iter()
+      .any(|ev| ev.subscription() == s_root && !ev.is_rescan()),
+    "…and its covering root's own subscription still receives it too"
+  );
+}
+
+/// Codex R14 F1 regression (the reject arm): a watch key the source CANNOT canonicalize (the fs
+/// source's non-existent-path case) is rejected with [`WatchError::Canonicalize`] at the choke
+/// point — never silently committed as an eventless key. Nothing is recorded and no plan leaks.
+#[tokio::test]
+async fn watch_whose_key_cannot_be_canonicalized_is_rejected() {
+  let mut h = Harness::new();
+
+  h.owner.source.cannot_canonicalize("/ghost");
+  let err = h
+    .watch("/ghost", Interest::all())
+    .await
+    .expect_err("a non-canonicalizable key is rejected, not committed");
+  assert!(
+    err.is_canonicalize(),
+    "the rejection is a Canonicalize error, got {err:?}"
+  );
+
+  assert_eq!(
+    h.owner.source.arm_count(),
+    0,
+    "a rejected watch arms nothing"
+  );
+  assert_eq!(
+    h.owner.subsumer.roots().count(),
+    0,
+    "no root is recorded for a rejected watch"
+  );
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "the rejected watch leaks no pending reservation (canonicalize fails before plan_watch)"
+  );
+  assert!(
+    !h.owner.subsumer.view().is_watched(&key("/ghost")),
+    "the rejected key is never published watched"
   );
 }
 
@@ -1901,6 +2187,9 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
   }
   impl Source<OsString> for CancelSafe {
     type Handle = u32;
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
       Ok(Armed::new(1, key.to_vec()))
     }
@@ -1923,6 +2212,9 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
   }
   impl Source<OsString> for CancelUnsafe {
     type Handle = u32;
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
       Ok(Armed::new(1, key.to_vec()))
     }
@@ -2236,6 +2528,10 @@ struct DrainableSource {
 
 impl Source<OsString> for DrainableSource {
   type Handle = u32;
+
+  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    Ok(key.to_vec())
+  }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
     self.next_handle += 1;

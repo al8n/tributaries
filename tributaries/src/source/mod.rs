@@ -68,7 +68,58 @@ pub trait Source<C> {
   /// watch a later [`disarm`](Self::disarm) releases and an event's
   /// [`SourceEvent::handle`] identifies. `Copy + Eq + Hash` so the umbrella can key its
   /// per-root bookkeeping on it (the fs source uses [`RootHandle`]).
+  ///
+  /// # No-ABA handle contract (hard requirement)
+  ///
+  /// A handle value MUST NOT be reused to name a **different** root while any root that
+  /// previously used that value is still recorded by the umbrella — i.e. not until the umbrella
+  /// has released it (a [`disarm`](Self::disarm) whose retirement has fully reconciled) or
+  /// observed it die (a terminal event for which [`root_key`](Self::root_key) is `None`).
+  /// Reusing a value for the **same** root (re-arming the identical key after a
+  /// [`disarm`](Self::disarm)) is fine — that is not a *different* root. The umbrella keys its
+  /// reverse index (handle → root) on this token, so an aliased handle would name two distinct
+  /// roots at once and corrupt routing.
+  ///
+  /// The sharp edge is the failed-widen restore: the umbrella disarms a set of sibling roots,
+  /// then re-arms them one at a time while the not-yet-restored siblings are **still recorded**;
+  /// a source that re-minted a *just-disarmed sibling's* value for a *different* sibling's re-arm
+  /// would alias two roots onto one handle. The umbrella hardens that restore defensively (a
+  /// detected alias retires the root rather than rebinding onto the aliased handle), so a
+  /// misbehaving source cannot corrupt the index — but a conforming source never triggers that
+  /// path. [`FsSource`] satisfies the contract structurally: its [`RootHandle`] carries a
+  /// **monotonically-minted** `ScopeId` never reissued for the life of the watcher.
   type Handle: Copy + Eq + core::hash::Hash;
+
+  /// Canonicalizes the caller-supplied `key` into the source's own **canonical coordinate** —
+  /// the single coordinate its events are located under — or reports why it cannot.
+  ///
+  /// The umbrella calls this at the **top** of every `watch` reconcile, **before** the key is
+  /// classified against the watch-set, so *every* path commits the canonical coordinate — a
+  /// fresh arm, a widen, and (critically) a subscription merely **covered** by an existing root,
+  /// which arms nothing and so never adopts a canonical key at arm time. Without this, a covered
+  /// non-canonical key would be committed verbatim and then silently miss every event, because
+  /// real events arrive under the canonical coordinate its key never matches (design §4,
+  /// invariant I2 — "one fs-canonical coordinate at one choke point").
+  ///
+  /// A source that canonicalizes (the filesystem resolves symlinks and `.`/`..`) returns the
+  /// resolved key; a source whose key space is already canonical (a generic component key)
+  /// returns `key` unchanged. This is a **synchronous** transform, mirroring
+  /// [`root_key`](Self::root_key): [`FsSource`] resolves the path with the same canonicalization
+  /// [`arm`](Self::arm) applies, so classification and the later arm agree on the coordinate.
+  ///
+  /// # Idempotence (hard contract)
+  ///
+  /// Canonicalizing an already-canonical key MUST return it unchanged, so re-canonicalizing at
+  /// arm time (the [`Armed::canonical_key`] the umbrella re-keys onto) is a no-op — the umbrella
+  /// relies on this to keep classification and commit in one coordinate.
+  ///
+  /// # Errors
+  ///
+  /// A [`WatchError`] when `key` cannot be canonicalized — for [`FsSource`], a
+  /// [`WatchError::Canonicalize`] when the path does not exist or its metadata cannot be read.
+  /// The umbrella surfaces it from `watch` rather than committing a key that would receive no
+  /// events.
+  fn canonicalize_key(&self, key: &[C]) -> Result<Vec<C>, WatchError>;
 
   /// Arms a concrete watch for `key`, returning the armed-root token plus the
   /// **canonical** key the source actually armed.
@@ -339,6 +390,23 @@ impl<R: RuntimeLite> FsSource<R> {
 
 impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
+
+  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    // Resolve the path with the SAME canonicalization `arm` applies (via
+    // `tributary_fs::Watcher::watch`, which `std::fs::canonicalize`s its root before spawning the
+    // stream), so the umbrella classifies and commits on the coordinate events arrive under. A
+    // non-existent or unreadable path fails here — the umbrella refuses to commit a key backed by
+    // no real location, rather than accepting it silently and then never delivering an event.
+    // Idempotent on an already-canonical path (`canonicalize` is a fixed point there), as the
+    // trait's idempotence contract requires.
+    let supplied = key_to_path(key);
+    let canonical =
+      std::fs::canonicalize(&supplied).map_err(|source| WatchError::Canonicalize {
+        path: supplied,
+        source,
+      })?;
+    Ok(path_components(&canonical))
+  }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, RootHandle>, WatchError> {
     // Roots are always armed `Interest::all` (design §4): the kernel watch never narrows

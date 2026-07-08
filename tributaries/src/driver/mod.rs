@@ -313,19 +313,19 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// re-points the subsumed subscriptions onto the new wider root and delivers each a
   /// synthetic dominating [`Rescan`](tributary_fs::EventKind::Rescan) (design §8).
   ///
-  /// # Callers MUST pass canonical keys (hard contract)
+  /// # Key canonicalization
   ///
-  /// For the filesystem source, `key` **must** be canonical (fully resolved: no symlink,
-  /// `.`, or `..` components). The source keys its subsumption index and reports its events
-  /// in canonical coordinates. A non-canonical `key` that resolves *under an already-watched
-  /// canonical root* is accepted as a `Covered` subscription keyed on the **non-canonical**
-  /// path — but later events arrive under the canonical path, fail this subscription's
-  /// ancestor/coverage match, and are **silently dropped with no `Rescan`** (there is no
-  /// coverage-loss to detect: the root is alive and delivering; only *this* subscription's
-  /// key never matches). Passing canonical keys is therefore a caller obligation this layer
-  /// cannot police. (A *disjoint* non-canonical key is re-keyed onto the source's reported
-  /// canonical key when it is armed — design §4 — so this trap is specific to a key subsumed
-  /// under an existing root, where no fresh arm re-keys it.)
+  /// Every watch `key` is canonicalized at the driver's single arm-and-key choke point — via
+  /// [`Source::canonicalize_key`] — **before** it is classified against the watch-set, so a
+  /// subscription is always keyed on the source's canonical coordinate (the one its events arrive
+  /// under). For the filesystem source a non-canonical `key` (a symlinked or `.`/`..`-laden path)
+  /// is resolved to its real path; a key that cannot be canonicalized (for the fs source, one that
+  /// does not exist) is rejected with [`WatchError::Canonicalize`]. This closes the trap the old
+  /// contract warned about — where a non-canonical key subsumed under an already-watched canonical
+  /// root was committed verbatim and then silently missed every event, because real events arrived
+  /// under the canonical coordinate its key never matched. A source whose keys are already
+  /// canonical (a generic component key) implements
+  /// [`canonicalize_key`](Source::canonicalize_key) as the identity.
   ///
   /// This sends a watch command to the owner and awaits its reply. Dropping the
   /// returned future drops only the wait — the owner still runs the reconcile to
@@ -340,9 +340,9 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   ///
   /// # Errors
   ///
-  /// - [`WatchError::Fs`] when arming the source watch fails (or the source's
-  ///   committed key diverged and changed subsumption — surfaced as
-  ///   [`WatchError::Canonicalize`]);
+  /// - [`WatchError::Canonicalize`] when `key` cannot be canonicalized (for the fs source, the
+  ///   path does not exist), or the source's committed key diverged and changed subsumption;
+  /// - [`WatchError::Fs`] when arming the source watch fails;
   /// - [`WatchError::Fs(WatchRootError::Closed)`](tributary_fs::WatchRootError::Closed)
   ///   when the owner is gone.
   pub async fn watch(
@@ -749,6 +749,21 @@ where
     interest: Interest,
     filter: Filter<C>,
   ) -> Result<Subscription, WatchError> {
+    // Canonicalize the caller key at the single arm-and-key choke point, BEFORE classification
+    // (invariant I2 — "one fs-canonical coordinate at one choke point"). Every downstream step —
+    // `plan_watch`, the Covered-liveness re-plan, the arm, and the commit — then keys on the
+    // source's canonical coordinate, so the `Covered` path (which arms nothing, and so never
+    // adopts a canonical key at arm time) can no longer commit a raw non-canonical key that later
+    // canonical events fail to match: real events arrive under the canonical coordinate, so a
+    // verbatim non-canonical key would receive nothing with no `Rescan` to signal the gap (Codex
+    // R14 F1 — the Covered-path silent-loss close). A source that cannot canonicalize the key
+    // rejects the watch here (FsSource: the path does not exist → `WatchError::Canonicalize`)
+    // rather than silently committing an eventless key; a source whose keys are already canonical
+    // (a generic component key) canonicalizes as the identity. The arm path still re-keys onto
+    // `Armed::canonical_key` and guards it with `fs_path_preserves_plan`, closing the residual
+    // TOCTOU where the coordinate changes between this canonicalization and the arm.
+    let canonical_key = self.source.canonicalize_key(key)?;
+    let key = canonical_key.as_slice();
     // Plan the watch, **re-planning past any dead covering root** so no subscription ever binds a
     // source-forgotten handle (Codex R12 F1 — the structural close of the dead-root-coverage class).
     // The owner loop is command-biased, so a `watch` queued while a dead root's terminal event is
@@ -787,8 +802,11 @@ where
     };
     match &outcome {
       WatchOutcome::Covered { fs_root, sub } => {
-        // Already covered by a root the re-plan loop just validated LIVE: no arm. The covering
-        // root's key was validated when first armed, so the newcomer's own key is used unchanged.
+        // Already covered by a root the re-plan loop just validated LIVE: no arm. The newcomer's
+        // key was canonicalized at the top of this method (the single choke point), so committing
+        // it verbatim keys the subscription on the source's canonical coordinate — the one its
+        // events arrive under — closing the old Covered-path silent-loss where a raw non-canonical
+        // key was committed and then never matched a canonical event (Codex R14 F1).
         let (fs_root, sub) = (*fs_root, *sub);
         self.subsumer.commit_watch(&outcome, fs_root, key);
         self.filters.insert(sub, filter);
@@ -986,16 +1004,21 @@ where
   /// with its subscribers — only the **source handle** was released. For each:
   ///
   /// - **re-arm at the same key** through the [`arm`](Self::arm) choke point. On success
-  ///   whose committed key is unchanged, [`rebind`](Subsumer::rebind_root) the root onto the
-  ///   fresh handle and mint a dominating [`Rescan`](tributary_fs::EventKind::Rescan) per
-  ///   subscriber — the re-arm restarts the source's raw epochs at zero, so each subscriber
+  ///   whose committed key is unchanged AND whose fresh handle does not **alias a still-recorded
+  ///   sibling** (a [`Source::Handle`] no-ABA violation — see the trait),
+  ///   [`rebind`](Subsumer::rebind_root) the root onto the fresh handle and mint a dominating
+  ///   [`Rescan`](tributary_fs::EventKind::Rescan) per subscriber — the re-arm restarts the
+  ///   source's raw epochs at zero, so each subscriber
   ///   [`repoint`](epoch::EpochLedger::repoint)s onto the new handle (exactly a widen
   ///   re-point) and re-enumerates. The subscription is live-and-covered again.
-  /// - if the re-arm **fails** (the root is genuinely dead), or its committed key **diverged**
-  ///   (a canonicalization race we cannot cleanly rebind), **retire** the root through the
-  ///   shared [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan): a
-  ///   durable dominating terminal Rescan per subscriber, then free its index / filter / epoch
-  ///   and drop it from the view.
+  /// - if the re-arm **fails** (the root is genuinely dead), its committed key **diverged**
+  ///   (a canonicalization race we cannot cleanly rebind), or its fresh handle **aliases a
+  ///   still-recorded sibling** (a misbehaving source we refuse to let corrupt the reverse
+  ///   index), **retire** the root through the shared
+  ///   [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan): a durable
+  ///   dominating terminal Rescan per subscriber, then free its index / filter / epoch and drop
+  ///   it from the view (the aliased sibling's record is left untouched, to be restored on its
+  ///   own iteration).
   ///
   /// Either way no subscription is left recorded-live-but-disarmed-and-published-watched.
   async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) {
@@ -1011,8 +1034,24 @@ where
       };
       match self.arm(&root_key).await {
         Ok((new_handle, fs_key)) if fs_key == root_key => {
-          // Re-armed at the same coordinate: rebind onto the fresh handle and re-point each
-          // subscriber (raw epochs restarted at zero) with a dominating Rescan.
+          // Defend the reverse index against a `Source::Handle` ABA violation (see the trait's
+          // no-ABA handle contract): the re-arm must not hand back a handle value that ALIASES a
+          // still-recorded root OTHER than `old` — a not-yet-restored sibling in `unwatch`, or any
+          // other live root. `rebind_root(old, new_handle)` would overwrite that sibling's
+          // reverse-map entry, stranding it published-but-unroutable and mis-resolving a later
+          // restore/unwatch/event to the wrong root. A conforming source never does this (FsSource
+          // mints monotonic ScopeIds), but a misbehaving one must not be allowed to corrupt the
+          // index: on a detected alias, disarm the stray fresh watch and retire `old` through the
+          // shared terminal-Rescan primitive (its subscribers re-enumerate and it leaves the view),
+          // leaving the aliased sibling's record untouched. `new_handle == old` is NOT an alias —
+          // it re-arms the SAME root at the SAME key, which the contract explicitly permits.
+          if new_handle != old && self.subsumer.entry(new_handle).is_some() {
+            self.source.disarm(new_handle).await;
+            self.retire_root_with_terminal_rescan(old);
+            continue;
+          }
+          // Re-armed at the same coordinate with a fresh, non-aliasing handle: rebind onto it and
+          // re-point each subscriber (raw epochs restarted at zero) with a dominating Rescan.
           self.subsumer.rebind_root(old, new_handle);
           let mut rescans = Vec::with_capacity(subscribers.len());
           for sub in subscribers {
