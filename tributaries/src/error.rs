@@ -55,6 +55,17 @@ pub enum WatchError {
   /// error — never its `Overlaps` case, which is subsumed away before any arm.
   #[error(transparent)]
   Fs(#[from] tributary_fs::WatchRootError),
+  /// The source reported the arm as succeeded, but the armed root was **already
+  /// gone** — a *dead-on-arrival* handle: the root was removed between the arm
+  /// request and its completion, so the source has already forgotten it
+  /// ([`Source::root_key`](crate::Source::root_key) answers `None`). The umbrella
+  /// refuses to commit a root no live source watch backs — it would publish the
+  /// key as watched yet stream no change under it — so it fails the watch at the
+  /// arm choke point (design §4, invariant I2); retry it. Distinct from
+  /// [`Fs`](Self::Fs) (the arm itself failed) and [`Canonicalize`](Self::Canonicalize)
+  /// (the arm succeeded, but at a divergent coordinate).
+  #[error("the watched root was removed before its watch could be armed; retry the watch")]
+  DeadOnArrival,
 }
 
 impl WatchError {
@@ -64,12 +75,18 @@ impl WatchError {
     matches!(self, Self::Canonicalize { .. })
   }
 
+  /// Whether this is [`DeadOnArrival`](Self::DeadOnArrival).
+  #[inline]
+  pub const fn is_dead_on_arrival(&self) -> bool {
+    matches!(self, Self::DeadOnArrival)
+  }
+
   /// The underlying `tributary-fs` watch error, if this is [`Fs`](Self::Fs).
   #[inline]
   pub const fn as_fs(&self) -> Option<&tributary_fs::WatchRootError> {
     match self {
       Self::Fs(err) => Some(err),
-      Self::Canonicalize { .. } => None,
+      Self::Canonicalize { .. } | Self::DeadOnArrival => None,
     }
   }
 }

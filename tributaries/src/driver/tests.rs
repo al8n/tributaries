@@ -45,8 +45,11 @@ enum Call {
 
 /// A fake [`Source`] over `u32` handles: it records every arm/disarm in order (so a test
 /// can assert the widen sequence), can be told to fail the *next* arm (so a test can drive
-/// the arm-failure path), and models the source's canonical-key adoption (a `retarget`
-/// diverges the reported canonical key from the requested one — the design §4 TOCTOU).
+/// the arm-failure path), can be told to return the *next* arm **dead-on-arrival** (a
+/// reported-armed handle the source has already forgotten — [`Source::root_key`] is `None` —
+/// so a test can drive the driver's I2 arm-choke-point liveness check), and models the
+/// source's canonical-key adoption (a `retarget` diverges the reported canonical key from the
+/// requested one — the design §4 TOCTOU).
 ///
 /// **It enforces the source's disjoint-root contract** (mirroring [`tributary_fs::Watcher`]):
 /// arming a key overlapping a currently-armed fake root returns
@@ -63,6 +66,11 @@ struct FakeSource {
   canonical: HashMap<u32, Vec<OsString>>,
   /// How many of the next `arm` calls to fail, decremented on each failed arm.
   fail_arms: u32,
+  /// How many of the next `arm` calls to return **dead-on-arrival**: the arm reports success
+  /// (a handle + canonical key) but the root is NOT recorded live, so [`Source::root_key`]
+  /// answers `None` for its handle — modelling a root torn down between the arm request and its
+  /// completion. The driver's arm-choke-point liveness check (invariant I2) must reject it.
+  dead_on_arrival_arms: u32,
   /// Planned path → the divergent canonical path `arm` should report for it (the §4
   /// canonicalization TOCTOU: the source commits a different coordinate than planned).
   retarget: HashMap<PathBuf, PathBuf>,
@@ -76,6 +84,7 @@ impl FakeSource {
       live: HashMap::new(),
       canonical: HashMap::new(),
       fail_arms: 0,
+      dead_on_arrival_arms: 0,
       retarget: HashMap::new(),
     }
   }
@@ -83,6 +92,13 @@ impl FakeSource {
   /// The next `arm` call fails.
   fn fail_next_arm(&mut self) {
     self.fail_arms = 1;
+  }
+
+  /// The next `arm` call returns **dead-on-arrival**: a reported-armed handle the source has
+  /// already forgotten ([`Source::root_key`] answers `None` for it), driving the driver's I2
+  /// liveness check at the arm choke point.
+  fn dead_on_arrival_next_arm(&mut self) {
+    self.dead_on_arrival_arms = 1;
   }
 
   /// The next `n` `arm` calls fail (each decrements the counter) — drives the failed-widen
@@ -154,6 +170,14 @@ impl Source<OsString> for FakeSource {
       .cloned()
       .unwrap_or_else(|| path.clone());
     let canonical_key = components(&canonical_path);
+    // A dead-on-arrival arm reports success but the root was torn down before it completed: do
+    // NOT record it live/canonical, so [`Source::root_key`] answers `None` and the driver's I2
+    // liveness check at the arm choke point must reject it (best-effort disarming the stray
+    // handle). Models the fs source's `root_path == None` after a nominally-successful watch.
+    if self.dead_on_arrival_arms > 0 {
+      self.dead_on_arrival_arms -= 1;
+      return Ok(Armed::new(handle, canonical_key));
+    }
     self.canonical.insert(handle, canonical_key.clone());
     self.live.insert(handle, path);
     Ok(Armed::new(handle, canonical_key))
@@ -450,6 +474,61 @@ async fn arm_failure_abandons_plan_no_pending_leak() {
   );
 }
 
+/// Codex R13 (the STRUCTURAL close of the handle-liveness class at the ARM choke point): a fresh
+/// `Disjoint` `watch` whose arm is **dead-on-arrival** — the source reports it armed but has
+/// already forgotten the root ([`Source::root_key`] is `None`) — must FAIL the watch, not commit a
+/// root no live source watch backs. The driver's I2 liveness validation at the single arm-and-key
+/// choke point rejects it: it best-effort disarms the stray handle and surfaces
+/// [`WatchError::DeadOnArrival`], leaving NO root recorded, NO `is_watched` published, and NO
+/// subscription returned.
+///
+/// Fail-on-old: without the choke-point liveness check the dead handle is committed as a root —
+/// `watch` returns `Ok`, `is_watched` is true, a root is recorded, and a subscription leaks — so
+/// every assertion below flips.
+#[tokio::test]
+async fn disjoint_dead_on_arrival_arm_fails_no_root_committed() {
+  let mut h = Harness::new();
+
+  h.owner.source.dead_on_arrival_next_arm();
+  let result = h.watch("/a", Interest::all()).await;
+
+  let err = result.expect_err("a dead-on-arrival fresh arm fails the watch");
+  assert!(
+    err.is_dead_on_arrival(),
+    "the failure is the dead-on-arrival arm error, got {err:?}"
+  );
+  // The arm happened once (minting handle 1); the choke point found it dead and best-effort
+  // disarmed it — the stray handle is released, never committed.
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![Call::Arm(PathBuf::from("/a")), Call::Disarm(1)],
+    "the dead-on-arrival handle is best-effort disarmed, not committed"
+  );
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "the failed arm abandons the plan — no pending reservation leaks"
+  );
+  assert!(
+    !h.owner.subsumer.view().is_watched(&key("/a")),
+    "NO root is committed for a dead-on-arrival arm (fail-on-old: is_watched true)"
+  );
+  assert_eq!(
+    h.owner.subsumer.roots().count(),
+    0,
+    "no root is recorded (fail-on-old: the dead handle is committed as a root)"
+  );
+  // The view is clean, so a retry arms afresh — the dead-on-arrival left no live root behind.
+  h.watch("/a", Interest::all())
+    .await
+    .expect("watch /a after the dead-on-arrival failure");
+  assert_eq!(
+    h.owner.source.arm_count(),
+    2,
+    "the retried watch arms again (the dead-on-arrival plan left no live root)"
+  );
+}
+
 #[tokio::test]
 async fn widen_emits_dominating_rescan_per_repointed_sub() {
   let mut h = Harness::new();
@@ -651,6 +730,108 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
     by_sub.get(&sc).copied(),
     Some(Epoch::new(3)),
     "the restored sc's Rescan strictly dominates its high-water of 2"
+  );
+}
+
+/// Codex R13 (the ARM-choke-point liveness close, widen path): a `Widen` whose **wider** arm is
+/// dead-on-arrival — the source reports it armed but has already forgotten the wider root
+/// ([`Source::root_key`] is `None`) — must run the same restore the injected arm-failure does, not
+/// strand the subsumed roots it disarmed. The choke point rejects the dead wider handle
+/// (best-effort disarming it) and surfaces [`WatchError::DeadOnArrival`]; the widen's failure path
+/// then re-arms the disarmed subsumed roots (restore) and aborts the newcomer's plan. No subsumed
+/// subscription is left recorded-live-but-disarmed.
+///
+/// Fail-on-old: without the choke-point check the dead wider handle is committed as the widened
+/// root — the subsumed roots collapse onto a handle NO live watch backs and their subscribers
+/// silently stop seeing events.
+#[tokio::test]
+async fn widen_dead_on_arrival_wider_arm_restores_disarmed_roots() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c");
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The wider /a arm is dead-on-arrival; the two restore re-arms succeed (live).
+  h.owner.source.dead_on_arrival_next_arm();
+  let result = h.watch("/a", Interest::all()).await;
+  let err = result.expect_err("the dead-on-arrival wider arm fails the widen");
+  assert!(
+    err.is_dead_on_arrival(),
+    "the widen fails with the dead-on-arrival arm error, got {err:?}"
+  );
+
+  // Disarm-subsumed, the wider arm reports armed-then-dead so the choke point disarms its stray
+  // handle (3), THEN both subsumed roots are re-armed (the restore) — never stranded.
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Disarm(3),
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+    ],
+    "the dead-on-arrival wider handle is disarmed, then the subsumed roots restored (not stranded)"
+  );
+
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "the aborted widen leaks no pending reservation"
+  );
+
+  // Both subsumed subscriptions are live-and-covered again on FRESH, live handles — the dead wider
+  // root was never committed.
+  let view = h.owner.subsumer.view();
+  assert!(
+    view.is_watched(&key("/a/b")) && view.is_watched(&key("/a/c")),
+    "the restored subscriptions read watched again"
+  );
+  assert!(
+    !view.is_watched(&key("/a")),
+    "the dead-on-arrival wider root was NEVER committed (fail-on-old: /a is watched)"
+  );
+  let roots: Vec<(PathBuf, u32)> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, handle)| (PathBuf::from_iter(k), handle))
+    .collect();
+  assert_eq!(
+    roots.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+    vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
+    "the two subsumed roots are back (re-armed), not collapsed onto the dead wider handle"
+  );
+  for (path, handle) in &roots {
+    assert!(
+      h.owner.source.root_key(*handle).is_some(),
+      "the re-armed root {path:?} is on a LIVE handle — never published-watched-but-disarmed"
+    );
+  }
+
+  // Each restored subscriber got a dominating Rescan (re-enumerate onto the re-armed root).
+  let by_sub: HashMap<Subscription, Epoch> = h
+    .drain()
+    .iter()
+    .map(|ev| {
+      assert!(ev.is_rescan(), "every restore signal is a Rescan");
+      (ev.subscription(), ev.epoch())
+    })
+    .collect();
+  assert_eq!(
+    by_sub.get(&sb).copied(),
+    Some(Epoch::new(5)),
+    "sb's restore Rescan strictly dominates its high-water of 4"
+  );
+  assert_eq!(
+    by_sub.get(&sc).copied(),
+    Some(Epoch::new(3)),
+    "sc's restore Rescan strictly dominates its high-water of 2"
   );
 }
 
