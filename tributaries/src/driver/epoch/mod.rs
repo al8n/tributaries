@@ -105,6 +105,28 @@ impl EpochLedger {
     stamp
   }
 
+  /// Like [`stamp`](Self::stamp) but for a **source-emitted `Rescan`**, which must
+  /// *strictly* dominate every prior delivery (it is the no-silent-loss coverage-loss
+  /// signal): returns `max(epoch_base + raw, high_water.next())` — one past the current
+  /// high-water even when an ordinary post-shed delivery already reached it — and advances
+  /// high-water to it.
+  ///
+  /// The distinction from [`stamp`](Self::stamp) is load-bearing after the R6 clamp: an
+  /// ordinary post-shed same-generation event is clamped *up to* `high_water` (a tie with
+  /// the shed `Rescan`, which is not dominated). A source `Rescan` stamped by the ordinary
+  /// clamp would then only *tie* that already-delivered event rather than dominate it, so a
+  /// high-water consumer could ignore the lower layer's coverage-loss signal. Minting at
+  /// `high_water.next()` restores strict dominance — the same guarantee the umbrella's own
+  /// synthetic Rescans already get from [`repoint`](Self::repoint) / [`shed_rescan`](Self::shed_rescan).
+  pub(crate) fn stamp_rescan(&mut self, sub: Subscription, raw: Epoch) -> Epoch {
+    let base = self.base.get(&sub).copied().unwrap_or(Epoch::START);
+    let natural = base.as_u64().saturating_add(raw.as_u64());
+    let hw = self.high_water.get(&sub).copied().unwrap_or(Epoch::START);
+    let stamp = Epoch::new(natural.max(hw.next().as_u64()));
+    self.bump(sub, stamp);
+    stamp
+  }
+
   /// Rebases `sub` onto a widened root (design §8) and returns the stamp for its
   /// synthetic dominating `Rescan`.
   ///
@@ -188,10 +210,21 @@ impl EpochLedger {
     C: PartialEq + 'a,
     E: RoutableEvent<C>,
   {
+    let is_rescan = event.is_rescan();
     fan_out(event, subscribers, canonical_of, admits)
       .into_iter()
       .map(|delivered| {
-        let stamp = self.stamp(sub_of(&delivered), raw);
+        let sub = sub_of(&delivered);
+        // A source-emitted `Rescan` must STRICTLY dominate every prior delivery for the
+        // subscription ([`stamp_rescan`] = `high_water.next()`); an ordinary delivery takes
+        // the R6 high-water clamp ([`stamp`]). Without the split a source `Rescan` at the
+        // same generation as a post-shed event would only tie it, losing the coverage-loss
+        // signal.
+        let stamp = if is_rescan {
+          self.stamp_rescan(sub, raw)
+        } else {
+          self.stamp(sub, raw)
+        };
         stamp_into(delivered, stamp)
       })
       .collect()
