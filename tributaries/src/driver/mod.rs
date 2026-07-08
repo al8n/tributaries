@@ -25,7 +25,7 @@
 //! [`TokioTributaries`] / [`SmolTributaries`] aliases).
 
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, HashMap, VecDeque},
   ffi::OsString,
   hash::Hash,
   marker::PhantomData,
@@ -283,6 +283,7 @@ where
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
+      pending_disarms: VecDeque::new(),
       #[cfg(debug_assertions)]
       observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<R>,
@@ -508,6 +509,19 @@ where
   /// strong `Sender`, so the channel is held open only for the brief life of the grant.
   commands_weak: async_channel::WeakSender<Command<C, V>>,
   events: async_channel::Sender<Event<C, V>>,
+  /// Freed root handles awaiting a **deferred** [`disarm`](Source::disarm) (Codex R20-F1): the
+  /// last-subscriber root a [`DropOrphan`](Command::DropOrphan) emptied. A `DropOrphan` is an
+  /// **internal** owner action (a dropped `watch` wait's [`WatchGrant`] fired), so its cleanup MUST
+  /// NOT block [`Close`](Command::Close) on source I/O (invariant II). Rather than await the
+  /// last-subscriber `source.disarm` inline — which would strand a `Close` queued behind the
+  /// `DropOrphan` on a slow/wedged source — [`dispatch_command`](Self::dispatch_command) purges the
+  /// orphan's owner-local state synchronously and pushes the freed root **here**. The [`run`] loop
+  /// drains ONE per iteration, but only when no command is already queued and racing the mailbox, so
+  /// a `Close` always wins; and the arm choke point flushes it if a re-`watch` overlaps it before the
+  /// idle drain runs (see [`arm`](Self::arm)). A wedged disarm here delays only this cleanup, never
+  /// `Close`. Any handles still queued at teardown are moot — dropping the owner drops the source,
+  /// whose own `Drop` releases every kernel watch (no leak, no hang).
+  pending_disarms: VecDeque<S::Handle>,
   /// A **debug-only** exhaustive tripwire for the generation-unique [`Source::Handle`] contract:
   /// every handle this owner has ever observed from a successful live [`arm`](Self::arm). The arm
   /// choke point asserts each freshly-armed handle was **never** seen before, catching ANY reuse —
@@ -540,9 +554,27 @@ where
   }
 }
 
+/// The [`run`] loop's control-flow after handling one ready arm: keep looping, or break out to
+/// teardown. Returned by [`Owner::dispatch_command`] so a command is dispatched identically from
+/// the loop's main `select` and its deferred-disarm drain `select` — above all a `Close`, which
+/// must break out of either (invariant II).
+enum Flow {
+  /// Keep looping (a command reconciled, an event fanned out, a disarm drained, a timer tick).
+  Continue,
+  /// Break out to teardown, carrying the `Close` acknowledgement and the source-drain flag.
+  Break {
+    /// The `Close` reply to acknowledge after teardown, or [`None`] when the break was a dropped
+    /// last handle or a source drain (nobody to confirm to).
+    closing: Option<futures_channel::oneshot::Sender<Result<(), CloseError>>>,
+    /// `true` only on a **source drain** (`next` yielded `None` with a consumer still attached),
+    /// which owes that consumer every parked Rescan before the stream ends.
+    drain_owed: bool,
+  },
+}
+
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
-/// fan out a raw source event, or drain the coalescer's due entries — whichever is ready,
-/// each to completion.
+/// fan out a raw source event, drain the coalescer's due entries, or release one deferred
+/// orphan-disarm — whichever is ready, each to completion.
 ///
 /// Biased to the command mailbox so control-plane requests (including `Close`) are never
 /// starved by a busy event stream. On a `Close` command or a dropped last handle (the
@@ -588,45 +620,75 @@ where
     .fuse();
     futures_util::pin_mut!(timer);
 
-    futures_util::select_biased! {
-      cmd = owner.commands.recv().fuse() => match cmd {
-        Ok(Command::Watch { key, value, interest, filter, reply }) => {
-          owner.on_watch(key, value, interest, filter, reply).await;
+    // A freed root awaiting its **deferred** orphan-disarm (Codex R20-F1, invariant II): release
+    // ONE, but only when no command is already queued — so a `Close` (or any command) behind the
+    // `DropOrphan` that queued it is serviced FIRST, never waiting behind this internal disarm.
+    // `Some` iff there is one to drain and the mailbox is idle; the disarm arm below still races
+    // `commands.recv`, so a `Close` arriving mid-disarm wins at once, and a wedged disarm delays
+    // only this cleanup (never `Close`). A re-`watch` that overlaps this root before the idle drain
+    // reaches it is made correct by the arm choke point's overlap-flush (see [`Owner::arm`]), so the
+    // umbrella still never surfaces `Overlaps`.
+    let deferred_disarm = if owner.commands.is_empty() {
+      owner.pending_disarms.front().copied()
+    } else {
+      None
+    };
+
+    let flow = if let Some(handle) = deferred_disarm {
+      futures_util::select_biased! {
+        // Command-biased so a queued/incoming `Close` always wins the race with the disarm.
+        cmd = owner.commands.recv().fuse() => owner.dispatch_command(cmd).await,
+        // The one INTERNAL `source.disarm`: on success drop the drained handle; a wedged disarm
+        // simply stays pending here, blocking neither `Close` (the biased arm above) nor — beyond
+        // this iteration — the command loop.
+        () = owner.source.disarm(handle).fuse() => {
+          owner.pending_disarms.pop_front();
+          Flow::Continue
         }
-        Ok(Command::Unwatch { sub, reply }) => owner.on_unwatch(sub, reply).await,
-        // A watch orphaned by a dropped caller wait (its [`WatchGrant`] fired): reconcile it away
-        // exactly like an unwatch, ignoring the result — it is cleanup, not a caller request (I1).
-        Ok(Command::DropOrphan(sub)) => {
-          let _ = owner.reconcile_unwatch(sub).await;
+        _ = timer => {
+          owner.drain_coalescer_due();
+          Flow::Continue
         }
-        Ok(Command::Close { reply }) => break (Some(reply), false),
-        // Every handle dropped: same orderly teardown, nobody to confirm it to. Nobody is
-        // left to receive, so nothing is owed.
-        Err(_) => break (None, false),
-      },
-      // `source.next()` is one `select!` arm: a command/timer branch winning **drops** this
-      // in-flight future. That is safe only because [`Source::next`] is a hard-contract
-      // **cancellation-safe** read (see its docs) — dropping the future loses/acks no event.
-      raw = owner.source.next().fuse() => match raw {
-        // A terminal event on a **dead root** (the source has forgotten its handle) retires that
-        // root through the unified park-terminal-Rescan-then-retire primitive — which durably owes
-        // every subscriber a dominating `Rescan` *before* freeing the subsumer state, so a full
-        // channel cannot drop it — and `retire_if_dead` returns `true`, so the ordinary fan-out is
-        // skipped here. A dead-root NON-`Rescan` terminal event (e.g. a root `Removed`) is NOT
-        // separately fanned out: the parked terminal `Rescan` dominates and re-enumerates it, and
-        // fanning it through the coalescer under debounce would buffer-then-drop it (Codex R12 F2).
-        // Every event on a still-live root (an ordinary delivery, or an overflow `Rescan` on a live
-        // root) returns `false` and fans out normally here.
-        Some(event) => {
-          if !owner.retire_if_dead(&event) {
-            owner.fan_out_and_push(&event);
+      }
+    } else {
+      futures_util::select_biased! {
+        cmd = owner.commands.recv().fuse() => owner.dispatch_command(cmd).await,
+        // `source.next()` is one `select!` arm: a command/timer branch winning **drops** this
+        // in-flight future. That is safe only because [`Source::next`] is a hard-contract
+        // **cancellation-safe** read (see its docs) — dropping the future loses/acks no event.
+        raw = owner.source.next().fuse() => match raw {
+          // A terminal event on a **dead root** (the source has forgotten its handle) retires that
+          // root through the unified park-terminal-Rescan-then-retire primitive — which durably owes
+          // every subscriber a dominating `Rescan` *before* freeing the subsumer state, so a full
+          // channel cannot drop it — and `retire_if_dead` returns `true`, so the ordinary fan-out is
+          // skipped here. A dead-root NON-`Rescan` terminal event (e.g. a root `Removed`) is NOT
+          // separately fanned out: the parked terminal `Rescan` dominates and re-enumerates it, and
+          // fanning it through the coalescer under debounce would buffer-then-drop it (Codex R12 F2).
+          // Every event on a still-live root (an ordinary delivery, or an overflow `Rescan` on a live
+          // root) returns `false` and fans out normally here.
+          Some(event) => {
+            if !owner.retire_if_dead(&event) {
+              owner.fan_out_and_push(&event);
+            }
+            Flow::Continue
           }
+          // The source drained while a consumer is still attached: it is OWED every parked
+          // Rescan before the stream ends (no silent loss on source drain).
+          None => Flow::Break { closing: None, drain_owed: true },
+        },
+        _ = timer => {
+          owner.drain_coalescer_due();
+          Flow::Continue
         }
-        // The source drained while a consumer is still attached: it is OWED every parked
-        // Rescan before the stream ends (no silent loss on source drain).
-        None => break (None, true),
-      },
-      _ = timer => owner.drain_coalescer_due(),
+      }
+    };
+
+    match flow {
+      Flow::Continue => {}
+      Flow::Break {
+        closing,
+        drain_owed,
+      } => break (closing, drain_owed),
     }
   };
 
@@ -687,6 +749,63 @@ where
   R: RuntimeLite,
   S: Source<C>,
 {
+  /// Dispatches one command from the mailbox, returning whether the [`run`] loop should keep
+  /// looping or break to teardown ([`Flow`]). Shared by the loop's main `select` and its
+  /// deferred-disarm drain `select` so both handle every command — above all a `Close` — identically
+  /// (invariant II).
+  ///
+  /// [`DropOrphan`](Command::DropOrphan) is the load-bearing case (Codex R20-F1): a `watch` orphaned
+  /// by a dropped caller wait. The owner purges its owner-local state SYNCHRONOUSLY via
+  /// [`purge_sub_local`](Self::purge_sub_local) and, if that emptied a root, DEFERS the
+  /// last-subscriber `source.disarm` onto [`pending_disarms`](Owner::pending_disarms) — it never
+  /// awaits the disarm inline. A `DropOrphan` is an **internal** owner action (no caller is waiting
+  /// on it), so awaiting a slow or wedged last-subscriber `disarm` here would strand a `Close` queued
+  /// behind it — the very hole R19 closed for the source-drain teardown, here closed for the normal
+  /// loop. The deferred handle is released by the loop's idle drain or the arm choke point's
+  /// overlap-flush; either way `Close` is never blocked on it.
+  async fn dispatch_command(
+    &mut self,
+    cmd: Result<Command<C, V>, async_channel::RecvError>,
+  ) -> Flow {
+    match cmd {
+      Ok(Command::Watch {
+        key,
+        value,
+        interest,
+        filter,
+        reply,
+      }) => {
+        self.on_watch(key, value, interest, filter, reply).await;
+        Flow::Continue
+      }
+      Ok(Command::Unwatch { sub, reply }) => {
+        self.on_unwatch(sub, reply).await;
+        Flow::Continue
+      }
+      // A watch orphaned by a dropped caller wait (its [`WatchGrant`] fired): purge its owner-local
+      // state synchronously and DEFER the last-subscriber root's `source.disarm` (Codex R20-F1),
+      // ignoring the result — it is cleanup, not a caller request (invariant I1). Never await the
+      // disarm here: a `Close` queued behind this `DropOrphan` must be serviced regardless of a
+      // slow/wedged source (invariant II).
+      Ok(Command::DropOrphan(sub)) => {
+        if let Ok(UnwatchOutcome::RootEmptied { fs_root }) = self.purge_sub_local(sub) {
+          self.pending_disarms.push_back(fs_root);
+        }
+        Flow::Continue
+      }
+      Ok(Command::Close { reply }) => Flow::Break {
+        closing: Some(reply),
+        drain_owed: false,
+      },
+      // Every handle dropped: same orderly teardown, nobody to confirm it to. Nobody is left to
+      // receive, so nothing is owed.
+      Err(_) => Flow::Break {
+        closing: None,
+        drain_owed: false,
+      },
+    }
+  }
+
   /// Handles a [`Command::Watch`]: reconcile it, then hand the committed subscription back inside
   /// a RAII [`WatchGrant`] so a dropped caller wait can never strand it (design driver-golden doc,
   /// invariant I1).
@@ -950,8 +1069,33 @@ where
   /// freshly-armed, live handle was NEVER observed by this owner before. It subsumes the old
   /// per-site live-index checks AND additionally catches reuse of a handle already removed from the
   /// live index by unwatch or terminal retirement (see `observed_handles`).
+  ///
+  /// It is also where a **deferred orphan-disarm** (Codex R20-F1) is reconciled against a re-`watch`:
+  /// a [`DropOrphan`](Command::DropOrphan) removes its emptied root from the subsumer immediately but
+  /// defers the kernel `disarm` (see [`pending_disarms`](Owner::pending_disarms)), so a re-`watch` of
+  /// a just-orphaned key can be classified `Disjoint`/`Widen` (the subsumer no longer records it) yet
+  /// still have its kernel watch armed — the source then rejects the fresh arm as
+  /// [`Overlaps`](tributary_fs::WatchRootError::Overlaps). When that happens with disarms still
+  /// pending, this flushes them ([`flush_pending_disarms`](Self::flush_pending_disarms) — releasing
+  /// those logically-retired watches) and retries the arm ONCE, so the umbrella upholds its contract
+  /// of **never surfacing `Overlaps`** to a caller (see [`WatchError`]). The flush awaits inline, but
+  /// only ever on a **caller-initiated** `watch`'s reconcile (bounded by the source liveness
+  /// contract) — never on the internal `DropOrphan`/`Close` path. A fresh handle from the retry is
+  /// generation-unique and validated live exactly as a first-try arm, and a stale pending disarm of
+  /// the OLD handle cannot touch it (a different generation); a residual overlap after the flush is a
+  /// genuine source condition, surfaced.
   async fn arm(&mut self, key: &[C]) -> Result<(S::Handle, Vec<C>), WatchError> {
-    let armed = self.source.arm(key).await?;
+    let armed = match self.source.arm(key).await {
+      Ok(armed) => armed,
+      Err(err)
+        if !self.pending_disarms.is_empty()
+          && err.as_fs().is_some_and(WatchRootError::is_overlaps) =>
+      {
+        self.flush_pending_disarms().await;
+        self.source.arm(key).await?
+      }
+      Err(err) => return Err(err),
+    };
     let handle = armed.handle();
     if self.source.root_key(handle).is_none() {
       self.source.disarm(handle).await;
@@ -973,6 +1117,23 @@ where
        retirement) — a generation-unique Source::Handle contract violation; see Source::Handle"
     );
     Ok((handle, armed.canonical_key().to_vec()))
+  }
+
+  /// Releases every root awaiting a **deferred** orphan-disarm
+  /// ([`pending_disarms`](Owner::pending_disarms)), awaiting each in turn — the backstop the arm
+  /// choke point runs when a fresh arm overlaps a not-yet-released orphaned root (Codex R20-F1), so a
+  /// re-`watch` of a just-orphaned key never surfaces the `Overlaps` the umbrella subsumes away.
+  ///
+  /// Unlike the [`run`] loop's idle drain — which races the mailbox so a wedged disarm never blocks
+  /// `Close` — this awaits inline. That is sound because it runs ONLY as part of a caller-initiated
+  /// `watch`'s reconcile, whose arm already awaits source I/O and is bounded by the source liveness
+  /// contract (invariant II's caller-initiated half); it is never reached from the internal
+  /// `DropOrphan`/`Close` path. A wedged pending disarm therefore blocks only the very `watch` that
+  /// needs that root released — the same coupling the pre-R20 inline disarm already had.
+  async fn flush_pending_disarms(&mut self) {
+    while let Some(handle) = self.pending_disarms.pop_front() {
+      self.source.disarm(handle).await;
+    }
   }
 
   /// Reconciles one `unwatch` (invariant I4): retires the subscription's per-source and
@@ -1019,12 +1180,20 @@ where
     if sub.instance() != self.subsumer.instance() {
       return Err(UnwatchError::UnknownSubscription);
     }
-    let Some(outcome) = self.subsumer.plan_unwatch(sub) else {
-      return Err(UnwatchError::UnknownSubscription);
-    };
-    // Reclaim this subscription's per-sub state so a watch → repoint → unwatch churn cannot leak
-    // it. A stop-watching reclaim owes NO coverage-loss re-enumeration, so drop its parked overflow
-    // Rescan alongside its filter and epoch.
+    // Reclaim this subscription's owner-local per-sub state FIRST — its parked overflow Rescan, its
+    // buffered coalescer deltas, its filter, and its epoch entry — keyed on `sub` ALONE, BEFORE the
+    // subsumer outcome is consulted (Codex R20-F2). This MUST run even when the subscription is
+    // already absent from the subsumer (`plan_unwatch` below reports `Unknown`): a
+    // committed-but-unclaimed watch can be **terminal-retired** while its [`WatchGrant`] still sits
+    // in the reply slot — root death (`retire_if_dead`) parks that sub's terminal Rescan and
+    // force-removes it from the subsumer — and the later [`DropOrphan`](Command::DropOrphan) must
+    // still clear that parked Rescan, or it lingers as FALSE debt: a Rescan
+    // [`flush_pending_rescans`](Self::flush_pending_rescans) would deliver for a subscription the
+    // caller never received, or endlessly retry on a full channel at source-drain. Returning
+    // `Unknown` before this cleanup (the pre-R20-F2 order) stranded exactly that. Keyed on `sub`
+    // alone, it never touches a still-live sibling subscription's owed parked Rescan. A stop-watching
+    // reclaim owes NO coverage-loss re-enumeration, so dropping the parked Rescan here is correct
+    // (unlike the root-death path, which KEEPS it).
     self.retire_sub_state(sub);
     self.needs_rescan.remove(&sub);
     // Purge the debounce coalescer too: a delta buffered before the reclaim would otherwise drain
@@ -1033,6 +1202,12 @@ where
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.drop_subscription(sub);
     }
+    // Now consult the subsumer. An already-retired sub is `Unknown` (fine as the RETURN — the local
+    // cleanup above has already run); a live one reports whether its root emptied so
+    // [`reconcile_unwatch`](Self::reconcile_unwatch) can release the kernel watch.
+    let Some(outcome) = self.subsumer.plan_unwatch(sub) else {
+      return Err(UnwatchError::UnknownSubscription);
+    };
     Ok(outcome)
   }
 
