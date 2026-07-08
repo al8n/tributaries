@@ -58,12 +58,15 @@ mod epoch;
 #[cfg(all(test, feature = "tokio"))]
 mod tests;
 
-/// A control-plane request from a [`Tributaries`] handle to its [`Owner`], carrying a
+/// A control-plane request from a [`Tributaries`] handle to its [`Owner`] — mostly carrying a
 /// `oneshot` reply the caller's cancellable wait reads.
 ///
 /// The owner processes each to completion (invariant I1): dropping the caller's returned
 /// future drops only the [`oneshot::Receiver`](futures_channel::oneshot::Receiver), never
-/// the reconcile the owner runs.
+/// the reconcile the owner runs. The one **reply-less** variant is [`DropOrphan`](Self::DropOrphan):
+/// a [`WatchGrant`]'s `Drop` enqueues it to reconcile away a subscription whose caller's `watch`
+/// wait was dropped after the owner had already committed it (closing the invariant-I1 orphan
+/// window a bare `Subscription` reply left open).
 enum Command<C, V> {
   /// Subscribe to `key` (carrying caller `value`), with the given fan-out `interest` and
   /// admission `filter`.
@@ -76,8 +79,9 @@ enum Command<C, V> {
     interest: Interest,
     /// The per-subscription admission [`Filter`] (design §7).
     filter: Filter<C>,
-    /// The reply channel: the minted [`Subscription`], or the arm error.
-    reply: futures_channel::oneshot::Sender<Result<Subscription, WatchError>>,
+    /// The reply channel: a [`WatchGrant`] guarding the minted [`Subscription`] (so a dropped
+    /// wait cannot strand it — invariant I1), or the arm error.
+    reply: futures_channel::oneshot::Sender<Result<WatchGrant<C, V>, WatchError>>,
   },
   /// Drop a live subscription.
   Unwatch {
@@ -91,6 +95,79 @@ enum Command<C, V> {
     /// The reply channel, resolved once the owner has flushed and is tearing down.
     reply: futures_channel::oneshot::Sender<Result<(), CloseError>>,
   },
+  /// Reconcile away a subscription whose caller's `watch` wait was dropped **after** the owner
+  /// committed it (invariant I1). Emitted **only** by a [`WatchGrant`]'s `Drop`, so it carries no
+  /// `oneshot` reply: a `Drop` is synchronous and cannot await, so the grant enqueues this with a
+  /// non-blocking `try_send`. The owner treats it exactly like an [`Unwatch`](Self::Unwatch),
+  /// ignoring the result (it is cleanup, not a caller request).
+  DropOrphan(Subscription),
+}
+
+/// A single-use RAII grant carrying a freshly-committed [`Subscription`] back to a waiting
+/// [`watch`](Tributaries::watch) call — the fix that closes the invariant-I1 orphan window
+/// (design driver-golden doc, mirroring the lower fs layer's arm-grant pattern).
+///
+/// The owner commits the subscription (subsumer entry, filter, epoch state, possibly an armed
+/// root), then hands ownership of the **reconcile-away obligation** to this grant and sends it
+/// through the reply `oneshot`. Two outcomes, exhaustively:
+///
+/// - the caller's wait observes the reply → it [`defuse`](Self::defuse)s the grant and takes the
+///   [`Subscription`]; the grant's `Drop` becomes a no-op, so a normal successful `watch` runs
+///   **no** extra reconcile;
+/// - the caller's wait is dropped before it observes the reply — whether the receiver was already
+///   gone the instant the owner sent, OR it vanished in the **post-send, pre-poll** window that a
+///   bare `Subscription` reply could not cover — the grant is dropped instead, and its `Drop`
+///   best-effort enqueues a reply-less [`DropOrphan`](Command::DropOrphan) the owner reconciles
+///   away, releasing the root / filter / epoch exactly like an [`unwatch`](Tributaries::unwatch).
+///
+/// So a committed-but-unclaimed subscription can never be stranded advertised-yet-unreachable.
+/// The `Drop` fires at most once (Rust drops each value once) and is idempotent even against a
+/// racing retire — [`reconcile_unwatch`](Owner::reconcile_unwatch) treats an already-gone
+/// subscription as `Unknown` and no-ops — so it can neither double-fire nor double-free.
+struct WatchGrant<C, V> {
+  /// The committed subscription this grant guards until the caller claims it.
+  sub: Subscription,
+  /// A **strong** clone of the owner's command `Sender`, kept alive for the whole life of the
+  /// grant so the command channel stays open across its `Drop`'s non-blocking enqueue — the
+  /// grant's own live `Sender` is what makes the `DropOrphan` `try_send` unloseable, independent
+  /// of whether any [`Tributaries`] handle still exists.
+  commands: async_channel::Sender<Command<C, V>>,
+  /// Set by [`defuse`](Self::defuse) once the caller has claimed the subscription: a defused
+  /// grant's `Drop` enqueues nothing.
+  defused: bool,
+}
+
+impl<C, V> WatchGrant<C, V> {
+  /// Wraps a just-committed `sub` with the command `Sender` its `Drop` uses to reconcile it
+  /// away should the caller's wait never claim it.
+  fn new(sub: Subscription, commands: async_channel::Sender<Command<C, V>>) -> Self {
+    Self {
+      sub,
+      commands,
+      defused: false,
+    }
+  }
+
+  /// Claims the subscription for a caller that observed the reply, defusing the grant so its
+  /// `Drop` enqueues no cleanup — the normal successful `watch` path.
+  fn defuse(mut self) -> Subscription {
+    self.defused = true;
+    self.sub
+  }
+}
+
+impl<C, V> Drop for WatchGrant<C, V> {
+  /// If the grant was never [`defuse`](Self::defuse)d — the caller's wait was dropped before it
+  /// claimed the subscription — best-effort enqueue a reply-less [`DropOrphan`](Command::DropOrphan)
+  /// so the owner reconciles the orphan away (invariant I1). A `Drop` cannot block or await, so this
+  /// is a non-blocking [`try_send`](async_channel::Sender::try_send); the command channel is
+  /// unbounded (a control plane) and this grant still holds a live `Sender`, so the enqueue can be
+  /// lost neither to a full channel nor to a closed one.
+  fn drop(&mut self) {
+    if !self.defused {
+      let _ = self.commands.try_send(Command::DropOrphan(self.sub));
+    }
+  }
 }
 
 /// The public top-level watcher: overlapping subscriptions in, attributed events out.
@@ -201,6 +278,9 @@ where
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
       coalescer: debounce.map(Coalescer::new),
+      // A weak self-clone (downgrade takes `&self`, so `command_tx` is still moved into the handle
+      // below): grants upgrade it to enqueue a `DropOrphan` without keeping the channel open.
+      commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
       _rt: PhantomData::<R>,
@@ -288,10 +368,16 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
       return Err(WatchError::Fs(WatchRootError::Closed));
     }
     // Awaiting the reply is the only cancellable part: dropping this future drops the
-    // `oneshot::Receiver` alone; the owner's reconcile is unaffected (I1).
-    response
-      .await
-      .unwrap_or(Err(WatchError::Fs(WatchRootError::Closed)))
+    // `oneshot::Receiver`, which drops the [`WatchGrant`] sitting in its slot — whose `Drop`
+    // enqueues a [`DropOrphan`](Command::DropOrphan) so the owner reconciles the
+    // committed-but-unclaimed subscription away (invariant I1). On success we **defuse** the grant
+    // (its `Drop` becomes a no-op) and take the [`Subscription`]; a closed reply (the owner is
+    // gone) surfaces `Closed`.
+    match response.await {
+      Ok(Ok(grant)) => Ok(grant.defuse()),
+      Ok(Err(err)) => Err(err),
+      Err(_) => Err(WatchError::Fs(WatchRootError::Closed)),
+    }
   }
 
   /// Drops `sub`, releasing its source watch once it was the last subscriber of its
@@ -409,6 +495,16 @@ where
   needs_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
+  /// A **weak** clone of the owner's own command `Sender`, upgraded to a strong `Sender` and
+  /// handed into each [`WatchGrant`] so a dropped `watch` wait can enqueue a reply-less
+  /// [`DropOrphan`](Command::DropOrphan) that reconciles its committed-but-unclaimed subscription
+  /// away (invariant I1). It is **weak** by construction: a strong clone held here would keep the
+  /// command channel open forever, so dropping every public [`Tributaries`] handle would no longer
+  /// close it and the owner would never reach its dropped-handles teardown (the design's Close/Drop
+  /// path). Each grant [`upgrade`](async_channel::WeakSender::upgrade)s it — succeeding while any
+  /// handle is live, including the one the borrowing `watch` call holds — and carries its **own**
+  /// strong `Sender`, so the channel is held open only for the brief life of the grant.
+  commands_weak: async_channel::WeakSender<Command<C, V>>,
   events: async_channel::Sender<Event<C, V>>,
   _rt: PhantomData<R>,
 }
@@ -487,6 +583,11 @@ where
           owner.on_watch(key, value, interest, filter, reply).await;
         }
         Ok(Command::Unwatch { sub, reply }) => owner.on_unwatch(sub, reply).await,
+        // A watch orphaned by a dropped caller wait (its [`WatchGrant`] fired): reconcile it away
+        // exactly like an unwatch, ignoring the result — it is cleanup, not a caller request (I1).
+        Ok(Command::DropOrphan(sub)) => {
+          let _ = owner.reconcile_unwatch(sub).await;
+        }
         Ok(Command::Close { reply }) => break (Some(reply), false),
         // Every handle dropped: same orderly teardown, nobody to confirm it to. Nobody is
         // left to receive, so nothing is owed.
@@ -571,24 +672,46 @@ where
   R: RuntimeLite,
   S: Source<C>,
 {
-  /// Handles a [`Command::Watch`]: reconcile it, then reply. If the caller vanished after
-  /// the watch committed (the reply `oneshot` is closed), retire the orphaned
-  /// subscription immediately — the one residual "dropped wait" case (design
-  /// driver-golden doc, invariant I1).
+  /// Handles a [`Command::Watch`]: reconcile it, then hand the committed subscription back inside
+  /// a RAII [`WatchGrant`] so a dropped caller wait can never strand it (design driver-golden doc,
+  /// invariant I1).
+  ///
+  /// The grant guards the whole "dropped wait" window, not just the receiver-gone-at-send-time
+  /// edge the old bare-`Subscription` reply covered:
+  ///
+  /// - if the receiver is already gone the instant we send, `reply.send` fails and hands the grant
+  ///   back; we defuse it and reconcile the orphan away **now** (the pre-existing immediate case);
+  /// - if the send succeeds but the caller drops its wait **before polling** the reply, the grant
+  ///   sitting in the `oneshot` slot is dropped and its `Drop` enqueues a
+  ///   [`DropOrphan`](Command::DropOrphan) the owner reconciles away — the residual hole a bare
+  ///   `Subscription` left open;
+  /// - a caller that observes the reply defuses the grant, so a normal successful `watch` runs no
+  ///   extra reconcile.
   async fn on_watch(
     &mut self,
     key: Vec<C>,
     value: V,
     interest: Interest,
     filter: Filter<C>,
-    reply: futures_channel::oneshot::Sender<Result<Subscription, WatchError>>,
+    reply: futures_channel::oneshot::Sender<Result<WatchGrant<C, V>, WatchError>>,
   ) {
     match self.reconcile_watch(&key, value, interest, filter).await {
-      Ok(sub) => {
-        if reply.send(Ok(sub)).is_err() {
+      Ok(sub) => match self.commands_weak.upgrade() {
+        Some(commands) => {
+          if let Err(Ok(grant)) = reply.send(Ok(WatchGrant::new(sub, commands))) {
+            // The receiver was already gone the instant we sent: defuse the returned grant and
+            // reconcile the orphan away now, rather than bounce a `DropOrphan` through our own
+            // mailbox. (A send that succeeds but is dropped before polling is handled by the
+            // grant's `Drop` instead.)
+            let _ = self.reconcile_unwatch(grant.defuse()).await;
+          }
+        }
+        // The command channel is already closed — every handle is gone, so no caller can observe
+        // the reply and the owner is about to tear down. Reconcile the orphan away now.
+        None => {
           let _ = self.reconcile_unwatch(sub).await;
         }
-      }
+      },
       Err(err) => {
         let _ = reply.send(Err(err));
       }
@@ -1276,6 +1399,11 @@ where
           }
           Ok(Command::Unwatch { reply, .. }) => {
             let _ = reply.send(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)));
+          }
+          // A watch orphaned mid-teardown (a dropped wait's [`WatchGrant`] fired): reconcile it
+          // away like an unwatch and keep draining the owed Rescans (no silent loss).
+          Ok(Command::DropOrphan(sub)) => {
+            let _ = self.reconcile_unwatch(sub).await;
           }
         },
         _ = sleep => {}

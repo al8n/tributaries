@@ -258,6 +258,7 @@ impl Harness {
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
       coalescer,
+      commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
       _rt: PhantomData::<TokioRuntime>,
@@ -873,6 +874,82 @@ async fn caller_vanished_after_commit_is_reconciled_away() {
   assert!(
     matches!(h.owner.source.calls().last(), Some(Call::Disarm(_))),
     "the committed root was disarmed by the immediate unwatch"
+  );
+}
+
+/// The post-commit orphan window (design driver-golden doc, invariant I1, Codex R10): a `watch`
+/// whose caller's wait is dropped **after** the owner committed and **successfully sent** the reply,
+/// but **before** the wait observed it, must not strand the committed subscription. The reply carries
+/// a RAII `WatchGrant`, not a bare `Subscription`; dropping the reply `Receiver` (the vanished wait)
+/// drops the grant, whose `Drop` enqueues a `DropOrphan` the owner reconciles away — releasing the
+/// root, filter, and epoch state exactly like an unwatch (the same purge the churn test checks).
+///
+/// This is the residual hole a bare-`Subscription` reply left open: a successful `send` only proves
+/// the receiver existed at that instant, never that it polls the value. Distinct from
+/// `caller_vanished_after_commit_is_reconciled_away`, which drops the receiver **before** the send
+/// (the pre-existing immediate-reconcile edge); here the send succeeds and the grant's `Drop` is the
+/// only thing that can detect the drop.
+///
+/// Fail-on-old: with the bare reply (no grant `Drop`), dropping the receiver drops only the
+/// subscription value — nothing is enqueued and the committed subscription stays live — so the
+/// `try_recv().expect(..)` (no `DropOrphan` present) and every purge assertion FAIL.
+#[tokio::test]
+async fn watch_wait_dropped_after_commit_reconciles_the_orphan_away() {
+  let mut h = Harness::new();
+
+  // Drive the owner to COMMIT the watch and SUCCESSFULLY send the reply: `response` is held here,
+  // so the grant lands in the `oneshot` slot — exactly the post-send, pre-poll window.
+  let (reply, response) = futures_channel::oneshot::channel();
+  h.owner
+    .on_watch(key("/a"), (), Interest::all(), Filter::all(), reply)
+    .await;
+  assert_eq!(
+    h.owner.source.arm_count(),
+    1,
+    "the watch armed once — it committed before the wait was dropped"
+  );
+  assert!(
+    h.owner.subsumer.view().is_watched(&key("/a")),
+    "the committed subscription reads watched while the grant is still in flight"
+  );
+
+  // The caller's wait vanishes in the post-send-pre-poll window: dropping the receiver drops the
+  // grant sitting in the slot, whose `Drop` enqueues a reply-less `DropOrphan`.
+  drop(response);
+
+  // Process that `DropOrphan` exactly as the run loop would. `try_recv` (not `recv().await`) so the
+  // fail-on-old path — where no command was enqueued — asserts cleanly instead of hanging.
+  let cmd = h
+    .owner
+    .commands
+    .try_recv()
+    .expect("the dropped grant enqueued a DropOrphan cleanup command");
+  match cmd {
+    super::Command::DropOrphan(sub) => {
+      let _ = h.owner.reconcile_unwatch(sub).await;
+    }
+    _ => panic!("the dropped grant must enqueue exactly a DropOrphan"),
+  }
+
+  // The orphan is fully purged — subsumer record, filter, and epoch state all released.
+  assert!(
+    !h.owner.subsumer.view().is_watched(&key("/a")),
+    "the orphaned subscription is no longer watched (reconciled away)"
+  );
+  assert_eq!(
+    h.owner.subsumer.roots().count(),
+    0,
+    "its subsumer root/record is released"
+  );
+  assert!(h.owner.filters.is_empty(), "its filter entry is purged");
+  assert_eq!(
+    h.owner.epochs.tracked_len(),
+    (0, 0),
+    "its epoch state is purged"
+  );
+  assert!(
+    matches!(h.owner.source.calls().last(), Some(Call::Disarm(_))),
+    "the committed root was disarmed by the DropOrphan reconcile"
   );
 }
 
@@ -1816,6 +1893,7 @@ impl OwnerU64 {
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
       coalescer,
+      commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
       _rt: PhantomData::<TokioRuntime>,
