@@ -682,6 +682,15 @@ where
         // re-enumerate — closing the unwatch→arm coverage gap.
         let mut rescans = Vec::with_capacity(repointed.len());
         for moved in repointed {
+          // The re-point Rescan re-enumerates the whole subscription, so it dominates any
+          // pre-widen deltas still buffered in the coalescer. Drop them before delivering it:
+          // otherwise, on a full channel, a buffered delta flushes ahead of the Rescan (the
+          // coalescer admits before `try_emit` suppresses) and parks at a fresh `shed_rescan`
+          // one epoch above the new root's raw-0, sorting the Rescan behind it and silently
+          // dropping post-widen events (the coalescer sibling of the Codex R5 re-point-epoch fix).
+          if let Some(coalescer) = self.coalescer.as_mut() {
+            coalescer.drop_subscription(moved);
+          }
           let rescan = self.epochs.repoint(moved);
           let mut event = Event::rescan(moved, fs_key.clone(), rescan);
           // The specific re-pointed subscription owns this Rescan (its key is invariant under the
@@ -790,6 +799,13 @@ where
           self.subsumer.rebind_root(old, new_handle);
           let mut rescans = Vec::with_capacity(subscribers.len());
           for sub in subscribers {
+            // As in the widen path: the restore re-point Rescan dominates the subscriber's
+            // buffered pre-widen coalescer deltas, so drop them before delivering it — else a
+            // buffered delta can flush ahead of the Rescan on a full channel and park one epoch
+            // above the new root's raw-0 (the coalescer sibling of the Codex R5 fix).
+            if let Some(coalescer) = self.coalescer.as_mut() {
+              coalescer.drop_subscription(sub);
+            }
             let rescan = self.epochs.repoint(sub);
             let mut event = Event::rescan(sub, root_key.clone(), rescan);
             // The re-armed root kept each subscriber's key (rebind touches only the handle), so

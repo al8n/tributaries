@@ -1151,6 +1151,56 @@ async fn widen_repoint_rescan_parks_at_own_epoch_not_shed_when_channel_full() {
   );
 }
 
+/// Codex R5 sibling (the coalescer-buffered-delta variant of the re-point-epoch hole): when a
+/// re-pointed subscription has **buffered pre-widen deltas** in the coalescer and the channel is
+/// FULL, `Coalescer::admit(rescan)` flushes those deltas AHEAD of the re-point `Rescan` in
+/// `push_all`; the first flushed ordinary delta hits `Full` and parks via `park_rescan` at a fresh
+/// `shed_rescan` (one above the repoint base), suppressing the Rescan behind it and dropping the new
+/// root's raw-0 as dominated — the same silent loss the direct-overflow fix closed, via the buffer.
+/// The fix drops a re-pointed sub's coalescer buffer BEFORE its re-point Rescan (the Rescan
+/// dominates those deltas), so nothing flushes ahead and the Rescan parks at its own repoint base.
+///
+/// Fail-on-old: with the `drop_subscription` before the widen re-point push removed, the buffered
+/// delta flushes ahead, parks at `shed_rescan` (high-water 5 → 6), and the parked epoch is 6, not 5.
+#[tokio::test]
+async fn widen_drops_buffered_coalescer_delta_so_repoint_rescan_parks_at_own_epoch() {
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200));
+  let mut h = Harness::build(Some(Coalescer::new(cfg)), Some(2));
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // root 1
+  for raw in 0..5 {
+    h.owner.epochs.stamp(sb, Epoch::new(raw)); // high-water 4
+  }
+
+  // A pre-widen delta BUFFERS in the coalescer (long quiet window → admit runs but nothing drains).
+  // It is pre-stamped, so it does not move sb's high-water off 4.
+  h.owner
+    .push_all(vec![modified_event(sb, "/a/b/buffered", 3)]);
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the buffered delta is held in the coalescer, not overflowed"
+  );
+
+  // Fill both channel slots so the widen's re-point Rescan push must overflow-park.
+  h.owner.try_emit(modified_event(sb, "/a/b/f0", 0));
+  h.owner.try_emit(modified_event(sb, "/a/b/f1", 1));
+
+  // Widen /a/b → /a: `repoint` rebases sb's base to high-water.next() = 5 and mints the re-point
+  // Rescan at 5. The fix drops sb's coalescer buffer before pushing that Rescan, so the buffered
+  // delta cannot flush ahead of it and park at a fresh `shed_rescan` (6).
+  h.watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+
+  assert_eq!(
+    h.owner.needs_rescan.get(&sb).map(|p| p.epoch),
+    Some(Epoch::new(5)),
+    "the buffered delta was dropped, so the re-point Rescan parked at the repoint base (5), \
+     not a fresh shed_rescan (6) minted by a buffered delta flushing ahead of it"
+  );
+}
+
 /// Source-drain no-silent-loss (design backpressure doc, checklist #1):
 /// a per-subscription overflow `Rescan` is **parked while the event channel is full**, then
 /// the source drains (`next` → `None`) at teardown. The owner must deliver that owed Rescan
