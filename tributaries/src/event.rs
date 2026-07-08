@@ -58,10 +58,13 @@ pub struct Event<C, V> {
   /// The underlying kernel change id, for an fs-source event; `None` for one this
   /// crate synthesized (a widen `Rescan`, a coalesced-churn `Modified`).
   change_id: Option<ChangeId>,
-  /// The caller value attributed to this delivery (design §3). Threaded for the
-  /// generic value plane; the fs driver leaves it `None` (its attribution values are
-  /// served by [`WatchView::covering`](crate::WatchView::covering), and the
-  /// per-event value is wired when the generic driver lands).
+  /// The caller value attributed to this delivery (design §3). **Not populated in
+  /// 0.1.0**: every constructor sets it `None`. Attribution instead runs through the
+  /// wait-free value plane — a caller resolves a delivered event's [`key`](Event::key)
+  /// via [`WatchView::resolve`](crate::WatchView::resolve) /
+  /// [`covering`](crate::WatchView::covering), which holds the authoritative per-root
+  /// value, so `V` is never cloned onto each delivery. Per-event value wiring is
+  /// reserved for a future version.
   value: Option<V>,
 }
 
@@ -274,9 +277,12 @@ impl<C, V> Event<C, V> {
 
   /// The caller value attributed to this delivery (design §3), if any.
   ///
-  /// Threaded for the generic value plane; the fs driver leaves it `None` (its
-  /// attribution values are served by
-  /// [`WatchView::covering`](crate::WatchView::covering)).
+  /// **Always `None` in 0.1.0** — the per-event value is not populated in this version.
+  /// Attribute a delivered event to its owning value by resolving its
+  /// [`key`](Self::key) through the wait-free value plane
+  /// ([`WatchView::resolve`](crate::WatchView::resolve) /
+  /// [`covering`](crate::WatchView::covering)), which holds the authoritative per-root
+  /// value. Per-event value wiring is reserved for a future version.
   #[inline]
   pub const fn value(&self) -> Option<&V> {
     self.value.as_ref()

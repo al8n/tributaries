@@ -32,8 +32,15 @@ tributary-fs = { version = "0.1", path = "../tributary-fs" }
 tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
+# Mirror a real consumer's manifest: the indexer-shaped integration suite
+# (`tests/indexer_shaped.rs`) names `tributary_fs::Watcher` + a concrete
+# `agnostic_lite` runtime directly, exactly as a downstream crate building its own
+# `Source` would. Their `tokio`/`smol` feature layers unify with this crate's own
+# (via the `tokio`/`smol` features above), so no extra feature wiring is needed.
+agnostic-lite = { version = "0.6", features = ["time"] }
 proptest = "1"
 tempfile = "3"
+tributary-fs = { version = "0.1", path = "../tributary-fs" }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
