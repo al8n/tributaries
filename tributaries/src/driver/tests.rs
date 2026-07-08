@@ -1970,3 +1970,101 @@ async fn baked_value_attributes_queued_events_after_teardown_empties_view() {
     "every delivered event carries a baked owning-subscription value (none slips through as None)"
   );
 }
+
+/// Codex R9-F1 (the full per-subscription-purge class): a **consumer unwatch** must purge the
+/// debounce coalescer along with every other per-sub structure, so a delta buffered before the
+/// unwatch can never drain to the retired subscription. The coalescer's drain path
+/// (`drain_coalescer_due` / the teardown flush → `try_emit`) has no live-subscription check, so an
+/// entry left buffered is delivered for a subscription whose `unwatch` already resolved.
+///
+/// Fail-on-old: without `coalescer.drop_subscription(sub)` on unwatch, the buffered delta survives
+/// the unwatch and the flush emits it → the drain is non-empty.
+#[tokio::test]
+async fn consumer_unwatch_purges_buffered_coalescer_delta() {
+  // A long quiet window so `push_all`'s immediate drain buffers the delta rather than emitting it.
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200));
+  let mut h = Harness::with_coalescer(Some(Coalescer::new(cfg)));
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  // A pre-unwatch delta buffers in the coalescer (long window → admit runs, nothing drains).
+  h.owner.push_all(vec![modified_event(sub, "/a/f", 0)]);
+  assert!(
+    h.drain().is_empty(),
+    "the delta is held under the long quiet window, not yet emitted"
+  );
+
+  // The consumer unwatches: every per-sub structure — including the coalescer buffer — is purged.
+  h.unwatch(sub).await.expect("sub was live");
+
+  // Both the settle-timer edge and the teardown flush drain the coalescer through `try_emit`;
+  // neither may surface anything for the retired subscription.
+  h.owner.drain_coalescer_due();
+  h.owner.drain_owed_once();
+  assert!(
+    h.drain().is_empty(),
+    "no buffered coalescer event drains for a subscription whose unwatch already resolved"
+  );
+}
+
+/// Codex R9-F2 (the panic-stranding class): a panic in a caller-provided callback the owner runs
+/// synchronously (here the admission [`Filter`] predicate at fan-out) unwinds the owner before the
+/// normal teardown path empties the read plane. The `impl Drop for Owner` guard publishes an empty
+/// plane on **any** owner drop — normal exit OR a panic — so a retained [`WatchView`] never keeps
+/// advertising a subscription whose owner task has died (the R3 stale-read-plane mode). The single
+/// Drop guard covers the whole class at once: any unwind through the owner future runs it.
+///
+/// Fail-on-old: with `impl Drop for Owner` removed, dropping the panicked owner leaves the last
+/// committed (non-empty) plane published, so the view still reports the sub watched → the final
+/// assertion FAILS.
+#[tokio::test]
+async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() {
+  let mut h = Harness::new();
+  // A filter whose predicate panics when fan-out consults it — the exact caller callback the owner
+  // invokes synchronously inside the run loop.
+  let sub = h
+    .owner
+    .reconcile_watch(
+      &key("/a"),
+      (),
+      Interest::all(),
+      Filter::new(|_| -> bool { panic!("caller filter predicate panics inside fan-out") }),
+    )
+    .await
+    .expect("watch /a"); // root handle 1
+
+  // A view clone taken while the sub is live — the retained handle the guarantee is about.
+  let view = h.owner.subsumer.view();
+  assert!(
+    view.is_watched(&key("/a")),
+    "the live watch is advertised while the sub is live"
+  );
+
+  // Drive an event through fan-out so the filter panics and the owner primitive unwinds. Catch it
+  // so the test survives to observe the plane, exactly as a runtime drops a panicked task's future.
+  let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    h.owner.fan_out_and_push(&source_modified(1, "/a/f", 0));
+  }));
+  assert!(
+    panicked.is_err(),
+    "the caller filter panicked, unwinding the owner"
+  );
+  assert!(
+    view.is_watched(&key("/a")),
+    "the caught panic left the owner alive — the plane is unchanged until the owner drops"
+  );
+  let _ = sub;
+
+  // Dropping the owner (as a runtime drops a panicked task's future) runs the Drop guard, which
+  // publishes the empty read plane so the retained view stops advertising the now-dead subscription.
+  drop(h);
+  assert!(
+    !view.is_watched(&key("/a")),
+    "the Owner Drop guard emptied the read plane on unwind — no stale coverage for a dead owner"
+  );
+  assert!(
+    view.covering(&key("/a")).is_none(),
+    "…and attribution resolves to nothing after the guard empties the plane"
+  );
+}
