@@ -50,6 +50,51 @@ mod tests;
 ///
 /// The default local-filesystem implementation is [`FsSource`].
 ///
+/// # Robustness boundary — what the umbrella REQUIRES vs GUARANTEES
+///
+/// The umbrella drives a `Source` as its single writer and is hardened against one that
+/// **misbehaves**. The line between what a conforming source must provide and what the umbrella
+/// upholds regardless is drawn precisely here (cross-reference: driver-golden invariant II,
+/// "Close-responsive").
+///
+/// **REQUIRED of a conforming `Source` (the umbrella relies on these):**
+///
+/// - **Generation-unique [`Handle`](Self::Handle)** — a handle value is never reused while any root
+///   or not-yet-emitted event still carries it (the hard contract on [`Handle`](Self::Handle), Codex
+///   R15). Makes handle ABA impossible; the umbrella routes strictly by handle rather than defending
+///   against reuse.
+/// - **Liveness of [`arm`](Self::arm) / [`disarm`](Self::disarm) / [`canonicalize_key`](Self::canonicalize_key)**
+///   — the umbrella awaits [`arm`](Self::arm)/[`disarm`](Self::disarm) (and calls the synchronous
+///   [`canonicalize_key`](Self::canonicalize_key)) while processing a **caller-initiated**
+///   `watch`/`unwatch`, running each reconcile to completion (invariant I1). These MUST make
+///   progress and resolve. A source that makes one **hang indefinitely** violates this liveness
+///   expectation: because the caller's `watch`/`unwatch` future is *also* awaiting, the caller may
+///   drop it to cancel its own wait, but the umbrella still owns the in-flight reconcile — so a
+///   wedged caller-initiated `arm`/`disarm` blocks the owner until the source honors the contract.
+///   This is the source's responsibility, not a bug the umbrella can defend against.
+/// - **Cancellation-safe [`next`](Self::next)** — dropping an in-flight [`next`](Self::next) future
+///   loses and acknowledges no event (the hard contract on [`next`](Self::next)).
+///
+/// **GUARANTEED by the umbrella even against a misbehaving `Source`:**
+///
+/// - **A wedged [`next`](Self::next) never blocks command processing.** The owner drives
+///   [`next`](Self::next) as one arm of a biased `select!`; a `next()` that never resolves is simply
+///   a pending arm — the loop still services the command mailbox and `Close`.
+/// - **Close-responsiveness against INTERNAL actions (invariant II).** Owner actions that are *not*
+///   a caller-awaited `watch`/`unwatch` — a `DropOrphan` from a dropped `watch` grant (Codex
+///   R20-F1), and the source-drain teardown (Codex R19) — MUST NEVER block `Close` on source I/O.
+///   The umbrella never awaits their [`disarm`](Self::disarm) inline: it **defers** an orphan's
+///   last-subscriber disarm and drains it only while racing the command mailbox (so a `Close` always
+///   wins), and the source-drain teardown purges orphans synchronously. A wedged
+///   [`disarm`](Self::disarm) of an orphaned root therefore delays only that deferred cleanup, never
+///   `Close`. (Caller-initiated `arm`/`disarm` are the other half of the split above — bounded by
+///   the source liveness contract, not by the umbrella.)
+/// - **No stranded or corrupt state.** A committed-but-unclaimed subscription is always reconciled
+///   away (the `WatchGrant`, invariant I1); a subscription terminal-retired while unclaimed leaves no
+///   lingering parked `Rescan` behind (Codex R20-F2); and a deferred orphan-disarm that has not run
+///   before a re-`watch` of the same key is flushed at the arm choke point, so the umbrella never
+///   surfaces the `Overlaps` it exists to subsume away.
+///
 /// # `Send` bounds
 ///
 /// **All three async methods return `Send` futures.** 0.1.0 targets tokio and smol, and

@@ -370,6 +370,7 @@ impl Harness {
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
+      pending_disarms: VecDeque::new(),
       #[cfg(debug_assertions)]
       observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<TokioRuntime>,
@@ -2593,6 +2594,10 @@ struct DrainableSource {
   next_handle: u32,
   live: HashMap<u32, Vec<OsString>>,
   drain: async_channel::Receiver<std::convert::Infallible>,
+  /// Make [`Source::disarm`] of this handle **never resolve** (park forever) — so the R20-F1
+  /// regression can prove the NORMAL run loop DEFERS a last-subscriber orphan-disarm rather than
+  /// awaiting it inline (which would strand a `Close` queued behind the `DropOrphan`).
+  hang_disarm: Option<u32>,
 }
 
 impl Source<OsString> for DrainableSource {
@@ -2610,6 +2615,11 @@ impl Source<OsString> for DrainableSource {
   }
 
   async fn disarm(&mut self, handle: u32) {
+    if self.hang_disarm == Some(handle) {
+      // Park forever: a NORMAL-loop `DropOrphan` that (wrongly) awaited this last-subscriber
+      // disarm inline would hang, stranding a queued `Close` — the R20-F1 pre-fix behaviour.
+      std::future::pending::<()>().await;
+    }
     self.live.remove(&handle);
   }
 
@@ -2643,6 +2653,7 @@ async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs
     next_handle: 0,
     live: HashMap::new(),
     drain: drain_rx,
+    hang_disarm: None,
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
     super::Tributaries::with_source(source, TributariesOptions::new());
@@ -2707,6 +2718,7 @@ impl OwnerU64 {
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
+      pending_disarms: VecDeque::new(),
       #[cfg(debug_assertions)]
       observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<TokioRuntime>,
@@ -2957,5 +2969,184 @@ async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() 
   assert!(
     view.covering(&key("/a")).is_none(),
     "…and attribution resolves to nothing after the guard empties the plane"
+  );
+}
+
+/// R20-F1 regression (design driver-golden doc, invariant II — Close-responsive normal loop): the
+/// NORMAL run loop must handle a [`DropOrphan`](super::Command::DropOrphan) WITHOUT awaiting its
+/// last-subscriber `source.disarm` inline, or a `Close` queued behind the `DropOrphan` is stranded
+/// when that disarm never resolves. The fix purges the orphan synchronously and DEFERS the disarm
+/// onto `pending_disarms`, so a `Close` behind a `DropOrphan` is acked promptly even when the
+/// orphan's root disarm hangs forever (the R19 source-drain fix, now closed for the normal loop too).
+///
+/// Runs the real spawned [`run`](super::run) loop over a source whose `next()` PARKS (so the loop
+/// stays in the normal phase, not source-drain) and whose disarm of the orphan's root (handle 1)
+/// never resolves. A single watch makes the orphan its root's only subscriber, so the `DropOrphan`
+/// empties the root and drives that never-resolving last-subscriber disarm.
+///
+/// Fail-on-old: with the normal-loop `DropOrphan` → `reconcile_unwatch(sub).await`, the loop parks
+/// inside the hung disarm before the `Close` is read, and `close()` times out.
+#[tokio::test]
+async fn normal_loop_dropped_orphan_defers_disarm_and_never_blocks_close() {
+  // Keep the drain sender alive for the whole test so `next()` parks: the loop stays in the NORMAL
+  // phase (a dropped sender would drain the source into the R19 teardown path instead).
+  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
+  let source = DrainableSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    drain: drain_rx,
+    // The orphan's root is the first (only) arm → handle 1; its disarm never resolves.
+    hang_disarm: Some(1),
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+
+  // One watch → its root's ONLY subscriber (handle 1), so a DropOrphan empties the root and drives
+  // its (never-resolving) last-subscriber disarm — exactly what the deferral must NOT await inline.
+  let orphan = w
+    .watch(key("/b"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /b");
+
+  // Queue DropOrphan(orphan) in the NORMAL loop, THEN Close behind it (FIFO): the ordering that,
+  // pre-R20-F1, parked the loop inside the orphan's never-resolving disarm before the Close was read.
+  w.commands
+    .try_send(super::Command::DropOrphan(orphan))
+    .expect("enqueue the DropOrphan command");
+
+  // Close must be acked promptly: the deferred orphan-disarm never blocks the command loop.
+  tokio::time::timeout(Duration::from_secs(5), w.close())
+    .await
+    .expect("close() is acked promptly — the deferred orphan-disarm did not block the command loop")
+    .expect("close completes");
+}
+
+/// R20-F2 regression (design driver-golden doc, invariant I4 / no false debt):
+/// [`purge_sub_local`](super::Owner::purge_sub_local) must clear a subscription's owner-local per-sub
+/// state — above all its parked overflow [`Rescan`](tributary_fs::EventKind::Rescan) — EVEN WHEN the
+/// subscription is already absent from the subsumer (terminal-retired). A committed-but-unclaimed
+/// watch can be terminal-retired (its terminal Rescan parked, the sub force-removed from the
+/// subsumer) while its [`WatchGrant`](super::WatchGrant) still sits in the reply slot; the later
+/// [`DropOrphan`](super::Command::DropOrphan) then finds `plan_unwatch` reporting `Unknown`. The fix
+/// runs the local purge (keyed on the sub alone) BEFORE that early return, so no parked Rescan is
+/// left behind as FALSE debt — a Rescan deliverable for a subscription the caller never received, or
+/// endlessly retried on a full channel at source-drain — while a live sibling's parked Rescan stays
+/// untouched.
+///
+/// Fail-on-old: with the early `Unknown` return placed BEFORE the local cleanup, the orphan's parked
+/// Rescan lingers in `needs_rescan` and the first assertion fails.
+#[tokio::test]
+async fn drop_orphan_after_terminal_retire_clears_the_orphans_parked_rescan_no_false_debt() {
+  let mut h = Harness::bounded(1);
+
+  // A LIVE sibling on one disjoint root and the ORPHAN on another. Monotonic mint: /a = handle 1
+  // (sibling), /b = handle 2 (orphan).
+  let sibling = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let orphan = h.watch("/b", Interest::all()).await.expect("watch /b");
+
+  // Give the LIVE sibling a parked overflow Rescan: fill the one channel slot, then overflow it — so
+  // the test can assert the orphan purge leaves a DIFFERENT sub's owed Rescan untouched.
+  for raw in 0..2 {
+    h.owner.epochs.stamp(sibling, Epoch::new(raw));
+  }
+  h.owner.try_emit(modified_event(sibling, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sibling, "/a/f1", 1));
+  assert!(
+    h.owner.needs_rescan.contains_key(&sibling),
+    "the sibling's overflow parked a dominating Rescan"
+  );
+
+  // Terminal-retire the ORPHAN's root (handle 2): parks the orphan's terminal Rescan into
+  // needs_rescan AND force-removes the sub from the subsumer — the committed-but-unclaimed-then-
+  // terminal-retired state R20-F2 is about (plan_unwatch can no longer find it).
+  h.owner.retire_root_with_terminal_rescan(2);
+  assert!(
+    h.owner.needs_rescan.contains_key(&orphan),
+    "terminal retirement parked the orphan's owed terminal Rescan"
+  );
+  assert!(
+    !h.owner.subsumer.view().is_watched(&key("/b")),
+    "the orphan's root is retired from the subsumer"
+  );
+
+  // The orphan's WatchGrant now fires: DropOrphan → purge_sub_local. The subsumer no longer records
+  // the orphan, so plan_unwatch reports Unknown — but the owner-local cleanup MUST still have run.
+  let outcome = h.owner.purge_sub_local(orphan);
+  assert!(
+    outcome.is_err_and(|err| err.is_unknown_subscription()),
+    "a terminal-retired sub is Unknown to the subsumer"
+  );
+
+  // R20-F2: the orphan's parked Rescan is GONE (no false debt) …
+  assert!(
+    !h.owner.needs_rescan.contains_key(&orphan),
+    "the orphan's parked Rescan was cleared despite the subsumer reporting Unknown (no false debt)"
+  );
+  // … while the LIVE sibling's parked Rescan (a DIFFERENT sub) is left untouched.
+  assert!(
+    h.owner.needs_rescan.contains_key(&sibling),
+    "the live sibling's owed parked Rescan survived the orphan purge untouched"
+  );
+}
+
+/// R20-F1 ordering safety (design driver-golden doc; `error::WatchError` — the umbrella NEVER
+/// surfaces `Overlaps`): a re-`watch` of a just-orphaned key **while its deferred disarm is still
+/// pending** must still succeed. A [`DropOrphan`](super::Command::DropOrphan) removes the emptied
+/// root from the subsumer immediately but DEFERS its kernel disarm, so the re-`watch` is classified
+/// `Disjoint` (the subsumer no longer records it) yet the source still has the old root armed —
+/// which the source rejects as [`Overlaps`](tributary_fs::WatchRootError::Overlaps). The arm choke
+/// point flushes the pending disarm and retries, so the re-`watch` arms a FRESH generation-unique
+/// handle and the umbrella upholds its no-`Overlaps` contract; the stale pending disarm of the OLD
+/// handle never touches the new root.
+///
+/// Fail-on-old: without the arm choke point's overlap-flush, the retry never happens and the
+/// re-`watch` surfaces `WatchError::Fs(Overlaps)`.
+#[tokio::test]
+async fn rewatch_of_a_just_orphaned_key_flushes_the_pending_disarm_and_never_surfaces_overlaps() {
+  let mut h = Harness::new();
+
+  // Watch /a → its root's only subscriber (handle 1), armed at the source.
+  let orphan = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  // Simulate the NORMAL-loop DropOrphan handling: purge the orphan's owner-local state (removing /a
+  // from the subsumer) and DEFER its emptied root's disarm — the source still has handle 1 armed.
+  let outcome = h.owner.purge_sub_local(orphan).expect("orphan purged");
+  let crate::subsume::UnwatchOutcome::RootEmptied { fs_root } = outcome else {
+    panic!("the orphan was its root's last subscriber");
+  };
+  h.owner.pending_disarms.push_back(fs_root);
+  assert!(
+    h.owner.source.root_key(1).is_some(),
+    "the orphaned root's kernel watch is still armed (its disarm was deferred)"
+  );
+
+  // Re-watch /a while handle 1's disarm is still pending: `Disjoint` (subsumer no longer records it)
+  // → arm overlaps the still-armed handle 1 → the choke point flushes the pending disarm and retries.
+  let rewatched = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("the re-watch flushes the pending disarm and never surfaces Overlaps");
+  assert_ne!(
+    orphan, rewatched,
+    "the re-watch minted a fresh subscription"
+  );
+
+  // The pending disarm was flushed (handle 1 released), then a FRESH root (handle 2) armed for /a.
+  assert!(
+    h.owner.pending_disarms.is_empty(),
+    "the overlap-flush drained the pending disarm"
+  );
+  assert!(
+    h.owner.source.calls().contains(&Call::Disarm(1)),
+    "the stale orphaned root was disarmed before the retry"
+  );
+  assert_eq!(
+    h.owner.source.root_key(1),
+    None,
+    "the OLD handle is released — a stale pending disarm of it cannot touch the new root"
+  );
+  assert!(
+    h.owner.subsumer.view().is_watched(&key("/a")),
+    "the re-watch is live and covered on a fresh root"
   );
 }
