@@ -386,6 +386,61 @@ fn rescan_only_flushes_its_own_subscription() {
   assert_eq!(out2[0].subscription(), s2);
 }
 
+/// Codex R11 F2 regression (forward-compat, design §6): the coalescer coalesces ONLY the known
+/// lifecycle kinds (`Created` / `Modified` / `Removed`). `tributary_fs::EventKind` is
+/// `#[non_exhaustive]`; a non-lifecycle kind must NOT be folded into the collapse table (whose
+/// default arm would relabel or drop it), but flushed-and-emitted immediately — the same path as
+/// `Moved`/`Rescan` — so it is delivered in-order and never collapsed.
+///
+/// LIMITATION: a truly-unknown future `EventKind` cannot be constructed from within `tributaries`
+/// — the enum's non-exhaustive fallthrough has no reachable variant beyond the five known ones,
+/// and `Moved`'s `MovedEvent` payload has no public constructor (so an unknown-kind event with
+/// `move_from() == None`, the one input that would reach the new `else` arm, is not buildable
+/// here). This test therefore exercises the observable classification the arm generalizes, using a
+/// `Moved` (the only constructible non-lifecycle kind) as the representative: a buffered lifecycle
+/// entry is flushed AHEAD of the immediately-emitted non-lifecycle event, and neither is collapsed
+/// — the exact flush-and-emit machinery the new `else` arm now routes future kinds through. The
+/// unknown-kind arm itself is verified by inspection (it mirrors this `Moved`/`Rescan` path).
+#[test]
+fn a_non_lifecycle_kind_flushes_and_emits_never_coalesced() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  // A known lifecycle Modified enters `coalesce` — buffered, nothing ready before its settle.
+  c.admit(modified(s, "/a/f", 1), clk.at(0));
+  assert!(
+    drain(&mut c, clk.at(0)).is_empty(),
+    "a lifecycle kind is buffered (enters coalesce), not immediately emitted"
+  );
+
+  // A non-lifecycle kind for the same subscription is NOT coalesced onto the buffered entry: it
+  // flushes the subscription's buffer and emits immediately, both undelayed and in-order.
+  c.admit(moved(s, "/a/dst", "/a/src", 2), clk.at(1));
+  let out = drain(&mut c, clk.at(1));
+  assert_eq!(
+    out.len(),
+    2,
+    "the buffered lifecycle entry and the non-lifecycle kind BOTH emit — neither coalesced away"
+  );
+  assert!(
+    out[0].kind().is_modified() && !is_moved(&out[0]),
+    "the buffered lifecycle Modified is flushed FIRST (older-epoch, ahead of the immediate emit)"
+  );
+  assert!(
+    is_moved(&out[1]),
+    "the non-lifecycle kind emits immediately AFTER the flushed entry"
+  );
+  assert!(
+    out[0].epoch() < out[1].epoch(),
+    "epochs stay monotone: the flushed buffered entry precedes the immediate emit (design §8)"
+  );
+  assert!(
+    c.next_deadline().is_none(),
+    "nothing lingers buffered — the non-lifecycle kind was not held for a settle window"
+  );
+}
+
 #[test]
 fn max_hold_forces_emission() {
   let clk = Clock::new();
