@@ -313,6 +313,54 @@ async fn overlapping_watch_issues_one_arm() {
   );
 }
 
+/// Codex R7 F2 regression (design §3, a handle is a per-watcher capability): every
+/// [`Subscription`] is branded with its owning watcher's `InstanceId`, so a handle minted by one
+/// watcher can never `unwatch` another's subscription — even when their `ScopeId`s collide (each
+/// owner mints scope ids independently from 1). The brand is checked BEFORE any state is mutated.
+///
+/// Fail-on-old: without the instance brand the two watchers' first subscriptions are equal bare
+/// `ScopeId(1)`s, so `b.unwatch(a_sub)` matches B's own live subscription by scope id and wrongly
+/// retires it.
+#[tokio::test]
+async fn a_foreign_subscription_cannot_unwatch_a_local_one_with_a_colliding_scope_id() {
+  let mut a = Harness::new();
+  let mut b = Harness::new();
+
+  // Each owner mints scope ids from 1, so these two handles share the SAME `ScopeId` but carry
+  // DIFFERENT per-watcher instance brands.
+  let a_sub = a.watch("/x", Interest::all()).await.expect("watch on A");
+  let b_sub = b.watch("/x", Interest::all()).await.expect("watch on B");
+  assert_eq!(
+    a_sub.id(),
+    b_sub.id(),
+    "the two owners minted a colliding ScopeId"
+  );
+  assert_ne!(
+    a_sub, b_sub,
+    "…but the per-watcher instance brand makes them distinct handles"
+  );
+
+  // B rejects A's foreign handle BEFORE touching any state, even though its ScopeId collides with
+  // B's live subscription.
+  let err = b
+    .unwatch(a_sub)
+    .await
+    .expect_err("a foreign subscription is rejected");
+  assert!(
+    err.is_unknown_subscription(),
+    "a foreign handle is Unknown, not applied to B's colliding subscription"
+  );
+
+  // B's own subscription stayed live throughout: still watched, and still unwatchable itself.
+  assert!(
+    b.owner.subsumer.view().is_watched(&key("/x")),
+    "B's subscription stays live after rejecting the foreign unwatch"
+  );
+  b.unwatch(b_sub)
+    .await
+    .expect("B's own subscription is still live and unwatchable");
+}
+
 /// The widen ordering (design §4), forced by the source's disjoint-root contract: the
 /// wider root cannot be armed while a subsumed one is live, so the widen must **disarm the
 /// subsumed roots BEFORE arming the wider root**. The brief coverage gap is closed by the

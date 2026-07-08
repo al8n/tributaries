@@ -42,7 +42,7 @@ use crate::{
   coalesce::Coalescer,
   error::{BuildError, CloseError, UnwatchError, WatchError},
   event::Event,
-  filter::Filter,
+  filter::{Filter, FilterInput},
   options::TributariesOptions,
   route::RoutableEvent,
   source::{FsSource, Source, SourceEvent},
@@ -75,7 +75,7 @@ enum Command<C, V> {
     /// The per-subscription fan-out interest gate (design §5).
     interest: Interest,
     /// The per-subscription admission [`Filter`] (design §7).
-    filter: Filter<C, V>,
+    filter: Filter<C>,
     /// The reply channel: the minted [`Subscription`], or the arm error.
     reply: futures_channel::oneshot::Sender<Result<Subscription, WatchError>>,
   },
@@ -270,7 +270,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
     key: Vec<C>,
     value: V,
     interest: Interest,
-    filter: Filter<C, V>,
+    filter: Filter<C>,
   ) -> Result<Subscription, WatchError> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self
@@ -395,7 +395,7 @@ where
   source: S,
   subsumer: Subsumer<C, V, S::Handle>,
   epochs: EpochLedger,
-  filters: HashMap<Subscription, Filter<C, V>>,
+  filters: HashMap<Subscription, Filter<C>>,
   /// The per-subscription overflow dirty-set (design backpressure doc): a subscription
   /// whose delivery hit a full event channel parks a durable **dominating**
   /// [`Rescan`](tributary_fs::EventKind::Rescan) here — a [`ParkedRescan`] holding its covered
@@ -560,7 +560,7 @@ where
     key: Vec<C>,
     value: V,
     interest: Interest,
-    filter: Filter<C, V>,
+    filter: Filter<C>,
     reply: futures_channel::oneshot::Sender<Result<Subscription, WatchError>>,
   ) {
     match self.reconcile_watch(&key, value, interest, filter).await {
@@ -600,7 +600,7 @@ where
     key: &[C],
     value: V,
     interest: Interest,
-    filter: Filter<C, V>,
+    filter: Filter<C>,
   ) -> Result<Subscription, WatchError> {
     let outcome = self.subsumer.plan_watch(key, value, interest);
     match &outcome {
@@ -718,6 +718,14 @@ where
   /// per-subscription state, releasing the source watch once it was the root's last
   /// subscriber.
   async fn reconcile_unwatch(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
+    // Reject a foreign/forged handle BEFORE mutating any state: a `Subscription` minted by a
+    // DIFFERENT watcher instance carries a different brand even when its `ScopeId` collides with a
+    // live local subscription's (every owner mints scope ids from 1). Without this brand check the
+    // colliding foreign handle would `plan_unwatch` — and retire — THIS owner's unrelated
+    // subscription. It is not one of ours, so it is Unknown.
+    if sub.instance() != self.subsumer.instance() {
+      return Err(UnwatchError::UnknownSubscription);
+    }
     let Some(outcome) = self.subsumer.plan_unwatch(sub) else {
       return Err(UnwatchError::UnknownSubscription);
     };
@@ -1043,11 +1051,23 @@ where
       // if the subscription's **interest** admits its (projected) kind AND its **filter**
       // admits it. A subscription with no recorded interest/filter (raced concurrent drop)
       // admits nothing. A `Rescan` never reaches here (fan_out bypasses both gates).
+      //
+      // The filter sees a pre-delivery [`FilterInput`] (key/kind/location), NOT this projected
+      // `Event` — whose epoch is still the raw source stamp and whose value is not yet baked
+      // here (both are set by `stamp_into` below, only for an admitted delivery). Handing the
+      // filter the raw event would let it mis-read a provisional epoch/absent value (Codex R7);
+      // the pre-delivery view makes that impossible while exposing the correct key/kind/path.
       |sub, event: &Event<C, V>| {
         subsumer
           .subscription_interest(sub)
           .is_some_and(|interest| interest_admits(interest, event.kind()))
-          && filters.get(&sub).is_some_and(|filter| filter.admits(event))
+          && filters.get(&sub).is_some_and(|filter| {
+            filter.admits(&FilterInput::new(
+              event.key(),
+              event.kind(),
+              event.location(),
+            ))
+          })
       },
       |event: &Event<C, V>| event.subscription(),
       |mut event, stamp| {

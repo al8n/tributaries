@@ -125,7 +125,7 @@ impl Fixture {
     let mut subs = Vec::new();
     let mut keys = HashMap::new();
     for &(id, path) in subscribers {
-      let sub = Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")));
+      let sub = Subscription::for_test(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")));
       subs.push(sub);
       keys.insert(sub, key(path));
     }
@@ -136,7 +136,7 @@ impl Fixture {
   }
 
   fn sub(&self, id: u64) -> Subscription {
-    Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
+    Subscription::for_test(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
   }
 
   /// The full deliveries `event` fans out to (subscriber + projection), every

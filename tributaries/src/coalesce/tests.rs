@@ -16,7 +16,7 @@ type Ev = Event<OsString, ()>;
 
 /// A subscription with the given non-zero id.
 fn sub(id: u64) -> Subscription {
-  Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
+  Subscription::for_test(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
 }
 
 /// A path's `OsString` components — the located-key form the fs source keys on.

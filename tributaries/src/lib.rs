@@ -114,10 +114,10 @@ mod view;
 pub use driver::Tributaries;
 pub use error::{BuildError, CloseError, UnwatchError, WatchError};
 pub use event::Event;
-pub use filter::Filter;
+pub use filter::{Filter, FilterInput};
 pub use options::{DebounceConfig, TributariesOptions};
 pub use source::{Armed, FsSource, Source, SourceEvent};
-pub use subscription::Subscription;
+pub use subscription::{InstanceId, Subscription};
 pub use view::{Snapshot, WatchView};
 
 #[cfg(feature = "tokio")]
