@@ -801,7 +801,7 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
 /// the debug_assert is the debug/test-only tripwire for a violating one. Hence `#[should_panic]` —
 /// and `ignore`d in release builds, where `debug_assert!` is compiled out and nothing panics.
 #[tokio::test]
-#[should_panic(expected = "already recorded for a different root")]
+#[should_panic(expected = "already-recorded handle")]
 #[cfg_attr(
   not(debug_assertions),
   ignore = "the debug_assert tripwire is compiled out in release builds"
@@ -818,6 +818,37 @@ async fn failed_widen_restore_reusing_a_recorded_sibling_handle_trips_the_tripwi
   h.owner.source.fail_next_arm();
   h.owner.source.reuse_next_arm_handle(2);
   // Panics inside the restore, before the watch returns — the source violated the handle contract.
+  let _ = h.watch("/a", Interest::all()).await;
+}
+
+/// Codex R16 regression (generation-unique contract, the SAME-key case the R15 tripwire wrongly
+/// exempted): the failed-widen restore re-arm must mint a FRESH handle even for the same key —
+/// reusing `old` is a `Source::Handle` violation, because a stale pre-disarm event still carrying
+/// `old` would then route through the re-armed root and be stamped in the new generation past the
+/// restore Rescan (a handle-ABA sibling). The R15 tripwire had `|| new_handle == old`, masking
+/// exactly this; R16 removed the exemption so a same-`old` re-arm trips the rebind debug_assert too.
+///
+/// Fail-on-old: with the `|| new_handle == old` exemption present, reusing `/a/b`'s own handle 1 is
+/// masked — no panic — so this `#[should_panic]` FAILS. Removing the exemption trips the assert
+/// (handle 1 is still recorded until the rebind).
+#[tokio::test]
+#[should_panic(expected = "already-recorded handle")]
+#[cfg_attr(
+  not(debug_assertions),
+  ignore = "the debug_assert tripwire is compiled out in release builds"
+)]
+async fn failed_widen_restore_reusing_old_handle_trips_the_tripwire() {
+  let mut h = Harness::new();
+
+  let _sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let _sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+
+  // The wider /a arm fails; the first restore re-arm (/a/b) REUSES handle 1 — /a/b's OWN old handle
+  // (same-key reuse), still recorded until the rebind. Generation-unique forbids reissuing `old`, so
+  // the rebind choke point's debug_assert panics (R16) rather than let a stale `old` event route
+  // through the re-armed root.
+  h.owner.source.fail_next_arm();
+  h.owner.source.reuse_next_arm_handle(1);
   let _ = h.watch("/a", Interest::all()).await;
 }
 
