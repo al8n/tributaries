@@ -1058,12 +1058,17 @@ where
           // is retired: it was incomplete AND, when the alias was an unrelated *live* root, its
           // `disarm` released that root's real source watch while its record/coverage stayed live,
           // silently missing future changes (Codex R15-F2). A `debug_assert` is the tripwire for a
-          // contract-violating source instead — `new_handle == old` is exempt (rebinding a value
-          // onto itself corrupts nothing), so only aliasing a *different* recorded root trips it.
+          // contract-violating source instead. The generation-unique contract forbids reusing a
+          // handle even for a *same-key* re-arm (Codex R16): if a stale pre-disarm event still
+          // carrying `old` is queued, re-arming `old` would let it route through the re-armed root
+          // and be stamped in the new generation past the restore Rescan — so `old` must fall to the
+          // dead-root drain path, and `new_handle == old` is NOT exempt. `old` is still recorded here
+          // (the `rebind_root` below moves it), so any reused handle — sibling or `old` — trips it.
           debug_assert!(
-            self.subsumer.entry(new_handle).is_none() || new_handle == old,
-            "Source::arm returned a handle already recorded for a different root — a \
-             generation-unique Source::Handle contract violation (see Source::Handle)"
+            self.subsumer.entry(new_handle).is_none(),
+            "Source::arm returned an already-recorded handle — a generation-unique \
+             Source::Handle contract violation (every arm must mint a fresh generation, even for a \
+             same-key re-arm; see Source::Handle)"
           );
           // Re-armed at the same coordinate with a fresh handle: rebind onto it and re-point each
           // subscriber (raw epochs restarted at zero) with a dominating Rescan.
