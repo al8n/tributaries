@@ -58,13 +58,15 @@ pub struct Event<C, V> {
   /// The underlying kernel change id, for an fs-source event; `None` for one this
   /// crate synthesized (a widen `Rescan`, a coalesced-churn `Modified`).
   change_id: Option<ChangeId>,
-  /// The caller value attributed to this delivery (design §3). **Not populated in
-  /// 0.1.0**: every constructor sets it `None`. Attribution instead runs through the
-  /// wait-free value plane — a caller resolves a delivered event's [`key`](Event::key)
-  /// via [`WatchView::resolve`](crate::WatchView::resolve) /
-  /// [`covering`](crate::WatchView::covering), which holds the authoritative per-root
-  /// value, so `V` is never cloned onto each delivery. Per-event value wiring is
-  /// reserved for a future version.
+  /// The caller value attributed to this delivery (design §3): the value of the
+  /// [`subscription`](Self::subscription) this event was routed to, **baked on at emit
+  /// time** by the driver (exposed by [`value`](Self::value)). Because it is captured
+  /// when the event is minted — while the owning subscription is still live — it is
+  /// **stable across teardown**: a consumer draining a queued event after the owner has
+  /// quiesced (and the [`WatchView`](crate::WatchView) has gone empty) still attributes
+  /// it from here, with no live view lookup. `None` only for an event with no live
+  /// owning subscription (a pure-test fixture, or a delivery whose subscription raced
+  /// retirement).
   value: Option<V>,
 }
 
@@ -224,6 +226,16 @@ impl<C, V> Event<C, V> {
     self.epoch = epoch;
   }
 
+  /// Bakes the owning subscription's caller value onto this delivery (design §3) — the
+  /// per-event attribution [`value`](Self::value) returns. The driver sets it at emit
+  /// time from the live subscription this event was routed to, so attribution survives
+  /// the subscription/owner teardown that empties the [`WatchView`](crate::WatchView)
+  /// (its `resolve` would then answer `None`, but the baked value persists on the event).
+  #[inline]
+  pub(crate) fn set_value(&mut self, value: Option<V>) {
+    self.value = value;
+  }
+
   /// The caller subscription this event was routed to.
   #[inline]
   pub const fn subscription(&self) -> Subscription {
@@ -275,14 +287,23 @@ impl<C, V> Event<C, V> {
     self.change_id
   }
 
-  /// The caller value attributed to this delivery (design §3), if any.
+  /// The caller value attributed to this delivery (design §3): the value of the
+  /// [`subscription`](Self::subscription) this event was routed to, baked on by the
+  /// driver at emit time.
   ///
-  /// **Always `None` in 0.1.0** — the per-event value is not populated in this version.
-  /// Attribute a delivered event to its owning value by resolving its
-  /// [`key`](Self::key) through the wait-free value plane
-  /// ([`WatchView::resolve`](crate::WatchView::resolve) /
-  /// [`covering`](crate::WatchView::covering)), which holds the authoritative per-root
-  /// value. Per-event value wiring is reserved for a future version.
+  /// This is the **per-event attribution**, and it is **stable across teardown**: the
+  /// value is captured when the event is minted (while its owning subscription is live),
+  /// so a consumer draining a queued event *after* the owner has torn down — when the
+  /// [`WatchView`](crate::WatchView) has been emptied and
+  /// [`resolve`](crate::WatchView::resolve) would answer `None` — still attributes it
+  /// from here. Prefer this to attribute a delivered event; use
+  /// [`WatchView::resolve`](crate::WatchView::resolve) /
+  /// [`covering`](crate::WatchView::covering) for the *live* "is key `k` watched, and by
+  /// whom" query (membership + pre-watch dedup), which reflects the current watch-set
+  /// rather than the moment a given event was emitted.
+  ///
+  /// `None` only when the event has no live owning subscription (a pure-test fixture, or
+  /// a delivery whose subscription raced retirement).
   #[inline]
   pub const fn value(&self) -> Option<&V> {
     self.value.as_ref()

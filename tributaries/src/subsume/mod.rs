@@ -137,6 +137,19 @@ impl<V> CoverEntry<V> {
       .expect("a present cover entry holds at least one live subscription")
       .1
   }
+
+  /// This **exact** subscription's own caller value, if `sub` is one of the live subscriptions at
+  /// this key. This is the per-event attribution source (design §3), distinct from
+  /// [`value`](Self::value) (the longest/most-recent owner the wait-free view query returns): a
+  /// delivered event is attributed to the *specific* subscription it was routed to, whose own
+  /// value the driver bakes onto it. `None` if `sub` is not (or no longer) at this key.
+  pub(crate) fn value_of(&self, sub: Subscription) -> Option<&V> {
+    self
+      .subs
+      .iter()
+      .find(|(s, _)| *s == sub)
+      .map(|(_, value)| value)
+  }
 }
 
 /// The shared, wait-free-readable publication of the authoritative watch-set: an
@@ -712,6 +725,22 @@ where
   /// [`Interest::all`], so this narrows *delivery*, never the kernel watch.
   pub(crate) fn subscription_interest(&self, sub: Subscription) -> Option<Interest> {
     self.subs.get(&sub).map(|record| record.interest)
+  }
+
+  /// The caller value the live subscription `sub` was registered with, read from the
+  /// live-subscription coverage plane (design §3/§5) — the per-event attribution the driver
+  /// bakes onto every delivery so it survives teardown (once the owner quiesces and the
+  /// [`WatchView`] is emptied, `resolve` can no longer attribute a still-queued event). `None`
+  /// for an unknown or already-retired subscription.
+  ///
+  /// Unlike [`covering`](crate::WatchView::covering) — the *longest* live subscription covering a
+  /// key, the view's live query — this is the value of the **exact** `sub` the delivery was
+  /// routed to: the specific owner of a per-subscription `Rescan`, and the covering subscription a
+  /// delta fanned out to. It reads the [`CoverEntry`] at `sub`'s own key (kept in lockstep with
+  /// the side table), so it is `Some` for the whole lifetime the driver needs to bake or capture.
+  pub(crate) fn subscription_value(&self, sub: Subscription) -> Option<&V> {
+    let key = self.subs.get(&sub)?.key.as_slice();
+    self.covers.get(key)?.value_of(sub)
   }
 
   /// Whether committing a fresh/widened root at `fs_root_key` would keep the same

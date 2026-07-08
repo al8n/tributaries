@@ -153,8 +153,15 @@ where
       .map(|entry| Snapshot::new(entry.value().clone()))
   }
 
-  /// Attribution alias for [`covering`](Self::covering): the caller value owning
-  /// `key`, for resolving an observed key back to its watch (design §5).
+  /// Attribution alias for [`covering`](Self::covering): the caller value **currently** owning
+  /// `key`, for resolving an observed key back to its live watch (design §5) — the *live* "is key
+  /// `k` watched, and by whom" query.
+  ///
+  /// This reflects the **current** watch-set, so it is the right call for pre-watch dedup and
+  /// membership. To attribute a **delivered event**, prefer its baked
+  /// [`Event::value`](crate::Event::value): that value is captured at emit time and stays valid
+  /// even after teardown empties this view (when `resolve` would answer `None` for a still-queued
+  /// event — design §3).
   #[inline]
   #[must_use]
   pub fn resolve(&self, key: &[C]) -> Option<Snapshot<V>>

@@ -848,7 +848,7 @@ async fn stalled_consumer_parks_dominating_rescan_and_resumes() {
   // growth).
   h.owner.try_emit(modified_event(sub, "/a/f2", 2));
   assert_eq!(
-    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    h.owner.needs_rescan.get(&sub).map(|p| p.epoch),
     Some(Epoch::new(3)),
     "overflow parked a Rescan minted one past the high-water (strictly dominating)"
   );
@@ -862,7 +862,7 @@ async fn stalled_consumer_parks_dominating_rescan_and_resumes() {
     "repeated overflow collapses to one parked Rescan"
   );
   assert_eq!(
-    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    h.owner.needs_rescan.get(&sub).map(|p| p.epoch),
     Some(Epoch::new(3)),
     "the parked epoch is idempotent under repeated overflow"
   );
@@ -979,7 +979,7 @@ async fn root_death_while_channel_full_keeps_owed_rescan() {
   h.owner.source.kill_root(1);
   h.owner.fan_out_and_push(&rescan_event(1, "/a"));
   assert_eq!(
-    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    h.owner.needs_rescan.get(&sub).map(|p| p.epoch),
     Some(Epoch::new(3)),
     "the terminal Rescan parked (channel full), minted one past the high-water"
   );
@@ -1068,7 +1068,7 @@ async fn source_drain_delivers_owed_parked_rescan_no_silent_loss() {
   h.owner.try_emit(modified_event(sub, "/a/f0", 0));
   h.owner.try_emit(modified_event(sub, "/a/f1", 1));
   assert_eq!(
-    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    h.owner.needs_rescan.get(&sub).map(|p| p.epoch),
     Some(Epoch::new(2)),
     "overflow parked a dominating Rescan while the channel is full"
   );
@@ -1355,7 +1355,7 @@ async fn source_drain_orders_parked_rescan_before_its_buffered_tail() {
   h.owner.try_emit(modified_event(sub, "/a/f0", 0));
   h.owner.try_emit(modified_event(sub, "/a/f1", 1));
   assert_eq!(
-    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    h.owner.needs_rescan.get(&sub).map(|p| p.epoch),
     Some(Epoch::new(2)),
     "overflow parked a dominating Rescan while the channel is full"
   );
@@ -1549,5 +1549,183 @@ async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs
   assert!(
     view.covering(&watched).is_none(),
     "…and attribution resolves to nothing (the owner + source are gone)"
+  );
+}
+
+/// A `u64`-valued [`Owner`] over a [`FakeSource`], with its drainable event stream — the
+/// value-baking regression rig. `V = u64` (not [`Harness`]'s `()`) so attribution values are
+/// distinguishable; the tests drive the owner's reconcile/emit primitives directly, then assert
+/// the baked [`Event::value`] on drained events.
+struct OwnerU64 {
+  owner: Owner<OsString, u64, TokioRuntime, FakeSource>,
+  events: async_channel::Receiver<Event<OsString, u64>>,
+  /// Kept alive so the owner's command receiver never observes a closed channel.
+  _commands: async_channel::Sender<super::Command<OsString, u64>>,
+}
+
+impl OwnerU64 {
+  /// Builds the rig with a bounded event channel of `capacity` and an optional coalescer.
+  fn new(capacity: usize, coalescer: Option<Coalescer<OsString, u64>>) -> Self {
+    let (event_tx, event_rx) = async_channel::bounded(capacity);
+    let (command_tx, command_rx) = async_channel::unbounded();
+    let owner = Owner {
+      source: FakeSource::new(),
+      subsumer: Subsumer::new(),
+      epochs: EpochLedger::new(),
+      filters: HashMap::new(),
+      needs_rescan: BTreeMap::new(),
+      coalescer,
+      commands: command_rx,
+      events: event_tx,
+      _rt: PhantomData::<TokioRuntime>,
+    };
+    Self {
+      owner,
+      events: event_rx,
+      _commands: command_tx,
+    }
+  }
+
+  /// Drains every event currently queued on the owner's stream.
+  fn drain(&self) -> Vec<Event<OsString, u64>> {
+    let mut out = Vec::new();
+    while let Ok(event) = self.events.try_recv() {
+      out.push(event);
+    }
+    out
+  }
+}
+
+/// Value baking, ordinary path (design §3): every delivered delta carries its owning
+/// subscription's value, baked at emit time. Fail-on-old: with `Event::value` left `None`, the
+/// `Some(42)` assertion FAILS.
+#[tokio::test]
+async fn delivered_delta_carries_owning_subscription_value() {
+  let mut rig = OwnerU64::new(8, None);
+  let sub = rig
+    .owner
+    .reconcile_watch(&key("/a"), 42, Interest::all(), Filter::all())
+    .await
+    .expect("watch /a");
+
+  // A raw change under /a fans out to the covering sub; the delivery is baked with the sub's value.
+  rig.owner.fan_out_and_push(&source_modified(1, "/a/f", 0));
+
+  let drained = rig.drain();
+  assert_eq!(drained.len(), 1, "one delivery for the single covering sub");
+  assert_eq!(
+    drained[0].subscription(),
+    sub,
+    "…retagged with its subscription"
+  );
+  assert_eq!(
+    drained[0].value().copied(),
+    Some(42),
+    "a normal delivered delta carries its owning subscription's value (baked at emit time)"
+  );
+}
+
+/// R4 regression (design §3, event attribution survives teardown): a source-drain leaves a queued
+/// coalescer **tail delta** (from one live sub) AND an **owed parked Rescan** (from another sub
+/// whose root died). The owner tears down — publishing the EMPTY read plane (R3-F1) — and only
+/// THEN does the consumer drain those queued events. Each must be attributable via its baked
+/// [`Event::value`], NOT via the emptied [`WatchView`] (whose `resolve` now answers `None`).
+///
+/// The terminal (retire) Rescan is the sharp case: its owning sub's subsumer state is force-removed
+/// at retire, so the value CANNOT be re-resolved at flush time — it is captured at park time while
+/// the sub is live. Fail-on-old: with `Event::value` left `None`, the `Some(7)`/`Some(9)`
+/// assertions FAIL, and `resolve` returns `None` post-teardown, so the old resolve-based
+/// attribution recovers nothing.
+#[tokio::test]
+async fn baked_value_attributes_queued_events_after_teardown_empties_view() {
+  // Windows long enough that the tail delta never settles on its own — it survives as a coalescer
+  // tail the teardown drain flushes.
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200));
+  let mut rig = OwnerU64::new(8, Some(Coalescer::new(cfg)));
+
+  let a = rig
+    .owner
+    .reconcile_watch(&key("/a"), 7, Interest::all(), Filter::all())
+    .await
+    .expect("watch /a"); // root handle 1
+  let b = rig
+    .owner
+    .reconcile_watch(&key("/b"), 9, Interest::all(), Filter::all())
+    .await
+    .expect("watch /b"); // root handle 2
+
+  // A view clone taken WHILE both are live — the handle the R3-F1/R4 story is about.
+  let view = rig.owner.subsumer.view();
+  assert_eq!(
+    view.resolve(&key("/b")).map(|s| *s.get()),
+    Some(9),
+    "the live view attributes /b while its sub is live"
+  );
+
+  // subB buffers a coalescer tail delta (baked value 9 at fan-out; not due under the long window).
+  rig.owner.fan_out_and_push(&source_modified(2, "/b/g0", 5));
+
+  // subA's root dies: the terminal Rescan is parked with subA's value CAPTURED AT PARK TIME, then
+  // its subsumer state is force-removed — after which the value can no longer be resolved.
+  rig.owner.retire_root_with_terminal_rescan(1);
+  assert!(
+    rig.owner.needs_rescan.contains_key(&a),
+    "subA owes a parked terminal Rescan"
+  );
+  assert_eq!(
+    rig.owner.subsumer.subscription_value(a),
+    None,
+    "subA's subsumer state is gone post-retire — its value HAD to be captured at park time"
+  );
+
+  // Teardown drain: deliver the owed Rescan and the coalescer tail into the channel.
+  rig.owner.drain_owed_once();
+  assert_eq!(
+    view.resolve(&key("/b")).map(|s| *s.get()),
+    Some(9),
+    "subB still resolves through the live view just before the empty publish"
+  );
+
+  // Publish the EMPTY read plane exactly as `run()` does at teardown (R3-F1): the view now reports
+  // nothing watched, so `resolve` can no longer attribute the still-queued events.
+  rig.owner.subsumer.publish_empty();
+  assert!(
+    view.resolve(&key("/b")).is_none(),
+    "teardown emptied the view — resolve now attributes NOTHING for the queued tail delta"
+  );
+  assert!(
+    view.resolve(&key("/a")).is_none(),
+    "…and nothing for the retired root"
+  );
+
+  // The consumer drains AFTER teardown and attributes each event via its BAKED value.
+  let drained = rig.drain();
+
+  let rescan = drained
+    .iter()
+    .find(|e| e.subscription() == a && e.is_rescan())
+    .expect("subA's owed terminal Rescan was delivered");
+  assert_eq!(
+    rescan.value().copied(),
+    Some(7),
+    "the owed terminal Rescan carries subA's value baked at park time — attribution survives \
+     teardown (the emptied view resolves to None)"
+  );
+
+  let tail = drained
+    .iter()
+    .find(|e| e.subscription() == b && !e.is_rescan())
+    .expect("subB's coalescer tail delta was delivered");
+  assert_eq!(
+    tail.value().copied(),
+    Some(9),
+    "the coalesced tail delta preserved subB's baked value through buffering"
+  );
+
+  assert!(
+    drained.iter().all(|e| e.value().is_some()),
+    "every delivered event carries a baked owning-subscription value (none slips through as None)"
   );
 }

@@ -398,13 +398,15 @@ where
   filters: HashMap<Subscription, Filter<C, V>>,
   /// The per-subscription overflow dirty-set (design backpressure doc): a subscription
   /// whose delivery hit a full event channel parks a durable **dominating**
-  /// [`Rescan`](tributary_fs::EventKind::Rescan) here — its covered key plus a
-  /// strictly-dominating epoch. A [`BTreeMap`] for a deterministic drain order.
+  /// [`Rescan`](tributary_fs::EventKind::Rescan) here — a [`ParkedRescan`] holding its covered
+  /// key, a strictly-dominating epoch, and the owning subscription's **baked value** (captured
+  /// while the sub is live, so the flushed Rescan stays attributable after retirement — R4). A
+  /// [`BTreeMap`] for a deterministic drain order.
   /// [`flush_pending_rescans`](Self::flush_pending_rescans) re-offers each every loop tick
   /// until `try_send` accepts it, and [`try_emit`](Self::try_emit) suppresses further
   /// ordinary deliveries to a parked subscription (they are dominated by its `Rescan`), so
   /// a shed can never be lost to a full channel (no-silent-loss).
-  needs_rescan: BTreeMap<Subscription, (Vec<C>, Epoch)>,
+  needs_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
   events: async_channel::Sender<Event<C, V>>,
@@ -681,7 +683,12 @@ where
         let mut rescans = Vec::with_capacity(repointed.len());
         for moved in repointed {
           let rescan = self.epochs.repoint(moved);
-          rescans.push(Event::rescan(moved, fs_key.clone(), rescan));
+          let mut event = Event::rescan(moved, fs_key.clone(), rescan);
+          // The specific re-pointed subscription owns this Rescan (its key is invariant under the
+          // widen, so its own value is still recorded); bake it so attribution is the sub's own
+          // value, not the widening root's (design §3).
+          event.set_value(self.subsumer.subscription_value(moved).cloned());
+          rescans.push(event);
         }
         self.push_all(rescans);
         Ok(sub)
@@ -784,7 +791,11 @@ where
           let mut rescans = Vec::with_capacity(subscribers.len());
           for sub in subscribers {
             let rescan = self.epochs.repoint(sub);
-            rescans.push(Event::rescan(sub, root_key.clone(), rescan));
+            let mut event = Event::rescan(sub, root_key.clone(), rescan);
+            // The re-armed root kept each subscriber's key (rebind touches only the handle), so
+            // bake the subscriber's own recorded value onto its restore Rescan (design §3).
+            event.set_value(self.subsumer.subscription_value(sub).cloned());
+            rescans.push(event);
           }
           self.push_all(rescans);
         }
@@ -836,11 +847,15 @@ where
     };
     for &sub in &subscribers {
       // Park a dominating terminal Rescan straight into `needs_rescan` (the root's key + a
-      // strictly-dominating epoch), independent of any later `subscription_key` lookup, so a
-      // full channel cannot drop it. Drop the sub's now-suspect buffered coalescer deltas — the
-      // Rescan dominates and re-enumerates them.
+      // strictly-dominating epoch + the subscriber's baked value), independent of any later
+      // lookup, so a full channel cannot drop it AND the flushed Rescan stays attributable once
+      // `force_remove_root` (below) frees the sub's subsumer state — after which
+      // `subscription_value` is gone, so the value MUST be captured here while the sub is still
+      // live (R4). Drop the sub's now-suspect buffered coalescer deltas — the Rescan dominates
+      // and re-enumerates them.
+      let value = self.subsumer.subscription_value(sub).cloned();
       let epoch = self.epochs.shed_rescan(sub);
-      merge_max(&mut self.needs_rescan, sub, root_key.clone(), epoch);
+      merge_max(&mut self.needs_rescan, sub, root_key.clone(), epoch, value);
       if let Some(coalescer) = self.coalescer.as_mut() {
         coalescer.drop_subscription(sub);
       }
@@ -890,12 +905,13 @@ where
   /// delivery to it found the channel full (design backpressure doc): the per-subscription
   /// overflow shed, mirroring the fs layer's `LagState::Lagged` one level up.
   ///
-  /// Looks up `sub`'s covered key (the subtree the consumer must re-enumerate), mints a
-  /// **non-rebasing** strictly-dominating epoch ([`EpochLedger::shed_rescan`]), and merges
-  /// it into `needs_rescan` keeping the newest/widest key and the max epoch (widen-safe:
-  /// [`merge_max`]). Finally it drops `sub`'s now-suspect buffered coalescer deltas — they
-  /// are dominated by the parked `Rescan`, so emitting them later would deliver a stale
-  /// epoch after it.
+  /// Looks up `sub`'s covered key (the subtree the consumer must re-enumerate) and its recorded
+  /// caller value, mints a **non-rebasing** strictly-dominating epoch
+  /// ([`EpochLedger::shed_rescan`]), and merges them into `needs_rescan` keeping the newest/widest
+  /// key, the max epoch, and the baked value (widen-safe: [`merge_max`]) so the flushed Rescan is
+  /// attributable after teardown (design §3). Finally it drops `sub`'s now-suspect buffered
+  /// coalescer deltas — they are dominated by the parked `Rescan`, so emitting them later would
+  /// deliver a stale epoch after it.
   ///
   /// A subscription with no live key (raced retirement) is not parked — a stale parked
   /// `Rescan` would be co-retired anyway, and there is no subtree left to name.
@@ -903,8 +919,9 @@ where
     let Some(key) = self.subsumer.subscription_key(sub).map(<[C]>::to_vec) else {
       return;
     };
+    let value = self.subsumer.subscription_value(sub).cloned();
     let epoch = self.epochs.shed_rescan(sub);
-    merge_max(&mut self.needs_rescan, sub, key, epoch);
+    merge_max(&mut self.needs_rescan, sub, key, epoch, value);
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.drop_subscription(sub);
     }
@@ -922,8 +939,12 @@ where
   /// [`try_send`]: async_channel::Sender::try_send
   fn flush_pending_rescans(&mut self) {
     let events = &self.events;
-    self.needs_rescan.retain(|&sub, (key, epoch)| {
-      match events.try_send(Event::rescan(sub, key.clone(), *epoch)) {
+    self.needs_rescan.retain(|&sub, parked| {
+      // Mint the owed Rescan carrying the value captured at park time (design §3): the sub or its
+      // root may already be retired, so the value cannot be re-resolved here — it rides the entry.
+      let mut event = Event::rescan(sub, parked.key.clone(), parked.epoch);
+      event.set_value(parked.value.clone());
+      match events.try_send(event) {
         Ok(()) | Err(async_channel::TrySendError::Closed(_)) => false,
         Err(async_channel::TrySendError::Full(_)) => true,
       }
@@ -969,6 +990,12 @@ where
       |event: &Event<C, V>| event.subscription(),
       |mut event, stamp| {
         event.set_epoch(stamp);
+        // Bake the owning subscription's value onto the delivery (design §3): the exact `sub`
+        // this copy was routed to — a covering subscription for an ordinary delta, or the
+        // specific subscriber for a fanned-out `Rescan` — read from the live coverage plane. This
+        // is the per-event attribution, stable across the teardown that empties the `WatchView`;
+        // the coalescer preserves it through buffering.
+        event.set_value(subsumer.subscription_value(event.subscription()).cloned());
         event
       },
     )
@@ -1136,34 +1163,54 @@ where
   }
 }
 
+/// One subscription's parked dominating [`Rescan`](tributary_fs::EventKind::Rescan) (design
+/// backpressure doc): the covered `key` to re-enumerate, a strictly-dominating `epoch`, and the
+/// owning subscription's baked `value` — the latter captured **while the subscription is live**
+/// (at park / retire time), so the Rescan minted from this entry by
+/// [`flush_pending_rescans`](Owner::flush_pending_rescans) stays attributable even after the
+/// subscription/root is retired and the [`WatchView`] is emptied (design §3, R4).
+struct ParkedRescan<C, V> {
+  /// The subscription's covered key — the subtree the consumer re-enumerates.
+  key: Vec<C>,
+  /// The non-rebasing strictly-dominating shed epoch.
+  epoch: Epoch,
+  /// The owning subscription's baked caller value (`None` only when the sub had no live value at
+  /// capture — a raced retirement).
+  value: Option<V>,
+}
+
 /// Merges a parked overflow [`Rescan`](tributary_fs::EventKind::Rescan) into the dirty-set,
-/// keeping the `key` and the max `epoch` (design backpressure doc, checklist #3/#4).
+/// keeping the `key`, the max `epoch`, and the baked `value` (design backpressure doc, checklist
+/// #3/#4; design §3 for the value).
 ///
 /// The load-bearing effect is the epoch `max`: repeated sheds of one subscription collapse to
 /// a single dominating `Rescan` at the greatest
 /// [`shed_rescan`](epoch::EpochLedger::shed_rescan) epoch (that mint is strictly increasing,
 /// so the newest shed already carries it; the `max` states the dominance intent regardless).
-/// The `key` overwrite is a **defensive no-op**: a subscription's own key is invariant across
-/// its lifetime — `commit_watch` repoints only which root a widened sub *rides*, never its own
-/// key — so every shed of a given `sub` carries the same `subscription_key(sub)`. It upholds
-/// the "keys only ever widen" invariant without ever needing to exercise it (a widen's own
-/// synthetic `Rescan` for an already-parked sub is suppressed by `try_emit`, so it never
-/// reaches this merge).
-fn merge_max<C>(
-  needs_rescan: &mut BTreeMap<Subscription, (Vec<C>, Epoch)>,
+/// The `key` **and** `value` overwrites are both **defensive no-ops**: a subscription's own key
+/// and its caller value are each invariant across its lifetime — `commit_watch` repoints only
+/// which root a widened sub *rides*, never its own key, and a value is set once at `watch` and
+/// never re-assigned — so every shed of a given `sub` carries the same
+/// `subscription_key(sub)`/`subscription_value(sub)`. They uphold the "keys only ever widen"
+/// invariant without ever needing to exercise it (a widen's own synthetic `Rescan` for an
+/// already-parked sub is suppressed by `try_emit`, so it never reaches this merge).
+fn merge_max<C, V>(
+  needs_rescan: &mut BTreeMap<Subscription, ParkedRescan<C, V>>,
   sub: Subscription,
   key: Vec<C>,
   epoch: Epoch,
+  value: Option<V>,
 ) {
   use std::collections::btree_map::Entry;
   match needs_rescan.entry(sub) {
     Entry::Occupied(mut occupied) => {
-      let (existing_key, existing_epoch) = occupied.get_mut();
-      *existing_key = key;
-      *existing_epoch = (*existing_epoch).max(epoch);
+      let parked = occupied.get_mut();
+      parked.key = key;
+      parked.epoch = parked.epoch.max(epoch);
+      parked.value = value;
     }
     Entry::Vacant(vacant) => {
-      vacant.insert((key, epoch));
+      vacant.insert(ParkedRescan { key, epoch, value });
     }
   }
 }
