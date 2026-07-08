@@ -79,10 +79,11 @@ struct FakeSource {
   /// rejects it (the fs source's non-existent-path case). A key ABSENT here canonicalizes to
   /// itself (identity — the already-canonical common case).
   canonicalize: HashMap<Vec<OsString>, Option<Vec<OsString>>>,
-  /// Forces the next SUCCESSFUL `arm` to return this handle value instead of a freshly-minted
-  /// one — modelling a source that REUSES a just-disarmed handle value (a [`Source::Handle`]
-  /// no-ABA violation), so a test can drive the failed-widen restore's alias-detection guard.
-  /// One-shot: consumed by the next arm that gets past the fail/overlap checks.
+  /// Forces the next SUCCESSFUL `arm` to return this handle value instead of a freshly-minted one —
+  /// modelling a source that REUSES a still-recorded handle value, a **generation-unique**
+  /// [`Source::Handle`] contract VIOLATION, so a test can drive the failed-widen restore's rebind
+  /// debug_assert tripwire. One-shot: consumed by the next arm that gets past the fail/overlap
+  /// checks.
   reuse_next_handle: Option<u32>,
 }
 
@@ -114,7 +115,7 @@ impl FakeSource {
   }
 
   /// Force the next successful `arm` to return `handle` (a REUSED handle value) — drives the
-  /// failed-widen restore's [`Source::Handle`] no-ABA alias-detection guard.
+  /// failed-widen restore's rebind debug_assert tripwire for a contract-violating source.
   fn reuse_next_arm_handle(&mut self, handle: u32) {
     self.reuse_next_handle = Some(handle);
   }
@@ -204,7 +205,7 @@ impl Source<OsString> for FakeSource {
       return Err(WatchError::Fs(WatchRootError::Overlaps { path, existing }));
     }
     // Mint a fresh monotonic handle, UNLESS a test forced this arm to reuse a specific value (a
-    // `Source::Handle` no-ABA violation) so the failed-widen restore's alias guard can be driven.
+    // `Source::Handle` generation-unique contract violation) to drive the restore's debug_assert.
     let handle = match self.reuse_next_handle.take() {
       Some(forced) => forced,
       None => {
@@ -784,140 +785,40 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
   );
 }
 
-/// Codex R14 F2 regression (design driver-golden doc, invariant I3 — the failed-widen restore's
-/// [`Source::Handle`] no-ABA hardening): when a widen fails and its restore re-arms the disarmed
-/// siblings ONE AT A TIME, a misbehaving source that hands back a re-arm handle value ALIASING a
-/// still-recorded sibling must NOT be allowed to corrupt the reverse index. Here the restore of
-/// `/a/b` (old handle 1) re-arms and the source REUSES handle `2` — still recorded as the
-/// not-yet-restored sibling `/a/c`. A bare `rebind_root(1, 2)` would overwrite `by_handle[2]`,
-/// stranding `/a/c` published-but-unroutable and mis-resolving its subscriber. The alias guard
-/// instead disarms the stray fresh watch and RETIRES `/a/b` (its subscriber owed a dominating
-/// terminal Rescan), leaving `/a/c`'s record intact so it restores cleanly on its own iteration
-/// and keeps routing to its own subscriber.
+/// Codex R15-F2 regression (the failed-widen restore under the **generation-unique**
+/// [`Source::Handle`] contract): a source that re-mints a **still-recorded** sibling's handle value
+/// for a re-arm violates the contract, and the rebind choke point's `debug_assert` must catch it
+/// LOUDLY rather than silently corrupt the reverse index. Here the widen of `/a` fails and the
+/// restore of `/a/b` (old handle 1) re-arms while the source REUSES handle `2` — still recorded as
+/// the not-yet-restored sibling `/a/c`. `rebind_root(1, 2)` would overwrite `by_handle[2]` and
+/// strand `/a/c`, so the debug_assert trips first.
 ///
-/// Fail-on-old: with the bare `rebind_root`, `by_handle[2]` is overwritten → `/a/c`'s record no
-/// longer round-trips through its handle and an event under `/a/c` routes to no live root — `sc`
-/// silently misses it. The reverse-map round-trip and delivery assertions then FAIL.
+/// The earlier R14-F2 defensive recovery (disarm the aliased handle + retire `old`) was RETIRED
+/// (Codex R15): it was incomplete, and when the alias was an unrelated *live* root its `disarm`
+/// released that root's real source watch while its record + coverage stayed live — silently missing
+/// future changes (R15-F2). The strengthened contract makes the alias impossible for a conforming
+/// source (a re-arm mints a fresh generation while `old` and its siblings are still recorded), so
+/// the debug_assert is the debug/test-only tripwire for a violating one. Hence `#[should_panic]` —
+/// and `ignore`d in release builds, where `debug_assert!` is compiled out and nothing panics.
 #[tokio::test]
-async fn failed_widen_restore_rearm_aliasing_sibling_handle_does_not_corrupt_index() {
+#[should_panic(expected = "already recorded for a different root")]
+#[cfg_attr(
+  not(debug_assertions),
+  ignore = "the debug_assert tripwire is compiled out in release builds"
+)]
+async fn failed_widen_restore_reusing_a_recorded_sibling_handle_trips_the_tripwire() {
   let mut h = Harness::new();
 
-  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
-  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
-  h.owner.epochs.stamp(sb, Epoch::new(4));
-  h.owner.epochs.stamp(sc, Epoch::new(2));
+  let _sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let _sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
 
-  // The wider /a arm fails, AND the first restore re-arm (/a/b) REUSES handle 2 — aliasing the
-  // still-recorded sibling /a/c (a `Source::Handle` no-ABA violation the guard must catch).
+  // The wider /a arm fails, AND the first restore re-arm (/a/b) REUSES handle 2 — still recorded as
+  // the not-yet-restored sibling /a/c. That is a generation-unique `Source::Handle` VIOLATION, so
+  // the rebind choke point's debug_assert panics on it rather than corrupt `by_handle` (R15-F2).
   h.owner.source.fail_next_arm();
   h.owner.source.reuse_next_arm_handle(2);
-  let result = h.watch("/a", Interest::all()).await;
-  assert!(result.is_err(), "the failed wider arm surfaces the error");
-
-  // Disarm-subsumed, wider arm fails, restore /a/b re-arms to the ALIASED handle 2 → the guard
-  // disarms that stray and retires /a/b, then /a/c re-arms cleanly to a fresh handle.
-  assert_eq!(
-    h.owner.source.calls(),
-    vec![
-      Call::Arm(PathBuf::from("/a/b")),
-      Call::Arm(PathBuf::from("/a/c")),
-      Call::Disarm(1),
-      Call::Disarm(2),
-      Call::Arm(PathBuf::from("/a")),
-      Call::Arm(PathBuf::from("/a/b")),
-      Call::Disarm(2), // the alias guard disarms the stray re-armed handle
-      Call::Arm(PathBuf::from("/a/c")),
-    ],
-    "the aliasing re-arm is disarmed (not rebound), /a/b retired, /a/c restored"
-  );
-  assert_eq!(
-    h.owner.subsumer.pending_len(),
-    0,
-    "the aborted widen leaks no pending reservation"
-  );
-
-  // Only /a/c remains a root — /a/b was retired by the guard, never rebound onto the aliased handle.
-  let roots: Vec<(Vec<OsString>, u32)> = h
-    .owner
-    .subsumer
-    .roots()
-    .map(|(k, handle)| (k.to_vec(), handle))
-    .collect();
-  assert_eq!(
-    roots.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
-    vec![key("/a/c")],
-    "only /a/c survives; /a/b is retired (fail-on-old: the bare rebind would leave a corrupt /a/b)"
-  );
-
-  // Reverse-map integrity: /a/c round-trips through its own handle — `by_handle` was NOT
-  // overwritten by the aliasing rebind (fail-on-old: its handle 2 resolves to /a/b).
-  let ac_handle = roots[0].1;
-  assert_eq!(
-    h.owner
-      .subsumer
-      .entry(ac_handle)
-      .map(|r| r.key.clone())
-      .as_deref(),
-    Some(key("/a/c").as_slice()),
-    "/a/c's handle resolves back to /a/c (fail-on-old: by_handle[2] overwritten → resolves to /a/b)"
-  );
-  let view = h.owner.subsumer.view();
-  assert!(
-    view.is_watched(&key("/a/c")),
-    "sc is live-and-covered again"
-  );
-  assert!(
-    !view.is_watched(&key("/a/b")),
-    "/a/b is retired — not left published-watched-but-corrupt"
-  );
-
-  // sb (retired /a/b) has its per-sub state freed; sc (restored) keeps its state.
-  assert!(
-    !h.owner.filters.contains_key(&sb),
-    "the retired /a/b subscriber's filter is freed (I4)"
-  );
-  assert!(
-    h.owner.filters.contains_key(&sc),
-    "the restored /a/c subscriber's filter is kept"
-  );
-  // No silent loss on the Rescan side: sc got a restore re-point Rescan (on the stream) and sb is
-  // owed a dominating terminal Rescan (durably parked before its state was freed). Flush the parked
-  // terminal, then drain BOTH — before fanning any delta, so neither Rescan is consumed early.
-  assert!(
-    h.owner.needs_rescan.contains_key(&sb),
-    "the retired sb is owed a durable terminal Rescan"
-  );
-  h.owner.flush_pending_rescans();
-  let by_sub: HashMap<Subscription, Epoch> = h
-    .drain()
-    .iter()
-    .map(|ev| {
-      assert!(ev.is_rescan(), "every loss/restore signal is a Rescan");
-      (ev.subscription(), ev.epoch())
-    })
-    .collect();
-  assert_eq!(
-    by_sub.get(&sb).copied(),
-    Some(Epoch::new(5)),
-    "the retired sb's terminal Rescan strictly dominates its high-water of 4"
-  );
-  assert_eq!(
-    by_sub.get(&sc).copied(),
-    Some(Epoch::new(3)),
-    "the restored sc's re-point Rescan strictly dominates its high-water of 2"
-  );
-
-  // No silent loss on the delivery side: an event under /a/c reaches sc — its routing survived the
-  // ABA-inducing restore (fail-on-old: /a/c orphaned by the by_handle overwrite → sc misses).
-  h.owner
-    .fan_out_and_push(&source_modified(ac_handle, "/a/c/f", 0));
-  let delivered = h.drain();
-  assert!(
-    delivered
-      .iter()
-      .any(|ev| ev.subscription() == sc && !ev.is_rescan()),
-    "an event under /a/c reaches sc after the ABA-guarded restore (fail-on-old: sc silently misses)"
-  );
+  // Panics inside the restore, before the watch returns — the source violated the handle contract.
+  let _ = h.watch("/a", Interest::all()).await;
 }
 
 /// Codex R13 (the ARM-choke-point liveness close, widen path): a `Widen` whose **wider** arm is

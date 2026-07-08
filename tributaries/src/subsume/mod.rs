@@ -716,6 +716,12 @@ where
   /// re-arm at the *same* key yields a new source handle, so the record's handle, the
   /// reverse index, and every subscriber's ridden-root pointer must move to it; no key
   /// changes, so the coverage plane is untouched. A no-op if `old` is not a live root.
+  ///
+  /// `new` is **generation-unique** by the [`Source::Handle`](crate::Source::Handle) contract, so
+  /// it is absent from `by_handle` before this runs: the `by_handle.insert(new, ..)` below can
+  /// never clobber another live root's reverse-map entry. The driver `debug_assert`s this at the
+  /// call site (a tripwire for a contract-violating source), so no in-band alias recovery is
+  /// needed here.
   pub(crate) fn rebind_root(&mut self, old: H, new: H) {
     let Some(root_key) = self.by_handle.get(&old).cloned() else {
       return;
