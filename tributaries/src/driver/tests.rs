@@ -17,6 +17,7 @@ use crate::{
   error::{UnwatchError, WatchError},
   event::Event,
   filter::Filter,
+  options::DebounceConfig,
   source::{Armed, Source, SourceEvent},
   subscription::Subscription,
   subsume::Subsumer,
@@ -562,7 +563,10 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
     "the restored subscriber's filter is kept"
   );
 
-  // BOTH subscribers got a dominating Rescan (sb: terminal/retire; sc: restore re-point).
+  // BOTH subscribers got a dominating Rescan (sb: terminal/retire; sc: restore re-point). The
+  // retired sb's terminal Rescan is durably PARKED by the shared retire primitive (before its
+  // subsumer state was freed), so flush it into the stream before draining.
+  h.owner.flush_pending_rescans();
   let by_sub: HashMap<Subscription, Epoch> = h
     .drain()
     .iter()
@@ -1245,5 +1249,213 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
   assert!(
     bad.lost > 0,
     "the cancel-unsafe source dropped popped-but-unreturned events (silent loss, no Rescan)"
+  );
+}
+
+/// R2-F1 regression (design backpressure doc, no silent loss): a failed widen whose subsumed
+/// root cannot re-arm retires it — and when the event channel is **full** (a stalled consumer)
+/// the retire must still owe that root's subscriber its dominating terminal `Rescan`. The shared
+/// retire primitive **parks** it into `needs_rescan` (root key + a dominating epoch, captured
+/// while live) BEFORE `force_remove_root`, so a full channel cannot drop it. Regression: the old
+/// code force-removed the root first and only then pushed the Rescan, so on a full channel
+/// `park_rescan`'s `subscription_key` lookup found nothing and the owed terminal Rescan was
+/// silently dropped. Fail-on-old: with park-before-retire reverted, the `needs_rescan`/resume
+/// assertions FAIL.
+#[tokio::test]
+async fn failed_widen_retire_parks_owed_terminal_rescan_when_channel_full() {
+  let mut h = Harness::bounded(1);
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // root 1
+  let _sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // root 2
+  // Drive sb's high-water up so its terminal Rescan has a prior stream to dominate.
+  for raw in 0..3 {
+    h.owner.epochs.stamp(sb, Epoch::new(raw)); // sb high-water 2
+  }
+  // FILL the one slot so the retire's terminal Rescan for sb must overflow-park, never deliver
+  // inline. The raw funnel does not overflow yet (the slot holds exactly this one delivery).
+  h.owner.try_emit(modified_event(sb, "/a/b/f0", 0));
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the pre-widen delivery filled the slot without overflowing yet"
+  );
+
+  // Fail the wider arm AND the first restore re-arm (/a/b): restore iterates root-key order
+  // (/a/b, /a/c), so /a/b cannot re-arm (retired) while /a/c re-arms (restored).
+  h.owner.source.fail_next_arms(2);
+  let result = h.watch("/a", Interest::all()).await;
+  assert!(result.is_err(), "the failed wider arm surfaces the error");
+
+  assert!(
+    !h.owner.subsumer.view().is_watched(&key("/a/b")),
+    "the un-re-armable subsumed root is retired"
+  );
+  // The core of the regression: despite the full channel, the retired root's owed terminal
+  // Rescan is durably PARKED (parked before the subsumer state was freed), not dropped.
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb),
+    "the retired root's owed terminal Rescan is parked despite the full channel (not dropped)"
+  );
+
+  // Resume: drain the buffered pre-widen delivery, then flush the parked Rescans (bounded 1, so
+  // flush + drain twice to release every parked entry).
+  let buffered = h.drain();
+  assert!(
+    buffered
+      .iter()
+      .any(|e| e.subscription() == sb && !e.is_rescan()),
+    "the pre-widen sb delivery drained in order"
+  );
+  let mut resumed = Vec::new();
+  for _ in 0..2 {
+    h.owner.flush_pending_rescans();
+    resumed.extend(h.drain());
+  }
+  let sb_rescan = resumed
+    .iter()
+    .find(|e| e.subscription() == sb && e.is_rescan())
+    .expect("sb receives its owed terminal dominating Rescan after resume (no silent loss)");
+  assert_eq!(
+    sb_rescan.path(),
+    Path::new("/a/b"),
+    "the terminal Rescan names the retired root the consumer re-enumerates"
+  );
+  let sb_max = buffered
+    .iter()
+    .filter(|e| e.subscription() == sb)
+    .map(Event::epoch)
+    .max()
+    .expect("sb had a buffered delivery");
+  assert!(
+    sb_rescan.epoch() > sb_max,
+    "sb's terminal Rescan strictly dominates every event delivered to it before it"
+  );
+}
+
+/// R2-F2 regression (design backpressure doc, checklist #5): with debounce enabled a
+/// subscription is **parked** (overflow) AND still holds **buffered tail deltas** whose epoch
+/// sits at or above its parked `Rescan`'s (the coalescer admits before `try_emit` suppresses).
+/// When the source drains, the owner must NOT deliver those tail deltas ahead of the owed
+/// `Rescan` — doing so would let a high-water consumer ignore the `Rescan` and leave the overflow
+/// loss unrecovered. The drain **purges** a parked sub's tail (its Rescan re-enumerates +
+/// dominates them) and delivers the Rescan first. Regression: the old drain flushed the coalescer
+/// tail with a bare `try_send` BEFORE the Rescans, so a tail delta with epoch >= the Rescan was
+/// delivered before it. Fail-on-old: with bare-`try_send` tail-first restored, FAILS.
+#[tokio::test]
+async fn source_drain_orders_parked_rescan_before_its_buffered_tail() {
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200));
+  let mut h = Harness::build(Some(Coalescer::new(cfg)), Some(1));
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  for raw in 0..2 {
+    h.owner.epochs.stamp(sub, Epoch::new(raw)); // high-water 1
+  }
+
+  // Fill the one slot and overflow → park a dominating Rescan (epoch 2). The raw funnel bypasses
+  // the coalescer, so its buffer is untouched by these two.
+  h.owner.try_emit(modified_event(sub, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sub, "/a/f1", 1));
+  assert_eq!(
+    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    Some(Epoch::new(2)),
+    "overflow parked a dominating Rescan while the channel is full"
+  );
+
+  // After parking, more deltas arrive and BUFFER in the coalescer (admit runs unconditionally;
+  // not yet due, so nothing drains). Their epoch (9) is far above the parked Rescan's (2) —
+  // exactly the tail-vs-Rescan ordering hazard.
+  h.owner.push_all(vec![modified_event(sub, "/a/g0", 9)]);
+
+  // The source drains at teardown; run the drain concurrently with a resuming consumer that
+  // collects every event for the sub up to and including its Rescan.
+  let events = h.events.clone();
+  let owner = &mut h.owner;
+  let consumer = async {
+    let mut seen: Vec<Event<OsString, ()>> = Vec::new();
+    while let Ok(event) = events.recv().await {
+      if event.subscription() == sub {
+        let is_rescan = event.is_rescan();
+        seen.push(event);
+        if is_rescan {
+          break;
+        }
+      }
+    }
+    seen
+  };
+  let (_, seen) = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::join!(owner.drain_owed_before_shutdown(), consumer)
+  })
+  .await
+  .expect("the source-drain teardown delivered the owed Rescan before the deadline");
+
+  let rescan_pos = seen
+    .iter()
+    .position(|e| e.is_rescan())
+    .expect("the owed Rescan was delivered");
+  let rescan_epoch = seen[rescan_pos].epoch();
+  assert_eq!(rescan_epoch, Epoch::new(2), "the owed dominating Rescan");
+  for earlier in &seen[..rescan_pos] {
+    assert!(
+      earlier.epoch() < rescan_epoch,
+      "no delta with epoch >= the Rescan's is delivered before it (dominance preserved)"
+    );
+  }
+  assert!(
+    !seen.iter().any(|e| e.key() == key("/a/g0").as_slice()),
+    "the parked sub's buffered tail delta was purged (dominated by its Rescan), not delivered"
+  );
+  assert!(
+    owner.needs_rescan.is_empty(),
+    "the owed Rescan was delivered — nothing left parked"
+  );
+}
+
+/// R2-F3 regression (design backpressure doc, invariant II): after the source drains, the owner
+/// owes every parked `Rescan` and retries across a full channel — but that retry must keep
+/// servicing the command mailbox, or a `Close` behind a full channel (a held-but-not-draining
+/// receiver keeps it both full and un-closed) queues forever and `close()` hangs. The drain
+/// `select!`s its retry timer against `commands.recv`, so a mid-drain `Close` is surfaced (to be
+/// acked) within a bounded deadline. Fail-on-old: with the command-unresponsive (blind-sleep)
+/// drain loop, this times out.
+#[tokio::test]
+async fn source_drain_retry_stays_responsive_to_close() {
+  let mut h = Harness::bounded(1);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  for raw in 0..2 {
+    h.owner.epochs.stamp(sub, Epoch::new(raw));
+  }
+  // Fill the one slot and overflow → park a dominating Rescan; the channel stays FULL and its
+  // receiver is HELD but never drained, so neither the slot-freed nor the all-receivers-dropped
+  // exit can ever fire on its own.
+  h.owner.try_emit(modified_event(sub, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sub, "/a/f1", 1));
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "overflow parked a Rescan; the channel is full"
+  );
+  let _held = h.events.clone(); // a receiver that never drains (keeps the channel full + open)
+
+  // Another handle calls close(): the Close command queues on the (unbounded) mailbox.
+  let (reply, response) = futures_channel::oneshot::channel();
+  h._commands
+    .try_send(super::Command::Close { reply })
+    .expect("enqueue the Close command");
+
+  // The source-drain retry must service that Close rather than spin behind the full channel.
+  let returned = tokio::time::timeout(
+    Duration::from_secs(10),
+    h.owner.drain_owed_before_shutdown(),
+  )
+  .await
+  .expect(
+    "the source-drain retry stayed responsive to Close (did not hang behind the full channel)",
+  );
+  let close_reply = returned.expect("the mid-drain Close is surfaced to the caller to be acked");
+
+  // Ack it exactly as `run` does; the close() caller then completes.
+  close_reply.send(Ok(())).expect("ack the Close");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "close() completes once the drain surfaced and acked its Close"
   );
 }
