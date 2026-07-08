@@ -399,11 +399,14 @@ fn move_decomposition_stamps_each_projection() {
 
 /// The overflow shed primitive (design backpressure doc): `shed_rescan` mints a
 /// strictly-dominating `Rescan` epoch WITHOUT rebasing the subscription's base (it stays on
-/// the same live root). The `Rescan` dominates the whole pre-shed stream, and subsequent
-/// genuine deltas from that SAME root — whose raw fs epochs keep climbing (no re-arm) —
-/// stamp `base + raw` and so sort **at or above** the `Rescan`, never below it (no silent
-/// loss). This is the property `repoint`'s base-rebasing would break for a shed: rebasing
-/// is sound only for a widen onto a fresh root whose raw epochs restart at 0.
+/// the same live root). The `Rescan` dominates the whole pre-shed stream. This exercises the
+/// case where the raw fs epoch has **advanced** across the shed (a later reconciliation
+/// generation — raw 5,6,7): those deltas stamp `base + raw` and so sort at or above the
+/// `Rescan`. The complementary case — a later **same-generation** event whose raw has NOT
+/// advanced (the common one, since the raw fs epoch is a generation, not a per-event
+/// counter), which relies on [`stamp`](EpochLedger::stamp)'s high-water clamp — is covered by
+/// [`post_shed_same_generation_event_is_not_dominated_by_the_shed_rescan`]. `repoint`'s
+/// base-rebasing is not used for a shed: it is sound only for a widen onto a fresh root.
 #[test]
 fn shed_rescan_dominates_prior_stream_and_same_root_deltas_sort_at_or_above() {
   let mut ledger = EpochLedger::new();
@@ -464,4 +467,52 @@ fn shed_rescan_dominates_prior_stream_and_same_root_deltas_sort_at_or_above() {
     "a second shed mints one past the new high-water (strictly increasing)"
   );
   assert!(rescan2 > rescan, "sheds are monotone");
+}
+
+/// Codex R6 regression (design backpressure doc, no silent loss): the raw fs epoch is a
+/// per-scope reconciliation **generation** — constant across ordinary events, advanced only
+/// on a `Rescan`/overflow (see `tributary_proto`'s monitor) — NOT a per-event counter. So
+/// after an overflow [`shed_rescan`](EpochLedger::shed_rescan) mints a dominating `Rescan` at
+/// `high_water.next()`, a later SAME-generation event (same raw) must still not sort below
+/// it. [`stamp`](EpochLedger::stamp)'s high-water clamp lifts such an event up to TIE the
+/// shed `Rescan` (a tie is not dominated).
+///
+/// Fail-on-old: without the clamp (`stamp = base + raw`), the post-shed same-generation event
+/// stamps `base + 0 = 0`, one BELOW the shed `Rescan` (1) → a dominance-applying consumer
+/// drops it → silent loss. This is exactly the class the climbing-raw shed test above (which
+/// models raw as a per-event counter) cannot see.
+#[test]
+fn post_shed_same_generation_event_is_not_dominated_by_the_shed_rescan() {
+  let mut ledger = EpochLedger::new();
+  let s = sub(1);
+  let root = Fixture::new("/a", &[(1, "/a")]);
+
+  // Ordinary events in ONE reconciliation generation all carry the SAME raw fs epoch (0);
+  // they stamp base + 0 = 0 and high-water stays 0.
+  for _ in 0..3 {
+    let delivered = root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(0));
+    assert_eq!(
+      delivered[0].1,
+      Epoch::new(0),
+      "same-generation events stamp base + 0"
+    );
+  }
+
+  // Overflow shed: the parked Rescan is minted one past the high-water.
+  let rescan = ledger.shed_rescan(s);
+  assert_eq!(rescan, Epoch::new(1), "shed_rescan = high_water.next()");
+
+  // A LATER event in the SAME generation still carries raw 0 (no fs re-arm, no generation
+  // bump). Its natural stamp base + 0 = 0 would sort BELOW the shed Rescan (1); the clamp
+  // lifts it to tie the Rescan (1) instead, so it is never dominated.
+  let post = root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(0));
+  assert_eq!(
+    post[0].1,
+    Epoch::new(1),
+    "the post-shed same-generation event is clamped up to tie the shed Rescan, not base + 0 = 0"
+  );
+  assert!(
+    post[0].1 >= rescan,
+    "no post-shed same-generation event sorts below the shed Rescan (Codex R6: no silent loss)"
+  );
 }

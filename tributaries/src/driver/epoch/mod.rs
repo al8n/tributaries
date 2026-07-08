@@ -19,8 +19,12 @@
 //! stamped in the subscription's **own** monotone space, never the raw fs epoch:
 //!
 //! - A delivered event from the subscription's current root with raw fs epoch `e` is
-//!   stamped `epoch_base + e` ([`stamp`](EpochLedger::stamp)). Within one root `e` is
-//!   monotone, so the stamp is monotone.
+//!   stamped `epoch_base + e`, **clamped up to the subscription's high-water**
+//!   ([`stamp`](EpochLedger::stamp)). The raw fs epoch is a per-scope reconciliation
+//!   *generation* — constant across ordinary events, advanced only on a `Rescan`/overflow
+//!   — so `e` does **not** climb per event; the high-water clamp (not any monotonicity of
+//!   `e`) is what keeps a delivery from sorting below a dominating `Rescan` that already
+//!   advanced high-water (an overflow shed).
 //! - On a widen re-point ([`repoint`](EpochLedger::repoint)): let `hw` be the
 //!   subscription's current high-water; the synthetic `Rescan` is emitted at
 //!   `hw.next()` and `epoch_base` is set to `hw.next()` for the new root. The new
@@ -72,15 +76,31 @@ impl EpochLedger {
   }
 
   /// The umbrella-relative stamp for `sub`'s next delivery from its **current** root
-  /// with raw fs epoch `raw`: `epoch_base + raw`, in `sub`'s own monotone space
-  /// (design §8). Advances `sub`'s high-water to cover the stamp and returns it.
+  /// with raw fs epoch `raw`: `epoch_base + raw`, **clamped up to `sub`'s current
+  /// high-water** so a delivery can never sort below a dominating `Rescan` that already
+  /// advanced high-water (design §8). Advances `sub`'s high-water to cover the stamp and
+  /// returns it.
   ///
-  /// Within one root `raw` is monotone, so the stamp is monotone. The `u64` add is
-  /// saturating; the ceiling is unreachable (it would take ~1.8·10¹⁹ events on one
-  /// subscription's current root to reach it).
+  /// The clamp is load-bearing because the raw fs epoch is a **per-scope reconciliation
+  /// generation, not a per-event counter**: `tributary-fs` stamps every ordinary change
+  /// with the scope's *current* generation and only advances it on a `Rescan`/overflow
+  /// (see `tributary_proto`'s monitor), so successive ordinary events routinely carry the
+  /// **same** `raw`. After an overflow [`shed_rescan`](Self::shed_rescan) mints a
+  /// dominating `Rescan` at `high_water.next()`, a later same-generation event would
+  /// otherwise stamp its old `epoch_base + raw` — *below* that `Rescan` — and a
+  /// dominance-applying consumer would silently drop it. Clamping to `high_water` lifts it
+  /// to tie the shed `Rescan` (a tie is not dominated), closing the loss. When `raw` does
+  /// climb — a fresh generation, or the post-[`repoint`](Self::repoint) new root counting
+  /// up from 0 — the clamp is a no-op: `epoch_base + raw` already meets or exceeds
+  /// high-water.
+  ///
+  /// The `u64` add is saturating; the ceiling is unreachable (it would take ~1.8·10¹⁹
+  /// events on one subscription's current root to reach it).
   pub(crate) fn stamp(&mut self, sub: Subscription, raw: Epoch) -> Epoch {
     let base = self.base.get(&sub).copied().unwrap_or(Epoch::START);
-    let stamp = Epoch::new(base.as_u64().saturating_add(raw.as_u64()));
+    let natural = base.as_u64().saturating_add(raw.as_u64());
+    let hw = self.high_water.get(&sub).copied().unwrap_or(Epoch::START);
+    let stamp = Epoch::new(natural.max(hw.as_u64()));
     self.bump(sub, stamp);
     stamp
   }
@@ -106,20 +126,19 @@ impl EpochLedger {
   /// `sub` **without rebasing its root** — the overflow shed (design backpressure doc).
   ///
   /// Returns `sub`'s current-high-water `.next()` and advances high-water to it, but —
-  /// unlike [`repoint`](Self::repoint) — **leaves `epoch_base` unchanged**. This is the
-  /// critical distinction from a widen re-point:
+  /// unlike [`repoint`](Self::repoint) — **leaves `epoch_base` unchanged**. A shed stays
+  /// on the **same live root** (there was no re-arm), so its `epoch_base` still names that
+  /// root's floor; [`repoint`](Self::repoint) rebases only because a widen re-arms onto a
+  /// fresh root whose raw fs epochs restart at 0.
   ///
-  /// - [`repoint`](Self::repoint) rebases `epoch_base` to `hw.next()`, which is correct
-  ///   **only for a widen onto a fresh root whose raw fs epochs restart at 0**: the new
-  ///   root's first event then stamps `hw.next() + 0`, tying the `Rescan`.
-  /// - A shed stays on the **same live root**, whose raw fs epochs keep climbing (there
-  ///   was no re-arm). Leaving `epoch_base` keeps the umbrella stamp in lockstep with
-  ///   that root: the next genuine delivery stamps `epoch_base + raw` for a `raw` strictly
-  ///   greater than every raw seen so far, so it lands **at or above** the `Rescan`
-  ///   (`hw.next()`) and is never dominated by it. Rebasing here would instead inflate
-  ///   `epoch_base` while the raw epochs continue from their old value, desynchronizing
-  ///   the stamp from the live sequence and mis-ordering later same-root deltas against
-  ///   the `Rescan`.
+  /// Post-shed dominance is upheld by [`stamp`](Self::stamp)'s high-water clamp — **not**
+  /// by any assumption that raw fs epochs climb. Because the raw epoch is a per-scope
+  /// reconciliation *generation* (constant across ordinary events — see
+  /// [`stamp`](Self::stamp)), a later same-generation delivery would stamp its old
+  /// `epoch_base + raw` *below* this `Rescan`; the clamp lifts it to tie the `Rescan`
+  /// instead, so it is never dominated. Leaving `epoch_base` unchanged (rather than
+  /// inflating it) keeps the base meaningful for a subsequent genuine generation bump,
+  /// whose `epoch_base + raw'` — clamped — still ties-or-exceeds this shed floor.
   ///
   /// The pre-shed stream (all `≤ hw`) is strictly dominated by the returned `Rescan`, and
   /// repeated sheds are idempotent (monotone `high_water.next()`; N sheds collapse to one
