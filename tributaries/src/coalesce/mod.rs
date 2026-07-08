@@ -53,6 +53,23 @@
 //! - **Bounded hold** — an entry's total hold is capped at
 //!   [`max_hold`](crate::DebounceConfig::max_hold), so a continuously-touched path
 //!   still emits its coalesced state instead of settling forever.
+//!
+//! # Per-subscription emission order (design §8)
+//!
+//! Buffered entries live in a [`BTreeMap`] keyed by `(subscription, path)`, but a
+//! subscription's due/flushed entries are **not** emitted in that path order — they are
+//! emitted in **admission-sequence** order, a monotone `u64` the coalescer stamps on each
+//! buffered entry at admit time (and re-takes on every collapse, so a surviving entry's
+//! sequence tracks the newest observation it folded in — the same observation whose epoch
+//! it carries). Within a subscription that sequence order equals epoch order (the umbrella
+//! epoch is monotone per subscription), so a consumer that uses the epoch high-water for
+//! idempotency/dominance never sees a subscription's epochs go backwards and silently drop
+//! the older change. Two paths whose lexical order opposes their epoch order — `/a` at
+//! epoch 2, `/z` at epoch 1 — would emit `/a` (epoch 2) before `/z` (epoch 1) under the
+//! BTreeMap path key; by admission sequence they emit `/z` (epoch 1) then `/a` (epoch 2).
+//! Across *different* subscriptions the relative order is unconstrained — each has an
+//! independent epoch space — so the drains key on `(subscription, sequence)`, leaving each
+//! subscription's run contiguous and in epoch order.
 
 use std::{
   collections::{BTreeMap, VecDeque},
@@ -74,8 +91,8 @@ mod tests;
 /// in the drain order (§10).
 type Key<C> = (Subscription, Vec<C>);
 
-/// One buffered, still-coalescing entry: the current collapsed event plus the two
-/// deadlines that decide when it emits.
+/// One buffered, still-coalescing entry: the current collapsed event, the two deadlines
+/// that decide when it emits, and its admission sequence for the drain order.
 #[derive(Debug, Clone)]
 struct Buffered<C, V> {
   /// When the burst began — the anchor for the [`max_hold`](DebounceConfig::max_hold)
@@ -86,6 +103,13 @@ struct Buffered<C, V> {
   /// Each new change pushes `last_seen + quiet_window` out (the settle), but the
   /// `first_seen + max_hold` cap bounds the total hold.
   emit_at: Instant,
+  /// This entry's monotone **admission sequence**, drawn from the coalescer's admission
+  /// counter on first insert and re-taken on every collapse so it always reflects the
+  /// *newest* folded observation — the same observation whose epoch this entry carries.
+  /// A multi-entry drain orders each subscription's entries by this sequence, not by their
+  /// BTreeMap path key, so a subscription's buffered epochs never emit out of order
+  /// (design §8; see the [module docs](self#per-subscription-emission-order-design-8)).
+  seq: u64,
   /// The current collapsed event, stamped with the newest observation's umbrella epoch.
   event: Event<C, V>,
 }
@@ -119,8 +143,10 @@ enum Collapse {
 #[derive(Debug)]
 pub(crate) struct Coalescer<C, V> {
   cfg: DebounceConfig,
-  /// The coalescing slots, one per `(subscription, key)`. A [`BTreeMap`] for a
-  /// deterministic drain order.
+  /// The coalescing slots, one per `(subscription, key)`. A [`BTreeMap`] so iteration is
+  /// deterministic (design §10 forbids `HashMap`-iteration nondeterminism); the *emission*
+  /// order within a subscription is by admission sequence (`Buffered::seq`), not this path
+  /// key — see the [module docs](self#per-subscription-emission-order-design-8).
   buffer: BTreeMap<Key<C>, Buffered<C, V>>,
   /// Events that must emit *immediately*, in FIFO order: [`Moved`](EventKind::Moved)
   /// whole, a [`Rescan`](EventKind::Rescan), and the buffered entries a `Moved`/`Rescan`
@@ -129,6 +155,15 @@ pub(crate) struct Coalescer<C, V> {
   /// releases it. FIFO preserves "flushed entries before the signal that flushed them"
   /// and "a `Rescan` jumps the queue ahead of a still-buffering burst".
   ready: VecDeque<(Instant, Event<C, V>)>,
+  /// The monotone **admission counter**: bumped once per buffered admission and stamped
+  /// onto the entry (`Buffered::seq`), so a multi-entry drain emits each subscription's
+  /// entries in admission order — which equals per-subscription epoch order, since the
+  /// umbrella epoch is monotone per subscription (design §8) — rather than in BTreeMap
+  /// path-key order, under which two paths whose lexical order opposes their epoch order
+  /// emit epochs backwards and a high-water consumer silently drops the older change. A
+  /// `u64` cannot wrap in practice: at a billion buffered admissions per second it would
+  /// take roughly 585 years.
+  next_seq: u64,
 }
 
 impl<C, V> Coalescer<C, V>
@@ -142,7 +177,18 @@ where
       cfg,
       buffer: BTreeMap::new(),
       ready: VecDeque::new(),
+      next_seq: 0,
     }
+  }
+
+  /// Returns the next monotone admission sequence, advancing the counter. It is stamped
+  /// onto each buffered entry (`Buffered::seq`) so a multi-entry drain emits a
+  /// subscription's entries in admission order (= per-subscription epoch order). The `u64`
+  /// cannot wrap in practice (one tick per buffered admission — see the field docs).
+  fn bump_seq(&mut self) -> u64 {
+    let seq = self.next_seq;
+    self.next_seq += 1;
+    seq
   }
 
   /// Admits one attributed event at logical time `now`: buffers and collapses a known
@@ -211,8 +257,8 @@ where
   }
 
   /// Appends every entry due at `now` to `out` — the ready queue first (immediate
-  /// emissions, in FIFO order), then every buffered entry whose deadline has passed
-  /// (in deterministic key order).
+  /// emissions, in FIFO order), then every buffered entry whose deadline has passed,
+  /// ordered within each subscription by admission sequence (= epoch order).
   ///
   /// After this the coalescer holds only entries still settling; their deadlines are
   /// reported by [`next_deadline`](Self::next_deadline). `now` must be nondecreasing.
@@ -228,32 +274,42 @@ where
         break;
       }
     }
-    // Then the buffered entries that have come due, in key order (deterministic).
-    let due: Vec<Key<C>> = self
+    // Then the buffered entries that have come due — emitted in (subscription, admission-
+    // sequence) order, NOT BTreeMap path-key order: within a subscription that is epoch
+    // order (admission is monotone), so a high-water consumer never sees a subscription's
+    // epochs go backwards. Across subscriptions the order is free (independent epoch
+    // spaces); keying on the subscription first keeps each one's run contiguous.
+    let mut due: Vec<(Subscription, u64, Key<C>)> = self
       .buffer
       .iter()
       .filter(|(_, b)| b.emit_at <= now)
-      .map(|(k, _)| k.clone())
+      .map(|(k, b)| (k.0, b.seq, k.clone()))
       .collect();
-    for key in due {
+    due.sort_by_key(|(sub, seq, _)| (*sub, *seq));
+    for (_, _, key) in due {
       let entry = self.buffer.remove(&key).expect("key just collected");
       out.push(entry.event);
     }
   }
 
   /// Appends *every* pending event to `out` regardless of deadline — the ready queue
-  /// (FIFO) then every buffered entry (key order) — leaving the coalescer empty.
+  /// (FIFO) then every buffered entry, ordered within each subscription by admission
+  /// sequence (= epoch order) — leaving the coalescer empty.
   ///
   /// For stream close: once the source is drained no further change can arrive to
   /// settle a buffered burst, so the driver force-emits the coalesced tail rather than
   /// silently dropping it (no-silent-loss).
   pub(crate) fn flush_all(&mut self, out: &mut Vec<Event<C, V>>) {
     out.extend(self.ready.drain(..).map(|(_, event)| event));
-    out.extend(
-      std::mem::take(&mut self.buffer)
-        .into_values()
-        .map(|b| b.event),
-    );
+    // The buffered tail in (subscription, admission-sequence) order — the same
+    // per-subscription epoch order `drain_ready` keeps, so a teardown flush cannot deliver
+    // a subscription's epochs out of order (design §8).
+    let mut tail: Vec<(Subscription, u64, Event<C, V>)> = std::mem::take(&mut self.buffer)
+      .into_iter()
+      .map(|((sub, _path), b)| (sub, b.seq, b.event))
+      .collect();
+    tail.sort_by_key(|(sub, seq, _)| (*sub, *seq));
+    out.extend(tail.into_iter().map(|(_, _, event)| event));
   }
 
   /// Buffers a lifecycle event, collapsing it onto any entry already held for its
@@ -263,11 +319,17 @@ where
     // Read the settle windows up front so recomputing the deadline does not re-borrow
     // `self` while the buffered entry is held mutably.
     let (quiet, max_hold) = (self.cfg.quiet_window(), self.cfg.max_hold());
+    // The admission sequence for THIS observation, taken before the buffer borrow. A fresh
+    // entry keeps it; a collapse re-takes it (below) so the surviving entry's drain
+    // position reflects its newest folded epoch — the epoch it also adopts here. An
+    // annihilating collapse leaves it unused: a harmless gap in the monotone sequence.
+    let seq = self.bump_seq();
     let Some(buffered) = self.buffer.get_mut(&key) else {
       // First change to this path in the window: open a fresh entry.
       let entry = Buffered {
         first_seen: now,
         emit_at: Self::deadline(now, now, quiet, max_hold),
+        seq,
         event: ev,
       };
       self.buffer.insert(key, entry);
@@ -278,15 +340,19 @@ where
     match Self::collapse(buffered.event.kind(), ev.kind()) {
       Collapse::KeepBuffered => {
         // The buffered kind already represents the net effect; only advance its stamp
-        // to the newest observation (monotone, so this never downgrades the epoch).
+        // to the newest observation (monotone, so this never downgrades the epoch), and
+        // take that observation's admission sequence so the entry's drain position tracks
+        // its newest epoch.
         buffered.event.set_epoch(ev.epoch());
         buffered.emit_at = Self::deadline(first_seen, now, quiet, max_hold);
+        buffered.seq = seq;
       }
       Collapse::ReplaceWithIncoming => {
         // The incoming event is the net effect and already carries the newest epoch;
         // the burst's original first_seen is kept so the hold cap is not reset.
         buffered.event = ev;
         buffered.emit_at = Self::deadline(first_seen, now, quiet, max_hold);
+        buffered.seq = seq;
       }
       Collapse::BecomeModified => {
         // Removed-then-Created churn: the net is a Modified carried by neither event —
@@ -303,10 +369,11 @@ where
         synthetic.set_value(ev.value().cloned());
         buffered.event = synthetic;
         buffered.emit_at = Self::deadline(first_seen, now, quiet, max_hold);
+        buffered.seq = seq;
       }
       Collapse::Annihilate => {
         // Created-then-Removed transient: the file lived and died inside the window;
-        // emit nothing.
+        // emit nothing. (The sequence taken above is simply left unused.)
         self.buffer.remove(&key);
       }
     }
@@ -346,10 +413,15 @@ where
   }
 
   /// Flushes every buffered entry for `sub` into the ready queue at `now`, in
-  /// deterministic key order — a `Rescan`'s "content is now suspect, emit what we held"
-  /// (design §6).
+  /// admission-sequence (= epoch) order — a `Rescan`/`Moved`'s "content is now suspect,
+  /// emit what we held" (design §6). Ordering by sequence rather than by path key keeps the
+  /// flushed entries climbing in epoch as the FIFO ready queue replays them ahead of the
+  /// signal that flushed them, so the subscription's delivered epochs never go backwards
+  /// (design §8).
   fn flush_subscription(&mut self, sub: Subscription, now: Instant) {
-    for key in self.subscription_keys(sub) {
+    let mut entries = self.subscription_entries(sub);
+    entries.sort_by_key(|(seq, _)| *seq);
+    for (_, key) in entries {
       let entry = self.buffer.remove(&key).expect("key just collected");
       self.ready.push_back((now, entry.event));
     }
@@ -367,22 +439,24 @@ where
   /// drained, so in practice only the buffer holds suspect deltas; the ready scan keeps the
   /// operation self-contained regardless of call site.)
   pub(crate) fn drop_subscription(&mut self, sub: Subscription) {
-    for key in self.subscription_keys(sub) {
+    for (_, key) in self.subscription_entries(sub) {
       self.buffer.remove(&key);
     }
     self.ready.retain(|(_, event)| event.subscription() != sub);
   }
 
-  /// The buffered keys belonging to `sub`, in deterministic key order — the shared prefix
-  /// scan behind both [`flush_subscription`](Self::flush_subscription) and
-  /// [`drop_subscription`](Self::drop_subscription). `(sub, Vec::new())` is the least key
-  /// in `sub`'s range, and the take-while stops at the first key of the next subscription.
-  fn subscription_keys(&self, sub: Subscription) -> Vec<Key<C>> {
+  /// The buffered `(admission-sequence, key)` pairs belonging to `sub`, in BTreeMap key
+  /// order — the shared prefix scan behind both
+  /// [`flush_subscription`](Self::flush_subscription) (which re-sorts by sequence to
+  /// preserve epoch order) and [`drop_subscription`](Self::drop_subscription) (which
+  /// ignores order, only removing). `(sub, Vec::new())` is the least key in `sub`'s range,
+  /// and the take-while stops at the first key of the next subscription.
+  fn subscription_entries(&self, sub: Subscription) -> Vec<(u64, Key<C>)> {
     self
       .buffer
       .range((sub, Vec::new())..)
       .take_while(|((s, _), _)| *s == sub)
-      .map(|(k, _)| k.clone())
+      .map(|(k, b)| (b.seq, k.clone()))
       .collect()
   }
 }
