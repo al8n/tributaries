@@ -69,25 +69,40 @@ pub trait Source<C> {
   /// [`SourceEvent::handle`] identifies. `Copy + Eq + Hash` so the umbrella can key its
   /// per-root bookkeeping on it (the fs source uses [`RootHandle`]).
   ///
-  /// # No-ABA handle contract (hard requirement)
+  /// # Generation-unique handle contract (hard requirement)
   ///
-  /// A handle value MUST NOT be reused to name a **different** root while any root that
-  /// previously used that value is still recorded by the umbrella — i.e. not until the umbrella
-  /// has released it (a [`disarm`](Self::disarm) whose retirement has fully reconciled) or
-  /// observed it die (a terminal event for which [`root_key`](Self::root_key) is `None`).
-  /// Reusing a value for the **same** root (re-arming the identical key after a
-  /// [`disarm`](Self::disarm)) is fine — that is not a *different* root. The umbrella keys its
-  /// reverse index (handle → root) on this token, so an aliased handle would name two distinct
-  /// roots at once and corrupt routing.
+  /// A `Source` MUST mint a **generation-unique** handle on **every** [`arm`](Self::arm): a handle
+  /// value is **never** reused for a new arm while any root **or** any not-yet-emitted event
+  /// carrying that value is still live. Equivalently — no handle the umbrella has observed is ever
+  /// reissued until the umbrella has **fully retired** the root it named (a [`disarm`](Self::disarm)
+  /// whose retirement has reconciled, or a terminal event for which [`root_key`](Self::root_key) is
+  /// `None`) **and** no further event can carry it. Unlike a weaker "never alias two *different*
+  /// live roots" rule, this also forbids reusing a value for the **same** key right after a
+  /// [`disarm`](Self::disarm): a re-arm always mints a *fresh* generation.
   ///
-  /// The sharp edge is the failed-widen restore: the umbrella disarms a set of sibling roots,
-  /// then re-arms them one at a time while the not-yet-restored siblings are **still recorded**;
-  /// a source that re-minted a *just-disarmed sibling's* value for a *different* sibling's re-arm
-  /// would alias two roots onto one handle. The umbrella hardens that restore defensively (a
-  /// detected alias retires the root rather than rebinding onto the aliased handle), so a
-  /// misbehaving source cannot corrupt the index — but a conforming source never triggers that
-  /// path. [`FsSource`] satisfies the contract structurally: its [`RootHandle`] carries a
-  /// **monotonically-minted** `ScopeId` never reissued for the life of the watcher.
+  /// This makes handle **ABA impossible**, and the umbrella relies on it rather than defending
+  /// against ABA itself (Codex R15 — a defensive alias-detection was both incomplete and the wrong
+  /// layer). Two consequences the umbrella depends on:
+  ///
+  /// - **An old-generation event never routes through a re-armed root.** A value the umbrella
+  ///   released and re-armed names a *new* generation with a *new* handle, so any event still queued
+  ///   from before the re-arm carries the **old, now-dead** handle. The umbrella routes strictly by
+  ///   handle: [`root_key`](Self::root_key) is `None` for that dead handle (the source released it),
+  ///   so the event falls to the dead-root retire/drain path — never onto the re-armed root. Were
+  ///   the same value reused (ABA), that stale event would route through the live re-armed root
+  ///   *after* the umbrella rebased its epochs, applying a stale change its restore
+  ///   [`Rescan`](tributary_fs::EventKind::Rescan) no longer dominates (Codex R15-F1).
+  /// - **A fresh arm's handle never aliases a live root.** The umbrella keys its reverse index
+  ///   (handle → root) on this token; a generation-unique value is absent from that index at commit
+  ///   time, so a fresh arm — including each one-at-a-time re-arm of a failed widen's disarmed
+  ///   siblings, whose not-yet-restored siblings are **still recorded** — can never overwrite
+  ///   another root's entry and strand it published-but-unroutable (Codex R15-F2).
+  ///
+  /// A conforming source therefore lets the umbrella rebind/commit onto the fresh handle
+  /// unconditionally; a `debug_assert` at each rebind/commit choke point is the tripwire for a
+  /// contract-violating source, never a release-mode recovery. [`FsSource`] satisfies the contract
+  /// structurally: its [`RootHandle`] carries a **monotonically-minted** `tributary_proto::ScopeId`
+  /// never reissued for the life of the watcher.
   type Handle: Copy + Eq + core::hash::Hash;
 
   /// Canonicalizes the caller-supplied `key` into the source's own **canonical coordinate** —

@@ -830,6 +830,14 @@ where
           self.subsumer.abort_watch(&outcome);
           return Err(canonical_race());
         }
+        // A fresh arm's handle is generation-unique (see `Source::Handle`), so it is absent from the
+        // reverse index and `commit_watch`'s `by_handle` insert cannot clobber a live root's entry.
+        // The debug_assert is the tripwire for a contract-violating source (Codex R15-F2).
+        debug_assert!(
+          self.subsumer.entry(handle).is_none(),
+          "Source::arm returned a handle already recorded for a different root — a \
+           generation-unique Source::Handle contract violation (see Source::Handle)"
+        );
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, filter);
         Ok(sub)
@@ -874,6 +882,15 @@ where
           self.subsumer.abort_watch(&outcome);
           return Err(canonical_race());
         }
+        // The wider arm's handle is generation-unique (see `Source::Handle`): it aliases none of the
+        // still-recorded subsumed roots `commit_watch` is about to drop, nor any other live root, so
+        // its `by_handle` insert cannot clobber a live entry. The debug_assert catches a
+        // contract-violating source loudly in debug/test builds (Codex R15-F2).
+        debug_assert!(
+          self.subsumer.entry(handle).is_none(),
+          "Source::arm returned a handle already recorded for a different root — a \
+           generation-unique Source::Handle contract violation (see Source::Handle)"
+        );
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, filter);
         // Rebase each re-pointed subscription onto the wider root (design §8): its
@@ -1003,22 +1020,22 @@ where
   /// The widen never committed, so the subsumer still holds each subsumed root at its key
   /// with its subscribers — only the **source handle** was released. For each:
   ///
-  /// - **re-arm at the same key** through the [`arm`](Self::arm) choke point. On success
-  ///   whose committed key is unchanged AND whose fresh handle does not **alias a still-recorded
-  ///   sibling** (a [`Source::Handle`] no-ABA violation — see the trait),
-  ///   [`rebind`](Subsumer::rebind_root) the root onto the fresh handle and mint a dominating
-  ///   [`Rescan`](tributary_fs::EventKind::Rescan) per subscriber — the re-arm restarts the
-  ///   source's raw epochs at zero, so each subscriber
-  ///   [`repoint`](epoch::EpochLedger::repoint)s onto the new handle (exactly a widen
-  ///   re-point) and re-enumerates. The subscription is live-and-covered again.
-  /// - if the re-arm **fails** (the root is genuinely dead), its committed key **diverged**
-  ///   (a canonicalization race we cannot cleanly rebind), or its fresh handle **aliases a
-  ///   still-recorded sibling** (a misbehaving source we refuse to let corrupt the reverse
-  ///   index), **retire** the root through the shared
+  /// - **re-arm at the same key** through the [`arm`](Self::arm) choke point. On success whose
+  ///   committed key is unchanged, [`rebind`](Subsumer::rebind_root) the root onto the fresh handle
+  ///   and mint a dominating [`Rescan`](tributary_fs::EventKind::Rescan) per subscriber — the re-arm
+  ///   restarts the source's raw epochs at zero, so each subscriber
+  ///   [`repoint`](epoch::EpochLedger::repoint)s onto the new handle (exactly a widen re-point) and
+  ///   re-enumerates. The subscription is live-and-covered again. The re-arm returns a
+  ///   **generation-unique** handle by contract (see [`Source::Handle`]), so it can alias neither
+  ///   `old` nor a not-yet-restored sibling still recorded here; the earlier defensive
+  ///   alias-detection is gone (Codex R15 — it was incomplete, and disarming an aliased handle
+  ///   stranded an *unrelated live* root), replaced by a `debug_assert` tripwire at the rebind that
+  ///   fires loudly on a contract-violating source without corrupting release builds.
+  /// - if the re-arm **fails** (the root is genuinely dead) or its committed key **diverged** (a
+  ///   canonicalization race we cannot cleanly rebind), **retire** the root through the shared
   ///   [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan): a durable
-  ///   dominating terminal Rescan per subscriber, then free its index / filter / epoch and drop
-  ///   it from the view (the aliased sibling's record is left untouched, to be restored on its
-  ///   own iteration).
+  ///   dominating terminal Rescan per subscriber, then free its index / filter / epoch and drop it
+  ///   from the view.
   ///
   /// Either way no subscription is left recorded-live-but-disarmed-and-published-watched.
   async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) {
@@ -1034,24 +1051,22 @@ where
       };
       match self.arm(&root_key).await {
         Ok((new_handle, fs_key)) if fs_key == root_key => {
-          // Defend the reverse index against a `Source::Handle` ABA violation (see the trait's
-          // no-ABA handle contract): the re-arm must not hand back a handle value that ALIASES a
-          // still-recorded root OTHER than `old` — a not-yet-restored sibling in `unwatch`, or any
-          // other live root. `rebind_root(old, new_handle)` would overwrite that sibling's
-          // reverse-map entry, stranding it published-but-unroutable and mis-resolving a later
-          // restore/unwatch/event to the wrong root. A conforming source never does this (FsSource
-          // mints monotonic ScopeIds), but a misbehaving one must not be allowed to corrupt the
-          // index: on a detected alias, disarm the stray fresh watch and retire `old` through the
-          // shared terminal-Rescan primitive (its subscribers re-enumerate and it leaves the view),
-          // leaving the aliased sibling's record untouched. `new_handle == old` is NOT an alias —
-          // it re-arms the SAME root at the SAME key, which the contract explicitly permits.
-          if new_handle != old && self.subsumer.entry(new_handle).is_some() {
-            self.source.disarm(new_handle).await;
-            self.retire_root_with_terminal_rescan(old);
-            continue;
-          }
-          // Re-armed at the same coordinate with a fresh, non-aliasing handle: rebind onto it and
-          // re-point each subscriber (raw epochs restarted at zero) with a dominating Rescan.
+          // The re-arm returns a GENERATION-UNIQUE handle by contract (see `Source::Handle`), so it
+          // aliases neither `old` nor any not-yet-restored sibling still recorded here — a fresh
+          // value is absent from the reverse index, so `rebind_root` cannot overwrite another root's
+          // entry. The earlier defensive alias-detection (disarm the aliased handle + retire `old`)
+          // is retired: it was incomplete AND, when the alias was an unrelated *live* root, its
+          // `disarm` released that root's real source watch while its record/coverage stayed live,
+          // silently missing future changes (Codex R15-F2). A `debug_assert` is the tripwire for a
+          // contract-violating source instead — `new_handle == old` is exempt (rebinding a value
+          // onto itself corrupts nothing), so only aliasing a *different* recorded root trips it.
+          debug_assert!(
+            self.subsumer.entry(new_handle).is_none() || new_handle == old,
+            "Source::arm returned a handle already recorded for a different root — a \
+             generation-unique Source::Handle contract violation (see Source::Handle)"
+          );
+          // Re-armed at the same coordinate with a fresh handle: rebind onto it and re-point each
+          // subscriber (raw epochs restarted at zero) with a dominating Rescan.
           self.subsumer.rebind_root(old, new_handle);
           let mut rescans = Vec::with_capacity(subscribers.len());
           for sub in subscribers {
