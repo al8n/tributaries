@@ -516,3 +516,48 @@ fn post_shed_same_generation_event_is_not_dominated_by_the_shed_rescan() {
     "no post-shed same-generation event sorts below the shed Rescan (Codex R6: no silent loss)"
   );
 }
+
+/// Codex R7 regression (design backpressure doc, no silent loss): a SOURCE-emitted `Rescan`
+/// must STRICTLY dominate every prior delivery. The R6 clamp lets an ordinary post-shed
+/// same-generation event deliver *at* the shed `Rescan`'s epoch (a tie). If the source then
+/// emits its own `Rescan`, the ordinary clamp (`max(base + raw, high_water)`) would only tie
+/// that already-delivered event — losing strict dominance and the lower layer's coverage-loss
+/// signal. [`stamp_rescan`](EpochLedger::stamp_rescan) (`max(base + raw, high_water.next())`)
+/// restores it.
+///
+/// Fail-on-old: routing the source `Rescan` through the ordinary `stamp` clamp stamps it AT
+/// the post-shed event's epoch (a tie, not strictly above) → the assertion FAILS.
+#[test]
+fn source_rescan_strictly_dominates_a_post_shed_same_generation_event() {
+  let mut ledger = EpochLedger::new();
+  let s = sub(1);
+  let root = Fixture::new("/a", &[(1, "/a")]);
+
+  // One generation of ordinary events (raw 0): stamp base + 0 = 0, high-water 0.
+  root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(0));
+
+  // Overflow shed → dominating Rescan at 1.
+  let shed = ledger.shed_rescan(s);
+  assert_eq!(shed, Epoch::new(1), "shed_rescan = high_water.next()");
+
+  // A post-shed SAME-generation ordinary event (raw 0) is clamped up to tie the shed Rescan.
+  let post = root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(0));
+  assert_eq!(
+    post[0].1,
+    Epoch::new(1),
+    "R6: the post-shed ordinary event ties the shed Rescan"
+  );
+
+  // Now the SOURCE emits its own `Rescan` in the SAME generation (raw 0). It must STRICTLY
+  // dominate the epoch-1 event just delivered — not merely tie it.
+  let src_rescan = root.deliver(&mut ledger, &FakeEvent::rescan("/a/f"), Epoch::new(0));
+  assert_eq!(
+    src_rescan[0].1,
+    Epoch::new(2),
+    "the source Rescan is stamped strictly above the post-shed event (high_water.next()), not tying it"
+  );
+  assert!(
+    src_rescan[0].1 > post[0].1,
+    "a source Rescan strictly dominates every prior delivery (Codex R7: coverage-loss signal preserved)"
+  );
+}
