@@ -474,9 +474,15 @@ where
       // in-flight future. That is safe only because [`Source::next`] is a hard-contract
       // **cancellation-safe** read (see its docs) — dropping the future loses/acks no event.
       raw = owner.source.next().fuse() => match raw {
+        // A terminal dead-root `Rescan` (the source has forgotten its root) retires that root
+        // through the unified park-terminal-Rescan-then-retire primitive — which durably owes
+        // every subscriber a dominating `Rescan` *before* freeing the subsumer state, so a full
+        // channel cannot drop it — instead of fanning it out. Every other event (an ordinary
+        // delivery, or an overflow `Rescan` on a still-live root) fans out normally.
         Some(event) => {
-          owner.fan_out_and_push(&event);
-          owner.retire_if_dead(&event);
+          if !owner.retire_if_dead(&event) {
+            owner.fan_out_and_push(&event);
+          }
         }
         // The source drained while a consumer is still attached: it is OWED every parked
         // Rescan before the stream ends (no silent loss on source drain).
@@ -486,21 +492,27 @@ where
     }
   };
 
-  if drain_owed {
-    // Source drain: deliver the coalesced tail AND every owed parked Rescan before ending
-    // the stream, retrying as the consumer drains (design backpressure doc, checklist #1).
-    owner.drain_owed_before_shutdown().await;
+  // Whichever `Close` we owe an acknowledgement: the loop-break `Close` (consumer-initiated),
+  // or a `Close` that interrupted the source-drain retry (returned by
+  // `drain_owed_before_shutdown` so the blocking retry could stop and stay responsive). The two
+  // are mutually exclusive — a source-drain break carries no `closing`.
+  let ack = if drain_owed {
+    // Source drain: deliver the coalesced tail AND every owed parked Rescan before the stream
+    // ends — ordered so a parked subscription's tail delta never precedes its dominating Rescan
+    // — retrying as the consumer drains, while servicing the command mailbox so a `Close` behind
+    // a full channel is always answered (no silent loss, without an unserviceable `Close`).
+    owner.drain_owed_before_shutdown().await
   } else {
-    // Consumer-initiated `Close`, or every handle dropped: best-effort force-emit the
-    // still-settling coalescer tail and one pass of any parked Rescans so a burst interrupted
-    // by the close is delivered when the channel has room. The undrained tail / owed Rescan on
-    // a full channel is permitted to be lost here (the consumer asked to stop, or nobody is
-    // left) — teardown never blocks on the channel, so `Close` stays responsive.
-    owner.flush_coalescer_tail();
-    owner.flush_pending_rescans();
-  }
+    // Consumer-initiated `Close`, or every handle dropped: one best-effort ordered pass (owed
+    // Rescans ahead of any tail delta; a parked sub's tail purged) so a burst interrupted by the
+    // close is delivered when the channel has room. The undrained tail / owed Rescan on a full
+    // channel is permitted to be lost here (the consumer asked to stop, or nobody is left) —
+    // teardown never blocks on the channel, so `Close` stays responsive.
+    owner.drain_owed_once();
+    closing
+  };
   // Dropping `owner` (and its source) performs the orderly source teardown.
-  if let Some(reply) = closing {
+  if let Some(reply) = ack {
     let _ = reply.send(Ok(()));
   }
 }
@@ -709,8 +721,9 @@ where
   /// - the consumer-initiated unwatch path ([`reconcile_unwatch`](Self::reconcile_unwatch))
   ///   drops it — the caller asked to stop watching, so no coverage-loss re-enumeration is
   ///   owed;
-  /// - the root-death path ([`retire_if_dead`](Self::retire_if_dead)) **keeps** it — the
-  ///   terminal coverage-loss `Rescan`, parked here only because the channel was full, IS
+  /// - both root-retirement paths
+  ///   ([`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan)) **keep**
+  ///   it — the terminal coverage-loss `Rescan`, parked there *before* this frees the state, IS
   ///   owed, and self-drains via [`flush_pending_rescans`](Self::flush_pending_rescans) after
   ///   retirement. It cannot leak (that flush clears the entry on `Ok`/`Closed`, and the set
   ///   is owner-private and bounded by the live-subscription count), and its stored `Epoch`
@@ -737,9 +750,10 @@ where
   ///   [`repoint`](epoch::EpochLedger::repoint)s onto the new handle (exactly a widen
   ///   re-point) and re-enumerates. The subscription is live-and-covered again.
   /// - if the re-arm **fails** (the root is genuinely dead), or its committed key **diverged**
-  ///   (a canonicalization race we cannot cleanly rebind), **retire** the root
-  ///   ([`retire_disarmed_root`](Self::retire_disarmed_root)): a dominating terminal Rescan
-  ///   per subscriber, then free its index / filter / epoch and drop it from the view.
+  ///   (a canonicalization race we cannot cleanly rebind), **retire** the root through the
+  ///   shared [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan): a
+  ///   durable dominating terminal Rescan per subscriber, then free its index / filter / epoch
+  ///   and drop it from the view.
   ///
   /// Either way no subscription is left recorded-live-but-disarmed-and-published-watched.
   async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) {
@@ -769,32 +783,64 @@ where
           // Re-armed, but at a divergent key we cannot cleanly rebind: disarm the stray new
           // handle and retire the old root so its subs re-enumerate and it leaves the view.
           self.source.disarm(new_handle).await;
-          self.retire_disarmed_root(old, &root_key);
+          self.retire_root_with_terminal_rescan(old);
         }
-        Err(_) => self.retire_disarmed_root(old, &root_key),
+        Err(_) => self.retire_root_with_terminal_rescan(old),
       }
     }
   }
 
-  /// Retires a subsumed root that could not be re-armed after a failed widen: a dominating
-  /// terminal [`Rescan`](tributary_fs::EventKind::Rescan) per subscriber (so each
-  /// re-enumerates and learns the root is gone), then frees its index / reverse-index / side
-  /// table (via [`force_remove_root`](Subsumer::force_remove_root)) and every subscriber's
-  /// per-sub filter + epoch state (invariant I4). After this the root no longer reads
-  /// watched, so a dedup caller re-installs it (no silent loss).
-  fn retire_disarmed_root(&mut self, old: S::Handle, root_key: &[C]) {
-    let subscribers = self.subsumer.force_remove_root(old);
-    let mut rescans = Vec::with_capacity(subscribers.len());
+  /// The single **park-terminal-Rescan-then-retire** primitive (invariant I4, no silent loss):
+  /// retires a root while durably owing every subscriber a dominating terminal
+  /// [`Rescan`](tributary_fs::EventKind::Rescan), so each re-enumerates its key and learns the
+  /// root is gone. Both retirement paths route through it — root death
+  /// ([`retire_if_dead`](Self::retire_if_dead)) and a failed widen whose subsumed root cannot
+  /// re-arm ([`restore_disarmed_roots`](Self::restore_disarmed_roots)) — so the class cannot
+  /// recur per-path. After this the root no longer reads watched, so a dedup caller re-installs
+  /// it.
+  ///
+  /// The **order is load-bearing**. For each subscriber it *parks* a dominating terminal
+  /// `Rescan` straight into `needs_rescan` — the root's own key (captured while the root is
+  /// still recorded) plus a non-rebasing strictly-dominating
+  /// [`shed_rescan`](epoch::EpochLedger::shed_rescan) epoch — **before**
+  /// [`force_remove_root`](Subsumer::force_remove_root) frees the subsumer state. Parking
+  /// directly (via [`merge_max`]) rather than pushing through [`try_emit`](Self::try_emit) is
+  /// what closes the overflow hole: `try_emit`'s [`park_rescan`](Self::park_rescan) resolves the
+  /// key via `subscription_key`, which is **gone** once the root is force-removed, so on a full
+  /// channel the owed terminal Rescan would be silently dropped. The parked entry carries its
+  /// own key + epoch and depends on no later lookup;
+  /// [`flush_pending_rescans`](Self::flush_pending_rescans) self-drains it once the consumer
+  /// resumes (`needs_rescan` is deliberately **kept** across retirement — see
+  /// [`retire_sub_state`](Self::retire_sub_state)). Its stored epoch is captured before the
+  /// ledger entry is freed, so delivering it post-retire is correct.
+  ///
+  /// A no-op if `handle` is not a live root.
+  fn retire_root_with_terminal_rescan(&mut self, handle: S::Handle) {
+    // Capture the root's key + subscribers while it is still recorded; force_remove is deferred
+    // until every owed terminal Rescan is durably parked.
+    let Some((root_key, subscribers)) = self
+      .subsumer
+      .entry(handle)
+      .map(|record| (record.key.clone(), record.subscribers.clone()))
+    else {
+      return;
+    };
     for &sub in &subscribers {
-      // Mint the dominating Rescan before freeing the ledger entry (repoint reads it); the
-      // built event carries its epoch, so the subsequent free cannot perturb it.
-      let rescan = self.epochs.repoint(sub);
-      rescans.push(Event::rescan(sub, root_key.to_vec(), rescan));
+      // Park a dominating terminal Rescan straight into `needs_rescan` (the root's key + a
+      // strictly-dominating epoch), independent of any later `subscription_key` lookup, so a
+      // full channel cannot drop it. Drop the sub's now-suspect buffered coalescer deltas — the
+      // Rescan dominates and re-enumerates them.
+      let epoch = self.epochs.shed_rescan(sub);
+      merge_max(&mut self.needs_rescan, sub, root_key.clone(), epoch);
+      if let Some(coalescer) = self.coalescer.as_mut() {
+        coalescer.drop_subscription(sub);
+      }
     }
-    for sub in subscribers {
+    // The owed Rescans are now durable: tear the dead root out of the index and free each
+    // subscriber's per-sub filter + epoch state (the parked `needs_rescan` entry is kept).
+    for sub in self.subsumer.force_remove_root(handle) {
       self.retire_sub_state(sub);
     }
-    self.push_all(rescans);
   }
 
   /// Fans one raw source event out to its covering, admitting subscribers and pushes the
@@ -919,35 +965,30 @@ where
     )
   }
 
-  /// Retires a source root that has **died**, after its terminal signal was fanned out
-  /// (invariant I4). When a watched root is deleted, the source tears its handle down and
-  /// emits a terminal [`Rescan`](tributary_fs::EventKind::Rescan); the fan-out on this same
-  /// event (run just before this call) either delivered that Rescan to every subscriber or —
-  /// if the event channel was full — **parked it** in `needs_rescan`, where
-  /// [`flush_pending_rescans`](Self::flush_pending_rescans) self-drains it once the consumer
-  /// resumes (loss is never silent). This then frees the now-dead root's index / filter /
-  /// epoch state while **keeping** each subscription's parked terminal Rescan, so its owed
-  /// re-enumeration survives retirement (design backpressure doc).
+  /// Classifies a raw source event and, when it is a **terminal dead-root**
+  /// [`Rescan`](tributary_fs::EventKind::Rescan), retires that root through the shared
+  /// [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan) primitive and
+  /// returns `true` (the run loop then skips the ordinary fan-out — the primitive already owes
+  /// every subscriber a durable dominating Rescan). Returns `false` for every other event (an
+  /// ordinary delivery, or an overflow `Rescan` on a still-live root), which the caller fans
+  /// out normally.
   ///
-  /// The terminal-vs-overflow distinction is the source liveness hook
-  /// [`Source::root_key`]: it answers `None` exactly for a dead/retired root, so a
-  /// terminal `Rescan` (whose root the source has forgotten) is retired while an overflow
-  /// re-enumeration on a still-live root is left alone. Only a source-emitted terminal
-  /// signal reaches here — synthetic widen Rescans are pushed directly, never pulled from
-  /// the stream.
-  fn retire_if_dead(&mut self, raw: &SourceEvent<C, S::Handle>) {
+  /// The terminal-vs-overflow distinction is the source liveness hook [`Source::root_key`]: it
+  /// answers `None` exactly for a dead/retired root, so a terminal `Rescan` (whose root the
+  /// source has forgotten) is retired while an overflow re-enumeration on a still-live root is
+  /// fanned out. Only a source-emitted terminal signal reaches here — synthetic widen Rescans
+  /// are minted directly, never pulled from the stream.
+  ///
+  /// Routing the terminal Rescan through the retire primitive (rather than fanning it out and
+  /// then force-removing) is the structural fix for the retire-with-Rescan class: the owed
+  /// dominating Rescan is parked into `needs_rescan` **before** the subsumer state is freed, so
+  /// a full channel can never drop it, and both retirement paths share one primitive.
+  fn retire_if_dead(&mut self, raw: &SourceEvent<C, S::Handle>) -> bool {
     if !raw.is_rescan() || self.source.root_key(raw.handle()).is_some() {
-      return;
+      return false;
     }
-    // The single retirement point (invariant I4): drop the dead root from the index and free
-    // each subscriber's filter + epoch — but do NOT co-retire `needs_rescan`. The terminal
-    // coverage-loss Rescan fanned out just above parks there when the channel is full, and it
-    // must survive retirement to self-drain so the consumer still learns the root is gone
-    // (design backpressure doc, no silent loss on root death). This is why the death path
-    // calls `retire_sub_state` bare, unlike the consumer-initiated unwatch path.
-    for sub in self.subsumer.force_remove_root(raw.handle()) {
-      self.retire_sub_state(sub);
-    }
+    self.retire_root_with_terminal_rescan(raw.handle());
+    true
   }
 
   /// Pushes attributed events to the event stream: through the coalescer (admit + drain
@@ -986,74 +1027,102 @@ where
     }
   }
 
-  /// Best-effort force-emits every still-settling coalescer entry onto the event stream,
-  /// regardless of deadline — the close/drain path (design §6). A no-op when debounce is
-  /// disabled.
+  /// One best-effort **ordered** delivery pass of everything owed at teardown — the coalesced
+  /// tail AND every parked per-subscription overflow [`Rescan`](tributary_fs::EventKind::Rescan)
+  /// — ordered so a parked subscription's buffered tail delta never precedes its dominating
+  /// `Rescan` (design backpressure doc, checklist #1/#5, no silent loss).
   ///
-  /// This is teardown, so it emits with a bare non-blocking
-  /// [`try_send`](async_channel::Sender::try_send) rather than the ordinary
-  /// [`try_emit`](Self::try_emit) funnel: the owner (and its `needs_rescan` set) is about to
-  /// drop, so there is no point parking an overflow `Rescan` for a subscription that will not
-  /// outlive this call. The tail is delivered when the channel has room, but a
-  /// consumer-initiated close is permitted to lose the undrained tail on a full channel
-  /// rather than block teardown. Bypassing [`try_emit`](Self::try_emit)'s suppression check
-  /// is harmless even when the tail carries a parked subscription's deltas: `push_all` admits
-  /// to the coalescer unconditionally (suppression is applied at drain time, not admit time),
-  /// so a parked sub can re-buffer deltas after its `park_rescan` dropped the old ones. Those
-  /// deltas stamp `base + raw`, which by the non-rebasing `shed_rescan` design sort at or above
-  /// the parked `Rescan`'s epoch — and teardown never runs
-  /// [`flush_pending_rescans`](Self::flush_pending_rescans), so that `Rescan` is not delivered
-  /// here. They are therefore extra best-effort deliveries, never losses and never deltas
-  /// ordered after their own dominating `Rescan`.
-  fn flush_coalescer_tail(&mut self) {
+  /// The seam this closes (the coalescer admit-vs-suppress ordering): [`push_all`](Self::push_all)
+  /// admits to the coalescer *before* [`try_emit`](Self::try_emit) suppresses a parked
+  /// subscription, so a parked sub can still hold buffered tail deltas whose epoch sits **at or
+  /// above** its parked `Rescan`'s (the non-rebasing [`shed_rescan`](epoch::EpochLedger::shed_rescan)
+  /// keeps later same-root deltas climbing). Delivering those first would put a delta at/above
+  /// the `Rescan`'s epoch ahead of it, so a high-water consumer would ignore the owed `Rescan`
+  /// and the overflow loss would go unrecovered. So this:
+  ///
+  /// 1. flushes the coalescer tail, then **drops every entry for a subscription in
+  ///    `needs_rescan`** — its owed dominating `Rescan` re-enumerates and dominates them;
+  /// 2. delivers the owed `Rescan`s ([`flush_pending_rescans`](Self::flush_pending_rescans))
+  ///    **before** the tail, so a parked sub gets *only* its dominating `Rescan`;
+  /// 3. routes the remaining (non-parked) tail through the suppress-safe
+  ///    [`try_emit`](Self::try_emit) — never a bare `try_send` — so a full channel sheds a tail
+  ///    delta to a *durable* dominating `Rescan` (recovered on a later pass) rather than dropping
+  ///    it or ordering it after a `Rescan`.
+  ///
+  /// Every emit is non-blocking (the owner never awaits the event sender). A caller that must
+  /// not lose an owed `Rescan` on a full channel (source drain) re-runs this across a retry;
+  /// [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) does exactly that.
+  fn drain_owed_once(&mut self) {
     let mut tail = Vec::new();
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.flush_all(&mut tail);
     }
+    // Drop parked subs' tail deltas — their owed dominating Rescan (delivered next) dominates
+    // and re-enumerates them; a non-parked sub's tail is kept.
+    tail.retain(|event| !self.needs_rescan.contains_key(&event.subscription()));
+    // Owed Rescans first, then the non-parked tail through the suppress-safe funnel.
+    self.flush_pending_rescans();
     for event in tail {
-      let _ = self.events.try_send(event);
+      self.try_emit(event);
     }
   }
 
   /// The **source-drain** shutdown drain (design backpressure doc, checklist #1): when the
-  /// source's `next` yields `None` while a consumer is still attached, deliver everything
-  /// OWED — the coalesced tail AND every parked per-subscription overflow Rescan — *before*
-  /// the stream ends, so a resuming consumer never reaches stream-end missing an owed
-  /// dominating Rescan (no silent loss on source drain).
+  /// source's `next` yields `None` while a consumer is still attached, deliver everything OWED
+  /// — the coalesced tail AND every parked per-subscription overflow Rescan — before the stream
+  /// ends, so a resuming consumer never reaches stream-end missing an owed dominating Rescan
+  /// (no silent loss on source drain).
   ///
-  /// Every emit is a non-blocking [`try_send`](async_channel::Sender::try_send) — the owner
-  /// **never awaits the event-stream sender** (invariant III preserved even at teardown) —
-  /// retried across a short [`RETRY`] sleep while the channel is full, reclaiming each refused
-  /// tail event and re-offering each parked Rescan. Bounded: it returns once everything owed is
-  /// delivered, or the consumer is gone ([`flush_pending_rescans`](Self::flush_pending_rescans)
-  /// clears parked entries on [`Closed`](async_channel::TrySendError::Closed), and
-  /// [`is_closed`](async_channel::Sender::is_closed) short-circuits an all-refused channel whose
-  /// receivers have all dropped).
+  /// Each pass is an ordered [`drain_owed_once`](Self::drain_owed_once) (a parked sub's tail
+  /// delta never precedes its `Rescan`), retried across a short [`RETRY`] sleep while the
+  /// channel is full — reclaiming refused tail events (shed to durable `Rescan`s) and
+  /// re-offering each parked `Rescan` — until everything owed is delivered or the consumer is
+  /// gone ([`is_closed`](async_channel::Sender::is_closed) short-circuits an all-refused channel
+  /// whose receivers have all dropped). The owner **never awaits the event sender** (invariant
+  /// III preserved even at teardown) — only the command receiver and the retry timer.
   ///
-  /// This runs **only** on the source-drain break — a consumer-initiated `Close` or a dropped
-  /// last handle owes nothing and takes the non-blocking best-effort path instead, so this
-  /// retry can never block a `Close`.
-  async fn drain_owed_before_shutdown(&mut self) {
-    let mut tail = Vec::new();
-    if let Some(coalescer) = self.coalescer.as_mut() {
-      coalescer.flush_all(&mut tail);
-    }
+  /// The retry **stays responsive to the command mailbox** (invariant II): a blind sleep would
+  /// let a [`Close`](Command::Close) queue forever while the drain spins — behind a full channel
+  /// a held-but-not-draining receiver keeps the channel both full and un-closed, so neither the
+  /// slot-freed nor the all-receivers-dropped exit ever fires. So it
+  /// [`select!`](futures_util::select_biased)s the retry timer against
+  /// [`commands.recv`](async_channel::Receiver::recv): a `Close` (or the command channel closing
+  /// = every handle dropped) stops the blocking retry, and the `Close` reply is returned to the
+  /// caller (which does a non-blocking best-effort teardown and acks it) so `close()` always
+  /// completes even mid-drain. A `watch`/`unwatch` arriving mid-teardown is failed fast (the
+  /// owner is quiescing) and the owed-`Rescan` drain continues.
+  ///
+  /// Returns the [`Close`](Command::Close) reply if a `Close` interrupted the drain, else
+  /// [`None`].
+  async fn drain_owed_before_shutdown(
+    &mut self,
+  ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
     loop {
-      // Re-offer the coalesced tail, keeping only the events the (full) channel still refuses.
-      tail = tail
-        .into_iter()
-        .filter_map(|event| match self.events.try_send(event) {
-          Ok(()) | Err(async_channel::TrySendError::Closed(_)) => None,
-          Err(async_channel::TrySendError::Full(returned)) => Some(returned),
-        })
-        .collect();
-      // Re-offer every owed parked Rescan (clears delivered / consumer-gone entries).
-      self.flush_pending_rescans();
-      if (tail.is_empty() && self.needs_rescan.is_empty()) || self.events.is_closed() {
-        break;
+      self.drain_owed_once();
+      if self.needs_rescan.is_empty() || self.events.is_closed() {
+        return None;
       }
-      // Wait for the consumer to drain a slot, then retry — never awaiting the sender itself.
-      R::sleep(RETRY).await;
+      let sleep = R::sleep(RETRY).fuse();
+      futures_util::pin_mut!(sleep);
+      futures_util::select_biased! {
+        cmd = self.commands.recv().fuse() => match cmd {
+          // A `Close` behind the full channel: stop the blocking retry and hand it back so the
+          // caller does a non-blocking best-effort teardown and acks it — `close()` completes.
+          Ok(Command::Close { reply }) => return Some(reply),
+          // Every handle dropped: nobody is left to receive the owed Rescans — stop and tear
+          // down (the caller's best-effort final pass runs next).
+          Err(_) => return None,
+          // A watch/unwatch mid-teardown: the owner is quiescing, so fail it fast (the handle
+          // surfaces `Closed`) and keep draining the owed Rescans (no silent loss).
+          Ok(Command::Watch { reply, .. }) => {
+            let _ = reply.send(Err(WatchError::Fs(WatchRootError::Closed)));
+          }
+          Ok(Command::Unwatch { reply, .. }) => {
+            let _ = reply.send(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)));
+          }
+        },
+        _ = sleep => {}
+      }
     }
   }
 }
