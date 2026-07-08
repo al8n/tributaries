@@ -645,6 +645,157 @@ fn drop_subscription_discards_only_that_subscriptions_entries() {
 }
 
 // -------------------------------------------------------------------------------
+// Per-subscription admission-order drains (design §8, Codex R18).
+//
+// Every multi-entry drain must emit a subscription's entries in admission (= epoch) order,
+// NOT BTreeMap path-key order. Each test uses the same fixture: two paths whose lexical
+// order OPPOSES their epoch order — `/z` admitted earlier at the LOWER epoch 1, `/a`
+// admitted later at the HIGHER epoch 2 (`/a` < `/z` lexically, but epoch 2 > 1). The
+// pre-fix path-key drain emitted `/a` (epoch 2) before `/z` (epoch 1) — a subscription's
+// epochs going backwards, which a monotone-epoch consumer silently drops. The fix orders
+// by the admission sequence, so `/z` (epoch 1) precedes `/a` (epoch 2).
+// -------------------------------------------------------------------------------
+
+#[test]
+fn drain_ready_emits_buffered_in_epoch_order_not_path_order() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  // `/z` admitted FIRST at the LOWER epoch; `/a` admitted SECOND at the HIGHER epoch.
+  c.admit(modified(s, "/z", 1), clk.at(0));
+  c.admit(modified(s, "/a", 2), clk.at(1));
+
+  // Both settle by t=20; the settle-timer drain releases them together.
+  let out = drain(&mut c, clk.at(20));
+  assert_eq!(
+    out.len(),
+    2,
+    "both distinct paths emit (no cross-path collapse)"
+  );
+  assert_eq!(
+    out[0].path(),
+    PathBuf::from("/z"),
+    "the earlier-admitted lower-epoch path emits first — NOT the lexically-first /a"
+  );
+  assert_eq!(out[0].epoch(), Epoch::new(1));
+  assert_eq!(
+    out[1].path(),
+    PathBuf::from("/a"),
+    "the later-admitted higher-epoch path emits second"
+  );
+  assert_eq!(out[1].epoch(), Epoch::new(2));
+  assert!(
+    out.windows(2).all(|w| w[0].epoch() <= w[1].epoch()),
+    "a subscription's buffered epochs never emit backwards"
+  );
+}
+
+#[test]
+fn flush_all_emits_buffered_in_epoch_order_not_path_order() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  c.admit(modified(s, "/z", 1), clk.at(0));
+  c.admit(modified(s, "/a", 2), clk.at(1));
+
+  // Force-emit the still-settling tail (as a stream close would), regardless of deadline.
+  let mut out = Vec::new();
+  c.flush_all(&mut out);
+  assert_eq!(out.len(), 2);
+  assert_eq!(
+    out[0].path(),
+    PathBuf::from("/z"),
+    "lower-epoch tail entry first"
+  );
+  assert_eq!(out[0].epoch(), Epoch::new(1));
+  assert_eq!(
+    out[1].path(),
+    PathBuf::from("/a"),
+    "higher-epoch tail entry second"
+  );
+  assert_eq!(out[1].epoch(), Epoch::new(2));
+  assert!(
+    out.windows(2).all(|w| w[0].epoch() <= w[1].epoch()),
+    "the teardown flush never delivers a subscription's epochs out of order"
+  );
+}
+
+#[test]
+fn rescan_flush_emits_buffered_in_epoch_order_not_path_order() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  c.admit(modified(s, "/z", 1), clk.at(0));
+  c.admit(modified(s, "/a", 2), clk.at(1));
+
+  // A Rescan (epoch 3) flushes the whole subscription buffer into the ready queue ahead of
+  // itself — in admission (seq) order, so the FIFO replay is lowest-epoch-first.
+  c.admit(rescan(s, "/root", 3), clk.at(2));
+
+  let out = drain(&mut c, clk.at(2));
+  assert_eq!(out.len(), 3, "both flushed entries plus the Rescan");
+  assert_eq!(
+    out[0].path(),
+    PathBuf::from("/z"),
+    "lower-epoch buffered entry flushed first"
+  );
+  assert_eq!(out[0].epoch(), Epoch::new(1));
+  assert_eq!(
+    out[1].path(),
+    PathBuf::from("/a"),
+    "higher-epoch buffered entry flushed second"
+  );
+  assert_eq!(out[1].epoch(), Epoch::new(2));
+  assert!(
+    out[2].is_rescan(),
+    "the Rescan bypasses to the end of the flush"
+  );
+  assert_eq!(out[2].epoch(), Epoch::new(3));
+  assert!(
+    out.windows(2).all(|w| w[0].epoch() <= w[1].epoch()),
+    "flushed epochs stay monotone: 1, 2, then the Rescan's 3"
+  );
+}
+
+#[test]
+fn moved_flush_emits_buffered_in_epoch_order_not_path_order() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(config());
+  let s = sub(1);
+
+  c.admit(modified(s, "/z", 1), clk.at(0));
+  c.admit(modified(s, "/a", 2), clk.at(1));
+
+  // A Moved (epoch 3) at unrelated endpoints flushes the WHOLE subscription buffer ahead of
+  // itself — the same seq-ordered flush machinery a Rescan uses.
+  c.admit(moved(s, "/dst", "/src", 3), clk.at(2));
+
+  let out = drain(&mut c, clk.at(2));
+  assert_eq!(out.len(), 3, "both flushed entries plus the Moved");
+  assert_eq!(
+    out[0].path(),
+    PathBuf::from("/z"),
+    "lower-epoch buffered entry flushed first"
+  );
+  assert_eq!(out[0].epoch(), Epoch::new(1));
+  assert_eq!(
+    out[1].path(),
+    PathBuf::from("/a"),
+    "higher-epoch buffered entry flushed second"
+  );
+  assert_eq!(out[1].epoch(), Epoch::new(2));
+  assert!(is_moved(&out[2]), "the Moved emits whole after the flush");
+  assert_eq!(out[2].epoch(), Epoch::new(3));
+  assert!(
+    out.windows(2).all(|w| w[0].epoch() <= w[1].epoch()),
+    "flushed epochs stay monotone: 1, 2, then the Moved's 3"
+  );
+}
+
+// -------------------------------------------------------------------------------
 // Property tests (design §10): no silent loss, determinism, no dominated post-Rescan.
 // -------------------------------------------------------------------------------
 
