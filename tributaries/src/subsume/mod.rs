@@ -47,11 +47,46 @@ use crate::{subscription::Subscription, view::WatchView};
 #[cfg(test)]
 mod tests;
 
+/// The last committed watch-set, published as **one** immutable snapshot so a
+/// [`WatchView`] reader never sees the root plane and the coverage plane torn apart.
+///
+/// Two immutable [`sync::Radix`](Radix)es, kept in lockstep and swapped together:
+///
+/// - `roots` — `root key -> record`: the armed-root plane. Answers root membership
+///   ([`WatchView::contains`]), the live-root count ([`WatchView::len`]), and the
+///   **attribution value** ([`WatchView::covering`] / [`resolve`](WatchView::resolve)
+///   read the covering root's value here).
+/// - `covers` — `subscription key -> refcount`: the **live-subscription coverage**
+///   plane, keyed on every live subscription's own key (a `usize` refcount folds
+///   several subscriptions sharing one key). Answers [`WatchView::is_watched`].
+///
+/// Why two planes: an armed root can outlive the subscription whose key equalled its
+/// own — a `Widen` then `unwatch` of the widening watch, or a `Covered` watch then
+/// `unwatch` of the root's own watch — leaving the armed root **broader than any live
+/// subscription** (the narrower covered/re-pointed subscriptions remain). Deriving
+/// `is_watched` from `roots` would then over-report: it would call a key watched that
+/// `fan_out` delivers to no subscriber, and a dedup caller (the indexer) would skip
+/// installing it and silently miss its changes. `is_watched` is therefore answered from
+/// `covers` — true iff some **live subscription's own key** is an ancestor-or-equal of
+/// the queried key, which is exactly the set `fan_out` delivers to (design §5). The
+/// armed root staying broad is harmless (a re-installed subscription is `Covered` under
+/// it, no re-arm — self-healing; re-narrowing the arm is deferred to M2).
+///
+/// Not [`Debug`]: the underlying [`sync::Radix`](Radix) is not, and no reader needs it.
+pub(crate) struct Published<C, V, H> {
+  /// The armed-root plane: `root key -> record` (membership, count, attribution value).
+  pub(crate) roots: Radix<C, RootRecord<C, V, H>>,
+  /// The live-subscription coverage plane: `subscription key -> refcount` of live
+  /// subscriptions registered at that key. Present (refcount ≥ 1) iff some live
+  /// subscription covers the key — the truthful `is_watched` set.
+  pub(crate) covers: Radix<C, usize>,
+}
+
 /// The shared, wait-free-readable publication of the authoritative watch-set: an
-/// `arc_swap` slot holding the last committed immutable [`sync::Radix`](Radix). The
+/// `arc_swap` slot holding the last committed immutable [`Published`] snapshot. The
 /// [`Subsumer`] publishes into it after every commit; each [`WatchView`] clone reads
 /// the same slot.
-pub(crate) type Shared<C, V, H> = Arc<ArcSwap<Radix<C, RootRecord<C, V, H>>>>;
+pub(crate) type Shared<C, V, H> = Arc<ArcSwap<Published<C, V, H>>>;
 
 /// One live root's registry record — the value stored in the subsumption radix.
 ///
@@ -164,6 +199,13 @@ struct PendingWatch<C, V> {
 pub(crate) struct Subsumer<C, V, H> {
   /// The authoritative watch-set: `key -> record`. The disjointness / ancestor plane.
   index: Radix<C, RootRecord<C, V, H>>,
+  /// The authoritative **live-subscription coverage** plane: `subscription key ->
+  /// refcount`. Every live subscription's own key is present (the `usize` counts the
+  /// subscriptions sharing that key), so a `get_ancestor` here answers "is some live
+  /// subscription an ancestor-or-equal of this key" — the truthful `is_watched` set
+  /// published in [`Published::covers`]. Maintained in lockstep with `subs`: incremented
+  /// on every `commit_watch`, decremented on every `plan_unwatch` / `force_remove_root`.
+  covers: Radix<C, usize>,
   /// Root handle → its radix key. The O(1) reverse lookup for [`entry`](Self::entry).
   by_handle: HashMap<H, Vec<C>>,
   /// Live subscription → the root it rides, its own key, and its interest.
@@ -222,9 +264,14 @@ where
   /// watch-set.
   pub(crate) fn new() -> Self {
     let index = Radix::new();
-    let shared = Arc::new(ArcSwap::from_pointee(index.clone()));
+    let covers = Radix::new();
+    let shared = Arc::new(ArcSwap::from_pointee(Published {
+      roots: index.clone(),
+      covers: covers.clone(),
+    }));
     Self {
       index,
+      covers,
       by_handle: HashMap::new(),
       subs: HashMap::new(),
       pending: HashMap::new(),
@@ -240,10 +287,43 @@ where
   }
 
   /// Publishes the current authoritative watch-set into the shared slot — the
-  /// **commit → publish** step run after every committed mutation (design §5). The
-  /// published tree is an O(1) structural-sharing clone.
+  /// **commit → publish** step run after every committed mutation (design §5). Both
+  /// planes (the armed-root `index` and the live-subscription `covers`) are swapped
+  /// together as one [`Published`] snapshot, so a reader never sees them torn apart;
+  /// each tree is an O(1) structural-sharing clone.
   fn publish(&self) {
-    self.shared.store(Arc::new(self.index.clone()));
+    self.shared.store(Arc::new(Published {
+      roots: self.index.clone(),
+      covers: self.covers.clone(),
+    }));
+  }
+
+  /// Records one more live subscription at `key` in the coverage plane (bumps its
+  /// refcount, inserting at 1 if absent). Called on every committed `watch` regardless
+  /// of outcome — `Disjoint`, `Widen`, and `Covered` all add a live subscription whose
+  /// own key must answer `is_watched` truthfully.
+  fn cover_add(&mut self, key: &[C]) {
+    let mut txn = self.covers.txn();
+    let next = txn.get(key).map_or(1, |count| count + 1);
+    txn.insert(key, next);
+    self.covers = txn.commit();
+  }
+
+  /// Drops one live subscription at `key` from the coverage plane (decrements its
+  /// refcount, removing the key when it reaches zero). Called on every `unwatch` and for
+  /// every subscriber of a force-removed dead root, so `covers` tracks exactly the set
+  /// of keys some live subscription still covers.
+  fn cover_remove(&mut self, key: &[C]) {
+    let mut txn = self.covers.txn();
+    match txn.get(key).copied() {
+      Some(count) if count > 1 => {
+        txn.insert(key, count - 1);
+      }
+      _ => {
+        txn.remove(key);
+      }
+    }
+    self.covers = txn.commit();
   }
 
   /// Plans a `watch` of `key` carrying `value` with `interest`, returning the
@@ -335,6 +415,9 @@ where
         record.subscribers.push(*sub);
         txn.insert(root_key.as_slice(), record);
         self.index = txn.commit();
+        // The covered subscription's own (narrower) key joins the coverage plane, so
+        // `is_watched` stays truthful for it even though it shares the covering root.
+        self.cover_add(&key);
         self.subs.insert(
           *sub,
           SubRecord {
@@ -360,6 +443,7 @@ where
         txn.insert(root_key.as_slice(), record);
         self.index = txn.commit();
         self.by_handle.insert(fs_root, root_key.clone());
+        self.cover_add(&root_key);
         self.subs.insert(
           *sub,
           SubRecord {
@@ -409,6 +493,10 @@ where
             .expect("re-pointed subscription is live")
             .root = fs_root;
         }
+        // Only the new (widening) subscription's key joins the coverage plane; each
+        // re-pointed subscription's own key is invariant under the widen (it rides a new
+        // root, but its key is unchanged), so it is already counted in `covers`.
+        self.cover_add(&root_key);
         self.subs.insert(
           *sub,
           SubRecord {
@@ -457,6 +545,10 @@ where
     }
     self.index = txn.commit();
 
+    // Drop this subscription's own key from the coverage plane (the root may live on for
+    // its other, narrower subscribers, but this key is no longer covered by *this* sub).
+    self.cover_remove(&record.key);
+
     let outcome = if emptied {
       self.by_handle.remove(&record.root);
       UnwatchOutcome::RootEmptied {
@@ -491,10 +583,42 @@ where
       .expect("force-removed root record");
     self.index = txn.commit();
     for &sub in &record.subscribers {
-      self.subs.remove(&sub);
+      // Free the dead root's subscribers from the side table AND the coverage plane, so a
+      // retired root's keys stop answering `is_watched` true (they cover nothing now).
+      if let Some(sub_record) = self.subs.remove(&sub) {
+        self.cover_remove(&sub_record.key);
+      }
     }
     self.publish();
     record.subscribers
+  }
+
+  /// Rebinds the live root `old` onto a fresh handle `new`, keeping its key, record, and
+  /// subscribers — the **re-arm restore** the driver runs when a failed widen must put its
+  /// disarmed subsumed roots back (design driver-golden doc, invariant I3). A disarm then
+  /// re-arm at the *same* key yields a new source handle, so the record's handle, the
+  /// reverse index, and every subscriber's ridden-root pointer must move to it; no key
+  /// changes, so the coverage plane is untouched. A no-op if `old` is not a live root.
+  pub(crate) fn rebind_root(&mut self, old: H, new: H) {
+    let Some(root_key) = self.by_handle.get(&old).cloned() else {
+      return;
+    };
+    let mut txn = self.index.txn();
+    let Some(mut record) = txn.get(&root_key).cloned() else {
+      return;
+    };
+    record.handle = new;
+    let subscribers = record.subscribers.clone();
+    txn.insert(root_key.as_slice(), record);
+    self.index = txn.commit();
+    self.by_handle.remove(&old);
+    self.by_handle.insert(new, root_key);
+    for sub in subscribers {
+      if let Some(side) = self.subs.get_mut(&sub) {
+        side.root = new;
+      }
+    }
+    self.publish();
   }
 
   /// The key a live subscription was registered at, if any (its entry in the §4 side

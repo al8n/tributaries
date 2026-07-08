@@ -230,6 +230,88 @@ fn fs_path_preserves_plan_detects_subsumption_divergence() {
   );
 }
 
+/// A stale broad root must not make [`WatchView::is_watched`] over-report (regression:
+/// unwatch-after-widen / unwatch-a-covering-parent leaves the armed root broader than any
+/// live subscription; deriving membership from the root then wrongly reports a key watched
+/// that fan-out delivers to nobody, so a dedup caller skips it and silently loses changes).
+///
+/// `is_watched` must reflect **live-subscription** coverage: true iff some live
+/// subscription's own key is an ancestor-or-equal of the queried key — exactly the set
+/// fan-out delivers to. Both siblings of the class are exercised, then the self-heal:
+/// re-installing the falsely-uncovered key is `Covered` under the still-armed broad root.
+#[test]
+fn stale_broad_root_does_not_over_report_is_watched() {
+  // Sibling 1 — widen then unwatch the widening watch.
+  let mut s = S::new();
+  let mut h = Handles::default();
+  let view = s.view();
+
+  let (_narrow, _s_narrow) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  // Widen /a: subsumes /a/b onto a wider root /a; the /a watch's own key equals the root.
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_wide = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+  // Unwatch the widening /a watch: the root /a lives on for /a/b, now broader than it.
+  assert!(matches!(
+    s.plan_unwatch(s_wide),
+    Some(UnwatchOutcome::Dropped)
+  ));
+
+  assert!(
+    view.contains(&key("/a")),
+    "the armed root /a is deliberately left broad (no M2 re-narrow)"
+  );
+  assert!(
+    view.is_watched(&key("/a/b")),
+    "the live /a/b subscription is watched (fan-out delivers under it)"
+  );
+  assert!(
+    !view.is_watched(&key("/a/c")),
+    "/a/c is NOT watched: no live subscription covers it, so fan-out delivers it to \
+     nobody — is_watched must not over-report the stale broad root",
+  );
+  assert!(
+    view.resolve(&key("/a/c")).is_none(),
+    "attribution follows coverage: /a/c resolves to nothing, not a departed watch"
+  );
+
+  // Self-heal: a dedup caller re-installs /a/c. It is Covered under the still-armed /a root
+  // (no new arm), and is now truthfully watched.
+  let re = s.plan_watch(&key("/a/c"), (), Interest::all());
+  assert!(
+    matches!(re, WatchOutcome::Covered { .. }),
+    "re-installing /a/c is Covered under the still-armed broad root — no re-arm",
+  );
+  s.commit_watch(&re, wide, &key("/a/c"));
+  assert!(
+    view.is_watched(&key("/a/c")),
+    "after re-install /a/c is watched again (self-healing, no silent loss)"
+  );
+
+  // Sibling 2 — a Covered watch then unwatch of the root's OWN watch (no widen involved).
+  let mut s = S::new();
+  let mut h = Handles::default();
+  let view = s.view();
+
+  let (rx, s_x) = watch(&mut s, &mut h, "/x", Interest::all());
+  let (_covered, _s_xy) = watch(&mut s, &mut h, "/x/y", Interest::all());
+  assert_eq!(_covered, rx, "/x/y is covered by the /x root (no new arm)");
+  // Unwatch /x's own watch: the root /x lives on for /x/y, now broader than it.
+  assert!(matches!(s.plan_unwatch(s_x), Some(UnwatchOutcome::Dropped)));
+  assert!(
+    view.is_watched(&key("/x/y")),
+    "the live /x/y subscription is still watched"
+  );
+  assert!(
+    !view.is_watched(&key("/x/z")),
+    "/x/z is NOT watched: only /x/y is live, and it does not cover /x/z (same class)",
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Property tests: invariants over any random watch/unwatch sequence.
 // ---------------------------------------------------------------------------
