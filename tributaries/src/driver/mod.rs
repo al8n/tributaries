@@ -601,11 +601,11 @@ where
         // root through the unified park-terminal-Rescan-then-retire primitive — which durably owes
         // every subscriber a dominating `Rescan` *before* freeing the subsumer state, so a full
         // channel cannot drop it — and `retire_if_dead` returns `true`, so the ordinary fan-out is
-        // skipped here. A dead-root NON-`Rescan` terminal event (e.g. a root `Removed`) is fanned
-        // out exactly once INSIDE `retire_if_dead` before it retires, so the consumer still sees it
-        // AND no re-`watch` can cover against the dead handle (Codex R11 F1). Every event on a
-        // still-live root (an ordinary delivery, or an overflow `Rescan` on a live root) returns
-        // `false` and fans out normally here.
+        // skipped here. A dead-root NON-`Rescan` terminal event (e.g. a root `Removed`) is NOT
+        // separately fanned out: the parked terminal `Rescan` dominates and re-enumerates it, and
+        // fanning it through the coalescer under debounce would buffer-then-drop it (Codex R12 F2).
+        // Every event on a still-live root (an ordinary delivery, or an overflow `Rescan` on a live
+        // root) returns `false` and fans out normally here.
         Some(event) => {
           if !owner.retire_if_dead(&event) {
             owner.fan_out_and_push(&event);
@@ -749,11 +749,46 @@ where
     interest: Interest,
     filter: Filter<C>,
   ) -> Result<Subscription, WatchError> {
-    let outcome = self.subsumer.plan_watch(key, value, interest);
+    // Plan the watch, **re-planning past any dead covering root** so no subscription ever binds a
+    // source-forgotten handle (Codex R12 F1 — the structural close of the dead-root-coverage class).
+    // The owner loop is command-biased, so a `watch` queued while a dead root's terminal event is
+    // still pending runs FIRST — before [`retire_if_dead`](Self::retire_if_dead) consumes that event
+    // and force-removes the root. `plan_watch` would then classify `Covered` against the
+    // still-recorded dead handle and bind the newcomer to a root NO live source watch backs; the
+    // later terminal event retires that subscription, silently missing writes under a recreated root.
+    // So before committing a `Covered` plan, synchronously VALIDATE the covering root's liveness
+    // ([`Source::root_key`]): if the source has forgotten it, retire that dead root through the shared
+    // park-terminal-Rescan-then-retire primitive (durably owing every subscriber a dominating
+    // terminal `Rescan` — no silent loss) and re-plan against the now-updated subsumer.
+    //
+    // Deep-audit of every coverage classification vs handle liveness: `Disjoint` and `Widen` each
+    // [`arm`](Self::arm) a FRESH (hence live) root, and `Widen` re-points the subscribers of its
+    // subsumed roots — dead or not — onto that fresh root with dominating Rescans, so neither can
+    // commit a dead binding; only `Covered` reuses a recorded root, and it now breaks the loop solely
+    // once that root is validated live. The loop terminates: each re-plan force-removes exactly one
+    // root from the finite, pairwise-disjoint index, and a retired ancestor cannot reappear
+    // (disjointness leaves at most one ancestor of `key`, so the next plan finds none). It never
+    // double-arms — the `Covered` path arms nothing; only the terminal `Disjoint`/`Widen` arms, once,
+    // after the loop exits.
+    let outcome = loop {
+      let outcome = self.subsumer.plan_watch(key, value.clone(), interest);
+      if let WatchOutcome::Covered { fs_root, .. } = &outcome {
+        let covering = *fs_root;
+        if self.source.root_key(covering).is_none() {
+          // The covering root is source-forgotten (dead): discard this plan's pending reservation,
+          // retire the dead root (parking every subscriber's dominating terminal Rescan before its
+          // state is freed), and re-plan — never binding a `Covered` subscription to a dead handle.
+          self.subsumer.abort_watch(&outcome);
+          self.retire_root_with_terminal_rescan(covering);
+          continue;
+        }
+      }
+      break outcome;
+    };
     match &outcome {
       WatchOutcome::Covered { fs_root, sub } => {
-        // Already covered by a live root: no arm. The covering root's key was validated
-        // when first armed, so the newcomer's own key is used unchanged.
+        // Already covered by a root the re-plan loop just validated LIVE: no arm. The covering
+        // root's key was validated when first armed, so the newcomer's own key is used unchanged.
         let (fs_root, sub) = (*fs_root, *sub);
         self.subsumer.commit_watch(&outcome, fs_root, key);
         self.filters.insert(sub, filter);
@@ -1262,37 +1297,41 @@ where
   /// BY a terminal `Rescan`; retiring only on the `Rescan` would leave the dead root recorded
   /// across the `Removed`, so a caller that observes the `Removed` and re-`watch`es the same path
   /// **before** the queued `Rescan` is processed (the command-biased select loop runs the `watch`
-  /// first) would be classified `Covered` by the still-recorded dead handle — a subscription
-  /// backed by no live source watch, which the later terminal `Rescan` then retires, silently
-  /// missing writes under the recreated root. Retiring eagerly closes that window: `plan_watch`
-  /// classifies coverage against the coverage index, and a dead root only leaves that index once
-  /// `retire_root_with_terminal_rescan` force-removes it — which now happens on the `Removed`.
+  /// first) is classified `Covered` by the still-recorded dead handle. Retiring eagerly on the
+  /// `Removed` narrows that window; the structural close is [`reconcile_watch`](Self::reconcile_watch),
+  /// which validates a `Covered` plan's covering root against [`Source::root_key`] and retires-and-
+  /// re-plans past a dead one regardless of terminal-event timing (Codex R12 F1).
   ///
-  /// A non-`Rescan` terminal event is fanned out **exactly once** — here, before the retire (so
-  /// the consumer still sees it) while the root's subsumer entry is still live — and never
-  /// double-fanned, because the `true` return suppresses the run loop's own fan-out. A `Rescan`
-  /// needs no separate fan-out: the retire already owes every subscriber a dominating one.
-  /// Routing the retire through the shared primitive parks each owed dominating `Rescan` into
-  /// `needs_rescan` **before** the subsumer state is freed, so a full channel can never drop it,
-  /// and both retirement paths share one primitive.
+  /// A non-`Rescan` terminal event (a root `Removed`) is **not** separately fanned out: it is
+  /// dominated by the terminal `Rescan` this retire parks for every subscriber (redundant), and
+  /// routing it through `fan_out_and_push` under debounce would admit it to the coalescer, where the
+  /// retire's `drop_subscription` then discards it — buffered-then-dropped, silently losing the
+  /// promised event (Codex R12 F2). The coverage loss is signaled by the parked `Rescan` alone, which
+  /// [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan) parks into
+  /// `needs_rescan` **before** the subsumer state is freed, so a full channel can never drop it — the
+  /// dead-root path is then uniform (debounce or not) with nothing buffered-away, and both retirement
+  /// paths share one primitive.
   ///
   /// The terminal-vs-live distinction is the source liveness hook [`Source::root_key`]; only a
   /// source-emitted terminal signal reaches here (synthetic widen Rescans are minted directly,
   /// never pulled from the stream). Retirement is idempotent: a second terminal event for the
   /// same dead handle (e.g. the `Rescan` after a `Removed` already retired the root) finds no
   /// live root, so [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan)
-  /// returns early and nothing is double-retired or re-fanned.
+  /// returns early and nothing is double-retired.
   fn retire_if_dead(&mut self, raw: &SourceEvent<C, S::Handle>) -> bool {
     // A still-live root: normal fan-out (an overflow `Rescan` on a live root is NOT a retirement).
     if self.source.root_key(raw.handle()).is_some() {
       return false;
     }
-    // The root is dead. Fan out a non-`Rescan` terminal event ONCE (so the consumer still sees the
-    // `Removed`) while the subsumer entry is still live, THEN retire — so no queued `watch` can
-    // classify `Covered` against the dead handle before control returns to the select loop.
-    if !raw.is_rescan() {
-      self.fan_out_and_push(raw);
-    }
+    // The root is dead. Retire it through the shared park-terminal-Rescan-then-retire primitive,
+    // which durably owes EVERY subscriber a dominating terminal `Rescan` (parked before the subsumer
+    // state is freed) — the coverage-loss signal that re-enumerates each subtree so the consumer
+    // learns the root is gone. A non-`Rescan` terminal event (a root `Removed`) is NOT separately
+    // fanned out: it is dominated by that terminal `Rescan` (redundant), and routing it through
+    // `fan_out_and_push` under debounce would admit it to the coalescer, where the retire's
+    // `drop_subscription` then discards it — buffered-then-dropped, silently losing the promised
+    // event (Codex R12 F2). Signaling the loss via the parked `Rescan` alone keeps the dead-root path
+    // uniform (debounce or not) with nothing buffered-away.
     self.retire_root_with_terminal_rescan(raw.handle());
     true
   }
