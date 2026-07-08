@@ -91,7 +91,7 @@ impl RoutableEvent<OsString> for FakeEvent {
 }
 
 fn sub(id: u64) -> Subscription {
-  Subscription::new(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
+  Subscription::for_test(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
 }
 
 /// A root serving the given subscribers, each registered at its own key (the two
@@ -158,6 +158,28 @@ impl Fixture {
       |_sub, _delivered| true,
       |(s, _projection)| *s,
       |(s, projection), stamp| (s, projection, stamp),
+    )
+  }
+
+  /// Like [`deliver`](Self::deliver) but with the admission gate under test: a delivery is kept
+  /// only when `admit(sub)` returns `true`. Lets a test drive a filtered-OUT delivery through the
+  /// same admit-then-stamp seam and confirm a rejected delivery never reaches
+  /// [`stamp`](EpochLedger::stamp).
+  fn deliver_gated(
+    &self,
+    ledger: &mut EpochLedger,
+    event: &FakeEvent,
+    raw: Epoch,
+    admit: impl Fn(Subscription) -> bool,
+  ) -> Vec<(Subscription, Epoch)> {
+    ledger.stamp_and_fan_out(
+      event,
+      raw,
+      &self.subscribers,
+      |s| self.canonical_of(s),
+      |sub, _delivered| admit(sub),
+      |(s, _projection)| *s,
+      |(s, _projection), stamp| (s, stamp),
     )
   }
 }
@@ -559,5 +581,47 @@ fn source_rescan_strictly_dominates_a_post_shed_same_generation_event() {
   assert!(
     src_rescan[0].1 > post[0].1,
     "a source Rescan strictly dominates every prior delivery (Codex R7: coverage-loss signal preserved)"
+  );
+}
+
+/// Codex R7 F3 regression (design §7, no silent perturbation): the filter admission gate runs
+/// BEFORE a delivery is stamped, so a filtered-OUT delivery must never advance the subscription's
+/// epoch high-water. This is the property that lets a filter be a pure pre-delivery predicate over
+/// the change while the epoch space stays owned by admitted deliveries alone (a rejected candidate
+/// perturbs nothing) — preserved by the Option-A fix, which keeps stamping strictly after
+/// admission.
+///
+/// Fail-on-old: were the stamp applied before admission, the rejected raw-9 delivery would inflate
+/// high-water to 9 and the clamp would then lift the later admitted raw-1 event up to 9.
+#[test]
+fn a_filtered_out_delivery_does_not_advance_high_water() {
+  let mut ledger = EpochLedger::new();
+  let s = sub(1);
+  let root = Fixture::new("/a", &[(1, "/a")]);
+
+  // An admitted event at raw 0 stamps 0 and drives high-water to 0.
+  let d0 = root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(0));
+  assert_eq!(d0, vec![(s, Epoch::new(0))]);
+
+  // A REJECTED delivery at raw 9: `fan_out` drops it before the map that stamps, so `stamp` never
+  // runs for it and high-water must stay 0.
+  let rejected = root.deliver_gated(
+    &mut ledger,
+    &FakeEvent::change("/a/f"),
+    Epoch::new(9),
+    |_| false,
+  );
+  assert!(
+    rejected.is_empty(),
+    "the filtered-out delivery is not delivered"
+  );
+
+  // A later admitted event at raw 1 stamps base + 1 = 1 — NOT inflated to 9. If the rejected raw-9
+  // delivery had wrongly advanced high-water, the clamp would lift this to 9.
+  let d1 = root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(1));
+  assert_eq!(
+    d1,
+    vec![(s, Epoch::new(1))],
+    "a rejected delivery did not perturb the subscription's epoch high-water"
   );
 }

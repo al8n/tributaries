@@ -78,8 +78,10 @@ impl WatchError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum UnwatchError {
-  /// The handle does not name a live subscription of this watcher (never
-  /// registered, or already dropped).
+  /// The handle does not name a live subscription of this watcher: never registered,
+  /// already dropped, or minted by a **different** watcher instance (its per-owner
+  /// brand does not match, so it can never name a subscription here — even if its
+  /// [`ScopeId`](crate::Subscription::id) collides with a live local one).
   #[error("the subscription is not live")]
   UnknownSubscription,
   /// Releasing the now-empty kernel watch failed at the `tributary-fs` layer.

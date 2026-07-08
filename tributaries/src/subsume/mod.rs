@@ -42,7 +42,10 @@ use arc_swap::ArcSwap;
 use iradix::sync::Radix;
 use tributary_proto::{Interest, ScopeId};
 
-use crate::{subscription::Subscription, view::WatchView};
+use crate::{
+  subscription::{InstanceId, Subscription},
+  view::WatchView,
+};
 
 #[cfg(test)]
 mod tests;
@@ -286,6 +289,10 @@ pub(crate) struct Subsumer<C, V, H> {
   /// only requirement is that every plan is eventually committed OR aborted, which
   /// [`abort_watch`](Self::abort_watch) makes enforceable.
   pending: HashMap<Subscription, PendingWatch<C, V>>,
+  /// This owner's per-watcher [`InstanceId`] brand, minted once at construction and stamped
+  /// onto every [`Subscription`] this engine mints — so a handle from a different watcher (whose
+  /// `next_sub` counter also starts at 1) can never be mistaken for one of ours (design §3).
+  instance: InstanceId,
   /// The next subscription id to mint. Monotonic and never reused, so a re-pointed or
   /// dropped-and-re-added subscription never aliases a live one.
   next_sub: NonZeroU64,
@@ -345,9 +352,18 @@ where
       by_handle: HashMap::new(),
       subs: HashMap::new(),
       pending: HashMap::new(),
+      instance: InstanceId::mint(),
       next_sub: NonZeroU64::MIN,
       shared,
     }
+  }
+
+  /// This owner's per-watcher [`InstanceId`] brand. The driver checks a handed-back
+  /// [`Subscription`]'s brand against this before an `unwatch` touches any state, so a handle
+  /// minted by a different watcher — even one whose `ScopeId` collides with a live local one —
+  /// is rejected rather than retiring an unrelated subscription (design §3).
+  pub(crate) fn instance(&self) -> InstanceId {
+    self.instance
   }
 
   /// A cheap `Clone` read handle over the shared watch-set publication (design §5):
@@ -782,14 +798,15 @@ where
       .map(|record| (record.key.as_slice(), record.handle))
   }
 
-  /// Mints the next subscription id from the engine's monotonic counter.
+  /// Mints the next subscription id from the engine's monotonic counter, branded with this
+  /// owner's [`InstanceId`] so the handle names a subscription of this watcher alone.
   fn mint_subscription(&mut self) -> Subscription {
     let next = self.next_sub;
     self.next_sub = self
       .next_sub
       .checked_add(1)
       .expect("subscription id space (u64) exhausted");
-    Subscription::new(ScopeId::new(next))
+    Subscription::new(self.instance, ScopeId::new(next))
   }
 
   /// Consumes the reservation `plan_watch` stashed under `sub`'s freshly-minted id. A
