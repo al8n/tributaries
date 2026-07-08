@@ -17,7 +17,7 @@ use crate::{
   error::{UnwatchError, WatchError},
   event::Event,
   filter::Filter,
-  options::DebounceConfig,
+  options::{DebounceConfig, TributariesOptions},
   source::{Armed, Source, SourceEvent},
   subscription::Subscription,
   subsume::Subsumer,
@@ -1457,5 +1457,97 @@ async fn source_drain_retry_stays_responsive_to_close() {
   assert!(
     matches!(response.await, Ok(Ok(()))),
     "close() completes once the drain surfaced and acked its Close"
+  );
+}
+
+/// A [`Source`] whose `next()` **parks** until the test drops its `drain` sender, then yields
+/// `None` — so a test can watch a key and take a `WatchView` clone, and only THEN drive the
+/// owner's source-drain teardown deterministically (no race between the watch command and the
+/// source draining). `arm` succeeds and records the root so `root_key` reports it live.
+struct DrainableSource {
+  next_handle: u32,
+  live: HashMap<u32, Vec<OsString>>,
+  drain: async_channel::Receiver<std::convert::Infallible>,
+}
+
+impl Source<OsString> for DrainableSource {
+  type Handle = u32;
+
+  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    self.next_handle += 1;
+    let handle = self.next_handle;
+    self.live.insert(handle, key.to_vec());
+    Ok(Armed::new(handle, key.to_vec()))
+  }
+
+  async fn disarm(&mut self, handle: u32) {
+    self.live.remove(&handle);
+  }
+
+  async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+    // Park until the test drops the drain sender; a closed channel (Err) means "drain now".
+    match self.drain.recv().await {
+      Ok(never) => match never {},
+      Err(_) => None,
+    }
+  }
+
+  fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+    self.live.get(&handle).cloned()
+  }
+}
+
+/// R3-F1 regression (design §5, no stale read plane on teardown): the owner publishes an EMPTY
+/// read plane at teardown, so a `WatchView` clone taken while watching stops advertising the (now
+/// dead) coverage once the source drains and the stream ends. Exercises the real `run()`
+/// source-drain teardown through the public [`Tributaries::with_source`](super::Tributaries).
+///
+/// Regression: the old teardown dropped the owner without republishing, so a retained view kept
+/// reading `is_watched=true` / `covering=Some` for a subscription whose owner task + source are
+/// gone — a dedup caller (the indexer) would then skip re-installing it and silently miss changes
+/// after rebuilding a fresh watcher. Fail-on-old: without the empty publish, `is_watched` stays
+/// true after stream-end → FAILS.
+#[tokio::test]
+async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs() {
+  let (drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
+  let source = DrainableSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    drain: drain_rx,
+  };
+  let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+
+  // A view clone taken WHILE watching — the pre-taken handle the regression is about.
+  let view = w.view();
+  let watched = key("/a");
+  let _sub = w
+    .watch(watched.clone(), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /a");
+  assert!(view.is_watched(&watched), "the live watch is advertised");
+  assert!(
+    view.covering(&watched).is_some(),
+    "…and attribution resolves it while live"
+  );
+
+  // Drain the source: dropping the sender makes `next()` yield None → the source-drain teardown.
+  drop(drain_tx);
+
+  // Once the stream ends (next() → None), the owner has torn down and published the empty plane.
+  let ended = tokio::time::timeout(Duration::from_secs(10), w.next()).await;
+  assert!(
+    matches!(ended, Ok(None)),
+    "the event stream ends after the source drains + teardown"
+  );
+
+  // The pre-taken view now reports nothing watched — the empty read plane published on teardown.
+  assert!(
+    !view.is_watched(&watched),
+    "the retained view stops advertising the dead subscription after teardown (empty read plane)"
+  );
+  assert!(
+    view.covering(&watched).is_none(),
+    "…and attribution resolves to nothing (the owner + source are gone)"
   );
 }

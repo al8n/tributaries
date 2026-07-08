@@ -543,13 +543,17 @@ async fn attribution_fans_out_to_covering_subs_and_resolves_owning_loc() {
      while the live, reachable other_sub receives only its own change — never the np/child one"
   );
 
-  // Attribution's owning value: resolve returns the COVERING ROOT's Loc — a covered
-  // subscription does not own a root, so np/child resolves to np's Loc (1), and the disjoint
-  // OTHER subtree to its own (3).
+  // Attribution by longest live subscription (design §5, per-subscription attribution): resolve
+  // returns the value of the LONGEST live subscription whose key covers the probe. The covered
+  // `child` sub owns its OWN value even though it shares np's armed root, so np/child resolves to
+  // child's Loc (2) — NOT the covering np root's (1) — and the disjoint OTHER subtree to its own
+  // (3). (An armed root can outlive the subscription whose value equalled it; attribution reads
+  // the live-subscription coverage plane, never the departed root's stored value.)
   assert_eq!(
     resolved_id(&view, &probe_key),
-    Some(1),
-    "the owning Loc under np/child is the np root's"
+    Some(2),
+    "np/child resolves to the covered child subscription's own Loc (the longest live sub), not \
+     the covering np root's"
   );
   assert_eq!(
     resolved_id(&view, &other_key),
