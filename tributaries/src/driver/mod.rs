@@ -413,6 +413,26 @@ where
   _rt: PhantomData<R>,
 }
 
+impl<C, V, R, S> Drop for Owner<C, V, R, S>
+where
+  S: Source<C>,
+{
+  /// The synchronous teardown guard that empties the read plane on **any** owner termination —
+  /// normal exit OR a panic unwinding through a caller-provided callback the owner runs (the
+  /// [`Filter`] predicate, a [`Source`] method, `V`/`C`/`H` ops). The normal path already publishes
+  /// empty after draining owed Rescans; this covers every panic path at once, so a retained
+  /// [`WatchView`] never keeps advertising subscriptions whose owner task and source have died (the
+  /// stale-read-plane mode the teardown publish prevents — design §5). Drop runs before the owner's
+  /// fields drop, so `self.subsumer` is still alive; [`publish_empty`](Subsumer::publish_empty) is a
+  /// single synchronous `arc_swap` store that runs no caller code, so it is idempotent (the normal
+  /// path's double publish is a no-op) and cannot double-panic while unwinding. Owed Rescans cannot
+  /// be drained mid-unwind and are necessarily lost on a panic; emptying the plane is the achievable
+  /// guarantee.
+  fn drop(&mut self) {
+    self.subsumer.publish_empty();
+  }
+}
+
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
 /// fan out a raw source event, or drain the coalescer's due entries — whichever is ready,
 /// each to completion.
@@ -731,11 +751,18 @@ where
     };
     // Reclaim this subscription's per-sub state so a watch → repoint → unwatch churn cannot
     // leak it. A consumer-initiated unwatch owes NO coverage-loss re-enumeration (the caller
-    // asked to stop watching), so drop its parked overflow Rescan alongside its filter and
-    // epoch — unlike the root-death path (`retire_if_dead`), which KEEPS the parked terminal
-    // Rescan so its owed re-enumeration self-drains (design backpressure doc, no silent loss).
+    // asked to stop watching), so drop its parked overflow Rescan AND its buffered coalescer
+    // deltas alongside its filter and epoch — unlike the root-death path (`retire_if_dead`),
+    // which KEEPS the parked terminal Rescan so its owed re-enumeration self-drains (design
+    // backpressure doc, no silent loss).
     self.retire_sub_state(sub);
     self.needs_rescan.remove(&sub);
+    // Purge the debounce coalescer too: a delta buffered before the unwatch would otherwise drain
+    // later through `drain_coalescer_due`/`try_emit` — neither of which re-checks live-subscription
+    // membership — and deliver an event for a subscription whose `unwatch` has already resolved.
+    if let Some(coalescer) = self.coalescer.as_mut() {
+      coalescer.drop_subscription(sub);
+    }
     if let UnwatchOutcome::RootEmptied { fs_root } = outcome {
       // The subscription was its root's last: release the kernel watch.
       self.source.disarm(fs_root).await;

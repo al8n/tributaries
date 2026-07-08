@@ -331,6 +331,28 @@ where
   }
 }
 
+// Bound-free operations — no `C`/`V`/`H` bounds, so the owner's `Drop` guard can call them while
+// assuming only the `Source` bound the `Owner` struct carries (a `Drop` impl may not add bounds
+// its type definition lacks).
+impl<C, V, H> Subsumer<C, V, H> {
+  /// Publishes an **empty** read-plane snapshot into the shared slot, so every [`WatchView`]
+  /// reader reports "nothing watched" — `is_watched`/`covering`/`resolve` all empty and
+  /// `contains`/`len` zero. The driver empties the plane at owner teardown — on the normal path
+  /// after draining owed Rescans, and unconditionally from the owner's `Drop` guard, so a panic in
+  /// any caller callback still empties it: the authoritative watch-set is about to drop with the
+  /// owner task and its source, so a retained view must stop advertising coverage whose owner and
+  /// source no longer exist (design §5). Like [`publish`](Self::publish) it is a single synchronous
+  /// `arc_swap` store of a fresh empty snapshot — idempotent, and running no caller `C`/`V`/`H`
+  /// method (the two trees are empty), so it needs no bounds and cannot itself panic, which makes it
+  /// safe to call while unwinding.
+  pub(crate) fn publish_empty(&self) {
+    self.shared.store(Arc::new(Published {
+      roots: Radix::new(),
+      covers: Radix::new(),
+    }));
+  }
+}
+
 impl<C, V, H> Subsumer<C, V, H>
 where
   C: Ord + Clone,
@@ -381,20 +403,6 @@ where
     self.shared.store(Arc::new(Published {
       roots: self.index.clone(),
       covers: self.covers.clone(),
-    }));
-  }
-
-  /// Publishes an **empty** read-plane snapshot into the shared slot, so every [`WatchView`]
-  /// reader reports "nothing watched" — `is_watched`/`covering`/`resolve` all empty and
-  /// `contains`/`len` zero. The driver calls this once at owner teardown: the authoritative
-  /// watch-set is about to drop with the owner task and its source, so a retained view must stop
-  /// advertising coverage whose owner and source no longer exist (design §5). Like
-  /// [`publish`](Self::publish) it is a single synchronous `arc_swap` store, so wait-free readers
-  /// never block.
-  pub(crate) fn publish_empty(&self) {
-    self.shared.store(Arc::new(Published {
-      roots: Radix::new(),
-      covers: Radix::new(),
     }));
   }
 
