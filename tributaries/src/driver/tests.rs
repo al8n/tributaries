@@ -1,10 +1,11 @@
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, HashMap, VecDeque},
   ffi::OsString,
   io,
   marker::PhantomData,
   num::NonZeroU64,
   path::{Path, PathBuf},
+  time::Duration,
 };
 
 use agnostic_lite::tokio::TokioRuntime;
@@ -81,6 +82,12 @@ impl FakeSource {
   /// The next `arm` call fails.
   fn fail_next_arm(&mut self) {
     self.fail_arms = 1;
+  }
+
+  /// The next `n` `arm` calls fail (each decrements the counter) — drives the failed-widen
+  /// restore where the wider arm AND some re-arms fail.
+  fn fail_next_arms(&mut self, n: u32) {
+    self.fail_arms = n;
   }
 
   /// Model the canonicalization TOCTOU: an `arm(planned)` reports `fs` as the handle's
@@ -190,6 +197,20 @@ fn modified_event(sub: Subscription, path: &str, epoch: u64) -> Event<OsString, 
     Location::new(),
     EventKind::Modified,
     Epoch::new(epoch),
+  )
+}
+
+/// A raw `Modified` [`SourceEvent`] for `handle` at `path` — the cancel-safety test's queued
+/// changes, distinguished by key.
+fn source_modified(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, u32> {
+  SourceEvent::new(
+    handle,
+    key(path),
+    EventKind::Modified,
+    None,
+    Location::new(),
+    Epoch::new(epoch),
+    ChangeId::new(NonZeroU64::MIN),
   )
 }
 
@@ -396,13 +417,15 @@ async fn widen_emits_dominating_rescan_per_repointed_sub() {
   );
 }
 
-/// The widen arm failure (design driver-golden doc, invariant I3): when the wider arm
-/// FAILS after the subsumed roots were disarmed, there is **no rollback** — the subsumed
-/// roots stay disarmed and their subscribers uncovered, each signalled a dominating Rescan
-/// (no silent loss), and the newcomer's plan is aborted with no pending leak. A later
-/// reconcile (the caller re-watching) re-covers them.
+/// The widen arm failure RESTORE (design driver-golden doc, invariant I3): when the wider
+/// arm FAILS after the subsumed roots were disarmed, the owner
+/// must **not** leave those live subscriptions bound to disarmed handles (recorded-live yet
+/// never delivering again). It re-arms each disarmed root through the choke point and mints
+/// a dominating Rescan per subscriber — the subs are live-and-covered again, never
+/// published-watched-but-disarmed. Regression: the old code signalled one Rescan and left
+/// the roots disarmed, so future changes were silently lost.
 #[tokio::test]
-async fn widen_arm_failure_signals_loss_no_rollback() {
+async fn widen_arm_failure_restores_disarmed_roots() {
   let mut h = Harness::new();
 
   let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
@@ -410,11 +433,12 @@ async fn widen_arm_failure_signals_loss_no_rollback() {
   h.owner.epochs.stamp(sb, Epoch::new(4));
   h.owner.epochs.stamp(sc, Epoch::new(2));
 
+  // Only the wider arm fails; the two restore re-arms succeed.
   h.owner.source.fail_next_arm();
   let result = h.watch("/a", Interest::all()).await;
   assert!(result.is_err(), "the failed wider arm surfaces the error");
 
-  // The subsumed roots are disarmed, the wider arm fails — and there is NO rollback re-arm.
+  // Disarm-subsumed, wider arm fails, THEN both subsumed roots are re-armed (the restore).
   assert_eq!(
     h.owner.source.calls(),
     vec![
@@ -423,8 +447,10 @@ async fn widen_arm_failure_signals_loss_no_rollback() {
       Call::Disarm(1),
       Call::Disarm(2),
       Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
     ],
-    "no rollback: the subsumed roots are disarmed, the wider arm fails, nothing re-arms"
+    "the failed widen re-arms the disarmed subsumed roots (restore, not strand)"
   );
 
   // No pending reservation leaked (the newcomer's plan was aborted).
@@ -434,36 +460,87 @@ async fn widen_arm_failure_signals_loss_no_rollback() {
     "the aborted widen leaks no pending reservation"
   );
 
-  // Each uncovered subscriber got a dominating Rescan (no silent loss).
+  // Both subsumed subscriptions are live-and-covered again on FRESH, live handles.
+  let view = h.owner.subsumer.view();
+  assert!(
+    view.is_watched(&key("/a/b")) && view.is_watched(&key("/a/c")),
+    "the restored subscriptions read watched again"
+  );
+  let roots: Vec<(PathBuf, u32)> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, handle)| (PathBuf::from_iter(k), handle))
+    .collect();
+  assert_eq!(
+    roots.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+    vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
+    "the two subsumed roots are back (re-armed), not collapsed and not gone"
+  );
+  for (path, handle) in &roots {
+    assert!(
+      h.owner.source.root_key(*handle).is_some(),
+      "the re-armed root {path:?} is on a LIVE handle — never published-watched-but-disarmed"
+    );
+  }
+
+  // Each restored subscriber got a dominating Rescan (re-enumerate onto the re-armed root).
   let by_sub: HashMap<Subscription, Epoch> = h
     .drain()
     .iter()
     .map(|ev| {
-      assert!(ev.is_rescan(), "every loss signal is a Rescan");
+      assert!(ev.is_rescan(), "every restore signal is a Rescan");
       (ev.subscription(), ev.epoch())
     })
     .collect();
   assert_eq!(
-    by_sub.len(),
-    2,
-    "one dominating Rescan per uncovered subscriber"
-  );
-  assert_eq!(
     by_sub.get(&sb).copied(),
     Some(Epoch::new(5)),
-    "sb's loss Rescan strictly dominates its high-water of 4"
+    "sb's restore Rescan strictly dominates its high-water of 4"
   );
   assert_eq!(
     by_sub.get(&sc).copied(),
     Some(Epoch::new(3)),
-    "sc's loss Rescan strictly dominates its high-water of 2"
+    "sc's restore Rescan strictly dominates its high-water of 2"
+  );
+}
+
+/// The failed-widen restore when a subsumed root is genuinely DEAD (design driver-golden
+/// doc, invariant I3/I4): the wider arm fails AND one disarmed root
+/// cannot be re-armed. That root is RETIRED — a dominating terminal Rescan, its per-sub
+/// state freed, and it leaves the view — while the re-armable one is restored. Never a
+/// sub left recorded-live-but-disarmed.
+#[tokio::test]
+async fn widen_arm_failure_retires_root_that_cannot_rearm() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c");
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // Fail the wider arm AND the first restore re-arm (/a/b): so /a/b cannot be re-armed
+  // (retired) while /a/c re-arms (restored). Restore iterates in root-key order (/a/b, /a/c).
+  h.owner.source.fail_next_arms(2);
+  let result = h.watch("/a", Interest::all()).await;
+  assert!(result.is_err(), "the failed wider arm surfaces the error");
+
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "the aborted widen leaks no pending reservation"
   );
 
-  // The caller reconciling again re-covers them: re-watching /a now succeeds (the dead
-  // subsumed handles disarm as no-ops, then the wider root arms).
-  h.watch("/a", Interest::all())
-    .await
-    .expect("re-watching /a after the failure widens successfully");
+  let view = h.owner.subsumer.view();
+  // /a/c re-armed and covered; /a/b retired (removed from the view — no longer watched).
+  assert!(
+    view.is_watched(&key("/a/c")),
+    "the re-armable subsumed root is restored and watched"
+  );
+  assert!(
+    !view.is_watched(&key("/a/b")),
+    "the dead subsumed root is RETIRED — not left published-watched-but-disarmed"
+  );
   let roots: Vec<PathBuf> = h
     .owner
     .subsumer
@@ -472,8 +549,37 @@ async fn widen_arm_failure_signals_loss_no_rollback() {
     .collect();
   assert_eq!(
     roots,
-    vec![PathBuf::from("/a")],
-    "reconciling again collapses to the wider root"
+    vec![PathBuf::from("/a/c")],
+    "only the re-armed root remains; the un-re-armable one is gone"
+  );
+  // The retired /a/b subscriber's per-sub state is freed (I4); the restored /a/c's is kept.
+  assert!(
+    !h.owner.filters.contains_key(&sb),
+    "the retired root's subscriber filter is freed (I4)"
+  );
+  assert!(
+    h.owner.filters.contains_key(&sc),
+    "the restored subscriber's filter is kept"
+  );
+
+  // BOTH subscribers got a dominating Rescan (sb: terminal/retire; sc: restore re-point).
+  let by_sub: HashMap<Subscription, Epoch> = h
+    .drain()
+    .iter()
+    .map(|ev| {
+      assert!(ev.is_rescan(), "every loss/restore signal is a Rescan");
+      (ev.subscription(), ev.epoch())
+    })
+    .collect();
+  assert_eq!(
+    by_sub.get(&sb).copied(),
+    Some(Epoch::new(5)),
+    "the retired sb's terminal Rescan strictly dominates its high-water of 4"
+  );
+  assert_eq!(
+    by_sub.get(&sc).copied(),
+    Some(Epoch::new(3)),
+    "the restored sc's Rescan strictly dominates its high-water of 2"
   );
 }
 
@@ -936,5 +1042,208 @@ async fn root_death_while_channel_full_keeps_owed_rescan() {
   assert!(
     rescan.epoch() > max_delivered,
     "the terminal Rescan strictly dominates every event delivered before it (no silent loss)"
+  );
+}
+
+/// Source-drain no-silent-loss (design backpressure doc, checklist #1):
+/// a per-subscription overflow `Rescan` is **parked while the event channel is full**, then
+/// the source drains (`next` → `None`) at teardown. The owner must deliver that owed Rescan
+/// **before** the stream ends, retrying across the full channel until the resuming consumer
+/// frees a slot — never dropping it. Regression: the old teardown flushed only the coalescer
+/// tail, dropping the parked Rescan, so a consumer that resumed after source-drain reached
+/// stream-end permanently stale. Exercises the exact drain the source-`None` break runs.
+#[tokio::test]
+async fn source_drain_delivers_owed_parked_rescan_no_silent_loss() {
+  let mut h = Harness::bounded(1);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  for raw in 0..2 {
+    h.owner.epochs.stamp(sub, Epoch::new(raw));
+  }
+
+  // Fill the one slot, then overflow → park a dominating Rescan (the channel stays full).
+  h.owner.try_emit(modified_event(sub, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sub, "/a/f1", 1));
+  assert_eq!(
+    h.owner.needs_rescan.get(&sub).map(|(_, e)| *e),
+    Some(Epoch::new(2)),
+    "overflow parked a dominating Rescan while the channel is full"
+  );
+
+  // The source drains at teardown. `drain_owed_before_shutdown` retries the owed Rescan across
+  // the full channel while the consumer resumes, delivering it before stream end. Run the
+  // drain concurrently with the resuming consumer so the retry-under-full path is exercised.
+  let events = h.events.clone();
+  let owner = &mut h.owner;
+  let consumer = async {
+    let buffered = events
+      .recv()
+      .await
+      .expect("the buffered pre-overflow event drains first");
+    let owed = events
+      .recv()
+      .await
+      .expect("then the owed Rescan is delivered (not dropped)");
+    (buffered, owed)
+  };
+  // Bounded, so a regression (the owed Rescan never delivered) fails cleanly, not hangs.
+  let (_, (buffered, owed)) = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::join!(owner.drain_owed_before_shutdown(), consumer)
+  })
+  .await
+  .expect("source-drain teardown delivered the owed Rescan before the deadline (no silent loss)");
+
+  assert!(
+    !buffered.is_rescan(),
+    "the first delivered event is the buffered ordinary one, in order"
+  );
+  assert!(owed.is_rescan(), "the owed shed signal is a Rescan");
+  assert_eq!(owed.subscription(), sub, "…for the overflowed subscription");
+  assert_eq!(
+    owed.path(),
+    Path::new("/a"),
+    "…naming its covered key to re-enumerate"
+  );
+  assert!(
+    owed.epoch() > buffered.epoch(),
+    "the owed Rescan strictly dominates every event delivered before it (no silent loss)"
+  );
+  assert!(
+    owner.needs_rescan.is_empty(),
+    "source-drain teardown delivered the owed Rescan — nothing left parked"
+  );
+}
+
+/// Source cancel-safety is load-bearing (design source doc hard contract):
+/// the owner drives `source.next()` as one `select!` arm, so a competing command/timer branch
+/// **drops the in-flight `next()` future**. A contract-conforming source that dequeues on the
+/// poll that returns `Ready` loses nothing across arbitrarily many such cancellations; a source
+/// that dequeues on poll START silently loses the in-flight event (the owner parks no Rescan —
+/// it never saw it). This reproduces the owner's cancel-then-retry pattern with both a
+/// conforming and a violating source, proving the documented contract is what keeps the owner's
+/// inline `next()` lossless.
+#[tokio::test]
+async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
+  use futures_util::FutureExt;
+
+  /// Cancel-SAFE: yields (returns `Pending`) BEFORE consuming, so a poll cancelled here
+  /// consumed nothing — the dequeue happens only on the poll that returns `Ready`.
+  struct CancelSafe {
+    queue: VecDeque<SourceEvent<OsString, u32>>,
+    consumed: u32,
+  }
+  impl Source<OsString> for CancelSafe {
+    type Handle = u32;
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      Ok(Armed::new(1, key.to_vec()))
+    }
+    async fn disarm(&mut self, _handle: u32) {}
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      tokio::task::yield_now().await; // Pending once BEFORE the dequeue → cancel-safe
+      self.consumed += 1;
+      self.queue.pop_front()
+    }
+    fn root_key(&self, _handle: u32) -> Option<Vec<OsString>> {
+      Some(key("/w"))
+    }
+  }
+
+  /// Cancel-UNSAFE: dequeues on poll START and holds the event in the future's local across
+  /// the yield — so a cancellation drops the popped event (silent loss, no Rescan owed).
+  struct CancelUnsafe {
+    queue: VecDeque<SourceEvent<OsString, u32>>,
+    lost: u32,
+  }
+  impl Source<OsString> for CancelUnsafe {
+    type Handle = u32;
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      Ok(Armed::new(1, key.to_vec()))
+    }
+    async fn disarm(&mut self, _handle: u32) {}
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      let popped = self.queue.pop_front(); // dequeue on poll START (the bug)
+      if popped.is_some() {
+        self.lost += 1; // provisionally lost until it survives to be returned
+      }
+      tokio::task::yield_now().await; // a cancellation here drops `popped` → truly lost
+      if popped.is_some() {
+        self.lost -= 1; // survived to return → not lost
+      }
+      popped
+    }
+    fn root_key(&self, _handle: u32) -> Option<Vec<OsString>> {
+      Some(key("/w"))
+    }
+  }
+
+  const N: u64 = 6;
+  const CANCELS: u32 = 2;
+
+  /// Reproduces the owner's `select!` arm: `next()` is polled FIRST (as in the loop), yields
+  /// `Pending`, then the ready "interrupt" (a stand-in for a command/timer branch) wins → the
+  /// in-flight `next()` is dropped. `CANCELS` cancellations, then one `next()` runs to
+  /// completion — repeated until the source drains. Returns the delivered events and the
+  /// cancellation count.
+  async fn drive<S>(source: &mut S) -> (Vec<SourceEvent<OsString, u32>>, u32)
+  where
+    S: Source<OsString, Handle = u32>,
+  {
+    let mut delivered = Vec::new();
+    let mut cancels = 0u32;
+    loop {
+      for _ in 0..CANCELS {
+        futures_util::select_biased! {
+          ev = source.next().fuse() => if let Some(event) = ev { delivered.push(event); },
+          _  = std::future::ready(()).fuse() => cancels += 1,
+        }
+      }
+      match source.next().await {
+        Some(event) => delivered.push(event),
+        None => break,
+      }
+    }
+    (delivered, cancels)
+  }
+
+  let queued = || -> VecDeque<_> {
+    (0..N)
+      .map(|i| source_modified(1, &format!("/w/f{i}"), i))
+      .collect()
+  };
+  let expected: Vec<Vec<OsString>> = (0..N).map(|i| key(&format!("/w/f{i}"))).collect();
+
+  // A cancel-safe source loses NOTHING despite repeated cancellation.
+  let mut safe = CancelSafe {
+    queue: queued(),
+    consumed: 0,
+  };
+  let (delivered, cancels) = drive(&mut safe).await;
+  assert!(
+    cancels > 0,
+    "the select actually cancelled in-flight next() futures"
+  );
+  assert_eq!(
+    delivered
+      .iter()
+      .map(|e| e.key().to_vec())
+      .collect::<Vec<_>>(),
+    expected,
+    "a cancel-safe source delivers every event, in order — no loss across cancellation"
+  );
+
+  // A cancel-UNSAFE source (dequeue on poll start) silently loses the cancelled-in-flight
+  // events — proving the documented cancel-safety contract is load-bearing, not incidental.
+  let mut bad = CancelUnsafe {
+    queue: queued(),
+    lost: 0,
+  };
+  let (delivered_bad, _) = drive(&mut bad).await;
+  assert!(
+    delivered_bad.len() < usize::try_from(N).unwrap(),
+    "a cancel-unsafe source loses events to cancellation (delivered {} of {N})",
+    delivered_bad.len()
+  );
+  assert!(
+    bad.lost > 0,
+    "the cancel-unsafe source dropped popped-but-unreturned events (silent loss, no Rescan)"
   );
 }

@@ -100,6 +100,26 @@ pub trait Source<C> {
   /// The next raw change as a [`SourceEvent`], or [`None`] once the source is closed and
   /// drained. Returns a `Send` future so the owner can pump the source's stream from its
   /// spawned task (see the `Send` bounds note on the [trait](Self)).
+  ///
+  /// # `next` MUST be cancellation-safe (hard contract)
+  ///
+  /// The owner drives `next()` as one arm of a [`select!`](futures_util::select_biased)
+  /// loop, racing it against the command mailbox and the settle timer. When another arm
+  /// wins, the in-flight `next()` future is **dropped before it resolves**. That drop
+  /// **must lose no event and acknowledge none**: the very next `next()` call must still
+  /// yield the change the dropped future would have. This is the cancellation-safety of
+  /// [`async_channel::Receiver::recv`](async_channel::Receiver::recv) or a `Stream` poll —
+  /// dropping the future only abandons the *wait*, never a dequeued item.
+  ///
+  /// Concretely, a source that **dequeues-then-acknowledges** an event MUST NOT acknowledge
+  /// (or otherwise consume/drop) it until it has been *returned* from `next()`. A source
+  /// that acks inside the future — before it resolves — silently loses the event on
+  /// cancellation, and the owner parks **no** `Rescan` for it (it never saw the event), so
+  /// the loss is silent. Model the dequeue as happening on the poll that *returns* `Ready`,
+  /// not on an earlier poll.
+  ///
+  /// [`FsSource`] satisfies this: its `next` awaits [`tributary_fs::Watcher::next`], itself
+  /// an `async_channel` receive, which is cancel-safe by construction.
   fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>> + Send;
 
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead

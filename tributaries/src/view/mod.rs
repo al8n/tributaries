@@ -97,35 +97,53 @@ impl<C, V, H> WatchView<C, V, H>
 where
   C: Ord + Clone,
 {
-  /// Whether `key` is watched: covered by an exact watch **or** any ancestor watch
-  /// (`contains || get_ancestor.is_some()`) — the membership dedup check (design §5).
+  /// Whether `key` is watched — the membership dedup check (design §5).
+  ///
+  /// True iff some **live subscription's own key** is an ancestor-or-equal of `key`.
+  /// This is live-subscription coverage, **not** armed-root coverage: an armed root can
+  /// outlive the subscription whose key equalled its own (a widen then unwatch of the
+  /// widening watch, or a covered watch then unwatch of the root's own watch), leaving the
+  /// root broader than any live subscription. Answering from the armed root would then
+  /// over-report — call a key watched that fan-out delivers to no subscriber — and a dedup
+  /// caller (the indexer) would skip installing it and silently miss its changes. Keying on
+  /// live subscriptions makes `is_watched` exactly the set fan-out delivers to, so a dedup
+  /// caller that skips a `true` key never loses events; and re-installing a `false` key is
+  /// covered under the still-armed broad root (no re-arm — self-healing).
   #[inline]
   #[must_use]
   pub fn is_watched(&self, key: &[C]) -> bool {
-    let snapshot = self.shared.load();
-    snapshot.contains(key) || snapshot.get_ancestor(key).is_some()
+    self.shared.load().covers.get_ancestor(key).is_some()
   }
 
-  /// Whether `key` is watched by an **exact** root (not merely covered by an
-  /// ancestor).
+  /// Whether `key` is watched by an **exact armed root** (not merely covered by an
+  /// ancestor) — a root-plane query, distinct from [`is_watched`](Self::is_watched)'s
+  /// live-subscription coverage.
   #[inline]
   #[must_use]
   pub fn contains(&self, key: &[C]) -> bool {
-    self.shared.load().contains(key)
+    self.shared.load().roots.contains(key)
   }
 
-  /// The caller value of the root that **covers** `key` — the deepest watch at or
-  /// above it (`get_ancestor`), the owning attribution value (design §5). `None` when
-  /// `key` is not watched.
+  /// The caller value of the root that **covers** `key` — the owning attribution value
+  /// (design §5). `None` when `key` is not watched.
+  ///
+  /// Coverage follows [`is_watched`](Self::is_watched) (the live-subscription plane), so
+  /// a key an armed-but-broadened root no longer truly covers resolves to nothing rather
+  /// than to a departed watch's value. The value returned is the **covering root's** —
+  /// a covered subscription does not own a root, so a covered key resolves to its
+  /// covering root's value (design §5), never the covered subscription's own.
   #[inline]
   #[must_use]
   pub fn covering(&self, key: &[C]) -> Option<Snapshot<V>>
   where
     V: Clone,
   {
-    self
-      .shared
-      .load()
+    let snapshot = self.shared.load();
+    // Coverage gates attribution: only a key some live subscription covers resolves (to its
+    // covering root's value). `?` short-circuits an uncovered key to `None`.
+    snapshot.covers.get_ancestor(key)?;
+    snapshot
+      .roots
       .get_ancestor(key)
       .map(|record| Snapshot::new(record.value.clone()))
   }
@@ -143,18 +161,18 @@ where
 }
 
 impl<C, V, H> WatchView<C, V, H> {
-  /// The number of live roots in the last committed watch-set.
+  /// The number of live **armed roots** in the last committed watch-set.
   #[inline]
   #[must_use]
   pub fn len(&self) -> usize {
-    self.shared.load().len()
+    self.shared.load().roots.len()
   }
 
-  /// Whether the last committed watch-set holds no roots.
+  /// Whether the last committed watch-set holds no armed roots.
   #[inline]
   #[must_use]
   pub fn is_empty(&self) -> bool {
-    self.shared.load().is_empty()
+    self.shared.load().roots.is_empty()
   }
 }
 

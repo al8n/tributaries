@@ -428,7 +428,12 @@ where
   R: RuntimeLite,
   S: Source<C>,
 {
-  let closing = loop {
+  // The loop yields `(reply, drain_owed)`: `reply` is the `Close` acknowledgement (if any);
+  // `drain_owed` is true only on a **source drain** (the source's `next` yielded `None` while
+  // a consumer is still attached), which owes that consumer every parked Rescan before the
+  // stream ends. A consumer-initiated `Close` or a dropped last handle owes nothing (the
+  // consumer asked to stop / nobody is left), and must never block teardown on a full channel.
+  let (closing, drain_owed) = loop {
     // Drain the parked per-subscription overflow Rescans ahead of everything else, so a
     // shed Rescan never needs a free channel slot at overflow time and is retried until
     // accepted (design backpressure doc, no-silent-loss).
@@ -460,28 +465,41 @@ where
           owner.on_watch(key, value, interest, filter, reply).await;
         }
         Ok(Command::Unwatch { sub, reply }) => owner.on_unwatch(sub, reply).await,
-        Ok(Command::Close { reply }) => break Some(reply),
-        // Every handle dropped: same orderly teardown, nobody to confirm it to.
-        Err(_) => break None,
+        Ok(Command::Close { reply }) => break (Some(reply), false),
+        // Every handle dropped: same orderly teardown, nobody to confirm it to. Nobody is
+        // left to receive, so nothing is owed.
+        Err(_) => break (None, false),
       },
+      // `source.next()` is one `select!` arm: a command/timer branch winning **drops** this
+      // in-flight future. That is safe only because [`Source::next`] is a hard-contract
+      // **cancellation-safe** read (see its docs) — dropping the future loses/acks no event.
       raw = owner.source.next().fuse() => match raw {
         Some(event) => {
           owner.fan_out_and_push(&event);
           owner.retire_if_dead(&event);
         }
-        // The source drained: flush the coalesced tail below, then tear down.
-        None => break None,
+        // The source drained while a consumer is still attached: it is OWED every parked
+        // Rescan before the stream ends (no silent loss on source drain).
+        None => break (None, true),
       },
       _ = timer => owner.drain_coalescer_due(),
     }
   };
 
-  // Teardown: best-effort force-emit any still-settling coalescer tail so a burst
-  // interrupted by the close/drain is delivered when the channel has room (the undrained
-  // tail on a full/stalled channel is permitted to be lost on a consumer-initiated close),
-  // then confirm the close. Dropping `owner` (and its source) performs the orderly source
-  // teardown.
-  owner.flush_coalescer_tail();
+  if drain_owed {
+    // Source drain: deliver the coalesced tail AND every owed parked Rescan before ending
+    // the stream, retrying as the consumer drains (design backpressure doc, checklist #1).
+    owner.drain_owed_before_shutdown().await;
+  } else {
+    // Consumer-initiated `Close`, or every handle dropped: best-effort force-emit the
+    // still-settling coalescer tail and one pass of any parked Rescans so a burst interrupted
+    // by the close is delivered when the channel has room. The undrained tail / owed Rescan on
+    // a full channel is permitted to be lost here (the consumer asked to stop, or nobody is
+    // left) — teardown never blocks on the channel, so `Close` stays responsive.
+    owner.flush_coalescer_tail();
+    owner.flush_pending_rescans();
+  }
+  // Dropping `owner` (and its source) performs the orderly source teardown.
   if let Some(reply) = closing {
     let _ = reply.send(Ok(()));
   }
@@ -611,18 +629,25 @@ where
         let armed = match self.arm(key).await {
           Ok(armed) => armed,
           Err(err) => {
-            // No rollback (invariant I3): the subsumed roots stay disarmed and their
-            // subscriptions uncovered. Signal each a dominating Rescan (no silent loss);
-            // a later reconcile re-covers them. Abort the newcomer's plan.
-            self.signal_uncovered(unwatch);
+            // The wider arm failed after the subsumed roots were disarmed. Do NOT leave
+            // their live subscriptions bound to disarmed handles (they would read watched
+            // yet never see another event). Restore the pre-widen armed state: re-arm each
+            // disarmed root through the choke point, or — for one that is genuinely dead —
+            // retire it with a dominating Rescan so its subs re-enumerate and it leaves the
+            // view (design driver-golden doc, invariant I3). Then abort the newcomer's plan.
+            self.restore_disarmed_roots(unwatch).await;
             self.subsumer.abort_watch(&outcome);
             return Err(err);
           }
         };
         let (handle, fs_key) = armed;
         if !self.subsumer.fs_path_preserves_plan(&fs_key, unwatch) {
+          // The wider root armed but its committed key diverged (a canonicalization race):
+          // disarm it, then restore the disarmed subsumed roots exactly as above — the same
+          // strand-avoidance the arm-failure branch runs (both post-disarm exits must restore,
+          // never signal-and-strand).
           self.source.disarm(handle).await;
-          self.signal_uncovered(unwatch);
+          self.restore_disarmed_roots(unwatch).await;
           self.subsumer.abort_watch(&outcome);
           return Err(canonical_race());
         }
@@ -697,31 +722,77 @@ where
     self.epochs.remove(sub);
   }
 
-  /// Signals every subscriber of the still-disarmed subsumed roots a dominating
-  /// [`Rescan`](tributary_fs::EventKind::Rescan) at that root's key (no silent loss) — the
-  /// "uncovered by a failed widen arm" repair (invariant I3): the subsumed roots stayed
-  /// disarmed (no rollback), so their subscribers must re-enumerate the root they rode.
+  /// Restores the pre-widen armed state after a widen disarmed its subsumed roots but then
+  /// failed (arm error, or a divergent committed key) — the bounded synchronous restore
+  /// that keeps a failed widen from stranding live subscriptions on disarmed handles
+  /// (design driver-golden doc, invariant I3).
   ///
-  /// The subsumer still holds the subsumed roots (the widen never committed), so each
-  /// handle resolves to its live record; its key names the subtree to re-enumerate.
-  fn signal_uncovered(&mut self, unwatch: &[S::Handle]) {
-    // Snapshot each still-present subsumed root's (key, subscribers) before repointing, so
-    // the immutable subsumer borrow is released before the mutable epoch bumps.
-    let roots: Vec<(Vec<C>, Vec<Subscription>)> = unwatch
-      .iter()
-      .filter_map(|&handle| {
-        self
-          .subsumer
-          .entry(handle)
-          .map(|record| (record.key.clone(), record.subscribers.clone()))
-      })
-      .collect();
-    let mut rescans = Vec::new();
-    for (root_key, subscribers) in roots {
-      for sub in subscribers {
-        let rescan = self.epochs.repoint(sub);
-        rescans.push(Event::rescan(sub, root_key.clone(), rescan));
+  /// The widen never committed, so the subsumer still holds each subsumed root at its key
+  /// with its subscribers — only the **source handle** was released. For each:
+  ///
+  /// - **re-arm at the same key** through the [`arm`](Self::arm) choke point. On success
+  ///   whose committed key is unchanged, [`rebind`](Subsumer::rebind_root) the root onto the
+  ///   fresh handle and mint a dominating [`Rescan`](tributary_fs::EventKind::Rescan) per
+  ///   subscriber — the re-arm restarts the source's raw epochs at zero, so each subscriber
+  ///   [`repoint`](epoch::EpochLedger::repoint)s onto the new handle (exactly a widen
+  ///   re-point) and re-enumerates. The subscription is live-and-covered again.
+  /// - if the re-arm **fails** (the root is genuinely dead), or its committed key **diverged**
+  ///   (a canonicalization race we cannot cleanly rebind), **retire** the root
+  ///   ([`retire_disarmed_root`](Self::retire_disarmed_root)): a dominating terminal Rescan
+  ///   per subscriber, then free its index / filter / epoch and drop it from the view.
+  ///
+  /// Either way no subscription is left recorded-live-but-disarmed-and-published-watched.
+  async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) {
+    for &old in unwatch {
+      // The subsumed root is still recorded (the widen never committed); recover its key
+      // and subscribers before any re-arm/retire mutates the subsumer.
+      let Some((root_key, subscribers)) = self
+        .subsumer
+        .entry(old)
+        .map(|record| (record.key.clone(), record.subscribers.clone()))
+      else {
+        continue;
+      };
+      match self.arm(&root_key).await {
+        Ok((new_handle, fs_key)) if fs_key == root_key => {
+          // Re-armed at the same coordinate: rebind onto the fresh handle and re-point each
+          // subscriber (raw epochs restarted at zero) with a dominating Rescan.
+          self.subsumer.rebind_root(old, new_handle);
+          let mut rescans = Vec::with_capacity(subscribers.len());
+          for sub in subscribers {
+            let rescan = self.epochs.repoint(sub);
+            rescans.push(Event::rescan(sub, root_key.clone(), rescan));
+          }
+          self.push_all(rescans);
+        }
+        Ok((new_handle, _diverged)) => {
+          // Re-armed, but at a divergent key we cannot cleanly rebind: disarm the stray new
+          // handle and retire the old root so its subs re-enumerate and it leaves the view.
+          self.source.disarm(new_handle).await;
+          self.retire_disarmed_root(old, &root_key);
+        }
+        Err(_) => self.retire_disarmed_root(old, &root_key),
       }
+    }
+  }
+
+  /// Retires a subsumed root that could not be re-armed after a failed widen: a dominating
+  /// terminal [`Rescan`](tributary_fs::EventKind::Rescan) per subscriber (so each
+  /// re-enumerates and learns the root is gone), then frees its index / reverse-index / side
+  /// table (via [`force_remove_root`](Subsumer::force_remove_root)) and every subscriber's
+  /// per-sub filter + epoch state (invariant I4). After this the root no longer reads
+  /// watched, so a dedup caller re-installs it (no silent loss).
+  fn retire_disarmed_root(&mut self, old: S::Handle, root_key: &[C]) {
+    let subscribers = self.subsumer.force_remove_root(old);
+    let mut rescans = Vec::with_capacity(subscribers.len());
+    for &sub in &subscribers {
+      // Mint the dominating Rescan before freeing the ledger entry (repoint reads it); the
+      // built event carries its epoch, so the subsequent free cannot perturb it.
+      let rescan = self.epochs.repoint(sub);
+      rescans.push(Event::rescan(sub, root_key.to_vec(), rescan));
+    }
+    for sub in subscribers {
+      self.retire_sub_state(sub);
     }
     self.push_all(rescans);
   }
@@ -941,6 +1012,48 @@ where
     }
     for event in tail {
       let _ = self.events.try_send(event);
+    }
+  }
+
+  /// The **source-drain** shutdown drain (design backpressure doc, checklist #1): when the
+  /// source's `next` yields `None` while a consumer is still attached, deliver everything
+  /// OWED — the coalesced tail AND every parked per-subscription overflow Rescan — *before*
+  /// the stream ends, so a resuming consumer never reaches stream-end missing an owed
+  /// dominating Rescan (no silent loss on source drain).
+  ///
+  /// Every emit is a non-blocking [`try_send`](async_channel::Sender::try_send) — the owner
+  /// **never awaits the event-stream sender** (invariant III preserved even at teardown) —
+  /// retried across a short [`RETRY`] sleep while the channel is full, reclaiming each refused
+  /// tail event and re-offering each parked Rescan. Bounded: it returns once everything owed is
+  /// delivered, or the consumer is gone ([`flush_pending_rescans`](Self::flush_pending_rescans)
+  /// clears parked entries on [`Closed`](async_channel::TrySendError::Closed), and
+  /// [`is_closed`](async_channel::Sender::is_closed) short-circuits an all-refused channel whose
+  /// receivers have all dropped).
+  ///
+  /// This runs **only** on the source-drain break — a consumer-initiated `Close` or a dropped
+  /// last handle owes nothing and takes the non-blocking best-effort path instead, so this
+  /// retry can never block a `Close`.
+  async fn drain_owed_before_shutdown(&mut self) {
+    let mut tail = Vec::new();
+    if let Some(coalescer) = self.coalescer.as_mut() {
+      coalescer.flush_all(&mut tail);
+    }
+    loop {
+      // Re-offer the coalesced tail, keeping only the events the (full) channel still refuses.
+      tail = tail
+        .into_iter()
+        .filter_map(|event| match self.events.try_send(event) {
+          Ok(()) | Err(async_channel::TrySendError::Closed(_)) => None,
+          Err(async_channel::TrySendError::Full(returned)) => Some(returned),
+        })
+        .collect();
+      // Re-offer every owed parked Rescan (clears delivered / consumer-gone entries).
+      self.flush_pending_rescans();
+      if (tail.is_empty() && self.needs_rescan.is_empty()) || self.events.is_closed() {
+        break;
+      }
+      // Wait for the consumer to drain a slot, then retry — never awaiting the sender itself.
+      R::sleep(RETRY).await;
     }
   }
 }
