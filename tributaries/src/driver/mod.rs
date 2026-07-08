@@ -885,8 +885,14 @@ where
   ///   would put an ordinary event ahead of the `Rescan` that covers the drop (the fan-out
   ///   atomicity guarantee — Lens 2 — holds across iterations through this check);
   /// - [`Ok`] → delivered;
-  /// - [`Full`](async_channel::TrySendError::Full) → shed this subscription to a dominating
-  ///   `Rescan` ([`park_rescan`](Self::park_rescan));
+  /// - [`Full`](async_channel::TrySendError::Full) → shed to a dominating `Rescan`, the mint
+  ///   depending on **what** overflowed. An already-minted synthetic `Rescan` (a widen/restore
+  ///   re-point, a fanned source-overflow, a terminal `Rescan`) is **parked UNCHANGED** at its own
+  ///   dominating epoch ([`park_rescan_event`](Self::park_rescan_event)): re-minting it via
+  ///   `shed_rescan` would push its epoch one *above* a re-point's calibrated new-root events and
+  ///   silently drop them (Codex R5). An ordinary delta instead sheds to a fresh
+  ///   [`shed_rescan`](epoch::EpochLedger::shed_rescan) ([`park_rescan`](Self::park_rescan)), whose
+  ///   new dominating `Rescan` covers its loss;
   /// - [`Closed`](async_channel::TrySendError::Closed) → no-op: the consumer is gone and
   ///   teardown arrives on the command mailbox.
   fn try_emit(&mut self, ev: Event<C, V>) {
@@ -896,14 +902,26 @@ where
     }
     match self.events.try_send(ev) {
       Ok(()) => {}
-      Err(async_channel::TrySendError::Full(_)) => self.park_rescan(sub),
+      // An already-minted `Rescan` carries its own strictly-dominating epoch — a re-point's is the
+      // rebased base its new root's raw-0/raw-1 events tie-or-exceed, so a fresh `shed_rescan` (one
+      // past the high-water) would dominate and silently drop them (Codex R5). Park it UNCHANGED; an
+      // ordinary delta sheds to a fresh dominating `shed_rescan`.
+      Err(async_channel::TrySendError::Full(ev)) => {
+        if ev.is_rescan() {
+          self.park_rescan_event(ev);
+        } else {
+          self.park_rescan(sub);
+        }
+      }
       Err(async_channel::TrySendError::Closed(_)) => {}
     }
   }
 
-  /// Sheds `sub` to a parked dominating [`Rescan`](tributary_fs::EventKind::Rescan) after a
-  /// delivery to it found the channel full (design backpressure doc): the per-subscription
-  /// overflow shed, mirroring the fs layer's `LagState::Lagged` one level up.
+  /// Sheds `sub` to a parked dominating [`Rescan`](tributary_fs::EventKind::Rescan) after an
+  /// **ordinary delta** to it found the channel full (design backpressure doc): the
+  /// per-subscription overflow shed, mirroring the fs layer's `LagState::Lagged` one level up. An
+  /// already-minted `Rescan` that overflows takes [`park_rescan_event`](Self::park_rescan_event)
+  /// instead (parked unchanged at its own epoch, never re-minted).
   ///
   /// Looks up `sub`'s covered key (the subtree the consumer must re-enumerate) and its recorded
   /// caller value, mints a **non-rebasing** strictly-dominating epoch
@@ -925,6 +943,34 @@ where
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.drop_subscription(sub);
     }
+  }
+
+  /// Parks an already-minted synthetic [`Rescan`](tributary_fs::EventKind::Rescan) that overflowed
+  /// the channel **UNCHANGED** (design backpressure doc, Codex R5): merges its own `key`, `epoch`,
+  /// and baked `value` into `needs_rescan` via [`merge_max`], **without** minting a fresh
+  /// [`shed_rescan`](epoch::EpochLedger::shed_rescan).
+  ///
+  /// The distinction from [`park_rescan`](Self::park_rescan) is load-bearing for a widen/restore
+  /// re-point `Rescan`: [`repoint`](epoch::EpochLedger::repoint) rebased the subscription's
+  /// `epoch_base` to this `Rescan`'s epoch, so its new root's genuine raw-0/raw-1 events stamp
+  /// `base + 0`, `base + 1` — they **tie-or-exceed** the `Rescan` and must not be dominated by it.
+  /// A fresh `shed_rescan` mints `high_water.next()`, one *above* the re-point epoch, which would
+  /// dominate the new root's raw-0 event and silently drop it under backpressure. Parking the
+  /// `Rescan` at its own epoch keeps that calibration. `merge_max`'s epoch `max` means a
+  /// higher-epoch `Rescan` already parked for the sub still wins (still dominating).
+  ///
+  /// No coalescer purge runs here (unlike [`park_rescan`](Self::park_rescan)): whatever admitted
+  /// this `Rescan` to the [`Coalescer`](crate::coalesce::Coalescer) already flushed the sub's
+  /// buffered deltas (a `Rescan` flushes its subscription's buffer), so none linger to be
+  /// dominated.
+  fn park_rescan_event(&mut self, ev: Event<C, V>) {
+    merge_max(
+      &mut self.needs_rescan,
+      ev.subscription(),
+      ev.key().to_vec(),
+      ev.epoch(),
+      ev.value().cloned(),
+    );
   }
 
   /// Re-offers every parked per-subscription overflow `Rescan` at the top of each loop

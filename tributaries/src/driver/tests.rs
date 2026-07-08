@@ -174,16 +174,19 @@ impl Source<OsString> for FakeSource {
   }
 }
 
-/// Builds a `Rescan` [`SourceEvent`] for `handle` at `path` — the terminal / overflow
-/// coverage-loss signal `retire_if_dead` classifies via [`Source::root_key`].
-fn rescan_event(handle: u32, path: &str) -> SourceEvent<OsString, u32> {
+/// Builds a `Rescan` [`SourceEvent`] for `handle` at `path` with raw fs `epoch` — the terminal /
+/// overflow coverage-loss signal `retire_if_dead` classifies via [`Source::root_key`]. The epoch is
+/// the source's raw stamp (rebased at fan-out); it is irrelevant on the retire path (which mints its
+/// own `shed_rescan`) and load-bearing only when the fanned `Rescan` overflows and parks at its own
+/// stamped epoch (Codex R5).
+fn rescan_event(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, u32> {
   SourceEvent::new(
     handle,
     key(path),
     EventKind::Rescan,
     None,
     Location::new(),
-    Epoch::new(0),
+    Epoch::new(epoch),
     ChangeId::new(NonZeroU64::MIN),
   )
 }
@@ -763,7 +766,7 @@ async fn terminal_rescan_retires_root_overflow_keeps_it() {
   h.owner.epochs.stamp(sub, Epoch::new(3));
 
   // Handle 1 is live: an overflow Rescan (root_key is Some) must NOT retire it.
-  h.owner.retire_if_dead(&rescan_event(1, "/a"));
+  h.owner.retire_if_dead(&rescan_event(1, "/a", 0));
   assert_eq!(
     h.owner.subsumer.roots().count(),
     1,
@@ -776,7 +779,7 @@ async fn terminal_rescan_retires_root_overflow_keeps_it() {
 
   // The root dies out of band (root_key now None): the terminal Rescan retires it.
   h.owner.source.kill_root(1);
-  h.owner.retire_if_dead(&rescan_event(1, "/a"));
+  h.owner.retire_if_dead(&rescan_event(1, "/a", 0));
   assert_eq!(
     h.owner.subsumer.roots().count(),
     0,
@@ -975,18 +978,21 @@ async fn root_death_while_channel_full_keeps_owed_rescan() {
 
   // The root dies out of band. Reproduce the run loop's same-event ordering: fan out the
   // terminal Rescan first, then retire. The fan-out finds the channel full, so the terminal
-  // coverage-loss Rescan is shed to a parked dominating Rescan.
+  // coverage-loss Rescan overflows and parks. It is an already-minted `Rescan`, so it parks at its
+  // OWN dominating epoch — its umbrella stamp `base + raw` = 0 + 3, past the high-water of 2 — not a
+  // fresh `shed_rescan` (Codex R5); for a source-overflow Rescan on a live root that is the same
+  // strictly-dominating value.
   h.owner.source.kill_root(1);
-  h.owner.fan_out_and_push(&rescan_event(1, "/a"));
+  h.owner.fan_out_and_push(&rescan_event(1, "/a", 3));
   assert_eq!(
     h.owner.needs_rescan.get(&sub).map(|p| p.epoch),
     Some(Epoch::new(3)),
-    "the terminal Rescan parked (channel full), minted one past the high-water"
+    "the overflowed terminal Rescan parked at its own dominating epoch (base + raw = 3)"
   );
 
   // Retiring the dead root frees its filter + epoch but must KEEP the parked terminal Rescan
   // — dropping it here is the silent-loss regression this test guards.
-  h.owner.retire_if_dead(&rescan_event(1, "/a"));
+  h.owner.retire_if_dead(&rescan_event(1, "/a", 0));
   assert_eq!(
     h.owner.subsumer.roots().count(),
     0,
@@ -1046,6 +1052,102 @@ async fn root_death_while_channel_full_keeps_owed_rescan() {
   assert!(
     rescan.epoch() > max_delivered,
     "the terminal Rescan strictly dominates every event delivered before it (no silent loss)"
+  );
+}
+
+/// Codex R5 regression (design backpressure doc §8, epoch calibration / no silent loss): a **widen
+/// while the event channel is FULL** so the synthetic re-point `Rescan` overflows into
+/// `needs_rescan`. It must park at its OWN epoch — the `repoint` base its new root's genuine events
+/// are calibrated to tie — NOT a fresh `shed_rescan` (one past the high-water). Parking at
+/// `shed_rescan` (high-water + 1) leaves the parked `Rescan` one *above* the new root's
+/// raw-epoch-0 event, so a dominance-applying consumer drops that post-widen event as "dominated"
+/// even though it happened AFTER the re-enumeration → silent loss under backpressure.
+///
+/// Fail-on-old: with the old unconditional `park_rescan`, the parked/delivered `Rescan` is epoch 6
+/// (high-water 4 → repoint 5 → shed 6), one above the new root's raw-0 stamp (5) → both the
+/// `needs_rescan == 5` and the `raw-0 not below the Rescan` assertions FAIL.
+#[tokio::test]
+async fn widen_repoint_rescan_parks_at_own_epoch_not_shed_when_channel_full() {
+  let mut h = Harness::bounded(2);
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // root 1
+  // Drive sb's high-water to 4, as genuine deliveries would.
+  for raw in 0..5 {
+    h.owner.epochs.stamp(sb, Epoch::new(raw));
+  }
+
+  // FILL both slots so the widen's re-point Rescan must overflow-park. `try_emit` never re-stamps a
+  // pre-stamped delivery, so these fillers leave sb's high-water at 4.
+  h.owner.try_emit(modified_event(sb, "/a/b/f0", 0));
+  h.owner.try_emit(modified_event(sb, "/a/b/f1", 1));
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the fillers took both slots without overflowing yet"
+  );
+
+  // Widen /a/b → /a: sb is re-pointed. `repoint` rebases sb's epoch_base to high-water.next() = 5
+  // and mints the re-point Rescan at 5; sb's new root (handle 2) will stamp its raw-0/raw-1 events
+  // 5 + 0 and 5 + 1. The `push_all` of that Rescan finds the channel full → it overflows.
+  h.watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+
+  // R5: the overflowed re-point Rescan parks at its OWN epoch (the repoint base 5), NOT a fresh
+  // shed_rescan (high-water.next() = 6). Parking at 6 would sort the new root's raw-0 event (5)
+  // below it and drop it as dominated.
+  assert_eq!(
+    h.owner.needs_rescan.get(&sb).map(|p| p.epoch),
+    Some(Epoch::new(5)),
+    "the re-point Rescan parked at the repoint base (5), not shed_rescan (6)"
+  );
+
+  // Resume: drain the two fillers, then flush the parked re-point Rescan.
+  assert_eq!(h.drain().len(), 2, "the two pre-widen fillers drained");
+  h.owner.flush_pending_rescans();
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the parked re-point Rescan was delivered on resume"
+  );
+  let rescan = h
+    .drain()
+    .into_iter()
+    .find(|e| e.subscription() == sb && e.is_rescan())
+    .expect("the re-point Rescan was delivered");
+  assert_eq!(rescan.path(), Path::new("/a"), "it names the widened root");
+  let rescan_epoch = rescan.epoch();
+  assert_eq!(
+    rescan_epoch,
+    Epoch::new(5),
+    "the delivered re-point Rescan carries the repoint base (5), not shed_rescan (6)"
+  );
+
+  // sb's new root (handle 2) now delivers genuine events; they stamp base + raw = 5 + 0, 5 + 1.
+  // Drain after each so the two co-subscribers (sb and the new /a watch) never overflow the
+  // two-slot channel.
+  h.owner.fan_out_and_push(&source_modified(2, "/a/b/g0", 0));
+  let raw0 = h
+    .drain()
+    .into_iter()
+    .find(|e| e.subscription() == sb)
+    .expect("sb's new-root raw-0 event was delivered, not suppressed");
+  h.owner.fan_out_and_push(&source_modified(2, "/a/b/g1", 1));
+  let raw1 = h
+    .drain()
+    .into_iter()
+    .find(|e| e.subscription() == sb)
+    .expect("sb's new-root raw-1 event was delivered");
+
+  // The R5 payoff: the new root's raw-0 (epoch 5) is NOT below the delivered Rescan (epoch 5) — it
+  // ties, so a dominance-applying consumer keeps it. With the old shed_rescan (Rescan at 6), raw-0
+  // (5) sorts BELOW it → dropped as dominated → silent loss of a post-widen change.
+  assert_eq!(raw0.epoch(), Epoch::new(5), "raw-0 stamps the repoint base");
+  assert_eq!(raw1.epoch(), Epoch::new(6), "raw-1 stamps base + 1");
+  assert!(
+    raw0.epoch() >= rescan_epoch,
+    "the new root's raw-0 genuine event is not dominated by the re-point Rescan (no silent loss)"
+  );
+  assert!(
+    raw1.epoch() >= rescan_epoch,
+    "…and raw-1 is not dominated either"
   );
 }
 
