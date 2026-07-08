@@ -904,10 +904,14 @@ where
   /// is a non-blocking [`try_send`](async_channel::Sender::try_send).
   ///
   /// Three outcomes:
-  /// - the subscription already carries a parked overflow `Rescan` (`needs_rescan`) →
-  ///   **suppress** the emit: it is dominated by that pending `Rescan`, and delivering it
-  ///   would put an ordinary event ahead of the `Rescan` that covers the drop (the fan-out
-  ///   atomicity guarantee — Lens 2 — holds across iterations through this check);
+  /// - the subscription already carries a parked overflow `Rescan` (`needs_rescan`) → for an
+  ///   **ordinary delta**, **suppress** the emit: it is dominated by that pending `Rescan`, and
+  ///   delivering it would put an ordinary event ahead of the `Rescan` that covers the drop (the
+  ///   fan-out atomicity guarantee — Lens 2 — holds across iterations through this check). A
+  ///   source-emitted `Rescan` arriving while parked is instead **merged** into the debt
+  ///   ([`park_rescan_event`](Self::park_rescan_event)): it is an independent coverage-loss signal
+  ///   that may name a *different* key under the same root, so discarding it would leave its
+  ///   subtree never re-enumerated (Codex R8, no silent loss under backpressure);
   /// - [`Ok`] → delivered;
   /// - [`Full`](async_channel::TrySendError::Full) → shed to a dominating `Rescan`, the mint
   ///   depending on **what** overflowed. An already-minted synthetic `Rescan` (a widen/restore
@@ -922,6 +926,14 @@ where
   fn try_emit(&mut self, ev: Event<C, V>) {
     let sub = ev.subscription();
     if self.needs_rescan.contains_key(&sub) {
+      // An ordinary delta is dominated by the parked `Rescan` — suppress it. But a source
+      // `Rescan` is an INDEPENDENT coverage-loss signal that may name a different located key
+      // under the same root; merge it into the parked debt (`merge_max` widens the key to the
+      // common ancestor covering both losses) instead of discarding it, or its subtree is
+      // never re-enumerated (Codex R8, no silent loss under backpressure).
+      if ev.is_rescan() {
+        self.park_rescan_event(ev);
+      }
       return;
     }
     match self.events.try_send(ev) {
@@ -1276,7 +1288,7 @@ struct ParkedRescan<C, V> {
 /// `subscription_key(sub)`/`subscription_value(sub)`. They uphold the "keys only ever widen"
 /// invariant without ever needing to exercise it (a widen's own synthetic `Rescan` for an
 /// already-parked sub is suppressed by `try_emit`, so it never reaches this merge).
-fn merge_max<C, V>(
+fn merge_max<C: PartialEq, V>(
   needs_rescan: &mut BTreeMap<Subscription, ParkedRescan<C, V>>,
   sub: Subscription,
   key: Vec<C>,
@@ -1287,7 +1299,19 @@ fn merge_max<C, V>(
   match needs_rescan.entry(sub) {
     Entry::Occupied(mut occupied) => {
       let parked = occupied.get_mut();
-      parked.key = key;
+      // Widen the parked key to the longest common prefix of the two keys, so the single
+      // parked `Rescan` covers BOTH re-enumeration debts. Overwriting with `key` is correct
+      // only when it is an ancestor of the parked key; two independent source `Rescan`s under
+      // one root (say /a/x then /a/y) are siblings, and dropping either's coverage is silent
+      // loss (Codex R8). Their common prefix (/a) re-enumerates a superset of both, and where
+      // `key` *is* an ancestor of the parked key the prefix is exactly `key` (unchanged
+      // behavior for the re-point/terminal/ordinary-shed paths).
+      let common = key
+        .iter()
+        .zip(parked.key.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+      parked.key.truncate(common);
       parked.epoch = parked.epoch.max(epoch);
       parked.value = value;
     }
