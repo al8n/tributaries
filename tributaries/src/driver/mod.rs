@@ -511,6 +511,15 @@ where
     owner.drain_owed_once();
     closing
   };
+  // Every teardown exit funnels here — a `Close` command, a dropped last handle, or the source
+  // draining — AFTER the owed Rescans above are made durable/delivered (nothing owed is lost).
+  // Publish an EMPTY read plane so a retained `WatchView` clone stops advertising subscriptions
+  // whose owner task and source are about to be gone: otherwise it keeps answering
+  // `is_watched`/`covering` from the last snapshot, and a dedup caller (the indexer) skips
+  // re-installing that coverage and silently misses changes after rebuilding a fresh watcher
+  // (design §5). It is a synchronous `arc_swap` store — the owner still never awaits the event
+  // sender, so no-deadlock (III) holds.
+  owner.subsumer.publish_empty();
   // Dropping `owner` (and its source) performs the orderly source teardown.
   if let Some(reply) = ack {
     let _ = reply.send(Ok(()));

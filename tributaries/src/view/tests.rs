@@ -122,3 +122,51 @@ fn view_reflects_unwatch() {
   );
   assert!(view.is_empty());
 }
+
+/// Attribution is per-subscription: a covered subscription resolves to its **own** value, not
+/// the covering armed root's — and once the root's own watch departs (leaving the armed root
+/// broader than any live subscription) attribution still returns the surviving covered sub's
+/// value, never the departed root-owner's (design §5, longest-live-subscription attribution).
+///
+/// Regression: the `Covered` commit path used to discard the covered watch's value and
+/// `covering`/`resolve` read the covering root's stored value, gated only by live coverage. So
+/// `watch(/a)=A` then `watch(/a/b)=B` (covered), then `unwatch(/a)` left `/a/b` live yet
+/// `resolve(/a/b/file)` returned the departed root `/a`'s stale A — misattributing live events
+/// across ownership boundaries. Fail-on-old (resolve on the root plane): returns 100 → FAILS.
+#[test]
+fn covered_sub_resolves_to_its_own_value_not_the_departed_root() {
+  let mut s = S::new();
+  let view = s.view();
+
+  // watch /a = 100 [disjoint root, handle 1]; watch /a/b = 200 [Covered by /a's root, handle 1].
+  let a = install(&mut s, 1, b"a", 100);
+  let _b = install(&mut s, 1, b"ab", 200);
+
+  // While both live: attribution is the LONGEST live subscription's value — /a/b/x → B(200) (the
+  // covered `/a/b` sub, not the covering `/a` root), and /a/x → A(100) (only `/a` covers it).
+  assert_eq!(
+    view.resolve(b"abx").map(Snapshot::into_inner),
+    Some(200),
+    "a covered key resolves to the covered subscription's OWN value (longest live sub)"
+  );
+  assert_eq!(
+    view.resolve(b"ax").map(Snapshot::into_inner),
+    Some(100),
+    "a key only the broader root covers resolves to the root subscription's value"
+  );
+
+  // Unwatch /a's own watch: the armed root /a lives on for /a/b, now broader than any live sub.
+  s.plan_unwatch(a);
+
+  assert_eq!(
+    view.resolve(b"abx").map(Snapshot::into_inner),
+    Some(200),
+    "/a/b/x still resolves to the surviving covered sub's value (200), NOT the departed root's \
+     stale 100"
+  );
+  assert_eq!(
+    view.resolve(b"ax"),
+    None,
+    "/a/x is no longer covered by any live subscription (only /a/b is live) → nothing"
+  );
+}

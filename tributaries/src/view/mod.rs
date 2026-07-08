@@ -124,28 +124,33 @@ where
     self.shared.load().roots.contains(key)
   }
 
-  /// The caller value of the root that **covers** `key` — the owning attribution value
-  /// (design §5). `None` when `key` is not watched.
+  /// The caller value **owning** `key` — the attribution value (design §5). `None` when `key`
+  /// is not watched.
   ///
-  /// Coverage follows [`is_watched`](Self::is_watched) (the live-subscription plane), so
-  /// a key an armed-but-broadened root no longer truly covers resolves to nothing rather
-  /// than to a departed watch's value. The value returned is the **covering root's** —
-  /// a covered subscription does not own a root, so a covered key resolves to its
-  /// covering root's value (design §5), never the covered subscription's own.
+  /// Attribution follows the **live-subscription** coverage plane, same as
+  /// [`is_watched`](Self::is_watched): the value returned is that of the **longest** live
+  /// subscription whose own key is an ancestor-or-equal of `key`. A covered subscription owns its
+  /// **own** value even though it shares a broader root, so a covered key resolves to the covered
+  /// subscription's value, not the covering root's; and a key an armed-but-broadened root no
+  /// longer truly covers resolves to nothing rather than to a departed watch's value. When
+  /// several live subscriptions share the exact longest key, the most-recent (highest-id) wins —
+  /// a deterministic tie-break.
   #[inline]
   #[must_use]
   pub fn covering(&self, key: &[C]) -> Option<Snapshot<V>>
   where
     V: Clone,
   {
-    let snapshot = self.shared.load();
-    // Coverage gates attribution: only a key some live subscription covers resolves (to its
-    // covering root's value). `?` short-circuits an uncovered key to `None`.
-    snapshot.covers.get_ancestor(key)?;
-    snapshot
-      .roots
+    // Attribution reads the live-subscription coverage plane, not the armed-root plane: the
+    // longest live subscription covering `key`, tie-broken most-recent within a shared key. An
+    // armed root can outlive the subscription whose value equalled it, so reading the root's
+    // value would return a departed watch's value for a key a narrower live sub now owns.
+    self
+      .shared
+      .load()
+      .covers
       .get_ancestor(key)
-      .map(|record| Snapshot::new(record.value.clone()))
+      .map(|entry| Snapshot::new(entry.value().clone()))
   }
 
   /// Attribution alias for [`covering`](Self::covering): the caller value owning
