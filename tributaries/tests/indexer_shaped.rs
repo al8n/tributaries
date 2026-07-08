@@ -111,6 +111,13 @@ impl<R: RuntimeLite> IndexerSource<R> {
 impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   type Handle = RootHandle;
 
+  fn canonicalize_key(&self, key: &[Comp]) -> Result<Vec<Comp>, WatchError> {
+    // The indexer coordinate is already canonical (a volume id + volume-relative `Seg`s, no
+    // symlink/`..` to resolve), so canonicalization is the identity — mirroring any source whose
+    // key space is canonical by construction.
+    Ok(key.to_vec())
+  }
+
   async fn arm(&mut self, key: &[Comp]) -> Result<Armed<Comp, RootHandle>, WatchError> {
     // A well-formed watch always resolves under a registered mount; `?`/`From` surfaces a
     // genuine arm failure (`WatchRootError` is `#[non_exhaustive]` — never constructed here).
