@@ -1282,15 +1282,22 @@ where
         // fresh cover, re-arming the newcomer's previously-pruned subtree). `Some` is the antichain of
         // all live subscribers' keys; `None` means a subscriber now pins the root at its own key, so
         // re-issue the CANCEL-equivalent — the root's OWN key (full coverage), which cancels any
-        // pending set_cover. Update the retained bookkeeping to EXACTLY what was issued, so a later
-        // `plan_watch` reads the source's true coverage. Only `Covered` needs this: `Widen` mints a
-        // fresh wide root (full coverage, its subsumed handles' set_covers dropped by
+        // pending set_cover. The recorded cover is PESSIMISTIC on a broaden (Codex R38): this
+        // re-issue only ENQUEUES the grow — for the fs source a reply-less try_send the lower
+        // driver applies later — so recording the broadened cover at issuance would let a SECOND
+        // Covered watch landing in the enqueue→apply window classify against the optimistic
+        // record, skip ITS bridging Rescan, and silently miss writes under the still-pruned
+        // subtree. The record therefore only ever NARROWS (at the over-broad release issue): a
+        // Covered-outside newcomer keeps the OLD narrower record, so every further newcomer
+        // outside it still parks a bridge and re-triggers the (idempotent, latest-wins) grow — a
+        // spurious bridge after the grow applies is the same benign class as the whole-subtree
+        // no-op backends, never a loss. Only `Covered` needs any of this: `Widen` mints a fresh
+        // wide root (full coverage, its subsumed handles' set_covers dropped by
         // supersede-by-release); `Disjoint` mints a fresh root, so nothing is pending. Synchronous
         // fire-and-forget like `disarm`/`set_cover` everywhere — a no-op source conforms.
         match self.subsumer.retained_cover_for(fs_root) {
           Some(cover) => {
             self.source.set_cover(fs_root, &cover);
-            self.subsumer.set_retained_cover(fs_root, Some(cover));
           }
           None => {
             if let Some(root_key) = self
@@ -1300,7 +1307,6 @@ where
             {
               self.source.set_cover(fs_root, &[root_key]);
             }
-            self.subsumer.set_retained_cover(fs_root, None);
           }
         }
         Ok(sub)

@@ -1029,6 +1029,57 @@ async fn covered_outside_narrowed_root_parks_bridge_and_grows_coverage() {
   );
 }
 
+/// Codex R38 regression — the recorded retained cover is PESSIMISTIC on a broaden: a Covered-outside
+/// grow only ENQUEUES the set_cover (for the fs source, a reply-less try_send applied later), so the
+/// record must NOT broaden at issuance. Two back-to-back Covered-outside watches after a narrow:
+/// the SECOND lands in the first's enqueue→apply window and must STILL classify outside the old
+/// narrow record — parking its own bridging Rescan — or writes under its still-pruned subtree would
+/// be silently missed. Fail-on-old: recording the broadened cover at the first grow made the second
+/// newcomer read inside-cover, skipping its bridge.
+#[tokio::test]
+async fn second_covered_outside_during_a_pending_broaden_still_bridges() {
+  let mut h = Harness::new();
+
+  // Narrow the wide /a root to {/a/b} (the over-broad release records the NARROW cover).
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  h.unwatch(s_a).expect("unwatch the widening /a");
+
+  // FIRST Covered-outside newcomer: bridges + enqueues the grow (the record must stay {/a/b}).
+  let s_c = h
+    .watch("/a/c", Interest::all())
+    .await
+    .expect("watch /a/c covered-outside");
+  assert!(
+    h.owner.needs_rescan.contains_key(&s_c),
+    "the first covered-outside newcomer parks its bridge"
+  );
+
+  // SECOND Covered-outside newcomer, conceptually inside the first grow's enqueue→apply window:
+  // the pessimistic record means it MUST also classify outside and park its own bridge.
+  let s_d = h
+    .watch("/a/d", Interest::all())
+    .await
+    .expect("watch /a/d covered-outside");
+  assert!(
+    h.owner.needs_rescan.contains_key(&s_d),
+    "the SECOND covered-outside newcomer ALSO parks a bridge — the record never broadened at \
+     issuance (Codex R38)"
+  );
+  // And its own grow re-issue carries a cover including /a/d (latest-wins at the source).
+  assert!(
+    h.owner
+      .source
+      .calls()
+      .iter()
+      .any(|c| matches!(c, Call::SetCover(_, cover) if cover.contains(&key("/a/d")))),
+    "the second newcomer re-triggered the grow with a cover including its key"
+  );
+}
+
 /// The widen arm failure RESTORE (design driver-golden doc, invariant I3): when the wider
 /// arm FAILS after the subsumed roots were disarmed, the owner
 /// must **not** leave those live subscriptions bound to disarmed handles (recorded-live yet
