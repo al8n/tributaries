@@ -80,10 +80,6 @@ struct IndexerSource<R: RuntimeLite> {
 /// releases each `arm` applies up front (bounded, keeps clause 5 eventual).
 const OPPORTUNISTIC_RELEASES: usize = 2;
 
-/// Mirror of the fs source's `OVERLAP_RETRY_CAP`: defense-in-depth bound on the conflict-triggered
-/// release-retry loop against a pathological watcher.
-const OVERLAP_RETRY_CAP: usize = 64;
-
 impl<R: RuntimeLite> IndexerSource<R> {
   fn new(watcher: Watcher<R>, mounts: Vec<(Vec<Comp>, PathBuf)>) -> Self {
     Self {
@@ -142,14 +138,15 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   }
 
   async fn arm(&mut self, key: &[Comp]) -> Result<Armed<Comp, RootHandle>, WatchError> {
-    // Mirror the fs source's R29 release application: (a) opportunistically unwatch the OLDEST few
-    // queued releases up front (bounded per-arm cost, keeps clause 5 eventual), then (b)+(c) attempt
-    // the watch and resolve on demand any `Overlaps` the watcher NAMES against a released-but-lingering
-    // root. The watcher rejects by identity and names `existing` (a canonical PATH), so reverse it into
-    // the `Comp` key space to find the matching pending entry (fallback: the oldest pending entry — a
-    // lingering released root is the only legitimate umbrella-side conflict), unwatch exactly it, and
-    // retry. Bounded: each retry removes ≥1 conflicting pending root; a rejection naming no pending
-    // root (a genuine live conflict) or the retry cap surfaces the overlap rather than looping forever.
+    // Mirror the fs source's release application: (a) opportunistically unwatch the OLDEST few queued
+    // releases up front (bounded per-arm cost, keeps clause 5 eventual), then (b)+(c) attempt the watch
+    // and resolve on demand any `Overlaps` the watcher NAMES against a released-but-lingering root. The
+    // watcher rejects by identity and names `existing` (a canonical PATH), so reverse it into the
+    // `Comp` key space to find the EXACT-matching pending entry, unwatch exactly it, and retry. Retry
+    // is a structural progress bound (Codex R30-F2), not a fixed cap: each retry strictly shrinks the
+    // pending queue, so it terminates in ≤ pending-queue-length retries with no arbitrary ceiling; a
+    // rejection naming no pending root (a genuine live conflict) surfaces the overlap immediately (no
+    // index-0 fallback masking a real conflict by unwatching an unrelated pending root).
     for _ in 0..OPPORTUNISTIC_RELEASES {
       let Some((released, _)) = self.pending_releases.pop_front() else {
         break;
@@ -161,37 +158,38 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     let path = self
       .key_to_path(key)
       .expect("indexer source: every armed key lies under a registered mount");
-    let mut retries = 0usize;
+    #[cfg(debug_assertions)]
+    let initial_pending = self.pending_releases.len();
+    #[cfg(debug_assertions)]
+    let mut iterations = 0usize;
     let handle = loop {
+      #[cfg(debug_assertions)]
+      {
+        iterations += 1;
+        debug_assert!(
+          iterations <= initial_pending + 1,
+          "IndexerSource::arm conflict-retry exceeded pending+1 iterations — pending must strictly \
+           shrink each retry (structural progress bound, Codex R30-F2)"
+        );
+      }
       match self.watcher.watch(path.clone(), Interest::all()).await {
         Ok(handle) => break handle,
         Err(WatchRootError::Overlaps {
           path: rejected,
           existing,
         }) => {
+          // Continue ONLY while the named conflict EXACT-matches a pending entry; otherwise surface it.
           let existing_key = self.path_to_key(&existing);
-          let victim = self
-            .pending_releases
-            .iter()
-            .position(|(_, stored)| {
-              existing_key
-                .as_deref()
-                .is_some_and(|ek| stored.as_deref() == Some(ek))
-            })
-            .or_else(|| (!self.pending_releases.is_empty()).then_some(0));
-          let Some(index) = victim else {
+          let Some(index) = self.pending_releases.iter().position(|(_, stored)| {
+            existing_key
+              .as_deref()
+              .is_some_and(|ek| stored.as_deref() == Some(ek))
+          }) else {
             return Err(WatchError::Fs(WatchRootError::Overlaps {
               path: rejected,
               existing,
             }));
           };
-          if retries >= OVERLAP_RETRY_CAP {
-            return Err(WatchError::Fs(WatchRootError::Overlaps {
-              path: rejected,
-              existing,
-            }));
-          }
-          retries += 1;
           let (released, _) = self
             .pending_releases
             .remove(index)

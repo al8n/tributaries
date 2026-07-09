@@ -68,10 +68,10 @@ mod integration {
 
   use agnostic_lite::tokio::TokioRuntime;
   use tempfile::TempDir;
-  use tributary_fs::{RootHandle, WatcherOptions};
+  use tributary_fs::{RootHandle, WatchRootError, WatcherOptions};
 
   use super::super::{FsSource, OPPORTUNISTIC_RELEASES, Source, SourceEvent, key_to_path};
-  use crate::event::path_components;
+  use crate::{error::WatchError, event::path_components};
 
   /// Generous ceiling for one expected observation; CI runners are slow and FSEvents
   /// batches on its own latency timer.
@@ -355,17 +355,22 @@ mod integration {
     );
   }
 
-  /// R29-F1 (i): an ancestor arm over N released-but-lingering descendants succeeds via the
+  /// R29-F1 (i) / R30-F2: an ancestor arm over N released-but-lingering descendants succeeds via the
   /// conflict-triggered retry — no [`Overlaps`](tributary_fs::WatchRootError::Overlaps) reaches the
-  /// caller. Watch+disarm N=8 disjoint tempdir SUBDIRS, then watch their PARENT: the parent overlaps
+  /// caller. Watch+disarm N disjoint tempdir SUBDIRS, then watch their PARENT: the parent overlaps
   /// every still-lingering descendant, so the watcher rejects with `Overlaps` NAMING one at a time;
   /// each retry unwatches exactly the named descendant and re-attempts, until the parent arms cleanly
   /// (contract clause 2). Asserts the parent is live (no overlap surfaced — the awaited work was
   /// bounded by the conflicts actually named), the whole descendant backlog was applied, and the armed
   /// parent genuinely delivers.
+  ///
+  /// **N deliberately exceeds the retired `OVERLAP_RETRY_CAP` (64)** (Codex R30-F2): the retry is now a
+  /// STRUCTURAL progress bound (pending strictly shrinks each retry), not a fixed ceiling. Fail-on-old:
+  /// with the 64-retry cap, ~65 named conflicts (67 descendants less the 2 applied opportunistically)
+  /// would trip the cap and surface `Overlaps` to the caller instead of arming the parent.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn fs_source_ancestor_arm_over_many_released_descendants_succeeds() {
-    const N: usize = 8;
+    const N: usize = 67;
     let (_dir, parent) = scratch();
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
@@ -421,6 +426,67 @@ mod integration {
       observed.kind().is_created() || observed.kind().is_modified(),
       "a fresh file surfaces as a create or modify, got {:?}",
       observed.kind()
+    );
+  }
+
+  /// R30-F2 (ii): a rejection whose named conflict is NOT a pending (released) root — a genuine LIVE
+  /// overlap — surfaces immediately, WITHOUT the retired index-0 fallback wrongly unwatching an
+  /// unrelated pending root to mask it. Arm a LIVE child watch, disarm several disjoint roots (so the
+  /// pending queue stays non-empty past the opportunistic application), then arm the child's ANCESTOR:
+  /// the watcher names the LIVE child as the conflict, which EXACT-matches no pending entry, so the arm
+  /// surfaces `Overlaps` and leaves the unrelated pending root untouched.
+  ///
+  /// Fail-on-old: the index-0 fallback would unwatch the unrelated pending root (releasing a watch the
+  /// umbrella still considers pending) and retry, so it would be gone — the assertion that it survives
+  /// flips.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_unmatched_overlap_surfaces_without_touching_unrelated_pending() {
+    let (_dir_p, parent) = scratch();
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).expect("create child");
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    // A LIVE child watch — the genuine overlap the ancestor arm below hits (never released, so never
+    // pending).
+    source
+      .arm(&path_components(&child))
+      .await
+      .expect("arm the live child");
+
+    // Arm `OPPORTUNISTIC_RELEASES + 1` DISJOINT roots (separate tempdirs) FIRST, then disarm them all —
+    // arming-before-disarming keeps each arm's opportunistic application from draining the backlog as it
+    // is built (mirroring the ancestor test). The queue then stays non-empty PAST the opportunistic
+    // application the parent arm runs: the LAST-disarmed handle survives as the front of the remaining
+    // queue — exactly the entry the retired index-0 fallback would grab.
+    let mut dirs = Vec::new();
+    let mut handles = Vec::new();
+    for _ in 0..(OPPORTUNISTIC_RELEASES + 1) {
+      let (dir, root) = scratch();
+      let armed = source
+        .arm(&path_components(&root))
+        .await
+        .expect("arm a disjoint root");
+      handles.push(armed.handle());
+      dirs.push(dir); // keep each tempdir on disk for the test's lifetime
+    }
+    for &handle in &handles {
+      source.disarm(handle);
+    }
+    let survivor = *handles.last().expect("at least one disjoint root");
+
+    // Arm the child's ANCESTOR: it overlaps the LIVE child (which the watcher names), and the child is
+    // NOT a pending entry — so the arm surfaces `Overlaps` immediately.
+    let err = source
+      .arm(&path_components(&parent))
+      .await
+      .expect_err("the ancestor arm surfaces the live-child overlap");
+    assert!(
+      matches!(err, WatchError::Fs(WatchRootError::Overlaps { .. })),
+      "an unmatched (live) conflict surfaces as Overlaps, not looped-away"
+    );
+    assert!(
+      source.pending_set.contains(&survivor),
+      "the unrelated pending root is untouched — no index-0 fallback released it (Codex R30-F2)"
     );
   }
 }

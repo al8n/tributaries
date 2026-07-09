@@ -538,14 +538,6 @@ impl<R: RuntimeLite> FsSource<R> {
 /// surfacing an `Overlaps` for a released root — is the conflict-triggered retry, not this.
 const OPPORTUNISTIC_RELEASES: usize = 2;
 
-/// Defense-in-depth cap on the conflict-triggered release-retry loop in [`arm`](Source::arm). Each
-/// retry unwatches exactly the pending root the watcher *named* as the conflict and re-attempts the
-/// watch, so a **correct** watcher resolves within pending-queue-length retries (each removes ≥1
-/// conflicting pending root, and the queue is finite). The cap only bites against a *pathological*
-/// watcher whose `unwatch` never clears the conflict it keeps reporting — there we surface the overlap
-/// rather than loop forever (Codex R29).
-const OVERLAP_RETRY_CAP: usize = 64;
-
 impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
 
@@ -590,34 +582,45 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     // The correctness guarantee — a conforming source never SURFACES an `Overlaps` for a root whose
     // release was requested (disarm contract clause 2) — is upheld here by construction: the WATCHER
     // itself names the conflicting `existing` root (it rejects by object/ancestor IDENTITY, so it
-    // catches case/normalization aliases a byte-prefix overlap test would miss — Codex R29-F2). On each
-    // rejection, find the pending entry whose stored path IS the named conflict and unwatch it (a
-    // fallback to the OLDEST pending entry covers a spelling nuance between the stored path and the
-    // watcher's `existing`; umbrella-side disjointness means a lingering released root is the only
-    // legitimate conflict), then RETRY. Each retry removes ≥1 conflicting pending root, so a correct
-    // watcher resolves in ≤ pending-queue-length retries (the common case is ≤1; an ancestor arm over N
-    // released descendants is bounded by the N the watcher names one at a time). If a rejection names a
-    // root NOT in the pending queue (nothing pending to blame — a genuine live conflict, i.e. an
-    // umbrella-side disjointness bug), or the retry cap is hit (a pathological watcher whose unwatch
-    // never clears the conflict), surface the overlap rather than loop forever.
+    // catches case/normalization aliases a byte-prefix overlap test would miss — Codex R29-F2). Retry
+    // is a **structural progress bound** (Codex R30-F2), not a fixed cap: continue ONLY while the named
+    // `existing` EXACT-matches a still-pending (released) entry — remove exactly it, unwatch, and
+    // re-attempt. Each retry strictly SHRINKS the pending queue (one exact-matched entry removed), so
+    // the loop terminates in ≤ pending-queue-length retries with no arbitrary ceiling (the common case
+    // is ≤1; an ancestor arm over N released descendants is bounded by the N the watcher names one at a
+    // time — however large N is). A rejection whose named conflict is NOT a pending entry — a genuine
+    // LIVE conflict (an umbrella-side disjointness bug), never a lingering released root — surfaces the
+    // overlap IMMEDIATELY: there is no index-0 fallback, so we never unwatch an unrelated pending root
+    // to mask a real conflict.
     let arm_path = key_to_path(key);
-    let mut retries = 0usize;
+    // Progress tripwire (debug-only): the exact-match retry can run at most one more iteration than the
+    // pending queue was deep, since pending strictly shrinks each retry and a non-matching rejection
+    // exits immediately.
+    #[cfg(debug_assertions)]
+    let initial_pending = self.pending_releases.len();
+    #[cfg(debug_assertions)]
+    let mut iterations = 0usize;
     let handle = loop {
+      #[cfg(debug_assertions)]
+      {
+        iterations += 1;
+        debug_assert!(
+          iterations <= initial_pending + 1,
+          "FsSource::arm conflict-retry exceeded pending+1 iterations — pending must strictly shrink \
+           each retry (structural progress bound, Codex R30-F2)"
+        );
+      }
       match self.watcher.watch(arm_path.clone(), Interest::all()).await {
         Ok(handle) => break handle,
         Err(WatchRootError::Overlaps { path, existing }) => {
-          let victim = self
+          // Continue ONLY while the named conflict EXACT-matches a pending entry; otherwise surface it.
+          let Some(index) = self
             .pending_releases
             .iter()
             .position(|(_, stored)| stored.as_deref() == Some(existing.as_path()))
-            .or_else(|| (!self.pending_releases.is_empty()).then_some(0));
-          let Some(index) = victim else {
+          else {
             return Err(WatchError::Fs(WatchRootError::Overlaps { path, existing }));
           };
-          if retries >= OVERLAP_RETRY_CAP {
-            return Err(WatchError::Fs(WatchRootError::Overlaps { path, existing }));
-          }
-          retries += 1;
           let (released, _) = self
             .pending_releases
             .remove(index)
