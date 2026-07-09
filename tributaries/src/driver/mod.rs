@@ -194,18 +194,32 @@ impl WatchGrant {
   /// Claims the subscription for a caller that observed the reply, defusing the grant so its
   /// `Drop` enqueues no cleanup — the normal successful `watch` path.
   ///
-  /// Before returning the [`Subscription`], best-effort enqueue a reply-less [`Cleanup::Claim`] on
-  /// the grant's held [`cleanup`](Self::cleanup) sender so the owner lifts this sub's
+  /// Before returning the [`Subscription`], enqueue a reply-less [`Cleanup::Claim`] on the grant's
+  /// held [`cleanup`](Self::cleanup) sender so the owner lifts this sub's
   /// [`unclaimed`](Owner::unclaimed) suppression (the caller now holds it, so any parked debt is
   /// genuinely owed). A `defuse` is synchronous and cannot await, so it is a non-blocking
-  /// [`try_send`](async_channel::Sender::try_send); a closed channel means the owner is already
-  /// tearing down and the claim is moot (the sub is dead like any post-teardown sub). This and the
-  /// `Drop`'s [`Cleanup::DropOrphan`] are **exactly-one-of-two**: setting `defused` makes the
-  /// subsequent `Drop` a no-op.
-  fn defuse(mut self) -> Subscription {
+  /// [`try_send`](async_channel::Sender::try_send). This and the `Drop`'s
+  /// [`Cleanup::DropOrphan`] are **exactly-one-of-two**: setting `defused` makes the subsequent
+  /// `Drop` a no-op.
+  ///
+  /// # Poisoned grants (Codex R31)
+  ///
+  /// A FAILED claim send — the cleanup receiver is gone, i.e. the owner has already torn down —
+  /// **poisons** the grant: `Err(sub)` is returned instead of a claimed subscription. A grant can
+  /// sit unpolled in the watch reply slot across a source-drain teardown: it has fired neither
+  /// `Claim` nor `DropOrphan`, so the teardown's grant linearization (the cleanup channel) cannot
+  /// see it, its suppressed parked debt is dropped with the owner, and the stream has already
+  /// ended. Returning `Ok` there would hand the caller a subscription that looks live but never
+  /// received its owed `Rescan`; the public [`watch`](Tributaries::watch) instead surfaces
+  /// `Closed`, exactly like every other owner-gone path. The owner's own internal bounce path
+  /// ignores the distinction (both arms carry the [`Subscription`]) — its channel is necessarily
+  /// open while it runs.
+  fn defuse(mut self) -> Result<Subscription, Subscription> {
     self.defused = true;
-    let _ = self.cleanup.try_send(Cleanup::Claim(self.sub));
-    self.sub
+    match self.cleanup.try_send(Cleanup::Claim(self.sub)) {
+      Ok(()) => Ok(self.sub),
+      Err(_) => Err(self.sub),
+    }
   }
 }
 
@@ -450,7 +464,13 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
     // subscription away (invariant I1). On success we **defuse** the grant (its `Drop` becomes a
     // no-op) and take the [`Subscription`]; a closed reply (the owner is gone) surfaces `Closed`.
     match response.await {
-      Ok(Ok(grant)) => Ok(grant.defuse()),
+      // A POISONED grant (Codex R31) — the claim's try_send found the owner already gone (a grant
+      // polled only after a source-drain teardown) — surfaces `Closed` like every other
+      // owner-gone path, never an `Ok` subscription whose stream already ended without its owed
+      // Rescan.
+      Ok(Ok(grant)) => grant
+        .defuse()
+        .map_err(|_| WatchError::Fs(WatchRootError::Closed)),
       Ok(Err(err)) => Err(err),
       Err(_) => Err(WatchError::Fs(WatchRootError::Closed)),
     }
@@ -1113,7 +1133,12 @@ where
           // was never in flight, so it is NOT recorded `unclaimed`. The release awaits nothing, so this
           // `Watch` never blocks the owner on source I/O (and shutdown rides its own channel regardless).
           Err(Ok(grant)) => {
-            let _ = self.release_subscription(grant.defuse());
+            // The owner's own cleanup channel is necessarily open while it runs, so the poisoned
+            // arm is unreachable here — both arms carry the sub either way.
+            let sub = match grant.defuse() {
+              Ok(sub) | Err(sub) => sub,
+            };
+            let _ = self.release_subscription(sub);
           }
           // Unreachable (we always send `Ok`): no grant in flight, nothing to record or orphan.
           Err(Err(_)) => {}
