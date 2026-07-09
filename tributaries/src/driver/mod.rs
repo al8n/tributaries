@@ -58,8 +58,20 @@ mod epoch;
 #[cfg(all(test, feature = "tokio"))]
 mod tests;
 
+/// The reply a [`close`](Tributaries::close) hands the owner over the dedicated **close signal**:
+/// resolved `Ok(())` once the owner has flushed its coalesced tail and its run loop has exited, or
+/// dropped by the owner (→ the caller's `close()` sees [`Stopped`](tributary_fs::CloseError::Stopped))
+/// when the owner is already gone. Close rides its **own** [`async_channel`] — checked at the top
+/// priority everywhere the owner selects — so a requested shutdown can never be starved behind the
+/// unbounded command mailbox (Codex R27); it is deliberately NOT a [`Command`] variant, so there is
+/// one shutdown path and no dual plumbing.
+type CloseReply = futures_channel::oneshot::Sender<Result<(), CloseError>>;
+
 /// A control-plane request from a [`Tributaries`] handle to its [`Owner`] — mostly carrying a
 /// `oneshot` reply the caller's cancellable wait reads.
+///
+/// Shutdown is **not** here: `close` rides a dedicated high-priority [`CloseReply`] channel (Codex
+/// R27), never the mailbox, so it cannot queue behind a `Watch`/`Unwatch` flood.
 ///
 /// The owner processes each to completion (invariant I1): dropping the caller's returned
 /// future drops only the [`oneshot::Receiver`](futures_channel::oneshot::Receiver), never
@@ -94,19 +106,15 @@ enum Command<C, V> {
     /// The reply channel: success, or why the drop failed.
     reply: futures_channel::oneshot::Sender<Result<(), UnwatchError>>,
   },
-  /// Tear the owner down: flush the coalesced tail, then quiesce.
-  Close {
-    /// The reply channel, resolved once the owner has flushed and is tearing down.
-    reply: futures_channel::oneshot::Sender<Result<(), CloseError>>,
-  },
   /// Reconcile away a subscription whose caller's `watch` wait was dropped **after** the owner
   /// committed it (invariant I1). Emitted **only** by a [`WatchGrant`]'s `Drop`, so it carries no
   /// `oneshot` reply: a `Drop` is synchronous and cannot await, so the grant enqueues this with a
   /// non-blocking `try_send`. The owner treats it exactly like an [`Unwatch`](Self::Unwatch) —
   /// releasing it through the synchronous [`release_subscription`](Owner::release_subscription),
   /// whose emptied-root [`disarm`](crate::Source::disarm) is a fire-and-forget request — and ignores
-  /// the result (it is cleanup, not a caller request). Because that release awaits nothing, a `Close`
-  /// queued behind a `DropOrphan` is never blocked (invariant II — Close-responsive by construction).
+  /// the result (it is cleanup, not a caller request). Because that release awaits nothing, it never
+  /// stalls the owner: shutdown is independent regardless (it rides the dedicated [`CloseReply`]
+  /// channel, not the mailbox — invariant II, Close-responsive by construction).
   /// `release_subscription` also removes the sub from [`unclaimed`](Owner::unclaimed) (purging its
   /// suppressed parked debt). The **exactly-one-of-two** twin of [`ClaimGrant`](Self::ClaimGrant).
   DropOrphan(Subscription),
@@ -116,8 +124,8 @@ enum Command<C, V> {
   /// grant's held strong `commands` sender. Processing it just removes the sub from `unclaimed`, so
   /// its parked overflow/terminal `Rescan` (if any) is no longer suppressed — a claimed subscription
   /// is genuinely owed its debt (see [`flush_pending_rescans`](Owner::flush_pending_rescans)). A pure
-  /// [`HashSet`](std::collections::HashSet) remove that awaits nothing, so a `Close` behind it is
-  /// never blocked (invariant II). The **exactly-one-of-two** twin of [`DropOrphan`](Self::DropOrphan):
+  /// [`HashSet`](std::collections::HashSet) remove that awaits nothing (and shutdown rides its own
+  /// channel regardless — invariant II). The **exactly-one-of-two** twin of [`DropOrphan`](Self::DropOrphan):
   /// `defuse` consumes the grant and sets `defused`, so the grant's `Drop` then no-ops.
   ClaimGrant(Subscription),
 }
@@ -235,10 +243,19 @@ impl<C, V> Drop for WatchGrant<C, V> {
 /// wait-free for membership (`is_watched`) and attribution (`resolve`), reflecting the
 /// last committed watch-set (design §5).
 pub struct Tributaries<C, V, R: RuntimeLite, H = RootHandle> {
-  /// The control plane: `watch`/`unwatch`/`close` send a [`Command`] here and await its
-  /// `oneshot` reply. Dropping every handle clone closes this channel, so the owner's
-  /// `recv` errors and it tears down (design driver-golden doc, Close/Drop).
+  /// The control plane: `watch`/`unwatch` send a [`Command`] here and await its `oneshot`
+  /// reply. Dropping every handle clone closes this channel, so the owner's `recv` errors and
+  /// it tears down (design driver-golden doc, Close/Drop). `close` does **not** ride here — see
+  /// [`closes`](Self::closes).
   commands: async_channel::Sender<Command<C, V>>,
+  /// The dedicated **high-priority shutdown signal** (Codex R27): [`close`](Self::close) sends its
+  /// [`CloseReply`] here, never the command mailbox, so a requested shutdown can never be starved
+  /// behind an unbounded `Watch`/`Unwatch` backlog. It is checked at the TOP priority in every place
+  /// the owner selects (the [`run`] loop and the source-drain teardown), both non-blockingly each
+  /// iteration and as the first `select!` arm. Bounded at one slot — the **first** close to reach the
+  /// owner wins; any racing close resolves to [`Stopped`](tributary_fs::CloseError::Stopped) once the
+  /// owner is gone (the channel closed), mirroring the command-send-failure mapping.
+  closes: async_channel::Sender<CloseReply>,
   /// The data plane: [`next`](Self::next) drains attributed, epoch-stamped, coalesced
   /// events the owner pushes here — a **separate** channel from the command mailbox, so a
   /// mid-reconcile command never blocks delivery.
@@ -265,6 +282,7 @@ impl<C, V, R: RuntimeLite, H> Clone for Tributaries<C, V, R, H> {
   fn clone(&self) -> Self {
     Self {
       commands: self.commands.clone(),
+      closes: self.closes.clone(),
       events: self.events.clone(),
       view: self.view.clone(),
       _rt: PhantomData,
@@ -307,6 +325,10 @@ where
     // bound — bounded memory with no silent loss.
     let (event_tx, event_rx) = async_channel::bounded(event_capacity.get());
     let (command_tx, command_rx) = async_channel::unbounded();
+    // The dedicated shutdown signal (Codex R27), bounded at one slot: the first close wins, and any
+    // racing close resolves to `Stopped` once the owner is gone. It carries ONLY close replies, so
+    // the unbounded command backlog the finding is about can never delay it.
+    let (close_tx, close_rx) = async_channel::bounded(1);
     let owner = Owner {
       source,
       subsumer,
@@ -319,6 +341,7 @@ where
       // below): grants upgrade it to enqueue a `DropOrphan` without keeping the channel open.
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
+      closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
       observed_handles: std::collections::HashSet::new(),
@@ -327,6 +350,7 @@ where
     R::spawn_detach(run(owner));
     Self {
       commands: command_tx,
+      closes: close_tx,
       events: event_rx,
       view,
       _rt: PhantomData,
@@ -471,13 +495,24 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// out of band here). It is [`Close`-responsive by construction](Self): the owner never
   /// awaits the event channel, so `close` returns promptly even while that channel is full.
   ///
+  /// # Bounded latency independent of the command backlog
+  ///
+  /// The reply rides a **dedicated** high-priority channel, NOT the command mailbox, and the owner
+  /// checks it at the TOP priority everywhere it selects — so `close` resolves within a bounded window
+  /// **regardless** of how deep the unbounded `Watch`/`Unwatch` backlog is (Codex R27). A sustained
+  /// command flood can no longer starve shutdown.
+  ///
   /// # Errors
   ///
   /// [`CloseError::Fs(Stopped)`](tributary_fs::CloseError::Stopped) when the owner had
-  /// already stopped (a dropped last handle, or the source closed itself).
+  /// already stopped (a dropped last handle, the source closed itself, or another racing `close`
+  /// already won and tore the owner down).
   pub async fn close(self) -> Result<(), CloseError> {
     let (reply, response) = futures_channel::oneshot::channel();
-    if self.commands.send(Command::Close { reply }).await.is_err() {
+    // Send on the dedicated close signal, never the command mailbox — the whole point of R27. A
+    // send failure means the owner's close receiver is gone (it already tore down): map to
+    // `Stopped`, mirroring the old command-send-failure path.
+    if self.closes.send(reply).await.is_err() {
       return Err(CloseError::Fs(tributary_fs::CloseError::Stopped));
     }
     response
@@ -556,6 +591,17 @@ where
   unclaimed: std::collections::HashSet<Subscription>,
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
+  /// The receive end of the dedicated **high-priority shutdown signal** (Codex R27): a
+  /// [`close`](Tributaries::close) sends its [`CloseReply`] here, NOT the command mailbox. The
+  /// [`run`] loop and [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) check it at
+  /// the TOP priority — both non-blockingly (a `try_recv`) each iteration and as the first
+  /// `select!` arm — so a queued close never waits behind an unbounded `Watch`/`Unwatch` backlog.
+  /// When it reports `Ok(reply)` the owner breaks to teardown with that reply to ack; when it
+  /// reports **closed** (every [`Tributaries`] handle dropped) that is NOT itself a teardown signal
+  /// — the **command** channel closing remains the dropped-handles signal (a live [`WatchGrant`]
+  /// can hold the command channel open past the last public handle) — so the close arm merely
+  /// disables itself and defers to the command channel.
+  closes: async_channel::Receiver<CloseReply>,
   /// A **weak** clone of the owner's own command `Sender`, upgraded to a strong `Sender` and
   /// handed into each [`WatchGrant`] so a dropped `watch` wait can enqueue a reply-less
   /// [`DropOrphan`](Command::DropOrphan) that reconciles its committed-but-unclaimed subscription
@@ -600,16 +646,18 @@ where
 }
 
 /// The [`run`] loop's control-flow after handling one ready arm: keep looping, or break out to
-/// teardown. Returned by [`Owner::dispatch_command`] and matched by the [`run`] loop — above all a
-/// `Close`, which breaks out to teardown (invariant II).
+/// teardown. Returned by [`Owner::dispatch_command`] and matched by the [`run`] loop. A close request
+/// (won by the dedicated close arm) and a dropped last handle break the same way; only the source
+/// drain owes a final Rescan pass first (invariant II).
 enum Flow {
-  /// Keep looping (a command reconciled, an event fanned out, a timer tick).
+  /// Keep looping (a command reconciled, an event fanned out, a timer tick, or the close arm
+  /// disabling itself when its channel closed).
   Continue,
-  /// Break out to teardown, carrying the `Close` acknowledgement and the source-drain flag.
+  /// Break out to teardown, carrying the close acknowledgement and the source-drain flag.
   Break {
-    /// The `Close` reply to acknowledge after teardown, or [`None`] when the break was a dropped
+    /// The close reply to acknowledge after teardown, or [`None`] when the break was a dropped
     /// last handle or a source drain (nobody to confirm to).
-    closing: Option<futures_channel::oneshot::Sender<Result<(), CloseError>>>,
+    closing: Option<CloseReply>,
     /// `true` only on a **source drain** (`next` yielded `None` with a consumer still attached),
     /// which owes that consumer every parked Rescan before the stream ends.
     drain_owed: bool,
@@ -623,12 +671,14 @@ enum Flow {
 /// root is the **synchronous** [`disarm`](Source::disarm) request, so **no** loop path awaits it and
 /// Close-responsiveness (invariant II) holds *by construction*.
 ///
-/// Biased to the command mailbox so control-plane requests (including `Close`) are never
-/// starved by a busy event stream. On a `Close` command or a dropped last handle (the
-/// command channel closed) or the source draining (`next` yields `None`), it breaks,
-/// flushes the coalesced tail (no-silent-loss), and tears down — dropping the [`Owner`]
-/// (and its source, whose own `Drop` performs the orderly source teardown). Nothing is
-/// owed to `Drop`.
+/// Shutdown rides a **dedicated** [`closes`](Owner::closes) channel checked at the TOP priority — the
+/// first `select!` arm AND a non-blocking `try_recv` at the very top of each iteration (before the
+/// flush/valve) — so a requested close is serviced within a bounded window no matter how deep the
+/// unbounded command backlog is (Codex R27). The command mailbox is otherwise biased above the data
+/// plane so `watch`/`unwatch` are not starved by a busy event stream. On a close request, a dropped
+/// last handle (the command channel closed), or the source draining (`next` yields `None`), it breaks,
+/// flushes the coalesced tail (no-silent-loss), and tears down — dropping the [`Owner`] (and its
+/// source, whose own `Drop` performs the orderly source teardown). Nothing is owed to `Drop`.
 async fn run<C, V, R, S>(mut owner: Owner<C, V, R, S>)
 where
   C: Ord + Clone,
@@ -639,12 +689,31 @@ where
   // Command-fairness valve state (Codex R25-F2): consecutive command-arm wins since the data plane
   // was last serviced. See [`COMMAND_FAIRNESS_BUDGET`].
   let mut command_streak: u32 = 0;
-  // The loop yields `(reply, drain_owed)`: `reply` is the `Close` acknowledgement (if any);
+  // Whether the dedicated close channel is still open. It closes when every [`Tributaries`] handle is
+  // dropped — but that is NOT itself a teardown signal (a live [`WatchGrant`] can hold the command
+  // channel open past the last public handle, and the command channel closing remains the
+  // dropped-handles teardown signal). So on a closed close channel the arm just disables itself
+  // (stops winning the biased select) and defers to the command channel (Codex R27).
+  let mut close_open = true;
+  // The loop yields `(reply, drain_owed)`: `reply` is the close acknowledgement (if any);
   // `drain_owed` is true only on a **source drain** (the source's `next` yielded `None` while
   // a consumer is still attached), which owes that consumer every parked Rescan before the
-  // stream ends. A consumer-initiated `Close` or a dropped last handle owes nothing (the
+  // stream ends. A consumer-initiated close or a dropped last handle owes nothing (the
   // consumer asked to stop / nobody is left), and must never block teardown on a full channel.
   let (closing, drain_owed) = loop {
+    // The dedicated shutdown signal is checked FIRST every iteration, non-blockingly, BEFORE the
+    // flush and the fairness valve (Codex R27): a requested close breaks to teardown without waiting
+    // even one command dispatch or one forced data-plane service, so it can never be starved behind
+    // the unbounded command backlog. A closed channel (every handle dropped) disables the check and
+    // lets the command channel drive teardown; an empty one falls through to the select below.
+    if close_open {
+      match owner.closes.try_recv() {
+        Ok(reply) => break (Some(reply), false),
+        Err(async_channel::TryRecvError::Closed) => close_open = false,
+        Err(async_channel::TryRecvError::Empty) => {}
+      }
+    }
+
     // Re-offer the parked per-subscription overflow Rescans ahead of new deltas — **unconditionally**
     // every tick (Codex R24). Which parked debt is *offered* is decided by owner STATE, not mailbox
     // timing: [`flush_pending_rescans`](Owner::flush_pending_rescans) suppresses any entry whose sub
@@ -666,8 +735,9 @@ where
     // [`COMMAND_FAIRNESS_BUDGET`] consecutive command wins, service the data plane ONCE,
     // non-blockingly: poll one source event — `now_or_never` drops a still-pending `next()`, which
     // is safe solely by its cancellation-safety contract — and drain any due coalescer output.
-    // `Close`-responsiveness is untouched: nothing here awaits (a pending poll is dropped
-    // instantly), so a queued `Close` is delayed by at most this bounded, non-awaiting service.
+    // Close-responsiveness is untouched: nothing here awaits, and a queued close was already handled
+    // by the non-blocking close check at the top of this iteration (it rides its own channel, not the
+    // command mailbox this valve services).
     if command_streak >= COMMAND_FAIRNESS_BUDGET {
       command_streak = 0;
       match owner.source.next().now_or_never() {
@@ -704,14 +774,41 @@ where
     .fuse();
     futures_util::pin_mut!(timer);
 
-    // The one owner `select!`: dispatch a command, pump one source event, or fire the settle/retry
-    // timer — whichever is ready. Command-biased so control-plane requests (above all a `Close`) are
-    // never starved by a busy event stream. `source.next()` is the ONLY [`Source`] call polled in a
-    // cancellable arm: a command/timer branch winning **drops** the in-flight `next()` future, which
-    // is safe solely because [`Source::next`] is a hard-contract **cancellation-safe** read (see its
-    // docs) — dropping it loses/acks no event. Releasing a root is the synchronous
-    // [`Source::disarm`] request, never awaited, so it is never raced here.
+    // The dedicated close arm's future, borrowing ONLY the close receiver (a field reborrow, so it
+    // does not conflict with the disjoint `commands`/`source` borrows the other arms take). When the
+    // channel is closed it resolves `None` (→ disable the arm); when disabled it parks forever, so it
+    // never spins the biased select. It stays the FIRST arm below so a close always wins over a ready
+    // command (Codex R27).
+    let closes = &owner.closes;
+    let close_arm = async move {
+      if close_open {
+        // `Ok(reply)` → a close request; `Err` (channel closed) → `None` = disable the arm.
+        closes.recv().await.ok()
+      } else {
+        futures_util::future::pending::<Option<CloseReply>>().await
+      }
+    };
+
+    // The one owner `select!`: acknowledge a close, dispatch a command, pump one source event, or
+    // fire the settle/retry timer — whichever is ready. The close arm is FIRST (a requested shutdown
+    // wins over everything); the command arm is next (control-plane requests are not starved by a busy
+    // event stream). `source.next()` is the ONLY [`Source`] call polled in a cancellable arm: a
+    // close/command/timer branch winning **drops** the in-flight `next()` future, which is safe solely
+    // because [`Source::next`] is a hard-contract **cancellation-safe** read (see its docs) — dropping
+    // it loses/acks no event. Releasing a root is the synchronous [`Source::disarm`] request, never
+    // awaited, so it is never raced here.
     let flow = futures_util::select_biased! {
+      maybe_reply = close_arm.fuse() => match maybe_reply {
+        // A close request: break to teardown carrying its reply — consumer-initiated, so it owes no
+        // source-drain pass (`drain_owed: false`).
+        Some(reply) => Flow::Break { closing: Some(reply), drain_owed: false },
+        // The close channel closed (every handle dropped): NOT a teardown signal on its own. Disable
+        // the arm and let the command channel observe its own close (a live grant may still hold it).
+        None => {
+          close_open = false;
+          Flow::Continue
+        }
+      },
       cmd = owner.commands.recv().fuse() => {
         command_streak += 1;
         owner.dispatch_command(cmd).await
@@ -752,27 +849,27 @@ where
     }
   };
 
-  // Whichever `Close` we owe an acknowledgement: the loop-break `Close` (consumer-initiated),
-  // or a `Close` that interrupted the source-drain retry (returned by
+  // Whichever close we owe an acknowledgement: the loop-break close (consumer-initiated, from the
+  // dedicated close arm), or a close that interrupted the source-drain retry (returned by
   // `drain_owed_before_shutdown` so the blocking retry could stop and stay responsive). The two
   // are mutually exclusive — a source-drain break carries no `closing`.
   let ack = if drain_owed {
     // Source drain: deliver the coalesced tail AND every owed parked Rescan before the stream
     // ends — ordered so a parked subscription's tail delta never precedes its dominating Rescan
-    // — retrying as the consumer drains, while servicing the command mailbox so a `Close` behind
-    // a full channel is always answered (no silent loss, without an unserviceable `Close`).
+    // — retrying as the consumer drains, while checking the dedicated close signal so a close during
+    // the drain is always answered (no silent loss, without an unserviceable close).
     owner.drain_owed_before_shutdown().await
   } else {
-    // Consumer-initiated `Close`, or every handle dropped: one best-effort non-blocking pass that
+    // Consumer-initiated close, or every handle dropped: one best-effort non-blocking pass that
     // delivers the owed tail when the channel has room. An unclaimed sub's parked debt is SUPPRESSED
     // by owner state inside this `drain_owed_once` (its `flush_pending_rescans`), so a residual
-    // `DropOrphan`/`ClaimGrant` still queued behind the `Close` may go unprocessed with no harm —
+    // `DropOrphan`/`ClaimGrant` still queued in the command mailbox may go unprocessed with no harm —
     // nothing is delivered for a still-unclaimed sub and the owner is exiting. Teardown never blocks
-    // on the channel, so `Close` stays responsive.
+    // on the channel, so close stays responsive.
     owner.drain_owed_once();
     closing
   };
-  // Every teardown exit funnels here — a `Close` command, a dropped last handle, or the source
+  // Every teardown exit funnels here — a close request, a dropped last handle, or the source
   // draining — AFTER the owed Rescans above are made durable/delivered (nothing owed is lost).
   // Publish an EMPTY read plane so a retained `WatchView` clone stops advertising subscriptions
   // whose owner task and source are about to be gone: otherwise it keeps answering
@@ -820,15 +917,18 @@ where
   S: Source<C>,
 {
   /// Dispatches one command from the mailbox, returning whether the [`run`] loop should keep
-  /// looping or break to teardown ([`Flow`]). Called from the [`run`] loop's single `select` — above
-  /// all a `Close`, which breaks out to teardown (invariant II).
+  /// looping or break to teardown ([`Flow`]). Called from the [`run`] loop's single `select`, one
+  /// priority below the dedicated close arm — so shutdown always outranks a queued command (invariant
+  /// II). The only teardown break here is the dropped-last-handle one (`Err`); a close is handled by
+  /// the [`closes`](Self::closes) arm, never as a command.
   ///
   /// [`DropOrphan`](Command::DropOrphan) is the load-bearing case: a `watch` orphaned by a dropped
   /// caller wait. It routes through the unified [`release_subscription`](Self::release_subscription),
   /// which purges the orphan's owner-local state and, if that emptied a root, issues the emptied
   /// root's **synchronous** [`disarm`](Source::disarm) request — it awaits nothing. A `DropOrphan` is
-  /// an **internal** owner action (no caller is waiting on it) and its result is ignored, so a `Close`
-  /// queued behind it is serviced with no delay (invariant II — Close-responsive by construction).
+  /// an **internal** owner action (no caller is waiting on it) and its result is ignored; because it
+  /// awaits nothing (and shutdown rides its own channel regardless), it never delays a close (invariant
+  /// II — Close-responsive by construction).
   async fn dispatch_command(
     &mut self,
     cmd: Result<Command<C, V>, async_channel::RecvError>,
@@ -859,16 +959,12 @@ where
       }
       // A grant the caller CLAIMED (its `defuse` fired): lift the sub's `unclaimed` suppression, so
       // its parked debt (if any) is offered by the next `flush_pending_rescans` — a claimed
-      // subscription is genuinely owed its Rescan. A `HashSet` remove that awaits nothing, so a
-      // `Close` queued behind it is never blocked (invariant II).
+      // subscription is genuinely owed its Rescan. A `HashSet` remove that awaits nothing (and
+      // shutdown rides its own channel regardless), so it never delays a close (invariant II).
       Ok(Command::ClaimGrant(sub)) => {
         self.unclaimed.remove(&sub);
         Flow::Continue
       }
-      Ok(Command::Close { reply }) => Flow::Break {
-        closing: Some(reply),
-        drain_owed: false,
-      },
       // Every handle dropped: same orderly teardown, nobody to confirm it to. Nobody is left to
       // receive, so nothing is owed.
       Err(_) => Flow::Break {
@@ -888,8 +984,8 @@ where
   /// - if the receiver is already gone the instant we send, `reply.send` fails and hands the grant
   ///   back; we defuse it and release the orphan through
   ///   [`release_subscription`](Self::release_subscription) — purge owner-local state, request the
-  ///   emptied root's synchronous `source.disarm`. The release awaits nothing, so a `Close` queued
-  ///   behind this `Watch` is never blocked on source I/O;
+  ///   emptied root's synchronous `source.disarm`. The release awaits nothing, so this `Watch` never
+  ///   blocks the owner on source I/O (and shutdown rides its own channel regardless);
   /// - if the command channel is already closed (every handle gone), no caller can observe the reply
   ///   and the owner is tearing down; we release the subscription the SAME way, so dropping all
   ///   handles never leaves the owner awaiting a disarm before its source is dropped (any still-
@@ -939,9 +1035,10 @@ where
         // Both orphan paths release the committed-but-unclaimed subscription with the SAME unified
         // [`release_subscription`](Self::release_subscription) as a [`DropOrphan`](Command::DropOrphan):
         // purge owner-local state and request the emptied root's synchronous `source.disarm`. The
-        // release awaits nothing, so a `Close` queued behind this `Watch` is never blocked; in the
-        // `None` case dropping all handles never leaves the owner awaiting a disarm before the source
-        // is dropped (any still-pending transport release is applied by the source's own `Drop`).
+        // release awaits nothing, so this `Watch` never blocks the owner (shutdown rides its own
+        // channel regardless); in the `None` case dropping all handles never leaves the owner awaiting
+        // a disarm before the source is dropped (any still-pending transport release is applied by the
+        // source's own `Drop`).
         if let Some(sub) = orphan {
           let _ = self.release_subscription(sub);
         }
@@ -954,7 +1051,8 @@ where
 
   /// Handles a [`Command::Unwatch`]: release the subscription and reply. Synchronous — the unified
   /// [`release_subscription`](Self::release_subscription) requests the emptied root's `source.disarm`
-  /// without awaiting, so an `unwatch` never blocks the owner (or a `Close` behind it) on source I/O.
+  /// without awaiting, so an `unwatch` never blocks the owner on source I/O (and shutdown, on its own
+  /// channel, is independent regardless).
   fn on_unwatch(
     &mut self,
     sub: Subscription,
@@ -1227,10 +1325,11 @@ where
   /// [`DropOrphan`](Command::DropOrphan) and both [`on_watch`](Self::on_watch) orphan paths
   /// (reply-send-failure and closed-channel), which ignore it; and the source-drain teardown loop
   /// ([`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown)), which likewise ignores it.
-  /// Because the release is a synchronous request that awaits nothing, this never blocks `Close` on
-  /// source I/O — Close-responsiveness (invariant II) holds by construction on every path, with no
-  /// per-path special-casing (the old defer / idle-drain / teardown-purge split collapses to one
-  /// call).
+  /// Because the release is a synchronous request that awaits nothing, this never blocks the owner on
+  /// source I/O — and shutdown, riding the dedicated [`closes`](Self::closes) channel checked at the
+  /// top priority, is bounded independent of any of this — so Close-responsiveness (invariant II)
+  /// holds by construction on every path, with no per-path special-casing (the old defer / idle-drain
+  /// / teardown-purge split collapses to one call).
   ///
   /// The **ordering is load-bearing** (Codex R20-F2): the owner-local reclaim runs FIRST, keyed on
   /// `sub` alone, EVEN WHEN the subscription is already absent from the subsumer. A
@@ -1284,7 +1383,8 @@ where
     if let UnwatchOutcome::RootEmptied { fs_root } = outcome {
       // The subscription was its root's last: request release of the kernel watch — a synchronous,
       // fire-and-forget [`Source::disarm`] (the source queues any async teardown and applies it at
-      // its next arm or `Drop`). Nothing is awaited, so no teardown path blocks `Close`.
+      // its next arm or `Drop`). Nothing is awaited, so no teardown path blocks the owner (and
+      // shutdown rides its own channel regardless).
       self.source.disarm(fs_root);
     }
     Ok(())
@@ -1831,33 +1931,46 @@ where
   /// suppression, so the next pass delivers that sub's Rescan before exiting), and a post-teardown
   /// claim holds a dead subscription exactly like any subscription after teardown (the read plane is
   /// already empty). The owner **never awaits the event sender** (invariant III preserved even at
-  /// teardown) — only the command receiver and the retry timer.
+  /// teardown) — only the close receiver, the command receiver, and the retry timer.
   ///
-  /// The retry **stays responsive to the command mailbox** (invariant II): a blind sleep would
-  /// let a [`Close`](Command::Close) queue forever while the drain spins — behind a full channel
-  /// a held-but-not-draining receiver keeps the channel both full and un-closed, so neither the
-  /// slot-freed nor the all-receivers-dropped exit ever fires. So it
-  /// [`select!`](futures_util::select_biased)s the retry timer against
-  /// [`commands.recv`](async_channel::Receiver::recv): a `Close` (or the command channel closing
-  /// = every handle dropped) stops the blocking retry, and the `Close` reply is returned to the
-  /// caller (which does a non-blocking best-effort teardown and acks it) so `close()` always
-  /// completes even mid-drain. A `watch`/`unwatch` arriving mid-teardown is failed fast (the
-  /// owner is quiescing) and the owed-`Rescan` drain continues.
+  /// The retry **stays responsive to shutdown** (invariant II): a blind sleep would let a close
+  /// request wait forever while the drain spins — behind a full channel a held-but-not-draining
+  /// receiver keeps the channel both full and un-closed, so neither the slot-freed nor the
+  /// all-receivers-dropped exit ever fires. So the dedicated [`closes`](Self::closes) signal is
+  /// checked at the TOP priority here too (Codex R27): a non-blocking `try_recv` at the top of each
+  /// iteration AND the first arm of the retry [`select!`](futures_util::select_biased). A close
+  /// interrupting the drain is returned to the caller (which does a non-blocking best-effort teardown
+  /// and acks it) so `close()` always completes even mid-drain — no matter how deep the command
+  /// backlog is. The command receiver is `select!`ed too so a dropped last handle (its `Err`) also
+  /// stops the retry; a `watch`/`unwatch` arriving mid-teardown is failed fast (the owner is
+  /// quiescing) and the owed-`Rescan` drain continues.
   ///
-  /// Returns the [`Close`](Command::Close) reply if a `Close` interrupted the drain, else
-  /// [`None`].
-  async fn drain_owed_before_shutdown(
-    &mut self,
-  ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
+  /// Returns the [`CloseReply`] if a close interrupted the drain, else [`None`].
+  async fn drain_owed_before_shutdown(&mut self) -> Option<CloseReply> {
+    // Whether the dedicated close channel is still open (see [`closes`](Self::closes)). A closed
+    // channel is NOT a teardown signal here either — the command channel's `Err` is — so on close the
+    // arm just disables itself and the drain keeps going until the command channel closes or the debt
+    // is delivered.
+    let mut close_open = true;
     loop {
+      // The dedicated shutdown signal is checked FIRST, non-blockingly, before the bounded command
+      // pre-drain and the owed pass (Codex R27): a close interrupts the drain without waiting behind
+      // the (possibly flooded) command mailbox.
+      if close_open {
+        match self.closes.try_recv() {
+          Ok(reply) => return Some(reply),
+          Err(async_channel::TryRecvError::Closed) => close_open = false,
+          Err(async_channel::TryRecvError::Empty) => {}
+        }
+      }
       // Service everything already queued BEFORE the owed pass and its exit check (Codex R25-F1):
       // a `ClaimGrant` sitting in the mailbox must lift its subscription's suppression FIRST — the
       // caller defused the grant and genuinely holds the sub, so its parked Rescan is owed — or the
       // all-unclaimed exit below would read the STALE `unclaimed` set and tear down having never
-      // delivered it: suppression become permanent loss. This pre-drain is non-blocking; a `Close`
-      // found here stops the drain exactly as the `select!` arm does. (It is NOT the suppression
-      // boundary — owner state is, R24 — it only makes the EXIT PREDICATE read post-claim state.)
-      // BOUNDED (Codex R26): at most COMMAND_FAIRNESS_BUDGET commands per iteration, so a
+      // delivered it: suppression become permanent loss. This pre-drain is non-blocking (and none of
+      // these commands is a close — shutdown rides its own channel, checked above). (It is NOT the
+      // suppression boundary — owner state is, R24 — it only makes the EXIT PREDICATE read post-claim
+      // state.) BOUNDED (Codex R26): at most COMMAND_FAIRNESS_BUDGET commands per iteration, so a
       // sustained flood on the unbounded mailbox cannot starve the owed pass below — owed
       // delivery makes progress every iteration, mirroring the run loop's fairness valve.
       let mut serviced = 0u32;
@@ -1865,9 +1978,7 @@ where
         && let Ok(cmd) = self.commands.try_recv()
       {
         serviced += 1;
-        if let Some(reply) = self.handle_teardown_command(cmd) {
-          return Some(reply);
-        }
+        self.handle_teardown_command(cmd);
       }
       self.drain_owed_once();
       // Exit once nothing is owed to a CLAIMED subscription AND the mailbox has been observed
@@ -1888,16 +1999,33 @@ where
       }
       let sleep = R::sleep(RETRY).fuse();
       futures_util::pin_mut!(sleep);
+      // The dedicated close arm, borrowing ONLY the close receiver (disjoint from the `commands`
+      // borrow the next arm takes). It is the FIRST arm so a close always wins over a queued command
+      // (Codex R27); on a closed channel it resolves `None` (→ disable) and on disable it parks.
+      let closes = &self.closes;
+      let close_arm = async move {
+        if close_open {
+          // `Ok(reply)` → a close request; `Err` (channel closed) → `None` = disable the arm.
+          closes.recv().await.ok()
+        } else {
+          futures_util::future::pending::<Option<CloseReply>>().await
+        }
+      };
       futures_util::select_biased! {
+        maybe_reply = close_arm.fuse() => match maybe_reply {
+          // A close interrupted the drain: hand its reply back so the caller acks it — `close()`
+          // completes even mid-drain.
+          Some(reply) => return Some(reply),
+          // The close channel closed (every handle dropped): disable the arm; the command channel's
+          // own `Err` (below) remains the dropped-handles stop signal.
+          None => close_open = false,
+        },
         cmd = self.commands.recv().fuse() => match cmd {
-          // A queued command mid-drain: a `Close` (handed back so the caller acks it — `close()`
-          // completes), a `DropOrphan` (released synchronously — its parked entry purged), or a
-          // `watch`/`unwatch` (failed fast — the owner is quiescing). Shared with the pre-drain above.
-          Ok(command) => {
-            if let Some(reply) = self.handle_teardown_command(command) {
-              return Some(reply);
-            }
-          }
+          // A queued command mid-drain: a `DropOrphan` (released synchronously — its parked entry
+          // purged), a `ClaimGrant` (lifts suppression), or a `watch`/`unwatch` (failed fast — the
+          // owner is quiescing). Shared with the pre-drain above. A close never arrives here — it
+          // rides the close arm above.
+          Ok(command) => self.handle_teardown_command(command),
           // Every handle dropped: nobody is left to receive the owed Rescans — stop and tear
           // down (the caller's best-effort final pass runs next).
           Err(_) => return None,
@@ -1918,14 +2046,13 @@ where
   ///   lifting the suppression so the next drain pass can deliver that sub's owed `Rescan` before
   ///   exiting (a claim arriving mid-teardown is genuinely owed its debt);
   /// - a [`Watch`](Command::Watch)/[`Unwatch`](Command::Unwatch) is **failed fast** — the owner is
-  ///   stopping, so the caller's handle surfaces `Closed`;
-  /// - a [`Close`](Command::Close) is handed back (as [`Some`]) for the caller to acknowledge.
+  ///   stopping, so the caller's handle surfaces `Closed`.
   ///
-  /// It awaits nothing, so it can never park teardown behind a queued `Close` (invariant II).
-  fn handle_teardown_command(
-    &mut self,
-    cmd: Command<C, V>,
-  ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
+  /// A close is **never** one of these: shutdown rides the dedicated [`closes`](Self::closes) signal,
+  /// handled by its own arm in [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown), so
+  /// this only ever handles the reply-less/fail-fast commands and returns nothing. It awaits nothing,
+  /// so it can never park teardown (invariant II).
+  fn handle_teardown_command(&mut self, cmd: Command<C, V>) {
     match cmd {
       // A watch orphaned mid-teardown (a dropped wait's [`WatchGrant`] fired): release it through the
       // unified [`release_subscription`](Self::release_subscription), which awaits nothing. A
@@ -1933,23 +2060,18 @@ where
       // uniformity beats a purge-only special case — and its `unclaimed`/parked state is purged.
       Command::DropOrphan(sub) => {
         let _ = self.release_subscription(sub);
-        None
       }
       // A claim arriving mid-teardown lifts the suppression so the drain delivers that sub's owed
       // Rescan (a claimed sub is genuinely owed). A `HashSet` remove — awaits nothing.
       Command::ClaimGrant(sub) => {
         self.unclaimed.remove(&sub);
-        None
       }
       Command::Watch { reply, .. } => {
         let _ = reply.send(Err(WatchError::Fs(WatchRootError::Closed)));
-        None
       }
       Command::Unwatch { reply, .. } => {
         let _ = reply.send(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)));
-        None
       }
-      Command::Close { reply } => Some(reply),
     }
   }
 }

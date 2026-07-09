@@ -88,14 +88,19 @@ mod tests;
 ///
 /// - **A wedged [`next`](Self::next) never blocks command processing.** The owner drives
 ///   [`next`](Self::next) as one arm of a biased `select!`; a `next()` that never resolves is simply
-///   a pending arm — the loop still services the command mailbox and `Close`.
-/// - **Close-responsiveness against INTERNAL actions, by construction (invariant II).** Owner actions
-///   that are *not* a caller-awaited `watch` — a `DropOrphan` from a dropped `watch` grant, the
-///   send-failure / all-handles-gone orphan on the same path, and the source-drain teardown — release
-///   an emptied root through the **synchronous** [`disarm`](Self::disarm). Because `disarm` returns no
-///   future, **no** owner cleanup path awaits source I/O: `Close` is serviced with no scheduling
-///   discipline to get wrong. Dropping every handle tears the owner down and drops the source, whose
-///   own `Drop` applies any still-pending releases.
+///   a pending arm — the loop still services the command mailbox and the dedicated close signal.
+/// - **Close-responsiveness against INTERNAL actions AND the command backlog, by construction
+///   (invariant II).** `close` rides a **dedicated high-priority signal** — a separate channel the
+///   owner checks at the TOP priority everywhere it selects (a non-blocking `try_recv` each iteration
+///   AND the first `select!` arm, in both the run loop and the source-drain teardown), NOT the command
+///   mailbox — so shutdown latency is **bounded independent of** how deep the unbounded `watch`/
+///   `unwatch` backlog is (Codex R27). And the owner never awaits source I/O on any cleanup path:
+///   owner actions that are *not* a caller-awaited `watch` — a `DropOrphan` from a dropped `watch`
+///   grant, the send-failure / all-handles-gone orphan on the same path, and the source-drain teardown
+///   — release an emptied root through the **synchronous** [`disarm`](Self::disarm). Because `disarm`
+///   returns no future, no cleanup path can wedge the owner, so the close is serviced with no
+///   scheduling discipline to get wrong. Dropping every handle tears the owner down and drops the
+///   source, whose own `Drop` applies any still-pending releases.
 /// - **No stranded or corrupt state.** A committed-but-unclaimed subscription is always reconciled
 ///   away (the `WatchGrant`, invariant I1); a subscription terminal-retired while unclaimed leaves no
 ///   lingering parked `Rescan` behind (Codex R20-F2); and a released-then-re-`watch`ed key never
