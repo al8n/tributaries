@@ -2523,6 +2523,92 @@ async fn source_drain_retry_stays_responsive_to_close() {
   );
 }
 
+/// R28-F2 regression (design backpressure doc, no silent loss): a close that INTERRUPTS the
+/// source-drain teardown must not skip the final best-effort owed flush. The drain returns the
+/// reply at its top-priority close check WITHOUT running an owed pass — but a resuming consumer may
+/// have freed a channel slot in the window just before the close arrived, so the now-sendable
+/// CLAIMED parked Rescan must still get its last offer. `run`'s tail runs ONE more non-blocking
+/// [`drain_owed_once`](super::Owner::drain_owed_once) when the drain returns `Some(reply)` (mirroring
+/// the non-drain close path); this test exercises that exact tail sequence (drain → `Some(reply)` →
+/// final pass → ack).
+///
+/// Fail-on-old: without the tail's final pass the owed Rescan is never delivered — the drain returned
+/// before any pass and the freed slot goes unused — so a consumer that resumes reaches stream-end
+/// permanently stale.
+#[tokio::test]
+async fn source_drain_close_interrupt_still_runs_a_final_owed_pass() {
+  let mut h = Harness::bounded(1);
+  // A CLAIMED sub (reconcile_watch commits directly — never recorded `unclaimed`), so its parked
+  // debt is genuinely owed and offered by `flush_pending_rescans`, never suppressed.
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  for raw in 0..2 {
+    h.owner.epochs.stamp(sub, Epoch::new(raw)); // high-water 1
+  }
+
+  // Fill the one slot (a buffered ordinary event) and overflow → park a dominating Rescan (epoch 2).
+  h.owner.try_emit(modified_event(sub, "/a/f0", 0));
+  h.owner.try_emit(modified_event(sub, "/a/f1", 1));
+  assert_eq!(
+    h.owner.needs_rescan.get(&sub).map(|p| p.epoch),
+    Some(Epoch::new(2)),
+    "overflow parked a dominating Rescan while the channel is full"
+  );
+
+  // A resuming consumer FREES one slot (drains the buffered ordinary event) — the channel now has
+  // room for the owed Rescan.
+  let buffered = h
+    .events
+    .try_recv()
+    .expect("the buffered ordinary event drains, freeing a slot");
+  assert!(!buffered.is_rescan(), "the freed event is the ordinary one");
+
+  // …then a close is queued on the dedicated signal, all BEFORE the drain runs. The drain observes
+  // the already-queued close at its top-priority `try_recv` and returns it WITHOUT running an owed
+  // pass — so the freed slot is left unused and the owed Rescan stays parked.
+  let (reply, response) = futures_channel::oneshot::channel();
+  h.closes
+    .try_send(reply)
+    .expect("send the close on the dedicated signal");
+  let interrupted = h.owner.drain_owed_before_shutdown().await;
+  let close_reply = interrupted.expect("the queued close interrupted the drain and is surfaced");
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the interrupted drain returned before delivering the owed Rescan (the freed slot is unused)"
+  );
+
+  // `run`'s tail: because the drain returned `Some(reply)`, run ONE final best-effort owed pass
+  // before publish_empty + ack. The slot is now free, so this delivers the owed Rescan.
+  h.owner.drain_owed_once();
+  // Ack exactly as `run` does; the close() caller then completes.
+  close_reply.send(Ok(())).expect("ack the close");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "close() completes once the drain surfaced and acked its close"
+  );
+
+  // The final pass delivered the now-sendable owed Rescan — nothing left parked, and it dominates
+  // the earlier ordinary event.
+  let owed = h
+    .events
+    .try_recv()
+    .expect("the final owed pass delivered the parked Rescan onto the freed slot");
+  assert!(owed.is_rescan(), "the delivered owed signal is a Rescan");
+  assert_eq!(owed.subscription(), sub, "…for the overflowed subscription");
+  assert_eq!(
+    owed.path(),
+    Path::new("/a"),
+    "…naming its covered key to re-enumerate"
+  );
+  assert!(
+    owed.epoch() > buffered.epoch(),
+    "the owed Rescan strictly dominates the ordinary event delivered before it (no silent loss)"
+  );
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the final pass delivered the owed Rescan — nothing left parked"
+  );
+}
+
 /// Close-responsive source drain (design source doc, invariant II): during source-drain teardown a
 /// queued [`DropOrphan`](super::Command::DropOrphan) is released through the synchronous
 /// [`release_subscription`](super::Owner::release_subscription) — it purges the orphan's owner-local

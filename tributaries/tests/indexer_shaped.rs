@@ -65,9 +65,12 @@ struct IndexerSource<R: RuntimeLite> {
   watcher: Watcher<R>,
   mounts: Vec<(Vec<Comp>, PathBuf)>,
   /// Roots whose release was requested (via the synchronous `disarm`) but not yet applied to the
-  /// `Watcher` — drained at the top of `arm` (release-before-subsequent-arm by construction), moot at
-  /// `Drop`. Mirrors the fs source's release queue for a caller-supplied source.
-  pending_releases: VecDeque<RootHandle>,
+  /// `Watcher`, each paired with the released root's canonical `Comp` key captured at `disarm` time.
+  /// At the top of `arm` only the entries whose key OVERLAPS the arm key are drained
+  /// (release-before-*overlapping*-arm by construction); a non-overlapping release stays queued and is
+  /// applied by a later overlapping arm or at `Drop`. Mirrors the fs source's overlap-scoped release
+  /// queue (Codex R28) for a caller-supplied source.
+  pending_releases: VecDeque<(RootHandle, Option<Vec<Comp>>)>,
   /// Mirror of `pending_releases` for O(1) `root_key` liveness answers: a requested release is
   /// logically dead immediately.
   pending_set: HashSet<RootHandle>,
@@ -131,12 +134,30 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   }
 
   async fn arm(&mut self, key: &[Comp]) -> Result<Armed<Comp, RootHandle>, WatchError> {
-    // Apply every requested-but-not-yet-applied release BEFORE arming (disarm contract clause 2):
-    // release-before-subsequent-arm by construction, so the `Watcher` never reports `Overlaps`
-    // against a root the umbrella already released.
-    while let Some(released) = self.pending_releases.pop_front() {
-      let _ = self.watcher.unwatch(released).await;
-      self.pending_set.remove(&released);
+    // Apply only the queued releases whose key OVERLAPS this arm's key BEFORE arming (disarm contract
+    // clause 2, mirroring the fs source's R28 scoping): release-before-*overlapping*-arm by
+    // construction, so the `Watcher` never reports `Overlaps` against a released root whose key
+    // overlaps this one. A non-overlapping queued release is left in place — a disjoint watch cannot
+    // cause `Overlaps`, so draining it here would only charge this `Watch` (and any `close` queued
+    // behind it) for unrelated cleanup; it is applied by a later overlapping arm or at `Drop`. Overlap
+    // is a plain component-prefix in either direction (ancestor-or-equal / descendant) on the
+    // canonical `Comp` keys. Walk by index without advancing on removal (a removed entry shifts its
+    // successor into the same slot), so a skipped non-overlapping entry stays queued.
+    let mut i = 0;
+    while i < self.pending_releases.len() {
+      let overlaps = match &self.pending_releases[i].1 {
+        Some(released_key) => {
+          key.starts_with(released_key.as_slice()) || released_key.starts_with(key)
+        }
+        None => false,
+      };
+      if overlaps {
+        let (released, _) = self.pending_releases.remove(i).expect("index in bounds");
+        let _ = self.watcher.unwatch(released).await;
+        self.pending_set.remove(&released);
+      } else {
+        i += 1;
+      }
     }
     // A well-formed watch always resolves under a registered mount; `?`/`From` surfaces a
     // genuine arm failure (`WatchRootError` is `#[non_exhaustive]` — never constructed here).
@@ -156,10 +177,16 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
 
   fn disarm(&mut self, handle: RootHandle) {
     // Synchronous, non-blocking release REQUEST (mirroring the fs source): the watcher's `unwatch`
-    // awaits a bounded ack, so queue the teardown (applied at the next `arm` or `Drop`) and mark the
-    // handle logically dead at once. Idempotent by the set.
+    // awaits a bounded ack, so queue the teardown — paired with the released root's canonical `Comp`
+    // key captured NOW from the live registry (independent of `pending_set`), so the next `arm` drains
+    // only the OVERLAPPING subset (contract clause 2, Codex R28) — and mark the handle logically dead
+    // at once. Applied at the next overlapping `arm` or `Drop`. Idempotent by the set.
     if self.pending_set.insert(handle) {
-      self.pending_releases.push_back(handle);
+      let key = self
+        .watcher
+        .root_path(handle)
+        .and_then(|path| self.path_to_key(&path));
+      self.pending_releases.push_back((handle, key));
     }
   }
 
