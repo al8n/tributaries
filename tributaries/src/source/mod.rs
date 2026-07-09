@@ -230,14 +230,20 @@ pub trait Source<C> {
   /// 1. **Non-blocking.** `disarm` returns without performing blocking I/O or awaiting anything. A
   ///    source that needs async work to release (the fs source does) queues the request internally.
   /// 2. **No arm surfaces a released-root overlap (an OUTCOME clause), with per-arm release work
-  ///    bounded independent of the queue depth.** A conforming source must guarantee that a later
-  ///    [`arm`](Self::arm) never **surfaces** an [`Overlaps`](tributary_fs::WatchRootError::Overlaps)
-  ///    rejection caused by a root whose release was requested — this is what makes widen (release the
-  ///    narrow roots, arm the wider root) and re-watch-after-orphan correct with **no** umbrella-side
-  ///    flushing. HOW it achieves this is the source's own business, so long as the release work any
-  ///    *single* arm performs is **bounded independent of** how deep the release queue is (a
-  ///    caller-bounded `Watch`, and any [`close`](crate::Tributaries::close) queued behind it, never
-  ///    waits on the whole backlog — Codex R28/R29). Two conforming mechanisms:
+  ///    bounded by that arm's OWN overlapping conflicts.** A conforming source must guarantee that a
+  ///    later [`arm`](Self::arm) never **surfaces** an
+  ///    [`Overlaps`](tributary_fs::WatchRootError::Overlaps) rejection caused by a root whose release
+  ///    was requested — this is what makes widen (release the narrow roots, arm the wider root) and
+  ///    re-watch-after-orphan correct with **no** umbrella-side flushing. HOW it achieves this is the
+  ///    source's own business, so long as the release work any *single* arm performs is bounded by
+  ///    the releases that **overlap that arm's key** — never the whole (disjoint) backlog (Codex
+  ///    R28/R29/R30). The overlapping-conflict set is the *caller's own*: an ancestor watch over N
+  ///    roots the caller itself created and released legitimately resolves those N conflicts inside
+  ///    that one caller-bounded `Watch` — invariant I1 run-to-completion — and a
+  ///    [`close`](crate::Tributaries::close) queued behind it waits for that one reconcile, exactly
+  ///    as it waits for any in-flight caller command (the RATIFIED semantics, Codex R33: close is
+  ///    decoupled from *unrelated* backlogs — command floods, disjoint release queues — not from the
+  ///    single caller reconcile it queued behind). Two conforming mechanisms:
   ///    - **pre-application** — apply queued releases before the watch; or
   ///    - **conflict-triggered application-and-retry** — as [`FsSource`] now does: attempt the arm,
   ///      and on the lower watcher's own `Overlaps` rejection apply the *named* conflicting release and
