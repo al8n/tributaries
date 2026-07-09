@@ -273,6 +273,9 @@ pub(crate) enum Command {
   /// (whose whole-subtree stream has no per-directory watches to prune or grow). Resolves
   /// once the reconcile has been applied to the Monitor (its `RemoveWatch`/`AddWatch`
   /// effects are then fire-and-forget, like any other descending disarm/arm).
+  // Constructed only by the crate-internal `Watcher::{set_cover, request_set_cover}` pair,
+  // which no non-test code calls until the effect-completion follow-up (Codex R43).
+  #[cfg_attr(not(test), allow(dead_code))]
   SetCover {
     /// The scope to reconcile.
     scope: ScopeId,
