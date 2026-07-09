@@ -85,12 +85,6 @@ struct FakeSource {
   /// debug_assert tripwire. One-shot: consumed by the next arm that gets past the fail/overlap
   /// checks.
   reuse_next_handle: Option<u32>,
-  /// Test knob: make [`Source::disarm`] of this handle **never resolve** — park forever — so a
-  /// test can prove the source-drain teardown loop does NOT await `disarm` for a `DropOrphan`
-  /// (Codex R19). A teardown that (wrongly) drove the full `reconcile_unwatch` would reach this
-  /// last-subscriber `disarm` and hang behind a queued `Close`; the fixed teardown purges the
-  /// orphan synchronously and never calls it.
-  hang_disarm: Option<u32>,
 }
 
 impl FakeSource {
@@ -105,7 +99,6 @@ impl FakeSource {
       retarget: HashMap::new(),
       canonicalize: HashMap::new(),
       reuse_next_handle: None,
-      hang_disarm: None,
     }
   }
 
@@ -125,12 +118,6 @@ impl FakeSource {
   /// failed-widen restore's rebind debug_assert tripwire for a contract-violating source.
   fn reuse_next_arm_handle(&mut self, handle: u32) {
     self.reuse_next_handle = Some(handle);
-  }
-
-  /// Make [`Source::disarm`] of `handle` never resolve (park forever) — drives the source-drain
-  /// teardown's `DropOrphan` handling to prove it does NOT await `disarm` (Codex R19).
-  fn hang_disarm_of(&mut self, handle: u32) {
-    self.hang_disarm = Some(handle);
   }
 
   /// The next `arm` call fails.
@@ -248,13 +235,12 @@ impl Source<OsString> for FakeSource {
     Ok(Armed::new(handle, canonical_key))
   }
 
-  async fn disarm(&mut self, handle: u32) {
+  fn disarm(&mut self, handle: u32) {
+    // Synchronous release request (contract clauses 1 & 3): record it and mark the handle released
+    // IMMEDIATELY — drop it from `canonical`/`live`, so `root_key` answers `None` at once and a
+    // subsequent arm never sees it. Immediate application trivially satisfies the
+    // release-before-subsequent-arm ordering.
     self.calls.push(Call::Disarm(handle));
-    if self.hang_disarm == Some(handle) {
-      // Park forever: a teardown `DropOrphan` that reached this last-subscriber `disarm` would
-      // hang, stranding a queued `Close` — the Codex R19 pre-fix behaviour the regression pins.
-      std::future::pending::<()>().await;
-    }
     self.canonical.remove(&handle);
     self.live.remove(&handle);
   }
@@ -370,7 +356,6 @@ impl Harness {
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
-      pending_disarms: VecDeque::new(),
       #[cfg(debug_assertions)]
       observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<TokioRuntime>,
@@ -389,8 +374,8 @@ impl Harness {
       .await
   }
 
-  async fn unwatch(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
-    self.owner.reconcile_unwatch(sub).await
+  fn unwatch(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
+    self.owner.release_subscription(sub)
   }
 
   /// Every event the owner has pushed to its stream so far (Rescans, coalescer output).
@@ -457,7 +442,6 @@ async fn a_foreign_subscription_cannot_unwatch_a_local_one_with_a_colliding_scop
   // B's live subscription.
   let err = b
     .unwatch(a_sub)
-    .await
     .expect_err("a foreign subscription is rejected");
   assert!(
     err.is_unknown_subscription(),
@@ -470,7 +454,6 @@ async fn a_foreign_subscription_cannot_unwatch_a_local_one_with_a_colliding_scop
     "B's subscription stays live after rejecting the foreign unwatch"
   );
   b.unwatch(b_sub)
-    .await
     .expect("B's own subscription is still live and unwatchable");
 }
 
@@ -901,7 +884,7 @@ async fn rearm_reusing_a_retired_handle_trips_the_tripwire() {
   // AND removes it from the live index (`by_handle`). Handle 1 is now retired — gone from every live
   // structure, but permanently recorded in the owner's observed-handle set.
   let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
-  h.unwatch(sa).await.expect("unwatch /a");
+  h.unwatch(sa).expect("unwatch /a");
 
   // Re-watch a disjoint key and force the source to REUSE the retired handle 1 — a generation-unique
   // `Source::Handle` violation. The retired live-index check would pass (handle 1 is absent from the
@@ -1260,8 +1243,8 @@ async fn unwatch_reclaims_epoch_ledger_across_churn() {
       .await
       .expect("watch /a widens");
     let _ = h.drain(); // discard the repoint Rescans
-    assert!(h.unwatch(a).await.is_ok(), "a was live");
-    assert!(h.unwatch(wide).await.is_ok(), "wide was live");
+    assert!(h.unwatch(a).is_ok(), "a was live");
+    assert!(h.unwatch(wide).is_ok(), "wide was live");
   }
 
   assert_eq!(
@@ -1567,18 +1550,19 @@ async fn dead_root_terminal_removed_under_debounce_signals_via_parked_rescan_onl
   );
 }
 
-/// The one residual "dropped wait" case (design driver-golden doc, invariant I1; Codex R21-F1): a
-/// `watch` whose caller vanished before the owner could hand back the grant (its reply `oneshot` is
-/// closed at send time) is orphaned — its owner-local state (subsumer record, filter, epoch) is
-/// purged SYNCHRONOUSLY, and its last-subscriber disarm is DEFERRED onto `pending_disarms`, never
-/// awaited inline. An inline `reconcile_unwatch().await` here would block the owner — and any
-/// `Close` queued behind this `Watch` — on source I/O (R21-F1).
+/// The one residual "dropped wait" case (design driver-golden doc, invariant I1): a `watch` whose
+/// caller vanished before the owner could hand back the grant (its reply `oneshot` is closed at send
+/// time) is orphaned — its owner-local state (subsumer record, filter, epoch) is purged and, being
+/// the root's last subscriber, its kernel watch is released through the **synchronous**
+/// [`Source::disarm`] request. The release awaits nothing, so a `Close` queued behind this `Watch` is
+/// never blocked on source I/O (invariant II — Close-responsive by construction).
 ///
-/// Fail-on-old: with the send-failure path reverted to `reconcile_unwatch(grant.defuse()).await`,
-/// the disarm runs inline (a `Call::Disarm` lands and `pending_disarms` stays empty), so both
-/// deferral assertions flip.
+/// Non-vacuous: asserts the orphan's owner-local state is fully purged, its last-subscriber `Disarm`
+/// op is recorded at cleanup, and the released handle is logically dead immediately
+/// (`root_key` → None). Fail-on-old (the pre-golden awaited disarm could block the owner): here the
+/// synchronous `release_subscription` records the release at once and never yields.
 #[tokio::test]
-async fn caller_vanished_after_commit_defers_the_orphan_disarm() {
+async fn caller_vanished_after_commit_releases_the_orphan_synchronously() {
   let mut h = Harness::new();
 
   let (reply, response) = futures_channel::oneshot::channel();
@@ -1599,24 +1583,17 @@ async fn caller_vanished_after_commit_defers_the_orphan_disarm() {
     1,
     "the watch armed once (it committed) before being orphaned"
   );
-  // The disarm is DEFERRED, not awaited inline (R21-F1): the emptied root's handle is queued for the
-  // run loop's idle drain, and NO `source.disarm` ran during `on_watch`.
+  // The last-subscriber disarm ran SYNCHRONOUSLY at cleanup: a `Disarm(1)` is recorded and the handle
+  // is logically dead immediately (`root_key` → None) — no deferral, no await, nothing to block a
+  // `Close` queued behind this `Watch`.
+  assert!(
+    h.owner.source.calls().contains(&Call::Disarm(1)),
+    "the committed root's last-subscriber disarm was requested synchronously at cleanup"
+  );
   assert_eq!(
-    h.owner.pending_disarms.len(),
-    1,
-    "the committed root's last-subscriber disarm was deferred onto pending_disarms"
-  );
-  assert!(
-    h.owner.pending_disarms.iter().any(|p| p.handle == 1),
-    "…the freed root handle 1"
-  );
-  assert!(
-    !h.owner
-      .source
-      .calls()
-      .iter()
-      .any(|c| matches!(c, Call::Disarm(_))),
-    "on_watch never awaited the disarm inline (so a Close behind this Watch is never blocked on I/O)"
+    h.owner.source.root_key(1),
+    None,
+    "the released handle is logically dead immediately"
   );
 }
 
@@ -1625,14 +1602,14 @@ async fn caller_vanished_after_commit_defers_the_orphan_disarm() {
 /// but **before** the wait observed it, must not strand the committed subscription. The reply carries
 /// a RAII `WatchGrant`, not a bare `Subscription`; dropping the reply `Receiver` (the vanished wait)
 /// drops the grant, whose `Drop` enqueues a `DropOrphan` the owner reconciles away — purging the
-/// filter and epoch state (the same purge the churn test checks) and DEFERRING the root's disarm
-/// (Codex R21-F1: the non-blocking cleanup, never an inline `reconcile_unwatch().await`).
+/// filter and epoch state and releasing the root's kernel watch through the **synchronous**
+/// [`Source::disarm`] request (never an awaited teardown that could block a `Close` behind it).
 ///
 /// This is the residual hole a bare-`Subscription` reply left open: a successful `send` only proves
 /// the receiver existed at that instant, never that it polls the value. Distinct from
-/// `caller_vanished_after_commit_is_reconciled_away`, which drops the receiver **before** the send
-/// (the pre-existing immediate-reconcile edge); here the send succeeds and the grant's `Drop` is the
-/// only thing that can detect the drop.
+/// `caller_vanished_after_commit_releases_the_orphan_synchronously`, which drops the receiver
+/// **before** the send (the immediate-reconcile edge); here the send succeeds and the grant's `Drop`
+/// is the only thing that can detect the drop.
 ///
 /// Fail-on-old: with the bare reply (no grant `Drop`), dropping the receiver drops only the
 /// subscription value — nothing is enqueued and the committed subscription stays live — so the
@@ -1672,8 +1649,9 @@ async fn watch_wait_dropped_after_commit_reconciles_the_orphan_away() {
     matches!(cmd, super::Command::DropOrphan(_)),
     "the dropped grant must enqueue exactly a DropOrphan"
   );
-  // Dispatch it exactly as the run loop's `select` does: purge owner-local state synchronously and
-  // DEFER the last-subscriber disarm (never inline — R21-F1).
+  // Dispatch it exactly as the run loop's `select` does: release the orphan through the unified
+  // `release_subscription` — purge owner-local state and request the emptied root's synchronous
+  // `source.disarm`.
   let _ = h.owner.dispatch_command(Ok(cmd)).await;
 
   // The orphan's owner-local state is fully purged — subsumer record, filter, and epoch all released.
@@ -1692,19 +1670,17 @@ async fn watch_wait_dropped_after_commit_reconciles_the_orphan_away() {
     (0, 0),
     "its epoch state is purged"
   );
-  // The kernel disarm is DEFERRED, not awaited inline: the freed root is queued for the run loop's
-  // idle drain, so a `Close` behind this `DropOrphan` is never blocked on source I/O (R21-F1).
+  // The kernel disarm ran SYNCHRONOUSLY as part of the DropOrphan dispatch: a `Disarm(1)` is recorded
+  // and the released handle is logically dead immediately (`root_key` → None) — no deferral, so a
+  // `Close` behind this `DropOrphan` is never blocked on source I/O.
   assert!(
-    h.owner.pending_disarms.iter().any(|p| p.handle == 1),
-    "the committed root's last-subscriber disarm was deferred onto pending_disarms"
+    h.owner.source.calls().contains(&Call::Disarm(1)),
+    "the committed root's last-subscriber disarm was requested synchronously at cleanup"
   );
-  assert!(
-    !h.owner
-      .source
-      .calls()
-      .iter()
-      .any(|c| matches!(c, Call::Disarm(_))),
-    "the DropOrphan dispatch deferred the disarm rather than awaiting it inline"
+  assert_eq!(
+    h.owner.source.root_key(1),
+    None,
+    "the released handle is logically dead immediately"
   );
 }
 
@@ -2216,7 +2192,7 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
       Ok(Armed::new(1, key.to_vec()))
     }
-    async fn disarm(&mut self, _handle: u32) {}
+    fn disarm(&mut self, _handle: u32) {}
     async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
       tokio::task::yield_now().await; // Pending once BEFORE the dequeue → cancel-safe
       self.consumed += 1;
@@ -2241,7 +2217,7 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
       Ok(Armed::new(1, key.to_vec()))
     }
-    async fn disarm(&mut self, _handle: u32) {}
+    fn disarm(&mut self, _handle: u32) {}
     async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
       let popped = self.queue.pop_front(); // dequeue on poll START (the bug)
       if popped.is_some() {
@@ -2539,32 +2515,28 @@ async fn source_drain_retry_stays_responsive_to_close() {
   );
 }
 
-/// R19 regression (design driver-golden doc, invariant II — Close-responsive source drain): during
-/// source-drain teardown a queued [`DropOrphan`](super::Command::DropOrphan) must be purged WITHOUT
-/// source I/O, or its last-subscriber `source.disarm` can park the retry loop inside a slow/wedged
-/// source and strand a `Close` queued behind it. The fixed teardown purges the orphan with the
-/// NON-awaiting `purge_sub_local`, so a `Close` behind a `DropOrphan` is still surfaced promptly
-/// even when the orphan's root `disarm` never resolves.
+/// Close-responsive source drain (design source doc, invariant II): during source-drain teardown a
+/// queued [`DropOrphan`](super::Command::DropOrphan) is released through the synchronous
+/// [`release_subscription`](super::Owner::release_subscription) — it purges the orphan's owner-local
+/// state and requests the emptied root's `source.disarm`, awaiting nothing — so a `Close` queued
+/// behind it is surfaced promptly with no scheduling discipline to get wrong. The purge is keyed on
+/// the orphan alone, so a live sub's owed Rescan survives it.
 ///
-/// The setup queues `DropOrphan(orphan)` ahead of `Close` and makes the orphan's last-subscriber
-/// `disarm` hang forever; a SEPARATE live subscription keeps a Rescan parked behind a full,
-/// held-open channel so the drain loop keeps spinning (and servicing the mailbox). The purge is
-/// keyed on the orphan alone, so the live sub's owed Rescan survives it.
-///
-/// Fail-on-old: with `DropOrphan` → `reconcile_unwatch(orphan).await`, the loop reaches the
-/// never-resolving `disarm` and parks there; the later `Close` is never read and the timeout fires.
+/// Non-vacuous: with `DropOrphan` ahead of `Close` and a SEPARATE live subscription keeping a Rescan
+/// parked behind a full, held-open channel (so the drain loop keeps spinning and servicing the
+/// mailbox), it asserts the drain surfaces the Close within the deadline, the orphan is reconciled
+/// away (its last-subscriber root released synchronously — a `Disarm` op recorded), and the live
+/// sub's owed Rescan survives untouched.
 #[tokio::test]
 async fn source_drain_dropped_orphan_is_purged_without_blocking_close_on_disarm() {
   let mut h = Harness::bounded(1);
 
   // A LIVE subscription whose parked overflow Rescan keeps the drain loop spinning (its channel is
   // filled + held open below), plus an ORPHAN on a disjoint root — the `DropOrphan` target and its
-  // own root's last subscriber, so a full `reconcile_unwatch` would drive that root's `disarm`.
+  // own root's last subscriber, so releasing it requests that root's `disarm`.
   let live = h.watch("/a", Interest::all()).await.expect("watch /a");
   let orphan = h.watch("/b", Interest::all()).await.expect("watch /b");
-  // Monotonic mint: /a = handle 1, /b = handle 2. Make the orphan root's release `disarm` hang, so
-  // a teardown that (wrongly) awaited it would never return.
-  h.owner.source.hang_disarm_of(2);
+  // Monotonic mint: /a = handle 1, /b = handle 2.
 
   for raw in 0..2 {
     h.owner.epochs.stamp(live, Epoch::new(raw));
@@ -2579,8 +2551,7 @@ async fn source_drain_dropped_orphan_is_purged_without_blocking_close_on_disarm(
   );
   let _held = h.events.clone(); // a receiver that never drains (keeps the channel full + open)
 
-  // Queue DropOrphan(orphan) BEFORE the Close — the ordering that, pre-fix, parks the loop inside
-  // the orphan's never-resolving `disarm` before the Close is ever read.
+  // Queue DropOrphan(orphan) BEFORE the Close.
   h._commands
     .try_send(super::Command::DropOrphan(orphan))
     .expect("enqueue the DropOrphan command");
@@ -2589,11 +2560,11 @@ async fn source_drain_dropped_orphan_is_purged_without_blocking_close_on_disarm(
     .try_send(super::Command::Close { reply })
     .expect("enqueue the Close command");
 
-  // The teardown must purge the orphan without awaiting its (never-resolving) `disarm`, then go on
-  // to surface the Close — all within the deadline.
+  // The teardown releases the orphan (synchronous disarm) and surfaces the Close — all within the
+  // deadline; a synchronous release can never park the drain behind the queued `Close`.
   let returned = tokio::time::timeout(Duration::from_secs(5), h.owner.drain_owed_before_shutdown())
     .await
-    .expect("the teardown did NOT park inside the orphan's never-resolving disarm");
+    .expect("the teardown surfaced the Close without blocking on the orphan's release");
   let close_reply = returned.expect("the mid-drain Close is surfaced to the caller to be acked");
 
   // Ack it exactly as `run` does; the close() caller then completes.
@@ -2603,11 +2574,11 @@ async fn source_drain_dropped_orphan_is_purged_without_blocking_close_on_disarm(
     "close() completes once the drain surfaced and acked its Close"
   );
 
-  // The orphan was purged SYNCHRONOUSLY — never disarmed (its `disarm` is the hung one) — while the
-  // live sub's owed Rescan (a DIFFERENT sub's `needs_rescan` entry) survived the purge untouched.
+  // The orphan's last-subscriber root was released SYNCHRONOUSLY — a `Disarm(2)` recorded at cleanup
+  // — while the live sub's owed Rescan (a DIFFERENT sub's `needs_rescan` entry) survived untouched.
   assert!(
-    !h.owner.source.calls().contains(&Call::Disarm(2)),
-    "the teardown purged the orphan WITHOUT awaiting its last-subscriber disarm"
+    h.owner.source.calls().contains(&Call::Disarm(2)),
+    "the teardown released the orphan's last-subscriber root via the synchronous disarm request"
   );
   assert!(
     !h.owner.subsumer.view().is_watched(&key("/b")),
@@ -2627,10 +2598,6 @@ struct DrainableSource {
   next_handle: u32,
   live: HashMap<u32, Vec<OsString>>,
   drain: async_channel::Receiver<std::convert::Infallible>,
-  /// Make [`Source::disarm`] of this handle **never resolve** (park forever) — so the R20-F1
-  /// regression can prove the NORMAL run loop DEFERS a last-subscriber orphan-disarm rather than
-  /// awaiting it inline (which would strand a `Close` queued behind the `DropOrphan`).
-  hang_disarm: Option<u32>,
 }
 
 impl Source<OsString> for DrainableSource {
@@ -2641,32 +2608,13 @@ impl Source<OsString> for DrainableSource {
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
-    // Enforce the source's disjoint-root contract (mirroring `tributary_fs::Watcher` and
-    // `FakeSource`): reject a key overlapping any live root as `Overlaps`, so a re-`watch` of a
-    // still-armed orphaned root drives the arm choke point's overlap-flush (Codex R20-F1/R22).
-    if let Some(existing) = self
-      .live
-      .values()
-      .find(|live| key.starts_with(live.as_slice()) || live.as_slice().starts_with(key))
-      .cloned()
-    {
-      return Err(WatchError::Fs(WatchRootError::Overlaps {
-        path: key.iter().collect(),
-        existing: existing.iter().collect(),
-      }));
-    }
     self.next_handle += 1;
     let handle = self.next_handle;
     self.live.insert(handle, key.to_vec());
     Ok(Armed::new(handle, key.to_vec()))
   }
 
-  async fn disarm(&mut self, handle: u32) {
-    if self.hang_disarm == Some(handle) {
-      // Park forever: a NORMAL-loop `DropOrphan` that (wrongly) awaited this last-subscriber
-      // disarm inline would hang, stranding a queued `Close` — the R20-F1 pre-fix behaviour.
-      std::future::pending::<()>().await;
-    }
+  fn disarm(&mut self, handle: u32) {
     self.live.remove(&handle);
   }
 
@@ -2700,7 +2648,6 @@ async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs
     next_handle: 0,
     live: HashMap::new(),
     drain: drain_rx,
-    hang_disarm: None,
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
     super::Tributaries::with_source(source, TributariesOptions::new());
@@ -2765,7 +2712,6 @@ impl OwnerU64 {
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
       events: event_tx,
-      pending_disarms: VecDeque::new(),
       #[cfg(debug_assertions)]
       observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<TokioRuntime>,
@@ -2946,7 +2892,7 @@ async fn consumer_unwatch_purges_buffered_coalescer_delta() {
   );
 
   // The consumer unwatches: every per-sub structure — including the coalescer buffer — is purged.
-  h.unwatch(sub).await.expect("sub was live");
+  h.unwatch(sub).expect("sub was live");
 
   // Both the settle-timer edge and the teardown flush drain the coalescer through `try_emit`;
   // neither may surface anything for the retired subscription.
@@ -3019,59 +2965,10 @@ async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() 
   );
 }
 
-/// R20-F1 regression (design driver-golden doc, invariant II — Close-responsive normal loop): the
-/// NORMAL run loop must handle a [`DropOrphan`](super::Command::DropOrphan) WITHOUT awaiting its
-/// last-subscriber `source.disarm` inline, or a `Close` queued behind the `DropOrphan` is stranded
-/// when that disarm never resolves. The fix purges the orphan synchronously and DEFERS the disarm
-/// onto `pending_disarms`, so a `Close` behind a `DropOrphan` is acked promptly even when the
-/// orphan's root disarm hangs forever (the R19 source-drain fix, now closed for the normal loop too).
-///
-/// Runs the real spawned [`run`](super::run) loop over a source whose `next()` PARKS (so the loop
-/// stays in the normal phase, not source-drain) and whose disarm of the orphan's root (handle 1)
-/// never resolves. A single watch makes the orphan its root's only subscriber, so the `DropOrphan`
-/// empties the root and drives that never-resolving last-subscriber disarm.
-///
-/// Fail-on-old: with the normal-loop `DropOrphan` → `reconcile_unwatch(sub).await`, the loop parks
-/// inside the hung disarm before the `Close` is read, and `close()` times out.
-#[tokio::test]
-async fn normal_loop_dropped_orphan_defers_disarm_and_never_blocks_close() {
-  // Keep the drain sender alive for the whole test so `next()` parks: the loop stays in the NORMAL
-  // phase (a dropped sender would drain the source into the R19 teardown path instead).
-  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
-  let source = DrainableSource {
-    next_handle: 0,
-    live: HashMap::new(),
-    drain: drain_rx,
-    // The orphan's root is the first (only) arm → handle 1; its disarm never resolves.
-    hang_disarm: Some(1),
-  };
-  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
-
-  // One watch → its root's ONLY subscriber (handle 1), so a DropOrphan empties the root and drives
-  // its (never-resolving) last-subscriber disarm — exactly what the deferral must NOT await inline.
-  let orphan = w
-    .watch(key("/b"), (), Interest::all(), Filter::all())
-    .await
-    .expect("watch /b");
-
-  // Queue DropOrphan(orphan) in the NORMAL loop, THEN Close behind it (FIFO): the ordering that,
-  // pre-R20-F1, parked the loop inside the orphan's never-resolving disarm before the Close was read.
-  w.commands
-    .try_send(super::Command::DropOrphan(orphan))
-    .expect("enqueue the DropOrphan command");
-
-  // Close must be acked promptly: the deferred orphan-disarm never blocks the command loop.
-  tokio::time::timeout(Duration::from_secs(5), w.close())
-    .await
-    .expect("close() is acked promptly — the deferred orphan-disarm did not block the command loop")
-    .expect("close completes");
-}
-
-/// R20-F2 regression (design driver-golden doc, invariant I4 / no false debt):
-/// [`purge_sub_local`](super::Owner::purge_sub_local) must clear a subscription's owner-local per-sub
-/// state — above all its parked overflow [`Rescan`](tributary_fs::EventKind::Rescan) — EVEN WHEN the
-/// subscription is already absent from the subsumer (terminal-retired). A committed-but-unclaimed
+/// R20-F2 regression (design source doc, invariant I4 / no false debt):
+/// [`release_subscription`](super::Owner::release_subscription) must clear a subscription's
+/// owner-local per-sub state — above all its parked overflow [`Rescan`](tributary_fs::EventKind::Rescan)
+/// — EVEN WHEN the subscription is already absent from the subsumer (terminal-retired). A committed-but-unclaimed
 /// watch can be terminal-retired (its terminal Rescan parked, the sub force-removed from the
 /// subsumer) while its [`WatchGrant`](super::WatchGrant) still sits in the reply slot; the later
 /// [`DropOrphan`](super::Command::DropOrphan) then finds `plan_unwatch` reporting `Unknown`. The fix
@@ -3116,9 +3013,10 @@ async fn drop_orphan_after_terminal_retire_clears_the_orphans_parked_rescan_no_f
     "the orphan's root is retired from the subsumer"
   );
 
-  // The orphan's WatchGrant now fires: DropOrphan → purge_sub_local. The subsumer no longer records
-  // the orphan, so plan_unwatch reports Unknown — but the owner-local cleanup MUST still have run.
-  let outcome = h.owner.purge_sub_local(orphan);
+  // The orphan's WatchGrant now fires: DropOrphan → release_subscription. The subsumer no longer
+  // records the orphan, so plan_unwatch reports Unknown — but the owner-local cleanup MUST still have
+  // run (and no last-subscriber disarm is issued, since the root is already terminal-retired).
+  let outcome = h.owner.release_subscription(orphan);
   assert!(
     outcome.is_err_and(|err| err.is_unknown_subscription()),
     "a terminal-retired sub is Unknown to the subsumer"
@@ -3136,64 +3034,65 @@ async fn drop_orphan_after_terminal_retire_clears_the_orphans_parked_rescan_no_f
   );
 }
 
-/// R20-F1 ordering safety (design driver-golden doc; `error::WatchError` — the umbrella NEVER
-/// surfaces `Overlaps`): a re-`watch` of a just-orphaned key **while its deferred disarm is still
-/// pending** must still succeed. A [`DropOrphan`](super::Command::DropOrphan) removes the emptied
-/// root from the subsumer immediately but DEFERS its kernel disarm, so the re-`watch` is classified
-/// `Disjoint` (the subsumer no longer records it) yet the source still has the old root armed —
-/// which the source rejects as [`Overlaps`](tributary_fs::WatchRootError::Overlaps). The arm choke
-/// point flushes the pending disarm and retries, so the re-`watch` arms a FRESH generation-unique
-/// handle and the umbrella upholds its no-`Overlaps` contract; the stale pending disarm of the OLD
-/// handle never touches the new root.
+/// The umbrella NEVER surfaces `Overlaps` (design source doc; `error::WatchError`): a re-`watch` of a
+/// just-orphaned key succeeds even though the orphan's release was requested a moment earlier. A
+/// [`DropOrphan`](super::Command::DropOrphan)'s
+/// [`release_subscription`](super::Owner::release_subscription) removes the emptied root from the
+/// subsumer AND issues the synchronous `source.disarm`, so the re-`watch` is classified `Disjoint`
+/// (the subsumer no longer records it) and the source has already applied the release before the
+/// fresh arm (disarm contract clause 2) — no flush machinery, no
+/// [`Overlaps`](tributary_fs::WatchRootError::Overlaps). The re-`watch` arms a FRESH
+/// generation-unique handle; the released OLD handle is logically dead and cannot touch it.
 ///
-/// Fail-on-old: without the arm choke point's overlap-flush, the retry never happens and the
-/// re-`watch` surfaces `WatchError::Fs(Overlaps)`.
+/// Non-vacuous: the recorded op sequence is exactly `Arm(/a)`, `Disarm(1)`, `Arm(/a)` — the release
+/// is recorded BEFORE the re-watch's arm (release-before-subsequent-arm ordering) with only ONE arm
+/// for the re-watch (no `Overlaps` retry) — and the OLD handle's `root_key` is `None` while the
+/// re-watch is live and covered on a fresh root.
 #[tokio::test]
-async fn rewatch_of_a_just_orphaned_key_flushes_the_pending_disarm_and_never_surfaces_overlaps() {
+async fn rewatch_of_a_just_orphaned_key_succeeds_no_overlaps() {
   let mut h = Harness::new();
 
   // Watch /a → its root's only subscriber (handle 1), armed at the source.
   let orphan = h.watch("/a", Interest::all()).await.expect("watch /a");
 
-  // Simulate the NORMAL-loop DropOrphan handling: purge the orphan's owner-local state (removing /a
-  // from the subsumer) and DEFER its emptied root's disarm — the source still has handle 1 armed.
-  let outcome = h.owner.purge_sub_local(orphan).expect("orphan purged");
-  let crate::subsume::UnwatchOutcome::RootEmptied { fs_root, root_key } = outcome else {
-    panic!("the orphan was its root's last subscriber");
-  };
-  h.owner.pending_disarms.push_back(super::PendingDisarm {
-    key: root_key,
-    handle: fs_root,
-  });
-  assert!(
-    h.owner.source.root_key(1).is_some(),
-    "the orphaned root's kernel watch is still armed (its disarm was deferred)"
+  // The NORMAL-loop DropOrphan handling: release the orphan's owner-local state (removing /a from the
+  // subsumer) AND request its emptied root's synchronous disarm — the FakeSource applies the release
+  // immediately, so handle 1 is logically dead at once.
+  h.owner
+    .release_subscription(orphan)
+    .expect("the orphan (its root's last subscriber) is released");
+  assert_eq!(
+    h.owner.source.root_key(1),
+    None,
+    "the orphaned root is logically dead immediately (its disarm was a synchronous request)"
   );
 
-  // Re-watch /a while handle 1's disarm is still pending: `Disjoint` (subsumer no longer records it)
-  // → arm overlaps the still-armed handle 1 → the choke point flushes the pending disarm and retries.
+  // Re-watch /a: `Disjoint` (the subsumer no longer records it) → arm a FRESH root. The prior release
+  // was already applied, so the source never reports `Overlaps` and no retry is needed.
   let rewatched = h
     .watch("/a", Interest::all())
     .await
-    .expect("the re-watch flushes the pending disarm and never surfaces Overlaps");
+    .expect("the re-watch never surfaces Overlaps (the prior release was already applied)");
   assert_ne!(
     orphan, rewatched,
     "the re-watch minted a fresh subscription"
   );
 
-  // The pending disarm was flushed (handle 1 released), then a FRESH root (handle 2) armed for /a.
-  assert!(
-    h.owner.pending_disarms.is_empty(),
-    "the overlap-flush drained the pending disarm"
-  );
-  assert!(
-    h.owner.source.calls().contains(&Call::Disarm(1)),
-    "the stale orphaned root was disarmed before the retry"
+  // The op sequence proves the ordering: the orphan's `Disarm(1)` is recorded BEFORE the re-watch's
+  // single `Arm(/a)` — release-before-subsequent-arm, and no `Overlaps` retry (exactly two arms).
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a")),
+      Call::Disarm(1),
+      Call::Arm(PathBuf::from("/a")),
+    ],
+    "release recorded before the re-watch's (single) arm — no Overlaps"
   );
   assert_eq!(
     h.owner.source.root_key(1),
     None,
-    "the OLD handle is released — a stale pending disarm of it cannot touch the new root"
+    "the OLD handle stays released — it cannot touch the new root"
   );
   assert!(
     h.owner.subsumer.view().is_watched(&key("/a")),
@@ -3201,133 +3100,17 @@ async fn rewatch_of_a_just_orphaned_key_flushes_the_pending_disarm_and_never_sur
   );
 }
 
-/// Codex R22 targeted-flush unit check (design source doc; invariant II — `Close` bounded by at
-/// most ONE disarm): with MULTIPLE deferred orphan-disarms queued, the arm choke point's
-/// overlap-flush releases ONLY the pending root whose key OVERLAPS the re-`watch` key, leaving
-/// every NON-overlapping deferred disarm queued for the idle drain. That is what keeps `Close`
-/// bounded by one disarm even after a burst of orphans — draining the whole queue on one re-`watch`
-/// would couple `Close` to the disarms of unrelated orphans (Codex R22-F1).
+/// The `commands_weak.upgrade()` == `None` orphan sub-case (design source doc): when every handle is
+/// already gone as the owner finishes a `watch` reconcile, the committed subscription is released via
+/// the SAME unified [`release_subscription`](super::Owner::release_subscription) — purge owner-local
+/// state and request the emptied root's synchronous `source.disarm`. Because the release awaits
+/// nothing, dropping all handles never leaves the owner awaiting a disarm before its source is
+/// dropped; any still-pending transport release is applied by the source's own `Drop` at teardown.
 ///
-/// Fail-on-old: the whole-queue flush disarms `/n` (handle 1) too — it appears in the source's
-/// `Disarm` calls and is gone from `pending_disarms`, so the "NOT touched" assertions flip.
+/// Non-vacuous: asserts the orphan's owner-local state is purged and its last-subscriber `Disarm` op
+/// is recorded synchronously at cleanup (the handle logically dead immediately).
 #[tokio::test]
-async fn overlap_flush_releases_only_the_overlapping_pending_disarm() {
-  let mut h = Harness::new();
-
-  // Two DISJOINT roots, each its own last subscriber: /n (handle 1) and /o (handle 2).
-  let orphan_n = h.watch("/n", Interest::all()).await.expect("watch /n");
-  let orphan_o = h.watch("/o", Interest::all()).await.expect("watch /o");
-
-  // Orphan both (the DropOrphan / send-failure cleanup): purge owner-local state and DEFER each
-  // root's last-subscriber disarm — the source still has handles 1 AND 2 armed.
-  h.owner.defer_orphan_disarm(orphan_n);
-  h.owner.defer_orphan_disarm(orphan_o);
-  assert_eq!(
-    h.owner.pending_disarms.len(),
-    2,
-    "both orphan disarms are deferred, non-overlapping with each other"
-  );
-
-  // Re-watch /o while BOTH disarms are pending: `Disjoint` (the subsumer no longer records it) →
-  // arm overlaps still-armed handle 2 (/o) → the choke point flushes ONLY the overlapping pending
-  // root and retries, arming a fresh handle 3.
-  let rewatched = h
-    .watch("/o", Interest::all())
-    .await
-    .expect("the re-watch flushes only the overlapping pending disarm and never surfaces Overlaps");
-  assert_ne!(
-    orphan_o, rewatched,
-    "the re-watch minted a fresh subscription"
-  );
-
-  // ONLY handle 2 (the overlapping /o root) was disarmed by the flush …
-  assert!(
-    h.owner.source.calls().contains(&Call::Disarm(2)),
-    "the overlapping pending root (handle 2) was disarmed by the flush + retry"
-  );
-  // … and handle 1 (the DISJOINT /n root) was left completely untouched — NOT a whole-queue drain.
-  assert!(
-    !h.owner.source.calls().contains(&Call::Disarm(1)),
-    "the non-overlapping pending root (handle 1) was NOT touched (R22: bounded by one disarm)"
-  );
-  assert_eq!(
-    h.owner.pending_disarms.len(),
-    1,
-    "the non-overlapping disarm stays queued for the idle drain (no leak, no whole-queue flush)"
-  );
-  assert!(
-    h.owner.pending_disarms.iter().any(|p| p.handle == 1),
-    "…and the entry left behind is handle 1 (the /n root)"
-  );
-  assert!(
-    h.owner.source.root_key(1).is_some(),
-    "handle 1's kernel watch is still armed — its deferred disarm awaits the idle drain, untouched"
-  );
-}
-
-/// R21-F1 regression (design source doc; invariant II — Close-responsive normal loop): the
-/// [`on_watch`](super::Owner::on_watch) reply-send-FAILURE orphan path — the caller's reply receiver
-/// was already gone the instant the owner went to hand back the [`WatchGrant`](super::WatchGrant) —
-/// must DEFER its last-subscriber `source.disarm` via the same non-blocking cleanup as a
-/// [`DropOrphan`](super::Command::DropOrphan), NEVER an inline `reconcile_unwatch().await`. Otherwise
-/// a never-resolving orphan disarm parks the command loop and a `Close` queued behind the orphaning
-/// `Watch` is stranded (the R19/R20-F1 hole, here on the send-failure branch R20 left inline).
-///
-/// Runs the real spawned [`run`](super::run) loop over a source whose `next()` PARKS (normal phase)
-/// and whose disarm of the orphan's root (handle 1) never resolves. A hand-built `Watch` command
-/// whose reply RECEIVER is already dropped drives the send-failure path; `/b` is its root's only
-/// subscriber, so the orphan empties the root and drives that never-resolving last-subscriber disarm.
-///
-/// Fail-on-old: with the send-failure branch reverted to `reconcile_unwatch(grant.defuse()).await`,
-/// `on_watch` parks inside the hung disarm before returning — the `Close` is never read and
-/// `close()` times out.
-#[tokio::test]
-async fn on_watch_send_failure_orphan_defers_disarm_and_never_blocks_close() {
-  // Keep the drain sender alive so `next()` parks: the loop stays in the NORMAL phase.
-  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
-  let source = DrainableSource {
-    next_handle: 0,
-    live: HashMap::new(),
-    drain: drain_rx,
-    // The orphan's root is the first (only) arm → handle 1; its disarm never resolves.
-    hang_disarm: Some(1),
-  };
-  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
-
-  // A `Watch` command whose reply RECEIVER is already dropped → the owner's `reply.send` FAILS (the
-  // send-failure orphan path). `/b` is its root's ONLY subscriber (handle 1), so the orphan empties
-  // the root and drives its (never-resolving) last-subscriber disarm — which MUST be deferred.
-  let (reply, response) = futures_channel::oneshot::channel();
-  drop(response);
-  w.commands
-    .try_send(super::Command::Watch {
-      key: key("/b"),
-      value: (),
-      interest: Interest::all(),
-      filter: Filter::all(),
-      reply,
-    })
-    .expect("enqueue the Watch command");
-
-  // Close must be acked promptly: the deferred send-failure orphan disarm never blocks the loop.
-  tokio::time::timeout(Duration::from_secs(5), w.close())
-    .await
-    .expect("close() is acked promptly — the send-failure orphan disarm was deferred, not inline")
-    .expect("close completes");
-}
-
-/// R21-F1, the `commands_weak.upgrade()` == `None` sub-case (design source doc): when every handle is
-/// already gone as the owner finishes a `watch` reconcile, the committed subscription is orphaned via
-/// the SAME non-blocking cleanup — purge owner-local state, DEFER the disarm — so dropping all handles
-/// never leaves the owner awaiting a disarm before its source is dropped (the deferred handle is moot
-/// at teardown; the run loop's `is_closed` guard skips it and the source drop releases the watch). It
-/// must NOT run an inline `reconcile_unwatch().await`.
-///
-/// Fail-on-old: with the `None` branch reverted to `reconcile_unwatch(sub).await`, a `Call::Disarm`
-/// lands (awaited inline) and `pending_disarms` stays empty — both deferral assertions flip.
-#[tokio::test]
-async fn on_watch_with_all_handles_gone_defers_orphan_disarm() {
+async fn on_watch_with_all_handles_gone_releases_orphan_synchronously() {
   let mut h = Harness::new();
   // A live reply receiver, kept (unused), so the ONLY reason to orphan is the None upgrade — not a
   // send failure. Dropping the sole strong command Sender makes the owner's weak upgrade return None.
@@ -3342,108 +3125,138 @@ async fn on_watch_with_all_handles_gone_defers_orphan_disarm() {
     0,
     "the orphan's owner-local state was purged"
   );
+  // Its last-subscriber disarm ran SYNCHRONOUSLY at cleanup — a `Disarm(1)` recorded and the handle
+  // logically dead immediately — so dropping all handles never leaves the owner awaiting a disarm.
   assert!(
-    h.owner.pending_disarms.iter().any(|p| p.handle == 1),
-    "its last-subscriber disarm was DEFERRED (never awaited inline)"
+    h.owner.source.calls().contains(&Call::Disarm(1)),
+    "its last-subscriber disarm was requested synchronously at cleanup"
   );
-  assert!(
-    !h.owner
-      .source
-      .calls()
-      .iter()
-      .any(|c| matches!(c, Call::Disarm(_))),
-    "on_watch never awaited the disarm inline (dropping all handles must not await a disarm before \
-     the source is dropped)"
+  assert_eq!(
+    h.owner.source.root_key(1),
+    None,
+    "the released handle is logically dead immediately"
   );
 }
 
-/// A [`Source`] whose `disarm` is **slow and NOT cancellation-safe** — the R21-F2 rig. Its `next()`
-/// parks (held-open drain) so the loop stays in the normal phase; its `disarm` sleeps a delay that is
-/// deliberately **longer than the run loop's 25ms `RETRY`** and only removes the handle + signals the
-/// `released` channel AFTER the sleep returns. A `disarm` future dropped mid-sleep (cancelled) never
-/// reaches that release, so the handle stays unreleased — modelling a real disarm the umbrella must
-/// drive to completion rather than cancel (the [`Source::disarm`] bounded-not-cancel-safe contract).
-struct SlowDisarmSource {
-  next_handle: u32,
-  live: HashMap<u32, Vec<OsString>>,
-  /// `next()` parks until the test drops this sender; a closed channel means "drain now" (`None`).
-  drain: async_channel::Receiver<std::convert::Infallible>,
-  /// How long each `disarm` sleeps before releasing — set `> RETRY` so the R20 cancellable select's
-  /// 25ms retry timer would preempt (drop) it every tick and starve it.
-  disarm_delay: Duration,
-  /// Signals each handle whose `disarm` ran **to completion** (reached the release past its sleep).
-  /// A cancelled/starved disarm never sends here.
-  released: async_channel::Sender<u32>,
+/// Golden widen ordering (design source doc, disarm contract clause 2): a widen releases its subsumed
+/// narrow roots via the **synchronous** [`Source::disarm`] request and then arms the wider root, so
+/// the recorded op sequence shows every `Disarm(narrow…)` BEFORE the `Arm(wider)`, and by the time the
+/// wider root is armed those releases are already applied — a conforming source can never report
+/// `Overlaps`. Beyond the plain ordering check, this asserts the released narrow handles are logically
+/// dead (`root_key` → None) once the wider root is live.
+#[tokio::test]
+async fn widen_records_releases_before_wider_arm_and_applies_them() {
+  let mut h = Harness::new();
+
+  // Two disjoint narrow roots: /a/b (handle 1) and /a/c (handle 2).
+  h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  h.watch("/a/c", Interest::all()).await.expect("watch /a/c");
+
+  // Widen to /a: releases the two narrow roots, then arms the wider /a (handle 3).
+  h.watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens over the narrow roots");
+
+  // The op sequence: both narrow arms, then BOTH releases, then the single wider arm — every `Disarm`
+  // recorded before `Arm(/a)` (release-before-subsequent-arm ordering, and no `Overlaps` retry).
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+    ],
+    "the narrow roots are released before the wider root is armed"
+  );
+  // The releases are APPLIED: the narrow handles are logically dead, and the wider root (handle 3) is
+  // live and covers both old narrow keys.
+  assert_eq!(h.owner.source.root_key(1), None, "narrow /a/b released");
+  assert_eq!(h.owner.source.root_key(2), None, "narrow /a/c released");
+  assert_eq!(
+    h.owner.source.root_key(3),
+    Some(key("/a")),
+    "the wider root is armed and live"
+  );
+  assert!(
+    h.owner.subsumer.view().is_watched(&key("/a/b")),
+    "the widened root covers the old narrow keys"
+  );
 }
 
-impl Source<OsString> for SlowDisarmSource {
-  type Handle = u32;
-
-  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-    Ok(key.to_vec())
+/// Immediate logical death (design source doc, disarm contract clause 3): after the owner releases a
+/// subscription (an unwatch/orphan cleanup), the source's `root_key` answers `None` for the freed
+/// handle AT ONCE — even for an FsSource-shaped source whose transport teardown is still pending.
+/// Modelled by a double whose `disarm` queues the transport release (applied only at the next `arm`,
+/// like the real `Watcher`'s bounded command channel) yet marks the handle logically dead immediately.
+#[tokio::test]
+async fn release_marks_handle_logically_dead_immediately_even_with_transport_pending() {
+  /// An FsSource-shaped double: `disarm` queues the transport teardown (drained at the next `arm`)
+  /// but marks the handle logically dead at once via `pending_set`.
+  struct PendingReleaseSource {
+    next_handle: u32,
+    /// Handles whose transport watch is still installed (the "kernel" side); a `disarm` does NOT
+    /// remove from here — only the next `arm`'s drain does.
+    transport_live: std::collections::HashSet<u32>,
+    /// The requested-but-not-yet-applied releases, plus their mirror for O(1) `root_key`.
+    pending: VecDeque<u32>,
+    pending_set: std::collections::HashSet<u32>,
+    keys: HashMap<u32, Vec<OsString>>,
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
-    self.next_handle += 1;
-    let handle = self.next_handle;
-    self.live.insert(handle, key.to_vec());
-    Ok(Armed::new(handle, key.to_vec()))
-  }
+  impl Source<OsString> for PendingReleaseSource {
+    type Handle = u32;
 
-  async fn disarm(&mut self, handle: u32) {
-    // SLOW + cancel-unsafe: the delay exceeds the loop's 25ms `RETRY`, so under the R20 cancellable
-    // select the retry timer would drop this future before it finishes and it would restart from
-    // scratch every tick (starvation). Only a disarm awaited TO COMPLETION reaches the release +
-    // signal below; a cancelled one leaves the handle live and never signals.
-    tokio::time::sleep(self.disarm_delay).await;
-    self.live.remove(&handle);
-    let _ = self.released.try_send(handle);
-  }
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
 
-  async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
-    match self.drain.recv().await {
-      Ok(never) => match never {},
-      Err(_) => None,
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      // Apply every deferred transport teardown FIRST (mirroring `FsSource::arm`).
+      while let Some(released) = self.pending.pop_front() {
+        self.transport_live.remove(&released);
+        self.pending_set.remove(&released);
+        self.keys.remove(&released);
+      }
+      self.next_handle += 1;
+      let handle = self.next_handle;
+      self.transport_live.insert(handle);
+      self.keys.insert(handle, key.to_vec());
+      Ok(Armed::new(handle, key.to_vec()))
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      // Synchronous request: queue the transport teardown (deferred to the next arm) and mark the
+      // handle logically dead immediately.
+      if self.pending_set.insert(handle) {
+        self.pending.push_back(handle);
+      }
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      None
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      // Logically dead immediately, even though `transport_live` still holds it.
+      if self.pending_set.contains(&handle) {
+        return None;
+      }
+      self.keys.get(&handle).cloned()
     }
   }
 
-  fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
-    self.live.get(&handle).cloned()
-  }
-}
-
-/// R21-F2 regression (design source doc — the [`Source::disarm`] bounded-but-NOT-cancel-safe
-/// contract): a deferred orphan-disarm, once begun, is driven **to completion** by the run loop's
-/// idle drain — never cancelled or starved — even while the 25ms parked-`Rescan` retry timer fires
-/// continuously. The R20 mechanism polled `source.disarm` in a CANCELLABLE `select!` racing that
-/// retry timer, so a disarm slower than 25ms was dropped and restarted every tick and the kernel
-/// watch never released (Codex R21). The redesigned drain awaits the disarm directly off the select.
-///
-/// A `SlowDisarmSource` whose `disarm` sleeps 120ms (`> RETRY`) and only releases + signals if
-/// awaited to completion; a DIFFERENT subscription's overflow parks a `Rescan` so the retry timer
-/// fires every ~25ms for the whole test. The watcher stays alive (its command channel is held open),
-/// so the loop is in its normal idle-drain phase, NOT teardown.
-///
-/// Fail-on-old: reverting the drain to the R20 cancellable select drops the 120ms disarm every ~25ms
-/// → it never completes → `released` never fires → the recv times out.
-#[tokio::test]
-async fn deferred_disarm_runs_to_completion_despite_continuous_retry_timer() {
-  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
-  let (released_tx, released_rx) = async_channel::unbounded::<u32>();
-  let source = SlowDisarmSource {
-    next_handle: 0,
-    live: HashMap::new(),
-    drain: drain_rx,
-    disarm_delay: Duration::from_millis(120), // > RETRY (25ms): the old select's timer starves it
-    released: released_tx,
-  };
-
-  // A bounded(1) event channel with NO consumer, so an overflowed Rescan stays parked (channel full)
-  // and the 25ms retry timer keeps firing for the whole run.
-  let (event_tx, _event_rx) = async_channel::bounded::<Event<OsString, ()>>(1);
+  let (event_tx, _event_rx) = async_channel::unbounded::<Event<OsString, ()>>();
   let (command_tx, command_rx) = async_channel::unbounded::<super::Command<OsString, ()>>();
   let mut owner = Owner {
-    source,
+    source: PendingReleaseSource {
+      next_handle: 0,
+      transport_live: std::collections::HashSet::new(),
+      pending: VecDeque::new(),
+      pending_set: std::collections::HashSet::new(),
+      keys: HashMap::new(),
+    },
     subsumer: Subsumer::new(),
     epochs: EpochLedger::new(),
     filters: HashMap::new(),
@@ -3452,144 +3265,38 @@ async fn deferred_disarm_runs_to_completion_despite_continuous_retry_timer() {
     commands_weak: command_tx.downgrade(),
     commands: command_rx,
     events: event_tx,
-    pending_disarms: VecDeque::new(),
     #[cfg(debug_assertions)]
     observed_handles: std::collections::HashSet::new(),
     _rt: PhantomData::<TokioRuntime>,
   };
+  let _commands = command_tx; // keep the command channel open for the owner's weak sender
 
-  // /x → handle 1: the root whose disarm we DEFER (the orphan).
-  let orphan = owner
-    .reconcile_watch(&key("/x"), (), Interest::all(), Filter::all())
+  // Watch /a → handle 1, its transport watch installed and live.
+  let sub = owner
+    .reconcile_watch(&key("/a"), (), Interest::all(), Filter::all())
     .await
-    .expect("watch /x");
-  // /y → handle 2: a DIFFERENT sub we park an overflow Rescan on, so the retry timer fires
-  // continuously (the timer that, under the old cancellable select, would starve the disarm).
-  let parked = owner
-    .reconcile_watch(&key("/y"), (), Interest::all(), Filter::all())
-    .await
-    .expect("watch /y");
-  for raw in 0..2 {
-    owner.epochs.stamp(parked, Epoch::new(raw));
-  }
-  // Fill the one event slot, then overflow → park /y's dominating Rescan. No consumer drains the
-  // channel, so it stays FULL and /y stays parked → the 25ms retry timer keeps firing.
-  owner.try_emit(modified_event(parked, "/y/f0", 0));
-  owner.try_emit(modified_event(parked, "/y/f1", 1));
-  assert!(
-    owner.needs_rescan.contains_key(&parked),
-    "the retry timer is armed by /y's parked overflow Rescan"
-  );
-
-  // Orphan /x: purge its owner-local state and DEFER handle 1's disarm (exactly what a DropOrphan /
-  // send-failure orphan does). Handle 1's watch is still armed, pending that deferred disarm.
-  owner.defer_orphan_disarm(orphan);
-  assert!(
-    owner.pending_disarms.iter().any(|p| p.handle == 1),
-    "handle 1's disarm is deferred"
-  );
-  assert!(
-    owner.source.root_key(1).is_some(),
-    "…and its watch is still armed until the idle drain runs it"
-  );
-
-  // Spawn the real run loop; hold the command Sender so the watcher STAYS ALIVE (the loop never
-  // breaks). The idle drain must run handle 1's slow disarm to COMPLETION despite the retry timer.
-  let _watcher_alive = command_tx;
-  tokio::spawn(super::run(owner));
-
-  // The disarm ran to completion → it signalled `released`. Under the old cancellable select the
-  // 25ms timer would drop the 120ms disarm every tick → it would never signal → this times out.
-  let released = tokio::time::timeout(Duration::from_secs(10), released_rx.recv())
-    .await
-    .expect("the deferred disarm was drained to completion, not starved by the retry timer")
-    .expect("the release signal");
+    .expect("watch /a");
   assert_eq!(
-    released, 1,
-    "handle 1's deferred disarm ran to completion (the orphaned root released, never cancelled)"
+    owner.source.root_key(1),
+    Some(key("/a")),
+    "the armed root is live before release"
   );
-}
 
-/// Codex R22 regression, end-to-end over the real [`run`](super::run) loop (design source doc;
-/// invariant II — `Close` delayed by at most ONE bounded disarm): a re-`watch` whose arm overlaps a
-/// still-armed orphaned root must flush ONLY that overlapping pending disarm, NEVER the whole
-/// `pending_disarms` queue. A burst of orphans queues several deferred disarms; if one re-`watch` in
-/// front of a `Close` drained the whole queue, a slow/never-resolving NON-overlapping disarm would
-/// be awaited too and strand the `Close` (Codex R22-F1).
-///
-/// Runs the spawned loop over an overlap-enforcing [`DrainableSource`] whose `next()` parks (normal
-/// phase) and whose disarm of the NON-overlapping orphan (`/n` = handle 1) never resolves. The whole
-/// command burst — DropOrphan(`/n`), DropOrphan(`/o`), the re-`watch` of `/o`, then `Close` — is
-/// enqueued SYNCHRONOUSLY (current-thread runtime), so the loop drains a mailbox that is never idle
-/// between them: the idle drain never reaches handle 1, and the flush disarms ONLY handle 2 (the
-/// overlapping `/o` root). Handle 1's hung disarm stays queued and is made moot by the source drop
-/// at teardown.
-///
-/// Fail-on-old: the whole-queue flush pops handle 1 FIRST, parks forever in its never-resolving
-/// disarm, and the `Close` queued behind the re-`watch` is never read → `close()` times out.
-#[tokio::test]
-async fn arm_overlap_flush_touches_only_the_overlapping_orphan_so_close_stays_bounded() {
-  // Keep the drain sender alive so `next()` parks: the loop stays in the NORMAL idle-drain phase.
-  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
-  let source = DrainableSource {
-    next_handle: 0,
-    live: HashMap::new(),
-    drain: drain_rx,
-    // The NON-overlapping orphan `/n` is armed FIRST → handle 1; its disarm never resolves.
-    hang_disarm: Some(1),
-  };
-  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+  // Release it (the caller unwatch path): the last-subscriber disarm is a synchronous REQUEST — its
+  // transport teardown is still queued (applied only at the next arm) …
+  owner
+    .release_subscription(sub)
+    .expect("the subscription is released");
 
-  // Commit two disjoint roots: `/n` (handle 1, disjoint from the re-watch) and `/o` (handle 2, the
-  // root the re-watch will overlap). Each `.await` completes before the next, so the arm order — and
-  // thus the handle numbering the `hang_disarm: Some(1)` predicts — is deterministic.
-  let orphan_n = w
-    .watch(key("/n"), (), Interest::all(), Filter::all())
-    .await
-    .expect("watch /n");
-  let orphan_o = w
-    .watch(key("/o"), (), Interest::all(), Filter::all())
-    .await
-    .expect("watch /o");
-
-  // Enqueue the whole burst SYNCHRONOUSLY (no await between the sends) so the current-thread run loop
-  // sees a mailbox that is NEVER idle until all four are drained in FIFO order — keeping the idle
-  // drain from ever running handle 1's hung disarm before `Close` breaks the loop.
-  w.commands
-    .try_send(super::Command::DropOrphan(orphan_n))
-    .expect("enqueue DropOrphan(/n) → defers handle 1");
-  w.commands
-    .try_send(super::Command::DropOrphan(orphan_o))
-    .expect("enqueue DropOrphan(/o) → defers handle 2");
-  // The re-`watch` of `/o`: `Disjoint` → arm overlaps still-armed handle 2 → the choke point flushes
-  // ONLY handle 2 and retries. Its reply receiver is kept alive so the grant is not a send-failure
-  // re-orphan; we read it after `Close` to confirm the re-watch never surfaced `Overlaps`.
-  let (reply, rewatch_reply) = futures_channel::oneshot::channel();
-  w.commands
-    .try_send(super::Command::Watch {
-      key: key("/o"),
-      value: (),
-      interest: Interest::all(),
-      filter: Filter::all(),
-      reply,
-    })
-    .expect("enqueue the re-watch of /o");
-
-  // `Close` must be acked promptly: the flush disarmed ONLY handle 2 (the overlapping /o root); it
-  // never touched handle 1's never-resolving disarm, which stays queued (moot at teardown).
-  tokio::time::timeout(Duration::from_secs(5), w.close())
-    .await
-    .expect("close() is acked promptly — the flush touched only the overlapping pending disarm")
-    .expect("close completes");
-
-  // The re-`watch` was processed before `Close` and its reply was sent: the flush + retry resolved
-  // the overlap, so the umbrella never surfaced `Overlaps` to the caller.
-  let rewatched = rewatch_reply
-    .await
-    .expect("the re-watch reply was sent (the owner processed it before Close)");
+  // … yet the handle is logically dead IMMEDIATELY (contract clause 3) …
+  assert_eq!(
+    owner.source.root_key(1),
+    None,
+    "root_key answers None the instant the release is requested"
+  );
+  // … while its transport watch is genuinely still installed (release pending, applied at next arm).
   assert!(
-    rewatched.is_ok(),
-    "the re-watch never surfaced Overlaps — the overlap-flush + retry resolved it"
+    owner.source.transport_live.contains(&1),
+    "the transport teardown is still pending — an FsSource-shaped deferred release"
   );
 }

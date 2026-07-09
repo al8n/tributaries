@@ -14,7 +14,7 @@
 //! actually armed — a source may canonicalize (the filesystem adopts a root's real
 //! path), so the umbrella keys its subsumption index on the coordinate the source
 //! committed, not the one requested (design §4, the TOCTOU close). [`Source::disarm`]
-//! releases a root, and [`Source::next`] yields the next raw change as a [`SourceEvent`]
+//! synchronously **requests** release of a root, and [`Source::next`] yields the next raw change as a [`SourceEvent`]
 //! carrying the owning root handle, the change's located key, its kind, and the metadata
 //! the umbrella's fan-out and attribution consume.
 //!
@@ -24,7 +24,12 @@
 //! into components is the fs binding's private business. The umbrella never
 //! re-implements it; it orchestrates subsumption and fan-out over `C` alone.
 
-use std::{ffi::OsString, path::PathBuf, vec::Vec};
+use std::{
+  collections::{HashSet, VecDeque},
+  ffi::OsString,
+  path::PathBuf,
+  vec::Vec,
+};
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
@@ -63,19 +68,19 @@ mod tests;
 ///   or not-yet-emitted event still carries it (the hard contract on [`Handle`](Self::Handle), Codex
 ///   R15). Makes handle ABA impossible; the umbrella routes strictly by handle rather than defending
 ///   against reuse.
-/// - **Bounded [`arm`](Self::arm) / [`disarm`](Self::disarm) / [`canonicalize_key`](Self::canonicalize_key)**
-///   — the umbrella awaits [`arm`](Self::arm) and [`disarm`](Self::disarm) (and calls the synchronous
-///   [`canonicalize_key`](Self::canonicalize_key)) and runs each **to completion**, so all three MUST
-///   make progress and resolve in **bounded time**. [`arm`](Self::arm) is awaited only on a
-///   **caller-initiated** `watch`, running the reconcile to completion (invariant I1); a wedged one
-///   blocks the owner until the source honors the contract (the caller may drop its own `watch` wait,
-///   but the umbrella still owns the in-flight reconcile). [`disarm`](Self::disarm) carries the
-///   sharper **bounded-but-NOT-cancellation-safe** contract (see its docs): the umbrella never
-///   cancels an in-flight `disarm` — on the caller `unwatch`/widen/restore paths **or** the internal
-///   orphan-disarm drain — so it may hold state across polls, but it must not block indefinitely,
-///   since the owner runs it to completion rather than racing it. A source that makes any of these
-///   **hang indefinitely** violates the contract; that is the source's responsibility, not a bug the
-///   umbrella can `await`-around.
+/// - **Bounded [`arm`](Self::arm) / [`canonicalize_key`](Self::canonicalize_key)** — the umbrella
+///   awaits [`arm`](Self::arm) and calls the synchronous [`canonicalize_key`](Self::canonicalize_key),
+///   running each **to completion**, so both MUST make progress and resolve in **bounded time**.
+///   [`arm`](Self::arm) is awaited only on a **caller-initiated** `watch`, running the reconcile to
+///   completion (invariant I1); a wedged one blocks that one reconcile until the source honors the
+///   contract (the caller may drop its own `watch` wait, but the umbrella still owns the in-flight
+///   reconcile). A source that makes either **hang indefinitely** violates the contract; that is the
+///   source's responsibility, not a bug the umbrella can `await`-around.
+/// - **Synchronous, non-blocking [`disarm`](Self::disarm)** — release is a fire-and-forget
+///   **request** the umbrella never awaits (see its docs): it returns at once, queuing any async
+///   teardown inside the source, and applies the release no later than the next [`arm`](Self::arm) or
+///   `Drop`. There is no `disarm` future to wedge the owner, so a slow transport release can never
+///   block the mailbox — the reason Close-responsiveness holds *by construction* below.
 /// - **Cancellation-safe [`next`](Self::next)** — dropping an in-flight [`next`](Self::next) future
 ///   loses and acknowledges no event (the hard contract on [`next`](Self::next)).
 ///
@@ -84,36 +89,30 @@ mod tests;
 /// - **A wedged [`next`](Self::next) never blocks command processing.** The owner drives
 ///   [`next`](Self::next) as one arm of a biased `select!`; a `next()` that never resolves is simply
 ///   a pending arm — the loop still services the command mailbox and `Close`.
-/// - **Close-responsiveness against INTERNAL actions (invariant II).** Owner actions that are *not*
-///   a caller-awaited `watch`/`unwatch` — a `DropOrphan` from a dropped `watch` grant and the
-///   send-failure orphan on the same path (Codex R20-F1/R21-F1), and the source-drain teardown
-///   (Codex R19) — MUST NOT block `Close` on source I/O beyond **at most one in-flight bounded
-///   [`disarm`](Self::disarm)**. The umbrella never awaits an orphan's last-subscriber disarm
-///   *inline on the command path*: it purges the orphan's owner-local state synchronously and
-///   **defers** the disarm, and the run loop then drains one deferred disarm **to completion** in its
-///   body — with a direct `.await`, never a cancellable `select!` arm — but only when the command
-///   mailbox is idle, re-checking the mailbox before each. So a queued `Close`/command is always
-///   serviced first and a **bounded** disarm delays `Close` by at most itself (the source-drain
-///   teardown likewise purges orphans synchronously, never disarming). Because a conforming
-///   [`disarm`](Self::disarm) is bounded, `Close` stays responsive; only a contract-violating
-///   **unbounded** disarm could delay it, which is out of scope — and dropping every handle tears the
-///   owner down and drops the source without awaiting these now-moot disarms. (Caller-initiated
-///   `arm`/`disarm` are the other half of the split above — bounded by the source contract, not
-///   defended against by the umbrella.)
+/// - **Close-responsiveness against INTERNAL actions, by construction (invariant II).** Owner actions
+///   that are *not* a caller-awaited `watch` — a `DropOrphan` from a dropped `watch` grant, the
+///   send-failure / all-handles-gone orphan on the same path, and the source-drain teardown — release
+///   an emptied root through the **synchronous** [`disarm`](Self::disarm). Because `disarm` returns no
+///   future, **no** owner cleanup path awaits source I/O: `Close` is serviced with no scheduling
+///   discipline to get wrong. Dropping every handle tears the owner down and drops the source, whose
+///   own `Drop` applies any still-pending releases.
 /// - **No stranded or corrupt state.** A committed-but-unclaimed subscription is always reconciled
 ///   away (the `WatchGrant`, invariant I1); a subscription terminal-retired while unclaimed leaves no
-///   lingering parked `Rescan` behind (Codex R20-F2); and a deferred orphan-disarm that has not run
-///   before a re-`watch` of the same key is flushed at the arm choke point, so the umbrella never
-///   surfaces the `Overlaps` it exists to subsume away.
+///   lingering parked `Rescan` behind (Codex R20-F2); and a released-then-re-`watch`ed key never
+///   surfaces the [`Overlaps`](tributary_fs::WatchRootError::Overlaps) the umbrella exists to subsume
+///   away — the source applies the prior release before the re-arm (contract clause 2), so the
+///   umbrella needs no flushing of its own.
 ///
 /// # `Send` bounds
 ///
-/// **All three async methods return `Send` futures.** 0.1.0 targets tokio and smol, and
-/// the driver is a single owned task spawned on their multi-threaded executors
-/// ([`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach)) that drives arming,
-/// disarming, and the event pump inline in one `select!` loop — so *every* future the
-/// owner awaits must be able to cross threads for `run(owner)` itself to be `Send`. The
-/// bounds are written explicitly on each return type (rather than left implicit by
+/// **Both async methods return `Send` futures.** 0.1.0 targets tokio and smol, and the driver is a
+/// single owned task spawned on their multi-threaded executors
+/// ([`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach)) that drives arming and the event
+/// pump inline in one `select!` loop — so *every* future the owner awaits must be able to cross
+/// threads for `run(owner)` itself to be `Send`. The two awaited methods are [`arm`](Self::arm) and
+/// [`next`](Self::next); [`disarm`](Self::disarm) is synchronous (it returns no future), and
+/// [`canonicalize_key`](Self::canonicalize_key) / [`root_key`](Self::root_key) are synchronous
+/// probes. The bounds are written explicitly on each return type (rather than left implicit by
 /// `async fn`, whose futures carry no such bound), so a generic `S: Source<C>` owner is
 /// structurally spawnable — every implementor's futures must satisfy them. This is now
 /// unconditionally satisfiable for the fs source because [`tributary_fs::Watcher`] is
@@ -211,42 +210,41 @@ pub trait Source<C> {
     key: &[C],
   ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> + Send;
 
-  /// Releases the root named by `handle`.
+  /// Requests release of the root named by `handle`. Synchronous and non-blocking: this is a
+  /// fire-and-forget release **request**, not an awaited teardown.
   ///
-  /// Best-effort: a source that cannot confirm the release (already closed, root already
-  /// gone) absorbs it rather than surfacing an error, since a released root's runtime
-  /// conditions reach the umbrella in-band as events, not out of band here.
+  /// The umbrella never observes a release's completion and always ignores its errors (there is no
+  /// result), so `disarm` is *requested*, never *awaited*: the async boundary lives inside the
+  /// source (which owns its transport and its own driver task), not on the owner's mailbox loop.
+  /// This is what makes [`Close`](crate::Tributaries::close)-responsiveness hold **by construction**
+  /// — no owner cleanup path can block on a release (driver-golden invariant II).
   ///
-  /// # `disarm` MUST be bounded — but need NOT be cancellation-safe (hard contract)
+  /// # Hard contract
   ///
-  /// The umbrella **awaits every `disarm` to completion and NEVER cancels an in-flight one.** Unlike
-  /// [`next`](Self::next), `disarm` is *never* one arm of a cancellable
-  /// [`select!`](futures_util::select_biased): every call site drives it with a direct `.await` — the
-  /// caller-initiated `unwatch`/widen/restore reconciles, and the owner's internal orphan-disarm
-  /// drain, which pops one deferred handle and awaits it to completion **in the run loop's body when
-  /// the command mailbox is idle**, never racing a timer or a competing arm. A `disarm` future is
-  /// therefore dropped only if the whole owner task is torn down, so an implementor may hold state
-  /// across polls freely: `disarm` does **not** have to survive mid-flight cancellation the way
-  /// [`next`](Self::next) must (dropping a half-run `disarm` and re-issuing it need not be a no-op).
+  /// 1. **Non-blocking.** `disarm` returns without performing blocking I/O or awaiting anything. A
+  ///    source that needs async work to release (the fs source does) queues the request internally.
+  /// 2. **Release-before-subsequent-arm ordering.** Every release requested before a later
+  ///    [`arm`](Self::arm) call is fully applied (the concrete watch torn down) before that arm is
+  ///    attempted. This is what makes widen (release the narrow roots, arm the wider root) and
+  ///    re-watch-after-orphan correct with **no** umbrella-side flushing: a conforming source can
+  ///    never report [`Overlaps`](tributary_fs::WatchRootError::Overlaps) against a root whose
+  ///    release was already requested.
+  /// 3. **Logically dead immediately.** After `disarm(h)` returns, [`root_key`](Self::root_key)
+  ///    answers `None`. The handle is retired from the umbrella's perspective the moment the request
+  ///    is made; events still in flight carrying `h` fall to the dead-root drain exactly like any
+  ///    post-retirement event.
+  /// 4. **Idempotent / tolerant.** Releasing an unknown, dead, or already-released handle is a
+  ///    no-op. Release errors are the source's own to absorb/log (there is no result), since a
+  ///    released root's runtime conditions reach the umbrella in-band as events, not out of band
+  ///    here.
+  /// 5. **Eventual release.** A requested release is applied no later than the source's next
+  ///    [`arm`](Self::arm) or its teardown (`Drop`). Between request and application the kernel watch
+  ///    may briefly linger; any events it emits route to nothing (the subsumer entry is gone) —
+  ///    correctness is unaffected.
   ///
-  /// In exchange, a conforming `disarm` **MUST complete in bounded time** — it must not block
-  /// indefinitely. Because the owner runs it to completion rather than racing it, an *unbounded*
-  /// `disarm` wedges the owner on that one call; a *bounded* one upholds the guarantee below.
-  ///
-  /// The resulting **Close-responsiveness** guarantee is precise: internal orphan cleanup (a
-  /// dropped-`watch` grant — Codex R20-F1/R21-F1 — or the send-failure orphan on the same path)
-  /// never blocks [`Close`](crate::Tributaries::close) on source I/O beyond **at most one in-flight
-  /// bounded `disarm`**. The owner services `Close`/commands *between* disarms — it checks the
-  /// mailbox before each and re-checks it after — so a conforming (bounded) source keeps `Close`
-  /// responsive; only a **contract-violating unbounded** `disarm` can delay `Close`, a documented
-  /// violation out of scope for the umbrella to defend against (the same stance the generation-unique
-  /// [`Handle`](Self::Handle) and caller-initiated arm/disarm liveness take: unbounded source I/O is
-  /// the source's bug, not one the single-owner umbrella can `await`-around). Dropping every handle
-  /// never leaves the owner awaiting a disarm before its source is dropped: any still-deferred handles
-  /// are moot at teardown — the dropped owner drops the source, whose own `Drop` releases every watch.
-  ///
-  /// Returns a `Send` future (see the `Send` bounds note on the [trait](Self)).
-  fn disarm(&mut self, handle: Self::Handle) -> impl Future<Output = ()> + Send;
+  /// [`next`](Self::next) keeps its cancellation-safety contract unchanged, and [`arm`](Self::arm)
+  /// keeps its caller-bounded liveness contract unchanged.
+  fn disarm(&mut self, handle: Self::Handle);
 
   /// The next raw change as a [`SourceEvent`], or [`None`] once the source is closed and
   /// drained. Returns a `Send` future so the owner can pump the source's stream from its
@@ -464,6 +462,16 @@ impl<C, H> SourceEvent<C, H> {
 /// raw filesystem event back into a key.
 pub struct FsSource<R: RuntimeLite> {
   watcher: Watcher<R>,
+  /// Roots whose release was requested (via the synchronous [`disarm`](Source::disarm)) but not
+  /// yet applied to the [`Watcher`]. Drained — awaited one by one — at the **top** of
+  /// [`arm`](Source::arm), so release-before-subsequent-arm holds by construction (contract clause
+  /// 2), and moot at `Drop` (the [`Watcher`]'s own teardown releases every live root). Bounded in
+  /// practice by the live-root count: each generation-unique handle is released at most once.
+  pending_releases: VecDeque<RootHandle>,
+  /// Mirror of [`pending_releases`](Self::pending_releases) for O(1)
+  /// [`root_key`](Source::root_key) liveness answers — contract clause 3: a requested release is
+  /// logically dead **immediately**, before the transport teardown is applied.
+  pending_set: HashSet<RootHandle>,
 }
 
 impl<R: RuntimeLite> core::fmt::Debug for FsSource<R> {
@@ -484,6 +492,8 @@ impl<R: RuntimeLite> FsSource<R> {
   pub fn new(options: WatcherOptions) -> Result<Self, BuildError> {
     Ok(Self {
       watcher: Watcher::new(options)?,
+      pending_releases: VecDeque::new(),
+      pending_set: HashSet::new(),
     })
   }
 }
@@ -509,6 +519,17 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, RootHandle>, WatchError> {
+    // Apply every requested-but-not-yet-applied release BEFORE arming, so
+    // release-before-subsequent-arm holds by construction (disarm contract clause 2): a widen or a
+    // re-watch-after-orphan can never race a still-armed root the umbrella already released, so a
+    // conforming source never reports `Overlaps` against an already-released root. Each drained
+    // release is a bounded(16)-channel send + driver ack (`Watcher::unwatch` awaits it); the result
+    // is ignored (release is best-effort). This runs only inside a caller-bounded `watch`, so its
+    // cost is charged to that reconcile, never to `Close`.
+    while let Some(released) = self.pending_releases.pop_front() {
+      let _ = self.watcher.unwatch(released).await;
+      self.pending_set.remove(&released);
+    }
     // Roots are always armed `Interest::all` (design §4): the kernel watch never narrows
     // what it collects, so a covered subscription can ask for any kind and the root
     // already carries it (interest becomes a pure fan-out gate at the umbrella).
@@ -530,11 +551,16 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     Ok(Armed::new(handle, path_components(&path)))
   }
 
-  async fn disarm(&mut self, handle: RootHandle) {
-    // Best-effort: an already-closed watcher or an already-dead root cannot be unwatched,
-    // and the umbrella treats those as in-band conditions, not errors (mirrors the
-    // driver's widen-path disarms).
-    let _ = self.watcher.unwatch(handle).await;
+  fn disarm(&mut self, handle: RootHandle) {
+    // Synchronous, non-blocking release REQUEST (contract clauses 1 & 3). The `Watcher`'s `unwatch`
+    // awaits a bounded(16) command-channel ack, so the actual teardown cannot run inline here; queue
+    // it, to be applied at the next `arm` (drained at its top) or at `Drop` (the `Watcher`'s own
+    // teardown releases every live root). The `pending_set` mirror makes the handle logically dead
+    // the instant this returns — `root_key` answers `None`. Idempotent by the set: re-requesting an
+    // already-pending (or unknown/dead) handle is a no-op.
+    if self.pending_set.insert(handle) {
+      self.pending_releases.push_back(handle);
+    }
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, RootHandle>> {
@@ -543,6 +569,12 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   }
 
   fn root_key(&self, handle: RootHandle) -> Option<Vec<OsString>> {
+    // A requested release is logically dead immediately (contract clause 3), even while its
+    // transport teardown is still queued: answer `None` for a pending handle before consulting the
+    // live registry, so a re-`watch` of a just-released key classifies it as gone.
+    if self.pending_set.contains(&handle) {
+      return None;
+    }
     // `tributary_fs::Watcher::root_path` reads its live-root registry synchronously and
     // answers `None` for a torn-down handle, so a terminal `Rescan` (whose root fs has
     // forgotten) reports `None` here — exactly the dead/retired signal the owner needs.

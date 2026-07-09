@@ -20,7 +20,7 @@
 #![cfg(all(feature = "tokio", not(miri)))]
 
 use std::{
-  collections::HashSet,
+  collections::{HashSet, VecDeque},
   future::Future,
   num::NonZeroUsize,
   path::{Path, PathBuf},
@@ -64,11 +64,23 @@ struct Loc {
 struct IndexerSource<R: RuntimeLite> {
   watcher: Watcher<R>,
   mounts: Vec<(Vec<Comp>, PathBuf)>,
+  /// Roots whose release was requested (via the synchronous `disarm`) but not yet applied to the
+  /// `Watcher` — drained at the top of `arm` (release-before-subsequent-arm by construction), moot at
+  /// `Drop`. Mirrors the fs source's release queue for a caller-supplied source.
+  pending_releases: VecDeque<RootHandle>,
+  /// Mirror of `pending_releases` for O(1) `root_key` liveness answers: a requested release is
+  /// logically dead immediately.
+  pending_set: HashSet<RootHandle>,
 }
 
 impl<R: RuntimeLite> IndexerSource<R> {
   fn new(watcher: Watcher<R>, mounts: Vec<(Vec<Comp>, PathBuf)>) -> Self {
-    Self { watcher, mounts }
+    Self {
+      watcher,
+      mounts,
+      pending_releases: VecDeque::new(),
+      pending_set: HashSet::new(),
+    }
   }
 
   /// The one key → path conversion: the longest mount whose key-prefix begins `key`, with
@@ -119,6 +131,13 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   }
 
   async fn arm(&mut self, key: &[Comp]) -> Result<Armed<Comp, RootHandle>, WatchError> {
+    // Apply every requested-but-not-yet-applied release BEFORE arming (disarm contract clause 2):
+    // release-before-subsequent-arm by construction, so the `Watcher` never reports `Overlaps`
+    // against a root the umbrella already released.
+    while let Some(released) = self.pending_releases.pop_front() {
+      let _ = self.watcher.unwatch(released).await;
+      self.pending_set.remove(&released);
+    }
     // A well-formed watch always resolves under a registered mount; `?`/`From` surfaces a
     // genuine arm failure (`WatchRootError` is `#[non_exhaustive]` — never constructed here).
     let path = self
@@ -135,10 +154,13 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     Ok(Armed::new(handle, canonical_key))
   }
 
-  async fn disarm(&mut self, handle: RootHandle) {
-    // Best-effort, mirroring the fs source: a released root's runtime conditions reach the
-    // umbrella in-band as events, not as an error here.
-    let _ = self.watcher.unwatch(handle).await;
+  fn disarm(&mut self, handle: RootHandle) {
+    // Synchronous, non-blocking release REQUEST (mirroring the fs source): the watcher's `unwatch`
+    // awaits a bounded ack, so queue the teardown (applied at the next `arm` or `Drop`) and mark the
+    // handle logically dead at once. Idempotent by the set.
+    if self.pending_set.insert(handle) {
+      self.pending_releases.push_back(handle);
+    }
   }
 
   async fn next(&mut self) -> Option<SourceEvent<Comp, RootHandle>> {
@@ -166,6 +188,11 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   }
 
   fn root_key(&self, handle: RootHandle) -> Option<Vec<Comp>> {
+    // A requested release is logically dead immediately (disarm contract clause 3), even while its
+    // transport teardown is still queued.
+    if self.pending_set.contains(&handle) {
+      return None;
+    }
     // `root_path` reads the live-root registry synchronously and answers `None` for a
     // torn-down handle, so a terminal `Rescan` reports `None` here — the dead/retired signal
     // `retire_if_dead` classifies on.

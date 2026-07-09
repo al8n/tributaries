@@ -47,23 +47,6 @@ use crate::{
   view::WatchView,
 };
 
-/// Whether two canonical keys **overlap** under the §4 subsumption relationship: one is an
-/// ancestor-or-equal of the other, i.e. one key is a (component-wise) prefix of the other.
-///
-/// `<[C]>::starts_with` is the *same* component-wise ancestor test the subsumption index
-/// ([`get_ancestor`](Radix::get_ancestor)) and the fan-out coverage check
-/// ([`route`](crate::route)) use — so `[a, b]` overlaps `[a, b, c]` but not `[a, bc]` — which is
-/// exactly the disjoint-root relationship a [`Source`](crate::Source) enforces when it rejects an
-/// arm overlapping a live root ([`WatchRootError::Overlaps`](tributary_fs::WatchRootError::Overlaps)).
-/// Sharing the one predicate keeps the umbrella's overlap decision in lock-step with the source's.
-///
-/// The driver's arm choke point uses it to flush ONLY the deferred orphan-disarm a re-`watch`
-/// conflicts with, rather than the whole pending-disarm queue (Codex R22), keeping `Close` bounded
-/// by at most one disarm.
-pub(crate) fn keys_overlap<C: PartialEq>(a: &[C], b: &[C]) -> bool {
-  a.starts_with(b) || b.starts_with(a)
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -241,8 +224,8 @@ pub(crate) enum WatchOutcome<C, H> {
 }
 
 /// The result of [`Subsumer::plan_unwatch`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum UnwatchOutcome<C, H> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnwatchOutcome<H> {
   /// The subscription was removed; its root still serves other subscribers.
   Dropped,
   /// The subscription was its root's last: the driver must release the kernel watch
@@ -250,12 +233,6 @@ pub(crate) enum UnwatchOutcome<C, H> {
   RootEmptied {
     /// The now-empty root handle to release.
     fs_root: H,
-    /// The freed root's **canonical** key — the exact coordinate the subsumer indexed it under.
-    /// The driver carries it onto the deferred-disarm queue so a later overlapping re-`watch` can
-    /// flush ONLY this root's pending disarm ([`keys_overlap`] against the re-`watch` key), keeping
-    /// `Close` bounded by at most one disarm (Codex R22). The caller-`unwatch` path ignores it (it
-    /// disarms inline).
-    root_key: Vec<C>,
   },
 }
 
@@ -666,7 +643,7 @@ where
 
   /// Removes `sub`, reporting whether its root emptied (returns `None` for an unknown
   /// subscription). Mutates immediately and republishes — no commit step is needed.
-  pub(crate) fn plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<C, H>> {
+  pub(crate) fn plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<H>> {
     let record = self.subs.remove(&sub)?;
     let root_key = self
       .by_handle
@@ -693,7 +670,6 @@ where
       self.by_handle.remove(&record.root);
       UnwatchOutcome::RootEmptied {
         fs_root: record.root,
-        root_key,
       }
     } else {
       UnwatchOutcome::Dropped
