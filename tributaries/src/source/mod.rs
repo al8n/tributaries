@@ -321,6 +321,17 @@ pub trait Source<C> {
   /// 5. **Purely an optimization.** Correctness MUST NEVER depend on shrink. It reclaims budget (kernel
   ///    watch descriptors); it changes no delivery. The umbrella keys, fans out, and attributes
   ///    identically whether or not any shrink is ever applied.
+  /// 6. **Freshness by re-issue (the umbrella's guarantee, a queueing source's obligation).** A
+  ///    `Covered` commit changes a root's membership **without** any `Source` call (it arms nothing),
+  ///    so the umbrella RE-ISSUES this request with the recomputed retained cover on **every** such
+  ///    membership change. A source that QUEUES shrinks (rather than applying them inline) MUST
+  ///    therefore apply the **LATEST** request per handle and **never** an older snapshot: a stale
+  ///    queued cover, applied after a newcomer was covered under the root, would prune coverage that
+  ///    newcomer needs — and, because shrink emits no `Rescan` (clause 2), that loss would be silent. A
+  ///    re-issued `retained` that includes the root's **own** key retains the whole root (its
+  ///    strictly-outside set is empty), so it **cancels** any queued shrink for that handle — the
+  ///    umbrella's cancel-equivalent, sent when a subscriber re-pins the root at its own key. This
+  ///    obligation is vacuous for an inline (non-queueing) or no-op source.
   ///
   /// The **default is a no-op**, so an implementor opts in only if it can reclaim coverage below a
   /// root (a per-directory descending backend). A whole-subtree source (one stream / one recursive
@@ -579,8 +590,12 @@ pub struct FsSource<R: RuntimeLite> {
   /// root down anyway) merely leaves the root briefly over-broad. **Superseded by release**: a shrink
   /// for a handle whose [`disarm`](Source::disarm) was requested is moot (the whole root is going
   /// away), so [`disarm`](Source::disarm) drops any queued shrink for its handle and
-  /// [`shrink`](Source::shrink) refuses to queue one for a pending-release handle. At most one entry
-  /// per handle: a newer shrink for a handle replaces its older queued cover.
+  /// [`shrink`](Source::shrink) refuses to queue one for a pending-release handle. **At most one entry
+  /// per handle (LATEST-WINS)**: a newer shrink for a handle replaces its older queued cover, so the
+  /// umbrella's freshness re-issue on a `Covered` commit (contract clause 6, Codex R35) is applied —
+  /// never an older snapshot. A re-issued cover that includes the root's OWN registry path is the
+  /// **cancel-equivalent**: it drops any queued entry for the handle and queues nothing (there is
+  /// nothing strictly outside the root to reclaim).
   pending_shrinks: VecDeque<(RootHandle, Vec<PathBuf>)>,
 }
 
@@ -775,17 +790,35 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     // awaits a bounded ack, so the prune cannot run inline here — and forward it at a subsequent
     // `arm` (opportunistically, bounded) or drop it at `Drop`. A shrink for a handle whose release was
     // already requested is superseded by that release (clause 4): the `pending_set` mirror makes the
-    // handle logically dead, so skip it. Rebuild each retained key into its canonical path — the
-    // coordinate `Watcher::shrink` prunes against — captured now, while the root is still live.
+    // handle logically dead, so skip it.
     if self.pending_set.contains(&handle) {
       return;
     }
-    let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
-    // At most one queued shrink per handle: a newer cover supersedes an older one (drop any prior
-    // entry for this handle before pushing the latest).
+    // LATEST-WINS per handle (contract clause 6): drop any older queued cover for this handle FIRST, so
+    // a re-issued fresh cover always REPLACES the stale snapshot rather than trailing behind it. The
+    // umbrella re-issues the current retained cover on every membership change that runs no `Source`
+    // call — a `Covered` commit (design §5, Codex R35) — relying on the source to apply the LATEST
+    // request per handle and never an older one; this drop is where that guarantee is honored.
     self
       .pending_shrinks
       .retain(|(pending, _)| *pending != handle);
+    // Rebuild each retained key into its canonical path — the coordinate `Watcher::shrink` prunes
+    // against — captured now, while the root is still live.
+    let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
+    // CANCEL-on-root-cover (contract clause 6): a retained cover that includes the root's OWN registry
+    // path retains everything under the root, so the strictly-outside set is empty — there is nothing
+    // to reclaim. This is the umbrella's cancel-equivalent re-issue (a `Covered` commit whose newcomer
+    // re-pins the root at its own key): having dropped any older entry above, queue NOTHING, so a stale
+    // narrower snapshot can never later prune coverage the root now legitimately holds again (Codex
+    // R35). A dead/forgotten root (`root_path` → `None`) cannot be root-covered here; its shrink is a
+    // no-op at the watcher anyway, so fall through and let the queue drain/drop it.
+    if let Some(root_path) = self.watcher.root_path(handle)
+      && paths
+        .iter()
+        .any(|path| path.as_path() == root_path.as_path())
+    {
+      return;
+    }
     self.pending_shrinks.push_back((handle, paths));
   }
 
