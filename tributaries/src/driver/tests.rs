@@ -2609,6 +2609,103 @@ async fn source_drain_close_interrupt_still_runs_a_final_owed_pass() {
   );
 }
 
+/// Codex R29-F3 regression — a close that INTERRUPTS the source drain must LINEARIZE any
+/// grant-resolution already queued at close time BEFORE its final owed pass, so a subscription the
+/// caller claimed (its [`ClaimGrant`](super::Command::ClaimGrant) queued, possibly behind a few flood
+/// commands) has its [`unclaimed`](super::Owner::unclaimed) suppression lifted and its genuinely-owed
+/// parked Rescan delivered — rather than the final pass reading STALE `unclaimed` state, suppressing
+/// the claimed debt, and tearing down (suppression become permanent loss). `run`'s tail runs
+/// [`linearize_queued_teardown_commands`](super::Owner::linearize_queued_teardown_commands) — a
+/// snapshot-bounded FIFO pre-drain of exactly the observably-queued commands — before the interrupt
+/// path's `drain_owed_once`; this test drives that exact sequence (drain → `Some(reply)` → linearize →
+/// final pass → ack).
+///
+/// Fail-on-old: without the linearize the queued `ClaimGrant` is never processed before the final
+/// pass, so the sub stays `unclaimed`, its parked Rescan is suppressed, and the assertion that the
+/// final pass delivered it flips.
+#[tokio::test]
+async fn source_drain_close_interrupt_linearizes_queued_claim_before_final_pass() {
+  let mut h = Harness::new(); // unbounded event channel — has capacity for the owed Rescan
+  // An UNCLAIMED sub (its grant still in flight) with parked overflow debt: `flush_pending_rescans`
+  // SUPPRESSES it while unclaimed, so a plain final pass would withhold it.
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  h.owner.unclaimed.insert(sub);
+  for raw in 0..2 {
+    h.owner.epochs.stamp(sub, Epoch::new(raw));
+  }
+  h.owner.park_rescan(sub);
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the unclaimed sub's overflow Rescan is parked (suppressed while unclaimed)"
+  );
+
+  // The caller CLAIMS the grant — its `ClaimGrant` is enqueued BEHIND a few flood commands (each a
+  // fail-fast `Watch` the teardown handler answers `Closed`), all queued BEFORE the close. The
+  // snapshot pre-drain must reach the claim past the flood (every snapshot command is processed FIFO).
+  for i in 0..3u8 {
+    let (reply, _resp) = futures_channel::oneshot::channel();
+    h._commands
+      .try_send(super::Command::Watch {
+        key: key(&format!("/flood{i}")),
+        value: (),
+        interest: Interest::all(),
+        filter: Filter::all(),
+        reply,
+      })
+      .expect("enqueue a flood command ahead of the claim");
+  }
+  h._commands
+    .try_send(super::Command::ClaimGrant(sub))
+    .expect("enqueue the ClaimGrant behind the flood");
+
+  // A close is queued on the dedicated signal BEFORE the drain runs, so the drain returns it at its
+  // top-priority `try_recv` WITHOUT running any pass or servicing any command.
+  let (reply, response) = futures_channel::oneshot::channel();
+  h.closes
+    .try_send(reply)
+    .expect("send the close on the dedicated signal");
+  let interrupted = h.owner.drain_owed_before_shutdown().await;
+  let close_reply = interrupted.expect("the queued close interrupted the drain and is surfaced");
+  assert!(
+    h.owner.unclaimed.contains(&sub) && h.owner.needs_rescan.contains_key(&sub),
+    "the drain returned before processing the queued ClaimGrant — the debt is still suppressed"
+  );
+  assert!(
+    h.drain().is_empty(),
+    "…and nothing was delivered yet (a bare final pass here would suppress the unclaimed debt)"
+  );
+
+  // `run`'s tail on a drain-interrupt: FIRST linearize the queued grant-resolution (the flood then the
+  // ClaimGrant), lifting the sub's suppression, THEN one final owed pass.
+  h.owner.linearize_queued_teardown_commands();
+  assert!(
+    !h.owner.unclaimed.contains(&sub),
+    "the snapshot pre-drain processed the ClaimGrant behind the flood — suppression lifted"
+  );
+  h.owner.drain_owed_once();
+
+  // The final pass delivered the now-owed Rescan BEFORE the ack is sent (mirroring `run`'s tail order:
+  // drain_owed_once → publish_empty → reply.send). Assert it is observable now, THEN ack.
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == sub && e.is_rescan()),
+    "the claimed sub's parked Rescan is delivered by the final pass, before the ack (Codex R29-F3)"
+  );
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the owed debt is resolved, not stranded by stale suppression state"
+  );
+
+  // Ack exactly as `run` does; the close() caller then completes.
+  close_reply.send(Ok(())).expect("ack the close");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "close() completes once the interrupted drain acked its close"
+  );
+}
+
 /// Close-responsive source drain (design source doc, invariant II): during source-drain teardown a
 /// queued [`DropOrphan`](super::Command::DropOrphan) is released through the synchronous
 /// [`release_subscription`](super::Owner::release_subscription) — it purges the orphan's owner-local

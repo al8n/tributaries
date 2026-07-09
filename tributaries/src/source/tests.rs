@@ -70,7 +70,7 @@ mod integration {
   use tempfile::TempDir;
   use tributary_fs::{RootHandle, WatcherOptions};
 
-  use super::super::{FsSource, Source, SourceEvent, key_to_path};
+  use super::super::{FsSource, OPPORTUNISTIC_RELEASES, Source, SourceEvent, key_to_path};
   use crate::event::path_components;
 
   /// Generous ceiling for one expected observation; CI runners are slow and FSEvents
@@ -159,10 +159,13 @@ mod integration {
 
   /// The synchronous release queue (design source doc §2.4): `disarm` is a fire-and-forget REQUEST
   /// that returns at once (its transport teardown queued), the freed handle is logically dead
-  /// immediately (`root_key` → None, contract clause 3), and the queued release is drained at the TOP
-  /// of the next `arm` — so re-arming the SAME (overlapping) key succeeds with no
-  /// [`Overlaps`](tributary_fs::WatchRootError::Overlaps), release-before-subsequent-arm by
-  /// construction (contract clause 2).
+  /// immediately (`root_key` → None, contract clause 3), and the queued release is applied by a later
+  /// `arm` — so re-arming the SAME key succeeds with no
+  /// [`Overlaps`](tributary_fs::WatchRootError::Overlaps) surfaced (contract clause 2). Here the single
+  /// queued release is the oldest, so the re-arm's OPPORTUNISTIC bounded application tears it down
+  /// before the watch (had it been deeper in the queue, the conflict-triggered retry would resolve the
+  /// watcher's own `Overlaps` rejection instead — Codex R29); either way no `Overlaps` reaches the
+  /// caller.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn fs_source_disarm_queues_release_drained_at_next_arm() {
     let (_dir, root) = scratch();
@@ -186,12 +189,13 @@ mod integration {
       "the released handle is logically dead immediately (contract clause 3)"
     );
 
-    // Re-arm the SAME key. Its queued release is drained at the TOP of `arm` BEFORE the new watch, so
-    // the real `Watcher` never reports `Overlaps` against the just-released root (contract clause 2).
+    // Re-arm the SAME key. Its queued release (the oldest) is applied by `arm`'s opportunistic bounded
+    // application BEFORE the new watch, so the real `Watcher` never surfaces `Overlaps` against the
+    // just-released root (contract clause 2, Codex R29).
     let second = source
       .arm(&root_key)
       .await
-      .expect("re-arm of the same key succeeds — the pending release drained before the watch");
+      .expect("re-arm of the same key succeeds — the pending release applied before the watch");
     assert_ne!(
       first.handle(),
       second.handle(),
@@ -229,91 +233,87 @@ mod integration {
     );
   }
 
-  /// R28-F1: the pre-arm release drain is scoped to the OVERLAPPING subset, so an arm of a DISJOINT
-  /// key applies **none** of the backlog — decoupling a caller-bounded `Watch` (and any `close`
-  /// queued behind it) from the whole release cleanup (contract clause 2). Disarm root `a`, then arm
-  /// a disjoint sibling `b`: `a`'s release is NOT applied (it does not overlap `b`), so it stays
-  /// queued and its kernel watch was never unwatched by the `b` arm; a later re-arm of `a`'s OWN
-  /// (overlapping) key finally drains it.
+  /// R29-F1: a DISJOINT arm's release work is HARD-BOUNDED — it applies at most
+  /// [`OPPORTUNISTIC_RELEASES`] of the OLDEST queued releases up front (FIFO), never the whole backlog,
+  /// so a caller-bounded `Watch` (and any `close` queued behind it) is decoupled from the release
+  /// cleanup (contract clause 2). Queue three disjoint releases A, B, C (in that order), then arm a
+  /// disjoint D: exactly the two OLDEST (A, B) are applied opportunistically — C stays queued — and D
+  /// arms with no overlap and no retry.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn fs_source_arm_drains_only_the_overlapping_release() {
+  async fn fs_source_disjoint_arm_applies_at_most_the_opportunistic_oldest() {
+    // The FIFO-order assertion below is meaningful only if exactly two of three are applied.
+    assert_eq!(
+      OPPORTUNISTIC_RELEASES, 2,
+      "this test is written for a bound of 2"
+    );
     let (_dir, parent) = scratch();
-    let a = parent.join("a");
-    let b = parent.join("b");
-    std::fs::create_dir_all(&a).expect("create a");
-    std::fs::create_dir_all(&b).expect("create b");
-    let a_key = path_components(&a);
-    let b_key = path_components(&b);
-
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
-    // Arm A, then disarm it → its release is QUEUED (transport teardown pending, root logically dead).
-    let armed_a = source.arm(&a_key).await.expect("arm A");
-    source.disarm(armed_a.handle());
+    // Arm three disjoint siblings A, B, C — all FIRST, before any disarm, so each arm's opportunistic
+    // application pops from an empty queue and the backlog is not drained as it is built.
+    let mut handles = Vec::new();
+    for name in ["a", "b", "c"] {
+      let sub = parent.join(name);
+      std::fs::create_dir_all(&sub).expect("create subroot");
+      let armed = source
+        .arm(&path_components(&sub))
+        .await
+        .expect("arm subroot");
+      handles.push(armed.handle());
+    }
+    // THEN disarm all three in order → queue [A, B, C] (A oldest).
+    for &handle in &handles {
+      source.disarm(handle);
+    }
     assert_eq!(
-      source.root_key(armed_a.handle()),
-      None,
-      "A is logically dead immediately (contract clause 3)"
+      source.pending_releases.len(),
+      3,
+      "three disjoint releases are queued"
     );
-    assert_eq!(source.pending_releases.len(), 1, "A's release is queued");
 
-    // Arm a DISJOINT sibling B. A's queued release does not overlap B, so the drain applies ZERO
-    // releases: B arms WITHOUT awaiting A's unwatch, and A's release stays queued — the R28
-    // decoupling (this arm, and a close behind its Watch, never wait on A's cleanup).
-    let armed_b = source.arm(&b_key).await.expect("arm disjoint B");
-    assert_eq!(
-      source.root_key(armed_b.handle()),
-      Some(b_key.clone()),
-      "the disjoint B armed and is live"
-    );
+    // Arm a disjoint D: the opportunistic bounded application unwatches the two OLDEST (A, B) up front;
+    // D overlaps none of the live roots, so it arms first try with no retry. C — the newest — is left
+    // queued (beyond the opportunistic bound).
+    let d = parent.join("d");
+    std::fs::create_dir_all(&d).expect("create d");
+    let d_key = path_components(&d);
+    let armed_d = source.arm(&d_key).await.expect("arm disjoint D");
     assert_eq!(
       source.pending_releases.len(),
       1,
-      "the disjoint arm applied NONE of A's release — it stays queued (R28 decoupling)"
+      "the disjoint arm applied at most the 2 opportunistic oldest (A, B); C stays queued"
     );
     assert!(
-      source.pending_set.contains(&armed_a.handle()),
-      "A's release is still pending — the disjoint B arm did not unwatch it"
-    );
-
-    // Re-arm A's OWN key: now the queued release OVERLAPS (equal key), so it drains first (A's kernel
-    // watch is unwatched) and the re-arm succeeds with no `Overlaps`, minting a fresh handle.
-    let rearm_a = source
-      .arm(&a_key)
-      .await
-      .expect("re-arm A drains its overlapping release first, then arms with no Overlaps");
-    assert_ne!(
-      armed_a.handle(),
-      rearm_a.handle(),
-      "the re-arm mints a fresh generation-unique handle"
+      !source.pending_set.contains(&handles[0]) && !source.pending_set.contains(&handles[1]),
+      "the two OLDEST releases (A, B) were the ones applied — FIFO"
     );
     assert!(
-      source.pending_releases.is_empty(),
-      "A's overlapping release was applied by the A re-arm"
-    );
-    assert!(
-      !source.pending_set.contains(&armed_a.handle()),
-      "A's pending flag cleared once its overlapping re-arm drained it"
+      source.pending_set.contains(&handles[2]),
+      "the newest release (C) is beyond the opportunistic bound and stays queued"
     );
     assert_eq!(
-      source.root_key(rearm_a.handle()),
-      Some(a_key.clone()),
-      "the re-armed A is live"
+      source.root_key(armed_d.handle()),
+      Some(d_key),
+      "the disjoint D armed and is live"
     );
   }
 
-  /// R28-F1 shape regression: an arm's release work does not scale with the backlog depth. Queue
+  /// R29-F1/F2 shape regression: an arm's release work does not scale with the backlog depth. Queue
   /// **many** disjoint releases (watch+disarm N disjoint subroots), then arm ANOTHER disjoint key and
-  /// assert it applies **zero** of the backlog (pending count unchanged) — so a `close` queued behind
-  /// that `Watch` is decoupled from the whole cleanup (the close-latency itself is covered by the
-  /// M2-A flood regressions). The old whole-backlog drain would have awaited N unwatches here.
+  /// assert it applies **at most the opportunistic bound** (pending stays ≥ N − bound) — so a `close`
+  /// queued behind that `Watch` is decoupled from the whole cleanup. The old whole-backlog drain would
+  /// have awaited N unwatches here; the bounded application awaits at most
+  /// [`OPPORTUNISTIC_RELEASES`].
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn fs_source_disjoint_arm_cost_is_independent_of_release_backlog() {
     const N: usize = 32;
     let (_dir, parent) = scratch();
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
-    // Build a backlog of N queued releases over N disjoint sibling subroots.
+    // Build a backlog of N queued releases over N disjoint sibling subroots. Arm all N FIRST, then
+    // disarm all N — otherwise each arm's opportunistic application would drain the previous disarm and
+    // the backlog would never accumulate.
+    let mut handles = Vec::new();
     for i in 0..N {
       let sub = parent.join(format!("r{i}"));
       std::fs::create_dir_all(&sub).expect("create subroot");
@@ -321,7 +321,10 @@ mod integration {
         .arm(&path_components(&sub))
         .await
         .expect("arm subroot");
-      source.disarm(armed.handle());
+      handles.push(armed.handle());
+    }
+    for &handle in &handles {
+      source.disarm(handle);
     }
     assert_eq!(
       source.pending_releases.len(),
@@ -329,8 +332,8 @@ mod integration {
       "N disjoint releases are queued"
     );
 
-    // Arm one MORE disjoint subroot: it overlaps none of the backlog, so the drain applies nothing —
-    // the arm's release work is independent of the backlog depth (R28).
+    // Arm one MORE disjoint subroot: it overlaps none of the backlog, so it applies only the ≤ bound
+    // opportunistic oldest — the arm's release work is independent of the backlog depth (R29).
     let other = parent.join("other");
     std::fs::create_dir_all(&other).expect("create other");
     let other_key = path_components(&other);
@@ -338,16 +341,86 @@ mod integration {
       .arm(&other_key)
       .await
       .expect("arm the extra disjoint subroot");
-    assert_eq!(
-      source.pending_releases.len(),
-      N,
-      "the disjoint arm applied ZERO of the N queued releases — arm cost is independent of backlog \
-       depth (R28), so a close behind that Watch is decoupled"
+    let remaining = source.pending_releases.len();
+    assert!(
+      remaining >= N - OPPORTUNISTIC_RELEASES,
+      "the disjoint arm applied at most OPPORTUNISTIC_RELEASES of the N queued (pending {remaining} ≥ \
+       {}) — arm cost is independent of backlog depth (R29), so a close behind that Watch is decoupled",
+      N - OPPORTUNISTIC_RELEASES
     );
     assert_eq!(
       source.root_key(armed.handle()),
       Some(other_key),
       "the extra disjoint subroot armed and is live"
+    );
+  }
+
+  /// R29-F1 (i): an ancestor arm over N released-but-lingering descendants succeeds via the
+  /// conflict-triggered retry — no [`Overlaps`](tributary_fs::WatchRootError::Overlaps) reaches the
+  /// caller. Watch+disarm N=8 disjoint tempdir SUBDIRS, then watch their PARENT: the parent overlaps
+  /// every still-lingering descendant, so the watcher rejects with `Overlaps` NAMING one at a time;
+  /// each retry unwatches exactly the named descendant and re-attempts, until the parent arms cleanly
+  /// (contract clause 2). Asserts the parent is live (no overlap surfaced — the awaited work was
+  /// bounded by the conflicts actually named), the whole descendant backlog was applied, and the armed
+  /// parent genuinely delivers.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_ancestor_arm_over_many_released_descendants_succeeds() {
+    const N: usize = 8;
+    let (_dir, parent) = scratch();
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    // Arm N disjoint descendants under `parent` — all FIRST — then disarm all N (the dirs stay on disk,
+    // only the watches are released, so they linger as kernel watches until applied). Arming all before
+    // disarming keeps each arm's opportunistic application from draining the backlog as it is built.
+    let mut handles = Vec::new();
+    for i in 0..N {
+      let sub = parent.join(format!("d{i}"));
+      std::fs::create_dir_all(&sub).expect("create descendant");
+      let armed = source
+        .arm(&path_components(&sub))
+        .await
+        .expect("arm descendant");
+      handles.push(armed.handle());
+    }
+    for &handle in &handles {
+      source.disarm(handle);
+    }
+    assert_eq!(
+      source.pending_releases.len(),
+      N,
+      "N descendant releases are queued"
+    );
+
+    // Arm the PARENT (an ancestor of all N). It overlaps every still-lingering descendant; the watcher
+    // names each conflict and the conflict-triggered retry unwatches exactly it and re-attempts — so
+    // the parent arms with NO `Overlaps` surfaced to the caller (contract clause 2, Codex R29).
+    let parent_key = path_components(&parent);
+    let armed = source.arm(&parent_key).await.expect(
+      "the ancestor arm resolves each named descendant conflict and succeeds — no Overlaps",
+    );
+    assert_eq!(
+      source.root_key(armed.handle()),
+      Some(parent_key),
+      "the parent armed and is live"
+    );
+    assert!(
+      source.pending_releases.is_empty() && source.pending_set.is_empty(),
+      "every released descendant was applied (opportunistically or by the retry) — nothing left pending"
+    );
+
+    // The armed parent genuinely delivers: a change under one of the (now folded) descendant dirs
+    // surfaces for the parent's handle, proving the fresh recursive watch is live.
+    let file = parent.join("d0").join("after.txt");
+    std::fs::write(&file, b"hi").expect("write probe under the parent");
+    let observed = wait_for(&mut source, DEADLINE, |event| {
+      event.handle() == armed.handle() && key_to_path(event.key()) == file
+    })
+    .await
+    .expect("the armed parent delivers a change under it");
+    assert!(
+      observed.kind().is_created() || observed.kind().is_modified(),
+      "a fresh file surfaces as a create or modify, got {:?}",
+      observed.kind()
     );
   }
 }
