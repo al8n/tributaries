@@ -444,6 +444,109 @@ fn over_broad_antichain_collapses_nested_survivors() {
   }
 }
 
+/// M2-B freshness re-issue (Codex R35): `retained_cover_for` recomputes a root's retained cover from
+/// its CURRENT live membership — the query the driver re-issues on every Covered commit to keep a
+/// queued shrink fresh. A subscriber still pinning the root at its own key reports `None` (the driver
+/// re-issues the cancel-equivalent for it); once that pinning subscriber departs, the over-broad root
+/// reports the survivor antichain; an unknown handle reports `None`.
+#[test]
+fn retained_cover_for_tracks_current_membership() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  let (_rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
+  // Widen /a over both disjoint roots: the wide root serves /a/b, /a/c, and its own /a watch.
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_a = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+
+  // The /a subscriber still pins the wide root at its own key → not over-broad → None.
+  assert_eq!(
+    s.retained_cover_for(wide),
+    None,
+    "a subscriber at the root key pins it — not over-broad, so the re-issue is the cancel-equivalent"
+  );
+
+  // Drop the /a subscriber: the wide root now serves only the narrower /a/b, /a/c → over-broad.
+  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  assert_eq!(
+    s.retained_cover_for(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the recomputed cover is the CURRENT survivor antichain"
+  );
+
+  // An unknown handle names no live root → nothing to reclaim.
+  assert_eq!(
+    s.retained_cover_for(9999),
+    None,
+    "an unknown handle has no cover"
+  );
+}
+
+/// `retained_cover_for` collapses nested survivors to the minimal antichain, exactly as the unwatch
+/// detection does: /a/b and its covered /a/b/c reduce to the single cover /a/b.
+#[test]
+fn retained_cover_for_collapses_nested_survivors() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  let (_rbc, _s_bc) = watch(&mut s, &mut h, "/a/b/c", Interest::all()); // Covered by /a/b.
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_a = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+
+  assert_eq!(
+    s.retained_cover_for(wide),
+    Some(vec![key("/a/b")]),
+    "nested survivors /a/b and /a/b/c collapse to the single cover /a/b"
+  );
+}
+
+/// The R35 core: a Covered watch under an already-over-broad root JOINS the recomputed cover, so the
+/// driver's re-issue reflects the newcomer — never a stale pre-newcomer snapshot. Over-broad /a serves
+/// only /a/b; watching /a/c (Covered, sharing the wide handle) grows the cover to {/a/b, /a/c}.
+#[test]
+fn retained_cover_for_includes_a_newly_covered_subscriber() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  // Make /a over-broad, serving only /a/b: widen /a over /a/b, then drop the /a sub.
+  let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_a = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  assert_eq!(
+    s.retained_cover_for(wide),
+    Some(vec![key("/a/b")]),
+    "before the covered newcomer, the cover is just the /a/b survivor"
+  );
+
+  // Watch /a/c: Covered under the still-live wide /a (arms nothing), sharing the wide handle.
+  let (rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
+  assert_eq!(rc, wide, "the covered /a/c rides the wide root");
+  assert_eq!(
+    s.retained_cover_for(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the covered /a/c JOINS the recomputed cover — the fresh membership, not the stale {{/a/b}} (R35)"
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Property tests: invariants over any random watch/unwatch sequence.
 // ---------------------------------------------------------------------------

@@ -766,6 +766,46 @@ where
     Some((root_handle, antichain(survivor_keys)))
   }
 
+  /// The retained cover the source may shrink the root `handle` down to, recomputed from the root's
+  /// **current** live membership — or `None` when the root is not over-broad (a live subscriber's key
+  /// still equals the root's own key, legitimately pinning the whole coverage).
+  ///
+  /// Unlike [`detect_shrink`](Self::detect_shrink) — which decides over-broadness from a *departing*
+  /// key on an unwatch — this is a pure membership query the driver re-issues on every **Covered**
+  /// commit: a `Covered` watch changes a root's subscriber set **without** any [`Source`] call (it arms
+  /// nothing), so the umbrella recomputes and re-forwards the current cover to keep any shrink the
+  /// source has already queued for this root **fresh** (Codex R35 — a stale queued cover, applied after
+  /// a newcomer was covered under the root, would prune the newcomer's coverage with no `Rescan` to
+  /// signal it). `Some` is the minimal prefix-free [`antichain`] of every live subscriber's key (the
+  /// narrowest set under which they all still sit); `None` means a subscriber now pins the root at its
+  /// own key, so the driver re-issues the **cancel-equivalent** instead (the root's own key, whose
+  /// strictly-outside set is empty — superseding any stale queued snapshot). A handle naming no live
+  /// root is `None` (nothing to reclaim).
+  pub(crate) fn retained_cover_for(&self, handle: H) -> Option<Vec<Vec<C>>> {
+    let root_key = self.by_handle.get(&handle)?;
+    let record = self.index.get(root_key)?;
+    let subscriber_keys: Vec<Vec<C>> = record
+      .subscribers
+      .iter()
+      .map(|s| {
+        self
+          .subs
+          .get(s)
+          .map(|sub_record| sub_record.key.clone())
+          .expect("a live root's subscriber is live in the side table")
+      })
+      .collect();
+    // A subscriber still at the root key keeps the whole coverage legitimately watched — not
+    // over-broad, so nothing may be reclaimed; the driver re-issues the cancel-equivalent instead.
+    if subscriber_keys
+      .iter()
+      .any(|key| key.as_slice() == root_key.as_slice())
+    {
+      return None;
+    }
+    Some(antichain(subscriber_keys))
+  }
+
   /// The live record for `fs_root`, if any.
   pub(crate) fn entry(&self, fs_root: H) -> Option<&RootRecord<C, H>> {
     let key = self.by_handle.get(&fs_root)?;

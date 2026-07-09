@@ -1253,6 +1253,30 @@ where
         let (fs_root, sub) = (*fs_root, *sub);
         self.subsumer.commit_watch(&outcome, fs_root, key);
         self.filters.insert(sub, filter);
+        // A `Covered` commit changes the covering root's membership WITHOUT any [`Source`] call (it
+        // arms nothing), so a shrink the umbrella has already queued for this root at the source can go
+        // stale — its retained snapshot predates this newcomer. Left unrefreshed, that queued cover
+        // would later prune the coverage this newcomer needs, SILENTLY (a shrink emits no `Rescan` by
+        // contract — Codex R35). So re-issue the CURRENT retained cover, relying on the source to apply
+        // the LATEST request per handle and never an older one: `Some` is the freshened antichain of
+        // all live subscribers' keys; `None` means a subscriber now pins the root at its own key, so we
+        // re-issue the CANCEL-equivalent — retaining the root's OWN key, whose strictly-outside set is
+        // empty, which cancels any pending shrink. Only `Covered` needs this re-issue: `Widen` releases
+        // the old handle, so its pending shrink is dropped by supersede-by-release; `Disjoint` mints a
+        // fresh root, so nothing is pending. Like `disarm`/`shrink` everywhere, this is synchronous
+        // fire-and-forget — a no-op source conforms (over-broadness is self-healing).
+        match self.subsumer.retained_cover_for(fs_root) {
+          Some(cover) => self.source.shrink(fs_root, &cover),
+          None => {
+            if let Some(root_key) = self
+              .subsumer
+              .entry(fs_root)
+              .map(|record| record.key.clone())
+            {
+              self.source.shrink(fs_root, &[root_key]);
+            }
+          }
+        }
         Ok(sub)
       }
       WatchOutcome::Disjoint { sub, .. } => {

@@ -426,8 +426,17 @@ async fn overlapping_watch_issues_one_arm() {
     1,
     "two overlapping subscriptions collapse to exactly one arm"
   );
+  // Only /a is ARMED. The covered /a/b commit re-issues a (cancel-equivalent) shrink to keep any
+  // queued snapshot fresh (Codex R35), never a second arm — so filter to the arms.
+  let arms: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Arm(_)))
+    .collect();
   assert_eq!(
-    h.owner.source.calls(),
+    arms,
     vec![Call::Arm(PathBuf::from("/a"))],
     "only the covering root /a is armed"
   );
@@ -668,14 +677,16 @@ async fn over_broad_unwatch_shrinks_root_in_place() {
     .map(|(_, handle)| handle)
     .expect("the wide /a root is live");
 
-  // Baseline: the widen disarmed the subsumed /a/b root and armed /a — no shrink yet.
+  // Baseline: the widen disarmed the subsumed /a/b root and armed /a — no shrink of the WIDE root
+  // yet. (The covered /a/b/c commit re-issued a shrink for the NARROW /a/b root, handle 1, not this
+  // wide one — Codex R35 freshness re-issue.)
   assert!(
     !h.owner
       .source
       .calls()
       .iter()
-      .any(|c| matches!(c, Call::Shrink(..))),
-    "no shrink before the over-broadening unwatch"
+      .any(|c| matches!(c, Call::Shrink(handle, _) if *handle == wide)),
+    "no shrink of the wide root before the over-broadening unwatch"
   );
 
   h.unwatch(s_a).expect("unwatch the widening /a");
@@ -685,12 +696,13 @@ async fn over_broad_unwatch_shrinks_root_in_place() {
     .source
     .calls()
     .into_iter()
-    .filter(|c| matches!(c, Call::Shrink(..)))
+    .filter(|c| matches!(c, Call::Shrink(handle, _) if *handle == wide))
     .collect();
   assert_eq!(
     shrinks,
     vec![Call::Shrink(wide, vec![key("/a/b")])],
-    "exactly one shrink to the nested-survivor antichain /a/b (not the raw {{/a/b, /a/b/c}})"
+    "exactly one shrink of the wide root to the nested-survivor antichain /a/b (not the raw \
+     {{/a/b, /a/b/c}})"
   );
   // The over-broad root is reclaimed in place, never released: no disarm of the wide handle.
   assert!(
@@ -716,16 +728,30 @@ async fn narrow_unwatch_does_not_shrink() {
     .await
     .expect("watch /a/b covered");
 
+  // The covered /a/b commit re-issues a cancel-equivalent shrink for the still-pinned root (Codex
+  // R35); snapshot the shrink calls so far, so we can assert the UNWATCH below adds none of its own.
+  let shrinks_before: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Shrink(..)))
+    .collect();
+
   // Drop the narrower /a/b: the root /a is still watched by its own /a subscriber — not over-broad.
   h.unwatch(s_b).expect("unwatch /a/b");
 
-  assert!(
-    !h.owner
-      .source
-      .calls()
-      .iter()
-      .any(|c| matches!(c, Call::Shrink(..))),
-    "a narrower drop widens no gap — the root is not over-broad, so no shrink fires"
+  let shrinks_after: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Shrink(..)))
+    .collect();
+  assert_eq!(
+    shrinks_before, shrinks_after,
+    "a narrower drop widens no gap — the root stays pinned by its own /a subscriber, so the unwatch \
+     fires no shrink"
   );
 }
 
@@ -765,6 +791,88 @@ async fn over_broad_droporphan_also_shrinks() {
     shrinks,
     vec![Call::Shrink(wide, vec![key("/a/b")])],
     "the orphan release shrinks the over-broad root too (uniform sync call-site)"
+  );
+}
+
+/// R35 freshness re-issue: a queued shrink's retained cover is RE-ISSUED on every Covered commit, so a
+/// pending snapshot can never go stale under a still-live root. Wide /a over survivor /a/b: unwatching
+/// the widening /a shrinks to {/a/b}; a later `watch /a/c` (Covered, no arm) re-issues the FRESH
+/// {/a/b, /a/c} cover — never leaving the stale {/a/b} that a later arm would apply, pruning /a/c's
+/// coverage while the subsumer advertises it live (the R35 silent loss); and a final `watch /a`
+/// (Covered, key == root) re-issues the cancel-equivalent {/a}, retaining the whole root so nothing is
+/// reclaimed. Each is a distinct forwarded `source.shrink` — the source's LATEST-WINS discipline makes
+/// the last one per handle the one actually applied.
+///
+/// Fail-on-old: without the Covered-commit re-issue, only the first shrink ({/a/b}) is ever sent; the
+/// covered /a/c never refreshes it, so the queued {/a/b} applies and silently drops /a/c.
+#[tokio::test]
+async fn covered_commit_reissues_fresh_retained_cover() {
+  let mut h = Harness::new();
+
+  // Wide /a over a disjoint survivor /a/b (a widen, so /a/b is NOT a covered commit — no re-issue
+  // until the covered watches below).
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+
+  // Nothing shrunk the wide root yet (the widen re-issues nothing).
+  assert!(
+    !h.owner
+      .source
+      .calls()
+      .iter()
+      .any(|c| matches!(c, Call::Shrink(handle, _) if *handle == wide)),
+    "no shrink of the wide root before any over-broadening drop or covered commit"
+  );
+
+  // (1) Unwatch the widening /a → over-broad → shrink to the {/a/b} survivor cover.
+  h.unwatch(s_a).expect("unwatch the widening /a");
+  // (2) watch /a/c, Covered under the still-live wide /a (arms nothing) → re-issue the FRESH
+  //     {/a/b, /a/c} cover so the queued shrink never trails behind as the stale {/a/b}.
+  let _s_c = h
+    .watch("/a/c", Interest::all())
+    .await
+    .expect("watch /a/c covered");
+  // (3) watch /a again, Covered with key == root → cancel-equivalent re-issue {/a} (retain the root).
+  let _s_a2 = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a again covered");
+
+  let shrinks: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Shrink(handle, _) if *handle == wide))
+    .collect();
+  assert_eq!(
+    shrinks,
+    vec![
+      Call::Shrink(wide, vec![key("/a/b")]),
+      Call::Shrink(wide, vec![key("/a/b"), key("/a/c")]),
+      Call::Shrink(wide, vec![key("/a")]),
+    ],
+    "each Covered commit re-issues the CURRENT retained cover: the {{/a/b}} survivor drop, then the \
+     FRESH {{/a/b, /a/c}} (never the stale {{/a/b}}), then the cancel-equivalent {{/a}} once /a \
+     re-pins the root — so a queued shrink can never apply a stale snapshot (Codex R35)"
+  );
+  // The re-issue that matters most: the covered /a/c commit forwarded a cover that INCLUDES /a/c —
+  // the fresh membership, never trailing behind as the stale {/a/b} that would drop /a/c silently.
+  assert!(
+    shrinks
+      .iter()
+      .any(|c| matches!(c, Call::Shrink(_, cover) if cover.contains(&key("/a/c")))),
+    "the covered /a/c commit re-issued a cover that includes /a/c (freshness, not the stale snapshot)"
   );
 }
 
