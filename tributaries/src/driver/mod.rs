@@ -1857,7 +1857,14 @@ where
       // delivered it: suppression become permanent loss. This pre-drain is non-blocking; a `Close`
       // found here stops the drain exactly as the `select!` arm does. (It is NOT the suppression
       // boundary — owner state is, R24 — it only makes the EXIT PREDICATE read post-claim state.)
-      while let Ok(cmd) = self.commands.try_recv() {
+      // BOUNDED (Codex R26): at most COMMAND_FAIRNESS_BUDGET commands per iteration, so a
+      // sustained flood on the unbounded mailbox cannot starve the owed pass below — owed
+      // delivery makes progress every iteration, mirroring the run loop's fairness valve.
+      let mut serviced = 0u32;
+      while serviced < COMMAND_FAIRNESS_BUDGET
+        && let Ok(cmd) = self.commands.try_recv()
+      {
+        serviced += 1;
         if let Some(reply) = self.handle_teardown_command(cmd) {
           return Some(reply);
         }

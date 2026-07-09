@@ -3864,6 +3864,34 @@ async fn raw_source_event_delivers_under_sustained_command_load() {
   flood.abort();
 }
 
+/// Codex R26 regression — the source-drain teardown makes OWED progress under a sustained command
+/// flood: its per-iteration command servicing is BOUNDED (COMMAND_FAIRNESS_BUDGET), so a
+/// continuously non-empty mailbox cannot starve `drain_owed_once` — an already-CLAIMED parked
+/// Rescan is delivered within a bounded window even though the flood keeps the drain from exiting
+/// (the exit's empty-mailbox linearization defers, delivery does not).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_drain_delivers_claimed_debt_under_sustained_command_flood() {
+  let mut h = Harness::new(); // unbounded event channel — has capacity
+  let live = h.watch("/a", Interest::all()).await.expect("watch /a"); // claimed (Harness::watch)
+  for raw in 0..2 {
+    h.owner.epochs.stamp(live, Epoch::new(raw));
+  }
+  h.owner.park_rescan(live);
+
+  let flood = spawn_command_flood(h._commands.clone());
+  // Under the flood the drain never observes an empty mailbox, so it keeps servicing (and never
+  // exits within the window) — but the bounded pre-drain guarantees the owed pass runs every
+  // iteration, so the claimed Rescan is delivered long before the timeout lapses.
+  let _ = tokio::time::timeout(Duration::from_secs(2), h.owner.drain_owed_before_shutdown()).await;
+  flood.abort();
+  assert!(
+    h.drain()
+      .iter()
+      .any(|e| e.subscription() == live && e.is_rescan()),
+    "the claimed sub's parked Rescan is delivered despite the sustained command flood (Codex R26)"
+  );
+}
+
 /// Codex R25-F2 regression — DUE debounced output drains within a bounded window under a sustained
 /// command flood: the settle-timer arm can never win against a continuously-ready command arm, so
 /// the valve's due-coalescer drain is what honors the coalescer's hold bounds. Fail-on-old: without
