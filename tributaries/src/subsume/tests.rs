@@ -158,7 +158,7 @@ fn unwatch_last_subscriber_empties_root() {
   // Dropping the last subscriber empties (and removes) the root.
   assert!(matches!(
     s.plan_unwatch(sa),
-    Some(UnwatchOutcome::RootEmptied { fs_root }) if fs_root == ra,
+    Some(UnwatchOutcome::RootEmptied { fs_root, .. }) if fs_root == ra,
   ));
   assert!(s.entry(ra).is_none());
   assert!(root_keys(&s).is_empty());
