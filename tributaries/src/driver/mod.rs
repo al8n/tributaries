@@ -636,6 +636,9 @@ where
   R: RuntimeLite,
   S: Source<C>,
 {
+  // Command-fairness valve state (Codex R25-F2): consecutive command-arm wins since the data plane
+  // was last serviced. See [`COMMAND_FAIRNESS_BUDGET`].
+  let mut command_streak: u32 = 0;
   // The loop yields `(reply, drain_owed)`: `reply` is the `Close` acknowledgement (if any);
   // `drain_owed` is true only on a **source drain** (the source's `next` yielded `None` while
   // a consumer is still attached), which owes that consumer every parked Rescan before the
@@ -655,6 +658,31 @@ where
     // and durability are unaffected (a parked sub's ordinary deltas are suppressed and its `Rescan`s
     // merged by `try_emit`; `needs_rescan` entries persist until delivered or purged).
     owner.flush_pending_rescans();
+
+    // The command-fairness valve (Codex R25-F2): the select below is command-biased, so a
+    // CONTINUOUS command flood would otherwise starve the data plane entirely — the source arm
+    // never pumped (claimed subscriptions miss ordinary events for the flood's whole duration) and
+    // the timer arm never fired (due coalescer output held past its bounds). After
+    // [`COMMAND_FAIRNESS_BUDGET`] consecutive command wins, service the data plane ONCE,
+    // non-blockingly: poll one source event — `now_or_never` drops a still-pending `next()`, which
+    // is safe solely by its cancellation-safety contract — and drain any due coalescer output.
+    // `Close`-responsiveness is untouched: nothing here awaits (a pending poll is dropped
+    // instantly), so a queued `Close` is delayed by at most this bounded, non-awaiting service.
+    if command_streak >= COMMAND_FAIRNESS_BUDGET {
+      command_streak = 0;
+      match owner.source.next().now_or_never() {
+        Some(Some(event)) => {
+          if !owner.retire_if_dead(&event) {
+            owner.fan_out_and_push(&event);
+          }
+        }
+        // The source drained during the forced poll: break to the owed drain exactly as the
+        // select arm does (no silent loss on source drain).
+        Some(None) => break (None, true),
+        None => {}
+      }
+      owner.drain_coalescer_due();
+    }
 
     // The sleep target: the coalescer's next settle deadline, floored by a short retry
     // while any parked Rescan still awaits a channel slot — so a resuming consumer gets its
@@ -684,8 +712,11 @@ where
     // docs) — dropping it loses/acks no event. Releasing a root is the synchronous
     // [`Source::disarm`] request, never awaited, so it is never raced here.
     let flow = futures_util::select_biased! {
-      cmd = owner.commands.recv().fuse() => owner.dispatch_command(cmd).await,
-      raw = owner.source.next().fuse() => match raw {
+      cmd = owner.commands.recv().fuse() => {
+        command_streak += 1;
+        owner.dispatch_command(cmd).await
+      }
+      raw = owner.source.next().fuse() => { command_streak = 0; match raw {
         // A terminal event on a **dead root** (the source has forgotten its handle) retires that
         // root through the unified park-terminal-Rescan-then-retire primitive — which durably owes
         // every subscriber a dominating `Rescan` *before* freeing the subsumer state, so a full
@@ -704,8 +735,9 @@ where
         // The source drained while a consumer is still attached: it is OWED every parked
         // Rescan before the stream ends (no silent loss on source drain).
         None => Flow::Break { closing: None, drain_owed: true },
-      },
+      } },
       _ = timer => {
+        command_streak = 0;
         owner.drain_coalescer_due();
         Flow::Continue
       }
@@ -761,6 +793,15 @@ where
 /// resuming consumer's next drained slot is also retried on the following command/event
 /// tick; this bounds the wait when the stream is otherwise idle.
 const RETRY: Duration = Duration::from_millis(25);
+
+/// How many consecutive command-arm wins the [`run`] loop tolerates before forcing one
+/// non-blocking data-plane service — a `now_or_never` source poll plus a due-coalescer drain —
+/// the command-fairness valve (Codex R25-F2). The `select!` is command-biased so `Close` is never
+/// starved; without a budget, a CONTINUOUS watch/unwatch flood keeps the command arm ready
+/// forever and the source/timer arms never win: claimed subscriptions would miss ordinary source
+/// events and the coalescer its hold bounds for the flood's whole duration. Small enough to bound
+/// data-plane staleness tightly under load, large enough to amortize the extra poll.
+const COMMAND_FAIRNESS_BUDGET: u32 = 32;
 
 /// The earlier of two optional deadlines, treating [`None`] as infinitely far — the sleep
 /// target combining the coalescer's settle deadline with the parked-Rescan retry.
@@ -1809,17 +1850,31 @@ where
     &mut self,
   ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
     loop {
+      // Service everything already queued BEFORE the owed pass and its exit check (Codex R25-F1):
+      // a `ClaimGrant` sitting in the mailbox must lift its subscription's suppression FIRST — the
+      // caller defused the grant and genuinely holds the sub, so its parked Rescan is owed — or the
+      // all-unclaimed exit below would read the STALE `unclaimed` set and tear down having never
+      // delivered it: suppression become permanent loss. This pre-drain is non-blocking; a `Close`
+      // found here stops the drain exactly as the `select!` arm does. (It is NOT the suppression
+      // boundary — owner state is, R24 — it only makes the EXIT PREDICATE read post-claim state.)
+      while let Ok(cmd) = self.commands.try_recv() {
+        if let Some(reply) = self.handle_teardown_command(cmd) {
+          return Some(reply);
+        }
+      }
       self.drain_owed_once();
-      // Exit once nothing is owed to a CLAIMED subscription: every remaining `needs_rescan` key is
-      // still `unclaimed` (its debt owed to nobody — suppressed by `drain_owed_once`'s flush above,
-      // and must not spin the drain waiting for a grant that may never be claimed), or the set is
-      // empty (`all` is vacuously true), or the consumer is gone. A claim arriving mid-drain is
-      // handled by the `select!` below (its `ClaimGrant` lifts the suppression, so a later pass
-      // delivers that sub's Rescan before this condition holds).
-      if self
+      // Exit once nothing is owed to a CLAIMED subscription AND the mailbox has been observed
+      // empty after that pass — the linearization point (Codex R25-F1): a claim observable by now
+      // was processed by the pre-drain above and its Rescan delivered by this pass; one arriving
+      // after this observation is post-teardown, its subscription dead like any subscription after
+      // teardown. Every remaining `needs_rescan` key still `unclaimed` means the debt is owed to
+      // nobody (and must not spin the drain waiting for a grant that may never resolve); or the
+      // consumer is gone entirely.
+      if (self
         .needs_rescan
         .keys()
         .all(|sub| self.unclaimed.contains(sub))
+        && self.commands.is_empty())
         || self.events.is_closed()
       {
         return None;

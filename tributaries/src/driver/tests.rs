@@ -3713,3 +3713,195 @@ async fn parked_rescan_delivers_under_sustained_command_load() {
   );
   flood.abort();
 }
+
+/// Spawns a control-plane flood: bursts of `Watch` commands whose reply receivers are dropped (each
+/// send-fails at the owner and is released synchronously) — keeping the command mailbox continuously
+/// non-empty, so the command-biased select's other arms can win only through the fairness valve.
+fn spawn_command_flood(
+  commands: async_channel::Sender<super::Command<OsString, ()>>,
+) -> tokio::task::JoinHandle<()> {
+  tokio::spawn(async move {
+    loop {
+      for _ in 0..8 {
+        let (reply, response) = futures_channel::oneshot::channel();
+        drop(response);
+        if commands
+          .try_send(super::Command::Watch {
+            key: key("/flood"),
+            value: (),
+            interest: Interest::all(),
+            filter: Filter::all(),
+            reply,
+          })
+          .is_err()
+        {
+          return;
+        }
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+}
+
+/// A source whose `next` yields one pre-queued event per trigger message, then parks — the
+/// command-flood fairness rig (Codex R25-F2): with the command arm continuously ready, only the run
+/// loop's fairness valve can pump these events. `next` is cancellation-safe: the trigger message
+/// and the event are consumed on the same poll that returns `Ready`.
+struct TriggeredSource {
+  next_handle: u32,
+  live: HashMap<u32, Vec<OsString>>,
+  events: std::collections::VecDeque<SourceEvent<OsString, u32>>,
+  trigger: async_channel::Receiver<()>,
+}
+
+impl Source<OsString> for TriggeredSource {
+  type Handle = u32;
+
+  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    Ok(key.to_vec())
+  }
+
+  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    self.next_handle += 1;
+    let handle = self.next_handle;
+    self.live.insert(handle, key.to_vec());
+    Ok(Armed::new(handle, key.to_vec()))
+  }
+
+  fn disarm(&mut self, handle: u32) {
+    self.live.remove(&handle);
+  }
+
+  async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+    match self.trigger.recv().await {
+      Ok(()) => self.events.pop_front(),
+      Err(_) => None,
+    }
+  }
+
+  fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+    self.live.get(&handle).cloned()
+  }
+}
+
+/// Codex R25-F1 regression — a `ClaimGrant` already QUEUED when the source drains must be serviced
+/// before the drain's all-unclaimed exit: the caller defused the grant (it holds the sub), so the
+/// parked terminal Rescan is genuinely owed and must be delivered before the stream ends. The exit
+/// predicate reads post-claim state (the mailbox is pre-drained and must be observed empty), or
+/// suppression becomes permanent loss. Fail-on-old: the pre-R25 exit takes the all-unclaimed arm
+/// before the select can process the queued claim — nothing is delivered and the assertion flips.
+#[tokio::test]
+async fn queued_claim_grant_is_serviced_before_the_source_drain_exit() {
+  let mut h = Harness::new(); // unbounded event channel — has capacity
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  h.owner.unclaimed.insert(sub);
+  // Terminal-retire the unclaimed sub's root: its owed terminal Rescan parks, suppressed.
+  h.owner.retire_root_with_terminal_rescan(1);
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the terminal Rescan is parked"
+  );
+  // The caller defuses as the source drains: its ClaimGrant is already queued when the drain runs.
+  h._commands
+    .try_send(super::Command::ClaimGrant(sub))
+    .expect("enqueue the ClaimGrant");
+
+  let returned = tokio::time::timeout(Duration::from_secs(5), h.owner.drain_owed_before_shutdown())
+    .await
+    .expect("the drain exits promptly after delivering the claimed debt");
+  assert!(returned.is_none(), "no Close interrupted the drain");
+
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == sub && e.is_rescan()),
+    "the claimed sub's parked Rescan is delivered before the source-drain exit (Codex R25-F1)"
+  );
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the owed debt is resolved, not stranded"
+  );
+}
+
+/// Codex R25-F2 regression — a RAW source event is delivered within a bounded window under a
+/// sustained command flood: the command-biased select would starve `next()` forever, so the
+/// fairness valve (after `COMMAND_FAIRNESS_BUDGET` consecutive command wins, one non-blocking
+/// source poll + a due-coalescer drain) is what pumps it. Fail-on-old: without the valve the
+/// command arm wins every iteration and the event never surfaces — the recv times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_source_event_delivers_under_sustained_command_load() {
+  let (trigger_tx, trigger_rx) = async_channel::unbounded::<()>();
+  let source = TriggeredSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    events: std::collections::VecDeque::from([SourceEvent::new(
+      1,
+      key("/a/f"),
+      EventKind::Created,
+      None,
+      Location::new(),
+      Epoch::new(0),
+      ChangeId::new(NonZeroU64::MIN),
+    )]),
+    trigger: trigger_rx,
+  };
+  let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+  let sub = w
+    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /a"); // handle 1
+
+  let flood = spawn_command_flood(w.commands.clone());
+  trigger_tx.try_send(()).expect("release the queued event");
+
+  let event = tokio::time::timeout(Duration::from_secs(5), w.next())
+    .await
+    .expect("the raw source event is delivered despite the sustained command flood (the valve)")
+    .expect("the stream is open");
+  assert_eq!(event.subscription(), sub, "routed to the covering sub");
+  flood.abort();
+}
+
+/// Codex R25-F2 regression — DUE debounced output drains within a bounded window under a sustained
+/// command flood: the settle-timer arm can never win against a continuously-ready command arm, so
+/// the valve's due-coalescer drain is what honors the coalescer's hold bounds. Fail-on-old: without
+/// the valve neither the timer nor the source arm ever fires and the buffered event never drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn due_debounced_event_drains_under_sustained_command_load() {
+  let (trigger_tx, trigger_rx) = async_channel::unbounded::<()>();
+  let source = TriggeredSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    events: std::collections::VecDeque::from([SourceEvent::new(
+      1,
+      key("/a/f"),
+      EventKind::Modified,
+      None,
+      Location::new(),
+      Epoch::new(0),
+      ChangeId::new(NonZeroU64::MIN),
+    )]),
+    trigger: trigger_rx,
+  };
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_millis(20))
+    .with_max_hold(Duration::from_millis(100));
+  let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new().debounce(cfg));
+  let sub = w
+    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /a"); // handle 1
+
+  let flood = spawn_command_flood(w.commands.clone());
+  trigger_tx.try_send(()).expect("release the queued event");
+
+  let event = tokio::time::timeout(Duration::from_secs(5), w.next())
+    .await
+    .expect("the due debounced event drains despite the flood (the valve's due-coalescer drain)")
+    .expect("the stream is open");
+  assert_eq!(event.subscription(), sub, "routed to the covering sub");
+  flood.abort();
+}
