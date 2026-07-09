@@ -467,7 +467,7 @@ impl Monitor {
   /// wide root but that no surviving consumer still needs (shrink-in-place).
   ///
   /// This is the same **narrow subtree drop** the Monitor already performs when a
-  /// watched directory is deleted or replaced ([`drop_subtree`](Self::drop_subtree)),
+  /// watched directory is deleted or replaced (`drop_subtree`),
   /// exposed for the driver to trigger from an out-of-band coverage-reclaim request
   /// rather than from an observed filesystem transition: it keeps the node map, the
   /// child index, the adjacency sets, held-source state, and outstanding enumerate
@@ -501,8 +501,8 @@ impl Monitor {
   /// pruned but that a survivor now needs again (the bidirectional dual of that shrink prune,
   /// set-cover / M2-B v2).
   ///
-  /// It reuses the exact overflow re-arm machinery ([`start_rearm`](Self::start_rearm) →
-  /// [`rearm_enumerate`](Self::rearm_enumerate)): a complete re-arm read installs a fresh
+  /// It reuses the exact overflow re-arm machinery (`start_rearm` →
+  /// `rearm_enumerate`): a complete re-arm read installs a fresh
   /// watch for every present child directory currently lacking one — including one a prior
   /// prune removed — and cascades the re-arm into it recursively, so the subtree rebuilds all
   /// the way down. It emits **no** `Created` (a re-arm is coverage maintenance, not discovery)
@@ -517,7 +517,7 @@ impl Monitor {
   /// coverage never shrank). Returns `true` iff `watch` names a live node of a descending
   /// scope, whose re-arm was started, coalesced onto an in-flight read, or marked to continue
   /// after a pending arm — mirroring the state guards of
-  /// [`inherit_rearm`](Self::inherit_rearm).
+  /// `inherit_rearm`.
   pub fn rearm_watch_subtree(&mut self, watch: WatchId) -> bool {
     let Some(scope) = self.scope_of(watch) else {
       return false;

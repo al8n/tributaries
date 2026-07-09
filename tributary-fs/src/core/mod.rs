@@ -716,13 +716,26 @@ impl DriverCore {
     // retained path that is not under the root — a caller typo, a relative or stale path — lies
     // strictly OUTSIDE every in-root watch, so an UNVALIDATED cover would mark the whole scope
     // outside and SILENTLY PRUNE ALL coverage. Keep only paths within the root (the root itself
-    // allowed). A root not yet known (stream not spawned) cannot validate anything, so no-op.
+    // allowed). The prefix test is LEXICAL, and `Path::starts_with` does not resolve `..` — so a
+    // path like `root/../elsewhere` lexically begins with the root while escaping it (Codex
+    // R42-F1). A CANONICAL retained path never contains `.`/`..` components (the scope root and
+    // every survivor cover the umbrella issues are canonical), so any path carrying one is a
+    // caller error: reject it outright rather than guessing what it resolves to. A root not yet
+    // known (stream not spawned) cannot validate anything, so no-op.
     let Some(root) = state.root.clone() else {
       return;
     };
     let retained: Vec<PathBuf> = retained
       .iter()
-      .filter(|path| path.starts_with(root.as_path()))
+      .filter(|path| {
+        path.starts_with(root.as_path())
+          && !path.components().any(|component| {
+            matches!(
+              component,
+              std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+          })
+      })
       .cloned()
       .collect();
     // An ENTIRELY out-of-root cover is a caller error the core refuses to act on: do NOT prune and

@@ -2473,12 +2473,31 @@ fn set_cover_validates_retained_against_the_scope_root() {
     "only the in-root prefix is honored; the out-of-root one is filtered away"
   );
 
-  // (4) A later all-out-of-root cover is STILL refused — it must not overwrite or reset the prior,
-  // still-correct coverage.
-  core.on_set_cover(scope, &[PathBuf::from("/bad")]);
+  // (3b) An ESCAPING path that lexically begins with the root — `Path::starts_with` does not
+  // resolve `..` — is refused too (Codex R42-F1): a canonical retained path never carries
+  // `.`/`..` components, so any that does is a caller error, never honored (alone or mixed).
+  core.on_set_cover(scope, &[PathBuf::from("/r/../outside")]);
   assert_eq!(
     applied(&core),
     Some(vec![PathBuf::from("/r/a")]),
+    "a dot-dot-escaping cover is refused — never recorded, never a prune (Codex R42)"
+  );
+  core.on_set_cover(
+    scope,
+    &[PathBuf::from("/r/b"), PathBuf::from("/r/./b/../../etc")],
+  );
+  assert_eq!(
+    applied(&core),
+    Some(vec![PathBuf::from("/r/b")]),
+    "in a mixed cover, only the canonical in-root prefix survives the component check"
+  );
+
+  // (4) A later all-out-of-root cover is STILL refused — it must not overwrite or reset the prior,
+  // still-correct coverage (the `/r/b` recorded by the mixed case above).
+  core.on_set_cover(scope, &[PathBuf::from("/bad")]);
+  assert_eq!(
+    applied(&core),
+    Some(vec![PathBuf::from("/r/b")]),
     "an all-out-of-root cover leaves the prior applied cover untouched"
   );
 }

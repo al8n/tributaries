@@ -70,7 +70,7 @@ mod integration {
   use tempfile::TempDir;
   use tributary_fs::{RootHandle, WatchRootError, WatcherOptions};
 
-  use super::super::{FsSource, Source, SourceEvent, key_to_path};
+  use super::super::{FsSource, OPPORTUNISTIC_RELEASE_HANDOFFS, Source, SourceEvent, key_to_path};
   use crate::{error::WatchError, event::path_components};
 
   /// Generous ceiling for one expected observation; CI runners are slow and FSEvents
@@ -233,16 +233,19 @@ mod integration {
     );
   }
 
-  /// R41: a DISJOINT arm AWAITS NOTHING for releases. The opportunistic application is now a
-  /// NON-BLOCKING hand-off — each queued release is `request_unwatch`ed (a reply-less `try_send`) and
-  /// moved to the in-flight sidecar, never awaited — so a caller-bounded `Watch` (and any `close`
-  /// queued behind it) is decoupled from every release's teardown latency (contract clause 2/5). Queue
-  /// three disjoint releases A, B, C, then arm a disjoint D: all three are handed over non-blocking
-  /// (the channel has room), NONE is awaited-and-applied, and every one stays logically dead
-  /// (`pending_set`), while D arms with no overlap and no awaited release work.
+  /// R41/R42: a DISJOINT arm AWAITS NOTHING for releases, and its opportunistic hand-off is HARD
+  /// BUDGETED. Each drained release is `request_unwatch`ed (a reply-less `try_send`) and moved to the
+  /// in-flight sidecar, never awaited — so a caller-bounded `Watch` (and any `close` queued behind it)
+  /// is decoupled from every release's teardown latency (contract clause 2/5) — and the drain stops
+  /// after [`OPPORTUNISTIC_RELEASE_HANDOFFS`] entries even when the channel still has room (R42: the
+  /// per-arm constant, not the channel's capacity, is the latency bound). Queue three disjoint
+  /// releases A, B, C, then arm a disjoint D: exactly the two OLDEST (A, B — FIFO) are handed over
+  /// non-blocking, C stays queued for a later drain, NONE is awaited-and-applied, and all three stay
+  /// logically dead (`pending_set`), while D arms with no overlap and no awaited release work.
   ///
   /// Fail-on-old: the retired opportunistic loop AWAITED `unwatch` for the two oldest, REMOVING them
-  /// from `pending_set` — so `pending_set.len()` would be 1 here, not 3.
+  /// from `pending_set` — so `pending_set.len()` would be 1 here, not 3. And the R41 channel-room drain
+  /// handed over ALL three — `pending_releases` would be empty here, not len 1.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn fs_source_disjoint_arm_applies_releases_non_blocking() {
     let (_dir, parent) = scratch();
@@ -271,21 +274,24 @@ mod integration {
     );
     assert!(source.enqueued.is_empty(), "nothing in flight yet");
 
-    // Arm a disjoint D: the opportunistic drain hands all three to the watcher non-blocking (the
-    // bounded(16) channel has room) — moving them queue → in-flight — and AWAITS none of them. D
-    // overlaps no live root, so it arms first try with no awaited release work.
+    // Arm a disjoint D: the opportunistic drain hands the two OLDEST to the watcher non-blocking —
+    // moving them queue → in-flight — then stops at the per-arm budget even though the bounded(16)
+    // channel still has room, and AWAITS none of them. D overlaps no live root, so it arms first try
+    // with no awaited release work.
     let d = parent.join("d");
     std::fs::create_dir_all(&d).expect("create d");
     let d_key = path_components(&d);
     let armed_d = source.arm(&d_key).await.expect("arm disjoint D");
-    assert!(
-      source.pending_releases.is_empty(),
-      "every queued release was handed over non-blocking (the channel had room)"
+    assert_eq!(
+      source.pending_releases.len(),
+      1,
+      "the drain stopped at the per-arm budget (2) with channel room to spare — the newest release \
+       stays queued for a later drain"
     );
     assert_eq!(
       source.enqueued.len(),
-      3,
-      "all three moved to the in-flight sidecar via `request_unwatch` — none awaited"
+      OPPORTUNISTIC_RELEASE_HANDOFFS,
+      "exactly the budgeted number moved to the in-flight sidecar via `request_unwatch` — none awaited"
     );
     assert_eq!(
       source.pending_set.len(),
