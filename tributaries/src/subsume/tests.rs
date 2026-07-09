@@ -50,7 +50,7 @@ fn watch(s: &mut S, handles: &mut Handles, path: &str, interest: Interest) -> (u
   let k = key(path);
   let outcome = s.plan_watch(&k, (), interest);
   let (fs_root, sub) = match &outcome {
-    WatchOutcome::Covered { fs_root, sub } => (*fs_root, *sub),
+    WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
     WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (handles.mint(), *sub),
   };
   s.commit_watch(&outcome, fs_root, &k);
@@ -90,8 +90,16 @@ fn descendant_is_covered() {
   // `/a/b` is already covered by `/a`: no new root, no new kernel watch.
   let outcome = s.plan_watch(&key("/a/b"), (), Interest::all());
   let sb = match &outcome {
-    WatchOutcome::Covered { fs_root, sub } => {
+    WatchOutcome::Covered {
+      fs_root,
+      sub,
+      outside_cover,
+    } => {
       assert_eq!(*fs_root, ra, "covered by the /a root");
+      assert!(
+        !outside_cover,
+        "a Covered newcomer under a full-coverage (never-narrowed) root is not outside_cover"
+      );
       *sub
     }
     other => panic!("expected Covered by /a, got {other:?}"),
@@ -545,6 +553,110 @@ fn retained_cover_for_includes_a_newly_covered_subscriber() {
     Some(vec![key("/a/b"), key("/a/c")]),
     "the covered /a/c JOINS the recomputed cover — the fresh membership, not the stale {{/a/b}} (R35)"
   );
+}
+
+/// M2-B v2 retained-cover bookkeeping (Codex R36): [`set_retained_cover`](S::set_retained_cover)
+/// records the cover last issued to the source and [`retained_cover_of`](S::retained_cover_of) reads
+/// it back. A fresh root is `None` (full coverage), a narrowing round-trips, a reset to `None` restores
+/// full, and an unknown handle is `None`.
+#[test]
+fn retained_cover_bookkeeping_round_trips() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (ra, _sa) = watch(&mut s, &mut h, "/a", Interest::all());
+  assert_eq!(
+    s.retained_cover_of(ra),
+    None,
+    "a fresh root is never narrowed — full coverage"
+  );
+
+  s.set_retained_cover(ra, Some(vec![key("/a/b"), key("/a/c")]));
+  assert_eq!(
+    s.retained_cover_of(ra),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the issued cover round-trips through the bookkeeping"
+  );
+
+  s.set_retained_cover(ra, None);
+  assert_eq!(
+    s.retained_cover_of(ra),
+    None,
+    "resetting to None restores the full-coverage bookkeeping (the cancel-equivalent)"
+  );
+
+  assert_eq!(
+    s.retained_cover_of(9999),
+    None,
+    "an unknown handle has no recorded cover"
+  );
+}
+
+/// M2-B v2 `outside_cover` classification (Codex R36): [`plan_watch`](S::plan_watch) flags a `Covered`
+/// newcomer that falls OUTSIDE the covering root's recorded retained cover — the region an applied
+/// set_cover pruned — and does NOT flag one under a full-coverage (`None`) root, one inside a retained
+/// prefix, or one whose key equals a retained prefix. Each probe plan is aborted so it leaks no pending
+/// reservation.
+#[test]
+fn plan_watch_flags_covered_outside_the_narrowed_cover() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (ra, _sa) = watch(&mut s, &mut h, "/a", Interest::all());
+
+  // Full coverage (None): no Covered newcomer is outside.
+  let outcome = s.plan_watch(&key("/a/x"), (), Interest::all());
+  match &outcome {
+    WatchOutcome::Covered { outside_cover, .. } => assert!(
+      !outside_cover,
+      "under a full-coverage (never-narrowed) root no newcomer is outside_cover"
+    ),
+    other => panic!("expected Covered, got {other:?}"),
+  }
+  s.abort_watch(&outcome);
+
+  // Narrow the recorded cover to {/a/b}: the source pruned everything else under /a.
+  s.set_retained_cover(ra, Some(vec![key("/a/b")]));
+
+  // A newcomer OUTSIDE {/a/b} → flagged.
+  let outcome = s.plan_watch(&key("/a/c"), (), Interest::all());
+  match &outcome {
+    WatchOutcome::Covered {
+      fs_root,
+      outside_cover,
+      ..
+    } => {
+      assert_eq!(*fs_root, ra, "still Covered by the wide /a root");
+      assert!(
+        *outside_cover,
+        "a newcomer under NONE of the narrowed cover's prefixes is outside_cover"
+      );
+    }
+    other => panic!("expected Covered, got {other:?}"),
+  }
+  s.abort_watch(&outcome);
+
+  // A newcomer INSIDE the retained prefix /a/b → not flagged.
+  let outcome = s.plan_watch(&key("/a/b/deep"), (), Interest::all());
+  match &outcome {
+    WatchOutcome::Covered { outside_cover, .. } => assert!(
+      !outside_cover,
+      "a newcomer under a retained prefix is already backed by the source — not outside_cover"
+    ),
+    other => panic!("expected Covered, got {other:?}"),
+  }
+  s.abort_watch(&outcome);
+
+  // A newcomer whose key EQUALS a retained prefix → not flagged (an ancestor-or-equal is covered).
+  let outcome = s.plan_watch(&key("/a/b"), (), Interest::all());
+  match &outcome {
+    WatchOutcome::Covered { outside_cover, .. } => assert!(
+      !outside_cover,
+      "a newcomer exactly at a retained prefix is covered — not outside_cover"
+    ),
+    other => panic!("expected Covered, got {other:?}"),
+  }
+  s.abort_watch(&outcome);
 }
 
 // ---------------------------------------------------------------------------

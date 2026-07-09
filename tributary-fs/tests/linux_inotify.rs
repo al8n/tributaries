@@ -521,13 +521,17 @@ fn count_inotify_wds() -> usize {
   total
 }
 
-/// M2-B shrink-in-place, end to end against real inotify: a wide root that armed per-directory
-/// watches over TWO nested subtrees is pruned in place down to a retained cover. The strictly-outside
-/// subtree's watch descriptors are reclaimed (the wd count drops), the retained subtree keeps
-/// delivering with NO gap (its watches are never re-armed), and the pruned subtree stops delivering —
-/// the whole point of shrinking the kernel coverage rather than releasing and re-arming.
+/// M2-B set-cover, end to end against real inotify: a wide root that armed per-directory
+/// watches over TWO nested subtrees is reconciled in place down to a retained cover, then
+/// **grown back**. Phase 1 (shrink): the strictly-outside subtree's watch descriptors are
+/// reclaimed (the wd count drops), the retained subtree keeps delivering with NO gap (its
+/// watches are never re-armed), and the pruned subtree stops delivering — the whole point of
+/// shrinking the kernel coverage rather than releasing and re-arming. Phase 2 (grow, Codex
+/// R36): re-issuing a cover that once again includes the pruned subtree re-arms it in place,
+/// so a fresh deep write under it IS delivered again — the bidirectional dual, without which a
+/// survivor watching a previously-pruned subtree would sit over a hole no watch backs.
 #[tokio::test]
-async fn shrink_prunes_outside_subtree_and_retains_the_cover() {
+async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
   let root = scratch_root("shrink");
   std::fs::create_dir_all(root.join("keep/deep")).unwrap();
   std::fs::create_dir_all(root.join("drop/deep")).unwrap();
@@ -562,7 +566,9 @@ async fn shrink_prunes_outside_subtree_and_retains_the_cover() {
   // Shrink the wide root down to the /keep cover: /drop and /drop/deep are strictly outside it, so
   // their watches are pruned; the root (connecting ancestor) and /keep + /keep/deep stay armed with
   // NO re-arm.
-  w.shrink(h, vec![root.join("keep")]).await.expect("shrink");
+  w.set_cover(h, vec![root.join("keep")])
+    .await
+    .expect("set_cover prune");
 
   // The pruned subtree's descriptors are reclaimed (the disarms apply asynchronously, fire-and-forget).
   let reclaimed = tokio::time::timeout(DEADLINE, async {
@@ -614,5 +620,32 @@ async fn shrink_prunes_outside_subtree_and_retains_the_cover() {
   assert!(
     !leaked,
     "the pruned /drop subtree stops delivering after the shrink"
+  );
+
+  // PHASE 2 — GROW BACK (Codex R36): re-issue a cover that once again includes /drop. The
+  // set-cover is bidirectional, so /drop's per-directory watches are re-armed in place (its
+  // deepest still-watched ancestor — the root — is re-armed, re-installing /drop and /drop/deep
+  // and cascading down), with no re-crawl of the retained /keep.
+  w.set_cover(h, vec![root.join("keep"), root.join("drop")])
+    .await
+    .expect("set_cover grow");
+
+  // Drain the re-arm's coverage-maintenance traffic (no `Created`/`Rescan` is emitted for the
+  // re-arm itself, but pre-existing quiescent entries may produce nothing) so the probe below
+  // observes only the fresh post-grow write.
+  let _ = tokio::time::timeout(Duration::from_millis(500), async {
+    while w.next().await.is_some() {}
+  })
+  .await;
+
+  // The previously-pruned /drop/deep now holds live per-directory watches again: a fresh deep
+  // write under it IS delivered — the regression the grow half closes.
+  let drop_regrown = root.join("drop/deep/regrown.txt");
+  std::fs::write(&drop_regrown, b"w").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &drop_regrown))
+      .await
+      .is_some(),
+    "the re-armed /drop/deep subtree delivers again after the set-cover grew it back (Codex R36)"
   );
 }
