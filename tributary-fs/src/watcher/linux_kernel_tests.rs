@@ -10,8 +10,9 @@
 //! external binary this module runs inside the parallel lib-test harness, where sibling unit
 //! tests (e.g. the `os::linux::inotify` suite) arm real inotify watches concurrently — so all
 //! watch-descriptor assertions are **object-scoped**: [`wds_watching`] matches fdinfo entries
-//! against the inodes of THIS test's own scratch directories, never a process-wide count that
-//! another test's arm or teardown could satisfy or mask (Codex R45).
+//! against the `(device, inode)` pairs of THIS test's own scratch directories, never a
+//! process-wide count that another test's arm or teardown could satisfy or mask (Codex R45;
+//! device+inode rather than inode alone, since inodes are unique only per device — R46).
 
 use std::{
   collections::HashSet,
@@ -73,23 +74,51 @@ fn covers(event: &Event, path: &Path) -> bool {
   event.is_rescan() && path.starts_with(event.path())
 }
 
-/// The inode numbers of `paths` (each must exist). Every scratch directory the module's
-/// tests create lives on the one `TMPDIR` filesystem, where inode numbers are unique, so a
-/// directory's inode identifies it among ALL inotify watches this process holds.
-fn inodes_of(paths: &[PathBuf]) -> HashSet<u64> {
+/// The `(device, inode)` identities of `paths` (each must exist), with the device in the
+/// KERNEL encoding fdinfo prints: `sdev:` carries the superblock's `s_dev` — `MKDEV`, i.e.
+/// `major << 20 | minor` — while `stat`'s `st_dev` is glibc-encoded, so the two only happen
+/// to coincide on major-0 devices like tmpfs. Converting through `major`/`minor` makes the
+/// match hold on ANY filesystem, not just the tmp one (Codex R46).
+fn objects_of(paths: &[PathBuf]) -> HashSet<(u64, u64)> {
   paths
     .iter()
-    .map(|path| std::fs::metadata(path).expect("stat scratch dir").ino())
+    .map(|path| {
+      let meta = std::fs::metadata(path).expect("stat scratch dir");
+      let major = u64::from(libc::major(meta.dev()));
+      let minor = u64::from(libc::minor(meta.dev()));
+      ((major << 20) | (minor & 0xF_FFFF), meta.ino())
+    })
     .collect()
 }
 
-/// How many inotify watch descriptors THIS PROCESS holds **on the given inodes**: an inotify
-/// fd's `/proc/self/fdinfo/<fd>` lists one `inotify wd:<wd> ino:<hex> ...` line per live
-/// watch, and the `ino:` field names the watched object. Matching on this test's own
-/// directory inodes makes the count immune to every sibling test's inotify activity (the
-/// `os::linux::inotify` unit tests arm and release real watches, unlocked, in this same
-/// parallel binary — a process-wide count could be satisfied or masked by them, Codex R45).
-fn wds_watching(inos: &HashSet<u64>) -> usize {
+/// Whether one fdinfo line records an inotify watch on one of `objects`: it must start with
+/// the `inotify wd:` marker and its `sdev:` + `ino:` hex fields must BOTH match one pair —
+/// device and inode together, since inode numbers are unique only within a device and this
+/// scans every inotify fd in the process (Codex R46).
+fn line_matches(line: &str, objects: &HashSet<(u64, u64)>) -> bool {
+  if !line.starts_with("inotify wd:") {
+    return false;
+  }
+  let field = |prefix: &str| {
+    line
+      .split_whitespace()
+      .find_map(|token| token.strip_prefix(prefix))
+      .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+  };
+  match (field("sdev:"), field("ino:")) {
+    (Some(sdev), Some(ino)) => objects.contains(&(sdev, ino)),
+    _ => false,
+  }
+}
+
+/// How many inotify watch descriptors THIS PROCESS holds **on the given objects**: an
+/// inotify fd's `/proc/self/fdinfo/<fd>` lists one `inotify wd:<wd> ino:<hex> sdev:<hex> ...`
+/// line per live watch, naming the watched object. Matching on this test's own directories'
+/// `(device, inode)` pairs makes the count immune to every sibling test's inotify activity
+/// (the `os::linux::inotify` unit tests arm and release real watches, unlocked, in this same
+/// parallel binary — a process-wide count could be satisfied or masked by them, Codex R45),
+/// including a sibling watching a same-inode object on a DIFFERENT filesystem (Codex R46).
+fn wds_watching(objects: &HashSet<(u64, u64)>) -> usize {
   let mut total = 0;
   let Ok(entries) = std::fs::read_dir("/proc/self/fdinfo") else {
     return 0;
@@ -98,18 +127,46 @@ fn wds_watching(inos: &HashSet<u64>) -> usize {
     if let Ok(content) = std::fs::read_to_string(entry.path()) {
       total += content
         .lines()
-        .filter(|line| line.starts_with("inotify wd:"))
-        .filter(|line| {
-          line
-            .split_whitespace()
-            .find_map(|token| token.strip_prefix("ino:"))
-            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-            .is_some_and(|ino| inos.contains(&ino))
-        })
+        .filter(|line| line_matches(line, objects))
         .count();
     }
   }
   total
+}
+
+/// The fdinfo matcher is device+inode exact: a line with the right inode on the WRONG
+/// device (the R46 collision) is rejected, the right pair on either field order is
+/// counted, and non-inotify lines never match.
+#[test]
+fn fdinfo_line_matching_is_device_and_inode_exact() {
+  let objects: HashSet<(u64, u64)> = [(0x11, 0x16fa6)].into_iter().collect();
+  assert!(
+    line_matches(
+      "inotify wd:3 ino:16fa6 sdev:11 mask:fff ignored_mask:0",
+      &objects
+    ),
+    "the matching (sdev, ino) pair is counted"
+  );
+  assert!(
+    line_matches("inotify wd:3 sdev:11 ino:16fa6 mask:fff", &objects),
+    "field order does not matter"
+  );
+  assert!(
+    !line_matches("inotify wd:9 ino:16fa6 sdev:800002 mask:fff", &objects),
+    "the same inode on a DIFFERENT device is rejected (Codex R46)"
+  );
+  assert!(
+    !line_matches("inotify wd:9 ino:dead sdev:11 mask:fff", &objects),
+    "a different inode on the same device is rejected"
+  );
+  assert!(
+    !line_matches("pos:\t0", &objects),
+    "a non-inotify fdinfo line never matches"
+  );
+  assert!(
+    !line_matches("inotify wd:9 mask:fff", &objects),
+    "a line missing either field is rejected, never miscounted"
+  );
 }
 
 /// Waits (bounded) until `done()` holds, polling the kernel-visible state; `false` on lapse.
@@ -130,10 +187,10 @@ async fn converge(mut done: impl FnMut() -> bool) -> bool {
 /// inodes remains (Codex R44): dropping a [`Watcher`] only *requests* an asynchronous driver
 /// shutdown, so a test must prove its kernel teardown finished rather than leak watches past
 /// its end. Object-scoped, so a sibling test's activity can neither satisfy nor stall it.
-async fn close_and_drain(w: TokioWatcher, inos: &HashSet<u64>) {
+async fn close_and_drain(w: TokioWatcher, objects: &HashSet<(u64, u64)>) {
   w.close().await.expect("close watcher");
   assert!(
-    converge(|| wds_watching(inos) == 0).await,
+    converge(|| wds_watching(objects) == 0).await,
     "watcher teardown releases every watch descriptor on this test's directories (Codex R44)"
   );
 }
@@ -153,15 +210,15 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
   let root = scratch_root("shrink");
   std::fs::create_dir_all(root.join("keep/deep")).unwrap();
   std::fs::create_dir_all(root.join("drop/deep")).unwrap();
-  let all = inodes_of(&[
+  let all = objects_of(&[
     root.clone(),
     root.join("keep"),
     root.join("keep/deep"),
     root.join("drop"),
     root.join("drop/deep"),
   ]);
-  let retained = inodes_of(&[root.clone(), root.join("keep"), root.join("keep/deep")]);
-  let pruned = inodes_of(&[root.join("drop"), root.join("drop/deep")]);
+  let retained = objects_of(&[root.clone(), root.join("keep"), root.join("keep/deep")]);
+  let pruned = objects_of(&[root.join("drop"), root.join("drop/deep")]);
 
   // Pin inotify: the shrink prunes PER-DIRECTORY watches, which only the descending backend holds
   // (a kernel-recursive fanotify mark has none, and its shrink is a documented no-op).
@@ -287,7 +344,7 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
   // it — the cover keeps only a/b/deep under a/b, so a/b stays purely as a CONNECTING ANCESTOR).
   std::fs::create_dir_all(root.join("a/b/deep")).unwrap();
   std::fs::create_dir_all(root.join("a/b/other")).unwrap();
-  let all = inodes_of(&[
+  let all = objects_of(&[
     root.clone(),
     root.join("a"),
     root.join("a/b"),
@@ -372,7 +429,7 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
   let root = scratch_root("grow-cancel");
   std::fs::create_dir_all(root.join("keep/deep")).unwrap();
   std::fs::create_dir_all(root.join("drop/deep")).unwrap();
-  let all = inodes_of(&[
+  let all = objects_of(&[
     root.clone(),
     root.join("keep"),
     root.join("keep/deep"),
