@@ -937,18 +937,18 @@ where
     // gets its last offer before teardown, mirroring the non-drain close path below (Codex R28-F2).
     // A `None` return needs none: it already delivered everything owed to a claimed sub in its final
     // pass, or the consumer is gone. Still non-blocking, so `close` stays responsive (invariant II).
-    if interrupted.is_some() {
-      // The ATOMIC claim cut (Codex R32): close the cleanup channel FIRST — a grant defused after
-      // this instant fails its claim try_send and is POISONED (`watch` surfaces `Closed`) — then
-      // drain what landed BEFORE the cut and run the final owed pass, so a pre-cut claim still
-      // gets its parked Rescan delivered (Codex R29-F3) while no post-cut claim can ever return a
-      // live-looking subscription no drain will service. Bounded by grants in flight, never by the
-      // public backlog (Codex R30-F1); awaits nothing (invariant II). (The drain's own exit
-      // already cut+drained on the `None` path; `close` is idempotent.)
-      owner.cleanup_rx.close();
-      owner.drain_pending_cleanup();
-      owner.drain_owed_once();
-    }
+    // The ATOMIC claim cut (Codex R32), UNCONDITIONAL on every drain exit (Codex R33-F1 — the
+    // dropped-handles `commands.recv()` Err exit returns without the drain's internal cut, and a
+    // grant holds `cleanup_tx` independently of the public senders, so it can still defuse in the
+    // pre-drop gap): close the cleanup channel FIRST — a grant defused after this instant fails
+    // its claim try_send and is POISONED (`watch` surfaces `Closed`) — then drain what landed
+    // BEFORE the cut and run the final owed pass, so a pre-cut claim still gets its parked Rescan
+    // delivered (Codex R29-F3) while no post-cut claim can ever return a live-looking subscription
+    // no drain will service. Bounded by grants in flight, never by the public backlog (Codex
+    // R30-F1); awaits nothing (invariant II). `close` is idempotent with the drain's internal cut.
+    owner.cleanup_rx.close();
+    owner.drain_pending_cleanup();
+    owner.drain_owed_once();
     interrupted
   } else {
     // Consumer-initiated close, or every handle dropped: drain any grant-resolution already queued at
