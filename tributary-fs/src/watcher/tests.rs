@@ -362,6 +362,55 @@ async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
   );
 }
 
+/// `request_unwatch` is the non-blocking, REPLY-LESS teardown twin of the awaited `unwatch` (Codex
+/// R41): it `try_send`s a reply-less `Unwatch` and reports whether the control channel accepted it —
+/// `true` with room, `false` when full or closed (or foreign) — never blocking or panicking. The
+/// enqueued command carries `reply: None`, marking it fire-and-forget for the driver.
+#[tokio::test]
+async fn request_unwatch_is_reply_less_and_reports_channel_capacity() {
+  let (watcher, commands) = manual_watcher();
+  let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
+
+  // A foreign handle is refused without touching the channel.
+  let foreign = RootHandle::new(
+    watcher.instance.wrapping_add(1),
+    ScopeId::new(1.try_into().unwrap()),
+  );
+  assert!(
+    !watcher.request_unwatch(foreign),
+    "a foreign handle is refused"
+  );
+
+  // With room, the request enqueues a REPLY-LESS Unwatch and reports success.
+  assert!(watcher.request_unwatch(handle), "the channel has room");
+  match commands.try_recv().expect("a command was enqueued") {
+    Command::Unwatch { scope, reply } => {
+      assert_eq!(scope, handle.scope());
+      assert!(
+        reply.is_none(),
+        "the reply-less request carries no reply (fire-and-forget)"
+      );
+    }
+    _ => panic!("expected an Unwatch command"),
+  }
+
+  // Saturate the bounded(16) channel: further requests are refused (false), never blocking.
+  for _ in 0..16 {
+    assert!(watcher.request_unwatch(handle));
+  }
+  assert!(
+    !watcher.request_unwatch(handle),
+    "a full channel refuses the request"
+  );
+
+  // A closed channel is likewise refused, never a panic.
+  drop(commands);
+  assert!(
+    !watcher.request_unwatch(handle),
+    "a closed channel refuses the request"
+  );
+}
+
 /// The awaited `set_cover` sends a SetCover carrying a reply to ack (the acked twin of the
 /// reply-less `request_set_cover`).
 #[tokio::test]

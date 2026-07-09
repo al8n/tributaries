@@ -276,7 +276,10 @@ async fn unwatch_stops_one_root_and_replies() {
   let (reply, on_reply) = futures_channel::oneshot::channel();
   rig
     .commands
-    .send(Command::Unwatch { scope, reply })
+    .send(Command::Unwatch {
+      scope,
+      reply: Some(reply),
+    })
     .await
     .unwrap();
   assert!(on_reply.await.unwrap(), "the scope existed");
@@ -647,7 +650,10 @@ async fn registry_sees_live_then_dead_in_order() {
   let (reply, on_reply) = futures_channel::oneshot::channel();
   rig
     .commands
-    .send(Command::Unwatch { scope, reply })
+    .send(Command::Unwatch {
+      scope,
+      reply: Some(reply),
+    })
     .await
     .unwrap();
   assert!(on_reply.await.unwrap(), "the unwatch resolves");

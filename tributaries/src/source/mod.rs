@@ -272,16 +272,18 @@ pub trait Source<C> {
   ///    single caller reconcile it queued behind). Two conforming mechanisms:
   ///    - **pre-application** — apply queued releases before the watch; or
   ///    - **conflict-triggered application-and-retry** — as [`FsSource`] now does: attempt the arm,
-  ///      and on the lower watcher's own `Overlaps` rejection apply the *named* conflicting release and
-  ///      retry (plus a small bounded opportunistic pre-application to keep clause 5 eventual and cap
-  ///      kernel-watch lingering). The lower watcher rejects by object/ancestor **identity** and names
-  ///      the conflicting root, so this is **identity-aware by construction** — it catches case /
+  ///      and on the lower watcher's own `Overlaps` rejection AWAIT the *named* conflicting release's
+  ///      teardown and retry (plus a NON-BLOCKING opportunistic hand-off that AWAITS NOTHING — a
+  ///      reply-less release request per queued entry when the control channel has room — to keep
+  ///      clause 5 eventual and cap kernel-watch lingering without coupling a disjoint arm to any
+  ///      teardown latency). The lower watcher rejects by object/ancestor **identity** and names the
+  ///      conflicting root, so this is **identity-aware by construction** — it catches case /
   ///      normalization aliases a byte-prefix overlap test would miss.
   ///
-  ///    A release not needed to clear a given arm's conflicts is left queued and follows clause 5
-  ///    (eventual — applied by a later arm's opportunistic or conflict-triggered application, or at
-  ///    teardown): a disjoint kernel watch never conflicts with the arm, so leaving it briefly live
-  ///    cannot cause an `Overlaps`.
+  ///    A release not needed to clear a given arm's conflicts is never AWAITED by that arm — it is
+  ///    handed over by the non-blocking request (or left queued when the channel is momentarily full)
+  ///    and follows clause 5 (eventual): a disjoint kernel watch never conflicts with the arm, so
+  ///    leaving it briefly live cannot cause an `Overlaps`.
   /// 3. **Logically dead immediately.** After `disarm(h)` returns, [`root_key`](Self::root_key)
   ///    answers `None`. The handle is retired from the umbrella's perspective the moment the request
   ///    is made; events still in flight carrying `h` fall to the dead-root drain exactly like any
@@ -291,9 +293,12 @@ pub trait Source<C> {
   ///    released root's runtime conditions reach the umbrella in-band as events, not out of band
   ///    here.
   /// 5. **Eventual release.** A requested release is applied no later than the source's next
-  ///    [`arm`](Self::arm) or its teardown (`Drop`). Between request and application the kernel watch
-  ///    may briefly linger; any events it emits route to nothing (the subsumer entry is gone) —
-  ///    correctness is unaffected.
+  ///    [`arm`](Self::arm) or its teardown (`Drop`), by one of three routes: a **non-blocking request**
+  ///    when the control channel has room (the normal path — it awaits nothing), the
+  ///    **conflict-triggered** teardown when a later arm's key overlaps the release (the only route that
+  ///    AWAITS, and only for that arm's OWN overlapping conflicts), or **teardown** (`Drop`). Between
+  ///    request and application the kernel watch may briefly linger; any events it emits route to
+  ///    nothing (the subsumer entry is gone) — correctness is unaffected.
   ///
   /// [`next`](Self::next) keeps its cancellation-safety contract unchanged, and [`arm`](Self::arm)
   /// keeps its caller-bounded liveness contract unchanged.
@@ -623,24 +628,46 @@ impl<C, H> SourceEvent<C, H> {
 pub struct FsSource<R: RuntimeLite> {
   watcher: Watcher<R>,
   /// Roots whose release was requested (via the synchronous [`disarm`](Source::disarm)) but not yet
-  /// applied to the [`Watcher`], each paired with the released root's **canonical path** captured at
-  /// `disarm` time (while it was still live in the registry). [`arm`](Source::arm) applies these two
-  /// ways (contract clause 2, Codex R29): (1) **opportunistically** it pops and unwatches at most
-  /// [`OPPORTUNISTIC_RELEASES`] of the OLDEST entries per arm — keeping clause 5 eventual (every queued
-  /// release is applied within a bounded number of subsequent arms) and capping how long a
-  /// released-but-lingering kernel watch survives — and (2) **on demand** it resolves any
-  /// [`Overlaps`](tributary_fs::WatchRootError::Overlaps) the watch attempt reports by unwatching the
-  /// entry the watcher *named* as the conflict (identity-aware — it catches case/normalization aliases)
-  /// and retrying. Either way the release work a single arm awaits is **bounded independent of the
-  /// queue depth**, so a caller-bounded `Watch`, and any [`close`](crate::Tributaries::close) queued
-  /// behind it, never waits on the whole backlog (Codex R28/R29). A `None` path means the root was
-  /// already torn down when disarmed; it can never be the *named* conflict, so it is applied only
+  /// handed to the [`Watcher`]'s control channel, each paired with the released root's **canonical
+  /// path** captured at `disarm` time (while it was still live in the registry). [`arm`](Source::arm)
+  /// drains this queue two ways (contract clause 2, Codex R29/R41): (1) **opportunistically** it walks
+  /// the queue and hands each entry to the watcher via the NON-BLOCKING, reply-less
+  /// [`request_unwatch`](tributary_fs::Watcher::request_unwatch) — moving it to the in-flight
+  /// [`enqueued`](Self::enqueued) sidecar — so the arm AWAITS NOTHING for a release that does not
+  /// overlap it (keeping clause 5 eventual: every queued release is enqueued the moment the control
+  /// channel has room), and (2) **on demand** it resolves any
+  /// [`Overlaps`](tributary_fs::WatchRootError::Overlaps) the watch attempt reports by AWAITING an
+  /// [`unwatch`](tributary_fs::Watcher::unwatch) of the entry the watcher *named* as the conflict
+  /// (identity-aware — it catches case/normalization aliases) and retrying. The only release work a
+  /// single arm AWAITS is (2) — bounded by that arm's OWN overlapping conflicts, never the (disjoint)
+  /// backlog — so a caller-bounded `Watch`, and any [`close`](crate::Tributaries::close) queued behind
+  /// it, never waits on unrelated teardown latency (Codex R28/R29/R41). A `None` path means the root
+  /// was already torn down when disarmed; it can never be the *named* conflict, so it is applied only
   /// opportunistically (or at `Drop`, where the [`Watcher`]'s own teardown releases every live root).
   /// Bounded in practice by the live-root count: each generation-unique handle is released at most once.
   pending_releases: VecDeque<(RootHandle, Option<PathBuf>)>,
-  /// Mirror of [`pending_releases`](Self::pending_releases) for O(1)
-  /// [`root_key`](Source::root_key) liveness answers — contract clause 3: a requested release is
-  /// logically dead **immediately**, before the transport teardown is applied.
+  /// Requested releases whose reply-less [`request_unwatch`](tributary_fs::Watcher::request_unwatch)
+  /// the control channel ACCEPTED but the watcher registry may not yet reflect — the **in-flight**
+  /// releases (Codex R41). Kept so a conflicting later arm can still resolve an
+  /// [`Overlaps`](tributary_fs::WatchRootError::Overlaps) the watcher NAMES against a release whose
+  /// fire-and-forget teardown has not landed yet: the entry is no longer in
+  /// [`pending_releases`](Self::pending_releases), so without this sidecar the exact-match would miss
+  /// and the arm would wrongly surface the overlap. On such a match the arm AWAITS an
+  /// [`unwatch`](tributary_fs::Watcher::unwatch) of the named handle — which, enqueued after the
+  /// reply-less request on the one FIFO channel, forces the teardown to land — then retries. Pruned at
+  /// each arm's top of every entry the watcher has since applied
+  /// ([`root_path`](tributary_fs::Watcher::root_path) `None`) — once the registry has forgotten a root
+  /// it can never NAME it — so it is bounded by the in-flight (requested-but-unapplied) release count,
+  /// never the watcher's lifetime.
+  enqueued: Vec<(RootHandle, Option<PathBuf>)>,
+  /// Union mirror of the requested releases — queued in [`pending_releases`](Self::pending_releases)
+  /// AND in-flight in [`enqueued`](Self::enqueued) — for O(1) [`root_key`](Source::root_key) liveness
+  /// answers (contract clause 3: a requested release is logically dead **immediately**, before its
+  /// teardown lands). A handle stays dead-marked here exactly while the watcher still reports its root
+  /// live; the same top-of-arm prune drops the mark the instant
+  /// [`root_path`](tributary_fs::Watcher::root_path) takes over answering `None`, so the invariant
+  /// "`root_key` is `None` from `disarm` until the handle is fully gone" holds unbroken while the set
+  /// stays bounded by in-flight releases.
   pending_set: HashSet<RootHandle>,
 }
 
@@ -663,19 +690,11 @@ impl<R: RuntimeLite> FsSource<R> {
     Ok(Self {
       watcher: Watcher::new(options)?,
       pending_releases: VecDeque::new(),
+      enqueued: Vec::new(),
       pending_set: HashSet::new(),
     })
   }
 }
-
-/// How many of the OLDEST queued releases each [`arm`](Source::arm) applies **opportunistically**
-/// (unwatched up front, regardless of overlap) before attempting the watch. Keeps the release queue
-/// draining under a bounded per-arm cost so clause 5 stays eventual (every queued release is applied
-/// within a bounded number of subsequent arms) and a released-but-lingering kernel watch is torn down
-/// promptly, while HARD-BOUNDING the release work any single arm awaits (Codex R29). Small: the common
-/// case is one queued release (a re-watch of a just-released key), and the correctness path — never
-/// surfacing an `Overlaps` for a released root — is the conflict-triggered retry, not this.
-const OPPORTUNISTIC_RELEASES: usize = 2;
 
 impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
@@ -698,20 +717,43 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, RootHandle>, WatchError> {
-    // (a) OPPORTUNISTIC bounded application: unwatch the OLDEST few queued releases up front,
-    // regardless of overlap. This keeps clause 5 eventual (every queued release is applied within a
-    // bounded number of subsequent arms) and caps how long a released-but-lingering kernel watch
-    // survives, while HARD-BOUNDING the release work this arm awaits — the R29 decoupling of a
-    // caller-bounded `Watch` (and any `close` queued behind it) from the whole release backlog. Each
-    // is a bounded(16)-channel send + driver ack (`Watcher::unwatch` awaits it); the result is ignored
-    // (release is best-effort). This is NOT the correctness mechanism — (c) below is — so applying an
-    // unrelated release here is harmless (it was going to be released anyway, clause 5).
-    for _ in 0..OPPORTUNISTIC_RELEASES {
-      let Some((released, _)) = self.pending_releases.pop_front() else {
+    // (0) MAINTENANCE: drop every in-flight release the watcher has SINCE applied, and its dead-mark.
+    // Once the watcher's registry has forgotten a root, it can never NAME it as a conflict again, and
+    // `root_path` now answers the same `None` the mirror did — so pruning here keeps both the in-flight
+    // sidecar and `pending_set` bounded by the in-flight (requested-but-unapplied) release count (never
+    // the watcher's lifetime), while preserving the clause-3 invariant: a handle stays dead-marked in
+    // `pending_set` exactly while the watcher still reports its root live, and the prune drops the mark
+    // the instant `root_path` takes over answering `None`. Split-borrow: `watcher` is a shared reborrow
+    // so each `retain` can mutate a DIFFERENT field.
+    {
+      let watcher = &self.watcher;
+      self
+        .enqueued
+        .retain(|(handle, _)| watcher.root_path(*handle).is_some());
+      self
+        .pending_set
+        .retain(|handle| watcher.root_path(*handle).is_some());
+    }
+
+    // (a) OPPORTUNISTIC NON-BLOCKING application: walk the pending-release queue and hand each entry to
+    // the watcher's control channel via the reply-less `request_unwatch` (a `try_send`). On acceptance
+    // the entry moves from the queue to the in-flight `enqueued` sidecar and STAYS dead-marked in
+    // `pending_set` (it is logically dead until its teardown lands, clause 3). This AWAITS NOTHING — a
+    // disjoint arm is decoupled from every release's teardown latency (Codex R41) — while keeping
+    // clause 5 eventual: every queued release is handed over the moment the channel has room. A
+    // full/closed channel stops the drain, leaving the rest queued for a later arm, the
+    // conflict-triggered path (c), or `Drop`. This is NOT the correctness mechanism — (c) is — so
+    // enqueuing an unrelated release here is harmless (it was going to be released anyway).
+    while let Some(entry) = self.pending_releases.pop_front() {
+      // `entry.0` is `Copy` (a `RootHandle`), so the try_send borrows nothing of `entry`.
+      if self.watcher.request_unwatch(entry.0) {
+        self.enqueued.push(entry);
+      } else {
+        // Channel full/closed: return the entry to the FRONT (FIFO preserved) and stop — the rest
+        // stay queued for a later arm, the conflict-triggered path (c), or `Drop`.
+        self.pending_releases.push_front(entry);
         break;
-      };
-      let _ = self.watcher.unwatch(released).await;
-      self.pending_set.remove(&released);
+      }
     }
     // (b)+(c) Arm the root, resolving on demand any `Overlaps` the watcher reports against a
     // released-but-still-lingering root. Roots are always armed `Interest::all` (design §4): the kernel
@@ -719,24 +761,29 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     // already carries it (interest becomes a pure fan-out gate at the umbrella).
     //
     // The correctness guarantee — a conforming source never SURFACES an `Overlaps` for a root whose
-    // release was requested (disarm contract clause 2) — is upheld here by construction: the WATCHER
-    // itself names the conflicting `existing` root (it rejects by object/ancestor IDENTITY, so it
-    // catches case/normalization aliases a byte-prefix overlap test would miss — Codex R29-F2). Retry
-    // is a **structural progress bound** (Codex R30-F2), not a fixed cap: continue ONLY while the named
-    // `existing` EXACT-matches a still-pending (released) entry — remove exactly it, unwatch, and
-    // re-attempt. Each retry strictly SHRINKS the pending queue (one exact-matched entry removed), so
-    // the loop terminates in ≤ pending-queue-length retries with no arbitrary ceiling (the common case
-    // is ≤1; an ancestor arm over N released descendants is bounded by the N the watcher names one at a
-    // time — however large N is). A rejection whose named conflict is NOT a pending entry — a genuine
-    // LIVE conflict (an umbrella-side disjointness bug), never a lingering released root — surfaces the
-    // overlap IMMEDIATELY: there is no index-0 fallback, so we never unwatch an unrelated pending root
-    // to mask a real conflict.
+    // release was requested, QUEUED or IN-FLIGHT (disarm contract clause 2) — is upheld here by
+    // construction: the WATCHER itself names the conflicting `existing` root (it rejects by
+    // object/ancestor IDENTITY, so it catches case/normalization aliases a byte-prefix overlap test
+    // would miss — Codex R29-F2). While the watcher's registry still reports a requested release live
+    // (so it can name it), that release is in `pending_releases` (not yet handed over) OR in `enqueued`
+    // (handed over, teardown not landed) — never neither — so the named `existing` EXACT-matches one of
+    // the two. Retry is a **structural progress bound** (Codex R30-F2/R41), not a fixed cap: on a match
+    // remove exactly that entry, AWAIT its `unwatch`, and re-attempt. An `enqueued` match awaits an
+    // acked `unwatch` that — enqueued after the earlier reply-less request on the one FIFO channel —
+    // resolves only once the driver has processed that teardown and reclaimed the registry entry, so
+    // the retry sees the root gone. Each retry strictly SHRINKS `pending_releases` + `enqueued` (one
+    // exact-matched entry removed, neither grows in the loop), so it terminates in ≤ (queued + in-flight)
+    // retries with no arbitrary ceiling (the common case is ≤1; an ancestor arm over N released
+    // descendants is bounded by the N the watcher names one at a time — however large N is). A rejection
+    // whose named conflict is in NEITHER set — a genuine LIVE conflict (an umbrella-side disjointness
+    // bug), never a lingering released root — surfaces the overlap IMMEDIATELY: there is no index-0
+    // fallback, so we never unwatch an unrelated pending root to mask a real conflict.
     let arm_path = key_to_path(key);
     // Progress tripwire (debug-only): the exact-match retry can run at most one more iteration than the
-    // pending queue was deep, since pending strictly shrinks each retry and a non-matching rejection
-    // exits immediately.
+    // queued-plus-in-flight release count was deep, since that total strictly shrinks each retry and a
+    // non-matching rejection exits immediately.
     #[cfg(debug_assertions)]
-    let initial_pending = self.pending_releases.len();
+    let initial_pending = self.pending_releases.len() + self.enqueued.len();
     #[cfg(debug_assertions)]
     let mut iterations = 0usize;
     let handle = loop {
@@ -745,27 +792,39 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
         iterations += 1;
         debug_assert!(
           iterations <= initial_pending + 1,
-          "FsSource::arm conflict-retry exceeded pending+1 iterations — pending must strictly shrink \
-           each retry (structural progress bound, Codex R30-F2)"
+          "FsSource::arm conflict-retry exceeded (queued + in-flight)+1 iterations — the queued and \
+           in-flight release sets must strictly shrink each retry (structural progress bound, Codex \
+           R30-F2/R41)"
         );
       }
       match self.watcher.watch(arm_path.clone(), Interest::all()).await {
         Ok(handle) => break handle,
         Err(WatchRootError::Overlaps { path, existing }) => {
-          // Continue ONLY while the named conflict EXACT-matches a pending entry; otherwise surface it.
-          let Some(index) = self
+          // Resolve ONLY a conflict the watcher NAMES against a release we requested — QUEUED (not yet
+          // handed to the channel) or IN-FLIGHT (handed over, teardown not landed). Await its teardown
+          // and retry; a named conflict in neither set is a genuine live overlap, surfaced as-is.
+          if let Some(index) = self
             .pending_releases
             .iter()
             .position(|(_, stored)| stored.as_deref() == Some(existing.as_path()))
-          else {
+          {
+            let (released, _) = self
+              .pending_releases
+              .remove(index)
+              .expect("index in bounds");
+            let _ = self.watcher.unwatch(released).await;
+            self.pending_set.remove(&released);
+          } else if let Some(index) = self
+            .enqueued
+            .iter()
+            .position(|(_, stored)| stored.as_deref() == Some(existing.as_path()))
+          {
+            let (released, _) = self.enqueued.remove(index);
+            let _ = self.watcher.unwatch(released).await;
+            self.pending_set.remove(&released);
+          } else {
             return Err(WatchError::Fs(WatchRootError::Overlaps { path, existing }));
-          };
-          let (released, _) = self
-            .pending_releases
-            .remove(index)
-            .expect("index in bounds");
-          let _ = self.watcher.unwatch(released).await;
-          self.pending_set.remove(&released);
+          }
         }
         Err(err) => return Err(err.into()),
       }
@@ -785,17 +844,16 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   }
 
   fn disarm(&mut self, handle: RootHandle) {
-    // Synchronous, non-blocking release REQUEST (contract clauses 1 & 3). The `Watcher`'s `unwatch`
-    // awaits a bounded(16) command-channel ack, so the actual teardown cannot run inline here; queue
-    // it — paired with the released root's canonical path captured NOW, while the root is still live
-    // in the registry (the release is only queued, never applied inline), so a later `arm` can match
-    // this entry against the conflict the watcher NAMES and apply exactly it (contract clause 2, Codex
-    // R29). A `None` path means the root is already gone (`root_path` answers `None`): it can never be
-    // the named conflict, so it is only applied opportunistically (or at `Drop`). Applied at a
-    // subsequent `arm` (opportunistically as one of the oldest, or on demand when it blocks that arm)
-    // or at `Drop` (the `Watcher`'s own teardown releases every live root). The `pending_set` mirror
-    // makes the handle logically dead the instant this returns — `root_key` answers `None`. Idempotent
-    // by the set: re-requesting an already-pending (or unknown/dead) handle is a no-op.
+    // Synchronous, non-blocking release REQUEST (contract clauses 1 & 3): queue it — paired with the
+    // released root's canonical path captured NOW, while the root is still live in the registry — never
+    // apply it inline. A later `arm` hands it to the watcher via the NON-BLOCKING `request_unwatch`
+    // (the common path, which awaits nothing), or — if that arm's key overlaps this release — resolves
+    // the conflict the watcher NAMES by awaiting exactly its `unwatch` (contract clause 2, Codex
+    // R29/R41); `Drop` releases whatever is left (the `Watcher`'s own teardown reclaims every live
+    // root). A `None` path means the root is already gone (`root_path` answers `None`): it can never be
+    // the named conflict, so it is only applied opportunistically. The `pending_set` mirror makes the
+    // handle logically dead the instant this returns — `root_key` answers `None`. Idempotent by the
+    // set: re-requesting an already-pending (or unknown/dead) handle is a no-op.
     if self.pending_set.insert(handle) {
       let root_path = self.watcher.root_path(handle);
       self.pending_releases.push_back((handle, root_path));
