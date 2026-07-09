@@ -254,12 +254,16 @@ pub(crate) enum Command {
     /// canonical root path event paths will arrive under.
     reply: WatchReply,
   },
-  /// Stop watching a root; resolves once its stream is torn down.
+  /// Stop watching a root; the awaited form resolves once its stream is torn down.
   Unwatch {
     /// The scope to stop.
     scope: ScopeId,
-    /// Resolved with whether the scope existed.
-    reply: futures_channel::oneshot::Sender<bool>,
+    /// `Some` for the awaited [`Watcher::unwatch`](crate::Watcher::unwatch) (resolved with
+    /// whether the scope existed); `None` for the non-blocking, reply-less
+    /// [`Watcher::request_unwatch`](crate::Watcher::request_unwatch) — the SAME teardown and
+    /// registry reclamation, simply unacknowledged (Codex R41). The driver applies both
+    /// identically and skips the ack when there is no reply.
+    reply: Option<futures_channel::oneshot::Sender<bool>>,
   },
   /// Reconcile a live scope's per-directory coverage to the `retained` cover IN PLACE,
   /// BIDIRECTIONALLY — prune every descended watch strictly outside the cover AND re-arm
@@ -1132,9 +1136,15 @@ pub(crate) async fn run<R, F>(
         }
         Ok(Command::Unwatch { scope, reply }) => {
           if handles.contains_key(&scope) || watch_replies.contains_key(&scope) {
-            unwatch_replies.insert(scope, reply);
+            // The awaited form records its waiter (answered at scope-dead); the reply-less
+            // `request_unwatch` tears down identically but registers none (Codex R41).
+            if let Some(reply) = reply {
+              unwatch_replies.insert(scope, reply);
+            }
             core.on_unwatch(scope);
-          } else {
+          } else if let Some(reply) = reply {
+            // Unknown scope: only the awaited form is answered — the reply-less request is
+            // fire-and-forget, so a no-op teardown is silently complete.
             let _ = reply.send(false);
           }
         }

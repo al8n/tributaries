@@ -691,11 +691,14 @@ impl DriverCore {
   /// skipped grow merely leaves the newcomer briefly under-covered until the umbrella's own
   /// bridging `Rescan` and a later re-issue converge — neither loses an event under a retained,
   /// covered key, and neither emits a `Rescan`. A **no-op** for an unknown scope, an empty
-  /// `retained` (defensive — never prune the whole tree), and — naturally — a
-  /// **kernel-recursive** scope (fanotify / FSEvents): its single whole-subtree stream has no
-  /// per-directory children, so the prune walk finds only the root node (never strictly outside
-  /// its own retained descendants) and the grow's ancestor is the root, whose re-arm is a
-  /// documented no-op (its coverage never shrank). Each pruned watch's
+  /// `retained` (defensive — never prune the whole tree), a `retained` cover ENTIRELY outside the
+  /// live root (a caller error — validated against the scope root and refused before any prune, so a
+  /// typo / relative / stale path can never silently prune the whole scope — Codex R41), and —
+  /// naturally — a **kernel-recursive** scope (fanotify / FSEvents): its single whole-subtree stream
+  /// has no per-directory children, so the prune walk finds only the root node (never strictly
+  /// outside its own retained descendants) and the grow's ancestor is the root, whose re-arm is a
+  /// documented no-op (its coverage never shrank). A PARTIALLY out-of-root cover proceeds with the
+  /// in-root subset only. Each pruned watch's
   /// [`RemoveWatch`](Effect::RemoveWatch) and each grown watch's [`AddWatch`](Effect::AddWatch) /
   /// [`Enumerate`](Effect::Enumerate) flow through the ordinary descending paths, keeping the
   /// reader's `wd` table and the core's addressing maps consistent exactly as delete-driven and
@@ -709,6 +712,27 @@ impl DriverCore {
     if retained.is_empty() {
       return;
     }
+    // Validate the retained cover against the LIVE scope root before acting on it (Codex R41). A
+    // retained path that is not under the root — a caller typo, a relative or stale path — lies
+    // strictly OUTSIDE every in-root watch, so an UNVALIDATED cover would mark the whole scope
+    // outside and SILENTLY PRUNE ALL coverage. Keep only paths within the root (the root itself
+    // allowed). A root not yet known (stream not spawned) cannot validate anything, so no-op.
+    let Some(root) = state.root.clone() else {
+      return;
+    };
+    let retained: Vec<PathBuf> = retained
+      .iter()
+      .filter(|path| path.starts_with(root.as_path()))
+      .cloned()
+      .collect();
+    // An ENTIRELY out-of-root cover is a caller error the core refuses to act on: do NOT prune and
+    // do NOT record `applied_cover`, leaving the prior (still-correct) coverage untouched. A
+    // PARTIALLY valid cover proceeds with the valid subset ONLY — the invalid prefixes are dropped.
+    if retained.is_empty() {
+      return;
+    }
+    let retained = retained.as_slice();
+
     let root_watch = state.watch;
     // The cover the previous reconcile settled on: the grow keys its re-arm on the delta
     // against THIS, not on which watches survive (Codex R37-F1).

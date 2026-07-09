@@ -2433,6 +2433,56 @@ fn broadening_delta_is_the_uncovered_retained_prefixes() {
   );
 }
 
+/// R41: `on_set_cover` validates the retained cover against the LIVE scope root before acting on it. A
+/// cover ENTIRELY outside the root is a caller error — refused as a no-op (no prune, `applied_cover`
+/// left untouched), so a typo / relative / stale path can never mark every in-root watch strictly-
+/// outside and SILENTLY PRUNE the whole scope; a PARTIALLY out-of-root cover proceeds with the in-root
+/// subset only. Exercised on a kernel-recursive scope: its prune/grow are structural no-ops here (one
+/// root watch, no broadening delta), so the observable effect is exactly the filter + the
+/// `applied_cover` recording it guards — which run for every backend.
+#[test]
+fn set_cover_validates_retained_against_the_scope_root() {
+  let (mut core, scope) = live_core(); // canonical root `/r`
+  let applied = |core: &DriverCore| core.scopes.get(&scope).unwrap().applied_cover.clone();
+
+  // (1) A cover ENTIRELY outside the root is refused as a no-op: nothing pruned, `applied_cover`
+  // stays `None` — a typo / relative / stale path can never silently collapse the scope's coverage.
+  core.on_set_cover(
+    scope,
+    &[PathBuf::from("/outside"), PathBuf::from("relative/x")],
+  );
+  assert_eq!(
+    applied(&core),
+    None,
+    "an all-out-of-root cover is refused — never recorded, never a full prune"
+  );
+
+  // (2) The root itself is a valid retained prefix (the boundary case): honored and recorded.
+  core.on_set_cover(scope, &[PathBuf::from("/r")]);
+  assert_eq!(
+    applied(&core),
+    Some(vec![PathBuf::from("/r")]),
+    "the root path itself is within the root and honored"
+  );
+
+  // (3) A MIXED cover proceeds with the in-root subset ONLY — the out-of-root prefix is dropped.
+  core.on_set_cover(scope, &[PathBuf::from("/r/a"), PathBuf::from("/elsewhere")]);
+  assert_eq!(
+    applied(&core),
+    Some(vec![PathBuf::from("/r/a")]),
+    "only the in-root prefix is honored; the out-of-root one is filtered away"
+  );
+
+  // (4) A later all-out-of-root cover is STILL refused — it must not overwrite or reset the prior,
+  // still-correct coverage.
+  core.on_set_cover(scope, &[PathBuf::from("/bad")]);
+  assert_eq!(
+    applied(&core),
+    Some(vec![PathBuf::from("/r/a")]),
+    "an all-out-of-root cover leaves the prior applied cover untouched"
+  );
+}
+
 mod lowering {
   use super::*;
 

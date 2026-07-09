@@ -502,7 +502,7 @@ impl<R: RuntimeLite> Watcher<R> {
       .commands
       .send(Command::Unwatch {
         scope: root.scope(),
-        reply,
+        reply: Some(reply),
       })
       .await
       .is_err()
@@ -533,6 +533,36 @@ impl<R: RuntimeLite> Watcher<R> {
         Err(UnwatchError::Closed)
       }
     }
+  }
+
+  /// Requests teardown of a root like [`unwatch`](Self::unwatch), but as a NON-BLOCKING,
+  /// REPLY-LESS fire-and-forget: it `try_send`s the ack-less command and reports whether the
+  /// control channel accepted it. Unlike `unwatch` it never awaits — so the layer above can apply
+  /// a queued release opportunistically without coupling a disjoint arm (and any `close` queued
+  /// behind it) to that release's teardown latency (Codex R41).
+  ///
+  /// The driver tears a reply-less `Unwatch` down exactly like the awaited one — the same stream
+  /// teardown and registry reclamation — it simply sends no acknowledgement, so the caller cannot
+  /// observe completion (nor the scope-existed bool). A caller that must KNOW the root is gone — to
+  /// clear a just-surfaced [`Overlaps`](WatchRootError::Overlaps) naming it — awaits
+  /// [`unwatch`](Self::unwatch) instead; enqueued after this reply-less request on the one FIFO
+  /// control channel, that awaited `unwatch` resolves only once the driver has processed this
+  /// teardown and reclaimed the registry entry.
+  ///
+  /// Returns `false` when the control channel is full (the caller re-tries at its next
+  /// opportunity) or closed, or when `root` is a foreign handle; `true` when the request was
+  /// enqueued. Never blocks and never panics.
+  pub fn request_unwatch(&self, root: RootHandle) -> bool {
+    if root.instance() != self.instance {
+      return false;
+    }
+    self
+      .commands
+      .try_send(Command::Unwatch {
+        scope: root.scope(),
+        reply: None,
+      })
+      .is_ok()
   }
 
   /// Reconciles a watched root's per-directory coverage to the `retained` cover **in place**,
