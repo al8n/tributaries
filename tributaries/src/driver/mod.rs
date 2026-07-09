@@ -63,10 +63,14 @@ mod tests;
 ///
 /// The owner processes each to completion (invariant I1): dropping the caller's returned
 /// future drops only the [`oneshot::Receiver`](futures_channel::oneshot::Receiver), never
-/// the reconcile the owner runs. The one **reply-less** variant is [`DropOrphan`](Self::DropOrphan):
-/// a [`WatchGrant`]'s `Drop` enqueues it to reconcile away a subscription whose caller's `watch`
-/// wait was dropped after the owner had already committed it (closing the invariant-I1 orphan
-/// window a bare `Subscription` reply left open).
+/// the reconcile the owner runs. Two variants are **reply-less**, and are the paired resolution of
+/// a single committed-but-unclaimed [`WatchGrant`] — **exactly one** ever fires per grant (see
+/// [`WatchGrant`]): [`ClaimGrant`](Self::ClaimGrant), enqueued by the grant's
+/// [`defuse`](WatchGrant::defuse) when the caller claims the subscription, and
+/// [`DropOrphan`](Self::DropOrphan), enqueued by the grant's `Drop` when the caller's `watch` wait
+/// was dropped after the owner had already committed it (closing the invariant-I1 orphan window a
+/// bare `Subscription` reply left open). Both drive the owner's [`unclaimed`](Owner::unclaimed)
+/// suppression state — a claim lifts it (the debt is now genuinely owed), a drop purges it.
 enum Command<C, V> {
   /// Subscribe to `key` (carrying caller `value`), with the given fan-out `interest` and
   /// admission `filter`.
@@ -103,7 +107,19 @@ enum Command<C, V> {
   /// whose emptied-root [`disarm`](crate::Source::disarm) is a fire-and-forget request — and ignores
   /// the result (it is cleanup, not a caller request). Because that release awaits nothing, a `Close`
   /// queued behind a `DropOrphan` is never blocked (invariant II — Close-responsive by construction).
+  /// `release_subscription` also removes the sub from [`unclaimed`](Owner::unclaimed) (purging its
+  /// suppressed parked debt). The **exactly-one-of-two** twin of [`ClaimGrant`](Self::ClaimGrant).
   DropOrphan(Subscription),
+  /// Lift the [`unclaimed`](Owner::unclaimed) suppression for a subscription the caller **claimed**
+  /// (invariant I1). Enqueued **only** by a [`WatchGrant`]'s [`defuse`](WatchGrant::defuse), which is
+  /// synchronous, so it too carries no `oneshot` reply and rides a non-blocking `try_send` on the
+  /// grant's held strong `commands` sender. Processing it just removes the sub from `unclaimed`, so
+  /// its parked overflow/terminal `Rescan` (if any) is no longer suppressed — a claimed subscription
+  /// is genuinely owed its debt (see [`flush_pending_rescans`](Owner::flush_pending_rescans)). A pure
+  /// [`HashSet`](std::collections::HashSet) remove that awaits nothing, so a `Close` behind it is
+  /// never blocked (invariant II). The **exactly-one-of-two** twin of [`DropOrphan`](Self::DropOrphan):
+  /// `defuse` consumes the grant and sets `defused`, so the grant's `Drop` then no-ops.
+  ClaimGrant(Subscription),
 }
 
 /// A single-use RAII grant carrying a freshly-committed [`Subscription`] back to a waiting
@@ -111,17 +127,24 @@ enum Command<C, V> {
 /// (design driver-golden doc, mirroring the lower fs layer's arm-grant pattern).
 ///
 /// The owner commits the subscription (subsumer entry, filter, epoch state, possibly an armed
-/// root), then hands ownership of the **reconcile-away obligation** to this grant and sends it
-/// through the reply `oneshot`. Two outcomes, exhaustively:
+/// root), records it in [`unclaimed`](Owner::unclaimed) (so its parked debt is suppressed while in
+/// flight — see [`flush_pending_rescans`](Owner::flush_pending_rescans)), and sends the grant
+/// through the reply `oneshot`. **Exactly one** of two reply-less commands then fires per grant,
+/// resolving that suppression:
 ///
-/// - the caller's wait observes the reply → it [`defuse`](Self::defuse)s the grant and takes the
-///   [`Subscription`]; the grant's `Drop` becomes a no-op, so a normal successful `watch` runs
-///   **no** extra reconcile;
+/// - the caller's wait observes the reply → it [`defuse`](Self::defuse)s the grant, which enqueues
+///   a [`ClaimGrant`](Command::ClaimGrant) (lifting the suppression — the caller now holds the sub,
+///   so its debt is genuinely owed) and takes the [`Subscription`]; the grant's `Drop` then no-ops,
+///   so a normal successful `watch` runs **no** extra reconcile;
 /// - the caller's wait is dropped before it observes the reply — whether the receiver was already
 ///   gone the instant the owner sent, OR it vanished in the **post-send, pre-poll** window that a
 ///   bare `Subscription` reply could not cover — the grant is dropped instead, and its `Drop`
 ///   best-effort enqueues a reply-less [`DropOrphan`](Command::DropOrphan) the owner reconciles
-///   away, releasing the root / filter / epoch exactly like an [`unwatch`](Tributaries::unwatch).
+///   away, releasing the root / filter / epoch / `unclaimed` entry exactly like an
+///   [`unwatch`](Tributaries::unwatch).
+///
+/// `defuse` consuming the grant (setting `defused`) is what makes it exactly-one-of-two: a defused
+/// grant's `Drop` enqueues nothing, so `ClaimGrant` and `DropOrphan` are mutually exclusive.
 ///
 /// So a committed-but-unclaimed subscription can never be stranded advertised-yet-unreachable.
 /// The `Drop` fires at most once (Rust drops each value once) and is idempotent even against a
@@ -153,8 +176,18 @@ impl<C, V> WatchGrant<C, V> {
 
   /// Claims the subscription for a caller that observed the reply, defusing the grant so its
   /// `Drop` enqueues no cleanup — the normal successful `watch` path.
+  ///
+  /// Before returning the [`Subscription`], best-effort enqueue a reply-less
+  /// [`ClaimGrant`](Command::ClaimGrant) on the grant's held strong `commands` sender so the owner
+  /// lifts this sub's [`unclaimed`](Owner::unclaimed) suppression (the caller now holds it, so any
+  /// parked debt is genuinely owed). A `defuse` is synchronous and cannot await, so it is a
+  /// non-blocking [`try_send`](async_channel::Sender::try_send); a closed channel means the owner is
+  /// already tearing down and the claim is moot (the sub is dead like any post-teardown sub). This
+  /// and the `Drop`'s [`DropOrphan`](Command::DropOrphan) are **exactly-one-of-two**: setting
+  /// `defused` makes the subsequent `Drop` a no-op.
   fn defuse(mut self) -> Subscription {
     self.defused = true;
+    let _ = self.commands.try_send(Command::ClaimGrant(self.sub));
     self.sub
   }
 }
@@ -280,6 +313,7 @@ where
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
+      unclaimed: std::collections::HashSet::new(),
       coalescer: debounce.map(Coalescer::new),
       // A weak self-clone (downgrade takes `&self`, so `command_tx` is still moved into the handle
       // below): grants upgrade it to enqueue a `DropOrphan` without keeping the channel open.
@@ -502,6 +536,24 @@ where
   /// ordinary deliveries to a parked subscription (they are dominated by its `Rescan`), so
   /// a shed can never be lost to a full channel (no-silent-loss).
   needs_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
+  /// The subscriptions whose committed [`WatchGrant`] is still **in flight** — grant sent, not yet
+  /// claimed or dropped (design driver-golden doc, Codex R24). A sub is inserted by
+  /// [`on_watch`](Self::on_watch) the instant the grant send **succeeds**, and removed by exactly one
+  /// of: its [`ClaimGrant`](Command::ClaimGrant) (the caller [`defuse`](WatchGrant::defuse)d it — now
+  /// genuinely owed), its [`DropOrphan`](Command::DropOrphan) via
+  /// [`release_subscription`](Self::release_subscription) (the caller's wait was dropped — purged), or
+  /// any other `release_subscription` (unwatch/orphan/teardown).
+  ///
+  /// This is the **correctness boundary** that replaces the old mailbox-idle flush gate (Codex R23):
+  /// [`flush_pending_rescans`](Self::flush_pending_rescans) **suppresses** (retains without sending)
+  /// any parked `Rescan` whose sub is in this set. Parked debt for a still-unclaimed grant is owed to
+  /// **nobody** — the caller never obtained the subscription — so offering it would deliver a `Rescan`
+  /// for a subscription the caller never received. It is owner-local state mutated **only** by the
+  /// owner while processing a command, so it is consulted at flush time with no probe and no timing
+  /// window (unlike a mailbox-emptiness gate, which is neither a correctness nor a starvation
+  /// boundary). Ordinary (non-parked) deliveries during the in-flight window are unaffected — only the
+  /// durable `needs_rescan` debt is state-gated.
+  unclaimed: std::collections::HashSet<Subscription>,
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
   /// A **weak** clone of the owner's own command `Sender`, upgraded to a strong `Sender` and
@@ -590,21 +642,19 @@ where
   // stream ends. A consumer-initiated `Close` or a dropped last handle owes nothing (the
   // consumer asked to stop / nobody is left), and must never block teardown on a full channel.
   let (closing, drain_owed) = loop {
-    // Re-offer the parked per-subscription overflow Rescans ahead of new deltas — but ONLY when the
-    // command mailbox is idle, so queued cleanup is serviced before any parked debt is offered
-    // (Codex R23). The select below is command-biased, so an idle mailbox lets it drain queued
-    // commands to quiescence — each `DropOrphan` purging its sub's parked entry via
-    // `release_subscription` — before the next tick's flush can offer a `Rescan`. Without the gate an
-    // orphaned (committed-but-unclaimed, then dropped) subscription's parked terminal `Rescan` could
-    // be delivered ahead of the `DropOrphan` that purges it — an event for a subscription the caller
-    // never obtained. Per-subscription ordering is unaffected (a parked sub's ordinary deltas are
-    // suppressed and its `Rescan`s merged by `try_emit` regardless of flush timing); durability is
-    // unaffected (`needs_rescan` entries persist — delivery is deferred to command-quiescence, never
-    // dropped, and the retry timer plus every later tick re-offer them). A busy mailbox delays the
-    // flush only as long as the command burst (design backpressure doc, no-silent-loss).
-    if owner.commands.is_empty() {
-      owner.flush_pending_rescans();
-    }
+    // Re-offer the parked per-subscription overflow Rescans ahead of new deltas — **unconditionally**
+    // every tick (Codex R24). Which parked debt is *offered* is decided by owner STATE, not mailbox
+    // timing: [`flush_pending_rescans`](Owner::flush_pending_rescans) suppresses any entry whose sub
+    // is still `unclaimed` (its `WatchGrant` in flight), so an orphaned committed-but-unclaimed
+    // subscription's parked terminal `Rescan` is never delivered — no probe, no window — while a
+    // LIVE claimed subscription's parked Rescan is flushed every tick regardless of how busy the
+    // (command-biased, unbounded) mailbox is. The old idle-mailbox gate did neither correctly: it was
+    // a TOCTOU race (a `DropOrphan` could enqueue after the emptiness probe but before the flush's
+    // `try_send`, Codex R24-F1) AND it let a sustained watch/unwatch stream starve live subscriptions'
+    // parked Rescans by keeping `is_empty()` false forever (Codex R24-F2). Per-subscription ordering
+    // and durability are unaffected (a parked sub's ordinary deltas are suppressed and its `Rescan`s
+    // merged by `try_emit`; `needs_rescan` entries persist until delivered or purged).
+    owner.flush_pending_rescans();
 
     // The sleep target: the coalescer's next settle deadline, floored by a short retry
     // while any parked Rescan still awaits a channel slot — so a resuming consumer gets its
@@ -681,10 +731,14 @@ where
     // a full channel is always answered (no silent loss, without an unserviceable `Close`).
     owner.drain_owed_before_shutdown().await
   } else {
-    // Consumer-initiated `Close`, or every handle dropped: one best-effort pass that services queued
-    // cleanup, then delivers the owed tail when the channel has room. Teardown never blocks on the
-    // channel, so `Close` stays responsive.
-    owner.best_effort_final_drain(closing)
+    // Consumer-initiated `Close`, or every handle dropped: one best-effort non-blocking pass that
+    // delivers the owed tail when the channel has room. An unclaimed sub's parked debt is SUPPRESSED
+    // by owner state inside this `drain_owed_once` (its `flush_pending_rescans`), so a residual
+    // `DropOrphan`/`ClaimGrant` still queued behind the `Close` may go unprocessed with no harm —
+    // nothing is delivered for a still-unclaimed sub and the owner is exiting. Teardown never blocks
+    // on the channel, so `Close` stays responsive.
+    owner.drain_owed_once();
+    closing
   };
   // Every teardown exit funnels here — a `Close` command, a dropped last handle, or the source
   // draining — AFTER the owed Rescans above are made durable/delivered (nothing owed is lost).
@@ -762,6 +816,14 @@ where
         let _ = self.release_subscription(sub);
         Flow::Continue
       }
+      // A grant the caller CLAIMED (its `defuse` fired): lift the sub's `unclaimed` suppression, so
+      // its parked debt (if any) is offered by the next `flush_pending_rescans` — a claimed
+      // subscription is genuinely owed its Rescan. A `HashSet` remove that awaits nothing, so a
+      // `Close` queued behind it is never blocked (invariant II).
+      Ok(Command::ClaimGrant(sub)) => {
+        self.unclaimed.remove(&sub);
+        Flow::Continue
+      }
       Ok(Command::Close { reply }) => Flow::Break {
         closing: Some(reply),
         drain_owed: false,
@@ -813,14 +875,24 @@ where
         let orphan = match self.commands_weak.upgrade() {
           // The command channel is still open: try to hand the grant to the waiting `watch`.
           Some(commands) => match reply.send(Ok(WatchGrant::new(sub, commands))) {
+            // Delivered: the grant now guards the committed subscription **in flight**. Record it in
+            // `unclaimed` — the ONLY insert site — so `flush_pending_rescans` suppresses its parked
+            // debt until the caller claims it (`ClaimGrant` → genuinely owed) or drops it
+            // (`DropOrphan` → purged). No orphan.
+            Ok(()) => {
+              self.unclaimed.insert(sub);
+              None
+            }
             // The receiver was already gone the instant we sent: the grant bounced back — defuse it
-            // (so its own `Drop` enqueues nothing) and orphan the subscription here.
+            // (so its own `Drop` enqueues nothing) and orphan the subscription here. Nothing was ever
+            // in flight, so it is NOT recorded `unclaimed`.
             Err(Ok(grant)) => Some(grant.defuse()),
-            // Delivered (the grant guards it now), or the unreachable `Err(Err(_))` (we sent `Ok`).
-            _ => None,
+            // Unreachable (we always send `Ok`): no grant in flight, nothing to record or orphan.
+            Err(Err(_)) => None,
           },
           // Every handle is gone (the command channel is closed): no caller can observe the reply and
-          // the owner is about to tear down. Orphan the subscription here.
+          // the owner is about to tear down. Orphan the subscription here (never in flight, so not
+          // `unclaimed`).
           None => Some(sub),
         };
         // Both orphan paths release the committed-but-unclaimed subscription with the SAME unified
@@ -1150,12 +1222,16 @@ where
       return Err(UnwatchError::UnknownSubscription);
     }
     // Reclaim this subscription's owner-local per-sub state FIRST — its filter, epoch entry, parked
-    // overflow Rescan, and buffered coalescer deltas — keyed on `sub` ALONE, BEFORE the subsumer
-    // outcome is consulted (Codex R20-F2 — see the ordering note above). Neither
-    // `drain_coalescer_due`/`try_emit` re-checks live-subscription membership, so a coalescer delta
-    // buffered before the reclaim must be dropped here or it would deliver for a gone subscription.
+    // overflow Rescan, `unclaimed` suppression flag, and buffered coalescer deltas — keyed on `sub`
+    // ALONE, BEFORE the subsumer outcome is consulted (Codex R20-F2 — see the ordering note above).
+    // Neither `drain_coalescer_due`/`try_emit` re-checks live-subscription membership, so a coalescer
+    // delta buffered before the reclaim must be dropped here or it would deliver for a gone
+    // subscription. Removing the `unclaimed` entry here is what makes a `DropOrphan` (and both
+    // `on_watch` orphan paths, and the Unknown path) clear an in-flight grant's suppression: exactly
+    // one of `ClaimGrant`/`DropOrphan` fires per grant, and this is the `DropOrphan` side.
     self.retire_sub_state(sub);
     self.needs_rescan.remove(&sub);
+    self.unclaimed.remove(&sub);
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.drop_subscription(sub);
     }
@@ -1466,14 +1542,33 @@ where
   /// durable `needs_rescan` set and is retried every tick until [`try_send`] accepts it, so
   /// it can never be lost to a full channel (checklist #1, no-silent-loss).
   ///
-  /// A [`Full`](async_channel::TrySendError::Full) channel keeps the entry for the next
+  /// **Suppression by owner state** (Codex R24, the correctness boundary): an entry whose sub is in
+  /// [`unclaimed`](Self::unclaimed) — its committed [`WatchGrant`] still in flight — is **retained
+  /// without being offered**. That debt is owed to nobody yet (the caller never obtained the
+  /// subscription), so delivering it would emit a `Rescan` for a subscription the caller never
+  /// received. The suppression lifts the instant the owner processes the grant's
+  /// [`ClaimGrant`](Command::ClaimGrant) (the caller claimed it — now genuinely owed) and the entry
+  /// is purged if instead its [`DropOrphan`](Command::DropOrphan) fires. Because `unclaimed` is
+  /// mutated only by the owner between flushes, this replaces the old mailbox-idle gate's TOCTOU
+  /// probe with a decision that is always consistent at flush time — and, being per-sub, never
+  /// starves a LIVE claimed subscription's parked Rescan under control-plane load. Every
+  /// [`flush_pending_rescans`](Self) caller (the run-loop tick and [`drain_owed_once`](Self::drain_owed_once))
+  /// inherits this suppression, since it lives inside the one method.
+  ///
+  /// A [`Full`](async_channel::TrySendError::Full) channel keeps the (offered) entry for the next
   /// tick; an accepted or [`Closed`](async_channel::TrySendError::Closed) one clears it
   /// (delivered, or the consumer is gone with nobody left to receive it).
   ///
   /// [`try_send`]: async_channel::Sender::try_send
   fn flush_pending_rescans(&mut self) {
     let events = &self.events;
+    let unclaimed = &self.unclaimed;
     self.needs_rescan.retain(|&sub, parked| {
+      // Suppress — retain without offering — a still-unclaimed sub's parked debt: it is owed to
+      // nobody until the caller claims (`ClaimGrant`) or drops (`DropOrphan`) the in-flight grant.
+      if unclaimed.contains(&sub) {
+        return true;
+      }
       // Mint the owed Rescan carrying the value captured at park time (design §3): the sub or its
       // root may already be retired, so the value cannot be re-resolved here — it rides the entry.
       let mut event = Event::rescan(sub, parked.key.clone(), parked.epoch);
@@ -1681,17 +1776,21 @@ where
   /// ends, so a resuming consumer never reaches stream-end missing an owed dominating Rescan
   /// (no silent loss on source drain).
   ///
-  /// Each pass first non-blockingly **pre-drains any queued cleanup**
-  /// ([`handle_teardown_command`](Self::handle_teardown_command)) so a `DropOrphan` purges its sub's
-  /// parked entry BEFORE the pass could flush it (Codex R23 — else the orphan's terminal `Rescan` is
-  /// delivered for a subscription the caller never obtained), then runs an ordered
-  /// [`drain_owed_once`](Self::drain_owed_once) (a parked sub's tail delta never precedes its
-  /// `Rescan`), retried across a short [`RETRY`] sleep while the channel is full — reclaiming refused
-  /// tail events (shed to durable `Rescan`s) and re-offering each parked `Rescan` — until everything
-  /// owed is delivered or the consumer is gone ([`is_closed`](async_channel::Sender::is_closed)
-  /// short-circuits an all-refused channel whose receivers have all dropped). The owner **never awaits
-  /// the event sender** (invariant III preserved even at teardown) — only the command receiver and
-  /// the retry timer.
+  /// Each pass runs an ordered [`drain_owed_once`](Self::drain_owed_once) (a parked sub's tail delta
+  /// never precedes its `Rescan`), retried across a short [`RETRY`] sleep while the channel is full —
+  /// reclaiming refused tail events (shed to durable `Rescan`s) and re-offering each parked `Rescan`.
+  /// A still-**unclaimed** sub's parked debt is **suppressed by owner state** inside that flush (Codex
+  /// R24), never delivered for a subscription the caller never obtained — no pre-drain, no timing
+  /// window. So the exit condition is "nothing owed to a **claimed** subscription": the drain stops
+  /// once every remaining `needs_rescan` key is still `unclaimed` (or the set is empty), or the
+  /// consumer is gone ([`is_closed`](async_channel::Sender::is_closed) short-circuits an all-refused
+  /// channel whose receivers have all dropped). An unclaimed sub's debt is owed to nobody, so it must
+  /// not spin the drain forever waiting for a grant that may never be claimed; a claim arriving
+  /// mid-drain is processed by the `select!` below ([`ClaimGrant`](Command::ClaimGrant) lifts the
+  /// suppression, so the next pass delivers that sub's Rescan before exiting), and a post-teardown
+  /// claim holds a dead subscription exactly like any subscription after teardown (the read plane is
+  /// already empty). The owner **never awaits the event sender** (invariant III preserved even at
+  /// teardown) — only the command receiver and the retry timer.
   ///
   /// The retry **stays responsive to the command mailbox** (invariant II): a blind sleep would
   /// let a [`Close`](Command::Close) queue forever while the drain spins — behind a full channel
@@ -1710,19 +1809,19 @@ where
     &mut self,
   ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
     loop {
-      // Service any queued cleanup BEFORE offering parked debt (Codex R23): a `DropOrphan` queued
-      // when the source drained must purge its sub's parked entry before `drain_owed_once` (below)
-      // flushes it, or the orphan's terminal `Rescan` is delivered for a subscription the caller
-      // never obtained. The pre-drain is non-blocking, so it adds nothing to teardown latency and
-      // can never park the drain (invariant II); a `Close` found here stops the drain and is handed
-      // back exactly as the `select!` arm below does.
-      while let Ok(cmd) = self.commands.try_recv() {
-        if let Some(reply) = self.handle_teardown_command(cmd) {
-          return Some(reply);
-        }
-      }
       self.drain_owed_once();
-      if self.needs_rescan.is_empty() || self.events.is_closed() {
+      // Exit once nothing is owed to a CLAIMED subscription: every remaining `needs_rescan` key is
+      // still `unclaimed` (its debt owed to nobody — suppressed by `drain_owed_once`'s flush above,
+      // and must not spin the drain waiting for a grant that may never be claimed), or the set is
+      // empty (`all` is vacuously true), or the consumer is gone. A claim arriving mid-drain is
+      // handled by the `select!` below (its `ClaimGrant` lifts the suppression, so a later pass
+      // delivers that sub's Rescan before this condition holds).
+      if self
+        .needs_rescan
+        .keys()
+        .all(|sub| self.unclaimed.contains(sub))
+        || self.events.is_closed()
+      {
         return None;
       }
       let sleep = R::sleep(RETRY).fuse();
@@ -1746,14 +1845,16 @@ where
     }
   }
 
-  /// Handles one command received during teardown — pre-drained non-blockingly or won by the
-  /// [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) `select!` — while the owner is
-  /// quiescing (Codex R23, the shared teardown-command core):
+  /// Handles one command won by the [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown)
+  /// `select!` while the owner is quiescing (the shared source-drain teardown-command core):
   ///
   /// - a [`DropOrphan`](Command::DropOrphan) is released through the synchronous
   ///   [`release_subscription`](Self::release_subscription) — purging its owner-local state (its
-  ///   parked terminal `Rescan` among it, so a later flush never delivers it for a subscription the
-  ///   caller never obtained) and requesting the emptied root's fire-and-forget `source.disarm`;
+  ///   `unclaimed` flag and any parked terminal `Rescan` among it) and requesting the emptied root's
+  ///   fire-and-forget `source.disarm`;
+  /// - a [`ClaimGrant`](Command::ClaimGrant) removes the sub from [`unclaimed`](Self::unclaimed),
+  ///   lifting the suppression so the next drain pass can deliver that sub's owed `Rescan` before
+  ///   exiting (a claim arriving mid-teardown is genuinely owed its debt);
   /// - a [`Watch`](Command::Watch)/[`Unwatch`](Command::Unwatch) is **failed fast** — the owner is
   ///   stopping, so the caller's handle surfaces `Closed`;
   /// - a [`Close`](Command::Close) is handed back (as [`Some`]) for the caller to acknowledge.
@@ -1767,10 +1868,15 @@ where
       // A watch orphaned mid-teardown (a dropped wait's [`WatchGrant`] fired): release it through the
       // unified [`release_subscription`](Self::release_subscription), which awaits nothing. A
       // released-at-teardown handle is moot anyway (the owner drops the source wholesale on exit), but
-      // uniformity beats a purge-only special case — and, above all, its parked entry is purged so no
-      // later flush delivers it (Codex R23).
+      // uniformity beats a purge-only special case — and its `unclaimed`/parked state is purged.
       Command::DropOrphan(sub) => {
         let _ = self.release_subscription(sub);
+        None
+      }
+      // A claim arriving mid-teardown lifts the suppression so the drain delivers that sub's owed
+      // Rescan (a claimed sub is genuinely owed). A `HashSet` remove — awaits nothing.
+      Command::ClaimGrant(sub) => {
+        self.unclaimed.remove(&sub);
         None
       }
       Command::Watch { reply, .. } => {
@@ -1783,38 +1889,6 @@ where
       }
       Command::Close { reply } => Some(reply),
     }
-  }
-
-  /// The **best-effort final drain** the [`run`] loop runs after a consumer-initiated
-  /// [`Close`](Command::Close) or a dropped last handle (NOT a source drain — that owes every parked
-  /// Rescan and takes [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown)): one
-  /// non-blocking pass so a burst interrupted by the close is delivered when the channel has room. The
-  /// undrained tail / owed Rescan on a full channel is permitted to be lost here (the consumer asked
-  /// to stop, or nobody is left) — nothing awaits the channel, so `Close` stays responsive.
-  ///
-  /// It services **queued cleanup FIRST** (Codex R23): a [`DropOrphan`](Command::DropOrphan) still
-  /// sitting behind the `Close` (or the dropped-last-handle break) in the mailbox must purge its sub's
-  /// parked entry BEFORE [`drain_owed_once`](Self::drain_owed_once) flushes it — else the orphan's
-  /// parked terminal `Rescan` is delivered for a subscription the caller never obtained. The pre-drain
-  /// ([`handle_teardown_command`](Self::handle_teardown_command)) is non-blocking, so `Close` stays
-  /// responsive (invariant II); a `watch`/`unwatch` behind the close is failed fast, and a residual
-  /// second `Close` reply is dropped — the FIRST `Close` reply is kept (the loop-break `closing`, or
-  /// the first pre-drained one when the break carried none), the rest getting the existing Stopped
-  /// semantics.
-  ///
-  /// Returns the `Close` reply the [`run`] tail acknowledges once the read plane is emptied.
-  fn best_effort_final_drain(
-    &mut self,
-    mut closing: Option<futures_channel::oneshot::Sender<Result<(), CloseError>>>,
-  ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
-    while let Ok(cmd) = self.commands.try_recv() {
-      if let Some(reply) = self.handle_teardown_command(cmd) {
-        // Keep the first Close reply (`get_or_insert` drops a residual second one).
-        closing.get_or_insert(reply);
-      }
-    }
-    self.drain_owed_once();
-    closing
   }
 }
 

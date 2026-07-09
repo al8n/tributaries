@@ -352,6 +352,7 @@ impl Harness {
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
+      unclaimed: std::collections::HashSet::new(),
       coalescer,
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
@@ -2708,6 +2709,7 @@ impl OwnerU64 {
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
+      unclaimed: std::collections::HashSet::new(),
       coalescer,
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
@@ -3261,6 +3263,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     epochs: EpochLedger::new(),
     filters: HashMap::new(),
     needs_rescan: BTreeMap::new(),
+    unclaimed: std::collections::HashSet::new(),
     coalescer: None,
     commands_weak: command_tx.downgrade(),
     commands: command_rx,
@@ -3301,25 +3304,27 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
   );
 }
 
-/// Codex R23-F1 regression, NORMAL loop (design driver-golden doc, invariant I1 / no false debt):
-/// the run loop's top-of-iteration parked-Rescan flush is **gated on an idle command mailbox**, so a
-/// queued [`DropOrphan`](super::Command::DropOrphan) is serviced — purging its sub's parked terminal
-/// [`Rescan`](tributary_fs::EventKind::Rescan) — BEFORE any parked debt is offered. Without the gate
-/// an orphaned (committed-but-unclaimed, then dropped) subscription's parked terminal Rescan is
-/// flushed to the event stream ahead of the `DropOrphan` that purges it — an event for a subscription
-/// the caller never obtained.
+/// Codex R24-F1 regression, NORMAL loop (design driver-golden doc, invariant I1 / no false debt):
+/// the run loop's top-of-iteration parked-Rescan flush is now **unconditional**, and which parked
+/// debt it OFFERS is decided by owner STATE — [`flush_pending_rescans`](super::Owner::flush_pending_rescans)
+/// suppresses any entry whose sub is still `unclaimed` (its [`WatchGrant`](super::WatchGrant) in
+/// flight). So an orphaned (committed-but-unclaimed, then dropped) subscription's parked terminal
+/// [`Rescan`](tributary_fs::EventKind::Rescan) is NEVER delivered, no matter how its
+/// [`DropOrphan`](super::Command::DropOrphan) interleaves with the flush — closing the TOCTOU the
+/// mailbox-idle gate left open (a `DropOrphan` could enqueue after the emptiness probe but before the
+/// flush's `try_send`).
 ///
 /// Exercises the REAL spawned [`run`](super::run) loop over a source that arms the watched root live,
 /// then on a trigger delivers a terminal event for that root AFTER killing it — and, in the same
 /// synchronous terminal-retire step (its `root_key` probe), drops the held reply receiver so the
-/// grant's `Drop` enqueues the `DropOrphan` exactly between the park and the next loop-top flush. The
-/// event channel has CAPACITY (unbounded), so the flush *would* deliver — a full channel would mask
-/// the race (the R20-F2 lingering-half test kept it full).
+/// grant's `Drop` enqueues the `DropOrphan`. The committed grant was recorded `unclaimed` by
+/// `on_watch`, so its parked terminal Rescan is suppressed by state and the `DropOrphan` then purges
+/// it. The event channel has CAPACITY (unbounded), so a non-suppressing flush *would* deliver.
 ///
-/// Fail-on-old: with the flush ungated, the parked Rescan is delivered and the drained stream is
-/// non-empty — the assertion flips.
+/// Fail-on-old: temporarily revert the `unclaimed` suppression in `flush_pending_rescans` (offer every
+/// entry) and the parked Rescan is delivered — the drained stream is non-empty and the assertion flips.
 #[tokio::test]
-async fn queued_drop_orphan_is_serviced_before_the_loop_flushes_its_parked_rescan() {
+async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop() {
   /// The Watch's reply receiver: the owner sends the committed [`WatchGrant`](super::WatchGrant) into
   /// it; the source holds it and drops it during the terminal-retire, so the grant's `Drop` enqueues
   /// the `DropOrphan`.
@@ -3381,9 +3386,10 @@ async fn queued_drop_orphan_is_serviced_before_the_loop_flushes_its_parked_resca
         Some(k) => Some(k.clone()),
         None => {
           // The dead-root terminal-retire probe: drop the held reply receiver NOW so the grant's
-          // `Drop` enqueues the `DropOrphan` synchronously — after `source.next()` won this iteration
-          // with the terminal event, and before the next loop-top flush could offer the parked
-          // Rescan. Idempotent: a later dead probe finds `None`.
+          // `Drop` enqueues the `DropOrphan`. With state suppression the exact interleaving no longer
+          // matters (the sub is `unclaimed`, so its parked Rescan is suppressed regardless) — but this
+          // still drives the committed-but-unclaimed → terminal-retire → drop path end to end.
+          // Idempotent: a later dead probe finds `None`.
           drop(self.held_reply.lock().unwrap().take());
           None
         }
@@ -3406,6 +3412,7 @@ async fn queued_drop_orphan_is_serviced_before_the_loop_flushes_its_parked_resca
     epochs: EpochLedger::new(),
     filters: HashMap::new(),
     needs_rescan: BTreeMap::new(),
+    unclaimed: std::collections::HashSet::new(),
     coalescer: None,
     commands_weak: command_tx.downgrade(),
     commands: command_rx,
@@ -3429,9 +3436,10 @@ async fn queued_drop_orphan_is_serviced_before_the_loop_flushes_its_parked_resca
       reply,
     })
     .expect("enqueue the Watch");
-  // Hand the reply receiver to the source and trigger the terminal event: the loop commits the watch,
-  // then delivers the terminal event — retire-and-park AND, in the same synchronous step, enqueue the
-  // DropOrphan — then services the DropOrphan (the gate defers the flush), purging the parked Rescan.
+  // Hand the reply receiver to the source and trigger the terminal event: the loop commits the watch
+  // (recording the grant `unclaimed`), then delivers the terminal event — retire-and-park AND, in the
+  // same synchronous step, enqueue the DropOrphan. The parked Rescan is suppressed by state until the
+  // DropOrphan purges it.
   trigger_tx
     .try_send(reply_rx)
     .expect("hand the reply receiver to the source");
@@ -3451,16 +3459,16 @@ async fn queued_drop_orphan_is_serviced_before_the_loop_flushes_its_parked_resca
   assert!(matches!(acked, Ok(())), "close() succeeds");
 
   // The event stream carries NO event for the orphaned subscription: its parked terminal Rescan was
-  // purged by the DropOrphan BEFORE any flush could offer it. Fail-on-old: without the gate the flush
-  // delivered it, so the drain is non-empty.
+  // suppressed by the `unclaimed` state and then purged by the DropOrphan. Fail-on-old: revert the
+  // suppression and the flush delivers it, so the drain is non-empty.
   let mut delivered = Vec::new();
   while let Ok(event) = event_rx.try_recv() {
     delivered.push(event);
   }
   assert!(
     delivered.is_empty(),
-    "the orphan's parked terminal Rescan was purged before any flush — no event for a subscription \
-     the caller never obtained (got {} event(s))",
+    "the orphan's parked terminal Rescan was suppressed by state — no event for a subscription the \
+     caller never obtained (got {} event(s))",
     delivered.len()
   );
 
@@ -3470,84 +3478,82 @@ async fn queued_drop_orphan_is_serviced_before_the_loop_flushes_its_parked_resca
     .expect("the run task did not panic");
 }
 
-/// Codex R23-F1 regression, SOURCE-DRAIN teardown (design backpressure doc, no false debt / no
-/// silent loss): [`drain_owed_before_shutdown`](super::Owner::drain_owed_before_shutdown) now
-/// **pre-drains queued cleanup** before each owed-Rescan pass, so a
-/// [`DropOrphan`](super::Command::DropOrphan) queued when the source drains purges its terminal-
-/// retired sub's parked Rescan BEFORE the pass could flush it — while a DIFFERENT live sub's owed
-/// Rescan is still delivered (the no-silent-loss half must not regress). The event channel has
-/// CAPACITY, so the pass *would* deliver the orphan's Rescan (a full channel masks the race).
-///
-/// Fail-on-old: without the pre-drain the first `drain_owed_once` flushes BOTH parked Rescans (the
-/// channel has room) and returns before the DropOrphan is ever serviced — the orphan's Rescan is
-/// delivered and the assertion flips.
+/// Codex R24 — SOURCE-DRAIN teardown under the STATE model (owed = CLAIMED): an UNCLAIMED
+/// terminal-retired sub's parked terminal Rescan is suppressed by the owner's `unclaimed` state —
+/// never delivered even with event-channel CAPACITY — while a claimed live sub's owed Rescan still
+/// delivers, and [`drain_owed_before_shutdown`](super::Owner::drain_owed_before_shutdown) then
+/// EXITS instead of spinning on the unclaimed leftover: its queued
+/// [`DropOrphan`](super::Command::DropOrphan) may go entirely unprocessed — STATE, not command
+/// timing, is what withholds the debt (the R24 close of the R23 TOCTOU).
 #[tokio::test]
-async fn source_drain_pre_drains_dropped_orphan_before_flushing_its_parked_rescan() {
+async fn source_drain_suppresses_unclaimed_orphan_debt_and_exits_without_spinning() {
   let mut h = Harness::new(); // unbounded event channel — has capacity
   let live = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
   let orphan = h.watch("/b", Interest::all()).await.expect("watch /b"); // handle 2
+  // Model the orphan's grant as still in flight (committed, successfully sent, unclaimed).
+  h.owner.unclaimed.insert(orphan);
 
-  // The LIVE sub owes a parked dominating Rescan (its overflow debt) …
+  // The LIVE (claimed) sub owes a parked dominating Rescan (its overflow debt) …
   for raw in 0..2 {
     h.owner.epochs.stamp(live, Epoch::new(raw));
   }
   h.owner.park_rescan(live);
-  assert!(
-    h.owner.needs_rescan.contains_key(&live),
-    "the live sub owes a parked Rescan"
-  );
-  // … and the ORPHAN is terminal-retired (parked terminal Rescan + force-removed from the subsumer):
-  // the committed-but-unclaimed-then-terminal-retired state whose DropOrphan must purge its debt.
+  // … and the ORPHAN is terminal-retired (parked terminal Rescan + force-removed from the subsumer)
+  // while its grant is still unclaimed.
   h.owner.retire_root_with_terminal_rescan(2);
   assert!(
-    h.owner.needs_rescan.contains_key(&orphan),
-    "terminal retirement parked the orphan's owed terminal Rescan"
+    h.owner.needs_rescan.contains_key(&live) && h.owner.needs_rescan.contains_key(&orphan),
+    "both the live sub's overflow Rescan and the orphan's terminal Rescan are parked"
   );
 
-  // The orphan's DropOrphan is queued when the source drains.
+  // The orphan's grant is dropped as the source drains: its DropOrphan is queued — and may never be
+  // processed (the drain exits first); the suppression must hold regardless.
   h._commands
     .try_send(super::Command::DropOrphan(orphan))
     .expect("enqueue the DropOrphan");
 
-  // The source-drain teardown pre-drains the DropOrphan (purging the orphan's parked Rescan) BEFORE
-  // flushing owed Rescans, so only the live sub's Rescan is delivered.
+  // The drain delivers the claimed sub's owed Rescan, suppresses the unclaimed one, and exits
+  // promptly (everything still owed belongs to unclaimed subs — owed to nobody): no spin on an
+  // abandoned grant.
   let returned = tokio::time::timeout(Duration::from_secs(5), h.owner.drain_owed_before_shutdown())
     .await
-    .expect("the source-drain teardown completed within the deadline");
+    .expect("the drain exits promptly instead of spinning on unclaimed-only debt");
   assert!(returned.is_none(), "no Close interrupted the drain");
 
   let delivered = h.drain();
   assert!(
     !delivered.iter().any(|e| e.subscription() == orphan),
-    "the orphan's parked terminal Rescan was purged before the flush — NOT delivered (no false debt)"
+    "the unclaimed orphan's parked terminal Rescan is suppressed by state — never delivered"
   );
   assert!(
     delivered
       .iter()
       .any(|e| e.subscription() == live && e.is_rescan()),
-    "the live sub's owed Rescan IS delivered (the no-silent-loss half did not regress)"
+    "the claimed live sub's owed Rescan IS delivered (no-silent-loss for claimed subs)"
   );
   assert!(
-    h.owner.needs_rescan.is_empty(),
-    "every owed Rescan was resolved — the live sub's delivered, the orphan's purged"
+    h.owner
+      .needs_rescan
+      .keys()
+      .all(|s| h.owner.unclaimed.contains(s)),
+    "only unclaimed (owed-to-nobody) debt remains at exit"
   );
 }
 
-/// Codex R23-F1 regression, POST-Close residual best-effort tail (design driver-golden doc, invariant
-/// II): [`best_effort_final_drain`](super::Owner::best_effort_final_drain) — the pass the [`run`] tail
-/// runs after a consumer `Close` or a dropped last handle — services queued cleanup FIRST, so a
-/// [`DropOrphan`](super::Command::DropOrphan) still sitting behind the `Close` in the mailbox purges
-/// its terminal-retired sub's parked Rescan BEFORE the best-effort `drain_owed_once` could flush it.
-/// The event channel has CAPACITY, so the flush *would* deliver the orphan's Rescan.
-///
-/// Models the tail after the loop popped the `Close` (its reply is the `closing` argument) with the
-/// `DropOrphan` residual behind it. Fail-on-old: with `drain_owed_once` run before the pre-drain, the
-/// orphan's parked Rescan is delivered and the assertion flips.
+/// Codex R24 — the POST-Close best-effort tail under the STATE model: the tail is a plain
+/// [`drain_owed_once`](super::Owner::drain_owed_once) (the R23 pre-drain helper is gone — state
+/// suppression made it unnecessary). A residual [`DropOrphan`](super::Command::DropOrphan) behind
+/// the `Close` may go entirely unprocessed, yet the unclaimed orphan's parked terminal Rescan is
+/// still withheld — suppressed by the owner's `unclaimed` state, not by command timing — while the
+/// claimed live sub's owed Rescan is delivered by the same pass. The event channel has CAPACITY, so
+/// the flush *would* deliver the orphan's Rescan were it not state-gated.
 #[tokio::test]
-async fn best_effort_final_drain_pre_drains_dropped_orphan_before_flushing_its_parked_rescan() {
+async fn final_drain_suppresses_unclaimed_orphan_debt_after_close() {
   let mut h = Harness::new(); // unbounded event channel — has capacity
   let live = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
   let orphan = h.watch("/b", Interest::all()).await.expect("watch /b"); // handle 2
+  // Model the orphan's grant as still in flight (committed, successfully sent, unclaimed).
+  h.owner.unclaimed.insert(orphan);
 
   for raw in 0..2 {
     h.owner.epochs.stamp(live, Epoch::new(raw));
@@ -3559,35 +3565,151 @@ async fn best_effort_final_drain_pre_drains_dropped_orphan_before_flushing_its_p
     "both the live sub's overflow Rescan and the orphan's terminal Rescan are parked"
   );
 
-  // Model the post-Close tail: the loop popped the `Close` (its reply is `closing`), and a
-  // `DropOrphan` sits unprocessed behind it in the mailbox.
+  // Model the post-Close tail: a residual DropOrphan sits unprocessed in the mailbox (the tail never
+  // pops it), and the tail runs exactly one best-effort drain_owed_once.
   h._commands
     .try_send(super::Command::DropOrphan(orphan))
     .expect("enqueue the residual DropOrphan");
-  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  h.owner.drain_owed_once();
 
-  let returned = h.owner.best_effort_final_drain(Some(close_reply));
-
-  // The residual DropOrphan was serviced FIRST — the orphan's parked terminal Rescan purged before
-  // the best-effort flush — so only the live sub's owed Rescan reaches the stream.
   let delivered = h.drain();
   assert!(
     !delivered.iter().any(|e| e.subscription() == orphan),
-    "the orphan's parked terminal Rescan was purged before the flush — NOT delivered (Codex R23)"
+    "the unclaimed orphan's parked Rescan is suppressed by state in the final pass (Codex R24)"
   );
   assert!(
     delivered
       .iter()
       .any(|e| e.subscription() == live && e.is_rescan()),
-    "the live sub's owed Rescan IS delivered by the best-effort pass (no regression)"
+    "the claimed live sub's owed Rescan IS delivered by the best-effort pass"
   );
-  // The held `Close` reply is returned for the tail to acknowledge — `close()` still completes.
-  returned
-    .expect("the best-effort drain returns the held Close reply")
-    .send(Ok(()))
-    .expect("acknowledge the Close");
+}
+
+/// Codex R24 — claim-then-deliver: suppression must never become LOSS for a subscription the caller
+/// actually obtained. An unclaimed sub's parked terminal Rescan is withheld (retained, not offered);
+/// once its [`ClaimGrant`](super::Command::ClaimGrant) is processed — the caller defused the grant
+/// and now holds the sub — the very next flush delivers the parked Rescan: the debt was deferred,
+/// never dropped.
+#[tokio::test]
+async fn claimed_grant_lifts_suppression_and_its_parked_rescan_is_delivered() {
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  h.owner.unclaimed.insert(sub);
+
+  // Terminal-retire the unclaimed sub's root: its owed terminal Rescan parks, suppressed.
+  h.owner.retire_root_with_terminal_rescan(1);
   assert!(
-    matches!(close_response.await, Ok(Ok(()))),
-    "the Close is acknowledged after the best-effort teardown"
+    h.owner.needs_rescan.contains_key(&sub),
+    "the terminal Rescan is parked"
   );
+  h.owner.flush_pending_rescans();
+  assert!(
+    h.drain().is_empty(),
+    "unclaimed: the parked Rescan is suppressed, not offered"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "…and retained (deferred), not dropped"
+  );
+
+  // The caller claims: process the ClaimGrant exactly as the run loop's select does.
+  let flow = h
+    .owner
+    .dispatch_command(Ok(super::Command::ClaimGrant(sub)))
+    .await;
+  assert!(matches!(flow, super::Flow::Continue));
+  h.owner.flush_pending_rescans();
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == sub && e.is_rescan()),
+    "claimed: the parked terminal Rescan is delivered — suppression never became loss"
+  );
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "the owed debt is resolved once claimed"
+  );
+}
+
+/// Codex R24-F2 regression — sustained control-plane load must not starve a CLAIMED sub's parked
+/// Rescan: the flush is UNCONDITIONAL again (the R23 mailbox-idle gate is reverted), so a live
+/// parked Rescan is delivered within a bounded window even while a flood keeps the command mailbox
+/// continuously non-empty. Fail-on-old: with the R23 `commands.is_empty()` gate, the flood keeps the
+/// gate shut and the parked re-point Rescan is withheld past the deadline.
+///
+/// Setup: a bounded(1) event channel; widening two claimed narrow watches to `/a` mints TWO
+/// re-point Rescans — the first fills the only slot, the second overflows and PARKS. A spawned
+/// flood then try_sends bursts of `Watch` commands (reply receivers dropped, so each send-fails and
+/// is released synchronously) keeping the mailbox busy, while the consumer drains: BOTH re-point
+/// Rescans must arrive within the deadline (the parked one flushed between commands).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_rescan_delivers_under_sustained_command_load() {
+  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
+  let source = DrainableSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    drain: drain_rx,
+  };
+  let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> = super::Tributaries::with_source(
+    source,
+    TributariesOptions::new().with_event_capacity(std::num::NonZeroUsize::new(1).expect("nonzero")),
+  );
+
+  // Two claimed narrow watches, then the widen: two re-point Rescans — one fills bounded(1), the
+  // other parks as overflow debt for a CLAIMED subscription.
+  let narrow_b = w
+    .watch(key("/a/b"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /a/b");
+  let narrow_c = w
+    .watch(key("/a/c"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /a/c");
+  let _wide = w
+    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .await
+    .expect("widen to /a");
+
+  // The flood: bursts of Watch commands whose reply receivers are dropped (each send-fails at the
+  // owner and is released synchronously) — pure control-plane load keeping the mailbox non-empty.
+  let flood_commands = w.commands.clone();
+  let flood = tokio::spawn(async move {
+    loop {
+      for _ in 0..8 {
+        let (reply, response) = futures_channel::oneshot::channel();
+        drop(response);
+        if flood_commands
+          .try_send(super::Command::Watch {
+            key: key("/flood"),
+            value: (),
+            interest: Interest::all(),
+            filter: Filter::all(),
+            reply,
+          })
+          .is_err()
+        {
+          return;
+        }
+      }
+      tokio::task::yield_now().await;
+    }
+  });
+
+  // Under sustained load, BOTH re-point Rescans arrive within the deadline: the queued one first,
+  // then the PARKED one — flushed by the unconditional per-tick flush despite the busy mailbox.
+  let mut seen = std::collections::HashSet::new();
+  for _ in 0..2 {
+    let event = tokio::time::timeout(Duration::from_secs(5), w.next())
+      .await
+      .expect("a re-point Rescan is delivered within the deadline despite sustained command load")
+      .expect("the stream is open");
+    assert!(event.is_rescan(), "the widen minted re-point Rescans");
+    seen.insert(event.subscription());
+  }
+  assert!(
+    seen.contains(&narrow_b) && seen.contains(&narrow_c),
+    "both re-pointed subscriptions received their Rescan — the parked one was never starved"
+  );
+  flood.abort();
 }
