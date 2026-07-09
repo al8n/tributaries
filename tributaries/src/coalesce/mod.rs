@@ -77,9 +77,11 @@ use std::{
   vec::Vec,
 };
 
-use tributary_fs::EventKind;
-
-use crate::{event::Event, options::DebounceConfig, subscription::Subscription};
+use crate::{
+  event::{Event, EventKind},
+  options::DebounceConfig,
+  subscription::Subscription,
+};
 
 #[cfg(test)]
 mod tests;
@@ -216,9 +218,9 @@ where
       // exactly as a Rescan does — flushing only its two endpoint paths would let the
       // immediate Moved jump ahead of an older buffered entry for another path of the
       // same subscription, so the delivered epochs would go backwards and violate the
-      // monotone per-subscription epoch contract (design §6/§8). Detected through the
-      // wrapper-level `move_from` (uniform for fs-backed and synthetic moves), not an
-      // `EventKind` match, so it needs no fs `MovedEvent` to recognize.
+      // monotone per-subscription epoch contract (design §6/§8). Detected through
+      // `move_from` — the `Moved` kind's in-kind source key — the same second endpoint
+      // the router fans out on.
       self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
     } else if matches!(
@@ -229,12 +231,13 @@ where
       // any entry already held for its (subscription, path).
       self.coalesce(ev, now);
     } else {
-      // An unknown/future non-lifecycle kind: `EventKind` is #[non_exhaustive], and the collapse
-      // table only knows the three lifecycle kinds (its default arm would relabel or drop one).
-      // Do NOT buffer it — flush the subscription's buffer and emit it immediately, exactly like a
-      // Moved/Rescan, so it is delivered in-order (older buffered entries flushed ahead of it, the
-      // monotone per-subscription epoch preserved) and never collapsed under an allowed
-      // version-skew (Codex R11 F2, no silent loss).
+      // An unknown/future non-lifecycle kind: the umbrella's own `EventKind` is
+      // #[non_exhaustive], and the collapse table only knows the three lifecycle kinds (its
+      // default arm would relabel or drop one). Do NOT buffer it — flush the subscription's
+      // buffer and emit it immediately, exactly like a Moved/Rescan, so it is delivered
+      // in-order (older buffered entries flushed ahead of it, the monotone per-subscription
+      // epoch preserved) and never collapsed under an allowed version-skew (Codex R11 F2,
+      // no silent loss).
       self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
     }
@@ -388,7 +391,7 @@ where
   /// `incoming` is a lifecycle kind too. The default arm covers the four rows whose result
   /// equals the buffered kind (`Created`/`Modified` then `Created`/`Modified`); a non-lifecycle
   /// kind cannot reach it, but would fall there harmlessly.
-  fn collapse(buffered: &EventKind, incoming: &EventKind) -> Collapse {
+  fn collapse(buffered: &EventKind<C>, incoming: &EventKind<C>) -> Collapse {
     use EventKind::{Created, Modified, Removed};
     match (buffered, incoming) {
       (Created, Removed) => Collapse::Annihilate,

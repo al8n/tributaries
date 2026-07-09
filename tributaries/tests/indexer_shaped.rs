@@ -33,10 +33,11 @@ use std::{
 use agnostic_lite::{RuntimeLite, tokio::TokioRuntime};
 use tempfile::TempDir;
 use tributaries::{
-  Armed, DebounceConfig, Epoch, Event, Filter, Interest, RootHandle, Source, SourceEvent,
-  Subscription, Tributaries, TributariesOptions, WatchError, WatchView, WatcherOptions,
+  Armed, DebounceConfig, Epoch, Event, EventKind, Filter, Interest, RootHandle, Source,
+  SourceEvent, Subscription, Tributaries, TributariesOptions, WatchError, WatchView,
+  WatcherOptions,
 };
-use tributary_fs::{WatchRootError, Watcher};
+use tributary_fs::{EventKind as FsEventKind, WatchRootError, Watcher};
 
 /// The custom, **non-`OsString`** key component: an indexer-shaped location coordinate.
 ///
@@ -241,18 +242,31 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
       let Some(key) = self.path_to_key(raw.path()) else {
         continue;
       };
-      let from = raw
-        .kind()
-        .moved()
-        .and_then(|moved| self.path_to_key(moved.from()));
+      // The fs-to-neutral map at this binding, per the source-honesty contract: the four
+      // single-endpoint kinds map one-to-one; a paired rename maps to a whole `Moved` only
+      // when its source path ALSO reverses into the key space. A move whose source lies
+      // outside every mount is outside the key space entirely — no subscriber could ever
+      // cover that endpoint — so the honest, whole mapping is its move-in half alone: a
+      // `Created` at the destination key (never a half-mapped `Moved`). An unknown future
+      // fs kind folds to the conservative `Rescan`.
+      let kind = match raw.kind() {
+        FsEventKind::Created => EventKind::Created,
+        FsEventKind::Modified => EventKind::Modified,
+        FsEventKind::Removed => EventKind::Removed,
+        FsEventKind::Moved(moved) => match self.path_to_key(moved.from()) {
+          Some(from) => EventKind::Moved { from },
+          None => EventKind::Created,
+        },
+        FsEventKind::Rescan => EventKind::Rescan,
+        _ => EventKind::Rescan,
+      };
       return Some(SourceEvent::new(
         raw.root(),
         key,
-        raw.kind().clone(),
-        from,
+        kind,
         raw.location().clone(),
         raw.epoch(),
-        raw.change_id(),
+        Some(raw.change_id()),
       ));
     }
   }

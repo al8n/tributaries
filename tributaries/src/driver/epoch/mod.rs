@@ -144,7 +144,7 @@ impl EpochLedger {
     rescan
   }
 
-  /// Mints a strictly-dominating [`Rescan`](tributary_fs::EventKind::Rescan) epoch for
+  /// Mints a strictly-dominating [`Rescan`](crate::EventKind::Rescan) epoch for
   /// `sub` **without rebasing its root** — the overflow shed (design backpressure doc).
   ///
   /// Returns `sub`'s current-high-water `.next()` and advances high-water to it, but —

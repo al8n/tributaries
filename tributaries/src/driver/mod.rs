@@ -41,7 +41,7 @@ use tributary_fs::{Epoch, Interest, RootHandle, WatchRootError};
 use crate::{
   coalesce::Coalescer,
   error::{BuildError, CloseError, UnwatchError, WatchError},
-  event::Event,
+  event::{Event, EventKind},
   filter::{Filter, FilterInput},
   options::TributariesOptions,
   route::RoutableEvent,
@@ -254,7 +254,7 @@ impl Drop for WatchGrant {
 ///
 /// # Loss is never silent
 ///
-/// Every coverage gap surfaces as a [`Rescan`](tributary_fs::EventKind::Rescan) whose
+/// Every coverage gap surfaces as a [`Rescan`](EventKind::Rescan) whose
 /// [`epoch`](Event::epoch) dominates everything delivered before it, fanned out to
 /// *every* subscriber of the affected root (design §5/§8). Widening a watch (design §4)
 /// emits a synthetic dominating `Rescan` per re-pointed subscription so a consumer
@@ -402,7 +402,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// Overlapping keys are accepted: they are subsumed onto a shared root (design §4), so
   /// this never surfaces the overlap the layer below rejects. Widening an existing watch
   /// re-points the subsumed subscriptions onto the new wider root and delivers each a
-  /// synthetic dominating [`Rescan`](tributary_fs::EventKind::Rescan) (design §8).
+  /// synthetic dominating [`Rescan`](EventKind::Rescan) (design §8).
   ///
   /// # Key canonicalization
   ///
@@ -425,7 +425,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   ///
   /// `filter` is this subscription's admission gate (design §7): a non-`Rescan` event is
   /// delivered only if its key covers the event **and** `filter` admits it. Pass
-  /// [`Filter::all`] to admit everything; a [`Rescan`](tributary_fs::EventKind::Rescan)
+  /// [`Filter::all`] to admit everything; a [`Rescan`](EventKind::Rescan)
   /// always bypasses it. The filter is live-swappable: keep a [`clone`](Filter::clone)
   /// and [`swap`](Filter::swap) it to re-scope delivery without a re-watch.
   ///
@@ -603,7 +603,7 @@ where
   filters: HashMap<Subscription, Filter<C>>,
   /// The per-subscription overflow dirty-set (design backpressure doc): a subscription
   /// whose delivery hit a full event channel parks a durable **dominating**
-  /// [`Rescan`](tributary_fs::EventKind::Rescan) here — a [`ParkedRescan`] holding its covered
+  /// [`Rescan`](EventKind::Rescan) here — a [`ParkedRescan`] holding its covered
   /// key, a strictly-dominating epoch, and the owning subscription's **baked value** (captured
   /// while the sub is live, so the flushed Rescan stays attributable after retirement — R4). A
   /// [`BTreeMap`] for a deterministic drain order.
@@ -990,7 +990,7 @@ where
 }
 
 /// How long the owner waits before re-attempting delivery of a parked per-subscription
-/// overflow [`Rescan`](tributary_fs::EventKind::Rescan) when the event channel is full
+/// overflow [`Rescan`](EventKind::Rescan) when the event channel is full
 /// (design backpressure doc). Mirrors the fs layer's `DELIVERY_RETRY`. Latency-only: a
 /// resuming consumer's next drained slot is also retried on the following command/event
 /// tick; this bounds the wait when the stream is otherwise idle.
@@ -1579,7 +1579,7 @@ where
   /// retires — its admission [`Filter`] and its [`EpochLedger`](epoch::EpochLedger) entry —
   /// the shared core both retire paths route through (invariant I4).
   ///
-  /// The parked overflow [`Rescan`](tributary_fs::EventKind::Rescan) (`needs_rescan`) is
+  /// The parked overflow [`Rescan`](EventKind::Rescan) (`needs_rescan`) is
   /// **deliberately not** freed here, because whether it survives retirement is
   /// path-dependent (design backpressure doc, no silent loss):
   ///
@@ -1610,7 +1610,7 @@ where
   ///
   /// - **re-arm at the same key** through the [`arm`](Self::arm) choke point. On success whose
   ///   committed key is unchanged, [`rebind`](Subsumer::rebind_root) the root onto the fresh handle
-  ///   and mint a dominating [`Rescan`](tributary_fs::EventKind::Rescan) per subscriber — the re-arm
+  ///   and mint a dominating [`Rescan`](EventKind::Rescan) per subscriber — the re-arm
   ///   restarts the source's raw epochs at zero, so each subscriber
   ///   [`repoint`](epoch::EpochLedger::repoint)s onto the new handle (exactly a widen re-point) and
   ///   re-enumerates. The subscription is live-and-covered again. The re-arm returns a
@@ -1690,7 +1690,7 @@ where
 
   /// The single **park-terminal-Rescan-then-retire** primitive (invariant I4, no silent loss):
   /// retires a root while durably owing every subscriber a dominating terminal
-  /// [`Rescan`](tributary_fs::EventKind::Rescan), so each re-enumerates its key and learns the
+  /// [`Rescan`](EventKind::Rescan), so each re-enumerates its key and learns the
   /// root is gone. Both retirement paths route through it — root death
   /// ([`retire_if_dead`](Self::retire_if_dead)) and a failed widen whose subsumed root cannot
   /// re-arm ([`restore_disarmed_roots`](Self::restore_disarmed_roots)) — so the class cannot
@@ -1807,7 +1807,7 @@ where
     }
   }
 
-  /// Sheds `sub` to a parked dominating [`Rescan`](tributary_fs::EventKind::Rescan) — the
+  /// Sheds `sub` to a parked dominating [`Rescan`](EventKind::Rescan) — the
   /// per-subscription overflow shed after an **ordinary delta** to it found the channel full
   /// (design backpressure doc), mirroring the fs layer's `LagState::Lagged` one level up. An
   /// already-minted `Rescan` that overflows takes [`park_rescan_event`](Self::park_rescan_event)
@@ -1840,7 +1840,7 @@ where
     }
   }
 
-  /// Parks an already-minted synthetic [`Rescan`](tributary_fs::EventKind::Rescan) that overflowed
+  /// Parks an already-minted synthetic [`Rescan`](EventKind::Rescan) that overflowed
   /// the channel **UNCHANGED** (design backpressure doc, Codex R5): merges its own `key`, `epoch`,
   /// and baked `value` into `needs_rescan` via [`merge_max`], **without** minting a fresh
   /// [`shed_rescan`](epoch::EpochLedger::shed_rescan).
@@ -1917,7 +1917,7 @@ where
   /// (design §5/§7/§8). An event whose root has no live entry (its subscription(s) were
   /// dropped between the source emitting it and us routing it) fans out to nothing.
   ///
-  /// A [`Moved`](tributary_fs::EventKind::Moved) is decomposed per subscriber inside
+  /// A [`Moved`](EventKind::Moved) is decomposed per subscriber inside
   /// [`fan_out`](crate::route::fan_out) (both endpoints → the whole move; source only → a
   /// synthesized `Removed`; destination only → a synthesized `Created`), and the filter +
   /// interest gate below runs against that already-projected delivery.
@@ -2063,7 +2063,7 @@ where
   }
 
   /// One best-effort **ordered** delivery pass of everything owed at teardown — the coalesced
-  /// tail AND every parked per-subscription overflow [`Rescan`](tributary_fs::EventKind::Rescan)
+  /// tail AND every parked per-subscription overflow [`Rescan`](EventKind::Rescan)
   /// — ordered so a parked subscription's buffered tail delta never precedes its dominating
   /// `Rescan` (design backpressure doc, checklist #1/#5, no silent loss).
   ///
@@ -2268,7 +2268,7 @@ where
   }
 }
 
-/// One subscription's parked dominating [`Rescan`](tributary_fs::EventKind::Rescan) (design
+/// One subscription's parked dominating [`Rescan`](EventKind::Rescan) (design
 /// backpressure doc): the covered `key` to re-enumerate, a strictly-dominating `epoch`, and the
 /// owning subscription's baked `value` — the latter captured **while the subscription is live**
 /// (at park / retire time), so the Rescan minted from this entry by
@@ -2284,7 +2284,7 @@ struct ParkedRescan<C, V> {
   value: Option<V>,
 }
 
-/// Merges a parked overflow [`Rescan`](tributary_fs::EventKind::Rescan) into the dirty-set,
+/// Merges a parked overflow [`Rescan`](EventKind::Rescan) into the dirty-set,
 /// keeping the `key`, the max `epoch`, and the baked `value` (design backpressure doc, checklist
 /// #3/#4; design §3 for the value).
 ///
@@ -2365,7 +2365,7 @@ where
 
   #[inline]
   fn move_from(&self) -> Option<&[C]> {
-    self.event.from()
+    self.event.kind().moved_from()
   }
 
   #[inline]
@@ -2393,16 +2393,20 @@ where
 /// gate (design §5). Every umbrella root is armed [`Interest::all`], so this narrows
 /// *delivery* only, never the source watch (design §4).
 ///
-/// A [`Rescan`](tributary_fs::EventKind::Rescan) is always admitted (though in practice it
+/// A [`Rescan`](EventKind::Rescan) is always admitted (though in practice it
 /// never reaches this gate — [`fan_out`](crate::route::fan_out) short-circuits it), and an
 /// unknown future kind is admitted conservatively rather than silently dropped.
-fn interest_admits(interest: Interest, kind: &tributary_fs::EventKind) -> bool {
+fn interest_admits<C>(interest: Interest, kind: &EventKind<C>) -> bool {
   match kind {
-    tributary_fs::EventKind::Created => interest.created(),
-    tributary_fs::EventKind::Modified => interest.modified(),
-    tributary_fs::EventKind::Removed => interest.removed(),
-    tributary_fs::EventKind::Moved(_) => interest.moved(),
-    tributary_fs::EventKind::Rescan => true,
+    EventKind::Created => interest.created(),
+    EventKind::Modified => interest.modified(),
+    EventKind::Removed => interest.removed(),
+    EventKind::Moved { .. } => interest.moved(),
+    EventKind::Rescan => true,
+    // `EventKind` is #[non_exhaustive]: a future variant must default to conservative
+    // admission here, not a silent drop. Unreachable today only because the defining
+    // crate matches its own enum exhaustively — the arm is the forward-compat default.
+    #[allow(unreachable_patterns)]
     _ => true,
   }
 }

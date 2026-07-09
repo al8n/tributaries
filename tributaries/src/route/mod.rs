@@ -9,19 +9,18 @@
 //!
 //! The one thing keeping this module pure is the [`RoutableEvent`] seam: the raw event
 //! is consumed through a trait exposing only its endpoint keys, whether it is a
-//! [`Rescan`](tributary_fs::EventKind::Rescan), and how to mint the retagged output
+//! [`Rescan`](crate::EventKind::Rescan), and how to mint the retagged output
 //! for one subscriber (including the two synthesized single-endpoint projections a
 //! move decomposes into). Production plugs in a thin adapter over the source event
 //! (whose deliver methods mint a [`crate::Event`]); tests plug in a trivial fake, so
-//! the routing decision is checked without constructing the fs event type (whose
-//! constructor is private to that crate).
+//! the routing decision is checked without constructing any source event at all.
 //!
 //! # No silent loss
 //!
 //! For every raw event, the set of subscribers it is delivered to equals exactly
 //! the set whose key covers it **and** whose [`Filter`](crate::Filter) admits it
 //! (design §5/§7) — with one override that *widens* that set, never narrows it: a
-//! [`Rescan`](tributary_fs::EventKind::Rescan) is delivered to **every** subscriber of
+//! [`Rescan`](crate::EventKind::Rescan) is delivered to **every** subscriber of
 //! the root, bypassing *both* the coverage test and the filter, because a
 //! coverage-loss signal must never be narrowed or filtered away (design §5/§7/§8).
 //!
@@ -31,7 +30,7 @@
 //! fan-out — before any coalescing (design §7) — so a settle burst only ever buffers
 //! events the caller actually wants.
 //!
-//! # A [`Moved`](tributary_fs::EventKind::Moved) has two endpoints
+//! # A [`Moved`](crate::EventKind::Moved) has two endpoints
 //!
 //! Every other event kind has a single covered key; a move has two — a source `from`
 //! and a destination `to` ([`key`](RoutableEvent::key)). Coverage must consider
@@ -48,7 +47,7 @@
 //! Each subscriber thus receives **exactly one** event for a move (dedup: a
 //! both-covering subscriber gets the `Moved`, never also a `Removed`/`Created`). The
 //! synthesized single-endpoint projections are minted as a flat owned
-//! [`Event`](crate::Event) — the umbrella never fabricates fs vocabulary — and every
+//! [`Event`](crate::Event) in the umbrella's own neutral vocabulary — and every
 //! projection of one raw move carries that subscriber's umbrella epoch stamp (assigned
 //! downstream, design §8).
 
@@ -58,29 +57,29 @@ use crate::subscription::Subscription;
 mod tests;
 
 /// A raw event, viewed by [`fan_out`] through only what routing needs — its endpoint
-/// keys, whether it is a [`Rescan`](tributary_fs::EventKind::Rescan), and how to mint
+/// keys, whether it is a [`Rescan`](crate::EventKind::Rescan), and how to mint
 /// the retagged delivery (whole, or one of the two single-endpoint move projections)
 /// for one subscriber.
 ///
 /// The seam that keeps [`fan_out`] pure and testable, generic over the key component
-/// `C`: production implements it for a thin adapter over the source event (the local
-/// fs [`tributary_fs::Event`]); tests implement it for a fake. `Delivered` is the
-/// per-subscriber output — [`crate::Event`] in production.
+/// `C`: production implements it for a thin adapter over the raw
+/// [`SourceEvent`](crate::SourceEvent); tests implement it for a fake. `Delivered` is
+/// the per-subscriber output — [`crate::Event`] in production.
 pub(crate) trait RoutableEvent<C> {
   /// The retagged per-subscriber delivery this event fans out into.
   type Delivered;
 
   /// The affected object's located key (the §4 ancestor-test anchor); for a
-  /// [`Moved`](tributary_fs::EventKind::Moved) this is the **destination** `to`.
+  /// [`Moved`](crate::EventKind::Moved) this is the **destination** `to`.
   fn key(&self) -> &[C];
 
   /// The move **source** `from`, iff this event is a
-  /// [`Moved`](tributary_fs::EventKind::Moved) — the second endpoint coverage must
+  /// [`Moved`](crate::EventKind::Moved) — the second endpoint coverage must
   /// test so a source-only subscriber is not silently skipped (design §5). `None` for
   /// every single-endpoint kind.
   fn move_from(&self) -> Option<&[C]>;
 
-  /// Whether this is a [`Rescan`](tributary_fs::EventKind::Rescan) — delivered to
+  /// Whether this is a [`Rescan`](crate::EventKind::Rescan) — delivered to
   /// every subscriber regardless of coverage.
   fn is_rescan(&self) -> bool;
 
@@ -102,7 +101,7 @@ pub(crate) trait RoutableEvent<C> {
 
 /// Fans one raw event out to every covering, filter-admitting subscriber of its
 /// matched root, retagging each delivered copy with that subscriber's
-/// [`Subscription`] and — for a [`Moved`](tributary_fs::EventKind::Moved) — projecting
+/// [`Subscription`] and — for a [`Moved`](crate::EventKind::Moved) — projecting
 /// it per that subscriber's two-endpoint coverage.
 ///
 /// `subscribers` is the subscriber list of the root the driver resolved from the raw
@@ -126,7 +125,7 @@ pub(crate) trait RoutableEvent<C> {
 /// single-endpoint event tests only `event.key()`; a move tests **both** `from` and
 /// `to` (below).
 ///
-/// **Move decomposition (design §5):** for a [`Moved`](tributary_fs::EventKind::Moved)
+/// **Move decomposition (design §5):** for a [`Moved`](crate::EventKind::Moved)
 /// (detected by [`move_from`](RoutableEvent::move_from) being `Some`), each subscriber
 /// receives **exactly one** projection: the whole `Moved` if it covers both endpoints,
 /// a synthesized `Removed(from)` if it covers only the source (move-out), a synthesized
@@ -139,7 +138,7 @@ pub(crate) trait RoutableEvent<C> {
 /// *narrow* the covered set. They run here, before any coalescing, so a settle burst
 /// never buffers a filtered-out or uninteresting event.
 ///
-/// **Rescan override:** if the event is a [`Rescan`](tributary_fs::EventKind::Rescan)
+/// **Rescan override:** if the event is a [`Rescan`](crate::EventKind::Rescan)
 /// it is delivered whole to *every* subscriber of the root regardless of coverage
 /// **and** regardless of filter/interest — a coverage-loss signal is never narrowed or
 /// filtered away (design §5/§7/§8).

@@ -1,11 +1,13 @@
 use core::num::NonZeroU64;
 use std::{ffi::OsString, path::Path};
 
-use tributary_fs::{Epoch, EventKind, Location};
-use tributary_proto::ScopeId;
+use tributary_proto::{Epoch, Location, ScopeId};
 
 use super::{Filter, FilterInput};
-use crate::{event::Event, subscription::Subscription};
+use crate::{
+  event::{Event, EventKind},
+  subscription::Subscription,
+};
 
 /// A subscription with the given non-zero id, under the fixed test instance brand.
 fn sub(id: u64) -> Subscription {
@@ -25,7 +27,7 @@ fn key(path: &str) -> Vec<OsString> {
 /// a filter cannot observe, design §7). A synthetic [`Event`] owns the borrowed parts; the filter
 /// reads only its public pre-delivery accessors, so this stand-in exercises it without the private
 /// `tributary_fs::Event` constructor.
-fn admits(f: &Filter<OsString>, path: &str, kind: EventKind) -> bool {
+fn admits(f: &Filter<OsString>, path: &str, kind: EventKind<OsString>) -> bool {
   let ev: Event<OsString, ()> =
     Event::synthetic(sub(1), key(path), Location::new(), kind, Epoch::new(1));
   f.admits(&FilterInput::new(ev.key(), ev.kind(), ev.location()))

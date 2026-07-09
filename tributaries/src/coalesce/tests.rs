@@ -5,11 +5,14 @@ use std::{
   time::Instant,
 };
 
-use tributary_fs::{Epoch, EventKind, Location};
-use tributary_proto::ScopeId;
+use tributary_proto::{Epoch, Location, ScopeId};
 
 use super::Coalescer;
-use crate::{event::Event, options::DebounceConfig, subscription::Subscription};
+use crate::{
+  event::{Event, EventKind},
+  options::DebounceConfig,
+  subscription::Subscription,
+};
 
 /// The delivered-event type this coalescer buffers: the fs `C = OsString`, `V = ()`.
 type Ev = Event<OsString, ()>;
@@ -31,7 +34,7 @@ fn key(path: &str) -> Vec<OsString> {
 /// reads `subscription`/`key`/`kind`/`epoch`/`location`, so a synthetic stand-in
 /// exercises it without the private `tributary_fs::Event` constructor. Its `location`
 /// is a fresh (root-anchored) one — the coalescer never keys on `location`.
-fn ev(s: Subscription, path: &str, kind: EventKind, epoch: u64) -> Ev {
+fn ev(s: Subscription, path: &str, kind: EventKind<OsString>, epoch: u64) -> Ev {
   Event::synthetic(s, key(path), Location::new(), kind, Epoch::new(epoch))
 }
 
@@ -47,12 +50,12 @@ fn removed(s: Subscription, path: &str, epoch: u64) -> Ev {
   ev(s, path, EventKind::Removed, epoch)
 }
 
-/// A synthetic move fixture. The wrapper cannot fabricate an fs `MovedEvent`, so a
-/// synthetic move surfaces through `move_from` (which the coalescer keys on) — its
-/// `kind` stays `Modified` and its `moved()` is `None`; tests inspect it via
+/// A synthetic whole-move fixture: an [`EventKind::Moved`] whose in-kind `from` is the
+/// rename source — directly constructible now that the umbrella owns the vocabulary.
+/// The coalescer keys on `move_from` (the kind's payload); tests inspect it via
 /// [`is_moved`] / `move_from`.
 fn moved(s: Subscription, path: &str, from: &str, epoch: u64) -> Ev {
-  Event::synthetic_moved(s, key(path), key(from), Epoch::new(epoch))
+  ev(s, path, EventKind::Moved { from: key(from) }, epoch)
 }
 
 /// Whether `ev` is a move — the same wrapper-level detector the coalescer uses.
@@ -387,20 +390,20 @@ fn rescan_only_flushes_its_own_subscription() {
 }
 
 /// Codex R11 F2 regression (forward-compat, design §6): the coalescer coalesces ONLY the known
-/// lifecycle kinds (`Created` / `Modified` / `Removed`). `tributary_fs::EventKind` is
+/// lifecycle kinds (`Created` / `Modified` / `Removed`). The umbrella's own `EventKind` is
 /// `#[non_exhaustive]`; a non-lifecycle kind must NOT be folded into the collapse table (whose
 /// default arm would relabel or drop it), but flushed-and-emitted immediately — the same path as
 /// `Moved`/`Rescan` — so it is delivered in-order and never collapsed.
 ///
-/// LIMITATION: a truly-unknown future `EventKind` cannot be constructed from within `tributaries`
-/// — the enum's non-exhaustive fallthrough has no reachable variant beyond the five known ones,
-/// and `Moved`'s `MovedEvent` payload has no public constructor (so an unknown-kind event with
-/// `move_from() == None`, the one input that would reach the new `else` arm, is not buildable
-/// here). This test therefore exercises the observable classification the arm generalizes, using a
-/// `Moved` (the only constructible non-lifecycle kind) as the representative: a buffered lifecycle
-/// entry is flushed AHEAD of the immediately-emitted non-lifecycle event, and neither is collapsed
-/// — the exact flush-and-emit machinery the new `else` arm now routes future kinds through. The
-/// unknown-kind arm itself is verified by inspection (it mirrors this `Moved`/`Rescan` path).
+/// LIMITATION: a truly-unknown future `EventKind` cannot be constructed, even from within the
+/// defining crate — the enum has no variant beyond the five known ones, and every one of those
+/// dispatches to a dedicated `admit` branch (the `matches!` trio, `move_from`, `is_rescan`), so
+/// no buildable input reaches the unknown-kind `else` arm today. This test therefore exercises
+/// the observable classification the arm generalizes, using a `Moved` (a constructible
+/// non-lifecycle kind) as the representative: a buffered lifecycle entry is flushed AHEAD of the
+/// immediately-emitted non-lifecycle event, and neither is collapsed — the exact flush-and-emit
+/// machinery the `else` arm routes a future variant through. The unknown-kind arm itself is
+/// verified by inspection (it mirrors this `Moved`/`Rescan` path).
 #[test]
 fn a_non_lifecycle_kind_flushes_and_emits_never_coalesced() {
   let clk = Clock::new();

@@ -113,7 +113,7 @@ mod view;
 
 pub use driver::Tributaries;
 pub use error::{BuildError, CloseError, UnwatchError, WatchError};
-pub use event::Event;
+pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
 pub use options::{DebounceConfig, TributariesOptions};
 pub use source::{Armed, FsSource, Source, SourceEvent};
@@ -128,10 +128,16 @@ pub use driver::TokioTributaries;
 #[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
 pub use driver::SmolTributaries;
 
-/// The event vocabulary, options, root handle, and change-id/epoch/location types are
-/// re-exported from [`tributary-fs`](tributary_fs) unchanged — this crate retags events,
-/// it does not redefine them. [`RootHandle`] is the [`FsSource`] armed-root token
-/// ([`Source::Handle`]).
-pub use tributary_fs::{
-  ChangeId, Epoch, EventKind, Interest, Location, MovedEvent, RootHandle, Segment, WatcherOptions,
-};
+/// The umbrella **owns** the source-neutral event vocabulary ([`EventKind`], with the
+/// move endpoint carried in-kind): each source — the fs binding included — maps into it
+/// at its binding, so the fs-only event types (`tributary_fs::EventKind`,
+/// `tributary_fs::MovedEvent`) stay in [`tributary-fs`](tributary_fs) for fs consumers.
+/// Only the two fs-binding types surface here: [`RootHandle`] is the [`FsSource`]
+/// armed-root token ([`Source::Handle`]), and [`WatcherOptions`] configures the
+/// underlying filesystem watcher it drives.
+pub use tributary_fs::{RootHandle, WatcherOptions};
+
+/// The identity/coordinate primitives — change id, epoch, interest, location — are
+/// owned by `tributary-proto` and re-exported from there directly
+/// ([`tributary-fs`](tributary_fs) merely re-exports them itself).
+pub use tributary_proto::{ChangeId, Epoch, Interest, Location, Segment};
