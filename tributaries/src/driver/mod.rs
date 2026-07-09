@@ -938,12 +938,14 @@ where
     // A `None` return needs none: it already delivered everything owed to a claimed sub in its final
     // pass, or the consumer is gone. Still non-blocking, so `close` stays responsive (invariant II).
     if interrupted.is_some() {
-      // FIRST drain any grant-resolution already queued at close time — a `Cleanup::Claim` on the
-      // dedicated cleanup channel lifts its sub's `unclaimed` suppression — so the final owed pass
-      // below DELIVERS that just-claimed sub's parked Rescan instead of reading stale `unclaimed`
-      // state and stranding it (Codex R29-F3). The drain is bounded by the grants in flight, NOT by
-      // the unbounded public backlog the old mailbox scan walked (Codex R30-F1), and awaits nothing
-      // (invariant II).
+      // The ATOMIC claim cut (Codex R32): close the cleanup channel FIRST — a grant defused after
+      // this instant fails its claim try_send and is POISONED (`watch` surfaces `Closed`) — then
+      // drain what landed BEFORE the cut and run the final owed pass, so a pre-cut claim still
+      // gets its parked Rescan delivered (Codex R29-F3) while no post-cut claim can ever return a
+      // live-looking subscription no drain will service. Bounded by grants in flight, never by the
+      // public backlog (Codex R30-F1); awaits nothing (invariant II). (The drain's own exit
+      // already cut+drained on the `None` path; `close` is idempotent.)
+      owner.cleanup_rx.close();
       owner.drain_pending_cleanup();
       owner.drain_owed_once();
     }
@@ -957,6 +959,9 @@ where
     // room. A sub STILL unclaimed after the drain stays SUPPRESSED by owner state inside
     // `drain_owed_once` (its `flush_pending_rescans`): its debt is owed to nobody and correctly
     // withheld, and the owner is exiting. Both steps await nothing, so close stays responsive.
+    // The ATOMIC claim cut first (Codex R32): close the cleanup channel so a grant defused after
+    // this instant is POISONED (`watch` surfaces `Closed`), then drain the pre-cut claims below.
+    owner.cleanup_rx.close();
     owner.drain_pending_cleanup();
     owner.drain_owed_once();
     closing
@@ -2097,6 +2102,16 @@ where
         && self.cleanup_rx.is_empty())
         || self.events.is_closed()
       {
+        // Make the exit ATOMIC with respect to grant claims (Codex R32): another thread holding an
+        // unpolled grant could `defuse` between the emptiness observation above and the owner's
+        // drop — its claim would land on a still-open channel (a live-looking Ok) that no later
+        // drain will ever process. CLOSE the cleanup channel FIRST — every subsequent claim
+        // try_send fails, poisoning its grant so the public `watch` surfaces `Closed` — then drain
+        // whatever landed BEFORE the cut (async_channel keeps queued messages receivable after
+        // close) and run one final owed pass so a pre-cut claim still gets its Rescan delivered.
+        self.cleanup_rx.close();
+        self.drain_pending_cleanup();
+        self.drain_owed_once();
         return None;
       }
       let sleep = R::sleep(RETRY).fuse();
