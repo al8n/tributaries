@@ -41,9 +41,13 @@ fn components(path: &Path) -> Vec<OsString> {
 enum Call {
   Arm(PathBuf),
   Disarm(u32),
-  /// An in-place bidirectional coverage-reconcile request: the root handle and the retained cover
-  /// (the survivor antichain) the driver forwarded (design M2-B / M2-B v2).
+  /// An in-place coverage PRUNE request: the root handle and the retained cover (the survivor
+  /// antichain) the driver forwarded (design M2-B v3, the shrink-in-place seam).
   SetCover(u32, Vec<Vec<OsString>>),
+  /// An AWAITED in-place coverage GROW: the root handle and the fresh cover (including the newcomer)
+  /// the driver awaited (design M2-B v3). Applied-before-return, mirroring the fs source's acked
+  /// `Watcher::set_cover`.
+  Grow(u32, Vec<Vec<OsString>>),
 }
 
 /// A fake [`Source`] over `u32` handles: it records every arm/disarm in order (so a test
@@ -127,6 +131,25 @@ impl FakeSource {
         .canonical
         .get(&handle)
         .is_some_and(|root| key.starts_with(root.as_slice())),
+    }
+  }
+
+  /// Reconcile the modelled ACTUAL coverage to exactly `retained` — the shared application both
+  /// [`set_cover`](Source::set_cover) (prune) and [`grow`](Source::grow) perform. A cover including
+  /// the root's own key is FULL coverage (drop the narrowing entry); else it narrows to exactly the
+  /// retained antichain. Both a prune and a grow reconcile to `retained` (the driver only ever sends
+  /// a narrower cover to `set_cover` and a wider one to `grow`), so the model application is identical
+  /// — the tests distinguish them by the recorded [`Call`].
+  fn apply_cover(&mut self, handle: u32, retained: &[Vec<OsString>]) {
+    let root_is_covered = self.canonical.get(&handle).is_some_and(|root| {
+      retained
+        .iter()
+        .any(|prefix| prefix.as_slice() == root.as_slice())
+    });
+    if root_is_covered {
+      self.actual_cover.remove(&handle);
+    } else {
+      self.actual_cover.insert(handle, retained.to_vec());
     }
   }
 
@@ -274,26 +297,24 @@ impl Source<OsString> for FakeSource {
   }
 
   fn set_cover(&mut self, handle: u32, retained: &[Vec<OsString>]) {
-    // Synchronous, fire-and-forget in-place bidirectional coverage-reconcile REQUEST (design M2-B /
-    // M2-B v2): record the root handle and the retained cover the driver forwarded, so a test can
-    // assert exactly which covers fired and in what order. The fake keeps the root live — set_cover
-    // reconciles coverage BELOW a root, never releases it — so `root_key` still answers, unlike
-    // `disarm`. Unlike `FsSource` (which QUEUES and drains opportunistically), the fake APPLIES the
-    // reconcile immediately, so `actual_covers` reflects the source's true coverage right away: a
-    // cover including the root's own key is FULL coverage (drop the narrowing entry), else it narrows
-    // to exactly the retained antichain — this is what lets a test observe a pruned key regain
-    // coverage after the grow re-issue (Codex R36).
+    // Synchronous, fire-and-forget in-place coverage PRUNE request (design M2-B v3): record the root
+    // handle and the retained cover the driver forwarded, so a test can assert exactly which prunes
+    // fired and in what order. The fake keeps the root live — a prune reconciles coverage BELOW a
+    // root, never releases it — so `root_key` still answers, unlike `disarm`. Unlike `FsSource` (which
+    // QUEUES and drains opportunistically), the fake APPLIES immediately, so `actual_covers` reflects
+    // the source's true coverage right away.
     self.calls.push(Call::SetCover(handle, retained.to_vec()));
-    let root_is_covered = self.canonical.get(&handle).is_some_and(|root| {
-      retained
-        .iter()
-        .any(|prefix| prefix.as_slice() == root.as_slice())
-    });
-    if root_is_covered {
-      self.actual_cover.remove(&handle);
-    } else {
-      self.actual_cover.insert(handle, retained.to_vec());
-    }
+    self.apply_cover(handle, retained);
+  }
+
+  async fn grow(&mut self, handle: u32, retained: &[Vec<OsString>]) {
+    // The AWAITED, applied-before-return GROW (design M2-B v3): record the fresh cover (including the
+    // newcomer) and apply it to the modelled ACTUAL coverage IMMEDIATELY — so `actual_covers` reflects
+    // the newcomer the instant this returns, mirroring the fs source's acked `Watcher::set_cover`.
+    // This is what lets a test observe a pruned key regain coverage the moment the covered-outside
+    // watch returns (Codex R39), with no bridging Rescan.
+    self.calls.push(Call::Grow(handle, retained.to_vec()));
+    self.apply_cover(handle, retained);
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
@@ -465,8 +486,8 @@ async fn overlapping_watch_issues_one_arm() {
     1,
     "two overlapping subscriptions collapse to exactly one arm"
   );
-  // Only /a is ARMED. The covered /a/b commit re-issues a (cancel-equivalent) shrink to keep any
-  // queued snapshot fresh (Codex R35), never a second arm — so filter to the arms.
+  // Only /a is ARMED. The covered /a/b lands INSIDE the covering root's full coverage (never
+  // narrowed), so it grows nothing and arms nothing — so filter to the arms.
   let arms: Vec<Call> = h
     .owner
     .source
@@ -716,16 +737,16 @@ async fn over_broad_unwatch_set_covers_root_in_place() {
     .map(|(_, handle)| handle)
     .expect("the wide /a root is live");
 
-  // Baseline: the widen disarmed the subsumed /a/b root and armed /a — no shrink of the WIDE root
-  // yet. (The covered /a/b/c commit re-issued a shrink for the NARROW /a/b root, handle 1, not this
-  // wide one — Codex R35 freshness re-issue.)
+  // Baseline: the widen disarmed the subsumed /a/b root and armed /a — no prune of the WIDE root
+  // yet. (The covered /a/b/c landed INSIDE the /a/b root's full coverage, so it grew and pruned
+  // nothing — v3 issues a cover call only when a newcomer falls OUTSIDE a narrowed cover.)
   assert!(
     !h.owner
       .source
       .calls()
       .iter()
       .any(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide)),
-    "no shrink of the wide root before the over-broadening unwatch"
+    "no prune of the wide root before the over-broadening unwatch"
   );
 
   h.unwatch(s_a).expect("unwatch the widening /a");
@@ -767,8 +788,9 @@ async fn narrow_unwatch_does_not_set_cover() {
     .await
     .expect("watch /a/b covered");
 
-  // The covered /a/b commit re-issues a cancel-equivalent shrink for the still-pinned root (Codex
-  // R35); snapshot the shrink calls so far, so we can assert the UNWATCH below adds none of its own.
+  // The covered /a/b landed INSIDE the /a root's full coverage (never narrowed), so it issued no
+  // cover call; snapshot the prune calls so far, so we can assert the UNWATCH below adds none of its
+  // own.
   let shrinks_before: Vec<Call> = h
     .owner
     .source
@@ -833,22 +855,18 @@ async fn over_broad_droporphan_also_set_covers() {
   );
 }
 
-/// R35 freshness re-issue: a queued shrink's retained cover is RE-ISSUED on every Covered commit, so a
-/// pending snapshot can never go stale under a still-live root. Wide /a over survivor /a/b: unwatching
-/// the widening /a shrinks to {/a/b}; a later `watch /a/c` (Covered, no arm) re-issues the FRESH
-/// {/a/b, /a/c} cover — never leaving the stale {/a/b} that a later arm would apply, pruning /a/c's
-/// coverage while the subsumer advertises it live (the R35 silent loss); and a final `watch /a`
-/// (Covered, key == root) re-issues the cancel-equivalent {/a}, retaining the whole root so nothing is
-/// reclaimed. Each is a distinct forwarded `source.set_cover` — the source's LATEST-WINS discipline makes
-/// the last one per handle the one actually applied.
-///
-/// Fail-on-old: without the Covered-commit re-issue, only the first shrink ({/a/b}) is ever sent; the
-/// covered /a/c never refreshes it, so the queued {/a/b} applies and silently drops /a/c.
+/// M2-B v3: covered-outside commits GROW (never prune), and the cancel-equivalent grows back to FULL.
+/// Wide /a over survivor /a/b: unwatching the widening /a PRUNES to {/a/b}; a later `watch /a/c`
+/// (Covered-outside, arms nothing) GROWS to the FRESH {/a/b, /a/c}; and a final `watch /a` (Covered,
+/// key == root, also outside the narrowed cover) grows back to FULL coverage — the cancel-equivalent —
+/// and clears the record to None (a subscriber now pins the root at its own key). One prune then two
+/// grows, each carrying the CURRENT fresh cover; and — every grow being AWAITED — the record stays
+/// EXACT at every step (None → {/a/b} → {/a/b, /a/c} → None).
 #[tokio::test]
-async fn covered_commit_reissues_fresh_retained_cover() {
+async fn covered_outside_grows_then_repins_to_full() {
   let mut h = Harness::new();
 
-  // Wide /a over a disjoint survivor /a/b (a widen, so /a/b is NOT a covered commit — no re-issue
+  // Wide /a over a disjoint survivor /a/b (a widen, so /a/b is NOT a covered commit — no cover call
   // until the covered watches below).
   let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
   let s_a = h
@@ -863,74 +881,90 @@ async fn covered_commit_reissues_fresh_retained_cover() {
     .map(|(_, handle)| handle)
     .expect("the wide /a root is live");
 
-  // Nothing shrunk the wide root yet (the widen re-issues nothing).
+  // No cover call on the wide root yet (the widen issues none).
   assert!(
     !h.owner
       .source
       .calls()
       .iter()
-      .any(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide)),
-    "no shrink of the wide root before any over-broadening drop or covered commit"
+      .any(|c| matches!(c, Call::SetCover(handle, _) | Call::Grow(handle, _) if *handle == wide)),
+    "no cover call on the wide root before any over-broadening drop or covered-outside commit"
   );
 
-  // (1) Unwatch the widening /a → over-broad → shrink to the {/a/b} survivor cover.
+  // (1) Unwatch the widening /a → over-broad → PRUNE to {/a/b}, record Some({/a/b}).
   h.unwatch(s_a).expect("unwatch the widening /a");
-  // (2) watch /a/c, Covered under the still-live wide /a (arms nothing) → re-issue the FRESH
-  //     {/a/b, /a/c} cover so the queued shrink never trails behind as the stale {/a/b}.
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b")]),
+    "the prune narrowed the record to {{/a/b}}"
+  );
+  // (2) watch /a/c, Covered-OUTSIDE {/a/b} → GROW to the fresh {/a/b, /a/c}, record Some({/a/b, /a/c}).
   let _s_c = h
     .watch("/a/c", Interest::all())
     .await
-    .expect("watch /a/c covered");
-  // (3) watch /a again, Covered with key == root → cancel-equivalent re-issue {/a} (retain the root).
+    .expect("watch /a/c covered-outside");
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the grow broadened the record EXACTLY to {{/a/b, /a/c}} (broaden-on-return)"
+  );
+  // (3) watch /a again, Covered with key == root (also outside the narrowed cover) → GROW to FULL
+  //     coverage (the cancel-equivalent), record None (/a now pins the root at its own key).
   let _s_a2 = h
     .watch("/a", Interest::all())
     .await
     .expect("watch /a again covered");
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    None,
+    "re-pinning the root at its own key grows back to FULL and clears the record"
+  );
 
-  let shrinks: Vec<Call> = h
+  // The prune is a Call::SetCover; both broadens are Call::Grow carrying the CURRENT fresh cover.
+  let covers: Vec<Call> = h
     .owner
     .source
     .calls()
     .into_iter()
-    .filter(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide))
+    .filter(|c| matches!(c, Call::SetCover(handle, _) | Call::Grow(handle, _) if *handle == wide))
     .collect();
   assert_eq!(
-    shrinks,
+    covers,
     vec![
       Call::SetCover(wide, vec![key("/a/b")]),
-      Call::SetCover(wide, vec![key("/a/b"), key("/a/c")]),
-      Call::SetCover(wide, vec![key("/a")]),
+      Call::Grow(wide, vec![key("/a/b"), key("/a/c")]),
+      Call::Grow(wide, vec![key("/a")]),
     ],
-    "each Covered commit re-issues the CURRENT retained cover: the {{/a/b}} survivor drop, then the \
-     FRESH {{/a/b, /a/c}} (never the stale {{/a/b}}), then the cancel-equivalent {{/a}} once /a \
-     re-pins the root — so a queued shrink can never apply a stale snapshot (Codex R35)"
+    "one PRUNE then two GROWs, each carrying the fresh cover: the {{/a/b}} survivor drop, then the \
+     grow to {{/a/b, /a/c}}, then the cancel-equivalent grow to FULL {{/a}} (M2-B v3)"
   );
-  // The re-issue that matters most: the covered /a/c commit forwarded a cover that INCLUDES /a/c —
-  // the fresh membership, never trailing behind as the stale {/a/b} that would drop /a/c silently.
+  // The full-coverage repin restored actual coverage everywhere under /a.
   assert!(
-    shrinks
-      .iter()
-      .any(|c| matches!(c, Call::SetCover(_, cover) if cover.contains(&key("/a/c")))),
-    "the covered /a/c commit re-issued a cover that includes /a/c (freshness, not the stale snapshot)"
+    h.owner.source.actual_covers(wide, &key("/a/c")),
+    "the grow covered /a/c"
+  );
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/z")),
+    "the cancel-equivalent grew back to FULL coverage under /a"
   );
 }
 
-/// M2-B v2 Covered-OUTSIDE bridge + grow, end to end at the driver (Codex R36): after an applied
-/// set_cover NARROWED a wide root's ACTUAL coverage below a key, a later watch of that pruned key is
-/// `Covered` (arms nothing) yet the source no longer backs it — silent loss unless bridged. The driver
-/// must, as one composition: (i) PARK a dominating Rescan for the newcomer's OWN key (bridging the
-/// commit→grow gap — suppressed while the grant is unclaimed, delivered once claimed); (ii) re-issue a
-/// `set_cover` whose FRESH cover INCLUDES the newcomer (the grow trigger); and (iii) the source's ACTUAL
-/// coverage then includes the newcomer again while the retained survivor never lost coverage.
+/// M2-B v3 Covered-OUTSIDE grow, end to end at the driver (Codex R39-F1): after a PRUNE narrowed a
+/// wide root's ACTUAL coverage below a key, a later watch of that pruned key is `Covered` (arms
+/// nothing) yet the source no longer backs it. The driver AWAITS a `Source::grow` to a fresh cover
+/// that INCLUDES the newcomer, applied BEFORE the watch returns, so: (i) NO bridging Rescan is parked
+/// (coverage is live on return — a new watch is "changes from now on"); (ii) the commit issued a
+/// Call::Grow with the fresh cover; (iii) the source's ACTUAL coverage includes the newcomer at
+/// return while the survivor never lost coverage; and the record broadens EXACTLY to the grown cover.
 ///
-/// Fail-on-old: a prune-only shrink cannot restore coverage, so the newcomer would commit over a hole
-/// with no Rescan behind it — the exact R36 silent loss this closes.
+/// Fail-on-old: a deferred fire-and-forget re-issue behind an already-flushed bridge could drop the
+/// write between commit and apply — the exact R39-F1 silent loss the awaited grow closes.
 #[tokio::test]
-async fn covered_outside_narrowed_root_parks_bridge_and_grows_coverage() {
+async fn covered_outside_narrowed_root_grows_before_returning() {
   let mut h = Harness::new();
 
-  // Wide /a over a disjoint survivor /a/b, then drop the widening /a → over-broad → set_cover narrows
-  // the wide root's ACTUAL coverage to {/a/b}; /a/c is now strictly outside it (pruned at the source).
+  // Wide /a over a disjoint survivor /a/b, then drop the widening /a → over-broad → PRUNE narrows the
+  // wide root's ACTUAL coverage to {/a/b}; /a/c is now strictly outside it (pruned at the source).
   let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
   let s_a = h
     .watch("/a", Interest::all())
@@ -945,22 +979,27 @@ async fn covered_outside_narrowed_root_parks_bridge_and_grows_coverage() {
     .expect("the wide /a root is live");
   h.unwatch(s_a).expect("unwatch the widening /a");
 
-  // Precondition — the source's actual coverage was narrowed: /a/b stays covered, /a/c does NOT.
+  // Precondition — the source's actual coverage was narrowed: /a/b covered, /a/c NOT; record {/a/b}.
   assert!(
     h.owner.source.actual_covers(wide, &key("/a/b")),
-    "the retained /a/b survivor stays covered after the shrink"
+    "the retained /a/b survivor stays covered after the prune"
   );
   assert!(
     !h.owner.source.actual_covers(wide, &key("/a/c")),
     "the pruned /a/c is NOT covered before the newcomer (the narrowed source state)"
   );
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b")]),
+    "the record narrowed to {{/a/b}} on the prune issue"
+  );
 
-  let set_covers_before = h
+  let grows_before = h
     .owner
     .source
     .calls()
     .into_iter()
-    .filter(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide))
+    .filter(|c| matches!(c, Call::Grow(handle, _) if *handle == wide))
     .count();
 
   // Watch /a/c: Covered under the still-armed wide /a, but OUTSIDE the narrowed cover {/a/b}.
@@ -969,114 +1008,200 @@ async fn covered_outside_narrowed_root_parks_bridge_and_grows_coverage() {
     .await
     .expect("watch /a/c covered-outside");
 
-  // (i) A dominating bridging Rescan is PARKED for the newcomer, naming its OWN key /a/c.
-  let parked = h
-    .owner
-    .needs_rescan
-    .get(&s_c)
-    .expect("a bridging Rescan is parked for the covered-outside newcomer");
-  assert_eq!(
-    parked.key,
-    key("/a/c"),
-    "the bridge Rescan re-enumerates the newcomer's own key"
-  );
-  // ...suppressed while the grant is unclaimed, then delivered once claimed. Clear any pre-existing
-  // stream events first (the widen re-pointed /a/b's Rescan) so the probe sees only the bridge.
-  let _ = h.drain();
-  h.owner.unclaimed.insert(s_c);
-  h.owner.flush_pending_rescans();
+  // (i) NO bridging Rescan is parked — the grow was applied before the watch returned, so nothing is
+  // owed under the newcomer's key (v3: coverage is live on return, so no bridge).
   assert!(
-    h.drain().is_empty(),
-    "the parked bridge Rescan is suppressed while the newcomer's grant is unclaimed"
-  );
-  h.owner.unclaimed.remove(&s_c); // the caller claims the grant
-  h.owner.flush_pending_rescans();
-  let delivered = h.drain();
-  assert!(
-    delivered
-      .iter()
-      .any(|e| e.subscription() == s_c && e.is_rescan() && e.key() == key("/a/c").as_slice()),
-    "the bridge Rescan delivers to the newcomer once its grant is claimed"
+    !h.owner.needs_rescan.contains_key(&s_c),
+    "no bridge Rescan is parked for the covered-outside newcomer — coverage is live on return (v3)"
   );
 
-  // (ii) The Covered-outside commit re-issued a set_cover whose FRESH cover INCLUDES the newcomer.
-  let set_covers_after: Vec<Call> = h
+  // (ii) The commit AWAITED a Call::Grow whose FRESH cover INCLUDES the newcomer.
+  let grows_after: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Grow(handle, _) if *handle == wide))
+    .collect();
+  assert!(
+    grows_after.len() > grows_before,
+    "the covered-outside commit issued a Call::Grow (the grow trigger)"
+  );
+  assert_eq!(
+    grows_after,
+    vec![Call::Grow(wide, vec![key("/a/b"), key("/a/c")])],
+    "the grow carried the fresh survivor+newcomer cover {{/a/b, /a/c}}"
+  );
+
+  // (iii) The source's ACTUAL coverage now includes /a/c (grown before return), /a/b never lost it,
+  // and the record broadened EXACTLY to the grown cover.
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/c")),
+    "the source grew its actual coverage to include /a/c before the watch returned (Codex R39)"
+  );
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/b")),
+    "the retained /a/b never lost coverage across the grow (no gap, no re-crawl)"
+  );
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the record broadened EXACTLY on grow-return, matching the source's live coverage (M2-B v3)"
+  );
+}
+
+/// M2-B v3: a second Covered newcomer landing INSIDE the record broadened by an earlier grow does NOT
+/// re-grow and owes NO bridge (Codex R39). Because the first grow is AWAITED and applied before its
+/// watch returned, the record broadened EXACTLY to the source's live coverage — so a newcomer now
+/// under that coverage classifies INSIDE and the source already backs it. (Contrast the v2 pessimism:
+/// there the grow was a fire-and-forget re-issue with an enqueue→apply window, so the record could not
+/// broaden at issuance and a second newcomer had to park its own bridge; v3 has no such window.)
+#[tokio::test]
+async fn second_covered_inside_the_grown_cover_does_not_regrow() {
+  let mut h = Harness::new();
+
+  // Narrow the wide /a root to {/a/b}, then GROW it back to {/a/b, /a/c} via a covered-outside /a/c.
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+  h.unwatch(s_a).expect("unwatch the widening /a");
+  let _s_c = h
+    .watch("/a/c", Interest::all())
+    .await
+    .expect("watch /a/c covered-outside grows");
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the first grow broadened the record EXACTLY to {{/a/b, /a/c}}"
+  );
+  let grows_before = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Grow(handle, _) if *handle == wide))
+    .count();
+
+  // A SECOND Covered newcomer INSIDE the grown cover: /a/c/x is under the retained prefix /a/c.
+  let s_cx = h
+    .watch("/a/c/x", Interest::all())
+    .await
+    .expect("watch /a/c/x covered-INSIDE");
+
+  // It classifies INSIDE the record, so the source already backs it: NO new grow, NO bridge parked.
+  assert!(
+    !h.owner.needs_rescan.contains_key(&s_cx),
+    "an inside-cover newcomer parks no bridge — coverage already backs it"
+  );
+  let grows_after = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Grow(handle, _) if *handle == wide))
+    .count();
+  assert_eq!(
+    grows_after, grows_before,
+    "an inside-cover newcomer issues NO grow (the exact broadened record classifies it INSIDE)"
+  );
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the record is unchanged by an inside-cover newcomer"
+  );
+}
+
+/// M2-B v3 F2 (Codex R39-F2), end to end at the driver: a non-root unwatch that shrinks an
+/// already-narrowed cover RE-PRUNES. After a grow broadened the wide /a root's cover to {/a/b, /a/c},
+/// unwatching the non-root /a/c survivor leaves the cover reclaimable to {/a/b}, so
+/// `release_subscription` issues a sync `set_cover` PRUNE with the shrunken antichain and narrows the
+/// record. Fail-on-old: the old detect_shrink only fired for a departing key EQUAL to the root key, so
+/// a non-root departure left the grown /a/c coverage pinned forever (a budget leak).
+#[tokio::test]
+async fn grow_then_unwatch_non_root_reprunes() {
+  let mut h = Harness::new();
+
+  // Narrow /a to {/a/b}, then grow to {/a/b, /a/c} via a covered-outside /a/c.
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+  h.unwatch(s_a).expect("unwatch the widening /a");
+  let s_c = h
+    .watch("/a/c", Interest::all())
+    .await
+    .expect("watch /a/c covered-outside grows");
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the grow broadened the record to {{/a/b, /a/c}}"
+  );
+  let prunes_before = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide))
+    .count();
+
+  // Unwatch the NON-ROOT /a/c survivor: the cover can shrink further, to {/a/b} (F2).
+  h.unwatch(s_c).expect("unwatch the non-root /a/c");
+
+  let prunes_after: Vec<Call> = h
     .owner
     .source
     .calls()
     .into_iter()
     .filter(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide))
     .collect();
-  assert!(
-    set_covers_after.len() > set_covers_before,
-    "the covered-outside commit re-issued a set_cover (the grow trigger)"
+  assert_eq!(
+    prunes_after.len(),
+    prunes_before + 1,
+    "the non-root unwatch issued exactly one re-prune of the wide root"
+  );
+  assert_eq!(
+    prunes_after.last(),
+    Some(&Call::SetCover(wide, vec![key("/a/b")])),
+    "the re-prune carries the shrunken {{/a/b}} antichain"
+  );
+  // The record narrowed back to {/a/b}, and the source reclaimed /a/c's coverage in place.
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b")]),
+    "the record narrowed on the F2 re-prune issue"
   );
   assert!(
-    set_covers_after
-      .iter()
-      .any(|c| matches!(c, Call::SetCover(_, cover) if cover.contains(&key("/a/c")))),
-    "the re-issued cover INCLUDES the newcomer /a/c — the grow, never the stale {{/a/b}}"
-  );
-
-  // (iii) The source's ACTUAL coverage grew back to include /a/c, and /a/b never lost coverage.
-  assert!(
-    h.owner.source.actual_covers(wide, &key("/a/c")),
-    "the source grew its actual coverage back to include the newcomer /a/c (Codex R36)"
+    !h.owner.source.actual_covers(wide, &key("/a/c")),
+    "the /a/c coverage was reclaimed by the re-prune"
   );
   assert!(
     h.owner.source.actual_covers(wide, &key("/a/b")),
-    "the retained /a/b never lost coverage across the grow (no gap, no re-crawl)"
+    "the retained /a/b survivor keeps coverage"
   );
-}
-
-/// Codex R38 regression — the recorded retained cover is PESSIMISTIC on a broaden: a Covered-outside
-/// grow only ENQUEUES the set_cover (for the fs source, a reply-less try_send applied later), so the
-/// record must NOT broaden at issuance. Two back-to-back Covered-outside watches after a narrow:
-/// the SECOND lands in the first's enqueue→apply window and must STILL classify outside the old
-/// narrow record — parking its own bridging Rescan — or writes under its still-pruned subtree would
-/// be silently missed. Fail-on-old: recording the broadened cover at the first grow made the second
-/// newcomer read inside-cover, skipping its bridge.
-#[tokio::test]
-async fn second_covered_outside_during_a_pending_broaden_still_bridges() {
-  let mut h = Harness::new();
-
-  // Narrow the wide /a root to {/a/b} (the over-broad release records the NARROW cover).
-  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
-  let s_a = h
-    .watch("/a", Interest::all())
-    .await
-    .expect("watch /a widens");
-  h.unwatch(s_a).expect("unwatch the widening /a");
-
-  // FIRST Covered-outside newcomer: bridges + enqueues the grow (the record must stay {/a/b}).
-  let s_c = h
-    .watch("/a/c", Interest::all())
-    .await
-    .expect("watch /a/c covered-outside");
   assert!(
-    h.owner.needs_rescan.contains_key(&s_c),
-    "the first covered-outside newcomer parks its bridge"
-  );
-
-  // SECOND Covered-outside newcomer, conceptually inside the first grow's enqueue→apply window:
-  // the pessimistic record means it MUST also classify outside and park its own bridge.
-  let s_d = h
-    .watch("/a/d", Interest::all())
-    .await
-    .expect("watch /a/d covered-outside");
-  assert!(
-    h.owner.needs_rescan.contains_key(&s_d),
-    "the SECOND covered-outside newcomer ALSO parks a bridge — the record never broadened at \
-     issuance (Codex R38)"
-  );
-  // And its own grow re-issue carries a cover including /a/d (latest-wins at the source).
-  assert!(
-    h.owner
+    !h.owner
       .source
       .calls()
       .iter()
-      .any(|c| matches!(c, Call::SetCover(_, cover) if cover.contains(&key("/a/d")))),
-    "the second newcomer re-triggered the grow with a cover including its key"
+      .any(|c| matches!(c, Call::Disarm(handle) if *handle == wide)),
+    "the re-prune reclaims in place, never disarms the surviving root"
   );
 }
 

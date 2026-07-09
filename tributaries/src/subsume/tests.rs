@@ -452,6 +452,84 @@ fn over_broad_antichain_collapses_nested_survivors() {
   }
 }
 
+/// M2-B v3 F2 (Codex R39-F2): a non-root unwatch that shrinks an ALREADY-NARROWED cover reports a
+/// re-prune. A wide /a narrowed to {/a/b, /a/c}: dropping the non-root /a/c survivor (departing key
+/// /a/c != root key /a) leaves the cover reclaimable to {/a/b} — so `detect_shrink` reports a shrink
+/// to the shrunken antichain. The old detection, gated on the departing key EQUALLING the root key,
+/// missed this and left /a/c's grown coverage pinned forever.
+#[test]
+fn narrowed_cover_non_root_unwatch_reprunes() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  let (_rc, s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
+  // Widen /a over /a/b and /a/c, then drop /a, leaving the wide root serving only /a/b and /a/c.
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_a = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  // Record the source's narrowed coverage exactly as the driver would (narrow-on-prune-issue).
+  s.set_retained_cover(wide, Some(vec![key("/a/b"), key("/a/c")]));
+
+  // Drop the NON-ROOT /a/c survivor: the survivor antichain {/a/b} is STRICTLY narrower than the
+  // recorded {/a/b, /a/c}, so the drop reports a re-prune to {/a/b}.
+  match s.plan_unwatch(s_c) {
+    Some(UnwatchOutcome::Dropped {
+      shrink: Some((handle, retained)),
+    }) => {
+      assert_eq!(
+        handle, wide,
+        "the narrowed wide root is reported for the re-prune"
+      );
+      assert_eq!(
+        retained,
+        vec![key("/a/b")],
+        "the re-prune carries the shrunken survivor antichain"
+      );
+    }
+    other => panic!("expected a re-prune Dropped, got {other:?}"),
+  }
+}
+
+/// M2-B v3 F2: a non-root unwatch that leaves the survivor antichain EQUAL to the recorded cover
+/// reports NO re-prune — dropping a survivor already covered by a shallower sibling reclaims nothing.
+/// A wide /a narrowed to {/a/b, /a/c} with an extra /a/b/deep sub under /a/b: dropping /a/b/deep
+/// leaves the antichain {/a/b, /a/c} unchanged, so no re-prune fires.
+#[test]
+fn equal_survivor_antichain_reports_no_reprune() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  let (_rdeep, s_deep) = watch(&mut s, &mut h, "/a/b/deep", Interest::all()); // Covered by /a/b.
+  let (_rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_a = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  // The narrowed cover the driver would record: the minimal antichain {/a/b, /a/c}.
+  s.set_retained_cover(wide, Some(vec![key("/a/b"), key("/a/c")]));
+
+  // Drop /a/b/deep — already covered by the shallower /a/b survivor — so the survivor antichain is
+  // unchanged: {/a/b, /a/c} still, EQUAL to the recorded cover → no re-prune.
+  assert!(
+    matches!(
+      s.plan_unwatch(s_deep),
+      Some(UnwatchOutcome::Dropped { shrink: None })
+    ),
+    "a survivor covered by a shallower sibling reclaims nothing — no re-prune"
+  );
+}
+
 /// M2-B freshness re-issue (Codex R35): `retained_cover_for` recomputes a root's retained cover from
 /// its CURRENT live membership — the query the driver re-issues on every Covered commit to keep a
 /// queued shrink fresh. A subscriber still pinning the root at its own key reports `None` (the driver
