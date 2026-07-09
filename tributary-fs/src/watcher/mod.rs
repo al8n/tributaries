@@ -27,6 +27,14 @@ use crate::{
 #[cfg(all(test, feature = "tokio"))]
 mod tests;
 
+// Real-kernel regression suite for the crate-internal set-cover pair: `set_cover` and
+// `request_set_cover` are `pub(crate)` (Codex R43 — no public reachability until the
+// effect-completion fence lands), so an external integration binary can no longer call
+// them; the inotify end-to-end coverage lives in-crate instead. not(miri): drives real
+// inotify syscalls and a tokio runtime.
+#[cfg(all(test, target_os = "linux", feature = "tokio", not(miri)))]
+mod linux_kernel_tests;
+
 /// Mints one id per [`Watcher`], branding its handles (see [`RootHandle`]).
 static WATCHER_INSTANCES: AtomicU64 = AtomicU64::new(1);
 
@@ -584,12 +592,25 @@ impl<R: RuntimeLite> Watcher<R> {
   /// `retained` are the watcher's own canonical coordinates (as
   /// [`root_path`](Self::root_path) reports), so they line up with the watches' addressing.
   ///
+  /// # Crate-internal until the effect-completion fence lands (Codex R43)
+  ///
+  /// The ack resolves when the reconcile has been **applied to the Monitor** — its
+  /// `AddWatch`/`RemoveWatch` effects are dispatched from the effect batch *after* the ack — NOT
+  /// when the kernel watches backing `retained` are live. A caller that shrank a subtree, awaited
+  /// a grow back, and wrote immediately could race the re-arm and miss the write with no `Rescan`
+  /// owed for the gap. Until the fs core mints an effect-completion token for the grow half (the
+  /// dedicated follow-up), this stays `pub(crate)`: exercised by the in-crate kernel tests, never
+  /// reachable as public API with the incomplete semantics.
+  ///
   /// # Errors
   ///
   /// - [`UnwatchError::UnknownRoot`] when `root` does not name a live root of THIS
   ///   watcher (never watched, already gone, or issued by a different watcher);
   /// - [`UnwatchError::Closed`] when the watcher is already closed.
-  pub async fn set_cover(
+  // Dormant on the lib target (Codex R43): no non-test code constructs a set-cover until the
+  // effect-completion follow-up re-publicizes the pair; the in-crate tests keep it exercised.
+  #[cfg_attr(not(test), allow(dead_code))]
+  pub(crate) async fn set_cover(
     &self,
     root: RootHandle,
     retained: Vec<PathBuf>,
@@ -638,7 +659,12 @@ impl<R: RuntimeLite> Watcher<R> {
   /// Returns `false` when the control channel is full (the caller re-tries at its next
   /// opportunity) or closed, or when `root` is a foreign handle; `true` when the request was
   /// enqueued. Never blocks and never panics.
-  pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> bool {
+  ///
+  /// Crate-internal for the same reason as [`set_cover`](Self::set_cover) (Codex R43): enqueue
+  /// says nothing about when the kernel coverage matches the cover, so the pair stays off the
+  /// public surface until the effect-completion fence lands.
+  #[cfg_attr(not(test), allow(dead_code))]
+  pub(crate) fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> bool {
     if root.instance() != self.instance {
       return false;
     }

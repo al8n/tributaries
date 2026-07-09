@@ -885,7 +885,7 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   ///
   /// # Why disabled, not merely defaulted
   ///
-  /// The awaited [`Watcher::set_cover`](tributary_fs::Watcher::set_cover) this method used to drive
+  /// The awaited, now crate-internal `Watcher::set_cover` this method used to drive
   /// does NOT provide the correctness fence clause 1 demands: it returns when the fs core has
   /// **QUEUED** the re-arm effects onto its driver, not when the kernel watches backing `retained` are
   /// **live** — so a write between the ack and the effect landing could still be missed — and a failed
@@ -908,7 +908,7 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   ///
   /// It stands down together with its awaited GROW counterpart [`grow`](Self::grow): the prune cannot
   /// be safely restored until the fs core mints an **effect-completion token** for the acked
-  /// [`Watcher::set_cover`](tributary_fs::Watcher::set_cover) (which returns at effect-QUEUE time, not
+  /// `Watcher::set_cover` (now crate-internal; it returns at effect-QUEUE time, not
   /// when the kernel watches are live — Codex R40), so both halves defer rather than pruning coverage
   /// a not-yet-correct `grow` could not restore. Deferred to a dedicated follow-up. The [`Source`]
   /// contract, the umbrella semantics, and the [`Watcher`] plumbing all remain correct and tested —
