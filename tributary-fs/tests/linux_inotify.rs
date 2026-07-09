@@ -500,3 +500,119 @@ async fn close_quiesces_under_sustained_traffic() {
      not after an EAGAIN that never comes: {closed:?}"
   );
 }
+
+/// Total inotify watch descriptors held by THIS process, summed across every inotify fd:
+/// an inotify fd's `/proc/self/fdinfo/<fd>` lists one `inotify wd:<n> ...` line per live
+/// per-directory watch. Run with `--test-threads=1` (this binary always is), so the single
+/// watcher under test is the only inotify fd and this reflects its descending watch count.
+fn count_inotify_wds() -> usize {
+  let mut total = 0;
+  let Ok(entries) = std::fs::read_dir("/proc/self/fdinfo") else {
+    return 0;
+  };
+  for entry in entries.flatten() {
+    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+      total += content
+        .lines()
+        .filter(|line| line.starts_with("inotify wd:"))
+        .count();
+    }
+  }
+  total
+}
+
+/// M2-B shrink-in-place, end to end against real inotify: a wide root that armed per-directory
+/// watches over TWO nested subtrees is pruned in place down to a retained cover. The strictly-outside
+/// subtree's watch descriptors are reclaimed (the wd count drops), the retained subtree keeps
+/// delivering with NO gap (its watches are never re-armed), and the pruned subtree stops delivering —
+/// the whole point of shrinking the kernel coverage rather than releasing and re-arming.
+#[tokio::test]
+async fn shrink_prunes_outside_subtree_and_retains_the_cover() {
+  let root = scratch_root("shrink");
+  std::fs::create_dir_all(root.join("keep/deep")).unwrap();
+  std::fs::create_dir_all(root.join("drop/deep")).unwrap();
+
+  // Pin inotify: the shrink prunes PER-DIRECTORY watches, which only the descending backend holds
+  // (a kernel-recursive fanotify mark has none, and its shrink is a documented no-op).
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let h = w.watch(&root, Interest::all()).await.expect("watch root");
+
+  // Both nested subtrees must be armed before the shrink: a write deep under each surfaces, proving
+  // /keep/deep and /drop/deep hold live per-directory watches.
+  let keep_probe = root.join("keep/deep/before.txt");
+  let drop_probe = root.join("drop/deep/before.txt");
+  std::fs::write(&keep_probe, b"x").unwrap();
+  std::fs::write(&drop_probe, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &keep_probe)).await.is_some(),
+    "the /keep subtree is armed (its deep write surfaces)"
+  );
+  assert!(
+    wait_for(&mut w, |e| covers(e, &drop_probe)).await.is_some(),
+    "the /drop subtree is armed (its deep write surfaces)"
+  );
+
+  let before = count_inotify_wds();
+  assert!(
+    before >= 5,
+    "root + keep + keep/deep + drop + drop/deep all hold watches before the shrink (got {before})"
+  );
+
+  // Shrink the wide root down to the /keep cover: /drop and /drop/deep are strictly outside it, so
+  // their watches are pruned; the root (connecting ancestor) and /keep + /keep/deep stay armed with
+  // NO re-arm.
+  w.shrink(h, vec![root.join("keep")]).await.expect("shrink");
+
+  // The pruned subtree's descriptors are reclaimed (the disarms apply asynchronously, fire-and-forget).
+  let reclaimed = tokio::time::timeout(DEADLINE, async {
+    loop {
+      if count_inotify_wds() < before {
+        return true;
+      }
+      tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    reclaimed,
+    "the strictly-outside /drop subtree's watch descriptors are reclaimed after the shrink"
+  );
+
+  // Drain any pre-shrink stragglers (a trailing /drop event decoded before its wd's `IN_IGNORED`)
+  // so the pruned-stops quiet window below sees ONLY post-shrink deliveries — the wds are already
+  // reclaimed above, so nothing new can enter for /drop, and this just clears the backlog.
+  let _ = tokio::time::timeout(Duration::from_millis(500), async {
+    while w.next().await.is_some() {}
+  })
+  .await;
+
+  // RETAINED keeps flowing with NO gap: a fresh write under /keep/deep still surfaces — its watches
+  // were never re-armed, so no event under them could have been missed.
+  let keep_after = root.join("keep/deep/after.txt");
+  std::fs::write(&keep_after, b"y").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &keep_after)).await.is_some(),
+    "the retained /keep/deep subtree still delivers after the shrink (no gap, no re-crawl)"
+  );
+
+  // PRUNED stops: a write deep under /drop produces nothing within a bounded quiet window — its
+  // parent watches were removed, and the still-armed root only sees its own direct entries.
+  let drop_after = root.join("drop/deep/after.txt");
+  std::fs::write(&drop_after, b"z").unwrap();
+  let leaked = tokio::time::timeout(Duration::from_secs(3), async {
+    while let Some(event) = w.next().await {
+      if event.path().starts_with(root.join("drop")) {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    !leaked,
+    "the pruned /drop subtree stops delivering after the shrink"
+  );
+}

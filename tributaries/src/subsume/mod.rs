@@ -75,7 +75,19 @@ mod tests;
 /// ancestor-or-equal of the queried key (exactly the set `fan_out` delivers to), and attribution
 /// returns the value of the **longest** such live subscription (design §5). The armed root
 /// staying broad is harmless (a re-installed subscription is `Covered` under it, no re-arm —
-/// self-healing; re-narrowing the arm is deferred to M2).
+/// **self-healing**).
+///
+/// # Over-broad is self-healing; shrink is the budget reclaim (M2-B)
+///
+/// Because over-broadness is correctness-neutral, the umbrella never *needs* to re-narrow an armed
+/// root — but a broad kernel watch still **pins source budget** (inotify watch descriptors under the
+/// wide root). So when a drop leaves a root over-broad, [`plan_unwatch`](Subsumer::plan_unwatch)
+/// reports the wide handle plus the survivors' **retained cover** (an antichain), and the driver
+/// forwards it to [`Source::shrink`](crate::Source::shrink) — a synchronous fire-and-forget request to
+/// reclaim the excess coverage **in place**. The golden rationale: **shrink-in-place at the source
+/// beats release-and-rearm at the umbrella because the survivors' coverage never moves** — no root is
+/// released and re-armed, so there is no gap to close with a `Rescan` and no re-crawl. Shrink is a
+/// pure optimization layered on top of the self-healing invariant, never a correctness dependency.
 ///
 /// Not [`Debug`]: the underlying [`sync::Radix`](Radix) is not, and no reader needs it.
 pub(crate) struct Published<C, V, H> {
@@ -224,10 +236,34 @@ pub(crate) enum WatchOutcome<C, H> {
 }
 
 /// The result of [`Subsumer::plan_unwatch`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnwatchOutcome<H> {
+///
+/// Not [`Copy`]: the [`Dropped`](Self::Dropped) shrink cover carries an owned antichain of
+/// keys (design M2-B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnwatchOutcome<C, H> {
   /// The subscription was removed; its root still serves other subscribers.
-  Dropped,
+  ///
+  /// `shrink` reports whether the drop left the armed root **over-broad** — broader than
+  /// any live subscriber — which the source may reclaim IN PLACE (design M2-B, the
+  /// shrink-in-place seam). It is `Some((wide_root, retained_cover))` iff the DEPARTING
+  /// subscription's key equalled the root's own key AND no SURVIVING subscriber's key
+  /// still equals it: the root then covers the whole wide key while every live subscriber
+  /// sits under a narrower key, so the kernel coverage can shrink down to the
+  /// `retained_cover` — the minimal prefix-free **antichain** of the survivors' keys —
+  /// with no gap and no re-crawl. `None` when the root is not over-broad: a survivor still
+  /// pins it at its own key, or the departing subscription was already narrower than the
+  /// root (its departure widens no gap).
+  ///
+  /// Over-broadness is **correctness-neutral and self-healing** (a re-installed key is
+  /// `Covered` under the still-armed wide root — design §5), so `shrink` is a pure
+  /// budget-reclaim optimization the driver forwards to the source; the source may apply
+  /// it, defer it, or ignore it.
+  Dropped {
+    /// `Some((wide_root, retained_cover))` iff the root is now over-broad — the wide root
+    /// handle plus the minimal prefix-free antichain of the surviving subscribers' keys
+    /// under it. `None` otherwise.
+    shrink: Option<(H, Vec<Vec<C>>)>,
+  },
   /// The subscription was its root's last: the driver must release the kernel watch
   /// on `fs_root` (the engine has already dropped the root's state).
   RootEmptied {
@@ -643,7 +679,11 @@ where
 
   /// Removes `sub`, reporting whether its root emptied (returns `None` for an unknown
   /// subscription). Mutates immediately and republishes — no commit step is needed.
-  pub(crate) fn plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<H>> {
+  ///
+  /// On the non-emptied ([`Dropped`](UnwatchOutcome::Dropped)) path it also reports
+  /// whether the armed root is now **over-broad** and the source may shrink its coverage
+  /// in place (design M2-B) — see [`detect_shrink`](Self::detect_shrink).
+  pub(crate) fn plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<C, H>> {
     let record = self.subs.remove(&sub)?;
     let root_key = self
       .by_handle
@@ -655,6 +695,9 @@ where
     let mut root = txn.get(&root_key).expect("live root record").clone();
     root.subscribers.retain(|&s| s != sub);
     let emptied = root.subscribers.is_empty();
+    // The surviving subscribers, captured before `root` is moved back into the index — the
+    // over-broadness detection reads their keys (each still live in `self.subs`).
+    let survivors = root.subscribers.clone();
     if emptied {
       txn.remove(root_key.as_slice());
     } else {
@@ -672,10 +715,55 @@ where
         fs_root: record.root,
       }
     } else {
-      UnwatchOutcome::Dropped
+      // The root lives on for its narrower subscribers; report whether the departure left
+      // it over-broad, so the source can reclaim the excess kernel coverage in place.
+      let shrink = self.detect_shrink(&record.key, &root_key, record.root, &survivors);
+      UnwatchOutcome::Dropped { shrink }
     };
     self.publish();
     Some(outcome)
+  }
+
+  /// Whether the armed root at `root_key` (handle `root_handle`) is now **over-broad**
+  /// after `departing_key` left its `survivors` behind, and if so the RETAINED COVER the
+  /// source may shrink its coverage down to (design M2-B).
+  ///
+  /// Over-broad iff the departing subscription's key EQUALLED the root's own key AND no
+  /// surviving subscriber's key still equals it: only the departure of the sub that pinned
+  /// the root at its own (widest) key can newly open a gap between the armed root and its
+  /// live subscribers, and a survivor still at the root key keeps that key legitimately
+  /// watched. The retained cover is the minimal prefix-free [`antichain`] of the survivors'
+  /// keys — the narrowest set of prefixes under which every live subscriber still sits, so
+  /// shrinking to it drops no live coverage. Always non-empty on a `Some` (a non-emptied
+  /// root has at least one survivor).
+  fn detect_shrink(
+    &self,
+    departing_key: &[C],
+    root_key: &[C],
+    root_handle: H,
+    survivors: &[Subscription],
+  ) -> Option<(H, Vec<Vec<C>>)> {
+    // Only the sub whose key equalled the root key pinned the root at its widest; a
+    // narrower sub departing widens no gap.
+    if departing_key != root_key {
+      return None;
+    }
+    let survivor_keys: Vec<Vec<C>> = survivors
+      .iter()
+      .map(|s| {
+        self
+          .subs
+          .get(s)
+          .map(|record| record.key.clone())
+          .expect("a surviving subscriber is live in the side table")
+      })
+      .collect();
+    // A survivor still at the root key keeps the wide coverage legitimately watched — not
+    // over-broad.
+    if survivor_keys.iter().any(|key| key.as_slice() == root_key) {
+      return None;
+    }
+    Some((root_handle, antichain(survivor_keys)))
   }
 
   /// The live record for `fs_root`, if any.
@@ -832,4 +920,28 @@ where
       .remove(&sub)
       .expect("commit_watch consumes its own plan's pending entry (not yet aborted)")
   }
+}
+
+/// The minimal prefix-free **antichain** of `keys`: the fewest keys such that every input
+/// key is an ancestor-or-equal of exactly one of them — the RETAINED COVER a shrink reclaims
+/// coverage down to (design M2-B).
+///
+/// Dedups equal keys, then keeps a key iff no OTHER key is a strict ancestor (proper prefix)
+/// of it, dropping every key that descends from another and leaving the maximal-coverage
+/// prefixes. So a survivor set `{[a,b], [a,b,c], [a,c]}` reduces to `{[a,b], [a,c]}` — `[a,b,c]`
+/// is already covered by `[a,b]`. Siblings with no ancestor among the set (`{[a,b,c], [a,b,d]}`)
+/// are all kept: neither covers the other, so both subtrees must be retained.
+fn antichain<C: Ord + Clone>(mut keys: Vec<Vec<C>>) -> Vec<Vec<C>> {
+  keys.sort();
+  keys.dedup();
+  keys
+    .iter()
+    .filter(|key| {
+      // Drop `key` iff some strictly-shorter OTHER key is a proper prefix (ancestor) of it.
+      !keys
+        .iter()
+        .any(|other| other.len() < key.len() && key.starts_with(other.as_slice()))
+    })
+    .cloned()
+    .collect()
 }

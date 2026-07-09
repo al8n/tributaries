@@ -461,6 +461,41 @@ impl Monitor {
     }
   }
 
+  /// Drops the watch subtree rooted at a **non-root** per-directory node `watch`,
+  /// queuing an [`Action::Unwatch`] for every live node removed — the in-place prune
+  /// that reclaims over-broad kernel coverage a descending backend armed under a
+  /// wide root but that no surviving consumer still needs (shrink-in-place).
+  ///
+  /// This is the same **narrow subtree drop** the Monitor already performs when a
+  /// watched directory is deleted or replaced ([`drop_subtree`](Self::drop_subtree)),
+  /// exposed for the driver to trigger from an out-of-band coverage-reclaim request
+  /// rather than from an observed filesystem transition: it keeps the node map, the
+  /// child index, the adjacency sets, held-source state, and outstanding enumerate
+  /// requests all in lockstep, and it deliberately leaves pending move halves
+  /// **pairable** (a `MovedTo` may still arrive at a surviving destination in the
+  /// scope — exactly as a delete-driven narrow drop does). It never emits a `Rescan`:
+  /// the caller prunes only coverage no consumer is subscribed under, so nothing is
+  /// owed a re-enumeration.
+  ///
+  /// A **no-op** (returning `false`) when `watch` is unknown or is a **scope root** —
+  /// a root is torn down only by [`unregister_root`](Self::unregister_root), never by
+  /// a subtree prune, so pruning can never collapse a scope. Returns `true` iff it
+  /// dropped a live subtree.
+  ///
+  /// A [`kernel_recursive`](Capabilities::kernel_recursive) scope has no descended
+  /// per-directory children — only its root node — so the driver never finds a
+  /// non-root node to pass here, and shrink is naturally a no-op for it.
+  pub fn drop_watch_subtree(&mut self, watch: WatchId) -> bool {
+    match self.nodes.get(&watch) {
+      // A root (no parent) is never pruned in place; an unknown watch is already gone.
+      Some(node) if node.parent.is_some() => {
+        self.drop_subtree(watch);
+        true
+      }
+      _ => false,
+    }
+  }
+
   /// Ingests one normalized event.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn on_os_record(&mut self, rec: OsRecord, now: Instant) {

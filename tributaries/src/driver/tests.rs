@@ -41,6 +41,9 @@ fn components(path: &Path) -> Vec<OsString> {
 enum Call {
   Arm(PathBuf),
   Disarm(u32),
+  /// An in-place coverage shrink request: the over-broad root handle and the retained cover
+  /// (the survivor antichain) the driver forwarded (design M2-B).
+  Shrink(u32, Vec<Vec<OsString>>),
 }
 
 /// A fake [`Source`] over `u32` handles: it records every arm/disarm in order (so a test
@@ -243,6 +246,15 @@ impl Source<OsString> for FakeSource {
     self.calls.push(Call::Disarm(handle));
     self.canonical.remove(&handle);
     self.live.remove(&handle);
+  }
+
+  fn shrink(&mut self, handle: u32, retained: &[Vec<OsString>]) {
+    // Synchronous, fire-and-forget in-place coverage shrink REQUEST (design M2-B): record the
+    // over-broad root handle and the retained cover the driver forwarded, so a test can assert
+    // exactly one shrink with the survivor antichain fired (and none when the root is not
+    // over-broad). The fake keeps the root live — shrink reclaims coverage BELOW a root, never
+    // releases it — so `root_key` still answers, unlike `disarm`.
+    self.calls.push(Call::Shrink(handle, retained.to_vec()));
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
@@ -627,6 +639,132 @@ async fn widen_emits_dominating_rescan_per_repointed_sub() {
     by_sub.get(&sc).copied(),
     Some(Epoch::new(3)),
     "sc's Rescan strictly dominates its high-water of 2"
+  );
+}
+
+/// M2-B shrink-in-place call-site (design §5): unwatching the widening subscription of a root that
+/// widened over NESTED survivors leaves the armed root over-broad, so `release_subscription` forwards
+/// EXACTLY ONE `source.shrink` with the survivor antichain — and NO `disarm` (the root survives; shrink
+/// reclaims coverage BELOW it, never releases it).
+#[tokio::test]
+async fn over_broad_unwatch_shrinks_root_in_place() {
+  let mut h = Harness::new();
+
+  // Nested survivors under a to-be-wide root: /a/b and its covered child /a/b/c.
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let _s_bc = h
+    .watch("/a/b/c", Interest::all())
+    .await
+    .expect("watch /a/b/c covered");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+
+  // Baseline: the widen disarmed the subsumed /a/b root and armed /a — no shrink yet.
+  assert!(
+    !h.owner
+      .source
+      .calls()
+      .iter()
+      .any(|c| matches!(c, Call::Shrink(..))),
+    "no shrink before the over-broadening unwatch"
+  );
+
+  h.unwatch(s_a).expect("unwatch the widening /a");
+
+  let shrinks: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Shrink(..)))
+    .collect();
+  assert_eq!(
+    shrinks,
+    vec![Call::Shrink(wide, vec![key("/a/b")])],
+    "exactly one shrink to the nested-survivor antichain /a/b (not the raw {{/a/b, /a/b/c}})"
+  );
+  // The over-broad root is reclaimed in place, never released: no disarm of the wide handle.
+  assert!(
+    !h.owner
+      .source
+      .calls()
+      .iter()
+      .any(|c| matches!(c, Call::Disarm(handle) if *handle == wide)),
+    "an over-broad drop shrinks the surviving root, never disarms it"
+  );
+}
+
+/// No shrink when the drop does NOT leave the root over-broad (design §5): unwatching a NARROWER
+/// covered subscription leaves the root still pinned by its own equal-key subscriber, so
+/// `release_subscription` forwards no shrink.
+#[tokio::test]
+async fn narrow_unwatch_does_not_shrink() {
+  let mut h = Harness::new();
+
+  let _s_a = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let s_b = h
+    .watch("/a/b", Interest::all())
+    .await
+    .expect("watch /a/b covered");
+
+  // Drop the narrower /a/b: the root /a is still watched by its own /a subscriber — not over-broad.
+  h.unwatch(s_b).expect("unwatch /a/b");
+
+  assert!(
+    !h.owner
+      .source
+      .calls()
+      .iter()
+      .any(|c| matches!(c, Call::Shrink(..))),
+    "a narrower drop widens no gap — the root is not over-broad, so no shrink fires"
+  );
+}
+
+/// The orphan (`DropOrphan`) release path also shrinks (design M2-B): a committed-but-unclaimed wide
+/// watch whose caller wait was dropped funnels through the SAME `release_subscription` a caller unwatch
+/// does, so an over-broad drop on THAT path forwards the shrink too. The synchronous fire-and-forget
+/// shape is exactly what makes one call uniform across every release path (caller unwatch, orphan,
+/// teardown) with no async-seam split.
+#[tokio::test]
+async fn over_broad_droporphan_also_shrinks() {
+  let mut h = Harness::new();
+
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+
+  // Retire the wide /a subscription through the ORPHAN path, not a caller unwatch.
+  h.owner.apply_cleanup(super::Cleanup::DropOrphan(s_a));
+
+  let shrinks: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Shrink(..)))
+    .collect();
+  assert_eq!(
+    shrinks,
+    vec![Call::Shrink(wide, vec![key("/a/b")])],
+    "the orphan release shrinks the over-broad root too (uniform sync call-site)"
   );
 }
 

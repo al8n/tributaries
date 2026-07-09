@@ -109,6 +109,19 @@ mod tests;
 ///   (contract clause 2), whether by pre-applying the release or by resolving the lower watcher's own
 ///   identity-aware `Overlaps` rejection and retrying, so the umbrella needs no flushing of its own.
 ///
+/// **OPTIONAL of a source (a pure optimization, never relied on):**
+///
+/// - **In-place coverage shrink** ([`shrink`](Self::shrink)) — an opt-in, synchronous, fire-and-forget
+///   request (the same non-blocking release-request shape as [`disarm`](Self::disarm)) to reclaim the
+///   excess kernel coverage of a now-**over-broad** root — one that outlived the subscription whose key
+///   equalled it, so it is broader than any live subscriber (design §5, M2-B). The umbrella issues it
+///   from its single release primitive on the non-emptied unwatch path; a source that can prune below a
+///   root (a per-directory descending backend) reclaims budget with **no gap and no re-crawl** — it
+///   never releases survivor coverage — while a whole-subtree source (one stream / one recursive mark)
+///   keeps the **default no-op**. Correctness NEVER depends on it: over-broadness is correctness-neutral
+///   and self-healing, so a no-op, deferred, or partial shrink is always conforming (the golden reason
+///   the umbrella forwards it synchronously and moves on).
+///
 /// # `Send` bounds
 ///
 /// **Both async methods return `Send` futures.** 0.1.0 targets tokio and smol, and the driver is a
@@ -272,6 +285,52 @@ pub trait Source<C> {
   /// [`next`](Self::next) keeps its cancellation-safety contract unchanged, and [`arm`](Self::arm)
   /// keeps its caller-bounded liveness contract unchanged.
   fn disarm(&mut self, handle: Self::Handle);
+
+  /// Requests that the root named by `handle` shrink its coverage **in place** down to the
+  /// `retained` cover — the antichain of keys some live subscriber still needs — reclaiming the
+  /// excess kernel coverage a now-over-broad root holds. Synchronous and non-blocking: a
+  /// fire-and-forget release **request**, modeled exactly on [`disarm`](Self::disarm)'s contract
+  /// style, never an awaited teardown.
+  ///
+  /// The umbrella issues this when a wide root outlives the subscription whose key equalled it — a
+  /// `Widen` or a `Covered`-then-unwatch that leaves the armed root broader than any live subscriber
+  /// (design §5, M2-B). Rather than release-and-rearm at the umbrella (which would move the survivors'
+  /// coverage, forcing a gap-closing `Rescan`), the source shrinks the KERNEL coverage in place: it
+  /// **never releases survivor coverage**, so events under the `retained` keys keep flowing with **no
+  /// gap and no loss** — the property that makes shrink `Rescan`-free. This is the golden rationale:
+  /// *shrink-in-place at the source beats release-and-rearm at the umbrella because the survivors'
+  /// coverage never moves.*
+  ///
+  /// # Hard contract (mirrors [`disarm`](Self::disarm))
+  ///
+  /// 1. **Non-blocking.** `shrink` returns without blocking I/O or awaiting anything. A source that
+  ///    needs async work to prune (the fs source does) queues the request internally.
+  /// 2. **Never below the retained cover.** The source MUST NOT reduce coverage below `retained`:
+  ///    every key under a `retained` prefix keeps delivering with no gap and no loss. Only coverage
+  ///    strictly outside every `retained` prefix may be reclaimed. This is what keeps shrink
+  ///    `Rescan`-free — the umbrella emits no re-enumeration because no live subscriber's coverage
+  ///    moves.
+  /// 3. **Eventual application, or never.** A requested shrink is applied at the source's own
+  ///    convenience — by the next [`arm`](Self::arm), any internal opportunity, or never. A **no-op is
+  ///    conforming**: an unshrunk root is merely over-broad, which is correctness-neutral and
+  ///    self-healing.
+  /// 4. **Idempotent / tolerant.** Shrinking an unknown, dead, or already-released handle is a no-op.
+  ///    A handle whose [`disarm`](Self::disarm) was already requested is logically dead, so its shrink
+  ///    is superseded by the release (the whole root is going away — nothing to reclaim in place).
+  ///    There is no result; errors are the source's own to absorb.
+  /// 5. **Purely an optimization.** Correctness MUST NEVER depend on shrink. It reclaims budget (kernel
+  ///    watch descriptors); it changes no delivery. The umbrella keys, fans out, and attributes
+  ///    identically whether or not any shrink is ever applied.
+  ///
+  /// The **default is a no-op**, so an implementor opts in only if it can reclaim coverage below a
+  /// root (a per-directory descending backend). A whole-subtree source (one stream / one recursive
+  /// mark per root) has nothing to reclaim in place and keeps the default.
+  ///
+  /// `retained` is a prefix-free antichain in the same `C` key space as [`arm`](Self::arm): every key
+  /// lies under exactly one member, and no member descends from another.
+  fn shrink(&mut self, handle: Self::Handle, retained: &[Vec<C>]) {
+    let _ = (handle, retained);
+  }
 
   /// The next raw change as a [`SourceEvent`], or [`None`] once the source is closed and
   /// drained. Returns a `Send` future so the owner can pump the source's stream from its
@@ -509,6 +568,20 @@ pub struct FsSource<R: RuntimeLite> {
   /// [`root_key`](Source::root_key) liveness answers — contract clause 3: a requested release is
   /// logically dead **immediately**, before the transport teardown is applied.
   pending_set: HashSet<RootHandle>,
+  /// Over-broad roots whose in-place coverage shrink was requested (via the synchronous
+  /// [`shrink`](Source::shrink)) but not yet applied to the [`Watcher`], each paired with the
+  /// **retained cover** as canonical paths. [`arm`](Source::arm) applies them the same way it drains
+  /// [`pending_releases`](Self::pending_releases): **opportunistically**, popping and forwarding at
+  /// most [`OPPORTUNISTIC_SHRINKS`] of the OLDEST entries per arm to
+  /// [`Watcher::shrink`](tributary_fs::Watcher::shrink) — keeping the queue draining under a bounded
+  /// per-arm cost (contract clause 3, eventual). A shrink is a pure optimization, so nothing is on the
+  /// correctness path: an entry left queued (or dropped at `Drop`, where the [`Watcher`] tears every
+  /// root down anyway) merely leaves the root briefly over-broad. **Superseded by release**: a shrink
+  /// for a handle whose [`disarm`](Source::disarm) was requested is moot (the whole root is going
+  /// away), so [`disarm`](Source::disarm) drops any queued shrink for its handle and
+  /// [`shrink`](Source::shrink) refuses to queue one for a pending-release handle. At most one entry
+  /// per handle: a newer shrink for a handle replaces its older queued cover.
+  pending_shrinks: VecDeque<(RootHandle, Vec<PathBuf>)>,
 }
 
 impl<R: RuntimeLite> core::fmt::Debug for FsSource<R> {
@@ -531,6 +604,7 @@ impl<R: RuntimeLite> FsSource<R> {
       watcher: Watcher::new(options)?,
       pending_releases: VecDeque::new(),
       pending_set: HashSet::new(),
+      pending_shrinks: VecDeque::new(),
     })
   }
 }
@@ -543,6 +617,13 @@ impl<R: RuntimeLite> FsSource<R> {
 /// case is one queued release (a re-watch of a just-released key), and the correctness path — never
 /// surfacing an `Overlaps` for a released root — is the conflict-triggered retry, not this.
 const OPPORTUNISTIC_RELEASES: usize = 2;
+
+/// How many of the OLDEST queued in-place shrinks each [`arm`](Source::arm) forwards to
+/// [`Watcher::shrink`](tributary_fs::Watcher::shrink), alongside the release application. Bounds the
+/// per-arm shrink cost exactly as [`OPPORTUNISTIC_RELEASES`] bounds releases, keeping the queue
+/// draining eventually while a caller-bounded `Watch` never awaits the whole shrink backlog. Small: a
+/// shrink is a pure budget-reclaim optimization, so promptness is a nicety, not a correctness need.
+const OPPORTUNISTIC_SHRINKS: usize = 2;
 
 impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
@@ -579,6 +660,21 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
       };
       let _ = self.watcher.unwatch(released).await;
       self.pending_set.remove(&released);
+    }
+    // (a') OPPORTUNISTIC bounded shrink application: forward the OLDEST few queued in-place
+    // coverage shrinks to `Watcher::shrink`, alongside the release drain above. Same bounded-per-arm
+    // cost model (a bounded(16)-channel send + driver ack), and — like releases — off the correctness
+    // path: a shrink is a pure budget reclaim (design M2-B, `Source::shrink`), so the result is
+    // ignored. A handle whose release was requested since the shrink was queued is skipped: the
+    // release supersedes (the whole root is going away, so there is nothing to reclaim in place).
+    for _ in 0..OPPORTUNISTIC_SHRINKS {
+      let Some((handle, retained)) = self.pending_shrinks.pop_front() else {
+        break;
+      };
+      if self.pending_set.contains(&handle) {
+        continue;
+      }
+      let _ = self.watcher.shrink(handle, retained).await;
     }
     // (b)+(c) Arm the root, resolving on demand any `Overlaps` the watcher reports against a
     // released-but-still-lingering root. Roots are always armed `Interest::all` (design §4): the kernel
@@ -667,6 +763,30 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
       let root_path = self.watcher.root_path(handle);
       self.pending_releases.push_back((handle, root_path));
     }
+    // A pending in-place shrink for this handle is now moot — the whole root is being released, so
+    // there is nothing to reclaim in place. The release supersedes it (contract clause 4).
+    self
+      .pending_shrinks
+      .retain(|(pending, _)| *pending != handle);
+  }
+
+  fn shrink(&mut self, handle: RootHandle, retained: &[Vec<OsString>]) {
+    // Synchronous, non-blocking shrink REQUEST (contract clauses 1 & 3): queue it — `Watcher::shrink`
+    // awaits a bounded ack, so the prune cannot run inline here — and forward it at a subsequent
+    // `arm` (opportunistically, bounded) or drop it at `Drop`. A shrink for a handle whose release was
+    // already requested is superseded by that release (clause 4): the `pending_set` mirror makes the
+    // handle logically dead, so skip it. Rebuild each retained key into its canonical path — the
+    // coordinate `Watcher::shrink` prunes against — captured now, while the root is still live.
+    if self.pending_set.contains(&handle) {
+      return;
+    }
+    let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
+    // At most one queued shrink per handle: a newer cover supersedes an older one (drop any prior
+    // entry for this handle before pushing the latest).
+    self
+      .pending_shrinks
+      .retain(|(pending, _)| *pending != handle);
+    self.pending_shrinks.push_back((handle, paths));
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, RootHandle>> {

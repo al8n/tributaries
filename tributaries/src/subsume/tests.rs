@@ -151,8 +151,13 @@ fn unwatch_last_subscriber_empties_root() {
   let (ra, sa) = watch(&mut s, &mut h, "/a", Interest::all());
   let (_covered_root, sb) = watch(&mut s, &mut h, "/a/b", Interest::all());
 
-  // Dropping the covered subscriber leaves the root alive (still one subscriber).
-  assert!(matches!(s.plan_unwatch(sb), Some(UnwatchOutcome::Dropped)));
+  // Dropping the covered subscriber leaves the root alive (still one subscriber). Not over-broad:
+  // the departing sub's key (/a/b) is narrower than the root (/a), so its departure widens no gap —
+  // the root's own /a subscriber still pins it.
+  assert!(matches!(
+    s.plan_unwatch(sb),
+    Some(UnwatchOutcome::Dropped { shrink: None })
+  ));
   assert_eq!(s.entry(ra).unwrap().subscribers, vec![sa]);
 
   // Dropping the last subscriber empties (and removes) the root.
@@ -255,11 +260,25 @@ fn stale_broad_root_does_not_over_report_is_watched() {
   };
   let wide = h.mint();
   s.commit_watch(&outcome, wide, &key("/a"));
-  // Unwatch the widening /a watch: the root /a lives on for /a/b, now broader than it.
-  assert!(matches!(
-    s.plan_unwatch(s_wide),
-    Some(UnwatchOutcome::Dropped)
-  ));
+  // Unwatch the widening /a watch: the root /a lives on for /a/b, now broader than it — exactly the
+  // over-broad case shrink-in-place reclaims (design M2-B). The departing key /a equals the root key
+  // and no survivor is at /a, so the drop reports a shrink to the /a/b survivor cover.
+  match s.plan_unwatch(s_wide) {
+    Some(UnwatchOutcome::Dropped {
+      shrink: Some((handle, retained)),
+    }) => {
+      assert_eq!(
+        handle, wide,
+        "the over-broad wide root /a is reported for shrink"
+      );
+      assert_eq!(
+        retained,
+        vec![key("/a/b")],
+        "the retained cover is the /a/b survivor"
+      );
+    }
+    other => panic!("expected Dropped with a shrink to /a/b, got {other:?}"),
+  }
 
   assert!(
     view.contains(&key("/a")),
@@ -300,8 +319,24 @@ fn stale_broad_root_does_not_over_report_is_watched() {
   let (rx, s_x) = watch(&mut s, &mut h, "/x", Interest::all());
   let (_covered, _s_xy) = watch(&mut s, &mut h, "/x/y", Interest::all());
   assert_eq!(_covered, rx, "/x/y is covered by the /x root (no new arm)");
-  // Unwatch /x's own watch: the root /x lives on for /x/y, now broader than it.
-  assert!(matches!(s.plan_unwatch(s_x), Some(UnwatchOutcome::Dropped)));
+  // Unwatch /x's own watch: the root /x lives on for /x/y, now broader than it — over-broad, so the
+  // drop reports a shrink to the /x/y survivor cover.
+  match s.plan_unwatch(s_x) {
+    Some(UnwatchOutcome::Dropped {
+      shrink: Some((handle, retained)),
+    }) => {
+      assert_eq!(
+        handle, rx,
+        "the over-broad wide root /x is reported for shrink"
+      );
+      assert_eq!(
+        retained,
+        vec![key("/x/y")],
+        "the retained cover is the /x/y survivor"
+      );
+    }
+    other => panic!("expected Dropped with a shrink to /x/y, got {other:?}"),
+  }
   assert!(
     view.is_watched(&key("/x/y")),
     "the live /x/y subscription is still watched"
@@ -310,6 +345,103 @@ fn stale_broad_root_does_not_over_report_is_watched() {
     !view.is_watched(&key("/x/z")),
     "/x/z is NOT watched: only /x/y is live, and it does not cover /x/z (same class)",
   );
+}
+
+/// M2-B shrink-in-place DETECTION (design §5): when the subscription whose key equalled the armed
+/// root's own key departs and every survivor sits under a NARROWER key, the drop reports the root
+/// OVER-BROAD plus the retained cover — the survivor antichain the source may shrink coverage down to
+/// (no gap, no re-crawl). Here /a widened over disjoint /a/b and /a/c; unwatching /a leaves the wide
+/// root serving only /a/b and /a/c, so it shrinks to exactly that antichain.
+#[test]
+fn over_broad_drop_reports_survivor_antichain() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  let (_rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
+  // Widen /a over both disjoint roots: the wide root /a now serves /a/b, /a/c, and its own /a watch.
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_a = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+
+  // Unwatch the widening /a: departing key /a == root key /a and no survivor is at /a, so the root is
+  // over-broad and shrinks to the {/a/b, /a/c} survivor cover.
+  match s.plan_unwatch(s_a) {
+    Some(UnwatchOutcome::Dropped {
+      shrink: Some((handle, retained)),
+    }) => {
+      assert_eq!(
+        handle, wide,
+        "the over-broad wide root is reported for shrink"
+      );
+      assert_eq!(
+        retained,
+        vec![key("/a/b"), key("/a/c")],
+        "the retained cover is the two survivor subtrees (a minimal antichain)"
+      );
+    }
+    other => panic!("expected an over-broad Dropped, got {other:?}"),
+  }
+}
+
+/// Not over-broad when a SURVIVOR's key still equals the root key (design §5): two subscriptions at
+/// the SAME key /a share one root; dropping one leaves the other pinning /a legitimately, so no shrink
+/// is reported — the root is exactly as wide as a live subscriber needs.
+#[test]
+fn drop_with_survivor_at_root_key_is_not_over_broad() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (ra, s_a1) = watch(&mut s, &mut h, "/a", Interest::all());
+  let (ra2, _s_a2) = watch(&mut s, &mut h, "/a", Interest::all()); // Covered: same key, one root.
+  assert_eq!(ra2, ra, "the second /a shares the one root");
+
+  assert!(
+    matches!(
+      s.plan_unwatch(s_a1),
+      Some(UnwatchOutcome::Dropped { shrink: None })
+    ),
+    "a survivor still at the root key keeps it legitimately watched — not over-broad"
+  );
+}
+
+/// Antichain MINIMALITY when survivors nest (design M2-B): survivors at /a/b and /a/b/c reduce to the
+/// single prefix /a/b — /a/b/c is already covered by it — so the retained cover is the minimal
+/// prefix-free set, never the raw survivor keys.
+#[test]
+fn over_broad_antichain_collapses_nested_survivors() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  // /a/b/c is Covered by the /a/b root (no new root); both ride /a/b.
+  let (_rbc, _s_bc) = watch(&mut s, &mut h, "/a/b/c", Interest::all());
+  // Widen /a: subsumes the /a/b root with BOTH its subscribers → wide /a serves /a/b, /a/b/c, /a.
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_a = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+
+  match s.plan_unwatch(s_a) {
+    Some(UnwatchOutcome::Dropped {
+      shrink: Some((handle, retained)),
+    }) => {
+      assert_eq!(handle, wide, "the over-broad wide root is reported");
+      assert_eq!(
+        retained,
+        vec![key("/a/b")],
+        "nested survivors /a/b and /a/b/c collapse to the single cover /a/b"
+      );
+    }
+    other => panic!("expected an over-broad Dropped, got {other:?}"),
+  }
 }
 
 // ---------------------------------------------------------------------------
