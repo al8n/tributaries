@@ -94,6 +94,31 @@ fn count_inotify_wds() -> usize {
   total
 }
 
+/// Closes the watcher and waits (bounded) until the process-wide inotify wd count has
+/// returned to `baseline` (Codex R44): dropping a [`Watcher`] only *requests* an
+/// asynchronous driver shutdown, so returning — and releasing [`KERNEL_SERIAL`] — before
+/// the teardown is proven would let a successor test observe THIS test's late wd release
+/// as its own shrink (`count < before` falsely satisfied). Every test in this module ends
+/// through here, still under the serial guard.
+async fn close_to_baseline(w: TokioWatcher, baseline: usize) {
+  w.close().await.expect("close watcher");
+  let drained = tokio::time::timeout(DEADLINE, async {
+    loop {
+      if count_inotify_wds() <= baseline {
+        return true;
+      }
+      tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    drained,
+    "watcher teardown returns the process-wide inotify wd count to its pre-test baseline \
+     before the serial guard is released (Codex R44)"
+  );
+}
+
 /// M2-B set-cover, end to end against real inotify: a wide root that armed per-directory
 /// watches over TWO nested subtrees is reconciled in place down to a retained cover, then
 /// **grown back**. Phase 1 (shrink): the strictly-outside subtree's watch descriptors are
@@ -106,6 +131,7 @@ fn count_inotify_wds() -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
   let _serial = KERNEL_SERIAL.lock().await;
+  let baseline = count_inotify_wds();
   let root = scratch_root("shrink");
   std::fs::create_dir_all(root.join("keep/deep")).unwrap();
   std::fs::create_dir_all(root.join("drop/deep")).unwrap();
@@ -222,6 +248,8 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
       .is_some(),
     "the re-armed /drop/deep subtree delivers again after the set-cover grew it back (Codex R36)"
   );
+
+  close_to_baseline(w, baseline).await;
 }
 
 /// M2-B set-cover, the R37-F1 regression: growing back to a RETAINED ANCESTOR whose connecting watch
@@ -234,6 +262,7 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
   let _serial = KERNEL_SERIAL.lock().await;
+  let baseline = count_inotify_wds();
   let root = scratch_root("grow-ancestor");
   // a/b has TWO descendant subtrees: a/b/deep (retained by the narrow cover) and a/b/other (pruned by
   // it — the cover keeps only a/b/deep under a/b, so a/b stays purely as a CONNECTING ANCESTOR).
@@ -305,6 +334,8 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
       .is_some(),
     "growing back to the retained ANCESTOR a/b re-arms the previously-pruned a/b/other (Codex R37-F1)"
   );
+
+  close_to_baseline(w, baseline).await;
 }
 
 /// M2-B set-cover, the R37-F1 root-key cancel: after an applied shrink, re-issuing the root's OWN key
@@ -314,6 +345,7 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
   let _serial = KERNEL_SERIAL.lock().await;
+  let baseline = count_inotify_wds();
   let root = scratch_root("grow-cancel");
   std::fs::create_dir_all(root.join("keep/deep")).unwrap();
   std::fs::create_dir_all(root.join("drop/deep")).unwrap();
@@ -376,4 +408,6 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
       .is_some(),
     "a root-key cancel after an applied shrink re-arms every previously-pruned region (Codex R37-F1)"
   );
+
+  close_to_baseline(w, baseline).await;
 }
