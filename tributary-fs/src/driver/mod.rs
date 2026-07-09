@@ -276,8 +276,12 @@ pub(crate) enum Command {
     /// antichain). Every watch neither under one of these nor an ancestor of one is
     /// pruned; every retained prefix not currently covered is re-armed.
     retained: Vec<PathBuf>,
-    /// Resolved once the reconcile is applied (or immediately no-op'd).
-    reply: futures_channel::oneshot::Sender<()>,
+    /// `Some` for the awaited [`Watcher::set_cover`](crate::Watcher::set_cover) (resolved once
+    /// applied, or immediately no-op'd); `None` for the non-blocking, reply-less
+    /// [`Watcher::request_set_cover`](crate::Watcher::request_set_cover) — the PROMPT path that
+    /// applies a queued reconcile without waiting for a later arm (Codex R37-F2). The driver
+    /// applies both identically and simply skips the ack when there is no reply.
+    reply: Option<futures_channel::oneshot::Sender<()>>,
   },
   /// Orderly shutdown; resolves when every stream is torn down.
   Close {
@@ -1144,7 +1148,11 @@ pub(crate) async fn run<R, F>(
           if handles.contains_key(&scope) {
             core.on_set_cover(scope, &retained);
           }
-          let _ = reply.send(());
+          // `Some` acks the awaited `set_cover`; `None` is the reply-less prompt request
+          // (`request_set_cover`, Codex R37-F2) — same reconcile, no acknowledgement.
+          if let Some(reply) = reply {
+            let _ = reply.send(());
+          }
         }
         Ok(Command::Close { reply }) => break Some(reply),
         // The watcher facade dropped: same orderly teardown, nobody to tell.

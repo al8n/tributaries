@@ -575,7 +575,7 @@ impl<R: RuntimeLite> Watcher<R> {
       .send(Command::SetCover {
         scope: root.scope(),
         retained,
-        reply,
+        reply: Some(reply),
       })
       .await
       .is_err()
@@ -593,6 +593,33 @@ impl<R: RuntimeLite> Watcher<R> {
         Err(UnwatchError::Closed)
       }
     }
+  }
+
+  /// Requests a coverage reconcile like [`set_cover`](Self::set_cover), but as a NON-BLOCKING,
+  /// REPLY-LESS fire-and-forget: it `try_send`s the ack-less command and reports whether the
+  /// control channel accepted it. Unlike `set_cover` it never awaits — so it applies a deferred
+  /// reconcile PROMPTLY, without waiting for a later watcher operation to carry it (Codex R37-F2:
+  /// a `Covered`-outside grow arms nothing, so a queue-only reconcile would otherwise wait for an
+  /// unrelated arm).
+  ///
+  /// The driver applies a reply-less `SetCover` exactly like the awaited one — the same in-place
+  /// bidirectional reconcile — it simply sends no acknowledgement.
+  ///
+  /// Returns `false` when the control channel is full (the caller re-tries at its next
+  /// opportunity) or closed, or when `root` is a foreign handle; `true` when the request was
+  /// enqueued. Never blocks and never panics.
+  pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> bool {
+    if root.instance() != self.instance {
+      return false;
+    }
+    self
+      .commands
+      .try_send(Command::SetCover {
+        scope: root.scope(),
+        retained,
+        reply: None,
+      })
+      .is_ok()
   }
 
   /// The driver is gone (its command channel closed without an orderly

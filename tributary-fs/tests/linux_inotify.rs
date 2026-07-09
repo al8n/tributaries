@@ -649,3 +649,155 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
     "the re-armed /drop/deep subtree delivers again after the set-cover grew it back (Codex R36)"
   );
 }
+
+/// M2-B set-cover, the R37-F1 regression: growing back to a RETAINED ANCESTOR whose connecting watch
+/// is still armed must re-arm the descendants the narrower cover pruned. A narrow cover {a/b/deep}
+/// keeps a/b as a connecting ancestor (its watch survives) while pruning a/b's OTHER child a/b/other.
+/// Growing to {a/b} then finds a/b's watch present — the exact situation the OLD exact-path grow check
+/// mishandled by skipping the re-arm, leaving a/b/other a silent hole. The broadening-delta rule
+/// re-arms a/b's deepest still-watched ancestor-or-self (a/b itself), re-installing a/b/other, so a
+/// deep write under it is delivered again.
+#[tokio::test]
+async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
+  let root = scratch_root("grow-ancestor");
+  // a/b has TWO descendant subtrees: a/b/deep (retained by the narrow cover) and a/b/other (pruned by
+  // it — the cover keeps only a/b/deep under a/b, so a/b stays purely as a CONNECTING ANCESTOR).
+  std::fs::create_dir_all(root.join("a/b/deep")).unwrap();
+  std::fs::create_dir_all(root.join("a/b/other")).unwrap();
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let h = w.watch(&root, Interest::all()).await.expect("watch root");
+
+  // Prove a/b/other is armed before the narrow cover.
+  let other_before = root.join("a/b/other/before.txt");
+  std::fs::write(&other_before, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &other_before))
+      .await
+      .is_some(),
+    "a/b/other is armed before the narrow cover"
+  );
+
+  // Narrow to {a/b/deep}: a/b/other is strictly outside it, so it is pruned; a/b (the connecting
+  // ancestor of a/b/deep) STAYS armed.
+  w.set_cover(h, vec![root.join("a/b/deep")])
+    .await
+    .expect("narrow cover");
+
+  // Drain stragglers so the quiet window sees only post-shrink deliveries.
+  let _ = tokio::time::timeout(Duration::from_millis(500), async {
+    while w.next().await.is_some() {}
+  })
+  .await;
+
+  // a/b/other stops delivering (pruned).
+  let other_after = root.join("a/b/other/after.txt");
+  std::fs::write(&other_after, b"z").unwrap();
+  let leaked = tokio::time::timeout(Duration::from_secs(3), async {
+    while let Some(event) = w.next().await {
+      if event.path().starts_with(root.join("a/b/other")) {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    !leaked,
+    "a/b/other stops delivering under the narrow {{a/b/deep}} cover"
+  );
+
+  // GROW to {a/b}: a/b is a retained prefix whose OWN watch still exists (it was the connecting
+  // ancestor), but whose descendant a/b/other was pruned. The broadening delta re-arms a/b's deepest
+  // still-watched ancestor-or-self — a/b itself — re-installing a/b/other. The OLD exact-path check
+  // saw a/b's watch present and skipped the re-arm, leaving a/b/other a silent hole (Codex R37-F1).
+  w.set_cover(h, vec![root.join("a/b")])
+    .await
+    .expect("grow to the retained ancestor");
+
+  let _ = tokio::time::timeout(Duration::from_millis(500), async {
+    while w.next().await.is_some() {}
+  })
+  .await;
+
+  let other_regrown = root.join("a/b/other/regrown.txt");
+  std::fs::write(&other_regrown, b"w").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &other_regrown))
+      .await
+      .is_some(),
+    "growing back to the retained ANCESTOR a/b re-arms the previously-pruned a/b/other (Codex R37-F1)"
+  );
+}
+
+/// M2-B set-cover, the R37-F1 root-key cancel: after an applied shrink, re-issuing the root's OWN key
+/// (the cancel-equivalent = full coverage) must re-arm every previously-pruned region. The broadening
+/// delta of the root against any narrower applied cover is the root itself, so its subtree is re-armed
+/// wholesale, re-installing the pruned /drop — a deep write under it is delivered again.
+#[tokio::test]
+async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
+  let root = scratch_root("grow-cancel");
+  std::fs::create_dir_all(root.join("keep/deep")).unwrap();
+  std::fs::create_dir_all(root.join("drop/deep")).unwrap();
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let h = w.watch(&root, Interest::all()).await.expect("watch root");
+
+  // Arm the /drop subtree, then prove it delivers.
+  let drop_before = root.join("drop/deep/before.txt");
+  std::fs::write(&drop_before, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &drop_before))
+      .await
+      .is_some(),
+    "the /drop subtree is armed before the shrink"
+  );
+
+  // Shrink to {keep}: /drop is strictly outside it, so it is pruned.
+  w.set_cover(h, vec![root.join("keep")])
+    .await
+    .expect("shrink to {keep}");
+
+  let _ = tokio::time::timeout(Duration::from_millis(500), async {
+    while w.next().await.is_some() {}
+  })
+  .await;
+
+  let drop_after = root.join("drop/deep/after.txt");
+  std::fs::write(&drop_after, b"z").unwrap();
+  let leaked = tokio::time::timeout(Duration::from_secs(3), async {
+    while let Some(event) = w.next().await {
+      if event.path().starts_with(root.join("drop")) {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(!leaked, "the pruned /drop subtree stops delivering");
+
+  // ROOT-KEY CANCEL: re-issue the root's OWN key = full coverage. The broadening delta is the root
+  // itself (not under the narrower {keep}), so the root's subtree is re-armed, re-installing every
+  // previously-pruned region — /drop included (Codex R37-F1, the full-cover cancel).
+  w.set_cover(h, vec![root.clone()])
+    .await
+    .expect("root-key cancel");
+
+  let _ = tokio::time::timeout(Duration::from_millis(500), async {
+    while w.next().await.is_some() {}
+  })
+  .await;
+
+  let drop_regrown = root.join("drop/deep/regrown.txt");
+  std::fs::write(&drop_regrown, b"w").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &drop_regrown))
+      .await
+      .is_some(),
+    "a root-key cancel after an applied shrink re-arms every previously-pruned region (Codex R37-F1)"
+  );
+}

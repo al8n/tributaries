@@ -315,11 +315,20 @@ pub trait Source<C> {
   ///    UP re-establishes real coverage for a survivor that returned to a pruned subtree; the umbrella
   ///    separately parks a dominating bridging `Rescan` for that survivor to cover the request→apply
   ///    gap, so the re-arm itself owes no `Rescan` and emits none.
-  /// 3. **Eventual application, or never.** A requested reconcile is applied at the source's own
-  ///    convenience — by the next [`arm`](Self::arm), any internal opportunity, or never. A **no-op is
-  ///    conforming**: an unreconciled root is merely over-broad or, for the grow half, briefly
-  ///    under-covered — both correctness-neutral and self-healing (the umbrella's bridging `Rescan`
-  ///    and next re-issue converge).
+  /// 3. **Prompt when it can, eventual otherwise, or never.** A source SHOULD apply a requested
+  ///    reconcile promptly and independently of any later call. [`FsSource`] does: it forwards the
+  ///    cover to the watcher's control channel the instant `set_cover` is called, via a non-blocking
+  ///    reply-less request, so the normal case — the channel has room — applies WITHOUT waiting for a
+  ///    future [`arm`](Self::arm) or any other operation. This matters because a `Covered`-outside grow
+  ///    arms nothing (clause 6): a source that applied only from `arm` would leave such a grow deferred
+  ///    indefinitely, and the writes after the newcomer's re-crawl and before the grow would be lost
+  ///    (Codex R37-F2). Only when the control channel is momentarily full does [`FsSource`] DEFER,
+  ///    re-forwarding at the next source op that touches the watcher (another `set_cover`, a
+  ///    [`disarm`](Self::disarm), or an [`arm`](Self::arm)). A **no-op is still conforming**: an
+  ///    unreconciled root is merely over-broad or, for the grow half, briefly under-covered — both
+  ///    correctness-neutral and self-healing (the umbrella's bridging `Rescan` and next re-issue
+  ///    converge). After this promptness the umbrella's bridging-`Rescan` window for a grown newcomer is
+  ///    bounded by control-channel availability rather than by an arbitrary later arm.
   /// 4. **Idempotent / tolerant.** Reconciling an unknown, dead, or already-released handle is a no-op.
   ///    A handle whose [`disarm`](Self::disarm) was already requested is logically dead, so its
   ///    set_cover is superseded by the release (the whole root is going away — nothing to reconcile in
@@ -589,24 +598,30 @@ pub struct FsSource<R: RuntimeLite> {
   /// logically dead **immediately**, before the transport teardown is applied.
   pending_set: HashSet<RootHandle>,
   /// Roots whose in-place coverage reconcile was requested (via the synchronous
-  /// [`set_cover`](Source::set_cover)) but not yet applied to the [`Watcher`], each paired with the
-  /// **retained cover** as canonical paths. [`arm`](Source::arm) applies them the same way it drains
-  /// [`pending_releases`](Self::pending_releases): **opportunistically**, popping and forwarding at
-  /// most [`OPPORTUNISTIC_SET_COVERS`] of the OLDEST entries per arm to
-  /// [`Watcher::set_cover`](tributary_fs::Watcher::set_cover) — keeping the queue draining under a
-  /// bounded per-arm cost (contract clause 3, eventual). A set_cover is a pure optimization, so nothing
-  /// is on the correctness path: an entry left queued (or dropped at `Drop`, where the [`Watcher`] tears
-  /// every root down anyway) merely leaves the root briefly over-broad or under-covered. **Superseded
-  /// by release**: a set_cover for a handle whose [`disarm`](Source::disarm) was requested is moot (the
-  /// whole root is going away), so [`disarm`](Source::disarm) drops any queued entry for its handle and
-  /// [`set_cover`](Source::set_cover) refuses to queue one for a pending-release handle. **At most one
-  /// entry per handle (LATEST-WINS)**: a newer request for a handle replaces its older queued cover, so
-  /// the umbrella's freshness re-issue on a `Covered` commit (contract clause 6, Codex R35/R36) is
-  /// applied — never an older snapshot — which is what carries both the shrink-newer-cover AND the grow
-  /// (a re-issued cover that once again includes a previously-pruned survivor subtree). A re-issued
-  /// cover that includes the root's OWN registry path is the **cancel-equivalent**: it drops any queued
-  /// entry for the handle and queues nothing (there is nothing strictly outside the root to reclaim, and
-  /// the whole root is already covered).
+  /// [`set_cover`](Source::set_cover)) but DEFERRED because the watcher's control channel was
+  /// momentarily full, each paired with the **retained cover** as canonical paths. The normal path
+  /// does NOT queue: [`set_cover`](Source::set_cover) forwards the cover PROMPTLY through
+  /// [`Watcher::request_set_cover`](tributary_fs::Watcher::request_set_cover) (a non-blocking
+  /// try_send), so a `Covered`-outside grow applies WITHOUT waiting for a later `arm` (Codex R37-F2:
+  /// a `Covered` commit arms nothing, so a queue-only cover would otherwise wait forever). Only when
+  /// that channel is full does an entry land here, to be re-forwarded through the prompt path at the
+  /// next source op that touches the watcher — [`drain_pending_set_covers`](Self::drain_pending_set_covers),
+  /// run at the START of every [`set_cover`](Source::set_cover) and [`disarm`](Source::disarm) — and,
+  /// as a bounded belt, by [`arm`](Source::arm)'s opportunistic drain of at most
+  /// [`OPPORTUNISTIC_SET_COVERS`] entries via [`Watcher::set_cover`](tributary_fs::Watcher::set_cover).
+  /// A set_cover is a pure optimization, so nothing is on the correctness path: an entry left queued
+  /// (or dropped at `Drop`, where the [`Watcher`] tears every root down anyway) merely leaves the root
+  /// briefly over-broad or under-covered. **Superseded by release**: a set_cover for a handle whose
+  /// [`disarm`](Source::disarm) was requested is moot (the whole root is going away), so
+  /// [`disarm`](Source::disarm) drops any queued entry for its handle and both
+  /// [`set_cover`](Source::set_cover) and the drain refuse to apply one for a pending-release handle.
+  /// **At most one entry per handle (LATEST-WINS)**: a newer request for a handle replaces its older
+  /// queued cover, so the umbrella's freshness re-issue on a `Covered` commit (contract clause 6, Codex
+  /// R35/R36) is applied — never an older snapshot — which carries both the shrink-newer-cover AND the
+  /// grow (a re-issued cover that once again includes a previously-pruned survivor subtree). A re-issued
+  /// cover that pins the root's OWN registry path is the **cancel-equivalent**: the latest-wins drop
+  /// discards any stale narrower snapshot, and the prompt forward reconciles the core back to FULL
+  /// coverage (its broadening delta re-arms everything the narrower cover pruned).
   pending_set_covers: VecDeque<(RootHandle, Vec<PathBuf>)>,
 }
 
@@ -632,6 +647,29 @@ impl<R: RuntimeLite> FsSource<R> {
       pending_set: HashSet::new(),
       pending_set_covers: VecDeque::new(),
     })
+  }
+
+  /// Flushes queued in-place coverage reconciles through the reply-less PROMPT path (Codex
+  /// R37-F2): each pending cover is forwarded via
+  /// [`Watcher::request_set_cover`](tributary_fs::Watcher::request_set_cover) and dropped on
+  /// success, or dropped outright when its handle's release was since requested (superseded). Only
+  /// the covers the control channel could not accept (momentarily full, or closed) stay queued.
+  /// Called at every `FsSource` op that already touches the watcher ([`set_cover`](Source::set_cover),
+  /// [`disarm`](Source::disarm)), so a sustained-full channel is the sole deferral case and any later
+  /// source activity drains the backlog. Each entry costs one non-blocking `try_send`; the queue is
+  /// bounded by the live-root count.
+  fn drain_pending_set_covers(&mut self) {
+    let watcher = &self.watcher;
+    let pending_set = &self.pending_set;
+    self.pending_set_covers.retain(|(handle, retained)| {
+      // Superseded by a requested release — drop (the whole root is going away).
+      if pending_set.contains(handle) {
+        return false;
+      }
+      // Keep iff the prompt request could NOT be enqueued (channel full/closed); a success applies
+      // it, so drop it.
+      !watcher.request_set_cover(*handle, retained.clone())
+    });
   }
 }
 
@@ -688,12 +726,14 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
       self.pending_set.remove(&released);
     }
     // (a') OPPORTUNISTIC bounded set_cover application: forward the OLDEST few queued in-place
-    // coverage reconciles to `Watcher::set_cover`, alongside the release drain above. Same
-    // bounded-per-arm cost model (a bounded(16)-channel send + driver ack), and — like releases — off
-    // the correctness path: a set_cover is a pure budget optimization (design M2-B, `Source::set_cover`),
-    // so the result is ignored. A handle whose release was requested since the set_cover was queued is
-    // skipped: the release supersedes (the whole root is going away, so there is nothing to reconcile in
-    // place).
+    // coverage reconciles to `Watcher::set_cover`, alongside the release drain above. This is only a
+    // BELT now — `set_cover`/`disarm` already drain the whole (bounded) backlog through the prompt
+    // path, so the queue is normally empty here (Codex R37-F2) — but it keeps the queue draining even
+    // across a run of arms with no other source op. Same bounded-per-arm cost model (a
+    // bounded(16)-channel send + driver ack), and — like releases — off the correctness path: a
+    // set_cover is a pure budget optimization (design M2-B, `Source::set_cover`), so the result is
+    // ignored. A handle whose release was requested since the set_cover was queued is skipped: the
+    // release supersedes (the whole root is going away, so there is nothing to reconcile in place).
     for _ in 0..OPPORTUNISTIC_SET_COVERS {
       let Some((handle, retained)) = self.pending_set_covers.pop_front() else {
         break;
@@ -795,43 +835,48 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     self
       .pending_set_covers
       .retain(|(pending, _)| *pending != handle);
+    // (Codex R37-F2) A disarm is a source op that reaches the watcher, so it drains the set-cover
+    // backlog for OTHER handles through the prompt path — this handle's own cover was just dropped,
+    // and the drain skips a pending-release handle — so a deferred grow never waits indefinitely for
+    // an unrelated arm.
+    self.drain_pending_set_covers();
   }
 
   fn set_cover(&mut self, handle: RootHandle, retained: &[Vec<OsString>]) {
-    // Synchronous, non-blocking set_cover REQUEST (contract clauses 1 & 3): queue it —
-    // `Watcher::set_cover` awaits a bounded ack, so the reconcile cannot run inline here — and forward
-    // it at a subsequent `arm` (opportunistically, bounded) or drop it at `Drop`. A set_cover for a
-    // handle whose release was already requested is superseded by that release (clause 4): the
-    // `pending_set` mirror makes the handle logically dead, so skip it.
+    // Superseded by a requested release (contract clause 4): the whole root is going away, so there
+    // is nothing to reconcile in place. The `pending_set` mirror makes the handle logically dead.
     if self.pending_set.contains(&handle) {
       return;
     }
-    // LATEST-WINS per handle (contract clause 6): drop any older queued cover for this handle FIRST, so
-    // a re-issued fresh cover always REPLACES the stale snapshot rather than trailing behind it. The
-    // umbrella re-issues the current retained cover on every membership change that runs no `Source`
-    // call — a `Covered` commit (design §5, Codex R35/R36) — relying on the source to apply the LATEST
-    // request per handle and never an older one; this drop is where that guarantee is honored, and it
-    // is also what lets a re-issued GROW cover (one that once again includes a previously-pruned
-    // survivor subtree) supersede the stale narrower snapshot rather than trail behind it.
+    // LATEST-WINS per handle (contract clause 6): drop any older QUEUED cover for this handle FIRST,
+    // so neither the drain below nor a later application ever trails a stale snapshot behind the
+    // fresh one. The umbrella re-issues the current retained cover on every membership change that
+    // runs no `Source` call — a `Covered` commit (design §5, Codex R35/R36) — relying on the source
+    // to apply the LATEST request per handle and never an older one; this drop is where that
+    // guarantee is honored, and it is also what lets a re-issued GROW cover (one that once again
+    // includes a previously-pruned survivor subtree) supersede a stale narrower snapshot rather than
+    // trail behind it.
     self
       .pending_set_covers
       .retain(|(pending, _)| *pending != handle);
+    // (Codex R37-F2) A set_cover is a source op that reaches the watcher, so it also drains any
+    // PREVIOUSLY-DEFERRED covers (for other handles) through the prompt path — a sustained-full
+    // control channel is then the only case a cover stays deferred, and any later source activity
+    // drains it. This handle's own stale entry was just dropped above, so the drain never re-applies
+    // it before the fresh cover below.
+    self.drain_pending_set_covers();
     // Rebuild each retained key into its canonical path — the coordinate `Watcher::set_cover`
     // reconciles against — captured now, while the root is still live.
     let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
-    // CANCEL-on-root-cover (contract clause 6): a retained cover that includes the root's OWN registry
-    // path retains everything under the root, so the strictly-outside set is empty and nothing is
-    // under-covered — there is nothing to reconcile. This is the umbrella's cancel-equivalent re-issue
-    // (a `Covered` commit whose newcomer re-pins the root at its own key): having dropped any older
-    // entry above, queue NOTHING, so a stale narrower snapshot can never later prune coverage the root
-    // now legitimately holds again (Codex R35). A dead/forgotten root (`root_path` → `None`) cannot be
-    // root-covered here; its set_cover is a no-op at the watcher anyway, so fall through and let the
-    // queue drain/drop it.
-    if let Some(root_path) = self.watcher.root_path(handle)
-      && paths
-        .iter()
-        .any(|path| path.as_path() == root_path.as_path())
-    {
+    // (Codex R37-F2) PROMPT path FIRST: forward the fresh cover via the NON-BLOCKING reply-less
+    // request. On success the driver applies it AT ONCE — WITHOUT waiting for a later `arm` (the fix:
+    // a `Covered`-outside grow arms nothing, so a queue-only cover would wait for an unrelated arm
+    // forever). The core grows a previously-narrowed root back to this cover via its own broadening
+    // delta — a subtree cover to that subtree, and a root-key cover (the cancel-equivalent) to FULL
+    // coverage, whose stale queued snapshot the latest-wins drop above already discarded (Codex R35).
+    // A cover of an already-full root is a core no-op. Only on a full/closed channel fall back to
+    // QUEUING for a later drain.
+    if self.watcher.request_set_cover(handle, paths.clone()) {
       return;
     }
     self.pending_set_covers.push_back((handle, paths));

@@ -306,6 +306,89 @@ async fn registry_reclaims_on_unwatch_cycles() {
   watcher.close().await.expect("close");
 }
 
+/// `request_set_cover` is the non-blocking, REPLY-LESS prompt path (Codex R37-F2): it `try_send`s a
+/// reply-less `SetCover` and reports whether the control channel accepted it — `true` with room,
+/// `false` when full or closed (or foreign), never blocking or panicking.
+#[tokio::test]
+async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
+  let (watcher, commands) = manual_watcher();
+  let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
+
+  // A foreign handle is refused without touching the channel.
+  let foreign = RootHandle::new(
+    watcher.instance.wrapping_add(1),
+    ScopeId::new(1.try_into().unwrap()),
+  );
+  assert!(
+    !watcher.request_set_cover(foreign, vec![PathBuf::from("/r/a")]),
+    "a foreign handle is refused"
+  );
+
+  // With room, the prompt request enqueues a REPLY-LESS SetCover and reports success.
+  assert!(
+    watcher.request_set_cover(handle, vec![PathBuf::from("/r/a")]),
+    "the channel has room"
+  );
+  match commands.try_recv().expect("a command was enqueued") {
+    Command::SetCover {
+      scope,
+      retained,
+      reply,
+    } => {
+      assert_eq!(scope, handle.scope());
+      assert_eq!(retained, vec![PathBuf::from("/r/a")]);
+      assert!(
+        reply.is_none(),
+        "the prompt request carries no reply (fire-and-forget)"
+      );
+    }
+    _ => panic!("expected a SetCover command"),
+  }
+
+  // Saturate the bounded(16) channel: further prompts are refused (false), never blocking.
+  for _ in 0..16 {
+    assert!(watcher.request_set_cover(handle, vec![PathBuf::from("/r/full")]));
+  }
+  assert!(
+    !watcher.request_set_cover(handle, vec![PathBuf::from("/r/overflow")]),
+    "a full channel refuses the prompt"
+  );
+
+  // A closed channel is likewise refused, never a panic.
+  drop(commands);
+  assert!(
+    !watcher.request_set_cover(handle, vec![PathBuf::from("/r/closed")]),
+    "a closed channel refuses the prompt"
+  );
+}
+
+/// The awaited `set_cover` sends a SetCover carrying a reply to ack (the acked twin of the
+/// reply-less `request_set_cover`).
+#[tokio::test]
+async fn set_cover_sends_an_acked_command() {
+  let (watcher, commands) = manual_watcher();
+  let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
+  let mut fut = Box::pin(watcher.set_cover(handle, vec![PathBuf::from("/r/a")]));
+  // One poll carries it past the send, parking on the never-answered reply.
+  assert!(futures_util::poll!(fut.as_mut()).is_pending());
+  match commands.try_recv().expect("the command was sent") {
+    Command::SetCover {
+      scope,
+      retained,
+      reply,
+    } => {
+      assert_eq!(scope, handle.scope());
+      assert_eq!(retained, vec![PathBuf::from("/r/a")]);
+      assert!(
+        reply.is_some(),
+        "the awaited set_cover carries a reply to ack"
+      );
+    }
+    _ => panic!("expected a SetCover command"),
+  }
+  drop(fut);
+}
+
 mod lifecycle {
   use super::*;
   use crate::driver::testing::FakeFs;

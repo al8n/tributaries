@@ -905,6 +905,7 @@ fn identity_minting_respects_devices_and_mounts() {
     resume_poisoned: false,
     publicly_live: true,
     liveness_deadline: None,
+    applied_cover: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -939,6 +940,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     resume_poisoned: false,
     publicly_live: true,
     liveness_deadline: None,
+    applied_cover: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -2387,6 +2389,50 @@ fn spawn_rejection_emits_nothing_public() {
   assert!(emits(&drain(&mut core)).is_empty());
 }
 
+/// The set-cover broadening-delta rule (Codex R37-F1), in isolation and cross-platform: the
+/// retained prefixes a re-issued cover must re-arm are exactly those the PREVIOUS applied cover
+/// did not already cover — never keyed on which watches happen to survive, so growing back to a
+/// retained ANCESTOR (whose connecting watch is still armed) or to the whole root re-arms the
+/// descendants the narrower cover pruned.
+#[test]
+fn broadening_delta_is_the_uncovered_retained_prefixes() {
+  let p = |s: &str| PathBuf::from(s);
+
+  // No previous cover (FULL) — nothing was pruned, so growing to any cover re-arms nothing.
+  assert!(broadening_delta(None, &[p("/r/a"), p("/r/b")]).is_empty());
+
+  // A prefix INSIDE a previously-retained subtree was never pruned — not broadening.
+  let prev = [p("/r/a")];
+  assert!(broadening_delta(Some(&prev), &[p("/r/a")]).is_empty());
+  assert!(
+    broadening_delta(Some(&prev), &[p("/r/a/x")]).is_empty(),
+    "deeper inside a retained subtree is already covered"
+  );
+
+  // A sibling OUTSIDE every previously-retained subtree is broadening — its subtree was pruned.
+  assert_eq!(
+    broadening_delta(Some(&prev), &[p("/r/a"), p("/r/b")]),
+    vec![Path::new("/r/b")],
+    "a sibling outside the previous cover must be re-armed"
+  );
+
+  // Growing to a retained ANCESTOR of the previous cover is broadening: the ancestor kept its
+  // connecting watch, but its OTHER descendants were pruned (the exact R37-F1 case).
+  let deep = [p("/r/a/b/deep")];
+  assert_eq!(
+    broadening_delta(Some(&deep), &[p("/r/a/b")]),
+    vec![Path::new("/r/a/b")],
+    "an ancestor of the previous cover is broadening — its other descendants were pruned"
+  );
+
+  // The root-key / full-cover cancel broadens against any narrower cover (re-arm everything).
+  assert_eq!(
+    broadening_delta(Some(&deep), &[p("/r")]),
+    vec![Path::new("/r")],
+    "a root-key cancel is broadening against any narrower cover"
+  );
+}
+
 mod lowering {
   use super::*;
 
@@ -2408,6 +2454,7 @@ mod lowering {
       resume_poisoned: false,
       publicly_live: true,
       liveness_deadline: None,
+      applied_cover: None,
     }
   }
 
