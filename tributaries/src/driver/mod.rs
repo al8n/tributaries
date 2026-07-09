@@ -385,8 +385,10 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
     }
   }
 
-  /// Drops `sub`, releasing its source watch once it was the last subscriber of its
-  /// (possibly shared) root.
+  /// Drops `sub`; once it was the last subscriber of its (possibly shared) root, the root's
+  /// source release is **requested** — the synchronous fire-and-forget [`Source::disarm`],
+  /// applied by the source no later than its next arm or its teardown. The subscription's
+  /// coverage is gone the moment this resolves; the transport release follows.
   ///
   /// Sends an unwatch command to the owner and awaits its reply; dropping the
   /// returned future drops only the wait.
