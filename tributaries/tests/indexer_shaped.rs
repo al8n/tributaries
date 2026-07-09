@@ -36,7 +36,7 @@ use tributaries::{
   Armed, DebounceConfig, Epoch, Event, Filter, Interest, RootHandle, Source, SourceEvent,
   Subscription, Tributaries, TributariesOptions, WatchError, WatchView, WatcherOptions,
 };
-use tributary_fs::Watcher;
+use tributary_fs::{WatchRootError, Watcher};
 
 /// The custom, **non-`OsString`** key component: an indexer-shaped location coordinate.
 ///
@@ -66,15 +66,23 @@ struct IndexerSource<R: RuntimeLite> {
   mounts: Vec<(Vec<Comp>, PathBuf)>,
   /// Roots whose release was requested (via the synchronous `disarm`) but not yet applied to the
   /// `Watcher`, each paired with the released root's canonical `Comp` key captured at `disarm` time.
-  /// At the top of `arm` only the entries whose key OVERLAPS the arm key are drained
-  /// (release-before-*overlapping*-arm by construction); a non-overlapping release stays queued and is
-  /// applied by a later overlapping arm or at `Drop`. Mirrors the fs source's overlap-scoped release
-  /// queue (Codex R28) for a caller-supplied source.
+  /// `arm` applies these opportunistically (the oldest few, bounded, up front) and on demand (resolve
+  /// the `Overlaps` the watcher NAMES, then retry) — bounded per-arm release work independent of queue
+  /// depth. Mirrors the fs source's conflict-triggered release retry (Codex R29) for a caller-supplied
+  /// source.
   pending_releases: VecDeque<(RootHandle, Option<Vec<Comp>>)>,
   /// Mirror of `pending_releases` for O(1) `root_key` liveness answers: a requested release is
   /// logically dead immediately.
   pending_set: HashSet<RootHandle>,
 }
+
+/// Mirror of the fs source's [`OPPORTUNISTIC_RELEASES`](../src/source/mod.rs): the oldest few queued
+/// releases each `arm` applies up front (bounded, keeps clause 5 eventual).
+const OPPORTUNISTIC_RELEASES: usize = 2;
+
+/// Mirror of the fs source's `OVERLAP_RETRY_CAP`: defense-in-depth bound on the conflict-triggered
+/// release-retry loop against a pathological watcher.
+const OVERLAP_RETRY_CAP: usize = 64;
 
 impl<R: RuntimeLite> IndexerSource<R> {
   fn new(watcher: Watcher<R>, mounts: Vec<(Vec<Comp>, PathBuf)>) -> Self {
@@ -134,37 +142,66 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   }
 
   async fn arm(&mut self, key: &[Comp]) -> Result<Armed<Comp, RootHandle>, WatchError> {
-    // Apply only the queued releases whose key OVERLAPS this arm's key BEFORE arming (disarm contract
-    // clause 2, mirroring the fs source's R28 scoping): release-before-*overlapping*-arm by
-    // construction, so the `Watcher` never reports `Overlaps` against a released root whose key
-    // overlaps this one. A non-overlapping queued release is left in place — a disjoint watch cannot
-    // cause `Overlaps`, so draining it here would only charge this `Watch` (and any `close` queued
-    // behind it) for unrelated cleanup; it is applied by a later overlapping arm or at `Drop`. Overlap
-    // is a plain component-prefix in either direction (ancestor-or-equal / descendant) on the
-    // canonical `Comp` keys. Walk by index without advancing on removal (a removed entry shifts its
-    // successor into the same slot), so a skipped non-overlapping entry stays queued.
-    let mut i = 0;
-    while i < self.pending_releases.len() {
-      let overlaps = match &self.pending_releases[i].1 {
-        Some(released_key) => {
-          key.starts_with(released_key.as_slice()) || released_key.starts_with(key)
-        }
-        None => false,
+    // Mirror the fs source's R29 release application: (a) opportunistically unwatch the OLDEST few
+    // queued releases up front (bounded per-arm cost, keeps clause 5 eventual), then (b)+(c) attempt
+    // the watch and resolve on demand any `Overlaps` the watcher NAMES against a released-but-lingering
+    // root. The watcher rejects by identity and names `existing` (a canonical PATH), so reverse it into
+    // the `Comp` key space to find the matching pending entry (fallback: the oldest pending entry — a
+    // lingering released root is the only legitimate umbrella-side conflict), unwatch exactly it, and
+    // retry. Bounded: each retry removes ≥1 conflicting pending root; a rejection naming no pending
+    // root (a genuine live conflict) or the retry cap surfaces the overlap rather than looping forever.
+    for _ in 0..OPPORTUNISTIC_RELEASES {
+      let Some((released, _)) = self.pending_releases.pop_front() else {
+        break;
       };
-      if overlaps {
-        let (released, _) = self.pending_releases.remove(i).expect("index in bounds");
-        let _ = self.watcher.unwatch(released).await;
-        self.pending_set.remove(&released);
-      } else {
-        i += 1;
-      }
+      let _ = self.watcher.unwatch(released).await;
+      self.pending_set.remove(&released);
     }
-    // A well-formed watch always resolves under a registered mount; `?`/`From` surfaces a
-    // genuine arm failure (`WatchRootError` is `#[non_exhaustive]` — never constructed here).
+    // A well-formed watch always resolves under a registered mount.
     let path = self
       .key_to_path(key)
       .expect("indexer source: every armed key lies under a registered mount");
-    let handle = self.watcher.watch(path, Interest::all()).await?;
+    let mut retries = 0usize;
+    let handle = loop {
+      match self.watcher.watch(path.clone(), Interest::all()).await {
+        Ok(handle) => break handle,
+        Err(WatchRootError::Overlaps {
+          path: rejected,
+          existing,
+        }) => {
+          let existing_key = self.path_to_key(&existing);
+          let victim = self
+            .pending_releases
+            .iter()
+            .position(|(_, stored)| {
+              existing_key
+                .as_deref()
+                .is_some_and(|ek| stored.as_deref() == Some(ek))
+            })
+            .or_else(|| (!self.pending_releases.is_empty()).then_some(0));
+          let Some(index) = victim else {
+            return Err(WatchError::Fs(WatchRootError::Overlaps {
+              path: rejected,
+              existing,
+            }));
+          };
+          if retries >= OVERLAP_RETRY_CAP {
+            return Err(WatchError::Fs(WatchRootError::Overlaps {
+              path: rejected,
+              existing,
+            }));
+          }
+          retries += 1;
+          let (released, _) = self
+            .pending_releases
+            .remove(index)
+            .expect("index in bounds");
+          let _ = self.watcher.unwatch(released).await;
+          self.pending_set.remove(&released);
+        }
+        Err(err) => return Err(err.into()),
+      }
+    };
     // Adopt the filesystem-authoritative canonical path as the committed key (design §4):
     // events arrive in canonical coordinates, so the index must key on them.
     let canonical_key = self
@@ -178,9 +215,10 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   fn disarm(&mut self, handle: RootHandle) {
     // Synchronous, non-blocking release REQUEST (mirroring the fs source): the watcher's `unwatch`
     // awaits a bounded ack, so queue the teardown — paired with the released root's canonical `Comp`
-    // key captured NOW from the live registry (independent of `pending_set`), so the next `arm` drains
-    // only the OVERLAPPING subset (contract clause 2, Codex R28) — and mark the handle logically dead
-    // at once. Applied at the next overlapping `arm` or `Drop`. Idempotent by the set.
+    // key captured NOW from the live registry (independent of `pending_set`), so a later `arm` can
+    // match this entry against the conflict the watcher NAMES and apply exactly it (contract clause 2,
+    // Codex R29) — and mark the handle logically dead at once. Applied opportunistically at a
+    // subsequent `arm`, on demand when it blocks one, or at `Drop`. Idempotent by the set.
     if self.pending_set.insert(handle) {
       let key = self
         .watcher

@@ -867,16 +867,24 @@ where
     // A `None` return needs none: it already delivered everything owed to a claimed sub in its final
     // pass, or the consumer is gone. Still non-blocking, so `close` stays responsive (invariant II).
     if interrupted.is_some() {
+      // FIRST linearize any grant-resolution already queued at close time — a `ClaimGrant` sitting
+      // behind a few flood commands lifts its sub's `unclaimed` suppression — so the final owed pass
+      // below DELIVERS that just-claimed sub's parked Rescan instead of reading stale `unclaimed`
+      // state and stranding it (Codex R29-F3). Snapshot-bounded and non-blocking (invariant II).
+      owner.linearize_queued_teardown_commands();
       owner.drain_owed_once();
     }
     interrupted
   } else {
-    // Consumer-initiated close, or every handle dropped: one best-effort non-blocking pass that
-    // delivers the owed tail when the channel has room. An unclaimed sub's parked debt is SUPPRESSED
-    // by owner state inside this `drain_owed_once` (its `flush_pending_rescans`), so a residual
-    // `DropOrphan`/`ClaimGrant` still queued in the command mailbox may go unprocessed with no harm —
-    // nothing is delivered for a still-unclaimed sub and the owner is exiting. Teardown never blocks
-    // on the channel, so close stays responsive.
+    // Consumer-initiated close, or every handle dropped: linearize any grant-resolution already queued
+    // at close time — the same snapshot-bounded pre-drain as the drain-interrupt path above, for
+    // uniformity — so a `ClaimGrant` queued behind a flood lifts its sub's `unclaimed` suppression
+    // BEFORE the final pass (Codex R29-F3). Then one best-effort non-blocking `drain_owed_once` that
+    // delivers the owed tail — including that just-claimed sub's now-owed debt — when the channel has
+    // room. A sub STILL unclaimed after the snapshot stays SUPPRESSED by owner state inside
+    // `drain_owed_once` (its `flush_pending_rescans`): its debt is owed to nobody and correctly
+    // withheld, and the owner is exiting. Both steps await nothing, so close stays responsive.
+    owner.linearize_queued_teardown_commands();
     owner.drain_owed_once();
     closing
   };
@@ -2082,6 +2090,32 @@ where
       }
       Command::Unwatch { reply, .. } => {
         let _ = reply.send(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)));
+      }
+    }
+  }
+
+  /// Processes exactly the teardown commands OBSERVABLY QUEUED right now — a FIFO snapshot bounded by
+  /// [`commands.len()`](async_channel::Receiver::len) — so a [`ClaimGrant`](Command::ClaimGrant)
+  /// already queued at close time lifts its subscription's [`unclaimed`](Self::unclaimed) suppression
+  /// **before** the [`run`] tail's final owed pass ([`drain_owed_once`](Self::drain_owed_once))
+  /// delivers, linearizing that claim ahead of the last delivery (Codex R29-F3). Without it, a claim
+  /// queued at close time would be observed only as stale `unclaimed` state by the final pass, which
+  /// would then suppress the just-claimed sub's genuinely-owed debt and tear down — suppression become
+  /// permanent loss.
+  ///
+  /// The bound is a **snapshot**, not a flood valve: it processes exactly what was observably queued,
+  /// FIFO — a claim sitting behind a few flood commands *within the snapshot* IS reached, because every
+  /// snapshot command is processed. Commands that arrive AFTER the snapshot are post-linearization
+  /// (their subscriptions are dead like any subscription after teardown; the read plane is emptied
+  /// next). Each command is dispatched by [`handle_teardown_command`](Self::handle_teardown_command) —
+  /// a `ClaimGrant` lifts suppression, a `DropOrphan` purges, a `Watch`/`Unwatch` fails fast — which
+  /// awaits nothing, so this never wedges the tail (invariant II).
+  fn linearize_queued_teardown_commands(&mut self) {
+    let snapshot = self.commands.len();
+    for _ in 0..snapshot {
+      match self.commands.try_recv() {
+        Ok(cmd) => self.handle_teardown_command(cmd),
+        Err(_) => break,
       }
     }
   }
