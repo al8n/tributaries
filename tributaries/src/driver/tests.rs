@@ -3671,6 +3671,55 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     .expect("the run task did not panic");
 }
 
+/// Codex R31 regression — a grant left UNPOLLED in the watch reply slot across a source-drain
+/// teardown is POISONED: it fired neither `Claim` nor `DropOrphan`, so the teardown's cleanup-channel
+/// linearization could not see it, its suppressed parked debt died with the owner, and the stream has
+/// already ended. A post-teardown [`defuse`](super::WatchGrant::defuse) must therefore return `Err`
+/// (the public `watch` surfaces `Closed`) — never an `Ok` subscription for a stream that ended
+/// without its owed Rescan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpolled_grant_across_source_drain_teardown_is_poisoned() {
+  let (drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
+  let source = DrainableSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    drain: drain_rx,
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+
+  // A hand-built Watch whose reply receiver is HELD UNPOLLED: the owner commits the sub and sends
+  // the grant into the slot, where it sits (unclaimed, no Cleanup fired).
+  let (reply, response) = futures_channel::oneshot::channel();
+  w.commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      interest: Interest::all(),
+      filter: Filter::all(),
+      reply,
+    })
+    .expect("enqueue the Watch");
+  tokio::time::sleep(Duration::from_millis(100)).await; // let the owner commit + send the grant
+
+  // The source drains (next → None): the owner runs its source-drain teardown — the unpolled
+  // grant's sub is unclaimed, no Cleanup is queued, so the drain exits and the owner drops.
+  drop(drain_tx);
+  tokio::time::sleep(Duration::from_millis(200)).await; // let the teardown complete
+
+  // NOW the caller polls the reply: the grant arrives, but its claim's try_send finds the cleanup
+  // receiver gone — the grant is poisoned, exactly what the public watch maps to `Closed`.
+  let grant = tokio::time::timeout(Duration::from_secs(5), response)
+    .await
+    .expect("the reply was sent before teardown")
+    .expect("the grant sits in the slot")
+    .expect("the watch committed successfully");
+  assert!(
+    grant.defuse().is_err(),
+    "a grant polled after the owner tore down is POISONED — watch() surfaces Closed, never a dead Ok"
+  );
+}
+
 /// Codex R24 — SOURCE-DRAIN teardown under the STATE model (owed = CLAIMED): an UNCLAIMED
 /// terminal-retired sub's parked terminal Rescan is suppressed by the owner's `unclaimed` state —
 /// never delivered even with event-channel CAPACITY — while a claimed live sub's owed Rescan still
