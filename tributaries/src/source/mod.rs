@@ -696,6 +696,16 @@ impl<R: RuntimeLite> FsSource<R> {
   }
 }
 
+/// How many pending releases one `arm` hands to the watcher's control channel via the
+/// reply-less [`Watcher::request_unwatch`] — the HARD per-arm opportunistic budget (Codex
+/// R42-F2). A channel-full stop is not a bound (the driver drains concurrently, so `try_send`
+/// can keep succeeding), and every reply-less `Unwatch` handed off here is processed BEFORE this
+/// arm's own `watch` command on the same FIFO control channel — so an unbounded walk would couple
+/// the caller (and any close behind it) to the entire unrelated release backlog. A fixed few per
+/// arm keeps that pre-watch FIFO work O(1) while preserving clause 5's eventual application
+/// (later arms, the conflict-triggered path, or `Drop` take the rest).
+const OPPORTUNISTIC_RELEASE_HANDOFFS: usize = 2;
+
 impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
 
@@ -735,22 +745,28 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
         .retain(|handle| watcher.root_path(*handle).is_some());
     }
 
-    // (a) OPPORTUNISTIC NON-BLOCKING application: walk the pending-release queue and hand each entry to
-    // the watcher's control channel via the reply-less `request_unwatch` (a `try_send`). On acceptance
+    // (a) OPPORTUNISTIC NON-BLOCKING application: hand a HARD-BOUNDED few pending releases to the
+    // watcher's control channel via the reply-less `request_unwatch` (a `try_send`). On acceptance
     // the entry moves from the queue to the in-flight `enqueued` sidecar and STAYS dead-marked in
     // `pending_set` (it is logically dead until its teardown lands, clause 3). This AWAITS NOTHING — a
-    // disjoint arm is decoupled from every release's teardown latency (Codex R41) — while keeping
-    // clause 5 eventual: every queued release is handed over the moment the channel has room. A
-    // full/closed channel stops the drain, leaving the rest queued for a later arm, the
-    // conflict-triggered path (c), or `Drop`. This is NOT the correctness mechanism — (c) is — so
-    // enqueuing an unrelated release here is harmless (it was going to be released anyway).
-    while let Some(entry) = self.pending_releases.pop_front() {
+    // disjoint arm is decoupled from every release's teardown latency (Codex R41). The bound is a
+    // FIXED per-arm handoff budget, NOT the channel-full stop (Codex R42-F2): on a multi-threaded
+    // runtime the driver drains the channel concurrently, so try_send could keep succeeding and an
+    // unbounded walk would enqueue the ENTIRE unrelated backlog ahead of this arm's own watch
+    // command on the same FIFO channel — coupling the caller (and any close behind it) to unrelated
+    // release processing. At most a fixed few per arm keeps that pre-watch FIFO work O(1); the rest
+    // stay queued for later arms, the conflict-triggered path (c), or `Drop` (clause 5's three
+    // routes unchanged). This is NOT the correctness mechanism — (c) is — so enqueuing an unrelated
+    // release here is harmless (it was going to be released anyway).
+    for _ in 0..OPPORTUNISTIC_RELEASE_HANDOFFS {
+      let Some(entry) = self.pending_releases.pop_front() else {
+        break;
+      };
       // `entry.0` is `Copy` (a `RootHandle`), so the try_send borrows nothing of `entry`.
       if self.watcher.request_unwatch(entry.0) {
         self.enqueued.push(entry);
       } else {
-        // Channel full/closed: return the entry to the FRONT (FIFO preserved) and stop — the rest
-        // stay queued for a later arm, the conflict-triggered path (c), or `Drop`.
+        // Channel full/closed: return the entry to the FRONT (FIFO preserved) and stop.
         self.pending_releases.push_front(entry);
         break;
       }
