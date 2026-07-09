@@ -3720,6 +3720,40 @@ async fn unpolled_grant_across_source_drain_teardown_is_poisoned() {
   );
 }
 
+/// Codex R32 regression — the source-drain exit is ATOMIC with respect to grant claims: the drain
+/// CLOSES the cleanup channel before accepting its all-unclaimed exit, so a grant defused in the
+/// window after the final emptiness observation but BEFORE the owner drops (the receiver was still
+/// alive — the R32 race) fails its claim try_send and is POISONED. Fail-on-old: without the in-exit
+/// cut, the post-drain defuse lands on the still-open channel and returns a live-looking Ok that no
+/// later drain will ever service.
+#[tokio::test]
+async fn claim_after_the_source_drain_cut_is_poisoned_even_before_owner_drop() {
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  h.owner.unclaimed.insert(sub);
+  // The unpolled grant sits in a caller's reply slot, wired to the SAME cleanup channel.
+  let grant = super::WatchGrant::new(sub, h.owner.cleanup_tx.clone());
+  // Its root terminal-retires: the owed terminal Rescan parks, suppressed (unclaimed).
+  h.owner.retire_root_with_terminal_rescan(1);
+
+  // Source drain runs to its all-unclaimed exit — which now CUTS (closes the cleanup channel),
+  // drains pre-cut claims, and runs a final owed pass before returning.
+  let returned = tokio::time::timeout(Duration::from_secs(5), h.owner.drain_owed_before_shutdown())
+    .await
+    .expect("the drain exits promptly");
+  assert!(returned.is_none(), "no close interrupted the drain");
+
+  // The OWNER STILL EXISTS (pre-drop window) — yet the claim must already be poisoned.
+  assert!(
+    grant.defuse().is_err(),
+    "a claim after the source-drain cut is poisoned even while the owner is still alive (Codex R32)"
+  );
+  assert!(
+    h.drain().iter().all(|e| e.subscription() != sub),
+    "the suppressed debt was never delivered for the never-claimed subscription"
+  );
+}
+
 /// Codex R24 — SOURCE-DRAIN teardown under the STATE model (owed = CLAIMED): an UNCLAIMED
 /// terminal-retired sub's parked terminal Rescan is suppressed by the owner's `unclaimed` state —
 /// never delivered even with event-channel CAPACITY — while a claimed live sub's owed Rescan still
