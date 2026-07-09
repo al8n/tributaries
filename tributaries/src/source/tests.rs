@@ -228,4 +228,126 @@ mod integration {
       observed.kind()
     );
   }
+
+  /// R28-F1: the pre-arm release drain is scoped to the OVERLAPPING subset, so an arm of a DISJOINT
+  /// key applies **none** of the backlog — decoupling a caller-bounded `Watch` (and any `close`
+  /// queued behind it) from the whole release cleanup (contract clause 2). Disarm root `a`, then arm
+  /// a disjoint sibling `b`: `a`'s release is NOT applied (it does not overlap `b`), so it stays
+  /// queued and its kernel watch was never unwatched by the `b` arm; a later re-arm of `a`'s OWN
+  /// (overlapping) key finally drains it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_arm_drains_only_the_overlapping_release() {
+    let (_dir, parent) = scratch();
+    let a = parent.join("a");
+    let b = parent.join("b");
+    std::fs::create_dir_all(&a).expect("create a");
+    std::fs::create_dir_all(&b).expect("create b");
+    let a_key = path_components(&a);
+    let b_key = path_components(&b);
+
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    // Arm A, then disarm it → its release is QUEUED (transport teardown pending, root logically dead).
+    let armed_a = source.arm(&a_key).await.expect("arm A");
+    source.disarm(armed_a.handle());
+    assert_eq!(
+      source.root_key(armed_a.handle()),
+      None,
+      "A is logically dead immediately (contract clause 3)"
+    );
+    assert_eq!(source.pending_releases.len(), 1, "A's release is queued");
+
+    // Arm a DISJOINT sibling B. A's queued release does not overlap B, so the drain applies ZERO
+    // releases: B arms WITHOUT awaiting A's unwatch, and A's release stays queued — the R28
+    // decoupling (this arm, and a close behind its Watch, never wait on A's cleanup).
+    let armed_b = source.arm(&b_key).await.expect("arm disjoint B");
+    assert_eq!(
+      source.root_key(armed_b.handle()),
+      Some(b_key.clone()),
+      "the disjoint B armed and is live"
+    );
+    assert_eq!(
+      source.pending_releases.len(),
+      1,
+      "the disjoint arm applied NONE of A's release — it stays queued (R28 decoupling)"
+    );
+    assert!(
+      source.pending_set.contains(&armed_a.handle()),
+      "A's release is still pending — the disjoint B arm did not unwatch it"
+    );
+
+    // Re-arm A's OWN key: now the queued release OVERLAPS (equal key), so it drains first (A's kernel
+    // watch is unwatched) and the re-arm succeeds with no `Overlaps`, minting a fresh handle.
+    let rearm_a = source
+      .arm(&a_key)
+      .await
+      .expect("re-arm A drains its overlapping release first, then arms with no Overlaps");
+    assert_ne!(
+      armed_a.handle(),
+      rearm_a.handle(),
+      "the re-arm mints a fresh generation-unique handle"
+    );
+    assert!(
+      source.pending_releases.is_empty(),
+      "A's overlapping release was applied by the A re-arm"
+    );
+    assert!(
+      !source.pending_set.contains(&armed_a.handle()),
+      "A's pending flag cleared once its overlapping re-arm drained it"
+    );
+    assert_eq!(
+      source.root_key(rearm_a.handle()),
+      Some(a_key.clone()),
+      "the re-armed A is live"
+    );
+  }
+
+  /// R28-F1 shape regression: an arm's release work does not scale with the backlog depth. Queue
+  /// **many** disjoint releases (watch+disarm N disjoint subroots), then arm ANOTHER disjoint key and
+  /// assert it applies **zero** of the backlog (pending count unchanged) — so a `close` queued behind
+  /// that `Watch` is decoupled from the whole cleanup (the close-latency itself is covered by the
+  /// M2-A flood regressions). The old whole-backlog drain would have awaited N unwatches here.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_disjoint_arm_cost_is_independent_of_release_backlog() {
+    const N: usize = 32;
+    let (_dir, parent) = scratch();
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    // Build a backlog of N queued releases over N disjoint sibling subroots.
+    for i in 0..N {
+      let sub = parent.join(format!("r{i}"));
+      std::fs::create_dir_all(&sub).expect("create subroot");
+      let armed = source
+        .arm(&path_components(&sub))
+        .await
+        .expect("arm subroot");
+      source.disarm(armed.handle());
+    }
+    assert_eq!(
+      source.pending_releases.len(),
+      N,
+      "N disjoint releases are queued"
+    );
+
+    // Arm one MORE disjoint subroot: it overlaps none of the backlog, so the drain applies nothing —
+    // the arm's release work is independent of the backlog depth (R28).
+    let other = parent.join("other");
+    std::fs::create_dir_all(&other).expect("create other");
+    let other_key = path_components(&other);
+    let armed = source
+      .arm(&other_key)
+      .await
+      .expect("arm the extra disjoint subroot");
+    assert_eq!(
+      source.pending_releases.len(),
+      N,
+      "the disjoint arm applied ZERO of the N queued releases — arm cost is independent of backlog \
+       depth (R28), so a close behind that Watch is decoupled"
+    );
+    assert_eq!(
+      source.root_key(armed.handle()),
+      Some(other_key),
+      "the extra disjoint subroot armed and is live"
+    );
+  }
 }

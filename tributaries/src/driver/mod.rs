@@ -858,7 +858,18 @@ where
     // ends — ordered so a parked subscription's tail delta never precedes its dominating Rescan
     // — retrying as the consumer drains, while checking the dedicated close signal so a close during
     // the drain is always answered (no silent loss, without an unserviceable close).
-    owner.drain_owed_before_shutdown().await
+    let interrupted = owner.drain_owed_before_shutdown().await;
+    // If a close INTERRUPTED that drain (it returned the reply), the drain stopped at its
+    // top-priority close check WITHOUT running a final owed pass — yet a resuming consumer may have
+    // freed a channel slot in the window between the drain's last pass and the close arriving. Run
+    // ONE more non-blocking best-effort `drain_owed_once` so a now-sendable CLAIMED parked Rescan
+    // gets its last offer before teardown, mirroring the non-drain close path below (Codex R28-F2).
+    // A `None` return needs none: it already delivered everything owed to a claimed sub in its final
+    // pass, or the consumer is gone. Still non-blocking, so `close` stays responsive (invariant II).
+    if interrupted.is_some() {
+      owner.drain_owed_once();
+    }
+    interrupted
   } else {
     // Consumer-initiated close, or every handle dropped: one best-effort non-blocking pass that
     // delivers the owed tail when the channel has room. An unclaimed sub's parked debt is SUPPRESSED
