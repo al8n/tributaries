@@ -642,29 +642,6 @@ pub struct FsSource<R: RuntimeLite> {
   /// [`root_key`](Source::root_key) liveness answers — contract clause 3: a requested release is
   /// logically dead **immediately**, before the transport teardown is applied.
   pending_set: HashSet<RootHandle>,
-  /// Roots whose in-place coverage PRUNE was requested (via the synchronous
-  /// [`set_cover`](Source::set_cover)) but DEFERRED because the watcher's control channel was
-  /// momentarily full, each paired with the **retained cover** as canonical paths. Only PRUNES land
-  /// here — a coverage GROW is [`grow`](Source::grow)'s job, and grows never queue: they AWAIT the
-  /// acked [`Watcher::set_cover`](tributary_fs::Watcher::set_cover) so the newcomer's coverage is live
-  /// before the reconcile returns (M2-B v3). The normal prune path does NOT queue either:
-  /// [`set_cover`](Source::set_cover) forwards the cover PROMPTLY through
-  /// [`Watcher::request_set_cover`](tributary_fs::Watcher::request_set_cover) (a non-blocking
-  /// try_send); only when that channel is full does an entry land here, to be re-forwarded through the
-  /// prompt path at the next source op that touches the watcher —
-  /// [`drain_pending_set_covers`](Self::drain_pending_set_covers), run at the START of every
-  /// [`set_cover`](Source::set_cover), [`grow`](Source::grow), and [`disarm`](Source::disarm) — and,
-  /// as a bounded belt, by [`arm`](Source::arm)'s opportunistic drain of at most
-  /// [`OPPORTUNISTIC_SET_COVERS`] entries via [`Watcher::set_cover`](tributary_fs::Watcher::set_cover).
-  /// A prune is a pure optimization (a **prune-only full-channel fallback**, losslessness NOT
-  /// required): an entry left queued (or dropped at `Drop`, where the [`Watcher`] tears every root
-  /// down anyway) merely leaves the root briefly over-broad — self-healing. **Superseded by release
-  /// or grow**: a prune for a handle whose [`disarm`](Source::disarm) was requested is moot (the whole
-  /// root is going away), and a [`grow`](Source::grow) for the handle carries a fresher, authoritative
-  /// cover — so [`disarm`](Source::disarm) and [`grow`](Source::grow) both drop any queued entry for
-  /// their handle, and the drain refuses to apply one for a pending-release handle. **At most one
-  /// entry per handle (LATEST-WINS)**: a newer prune for a handle replaces its older queued cover.
-  pending_set_covers: VecDeque<(RootHandle, Vec<PathBuf>)>,
 }
 
 impl<R: RuntimeLite> core::fmt::Debug for FsSource<R> {
@@ -687,31 +664,7 @@ impl<R: RuntimeLite> FsSource<R> {
       watcher: Watcher::new(options)?,
       pending_releases: VecDeque::new(),
       pending_set: HashSet::new(),
-      pending_set_covers: VecDeque::new(),
     })
-  }
-
-  /// Flushes queued in-place coverage PRUNES through the reply-less PROMPT path: each pending prune
-  /// is forwarded via
-  /// [`Watcher::request_set_cover`](tributary_fs::Watcher::request_set_cover) and dropped on
-  /// success, or dropped outright when its handle's release was since requested (superseded). Only
-  /// the prunes the control channel could not accept (momentarily full, or closed) stay queued.
-  /// Called at every `FsSource` op that already touches the watcher ([`set_cover`](Source::set_cover),
-  /// [`grow`](Source::grow), [`disarm`](Source::disarm)), so a sustained-full channel is the sole
-  /// deferral case and any later source activity drains the backlog. Each entry costs one non-blocking
-  /// `try_send`; the queue is bounded by the live-root count.
-  fn drain_pending_set_covers(&mut self) {
-    let watcher = &self.watcher;
-    let pending_set = &self.pending_set;
-    self.pending_set_covers.retain(|(handle, retained)| {
-      // Superseded by a requested release — drop (the whole root is going away).
-      if pending_set.contains(handle) {
-        return false;
-      }
-      // Keep iff the prompt request could NOT be enqueued (channel full/closed); a success applies
-      // it, so drop it.
-      !watcher.request_set_cover(*handle, retained.clone())
-    });
   }
 }
 
@@ -723,13 +676,6 @@ impl<R: RuntimeLite> FsSource<R> {
 /// case is one queued release (a re-watch of a just-released key), and the correctness path — never
 /// surfacing an `Overlaps` for a released root — is the conflict-triggered retry, not this.
 const OPPORTUNISTIC_RELEASES: usize = 2;
-
-/// How many of the OLDEST queued in-place coverage PRUNES each [`arm`](Source::arm) forwards to
-/// [`Watcher::set_cover`](tributary_fs::Watcher::set_cover), alongside the release application. Bounds
-/// the per-arm reconcile cost exactly as [`OPPORTUNISTIC_RELEASES`] bounds releases, keeping the queue
-/// draining eventually while a caller-bounded `Watch` never awaits the whole prune backlog. Small: a
-/// prune is a pure budget optimization, so promptness is a nicety, not a correctness need.
-const OPPORTUNISTIC_SET_COVERS: usize = 2;
 
 impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
@@ -766,24 +712,6 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
       };
       let _ = self.watcher.unwatch(released).await;
       self.pending_set.remove(&released);
-    }
-    // (a') OPPORTUNISTIC bounded PRUNE application: forward the OLDEST few queued in-place coverage
-    // prunes to `Watcher::set_cover`, alongside the release drain above. This is only a BELT —
-    // `set_cover`/`grow`/`disarm` already drain the whole (bounded) prune backlog through the prompt
-    // path, so the queue is normally empty here — but it keeps the queue draining even across a run of
-    // arms with no other source op. Same bounded-per-arm cost model (a bounded(16)-channel send +
-    // driver ack), and — like releases — off the correctness path: a prune is a pure budget
-    // optimization (design M2-B, `Source::set_cover`), so the result is ignored. A handle whose
-    // release was requested since the prune was queued is skipped: the release supersedes (the whole
-    // root is going away, so there is nothing to reconcile in place).
-    for _ in 0..OPPORTUNISTIC_SET_COVERS {
-      let Some((handle, retained)) = self.pending_set_covers.pop_front() else {
-        break;
-      };
-      if self.pending_set.contains(&handle) {
-        continue;
-      }
-      let _ = self.watcher.set_cover(handle, retained).await;
     }
     // (b)+(c) Arm the root, resolving on demand any `Overlaps` the watcher reports against a
     // released-but-still-lingering root. Roots are always armed `Interest::all` (design §4): the kernel
@@ -872,77 +800,47 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
       let root_path = self.watcher.root_path(handle);
       self.pending_releases.push_back((handle, root_path));
     }
-    // A pending prune for this handle is now moot — the whole root is being released, so there is
-    // nothing to reconcile in place. The release supersedes it (contract clause 4).
-    self
-      .pending_set_covers
-      .retain(|(pending, _)| *pending != handle);
-    // A disarm is a source op that reaches the watcher, so it drains the prune backlog for OTHER
-    // handles through the prompt path — this handle's own prune was just dropped, and the drain skips
-    // a pending-release handle.
-    self.drain_pending_set_covers();
   }
 
+  /// **Deferred no-op — Codex R40 safe-disable.** The awaited GROW half of in-place coverage
+  /// reconcile is disabled for the fs source. `grow`'s hard contract is met **vacuously** here:
+  /// [`arm`](Self::arm) arms every root `Interest::all` over its **whole subtree** and this source's
+  /// actual coverage never narrows below a root (its [`set_cover`](Self::set_cover) is the matching
+  /// no-op), so every `retained` key already lies inside a live root's coverage — there is nothing to
+  /// grow back, and clause 1 ("coverage is live on return") holds trivially.
+  ///
+  /// # Why disabled, not merely defaulted
+  ///
+  /// The awaited [`Watcher::set_cover`](tributary_fs::Watcher::set_cover) this method used to drive
+  /// does NOT provide the correctness fence clause 1 demands: it returns when the fs core has
+  /// **QUEUED** the re-arm effects onto its driver, not when the kernel watches backing `retained` are
+  /// **live** — so a write between the ack and the effect landing could still be missed — and a failed
+  /// grow was silently swallowed (its result ignored). A correctness-grade `grow` needs an
+  /// **effect-completion token** the fs core does not yet mint; wiring that fence is deferred to a
+  /// dedicated follow-up. Until then the fs source stays on its self-healing whole-subtree coverage,
+  /// where the no-op is provably correct. The [`Source`] contract, the umbrella semantics, and the
+  /// [`Watcher`] plumbing all remain correct and tested — only this binding defers.
   async fn grow(&mut self, handle: RootHandle, retained: &[Vec<OsString>]) {
-    // The AWAITED, applied-before-return GROW half (M2-B v3): re-arm the `retained` subtrees a
-    // `Covered`-outside newcomer landed under. A requested release supersedes — the whole root is
-    // going away, so there is nothing to grow (contract clause 4 of the release seam).
-    if self.pending_set.contains(&handle) {
-      return;
-    }
-    // This grow's cover is the FRESHEST and authoritative for the handle: supersede (drop) any queued
-    // PRUNE for it, so a stale narrower snapshot can never trail behind and re-prune the newcomer's
-    // subtree the grow is about to restore (`Source::grow`/`Source::set_cover` latest-wins).
-    self
-      .pending_set_covers
-      .retain(|(pending, _)| *pending != handle);
-    // Rebuild each retained key into its canonical path — the coordinate `Watcher::set_cover`
-    // reconciles against — captured now, while the root is still live.
-    let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
-    // AWAIT the ACKED bidirectional reconcile: the fs core's R37 applied-cover delta prunes any excess
-    // AND re-arms every `retained` subtree the root was not covering, atomically at the driver, so the
-    // source's ACTUAL coverage INCLUDES every retained key the instant this returns. Applied-before-
-    // return kills the enqueue→apply window a fire-and-forget re-issue left open (Codex R39-F1): the
-    // umbrella needs no bridging `Rescan`, because a new watch is "changes from now on" and coverage is
-    // live before `watch()` returns. The result is ignored — grow is a best-effort budget optimization
-    // whose failure (the driver gone) leaves the root harmlessly over/under-broad, self-healing.
-    let _ = self.watcher.set_cover(handle, paths).await;
+    let _ = (handle, retained);
   }
 
+  /// **Deferred no-op — Codex R40 safe-disable.** The PRUNE half of in-place coverage reconcile is
+  /// disabled for the fs source. A no-op is a **conforming** `set_cover` (contract clause 5, "purely
+  /// an optimization" — correctness never depends on it): leaving a root at full-subtree coverage
+  /// merely keeps it over-broad, which is correctness-neutral and self-healing, so this source
+  /// reclaims no kernel budget for now but loses no event.
+  ///
+  /// # Why disabled, not merely defaulted
+  ///
+  /// It stands down together with its awaited GROW counterpart [`grow`](Self::grow): the prune cannot
+  /// be safely restored until the fs core mints an **effect-completion token** for the acked
+  /// [`Watcher::set_cover`](tributary_fs::Watcher::set_cover) (which returns at effect-QUEUE time, not
+  /// when the kernel watches are live — Codex R40), so both halves defer rather than pruning coverage
+  /// a not-yet-correct `grow` could not restore. Deferred to a dedicated follow-up. The [`Source`]
+  /// contract, the umbrella semantics, and the [`Watcher`] plumbing all remain correct and tested —
+  /// only this binding defers.
   fn set_cover(&mut self, handle: RootHandle, retained: &[Vec<OsString>]) {
-    // The PRUNE half (contract): narrow a now-over-broad root's coverage toward `retained`.
-    // Superseded by a requested release (contract clause 4): the whole root is going away, so there
-    // is nothing to reconcile in place. The `pending_set` mirror makes the handle logically dead.
-    if self.pending_set.contains(&handle) {
-      return;
-    }
-    // LATEST-WINS per handle (contract clause 6): drop any older QUEUED prune for this handle FIRST,
-    // so neither the drain below nor a later application ever trails a stale snapshot behind the fresh
-    // one. The umbrella re-issues a fresh, narrower cover on a non-root unwatch that shrinks an
-    // already-narrowed cover (F2), relying on the source to apply the LATEST prune per handle; this
-    // drop is where that guarantee is honored. (A GROW for this handle likewise supersedes any queued
-    // prune — see [`grow`](Self::grow).)
-    self
-      .pending_set_covers
-      .retain(|(pending, _)| *pending != handle);
-    // A set_cover is a source op that reaches the watcher, so it also drains any PREVIOUSLY-DEFERRED
-    // prunes (for other handles) through the prompt path — a sustained-full control channel is then
-    // the only case a prune stays deferred, and any later source activity drains it. This handle's own
-    // stale entry was just dropped above, so the drain never re-applies it before the fresh prune
-    // below.
-    self.drain_pending_set_covers();
-    // Rebuild each retained key into its canonical path — the coordinate `Watcher::set_cover`
-    // reconciles against — captured now, while the root is still live.
-    let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
-    // PROMPT path FIRST: forward the prune via the NON-BLOCKING reply-less request. On success the
-    // driver applies it AT ONCE. The fs core's bidirectional reconcile trims coverage strictly outside
-    // the retained prefixes; a `retained` no narrower than actual is a core no-op. (A broaden is never
-    // sent here — it goes through the awaited `grow`.) Only on a full/closed channel fall back to
-    // QUEUING for a later drain (a prune-only full-channel fallback; losslessness is not required).
-    if self.watcher.request_set_cover(handle, paths.clone()) {
-      return;
-    }
-    self.pending_set_covers.push_back((handle, paths));
+    let _ = (handle, retained);
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, RootHandle>> {

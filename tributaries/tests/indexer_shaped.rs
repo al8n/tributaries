@@ -226,20 +226,11 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     }
   }
 
+  /// Deferred no-op (Codex R40 safe-disable): this source arms whole subtrees, so its coverage never
+  /// narrows below a root and `grow` has nothing to restore — mirroring `FsSource`, whose
+  /// correctness-grade grow fence (an effect-completion token) is deferred to a follow-up.
   async fn grow(&mut self, handle: RootHandle, retained: &[Vec<Comp>]) {
-    // The AWAITED, applied-before-return GROW (M2-B v3), mirroring the fs source: re-arm the retained
-    // subtrees a `Covered`-outside newcomer landed under by reconciling to exactly `retained` via the
-    // ACKED `Watcher::set_cover` — which grows the missing subtree AND leaves survivor coverage
-    // untouched (no gap). A requested release supersedes (the whole root is going away). Because it is
-    // awaited, coverage is live before the watch returns, so the umbrella owes no bridging Rescan.
-    if self.pending_set.contains(&handle) {
-      return;
-    }
-    let paths: Vec<PathBuf> = retained
-      .iter()
-      .filter_map(|key| self.key_to_path(key))
-      .collect();
-    let _ = self.watcher.set_cover(handle, paths).await;
+    let _ = (handle, retained);
   }
 
   async fn next(&mut self) -> Option<SourceEvent<Comp, RootHandle>> {
