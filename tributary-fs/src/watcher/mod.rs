@@ -535,6 +535,61 @@ impl<R: RuntimeLite> Watcher<R> {
     }
   }
 
+  /// Reclaims over-broad per-directory coverage of a watched root **in place**:
+  /// prunes every descended kernel watch strictly outside the `retained` cover — the
+  /// canonical absolute paths whose coverage must survive — while leaving the retained
+  /// subtrees and the connecting ancestors from the root down to each of them armed.
+  /// The retained watches are **never re-armed**, so their events keep flowing with **no
+  /// gap and no re-crawl**.
+  ///
+  /// A **best-effort optimization** the layer above uses to reclaim inotify watch budget
+  /// after a wide root outlived the consumer whose key equalled it (design M2-B): it only
+  /// ever removes coverage no consumer is subscribed under, emits **no**
+  /// [`Rescan`](crate::EventKind::Rescan), and is a **no-op** for a kernel-recursive
+  /// backend (fanotify / FSEvents), whose single whole-subtree stream has no
+  /// per-directory watches to prune. A watch is kept iff its path lies under a retained
+  /// prefix OR is an ancestor one descends from; only a watch strictly outside every
+  /// retained prefix is dropped. `retained` are the watcher's own canonical coordinates
+  /// (as [`root_path`](Self::root_path) reports), so they line up with the watches'
+  /// addressing.
+  ///
+  /// # Errors
+  ///
+  /// - [`UnwatchError::UnknownRoot`] when `root` does not name a live root of THIS
+  ///   watcher (never watched, already gone, or issued by a different watcher);
+  /// - [`UnwatchError::Closed`] when the watcher is already closed.
+  pub async fn shrink(&self, root: RootHandle, retained: Vec<PathBuf>) -> Result<(), UnwatchError> {
+    // A foreign handle's scope number can name THIS watcher's unrelated root — reject
+    // before anything is sent, exactly as `unwatch` does.
+    if root.instance() != self.instance {
+      return Err(UnwatchError::UnknownRoot);
+    }
+    let (reply, response) = futures_channel::oneshot::channel();
+    if self
+      .commands
+      .send(Command::Shrink {
+        scope: root.scope(),
+        retained,
+        reply,
+      })
+      .await
+      .is_err()
+    {
+      self.driver_gone();
+      return Err(UnwatchError::Closed);
+    }
+    match response.await {
+      Ok(()) => Ok(()),
+      // The driver dropped the reply (it tore down): the prune may not have applied,
+      // but shrink is a best-effort optimization — surface the closed state like
+      // `unwatch`, and the layer above simply keeps the (harmless) over-broad coverage.
+      Err(_) => {
+        self.driver_gone();
+        Err(UnwatchError::Closed)
+      }
+    }
+  }
+
   /// The driver is gone (its command channel closed without an orderly
   /// confirmation): clear the read view so the registry is empty-and-honest
   /// rather than frozen at its last state. The single-writer rule is intact —

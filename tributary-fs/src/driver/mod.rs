@@ -261,6 +261,23 @@ pub(crate) enum Command {
     /// Resolved with whether the scope existed.
     reply: futures_channel::oneshot::Sender<bool>,
   },
+  /// Reclaim over-broad per-directory coverage of a live scope IN PLACE — prune every
+  /// descended watch strictly outside the `retained` cover, keeping the retained
+  /// subtrees and their connecting ancestors armed (no re-arm, so no gap). A
+  /// best-effort optimization: a no-op for an unknown scope or a kernel-recursive
+  /// backend (whose whole-subtree stream has no per-directory watches to prune).
+  /// Resolves once the prune has been applied to the Monitor (its `RemoveWatch`
+  /// effects are then fire-and-forget, like any other descending disarm).
+  Shrink {
+    /// The scope to prune.
+    scope: ScopeId,
+    /// The canonical absolute paths whose coverage MUST be retained (the survivor
+    /// antichain). Every watch neither under one of these nor an ancestor of one is
+    /// pruned.
+    retained: Vec<PathBuf>,
+    /// Resolved once the prune is applied (or immediately no-op'd).
+    reply: futures_channel::oneshot::Sender<()>,
+  },
   /// Orderly shutdown; resolves when every stream is torn down.
   Close {
     /// Resolved with the number of teardowns still wedged past the close
@@ -1115,6 +1132,17 @@ pub(crate) async fn run<R, F>(
           } else {
             let _ = reply.send(false);
           }
+        }
+        Ok(Command::Shrink { scope, retained, reply }) => {
+          // In-place coverage reclaim for a LIVE descending scope. Gate on a live
+          // stream (`handles`): a still-spawning or unknown scope has nothing to prune
+          // through, and `on_shrink` is itself a no-op for an unknown scope and for a
+          // kernel-recursive backend. The pruned watches' `RemoveWatch` effects are
+          // fire-and-forget (drained below like any disarm), so ack once applied.
+          if handles.contains_key(&scope) {
+            core.on_shrink(scope, &retained);
+          }
+          let _ = reply.send(());
         }
         Ok(Command::Close { reply }) => break Some(reply),
         // The watcher facade dropped: same orderly teardown, nobody to tell.

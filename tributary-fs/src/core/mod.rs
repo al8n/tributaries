@@ -643,6 +643,75 @@ impl DriverCore {
     }
   }
 
+  /// Reclaims over-broad per-directory kernel coverage of `scope` **in place**: prunes
+  /// every descended watch strictly OUTSIDE the `retained` cover — the antichain of
+  /// canonical absolute paths some surviving consumer still needs — while leaving the
+  /// retained subtrees AND the connecting ancestors on the path from the root down to
+  /// each of them untouched. The retained watches are never re-armed, so their events
+  /// keep flowing with **no gap and no re-crawl** (the M2-B shrink-in-place): a root
+  /// that widened over `/a/b` + `/a/c` and then lost its own `/a` consumer keeps serving
+  /// `/a/b` and `/a/c` while dropping `/a/e`, reclaiming its inotify watch budget.
+  ///
+  /// A watch at path `P` is KEPT iff some retained `R` satisfies `P.starts_with(R)` (P
+  /// lies in a retained subtree) OR `R.starts_with(P)` (P is a connecting ancestor a
+  /// retained subtree descends from); it is pruned only when strictly outside **every**
+  /// retained prefix, so no retained key ever routes through a pruned watch.
+  ///
+  /// **Best-effort and correctness-neutral.** The caller (the umbrella's shrink seam)
+  /// computes `retained` from the live survivors, so this only ever removes coverage no
+  /// consumer is subscribed under: a partial or skipped prune merely leaves the root
+  /// briefly over-broad (self-healing), never losing an event under a retained key, and
+  /// it emits **no `Rescan`** (nothing is owed a re-enumeration). A **no-op** for an
+  /// unknown scope, an empty `retained` (defensive — never prune the whole tree), and —
+  /// naturally — a **kernel-recursive** scope (fanotify / FSEvents): its single
+  /// whole-subtree stream has no per-directory children, so the walk finds only the
+  /// root node, which is never strictly outside its own retained descendants. Each
+  /// pruned watch's [`RemoveWatch`](Effect::RemoveWatch) flows through the ordinary
+  /// descending disarm path (`batch_control` → `inotify_rm_watch`), keeping the reader's
+  /// `wd` table and the core's addressing maps consistent exactly as a delete-driven
+  /// drop does.
+  pub(crate) fn on_shrink(&mut self, scope: ScopeId, retained: &[PathBuf]) {
+    let Some(state) = self.scopes.get(&scope) else {
+      return;
+    };
+    // An empty cover would mark every node strictly-outside (vacuously) and prune the
+    // whole scope; the umbrella never requests it, but never risk collapsing coverage.
+    if retained.is_empty() {
+      return;
+    }
+    let root_watch = state.watch;
+    // This scope's descended (non-root) watches strictly OUTSIDE every retained prefix,
+    // shallowest first — so a maximal outside subtree is dropped at its top and its
+    // deeper descendants are already gone (skipped by the `is_watched` guard) when
+    // reached. The root is never a candidate (it is an ancestor of every retained key).
+    let mut outside: Vec<(usize, WatchId)> = self
+      .watch_scopes
+      .iter()
+      .filter(|(watch, watch_scope)| **watch_scope == scope && **watch != root_watch)
+      .filter_map(|(watch, _)| {
+        let path = self.watch_paths.get(watch)?;
+        let strictly_outside = retained
+          .iter()
+          .all(|r| !path.starts_with(r) && !r.starts_with(path.as_path()));
+        strictly_outside.then(|| (path.components().count(), *watch))
+      })
+      .collect();
+    if outside.is_empty() {
+      return;
+    }
+    outside.sort_unstable_by_key(|(depth, _)| *depth);
+    for (_, watch) in outside {
+      // A node an ancestor's drop already reclaimed is no longer watched — skip it (the
+      // shallow-first order guarantees the ancestor was processed first).
+      if self.monitor.is_watched(watch) {
+        self.monitor.drop_watch_subtree(watch);
+      }
+    }
+    // Turn the queued `Action::Unwatch`es into `RemoveWatch` effects and forget the
+    // pruned watches' addressing, exactly as a Monitor-driven drop does.
+    self.drain_monitor();
+  }
+
   /// Feeds the blocking spawn's outcome for `scope`'s stream.
   pub(crate) fn on_stream_spawned(&mut self, scope: ScopeId, res: Result<RootMeta, SourceError>) {
     let Some(state) = self.scopes.get_mut(&scope) else {

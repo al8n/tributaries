@@ -481,6 +481,13 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// applied by the source no later than its next arm or its teardown. The subscription's
   /// coverage is gone the moment this resolves; the transport release follows.
   ///
+  /// If instead the drop leaves a shared root **over-broad** — the departing subscription's key
+  /// equalled the root's own key and every survivor sits under a narrower key — the root stays armed
+  /// for its survivors, and the excess kernel coverage is reclaimed **in place** via the synchronous
+  /// fire-and-forget [`Source::shrink`] (design §5, M2-B): survivor coverage never moves, so there is
+  /// no gap and no re-crawl. Over-broadness is correctness-neutral and self-healing, so this is a pure
+  /// budget-reclaim optimization the source may apply, defer, or ignore.
+  ///
   /// Sends an unwatch command to the owner and awaits its reply; dropping the
   /// returned future drops only the wait.
   ///
@@ -1483,16 +1490,34 @@ where
       coalescer.drop_subscription(sub);
     }
     // Now consult the subsumer. An already-retired sub is `Unknown` (its owner-local cleanup above
-    // has already run); a live one reports whether its root emptied.
+    // has already run); a live one reports whether its root emptied — or, on the non-emptied path,
+    // whether the departure left the root OVER-BROAD (design M2-B).
     let Some(outcome) = self.subsumer.plan_unwatch(sub) else {
       return Err(UnwatchError::UnknownSubscription);
     };
-    if let UnwatchOutcome::RootEmptied { fs_root } = outcome {
-      // The subscription was its root's last: request release of the kernel watch — a synchronous,
-      // fire-and-forget [`Source::disarm`] (the source queues any async teardown and applies it at
-      // its next arm or `Drop`). Nothing is awaited, so no teardown path blocks the owner (and
-      // shutdown rides its own channel regardless).
-      self.source.disarm(fs_root);
+    match outcome {
+      UnwatchOutcome::RootEmptied { fs_root } => {
+        // The subscription was its root's last: request release of the kernel watch — a synchronous,
+        // fire-and-forget [`Source::disarm`] (the source queues any async teardown and applies it at
+        // its next arm or `Drop`). Nothing is awaited, so no teardown path blocks the owner (and
+        // shutdown rides its own channel regardless).
+        self.source.disarm(fs_root);
+      }
+      UnwatchOutcome::Dropped {
+        shrink: Some((handle, retained)),
+      } => {
+        // The root survives for narrower subscribers but is now over-broad — it covers the whole
+        // wide key while every live subscriber sits under `retained`. Request the source SHRINK its
+        // kernel coverage in place down to the retained cover: a synchronous fire-and-forget request
+        // modeled exactly on [`Source::disarm`], so it is uniform and safe on EVERY release path
+        // (caller unwatch AND the [`Cleanup::DropOrphan`] orphan AND source-drain teardown) with no
+        // async-seam split — the sync nature is what licenses one call at the one release primitive.
+        // It reclaims the wide root's watch budget with no gap and no re-crawl; a no-op source (the
+        // default) conforms, since over-broadness is correctness-neutral and self-healing.
+        self.source.shrink(handle, &retained);
+      }
+      // Not over-broad: the root is exactly as wide as a live subscriber still needs it.
+      UnwatchOutcome::Dropped { shrink: None } => {}
     }
     Ok(())
   }
