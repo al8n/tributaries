@@ -7,11 +7,15 @@
 //!
 //! Real-kernel timing is nondeterministic, so every assertion is convergence-style: wait
 //! (bounded) until the expected fact is observed; extra events are always legal. Unlike the
-//! external binary this module runs inside the parallel lib-test harness, so the trio
-//! serializes itself on [`KERNEL_SERIAL`]: `count_inotify_wds` sums watch descriptors
-//! process-wide, which only reflects the watcher under test while no sibling holds one.
+//! external binary this module runs inside the parallel lib-test harness, where sibling unit
+//! tests (e.g. the `os::linux::inotify` suite) arm real inotify watches concurrently — so all
+//! watch-descriptor assertions are **object-scoped**: [`wds_watching`] matches fdinfo entries
+//! against the inodes of THIS test's own scratch directories, never a process-wide count that
+//! another test's arm or teardown could satisfy or mask (Codex R45).
 
 use std::{
+  collections::HashSet,
+  os::unix::fs::MetadataExt,
   path::{Path, PathBuf},
   sync::atomic::{AtomicU32, Ordering},
   time::Duration,
@@ -21,11 +25,6 @@ use super::Watcher;
 use crate::{Backend, Event, Interest, WatcherOptions};
 
 type TokioWatcher = Watcher<agnostic_lite::tokio::TokioRuntime>;
-
-/// Serializes the trio: these tests count process-wide inotify state and each drives its own
-/// real kernel watcher, so they must not overlap each other (the surrounding lib tests are
-/// sans-I/O and hold no inotify fds). An async mutex — the guard is held across awaits.
-static KERNEL_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -74,11 +73,23 @@ fn covers(event: &Event, path: &Path) -> bool {
   event.is_rescan() && path.starts_with(event.path())
 }
 
-/// Total inotify watch descriptors held by THIS process, summed across every inotify fd:
-/// an inotify fd's `/proc/self/fdinfo/<fd>` lists one `inotify wd:<n> ...` line per live
-/// per-directory watch. Meaningful only under [`KERNEL_SERIAL`], so the single watcher
-/// under test is the only inotify fd and this reflects its descending watch count.
-fn count_inotify_wds() -> usize {
+/// The inode numbers of `paths` (each must exist). Every scratch directory the module's
+/// tests create lives on the one `TMPDIR` filesystem, where inode numbers are unique, so a
+/// directory's inode identifies it among ALL inotify watches this process holds.
+fn inodes_of(paths: &[PathBuf]) -> HashSet<u64> {
+  paths
+    .iter()
+    .map(|path| std::fs::metadata(path).expect("stat scratch dir").ino())
+    .collect()
+}
+
+/// How many inotify watch descriptors THIS PROCESS holds **on the given inodes**: an inotify
+/// fd's `/proc/self/fdinfo/<fd>` lists one `inotify wd:<wd> ino:<hex> ...` line per live
+/// watch, and the `ino:` field names the watched object. Matching on this test's own
+/// directory inodes makes the count immune to every sibling test's inotify activity (the
+/// `os::linux::inotify` unit tests arm and release real watches, unlocked, in this same
+/// parallel binary — a process-wide count could be satisfied or masked by them, Codex R45).
+fn wds_watching(inos: &HashSet<u64>) -> usize {
   let mut total = 0;
   let Ok(entries) = std::fs::read_dir("/proc/self/fdinfo") else {
     return 0;
@@ -88,53 +99,69 @@ fn count_inotify_wds() -> usize {
       total += content
         .lines()
         .filter(|line| line.starts_with("inotify wd:"))
+        .filter(|line| {
+          line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("ino:"))
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .is_some_and(|ino| inos.contains(&ino))
+        })
         .count();
     }
   }
   total
 }
 
-/// Closes the watcher and waits (bounded) until the process-wide inotify wd count has
-/// returned to `baseline` (Codex R44): dropping a [`Watcher`] only *requests* an
-/// asynchronous driver shutdown, so returning — and releasing [`KERNEL_SERIAL`] — before
-/// the teardown is proven would let a successor test observe THIS test's late wd release
-/// as its own shrink (`count < before` falsely satisfied). Every test in this module ends
-/// through here, still under the serial guard.
-async fn close_to_baseline(w: TokioWatcher, baseline: usize) {
-  w.close().await.expect("close watcher");
-  let drained = tokio::time::timeout(DEADLINE, async {
+/// Waits (bounded) until `done()` holds, polling the kernel-visible state; `false` on lapse.
+async fn converge(mut done: impl FnMut() -> bool) -> bool {
+  tokio::time::timeout(DEADLINE, async {
     loop {
-      if count_inotify_wds() <= baseline {
+      if done() {
         return true;
       }
       tokio::time::sleep(Duration::from_millis(25)).await;
     }
   })
   .await
-  .unwrap_or(false);
+  .unwrap_or(false)
+}
+
+/// Closes the watcher and waits (bounded) until no watch descriptor on this test's own
+/// inodes remains (Codex R44): dropping a [`Watcher`] only *requests* an asynchronous driver
+/// shutdown, so a test must prove its kernel teardown finished rather than leak watches past
+/// its end. Object-scoped, so a sibling test's activity can neither satisfy nor stall it.
+async fn close_and_drain(w: TokioWatcher, inos: &HashSet<u64>) {
+  w.close().await.expect("close watcher");
   assert!(
-    drained,
-    "watcher teardown returns the process-wide inotify wd count to its pre-test baseline \
-     before the serial guard is released (Codex R44)"
+    converge(|| wds_watching(inos) == 0).await,
+    "watcher teardown releases every watch descriptor on this test's directories (Codex R44)"
   );
 }
 
 /// M2-B set-cover, end to end against real inotify: a wide root that armed per-directory
 /// watches over TWO nested subtrees is reconciled in place down to a retained cover, then
 /// **grown back**. Phase 1 (shrink): the strictly-outside subtree's watch descriptors are
-/// reclaimed (the wd count drops), the retained subtree keeps delivering with NO gap (its
-/// watches are never re-armed), and the pruned subtree stops delivering — the whole point of
-/// shrinking the kernel coverage rather than releasing and re-arming. Phase 2 (grow, Codex
-/// R36): re-issuing a cover that once again includes the pruned subtree re-arms it in place,
-/// so a fresh deep write under it IS delivered again — the bidirectional dual, without which a
-/// survivor watching a previously-pruned subtree would sit over a hole no watch backs.
+/// reclaimed (its object-scoped wd count drops to zero) while the retained subtree's stay
+/// intact and keep delivering with NO gap (never re-armed), and the pruned subtree stops
+/// delivering — the whole point of shrinking the kernel coverage rather than releasing and
+/// re-arming. Phase 2 (grow, Codex R36): re-issuing a cover that once again includes the
+/// pruned subtree re-arms it in place, so a fresh deep write under it IS delivered again —
+/// the bidirectional dual, without which a survivor watching a previously-pruned subtree
+/// would sit over a hole no watch backs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
-  let _serial = KERNEL_SERIAL.lock().await;
-  let baseline = count_inotify_wds();
   let root = scratch_root("shrink");
   std::fs::create_dir_all(root.join("keep/deep")).unwrap();
   std::fs::create_dir_all(root.join("drop/deep")).unwrap();
+  let all = inodes_of(&[
+    root.clone(),
+    root.join("keep"),
+    root.join("keep/deep"),
+    root.join("drop"),
+    root.join("drop/deep"),
+  ]);
+  let retained = inodes_of(&[root.clone(), root.join("keep"), root.join("keep/deep")]);
+  let pruned = inodes_of(&[root.join("drop"), root.join("drop/deep")]);
 
   // Pin inotify: the shrink prunes PER-DIRECTORY watches, which only the descending backend holds
   // (a kernel-recursive fanotify mark has none, and its shrink is a documented no-op).
@@ -156,11 +183,10 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
     wait_for(&mut w, |e| covers(e, &drop_probe)).await.is_some(),
     "the /drop subtree is armed (its deep write surfaces)"
   );
-
-  let before = count_inotify_wds();
   assert!(
-    before >= 5,
-    "root + keep + keep/deep + drop + drop/deep all hold watches before the shrink (got {before})"
+    converge(|| wds_watching(&all) == 5).await,
+    "root + keep + keep/deep + drop + drop/deep all hold watches before the shrink (got {})",
+    wds_watching(&all)
   );
 
   // Shrink the wide root down to the /keep cover: /drop and /drop/deep are strictly outside it, so
@@ -170,20 +196,16 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
     .await
     .expect("set_cover prune");
 
-  // The pruned subtree's descriptors are reclaimed (the disarms apply asynchronously, fire-and-forget).
-  let reclaimed = tokio::time::timeout(DEADLINE, async {
-    loop {
-      if count_inotify_wds() < before {
-        return true;
-      }
-      tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-  })
-  .await
-  .unwrap_or(false);
+  // The pruned subtree's descriptors are reclaimed (the disarms apply asynchronously,
+  // fire-and-forget) — and ONLY those: the retained cover's three watches survive untouched.
   assert!(
-    reclaimed,
+    converge(|| wds_watching(&pruned) == 0).await,
     "the strictly-outside /drop subtree's watch descriptors are reclaimed after the shrink"
+  );
+  assert_eq!(
+    wds_watching(&retained),
+    3,
+    "the retained root + keep + keep/deep watches survive the shrink untouched (no re-arm)"
   );
 
   // Drain any pre-shrink stragglers (a trailing /drop event decoded before its wd's `IN_IGNORED`)
@@ -248,8 +270,7 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
       .is_some(),
     "the re-armed /drop/deep subtree delivers again after the set-cover grew it back (Codex R36)"
   );
-
-  close_to_baseline(w, baseline).await;
+  close_and_drain(w, &all).await;
 }
 
 /// M2-B set-cover, the R37-F1 regression: growing back to a RETAINED ANCESTOR whose connecting watch
@@ -261,13 +282,18 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
 /// deep write under it is delivered again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
-  let _serial = KERNEL_SERIAL.lock().await;
-  let baseline = count_inotify_wds();
   let root = scratch_root("grow-ancestor");
   // a/b has TWO descendant subtrees: a/b/deep (retained by the narrow cover) and a/b/other (pruned by
   // it — the cover keeps only a/b/deep under a/b, so a/b stays purely as a CONNECTING ANCESTOR).
   std::fs::create_dir_all(root.join("a/b/deep")).unwrap();
   std::fs::create_dir_all(root.join("a/b/other")).unwrap();
+  let all = inodes_of(&[
+    root.clone(),
+    root.join("a"),
+    root.join("a/b"),
+    root.join("a/b/deep"),
+    root.join("a/b/other"),
+  ]);
 
   let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
     .expect("build inotify watcher");
@@ -334,8 +360,7 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
       .is_some(),
     "growing back to the retained ANCESTOR a/b re-arms the previously-pruned a/b/other (Codex R37-F1)"
   );
-
-  close_to_baseline(w, baseline).await;
+  close_and_drain(w, &all).await;
 }
 
 /// M2-B set-cover, the R37-F1 root-key cancel: after an applied shrink, re-issuing the root's OWN key
@@ -344,11 +369,16 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
 /// wholesale, re-installing the pruned /drop — a deep write under it is delivered again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
-  let _serial = KERNEL_SERIAL.lock().await;
-  let baseline = count_inotify_wds();
   let root = scratch_root("grow-cancel");
   std::fs::create_dir_all(root.join("keep/deep")).unwrap();
   std::fs::create_dir_all(root.join("drop/deep")).unwrap();
+  let all = inodes_of(&[
+    root.clone(),
+    root.join("keep"),
+    root.join("keep/deep"),
+    root.join("drop"),
+    root.join("drop/deep"),
+  ]);
 
   let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
     .expect("build inotify watcher");
@@ -408,6 +438,5 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
       .is_some(),
     "a root-key cancel after an applied shrink re-arms every previously-pruned region (Codex R37-F1)"
   );
-
-  close_to_baseline(w, baseline).await;
+  close_and_drain(w, &all).await;
 }

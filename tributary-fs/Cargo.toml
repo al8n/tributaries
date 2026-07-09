@@ -35,13 +35,10 @@ thiserror = "2"
 tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
-# `sync` backs the in-crate linux kernel tests' serialization mutex (an async mutex —
-# the guard is held across awaits, which a std guard would trip await_holding_lock on).
 tokio = { version = "1", features = [
   "macros",
   "rt",
   "rt-multi-thread",
-  "sync",
   "test-util",
   "time",
 ] }
