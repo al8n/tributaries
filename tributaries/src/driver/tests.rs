@@ -322,6 +322,10 @@ struct Harness {
   /// Kept alive so the owner's command receiver never observes a closed channel (the loop
   /// is not run here; reconcile is driven directly).
   _commands: async_channel::Sender<super::Command<OsString, ()>>,
+  /// The dedicated close signal's sender (Codex R27): kept alive so the owner's close receiver
+  /// never observes a closed channel, and used by the close-under-teardown tests to inject a close
+  /// exactly as `Tributaries::close` does — `try_send(reply)` on this channel, never a command.
+  closes: async_channel::Sender<super::CloseReply>,
 }
 
 impl Harness {
@@ -346,6 +350,7 @@ impl Harness {
       None => async_channel::unbounded(),
     };
     let (command_tx, command_rx) = async_channel::unbounded();
+    let (close_tx, close_rx) = async_channel::bounded(1);
     let owner = Owner {
       source: FakeSource::new(),
       subsumer: Subsumer::new(),
@@ -356,6 +361,7 @@ impl Harness {
       coalescer,
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
+      closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
       observed_handles: std::collections::HashSet::new(),
@@ -365,6 +371,7 @@ impl Harness {
       owner,
       events: event_rx,
       _commands: command_tx,
+      closes: close_tx,
     }
   }
 
@@ -2467,12 +2474,12 @@ async fn source_drain_orders_parked_rescan_before_its_buffered_tail() {
 }
 
 /// R2-F3 regression (design backpressure doc, invariant II): after the source drains, the owner
-/// owes every parked `Rescan` and retries across a full channel — but that retry must keep
-/// servicing the command mailbox, or a `Close` behind a full channel (a held-but-not-draining
-/// receiver keeps it both full and un-closed) queues forever and `close()` hangs. The drain
-/// `select!`s its retry timer against `commands.recv`, so a mid-drain `Close` is surfaced (to be
-/// acked) within a bounded deadline. Fail-on-old: with the command-unresponsive (blind-sleep)
-/// drain loop, this times out.
+/// owes every parked `Rescan` and retries across a full channel — but that retry must stay
+/// responsive to shutdown, or a close behind a full channel (a held-but-not-draining receiver keeps
+/// it both full and un-closed) waits forever and `close()` hangs. The drain checks the dedicated
+/// close signal at the top priority (a non-blocking `try_recv` each iteration AND the first arm of
+/// its retry `select!`), so a mid-drain close is surfaced (to be acked) within a bounded deadline.
+/// Fail-on-old: with the close-unresponsive (blind-sleep) drain loop, this times out.
 #[tokio::test]
 async fn source_drain_retry_stays_responsive_to_close() {
   let mut h = Harness::bounded(1);
@@ -2491,13 +2498,13 @@ async fn source_drain_retry_stays_responsive_to_close() {
   );
   let _held = h.events.clone(); // a receiver that never drains (keeps the channel full + open)
 
-  // Another handle calls close(): the Close command queues on the (unbounded) mailbox.
+  // Another handle calls close(): the reply rides the dedicated close signal, not the mailbox.
   let (reply, response) = futures_channel::oneshot::channel();
-  h._commands
-    .try_send(super::Command::Close { reply })
-    .expect("enqueue the Close command");
+  h.closes
+    .try_send(reply)
+    .expect("send the close on the dedicated signal");
 
-  // The source-drain retry must service that Close rather than spin behind the full channel.
+  // The source-drain retry must service that close rather than spin behind the full channel.
   let returned = tokio::time::timeout(
     Duration::from_secs(10),
     h.owner.drain_owed_before_shutdown(),
@@ -2519,13 +2526,13 @@ async fn source_drain_retry_stays_responsive_to_close() {
 /// Close-responsive source drain (design source doc, invariant II): during source-drain teardown a
 /// queued [`DropOrphan`](super::Command::DropOrphan) is released through the synchronous
 /// [`release_subscription`](super::Owner::release_subscription) — it purges the orphan's owner-local
-/// state and requests the emptied root's `source.disarm`, awaiting nothing — so a `Close` queued
-/// behind it is surfaced promptly with no scheduling discipline to get wrong. The purge is keyed on
-/// the orphan alone, so a live sub's owed Rescan survives it.
+/// state and requests the emptied root's `source.disarm`, awaiting nothing — so it never wedges the
+/// owner, and the close (on its dedicated signal) is surfaced promptly with no scheduling discipline
+/// to get wrong. The purge is keyed on the orphan alone, so a live sub's owed Rescan survives it.
 ///
-/// Non-vacuous: with `DropOrphan` ahead of `Close` and a SEPARATE live subscription keeping a Rescan
-/// parked behind a full, held-open channel (so the drain loop keeps spinning and servicing the
-/// mailbox), it asserts the drain surfaces the Close within the deadline, the orphan is reconciled
+/// Non-vacuous: with a `DropOrphan` queued on the mailbox and a SEPARATE live subscription keeping a
+/// Rescan parked behind a full, held-open channel (so the drain loop keeps spinning and servicing the
+/// mailbox), it asserts the drain surfaces the close within the deadline, the orphan is reconciled
 /// away (its last-subscriber root released synchronously — a `Disarm` op recorded), and the live
 /// sub's owed Rescan survives untouched.
 #[tokio::test]
@@ -2552,27 +2559,34 @@ async fn source_drain_dropped_orphan_is_purged_without_blocking_close_on_disarm(
   );
   let _held = h.events.clone(); // a receiver that never drains (keeps the channel full + open)
 
-  // Queue DropOrphan(orphan) BEFORE the Close.
+  // Queue DropOrphan(orphan) on the mailbox. The close is NOT sent yet: under R27 a close already
+  // pending on the dedicated signal would (correctly) preempt the queued command, so to exercise the
+  // drain SERVICING the DropOrphan we let it arrive only after the drain's first pass. Run the drain
+  // concurrently with a sender that yields once (so the drain runs its first pass — servicing the
+  // queued DropOrphan via the synchronous release — before the close lands), then interrupts it via
+  // the dedicated close arm.
   h._commands
     .try_send(super::Command::DropOrphan(orphan))
     .expect("enqueue the DropOrphan command");
   let (reply, response) = futures_channel::oneshot::channel();
-  h._commands
-    .try_send(super::Command::Close { reply })
-    .expect("enqueue the Close command");
-
-  // The teardown releases the orphan (synchronous disarm) and surfaces the Close — all within the
-  // deadline; a synchronous release can never park the drain behind the queued `Close`.
-  let returned = tokio::time::timeout(Duration::from_secs(5), h.owner.drain_owed_before_shutdown())
-    .await
-    .expect("the teardown surfaced the Close without blocking on the orphan's release");
-  let close_reply = returned.expect("the mid-drain Close is surfaced to the caller to be acked");
+  let closes = h.closes.clone();
+  let (returned, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::join!(h.owner.drain_owed_before_shutdown(), async move {
+      tokio::task::yield_now().await;
+      closes
+        .try_send(reply)
+        .expect("send the close on the dedicated signal");
+    })
+  })
+  .await
+  .expect("the drain serviced the queued DropOrphan and then surfaced the close");
+  let close_reply = returned.expect("the mid-drain close is surfaced to the caller to be acked");
 
   // Ack it exactly as `run` does; the close() caller then completes.
-  close_reply.send(Ok(())).expect("ack the Close");
+  close_reply.send(Ok(())).expect("ack the close");
   assert!(
     matches!(response.await, Ok(Ok(()))),
-    "close() completes once the drain surfaced and acked its Close"
+    "close() completes once the drain surfaced and acked its close"
   );
 
   // The orphan's last-subscriber root was released SYNCHRONOUSLY — a `Disarm(2)` recorded at cleanup
@@ -2696,6 +2710,9 @@ struct OwnerU64 {
   events: async_channel::Receiver<Event<OsString, u64>>,
   /// Kept alive so the owner's command receiver never observes a closed channel.
   _commands: async_channel::Sender<super::Command<OsString, u64>>,
+  /// Kept alive so the owner's close receiver never observes a closed channel (these rigs drive
+  /// primitives directly and never inject a close).
+  _closes: async_channel::Sender<super::CloseReply>,
 }
 
 impl OwnerU64 {
@@ -2703,6 +2720,7 @@ impl OwnerU64 {
   fn new(capacity: usize, coalescer: Option<Coalescer<OsString, u64>>) -> Self {
     let (event_tx, event_rx) = async_channel::bounded(capacity);
     let (command_tx, command_rx) = async_channel::unbounded();
+    let (close_tx, close_rx) = async_channel::bounded(1);
     let owner = Owner {
       source: FakeSource::new(),
       subsumer: Subsumer::new(),
@@ -2713,6 +2731,7 @@ impl OwnerU64 {
       coalescer,
       commands_weak: command_tx.downgrade(),
       commands: command_rx,
+      closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
       observed_handles: std::collections::HashSet::new(),
@@ -2722,6 +2741,7 @@ impl OwnerU64 {
       owner,
       events: event_rx,
       _commands: command_tx,
+      _closes: close_tx,
     }
   }
 
@@ -3251,6 +3271,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
 
   let (event_tx, _event_rx) = async_channel::unbounded::<Event<OsString, ()>>();
   let (command_tx, command_rx) = async_channel::unbounded::<super::Command<OsString, ()>>();
+  let (_close_tx, close_rx) = async_channel::bounded::<super::CloseReply>(1);
   let mut owner = Owner {
     source: PendingReleaseSource {
       next_handle: 0,
@@ -3267,6 +3288,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     coalescer: None,
     commands_weak: command_tx.downgrade(),
     commands: command_rx,
+    closes: close_rx,
     events: event_tx,
     #[cfg(debug_assertions)]
     observed_handles: std::collections::HashSet::new(),
@@ -3399,6 +3421,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
 
   let (event_tx, event_rx) = async_channel::unbounded::<Event<OsString, ()>>();
   let (command_tx, command_rx) = async_channel::unbounded::<super::Command<OsString, ()>>();
+  let (close_tx, close_rx) = async_channel::bounded::<super::CloseReply>(1);
   let (trigger_tx, trigger_rx) = async_channel::unbounded::<ReplyRx>();
   let owner = Owner {
     source: TerminalRetireSource {
@@ -3416,6 +3439,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     coalescer: None,
     commands_weak: command_tx.downgrade(),
     commands: command_rx,
+    closes: close_rx,
     events: event_tx,
     #[cfg(debug_assertions)]
     observed_handles: std::collections::HashSet::new(),
@@ -3447,11 +3471,12 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
   // Give the loop a beat to run those iterations to quiescence.
   tokio::time::sleep(Duration::from_millis(250)).await;
 
-  // `close()` still completes (the loop is Close-responsive by construction).
+  // `close()` still completes (the loop is Close-responsive by construction) — the reply rides the
+  // dedicated close signal, not the command mailbox.
   let (close_reply, close_response) = futures_channel::oneshot::channel();
-  command_tx
-    .try_send(super::Command::Close { reply: close_reply })
-    .expect("enqueue the Close");
+  close_tx
+    .try_send(close_reply)
+    .expect("send the close on the dedicated signal");
   let acked = tokio::time::timeout(Duration::from_secs(5), close_response)
     .await
     .expect("close() completes within the deadline")
@@ -3931,5 +3956,112 @@ async fn due_debounced_event_drains_under_sustained_command_load() {
     .expect("the due debounced event drains despite the flood (the valve's due-coalescer drain)")
     .expect("the stream is open");
   assert_eq!(event.subscription(), sub, "routed to the covering sub");
+  flood.abort();
+}
+
+/// Codex R27 (M2-A) regression — `close()` is never starved behind an unbounded command backlog:
+/// the reply rides a **dedicated** high-priority signal, checked at the TOP priority in the real
+/// [`run`](super::run) loop (a non-blocking `try_recv` each iteration AND the first `select!` arm),
+/// so a requested shutdown completes within a bounded window no matter how deep the command mailbox
+/// is. Exercises the REAL spawned run loop over a source that parks (never drains, so the loop stays
+/// alive purely to answer the close), with the unbounded mailbox both PREFILLED with 500 fail-fast
+/// `Watch` commands AND kept continuously non-empty by a spawned flood.
+///
+/// Fail-on-old: with `Close` on the FIFO command mailbox behind the 500-deep backlog + the ongoing
+/// flood, the owner would have to chew through the whole backlog (arm/orphan/disarm each) before it
+/// ever dequeued the `Close`, so `close()` waits it out and probabilistically times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_is_not_starved_by_a_prefilled_command_backlog_and_flood() {
+  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
+  let source = DrainableSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    drain: drain_rx, // held open (`_drain_tx` kept alive) so `next()` parks forever
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+
+  // A live claimed subscription, so the owner is genuinely running with real state (the finding's
+  // "owner/source kept alive while shutdown is requested").
+  w.watch(key("/a"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /a");
+
+  // Prefill the UNBOUNDED command mailbox with MANY fail-fast Watch commands: each reply receiver is
+  // dropped, so the owner's send-back fails and it releases the orphan synchronously (arm→disarm) —
+  // real per-command work the old FIFO `Close` would have queued behind.
+  for _ in 0..500 {
+    let (reply, response) = futures_channel::oneshot::channel();
+    drop(response);
+    w.commands
+      .try_send(super::Command::Watch {
+        key: key("/backlog"),
+        value: (),
+        interest: Interest::all(),
+        filter: Filter::all(),
+        reply,
+      })
+      .expect("prefill the command backlog");
+  }
+  // …and a sustained flood keeping the mailbox continuously non-empty against the real run loop.
+  let flood = spawn_command_flood(w.commands.clone());
+
+  // close() rides the dedicated close signal, so it completes within a bounded window DESPITE the
+  // 500-deep backlog + ongoing flood on the command mailbox (Codex R27).
+  let closed = tokio::time::timeout(Duration::from_secs(5), w.close())
+    .await
+    .expect("close() completes within the deadline despite the command backlog + flood");
+  assert!(matches!(closed, Ok(())), "close() succeeds");
+  flood.abort();
+}
+
+/// Codex R27 (M2-A) regression, SOURCE-DRAIN teardown under a flood — a close DURING the owed-Rescan
+/// drain is surfaced within a bounded window even while a sustained command flood keeps the mailbox
+/// continuously non-empty. [`drain_owed_before_shutdown`](super::Owner::drain_owed_before_shutdown)
+/// checks the dedicated close signal FIRST (a non-blocking `try_recv` before its bounded command
+/// pre-drain AND the first arm of its retry `select!`), so the close outranks the flood the bounded
+/// pre-drain services. A claimed sub's parked overflow Rescan behind a full, held-open channel keeps
+/// the drain spinning (so the close-check is genuinely exercised mid-drain).
+///
+/// Fail-on-old (Close on the FIFO mailbox): behind the flood the drain's command servicing would
+/// dequeue flood commands ahead of the `Close`, so the close waits out the never-emptying backlog and
+/// times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_drain_close_is_surfaced_under_sustained_command_flood() {
+  let mut h = Harness::bounded(1);
+  let live = h.watch("/a", Interest::all()).await.expect("watch /a"); // claimed
+  for raw in 0..2 {
+    h.owner.epochs.stamp(live, Epoch::new(raw));
+  }
+  // Fill the one slot and overflow → park the CLAIMED sub's dominating Rescan; the held receiver
+  // keeps the channel full + open, so the drain keeps spinning (neither exit fires on its own).
+  h.owner.try_emit(modified_event(live, "/a/f0", 0));
+  h.owner.try_emit(modified_event(live, "/a/f1", 1));
+  assert!(
+    h.owner.needs_rescan.contains_key(&live),
+    "overflow parked the claimed sub's Rescan; the channel is full"
+  );
+  let _held = h.events.clone(); // a receiver that never drains (keeps the channel full + open)
+
+  // A sustained command flood keeping the mailbox continuously non-empty during the drain.
+  let flood = spawn_command_flood(h._commands.clone());
+
+  // A close rides the dedicated signal.
+  let (reply, response) = futures_channel::oneshot::channel();
+  h.closes
+    .try_send(reply)
+    .expect("send the close on the dedicated signal");
+
+  // The source-drain teardown surfaces the close within the deadline despite the flood (Codex R27).
+  let returned = tokio::time::timeout(Duration::from_secs(5), h.owner.drain_owed_before_shutdown())
+    .await
+    .expect("the source-drain teardown surfaced the close despite the sustained command flood");
+  let close_reply = returned.expect("the mid-drain close is surfaced to the caller to be acked");
+  // Ack it exactly as `run` does; the close() caller then completes.
+  close_reply.send(Ok(())).expect("ack the close");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "close() completes once the drain surfaced and acked its close, under the flood"
+  );
   flood.abort();
 }
