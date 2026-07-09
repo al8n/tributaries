@@ -261,21 +261,22 @@ pub(crate) enum Command {
     /// Resolved with whether the scope existed.
     reply: futures_channel::oneshot::Sender<bool>,
   },
-  /// Reclaim over-broad per-directory coverage of a live scope IN PLACE — prune every
-  /// descended watch strictly outside the `retained` cover, keeping the retained
-  /// subtrees and their connecting ancestors armed (no re-arm, so no gap). A
-  /// best-effort optimization: a no-op for an unknown scope or a kernel-recursive
-  /// backend (whose whole-subtree stream has no per-directory watches to prune).
-  /// Resolves once the prune has been applied to the Monitor (its `RemoveWatch`
-  /// effects are then fire-and-forget, like any other descending disarm).
-  Shrink {
-    /// The scope to prune.
+  /// Reconcile a live scope's per-directory coverage to the `retained` cover IN PLACE,
+  /// BIDIRECTIONALLY — prune every descended watch strictly outside the cover AND re-arm
+  /// any retained subtree an earlier, narrower cover pruned — keeping every already-covered
+  /// retained subtree and its connecting ancestors armed (no re-arm, so no gap). A
+  /// best-effort optimization: a no-op for an unknown scope or a kernel-recursive backend
+  /// (whose whole-subtree stream has no per-directory watches to prune or grow). Resolves
+  /// once the reconcile has been applied to the Monitor (its `RemoveWatch`/`AddWatch`
+  /// effects are then fire-and-forget, like any other descending disarm/arm).
+  SetCover {
+    /// The scope to reconcile.
     scope: ScopeId,
     /// The canonical absolute paths whose coverage MUST be retained (the survivor
     /// antichain). Every watch neither under one of these nor an ancestor of one is
-    /// pruned.
+    /// pruned; every retained prefix not currently covered is re-armed.
     retained: Vec<PathBuf>,
-    /// Resolved once the prune is applied (or immediately no-op'd).
+    /// Resolved once the reconcile is applied (or immediately no-op'd).
     reply: futures_channel::oneshot::Sender<()>,
   },
   /// Orderly shutdown; resolves when every stream is torn down.
@@ -1133,14 +1134,15 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(false);
           }
         }
-        Ok(Command::Shrink { scope, retained, reply }) => {
-          // In-place coverage reclaim for a LIVE descending scope. Gate on a live
-          // stream (`handles`): a still-spawning or unknown scope has nothing to prune
-          // through, and `on_shrink` is itself a no-op for an unknown scope and for a
-          // kernel-recursive backend. The pruned watches' `RemoveWatch` effects are
-          // fire-and-forget (drained below like any disarm), so ack once applied.
+        Ok(Command::SetCover { scope, retained, reply }) => {
+          // In-place bidirectional coverage reconcile for a LIVE descending scope. Gate on a
+          // live stream (`handles`): a still-spawning or unknown scope has nothing to prune or
+          // grow through, and `on_set_cover` is itself a no-op for an unknown scope and for a
+          // kernel-recursive backend. The pruned watches' `RemoveWatch` and grown watches'
+          // `AddWatch`/`Enumerate` effects are fire-and-forget (drained below like any
+          // disarm/arm), so ack once applied.
           if handles.contains_key(&scope) {
-            core.on_shrink(scope, &retained);
+            core.on_set_cover(scope, &retained);
           }
           let _ = reply.send(());
         }

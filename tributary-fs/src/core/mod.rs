@@ -72,7 +72,7 @@
 //! loss-triggered refresh already catches it immediately when one occurs.
 
 use std::{
-  collections::{BTreeMap, VecDeque},
+  collections::{BTreeMap, BTreeSet, VecDeque},
   num::NonZeroU64,
   path::{Path, PathBuf},
   sync::Arc,
@@ -643,34 +643,52 @@ impl DriverCore {
     }
   }
 
-  /// Reclaims over-broad per-directory kernel coverage of `scope` **in place**: prunes
-  /// every descended watch strictly OUTSIDE the `retained` cover — the antichain of
-  /// canonical absolute paths some surviving consumer still needs — while leaving the
-  /// retained subtrees AND the connecting ancestors on the path from the root down to
-  /// each of them untouched. The retained watches are never re-armed, so their events
-  /// keep flowing with **no gap and no re-crawl** (the M2-B shrink-in-place): a root
-  /// that widened over `/a/b` + `/a/c` and then lost its own `/a` consumer keeps serving
-  /// `/a/b` and `/a/c` while dropping `/a/e`, reclaiming its inotify watch budget.
+  /// Reconciles `scope`'s per-directory kernel coverage to the `retained` cover **in place**,
+  /// **bidirectionally** (the set-cover, M2-B v2): it BOTH prunes every descended watch
+  /// strictly OUTSIDE the cover AND re-arms any retained subtree the scope is not currently
+  /// covering — while leaving every retained subtree that is already covered, and the
+  /// connecting ancestors from the root down to each, untouched. Neither the retained-and-
+  /// covered watches nor the connecting ancestors are ever re-armed, so their events keep
+  /// flowing with **no gap and no re-crawl** (the shrink-in-place property); only the
+  /// previously-pruned corner is grown back.
   ///
-  /// A watch at path `P` is KEPT iff some retained `R` satisfies `P.starts_with(R)` (P
-  /// lies in a retained subtree) OR `R.starts_with(P)` (P is a connecting ancestor a
-  /// retained subtree descends from); it is pruned only when strictly outside **every**
-  /// retained prefix, so no retained key ever routes through a pruned watch.
+  /// `retained` is the antichain of canonical absolute paths some surviving consumer still
+  /// needs. A watch at path `P` is KEPT by the prune iff some retained `R` satisfies
+  /// `P.starts_with(R)` (P lies in a retained subtree) OR `R.starts_with(P)` (P is a
+  /// connecting ancestor a retained subtree descends from); it is pruned only when strictly
+  /// outside **every** retained prefix, so no retained key ever routes through a pruned watch.
+  /// A retained prefix with **no live watch at its own path** — one an EARLIER, narrower cover
+  /// pruned — is re-armed by re-arming its deepest still-watched ancestor (the root is always
+  /// one), whose recursive re-arm re-installs the pruned directory and everything between; the
+  /// re-arm emits no `Created` and no `Rescan`, so it silently restores coverage the way the
+  /// prune silently reclaims it.
   ///
-  /// **Best-effort and correctness-neutral.** The caller (the umbrella's shrink seam)
-  /// computes `retained` from the live survivors, so this only ever removes coverage no
-  /// consumer is subscribed under: a partial or skipped prune merely leaves the root
-  /// briefly over-broad (self-healing), never losing an event under a retained key, and
-  /// it emits **no `Rescan`** (nothing is owed a re-enumeration). A **no-op** for an
-  /// unknown scope, an empty `retained` (defensive — never prune the whole tree), and —
-  /// naturally — a **kernel-recursive** scope (fanotify / FSEvents): its single
-  /// whole-subtree stream has no per-directory children, so the walk finds only the
-  /// root node, which is never strictly outside its own retained descendants. Each
-  /// pruned watch's [`RemoveWatch`](Effect::RemoveWatch) flows through the ordinary
-  /// descending disarm path (`batch_control` → `inotify_rm_watch`), keeping the reader's
-  /// `wd` table and the core's addressing maps consistent exactly as a delete-driven
-  /// drop does.
-  pub(crate) fn on_shrink(&mut self, scope: ScopeId, retained: &[PathBuf]) {
+  /// # Why the grow half exists (Codex R36)
+  ///
+  /// A prune-only set-cover cannot restore coverage: after an applied prune of `/a/c`, a later
+  /// consumer watching `/a/c` again (subsumed under the still-armed wide root — `Covered` at
+  /// the umbrella, no re-arm) would sit over a hole no per-directory watch backs, silently
+  /// missing every deep change. The umbrella now re-issues the FRESH cover (including that
+  /// newcomer) on the `Covered` commit, and this grow half is what turns that re-issue into
+  /// real coverage again.
+  ///
+  /// **Best-effort and correctness-neutral.** The caller (the umbrella's set-cover seam)
+  /// computes `retained` from the live survivors, so the prune only ever removes coverage no
+  /// consumer is subscribed under and the grow only ever re-arms coverage a survivor needs: a
+  /// partial or skipped prune merely leaves the root briefly over-broad (self-healing), and a
+  /// skipped grow merely leaves the newcomer briefly under-covered until the umbrella's own
+  /// bridging `Rescan` and a later re-issue converge — neither loses an event under a retained,
+  /// covered key, and neither emits a `Rescan`. A **no-op** for an unknown scope, an empty
+  /// `retained` (defensive — never prune the whole tree), and — naturally — a
+  /// **kernel-recursive** scope (fanotify / FSEvents): its single whole-subtree stream has no
+  /// per-directory children, so the prune walk finds only the root node (never strictly outside
+  /// its own retained descendants) and the grow's ancestor is the root, whose re-arm is a
+  /// documented no-op (its coverage never shrank). Each pruned watch's
+  /// [`RemoveWatch`](Effect::RemoveWatch) and each grown watch's [`AddWatch`](Effect::AddWatch) /
+  /// [`Enumerate`](Effect::Enumerate) flow through the ordinary descending paths, keeping the
+  /// reader's `wd` table and the core's addressing maps consistent exactly as delete-driven and
+  /// create-driven transitions do.
+  pub(crate) fn on_set_cover(&mut self, scope: ScopeId, retained: &[PathBuf]) {
     let Some(state) = self.scopes.get(&scope) else {
       return;
     };
@@ -680,6 +698,8 @@ impl DriverCore {
       return;
     }
     let root_watch = state.watch;
+
+    // --- PRUNE (the shrink half): drop every descended watch strictly OUTSIDE the cover ---
     // This scope's descended (non-root) watches strictly OUTSIDE every retained prefix,
     // shallowest first — so a maximal outside subtree is dropped at its top and its
     // deeper descendants are already gone (skipped by the `is_watched` guard) when
@@ -696,9 +716,6 @@ impl DriverCore {
         strictly_outside.then(|| (path.components().count(), *watch))
       })
       .collect();
-    if outside.is_empty() {
-      return;
-    }
     outside.sort_unstable_by_key(|(depth, _)| *depth);
     for (_, watch) in outside {
       // A node an ancestor's drop already reclaimed is no longer watched — skip it (the
@@ -707,8 +724,51 @@ impl DriverCore {
         self.monitor.drop_watch_subtree(watch);
       }
     }
-    // Turn the queued `Action::Unwatch`es into `RemoveWatch` effects and forget the
-    // pruned watches' addressing, exactly as a Monitor-driven drop does.
+
+    // --- GROW (the set-cover dual): re-arm any retained prefix the scope is NOT covering ---
+    // For each retained prefix with no live watch AT its own path (one an earlier, narrower
+    // cover pruned), re-arm the DEEPEST still-watched ancestor: the recursive re-arm re-reads
+    // it, re-installs the previously-pruned directory (and everything between), and cascades
+    // down — with no `Created` and no `Rescan`. Dedup by ancestor, so sibling retained prefixes
+    // sharing one ancestor re-arm it once.
+    let mut to_rearm: BTreeSet<WatchId> = BTreeSet::new();
+    for r in retained {
+      // Already covered iff a live watch of THIS scope sits at exactly this path.
+      let covered = self.watch_scopes.iter().any(|(watch, watch_scope)| {
+        *watch_scope == scope
+          && self
+            .watch_paths
+            .get(watch)
+            .is_some_and(|path| path.as_path() == r.as_path())
+      });
+      if covered {
+        continue;
+      }
+      // The deepest still-watched PROPER ancestor of `r` in this scope. The root is always an
+      // ancestor of every retained prefix, so this is `Some` for any prefix under the root;
+      // a `None` (a prefix somehow above/outside the root) simply grows nothing.
+      let deepest = self
+        .watch_scopes
+        .iter()
+        .filter(|(_, watch_scope)| **watch_scope == scope)
+        .filter_map(|(watch, _)| {
+          let path = self.watch_paths.get(watch)?;
+          (r.starts_with(path.as_path()) && path.as_path() != r.as_path())
+            .then(|| (path.components().count(), *watch))
+        })
+        .max_by_key(|(depth, _)| *depth);
+      if let Some((_, watch)) = deepest {
+        to_rearm.insert(watch);
+      }
+    }
+    for watch in to_rearm {
+      self.monitor.rearm_watch_subtree(watch);
+    }
+
+    // Turn the queued `Action::Unwatch`es (prune) into `RemoveWatch` effects and the queued
+    // `Action::Watch`/`Enumerate`s (grow) into `AddWatch`/`Enumerate` effects, and reconcile
+    // the addressing maps, exactly as Monitor-driven drops and descents do. A no-op when both
+    // halves queued nothing.
     self.drain_monitor();
   }
 

@@ -490,60 +490,62 @@ mod integration {
     );
   }
 
-  /// M2-B shrink QUEUE discipline (Codex R35): `FsSource::shrink` keeps at most ONE pending entry per
-  /// handle — LATEST-WINS, so a re-issued fresh cover REPLACES the older snapshot rather than trailing
-  /// behind it — and a cover that RETAINS THE ROOT'S OWN PATH cancels the pending shrink entirely (the
-  /// cancel-equivalent the umbrella re-issues when a Covered commit re-pins the root at its own key).
-  /// Asserted at the QUEUE level: the macOS watcher's `shrink` is a whole-subtree no-op, so what this
-  /// fixes is the FsSource bookkeeping the umbrella's freshness guarantee relies on, not a kernel prune
-  /// (this test never re-arms, so `Watcher::shrink` is never invoked).
+  /// M2-B set_cover QUEUE discipline (Codex R35/R36): `FsSource::set_cover` keeps at most ONE pending
+  /// entry per handle — LATEST-WINS, so a re-issued fresh cover REPLACES the older snapshot rather than
+  /// trailing behind it (this is what carries both a shrink-newer-cover AND a grow re-issue that once
+  /// again includes a previously-pruned subtree) — and a cover that RETAINS THE ROOT'S OWN PATH cancels
+  /// the pending entry entirely (the cancel-equivalent the umbrella re-issues when a Covered commit
+  /// re-pins the root at its own key). Asserted at the QUEUE level: the macOS watcher's `set_cover` is a
+  /// whole-subtree no-op, so what this fixes is the FsSource bookkeeping the umbrella's freshness
+  /// guarantee relies on, not a kernel reconcile (this test never re-arms, so `Watcher::set_cover` is
+  /// never invoked).
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn fs_source_shrink_is_latest_wins_and_root_cover_cancels() {
+  async fn fs_source_set_cover_is_latest_wins_and_root_cover_cancels() {
     let (_dir, root) = scratch();
     let root_key = path_components(&root);
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
-    // A live armed root — its handle is what `shrink` bookkeeps, and its registry path is what
+    // A live armed root — its handle is what `set_cover` bookkeeps, and its registry path is what
     // cancel-on-root-cover compares against.
     let armed = source.arm(&root_key).await.expect("arm the tempdir");
     let handle = armed.handle();
 
-    // Two nested subtree covers UNDER the root. Never created on disk: the shrink queue rebuilds paths
-    // from components (`key_to_path`) without touching the filesystem, and cancel-on-root-cover only
-    // reads the root's own registry path.
+    // Two nested subtree covers UNDER the root. Never created on disk: the set_cover queue rebuilds
+    // paths from components (`key_to_path`) without touching the filesystem, and cancel-on-root-cover
+    // only reads the root's own registry path.
     let b_key = path_components(&root.join("b"));
     let c_key = path_components(&root.join("c"));
 
-    // First shrink queues one entry.
-    source.shrink(handle, std::slice::from_ref(&b_key));
+    // First set_cover queues one entry.
+    source.set_cover(handle, std::slice::from_ref(&b_key));
     assert_eq!(
-      source.pending_shrinks.len(),
+      source.pending_set_covers.len(),
       1,
-      "one pending shrink after the first request"
+      "one pending set_cover after the first request"
     );
 
-    // A second shrink for the SAME handle REPLACES it (latest-wins): still one entry, now the fresh
-    // {b, c} cover — never the stale {b} snapshot the R35 finding was about.
-    source.shrink(handle, &[b_key.clone(), c_key.clone()]);
+    // A second set_cover for the SAME handle REPLACES it (latest-wins): still one entry, now the fresh
+    // {b, c} cover — never the stale {b} snapshot the R35/R36 findings were about.
+    source.set_cover(handle, &[b_key.clone(), c_key.clone()]);
     assert_eq!(
-      source.pending_shrinks.len(),
+      source.pending_set_covers.len(),
       1,
       "latest-wins keeps exactly one pending entry per handle"
     );
-    let (pending_handle, pending_paths) = &source.pending_shrinks[0];
+    let (pending_handle, pending_paths) = &source.pending_set_covers[0];
     assert_eq!(*pending_handle, handle, "the one entry is for our handle");
     assert_eq!(
       pending_paths,
       &vec![root.join("b"), root.join("c")],
-      "the pending cover is the FRESH {{b, c}} re-issue, not the stale {{b}} snapshot (Codex R35)"
+      "the pending cover is the FRESH {{b, c}} re-issue, not the stale {{b}} snapshot (Codex R35/R36)"
     );
 
     // A cover that includes the root's OWN path is the cancel-equivalent: it retains everything, so the
     // strictly-outside set is empty. The pending entry is dropped and NOTHING is queued.
-    source.shrink(handle, std::slice::from_ref(&root_key));
+    source.set_cover(handle, std::slice::from_ref(&root_key));
     assert!(
-      source.pending_shrinks.is_empty(),
-      "retaining the root's own path cancels the pending shrink and queues nothing \
+      source.pending_set_covers.is_empty(),
+      "retaining the root's own path cancels the pending set_cover and queues nothing \
        (cancel-on-root-cover)"
     );
   }

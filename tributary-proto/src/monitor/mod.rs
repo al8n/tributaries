@@ -496,6 +496,39 @@ impl Monitor {
     }
   }
 
+  /// Re-arms the live per-directory watch subtree rooted at `watch` — the in-place **grow**
+  /// that restores kernel coverage of a subtree an earlier [`drop_watch_subtree`](Self::drop_watch_subtree)
+  /// pruned but that a survivor now needs again (the bidirectional dual of that shrink prune,
+  /// set-cover / M2-B v2).
+  ///
+  /// It reuses the exact overflow re-arm machinery ([`start_rearm`](Self::start_rearm) →
+  /// [`rearm_enumerate`](Self::rearm_enumerate)): a complete re-arm read installs a fresh
+  /// watch for every present child directory currently lacking one — including one a prior
+  /// prune removed — and cascades the re-arm into it recursively, so the subtree rebuilds all
+  /// the way down. It emits **no** `Created` (a re-arm is coverage maintenance, not discovery)
+  /// and, on a complete read, **no** `Rescan`; an unreadable read stands a `Rescan` and
+  /// bounded-retries, exactly as an overflow re-arm does. The driver re-arms the deepest
+  /// still-watched ANCESTOR of a now-retained prefix, so the recursive re-arm reaches and
+  /// re-installs every previously-pruned directory between that ancestor and the leaf.
+  ///
+  /// A **no-op** (returning `false`) when `watch` is unknown/dead or its scope is
+  /// [`kernel_recursive`](Capabilities::kernel_recursive): a whole-subtree mark has no
+  /// per-directory children that could have been pruned, so there is nothing to re-arm (its
+  /// coverage never shrank). Returns `true` iff `watch` names a live node of a descending
+  /// scope, whose re-arm was started, coalesced onto an in-flight read, or marked to continue
+  /// after a pending arm — mirroring the state guards of
+  /// [`inherit_rearm`](Self::inherit_rearm).
+  pub fn rearm_watch_subtree(&mut self, watch: WatchId) -> bool {
+    let Some(scope) = self.scope_of(watch) else {
+      return false;
+    };
+    if !self.scope_descends(scope) {
+      return false;
+    }
+    self.inherit_rearm(watch);
+    true
+  }
+
   /// Ingests one normalized event.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn on_os_record(&mut self, rec: OsRecord, now: Instant) {

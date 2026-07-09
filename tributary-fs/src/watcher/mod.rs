@@ -535,30 +535,35 @@ impl<R: RuntimeLite> Watcher<R> {
     }
   }
 
-  /// Reclaims over-broad per-directory coverage of a watched root **in place**:
-  /// prunes every descended kernel watch strictly outside the `retained` cover — the
-  /// canonical absolute paths whose coverage must survive — while leaving the retained
-  /// subtrees and the connecting ancestors from the root down to each of them armed.
-  /// The retained watches are **never re-armed**, so their events keep flowing with **no
-  /// gap and no re-crawl**.
+  /// Reconciles a watched root's per-directory coverage to the `retained` cover **in place**,
+  /// **bidirectionally**: it prunes every descended kernel watch strictly outside the cover
+  /// — the canonical absolute paths whose coverage must survive — AND re-arms any retained
+  /// subtree an earlier, narrower cover pruned, while leaving every already-covered retained
+  /// subtree and the connecting ancestors from the root down to each of them armed. The
+  /// retained-and-covered watches are **never re-armed**, so their events keep flowing with
+  /// **no gap and no re-crawl**; only a previously-pruned corner is grown back.
   ///
-  /// A **best-effort optimization** the layer above uses to reclaim inotify watch budget
-  /// after a wide root outlived the consumer whose key equalled it (design M2-B): it only
-  /// ever removes coverage no consumer is subscribed under, emits **no**
-  /// [`Rescan`](crate::EventKind::Rescan), and is a **no-op** for a kernel-recursive
-  /// backend (fanotify / FSEvents), whose single whole-subtree stream has no
-  /// per-directory watches to prune. A watch is kept iff its path lies under a retained
-  /// prefix OR is an ancestor one descends from; only a watch strictly outside every
-  /// retained prefix is dropped. `retained` are the watcher's own canonical coordinates
-  /// (as [`root_path`](Self::root_path) reports), so they line up with the watches'
-  /// addressing.
+  /// A **best-effort optimization** the layer above uses to reclaim (and, when a survivor
+  /// returns, restore) inotify watch budget after a wide root outlived the consumer whose key
+  /// equalled it (design M2-B): it only ever removes coverage no consumer is subscribed under
+  /// and only ever re-arms coverage a survivor needs, emits **no**
+  /// [`Rescan`](crate::EventKind::Rescan), and is a **no-op** for a kernel-recursive backend
+  /// (fanotify / FSEvents), whose single whole-subtree stream has no per-directory watches to
+  /// prune or grow. A watch is kept by the prune iff its path lies under a retained prefix OR
+  /// is an ancestor one descends from; a retained prefix not currently covered is re-armed.
+  /// `retained` are the watcher's own canonical coordinates (as
+  /// [`root_path`](Self::root_path) reports), so they line up with the watches' addressing.
   ///
   /// # Errors
   ///
   /// - [`UnwatchError::UnknownRoot`] when `root` does not name a live root of THIS
   ///   watcher (never watched, already gone, or issued by a different watcher);
   /// - [`UnwatchError::Closed`] when the watcher is already closed.
-  pub async fn shrink(&self, root: RootHandle, retained: Vec<PathBuf>) -> Result<(), UnwatchError> {
+  pub async fn set_cover(
+    &self,
+    root: RootHandle,
+    retained: Vec<PathBuf>,
+  ) -> Result<(), UnwatchError> {
     // A foreign handle's scope number can name THIS watcher's unrelated root — reject
     // before anything is sent, exactly as `unwatch` does.
     if root.instance() != self.instance {
@@ -567,7 +572,7 @@ impl<R: RuntimeLite> Watcher<R> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self
       .commands
-      .send(Command::Shrink {
+      .send(Command::SetCover {
         scope: root.scope(),
         retained,
         reply,
@@ -580,8 +585,8 @@ impl<R: RuntimeLite> Watcher<R> {
     }
     match response.await {
       Ok(()) => Ok(()),
-      // The driver dropped the reply (it tore down): the prune may not have applied,
-      // but shrink is a best-effort optimization — surface the closed state like
+      // The driver dropped the reply (it tore down): the reconcile may not have applied,
+      // but set_cover is a best-effort optimization — surface the closed state like
       // `unwatch`, and the layer above simply keeps the (harmless) over-broad coverage.
       Err(_) => {
         self.driver_gone();

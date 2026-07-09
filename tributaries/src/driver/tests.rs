@@ -41,9 +41,9 @@ fn components(path: &Path) -> Vec<OsString> {
 enum Call {
   Arm(PathBuf),
   Disarm(u32),
-  /// An in-place coverage shrink request: the over-broad root handle and the retained cover
-  /// (the survivor antichain) the driver forwarded (design M2-B).
-  Shrink(u32, Vec<Vec<OsString>>),
+  /// An in-place bidirectional coverage-reconcile request: the root handle and the retained cover
+  /// (the survivor antichain) the driver forwarded (design M2-B / M2-B v2).
+  SetCover(u32, Vec<Vec<OsString>>),
 }
 
 /// A fake [`Source`] over `u32` handles: it records every arm/disarm in order (so a test
@@ -88,6 +88,13 @@ struct FakeSource {
   /// debug_assert tripwire. One-shot: consumed by the next arm that gets past the fail/overlap
   /// checks.
   reuse_next_handle: Option<u32>,
+  /// Each live handle's modelled ACTUAL kernel coverage as a retained antichain (M2-B v2, Codex
+  /// R36): the fake applies every [`set_cover`](Source::set_cover) IMMEDIATELY (unlike `FsSource`,
+  /// which queues) so a test can assert the source's true coverage after a shrink-then-grow. A
+  /// handle ABSENT here is at FULL coverage (its whole armed root — the fresh-arm default and the
+  /// cancel-equivalent); a `Some(cover)` covers exactly the union of the retained prefixes'
+  /// subtrees. Queried by [`actual_covers`](Self::actual_covers).
+  actual_cover: HashMap<u32, Vec<Vec<OsString>>>,
 }
 
 impl FakeSource {
@@ -102,6 +109,24 @@ impl FakeSource {
       retarget: HashMap::new(),
       canonicalize: HashMap::new(),
       reuse_next_handle: None,
+      actual_cover: HashMap::new(),
+    }
+  }
+
+  /// Whether the fake's modelled ACTUAL kernel coverage for `handle` includes `key` (M2-B v2): a
+  /// handle at FULL coverage (no recorded `set_cover`) covers everything under its armed root; a
+  /// narrowed handle covers exactly the union of its retained prefixes' subtrees. The regression
+  /// probe: after a shrink that pruned a subtree then a grow re-issue, the previously-pruned key is
+  /// covered again.
+  fn actual_covers(&self, handle: u32, key: &[OsString]) -> bool {
+    match self.actual_cover.get(&handle) {
+      Some(cover) => cover
+        .iter()
+        .any(|prefix| key.starts_with(prefix.as_slice())),
+      None => self
+        .canonical
+        .get(&handle)
+        .is_some_and(|root| key.starts_with(root.as_slice())),
     }
   }
 
@@ -248,13 +273,27 @@ impl Source<OsString> for FakeSource {
     self.live.remove(&handle);
   }
 
-  fn shrink(&mut self, handle: u32, retained: &[Vec<OsString>]) {
-    // Synchronous, fire-and-forget in-place coverage shrink REQUEST (design M2-B): record the
-    // over-broad root handle and the retained cover the driver forwarded, so a test can assert
-    // exactly one shrink with the survivor antichain fired (and none when the root is not
-    // over-broad). The fake keeps the root live — shrink reclaims coverage BELOW a root, never
-    // releases it — so `root_key` still answers, unlike `disarm`.
-    self.calls.push(Call::Shrink(handle, retained.to_vec()));
+  fn set_cover(&mut self, handle: u32, retained: &[Vec<OsString>]) {
+    // Synchronous, fire-and-forget in-place bidirectional coverage-reconcile REQUEST (design M2-B /
+    // M2-B v2): record the root handle and the retained cover the driver forwarded, so a test can
+    // assert exactly which covers fired and in what order. The fake keeps the root live — set_cover
+    // reconciles coverage BELOW a root, never releases it — so `root_key` still answers, unlike
+    // `disarm`. Unlike `FsSource` (which QUEUES and drains opportunistically), the fake APPLIES the
+    // reconcile immediately, so `actual_covers` reflects the source's true coverage right away: a
+    // cover including the root's own key is FULL coverage (drop the narrowing entry), else it narrows
+    // to exactly the retained antichain — this is what lets a test observe a pruned key regain
+    // coverage after the grow re-issue (Codex R36).
+    self.calls.push(Call::SetCover(handle, retained.to_vec()));
+    let root_is_covered = self.canonical.get(&handle).is_some_and(|root| {
+      retained
+        .iter()
+        .any(|prefix| prefix.as_slice() == root.as_slice())
+    });
+    if root_is_covered {
+      self.actual_cover.remove(&handle);
+    } else {
+      self.actual_cover.insert(handle, retained.to_vec());
+    }
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
@@ -653,10 +692,10 @@ async fn widen_emits_dominating_rescan_per_repointed_sub() {
 
 /// M2-B shrink-in-place call-site (design §5): unwatching the widening subscription of a root that
 /// widened over NESTED survivors leaves the armed root over-broad, so `release_subscription` forwards
-/// EXACTLY ONE `source.shrink` with the survivor antichain — and NO `disarm` (the root survives; shrink
+/// EXACTLY ONE `source.set_cover` with the survivor antichain — and NO `disarm` (the root survives; shrink
 /// reclaims coverage BELOW it, never releases it).
 #[tokio::test]
-async fn over_broad_unwatch_shrinks_root_in_place() {
+async fn over_broad_unwatch_set_covers_root_in_place() {
   let mut h = Harness::new();
 
   // Nested survivors under a to-be-wide root: /a/b and its covered child /a/b/c.
@@ -685,7 +724,7 @@ async fn over_broad_unwatch_shrinks_root_in_place() {
       .source
       .calls()
       .iter()
-      .any(|c| matches!(c, Call::Shrink(handle, _) if *handle == wide)),
+      .any(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide)),
     "no shrink of the wide root before the over-broadening unwatch"
   );
 
@@ -696,11 +735,11 @@ async fn over_broad_unwatch_shrinks_root_in_place() {
     .source
     .calls()
     .into_iter()
-    .filter(|c| matches!(c, Call::Shrink(handle, _) if *handle == wide))
+    .filter(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide))
     .collect();
   assert_eq!(
     shrinks,
-    vec![Call::Shrink(wide, vec![key("/a/b")])],
+    vec![Call::SetCover(wide, vec![key("/a/b")])],
     "exactly one shrink of the wide root to the nested-survivor antichain /a/b (not the raw \
      {{/a/b, /a/b/c}})"
   );
@@ -719,7 +758,7 @@ async fn over_broad_unwatch_shrinks_root_in_place() {
 /// covered subscription leaves the root still pinned by its own equal-key subscriber, so
 /// `release_subscription` forwards no shrink.
 #[tokio::test]
-async fn narrow_unwatch_does_not_shrink() {
+async fn narrow_unwatch_does_not_set_cover() {
   let mut h = Harness::new();
 
   let _s_a = h.watch("/a", Interest::all()).await.expect("watch /a");
@@ -735,7 +774,7 @@ async fn narrow_unwatch_does_not_shrink() {
     .source
     .calls()
     .into_iter()
-    .filter(|c| matches!(c, Call::Shrink(..)))
+    .filter(|c| matches!(c, Call::SetCover(..)))
     .collect();
 
   // Drop the narrower /a/b: the root /a is still watched by its own /a subscriber — not over-broad.
@@ -746,7 +785,7 @@ async fn narrow_unwatch_does_not_shrink() {
     .source
     .calls()
     .into_iter()
-    .filter(|c| matches!(c, Call::Shrink(..)))
+    .filter(|c| matches!(c, Call::SetCover(..)))
     .collect();
   assert_eq!(
     shrinks_before, shrinks_after,
@@ -761,7 +800,7 @@ async fn narrow_unwatch_does_not_shrink() {
 /// shape is exactly what makes one call uniform across every release path (caller unwatch, orphan,
 /// teardown) with no async-seam split.
 #[tokio::test]
-async fn over_broad_droporphan_also_shrinks() {
+async fn over_broad_droporphan_also_set_covers() {
   let mut h = Harness::new();
 
   let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
@@ -785,11 +824,11 @@ async fn over_broad_droporphan_also_shrinks() {
     .source
     .calls()
     .into_iter()
-    .filter(|c| matches!(c, Call::Shrink(..)))
+    .filter(|c| matches!(c, Call::SetCover(..)))
     .collect();
   assert_eq!(
     shrinks,
-    vec![Call::Shrink(wide, vec![key("/a/b")])],
+    vec![Call::SetCover(wide, vec![key("/a/b")])],
     "the orphan release shrinks the over-broad root too (uniform sync call-site)"
   );
 }
@@ -800,7 +839,7 @@ async fn over_broad_droporphan_also_shrinks() {
 /// {/a/b, /a/c} cover — never leaving the stale {/a/b} that a later arm would apply, pruning /a/c's
 /// coverage while the subsumer advertises it live (the R35 silent loss); and a final `watch /a`
 /// (Covered, key == root) re-issues the cancel-equivalent {/a}, retaining the whole root so nothing is
-/// reclaimed. Each is a distinct forwarded `source.shrink` — the source's LATEST-WINS discipline makes
+/// reclaimed. Each is a distinct forwarded `source.set_cover` — the source's LATEST-WINS discipline makes
 /// the last one per handle the one actually applied.
 ///
 /// Fail-on-old: without the Covered-commit re-issue, only the first shrink ({/a/b}) is ever sent; the
@@ -830,7 +869,7 @@ async fn covered_commit_reissues_fresh_retained_cover() {
       .source
       .calls()
       .iter()
-      .any(|c| matches!(c, Call::Shrink(handle, _) if *handle == wide)),
+      .any(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide)),
     "no shrink of the wide root before any over-broadening drop or covered commit"
   );
 
@@ -853,14 +892,14 @@ async fn covered_commit_reissues_fresh_retained_cover() {
     .source
     .calls()
     .into_iter()
-    .filter(|c| matches!(c, Call::Shrink(handle, _) if *handle == wide))
+    .filter(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide))
     .collect();
   assert_eq!(
     shrinks,
     vec![
-      Call::Shrink(wide, vec![key("/a/b")]),
-      Call::Shrink(wide, vec![key("/a/b"), key("/a/c")]),
-      Call::Shrink(wide, vec![key("/a")]),
+      Call::SetCover(wide, vec![key("/a/b")]),
+      Call::SetCover(wide, vec![key("/a/b"), key("/a/c")]),
+      Call::SetCover(wide, vec![key("/a")]),
     ],
     "each Covered commit re-issues the CURRENT retained cover: the {{/a/b}} survivor drop, then the \
      FRESH {{/a/b, /a/c}} (never the stale {{/a/b}}), then the cancel-equivalent {{/a}} once /a \
@@ -871,8 +910,122 @@ async fn covered_commit_reissues_fresh_retained_cover() {
   assert!(
     shrinks
       .iter()
-      .any(|c| matches!(c, Call::Shrink(_, cover) if cover.contains(&key("/a/c")))),
+      .any(|c| matches!(c, Call::SetCover(_, cover) if cover.contains(&key("/a/c")))),
     "the covered /a/c commit re-issued a cover that includes /a/c (freshness, not the stale snapshot)"
+  );
+}
+
+/// M2-B v2 Covered-OUTSIDE bridge + grow, end to end at the driver (Codex R36): after an applied
+/// set_cover NARROWED a wide root's ACTUAL coverage below a key, a later watch of that pruned key is
+/// `Covered` (arms nothing) yet the source no longer backs it — silent loss unless bridged. The driver
+/// must, as one composition: (i) PARK a dominating Rescan for the newcomer's OWN key (bridging the
+/// commit→grow gap — suppressed while the grant is unclaimed, delivered once claimed); (ii) re-issue a
+/// `set_cover` whose FRESH cover INCLUDES the newcomer (the grow trigger); and (iii) the source's ACTUAL
+/// coverage then includes the newcomer again while the retained survivor never lost coverage.
+///
+/// Fail-on-old: a prune-only shrink cannot restore coverage, so the newcomer would commit over a hole
+/// with no Rescan behind it — the exact R36 silent loss this closes.
+#[tokio::test]
+async fn covered_outside_narrowed_root_parks_bridge_and_grows_coverage() {
+  let mut h = Harness::new();
+
+  // Wide /a over a disjoint survivor /a/b, then drop the widening /a → over-broad → set_cover narrows
+  // the wide root's ACTUAL coverage to {/a/b}; /a/c is now strictly outside it (pruned at the source).
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+  h.unwatch(s_a).expect("unwatch the widening /a");
+
+  // Precondition — the source's actual coverage was narrowed: /a/b stays covered, /a/c does NOT.
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/b")),
+    "the retained /a/b survivor stays covered after the shrink"
+  );
+  assert!(
+    !h.owner.source.actual_covers(wide, &key("/a/c")),
+    "the pruned /a/c is NOT covered before the newcomer (the narrowed source state)"
+  );
+
+  let set_covers_before = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide))
+    .count();
+
+  // Watch /a/c: Covered under the still-armed wide /a, but OUTSIDE the narrowed cover {/a/b}.
+  let s_c = h
+    .watch("/a/c", Interest::all())
+    .await
+    .expect("watch /a/c covered-outside");
+
+  // (i) A dominating bridging Rescan is PARKED for the newcomer, naming its OWN key /a/c.
+  let parked = h
+    .owner
+    .needs_rescan
+    .get(&s_c)
+    .expect("a bridging Rescan is parked for the covered-outside newcomer");
+  assert_eq!(
+    parked.key,
+    key("/a/c"),
+    "the bridge Rescan re-enumerates the newcomer's own key"
+  );
+  // ...suppressed while the grant is unclaimed, then delivered once claimed. Clear any pre-existing
+  // stream events first (the widen re-pointed /a/b's Rescan) so the probe sees only the bridge.
+  let _ = h.drain();
+  h.owner.unclaimed.insert(s_c);
+  h.owner.flush_pending_rescans();
+  assert!(
+    h.drain().is_empty(),
+    "the parked bridge Rescan is suppressed while the newcomer's grant is unclaimed"
+  );
+  h.owner.unclaimed.remove(&s_c); // the caller claims the grant
+  h.owner.flush_pending_rescans();
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == s_c && e.is_rescan() && e.key() == key("/a/c").as_slice()),
+    "the bridge Rescan delivers to the newcomer once its grant is claimed"
+  );
+
+  // (ii) The Covered-outside commit re-issued a set_cover whose FRESH cover INCLUDES the newcomer.
+  let set_covers_after: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide))
+    .collect();
+  assert!(
+    set_covers_after.len() > set_covers_before,
+    "the covered-outside commit re-issued a set_cover (the grow trigger)"
+  );
+  assert!(
+    set_covers_after
+      .iter()
+      .any(|c| matches!(c, Call::SetCover(_, cover) if cover.contains(&key("/a/c")))),
+    "the re-issued cover INCLUDES the newcomer /a/c — the grow, never the stale {{/a/b}}"
+  );
+
+  // (iii) The source's ACTUAL coverage grew back to include /a/c, and /a/b never lost coverage.
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/c")),
+    "the source grew its actual coverage back to include the newcomer /a/c (Codex R36)"
+  );
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/b")),
+    "the retained /a/b never lost coverage across the grow (no gap, no re-crawl)"
   );
 }
 

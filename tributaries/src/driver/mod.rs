@@ -484,9 +484,9 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// If instead the drop leaves a shared root **over-broad** — the departing subscription's key
   /// equalled the root's own key and every survivor sits under a narrower key — the root stays armed
   /// for its survivors, and the excess kernel coverage is reclaimed **in place** via the synchronous
-  /// fire-and-forget [`Source::shrink`] (design §5, M2-B): survivor coverage never moves, so there is
-  /// no gap and no re-crawl. Over-broadness is correctness-neutral and self-healing, so this is a pure
-  /// budget-reclaim optimization the source may apply, defer, or ignore.
+  /// fire-and-forget bidirectional [`Source::set_cover`] (design §5, M2-B): survivor coverage never
+  /// moves, so there is no gap and no re-crawl. Over-broadness is correctness-neutral and self-healing,
+  /// so this is a pure budget-reclaim optimization the source may apply, defer, or ignore.
   ///
   /// Sends an unwatch command to the owner and awaits its reply; dropping the
   /// returned future drops only the wait.
@@ -1244,37 +1244,63 @@ where
       break outcome;
     };
     match &outcome {
-      WatchOutcome::Covered { fs_root, sub } => {
+      WatchOutcome::Covered {
+        fs_root,
+        sub,
+        outside_cover,
+      } => {
         // Already covered by a root the re-plan loop just validated LIVE: no arm. The newcomer's
         // key was canonicalized at the top of this method (the single choke point), so committing
         // it verbatim keys the subscription on the source's canonical coordinate — the one its
         // events arrive under — closing the old Covered-path silent-loss where a raw non-canonical
         // key was committed and then never matched a canonical event (Codex R14 F1).
-        let (fs_root, sub) = (*fs_root, *sub);
+        let (fs_root, sub, outside_cover) = (*fs_root, *sub, *outside_cover);
         self.subsumer.commit_watch(&outcome, fs_root, key);
         self.filters.insert(sub, filter);
-        // A `Covered` commit changes the covering root's membership WITHOUT any [`Source`] call (it
-        // arms nothing), so a shrink the umbrella has already queued for this root at the source can go
-        // stale — its retained snapshot predates this newcomer. Left unrefreshed, that queued cover
-        // would later prune the coverage this newcomer needs, SILENTLY (a shrink emits no `Rescan` by
-        // contract — Codex R35). So re-issue the CURRENT retained cover, relying on the source to apply
-        // the LATEST request per handle and never an older one: `Some` is the freshened antichain of
-        // all live subscribers' keys; `None` means a subscriber now pins the root at its own key, so we
-        // re-issue the CANCEL-equivalent — retaining the root's OWN key, whose strictly-outside set is
-        // empty, which cancels any pending shrink. Only `Covered` needs this re-issue: `Widen` releases
-        // the old handle, so its pending shrink is dropped by supersede-by-release; `Disjoint` mints a
-        // fresh root, so nothing is pending. Like `disarm`/`shrink` everywhere, this is synchronous
-        // fire-and-forget — a no-op source conforms (over-broadness is self-healing).
+        // (a) Covered-OUTSIDE bridge (M2-B v2, Codex R36): the covering root's source coverage was
+        // NARROWED below this newcomer's key by an earlier applied set_cover, so this `Covered`
+        // commit — which arms nothing — regains NO real kernel coverage until the grow re-issue (b)
+        // below reaches the source and reconciles it back up. Park a dominating `Rescan` for the
+        // newcomer to bridge that commit→grow-applied gap, so nothing under its key is silently lost
+        // in the interim: `park_rescan` mints a non-rebasing strictly-dominating shed epoch on the
+        // sub, merges it into `needs_rescan` carrying the sub's own key + baked value, and is
+        // suppressed-while-unclaimed like any parked debt (delivered once the caller claims the
+        // grant, driving a re-enumeration of the subtree). When the newcomer is already inside the
+        // retained cover, or the root was never narrowed (`outside_cover == false`), the source
+        // already backs it and no bridge is owed. On a whole-subtree source this is the ONE benign
+        // spurious newcomer `Rescan` (its actual coverage never shrank, so the grow (b) is a no-op).
+        if outside_cover {
+          self.park_rescan(sub);
+        }
+        // (b) Freshness re-issue AND the grow trigger (Codex R35 + R36): a `Covered` commit changes
+        // the covering root's membership WITHOUT any [`Source`] call (it arms nothing), so a queued
+        // set_cover can go stale — its retained snapshot predates this newcomer. Re-issue the CURRENT
+        // retained cover, whose freshened antichain now INCLUDES this newcomer, relying on the source
+        // to apply the LATEST request per handle: that is BOTH the R35 freshness guarantee (a stale
+        // snapshot can never prune the newcomer's coverage — a set_cover emits no `Rescan`, so the
+        // loss would be silent) AND the R36 GROW (the source reconciles its actual coverage UP to the
+        // fresh cover, re-arming the newcomer's previously-pruned subtree). `Some` is the antichain of
+        // all live subscribers' keys; `None` means a subscriber now pins the root at its own key, so
+        // re-issue the CANCEL-equivalent — the root's OWN key (full coverage), which cancels any
+        // pending set_cover. Update the retained bookkeeping to EXACTLY what was issued, so a later
+        // `plan_watch` reads the source's true coverage. Only `Covered` needs this: `Widen` mints a
+        // fresh wide root (full coverage, its subsumed handles' set_covers dropped by
+        // supersede-by-release); `Disjoint` mints a fresh root, so nothing is pending. Synchronous
+        // fire-and-forget like `disarm`/`set_cover` everywhere — a no-op source conforms.
         match self.subsumer.retained_cover_for(fs_root) {
-          Some(cover) => self.source.shrink(fs_root, &cover),
+          Some(cover) => {
+            self.source.set_cover(fs_root, &cover);
+            self.subsumer.set_retained_cover(fs_root, Some(cover));
+          }
           None => {
             if let Some(root_key) = self
               .subsumer
               .entry(fs_root)
               .map(|record| record.key.clone())
             {
-              self.source.shrink(fs_root, &[root_key]);
+              self.source.set_cover(fs_root, &[root_key]);
             }
+            self.subsumer.set_retained_cover(fs_root, None);
           }
         }
         Ok(sub)
@@ -1531,14 +1557,18 @@ where
         shrink: Some((handle, retained)),
       } => {
         // The root survives for narrower subscribers but is now over-broad — it covers the whole
-        // wide key while every live subscriber sits under `retained`. Request the source SHRINK its
-        // kernel coverage in place down to the retained cover: a synchronous fire-and-forget request
-        // modeled exactly on [`Source::disarm`], so it is uniform and safe on EVERY release path
-        // (caller unwatch AND the [`Cleanup::DropOrphan`] orphan AND source-drain teardown) with no
-        // async-seam split — the sync nature is what licenses one call at the one release primitive.
-        // It reclaims the wide root's watch budget with no gap and no re-crawl; a no-op source (the
-        // default) conforms, since over-broadness is correctness-neutral and self-healing.
-        self.source.shrink(handle, &retained);
+        // wide key while every live subscriber sits under `retained`. Request the source reconcile
+        // its kernel coverage in place down to the retained cover via the bidirectional
+        // [`Source::set_cover`]: a synchronous fire-and-forget request modeled exactly on
+        // [`Source::disarm`], so it is uniform and safe on EVERY release path (caller unwatch AND the
+        // [`Cleanup::DropOrphan`] orphan AND source-drain teardown) with no async-seam split — the
+        // sync nature is what licenses one call at the one release primitive. It reclaims the wide
+        // root's watch budget with no gap and no re-crawl; a no-op source (the default) conforms,
+        // since over-broadness is correctness-neutral and self-healing. Record the issued cover in the
+        // subsumer's retained bookkeeping (M2-B v2, Codex R36), so a later `Covered` newcomer under a
+        // now-pruned region is classified `outside_cover` and gets its bridging `Rescan`.
+        self.source.set_cover(handle, &retained);
+        self.subsumer.set_retained_cover(handle, Some(retained));
       }
       // Not over-broad: the root is exactly as wide as a live subscriber still needs it.
       UnwatchOutcome::Dropped { shrink: None } => {}
@@ -1778,11 +1808,17 @@ where
     }
   }
 
-  /// Sheds `sub` to a parked dominating [`Rescan`](tributary_fs::EventKind::Rescan) after an
-  /// **ordinary delta** to it found the channel full (design backpressure doc): the
-  /// per-subscription overflow shed, mirroring the fs layer's `LagState::Lagged` one level up. An
+  /// Sheds `sub` to a parked dominating [`Rescan`](tributary_fs::EventKind::Rescan) — the
+  /// per-subscription overflow shed after an **ordinary delta** to it found the channel full
+  /// (design backpressure doc), mirroring the fs layer's `LagState::Lagged` one level up. An
   /// already-minted `Rescan` that overflows takes [`park_rescan_event`](Self::park_rescan_event)
   /// instead (parked unchanged at its own epoch, never re-minted).
+  ///
+  /// It is also the **Covered-outside bridge** (M2-B v2, Codex R36): a newcomer `Covered` under a
+  /// root whose source coverage was narrowed below its key parks a dominating `Rescan` here to
+  /// cover the commit→grow-applied gap, re-enumerating its subtree once the grow re-issue lands. The
+  /// mechanism is identical — a fresh dominating shed epoch owing the sub a re-enumeration of its
+  /// own key — so the one primitive serves both.
   ///
   /// Looks up `sub`'s covered key (the subtree the consumer must re-enumerate) and its recorded
   /// caller value, mints a **non-rebasing** strictly-dominating epoch
