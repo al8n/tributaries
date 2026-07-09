@@ -490,6 +490,17 @@ struct ScopeState {
   /// once the birth refresh confirms the root alive and re-armed by
   /// [`on_timeout`](DriverCore::on_timeout) after each tick fires.
   liveness_deadline: Option<Instant>,
+  /// The retained cover this scope's per-directory coverage was last reconciled to by
+  /// [`on_set_cover`](DriverCore::on_set_cover) — `None` is FULL coverage (the initial,
+  /// never-pruned state). The broadening delta a later set-cover must re-arm is computed
+  /// against THIS previously-applied cover ([`broadening_delta`]), never against which
+  /// watches happen to exist: a narrower cover deliberately keeps the connecting ANCESTORS
+  /// of its retained prefixes armed while pruning their other descendants, so an exact-path
+  /// "is a watch present at this prefix" test would wrongly read a retained ancestor as
+  /// fully covered and skip re-arming the descendants the earlier cover pruned — silent loss
+  /// after the bridge Rescan's crawl (Codex R37-F1). Set on every successful `on_set_cover`;
+  /// initialized `None`.
+  applied_cover: Option<Vec<PathBuf>>,
 }
 
 impl ScopeState {
@@ -628,6 +639,7 @@ impl DriverCore {
         resume_poisoned: false,
         publicly_live: false,
         liveness_deadline: None,
+        applied_cover: None,
       },
     );
     self.watch_scopes.insert(watch, scope);
@@ -698,6 +710,9 @@ impl DriverCore {
       return;
     }
     let root_watch = state.watch;
+    // The cover the previous reconcile settled on: the grow keys its re-arm on the delta
+    // against THIS, not on which watches survive (Codex R37-F1).
+    let prev_cover = state.applied_cover.clone();
 
     // --- PRUNE (the shrink half): drop every descended watch strictly OUTSIDE the cover ---
     // This scope's descended (non-root) watches strictly OUTSIDE every retained prefix,
@@ -725,35 +740,29 @@ impl DriverCore {
       }
     }
 
-    // --- GROW (the set-cover dual): re-arm any retained prefix the scope is NOT covering ---
-    // For each retained prefix with no live watch AT its own path (one an earlier, narrower
-    // cover pruned), re-arm the DEEPEST still-watched ancestor: the recursive re-arm re-reads
-    // it, re-installs the previously-pruned directory (and everything between), and cascades
-    // down — with no `Created` and no `Rescan`. Dedup by ancestor, so sibling retained prefixes
-    // sharing one ancestor re-arm it once.
+    // --- GROW (the set-cover dual): re-arm the BROADENING DELTA against the PREVIOUS cover ---
+    // A retained prefix is re-armed iff the previously-applied cover did NOT already cover it
+    // ([`broadening_delta`]): its subtree was pruned under that cover, so a watch may still sit
+    // at its own path merely as a connecting ANCESTOR while its descendants are gone. Keying on
+    // the delta rather than on exact-path watch presence is exactly what re-arms those pruned
+    // descendants when growing back to a retained ancestor (`/a/b/deep` → `/a/b`) or to the
+    // whole root (Codex R37-F1). For each delta prefix, re-arm the DEEPEST still-watched
+    // ancestor-OR-SELF: its recursive re-arm re-reads that directory, re-installs every
+    // previously-pruned directory beneath it, and cascades down — with no `Created` and no
+    // `Rescan`. Dedup by target watch, so sibling delta prefixes sharing one ancestor re-arm
+    // it once.
     let mut to_rearm: BTreeSet<WatchId> = BTreeSet::new();
-    for r in retained {
-      // Already covered iff a live watch of THIS scope sits at exactly this path.
-      let covered = self.watch_scopes.iter().any(|(watch, watch_scope)| {
-        *watch_scope == scope
-          && self
-            .watch_paths
-            .get(watch)
-            .is_some_and(|path| path.as_path() == r.as_path())
-      });
-      if covered {
-        continue;
-      }
-      // The deepest still-watched PROPER ancestor of `r` in this scope. The root is always an
-      // ancestor of every retained prefix, so this is `Some` for any prefix under the root;
-      // a `None` (a prefix somehow above/outside the root) simply grows nothing.
+    for r in broadening_delta(prev_cover.as_deref(), retained) {
+      // The deepest still-watched ancestor-or-self of `r` in this scope. The root is always an
+      // ancestor of every retained prefix, so a prefix under the root always finds one; a `None`
+      // (a prefix somehow above/outside the root) simply grows nothing.
       let deepest = self
         .watch_scopes
         .iter()
         .filter(|(_, watch_scope)| **watch_scope == scope)
         .filter_map(|(watch, _)| {
           let path = self.watch_paths.get(watch)?;
-          (r.starts_with(path.as_path()) && path.as_path() != r.as_path())
+          r.starts_with(path.as_path())
             .then(|| (path.components().count(), *watch))
         })
         .max_by_key(|(depth, _)| *depth);
@@ -770,6 +779,14 @@ impl DriverCore {
     // the addressing maps, exactly as Monitor-driven drops and descents do. A no-op when both
     // halves queued nothing.
     self.drain_monitor();
+
+    // Record the cover just applied: the NEXT set-cover computes its broadening delta against it
+    // (Codex R37-F1). Stored verbatim; `broadening_delta` treats the init `None` as full, and a
+    // full-root cover (retained = the root's own path) yields an empty delta for any later shrink
+    // exactly as `None` would.
+    if let Some(state) = self.scopes.get_mut(&scope) {
+      state.applied_cover = Some(retained.to_vec());
+    }
   }
 
   /// Feeds the blocking spawn's outcome for `scope`'s stream.
@@ -2189,6 +2206,28 @@ fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
     (Some(root_mnt), Some(entry_mnt)) if root_mnt != entry_mnt
   );
   device_boundary || mount_boundary
+}
+
+/// The retained prefixes in `new` the PREVIOUS applied cover `prev` did not already cover —
+/// the broadening delta a set-cover must re-arm (Codex R37-F1). `prev == None` is the FULL
+/// (never-pruned) cover: it covers everything, so nothing is broadening and the delta is empty.
+/// Otherwise a retained prefix `r` is broadening iff NO member of `prev` is a prefix of it: its
+/// subtree was pruned under `prev` (only its connecting ancestors were kept armed), so it must
+/// be re-armed regardless of whether a watch survives at its own path. A prefix INSIDE some
+/// previously-retained subtree (`r.starts_with(p)`) was never pruned and is skipped.
+///
+/// A pure function of the two covers — the coverage-restore decision in isolation, unit-tested
+/// cross-platform. The caller resolves each broadening prefix to the deepest still-watched
+/// ancestor-or-self and re-arms it.
+fn broadening_delta<'a>(prev: Option<&[PathBuf]>, new: &'a [PathBuf]) -> Vec<&'a Path> {
+  let Some(prev) = prev else {
+    return Vec::new();
+  };
+  new
+    .iter()
+    .filter(|r| !prev.iter().any(|p| r.starts_with(p)))
+    .map(PathBuf::as_path)
+    .collect()
 }
 
 /// The move cookie for a rename half, minted ONLY from contemporaneous probe
