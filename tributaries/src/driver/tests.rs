@@ -3300,3 +3300,294 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     "the transport teardown is still pending — an FsSource-shaped deferred release"
   );
 }
+
+/// Codex R23-F1 regression, NORMAL loop (design driver-golden doc, invariant I1 / no false debt):
+/// the run loop's top-of-iteration parked-Rescan flush is **gated on an idle command mailbox**, so a
+/// queued [`DropOrphan`](super::Command::DropOrphan) is serviced — purging its sub's parked terminal
+/// [`Rescan`](tributary_fs::EventKind::Rescan) — BEFORE any parked debt is offered. Without the gate
+/// an orphaned (committed-but-unclaimed, then dropped) subscription's parked terminal Rescan is
+/// flushed to the event stream ahead of the `DropOrphan` that purges it — an event for a subscription
+/// the caller never obtained.
+///
+/// Exercises the REAL spawned [`run`](super::run) loop over a source that arms the watched root live,
+/// then on a trigger delivers a terminal event for that root AFTER killing it — and, in the same
+/// synchronous terminal-retire step (its `root_key` probe), drops the held reply receiver so the
+/// grant's `Drop` enqueues the `DropOrphan` exactly between the park and the next loop-top flush. The
+/// event channel has CAPACITY (unbounded), so the flush *would* deliver — a full channel would mask
+/// the race (the R20-F2 lingering-half test kept it full).
+///
+/// Fail-on-old: with the flush ungated, the parked Rescan is delivered and the drained stream is
+/// non-empty — the assertion flips.
+#[tokio::test]
+async fn queued_drop_orphan_is_serviced_before_the_loop_flushes_its_parked_rescan() {
+  /// The Watch's reply receiver: the owner sends the committed [`WatchGrant`](super::WatchGrant) into
+  /// it; the source holds it and drops it during the terminal-retire, so the grant's `Drop` enqueues
+  /// the `DropOrphan`.
+  type ReplyRx =
+    futures_channel::oneshot::Receiver<Result<super::WatchGrant<OsString, ()>, WatchError>>;
+
+  /// A source that arms `/a` live, then — on the trigger carrying the Watch's reply receiver —
+  /// delivers a terminal `Rescan` for it after killing the root. When `retire_if_dead` probes
+  /// `root_key` for the now-dead handle, it drops the held reply receiver, so the grant's `Drop`
+  /// enqueues the `DropOrphan` synchronously between the retire's park and the next loop-top flush
+  /// (the exact R23-F1 interleaving). After the one terminal event `next` parks, so the loop stays
+  /// alive to answer `Close`.
+  struct TerminalRetireSource {
+    next_handle: u32,
+    live: HashMap<u32, Vec<OsString>>,
+    trigger: async_channel::Receiver<ReplyRx>,
+    held_reply: std::sync::Mutex<Option<ReplyRx>>,
+    delivered_terminal: bool,
+  }
+
+  impl Source<OsString> for TerminalRetireSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      self.next_handle += 1;
+      let handle = self.next_handle;
+      self.live.insert(handle, key.to_vec());
+      Ok(Armed::new(handle, key.to_vec()))
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.live.remove(&handle);
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      if self.delivered_terminal {
+        // The one terminal event is delivered; park so the loop survives to answer `Close`.
+        std::future::pending::<Option<SourceEvent<OsString, u32>>>().await
+      } else {
+        let reply_rx = match self.trigger.recv().await {
+          Ok(rx) => rx,
+          Err(_) => return None,
+        };
+        *self.held_reply.lock().unwrap() = Some(reply_rx);
+        // Kill the watched root so the terminal-retire's `root_key` probe reports it dead …
+        self.live.clear();
+        self.delivered_terminal = true;
+        // … and deliver its terminal Rescan, which drives the retire-and-park.
+        Some(rescan_event(1, "/a", 0))
+      }
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      match self.live.get(&handle) {
+        Some(k) => Some(k.clone()),
+        None => {
+          // The dead-root terminal-retire probe: drop the held reply receiver NOW so the grant's
+          // `Drop` enqueues the `DropOrphan` synchronously — after `source.next()` won this iteration
+          // with the terminal event, and before the next loop-top flush could offer the parked
+          // Rescan. Idempotent: a later dead probe finds `None`.
+          drop(self.held_reply.lock().unwrap().take());
+          None
+        }
+      }
+    }
+  }
+
+  let (event_tx, event_rx) = async_channel::unbounded::<Event<OsString, ()>>();
+  let (command_tx, command_rx) = async_channel::unbounded::<super::Command<OsString, ()>>();
+  let (trigger_tx, trigger_rx) = async_channel::unbounded::<ReplyRx>();
+  let owner = Owner {
+    source: TerminalRetireSource {
+      next_handle: 0,
+      live: HashMap::new(),
+      trigger: trigger_rx,
+      held_reply: std::sync::Mutex::new(None),
+      delivered_terminal: false,
+    },
+    subsumer: Subsumer::new(),
+    epochs: EpochLedger::new(),
+    filters: HashMap::new(),
+    needs_rescan: BTreeMap::new(),
+    coalescer: None,
+    commands_weak: command_tx.downgrade(),
+    commands: command_rx,
+    events: event_tx,
+    #[cfg(debug_assertions)]
+    observed_handles: std::collections::HashSet::new(),
+    _rt: PhantomData::<TokioRuntime>,
+  };
+  let run = tokio::spawn(super::run(owner));
+
+  // A hand-built Watch whose reply receiver is HELD UNPOLLED — the grant lands in the reply slot
+  // (committed-but-unclaimed). The receiver is handed to the source (via the trigger) so it can drop
+  // it during the terminal-retire.
+  let (reply, reply_rx) = futures_channel::oneshot::channel();
+  command_tx
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      interest: Interest::all(),
+      filter: Filter::all(),
+      reply,
+    })
+    .expect("enqueue the Watch");
+  // Hand the reply receiver to the source and trigger the terminal event: the loop commits the watch,
+  // then delivers the terminal event — retire-and-park AND, in the same synchronous step, enqueue the
+  // DropOrphan — then services the DropOrphan (the gate defers the flush), purging the parked Rescan.
+  trigger_tx
+    .try_send(reply_rx)
+    .expect("hand the reply receiver to the source");
+
+  // Give the loop a beat to run those iterations to quiescence.
+  tokio::time::sleep(Duration::from_millis(250)).await;
+
+  // `close()` still completes (the loop is Close-responsive by construction).
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  command_tx
+    .try_send(super::Command::Close { reply: close_reply })
+    .expect("enqueue the Close");
+  let acked = tokio::time::timeout(Duration::from_secs(5), close_response)
+    .await
+    .expect("close() completes within the deadline")
+    .expect("the close reply channel stays open");
+  assert!(matches!(acked, Ok(())), "close() succeeds");
+
+  // The event stream carries NO event for the orphaned subscription: its parked terminal Rescan was
+  // purged by the DropOrphan BEFORE any flush could offer it. Fail-on-old: without the gate the flush
+  // delivered it, so the drain is non-empty.
+  let mut delivered = Vec::new();
+  while let Ok(event) = event_rx.try_recv() {
+    delivered.push(event);
+  }
+  assert!(
+    delivered.is_empty(),
+    "the orphan's parked terminal Rescan was purged before any flush — no event for a subscription \
+     the caller never obtained (got {} event(s))",
+    delivered.len()
+  );
+
+  tokio::time::timeout(Duration::from_secs(5), run)
+    .await
+    .expect("the run task joins after Close")
+    .expect("the run task did not panic");
+}
+
+/// Codex R23-F1 regression, SOURCE-DRAIN teardown (design backpressure doc, no false debt / no
+/// silent loss): [`drain_owed_before_shutdown`](super::Owner::drain_owed_before_shutdown) now
+/// **pre-drains queued cleanup** before each owed-Rescan pass, so a
+/// [`DropOrphan`](super::Command::DropOrphan) queued when the source drains purges its terminal-
+/// retired sub's parked Rescan BEFORE the pass could flush it — while a DIFFERENT live sub's owed
+/// Rescan is still delivered (the no-silent-loss half must not regress). The event channel has
+/// CAPACITY, so the pass *would* deliver the orphan's Rescan (a full channel masks the race).
+///
+/// Fail-on-old: without the pre-drain the first `drain_owed_once` flushes BOTH parked Rescans (the
+/// channel has room) and returns before the DropOrphan is ever serviced — the orphan's Rescan is
+/// delivered and the assertion flips.
+#[tokio::test]
+async fn source_drain_pre_drains_dropped_orphan_before_flushing_its_parked_rescan() {
+  let mut h = Harness::new(); // unbounded event channel — has capacity
+  let live = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  let orphan = h.watch("/b", Interest::all()).await.expect("watch /b"); // handle 2
+
+  // The LIVE sub owes a parked dominating Rescan (its overflow debt) …
+  for raw in 0..2 {
+    h.owner.epochs.stamp(live, Epoch::new(raw));
+  }
+  h.owner.park_rescan(live);
+  assert!(
+    h.owner.needs_rescan.contains_key(&live),
+    "the live sub owes a parked Rescan"
+  );
+  // … and the ORPHAN is terminal-retired (parked terminal Rescan + force-removed from the subsumer):
+  // the committed-but-unclaimed-then-terminal-retired state whose DropOrphan must purge its debt.
+  h.owner.retire_root_with_terminal_rescan(2);
+  assert!(
+    h.owner.needs_rescan.contains_key(&orphan),
+    "terminal retirement parked the orphan's owed terminal Rescan"
+  );
+
+  // The orphan's DropOrphan is queued when the source drains.
+  h._commands
+    .try_send(super::Command::DropOrphan(orphan))
+    .expect("enqueue the DropOrphan");
+
+  // The source-drain teardown pre-drains the DropOrphan (purging the orphan's parked Rescan) BEFORE
+  // flushing owed Rescans, so only the live sub's Rescan is delivered.
+  let returned = tokio::time::timeout(Duration::from_secs(5), h.owner.drain_owed_before_shutdown())
+    .await
+    .expect("the source-drain teardown completed within the deadline");
+  assert!(returned.is_none(), "no Close interrupted the drain");
+
+  let delivered = h.drain();
+  assert!(
+    !delivered.iter().any(|e| e.subscription() == orphan),
+    "the orphan's parked terminal Rescan was purged before the flush — NOT delivered (no false debt)"
+  );
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == live && e.is_rescan()),
+    "the live sub's owed Rescan IS delivered (the no-silent-loss half did not regress)"
+  );
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "every owed Rescan was resolved — the live sub's delivered, the orphan's purged"
+  );
+}
+
+/// Codex R23-F1 regression, POST-Close residual best-effort tail (design driver-golden doc, invariant
+/// II): [`best_effort_final_drain`](super::Owner::best_effort_final_drain) — the pass the [`run`] tail
+/// runs after a consumer `Close` or a dropped last handle — services queued cleanup FIRST, so a
+/// [`DropOrphan`](super::Command::DropOrphan) still sitting behind the `Close` in the mailbox purges
+/// its terminal-retired sub's parked Rescan BEFORE the best-effort `drain_owed_once` could flush it.
+/// The event channel has CAPACITY, so the flush *would* deliver the orphan's Rescan.
+///
+/// Models the tail after the loop popped the `Close` (its reply is the `closing` argument) with the
+/// `DropOrphan` residual behind it. Fail-on-old: with `drain_owed_once` run before the pre-drain, the
+/// orphan's parked Rescan is delivered and the assertion flips.
+#[tokio::test]
+async fn best_effort_final_drain_pre_drains_dropped_orphan_before_flushing_its_parked_rescan() {
+  let mut h = Harness::new(); // unbounded event channel — has capacity
+  let live = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  let orphan = h.watch("/b", Interest::all()).await.expect("watch /b"); // handle 2
+
+  for raw in 0..2 {
+    h.owner.epochs.stamp(live, Epoch::new(raw));
+  }
+  h.owner.park_rescan(live);
+  h.owner.retire_root_with_terminal_rescan(2);
+  assert!(
+    h.owner.needs_rescan.contains_key(&live) && h.owner.needs_rescan.contains_key(&orphan),
+    "both the live sub's overflow Rescan and the orphan's terminal Rescan are parked"
+  );
+
+  // Model the post-Close tail: the loop popped the `Close` (its reply is `closing`), and a
+  // `DropOrphan` sits unprocessed behind it in the mailbox.
+  h._commands
+    .try_send(super::Command::DropOrphan(orphan))
+    .expect("enqueue the residual DropOrphan");
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+
+  let returned = h.owner.best_effort_final_drain(Some(close_reply));
+
+  // The residual DropOrphan was serviced FIRST — the orphan's parked terminal Rescan purged before
+  // the best-effort flush — so only the live sub's owed Rescan reaches the stream.
+  let delivered = h.drain();
+  assert!(
+    !delivered.iter().any(|e| e.subscription() == orphan),
+    "the orphan's parked terminal Rescan was purged before the flush — NOT delivered (Codex R23)"
+  );
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == live && e.is_rescan()),
+    "the live sub's owed Rescan IS delivered by the best-effort pass (no regression)"
+  );
+  // The held `Close` reply is returned for the tail to acknowledge — `close()` still completes.
+  returned
+    .expect("the best-effort drain returns the held Close reply")
+    .send(Ok(()))
+    .expect("acknowledge the Close");
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "the Close is acknowledged after the best-effort teardown"
+  );
+}

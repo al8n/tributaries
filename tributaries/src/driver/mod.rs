@@ -590,10 +590,21 @@ where
   // stream ends. A consumer-initiated `Close` or a dropped last handle owes nothing (the
   // consumer asked to stop / nobody is left), and must never block teardown on a full channel.
   let (closing, drain_owed) = loop {
-    // Drain the parked per-subscription overflow Rescans ahead of everything else, so a
-    // shed Rescan never needs a free channel slot at overflow time and is retried until
-    // accepted (design backpressure doc, no-silent-loss).
-    owner.flush_pending_rescans();
+    // Re-offer the parked per-subscription overflow Rescans ahead of new deltas — but ONLY when the
+    // command mailbox is idle, so queued cleanup is serviced before any parked debt is offered
+    // (Codex R23). The select below is command-biased, so an idle mailbox lets it drain queued
+    // commands to quiescence — each `DropOrphan` purging its sub's parked entry via
+    // `release_subscription` — before the next tick's flush can offer a `Rescan`. Without the gate an
+    // orphaned (committed-but-unclaimed, then dropped) subscription's parked terminal `Rescan` could
+    // be delivered ahead of the `DropOrphan` that purges it — an event for a subscription the caller
+    // never obtained. Per-subscription ordering is unaffected (a parked sub's ordinary deltas are
+    // suppressed and its `Rescan`s merged by `try_emit` regardless of flush timing); durability is
+    // unaffected (`needs_rescan` entries persist — delivery is deferred to command-quiescence, never
+    // dropped, and the retry timer plus every later tick re-offer them). A busy mailbox delays the
+    // flush only as long as the command burst (design backpressure doc, no-silent-loss).
+    if owner.commands.is_empty() {
+      owner.flush_pending_rescans();
+    }
 
     // The sleep target: the coalescer's next settle deadline, floored by a short retry
     // while any parked Rescan still awaits a channel slot — so a resuming consumer gets its
@@ -670,13 +681,10 @@ where
     // a full channel is always answered (no silent loss, without an unserviceable `Close`).
     owner.drain_owed_before_shutdown().await
   } else {
-    // Consumer-initiated `Close`, or every handle dropped: one best-effort ordered pass (owed
-    // Rescans ahead of any tail delta; a parked sub's tail purged) so a burst interrupted by the
-    // close is delivered when the channel has room. The undrained tail / owed Rescan on a full
-    // channel is permitted to be lost here (the consumer asked to stop, or nobody is left) —
-    // teardown never blocks on the channel, so `Close` stays responsive.
-    owner.drain_owed_once();
-    closing
+    // Consumer-initiated `Close`, or every handle dropped: one best-effort pass that services queued
+    // cleanup, then delivers the owed tail when the channel has room. Teardown never blocks on the
+    // channel, so `Close` stays responsive.
+    owner.best_effort_final_drain(closing)
   };
   // Every teardown exit funnels here — a `Close` command, a dropped last handle, or the source
   // draining — AFTER the owed Rescans above are made durable/delivered (nothing owed is lost).
@@ -1673,13 +1681,17 @@ where
   /// ends, so a resuming consumer never reaches stream-end missing an owed dominating Rescan
   /// (no silent loss on source drain).
   ///
-  /// Each pass is an ordered [`drain_owed_once`](Self::drain_owed_once) (a parked sub's tail
-  /// delta never precedes its `Rescan`), retried across a short [`RETRY`] sleep while the
-  /// channel is full — reclaiming refused tail events (shed to durable `Rescan`s) and
-  /// re-offering each parked `Rescan` — until everything owed is delivered or the consumer is
-  /// gone ([`is_closed`](async_channel::Sender::is_closed) short-circuits an all-refused channel
-  /// whose receivers have all dropped). The owner **never awaits the event sender** (invariant
-  /// III preserved even at teardown) — only the command receiver and the retry timer.
+  /// Each pass first non-blockingly **pre-drains any queued cleanup**
+  /// ([`handle_teardown_command`](Self::handle_teardown_command)) so a `DropOrphan` purges its sub's
+  /// parked entry BEFORE the pass could flush it (Codex R23 — else the orphan's terminal `Rescan` is
+  /// delivered for a subscription the caller never obtained), then runs an ordered
+  /// [`drain_owed_once`](Self::drain_owed_once) (a parked sub's tail delta never precedes its
+  /// `Rescan`), retried across a short [`RETRY`] sleep while the channel is full — reclaiming refused
+  /// tail events (shed to durable `Rescan`s) and re-offering each parked `Rescan` — until everything
+  /// owed is delivered or the consumer is gone ([`is_closed`](async_channel::Sender::is_closed)
+  /// short-circuits an all-refused channel whose receivers have all dropped). The owner **never awaits
+  /// the event sender** (invariant III preserved even at teardown) — only the command receiver and
+  /// the retry timer.
   ///
   /// The retry **stays responsive to the command mailbox** (invariant II): a blind sleep would
   /// let a [`Close`](Command::Close) queue forever while the drain spins — behind a full channel
@@ -1698,6 +1710,17 @@ where
     &mut self,
   ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
     loop {
+      // Service any queued cleanup BEFORE offering parked debt (Codex R23): a `DropOrphan` queued
+      // when the source drained must purge its sub's parked entry before `drain_owed_once` (below)
+      // flushes it, or the orphan's terminal `Rescan` is delivered for a subscription the caller
+      // never obtained. The pre-drain is non-blocking, so it adds nothing to teardown latency and
+      // can never park the drain (invariant II); a `Close` found here stops the drain and is handed
+      // back exactly as the `select!` arm below does.
+      while let Ok(cmd) = self.commands.try_recv() {
+        if let Some(reply) = self.handle_teardown_command(cmd) {
+          return Some(reply);
+        }
+      }
       self.drain_owed_once();
       if self.needs_rescan.is_empty() || self.events.is_closed() {
         return None;
@@ -1706,35 +1729,92 @@ where
       futures_util::pin_mut!(sleep);
       futures_util::select_biased! {
         cmd = self.commands.recv().fuse() => match cmd {
-          // A `Close` behind the full channel: stop the blocking retry and hand it back so the
-          // caller does a non-blocking best-effort teardown and acks it — `close()` completes.
-          Ok(Command::Close { reply }) => return Some(reply),
+          // A queued command mid-drain: a `Close` (handed back so the caller acks it — `close()`
+          // completes), a `DropOrphan` (released synchronously — its parked entry purged), or a
+          // `watch`/`unwatch` (failed fast — the owner is quiescing). Shared with the pre-drain above.
+          Ok(command) => {
+            if let Some(reply) = self.handle_teardown_command(command) {
+              return Some(reply);
+            }
+          }
           // Every handle dropped: nobody is left to receive the owed Rescans — stop and tear
           // down (the caller's best-effort final pass runs next).
           Err(_) => return None,
-          // A watch/unwatch mid-teardown: the owner is quiescing, so fail it fast (the handle
-          // surfaces `Closed`) and keep draining the owed Rescans (no silent loss).
-          Ok(Command::Watch { reply, .. }) => {
-            let _ = reply.send(Err(WatchError::Fs(WatchRootError::Closed)));
-          }
-          Ok(Command::Unwatch { reply, .. }) => {
-            let _ = reply.send(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)));
-          }
-          // A watch orphaned mid-teardown (a dropped wait's [`WatchGrant`] fired): release it through
-          // the unified [`release_subscription`](Self::release_subscription) — it purges the orphan's
-          // owner-local state and requests the emptied root's synchronous `source.disarm`, awaiting
-          // nothing, so this drain loop is never parked behind the queued `Close` on a slow source. A
-          // released-at-teardown handle is moot anyway (the owner drops the source wholesale on exit),
-          // but uniformity beats a purge-only special case. Keep draining the still-live
-          // subscriptions' owed Rescans (no silent loss) and stay free to answer `Close` at once
-          // (invariant II).
-          Ok(Command::DropOrphan(sub)) => {
-            let _ = self.release_subscription(sub);
-          }
         },
         _ = sleep => {}
       }
     }
+  }
+
+  /// Handles one command received during teardown — pre-drained non-blockingly or won by the
+  /// [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) `select!` — while the owner is
+  /// quiescing (Codex R23, the shared teardown-command core):
+  ///
+  /// - a [`DropOrphan`](Command::DropOrphan) is released through the synchronous
+  ///   [`release_subscription`](Self::release_subscription) — purging its owner-local state (its
+  ///   parked terminal `Rescan` among it, so a later flush never delivers it for a subscription the
+  ///   caller never obtained) and requesting the emptied root's fire-and-forget `source.disarm`;
+  /// - a [`Watch`](Command::Watch)/[`Unwatch`](Command::Unwatch) is **failed fast** — the owner is
+  ///   stopping, so the caller's handle surfaces `Closed`;
+  /// - a [`Close`](Command::Close) is handed back (as [`Some`]) for the caller to acknowledge.
+  ///
+  /// It awaits nothing, so it can never park teardown behind a queued `Close` (invariant II).
+  fn handle_teardown_command(
+    &mut self,
+    cmd: Command<C, V>,
+  ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
+    match cmd {
+      // A watch orphaned mid-teardown (a dropped wait's [`WatchGrant`] fired): release it through the
+      // unified [`release_subscription`](Self::release_subscription), which awaits nothing. A
+      // released-at-teardown handle is moot anyway (the owner drops the source wholesale on exit), but
+      // uniformity beats a purge-only special case — and, above all, its parked entry is purged so no
+      // later flush delivers it (Codex R23).
+      Command::DropOrphan(sub) => {
+        let _ = self.release_subscription(sub);
+        None
+      }
+      Command::Watch { reply, .. } => {
+        let _ = reply.send(Err(WatchError::Fs(WatchRootError::Closed)));
+        None
+      }
+      Command::Unwatch { reply, .. } => {
+        let _ = reply.send(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)));
+        None
+      }
+      Command::Close { reply } => Some(reply),
+    }
+  }
+
+  /// The **best-effort final drain** the [`run`] loop runs after a consumer-initiated
+  /// [`Close`](Command::Close) or a dropped last handle (NOT a source drain — that owes every parked
+  /// Rescan and takes [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown)): one
+  /// non-blocking pass so a burst interrupted by the close is delivered when the channel has room. The
+  /// undrained tail / owed Rescan on a full channel is permitted to be lost here (the consumer asked
+  /// to stop, or nobody is left) — nothing awaits the channel, so `Close` stays responsive.
+  ///
+  /// It services **queued cleanup FIRST** (Codex R23): a [`DropOrphan`](Command::DropOrphan) still
+  /// sitting behind the `Close` (or the dropped-last-handle break) in the mailbox must purge its sub's
+  /// parked entry BEFORE [`drain_owed_once`](Self::drain_owed_once) flushes it — else the orphan's
+  /// parked terminal `Rescan` is delivered for a subscription the caller never obtained. The pre-drain
+  /// ([`handle_teardown_command`](Self::handle_teardown_command)) is non-blocking, so `Close` stays
+  /// responsive (invariant II); a `watch`/`unwatch` behind the close is failed fast, and a residual
+  /// second `Close` reply is dropped — the FIRST `Close` reply is kept (the loop-break `closing`, or
+  /// the first pre-drained one when the break carried none), the rest getting the existing Stopped
+  /// semantics.
+  ///
+  /// Returns the `Close` reply the [`run`] tail acknowledges once the read plane is emptied.
+  fn best_effort_final_drain(
+    &mut self,
+    mut closing: Option<futures_channel::oneshot::Sender<Result<(), CloseError>>>,
+  ) -> Option<futures_channel::oneshot::Sender<Result<(), CloseError>>> {
+    while let Ok(cmd) = self.commands.try_recv() {
+      if let Some(reply) = self.handle_teardown_command(cmd) {
+        // Keep the first Close reply (`get_or_insert` drops a residual second one).
+        closing.get_or_insert(reply);
+      }
+    }
+    self.drain_owed_once();
+    closing
   }
 }
 
