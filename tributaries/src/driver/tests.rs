@@ -1607,7 +1607,7 @@ async fn caller_vanished_after_commit_defers_the_orphan_disarm() {
     "the committed root's last-subscriber disarm was deferred onto pending_disarms"
   );
   assert!(
-    h.owner.pending_disarms.contains(&1),
+    h.owner.pending_disarms.iter().any(|p| p.handle == 1),
     "…the freed root handle 1"
   );
   assert!(
@@ -1695,7 +1695,7 @@ async fn watch_wait_dropped_after_commit_reconciles_the_orphan_away() {
   // The kernel disarm is DEFERRED, not awaited inline: the freed root is queued for the run loop's
   // idle drain, so a `Close` behind this `DropOrphan` is never blocked on source I/O (R21-F1).
   assert!(
-    h.owner.pending_disarms.contains(&1),
+    h.owner.pending_disarms.iter().any(|p| p.handle == 1),
     "the committed root's last-subscriber disarm was deferred onto pending_disarms"
   );
   assert!(
@@ -2641,6 +2641,20 @@ impl Source<OsString> for DrainableSource {
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    // Enforce the source's disjoint-root contract (mirroring `tributary_fs::Watcher` and
+    // `FakeSource`): reject a key overlapping any live root as `Overlaps`, so a re-`watch` of a
+    // still-armed orphaned root drives the arm choke point's overlap-flush (Codex R20-F1/R22).
+    if let Some(existing) = self
+      .live
+      .values()
+      .find(|live| key.starts_with(live.as_slice()) || live.as_slice().starts_with(key))
+      .cloned()
+    {
+      return Err(WatchError::Fs(WatchRootError::Overlaps {
+        path: key.iter().collect(),
+        existing: existing.iter().collect(),
+      }));
+    }
     self.next_handle += 1;
     let handle = self.next_handle;
     self.live.insert(handle, key.to_vec());
@@ -3144,10 +3158,13 @@ async fn rewatch_of_a_just_orphaned_key_flushes_the_pending_disarm_and_never_sur
   // Simulate the NORMAL-loop DropOrphan handling: purge the orphan's owner-local state (removing /a
   // from the subsumer) and DEFER its emptied root's disarm — the source still has handle 1 armed.
   let outcome = h.owner.purge_sub_local(orphan).expect("orphan purged");
-  let crate::subsume::UnwatchOutcome::RootEmptied { fs_root } = outcome else {
+  let crate::subsume::UnwatchOutcome::RootEmptied { fs_root, root_key } = outcome else {
     panic!("the orphan was its root's last subscriber");
   };
-  h.owner.pending_disarms.push_back(fs_root);
+  h.owner.pending_disarms.push_back(super::PendingDisarm {
+    key: root_key,
+    handle: fs_root,
+  });
   assert!(
     h.owner.source.root_key(1).is_some(),
     "the orphaned root's kernel watch is still armed (its disarm was deferred)"
@@ -3181,6 +3198,70 @@ async fn rewatch_of_a_just_orphaned_key_flushes_the_pending_disarm_and_never_sur
   assert!(
     h.owner.subsumer.view().is_watched(&key("/a")),
     "the re-watch is live and covered on a fresh root"
+  );
+}
+
+/// Codex R22 targeted-flush unit check (design source doc; invariant II — `Close` bounded by at
+/// most ONE disarm): with MULTIPLE deferred orphan-disarms queued, the arm choke point's
+/// overlap-flush releases ONLY the pending root whose key OVERLAPS the re-`watch` key, leaving
+/// every NON-overlapping deferred disarm queued for the idle drain. That is what keeps `Close`
+/// bounded by one disarm even after a burst of orphans — draining the whole queue on one re-`watch`
+/// would couple `Close` to the disarms of unrelated orphans (Codex R22-F1).
+///
+/// Fail-on-old: the whole-queue flush disarms `/n` (handle 1) too — it appears in the source's
+/// `Disarm` calls and is gone from `pending_disarms`, so the "NOT touched" assertions flip.
+#[tokio::test]
+async fn overlap_flush_releases_only_the_overlapping_pending_disarm() {
+  let mut h = Harness::new();
+
+  // Two DISJOINT roots, each its own last subscriber: /n (handle 1) and /o (handle 2).
+  let orphan_n = h.watch("/n", Interest::all()).await.expect("watch /n");
+  let orphan_o = h.watch("/o", Interest::all()).await.expect("watch /o");
+
+  // Orphan both (the DropOrphan / send-failure cleanup): purge owner-local state and DEFER each
+  // root's last-subscriber disarm — the source still has handles 1 AND 2 armed.
+  h.owner.defer_orphan_disarm(orphan_n);
+  h.owner.defer_orphan_disarm(orphan_o);
+  assert_eq!(
+    h.owner.pending_disarms.len(),
+    2,
+    "both orphan disarms are deferred, non-overlapping with each other"
+  );
+
+  // Re-watch /o while BOTH disarms are pending: `Disjoint` (the subsumer no longer records it) →
+  // arm overlaps still-armed handle 2 (/o) → the choke point flushes ONLY the overlapping pending
+  // root and retries, arming a fresh handle 3.
+  let rewatched = h
+    .watch("/o", Interest::all())
+    .await
+    .expect("the re-watch flushes only the overlapping pending disarm and never surfaces Overlaps");
+  assert_ne!(
+    orphan_o, rewatched,
+    "the re-watch minted a fresh subscription"
+  );
+
+  // ONLY handle 2 (the overlapping /o root) was disarmed by the flush …
+  assert!(
+    h.owner.source.calls().contains(&Call::Disarm(2)),
+    "the overlapping pending root (handle 2) was disarmed by the flush + retry"
+  );
+  // … and handle 1 (the DISJOINT /n root) was left completely untouched — NOT a whole-queue drain.
+  assert!(
+    !h.owner.source.calls().contains(&Call::Disarm(1)),
+    "the non-overlapping pending root (handle 1) was NOT touched (R22: bounded by one disarm)"
+  );
+  assert_eq!(
+    h.owner.pending_disarms.len(),
+    1,
+    "the non-overlapping disarm stays queued for the idle drain (no leak, no whole-queue flush)"
+  );
+  assert!(
+    h.owner.pending_disarms.iter().any(|p| p.handle == 1),
+    "…and the entry left behind is handle 1 (the /n root)"
+  );
+  assert!(
+    h.owner.source.root_key(1).is_some(),
+    "handle 1's kernel watch is still armed — its deferred disarm awaits the idle drain, untouched"
   );
 }
 
@@ -3262,7 +3343,7 @@ async fn on_watch_with_all_handles_gone_defers_orphan_disarm() {
     "the orphan's owner-local state was purged"
   );
   assert!(
-    h.owner.pending_disarms.contains(&1),
+    h.owner.pending_disarms.iter().any(|p| p.handle == 1),
     "its last-subscriber disarm was DEFERRED (never awaited inline)"
   );
   assert!(
@@ -3404,7 +3485,7 @@ async fn deferred_disarm_runs_to_completion_despite_continuous_retry_timer() {
   // send-failure orphan does). Handle 1's watch is still armed, pending that deferred disarm.
   owner.defer_orphan_disarm(orphan);
   assert!(
-    owner.pending_disarms.contains(&1),
+    owner.pending_disarms.iter().any(|p| p.handle == 1),
     "handle 1's disarm is deferred"
   );
   assert!(
@@ -3426,5 +3507,89 @@ async fn deferred_disarm_runs_to_completion_despite_continuous_retry_timer() {
   assert_eq!(
     released, 1,
     "handle 1's deferred disarm ran to completion (the orphaned root released, never cancelled)"
+  );
+}
+
+/// Codex R22 regression, end-to-end over the real [`run`](super::run) loop (design source doc;
+/// invariant II — `Close` delayed by at most ONE bounded disarm): a re-`watch` whose arm overlaps a
+/// still-armed orphaned root must flush ONLY that overlapping pending disarm, NEVER the whole
+/// `pending_disarms` queue. A burst of orphans queues several deferred disarms; if one re-`watch` in
+/// front of a `Close` drained the whole queue, a slow/never-resolving NON-overlapping disarm would
+/// be awaited too and strand the `Close` (Codex R22-F1).
+///
+/// Runs the spawned loop over an overlap-enforcing [`DrainableSource`] whose `next()` parks (normal
+/// phase) and whose disarm of the NON-overlapping orphan (`/n` = handle 1) never resolves. The whole
+/// command burst — DropOrphan(`/n`), DropOrphan(`/o`), the re-`watch` of `/o`, then `Close` — is
+/// enqueued SYNCHRONOUSLY (current-thread runtime), so the loop drains a mailbox that is never idle
+/// between them: the idle drain never reaches handle 1, and the flush disarms ONLY handle 2 (the
+/// overlapping `/o` root). Handle 1's hung disarm stays queued and is made moot by the source drop
+/// at teardown.
+///
+/// Fail-on-old: the whole-queue flush pops handle 1 FIRST, parks forever in its never-resolving
+/// disarm, and the `Close` queued behind the re-`watch` is never read → `close()` times out.
+#[tokio::test]
+async fn arm_overlap_flush_touches_only_the_overlapping_orphan_so_close_stays_bounded() {
+  // Keep the drain sender alive so `next()` parks: the loop stays in the NORMAL idle-drain phase.
+  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
+  let source = DrainableSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    drain: drain_rx,
+    // The NON-overlapping orphan `/n` is armed FIRST → handle 1; its disarm never resolves.
+    hang_disarm: Some(1),
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+
+  // Commit two disjoint roots: `/n` (handle 1, disjoint from the re-watch) and `/o` (handle 2, the
+  // root the re-watch will overlap). Each `.await` completes before the next, so the arm order — and
+  // thus the handle numbering the `hang_disarm: Some(1)` predicts — is deterministic.
+  let orphan_n = w
+    .watch(key("/n"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /n");
+  let orphan_o = w
+    .watch(key("/o"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch /o");
+
+  // Enqueue the whole burst SYNCHRONOUSLY (no await between the sends) so the current-thread run loop
+  // sees a mailbox that is NEVER idle until all four are drained in FIFO order — keeping the idle
+  // drain from ever running handle 1's hung disarm before `Close` breaks the loop.
+  w.commands
+    .try_send(super::Command::DropOrphan(orphan_n))
+    .expect("enqueue DropOrphan(/n) → defers handle 1");
+  w.commands
+    .try_send(super::Command::DropOrphan(orphan_o))
+    .expect("enqueue DropOrphan(/o) → defers handle 2");
+  // The re-`watch` of `/o`: `Disjoint` → arm overlaps still-armed handle 2 → the choke point flushes
+  // ONLY handle 2 and retries. Its reply receiver is kept alive so the grant is not a send-failure
+  // re-orphan; we read it after `Close` to confirm the re-watch never surfaced `Overlaps`.
+  let (reply, rewatch_reply) = futures_channel::oneshot::channel();
+  w.commands
+    .try_send(super::Command::Watch {
+      key: key("/o"),
+      value: (),
+      interest: Interest::all(),
+      filter: Filter::all(),
+      reply,
+    })
+    .expect("enqueue the re-watch of /o");
+
+  // `Close` must be acked promptly: the flush disarmed ONLY handle 2 (the overlapping /o root); it
+  // never touched handle 1's never-resolving disarm, which stays queued (moot at teardown).
+  tokio::time::timeout(Duration::from_secs(5), w.close())
+    .await
+    .expect("close() is acked promptly — the flush touched only the overlapping pending disarm")
+    .expect("close completes");
+
+  // The re-`watch` was processed before `Close` and its reply was sent: the flush + retry resolved
+  // the overlap, so the umbrella never surfaced `Overlaps` to the caller.
+  let rewatched = rewatch_reply
+    .await
+    .expect("the re-watch reply was sent (the owner processed it before Close)");
+  assert!(
+    rewatched.is_ok(),
+    "the re-watch never surfaced Overlaps — the overlap-flush + retry resolved it"
   );
 }
