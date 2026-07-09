@@ -9,13 +9,13 @@ use std::{
 };
 
 use agnostic_lite::tokio::TokioRuntime;
-use tributary_fs::{ChangeId, Epoch, EventKind, Interest, Location, WatchRootError};
+use tributary_fs::{ChangeId, Epoch, Interest, Location, WatchRootError};
 
 use super::{Owner, epoch::EpochLedger, interest_admits};
 use crate::{
   coalesce::Coalescer,
   error::{UnwatchError, WatchError},
-  event::Event,
+  event::{Event, EventKind},
   filter::Filter,
   options::{DebounceConfig, TributariesOptions},
   source::{Armed, Source, SourceEvent},
@@ -336,10 +336,9 @@ fn rescan_event(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, u3
     handle,
     key(path),
     EventKind::Rescan,
-    None,
     Location::new(),
     Epoch::new(epoch),
-    ChangeId::new(NonZeroU64::MIN),
+    Some(ChangeId::new(NonZeroU64::MIN)),
   )
 }
 
@@ -363,10 +362,9 @@ fn source_modified(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString,
     handle,
     key(path),
     EventKind::Modified,
-    None,
     Location::new(),
     Epoch::new(epoch),
-    ChangeId::new(NonZeroU64::MIN),
+    Some(ChangeId::new(NonZeroU64::MIN)),
   )
 }
 
@@ -378,10 +376,9 @@ fn source_removed(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, 
     handle,
     key(path),
     EventKind::Removed,
-    None,
     Location::new(),
     Epoch::new(epoch),
-    ChangeId::new(NonZeroU64::MIN),
+    Some(ChangeId::new(NonZeroU64::MIN)),
   )
 }
 
@@ -1608,12 +1605,36 @@ async fn covered_sub_with_wider_interest_still_delivered() {
     "the covered sub's own removed-only interest is its fan-out gate"
   );
   assert!(
-    interest_admits(removed_only, &EventKind::Removed),
+    interest_admits(removed_only, &EventKind::<OsString>::Removed),
     "a removal under /a/b is admitted by the covered sub's gate — not silently lost"
   );
   assert!(
-    !interest_admits(created_only, &EventKind::Removed),
+    !interest_admits(created_only, &EventKind::<OsString>::Removed),
     "…and the gate is genuinely narrowing (a created-only gate would drop it)"
+  );
+}
+
+/// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
+/// interest bit (design §5) — directly constructible now that the umbrella owns the
+/// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`
+/// payload had no public constructor, so this arm was previously untestable).
+#[test]
+fn interest_gates_a_whole_moved_by_the_moved_bit() {
+  let moved = EventKind::Moved {
+    from: key("/a/src/f"),
+  };
+  assert!(
+    interest_admits(Interest::new().with_moved(), &moved),
+    "a moved-interested gate admits the whole Moved"
+  );
+  assert!(
+    interest_admits(Interest::all(), &moved),
+    "the widest gate admits it too"
+  );
+  assert!(
+    !interest_admits(Interest::new().with_created().with_removed(), &moved),
+    "a gate without the moved bit rejects the whole Moved — it is gated by moved(), \
+     not by its endpoints' created/removed projections"
   );
 }
 
@@ -3767,7 +3788,7 @@ async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() 
 
 /// R20-F2 regression (design source doc, invariant I4 / no false debt):
 /// [`release_subscription`](super::Owner::release_subscription) must clear a subscription's
-/// owner-local per-sub state — above all its parked overflow [`Rescan`](tributary_fs::EventKind::Rescan)
+/// owner-local per-sub state — above all its parked overflow [`Rescan`](EventKind::Rescan)
 /// — EVEN WHEN the subscription is already absent from the subsumer (terminal-retired). A committed-but-unclaimed
 /// watch can be terminal-retired (its terminal Rescan parked, the sub force-removed from the
 /// subsumer) while its [`WatchGrant`](super::WatchGrant) still sits in the reply slot; the later
@@ -4073,7 +4094,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
 /// debt it OFFERS is decided by owner STATE — [`flush_pending_rescans`](super::Owner::flush_pending_rescans)
 /// suppresses any entry whose sub is still `unclaimed` (its [`WatchGrant`](super::WatchGrant) in
 /// flight). So an orphaned (committed-but-unclaimed, then dropped) subscription's parked terminal
-/// [`Rescan`](tributary_fs::EventKind::Rescan) is NEVER delivered, no matter how its
+/// [`Rescan`](EventKind::Rescan) is NEVER delivered, no matter how its
 /// [`Cleanup::DropOrphan`](super::Cleanup::DropOrphan) interleaves with the flush — closing the TOCTOU the
 /// mailbox-idle gate left open (a `DropOrphan` could enqueue after the emptiness probe but before the
 /// flush's `try_send`).
@@ -4687,10 +4708,9 @@ async fn raw_source_event_delivers_under_sustained_command_load() {
       1,
       key("/a/f"),
       EventKind::Created,
-      None,
       Location::new(),
       Epoch::new(0),
-      ChangeId::new(NonZeroU64::MIN),
+      Some(ChangeId::new(NonZeroU64::MIN)),
     )]),
     trigger: trigger_rx,
   };
@@ -4754,10 +4774,9 @@ async fn due_debounced_event_drains_under_sustained_command_load() {
       1,
       key("/a/f"),
       EventKind::Modified,
-      None,
       Location::new(),
       Epoch::new(0),
-      ChangeId::new(NonZeroU64::MIN),
+      Some(ChangeId::new(NonZeroU64::MIN)),
     )]),
     trigger: trigger_rx,
   };

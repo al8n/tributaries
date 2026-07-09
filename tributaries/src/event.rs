@@ -1,21 +1,127 @@
-//! The delivered event: a filesystem change routed to a caller [`Subscription`],
-//! generic over the key component `C` and the caller value `V`.
+//! The umbrella's source-neutral event vocabulary ([`EventKind`]) and the delivered
+//! [`Event`]: a change routed to a caller [`Subscription`], generic over the key
+//! component `C` and the caller value `V`.
 //!
-//! An [`Event`] is fully owned — it does **not** borrow the raw
-//! [`tributary_fs::Event`] it was minted from. It carries the change's **located
-//! key** (a `Vec<C>` of key components — for the fs source, a path's components),
-//! its [`kind`](Event::kind), its umbrella [`epoch`](Event::epoch) stamp, the
-//! [`Subscription`] it was routed to, and — where present — the fs-source metadata
-//! (root-relative [`location`](Event::location), [`change_id`](Event::change_id),
-//! and rename payload). Being owned and key-generic is what lets the sans-I/O
+//! An [`Event`] is fully owned — it does **not** borrow the raw source event it was
+//! minted from. It carries the change's **located key** (a `Vec<C>` of key components —
+//! for the fs source, a path's components), its [`kind`](Event::kind) — including, for a
+//! [`Moved`](EventKind::Moved), the move's source key — its umbrella
+//! [`epoch`](Event::epoch) stamp, the [`Subscription`] it was routed to, and — where the
+//! source supplied them — the root-relative [`location`](Event::location) and
+//! [`change_id`](Event::change_id). Being owned and key-generic is what lets the sans-I/O
 //! engines ([`route`](crate::route), [`coalesce`](crate::coalesce)) operate over the
 //! key alone, with no coupling to any concrete source.
 
 use std::vec::Vec;
 
-use tributary_fs::{ChangeId, Epoch, EventKind, Location, MovedEvent};
+use tributary_proto::{ChangeId, Epoch, Location};
 
 use crate::{source::SourceEvent, subscription::Subscription};
+
+/// What kind of change an [`Event`] reports — the umbrella's **source-neutral**
+/// vocabulary, generic over the key component `C`.
+///
+/// The umbrella owns this vocabulary; every [`Source`](crate::Source) (the fs binding
+/// included) maps its raw kinds into it at its binding. A [`Moved`](Self::Moved) carries
+/// its second endpoint — the source key — **in-kind**, in the same `C` component space
+/// the event is keyed in, so a whole-move delivery is lossless without any parallel
+/// side-channel field.
+///
+/// # Source honesty (the binding contract)
+///
+/// A source maps into this vocabulary **honestly**, degrading only ever toward the
+/// conservative signal — never inventing precision and never leaving a kind half-mapped:
+///
+/// - a source that cannot tell created-from-modified emits [`Modified`](Self::Modified)
+///   conservatively;
+/// - a source that cannot pair a rename degrades it to [`Removed`](Self::Removed) plus
+///   [`Created`](Self::Created) **at its binding** — never half a move above the seam
+///   (a `Moved` either carries its real source key or is not a `Moved` at all);
+/// - an unknown upstream kind folds to [`Rescan`](Self::Rescan) at the binding — the
+///   conservative re-read signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EventKind<C> {
+  /// An object appeared at the event's key.
+  Created,
+  /// An object's content changed at the event's key.
+  Modified,
+  /// An object disappeared from the event's key.
+  Removed,
+  /// The object moved within the watch: the event's key is the destination, `from` is
+  /// the source key in the same component space — the second endpoint routing fans out
+  /// (design §5).
+  Moved {
+    /// The move's source key: where the object moved away from, in the same `C`
+    /// component space as the event's (destination) key.
+    from: Vec<C>,
+  },
+  /// Coverage became uncertain at (and below) the event's key: re-enumerate it.
+  /// Delivered with an epoch that strictly dominates every prior delivery to its
+  /// subscription; bypasses coverage, interest, filter, and coalescing.
+  Rescan,
+}
+
+impl<C> EventKind<C> {
+  /// The stable snake_case name of this kind.
+  #[inline]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Created => "created",
+      Self::Modified => "modified",
+      Self::Removed => "removed",
+      Self::Moved { .. } => "moved",
+      Self::Rescan => "rescan",
+    }
+  }
+
+  /// Whether this is [`Created`](Self::Created).
+  #[inline]
+  pub const fn is_created(&self) -> bool {
+    matches!(self, Self::Created)
+  }
+
+  /// Whether this is [`Modified`](Self::Modified).
+  #[inline]
+  pub const fn is_modified(&self) -> bool {
+    matches!(self, Self::Modified)
+  }
+
+  /// Whether this is [`Removed`](Self::Removed).
+  #[inline]
+  pub const fn is_removed(&self) -> bool {
+    matches!(self, Self::Removed)
+  }
+
+  /// Whether this is [`Moved`](Self::Moved).
+  #[inline]
+  pub const fn is_moved(&self) -> bool {
+    matches!(self, Self::Moved { .. })
+  }
+
+  /// Whether this is [`Rescan`](Self::Rescan).
+  #[inline]
+  pub const fn is_rescan(&self) -> bool {
+    matches!(self, Self::Rescan)
+  }
+
+  /// The move's source key, iff this is [`Moved`](Self::Moved) — the second endpoint
+  /// routing fans out. `None` for every single-endpoint kind.
+  #[inline]
+  pub fn moved_from(&self) -> Option<&[C]> {
+    match self {
+      Self::Moved { from } => Some(from),
+      _ => None,
+    }
+  }
+}
+
+impl<C> core::fmt::Display for EventKind<C> {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
 
 /// One change, delivered to a caller [`Subscription`], keyed by components of type
 /// `C` and carrying the caller value type `V`.
@@ -46,17 +152,16 @@ pub struct Event<C, V> {
   /// The change's located key: its components in `C`-space (for the fs source, the
   /// change path's components). Coverage and coalescing key on this.
   key: Vec<C>,
-  kind: EventKind,
-  /// The rename **source** key, present only for a whole [`Moved`](EventKind::Moved)
-  /// delivery — the second endpoint the coalescer keys on (design §6). `None` for
-  /// every single-endpoint kind (including the synthesized move-out / move-in
-  /// projections, which are plain `Removed` / `Created`).
-  from: Option<Vec<C>>,
+  /// What happened — including, for a whole [`Moved`](EventKind::Moved) delivery, the
+  /// move's source key (the second endpoint the coalescer keys on, design §6). The
+  /// synthesized move-out / move-in projections are plain `Removed` / `Created`.
+  kind: EventKind<C>,
   /// The change's location relative to its watched root (fs-source metadata). The
   /// empty (root-anchored) location for a synthetic event.
   location: Location,
-  /// The underlying kernel change id, for an fs-source event; `None` for one this
-  /// crate synthesized (a widen `Rescan`, a coalesced-churn `Modified`).
+  /// The underlying change id, when the source supplied one; `None` for an event this
+  /// crate synthesized (a widen `Rescan`, a coalesced-churn `Modified`) or a source
+  /// that mints no ids.
   change_id: Option<ChangeId>,
   /// The caller value attributed to this delivery (design §3): the value of the
   /// [`subscription`](Self::subscription) this event was routed to, **baked on at emit
@@ -76,12 +181,12 @@ impl<C, V> Event<C, V> {
   ///
   /// The coalescer's one collapse row that yields a kind carried by *neither* of the
   /// two collapsed events — `Removed` then `Created` → `Modified` (design §6) — mints
-  /// its result here. A synthetic event carries no change id and no fs move payload.
+  /// its result here. A synthetic event carries no change id.
   pub(crate) fn synthetic(
     subscription: Subscription,
     key: Vec<C>,
     location: Location,
-    kind: EventKind,
+    kind: EventKind<C>,
     epoch: Epoch,
   ) -> Self {
     Self {
@@ -89,7 +194,6 @@ impl<C, V> Event<C, V> {
       epoch,
       key,
       kind,
-      from: None,
       location,
       change_id: None,
       value: None,
@@ -108,7 +212,6 @@ impl<C, V> Event<C, V> {
       epoch,
       key,
       kind: EventKind::Rescan,
-      from: None,
       location: Location::new(),
       change_id: None,
       value: None,
@@ -117,7 +220,7 @@ impl<C, V> Event<C, V> {
 
   /// Retags a raw [`SourceEvent`] with the [`Subscription`] it fanned out to (design §5),
   /// carrying its located key, kind (including a whole [`Moved`](EventKind::Moved)'s
-  /// payload), move-source key, location, and change id.
+  /// in-kind source key), location, and change id.
   ///
   /// The event is born with the source's **raw** epoch as a provisional stamp; the driver
   /// rebases it into this subscription's monotone space via [`set_epoch`](Self::set_epoch)
@@ -133,9 +236,8 @@ impl<C, V> Event<C, V> {
       epoch: event.epoch(),
       key: event.key().to_vec(),
       kind: event.kind().clone(),
-      from: event.from().map(<[C]>::to_vec),
       location: event.location().clone(),
-      change_id: Some(event.change_id()),
+      change_id: event.change_id(),
       value: None,
     }
   }
@@ -156,11 +258,10 @@ impl<C, V> Event<C, V> {
       subscription,
       epoch: event.epoch(),
       key: event
-        .from()
+        .move_from()
         .expect("move-out is only minted for a move")
         .to_vec(),
       kind: EventKind::Removed,
-      from: None,
       location: Location::new(),
       change_id: None,
       value: None,
@@ -183,36 +284,7 @@ impl<C, V> Event<C, V> {
       epoch: event.epoch(),
       key: event.key().to_vec(),
       kind: EventKind::Created,
-      from: None,
       location: event.location().clone(),
-      change_id: None,
-      value: None,
-    }
-  }
-
-  /// Mints a synthetic [`Moved`](EventKind::Moved) fixture from `from` to `key`,
-  /// stamped `epoch`, for `subscription` — a **test-only** constructor.
-  ///
-  /// A synthetic event cannot carry a real [`MovedEvent`] (its constructor is private
-  /// to `tributary-fs`); production moves are always fs-source-backed. This exists
-  /// only so the coalescer's sans-I/O tests can exercise the move-is-atomic
-  /// invariant: the move is surfaced through [`move_from`](Self::move_from) (which the
-  /// coalescer keys on), while [`kind`](Self::kind) stays
-  /// [`Modified`](EventKind::Modified) and [`moved`](Self::moved) is `None`.
-  #[cfg(test)]
-  pub(crate) fn synthetic_moved(
-    subscription: Subscription,
-    key: Vec<C>,
-    from: Vec<C>,
-    epoch: Epoch,
-  ) -> Self {
-    Self {
-      subscription,
-      epoch,
-      key,
-      kind: EventKind::Modified,
-      from: Some(from),
-      location: Location::new(),
       change_id: None,
       value: None,
     }
@@ -260,7 +332,7 @@ impl<C, V> Event<C, V> {
 
   /// What happened.
   #[inline]
-  pub fn kind(&self) -> &EventKind {
+  pub fn kind(&self) -> &EventKind<C> {
     &self.kind
   }
 
@@ -277,11 +349,12 @@ impl<C, V> Event<C, V> {
     self.epoch
   }
 
-  /// The change's unique id (monotonic per watcher), for an fs-source event.
+  /// The change's unique id (monotonic per source), when the source supplied one.
   ///
-  /// A synthetic event (a widen [`Rescan`](EventKind::Rescan), or a coalesced-churn
-  /// [`Modified`](EventKind::Modified)) has no single underlying kernel change and so
-  /// reports `None`; its dominance rides its [`epoch`](Self::epoch), not a change id.
+  /// A synthetic event (a widen [`Rescan`](EventKind::Rescan), a coalesced-churn
+  /// [`Modified`](EventKind::Modified), or a move-out/move-in projection) has no single
+  /// underlying source change and so reports `None` — as does an event from a source
+  /// that mints no ids; dominance rides the [`epoch`](Self::epoch), not a change id.
   #[inline]
   pub const fn change_id(&self) -> Option<ChangeId> {
     self.change_id
@@ -315,25 +388,15 @@ impl<C, V> Event<C, V> {
     self.kind.is_rescan()
   }
 
-  /// The rename payload, if this is an fs-source [`Moved`](EventKind::Moved).
-  ///
-  /// Only a real `tributary-fs`-backed whole move carries a [`MovedEvent`]; a
-  /// synthesized event (a widen [`Rescan`](EventKind::Rescan), a coalesced-churn
-  /// [`Modified`](EventKind::Modified), or a move-out/move-in projection) holds no fs
-  /// payload, so this is `None` for one.
-  #[inline]
-  pub const fn moved(&self) -> Option<&MovedEvent> {
-    self.kind.moved()
-  }
-
-  /// The rename source key, if this is a [`Moved`](EventKind::Moved) — the
-  /// wrapper-level move detector the coalescer keys on (design §6, move-is-atomic).
+  /// The move's source key, if this is a whole [`Moved`](EventKind::Moved) delivery —
+  /// the second endpoint the coalescer keys on (design §6, move-is-atomic).
   ///
   /// `Some` iff this delivery is a whole move; the destination is [`key`](Self::key).
-  /// Uniform across an fs-source move and a synthetic (test-only) one.
+  /// A synthesized move-out / move-in projection is a plain `Removed` / `Created` and
+  /// reports `None`.
   #[inline]
-  pub(crate) fn move_from(&self) -> Option<&[C]> {
-    self.from.as_deref()
+  pub fn move_from(&self) -> Option<&[C]> {
+    self.kind.moved_from()
   }
 }
 
@@ -347,6 +410,18 @@ impl<V> Event<std::ffi::OsString, V> {
   #[inline]
   pub fn path(&self) -> std::path::PathBuf {
     self.key.iter().collect()
+  }
+
+  /// The move's source as an absolute path, if this is a whole
+  /// [`Moved`](EventKind::Moved) delivery — the fs-source convenience over
+  /// [`move_from`](Self::move_from), mirroring [`path`](Self::path).
+  ///
+  /// This allocates a fresh [`PathBuf`](std::path::PathBuf) from the source key's
+  /// components on every call; [`move_from`](Self::move_from) is the allocation-free
+  /// `Option<&[C]>` accessor for hot paths.
+  #[inline]
+  pub fn moved_from_path(&self) -> Option<std::path::PathBuf> {
+    self.move_from().map(|from| from.iter().collect())
   }
 }
 

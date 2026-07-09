@@ -26,7 +26,7 @@
 //!
 //! # A `Rescan` always bypasses the filter
 //!
-//! A [`Rescan`](tributary_fs::EventKind::Rescan) is a coverage-loss signal whose
+//! A [`Rescan`](EventKind::Rescan) is a coverage-loss signal whose
 //! [`epoch`](crate::Event::epoch) dominates everything before it, so it must reach every
 //! subscriber unconditionally (design §7/§8). The filter is therefore **never** consulted for a
 //! `Rescan`: [`fan_out`](crate::route::fan_out) delivers it before it ever reaches
@@ -37,7 +37,9 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use tributary_fs::{EventKind, Location};
+use tributary_proto::Location;
+
+use crate::event::EventKind;
 
 /// The pre-delivery view a [`Filter`] predicate inspects (design §7): the attributes of a change
 /// known **before** the umbrella stamps the delivery's epoch and bakes its owning value.
@@ -55,7 +57,7 @@ use tributary_fs::{EventKind, Location};
 #[derive(Debug, Clone, Copy)]
 pub struct FilterInput<'a, C> {
   key: &'a [C],
-  kind: &'a EventKind,
+  kind: &'a EventKind<C>,
   location: &'a Location,
 }
 
@@ -63,7 +65,7 @@ impl<'a, C> FilterInput<'a, C> {
   /// Builds a pre-delivery view over a change's located key, kind, and location. Crate-private:
   /// the driver constructs it from the projected delivery at the fan-out admission gate.
   #[inline]
-  pub(crate) fn new(key: &'a [C], kind: &'a EventKind, location: &'a Location) -> Self {
+  pub(crate) fn new(key: &'a [C], kind: &'a EventKind<C>, location: &'a Location) -> Self {
     Self {
       key,
       kind,
@@ -81,11 +83,10 @@ impl<'a, C> FilterInput<'a, C> {
 
   /// What changed — the **already-projected** delivery kind (design §5): a move-out reads as
   /// `Removed`, a move-in as `Created`, so a filter gates on the kind the caller will actually
-  /// receive. A [`Rescan`](tributary_fs::EventKind::Rescan) never reaches here (it bypasses the
-  /// filter).
+  /// receive. A [`Rescan`](EventKind::Rescan) never reaches here (it bypasses the filter).
   #[inline]
   #[must_use]
-  pub fn kind(&self) -> &EventKind {
+  pub fn kind(&self) -> &EventKind<C> {
     self.kind
   }
 
@@ -151,7 +152,7 @@ impl<C> Filter<C> {
   /// [`kind`](FilterInput::kind), and [`path`](FilterInput::path), but **not** the delivered
   /// event's epoch or value (design §7). It must be `Send + Sync`
   /// (the driver evaluates it from the polling task and may [`swap`](Filter::swap) it across the
-  /// async boundary). A [`Rescan`](tributary_fs::EventKind::Rescan) never reaches it — coverage
+  /// async boundary). A [`Rescan`](EventKind::Rescan) never reaches it — coverage
   /// loss bypasses the filter (design §7/§8).
   #[inline]
   #[must_use]
@@ -177,7 +178,7 @@ impl<C> Filter<C> {
   /// Whether this filter admits `input` — the fan-out admission gate (design §5/§7).
   ///
   /// A pure evaluation of the current predicate over the change's pre-delivery attributes; it does
-  /// **not** special-case a [`Rescan`](tributary_fs::EventKind::Rescan), because the unconditional
+  /// **not** special-case a [`Rescan`](EventKind::Rescan), because the unconditional
   /// Rescan bypass is enforced at fan-out — before a change reaches here (design §7/§8).
   #[inline]
   #[must_use]

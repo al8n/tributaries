@@ -33,13 +33,13 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
-  ChangeId, Epoch, Event as FsEvent, EventKind, Interest, Location, MovedEvent, RootHandle,
-  WatchRootError, Watcher, WatcherOptions,
+  Event as FsEvent, EventKind as FsEventKind, RootHandle, WatchRootError, Watcher, WatcherOptions,
 };
+use tributary_proto::{ChangeId, Epoch, Interest, Location};
 
 use crate::{
   error::{BuildError, WatchError},
-  event::path_components,
+  event::{EventKind, path_components},
 };
 
 #[cfg(test)]
@@ -178,7 +178,7 @@ pub trait Source<C> {
   ///   so the event falls to the dead-root retire/drain path — never onto the re-armed root. Were
   ///   the same value reused (ABA), that stale event would route through the live re-armed root
   ///   *after* the umbrella rebased its epochs, applying a stale change its restore
-  ///   [`Rescan`](tributary_fs::EventKind::Rescan) no longer dominates (Codex R15-F1).
+  ///   [`Rescan`](EventKind::Rescan) no longer dominates (Codex R15-F1).
   /// - **A fresh arm's handle never aliases a live root.** The umbrella keys its reverse index
   ///   (handle → root) on this token; a generation-unique value is absent from that index at commit
   ///   time, so a fresh arm — including each one-at-a-time re-arm of a failed widen's disarmed
@@ -315,7 +315,7 @@ pub trait Source<C> {
   /// The umbrella issues this when a `Covered` newcomer lands OUTSIDE a root's already-narrowed
   /// coverage (design §5, M2-B v3): the newcomer arms nothing, so without a grow the source would not
   /// back its subtree. Rather than release-and-rearm the whole root at the umbrella (which would move
-  /// the survivors' coverage, forcing a gap-closing [`Rescan`](tributary_fs::EventKind::Rescan)), the
+  /// the survivors' coverage, forcing a gap-closing [`Rescan`](EventKind::Rescan)), the
   /// source re-arms only the missing subtree in place — survivor coverage never moves, so events under
   /// an unchanged `retained` key keep flowing with **no gap and no loss**. It is the awaited GROW
   /// counterpart of the fire-and-forget [`set_cover`](Self::set_cover) PRUNE.
@@ -365,7 +365,7 @@ pub trait Source<C> {
   /// over-broad `unwatch` (the departing subscription's key equalled the root's), or a non-root
   /// `unwatch` that shrinks an already-narrowed cover (design §5, M2-B v3). Rather than release-and-
   /// rearm the whole root at the umbrella (which would move the survivors' coverage, forcing a
-  /// gap-closing [`Rescan`](tributary_fs::EventKind::Rescan)), the source reclaims the KERNEL coverage
+  /// gap-closing [`Rescan`](EventKind::Rescan)), the source reclaims the KERNEL coverage
   /// in place: it **never moves survivor coverage that is already correct**, so events under an
   /// unchanged `retained` key keep flowing with **no gap and no loss**.
   ///
@@ -500,20 +500,21 @@ impl<C, H> Armed<C, H> {
 ///
 /// A source produces these; the umbrella resolves the owning root by
 /// [`handle`](Self::handle), fans the change out to every subscription whose key covers
-/// [`key`](Self::key), and (for a move) decomposes it per subscriber using
-/// [`from`](Self::from). The [`kind`](Self::kind) reuses the filesystem event vocabulary
-/// [`EventKind`] unchanged — a source converts into it at the binding rather than
-/// inventing a parallel enum.
+/// [`key`](Self::key), and (for a move) decomposes it per subscriber using the
+/// [`Moved`](EventKind::Moved) kind's in-kind source key. The [`kind`](Self::kind) is
+/// the umbrella-owned **source-neutral** vocabulary [`EventKind`]: the umbrella owns it,
+/// and every source — the fs binding included — maps its raw kinds into it at its
+/// binding (see the [source-honesty contract](EventKind#source-honesty-the-binding-contract)),
+/// rather than any source's own enum leaking through the seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SourceEvent<C, H> {
   handle: H,
   key: Vec<C>,
-  kind: EventKind,
-  from: Option<Vec<C>>,
+  kind: EventKind<C>,
   location: Location,
   epoch: Epoch,
-  change_id: ChangeId,
+  change_id: Option<ChangeId>,
 }
 
 impl<C, H> SourceEvent<C, H> {
@@ -521,24 +522,23 @@ impl<C, H> SourceEvent<C, H> {
   /// uses to report a raw change in its own `C` key space.
   ///
   /// `handle` is the armed root the change belongs to; `key` its full located key;
-  /// `kind` what happened (in the [`EventKind`] vocabulary); `from` the move-source key
-  /// for a [`Moved`](EventKind::Moved) (`None` for every single-endpoint kind);
-  /// `location` the change's root-relative location; `epoch` the raw source epoch; and
-  /// `change_id` the change's unique id.
+  /// `kind` what happened (in the neutral [`EventKind`] vocabulary — a
+  /// [`Moved`](EventKind::Moved) carries its source key in-kind); `location` the
+  /// change's root-relative location; `epoch` the raw source epoch; and `change_id` the
+  /// change's unique id, when the source mints one (a source with no ids passes `None`
+  /// rather than counterfeiting them — the fs binding passes `Some`).
   pub fn new(
     handle: H,
     key: Vec<C>,
-    kind: EventKind,
-    from: Option<Vec<C>>,
+    kind: EventKind<C>,
     location: Location,
     epoch: Epoch,
-    change_id: ChangeId,
+    change_id: Option<ChangeId>,
   ) -> Self {
     Self {
       handle,
       key,
       kind,
-      from,
       location,
       epoch,
       change_id,
@@ -563,21 +563,23 @@ impl<C, H> SourceEvent<C, H> {
     &self.key
   }
 
-  /// What happened, in the filesystem event vocabulary. A [`Moved`](EventKind::Moved)
-  /// still carries its [`MovedEvent`] payload, so a whole-move delivery stays lossless.
+  /// What happened, in the umbrella's source-neutral [`EventKind`] vocabulary. A
+  /// [`Moved`](EventKind::Moved) carries its source key in-kind, so a whole-move
+  /// delivery stays lossless.
   #[inline]
   #[must_use]
-  pub fn kind(&self) -> &EventKind {
+  pub fn kind(&self) -> &EventKind<C> {
     &self.kind
   }
 
   /// The move **source** key, present only for a [`Moved`](EventKind::Moved) — the second
   /// endpoint the umbrella decomposes and the coalescer keys on. `None` for every
-  /// single-endpoint kind.
+  /// single-endpoint kind. Delegates to the kind's in-kind payload
+  /// ([`EventKind::moved_from`]).
   #[inline]
   #[must_use]
-  pub fn from(&self) -> Option<&[C]> {
-    self.from.as_deref()
+  pub fn move_from(&self) -> Option<&[C]> {
+    self.kind.moved_from()
   }
 
   /// The change's location relative to its armed root — the metadata the umbrella carries
@@ -597,10 +599,11 @@ impl<C, H> SourceEvent<C, H> {
     self.epoch
   }
 
-  /// The change's unique id (monotonic per source).
+  /// The change's unique id (monotonic per source), when the source mints one; `None`
+  /// for a source with no ids (the fs binding always supplies `Some`).
   #[inline]
   #[must_use]
-  pub const fn change_id(&self) -> ChangeId {
+  pub const fn change_id(&self) -> Option<ChangeId> {
     self.change_id
   }
 
@@ -610,13 +613,6 @@ impl<C, H> SourceEvent<C, H> {
   #[must_use]
   pub const fn is_rescan(&self) -> bool {
     self.kind.is_rescan()
-  }
-
-  /// The rename payload, if this is a [`Moved`](EventKind::Moved).
-  #[inline]
-  #[must_use]
-  pub const fn moved(&self) -> Option<&MovedEvent> {
-    self.kind.moved()
   }
 }
 
@@ -940,25 +936,33 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
 }
 
 impl SourceEvent<OsString, RootHandle> {
-  /// Reverses a raw `tributary-fs` event into a source event: its absolute path back into
-  /// key components, and — for a move — its source path likewise. The one place a raw
-  /// filesystem event's key is extracted (mirroring [`Event::from_fs`] one layer up).
-  ///
-  /// [`Event::from_fs`]: crate::Event
+  /// Reverses a raw `tributary-fs` event into a source event — **the** fs-to-neutral
+  /// map: its absolute path back into key components, and its
+  /// [`tributary_fs::EventKind`] into the umbrella's source-neutral [`EventKind`]
+  /// (a move's source path becomes the [`Moved`](EventKind::Moved) kind's in-kind
+  /// source key). The one place the fs vocabulary and a raw filesystem event's key are
+  /// converted at this binding.
   fn from_fs(event: &FsEvent) -> Self {
-    let key = path_components(event.path());
-    let from = event
-      .kind()
-      .moved()
-      .map(|moved| path_components(moved.from()));
+    let kind = match event.kind() {
+      FsEventKind::Created => EventKind::Created,
+      FsEventKind::Modified => EventKind::Modified,
+      FsEventKind::Removed => EventKind::Removed,
+      FsEventKind::Moved(moved) => EventKind::Moved {
+        from: path_components(moved.from()),
+      },
+      FsEventKind::Rescan => EventKind::Rescan,
+      // The fs enum is #[non_exhaustive]: an unknown future kind degrades to the
+      // conservative re-read signal at this binding, exactly as fs itself folds
+      // unknown proto kinds (the source-honesty contract).
+      _ => EventKind::Rescan,
+    };
     Self::new(
       event.root(),
-      key,
-      event.kind().clone(),
-      from,
+      path_components(event.path()),
+      kind,
       event.location().clone(),
       event.epoch(),
-      event.change_id(),
+      Some(event.change_id()),
     )
   }
 }

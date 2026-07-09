@@ -146,7 +146,7 @@ impl TributariesOptions {
   /// The capacity of the owner→consumer event channel (design backpressure doc): the
   /// bounded buffer [`next`](crate::Tributaries::next) drains. When it fills (a stalled
   /// consumer), the owner sheds the affected subscription to a dominating
-  /// [`Rescan`](tributary_fs::EventKind::Rescan) rather than blocking or growing memory
+  /// [`Rescan`](crate::EventKind::Rescan) rather than blocking or growing memory
   /// without bound — so this trades buffering headroom against how eagerly a slow
   /// consumer is asked to re-enumerate. Distinct from the wrapped watcher's own
   /// [`event_capacity`](WatcherOptions::event_capacity), which bounds the fs layer's
