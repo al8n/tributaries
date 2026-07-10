@@ -870,3 +870,58 @@ proptest! {
     prop_assert_eq!(engine_subs, model_subs);
   }
 }
+
+/// Codex R60: retiring an N-cohort root is LINEAR in value clones — the batched
+/// `force_remove_root` clones each same-key cover entry once and retains through it
+/// once, instead of the per-subscriber clone-of-the-shrinking-cohort that cost
+/// O(N squared) deep clones. Fail-on-old: 256 subscribers cost ~32k clones quadratic;
+/// the assert allows a generous linear budget only.
+#[test]
+fn cohort_retirement_clones_values_linearly() {
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+
+  #[derive(Debug)]
+  struct CountedValue(Arc<AtomicUsize>);
+  impl Clone for CountedValue {
+    fn clone(&self) -> Self {
+      self.0.fetch_add(1, Ordering::Relaxed);
+      Self(Arc::clone(&self.0))
+    }
+  }
+
+  const COHORT: usize = 256;
+  let clones = Arc::new(AtomicUsize::new(0));
+  let mut s: Subsumer<OsString, CountedValue, u32> = Subsumer::new();
+
+  // Build the same-key cohort: the first watch arms the root, the rest subsume as
+  // Covered onto it.
+  let k = key("/cohort");
+  let mut root_handle = 0u32;
+  for i in 0..COHORT {
+    let outcome = s.plan_watch(&k, CountedValue(Arc::clone(&clones)), Interest::all());
+    let fs_root = match &outcome {
+      WatchOutcome::Covered { fs_root, .. } => *fs_root,
+      WatchOutcome::Widen { .. } | WatchOutcome::Disjoint { .. } => {
+        root_handle = 1;
+        1
+      }
+    };
+    let _ = i;
+    s.commit_watch(&outcome, fs_root, &k);
+  }
+
+  // Count ONLY the retirement's clones.
+  clones.store(0, Ordering::Relaxed);
+  let retired = s.force_remove_root(root_handle);
+  assert_eq!(retired.len(), COHORT, "the whole cohort retired");
+  let spent = clones.load(Ordering::Relaxed);
+  assert!(
+    spent <= COHORT * 2,
+    "cohort retirement is linear in value clones (spent {spent} for {COHORT} — \
+     the old per-subscriber path spent ~{})",
+    COHORT * COHORT / 2
+  );
+}

@@ -429,6 +429,8 @@ impl Harness {
       needs_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
+      #[cfg(test)]
+      last_flush_visited: 0,
       coalescer,
       cleanup_tx,
       cleanup_rx,
@@ -2037,6 +2039,43 @@ async fn batch_retirement_stands_above_the_threshold_but_cannot_replenish() {
   h.watch("/fresh", Interest::all())
     .await
     .expect("admission restored once the retired debt drained (Codex R59)");
+}
+
+/// Codex R60: each flush pass visits a ROOM-PROPORTIONAL number of candidates — never
+/// the whole parked map. Capacity-1 drain over a 64-entry retired cohort: every pass
+/// visits at most two keys (the one delivered offer plus the probe that found the
+/// channel full or the map empty), pinned by the test-only visited counter.
+#[tokio::test]
+async fn flush_pass_work_is_room_proportional_not_map_proportional() {
+  const COHORT: usize = 64;
+  let mut h = Harness::bounded(1);
+  for _ in 0..COHORT {
+    h.watch("/cohort", Interest::all())
+      .await
+      .expect("cohort watch");
+  }
+  h.owner.source.kill_root(1);
+  h.owner.retire_root_with_terminal_rescan(1);
+
+  // Drain slot-by-slot: each pass must do O(room) work, not O(map).
+  let mut delivered = 0usize;
+  while delivered < COHORT {
+    h.owner.flush_pending_rescans();
+    assert!(
+      h.owner.last_flush_visited <= 2,
+      "a capacity-1 pass visits at most the delivered offer plus one probe \
+       (visited {} with {} entries left — Codex R60)",
+      h.owner.last_flush_visited,
+      COHORT - delivered
+    );
+    let batch = h.drain();
+    if batch.is_empty() {
+      break;
+    }
+    delivered += batch.len();
+  }
+  assert_eq!(delivered, COHORT, "every owed terminal Rescan drained");
+  assert!(h.owner.needs_rescan.is_empty(), "no residue");
 }
 
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
@@ -3952,6 +3991,8 @@ impl OwnerU64 {
       needs_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
+      #[cfg(test)]
+      last_flush_visited: 0,
       coalescer,
       cleanup_tx,
       cleanup_rx,
@@ -4474,6 +4515,8 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     needs_rescan: BTreeMap::new(),
     unclaimed: std::collections::HashSet::new(),
     flush_cursor: None,
+    #[cfg(test)]
+    last_flush_visited: 0,
     coalescer: None,
     cleanup_tx,
     cleanup_rx,
@@ -4627,6 +4670,8 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     needs_rescan: BTreeMap::new(),
     unclaimed: std::collections::HashSet::new(),
     flush_cursor: None,
+    #[cfg(test)]
+    last_flush_visited: 0,
     coalescer: None,
     cleanup_tx,
     cleanup_rx,

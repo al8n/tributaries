@@ -424,6 +424,8 @@ where
       needs_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
+      #[cfg(test)]
+      last_flush_visited: 0,
       coalescer: debounce.map(Coalescer::new),
       cleanup_tx,
       cleanup_rx,
@@ -733,10 +735,15 @@ where
   /// durable `needs_rescan` debt is state-gated.
   unclaimed: std::collections::HashSet<Subscription>,
   /// Where the next [`flush_pending_rescans`](Self::flush_pending_rescans) pass resumes
-  /// (Codex R59): the subscription whose offer found the channel full last pass —
-  /// round-robin fairness over a parked map that can legitimately be as large as a
-  /// caller's peak cohort, with per-pass work proportional to channel room.
+  /// (Codex R59/R60): the subscription whose offer found the channel full last pass —
+  /// retried first (inclusive), then round-robin past it — fairness over a parked map
+  /// that can legitimately be as large as a caller's peak cohort, with per-pass work
+  /// proportional to channel room plus unclaimed skips.
   flush_cursor: Option<Subscription>,
+  /// Test instrumentation (Codex R60): how many candidate keys the last flush pass
+  /// visited — pins the room-proportional bound without production cost.
+  #[cfg(test)]
+  last_flush_visited: usize,
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of the dedicated **high-priority shutdown signal** (Codex R27): a
@@ -2030,6 +2037,10 @@ where
   ///
   /// [`try_send`]: async_channel::Sender::try_send
   fn flush_pending_rescans(&mut self) {
+    #[cfg(test)]
+    {
+      self.last_flush_visited = 0;
+    }
     // A full channel accepts nothing this pass — skip even the walk (Codex R58/R59:
     // a pass used to clone, then merely traverse, every retained entry against an
     // already-full channel; with the map legitimately as large as a caller's peak
@@ -2037,27 +2048,43 @@ where
     if self.events.is_full() {
       return;
     }
-    // Round-robin resume (Codex R59): start offering AFTER the last position instead
-    // of from the front, so a large parked map is serviced fairly and each pass's
-    // work is proportional to the offers the channel actually had room for (plus the
-    // one Full probe that ends it), not to the map size.
-    let start = self.flush_cursor.take();
-    let mut order: Vec<Subscription> = match start {
-      Some(cursor) => {
-        let mut after: Vec<Subscription> = self
-          .needs_rescan
-          .range((
-            std::ops::Bound::Excluded(cursor),
-            std::ops::Bound::Unbounded,
-          ))
-          .map(|(&sub, _)| sub)
-          .collect();
-        after.extend(self.needs_rescan.range(..=cursor).map(|(&sub, _)| sub));
-        after
+    let len = self.needs_rescan.len();
+    if len == 0 {
+      return;
+    }
+    // LAZY round-robin resume (Codex R59/R60): candidates come one BTreeMap range
+    // probe at a time — never a materialized snapshot of the map (a capacity-one
+    // drain over a cohort-sized map would otherwise pay an O(map) collect per
+    // delivered slot, O(map squared) overall). `resume` = retry this key first,
+    // inclusive (its offer found the channel full last pass — it was NOT delivered;
+    // sound even if it was removed meanwhile: the range just starts at the next
+    // greater key). After each handled key the probe continues EXCLUSIVE past it,
+    // wrapping once; the pass visits at most `len` keys, and ends at the first Full.
+    // Per-pass work is proportional to the offers the channel had room for, plus
+    // unclaimed skips, plus the one Full probe.
+    let mut resume = self.flush_cursor.take();
+    let mut exclusive = false;
+    for _ in 0..len {
+      #[cfg(test)]
+      {
+        self.last_flush_visited += 1;
       }
-      None => self.needs_rescan.keys().copied().collect(),
-    };
-    for sub in order.drain(..) {
+      let bound = match (&resume, exclusive) {
+        (Some(at), false) => (std::ops::Bound::Included(*at), std::ops::Bound::Unbounded),
+        (Some(at), true) => (std::ops::Bound::Excluded(*at), std::ops::Bound::Unbounded),
+        (None, _) => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+      };
+      let next = self
+        .needs_rescan
+        .range(bound)
+        .next()
+        .or_else(|| self.needs_rescan.iter().next())
+        .map(|(&sub, _)| sub);
+      let Some(sub) = next else {
+        break;
+      };
+      resume = Some(sub);
+      exclusive = true;
       // Suppress — retain without offering — a still-unclaimed sub's parked debt: it is owed to
       // nobody until the caller claims (`Cleanup::Claim`) or drops (`Cleanup::DropOrphan`) the
       // in-flight grant.
@@ -2076,7 +2103,7 @@ where
           self.needs_rescan.remove(&sub);
         }
         Err(async_channel::TrySendError::Full(_)) => {
-          // The channel filled mid-pass: resume from here next tick.
+          // The channel filled: retry THIS key (inclusive) next tick.
           self.flush_cursor = Some(sub);
           return;
         }
