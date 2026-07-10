@@ -617,8 +617,10 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
 
   /// How many delivered events currently sit in the shared stream's buffer — the
   /// demux shutdown barrier's SNAPSHOT bound (Codex R56): it drains at most this many,
-  /// so the barrier is finite under a live producer and post-stop events stay on the
-  /// stream for surviving clones.
+  /// so the barrier is finite under a live producer. The count identifies the pre-stop
+  /// backlog only under the demux's SOLE-DRAINER precondition (no competing `next()`
+  /// through the whole barrier — Codex R57/R58); post-stop events stay on the stream
+  /// for clones that resume `next()` only after the routing future resolves.
   pub(crate) fn queued_events(&self) -> usize {
     self.events.len()
   }
@@ -1285,6 +1287,14 @@ where
   /// **Roots are always armed by the source's own policy** ([`FsSource`] uses
   /// [`Interest::all`], design §4): the caller's `interest` is recorded on the
   /// subscription as a fan-out gate, never passed to the arm.
+  /// The cap on RETIRED terminal parked-`Rescan` entries (Codex R58): `needs_rescan`
+  /// entries whose subscription is already retired — kept so a root death parked
+  /// against a full channel is never silently lost. Watch admission is refused past
+  /// this cap ([`WatchError::RescanBacklog`]), which breaks the only loop that can
+  /// grow it (retire-and-rewatch against a full channel); generous enough that any
+  /// draining consumer never sees it.
+  const RETIRED_RESCAN_DEBT_LIMIT: usize = 1024;
+
   async fn reconcile_watch(
     &mut self,
     key: &[C],
@@ -1292,6 +1302,22 @@ where
     interest: Interest,
     filter: Filter<C>,
   ) -> Result<Subscription, WatchError> {
+    // RETIRED-DEBT ADMISSION GATE (Codex R58): terminal parked Rescans are deliberately
+    // retained past their subscriptions' retirement (a full channel must not drop a root
+    // death), so `needs_rescan` is bounded by live subs PLUS retired terminal entries —
+    // and a retire-and-rewatch cycle against a full channel mints one retired entry per
+    // round. Each such round needs exactly one fresh watch, so refusing admission at the
+    // cap is what makes the retired debt structurally bounded: the pathological caller
+    // gets `RescanBacklog` until it drains the owed Rescans (each flush Ok/Closed frees
+    // an entry). Close is untouched — it rides its own dedicated channel.
+    let retired_debt = self
+      .needs_rescan
+      .keys()
+      .filter(|&&sub| self.subsumer.subscription_key(sub).is_none())
+      .count();
+    if retired_debt >= Self::RETIRED_RESCAN_DEBT_LIMIT {
+      return Err(WatchError::RescanBacklog);
+    }
     // Canonicalize the caller key at the single arm-and-key choke point, BEFORE classification
     // (invariant I2 — "one fs-canonical coordinate at one choke point"). Every downstream step —
     // `plan_watch`, the Covered-liveness re-plan, the arm, and the commit — then keys on the
@@ -1993,7 +2019,14 @@ where
   fn flush_pending_rescans(&mut self) {
     let events = &self.events;
     let unclaimed = &self.unclaimed;
+    // Once one offer reports Full the channel IS full — every later offer this pass
+    // would fail identically, so stop offering (Codex R58: a flush pass used to clone
+    // every retained entry against an already-full channel, pure heap/CPU churn).
+    let mut full = false;
     self.needs_rescan.retain(|&sub, parked| {
+      if full {
+        return true;
+      }
       // Suppress — retain without offering — a still-unclaimed sub's parked debt: it is owed to
       // nobody until the caller claims (`Cleanup::Claim`) or drops (`Cleanup::DropOrphan`) the
       // in-flight grant.
@@ -2006,7 +2039,10 @@ where
       event.set_value(parked.value.clone());
       match events.try_send(event) {
         Ok(()) | Err(async_channel::TrySendError::Closed(_)) => false,
-        Err(async_channel::TrySendError::Full(_)) => true,
+        Err(async_channel::TrySendError::Full(_)) => {
+          full = true;
+          true
+        }
       }
     });
   }

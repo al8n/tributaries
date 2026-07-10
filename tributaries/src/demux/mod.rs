@@ -52,10 +52,12 @@ enum Control<C, V> {
     /// lives in the caller's [`Lane`].
     lane: async_channel::Sender<Event<C, V>>,
   },
-  /// An orderly stop request ([`Demux::shutdown`], Codex R54): the routing task exits
-  /// after completing its current delivery — never mid-send — then drops every lane
-  /// sender, so each lane drains its buffered tail and reads clean end-of-stream with
-  /// nothing lost.
+  /// An orderly stop request ([`Demux::shutdown`], Codex R54/R58): the routing task
+  /// finishes its current delivery — never mid-send — drains the snapshot-bounded
+  /// pre-stop backlog, then drops every lane sender so each lane drains its buffered
+  /// tail to a clean end-of-stream. Loss-free UNDER the module's sole-drainer
+  /// precondition (held through the whole barrier); post-stop events stay on the
+  /// shared stream for clones that resume `next()` after the routing future resolves.
   Shutdown,
   /// A best-effort release sent by a dropped [`Lane`] (Codex R49): remove the
   /// subscription's slot — IF it still holds generation `generation` — returning the

@@ -1924,6 +1924,68 @@ async fn coalescer_overflow_sheds_to_a_dominating_parked_rescan() {
   );
 }
 
+/// Codex R58: a retire-and-rewatch cycle against a FULL channel is structurally
+/// bounded — terminal parked Rescans retained past their subscriptions' retirement
+/// count as RETIRED debt, and watch admission is refused at the cap
+/// ([`WatchError::RescanBacklog`]), breaking the only loop that grows it. Draining the
+/// owed Rescans (the flush frees entries) restores admission. Capacity-1 channel, the
+/// exact repro shape.
+#[tokio::test]
+async fn retire_rewatch_cycle_is_bounded_by_the_retired_debt_gate() {
+  let mut h = Harness::bounded(1);
+
+  // Fill the single event slot so every terminal Rescan parks instead of delivering.
+  let plug = h.watch("/plug", Interest::all()).await.expect("watch plug");
+  h.owner.epochs.stamp(plug, Epoch::new(1));
+  h.owner.source.kill_root(1);
+  h.owner.retire_root_with_terminal_rescan(1);
+  h.owner.flush_pending_rescans(); // occupies the one slot with plug's terminal Rescan
+
+  // Cycle: watch a fresh key, kill its root, retire — each round force-removes the sub
+  // while RETAINING its parked terminal entry (the retired debt the gate counts).
+  let mut cycles = 0usize;
+  loop {
+    match h.watch(&format!("/cycle{cycles}"), Interest::all()).await {
+      Ok(_) => {
+        // FakeSource handles are monotone: this watch armed handle cycles+2 (plug took 1).
+        let handle = u32::try_from(cycles).expect("small") + 2;
+        h.owner.source.kill_root(handle);
+        h.owner.retire_root_with_terminal_rescan(handle);
+        cycles += 1;
+        assert!(
+          cycles
+            <= super::Owner::<OsString, (), TokioRuntime, FakeSource>::RETIRED_RESCAN_DEBT_LIMIT
+              + 1,
+          "the gate must refuse before the debt exceeds its cap"
+        );
+      }
+      Err(WatchError::RescanBacklog) => break,
+      Err(other) => panic!("unexpected watch error: {other:?}"),
+    }
+  }
+  let retired = h
+    .owner
+    .needs_rescan
+    .keys()
+    .filter(|&&sub| h.owner.subsumer.subscription_key(sub).is_none())
+    .count();
+  assert!(
+    retired <= super::Owner::<OsString, (), TokioRuntime, FakeSource>::RETIRED_RESCAN_DEBT_LIMIT,
+    "retired debt is capped (got {retired})"
+  );
+
+  // Drain the owed Rescans: each flush frees entries, restoring admission.
+  loop {
+    h.owner.flush_pending_rescans();
+    if h.drain().is_empty() {
+      break;
+    }
+  }
+  h.watch("/after-drain", Interest::all())
+    .await
+    .expect("admission restored once the retired debt drained (Codex R58)");
+}
+
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
 /// interest bit (design §5) — directly constructible now that the umbrella owns the
 /// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`
