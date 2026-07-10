@@ -227,18 +227,32 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
   let h = w.watch(&root, Interest::all()).await.expect("watch root");
 
   // Both nested subtrees must be armed before the shrink: a write deep under each surfaces, proving
-  // /keep/deep and /drop/deep hold live per-directory watches.
+  // /keep/deep and /drop/deep hold live per-directory watches. Both facts are collected
+  // in ONE pass over the stream — two sequential waits would let the first CONSUME the
+  // second's event when the kernel delivers them in the other order (the race the first
+  // real CI run of this moved test exposed; the external suite documents the same idiom
+  // on its churn test).
   let keep_probe = root.join("keep/deep/before.txt");
   let drop_probe = root.join("drop/deep/before.txt");
   std::fs::write(&keep_probe, b"x").unwrap();
   std::fs::write(&drop_probe, b"x").unwrap();
+  let (mut keep_seen, mut drop_seen) = (false, false);
+  let both_armed = tokio::time::timeout(DEADLINE, async {
+    while let Some(event) = w.next().await {
+      keep_seen |= covers(&event, &keep_probe);
+      drop_seen |= covers(&event, &drop_probe);
+      if keep_seen && drop_seen {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
   assert!(
-    wait_for(&mut w, |e| covers(e, &keep_probe)).await.is_some(),
-    "the /keep subtree is armed (its deep write surfaces)"
-  );
-  assert!(
-    wait_for(&mut w, |e| covers(e, &drop_probe)).await.is_some(),
-    "the /drop subtree is armed (its deep write surfaces)"
+    both_armed,
+    "both nested subtrees are armed — their deep writes surface in one collection pass \
+     (keep: {keep_seen}, drop: {drop_seen})"
   );
   assert!(
     converge(|| wds_watching(&all) == 5).await,
