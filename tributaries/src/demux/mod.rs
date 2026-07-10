@@ -325,10 +325,13 @@ impl<C, V> Demux<C, V> {
     self.tracked.load(Ordering::Acquire)
   }
 
-  /// Requests an ORDERLY stop of the routing task (Codex R54): it finishes the
+  /// Requests an ORDERLY stop of the routing task (Codex R54/R55): it finishes the
   /// delivery it is currently awaiting — a stalled send completes when that lane
-  /// drains, never mid-send — then exits, dropping every lane sender so each
-  /// [`Lane::recv`] drains its buffered tail and reads `None`. Nothing is lost.
+  /// drains, never mid-send — then routes EVERYTHING the shared stream already holds
+  /// at that instant (the drain barrier), and only then exits, dropping every lane
+  /// sender so each [`Lane::recv`] drains its buffered tail and reads `None`. Nothing
+  /// emitted before the stop took effect is lost; events the actor emits afterwards
+  /// are post-stop and remain drainable by surviving handle clones.
   ///
   /// This is the loss-free way to stop routing without ending the watcher itself
   /// (closing the watcher ends the shared stream and the lanes with it). By contrast,
@@ -423,7 +426,7 @@ async fn run<C, V, R, H>(
   // Value = (registration generation, send side). Entries are REMOVED on release or
   // send-time reclamation — the table is bounded by live lanes, not lifetime
   // registrations (Codex R49).
-  let mut lanes: HashMap<Subscription, (u64, async_channel::Sender<Event<C, V>>)> = HashMap::new();
+  let mut lanes: LaneTable<C, V> = HashMap::new();
   // `None` once the rest receiver is dropped: unrouted events are discarded from then on.
   let mut rest = Some(rest);
   // The control channel closes when the `Demux` handle drops — NOT a stop signal: the
@@ -465,10 +468,18 @@ async fn run<C, V, R, H>(
               }
             }
             Ok(Control::Shutdown) => {
-              // Orderly stop-and-drain (Codex R54): the current delivery — the send
-              // this loop completed before selecting again — is already done, so
-              // exiting here loses nothing; dropping the senders below ends every
-              // lane after its buffered tail.
+              // Orderly stop-and-DRAIN (Codex R54/R55): the delivery this loop
+              // completed before selecting again is already done — and everything the
+              // shared stream ALREADY HOLDS at this instant is routed too, via the
+              // non-blocking drain barrier below (a `now_or_never` poll of `next()` is
+              // one cancel-safe channel poll: `Some` routes the event, `None` means
+              // the stream is empty NOW and the barrier is complete). Events the actor
+              // emits after the barrier are post-stop — surviving handle clones can
+              // still drain them. Only then do the senders drop, so every lane ends
+              // after a tail that includes the whole pre-shutdown backlog.
+              while let Some(Some(event)) = watcher.next().now_or_never() {
+                deliver(&mut lanes, &mut rest, &tracked, event).await;
+              }
               break;
             }
             Ok(Control::Release { sub, generation }) => {
@@ -492,36 +503,47 @@ async fn run<C, V, R, H>(
     let Some(event) = event else {
       break;
     };
-    let sub = event.subscription();
-    // THE deliberate stall (stall-not-shed): await the bounded lane send. While a full
-    // lane holds this send, the task stops receiving from the shared stream; the
-    // shared channel fills and the ACTOR's overflow machinery mints the genuine
-    // dominating Rescans. The demux itself never sheds here.
-    let unclaimed = match lanes.get(&sub) {
-      Some((_, lane)) => match lane.send(event).await {
-        Ok(()) => None,
-        // The send observed the lane's receiver dropped: reclaim the slot on the spot
-        // (send-time reclamation, Codex R49 — covers a lost drop-release) and RECOVER
-        // the very event the failed send handed back. The subscription is unclaimed
-        // again from here on; the recovered event flows to rest like any unclaimed
-        // traffic.
-        Err(async_channel::SendError(event)) => {
-          lanes.remove(&sub);
-          tracked.store(lanes.len(), Ordering::Release);
-          Some(event)
-        }
-      },
-      None => Some(event),
-    };
-    // Unclaimed traffic: the rest lane — the same awaited-send stall. A dropped rest
-    // receiver discards unrouted events from then on.
-    if let Some(event) = unclaimed
-      && let Some(lane) = &rest
-      && lane.send(event).await.is_err()
-    {
-      rest = None;
-    }
+    deliver(&mut lanes, &mut rest, &tracked, event).await;
   }
   // Returning drops every lane sender (the table) and the rest sender: each `Lane`
   // drains its buffered tail, then reads `None`.
+}
+
+/// The routing task's lane table: each claimed subscription's registration generation
+/// and bounded send side.
+type LaneTable<C, V> = HashMap<Subscription, (u64, async_channel::Sender<Event<C, V>>)>;
+
+/// One delivery: route `event` to its subscription's lane — THE deliberate stall
+/// (stall-not-shed): the bounded lane send is awaited, so a full lane parks the caller
+/// while the shared channel fills and the ACTOR's overflow machinery mints the genuine
+/// dominating Rescans; the demux itself never sheds. A send that observes the lane's
+/// receiver dropped reclaims the slot on the spot (send-time reclamation, Codex R49 —
+/// covers a lost drop-release) and RECOVERS the very event the failed send handed
+/// back: the subscription is unclaimed again, and the recovered event flows to rest
+/// like any unclaimed traffic. A dropped rest receiver discards unrouted events from
+/// then on.
+async fn deliver<C, V>(
+  lanes: &mut LaneTable<C, V>,
+  rest: &mut Option<async_channel::Sender<Event<C, V>>>,
+  tracked: &Arc<AtomicUsize>,
+  event: Event<C, V>,
+) {
+  let sub = event.subscription();
+  let unclaimed = match lanes.get(&sub) {
+    Some((_, lane)) => match lane.send(event).await {
+      Ok(()) => None,
+      Err(async_channel::SendError(event)) => {
+        lanes.remove(&sub);
+        tracked.store(lanes.len(), Ordering::Release);
+        Some(event)
+      }
+    },
+    None => Some(event),
+  };
+  if let Some(event) = unclaimed
+    && let Some(lane) = &*rest
+    && lane.send(event).await.is_err()
+  {
+    *rest = None;
+  }
 }

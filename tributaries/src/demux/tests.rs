@@ -487,21 +487,26 @@ async fn shutdown_stops_and_drains_losslessly_even_while_stalled() {
   let lane_a = demux.lane(sub_a, 1).await;
 
   // Prove the router is live, then park it deterministically: /a/one round-trips
-  // (router idle again), /a/two fills the capacity-1 lane, /a/three parks the send.
+  // (router idle again), /a/two fills the capacity-1 lane, /a/three parks the send —
+  // and /a/four is QUEUED BEHIND the stall on the shared stream (the Codex R55
+  // stranding case: an event the router has not even pulled yet).
   feed.modified("/a", "/a/one").await;
   assert_eq!(recv(&lane_a).await.key(), key("/a/one").as_slice());
   feed.modified("/a", "/a/two").await;
   feed.modified("/a", "/a/three").await;
+  feed.modified("/a", "/a/four").await;
   tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
   // Request the orderly stop WHILE parked mid-send. Admission succeeds (control queue
-  // has room); the stop takes effect only after the in-flight send completes.
+  // has room); the stop takes effect only after the in-flight send completes, and the
+  // drain barrier then routes the queued shared-stream tail too.
   demux.shutdown().await;
 
-  // Drain the lane: BOTH remaining events arrive — the parked send completed, nothing
-  // lost — and then the lane ends because the router exited after that delivery.
+  // Drain the lane: ALL THREE remaining events arrive — the parked send completed and
+  // the barrier pulled the queued tail — and then the lane ends.
   assert_eq!(recv(&lane_a).await.key(), key("/a/two").as_slice());
   assert_eq!(recv(&lane_a).await.key(), key("/a/three").as_slice());
+  assert_eq!(recv(&lane_a).await.key(), key("/a/four").as_slice());
   assert!(
     tokio::time::timeout(DEADLINE, lane_a.recv())
       .await

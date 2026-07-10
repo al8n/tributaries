@@ -205,12 +205,22 @@ where
   /// ready, or — for exactly the create-then-remove transient — intentionally
   /// annihilated. `now` must be nondecreasing across calls (the driver's monotonic
   /// clock guarantees it).
-  pub(crate) fn admit(&mut self, ev: Event<C, V>, now: Instant) {
+  ///
+  /// Returns `Some(subscription)` when this admission OVERFLOWED the buffered-entry cap
+  /// ([`DebounceConfig::max_buffered`], Codex R55): the event was NOT buffered, and the
+  /// caller owes that subscription the same dominating parked
+  /// [`Rescan`](EventKind::Rescan) it mints for a full event channel
+  /// (`park_rescan` — which also purges the subscription's buffered entries), so the
+  /// dropped event and everything purged are accounted, never silent. `None` on every
+  /// ordinary admission.
+  #[must_use = "an overflowed subscription is owed a dominating parked Rescan"]
+  pub(crate) fn admit(&mut self, ev: Event<C, V>, now: Instant) -> Option<Subscription> {
     if ev.is_rescan() {
       // Rescan: flush every buffered entry for this subscription (their content is now
       // suspect) and emit the Rescan undelayed, its upstream epoch stamp preserved.
       self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
+      None
     } else if ev.move_from().is_some() {
       // Moved is atomic: it emits whole and *undelayed* — never split, never coalesced.
       // Because it emits immediately (newest epoch), it must first flush the WHOLE
@@ -223,13 +233,15 @@ where
       // the router fans out on.
       self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
+      None
     } else if matches!(
       ev.kind(),
       EventKind::Created | EventKind::Modified | EventKind::Removed
     ) {
       // A known lifecycle change (Created / Modified / Removed): buffer it, collapsing onto
-      // any entry already held for its (subscription, path).
-      self.coalesce(ev, now);
+      // any entry already held for its (subscription, path) — or shed the subscription
+      // when a fresh entry would overflow the cap (Codex R55).
+      self.coalesce(ev, now)
     } else {
       // An unknown/future non-lifecycle kind: the umbrella's own `EventKind` is
       // #[non_exhaustive], and the collapse table only knows the three lifecycle kinds (its
@@ -240,6 +252,7 @@ where
       // no silent loss).
       self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
+      None
     }
   }
 
@@ -317,7 +330,7 @@ where
 
   /// Buffers a lifecycle event, collapsing it onto any entry already held for its
   /// `(subscription, key)` per the [table](self#the-collapse-table-design-6).
-  fn coalesce(&mut self, ev: Event<C, V>, now: Instant) {
+  fn coalesce(&mut self, ev: Event<C, V>, now: Instant) -> Option<Subscription> {
     let key = (ev.subscription(), ev.key().to_vec());
     // Read the settle windows up front so recomputing the deadline does not re-borrow
     // `self` while the buffered entry is held mutably.
@@ -328,7 +341,15 @@ where
     // annihilating collapse leaves it unused: a harmless gap in the monotone sequence.
     let seq = self.bump_seq();
     let Some(buffered) = self.buffer.get_mut(&key) else {
-      // First change to this path in the window: open a fresh entry.
+      // First change to this path in the window: a FRESH entry — the only way the
+      // buffer grows, so this is where the structural memory bound lives (Codex R55).
+      // At the cap, shed the subscription instead of growing: the event is dropped
+      // UNBUFFERED and the caller parks the dominating Rescan that accounts for it
+      // (and purges the subscription's entries, freeing space). Collapses below never
+      // grow the map and stay exempt.
+      if self.buffer.len() >= self.cfg.max_buffered() {
+        return Some(ev.subscription());
+      }
       let entry = Buffered {
         first_seen: now,
         emit_at: Self::deadline(now, now, quiet, max_hold),
@@ -336,7 +357,7 @@ where
         event: ev,
       };
       self.buffer.insert(key, entry);
-      return;
+      return None;
     };
     let first_seen = buffered.first_seen;
 
@@ -380,6 +401,7 @@ where
         self.buffer.remove(&key);
       }
     }
+    None
   }
 
   /// The action the collapse table dictates for `buffered` meeting `incoming`.

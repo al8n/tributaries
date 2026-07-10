@@ -1875,6 +1875,55 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
   );
 }
 
+/// Codex R55: the coalescer's buffered-entry cap engages the EXISTING loss-accounting
+/// path — a high-cardinality burst past the cap sheds the subscription to a dominating
+/// parked Rescan (`park_rescan`: shed epoch + `needs_rescan` merge + coalescer purge),
+/// so debounce keeps the crate's bounded-memory guarantee with no silent loss.
+#[tokio::test]
+async fn coalescer_overflow_sheds_to_a_dominating_parked_rescan() {
+  // Never-settling windows: nothing drains on its own, so the buffer would grow one
+  // entry per distinct key without the cap.
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200))
+    .with_max_buffered(2);
+  let mut h = Harness::with_coalescer(Some(Coalescer::new(cfg)));
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  h.owner.epochs.stamp(sub, Epoch::new(3));
+
+  // Two distinct keys fill the cap; the third OVERFLOWS: the coalescer sheds the
+  // subscription instead of growing.
+  h.owner.fan_out_and_push(&source_modified(1, "/a/k0", 4));
+  h.owner.fan_out_and_push(&source_modified(1, "/a/k1", 5));
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "under the cap nothing is shed"
+  );
+  h.owner.fan_out_and_push(&source_modified(1, "/a/k2", 6));
+
+  // The shed landed in the parked-Rescan debt (dominating epoch) and the purge freed
+  // the subscription's buffered entries — bounded memory, accounted loss.
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the overflowed subscription is owed a dominating parked Rescan (Codex R55)"
+  );
+  let parked_epoch = h.owner.needs_rescan.get(&sub).expect("parked").epoch;
+  assert!(
+    parked_epoch >= Epoch::new(6),
+    "the shed Rescan dominates the purged buffered epochs (got {parked_epoch:?})"
+  );
+
+  // The flush delivers the dominating Rescan to the consumer — the loss is announced.
+  h.owner.flush_pending_rescans();
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == sub && e.kind().is_rescan()),
+    "the parked Rescan flushes to the consumer"
+  );
+}
+
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
 /// interest bit (design §5) — directly constructible now that the umbrella owns the
 /// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`
