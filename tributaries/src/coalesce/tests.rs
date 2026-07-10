@@ -401,7 +401,7 @@ fn rescan_only_flushes_its_own_subscription() {
   assert_eq!(out2[0].subscription(), s2);
 }
 
-/// Codex R11 F2 regression (forward-compat, design §6): the coalescer coalesces ONLY the known
+/// Regression (forward-compat, design §6): the coalescer coalesces ONLY the known
 /// lifecycle kinds (`Created` / `Modified` / `Removed`). The umbrella's own `EventKind` is
 /// `#[non_exhaustive]`; a non-lifecycle kind must NOT be folded into the collapse table (whose
 /// default arm would relabel or drop it), but flushed-and-emitted immediately — the same path as
@@ -663,7 +663,7 @@ fn drop_subscription_discards_only_that_subscriptions_entries() {
 }
 
 // -------------------------------------------------------------------------------
-// Per-subscription admission-order drains (design §8, Codex R18).
+// Per-subscription admission-order drains (design §8).
 //
 // Every multi-entry drain must emit a subscription's entries in admission (= epoch) order,
 // NOT BTreeMap path-key order. Each test uses the same fixture: two paths whose lexical
@@ -1040,7 +1040,7 @@ mod tokio_timer {
   }
 }
 
-/// Codex R55: the buffered-entry cap is the structural memory bound in FRONT of the
+/// the buffered-entry cap is the structural memory bound in FRONT of the
 /// bounded event channel. A high-cardinality burst (10,000 distinct keys) against a
 /// cap of 64 never grows the buffer past the cap; every admission past it signals the
 /// overflowed subscription (owed a dominating parked Rescan by the driver), and

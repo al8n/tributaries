@@ -5,7 +5,7 @@
 //! [`fan_out`](crate::route::fan_out) consults it as an **additional** admission gate, *after* the
 //! coverage ancestor test (design §5). It is a predicate over a [`FilterInput`] — the change's
 //! located key, its kind, and (for the fs source) its path — the fully-typed `Filter<L>`
-//! location-parsing generic is deferred to M2 (design §7). The predicate lives behind an
+//! location-parsing generic is deferred (design §7). The predicate lives behind an
 //! [`arc_swap::ArcSwap`] so it can be **hot-swapped** at any time without re-arming the kernel
 //! watch (a re-watch): the driver holds each subscription's `Filter` and [`swap`](Filter::swap)s
 //! the closure in place, and the next change admitted sees the new predicate.

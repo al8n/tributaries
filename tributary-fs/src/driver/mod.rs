@@ -261,7 +261,7 @@ pub(crate) enum Command {
     /// `Some` for the awaited [`Watcher::unwatch`](crate::Watcher::unwatch) (resolved with
     /// whether the scope existed); `None` for the non-blocking, reply-less
     /// [`Watcher::request_unwatch`](crate::Watcher::request_unwatch) — the SAME teardown and
-    /// registry reclamation, simply unacknowledged (Codex R41). The driver applies both
+    /// registry reclamation, simply unacknowledged. The driver applies both
     /// identically and skips the ack when there is no reply.
     reply: Option<futures_channel::oneshot::Sender<bool>>,
   },
@@ -274,7 +274,7 @@ pub(crate) enum Command {
   /// once the reconcile has been applied to the Monitor (its `RemoveWatch`/`AddWatch`
   /// effects are then fire-and-forget, like any other descending disarm/arm).
   // Constructed only by the crate-internal `Watcher::{set_cover, request_set_cover}` pair,
-  // which no non-test code calls until the effect-completion follow-up (Codex R43).
+  // which no non-test code calls until the effect-completion follow-up.
   #[cfg_attr(not(test), allow(dead_code))]
   SetCover {
     /// The scope to reconcile.
@@ -286,7 +286,7 @@ pub(crate) enum Command {
     /// `Some` for the awaited [`Watcher::set_cover`](crate::Watcher::set_cover) (resolved once
     /// applied, or immediately no-op'd); `None` for the non-blocking, reply-less
     /// [`Watcher::request_set_cover`](crate::Watcher::request_set_cover) — the PROMPT path that
-    /// applies a queued reconcile without waiting for a later arm (Codex R37-F2). The driver
+    /// applies a queued reconcile without waiting for a later arm. The driver
     /// applies both identically and simply skips the ack when there is no reply.
     reply: Option<futures_channel::oneshot::Sender<()>>,
   },
@@ -1140,7 +1140,7 @@ pub(crate) async fn run<R, F>(
         Ok(Command::Unwatch { scope, reply }) => {
           if handles.contains_key(&scope) || watch_replies.contains_key(&scope) {
             // The awaited form records its waiter (answered at scope-dead); the reply-less
-            // `request_unwatch` tears down identically but registers none (Codex R41).
+            // `request_unwatch` tears down identically but registers none.
             if let Some(reply) = reply {
               unwatch_replies.insert(scope, reply);
             }
@@ -1162,7 +1162,7 @@ pub(crate) async fn run<R, F>(
             core.on_set_cover(scope, &retained);
           }
           // `Some` acks the awaited `set_cover`; `None` is the reply-less prompt request
-          // (`request_set_cover`, Codex R37-F2) — same reconcile, no acknowledgement.
+          // (`request_set_cover`) — same reconcile, no acknowledgement.
           if let Some(reply) = reply {
             let _ = reply.send(());
           }

@@ -28,7 +28,7 @@ use crate::{
 mod tests;
 
 // Real-kernel regression suite for the crate-internal set-cover pair: `set_cover` and
-// `request_set_cover` are `pub(crate)` (Codex R43 — no public reachability until the
+// `request_set_cover` are `pub(crate)` (no public reachability until the
 // effect-completion fence lands), so an external integration binary can no longer call
 // them; the inotify end-to-end coverage lives in-crate instead. not(miri): drives real
 // inotify syscalls and a tokio runtime.
@@ -547,7 +547,7 @@ impl<R: RuntimeLite> Watcher<R> {
   /// REPLY-LESS fire-and-forget: it `try_send`s the ack-less command and reports whether the
   /// control channel accepted it. Unlike `unwatch` it never awaits — so the layer above can apply
   /// a queued release opportunistically without coupling a disjoint arm (and any `close` queued
-  /// behind it) to that release's teardown latency (Codex R41).
+  /// behind it) to that release's teardown latency.
   ///
   /// The driver tears a reply-less `Unwatch` down exactly like the awaited one — the same stream
   /// teardown and registry reclamation — it simply sends no acknowledgement, so the caller cannot
@@ -583,7 +583,7 @@ impl<R: RuntimeLite> Watcher<R> {
   ///
   /// A **best-effort optimization** the layer above uses to reclaim (and, when a survivor
   /// returns, restore) inotify watch budget after a wide root outlived the consumer whose key
-  /// equalled it (design M2-B): it only ever removes coverage no consumer is subscribed under
+  /// equalled it (the set-cover design): it only ever removes coverage no consumer is subscribed under
   /// and only ever re-arms coverage a survivor needs, emits **no**
   /// [`Rescan`](crate::EventKind::Rescan), and is a **no-op** for a kernel-recursive backend
   /// (fanotify / FSEvents), whose single whole-subtree stream has no per-directory watches to
@@ -592,7 +592,7 @@ impl<R: RuntimeLite> Watcher<R> {
   /// `retained` are the watcher's own canonical coordinates (as
   /// [`root_path`](Self::root_path) reports), so they line up with the watches' addressing.
   ///
-  /// # Crate-internal until the effect-completion fence lands (Codex R43)
+  /// # Crate-internal until the effect-completion fence lands
   ///
   /// The ack resolves when the reconcile has been **applied to the Monitor** — its
   /// `AddWatch`/`RemoveWatch` effects are dispatched from the effect batch *after* the ack — NOT
@@ -607,7 +607,7 @@ impl<R: RuntimeLite> Watcher<R> {
   /// - [`UnwatchError::UnknownRoot`] when `root` does not name a live root of THIS
   ///   watcher (never watched, already gone, or issued by a different watcher);
   /// - [`UnwatchError::Closed`] when the watcher is already closed.
-  // Dormant on the lib target (Codex R43): no non-test code constructs a set-cover until the
+  // Dormant on the lib target: no non-test code constructs a set-cover until the
   // effect-completion follow-up re-publicizes the pair; the in-crate tests keep it exercised.
   #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) async fn set_cover(
@@ -649,8 +649,7 @@ impl<R: RuntimeLite> Watcher<R> {
   /// Requests a coverage reconcile like [`set_cover`](Self::set_cover), but as a NON-BLOCKING,
   /// REPLY-LESS fire-and-forget: it `try_send`s the ack-less command and reports whether the
   /// control channel accepted it. Unlike `set_cover` it never awaits — so it applies a deferred
-  /// reconcile PROMPTLY, without waiting for a later watcher operation to carry it (Codex R37-F2:
-  /// a `Covered`-outside grow arms nothing, so a queue-only reconcile would otherwise wait for an
+  /// reconcile PROMPTLY, without waiting for a later watcher operation to carry it (/// a `Covered`-outside grow arms nothing, so a queue-only reconcile would otherwise wait for an
   /// unrelated arm).
   ///
   /// The driver applies a reply-less `SetCover` exactly like the awaited one — the same in-place
@@ -660,7 +659,7 @@ impl<R: RuntimeLite> Watcher<R> {
   /// opportunity) or closed, or when `root` is a foreign handle; `true` when the request was
   /// enqueued. Never blocks and never panics.
   ///
-  /// Crate-internal for the same reason as [`set_cover`](Self::set_cover) (Codex R43): enqueue
+  /// Crate-internal for the same reason as [`set_cover`](Self::set_cover): enqueue
   /// says nothing about when the kernel coverage matches the cover, so the pair stays off the
   /// public surface until the effect-completion fence lands.
   #[cfg_attr(not(test), allow(dead_code))]

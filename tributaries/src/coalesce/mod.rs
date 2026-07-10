@@ -207,7 +207,7 @@ where
   /// clock guarantees it).
   ///
   /// Returns `Some(subscription)` when this admission OVERFLOWED the buffered-entry cap
-  /// ([`DebounceConfig::max_buffered`], Codex R55): the event was NOT buffered, and the
+  /// ([`DebounceConfig::max_buffered`]): the event was NOT buffered, and the
   /// caller owes that subscription the same dominating parked
   /// [`Rescan`](EventKind::Rescan) it mints for a full event channel
   /// (`park_rescan` — which also purges the subscription's buffered entries), so the
@@ -240,7 +240,7 @@ where
     ) {
       // A known lifecycle change (Created / Modified / Removed): buffer it, collapsing onto
       // any entry already held for its (subscription, path) — or shed the subscription
-      // when a fresh entry would overflow the cap (Codex R55).
+      // when a fresh entry would overflow the cap.
       self.coalesce(ev, now)
     } else {
       // An unknown/future non-lifecycle kind: the umbrella's own `EventKind` is
@@ -248,8 +248,7 @@ where
       // default arm would relabel or drop one). Do NOT buffer it — flush the subscription's
       // buffer and emit it immediately, exactly like a Moved/Rescan, so it is delivered
       // in-order (older buffered entries flushed ahead of it, the monotone per-subscription
-      // epoch preserved) and never collapsed under an allowed version-skew (Codex R11 F2,
-      // no silent loss).
+      // epoch preserved) and never collapsed under an allowed version-skew (// no silent loss).
       self.flush_subscription(ev.subscription(), now);
       self.ready.push_back((now, ev));
       None
@@ -342,7 +341,7 @@ where
     let seq = self.bump_seq();
     let Some(buffered) = self.buffer.get_mut(&key) else {
       // First change to this path in the window: a FRESH entry — the only way the
-      // buffer grows, so this is where the structural memory bound lives (Codex R55).
+      // buffer grows, so this is where the structural memory bound lives.
       // At the cap, shed the subscription instead of growing: the event is dropped
       // UNBUFFERED and the caller parks the dominating Rescan that accounts for it
       // (and purges the subscription's entries, freeing space). Collapses below never

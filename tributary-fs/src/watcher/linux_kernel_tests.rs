@@ -1,6 +1,6 @@
 //! Real-inotify end-to-end regressions for the crate-internal set-cover pair.
 //!
-//! These three tests lived in the external `linux_inotify` integration binary until Codex R43
+//! These three tests lived in the external `linux_inotify` integration binary until the crate
 //! demoted [`Watcher::set_cover`] / [`Watcher::request_set_cover`] to `pub(crate)` (the ack
 //! resolves at effect-queue time, not watch-live time — the pair stays off the public surface
 //! until the effect-completion fence lands), which an external test binary can no longer call.
@@ -11,8 +11,8 @@
 //! tests (e.g. the `os::linux::inotify` suite) arm real inotify watches concurrently — so all
 //! watch-descriptor assertions are **object-scoped**: [`wds_watching`] matches fdinfo entries
 //! against the `(device, inode)` pairs of THIS test's own scratch directories, never a
-//! process-wide count that another test's arm or teardown could satisfy or mask (Codex R45;
-//! device+inode rather than inode alone, since inodes are unique only per device — R46).
+//! process-wide count that another test's arm or teardown could satisfy or mask
+//! (device+inode rather than inode alone, since inodes are unique only per device).
 
 use std::{
   collections::HashSet,
@@ -78,7 +78,7 @@ fn covers(event: &Event, path: &Path) -> bool {
 /// KERNEL encoding fdinfo prints: `sdev:` carries the superblock's `s_dev` — `MKDEV`, i.e.
 /// `major << 20 | minor` — while `stat`'s `st_dev` is glibc-encoded, so the two only happen
 /// to coincide on major-0 devices like tmpfs. Converting through `major`/`minor` makes the
-/// match hold on ANY filesystem, not just the tmp one (Codex R46).
+/// match hold on ANY filesystem, not just the tmp one.
 fn objects_of(paths: &[PathBuf]) -> HashSet<(u64, u64)> {
   paths
     .iter()
@@ -94,7 +94,7 @@ fn objects_of(paths: &[PathBuf]) -> HashSet<(u64, u64)> {
 /// Whether one fdinfo line records an inotify watch on one of `objects`: it must start with
 /// the `inotify wd:` marker and its `sdev:` + `ino:` hex fields must BOTH match one pair —
 /// device and inode together, since inode numbers are unique only within a device and this
-/// scans every inotify fd in the process (Codex R46).
+/// scans every inotify fd in the process.
 fn line_matches(line: &str, objects: &HashSet<(u64, u64)>) -> bool {
   if !line.starts_with("inotify wd:") {
     return false;
@@ -116,8 +116,8 @@ fn line_matches(line: &str, objects: &HashSet<(u64, u64)>) -> bool {
 /// line per live watch, naming the watched object. Matching on this test's own directories'
 /// `(device, inode)` pairs makes the count immune to every sibling test's inotify activity
 /// (the `os::linux::inotify` unit tests arm and release real watches, unlocked, in this same
-/// parallel binary — a process-wide count could be satisfied or masked by them, Codex R45),
-/// including a sibling watching a same-inode object on a DIFFERENT filesystem (Codex R46).
+/// parallel binary — a process-wide count could be satisfied or masked by them),
+/// including a sibling watching a same-inode object on a DIFFERENT filesystem.
 fn wds_watching(objects: &HashSet<(u64, u64)>) -> usize {
   let mut total = 0;
   let Ok(entries) = std::fs::read_dir("/proc/self/fdinfo") else {
@@ -135,7 +135,7 @@ fn wds_watching(objects: &HashSet<(u64, u64)>) -> usize {
 }
 
 /// The fdinfo matcher is device+inode exact: a line with the right inode on the WRONG
-/// device (the R46 collision) is rejected, the right pair on either field order is
+/// device (the cross-device inode collision) is rejected, the right pair on either field order is
 /// counted, and non-inotify lines never match.
 #[test]
 fn fdinfo_line_matching_is_device_and_inode_exact() {
@@ -153,7 +153,7 @@ fn fdinfo_line_matching_is_device_and_inode_exact() {
   );
   assert!(
     !line_matches("inotify wd:9 ino:16fa6 sdev:800002 mask:fff", &objects),
-    "the same inode on a DIFFERENT device is rejected (Codex R46)"
+    "the same inode on a DIFFERENT device is rejected"
   );
   assert!(
     !line_matches("inotify wd:9 ino:dead sdev:11 mask:fff", &objects),
@@ -184,24 +184,24 @@ async fn converge(mut done: impl FnMut() -> bool) -> bool {
 }
 
 /// Closes the watcher and waits (bounded) until no watch descriptor on this test's own
-/// inodes remains (Codex R44): dropping a [`Watcher`] only *requests* an asynchronous driver
+/// inodes remains: dropping a [`Watcher`] only *requests* an asynchronous driver
 /// shutdown, so a test must prove its kernel teardown finished rather than leak watches past
 /// its end. Object-scoped, so a sibling test's activity can neither satisfy nor stall it.
 async fn close_and_drain(w: TokioWatcher, objects: &HashSet<(u64, u64)>) {
   w.close().await.expect("close watcher");
   assert!(
     converge(|| wds_watching(objects) == 0).await,
-    "watcher teardown releases every watch descriptor on this test's directories (Codex R44)"
+    "watcher teardown releases every watch descriptor on this test's directories"
   );
 }
 
-/// M2-B set-cover, end to end against real inotify: a wide root that armed per-directory
+/// Set-cover: end to end against real inotify: a wide root that armed per-directory
 /// watches over TWO nested subtrees is reconciled in place down to a retained cover, then
 /// **grown back**. Phase 1 (shrink): the strictly-outside subtree's watch descriptors are
 /// reclaimed (its object-scoped wd count drops to zero) while the retained subtree's stay
 /// intact and keep delivering with NO gap (never re-armed), and the pruned subtree stops
 /// delivering — the whole point of shrinking the kernel coverage rather than releasing and
-/// re-arming. Phase 2 (grow, Codex R36): re-issuing a cover that once again includes the
+/// re-arming. Phase 2 (grow): re-issuing a cover that once again includes the
 /// pruned subtree re-arms it in place, so a fresh deep write under it IS delivered again —
 /// the bidirectional dual, without which a survivor watching a previously-pruned subtree
 /// would sit over a hole no watch backs.
@@ -315,7 +315,7 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
     "the pruned /drop subtree stops delivering after the shrink"
   );
 
-  // PHASE 2 — GROW BACK (Codex R36): re-issue a cover that once again includes /drop. The
+  // PHASE 2 — GROW BACK: re-issue a cover that once again includes /drop. The
   // set-cover is bidirectional, so /drop's per-directory watches are re-armed in place (its
   // deepest still-watched ancestor — the root — is re-armed, re-installing /drop and /drop/deep
   // and cascading down), with no re-crawl of the retained /keep.
@@ -339,12 +339,12 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
     wait_for(&mut w, |e| covers(e, &drop_regrown))
       .await
       .is_some(),
-    "the re-armed /drop/deep subtree delivers again after the set-cover grew it back (Codex R36)"
+    "the re-armed /drop/deep subtree delivers again after the set-cover grew it back"
   );
   close_and_drain(w, &all).await;
 }
 
-/// M2-B set-cover, the R37-F1 regression: growing back to a RETAINED ANCESTOR whose connecting watch
+/// Set-cover: the regression: growing back to a RETAINED ANCESTOR whose connecting watch
 /// is still armed must re-arm the descendants the narrower cover pruned. A narrow cover {a/b/deep}
 /// keeps a/b as a connecting ancestor (its watch survives) while pruning a/b's OTHER child a/b/other.
 /// Growing to {a/b} then finds a/b's watch present — the exact situation the OLD exact-path grow check
@@ -413,7 +413,7 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
   // GROW to {a/b}: a/b is a retained prefix whose OWN watch still exists (it was the connecting
   // ancestor), but whose descendant a/b/other was pruned. The broadening delta re-arms a/b's deepest
   // still-watched ancestor-or-self — a/b itself — re-installing a/b/other. The OLD exact-path check
-  // saw a/b's watch present and skipped the re-arm, leaving a/b/other a silent hole (Codex R37-F1).
+  // saw a/b's watch present and skipped the re-arm, leaving a/b/other a silent hole.
   w.set_cover(h, vec![root.join("a/b")])
     .await
     .expect("grow to the retained ancestor");
@@ -429,12 +429,12 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
     wait_for(&mut w, |e| covers(e, &other_regrown))
       .await
       .is_some(),
-    "growing back to the retained ANCESTOR a/b re-arms the previously-pruned a/b/other (Codex R37-F1)"
+    "growing back to the retained ANCESTOR a/b re-arms the previously-pruned a/b/other"
   );
   close_and_drain(w, &all).await;
 }
 
-/// M2-B set-cover, the R37-F1 root-key cancel: after an applied shrink, re-issuing the root's OWN key
+/// Set-cover: the root-key cancel: after an applied shrink, re-issuing the root's OWN key
 /// (the cancel-equivalent = full coverage) must re-arm every previously-pruned region. The broadening
 /// delta of the root against any narrower applied cover is the root itself, so its subtree is re-armed
 /// wholesale, re-installing the pruned /drop — a deep write under it is delivered again.
@@ -491,7 +491,7 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
 
   // ROOT-KEY CANCEL: re-issue the root's OWN key = full coverage. The broadening delta is the root
   // itself (not under the narrower {keep}), so the root's subtree is re-armed, re-installing every
-  // previously-pruned region — /drop included (Codex R37-F1, the full-cover cancel).
+  // previously-pruned region — /drop included (the full-cover cancel).
   w.set_cover(h, vec![root.clone()])
     .await
     .expect("root-key cancel");
@@ -507,7 +507,7 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
     wait_for(&mut w, |e| covers(e, &drop_regrown))
       .await
       .is_some(),
-    "a root-key cancel after an applied shrink re-arms every previously-pruned region (Codex R37-F1)"
+    "a root-key cancel after an applied shrink re-arms every previously-pruned region"
   );
   close_and_drain(w, &all).await;
 }

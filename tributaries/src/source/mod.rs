@@ -6,7 +6,7 @@
 //! one place that knows how a key maps to a concrete watch, and how a raw change maps
 //! back to a located key. For 0.1.0 the only source is [`FsSource`], binding
 //! `C = OsString` (a path's components) to the local filesystem over one
-//! [`tributary_fs::Watcher`]; a general remote-capable registry is M2.
+//! [`tributary_fs::Watcher`]; a general remote-capable registry is future work.
 //!
 //! # The seam
 //!
@@ -51,7 +51,7 @@ mod tests;
 /// An implementor owns the source-specific knowledge of how a key maps to a real watch
 /// and how a raw change maps back to a located key; the umbrella drives it as the single
 /// writer and never re-implements that mapping. This is **static dispatch only** — a
-/// `dyn`-compatible registry for heterogeneous remote sources is M2.
+/// `dyn`-compatible registry for heterogeneous remote sources is future work.
 ///
 /// The default local-filesystem implementation is [`FsSource`].
 ///
@@ -65,8 +65,7 @@ mod tests;
 /// **REQUIRED of a conforming `Source` (the umbrella relies on these):**
 ///
 /// - **Generation-unique [`Handle`](Self::Handle)** — a handle value is never reused while any root
-///   or not-yet-emitted event still carries it (the hard contract on [`Handle`](Self::Handle), Codex
-///   R15). Makes handle ABA impossible; the umbrella routes strictly by handle rather than defending
+///   or not-yet-emitted event still carries it (the hard contract on [`Handle`](Self::Handle)). Makes handle ABA impossible; the umbrella routes strictly by handle rather than defending
 ///   against reuse.
 /// - **Bounded [`arm`](Self::arm) / [`grow`](Self::grow) / [`canonicalize_key`](Self::canonicalize_key)**
 ///   — the umbrella awaits [`arm`](Self::arm) and [`grow`](Self::grow) and calls the synchronous
@@ -95,7 +94,7 @@ mod tests;
 ///   owner checks at the TOP priority everywhere it selects (a non-blocking `try_recv` each iteration
 ///   AND the first `select!` arm, in both the run loop and the source-drain teardown), NOT the command
 ///   mailbox — so shutdown latency is **bounded independent of** how deep the unbounded `watch`/
-///   `unwatch` backlog is (Codex R27). And the owner never awaits source I/O on any cleanup path:
+///   `unwatch` backlog is. And the owner never awaits source I/O on any cleanup path:
 ///   owner actions that are *not* a caller-awaited `watch` — a `DropOrphan` from a dropped `watch`
 ///   grant, the send-failure / all-handles-gone orphan on the same path, and the source-drain teardown
 ///   — release an emptied root through the **synchronous** [`disarm`](Self::disarm). Because `disarm`
@@ -104,7 +103,7 @@ mod tests;
 ///   source, whose own `Drop` applies any still-pending releases.
 /// - **No stranded or corrupt state.** A committed-but-unclaimed subscription is always reconciled
 ///   away (the `WatchGrant`, invariant I1); a subscription terminal-retired while unclaimed leaves no
-///   lingering parked `Rescan` behind (Codex R20-F2); and a released-then-re-`watch`ed key never
+///   lingering parked `Rescan` behind; and a released-then-re-`watch`ed key never
 ///   surfaces the [`Overlaps`](tributary_fs::WatchRootError::Overlaps) the umbrella exists to subsume
 ///   away — a conforming source guarantees no arm surfaces an overlap caused by a released root
 ///   (contract clause 2), whether by pre-applying the release or by resolving the lower watcher's own
@@ -113,7 +112,7 @@ mod tests;
 /// **OPTIONAL of a source (in-place coverage reconcile — never relied on for delivery correctness):**
 ///
 /// A source may reclaim (and, when a survivor returns to a pruned region, restore) the kernel
-/// coverage of a root that outlived the subscription whose key equalled it (design §5, M2-B v3). It
+/// coverage of a root that outlived the subscription whose key equalled it (design §5, set-cover ). It
 /// has two halves, split by their correctness role:
 ///
 /// - [`set_cover`](Self::set_cover), the **PRUNE** half — an opt-in, synchronous, fire-and-forget
@@ -132,7 +131,7 @@ mod tests;
 ///   the default no-op `set_cover` (its coverage never narrows) keeps the default no-op `grow` too.
 ///   `grow` is awaited inside the caller-bounded reconcile and **applied before return**, so the
 ///   newcomer's coverage is live before `watch()` returns — closing the request→apply window a
-///   fire-and-forget re-issue left open (Codex R39-F1, M2-B v3), with no bridging `Rescan` needed.
+///   fire-and-forget re-issue left open (set-cover ), with no bridging `Rescan` needed.
 ///
 /// # `Send` bounds
 ///
@@ -158,11 +157,11 @@ mod tests;
 /// and cancel-safe by construction, meeting the [`next`](Self::next) contract for
 /// free), never by the ring internals, which stay pinned to their own thread. Hosting
 /// the umbrella OWNER itself on a `!Send` executor is a separate, deliberately deferred
-/// question (M2-E): the handle plane is already executor-agnostic, callers who need to
+/// question: the handle plane is already executor-agnostic, callers who need to
 /// own the spawn use [`Tributaries::parts`](crate::Tributaries::parts), and relaxing
 /// these trait bounds awaits stable return-type notation.
 ///
-/// # Cancellation and `Drop` reclamation (Codex R54)
+/// # Cancellation and `Drop` reclamation
 ///
 /// With [`Tributaries::parts`](crate::Tributaries::parts) the owner future is
 /// caller-owned and **may be dropped at any await point** — including mid-[`arm`](Source::arm)
@@ -196,7 +195,7 @@ pub trait Source<C> {
   /// [`disarm`](Self::disarm): a re-arm always mints a *fresh* generation.
   ///
   /// This makes handle **ABA impossible**, and the umbrella relies on it rather than defending
-  /// against ABA itself (Codex R15 — a defensive alias-detection was both incomplete and the wrong
+  /// against ABA itself (a defensive alias-detection was both incomplete and the wrong
   /// layer). Two consequences the umbrella depends on:
   ///
   /// - **An old-generation event never routes through a re-armed root.** A value the umbrella
@@ -206,17 +205,17 @@ pub trait Source<C> {
   ///   so the event falls to the dead-root retire/drain path — never onto the re-armed root. Were
   ///   the same value reused (ABA), that stale event would route through the live re-armed root
   ///   *after* the umbrella rebased its epochs, applying a stale change its restore
-  ///   [`Rescan`](EventKind::Rescan) no longer dominates (Codex R15-F1).
+  ///   [`Rescan`](EventKind::Rescan) no longer dominates.
   /// - **A fresh arm's handle never aliases a live root.** The umbrella keys its reverse index
   ///   (handle → root) on this token; a generation-unique value is absent from that index at commit
   ///   time, so a fresh arm — including each one-at-a-time re-arm of a failed widen's disarmed
   ///   siblings, whose not-yet-restored siblings are **still recorded** — can never overwrite
-  ///   another root's entry and strand it published-but-unroutable (Codex R15-F2).
+  ///   another root's entry and strand it published-but-unroutable.
   ///
   /// A conforming source therefore lets the umbrella rebind/commit onto the fresh handle
   /// unconditionally; a debug-only owner-level observed-handle `debug_assert` at the single arm
   /// choke point is the exhaustive tripwire for a contract-violating source (it catches reuse of a
-  /// handle already retired out of the live index too, Codex R17), never a release-mode recovery.
+  /// handle already retired out of the live index too), never a release-mode recovery.
   /// [`FsSource`] satisfies the contract structurally: its [`RootHandle`] carries a
   /// **monotonically-minted** `tributary_proto::ScopeId` never reissued for the life of the watcher.
   type Handle: Copy + Eq + core::hash::Hash;
@@ -290,12 +289,12 @@ pub trait Source<C> {
   ///    was requested — this is what makes widen (release the narrow roots, arm the wider root) and
   ///    re-watch-after-orphan correct with **no** umbrella-side flushing. HOW it achieves this is the
   ///    source's own business, so long as the release work any *single* arm performs is bounded by
-  ///    the releases that **overlap that arm's key** — never the whole (disjoint) backlog (Codex
-  ///    R28/R29/R30). The overlapping-conflict set is the *caller's own*: an ancestor watch over N
+  ///    the releases that **overlap that arm's key** — never the whole (disjoint) backlog.
+  ///    The overlapping-conflict set is the *caller's own*: an ancestor watch over N
   ///    roots the caller itself created and released legitimately resolves those N conflicts inside
   ///    that one caller-bounded `Watch` — invariant I1 run-to-completion — and a
   ///    [`close`](crate::Tributaries::close) queued behind it waits for that one reconcile, exactly
-  ///    as it waits for any in-flight caller command (the RATIFIED semantics, Codex R33: close is
+  ///    as it waits for any in-flight caller command (the RATIFIED semantics: close is
   ///    decoupled from *unrelated* backlogs — command floods, disjoint release queues — not from the
   ///    single caller reconcile it queued behind). Two conforming mechanisms:
   ///    - **pre-application** — apply queued releases before the watch; or
@@ -341,7 +340,7 @@ pub trait Source<C> {
   /// backlog or a queued [`close`](crate::Tributaries::close).
   ///
   /// The umbrella issues this when a `Covered` newcomer lands OUTSIDE a root's already-narrowed
-  /// coverage (design §5, M2-B v3): the newcomer arms nothing, so without a grow the source would not
+  /// coverage (design §5, set-cover ): the newcomer arms nothing, so without a grow the source would not
   /// back its subtree. Rather than release-and-rearm the whole root at the umbrella (which would move
   /// the survivors' coverage, forcing a gap-closing [`Rescan`](EventKind::Rescan)), the
   /// source re-arms only the missing subtree in place — survivor coverage never moves, so events under
@@ -356,7 +355,7 @@ pub trait Source<C> {
   ///    newcomer with **no bridging `Rescan`**: a watch is "changes from now on", and because coverage
   ///    is live before `watch()` returns there is no request→apply window in which a write could be
   ///    silently lost — the exact loss a deferred fire-and-forget re-issue behind an already-flushed
-  ///    bridge could leak (Codex R39-F1).
+  ///    bridge could leak.
   /// 2. **Never moves survivor coverage.** A `retained` prefix the source already covers is left
   ///    untouched (no re-crawl, no gap); only a prefix it does not yet cover is (re-)armed.
   /// 3. **Idempotent.** Growing to a `retained` the source already fully covers is a no-op.
@@ -391,7 +390,7 @@ pub trait Source<C> {
   ///
   /// The umbrella issues this when a drop leaves a wide root broader than any live subscriber — an
   /// over-broad `unwatch` (the departing subscription's key equalled the root's), or a non-root
-  /// `unwatch` that shrinks an already-narrowed cover (design §5, M2-B v3). Rather than release-and-
+  /// `unwatch` that shrinks an already-narrowed cover (design §5, set-cover ). Rather than release-and-
   /// rearm the whole root at the umbrella (which would move the survivors' coverage, forcing a
   /// gap-closing [`Rescan`](EventKind::Rescan)), the source reclaims the KERNEL coverage
   /// in place: it **never moves survivor coverage that is already correct**, so events under an
@@ -654,7 +653,7 @@ pub struct FsSource<R: RuntimeLite> {
   /// Roots whose release was requested (via the synchronous [`disarm`](Source::disarm)) but not yet
   /// handed to the [`Watcher`]'s control channel, each paired with the released root's **canonical
   /// path** captured at `disarm` time (while it was still live in the registry). [`arm`](Source::arm)
-  /// drains this queue two ways (contract clause 2, Codex R29/R41): (1) **opportunistically** it walks
+  /// drains this queue two ways (contract clause 2): (1) **opportunistically** it walks
   /// the queue and hands each entry to the watcher via the NON-BLOCKING, reply-less
   /// [`request_unwatch`](tributary_fs::Watcher::request_unwatch) — moving it to the in-flight
   /// [`enqueued`](Self::enqueued) sidecar — so the arm AWAITS NOTHING for a release that does not
@@ -665,14 +664,14 @@ pub struct FsSource<R: RuntimeLite> {
   /// (identity-aware — it catches case/normalization aliases) and retrying. The only release work a
   /// single arm AWAITS is (2) — bounded by that arm's OWN overlapping conflicts, never the (disjoint)
   /// backlog — so a caller-bounded `Watch`, and any [`close`](crate::Tributaries::close) queued behind
-  /// it, never waits on unrelated teardown latency (Codex R28/R29/R41). A `None` path means the root
+  /// it, never waits on unrelated teardown latency. A `None` path means the root
   /// was already torn down when disarmed; it can never be the *named* conflict, so it is applied only
   /// opportunistically (or at `Drop`, where the [`Watcher`]'s own teardown releases every live root).
   /// Bounded in practice by the live-root count: each generation-unique handle is released at most once.
   pending_releases: VecDeque<(RootHandle, Option<PathBuf>)>,
   /// Requested releases whose reply-less [`request_unwatch`](tributary_fs::Watcher::request_unwatch)
   /// the control channel ACCEPTED but the watcher registry may not yet reflect — the **in-flight**
-  /// releases (Codex R41). Kept so a conflicting later arm can still resolve an
+  /// releases. Kept so a conflicting later arm can still resolve an
   /// [`Overlaps`](tributary_fs::WatchRootError::Overlaps) the watcher NAMES against a release whose
   /// fire-and-forget teardown has not landed yet: the entry is no longer in
   /// [`pending_releases`](Self::pending_releases), so without this sidecar the exact-match would miss
@@ -721,8 +720,8 @@ impl<R: RuntimeLite> FsSource<R> {
 }
 
 /// How many pending releases one `arm` hands to the watcher's control channel via the
-/// reply-less [`Watcher::request_unwatch`] — the HARD per-arm opportunistic budget (Codex
-/// R42-F2). A channel-full stop is not a bound (the driver drains concurrently, so `try_send`
+/// reply-less [`Watcher::request_unwatch`] — the HARD per-arm opportunistic budget (
+/// ). A channel-full stop is not a bound (the driver drains concurrently, so `try_send`
 /// can keep succeeding), and every reply-less `Unwatch` handed off here is processed BEFORE this
 /// arm's own `watch` command on the same FIFO control channel — so an unbounded walk would couple
 /// the caller (and any close behind it) to the entire unrelated release backlog. A fixed few per
@@ -773,8 +772,8 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     // watcher's control channel via the reply-less `request_unwatch` (a `try_send`). On acceptance
     // the entry moves from the queue to the in-flight `enqueued` sidecar and STAYS dead-marked in
     // `pending_set` (it is logically dead until its teardown lands, clause 3). This AWAITS NOTHING — a
-    // disjoint arm is decoupled from every release's teardown latency (Codex R41). The bound is a
-    // FIXED per-arm handoff budget, NOT the channel-full stop (Codex R42-F2): on a multi-threaded
+    // disjoint arm is decoupled from every release's teardown latency. The bound is a
+    // FIXED per-arm handoff budget, NOT the channel-full stop: on a multi-threaded
     // runtime the driver drains the channel concurrently, so try_send could keep succeeding and an
     // unbounded walk would enqueue the ENTIRE unrelated backlog ahead of this arm's own watch
     // command on the same FIFO channel — coupling the caller (and any close behind it) to unrelated
@@ -804,10 +803,10 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     // release was requested, QUEUED or IN-FLIGHT (disarm contract clause 2) — is upheld here by
     // construction: the WATCHER itself names the conflicting `existing` root (it rejects by
     // object/ancestor IDENTITY, so it catches case/normalization aliases a byte-prefix overlap test
-    // would miss — Codex R29-F2). While the watcher's registry still reports a requested release live
+    // would miss). While the watcher's registry still reports a requested release live
     // (so it can name it), that release is in `pending_releases` (not yet handed over) OR in `enqueued`
     // (handed over, teardown not landed) — never neither — so the named `existing` EXACT-matches one of
-    // the two. Retry is a **structural progress bound** (Codex R30-F2/R41), not a fixed cap: on a match
+    // the two. Retry is a **structural progress bound**, not a fixed cap: on a match
     // remove exactly that entry, AWAIT its `unwatch`, and re-attempt. An `enqueued` match awaits an
     // acked `unwatch` that — enqueued after the earlier reply-less request on the one FIFO channel —
     // resolves only once the driver has processed that teardown and reclaimed the registry entry, so
@@ -833,8 +832,7 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
         debug_assert!(
           iterations <= initial_pending + 1,
           "FsSource::arm conflict-retry exceeded (queued + in-flight)+1 iterations — the queued and \
-           in-flight release sets must strictly shrink each retry (structural progress bound, Codex \
-           R30-F2/R41)"
+           in-flight release sets must strictly shrink each retry (structural progress bound)"
         );
       }
       match self.watcher.watch(arm_path.clone(), Interest::all()).await {
@@ -888,8 +886,7 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     // released root's canonical path captured NOW, while the root is still live in the registry — never
     // apply it inline. A later `arm` hands it to the watcher via the NON-BLOCKING `request_unwatch`
     // (the common path, which awaits nothing), or — if that arm's key overlaps this release — resolves
-    // the conflict the watcher NAMES by awaiting exactly its `unwatch` (contract clause 2, Codex
-    // R29/R41); `Drop` releases whatever is left (the `Watcher`'s own teardown reclaims every live
+    // the conflict the watcher NAMES by awaiting exactly its `unwatch` (contract clause 2); `Drop` releases whatever is left (the `Watcher`'s own teardown reclaims every live
     // root). A `None` path means the root is already gone (`root_path` answers `None`): it can never be
     // the named conflict, so it is only applied opportunistically. The `pending_set` mirror makes the
     // handle logically dead the instant this returns — `root_key` answers `None`. Idempotent by the
@@ -900,7 +897,7 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     }
   }
 
-  /// **Deferred no-op — Codex R40 safe-disable.** The awaited GROW half of in-place coverage
+  /// **Deferred no-op safe-disable.** The awaited GROW half of in-place coverage
   /// reconcile is disabled for the fs source. `grow`'s hard contract is met **vacuously** here:
   /// [`arm`](Self::arm) arms every root `Interest::all` over its **whole subtree** and this source's
   /// actual coverage never narrows below a root (its [`set_cover`](Self::set_cover) is the matching
@@ -922,7 +919,7 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     let _ = (handle, retained);
   }
 
-  /// **Deferred no-op — Codex R40 safe-disable.** The PRUNE half of in-place coverage reconcile is
+  /// **Deferred no-op safe-disable.** The PRUNE half of in-place coverage reconcile is
   /// disabled for the fs source. A no-op is a **conforming** `set_cover` (contract clause 5, "purely
   /// an optimization" — correctness never depends on it): leaving a root at full-subtree coverage
   /// merely keeps it over-broad, which is correctness-neutral and self-healing, so this source
@@ -933,7 +930,7 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   /// It stands down together with its awaited GROW counterpart [`grow`](Self::grow): the prune cannot
   /// be safely restored until the fs core mints an **effect-completion token** for the acked
   /// `Watcher::set_cover` (now crate-internal; it returns at effect-QUEUE time, not
-  /// when the kernel watches are live — Codex R40), so both halves defer rather than pruning coverage
+  /// when the kernel watches are live), so both halves defer rather than pruning coverage
   /// a not-yet-correct `grow` could not restore. Deferred to a dedicated follow-up. The [`Source`]
   /// contract, the umbrella semantics, and the [`Watcher`] plumbing all remain correct and tested —
   /// only this binding defers.

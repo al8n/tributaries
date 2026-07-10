@@ -499,7 +499,7 @@ impl Monitor {
   /// Re-arms the live per-directory watch subtree rooted at `watch` — the in-place **grow**
   /// that restores kernel coverage of a subtree an earlier [`drop_watch_subtree`](Self::drop_watch_subtree)
   /// pruned but that a survivor now needs again (the bidirectional dual of that shrink prune,
-  /// set-cover / M2-B v2).
+  /// set-cover / set-cover ).
   ///
   /// It reuses the exact overflow re-arm machinery (`start_rearm` →
   /// `rearm_enumerate`): a complete re-arm read installs a fresh

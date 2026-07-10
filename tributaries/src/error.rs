@@ -69,7 +69,7 @@ pub enum WatchError {
   /// The owner is holding the maximum RETIRED parked-`Rescan` debt — terminal
   /// [`Rescan`](crate::EventKind::Rescan)s owed to subscriptions whose roots died,
   /// parked because the event channel was full, and retained past the subscriptions'
-  /// retirement so the deaths are never silently lost (Codex R58). New watch admission
+  /// retirement so the deaths are never silently lost. New watch admission
   /// is refused at that cap: each retire-and-rewatch cycle mints another retired entry,
   /// so gating the ONE step the cycle needs — a fresh watch — is what keeps the debt
   /// (each entry retains a key and a cloned value) structurally bounded. Drain

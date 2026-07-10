@@ -69,7 +69,7 @@ struct IndexerSource<R: RuntimeLite> {
   /// `Watcher`, each paired with the released root's canonical `Comp` key captured at `disarm` time.
   /// `arm` applies these opportunistically (the oldest few, bounded, up front) and on demand (resolve
   /// the `Overlaps` the watcher NAMES, then retry) — bounded per-arm release work independent of queue
-  /// depth. Mirrors the fs source's conflict-triggered release retry (Codex R29) for a caller-supplied
+  /// depth. Mirrors the fs source's conflict-triggered release retry for a caller-supplied
   /// source.
   pending_releases: VecDeque<(RootHandle, Option<Vec<Comp>>)>,
   /// Mirror of `pending_releases` for O(1) `root_key` liveness answers: a requested release is
@@ -144,7 +144,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     // and resolve on demand any `Overlaps` the watcher NAMES against a released-but-lingering root. The
     // watcher rejects by identity and names `existing` (a canonical PATH), so reverse it into the
     // `Comp` key space to find the EXACT-matching pending entry, unwatch exactly it, and retry. Retry
-    // is a structural progress bound (Codex R30-F2), not a fixed cap: each retry strictly shrinks the
+    // is a structural progress bound, not a fixed cap: each retry strictly shrinks the
     // pending queue, so it terminates in ≤ pending-queue-length retries with no arbitrary ceiling; a
     // rejection naming no pending root (a genuine live conflict) surfaces the overlap immediately (no
     // index-0 fallback masking a real conflict by unwatching an unrelated pending root).
@@ -170,7 +170,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
         debug_assert!(
           iterations <= initial_pending + 1,
           "IndexerSource::arm conflict-retry exceeded pending+1 iterations — pending must strictly \
-           shrink each retry (structural progress bound, Codex R30-F2)"
+           shrink each retry (structural progress bound)"
         );
       }
       match self.watcher.watch(path.clone(), Interest::all()).await {
@@ -215,8 +215,8 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     // Synchronous, non-blocking release REQUEST (mirroring the fs source): the watcher's `unwatch`
     // awaits a bounded ack, so queue the teardown — paired with the released root's canonical `Comp`
     // key captured NOW from the live registry (independent of `pending_set`), so a later `arm` can
-    // match this entry against the conflict the watcher NAMES and apply exactly it (contract clause 2,
-    // Codex R29) — and mark the handle logically dead at once. Applied opportunistically at a
+    // match this entry against the conflict the watcher NAMES and apply exactly it (contract clause 2)
+    // — and mark the handle logically dead at once. Applied opportunistically at a
     // subsequent `arm`, on demand when it blocks one, or at `Drop`. Idempotent by the set.
     if self.pending_set.insert(handle) {
       let key = self
@@ -227,7 +227,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     }
   }
 
-  /// Deferred no-op (Codex R40 safe-disable): this source arms whole subtrees, so its coverage never
+  /// Deferred no-op (safe-disable): this source arms whole subtrees, so its coverage never
   /// narrows below a root and `grow` has nothing to restore — mirroring `FsSource`, whose
   /// correctness-grade grow fence (an effect-completion token) is deferred to a follow-up.
   async fn grow(&mut self, handle: RootHandle, retained: &[Vec<Comp>]) {

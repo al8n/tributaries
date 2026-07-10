@@ -363,7 +363,7 @@ async fn dropped_lane_releases_its_sub_to_rest_without_stalling_the_demux() {
   );
   assert_eq!(alive.key(), key("/b/alive").as_slice());
 
-  // The released sub reverted to UNCLAIMED (Codex R49): every post-drop /a event —
+  // The released sub reverted to UNCLAIMED: every post-drop /a event —
   // including one a send-time reclamation recovered — surfaces on rest, none is lost,
   // and the table entry is gone.
   drop(feed);
@@ -392,7 +392,7 @@ async fn dropped_lane_releases_its_sub_to_rest_without_stalling_the_demux() {
   );
 }
 
-/// Codex R49 F1: registration BACKPRESSURES while the routing task is stalled — the
+/// registration BACKPRESSURES while the routing task is stalled — the
 /// bounded control queue absorbs [`CONTROL_CAPACITY`] registrations and the next one
 /// parks until the stall clears; it can never grow an unbounded queue. Race-free
 /// negative window: the parked routing task is the only control consumer, and this
@@ -427,7 +427,7 @@ async fn registration_backpressures_while_the_demux_is_stalled() {
   assert!(
     !registrar.is_finished(),
     "the registration past the control bound parks while the demux is stalled — \
-     registration cannot outgrow the bounded queue (Codex R49)"
+     registration cannot outgrow the bounded queue"
   );
 
   // Clear the stall: draining lane A resumes the routing task, which drains the
@@ -440,7 +440,7 @@ async fn registration_backpressures_while_the_demux_is_stalled() {
     .expect("registrar task");
 }
 
-/// M2-E `Demux::parts`: the caller owns the routing task's spawn — routing works when
+/// `Demux::parts`: the caller owns the routing task's spawn — routing works when
 /// the caller polls the returned future, and end-of-stream fan-in survives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn demux_parts_routes_when_caller_spawned() {
@@ -475,7 +475,7 @@ async fn demux_parts_routes_when_caller_spawned() {
     .expect("routing task");
 }
 
-/// Codex R54: `shutdown()` is the LOSS-FREE stop — even requested while a lane is
+/// `shutdown()` is the LOSS-FREE stop — even requested while a lane is
 /// full and the router is parked mid-send, the in-flight delivery completes once the
 /// lane drains, THEN the router exits and every lane ends after its buffered tail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -488,7 +488,7 @@ async fn shutdown_stops_and_drains_losslessly_even_while_stalled() {
 
   // Prove the router is live, then park it deterministically: /a/one round-trips
   // (router idle again), /a/two fills the capacity-1 lane, /a/three parks the send —
-  // and /a/four is QUEUED BEHIND the stall on the shared stream (the Codex R55
+  // and /a/four is QUEUED BEHIND the stall on the shared stream (the
   // stranding case: an event the router has not even pulled yet).
   feed.modified("/a", "/a/one").await;
   assert_eq!(recv(&lane_a).await.key(), key("/a/one").as_slice());
@@ -512,7 +512,7 @@ async fn shutdown_stops_and_drains_losslessly_even_while_stalled() {
       .await
       .expect("lane settles")
       .is_none(),
-    "the router exited after completing its in-flight delivery (Codex R54)"
+    "the router exited after completing its in-flight delivery"
   );
   assert!(
     tokio::time::timeout(DEADLINE, rest.recv())
@@ -527,7 +527,7 @@ async fn shutdown_stops_and_drains_losslessly_even_while_stalled() {
     .expect("routing task");
 }
 
-/// Codex R54: ABORTING the routing future mid-full-lane-send is the documented hard
+/// ABORTING the routing future mid-full-lane-send is the documented hard
 /// stop — at most the single in-flight delivery is lost, lanes end after their
 /// buffered tails (no hang), and remaining `Tributaries` clones can still drain the
 /// MPMC stream afterwards.
@@ -569,7 +569,7 @@ async fn aborting_the_routing_future_loses_at_most_the_in_flight_delivery() {
   assert_eq!(later.key(), key("/a/after-abort").as_slice());
 }
 
-/// Codex R56: the shutdown drain barrier is bounded by a COUNT SNAPSHOT taken when the
+/// the shutdown drain barrier is bounded by a COUNT SNAPSHOT taken when the
 /// stop is processed — traffic arriving DURING the barrier (while it stalls on a full
 /// lane) is past the snapshot: the routing future still resolves (no livelock against
 /// a live producer) and the post-stop events remain on the shared MPMC stream for
@@ -617,7 +617,7 @@ async fn shutdown_barrier_is_snapshot_bounded_under_a_live_producer() {
       .await
       .expect("lane settles")
       .is_none(),
-    "the barrier stopped at the snapshot — no post-stop absorption (Codex R56)"
+    "the barrier stopped at the snapshot — no post-stop absorption"
   );
   tokio::time::timeout(DEADLINE, routing)
     .await
@@ -634,7 +634,7 @@ async fn shutdown_barrier_is_snapshot_bounded_under_a_live_producer() {
   }
 }
 
-/// Codex R50: releases LOST to a full control queue cannot leak the table. The exact
+/// releases LOST to a full control queue cannot leak the table. The exact
 /// repro: stall the router on a full lane, admit CONTROL_CAPACITY registrations (the
 /// queue is now full), drop every one of those lanes — each drop-release try_send
 /// finds the queue full and is LOST — then clear the stall. The queued registrations
@@ -654,7 +654,7 @@ async fn lost_releases_on_a_full_control_queue_cannot_leak_the_table() {
 
   // Admit exactly CONTROL_CAPACITY registrations while the router is parked — filling
   // the control queue — then DROP them all: every drop-release try_send hits the full
-  // queue and is lost (the R50 hole).
+  // queue and is lost (the lost-release hole).
   let mut doomed = Vec::new();
   for i in 0..CONTROL_CAPACITY {
     let sub = watch(&w, &format!("/doomed{i}")).await;
@@ -677,11 +677,11 @@ async fn lost_releases_on_a_full_control_queue_cannot_leak_the_table() {
     demux.tracked_lanes(),
     2,
     "sixteen lost releases leaked nothing — the table is bounded by live lanes \
-     (register-time sweep + dead registrations never installed; Codex R50)"
+     (register-time sweep + dead registrations never installed)"
   );
 }
 
-/// Codex R51: a replacement registration admitted and DROPPED while the router is
+/// a replacement registration admitted and DROPPED while the router is
 /// stalled still DISPLACES the predecessor. Without unconditional displacement the
 /// sweep keeps the (live) predecessor, skip-install leaves it routed, and the queued
 /// release carries the replacement's generation — the superseded lane would keep
@@ -717,7 +717,7 @@ async fn dropped_replacement_still_displaces_the_predecessor_lane() {
       .await
       .expect("predecessor settles within the deadline")
       .is_none(),
-    "the superseded lane ends — it must not keep receiving (Codex R51)"
+    "the superseded lane ends — it must not keep receiving"
   );
   // ...and /x is unclaimed again: its traffic surfaces on rest.
   feed.modified("/x", "/x/after").await;
@@ -733,7 +733,7 @@ async fn dropped_replacement_still_displaces_the_predecessor_lane() {
   }
 }
 
-/// Codex R49 F2: watch → lane → unwatch → drop churn leaves NO residue — the lane
+/// watch → lane → unwatch → drop churn leaves NO residue — the lane
 /// table is bounded by concurrently live lanes, never by lifetime registrations. The
 /// trailing probe registration is an awaited send on the FIFO control queue, so every
 /// queued release is processed before it; the tracked count then reflects exactly the
@@ -764,7 +764,7 @@ async fn lane_churn_leaves_no_tracked_residue() {
     demux.tracked_lanes(),
     1,
     "32 churn cycles left zero residue — only the live probe lane is tracked \
-     (bounded by concurrent lanes, not lifetime registrations; Codex R49)"
+     (bounded by concurrent lanes, not lifetime registrations)"
   );
 }
 

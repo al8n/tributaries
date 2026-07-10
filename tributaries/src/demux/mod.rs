@@ -25,13 +25,13 @@ mod tests;
 
 /// The control queue's depth. Small on purpose: control messages are tiny and rare, and
 /// a BOUNDED queue is what keeps a stalled routing task from turning registration into
-/// an unbounded memory-growth path (Codex R49) — while the task is parked on a full
+/// an unbounded memory-growth path — while the task is parked on a full
 /// lane's awaited send it services no control messages, so registrants must feel
 /// backpressure instead of queueing without limit.
 const CONTROL_CAPACITY: usize = 16;
 
 /// The release a registered [`Lane`] owes on drop: its subscription, its registration
-/// brand, and the control queue to notify (Codex R49).
+/// brand, and the control queue to notify.
 struct OwedRelease<C, V> {
   sub: Subscription,
   generation: u64,
@@ -52,14 +52,14 @@ enum Control<C, V> {
     /// lives in the caller's [`Lane`].
     lane: async_channel::Sender<Event<C, V>>,
   },
-  /// An orderly stop request ([`Demux::shutdown`], Codex R54/R58): the routing task
+  /// An orderly stop request ([`Demux::shutdown`]): the routing task
   /// finishes its current delivery — never mid-send — drains the snapshot-bounded
   /// pre-stop backlog, then drops every lane sender so each lane drains its buffered
   /// tail to a clean end-of-stream. Loss-free UNDER the module's sole-drainer
   /// precondition (held through the whole barrier); post-stop events stay on the
   /// shared stream for clones that resume `next()` after the routing future resolves.
   Shutdown,
-  /// A best-effort release sent by a dropped [`Lane`] (Codex R49): remove the
+  /// A best-effort release sent by a dropped [`Lane`]: remove the
   /// subscription's slot — IF it still holds generation `generation` — returning the
   /// subscription to unclaimed (rest) routing. Lost releases (full/closed control
   /// queue) are covered by send-time reclamation in the routing loop.
@@ -112,7 +112,7 @@ enum Control<C, V> {
 /// [`lane`](Self::lane) registers a bounded per-subscription lane over a **bounded**
 /// control channel into the routing task; the registration send is awaited, so while
 /// the routing task is stalled on a full lane, registrants feel backpressure instead of
-/// growing an unbounded control queue (Codex R49). Events whose subscription has no
+/// growing an unbounded control queue. Events whose subscription has no
 /// registered lane land on the **rest** lane returned by [`spawn`](Self::spawn). A
 /// registration is applied before the routing of any event that enters the shared
 /// stream after it returns, so events emitted after `lane` returns reach the lane;
@@ -125,10 +125,10 @@ enum Control<C, V> {
 /// that observes the dropped receiver reclaims the slot on the spot (recovering that
 /// very event), and — the structural backstop — every registration first sweeps all
 /// entries whose receiver is gone before installing (registration being the table's
-/// only growth site, Codex R50; a release lost to a full control queue on an idle
+/// only growth site; a release lost to a full control queue on an idle
 /// subscription is reclaimed at the latest by the next registration). All three paths
 /// REMOVE the entry, so the lane table is bounded by *peak-concurrent* lanes, never by
-/// lifetime registrations (Codex R49). From the
+/// lifetime registrations. From the
 /// release onward the subscription is unclaimed again: its late stragglers surface on
 /// the rest lane exactly like pre-registration traffic — while a lane is registered it
 /// exclusively owns its subscription's events; there is no split delivery. A consumer
@@ -201,7 +201,7 @@ enum Control<C, V> {
 /// ```
 pub struct Demux<C, V> {
   /// The bounded control channel into the routing task (capacity
-  /// [`CONTROL_CAPACITY`]; Codex R49 — a stalled task backpressures registrants).
+  /// [`CONTROL_CAPACITY`]; a stalled task backpressures registrants).
   control: async_channel::Sender<Control<C, V>>,
   /// Brands each registration (see [`Control::Register::generation`]).
   next_gen: AtomicU64,
@@ -235,7 +235,7 @@ impl<C, V> Drop for Lane<C, V> {
       // Best-effort PROMPT path: a full or closed control queue skips the notice. A
       // lost release is still reclaimed — at the next delivery against the dropped
       // receiver (recovering that event to rest), or structurally by the next
-      // registration's sweep (Codex R50) — so it costs staleness, never unboundedness.
+      // registration's sweep — so it costs staleness, never unboundedness.
       let _ = control.try_send(Control::Release { sub, generation });
     }
   }
@@ -271,12 +271,12 @@ impl<C, V> Demux<C, V> {
   }
 
   /// Like [`spawn`](Self::spawn) but WITHOUT spawning: returns the control handle, the
-  /// rest lane, and the routing future for the CALLER to spawn (M2-E) — the demux twin
+  /// rest lane, and the routing future for the CALLER to spawn — the demux twin
   /// of [`Tributaries::parts`]. Routing progresses only while the future is polled
   /// (unpolled = every lane silent), and the future is `Send` so any executor may host
   /// it (the routing loop itself uses no timers).
   ///
-  /// **Aborting the future is a hard stop** (Codex R54): dropping it mid-poll may drop
+  /// **Aborting the future is a hard stop**: dropping it mid-poll may drop
   /// the single delivery in flight at that moment — an event already pulled off the
   /// shared stream and parked in a stalled lane send dies with the future, and the
   /// actor cannot re-issue it (it left the actor's channel; no Rescan is owed). Lanes
@@ -322,12 +322,12 @@ impl<C, V> Demux<C, V> {
 
   /// How many subscriptions the routing task currently tracks (registered lanes not
   /// yet released or reclaimed). Bounded by concurrently live lanes — never by
-  /// lifetime registrations (Codex R49); the churn test pins that property.
+  /// lifetime registrations; the churn test pins that property.
   pub fn tracked_lanes(&self) -> usize {
     self.tracked.load(Ordering::Acquire)
   }
 
-  /// Requests an ORDERLY stop of the routing task (Codex R54/R55/R56/R57): it
+  /// Requests an ORDERLY stop of the routing task: it
   /// finishes the delivery it is currently awaiting — a stalled send completes when
   /// that lane drains, never mid-send — then routes the backlog the shared stream
   /// holds at the instant the stop is processed (the drain barrier, bounded by a
@@ -338,7 +338,7 @@ impl<C, V> Demux<C, V> {
   /// The loss-free pre-stop/post-stop split holds under the module's SOLE-DRAINER
   /// precondition (the [type docs](Self)): while the routing task runs — the barrier
   /// included — no other clone may call `next()`; a competing drainer voids the split
-  /// exactly as it voids routing generally (Codex R57). Under that precondition,
+  /// exactly as it voids routing generally. Under that precondition,
   /// nothing emitted before the stop took effect is lost, and events emitted
   /// afterwards — past the snapshot — are post-stop: they stay on the shared MPMC
   /// stream, drainable by the caller's clones once the routing future has resolved.
@@ -361,7 +361,7 @@ impl<C, V> Demux<C, V> {
   ///
   /// The registration send is **awaited on the bounded control queue**: while the
   /// routing task is stalled on a full lane it services no control messages, so this
-  /// call backpressures instead of growing an unbounded queue (Codex R49) — do not
+  /// call backpressures instead of growing an unbounded queue — do not
   /// call it from the one task responsible for draining a currently-full lane. The
   /// registration is admitted before this returns and is applied before the routing of
   /// any event that enters the shared stream afterwards, so events emitted after this
@@ -373,7 +373,7 @@ impl<C, V> Demux<C, V> {
   /// released. A registration displaces the predecessor UNCONDITIONALLY — even one
   /// whose own receiver is already gone by processing time (registered, then dropped
   /// before the router got to it): that claim-then-release still ends the predecessor
-  /// and reverts the subscription to unclaimed (Codex R51).
+  /// and reverts the subscription to unclaimed.
   ///
   /// A lane registered after the routing task has exited (the stream already ended)
   /// yields `None` immediately — indistinguishable from a lane at end-of-stream.
@@ -435,7 +435,7 @@ async fn run<C, V, R, H>(
 {
   // Value = (registration generation, send side). Entries are REMOVED on release or
   // send-time reclamation — the table is bounded by live lanes, not lifetime
-  // registrations (Codex R49).
+  // registrations.
   let mut lanes: LaneTable<C, V> = HashMap::new();
   // `None` once the rest receiver is dropped: unrouted events are discarded from then on.
   let mut rest = Some(rest);
@@ -456,7 +456,7 @@ async fn run<C, V, R, H>(
           match message {
             Ok(Control::Register { sub, generation, lane }) => {
               // Registration is the table's ONLY growth site, so it is also the sweep
-              // site (Codex R50): purge every entry whose receiver is gone before
+              // site: purge every entry whose receiver is gone before
               // inserting. A dropped lane's best-effort release can be LOST on a full
               // control queue, and an idle subscription never triggers send-time
               // reclamation — but the table cannot grow without a registration passing
@@ -467,10 +467,10 @@ async fn run<C, V, R, H>(
               // when its own receiver already died (admitted, then dropped while the
               // router was stalled): claim-then-drop means the caller re-pointed and
               // released, so the predecessor must stop routing and the subscription
-              // reverts to unclaimed (Codex R51 — skip-install alone left a live
+              // reverts to unclaimed (skip-install alone left a live
               // predecessor routing forever, with the queued release carrying the
               // replacement's generation and so unable to remove it). A dead
-              // replacement is then simply not installed (the R50 repro's dead
+              // replacement is then simply not installed (the lost-release repro's dead
               // installs still never happen).
               lanes.remove(&sub);
               if !lane.is_closed() {
@@ -478,10 +478,10 @@ async fn run<C, V, R, H>(
               }
             }
             Ok(Control::Shutdown) => {
-              // Orderly stop-and-DRAIN (Codex R54/R55/R56/R57): the delivery this
+              // Orderly stop-and-DRAIN: the delivery this
               // loop completed before selecting again is already done — and the
               // backlog the shared stream holds AT THIS INSTANT is routed too,
-              // bounded by a COUNT SNAPSHOT taken now (Codex R56: an until-empty
+              // bounded by a COUNT SNAPSHOT taken now (an until-empty
               // loop has no finite boundary — a lane stall mid-barrier lets the
               // producer refill the stream, so it could absorb post-stop traffic
               // forever). At most `owed` events drain: each `now_or_never` poll of
@@ -494,7 +494,7 @@ async fn run<C, V, R, H>(
               // `next()` caller, the count identifies exactly the pre-stop backlog.
               // A caller who violates that precondition mid-barrier voids the split —
               // a competing drainer shifts which events the counted pulls take, just
-              // as it voids routing at any other time (Codex R57: the count carries
+              // as it voids routing at any other time (the count carries
               // no event identities; exclusivity is the contract, not an option).
               // The early break below is purely defensive termination for that
               // violated state, not support for it.
@@ -542,8 +542,7 @@ type LaneTable<C, V> = HashMap<Subscription, (u64, async_channel::Sender<Event<C
 /// (stall-not-shed): the bounded lane send is awaited, so a full lane parks the caller
 /// while the shared channel fills and the ACTOR's overflow machinery mints the genuine
 /// dominating Rescans; the demux itself never sheds. A send that observes the lane's
-/// receiver dropped reclaims the slot on the spot (send-time reclamation, Codex R49 —
-/// covers a lost drop-release) and RECOVERS the very event the failed send handed
+/// receiver dropped reclaims the slot on the spot (send-time reclamation, /// covers a lost drop-release) and RECOVERS the very event the failed send handed
 /// back: the subscription is unclaimed again, and the recovered event flows to rest
 /// like any unclaimed traffic. A dropped rest receiver discards unrouted events from
 /// then on.

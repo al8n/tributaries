@@ -43,7 +43,7 @@ impl DebounceConfig {
 
   /// The default cap on buffered coalescer entries (1024, mirroring the event
   /// channel's default) — the structural memory bound in front of the bounded event
-  /// channel (Codex R55). See [`max_buffered`](Self::max_buffered).
+  /// channel. See [`max_buffered`](Self::max_buffered).
   pub const DEFAULT_MAX_BUFFERED: usize = 1024;
 
   /// The default debounce policy.
@@ -56,7 +56,7 @@ impl DebounceConfig {
     }
   }
 
-  /// The cap on BUFFERED coalescer entries across all subscriptions (Codex R55): the
+  /// The cap on BUFFERED coalescer entries across all subscriptions: the
   /// settle buffer sits in FRONT of the bounded event channel, so without its own bound
   /// a high-cardinality burst under a long window could grow memory without limit and
   /// the overflow-to-`Rescan` machinery would never engage. When an admission would
@@ -167,7 +167,7 @@ impl TributariesOptions {
   /// The default capacity of the caller→owner command mailbox (64). Deliberately much
   /// tighter than [`DEFAULT_EVENT_CAPACITY`](Self::DEFAULT_EVENT_CAPACITY): each queued
   /// command owns its key, value, and filter, so the bound caps what abandoned
-  /// requests can retain (Codex R52) — while 64 in-flight control operations is far
+  /// requests can retain — while 64 in-flight control operations is far
   /// beyond what an orderly consumer keeps outstanding.
   pub const DEFAULT_COMMAND_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
@@ -217,7 +217,7 @@ impl TributariesOptions {
     self
   }
 
-  /// The capacity of the caller→owner command mailbox (Codex R52): the bounded queue
+  /// The capacity of the caller→owner command mailbox: the bounded queue
   /// [`watch`](crate::Tributaries::watch)/[`unwatch`](crate::Tributaries::unwatch)
   /// submit into. When it is full — the owner busy inside a caller-bounded reconcile —
   /// a submitting call awaits ADMISSION instead of growing the queue, so abandoned

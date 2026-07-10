@@ -54,7 +54,7 @@ fn self_dfid(mask: u64, dir_fid: Fid) -> RawFanotifyEvent {
 }
 
 /// A name-less self-event in the `FID`-only shape — the object's own FID as
-/// `target_fid`, `dir_fid = None` (the R25 root-death shape).
+/// `target_fid`, `dir_fid = None` (the root-death shape).
 fn self_fid_only(mask: u64, self_fid: Fid) -> RawFanotifyEvent {
   RawFanotifyEvent {
     mask: FanMask::new(mask),
@@ -983,7 +983,7 @@ mod classification_totality {
       Kind::ForgetDir,
     );
 
-    // R23/R24 relocation: a directory mutation MISSING its child FID, in-root → Lossy
+    // relocation: a directory mutation MISSING its child FID, in-root → Lossy
     // (the action needs the field). A FILE mutation needs none → Forward.
     assert_row(
       "dir create no target (in-root)",
@@ -1009,7 +1009,7 @@ mod classification_totality {
       Kind::ForeignDrop,
     );
 
-    // R23 name gate: a named dirent whose name is absent/empty (decode folds empty →
+    // Name gate: a named dirent whose name is absent/empty (decode folds empty →
     // None) → Lossy in-root, ForeignDrop out-of-root.
     assert_row(
       "create empty name (in-root)",
@@ -1100,7 +1100,7 @@ mod classification_totality {
     );
   }
 
-  /// The R25 closure at the classification layer: a root self-event is `RootDeath` in
+  /// The admission closure at the classification layer: a root self-event is `RootDeath` in
   /// BOTH the `DFID` shape AND the `FID`-only shape (dir_fid = None) — the latter is
   /// what the old admission dropped, leaving the root's death to the liveness tick.
   /// The forwarded event carries the ROOT's own path, so compile lowers it to the
@@ -1128,7 +1128,7 @@ mod classification_totality {
       let fid_only = classify_one(&mut map, &self_fid_only(mask, fid(1)));
       assert!(
         matches!(fid_only, Admission::RootDeath(_)),
-        "FID-only root self-event {mask:#x} — the R25 shape — is RootDeath, not a drop"
+        "FID-only root self-event {mask:#x} — the shape — is RootDeath, not a drop"
       );
       assert_eq!(
         forwarded(fid_only).path.as_deref(),
@@ -1197,7 +1197,7 @@ mod classification_totality {
       Kind::Rename,
     );
 
-    // R24 relocation: a targetless ONDIR rename is Lossy for EVERY in-root move shape
+    // Relocation: a targetless ONDIR rename is Lossy for EVERY in-root move shape
     // (the action needs the moved FID), but ForeignDrop when both ends are outside.
     for (label, old_dir, new_dir) in [
       ("targetless ondir reparent", fid(1), fid(1)),
@@ -1446,7 +1446,7 @@ mod batch_memo {
 ///         two or more structural verbs (rename counted among them) is `Lossy`, never a
 ///         single-verb mutation that drops the other verb(s) (a merged create+delete
 ///         leaving a deleted dir learned; a merged rename+delete applying only the
-///         re-parent — the class R27's rename-separate sweep + the mirrored model both
+/// re-parent — the class the rename-separate sweep + the mirrored model both
 ///         missed);
 ///   (iv)  raw-membership — the INDEPENDENT, UNIFORM backstop: an event carrying ANY
 ///         map-resident raw FID is NEVER `ForeignDrop`, decided from RAW handle membership
@@ -1462,7 +1462,7 @@ mod batch_memo {
 ///
 /// An exhaustive generator sweeps the whole reachable mask space — the POWER SET of ALL
 /// subscribed action bits, `FAN_RENAME` INCLUDED, so every merged bitmask appears with
-/// NO EXCLUDED REGION (a merged rename+delete no longer escapes the sweep the way R27's
+/// NO EXCLUDED REGION (a merged rename+delete no longer escapes the sweep the way the earlier
 /// rename-separate sweep let it) — and asserts all five properties (agreement + (i)–(iv))
 /// per case. This SUBSUMES the totality table's non-panic sweep: totality proved classify
 /// RETURNS for every shape; the oracle proves it returns the RIGHT action.
@@ -1868,7 +1868,7 @@ mod classification_oracle {
   /// The COMPLETE input space: the POWER SET of ALL subscribed action bits — the seven
   /// non-rename verbs AND `FAN_RENAME` — so every merged bitmask the kernel can deliver
   /// appears, with NO EXCLUDED REGION. This closes the carve-out the two prior sweeps
-  /// left: R27 swept the `2^7` non-rename subsets and swept rename SEPARATELY as its own
+  /// left: the earlier sweep took the `2^7` non-rename subsets and rename SEPARATELY as its own
   /// single-structural shape, so a mask merging `FAN_RENAME` with another structural
   /// verb (a directory renamed AND deleted in one event) never appeared — and classify
   /// dispatched it to a one-sided re-parent. `FAN_RENAME` is now a structural verb in

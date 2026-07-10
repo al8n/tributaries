@@ -165,7 +165,7 @@ mod integration {
   /// hands the queued release to the watcher via the NON-BLOCKING `request_unwatch`; whether the
   /// driver applies that reply-less teardown before the re-watch's own disjointness check (no
   /// conflict) or not (the conflict-triggered retry then AWAITS the release the watcher NAMES against
-  /// the still-lingering root — Codex R29/R41), no `Overlaps` reaches the caller either way.
+  /// the still-lingering root), no `Overlaps` reaches the caller either way.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn fs_source_disarm_queues_release_drained_at_next_arm() {
     let (_dir, root) = scratch();
@@ -191,7 +191,7 @@ mod integration {
 
     // Re-arm the SAME key. Its queued release (the oldest) is applied by `arm`'s opportunistic bounded
     // application BEFORE the new watch, so the real `Watcher` never surfaces `Overlaps` against the
-    // just-released root (contract clause 2, Codex R29).
+    // just-released root (contract clause 2).
     let second = source
       .arm(&root_key)
       .await
@@ -233,18 +233,18 @@ mod integration {
     );
   }
 
-  /// R41/R42: a DISJOINT arm AWAITS NOTHING for releases, and its opportunistic hand-off is HARD
+  /// : a DISJOINT arm AWAITS NOTHING for releases, and its opportunistic hand-off is HARD
   /// BUDGETED. Each drained release is `request_unwatch`ed (a reply-less `try_send`) and moved to the
   /// in-flight sidecar, never awaited — so a caller-bounded `Watch` (and any `close` queued behind it)
   /// is decoupled from every release's teardown latency (contract clause 2/5) — and the drain stops
-  /// after [`OPPORTUNISTIC_RELEASE_HANDOFFS`] entries even when the channel still has room (R42: the
+  /// after [`OPPORTUNISTIC_RELEASE_HANDOFFS`] entries even when the channel still has room (the
   /// per-arm constant, not the channel's capacity, is the latency bound). Queue three disjoint
   /// releases A, B, C, then arm a disjoint D: exactly the two OLDEST (A, B — FIFO) are handed over
   /// non-blocking, C stays queued for a later drain, NONE is awaited-and-applied, and all three stay
   /// logically dead (`pending_set`), while D arms with no overlap and no awaited release work.
   ///
   /// Fail-on-old: the retired opportunistic loop AWAITED `unwatch` for the two oldest, REMOVING them
-  /// from `pending_set` — so `pending_set.len()` would be 1 here, not 3. And the R41 channel-room drain
+  /// from `pending_set` — so `pending_set.len()` would be 1 here, not 3. And the retired channel-room drain
   /// handed over ALL three — `pending_releases` would be empty here, not len 1.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn fs_source_disjoint_arm_applies_releases_non_blocking() {
@@ -306,7 +306,7 @@ mod integration {
     );
   }
 
-  /// R41 shape regression: an arm's AWAITED release work does not scale with the backlog depth — it is
+  /// Shape regression: an arm's AWAITED release work does not scale with the backlog depth — it is
   /// ZERO for a disjoint arm. Queue **many** disjoint releases (watch+disarm N disjoint subroots), then
   /// arm ANOTHER disjoint key: the opportunistic drain hands releases to the watcher non-blocking
   /// (queue → in-flight, bounded by the channel's room), AWAITING none, so every one of the N stays
@@ -345,7 +345,7 @@ mod integration {
 
     // Arm one MORE disjoint subroot: it overlaps none of the backlog, so the drain hands releases over
     // non-blocking and AWAITS none — the arm's awaited release work is ZERO, independent of backlog
-    // depth (R41).
+    // depth.
     let other = parent.join("other");
     std::fs::create_dir_all(&other).expect("create other");
     let other_key = path_components(&other);
@@ -357,7 +357,7 @@ mod integration {
       source.pending_set.len(),
       N,
       "the disjoint arm awaited NO release teardown — every one of the N stays logically dead, whether \
-       still queued or handed over in-flight (arm cost is independent of backlog depth, R41)"
+       still queued or handed over in-flight (arm cost is independent of backlog depth)"
     );
     assert_eq!(
       source.pending_releases.len() + source.enqueued.len(),
@@ -372,7 +372,7 @@ mod integration {
     );
   }
 
-  /// R29-F1 (i) / R30-F2: an ancestor arm over N released-but-lingering descendants succeeds via the
+  /// An ancestor arm over N released-but-lingering descendants succeeds via the
   /// conflict-triggered retry — no [`Overlaps`](tributary_fs::WatchRootError::Overlaps) reaches the
   /// caller. Watch+disarm N disjoint tempdir SUBDIRS, then watch their PARENT: the parent overlaps
   /// every still-lingering descendant, so the watcher rejects with `Overlaps` NAMING one at a time;
@@ -381,7 +381,7 @@ mod integration {
   /// bounded by the conflicts actually named), the whole descendant backlog was applied, and the armed
   /// parent genuinely delivers.
   ///
-  /// **N deliberately exceeds the retired `OVERLAP_RETRY_CAP` (64)** (Codex R30-F2): the retry is now a
+  /// **N deliberately exceeds the retired `OVERLAP_RETRY_CAP` (64)**: the retry is now a
   /// STRUCTURAL progress bound (the queued + in-flight release sets strictly shrink each retry), not a
   /// fixed ceiling. Fail-on-old: with the 64-retry cap, the ~65+ named conflicts an ancestor over 67
   /// released descendants must resolve would trip the cap and surface `Overlaps` to the caller instead
@@ -416,7 +416,7 @@ mod integration {
 
     // Arm the PARENT (an ancestor of all N). It overlaps every still-lingering descendant; the watcher
     // names each conflict and the conflict-triggered retry unwatches exactly it and re-attempts — so
-    // the parent arms with NO `Overlaps` surfaced to the caller (contract clause 2, Codex R29).
+    // the parent arms with NO `Overlaps` surfaced to the caller (contract clause 2).
     let parent_key = path_components(&parent);
     let armed = source.arm(&parent_key).await.expect(
       "the ancestor arm resolves each named descendant conflict and succeeds — no Overlaps",
@@ -458,7 +458,7 @@ mod integration {
     );
   }
 
-  /// R30-F2 (ii): a rejection whose named conflict is NOT a pending (released) root — a genuine LIVE
+  /// A rejection whose named conflict is NOT a pending (released) root — a genuine LIVE
   /// overlap — surfaces immediately, WITHOUT the retired index-0 fallback wrongly unwatching an
   /// unrelated pending root to mask it. Arm a LIVE child watch, disarm several disjoint roots (so the
   /// pending queue stays non-empty past the opportunistic application), then arm the child's ANCESTOR:
@@ -517,11 +517,11 @@ mod integration {
     assert!(
       source.pending_set.contains(&survivor),
       "the unrelated release is untouched by the conflict path — no index-0 fallback awaited-and-\
-       removed it to mask the real conflict (Codex R30-F2)"
+       removed it to mask the real conflict"
     );
   }
 
-  /// R41: a conflict against an IN-FLIGHT (request-enqueued) release resolves WITHOUT surfacing
+  /// a conflict against an IN-FLIGHT (request-enqueued) release resolves WITHOUT surfacing
   /// [`Overlaps`](tributary_fs::WatchRootError::Overlaps). The opportunistic drain hands a queued
   /// release to the watcher via the reply-less `request_unwatch` and moves it to the in-flight sidecar;
   /// if the SAME arm's watch then overlaps that release before the driver has applied the reply-less
