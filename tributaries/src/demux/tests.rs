@@ -440,6 +440,53 @@ async fn registration_backpressures_while_the_demux_is_stalled() {
     .expect("registrar task");
 }
 
+/// Codex R50: releases LOST to a full control queue cannot leak the table. The exact
+/// repro: stall the router on a full lane, admit CONTROL_CAPACITY registrations (the
+/// queue is now full), drop every one of those lanes — each drop-release try_send
+/// finds the queue full and is LOST — then clear the stall. The queued registrations
+/// arrive with already-closed receivers and are never installed; the next registration
+/// sweeps anything dead. The table ends bounded by the live lanes, not by the sixteen
+/// dead ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_releases_on_a_full_control_queue_cannot_leak_the_table() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let (demux, _rest) = Demux::spawn(w.clone(), 16);
+  let lane_a = demux.lane(sub_a, 1).await;
+
+  // Stall the routing task on lane A's awaited send.
+  feed.modified("/a", "/a/one").await;
+  feed.modified("/a", "/a/two").await;
+
+  // Admit exactly CONTROL_CAPACITY registrations while the router is parked — filling
+  // the control queue — then DROP them all: every drop-release try_send hits the full
+  // queue and is lost (the R50 hole).
+  let mut doomed = Vec::new();
+  for i in 0..CONTROL_CAPACITY {
+    let sub = watch(&w, &format!("/doomed{i}")).await;
+    doomed.push(demux.lane(sub, 1).await);
+  }
+  drop(doomed);
+
+  // Clear the stall: the router drains the queued registrations — each arrives with
+  // an already-closed receiver and is never installed (and each processing sweeps).
+  assert_eq!(recv(&lane_a).await.key(), key("/a/one").as_slice());
+  assert_eq!(recv(&lane_a).await.key(), key("/a/two").as_slice());
+
+  // One live probe registration; its event round-trip proves it was applied, and by
+  // then every doomed entry is gone — the table holds exactly lane A and the probe.
+  let probe_sub = watch(&w, "/probe").await;
+  let probe = demux.lane(probe_sub, 4).await;
+  feed.modified("/probe", "/probe/touch").await;
+  assert_eq!(recv(&probe).await.subscription(), probe_sub);
+  assert_eq!(
+    demux.tracked_lanes(),
+    2,
+    "sixteen lost releases leaked nothing — the table is bounded by live lanes \
+     (register-time sweep + dead registrations never installed; Codex R50)"
+  );
+}
+
 /// Codex R49 F2: watch → lane → unwatch → drop churn leaves NO residue — the lane
 /// table is bounded by concurrently live lanes, never by lifetime registrations. The
 /// trailing probe registration is an awaited send on the FIFO control queue, so every
