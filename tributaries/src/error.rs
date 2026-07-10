@@ -66,6 +66,17 @@ pub enum WatchError {
   /// (the arm succeeded, but at a divergent coordinate).
   #[error("the watched root was removed before its watch could be armed; retry the watch")]
   DeadOnArrival,
+  /// The owner is holding the maximum RETIRED parked-`Rescan` debt — terminal
+  /// [`Rescan`](crate::EventKind::Rescan)s owed to subscriptions whose roots died,
+  /// parked because the event channel was full, and retained past the subscriptions'
+  /// retirement so the deaths are never silently lost (Codex R58). New watch admission
+  /// is refused at that cap: each retire-and-rewatch cycle mints another retired entry,
+  /// so gating the ONE step the cycle needs — a fresh watch — is what keeps the debt
+  /// (each entry retains a key and a cloned value) structurally bounded. Drain
+  /// [`next`](crate::Tributaries::next) — delivering the owed terminal `Rescan`s — and
+  /// retry; `close` is never gated (it rides its own channel).
+  #[error("retired parked-Rescan debt is at its cap; drain the event stream, then retry the watch")]
+  RescanBacklog,
 }
 
 impl WatchError {
@@ -86,7 +97,7 @@ impl WatchError {
   pub const fn as_fs(&self) -> Option<&tributary_fs::WatchRootError> {
     match self {
       Self::Fs(err) => Some(err),
-      Self::Canonicalize { .. } | Self::DeadOnArrival => None,
+      Self::Canonicalize { .. } | Self::DeadOnArrival | Self::RescanBacklog => None,
     }
   }
 }
