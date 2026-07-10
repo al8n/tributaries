@@ -10,7 +10,7 @@ use std::{
 use agnostic_lite::tokio::TokioRuntime;
 use tributary_fs::{Epoch, Interest, Location};
 
-use super::{Demux, Lane};
+use super::{CONTROL_CAPACITY, Demux, Lane};
 use crate::{
   driver::Tributaries,
   error::WatchError,
@@ -167,8 +167,8 @@ async fn events_route_to_their_own_lanes_in_per_sub_order() {
   let sub_b = watch(&w, "/b").await;
   let (demux, _rest) = Demux::spawn(w.clone(), 16);
   // Registered before any event flows, so nothing can land on rest.
-  let lane_a = demux.lane(sub_a, 16);
-  let lane_b = demux.lane(sub_b, 16);
+  let lane_a = demux.lane(sub_a, 16).await;
+  let lane_b = demux.lane(sub_b, 16).await;
 
   for i in 0..3 {
     feed.modified("/a", &format!("/a/f{i}")).await;
@@ -201,7 +201,7 @@ async fn unregistered_subscription_lands_on_rest_until_registered() {
   let sub_a = watch(&w, "/a").await;
   let sub_b = watch(&w, "/b").await;
   let (demux, rest) = Demux::spawn(w.clone(), 16);
-  let lane_a = demux.lane(sub_a, 16);
+  let lane_a = demux.lane(sub_a, 16).await;
 
   feed.modified("/b", "/b/one").await;
   feed.modified("/a", "/a/one").await;
@@ -223,7 +223,7 @@ async fn unregistered_subscription_lands_on_rest_until_registered() {
   // Register B, THEN feed: the registration is queued before the event enters the
   // shared stream, and the routing loop applies control before pulling events, so the
   // post-registration event deterministically reaches the lane, not rest.
-  let lane_b = demux.lane(sub_b, 16);
+  let lane_b = demux.lane(sub_b, 16).await;
   feed.modified("/b", "/b/two").await;
   let routed = recv(&lane_b).await;
   assert_eq!(
@@ -247,8 +247,8 @@ async fn stalled_lane_backs_up_shared_channel_and_actor_sheds_to_rescans() {
   let sub_b = watch(&w, "/b").await;
   let (demux, _rest) = Demux::spawn(w.clone(), 4);
   // Lane A is full after ONE undrained event; lane B is roomy.
-  let lane_a = demux.lane(sub_a, 1);
-  let lane_b = demux.lane(sub_b, 4);
+  let lane_a = demux.lane(sub_a, 1).await;
+  let lane_b = demux.lane(sub_b, 4).await;
 
   // Saturate A well past everything the pipeline can hold undrained (lane A buffer 1 +
   // the demux's one stalled in-flight send + the shared slot 1): the actor's try_send
@@ -332,14 +332,14 @@ async fn stalled_lane_backs_up_shared_channel_and_actor_sheds_to_rescans() {
 /// discarded (never rerouted to rest), other lanes keep flowing, and the demux does
 /// not stall on the dead lane.
 #[tokio::test]
-async fn dropped_lane_discards_its_sub_without_stalling_the_demux() {
+async fn dropped_lane_releases_its_sub_to_rest_without_stalling_the_demux() {
   let (w, mut feed) = rig(1024);
   let sub_a = watch(&w, "/a").await;
   let sub_b = watch(&w, "/b").await;
   let (demux, rest) = Demux::spawn(w.clone(), 16);
   // Capacity 1: were the demux to keep buffering for the dropped lane, it would wedge.
-  let lane_a = demux.lane(sub_a, 1);
-  let lane_b = demux.lane(sub_b, 16);
+  let lane_a = demux.lane(sub_a, 1).await;
+  let lane_b = demux.lane(sub_b, 16).await;
 
   feed.modified("/a", "/a/before").await;
   let before = recv(&lane_a).await;
@@ -363,22 +363,116 @@ async fn dropped_lane_discards_its_sub_without_stalling_the_demux() {
   );
   assert_eq!(alive.key(), key("/b/alive").as_slice());
 
-  // The retired sub's traffic went nowhere: end the stream and drain rest to the end —
-  // it must never have carried an /a event (retired traffic is discarded, not rerouted).
+  // The released sub reverted to UNCLAIMED (Codex R49): every post-drop /a event —
+  // including one a send-time reclamation recovered — surfaces on rest, none is lost,
+  // and the table entry is gone.
   drop(feed);
+  let mut rest_a = 0;
   loop {
     let drained = tokio::time::timeout(DEADLINE, rest.recv())
       .await
       .expect("rest drains within the deadline");
     match drained {
-      Some(event) => assert_ne!(
-        event.subscription(),
-        sub_a,
-        "a retired sub's traffic is never rerouted to rest"
-      ),
+      Some(event) => {
+        if event.subscription() == sub_a {
+          rest_a += 1;
+        }
+      }
       None => break,
     }
   }
+  assert_eq!(
+    rest_a, 4,
+    "all post-release /a traffic flows to rest — the sub is unclaimed again, nothing lost"
+  );
+  assert_eq!(
+    demux.tracked_lanes(),
+    1,
+    "the released sub's slot was reclaimed; only lane B remains tracked"
+  );
+}
+
+/// Codex R49 F1: registration BACKPRESSURES while the routing task is stalled — the
+/// bounded control queue absorbs [`CONTROL_CAPACITY`] registrations and the next one
+/// parks until the stall clears; it can never grow an unbounded queue. Race-free
+/// negative window: the parked routing task is the only control consumer, and this
+/// test is lane A's only drainer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registration_backpressures_while_the_demux_is_stalled() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let (demux, _rest) = Demux::spawn(w.clone(), 16);
+  let lane_a = demux.lane(sub_a, 1).await;
+
+  // Stall the routing task: the first /a event fills lane A (capacity 1), the second
+  // parks the task on the awaited lane send.
+  feed.modified("/a", "/a/one").await;
+  feed.modified("/a", "/a/two").await;
+
+  // Fill the control queue past its bound from a side task: CONTROL_CAPACITY sends are
+  // admitted queue-side; the next one must PARK (bounded backpressure), so the task
+  // cannot finish while the demux is stalled.
+  let demux = std::sync::Arc::new(demux);
+  let registrar = {
+    let demux = std::sync::Arc::clone(&demux);
+    let w = w.clone();
+    tokio::spawn(async move {
+      for i in 0..=CONTROL_CAPACITY {
+        let sub = watch(&w, &format!("/reg{i}")).await;
+        demux.lane(sub, 1).await;
+      }
+    })
+  };
+  tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+  assert!(
+    !registrar.is_finished(),
+    "the registration past the control bound parks while the demux is stalled — \
+     registration cannot outgrow the bounded queue (Codex R49)"
+  );
+
+  // Clear the stall: draining lane A resumes the routing task, which drains the
+  // control queue (control-first bias) and unparks the registrar.
+  assert_eq!(recv(&lane_a).await.key(), key("/a/one").as_slice());
+  assert_eq!(recv(&lane_a).await.key(), key("/a/two").as_slice());
+  tokio::time::timeout(DEADLINE, registrar)
+    .await
+    .expect("the registrar unparks once the stall clears")
+    .expect("registrar task");
+}
+
+/// Codex R49 F2: watch → lane → unwatch → drop churn leaves NO residue — the lane
+/// table is bounded by concurrently live lanes, never by lifetime registrations. The
+/// trailing probe registration is an awaited send on the FIFO control queue, so every
+/// queued release is processed before it; the tracked count then reflects exactly the
+/// probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lane_churn_leaves_no_tracked_residue() {
+  let (w, mut feed) = rig(1024);
+  let (demux, _rest) = Demux::spawn(w.clone(), 16);
+
+  for i in 0..32 {
+    let path = format!("/churn{i}");
+    let sub = watch(&w, &path).await;
+    let lane = demux.lane(sub, 4).await;
+    feed.modified(&path, &format!("{path}/touch")).await;
+    assert_eq!(recv(&lane).await.subscription(), sub);
+    w.unwatch(sub).await.expect("unwatch churn sub");
+    drop(lane);
+  }
+
+  let probe_sub = watch(&w, "/probe").await;
+  let probe = demux.lane(probe_sub, 4).await;
+  // Route one event through the probe: it can only arrive after the routing task
+  // APPLIED the probe's registration (admission alone is queue-side), and the FIFO
+  // control queue puts every churn release before it — so the count below is settled.
+  feed.modified("/probe", "/probe/touch").await;
+  assert_eq!(recv(&probe).await.subscription(), probe_sub);
+  assert_eq!(
+    demux.tracked_lanes(),
+    1,
+    "32 churn cycles left zero residue — only the live probe lane is tracked \
+     (bounded by concurrent lanes, not lifetime registrations; Codex R49)"
+  );
 }
 
 /// Closing the watcher through the caller's clone ends the shared stream: the routing
@@ -390,7 +484,7 @@ async fn closed_watcher_ends_every_lane_after_draining_buffers() {
   let sub_a = watch(&w, "/a").await;
   let sub_m = watch(&w, "/m").await;
   let (demux, rest) = Demux::spawn(w.clone(), 16);
-  let lane_a = demux.lane(sub_a, 16);
+  let lane_a = demux.lane(sub_a, 16).await;
 
   feed.modified("/a", "/a/one").await;
   let one = recv(&lane_a).await;
@@ -456,7 +550,7 @@ async fn unwatch_stragglers_arrive_on_the_kept_lane() {
   let sub_a = watch(&w, "/a").await;
   let sub_m = watch(&w, "/m").await;
   let (demux, rest) = Demux::spawn(w.clone(), 16);
-  let lane_a = demux.lane(sub_a, 16);
+  let lane_a = demux.lane(sub_a, 16).await;
 
   // Queue stragglers, then a marker for the unclaimed sub_m: its arrival on rest
   // proves the /a events were already routed into lane A's buffer (sequential routing),
