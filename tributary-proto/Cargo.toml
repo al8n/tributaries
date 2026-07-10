@@ -14,7 +14,6 @@ keywords = ["filesystem", "notify", "sans-io", "no_std"]
 [features]
 default = ["std"]
 std = []
-alloc = []
 
 [dependencies]
 

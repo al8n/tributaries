@@ -37,7 +37,9 @@
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+// The crate floor is alloc: every configuration needs collections and strings,
+// so the alias is unconditional off-std rather than gated behind a feature.
+#[cfg(not(feature = "std"))]
 extern crate alloc as std;
 
 #[cfg(feature = "std")]
