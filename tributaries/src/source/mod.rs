@@ -1,5 +1,5 @@
-//! The [`Source<C>`] binding seam (design §4) and its default local-filesystem
-//! implementation over [`tributary_fs::Watcher`].
+//! The [`Source<C>`]/[`LocalSource<C>`] binding seam (design §4) and its default
+//! local-filesystem implementation over [`tributary_fs::Watcher`].
 //!
 //! The generic watch-set the umbrella maintains is source-agnostic: it plans
 //! subsumption and fans events out purely in `Vec<C>` key space. A **source** is the
@@ -17,6 +17,13 @@
 //! synchronously **requests** release of a root, and [`Source::next`] yields the next raw change as a [`SourceEvent`]
 //! carrying the owning root handle, the change's located key, its kind, and the metadata
 //! the umbrella's fan-out and attribution consume.
+//!
+//! The seam comes in two flavors sharing one contract: [`LocalSource`] is the **base**
+//! (the same items, futures with no `Send` requirement — hosting genuinely thread-local
+//! sources via [`Tributaries::parts_local`](crate::Tributaries::parts_local)), and
+//! [`Source`] is the **multithread-spawnable** variant (its three async methods promise
+//! `Send` futures). Every `Source` is a `LocalSource` through the crate's blanket
+//! forwarding impl, so a type implements exactly one of the two.
 //!
 //! # Key ↔ path knowledge lives here only
 //!
@@ -47,23 +54,48 @@ use crate::{
 mod tests;
 
 /// The binding between the umbrella's generic `Vec<C>` key space and a concrete watcher
-/// (design §4).
+/// (design §4) — the **base seam**, whose async methods return futures with **no `Send`
+/// requirement**.
 ///
 /// An implementor owns the source-specific knowledge of how a key maps to a real watch
 /// and how a raw change maps back to a located key; the umbrella drives it as the single
 /// writer and never re-implements that mapping. This is **static dispatch only** — a
 /// `dyn`-compatible registry for heterogeneous remote sources is future work.
 ///
-/// The default local-filesystem implementation is [`FsSource`].
+/// # Two traits, one seam
+///
+/// [`Source`] declares the same eight items under the same contracts, differing ONLY in its
+/// three async methods ([`arm`](Self::arm), [`grow`](Self::grow), [`next`](Self::next))
+/// promising `Send` futures. Every contract in this trait's documentation — the robustness
+/// boundary, the cancellation clause, each item's hard contract — binds [`Source`]
+/// implementors identically; the text lives here because this is the base trait the
+/// umbrella's owner loop is written against. A type implements exactly ONE of the two:
+///
+/// - A source whose futures can cross threads implements [`Source`] — almost every source,
+///   the default local-filesystem [`FsSource`] and any channel-fronted transport included —
+///   and receives `LocalSource` **for free** through the crate's blanket forwarding impl
+///   (which is also why coherence forbids implementing both). It constructs through
+///   [`Tributaries::with_source`](crate::Tributaries::with_source) or
+///   [`Tributaries::parts`](crate::Tributaries::parts), and equally through
+///   [`parts_local`](crate::Tributaries::parts_local).
+/// - A **genuinely thread-local** source — `Rc`/`RefCell` state or a completion ring's
+///   handles captured by its futures — cannot promise `Send`, so it implements
+///   `LocalSource` directly and constructs through
+///   [`Tributaries::parts_local`](crate::Tributaries::parts_local), whose returned driver
+///   future must then be polled on the thread that owns the source.
+///
+/// The two traits are deliberately **independent**: [`Source`] is NOT declared
+/// `Source: LocalSource`; the blanket impl alone relates them (see [`Source`]'s docs for
+/// why a supertrait relation is off the table).
 ///
 /// # Robustness boundary — what the umbrella REQUIRES vs GUARANTEES
 ///
-/// The umbrella drives a `Source` as its single writer and is hardened against one that
+/// The umbrella drives a source as its single writer and is hardened against one that
 /// **misbehaves**. The line between what a conforming source must provide and what the umbrella
 /// upholds regardless is drawn precisely here (cross-reference: driver-golden invariant II,
 /// "Close-responsive").
 ///
-/// **REQUIRED of a conforming `Source` (the umbrella relies on these):**
+/// **REQUIRED of a conforming source (the umbrella relies on these):**
 ///
 /// - **Generation-unique [`Handle`](Self::Handle)** — a handle value is never reused while any root
 ///   or not-yet-emitted event still carries it (the hard contract on [`Handle`](Self::Handle)). Makes handle ABA impossible; the umbrella routes strictly by handle rather than defending
@@ -85,7 +117,7 @@ mod tests;
 /// - **Cancellation-safe [`next`](Self::next)** — dropping an in-flight [`next`](Self::next) future
 ///   loses and acknowledges no event (the hard contract on [`next`](Self::next)).
 ///
-/// **GUARANTEED by the umbrella even against a misbehaving `Source`:**
+/// **GUARANTEED by the umbrella even against a misbehaving source:**
 ///
 /// - **A wedged [`next`](Self::next) never blocks command processing.** The owner drives
 ///   [`next`](Self::next) as one arm of a biased `select!`; a `next()` that never resolves is simply
@@ -134,39 +166,12 @@ mod tests;
 ///   newcomer's coverage is live before `watch()` returns — closing the request→apply window a
 ///   fire-and-forget re-issue left open (set-cover ), with no bridging `Rescan` needed.
 ///
-/// # `Send` bounds
-///
-/// **All three async methods return `Send` futures.** 0.1.0 targets tokio and smol, and the driver is
-/// a single owned task spawned on their multi-threaded executors
-/// ([`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach)) that drives arming and the event
-/// pump inline in one `select!` loop — so *every* future the owner awaits must be able to cross
-/// threads for `run(owner)` itself to be `Send`. The three awaited methods are [`arm`](Self::arm),
-/// [`grow`](Self::grow), and [`next`](Self::next); [`disarm`](Self::disarm) and
-/// [`set_cover`](Self::set_cover) are synchronous (they return no future), and
-/// [`canonicalize_key`](Self::canonicalize_key) / [`root_key`](Self::root_key) are synchronous
-/// probes. The bounds are written explicitly on each return type (rather than left implicit by
-/// `async fn`, whose futures carry no such bound), so a generic `S: Source<C>` owner is
-/// structurally spawnable — every implementor's futures must satisfy them. This is now
-/// unconditionally satisfiable for the fs source because [`tributary_fs::Watcher`] is
-/// `Sync` (its `watch`/`unwatch` futures are `Send`).
-///
-/// **A completion-based / `!Send` transport (io_uring via compio, or any thread-per-core
-/// ring) implements this trait by running its ring on a dedicated thread behind
-/// channels** — exactly the shape the in-tree fs stack already uses one layer down (the
-/// inotify/fanotify reader threads, and [`FsSource`]'s watcher-backed release queue).
-/// The `Send` bounds here are then satisfied by the CHANNEL futures (a `recv` is `Send`
-/// and cancel-safe by construction, meeting the [`next`](Self::next) contract for
-/// free), never by the ring internals, which stay pinned to their own thread. Hosting
-/// the umbrella OWNER itself on a `!Send` executor is a separate, deliberately deferred
-/// question: the handle plane is already executor-agnostic, callers who need to
-/// own the spawn use [`Tributaries::parts`](crate::Tributaries::parts), and relaxing
-/// these trait bounds awaits stable return-type notation.
-///
 /// # Cancellation and `Drop` reclamation
 ///
-/// With [`Tributaries::parts`](crate::Tributaries::parts) the owner future is
-/// caller-owned and **may be dropped at any await point** — including mid-[`arm`](Source::arm)
-/// or mid-[`grow`](Source::grow). The run-to-completion wording on those methods describes what the
+/// With [`Tributaries::parts`](crate::Tributaries::parts) or
+/// [`parts_local`](crate::Tributaries::parts_local) the owner future is
+/// caller-owned and **may be dropped at any await point** — including mid-[`arm`](Self::arm)
+/// or mid-[`grow`](Self::grow). The run-to-completion wording on those methods describes what the
 /// owner does while polled; it is NOT a promise a source may lean on for external
 /// consistency. The obligation is therefore on the implementor's `Drop`: **dropping the
 /// source must reclaim every external effect it ever initiated, including an arm or
@@ -174,11 +179,12 @@ mod tests;
 /// an external watch request and awaits the acknowledgement must tear that watch down
 /// through its own teardown path (its internal driver's shutdown, its transport's
 /// `Drop`) when the source itself drops — never rely on the caller having received a
-/// handle to disarm. The channel-fronted shape above satisfies this structurally: the
+/// handle to disarm. A channel-fronted source (the dedicated-transport-thread shape
+/// described in [`Source`]'s `Send` bounds note) satisfies this structurally: the
 /// dropped frontend closes its channels, and the transport driver behind them tears
 /// down every live watch as it exits — exactly what [`FsSource`] inherits from
 /// [`tributary_fs::Watcher`]'s drop semantics.
-pub trait Source<C> {
+pub trait LocalSource<C> {
   /// The armed-root token a successful [`arm`](Self::arm) yields, naming the concrete
   /// watch a later [`disarm`](Self::disarm) releases and an event's
   /// [`SourceEvent::handle`] identifies. `Copy + Eq + Hash` so the umbrella can key its
@@ -186,7 +192,7 @@ pub trait Source<C> {
   ///
   /// # Generation-unique handle contract (hard requirement)
   ///
-  /// A `Source` MUST mint a **generation-unique** handle on **every** [`arm`](Self::arm): a handle
+  /// A source MUST mint a **generation-unique** handle on **every** [`arm`](Self::arm): a handle
   /// value is **never** reused for a new arm while any root **or** any not-yet-emitted event
   /// carrying that value is still live. Equivalently — no handle the umbrella has observed is ever
   /// reissued until the umbrella has **fully retired** the root it named (a [`disarm`](Self::disarm)
@@ -264,11 +270,9 @@ pub trait Source<C> {
   ///
   /// A [`WatchError`] when the concrete watch cannot be armed.
   ///
-  /// Returns a `Send` future (see the `Send` bounds note on the [trait](Self)).
-  fn arm(
-    &mut self,
-    key: &[C],
-  ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> + Send;
+  /// The returned future carries no `Send` requirement; [`Source::arm`] is the
+  /// `Send`-promising twin.
+  fn arm(&mut self, key: &[C]) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>>;
 
   /// Requests release of the root named by `handle`. Synchronous and non-blocking: this is a
   /// fire-and-forget release **request**, not an awaited teardown.
@@ -370,9 +374,10 @@ pub trait Source<C> {
   /// `retained` is a prefix-free antichain in the same `C` key space as [`arm`](Self::arm): every key
   /// lies under exactly one member, and no member descends from another.
   ///
-  /// Returns a `Send` future (see the `Send` bounds note on the [trait](Self)); it is one of the three
-  /// awaited methods, alongside [`arm`](Self::arm) and [`next`](Self::next).
-  fn grow(&mut self, handle: Self::Handle, retained: &[Vec<C>]) -> impl Future<Output = ()> + Send {
+  /// One of the three awaited methods, alongside [`arm`](Self::arm) and [`next`](Self::next);
+  /// the returned future carries no `Send` requirement here ([`Source::grow`] is the
+  /// `Send`-promising twin).
+  fn grow(&mut self, handle: Self::Handle, retained: &[Vec<C>]) -> impl Future<Output = ()> {
     let _ = (handle, retained);
     async {}
   }
@@ -440,8 +445,9 @@ pub trait Source<C> {
   }
 
   /// The next raw change as a [`SourceEvent`], or [`None`] once the source is closed and
-  /// drained. Returns a `Send` future so the owner can pump the source's stream from its
-  /// spawned task (see the `Send` bounds note on the [trait](Self)).
+  /// drained — the event pump the owner drives as one arm of its `select!` loop. The
+  /// returned future carries no `Send` requirement; [`Source::next`] is the
+  /// `Send`-promising twin.
   ///
   /// # `next` MUST be cancellation-safe (hard contract)
   ///
@@ -462,7 +468,7 @@ pub trait Source<C> {
   ///
   /// [`FsSource`] satisfies this: its `next` awaits [`tributary_fs::Watcher::next`], itself
   /// an `async_channel` receive, which is cancel-safe by construction.
-  fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>> + Send;
+  fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>>;
 
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
   /// or retired — a **synchronous** liveness probe (mirroring
@@ -475,6 +481,185 @@ pub trait Source<C> {
   /// `Some`, so the root is kept and the consumer re-enumerates). Because it is out of
   /// band, it never races the event stream the owner drives (design §4, I4).
   fn root_key(&self, handle: Self::Handle) -> Option<Vec<C>>;
+}
+
+// Deliberately NOT `pub trait Source<C>: LocalSource<C>`, even though every `Source` is a
+// `LocalSource` through the blanket forwarding impl below. With a supertrait relation the
+// `Send` promise `Tributaries::parts` makes for a generic `S: Source` becomes unprovable
+// on stable Rust: proving `run(owner)`'s future `Send` normalizes the opaque futures of
+// `<S as LocalSource>`, and the where-clause candidate elaborated from the supertrait
+// (`S: LocalSource`) shadows the blanket impl during that normalization — a where-clause
+// candidate carries no hidden type to leak `Send` from, so the proof fails with "future
+// cannot be sent between threads safely" (empirically reproduced). Independence keeps the
+// blanket impl the ONLY `LocalSource` candidate for a generic `S: Source`, whose hidden
+// types are this trait's `+ Send` opaques. Coherence forbidding one type from
+// implementing both traits is the desirable corollary, not the motivation.
+/// The **multithread-spawnable** variant of the source seam: the same eight items as
+/// [`LocalSource`], with the three async methods ([`arm`](Self::arm), [`grow`](Self::grow),
+/// [`next`](Self::next)) promising `Send` futures.
+///
+/// This is the trait (almost) every source implements — the default local-filesystem
+/// implementation is [`FsSource`]. **Every contract on [`LocalSource`] applies verbatim**:
+/// the seam description, the robustness boundary (what the umbrella REQUIRES vs
+/// GUARANTEES), the cancellation / `Drop`-reclamation clause, and each item's hard contract
+/// are written once there, and this trait adds exactly one thing — the `Send` promise
+/// below, which is what makes a generic owner over it spawnable on a multi-threaded
+/// executor ([`Tributaries::with_source`](crate::Tributaries::with_source),
+/// [`Tributaries::parts`](crate::Tributaries::parts)).
+///
+/// Implementing `Source` grants [`LocalSource`] for free through the crate's blanket
+/// forwarding impl — so a `Source` also constructs via
+/// [`Tributaries::parts_local`](crate::Tributaries::parts_local) — and coherence therefore
+/// forbids implementing both traits: a source either promises `Send` futures here, or is
+/// genuinely thread-local and implements [`LocalSource`] alone. The two traits are
+/// deliberately independent (no supertrait relation): relating them by supertrait would
+/// stop the compiler from proving the blanket impl's `Send` leakage for a generic
+/// `S: Source`, which is exactly the proof [`Tributaries::parts`](crate::Tributaries::parts)
+/// stands on.
+///
+/// # `Send` bounds
+///
+/// **All three async methods return `Send` futures.** The stock hosting path spawns the driver as
+/// a single owned task on a multi-threaded tokio or smol executor
+/// ([`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach)) that drives arming and the event
+/// pump inline in one `select!` loop — so *every* future the owner awaits must be able to cross
+/// threads for `run(owner)` itself to be `Send`. The three awaited methods are [`arm`](Self::arm),
+/// [`grow`](Self::grow), and [`next`](Self::next); [`disarm`](Self::disarm) and
+/// [`set_cover`](Self::set_cover) are synchronous (they return no future), and
+/// [`canonicalize_key`](Self::canonicalize_key) / [`root_key`](Self::root_key) are synchronous
+/// probes. The bounds are written explicitly on each return type (rather than left implicit by
+/// `async fn`, whose futures carry no such bound), so a generic `S: Source<C>` owner is
+/// structurally spawnable — every implementor's futures must satisfy them. This is
+/// unconditionally satisfiable for the fs source because [`tributary_fs::Watcher`] is
+/// `Sync` (its `watch`/`unwatch` futures are `Send`).
+///
+/// **A completion-based / `!Send` transport (io_uring via compio, or any thread-per-core
+/// ring) has two conforming shapes.** It can implement THIS trait by running its ring on a
+/// dedicated thread behind channels — exactly the shape the in-tree fs stack already uses
+/// one layer down (the inotify/fanotify reader threads, and [`FsSource`]'s watcher-backed
+/// release queue); the `Send` bounds here are then satisfied by the CHANNEL futures (a
+/// `recv` is `Send` and cancel-safe by construction, meeting the [`next`](Self::next)
+/// contract for free), never by the ring internals, which stay pinned to their own thread.
+/// Or it can implement [`LocalSource`] directly — the same items with no `Send` promise —
+/// and construct through [`Tributaries::parts_local`](crate::Tributaries::parts_local),
+/// polling the returned driver future on the thread that owns the source. Neither shape
+/// waits on unstable syntax: return-type notation (the per-bound-site `S::arm(..): Send`
+/// clause that would let ONE trait serve both) remains unstabilized with no owner or
+/// timeline upstream, and the [`LocalSource`] split is its stable equivalent — `Source` IS
+/// `LocalSource` plus the `Send` promise, which is exactly what RTN would spell at the
+/// bound sites.
+pub trait Source<C> {
+  /// The armed-root token a successful [`arm`](Self::arm) yields, naming the concrete
+  /// watch a later [`disarm`](Self::disarm) releases and an event's
+  /// [`SourceEvent::handle`] identifies. Contract-identical to [`LocalSource::Handle`],
+  /// whose **generation-unique handle contract** (a hard requirement) applies verbatim: a
+  /// handle value is never reused while any root or not-yet-emitted event still carries
+  /// it, making handle ABA impossible.
+  type Handle: Copy + Eq + core::hash::Hash;
+
+  /// Canonicalizes the caller-supplied `key` into the source's own **canonical
+  /// coordinate**, or reports why it cannot. Contract-identical to
+  /// [`LocalSource::canonicalize_key`] — the single-choke-point rationale and the
+  /// idempotence hard contract there apply verbatim (the method is synchronous, so the two
+  /// traits' signatures coincide exactly).
+  ///
+  /// # Errors
+  ///
+  /// A [`WatchError`] when `key` cannot be canonicalized (see
+  /// [`LocalSource::canonicalize_key`]).
+  fn canonicalize_key(&self, key: &[C]) -> Result<Vec<C>, WatchError>;
+
+  /// Arms a concrete watch for `key`, returning the armed-root token plus the
+  /// **canonical** key the source actually armed. Contract-identical to
+  /// [`LocalSource::arm`] (canonical-key adoption, caller-bounded liveness); the future
+  /// here additionally promises `Send` (see the `Send` bounds note on the [trait](Self)).
+  ///
+  /// # Errors
+  ///
+  /// A [`WatchError`] when the concrete watch cannot be armed.
+  fn arm(
+    &mut self,
+    key: &[C],
+  ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> + Send;
+
+  /// Requests release of the root named by `handle` — synchronous, non-blocking,
+  /// fire-and-forget, never awaited. Contract-identical to [`LocalSource::disarm`], whose
+  /// five-clause hard contract (non-blocking; no arm surfaces a released-root overlap;
+  /// logically dead immediately; idempotent/tolerant; eventual release) applies verbatim.
+  fn disarm(&mut self, handle: Self::Handle);
+
+  /// Grows the root named by `handle` so its actual coverage includes every key in
+  /// `retained` — the **awaited GROW half** of in-place coverage reconcile.
+  /// Contract-identical to [`LocalSource::grow`] (applied-before-return, never moves
+  /// survivor coverage, idempotent, a no-op conforming only for a source whose coverage
+  /// never narrows — the default body); the future here additionally promises `Send` (see
+  /// the `Send` bounds note on the [trait](Self)).
+  fn grow(&mut self, handle: Self::Handle, retained: &[Vec<C>]) -> impl Future<Output = ()> + Send {
+    let _ = (handle, retained);
+    async {}
+  }
+
+  /// Requests that the root named by `handle` PRUNE its actual coverage toward the
+  /// `retained` cover — synchronous, fire-and-forget, purely an optimization.
+  /// Contract-identical to [`LocalSource::set_cover`], whose six-clause hard contract
+  /// applies verbatim (the default no-op is conforming; a source that actually narrows
+  /// coverage MUST pair it with a real [`grow`](Self::grow)).
+  fn set_cover(&mut self, handle: Self::Handle, retained: &[Vec<C>]) {
+    let _ = (handle, retained);
+  }
+
+  /// The next raw change as a [`SourceEvent`], or [`None`] once the source is closed and
+  /// drained. Contract-identical to [`LocalSource::next`] — in particular its
+  /// **cancellation-safety hard contract** (dropping an in-flight `next()` future loses
+  /// and acknowledges no event) applies verbatim; the future here additionally promises
+  /// `Send`, so the owner can pump the stream from its spawned task (see the `Send` bounds
+  /// note on the [trait](Self)).
+  fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>> + Send;
+
+  /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
+  /// or retired — a synchronous liveness probe. Contract-identical to
+  /// [`LocalSource::root_key`].
+  fn root_key(&self, handle: Self::Handle) -> Option<Vec<C>>;
+}
+
+/// Every [`Source`] is a [`LocalSource`]: the forwarding blanket impl wraps each of
+/// [`Source`]'s (unnameable) `+ Send` opaque futures in a fresh opaque that simply does
+/// not re-state the `Send` promise. The hidden types still ARE the `Send` futures, so
+/// auto-trait leakage keeps the owner future `Send` for a generic `S: Source` — the proof
+/// [`Tributaries::parts`](crate::Tributaries::parts) stands on. Every item forwards
+/// explicitly — including the defaulted [`grow`](Source::grow) /
+/// [`set_cover`](Source::set_cover) — so an implementor's overrides are never shadowed by
+/// [`LocalSource`]'s own defaults.
+impl<C, T: Source<C>> LocalSource<C> for T {
+  type Handle = <T as Source<C>>::Handle;
+
+  fn canonicalize_key(&self, key: &[C]) -> Result<Vec<C>, WatchError> {
+    <T as Source<C>>::canonicalize_key(self, key)
+  }
+
+  fn arm(&mut self, key: &[C]) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> {
+    <T as Source<C>>::arm(self, key)
+  }
+
+  fn disarm(&mut self, handle: Self::Handle) {
+    <T as Source<C>>::disarm(self, handle)
+  }
+
+  fn grow(&mut self, handle: Self::Handle, retained: &[Vec<C>]) -> impl Future<Output = ()> {
+    <T as Source<C>>::grow(self, handle, retained)
+  }
+
+  fn set_cover(&mut self, handle: Self::Handle, retained: &[Vec<C>]) {
+    <T as Source<C>>::set_cover(self, handle, retained)
+  }
+
+  fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>> {
+    <T as Source<C>>::next(self)
+  }
+
+  fn root_key(&self, handle: Self::Handle) -> Option<Vec<C>> {
+    <T as Source<C>>::root_key(self, handle)
+  }
 }
 
 /// The outcome of a successful [`Source::arm`]: the armed-root token plus the canonical
@@ -492,8 +677,8 @@ pub struct Armed<C, H> {
 
 impl<C, H> Armed<C, H> {
   /// Builds the [`arm`](Source::arm) outcome from the armed-root `handle` and the
-  /// `canonical_key` the source committed to — the constructor an out-of-tree [`Source`]
-  /// uses to report what it armed.
+  /// `canonical_key` the source committed to — the constructor an out-of-tree source
+  /// ([`Source`] or [`LocalSource`]) uses to report what it armed.
   pub fn new(handle: H, canonical_key: Vec<C>) -> Self {
     Self {
       handle,
@@ -546,8 +731,8 @@ pub struct SourceEvent<C, H> {
 }
 
 impl<C, H> SourceEvent<C, H> {
-  /// Builds a source event from its parts — the constructor an out-of-tree [`Source`]
-  /// uses to report a raw change in its own `C` key space.
+  /// Builds a source event from its parts — the constructor an out-of-tree source
+  /// ([`Source`] or [`LocalSource`]) uses to report a raw change in its own `C` key space.
   ///
   /// `handle` is the armed root the change belongs to; `key` its full located key;
   /// `kind` what happened (in the neutral [`EventKind`] vocabulary — a
