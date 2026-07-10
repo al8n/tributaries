@@ -2123,18 +2123,28 @@ where
   /// affected subscription to a dominating `Rescan` rather than blocking (no-silent-loss,
   /// bounded memory).
   fn push_all(&mut self, events: Vec<Event<C, V>>) {
-    let ready = match self.coalescer.as_mut() {
+    let (ready, overflowed) = match self.coalescer.as_mut() {
       Some(coalescer) => {
         let now: Instant = R::now().into();
+        // Subscriptions the coalescer SHED at its buffered-entry cap (Codex R55): each
+        // is owed the same dominating parked Rescan as a full event channel —
+        // `park_rescan` mints it and purges the sub's buffered entries, so the bound
+        // holds with no silent loss.
+        let mut overflowed = Vec::new();
         for event in events {
-          coalescer.admit(event, now);
+          if let Some(sub) = coalescer.admit(event, now) {
+            overflowed.push(sub);
+          }
         }
         let mut ready = Vec::new();
         coalescer.drain_ready(now, &mut ready);
-        ready
+        (ready, overflowed)
       }
-      None => events,
+      None => (events, Vec::new()),
     };
+    for sub in overflowed {
+      self.park_rescan(sub);
+    }
     for event in ready {
       self.try_emit(event);
     }

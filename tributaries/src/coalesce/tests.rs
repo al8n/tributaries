@@ -116,8 +116,8 @@ fn created_then_modified_stays_created() {
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  c.admit(created(s, "/a/f", 1), clk.at(0));
-  c.admit(modified(s, "/a/f", 2), clk.at(1));
+  assert!(c.admit(created(s, "/a/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/a/f", 2), clk.at(1)).is_none());
 
   // Nothing before the settle window; one Created after it.
   assert!(
@@ -140,7 +140,10 @@ fn modified_coalesces() {
   let s = sub(1);
 
   for (n, epoch) in [1, 2, 3, 4].into_iter().enumerate() {
-    c.admit(modified(s, "/a/f", epoch), clk.at(n as u64));
+    assert!(
+      c.admit(modified(s, "/a/f", epoch), clk.at(n as u64))
+        .is_none()
+    );
   }
   let out = drain(&mut c, clk.at(20));
   assert_eq!(out.len(), 1, "four Modifieds coalesce to one");
@@ -153,8 +156,8 @@ fn created_then_removed_annihilates() {
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  c.admit(created(s, "/a/tmp", 1), clk.at(0));
-  c.admit(removed(s, "/a/tmp", 2), clk.at(1));
+  assert!(c.admit(created(s, "/a/tmp", 1), clk.at(0)).is_none());
+  assert!(c.admit(removed(s, "/a/tmp", 2), clk.at(1)).is_none());
 
   // A file that lived and died inside the window emits NOTHING — and nothing is left
   // to ever emit.
@@ -171,8 +174,8 @@ fn modified_then_removed_is_removed() {
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  c.admit(modified(s, "/a/f", 1), clk.at(0));
-  c.admit(removed(s, "/a/f", 2), clk.at(1));
+  assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(removed(s, "/a/f", 2), clk.at(1)).is_none());
 
   let out = drain(&mut c, clk.at(20));
   assert_eq!(out.len(), 1);
@@ -188,8 +191,8 @@ fn removed_then_created_is_modified() {
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  c.admit(removed(s, "/a/f", 1), clk.at(0));
-  c.admit(created(s, "/a/f", 2), clk.at(1));
+  assert!(c.admit(removed(s, "/a/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(created(s, "/a/f", 2), clk.at(1)).is_none());
 
   let out = drain(&mut c, clk.at(20));
   assert_eq!(out.len(), 1);
@@ -216,12 +219,15 @@ fn moved_is_atomic_and_flushes() {
   let s = sub(1);
 
   // Buffer changes at both endpoints of the coming rename.
-  c.admit(modified(s, "/a/src", 1), clk.at(0));
-  c.admit(created(s, "/a/dst", 2), clk.at(1));
+  assert!(c.admit(modified(s, "/a/src", 1), clk.at(0)).is_none());
+  assert!(c.admit(created(s, "/a/dst", 2), clk.at(1)).is_none());
 
   // A rename /a/src -> /a/dst. It is atomic: it flushes both buffered endpoints and
   // emits WHOLE, undelayed — never split, never coalesced.
-  c.admit(moved(s, "/a/dst", "/a/src", 3), clk.at(2));
+  assert!(
+    c.admit(moved(s, "/a/dst", "/a/src", 3), clk.at(2))
+      .is_none()
+  );
 
   let out = drain(&mut c, clk.at(2));
   // The two flushed endpoints, then the Moved (FIFO: flushed-before-the-signal).
@@ -255,7 +261,10 @@ fn moved_emits_undelayed_not_after_a_settle_window() {
   // A rename with NOTHING else buffered for the subscription: it must be due at its own
   // instant (undelayed), not after the quiet window — unlike a plain lifecycle change,
   // which would settle for `quiet_window` first.
-  c.admit(moved(s, "/a/dst", "/a/src", 1), clk.at(0));
+  assert!(
+    c.admit(moved(s, "/a/dst", "/a/src", 1), clk.at(0))
+      .is_none()
+  );
 
   assert_eq!(
     c.next_deadline(),
@@ -278,11 +287,14 @@ fn debounced_moved_flushes_subscription_buffer_preserving_epoch_order() {
   // source nor its destination). The pre-fix Moved path flushed only its two endpoint
   // paths, so this entry would stay buffered and drain LATER than the immediate Moved —
   // its epoch 1 delivered after the Moved's epoch 2, i.e. epochs going backwards.
-  c.admit(modified(s, "/a/other", 1), clk.at(0));
+  assert!(c.admit(modified(s, "/a/other", 1), clk.at(0)).is_none());
 
   // A rename at other paths (epoch 2) — immediate. It must flush the whole subscription
   // buffer first, so /a/other's epoch-1 Modified emits BEFORE the Moved.
-  c.admit(moved(s, "/a/dst", "/a/src", 2), clk.at(1));
+  assert!(
+    c.admit(moved(s, "/a/dst", "/a/src", 2), clk.at(1))
+      .is_none()
+  );
 
   let out = drain(&mut c, clk.at(1));
   assert_eq!(
@@ -321,11 +333,11 @@ fn rescan_flushes_and_bypasses() {
   let s = sub(1);
 
   // Buffer a couple of bursts for this subscription.
-  c.admit(modified(s, "/a/one", 1), clk.at(0));
-  c.admit(created(s, "/a/two", 2), clk.at(1));
+  assert!(c.admit(modified(s, "/a/one", 1), clk.at(0)).is_none());
+  assert!(c.admit(created(s, "/a/two", 2), clk.at(1)).is_none());
 
   // A Rescan stamped with an umbrella epoch that DOMINATES the buffered stamps.
-  c.admit(rescan(s, "/a", 9), clk.at(2));
+  assert!(c.admit(rescan(s, "/a", 9), clk.at(2)).is_none());
 
   let out = drain(&mut c, clk.at(2));
   // Every buffered entry is flushed AND the Rescan emits — all undelayed.
@@ -367,11 +379,11 @@ fn rescan_only_flushes_its_own_subscription() {
   let mut c = Coalescer::new(config());
   let (s1, s2) = (sub(1), sub(2));
 
-  c.admit(modified(s1, "/a/f", 1), clk.at(0));
-  c.admit(modified(s2, "/b/f", 1), clk.at(0));
+  assert!(c.admit(modified(s1, "/a/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(s2, "/b/f", 1), clk.at(0)).is_none());
 
   // A Rescan for s1 must not disturb s2's buffered burst.
-  c.admit(rescan(s1, "/a", 5), clk.at(1));
+  assert!(c.admit(rescan(s1, "/a", 5), clk.at(1)).is_none());
 
   let out = drain(&mut c, clk.at(1));
   assert_eq!(out.len(), 2, "s1's flushed burst plus its Rescan");
@@ -411,7 +423,7 @@ fn a_non_lifecycle_kind_flushes_and_emits_never_coalesced() {
   let s = sub(1);
 
   // A known lifecycle Modified enters `coalesce` — buffered, nothing ready before its settle.
-  c.admit(modified(s, "/a/f", 1), clk.at(0));
+  assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
   assert!(
     drain(&mut c, clk.at(0)).is_empty(),
     "a lifecycle kind is buffered (enters coalesce), not immediately emitted"
@@ -419,7 +431,10 @@ fn a_non_lifecycle_kind_flushes_and_emits_never_coalesced() {
 
   // A non-lifecycle kind for the same subscription is NOT coalesced onto the buffered entry: it
   // flushes the subscription's buffer and emits immediately, both undelayed and in-order.
-  c.admit(moved(s, "/a/dst", "/a/src", 2), clk.at(1));
+  assert!(
+    c.admit(moved(s, "/a/dst", "/a/src", 2), clk.at(1))
+      .is_none()
+  );
   let out = drain(&mut c, clk.at(1));
   assert_eq!(
     out.len(),
@@ -453,7 +468,7 @@ fn max_hold_forces_emission() {
   // Touch the path every 5 ms so the 10 ms settle window NEVER elapses on its own.
   let mut t = 0;
   while t <= 130 {
-    c.admit(modified(s, "/a/f", t / 5 + 1), clk.at(t));
+    assert!(c.admit(modified(s, "/a/f", t / 5 + 1), clk.at(t)).is_none());
     // Before the hold cap (first_seen=0 + 100ms) nothing emits.
     if t < 100 {
       assert!(
@@ -487,9 +502,9 @@ fn coalesced_pair_emits_with_the_newest_stamp() {
   let s = sub(1);
 
   // Monotone stamps within the burst; the emitted event must carry the NEWEST (4).
-  c.admit(created(s, "/a/f", 2), clk.at(0));
-  c.admit(modified(s, "/a/f", 3), clk.at(1));
-  c.admit(modified(s, "/a/f", 4), clk.at(2));
+  assert!(c.admit(created(s, "/a/f", 2), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/a/f", 3), clk.at(1)).is_none());
+  assert!(c.admit(modified(s, "/a/f", 4), clk.at(2)).is_none());
 
   let out = drain(&mut c, clk.at(20));
   assert_eq!(out.len(), 1);
@@ -511,8 +526,8 @@ fn become_modified_keeps_the_newest_stamp() {
   let s = sub(1);
 
   // Removed(5) then Created(7) → synthetic Modified carrying the newest stamp (7).
-  c.admit(removed(s, "/a/f", 5), clk.at(0));
-  c.admit(created(s, "/a/f", 7), clk.at(1));
+  assert!(c.admit(removed(s, "/a/f", 5), clk.at(0)).is_none());
+  assert!(c.admit(created(s, "/a/f", 7), clk.at(1)).is_none());
 
   let out = drain(&mut c, clk.at(20));
   assert_eq!(out.len(), 1);
@@ -533,9 +548,9 @@ fn post_rescan_emission_never_carries_a_dominated_epoch() {
   // A Rescan at umbrella epoch 10, then genuine post-Rescan changes rebased ABOVE it
   // upstream (epoch 11, 12). A conforming consumer must never see a post-Rescan event
   // dominated by the Rescan.
-  c.admit(rescan(s, "/a", 10), clk.at(0));
-  c.admit(modified(s, "/a/f", 11), clk.at(1));
-  c.admit(modified(s, "/a/f", 12), clk.at(2));
+  assert!(c.admit(rescan(s, "/a", 10), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/a/f", 11), clk.at(1)).is_none());
+  assert!(c.admit(modified(s, "/a/f", 12), clk.at(2)).is_none());
 
   // The Rescan is already ready (undelayed); the burst settles after its window.
   let rescan_out = drain(&mut c, clk.at(2));
@@ -567,7 +582,7 @@ fn next_deadline_is_the_earliest_pending() {
 
   assert_eq!(c.next_deadline(), None, "empty: no deadline");
 
-  c.admit(modified(s, "/a/f", 1), clk.at(0));
+  assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
   assert_eq!(
     c.next_deadline(),
     Some(clk.at(10)),
@@ -576,7 +591,7 @@ fn next_deadline_is_the_earliest_pending() {
 
   // A Rescan makes something immediately ready — the deadline drops to that ready
   // instant (in the past relative to the burst's), so the driver drains at once.
-  c.admit(rescan(s, "/b", 3), clk.at(1));
+  assert!(c.admit(rescan(s, "/b", 3), clk.at(1)).is_none());
   assert_eq!(
     c.next_deadline(),
     Some(clk.at(1)),
@@ -590,8 +605,8 @@ fn flush_all_drains_everything_for_stream_close() {
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  c.admit(modified(s, "/a/f", 1), clk.at(0));
-  c.admit(created(s, "/b/g", 2), clk.at(0));
+  assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(created(s, "/b/g", 2), clk.at(0)).is_none());
 
   // On stream close no further change can settle the bursts — flush the tail.
   let mut out = Vec::new();
@@ -618,12 +633,12 @@ fn drop_subscription_discards_only_that_subscriptions_entries() {
 
   // A buffered entry for s1, then a Rescan for s1 flushes it into the ready queue and
   // enqueues itself — so s1 now holds entries in the READY queue…
-  c.admit(modified(s1, "/a/f", 1), clk.at(0));
-  c.admit(rescan(s1, "/a", 2), clk.at(0));
+  assert!(c.admit(modified(s1, "/a/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(rescan(s1, "/a", 2), clk.at(0)).is_none());
   // …and a fresh buffered entry after the flush — so s1 also holds a BUFFER entry.
-  c.admit(modified(s1, "/a/h", 3), clk.at(0));
+  assert!(c.admit(modified(s1, "/a/h", 3), clk.at(0)).is_none());
   // An unrelated subscription's buffered entry, which the drop must not touch.
-  c.admit(modified(s2, "/b/f", 4), clk.at(0));
+  assert!(c.admit(modified(s2, "/b/f", 4), clk.at(0)).is_none());
   assert!(
     c.next_deadline().is_some(),
     "entries are pending before the drop"
@@ -666,8 +681,8 @@ fn drain_ready_emits_buffered_in_epoch_order_not_path_order() {
   let s = sub(1);
 
   // `/z` admitted FIRST at the LOWER epoch; `/a` admitted SECOND at the HIGHER epoch.
-  c.admit(modified(s, "/z", 1), clk.at(0));
-  c.admit(modified(s, "/a", 2), clk.at(1));
+  assert!(c.admit(modified(s, "/z", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/a", 2), clk.at(1)).is_none());
 
   // Both settle by t=20; the settle-timer drain releases them together.
   let out = drain(&mut c, clk.at(20));
@@ -700,8 +715,8 @@ fn flush_all_emits_buffered_in_epoch_order_not_path_order() {
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  c.admit(modified(s, "/z", 1), clk.at(0));
-  c.admit(modified(s, "/a", 2), clk.at(1));
+  assert!(c.admit(modified(s, "/z", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/a", 2), clk.at(1)).is_none());
 
   // Force-emit the still-settling tail (as a stream close would), regardless of deadline.
   let mut out = Vec::new();
@@ -731,12 +746,12 @@ fn rescan_flush_emits_buffered_in_epoch_order_not_path_order() {
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  c.admit(modified(s, "/z", 1), clk.at(0));
-  c.admit(modified(s, "/a", 2), clk.at(1));
+  assert!(c.admit(modified(s, "/z", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/a", 2), clk.at(1)).is_none());
 
   // A Rescan (epoch 3) flushes the whole subscription buffer into the ready queue ahead of
   // itself — in admission (seq) order, so the FIFO replay is lowest-epoch-first.
-  c.admit(rescan(s, "/root", 3), clk.at(2));
+  assert!(c.admit(rescan(s, "/root", 3), clk.at(2)).is_none());
 
   let out = drain(&mut c, clk.at(2));
   assert_eq!(out.len(), 3, "both flushed entries plus the Rescan");
@@ -769,12 +784,12 @@ fn moved_flush_emits_buffered_in_epoch_order_not_path_order() {
   let mut c = Coalescer::new(config());
   let s = sub(1);
 
-  c.admit(modified(s, "/z", 1), clk.at(0));
-  c.admit(modified(s, "/a", 2), clk.at(1));
+  assert!(c.admit(modified(s, "/z", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/a", 2), clk.at(1)).is_none());
 
   // A Moved (epoch 3) at unrelated endpoints flushes the WHOLE subscription buffer ahead of
   // itself — the same seq-ordered flush machinery a Rescan uses.
-  c.admit(moved(s, "/dst", "/src", 3), clk.at(2));
+  assert!(c.admit(moved(s, "/dst", "/src", 3), clk.at(2)).is_none());
 
   let out = drain(&mut c, clk.at(2));
   assert_eq!(out.len(), 3, "both flushed entries plus the Moved");
@@ -867,7 +882,7 @@ mod proptests {
       for step in &steps {
         epoch += u64::from(step.epoch_delta); // monotone-nondecreasing
         t += u64::from(step.time_delta);
-        c.admit(event_for(s, step, epoch), clk.at(t));
+        assert!(c.admit(event_for(s, step, epoch), clk.at(t)).is_none());
         admitted += 1;
         // Drain whatever became ready as time advanced.
         c.drain_ready(clk.at(t), &mut emitted);
@@ -906,7 +921,7 @@ mod proptests {
         for step in steps {
           epoch += u64::from(step.epoch_delta);
           t += u64::from(step.time_delta);
-          c.admit(event_for(s, step, epoch), clk.at(t));
+          assert!(c.admit(event_for(s, step, epoch), clk.at(t)).is_none());
           c.drain_ready(clk.at(t), &mut out);
         }
         c.flush_all(&mut out);
@@ -936,7 +951,7 @@ mod proptests {
       for step in &steps {
         epoch += u64::from(step.epoch_delta);
         t += u64::from(step.time_delta);
-        c.admit(event_for(s, step, epoch), clk.at(t));
+        assert!(c.admit(event_for(s, step, epoch), clk.at(t)).is_none());
         c.drain_ready(clk.at(t), &mut emitted);
       }
       c.flush_all(&mut emitted);
@@ -988,7 +1003,7 @@ mod tokio_timer {
     // Admit a burst of three Modifieds to one path at the current (paused) instant.
     let start = Rt::now();
     for epoch in 1..=3 {
-      c.admit(modified(s, "/a/f", epoch), start.into());
+      assert!(c.admit(modified(s, "/a/f", epoch), start.into()).is_none());
     }
 
     // The burst is not yet due: draining now yields nothing.
@@ -999,7 +1014,7 @@ mod tokio_timer {
     // A Rescan mid-burst is immediately ready — it must NOT wait for the burst's
     // deadline. Sleep until the coalescer's next deadline (now the ready Rescan) and
     // drain: the flushed burst + the Rescan come out well before quiet_window elapses.
-    c.admit(rescan(s, "/a", 9), Rt::now().into());
+    assert!(c.admit(rescan(s, "/a", 9), Rt::now().into()).is_none());
     let deadline = c.next_deadline().expect("the ready Rescan sets a deadline");
     Rt::sleep_until(deadline.into()).await;
     c.drain_ready(Rt::now().into(), &mut out);
@@ -1023,4 +1038,43 @@ mod tokio_timer {
     );
     assert_eq!(c.next_deadline(), None, "everything drained");
   }
+}
+
+/// Codex R55: the buffered-entry cap is the structural memory bound in FRONT of the
+/// bounded event channel. A high-cardinality burst (10,000 distinct keys) against a
+/// cap of 64 never grows the buffer past the cap; every admission past it signals the
+/// overflowed subscription (owed a dominating parked Rescan by the driver), and
+/// collapses onto existing entries stay exempt at the cap.
+#[test]
+fn buffered_entry_cap_bounds_high_cardinality_bursts() {
+  let now = Instant::now();
+  let mut coalescer = Coalescer::new(crate::options::DebounceConfig::new().with_max_buffered(64));
+  let s = sub(1);
+
+  let mut overflows = 0usize;
+  for i in 0..10_000u32 {
+    let outcome = coalescer.admit(created(s, &format!("/k{i}"), u64::from(i) + 1), now);
+    assert!(
+      coalescer.buffer.len() <= 64,
+      "the buffer NEVER exceeds the cap (got {} at admission {i})",
+      coalescer.buffer.len()
+    );
+    if let Some(overflowed) = outcome {
+      assert_eq!(overflowed, s, "the shed names the admitting subscription");
+      overflows += 1;
+    }
+  }
+  assert_eq!(
+    overflows,
+    10_000 - 64,
+    "every admission past the cap signalled the shed — none was silently dropped"
+  );
+
+  // Collapsing onto an ALREADY-buffered entry never counts against the cap: a second
+  // observation of a buffered key is admitted even while the buffer sits at the cap.
+  assert!(
+    coalescer.admit(modified(s, "/k0", 20_000), now).is_none(),
+    "a collapse onto an existing entry is exempt at the cap"
+  );
+  assert_eq!(coalescer.buffer.len(), 64, "still exactly at the cap");
 }

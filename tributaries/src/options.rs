@@ -29,6 +29,7 @@ use tributary_fs::WatcherOptions;
 pub struct DebounceConfig {
   quiet_window: Duration,
   max_hold: Duration,
+  max_buffered: usize,
 }
 
 impl DebounceConfig {
@@ -40,13 +41,48 @@ impl DebounceConfig {
   /// coalesced state is held before it is forced out.
   pub const DEFAULT_MAX_HOLD: Duration = Duration::from_millis(500);
 
+  /// The default cap on buffered coalescer entries (1024, mirroring the event
+  /// channel's default) — the structural memory bound in front of the bounded event
+  /// channel (Codex R55). See [`max_buffered`](Self::max_buffered).
+  pub const DEFAULT_MAX_BUFFERED: usize = 1024;
+
   /// The default debounce policy.
   #[inline]
   pub const fn new() -> Self {
     Self {
       quiet_window: Self::DEFAULT_QUIET_WINDOW,
       max_hold: Self::DEFAULT_MAX_HOLD,
+      max_buffered: Self::DEFAULT_MAX_BUFFERED,
     }
+  }
+
+  /// The cap on BUFFERED coalescer entries across all subscriptions (Codex R55): the
+  /// settle buffer sits in FRONT of the bounded event channel, so without its own bound
+  /// a high-cardinality burst under a long window could grow memory without limit and
+  /// the overflow-to-`Rescan` machinery would never engage. When an admission would
+  /// open an entry PAST this cap, the affected subscription is shed instead: its
+  /// buffered entries are purged and a dominating parked
+  /// [`Rescan`](crate::EventKind::Rescan) is owed through the same loss-accounting path
+  /// as a full event channel — bounded memory, no silent loss. Collapsing onto an
+  /// already-buffered entry never counts against the cap.
+  #[inline]
+  pub const fn max_buffered(&self) -> usize {
+    self.max_buffered
+  }
+
+  /// Returns this policy with the buffered-entry cap set (0 is clamped to 1).
+  #[inline]
+  #[must_use]
+  pub const fn with_max_buffered(mut self, max_buffered: usize) -> Self {
+    self.max_buffered = if max_buffered == 0 { 1 } else { max_buffered };
+    self
+  }
+
+  /// Sets the buffered-entry cap (0 is clamped to 1).
+  #[inline]
+  pub const fn set_max_buffered(&mut self, max_buffered: usize) -> &mut Self {
+    self.max_buffered = if max_buffered == 0 { 1 } else { max_buffered };
+    self
   }
 
   /// The settle window: an entry emits once its path has been quiet this long.
