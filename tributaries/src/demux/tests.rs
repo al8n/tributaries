@@ -569,6 +569,71 @@ async fn aborting_the_routing_future_loses_at_most_the_in_flight_delivery() {
   assert_eq!(later.key(), key("/a/after-abort").as_slice());
 }
 
+/// Codex R56: the shutdown drain barrier is bounded by a COUNT SNAPSHOT taken when the
+/// stop is processed — traffic arriving DURING the barrier (while it stalls on a full
+/// lane) is past the snapshot: the routing future still resolves (no livelock against
+/// a live producer) and the post-stop events remain on the shared MPMC stream for
+/// surviving clones instead of being diverted into the demux.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_barrier_is_snapshot_bounded_under_a_live_producer() {
+  let (mut w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let (demux, _rest, driver) = Demux::parts(w.clone(), 16);
+  let routing = tokio::spawn(driver);
+  let lane_a = demux.lane(sub_a, 1).await;
+
+  // Park the router deterministically: e1 round-trips, e2 fills the capacity-1 lane,
+  // e3 parks the in-flight send; e4 and e5 queue on the shared stream — the backlog
+  // the snapshot must cover.
+  feed.modified("/a", "/a/e1").await;
+  assert_eq!(recv(&lane_a).await.key(), key("/a/e1").as_slice());
+  feed.modified("/a", "/a/e2").await;
+  feed.modified("/a", "/a/e3").await;
+  feed.modified("/a", "/a/e4").await;
+  feed.modified("/a", "/a/e5").await;
+  tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+  // Stop requested while parked; the snapshot is taken when the stop is processed —
+  // after e3's send completes below.
+  demux.shutdown().await;
+
+  // Drain e2 (unparks e3), then keep feeding WHILE the barrier runs: e6/e7 arrive
+  // after the snapshot and must NOT be absorbed by the barrier.
+  assert_eq!(recv(&lane_a).await.key(), key("/a/e2").as_slice());
+  assert_eq!(recv(&lane_a).await.key(), key("/a/e3").as_slice());
+  // Give the router time to process the stop and take its snapshot (it then parks in
+  // the barrier's own lane delivery) before the post-stop traffic arrives — the
+  // snapshot must provably predate e6/e7.
+  tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+  feed.modified("/a", "/a/e6").await;
+  feed.modified("/a", "/a/e7").await;
+
+  // The barrier delivers exactly the snapshot backlog (e4, e5), then the lane ends —
+  // the routing future resolves despite the producer staying live.
+  assert_eq!(recv(&lane_a).await.key(), key("/a/e4").as_slice());
+  assert_eq!(recv(&lane_a).await.key(), key("/a/e5").as_slice());
+  assert!(
+    tokio::time::timeout(DEADLINE, lane_a.recv())
+      .await
+      .expect("lane settles")
+      .is_none(),
+    "the barrier stopped at the snapshot — no post-stop absorption (Codex R56)"
+  );
+  tokio::time::timeout(DEADLINE, routing)
+    .await
+    .expect("the routing future resolves under a live producer")
+    .expect("routing task");
+
+  // The post-stop events are still on the shared stream for the surviving clone.
+  for expected in ["/a/e6", "/a/e7"] {
+    let event = tokio::time::timeout(DEADLINE, w.next())
+      .await
+      .expect("next settles")
+      .expect("stream live for survivors");
+    assert_eq!(event.key(), key(expected).as_slice());
+  }
+}
+
 /// Codex R50: releases LOST to a full control queue cannot leak the table. The exact
 /// repro: stall the router on a full lane, admit CONTROL_CAPACITY registrations (the
 /// queue is now full), drop every one of those lanes — each drop-release try_send

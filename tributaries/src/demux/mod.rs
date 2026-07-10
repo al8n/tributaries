@@ -325,13 +325,16 @@ impl<C, V> Demux<C, V> {
     self.tracked.load(Ordering::Acquire)
   }
 
-  /// Requests an ORDERLY stop of the routing task (Codex R54/R55): it finishes the
-  /// delivery it is currently awaiting — a stalled send completes when that lane
-  /// drains, never mid-send — then routes EVERYTHING the shared stream already holds
-  /// at that instant (the drain barrier), and only then exits, dropping every lane
-  /// sender so each [`Lane::recv`] drains its buffered tail and reads `None`. Nothing
-  /// emitted before the stop took effect is lost; events the actor emits afterwards
-  /// are post-stop and remain drainable by surviving handle clones.
+  /// Requests an ORDERLY stop of the routing task (Codex R54/R55/R56): it finishes
+  /// the delivery it is currently awaiting — a stalled send completes when that lane
+  /// drains, never mid-send — then routes the backlog the shared stream holds at the
+  /// instant the stop is processed (the drain barrier, bounded by a COUNT SNAPSHOT
+  /// taken at that moment, so it is finite even under a producer that keeps the
+  /// stream non-empty), and only then exits, dropping every lane sender so each
+  /// [`Lane::recv`] drains its buffered tail and reads `None`. Nothing emitted before
+  /// the stop took effect is lost; events emitted afterwards — past the snapshot —
+  /// are post-stop and remain drainable by surviving handle clones on the shared
+  /// MPMC stream.
   ///
   /// This is the loss-free way to stop routing without ending the watcher itself
   /// (closing the watcher ends the shared stream and the lanes with it). By contrast,
@@ -468,17 +471,26 @@ async fn run<C, V, R, H>(
               }
             }
             Ok(Control::Shutdown) => {
-              // Orderly stop-and-DRAIN (Codex R54/R55): the delivery this loop
-              // completed before selecting again is already done — and everything the
-              // shared stream ALREADY HOLDS at this instant is routed too, via the
-              // non-blocking drain barrier below (a `now_or_never` poll of `next()` is
-              // one cancel-safe channel poll: `Some` routes the event, `None` means
-              // the stream is empty NOW and the barrier is complete). Events the actor
-              // emits after the barrier are post-stop — surviving handle clones can
-              // still drain them. Only then do the senders drop, so every lane ends
-              // after a tail that includes the whole pre-shutdown backlog.
-              while let Some(Some(event)) = watcher.next().now_or_never() {
-                deliver(&mut lanes, &mut rest, &tracked, event).await;
+              // Orderly stop-and-DRAIN (Codex R54/R55/R56): the delivery this loop
+              // completed before selecting again is already done — and the backlog the
+              // shared stream holds AT THIS INSTANT is routed too, bounded by a COUNT
+              // SNAPSHOT taken now (Codex R56: an until-empty loop has no finite
+              // boundary — a lane stall mid-barrier lets the producer refill the
+              // stream, so it could absorb post-stop traffic forever). At most
+              // `owed` events drain: each `now_or_never` poll of `next()` is one
+              // cancel-safe channel poll, `None` (another clone raced the backlog
+              // away) ends the barrier early, and each drained event routes through
+              // the normal awaited-lane delivery (finite stalls, `owed` of them at
+              // worst). Everything past the snapshot is post-stop — surviving handle
+              // clones drain it from the shared MPMC stream. Only then do the senders
+              // drop, so every lane ends after a tail that includes exactly the
+              // pre-stop backlog.
+              let owed = watcher.queued_events();
+              for _ in 0..owed {
+                match watcher.next().now_or_never() {
+                  Some(Some(event)) => deliver(&mut lanes, &mut rest, &tracked, event).await,
+                  _ => break,
+                }
               }
               break;
             }
