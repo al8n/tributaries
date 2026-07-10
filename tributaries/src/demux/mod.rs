@@ -153,11 +153,11 @@ enum Control<C, V> {
 /// # Example
 ///
 /// ```rust,no_run
-/// # #[cfg(feature = "tokio")]
+/// # #[cfg(all(feature = "tokio", feature = "fs"))]
 /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 /// use std::{ffi::OsString, path::Path};
 ///
-/// use tributaries::{Demux, TokioTributaries, TributariesOptions, WatchOptions};
+/// use tributaries::{Demux, TokioTributaries, TributariesOptions, WatchOptions, WatcherOptions};
 ///
 /// fn key(path: &str) -> Vec<OsString> {
 ///   Path::new(path)
@@ -166,7 +166,7 @@ enum Control<C, V> {
 ///     .collect()
 /// }
 ///
-/// let w = TokioTributaries::new(TributariesOptions::new())?;
+/// let w = TokioTributaries::new(WatcherOptions::new(), TributariesOptions::new())?;
 /// let project = key("/path/to/project");
 /// let sub = w.watch(project.clone(), (), WatchOptions::new()).await?;
 ///

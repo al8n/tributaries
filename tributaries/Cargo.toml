@@ -12,10 +12,18 @@ categories = ["filesystem", "asynchronous"]
 keywords = ["filesystem", "notify", "watcher", "subsume"]
 
 [features]
-# Runtime aliases mirror `tributary-fs`. The sans-I/O engines need no runtime;
-# these gate the async driver's `Tokio*`/`Smol*` aliases.
-tokio = ["tributary-fs/tokio", "agnostic-lite/tokio"]
-smol = ["tributary-fs/smol", "agnostic-lite/smol"]
+default = ["fs"]
+# The default local-filesystem binding (`FsSource`, the `RootHandle`/`WatcherOptions`
+# re-exports, the pure-fs constructor and runtime aliases). Off, the crate is the
+# generic core over `tributary-proto` alone — a custom-`Source` consumer skips the
+# whole fs stack.
+fs = ["dep:tributary-fs"]
+# Runtime features are orthogonal to `fs`: they gate the async driver's
+# `Tokio*`/`Smol*` aliases and forward the runtime into `tributary-fs` only when the
+# fs binding is enabled too (the weak `?` dependency). The sans-I/O engines need no
+# runtime.
+tokio = ["agnostic-lite/tokio", "tributary-fs?/tokio"]
+smol = ["agnostic-lite/smol", "tributary-fs?/smol"]
 
 [dependencies]
 agnostic-lite = { version = "0.6", features = ["time"] }
@@ -28,22 +36,35 @@ futures-util = { version = "0.3", default-features = false, features = [
 ] }
 iradix = "0.3"
 thiserror = "2"
-tributary-fs = { version = "0.1", path = "../tributary-fs" }
+tributary-fs = { version = "0.1", path = "../tributary-fs", optional = true }
 tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
 # Mirror a real consumer's manifest: the indexer-shaped integration suite
 # (`tests/indexer_shaped.rs`) names `tributary_fs::Watcher` + a concrete
 # `agnostic_lite` runtime directly, exactly as a downstream crate building its own
-# `Source` would. Their `tokio`/`smol` feature layers unify with this crate's own
-# (via the `tokio`/`smol` features above), so no extra feature wiring is needed.
+# `Source` would — with this crate's own `fs` feature OFF, so the dev-dependency is
+# unconditional and carries its own `tokio` layer (the weak `tributary-fs?/tokio`
+# forwarding above deliberately does not fire when `fs` is off).
 agnostic-lite = { version = "0.6", features = ["time"] }
 proptest = "1"
 tempfile = "3"
-tributary-fs = { version = "0.1", path = "../tributary-fs" }
+tributary-fs = { version = "0.1", path = "../tributary-fs", features = ["tokio"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+
+# The pure-fs end-to-end suite needs the default fs binding and a runtime.
+[[test]]
+name = "umbrella"
+required-features = ["fs", "tokio"]
+
+# The custom-source proof: it binds its own `Source` over the `tributary-fs`
+# DEV-dependency, so it deliberately does NOT require `fs` — it must keep compiling
+# and running with the umbrella's fs feature off.
+[[test]]
+name = "indexer_shaped"
+required-features = ["tokio"]
 
 [lints]
 workspace = true

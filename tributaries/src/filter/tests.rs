@@ -25,8 +25,8 @@ fn key(path: &str) -> Vec<OsString> {
 /// Whether `f` admits a change of `kind` at `path`, built as the pre-delivery
 /// [`FilterInput`] a filter actually inspects (key/kind/location — never an epoch or value, which
 /// a filter cannot observe, design §7). A synthetic [`Event`] owns the borrowed parts; the filter
-/// reads only its public pre-delivery accessors, so this stand-in exercises it without the private
-/// `tributary_fs::Event` constructor.
+/// reads only its public pre-delivery accessors, so this stand-in exercises it without any real
+/// source's private event constructor.
 fn admits(f: &Filter<OsString>, path: &str, kind: EventKind<OsString>) -> bool {
   let ev: Event<OsString, ()> =
     Event::synthetic(sub(1), key(path), Location::new(), kind, Epoch::new(1));

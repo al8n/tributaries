@@ -42,7 +42,7 @@
 
 use std::collections::HashMap;
 
-use tributary_fs::Epoch;
+use tributary_proto::Epoch;
 
 use crate::{
   route::{RoutableEvent, fan_out},

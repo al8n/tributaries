@@ -32,7 +32,7 @@ fn key(path: &str) -> Vec<OsString> {
 
 /// A synthetic event of `kind` for `s` at `path`, stamped `epoch`. The coalescer only
 /// reads `subscription`/`key`/`kind`/`epoch`/`location`, so a synthetic stand-in
-/// exercises it without the private `tributary_fs::Event` constructor. Its `location`
+/// exercises it without any real source's private event constructor. Its `location`
 /// is a fresh (root-anchored) one — the coalescer never keys on `location`.
 fn ev(s: Subscription, path: &str, kind: EventKind<OsString>, epoch: u64) -> Ev {
   Event::synthetic(s, key(path), Location::new(), kind, Epoch::new(epoch))

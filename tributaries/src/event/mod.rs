@@ -138,8 +138,8 @@ impl<C> core::fmt::Display for EventKind<C> {
 /// # Epoch is umbrella-relative, not the raw fs epoch
 ///
 /// [`epoch`](Self::epoch) is the umbrella's own per-subscription monotone stamp,
-/// assigned by the driver at delivery time (design §8) — **not** the raw
-/// [`tributary_fs::Event::epoch`], which is per-`ScopeId` and **restarts at
+/// assigned by the driver at delivery time (design §8) — **not** the raw source epoch
+/// (`tributary-fs`'s per-event epoch), which is per-`ScopeId` and **restarts at
 /// [`Epoch::START`] on every new kernel arm**. Because a subscription is delivered
 /// from *different* fs roots over its lifetime (a widen re-points it onto a
 /// freshly-armed wider root whose epoch sequence restarts at 0), the raw fs epoch is
@@ -341,8 +341,8 @@ impl<C, V> Event<C, V> {
 
   /// This subscription's monotone reconciliation epoch for this event.
   ///
-  /// The **umbrella-relative** stamp (design §8), *not* the raw
-  /// [`tributary_fs::Event::epoch`] — see the [type docs](Self). A delivered
+  /// The **umbrella-relative** stamp (design §8), *not* the raw source epoch
+  /// ([`SourceEvent::epoch`](crate::SourceEvent::epoch)) — see the [type docs](Self). A delivered
   /// [`Rescan`](EventKind::Rescan) carries a stamp that strictly dominates every event
   /// previously delivered to this subscription; events with epochs dominated by a
   /// delivered `Rescan` may have been dropped, and everything they described is
@@ -442,9 +442,11 @@ impl<V> Event<std::ffi::OsString, V> {
 
 /// The `OsString` components of a path — the located-key form the fs source keys on
 /// (mirroring [`iradix`]'s `Path` key: one `OsString` per [`Path::components`] entry,
-/// so `a/b` is an ancestor of `a/b/c` but not of `a/bc`).
+/// so `a/b` is an ancestor of `a/b/c` but not of `a/bc`). Only the fs binding converts
+/// between keys and paths, so this rides its feature.
 ///
 /// [`Path::components`]: std::path::Path::components
+#[cfg(feature = "fs")]
 pub(crate) fn path_components(path: &std::path::Path) -> Vec<std::ffi::OsString> {
   path
     .components()

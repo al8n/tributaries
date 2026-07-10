@@ -4,8 +4,6 @@
 
 use core::{num::NonZeroUsize, time::Duration};
 
-use tributary_fs::WatcherOptions;
-
 use crate::{filter::Filter, interest::Interest};
 
 #[cfg(test)]
@@ -203,17 +201,20 @@ impl Debounce {
   }
 }
 
-/// Configuration for a [`Tributaries`](crate::Tributaries) watcher.
+/// Configuration for a [`Tributaries`](crate::Tributaries) watcher — purely the
+/// umbrella's own knobs.
 ///
-/// Embeds the lower-level [`WatcherOptions`] (forwarded to the wrapped
-/// `tributary-fs` watcher), the owner→consumer [`event_capacity`](Self::event_capacity),
-/// the caller→owner [`command_capacity`](Self::command_capacity), and an optional
+/// Carries the owner→consumer [`event_capacity`](Self::event_capacity), the
+/// caller→owner [`command_capacity`](Self::command_capacity), and an optional
 /// [`DebounceConfig`] enabling the settle coalescer (design §6). [`new`](Self::new)
-/// returns the defaults — the default watcher options, the default capacities, and
-/// **no** debounce (events pass through untouched).
+/// returns the defaults — the default capacities and **no** debounce (events pass
+/// through untouched). A source's own transport configuration lives with the source:
+/// the pure-fs constructor takes the fs watcher's options as its own separate argument
+/// (`Tributaries::new(watcher, options)` under the `fs` feature), and a pre-built
+/// custom source ([`Tributaries::with_source`](crate::Tributaries::with_source)) was
+/// configured by its builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TributariesOptions {
-  watcher: WatcherOptions,
   event_capacity: NonZeroUsize,
   command_capacity: NonZeroUsize,
   debounce: Option<DebounceConfig>,
@@ -226,10 +227,10 @@ impl TributariesOptions {
 
   /// The default capacity of the owner→consumer event channel (1024) — the bounded
   /// buffer the owner delivers attributed events through (design backpressure doc).
-  /// Mirrors [`WatcherOptions::DEFAULT_EVENT_CAPACITY`], generous enough to absorb
-  /// ordinary bursts in-order so per-subscription overflow-to-`Rescan` shedding stays
-  /// rare.
-  pub const DEFAULT_EVENT_CAPACITY: NonZeroUsize = WatcherOptions::DEFAULT_EVENT_CAPACITY;
+  /// Mirrors the fs watcher's own default event capacity one level down, generous
+  /// enough to absorb ordinary bursts in-order so per-subscription
+  /// overflow-to-`Rescan` shedding stays rare.
+  pub const DEFAULT_EVENT_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
   /// The default capacity of the caller→owner command mailbox (64). Deliberately much
   /// tighter than [`DEFAULT_EVENT_CAPACITY`](Self::DEFAULT_EVENT_CAPACITY): each queued
@@ -238,22 +239,14 @@ impl TributariesOptions {
   /// beyond what an orderly consumer keeps outstanding.
   pub const DEFAULT_COMMAND_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
-  /// The default options: default [`WatcherOptions`], default capacities, no
-  /// debounce.
+  /// The default options: default capacities, no debounce.
   #[inline]
-  pub fn new() -> Self {
+  pub const fn new() -> Self {
     Self {
-      watcher: WatcherOptions::new(),
       event_capacity: Self::DEFAULT_EVENT_CAPACITY,
       command_capacity: Self::DEFAULT_COMMAND_CAPACITY,
       debounce: Self::DEFAULT_DEBOUNCE,
     }
-  }
-
-  /// The lower-level watcher options forwarded to the wrapped `tributary-fs` watcher.
-  #[inline]
-  pub const fn watcher(&self) -> &WatcherOptions {
-    &self.watcher
   }
 
   /// The capacity of the owner→consumer event channel (design backpressure doc): the
@@ -261,9 +254,9 @@ impl TributariesOptions {
   /// consumer), the owner sheds the affected subscription to a dominating
   /// [`Rescan`](crate::EventKind::Rescan) rather than blocking or growing memory
   /// without bound — so this trades buffering headroom against how eagerly a slow
-  /// consumer is asked to re-enumerate. Distinct from the wrapped watcher's own
-  /// [`event_capacity`](WatcherOptions::event_capacity), which bounds the fs layer's
-  /// channel one level down.
+  /// consumer is asked to re-enumerate. Distinct from any capacity the source's own
+  /// transport configuration carries (the fs watcher's `event_capacity` bounds the fs
+  /// layer's channel one level down).
   #[inline]
   pub const fn event_capacity(&self) -> NonZeroUsize {
     self.event_capacity
@@ -311,21 +304,6 @@ impl TributariesOptions {
     self
   }
 
-  /// Returns these options with the lower-level watcher options set.
-  #[inline]
-  #[must_use]
-  pub fn with_watcher(mut self, watcher: WatcherOptions) -> Self {
-    self.watcher = watcher;
-    self
-  }
-
-  /// Sets the lower-level watcher options.
-  #[inline]
-  pub fn set_watcher(&mut self, watcher: WatcherOptions) -> &mut Self {
-    self.watcher = watcher;
-    self
-  }
-
   /// The debounce policy, if the settle coalescer is enabled — the watcher-global
   /// **default** every subscription inherits unless its own
   /// [`WatchOptions::with_debounce`] overrides it (see [`Debounce`]).
@@ -350,24 +328,12 @@ impl TributariesOptions {
     self
   }
 
-  /// Consumes these options, yielding the parts the driver wires up: the lower-level
-  /// watcher options, the owner→consumer event-channel capacity, the caller→owner
-  /// command-mailbox capacity, and the optional debounce policy.
+  /// Consumes these options, yielding the parts the driver wires up: the
+  /// owner→consumer event-channel capacity, the caller→owner command-mailbox capacity,
+  /// and the optional debounce policy.
   #[inline]
-  pub(crate) fn into_parts(
-    self,
-  ) -> (
-    WatcherOptions,
-    NonZeroUsize,
-    NonZeroUsize,
-    Option<DebounceConfig>,
-  ) {
-    (
-      self.watcher,
-      self.event_capacity,
-      self.command_capacity,
-      self.debounce,
-    )
+  pub(crate) fn into_parts(self) -> (NonZeroUsize, NonZeroUsize, Option<DebounceConfig>) {
+    (self.event_capacity, self.command_capacity, self.debounce)
   }
 }
 
@@ -378,14 +344,6 @@ impl Default for TributariesOptions {
   }
 }
 
-impl From<WatcherOptions> for TributariesOptions {
-  /// Adopts lower-level watcher options with debounce left disabled.
-  #[inline]
-  fn from(watcher: WatcherOptions) -> Self {
-    Self::new().with_watcher(watcher)
-  }
-}
-
 /// Per-watch options for one [`watch`](crate::Tributaries::watch) call: the fan-out
 /// [`Interest`] gate (design §5), the admission [`Filter`] (design §7), and the
 /// [`Debounce`] posture (design §6).
@@ -393,8 +351,9 @@ impl From<WatcherOptions> for TributariesOptions {
 /// [`new`](Self::new) is the deliver-everything default — every kind, every change,
 /// the watcher-global debounce — and narrowing is the opt-in act, one `with_*` builder
 /// per knob. Not to be confused with the fs watcher's transport-level
-/// [`WatcherOptions`]: these options configure one *subscription*, never the underlying
-/// kernel watch (every root is armed with the source's widest policy, design §4).
+/// `WatcherOptions` (an `fs`-feature item): these options configure one *subscription*,
+/// never the underlying kernel watch (every root is armed with the source's widest
+/// policy, design §4).
 ///
 /// # Cloning shares the [`Filter`] slot
 ///

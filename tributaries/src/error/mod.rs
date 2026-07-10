@@ -19,6 +19,9 @@
 
 use core::error::Error;
 
+#[cfg(all(test, not(feature = "fs")))]
+mod tests;
+
 /// A classified failure reported by a [`Source`](crate::Source): the umbrella-neutral
 /// [`FaultKind`] plus, when the source has one, the concrete source error boxed behind
 /// the standard error chain (`Send + Sync` payloads only, so errors cross threads).
@@ -211,8 +214,9 @@ impl BuildError {
 
   /// The underlying `tributary-fs` build error, when this error's fault carries one —
   /// downcast sugar over [`fault`](Self::fault) + [`SourceFault::downcast_ref`] for the
-  /// default fs source. Moves behind the `fs` feature once the fs dependency becomes
-  /// optional.
+  /// default fs source, riding its `fs` feature (on by default).
+  #[cfg(feature = "fs")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
   #[inline]
   pub fn as_fs(&self) -> Option<&tributary_fs::BuildError> {
     self.fault()?.downcast_ref()
@@ -349,8 +353,9 @@ impl WatchError {
 
   /// The underlying [`tributary_fs::WatchRootError`], when this error's fault carries
   /// one — downcast sugar over [`fault`](Self::fault) + [`SourceFault::downcast_ref`]
-  /// for the default fs source. Moves behind the `fs` feature once the fs dependency
-  /// becomes optional.
+  /// for the default fs source, riding its `fs` feature (on by default).
+  #[cfg(feature = "fs")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
   #[inline]
   pub fn as_fs(&self) -> Option<&tributary_fs::WatchRootError> {
     self.fault()?.downcast_ref()

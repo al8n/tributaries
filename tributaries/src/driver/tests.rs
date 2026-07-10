@@ -9,7 +9,7 @@ use std::{
 };
 
 use agnostic_lite::tokio::TokioRuntime;
-use tributary_fs::{ChangeId, Epoch, Location};
+use tributary_proto::{ChangeId, Epoch, Location};
 
 use super::{Owner, epoch::EpochLedger};
 use crate::{
@@ -59,7 +59,7 @@ enum Call {
 /// source's canonical-key adoption (a `retarget` diverges the reported canonical key from the
 /// requested one — the design §4 TOCTOU).
 ///
-/// **It enforces the source's disjoint-root contract** (mirroring [`tributary_fs::Watcher`]):
+/// **It enforces the source's disjoint-root contract** (mirroring the `tributary-fs` watcher):
 /// arming a key overlapping a currently-armed fake root returns a
 /// [`FaultKind::Conflict`] fault, so the widen-ordering tests validate a *real-executable*
 /// sequence — a naive arm-before-unwatch would be rejected here just as the kernel watcher
@@ -246,7 +246,7 @@ impl Source<OsString> for FakeSource {
       ));
     }
     // The disjoint-root contract (design §4): reject a key overlapping any live root,
-    // exactly as `tributary_fs::Watcher` does — this forces disarm-before-arm on a widen.
+    // exactly as the `tributary-fs` watcher does — this forces disarm-before-arm on a widen.
     if let Some(existing) = self
       .live
       .values()
@@ -4887,7 +4887,7 @@ async fn drop_orphan_after_terminal_retire_clears_the_orphans_parked_rescan_no_f
 /// subsumer AND issues the synchronous `source.disarm`, so the re-`watch` is classified `Disjoint`
 /// (the subsumer no longer records it) and the source has already applied the release before the
 /// fresh arm (disarm contract clause 2) — no flush machinery, no
-/// [`Overlaps`](tributary_fs::WatchRootError::Overlaps). The re-`watch` arms a FRESH
+/// overlap rejection. The re-`watch` arms a FRESH
 /// generation-unique handle; the released OLD handle is logically dead and cannot touch it.
 ///
 /// Non-vacuous: the recorded op sequence is exactly `Arm(/a)`, `Disarm(1)`, `Arm(/a)` — the release

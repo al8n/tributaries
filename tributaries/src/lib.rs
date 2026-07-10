@@ -1,6 +1,6 @@
 //! The public top-level crate of the `tributaries` filesystem-notification stack.
 //!
-//! [`tributary-fs`](tributary_fs) deliberately watches only **disjoint** roots
+//! `tributary-fs` deliberately watches only **disjoint** roots
 //! (it rejects a new root that overlaps an existing one) because subsuming
 //! overlapping trees is the layer above's job. `tributaries` is that layer. It:
 //!
@@ -14,8 +14,14 @@
 //!    settle/debounce coalescer — without touching the hardened core.
 //!
 //! Everything hard (identity, move-pairing, loss-is-a-`Rescan`, epoch dominance)
-//! already lives in the Monitor and ships through [`tributary_fs::Event`];
+//! already lives in the Monitor and ships through `tributary-fs`'s own event type;
 //! `tributaries` adds routing and consumer ergonomics, not new correctness logic.
+//!
+//! The local-filesystem binding — `FsSource`, the `RootHandle`/`WatcherOptions`
+//! re-exports, the pure-fs constructor and runtime aliases — rides the **`fs` feature,
+//! on by default**. With it off, the crate is the generic core over `tributary-proto`
+//! alone: bring your own [`Source`] (or [`LocalSource`]) and construct through
+//! [`Tributaries::with_source`]/[`Tributaries::parts`]/[`Tributaries::parts_local`].
 //!
 //! # Quick start
 //!
@@ -26,12 +32,13 @@
 //! to every covering subscription under its own id.
 //!
 //! ```no_run
-//! # #[cfg(feature = "tokio")]
+//! # #[cfg(all(feature = "tokio", feature = "fs"))]
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::{ffi::OsString, path::Path};
 //!
 //! use tributaries::{
 //!   Debounce, DebounceConfig, Filter, TokioTributaries, TributariesOptions, WatchOptions,
+//!   WatcherOptions,
 //! };
 //!
 //! // The local-fs source keys on a path's components (the caller supplies canonical paths).
@@ -42,9 +49,10 @@
 //!     .collect()
 //! }
 //!
+//! // The fs watcher's own transport options ride separately from the umbrella's knobs.
 //! // Opt into the settle coalescer (omit `.debounce(..)` for raw pass-through).
 //! let options = TributariesOptions::new().debounce(DebounceConfig::new());
-//! let mut tributaries = TokioTributaries::new(options)?;
+//! let mut tributaries = TokioTributaries::new(WatcherOptions::new(), options)?;
 //!
 //! // A subscription that only reports Rust sources — the filter is live-swappable.
 //! let sources = Filter::new(|event| event.path().extension().is_some_and(|x| x == "rs"));
@@ -138,31 +146,37 @@ pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
 pub use interest::Interest;
 pub use options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions};
-pub use source::{Armed, FsSource, LocalSource, Source, SourceEvent};
+pub use source::{Armed, LocalSource, Source, SourceEvent};
 pub use subscription::{InstanceId, Subscription};
 pub use view::{Snapshot, WatchView};
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "fs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
+pub use source::FsSource;
+
+#[cfg(all(feature = "fs", feature = "tokio"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fs", feature = "tokio"))))]
 pub use driver::TokioTributaries;
 
-#[cfg(feature = "smol")]
-#[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
+#[cfg(all(feature = "fs", feature = "smol"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fs", feature = "smol"))))]
 pub use driver::SmolTributaries;
 
 /// The umbrella **owns** the source-neutral event vocabulary ([`EventKind`], with the
 /// move endpoint carried in-kind): each source — the fs binding included — maps into it
 /// at its binding, so the fs-only event types (`tributary_fs::EventKind`,
 /// `tributary_fs::MovedEvent`) stay in [`tributary-fs`](tributary_fs) for fs consumers.
-/// Only the two fs-binding types surface here: [`RootHandle`] is the [`FsSource`]
-/// armed-root token ([`Source::Handle`]), and [`WatcherOptions`] configures the
-/// underlying filesystem watcher it drives.
+/// Only the two fs-binding types surface here (with the default `fs` feature):
+/// [`RootHandle`] is the [`FsSource`] armed-root token ([`Source::Handle`]), and
+/// [`WatcherOptions`] configures the underlying filesystem watcher it drives.
+#[cfg(feature = "fs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
 pub use tributary_fs::{RootHandle, WatcherOptions};
 
 /// The identity/coordinate primitives — change id, epoch, location — are owned by
-/// `tributary-proto` and re-exported from there directly
-/// ([`tributary-fs`](tributary_fs) merely re-exports them itself). The per-watch
-/// [`Interest`] is **not** among them: the umbrella owns its own source-neutral mask
-/// (aligned to [`EventKind`]), and the proto/fs `Interest` stays a purely fs-internal
-/// arm mask for consumers driving a raw [`tributary_fs::Watcher`].
+/// `tributary-proto` and re-exported from there directly (`tributary-fs` merely
+/// re-exports them itself). The per-watch [`Interest`] is **not** among them: the
+/// umbrella owns its own source-neutral mask (aligned to [`EventKind`]), and the
+/// proto/fs `Interest` stays a purely fs-internal arm mask for consumers driving a raw
+/// fs watcher.
 pub use tributary_proto::{ChangeId, Epoch, Location, Segment};
