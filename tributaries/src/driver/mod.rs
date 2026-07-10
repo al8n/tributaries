@@ -29,14 +29,13 @@ use std::{
   ffi::OsString,
   hash::Hash,
   marker::PhantomData,
-  path::PathBuf,
   time::{Duration, Instant},
   vec::Vec,
 };
 
 use agnostic_lite::RuntimeLite;
 use futures_util::FutureExt;
-use tributary_fs::{Epoch, Interest, RootHandle, WatchRootError};
+use tributary_fs::{Epoch, Interest, RootHandle};
 
 use crate::{
   coalesce::Coalescer,
@@ -60,7 +59,7 @@ mod tests;
 
 /// The reply a [`close`](Tributaries::close) hands the owner over the dedicated **close signal**:
 /// resolved `Ok(())` once the owner has flushed its coalesced tail and its run loop has exited, or
-/// dropped by the owner (→ the caller's `close()` sees [`Stopped`](tributary_fs::CloseError::Stopped))
+/// dropped by the owner (→ the caller's `close()` sees [`Stopped`](CloseError::Stopped))
 /// when the owner is already gone. Close rides its **own** [`async_channel`] — checked at the top
 /// priority everywhere the owner selects — so a requested shutdown can never be starved behind the
 /// command mailbox ; it is deliberately NOT a [`Command`] variant, so there is
@@ -503,10 +502,11 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// # Errors
   ///
   /// - [`WatchError::Canonicalize`] when `key` cannot be canonicalized (for the fs source, the
-  ///   path does not exist), or the source's committed key diverged and changed subsumption;
-  /// - [`WatchError::Fs`] when arming the source watch fails;
-  /// - [`WatchError::Fs(WatchRootError::Closed)`](tributary_fs::WatchRootError::Closed)
-  ///   when the owner is gone.
+  ///   path does not exist);
+  /// - [`WatchError::CanonicalRace`] when the source's committed key diverged from the planned
+  ///   one and changed subsumption — a retryable race;
+  /// - [`WatchError::Source`] when arming the source watch fails;
+  /// - [`WatchError::Closed`] when the owner is gone.
   pub async fn watch(
     &self,
     key: Vec<C>,
@@ -527,7 +527,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
       .await
       .is_err()
     {
-      return Err(WatchError::Fs(WatchRootError::Closed));
+      return Err(WatchError::Closed);
     }
     // Awaiting the reply is the only cancellable part: dropping this future drops the
     // `oneshot::Receiver`, which drops the [`WatchGrant`] sitting in its slot — whose `Drop`
@@ -539,11 +539,9 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
       // polled only after a source-drain teardown) — surfaces `Closed` like every other
       // owner-gone path, never an `Ok` subscription whose stream already ended without its owed
       // Rescan.
-      Ok(Ok(grant)) => grant
-        .defuse()
-        .map_err(|_| WatchError::Fs(WatchRootError::Closed)),
+      Ok(Ok(grant)) => grant.defuse().map_err(|_| WatchError::Closed),
       Ok(Err(err)) => Err(err),
-      Err(_) => Err(WatchError::Fs(WatchRootError::Closed)),
+      Err(_) => Err(WatchError::Closed),
     }
   }
 
@@ -578,8 +576,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// # Errors
   ///
   /// - [`UnwatchError::UnknownSubscription`] when `sub` is not live;
-  /// - [`UnwatchError::Fs(Closed)`](tributary_fs::UnwatchError::Closed) when the owner is
-  ///   gone.
+  /// - [`UnwatchError::Closed`] when the owner is gone.
   pub async fn unwatch(&self, sub: Subscription) -> Result<(), UnwatchError> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self
@@ -588,11 +585,9 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
       .await
       .is_err()
     {
-      return Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed));
+      return Err(UnwatchError::Closed);
     }
-    response
-      .await
-      .unwrap_or(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)))
+    response.await.unwrap_or(Err(UnwatchError::Closed))
   }
 
   /// The next attributed event, or `None` once the owner is closed and the stream is
@@ -652,20 +647,18 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   ///
   /// # Errors
   ///
-  /// [`CloseError::Fs(Stopped)`](tributary_fs::CloseError::Stopped) when the owner had
-  /// already stopped (a dropped last handle, the source closed itself, or another racing `close`
-  /// already won and tore the owner down).
+  /// [`CloseError::Stopped`] when the owner had already stopped (a dropped last handle,
+  /// the source closed itself, or another racing `close` already won and tore the owner
+  /// down).
   pub async fn close(self) -> Result<(), CloseError> {
     let (reply, response) = futures_channel::oneshot::channel();
     // Send on the dedicated close signal, never the command mailbox — the whole point of the dedicated signal. A
     // send failure means the owner's close receiver is gone (it already tore down): map to
     // `Stopped`, mirroring the old command-send-failure path.
     if self.closes.send(reply).await.is_err() {
-      return Err(CloseError::Fs(tributary_fs::CloseError::Stopped));
+      return Err(CloseError::Stopped);
     }
-    response
-      .await
-      .unwrap_or(Err(CloseError::Fs(tributary_fs::CloseError::Stopped)))
+    response.await.unwrap_or(Err(CloseError::Stopped))
   }
 }
 
@@ -681,7 +674,7 @@ impl<R: RuntimeLite> Tributaries<OsString, (), R, RootHandle> {
   ///
   /// # Errors
   ///
-  /// [`BuildError::Fs`] when the underlying `tributary-fs` watcher cannot be built.
+  /// [`BuildError::Source`] when the underlying `tributary-fs` watcher cannot be built.
   pub fn new(options: impl Into<TributariesOptions>) -> Result<Self, BuildError> {
     let options = options.into();
     let source = FsSource::<R>::new(options.watcher().clone())?;
@@ -2540,10 +2533,10 @@ where
   fn handle_teardown_command(&mut self, cmd: Command<C, V>) {
     match cmd {
       Command::Watch { reply, .. } => {
-        let _ = reply.send(Err(WatchError::Fs(WatchRootError::Closed)));
+        let _ = reply.send(Err(WatchError::Closed));
       }
       Command::Unwatch { reply, .. } => {
-        let _ = reply.send(Err(UnwatchError::Fs(tributary_fs::UnwatchError::Closed)));
+        let _ = reply.send(Err(UnwatchError::Closed));
       }
     }
   }
@@ -2694,17 +2687,10 @@ fn interest_admits<C>(interest: Interest, kind: &EventKind<C>) -> bool {
 
 /// The error for a canonicalization race where the source's committed canonical key
 /// diverged from the planned one in a way that changes subsumption (design §4, invariant
-/// I2). Framed as a [`Canonicalize`](WatchError::Canonicalize) failure — it *is* a
-/// canonical-coordinate mismatch — carrying a generic message (the key space is `C`, not
-/// necessarily a path, so no path is encoded).
+/// I2) — the honest retryable-race variant, keyed in no coordinate (the key space is
+/// `C`, not necessarily a path, and the caller already holds the key it passed).
 fn canonical_race() -> WatchError {
-  WatchError::Canonicalize {
-    path: PathBuf::new(),
-    source: std::io::Error::other(
-      "the source's committed canonical key diverged from the planned one and changed \
-       subsumption; retry the watch",
-    ),
-  }
+  WatchError::CanonicalRace
 }
 
 /// Compile-time proof that the pure-fs [`Tributaries`] constructs and its owner future is

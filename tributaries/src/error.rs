@@ -1,60 +1,252 @@
-//! The umbrella crate's error vocabulary.
+//! The umbrella crate's **source-neutral** error vocabulary.
 //!
-//! These mirror the [`tributary-fs`](tributary_fs) errors one layer down, minus
-//! the one condition this crate exists to absorb: a `watch` never surfaces
-//! [`WatchRootError::Overlaps`](tributary_fs::WatchRootError::Overlaps), because
-//! subsuming overlapping subscriptions into disjoint roots is precisely this
-//! layer's job. Once a subscription is live, every runtime condition — a vanished
-//! root, kernel-side loss, a lagging consumer — arrives in-band as an
-//! [`Event`](crate::Event) (a `Removed`, a `Rescan`), never as an error here.
+//! The umbrella owns this vocabulary exactly as it owns the event vocabulary
+//! ([`EventKind`](crate::EventKind)): every [`Source`](crate::Source) — the fs binding
+//! included — maps its own failures into it at its binding, so no source's error enum
+//! leaks through the generic seam. A classified failure travels as a [`SourceFault`]
+//! (a neutral [`FaultKind`] plus the concrete source error boxed behind the standard
+//! error chain), and the concrete error stays recoverable via
+//! [`SourceFault::downcast_ref`] — for the default fs source, the
+//! [`WatchError::as_fs`] sugar.
+//!
+//! Note the absence of any overlap variant: subsuming overlapping subscriptions into
+//! disjoint roots is precisely this layer's job, so the overlap a source rejects can
+//! never reach the caller here (a [`FaultKind::Conflict`] is only ever a genuine live
+//! conflict — a source-contract violation, never a subsumed-away overlap). And once a
+//! subscription is live, every runtime condition — a vanished root, kernel-side loss, a
+//! lagging consumer — arrives in-band as an [`Event`](crate::Event) (a `Removed`, a
+//! `Rescan`), never as an error here.
 
-use std::path::PathBuf;
+use core::error::Error;
+
+/// A classified failure reported by a [`Source`](crate::Source): the umbrella-neutral
+/// [`FaultKind`] plus, when the source has one, the concrete source error boxed behind
+/// the standard error chain (`Send + Sync` payloads only, so errors cross threads).
+///
+/// A source constructs these at its binding — classify honestly into a [`FaultKind`]
+/// and preserve the full concrete error via [`with_source`](Self::with_source) — and
+/// the umbrella carries them opaquely inside [`WatchError`] / [`BuildError`]. A caller
+/// dispatches on [`kind`](Self::kind) generically, or recovers the concrete error with
+/// [`downcast_ref`](Self::downcast_ref) when it knows the source.
+///
+/// `Display` is the kind; the boxed error is exposed through
+/// [`Error::source`](core::error::Error::source), so the standard error-chain walk
+/// reaches the concrete failure.
+///
+/// # Examples
+///
+/// ```
+/// use tributaries::{FaultKind, SourceFault};
+///
+/// let fault = SourceFault::new(FaultKind::NotFound)
+///   .with_source(std::io::Error::from(std::io::ErrorKind::NotFound));
+/// assert!(fault.kind().is_not_found());
+/// assert!(fault.downcast_ref::<std::io::Error>().is_some());
+/// ```
+#[derive(Debug, thiserror::Error)]
+#[error("{kind}")]
+pub struct SourceFault {
+  kind: FaultKind,
+  #[source]
+  source: Option<Box<dyn Error + Send + Sync>>,
+}
+
+impl SourceFault {
+  /// A fault classified as `kind`, with no concrete source error attached.
+  #[inline]
+  pub const fn new(kind: FaultKind) -> Self {
+    Self { kind, source: None }
+  }
+
+  /// Attaches the concrete source error, preserved whole behind the box so
+  /// [`get_ref`](Self::get_ref) / [`downcast_ref`](Self::downcast_ref) recover it with
+  /// full fidelity.
+  #[inline]
+  #[must_use]
+  pub fn with_source(mut self, source: impl Into<Box<dyn Error + Send + Sync>>) -> Self {
+    self.source = Some(source.into());
+    self
+  }
+
+  /// The umbrella-neutral classification of this fault.
+  #[inline]
+  pub const fn kind(&self) -> FaultKind {
+    self.kind
+  }
+
+  /// The boxed concrete source error, if one was attached.
+  #[inline]
+  pub fn get_ref(&self) -> Option<&(dyn Error + Send + Sync + 'static)> {
+    self.source.as_deref()
+  }
+
+  /// The concrete source error downcast to `E`, when one is attached and is an `E`.
+  #[inline]
+  pub fn downcast_ref<E>(&self) -> Option<&E>
+  where
+    E: Error + 'static,
+  {
+    self.get_ref()?.downcast_ref()
+  }
+}
+
+/// The umbrella-neutral classification of a [`SourceFault`] — owned by this crate on
+/// the same principle as [`EventKind`](crate::EventKind): sources map their failures
+/// honestly into it at their bindings, degrading only ever toward
+/// [`Other`](Self::Other) (the boxed concrete error keeps the detail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FaultKind {
+  /// The keyed object does not exist at the source.
+  NotFound,
+  /// The keyed object exists but cannot anchor a watch (for the fs source, the path is
+  /// not a directory).
+  NotADirectory,
+  /// The source was not permitted to inspect or watch the keyed object.
+  PermissionDenied,
+  /// A source resource budget is exhausted (for the fs source, the per-user
+  /// watch-instance limit).
+  Capacity,
+  /// The source rejected the watch as conflicting with one it already holds. Never an
+  /// overlap between this watcher's own subscriptions — those are subsumed away before
+  /// any arm — so a genuine conflict indicates a source-contract violation or a watch
+  /// held outside this watcher.
+  Conflict,
+  /// The source cannot watch at all on this platform or configuration.
+  Unsupported,
+  /// A failure outside the classified kinds; the boxed concrete error carries the
+  /// detail.
+  Other,
+}
+
+impl FaultKind {
+  /// The stable snake_case name of this kind.
+  #[inline]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::NotFound => "not_found",
+      Self::NotADirectory => "not_a_directory",
+      Self::PermissionDenied => "permission_denied",
+      Self::Capacity => "capacity",
+      Self::Conflict => "conflict",
+      Self::Unsupported => "unsupported",
+      Self::Other => "other",
+    }
+  }
+
+  /// Whether this is [`NotFound`](Self::NotFound).
+  #[inline]
+  pub const fn is_not_found(&self) -> bool {
+    matches!(self, Self::NotFound)
+  }
+
+  /// Whether this is [`NotADirectory`](Self::NotADirectory).
+  #[inline]
+  pub const fn is_not_a_directory(&self) -> bool {
+    matches!(self, Self::NotADirectory)
+  }
+
+  /// Whether this is [`PermissionDenied`](Self::PermissionDenied).
+  #[inline]
+  pub const fn is_permission_denied(&self) -> bool {
+    matches!(self, Self::PermissionDenied)
+  }
+
+  /// Whether this is [`Capacity`](Self::Capacity).
+  #[inline]
+  pub const fn is_capacity(&self) -> bool {
+    matches!(self, Self::Capacity)
+  }
+
+  /// Whether this is [`Conflict`](Self::Conflict).
+  #[inline]
+  pub const fn is_conflict(&self) -> bool {
+    matches!(self, Self::Conflict)
+  }
+
+  /// Whether this is [`Unsupported`](Self::Unsupported).
+  #[inline]
+  pub const fn is_unsupported(&self) -> bool {
+    matches!(self, Self::Unsupported)
+  }
+
+  /// Whether this is [`Other`](Self::Other).
+  #[inline]
+  pub const fn is_other(&self) -> bool {
+    matches!(self, Self::Other)
+  }
+}
+
+impl core::fmt::Display for FaultKind {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
 
 /// Why a [`Tributaries`](crate::Tributaries) watcher could not be built.
-///
-/// A thin re-surfacing of [`tributary_fs::BuildError`]: construction wraps one
-/// `tributary-fs` watcher and adds no build-time state of its own.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BuildError {
-  /// The underlying `tributary-fs` watcher could not be built.
-  #[error(transparent)]
-  Fs(#[from] tributary_fs::BuildError),
+  /// The source could not be built; the classified fault carries the source's concrete
+  /// error.
+  #[error("the source could not be built")]
+  Source(#[source] SourceFault),
 }
 
 impl BuildError {
-  /// The underlying `tributary-fs` build error, if any.
+  /// Whether this is [`Source`](Self::Source).
   #[inline]
-  pub const fn as_fs(&self) -> Option<&tributary_fs::BuildError> {
+  pub const fn is_source(&self) -> bool {
+    matches!(self, Self::Source(_))
+  }
+
+  /// The classified fault this error carries.
+  #[inline]
+  pub const fn fault(&self) -> Option<&SourceFault> {
     match self {
-      Self::Fs(err) => Some(err),
+      Self::Source(fault) => Some(fault),
     }
+  }
+
+  /// The underlying `tributary-fs` build error, when this error's fault carries one —
+  /// downcast sugar over [`fault`](Self::fault) + [`SourceFault::downcast_ref`] for the
+  /// default fs source. Moves behind the `fs` feature once the fs dependency becomes
+  /// optional.
+  #[inline]
+  pub fn as_fs(&self) -> Option<&tributary_fs::BuildError> {
+    self.fault()?.downcast_ref()
   }
 }
 
 /// Why a subscription could not be established.
 ///
-/// Note the absence of an `Overlaps` variant: overlapping subscriptions are
-/// subsumed onto a shared kernel watch (design §4), so the overlap that
-/// [`tributary-fs`](tributary_fs) rejects can never reach the caller here.
+/// Note the absence of an `Overlaps` variant: overlapping subscriptions are subsumed
+/// onto a shared source watch (design §4), so the overlap a source rejects can never
+/// reach the caller here (see [`FaultKind::Conflict`] for the never-expected genuine
+/// live conflict).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WatchError {
-  /// The path could not be canonicalized: it does not exist, or its metadata
-  /// could not be read. Canonicalization runs at this layer so the subsumption
-  /// index keys off the same canonical-path space `tributary-fs` reports.
-  #[error("watch path {} could not be canonicalized", path.display())]
+  /// `key` — the source-rendered display form of the caller's key — could not be
+  /// canonicalized into the source's canonical coordinate: it does not exist, or its
+  /// metadata could not be read. Canonicalization runs at the top of every watch so the
+  /// subsumption index keys off the same canonical coordinate space the source reports
+  /// events in; the umbrella refuses to commit a key that would receive no events.
+  #[error("watch key {key} could not be canonicalized")]
   Canonicalize {
-    /// The path as the caller supplied it.
-    path: PathBuf,
-    /// The underlying I/O error.
+    /// The caller's key in the source's own display rendering (the fs source renders
+    /// the supplied path) — diagnostic only; the typed key is in the caller's hand at
+    /// the `watch` call site.
+    key: Box<str>,
+    /// The classified canonicalization failure.
     #[source]
-    source: std::io::Error,
+    source: SourceFault,
   },
-  /// Arming the kernel watch failed. Carries the underlying `tributary-fs`
-  /// error — never its `Overlaps` case, which is subsumed away before any arm.
-  #[error(transparent)]
-  Fs(#[from] tributary_fs::WatchRootError),
+  /// Arming the source watch failed; the classified fault carries the source's concrete
+  /// error. Never an overlap caused by subsumed roots (see the enum docs).
+  #[error("the source could not arm the watch")]
+  Source(#[source] SourceFault),
   /// The source reported the arm as succeeded, but the armed root was **already
   /// gone** — a *dead-on-arrival* handle: the root was removed between the arm
   /// request and its completion, so the source has already forgotten it
@@ -62,10 +254,17 @@ pub enum WatchError {
   /// refuses to commit a root no live source watch backs — it would publish the
   /// key as watched yet stream no change under it — so it fails the watch at the
   /// arm choke point (design §4, invariant I2); retry it. Distinct from
-  /// [`Fs`](Self::Fs) (the arm itself failed) and [`Canonicalize`](Self::Canonicalize)
-  /// (the arm succeeded, but at a divergent coordinate).
+  /// [`Source`](Self::Source) (the arm itself failed) and
+  /// [`CanonicalRace`](Self::CanonicalRace) (the arm succeeded, but at a divergent
+  /// coordinate).
   #[error("the watched root was removed before its watch could be armed; retry the watch")]
   DeadOnArrival,
+  /// The source's committed canonical key diverged from the planned one in a way that
+  /// changes subsumption (design §4, invariant I2): the just-armed root was released and
+  /// the reconcile aborted cleanly rather than commit a mis-keyed or overlapping entry.
+  /// A retryable race, like [`DeadOnArrival`](Self::DeadOnArrival) — retry the watch.
+  #[error("the source's committed canonical key diverged from the planned one; retry the watch")]
+  CanonicalRace,
   /// The owner is holding the maximum RETIRED parked-`Rescan` debt — terminal
   /// [`Rescan`](crate::EventKind::Rescan)s owed to subscriptions whose roots died,
   /// parked because the event channel was full, and retained past the subscriptions'
@@ -77,13 +276,41 @@ pub enum WatchError {
   /// retry; `close` is never gated (it rides its own channel).
   #[error("retired parked-Rescan debt is at its cap; drain the event stream, then retry the watch")]
   RescanBacklog,
+  /// The watcher is closed: the owner is gone (closed, torn down, or every handle
+  /// dropped), so no watch can be established.
+  #[error("the watcher is closed")]
+  Closed,
 }
 
 impl WatchError {
+  /// The [`Canonicalize`](Self::Canonicalize) constructor a [`Source`](crate::Source)
+  /// uses: the source renders its own coordinate's display form (the fs source renders
+  /// the supplied path) and classifies the failure.
+  #[inline]
+  pub fn canonicalize(key: impl Into<Box<str>>, fault: SourceFault) -> Self {
+    Self::Canonicalize {
+      key: key.into(),
+      source: fault,
+    }
+  }
+
+  /// The [`Source`](Self::Source) constructor a [`Source`](crate::Source) uses to
+  /// report a classified arm failure.
+  #[inline]
+  pub const fn source(fault: SourceFault) -> Self {
+    Self::Source(fault)
+  }
+
   /// Whether this is [`Canonicalize`](Self::Canonicalize).
   #[inline]
   pub const fn is_canonicalize(&self) -> bool {
     matches!(self, Self::Canonicalize { .. })
+  }
+
+  /// Whether this is [`Source`](Self::Source).
+  #[inline]
+  pub const fn is_source(&self) -> bool {
+    matches!(self, Self::Source(_))
   }
 
   /// Whether this is [`DeadOnArrival`](Self::DeadOnArrival).
@@ -92,13 +319,41 @@ impl WatchError {
     matches!(self, Self::DeadOnArrival)
   }
 
-  /// The underlying `tributary-fs` watch error, if this is [`Fs`](Self::Fs).
+  /// Whether this is [`CanonicalRace`](Self::CanonicalRace).
   #[inline]
-  pub const fn as_fs(&self) -> Option<&tributary_fs::WatchRootError> {
+  pub const fn is_canonical_race(&self) -> bool {
+    matches!(self, Self::CanonicalRace)
+  }
+
+  /// Whether this is [`RescanBacklog`](Self::RescanBacklog).
+  #[inline]
+  pub const fn is_rescan_backlog(&self) -> bool {
+    matches!(self, Self::RescanBacklog)
+  }
+
+  /// Whether this is [`Closed`](Self::Closed).
+  #[inline]
+  pub const fn is_closed(&self) -> bool {
+    matches!(self, Self::Closed)
+  }
+
+  /// The classified fault this error carries, for the two fault-carrying variants
+  /// ([`Canonicalize`](Self::Canonicalize) and [`Source`](Self::Source)).
+  #[inline]
+  pub const fn fault(&self) -> Option<&SourceFault> {
     match self {
-      Self::Fs(err) => Some(err),
-      Self::Canonicalize { .. } | Self::DeadOnArrival | Self::RescanBacklog => None,
+      Self::Canonicalize { source, .. } | Self::Source(source) => Some(source),
+      Self::DeadOnArrival | Self::CanonicalRace | Self::RescanBacklog | Self::Closed => None,
     }
+  }
+
+  /// The underlying [`tributary_fs::WatchRootError`], when this error's fault carries
+  /// one — downcast sugar over [`fault`](Self::fault) + [`SourceFault::downcast_ref`]
+  /// for the default fs source. Moves behind the `fs` feature once the fs dependency
+  /// becomes optional.
+  #[inline]
+  pub fn as_fs(&self) -> Option<&tributary_fs::WatchRootError> {
+    self.fault()?.downcast_ref()
   }
 }
 
@@ -112,9 +367,10 @@ pub enum UnwatchError {
   /// [`ScopeId`](crate::Subscription::id) collides with a live local one).
   #[error("the subscription is not live")]
   UnknownSubscription,
-  /// Releasing the now-empty kernel watch failed at the `tributary-fs` layer.
-  #[error(transparent)]
-  Fs(#[from] tributary_fs::UnwatchError),
+  /// The watcher is closed: the owner is gone (closed, torn down, or every handle
+  /// dropped), so there is nothing left to drop from.
+  #[error("the watcher is closed")]
+  Closed,
 }
 
 impl UnwatchError {
@@ -124,34 +380,28 @@ impl UnwatchError {
     matches!(self, Self::UnknownSubscription)
   }
 
-  /// The underlying `tributary-fs` unwatch error, if this is [`Fs`](Self::Fs).
+  /// Whether this is [`Closed`](Self::Closed).
   #[inline]
-  pub const fn as_fs(&self) -> Option<&tributary_fs::UnwatchError> {
-    match self {
-      Self::Fs(err) => Some(err),
-      Self::UnknownSubscription => None,
-    }
+  pub const fn is_closed(&self) -> bool {
+    matches!(self, Self::Closed)
   }
 }
 
 /// Why an orderly [`close`](crate::Tributaries::close) could not be confirmed.
-///
-/// A thin re-surfacing of [`tributary_fs::CloseError`]: close tears down the one
-/// wrapped watcher and adds no teardown state of its own.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CloseError {
-  /// The underlying `tributary-fs` watcher could not confirm its shutdown.
-  #[error(transparent)]
-  Fs(#[from] tributary_fs::CloseError),
+  /// The owner had already stopped before confirming the shutdown: a dropped last
+  /// handle, a source that closed itself, or another racing `close` already won and
+  /// tore the owner down.
+  #[error("the watcher stopped before confirming the shutdown")]
+  Stopped,
 }
 
 impl CloseError {
-  /// The underlying `tributary-fs` close error, if any.
+  /// Whether this is [`Stopped`](Self::Stopped).
   #[inline]
-  pub const fn as_fs(&self) -> Option<&tributary_fs::CloseError> {
-    match self {
-      Self::Fs(err) => Some(err),
-    }
+  pub const fn is_stopped(&self) -> bool {
+    matches!(self, Self::Stopped)
   }
 }

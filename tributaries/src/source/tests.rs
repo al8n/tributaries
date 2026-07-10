@@ -59,6 +59,74 @@ fn round_trips_root() {
   assert_round_trips(&["/"]);
 }
 
+/// The fs-to-neutral fault classification (the error half of the fs binding,
+/// [`watch_error_from_fs`](super::watch_error_from_fs)): each fs watch-root failure maps
+/// to its honest neutral [`FaultKind`], a closed watcher maps to the umbrella's own
+/// `Closed`, and the whole concrete fs error survives in the fault's box.
+#[test]
+fn watch_error_from_fs_classifies_honestly() {
+  use std::path::PathBuf;
+
+  use tributary_fs::{SourceError, WatchRootError};
+
+  use crate::error::FaultKind;
+
+  let cases = [
+    (
+      WatchRootError::NotFound {
+        path: PathBuf::from("/missing"),
+      },
+      FaultKind::NotFound,
+    ),
+    (
+      WatchRootError::NotADirectory {
+        path: PathBuf::from("/file"),
+      },
+      FaultKind::NotADirectory,
+    ),
+    (
+      WatchRootError::Overlaps {
+        path: PathBuf::from("/a/b"),
+        existing: PathBuf::from("/a"),
+      },
+      FaultKind::Conflict,
+    ),
+    (
+      WatchRootError::Source(SourceError::Unsupported),
+      FaultKind::Unsupported,
+    ),
+    (
+      WatchRootError::Source(SourceError::InstanceLimit),
+      FaultKind::Capacity,
+    ),
+    // A source failure outside the classified cases degrades to the conservative Other.
+    (
+      WatchRootError::Source(SourceError::CreateFailed),
+      FaultKind::Other,
+    ),
+  ];
+  for (err, expected) in cases {
+    let mapped = super::watch_error_from_fs(err);
+    let fault = mapped
+      .fault()
+      .expect("a classified arm failure carries its fault");
+    assert_eq!(
+      fault.kind(),
+      expected,
+      "the fs case maps to its honest neutral kind"
+    );
+    assert!(
+      fault.downcast_ref::<WatchRootError>().is_some(),
+      "the whole fs error is preserved in the box"
+    );
+  }
+
+  assert!(
+    super::watch_error_from_fs(WatchRootError::Closed).is_closed(),
+    "a closed fs watcher maps to the umbrella's own Closed, with no fault payload"
+  );
+}
+
 // The integration suite drives a real kernel watch on a tokio runtime — so it is gated
 // on the runtime feature, off miri (which cannot execute the syscalls), and onto the
 // platforms with a real backend (elsewhere `tributary-fs` compiles but arms fail at
@@ -77,7 +145,7 @@ mod integration {
   use tributary_fs::{RootHandle, WatchRootError, WatcherOptions};
 
   use super::super::{FsSource, OPPORTUNISTIC_RELEASE_HANDOFFS, Source, SourceEvent, key_to_path};
-  use crate::{error::WatchError, event::path_components};
+  use crate::event::path_components;
 
   /// Generous ceiling for one expected observation; CI runners are slow and FSEvents
   /// batches on its own latency timer.
@@ -517,8 +585,12 @@ mod integration {
       .await
       .expect_err("the ancestor arm surfaces the live-child overlap");
     assert!(
-      matches!(err, WatchError::Fs(WatchRootError::Overlaps { .. })),
-      "an unmatched (live) conflict surfaces as Overlaps, not looped-away"
+      err.fault().is_some_and(|fault| fault.kind().is_conflict()),
+      "an unmatched (live) conflict surfaces as a Conflict fault, not looped-away — got {err:?}"
+    );
+    assert!(
+      matches!(err.as_fs(), Some(WatchRootError::Overlaps { .. })),
+      "the concrete fs Overlaps survives in the box for downcast"
     );
     assert!(
       source.pending_set.contains(&survivor),
@@ -573,6 +645,40 @@ mod integration {
       source.root_key(second.handle()),
       Some(root_key),
       "the re-armed root is live"
+    );
+  }
+
+  /// A REAL fs failure round-trips through the neutral surface with full fidelity:
+  /// arming a non-existent path classifies as a `NotFound` fault, and the concrete
+  /// [`WatchRootError`] is recoverable from the box via both the `as_fs` sugar and the
+  /// underlying [`SourceFault::downcast_ref`](crate::SourceFault::downcast_ref).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_not_found_round_trips_through_downcast() {
+    let (_dir, root) = scratch();
+    let missing = root.join("missing");
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    let err = source
+      .arm(&path_components(&missing))
+      .await
+      .expect_err("arming a non-existent path fails");
+    assert!(err.is_source(), "the arm failure is a fault, got {err:?}");
+    let fault = err.fault().expect("a Source error carries its fault");
+    assert!(
+      fault.kind().is_not_found(),
+      "a non-existent path classifies as NotFound, got {:?}",
+      fault.kind()
+    );
+    assert!(
+      matches!(err.as_fs(), Some(WatchRootError::NotFound { .. })),
+      "as_fs recovers the concrete fs error from the box"
+    );
+    assert!(
+      matches!(
+        fault.downcast_ref::<WatchRootError>(),
+        Some(WatchRootError::NotFound { .. })
+      ),
+      "downcast_ref recovers the same concrete fs error"
     );
   }
 }
