@@ -1385,8 +1385,8 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
 /// the observed-handle assert first (`rebind_root(1, 2)` would otherwise overwrite `by_handle[2]`
 /// and strand `/a/c`).
 ///
-/// The earlier defensive recovery (disarm the aliased handle + retire `old`) was RETIRED
-///: it was incomplete, and when the alias was an unrelated *live* root its `disarm`
+/// The earlier defensive recovery (disarm the aliased handle + retire `old`) was
+/// RETIRED: it was incomplete, and when the alias was an unrelated *live* root its `disarm`
 /// released that root's real source watch while its record + coverage stayed live — silently missing
 /// future changes. The strengthened contract makes the alias impossible for a conforming
 /// source (a re-arm mints a fresh generation while `old` and its siblings are still recorded), so

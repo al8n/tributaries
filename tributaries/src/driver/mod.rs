@@ -743,8 +743,8 @@ where
   /// boundary). Ordinary (non-parked) deliveries during the in-flight window are unaffected — only the
   /// durable `needs_rescan` debt is state-gated.
   unclaimed: std::collections::HashSet<Subscription>,
-  /// Where the next [`flush_pending_rescans`](Self::flush_pending_rescans) pass resumes
-  ///: the subscription whose offer found the channel full last pass —
+  /// Where the next [`flush_pending_rescans`](Self::flush_pending_rescans) pass
+  /// resumes: the subscription whose offer found the channel full last pass —
   /// retried first (inclusive), then round-robin past it — fairness over a parked map
   /// that can legitimately be as large as a caller's peak cohort, with per-pass work
   /// proportional to channel room plus unclaimed skips.
