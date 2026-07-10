@@ -1,0 +1,500 @@
+use std::{
+  collections::HashMap,
+  ffi::OsString,
+  num::NonZeroUsize,
+  path::Path,
+  sync::{Arc, Mutex},
+  time::Duration,
+};
+
+use agnostic_lite::tokio::TokioRuntime;
+use tributary_fs::{Epoch, Interest, Location};
+
+use super::{Demux, Lane};
+use crate::{
+  driver::Tributaries,
+  error::WatchError,
+  event::{Event, EventKind},
+  filter::Filter,
+  options::TributariesOptions,
+  source::{Armed, Source, SourceEvent},
+  subscription::Subscription,
+};
+
+/// A path's `OsString` components — the key form these tests watch and feed under.
+fn key(path: &str) -> Vec<OsString> {
+  Path::new(path)
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
+}
+
+/// Generous ceiling for one expected observation: everything here is in-process (no
+/// kernel), so this only bounds a wedged pipeline, not ordinary latency.
+const DEADLINE: Duration = Duration::from_secs(10);
+
+/// The bounded window a NEGATIVE assertion watches for traffic that must not arrive.
+const STARVED: Duration = Duration::from_millis(300);
+
+/// How long the stall test lets the pipeline settle into its stalled state: the actor's
+/// parked-Rescan retry tick is 25ms, so this spans many ticks on any CI machine.
+const QUIESCE: Duration = Duration::from_millis(500);
+
+/// The armed-root registry a [`StreamSource`] shares with its test's [`Feed`], so the
+/// feed can mint raw events carrying the right root handle for a watched key.
+type Roots = Arc<Mutex<HashMap<Vec<OsString>, u32>>>;
+
+/// A channel-fed [`Source`] over `u32` handles: `next()` yields exactly what the test's
+/// [`Feed`] sends — staying pending while the feed is idle, and draining (ending the
+/// stream) when the feed is dropped. Arm/disarm maintain the live-root registry the
+/// driver's liveness checks read.
+struct StreamSource {
+  next_handle: u32,
+  live: HashMap<u32, Vec<OsString>>,
+  roots: Roots,
+  events: async_channel::Receiver<SourceEvent<OsString, u32>>,
+}
+
+impl Source<OsString> for StreamSource {
+  type Handle = u32;
+
+  fn canonicalize_key(&self, k: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    Ok(k.to_vec())
+  }
+
+  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    self.next_handle += 1;
+    let handle = self.next_handle;
+    self.live.insert(handle, key.to_vec());
+    self
+      .roots
+      .lock()
+      .expect("roots registry")
+      .insert(key.to_vec(), handle);
+    Ok(Armed::new(handle, key.to_vec()))
+  }
+
+  fn disarm(&mut self, handle: u32) {
+    if let Some(key) = self.live.remove(&handle) {
+      self.roots.lock().expect("roots registry").remove(&key);
+    }
+  }
+
+  async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+    self.events.recv().await.ok()
+  }
+
+  fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+    self.live.get(&handle).cloned()
+  }
+}
+
+/// The test's producer half: feeds raw `Modified` source events under an armed root,
+/// with a per-root monotone raw epoch. Dropping it drains the source (ends the stream).
+struct Feed {
+  tx: async_channel::Sender<SourceEvent<OsString, u32>>,
+  roots: Roots,
+  epochs: HashMap<u32, u64>,
+}
+
+impl Feed {
+  /// Feeds one raw `Modified` at `path` under the armed root keyed `root`.
+  async fn modified(&mut self, root: &str, path: &str) {
+    let handle = *self
+      .roots
+      .lock()
+      .expect("roots registry")
+      .get(&key(root))
+      .expect("the root is armed");
+    let epoch = self.epochs.entry(handle).or_insert(0);
+    *epoch += 1;
+    let event = SourceEvent::new(
+      handle,
+      key(path),
+      EventKind::Modified,
+      Location::new(),
+      Epoch::new(*epoch),
+      None,
+    );
+    self.tx.send(event).await.expect("the source is live");
+  }
+}
+
+/// The watcher/feed pair every test drives: a real driver over a [`StreamSource`],
+/// with the owner→consumer event channel bounded at `capacity`.
+fn rig(capacity: usize) -> (Tributaries<OsString, (), TokioRuntime, u32>, Feed) {
+  let (tx, rx) = async_channel::unbounded();
+  let roots: Roots = Arc::default();
+  let source = StreamSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    roots: roots.clone(),
+    events: rx,
+  };
+  let options = TributariesOptions::new()
+    .with_event_capacity(NonZeroUsize::new(capacity).expect("nonzero capacity"));
+  let watcher = Tributaries::with_source(source, options);
+  (
+    watcher,
+    Feed {
+      tx,
+      roots,
+      epochs: HashMap::new(),
+    },
+  )
+}
+
+/// Watches `path` with all-admitting interest/filter.
+async fn watch(w: &Tributaries<OsString, (), TokioRuntime, u32>, path: &str) -> Subscription {
+  w.watch(key(path), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch")
+}
+
+/// The next event on `lane`, bounded by [`DEADLINE`]; panics on timeout or stream end.
+async fn recv(lane: &Lane<OsString, ()>) -> Event<OsString, ()> {
+  tokio::time::timeout(DEADLINE, lane.recv())
+    .await
+    .expect("a lane delivery within the deadline")
+    .expect("the stream is still open")
+}
+
+/// Events for two subscriptions arrive on their own lanes, each in per-sub order.
+#[tokio::test]
+async fn events_route_to_their_own_lanes_in_per_sub_order() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let sub_b = watch(&w, "/b").await;
+  let (demux, _rest) = Demux::spawn(w.clone(), 16);
+  // Registered before any event flows, so nothing can land on rest.
+  let lane_a = demux.lane(sub_a, 16);
+  let lane_b = demux.lane(sub_b, 16);
+
+  for i in 0..3 {
+    feed.modified("/a", &format!("/a/f{i}")).await;
+    feed.modified("/b", &format!("/b/f{i}")).await;
+  }
+
+  for i in 0..3 {
+    let a = recv(&lane_a).await;
+    assert_eq!(a.subscription(), sub_a, "lane A carries only sub A");
+    assert_eq!(
+      a.key(),
+      key(&format!("/a/f{i}")).as_slice(),
+      "lane A preserves per-sub delivery order"
+    );
+    let b = recv(&lane_b).await;
+    assert_eq!(b.subscription(), sub_b, "lane B carries only sub B");
+    assert_eq!(
+      b.key(),
+      key(&format!("/b/f{i}")).as_slice(),
+      "lane B preserves per-sub delivery order"
+    );
+  }
+}
+
+/// An unregistered subscription's events land on the rest lane; from registration
+/// onward they go to the fresh lane instead.
+#[tokio::test]
+async fn unregistered_subscription_lands_on_rest_until_registered() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let sub_b = watch(&w, "/b").await;
+  let (demux, rest) = Demux::spawn(w.clone(), 16);
+  let lane_a = demux.lane(sub_a, 16);
+
+  feed.modified("/b", "/b/one").await;
+  feed.modified("/a", "/a/one").await;
+
+  let unclaimed = recv(&rest).await;
+  assert_eq!(
+    unclaimed.subscription(),
+    sub_b,
+    "the unregistered sub's event lands on the rest lane"
+  );
+  assert_eq!(unclaimed.key(), key("/b/one").as_slice());
+  let claimed = recv(&lane_a).await;
+  assert_eq!(
+    claimed.subscription(),
+    sub_a,
+    "the registered sub's event bypasses rest"
+  );
+
+  // Register B, THEN feed: the registration is queued before the event enters the
+  // shared stream, and the routing loop applies control before pulling events, so the
+  // post-registration event deterministically reaches the lane, not rest.
+  let lane_b = demux.lane(sub_b, 16);
+  feed.modified("/b", "/b/two").await;
+  let routed = recv(&lane_b).await;
+  assert_eq!(
+    routed.key(),
+    key("/b/two").as_slice(),
+    "from registration onward the sub's events go to its lane"
+  );
+}
+
+/// The load-bearing stall-not-shed proof, end to end through the real actor: a full,
+/// undrained lane stalls the demux (its only backpressure move is to stop receiving);
+/// the one-slot shared channel backs up behind it; and the ACTOR — never the demux —
+/// sheds the affected subscriptions to parked, epoch-dominating Rescans that are
+/// delivered on the lanes once the stalled lane drains. B's starvation while A is
+/// undrained is latency; its loss accounting stays in the actor.
+#[tokio::test]
+async fn stalled_lane_backs_up_shared_channel_and_actor_sheds_to_rescans() {
+  // A one-slot shared channel so the stall propagates to the actor promptly.
+  let (w, mut feed) = rig(1);
+  let sub_a = watch(&w, "/a").await;
+  let sub_b = watch(&w, "/b").await;
+  let (demux, _rest) = Demux::spawn(w.clone(), 4);
+  // Lane A is full after ONE undrained event; lane B is roomy.
+  let lane_a = demux.lane(sub_a, 1);
+  let lane_b = demux.lane(sub_b, 4);
+
+  // Saturate A well past everything the pipeline can hold undrained (lane A buffer 1 +
+  // the demux's one stalled in-flight send + the shared slot 1): the actor's try_send
+  // hits Full and sheds A to a parked dominating Rescan.
+  for i in 0..6 {
+    feed.modified("/a", &format!("/a/f{i}")).await;
+  }
+  // Let the pipeline settle into its stalled state: lane A holds its one buffered
+  // event, the demux is parked on an awaited send into it, and the shared channel
+  // holds (or the actor parks) the rest.
+  tokio::time::sleep(QUIESCE).await;
+  // B's traffic now finds the shared channel it cannot pass: at most one event fits
+  // the shared slot, so at least one hits Full and the ACTOR parks B's dominating
+  // Rescan. The demux drops nothing — it is merely not receiving.
+  for i in 0..3 {
+    feed.modified("/b", &format!("/b/g{i}")).await;
+  }
+
+  // Starvation is LATENCY, not loss: while lane A is undrained the demux is stalled,
+  // so nothing can reach lane B.
+  assert!(
+    tokio::time::timeout(STARVED, lane_b.recv()).await.is_err(),
+    "lane B starves while the demux is stalled on the full lane A (latency, not loss)"
+  );
+
+  // Drain lane A: its ordinary deltas (epoch-monotone, in order), then the actor's
+  // dominating Rescan naming A's covered key.
+  let mut last_ordinary: Option<Epoch> = None;
+  let rescan_a = loop {
+    let event = recv(&lane_a).await;
+    assert_eq!(event.subscription(), sub_a, "lane A carries only sub A");
+    if event.is_rescan() {
+      break event;
+    }
+    if let Some(prior) = last_ordinary {
+      assert!(
+        event.epoch() > prior,
+        "lane A's ordinary deltas arrive in epoch order"
+      );
+    }
+    last_ordinary = Some(event.epoch());
+  };
+  assert_eq!(
+    rescan_a.key(),
+    key("/a").as_slice(),
+    "the shed Rescan names A's covered key to re-enumerate"
+  );
+  if let Some(max) = last_ordinary {
+    assert!(
+      rescan_a.epoch() > max,
+      "the actor-minted Rescan dominates every ordinary delivery before it"
+    );
+  }
+
+  // With A drained the demux unstalls, and B's loss surfaces as the actor's parked
+  // dominating Rescan on B's OWN lane (possibly after a delta that squeaked into the
+  // shared slot before it filled) — loss accounting stayed in the actor.
+  let mut b_ordinary: Option<Epoch> = None;
+  let rescan_b = loop {
+    let event = recv(&lane_b).await;
+    assert_eq!(event.subscription(), sub_b, "lane B carries only sub B");
+    if event.is_rescan() {
+      break event;
+    }
+    b_ordinary = Some(event.epoch());
+  };
+  assert_eq!(
+    rescan_b.key(),
+    key("/b").as_slice(),
+    "B was shed by the ACTOR: a genuine dominating Rescan naming B's covered key"
+  );
+  if let Some(max) = b_ordinary {
+    assert!(
+      rescan_b.epoch() > max,
+      "B's Rescan dominates any delta delivered before it"
+    );
+  }
+}
+
+/// Dropping a lane's receiver mid-traffic retires its subscription: its events are
+/// discarded (never rerouted to rest), other lanes keep flowing, and the demux does
+/// not stall on the dead lane.
+#[tokio::test]
+async fn dropped_lane_discards_its_sub_without_stalling_the_demux() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let sub_b = watch(&w, "/b").await;
+  let (demux, rest) = Demux::spawn(w.clone(), 16);
+  // Capacity 1: were the demux to keep buffering for the dropped lane, it would wedge.
+  let lane_a = demux.lane(sub_a, 1);
+  let lane_b = demux.lane(sub_b, 16);
+
+  feed.modified("/a", "/a/before").await;
+  let before = recv(&lane_a).await;
+  assert_eq!(
+    before.subscription(),
+    sub_a,
+    "lane A was live before the drop"
+  );
+
+  drop(lane_a);
+  for i in 0..4 {
+    feed.modified("/a", &format!("/a/after{i}")).await;
+  }
+  feed.modified("/b", "/b/alive").await;
+
+  let alive = recv(&lane_b).await;
+  assert_eq!(
+    alive.subscription(),
+    sub_b,
+    "lane B keeps flowing past the dead lane (no stall on it)"
+  );
+  assert_eq!(alive.key(), key("/b/alive").as_slice());
+
+  // The retired sub's traffic went nowhere: end the stream and drain rest to the end —
+  // it must never have carried an /a event (retired traffic is discarded, not rerouted).
+  drop(feed);
+  loop {
+    let drained = tokio::time::timeout(DEADLINE, rest.recv())
+      .await
+      .expect("rest drains within the deadline");
+    match drained {
+      Some(event) => assert_ne!(
+        event.subscription(),
+        sub_a,
+        "a retired sub's traffic is never rerouted to rest"
+      ),
+      None => break,
+    }
+  }
+}
+
+/// Closing the watcher through the caller's clone ends the shared stream: the routing
+/// task exits and every lane drains its buffered tail, then yields `None` — while a
+/// dropped `Demux` handle beforehand changes nothing about routing.
+#[tokio::test]
+async fn closed_watcher_ends_every_lane_after_draining_buffers() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let sub_m = watch(&w, "/m").await;
+  let (demux, rest) = Demux::spawn(w.clone(), 16);
+  let lane_a = demux.lane(sub_a, 16);
+
+  feed.modified("/a", "/a/one").await;
+  let one = recv(&lane_a).await;
+  assert_eq!(one.key(), key("/a/one").as_slice());
+
+  // Dropping the Demux handle only closes the control channel — routing continues.
+  drop(demux);
+  feed.modified("/a", "/a/two").await;
+  let two = recv(&lane_a).await;
+  assert_eq!(
+    two.key(),
+    key("/a/two").as_slice(),
+    "routing survives the dropped Demux handle"
+  );
+
+  // Buffer one more event in lane A, unobserved. The unclaimed sub_m marker lands on
+  // rest strictly AFTER /a/three was sent into lane A (the demux routes the shared
+  // stream sequentially), so receiving it proves /a/three sits in lane A's buffer.
+  feed.modified("/a", "/a/three").await;
+  feed.modified("/m", "/m/marker").await;
+  let marker = recv(&rest).await;
+  assert_eq!(
+    marker.subscription(),
+    sub_m,
+    "the marker proves /a/three is buffered"
+  );
+
+  // Close through the caller's clone: the stream ends, the routing task exits, and the
+  // lane drains its buffered tail before reporting end-of-stream.
+  w.close().await.expect("close");
+  let three = tokio::time::timeout(DEADLINE, lane_a.recv())
+    .await
+    .expect("the buffered tail drains");
+  assert_eq!(
+    three
+      .expect("the buffered event precedes end-of-stream")
+      .key(),
+    key("/a/three").as_slice(),
+    "the lane drains its buffer before ending"
+  );
+  assert!(
+    tokio::time::timeout(DEADLINE, lane_a.recv())
+      .await
+      .expect("the lane ends")
+      .is_none(),
+    "a drained lane yields None once the watcher is closed"
+  );
+  assert!(
+    tokio::time::timeout(DEADLINE, rest.recv())
+      .await
+      .expect("rest ends")
+      .is_none(),
+    "the rest lane ends with the stream too"
+  );
+}
+
+/// Unwatching a subscription while its delivered events sit undrained in its lane:
+/// the queued stragglers still arrive carrying the retired subscription (tolerated,
+/// never lost by the demux), and the demux keeps routing after the lane is dropped.
+#[tokio::test]
+async fn unwatch_stragglers_arrive_on_the_kept_lane() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let sub_m = watch(&w, "/m").await;
+  let (demux, rest) = Demux::spawn(w.clone(), 16);
+  let lane_a = demux.lane(sub_a, 16);
+
+  // Queue stragglers, then a marker for the unclaimed sub_m: its arrival on rest
+  // proves the /a events were already routed into lane A's buffer (sequential routing),
+  // so they are queued-at-unwatch-time by construction.
+  for i in 0..3 {
+    feed.modified("/a", &format!("/a/s{i}")).await;
+  }
+  feed.modified("/m", "/m/marker").await;
+  let marker = recv(&rest).await;
+  assert_eq!(
+    marker.subscription(),
+    sub_m,
+    "the stragglers are buffered in lane A"
+  );
+
+  w.unwatch(sub_a).await.expect("unwatch");
+
+  // The stragglers still arrive, carrying the retired subscription — the demux routes
+  // by the event's own token and never consults the watch-set, so a kept lane receives
+  // its sub's queued tail across the unwatch.
+  for i in 0..3 {
+    let straggler = recv(&lane_a).await;
+    assert_eq!(
+      straggler.subscription(),
+      sub_a,
+      "a straggler still carries the retired subscription"
+    );
+    assert_eq!(straggler.key(), key(&format!("/a/s{i}")).as_slice());
+  }
+
+  // Dropping the lane afterwards discards silently (any residue for the sub would hit
+  // the retired slot — exercised in the lane-drop test); the demux keeps routing.
+  drop(lane_a);
+  feed.modified("/m", "/m/after").await;
+  let after = recv(&rest).await;
+  assert_eq!(
+    after.key(),
+    key("/m/after").as_slice(),
+    "the demux keeps routing after the retired sub's lane is dropped"
+  );
+}

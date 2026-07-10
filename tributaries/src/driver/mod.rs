@@ -301,6 +301,16 @@ impl<C, V, R: RuntimeLite, H> Clone for Tributaries<C, V, R, H> {
   /// Shares the same actor: every clone sends to the one command mailbox, draws from the
   /// one event stream, and reads the one published watch-set. The last clone dropped
   /// closes the command channel and tears the owner down.
+  ///
+  /// # Clones share ONE event stream — competing consumers, not broadcast
+  ///
+  /// All clones draw from a single shared MPMC stream: each event is consumed by exactly
+  /// **one** of the competing [`next`](Tributaries::next) callers (stealing, not
+  /// broadcast). Cloning does not duplicate delivery, so exactly one task should drain
+  /// `next()`; the other clones are for `watch`/`unwatch`/`close` and the read plane. To
+  /// hand independent tasks their own per-subscription streams, use the
+  /// [`Demux`](crate::Demux) fan-out layer — the supported shape — rather than competing
+  /// `next()` callers.
   #[inline]
   fn clone(&self) -> Self {
     Self {
@@ -492,6 +502,14 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// Sends an unwatch command to the owner and awaits its reply; dropping the
   /// returned future drops only the wait.
   ///
+  /// # Stragglers: events already queued keep the retired subscription
+  ///
+  /// Unwatching stops *future* fan-out; it does not reach back into the event stream.
+  /// Events already queued at unwatch time still arrive through
+  /// [`next`](Tributaries::next) carrying the retired [`Subscription`] — a consumer
+  /// tolerates and ignores such stragglers (their baked [`value`](Event::value) survives
+  /// the teardown, so they remain attributable if inspected).
+  ///
   /// # Errors
   ///
   /// - [`UnwatchError::UnknownSubscription`] when `sub` is not live;
@@ -519,6 +537,20 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// a dropped `next()` loses nothing (queued events stay queued). With the settle
   /// coalescer enabled (design §6) events arrive collapsed on the settle timer; absent
   /// it, untouched.
+  ///
+  /// # One shared stream — exactly one drainer
+  ///
+  /// Every [`Clone`] of this handle draws from the same MPMC stream: each event is
+  /// consumed by exactly **one** of the competing `next()` callers (stealing, not
+  /// broadcast). Exactly one task should drain `next()`; to give independent tasks their
+  /// own per-subscription streams, hand the drained handle to the
+  /// [`Demux`](crate::Demux) fan-out layer instead of racing a second caller.
+  ///
+  /// # Stragglers after an unwatch
+  ///
+  /// An [`unwatch`](Tributaries::unwatch) does not reach back into the queue: events
+  /// already queued when it resolved still arrive here carrying the retired
+  /// [`Subscription`]. Consumers tolerate and ignore such stragglers.
   #[inline]
   pub async fn next(&mut self) -> Option<Event<C, V>> {
     self.events.recv().await.ok()

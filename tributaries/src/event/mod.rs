@@ -18,6 +18,9 @@ use tributary_proto::{ChangeId, Epoch, Location};
 
 use crate::{source::SourceEvent, subscription::Subscription};
 
+#[cfg(test)]
+mod tests;
+
 /// What kind of change an [`Event`] reports — the umbrella's **source-neutral**
 /// vocabulary, generic over the key component `C`.
 ///
@@ -386,6 +389,18 @@ impl<C, V> Event<C, V> {
   #[inline]
   pub fn is_rescan(&self) -> bool {
     self.kind.is_rescan()
+  }
+
+  /// Whether this event bears on `key`: it names `key` exactly, or it is a
+  /// [`Rescan`](EventKind::Rescan) at `key` or an ancestor of it (a rescan obliges
+  /// re-enumeration of everything below its key). The dispatch idiom every
+  /// re-enumeration-class consumer needs.
+  #[inline]
+  pub fn reaches(&self, key: &[C]) -> bool
+  where
+    C: PartialEq,
+  {
+    self.key() == key || (self.kind().is_rescan() && key.starts_with(self.key()))
   }
 
   /// The move's source key, if this is a whole [`Moved`](EventKind::Moved) delivery —
