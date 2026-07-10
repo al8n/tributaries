@@ -63,7 +63,7 @@ mod tests;
 /// dropped by the owner (→ the caller's `close()` sees [`Stopped`](tributary_fs::CloseError::Stopped))
 /// when the owner is already gone. Close rides its **own** [`async_channel`] — checked at the top
 /// priority everywhere the owner selects — so a requested shutdown can never be starved behind the
-/// unbounded command mailbox (Codex R27); it is deliberately NOT a [`Command`] variant, so there is
+/// command mailbox (Codex R27; bounded since R52); it is deliberately NOT a [`Command`] variant, so there is
 /// one shutdown path and no dual plumbing.
 type CloseReply = futures_channel::oneshot::Sender<Result<(), CloseError>>;
 
@@ -74,7 +74,7 @@ type CloseReply = futures_channel::oneshot::Sender<Result<(), CloseError>>;
 /// R27), never the mailbox, so it cannot queue behind a `Watch`/`Unwatch` flood. Grant resolution is
 /// **not** here either: a committed-but-unclaimed [`WatchGrant`]'s claim/drop rides the dedicated
 /// reply-less [`Cleanup`] channel (Codex R30), so the owner's close-time grant-resolution drain is
-/// bounded by the grants in flight, never by the unbounded public backlog a mailbox scan would walk.
+/// bounded by the grants in flight, never by the public command backlog a mailbox scan would walk.
 ///
 /// The owner processes each to completion (invariant I1): dropping the caller's returned future drops
 /// only the [`oneshot::Receiver`](futures_channel::oneshot::Receiver), never the reconcile the owner
@@ -112,7 +112,7 @@ enum Command<C, V> {
 /// It rides its **own** unbounded channel, separate from the [`Command`] mailbox, so the owner's
 /// close-time grant-resolution drain ([`drain_pending_cleanup`](Owner::drain_pending_cleanup)) is
 /// bounded by the number of grants in flight — **each grant sends exactly one `Cleanup`** — rather
-/// than by the unbounded `Watch`/`Unwatch` backlog the old in-mailbox scan walked (Codex R30-F1, the
+/// than by the `Watch`/`Unwatch` backlog the old in-mailbox scan walked (Codex R30-F1, the
 /// O(public backlog) close-ack). Both variants are synchronous fire-and-forget `try_send`s from a
 /// grant (a `Drop`/`defuse` cannot await); the owner keeps a **strong** keep-alive
 /// [`cleanup_tx`](Owner::cleanup_tx), so the channel never closes while the owner lives and neither
@@ -273,7 +273,7 @@ pub struct Tributaries<C, V, R: RuntimeLite, H = RootHandle> {
   commands: async_channel::Sender<Command<C, V>>,
   /// The dedicated **high-priority shutdown signal** (Codex R27): [`close`](Self::close) sends its
   /// [`CloseReply`] here, never the command mailbox, so a requested shutdown can never be starved
-  /// behind an unbounded `Watch`/`Unwatch` backlog. It is checked at the TOP priority in every place
+  /// behind the `Watch`/`Unwatch` backlog. It is checked at the TOP priority in every place
   /// the owner selects (the [`run`] loop and the source-drain teardown), both non-blockingly each
   /// iteration and as the first `select!` arm. Bounded at one slot — the **first** close to reach the
   /// owner wins; any racing close resolves to [`Stopped`](tributary_fs::CloseError::Stopped) once the
@@ -346,8 +346,9 @@ where
     S: Source<C, Handle = H> + Send + 'static,
   {
     // The source is already constructed, so its watcher options no longer apply here; the
-    // event-channel capacity and the debounce policy are what the owner still wires up.
-    let (_watcher_options, event_capacity, debounce) = options.into().into_parts();
+    // channel capacities and the debounce policy are what the owner still wires up.
+    let (_watcher_options, event_capacity, command_capacity, debounce) =
+      options.into().into_parts();
     let subsumer = Subsumer::new();
     let view = subsumer.view();
     // Bounded (design backpressure doc): the owner **never awaits** this channel — every
@@ -357,10 +358,15 @@ where
     // to a durable dominating `Rescan` (`needs_rescan`) rather than growing memory without
     // bound — bounded memory with no silent loss.
     let (event_tx, event_rx) = async_channel::bounded(event_capacity.get());
-    let (command_tx, command_rx) = async_channel::unbounded();
+    // Bounded too (Codex R52): each queued command owns its key/value/filter, so an
+    // unbounded mailbox let poll-then-cancel callers retain arbitrary memory in
+    // abandoned requests. Submissions AWAIT admission when the owner is mid-reconcile
+    // (`watch`/`unwatch` are caller-cancellable up to admission); `close` never queues
+    // here — it rides its own dedicated channel below.
+    let (command_tx, command_rx) = async_channel::bounded(command_capacity.get());
     // The dedicated shutdown signal (Codex R27), bounded at one slot: the first close wins, and any
     // racing close resolves to `Stopped` once the owner is gone. It carries ONLY close replies, so
-    // the unbounded command backlog the finding is about can never delay it.
+    // the command backlog can never delay it.
     let (close_tx, close_rx) = async_channel::bounded(1);
     // The dedicated grant-resolution channel (Codex R30), unbounded and reply-less: each in-flight
     // [`WatchGrant`] sends exactly one [`Cleanup`] here, so the owner's close-time drain is bounded by
@@ -428,10 +434,15 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// canonical (a generic component key) implements
   /// [`canonicalize_key`](Source::canonicalize_key) as the identity.
   ///
-  /// This sends a watch command to the owner and awaits its reply. Dropping the
-  /// returned future drops only the wait — the owner still runs the reconcile to
-  /// completion, and if the caller vanished after the watch committed the owner retires
-  /// the orphaned subscription itself (invariant I1).
+  /// This submits a watch command into the bounded mailbox
+  /// ([`command_capacity`](crate::TributariesOptions::command_capacity)) and awaits the
+  /// owner's reply. When the mailbox is full — the owner busy inside a caller-bounded
+  /// reconcile — the submission awaits ADMISSION first (Codex R52), so abandoned
+  /// requests can never pile up without bound: dropping the returned future before
+  /// admission leaves nothing queued at all. Dropping it after admission drops only the
+  /// wait — the owner still runs the reconcile to completion, and if the caller
+  /// vanished after the watch committed the owner retires the orphaned subscription
+  /// itself (invariant I1).
   ///
   /// `filter` is this subscription's admission gate (design §7): a non-`Rescan` event is
   /// delivered only if its key covers the event **and** `filter` admits it. Pass
@@ -510,6 +521,10 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// tolerates and ignores such stragglers (their baked [`value`](Event::value) survives
   /// the teardown, so they remain attributable if inspected).
   ///
+  /// Like [`watch`](Self::watch), the command is submitted into the bounded mailbox: a
+  /// full mailbox makes this await admission (Codex R52), and cancellation before
+  /// admission leaves nothing queued.
+  ///
   /// # Errors
   ///
   /// - [`UnwatchError::UnknownSubscription`] when `sub` is not live;
@@ -572,7 +587,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   ///
   /// The reply rides a **dedicated** high-priority channel, NOT the command mailbox, and the owner
   /// checks it at the TOP priority everywhere it selects — so `close` resolves within a bounded window
-  /// **regardless** of how deep the unbounded `Watch`/`Unwatch` backlog is (Codex R27). A sustained
+  /// **regardless** of how deep the queued `Watch`/`Unwatch` backlog is (Codex R27). A sustained
   /// command flood can no longer starve shutdown.
   ///
   /// # Errors
@@ -668,7 +683,7 @@ where
   /// [`close`](Tributaries::close) sends its [`CloseReply`] here, NOT the command mailbox. The
   /// [`run`] loop and [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) check it at
   /// the TOP priority — both non-blockingly (a `try_recv`) each iteration and as the first
-  /// `select!` arm — so a queued close never waits behind an unbounded `Watch`/`Unwatch` backlog.
+  /// `select!` arm — so a queued close never waits behind the `Watch`/`Unwatch` backlog.
   /// When it reports `Ok(reply)` the owner breaks to teardown with that reply to ack; when it
   /// reports **closed** (every [`Tributaries`] handle dropped) that is NOT itself a teardown signal
   /// — the **command** channel closing remains the dropped-handles signal — so the close arm merely

@@ -104,13 +104,15 @@ impl Default for DebounceConfig {
 ///
 /// Embeds the lower-level [`WatcherOptions`] (forwarded to the wrapped
 /// `tributary-fs` watcher), the owner→consumer [`event_capacity`](Self::event_capacity),
-/// and an optional [`DebounceConfig`] enabling the settle coalescer (design §6).
-/// [`new`](Self::new) returns the defaults — the default watcher options, the default
-/// event capacity, and **no** debounce (events pass through untouched).
+/// the caller→owner [`command_capacity`](Self::command_capacity), and an optional
+/// [`DebounceConfig`] enabling the settle coalescer (design §6). [`new`](Self::new)
+/// returns the defaults — the default watcher options, the default capacities, and
+/// **no** debounce (events pass through untouched).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TributariesOptions {
   watcher: WatcherOptions,
   event_capacity: NonZeroUsize,
+  command_capacity: NonZeroUsize,
   debounce: Option<DebounceConfig>,
 }
 
@@ -126,13 +128,21 @@ impl TributariesOptions {
   /// rare.
   pub const DEFAULT_EVENT_CAPACITY: NonZeroUsize = WatcherOptions::DEFAULT_EVENT_CAPACITY;
 
-  /// The default options: default [`WatcherOptions`], default event capacity, no
+  /// The default capacity of the caller→owner command mailbox (64). Deliberately much
+  /// tighter than [`DEFAULT_EVENT_CAPACITY`](Self::DEFAULT_EVENT_CAPACITY): each queued
+  /// command owns its key, value, and filter, so the bound caps what abandoned
+  /// requests can retain (Codex R52) — while 64 in-flight control operations is far
+  /// beyond what an orderly consumer keeps outstanding.
+  pub const DEFAULT_COMMAND_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
+  /// The default options: default [`WatcherOptions`], default capacities, no
   /// debounce.
   #[inline]
   pub fn new() -> Self {
     Self {
       watcher: WatcherOptions::new(),
       event_capacity: Self::DEFAULT_EVENT_CAPACITY,
+      command_capacity: Self::DEFAULT_COMMAND_CAPACITY,
       debounce: Self::DEFAULT_DEBOUNCE,
     }
   }
@@ -168,6 +178,33 @@ impl TributariesOptions {
   #[inline]
   pub const fn set_event_capacity(&mut self, event_capacity: NonZeroUsize) -> &mut Self {
     self.event_capacity = event_capacity;
+    self
+  }
+
+  /// The capacity of the caller→owner command mailbox (Codex R52): the bounded queue
+  /// [`watch`](crate::Tributaries::watch)/[`unwatch`](crate::Tributaries::unwatch)
+  /// submit into. When it is full — the owner busy inside a caller-bounded reconcile —
+  /// a submitting call awaits ADMISSION instead of growing the queue, so abandoned
+  /// (cancelled) requests can never accumulate unboundedly: a call cancelled before
+  /// admission leaves nothing behind. [`close`](crate::Tributaries::close) rides its
+  /// own dedicated channel and is never delayed by a full mailbox.
+  #[inline]
+  pub const fn command_capacity(&self) -> NonZeroUsize {
+    self.command_capacity
+  }
+
+  /// Returns these options with the caller→owner command-mailbox capacity set.
+  #[inline]
+  #[must_use]
+  pub const fn with_command_capacity(mut self, command_capacity: NonZeroUsize) -> Self {
+    self.command_capacity = command_capacity;
+    self
+  }
+
+  /// Sets the caller→owner command-mailbox capacity.
+  #[inline]
+  pub const fn set_command_capacity(&mut self, command_capacity: NonZeroUsize) -> &mut Self {
+    self.command_capacity = command_capacity;
     self
   }
 
@@ -208,11 +245,23 @@ impl TributariesOptions {
   }
 
   /// Consumes these options, yielding the parts the driver wires up: the lower-level
-  /// watcher options, the owner→consumer event-channel capacity, and the optional
-  /// debounce policy.
+  /// watcher options, the owner→consumer event-channel capacity, the caller→owner
+  /// command-mailbox capacity, and the optional debounce policy.
   #[inline]
-  pub(crate) fn into_parts(self) -> (WatcherOptions, NonZeroUsize, Option<DebounceConfig>) {
-    (self.watcher, self.event_capacity, self.debounce)
+  pub(crate) fn into_parts(
+    self,
+  ) -> (
+    WatcherOptions,
+    NonZeroUsize,
+    NonZeroUsize,
+    Option<DebounceConfig>,
+  ) {
+    (
+      self.watcher,
+      self.event_capacity,
+      self.command_capacity,
+      self.debounce,
+    )
   }
 }
 
