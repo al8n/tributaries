@@ -44,7 +44,7 @@ use crate::{
   filter::{Filter, FilterInput},
   options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
   route::RoutableEvent,
-  source::{FsSource, Source, SourceEvent},
+  source::{Armed, FsSource, LocalSource, Source, SourceEvent},
   subscription::Subscription,
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
   view::WatchView,
@@ -340,7 +340,9 @@ where
   /// This is the generic construction path; the pure-fs [`new`](Self::new) builds a
   /// [`FsSource`] and delegates here. For caller-owned spawning — structured
   /// concurrency, a `LocalSet`, or an executor outside `agnostic-lite` — use
-  /// [`parts`](Self::parts) and spawn the returned driver future yourself.
+  /// [`parts`](Self::parts) and spawn the returned driver future yourself; for a
+  /// thread-local source that cannot promise `Send` futures (a [`LocalSource`]
+  /// implementor), use [`parts_local`](Self::parts_local).
   pub fn with_source<S>(source: S, options: impl Into<TributariesOptions>) -> Self
   where
     S: Source<C, Handle = H> + Send + 'static,
@@ -377,7 +379,8 @@ where
   ///   run anywhere.
   ///
   /// The returned future is `Send` (pinned by the crate's compile-time owner proofs),
-  /// so it is spawnable on both work-stealing and local executors.
+  /// so it is spawnable on both work-stealing and local executors. For a source that
+  /// cannot promise `Send` futures at all, use [`parts_local`](Self::parts_local).
   pub fn parts<S>(
     source: S,
     options: impl Into<TributariesOptions>,
@@ -385,10 +388,62 @@ where
   where
     S: Source<C, Handle = H> + Send + 'static,
   {
+    let (this, owner) = Self::assemble(source, options.into());
+    (this, run(owner))
+  }
+
+  /// Builds a watcher over a **thread-local** [`LocalSource`] WITHOUT spawning — the
+  /// `!Send` twin of [`parts`](Self::parts), for a source whose futures cannot cross
+  /// threads (`Rc`/`RefCell` state, a completion ring's handles). Identical
+  /// construction, identical handle plane; only the returned driver future differs: it
+  /// makes **no `Send` promise**, so the caller must poll it on the thread that owns the
+  /// source.
+  ///
+  /// The handle plane still crosses threads freely — `C`/`V`/`H` keep their
+  /// `Send + Sync` bounds because this [`Tributaries`] handle, its [`WatchView`], and the
+  /// event stream are exactly as thread-mobile as under [`parts`](Self::parts); only the
+  /// SOURCE (and with it the driver future that owns it) is pinned. Hand the handle to
+  /// any thread; keep the future home.
+  ///
+  /// [`parts`](Self::parts)' three caveats bind here identically — liveness is yours,
+  /// dropping the future is hard teardown, and the polling executor must support `R`'s
+  /// timers — plus the locality one:
+  ///
+  /// - **Poll it where the source lives.** Drive the returned future on the owning
+  ///   thread: directly (`block_on`, or as one arm of that thread's own select loop) or
+  ///   through the executor's own local-spawn API (`tokio::task::spawn_local` inside a
+  ///   `LocalSet`, a smol `LocalExecutor` the thread actually runs). Do NOT reach for
+  ///   `agnostic-lite`'s `spawn_local*` here: its smol implementation spawns onto an
+  ///   immediately-dropped `LocalExecutor` — a silent no-op, the driver is never polled —
+  ///   and its tokio implementation panics outside a `LocalSet`. (That is also why there
+  ///   is no `with_source_local` convenience.)
+  ///
+  /// Every [`Source`] is a [`LocalSource`] through the crate's blanket impl, so a `Send`
+  /// source constructs here too — but then [`parts`](Self::parts) is strictly more
+  /// capable (its driver future can ALSO be polled locally).
+  pub fn parts_local<S>(
+    source: S,
+    options: impl Into<TributariesOptions>,
+  ) -> (Self, impl Future<Output = ()> + 'static)
+  where
+    S: LocalSource<C, Handle = H> + 'static,
+  {
+    let (this, owner) = Self::assemble(source, options.into());
+    (this, run(owner))
+  }
+
+  /// The shared construction body of [`parts`](Self::parts) and
+  /// [`parts_local`](Self::parts_local): channels, [`Owner`], handle. Each public
+  /// constructor wraps [`run`]`(owner)` in its own opaque return type itself, so its
+  /// `Send` promise (or [`parts_local`](Self::parts_local)'s deliberate lack of one) is
+  /// proven directly against the owner future's hidden type.
+  fn assemble<S>(source: S, options: TributariesOptions) -> (Self, Owner<C, V, R, S>)
+  where
+    S: LocalSource<C, Handle = H>,
+  {
     // The source is already constructed, so its watcher options no longer apply here; the
     // channel capacities and the debounce policy are what the owner still wires up.
-    let (_watcher_options, event_capacity, command_capacity, debounce) =
-      options.into().into_parts();
+    let (_watcher_options, event_capacity, command_capacity, debounce) = options.into_parts();
     let subsumer = Subsumer::new();
     let view = subsumer.view();
     // Bounded (design backpressure doc): the owner **never awaits** this channel — every
@@ -448,7 +503,7 @@ where
         view,
         _rt: PhantomData,
       },
-      run(owner),
+      owner,
     )
   }
 }
@@ -697,19 +752,24 @@ impl<R: RuntimeLite> Tributaries<OsString, (), R, RootHandle> {
 }
 
 /// The owned-task actor: the sole writer of every authoritative state, driving the
-/// [`Source`] and the sans-I/O engines from one [`run`] `select!` loop.
+/// source and the sans-I/O engines from one [`run`] `select!` loop. Bounded on
+/// [`LocalSource`] — the base seam — so ONE owner body serves both construction paths:
+/// [`Tributaries::parts`] (whose `S: Source` `Send` futures leak through the blanket
+/// impl and keep `run(owner)` spawnable) and [`Tributaries::parts_local`] (a genuinely
+/// thread-local source, polled where it lives).
 ///
-/// Spawned once at [`Tributaries::with_source`] and never shared: it owns the
-/// [`Source`], the [`Subsumer`](crate::subsume::Subsumer), the
+/// Spawned once at [`Tributaries::with_source`] (or handed to the caller by the two
+/// `parts` constructors) and never shared: it owns the source, the
+/// [`Subsumer`](crate::subsume::Subsumer), the
 /// [`EpochLedger`](epoch::EpochLedger), the per-subscription filter map, and the opt-in
 /// [`Coalescer`](crate::coalesce::Coalescer). All arming and every state mutation run here, to
 /// completion (invariant I1); releasing a root is a **synchronous** fire-and-forget
-/// [`Source::disarm`] request, so no cleanup path awaits source I/O and `Close`-responsiveness
+/// [`LocalSource::disarm`] request, so no cleanup path awaits source I/O and `Close`-responsiveness
 /// (invariant II) holds by construction. No journal, no rollback, no pending-widen: an
 /// interrupted or failed reconcile is repaired by reconciling again (invariant I3).
 struct Owner<C, V, R, S>
 where
-  S: Source<C>,
+  S: LocalSource<C>,
 {
   source: S,
   subsumer: Subsumer<C, V, S::Handle>,
@@ -823,7 +883,7 @@ where
 
 impl<C, V, R, S> Drop for Owner<C, V, R, S>
 where
-  S: Source<C>,
+  S: LocalSource<C>,
 {
   /// The synchronous teardown guard that empties the read plane on **any** owner termination —
   /// normal exit OR a panic unwinding through a caller-provided callback the owner runs (the
@@ -862,9 +922,9 @@ enum Flow {
 
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
 /// fan out a raw source event, or drain the coalescer's due entries — whichever is ready, each to
-/// completion. The only [`Source`] calls it awaits are [`next`](Source::next) (one cancel-safe
-/// `select!` arm) and, inside a caller-bounded `Watch` reconcile, [`arm`](Source::arm); releasing a
-/// root is the **synchronous** [`disarm`](Source::disarm) request, so **no** loop path awaits it and
+/// completion. The only source calls it awaits are [`next`](LocalSource::next) (one cancel-safe
+/// `select!` arm) and, inside a caller-bounded `Watch` reconcile, [`arm`](LocalSource::arm); releasing a
+/// root is the **synchronous** [`disarm`](LocalSource::disarm) request, so **no** loop path awaits it and
 /// Close-responsiveness (invariant II) holds *by construction*.
 ///
 /// Shutdown rides a **dedicated** [`closes`](Owner::closes) channel checked at the TOP priority — the
@@ -883,7 +943,7 @@ where
   C: Ord + Clone,
   V: Clone,
   R: RuntimeLite,
-  S: Source<C>,
+  S: LocalSource<C>,
 {
   // Command-fairness valve state: consecutive command-arm wins since the data plane
   // was last serviced. See [`COMMAND_FAIRNESS_BUDGET`].
@@ -1164,7 +1224,7 @@ where
   C: Ord + Clone,
   V: Clone,
   R: RuntimeLite,
-  S: Source<C>,
+  S: LocalSource<C>,
 {
   /// Dispatches one command from the mailbox, returning whether the [`run`] loop should keep
   /// looping or break to teardown ([`Flow`]). Called from the [`run`] loop's single `select`, one
@@ -2780,6 +2840,64 @@ where
 {
   fn needs_send<F: Send>(_: F) {}
   needs_send(run(owner));
+}
+
+/// Compile-time proof of the `!Send` construction path: a genuinely thread-local source —
+/// `Rc` state captured by its futures, so it cannot promise `Send` and can implement only
+/// [`LocalSource`] — constructs through [`Tributaries::parts_local`]. The twin of
+/// [`assert_generic_owner_send`], which pins the `Send` half (the blanket impl must keep
+/// [`Tributaries::parts`]' promise provable for a generic `S: Source`); this half pins
+/// that the base seam genuinely hosts a source no [`Source`] impl could be written for.
+/// Generic over `R`, so it type-checks under every runtime feature set. Never invoked.
+#[allow(dead_code)]
+fn assert_rc_local_source_constructs<R: RuntimeLite>() {
+  use std::{cell::Cell, rc::Rc};
+
+  struct RcSource {
+    state: Rc<Cell<u32>>,
+  }
+
+  impl LocalSource<OsString> for RcSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    fn arm(
+      &mut self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Armed<OsString, u32>, WatchError>> {
+      let state = Rc::clone(&self.state);
+      let canonical = key.to_vec();
+      async move {
+        let handle = state.get() + 1;
+        state.set(handle);
+        Ok(Armed::new(handle, canonical))
+      }
+    }
+
+    fn disarm(&mut self, _handle: u32) {}
+
+    fn next(&mut self) -> impl Future<Output = Option<SourceEvent<OsString, u32>>> {
+      let state = Rc::clone(&self.state);
+      async move {
+        let _ = state.get();
+        core::future::pending().await
+      }
+    }
+
+    fn root_key(&self, _handle: u32) -> Option<Vec<OsString>> {
+      None
+    }
+  }
+
+  let (_handle, _driver): (Tributaries<OsString, (), R, u32>, _) = Tributaries::parts_local(
+    RcSource {
+      state: Rc::new(Cell::new(0)),
+    },
+    TributariesOptions::new(),
+  );
 }
 
 /// A [`Tributaries`] driven by the tokio runtime, over the local filesystem.

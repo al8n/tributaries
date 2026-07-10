@@ -20,6 +20,103 @@ fn assert_source_futures_send<C, S: Source<C>>(s: &mut S, key: &[C], handle: S::
   s.disarm(handle);
 }
 
+/// The blanket forwarding impl (`impl<C, T: Source<C>> LocalSource<C> for T`) forwards
+/// EVERY item — including the defaulted [`grow`](Source::grow) /
+/// [`set_cover`](Source::set_cover) — so a [`Source`] implementor's overrides are reached
+/// when the owner drives it through [`LocalSource`](super::LocalSource). Fail-on-old: a
+/// blanket impl that leaned on the base trait's own defaults for the two defaulted items
+/// would silently swallow an implementor's coverage reconcile.
+#[test]
+fn blanket_local_source_forwards_every_item() {
+  use futures_util::FutureExt;
+
+  use super::{Armed, LocalSource, SourceEvent};
+  use crate::error::WatchError;
+
+  #[derive(Default)]
+  struct Probe {
+    calls: Vec<&'static str>,
+  }
+
+  impl Source<u8> for Probe {
+    type Handle = u8;
+
+    fn canonicalize_key(&self, key: &[u8]) -> Result<Vec<u8>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    fn arm(
+      &mut self,
+      key: &[u8],
+    ) -> impl Future<Output = Result<Armed<u8, u8>, WatchError>> + Send {
+      self.calls.push("arm");
+      let canonical = key.to_vec();
+      async move { Ok(Armed::new(7, canonical)) }
+    }
+
+    fn disarm(&mut self, _handle: u8) {
+      self.calls.push("disarm");
+    }
+
+    fn grow(&mut self, _handle: u8, _retained: &[Vec<u8>]) -> impl Future<Output = ()> + Send {
+      self.calls.push("grow");
+      async {}
+    }
+
+    fn set_cover(&mut self, _handle: u8, _retained: &[Vec<u8>]) {
+      self.calls.push("set_cover");
+    }
+
+    fn next(&mut self) -> impl Future<Output = Option<SourceEvent<u8, u8>>> + Send {
+      self.calls.push("next");
+      async { None }
+    }
+
+    fn root_key(&self, _handle: u8) -> Option<Vec<u8>> {
+      Some(vec![1])
+    }
+  }
+
+  let mut probe = Probe::default();
+
+  // Drive every item through the LocalSource seam (fully qualified, exactly as the
+  // owner's generic `S: LocalSource` bound resolves them) and assert the implementor's
+  // overrides answer.
+  assert_eq!(
+    LocalSource::canonicalize_key(&probe, &[1u8]).expect("canonicalize_key forwards"),
+    vec![1u8],
+  );
+  let armed = LocalSource::arm(&mut probe, &[1u8])
+    .now_or_never()
+    .expect("the forwarded arm future is ready")
+    .expect("arm forwards");
+  assert_eq!(armed.handle(), 7, "the implementor's arm answered");
+  LocalSource::grow(&mut probe, 7, &[])
+    .now_or_never()
+    .expect("the forwarded grow future is ready");
+  LocalSource::set_cover(&mut probe, 7, &[]);
+  assert!(
+    LocalSource::next(&mut probe)
+      .now_or_never()
+      .expect("the forwarded next future is ready")
+      .is_none(),
+    "the implementor's next answered"
+  );
+  LocalSource::disarm(&mut probe, 7);
+  assert_eq!(
+    LocalSource::root_key(&probe, 7),
+    Some(vec![1u8]),
+    "root_key forwards"
+  );
+
+  assert_eq!(
+    probe.calls,
+    vec!["arm", "grow", "set_cover", "next", "disarm"],
+    "every recording item reached the implementor — the defaulted grow/set_cover were \
+     forwarded, not shadowed by the base trait's own defaults"
+  );
+}
+
 /// Asserts a component sequence round-trips: rebuilding a path from key components and
 /// re-decomposing it yields the original components. This is the fs binding's key ↔ path
 /// contract — events are located by re-decomposing a canonical path, so the two

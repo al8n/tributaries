@@ -1908,6 +1908,104 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
   assert!(matches!(err, WatchError::Closed), "got {err:?}");
 }
 
+/// `parts_local()`: the `!Send` construction path end-to-end — a genuinely thread-local
+/// source (`Rc` state, implementing [`LocalSource`](crate::source::LocalSource) directly,
+/// so no [`Source`] impl could be written for it) drives the full watch → raw event →
+/// attributed delivery → close lifecycle, with the driver future polled on the thread
+/// that owns the source (a tokio `LocalSet` — the "poll it where the source lives"
+/// caveat) while the handle plane is used exactly as under `parts()`.
+#[tokio::test]
+async fn parts_local_drives_a_thread_local_source_end_to_end() {
+  use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+  };
+
+  use crate::source::LocalSource;
+
+  /// A thread-local source: handle minting and the live-root map ride `Rc`s, so `Self`
+  /// is `!Send` and every `async fn` future (capturing `&mut Self`) is too.
+  struct RcSource {
+    next_handle: Rc<Cell<u32>>,
+    live: Rc<RefCell<HashMap<u32, Vec<OsString>>>>,
+    /// Raw changes the test feeds in; `recv` is cancel-safe, satisfying the `next`
+    /// contract, and parks while the test holds the sender (the driver exits via
+    /// `close`, not stream end).
+    events: async_channel::Receiver<SourceEvent<OsString, u32>>,
+  }
+
+  impl LocalSource<OsString> for RcSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      let handle = self.next_handle.get() + 1;
+      self.next_handle.set(handle);
+      self.live.borrow_mut().insert(handle, key.to_vec());
+      Ok(Armed::new(handle, key.to_vec()))
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.live.borrow_mut().remove(&handle);
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      self.events.recv().await.ok()
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.live.borrow().get(&handle).cloned()
+    }
+  }
+
+  let (event_tx, event_rx) = async_channel::unbounded();
+  let source = RcSource {
+    next_handle: Rc::new(Cell::new(0)),
+    live: Rc::new(RefCell::new(HashMap::new())),
+    events: event_rx,
+  };
+  let (mut w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
+    super::Tributaries::parts_local(source, TributariesOptions::new());
+
+  let local = tokio::task::LocalSet::new();
+  local
+    .run_until(async move {
+      let driver = tokio::task::spawn_local(driver);
+
+      let sub = w
+        .watch(key("/a"), (), WatchOptions::new())
+        .await
+        .expect("watch through the locally-polled driver");
+      assert!(w.view().is_watched(&key("/a")), "the read plane published");
+
+      // Feed a raw change under the armed root (the fixture mints handle 1 first).
+      event_tx
+        .send(source_modified(1, "/a/file.txt", 1))
+        .await
+        .expect("feed the thread-local source");
+      let event = tokio::time::timeout(Duration::from_secs(10), w.next())
+        .await
+        .expect("delivery is prompt")
+        .expect("the change is delivered");
+      assert_eq!(
+        event.subscription(),
+        sub,
+        "attributed to the covering subscription"
+      );
+      assert!(event.kind().is_modified(), "the kind survives the fan-out");
+
+      w.close().await.expect("close resolves on the local driver");
+      tokio::time::timeout(Duration::from_secs(5), driver)
+        .await
+        .expect("the driver future completes after close")
+        .expect("driver task");
+    })
+    .await;
+}
+
 /// the coalescer's buffered-entry cap engages the EXISTING loss-accounting
 /// path — a high-cardinality burst past the cap sheds the subscription to a dominating
 /// parked Rescan (`park_rescan`: shed epoch + `needs_rescan` merge + coalescer purge),

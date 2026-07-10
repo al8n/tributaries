@@ -138,7 +138,7 @@ pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
 pub use interest::Interest;
 pub use options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions};
-pub use source::{Armed, FsSource, Source, SourceEvent};
+pub use source::{Armed, FsSource, LocalSource, Source, SourceEvent};
 pub use subscription::{InstanceId, Subscription};
 pub use view::{Snapshot, WatchView};
 
