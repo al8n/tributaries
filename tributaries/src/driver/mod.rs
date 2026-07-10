@@ -615,6 +615,14 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
     self.events.recv().await.ok()
   }
 
+  /// How many delivered events currently sit in the shared stream's buffer — the
+  /// demux shutdown barrier's SNAPSHOT bound (Codex R56): it drains at most this many,
+  /// so the barrier is finite under a live producer and post-stop events stay on the
+  /// stream for surviving clones.
+  pub(crate) fn queued_events(&self) -> usize {
+    self.events.len()
+  }
+
   /// Closes the watcher: asks the owner to flush its coalesced tail and tear the source
   /// down, resolving once it has.
   ///
