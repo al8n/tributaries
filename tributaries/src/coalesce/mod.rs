@@ -11,6 +11,19 @@
 //! feeds it `now`, asks it for the [next deadline](Coalescer::next_deadline) to sleep
 //! until, and [drains](Coalescer::drain_ready) the entries that have come due.
 //!
+//! # Per-subscription policy (design §6)
+//!
+//! The coalescer owns each subscription's effective debounce policy (it already keys
+//! everything by [`Subscription`]): the watcher-global `default` plus a per-subscription
+//! override map the driver [registers](Coalescer::set_policy) at watch commit. An
+//! absent entry inherits the default; an [`Off`](Debounce::Off) override rides the
+//! ready queue undelayed and uncollapsed (pass-through in admission order — it drains
+//! on the same tick it was admitted); a [`Custom`](Debounce::Custom) override runs the
+//! collapse table under its own windows, its `max_buffered` additionally capping that
+//! subscription's own fresh entries. A policy is registered before any of its
+//! subscription's events are admitted and never changes over the subscription's life,
+//! so a pass-through subscription can never hold buffered entries to order against.
+//!
 //! # The collapse table (design §6)
 //!
 //! Within a settle window, per `(subscription, path)`, the buffered kind and an
@@ -72,14 +85,14 @@
 //! subscription's run contiguous and in epoch order.
 
 use std::{
-  collections::{BTreeMap, VecDeque},
+  collections::{BTreeMap, HashMap, VecDeque},
   time::Instant,
   vec::Vec,
 };
 
 use crate::{
   event::{Event, EventKind},
-  options::DebounceConfig,
+  options::{Debounce, DebounceConfig},
   subscription::Subscription,
 };
 
@@ -138,13 +151,30 @@ enum Collapse {
 /// The opt-in settle/debounce coalescer (design §6): a pure state machine collapsing
 /// bursts of changes per `(subscription, path)`, driven by an external clock.
 ///
-/// Constructed with a [`DebounceConfig`]; the driver instantiates one only when the
-/// caller opted in (absent a config, events pass through untouched and no coalescer
-/// exists). See the [module docs](self) for the collapse table and the overriding
-/// invariants.
+/// Constructed with the watcher-global default policy; the driver instantiates one only
+/// when somebody opted in — eagerly for a global [`DebounceConfig`], lazily on the first
+/// [`Debounce::Custom`] override (absent both, events pass through untouched and no
+/// coalescer exists). See the [module docs](self) for the per-subscription policy
+/// resolution, the collapse table, and the overriding invariants.
 #[derive(Debug)]
 pub(crate) struct Coalescer<C, V> {
-  cfg: DebounceConfig,
+  /// The watcher-global settle policy every subscription inherits absent an override —
+  /// [`None`] when the coalescer exists only via per-subscription
+  /// [`Custom`](Debounce::Custom) overrides (inheriting nothing = pass-through).
+  default: Option<DebounceConfig>,
+  /// The per-subscription policy overrides ([`set_policy`](Self::set_policy)):
+  /// `Some(config)` = [`Custom`](Debounce::Custom), `None` = [`Off`](Debounce::Off);
+  /// an ABSENT subscription inherits [`default`](Self::default). Never iterated (all
+  /// point lookups), so `HashMap` nondeterminism cannot leak into any drain order
+  /// (design §10).
+  policies: HashMap<Subscription, Option<DebounceConfig>>,
+  /// Each subscription's count of FRESH buffered entries — the state behind the
+  /// per-subscription `max_buffered` cap ([`DebounceConfig::max_buffered`]). Maintained
+  /// by every path that inserts into or removes from [`buffer`](Self::buffer)
+  /// (an entry is dropped at zero, so absence = 0); an incorrect counter is the bug
+  /// class here, so every decrement funnels through the debug-asserted
+  /// [`dec_per_sub`](Self::dec_per_sub) or a whole-subscription reconciliation.
+  per_sub_len: HashMap<Subscription, usize>,
   /// The coalescing slots, one per `(subscription, key)`. A [`BTreeMap`] so iteration is
   /// deterministic (design §10 forbids `HashMap`-iteration nondeterminism); the *emission*
   /// order within a subscription is by admission sequence (`Buffered::seq`), not this path
@@ -173,14 +203,79 @@ where
   C: Ord + Clone,
   V: Clone,
 {
-  /// Creates a coalescer with the given settle policy.
-  pub(crate) fn new(cfg: DebounceConfig) -> Self {
+  /// Creates a coalescer with the given watcher-global default policy — [`None`] when
+  /// it exists only to serve per-subscription [`Custom`](Debounce::Custom) overrides
+  /// (an inheriting subscription then passes through untouched).
+  pub(crate) fn new(default: Option<DebounceConfig>) -> Self {
     Self {
-      cfg,
+      default,
+      policies: HashMap::new(),
+      per_sub_len: HashMap::new(),
       buffer: BTreeMap::new(),
       ready: VecDeque::new(),
       next_seq: 0,
     }
+  }
+
+  /// Registers `sub`'s debounce posture (design §6): [`Inherit`](Debounce::Inherit)
+  /// removes the override (absence IS the inherit resolution), [`Off`](Debounce::Off)
+  /// records raw pass-through, [`Custom`](Debounce::Custom) records the subscription's
+  /// own settle policy. Called by the driver at watch commit, adjacent to the filter
+  /// registration, before any of the subscription's events are admitted.
+  pub(crate) fn set_policy(&mut self, sub: Subscription, policy: Debounce) {
+    match policy {
+      Debounce::Inherit => {
+        self.policies.remove(&sub);
+      }
+      Debounce::Off => {
+        self.policies.insert(sub, None);
+      }
+      Debounce::Custom(config) => {
+        self.policies.insert(sub, Some(config));
+      }
+    }
+  }
+
+  /// Retires `sub` entirely: its buffered and ready entries
+  /// ([`drop_subscription`](Self::drop_subscription), which also zeroes its fresh-entry
+  /// counter) AND its registered policy. For the paths where the subscription itself
+  /// ends — a caller unwatch/orphan release or a terminal root retirement. The
+  /// still-live paths (a widen/restore re-point, an overflow park) call
+  /// [`drop_subscription`](Self::drop_subscription) instead, keeping the policy: the
+  /// subscription keeps delivering and must keep its posture.
+  pub(crate) fn forget_subscription(&mut self, sub: Subscription) {
+    self.drop_subscription(sub);
+    self.policies.remove(&sub);
+  }
+
+  /// The effective settle policy for `sub`: its registered override — `Some(config)` =
+  /// [`Custom`](Debounce::Custom), `None` = [`Off`](Debounce::Off) — or, absent one,
+  /// the watcher-global [`default`](Self::default). A resolved `None` means raw
+  /// pass-through.
+  fn effective_policy(&self, sub: Subscription) -> Option<DebounceConfig> {
+    match self.policies.get(&sub) {
+      Some(policy) => *policy,
+      None => self.default,
+    }
+  }
+
+  /// The coalescer-wide structural bound on buffered entries: the watcher-global
+  /// default's `max_buffered`, or [`DebounceConfig::DEFAULT_MAX_BUFFERED`] when the
+  /// coalescer exists only via per-subscription overrides (no global config to read a
+  /// cap from). Per-subscription `Custom` caps apply *within* this bound, never widen it.
+  fn structural_cap(&self) -> usize {
+    self
+      .default
+      .map_or(DebounceConfig::DEFAULT_MAX_BUFFERED, |config| {
+        config.max_buffered()
+      })
+  }
+
+  /// Whether `sub` has a registered policy override — the driver-level tests' probe for
+  /// the forget-vs-drop cleanup split.
+  #[cfg(test)]
+  pub(crate) fn has_policy(&self, sub: Subscription) -> bool {
+    self.policies.contains_key(&sub)
   }
 
   /// Returns the next monotone admission sequence, advancing the counter. It is stamped
@@ -193,12 +288,16 @@ where
     seq
   }
 
-  /// Admits one attributed event at logical time `now`: buffers and collapses a known
-  /// lifecycle change ([`Created`](EventKind::Created) / [`Modified`](EventKind::Modified) /
-  /// [`Removed`](EventKind::Removed)) per the [table](self#the-collapse-table-design-6), or —
+  /// Admits one attributed event at logical time `now` under its subscription's
+  /// [effective policy](self#per-subscription-policy-design-6): a raw
+  /// pass-through subscription's event rides the ready queue undelayed; otherwise a
+  /// known lifecycle change ([`Created`](EventKind::Created) / [`Modified`](EventKind::Modified) /
+  /// [`Removed`](EventKind::Removed)) buffers and collapses per the
+  /// [table](self#the-collapse-table-design-6), and —
   /// for a [`Moved`](EventKind::Moved), a [`Rescan`](EventKind::Rescan), or any unknown/future
-  /// non-lifecycle kind (`EventKind` is `#[non_exhaustive]`) — applies the overriding invariant
-  /// (flush + emit whole / flush + bypass), never folding it into the lifecycle collapse table.
+  /// non-lifecycle kind (`EventKind` is `#[non_exhaustive]`) — the overriding invariant applies
+  /// (flush + emit whole / flush + bypass) regardless of policy, never folding it into the
+  /// lifecycle collapse table.
   ///
   /// No event is ever silently dropped: every admitted event is either buffered for
   /// later emission, folded into a buffered entry that will emit, made immediately
@@ -206,13 +305,15 @@ where
   /// annihilated. `now` must be nondecreasing across calls (the driver's monotonic
   /// clock guarantees it).
   ///
-  /// Returns `Some(subscription)` when this admission OVERFLOWED the buffered-entry cap
-  /// ([`DebounceConfig::max_buffered`]): the event was NOT buffered, and the
+  /// Returns `Some(subscription)` when this admission OVERFLOWED a buffered-entry cap
+  /// ([`DebounceConfig::max_buffered`]) — the coalescer-wide
+  /// [structural bound](Self::structural_cap) or the admitting subscription's own
+  /// per-subscription cap: the event was NOT buffered, and the
   /// caller owes that subscription the same dominating parked
   /// [`Rescan`](EventKind::Rescan) it mints for a full event channel
-  /// (`park_rescan` — which also purges the subscription's buffered entries), so the
-  /// dropped event and everything purged are accounted, never silent. `None` on every
-  /// ordinary admission.
+  /// (`park_rescan` — which also purges the subscription's buffered entries, zeroing its
+  /// fresh-entry counter), so the dropped event and everything purged are accounted,
+  /// never silent. `None` on every ordinary admission.
   #[must_use = "an overflowed subscription is owed a dominating parked Rescan"]
   pub(crate) fn admit(&mut self, ev: Event<C, V>, now: Instant) -> Option<Subscription> {
     if ev.is_rescan() {
@@ -238,10 +339,26 @@ where
       ev.kind(),
       EventKind::Created | EventKind::Modified | EventKind::Removed
     ) {
-      // A known lifecycle change (Created / Modified / Removed): buffer it, collapsing onto
-      // any entry already held for its (subscription, path) — or shed the subscription
-      // when a fresh entry would overflow the cap.
-      self.coalesce(ev, now)
+      // A known lifecycle change (Created / Modified / Removed), dispatched on the
+      // subscription's effective policy.
+      match self.effective_policy(ev.subscription()) {
+        // Raw pass-through — an `Off` override, or inheriting a disabled global default
+        // (possible once a sibling's `Custom` override instantiated the coalescer): ride
+        // the ready queue undelayed and uncollapsed. The FIFO queue drains on the same
+        // push tick the event was admitted on, so pass-through adds zero latency and
+        // preserves per-subscription admission order (a pass-through subscription never
+        // holds buffered entries to order against — its policy is fixed before its first
+        // event, see the module docs).
+        None => {
+          self.ready.push_back((now, ev));
+          None
+        }
+        // A settling policy — the global default inherited, or the subscription's own
+        // `Custom` windows: buffer it, collapsing onto any entry already held for its
+        // (subscription, path) — or shed the subscription when a fresh entry would
+        // overflow a cap.
+        Some(config) => self.coalesce(ev, now, config),
+      }
     } else {
       // An unknown/future non-lifecycle kind: the umbrella's own `EventKind` is
       // #[non_exhaustive], and the collapse table only knows the three lifecycle kinds (its
@@ -303,6 +420,7 @@ where
     due.sort_by_key(|(sub, seq, _)| (*sub, *seq));
     for (_, _, key) in due {
       let entry = self.buffer.remove(&key).expect("key just collected");
+      self.dec_per_sub(key.0);
       out.push(entry.event);
     }
   }
@@ -325,15 +443,23 @@ where
       .collect();
     tail.sort_by_key(|(sub, seq, _)| (*sub, *seq));
     out.extend(tail.into_iter().map(|(_, _, event)| event));
+    // The whole buffer is gone, so every fresh-entry count reconciles to zero.
+    self.per_sub_len.clear();
   }
 
-  /// Buffers a lifecycle event, collapsing it onto any entry already held for its
-  /// `(subscription, key)` per the [table](self#the-collapse-table-design-6).
-  fn coalesce(&mut self, ev: Event<C, V>, now: Instant) -> Option<Subscription> {
+  /// Buffers a lifecycle event under its subscription's effective `config`, collapsing
+  /// it onto any entry already held for its `(subscription, key)` per the
+  /// [table](self#the-collapse-table-design-6).
+  fn coalesce(
+    &mut self,
+    ev: Event<C, V>,
+    now: Instant,
+    config: DebounceConfig,
+  ) -> Option<Subscription> {
     let key = (ev.subscription(), ev.key().to_vec());
-    // Read the settle windows up front so recomputing the deadline does not re-borrow
-    // `self` while the buffered entry is held mutably.
-    let (quiet, max_hold) = (self.cfg.quiet_window(), self.cfg.max_hold());
+    // The effective settle windows, read up front so recomputing the deadline does not
+    // re-borrow `self` while the buffered entry is held mutably.
+    let (quiet, max_hold) = (config.quiet_window(), config.max_hold());
     // The admission sequence for THIS observation, taken before the buffer borrow. A fresh
     // entry keeps it; a collapse re-takes it (below) so the surviving entry's drain
     // position reflects its newest folded epoch — the epoch it also adopts here. An
@@ -341,13 +467,25 @@ where
     let seq = self.bump_seq();
     let Some(buffered) = self.buffer.get_mut(&key) else {
       // First change to this path in the window: a FRESH entry — the only way the
-      // buffer grows, so this is where the structural memory bound lives.
-      // At the cap, shed the subscription instead of growing: the event is dropped
-      // UNBUFFERED and the caller parks the dominating Rescan that accounts for it
-      // (and purges the subscription's entries, freeing space). Collapses below never
-      // grow the map and stay exempt.
-      if self.buffer.len() >= self.cfg.max_buffered() {
-        return Some(ev.subscription());
+      // buffer grows, so this is where both memory bounds live. At a cap, shed the
+      // subscription instead of growing: the event is dropped UNBUFFERED and the caller
+      // parks the dominating Rescan that accounts for it (and purges the subscription's
+      // entries, freeing space and zeroing its counter). Collapses below never grow the
+      // map and stay exempt from both caps.
+      let sub = ev.subscription();
+      // The coalescer-WIDE structural bound (the watcher-global cap) is checked first:
+      // for an inheriting subscription the per-sub check below reads the same cap over
+      // a subset count, so this one always fires first — the per-sub cap only ever
+      // narrows a `Custom` subscription within the structural bound.
+      if self.buffer.len() >= self.structural_cap() {
+        return Some(sub);
+      }
+      // The PER-SUBSCRIPTION cap: the effective policy's `max_buffered` bounds this
+      // subscription's own fresh entries, so one noisy long-window subscription sheds
+      // itself instead of starving the shared buffer until the structural bound sheds
+      // whoever admits next.
+      if self.per_sub_len.get(&sub).copied().unwrap_or(0) >= config.max_buffered() {
+        return Some(sub);
       }
       let entry = Buffered {
         first_seen: now,
@@ -356,6 +494,7 @@ where
         event: ev,
       };
       self.buffer.insert(key, entry);
+      *self.per_sub_len.entry(sub).or_insert(0) += 1;
       return None;
     };
     let first_seen = buffered.first_seen;
@@ -396,11 +535,41 @@ where
       }
       Collapse::Annihilate => {
         // Created-then-Removed transient: the file lived and died inside the window;
-        // emit nothing. (The sequence taken above is simply left unused.)
+        // emit nothing. (The sequence taken above is simply left unused.) The removed
+        // entry frees its fresh-entry slot.
         self.buffer.remove(&key);
+        self.dec_per_sub(key.0);
       }
     }
     None
+  }
+
+  /// Decrements `sub`'s fresh-entry count by one, dropping the map entry at zero
+  /// (absence = 0, so the map stays bounded by subscriptions that actually hold
+  /// buffered entries). Every single-entry buffer removal funnels through here; the
+  /// whole-subscription paths ([`flush_subscription`](Self::flush_subscription) /
+  /// [`drop_subscription`](Self::drop_subscription) / [`flush_all`](Self::flush_all))
+  /// reconcile the counter wholesale instead. The debug asserts are the tripwire for
+  /// the counter-drift bug class: a decrement with no recorded count means some insert
+  /// or removal path missed its accounting.
+  fn dec_per_sub(&mut self, sub: Subscription) {
+    use std::collections::hash_map::Entry;
+    match self.per_sub_len.entry(sub) {
+      Entry::Occupied(mut occupied) => {
+        let count = occupied.get_mut();
+        debug_assert!(*count > 0, "a zero fresh-entry count was left in the map");
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+          occupied.remove();
+        }
+      }
+      Entry::Vacant(_) => {
+        debug_assert!(
+          false,
+          "a buffered entry was removed for a subscription with no fresh-entry count"
+        );
+      }
+    }
   }
 
   /// The action the collapse table dictates for `buffered` meeting `incoming`.
@@ -445,13 +614,23 @@ where
   fn flush_subscription(&mut self, sub: Subscription, now: Instant) {
     let mut entries = self.subscription_entries(sub);
     entries.sort_by_key(|(seq, _)| *seq);
+    let flushed = entries.len();
     for (_, key) in entries {
       let entry = self.buffer.remove(&key).expect("key just collected");
       self.ready.push_back((now, entry.event));
     }
+    // Every buffered entry of `sub` moved to the ready queue: its fresh-entry count
+    // reconciles to zero (flushed-ready entries are no longer capped — they are already
+    // owed emission).
+    let counted = self.per_sub_len.remove(&sub).unwrap_or(0);
+    debug_assert!(
+      counted == flushed,
+      "fresh-entry count drifted from the buffer: counted {counted}, flushed {flushed}"
+    );
   }
 
-  /// Drops every buffered and ready entry for `sub` — the parked-overflow-`Rescan` analog
+  /// Drops every buffered and ready entry for `sub` — zeroing its fresh-entry counter,
+  /// but **keeping its registered policy** — the parked-overflow-`Rescan` analog
   /// of [`admit`](Self::admit)'s flush-on-`Rescan` (design backpressure doc).
   ///
   /// When the owner sheds `sub` to a **parked** dominating `Rescan` (the event channel was
@@ -462,10 +641,24 @@ where
   /// `purge_scope_emits`. (In the driver's call path the ready queue has already been
   /// drained, so in practice only the buffer holds suspect deltas; the ready scan keeps the
   /// operation self-contained regardless of call site.)
+  ///
+  /// The policy survives because every caller of this method sheds a subscription that is
+  /// **still live** — an overflow park, a widen/restore re-point — and its later events
+  /// must keep their registered posture. A subscription that is genuinely ending takes
+  /// [`forget_subscription`](Self::forget_subscription) instead.
   pub(crate) fn drop_subscription(&mut self, sub: Subscription) {
-    for (_, key) in self.subscription_entries(sub) {
+    let entries = self.subscription_entries(sub);
+    let dropped = entries.len();
+    for (_, key) in entries {
       self.buffer.remove(&key);
     }
+    // Every buffered entry of `sub` is gone: its fresh-entry count reconciles to zero —
+    // the counter zeroing behind the shed path's "purge frees the cap" guarantee.
+    let counted = self.per_sub_len.remove(&sub).unwrap_or(0);
+    debug_assert!(
+      counted == dropped,
+      "fresh-entry count drifted from the buffer: counted {counted}, dropped {dropped}"
+    );
     self.ready.retain(|(_, event)| event.subscription() != sub);
   }
 

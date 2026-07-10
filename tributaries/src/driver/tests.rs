@@ -18,7 +18,7 @@ use crate::{
   event::{Event, EventKind},
   filter::Filter,
   interest::Interest,
-  options::{DebounceConfig, TributariesOptions},
+  options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
   source::{Armed, Source, SourceEvent},
   subscription::Subscription,
   subsume::Subsumer,
@@ -466,6 +466,7 @@ impl Harness {
       last_flush_visited: 0,
       #[cfg(test)]
       test_pre_cut_claims: Vec::new(),
+      debounce: None,
       coalescer,
       cleanup_tx,
       cleanup_rx,
@@ -486,9 +487,18 @@ impl Harness {
 
   async fn watch(&mut self, path: &str, interest: Interest) -> Result<Subscription, WatchError> {
     self
-      .owner
-      .reconcile_watch(&key(path), (), interest, Filter::all())
+      .watch_with(path, WatchOptions::new().with_interest(interest))
       .await
+  }
+
+  /// [`watch`](Self::watch) with the full per-watch options — for the tests exercising
+  /// a custom filter or a per-subscription debounce posture.
+  async fn watch_with(
+    &mut self,
+    path: &str,
+    options: WatchOptions<OsString>,
+  ) -> Result<Subscription, WatchError> {
+    self.owner.reconcile_watch(&key(path), (), options).await
   }
 
   fn unwatch(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
@@ -1707,27 +1717,18 @@ async fn watch_admission_backpressures_when_the_mailbox_is_full() {
   // fills the capacity-1 mailbox. Watch 3's submission must AWAIT admission.
   let w1 = {
     let w = w.clone();
-    tokio::spawn(async move {
-      w.watch(key("/one"), (), Interest::all(), Filter::all())
-        .await
-    })
+    tokio::spawn(async move { w.watch(key("/one"), (), WatchOptions::new()).await })
   };
   let w2 = {
     let w = w.clone();
-    tokio::spawn(async move {
-      w.watch(key("/two"), (), Interest::all(), Filter::all())
-        .await
-    })
+    tokio::spawn(async move { w.watch(key("/two"), (), WatchOptions::new()).await })
   };
   // Deterministic fill order: give the owner and the two submitters time to reach
   // their steady state (owner parked in arm; mailbox holding exactly one command).
   tokio::time::sleep(std::time::Duration::from_millis(200)).await;
   let w3 = {
     let w = w.clone();
-    tokio::spawn(async move {
-      w.watch(key("/three"), (), Interest::all(), Filter::all())
-        .await
-    })
+    tokio::spawn(async move { w.watch(key("/three"), (), WatchOptions::new()).await })
   };
   tokio::time::sleep(std::time::Duration::from_millis(300)).await;
   assert!(
@@ -1780,7 +1781,7 @@ async fn parts_future_drives_the_watcher_when_caller_spawned() {
   let driver = tokio::spawn(driver);
 
   let sub = w
-    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .watch(key("/a"), (), WatchOptions::new())
     .await
     .expect("watch through the caller-spawned driver");
   assert!(w.view().is_watched(&key("/a")), "the read plane published");
@@ -1804,7 +1805,7 @@ async fn dropping_the_parts_future_is_hard_teardown() {
   drop(driver);
 
   let err = w
-    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .watch(key("/a"), (), WatchOptions::new())
     .await
     .expect_err("watch against a dropped driver surfaces Closed");
   assert!(matches!(err, WatchError::Closed), "got {err:?}");
@@ -1883,7 +1884,7 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
   // Submit a watch and wait until the owner is provably INSIDE the gated arm.
   let watching = {
     let w = w.clone();
-    tokio::spawn(async move { w.watch(key("/a"), (), Interest::all(), Filter::all()).await })
+    tokio::spawn(async move { w.watch(key("/a"), (), WatchOptions::new()).await })
   };
   entered_rx
     .await
@@ -1919,7 +1920,7 @@ async fn coalescer_overflow_sheds_to_a_dominating_parked_rescan() {
     .with_quiet_window(Duration::from_secs(3600))
     .with_max_hold(Duration::from_secs(7200))
     .with_max_buffered(2);
-  let mut h = Harness::with_coalescer(Some(Coalescer::new(cfg)));
+  let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(cfg))));
   let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
   h.owner.epochs.stamp(sub, Epoch::new(3));
 
@@ -1953,6 +1954,250 @@ async fn coalescer_overflow_sheds_to_a_dominating_parked_rescan() {
       .iter()
       .any(|e| e.subscription() == sub && e.kind().is_rescan()),
     "the parked Rescan flushes to the consumer"
+  );
+}
+
+/// Per-subscription debounce (design §6): two subscriptions over ONE root,
+/// one inheriting the watcher-global settle policy, one watched with `Debounce::Off` —
+/// one raw burst delivers every event to the raw subscription undelayed while the
+/// settled sibling holds a single collapsed entry.
+#[tokio::test]
+async fn per_sub_off_delivers_raw_while_inherit_sibling_settles() {
+  // Never-settling global windows: the settled side deterministically holds, no timers.
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200));
+  let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(cfg))));
+  let settled = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let raw = h
+    .watch_with("/a", WatchOptions::new().with_debounce(Debounce::Off))
+    .await
+    .expect("watch /a raw");
+
+  // One three-write burst to a single path fans out to BOTH covering subscriptions.
+  for epoch in 1..=3 {
+    h.owner.fan_out_and_push(&source_modified(1, "/a/f", epoch));
+  }
+
+  let delivered = h.drain();
+  let raw_events: Vec<_> = delivered
+    .iter()
+    .filter(|e| e.subscription() == raw)
+    .collect();
+  assert_eq!(
+    raw_events.len(),
+    3,
+    "the Off subscription sees every raw event, undelayed and uncollapsed"
+  );
+  assert!(
+    raw_events.windows(2).all(|w| w[0].epoch() < w[1].epoch()),
+    "…in admission (= epoch) order"
+  );
+  assert!(
+    !delivered.iter().any(|e| e.subscription() == settled),
+    "the inheriting sibling's burst is still settling — nothing delivered yet"
+  );
+
+  // The settled sibling holds exactly its ONE collapsed entry: the teardown flush
+  // releases a single event carrying the newest stamp.
+  h.owner.drain_owed_once();
+  let tail = h.drain();
+  assert_eq!(
+    tail.len(),
+    1,
+    "the settled sibling collapsed the burst to one"
+  );
+  assert_eq!(tail[0].subscription(), settled);
+  assert_eq!(
+    tail[0].epoch(),
+    Epoch::new(3),
+    "the newest observation's stamp"
+  );
+}
+
+/// The lazy-instantiation matrix, `Off` half: `Debounce::Off` when the watcher-global
+/// debounce is off too is a NO-OP — events already pass through untouched, so no
+/// coalescer is instantiated (the zero-cost claim).
+#[tokio::test]
+async fn off_with_global_none_never_instantiates_the_coalescer() {
+  let mut h = Harness::new();
+  let sub = h
+    .watch_with("/a", WatchOptions::new().with_debounce(Debounce::Off))
+    .await
+    .expect("watch /a");
+  assert!(
+    h.owner.coalescer.is_none(),
+    "Off atop a disabled global debounce instantiates nothing"
+  );
+
+  h.owner.fan_out_and_push(&source_modified(1, "/a/f", 0));
+  let delivered = h.drain();
+  assert_eq!(delivered.len(), 1, "events pass straight through");
+  assert_eq!(delivered[0].subscription(), sub);
+}
+
+/// The lazy-instantiation matrix, `Custom` half: a `Debounce::Custom` commit when the
+/// watcher-global debounce is off instantiates the coalescer lazily with NO default —
+/// the override settles while an inheriting sibling keeps passing through raw.
+#[tokio::test]
+async fn custom_with_global_none_lazily_instantiates_the_coalescer() {
+  let mut h = Harness::new();
+  assert!(h.owner.coalescer.is_none(), "nothing opted in yet");
+
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200));
+  let custom = h
+    .watch_with(
+      "/a",
+      WatchOptions::new().with_debounce(Debounce::Custom(cfg)),
+    )
+    .await
+    .expect("watch /a"); // root 1
+  assert!(
+    h.owner.coalescer.is_some(),
+    "the first Custom commit lazily instantiated the coalescer"
+  );
+  let inherit = h.watch("/b", Interest::all()).await.expect("watch /b"); // root 2
+
+  h.owner.fan_out_and_push(&source_modified(1, "/a/f", 0)); // custom → settles
+  h.owner.fan_out_and_push(&source_modified(2, "/b/g", 0)); // inherit-of-nothing → raw
+
+  let delivered = h.drain();
+  assert_eq!(
+    delivered.len(),
+    1,
+    "only the inheriting sibling's event passes through"
+  );
+  assert_eq!(delivered[0].subscription(), inherit);
+  assert!(
+    delivered[0].kind().is_modified(),
+    "…as the raw delivery itself, not a Rescan"
+  );
+  let _ = custom;
+  assert!(
+    h.owner
+      .coalescer
+      .as_ref()
+      .and_then(Coalescer::next_deadline)
+      .is_some(),
+    "the Custom subscription's delta is held settling"
+  );
+}
+
+/// The forget-vs-drop regression at the driver seam (design §6, the subtle
+/// cleanup split): a WIDEN re-points a live subscription — its buffered pre-widen deltas
+/// are dropped, but its `Debounce::Custom` policy survives, so post-widen events on the
+/// wider root still settle. An overflow park likewise keeps the policy; only release
+/// (unwatch) and terminal retirement forget it.
+#[tokio::test]
+async fn widen_repoint_keeps_the_custom_policy_release_forgets_it() {
+  let mut h = Harness::new();
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200));
+  let sb = h
+    .watch_with(
+      "/a/b",
+      WatchOptions::new().with_debounce(Debounce::Custom(cfg)),
+    )
+    .await
+    .expect("watch /a/b"); // root 1, lazily instantiates the coalescer
+
+  // A pre-widen delta buffers under the Custom policy.
+  h.owner.fan_out_and_push(&source_modified(1, "/a/b/f", 0));
+  assert!(h.drain().is_empty(), "the pre-widen delta is settling");
+
+  // Widen to /a: sb re-points onto the wider root — the coalescer purge is
+  // drop_subscription (buffers only), NOT forget (policy retained).
+  let sa = h.watch("/a", Interest::all()).await.expect("widen to /a"); // root 2
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == sb && e.is_rescan()),
+    "the re-pointed subscription received its dominating widen Rescan"
+  );
+  assert!(
+    !delivered
+      .iter()
+      .any(|e| e.subscription() == sb && !e.is_rescan()),
+    "the purged pre-widen delta never delivers (dominated by the Rescan)"
+  );
+  let coalescer = h.owner.coalescer.as_ref().expect("coalescer live");
+  assert!(
+    coalescer.has_policy(sb),
+    "the widen re-point KEPT the Custom policy — the subscription is still live"
+  );
+
+  // THE regression assert: a post-widen event on the WIDER root fans out to BOTH
+  // subscribers — the widener (inheriting the disabled default: raw pass-through) and
+  // the re-pointed sb, whose retained Custom policy must still settle its copy.
+  h.owner.fan_out_and_push(&source_modified(2, "/a/b/g", 0));
+  let delivered = h.drain();
+  assert!(
+    !delivered.iter().any(|e| e.subscription() == sb),
+    "sb's post-widen delta is buffered under the retained Custom policy, not raw"
+  );
+  assert!(
+    delivered.iter().any(|e| e.subscription() == sa),
+    "…while the inheriting widener's copy passes through raw (per-sub isolation)"
+  );
+
+  // The overflow park keeps it too…
+  h.owner.park_rescan(sb);
+  let coalescer = h.owner.coalescer.as_ref().expect("coalescer live");
+  assert!(
+    coalescer.has_policy(sb),
+    "an overflow park purges buffers but keeps the policy"
+  );
+
+  // …while release (unwatch) FORGETS it with the subscription.
+  h.unwatch(sb).expect("unwatch");
+  let coalescer = h.owner.coalescer.as_ref().expect("coalescer live");
+  assert!(
+    !coalescer.has_policy(sb),
+    "release_subscription forgets the retired subscription's policy"
+  );
+}
+
+/// Terminal retirement (root death) FORGETS the dead subscription's policy — the other
+/// half of the forget split, so a retired subscription leaks no policy entry.
+#[tokio::test]
+async fn terminal_retirement_forgets_the_policy() {
+  let mut h = Harness::new();
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200));
+  let sub = h
+    .watch_with(
+      "/a",
+      WatchOptions::new().with_debounce(Debounce::Custom(cfg)),
+    )
+    .await
+    .expect("watch /a"); // root 1
+  assert!(
+    h.owner
+      .coalescer
+      .as_ref()
+      .expect("coalescer")
+      .has_policy(sub),
+    "the Custom policy is registered at commit"
+  );
+
+  h.owner.source.kill_root(1);
+  h.owner.retire_root_with_terminal_rescan(1);
+  assert!(
+    !h.owner
+      .coalescer
+      .as_ref()
+      .expect("coalescer")
+      .has_policy(sub),
+    "terminal retirement forgets the dead subscription's policy"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "…while its owed terminal Rescan is still parked (unaffected by the forget)"
   );
 }
 
@@ -2776,7 +3021,7 @@ async fn dead_root_terminal_removed_under_debounce_signals_via_parked_rescan_onl
   let cfg = DebounceConfig::new()
     .with_quiet_window(Duration::from_millis(0))
     .with_max_hold(Duration::from_millis(0));
-  let mut h = Harness::with_coalescer(Some(Coalescer::new(cfg)));
+  let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(cfg))));
   let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
   h.owner.epochs.stamp(sub, Epoch::new(3));
 
@@ -2850,7 +3095,7 @@ async fn caller_vanished_after_commit_releases_the_orphan_synchronously() {
   drop(response); // the caller's wait vanished before the reconcile ran
 
   h.owner
-    .on_watch(key("/a"), (), Interest::all(), Filter::all(), reply)
+    .on_watch(key("/a"), (), WatchOptions::new(), reply)
     .await;
 
   assert_eq!(
@@ -2903,7 +3148,7 @@ async fn watch_wait_dropped_after_commit_reconciles_the_orphan_away() {
   // so the grant lands in the `oneshot` slot — exactly the post-send, pre-poll window.
   let (reply, response) = futures_channel::oneshot::channel();
   h.owner
-    .on_watch(key("/a"), (), Interest::all(), Filter::all(), reply)
+    .on_watch(key("/a"), (), WatchOptions::new(), reply)
     .await;
   assert_eq!(
     h.owner.source.arm_count(),
@@ -3305,7 +3550,7 @@ async fn widen_drops_buffered_coalescer_delta_so_repoint_rescan_parks_at_own_epo
   let cfg = DebounceConfig::new()
     .with_quiet_window(Duration::from_secs(3600))
     .with_max_hold(Duration::from_secs(7200));
-  let mut h = Harness::build(Some(Coalescer::new(cfg)), Some(2));
+  let mut h = Harness::build(Some(Coalescer::new(Some(cfg))), Some(2));
   let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // root 1
   for raw in 0..5 {
     h.owner.epochs.stamp(sb, Epoch::new(raw)); // high-water 4
@@ -3681,7 +3926,7 @@ async fn source_drain_orders_parked_rescan_before_its_buffered_tail() {
   let cfg = DebounceConfig::new()
     .with_quiet_window(Duration::from_secs(3600))
     .with_max_hold(Duration::from_secs(7200));
-  let mut h = Harness::build(Some(Coalescer::new(cfg)), Some(1));
+  let mut h = Harness::build(Some(Coalescer::new(Some(cfg))), Some(1));
   let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
   for raw in 0..2 {
     h.owner.epochs.stamp(sub, Epoch::new(raw)); // high-water 1
@@ -3922,8 +4167,7 @@ async fn close_tail_drains_cleanup_not_public_backlog() {
       .try_send(super::Command::Watch {
         key: key(&format!("/flood{i}")),
         value: (),
-        interest: Interest::all(),
-        filter: Filter::all(),
+        options: WatchOptions::new(),
         reply,
       })
       .expect("prefill a public backlog command");
@@ -4143,7 +4387,7 @@ async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs
   let view = w.view();
   let watched = key("/a");
   let _sub = w
-    .watch(watched.clone(), (), Interest::all(), Filter::all())
+    .watch(watched.clone(), (), WatchOptions::new())
     .await
     .expect("watch /a");
   assert!(view.is_watched(&watched), "the live watch is advertised");
@@ -4207,6 +4451,7 @@ impl OwnerU64 {
       last_flush_visited: 0,
       #[cfg(test)]
       test_pre_cut_claims: Vec::new(),
+      debounce: None,
       coalescer,
       cleanup_tx,
       cleanup_rx,
@@ -4243,7 +4488,7 @@ async fn delivered_delta_carries_owning_subscription_value() {
   let mut rig = OwnerU64::new(8, None);
   let sub = rig
     .owner
-    .reconcile_watch(&key("/a"), 42, Interest::all(), Filter::all())
+    .reconcile_watch(&key("/a"), 42, WatchOptions::new())
     .await
     .expect("watch /a");
 
@@ -4282,16 +4527,16 @@ async fn baked_value_attributes_queued_events_after_teardown_empties_view() {
   let cfg = DebounceConfig::new()
     .with_quiet_window(Duration::from_secs(3600))
     .with_max_hold(Duration::from_secs(7200));
-  let mut rig = OwnerU64::new(8, Some(Coalescer::new(cfg)));
+  let mut rig = OwnerU64::new(8, Some(Coalescer::new(Some(cfg))));
 
   let a = rig
     .owner
-    .reconcile_watch(&key("/a"), 7, Interest::all(), Filter::all())
+    .reconcile_watch(&key("/a"), 7, WatchOptions::new())
     .await
     .expect("watch /a"); // root handle 1
   let b = rig
     .owner
-    .reconcile_watch(&key("/b"), 9, Interest::all(), Filter::all())
+    .reconcile_watch(&key("/b"), 9, WatchOptions::new())
     .await
     .expect("watch /b"); // root handle 2
 
@@ -4383,7 +4628,7 @@ async fn consumer_unwatch_purges_buffered_coalescer_delta() {
   let cfg = DebounceConfig::new()
     .with_quiet_window(Duration::from_secs(3600))
     .with_max_hold(Duration::from_secs(7200));
-  let mut h = Harness::with_coalescer(Some(Coalescer::new(cfg)));
+  let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(cfg))));
   let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
 
   // A pre-unwatch delta buffers in the coalescer (long window → admit runs, nothing drains).
@@ -4426,8 +4671,9 @@ async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() 
     .reconcile_watch(
       &key("/a"),
       (),
-      Interest::all(),
-      Filter::new(|_| -> bool { panic!("caller filter predicate panics inside fan-out") }),
+      WatchOptions::new().with_filter(Filter::new(|_| -> bool {
+        panic!("caller filter predicate panics inside fan-out")
+      })),
     )
     .await
     .expect("watch /a"); // root handle 1
@@ -4734,6 +4980,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     last_flush_visited: 0,
     #[cfg(test)]
     test_pre_cut_claims: Vec::new(),
+    debounce: None,
     coalescer: None,
     cleanup_tx,
     cleanup_rx,
@@ -4748,7 +4995,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
 
   // Watch /a → handle 1, its transport watch installed and live.
   let sub = owner
-    .reconcile_watch(&key("/a"), (), Interest::all(), Filter::all())
+    .reconcile_watch(&key("/a"), (), WatchOptions::new())
     .await
     .expect("watch /a");
   assert_eq!(
@@ -4892,6 +5139,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     last_flush_visited: 0,
     #[cfg(test)]
     test_pre_cut_claims: Vec::new(),
+    debounce: None,
     coalescer: None,
     cleanup_tx,
     cleanup_rx,
@@ -4912,8 +5160,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     .try_send(super::Command::Watch {
       key: key("/a"),
       value: (),
-      interest: Interest::all(),
-      filter: Filter::all(),
+      options: WatchOptions::new(),
       reply,
     })
     .expect("enqueue the Watch");
@@ -4984,8 +5231,7 @@ async fn unpolled_grant_across_source_drain_teardown_is_poisoned() {
     .try_send(super::Command::Watch {
       key: key("/a"),
       value: (),
-      interest: Interest::all(),
-      filter: Filter::all(),
+      options: WatchOptions::new(),
       reply,
     })
     .expect("enqueue the Watch");
@@ -5224,15 +5470,15 @@ async fn parked_rescan_delivers_under_sustained_command_load() {
   // Two claimed narrow watches, then the widen: two re-point Rescans — one fills bounded(1), the
   // other parks as overflow debt for a CLAIMED subscription.
   let narrow_b = w
-    .watch(key("/a/b"), (), Interest::all(), Filter::all())
+    .watch(key("/a/b"), (), WatchOptions::new())
     .await
     .expect("watch /a/b");
   let narrow_c = w
-    .watch(key("/a/c"), (), Interest::all(), Filter::all())
+    .watch(key("/a/c"), (), WatchOptions::new())
     .await
     .expect("watch /a/c");
   let _wide = w
-    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .watch(key("/a"), (), WatchOptions::new())
     .await
     .expect("widen to /a");
 
@@ -5248,8 +5494,7 @@ async fn parked_rescan_delivers_under_sustained_command_load() {
           .try_send(super::Command::Watch {
             key: key("/flood"),
             value: (),
-            interest: Interest::all(),
-            filter: Filter::all(),
+            options: WatchOptions::new(),
             reply,
           })
           .is_err()
@@ -5294,8 +5539,7 @@ fn spawn_command_flood(
           .try_send(super::Command::Watch {
             key: key("/flood"),
             value: (),
-            interest: Interest::all(),
-            filter: Filter::all(),
+            options: WatchOptions::new(),
             reply,
           })
           .is_err()
@@ -5415,7 +5659,7 @@ async fn raw_source_event_delivers_under_sustained_command_load() {
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
     super::Tributaries::with_source(source, TributariesOptions::new());
   let sub = w
-    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .watch(key("/a"), (), WatchOptions::new())
     .await
     .expect("watch /a"); // handle 1
 
@@ -5484,7 +5728,7 @@ async fn due_debounced_event_drains_under_sustained_command_load() {
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
     super::Tributaries::with_source(source, TributariesOptions::new().debounce(cfg));
   let sub = w
-    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .watch(key("/a"), (), WatchOptions::new())
     .await
     .expect("watch /a"); // handle 1
 
@@ -5527,7 +5771,7 @@ async fn close_is_not_starved_by_a_prefilled_command_backlog_and_flood() {
 
   // A live claimed subscription, so the owner is genuinely running with real state (the finding's
   // "owner/source kept alive while shutdown is requested").
-  w.watch(key("/a"), (), Interest::all(), Filter::all())
+  w.watch(key("/a"), (), WatchOptions::new())
     .await
     .expect("watch /a");
 
@@ -5542,8 +5786,7 @@ async fn close_is_not_starved_by_a_prefilled_command_backlog_and_flood() {
       .try_send(super::Command::Watch {
         key: key("/backlog"),
         value: (),
-        interest: Interest::all(),
-        filter: Filter::all(),
+        options: WatchOptions::new(),
         reply,
       })
       .expect("prefill the command backlog");

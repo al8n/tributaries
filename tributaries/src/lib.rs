@@ -19,17 +19,20 @@
 //!
 //! # Quick start
 //!
-//! Watch possibly-overlapping paths — each with its own [`Filter`] — optionally settle
-//! bursts with a [`DebounceConfig`], and pull the merged, attributed stream. Each event
-//! is retagged with the [`Subscription`] it belongs to, so one change under an overlap
-//! is delivered to every covering subscription under its own id.
+//! Watch possibly-overlapping paths — each under its own per-watch [`WatchOptions`]
+//! (interest, [`Filter`], [`Debounce`] posture) — optionally settle bursts with a
+//! [`DebounceConfig`], and pull the merged, attributed stream. Each event is retagged
+//! with the [`Subscription`] it belongs to, so one change under an overlap is delivered
+//! to every covering subscription under its own id.
 //!
 //! ```no_run
 //! # #[cfg(feature = "tokio")]
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::{ffi::OsString, path::Path};
 //!
-//! use tributaries::{DebounceConfig, Filter, Interest, TokioTributaries, TributariesOptions};
+//! use tributaries::{
+//!   Debounce, DebounceConfig, Filter, TokioTributaries, TributariesOptions, WatchOptions,
+//! };
 //!
 //! // The local-fs source keys on a path's components (the caller supplies canonical paths).
 //! fn key(path: &str) -> Vec<OsString> {
@@ -47,20 +50,30 @@
 //! let sources = Filter::new(|event| event.path().extension().is_some_and(|x| x == "rs"));
 //! let handle = sources.clone(); // shares the swappable slot with the one `watch` holds
 //! let project = tributaries
-//!   .watch(key("/path/to/project"), (), Interest::all(), sources)
+//!   .watch(
+//!     key("/path/to/project"),
+//!     (),
+//!     WatchOptions::new().with_filter(sources),
+//!   )
 //!   .await?;
 //!
 //! // An OVERLAPPING watch of a subtree — accepted, never `Overlaps`: it is subsumed
 //! // onto the same kernel watch, and a change under it fans out to both subscriptions.
-//! let tests = tributaries
-//!   .watch(key("/path/to/project/tests"), (), Interest::all(), Filter::all())
+//! // Its per-watch Debounce::Off overrides the global debounce: raw pass-through for
+//! // this subscription while `project` keeps settling.
+//! let logs = tributaries
+//!   .watch(
+//!     key("/path/to/project/logs"),
+//!     (),
+//!     WatchOptions::new().with_debounce(Debounce::Off),
+//!   )
 //!   .await?;
 //!
 //! // Re-scope what `project` delivers at any time — no re-watch:
 //! handle.swap(|_| true);
 //!
 //! while let Some(event) = tributaries.next().await {
-//!   // `event.subscription()` is `project` or `tests`; a `Rescan` reaches every
+//!   // `event.subscription()` is `project` or `logs`; a `Rescan` reaches every
 //!   // subscriber of the affected root regardless of filter (coverage loss).
 //!   println!(
 //!     "{} [{}]: {}",
@@ -68,7 +81,7 @@
 //!     event.subscription(),
 //!     event.path().display()
 //!   );
-//!   let _ = (project, tests);
+//!   let _ = (project, logs);
 //! }
 //! # Ok(())
 //! # }
@@ -92,8 +105,13 @@
 //! state machine: it buffers attributed events per `(subscription, path)` and
 //! collapses a burst to a single emission on a settle timer, while treating a
 //! [`Moved`](EventKind::Moved) atomically and flushing on a
-//! [`Rescan`](EventKind::Rescan) so coverage loss is never held back or lost. Absent a
-//! `DebounceConfig`, events pass through untouched at zero cost.
+//! [`Rescan`](EventKind::Rescan) so coverage loss is never held back or lost.
+//!
+//! The global config is a per-subscription **default**: each watch can override its own
+//! posture with a [`Debounce`] on its [`WatchOptions`] — [`Debounce::Off`] for raw
+//! pass-through while siblings settle, [`Debounce::Custom`] for its own windows (which
+//! also *enables* settling when the global debounce is off). Absent a `DebounceConfig`
+//! and absent any `Custom` override, events pass through untouched at zero cost.
 
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -119,7 +137,7 @@ pub use error::{BuildError, CloseError, FaultKind, SourceFault, UnwatchError, Wa
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
 pub use interest::Interest;
-pub use options::{DebounceConfig, TributariesOptions};
+pub use options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions};
 pub use source::{Armed, FsSource, Source, SourceEvent};
 pub use subscription::{InstanceId, Subscription};
 pub use view::{Snapshot, WatchView};
