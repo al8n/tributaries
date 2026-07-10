@@ -132,6 +132,13 @@ impl<V> CoverEntry<V> {
 
   /// Drops `sub` from this key (a no-op if absent), leaving every other subscription sharing it
   /// — so attribution falls back to a surviving owner rather than to nothing.
+  /// Drops every subscription in `departing` in ONE pass — the batch-retirement
+  /// primitive (Codex R60): a cohort retire clones this entry once and retains
+  /// through it once, instead of clone-per-subscriber.
+  fn remove_all(&mut self, departing: &std::collections::HashSet<Subscription>) {
+    self.subs.retain(|(sub, _)| !departing.contains(sub));
+  }
+
   fn remove(&mut self, sub: Subscription) {
     self.subs.retain(|(s, _)| *s != sub);
   }
@@ -949,13 +956,37 @@ where
       .remove(root_key.as_slice())
       .expect("force-removed root record");
     self.index = txn.commit();
+    // Free the dead root's subscribers from the side table AND the coverage plane, so a
+    // retired root's keys stop answering `is_watched` true (they cover nothing now).
+    // BATCHED per cover key (Codex R60): the per-subscriber `cover_remove` cloned the
+    // whole same-key cohort entry once per departing member — O(cohort squared) deep
+    // value clones plus a txn commit each. Grouping the departures by key makes the
+    // conversion genuinely linear: one entry clone, one retain pass, and one commit
+    // for the whole root.
+    let mut departing_by_key: std::collections::BTreeMap<
+      Vec<C>,
+      std::collections::HashSet<Subscription>,
+    > = std::collections::BTreeMap::new();
     for &sub in &record.subscribers {
-      // Free the dead root's subscribers from the side table AND the coverage plane, so a
-      // retired root's keys stop answering `is_watched` true (they cover nothing now).
       if let Some(sub_record) = self.subs.remove(&sub) {
-        self.cover_remove(sub, &sub_record.key);
+        departing_by_key
+          .entry(sub_record.key)
+          .or_default()
+          .insert(sub);
       }
     }
+    let mut txn = self.covers.txn();
+    for (key, departing) in departing_by_key {
+      if let Some(mut entry) = txn.get(&key).cloned() {
+        entry.remove_all(&departing);
+        if entry.is_empty() {
+          txn.remove(&key);
+        } else {
+          txn.insert(key.as_slice(), entry);
+        }
+      }
+    }
+    self.covers = txn.commit();
     self.publish();
     record.subscribers
   }
