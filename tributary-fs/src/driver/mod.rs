@@ -275,7 +275,7 @@ pub(crate) enum Command {
   /// effects are then fire-and-forget, like any other descending disarm/arm).
   // Constructed only by the crate-internal `Watcher::{set_cover, request_set_cover}` pair,
   // which no non-test code calls until the effect-completion follow-up.
-  #[cfg_attr(not(test), allow(dead_code))]
+  #[cfg_attr(not(all(test, feature = "tokio")), allow(dead_code))]
   SetCover {
     /// The scope to reconcile.
     scope: ScopeId,
