@@ -2402,6 +2402,9 @@ where
     // arm just disables itself and the drain keeps going until the command channel closes or the debt
     // is delivered.
     let mut close_open = true;
+    // Disabled once the atomic cut closes the cleanup channel (Codex R62): a closed,
+    // drained channel's recv errors immediately — an enabled arm would spin the select.
+    let mut cleanup_open = true;
     loop {
       // The dedicated shutdown signal is checked FIRST, non-blockingly, before the cleanup drain and
       // the owed pass (Codex R27): a close interrupts the drain without waiting behind the (possibly
@@ -2440,9 +2443,22 @@ where
         // whatever landed BEFORE the cut (async_channel keeps queued messages receivable after
         // close) and run one final owed pass so a pre-cut claim still gets its Rescan delivered.
         self.cleanup_rx.close();
+        cleanup_open = false;
         self.drain_pending_cleanup();
         self.drain_owed_once();
-        return None;
+        // A claim that RACED the cut — sent successfully after the emptiness observation
+        // above but before the close — was drained just now and may have re-armed
+        // OFFERABLE debt against a full event channel, where the single best-effort pass
+        // above could not deliver it (Codex R62: its caller holds a live Ok subscription;
+        // returning here would strand its terminal Rescan forever). Exit only once no
+        // offerable debt remains (or nobody is left listening); otherwise stay in the
+        // drain loop — the cut is done, so no NEW claims can land (they poison), the
+        // cleanup channel is closed-and-drained, and the retry machinery below delivers
+        // the raced debt as the consumer drains, exactly like any other owed Rescan.
+        if self.needs_rescan.is_empty() || self.events.is_closed() {
+          return None;
+        }
+        continue;
       }
       let sleep = R::sleep(RETRY).fuse();
       futures_util::pin_mut!(sleep);
@@ -2462,7 +2478,13 @@ where
       // when a grant resolves mid-retry so its `Cleanup::Claim` lifts suppression / `Cleanup::DropOrphan`
       // purges before the next owed pass. Never errors while the owner lives (it holds `cleanup_tx`).
       let cleanup_rx = &self.cleanup_rx;
-      let cleanup_arm = async move { cleanup_rx.recv().await };
+      let cleanup_arm = async move {
+        if cleanup_open {
+          cleanup_rx.recv().await.ok()
+        } else {
+          futures_util::future::pending::<Option<Cleanup>>().await
+        }
+      };
       futures_util::select_biased! {
         maybe_reply = close_arm.fuse() => match maybe_reply {
           // A close interrupted the drain: hand its reply back so the caller acks it — `close()`
@@ -2472,13 +2494,14 @@ where
           // own `Err` (below) remains the dropped-handles stop signal.
           None => close_open = false,
         },
-        cleanup = cleanup_arm.fuse() => {
+        cleanup = cleanup_arm.fuse() => match cleanup {
           // A grant resolution mid-drain: apply it and loop (the next iteration's top drain handles any
-          // more). Never `Err` while the owner lives.
-          if let Ok(cleanup) = cleanup {
-            self.apply_cleanup(cleanup);
-          }
-        }
+          // more).
+          Some(cleanup) => self.apply_cleanup(cleanup),
+          // Closed (the post-cut iterations, Codex R62): disable the arm — the cut already drained
+          // every pre-cut claim, and later grants poison at their own try_send.
+          None => cleanup_open = false,
+        },
         cmd = self.commands.recv().fuse() => match cmd {
           // A queued PUBLIC command mid-drain — a `watch`/`unwatch` — failed fast (the owner is
           // quiescing). A close never arrives here (its own arm above); grant resolution never arrives

@@ -2132,6 +2132,79 @@ async fn unclaimed_retired_cohort_costs_the_flush_nothing() {
   );
 }
 
+/// Codex R62: a `Cleanup::Claim` that RACES the source-drain's atomic cut — enqueued
+/// after the emptiness observation, drained after the cut — re-arms OFFERABLE debt that
+/// a full event channel cannot take in the final best-effort pass. The drain must NOT
+/// return then (the claimer holds a live Ok subscription; returning strands its
+/// terminal Rescan forever): it stays in the retry loop and delivers once the consumer
+/// drains the plug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raced_pre_cut_claim_is_delivered_not_stranded() {
+  let mut h = Harness::bounded(1);
+  // Plug the single event slot with an unrelated claimed sub's owed Rescan.
+  let plug = h.watch("/plug", Interest::all()).await.expect("watch plug");
+  h.owner.epochs.stamp(plug, Epoch::new(1));
+  h.owner.source.kill_root(1);
+  h.owner.retire_root_with_terminal_rescan(1);
+  h.owner.flush_pending_rescans(); // the slot now holds plug's terminal Rescan
+
+  // The racing sub: unclaimed grant, terminal-retired — its debt sits SUPPRESSED, so
+  // the drain's emptiness predicate holds (offerable empty, cleanup empty)…
+  let racer = h
+    .watch("/racer", Interest::all())
+    .await
+    .expect("watch racer");
+  h.owner.unclaimed.insert(racer);
+  h.owner.source.kill_root(2);
+  h.owner.retire_root_with_terminal_rescan(2);
+  assert!(h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.contains_key(&racer));
+
+  // …and the claim is ALREADY QUEUED when the drain runs: the drain's first iteration
+  // observes cleanup non-empty and drains it pre-cut — but an equivalent claim landing
+  // between the observation and the cut takes exactly the same post-drain path, with
+  // the event channel FULL so the final pass cannot deliver. Either way the debt is
+  // offerable-against-a-full-channel at the exit decision — the R62 window.
+  h.owner
+    .cleanup_tx
+    .try_send(super::Cleanup::Claim(racer))
+    .expect("queue the racing claim");
+
+  let events = h.events.clone();
+  let drain = tokio::spawn(async move {
+    // Drive the drain to completion on its own task; it must not return while the
+    // racer's offerable debt is undeliverable.
+    h.owner.drain_owed_before_shutdown().await;
+    h
+  });
+  tokio::time::sleep(Duration::from_millis(300)).await;
+  assert!(
+    !drain.is_finished(),
+    "the drain stays in the retry loop while the raced claim's Rescan cannot be \
+     delivered (Codex R62) — returning here would strand a live Ok subscription"
+  );
+
+  // The consumer drains the plug; the retry tick then delivers the racer's Rescan and
+  // the drain exits.
+  let first = tokio::time::timeout(Duration::from_secs(5), events.recv())
+    .await
+    .expect("recv settles")
+    .expect("plug Rescan");
+  assert_eq!(first.subscription(), plug);
+  let second = tokio::time::timeout(Duration::from_secs(10), events.recv())
+    .await
+    .expect("recv settles")
+    .expect("racer Rescan");
+  assert!(
+    second.subscription() == racer && second.is_rescan(),
+    "the raced claim's terminal Rescan IS delivered (Codex R62)"
+  );
+  let h = tokio::time::timeout(Duration::from_secs(5), drain)
+    .await
+    .expect("the drain returns once the raced debt delivered")
+    .expect("drain task");
+  assert!(h.owner.needs_rescan.is_empty(), "nothing stranded");
+}
+
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
 /// interest bit (design §5) — directly constructible now that the umbrella owns the
 /// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`
