@@ -35,7 +35,7 @@ use std::{
 use tempfile::TempDir;
 use tributaries::{
   Debounce, DebounceConfig, Event, Filter, Subscription, TokioTributaries, TributariesOptions,
-  WatchOptions,
+  WatchOptions, WatcherOptions,
 };
 
 /// The concrete delivered-event type of the local-fs driver (`C = OsString`, `V = ()`).
@@ -76,9 +76,9 @@ fn scratch(prefix: &str) -> (TempDir, PathBuf) {
   (dir, canonical)
 }
 
-/// A watcher with the given options.
+/// A watcher with the given umbrella options (default fs-watcher transport options).
 fn watcher(options: TributariesOptions) -> TokioTributaries {
-  TokioTributaries::new(options).expect("build watcher")
+  TokioTributaries::new(WatcherOptions::new(), options).expect("build watcher")
 }
 
 /// Waits until an event satisfying `pred` arrives, or the deadline lapses, returning it.

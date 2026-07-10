@@ -8,7 +8,7 @@ use std::{
 };
 
 use agnostic_lite::tokio::TokioRuntime;
-use tributary_fs::{Epoch, Location};
+use tributary_proto::{Epoch, Location};
 
 use super::{CONTROL_CAPACITY, Demux, Lane};
 use crate::{

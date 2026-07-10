@@ -3,7 +3,7 @@
 //!
 //! This is the control plane of the umbrella crate: a pure state machine that folds
 //! possibly-**overlapping** caller subscriptions into the pairwise-disjoint roots the
-//! source ([`tributary-fs`](tributary_fs) for 0.1.0) requires. It performs **no** I/O,
+//! source (`tributary-fs` for 0.1.0) requires. It performs **no** I/O,
 //! reads no clock, and knows nothing of any runtime — it is exhaustively
 //! property-testable over keys and an abstract handle alone.
 //!
@@ -352,8 +352,8 @@ struct PendingWatch<C, V> {
 /// The sans-I/O overlap-subsumption engine, generic over the key component `C`, the
 /// caller value `V`, and the armed-root handle `H`.
 ///
-/// `H` is testable with a trivial handle type (e.g. `u32`); the driver instantiates
-/// it at `H = tributary_fs::RootHandle`. Maintains the authoritative immutable
+/// `H` is testable with a trivial handle type (e.g. `u32`); the fs driver instantiates
+/// it at the fs binding's `RootHandle`. Maintains the authoritative immutable
 /// [`sync::Radix`](Radix) (`key -> record`, the subsumption / ancestor plane), a
 /// handle → key reverse index (the O(1) per-root lookup), a side table from each live
 /// subscription to the root it rides, and the shared publication slot every

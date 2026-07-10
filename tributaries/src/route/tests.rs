@@ -37,8 +37,8 @@ struct Delivered {
 
 /// A minimal stand-in for a raw event: routing reads its endpoint keys and whether it
 /// is a `Rescan`. Its delivery records the subscriber and which projection it got, so a
-/// test asserts the covered set **and** each move decomposition without touching the
-/// private `tributary_fs::Event` constructor. A `Some(from)` makes it a move whose
+/// test asserts the covered set **and** each move decomposition without touching any
+/// real source's private event constructor. A `Some(from)` makes it a move whose
 /// destination is `key`.
 struct FakeEvent {
   key: Vec<OsString>,

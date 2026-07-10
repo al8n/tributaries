@@ -20,9 +20,9 @@
 //!
 //! All I/O lives in the [`Source`](crate::Source) the owner drives; the engines it
 //! orchestrates (subsumption, routing, epoch rebasing, coalescing) are pure and generic
-//! over the key component `C` and caller value `V`. The pure-fs convenience fixes
-//! `C = OsString`, `V = ()`, and a [`FsSource`] over one [`tributary_fs::Watcher`] (the
-//! [`TokioTributaries`] / [`SmolTributaries`] aliases).
+//! over the key component `C` and caller value `V`. The pure-fs convenience — behind
+//! the default `fs` feature — fixes `C = OsString`, `V = ()`, and a [`FsSource`] over
+//! one `tributary-fs` watcher (the [`TokioTributaries`] / [`SmolTributaries`] aliases).
 
 use std::{
   collections::{BTreeMap, HashMap},
@@ -35,20 +35,26 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use futures_util::FutureExt;
-use tributary_fs::{Epoch, RootHandle};
+use tributary_proto::Epoch;
+
+#[cfg(feature = "fs")]
+use tributary_fs::{RootHandle, WatcherOptions};
 
 use crate::{
   coalesce::Coalescer,
-  error::{BuildError, CloseError, UnwatchError, WatchError},
+  error::{CloseError, UnwatchError, WatchError},
   event::Event,
   filter::{Filter, FilterInput},
   options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
   route::RoutableEvent,
-  source::{Armed, FsSource, LocalSource, Source, SourceEvent},
+  source::{Armed, LocalSource, Source, SourceEvent},
   subscription::Subscription,
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
   view::WatchView,
 };
+
+#[cfg(feature = "fs")]
+use crate::{error::BuildError, source::FsSource};
 
 use self::epoch::EpochLedger;
 
@@ -240,15 +246,16 @@ impl Drop for WatchGrant {
 /// A cheap `Clone` **handle** over an owned-task actor (design driver-golden doc): a
 /// command mailbox to the owner task, a separate event stream the owner pushes to, and a
 /// concurrent-read [`WatchView`]. It is generic over the key component `C`, the caller
-/// value `V`, the runtime `R`, and the source's armed-root handle `H` (defaulting to the
-/// filesystem [`RootHandle`]). Build one over any [`Source`] with
-/// [`with_source`](Self::with_source), or use the pure-fs [`TokioTributaries`] /
-/// [`SmolTributaries`] aliases and their [`new`](Self::new) constructor.
+/// value `V`, the runtime `R`, and the source's armed-root handle `H` (inferred from the
+/// source at construction; the fs binding's aliases carry its `RootHandle`). Build one
+/// over any [`Source`] with [`with_source`](Self::with_source), or — with the default
+/// `fs` feature — use the pure-fs `TokioTributaries` / `SmolTributaries` aliases and
+/// their `new` constructor.
 ///
 /// # Watching means "changes from now on"
 ///
-/// Like the layer below, registering a subscription delivers no initial inventory —
-/// start the watch, then crawl. See [`tributary_fs::Watcher`].
+/// Like the layer below (the `tributary-fs` watcher), registering a subscription
+/// delivers no initial inventory — start the watch, then crawl.
 ///
 /// # Loss is never silent
 ///
@@ -263,7 +270,7 @@ impl Drop for WatchGrant {
 /// [`view`](Self::view) hands out a cheap `Clone` [`WatchView`] any thread reads
 /// wait-free for membership (`is_watched`) and attribution (`resolve`), reflecting the
 /// last committed watch-set (design §5).
-pub struct Tributaries<C, V, R: RuntimeLite, H = RootHandle> {
+pub struct Tributaries<C, V, R: RuntimeLite, H> {
   /// The control plane: `watch`/`unwatch` send a [`Command`] here and await its `oneshot`
   /// reply. Dropping every handle clone closes this channel, so the owner's `recv` errors and
   /// it tears down (design driver-golden doc, Close/Drop). `close` does **not** ride here — see
@@ -274,7 +281,7 @@ pub struct Tributaries<C, V, R: RuntimeLite, H = RootHandle> {
   /// behind the `Watch`/`Unwatch` backlog. It is checked at the TOP priority in every place
   /// the owner selects (the [`run`] loop and the source-drain teardown), both non-blockingly each
   /// iteration and as the first `select!` arm. Bounded at one slot — the **first** close to reach the
-  /// owner wins; any racing close resolves to [`Stopped`](tributary_fs::CloseError::Stopped) once the
+  /// owner wins; any racing close resolves to [`Stopped`](CloseError::Stopped) once the
   /// owner is gone (the channel closed), mirroring the command-send-failure mapping.
   closes: async_channel::Sender<CloseReply>,
   /// The data plane: [`next`](Self::next) drains attributed, epoch-stamped, coalesced
@@ -333,12 +340,12 @@ where
   /// Enable the opt-in settle/debounce coalescer (design §6) by setting a
   /// [`DebounceConfig`](crate::DebounceConfig) on `options`
   /// ([`TributariesOptions::debounce`]); absent it,
-  /// events pass through untouched. For a pre-built source only the debounce policy is
-  /// read (the source owns its own transport configuration), so the watcher options
-  /// embedded in `options` are unused here.
+  /// events pass through untouched. `options` carries purely umbrella knobs (channel
+  /// capacities, debounce); the pre-built source owns its own transport configuration.
   ///
-  /// This is the generic construction path; the pure-fs [`new`](Self::new) builds a
-  /// [`FsSource`] and delegates here. For caller-owned spawning — structured
+  /// This is the generic construction path; the pure-fs `new` (under the
+  /// default `fs` feature) builds a `FsSource` and delegates here. For caller-owned
+  /// spawning — structured
   /// concurrency, a `LocalSet`, or an executor outside `agnostic-lite` — use
   /// [`parts`](Self::parts) and spawn the returned driver future yourself; for a
   /// thread-local source that cannot promise `Send` futures (a [`LocalSource`]
@@ -441,9 +448,7 @@ where
   where
     S: LocalSource<C, Handle = H>,
   {
-    // The source is already constructed, so its watcher options no longer apply here; the
-    // channel capacities and the debounce policy are what the owner still wires up.
-    let (_watcher_options, event_capacity, command_capacity, debounce) = options.into_parts();
+    let (event_capacity, command_capacity, debounce) = options.into_parts();
     let subsumer = Subsumer::new();
     let view = subsumer.view();
     // Bounded (design backpressure doc): the owner **never awaits** this channel — every
@@ -731,22 +736,24 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   }
 }
 
+#[cfg(feature = "fs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
 impl<R: RuntimeLite> Tributaries<OsString, (), R, RootHandle> {
   /// Builds a pure-filesystem watcher over one `tributary-fs` watcher, spawning its
   /// owned-task owner on `R` — the convenience mirroring the layer below's
   /// constructor.
   ///
-  /// Enable the opt-in settle/debounce coalescer (design §6) with a
-  /// [`DebounceConfig`](crate::DebounceConfig) on `options`
-  /// ([`TributariesOptions::debounce`]); absent it, events pass through
+  /// `watcher` configures the underlying filesystem watcher (its transport knobs);
+  /// `options` carries the umbrella's own knobs. Enable the opt-in settle/debounce
+  /// coalescer (design §6) with a [`DebounceConfig`](crate::DebounceConfig) on
+  /// `options` ([`TributariesOptions::debounce`]); absent it, events pass through
   /// untouched.
   ///
   /// # Errors
   ///
   /// [`BuildError::Source`] when the underlying `tributary-fs` watcher cannot be built.
-  pub fn new(options: impl Into<TributariesOptions>) -> Result<Self, BuildError> {
-    let options = options.into();
-    let source = FsSource::<R>::new(options.watcher().clone())?;
+  pub fn new(watcher: WatcherOptions, options: TributariesOptions) -> Result<Self, BuildError> {
+    let source = FsSource::<R>::new(watcher)?;
     Ok(Self::with_source(source, options))
   }
 }
@@ -1398,8 +1405,8 @@ where
   /// leaves the affected subscriptions uncovered with a dominating Rescan (no silent
   /// loss), to be re-covered by a later reconcile.
   ///
-  /// **Roots are always armed by the source's own policy** ([`FsSource`] uses the
-  /// fs-level [`Interest::all`](tributary_fs::Interest::all), design §4): the caller's
+  /// **Roots are always armed by the source's own policy** ([`FsSource`] arms at the
+  /// fs level's widest all-interest mask, design §4): the caller's
   /// interest (from its [`WatchOptions`]) is recorded on the subscription as a fan-out
   /// gate, never passed to the arm. The options' filter and debounce posture are
   /// registered adjacently at commit.
@@ -1711,7 +1718,7 @@ where
   /// A successful [`Source::arm`] does **not** by itself guarantee liveness: a source may
   /// report an arm as succeeded for a root it has **already forgotten** — one removed between
   /// the request and the arm completing ([`FsSource`] historically fell back to the requested
-  /// key when [`root_path`](tributary_fs::Watcher::root_path) was `None`). Committing such a
+  /// key when the fs watcher's `root_path` was `None`). Committing such a
   /// dead-on-arrival handle publishes the key as watched yet backs it with **no live watch**:
   /// changes would rely on a later terminal event instead of being streamed. So after the arm
   /// this synchronously validates the handle through the same out-of-band [`Source::root_key`]
@@ -1727,7 +1734,7 @@ where
   /// per-site live-index checks AND additionally catches reuse of a handle already removed from the
   /// live index by unwatch or terminal retirement (see `observed_handles`).
   ///
-  /// An [`Overlaps`](tributary_fs::WatchRootError::Overlaps) from a conforming source is now
+  /// An overlap rejection (the fs binding's `Overlaps`) from a conforming source is now
   /// **unreachable**, so there is no overlap-retry here. [`Source::disarm`]'s
   /// release-before-subsequent-arm ordering (contract clause 2) guarantees every release the
   /// umbrella already requested — a widen's subsumed roots, or a just-orphaned root's — is applied
@@ -2807,11 +2814,11 @@ fn canonical_race() -> WatchError {
 /// `Send`, so it can be spawned via
 /// [`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach) on a multi-threaded
 /// executor. Never invoked — it only has to type-check.
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "fs", feature = "tokio"))]
 #[allow(dead_code)]
 fn assert_fs_owner_send() {
   fn is_send<T: Send>() {}
-  is_send::<Tributaries<OsString, (), agnostic_lite::tokio::TokioRuntime>>();
+  is_send::<Tributaries<OsString, (), agnostic_lite::tokio::TokioRuntime, RootHandle>>();
   fn owner_future_is_send(
     owner: Owner<
       OsString,
@@ -2901,11 +2908,12 @@ fn assert_rc_local_source_constructs<R: RuntimeLite>() {
 }
 
 /// A [`Tributaries`] driven by the tokio runtime, over the local filesystem.
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-pub type TokioTributaries = Tributaries<OsString, (), agnostic_lite::tokio::TokioRuntime>;
+#[cfg(all(feature = "fs", feature = "tokio"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fs", feature = "tokio"))))]
+pub type TokioTributaries =
+  Tributaries<OsString, (), agnostic_lite::tokio::TokioRuntime, RootHandle>;
 
 /// A [`Tributaries`] driven by the smol runtime, over the local filesystem.
-#[cfg(feature = "smol")]
-#[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
-pub type SmolTributaries = Tributaries<OsString, (), agnostic_lite::smol::SmolRuntime>;
+#[cfg(all(feature = "fs", feature = "smol"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fs", feature = "smol"))))]
+pub type SmolTributaries = Tributaries<OsString, (), agnostic_lite::smol::SmolRuntime, RootHandle>;

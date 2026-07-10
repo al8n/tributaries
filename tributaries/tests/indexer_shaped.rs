@@ -39,11 +39,17 @@ use std::{
 use agnostic_lite::{RuntimeLite, tokio::TokioRuntime};
 use tempfile::TempDir;
 use tributaries::{
-  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, RootHandle, Source, SourceEvent,
-  SourceFault, Subscription, Tributaries, TributariesOptions, WatchError, WatchOptions, WatchView,
+  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, Source, SourceEvent, SourceFault,
+  Subscription, Tributaries, TributariesOptions, WatchError, WatchOptions, WatchView,
+};
+// The fs types come from the `tributary-fs` DEV-dependency, not the umbrella: this
+// suite is the custom-source proof, compiled and run with the umbrella's `fs` feature
+// OFF (its test target requires only `tokio`), exactly as a downstream crate binding
+// its own transport would depend on the stack.
+use tributary_fs::{
+  EventKind as FsEventKind, Interest as FsInterest, RootHandle, WatchRootError, Watcher,
   WatcherOptions,
 };
-use tributary_fs::{EventKind as FsEventKind, Interest as FsInterest, WatchRootError, Watcher};
 
 /// The custom, **non-`OsString`** key component: an indexer-shaped location coordinate.
 ///
@@ -83,8 +89,8 @@ struct IndexerSource<R: RuntimeLite> {
   pending_set: HashSet<RootHandle>,
 }
 
-/// Mirror of the fs source's [`OPPORTUNISTIC_RELEASES`](../src/source/mod.rs): the oldest few queued
-/// releases each `arm` applies up front (bounded, keeps clause 5 eventual).
+/// Mirror of the fs source's [`OPPORTUNISTIC_RELEASE_HANDOFFS`](../src/source/fs/mod.rs): the oldest
+/// few queued releases each `arm` applies up front (bounded, keeps clause 5 eventual).
 const OPPORTUNISTIC_RELEASES: usize = 2;
 
 /// Maps a raw fs watch-root error into the umbrella's neutral error vocabulary at this
@@ -311,8 +317,9 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
 }
 
 /// The generic driver instantiated at the indexer coordinate: custom key `Comp`, caller
-/// value `Loc`, tokio runtime, fs [`RootHandle`].
-type Indexer = Tributaries<Comp, Loc, TokioRuntime>;
+/// value `Loc`, tokio runtime, fs [`RootHandle`] (spelled explicitly — the umbrella's
+/// generic struct carries no fs-flavored default for `H`).
+type Indexer = Tributaries<Comp, Loc, TokioRuntime, RootHandle>;
 
 /// Generous ceiling for one expected observation; CI runners (macOS especially) are slow and
 /// FSEvents batches on its own latency timer.

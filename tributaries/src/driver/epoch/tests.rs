@@ -1,8 +1,7 @@
 use core::num::NonZeroU64;
 use std::{ffi::OsString, path::Path};
 
-use tributary_fs::Epoch;
-use tributary_proto::ScopeId;
+use tributary_proto::{Epoch, ScopeId};
 
 use super::EpochLedger;
 use crate::{route::RoutableEvent, subscription::Subscription};
@@ -16,7 +15,7 @@ fn key(path: &str) -> Vec<OsString> {
 }
 
 /// A minimal stand-in for a raw event — the same shape `route::tests` uses, so the
-/// ledger's fan-out + stamp is exercised without the private `tributary_fs::Event`
+/// ledger's fan-out + stamp is exercised without any real source's private event
 /// constructor. Routing reads its endpoint keys and whether it is a `Rescan`; its
 /// per-subscriber delivery is the [`Subscription`] paired with which projection it got,
 /// which the ledger then stamps — so a move test can confirm every projection of one
