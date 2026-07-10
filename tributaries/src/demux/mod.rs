@@ -112,10 +112,14 @@ enum Control<C, V> {
 ///
 /// # Dropped lanes release their subscription back to unclaimed
 ///
-/// A dropped [`Lane`] sends a best-effort release to the routing task, and a delivery
+/// A dropped [`Lane`] sends a best-effort release to the routing task, a delivery
 /// that observes the dropped receiver reclaims the slot on the spot (recovering that
-/// very event) — either way the entry is REMOVED, so the lane table is bounded by
-/// *concurrently live* lanes, never by lifetime registrations (Codex R49). From the
+/// very event), and — the structural backstop — every registration first sweeps all
+/// entries whose receiver is gone before installing (registration being the table's
+/// only growth site, Codex R50; a release lost to a full control queue on an idle
+/// subscription is reclaimed at the latest by the next registration). All three paths
+/// REMOVE the entry, so the lane table is bounded by *peak-concurrent* lanes, never by
+/// lifetime registrations (Codex R49). From the
 /// release onward the subscription is unclaimed again: its late stragglers surface on
 /// the rest lane exactly like pre-registration traffic — while a lane is registered it
 /// exclusively owns its subscription's events; there is no split delivery. A consumer
@@ -219,10 +223,10 @@ impl<C, V> Drop for Lane<C, V> {
       control,
     }) = self.release.take()
     {
-      // Best-effort: a full or closed control queue skips the notice — the routing
-      // loop then reclaims the slot at its next delivery against the dropped receiver
-      // (recovering that event to rest), so a lost release costs staleness, never
-      // unboundedness.
+      // Best-effort PROMPT path: a full or closed control queue skips the notice. A
+      // lost release is still reclaimed — at the next delivery against the dropped
+      // receiver (recovering that event to rest), or structurally by the next
+      // registration's sweep (Codex R50) — so it costs staleness, never unboundedness.
       let _ = control.try_send(Control::Release { sub, generation });
     }
   }
@@ -372,8 +376,20 @@ async fn run<C, V, R, H>(
         message = control.recv().fuse() => {
           match message {
             Ok(Control::Register { sub, generation, lane }) => {
-              // Insert unconditionally: a fresh lane re-points (or re-claims) the sub.
-              lanes.insert(sub, (generation, lane));
+              // Registration is the table's ONLY growth site, so it is also the sweep
+              // site (Codex R50): purge every entry whose receiver is gone before
+              // inserting. A dropped lane's best-effort release can be LOST on a full
+              // control queue, and an idle subscription never triggers send-time
+              // reclamation — but the table cannot grow without a registration passing
+              // through here, so sweeping here bounds it by peak-concurrent lanes
+              // regardless of lost releases.
+              lanes.retain(|_, (_, sender)| !sender.is_closed());
+              // A lane whose receiver died before its registration was processed (the
+              // R50 repro: admitted, then dropped while the router was stalled) is
+              // never installed at all.
+              if !lane.is_closed() {
+                lanes.insert(sub, (generation, lane));
+              }
             }
             Ok(Control::Release { sub, generation }) => {
               // Remove only the matching generation: a stale release from a lane that
