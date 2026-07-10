@@ -423,6 +423,7 @@ where
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
+      flush_cursor: None,
       coalescer: debounce.map(Coalescer::new),
       cleanup_tx,
       cleanup_rx,
@@ -731,6 +732,11 @@ where
   /// boundary). Ordinary (non-parked) deliveries during the in-flight window are unaffected — only the
   /// durable `needs_rescan` debt is state-gated.
   unclaimed: std::collections::HashSet<Subscription>,
+  /// Where the next [`flush_pending_rescans`](Self::flush_pending_rescans) pass resumes
+  /// (Codex R59): the subscription whose offer found the channel full last pass —
+  /// round-robin fairness over a parked map that can legitimately be as large as a
+  /// caller's peak cohort, with per-pass work proportional to channel room.
+  flush_cursor: Option<Subscription>,
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of the dedicated **high-priority shutdown signal** (Codex R27): a
@@ -1287,12 +1293,15 @@ where
   /// **Roots are always armed by the source's own policy** ([`FsSource`] uses
   /// [`Interest::all`], design §4): the caller's `interest` is recorded on the
   /// subscription as a fan-out gate, never passed to the arm.
-  /// The cap on RETIRED terminal parked-`Rescan` entries (Codex R58): `needs_rescan`
+  /// The retired terminal parked-`Rescan` debt threshold (Codex R58/R59): `needs_rescan`
   /// entries whose subscription is already retired — kept so a root death parked
-  /// against a full channel is never silently lost. Watch admission is refused past
-  /// this cap ([`WatchError::RescanBacklog`]), which breaks the only loop that can
-  /// grow it (retire-and-rewatch against a full channel); generous enough that any
-  /// draining consumer never sees it.
+  /// against a full channel is never silently lost. Watch ADMISSION is refused while
+  /// the count sits at or above this ([`WatchError::RescanBacklog`]): retirement only
+  /// ever converts live state 1:1 (a batch conversion may stand above the threshold,
+  /// bounded by the caller's own peak concurrent subscriptions), and admission is the
+  /// only growth of the live-plus-retired total — so gating admission bounds the map
+  /// at peak-live-plus-threshold. Generous enough that a draining consumer never
+  /// sees it.
   const RETIRED_RESCAN_DEBT_LIMIT: usize = 1024;
 
   async fn reconcile_watch(
@@ -1302,14 +1311,18 @@ where
     interest: Interest,
     filter: Filter<C>,
   ) -> Result<Subscription, WatchError> {
-    // RETIRED-DEBT ADMISSION GATE (Codex R58): terminal parked Rescans are deliberately
-    // retained past their subscriptions' retirement (a full channel must not drop a root
-    // death), so `needs_rescan` is bounded by live subs PLUS retired terminal entries —
-    // and a retire-and-rewatch cycle against a full channel mints one retired entry per
-    // round. Each such round needs exactly one fresh watch, so refusing admission at the
-    // cap is what makes the retired debt structurally bounded: the pathological caller
-    // gets `RescanBacklog` until it drains the owed Rescans (each flush Ok/Closed frees
-    // an entry). Close is untouched — it rides its own dedicated channel.
+    // RETIRED-DEBT ADMISSION GATE (Codex R58/R59). The invariant this enforces, stated
+    // honestly: retirement CONVERTS a live subscription's state into one retired parked
+    // entry 1:1 (`force_remove_root` frees the subsumer/filter/epoch state as the entry
+    // is parked — no growth at conversion), so a single root death can convert an
+    // entire covered cohort at once and legitimately stand ABOVE this cap — bounded by
+    // the caller's own peak concurrent subscriptions, memory it was already paying for
+    // while they lived (Codex R59: the cap is not a ceiling on one batch). What the
+    // gate bounds is GROWTH: admission is the only operation that increases the
+    // live-plus-retired total, so refusing fresh watches while retired debt sits at or
+    // above the cap breaks every replenishment cycle — the map can never exceed
+    // peak-live-plus-cap. The refused caller drains the owed Rescans (each flush
+    // Ok/Closed frees an entry) and retries. Close is untouched — its own channel.
     let retired_debt = self
       .needs_rescan
       .keys()
@@ -2017,34 +2030,59 @@ where
   ///
   /// [`try_send`]: async_channel::Sender::try_send
   fn flush_pending_rescans(&mut self) {
-    let events = &self.events;
-    let unclaimed = &self.unclaimed;
-    // Once one offer reports Full the channel IS full — every later offer this pass
-    // would fail identically, so stop offering (Codex R58: a flush pass used to clone
-    // every retained entry against an already-full channel, pure heap/CPU churn).
-    let mut full = false;
-    self.needs_rescan.retain(|&sub, parked| {
-      if full {
-        return true;
+    // A full channel accepts nothing this pass — skip even the walk (Codex R58/R59:
+    // a pass used to clone, then merely traverse, every retained entry against an
+    // already-full channel; with the map legitimately as large as a caller's peak
+    // cohort, an O(map) walk per tick is real CPU).
+    if self.events.is_full() {
+      return;
+    }
+    // Round-robin resume (Codex R59): start offering AFTER the last position instead
+    // of from the front, so a large parked map is serviced fairly and each pass's
+    // work is proportional to the offers the channel actually had room for (plus the
+    // one Full probe that ends it), not to the map size.
+    let start = self.flush_cursor.take();
+    let mut order: Vec<Subscription> = match start {
+      Some(cursor) => {
+        let mut after: Vec<Subscription> = self
+          .needs_rescan
+          .range((
+            std::ops::Bound::Excluded(cursor),
+            std::ops::Bound::Unbounded,
+          ))
+          .map(|(&sub, _)| sub)
+          .collect();
+        after.extend(self.needs_rescan.range(..=cursor).map(|(&sub, _)| sub));
+        after
       }
+      None => self.needs_rescan.keys().copied().collect(),
+    };
+    for sub in order.drain(..) {
       // Suppress — retain without offering — a still-unclaimed sub's parked debt: it is owed to
       // nobody until the caller claims (`Cleanup::Claim`) or drops (`Cleanup::DropOrphan`) the
       // in-flight grant.
-      if unclaimed.contains(&sub) {
-        return true;
+      if self.unclaimed.contains(&sub) {
+        continue;
       }
+      let Some(parked) = self.needs_rescan.get(&sub) else {
+        continue;
+      };
       // Mint the owed Rescan carrying the value captured at park time (design §3): the sub or its
       // root may already be retired, so the value cannot be re-resolved here — it rides the entry.
       let mut event = Event::rescan(sub, parked.key.clone(), parked.epoch);
       event.set_value(parked.value.clone());
-      match events.try_send(event) {
-        Ok(()) | Err(async_channel::TrySendError::Closed(_)) => false,
+      match self.events.try_send(event) {
+        Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {
+          self.needs_rescan.remove(&sub);
+        }
         Err(async_channel::TrySendError::Full(_)) => {
-          full = true;
-          true
+          // The channel filled mid-pass: resume from here next tick.
+          self.flush_cursor = Some(sub);
+          return;
         }
       }
-    });
+    }
+    self.flush_cursor = None;
   }
 
   /// Resolves one raw event's root and fans it out to every covering, admitting
