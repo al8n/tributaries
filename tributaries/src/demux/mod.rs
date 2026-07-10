@@ -294,7 +294,10 @@ impl<C, V> Demux<C, V> {
   /// second lane for the same subscription re-points routing to it (the previous lane
   /// drains its buffer and ends; its later drop-release is generation-stale and
   /// ignored), and re-claims a subscription whose earlier lane was dropped or
-  /// released.
+  /// released. A registration displaces the predecessor UNCONDITIONALLY — even one
+  /// whose own receiver is already gone by processing time (registered, then dropped
+  /// before the router got to it): that claim-then-release still ends the predecessor
+  /// and reverts the subscription to unclaimed (Codex R51).
   ///
   /// A lane registered after the routing task has exited (the stream already ended)
   /// yields `None` immediately — indistinguishable from a lane at end-of-stream.
@@ -384,9 +387,16 @@ async fn run<C, V, R, H>(
               // through here, so sweeping here bounds it by peak-concurrent lanes
               // regardless of lost releases.
               lanes.retain(|_, (_, sender)| !sender.is_closed());
-              // A lane whose receiver died before its registration was processed (the
-              // R50 repro: admitted, then dropped while the router was stalled) is
-              // never installed at all.
+              // A registration ALWAYS DISPLACES the subscription's predecessor — even
+              // when its own receiver already died (admitted, then dropped while the
+              // router was stalled): claim-then-drop means the caller re-pointed and
+              // released, so the predecessor must stop routing and the subscription
+              // reverts to unclaimed (Codex R51 — skip-install alone left a live
+              // predecessor routing forever, with the queued release carrying the
+              // replacement's generation and so unable to remove it). A dead
+              // replacement is then simply not installed (the R50 repro's dead
+              // installs still never happen).
+              lanes.remove(&sub);
               if !lane.is_closed() {
                 lanes.insert(sub, (generation, lane));
               }
