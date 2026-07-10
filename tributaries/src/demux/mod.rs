@@ -13,6 +13,8 @@ use std::{
   },
 };
 
+use std::future::Future;
+
 use agnostic_lite::RuntimeLite;
 use futures_util::FutureExt;
 
@@ -256,10 +258,36 @@ impl<C, V> Demux<C, V> {
     R: RuntimeLite,
     H: Send + Sync + 'static,
   {
+    let (demux, rest, driver) = Self::parts(watcher, rest_capacity);
+    R::spawn_detach(driver);
+    (demux, rest)
+  }
+
+  /// Like [`spawn`](Self::spawn) but WITHOUT spawning: returns the control handle, the
+  /// rest lane, and the routing future for the CALLER to spawn (M2-E) — the demux twin
+  /// of [`Tributaries::parts`], with the same caveats: routing progresses only while
+  /// the future is polled (unpolled = every lane silent), dropping it ends every lane
+  /// after its buffered tail, and the future is `Send` so any executor may host it
+  /// (the routing loop itself uses no timers).
+  ///
+  /// # Panics
+  ///
+  /// Panics if `rest_capacity` is zero (a lane must be able to buffer at least one
+  /// event).
+  pub fn parts<R, H>(
+    watcher: Tributaries<C, V, R, H>,
+    rest_capacity: usize,
+  ) -> (Self, Lane<C, V>, impl Future<Output = ()> + Send + 'static)
+  where
+    C: Send + Sync + 'static,
+    V: Send + Sync + 'static,
+    R: RuntimeLite,
+    H: Send + Sync + 'static,
+  {
     let (control_tx, control_rx) = async_channel::bounded(CONTROL_CAPACITY);
     let (rest_tx, rest_rx) = async_channel::bounded(rest_capacity);
     let tracked = Arc::new(AtomicUsize::new(0));
-    R::spawn_detach(run(watcher, control_rx, rest_tx, Arc::clone(&tracked)));
+    let driver = run(watcher, control_rx, rest_tx, Arc::clone(&tracked));
     (
       Self {
         control: control_tx,
@@ -270,6 +298,7 @@ impl<C, V> Demux<C, V> {
         events: rest_rx,
         release: None,
       },
+      driver,
     )
   }
 

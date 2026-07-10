@@ -148,8 +148,19 @@ mod tests;
 /// `async fn`, whose futures carry no such bound), so a generic `S: Source<C>` owner is
 /// structurally spawnable — every implementor's futures must satisfy them. This is now
 /// unconditionally satisfiable for the fs source because [`tributary_fs::Watcher`] is
-/// `Sync` (its `watch`/`unwatch` futures are `Send`). A fully `!Send` thread-per-core
-/// (compio) variant — spawned via `spawn_local_detach` — is deferred to M2.
+/// `Sync` (its `watch`/`unwatch` futures are `Send`).
+///
+/// **A completion-based / `!Send` transport (io_uring via compio, or any thread-per-core
+/// ring) implements this trait by running its ring on a dedicated thread behind
+/// channels** — exactly the shape the in-tree fs stack already uses one layer down (the
+/// inotify/fanotify reader threads, and [`FsSource`]'s watcher-backed release queue).
+/// The `Send` bounds here are then satisfied by the CHANNEL futures (a `recv` is `Send`
+/// and cancel-safe by construction, meeting the [`next`](Self::next) contract for
+/// free), never by the ring internals, which stay pinned to their own thread. Hosting
+/// the umbrella OWNER itself on a `!Send` executor is a separate, deliberately deferred
+/// question (M2-E): the handle plane is already executor-agnostic, callers who need to
+/// own the spawn use [`Tributaries::parts`](crate::Tributaries::parts), and relaxing
+/// these trait bounds awaits stable return-type notation.
 pub trait Source<C> {
   /// The armed-root token a successful [`arm`](Self::arm) yields, naming the concrete
   /// watch a later [`disarm`](Self::disarm) releases and an event's
