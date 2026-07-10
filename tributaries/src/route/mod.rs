@@ -112,7 +112,7 @@ pub(crate) trait RoutableEvent<C> {
 /// `admits` is the subscriber's admission gate (design §5/§7): given a subscriber and
 /// the *minted* (already projected) delivery, it returns whether that subscriber
 /// accepts it. Production folds **both** the subscription's [`Filter`](crate::Filter)
-/// and its [`Interest`](tributary_fs::Interest) gate into this closure, checking them
+/// and its [`Interest`](crate::Interest) gate into this closure, checking them
 /// against the projected delivery's kind (so a move-out is gated by `removed` interest,
 /// a move-in by `created`, a whole `Moved` by `moved`). It is only consulted for
 /// non-`Rescan` events, and only after the coverage test has passed — so the closure

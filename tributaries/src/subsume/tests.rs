@@ -6,9 +6,9 @@ use std::{
 };
 
 use proptest::prelude::*;
-use tributary_proto::Interest;
 
 use super::{Subscription, Subsumer, UnwatchOutcome, WatchOutcome};
+use crate::interest::Interest;
 
 /// The subsumer under test: fs key component `OsString`, no per-watch value, `u32`
 /// handles (the trivial stand-in for the real `tributary-fs` handle).
@@ -188,8 +188,8 @@ fn side_table_records_per_subscription_interest() {
   let mut s = S::new();
   let mut h = Handles::default();
 
-  let created = Interest::new().with_created();
-  let removed = Interest::new().with_removed();
+  let created = Interest::none().with_created();
+  let removed = Interest::none().with_removed();
 
   // A disjoint root and a covered sub with a DIFFERENT interest.
   let (_ra, sa) = watch(&mut s, &mut h, "/a", created);
@@ -198,7 +198,7 @@ fn side_table_records_per_subscription_interest() {
   assert_eq!(s.subscription_interest(sb), Some(removed));
 
   // Widen the whole tree with /: both /a's subs re-point, each keeping its interest.
-  let modified = Interest::new().with_modified();
+  let modified = Interest::none().with_modified();
   let (_root, sroot) = watch(&mut s, &mut h, "/", modified);
   assert_eq!(
     s.subscription_interest(sa),
