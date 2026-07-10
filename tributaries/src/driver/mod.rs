@@ -422,6 +422,7 @@ where
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
+      suppressed_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
@@ -716,6 +717,12 @@ where
   /// ordinary deliveries to a parked subscription (they are dominated by its `Rescan`), so
   /// a shed can never be lost to a full channel (no-silent-loss).
   needs_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
+  /// Parked debt owed to a still-UNCLAIMED subscription (its grant unresolved), kept
+  /// APART from the offerable map (Codex R61): suppressed entries cost the flush and
+  /// the retry timer nothing — an all-unclaimed retired cohort no longer burns
+  /// full-map probes every tick. A `Cleanup::Claim` moves the entry into
+  /// [`needs_rescan`](Self::needs_rescan); a `DropOrphan`/release removes it.
+  suppressed_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
   /// The subscriptions whose committed [`WatchGrant`] is still **in flight** — grant sent, not yet
   /// claimed or dropped (design driver-golden doc, Codex R24). A sub is inserted by
   /// [`on_watch`](Self::on_watch) the instant the grant send **succeeds**, and removed by exactly one
@@ -1188,6 +1195,18 @@ where
     match cleanup {
       Cleanup::Claim(sub) => {
         self.unclaimed.remove(&sub);
+        // The claim lifts the suppression: any debt parked while the grant was
+        // unclaimed becomes OFFERABLE now (Codex R61 — it was kept apart so it cost
+        // the flush nothing until this moment).
+        if let Some(parked) = self.suppressed_rescan.remove(&sub) {
+          merge_max(
+            &mut self.needs_rescan,
+            sub,
+            parked.key,
+            parked.epoch,
+            parked.value,
+          );
+        }
       }
       Cleanup::DropOrphan(sub) => {
         let _ = self.release_subscription(sub);
@@ -1333,6 +1352,7 @@ where
     let retired_debt = self
       .needs_rescan
       .keys()
+      .chain(self.suppressed_rescan.keys())
       .filter(|&&sub| self.subsumer.subscription_key(sub).is_none())
       .count();
     if retired_debt >= Self::RETIRED_RESCAN_DEBT_LIMIT {
@@ -1676,6 +1696,7 @@ where
     // the `DropOrphan` side.
     self.retire_sub_state(sub);
     self.needs_rescan.remove(&sub);
+    self.suppressed_rescan.remove(&sub);
     self.unclaimed.remove(&sub);
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.drop_subscription(sub);
@@ -1878,7 +1899,12 @@ where
       // and re-enumerates them.
       let value = self.subsumer.subscription_value(sub).cloned();
       let epoch = self.epochs.shed_rescan(sub);
-      merge_max(&mut self.needs_rescan, sub, root_key.clone(), epoch, value);
+      let target = if self.unclaimed.contains(&sub) {
+        &mut self.suppressed_rescan
+      } else {
+        &mut self.needs_rescan
+      };
+      merge_max(target, sub, root_key.clone(), epoch, value);
       if let Some(coalescer) = self.coalescer.as_mut() {
         coalescer.drop_subscription(sub);
       }
@@ -1924,7 +1950,7 @@ where
   ///   teardown arrives on the command mailbox.
   fn try_emit(&mut self, ev: Event<C, V>) {
     let sub = ev.subscription();
-    if self.needs_rescan.contains_key(&sub) {
+    if self.needs_rescan.contains_key(&sub) || self.suppressed_rescan.contains_key(&sub) {
       // An ordinary delta is dominated by the parked `Rescan` — suppress it. But a source
       // `Rescan` is an INDEPENDENT coverage-loss signal that may name a different located key
       // under the same root; merge it into the parked debt (`merge_max` widens the key to the
@@ -1979,7 +2005,12 @@ where
     };
     let value = self.subsumer.subscription_value(sub).cloned();
     let epoch = self.epochs.shed_rescan(sub);
-    merge_max(&mut self.needs_rescan, sub, key, epoch, value);
+    let target = if self.unclaimed.contains(&sub) {
+      &mut self.suppressed_rescan
+    } else {
+      &mut self.needs_rescan
+    };
+    merge_max(target, sub, key, epoch, value);
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.drop_subscription(sub);
     }
@@ -2004,9 +2035,15 @@ where
   /// buffered deltas (a `Rescan` flushes its subscription's buffer), so none linger to be
   /// dominated.
   fn park_rescan_event(&mut self, ev: Event<C, V>) {
+    let sub = ev.subscription();
+    let target = if self.unclaimed.contains(&sub) {
+      &mut self.suppressed_rescan
+    } else {
+      &mut self.needs_rescan
+    };
     merge_max(
-      &mut self.needs_rescan,
-      ev.subscription(),
+      target,
+      sub,
       ev.key().to_vec(),
       ev.epoch(),
       ev.value().cloned(),
@@ -2060,8 +2097,9 @@ where
     // sound even if it was removed meanwhile: the range just starts at the next
     // greater key). After each handled key the probe continues EXCLUSIVE past it,
     // wrapping once; the pass visits at most `len` keys, and ends at the first Full.
-    // Per-pass work is proportional to the offers the channel had room for, plus
-    // unclaimed skips, plus the one Full probe.
+    // Per-pass work is proportional to the offers the channel had room for plus the
+    // one Full probe — unclaimed debt lives in `suppressed_rescan` and costs this
+    // pass nothing (Codex R61).
     let mut resume = self.flush_cursor.take();
     let mut exclusive = false;
     for _ in 0..len {
@@ -2085,12 +2123,14 @@ where
       };
       resume = Some(sub);
       exclusive = true;
-      // Suppress — retain without offering — a still-unclaimed sub's parked debt: it is owed to
-      // nobody until the caller claims (`Cleanup::Claim`) or drops (`Cleanup::DropOrphan`) the
-      // in-flight grant.
-      if self.unclaimed.contains(&sub) {
-        continue;
-      }
+      // An unclaimed sub's debt lives in `suppressed_rescan`, never here (Codex R61 —
+      // the partition is what keeps this pass's cost offer-proportional): parks target
+      // the map matching the sub's claim state, and the claim/orphan transitions move
+      // or purge entries.
+      debug_assert!(
+        !self.unclaimed.contains(&sub),
+        "offerable parked debt for an unclaimed sub — a park missed the partition"
+      );
       let Some(parked) = self.needs_rescan.get(&sub) else {
         continue;
       };
@@ -2304,7 +2344,10 @@ where
     }
     // Drop parked subs' tail deltas — their owed dominating Rescan (delivered next) dominates
     // and re-enumerates them; a non-parked sub's tail is kept.
-    tail.retain(|event| !self.needs_rescan.contains_key(&event.subscription()));
+    tail.retain(|event| {
+      let sub = event.subscription();
+      !self.needs_rescan.contains_key(&sub) && !self.suppressed_rescan.contains_key(&sub)
+    });
     // Owed Rescans first, then the non-parked tail through the suppress-safe funnel.
     self.flush_pending_rescans();
     for event in tail {
@@ -2388,13 +2431,7 @@ where
       // observation is post-teardown, its subscription dead like any subscription after teardown. Every
       // remaining `needs_rescan` key still `unclaimed` means the debt is owed to nobody (and must not
       // spin the drain waiting for a grant that may never resolve); or the consumer is gone entirely.
-      if (self
-        .needs_rescan
-        .keys()
-        .all(|sub| self.unclaimed.contains(sub))
-        && self.cleanup_rx.is_empty())
-        || self.events.is_closed()
-      {
+      if (self.needs_rescan.is_empty() && self.cleanup_rx.is_empty()) || self.events.is_closed() {
         // Make the exit ATOMIC with respect to grant claims (Codex R32): another thread holding an
         // unpolled grant could `defuse` between the emptiness observation above and the owner's
         // drop — its claim would land on a still-open channel (a live-looking Ok) that no later
