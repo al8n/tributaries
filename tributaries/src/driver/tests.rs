@@ -427,6 +427,7 @@ impl Harness {
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
+      suppressed_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
@@ -2078,6 +2079,59 @@ async fn flush_pass_work_is_room_proportional_not_map_proportional() {
   assert!(h.owner.needs_rescan.is_empty(), "no residue");
 }
 
+/// Codex R61: an ALL-UNCLAIMED retired cohort costs the flush NOTHING — the debt lives
+/// in the suppressed partition, the offerable map stays empty (so the 25 ms retry timer
+/// never arms for it), and every flush pass visits zero candidates instead of probing
+/// the whole cohort each tick. Claiming one grant moves exactly its entry into the
+/// offerable map and it delivers.
+#[tokio::test]
+async fn unclaimed_retired_cohort_costs_the_flush_nothing() {
+  const COHORT: usize = 64;
+  let mut h = Harness::new();
+  let mut subs = Vec::new();
+  for _ in 0..COHORT {
+    let sub = h.watch("/cohort", Interest::all()).await.expect("watch");
+    h.owner.unclaimed.insert(sub); // model every grant as still in flight
+    subs.push(sub);
+  }
+  h.owner.source.kill_root(1);
+  h.owner.retire_root_with_terminal_rescan(1);
+
+  assert!(
+    h.owner.needs_rescan.is_empty(),
+    "no offerable debt — the retry timer has nothing to arm for (Codex R61)"
+  );
+  assert_eq!(
+    h.owner.suppressed_rescan.len(),
+    COHORT,
+    "the whole cohort's terminal debt is suppressed apart"
+  );
+  h.owner.flush_pending_rescans();
+  assert_eq!(
+    h.owner.last_flush_visited, 0,
+    "a flush pass over an all-unclaimed cohort visits ZERO candidates (Codex R61)"
+  );
+  assert!(h.drain().is_empty(), "nothing delivered while unclaimed");
+
+  // One claim lifts exactly one entry into the offerable map; it delivers.
+  let claimed = subs[COHORT / 2];
+  h.owner.apply_cleanup(super::Cleanup::Claim(claimed));
+  assert_eq!(h.owner.needs_rescan.len(), 1, "the claim moved its entry");
+  h.owner.flush_pending_rescans();
+  let delivered = h.drain();
+  assert!(
+    delivered
+      .iter()
+      .any(|e| e.subscription() == claimed && e.is_rescan()),
+    "the claimed sub's terminal Rescan is delivered — suppression never became loss"
+  );
+  assert_eq!(
+    h.owner.suppressed_rescan.len(),
+    COHORT - 1,
+    "the other suppressed entries remain, still costing nothing"
+  );
+}
+
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
 /// interest bit (design §5) — directly constructible now that the umbrella owns the
 /// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`
@@ -3697,8 +3751,8 @@ async fn close_tail_drains_cleanup_not_public_backlog() {
   }
   h.owner.park_rescan(sub);
   assert!(
-    h.owner.needs_rescan.contains_key(&sub),
-    "the unclaimed sub's overflow Rescan is parked (suppressed while unclaimed)"
+    h.owner.suppressed_rescan.contains_key(&sub),
+    "the unclaimed sub's overflow Rescan is parked into the suppressed partition (Codex R61)"
   );
 
   // Prefill ~2000 PUBLIC Watch commands (reply receivers dropped): the deep mailbox backlog the old
@@ -3736,7 +3790,7 @@ async fn close_tail_drains_cleanup_not_public_backlog() {
       .expect("the drain returns promptly (close queued first), not O(public backlog)");
   let close_reply = interrupted.expect("the queued close interrupted the drain and is surfaced");
   assert!(
-    h.owner.unclaimed.contains(&sub) && h.owner.needs_rescan.contains_key(&sub),
+    h.owner.unclaimed.contains(&sub) && h.owner.suppressed_rescan.contains_key(&sub),
     "the drain returned before draining the queued Cleanup::Claim — the debt is still suppressed"
   );
   assert!(
@@ -3764,7 +3818,7 @@ async fn close_tail_drains_cleanup_not_public_backlog() {
     "the claimed sub's parked Rescan is delivered by the final pass, before the ack (Codex R30-F1)"
   );
   assert!(
-    h.owner.needs_rescan.is_empty(),
+    h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.is_empty(),
     "the owed debt is resolved, not stranded by stale suppression state"
   );
   // The 2000 public commands are UNTOUCHED — the cleanup drain is O(grants in flight), not O(public
@@ -3989,6 +4043,7 @@ impl OwnerU64 {
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
+      suppressed_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
@@ -4513,6 +4568,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     epochs: EpochLedger::new(),
     filters: HashMap::new(),
     needs_rescan: BTreeMap::new(),
+    suppressed_rescan: BTreeMap::new(),
     unclaimed: std::collections::HashSet::new(),
     flush_cursor: None,
     #[cfg(test)]
@@ -4668,6 +4724,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     epochs: EpochLedger::new(),
     filters: HashMap::new(),
     needs_rescan: BTreeMap::new(),
+    suppressed_rescan: BTreeMap::new(),
     unclaimed: std::collections::HashSet::new(),
     flush_cursor: None,
     #[cfg(test)]
@@ -4847,8 +4904,9 @@ async fn source_drain_suppresses_unclaimed_orphan_debt_and_exits_without_spinnin
   // while its grant is still unclaimed.
   h.owner.retire_root_with_terminal_rescan(2);
   assert!(
-    h.owner.needs_rescan.contains_key(&live) && h.owner.needs_rescan.contains_key(&orphan),
-    "both the live sub's overflow Rescan and the orphan's terminal Rescan are parked"
+    h.owner.needs_rescan.contains_key(&live) && h.owner.suppressed_rescan.contains_key(&orphan),
+    "both parked: the live sub's overflow Rescan offerable, the unclaimed orphan's terminal \
+     Rescan in the suppressed partition (Codex R61)"
   );
 
   // NO Cleanup is enqueued: the orphan stays unclaimed with its parked terminal Rescan for the whole
@@ -4874,11 +4932,8 @@ async fn source_drain_suppresses_unclaimed_orphan_debt_and_exits_without_spinnin
     "the claimed live sub's owed Rescan IS delivered (no-silent-loss for claimed subs)"
   );
   assert!(
-    h.owner
-      .needs_rescan
-      .keys()
-      .all(|s| h.owner.unclaimed.contains(s)),
-    "only unclaimed (owed-to-nobody) debt remains at exit"
+    h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.contains_key(&orphan),
+    "only suppressed (owed-to-nobody) debt remains at exit — the offerable map drained"
   );
 }
 
@@ -4904,8 +4959,9 @@ async fn final_drain_suppresses_unclaimed_orphan_debt_after_close() {
   h.owner.park_rescan(live);
   h.owner.retire_root_with_terminal_rescan(2);
   assert!(
-    h.owner.needs_rescan.contains_key(&live) && h.owner.needs_rescan.contains_key(&orphan),
-    "both the live sub's overflow Rescan and the orphan's terminal Rescan are parked"
+    h.owner.needs_rescan.contains_key(&live) && h.owner.suppressed_rescan.contains_key(&orphan),
+    "both parked: the live sub's overflow Rescan offerable, the unclaimed orphan's terminal \
+     Rescan in the suppressed partition (Codex R61)"
   );
 
   // Model the post-Close tail: a residual Cleanup::DropOrphan sits UNDRAINED on the cleanup channel
@@ -4941,19 +4997,24 @@ async fn claimed_grant_lifts_suppression_and_its_parked_rescan_is_delivered() {
   let sub = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
   h.owner.unclaimed.insert(sub);
 
-  // Terminal-retire the unclaimed sub's root: its owed terminal Rescan parks, suppressed.
+  // Terminal-retire the unclaimed sub's root: its owed terminal Rescan parks into the
+  // SUPPRESSED partition (Codex R61) — the flush never even visits it.
   h.owner.retire_root_with_terminal_rescan(1);
   assert!(
-    h.owner.needs_rescan.contains_key(&sub),
-    "the terminal Rescan is parked"
+    h.owner.suppressed_rescan.contains_key(&sub),
+    "the terminal Rescan is parked, suppressed"
   );
   h.owner.flush_pending_rescans();
   assert!(
     h.drain().is_empty(),
     "unclaimed: the parked Rescan is suppressed, not offered"
   );
+  assert_eq!(
+    h.owner.last_flush_visited, 0,
+    "…at zero flush cost — suppressed debt lives outside the offerable map (Codex R61)"
+  );
   assert!(
-    h.owner.needs_rescan.contains_key(&sub),
+    h.owner.suppressed_rescan.contains_key(&sub),
     "…and retained (deferred), not dropped"
   );
 
@@ -4968,7 +5029,7 @@ async fn claimed_grant_lifts_suppression_and_its_parked_rescan_is_delivered() {
     "claimed: the parked terminal Rescan is delivered — suppression never became loss"
   );
   assert!(
-    h.owner.needs_rescan.is_empty(),
+    h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.is_empty(),
     "the owed debt is resolved once claimed"
   );
 }
@@ -5136,11 +5197,12 @@ async fn queued_claim_grant_is_serviced_before_the_source_drain_exit() {
   let mut h = Harness::new(); // unbounded event channel — has capacity
   let sub = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
   h.owner.unclaimed.insert(sub);
-  // Terminal-retire the unclaimed sub's root: its owed terminal Rescan parks, suppressed.
+  // Terminal-retire the unclaimed sub's root: its owed terminal Rescan parks into the
+  // suppressed partition (Codex R61).
   h.owner.retire_root_with_terminal_rescan(1);
   assert!(
-    h.owner.needs_rescan.contains_key(&sub),
-    "the terminal Rescan is parked"
+    h.owner.suppressed_rescan.contains_key(&sub),
+    "the terminal Rescan is parked, suppressed"
   );
   // The caller defuses as the source drains: its Cleanup::Claim is already queued when the drain runs.
   h.owner
@@ -5161,7 +5223,7 @@ async fn queued_claim_grant_is_serviced_before_the_source_drain_exit() {
     "the claimed sub's parked Rescan is delivered before the source-drain exit (Codex R25-F1)"
   );
   assert!(
-    h.owner.needs_rescan.is_empty(),
+    h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.is_empty(),
     "the owed debt is resolved, not stranded"
   );
 }
