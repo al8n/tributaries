@@ -607,9 +607,11 @@ impl<R: RuntimeLite> Watcher<R> {
   /// - [`UnwatchError::UnknownRoot`] when `root` does not name a live root of THIS
   ///   watcher (never watched, already gone, or issued by a different watcher);
   /// - [`UnwatchError::Closed`] when the watcher is already closed.
-  // Dormant on the lib target: no non-test code constructs a set-cover until the
-  // effect-completion follow-up re-publicizes the pair; the in-crate tests keep it exercised.
-  #[cfg_attr(not(test), allow(dead_code))]
+  // Dormant until the effect-completion follow-up re-publicizes the pair: only the
+  // tokio-gated in-crate tests exercise it, so every other configuration (the lib
+  // target, and test builds without the tokio feature — the CI matrix's smol leg)
+  // must tolerate it unused.
+  #[cfg_attr(not(all(test, feature = "tokio")), allow(dead_code))]
   pub(crate) async fn set_cover(
     &self,
     root: RootHandle,
@@ -662,7 +664,7 @@ impl<R: RuntimeLite> Watcher<R> {
   /// Crate-internal for the same reason as [`set_cover`](Self::set_cover): enqueue
   /// says nothing about when the kernel coverage matches the cover, so the pair stays off the
   /// public surface until the effect-completion fence lands.
-  #[cfg_attr(not(test), allow(dead_code))]
+  #[cfg_attr(not(all(test, feature = "tokio")), allow(dead_code))]
   pub(crate) fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> bool {
     if root.instance() != self.instance {
       return false;

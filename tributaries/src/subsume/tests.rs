@@ -801,10 +801,15 @@ fn run(ops: &[Op]) -> (S, HashMap<Subscription, PathBuf>) {
   (s, live.into_iter().collect())
 }
 
+/// Case budget: a full sweep natively, a handful under miri. Each miri case runs the
+/// interpreter over a 40-op model, and the full count exhausts the 32-bit address
+/// space on i686 (miri recycles addresses too slowly for that much churn).
+const CASES: u32 = if cfg!(miri) { 4 } else { 256 };
+
 proptest! {
   // No on-disk regression file: it would resolve the current directory (a `getcwd`
   // syscall) at setup, which trips Miri's isolation on an otherwise sans-I/O suite.
-  #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
+  #![proptest_config(ProptestConfig { cases: CASES, failure_persistence: None, ..ProptestConfig::default() })]
 
   /// (a) The live roots are pairwise disjoint (no root is an ancestor of another).
   #[test]
