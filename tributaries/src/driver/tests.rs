@@ -1780,6 +1780,101 @@ async fn dropping_the_parts_future_is_hard_teardown() {
   assert!(w.next().await.is_none(), "the event stream is ended");
 }
 
+/// Codex R54: dropping the `parts()` driver MID-ARM cancels the in-flight reconcile at
+/// its await point — and the SOURCE drops with the owner, which is the contract's
+/// reclamation boundary: a conforming source's `Drop` tears down whatever external
+/// effect the cancelled arm had initiated (`grow` shares the same await surface). The
+/// instrumented source proves both halves: the arm was genuinely in flight when the
+/// driver dropped, and the source's Drop ran promptly to reclaim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
+  struct InstrumentedSource {
+    inner: FakeSource,
+    /// Closed when an arm is entered — the test's proof the reconcile was in flight.
+    arm_entered: Option<futures_channel::oneshot::Sender<()>>,
+    /// Never yields: holds the owner at the arm await point.
+    gate: async_channel::Receiver<()>,
+    /// Set by Drop — the reclamation boundary observed.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+  }
+  impl Drop for InstrumentedSource {
+    fn drop(&mut self) {
+      // A real transport would tear down its external watches here (the contract's
+      // cancellation clause); the flag stands in for that teardown.
+      self
+        .dropped
+        .store(true, std::sync::atomic::Ordering::Release);
+    }
+  }
+  impl Source<OsString> for InstrumentedSource {
+    type Handle = u32;
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      self.inner.canonicalize_key(key)
+    }
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      if let Some(entered) = self.arm_entered.take() {
+        let _ = entered.send(());
+      }
+      // Park forever: the cancellation arrives as this future being dropped.
+      let _ = self.gate.recv().await;
+      self.inner.arm(key).await
+    }
+    fn disarm(&mut self, handle: u32) {
+      self.inner.disarm(handle);
+    }
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      core::future::pending().await
+    }
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.inner.root_key(handle)
+    }
+  }
+
+  let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let (entered_tx, entered_rx) = futures_channel::oneshot::channel();
+  let (_gate_tx, gate_rx) = async_channel::unbounded::<()>();
+  let (w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
+    super::Tributaries::parts(
+      InstrumentedSource {
+        inner: FakeSource::new(),
+        arm_entered: Some(entered_tx),
+        gate: gate_rx,
+        dropped: std::sync::Arc::clone(&dropped),
+      },
+      TributariesOptions::new(),
+    );
+  let driver = tokio::spawn(driver);
+
+  // Submit a watch and wait until the owner is provably INSIDE the gated arm.
+  let watching = {
+    let w = w.clone();
+    tokio::spawn(async move { w.watch(key("/a"), (), Interest::all(), Filter::all()).await })
+  };
+  entered_rx
+    .await
+    .expect("the arm was entered — reconcile in flight");
+
+  // Cancel the driver mid-arm.
+  driver.abort();
+  let _ = driver.await;
+
+  // The source dropped WITH the owner — the reclamation boundary fired...
+  assert!(
+    dropped.load(std::sync::atomic::Ordering::Acquire),
+    "the source's Drop ran when the mid-arm driver was cancelled (Codex R54)"
+  );
+  // ...and the caller's in-flight watch surfaces Closed rather than hanging.
+  let err = tokio::time::timeout(Duration::from_secs(5), watching)
+    .await
+    .expect("the watch settles")
+    .expect("task")
+    .expect_err("a cancelled owner surfaces Closed to the in-flight watch");
+  assert!(
+    matches!(err, WatchError::Fs(WatchRootError::Closed)),
+    "got {err:?}"
+  );
+}
+
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
 /// interest bit (design §5) — directly constructible now that the umbrella owns the
 /// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`

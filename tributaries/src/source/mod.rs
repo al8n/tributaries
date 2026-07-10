@@ -161,6 +161,23 @@ mod tests;
 /// question (M2-E): the handle plane is already executor-agnostic, callers who need to
 /// own the spawn use [`Tributaries::parts`](crate::Tributaries::parts), and relaxing
 /// these trait bounds awaits stable return-type notation.
+///
+/// # Cancellation and `Drop` reclamation (Codex R54)
+///
+/// With [`Tributaries::parts`](crate::Tributaries::parts) the owner future is
+/// caller-owned and **may be dropped at any await point** — including mid-[`arm`](Source::arm)
+/// or mid-[`grow`](Source::grow). The run-to-completion wording on those methods describes what the
+/// owner does while polled; it is NOT a promise a source may lean on for external
+/// consistency. The obligation is therefore on the implementor's `Drop`: **dropping the
+/// source must reclaim every external effect it ever initiated, including an arm or
+/// grow cancelled mid-flight whose handle was never returned.** A source that submits
+/// an external watch request and awaits the acknowledgement must tear that watch down
+/// through its own teardown path (its internal driver's shutdown, its transport's
+/// `Drop`) when the source itself drops — never rely on the caller having received a
+/// handle to disarm. The channel-fronted shape above satisfies this structurally: the
+/// dropped frontend closes its channels, and the transport driver behind them tears
+/// down every live watch as it exits — exactly what [`FsSource`] inherits from
+/// [`tributary_fs::Watcher`]'s drop semantics.
 pub trait Source<C> {
   /// The armed-root token a successful [`arm`](Self::arm) yields, naming the concrete
   /// watch a later [`disarm`](Self::disarm) releases and an event's

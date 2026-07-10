@@ -365,7 +365,12 @@ where
   ///   pending forever — nothing errors, nothing times out.
   /// - **Dropping the future is hard teardown.** The owner's drop publishes an empty
   ///   read plane and closes every channel: in-flight and later calls surface
-  ///   `Closed`/`Stopped`, [`next`](Self::next) drains then ends. Orderly shutdown is
+  ///   `Closed`/`Stopped`, [`next`](Self::next) drains then ends. A drop mid-poll also
+  ///   CANCELS whatever the owner was awaiting — an in-flight [`Source::arm`]/
+  ///   [`Source::grow`] stops at its await point — and the SOURCE is dropped with the
+  ///   owner: per the Source contract's cancellation clause (Codex R54), the source's
+  ///   own `Drop` is the reclamation boundary that tears down any external effect the
+  ///   cancelled operation had already initiated. Orderly shutdown is
   ///   [`close`](Self::close) — polled to completion — not dropping the driver.
   /// - **Timer compatibility.** The driver awaits `R`'s timers
   ///   ([`RuntimeLite::sleep_until`]) for the coalescer and the parked-Rescan retry
