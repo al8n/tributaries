@@ -428,6 +428,7 @@ impl Harness {
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
+      flush_cursor: None,
       coalescer,
       cleanup_tx,
       cleanup_rx,
@@ -1984,6 +1985,58 @@ async fn retire_rewatch_cycle_is_bounded_by_the_retired_debt_gate() {
   h.watch("/after-drain", Interest::all())
     .await
     .expect("admission restored once the retired debt drained (Codex R58)");
+}
+
+/// Codex R59: a BATCH conversion — one root death retiring an entire covered cohort at
+/// once — legitimately stands ABOVE the retired-debt threshold (bounded by the caller's
+/// own peak concurrent subscriptions, state it was already paying for), and the gate
+/// then refuses the replenishing watch, so the live-plus-retired total can never grow
+/// past peak-live-plus-threshold. Draining restores admission.
+#[tokio::test]
+async fn batch_retirement_stands_above_the_threshold_but_cannot_replenish() {
+  const COHORT: usize = 1200; // deliberately above RETIRED_RESCAN_DEBT_LIMIT (1024)
+  let mut h = Harness::bounded(1);
+
+  // A covered cohort: the first watch arms the root, the rest subsume onto it — all
+  // admitted while retired debt is zero (the R59 bypass shape).
+  for _ in 0..COHORT {
+    h.watch("/batch", Interest::all())
+      .await
+      .expect("cohort watch admitted under a zero retired count");
+  }
+
+  // One root death converts the whole cohort 1:1 into retired parked debt.
+  h.owner.source.kill_root(1);
+  h.owner.retire_root_with_terminal_rescan(1);
+  let retired = h
+    .owner
+    .needs_rescan
+    .keys()
+    .filter(|&&sub| h.owner.subsumer.subscription_key(sub).is_none())
+    .count();
+  assert_eq!(
+    retired, COHORT,
+    "the batch stands above the threshold — bounded by the caller's own peak cohort"
+  );
+
+  // Replenishment is refused: the gate sees the retired debt at/above the threshold.
+  let refused = h.watch("/fresh", Interest::all()).await;
+  assert!(
+    matches!(refused, Err(WatchError::RescanBacklog)),
+    "admission refused while retired debt sits at/above the threshold (got {refused:?})"
+  );
+
+  // Drain the owed terminal Rescans (capacity-1: one flush offer per drained slot —
+  // also exercising the cursor-resumed pass); admission then returns.
+  loop {
+    h.owner.flush_pending_rescans();
+    if h.drain().is_empty() {
+      break;
+    }
+  }
+  h.watch("/fresh", Interest::all())
+    .await
+    .expect("admission restored once the retired debt drained (Codex R59)");
 }
 
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
@@ -3898,6 +3951,7 @@ impl OwnerU64 {
       filters: HashMap::new(),
       needs_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
+      flush_cursor: None,
       coalescer,
       cleanup_tx,
       cleanup_rx,
@@ -4419,6 +4473,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     filters: HashMap::new(),
     needs_rescan: BTreeMap::new(),
     unclaimed: std::collections::HashSet::new(),
+    flush_cursor: None,
     coalescer: None,
     cleanup_tx,
     cleanup_rx,
@@ -4571,6 +4626,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     filters: HashMap::new(),
     needs_rescan: BTreeMap::new(),
     unclaimed: std::collections::HashSet::new(),
+    flush_cursor: None,
     coalescer: None,
     cleanup_tx,
     cleanup_rx,
