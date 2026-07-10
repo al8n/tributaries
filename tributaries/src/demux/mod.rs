@@ -325,16 +325,21 @@ impl<C, V> Demux<C, V> {
     self.tracked.load(Ordering::Acquire)
   }
 
-  /// Requests an ORDERLY stop of the routing task (Codex R54/R55/R56): it finishes
-  /// the delivery it is currently awaiting — a stalled send completes when that lane
-  /// drains, never mid-send — then routes the backlog the shared stream holds at the
-  /// instant the stop is processed (the drain barrier, bounded by a COUNT SNAPSHOT
-  /// taken at that moment, so it is finite even under a producer that keeps the
-  /// stream non-empty), and only then exits, dropping every lane sender so each
-  /// [`Lane::recv`] drains its buffered tail and reads `None`. Nothing emitted before
-  /// the stop took effect is lost; events emitted afterwards — past the snapshot —
-  /// are post-stop and remain drainable by surviving handle clones on the shared
-  /// MPMC stream.
+  /// Requests an ORDERLY stop of the routing task (Codex R54/R55/R56/R57): it
+  /// finishes the delivery it is currently awaiting — a stalled send completes when
+  /// that lane drains, never mid-send — then routes the backlog the shared stream
+  /// holds at the instant the stop is processed (the drain barrier, bounded by a
+  /// COUNT SNAPSHOT taken at that moment, so it is finite even under a producer that
+  /// keeps the stream non-empty), and only then exits, dropping every lane sender so
+  /// each [`Lane::recv`] drains its buffered tail and reads `None`.
+  ///
+  /// The loss-free pre-stop/post-stop split holds under the module's SOLE-DRAINER
+  /// precondition (the [type docs](Self)): while the routing task runs — the barrier
+  /// included — no other clone may call `next()`; a competing drainer voids the split
+  /// exactly as it voids routing generally (Codex R57). Under that precondition,
+  /// nothing emitted before the stop took effect is lost, and events emitted
+  /// afterwards — past the snapshot — are post-stop: they stay on the shared MPMC
+  /// stream, drainable by the caller's clones once the routing future has resolved.
   ///
   /// This is the loss-free way to stop routing without ending the watcher itself
   /// (closing the watcher ends the shared stream and the lanes with it). By contrast,
@@ -471,20 +476,26 @@ async fn run<C, V, R, H>(
               }
             }
             Ok(Control::Shutdown) => {
-              // Orderly stop-and-DRAIN (Codex R54/R55/R56): the delivery this loop
-              // completed before selecting again is already done — and the backlog the
-              // shared stream holds AT THIS INSTANT is routed too, bounded by a COUNT
-              // SNAPSHOT taken now (Codex R56: an until-empty loop has no finite
-              // boundary — a lane stall mid-barrier lets the producer refill the
-              // stream, so it could absorb post-stop traffic forever). At most
-              // `owed` events drain: each `now_or_never` poll of `next()` is one
-              // cancel-safe channel poll, `None` (another clone raced the backlog
-              // away) ends the barrier early, and each drained event routes through
-              // the normal awaited-lane delivery (finite stalls, `owed` of them at
-              // worst). Everything past the snapshot is post-stop — surviving handle
-              // clones drain it from the shared MPMC stream. Only then do the senders
-              // drop, so every lane ends after a tail that includes exactly the
-              // pre-stop backlog.
+              // Orderly stop-and-DRAIN (Codex R54/R55/R56/R57): the delivery this
+              // loop completed before selecting again is already done — and the
+              // backlog the shared stream holds AT THIS INSTANT is routed too,
+              // bounded by a COUNT SNAPSHOT taken now (Codex R56: an until-empty
+              // loop has no finite boundary — a lane stall mid-barrier lets the
+              // producer refill the stream, so it could absorb post-stop traffic
+              // forever). At most `owed` events drain: each `now_or_never` poll of
+              // `next()` is one cancel-safe channel poll, and each drained event
+              // routes through the normal awaited-lane delivery (finite stalls,
+              // `owed` of them at worst).
+              //
+              // The pre-stop/post-stop split this implements holds under the module's
+              // SOLE-DRAINER precondition (see the type docs): with no competing
+              // `next()` caller, the count identifies exactly the pre-stop backlog.
+              // A caller who violates that precondition mid-barrier voids the split —
+              // a competing drainer shifts which events the counted pulls take, just
+              // as it voids routing at any other time (Codex R57: the count carries
+              // no event identities; exclusivity is the contract, not an option).
+              // The early break below is purely defensive termination for that
+              // violated state, not support for it.
               let owed = watcher.queued_events();
               for _ in 0..owed {
                 match watcher.next().now_or_never() {
