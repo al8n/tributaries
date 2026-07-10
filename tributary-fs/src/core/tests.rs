@@ -2389,7 +2389,7 @@ fn spawn_rejection_emits_nothing_public() {
   assert!(emits(&drain(&mut core)).is_empty());
 }
 
-/// The set-cover broadening-delta rule (Codex R37-F1), in isolation and cross-platform: the
+/// The set-cover broadening-delta rule, in isolation and cross-platform: the
 /// retained prefixes a re-issued cover must re-arm are exactly those the PREVIOUS applied cover
 /// did not already cover — never keyed on which watches happen to survive, so growing back to a
 /// retained ANCESTOR (whose connecting watch is still armed) or to the whole root re-arms the
@@ -2417,7 +2417,7 @@ fn broadening_delta_is_the_uncovered_retained_prefixes() {
   );
 
   // Growing to a retained ANCESTOR of the previous cover is broadening: the ancestor kept its
-  // connecting watch, but its OTHER descendants were pruned (the exact R37-F1 case).
+  // connecting watch, but its OTHER descendants were pruned (the exact retained-ancestor case).
   let deep = [p("/r/a/b/deep")];
   assert_eq!(
     broadening_delta(Some(&deep), &[p("/r/a/b")]),
@@ -2433,7 +2433,7 @@ fn broadening_delta_is_the_uncovered_retained_prefixes() {
   );
 }
 
-/// R41: `on_set_cover` validates the retained cover against the LIVE scope root before acting on it. A
+/// `on_set_cover` validates the retained cover against the LIVE scope root before acting on it. A
 /// cover ENTIRELY outside the root is a caller error — refused as a no-op (no prune, `applied_cover`
 /// left untouched), so a typo / relative / stale path can never mark every in-root watch strictly-
 /// outside and SILENTLY PRUNE the whole scope; a PARTIALLY out-of-root cover proceeds with the in-root
@@ -2474,13 +2474,13 @@ fn set_cover_validates_retained_against_the_scope_root() {
   );
 
   // (3b) An ESCAPING path that lexically begins with the root — `Path::starts_with` does not
-  // resolve `..` — is refused too (Codex R42-F1): a canonical retained path never carries
+  // resolve `..` — is refused too: a canonical retained path never carries
   // `.`/`..` components, so any that does is a caller error, never honored (alone or mixed).
   core.on_set_cover(scope, &[PathBuf::from("/r/../outside")]);
   assert_eq!(
     applied(&core),
     Some(vec![PathBuf::from("/r/a")]),
-    "a dot-dot-escaping cover is refused — never recorded, never a prune (Codex R42)"
+    "a dot-dot-escaping cover is refused — never recorded, never a prune"
   );
   core.on_set_cover(
     scope,
@@ -4300,7 +4300,7 @@ mod kernel_recursive_fanotify {
     );
   }
 
-  /// The R25 closure at the DRIVER layer, tick-INDEPENDENT: the admission classifier
+  /// The admission closure at the DRIVER layer, tick-INDEPENDENT: the admission classifier
   /// turns a FID-only root self-event (`target_fid` = the root anchor, `dir_fid` =
   /// None — the shape the pre-inversion admission DROPPED) into a `RootDeath` whose
   /// forwarded event carries the root's OWN path, so it lowers through the SAME

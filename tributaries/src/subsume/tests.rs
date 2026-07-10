@@ -269,7 +269,7 @@ fn stale_broad_root_does_not_over_report_is_watched() {
   let wide = h.mint();
   s.commit_watch(&outcome, wide, &key("/a"));
   // Unwatch the widening /a watch: the root /a lives on for /a/b, now broader than it — exactly the
-  // over-broad case shrink-in-place reclaims (design M2-B). The departing key /a equals the root key
+  // over-broad case shrink-in-place reclaims (the set-cover design). The departing key /a equals the root key
   // and no survivor is at /a, so the drop reports a shrink to the /a/b survivor cover.
   match s.plan_unwatch(s_wide) {
     Some(UnwatchOutcome::Dropped {
@@ -290,7 +290,7 @@ fn stale_broad_root_does_not_over_report_is_watched() {
 
   assert!(
     view.contains(&key("/a")),
-    "the armed root /a is deliberately left broad (no M2 re-narrow)"
+    "the armed root /a is deliberately left broad (no re-narrow)"
   );
   assert!(
     view.is_watched(&key("/a/b")),
@@ -355,7 +355,7 @@ fn stale_broad_root_does_not_over_report_is_watched() {
   );
 }
 
-/// M2-B shrink-in-place DETECTION (design §5): when the subscription whose key equalled the armed
+/// set-cover shrink-in-place DETECTION (design §5): when the subscription whose key equalled the armed
 /// root's own key departs and every survivor sits under a NARROWER key, the drop reports the root
 /// OVER-BROAD plus the retained cover — the survivor antichain the source may shrink coverage down to
 /// (no gap, no re-crawl). Here /a widened over disjoint /a/b and /a/c; unwatching /a leaves the wide
@@ -417,7 +417,7 @@ fn drop_with_survivor_at_root_key_is_not_over_broad() {
   );
 }
 
-/// Antichain MINIMALITY when survivors nest (design M2-B): survivors at /a/b and /a/b/c reduce to the
+/// Antichain MINIMALITY when survivors nest (the set-cover design): survivors at /a/b and /a/b/c reduce to the
 /// single prefix /a/b — /a/b/c is already covered by it — so the retained cover is the minimal
 /// prefix-free set, never the raw survivor keys.
 #[test]
@@ -452,7 +452,7 @@ fn over_broad_antichain_collapses_nested_survivors() {
   }
 }
 
-/// M2-B v3 F2 (Codex R39-F2): a non-root unwatch that shrinks an ALREADY-NARROWED cover reports a
+/// set-cover F2: a non-root unwatch that shrinks an ALREADY-NARROWED cover reports a
 /// re-prune. A wide /a narrowed to {/a/b, /a/c}: dropping the non-root /a/c survivor (departing key
 /// /a/c != root key /a) leaves the cover reclaimable to {/a/b} — so `detect_shrink` reports a shrink
 /// to the shrunken antichain. The old detection, gated on the departing key EQUALLING the root key,
@@ -496,7 +496,7 @@ fn narrowed_cover_non_root_unwatch_reprunes() {
   }
 }
 
-/// M2-B v3 F2: a non-root unwatch that leaves the survivor antichain EQUAL to the recorded cover
+/// set-cover F2: a non-root unwatch that leaves the survivor antichain EQUAL to the recorded cover
 /// reports NO re-prune — dropping a survivor already covered by a shallower sibling reclaims nothing.
 /// A wide /a narrowed to {/a/b, /a/c} with an extra /a/b/deep sub under /a/b: dropping /a/b/deep
 /// leaves the antichain {/a/b, /a/c} unchanged, so no re-prune fires.
@@ -530,7 +530,7 @@ fn equal_survivor_antichain_reports_no_reprune() {
   );
 }
 
-/// M2-B freshness re-issue (Codex R35): `retained_cover_for` recomputes a root's retained cover from
+/// set-cover freshness re-issue: `retained_cover_for` recomputes a root's retained cover from
 /// its CURRENT live membership — the query the driver re-issues on every Covered commit to keep a
 /// queued shrink fresh. A subscriber still pinning the root at its own key reports `None` (the driver
 /// re-issues the cancel-equivalent for it); once that pinning subscriber departs, the over-broad root
@@ -599,7 +599,7 @@ fn retained_cover_for_collapses_nested_survivors() {
   );
 }
 
-/// The R35 core: a Covered watch under an already-over-broad root JOINS the recomputed cover, so the
+/// The over-broad-join core: a Covered watch under an already-over-broad root JOINS the recomputed cover, so the
 /// driver's re-issue reflects the newcomer — never a stale pre-newcomer snapshot. Over-broad /a serves
 /// only /a/b; watching /a/c (Covered, sharing the wide handle) grows the cover to {/a/b, /a/c}.
 #[test]
@@ -629,11 +629,11 @@ fn retained_cover_for_includes_a_newly_covered_subscriber() {
   assert_eq!(
     s.retained_cover_for(wide),
     Some(vec![key("/a/b"), key("/a/c")]),
-    "the covered /a/c JOINS the recomputed cover — the fresh membership, not the stale {{/a/b}} (R35)"
+    "the covered /a/c JOINS the recomputed cover — the fresh membership, not the stale {{/a/b}}"
   );
 }
 
-/// M2-B v2 retained-cover bookkeeping (Codex R36): [`set_retained_cover`](S::set_retained_cover)
+/// set-cover retained-cover bookkeeping: [`set_retained_cover`](S::set_retained_cover)
 /// records the cover last issued to the source and [`retained_cover_of`](S::retained_cover_of) reads
 /// it back. A fresh root is `None` (full coverage), a narrowing round-trips, a reset to `None` restores
 /// full, and an unknown handle is `None`.
@@ -670,7 +670,7 @@ fn retained_cover_bookkeeping_round_trips() {
   );
 }
 
-/// M2-B v2 `outside_cover` classification (Codex R36): [`plan_watch`](S::plan_watch) flags a `Covered`
+/// set-cover `outside_cover` classification: [`plan_watch`](S::plan_watch) flags a `Covered`
 /// newcomer that falls OUTSIDE the covering root's recorded retained cover — the region an applied
 /// set_cover pruned — and does NOT flag one under a full-coverage (`None`) root, one inside a retained
 /// prefix, or one whose key equals a retained prefix. Each probe plan is aborted so it leaks no pending
@@ -871,7 +871,7 @@ proptest! {
   }
 }
 
-/// Codex R60: retiring an N-cohort root is LINEAR in value clones — the batched
+/// retiring an N-cohort root is LINEAR in value clones — the batched
 /// `force_remove_root` clones each same-key cover entry once and retains through it
 /// once, instead of the per-subscriber clone-of-the-shrinking-cohort that cost
 /// O(N squared) deep clones. Fail-on-old: 256 subscribers cost ~32k clones quadratic;

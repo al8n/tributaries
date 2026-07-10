@@ -111,7 +111,7 @@ impl EpochLedger {
   /// high-water even when an ordinary post-shed delivery already reached it — and advances
   /// high-water to it.
   ///
-  /// The distinction from [`stamp`](Self::stamp) is load-bearing after the R6 clamp: an
+  /// The distinction from [`stamp`](Self::stamp) is load-bearing after the high-water clamp: an
   /// ordinary post-shed same-generation event is clamped *up to* `high_water` (a tie with
   /// the shed `Rescan`, which is not dominated). A source `Rescan` stamped by the ordinary
   /// clamp would then only *tie* that already-delivered event rather than dominate it, so a
@@ -217,7 +217,7 @@ impl EpochLedger {
         let sub = sub_of(&delivered);
         // A source-emitted `Rescan` must STRICTLY dominate every prior delivery for the
         // subscription ([`stamp_rescan`] = `high_water.next()`); an ordinary delivery takes
-        // the R6 high-water clamp ([`stamp`]). Without the split a source `Rescan` at the
+        // the high-water clamp ([`stamp`]). Without the split a source `Rescan` at the
         // same generation as a post-shed event would only tie it, losing the coverage-loss
         // signal.
         let stamp = if is_rescan {

@@ -491,7 +491,7 @@ fn shed_rescan_dominates_prior_stream_and_same_root_deltas_sort_at_or_above() {
   assert!(rescan2 > rescan, "sheds are monotone");
 }
 
-/// Codex R6 regression (design backpressure doc, no silent loss): the raw fs epoch is a
+/// Regression (design backpressure doc, no silent loss): the raw fs epoch is a
 /// per-scope reconciliation **generation** — constant across ordinary events, advanced only
 /// on a `Rescan`/overflow (see `tributary_proto`'s monitor) — NOT a per-event counter. So
 /// after an overflow [`shed_rescan`](EpochLedger::shed_rescan) mints a dominating `Rescan` at
@@ -535,12 +535,12 @@ fn post_shed_same_generation_event_is_not_dominated_by_the_shed_rescan() {
   );
   assert!(
     post[0].1 >= rescan,
-    "no post-shed same-generation event sorts below the shed Rescan (Codex R6: no silent loss)"
+    "no post-shed same-generation event sorts below the shed Rescan (no silent loss)"
   );
 }
 
-/// Codex R7 regression (design backpressure doc, no silent loss): a SOURCE-emitted `Rescan`
-/// must STRICTLY dominate every prior delivery. The R6 clamp lets an ordinary post-shed
+/// Regression (design backpressure doc, no silent loss): a SOURCE-emitted `Rescan`
+/// must STRICTLY dominate every prior delivery. The high-water clamp lets an ordinary post-shed
 /// same-generation event deliver *at* the shed `Rescan`'s epoch (a tie). If the source then
 /// emits its own `Rescan`, the ordinary clamp (`max(base + raw, high_water)`) would only tie
 /// that already-delivered event — losing strict dominance and the lower layer's coverage-loss
@@ -567,7 +567,7 @@ fn source_rescan_strictly_dominates_a_post_shed_same_generation_event() {
   assert_eq!(
     post[0].1,
     Epoch::new(1),
-    "R6: the post-shed ordinary event ties the shed Rescan"
+    "the post-shed ordinary event ties the shed Rescan"
   );
 
   // Now the SOURCE emits its own `Rescan` in the SAME generation (raw 0). It must STRICTLY
@@ -580,11 +580,11 @@ fn source_rescan_strictly_dominates_a_post_shed_same_generation_event() {
   );
   assert!(
     src_rescan[0].1 > post[0].1,
-    "a source Rescan strictly dominates every prior delivery (Codex R7: coverage-loss signal preserved)"
+    "a source Rescan strictly dominates every prior delivery (coverage-loss signal preserved)"
   );
 }
 
-/// Codex R7 F3 regression (design §7, no silent perturbation): the filter admission gate runs
+/// Regression (design §7, no silent perturbation): the filter admission gate runs
 /// BEFORE a delivery is stamped, so a filtered-OUT delivery must never advance the subscription's
 /// epoch high-water. This is the property that lets a filter be a pure pre-delivery predicate over
 /// the change while the epoch space stays owned by admitted deliveries alone (a rejected candidate

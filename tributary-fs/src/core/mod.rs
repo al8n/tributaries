@@ -498,7 +498,7 @@ struct ScopeState {
   /// of its retained prefixes armed while pruning their other descendants, so an exact-path
   /// "is a watch present at this prefix" test would wrongly read a retained ancestor as
   /// fully covered and skip re-arming the descendants the earlier cover pruned — silent loss
-  /// after the bridge Rescan's crawl (Codex R37-F1). Set on every successful `on_set_cover`;
+  /// after the bridge Rescan's crawl. Set on every successful `on_set_cover`;
   /// initialized `None`.
   applied_cover: Option<Vec<PathBuf>>,
 }
@@ -656,7 +656,7 @@ impl DriverCore {
   }
 
   /// Reconciles `scope`'s per-directory kernel coverage to the `retained` cover **in place**,
-  /// **bidirectionally** (the set-cover, M2-B v2): it BOTH prunes every descended watch
+  /// **bidirectionally** (the set-cover reconcile): it BOTH prunes every descended watch
   /// strictly OUTSIDE the cover AND re-arms any retained subtree the scope is not currently
   /// covering — while leaving every retained subtree that is already covered, and the
   /// connecting ancestors from the root down to each, untouched. Neither the retained-and-
@@ -675,7 +675,7 @@ impl DriverCore {
   /// re-arm emits no `Created` and no `Rescan`, so it silently restores coverage the way the
   /// prune silently reclaims it.
   ///
-  /// # Why the grow half exists (Codex R36)
+  /// # Why the grow half exists
   ///
   /// A prune-only set-cover cannot restore coverage: after an applied prune of `/a/c`, a later
   /// consumer watching `/a/c` again (subsumed under the still-armed wide root — `Covered` at
@@ -693,7 +693,7 @@ impl DriverCore {
   /// covered key, and neither emits a `Rescan`. A **no-op** for an unknown scope, an empty
   /// `retained` (defensive — never prune the whole tree), a `retained` cover ENTIRELY outside the
   /// live root (a caller error — validated against the scope root and refused before any prune, so a
-  /// typo / relative / stale path can never silently prune the whole scope — Codex R41), and —
+  /// typo / relative / stale path can never silently prune the whole scope), and —
   /// naturally — a **kernel-recursive** scope (fanotify / FSEvents): its single whole-subtree stream
   /// has no per-directory children, so the prune walk finds only the root node (never strictly
   /// outside its own retained descendants) and the grow's ancestor is the root, whose re-arm is a
@@ -712,13 +712,13 @@ impl DriverCore {
     if retained.is_empty() {
       return;
     }
-    // Validate the retained cover against the LIVE scope root before acting on it (Codex R41). A
+    // Validate the retained cover against the LIVE scope root before acting on it. A
     // retained path that is not under the root — a caller typo, a relative or stale path — lies
     // strictly OUTSIDE every in-root watch, so an UNVALIDATED cover would mark the whole scope
     // outside and SILENTLY PRUNE ALL coverage. Keep only paths within the root (the root itself
     // allowed). The prefix test is LEXICAL, and `Path::starts_with` does not resolve `..` — so a
-    // path like `root/../elsewhere` lexically begins with the root while escaping it (Codex
-    // R42-F1). A CANONICAL retained path never contains `.`/`..` components (the scope root and
+    // path like `root/../elsewhere` lexically begins with the root while escaping it (
+    // ). A CANONICAL retained path never contains `.`/`..` components (the scope root and
     // every survivor cover the umbrella issues are canonical), so any path carrying one is a
     // caller error: reject it outright rather than guessing what it resolves to. A root not yet
     // known (stream not spawned) cannot validate anything, so no-op.
@@ -748,7 +748,7 @@ impl DriverCore {
 
     let root_watch = state.watch;
     // The cover the previous reconcile settled on: the grow keys its re-arm on the delta
-    // against THIS, not on which watches survive (Codex R37-F1).
+    // against THIS, not on which watches survive.
     let prev_cover = state.applied_cover.clone();
 
     // --- PRUNE (the shrink half): drop every descended watch strictly OUTSIDE the cover ---
@@ -783,7 +783,7 @@ impl DriverCore {
     // at its own path merely as a connecting ANCESTOR while its descendants are gone. Keying on
     // the delta rather than on exact-path watch presence is exactly what re-arms those pruned
     // descendants when growing back to a retained ancestor (`/a/b/deep` → `/a/b`) or to the
-    // whole root (Codex R37-F1). For each delta prefix, re-arm the DEEPEST still-watched
+    // whole root. For each delta prefix, re-arm the DEEPEST still-watched
     // ancestor-OR-SELF: its recursive re-arm re-reads that directory, re-installs every
     // previously-pruned directory beneath it, and cascades down — with no `Created` and no
     // `Rescan`. Dedup by target watch, so sibling delta prefixes sharing one ancestor re-arm
@@ -818,7 +818,7 @@ impl DriverCore {
     self.drain_monitor();
 
     // Record the cover just applied: the NEXT set-cover computes its broadening delta against it
-    // (Codex R37-F1). Stored verbatim; `broadening_delta` treats the init `None` as full, and a
+    //. Stored verbatim; `broadening_delta` treats the init `None` as full, and a
     // full-root cover (retained = the root's own path) yields an empty delta for any later shrink
     // exactly as `None` would.
     if let Some(state) = self.scopes.get_mut(&scope) {
@@ -2246,7 +2246,7 @@ fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
 }
 
 /// The retained prefixes in `new` the PREVIOUS applied cover `prev` did not already cover —
-/// the broadening delta a set-cover must re-arm (Codex R37-F1). `prev == None` is the FULL
+/// the broadening delta a set-cover must re-arm. `prev == None` is the FULL
 /// (never-pruned) cover: it covers everything, so nothing is broadening and the delta is empty.
 /// Otherwise a retained prefix `r` is broadening iff NO member of `prev` is a prefix of it: its
 /// subtree was pruned under `prev` (only its connecting ancestors were kept armed), so it must

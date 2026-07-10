@@ -306,7 +306,7 @@ async fn registry_reclaims_on_unwatch_cycles() {
   watcher.close().await.expect("close");
 }
 
-/// `request_set_cover` is the non-blocking, REPLY-LESS prompt path (Codex R37-F2): it `try_send`s a
+/// `request_set_cover` is the non-blocking, REPLY-LESS prompt path: it `try_send`s a
 /// reply-less `SetCover` and reports whether the control channel accepted it — `true` with room,
 /// `false` when full or closed (or foreign), never blocking or panicking.
 #[tokio::test]
@@ -362,8 +362,8 @@ async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
   );
 }
 
-/// `request_unwatch` is the non-blocking, REPLY-LESS teardown twin of the awaited `unwatch` (Codex
-/// R41): it `try_send`s a reply-less `Unwatch` and reports whether the control channel accepted it —
+/// `request_unwatch` is the non-blocking, REPLY-LESS teardown twin of the awaited `unwatch` (
+/// ): it `try_send`s a reply-less `Unwatch` and reports whether the control channel accepted it —
 /// `true` with room, `false` when full or closed (or foreign) — never blocking or panicking. The
 /// enqueued command carries `reply: None`, marking it fire-and-forget for the driver.
 #[tokio::test]

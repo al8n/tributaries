@@ -63,17 +63,17 @@ mod tests;
 /// dropped by the owner (→ the caller's `close()` sees [`Stopped`](tributary_fs::CloseError::Stopped))
 /// when the owner is already gone. Close rides its **own** [`async_channel`] — checked at the top
 /// priority everywhere the owner selects — so a requested shutdown can never be starved behind the
-/// command mailbox (Codex R27; bounded since R52); it is deliberately NOT a [`Command`] variant, so there is
+/// command mailbox ; it is deliberately NOT a [`Command`] variant, so there is
 /// one shutdown path and no dual plumbing.
 type CloseReply = futures_channel::oneshot::Sender<Result<(), CloseError>>;
 
 /// A control-plane request from a [`Tributaries`] handle to its [`Owner`], carrying a `oneshot`
 /// reply the caller's cancellable wait reads.
 ///
-/// Shutdown is **not** here: `close` rides a dedicated high-priority [`CloseReply`] channel (Codex
-/// R27), never the mailbox, so it cannot queue behind a `Watch`/`Unwatch` flood. Grant resolution is
+/// Shutdown is **not** here: `close` rides a dedicated high-priority [`CloseReply`] channel (
+/// ), never the mailbox, so it cannot queue behind a `Watch`/`Unwatch` flood. Grant resolution is
 /// **not** here either: a committed-but-unclaimed [`WatchGrant`]'s claim/drop rides the dedicated
-/// reply-less [`Cleanup`] channel (Codex R30), so the owner's close-time grant-resolution drain is
+/// reply-less [`Cleanup`] channel, so the owner's close-time grant-resolution drain is
 /// bounded by the grants in flight, never by the public command backlog a mailbox scan would walk.
 ///
 /// The owner processes each to completion (invariant I1): dropping the caller's returned future drops
@@ -106,13 +106,13 @@ enum Command<C, V> {
 }
 
 /// A reply-less grant-resolution notice on the [`Owner`]'s dedicated [`cleanup_rx`](Owner::cleanup_rx)
-/// channel (Codex R30): the paired resolution of a single committed-but-unclaimed [`WatchGrant`] —
+/// channel: the paired resolution of a single committed-but-unclaimed [`WatchGrant`] —
 /// **exactly one** ever fires per grant (see [`WatchGrant`]).
 ///
 /// It rides its **own** unbounded channel, separate from the [`Command`] mailbox, so the owner's
 /// close-time grant-resolution drain ([`drain_pending_cleanup`](Owner::drain_pending_cleanup)) is
 /// bounded by the number of grants in flight — **each grant sends exactly one `Cleanup`** — rather
-/// than by the `Watch`/`Unwatch` backlog the old in-mailbox scan walked (Codex R30-F1, the
+/// than by the `Watch`/`Unwatch` backlog the old in-mailbox scan walked (the
 /// O(public backlog) close-ack). Both variants are synchronous fire-and-forget `try_send`s from a
 /// grant (a `Drop`/`defuse` cannot await); the owner keeps a **strong** keep-alive
 /// [`cleanup_tx`](Owner::cleanup_tx), so the channel never closes while the owner lives and neither
@@ -202,7 +202,7 @@ impl WatchGrant {
   /// [`Cleanup::DropOrphan`] are **exactly-one-of-two**: setting `defused` makes the subsequent
   /// `Drop` a no-op.
   ///
-  /// # Poisoned grants (Codex R31)
+  /// # Poisoned grants
   ///
   /// A FAILED claim send — the cleanup receiver is gone, i.e. the owner has already torn down —
   /// **poisons** the grant: `Err(sub)` is returned instead of a claimed subscription. A grant can
@@ -271,7 +271,7 @@ pub struct Tributaries<C, V, R: RuntimeLite, H = RootHandle> {
   /// it tears down (design driver-golden doc, Close/Drop). `close` does **not** ride here — see
   /// [`closes`](Self::closes).
   commands: async_channel::Sender<Command<C, V>>,
-  /// The dedicated **high-priority shutdown signal** (Codex R27): [`close`](Self::close) sends its
+  /// The dedicated **high-priority shutdown signal**: [`close`](Self::close) sends its
   /// [`CloseReply`] here, never the command mailbox, so a requested shutdown can never be starved
   /// behind the `Watch`/`Unwatch` backlog. It is checked at the TOP priority in every place
   /// the owner selects (the [`run`] loop and the source-drain teardown), both non-blockingly each
@@ -355,7 +355,7 @@ where
   /// Builds a watcher over any [`Source`] WITHOUT spawning: returns the handle and the
   /// owner's driver future for the CALLER to spawn — on `R` via
   /// [`with_source`](Self::with_source)'s one-liner, on a `LocalSet`, under structured
-  /// concurrency, or on any executor compatible with `R`'s timers (M2-E).
+  /// concurrency, or on any executor compatible with `R`'s timers.
   ///
   /// Three caveats bind the caller:
   ///
@@ -368,7 +368,7 @@ where
   ///   `Closed`/`Stopped`, [`next`](Self::next) drains then ends. A drop mid-poll also
   ///   CANCELS whatever the owner was awaiting — an in-flight [`Source::arm`]/
   ///   [`Source::grow`] stops at its await point — and the SOURCE is dropped with the
-  ///   owner: per the Source contract's cancellation clause (Codex R54), the source's
+  ///   owner: per the Source contract's cancellation clause, the source's
   ///   own `Drop` is the reclamation boundary that tears down any external effect the
   ///   cancelled operation had already initiated. Orderly shutdown is
   ///   [`close`](Self::close) — polled to completion — not dropping the driver.
@@ -400,17 +400,17 @@ where
     // to a durable dominating `Rescan` (`needs_rescan`) rather than growing memory without
     // bound — bounded memory with no silent loss.
     let (event_tx, event_rx) = async_channel::bounded(event_capacity.get());
-    // Bounded too (Codex R52): each queued command owns its key/value/filter, so an
+    // Bounded too: each queued command owns its key/value/filter, so an
     // unbounded mailbox let poll-then-cancel callers retain arbitrary memory in
     // abandoned requests. Submissions AWAIT admission when the owner is mid-reconcile
     // (`watch`/`unwatch` are caller-cancellable up to admission); `close` never queues
     // here — it rides its own dedicated channel below.
     let (command_tx, command_rx) = async_channel::bounded(command_capacity.get());
-    // The dedicated shutdown signal (Codex R27), bounded at one slot: the first close wins, and any
+    // The dedicated shutdown signal, bounded at one slot: the first close wins, and any
     // racing close resolves to `Stopped` once the owner is gone. It carries ONLY close replies, so
     // the command backlog can never delay it.
     let (close_tx, close_rx) = async_channel::bounded(1);
-    // The dedicated grant-resolution channel (Codex R30), unbounded and reply-less: each in-flight
+    // The dedicated grant-resolution channel, unbounded and reply-less: each in-flight
     // [`WatchGrant`] sends exactly one [`Cleanup`] here, so the owner's close-time drain is bounded by
     // grants in flight, not by the public mailbox backlog. The owner keeps the STRONG `cleanup_tx`
     // (cloned into each grant), so the channel never closes while the owner lives — the old weak
@@ -487,7 +487,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// This submits a watch command into the bounded mailbox
   /// ([`command_capacity`](crate::TributariesOptions::command_capacity)) and awaits the
   /// owner's reply. When the mailbox is full — the owner busy inside a caller-bounded
-  /// reconcile — the submission awaits ADMISSION first (Codex R52), so abandoned
+  /// reconcile — the submission awaits ADMISSION first, so abandoned
   /// requests can never pile up without bound: dropping the returned future before
   /// admission leaves nothing queued at all. Dropping it after admission drops only the
   /// wait — the owner still runs the reconcile to completion, and if the caller
@@ -535,7 +535,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
     // subscription away (invariant I1). On success we **defuse** the grant (its `Drop` becomes a
     // no-op) and take the [`Subscription`]; a closed reply (the owner is gone) surfaces `Closed`.
     match response.await {
-      // A POISONED grant (Codex R31) — the claim's try_send found the owner already gone (a grant
+      // A POISONED grant — the claim's try_send found the owner already gone (a grant
       // polled only after a source-drain teardown) — surfaces `Closed` like every other
       // owner-gone path, never an `Ok` subscription whose stream already ended without its owed
       // Rescan.
@@ -556,7 +556,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// subscription pinned the root at its own key, or a survivor under an already-narrowed cover
   /// departed (a non-root unwatch that lets the cover shrink further) — the root stays armed for its
   /// survivors, and the excess kernel coverage is reclaimed **in place** via the synchronous
-  /// fire-and-forget [`Source::set_cover`] PRUNE (design §5, M2-B v3): survivor coverage never moves,
+  /// fire-and-forget [`Source::set_cover`] PRUNE (design §5, set-cover ): survivor coverage never moves,
   /// so there is no gap and no re-crawl. Over-broadness is correctness-neutral and self-healing, so
   /// this is a pure budget-reclaim optimization the source may apply, defer, or ignore.
   ///
@@ -572,7 +572,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// the teardown, so they remain attributable if inspected).
   ///
   /// Like [`watch`](Self::watch), the command is submitted into the bounded mailbox: a
-  /// full mailbox makes this await admission (Codex R52), and cancellation before
+  /// full mailbox makes this await admission, and cancellation before
   /// admission leaves nothing queued.
   ///
   /// # Errors
@@ -622,10 +622,10 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   }
 
   /// How many delivered events currently sit in the shared stream's buffer — the
-  /// demux shutdown barrier's SNAPSHOT bound (Codex R56): it drains at most this many,
+  /// demux shutdown barrier's SNAPSHOT bound: it drains at most this many,
   /// so the barrier is finite under a live producer. The count identifies the pre-stop
   /// backlog only under the demux's SOLE-DRAINER precondition (no competing `next()`
-  /// through the whole barrier — Codex R57/R58); post-stop events stay on the stream
+  /// through the whole barrier); post-stop events stay on the stream
   /// for clones that resume `next()` only after the routing future resolves.
   pub(crate) fn queued_events(&self) -> usize {
     self.events.len()
@@ -647,7 +647,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   ///
   /// The reply rides a **dedicated** high-priority channel, NOT the command mailbox, and the owner
   /// checks it at the TOP priority everywhere it selects — so `close` resolves within a bounded window
-  /// **regardless** of how deep the queued `Watch`/`Unwatch` backlog is (Codex R27). A sustained
+  /// **regardless** of how deep the queued `Watch`/`Unwatch` backlog is. A sustained
   /// command flood can no longer starve shutdown.
   ///
   /// # Errors
@@ -657,7 +657,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// already won and tore the owner down).
   pub async fn close(self) -> Result<(), CloseError> {
     let (reply, response) = futures_channel::oneshot::channel();
-    // Send on the dedicated close signal, never the command mailbox — the whole point of R27. A
+    // Send on the dedicated close signal, never the command mailbox — the whole point of the dedicated signal. A
     // send failure means the owner's close receiver is gone (it already tore down): map to
     // `Stopped`, mirroring the old command-send-failure path.
     if self.closes.send(reply).await.is_err() {
@@ -712,7 +712,7 @@ where
   /// whose delivery hit a full event channel parks a durable **dominating**
   /// [`Rescan`](EventKind::Rescan) here — a [`ParkedRescan`] holding its covered
   /// key, a strictly-dominating epoch, and the owning subscription's **baked value** (captured
-  /// while the sub is live, so the flushed Rescan stays attributable after retirement — R4). A
+  /// while the sub is live, so the flushed Rescan stays attributable after retirement). A
   /// [`BTreeMap`] for a deterministic drain order.
   /// [`flush_pending_rescans`](Self::flush_pending_rescans) re-offers each every loop tick
   /// until `try_send` accepts it, and [`try_emit`](Self::try_emit) suppresses further
@@ -720,20 +720,20 @@ where
   /// a shed can never be lost to a full channel (no-silent-loss).
   needs_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
   /// Parked debt owed to a still-UNCLAIMED subscription (its grant unresolved), kept
-  /// APART from the offerable map (Codex R61): suppressed entries cost the flush and
+  /// APART from the offerable map: suppressed entries cost the flush and
   /// the retry timer nothing — an all-unclaimed retired cohort no longer burns
   /// full-map probes every tick. A `Cleanup::Claim` moves the entry into
   /// [`needs_rescan`](Self::needs_rescan); a `DropOrphan`/release removes it.
   suppressed_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
   /// The subscriptions whose committed [`WatchGrant`] is still **in flight** — grant sent, not yet
-  /// claimed or dropped (design driver-golden doc, Codex R24). A sub is inserted by
+  /// claimed or dropped (design driver-golden doc). A sub is inserted by
   /// [`on_watch`](Self::on_watch) the instant the grant send **succeeds**, and removed by exactly one
   /// of: its [`Cleanup::Claim`] (the caller [`defuse`](WatchGrant::defuse)d it — now genuinely owed),
   /// its [`Cleanup::DropOrphan`] via [`release_subscription`](Self::release_subscription) (the
   /// caller's wait was dropped — purged), or any other `release_subscription` (unwatch/orphan/
   /// teardown).
   ///
-  /// This is the **correctness boundary** that replaces the old mailbox-idle flush gate (Codex R23):
+  /// This is the **correctness boundary** that replaces the old mailbox-idle flush gate:
   /// [`flush_pending_rescans`](Self::flush_pending_rescans) **suppresses** (retains without sending)
   /// any parked `Rescan` whose sub is in this set. Parked debt for a still-unclaimed grant is owed to
   /// **nobody** — the caller never obtained the subscription — so offering it would deliver a `Rescan`
@@ -744,16 +744,16 @@ where
   /// durable `needs_rescan` debt is state-gated.
   unclaimed: std::collections::HashSet<Subscription>,
   /// Where the next [`flush_pending_rescans`](Self::flush_pending_rescans) pass resumes
-  /// (Codex R59/R60): the subscription whose offer found the channel full last pass —
+  ///: the subscription whose offer found the channel full last pass —
   /// retried first (inclusive), then round-robin past it — fairness over a parked map
   /// that can legitimately be as large as a caller's peak cohort, with per-pass work
   /// proportional to channel room plus unclaimed skips.
   flush_cursor: Option<Subscription>,
-  /// Test instrumentation (Codex R60): how many candidate keys the last flush pass
+  /// Test instrumentation: how many candidate keys the last flush pass
   /// visited — pins the room-proportional bound without production cost.
   #[cfg(test)]
   last_flush_visited: usize,
-  /// Test injection point (Codex R63): claims staged here are sent onto the still-open
+  /// Test injection point: claims staged here are sent onto the still-open
   /// cleanup channel at EXACTLY the raced instant — after the source-drain exit
   /// predicate's emptiness observation, before the atomic cut — the sub-instruction
   /// window no external test can hit deterministically. Empty in every real run.
@@ -761,7 +761,7 @@ where
   test_pre_cut_claims: Vec<Cleanup>,
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
-  /// The receive end of the dedicated **high-priority shutdown signal** (Codex R27): a
+  /// The receive end of the dedicated **high-priority shutdown signal**: a
   /// [`close`](Tributaries::close) sends its [`CloseReply`] here, NOT the command mailbox. The
   /// [`run`] loop and [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) check it at
   /// the TOP priority — both non-blockingly (a `try_recv`) each iteration and as the first
@@ -770,11 +770,10 @@ where
   /// reports **closed** (every [`Tributaries`] handle dropped) that is NOT itself a teardown signal
   /// — the **command** channel closing remains the dropped-handles signal — so the close arm merely
   /// disables itself and defers to the command channel. A live [`WatchGrant`] no longer holds the
-  /// command channel open (it holds the dedicated [`cleanup_tx`](Self::cleanup_tx) instead — Codex
-  /// R30), so dropping every public handle closes the mailbox promptly; any in-flight grant's
+  /// command channel open (it holds the dedicated [`cleanup_tx`](Self::cleanup_tx) instead), so dropping every public handle closes the mailbox promptly; any in-flight grant's
   /// [`Cleanup`] still lands on the owner-kept cleanup channel and is drained at teardown.
   closes: async_channel::Receiver<CloseReply>,
-  /// The owner's **strong** keep-alive sender for the dedicated grant-resolution channel (Codex R30),
+  /// The owner's **strong** keep-alive sender for the dedicated grant-resolution channel,
   /// cloned into each [`WatchGrant`] so a claimed/dropped `watch` wait can enqueue its reply-less
   /// [`Cleanup`] (a [`Claim`](Cleanup::Claim) lifting [`unclaimed`](Self::unclaimed) suppression, or a
   /// [`DropOrphan`](Cleanup::DropOrphan) reconciling the committed-but-unclaimed subscription away —
@@ -784,20 +783,20 @@ where
   /// command mailbox open past the last public handle (the dropped-handles teardown still fires). It
   /// is never received from; the receive end is [`cleanup_rx`](Self::cleanup_rx).
   cleanup_tx: async_channel::Sender<Cleanup>,
-  /// The receive end of the dedicated grant-resolution channel (Codex R30). The [`run`] loop and
+  /// The receive end of the dedicated grant-resolution channel. The [`run`] loop and
   /// [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) drain it at the **second**
   /// priority (below the close signal, above the command mailbox): a top-of-iteration full
   /// non-blocking [`drain_pending_cleanup`](Self::drain_pending_cleanup) AND a `recv()` `select!` arm.
   /// Traffic is bounded by the grants in flight (each sends exactly one [`Cleanup`]), so the full
-  /// drain — including the close-time one that replaced the O(public backlog) mailbox scan (Codex
-  /// R30-F1) — is bounded and never awaits.
+  /// drain — including the close-time one that replaced the O(public backlog) mailbox scan (
+  /// ) — is bounded and never awaits.
   cleanup_rx: async_channel::Receiver<Cleanup>,
   events: async_channel::Sender<Event<C, V>>,
   /// A **debug-only** exhaustive tripwire for the generation-unique [`Source::Handle`] contract:
   /// every handle this owner has ever observed from a successful live [`arm`](Self::arm). The arm
   /// choke point asserts each freshly-armed handle was **never** seen before, catching ANY reuse —
   /// a still-recorded sibling, or one already removed from the live index by unwatch or terminal
-  /// retirement (the post-retirement reuse the per-site live-index checks missed, Codex R17). It is
+  /// retirement (the post-retirement reuse the per-site live-index checks missed). It is
   /// only ever inserted into, never pruned, so a retired-then-reused handle is still caught;
   /// `#[cfg(debug_assertions)]` so the field, its init, and its assert add zero release-build cost.
   #[cfg(debug_assertions)]
@@ -854,9 +853,9 @@ enum Flow {
 /// Shutdown rides a **dedicated** [`closes`](Owner::closes) channel checked at the TOP priority — the
 /// first `select!` arm AND a non-blocking `try_recv` at the very top of each iteration (before the
 /// flush/valve) — so a requested close is serviced within a bounded window no matter how deep the
-/// unbounded command backlog is (Codex R27). Grant resolution rides the dedicated
+/// unbounded command backlog is. Grant resolution rides the dedicated
 /// [`cleanup_rx`](Owner::cleanup_rx) channel at the **second** priority (below close, above the
-/// mailbox — Codex R30): a top-of-iteration full [`drain_pending_cleanup`](Owner::drain_pending_cleanup)
+/// mailbox): a top-of-iteration full [`drain_pending_cleanup`](Owner::drain_pending_cleanup)
 /// AND a `select!` arm between close and commands. The command mailbox is otherwise biased above the
 /// data plane so `watch`/`unwatch` are not starved by a busy event stream. On a close request, a
 /// dropped last handle (the command channel closed), or the source draining (`next` yields `None`), it
@@ -869,13 +868,13 @@ where
   R: RuntimeLite,
   S: Source<C>,
 {
-  // Command-fairness valve state (Codex R25-F2): consecutive command-arm wins since the data plane
+  // Command-fairness valve state: consecutive command-arm wins since the data plane
   // was last serviced. See [`COMMAND_FAIRNESS_BUDGET`].
   let mut command_streak: u32 = 0;
   // Whether the dedicated close channel is still open. It closes when every [`Tributaries`] handle is
   // dropped — but that is NOT itself a teardown signal (the command channel closing remains the
   // dropped-handles teardown signal). So on a closed close channel the arm just disables itself
-  // (stops winning the biased select) and defers to the command channel (Codex R27).
+  // (stops winning the biased select) and defers to the command channel.
   let mut close_open = true;
   // The loop yields `(reply, drain_owed)`: `reply` is the close acknowledgement (if any);
   // `drain_owed` is true only on a **source drain** (the source's `next` yielded `None` while
@@ -884,7 +883,7 @@ where
   // consumer asked to stop / nobody is left), and must never block teardown on a full channel.
   let (closing, drain_owed) = loop {
     // The dedicated shutdown signal is checked FIRST every iteration, non-blockingly, BEFORE the
-    // flush and the fairness valve (Codex R27): a requested close breaks to teardown without waiting
+    // flush and the fairness valve: a requested close breaks to teardown without waiting
     // even one command dispatch or one forced data-plane service, so it can never be starved behind
     // the unbounded command backlog. A closed channel (every handle dropped) disables the check and
     // lets the command channel drive teardown; an empty one falls through to the select below.
@@ -897,7 +896,7 @@ where
     }
 
     // Grant resolution is drained SECOND — below the close check, above the flush and the command
-    // mailbox (Codex R30). A full non-blocking drain of the dedicated cleanup channel: a
+    // mailbox. A full non-blocking drain of the dedicated cleanup channel: a
     // [`Cleanup::Claim`] lifts its sub's `unclaimed` suppression BEFORE the flush below offers parked
     // Rescans (so a just-claimed sub's debt is delivered this tick), and a [`Cleanup::DropOrphan`]
     // releases the committed-but-unclaimed orphan. Traffic is bounded by the grants in flight (each
@@ -905,20 +904,20 @@ where
     owner.drain_pending_cleanup();
 
     // Re-offer the parked per-subscription overflow Rescans ahead of new deltas — **unconditionally**
-    // every tick (Codex R24). Which parked debt is *offered* is decided by owner STATE, not mailbox
+    // every tick. Which parked debt is *offered* is decided by owner STATE, not mailbox
     // timing: [`flush_pending_rescans`](Owner::flush_pending_rescans) suppresses any entry whose sub
     // is still `unclaimed` (its `WatchGrant` in flight), so an orphaned committed-but-unclaimed
     // subscription's parked terminal `Rescan` is never delivered — no probe, no window — while a
     // LIVE claimed subscription's parked Rescan is flushed every tick regardless of how busy the
     // (command-biased, unbounded) mailbox is. The old idle-mailbox gate did neither correctly: it was
     // a TOCTOU race (a `DropOrphan` could enqueue after the emptiness probe but before the flush's
-    // `try_send`, Codex R24-F1) AND it let a sustained watch/unwatch stream starve live subscriptions'
-    // parked Rescans by keeping `is_empty()` false forever (Codex R24-F2). Per-subscription ordering
+    // `try_send`) AND it let a sustained watch/unwatch stream starve live subscriptions'
+    // parked Rescans by keeping `is_empty()` false forever. Per-subscription ordering
     // and durability are unaffected (a parked sub's ordinary deltas are suppressed and its `Rescan`s
     // merged by `try_emit`; `needs_rescan` entries persist until delivered or purged).
     owner.flush_pending_rescans();
 
-    // The command-fairness valve (Codex R25-F2): the select below is command-biased, so a
+    // The command-fairness valve: the select below is command-biased, so a
     // CONTINUOUS command flood would otherwise starve the data plane entirely — the source arm
     // never pumped (claimed subscriptions miss ordinary events for the flood's whole duration) and
     // the timer arm never fired (due coalescer output held past its bounds). After
@@ -968,7 +967,7 @@ where
     // does not conflict with the disjoint `commands`/`source` borrows the other arms take). When the
     // channel is closed it resolves `None` (→ disable the arm); when disabled it parks forever, so it
     // never spins the biased select. It stays the FIRST arm below so a close always wins over a ready
-    // command (Codex R27).
+    // command.
     let closes = &owner.closes;
     let close_arm = async move {
       if close_open {
@@ -983,7 +982,7 @@ where
     // source borrows the other arms take). It wakes the parked loop when a grant resolves; the
     // top-of-iteration full drain already services everything queued, so this mainly exists so a
     // `Cleanup` arriving while the loop is otherwise idle is applied promptly. It is the SECOND arm
-    // (below close, above commands — Codex R30) and never errors while the owner lives (the owner holds
+    // (below close, above commands) and never errors while the owner lives (the owner holds
     // the strong `cleanup_tx`).
     let cleanup_rx = &owner.cleanup_rx;
     let cleanup_arm = async move { cleanup_rx.recv().await };
@@ -1028,7 +1027,7 @@ where
         // channel cannot drop it — and `retire_if_dead` returns `true`, so the ordinary fan-out is
         // skipped here. A dead-root NON-`Rescan` terminal event (e.g. a root `Removed`) is NOT
         // separately fanned out: the parked terminal `Rescan` dominates and re-enumerates it, and
-        // fanning it through the coalescer under debounce would buffer-then-drop it (Codex R12 F2).
+        // fanning it through the coalescer under debounce would buffer-then-drop it.
         // Every event on a still-live root (an ordinary delivery, or an overflow `Rescan` on a live
         // root) returns `false` and fans out normally here.
         Some(event) => {
@@ -1071,18 +1070,18 @@ where
     // top-priority close check WITHOUT running a final owed pass — yet a resuming consumer may have
     // freed a channel slot in the window between the drain's last pass and the close arriving. Run
     // ONE more non-blocking best-effort `drain_owed_once` so a now-sendable CLAIMED parked Rescan
-    // gets its last offer before teardown, mirroring the non-drain close path below (Codex R28-F2).
+    // gets its last offer before teardown, mirroring the non-drain close path below.
     // A `None` return needs none: it already delivered everything owed to a claimed sub in its final
     // pass, or the consumer is gone. Still non-blocking, so `close` stays responsive (invariant II).
-    // The ATOMIC claim cut (Codex R32), UNCONDITIONAL on every drain exit (Codex R33-F1 — the
+    // The ATOMIC claim cut, UNCONDITIONAL on every drain exit (the
     // dropped-handles `commands.recv()` Err exit returns without the drain's internal cut, and a
     // grant holds `cleanup_tx` independently of the public senders, so it can still defuse in the
     // pre-drop gap): close the cleanup channel FIRST — a grant defused after this instant fails
     // its claim try_send and is POISONED (`watch` surfaces `Closed`) — then drain what landed
     // BEFORE the cut and run the final owed pass, so a pre-cut claim still gets its parked Rescan
-    // delivered (Codex R29-F3) while no post-cut claim can ever return a live-looking subscription
-    // no drain will service. Bounded by grants in flight, never by the public backlog (Codex
-    // R30-F1); awaits nothing (invariant II). `close` is idempotent with the drain's internal cut.
+    // delivered while no post-cut claim can ever return a live-looking subscription
+    // no drain will service. Bounded by grants in flight, never by the public backlog (
+    // ); awaits nothing (invariant II). `close` is idempotent with the drain's internal cut.
     owner.cleanup_rx.close();
     owner.drain_pending_cleanup();
     owner.drain_owed_once();
@@ -1091,12 +1090,12 @@ where
     // Consumer-initiated close, or every handle dropped: drain any grant-resolution already queued at
     // close time from the dedicated cleanup channel — the same bounded pre-drain as the drain-interrupt
     // path above, for uniformity — so a `Cleanup::Claim` lifts its sub's `unclaimed` suppression BEFORE
-    // the final pass (Codex R29-F3/R30-F1). Then one best-effort non-blocking `drain_owed_once` that
+    // the final pass. Then one best-effort non-blocking `drain_owed_once` that
     // delivers the owed tail — including that just-claimed sub's now-owed debt — when the channel has
     // room. A sub STILL unclaimed after the drain stays SUPPRESSED by owner state inside
     // `drain_owed_once` (its `flush_pending_rescans`): its debt is owed to nobody and correctly
     // withheld, and the owner is exiting. Both steps await nothing, so close stays responsive.
-    // The ATOMIC claim cut first (Codex R32): close the cleanup channel so a grant defused after
+    // The ATOMIC claim cut first: close the cleanup channel so a grant defused after
     // this instant is POISONED (`watch` surfaces `Closed`), then drain the pre-cut claims below.
     owner.cleanup_rx.close();
     owner.drain_pending_cleanup();
@@ -1127,7 +1126,7 @@ const RETRY: Duration = Duration::from_millis(25);
 
 /// How many consecutive command-arm wins the [`run`] loop tolerates before forcing one
 /// non-blocking data-plane service — a `now_or_never` source poll plus a due-coalescer drain —
-/// the command-fairness valve (Codex R25-F2). The `select!` is command-biased so `Close` is never
+/// the command-fairness valve. The `select!` is command-biased so `Close` is never
 /// starved; without a budget, a CONTINUOUS watch/unwatch flood keeps the command arm ready
 /// forever and the source/timer arms never win: claimed subscriptions would miss ordinary source
 /// events and the coalescer its hold bounds for the flood's whole duration. Small enough to bound
@@ -1153,7 +1152,7 @@ where
   /// Dispatches one command from the mailbox, returning whether the [`run`] loop should keep
   /// looping or break to teardown ([`Flow`]). Called from the [`run`] loop's single `select`, one
   /// priority below the dedicated close and cleanup arms — so shutdown and grant resolution both
-  /// outrank a queued command (invariant II, Codex R30). The mailbox now carries ONLY the two
+  /// outrank a queued command (invariant II). The mailbox now carries ONLY the two
   /// caller-reply commands ([`Watch`](Command::Watch)/[`Unwatch`](Command::Unwatch)); grant
   /// resolution moved to the dedicated [`cleanup_rx`](Self::cleanup_rx) channel. The only teardown
   /// break here is the dropped-last-handle one (`Err`); a close is handled by the
@@ -1187,7 +1186,7 @@ where
   }
 
   /// Applies one grant-resolution [`Cleanup`] from the dedicated [`cleanup_rx`](Self::cleanup_rx)
-  /// channel (Codex R30). Both cases await nothing, so neither can ever park teardown (invariant II —
+  /// channel. Both cases await nothing, so neither can ever park teardown (invariant II —
   /// shutdown rides its own channel regardless):
   ///
   /// - a [`Claim`](Cleanup::Claim) removes the sub from [`unclaimed`](Self::unclaimed), lifting the
@@ -1204,7 +1203,7 @@ where
       Cleanup::Claim(sub) => {
         self.unclaimed.remove(&sub);
         // The claim lifts the suppression: any debt parked while the grant was
-        // unclaimed becomes OFFERABLE now (Codex R61 — it was kept apart so it cost
+        // unclaimed becomes OFFERABLE now (it was kept apart so it cost
         // the flush nothing until this moment).
         if let Some(parked) = self.suppressed_rescan.remove(&sub) {
           merge_max(
@@ -1223,13 +1222,13 @@ where
   }
 
   /// Drains the dedicated [`cleanup_rx`](Self::cleanup_rx) channel to empty, applying each queued
-  /// [`Cleanup`] via [`apply_cleanup`](Self::apply_cleanup) (Codex R30). Non-blocking and **bounded by
+  /// [`Cleanup`] via [`apply_cleanup`](Self::apply_cleanup). Non-blocking and **bounded by
   /// the grants in flight** (each [`WatchGrant`] sends exactly one `Cleanup`), so this full drain —
   /// run at the top of every [`run`]/[`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown)
   /// iteration AND at the close-time run tail — is bounded and awaits nothing. It replaces the old
   /// O(public backlog) close-time mailbox scan: a `Cleanup::Claim` queued at close time lifts its sub's
   /// suppression before the final owed pass, without walking the unbounded `Watch`/`Unwatch` backlog
-  /// (Codex R30-F1). The strong owner-held `cleanup_tx` keeps the
+  ///. The strong owner-held `cleanup_tx` keeps the
   /// channel open, so `try_recv` never reports `Closed` while the owner lives — the loop stops on the
   /// first `Empty`.
   fn drain_pending_cleanup(&mut self) {
@@ -1260,7 +1259,7 @@ where
   /// `Drop`/`defuse` `try_send` is unloseable regardless of any [`Tributaries`] handle — the old
   /// weak-`commands`-upgrade dance (and its "every handle gone at send time → no caller can observe
   /// the reply" orphan branch) is gone: the owner is running this reconcile, so it is alive, and the
-  /// cleanup channel it keeps is open (Codex R30).
+  /// cleanup channel it keeps is open.
   async fn on_watch(
     &mut self,
     key: Vec<C>,
@@ -1327,7 +1326,7 @@ where
   /// **Roots are always armed by the source's own policy** ([`FsSource`] uses
   /// [`Interest::all`], design §4): the caller's `interest` is recorded on the
   /// subscription as a fan-out gate, never passed to the arm.
-  /// The retired terminal parked-`Rescan` debt threshold (Codex R58/R59): `needs_rescan`
+  /// The retired terminal parked-`Rescan` debt threshold: `needs_rescan`
   /// entries whose subscription is already retired — kept so a root death parked
   /// against a full channel is never silently lost. Watch ADMISSION is refused while
   /// the count sits at or above this ([`WatchError::RescanBacklog`]): retirement only
@@ -1345,13 +1344,13 @@ where
     interest: Interest,
     filter: Filter<C>,
   ) -> Result<Subscription, WatchError> {
-    // RETIRED-DEBT ADMISSION GATE (Codex R58/R59). The invariant this enforces, stated
+    // RETIRED-DEBT ADMISSION GATE. The invariant this enforces, stated
     // honestly: retirement CONVERTS a live subscription's state into one retired parked
     // entry 1:1 (`force_remove_root` frees the subsumer/filter/epoch state as the entry
     // is parked — no growth at conversion), so a single root death can convert an
     // entire covered cohort at once and legitimately stand ABOVE this cap — bounded by
     // the caller's own peak concurrent subscriptions, memory it was already paying for
-    // while they lived (Codex R59: the cap is not a ceiling on one batch). What the
+    // while they lived (the cap is not a ceiling on one batch). What the
     // gate bounds is GROWTH: admission is the only operation that increases the
     // live-plus-retired total, so refusing fresh watches while retired debt sits at or
     // above the cap breaks every replenishment cycle — the map can never exceed
@@ -1372,8 +1371,8 @@ where
     // source's canonical coordinate, so the `Covered` path (which arms nothing, and so never
     // adopts a canonical key at arm time) can no longer commit a raw non-canonical key that later
     // canonical events fail to match: real events arrive under the canonical coordinate, so a
-    // verbatim non-canonical key would receive nothing with no `Rescan` to signal the gap (Codex
-    // R14 F1 — the Covered-path silent-loss close). A source that cannot canonicalize the key
+    // verbatim non-canonical key would receive nothing with no `Rescan` to signal the gap (
+    // — the Covered-path silent-loss close). A source that cannot canonicalize the key
     // rejects the watch here (FsSource: the path does not exist → `WatchError::Canonicalize`)
     // rather than silently committing an eventless key; a source whose keys are already canonical
     // (a generic component key) canonicalizes as the identity. The arm path still re-keys onto
@@ -1382,7 +1381,7 @@ where
     let canonical_key = self.source.canonicalize_key(key)?;
     let key = canonical_key.as_slice();
     // Plan the watch, **re-planning past any dead covering root** so no subscription ever binds a
-    // source-forgotten handle (Codex R12 F1 — the structural close of the dead-root-coverage class).
+    // source-forgotten handle (the structural close of the dead-root-coverage class).
     // The owner loop is command-biased, so a `watch` queued while a dead root's terminal event is
     // still pending runs FIRST — before [`retire_if_dead`](Self::retire_if_dead) consumes that event
     // and force-removes the root. `plan_watch` would then classify `Covered` against the
@@ -1427,18 +1426,18 @@ where
         // key was canonicalized at the top of this method (the single choke point), so committing
         // it verbatim keys the subscription on the source's canonical coordinate — the one its
         // events arrive under — closing the old Covered-path silent-loss where a raw non-canonical
-        // key was committed and then never matched a canonical event (Codex R14 F1).
+        // key was committed and then never matched a canonical event.
         let (fs_root, sub, outside_cover) = (*fs_root, *sub, *outside_cover);
         self.subsumer.commit_watch(&outcome, fs_root, key);
         self.filters.insert(sub, filter);
-        // Covered-OUTSIDE grow (M2-B v3, Codex R39): the covering root's source coverage was NARROWED
+        // Covered-OUTSIDE grow (set-cover ): the covering root's source coverage was NARROWED
         // below this newcomer's key by an earlier prune, so this `Covered` commit — which arms nothing
         // — regains no real kernel coverage on its own. GROW the source back up to a fresh cover that
         // INCLUDES the newcomer, and AWAIT it inside this caller-bounded reconcile (invariant I1, the
         // ratified fence — exactly like `arm`). The grow is applied-BEFORE-return, so the newcomer's
         // subtree is live before `watch()` returns and NO bridging `Rescan` is owed: a new watch is
         // "changes from now on", and there is no enqueue→apply window in which a write under the
-        // newly-covered subtree could be silently lost — the R39-F1 close (a full control channel that
+        // newly-covered subtree could be silently lost — the close (a full control channel that
         // deferred a fire-and-forget re-issue behind an already-flushed bridge dropped exactly that
         // write). The record then broadens EXACTLY here, on grow-RETURN — never optimistically at
         // issuance — so it always names the source's true current coverage: a second Covered newcomer
@@ -1495,7 +1494,7 @@ where
         // A fresh arm's handle is generation-unique (see `Source::Handle`), so it is absent from the
         // reverse index and `commit_watch`'s `by_handle` insert cannot clobber a live root's entry.
         // A contract-violating source is caught by the arm choke point's exhaustive observed-handle
-        // tripwire (Codex R17), which fires on ANY reuse before this commit is ever reached.
+        // tripwire, which fires on ANY reuse before this commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, filter);
         Ok(sub)
@@ -1551,7 +1550,7 @@ where
         // The wider arm's handle is generation-unique (see `Source::Handle`): it aliases none of the
         // still-recorded subsumed roots `commit_watch` is about to drop, nor any other live root, so
         // its `by_handle` insert cannot clobber a live entry. A contract-violating source is caught
-        // by the arm choke point's exhaustive observed-handle tripwire (Codex R17) before this
+        // by the arm choke point's exhaustive observed-handle tripwire before this
         // commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, filter);
@@ -1566,7 +1565,7 @@ where
           // otherwise, on a full channel, a buffered delta flushes ahead of the Rescan (the
           // coalescer admits before `try_emit` suppresses) and parks at a fresh `shed_rescan`
           // one epoch above the new root's raw-0, sorting the Rescan behind it and silently
-          // dropping post-widen events (the coalescer sibling of the Codex R5 re-point-epoch fix).
+          // dropping post-widen events (the coalescer sibling of the re-point-epoch calibration).
           if let Some(coalescer) = self.coalescer.as_mut() {
             coalescer.drop_subscription(moved);
           }
@@ -1598,14 +1597,14 @@ where
   /// dead-on-arrival handle publishes the key as watched yet backs it with **no live watch**:
   /// changes would rely on a later terminal event instead of being streamed. So after the arm
   /// this synchronously validates the handle through the same out-of-band [`Source::root_key`]
-  /// probe the Covered-reuse loop (Codex R12) and terminal retirement (R11) use; on a dead
+  /// probe the Covered-reuse loop and terminal retirement use; on a dead
   /// handle it best-effort [`disarm`](Source::disarm)s the stray root (a synchronous
   /// fire-and-forget release request) and fails the arm with [`WatchError::DeadOnArrival`].
-  /// Arm-time (R13) + reuse-time (R12) + terminal-time (R11) liveness together close the
+  /// Arm-time + reuse-time + terminal-time liveness together close the
   /// handle-liveness class.
   ///
   /// Because every arming path funnels through here, this is also where the **exhaustive**
-  /// generation-unique [`Source::Handle`] tripwire lives (Codex R17): a debug-only assert that the
+  /// generation-unique [`Source::Handle`] tripwire lives: a debug-only assert that the
   /// freshly-armed, live handle was NEVER observed by this owner before. It subsumes the old
   /// per-site live-index checks AND additionally catches reuse of a handle already removed from the
   /// live index by unwatch or terminal retirement (see `observed_handles`).
@@ -1628,8 +1627,8 @@ where
       self.source.disarm(handle);
       return Err(WatchError::DeadOnArrival);
     }
-    // The single exhaustive tripwire for the generation-unique `Source::Handle` contract (Codex
-    // R17): a freshly-armed, live handle must NEVER have been observed by this owner before. This
+    // The single exhaustive tripwire for the generation-unique `Source::Handle` contract (
+    // ): a freshly-armed, live handle must NEVER have been observed by this owner before. This
     // one choke-point check subsumes the old per-site live-index `entry(handle).is_none()` asserts
     // (Disjoint/Widen commit, restore rebind) AND additionally catches reuse of a handle already
     // removed from the live index by unwatch or terminal retirement — which those per-site checks
@@ -1649,7 +1648,7 @@ where
   /// The single synchronous subscription-release primitive (invariant I4): brand-check, purge the
   /// subscription's owner-local per-sub state (filter, epoch, parked overflow Rescan, buffered
   /// coalescer deltas — BEFORE the subsumer is consulted, so a terminal-retired orphan leaves no
-  /// false debt: Codex R20-F2), `plan_unwatch`, and — if that emptied the root — request the source
+  /// false debt), `plan_unwatch`, and — if that emptied the root — request the source
   /// release via the **synchronous** fire-and-forget [`Source::disarm`].
   ///
   /// Every subscription teardown funnels through here: the caller-initiated
@@ -1663,7 +1662,7 @@ where
   /// holds by construction on every path, with no per-path special-casing (the old defer / idle-drain
   /// / teardown-purge split collapses to one call).
   ///
-  /// The **ordering is load-bearing** (Codex R20-F2): the owner-local reclaim runs FIRST, keyed on
+  /// The **ordering is load-bearing**: the owner-local reclaim runs FIRST, keyed on
   /// `sub` alone, EVEN WHEN the subscription is already absent from the subsumer. A
   /// committed-but-unclaimed watch can be **terminal-retired** while its [`WatchGrant`] still sits in
   /// the reply slot — root death (`retire_if_dead`) parks that sub's terminal Rescan and
@@ -1695,7 +1694,7 @@ where
     }
     // Reclaim this subscription's owner-local per-sub state FIRST — its filter, epoch entry, parked
     // overflow Rescan, `unclaimed` suppression flag, and buffered coalescer deltas — keyed on `sub`
-    // ALONE, BEFORE the subsumer outcome is consulted (Codex R20-F2 — see the ordering note above).
+    // ALONE, BEFORE the subsumer outcome is consulted (see the ordering note above).
     // Neither `drain_coalescer_due`/`try_emit` re-checks live-subscription membership, so a coalescer
     // delta buffered before the reclaim must be dropped here or it would deliver for a gone
     // subscription. Removing the `unclaimed` entry here is what makes a `Cleanup::DropOrphan` (and the
@@ -1711,7 +1710,7 @@ where
     }
     // Now consult the subsumer. An already-retired sub is `Unknown` (its owner-local cleanup above
     // has already run); a live one reports whether its root emptied — or, on the non-emptied path,
-    // whether the departure left the root OVER-BROAD (design M2-B).
+    // whether the departure left the root OVER-BROAD (the set-cover design).
     let Some(outcome) = self.subsumer.plan_unwatch(sub) else {
       return Err(UnwatchError::UnknownSubscription);
     };
@@ -1730,7 +1729,7 @@ where
         // covers more than `retained`, the antichain every live subscriber still sits under. This
         // fires in BOTH shrink cases (`detect_shrink`): a full-coverage root whose root-key sub
         // departed (over-broad), AND an already-narrowed root a non-root departure lets shrink further
-        // (F2, Codex R39-F2). Request the source PRUNE its kernel coverage in place down to `retained`
+        // (F2). Request the source PRUNE its kernel coverage in place down to `retained`
         // via [`Source::set_cover`]: a synchronous fire-and-forget request modeled exactly on
         // [`Source::disarm`], so it is uniform and safe on EVERY release path (caller unwatch AND the
         // [`Cleanup::DropOrphan`] orphan AND source-drain teardown) with no async-seam split — the
@@ -1790,9 +1789,9 @@ where
   ///   re-enumerates. The subscription is live-and-covered again. The re-arm returns a
   ///   **generation-unique** handle by contract (see [`Source::Handle`]), so it can alias neither
   ///   `old` nor a not-yet-restored sibling still recorded here; the earlier defensive
-  ///   alias-detection is gone (Codex R15 — it was incomplete, and disarming an aliased handle
+  ///   alias-detection is gone (it was incomplete, and disarming an aliased handle
   ///   stranded an *unrelated live* root), replaced by the arm choke point's exhaustive
-  ///   observed-handle `debug_assert` tripwire (Codex R17) that fires loudly on a contract-violating
+  ///   observed-handle `debug_assert` tripwire that fires loudly on a contract-violating
   ///   source without corrupting release builds.
   /// - if the re-arm **fails** (the root is genuinely dead) or its committed key **diverged** (a
   ///   canonicalization race we cannot cleanly rebind), **retire** the root through the shared
@@ -1820,13 +1819,13 @@ where
           // entry. The earlier defensive alias-detection (disarm the aliased handle + retire `old`)
           // is retired: it was incomplete AND, when the alias was an unrelated *live* root, its
           // `disarm` released that root's real source watch while its record/coverage stayed live,
-          // silently missing future changes (Codex R15-F2). The generation-unique contract also
-          // forbids reusing a handle even for a *same-key* re-arm (Codex R16): if a stale pre-disarm
+          // silently missing future changes. The generation-unique contract also
+          // forbids reusing a handle even for a *same-key* re-arm: if a stale pre-disarm
           // event still carrying `old` is queued, re-arming `old` would let it route through the
           // re-armed root and be stamped in the new generation past the restore Rescan — so `old`
           // must fall to the dead-root drain path, and reusing `old` is NOT exempt. Any reuse —
           // a sibling, `old`, or a handle already removed from the live index by a prior retirement —
-          // is caught by the arm choke point's exhaustive observed-handle tripwire (Codex R17)
+          // is caught by the arm choke point's exhaustive observed-handle tripwire
           // before this rebind is ever reached.
           //
           // Re-armed at the same coordinate with a fresh handle: rebind onto it and re-point each
@@ -1837,7 +1836,7 @@ where
             // As in the widen path: the restore re-point Rescan dominates the subscriber's
             // buffered pre-widen coalescer deltas, so drop them before delivering it — else a
             // buffered delta can flush ahead of the Rescan on a full channel and park one epoch
-            // above the new root's raw-0 (the coalescer sibling of the Codex R5 fix).
+            // above the new root's raw-0 (the coalescer sibling of the re-point-epoch calibration).
             if let Some(coalescer) = self.coalescer.as_mut() {
               coalescer.drop_subscription(sub);
             }
@@ -1903,7 +1902,7 @@ where
       // lookup, so a full channel cannot drop it AND the flushed Rescan stays attributable once
       // `force_remove_root` (below) frees the sub's subsumer state — after which
       // `subscription_value` is gone, so the value MUST be captured here while the sub is still
-      // live (R4). Drop the sub's now-suspect buffered coalescer deltas — the Rescan dominates
+      // live. Drop the sub's now-suspect buffered coalescer deltas — the Rescan dominates
       // and re-enumerates them.
       let value = self.subsumer.subscription_value(sub).cloned();
       let epoch = self.epochs.shed_rescan(sub);
@@ -1944,14 +1943,14 @@ where
   ///   source-emitted `Rescan` arriving while parked is instead **merged** into the debt
   ///   ([`park_rescan_event`](Self::park_rescan_event)): it is an independent coverage-loss signal
   ///   that may name a *different* key under the same root, so discarding it would leave its
-  ///   subtree never re-enumerated (Codex R8, no silent loss under backpressure);
+  ///   subtree never re-enumerated (no silent loss under backpressure);
   /// - [`Ok`] → delivered;
   /// - [`Full`](async_channel::TrySendError::Full) → shed to a dominating `Rescan`, the mint
   ///   depending on **what** overflowed. An already-minted synthetic `Rescan` (a widen/restore
   ///   re-point, a fanned source-overflow, a terminal `Rescan`) is **parked UNCHANGED** at its own
   ///   dominating epoch ([`park_rescan_event`](Self::park_rescan_event)): re-minting it via
   ///   `shed_rescan` would push its epoch one *above* a re-point's calibrated new-root events and
-  ///   silently drop them (Codex R5). An ordinary delta instead sheds to a fresh
+  ///   silently drop them. An ordinary delta instead sheds to a fresh
   ///   [`shed_rescan`](epoch::EpochLedger::shed_rescan) ([`park_rescan`](Self::park_rescan)), whose
   ///   new dominating `Rescan` covers its loss;
   /// - [`Closed`](async_channel::TrySendError::Closed) → no-op: the consumer is gone and
@@ -1963,7 +1962,7 @@ where
       // `Rescan` is an INDEPENDENT coverage-loss signal that may name a different located key
       // under the same root; merge it into the parked debt (`merge_max` widens the key to the
       // common ancestor covering both losses) instead of discarding it, or its subtree is
-      // never re-enumerated (Codex R8, no silent loss under backpressure).
+      // never re-enumerated (no silent loss under backpressure).
       if ev.is_rescan() {
         self.park_rescan_event(ev);
       }
@@ -1973,7 +1972,7 @@ where
       Ok(()) => {}
       // An already-minted `Rescan` carries its own strictly-dominating epoch — a re-point's is the
       // rebased base its new root's raw-0/raw-1 events tie-or-exceed, so a fresh `shed_rescan` (one
-      // past the high-water) would dominate and silently drop them (Codex R5). Park it UNCHANGED; an
+      // past the high-water) would dominate and silently drop them. Park it UNCHANGED; an
       // ordinary delta sheds to a fresh dominating `shed_rescan`.
       Err(async_channel::TrySendError::Full(ev)) => {
         if ev.is_rescan() {
@@ -1993,9 +1992,9 @@ where
   /// instead (parked unchanged at its own epoch, never re-minted).
   ///
   /// This is the sole overflow-shed primitive now: a `Covered`-outside newcomer no longer bridges
-  /// through here — M2-B v3 grows the source's coverage with an **awaited**, applied-before-return
+  /// through here — set-cover grows the source's coverage with an **awaited**, applied-before-return
   /// [`Source::grow`], so the newcomer's coverage is live before `watch()` returns and owes no
-  /// bridging `Rescan` (Codex R39).
+  /// bridging `Rescan`.
   ///
   /// Looks up `sub`'s covered key (the subtree the consumer must re-enumerate) and its recorded
   /// caller value, mints a **non-rebasing** strictly-dominating epoch
@@ -2025,7 +2024,7 @@ where
   }
 
   /// Parks an already-minted synthetic [`Rescan`](EventKind::Rescan) that overflowed
-  /// the channel **UNCHANGED** (design backpressure doc, Codex R5): merges its own `key`, `epoch`,
+  /// the channel **UNCHANGED** (design backpressure doc): merges its own `key`, `epoch`,
   /// and baked `value` into `needs_rescan` via [`merge_max`], **without** minting a fresh
   /// [`shed_rescan`](epoch::EpochLedger::shed_rescan).
   ///
@@ -2063,7 +2062,7 @@ where
   /// durable `needs_rescan` set and is retried every tick until [`try_send`] accepts it, so
   /// it can never be lost to a full channel (checklist #1, no-silent-loss).
   ///
-  /// **Suppression by owner state** (Codex R24, the correctness boundary): an entry whose sub is in
+  /// **Suppression by owner state** (the correctness boundary): an entry whose sub is in
   /// [`unclaimed`](Self::unclaimed) — its committed [`WatchGrant`] still in flight — is **retained
   /// without being offered**. That debt is owed to nobody yet (the caller never obtained the
   /// subscription), so delivering it would emit a `Rescan` for a subscription the caller never
@@ -2086,8 +2085,7 @@ where
     {
       self.last_flush_visited = 0;
     }
-    // A full channel accepts nothing this pass — skip even the walk (Codex R58/R59:
-    // a pass used to clone, then merely traverse, every retained entry against an
+    // A full channel accepts nothing this pass — skip even the walk (// a pass used to clone, then merely traverse, every retained entry against an
     // already-full channel; with the map legitimately as large as a caller's peak
     // cohort, an O(map) walk per tick is real CPU).
     if self.events.is_full() {
@@ -2097,7 +2095,7 @@ where
     if len == 0 {
       return;
     }
-    // LAZY round-robin resume (Codex R59/R60): candidates come one BTreeMap range
+    // LAZY round-robin resume: candidates come one BTreeMap range
     // probe at a time — never a materialized snapshot of the map (a capacity-one
     // drain over a cohort-sized map would otherwise pay an O(map) collect per
     // delivered slot, O(map squared) overall). `resume` = retry this key first,
@@ -2107,7 +2105,7 @@ where
     // wrapping once; the pass visits at most `len` keys, and ends at the first Full.
     // Per-pass work is proportional to the offers the channel had room for plus the
     // one Full probe — unclaimed debt lives in `suppressed_rescan` and costs this
-    // pass nothing (Codex R61).
+    // pass nothing.
     let mut resume = self.flush_cursor.take();
     let mut exclusive = false;
     for _ in 0..len {
@@ -2131,8 +2129,7 @@ where
       };
       resume = Some(sub);
       exclusive = true;
-      // An unclaimed sub's debt lives in `suppressed_rescan`, never here (Codex R61 —
-      // the partition is what keeps this pass's cost offer-proportional): parks target
+      // An unclaimed sub's debt lives in `suppressed_rescan`, never here (// the partition is what keeps this pass's cost offer-proportional): parks target
       // the map matching the sub's claim state, and the claim/orphan transitions move
       // or purge entries.
       debug_assert!(
@@ -2194,7 +2191,7 @@ where
       // The filter sees a pre-delivery [`FilterInput`] (key/kind/location), NOT this projected
       // `Event` — whose epoch is still the raw source stamp and whose value is not yet baked
       // here (both are set by `stamp_into` below, only for an admitted delivery). Handing the
-      // filter the raw event would let it mis-read a provisional epoch/absent value (Codex R7);
+      // filter the raw event would let it mis-read a provisional epoch/absent value;
       // the pre-delivery view makes that impossible while exposing the correct key/kind/path.
       |sub, event: &Event<C, V>| {
         subsumer
@@ -2230,7 +2227,7 @@ where
   /// which the caller fans out normally — an overflow re-enumeration is a coverage-loss signal,
   /// not a retirement.
   ///
-  /// A dead root is retired on **any** terminal event kind, not just a `Rescan` (Codex R11 F1).
+  /// A dead root is retired on **any** terminal event kind, not just a `Rescan`.
   /// The lower fs layer can surface a watched-root deletion as a user-visible `Removed` FOLLOWED
   /// BY a terminal `Rescan`; retiring only on the `Rescan` would leave the dead root recorded
   /// across the `Removed`, so a caller that observes the `Removed` and re-`watch`es the same path
@@ -2238,13 +2235,13 @@ where
   /// first) is classified `Covered` by the still-recorded dead handle. Retiring eagerly on the
   /// `Removed` narrows that window; the structural close is [`reconcile_watch`](Self::reconcile_watch),
   /// which validates a `Covered` plan's covering root against [`Source::root_key`] and retires-and-
-  /// re-plans past a dead one regardless of terminal-event timing (Codex R12 F1).
+  /// re-plans past a dead one regardless of terminal-event timing.
   ///
   /// A non-`Rescan` terminal event (a root `Removed`) is **not** separately fanned out: it is
   /// dominated by the terminal `Rescan` this retire parks for every subscriber (redundant), and
   /// routing it through `fan_out_and_push` under debounce would admit it to the coalescer, where the
   /// retire's `drop_subscription` then discards it — buffered-then-dropped, silently losing the
-  /// promised event (Codex R12 F2). The coverage loss is signaled by the parked `Rescan` alone, which
+  /// promised event. The coverage loss is signaled by the parked `Rescan` alone, which
   /// [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan) parks into
   /// `needs_rescan` **before** the subsumer state is freed, so a full channel can never drop it — the
   /// dead-root path is then uniform (debounce or not) with nothing buffered-away, and both retirement
@@ -2268,7 +2265,7 @@ where
     // fanned out: it is dominated by that terminal `Rescan` (redundant), and routing it through
     // `fan_out_and_push` under debounce would admit it to the coalescer, where the retire's
     // `drop_subscription` then discards it — buffered-then-dropped, silently losing the promised
-    // event (Codex R12 F2). Signaling the loss via the parked `Rescan` alone keeps the dead-root path
+    // event. Signaling the loss via the parked `Rescan` alone keeps the dead-root path
     // uniform (debounce or not) with nothing buffered-away.
     self.retire_root_with_terminal_rescan(raw.handle());
     true
@@ -2283,7 +2280,7 @@ where
     let (ready, overflowed) = match self.coalescer.as_mut() {
       Some(coalescer) => {
         let now: Instant = R::now().into();
-        // Subscriptions the coalescer SHED at its buffered-entry cap (Codex R55): each
+        // Subscriptions the coalescer SHED at its buffered-entry cap: each
         // is owed the same dominating parked Rescan as a full event channel —
         // `park_rescan` mints it and purges the sub's buffered entries, so the bound
         // holds with no silent loss.
@@ -2372,8 +2369,8 @@ where
   /// Each pass runs an ordered [`drain_owed_once`](Self::drain_owed_once) (a parked sub's tail delta
   /// never precedes its `Rescan`), retried across a short [`RETRY`] sleep while the channel is full —
   /// reclaiming refused tail events (shed to durable `Rescan`s) and re-offering each parked `Rescan`.
-  /// A still-**unclaimed** sub's parked debt is **suppressed by owner state** inside that flush (Codex
-  /// R24), never delivered for a subscription the caller never obtained — no timing window. So the
+  /// A still-**unclaimed** sub's parked debt is **suppressed by owner state** inside that flush (
+  /// ), never delivered for a subscription the caller never obtained — no timing window. So the
   /// exit condition is "nothing owed to a **claimed** subscription AND no pending grant resolution":
   /// the drain stops once every remaining `needs_rescan` key is still `unclaimed` (or the set is
   /// empty) **and** the dedicated cleanup channel is empty (the linearization point — a
@@ -2393,9 +2390,9 @@ where
   /// request wait forever while the drain spins — behind a full channel a held-but-not-draining
   /// receiver keeps the channel both full and un-closed, so neither the slot-freed nor the
   /// all-receivers-dropped exit ever fires. So the dedicated [`closes`](Self::closes) signal is
-  /// checked at the TOP priority here too (Codex R27): a non-blocking `try_recv` at the top of each
+  /// checked at the TOP priority here too: a non-blocking `try_recv` at the top of each
   /// iteration AND the first arm of the retry [`select!`](futures_util::select_biased). Grant
-  /// resolution is drained at the **second** priority (Codex R30): a full non-blocking
+  /// resolution is drained at the **second** priority: a full non-blocking
   /// [`drain_pending_cleanup`](Self::drain_pending_cleanup) at the top of each iteration AND the second
   /// `select!` arm. A close interrupting the drain is returned to the caller (which does a non-blocking
   /// best-effort teardown and acks it) so `close()` always completes even mid-drain — no matter how
@@ -2410,12 +2407,12 @@ where
     // arm just disables itself and the drain keeps going until the command channel closes or the debt
     // is delivered.
     let mut close_open = true;
-    // Disabled once the atomic cut closes the cleanup channel (Codex R62): a closed,
+    // Disabled once the atomic cut closes the cleanup channel: a closed,
     // drained channel's recv errors immediately — an enabled arm would spin the select.
     let mut cleanup_open = true;
     loop {
       // The dedicated shutdown signal is checked FIRST, non-blockingly, before the cleanup drain and
-      // the owed pass (Codex R27): a close interrupts the drain without waiting behind the (possibly
+      // the owed pass: a close interrupts the drain without waiting behind the (possibly
       // flooded) command mailbox.
       if close_open {
         match self.closes.try_recv() {
@@ -2424,32 +2421,32 @@ where
           Err(async_channel::TryRecvError::Empty) => {}
         }
       }
-      // Grant resolution SECOND (Codex R30): a full non-blocking drain of the dedicated cleanup channel
+      // Grant resolution SECOND: a full non-blocking drain of the dedicated cleanup channel
       // BEFORE the owed pass and its exit check. A `Cleanup::Claim` sitting here must lift its
       // subscription's suppression FIRST — the caller defused the grant and genuinely holds the sub, so
       // its parked Rescan is owed — or the all-unclaimed exit below would read STALE `unclaimed` state
-      // and tear down having never delivered it: suppression become permanent loss (Codex R25-F1). It
+      // and tear down having never delivered it: suppression become permanent loss. It
       // is bounded by the grants in flight (not the unbounded mailbox the old bounded pre-drain
       // serviced), so a public `Watch`/`Unwatch` flood cannot starve the owed pass — owed delivery
-      // makes progress every iteration. (It is NOT the suppression boundary — owner state is, R24 — it
+      // makes progress every iteration. (It is NOT the suppression boundary — owner state is — it
       // only makes the EXIT PREDICATE read post-claim state.)
       self.drain_pending_cleanup();
       self.drain_owed_once();
       // Exit once nothing is owed to a CLAIMED subscription AND no grant resolution is still pending —
-      // the linearization point (Codex R25-F1/R30): a claim observable by now was drained above and its
+      // the linearization point: a claim observable by now was drained above and its
       // Rescan delivered by this pass; one arriving after the drain keeps `cleanup_rx` non-empty, so
       // this predicate fails and the loop delivers it next iteration; one arriving after this
       // observation is post-teardown, its subscription dead like any subscription after teardown. Every
       // remaining `needs_rescan` key still `unclaimed` means the debt is owed to nobody (and must not
       // spin the drain waiting for a grant that may never resolve); or the consumer is gone entirely.
       if (self.needs_rescan.is_empty() && self.cleanup_rx.is_empty()) || self.events.is_closed() {
-        // Test-only race injection (Codex R63): stage claims land HERE — between the
+        // Test-only race injection: stage claims land HERE — between the
         // emptiness observation and the cut — the exact window the fix below covers.
         #[cfg(test)]
         for staged in self.test_pre_cut_claims.drain(..) {
           let _ = self.cleanup_tx.try_send(staged);
         }
-        // Make the exit ATOMIC with respect to grant claims (Codex R32): another thread holding an
+        // Make the exit ATOMIC with respect to grant claims: another thread holding an
         // unpolled grant could `defuse` between the emptiness observation above and the owner's
         // drop — its claim would land on a still-open channel (a live-looking Ok) that no later
         // drain will ever process. CLOSE the cleanup channel FIRST — every subsequent claim
@@ -2463,7 +2460,7 @@ where
         // A claim that RACED the cut — sent successfully after the emptiness observation
         // above but before the close — was drained just now and may have re-armed
         // OFFERABLE debt against a full event channel, where the single best-effort pass
-        // above could not deliver it (Codex R62: its caller holds a live Ok subscription;
+        // above could not deliver it (its caller holds a live Ok subscription;
         // returning here would strand its terminal Rescan forever). Exit only once no
         // offerable debt remains (or nobody is left listening); otherwise stay in the
         // drain loop — the cut is done, so no NEW claims can land (they poison), the
@@ -2478,7 +2475,7 @@ where
       futures_util::pin_mut!(sleep);
       // The dedicated close arm, borrowing ONLY the close receiver (disjoint from the cleanup/commands
       // borrows the next arms take). It is the FIRST arm so a close always wins over a queued cleanup or
-      // command (Codex R27); on a closed channel it resolves `None` (→ disable) and on disable it parks.
+      // command; on a closed channel it resolves `None` (→ disable) and on disable it parks.
       let closes = &self.closes;
       let close_arm = async move {
         if close_open {
@@ -2488,7 +2485,7 @@ where
           futures_util::future::pending::<Option<CloseReply>>().await
         }
       };
-      // The dedicated cleanup arm (SECOND, below close, above commands — Codex R30): wakes the drain
+      // The dedicated cleanup arm (SECOND, below close, above commands): wakes the drain
       // when a grant resolves mid-retry so its `Cleanup::Claim` lifts suppression / `Cleanup::DropOrphan`
       // purges before the next owed pass. Never errors while the owner lives (it holds `cleanup_tx`).
       let cleanup_rx = &self.cleanup_rx;
@@ -2512,7 +2509,7 @@ where
           // A grant resolution mid-drain: apply it and loop (the next iteration's top drain handles any
           // more).
           Some(cleanup) => self.apply_cleanup(cleanup),
-          // Closed (the post-cut iterations, Codex R62): disable the arm — the cut already drained
+          // Closed (the post-cut iterations): disable the arm — the cut already drained
           // every pre-cut claim, and later grants poison at their own try_send.
           None => cleanup_open = false,
         },
@@ -2537,7 +2534,7 @@ where
   ///
   /// The mailbox now carries ONLY these two caller-reply commands; grant resolution
   /// ([`Cleanup::Claim`]/[`Cleanup::DropOrphan`]) rides the dedicated cleanup channel, handled by
-  /// [`apply_cleanup`](Self::apply_cleanup) (Codex R30). A close is **never** one of these either:
+  /// [`apply_cleanup`](Self::apply_cleanup). A close is **never** one of these either:
   /// shutdown rides the dedicated [`closes`](Self::closes) signal, handled by its own arm. This awaits
   /// nothing, so it can never park teardown (invariant II).
   fn handle_teardown_command(&mut self, cmd: Command<C, V>) {
@@ -2557,7 +2554,7 @@ where
 /// owning subscription's baked `value` — the latter captured **while the subscription is live**
 /// (at park / retire time), so the Rescan minted from this entry by
 /// [`flush_pending_rescans`](Owner::flush_pending_rescans) stays attributable even after the
-/// subscription/root is retired and the [`WatchView`] is emptied (design §3, R4).
+/// subscription/root is retired and the [`WatchView`] is emptied (design §3).
 struct ParkedRescan<C, V> {
   /// The subscription's covered key — the subtree the consumer re-enumerates.
   key: Vec<C>,
@@ -2598,7 +2595,7 @@ fn merge_max<C: PartialEq, V>(
       // parked `Rescan` covers BOTH re-enumeration debts. Overwriting with `key` is correct
       // only when it is an ancestor of the parked key; two independent source `Rescan`s under
       // one root (say /a/x then /a/y) are siblings, and dropping either's coverage is silent
-      // loss (Codex R8). Their common prefix (/a) re-enumerates a superset of both, and where
+      // loss. Their common prefix (/a) re-enumerates a superset of both, and where
       // `key` *is* an ancestor of the parked key the prefix is exactly `key` (unchanged
       // behavior for the re-point/terminal/ordinary-shed paths).
       let common = key
