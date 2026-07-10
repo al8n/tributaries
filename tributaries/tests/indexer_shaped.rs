@@ -16,8 +16,14 @@
 //! (bounded) until the expected fact is observed. The one place overflow must be *forced*
 //! (backpressure) drives the producer strictly ahead of the consumer rather than sleeping.
 
-// not(miri): drives a real kernel watch and a tokio runtime — syscalls miri cannot execute.
-#![cfg(all(feature = "tokio", not(miri)))]
+// Drives a real kernel watch on a tokio runtime: off miri (which cannot execute the
+// syscalls) and gated onto the platforms with a real backend (elsewhere `tributary-fs`
+// compiles but arms fail at runtime).
+#![cfg(all(
+  feature = "tokio",
+  not(miri),
+  any(target_os = "macos", target_os = "linux")
+))]
 
 use std::{
   collections::{HashSet, VecDeque},
