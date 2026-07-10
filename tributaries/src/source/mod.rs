@@ -33,12 +33,13 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
-  Event as FsEvent, EventKind as FsEventKind, RootHandle, WatchRootError, Watcher, WatcherOptions,
+  Event as FsEvent, EventKind as FsEventKind, RootHandle, SourceError, WatchRootError, Watcher,
+  WatcherOptions,
 };
 use tributary_proto::{ChangeId, Epoch, Interest, Location};
 
 use crate::{
-  error::{BuildError, WatchError},
+  error::{BuildError, FaultKind, SourceFault, WatchError},
   event::{EventKind, path_components},
 };
 
@@ -708,10 +709,15 @@ impl<R: RuntimeLite> FsSource<R> {
   ///
   /// # Errors
   ///
-  /// [`BuildError::Fs`] when the underlying `tributary-fs` watcher cannot be built.
+  /// [`BuildError::Source`] when the underlying `tributary-fs` watcher cannot be built.
   pub fn new(options: WatcherOptions) -> Result<Self, BuildError> {
+    // The only fs build failure is a configuration bound (too many exclusion paths); it
+    // has no dedicated neutral kind, so it folds to `Other` with the whole fs error
+    // preserved in the box for `BuildError::as_fs` recovery.
+    let watcher = Watcher::new(options)
+      .map_err(|err| BuildError::Source(SourceFault::new(FaultKind::Other).with_source(err)))?;
     Ok(Self {
-      watcher: Watcher::new(options)?,
+      watcher,
       pending_releases: VecDeque::new(),
       enqueued: Vec::new(),
       pending_set: HashSet::new(),
@@ -741,11 +747,21 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     // Idempotent on an already-canonical path (`canonicalize` is a fixed point there), as the
     // trait's idempotence contract requires.
     let supplied = key_to_path(key);
-    let canonical =
-      std::fs::canonicalize(&supplied).map_err(|source| WatchError::Canonicalize {
-        path: supplied,
-        source,
-      })?;
+    let canonical = std::fs::canonicalize(&supplied).map_err(|source| {
+      // Classify by the io error's kind — the two cases a caller can act on distinctly
+      // (a missing path vs a permission wall) — and fold the rest to `Other`; the whole
+      // io error is preserved in the box either way. The key's display form is this
+      // binding's own rendering (the neutral error is not path-typed).
+      let kind = match source.kind() {
+        std::io::ErrorKind::NotFound => FaultKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => FaultKind::PermissionDenied,
+        _ => FaultKind::Other,
+      };
+      WatchError::canonicalize(
+        supplied.display().to_string(),
+        SourceFault::new(kind).with_source(source),
+      )
+    })?;
     Ok(path_components(&canonical))
   }
 
@@ -861,10 +877,13 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
             let _ = self.watcher.unwatch(released).await;
             self.pending_set.remove(&released);
           } else {
-            return Err(WatchError::Fs(WatchRootError::Overlaps { path, existing }));
+            return Err(watch_error_from_fs(WatchRootError::Overlaps {
+              path,
+              existing,
+            }));
           }
         }
-        Err(err) => return Err(err.into()),
+        Err(err) => return Err(watch_error_from_fs(err)),
       }
     };
     // Adopt the filesystem-authoritative canonical path as the committed key (design §4, the
@@ -990,6 +1009,32 @@ impl SourceEvent<OsString, RootHandle> {
       Some(event.change_id()),
     )
   }
+}
+
+/// Maps a raw `tributary-fs` watch-root error into the umbrella's neutral error
+/// vocabulary — the error half of the fs-to-neutral binding (its event half is
+/// [`SourceEvent::from_fs`]), and the one place the fs error enum crosses the seam.
+///
+/// Classification is honest-and-conservative, mirroring the source-honesty contract on
+/// [`EventKind`]: each fs case maps to its neutral [`FaultKind`], an unknown future case
+/// degrades to [`Other`](FaultKind::Other), and a closed watcher maps to the umbrella's
+/// own [`WatchError::Closed`] (the uniform "the stack is closed" signal). The whole fs
+/// error is always preserved in the fault's box, so [`WatchError::as_fs`] recovers full
+/// fidelity.
+fn watch_error_from_fs(err: WatchRootError) -> WatchError {
+  let kind = match &err {
+    WatchRootError::NotFound { .. } => FaultKind::NotFound,
+    WatchRootError::NotADirectory { .. } => FaultKind::NotADirectory,
+    WatchRootError::Overlaps { .. } => FaultKind::Conflict,
+    WatchRootError::Source(source) => match source {
+      SourceError::Unsupported => FaultKind::Unsupported,
+      SourceError::InstanceLimit => FaultKind::Capacity,
+      _ => FaultKind::Other,
+    },
+    WatchRootError::Closed => return WatchError::Closed,
+    _ => FaultKind::Other,
+  };
+  WatchError::source(SourceFault::new(kind).with_source(err))
 }
 
 /// Rebuilds a filesystem path from key components — the reverse of

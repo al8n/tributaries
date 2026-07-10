@@ -114,7 +114,7 @@ mod view;
 
 pub use demux::{Demux, Lane};
 pub use driver::Tributaries;
-pub use error::{BuildError, CloseError, UnwatchError, WatchError};
+pub use error::{BuildError, CloseError, FaultKind, SourceFault, UnwatchError, WatchError};
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
 pub use options::{DebounceConfig, TributariesOptions};

@@ -9,12 +9,12 @@ use std::{
 };
 
 use agnostic_lite::tokio::TokioRuntime;
-use tributary_fs::{ChangeId, Epoch, Interest, Location, WatchRootError};
+use tributary_fs::{ChangeId, Epoch, Interest, Location};
 
 use super::{Owner, epoch::EpochLedger, interest_admits};
 use crate::{
   coalesce::Coalescer,
-  error::{UnwatchError, WatchError},
+  error::{FaultKind, SourceFault, UnwatchError, WatchError},
   event::{Event, EventKind},
   filter::Filter,
   options::{DebounceConfig, TributariesOptions},
@@ -59,8 +59,8 @@ enum Call {
 /// requested one — the design §4 TOCTOU).
 ///
 /// **It enforces the source's disjoint-root contract** (mirroring [`tributary_fs::Watcher`]):
-/// arming a key overlapping a currently-armed fake root returns
-/// [`WatchRootError::Overlaps`], so the widen-ordering tests validate a *real-executable*
+/// arming a key overlapping a currently-armed fake root returns a
+/// [`FaultKind::Conflict`] fault, so the widen-ordering tests validate a *real-executable*
 /// sequence — a naive arm-before-unwatch would be rejected here just as the kernel watcher
 /// rejects it.
 struct FakeSource {
@@ -225,10 +225,11 @@ impl Source<OsString> for FakeSource {
       // Re-key onto the modelled canonical coordinate.
       Some(Some(canonical)) => Ok(canonical.clone()),
       // A key the source cannot canonicalize (non-existent path): reject, don't commit-eventless.
-      Some(None) => Err(WatchError::Canonicalize {
-        path: k.iter().collect(),
-        source: io::Error::other("injected non-canonicalizable key"),
-      }),
+      Some(None) => Err(WatchError::canonicalize(
+        k.iter().collect::<PathBuf>().display().to_string(),
+        SourceFault::new(FaultKind::NotFound)
+          .with_source(io::Error::other("injected non-canonicalizable key")),
+      )),
       // Absent → already canonical (identity), the common case.
       None => Ok(k.to_vec()),
     }
@@ -239,10 +240,9 @@ impl Source<OsString> for FakeSource {
     self.calls.push(Call::Arm(path.clone()));
     if self.fail_arms > 0 {
       self.fail_arms -= 1;
-      return Err(WatchError::Canonicalize {
-        path,
-        source: io::Error::other("injected arm failure"),
-      });
+      return Err(WatchError::source(
+        SourceFault::new(FaultKind::Other).with_source(io::Error::other("injected arm failure")),
+      ));
     }
     // The disjoint-root contract (design §4): reject a key overlapping any live root,
     // exactly as `tributary_fs::Watcher` does — this forces disarm-before-arm on a widen.
@@ -252,7 +252,13 @@ impl Source<OsString> for FakeSource {
       .find(|live| path.starts_with(live) || live.starts_with(&path))
       .cloned()
     {
-      return Err(WatchError::Fs(WatchRootError::Overlaps { path, existing }));
+      return Err(WatchError::source(
+        SourceFault::new(FaultKind::Conflict).with_source(io::Error::other(format!(
+          "fake root {} overlaps the already-armed {}",
+          path.display(),
+          existing.display()
+        ))),
+      ));
     }
     // Mint a fresh monotonic handle, UNLESS a test forced this arm to reuse a specific value (a
     // `Source::Handle` generation-unique contract violation) to drive the restore's debug_assert.
@@ -1774,10 +1780,7 @@ async fn dropping_the_parts_future_is_hard_teardown() {
     .watch(key("/a"), (), Interest::all(), Filter::all())
     .await
     .expect_err("watch against a dropped driver surfaces Closed");
-  assert!(
-    matches!(err, WatchError::Fs(WatchRootError::Closed)),
-    "got {err:?}"
-  );
+  assert!(matches!(err, WatchError::Closed), "got {err:?}");
   assert!(
     !w.view().is_watched(&key("/a")),
     "the read plane is empty-and-honest after the hard teardown"
@@ -1874,10 +1877,7 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
     .expect("the watch settles")
     .expect("task")
     .expect_err("a cancelled owner surfaces Closed to the in-flight watch");
-  assert!(
-    matches!(err, WatchError::Fs(WatchRootError::Closed)),
-    "got {err:?}"
-  );
+  assert!(matches!(err, WatchError::Closed), "got {err:?}");
 }
 
 /// the coalescer's buffered-entry cap engages the EXISTING loss-accounting
@@ -2304,10 +2304,13 @@ async fn canonical_race_that_changes_subsumption_aborts_cleanly() {
   h.watch("/a", Interest::all()).await.expect("watch /a");
 
   h.owner.source.retarget("/b", "/a/inside");
-  let result = h.watch("/b", Interest::all()).await;
+  let err = h
+    .watch("/b", Interest::all())
+    .await
+    .expect_err("a subsumption-changing canonical race aborts");
   assert!(
-    result.is_err(),
-    "a subsumption-changing canonical race aborts"
+    err.is_canonical_race(),
+    "the abort is the retryable canonical-race error, got {err:?}"
   );
 
   let roots: Vec<PathBuf> = h

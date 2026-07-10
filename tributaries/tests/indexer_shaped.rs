@@ -39,8 +39,8 @@ use std::{
 use agnostic_lite::{RuntimeLite, tokio::TokioRuntime};
 use tempfile::TempDir;
 use tributaries::{
-  Armed, DebounceConfig, Epoch, Event, EventKind, Filter, Interest, RootHandle, Source,
-  SourceEvent, Subscription, Tributaries, TributariesOptions, WatchError, WatchView,
+  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, Filter, Interest, RootHandle, Source,
+  SourceEvent, SourceFault, Subscription, Tributaries, TributariesOptions, WatchError, WatchView,
   WatcherOptions,
 };
 use tributary_fs::{EventKind as FsEventKind, WatchRootError, Watcher};
@@ -86,6 +86,23 @@ struct IndexerSource<R: RuntimeLite> {
 /// Mirror of the fs source's [`OPPORTUNISTIC_RELEASES`](../src/source/mod.rs): the oldest few queued
 /// releases each `arm` applies up front (bounded, keeps clause 5 eventual).
 const OPPORTUNISTIC_RELEASES: usize = 2;
+
+/// Maps a raw fs watch-root error into the umbrella's neutral error vocabulary at this
+/// binding — the error half of the source's fs-to-neutral map (its event half is the
+/// kind map in `next`), exactly as a downstream custom source classifies its own
+/// transport failures. Honest-and-conservative: the cases this source can hit map to
+/// their neutral kinds, anything else degrades to `Other`, a closed watcher maps to the
+/// umbrella's own `Closed`, and the whole fs error rides in the fault's box.
+fn fs_fault(err: WatchRootError) -> WatchError {
+  let kind = match &err {
+    WatchRootError::NotFound { .. } => FaultKind::NotFound,
+    WatchRootError::NotADirectory { .. } => FaultKind::NotADirectory,
+    WatchRootError::Overlaps { .. } => FaultKind::Conflict,
+    WatchRootError::Closed => return WatchError::Closed,
+    _ => FaultKind::Other,
+  };
+  WatchError::source(SourceFault::new(kind).with_source(err))
+}
 
 impl<R: RuntimeLite> IndexerSource<R> {
   fn new(watcher: Watcher<R>, mounts: Vec<(Vec<Comp>, PathBuf)>) -> Self {
@@ -192,7 +209,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
               .as_deref()
               .is_some_and(|ek| stored.as_deref() == Some(ek))
           }) else {
-            return Err(WatchError::Fs(WatchRootError::Overlaps {
+            return Err(fs_fault(WatchRootError::Overlaps {
               path: rejected,
               existing,
             }));
@@ -204,7 +221,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
           let _ = self.watcher.unwatch(released).await;
           self.pending_set.remove(&released);
         }
-        Err(err) => return Err(err.into()),
+        Err(err) => return Err(fs_fault(err)),
       }
     };
     // Adopt the filesystem-authoritative canonical path as the committed key (design §4):
