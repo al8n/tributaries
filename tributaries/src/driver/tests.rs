@@ -1614,6 +1614,103 @@ async fn covered_sub_with_wider_interest_still_delivered() {
   );
 }
 
+/// Codex R52: the public command mailbox is BOUNDED — a submission past
+/// `command_capacity` awaits ADMISSION while the owner is parked inside a
+/// caller-bounded reconcile, so poll-then-cancel callers can never grow the queue (a
+/// cancel before admission leaves nothing queued). Race-free negative window: the
+/// gated arm parks the owner, capacity 1 is filled by the second watch, and this test
+/// controls both the gate and the only submitters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_admission_backpressures_when_the_mailbox_is_full() {
+  struct GatedArmSource {
+    inner: FakeSource,
+    /// Each `arm` awaits one token before delegating — the owner parks mid-reconcile
+    /// until the test feeds it.
+    gate: async_channel::Receiver<()>,
+  }
+
+  impl Source<OsString> for GatedArmSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      self.inner.canonicalize_key(key)
+    }
+
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      let _ = self.gate.recv().await;
+      self.inner.arm(key).await
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.inner.disarm(handle);
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      // Keep the source alive: the FakeSource's instant `None` would drain the owner
+      // before the watches under test even arrive.
+      core::future::pending().await
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.inner.root_key(handle)
+    }
+  }
+
+  let (gate_tx, gate_rx) = async_channel::unbounded::<()>();
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> = super::Tributaries::with_source(
+    GatedArmSource {
+      inner: FakeSource::new(),
+      gate: gate_rx,
+    },
+    TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(1).unwrap()),
+  );
+
+  // Watch 1 is consumed by the owner, which parks inside the gated arm. Watch 2 then
+  // fills the capacity-1 mailbox. Watch 3's submission must AWAIT admission.
+  let w1 = {
+    let w = w.clone();
+    tokio::spawn(async move {
+      w.watch(key("/one"), (), Interest::all(), Filter::all())
+        .await
+    })
+  };
+  let w2 = {
+    let w = w.clone();
+    tokio::spawn(async move {
+      w.watch(key("/two"), (), Interest::all(), Filter::all())
+        .await
+    })
+  };
+  // Deterministic fill order: give the owner and the two submitters time to reach
+  // their steady state (owner parked in arm; mailbox holding exactly one command).
+  tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+  let w3 = {
+    let w = w.clone();
+    tokio::spawn(async move {
+      w.watch(key("/three"), (), Interest::all(), Filter::all())
+        .await
+    })
+  };
+  tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+  assert!(
+    !w3.is_finished(),
+    "the third watch awaits mailbox ADMISSION while the owner is parked and the \
+     capacity-1 mailbox is full (Codex R52) — it must not resolve, and nothing queues"
+  );
+
+  // Open the gate for all three arms: every submission admits, reconciles, resolves.
+  for _ in 0..3 {
+    gate_tx.send(()).await.expect("feed the arm gate");
+  }
+  for handle in [w1, w2, w3] {
+    tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+      .await
+      .expect("watch resolves once the owner unparks")
+      .expect("task")
+      .expect("watch succeeds");
+  }
+}
+
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
 /// interest bit (design §5) — directly constructible now that the umbrella owns the
 /// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`
@@ -4820,8 +4917,12 @@ async fn close_is_not_starved_by_a_prefilled_command_backlog_and_flood() {
     live: HashMap::new(),
     drain: drain_rx, // held open (`_drain_tx` kept alive) so `next()` parks forever
   };
-  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> = super::Tributaries::with_source(
+    source,
+    // The mailbox is BOUNDED since Codex R52; size it to this test's full 500-deep
+    // prefill so the close-vs-deepest-possible-backlog shape is preserved.
+    TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(500).unwrap()),
+  );
 
   // A live claimed subscription, so the owner is genuinely running with real state (the finding's
   // "owner/source kept alive while shutdown is requested").
@@ -4829,9 +4930,10 @@ async fn close_is_not_starved_by_a_prefilled_command_backlog_and_flood() {
     .await
     .expect("watch /a");
 
-  // Prefill the UNBOUNDED command mailbox with MANY fail-fast Watch commands: each reply receiver is
-  // dropped, so the owner's send-back fails and it releases the orphan synchronously (arm→disarm) —
-  // real per-command work the old FIFO `Close` would have queued behind.
+  // Prefill the command mailbox to its FULL configured depth with fail-fast Watch commands: each
+  // reply receiver is dropped, so the owner's send-back fails and it releases the orphan
+  // synchronously (arm→disarm) — real per-command work the old FIFO `Close` would have queued
+  // behind.
   for _ in 0..500 {
     let (reply, response) = futures_channel::oneshot::channel();
     drop(response);
