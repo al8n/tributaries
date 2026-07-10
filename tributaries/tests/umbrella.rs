@@ -12,10 +12,16 @@
 //! additional `Rescan`s — are always legal. A backend that reports nothing within the
 //! deadline fails loudly rather than hanging (the outer `timeout`).
 
-// not(miri): drives a real kernel watch and a tokio runtime — syscalls miri cannot
-// execute. The sans-I/O logic these exercise (subsumption, fan-out, coalescing, epoch
-// rebasing) is covered exhaustively by the crate's lib unit + property tests.
-#![cfg(all(feature = "tokio", not(miri)))]
+// Drives a real kernel watch on a tokio runtime: off miri (which cannot execute the
+// syscalls) and gated onto the platforms with a real backend (elsewhere `tributary-fs`
+// compiles but arms fail at runtime). The sans-I/O logic these exercise (subsumption,
+// fan-out, coalescing, epoch rebasing) is covered exhaustively by the crate's lib
+// unit + property tests.
+#![cfg(all(
+  feature = "tokio",
+  not(miri),
+  any(target_os = "macos", target_os = "linux")
+))]
 
 use std::{
   collections::HashSet,

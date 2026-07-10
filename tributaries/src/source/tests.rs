@@ -59,10 +59,16 @@ fn round_trips_root() {
   assert_round_trips(&["/"]);
 }
 
-// The integration suite drives a real kernel watch on a tokio runtime — syscalls miri
-// cannot execute — so it is gated on the runtime feature and off miri, exactly like the
-// umbrella integration suite. The key ↔ path round-trip above is the miri-scoped part.
-#[cfg(all(feature = "tokio", not(miri)))]
+// The integration suite drives a real kernel watch on a tokio runtime — so it is gated
+// on the runtime feature, off miri (which cannot execute the syscalls), and onto the
+// platforms with a real backend (elsewhere `tributary-fs` compiles but arms fail at
+// runtime), exactly like the umbrella integration suite. The key ↔ path round-trip
+// above is the portable part.
+#[cfg(all(
+  feature = "tokio",
+  not(miri),
+  any(target_os = "macos", target_os = "linux")
+))]
 mod integration {
   use std::{ffi::OsString, path::PathBuf, time::Duration};
 
@@ -233,7 +239,7 @@ mod integration {
     );
   }
 
-  /// : a DISJOINT arm AWAITS NOTHING for releases, and its opportunistic hand-off is HARD
+  /// A DISJOINT arm AWAITS NOTHING for releases, and its opportunistic hand-off is HARD
   /// BUDGETED. Each drained release is `request_unwatch`ed (a reply-less `try_send`) and moved to the
   /// in-flight sidecar, never awaited — so a caller-bounded `Watch` (and any `close` queued behind it)
   /// is decoupled from every release's teardown latency (contract clause 2/5) — and the drain stops
