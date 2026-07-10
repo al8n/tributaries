@@ -340,8 +340,45 @@ where
   /// embedded in `options` are unused here.
   ///
   /// This is the generic construction path; the pure-fs [`new`](Self::new) builds a
-  /// [`FsSource`] and delegates here.
+  /// [`FsSource`] and delegates here. For caller-owned spawning — structured
+  /// concurrency, a `LocalSet`, or an executor outside `agnostic-lite` — use
+  /// [`parts`](Self::parts) and spawn the returned driver future yourself.
   pub fn with_source<S>(source: S, options: impl Into<TributariesOptions>) -> Self
+  where
+    S: Source<C, Handle = H> + Send + 'static,
+  {
+    let (this, driver) = Self::parts(source, options);
+    R::spawn_detach(driver);
+    this
+  }
+
+  /// Builds a watcher over any [`Source`] WITHOUT spawning: returns the handle and the
+  /// owner's driver future for the CALLER to spawn — on `R` via
+  /// [`with_source`](Self::with_source)'s one-liner, on a `LocalSet`, under structured
+  /// concurrency, or on any executor compatible with `R`'s timers (M2-E).
+  ///
+  /// Three caveats bind the caller:
+  ///
+  /// - **Liveness is yours.** The watcher makes progress only while the driver future
+  ///   is being polled. A future that is held but never polled leaves every submitted
+  ///   [`watch`](Self::watch)/[`unwatch`](Self::unwatch)/[`close`](Self::close)
+  ///   pending forever — nothing errors, nothing times out.
+  /// - **Dropping the future is hard teardown.** The owner's drop publishes an empty
+  ///   read plane and closes every channel: in-flight and later calls surface
+  ///   `Closed`/`Stopped`, [`next`](Self::next) drains then ends. Orderly shutdown is
+  ///   [`close`](Self::close) — polled to completion — not dropping the driver.
+  /// - **Timer compatibility.** The driver awaits `R`'s timers
+  ///   ([`RuntimeLite::sleep_until`]) for the coalescer and the parked-Rescan retry
+  ///   floor, so it must be polled on an executor those timers work under — a
+  ///   tokio-flavored `R` panics off a tokio reactor, while async-io-backed runtimes
+  ///   run anywhere.
+  ///
+  /// The returned future is `Send` (pinned by the crate's compile-time owner proofs),
+  /// so it is spawnable on both work-stealing and local executors.
+  pub fn parts<S>(
+    source: S,
+    options: impl Into<TributariesOptions>,
+  ) -> (Self, impl Future<Output = ()> + Send + 'static)
   where
     S: Source<C, Handle = H> + Send + 'static,
   {
@@ -391,14 +428,16 @@ where
       observed_handles: std::collections::HashSet::new(),
       _rt: PhantomData::<R>,
     };
-    R::spawn_detach(run(owner));
-    Self {
-      commands: command_tx,
-      closes: close_tx,
-      events: event_rx,
-      view,
-      _rt: PhantomData,
-    }
+    (
+      Self {
+        commands: command_tx,
+        closes: close_tx,
+        events: event_rx,
+        view,
+        _rt: PhantomData,
+      },
+      run(owner),
+    )
   }
 }
 

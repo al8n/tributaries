@@ -440,6 +440,41 @@ async fn registration_backpressures_while_the_demux_is_stalled() {
     .expect("registrar task");
 }
 
+/// M2-E `Demux::parts`: the caller owns the routing task's spawn — routing works when
+/// the caller polls the returned future, and end-of-stream fan-in survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn demux_parts_routes_when_caller_spawned() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let (demux, rest, driver) = Demux::parts(w.clone(), 16);
+  let routing = tokio::spawn(driver);
+  let lane_a = demux.lane(sub_a, 16).await;
+
+  feed.modified("/a", "/a/one").await;
+  assert_eq!(recv(&lane_a).await.subscription(), sub_a);
+
+  // End the stream: the caller-spawned routing future exits and closes every lane.
+  drop(feed);
+  assert!(
+    tokio::time::timeout(DEADLINE, lane_a.recv())
+      .await
+      .expect("lane settles")
+      .is_none(),
+    "lane ends after end-of-stream fan-in"
+  );
+  assert!(
+    tokio::time::timeout(DEADLINE, rest.recv())
+      .await
+      .expect("rest settles")
+      .is_none(),
+    "rest ends too"
+  );
+  tokio::time::timeout(DEADLINE, routing)
+    .await
+    .expect("the routing future completes at end-of-stream")
+    .expect("routing task");
+}
+
 /// Codex R50: releases LOST to a full control queue cannot leak the table. The exact
 /// repro: stall the router on a full lane, admit CONTROL_CAPACITY registrations (the
 /// queue is now full), drop every one of those lanes — each drop-release try_send

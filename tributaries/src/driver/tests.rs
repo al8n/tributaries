@@ -1711,6 +1711,75 @@ async fn watch_admission_backpressures_when_the_mailbox_is_full() {
   }
 }
 
+/// M2-E `parts()`: the caller owns the spawn — the same construction as `with_source`
+/// minus the detach. Spawning the returned driver future manually drives the full
+/// watch → unwatch → close lifecycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parts_future_drives_the_watcher_when_caller_spawned() {
+  struct AliveSource(FakeSource);
+  impl Source<OsString> for AliveSource {
+    type Handle = u32;
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      self.0.canonicalize_key(key)
+    }
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      self.0.arm(key).await
+    }
+    fn disarm(&mut self, handle: u32) {
+      self.0.disarm(handle);
+    }
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      // Keep the source alive (FakeSource's instant `None` would drain the owner).
+      core::future::pending().await
+    }
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.0.root_key(handle)
+    }
+  }
+
+  let (w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
+    super::Tributaries::parts(AliveSource(FakeSource::new()), TributariesOptions::new());
+  let driver = tokio::spawn(driver);
+
+  let sub = w
+    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .await
+    .expect("watch through the caller-spawned driver");
+  assert!(w.view().is_watched(&key("/a")), "the read plane published");
+  w.unwatch(sub).await.expect("unwatch");
+  w.close()
+    .await
+    .expect("close resolves — the caller-spawned driver serviced it");
+  tokio::time::timeout(Duration::from_secs(5), driver)
+    .await
+    .expect("the driver future completes after close")
+    .expect("driver task");
+}
+
+/// M2-E `parts()` caveat two, pinned: DROPPING the un-spawned driver future is hard
+/// teardown — the owner's drop publishes an empty read plane and closes every channel,
+/// so calls surface Closed/Stopped rather than hanging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_parts_future_is_hard_teardown() {
+  let (mut w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
+    super::Tributaries::parts(FakeSource::new(), TributariesOptions::new());
+  drop(driver);
+
+  let err = w
+    .watch(key("/a"), (), Interest::all(), Filter::all())
+    .await
+    .expect_err("watch against a dropped driver surfaces Closed");
+  assert!(
+    matches!(err, WatchError::Fs(WatchRootError::Closed)),
+    "got {err:?}"
+  );
+  assert!(
+    !w.view().is_watched(&key("/a")),
+    "the read plane is empty-and-honest after the hard teardown"
+  );
+  assert!(w.next().await.is_none(), "the event stream is ended");
+}
+
 /// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
 /// interest bit (design §5) — directly constructible now that the umbrella owns the
 /// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`
