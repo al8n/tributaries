@@ -15,9 +15,7 @@ use crate::{
   driver::Tributaries,
   error::WatchError,
   event::{Event, EventKind},
-  filter::Filter,
-  interest::Interest,
-  options::TributariesOptions,
+  options::{TributariesOptions, WatchOptions},
   source::{Armed, Source, SourceEvent},
   subscription::Subscription,
 };
@@ -145,9 +143,9 @@ fn rig(capacity: usize) -> (Tributaries<OsString, (), TokioRuntime, u32>, Feed) 
   )
 }
 
-/// Watches `path` with all-admitting interest/filter.
+/// Watches `path` with the deliver-everything default options.
 async fn watch(w: &Tributaries<OsString, (), TokioRuntime, u32>, path: &str) -> Subscription {
-  w.watch(key(path), (), Interest::all(), Filter::all())
+  w.watch(key(path), (), WatchOptions::new())
     .await
     .expect("watch")
 }

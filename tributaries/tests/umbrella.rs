@@ -34,7 +34,8 @@ use std::{
 
 use tempfile::TempDir;
 use tributaries::{
-  DebounceConfig, Event, Filter, Interest, Subscription, TokioTributaries, TributariesOptions,
+  Debounce, DebounceConfig, Event, Filter, Subscription, TokioTributaries, TributariesOptions,
+  WatchOptions,
 };
 
 /// The concrete delivered-event type of the local-fs driver (`C = OsString`, `V = ()`).
@@ -144,11 +145,11 @@ async fn overlapping_subscriptions_one_kernel_watch() {
   // tributary-fs rejects overlapping roots, so this succeeding proves the umbrella
   // subsumed both onto the one already-armed kernel watch (design §4).
   let outer = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("outer watch arms one kernel watch");
   let nested = w
-    .watch(key(&sub_dir), (), Interest::all(), Filter::all())
+    .watch(key(&sub_dir), (), WatchOptions::new())
     .await
     .expect("an overlapping nested watch is subsumed, never surfaces Overlaps");
   assert_ne!(
@@ -186,20 +187,17 @@ async fn widen_narrow_first_then_ancestor_succeeds_and_keeps_routing() {
 
   // Watch the NARROW child first (arms one kernel watch of /root/child).
   let child_sub = w
-    .watch(key(&child), (), Interest::all(), Filter::all())
+    .watch(key(&child), (), WatchOptions::new())
     .await
     .expect("watch the narrow child first");
 
   // Now watch its ANCESTOR /root — a widen. Against the real watcher this succeeds ONLY
   // because the widen unwatches /root/child before arming /root; the pre-fix
   // arm-before-unwatch order would have been rejected `Overlaps` here.
-  let root_sub = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
-    .await
-    .expect(
-      "the ancestor watch widens (Ok, not Overlaps) — arms the wider root after \
+  let root_sub = w.watch(key(&root), (), WatchOptions::new()).await.expect(
+    "the ancestor watch widens (Ok, not Overlaps) — arms the wider root after \
              disarming the subsumed child",
-    );
+  );
   assert_ne!(
     child_sub, root_sub,
     "each watch yields its own subscription id"
@@ -242,11 +240,11 @@ async fn event_fans_to_both_overlapping_subs() {
   // Two overlapping subscriptions: the outer root and the nested subtree. A change under
   // the nested subtree is covered by BOTH.
   let outer = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("watch outer");
   let inner = w
-    .watch(key(&sub_dir), (), Interest::all(), Filter::all())
+    .watch(key(&sub_dir), (), WatchOptions::new())
     .await
     .expect("watch nested");
 
@@ -278,13 +276,12 @@ async fn filter_narrows_delivery_on_the_real_stack() {
     .watch(
       key(&root),
       (),
-      Interest::all(),
-      Filter::new(move |e| e.path() == wanted_for_pred),
+      WatchOptions::new().with_filter(Filter::new(move |e| e.path() == wanted_for_pred)),
     )
     .await
     .expect("watch with a narrowing filter");
   let permissive = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("watch admitting everything");
 
@@ -337,7 +334,7 @@ async fn debounced_burst_coalesces() {
   let mut w = watcher(TributariesOptions::new().debounce(cfg));
 
   let sub = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("watch with debounce");
 
@@ -375,6 +372,72 @@ async fn debounced_burst_coalesces() {
   w.close().await.expect("close");
 }
 
+/// Per-subscription debounce override (design §6): with the watcher-global
+/// debounce ON, a sibling subscription of the SAME root watched with [`Debounce::Off`]
+/// passes its events through raw while the inheriting subscription's delivery is held
+/// for the settle window — so the Off subscription's first delivery arrives strictly
+/// before the settled sibling's, and both eventually observe the change (no silent
+/// loss).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_sub_debounce_off_overrides_the_global_default() {
+  let (_dir, root) = scratch("debounce-override");
+  // A LONG settle window: the inheriting subscription's delivery is held well past the
+  // last kernel event, while the Off override's rides through on the same tick its raw
+  // event arrives — the relative first-delivery order is deterministic even on a slow
+  // CI kernel (the event channel is FIFO, and the settled emission is enqueued at least
+  // a full quiet window later).
+  let cfg = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3))
+    .with_max_hold(Duration::from_secs(15));
+  let mut w = watcher(TributariesOptions::new().debounce(cfg));
+
+  let settled = w
+    .watch(key(&root), (), WatchOptions::new())
+    .await
+    .expect("watch inheriting the global debounce");
+  let raw = w
+    .watch(
+      key(&root),
+      (),
+      WatchOptions::new().with_debounce(Debounce::Off),
+    )
+    .await
+    .expect("watch with the per-sub Off override");
+
+  let file = root.join("busy.txt");
+  for i in 0..10u32 {
+    std::fs::write(&file, i.to_le_bytes()).expect("burst write");
+  }
+
+  // Scan the merged stream, recording each subscription's FIRST observation of the
+  // file: both must arrive (no silent loss), the raw one first (raw ordering observed).
+  let mut first: Vec<Subscription> = Vec::new();
+  let observed = tokio::time::timeout(DEADLINE, async {
+    while let Some(event) = w.next().await {
+      if reaches(&event, &file) && !first.contains(&event.subscription()) {
+        first.push(event.subscription());
+        if first.len() == 2 {
+          return true;
+        }
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    observed,
+    "both the raw and the settled subscription observe the burst"
+  );
+  assert_eq!(
+    first,
+    vec![raw, settled],
+    "the Off override's raw delivery precedes the settled sibling's held one"
+  );
+
+  w.close().await.expect("close");
+}
+
 /// A move decomposes per subscriber by two-endpoint coverage (design §5): a rename
 /// within an outer watched root, between two nested subscriptions, delivers the
 /// source-only subscription a `Removed(from)` (it saw the file leave its tree) and the
@@ -395,15 +458,15 @@ async fn move_decomposes_across_sibling_subscriptions() {
   // The outer root covers BOTH endpoints; two nested subs each cover ONE. All three are
   // subsumed onto the single /root kernel watch, so the one rename fans out to all.
   let _outer = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("watch outer root");
   let src_sub = w
-    .watch(key(&src), (), Interest::all(), Filter::all())
+    .watch(key(&src), (), WatchOptions::new())
     .await
     .expect("watch src subtree");
   let dst_sub = w
-    .watch(key(&dst), (), Interest::all(), Filter::all())
+    .watch(key(&dst), (), WatchOptions::new())
     .await
     .expect("watch dst subtree");
 
@@ -464,7 +527,7 @@ async fn deleted_root_is_retired_and_can_be_rewatched() {
 
   // Watch /root (arms one kernel watch).
   let first = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("watch the root");
 
@@ -486,7 +549,7 @@ async fn deleted_root_is_retired_and_can_be_rewatched() {
   // this would resolve `Covered` against it, delivering nothing below.
   std::fs::create_dir_all(&root).expect("recreate the watched root");
   let second = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("re-watch the recreated root re-arms a fresh kernel root");
 
@@ -521,11 +584,11 @@ async fn rescan_delivered_to_all() {
   // nested subtree. A plain change at the root would NOT reach the nested subscription,
   // but a coverage-loss Rescan must reach BOTH.
   let outer_sub = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("watch root");
   let nested_sub = w
-    .watch(key(&nested), (), Interest::all(), Filter::all())
+    .watch(key(&nested), (), WatchOptions::new())
     .await
     .expect("watch nested");
 
@@ -559,7 +622,7 @@ async fn close_is_responsive_while_event_channel_is_full() {
     TributariesOptions::new().with_event_capacity(NonZeroUsize::new(1).expect("nonzero"));
   let w = watcher(options);
   let _sub = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("watch the root");
 
@@ -594,7 +657,7 @@ async fn stalled_then_resumed_consumer_gets_a_rescan_no_silent_loss() {
     TributariesOptions::new().with_event_capacity(NonZeroUsize::new(1).expect("nonzero"));
   let mut w = watcher(options);
   let sub = w
-    .watch(key(&root), (), Interest::all(), Filter::all())
+    .watch(key(&root), (), WatchOptions::new())
     .await
     .expect("watch the root");
 

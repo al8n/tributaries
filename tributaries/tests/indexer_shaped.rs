@@ -39,8 +39,8 @@ use std::{
 use agnostic_lite::{RuntimeLite, tokio::TokioRuntime};
 use tempfile::TempDir;
 use tributaries::{
-  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, Filter, Interest, RootHandle, Source,
-  SourceEvent, SourceFault, Subscription, Tributaries, TributariesOptions, WatchError, WatchView,
+  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, RootHandle, Source, SourceEvent,
+  SourceFault, Subscription, Tributaries, TributariesOptions, WatchError, WatchOptions, WatchView,
   WatcherOptions,
 };
 use tributary_fs::{EventKind as FsEventKind, Interest as FsInterest, WatchRootError, Watcher};
@@ -475,21 +475,11 @@ async fn concurrent_view_reads_are_wait_free_and_eventually_consistent() {
 
   // The actor mutates concurrently: two disjoint roots with distinct owning Locs.
   let sub = w
-    .watch(
-      sub_key.clone(),
-      Loc { id: 7 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(sub_key.clone(), Loc { id: 7 }, WatchOptions::new())
     .await
     .expect("watch sub");
   let _other = w
-    .watch(
-      other_key.clone(),
-      Loc { id: 9 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(other_key.clone(), Loc { id: 9 }, WatchOptions::new())
     .await
     .expect("watch other");
 
@@ -546,12 +536,7 @@ async fn overlap_subsumption_widens_and_folds_descendant() {
 
   // Watch the DEEP dir first — a disjoint root.
   let deep = w
-    .watch(
-      deep_key.clone(),
-      Loc { id: 1 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(deep_key.clone(), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch deep");
   assert!(view.contains(&deep_key), "the deep dir is an exact root");
@@ -561,12 +546,7 @@ async fn overlap_subsumption_widens_and_folds_descendant() {
   // this succeeds because the widen disarms the subsumed deep root before arming the wider
   // one, folding the descendant onto it.
   let anc = w
-    .watch(
-      anc_key.clone(),
-      Loc { id: 2 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(anc_key.clone(), Loc { id: 2 }, WatchOptions::new())
     .await
     .expect("watch ancestor widens (Ok, not Overlaps)");
   assert_ne!(deep, anc, "each watch mints its own subscription id");
@@ -619,30 +599,15 @@ async fn attribution_fans_out_to_covering_subs_and_resolves_owning_loc() {
   // NP is the owning root (Loc 1); child is covered by it (Loc 2); OTHER is a disjoint owning
   // root (Loc 3).
   let np_sub = w
-    .watch(
-      np_key.clone(),
-      Loc { id: 1 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(np_key.clone(), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch np");
   let child_sub = w
-    .watch(
-      child_key.clone(),
-      Loc { id: 2 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(child_key.clone(), Loc { id: 2 }, WatchOptions::new())
     .await
     .expect("watch child (covered)");
   let other_sub = w
-    .watch(
-      other_key.clone(),
-      Loc { id: 3 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(other_key.clone(), Loc { id: 3 }, WatchOptions::new())
     .await
     .expect("watch other");
   assert_ne!(other_sub, np_sub, "distinct subscriptions");
@@ -716,12 +681,7 @@ async fn debounce_coalesces_a_burst() {
   } = outer;
 
   let sub = w
-    .watch(
-      key(&volume, &[]),
-      Loc { id: 1 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(key(&volume, &[]), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch the volume root");
 
@@ -776,12 +736,7 @@ async fn widen_delivers_dominating_rescan_no_silent_loss() {
   let anc_key = key(&volume, &["proj"]);
 
   let child_sub = w
-    .watch(
-      child_key.clone(),
-      Loc { id: 1 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(child_key.clone(), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch child");
 
@@ -797,12 +752,7 @@ async fn widen_delivers_dominating_rescan_no_silent_loss() {
   // Widen: watch the ancestor. The child is re-pointed onto the wider root and owed a
   // dominating Rescan across the coverage re-point.
   let _anc = w
-    .watch(
-      anc_key.clone(),
-      Loc { id: 2 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(anc_key.clone(), Loc { id: 2 }, WatchOptions::new())
     .await
     .expect("watch ancestor widens");
   let rescan = wait_for(&mut w, |e| {
@@ -845,12 +795,7 @@ async fn watch_whose_caller_vanished_after_commit_is_reconciled_away() {
   // Enqueue the watch command, then drop the wait: one poll drives the future past the
   // (unbounded) command send and parks it on the reply; dropping it closes the reply oneshot.
   {
-    let mut fut = pin!(w.watch(
-      orphan_key.clone(),
-      Loc { id: 99 },
-      Interest::all(),
-      Filter::all()
-    ));
+    let mut fut = pin!(w.watch(orphan_key.clone(), Loc { id: 99 }, WatchOptions::new()));
     let mut cx = Context::from_waker(Waker::noop());
     assert!(
       matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
@@ -861,12 +806,7 @@ async fn watch_whose_caller_vanished_after_commit_is_reconciled_away() {
   // FIFO barrier: a later awaited watch is processed strictly after the orphan command, so
   // once it returns the orphan has been committed-then-reconciled-away.
   let _live = w
-    .watch(
-      live_key.clone(),
-      Loc { id: 1 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(live_key.clone(), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch live");
 
@@ -899,7 +839,7 @@ async fn close_and_handle_drop_teardown() {
   let mut reader = w.clone();
   drop(w.clone());
   let _sub = w
-    .watch(key_d.clone(), Loc { id: 1 }, Interest::all(), Filter::all())
+    .watch(key_d.clone(), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch survives a non-last clone drop (actor alive)");
 
@@ -916,7 +856,7 @@ async fn close_and_handle_drop_teardown() {
   // Teardown reached the CONTROL plane: a further command errors (owner gone).
   assert!(
     reader
-      .watch(key_d.clone(), Loc { id: 2 }, Interest::all(), Filter::all())
+      .watch(key_d.clone(), Loc { id: 2 }, WatchOptions::new())
       .await
       .is_err(),
     "a watch after teardown errors (control plane closed)"
@@ -939,12 +879,7 @@ async fn stalled_consumer_close_is_responsive() {
     w,
   } = outer;
   let _sub = w
-    .watch(
-      key(&volume, &[]),
-      Loc { id: 1 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(key(&volume, &[]), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch the volume root");
 
@@ -983,12 +918,7 @@ async fn stalled_consumer_resume_gets_dominating_rescan_no_silent_loss() {
 
   let root_key = key(&volume, &[]);
   let sub = w
-    .watch(
-      root_key.clone(),
-      Loc { id: 1 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(root_key.clone(), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch the volume root");
 
@@ -1061,12 +991,7 @@ async fn deleted_root_delivers_terminal_rescan_and_is_retired() {
 
   let watched_key = key(&volume, &["watched"]);
   let sub = w
-    .watch(
-      watched_key.clone(),
-      Loc { id: 1 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(watched_key.clone(), Loc { id: 1 }, WatchOptions::new())
     .await
     .expect("watch the subdir root");
 
@@ -1090,12 +1015,7 @@ async fn deleted_root_delivers_terminal_rescan_and_is_retired() {
   // second watch would resolve Covered against the dead handle and receive nothing below).
   std::fs::create_dir_all(&watched).expect("recreate the watched root");
   let second = w
-    .watch(
-      watched_key.clone(),
-      Loc { id: 2 },
-      Interest::all(),
-      Filter::all(),
-    )
+    .watch(watched_key.clone(), Loc { id: 2 }, WatchOptions::new())
     .await
     .expect("re-watch re-arms a fresh root");
   assert_ne!(sub, second, "the re-watch mints a new subscription");

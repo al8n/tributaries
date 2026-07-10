@@ -42,8 +42,7 @@ use crate::{
   error::{BuildError, CloseError, UnwatchError, WatchError},
   event::Event,
   filter::{Filter, FilterInput},
-  interest::Interest,
-  options::TributariesOptions,
+  options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
   route::RoutableEvent,
   source::{FsSource, Source, SourceEvent},
   subscription::Subscription,
@@ -81,17 +80,16 @@ type CloseReply = futures_channel::oneshot::Sender<Result<(), CloseError>>;
 /// runs. Every variant carries a `oneshot` reply; the only teardown break a command drives is the
 /// dropped-last-handle one (the mailbox closing).
 enum Command<C, V> {
-  /// Subscribe to `key` (carrying caller `value`), with the given fan-out `interest` and
-  /// admission `filter`.
+  /// Subscribe to `key` (carrying caller `value`), with the given per-watch `options`.
   Watch {
     /// The located key to subsume/arm.
     key: Vec<C>,
     /// The caller value attribution returns for this watch (design §3).
     value: V,
-    /// The per-subscription fan-out interest gate (design §5).
-    interest: Interest,
-    /// The per-subscription admission [`Filter`] (design §7).
-    filter: Filter<C>,
+    /// The per-subscription delivery options (design §5/§6/§7): the fan-out
+    /// [`Interest`](crate::Interest) gate, the admission [`Filter`], and the
+    /// [`Debounce`] posture.
+    options: WatchOptions<C>,
     /// The reply channel: a [`WatchGrant`] guarding the minted [`Subscription`] (so a dropped
     /// wait cannot strand it — invariant I1), or the arm error.
     reply: futures_channel::oneshot::Sender<Result<WatchGrant, WatchError>>,
@@ -429,7 +427,10 @@ where
       last_flush_visited: 0,
       #[cfg(test)]
       test_pre_cut_claims: Vec::new(),
-      coalescer: debounce.map(Coalescer::new),
+      debounce,
+      // Eager when the watcher-global debounce is on; a per-subscription Custom
+      // override instantiates it lazily at commit otherwise (`register_debounce`).
+      coalescer: debounce.map(|config| Coalescer::new(Some(config))),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -462,13 +463,33 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
     self.view.clone()
   }
 
-  /// Subscribes to `key` (carrying caller `value`) with `interest` and admission
-  /// `filter`, returning its [`Subscription`].
+  /// Subscribes to `key` (carrying caller `value`) under the per-watch
+  /// [`WatchOptions`], returning its [`Subscription`].
   ///
   /// Overlapping keys are accepted: they are subsumed onto a shared root (design §4), so
   /// this never surfaces the overlap the layer below rejects. Widening an existing watch
   /// re-points the subsumed subscriptions onto the new wider root and delivers each a
   /// synthetic dominating [`Rescan`](crate::EventKind::Rescan) (design §8).
+  ///
+  /// # Per-watch options
+  ///
+  /// `options` batches this subscription's delivery knobs ([`WatchOptions::new`] =
+  /// deliver everything, admit everything, inherit the watcher-global debounce):
+  ///
+  /// - **[`interest`](WatchOptions::with_interest)** (design §5) gates which
+  ///   **projected** kinds are delivered — it narrows delivery only, never the
+  ///   underlying source watch (every root is armed with the source's widest policy);
+  /// - **[`filter`](WatchOptions::with_filter)** (design §7) is the admission gate: a
+  ///   non-`Rescan` event is delivered only if the subscription's key covers it **and**
+  ///   the filter admits it; a [`Rescan`](crate::EventKind::Rescan) always bypasses
+  ///   both. The filter is live-swappable: keep a [`clone`](Filter::clone) and
+  ///   [`swap`](Filter::swap) it to re-scope delivery without a re-watch;
+  /// - **[`debounce`](WatchOptions::with_debounce)** (design §6) is this subscription's
+  ///   settle posture, resolved against the watcher-global default
+  ///   ([`TributariesOptions::debounce`](crate::TributariesOptions::debounce)):
+  ///   [`Debounce::Off`] passes its events through raw even while siblings settle, and
+  ///   [`Debounce::Custom`] settles under its own windows even when the global debounce
+  ///   is off.
   ///
   /// # Key canonicalization
   ///
@@ -494,12 +515,6 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// vanished after the watch committed the owner retires the orphaned subscription
   /// itself (invariant I1).
   ///
-  /// `filter` is this subscription's admission gate (design §7): a non-`Rescan` event is
-  /// delivered only if its key covers the event **and** `filter` admits it. Pass
-  /// [`Filter::all`] to admit everything; a [`Rescan`](crate::EventKind::Rescan)
-  /// always bypasses it. The filter is live-swappable: keep a [`clone`](Filter::clone)
-  /// and [`swap`](Filter::swap) it to re-scope delivery without a re-watch.
-  ///
   /// # Errors
   ///
   /// - [`WatchError::Canonicalize`] when `key` cannot be canonicalized (for the fs source, the
@@ -512,8 +527,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
     &self,
     key: Vec<C>,
     value: V,
-    interest: Interest,
-    filter: Filter<C>,
+    options: WatchOptions<C>,
   ) -> Result<Subscription, WatchError> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self
@@ -521,8 +535,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
       .send(Command::Watch {
         key,
         value,
-        interest,
-        filter,
+        options,
         reply,
       })
       .await
@@ -753,6 +766,16 @@ where
   /// window no external test can hit deterministically. Empty in every real run.
   #[cfg(test)]
   test_pre_cut_claims: Vec<Cleanup>,
+  /// The watcher-global debounce default ([`TributariesOptions::debounce`]): what an
+  /// [`Inherit`](Debounce::Inherit) subscription resolves to, kept apart from the live
+  /// [`coalescer`](Owner::coalescer) so a LAZY instantiation — the first
+  /// [`Custom`](Debounce::Custom) commit when this is `None`, see
+  /// [`register_debounce`](Self::register_debounce) — still knows the global posture to
+  /// construct with.
+  debounce: Option<DebounceConfig>,
+  /// The settle coalescer (design §6): eagerly created when [`debounce`](Owner::debounce)
+  /// is `Some`, lazily by the first committed [`Custom`](Debounce::Custom) override, and
+  /// **never** otherwise — the zero-cost claim for consumers who never opt in anywhere.
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of the dedicated **high-priority shutdown signal**: a
@@ -1159,11 +1182,10 @@ where
       Ok(Command::Watch {
         key,
         value,
-        interest,
-        filter,
+        options,
         reply,
       }) => {
-        self.on_watch(key, value, interest, filter, reply).await;
+        self.on_watch(key, value, options, reply).await;
         Flow::Continue
       }
       Ok(Command::Unwatch { sub, reply }) => {
@@ -1258,11 +1280,10 @@ where
     &mut self,
     key: Vec<C>,
     value: V,
-    interest: Interest,
-    filter: Filter<C>,
+    options: WatchOptions<C>,
     reply: futures_channel::oneshot::Sender<Result<WatchGrant, WatchError>>,
   ) {
-    match self.reconcile_watch(&key, value, interest, filter).await {
+    match self.reconcile_watch(&key, value, options).await {
       Ok(sub) => {
         // Hand the committed subscription back inside a grant carrying a clone of the owner's strong
         // cleanup sender.
@@ -1319,8 +1340,9 @@ where
   ///
   /// **Roots are always armed by the source's own policy** ([`FsSource`] uses the
   /// fs-level [`Interest::all`](tributary_fs::Interest::all), design §4): the caller's
-  /// `interest` is recorded on the subscription as a fan-out gate, never passed to the
-  /// arm.
+  /// interest (from its [`WatchOptions`]) is recorded on the subscription as a fan-out
+  /// gate, never passed to the arm. The options' filter and debounce posture are
+  /// registered adjacently at commit.
   /// The retired terminal parked-`Rescan` debt threshold: `needs_rescan`
   /// entries whose subscription is already retired — kept so a root death parked
   /// against a full channel is never silently lost. Watch ADMISSION is refused while
@@ -1336,9 +1358,9 @@ where
     &mut self,
     key: &[C],
     value: V,
-    interest: Interest,
-    filter: Filter<C>,
+    options: WatchOptions<C>,
   ) -> Result<Subscription, WatchError> {
+    let (interest, filter, debounce) = options.into_parts();
     // RETIRED-DEBT ADMISSION GATE. The invariant this enforces, stated
     // honestly: retirement CONVERTS a live subscription's state into one retired parked
     // entry 1:1 (`force_remove_root` frees the subsumer/filter/epoch state as the entry
@@ -1425,6 +1447,7 @@ where
         let (fs_root, sub, outside_cover) = (*fs_root, *sub, *outside_cover);
         self.subsumer.commit_watch(&outcome, fs_root, key);
         self.filters.insert(sub, filter);
+        self.register_debounce(sub, debounce);
         // Covered-OUTSIDE grow (set-cover ): the covering root's source coverage was NARROWED
         // below this newcomer's key by an earlier prune, so this `Covered` commit — which arms nothing
         // — regains no real kernel coverage on its own. GROW the source back up to a fresh cover that
@@ -1492,6 +1515,7 @@ where
         // tripwire, which fires on ANY reuse before this commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, filter);
+        self.register_debounce(sub, debounce);
         Ok(sub)
       }
       WatchOutcome::Widen {
@@ -1549,6 +1573,7 @@ where
         // commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, filter);
+        self.register_debounce(sub, debounce);
         // Rebase each re-pointed subscription onto the wider root (design §8): its
         // synthetic dominating Rescan strictly dominates its pre-widen stream while the
         // new root's genuine events tie-or-exceed it, and names the widened root to
@@ -1561,6 +1586,8 @@ where
           // coalescer admits before `try_emit` suppresses) and parks at a fresh `shed_rescan`
           // one epoch above the new root's raw-0, sorting the Rescan behind it and silently
           // dropping post-widen events (the coalescer sibling of the re-point-epoch calibration).
+          // DROP, not forget: the re-pointed subscription stays live on the wider root, so its
+          // registered debounce policy must keep governing its post-widen events.
           if let Some(coalescer) = self.coalescer.as_mut() {
             coalescer.drop_subscription(moved);
           }
@@ -1574,6 +1601,42 @@ where
         }
         self.push_all(rescans);
         Ok(sub)
+      }
+    }
+  }
+
+  /// Registers a freshly-committed subscription's [`Debounce`] posture with the
+  /// coalescer — the debounce half of the commit, adjacent to the filter-map insert
+  /// (design §6).
+  ///
+  /// Lazy instantiation preserves the zero-cost claim — absent a config the coalescer
+  /// is never even instantiated (design §6) — for consumers who never opt in
+  /// **anywhere**:
+  ///
+  /// - [`Inherit`](Debounce::Inherit) records nothing: an absent policy entry IS the
+  ///   inherit resolution (and a fresh subscription never has a stale one to remove),
+  ///   so it never instantiates;
+  /// - [`Off`](Debounce::Off) with no coalescer is a no-op — events already pass
+  ///   through untouched, so there is nothing to switch off and nothing is
+  ///   instantiated; with a live coalescer it records the raw pass-through override;
+  /// - [`Custom`](Debounce::Custom) is the one opt-in act: it creates the coalescer on
+  ///   first use — carrying the watcher-global [`debounce`](Owner::debounce) default
+  ///   (`None` here, or the eager path would already have built it) so sibling
+  ///   subscriptions' inherit resolution stays honest — and records the override.
+  fn register_debounce(&mut self, sub: Subscription, debounce: Debounce) {
+    match debounce {
+      Debounce::Inherit => {}
+      Debounce::Off => {
+        if let Some(coalescer) = self.coalescer.as_mut() {
+          coalescer.set_policy(sub, debounce);
+        }
+      }
+      Debounce::Custom(_) => {
+        let default = self.debounce;
+        self
+          .coalescer
+          .get_or_insert_with(|| Coalescer::new(default))
+          .set_policy(sub, debounce);
       }
     }
   }
@@ -1701,7 +1764,10 @@ where
     self.suppressed_rescan.remove(&sub);
     self.unclaimed.remove(&sub);
     if let Some(coalescer) = self.coalescer.as_mut() {
-      coalescer.drop_subscription(sub);
+      // FORGET, not drop: the subscription is ending, so its registered debounce policy
+      // goes with its buffered deltas — unlike the still-live shed paths (a widen/restore
+      // re-point, an overflow park), which purge buffers but keep the policy.
+      coalescer.forget_subscription(sub);
     }
     // Now consult the subsumer. An already-retired sub is `Unknown` (its owner-local cleanup above
     // has already run); a live one reports whether its root emptied — or, on the non-emptied path,
@@ -1832,6 +1898,7 @@ where
             // buffered pre-widen coalescer deltas, so drop them before delivering it — else a
             // buffered delta can flush ahead of the Rescan on a full channel and park one epoch
             // above the new root's raw-0 (the coalescer sibling of the re-point-epoch calibration).
+            // DROP, not forget: the re-bound subscription stays live and keeps its policy.
             if let Some(coalescer) = self.coalescer.as_mut() {
               coalescer.drop_subscription(sub);
             }
@@ -1897,8 +1964,9 @@ where
       // lookup, so a full channel cannot drop it AND the flushed Rescan stays attributable once
       // `force_remove_root` (below) frees the sub's subsumer state — after which
       // `subscription_value` is gone, so the value MUST be captured here while the sub is still
-      // live. Drop the sub's now-suspect buffered coalescer deltas — the Rescan dominates
-      // and re-enumerates them.
+      // live. FORGET the sub in the coalescer — its now-suspect buffered deltas (the Rescan
+      // dominates and re-enumerates them) AND its registered debounce policy, since terminal
+      // retirement ends the subscription (the forget twin of `release_subscription`).
       let value = self.subsumer.subscription_value(sub).cloned();
       let epoch = self.epochs.shed_rescan(sub);
       let target = if self.unclaimed.contains(&sub) {
@@ -1908,7 +1976,7 @@ where
       };
       merge_max(target, sub, root_key.clone(), epoch, value);
       if let Some(coalescer) = self.coalescer.as_mut() {
-        coalescer.drop_subscription(sub);
+        coalescer.forget_subscription(sub);
       }
     }
     // The owed Rescans are now durable: tear the dead root out of the index and free each
@@ -1997,7 +2065,9 @@ where
   /// key, the max epoch, and the baked value (widen-safe: [`merge_max`]) so the flushed Rescan is
   /// attributable after teardown (design §3). Finally it drops `sub`'s now-suspect buffered
   /// coalescer deltas — they are dominated by the parked `Rescan`, so emitting them later would
-  /// deliver a stale epoch after it.
+  /// deliver a stale epoch after it. It DROPS rather than forgets: a parked subscription is
+  /// still live (its stream resumes with the flushed `Rescan`), so its registered debounce
+  /// policy keeps governing its later events.
   ///
   /// A subscription with no live key (raced retirement) is not parked — a stale parked
   /// `Rescan` would be co-retired anyway, and there is no subtree left to name.

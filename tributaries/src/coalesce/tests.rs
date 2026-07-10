@@ -10,7 +10,7 @@ use tributary_proto::{Epoch, Location, ScopeId};
 use super::Coalescer;
 use crate::{
   event::{Event, EventKind},
-  options::DebounceConfig,
+  options::{Debounce, DebounceConfig},
   subscription::Subscription,
 };
 
@@ -113,7 +113,7 @@ fn drain(coalescer: &mut Coalescer<OsString, ()>, now: Instant) -> Vec<Ev> {
 #[test]
 fn created_then_modified_stays_created() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert!(c.admit(created(s, "/a/f", 1), clk.at(0)).is_none());
@@ -136,7 +136,7 @@ fn created_then_modified_stays_created() {
 #[test]
 fn modified_coalesces() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   for (n, epoch) in [1, 2, 3, 4].into_iter().enumerate() {
@@ -153,7 +153,7 @@ fn modified_coalesces() {
 #[test]
 fn created_then_removed_annihilates() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert!(c.admit(created(s, "/a/tmp", 1), clk.at(0)).is_none());
@@ -171,7 +171,7 @@ fn created_then_removed_annihilates() {
 #[test]
 fn modified_then_removed_is_removed() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
@@ -188,7 +188,7 @@ fn modified_then_removed_is_removed() {
 #[test]
 fn removed_then_created_is_modified() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert!(c.admit(removed(s, "/a/f", 1), clk.at(0)).is_none());
@@ -215,7 +215,7 @@ fn removed_then_created_is_modified() {
 #[test]
 fn moved_is_atomic_and_flushes() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   // Buffer changes at both endpoints of the coming rename.
@@ -255,7 +255,7 @@ fn moved_is_atomic_and_flushes() {
 #[test]
 fn moved_emits_undelayed_not_after_a_settle_window() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config()); // quiet 10ms
+  let mut c = Coalescer::new(Some(config())); // quiet 10ms
   let s = sub(1);
 
   // A rename with NOTHING else buffered for the subscription: it must be due at its own
@@ -280,7 +280,7 @@ fn moved_emits_undelayed_not_after_a_settle_window() {
 #[test]
 fn debounced_moved_flushes_subscription_buffer_preserving_epoch_order() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   // Buffer an older-epoch change at an UNRELATED path (neither the coming rename's
@@ -329,7 +329,7 @@ fn debounced_moved_flushes_subscription_buffer_preserving_epoch_order() {
 #[test]
 fn rescan_flushes_and_bypasses() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   // Buffer a couple of bursts for this subscription.
@@ -376,7 +376,7 @@ fn rescan_flushes_and_bypasses() {
 #[test]
 fn rescan_only_flushes_its_own_subscription() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let (s1, s2) = (sub(1), sub(2));
 
   assert!(c.admit(modified(s1, "/a/f", 1), clk.at(0)).is_none());
@@ -419,7 +419,7 @@ fn rescan_only_flushes_its_own_subscription() {
 #[test]
 fn a_non_lifecycle_kind_flushes_and_emits_never_coalesced() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   // A known lifecycle Modified enters `coalesce` — buffered, nothing ready before its settle.
@@ -462,7 +462,7 @@ fn a_non_lifecycle_kind_flushes_and_emits_never_coalesced() {
 #[test]
 fn max_hold_forces_emission() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config()); // quiet 10ms, max_hold 100ms
+  let mut c = Coalescer::new(Some(config())); // quiet 10ms, max_hold 100ms
   let s = sub(1);
 
   // Touch the path every 5 ms so the 10 ms settle window NEVER elapses on its own.
@@ -498,7 +498,7 @@ fn max_hold_forces_emission() {
 #[test]
 fn coalesced_pair_emits_with_the_newest_stamp() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   // Monotone stamps within the burst; the emitted event must carry the NEWEST (4).
@@ -522,7 +522,7 @@ fn coalesced_pair_emits_with_the_newest_stamp() {
 #[test]
 fn become_modified_keeps_the_newest_stamp() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   // Removed(5) then Created(7) → synthetic Modified carrying the newest stamp (7).
@@ -542,7 +542,7 @@ fn become_modified_keeps_the_newest_stamp() {
 #[test]
 fn post_rescan_emission_never_carries_a_dominated_epoch() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   // A Rescan at umbrella epoch 10, then genuine post-Rescan changes rebased ABOVE it
@@ -577,7 +577,7 @@ fn post_rescan_emission_never_carries_a_dominated_epoch() {
 #[test]
 fn next_deadline_is_the_earliest_pending() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert_eq!(c.next_deadline(), None, "empty: no deadline");
@@ -602,7 +602,7 @@ fn next_deadline_is_the_earliest_pending() {
 #[test]
 fn flush_all_drains_everything_for_stream_close() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
@@ -628,7 +628,7 @@ fn flush_all_drains_everything_for_stream_close() {
 #[test]
 fn drop_subscription_discards_only_that_subscriptions_entries() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let (s1, s2) = (sub(1), sub(2));
 
   // A buffered entry for s1, then a Rescan for s1 flushes it into the ready queue and
@@ -663,6 +663,301 @@ fn drop_subscription_discards_only_that_subscriptions_entries() {
 }
 
 // -------------------------------------------------------------------------------
+// Per-subscription policy resolution (design §6): Inherit / Off / Custom,
+// the per-sub max_buffered cap + its counter, and the forget-vs-drop split.
+// -------------------------------------------------------------------------------
+
+/// An `Off` override passes its events through undelayed and uncollapsed, in admission
+/// order, while an inheriting sibling's burst keeps settling under the global default.
+#[test]
+fn off_override_passes_through_while_inherit_sibling_settles() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(Some(config())); // global quiet 10ms
+  let (raw, settled) = (sub(1), sub(2));
+  c.set_policy(raw, Debounce::Off);
+
+  // Interleave: the settling sibling first, then three raw events — two to the SAME key,
+  // which a settling policy would collapse.
+  assert!(c.admit(modified(settled, "/s/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(raw, "/r/a", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(raw, "/r/a", 2), clk.at(1)).is_none());
+  assert!(c.admit(created(raw, "/r/b", 3), clk.at(1)).is_none());
+
+  // The raw events are due at their own admission instants — not at now + quiet_window.
+  assert_eq!(
+    c.next_deadline(),
+    Some(clk.at(0)),
+    "a pass-through event is ready the instant it is admitted"
+  );
+  let out = drain(&mut c, clk.at(1));
+  assert_eq!(out.len(), 3, "every raw event emits — none collapsed");
+  assert!(
+    out.iter().all(|e| e.subscription() == raw),
+    "only the Off subscription's events ride through"
+  );
+  assert_eq!(
+    (out[0].epoch(), out[1].epoch(), out[2].epoch()),
+    (Epoch::new(1), Epoch::new(2), Epoch::new(3)),
+    "pass-through preserves per-subscription admission (= epoch) order"
+  );
+
+  // The inheriting sibling still settles under the global window.
+  assert!(
+    drain(&mut c, clk.at(5)).is_empty(),
+    "the settling sibling is still held"
+  );
+  let out = drain(&mut c, clk.at(11));
+  assert_eq!(out.len(), 1, "the sibling's burst settles normally");
+  assert_eq!(out[0].subscription(), settled);
+}
+
+/// A `Custom` override settles under its OWN windows, not the watcher-global default's.
+#[test]
+fn custom_override_settles_under_its_own_windows() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(Some(config())); // global quiet 10ms
+  let (custom, inherit) = (sub(1), sub(2));
+  c.set_policy(
+    custom,
+    Debounce::Custom(config().with_quiet_window(Duration::from_millis(40))),
+  );
+
+  assert!(c.admit(modified(custom, "/c/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(inherit, "/i/f", 1), clk.at(0)).is_none());
+
+  // The inheriting entry is due at the global 10ms; the custom one at its own 40ms.
+  let out = drain(&mut c, clk.at(11));
+  assert_eq!(out.len(), 1, "only the inheriting entry is due at 10ms");
+  assert_eq!(out[0].subscription(), inherit);
+  assert!(
+    drain(&mut c, clk.at(39)).is_empty(),
+    "the custom entry still settles under its longer window"
+  );
+  let out = drain(&mut c, clk.at(41));
+  assert_eq!(out.len(), 1, "the custom entry emits at its own deadline");
+  assert_eq!(out[0].subscription(), custom);
+}
+
+/// A `Custom` override ENABLES settling on a coalescer whose global default is `None`
+/// (the lazy override-only instantiation), while a sibling inheriting nothing passes
+/// through raw.
+#[test]
+fn custom_override_enables_settling_when_global_is_off() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(None);
+  let (custom, inherit) = (sub(1), sub(2));
+  c.set_policy(custom, Debounce::Custom(config()));
+
+  // The custom subscription's burst buffers and collapses…
+  assert!(c.admit(modified(custom, "/c/f", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(custom, "/c/f", 2), clk.at(1)).is_none());
+  // …while the inheriting sibling resolves to the disabled default: pass-through.
+  assert!(c.admit(modified(inherit, "/i/f", 1), clk.at(1)).is_none());
+
+  let out = drain(&mut c, clk.at(1));
+  assert_eq!(out.len(), 1, "inherit-of-nothing rides through undelayed");
+  assert_eq!(out[0].subscription(), inherit);
+
+  let out = drain(&mut c, clk.at(20));
+  assert_eq!(out.len(), 1, "the custom burst settled to one emission");
+  assert_eq!(out[0].subscription(), custom);
+  assert_eq!(out[0].epoch(), Epoch::new(2), "carrying the newest stamp");
+}
+
+/// `set_policy(Inherit)` removes a previously-registered override: the subscription
+/// falls back to the watcher-global default.
+#[test]
+fn set_policy_inherit_removes_the_override() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(Some(config()));
+  let s = sub(1);
+
+  c.set_policy(s, Debounce::Off);
+  assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
+  assert_eq!(
+    drain(&mut c, clk.at(0)).len(),
+    1,
+    "the Off override passes through"
+  );
+
+  c.set_policy(s, Debounce::Inherit);
+  assert!(!c.has_policy(s), "Inherit removes the override entry");
+  assert!(c.admit(modified(s, "/a/g", 2), clk.at(1)).is_none());
+  assert!(
+    drain(&mut c, clk.at(1)).is_empty(),
+    "back under the global default: the event settles"
+  );
+  assert_eq!(drain(&mut c, clk.at(20)).len(), 1);
+}
+
+/// A `Custom` policy's `max_buffered` caps THAT subscription's own fresh entries: the
+/// overflow signals the shed, and the driver's purge (`drop_subscription`) zeroes the
+/// counter so the cap re-arms from zero.
+#[test]
+fn per_sub_cap_sheds_and_counter_zeroes_after_the_purge() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(None); // structural cap = DEFAULT_MAX_BUFFERED, not in play
+  let s = sub(1);
+  c.set_policy(s, Debounce::Custom(config().with_max_buffered(2)));
+
+  assert!(c.admit(modified(s, "/k0", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/k1", 2), clk.at(0)).is_none());
+  assert_eq!(
+    c.per_sub_len.get(&s).copied(),
+    Some(2),
+    "two fresh entries counted"
+  );
+  assert_eq!(
+    c.admit(modified(s, "/k2", 3), clk.at(0)),
+    Some(s),
+    "the third fresh entry overflows the per-sub cap and sheds the subscription"
+  );
+
+  // The driver's park path purges the shed subscription — the counter zeroes with it.
+  c.drop_subscription(s);
+  assert!(
+    !c.per_sub_len.contains_key(&s),
+    "the purge zeroes the fresh-entry counter"
+  );
+  assert!(c.buffer.is_empty(), "…and frees the buffered entries");
+
+  // The cap re-arms from zero: two fresh admissions fit again before the next shed.
+  assert!(c.admit(modified(s, "/k3", 4), clk.at(1)).is_none());
+  assert!(c.admit(modified(s, "/k4", 5), clk.at(1)).is_none());
+  assert_eq!(c.admit(modified(s, "/k5", 6), clk.at(1)), Some(s));
+}
+
+/// Collapsing onto an already-buffered entry is exempt from the per-sub cap, exactly as
+/// it is from the structural cap.
+#[test]
+fn per_sub_cap_exempts_collapses() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(None);
+  let s = sub(1);
+  c.set_policy(s, Debounce::Custom(config().with_max_buffered(2)));
+
+  assert!(c.admit(modified(s, "/k0", 1), clk.at(0)).is_none());
+  assert!(c.admit(modified(s, "/k1", 2), clk.at(0)).is_none());
+  assert!(
+    c.admit(modified(s, "/k0", 3), clk.at(0)).is_none(),
+    "a collapse onto a buffered entry is admitted at the cap"
+  );
+  assert_eq!(
+    c.per_sub_len.get(&s).copied(),
+    Some(2),
+    "a collapse never grows the fresh-entry count"
+  );
+}
+
+/// The fresh-entry counter tracks EVERY buffer-removal path: the annihilating collapse,
+/// the settle-timer drain, the `Rescan` flush, and the teardown `flush_all`.
+#[test]
+fn per_sub_counter_tracks_every_removal_path() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(None);
+  let s = sub(1);
+  c.set_policy(s, Debounce::Custom(config().with_max_buffered(2)));
+
+  // Annihilate: created-then-removed frees its slot.
+  assert!(c.admit(created(s, "/a", 1), clk.at(0)).is_none());
+  assert!(c.admit(removed(s, "/a", 2), clk.at(0)).is_none());
+  assert!(
+    !c.per_sub_len.contains_key(&s),
+    "the annihilated transient freed its counted slot"
+  );
+
+  // Settle drain: a due entry decrements as it emits.
+  assert!(c.admit(modified(s, "/b", 3), clk.at(0)).is_none());
+  assert_eq!(c.per_sub_len.get(&s).copied(), Some(1));
+  assert_eq!(drain(&mut c, clk.at(20)).len(), 1);
+  assert!(
+    !c.per_sub_len.contains_key(&s),
+    "the drained entry decremented its count"
+  );
+
+  // Rescan flush: the flushed entries reconcile the count to zero.
+  assert!(c.admit(modified(s, "/c", 4), clk.at(21)).is_none());
+  assert!(c.admit(modified(s, "/d", 5), clk.at(21)).is_none());
+  assert!(c.admit(rescan(s, "/", 6), clk.at(21)).is_none());
+  assert!(
+    !c.per_sub_len.contains_key(&s),
+    "the Rescan flush zeroed the count"
+  );
+  assert_eq!(drain(&mut c, clk.at(21)).len(), 3);
+
+  // flush_all: the teardown flush clears every count.
+  assert!(c.admit(modified(s, "/e", 7), clk.at(22)).is_none());
+  let mut out = Vec::new();
+  c.flush_all(&mut out);
+  assert_eq!(out.len(), 1);
+  assert!(
+    c.per_sub_len.is_empty(),
+    "the teardown flush cleared the counter map"
+  );
+}
+
+/// The forget-vs-drop split: `drop_subscription` purges buffers but RETAINS the policy
+/// (the subscription is still live — a widen re-point / overflow park), while
+/// `forget_subscription` retires the policy with the buffers (unwatch / terminal
+/// retirement).
+#[test]
+fn forget_clears_the_policy_drop_retains_it() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(None);
+  let s = sub(1);
+  c.set_policy(s, Debounce::Custom(config()));
+
+  assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
+  c.drop_subscription(s);
+  assert!(
+    c.has_policy(s),
+    "drop_subscription keeps the policy — the subscription is still live"
+  );
+  // Post-drop events still settle under the retained Custom policy.
+  assert!(c.admit(modified(s, "/a/g", 2), clk.at(1)).is_none());
+  assert!(
+    drain(&mut c, clk.at(1)).is_empty(),
+    "the retained policy still buffers"
+  );
+  assert_eq!(drain(&mut c, clk.at(20)).len(), 1);
+
+  c.forget_subscription(s);
+  assert!(!c.has_policy(s), "forget_subscription retires the policy");
+  // Back to inheriting the (disabled) default: pass-through.
+  assert!(c.admit(modified(s, "/a/h", 3), clk.at(21)).is_none());
+  assert_eq!(
+    drain(&mut c, clk.at(21)).len(),
+    1,
+    "without the policy the subscription inherits the disabled default"
+  );
+}
+
+/// With no global default, the coalescer-wide structural bound falls back to
+/// [`DebounceConfig::DEFAULT_MAX_BUFFERED`] — a `Custom` override cannot widen it.
+#[test]
+fn structural_cap_defaults_when_override_only() {
+  let clk = Clock::new();
+  let mut c = Coalescer::new(None);
+  let s = sub(1);
+  // A per-sub cap far beyond the structural bound: the structural bound must still shed.
+  c.set_policy(s, Debounce::Custom(config().with_max_buffered(usize::MAX)));
+
+  for i in 0..DebounceConfig::DEFAULT_MAX_BUFFERED {
+    assert!(
+      c.admit(modified(s, &format!("/k{i}"), i as u64 + 1), clk.at(0))
+        .is_none(),
+      "admission {i} sits under the structural bound"
+    );
+  }
+  assert_eq!(
+    c.admit(modified(s, "/overflow", u64::MAX), clk.at(0)),
+    Some(s),
+    "the coalescer-wide structural bound sheds past DEFAULT_MAX_BUFFERED"
+  );
+  assert_eq!(c.buffer.len(), DebounceConfig::DEFAULT_MAX_BUFFERED);
+}
+
+// -------------------------------------------------------------------------------
 // Per-subscription admission-order drains (design §8).
 //
 // Every multi-entry drain must emit a subscription's entries in admission (= epoch) order,
@@ -677,7 +972,7 @@ fn drop_subscription_discards_only_that_subscriptions_entries() {
 #[test]
 fn drain_ready_emits_buffered_in_epoch_order_not_path_order() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   // `/z` admitted FIRST at the LOWER epoch; `/a` admitted SECOND at the HIGHER epoch.
@@ -712,7 +1007,7 @@ fn drain_ready_emits_buffered_in_epoch_order_not_path_order() {
 #[test]
 fn flush_all_emits_buffered_in_epoch_order_not_path_order() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert!(c.admit(modified(s, "/z", 1), clk.at(0)).is_none());
@@ -743,7 +1038,7 @@ fn flush_all_emits_buffered_in_epoch_order_not_path_order() {
 #[test]
 fn rescan_flush_emits_buffered_in_epoch_order_not_path_order() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert!(c.admit(modified(s, "/z", 1), clk.at(0)).is_none());
@@ -781,7 +1076,7 @@ fn rescan_flush_emits_buffered_in_epoch_order_not_path_order() {
 #[test]
 fn moved_flush_emits_buffered_in_epoch_order_not_path_order() {
   let clk = Clock::new();
-  let mut c = Coalescer::new(config());
+  let mut c = Coalescer::new(Some(config()));
   let s = sub(1);
 
   assert!(c.admit(modified(s, "/z", 1), clk.at(0)).is_none());
@@ -872,7 +1167,7 @@ mod proptests {
     #[test]
     fn no_admitted_event_is_silently_lost(steps in prop::collection::vec(step_strategy(), 1..40)) {
       let clk = Clock::new();
-      let mut c = Coalescer::new(config());
+      let mut c = Coalescer::new(Some(config()));
       let s = sub(1);
 
       let mut epoch = 0u64;
@@ -913,7 +1208,7 @@ mod proptests {
     fn determinism(steps in prop::collection::vec(step_strategy(), 1..40)) {
       fn run(steps: &[Step]) -> Vec<(PathBuf, &'static str, Epoch)> {
         let clk = Clock::new();
-        let mut c = Coalescer::new(config());
+        let mut c = Coalescer::new(Some(config()));
         let s = sub(1);
         let mut epoch = 0u64;
         let mut t = 0u64;
@@ -943,7 +1238,7 @@ mod proptests {
     #[test]
     fn no_post_immediate_dominated_epoch(steps in prop::collection::vec(step_strategy(), 1..40)) {
       let clk = Clock::new();
-      let mut c = Coalescer::new(config());
+      let mut c = Coalescer::new(Some(config()));
       let s = sub(1);
       let mut epoch = 0u64;
       let mut t = 0u64;
@@ -997,7 +1292,7 @@ mod tokio_timer {
   #[tokio::test(start_paused = true)]
   async fn burst_coalesces_and_rescan_jumps_the_queue() {
     let cfg = config(); // quiet 10ms, max_hold 100ms
-    let mut c = Coalescer::new(cfg);
+    let mut c = Coalescer::new(Some(cfg));
     let s = sub(1);
 
     // Admit a burst of three Modifieds to one path at the current (paused) instant.
@@ -1048,7 +1343,9 @@ mod tokio_timer {
 #[test]
 fn buffered_entry_cap_bounds_high_cardinality_bursts() {
   let now = Instant::now();
-  let mut coalescer = Coalescer::new(crate::options::DebounceConfig::new().with_max_buffered(64));
+  let mut coalescer = Coalescer::new(Some(
+    crate::options::DebounceConfig::new().with_max_buffered(64),
+  ));
   let s = sub(1);
 
   let mut overflows = 0usize;

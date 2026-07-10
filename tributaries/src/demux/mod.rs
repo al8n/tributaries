@@ -157,7 +157,7 @@ enum Control<C, V> {
 /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 /// use std::{ffi::OsString, path::Path};
 ///
-/// use tributaries::{Demux, Filter, Interest, TokioTributaries, TributariesOptions};
+/// use tributaries::{Demux, TokioTributaries, TributariesOptions, WatchOptions};
 ///
 /// fn key(path: &str) -> Vec<OsString> {
 ///   Path::new(path)
@@ -168,9 +168,7 @@ enum Control<C, V> {
 ///
 /// let w = TokioTributaries::new(TributariesOptions::new())?;
 /// let project = key("/path/to/project");
-/// let sub = w
-///   .watch(project.clone(), (), Interest::all(), Filter::all())
-///   .await?;
+/// let sub = w.watch(project.clone(), (), WatchOptions::new()).await?;
 ///
 /// // The demux CONSUMES one handle (the sole drainer); `w` stays behind for
 /// // watch/unwatch/close only — never for next().
