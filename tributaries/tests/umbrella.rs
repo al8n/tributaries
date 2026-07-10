@@ -114,9 +114,10 @@ async fn wait_until_all(
 }
 
 /// An event "reaches" `path` when it names it directly or is a `Rescan` at the path or
-/// one of its ancestors (a rescan obliges re-enumeration below it).
+/// one of its ancestors — the path-typed convenience over [`Event::reaches`] (the fs
+/// key IS the path's components).
 fn reaches(event: &Ev, path: &Path) -> bool {
-  event.path() == path || (event.is_rescan() && path.starts_with(event.path()))
+  event.reaches(&key(path))
 }
 
 /// Two overlapping subscriptions collapse onto a single kernel watch (design §4): the
@@ -201,7 +202,7 @@ async fn widen_narrow_first_then_ancestor_succeeds_and_keeps_routing() {
   // (b) The re-pointed child subscription receives the widen dominating Rescan (naming
   // the widened root, or an ancestor of the child).
   let saw_rescan = wait_for(&mut w, |e| {
-    e.subscription() == child_sub && e.is_rescan() && child.starts_with(e.path())
+    e.subscription() == child_sub && e.is_rescan() && reaches(e, &child)
   })
   .await;
   assert!(

@@ -100,6 +100,7 @@
 #![cfg_attr(docsrs, allow(unused_attributes))]
 
 mod coalesce;
+mod demux;
 mod driver;
 mod error;
 mod event;
@@ -111,6 +112,7 @@ mod subscription;
 pub(crate) mod subsume;
 mod view;
 
+pub use demux::{Demux, Lane};
 pub use driver::Tributaries;
 pub use error::{BuildError, CloseError, UnwatchError, WatchError};
 pub use event::{Event, EventKind};

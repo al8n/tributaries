@@ -346,12 +346,6 @@ fn key(volume: &[Comp], segs: &[&str]) -> Vec<Comp> {
   key
 }
 
-/// An event "reaches" `key` when it names it directly or is a `Rescan` at the key or one of
-/// its ancestors (a rescan obliges re-enumeration below it).
-fn reaches(event: &Event<Comp, Loc>, key: &[Comp]) -> bool {
-  event.key() == key || (event.is_rescan() && key.starts_with(event.key()))
-}
-
 /// The owning [`Loc`] id the wait-free value plane resolves for `key`, if any.
 fn resolved_id(view: &WatchView<Comp, Loc, RootHandle>, key: &[Comp]) -> Option<u64> {
   view.resolve(key).map(|snapshot| snapshot.get().id)
@@ -570,7 +564,7 @@ async fn overlap_subsumption_widens_and_folds_descendant() {
   let file_key = key(&volume, &["a", "b", "c", "probe.txt"]);
   std::fs::write(deep_dir.join("probe.txt"), b"x").expect("write probe");
   assert!(
-    wait_until_all(&mut w, &[deep, anc], |e| reaches(e, &file_key)).await,
+    wait_until_all(&mut w, &[deep, anc], |e| e.reaches(&file_key)).await,
     "a write under the folded descendant routes to both subscriptions"
   );
 
@@ -645,15 +639,15 @@ async fn attribution_fans_out_to_covering_subs_and_resolves_owning_loc() {
   assert!(
     wait_until_all(&mut w, &[np_sub, child_sub, other_sub], |e| {
       assert!(
-        !(e.subscription() == other_sub && reaches(e, &probe_key)),
+        !(e.subscription() == other_sub && e.reaches(&probe_key)),
         "the disjoint OTHER subscription must never receive the np/child change"
       );
       if e.subscription() == other_sub {
         // other_sub's liveness bound: it DOES receive the change under its own key.
-        reaches(e, &other_probe_key)
+        e.reaches(&other_probe_key)
       } else {
         // np_sub / child_sub: the fan-out of the one np/child change to every covering sub.
-        reaches(e, &probe_key)
+        e.reaches(&probe_key)
       }
     })
     .await,
@@ -715,7 +709,7 @@ async fn debounce_coalesces_a_burst() {
 
   // The coalesced settle still delivers something covering the file (its net effect emits).
   assert!(
-    wait_for(&mut w, |e| e.subscription() == sub && reaches(e, &busy_key))
+    wait_for(&mut w, |e| e.subscription() == sub && e.reaches(&busy_key))
       .await
       .is_some(),
     "the debounced burst collapses but its settled effect is still delivered"
@@ -726,7 +720,7 @@ async fn debounce_coalesces_a_burst() {
   let mut extra = 0u32;
   let _ = tokio::time::timeout(cfg.quiet_window() * 3, async {
     while let Some(event) = w.next().await {
-      if event.subscription() == sub && reaches(&event, &busy_key) {
+      if event.subscription() == sub && event.reaches(&busy_key) {
         extra += 1;
       }
     }
@@ -772,7 +766,7 @@ async fn widen_delivers_dominating_rescan_no_silent_loss() {
   let seed_key = key(&volume, &["proj", "child", "seed.txt"]);
   std::fs::write(child.join("seed.txt"), b"x").expect("write seed");
   let seed = wait_for(&mut w, |e| {
-    e.subscription() == child_sub && reaches(e, &seed_key)
+    e.subscription() == child_sub && e.reaches(&seed_key)
   })
   .await
   .expect("the child sees its seed change");
@@ -789,7 +783,7 @@ async fn widen_delivers_dominating_rescan_no_silent_loss() {
     .await
     .expect("watch ancestor widens");
   let rescan = wait_for(&mut w, |e| {
-    e.subscription() == child_sub && e.is_rescan() && child_key.starts_with(e.key())
+    e.subscription() == child_sub && e.is_rescan() && e.reaches(&child_key)
   })
   .await
   .expect("the widen delivers the child a Rescan naming an ancestor of its key");
@@ -1058,7 +1052,7 @@ async fn deleted_root_delivers_terminal_rescan_and_is_retired() {
   assert!(
     wait_for(&mut w, |e| e.subscription() == sub
       && (e.is_rescan()
-        || (e.kind().is_removed() && reaches(e, &watched_key))))
+        || (e.kind().is_removed() && e.reaches(&watched_key))))
     .await
     .is_some(),
     "the deleted root surfaces a terminal Rescan/Removed to its subscription"
@@ -1087,7 +1081,7 @@ async fn deleted_root_delivers_terminal_rescan_and_is_retired() {
   std::fs::write(watched.join("after.txt"), b"x").expect("write under the recreated root");
   assert!(
     wait_for(&mut w, |e| e.subscription() == second
-      && reaches(e, &probe_key))
+      && e.reaches(&probe_key))
     .await
     .is_some(),
     "a write under the recreated, re-armed root reaches the new subscription"
