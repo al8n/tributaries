@@ -487,6 +487,58 @@ async fn lost_releases_on_a_full_control_queue_cannot_leak_the_table() {
   );
 }
 
+/// Codex R51: a replacement registration admitted and DROPPED while the router is
+/// stalled still DISPLACES the predecessor. Without unconditional displacement the
+/// sweep keeps the (live) predecessor, skip-install leaves it routed, and the queued
+/// release carries the replacement's generation — the superseded lane would keep
+/// consuming forever. With it: the predecessor ends (drains then `None`) and the
+/// subscription reverts to unclaimed, surfacing on rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_replacement_still_displaces_the_predecessor_lane() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let sub_x = watch(&w, "/x").await;
+  let (demux, rest) = Demux::spawn(w.clone(), 16);
+  let lane_a = demux.lane(sub_a, 1).await;
+  let lane_x_old = demux.lane(sub_x, 4).await;
+
+  // Prove the predecessor routes, then stall the router on lane A.
+  feed.modified("/x", "/x/before").await;
+  assert_eq!(recv(&lane_x_old).await.subscription(), sub_x);
+  feed.modified("/a", "/a/one").await;
+  feed.modified("/a", "/a/two").await;
+
+  // While stalled: admit a REPLACEMENT lane for /x and drop it before the router can
+  // process the registration — the claim-then-release the displacement rule covers.
+  let lane_x_new = demux.lane(sub_x, 4).await;
+  drop(lane_x_new);
+
+  // Clear the stall; the router then processes the replacement registration.
+  assert_eq!(recv(&lane_a).await.key(), key("/a/one").as_slice());
+  assert_eq!(recv(&lane_a).await.key(), key("/a/two").as_slice());
+
+  // The predecessor was displaced: its sender is gone, so it drains then ends...
+  assert!(
+    tokio::time::timeout(DEADLINE, lane_x_old.recv())
+      .await
+      .expect("predecessor settles within the deadline")
+      .is_none(),
+    "the superseded lane ends — it must not keep receiving (Codex R51)"
+  );
+  // ...and /x is unclaimed again: its traffic surfaces on rest.
+  feed.modified("/x", "/x/after").await;
+  loop {
+    let event = tokio::time::timeout(DEADLINE, rest.recv())
+      .await
+      .expect("rest receives within the deadline")
+      .expect("stream still live");
+    if event.subscription() == sub_x {
+      assert_eq!(event.key(), key("/x/after").as_slice());
+      break;
+    }
+  }
+}
+
 /// Codex R49 F2: watch → lane → unwatch → drop churn leaves NO residue — the lane
 /// table is bounded by concurrently live lanes, never by lifetime registrations. The
 /// trailing probe registration is an awaited send on the FIFO control queue, so every
