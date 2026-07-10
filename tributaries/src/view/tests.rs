@@ -1,7 +1,6 @@
-use tributary_proto::Interest;
-
 use super::{Snapshot, WatchView};
 use crate::{
+  interest::Interest,
   subscription::Subscription,
   subsume::{Subsumer, WatchOutcome},
 };

@@ -43,7 +43,7 @@ use tributaries::{
   SourceEvent, SourceFault, Subscription, Tributaries, TributariesOptions, WatchError, WatchView,
   WatcherOptions,
 };
-use tributary_fs::{EventKind as FsEventKind, WatchRootError, Watcher};
+use tributary_fs::{EventKind as FsEventKind, Interest as FsInterest, WatchRootError, Watcher};
 
 /// The custom, **non-`OsString`** key component: an indexer-shaped location coordinate.
 ///
@@ -196,7 +196,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
            shrink each retry (structural progress bound)"
         );
       }
-      match self.watcher.watch(path.clone(), Interest::all()).await {
+      match self.watcher.watch(path.clone(), FsInterest::all()).await {
         Ok(handle) => break handle,
         Err(WatchRootError::Overlaps {
           path: rejected,

@@ -105,6 +105,7 @@ mod driver;
 mod error;
 mod event;
 mod filter;
+mod interest;
 mod options;
 mod route;
 mod source;
@@ -117,6 +118,7 @@ pub use driver::Tributaries;
 pub use error::{BuildError, CloseError, FaultKind, SourceFault, UnwatchError, WatchError};
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
+pub use interest::Interest;
 pub use options::{DebounceConfig, TributariesOptions};
 pub use source::{Armed, FsSource, Source, SourceEvent};
 pub use subscription::{InstanceId, Subscription};
@@ -139,7 +141,10 @@ pub use driver::SmolTributaries;
 /// underlying filesystem watcher it drives.
 pub use tributary_fs::{RootHandle, WatcherOptions};
 
-/// The identity/coordinate primitives — change id, epoch, interest, location — are
-/// owned by `tributary-proto` and re-exported from there directly
-/// ([`tributary-fs`](tributary_fs) merely re-exports them itself).
-pub use tributary_proto::{ChangeId, Epoch, Interest, Location, Segment};
+/// The identity/coordinate primitives — change id, epoch, location — are owned by
+/// `tributary-proto` and re-exported from there directly
+/// ([`tributary-fs`](tributary_fs) merely re-exports them itself). The per-watch
+/// [`Interest`] is **not** among them: the umbrella owns its own source-neutral mask
+/// (aligned to [`EventKind`]), and the proto/fs `Interest` stays a purely fs-internal
+/// arm mask for consumers driving a raw [`tributary_fs::Watcher`].
+pub use tributary_proto::{ChangeId, Epoch, Location, Segment};

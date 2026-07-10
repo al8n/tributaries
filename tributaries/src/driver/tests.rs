@@ -9,14 +9,15 @@ use std::{
 };
 
 use agnostic_lite::tokio::TokioRuntime;
-use tributary_fs::{ChangeId, Epoch, Interest, Location};
+use tributary_fs::{ChangeId, Epoch, Location};
 
-use super::{Owner, epoch::EpochLedger, interest_admits};
+use super::{Owner, epoch::EpochLedger};
 use crate::{
   coalesce::Coalescer,
   error::{FaultKind, SourceFault, UnwatchError, WatchError},
   event::{Event, EventKind},
   filter::Filter,
+  interest::Interest,
   options::{DebounceConfig, TributariesOptions},
   source::{Armed, Source, SourceEvent},
   subscription::Subscription,
@@ -381,6 +382,32 @@ fn source_removed(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, 
     handle,
     key(path),
     EventKind::Removed,
+    Location::new(),
+    Epoch::new(epoch),
+    Some(ChangeId::new(NonZeroU64::MIN)),
+  )
+}
+
+/// A raw `Created` [`SourceEvent`] for `handle` at `path`.
+fn source_created(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, u32> {
+  SourceEvent::new(
+    handle,
+    key(path),
+    EventKind::Created,
+    Location::new(),
+    Epoch::new(epoch),
+    Some(ChangeId::new(NonZeroU64::MIN)),
+  )
+}
+
+/// A raw whole-`Moved` [`SourceEvent`] on `handle` from `from` to `to` — fan-out
+/// projects it per subscriber coverage (design §5), so one raw move drives both the
+/// whole-move interest gate and the single-endpoint projections.
+fn source_moved(handle: u32, from: &str, to: &str, epoch: u64) -> SourceEvent<OsString, u32> {
+  SourceEvent::new(
+    handle,
+    key(to),
+    EventKind::Moved { from: key(from) },
     Location::new(),
     Epoch::new(epoch),
     Some(ChangeId::new(NonZeroU64::MIN)),
@@ -1596,10 +1623,10 @@ async fn widen_dead_on_arrival_wider_arm_restores_disarmed_roots() {
 async fn covered_sub_with_wider_interest_still_delivered() {
   let mut h = Harness::new();
 
-  let created_only = Interest::new().with_created();
+  let created_only = Interest::none().with_created();
   h.watch("/a", created_only).await.expect("watch /a");
 
-  let removed_only = Interest::new().with_removed();
+  let removed_only = Interest::none().with_removed();
   let sb = h
     .watch("/a/b", removed_only)
     .await
@@ -1616,11 +1643,11 @@ async fn covered_sub_with_wider_interest_still_delivered() {
     "the covered sub's own removed-only interest is its fan-out gate"
   );
   assert!(
-    interest_admits(removed_only, &EventKind::<OsString>::Removed),
+    removed_only.admits(&EventKind::<OsString>::Removed),
     "a removal under /a/b is admitted by the covered sub's gate — not silently lost"
   );
   assert!(
-    !interest_admits(created_only, &EventKind::<OsString>::Removed),
+    !created_only.admits(&EventKind::<OsString>::Removed),
     "…and the gate is genuinely narrowing (a created-only gate would drop it)"
   );
 }
@@ -2210,7 +2237,7 @@ async fn raced_pre_cut_claim_is_delivered_not_stranded() {
   assert!(h.owner.needs_rescan.is_empty(), "nothing stranded");
 }
 
-/// `interest_admits` gates a whole [`EventKind::Moved`] delivery under the `moved()`
+/// [`Interest::admits`] gates a whole [`EventKind::Moved`] delivery under the `moved()`
 /// interest bit (design §5) — directly constructible now that the umbrella owns the
 /// source-neutral vocabulary with the move endpoint in-kind (the fs `MovedEvent`
 /// payload had no public constructor, so this arm was previously untestable).
@@ -2220,17 +2247,66 @@ fn interest_gates_a_whole_moved_by_the_moved_bit() {
     from: key("/a/src/f"),
   };
   assert!(
-    interest_admits(Interest::new().with_moved(), &moved),
+    Interest::none().with_moved().admits(&moved),
     "a moved-interested gate admits the whole Moved"
   );
   assert!(
-    interest_admits(Interest::all(), &moved),
+    Interest::all().admits(&moved),
     "the widest gate admits it too"
   );
   assert!(
-    !interest_admits(Interest::new().with_created().with_removed(), &moved),
+    !Interest::none()
+      .with_created()
+      .with_removed()
+      .admits(&moved),
     "a gate without the moved bit rejects the whole Moved — it is gated by moved(), \
      not by its endpoints' created/removed projections"
+  );
+}
+
+/// End-to-end interest regression through the driver's fan-out (design §5): the gate
+/// applies to the PROJECTED kind, so a created-only subscription receives a plain
+/// `Created` AND a move-IN projection (a raw `Moved` whose destination alone it
+/// covers, projected to `Created` before the gate) — but neither a `Modified` nor a
+/// whole `Moved` (both endpoints covered, gated by the absent `moved` bit and never
+/// smuggled through its endpoint projections).
+#[tokio::test]
+async fn created_only_subscription_receives_created_and_move_in_only() {
+  let mut h = Harness::new();
+  let sub = h
+    .watch("/a", Interest::none().with_created())
+    .await
+    .expect("watch /a");
+
+  h.owner.fan_out_and_push(&source_created(1, "/a/f", 0));
+  h.owner.fan_out_and_push(&source_modified(1, "/a/f", 1));
+  // Both endpoints under /a → projected to the whole Moved, rejected by the absent
+  // moved bit.
+  h.owner
+    .fan_out_and_push(&source_moved(1, "/a/src", "/a/dst", 2));
+  // Source OUTSIDE /a → projected to the move-in: a synthesized Created, admitted.
+  h.owner
+    .fan_out_and_push(&source_moved(1, "/outside/g", "/a/arrived", 3));
+
+  let delivered = h.drain();
+  assert_eq!(
+    delivered.len(),
+    2,
+    "exactly the plain Created and the move-in projection are delivered, got {delivered:?}"
+  );
+  assert!(delivered.iter().all(|ev| ev.subscription() == sub));
+  assert!(
+    delivered[0].kind().is_created() && delivered[0].key() == key("/a/f").as_slice(),
+    "the plain Created is admitted by the created bit"
+  );
+  assert!(
+    delivered[1].kind().is_created() && delivered[1].key() == key("/a/arrived").as_slice(),
+    "the move-in projection is a plain Created at the destination — admitted by the \
+     created bit, not the moved bit"
+  );
+  assert!(
+    delivered[1].move_from().is_none(),
+    "the projection carries no move source — it is not a whole Moved"
   );
 }
 
@@ -2239,8 +2315,8 @@ fn interest_gates_a_whole_moved_by_the_moved_bit() {
 #[tokio::test]
 async fn equal_path_heterogeneous_interest() {
   let mut h = Harness::new();
-  let created_only = Interest::new().with_created();
-  let removed_only = Interest::new().with_removed();
+  let created_only = Interest::none().with_created();
+  let removed_only = Interest::none().with_removed();
 
   let s1 = h.watch("/a", created_only).await.expect("watch /a created");
   let s2 = h.watch("/a", removed_only).await.expect("watch /a removed");

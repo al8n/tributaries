@@ -40,9 +40,10 @@ use std::{collections::HashMap, sync::Arc, vec::Vec};
 
 use arc_swap::ArcSwap;
 use iradix::sync::Radix;
-use tributary_proto::{Interest, ScopeId};
+use tributary_proto::ScopeId;
 
 use crate::{
+  interest::Interest,
   subscription::{InstanceId, Subscription},
   view::WatchView,
 };
