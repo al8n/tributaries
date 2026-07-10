@@ -432,6 +432,8 @@ impl Harness {
       flush_cursor: None,
       #[cfg(test)]
       last_flush_visited: 0,
+      #[cfg(test)]
+      test_pre_cut_claims: Vec::new(),
       coalescer,
       cleanup_tx,
       cleanup_rx,
@@ -2132,12 +2134,16 @@ async fn unclaimed_retired_cohort_costs_the_flush_nothing() {
   );
 }
 
-/// Codex R62: a `Cleanup::Claim` that RACES the source-drain's atomic cut — enqueued
-/// after the emptiness observation, drained after the cut — re-arms OFFERABLE debt that
-/// a full event channel cannot take in the final best-effort pass. The drain must NOT
-/// return then (the claimer holds a live Ok subscription; returning strands its
-/// terminal Rescan forever): it stays in the retry loop and delivers once the consumer
-/// drains the plug.
+/// Codex R62/R63: a `Cleanup::Claim` that RACES the source-drain's atomic cut —
+/// injected via the test-only window hook BETWEEN the emptiness observation and the
+/// close, so the CUT BLOCK's own drain finds it — re-arms OFFERABLE debt that a full
+/// event channel cannot take in the final best-effort pass. The drain must NOT return
+/// then (the claimer holds a live Ok subscription; returning strands its terminal
+/// Rescan forever): it takes the post-cut `continue`, the closed cleanup channel's
+/// select arm disables on its first error instead of spinning, and the retry loop
+/// delivers once the consumer drains the plug. Fail-on-old: the pre-R62 cut block
+/// returned unconditionally — the racer's Rescan was stranded and this test's second
+/// recv would time out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raced_pre_cut_claim_is_delivered_not_stranded() {
   let mut h = Harness::bounded(1);
@@ -2159,15 +2165,15 @@ async fn raced_pre_cut_claim_is_delivered_not_stranded() {
   h.owner.retire_root_with_terminal_rescan(2);
   assert!(h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.contains_key(&racer));
 
-  // …and the claim is ALREADY QUEUED when the drain runs: the drain's first iteration
-  // observes cleanup non-empty and drains it pre-cut — but an equivalent claim landing
-  // between the observation and the cut takes exactly the same post-drain path, with
-  // the event channel FULL so the final pass cannot deliver. Either way the debt is
-  // offerable-against-a-full-channel at the exit decision — the R62 window.
+  // …and the claim lands IN THE WINDOW: the test injection point (Codex R63) sends it
+  // onto the still-open cleanup channel exactly between the drain's emptiness
+  // observation and the atomic cut — so the CUT BLOCK ITSELF drains it, re-arms
+  // offerable debt against the FULL channel, and must take the post-cut `continue`
+  // rather than returning. (A claim merely pre-queued before the drain is drained at
+  // the loop top and never reaches the cut — the path this regression exists to pin.)
   h.owner
-    .cleanup_tx
-    .try_send(super::Cleanup::Claim(racer))
-    .expect("queue the racing claim");
+    .test_pre_cut_claims
+    .push(super::Cleanup::Claim(racer));
 
   let events = h.events.clone();
   let drain = tokio::spawn(async move {
@@ -4121,6 +4127,8 @@ impl OwnerU64 {
       flush_cursor: None,
       #[cfg(test)]
       last_flush_visited: 0,
+      #[cfg(test)]
+      test_pre_cut_claims: Vec::new(),
       coalescer,
       cleanup_tx,
       cleanup_rx,
@@ -4646,6 +4654,8 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     flush_cursor: None,
     #[cfg(test)]
     last_flush_visited: 0,
+    #[cfg(test)]
+    test_pre_cut_claims: Vec::new(),
     coalescer: None,
     cleanup_tx,
     cleanup_rx,
@@ -4802,6 +4812,8 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     flush_cursor: None,
     #[cfg(test)]
     last_flush_visited: 0,
+    #[cfg(test)]
+    test_pre_cut_claims: Vec::new(),
     coalescer: None,
     cleanup_tx,
     cleanup_rx,
