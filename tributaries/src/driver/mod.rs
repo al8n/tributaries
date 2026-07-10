@@ -427,6 +427,8 @@ where
       flush_cursor: None,
       #[cfg(test)]
       last_flush_visited: 0,
+      #[cfg(test)]
+      test_pre_cut_claims: Vec::new(),
       coalescer: debounce.map(Coalescer::new),
       cleanup_tx,
       cleanup_rx,
@@ -751,6 +753,12 @@ where
   /// visited — pins the room-proportional bound without production cost.
   #[cfg(test)]
   last_flush_visited: usize,
+  /// Test injection point (Codex R63): claims staged here are sent onto the still-open
+  /// cleanup channel at EXACTLY the raced instant — after the source-drain exit
+  /// predicate's emptiness observation, before the atomic cut — the sub-instruction
+  /// window no external test can hit deterministically. Empty in every real run.
+  #[cfg(test)]
+  test_pre_cut_claims: Vec<Cleanup>,
   coalescer: Option<Coalescer<C, V>>,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of the dedicated **high-priority shutdown signal** (Codex R27): a
@@ -2435,6 +2443,12 @@ where
       // remaining `needs_rescan` key still `unclaimed` means the debt is owed to nobody (and must not
       // spin the drain waiting for a grant that may never resolve); or the consumer is gone entirely.
       if (self.needs_rescan.is_empty() && self.cleanup_rx.is_empty()) || self.events.is_closed() {
+        // Test-only race injection (Codex R63): stage claims land HERE — between the
+        // emptiness observation and the cut — the exact window the fix below covers.
+        #[cfg(test)]
+        for staged in self.test_pre_cut_claims.drain(..) {
+          let _ = self.cleanup_tx.try_send(staged);
+        }
         // Make the exit ATOMIC with respect to grant claims (Codex R32): another thread holding an
         // unpolled grant could `defuse` between the emptiness observation above and the owner's
         // drop — its claim would land on a still-open channel (a live-looking Ok) that no later
