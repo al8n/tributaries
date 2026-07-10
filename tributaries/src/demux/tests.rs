@@ -475,6 +475,95 @@ async fn demux_parts_routes_when_caller_spawned() {
     .expect("routing task");
 }
 
+/// Codex R54: `shutdown()` is the LOSS-FREE stop — even requested while a lane is
+/// full and the router is parked mid-send, the in-flight delivery completes once the
+/// lane drains, THEN the router exits and every lane ends after its buffered tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_stops_and_drains_losslessly_even_while_stalled() {
+  let (w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let (demux, rest, driver) = Demux::parts(w.clone(), 16);
+  let routing = tokio::spawn(driver);
+  let lane_a = demux.lane(sub_a, 1).await;
+
+  // Prove the router is live, then park it deterministically: /a/one round-trips
+  // (router idle again), /a/two fills the capacity-1 lane, /a/three parks the send.
+  feed.modified("/a", "/a/one").await;
+  assert_eq!(recv(&lane_a).await.key(), key("/a/one").as_slice());
+  feed.modified("/a", "/a/two").await;
+  feed.modified("/a", "/a/three").await;
+  tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+  // Request the orderly stop WHILE parked mid-send. Admission succeeds (control queue
+  // has room); the stop takes effect only after the in-flight send completes.
+  demux.shutdown().await;
+
+  // Drain the lane: BOTH remaining events arrive — the parked send completed, nothing
+  // lost — and then the lane ends because the router exited after that delivery.
+  assert_eq!(recv(&lane_a).await.key(), key("/a/two").as_slice());
+  assert_eq!(recv(&lane_a).await.key(), key("/a/three").as_slice());
+  assert!(
+    tokio::time::timeout(DEADLINE, lane_a.recv())
+      .await
+      .expect("lane settles")
+      .is_none(),
+    "the router exited after completing its in-flight delivery (Codex R54)"
+  );
+  assert!(
+    tokio::time::timeout(DEADLINE, rest.recv())
+      .await
+      .expect("rest settles")
+      .is_none(),
+    "rest ends with the router"
+  );
+  tokio::time::timeout(DEADLINE, routing)
+    .await
+    .expect("the routing future resolves after shutdown")
+    .expect("routing task");
+}
+
+/// Codex R54: ABORTING the routing future mid-full-lane-send is the documented hard
+/// stop — at most the single in-flight delivery is lost, lanes end after their
+/// buffered tails (no hang), and remaining `Tributaries` clones can still drain the
+/// MPMC stream afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_the_routing_future_loses_at_most_the_in_flight_delivery() {
+  let (mut w, mut feed) = rig(1024);
+  let sub_a = watch(&w, "/a").await;
+  let (demux, _rest, driver) = Demux::parts(w.clone(), 16);
+  let routing = tokio::spawn(driver);
+  let lane_a = demux.lane(sub_a, 1).await;
+
+  // Park the router mid-send: /a/one fills the lane, /a/two is the in-flight send.
+  feed.modified("/a", "/a/one").await;
+  feed.modified("/a", "/a/two").await;
+  // Give the router time to pull /a/two off the shared stream and park in the send.
+  tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+  // HARD STOP: abort the routing future while it owns the in-flight event.
+  routing.abort();
+  let _ = routing.await;
+
+  // The buffered tail survives; the aborted in-flight delivery (/a/two) is the one
+  // documented loss; the lane then ENDS rather than hanging.
+  assert_eq!(recv(&lane_a).await.key(), key("/a/one").as_slice());
+  assert!(
+    tokio::time::timeout(DEADLINE, lane_a.recv())
+      .await
+      .expect("lane settles")
+      .is_none(),
+    "after an abort the lane ends after its buffered tail (at most one in-flight loss)"
+  );
+
+  // Remaining clones still own the MPMC stream: later events flow through next().
+  feed.modified("/a", "/a/after-abort").await;
+  let later = tokio::time::timeout(DEADLINE, w.next())
+    .await
+    .expect("next settles")
+    .expect("the stream is still live for surviving clones");
+  assert_eq!(later.key(), key("/a/after-abort").as_slice());
+}
+
 /// Codex R50: releases LOST to a full control queue cannot leak the table. The exact
 /// repro: stall the router on a full lane, admit CONTROL_CAPACITY registrations (the
 /// queue is now full), drop every one of those lanes — each drop-release try_send

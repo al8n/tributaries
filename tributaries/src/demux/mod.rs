@@ -52,6 +52,11 @@ enum Control<C, V> {
     /// lives in the caller's [`Lane`].
     lane: async_channel::Sender<Event<C, V>>,
   },
+  /// An orderly stop request ([`Demux::shutdown`], Codex R54): the routing task exits
+  /// after completing its current delivery — never mid-send — then drops every lane
+  /// sender, so each lane drains its buffered tail and reads clean end-of-stream with
+  /// nothing lost.
+  Shutdown,
   /// A best-effort release sent by a dropped [`Lane`] (Codex R49): remove the
   /// subscription's slot — IF it still holds generation `generation` — returning the
   /// subscription to unclaimed (rest) routing. Lost releases (full/closed control
@@ -265,10 +270,21 @@ impl<C, V> Demux<C, V> {
 
   /// Like [`spawn`](Self::spawn) but WITHOUT spawning: returns the control handle, the
   /// rest lane, and the routing future for the CALLER to spawn (M2-E) — the demux twin
-  /// of [`Tributaries::parts`], with the same caveats: routing progresses only while
-  /// the future is polled (unpolled = every lane silent), dropping it ends every lane
-  /// after its buffered tail, and the future is `Send` so any executor may host it
-  /// (the routing loop itself uses no timers).
+  /// of [`Tributaries::parts`]. Routing progresses only while the future is polled
+  /// (unpolled = every lane silent), and the future is `Send` so any executor may host
+  /// it (the routing loop itself uses no timers).
+  ///
+  /// **Aborting the future is a hard stop** (Codex R54): dropping it mid-poll may drop
+  /// the single delivery in flight at that moment — an event already pulled off the
+  /// shared stream and parked in a stalled lane send dies with the future, and the
+  /// actor cannot re-issue it (it left the actor's channel; no Rescan is owed). Lanes
+  /// then end after their buffered tails, indistinguishable from a clean end. The
+  /// no-known-event-drop guarantee is therefore scoped to routing that runs to
+  /// completion: stop LOSS-FREE via [`shutdown`](Self::shutdown) (finish current
+  /// delivery, then drain-and-end) or by closing the watcher (end-of-stream fan-in);
+  /// abort only when losing one in-flight event is acceptable. Remaining `Tributaries`
+  /// clones can still drain the shared stream after an abort — the events channel is
+  /// MPMC.
   ///
   /// # Panics
   ///
@@ -307,6 +323,24 @@ impl<C, V> Demux<C, V> {
   /// lifetime registrations (Codex R49); the churn test pins that property.
   pub fn tracked_lanes(&self) -> usize {
     self.tracked.load(Ordering::Acquire)
+  }
+
+  /// Requests an ORDERLY stop of the routing task (Codex R54): it finishes the
+  /// delivery it is currently awaiting — a stalled send completes when that lane
+  /// drains, never mid-send — then exits, dropping every lane sender so each
+  /// [`Lane::recv`] drains its buffered tail and reads `None`. Nothing is lost.
+  ///
+  /// This is the loss-free way to stop routing without ending the watcher itself
+  /// (closing the watcher ends the shared stream and the lanes with it). By contrast,
+  /// ABORTING the routing future (dropping the [`parts`](Self::parts) driver mid-poll)
+  /// is a hard stop that may drop the single in-flight delivery — see `parts`.
+  ///
+  /// Awaits admission on the bounded control queue like [`lane`](Self::lane); returns
+  /// once the request is admitted (the stop itself completes when the driver future
+  /// resolves — callers holding the `parts` driver await that for the drain barrier).
+  /// A no-op if the routing task already exited.
+  pub async fn shutdown(&self) {
+    let _ = self.control.send(Control::Shutdown).await;
   }
 
   /// Registers a bounded lane (of `capacity` events) for `sub` with the routing task,
@@ -429,6 +463,13 @@ async fn run<C, V, R, H>(
               if !lane.is_closed() {
                 lanes.insert(sub, (generation, lane));
               }
+            }
+            Ok(Control::Shutdown) => {
+              // Orderly stop-and-drain (Codex R54): the current delivery — the send
+              // this loop completed before selecting again — is already done, so
+              // exiting here loses nothing; dropping the senders below ends every
+              // lane after its buffered tail.
+              break;
             }
             Ok(Control::Release { sub, generation }) => {
               // Remove only the matching generation: a stale release from a lane that
