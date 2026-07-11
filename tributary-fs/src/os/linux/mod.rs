@@ -450,6 +450,9 @@ impl Source {
       super::Backend::Inotify => Self::spawn_inotify(config, canonical, root_fd.as_fd()),
       super::Backend::Fanotify => Self::spawn_probed(config, canonical, root_fd.as_fd(), false),
       super::Backend::Auto => Self::spawn_probed(config, canonical, root_fd.as_fd(), true),
+      // The real spawn seam rejects foreign selections before dispatch; a
+      // direct spawn (the os-level suites) gets the same typed refusal.
+      foreign => Err(super::SourceError::ForeignBackend { requested: foreign }),
     }
   }
 

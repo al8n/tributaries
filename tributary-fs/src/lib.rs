@@ -57,7 +57,7 @@ mod watcher;
 pub use error::{BuildError, CloseError, UnwatchError, WatchRootError};
 pub use event::{Event, EventKind, MovedEvent};
 pub use options::WatcherOptions;
-pub use os::{Backend, BackendKind, BackendStats, SourceError};
+pub use os::{Backend, BackendKind, BackendStats, ProbeStage, SourceError};
 pub use watcher::{CoverOutcome, RootHandle, SkipReason, Watcher};
 
 pub use tributary_proto::{ChangeId, Epoch, Interest, Location, ScopeId, Segment};
