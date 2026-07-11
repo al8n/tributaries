@@ -26,7 +26,7 @@ tokio = ["agnostic-lite/tokio", "tributary-fs?/tokio"]
 smol = ["agnostic-lite/smol", "tributary-fs?/smol"]
 
 [dependencies]
-agnostic-lite = { version = "0.6", features = ["time"] }
+agnostic-lite = { version = "0.7", features = ["time"] }
 arc-swap = "1"
 async-channel = "2"
 futures-channel = "0.3"
@@ -46,7 +46,7 @@ tributary-proto = { version = "0.2", path = "../tributary-proto" }
 # `Source` would — with this crate's own `fs` feature OFF, so the dev-dependency is
 # unconditional and carries its own `tokio` layer (the weak `tributary-fs?/tokio`
 # forwarding above deliberately does not fire when `fs` is off).
-agnostic-lite = { version = "0.6", features = ["time"] }
+agnostic-lite = { version = "0.7", features = ["time"] }
 proptest = "1"
 tempfile = "3"
 tributary-fs = { version = "0.2", path = "../tributary-fs", features = ["tokio"] }
