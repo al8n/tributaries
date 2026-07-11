@@ -20,7 +20,7 @@
 #![cfg(all(
   feature = "tokio",
   not(miri),
-  any(target_os = "macos", target_os = "linux")
+  any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 
 use std::{
