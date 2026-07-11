@@ -35,7 +35,7 @@ mod tests;
 /// Binds `C = OsString` (a path's [components](std::path::Path::components)) to real
 /// kernel watches. This is the only place the crate maps a key to a path and reverses a
 /// raw filesystem event back into a key.
-pub struct FsSource<R: RuntimeLite> {
+pub struct FsSource<R> {
   watcher: Watcher<R>,
   /// Roots whose release was requested (via the synchronous [`disarm`](Source::disarm)) but not yet
   /// handed to the [`Watcher`]'s control channel, each paired with the released root's **canonical
@@ -100,7 +100,7 @@ pub struct FsSource<R: RuntimeLite> {
   deferred_forwards: usize,
 }
 
-impl<R: RuntimeLite> core::fmt::Debug for FsSource<R> {
+impl<R> core::fmt::Debug for FsSource<R> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("FsSource")
       .field("watcher", &self.watcher)
@@ -133,7 +133,12 @@ impl<R: RuntimeLite> FsSource<R> {
       deferred_forwards: 0,
     })
   }
+}
 
+// The deferral queue and the Source seam below are channel and registry work:
+// no method names an `R` item (the runtime bound lives on `new`, the one
+// place the watcher driver is spawned).
+impl<R> FsSource<R> {
   /// Queues a prune the control channel refused (momentarily full), **latest-wins per handle**
   /// ([`Source::set_cover`] contract clause 6): a newer request for the same handle replaces the
   /// stale snapshot, so a later flush never applies an outdated cover.
@@ -177,7 +182,7 @@ impl<R: RuntimeLite> FsSource<R> {
 /// (later arms, the conflict-triggered path, or `Drop` take the rest).
 const OPPORTUNISTIC_RELEASE_HANDOFFS: usize = 2;
 
-impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
+impl<R> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
 
   fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
