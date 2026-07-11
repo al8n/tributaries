@@ -808,7 +808,9 @@ impl DriverCore {
       }
     }
     for watch in to_rearm {
-      self.monitor.rearm_watch_subtree(watch);
+      // The kickoff report feeds the effect-completion fence; the fence wiring
+      // consumes it when the cover reconcile grows (see the fence design, §6).
+      let _ = self.monitor.rearm_watch_subtree(watch);
     }
 
     // Turn the queued `Action::Unwatch`es (prune) into `RemoveWatch` effects and the queued
