@@ -1211,10 +1211,13 @@ impl DriverCore {
             // did not get replaced between that read and the (absolute-path) open.
             // The spawn barrier already brackets identity around start, but the
             // root arm happens after — so the same confirmation applies here.
-            let expected = NonZeroU64::new(meta.identity.ino()).map(|ino| ExpectedObject {
-              dev: meta.identity.dev(),
-              ino,
-            });
+            let expected = u64::try_from(meta.identity.ino())
+              .ok()
+              .and_then(NonZeroU64::new)
+              .map(|ino| ExpectedObject {
+                dev: meta.identity.dev(),
+                ino,
+              });
             self.effects.push_back(Effect::AddWatch {
               scope,
               watch,

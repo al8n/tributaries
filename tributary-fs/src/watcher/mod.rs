@@ -1006,7 +1006,7 @@ fn identity_of(meta: &std::fs::Metadata) -> Option<RootIdentity> {
   #[cfg(unix)]
   {
     use std::os::unix::fs::MetadataExt;
-    Some(RootIdentity::new(meta.dev(), meta.ino()))
+    Some(RootIdentity::new(meta.dev(), meta.ino().into()))
   }
   #[cfg(not(unix))]
   {

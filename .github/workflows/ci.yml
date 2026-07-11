@@ -209,6 +209,43 @@ jobs:
       # aliasing cell; the tests snapshot and restore every knob they touch.
       run: sudo -E env "PATH=$PATH" cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1
 
+  windows-integration:
+    name: windows-integration
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          # Pinned labels: windows-latest re-points across image migrations,
+          # and the integration matrix is exactly the support claim.
+          - windows-2022
+          - windows-2025
+    runs-on: ${{ matrix.os }}
+    # Real-RDCW suites; a wedged completion port must fail the job, not idle
+    # out the runner.
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v7
+    - name: Cache cargo build and registry
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ matrix.os }}-windows-integration-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ matrix.os }}-windows-integration-
+    - name: Install Rust
+      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
+      run: rustup update stable --no-self-update && rustup default stable
+    - name: Build the volume zoo
+      run: pwsh ci/windows/zoo.ps1 -Root "$env:RUNNER_TEMP\zoo"
+    - name: Integration
+      # Single-threaded by the suite's contract (root-death and overflow
+      # cells own their scratch trees; serialization keeps kernel-buffer
+      # pressure deterministic).
+      run: cargo test -p tributary-fs --all-features --test windows_rdcw -- --test-threads=1
+
   sanitizer:
     name: sanitizer
     runs-on: ubuntu-latest

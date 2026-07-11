@@ -811,7 +811,7 @@ fn ancestor_identities(canonical: &Path) -> Result<Vec<super::RootIdentity>, sup
       Err(err) => return Err(unavailable(err)),
     };
     let stat = rustix::fs::fstat(&fd).map_err(unavailable)?;
-    ancestors.push(super::RootIdentity::new(stat.st_dev, stat.st_ino));
+    ancestors.push(super::RootIdentity::new(stat.st_dev, stat.st_ino.into()));
   }
   Ok(ancestors)
 }
@@ -1030,7 +1030,7 @@ mod inotify_source {
         root: canonical.clone(),
         source: err.into(),
       })?;
-      let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
+      let identity = RootIdentity::new(stat.st_dev, stat.st_ino.into());
       let mounts = mounts_under(&canonical).unwrap_or_default();
 
       let (queue_tx, queue_rx) = async_channel::unbounded();
@@ -1069,7 +1069,7 @@ mod inotify_source {
           });
         }
       };
-      if RootIdentity::new(pinned.st_dev, pinned.st_ino) != identity {
+      if RootIdentity::new(pinned.st_dev, pinned.st_ino.into()) != identity {
         handle.shutdown();
         return Err(SourceError::RootReplaced { root: canonical });
       }
@@ -1087,7 +1087,7 @@ mod inotify_source {
         handle.shutdown();
         return Err(SourceError::NotADirectory { root: canonical });
       }
-      if RootIdentity::new(live.dev(), live.ino()) != identity {
+      if RootIdentity::new(live.dev(), live.ino().into()) != identity {
         handle.shutdown();
         return Err(SourceError::RootReplaced { root: canonical });
       }

@@ -11,6 +11,20 @@
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) mod ffi;
 pub(crate) mod rdcw;
+#[cfg(all(target_os = "windows", not(miri)))]
+pub(crate) mod source;
+#[cfg(all(target_os = "windows", not(miri)))]
+pub(crate) use source::{Source, SourceHandle};
+
+/// Windows reads no mount table in v1: `None` keeps event-side trust closed
+/// until the driver's post-live refresh (the seam's unknown-boundary
+/// semantic), and junction containment is enforced by the reparse refusal at
+/// descent rather than by a seed.
+#[cfg(all(target_os = "windows", not(miri)))]
+pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+  let _ = root;
+  None
+}
 
 pub(crate) use rdcw::{
   decode::{RdcwAction, RdcwName, RdcwRecord},
@@ -23,9 +37,9 @@ pub(crate) use rdcw::{
 /// silently lossy) on SMB, so a remote root is refused at the spawn barrier;
 /// a drive-lettered mapping is caught separately by the handle-side drive
 /// probe. Pure string logic so every host's twins pin it.
-// The spawn barrier consumes this once the source lands behind this seam;
-// until then the twins are the only caller.
-#[allow(dead_code)]
+// The windows spawn barrier is the production caller; on every other host
+// only the twins reach it.
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
 pub(crate) fn is_unc_remote(path: &std::path::Path) -> bool {
   let Some(text) = path.to_str() else {
     // A root that cannot even spell as UTF-8 is refused elsewhere; the
@@ -65,9 +79,9 @@ pub(crate) enum RawWindowsEvent {
 /// A lossy chain also widows the pairer's held OLD first: its NEW half may
 /// sit in the refused remainder, and the widow must precede the loss signal
 /// it predates — the pump-side loss-ordering invariant.
-// The OVERLAPPED pump drives this per completion once it lands behind this
-// seam; until then the twins are the only caller.
-#[allow(dead_code)]
+// The windows pump drives this per completion; on every other host only
+// the twins reach it.
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
 pub(crate) fn lower_rdcw_buffer(
   pairer: &mut RdcwPairer,
   buf: &[u8],

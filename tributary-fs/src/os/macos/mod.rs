@@ -144,7 +144,7 @@ impl Source {
       });
     }
     let root_dev = root_meta.dev() as libc::dev_t;
-    let identity = super::RootIdentity::new(root_meta.dev(), root_meta.ino());
+    let identity = super::RootIdentity::new(root_meta.dev(), root_meta.ino().into());
     // The mount seed and device UUID are part of the pre-start barrier: taken
     // here they cannot postdate any event. The seed is trust-reducing only —
     // a mount in the read→start gap would be in neither the seed nor the
@@ -211,7 +211,7 @@ impl Source {
         root: roots[0].clone(),
       });
     }
-    if super::RootIdentity::new(live.dev(), live.ino()) != identity {
+    if super::RootIdentity::new(live.dev(), live.ino().into()) != identity {
       handle.shutdown();
       return Err(SourceError::RootReplaced {
         root: roots[0].clone(),
@@ -226,7 +226,7 @@ impl Source {
     let mut ancestors = Vec::new();
     for ancestor in roots[0].ancestors().skip(1) {
       match fs::metadata(ancestor) {
-        Ok(meta) => ancestors.push(super::RootIdentity::new(meta.dev(), meta.ino())),
+        Ok(meta) => ancestors.push(super::RootIdentity::new(meta.dev(), meta.ino().into())),
         Err(source) => {
           handle.shutdown();
           return Err(SourceError::RootUnavailable {

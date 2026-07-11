@@ -219,7 +219,7 @@ impl Source {
         source: err.into(),
       })
     })?;
-    let identity = RootIdentity::new(stat.st_dev, stat.st_ino);
+    let identity = RootIdentity::new(stat.st_dev, stat.st_ino.into());
     let mounts = mounts_under(&canonical).unwrap_or_default();
 
     // The root's FID — encoded from the PIN, so it names exactly the object the
@@ -323,7 +323,7 @@ impl Source {
         }));
       }
     };
-    if RootIdentity::new(pinned.st_dev, pinned.st_ino) != identity {
+    if RootIdentity::new(pinned.st_dev, pinned.st_ino.into()) != identity {
       handle.shutdown();
       return Err(SpawnFailure::Error(SourceError::RootReplaced {
         root: canonical,
@@ -345,7 +345,7 @@ impl Source {
         root: canonical,
       }));
     }
-    if RootIdentity::new(live.dev(), live.ino()) != identity {
+    if RootIdentity::new(live.dev(), live.ino().into()) != identity {
       handle.shutdown();
       return Err(SpawnFailure::Error(SourceError::RootReplaced {
         root: canonical,

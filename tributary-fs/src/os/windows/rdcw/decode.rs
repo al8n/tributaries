@@ -184,7 +184,7 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
     // malformed record, and the payload must fit the buffer.
     let name_len = load_u32(buf, name_len_at) as usize;
     let name_at = end_of_header;
-    let name_fits = name_len % 2 == 0
+    let name_fits = name_len.is_multiple_of(2)
       && name_at
         .checked_add(name_len)
         .is_some_and(|end| end <= buf.len());
@@ -196,8 +196,10 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
     }
 
     let units: Vec<u16> = buf[name_at..name_at + name_len]
-      .chunks_exact(2)
-      .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+      .as_chunks::<2>()
+      .0
+      .iter()
+      .map(|pair| u16::from_le_bytes(*pair))
       .collect();
     let name = decode_name(&units);
 
@@ -218,7 +220,7 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
     }
     // A link must be DWORD-aligned and make forward progress past this
     // record's fixed prefix, inside the buffer.
-    let aligned = next_offset % 4 == 0;
+    let aligned = next_offset.is_multiple_of(4);
     let Some(next_at) = at.checked_add(next_offset) else {
       return DecodedBuffer {
         records,
