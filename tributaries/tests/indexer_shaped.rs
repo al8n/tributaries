@@ -854,12 +854,13 @@ async fn close_and_handle_drop_teardown() {
 
   w.close().await.expect("close returns Ok");
 
-  // Teardown reached the DATA plane: the retained clone's stream ends.
+  // Teardown reached the DATA plane: the retained clone's stream ENDS — after any
+  // owed buffered deliveries drain first (close delivers owed debt before the end,
+  // so a straggler event ahead of the `None` is contractual, not a failure).
   assert!(
-    matches!(
-      tokio::time::timeout(DEADLINE, reader.next()).await,
-      Ok(None)
-    ),
+    tokio::time::timeout(DEADLINE, async { while reader.next().await.is_some() {} })
+      .await
+      .is_ok(),
     "the event stream ends once the actor tore down (close teardown)"
   );
   // Teardown reached the CONTROL plane: a further command errors (owner gone).
