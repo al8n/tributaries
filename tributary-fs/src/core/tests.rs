@@ -906,6 +906,7 @@ fn identity_minting_respects_devices_and_mounts() {
     publicly_live: true,
     liveness_deadline: None,
     applied_cover: None,
+    settle_floor: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -941,6 +942,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     publicly_live: true,
     liveness_deadline: None,
     applied_cover: None,
+    settle_floor: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -2433,72 +2435,88 @@ fn broadening_delta_is_the_uncovered_retained_prefixes() {
   );
 }
 
-/// `on_set_cover` validates the retained cover against the LIVE scope root before acting on it. A
-/// cover ENTIRELY outside the root is a caller error — refused as a no-op (no prune, `applied_cover`
-/// left untouched), so a typo / relative / stale path can never mark every in-root watch strictly-
-/// outside and SILENTLY PRUNE the whole scope; a PARTIALLY out-of-root cover proceeds with the in-root
-/// subset only. Exercised on a kernel-recursive scope: its prune/grow are structural no-ops here (one
-/// root watch, no broadening delta), so the observable effect is exactly the filter + the
-/// `applied_cover` recording it guards — which run for every backend.
+/// The antichain MEET the settle floor folds with — the coverage guaranteed by
+/// BOTH covers: the deeper prefix of each nested pair, nothing from disjoint
+/// pairs, `None` (FULL) as the identity, and the result normalized to cover
+/// form.
 #[test]
-fn set_cover_validates_retained_against_the_scope_root() {
-  let (mut core, scope) = live_core(); // canonical root `/r`
-  let applied = |core: &DriverCore| core.scopes.get(&scope).unwrap().applied_cover.clone();
+fn cover_meet_is_the_coverage_guaranteed_by_both() {
+  let p = |s: &str| PathBuf::from(s);
 
-  // (1) A cover ENTIRELY outside the root is refused as a no-op: nothing pruned, `applied_cover`
-  // stays `None` — a typo / relative / stale path can never silently collapse the scope's coverage.
-  core.on_set_cover(
-    scope,
-    &[PathBuf::from("/outside"), PathBuf::from("relative/x")],
-  );
+  // FULL (`None`) is the meet identity: meet(FULL, A) = A.
   assert_eq!(
-    applied(&core),
-    None,
-    "an all-out-of-root cover is refused — never recorded, never a full prune"
+    cover_meet(None, &[p("/x"), p("/y")]),
+    vec![p("/x"), p("/y")],
+    "full coverage guarantees whatever the other cover does"
   );
 
-  // (2) The root itself is a valid retained prefix (the boundary case): honored and recorded.
-  core.on_set_cover(scope, &[PathBuf::from("/r")]);
+  // A nested pair keeps the DEEPER prefix — the intersection of the two subtrees.
+  assert_eq!(cover_meet(Some(&[p("/x")]), &[p("/x/y")]), vec![p("/x/y")]);
+  assert_eq!(cover_meet(Some(&[p("/x/y")]), &[p("/x")]), vec![p("/x/y")]);
+
+  // Disjoint covers guarantee NOTHING in common — an empty meet is meaningful.
   assert_eq!(
-    applied(&core),
-    Some(vec![PathBuf::from("/r")]),
-    "the root path itself is within the root and honored"
+    cover_meet(Some(&[p("/x")]), &[p("/z")]),
+    Vec::<PathBuf>::new()
   );
 
-  // (3) A MIXED cover proceeds with the in-root subset ONLY — the out-of-root prefix is dropped.
-  core.on_set_cover(scope, &[PathBuf::from("/r/a"), PathBuf::from("/elsewhere")]);
+  // Equal prefixes meet to themselves, once (dedup).
+  assert_eq!(cover_meet(Some(&[p("/x")]), &[p("/x")]), vec![p("/x")]);
+
+  // Pairwise over antichains: each nested pair contributes its deeper member;
+  // members nested in nothing on the other side drop out.
   assert_eq!(
-    applied(&core),
-    Some(vec![PathBuf::from("/r/a")]),
-    "only the in-root prefix is honored; the out-of-root one is filtered away"
+    cover_meet(
+      Some(&[p("/r/a"), p("/r/b")]),
+      &[p("/r/a/deep"), p("/r/b"), p("/r/c")]
+    ),
+    vec![p("/r/a/deep"), p("/r/b")]
   );
 
-  // (3b) An ESCAPING path that lexically begins with the root — `Path::starts_with` does not
-  // resolve `..` — is refused too: a canonical retained path never carries
-  // `.`/`..` components, so any that does is a caller error, never honored (alone or mixed).
-  core.on_set_cover(scope, &[PathBuf::from("/r/../outside")]);
+  // Cover normal form: a NON-antichain input ({/x/y} beside {/x}) collapses —
+  // the pairwise set {/x/y, /x} prunes the member inside the other's subtree,
+  // because cover({/x/y, /x}) IS cover({/x}).
   assert_eq!(
-    applied(&core),
-    Some(vec![PathBuf::from("/r/a")]),
-    "a dot-dot-escaping cover is refused — never recorded, never a prune"
-  );
-  core.on_set_cover(
-    scope,
-    &[PathBuf::from("/r/b"), PathBuf::from("/r/./b/../../etc")],
-  );
-  assert_eq!(
-    applied(&core),
-    Some(vec![PathBuf::from("/r/b")]),
-    "in a mixed cover, only the canonical in-root prefix survives the component check"
+    cover_meet(Some(&[p("/x")]), &[p("/x/y"), p("/x")]),
+    vec![p("/x")]
   );
 
-  // (4) A later all-out-of-root cover is STILL refused — it must not overwrite or reset the prior,
-  // still-correct coverage (the `/r/b` recorded by the mixed case above).
-  core.on_set_cover(scope, &[PathBuf::from("/bad")]);
+  // Prefix tests are componentwise, never byte-wise: /xy is not under /x.
   assert_eq!(
-    applied(&core),
-    Some(vec![PathBuf::from("/r/b")]),
-    "an all-out-of-root cover leaves the prior applied cover untouched"
+    cover_meet(Some(&[p("/x")]), &[p("/xy")]),
+    Vec::<PathBuf>::new()
+  );
+}
+
+/// The `Noop` refusals that need no descending machinery: an unknown scope,
+/// and a kernel-recursive scope — its whole-subtree coverage never narrowed,
+/// reported explicitly as `KernelRecursive` rather than walked as silence.
+/// Neither records `applied_cover` (the stream was never reconciled) nor opens
+/// a fence window. The remaining refusals (`NotLive`, `RefusedCover`) and the
+/// recording behavior live with the descending suites below.
+#[test]
+fn set_cover_refuses_unknown_and_kernel_recursive_scopes() {
+  let (mut core, scope) = live_core(); // FSEvents: kernel-recursive
+  assert_eq!(
+    core.on_set_cover(scope, &[PathBuf::from("/r/a")]),
+    CoverReconcile::Noop(CoverNoop::KernelRecursive),
+    "kernel-recursive coverage never narrowed — an explicit refusal, not a silent walk"
+  );
+  let state = core.scopes.get(&scope).unwrap();
+  assert_eq!(
+    state.applied_cover, None,
+    "a refused cover is never recorded"
+  );
+  assert_eq!(state.settle_floor, None);
+  assert!(
+    core.cover_fences.is_empty(),
+    "a refusal opens no fence window"
+  );
+
+  let ghost = ScopeId::new(NonZeroU64::new(999).unwrap());
+  assert_eq!(
+    core.on_set_cover(ghost, &[PathBuf::from("/r/a")]),
+    CoverReconcile::Noop(CoverNoop::UnknownScope),
   );
 }
 
@@ -2524,6 +2542,7 @@ mod lowering {
       publicly_live: true,
       liveness_deadline: None,
       applied_cover: None,
+      settle_floor: None,
     }
   }
 
@@ -3856,6 +3875,611 @@ mod descending {
         Effect::Enumerate { watch, .. } if *watch == root
       )),
       "the degraded listing retries: {effects:?}"
+    );
+  }
+
+  // --- The set-cover fence: reconcile disposition, lossy window, settle floor ---
+
+  fn p(s: &str) -> PathBuf {
+    PathBuf::from(s)
+  }
+
+  /// The root listing the fence suites share: two subdirectories on the root
+  /// device, stable inode identities so a re-arm read identity-keeps a live
+  /// survivor.
+  fn root_listing() -> Vec<RawDirEntry> {
+    vec![
+      entry("keep", FileKind::Dir, 1, 11),
+      entry("drop", FileKind::Dir, 1, 12),
+    ]
+  }
+
+  /// Answers every queued arm with `Installed` and every queued enumerate with
+  /// its listing from `listings` (absent paths list empty), repeating until a
+  /// drain holds neither — the hand-driven equivalent of the async driver's
+  /// execute-effects loop, quiescing a discovery or re-arm cascade.
+  fn run_cascade(core: &mut DriverCore, listings: &BTreeMap<&str, Vec<RawDirEntry>>) {
+    let mut wd = 100;
+    for _ in 0..32 {
+      let effects = drain(core);
+      let mut progressed = false;
+      for effect in &effects {
+        match effect {
+          Effect::AddWatch { watch, .. } => {
+            wd += 1;
+            core.on_watch_installed(*watch, crate::os::linux::WatchOutcome::Installed(wd));
+            progressed = true;
+          }
+          Effect::Enumerate { req, path, .. } => {
+            let entries = listings
+              .get(path.to_str().expect("test paths are UTF-8"))
+              .cloned()
+              .unwrap_or_default();
+            core.on_enumerated(*req, listed(entries));
+            progressed = true;
+          }
+          _ => {}
+        }
+      }
+      if !progressed {
+        return;
+      }
+    }
+    panic!("the cascade did not quiesce within the iteration bound");
+  }
+
+  /// A live descending scope at `/r` whose cold discovery armed `keep` and
+  /// `drop`, then shrunk in place to `{/r/keep}` with the shrink's window
+  /// already observed settled and CLEAN: `drop`'s watch is pruned and
+  /// `applied_cover == settle_floor == {/r/keep}` — the shared start of the
+  /// grow-fence suites.
+  fn shrunk_to_keep() -> (DriverCore, ScopeId, WatchId) {
+    let (mut core, scope, req, root_watch) = live_descending();
+    core.on_enumerated(req, listed(root_listing()));
+    run_cascade(&mut core, &BTreeMap::new());
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "cold discovery is not re-arm work"
+    );
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    assert!(
+      drain(&mut core)
+        .iter()
+        .any(|e| matches!(e, Effect::RemoveWatch { .. })),
+      "the shrink prunes /r/drop"
+    );
+    // A shrink grows nothing, so the scope reads settled at once: the
+    // observation is immediate, fence-less, and clean — it resets the floor
+    // to the applied cover and clears the scope's fence entry.
+    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(state.applied_cover, Some(vec![p("/r/keep")]));
+    assert_eq!(state.settle_floor, Some(vec![p("/r/keep")]));
+    assert!(core.cover_fences.is_empty());
+    (core, scope, root_watch)
+  }
+
+  /// `on_set_cover` validates the retained cover against the LIVE scope root
+  /// before acting on it, reporting each refusal as a typed `Noop`. A cover
+  /// ENTIRELY outside the root is a caller error — refused (`RefusedCover`, no
+  /// prune, `applied_cover` untouched), so a typo / relative / stale path can
+  /// never mark every in-root watch strictly-outside and SILENTLY PRUNE the
+  /// whole scope; a PARTIALLY out-of-root cover proceeds with the in-root
+  /// subset only. Exercised on a childless descending scope: prune/grow are
+  /// structural no-ops, so the observable effect is exactly the filter + the
+  /// `applied_cover` recording it guards.
+  #[test]
+  fn set_cover_validates_retained_against_the_scope_root() {
+    let (mut core, scope, req, _root) = live_descending();
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    let applied = |core: &DriverCore| core.scopes.get(&scope).unwrap().applied_cover.clone();
+
+    // (1) A cover ENTIRELY outside the root is refused: nothing pruned, `applied_cover`
+    // stays `None` — a typo / relative / stale path can never silently collapse coverage.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/outside"), p("relative/x")]),
+      CoverReconcile::Noop(CoverNoop::RefusedCover),
+    );
+    assert_eq!(
+      applied(&core),
+      None,
+      "an all-out-of-root cover is refused — never recorded, never a full prune"
+    );
+
+    // (1b) An EMPTY cover is refused the same way (defensive — never prune the whole tree).
+    assert_eq!(
+      core.on_set_cover(scope, &[]),
+      CoverReconcile::Noop(CoverNoop::RefusedCover),
+    );
+
+    // (2) The root itself is a valid retained prefix (the boundary case): honored and recorded.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r")]),
+      CoverReconcile::Reconciling
+    );
+    assert_eq!(
+      applied(&core),
+      Some(vec![p("/r")]),
+      "the root path itself is within the root and honored"
+    );
+
+    // (3) A MIXED cover proceeds with the in-root subset ONLY — the out-of-root prefix is dropped.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/a"), p("/elsewhere")]),
+      CoverReconcile::Reconciling
+    );
+    assert_eq!(
+      applied(&core),
+      Some(vec![p("/r/a")]),
+      "only the in-root prefix is honored; the out-of-root one is filtered away"
+    );
+
+    // (3b) An ESCAPING path that lexically begins with the root — `Path::starts_with` does not
+    // resolve `..` — is refused too: a canonical retained path never carries
+    // `.`/`..` components, so any that does is a caller error, never honored (alone or mixed).
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/../outside")]),
+      CoverReconcile::Noop(CoverNoop::RefusedCover),
+    );
+    assert_eq!(
+      applied(&core),
+      Some(vec![p("/r/a")]),
+      "a dot-dot-escaping cover is refused — never recorded, never a prune"
+    );
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/b"), p("/r/./b/../../etc")]),
+      CoverReconcile::Reconciling
+    );
+    assert_eq!(
+      applied(&core),
+      Some(vec![p("/r/b")]),
+      "in a mixed cover, only the canonical in-root prefix survives the component check"
+    );
+
+    // (4) A later all-out-of-root cover is STILL refused — it must not overwrite or reset the
+    // prior, still-correct coverage (the `/r/b` recorded by the mixed case above).
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/bad")]),
+      CoverReconcile::Noop(CoverNoop::RefusedCover),
+    );
+    assert_eq!(
+      applied(&core),
+      Some(vec![p("/r/b")]),
+      "an all-out-of-root cover leaves the prior applied cover untouched"
+    );
+  }
+
+  /// A set-cover between a descending scope's SPAWN and its root-arm GRANT is
+  /// refused `NotLive`: the root's arm is still COLD, and a grow would mark it
+  /// re-arm-flavored — suppressing the initial inventory's `Created`s (re-arms
+  /// deliberately emit none). The refusal perturbs nothing, and the later cold
+  /// discovery delivers its inventory intact.
+  #[test]
+  fn set_cover_before_the_grant_is_refused_not_live() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root_watch) = spawned_with_pending_root_arm_at(&mut core, "/r");
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Noop(CoverNoop::NotLive),
+    );
+    // A second pre-grant cover must stay refused too: recording the first would
+    // seed the broadening delta whose grow performs the cold-to-re-arm conversion.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/other")]),
+      CoverReconcile::Noop(CoverNoop::NotLive),
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(state.applied_cover, None, "a refused cover records nothing");
+    assert_eq!(state.settle_floor, None);
+    assert!(
+      core.cover_fences.is_empty(),
+      "no fence window opens pre-grant"
+    );
+
+    // The grant commits: the root arms, cold-enumerates, and the inventory's
+    // `Created`s flow — cold discovery was not converted into a re-arm.
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    let req = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, watch, .. } if *watch == root_watch => Some(*req),
+        _ => None,
+      })
+      .expect("the granted root cold-enumerates");
+    core.on_enumerated(req, listed(vec![entry("keep", FileKind::Dir, 1, 11)]));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_created()),
+      "cold discovery still emits its inventory: {effects:?}"
+    );
+  }
+
+  /// The fence's core promise: an acked grow's fence PENDS until the re-arm
+  /// cascade quiesces — not until its effects are queued — and a clean window
+  /// resolves `Applied`; the clean settle resets the floor to the now-truthful
+  /// applied cover and clears the scope's fence state.
+  #[test]
+  fn cover_fence_pends_until_the_grow_cascade_settles() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    // Grow back: /r/drop's broadening delta re-arms its deepest still-watched
+    // ancestor — the root.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    assert!(
+      !core.monitor.rearm_settled(scope),
+      "the grow started counted re-arm work"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "the fence pends while the cascade runs"
+    );
+    // Quiesce: the root's re-arm read re-installs `drop` and cascades down
+    // (`keep` is identity-kept, never re-armed).
+    run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    assert!(core.monitor.rearm_settled(scope));
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Applied)]
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(state.applied_cover, Some(vec![p("/r/keep"), p("/r/drop")]));
+    assert_eq!(
+      state.settle_floor, state.applied_cover,
+      "a clean settle resets the floor to the truthful applied cover"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "settling clears the scope's fence state"
+    );
+  }
+
+  /// A `Rescan` passing `route_event` inside the window degrades the fence,
+  /// and the lossy settle REWINDS `applied_cover` to the settle floor — so
+  /// re-issuing the same cover computes a NON-empty broadening delta and the
+  /// grow re-attempts. This is the applied-cover-lie regression: without the
+  /// rewind, the re-issue would compute an empty delta and settle clean over
+  /// the hole the failed arm left.
+  #[test]
+  fn lossy_window_degrades_and_rewinds_the_applied_cover() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    // The re-arm read runs, but the re-installed `drop`'s ARM fails: the
+    // Monitor drops the subtree and stands a covering Rescan — the loss the
+    // window must catch.
+    let req = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the grow re-arms the root");
+    core.on_enumerated(req, listed(root_listing()));
+    let effects = drain(&mut core);
+    // The surviving `keep` is identity-kept and re-armed DOWNWARD — a clean
+    // counted read; answer it so the failed arm below is the cascade's last
+    // obligation.
+    let keep = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/keep") => Some(*req),
+        _ => None,
+      })
+      .expect("the survivor re-arms downward");
+    core.on_enumerated(keep, listed(Vec::new()));
+    let add = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/drop") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the re-arm re-installs the pruned directory");
+    core.on_watch_installed(
+      add,
+      crate::os::linux::WatchOutcome::Failed(WatchError::NoSpace),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the failed arm stands a covering Rescan: {effects:?}"
+    );
+    // The failure ended the obligation (dropped-with-standing-Rescan): the
+    // fence settles Degraded and the applied cover rewinds to the floor.
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Degraded)]
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.applied_cover,
+      Some(vec![p("/r/keep")]),
+      "the lossy settle rewinds the applied cover to the provable floor"
+    );
+    assert_eq!(
+      state.settle_floor,
+      Some(vec![p("/r/keep")]),
+      "the floor stays on a lossy settle — it IS the floor"
+    );
+    // The regression: re-issuing the SAME cover must re-attempt the grow.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let effects = drain(&mut core);
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r"))),
+      "the rewound cover yields a non-empty broadening delta — the grow re-attempts: {effects:?}"
+    );
+  }
+
+  /// The F0 amendment end-to-end: a grow landing on a directory whose COLD
+  /// read is in flight coalesces into the dirty bit — a latent obligation the
+  /// settle counter deliberately does not see, so the scope reads settled
+  /// while the coverage work is outstanding. The fence opened for that
+  /// reconcile resolves `Degraded` (lossy from birth) even though NO Rescan
+  /// passed in its window — without the born-lossy memory this poll would
+  /// resolve `Applied` over the latent hole.
+  #[test]
+  fn coalesced_grow_makes_the_fence_lossy_from_birth() {
+    let (mut core, scope, root_watch) = shrunk_to_keep();
+    // Live churn re-creates `/r/drop`: cold discovery arms it and its COLD
+    // read goes in flight — deliberately left unanswered.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_CREATE | IN_ISDIR,
+        0,
+        Some(b"drop"),
+      )],
+      at(5),
+    );
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/drop") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("cold discovery arms the re-created directory");
+    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(9));
+    assert!(
+      drain(&mut core).iter().any(
+        |e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/drop"))
+      ),
+      "the cold read is in flight"
+    );
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "a cold read is not re-arm work — the scope reads settled"
+    );
+    // The grow's delta lands exactly on the in-flight cold read: Coalesced.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "the latent obligation is invisible to the settle counter"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Degraded)],
+      "a Coalesced kickoff makes the fence lossy from birth"
+    );
+    assert_eq!(
+      core.scopes.get(&scope).unwrap().applied_cover,
+      Some(vec![p("/r/keep")]),
+      "the born-lossy settle rewinds to the floor like any lossy settle"
+    );
+  }
+
+  /// The reply-less-reconcile interaction, both directions: (i) a coalesced
+  /// reconcile with NO fence of its own (`request_set_cover` is reply-less)
+  /// still marks every ALREADY-PENDING fence of the scope lossy; (ii) the loss
+  /// memory clears with the settle observation, so a fence opened for a LATER
+  /// reconcile — after the latent obligation escalated and quiesced — resolves
+  /// `Applied`: nothing leaks across windows.
+  #[test]
+  fn reply_less_coalesce_marks_pending_fences_and_clears_at_settle() {
+    let (mut core, scope, root_watch) = shrunk_to_keep();
+    // An acked reconcile with nothing to grow: its fence pends clean on an
+    // already-settled scope (unpolled, so the window stays open).
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let pending = core.open_cover_fence(scope);
+
+    // Live churn re-creates `/r/drop`; its cold read goes in flight.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_CREATE | IN_ISDIR,
+        0,
+        Some(b"drop"),
+      )],
+      at(5),
+    );
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/drop") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("cold discovery arms the re-created directory");
+    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(9));
+    let cold = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/drop") => Some(*req),
+        _ => None,
+      })
+      .expect("the cold read is in flight");
+
+    // (i) The REPLY-LESS grow coalesces into the cold read: no fence of its
+    // own, but the already-pending fence is marked and resolves Degraded.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(pending, CoverSettle::Degraded)],
+      "a reply-less coalesce degrades the fences already pending"
+    );
+    assert_eq!(
+      core.scopes.get(&scope).unwrap().applied_cover,
+      Some(vec![p("/r/keep")]),
+      "the lossy settle rewound the reply-less over-claim"
+    );
+    assert!(core.cover_fences.is_empty());
+
+    // The latent obligation completes: the dirtied cold read escalates (a
+    // covering Rescan plus a counted re-arm retry). With no fence entry the
+    // Rescan marks nothing — the rewind above already under-claimed.
+    core.on_enumerated(cold, listed(Vec::new()));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the dirtied read's completion emits the covering Rescan: {effects:?}"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "a Rescan with no unobserved reconcile records nothing"
+    );
+    let retry = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/drop") => Some(*req),
+        _ => None,
+      })
+      .expect("the escalated re-arm retry read");
+    core.on_enumerated(retry, listed(Vec::new()));
+    let _ = drain(&mut core);
+    assert!(core.monitor.rearm_settled(scope), "the escalation quiesced");
+
+    // (ii) A LATER reconcile's fence starts clean: the memory did not leak.
+    // The rewound cover makes /r/drop a real broadening delta again; its watch
+    // is now Live, so the re-arm is counted work that settles clean.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let later = core.open_cover_fence(scope);
+    run_cascade(&mut core, &BTreeMap::new());
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(later, CoverSettle::Applied)],
+      "the cleared memory does not leak onto a later unrelated fence"
+    );
+  }
+
+  /// Supersession: two acked reconciles park two fences (FIFO); both resolve
+  /// at ONE settle instant, reported in open order. Coverage is latest-wins by
+  /// ordered application; lossiness only accretes between settles (an opening
+  /// fence inherits it, a loss marks all pending), so fences settling together
+  /// agree — here both clean, both `Applied`. The first grow's cascade
+  /// quiesces UN-POLLED before the superseding grow re-unsettles the scope:
+  /// had the second cascade instead re-armed a child whose re-arm read was
+  /// still IN FLIGHT, it would dirty that read, whose completion stands a
+  /// `Rescan` (the Monitor's dirty-window recovery) — and both fences would
+  /// honestly degrade.
+  #[test]
+  fn superseding_fences_resolve_together_at_one_settle() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let first = core.open_cover_fence(scope);
+    // The first grow's cascade runs to quiescence — but with no settlement
+    // poll in between, its fence stays pending.
+    run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    // The superseding cover broadens further: its delta re-arms the idle root
+    // with a fresh counted read, re-unsettling the scope for BOTH fences.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop"), p("/r/extra")]),
+      CoverReconcile::Reconciling
+    );
+    let second = core.open_cover_fence(scope);
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "both fences pend on the same scope settle"
+    );
+    let listing = vec![
+      entry("keep", FileKind::Dir, 1, 11),
+      entry("drop", FileKind::Dir, 1, 12),
+      entry("extra", FileKind::Dir, 1, 13),
+    ];
+    run_cascade(&mut core, &BTreeMap::from([("/r", listing)]));
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![
+        (first, CoverSettle::Applied),
+        (second, CoverSettle::Applied)
+      ],
+      "one settle instant resolves every pending fence, FIFO"
+    );
+    assert_eq!(
+      core.scopes.get(&scope).unwrap().applied_cover,
+      Some(vec![p("/r/keep"), p("/r/drop"), p("/r/extra")]),
+      "coverage is latest-wins by ordered application"
+    );
+  }
+
+  /// Scope teardown mid-fence: the pending fences resolve `Degraded` (the
+  /// terminal Rescan covers the caller) at the NEXT settlement poll — the
+  /// driver's one choke point — and no fence state survives the scope.
+  #[test]
+  fn teardown_mid_fence_degrades_and_clears() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    core.on_unwatch(scope);
+    assert!(
+      drain(&mut core)
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the unwatch tears the scope down mid-cascade"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Degraded)],
+      "teardown mid-fence resolves Degraded at the next poll"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "no fence state outlives the scope"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "resolution is one-shot"
     );
   }
 }
