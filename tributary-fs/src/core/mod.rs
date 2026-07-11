@@ -266,6 +266,117 @@ pub(crate) enum Delivery {
   Refused,
 }
 
+/// Correlates one parked set-cover acknowledgement with its settlement: the
+/// driver opens a fence via [`open_cover_fence`](DriverCore::open_cover_fence)
+/// when an acked reconcile starts, and
+/// [`poll_cover_settlements`](DriverCore::poll_cover_settlements) reports each
+/// fence's [`CoverSettle`] once its scope's re-arm work quiesces. Minted from a
+/// monotone counter, never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct FenceId(u64);
+
+/// How [`on_set_cover`](DriverCore::on_set_cover) disposed of one requested
+/// cover reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoverReconcile {
+  /// The prune/grow walk ran. The scope may now hold re-arm work; a caller
+  /// that owes an acknowledgement opens a fence
+  /// ([`open_cover_fence`](DriverCore::open_cover_fence)) that resolves when
+  /// [`Monitor::rearm_settled`] next holds for the scope.
+  Reconciling,
+  /// No reconcile ran; the reason tells the driver what to answer immediately.
+  Noop(CoverNoop),
+}
+
+/// Why [`on_set_cover`](DriverCore::on_set_cover) refused to reconcile — each
+/// reason maps to an immediate (never-fenced) driver answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoverNoop {
+  /// The scope is not registered.
+  UnknownScope,
+  /// The scope is not publicly live: between its spawn and the root-arm grant
+  /// (or root-less before spawn) no caller holds a handle, and a reconcile in
+  /// that window would mark the root's pending COLD arm as a re-arm —
+  /// converting the initial cold discovery into a `Created`-suppressing
+  /// re-arm read. Refused outright; the caller's cover is re-issued once the
+  /// grant commits (the umbrella only ever covers committed watches, so only
+  /// the re-publicized API can reach this).
+  NotLive,
+  /// The scope's backend is kernel-recursive: one whole-subtree stream is the
+  /// coverage, which never narrowed, so there is nothing to prune or re-arm.
+  /// Explicit rather than a silent walk-of-nothing, so the driver can answer
+  /// "coverage was never reduced" instead of "applied".
+  KernelRecursive,
+  /// The retained cover was refused: empty, or entirely outside the live root
+  /// (a caller typo / relative / stale path) — acting on either would prune
+  /// the whole scope. Prior coverage and `applied_cover` stay untouched.
+  RefusedCover,
+}
+
+/// How one settled set-cover fence reports its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoverSettle {
+  /// The reconcile's re-arm work quiesced with no loss signal in the window:
+  /// every re-armed watch is live, so writes under the retained cover from
+  /// this moment are delivered.
+  Applied,
+  /// The reconcile settled, but the window was lossy — a covering `Rescan`
+  /// passed, a grow kickoff coalesced into an in-flight cold read, or the
+  /// scope tore down mid-fence. Coverage may be partial; the `Rescan`
+  /// (terminal, for teardown) dominates the gap.
+  Degraded,
+}
+
+/// One scope's pending set-cover fence bookkeeping.
+///
+/// # The lossy-window rule
+///
+/// `lossy` is the scope's loss memory since its last settle **observation**
+/// (the [`poll_cover_settlements`](DriverCore::poll_cover_settlements) call
+/// that found the scope settled and cleared this entry). It is set by
+///
+/// - any scope `Rescan` passing [`route_event`](DriverCore::route_event)
+///   while this entry exists, and
+/// - any reconcile whose grow observed a [`RearmKickoff::Coalesced`] — the
+///   obligation rides an in-flight COLD read the settle counter deliberately
+///   does not see, so the scope can read settled while the obligation is
+///   latent (lossy **from birth**, per the fence design's F0 amendment).
+///
+/// Either event marks every currently-pending fence lossy AND is remembered
+/// here until the scope next settles, so a fence opened AFTER the event but
+/// BEFORE that settle inherits it — a reply-less reconcile
+/// (`request_set_cover`) that coalesced still degrades the fence the driver
+/// opens for a later acked reconcile of the same window. The settle
+/// observation clears the memory with the fences, so nothing leaks onto a
+/// fence opened after it. A corollary: every fence resolving at one settle
+/// reports the same verdict — lossiness only accretes between settles, an
+/// opening fence inherits the accreted state, and a loss marks all pending —
+/// which is the honest shape: covers applied within one unsettled window ride
+/// each other's re-arm work, so none of them can claim a cleaner window than
+/// the scope's.
+///
+/// [`RearmKickoff::Coalesced`]: tributary_proto::RearmKickoff::Coalesced
+#[derive(Debug, Default)]
+struct CoverFence {
+  /// Pending fences in open (FIFO) order, each carrying its own lossy flag —
+  /// inherited from `lossy` at open, then marked by later loss events.
+  pending: Vec<(FenceId, bool)>,
+  /// The scope's loss memory since the last settle observation (see the
+  /// lossy-window rule above).
+  lossy: bool,
+}
+
+impl CoverFence {
+  /// Records one loss event: remembered until the next settle observation and
+  /// stamped onto every pending fence.
+  fn mark_lossy(&mut self) {
+    self.lossy = true;
+    for (_, lossy) in &mut self.pending {
+      *lossy = true;
+    }
+  }
+}
+
 /// A planned Monitor input, compiled from one raw event.
 #[derive(Debug)]
 enum Planned {
@@ -499,8 +610,23 @@ struct ScopeState {
   /// "is a watch present at this prefix" test would wrongly read a retained ancestor as
   /// fully covered and skip re-arming the descendants the earlier cover pruned — silent loss
   /// after the bridge Rescan's crawl. Set on every successful `on_set_cover`;
-  /// initialized `None`.
+  /// initialized `None`. **Optimistic**: recorded before the grow's re-arm
+  /// work completes, so a LOSSY settle rewinds it to `settle_floor` (the
+  /// applied-cover-lie fix — see `settle_floor`).
   applied_cover: Option<Vec<PathBuf>>,
+  /// The coverage provably live regardless of grow outcomes: the running
+  /// antichain MEET ([`cover_meet`]) of every cover applied since the last
+  /// CLEAN settle observation — `None` is FULL coverage, the meet identity.
+  /// Retained-and-covered survivors are never re-armed by a reconcile, so
+  /// meet-coverage never gapped even when every grow arm failed. Updated on
+  /// EVERY `on_set_cover` application (acked or reply-less); at each settle
+  /// observation ([`poll_cover_settlements`](DriverCore::poll_cover_settlements)):
+  /// a CLEAN settle resets it to the now-truthful `applied_cover`, a LOSSY
+  /// settle rewinds `applied_cover` to it (it IS the floor, so it stays).
+  /// Without the rewind a re-issue after a failed grow would compute an empty
+  /// [`broadening_delta`] and settle clean over a hole; under-claiming only
+  /// costs redundant re-reads.
+  settle_floor: Option<Vec<PathBuf>>,
 }
 
 impl ScopeState {
@@ -545,8 +671,22 @@ pub(crate) struct DriverCore {
   /// Scope handles are never reused, so a dead scope's key cannot collide
   /// with a live one.
   dying: BTreeMap<ScopeId, DyingDelivery>,
+  /// Per-scope set-cover fence bookkeeping (see [`CoverFence`]'s lossy-window
+  /// rule). An entry exists exactly while the scope has an unobserved
+  /// reconcile — created by every `Reconciling`
+  /// [`on_set_cover`](Self::on_set_cover) (acked or not, so a reply-less
+  /// reconcile's window is still observed and its loss memory still clears),
+  /// removed by the settle observation or the scope's teardown. No entry may
+  /// outlive its scope.
+  cover_fences: BTreeMap<ScopeId, CoverFence>,
+  /// Fences a scope teardown resolved (always [`CoverSettle::Degraded`] — the
+  /// terminal `Rescan` covers the caller), folded into the next
+  /// [`poll_cover_settlements`](Self::poll_cover_settlements) so the driver
+  /// consumes every resolution at its one loop-top choke point.
+  settled_covers: Vec<(FenceId, CoverSettle)>,
   scope_seq: u64,
   probe_seq: u64,
+  fence_seq: u64,
   /// A monotone counter minting move cookies for `FAN_RENAME` pairs. fanotify
   /// reports each rename atomically (both halves in one event), so the cookie
   /// only needs to pair the two records emitted adjacently — a fresh counter
@@ -575,8 +715,11 @@ impl DriverCore {
       probes: BTreeMap::new(),
       effects: VecDeque::new(),
       dying: BTreeMap::new(),
+      cover_fences: BTreeMap::new(),
+      settled_covers: Vec::new(),
       scope_seq: 0,
       probe_seq: 0,
+      fence_seq: 0,
       cookie_seq: 0,
       root_liveness_interval,
     }
@@ -640,6 +783,7 @@ impl DriverCore {
         publicly_live: false,
         liveness_deadline: None,
         applied_cover: None,
+        settle_floor: None,
       },
     );
     self.watch_scopes.insert(watch, scope);
@@ -690,27 +834,58 @@ impl DriverCore {
   /// partial or skipped prune merely leaves the root briefly over-broad (self-healing), and a
   /// skipped grow merely leaves the newcomer briefly under-covered until the umbrella's own
   /// bridging `Rescan` and a later re-issue converge — neither loses an event under a retained,
-  /// covered key, and neither emits a `Rescan`. A **no-op** for an unknown scope, an empty
-  /// `retained` (defensive — never prune the whole tree), a `retained` cover ENTIRELY outside the
-  /// live root (a caller error — validated against the scope root and refused before any prune, so a
-  /// typo / relative / stale path can never silently prune the whole scope), and —
-  /// naturally — a **kernel-recursive** scope (fanotify / FSEvents): its single whole-subtree stream
-  /// has no per-directory children, so the prune walk finds only the root node (never strictly
-  /// outside its own retained descendants) and the grow's ancestor is the root, whose re-arm is a
-  /// documented no-op (its coverage never shrank). A PARTIALLY out-of-root cover proceeds with the
-  /// in-root subset only. Each pruned watch's
-  /// [`RemoveWatch`](Effect::RemoveWatch) and each grown watch's [`AddWatch`](Effect::AddWatch) /
-  /// [`Enumerate`](Effect::Enumerate) flow through the ordinary descending paths, keeping the
-  /// reader's `wd` table and the core's addressing maps consistent exactly as delete-driven and
-  /// create-driven transitions do.
-  pub(crate) fn on_set_cover(&mut self, scope: ScopeId, retained: &[PathBuf]) {
+  /// covered key, and neither emits a `Rescan`.
+  ///
+  /// # Refusals
+  ///
+  /// A [`Noop`](CoverReconcile::Noop) — no prune, no grow, `applied_cover` and the settle
+  /// floor untouched — for:
+  ///
+  /// - an **unknown scope** ([`UnknownScope`](CoverNoop::UnknownScope));
+  /// - a scope that is **not publicly live** ([`NotLive`](CoverNoop::NotLive)) — between a
+  ///   descending scope's spawn and its root-arm grant the root's arm is still COLD, and a
+  ///   reconcile's grow would mark it re-arm-flavored, suppressing the initial inventory's
+  ///   `Created`s (re-arms deliberately emit none); no caller holds a handle yet, so there is
+  ///   no coverage to reconcile;
+  /// - a **kernel-recursive** scope (fanotify / FSEvents;
+  ///   [`KernelRecursive`](CoverNoop::KernelRecursive)): its single whole-subtree stream has no
+  ///   per-directory children, so coverage never narrowed and there is nothing to prune or
+  ///   re-arm — reported explicitly rather than walked as silence, so the driver can answer
+  ///   "recursive" instead of "applied";
+  /// - a **refused cover** ([`RefusedCover`](CoverNoop::RefusedCover)): empty `retained`
+  ///   (defensive — never prune the whole tree) or a cover ENTIRELY outside the live root (a
+  ///   caller error — validated against the scope root and refused before any prune, so a typo /
+  ///   relative / stale path can never silently prune the whole scope). A PARTIALLY out-of-root
+  ///   cover proceeds with the in-root subset only.
+  ///
+  /// Otherwise [`Reconciling`](CoverReconcile::Reconciling): the walk ran, and each pruned
+  /// watch's [`RemoveWatch`](Effect::RemoveWatch) and each grown watch's
+  /// [`AddWatch`](Effect::AddWatch) / [`Enumerate`](Effect::Enumerate) flow through the ordinary
+  /// descending paths, keeping the reader's `wd` table and the core's addressing maps consistent
+  /// exactly as delete-driven and create-driven transitions do. A `Reconciling` return also
+  /// updates the fence bookkeeping: the scope's [`CoverFence`] entry is (re)ensured so the next
+  /// settle observation sees this window, any `Coalesced` grow kickoff records the born-lossy
+  /// memory (see [`CoverFence`]), and `applied_cover` / `settle_floor` are recorded
+  /// (optimistically / as the running meet).
+  pub(crate) fn on_set_cover(&mut self, scope: ScopeId, retained: &[PathBuf]) -> CoverReconcile {
     let Some(state) = self.scopes.get(&scope) else {
-      return;
+      return CoverReconcile::Noop(CoverNoop::UnknownScope);
     };
+    // The publicly-live gate (see the refusal table above): a pre-grant reconcile would
+    // convert the root's cold discovery into a `Created`-suppressing re-arm.
+    if !state.publicly_live {
+      return CoverReconcile::Noop(CoverNoop::NotLive);
+    }
+    // Kernel-recursive coverage never narrowed: refuse explicitly (the walk below would be
+    // a structural no-op, but recording `applied_cover` for it would misstate that the
+    // whole-subtree stream was ever reconciled).
+    if state.profile.is_kernel_recursive() {
+      return CoverReconcile::Noop(CoverNoop::KernelRecursive);
+    }
     // An empty cover would mark every node strictly-outside (vacuously) and prune the
     // whole scope; the umbrella never requests it, but never risk collapsing coverage.
     if retained.is_empty() {
-      return;
+      return CoverReconcile::Noop(CoverNoop::RefusedCover);
     }
     // Validate the retained cover against the LIVE scope root before acting on it. A
     // retained path that is not under the root — a caller typo, a relative or stale path — lies
@@ -721,9 +896,10 @@ impl DriverCore {
     // ). A CANONICAL retained path never contains `.`/`..` components (the scope root and
     // every survivor cover the umbrella issues are canonical), so any path carrying one is a
     // caller error: reject it outright rather than guessing what it resolves to. A root not yet
-    // known (stream not spawned) cannot validate anything, so no-op.
+    // known cannot validate anything — unreachable behind the publicly-live gate (a live scope
+    // always spawned), kept as the defensive not-live answer.
     let Some(root) = state.root.clone() else {
-      return;
+      return CoverReconcile::Noop(CoverNoop::NotLive);
     };
     let retained: Vec<PathBuf> = retained
       .iter()
@@ -742,7 +918,7 @@ impl DriverCore {
     // do NOT record `applied_cover`, leaving the prior (still-correct) coverage untouched. A
     // PARTIALLY valid cover proceeds with the valid subset ONLY — the invalid prefixes are dropped.
     if retained.is_empty() {
-      return;
+      return CoverReconcile::Noop(CoverNoop::RefusedCover);
     }
     let retained = retained.as_slice();
 
@@ -807,10 +983,25 @@ impl DriverCore {
         to_rearm.insert(watch);
       }
     }
+    // A `Coalesced` kickoff folded its obligation into an in-flight COLD read the settle
+    // counter deliberately does not see: the scope can read settled while the obligation is
+    // latent, so the fence window is lossy FROM BIRTH (the F0 amendment).
+    let mut coalesced = false;
     for watch in to_rearm {
-      // The kickoff report feeds the effect-completion fence; the fence wiring
-      // consumes it when the cover reconcile grows (see the fence design, §6).
-      let _ = self.monitor.rearm_watch_subtree(watch);
+      if self.monitor.rearm_watch_subtree(watch).is_coalesced() {
+        coalesced = true;
+      }
+    }
+
+    // Fence bookkeeping BEFORE the drain, so an entry exists when any change this reconcile
+    // provokes routes: ensure the scope's entry (the next settle observation must see this
+    // window even when the reconcile is reply-less — that observation resets the floor on a
+    // clean settle and clears the loss memory), and record the born-lossy memory, which marks
+    // every already-pending fence and is inherited by any fence opened before the scope next
+    // settles (see [`CoverFence`]).
+    let fence = self.cover_fences.entry(scope).or_default();
+    if coalesced {
+      fence.mark_lossy();
     }
 
     // Turn the queued `Action::Unwatch`es (prune) into `RemoveWatch` effects and the queued
@@ -822,10 +1013,83 @@ impl DriverCore {
     // Record the cover just applied: the NEXT set-cover computes its broadening delta against it
     //. Stored verbatim; `broadening_delta` treats the init `None` as full, and a
     // full-root cover (retained = the root's own path) yields an empty delta for any later shrink
-    // exactly as `None` would.
+    // exactly as `None` would. The record is OPTIMISTIC (the grow's re-arm work has not
+    // completed), so the settle floor keeps the running meet the lossy-settle rewind falls back
+    // to (see `ScopeState::settle_floor`).
     if let Some(state) = self.scopes.get_mut(&scope) {
+      state.settle_floor = Some(cover_meet(state.settle_floor.as_deref(), retained));
       state.applied_cover = Some(retained.to_vec());
     }
+    CoverReconcile::Reconciling
+  }
+
+  /// Opens one settlement fence for `scope`: the driver parks an acked
+  /// `set_cover`'s reply under the returned id and resolves it with the
+  /// [`CoverSettle`] the next [`poll_cover_settlements`](Self::poll_cover_settlements)
+  /// reports for it. Call it immediately after the
+  /// [`Reconciling`](CoverReconcile::Reconciling) `on_set_cover` it acknowledges
+  /// (before any other core input), so the fence cannot miss its own
+  /// reconcile's window: it inherits the scope's loss memory accrued since the
+  /// last settle observation — including a born-lossy `Coalesced` grow — per
+  /// [`CoverFence`]'s rule.
+  #[cfg_attr(not(test), allow(dead_code))] // consumed by the F2 driver wiring
+  pub(crate) fn open_cover_fence(&mut self, scope: ScopeId) -> FenceId {
+    self.fence_seq += 1;
+    let fence = FenceId(self.fence_seq);
+    let entry = self.cover_fences.entry(scope).or_default();
+    entry.pending.push((fence, entry.lossy));
+    fence
+  }
+
+  /// Reports every set-cover fence that has settled since the last poll: each
+  /// scope with an unobserved reconcile whose re-arm work quiesced
+  /// ([`Monitor::rearm_settled`]) resolves ALL its pending fences at this one
+  /// settle instant — in FIFO open order, each with its recorded lossiness
+  /// ([`Applied`](CoverSettle::Applied) / [`Degraded`](CoverSettle::Degraded))
+  /// — plus every fence a scope teardown already resolved `Degraded`. The
+  /// driver polls this at its loop top, after feeding results back.
+  ///
+  /// The settle observation is also where the applied-cover lie is repaired:
+  /// a LOSSY window rewinds `applied_cover` to the settle floor (the provable
+  /// under-claim, so a re-issue recomputes a real broadening delta); a CLEAN
+  /// window resets the floor to the now-truthful `applied_cover`. Either way
+  /// the scope's fence entry — pending fences and loss memory — is cleared:
+  /// no fence state outlives its settle.
+  #[cfg_attr(not(test), allow(dead_code))] // consumed by the F2 driver wiring
+  pub(crate) fn poll_cover_settlements(&mut self) -> Vec<(FenceId, CoverSettle)> {
+    let mut settled = std::mem::take(&mut self.settled_covers);
+    let scopes: Vec<ScopeId> = self.cover_fences.keys().copied().collect();
+    for scope in scopes {
+      if !self.monitor.rearm_settled(scope) {
+        continue;
+      }
+      let Some(entry) = self.cover_fences.remove(&scope) else {
+        continue;
+      };
+      // Teardown removes the entry with its scope, so a live entry always has scope
+      // state; a scope-less entry is a seam bug — degrade its fences rather than
+      // report `Applied` for coverage nobody backs.
+      let mut dead = false;
+      if let Some(state) = self.scopes.get_mut(&scope) {
+        if entry.lossy {
+          state.applied_cover = state.settle_floor.clone();
+        } else {
+          state.settle_floor = state.applied_cover.clone();
+        }
+      } else {
+        debug_assert!(false, "a fence entry never outlives its scope");
+        dead = true;
+      }
+      for (fence, lossy) in entry.pending {
+        let settle = if lossy || dead {
+          CoverSettle::Degraded
+        } else {
+          CoverSettle::Applied
+        };
+        settled.push((fence, settle));
+      }
+    }
+    settled
   }
 
   /// Feeds the blocking spawn's outcome for `scope`'s stream.
@@ -2021,6 +2285,17 @@ impl DriverCore {
                 },
               );
             }
+            // Scope teardown mid-fence (unwatch, root death — every teardown funnels
+            // through this arm): the reconcile's work dies with the scope, so every
+            // pending fence resolves `Degraded` — the terminal `Rescan` above covers
+            // the caller — folded into the next settlement poll so the driver keeps
+            // its one choke point. The entry is removed with the scope: no fence
+            // state outlives it.
+            if let Some(entry) = self.cover_fences.remove(&scope) {
+              for (fence, _) in entry.pending {
+                self.settled_covers.push((fence, CoverSettle::Degraded));
+              }
+            }
             self.probes.retain(|_, ctx| ctx.scope != scope);
             let dead: Vec<WatchId> = self
               .watch_scopes
@@ -2087,6 +2362,20 @@ impl DriverCore {
     // root arm (whose `Err` the deferred grant already delivered) is fenced here.
     if !state.publicly_live {
       return;
+    }
+    // THE LOSSY WINDOW: a scope `Rescan` reaching the public stream while the scope
+    // has an unobserved set-cover reconcile signals the window may have lost coverage
+    // work (a failed grow arm, an unreadable re-arm read, an overflow) — mark every
+    // pending fence AND the scope's loss memory (see [`CoverFence`]), so the settle
+    // resolves `Degraded` and rewinds `applied_cover` to the floor. Conservative by
+    // design: an unrelated churn `Rescan` inside the window degrades too (the caller
+    // self-heals by re-issuing). Both routes below deliver the `Rescan` (emitted, or
+    // parked as the lag's dominating change), so a marked window is never a signal
+    // the consumer didn't also get.
+    if change.kind().is_rescan()
+      && let Some(fence) = self.cover_fences.get_mut(&scope)
+    {
+      fence.mark_lossy();
     }
     match &mut state.lag {
       LagState::Normal => {
@@ -2267,6 +2556,57 @@ fn broadening_delta<'a>(prev: Option<&[PathBuf]>, new: &'a [PathBuf]) -> Vec<&'a
     .filter(|r| !prev.iter().any(|p| r.starts_with(p)))
     .map(PathBuf::as_path)
     .collect()
+}
+
+/// The antichain MEET of two retained covers — the coverage guaranteed by BOTH.
+///
+/// A cover retains everything under its prefixes, so the meet is their
+/// intersection: a path is covered by the meet iff it is covered by `prev` AND
+/// by `applied`. For antichain covers that is the pairwise rule — for each
+/// nested pair, keep the DEEPER prefix (`meet({/x}, {/x/y}) = {/x/y}`); prefixes
+/// nested in no member of the other cover contribute nothing
+/// (`meet({/x}, {/z}) = {}` — an EMPTY meet is meaningful: nothing is
+/// guaranteed by both). `prev == None` is FULL coverage, the meet identity
+/// (`meet(FULL, A) = A`), mirroring `applied_cover`'s never-pruned initial
+/// state. The pairwise result is deduped and normalized to cover form (a
+/// member inside another member's subtree is redundant — with antichain
+/// inputs the pairwise set already is one, so the pruning is defensive).
+///
+/// The settle floor is folded with this on every applied cover; a pure
+/// function of the two covers, unit-tested cross-platform like
+/// [`broadening_delta`].
+fn cover_meet(prev: Option<&[PathBuf]>, applied: &[PathBuf]) -> Vec<PathBuf> {
+  let Some(prev) = prev else {
+    return applied.to_vec();
+  };
+  let mut deeper: Vec<&Path> = Vec::new();
+  for p in prev {
+    for a in applied {
+      let kept = if a.starts_with(p) {
+        a.as_path()
+      } else if p.starts_with(a) {
+        p.as_path()
+      } else {
+        continue;
+      };
+      if !deeper.contains(&kept) {
+        deeper.push(kept);
+      }
+    }
+  }
+  let mut meet: Vec<PathBuf> = Vec::new();
+  for kept in &deeper {
+    // Cover normal form: a member strictly inside another member's subtree is
+    // redundant — the shallower member already covers it. (`deeper` is deduped,
+    // so value inequality means a different member.)
+    let redundant = deeper
+      .iter()
+      .any(|other| *kept != *other && kept.starts_with(other));
+    if !redundant {
+      meet.push(kept.to_path_buf());
+    }
+  }
+  meet
 }
 
 /// The move cookie for a rename half, minted ONLY from contemporaneous probe
