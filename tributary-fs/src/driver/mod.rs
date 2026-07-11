@@ -97,10 +97,15 @@ pub(crate) struct DriverConfig {
 }
 
 impl DriverConfig {
-  /// The platform's native backend profile.
+  /// The platform's native backend profile — PROVISIONAL under
+  /// `Backend::Auto` (the resolved `RootMeta.backend` supersedes it at
+  /// spawn); on Windows the provisional and resolved profiles are both
+  /// kernel-recursive, so the reconcile is always profile-stable there.
   pub(crate) fn platform_profile() -> BackendKind {
     if cfg!(target_os = "linux") {
       BackendKind::Inotify
+    } else if cfg!(target_os = "windows") {
+      BackendKind::Rdcw
     } else {
       BackendKind::FsEvents
     }
