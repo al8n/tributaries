@@ -109,6 +109,28 @@ mod integration {
     (dir, canonical)
   }
 
+  /// Grows `retained` on a live root, retrying the documented-retryable
+  /// [`WatchError::CoverageIncomplete`]: on a descending backend the fence
+  /// conservatively degrades any window a covering `Rescan` touched — including
+  /// a grow that coalesced into the root's still-in-flight cold read — and the
+  /// caller's contract is to re-issue; a clean settle then applies.
+  async fn grow_until_applied(
+    source: &mut FsSource<TokioRuntime>,
+    handle: tributary_fs::RootHandle,
+    retained: &[Vec<OsString>],
+  ) {
+    for _ in 0..40 {
+      match source.grow(handle, retained).await {
+        Ok(()) => return,
+        Err(err) if err.is_coverage_incomplete() => {
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(err) => panic!("grow of a live root failed: {err}"),
+      }
+    }
+    panic!("grow never applied within the retry budget");
+  }
+
   /// Pulls from the source until an event satisfying `pred` arrives or `timeout` lapses,
   /// returning it (`None` on lapse — used both for a positive wait and a negative window).
   async fn wait_for(
@@ -613,16 +635,18 @@ mod integration {
 
     // Grow to full coverage (the cancel-equivalent shape the umbrella sends): a no-op reconcile
     // either way, but only the descending backend pays the round-trip.
-    source
-      .grow(armed.handle(), std::slice::from_ref(&root_key))
-      .await
-      .expect("grow of a live root succeeds");
-    assert_eq!(
-      source.cover_round_trips,
-      usize::from(!kernel_recursive),
-      "a kernel-recursive root is answered by the short-circuit (no round-trip); a descending \
-       one awaits the watcher's fenced set_cover exactly once"
-    );
+    grow_until_applied(&mut source, armed.handle(), std::slice::from_ref(&root_key)).await;
+    if kernel_recursive {
+      assert_eq!(
+        source.cover_round_trips, 0,
+        "a kernel-recursive root is answered by the short-circuit (no round-trip)"
+      );
+    } else {
+      assert!(
+        source.cover_round_trips >= 1,
+        "a descending root awaits the watcher's fenced set_cover (once per grow attempt)"
+      );
+    }
   }
 
   /// [`grow`](crate::Source::grow) of a root the watcher has since torn down (root death) maps
@@ -707,10 +731,7 @@ mod integration {
     );
 
     // An awaited grow SUPERSEDES the handle's queued prune: removed outright, never forwarded.
-    source
-      .grow(armed.handle(), std::slice::from_ref(&root_key))
-      .await
-      .expect("grow of a live root succeeds");
+    grow_until_applied(&mut source, armed.handle(), std::slice::from_ref(&root_key)).await;
     assert!(
       source.deferred_prunes.is_empty(),
       "the grow superseded the queued prune (clause 6)"
