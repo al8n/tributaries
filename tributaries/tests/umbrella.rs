@@ -604,11 +604,24 @@ async fn covered_outside_grow_fence_delivers_an_immediate_write() {
     .expect("unwatch the root-key subscription");
 
   // Covered-OUTSIDE watch of the pruned region: the awaited grow re-arms /drop/deep and the
-  // watch returns only once that coverage is live.
-  let newcomer = w
-    .watch(key(&deep), (), WatchOptions::new())
-    .await
-    .expect("the covered-outside watch grows and commits");
+  // watch returns only once that coverage is live. `CoverageIncomplete` is the documented
+  // retryable outcome — the fence conservatively degrades a window any covering `Rescan`
+  // touched (including a grow coalescing into a still-in-flight read on a slow host) — so
+  // the caller's contract is to re-issue; a clean settle then applies.
+  let mut newcomer = None;
+  for _ in 0..40 {
+    match w.watch(key(&deep), (), WatchOptions::new()).await {
+      Ok(sub) => {
+        newcomer = Some(sub);
+        break;
+      }
+      Err(err) if err.is_coverage_incomplete() => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(err) => panic!("the covered-outside watch failed: {err}"),
+    }
+  }
+  let newcomer = newcomer.expect("the covered-outside watch grows and commits within the budget");
 
   // Write IMMEDIATELY on return — deliberately no wait of any kind between watch() and the
   // write; only the delivery observation below is convergence-style.
