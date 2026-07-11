@@ -1017,11 +1017,7 @@ where
     if command_streak >= COMMAND_FAIRNESS_BUDGET {
       command_streak = 0;
       match owner.source.next().now_or_never() {
-        Some(Some(event)) => {
-          if !owner.retire_if_dead(&event) {
-            owner.fan_out_and_push(&event);
-          }
-        }
+        Some(Some(event)) => owner.consume_source_event(&event),
         // The source drained during the forced poll: break to the owed drain exactly as the
         // select arm does (no silent loss on source drain).
         Some(None) => break (None, true),
@@ -1118,10 +1114,7 @@ where
         // Every event on a still-live root (an ordinary delivery, or an overflow `Rescan` on a live
         // root) returns `false` and fans out normally here.
         Some(event) => {
-          if !owner.retire_if_dead(&event) {
-            owner.degrade_retained_cover_on_rescan(&event);
-            owner.fan_out_and_push(&event);
-          }
+          owner.consume_source_event(&event);
           Flow::Continue
         }
         // The source drained while a consumer is still attached: it is OWED every parked
@@ -2424,6 +2417,17 @@ where
   /// same dead handle (e.g. the `Rescan` after a `Removed` already retired the root) finds no
   /// live root, so [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan)
   /// returns early and nothing is double-retired.
+  /// The single live-event consumption funnel BOTH source paths share — the select arm and
+  /// the command-fairness valve's forced poll: dead-root retirement, retained-cover
+  /// degradation on a live-root `Rescan`, then fan-out, in that one order. A coverage-loss
+  /// signal can never reach subscribers with the stale claim left standing on either path.
+  fn consume_source_event(&mut self, event: &SourceEvent<C, S::Handle>) {
+    if !self.retire_if_dead(event) {
+      self.degrade_retained_cover_on_rescan(event);
+      self.fan_out_and_push(event);
+    }
+  }
+
   /// A live-root source `Rescan` is a coverage-loss signal from the layer that owns the
   /// kernel watches: whatever narrowing the retained-cover record claims for that root may
   /// now span the lost region — trusting it would let a later newcomer classify
