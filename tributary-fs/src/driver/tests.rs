@@ -1862,6 +1862,45 @@ mod descending {
       );
     }
 
+    /// A cancel storm against a STALLED grow stays bounded and healthy: each
+    /// issued-then-dropped `set_cover` ack's fence is abandoned on both sides
+    /// of the driver/core seam at the next loop-top prune (the sender AND the
+    /// core's pending tuple), the loss memory is untouched, and a live caller
+    /// issued after the storm still resolves `Applied` once the stall lifts.
+    /// Fail-on-old: only the sender was pruned — one core pending tuple
+    /// accumulated per processed request for the whole stall.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_acks_under_a_stalled_grow_stay_bounded_and_resolve_the_live_caller() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+
+      // Stall the grow: /r/drop's re-install parks on the blocking pool.
+      let hold = rig.fs.hold_arms();
+      // The storm: issue-and-cancel many acked reconciles against the stall.
+      for _ in 0..64 {
+        let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+        drop(ack);
+        tokio::task::yield_now().await;
+      }
+      // The live caller arrives after the storm and pends on the same stall.
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      let mut ack = Box::pin(ack);
+      for _ in 0..50 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(ack.as_mut()).is_pending(),
+        "the live ack pends on the stalled grow"
+      );
+      hold.release();
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "the storm's abandoned fences never poison the live caller's clean settle"
+      );
+    }
+
     /// A failed grow arm is loss inside the window: the fence settles
     /// `Degraded`, and the covering `Rescan` that dominates the gap reaches
     /// the consumer in-band.

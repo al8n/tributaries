@@ -1081,6 +1081,24 @@ impl DriverCore {
     fence
   }
 
+  /// Drops the pending tuples of `abandoned` fences — callers that cancelled their
+  /// `set_cover` await before the settle. Only the per-fence tuples go: the scope's
+  /// loss memory, its settle-floor bookkeeping, and every still-awaited fence stay
+  /// untouched, so the settle observation's cover repair is unaffected. Without this,
+  /// a caller repeatedly issuing-and-cancelling against a scope whose re-arm work is
+  /// stalled would accumulate one pending tuple per processed request indefinitely —
+  /// the bounded command mailbox limits only instantaneous traffic, never the total.
+  pub(crate) fn abandon_cover_fences(&mut self, abandoned: &std::collections::BTreeSet<FenceId>) {
+    if abandoned.is_empty() {
+      return;
+    }
+    for entry in self.cover_fences.values_mut() {
+      entry
+        .pending
+        .retain(|(fence, _)| !abandoned.contains(fence));
+    }
+  }
+
   /// Reports every set-cover fence that has settled since the last poll: each
   /// scope with an unobserved reconcile whose re-arm work quiesced
   /// ([`Monitor::rearm_settled`]) resolves ALL its pending fences at this one
