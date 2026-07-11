@@ -8,12 +8,42 @@
 //! thread) is `cfg(all(target_os = "windows", not(miri)))` and reduces every
 //! completion to these types as early as possible.
 
+#[cfg(all(target_os = "windows", not(miri)))]
+pub(crate) mod ffi;
 pub(crate) mod rdcw;
 
 pub(crate) use rdcw::{
   decode::{RdcwAction, RdcwName, RdcwRecord},
   pairing::{RdcwEvent, RdcwPairer},
 };
+
+/// Whether a canonical root's byte form names a REMOTE object by prefix
+/// alone: a UNC path (`\\server\share`, or `\\?\UNC\server\share`) that no
+/// local drive letter mediates. RDCW and the USN journal are both blind (or
+/// silently lossy) on SMB, so a remote root is refused at the spawn barrier;
+/// a drive-lettered mapping is caught separately by the handle-side drive
+/// probe. Pure string logic so every host's twins pin it.
+// The spawn barrier consumes this once the source lands behind this seam;
+// until then the twins are the only caller.
+#[allow(dead_code)]
+pub(crate) fn is_unc_remote(path: &std::path::Path) -> bool {
+  let Some(text) = path.to_str() else {
+    // A root that cannot even spell as UTF-8 is refused elsewhere; the
+    // prefix classifier only answers the remote question.
+    return false;
+  };
+  let verbatim_unc = text
+    .get(..8)
+    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"));
+  if verbatim_unc {
+    return true;
+  }
+  if let Some(rest) = text.strip_prefix(r"\\") {
+    // `\\?\C:\...` and `\\.\pipe\...` are verbatim/device forms, not UNC.
+    return !rest.starts_with("?\\") && !rest.starts_with(".\\");
+  }
+  false
+}
 
 /// One decoded, pump-paired Windows source event as it crosses the
 /// pump→driver queue.
@@ -113,5 +143,20 @@ mod tests {
         if rec.action == RdcwAction::RenamedOld
     ));
     assert!(!pairer.holds_old());
+  }
+
+  #[test]
+  fn unc_remote_prefixes_classify() {
+    use std::path::Path;
+
+    use super::is_unc_remote;
+
+    assert!(is_unc_remote(Path::new(r"\\server\share\dir")));
+    assert!(is_unc_remote(Path::new(r"\\?\UNC\server\share")));
+    assert!(is_unc_remote(Path::new(r"\\?\unc\server\share")));
+    assert!(!is_unc_remote(Path::new(r"\\?\C:\local\dir")));
+    assert!(!is_unc_remote(Path::new(r"\\.\pipe\name")));
+    assert!(!is_unc_remote(Path::new(r"C:\local\dir")));
+    assert!(!is_unc_remote(Path::new("/posix/style")));
   }
 }
