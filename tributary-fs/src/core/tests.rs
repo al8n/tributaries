@@ -4164,6 +4164,53 @@ mod descending {
     );
   }
 
+  /// Abandoned fences (cancelled `set_cover` callers) are pruned from the
+  /// scope's pending list WITHOUT touching the loss memory, the settle-floor
+  /// bookkeeping, or any still-awaited fence: only the survivors resolve at
+  /// the settle, and the cover repair is identical. Fail-on-old: pending
+  /// tuples lived until the settle, so an issue-and-cancel storm against a
+  /// stalled scope accumulated one tuple per processed request.
+  #[test]
+  fn abandoned_fences_are_pruned_without_touching_the_settle_bookkeeping() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    // A cancel storm: many fences opened against the stalled cascade, all but
+    // one abandoned. The pending list shrinks to the survivor immediately.
+    let survivor = core.open_cover_fence(scope);
+    let abandoned: std::collections::BTreeSet<FenceId> =
+      (0..64).map(|_| core.open_cover_fence(scope)).collect();
+    assert_eq!(core.cover_fences.get(&scope).unwrap().pending.len(), 65);
+    core.abandon_cover_fences(&abandoned);
+    let entry = core.cover_fences.get(&scope).unwrap();
+    assert_eq!(
+      entry.pending.len(),
+      1,
+      "the abandoned tuples are gone; the awaited fence survives"
+    );
+    assert!(!entry.lossy, "abandonment never fabricates loss memory");
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "the surviving fence still pends on the stalled cascade"
+    );
+    // Quiesce: only the survivor resolves, with the clean-settle repair intact.
+    run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(survivor, CoverSettle::Applied)]
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(state.applied_cover, Some(vec![p("/r/keep"), p("/r/drop")]));
+    assert_eq!(
+      state.settle_floor, state.applied_cover,
+      "the clean settle's floor reset is unaffected by the abandonment"
+    );
+    assert!(core.cover_fences.is_empty());
+  }
+
   /// A `Rescan` passing `route_event` inside the window degrades the fence
   /// AND immediately degrades the coverage claim to the EMPTY cover (the
   /// `Rescan`'s cause is opaque — an overflow recovery can drop a survivor,

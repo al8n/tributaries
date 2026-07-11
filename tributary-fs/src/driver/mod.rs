@@ -323,21 +323,32 @@ const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
 }
 
 /// Resolves every parked set-cover acknowledgement whose fence has settled —
-/// the loop-top (and close-drain) choke point. It first prunes the parked
-/// senders whose receiver is gone (the caller cancelled its `set_cover`
-/// await): the fence itself still settles and updates the core's cover
-/// bookkeeping, but nobody is left to answer, and on a scope that stays busy
-/// the abandoned sender would otherwise pin memory until that settle. The
+/// the loop-top (and close-drain) choke point. It first prunes CANCELLED
+/// callers (the reply receiver is gone) on BOTH sides of the seam: the parked
+/// sender here, and the fence's pending tuple in the core
+/// ([`DriverCore::abandon_cover_fences`]) — the scope's loss memory and
+/// settle-floor bookkeeping stay untouched, so the settle observation's cover
+/// repair is unaffected. Pruning only the sender would let an issue-and-cancel
+/// storm against a stalled scope grow the core's pending list without bound
+/// (the bounded mailbox limits instantaneous traffic, never the total). The
 /// prune is O(parked) per pass, and it means a reported settlement may
-/// legitimately find no sender.
+/// legitimately find no sender (a caller dropped at close).
 fn resolve_cover_settlements(
   core: &mut DriverCore,
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
 ) {
-  cover_replies.retain(|_, reply| !reply.is_canceled());
+  let mut abandoned = std::collections::BTreeSet::new();
+  cover_replies.retain(|fence, reply| {
+    let live = !reply.is_canceled();
+    if !live {
+      abandoned.insert(*fence);
+    }
+    live
+  });
+  core.abandon_cover_fences(&abandoned);
   for (fence, settle) in core.poll_cover_settlements() {
-    // A missing sender is a cancelled caller (pruned above, or dropped at
-    // close); settlement already updated the core's bookkeeping either way.
+    // A missing sender is a caller dropped at close; settlement already
+    // updated the core's bookkeeping either way.
     if let Some(reply) = cover_replies.remove(&fence) {
       let _ = reply.send(settle_outcome(settle));
     }
