@@ -120,6 +120,31 @@
 //! pass-through while siblings settle, [`Debounce::Custom`] for its own windows (which
 //! also *enables* settling when the global debounce is off). Absent a `DebounceConfig`
 //! and absent any `Custom` override, events pass through untouched at zero cost.
+//!
+//! # Hosting on a `!Send` runtime today
+//!
+//! The umbrella runs on thread-per-core / completion-based apps (compio, a pinned
+//! `LocalSet`) **today**, in either of two shapes:
+//!
+//! - **A `Send` source, a `!Send` app** (the common case — the fs source is `Send`):
+//!   spawn ONE auxiliary thread running any supported runtime, build there via
+//!   [`Tributaries::parts`], and poll the returned driver future on it. The whole
+//!   handle plane is executor-agnostic and thread-mobile — [`Tributaries`] is
+//!   `Clone + Send`, [`WatchView`] is a cheap `Clone + Send + Sync` read handle,
+//!   [`Subscription`] is `Copy` — so `watch`/`unwatch`/[`next`](Tributaries::next)/
+//!   `close` are awaitable from the `!Send` app directly; only the driver lives on
+//!   the auxiliary thread. [`Demux::parts`] returns a `Send` routing future that can
+//!   be hosted on either side.
+//! - **A `!Send` source** (thread-local state, an `Rc`, a ring handle): implement
+//!   [`LocalSource`] instead of [`Source`] and construct via
+//!   [`Tributaries::parts_local`]; the returned driver future is `!Send` and must be
+//!   polled on the thread that owns the source (`block_on`, `LocalSet::run_until`,
+//!   or the executor's own local API).
+//!
+//! Do **not** reach for `agnostic-lite`'s `spawn_local*` for either shape: its smol
+//! local spawner spawns onto an immediately-dropped executor (a silent no-op) and its
+//! tokio one panics outside a `LocalSet`. Poll the future directly, or use the host
+//! executor's own local-spawn API.
 
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

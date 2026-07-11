@@ -123,7 +123,7 @@ impl FakeSource {
     }
   }
 
-  /// Whether the fake's modelled ACTUAL kernel coverage for `handle` includes `key` (set-cover ): a
+  /// Whether the fake's modelled ACTUAL kernel coverage for `handle` includes `key`: a
   /// handle at FULL coverage (no recorded `set_cover`) covers everything under its armed root; a
   /// narrowed handle covers exactly the union of its retained prefixes' subtrees. The regression
   /// probe: after a shrink that pruned a subtree then a grow re-issue, the previously-pruned key is
@@ -1001,7 +1001,7 @@ async fn covered_outside_grows_then_repins_to_full() {
       Call::Grow(wide, vec![key("/a")]),
     ],
     "one PRUNE then two GROWs, each carrying the fresh cover: the {{/a/b}} survivor drop, then the \
-     grow to {{/a/b, /a/c}}, then the cancel-equivalent grow to FULL {{/a}} (set-cover )"
+     grow to {{/a/b, /a/c}}, then the cancel-equivalent grow to FULL {{/a}}"
   );
   // The full-coverage repin restored actual coverage everywhere under /a.
   assert!(
@@ -1111,7 +1111,7 @@ async fn covered_outside_narrowed_root_grows_before_returning() {
   assert_eq!(
     h.owner.subsumer.retained_cover_of(wide),
     Some(vec![key("/a/b"), key("/a/c")]),
-    "the record broadened EXACTLY on grow-return, matching the source's live coverage (set-cover )"
+    "the record broadened EXACTLY on grow-return, matching the source's live coverage"
   );
 }
 

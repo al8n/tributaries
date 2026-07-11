@@ -631,7 +631,7 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// subscription pinned the root at its own key, or a survivor under an already-narrowed cover
   /// departed (a non-root unwatch that lets the cover shrink further) — the root stays armed for its
   /// survivors, and the excess kernel coverage is reclaimed **in place** via the synchronous
-  /// fire-and-forget [`Source::set_cover`] PRUNE (design §5, set-cover ): survivor coverage never moves,
+  /// fire-and-forget [`Source::set_cover`] PRUNE (design §5): survivor coverage never moves,
   /// so there is no gap and no re-crawl. Over-broadness is correctness-neutral and self-healing, so
   /// this is a pure budget-reclaim optimization the source may apply, defer, or ignore.
   ///
