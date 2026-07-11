@@ -1746,6 +1746,305 @@ mod descending {
       }
     }
   }
+
+  mod cover_fence {
+    //! The set-cover effect-completion fence through the REAL loop: an acked
+    //! reconcile's reply parks under its fence and resolves at SETTLE — when
+    //! the grow's re-arm work has quiesced — never at effect-queue time. The
+    //! core's fence table is unit-covered in `core/tests.rs`; these cells pin
+    //! the driver wiring around it (parking, loop-top resolution, close).
+
+    use super::*;
+    use crate::watcher::{CoverOutcome, SkipReason};
+
+    /// Sends an awaited `SetCover`, handing back its parked acknowledgement.
+    async fn send_set_cover(
+      rig: &Rig,
+      scope: ScopeId,
+      retained: &[&str],
+    ) -> futures_channel::oneshot::Receiver<CoverOutcome> {
+      let (reply, ack) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SetCover {
+          scope,
+          retained: retained.iter().map(PathBuf::from).collect(),
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      ack
+    }
+
+    /// Awaits a parked acknowledgement (pinned or not), bounded.
+    async fn resolved(
+      ack: impl std::future::Future<Output = Result<CoverOutcome, futures_channel::oneshot::Canceled>>,
+    ) -> CoverOutcome {
+      tokio::time::timeout(Duration::from_secs(10), ack)
+        .await
+        .expect("the fence settles within the deadline")
+        .expect("the driver answers the parked reply")
+    }
+
+    /// How many arms have been executed at `path`.
+    fn arms_at(rig: &Rig, path: &str) -> usize {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .filter(|(_, p)| p == std::path::Path::new(path))
+        .count()
+    }
+
+    /// A live descending rig over `/r` with the given child directories,
+    /// whose cold discovery has FULLY quiesced (every child's cold read
+    /// landed) — so a later grow can never coalesce into an in-flight cold
+    /// read and degrade a window these cells expect clean.
+    async fn covered_rig(children: &[(&str, u64)]) -> (Rig, ScopeId) {
+      let fs = FakeFs::new(1);
+      for (path, ino) in children {
+        fs.put(path, FileKind::Dir, *ino);
+      }
+      let rig = inotify_rig_fs(fs);
+      let scope = watch(&rig, "/r").await;
+      settle(|| {
+        let enumerates = rig.fs.enumerates();
+        children.iter().all(|(path, _)| {
+          enumerates
+            .iter()
+            .any(|(_, p)| p == std::path::Path::new(path))
+        })
+      })
+      .await;
+      (rig, scope)
+    }
+
+    /// Shrinks the live rig to `{/r/keep}` and awaits the ack: a prune grows
+    /// nothing, so the fence settles at the next loop top, clean.
+    async fn shrunk_to_keep(rig: &Rig, scope: ScopeId) {
+      let ack = send_set_cover(rig, scope, &["/r/keep"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "a prune-only reconcile settles clean"
+      );
+    }
+
+    /// The fence's core promise at the driver level: the ack PENDS while the
+    /// grow's re-arm work is in flight — here an arm parked on the blocking
+    /// pool — and resolves `Applied` only once that work lands. Under the old
+    /// queue-time ack this future resolved before the arm even dispatched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ack_pends_until_the_grow_settles_then_applies() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+
+      // Hold the grow's arms: the root's re-arm read runs (enumerates are not
+      // held), but re-installing /r/drop parks — the fence must pend with it.
+      let hold = rig.fs.hold_arms();
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      let mut ack = Box::pin(ack);
+      // Generous scheduler slices: the reconcile applies, its re-arm read
+      // completes, the /r/drop arm parks — and the ack still pends.
+      for _ in 0..50 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(ack.as_mut()).is_pending(),
+        "the ack pends while the grow's arm is parked — settle-time, not queue-time"
+      );
+      hold.release();
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "the released arm lands, the cascade quiesces, the clean window applies"
+      );
+    }
+
+    /// A failed grow arm is loss inside the window: the fence settles
+    /// `Degraded`, and the covering `Rescan` that dominates the gap reaches
+    /// the consumer in-band.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_grow_arm_settles_degraded() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+      rig
+        .fs
+        .fail_watch_at("/r/drop", tributary_proto::WatchError::NoSpace);
+
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Degraded,
+        "a failed re-arm is signaled loss, not a clean apply"
+      );
+      let mut saw_rescan = false;
+      for _ in 0..8 {
+        let (_scope, change) = next_event(&rig).await;
+        if change.kind().is_rescan() {
+          saw_rescan = true;
+          break;
+        }
+      }
+      assert!(
+        saw_rescan,
+        "the degraded window's covering Rescan is delivered"
+      );
+    }
+
+    /// The applied-cover-lie regression at the driver level: after a lossy
+    /// settle the cover is rewound, so RE-ISSUING the same cover computes a
+    /// non-empty broadening delta and the grow re-attempts its arms — here
+    /// healed, so the re-issue settles `Applied` over real coverage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reissue_after_lossy_settle_re_attempts_the_arms() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+      rig
+        .fs
+        .fail_watch_at("/r/drop", tributary_proto::WatchError::NoSpace);
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      assert_eq!(resolved(ack).await, CoverOutcome::Degraded);
+
+      // Re-issue the SAME cover after healing the arm: without the settle
+      // rewind the delta would be empty — no arm attempted, an instant clean
+      // settle over the hole the failed arm left.
+      rig.fs.heal_watch_at("/r/drop");
+      let attempts = arms_at(&rig, "/r/drop");
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "the re-issued grow settles clean over re-attempted coverage"
+      );
+      assert!(
+        arms_at(&rig, "/r/drop") > attempts,
+        "the rewound cover made the delta non-empty — the arm was re-attempted"
+      );
+    }
+
+    /// Supersession: two acked covers of one root queued back to back — the
+    /// second while the first's re-arm work is still parked — both pend, both
+    /// resolve at the shared settle, and the latest cover's subtree holds a
+    /// live watch again. (FIFO application and latest-wins bookkeeping are
+    /// core-pinned; this cell pins the driver's one-fence-one-reply routing.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn superseding_acks_resolve_at_the_shared_settle() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12), ("/r/other", 13)]).await;
+      shrunk_to_keep(&rig, scope).await;
+      let other_arms = arms_at(&rig, "/r/other");
+
+      let hold = rig.fs.hold_arms();
+      let first = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      // The first grow's re-arm READ of the root must land before the second
+      // cover applies: a cover racing an in-flight re-arm read dirties it,
+      // and the dirtied read's completion stands a Rescan that would
+      // (honestly) degrade both windows — this cell wants the clean shape.
+      // The read having FED the core is observable as the survivor cascade's
+      // own read (its second /r/keep enumerate), which that feeding queues.
+      settle(|| {
+        rig
+          .fs
+          .enumerates()
+          .iter()
+          .filter(|(_, p)| p == std::path::Path::new("/r/keep"))
+          .count()
+          >= 2
+      })
+      .await;
+      let second = send_set_cover(&rig, scope, &["/r/keep", "/r/drop", "/r/other"]).await;
+      let mut first = Box::pin(first);
+      let mut second = Box::pin(second);
+      for _ in 0..50 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(first.as_mut()).is_pending(),
+        "the first ack pends on the held grow"
+      );
+      assert!(
+        futures_util::poll!(second.as_mut()).is_pending(),
+        "the superseding ack pends on the same scope settle"
+      );
+      hold.release();
+      assert_eq!(resolved(first).await, CoverOutcome::Applied);
+      assert_eq!(resolved(second).await, CoverOutcome::Applied);
+      assert!(
+        arms_at(&rig, "/r/other") > other_arms,
+        "the latest cover's /r/other was re-armed"
+      );
+    }
+
+    /// Close mid-fence DROPS the parked reply (the ratified semantics): the
+    /// caller's ack resolves as a cancellation — `UnwatchError::Closed` at the
+    /// watcher surface — never as a fabricated outcome over a torn-down
+    /// driver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_mid_fence_drops_the_parked_reply() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+
+      let hold = rig.fs.hold_arms();
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      // The reconcile has been applied once its re-arm read of the root is
+      // re-executed; the /r/drop arm it queued is parked on the hold.
+      settle(|| {
+        rig
+          .fs
+          .enumerates()
+          .iter()
+          .filter(|(_, p)| p == std::path::Path::new("/r"))
+          .count()
+          >= 2
+      })
+      .await;
+
+      let (creply, on_close) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Close { reply: creply })
+        .await
+        .unwrap();
+      let _ = on_close.await.expect("close replies");
+      assert!(
+        ack.await.is_err(),
+        "a fence still pending at close drops its reply — the watcher maps it to Closed"
+      );
+      hold.release();
+    }
+
+    /// A kernel-recursive scope answers `Recursive` IMMEDIATELY — its
+    /// whole-subtree stream never narrowed, so there is no reconcile to fence
+    /// — and no per-directory arm or disarm is ever attempted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kernel_recursive_scope_answers_recursive_immediately() {
+      // The plain rig IS the kernel-recursive shape: an FsEvents profile with
+      // FsEvents-claiming spawns (the hermetic default).
+      let rig = rig_with_capacity(64);
+      let scope = watch(&rig, "/r").await;
+      let ack = send_set_cover(&rig, scope, &["/r/keep"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Recursive,
+        "kernel-recursive coverage never narrowed — reported, not fenced"
+      );
+      assert!(
+        rig.fs.arms().is_empty() && rig.fs.disarms().is_empty(),
+        "a kernel-recursive scope holds no per-directory watches to reconcile"
+      );
+
+      // An unknown scope is the immediate driver-side skip.
+      let ghost = ScopeId::new(core::num::NonZeroU64::new(999).unwrap());
+      let ack = send_set_cover(&rig, ghost, &["/r/keep"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Skipped(SkipReason::UnknownRoot),
+        "an unknown scope is skipped at command time"
+      );
+    }
+  }
 }
 
 /// The Linux one-sample enumerate: `list_dir`/`dir_entry_stat` build each

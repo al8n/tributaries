@@ -867,6 +867,7 @@ impl DriverCore {
   /// settle observation sees this window, any `Coalesced` grow kickoff records the born-lossy
   /// memory (see [`CoverFence`]), and `applied_cover` / `settle_floor` are recorded
   /// (optimistically / as the running meet).
+  #[must_use = "the disposition routes the acknowledgement: a Noop is answered immediately, a Reconciling may owe a fence"]
   pub(crate) fn on_set_cover(&mut self, scope: ScopeId, retained: &[PathBuf]) -> CoverReconcile {
     let Some(state) = self.scopes.get(&scope) else {
       return CoverReconcile::Noop(CoverNoop::UnknownScope);
@@ -1032,7 +1033,6 @@ impl DriverCore {
   /// reconcile's window: it inherits the scope's loss memory accrued since the
   /// last settle observation — including a born-lossy `Coalesced` grow — per
   /// [`CoverFence`]'s rule.
-  #[cfg_attr(not(test), allow(dead_code))] // consumed by the F2 driver wiring
   pub(crate) fn open_cover_fence(&mut self, scope: ScopeId) -> FenceId {
     self.fence_seq += 1;
     let fence = FenceId(self.fence_seq);
@@ -1055,7 +1055,6 @@ impl DriverCore {
   /// window resets the floor to the now-truthful `applied_cover`. Either way
   /// the scope's fence entry — pending fences and loss memory — is cleared:
   /// no fence state outlives its settle.
-  #[cfg_attr(not(test), allow(dead_code))] // consumed by the F2 driver wiring
   pub(crate) fn poll_cover_settlements(&mut self) -> Vec<(FenceId, CoverSettle)> {
     let mut settled = std::mem::take(&mut self.settled_covers);
     let scopes: Vec<ScopeId> = self.cover_fences.keys().copied().collect();

@@ -407,7 +407,8 @@ impl FakeFs {
     *self.state.spawn_backend.lock().unwrap() = backend;
   }
 
-  /// Fails every arm of `path` with `err` (persistent until replaced).
+  /// Fails every arm of `path` with `err` (persistent until replaced, or
+  /// cleared by [`heal_watch_at`](Self::heal_watch_at)).
   pub(crate) fn fail_watch_at(&self, path: impl AsRef<Path>, err: tributary_proto::WatchError) {
     self
       .state
@@ -415,6 +416,18 @@ impl FakeFs {
       .lock()
       .unwrap()
       .insert(path.as_ref().to_path_buf(), err);
+  }
+
+  /// Clears a [`fail_watch_at`](Self::fail_watch_at) injection: later arms of
+  /// `path` resolve normally again — the heal half of a lossy-then-re-issued
+  /// grow.
+  pub(crate) fn heal_watch_at(&self, path: impl AsRef<Path>) {
+    self
+      .state
+      .watch_failures
+      .lock()
+      .unwrap()
+      .remove(path.as_ref());
   }
 
   /// Resolves every arm of `path` as `Aliased` — the EEXIST fan-out outcome.

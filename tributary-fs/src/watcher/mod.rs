@@ -27,11 +27,12 @@ use crate::{
 #[cfg(all(test, feature = "tokio"))]
 mod tests;
 
-// Real-kernel regression suite for the crate-internal set-cover pair: `set_cover` and
-// `request_set_cover` are `pub(crate)` (no public reachability until the
-// effect-completion fence lands), so an external integration binary can no longer call
-// them; the inotify end-to-end coverage lives in-crate instead. not(miri): drives real
-// inotify syscalls and a tokio runtime.
+// Real-kernel regression suite for the set-cover pair: the in-place prune/grow
+// reconciles end to end, plus the effect-completion fence's acceptance test
+// (`set_cover_ack_resolves_at_watch_live`). In-crate rather than an external
+// integration binary so it runs inside the parallel lib-test harness with
+// object-scoped watch-descriptor assertions (see the module docs). not(miri):
+// drives real inotify syscalls and a tokio runtime.
 #[cfg(all(test, target_os = "linux", feature = "tokio", not(miri)))]
 mod linux_kernel_tests;
 
@@ -67,6 +68,158 @@ impl RootHandle {
   /// The issuing watcher's brand.
   pub(crate) const fn instance(&self) -> u64 {
     self.instance
+  }
+}
+
+/// How an awaited coverage reconcile ([`Watcher::set_cover`]) completed.
+///
+/// The acknowledgement is an **effect-completion fence**: for a reconcile that
+/// actually ran, it resolves when the reconcile has *settled* — every re-arm
+/// the grow half started has quiesced — never when its effects were merely
+/// queued. The settled verdicts ([`Applied`](Self::Applied) /
+/// [`Degraded`](Self::Degraded)) are constructed only by that settlement, so
+/// no code path can resolve them early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CoverOutcome {
+  /// The reconcile settled **clean**: every watch the grow half re-armed is
+  /// live and no coverage loss was signaled inside the window — writes under
+  /// the retained cover from the moment the ack resolves are delivered. A
+  /// caller that shrank coverage, grew it back, and writes immediately on
+  /// this resolution races nothing.
+  Applied,
+  /// The reconcile settled, but coverage loss was signaled inside the window
+  /// (a failed re-arm, an unreadable re-arm read, an overflow, or the root
+  /// tearing down mid-fence): coverage may be partial, and the covering
+  /// [`Rescan`](crate::EventKind::Rescan) — already delivered in-band —
+  /// dominates the gap. Re-issuing the same cover re-attempts exactly the
+  /// coverage the loss may have cost.
+  Degraded,
+  /// The root is backed by a kernel-recursive backend (fanotify / FSEvents),
+  /// whose single whole-subtree stream never narrowed: there is nothing to
+  /// prune or re-arm, ever, for this root. Reported explicitly — "coverage
+  /// was never reduced" — rather than as a hollow `Applied`;
+  /// [`BackendKind::is_kernel_recursive`](crate::BackendKind::is_kernel_recursive)
+  /// on [`Watcher::backend_of`]'s report lets a caller skip the round-trip
+  /// a priori.
+  Recursive,
+  /// No reconcile ran; the payload says why. Prior coverage — and the record
+  /// the next reconcile's grow is computed against — is untouched.
+  Skipped(SkipReason),
+}
+
+impl CoverOutcome {
+  /// The stable snake_case name of this outcome (independent of any carried
+  /// data).
+  #[inline]
+  #[must_use]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Applied => "applied",
+      Self::Degraded => "degraded",
+      Self::Recursive => "recursive",
+      Self::Skipped(_) => "skipped",
+    }
+  }
+
+  /// Whether this is [`Applied`](Self::Applied).
+  #[inline]
+  pub const fn is_applied(&self) -> bool {
+    matches!(self, Self::Applied)
+  }
+
+  /// Whether this is [`Degraded`](Self::Degraded).
+  #[inline]
+  pub const fn is_degraded(&self) -> bool {
+    matches!(self, Self::Degraded)
+  }
+
+  /// Whether this is [`Recursive`](Self::Recursive).
+  #[inline]
+  pub const fn is_recursive(&self) -> bool {
+    matches!(self, Self::Recursive)
+  }
+
+  /// Whether this is [`Skipped`](Self::Skipped).
+  #[inline]
+  pub const fn is_skipped(&self) -> bool {
+    matches!(self, Self::Skipped(_))
+  }
+
+  /// The skip reason, if this is [`Skipped`](Self::Skipped).
+  #[inline]
+  pub const fn skip_reason(&self) -> Option<SkipReason> {
+    match self {
+      Self::Skipped(reason) => Some(*reason),
+      _ => None,
+    }
+  }
+}
+
+impl core::fmt::Display for CoverOutcome {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+/// Why a [`Watcher::set_cover`] reconcile was [`Skipped`](CoverOutcome::Skipped):
+/// the driver refused to run it, and prior coverage is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkipReason {
+  /// The handle does not name a live root of the driver: never watched,
+  /// already unwatched, or torn down (root death, stream fatal) concurrently
+  /// with this call — indistinguishable from a root that died right after the
+  /// call was made, exactly like [`Watcher::unwatch`]'s unknown-root answer.
+  UnknownRoot,
+  /// The root is not publicly live yet: between a descending root's stream
+  /// spawn and the root arm that commits its registration there is no
+  /// coverage to reconcile, and a grow in that window would convert the
+  /// root's cold discovery into a `Created`-suppressing re-arm. Re-issue once
+  /// [`Watcher::watch`] has resolved.
+  NotLive,
+  /// The retained cover was refused: empty, or entirely outside the live root
+  /// (a typo, a relative path, a stale path) — acting on either would prune
+  /// the whole scope's coverage.
+  RefusedCover,
+}
+
+impl SkipReason {
+  /// The stable snake_case name of this reason.
+  #[inline]
+  #[must_use]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::UnknownRoot => "unknown_root",
+      Self::NotLive => "not_live",
+      Self::RefusedCover => "refused_cover",
+    }
+  }
+
+  /// Whether this is [`UnknownRoot`](Self::UnknownRoot).
+  #[inline]
+  pub const fn is_unknown_root(&self) -> bool {
+    matches!(self, Self::UnknownRoot)
+  }
+
+  /// Whether this is [`NotLive`](Self::NotLive).
+  #[inline]
+  pub const fn is_not_live(&self) -> bool {
+    matches!(self, Self::NotLive)
+  }
+
+  /// Whether this is [`RefusedCover`](Self::RefusedCover).
+  #[inline]
+  pub const fn is_refused_cover(&self) -> bool {
+    matches!(self, Self::RefusedCover)
+  }
+}
+
+impl core::fmt::Display for SkipReason {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
   }
 }
 
@@ -592,31 +745,47 @@ impl<R: RuntimeLite> Watcher<R> {
   /// `retained` are the watcher's own canonical coordinates (as
   /// [`root_path`](Self::root_path) reports), so they line up with the watches' addressing.
   ///
-  /// # Crate-internal until the effect-completion fence lands
+  /// # The acknowledgement is an effect-completion fence
   ///
-  /// The ack resolves when the reconcile has been **applied to the Monitor** — its
-  /// `AddWatch`/`RemoveWatch` effects are dispatched from the effect batch *after* the ack — NOT
-  /// when the kernel watches backing `retained` are live. A caller that shrank a subtree, awaited
-  /// a grow back, and wrote immediately could race the re-arm and miss the write with no `Rescan`
-  /// owed for the gap. Until the fs core mints an effect-completion token for the grow half (the
-  /// dedicated follow-up), this stays `pub(crate)`: exercised by the in-crate kernel tests, never
-  /// reachable as public API with the incomplete semantics.
+  /// The returned future resolves when the reconcile has **settled** — every re-arm the grow
+  /// half started has quiesced, each terminal being an armed-live watch or a loss already
+  /// signaled in-band — never when its effects were merely queued or applied to the in-memory
+  /// tree. What settled means is the [`CoverOutcome`]:
+  ///
+  /// - [`Applied`](CoverOutcome::Applied): the window was clean — **writes under the retained
+  ///   cover from the moment the ack resolves are delivered**. Shrinking, growing back, and
+  ///   writing immediately on the resolved ack races nothing.
+  /// - [`Degraded`](CoverOutcome::Degraded): the reconcile settled, but coverage loss was
+  ///   signaled inside the window (a failed re-arm, an unreadable re-arm read, an overflow, a
+  ///   teardown racing the fence): coverage may be partial, and the covering
+  ///   [`Rescan`](crate::EventKind::Rescan) — already delivered in-band — dominates the gap.
+  ///   Re-issuing the same cover re-attempts the grow.
+  /// - [`Recursive`](CoverOutcome::Recursive): the root is backed by a kernel-recursive
+  ///   backend, whose coverage never narrowed — nothing to reconcile, answered immediately.
+  /// - [`Skipped`](CoverOutcome::Skipped): no reconcile ran — the scope is unknown to the
+  ///   driver ([`UnknownRoot`](SkipReason::UnknownRoot)), not yet publicly live
+  ///   ([`NotLive`](SkipReason::NotLive)), or the cover was refused
+  ///   ([`RefusedCover`](SkipReason::RefusedCover)). Prior coverage is untouched.
+  ///
+  /// A root torn down mid-fence (unwatch, root death) settles `Degraded` — its terminal
+  /// `Rescan` covers the caller. Several in-flight reconciles of one root apply in command
+  /// order (latest wins) and settle together, each acknowledged with the shared window's
+  /// verdict.
   ///
   /// # Errors
   ///
-  /// - [`UnwatchError::UnknownRoot`] when `root` does not name a live root of THIS
-  ///   watcher (never watched, already gone, or issued by a different watcher);
-  /// - [`UnwatchError::Closed`] when the watcher is already closed.
-  // Dormant until the effect-completion follow-up re-publicizes the pair: only the
-  // tokio-gated in-crate tests exercise it, so every other configuration (the lib
-  // target, and test builds without the tokio feature — the CI matrix's smol leg)
-  // must tolerate it unused.
-  #[cfg_attr(not(all(test, feature = "tokio")), allow(dead_code))]
-  pub(crate) async fn set_cover(
+  /// - [`UnwatchError::UnknownRoot`] when `root` was issued by a DIFFERENT watcher — rejected
+  ///   before anything is sent, exactly as [`unwatch`](Self::unwatch) does (a live handle of
+  ///   this watcher whose root just died answers `Ok(Skipped(UnknownRoot))` instead: the
+  ///   driver, not the handle check, is the authority on scope liveness);
+  /// - [`UnwatchError::Closed`] when the watcher is already closed, or closes (or its driver
+  ///   dies) mid-fence — the ratified close semantics drop parked acknowledgements rather
+  ///   than resolve them over a torn-down driver.
+  pub async fn set_cover(
     &self,
     root: RootHandle,
     retained: Vec<PathBuf>,
-  ) -> Result<(), UnwatchError> {
+  ) -> Result<CoverOutcome, UnwatchError> {
     // A foreign handle's scope number can name THIS watcher's unrelated root — reject
     // before anything is sent, exactly as `unwatch` does.
     if root.instance() != self.instance {
@@ -637,10 +806,10 @@ impl<R: RuntimeLite> Watcher<R> {
       return Err(UnwatchError::Closed);
     }
     match response.await {
-      Ok(()) => Ok(()),
-      // The driver dropped the reply (it tore down): the reconcile may not have applied,
-      // but set_cover is a best-effort optimization — surface the closed state like
-      // `unwatch`, and the layer above simply keeps the (harmless) over-broad coverage.
+      Ok(outcome) => Ok(outcome),
+      // The driver dropped the reply: it closed (or died) mid-fence, so the reconcile's
+      // settlement was never observed. Surface the closed state like `unwatch` — the layer
+      // above keeps the (harmless) over-broad coverage and re-issues against a live watcher.
       Err(_) => {
         self.driver_gone();
         Err(UnwatchError::Closed)
@@ -651,21 +820,23 @@ impl<R: RuntimeLite> Watcher<R> {
   /// Requests a coverage reconcile like [`set_cover`](Self::set_cover), but as a NON-BLOCKING,
   /// REPLY-LESS fire-and-forget: it `try_send`s the ack-less command and reports whether the
   /// control channel accepted it. Unlike `set_cover` it never awaits — so it applies a deferred
-  /// reconcile PROMPTLY, without waiting for a later watcher operation to carry it (/// a `Covered`-outside grow arms nothing, so a queue-only reconcile would otherwise wait for an
+  /// reconcile PROMPTLY, without waiting for a later watcher operation to carry it (a
+  /// `Covered`-outside grow arms nothing, so a queue-only reconcile would otherwise wait for an
   /// unrelated arm).
   ///
   /// The driver applies a reply-less `SetCover` exactly like the awaited one — the same in-place
-  /// bidirectional reconcile — it simply sends no acknowledgement.
+  /// bidirectional reconcile, the same latest-wins ordering against other covers of the root —
+  /// it simply sends no acknowledgement: `true` says the request was ENQUEUED, nothing about
+  /// when (or whether) the retained cover's kernel coverage is live. A caller that must know —
+  /// to write into a just-regrown subtree without racing the re-arm — awaits
+  /// [`set_cover`](Self::set_cover) instead, whose acknowledgement is the effect-completion
+  /// fence; a reconcile requested here still participates in that fence's bookkeeping (its
+  /// window is observed at the next settlement), it just has no reply to resolve.
   ///
   /// Returns `false` when the control channel is full (the caller re-tries at its next
   /// opportunity) or closed, or when `root` is a foreign handle; `true` when the request was
   /// enqueued. Never blocks and never panics.
-  ///
-  /// Crate-internal for the same reason as [`set_cover`](Self::set_cover): enqueue
-  /// says nothing about when the kernel coverage matches the cover, so the pair stays off the
-  /// public surface until the effect-completion fence lands.
-  #[cfg_attr(not(all(test, feature = "tokio")), allow(dead_code))]
-  pub(crate) fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> bool {
+  pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> bool {
     if root.instance() != self.instance {
       return false;
     }

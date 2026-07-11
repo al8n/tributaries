@@ -43,14 +43,15 @@ use tributary_proto::{
 
 use crate::{
   core::{
-    Delivery, DriverCore, Effect, ExpectedObject, MountRefresh, ProbeId, ProbeOutcome, RawDirEntry,
-    RawEnumerate, RootLiveness,
+    CoverNoop, CoverReconcile, CoverSettle, Delivery, DriverCore, Effect, ExpectedObject, FenceId,
+    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness,
   },
   error::WatchRootError,
   os::{
     Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, Source, SourceConfig,
     SourceError, SourceHandle, SourceMessage, linux::WatchOutcome,
   },
+  watcher::{CoverOutcome, SkipReason},
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -268,14 +269,12 @@ pub(crate) enum Command {
   /// Reconcile a live scope's per-directory coverage to the `retained` cover IN PLACE,
   /// BIDIRECTIONALLY — prune every descended watch strictly outside the cover AND re-arm
   /// any retained subtree an earlier, narrower cover pruned — keeping every already-covered
-  /// retained subtree and its connecting ancestors armed (no re-arm, so no gap). A
-  /// best-effort optimization: a no-op for an unknown scope or a kernel-recursive backend
-  /// (whose whole-subtree stream has no per-directory watches to prune or grow). Resolves
-  /// once the reconcile has been applied to the Monitor (its `RemoveWatch`/`AddWatch`
-  /// effects are then fire-and-forget, like any other descending disarm/arm).
-  // Constructed only by the crate-internal `Watcher::{set_cover, request_set_cover}` pair,
-  // which no non-test code calls until the effect-completion follow-up.
-  #[cfg_attr(not(all(test, feature = "tokio")), allow(dead_code))]
+  /// retained subtree and its connecting ancestors armed (no re-arm, so no gap). The core
+  /// answers every refusal as a typed no-op (unknown scope, not publicly live,
+  /// kernel-recursive profile, refused cover), acknowledged immediately; a reconcile that
+  /// RAN parks its acknowledgement under a settlement fence, resolved only once the scope's
+  /// re-arm work has quiesced — the effect-completion fence, so the ack means "the retained
+  /// cover is live", never "the effects were queued".
   SetCover {
     /// The scope to reconcile.
     scope: ScopeId,
@@ -283,12 +282,14 @@ pub(crate) enum Command {
     /// antichain). Every watch neither under one of these nor an ancestor of one is
     /// pruned; every retained prefix not currently covered is re-armed.
     retained: Vec<PathBuf>,
-    /// `Some` for the awaited [`Watcher::set_cover`](crate::Watcher::set_cover) (resolved once
-    /// applied, or immediately no-op'd); `None` for the non-blocking, reply-less
-    /// [`Watcher::request_set_cover`](crate::Watcher::request_set_cover) — the PROMPT path that
-    /// applies a queued reconcile without waiting for a later arm. The driver
-    /// applies both identically and simply skips the ack when there is no reply.
-    reply: Option<futures_channel::oneshot::Sender<()>>,
+    /// `Some` for the awaited [`Watcher::set_cover`](crate::Watcher::set_cover) — resolved
+    /// with the reconcile's [`CoverOutcome`]: immediately for a no-op, at the settlement
+    /// fence otherwise; `None` for the non-blocking, reply-less
+    /// [`Watcher::request_set_cover`](crate::Watcher::request_set_cover) — the PROMPT path
+    /// that applies a queued reconcile without waiting for a later arm. The driver applies
+    /// both identically; a reply-less reconcile opens no fence, though its window still
+    /// feeds the settlement bookkeeping (loss memory, floor rewind).
+    reply: Option<futures_channel::oneshot::Sender<CoverOutcome>>,
   },
   /// Orderly shutdown; resolves when every stream is torn down.
   Close {
@@ -296,6 +297,51 @@ pub(crate) enum Command {
     /// grace — 0 means native-stream quiescence was proven.
     reply: futures_channel::oneshot::Sender<usize>,
   },
+}
+
+/// Lowers a refused cover reconcile to the public outcome — answered at
+/// command time, the never-fenced half of the set-cover ack.
+const fn noop_outcome(reason: CoverNoop) -> CoverOutcome {
+  match reason {
+    CoverNoop::KernelRecursive => CoverOutcome::Recursive,
+    CoverNoop::UnknownScope => CoverOutcome::Skipped(SkipReason::UnknownRoot),
+    CoverNoop::NotLive => CoverOutcome::Skipped(SkipReason::NotLive),
+    CoverNoop::RefusedCover => CoverOutcome::Skipped(SkipReason::RefusedCover),
+  }
+}
+
+/// Lowers a settled fence's verdict to the public outcome. This is the ONLY
+/// constructor of an [`Applied`](CoverOutcome::Applied) /
+/// [`Degraded`](CoverOutcome::Degraded) for a parked reply — reached solely
+/// through [`resolve_cover_settlements`] — which is what makes a queue-time
+/// acknowledgement unrepresentable: nothing else can answer a fenced reply.
+const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
+  match settle {
+    CoverSettle::Applied => CoverOutcome::Applied,
+    CoverSettle::Degraded => CoverOutcome::Degraded,
+  }
+}
+
+/// Resolves every parked set-cover acknowledgement whose fence has settled —
+/// the loop-top (and close-drain) choke point. A fence is opened only when a
+/// reply exists, so every reported settlement finds its sender unless the
+/// close path already dropped it.
+fn resolve_cover_settlements(
+  core: &mut DriverCore,
+  cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
+) {
+  for (fence, settle) in core.poll_cover_settlements() {
+    let reply = cover_replies.remove(&fence);
+    debug_assert!(
+      reply.is_some(),
+      "every opened fence parks exactly one reply"
+    );
+    if let Some(reply) = reply {
+      // The caller may have cancelled its await; settlement already updated
+      // the core's cover bookkeeping either way.
+      let _ = reply.send(settle_outcome(settle));
+    }
+  }
 }
 
 /// A spawned native source, as the blocking pool hands it back.
@@ -1095,6 +1141,12 @@ pub(crate) async fn run<R, F>(
   let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
   let mut unwatch_replies: BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>> =
     BTreeMap::new();
+  // Awaited set-cover acknowledgements parked under their settlement fences
+  // (see `Command::SetCover`): resolved by `resolve_cover_settlements` at the
+  // loop top once the scope's re-arm work quiesces, dropped at close (the
+  // caller sees `Closed` through the dropped-reply mapping).
+  let mut cover_replies: BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>> =
+    BTreeMap::new();
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
   // driver keeps a sender so grants can always be minted, which is fine —
   // exit is driven by the COMMAND channel, and this receiver merely pends.
@@ -1115,6 +1167,13 @@ pub(crate) async fn run<R, F>(
       &registry,
       &now,
     );
+
+    // Set-cover settlements resolve at this one choke point — after the
+    // previous arm's results fed the core and their effects drained, BEFORE
+    // any new command is processed — so a lossy settle's `applied_cover`
+    // rewind always lands before the next reconcile computes its broadening
+    // delta, and a teardown-folded `Degraded` is delivered promptly.
+    resolve_cover_settlements(&mut core, &mut cover_replies);
 
     let deadline = core
       .poll_timeout()
@@ -1152,19 +1211,28 @@ pub(crate) async fn run<R, F>(
           }
         }
         Ok(Command::SetCover { scope, retained, reply }) => {
-          // In-place bidirectional coverage reconcile for a LIVE descending scope. Gate on a
-          // live stream (`handles`): a still-spawning or unknown scope has nothing to prune or
-          // grow through, and `on_set_cover` is itself a no-op for an unknown scope and for a
-          // kernel-recursive backend. The pruned watches' `RemoveWatch` and grown watches'
-          // `AddWatch`/`Enumerate` effects are fire-and-forget (drained below like any
-          // disarm/arm), so ack once applied.
-          if handles.contains_key(&scope) {
-            core.on_set_cover(scope, &retained);
-          }
-          // `Some` acks the awaited `set_cover`; `None` is the reply-less prompt request
-          // (`request_set_cover`) — same reconcile, no acknowledgement.
-          if let Some(reply) = reply {
-            let _ = reply.send(());
+          // In-place bidirectional coverage reconcile. The core is the authority on whether
+          // a reconcile ran: every refusal — unknown scope, not yet publicly live,
+          // kernel-recursive profile, refused cover — comes back as a typed `Noop` and is
+          // acknowledged IMMEDIATELY, never fenced. A reconcile that RAN parks its reply
+          // under a fence opened right here, before any other core input, so the fence
+          // inherits exactly this reconcile's window (a born-lossy coalesced grow
+          // included); the loop-top `resolve_cover_settlements` answers it once the
+          // scope's re-arm work quiesces. A reply-less reconcile (`request_set_cover`)
+          // opens no fence — its window still feeds the settlement bookkeeping,
+          // unacknowledged.
+          match core.on_set_cover(scope, &retained) {
+            CoverReconcile::Reconciling => {
+              if let Some(reply) = reply {
+                let fence = core.open_cover_fence(scope);
+                cover_replies.insert(fence, reply);
+              }
+            }
+            CoverReconcile::Noop(reason) => {
+              if let Some(reply) = reply {
+                let _ = reply.send(noop_outcome(reason));
+              }
+            }
           }
         }
         Ok(Command::Close { reply }) => break Some(reply),
@@ -1457,6 +1525,12 @@ pub(crate) async fn run<R, F>(
     &registry,
     &now,
   );
+  // One final settlement poll: a fence whose re-arm work quiesced during the
+  // drain resolves with its honest verdict instead of spuriously reading as
+  // `Closed`. Whatever is still pending drops with `cover_replies` — the
+  // ratified close-mid-fence semantics: the caller sees `Closed`, never an
+  // outcome fabricated over a torn-down driver.
+  resolve_cover_settlements(&mut core, &mut cover_replies);
   if let Some(reply) = close_reply {
     let _ = reply.send(pending_teardowns.len() + pending_spawns.len());
   }
