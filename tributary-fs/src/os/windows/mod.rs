@@ -13,6 +13,9 @@ pub(crate) mod ffi;
 pub(crate) mod rdcw;
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) mod source;
+// The journal source consumes this next; the twins pin its contracts first.
+#[allow(dead_code)]
+pub(crate) mod usn;
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) use source::{Source, SourceHandle};
 
