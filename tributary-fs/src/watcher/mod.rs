@@ -446,13 +446,15 @@ impl Drop for Reservation {
 /// close and performs the same orderly stream teardown as
 /// [`close`](Self::close), without anyone to confirm it to. Prefer `close()`
 /// in orderly programs — it awaits the teardown.
-pub struct Watcher<R: RuntimeLite> {
+pub struct Watcher<R> {
   /// This watcher's handle brand (see [`RootHandle`]).
   instance: u64,
   commands: async_channel::Sender<Command>,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
-  _runtime: PhantomData<R>,
+  // `fn() -> R`, not `R`: the watcher holds no runtime value, so its auto
+  // traits (`Send`/`Sync`/`Unpin`) must not condition on `R`'s.
+  _runtime: PhantomData<fn() -> R>,
 }
 
 /// The watcher's inbound event stream: the driver's `async_channel::Receiver`,
@@ -463,7 +465,7 @@ pub struct Watcher<R: RuntimeLite> {
 type EventStream =
   Pin<Box<dyn Stream<Item = (ScopeId, Arc<PathBuf>, Change)> + Send + Sync + 'static>>;
 
-impl<R: RuntimeLite> core::fmt::Debug for Watcher<R> {
+impl<R> core::fmt::Debug for Watcher<R> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("Watcher")
       .field("roots", &self.roots)
@@ -547,7 +549,12 @@ impl<R: RuntimeLite> Watcher<R> {
     };
     Self::spawn_with(options, config, ops)
   }
+}
 
+// Everything below is channel and registry work: no method names an `R` item,
+// so the runtime bound stays on the constructors above (the one place the
+// driver task is spawned) and a `Watcher<R>` in a signature needs no bound.
+impl<R> Watcher<R> {
   /// Watches `root`, resolving once the native stream is live. From that
   /// moment every change under the root is delivered per `interest`
   /// (`Rescan`s are always delivered).
@@ -1008,7 +1015,7 @@ fn identity_of(meta: &std::fs::Metadata) -> Option<RootIdentity> {
   }
 }
 
-impl<R: RuntimeLite> Stream for Watcher<R> {
+impl<R> Stream for Watcher<R> {
   type Item = Event;
 
   fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

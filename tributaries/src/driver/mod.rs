@@ -270,7 +270,7 @@ impl Drop for WatchGrant {
 /// [`view`](Self::view) hands out a cheap `Clone` [`WatchView`] any thread reads
 /// wait-free for membership (`is_watched`) and attribution (`resolve`), reflecting the
 /// last committed watch-set (design §5).
-pub struct Tributaries<C, V, R: RuntimeLite, H> {
+pub struct Tributaries<C, V, R, H> {
   /// The control plane: `watch`/`unwatch` send a [`Command`] here and await its `oneshot`
   /// reply. Dropping every handle clone closes this channel, so the owner's `recv` errors and
   /// it tears down (design driver-golden doc, Close/Drop). `close` does **not** ride here — see
@@ -291,10 +291,12 @@ pub struct Tributaries<C, V, R: RuntimeLite, H> {
   /// The concurrent read plane (design §5): a cheap `Clone` handle over the last
   /// committed watch-set, read wait-free by any thread.
   view: WatchView<C, V, H>,
-  _rt: PhantomData<R>,
+  // `fn() -> R`, not `R`: the handle holds no runtime value, so its auto
+  // traits (`Send`/`Sync`) must not condition on `R`'s.
+  _rt: PhantomData<fn() -> R>,
 }
 
-impl<C, V, R: RuntimeLite, H> core::fmt::Debug for Tributaries<C, V, R, H> {
+impl<C, V, R, H> core::fmt::Debug for Tributaries<C, V, R, H> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("Tributaries")
       .field("view", &self.view)
@@ -302,7 +304,7 @@ impl<C, V, R: RuntimeLite, H> core::fmt::Debug for Tributaries<C, V, R, H> {
   }
 }
 
-impl<C, V, R: RuntimeLite, H> Clone for Tributaries<C, V, R, H> {
+impl<C, V, R, H> Clone for Tributaries<C, V, R, H> {
   /// Shares the same actor: every clone sends to the one command mailbox, draws from the
   /// one event stream, and reads the one published watch-set. The last clone dropped
   /// closes the command channel and tears the owner down.
@@ -513,7 +515,10 @@ where
   }
 }
 
-impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
+// The handle plane is pure channel and read-plane work: no method names an
+// `R` item, so the runtime bound lives only where the driver is built and
+// spawned (`with_source`, `parts`, `parts_local`, and the fs constructor).
+impl<C, V, R, H> Tributaries<C, V, R, H> {
   /// A cheap `Clone` concurrent read handle over the watch-set (design §5): any thread
   /// answers `is_watched` / `resolve` from it wait-free, reflecting the last committed
   /// watch-set. See [`WatchView`].
