@@ -6836,3 +6836,269 @@ fn mixed_profile_storm_holds_invariants_and_terminates() {
     m.assert_invariants();
   }
 }
+
+/// A scope the Monitor has never seen — or one already torn down — carries no
+/// re-arm work by definition, so the settle predicate is trivially true.
+#[test]
+fn rearm_settled_unknown_scope_is_settled() {
+  let m = per_dir();
+  assert!(m.rearm_settled(scope(1)));
+}
+
+/// Cold discovery — the bootstrap arm + enumerate of a fresh root, a discovered
+/// child's arm + read, and a live-churn `Created` descent — never unsettles the
+/// scope: it runs in non-re-arm states by construction, so ordinary churn cannot
+/// hold [`Monitor::rearm_settled`] down.
+#[test]
+fn cold_discovery_never_unsettles_rearm() {
+  let mut m = per_dir();
+  let s = scope(1);
+
+  let root = m.register_root(s, Interest::all());
+  assert!(m.rearm_settled(s), "a pending root arm is not re-arm work");
+  m.on_watch_result(root, Ok(()));
+  assert!(
+    m.rearm_settled(s),
+    "a cold bootstrap read is not re-arm work"
+  );
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  assert!(
+    m.rearm_settled(s),
+    "a discovered child's pending arm is not re-arm work"
+  );
+  let child = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("child watch armed");
+  m.on_watch_result(child, Ok(()));
+  assert!(m.rearm_settled(s), "a child's cold read is not re-arm work");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("b"))
+      .with_is_dir(true),
+    at(1),
+  );
+  assert!(
+    m.rearm_settled(s),
+    "live-churn discovery is not re-arm work"
+  );
+  m.assert_invariants();
+}
+
+/// A grow re-arm cascade unsettles the scope until every spawned obligation lands:
+/// the root's re-arm read, the re-installed child's arm, and that child's own
+/// re-arm read each hold the predicate down in turn, and the final result settles
+/// it. A second scope stays settled throughout — the counter is per scope.
+#[test]
+fn grow_rearm_unsettles_until_results_land() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (root, child) = root_with_live_child(&mut m, s, "a");
+  let other = scope(2);
+  let _bystander = live_root_idle(&mut m, other);
+  assert!(m.rearm_settled(s));
+
+  // Prune the child subtree (shrink), then grow it back through the public re-arm.
+  assert!(m.drop_watch_subtree(child));
+  assert!(m.rearm_settled(s), "a prune leaves no re-arm work behind");
+  assert!(m.rearm_watch_subtree(root).is_started());
+  assert!(!m.rearm_settled(s), "the grow's re-arm read is outstanding");
+  m.assert_invariants();
+
+  // The root's re-arm read lists the pruned child: a fresh watch is installed
+  // marked to continue the re-arm, so the scope stays unsettled after the root's
+  // own read lands.
+  let req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("grow re-arm read");
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "the re-installed child still owes its re-arm"
+  );
+  m.assert_invariants();
+  let fresh = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("re-installed child watch");
+  m.on_watch_result(fresh, Ok(()));
+  assert!(
+    !m.rearm_settled(s),
+    "the child's own re-arm read is outstanding"
+  );
+  let child_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("child re-arm read");
+  m.on_enumerate(child_req, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(s), "the cascade quiesced");
+  assert!(m.rearm_settled(other), "an idle scope never unsettled");
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_created()),
+    "a grow re-arm emits no Created"
+  );
+  m.assert_invariants();
+}
+
+/// A grow landing on a node whose COLD read is still in flight coalesces: the
+/// obligation rides the dirtied cold read, the kickoff reports `Coalesced`, and —
+/// by deliberate design — the scope still reads settled while the obligation is
+/// latent (cold discovery must never hold a fence down). The dirtied read's
+/// completion then escalates into a counted re-arm retry plus a covering
+/// `Rescan`, unsettling the scope until the retry lands. A fence consumes the
+/// `Coalesced` report as lossy-from-birth precisely because of this window.
+#[test]
+fn coalesced_grow_rides_the_inflight_cold_read() {
+  let mut m = per_dir();
+  let s = scope(1);
+
+  // A fresh root whose bootstrap COLD read is still outstanding.
+  let root = m.register_root(s, Interest::all());
+  m.on_watch_result(root, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  assert!(
+    m.rearm_settled(s),
+    "a cold bootstrap read is not re-arm work"
+  );
+
+  // The grow coalesces onto the in-flight cold read: latent, and reported as such.
+  assert!(m.rearm_watch_subtree(root).is_coalesced());
+  assert!(
+    m.rearm_settled(s),
+    "the latent obligation is deliberately invisible to the settle counter"
+  );
+  m.assert_invariants();
+
+  // The dirtied cold read's completion escalates: a covering Rescan stands and a
+  // counted re-arm retry unsettles the scope until it lands clean.
+  m.on_enumerate(boot, EnumerateResult::Ok(vec![]));
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "the dirtied read's completion emits the covering Rescan"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "the escalated re-arm retry is a counted obligation"
+  );
+  let retry = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("escalated re-arm retry read");
+  m.on_enumerate(retry, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(s), "the escalated obligation quiesced");
+  m.assert_invariants();
+}
+
+/// The kickoff report's refusal cases: an unknown watch and a kernel-recursive
+/// scope (whole-subtree coverage never shrank) both refuse without recording any
+/// obligation.
+#[test]
+fn rearm_kickoff_refusal_cases() {
+  let mut m = per_dir();
+  let ghost = WatchId::new(NonZeroU64::new(999).unwrap());
+  assert!(m.rearm_watch_subtree(ghost).is_refused());
+
+  let mut kr = kernel_recursive();
+  let s = scope(7);
+  let root = kr.register_root(s, Interest::all());
+  kr.on_watch_result(root, Ok(()));
+  assert!(kr.rearm_watch_subtree(root).is_refused());
+  assert!(kr.rearm_settled(s));
+  kr.assert_invariants();
+}
+
+/// An unreadable re-arm read keeps the scope unsettled across its bounded retries;
+/// exhausting the cap resolves the obligation — the `Rescan` stands, the node goes
+/// idle, and the scope settles rather than pending forever.
+#[test]
+fn rearm_retry_cap_resolution_settles() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  assert!(m.rearm_watch_subtree(root).is_started());
+  assert!(!m.rearm_settled(s));
+
+  // Results carrying attempts 0..REARM_MAX_RETRIES each queue a retry read; the
+  // result carrying attempts == REARM_MAX_RETRIES lets the Rescan stand instead.
+  for _ in 0..REARM_MAX_RETRIES {
+    let req = drain_actions(&mut m)
+      .iter()
+      .find_map(|a| a.as_enumerate().map(|e| e.req()))
+      .expect("re-arm read outstanding");
+    m.on_enumerate(req, EnumerateResult::Failed(IoClass::Io));
+    assert!(
+      !m.rearm_settled(s),
+      "an incomplete re-arm read retries and stays pending"
+    );
+    m.assert_invariants();
+  }
+  let last = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("final retry read");
+  m.on_enumerate(last, EnumerateResult::Failed(IoClass::Io));
+  assert!(
+    m.rearm_settled(s),
+    "retries exhausted: the Rescan stands and the scope settles"
+  );
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "the exhausted obligation left a standing Rescan"
+  );
+  m.assert_invariants();
+}
+
+/// Tearing down watches mid-cascade settles the scope: a removed node takes its
+/// pending count with it (no obligation outlives its node), whether through a
+/// narrow subtree drop or a whole-scope unregister.
+#[test]
+fn drop_subtree_mid_rearm_cascade_settles() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (root, child) = root_with_live_child(&mut m, s, "a");
+
+  // Drive the cascade to the point where the re-installed child owes its re-arm
+  // (Arming { rearm: true }), then drop that subtree.
+  assert!(m.drop_watch_subtree(child));
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("grow re-arm read");
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  assert!(!m.rearm_settled(s), "the cascade is mid-flight");
+  let fresh = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("re-installed child watch");
+  assert!(m.drop_watch_subtree(fresh));
+  assert!(
+    m.rearm_settled(s),
+    "a dropped mid-cascade subtree settles the scope"
+  );
+  m.assert_invariants();
+
+  // Whole-scope teardown from a pending state settles too, leaving no residue.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  assert!(!m.rearm_settled(s));
+  m.unregister_root(s);
+  assert!(m.rearm_settled(s), "an unregistered scope is settled");
+  m.assert_invariants();
+}

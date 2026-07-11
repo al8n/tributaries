@@ -67,6 +67,23 @@ enum NodeState {
   },
 }
 
+impl NodeState {
+  /// Whether this state carries outstanding re-arm work: a pending arm that must
+  /// continue a re-arm, or an in-flight re-arm read. These are the states the
+  /// per-scope pending counter behind [`Monitor::rearm_settled`] tracks, and the
+  /// obligation [`Monitor::has_rearm_obligation`] transfers to a replacement watch.
+  const fn is_rearm(self) -> bool {
+    matches!(
+      self,
+      Self::Arming { rearm: true }
+        | Self::Enumerating {
+          kind: EnumKind::Rearm,
+          ..
+        }
+    )
+  }
+}
+
 /// One node in the parent-relative watch tree.
 ///
 /// Paths are reconstructed by walking `parent` links to a root, so a node stores
@@ -171,6 +188,45 @@ enum SlotOccupant {
   Gone,
 }
 
+/// How [`Monitor::rearm_watch_subtree`] (or an internal re-arm trigger) recorded a
+/// re-arm obligation — the coverage-grow kickoff report a settle fence keys on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use = "a Coalesced kickoff's obligation is invisible to rearm_settled until its read completes; a settle fence must consume this"]
+pub enum RearmKickoff {
+  /// Nothing to re-arm: the watch is unknown/dead, or its scope is kernel-recursive
+  /// (whole-subtree coverage never shrank).
+  Refused,
+  /// The obligation entered a state [`Monitor::rearm_settled`] counts — the scope
+  /// reads unsettled until the re-arm work quiesces.
+  Started,
+  /// The obligation was folded into an in-flight **cold** read the settle counter
+  /// deliberately does not count. It is not lost — the dirtied read's completion
+  /// always escalates into a covering `Rescan` plus a counted re-arm retry — but a
+  /// settle fence must treat this kickoff as lossy from birth (see
+  /// [`Monitor::rearm_watch_subtree`]).
+  Coalesced,
+}
+
+impl RearmKickoff {
+  /// Whether this is [`Refused`](Self::Refused).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_refused(&self) -> bool {
+    matches!(self, Self::Refused)
+  }
+
+  /// Whether this is [`Started`](Self::Started).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_started(&self) -> bool {
+    matches!(self, Self::Started)
+  }
+
+  /// Whether this is [`Coalesced`](Self::Coalesced).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_coalesced(&self) -> bool {
+    matches!(self, Self::Coalesced)
+  }
+}
+
 /// The primitive-agnostic top half of the `tributaries` state machine.
 ///
 /// `Monitor` owns everything the design says must be written once and shared
@@ -231,6 +287,13 @@ pub struct Monitor {
   /// constructor default — so a stale profile cannot leak across a scope's
   /// re-registration. Read through [`scope_descends`](Self::scope_descends).
   scope_profiles: BTreeMap<ScopeId, Capabilities>,
+  /// Per-scope count of nodes in a re-arm-flavored state ([`NodeState::is_rearm`]) —
+  /// the O(1) backing for [`rearm_settled`](Self::rearm_settled). Maintained at the
+  /// three counter edges: every state transition (all funneled through
+  /// [`set_state`](Self::set_state)), node birth ([`insert_node`](Self::insert_node)),
+  /// and node removal (`drop_subtree`). An entry leaves the map when its count reaches
+  /// zero, so a settled or torn-down scope holds no residue.
+  rearm_pending: BTreeMap<ScopeId, usize>,
   /// Maps an outstanding enumerate request to the directory it reads. The node's
   /// [`NodeState::Enumerating`] carries the same `req` as the forward check, so a
   /// superseded result (whose node has moved on) is dropped rather than reconciled;
@@ -282,6 +345,7 @@ impl Monitor {
       scope_epochs: BTreeMap::new(),
       scope_interests: BTreeMap::new(),
       scope_profiles: BTreeMap::new(),
+      rearm_pending: BTreeMap::new(),
       pending_enumerate: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
       held_sources: BTreeSet::new(),
@@ -377,7 +441,7 @@ impl Monitor {
     caps: Capabilities,
   ) -> WatchId {
     let id = WatchId::new(self.watch_ids.mint());
-    self.nodes.insert(
+    self.insert_node(
       id,
       WatchNode {
         parent: None,
@@ -511,22 +575,53 @@ impl Monitor {
   /// still-watched ANCESTOR of a now-retained prefix, so the recursive re-arm reaches and
   /// re-installs every previously-pruned directory between that ancestor and the leaf.
   ///
-  /// A **no-op** (returning `false`) when `watch` is unknown/dead or its scope is
-  /// [`kernel_recursive`](Capabilities::kernel_recursive): a whole-subtree mark has no
-  /// per-directory children that could have been pruned, so there is nothing to re-arm (its
-  /// coverage never shrank). Returns `true` iff `watch` names a live node of a descending
-  /// scope, whose re-arm was started, coalesced onto an in-flight read, or marked to continue
-  /// after a pending arm — mirroring the state guards of
-  /// `inherit_rearm`.
-  pub fn rearm_watch_subtree(&mut self, watch: WatchId) -> bool {
+  /// A **no-op** (returning [`RearmKickoff::Refused`]) when `watch` is unknown/dead or its
+  /// scope is [`kernel_recursive`](Capabilities::kernel_recursive): a whole-subtree mark has
+  /// no per-directory children that could have been pruned, so there is nothing to re-arm
+  /// (its coverage never shrank). Otherwise reports how the obligation was recorded:
+  ///
+  /// - [`Started`](RearmKickoff::Started) — the re-arm entered a state
+  ///   [`rearm_settled`](Self::rearm_settled) counts (a fresh re-arm read, a dirtied
+  ///   in-flight re-arm read, or a pending arm marked to continue re-arming), so the
+  ///   scope reads unsettled until the work quiesces.
+  /// - [`Coalesced`](RearmKickoff::Coalesced) — the obligation was folded into an
+  ///   in-flight **cold** read the settle counter deliberately does not count (cold
+  ///   discovery must never hold a fence). The obligation is not lost — the dirtied
+  ///   read's completion always escalates (a covering `Rescan` plus a counted re-arm
+  ///   retry) — but until that completion the scope can read settled while the
+  ///   obligation is latent. **A settle fence built on
+  ///   [`rearm_settled`](Self::rearm_settled) must therefore treat a `Coalesced`
+  ///   kickoff as lossy from birth**: resolve it degraded, matching the covering
+  ///   `Rescan` its completion is guaranteed to emit.
+  pub fn rearm_watch_subtree(&mut self, watch: WatchId) -> RearmKickoff {
     let Some(scope) = self.scope_of(watch) else {
-      return false;
+      return RearmKickoff::Refused;
     };
     if !self.scope_descends(scope) {
-      return false;
+      return RearmKickoff::Refused;
     }
-    self.inherit_rearm(watch);
-    true
+    self.inherit_rearm(watch)
+  }
+
+  /// Whether `scope` has no outstanding re-arm work: no node of the scope is
+  /// pending an arm that continues a re-arm or holds an in-flight re-arm read.
+  /// O(1).
+  ///
+  /// This is the coverage-reconcile settle predicate: a driver that triggered
+  /// re-arm work for `scope` — a [`rearm_watch_subtree`](Self::rearm_watch_subtree)
+  /// grow, an [`on_overflow`](Self::on_overflow) recovery — polls this after
+  /// feeding results back to learn when that work has quiesced. Cold discovery
+  /// never holds it down: a fresh root's or a live-churn directory's initial arm
+  /// and enumerate run in non-re-arm states by construction, so consumer churn
+  /// inside a settled scope cannot starve a fence built on this predicate. Every
+  /// counted obligation is bounded — an unreadable re-arm read retries at most
+  /// `REARM_MAX_RETRIES` times before its [`Rescan`](ChangeKind::Rescan) stands —
+  /// so each terminal is armed-live or dropped-with-a-standing-`Rescan`, and a
+  /// pending scope settles in bounded steps. A scope with no re-arm-flavored
+  /// nodes — unknown, torn down, or simply idle — is trivially settled (`true`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn rearm_settled(&self, scope: ScopeId) -> bool {
+    !self.rearm_pending.contains_key(&scope)
   }
 
   /// Ingests one normalized event.
@@ -778,7 +873,7 @@ impl Monitor {
       .map(|node| node.children.iter().copied().collect())
       .unwrap_or_default();
     for child in children {
-      self.inherit_rearm(child);
+      let _ = self.inherit_rearm(child);
     }
     // A held dir's `Rescan` would point at its stale pre-move path, so it is suppressed
     // (the pairing reparent re-scans the real destination); coverage above still retries.
@@ -824,43 +919,67 @@ impl Monitor {
   /// whose listing may omit everything the trigger is about. A pending or dead node has
   /// nothing to read yet — a pending one's post-arm enumerate carries the obligation.
   /// A no-op on a non-descending scope (or a dead `dir`).
-  fn start_rearm(&mut self, dir: WatchId) {
+  ///
+  /// Reports how the obligation was recorded — see [`RearmKickoff`]: dirtying an
+  /// in-flight **cold** read is [`Coalesced`](RearmKickoff::Coalesced) (the obligation
+  /// rides a read [`rearm_settled`](Self::rearm_settled) does not count until its
+  /// completion escalates), while dirtying an in-flight re-arm read is
+  /// [`Started`](RearmKickoff::Started) (that read is already counted).
+  fn start_rearm(&mut self, dir: WatchId) -> RearmKickoff {
     let Some(scope) = self.scope_of(dir) else {
-      return;
+      return RearmKickoff::Refused;
     };
     if !self.scope_descends(scope) {
-      return;
+      return RearmKickoff::Refused;
     }
     match self.nodes.get(&dir).map(|node| node.state) {
-      Some(NodeState::Live) => self.queue_enumerate(dir, EnumKind::Rearm, 0),
+      Some(NodeState::Live) => {
+        self.queue_enumerate(dir, EnumKind::Rearm, 0);
+        RearmKickoff::Started
+      }
       // Dirty the in-flight read AND reset its retry budget: the bounded ceiling is
       // per OBLIGATION, not per node lifetime. A fresh trigger coalescing onto a read
       // whose earlier incomplete completions already exhausted `attempts` must still
       // get its post-trigger retry — a record race, by contrast, needs no reset, since
       // the racing record's own slot reconciliation installs the coverage directly.
-      Some(NodeState::Enumerating { req, kind, .. }) => self.set_state(
-        dir,
-        NodeState::Enumerating {
-          req,
-          kind,
-          attempts: 0,
-          dirty: true,
-        },
-      ),
-      _ => {}
+      Some(NodeState::Enumerating { req, kind, .. }) => {
+        self.set_state(
+          dir,
+          NodeState::Enumerating {
+            req,
+            kind,
+            attempts: 0,
+            dirty: true,
+          },
+        );
+        // A dirtied re-arm read is already a counted obligation; a dirtied COLD read
+        // hides this trigger from the settle counter until its completion escalates.
+        match kind {
+          EnumKind::Cold => RearmKickoff::Coalesced,
+          EnumKind::Rearm => RearmKickoff::Started,
+        }
+      }
+      _ => RearmKickoff::Refused,
     }
   }
 
   /// Transfers a re-arm obligation onto `watch` — a watch that has just replaced a
   /// mid-re-arm one, or a surviving child cascaded during an incomplete parent read.
-  fn inherit_rearm(&mut self, watch: WatchId) {
+  /// Reports how the obligation was recorded ([`RearmKickoff`]); cascade-internal
+  /// callers discard it (a cascade's own counted work keeps the scope unsettled
+  /// through any coalesced sibling's completion).
+  fn inherit_rearm(&mut self, watch: WatchId) -> RearmKickoff {
     match self.nodes.get(&watch).map(|node| node.state) {
       // Live (idle or enumerating): start_rearm reads now or dirties the in-flight read.
       Some(NodeState::Live) | Some(NodeState::Enumerating { .. }) => self.start_rearm(watch),
-      // Still arming: its post-arm enumerate must continue the re-arm, so mark it.
-      Some(NodeState::Arming { .. }) => self.set_state(watch, NodeState::Arming { rearm: true }),
+      // Still arming: its post-arm enumerate must continue the re-arm, so mark it —
+      // a counted obligation (`Arming { rearm: true }`).
+      Some(NodeState::Arming { .. }) => {
+        self.set_state(watch, NodeState::Arming { rearm: true });
+        RearmKickoff::Started
+      }
       // Dead — nothing to transfer.
-      _ => {}
+      _ => RearmKickoff::Refused,
     }
   }
 
@@ -907,7 +1026,7 @@ impl Monitor {
         .and_then(|name| present.get(name).copied())
         .is_some_and(|fresh| self.identity_matches(child, fresh));
       if survives {
-        self.inherit_rearm(child);
+        let _ = self.inherit_rearm(child);
       } else {
         self.drop_subtree(child);
       }
@@ -922,7 +1041,7 @@ impl Monitor {
       if self.child_watch(dir, entry.name()).is_none() {
         self.install_child(dir, scope, entry.name().clone(), true, entry.node());
         if let Some(fresh) = self.child_watch(dir, entry.name()) {
-          self.inherit_rearm(fresh);
+          let _ = self.inherit_rearm(fresh);
         }
       }
     }
@@ -957,7 +1076,7 @@ impl Monitor {
         let NodeState::Arming { rearm } = node.state else {
           return;
         };
-        node.state = NodeState::Live;
+        self.set_state(id, NodeState::Live);
         if is_dir && self.scope_descends(scope) {
           // Continue a rescan re-arm into this freshly-armed directory if it was installed
           // as part of one — OR if it arms while in a held subtree: a held-origin read must
@@ -966,7 +1085,7 @@ impl Monitor {
           // on `Enumerating.kind`). A cold discovery would else emit false `Created` for
           // pre-existing destination children after the move.
           if rearm || self.in_held_subtree(id).is_some() {
-            self.start_rearm(id);
+            let _ = self.start_rearm(id);
           } else {
             self.queue_enumerate(id, EnumKind::Cold, 0);
           }
@@ -1047,7 +1166,7 @@ impl Monitor {
           let at = self.location_of(watch).join(sub.descent());
           self.dirty_pending_sources_touching(scope_id, &at, None, None);
           self.emit_rescan(scope_id, at);
-          self.start_rearm(watch);
+          let _ = self.start_rearm(watch);
         }
       }
     }
@@ -1204,7 +1323,7 @@ impl Monitor {
   /// the dual obligation. A no-op re-arm on a non-descending backend or a dead `dir`.
   fn rescan_and_rearm(&mut self, scope: ScopeId, dir: WatchId) {
     self.emit_rescan(scope, self.location_of(dir));
-    self.start_rearm(dir);
+    let _ = self.start_rearm(dir);
   }
 
   /// Advances time, resolving move halves whose pairing window has elapsed: an
@@ -1403,7 +1522,7 @@ impl Monitor {
                 // Records under the moved subtree were suppressed at the stale path:
                 // re-scan the destination and re-arm the subtree to recover them.
                 self.emit_rescan(scope, to);
-                self.inherit_rearm(src);
+                let _ = self.inherit_rearm(src);
               }
             } else {
               // Not reparentable: a dead or cyclic held source, or a reparent that
@@ -1665,7 +1784,7 @@ impl Monitor {
     }
     self.child_index.insert((new_parent, new_name), child);
     if inherit_rearm {
-      self.inherit_rearm(child);
+      let _ = self.inherit_rearm(child);
     }
     true
   }
@@ -1761,7 +1880,7 @@ impl Monitor {
         }
         self.install_child(parent, scope, name.clone(), true, identity);
         if inherit && let Some(fresh) = self.child_watch(parent, name) {
-          self.inherit_rearm(fresh);
+          let _ = self.inherit_rearm(fresh);
         }
       }
       SlotOccupant::File | SlotOccupant::Gone => {
@@ -2055,6 +2174,16 @@ impl Monitor {
     a.starts_with(b) || b.starts_with(a)
   }
 
+  /// Inserts a freshly-minted node — the single funnel every node birth passes
+  /// through, so one born directly into a re-arm-flavored state is counted for
+  /// [`rearm_settled`](Self::rearm_settled) exactly like a transition into one.
+  fn insert_node(&mut self, id: WatchId, node: WatchNode) {
+    if node.state.is_rearm() {
+      self.rearm_pending_inc(node.scope);
+    }
+    self.nodes.insert(id, node);
+  }
+
   fn install_child(
     &mut self,
     parent: WatchId,
@@ -2071,7 +2200,7 @@ impl Monitor {
       return;
     }
     let id = WatchId::new(self.watch_ids.mint());
-    self.nodes.insert(
+    self.insert_node(
       id,
       WatchNode {
         parent: Some(parent),
@@ -2105,6 +2234,12 @@ impl Monitor {
       let Some(node) = self.nodes.remove(&id) else {
         continue;
       };
+      // Removal is the third counter edge beside transition and birth: a node dropped
+      // mid-re-arm takes its pending count with it, so a torn-down cascade settles
+      // rather than holding `rearm_settled` down forever.
+      if node.state.is_rearm() {
+        self.rearm_pending_dec(node.scope);
+      }
       // Descend via the adjacency set — O(subtree), not an O(N) scan of every node for
       // each popped one. A held (detached) source under `id` is in `children` too, so a
       // torn-down parent reclaims its held child here.
@@ -2207,22 +2342,47 @@ impl Monitor {
   /// that will re-arm (`Arming { rearm: true }`) or an outstanding re-arm read
   /// (`Enumerating { kind: Rearm }`) — so it can be transferred to a replacement watch.
   fn has_rearm_obligation(&self, id: WatchId) -> bool {
-    matches!(
-      self.nodes.get(&id).map(|node| node.state),
-      Some(
-        NodeState::Arming { rearm: true }
-          | NodeState::Enumerating {
-            kind: EnumKind::Rearm,
-            ..
-          }
-      )
-    )
+    self
+      .nodes
+      .get(&id)
+      .is_some_and(|node| node.state.is_rearm())
   }
 
-  /// Sets a node's [`NodeState`], if it is still registered.
+  /// Sets a node's [`NodeState`], if it is still registered — the single funnel
+  /// every state transition passes through, so the per-scope counter behind
+  /// [`rearm_settled`](Self::rearm_settled) is maintained in O(1) at the
+  /// transition edges (a node entering or leaving a re-arm-flavored state).
   fn set_state(&mut self, id: WatchId, state: NodeState) {
-    if let Some(node) = self.nodes.get_mut(&id) {
-      node.state = state;
+    let Some(node) = self.nodes.get_mut(&id) else {
+      return;
+    };
+    let was = node.state.is_rearm();
+    let is = state.is_rearm();
+    let scope = node.scope;
+    node.state = state;
+    if was == is {
+      return;
+    }
+    if is {
+      self.rearm_pending_inc(scope);
+    } else {
+      self.rearm_pending_dec(scope);
+    }
+  }
+
+  /// Counts one node of `scope` entering a re-arm-flavored state.
+  fn rearm_pending_inc(&mut self, scope: ScopeId) {
+    *self.rearm_pending.entry(scope).or_insert(0) += 1;
+  }
+
+  /// Counts one node of `scope` leaving a re-arm-flavored state (or being removed
+  /// in one), dropping the entry at zero so a settled scope holds no residue.
+  fn rearm_pending_dec(&mut self, scope: ScopeId) {
+    if let Some(count) = self.rearm_pending.get_mut(&scope) {
+      *count -= 1;
+      if *count == 0 {
+        self.rearm_pending.remove(&scope);
+      }
     }
   }
 
@@ -2354,6 +2514,19 @@ impl Monitor {
         "a dirtied hold is a held source"
       );
     }
+    // The incremental per-scope re-arm-pending counter equals a from-scratch
+    // recount of re-arm-flavored nodes — and holds no zero-count entries, since
+    // the recount cannot produce one.
+    let mut recount: BTreeMap<ScopeId, usize> = BTreeMap::new();
+    for node in self.nodes.values() {
+      if node.state.is_rearm() {
+        *recount.entry(node.scope).or_insert(0) += 1;
+      }
+    }
+    assert_eq!(
+      self.rearm_pending, recount,
+      "the re-arm-pending counter matches a from-scratch recount"
+    );
   }
 
   fn location_of(&self, id: WatchId) -> Location {
