@@ -256,11 +256,13 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     }
   }
 
-  /// Deferred no-op (safe-disable): this source arms whole subtrees, so its coverage never
-  /// narrows below a root and `grow` has nothing to restore — mirroring `FsSource`, whose
-  /// correctness-grade grow fence (an effect-completion token) is deferred to a follow-up.
-  async fn grow(&mut self, handle: RootHandle, retained: &[Vec<Comp>]) {
+  /// Conforming no-op `Ok`: this source arms whole subtrees and its [`set_cover`](Source::set_cover)
+  /// keeps the default no-op, so its coverage never narrows below a root and `grow` has nothing to
+  /// restore — every `retained` key already lies inside a live root's whole-subtree coverage
+  /// (contract clause 4: a no-op conforms exactly for a source whose coverage never narrows).
+  async fn grow(&mut self, handle: RootHandle, retained: &[Vec<Comp>]) -> Result<(), WatchError> {
     let _ = (handle, retained);
+    Ok(())
   }
 
   async fn next(&mut self) -> Option<SourceEvent<Comp, RootHandle>> {

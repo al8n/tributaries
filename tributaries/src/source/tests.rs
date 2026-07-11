@@ -55,9 +55,13 @@ fn blanket_local_source_forwards_every_item() {
       self.calls.push("disarm");
     }
 
-    fn grow(&mut self, _handle: u8, _retained: &[Vec<u8>]) -> impl Future<Output = ()> + Send {
+    fn grow(
+      &mut self,
+      _handle: u8,
+      _retained: &[Vec<u8>],
+    ) -> impl Future<Output = Result<(), WatchError>> + Send {
       self.calls.push("grow");
-      async {}
+      async { Ok(()) }
     }
 
     fn set_cover(&mut self, _handle: u8, _retained: &[Vec<u8>]) {
@@ -90,7 +94,8 @@ fn blanket_local_source_forwards_every_item() {
   assert_eq!(armed.handle(), 7, "the implementor's arm answered");
   LocalSource::grow(&mut probe, 7, &[])
     .now_or_never()
-    .expect("the forwarded grow future is ready");
+    .expect("the forwarded grow future is ready")
+    .expect("the implementor's grow answered Ok");
   LocalSource::set_cover(&mut probe, 7, &[]);
   assert!(
     LocalSource::next(&mut probe)

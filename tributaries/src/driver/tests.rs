@@ -74,6 +74,11 @@ struct FakeSource {
   canonical: HashMap<u32, Vec<OsString>>,
   /// How many of the next `arm` calls to fail, decremented on each failed arm.
   fail_arms: u32,
+  /// How many of the next `grow` calls to fail with [`WatchError::CoverageIncomplete`],
+  /// decremented on each failed grow — drives the grow-before-commit failure path (ratified R1:
+  /// the watch fails, the record does not broaden). A failed grow applies NO coverage change
+  /// (the conservative model: the missing subtree stays missing, survivors keep theirs).
+  fail_grows: u32,
   /// How many of the next `arm` calls to return **dead-on-arrival**: the arm reports success
   /// (a handle + canonical key) but the root is NOT recorded live, so [`Source::root_key`]
   /// answers `None` for its handle — modelling a root torn down between the arm request and its
@@ -109,6 +114,7 @@ impl FakeSource {
       live: HashMap::new(),
       canonical: HashMap::new(),
       fail_arms: 0,
+      fail_grows: 0,
       dead_on_arrival_arms: 0,
       retarget: HashMap::new(),
       canonicalize: HashMap::new(),
@@ -174,6 +180,12 @@ impl FakeSource {
   /// The next `arm` call fails.
   fn fail_next_arm(&mut self) {
     self.fail_arms = 1;
+  }
+
+  /// The next `grow` call fails with [`WatchError::CoverageIncomplete`], applying no coverage
+  /// change — drives the grow-before-commit failure path (R1).
+  fn fail_next_grow(&mut self) {
+    self.fail_grows = 1;
   }
 
   /// The next `arm` call returns **dead-on-arrival**: a reported-armed handle the source has
@@ -313,14 +325,22 @@ impl Source<OsString> for FakeSource {
     self.apply_cover(handle, retained);
   }
 
-  async fn grow(&mut self, handle: u32, retained: &[Vec<OsString>]) {
-    // The AWAITED, applied-before-return GROW (the set-cover design v3): record the fresh cover (including the
-    // newcomer) and apply it to the modelled ACTUAL coverage IMMEDIATELY — so `actual_covers` reflects
-    // the newcomer the instant this returns, mirroring the fs source's acked `Watcher::set_cover`.
-    // This is what lets a test observe a pruned key regain coverage the moment the covered-outside
-    // watch returns, with no bridging Rescan.
+  async fn grow(&mut self, handle: u32, retained: &[Vec<OsString>]) -> Result<(), WatchError> {
+    // The AWAITED, applied-before-`Ok` GROW (the set-cover design v3): record the fresh cover
+    // (including the newcomer) and apply it to the modelled ACTUAL coverage IMMEDIATELY — so
+    // `actual_covers` reflects the newcomer the instant this returns `Ok`, mirroring the fs source's
+    // fenced `Watcher::set_cover` ack. This is what lets a test observe a pruned key regain coverage
+    // the moment the covered-outside watch returns, with no bridging Rescan. An injected failure
+    // (`fail_next_grow`) records the ATTEMPT but applies nothing — coverage may not include the
+    // retained keys (the conservative model) — and reports the fs binding's degraded-fence error,
+    // driving the grow-before-commit abort (R1).
     self.calls.push(Call::Grow(handle, retained.to_vec()));
+    if self.fail_grows > 0 {
+      self.fail_grows -= 1;
+      return Err(WatchError::CoverageIncomplete);
+    }
     self.apply_cover(handle, retained);
+    Ok(())
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
@@ -1250,6 +1270,144 @@ async fn grow_then_unwatch_non_root_reprunes() {
   );
 }
 
+/// Grow-before-commit (ratified R1): a Covered-outside newcomer whose awaited [`Source::grow`]
+/// FAILS fails the `watch()` with the retryable `CoverageIncomplete` — never a committed
+/// subscription whose subtree has no kernel backing and no retry owner. The record is NOT broadened
+/// (record-exact), nothing leaks (the not-yet-committed plan unwinds through the same `abort_watch`
+/// the dead-covering-root re-plan uses), and a subsequent identical `watch()` re-issues the grow
+/// and succeeds (self-healing). Fail-on-old: the pre-R1 order committed BEFORE the grow, so a
+/// failed grow returned `Ok` over a coverage hole with the record broadened to coverage that does
+/// not exist — and the SECOND newcomer then classified inside-cover and silently received nothing.
+#[tokio::test]
+async fn covered_outside_grow_failure_fails_the_watch_and_broadens_nothing() {
+  let mut h = Harness::new();
+
+  // Narrow the wide /a root to {/a/b}: widen /a over /a/b, then drop the widening /a (PRUNE).
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+  h.unwatch(s_a).expect("unwatch the widening /a");
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b")]),
+    "the prune narrowed the record to {{/a/b}}"
+  );
+  // Clear the setup's widen Rescan so the post-failure stream assert below is exact.
+  let _ = h.drain();
+  let filters_before = h.owner.filters.len();
+
+  // The next grow fails: the covered-outside watch of /a/c must FAIL, not commit (R1).
+  h.owner.source.fail_next_grow();
+  let err = h
+    .watch("/a/c", Interest::all())
+    .await
+    .expect_err("a failed covered-outside grow fails the watch (grow-before-commit)");
+  assert!(
+    err.is_coverage_incomplete(),
+    "the failure is the retryable CoverageIncomplete, got {err:?}"
+  );
+
+  // The grow was ATTEMPTED, carrying the fresh survivors+newcomer cover computed BEFORE commit
+  // (the explicit-newcomer parameter)...
+  let grows: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Grow(handle, _) if *handle == wide))
+    .collect();
+  assert_eq!(
+    grows,
+    vec![Call::Grow(wide, vec![key("/a/b"), key("/a/c")])],
+    "the failed grow carried the fresh {{/a/b, /a/c}} cover"
+  );
+  // ...but the record did NOT broaden — record-exact, so the next newcomer under the pruned
+  // region still classifies outside-cover...
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b")]),
+    "no broaden on a failed grow — the record still names the source's true coverage"
+  );
+  // ...the source's actual coverage is unchanged (the fake applies nothing on a failed grow)...
+  assert!(
+    !h.owner.source.actual_covers(wide, &key("/a/c")),
+    "the newcomer's subtree is NOT covered after the failed grow"
+  );
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/b")),
+    "survivor coverage is untouched by the failed grow (never moves)"
+  );
+  // ...and nothing leaked: no pending reservation, no published subscription, no per-sub state,
+  // no parked debt, nothing delivered.
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "the aborted plan leaks no pending reservation"
+  );
+  assert!(
+    !h.owner.subsumer.view().is_watched(&key("/a/c")),
+    "the failed watch is never published as watched"
+  );
+  assert_eq!(
+    h.owner.filters.len(),
+    filters_before,
+    "no filter was registered for the never-committed subscription"
+  );
+  assert!(
+    h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.is_empty(),
+    "no parked Rescan debt for a never-committed subscription"
+  );
+  assert!(
+    h.drain().is_empty(),
+    "the failed watch delivered nothing (existing subscribers are covered by the source's own \
+     in-band Rescan, per the grow error contract — not by the umbrella)"
+  );
+
+  // Self-heal: an identical retry re-issues the grow (the record still classifies /a/c
+  // outside-cover) and commits with the broadened record.
+  let _s_c = h
+    .watch("/a/c", Interest::all())
+    .await
+    .expect("the identical retry succeeds");
+  let grows_after: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Grow(handle, _) if *handle == wide))
+    .collect();
+  assert_eq!(
+    grows_after,
+    vec![
+      Call::Grow(wide, vec![key("/a/b"), key("/a/c")]),
+      Call::Grow(wide, vec![key("/a/b"), key("/a/c")]),
+    ],
+    "the retry re-issued the SAME grow — the unbroadened record classified it outside-cover again"
+  );
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the successful retry broadened the record exactly on grow-Ok"
+  );
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/c")),
+    "the retry's grow applied — the newcomer's subtree is live"
+  );
+  assert!(
+    h.owner.subsumer.view().is_watched(&key("/a/c")),
+    "the retry committed and published"
+  );
+}
+
 /// The widen arm failure RESTORE (design driver-golden doc, invariant I3): when the wider
 /// arm FAILS after the subsumed roots were disarmed, the owner
 /// must **not** leave those live subscriptions bound to disarmed handles (recorded-live yet
@@ -1906,6 +2064,121 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
     .expect("task")
     .expect_err("a cancelled owner surfaces Closed to the in-flight watch");
   assert!(matches!(err, WatchError::Closed), "got {err:?}");
+}
+
+/// The mid-arm twin for `grow`: dropping the `parts()` driver MID-GROW cancels the in-flight
+/// covered-outside reconcile at its await point — which, grow-before-commit (R1), is now
+/// PRE-commit, so the unwind strands nothing: no subscription was committed, no grant minted to
+/// orphan, and the pending plan drops with the owner. The SOURCE drops with the owner too — the
+/// contract's reclamation boundary for whatever external re-arm the cancelled grow had initiated
+/// — and the caller's in-flight watch surfaces Closed rather than hanging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_parts_future_mid_grow_drops_the_source_for_reclamation() {
+  struct GrowGatedSource {
+    inner: FakeSource,
+    /// Closed when a grow is entered — the test's proof the covered-outside reconcile was
+    /// parked at the PRE-commit grow await when the driver dropped.
+    grow_entered: Option<futures_channel::oneshot::Sender<()>>,
+    /// Never yields: holds the owner at the grow await point.
+    gate: async_channel::Receiver<()>,
+    /// Set by Drop — the reclamation boundary observed.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+  }
+  impl Drop for GrowGatedSource {
+    fn drop(&mut self) {
+      self
+        .dropped
+        .store(true, std::sync::atomic::Ordering::Release);
+    }
+  }
+  impl Source<OsString> for GrowGatedSource {
+    type Handle = u32;
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      self.inner.canonicalize_key(key)
+    }
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      self.inner.arm(key).await
+    }
+    fn disarm(&mut self, handle: u32) {
+      self.inner.disarm(handle);
+    }
+    fn set_cover(&mut self, handle: u32, retained: &[Vec<OsString>]) {
+      self.inner.set_cover(handle, retained);
+    }
+    async fn grow(&mut self, handle: u32, retained: &[Vec<OsString>]) -> Result<(), WatchError> {
+      if let Some(entered) = self.grow_entered.take() {
+        let _ = entered.send(());
+      }
+      // Park forever: the cancellation arrives as this future being dropped.
+      let _ = self.gate.recv().await;
+      self.inner.grow(handle, retained).await
+    }
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      core::future::pending().await
+    }
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.inner.root_key(handle)
+    }
+  }
+
+  let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let (entered_tx, entered_rx) = futures_channel::oneshot::channel();
+  let (_gate_tx, gate_rx) = async_channel::unbounded::<()>();
+  let (w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
+    super::Tributaries::parts(
+      GrowGatedSource {
+        inner: FakeSource::new(),
+        grow_entered: Some(entered_tx),
+        gate: gate_rx,
+        dropped: std::sync::Arc::clone(&dropped),
+      },
+      TributariesOptions::new(),
+    );
+  let driver = tokio::spawn(driver);
+
+  // Build the covered-outside state through the real loop: /a/b, widen /a, unwatch the widening
+  // sub — the wide root's cover narrows to {/a/b} (prune + record), and no grow has run yet.
+  // (The widen's dominating Rescan sits harmlessly in the event channel; nothing here drains it.)
+  let _s_b = w
+    .watch(key("/a/b"), (), WatchOptions::new())
+    .await
+    .expect("watch /a/b");
+  let s_a = w
+    .watch(key("/a"), (), WatchOptions::new())
+    .await
+    .expect("watch /a widens");
+  w.unwatch(s_a).await.expect("unwatch the widening /a");
+
+  // Watch /a/c: Covered-outside → the owner parks INSIDE the gated grow, before any commit.
+  let watching = {
+    let w = w.clone();
+    tokio::spawn(async move { w.watch(key("/a/c"), (), WatchOptions::new()).await })
+  };
+  entered_rx
+    .await
+    .expect("the grow was entered — the covered-outside reconcile is parked pre-commit");
+
+  // Cancel the driver mid-grow.
+  driver.abort();
+  let _ = driver.await;
+
+  // The source dropped WITH the owner — the reclamation boundary fired...
+  assert!(
+    dropped.load(std::sync::atomic::Ordering::Acquire),
+    "the source's Drop ran when the mid-grow driver was cancelled"
+  );
+  // ...and the caller's in-flight watch surfaces Closed rather than hanging (nothing was
+  // committed, so there is no grant and no subscription to strand).
+  let err = tokio::time::timeout(Duration::from_secs(5), watching)
+    .await
+    .expect("the watch settles")
+    .expect("task")
+    .expect_err("a cancelled owner surfaces Closed to the in-flight watch");
+  assert!(matches!(err, WatchError::Closed), "got {err:?}");
+  assert!(
+    !w.view().is_watched(&key("/a/c")),
+    "the cancelled covered-outside watch was never published"
+  );
 }
 
 /// `parts_local()`: the `!Send` construction path end-to-end — a genuinely thread-local

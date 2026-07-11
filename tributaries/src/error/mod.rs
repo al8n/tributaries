@@ -247,9 +247,11 @@ pub enum WatchError {
     #[source]
     source: SourceFault,
   },
-  /// Arming the source watch failed; the classified fault carries the source's concrete
-  /// error. Never an overlap caused by subsumed roots (see the enum docs).
-  #[error("the source could not arm the watch")]
+  /// The source reported a classified fault establishing the watch — arming it failed,
+  /// or (for a covered newcomer) its awaited coverage
+  /// [`grow`](crate::Source::grow) hit a fault such as the covering root dying
+  /// concurrently. Never an overlap caused by subsumed roots (see the enum docs).
+  #[error("the source could not establish the watch")]
   Source(#[source] SourceFault),
   /// The source reported the arm as succeeded, but the armed root was **already
   /// gone** — a *dead-on-arrival* handle: the root was removed between the arm
@@ -284,6 +286,21 @@ pub enum WatchError {
   /// dropped), so no watch can be established.
   #[error("the watcher is closed")]
   Closed,
+  /// The key is covered by an existing root whose coverage was narrowed below it, and
+  /// the awaited [`Source::grow`](crate::Source::grow) could not restore coverage for
+  /// the key's subtree (for the fs source, the grow's effect-completion fence settled
+  /// degraded). The umbrella refuses to commit a subscription whose subtree has no
+  /// live backing and no retry owner (ratified R1, grow-before-commit), so the watch
+  /// fails instead — **record-exact**: the coverage record was NOT broadened, so a
+  /// later watch under the pruned region classifies outside-cover again and re-issues
+  /// the grow (self-healing). Nothing is silently lost meanwhile: the source has
+  /// already emitted an in-band dominating [`Rescan`](crate::EventKind::Rescan) to the
+  /// root's current subscribers wherever one is owed. Retryable — retry the watch.
+  #[error(
+    "the source could not restore coverage for the watch; the covering Rescan dominates the gap; \
+     retry the watch"
+  )]
+  CoverageIncomplete,
 }
 
 impl WatchError {
@@ -341,13 +358,25 @@ impl WatchError {
     matches!(self, Self::Closed)
   }
 
+  /// Whether this is [`CoverageIncomplete`](Self::CoverageIncomplete) — the retryable,
+  /// record-exact refusal to commit a covered newcomer whose awaited coverage grow
+  /// could not be applied (no broaden happened; retry the watch).
+  #[inline]
+  pub const fn is_coverage_incomplete(&self) -> bool {
+    matches!(self, Self::CoverageIncomplete)
+  }
+
   /// The classified fault this error carries, for the two fault-carrying variants
   /// ([`Canonicalize`](Self::Canonicalize) and [`Source`](Self::Source)).
   #[inline]
   pub const fn fault(&self) -> Option<&SourceFault> {
     match self {
       Self::Canonicalize { source, .. } | Self::Source(source) => Some(source),
-      Self::DeadOnArrival | Self::CanonicalRace | Self::RescanBacklog | Self::Closed => None,
+      Self::DeadOnArrival
+      | Self::CanonicalRace
+      | Self::RescanBacklog
+      | Self::Closed
+      | Self::CoverageIncomplete => None,
     }
   }
 

@@ -140,7 +140,7 @@ mod tests;
 /// **OPTIONAL of a source (in-place coverage reconcile — never relied on for delivery correctness):**
 ///
 /// A source may reclaim (and, when a survivor returns to a pruned region, restore) the kernel
-/// coverage of a root that outlived the subscription whose key equalled it (design §5, set-cover ). It
+/// coverage of a root that outlived the subscription whose key equalled it (design §5, set-cover). It
 /// has two halves, split by their correctness role:
 ///
 /// - [`set_cover`](Self::set_cover), the **PRUNE** half — an opt-in, synchronous, fire-and-forget
@@ -156,10 +156,13 @@ mod tests;
 ///   `Covered` newcomer landed under but an earlier prune had removed. Unlike the prune it is a
 ///   correctness counterpart: a source that actually narrows coverage via `set_cover` MUST implement
 ///   `grow`, or a newcomer under a pruned region would silently receive nothing. A source that keeps
-///   the default no-op `set_cover` (its coverage never narrows) keeps the default no-op `grow` too.
-///   `grow` is awaited inside the caller-bounded reconcile and **applied before return**, so the
-///   newcomer's coverage is live before `watch()` returns — closing the request→apply window a
-///   fire-and-forget re-issue left open (set-cover ), with no bridging `Rescan` needed.
+///   the default no-op `set_cover` (its coverage never narrows) keeps the default `Ok(())` `grow`
+///   too. `grow` is awaited inside the caller-bounded reconcile and **applied before its `Ok`**, so
+///   the newcomer's coverage is live before `watch()` returns — closing the request→apply window a
+///   fire-and-forget re-issue left open (set-cover), with no bridging `Rescan` needed. On its `Err`
+///   the umbrella refuses the commit instead (the record stays exact and the watch fails retryably —
+///   see the method's errors section), so a `Covered` subscription is never published over a
+///   coverage hole.
 ///
 /// # Cancellation and `Drop` reclamation
 ///
@@ -333,14 +336,15 @@ pub trait LocalSource<C> {
 
   /// Grows the root named by `handle` so its ACTUAL coverage INCLUDES every key in `retained` — the
   /// prefix-free antichain of keys some live subscriber still needs — reconciling the source's kernel
-  /// coverage UP **in place**. **Awaited**, and awaited **only inside a caller-bounded `watch`
-  /// reconcile** (the ratified fence — invariant I1 — covers it exactly like [`arm`](Self::arm)): the
-  /// umbrella runs the reconcile to completion, so a wedged `grow` blocks that one reconcile until the
-  /// source honors the contract, exactly as a wedged [`arm`](Self::arm) does, and never any unrelated
-  /// backlog or a queued [`close`](crate::Tributaries::close).
+  /// coverage UP **in place**, and reports whether that coverage is live. **Awaited**, and awaited
+  /// **only inside a caller-bounded `watch` reconcile** (the ratified fence — invariant I1 — covers it
+  /// exactly like [`arm`](Self::arm)): the umbrella runs the reconcile to completion, so a wedged
+  /// `grow` blocks that one reconcile until the source honors the contract, exactly as a wedged
+  /// [`arm`](Self::arm) does, and never any unrelated backlog or a queued
+  /// [`close`](crate::Tributaries::close).
   ///
   /// The umbrella issues this when a `Covered` newcomer lands OUTSIDE a root's already-narrowed
-  /// coverage (design §5, set-cover ): the newcomer arms nothing, so without a grow the source would not
+  /// coverage (design §5, set-cover): the newcomer arms nothing, so without a grow the source would not
   /// back its subtree. Rather than release-and-rearm the whole root at the umbrella (which would move
   /// the survivors' coverage, forcing a gap-closing [`Rescan`](EventKind::Rescan)), the
   /// source re-arms only the missing subtree in place — survivor coverage never moves, so events under
@@ -349,32 +353,53 @@ pub trait LocalSource<C> {
   ///
   /// # Hard contract
   ///
-  /// 1. **Applied, not enqueued — coverage is live on return.** When `grow` returns, the source's
-  ///    ACTUAL coverage MUST already include every key in `retained` (the re-armed subtrees are live),
-  ///    NOT merely have the request queued. This is what lets the umbrella commit a `Covered`-outside
-  ///    newcomer with **no bridging `Rescan`**: a watch is "changes from now on", and because coverage
-  ///    is live before `watch()` returns there is no request→apply window in which a write could be
-  ///    silently lost — the exact loss a deferred fire-and-forget re-issue behind an already-flushed
-  ///    bridge could leak.
+  /// 1. **`Ok` = applied, not enqueued — coverage is live on return.** When `grow` returns `Ok(())`,
+  ///    the source's ACTUAL coverage MUST already include every key in `retained` (the re-armed
+  ///    subtrees are live), NOT merely have the request queued. This is what lets the umbrella commit
+  ///    a `Covered`-outside newcomer with **no bridging `Rescan`**: a watch is "changes from now on",
+  ///    and because coverage is live before `watch()` returns there is no request→apply window in
+  ///    which a write could be silently lost — the exact loss a deferred fire-and-forget re-issue
+  ///    behind an already-flushed bridge could leak. (For the fs binding this is the watcher's
+  ///    effect-completion fence: the ack resolves at watch-live, never at effect-queue time.)
   /// 2. **Never moves survivor coverage.** A `retained` prefix the source already covers is left
-  ///    untouched (no re-crawl, no gap); only a prefix it does not yet cover is (re-)armed.
-  /// 3. **Idempotent.** Growing to a `retained` the source already fully covers is a no-op.
-  /// 4. **A no-op is conforming only for a source whose coverage never narrows.** The **default is a
-  ///    no-op**, correct for a whole-subtree source (one stream / one recursive mark per root) whose
-  ///    actual coverage never shrank below a root — there is nothing to grow back. A source that can
-  ///    prune below a root (a per-directory descending backend, whose [`set_cover`](Self::set_cover)
-  ///    actually narrows coverage) MUST implement `grow`, or a `Covered`-outside newcomer under a
-  ///    pruned region would silently receive nothing.
+  ///    untouched (no re-crawl, no gap); only a prefix it does not yet cover is (re-)armed. This
+  ///    holds on `Err` too — a failed grow may leave a missing subtree missing, never un-cover a
+  ///    covered one.
+  /// 3. **Idempotent.** Growing to a `retained` the source already fully covers is a no-op `Ok`.
+  /// 4. **A no-op is conforming only for a source whose coverage never narrows.** The **default
+  ///    returns `Ok(())` without doing anything**, correct for a whole-subtree source (one stream /
+  ///    one recursive mark per root) whose actual coverage never shrank below a root — there is
+  ///    nothing to grow back. A source that can prune below a root (a per-directory descending
+  ///    backend, whose [`set_cover`](Self::set_cover) actually narrows coverage) MUST implement
+  ///    `grow`, or a `Covered`-outside newcomer under a pruned region would silently receive nothing.
   ///
   /// `retained` is a prefix-free antichain in the same `C` key space as [`arm`](Self::arm): every key
   /// lies under exactly one member, and no member descends from another.
   ///
+  /// # Errors
+  ///
+  /// An `Err` means coverage may NOT include some `retained` key — the grow could not be
+  /// applied (a re-arm failed or was lost to a degraded window, or the root died concurrently).
+  /// A source that reports `Err` MUST already have emitted an in-band dominating
+  /// [`Rescan`](EventKind::Rescan) to the root's current subscribers wherever one is owed (the fs
+  /// binding's Monitor does this for every failed or degraded re-arm), so the loss is never silent
+  /// for anyone already subscribed. The umbrella then does NOT broaden its coverage record — the
+  /// next newcomer under the pruned region classifies outside-cover and re-issues the grow
+  /// (self-healing) — and fails the caller's `watch` retryably
+  /// ([`WatchError::CoverageIncomplete`] from the fs binding's degraded fence, or whatever honest
+  /// error the source classified) rather than commit a subscription whose subtree has no backing
+  /// and no retry owner (ratified R1, grow-before-commit).
+  ///
   /// One of the three awaited methods, alongside [`arm`](Self::arm) and [`next`](Self::next);
   /// the returned future carries no `Send` requirement here ([`Source::grow`] is the
   /// `Send`-promising twin).
-  fn grow(&mut self, handle: Self::Handle, retained: &[Vec<C>]) -> impl Future<Output = ()> {
+  fn grow(
+    &mut self,
+    handle: Self::Handle,
+    retained: &[Vec<C>],
+  ) -> impl Future<Output = Result<(), WatchError>> {
     let _ = (handle, retained);
-    async {}
+    async { Ok(()) }
   }
 
   /// Requests that the root named by `handle` PRUNE its ACTUAL coverage toward the `retained` cover —
@@ -391,7 +416,7 @@ pub trait LocalSource<C> {
   ///
   /// The umbrella issues this when a drop leaves a wide root broader than any live subscriber — an
   /// over-broad `unwatch` (the departing subscription's key equalled the root's), or a non-root
-  /// `unwatch` that shrinks an already-narrowed cover (design §5, set-cover ). Rather than release-and-
+  /// `unwatch` that shrinks an already-narrowed cover (design §5, set-cover). Rather than release-and-
   /// rearm the whole root at the umbrella (which would move the survivors' coverage, forcing a
   /// gap-closing [`Rescan`](EventKind::Rescan)), the source reclaims the KERNEL coverage
   /// in place: it **never moves survivor coverage that is already correct**, so events under an
@@ -410,8 +435,9 @@ pub trait LocalSource<C> {
   ///    promptly. `FsSource` forwards it to the watcher's control channel the instant `set_cover` is
   ///    called, via a non-blocking reply-less request; only when that channel is momentarily full does
   ///    it DEFER, re-forwarding at the next source op that touches the watcher (another `set_cover`, a
-  ///    [`disarm`](Self::disarm), or an [`arm`](Self::arm)). A **no-op is still conforming**: an
-  ///    unreconciled root is merely over-broad — correctness-neutral and self-healing.
+  ///    [`grow`](Self::grow), a [`disarm`](Self::disarm), or an [`arm`](Self::arm)). A **no-op is
+  ///    still conforming**: an unreconciled root is merely over-broad — correctness-neutral and
+  ///    self-healing.
   /// 4. **Idempotent / tolerant.** Pruning an unknown, dead, or already-released handle is a no-op. A
   ///    handle whose [`disarm`](Self::disarm) was already requested is logically dead, so its prune is
   ///    superseded by the release (the whole root is going away). There is no result; errors are the
@@ -584,13 +610,23 @@ pub trait Source<C> {
 
   /// Grows the root named by `handle` so its actual coverage includes every key in
   /// `retained` — the **awaited GROW half** of in-place coverage reconcile.
-  /// Contract-identical to [`LocalSource::grow`] (applied-before-return, never moves
-  /// survivor coverage, idempotent, a no-op conforming only for a source whose coverage
-  /// never narrows — the default body); the future here additionally promises `Send` (see
-  /// the `Send` bounds note on the [trait](Self)).
-  fn grow(&mut self, handle: Self::Handle, retained: &[Vec<C>]) -> impl Future<Output = ()> + Send {
+  /// Contract-identical to [`LocalSource::grow`] (`Ok` = applied-before-return, never
+  /// moves survivor coverage, idempotent, a no-op `Ok` conforming only for a source
+  /// whose coverage never narrows — the default body); the future here additionally
+  /// promises `Send` (see the `Send` bounds note on the [trait](Self)).
+  ///
+  /// # Errors
+  ///
+  /// See [`LocalSource::grow`]: `Err` = coverage may not include some `retained` key,
+  /// with the dominating in-band loss signal already emitted where one is owed; the
+  /// umbrella keeps its record unbroadened and fails the caller's watch retryably.
+  fn grow(
+    &mut self,
+    handle: Self::Handle,
+    retained: &[Vec<C>],
+  ) -> impl Future<Output = Result<(), WatchError>> + Send {
     let _ = (handle, retained);
-    async {}
+    async { Ok(()) }
   }
 
   /// Requests that the root named by `handle` PRUNE its actual coverage toward the
@@ -639,7 +675,11 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     <T as Source<C>>::disarm(self, handle)
   }
 
-  fn grow(&mut self, handle: Self::Handle, retained: &[Vec<C>]) -> impl Future<Output = ()> {
+  fn grow(
+    &mut self,
+    handle: Self::Handle,
+    retained: &[Vec<C>],
+  ) -> impl Future<Output = Result<(), WatchError>> {
     <T as Source<C>>::grow(self, handle, retained)
   }
 

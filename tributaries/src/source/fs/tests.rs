@@ -591,6 +591,166 @@ mod integration {
     );
   }
 
+  /// [`grow`](crate::Source::grow) short-circuits a kernel-recursive root (FSEvents /
+  /// fanotify) to `Ok` WITHOUT the awaited command round-trip — coverage on such a backend never
+  /// narrows, so there is nothing to reconcile inside the caller-bounded window — while a
+  /// descending backend (inotify) genuinely round-trips through the watcher's fenced
+  /// `set_cover` and maps its settled outcome to `Ok`. One cross-platform test, branched on the
+  /// live root's reported backend: on macOS the backend IS kernel-recursive (the short-circuit
+  /// leg), on unprivileged Linux it is inotify (the round-trip leg).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_grow_short_circuits_kernel_recursive_roots() {
+    let (_dir, root) = scratch();
+    let root_key = path_components(&root);
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    let armed = source.arm(&root_key).await.expect("arm the tempdir");
+    let kernel_recursive = source
+      .watcher
+      .backend_of(armed.handle())
+      .expect("the armed root reports its backend")
+      .is_kernel_recursive();
+
+    // Grow to full coverage (the cancel-equivalent shape the umbrella sends): a no-op reconcile
+    // either way, but only the descending backend pays the round-trip.
+    source
+      .grow(armed.handle(), std::slice::from_ref(&root_key))
+      .await
+      .expect("grow of a live root succeeds");
+    assert_eq!(
+      source.cover_round_trips,
+      usize::from(!kernel_recursive),
+      "a kernel-recursive root is answered by the short-circuit (no round-trip); a descending \
+       one awaits the watcher's fenced set_cover exactly once"
+    );
+  }
+
+  /// [`grow`](crate::Source::grow) of a root the watcher has since torn down (root death) maps
+  /// the driver's `Skipped(UnknownRoot)` answer to a retryable [`FaultKind::NotFound`]
+  /// fault — deliberately NOT `CoverageIncomplete` (nothing degraded; the root is GONE) — so the
+  /// umbrella's retry re-plans, finds the dead root via `root_key`, and retires it. Deleting the
+  /// watched directory kills the root; the registry forgetting it is what routes the grow past
+  /// the kernel-recursive short-circuit (`backend_of` answers `None`) into the real round-trip.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_grow_dead_root_maps_to_not_found() {
+    // An outer dir holds the watched root, so deleting the root does not delete the temp dir
+    // out from under the still-open handle.
+    let (_dir, outer) = scratch();
+    let root = outer.join("watched");
+    std::fs::create_dir_all(&root).expect("create the watched root");
+    let root_key = path_components(&root);
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    let armed = source.arm(&root_key).await.expect("arm the watched root");
+    std::fs::remove_dir_all(&root).expect("delete the watched root");
+
+    // Wait (bounded) until the watcher's registry forgets the dead root — the driver tears it
+    // down autonomously; `root_key` answering `None` is the source-level observation.
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while source.root_key(armed.handle()).is_some() {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the deleted root was never torn down"
+      );
+      tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let err = source
+      .grow(armed.handle(), &[root_key])
+      .await
+      .expect_err("growing a dead root fails");
+    let fault = err.fault().expect("the dead-root grow carries its fault");
+    assert!(
+      fault.kind().is_not_found(),
+      "a concurrently-dead root classifies as NotFound (root-gone, not coverage-degraded), got {:?}",
+      fault.kind()
+    );
+    assert!(
+      !err.is_coverage_incomplete(),
+      "root death is not the degraded-fence error"
+    );
+  }
+
+  /// The full-channel deferral queue ([`Source::set_cover`] contract clauses 3/6). The bounded
+  /// control channel cannot be forced full hermetically (the driver drains it concurrently), so
+  /// the prompt path is asserted end to end and the deferral logic on the queue seam itself:
+  /// a prune with channel room forwards immediately (nothing queued); a deferred entry is
+  /// latest-wins per handle; an awaited [`grow`](crate::Source::grow) — and a newer `set_cover`
+  /// of the same handle — SUPERSEDES the handle's queued prune (removed, never re-forwarded, so
+  /// a stale snapshot can never land after the newer cover); and a deferred entry is
+  /// re-forwarded at the next watcher-touching op.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_deferred_prunes_are_latest_wins_superseded_and_reforwarded() {
+    let (_dir, root) = scratch();
+    let keep = root.join("keep");
+    let drop_dir = root.join("drop");
+    std::fs::create_dir_all(&keep).expect("create keep");
+    std::fs::create_dir_all(&drop_dir).expect("create drop");
+    let root_key = path_components(&root);
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+    let armed = source.arm(&root_key).await.expect("arm the tempdir");
+
+    // Prompt path: with channel room the prune is handed over immediately — nothing defers.
+    source.set_cover(armed.handle(), &[path_components(&keep)]);
+    assert!(
+      source.deferred_prunes.is_empty(),
+      "a prune the control channel accepts is never queued"
+    );
+
+    // Latest-wins per handle on the deferral seam (the full-channel fallback path).
+    source.defer_prune(armed.handle(), vec![keep.clone()]);
+    source.defer_prune(armed.handle(), vec![drop_dir.clone()]);
+    assert_eq!(
+      source.deferred_prunes.get(&armed.handle()),
+      Some(&vec![drop_dir.clone()]),
+      "a re-deferred prune REPLACES the handle's stale snapshot (latest-wins, clause 6)"
+    );
+
+    // An awaited grow SUPERSEDES the handle's queued prune: removed outright, never forwarded.
+    source
+      .grow(armed.handle(), std::slice::from_ref(&root_key))
+      .await
+      .expect("grow of a live root succeeds");
+    assert!(
+      source.deferred_prunes.is_empty(),
+      "the grow superseded the queued prune (clause 6)"
+    );
+    assert_eq!(
+      source.deferred_forwards, 0,
+      "the superseded prune was REMOVED, not re-forwarded — the grow's fresh cover is authoritative"
+    );
+
+    // A NEWER set_cover of the same handle supersedes its queued snapshot too: the stale entry
+    // must never be re-forwarded around the newer cover (it would land AFTER it, stale-wins).
+    source.defer_prune(armed.handle(), vec![drop_dir.clone()]);
+    source.set_cover(armed.handle(), &[path_components(&keep)]);
+    assert!(
+      source.deferred_prunes.is_empty(),
+      "the newer prune superseded the handle's queued snapshot"
+    );
+    assert_eq!(
+      source.deferred_forwards, 0,
+      "the stale same-handle snapshot was REMOVED, never re-forwarded (latest-wins, clause 6)"
+    );
+
+    // A deferred prune IS re-forwarded at the next watcher-touching op on OTHER handles
+    // (clause 3): an unrelated arm flushes it.
+    source.defer_prune(armed.handle(), vec![keep.clone()]);
+    let (_dir2, other) = scratch();
+    source
+      .arm(&path_components(&other))
+      .await
+      .expect("arm a disjoint second root");
+    assert!(
+      source.deferred_prunes.is_empty(),
+      "the next watcher-touching op flushed the deferred prune"
+    );
+    assert_eq!(
+      source.deferred_forwards, 1,
+      "the flush re-forwarded exactly the one deferred entry"
+    );
+  }
+
   /// A REAL fs failure round-trips through the neutral surface with full fidelity:
   /// arming a non-existent path classifies as a `NotFound` fault, and the concrete
   /// [`WatchRootError`] is recoverable from the box via both the `as_fs` sugar and the
