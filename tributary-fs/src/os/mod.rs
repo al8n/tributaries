@@ -21,6 +21,7 @@ use std::{io, num::NonZeroUsize, path::PathBuf, time::Duration};
 pub(crate) mod fsevent;
 pub(crate) mod linux;
 pub(crate) mod transport;
+pub(crate) mod windows;
 
 #[cfg(all(target_os = "macos", not(miri)))]
 mod macos;
