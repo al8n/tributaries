@@ -422,10 +422,10 @@ where
   ///   thread: directly (`block_on`, or as one arm of that thread's own select loop) or
   ///   through the executor's own local-spawn API (`tokio::task::spawn_local` inside a
   ///   `LocalSet`, a smol `LocalExecutor` the thread actually runs). Do NOT reach for
-  ///   `agnostic-lite`'s `spawn_local*` here: its smol implementation spawns onto an
-  ///   immediately-dropped `LocalExecutor` — a silent no-op, the driver is never polled —
-  ///   and its tokio implementation panics outside a `LocalSet`. (That is also why there
-  ///   is no `with_source_local` convenience.)
+  ///   `agnostic-lite`'s `spawn_local*` here: its smol implementation panics — smol has
+  ///   no ambient thread-local executor to target — and its tokio implementation panics
+  ///   outside a `LocalSet`. (That is also why there is no `with_source_local`
+  ///   convenience.)
   ///
   /// Every [`Source`] is a [`LocalSource`] through the crate's blanket impl, so a `Send`
   /// source constructs here too — but then [`parts`](Self::parts) is strictly more

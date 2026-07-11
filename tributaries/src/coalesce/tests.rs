@@ -1282,7 +1282,7 @@ mod proptests {
 #[cfg(feature = "tokio")]
 mod tokio_timer {
   use super::*;
-  use agnostic_lite::RuntimeLite;
+  use agnostic_lite::{LocalRuntimeLite, RuntimeLite};
 
   type Rt = agnostic_lite::tokio::TokioRuntime;
 

@@ -142,7 +142,7 @@
 //!   or the executor's own local API).
 //!
 //! Do **not** reach for `agnostic-lite`'s `spawn_local*` for either shape: its smol
-//! local spawner spawns onto an immediately-dropped executor (a silent no-op) and its
+//! local spawner panics (smol has no ambient thread-local executor to target) and its
 //! tokio one panics outside a `LocalSet`. Poll the future directly, or use the host
 //! executor's own local-spawn API.
 
