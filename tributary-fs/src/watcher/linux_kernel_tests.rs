@@ -1,18 +1,17 @@
-//! Real-inotify end-to-end regressions for the crate-internal set-cover pair.
+//! Real-inotify end-to-end regressions for the public set-cover pair: the in-place
+//! prune/grow reconciles, and the effect-completion fence's acceptance test
+//! (`set_cover_ack_resolves_at_watch_live`) — the one cell that deliberately
+//! writes with NO convergence wait, because the resolved ack itself is the claim
+//! that the retained cover's kernel watches are live.
 //!
-//! These three tests lived in the external `linux_inotify` integration binary until the crate
-//! demoted [`Watcher::set_cover`] / [`Watcher::request_set_cover`] to `pub(crate)` (the ack
-//! resolves at effect-queue time, not watch-live time — the pair stays off the public surface
-//! until the effect-completion fence lands), which an external test binary can no longer call.
-//!
-//! Real-kernel timing is nondeterministic, so every assertion is convergence-style: wait
-//! (bounded) until the expected fact is observed; extra events are always legal. Unlike the
-//! external binary this module runs inside the parallel lib-test harness, where sibling unit
-//! tests (e.g. the `os::linux::inotify` suite) arm real inotify watches concurrently — so all
-//! watch-descriptor assertions are **object-scoped**: [`wds_watching`] matches fdinfo entries
-//! against the `(device, inode)` pairs of THIS test's own scratch directories, never a
-//! process-wide count that another test's arm or teardown could satisfy or mask
-//! (device+inode rather than inode alone, since inodes are unique only per device).
+//! Real-kernel timing is nondeterministic, so every other assertion is convergence-style:
+//! wait (bounded) until the expected fact is observed; extra events are always legal. Unlike
+//! the external `linux_inotify` binary this module runs inside the parallel lib-test harness,
+//! where sibling unit tests (e.g. the `os::linux::inotify` suite) arm real inotify watches
+//! concurrently — so all watch-descriptor assertions are **object-scoped**: [`wds_watching`]
+//! matches fdinfo entries against the `(device, inode)` pairs of THIS test's own scratch
+//! directories, never a process-wide count that another test's arm or teardown could satisfy
+//! or mask (device+inode rather than inode alone, since inodes are unique only per device).
 
 use std::{
   collections::HashSet,
@@ -430,6 +429,93 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
       .await
       .is_some(),
     "growing back to the retained ANCESTOR a/b re-arms the previously-pruned a/b/other"
+  );
+  close_and_drain(w, &all).await;
+}
+
+/// The effect-completion fence's ACCEPTANCE TEST (design §6 risk register): the resolved
+/// ack IS "the retained cover is live". Shrink to `{keep}` and prove the coverage gap the
+/// old queue-time ack would hide (a deep write under the pruned /drop yields nothing);
+/// then grow back with `set_cover({keep, drop})` and — immediately on the resolved
+/// `Applied`, with deliberately NO convergence wait, drain, or sleep — write under the
+/// re-grown subtree and assert delivery. Under a queue-time ack that write races the
+/// re-arm cascade and is lost with no `Rescan` owed for the gap; under the settle-time
+/// fence every re-armed watch (the grandchild `drop/deep` included — re-arms emit no
+/// `Created`, so nothing else covers it) is live before the ack resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_cover_ack_resolves_at_watch_live() {
+  let root = scratch_root("fence-ack");
+  std::fs::create_dir_all(root.join("keep")).unwrap();
+  std::fs::create_dir_all(root.join("drop/deep")).unwrap();
+  let all = objects_of(&[
+    root.clone(),
+    root.join("keep"),
+    root.join("drop"),
+    root.join("drop/deep"),
+  ]);
+  let pruned = objects_of(&[root.join("drop"), root.join("drop/deep")]);
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let h = w.watch(&root, Interest::all()).await.expect("watch root");
+
+  // /drop/deep holds a live per-directory watch before the shrink: a deep write surfaces.
+  let before = root.join("drop/deep/before.txt");
+  std::fs::write(&before, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &before)).await.is_some(),
+    "the /drop subtree is armed before the shrink"
+  );
+
+  // Shrink to {keep} and PROVE THE GAP: the pruned subtree's descriptors are reclaimed,
+  // and a deep write under it yields NOTHING within a bounded quiet window — exactly the
+  // hole the grow's ack must not resolve before closing.
+  w.set_cover(h, vec![root.join("keep")])
+    .await
+    .expect("set_cover shrink");
+  assert!(
+    converge(|| wds_watching(&pruned) == 0).await,
+    "the pruned /drop subtree's watch descriptors are reclaimed"
+  );
+  // Drain pre-shrink stragglers so the quiet window sees only post-shrink deliveries
+  // (the suite's usual idiom — legal here, this is the SHRINK phase).
+  let _ = tokio::time::timeout(Duration::from_millis(500), async {
+    while w.next().await.is_some() {}
+  })
+  .await;
+  let gap = root.join("drop/deep/gap.txt");
+  std::fs::write(&gap, b"y").unwrap();
+  let leaked = tokio::time::timeout(Duration::from_secs(3), async {
+    while let Some(event) = w.next().await {
+      if event.path().starts_with(root.join("drop")) {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    !leaked,
+    "the gap is real: the pruned /drop delivers nothing"
+  );
+
+  // GROW BACK — and write the INSTANT the ack resolves. No drain, no converge, no sleep
+  // between the resolved ack and the write: that immediacy is the whole point.
+  let outcome = w
+    .set_cover(h, vec![root.join("keep"), root.join("drop")])
+    .await
+    .expect("set_cover grow");
+  assert!(
+    outcome.is_applied(),
+    "a clean grow settles Applied, got {outcome:?}"
+  );
+  let probe = root.join("drop/deep/immediate.txt");
+  std::fs::write(&probe, b"z").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &probe)).await.is_some(),
+    "a write issued immediately on the resolved ack is delivered — the ack resolves at \
+     watch-live, not at effect-queue time"
   );
   close_and_drain(w, &all).await;
 }

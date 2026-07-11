@@ -412,13 +412,14 @@ async fn request_unwatch_is_reply_less_and_reports_channel_capacity() {
 }
 
 /// The awaited `set_cover` sends a SetCover carrying a reply to ack (the acked twin of the
-/// reply-less `request_set_cover`).
+/// reply-less `request_set_cover`), and the driver's answered outcome reaches the caller
+/// verbatim.
 #[tokio::test]
 async fn set_cover_sends_an_acked_command() {
   let (watcher, commands) = manual_watcher();
   let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
   let mut fut = Box::pin(watcher.set_cover(handle, vec![PathBuf::from("/r/a")]));
-  // One poll carries it past the send, parking on the never-answered reply.
+  // One poll carries it past the send, parking on the not-yet-answered reply.
   assert!(futures_util::poll!(fut.as_mut()).is_pending());
   match commands.try_recv().expect("the command was sent") {
     Command::SetCover {
@@ -428,14 +429,52 @@ async fn set_cover_sends_an_acked_command() {
     } => {
       assert_eq!(scope, handle.scope());
       assert_eq!(retained, vec![PathBuf::from("/r/a")]);
-      assert!(
-        reply.is_some(),
-        "the awaited set_cover carries a reply to ack"
-      );
+      let reply = reply.expect("the awaited set_cover carries a reply to ack");
+      reply
+        .send(CoverOutcome::Degraded)
+        .expect("the caller is awaiting");
     }
     _ => panic!("expected a SetCover command"),
   }
-  drop(fut);
+  let outcome = fut.await.expect("an answered ack resolves Ok");
+  assert_eq!(
+    outcome,
+    CoverOutcome::Degraded,
+    "the driver's outcome reaches the caller verbatim"
+  );
+}
+
+/// A reply dropped mid-fence — the driver died, or close-mid-fence under the ratified
+/// drop-the-replies semantics — surfaces as [`UnwatchError::Closed`]: never a hang, never a
+/// fabricated outcome. A foreign handle is still rejected before anything is sent.
+#[tokio::test]
+async fn set_cover_maps_a_dropped_reply_to_closed() {
+  let (watcher, commands) = manual_watcher();
+  let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
+
+  let foreign = RootHandle::new(
+    watcher.instance.wrapping_add(1),
+    ScopeId::new(1.try_into().unwrap()),
+  );
+  assert!(matches!(
+    watcher
+      .set_cover(foreign, vec![PathBuf::from("/r/a")])
+      .await,
+    Err(UnwatchError::UnknownRoot)
+  ));
+  assert!(
+    commands.try_recv().is_err(),
+    "a foreign handle never reaches the driver"
+  );
+
+  let mut fut = Box::pin(watcher.set_cover(handle, vec![PathBuf::from("/r/a")]));
+  assert!(futures_util::poll!(fut.as_mut()).is_pending());
+  match commands.try_recv().expect("the command was sent") {
+    Command::SetCover { reply, .. } => drop(reply),
+    _ => panic!("expected a SetCover command"),
+  }
+  let err = fut.await.expect_err("a dropped reply is Closed");
+  assert!(err.is_closed(), "{err:?}");
 }
 
 mod lifecycle {
@@ -937,6 +976,42 @@ mod lifecycle {
       .expect("an event arrives")
       .expect("the stream is open");
     assert_eq!(event.path(), file.as_path(), "assembly uses the final root");
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The public set-cover ack over a live KERNEL-RECURSIVE root (the hermetic
+  /// suites pin FSEvents): answered `Recursive` immediately — one
+  /// whole-subtree stream IS the coverage, which never narrowed, so there is
+  /// no reconcile to fence — and an unknown scope of this watcher is the
+  /// driver-side `Skipped(UnknownRoot)`, not an error (the handle plane
+  /// cannot distinguish never-watched from just-died).
+  #[tokio::test(start_paused = true)]
+  async fn set_cover_on_a_kernel_recursive_root_answers_recursive() {
+    let (dir, canonical) = scratch("kr-cover");
+    let fs = FakeFs::new(1);
+    fs.put(&canonical, FileKind::Dir, 1);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+    let handle = watcher.watch(&dir, Interest::all()).await.expect("watch");
+
+    let outcome = watcher
+      .set_cover(handle, vec![canonical.join("keep")])
+      .await
+      .expect("the driver answers");
+    assert_eq!(
+      outcome,
+      CoverOutcome::Recursive,
+      "kernel-recursive coverage never narrowed — reported, never fenced"
+    );
+
+    let dead = RootHandle::new(watcher.instance, ScopeId::new(9.try_into().unwrap()));
+    let outcome = watcher
+      .set_cover(dead, vec![canonical.join("keep")])
+      .await
+      .expect("the driver answers");
+    assert_eq!(outcome, CoverOutcome::Skipped(SkipReason::UnknownRoot));
 
     watcher.close().await.expect("close");
     let _ = std::fs::remove_dir_all(&dir);
