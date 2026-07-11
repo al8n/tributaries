@@ -284,7 +284,12 @@ async fn backend_stats_is_fanotify_only_and_gated() {
 
 /// The registry holds exactly the LIVE roots: every unwatch reclaims its
 /// entry (the driver's scope-dead signal), so repeated cycles cannot grow it.
-#[cfg(target_os = "macos")]
+/// not(miri): the one unit test that spawns the REAL backend (`Watcher::new`
+/// → FSEvents), and under miri the os seam is deliberately the unsupported
+/// stub, so the watch itself would honestly refuse. The hermetic twin below
+/// (`registry_reclaims_on_unwatch_cycles_hermetic`) keeps the reclaim logic
+/// under miri via the fake seam.
+#[cfg(all(target_os = "macos", not(miri)))]
 #[tokio::test]
 async fn registry_reclaims_on_unwatch_cycles() {
   let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
