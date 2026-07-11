@@ -1319,12 +1319,7 @@ async fn source_rescan_degrades_the_retained_cover_so_newcomers_regrow() {
   // Rescan): mirror the loop's live-root sequence — retire (no-op, the root is live),
   // degrade, fan out.
   let loss = rescan_event(wide, "/a/b", 1);
-  assert!(
-    !h.owner.retire_if_dead(&loss),
-    "a live root's Rescan is not a retirement"
-  );
-  h.owner.degrade_retained_cover_on_rescan(&loss);
-  h.owner.fan_out_and_push(&loss);
+  h.owner.consume_source_event(&loss);
   assert_eq!(
     h.owner.subsumer.retained_cover_of(wide),
     Some(vec![]),
@@ -1408,9 +1403,7 @@ async fn post_degrade_unwatch_keeps_the_record_degraded_until_a_grow_re_proves()
 
   // The source signals coverage loss; the claim degrades to the empty cover.
   let loss = rescan_event(wide, "/a", 1);
-  assert!(!h.owner.retire_if_dead(&loss));
-  h.owner.degrade_retained_cover_on_rescan(&loss);
-  h.owner.fan_out_and_push(&loss);
+  h.owner.consume_source_event(&loss);
   assert_eq!(h.owner.subsumer.retained_cover_of(wide), Some(vec![]));
   let calls_before = h.owner.source.calls().len();
 
@@ -6107,6 +6100,7 @@ struct TriggeredSource {
   live: HashMap<u32, Vec<OsString>>,
   events: std::collections::VecDeque<SourceEvent<OsString, u32>>,
   trigger: async_channel::Receiver<()>,
+  grows: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Source<OsString> for TriggeredSource {
@@ -6125,6 +6119,11 @@ impl Source<OsString> for TriggeredSource {
 
   fn disarm(&mut self, handle: u32) {
     self.live.remove(&handle);
+  }
+
+  async fn grow(&mut self, _handle: u32, _retained: &[Vec<OsString>]) -> Result<(), WatchError> {
+    self.grows.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
@@ -6201,6 +6200,7 @@ async fn raw_source_event_delivers_under_sustained_command_load() {
       Some(ChangeId::new(NonZeroU64::MIN)),
     )]),
     trigger: trigger_rx,
+    grows: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
     super::Tributaries::with_source(source, TributariesOptions::new());
@@ -6218,6 +6218,79 @@ async fn raw_source_event_delivers_under_sustained_command_load() {
     .expect("the stream is open");
   assert_eq!(event.subscription(), sub, "routed to the covering sub");
   flood.abort();
+}
+
+/// Regression — a live-root coverage-loss `Rescan` pumped through the COMMAND-FAIRNESS
+/// VALVE (not the select arm) still degrades the retained-cover record: both source
+/// paths run the one `consume_source_event` funnel (retire → degrade → fan out).
+/// Fail-on-old: the valve's forced poll went retire → fan-out directly, so under a
+/// sustained command flood the `Rescan` delivered while the stale narrowed claim
+/// survived — and the next covered newcomer skipped its coverage-re-proving grow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valve_pumped_rescan_still_degrades_the_retained_cover() {
+  let (trigger_tx, trigger_rx) = async_channel::unbounded::<()>();
+  let grows = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+  let source = TriggeredSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    // The queued live-root coverage-loss signal: handle 2 is the wide /a root the widen
+    // below arms second.
+    events: std::collections::VecDeque::from([SourceEvent::new(
+      2,
+      key("/a"),
+      EventKind::Rescan,
+      Location::new(),
+      Epoch::new(1),
+      None,
+    )]),
+    trigger: trigger_rx,
+    grows: grows.clone(),
+  };
+  let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+
+  // Narrow the wide /a root to {/a/b}: widen /a over /a/b (handle 2), then prune the widener.
+  let s_b = w
+    .watch(key("/a/b"), (), WatchOptions::new())
+    .await
+    .expect("watch /a/b");
+  let s_a = w
+    .watch(key("/a"), (), WatchOptions::new())
+    .await
+    .expect("watch /a widens");
+  w.unwatch(s_a).await.expect("unwatch the widening /a");
+  // Consume the widen re-point Rescan so the valve-pumped loss signal is the next delivery.
+  let repoint = tokio::time::timeout(Duration::from_secs(5), w.next())
+    .await
+    .expect("the re-point Rescan arrives")
+    .expect("stream open");
+  assert!(repoint.is_rescan() && repoint.subscription() == s_b);
+
+  // Under a sustained command flood only the fairness valve pumps the source: the queued
+  // loss Rescan must arrive AND degrade the record on that same valve path.
+  let flood = spawn_command_flood(w.commands.clone());
+  trigger_tx.try_send(()).expect("release the queued Rescan");
+  let event = tokio::time::timeout(Duration::from_secs(5), w.next())
+    .await
+    .expect("the loss Rescan is delivered through the valve despite the flood")
+    .expect("stream open");
+  assert!(
+    event.is_rescan() && event.subscription() == s_b,
+    "the coverage-loss Rescan fanned to the covering sub"
+  );
+  flood.abort();
+
+  // The record degraded on the valve path iff this covered newcomer re-proves via grow.
+  assert_eq!(grows.load(std::sync::atomic::Ordering::SeqCst), 0);
+  let _s2 = w
+    .watch(key("/a/b/x"), (), WatchOptions::new())
+    .await
+    .expect("the post-loss newcomer commits through a re-proving grow");
+  assert_eq!(
+    grows.load(std::sync::atomic::Ordering::SeqCst),
+    1,
+    "the newcomer classified covered-OUTSIDE against the degraded record and grew"
+  );
 }
 
 /// Regression — the source-drain teardown makes OWED progress under a sustained command
@@ -6267,6 +6340,7 @@ async fn due_debounced_event_drains_under_sustained_command_load() {
       Some(ChangeId::new(NonZeroU64::MIN)),
     )]),
     trigger: trigger_rx,
+    grows: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
   };
   let cfg = DebounceConfig::new()
     .with_quiet_window(Duration::from_millis(20))
