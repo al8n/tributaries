@@ -13,7 +13,8 @@
 pub(crate) mod decode;
 pub(crate) mod map;
 
-use decode::UsnRecord;
+use decode::{UsnName, UsnRecord};
+use map::{FrnMap, LearnOutcome};
 
 /// `USN_REASON_*` bits (the stable journal ABI).
 pub(crate) mod reason {
@@ -190,6 +191,263 @@ impl UsnPairer {
   }
 }
 
+/// A resolved event target: the subject's root-relative components, or the
+/// deepest location the escalation can still name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UsnTarget {
+  /// The subject, root-relative (empty = the root itself — a self-event).
+  Resolved(Vec<String>),
+  /// The subject's name has no Unicode spelling: cover the PARENT.
+  EscalateAt(Vec<String>),
+}
+
+/// One admitted journal event — membership-checked, map-mutated, resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UsnAdmitted {
+  /// A single-subject event with its fresh reason bits.
+  Single {
+    /// The fresh (delta) reason bits.
+    delta: u32,
+    /// The resolved target.
+    target: UsnTarget,
+    /// Whether the subject is a directory.
+    is_dir: bool,
+  },
+  /// An in-root rename, both ends resolved.
+  Renamed {
+    /// The departing end.
+    old: UsnTarget,
+    /// The arriving end.
+    new: UsnTarget,
+    /// Whether the subject is a directory.
+    is_dir: bool,
+  },
+  /// The subject IS the root anchor and the record is structural: the
+  /// scope's death (delete or rename of the watched root).
+  RootDeath,
+  /// The map could no longer stay complete (a live learn overflowed the
+  /// directory cap): the source must die rather than go blind.
+  MapOverflow,
+}
+
+/// The admission state one journal source owns.
+#[derive(Debug)]
+pub(crate) struct UsnAdmission {
+  map: FrnMap,
+  sessions: SessionTable,
+  pairer: UsnPairer,
+}
+
+impl UsnAdmission {
+  /// A fresh admission over a seeded map.
+  pub(crate) fn new(map: FrnMap, session_cap: usize) -> Self {
+    Self {
+      map,
+      sessions: SessionTable::new(session_cap),
+      pairer: UsnPairer::new(),
+    }
+  }
+
+  /// The map, for the reseed swap.
+  pub(crate) fn map_mut(&mut self) -> &mut FrnMap {
+    &mut self.map
+  }
+
+  /// Whether a rename OLD half is parked (the read-wait bound cue).
+  pub(crate) fn holds_old(&self) -> bool {
+    self.pairer.holds_old()
+  }
+
+  /// Admits one decoded record in journal order, appending admitted events.
+  pub(crate) fn admit(&mut self, record: UsnRecord, out: &mut Vec<UsnAdmitted>) {
+    let delta = self.sessions.delta(&record);
+    let fresh = delta & !reason::FILTERED;
+    if fresh == 0 {
+      return;
+    }
+    let mut paired = Vec::new();
+    self.pairer.push(record, fresh, &mut paired);
+    for event in paired {
+      self.lower_paired(event, out);
+    }
+  }
+
+  /// Widows the pairing carry (read boundary / loss barrier / teardown).
+  pub(crate) fn flush(&mut self, out: &mut Vec<UsnAdmitted>) {
+    let mut paired = Vec::new();
+    self.pairer.flush(&mut paired);
+    for event in paired {
+      self.lower_paired(event, out);
+    }
+  }
+
+  fn lower_paired(&mut self, event: UsnEvent, out: &mut Vec<UsnAdmitted>) {
+    match event {
+      UsnEvent::Single(record) => self.admit_single(record, out),
+      UsnEvent::Renamed { old, new } => self.admit_rename(old, new, out),
+      // A widowed OLD names an object that LEFT its slot with no arriving
+      // end: membership-wise it is a delete (out-of-root moves and deletes
+      // are indistinguishable from inside), and the lowering degrades the
+      // same way.
+      UsnEvent::WidowOld(record) => {
+        let synthetic = UsnRecord {
+          reason: reason::FILE_DELETE,
+          ..record
+        };
+        self.admit_single(synthetic, out);
+      }
+      // A widowed NEW arrived from nowhere visible: a create.
+      UsnEvent::WidowNew(record) => {
+        let synthetic = UsnRecord {
+          reason: reason::FILE_CREATE,
+          ..record
+        };
+        self.admit_single(synthetic, out);
+      }
+    }
+  }
+
+  fn admit_single(&mut self, record: UsnRecord, out: &mut Vec<UsnAdmitted>) {
+    if self.map.is_root(record.frn) {
+      // Structural facts about the root anchor are the scope's death; pure
+      // metadata on the root is an ordinary self-event.
+      if record.reason & (reason::FILE_DELETE | reason::RENAME_OLD_NAME) != 0 {
+        out.push(UsnAdmitted::RootDeath);
+        return;
+      }
+      out.push(UsnAdmitted::Single {
+        delta: record.reason,
+        target: UsnTarget::Resolved(Vec::new()),
+        is_dir: true,
+      });
+      return;
+    }
+
+    // Membership: the parent decides. An unmapped parent is outside the
+    // root — dropped, not an error (the superblock-firehose admission).
+    let Some(parent_components) = self.map.resolve_dir(record.parent) else {
+      return;
+    };
+    let target = match &record.name {
+      UsnName::Utf8(name) => {
+        let mut components = parent_components;
+        components.push(name.clone());
+        UsnTarget::Resolved(components)
+      }
+      UsnName::Escalate => UsnTarget::EscalateAt(parent_components),
+    };
+
+    // Map maintenance BEFORE emission order does not matter here (the map
+    // answers membership for LATER records; this record's own resolution
+    // used the pre-state), but keeping it adjacent keeps journal order and
+    // map state in lockstep.
+    if record.is_dir() {
+      if record.reason & reason::FILE_CREATE != 0
+        && let UsnName::Utf8(name) = &record.name
+        && self.map.learn(record.frn, record.parent, name.clone()) == LearnOutcome::OverCapacity
+      {
+        out.push(UsnAdmitted::MapOverflow);
+        return;
+      }
+      if record.reason & reason::FILE_DELETE != 0 {
+        self.map.forget(record.frn);
+      }
+      if record.reason & reason::REPARSE_POINT_CHANGE != 0 && self.map.contains(record.frn) {
+        // A mapped directory turning into (or out of) a reparse point is a
+        // containment change: drop the subtree and let the located rescan
+        // re-establish what is really below.
+        self.map.forget(record.frn);
+      }
+    }
+
+    out.push(UsnAdmitted::Single {
+      delta: record.reason,
+      target,
+      is_dir: record.is_dir(),
+    });
+  }
+
+  fn admit_rename(&mut self, old: UsnRecord, new: UsnRecord, out: &mut Vec<UsnAdmitted>) {
+    if self.map.is_root(new.frn) {
+      out.push(UsnAdmitted::RootDeath);
+      return;
+    }
+    let old_parent = self.map.resolve_dir(old.parent);
+    let new_parent = self.map.resolve_dir(new.parent);
+    let is_dir = new.is_dir();
+
+    let resolve_end = |parent: Option<Vec<String>>, name: &UsnName| {
+      parent.map(|components| match name {
+        UsnName::Utf8(text) => {
+          let mut full = components;
+          full.push(text.clone());
+          UsnTarget::Resolved(full)
+        }
+        UsnName::Escalate => UsnTarget::EscalateAt(components),
+      })
+    };
+    let old_end = resolve_end(old_parent.clone(), &old.name);
+    let new_end = resolve_end(new_parent.clone(), &new.name);
+
+    // Map maintenance mirrors the boundary shape.
+    if is_dir {
+      match (old_parent.is_some(), new_parent.is_some()) {
+        (true, true) => {
+          if let UsnName::Utf8(name) = &new.name {
+            if !self.map.reparent(new.frn, new.parent, name.clone())
+              && self.map.learn(new.frn, new.parent, name.clone()) == LearnOutcome::OverCapacity
+            {
+              out.push(UsnAdmitted::MapOverflow);
+              return;
+            }
+          } else {
+            // An in-root directory whose new name has no spelling cannot
+            // stay mapped (its children would resolve through a name the
+            // vocabulary cannot carry): drop the subtree; the located
+            // rescan covers it.
+            self.map.forget(new.frn);
+          }
+        }
+        (true, false) => self.map.forget(new.frn),
+        (false, true) => {
+          if let UsnName::Utf8(name) = &new.name
+            && self.map.learn(new.frn, new.parent, name.clone()) == LearnOutcome::OverCapacity
+          {
+            out.push(UsnAdmitted::MapOverflow);
+            return;
+          }
+          // A directory moved IN brings an unmapped subtree: the pending
+          // walk is the source's duty; the admitted event's located rescan
+          // covers the window either way.
+        }
+        (false, false) => {}
+      }
+    }
+
+    match (old_end, new_end) {
+      (Some(old_target), Some(new_target)) => out.push(UsnAdmitted::Renamed {
+        old: old_target,
+        new: new_target,
+        is_dir,
+      }),
+      // Boundary renames: the in-root end alone, as a single (the lowering
+      // covers it — a located rescan for a moved-in dir, the plain verb
+      // otherwise).
+      (Some(old_target), None) => out.push(UsnAdmitted::Single {
+        delta: reason::FILE_DELETE,
+        target: old_target,
+        is_dir,
+      }),
+      (None, Some(new_target)) => out.push(UsnAdmitted::Single {
+        delta: reason::FILE_CREATE,
+        target: new_target,
+        is_dir,
+      }),
+      (None, None) => {}
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
@@ -322,5 +580,158 @@ mod tests {
       reason::CLOSE & (reason::MODIFY | reason::ATTRIB | reason::STRUCTURAL),
       0
     );
+  }
+}
+
+#[cfg(test)]
+mod admission_tests {
+  use super::{
+    UsnAdmission, UsnAdmitted, UsnTarget,
+    decode::{UsnName, UsnRecord},
+    map::FrnMap,
+    reason,
+  };
+
+  const ROOT: u128 = 1;
+
+  fn admission() -> UsnAdmission {
+    let mut map = FrnMap::new(ROOT, None);
+    map.seed([(10, ROOT, "a".into()), (20, 10, "b".into())]);
+    UsnAdmission::new(map, 64)
+  }
+
+  fn record(frn: u128, parent: u128, reason_mask: u32, attrs: u32, name: &str) -> UsnRecord {
+    UsnRecord {
+      frn,
+      parent,
+      usn: 0,
+      reason: reason_mask,
+      source_info: 0,
+      attributes: attrs,
+      name: UsnName::Utf8(name.into()),
+    }
+  }
+
+  #[test]
+  fn membership_is_the_parent_map() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(record(50, 20, reason::FILE_CREATE, 0x20, "f.txt"), &mut out);
+    assert_eq!(out.len(), 1);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), is_dir: false, .. }
+      if c == &["a".to_owned(), "b".to_owned(), "f.txt".to_owned()])
+    );
+
+    out.clear();
+    adm.admit(
+      record(60, 999, reason::FILE_CREATE, 0x20, "alien"),
+      &mut out,
+    );
+    assert!(out.is_empty(), "an unmapped parent is outside the root");
+  }
+
+  #[test]
+  fn directory_lifecycle_maintains_the_map() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(record(30, 20, reason::FILE_CREATE, 0x10, "c"), &mut out);
+    out.clear();
+    adm.admit(
+      record(70, 30, reason::FILE_CREATE, 0x20, "under-c"),
+      &mut out,
+    );
+    assert_eq!(out.len(), 1, "the freshly-learned dir admits its children");
+
+    out.clear();
+    adm.admit(
+      record(30, 20, reason::FILE_DELETE | reason::CLOSE, 0x10, "c"),
+      &mut out,
+    );
+    assert_eq!(out.len(), 1);
+    out.clear();
+    adm.admit(record(80, 30, reason::FILE_CREATE, 0x20, "ghost"), &mut out);
+    assert!(out.is_empty(), "the forgotten dir no longer admits");
+  }
+
+  #[test]
+  fn an_in_root_rename_resolves_both_ends_and_reparents() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(record(20, 10, reason::RENAME_OLD_NAME, 0x10, "b"), &mut out);
+    assert!(out.is_empty(), "the OLD half parks");
+    adm.admit(
+      record(20, ROOT, reason::RENAME_NEW_NAME, 0x10, "b2"),
+      &mut out,
+    );
+    assert_eq!(out.len(), 1);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Renamed { old: UsnTarget::Resolved(o), new: UsnTarget::Resolved(n), is_dir: true }
+      if o == &["a".to_owned(), "b".to_owned()] && n == &["b2".to_owned()])
+    );
+
+    out.clear();
+    adm.admit(record(90, 20, reason::FILE_CREATE, 0x20, "x"), &mut out);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
+      if c == &["b2".to_owned(), "x".to_owned()]),
+      "children resolve through the reparented chain: {out:?}"
+    );
+  }
+
+  #[test]
+  fn root_structural_records_are_the_scopes_death() {
+    // A root delete is immediate.
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(
+      record(ROOT, 999, reason::FILE_DELETE | reason::CLOSE, 0x10, "root"),
+      &mut out,
+    );
+    assert!(matches!(out.as_slice(), [UsnAdmitted::RootDeath]));
+
+    // A root rename's OLD half parks like any other; whether its NEW pairs
+    // or the carry widows (the synthetic delete), the death still surfaces.
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(
+      record(ROOT, 999, reason::RENAME_OLD_NAME, 0x10, "root"),
+      &mut out,
+    );
+    assert!(out.is_empty(), "the OLD half parks first");
+    adm.flush(&mut out);
+    assert!(matches!(out.as_slice(), [UsnAdmitted::RootDeath]));
+  }
+
+  #[test]
+  fn widows_degrade_to_membership_verbs() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(record(20, 10, reason::RENAME_OLD_NAME, 0x10, "b"), &mut out);
+    let mut flushed = Vec::new();
+    adm.flush(&mut flushed);
+    assert_eq!(flushed.len(), 1);
+    assert!(
+      matches!(&flushed[0], UsnAdmitted::Single { delta, is_dir: true, .. }
+      if delta & reason::FILE_DELETE != 0),
+      "a widowed OLD is membership-wise a delete: {flushed:?}"
+    );
+  }
+
+  #[test]
+  fn filtered_bits_never_admit() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(
+      record(
+        50,
+        20,
+        reason::INDEXABLE_CHANGE | reason::OBJECT_ID_CHANGE,
+        0x20,
+        "f",
+      ),
+      &mut out,
+    );
+    assert!(out.is_empty());
   }
 }
