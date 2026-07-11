@@ -132,12 +132,13 @@ impl DriverCore {
     vec![Planned::Rec(rec)]
   }
 
-  /// Plans a `FAN_RENAME` into an adjacent `MovedFrom`/`MovedTo` pair sharing a
-  /// freshly-minted counter cookie. Both halves are always present, so the
-  /// Monitor pairs them with no window; a half whose end lies outside the root
-  /// degrades to a located rescan of the in-root end (a move across the root
-  /// boundary), never a half-move.
-  fn plan_rename(
+  /// Plans an atomically-paired rename into an adjacent `MovedFrom`/`MovedTo`
+  /// pair sharing a freshly-minted counter cookie. Both halves are always
+  /// present, so the Monitor pairs them with no window; a half whose end lies
+  /// outside the root degrades to a located rescan of the in-root end (a move
+  /// across the root boundary), never a half-move. The RDCW lowering plans its
+  /// pump-paired renames through this same path.
+  pub(in crate::core) fn plan_rename(
     &mut self,
     state: &ScopeState,
     scope: ScopeId,

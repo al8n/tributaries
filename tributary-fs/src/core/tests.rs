@@ -5681,3 +5681,188 @@ mod auto_selection {
     );
   }
 }
+
+/// The RDCW lowering: pump-paired events on a kernel-recursive Windows scope
+/// lower from watch-relative names — precise verbs directly, paired renames
+/// through the counter-cookie path, escalations and unknown verbs to located
+/// rescans, widows into the Monitor's own move window.
+mod rdcw_lowering {
+  use super::*;
+  use crate::os::windows::{RawWindowsEvent, RdcwAction, RdcwEvent, RdcwName, RdcwRecord};
+
+  fn rdcw(action: RdcwAction, components: &[&str]) -> RdcwRecord {
+    RdcwRecord {
+      action,
+      name: RdcwName::Utf8(components.iter().map(|c| (*c).to_owned()).collect()),
+      file_id: None,
+      parent_id: None,
+      attributes: None,
+      reparse_tag: None,
+    }
+  }
+
+  fn payload(events: Vec<RdcwEvent>) -> BatchPayload {
+    BatchPayload::detached(
+      events
+        .into_iter()
+        .map(|event| SourceEvent::Windows(RawWindowsEvent::Rdcw(event)))
+        .collect(),
+    )
+  }
+
+  /// A live RDCW scope: registered, spawned (the KR spawn doubles as the
+  /// watch-result), birth refresh fed.
+  fn live_scope(core: &mut DriverCore) -> ScopeId {
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Rdcw);
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Rdcw,
+      }),
+    );
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    scope
+  }
+
+  #[test]
+  fn precise_verbs_lower_at_their_locations() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    core.on_batch(
+      scope,
+      payload(vec![
+        RdcwEvent::Single(rdcw(RdcwAction::Added, &["deep", "made.txt"])),
+        RdcwEvent::Single(rdcw(RdcwAction::Modified, &["deep", "made.txt"])),
+        RdcwEvent::Single(rdcw(RdcwAction::Removed, &["gone.txt"])),
+      ]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !effects.iter().any(|e| matches!(e, Effect::AddWatch { .. })),
+      "a KR event never arms: {effects:?}"
+    );
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 3, "{emitted:?}");
+    assert!(emitted[0].kind().is_created());
+    assert_eq!(emitted[0].location(), &loc(&["deep", "made.txt"]));
+    assert!(emitted[1].kind().is_modified());
+    assert_eq!(emitted[1].location(), &loc(&["deep", "made.txt"]));
+    assert!(emitted[2].kind().is_removed());
+    assert_eq!(emitted[2].location(), &loc(&["gone.txt"]));
+  }
+
+  #[test]
+  fn a_pump_paired_rename_becomes_one_moved_change() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    core.on_batch(
+      scope,
+      payload(vec![RdcwEvent::Renamed {
+        old: rdcw(RdcwAction::RenamedOld, &["a", "old.txt"]),
+        new: rdcw(RdcwAction::RenamedNew, &["b", "new.txt"]),
+      }]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(
+      emitted[0].kind().moved_from(),
+      Some(&loc(&["a", "old.txt"])),
+      "the counter cookie pairs the halves into one Moved"
+    );
+    assert_eq!(emitted[0].location(), &loc(&["b", "new.txt"]));
+  }
+
+  #[test]
+  fn an_escalated_component_covers_its_decodable_ancestor() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    core.on_batch(
+      scope,
+      payload(vec![RdcwEvent::Single(RdcwRecord {
+        action: RdcwAction::Modified,
+        name: RdcwName::Escalate {
+          prefix: vec!["deep".to_owned()],
+        },
+        file_id: None,
+        parent_id: None,
+        attributes: None,
+        reparse_tag: None,
+      })]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&["deep"]),
+      "the undecodable leaf is covered at its named ancestor: {emitted:?}"
+    );
+  }
+
+  #[test]
+  fn an_unknown_action_covers_its_target() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    core.on_batch(
+      scope,
+      payload(vec![RdcwEvent::Single(rdcw(
+        RdcwAction::Unknown(99),
+        &["odd.bin"],
+      ))]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&["odd.bin"]),
+      "a verb outside the vocabulary rescans the object it names: {emitted:?}"
+    );
+  }
+
+  #[test]
+  fn widows_degrade_immediately_and_never_fabricate_a_moved() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    core.on_batch(
+      scope,
+      payload(vec![
+        RdcwEvent::WidowOld(rdcw(RdcwAction::RenamedOld, &["lonely.txt"])),
+        RdcwEvent::WidowNew(rdcw(RdcwAction::RenamedNew, &["arrived.txt"])),
+      ]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 2, "{emitted:?}");
+    assert!(
+      emitted[0].kind().is_removed() && emitted[0].location() == &loc(&["lonely.txt"]),
+      "a cookie-less FROM resolves immediately as the Removed degrade: {emitted:?}"
+    );
+    assert!(
+      emitted[1].kind().is_created() && emitted[1].location() == &loc(&["arrived.txt"]),
+      "a cookie-less TO resolves immediately as the Created degrade: {emitted:?}"
+    );
+    assert!(
+      emitted.iter().all(|c| c.kind().moved_from().is_none()),
+      "a widow never fabricates a Moved: {emitted:?}"
+    );
+  }
+}

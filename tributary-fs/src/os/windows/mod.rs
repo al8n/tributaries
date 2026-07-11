@@ -10,18 +10,108 @@
 
 pub(crate) mod rdcw;
 
-pub(crate) use rdcw::decode::{DecodedBuffer, RdcwAction, RdcwName, RdcwRecord};
+pub(crate) use rdcw::{
+  decode::{RdcwAction, RdcwName, RdcwRecord},
+  pairing::{RdcwEvent, RdcwPairer},
+};
 
-/// One decoded Windows source event as it crosses the pump→driver queue.
+/// One decoded, pump-paired Windows source event as it crosses the
+/// pump→driver queue.
 ///
 /// The USN arm arrives with the journal backend; the enum exists from the
 /// start so the seam payload, the driver lowering, and the hermetic twins
 /// name one Windows shape throughout the campaign.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// The driver lowering consumes this in the next stage; the vocabulary and its
-// decode land first so the twins pin the byte-level contract early.
-#[allow(dead_code)]
 pub(crate) enum RawWindowsEvent {
-  /// One decoded `ReadDirectoryChangesW` record.
-  Rdcw(RdcwRecord),
+  /// One `ReadDirectoryChangesW` event after rename pairing.
+  Rdcw(RdcwEvent),
+}
+
+/// One completion buffer's full pure pipeline — decode, pair, and wrap into
+/// the seam payload, in kernel order. Returns the events plus whether the
+/// chain refused part-way (decode loss the pump signals AFTER forwarding the
+/// events, so the loss covers exactly what follows them).
+///
+/// A lossy chain also widows the pairer's held OLD first: its NEW half may
+/// sit in the refused remainder, and the widow must precede the loss signal
+/// it predates — the pump-side loss-ordering invariant.
+// The OVERLAPPED pump drives this per completion once it lands behind this
+// seam; until then the twins are the only caller.
+#[allow(dead_code)]
+pub(crate) fn lower_rdcw_buffer(
+  pairer: &mut RdcwPairer,
+  buf: &[u8],
+  extended: bool,
+) -> (Vec<super::SourceEvent>, bool) {
+  let decoded = rdcw::decode::decode_records(buf, extended);
+  let mut paired = Vec::with_capacity(decoded.records.len());
+  for record in decoded.records {
+    pairer.push(record, &mut paired);
+  }
+  if decoded.lossy {
+    pairer.flush(&mut paired);
+  }
+  let events = paired
+    .into_iter()
+    .map(|event| super::SourceEvent::Windows(RawWindowsEvent::Rdcw(event)))
+    .collect();
+  (events, decoded.lossy)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    RawWindowsEvent, RdcwEvent, RdcwPairer, lower_rdcw_buffer, rdcw::decode::RdcwAction,
+  };
+  use crate::os::SourceEvent;
+
+  fn record_bytes(next: u32, action: u32, name: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&next.to_le_bytes());
+    buf.extend_from_slice(&action.to_le_bytes());
+    let units: Vec<u8> = name
+      .encode_utf16()
+      .flat_map(|unit| unit.to_le_bytes())
+      .collect();
+    buf.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&units);
+    buf
+  }
+
+  #[test]
+  fn a_pair_split_across_buffers_survives_the_seam() {
+    let mut pairer = RdcwPairer::new();
+    let (events, lossy) = lower_rdcw_buffer(&mut pairer, &record_bytes(0, 4, "old"), false);
+    assert!(!lossy);
+    assert!(events.is_empty(), "the OLD parks across the boundary");
+
+    let (events, lossy) = lower_rdcw_buffer(&mut pairer, &record_bytes(0, 5, "new"), false);
+    assert!(!lossy);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+      &events[0],
+      SourceEvent::Windows(RawWindowsEvent::Rdcw(RdcwEvent::Renamed { .. }))
+    ));
+  }
+
+  #[test]
+  fn a_lossy_chain_widows_the_carry_before_the_loss() {
+    let mut pairer = RdcwPairer::new();
+    let mut buf = record_bytes(0, 4, "old");
+    // Retro-link to a truncated second record: the chain refuses there.
+    let second_at = buf.len().next_multiple_of(4);
+    buf.resize(second_at, 0);
+    buf[0..4].copy_from_slice(&(second_at as u32).to_le_bytes());
+    buf.extend_from_slice(&[0u8; 6]);
+
+    let (events, lossy) = lower_rdcw_buffer(&mut pairer, &buf, false);
+    assert!(lossy);
+    assert_eq!(events.len(), 1, "the held OLD widows ahead of the loss");
+    assert!(matches!(
+      &events[0],
+      SourceEvent::Windows(RawWindowsEvent::Rdcw(RdcwEvent::WidowOld(rec)))
+        if rec.action == RdcwAction::RenamedOld
+    ));
+    assert!(!pairer.holds_old());
+  }
 }

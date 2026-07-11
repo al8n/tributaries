@@ -90,6 +90,7 @@ use crate::os::{
   SourceEvent,
   linux::{RawLinuxEvent, WatchOutcome},
   transport::BudgetPermit,
+  windows::RawWindowsEvent,
 };
 
 mod compile;
@@ -1830,12 +1831,12 @@ impl DriverCore {
         for ev in events {
           match ev {
             SourceEvent::FsEvents(ev) => fsevents.push(ev),
-            SourceEvent::Linux(_) => mismatched = true,
+            _ => mismatched = true,
           }
         }
         let mut batch = self.compile_fsevents(state, scope, fsevents);
         if mismatched {
-          debug_assert!(false, "a Linux event reached an FSEvents scope");
+          debug_assert!(false, "a foreign event reached an FSEvents scope");
           batch.trailing.push(Planned::Over(Scope::Root(scope)));
         }
         batch
@@ -1874,12 +1875,28 @@ impl DriverCore {
         }
         batch
       }
-      // No Windows payload variant exists yet (it lands with the os::windows
-      // pump), so a batch reaching a Windows-profiled scope is a seam bug in
+      BackendKind::Rdcw => {
+        let mut rdcw = Vec::with_capacity(events.len());
+        let mut mismatched = false;
+        for ev in events {
+          match ev {
+            SourceEvent::Windows(RawWindowsEvent::Rdcw(event)) => rdcw.push(event),
+            _ => mismatched = true,
+          }
+        }
+        let mut batch = self.compile_rdcw(state, scope, rdcw);
+        if mismatched {
+          debug_assert!(false, "a non-RDCW event reached an RDCW scope");
+          batch.trailing.push(Planned::Over(Scope::Root(scope)));
+        }
+        batch
+      }
+      // No USN payload variant exists yet (it lands with the journal
+      // backend), so a batch reaching a USN-profiled scope is a seam bug in
       // its entirety: every event degrades to the covering root rescan,
       // never a wrong lowering.
-      BackendKind::Rdcw | BackendKind::UsnJournal => {
-        debug_assert!(false, "no source feeds a Windows-profiled scope yet");
+      BackendKind::UsnJournal => {
+        debug_assert!(false, "no source feeds a USN-profiled scope yet");
         drop(events);
         PendingBatch {
           items: Vec::new(),
