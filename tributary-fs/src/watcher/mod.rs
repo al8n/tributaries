@@ -88,12 +88,15 @@ pub enum CoverOutcome {
   /// caller that shrank coverage, grew it back, and writes immediately on
   /// this resolution races nothing.
   Applied,
-  /// The reconcile settled, but coverage loss was signaled inside the window
-  /// (a failed re-arm, an unreadable re-arm read, an overflow, or the root
-  /// tearing down mid-fence): coverage may be partial, and the covering
+  /// The reconcile settled, but coverage loss was signaled since the root's
+  /// last settled window (a failed re-arm, an unreadable re-arm read, an
+  /// overflow, or the root tearing down mid-fence) — the loss memory is
+  /// per-root, so a loss landing just BEFORE the reconcile degrades it too:
+  /// coverage may be partial, and the covering
   /// [`Rescan`](crate::EventKind::Rescan) — already delivered in-band —
-  /// dominates the gap. Re-issuing the same cover re-attempts exactly the
-  /// coverage the loss may have cost.
+  /// dominates the gap. Any loss also drops the root's recorded coverage
+  /// claim, so re-issuing the same cover re-attempts the FULL grow (re-proving
+  /// the requested coverage), and a clean re-issue resolves `Applied`.
   Degraded,
   /// The root is backed by a kernel-recursive backend (fanotify / FSEvents),
   /// whose single whole-subtree stream never narrowed: there is nothing to
@@ -756,10 +759,14 @@ impl<R: RuntimeLite> Watcher<R> {
   ///   cover from the moment the ack resolves are delivered**. Shrinking, growing back, and
   ///   writing immediately on the resolved ack races nothing.
   /// - [`Degraded`](CoverOutcome::Degraded): the reconcile settled, but coverage loss was
-  ///   signaled inside the window (a failed re-arm, an unreadable re-arm read, an overflow, a
-  ///   teardown racing the fence): coverage may be partial, and the covering
-  ///   [`Rescan`](crate::EventKind::Rescan) — already delivered in-band — dominates the gap.
-  ///   Re-issuing the same cover re-attempts the grow.
+  ///   signaled since the root's last settled window (a failed re-arm, an unreadable re-arm
+  ///   read, an overflow, a teardown racing the fence): coverage may be partial, and the
+  ///   covering [`Rescan`](crate::EventKind::Rescan) — already delivered in-band — dominates
+  ///   the gap. The loss memory is per-root, not per-fence: a loss that landed BEFORE this
+  ///   reconcile (with no reconcile in flight) both degrades this acknowledgement and drops
+  ///   the root's recorded coverage claim, so re-issuing the same cover re-attempts the FULL
+  ///   grow — re-proving the requested coverage rather than trusting the pre-loss record —
+  ///   and a clean re-issue then resolves `Applied` honestly.
   /// - [`Recursive`](CoverOutcome::Recursive): the root is backed by a kernel-recursive
   ///   backend, whose coverage never narrowed — nothing to reconcile, answered immediately.
   /// - [`Skipped`](CoverOutcome::Skipped): no reconcile ran — the scope is unknown to the
