@@ -558,6 +558,13 @@ pub enum ProbeStage {
   /// `name_to_handle_at` on the root was refused — the filesystem cannot export
   /// file handles, so FID identity is impossible (`EOPNOTSUPP`).
   Handle,
+  /// The volume device hosting the root could not be opened (the USN arm's
+  /// privilege discriminator — `\\.\X:` effectively requires elevation), or
+  /// the root has no drive letter to name one.
+  VolumeAccess,
+  /// The volume's change journal is absent, deleted, or speaks no record
+  /// version this backend reads (2..=3).
+  JournalActive,
   /// The seed walk could not fully enumerate the tree under the root: an
   /// EXISTING in-root directory could not be read or handle-encoded (`EACCES`
   /// and friends), so the FID map would be born blind to that subtree and later
@@ -578,6 +585,8 @@ impl ProbeStage {
       Self::Init => "fanotify_init",
       Self::Mark => "fanotify_mark(FAN_MARK_FILESYSTEM)",
       Self::Handle => "name_to_handle_at",
+      Self::VolumeAccess => "volume open",
+      Self::JournalActive => "FSCTL_QUERY_USN_JOURNAL",
       Self::Walk => "seed-walk completeness",
     }
   }
@@ -658,12 +667,12 @@ pub enum SourceError {
   /// The OS could not start the event stream.
   #[error("the OS could not start the event stream")]
   StartFailed,
-  /// A forced [`Backend::Fanotify`] failed a precondition (design §5): the named
-  /// stage was refused (`Init`/`Mark`/`Handle`) or the seed walk found the tree
-  /// not fully walkable (`Walk` — an existing in-root directory the map could
-  /// not admit), so the backend cannot start. `Backend::Auto` falls back to
-  /// inotify instead of surfacing this.
-  #[error("the fanotify backend is unavailable: {stage} was refused")]
+  /// A forced privileged backend ([`Backend::Fanotify`], [`Backend::UsnJournal`])
+  /// failed a precondition: the named stage was refused, or the seed walk found
+  /// the tree not fully walkable (`Walk` — an existing in-root directory the
+  /// map could not admit), so the backend cannot start. `Backend::Auto` falls
+  /// back to the unprivileged arm instead of surfacing this.
+  #[error("the probed backend is unavailable: {stage} was refused")]
   BackendProbeFailed {
     /// The precondition stage that failed.
     stage: ProbeStage,

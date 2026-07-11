@@ -49,10 +49,10 @@ use super::{
   RdcwPairer, ffi, is_unc_remote, lower_rdcw_buffer,
 };
 
-/// The completion key of the one directory read.
-const KEY_READ: usize = 1;
+/// The completion key of the one directory (or volume) read.
+pub(super) const KEY_READ: usize = 1;
 /// The completion key of a posted control (shutdown) packet.
-const KEY_CONTROL: usize = 2;
+pub(super) const KEY_CONTROL: usize = 2;
 
 /// How long a held rename OLD half waits for its NEW before widowing — the
 /// pump-side pairing window. Bounded and small: adjacency is the documented
@@ -109,21 +109,26 @@ impl PumpIo {
 }
 
 /// The state the spawn shares with the pump thread and the handle.
-struct PumpShared {
-  queue: async_channel::Sender<SourceMessage>,
-  transport: TransportState,
+pub(super) struct PumpShared {
+  pub(super) queue: async_channel::Sender<SourceMessage>,
+  pub(super) transport: TransportState,
   /// The stop belt: raised by `shutdown` before the control post, so a pump
   /// that dequeues ANY packet after it knows the source is closing.
-  stopped: AtomicBool,
+  pub(super) stopped: AtomicBool,
 }
 
 impl PumpShared {
-  fn send(&self, msg: SourceMessage) -> bool {
+  pub(super) fn send(&self, msg: SourceMessage) -> bool {
     self.queue.try_send(msg).is_ok()
   }
 
-  fn fatal(&self, err: SourceError) {
+  pub(super) fn fatal(&self, err: SourceError) {
     transport::signal_fatal_once(&self.transport, err, |msg| self.send(msg));
+  }
+
+  /// Whether the stop belt is raised (teardown is in progress).
+  pub(super) fn stopped(&self) -> bool {
+    self.stopped.load(Ordering::Acquire)
   }
 }
 
