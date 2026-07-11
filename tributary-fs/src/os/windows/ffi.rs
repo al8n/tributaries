@@ -22,17 +22,23 @@ use windows_sys::Win32::{
     ERROR_IO_PENDING, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
   },
   Storage::FileSystem::{
-    CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_ID_INFO,
-    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
-    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_DISK, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx,
-    GetFileType, OPEN_EXISTING, ReadDirectoryChangesExW, ReadDirectoryChangesW,
-    ReadDirectoryNotifyExtendedInformation,
+    CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FileAttributeTagInfo,
+    FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING,
+    ReadDirectoryChangesExW, ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
   },
-  System::IO::{
-    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
-    PostQueuedCompletionStatus,
+  System::{
+    IO::{
+      CancelIoEx, CreateIoCompletionPort, DeviceIoControl, GetOverlappedResult,
+      GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
+    },
+    Ioctl::{
+      FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1,
+      USN_JOURNAL_DATA_V1,
+    },
   },
 };
 
@@ -329,4 +335,162 @@ pub(super) fn cancel_io(handle: BorrowedHandle<'_>) {
   // outstanding operations. A FALSE return with ERROR_NOT_FOUND (nothing
   // outstanding) is benign by contract.
   let _ = unsafe { CancelIoEx(handle.as_raw_handle() as HANDLE, std::ptr::null()) };
+}
+
+/// Whether the open object is a reparse point (junction, symlink, mount) —
+/// the containment boundary the seed walk never descends.
+pub(super) fn is_reparse_point(handle: BorrowedHandle<'_>) -> io::Result<bool> {
+  let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+  // SAFETY: `info` is a properly-sized, writable FILE_ATTRIBUTE_TAG_INFO and
+  // the class constant matches the struct; the handle is live for the call.
+  let ok = unsafe {
+    GetFileInformationByHandleEx(
+      handle.as_raw_handle() as HANDLE,
+      FileAttributeTagInfo,
+      (&raw mut info).cast(),
+      size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+    )
+  };
+  if ok == 0 {
+    return Err(io::Error::last_os_error());
+  }
+  const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+  Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+/// What `FSCTL_QUERY_USN_JOURNAL` reports about a volume's live journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct JournalFacts {
+  /// The journal's identity — a read cursor is valid only against it.
+  pub(super) journal_id: u64,
+  /// The oldest USN still in the journal.
+  pub(super) first_usn: i64,
+  /// The next USN the journal will mint (the live-only anchor).
+  pub(super) next_usn: i64,
+  /// The lowest record major version the volume emits.
+  pub(super) min_major: u16,
+  /// The highest record major version the volume emits.
+  pub(super) max_major: u16,
+}
+
+/// Opens the volume device (`\\.\X:`) hosting `drive` for journal reads.
+/// Effectively requires elevation — the probe ladder's privilege
+/// discriminator.
+pub(super) fn open_volume(drive: char) -> io::Result<OwnedHandle> {
+  let device: Vec<u16> = format!(r"\\.\{drive}:").encode_utf16().chain([0]).collect();
+  // SAFETY: `device` is NUL-terminated and outlives the call; null security
+  // attributes and template are the documented "none".
+  let raw = unsafe {
+    CreateFileW(
+      device.as_ptr(),
+      GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      std::ptr::null(),
+      OPEN_EXISTING,
+      FILE_FLAG_OVERLAPPED,
+      std::ptr::null_mut(),
+    )
+  };
+  if raw == INVALID_HANDLE_VALUE {
+    return Err(io::Error::last_os_error());
+  }
+  // SAFETY: freshly returned by a successful CreateFileW, owned by no one
+  // else; OwnedHandle takes over closure.
+  Ok(unsafe { OwnedHandle::from_raw_handle(raw as _) })
+}
+
+/// Queries the volume's journal state (synchronous — the query is cheap and
+/// the barrier runs before the pump exists).
+pub(super) fn query_journal(volume: BorrowedHandle<'_>) -> io::Result<JournalFacts> {
+  let mut data: USN_JOURNAL_DATA_V1 = unsafe { std::mem::zeroed() };
+  let mut returned = 0u32;
+  // SAFETY: the handle is live; `data` is a properly-sized, writable
+  // USN_JOURNAL_DATA_V1 and the control code matches the struct; a null
+  // OVERLAPPED makes the call synchronous on this handle... the handle is
+  // OVERLAPPED-opened, so an OVERLAPPED is REQUIRED: use a local zeroed one
+  // and wait inline via GetOverlappedResult.
+  let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+  let ok = unsafe {
+    DeviceIoControl(
+      volume.as_raw_handle() as HANDLE,
+      FSCTL_QUERY_USN_JOURNAL,
+      std::ptr::null(),
+      0,
+      (&raw mut data).cast(),
+      size_of::<USN_JOURNAL_DATA_V1>() as u32,
+      &raw mut returned,
+      &raw mut overlapped,
+    )
+  };
+  if ok == 0 {
+    // SAFETY: reads the calling thread's last-error slot.
+    let error = unsafe { GetLastError() };
+    if error != ERROR_IO_PENDING {
+      return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    // SAFETY: the overlapped and handle are live; bWait blocks until the
+    // pended query completes.
+    let done = unsafe {
+      GetOverlappedResult(
+        volume.as_raw_handle() as HANDLE,
+        &raw const overlapped,
+        &raw mut returned,
+        1,
+      )
+    };
+    if done == 0 {
+      return Err(io::Error::last_os_error());
+    }
+  }
+  Ok(JournalFacts {
+    journal_id: data.UsnJournalID,
+    first_usn: data.FirstUsn,
+    next_usn: data.NextUsn,
+    min_major: data.MinSupportedMajorVersion,
+    max_major: data.MaxSupportedMajorVersion,
+  })
+}
+
+/// Issues one overlapped journal read from `start_usn` into `buffer`.
+///
+/// `BytesToWaitFor = 1` with `Timeout = 0` pends until the journal grows —
+/// the IOCP delivers the completion, so the pump's wait model is identical
+/// to the RDCW read. `MinMajorVersion..=MaxMajorVersion` is pinned 2..=3
+/// (the decode's ceiling; V4 range-tracking is never enabled).
+///
+/// # Safety
+///
+/// The caller guarantees the P1 pin for `buffer`, `overlapped`, AND `read`
+/// (the kernel reads the request struct for the operation's lifetime), and
+/// at most one journal read outstanding per volume handle (P2).
+pub(super) unsafe fn issue_journal_read(
+  volume: BorrowedHandle<'_>,
+  read: *mut READ_USN_JOURNAL_DATA_V1,
+  buffer: &mut [u8],
+  overlapped: *mut OVERLAPPED,
+) -> io::Result<()> {
+  let len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+  // SAFETY: the handle is live and OVERLAPPED-opened; request/buffer/
+  // overlapped validity and exclusivity are the caller's contract; the
+  // returned-bytes pointer may be null for an overlapped call.
+  let ok = unsafe {
+    DeviceIoControl(
+      volume.as_raw_handle() as HANDLE,
+      FSCTL_READ_USN_JOURNAL,
+      read.cast(),
+      size_of::<READ_USN_JOURNAL_DATA_V1>() as u32,
+      buffer.as_mut_ptr().cast(),
+      len,
+      std::ptr::null_mut(),
+      overlapped,
+    )
+  };
+  if ok == 0 {
+    // SAFETY: reads the calling thread's last-error slot.
+    let error = unsafe { GetLastError() };
+    if error != ERROR_IO_PENDING {
+      return Err(io::Error::from_raw_os_error(error as i32));
+    }
+  }
+  Ok(())
 }
