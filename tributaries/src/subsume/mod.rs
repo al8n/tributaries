@@ -849,11 +849,20 @@ where
         }
         Some((root_handle, antichain(survivor_keys)))
       }
-      // Already narrowed: re-prune iff the survivors' antichain is strictly narrower than the recorded
-      // cover (F2).
+      // Already narrowed: re-prune iff the survivors' antichain is strictly narrower than the
+      // recorded cover — unequal AND contained by it. A survivor OUTSIDE the recorded cover
+      // means the record is DEGRADED (a live-root source `Rescan` rewound the claim to the
+      // empty cover): the survivors' keys are not proof of coverage there, and re-pruning
+      // would RECORD a cover the source never re-proved — the fire-and-forget `set_cover`
+      // retains-and-releases, it never establishes — so a later newcomer under it would
+      // classify Covered-INSIDE and commit over the unproven region. Skip the reclaim and
+      // keep the degraded record: it broadens only through an awaited successful grow.
       Some(cover) => {
         let survivor_antichain = antichain(survivor_keys);
-        (survivor_antichain != cover).then_some((root_handle, survivor_antichain))
+        let contained = survivor_antichain
+          .iter()
+          .all(|key| cover.iter().any(|c| key.starts_with(c.as_slice())));
+        (contained && survivor_antichain != cover).then_some((root_handle, survivor_antichain))
       }
     }
   }
