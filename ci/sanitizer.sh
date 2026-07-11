@@ -23,7 +23,7 @@ cargo test --tests --target "$TARGET" --all-features
 # umbrella lib's own fs-source integration module. The sans-I/O core, view,
 # subsume, demux, and coalesce suites all stay under MSAN.
 RUSTFLAGS="-Z sanitizer=memory" \
-cargo -Zbuild-std test --lib --target "$TARGET" --all-features --workspace --exclude tributary-fs -- --skip source::tests::integration
+cargo -Zbuild-std test --lib --target "$TARGET" --all-features --workspace --exclude tributary-fs -- --skip source::fs::tests::integration
 
 # Run thread sanitizer (requires -Zbuild-std for instrumented std)
 RUSTFLAGS="-Z sanitizer=thread" \
