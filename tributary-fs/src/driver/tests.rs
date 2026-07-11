@@ -2044,6 +2044,177 @@ mod descending {
         "an unknown scope is skipped at command time"
       );
     }
+
+    /// How many enumerates have been executed at `path`.
+    fn enumerates_at(rig: &Rig, path: &str) -> usize {
+      rig
+        .fs
+        .enumerates()
+        .iter()
+        .filter(|(_, p)| p == std::path::Path::new(path))
+        .count()
+    }
+
+    /// Out-of-window coverage loss through the public API: an overflow lands
+    /// AFTER a clean settle with NO reconcile pending, then the SAME cover is
+    /// re-issued. The loss must degrade the recorded claim, so the re-issue
+    /// re-attempts real arm work and its ack inherits the still-unobserved
+    /// loss (`Degraded`); a second re-issue then settles `Applied`. Fail-on-old
+    /// twice over: without the out-of-window handling the first re-issue
+    /// computes an EMPTY broadening delta (no work) and settles `Applied` over
+    /// whatever the overflow cost, and the second re-issue re-arms nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn out_of_window_overflow_degrades_then_reissue_applies() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+      // Grow back to the full pair and settle clean: the recorded claim is
+      // truthful and no fence entry remains.
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      assert_eq!(resolved(ack).await, CoverOutcome::Applied);
+
+      // Hold enumerates so the overflow's recovery re-arm cannot quiesce: the
+      // loss memory stays unobserved until the re-issued cover's fence opens
+      // into it (the deterministic stand-in for a reconcile racing the loss).
+      let hold = rig.fs.hold_enumerates();
+      rig.fs.send_lossy("/r");
+      // The overflow's covering Rescan reaching the consumer proves the loss
+      // was routed (and, with the fix, the claim degraded).
+      loop {
+        let (_scope, change) = next_event(&rig).await;
+        if change.kind().is_rescan() {
+          break;
+        }
+      }
+
+      // Re-issue the IDENTICAL cover: the degraded claim yields a full
+      // broadening delta, so the reconcile re-arms the retained set; its fence
+      // shares the loss's still-unobserved window.
+      let first = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      let mut first = Box::pin(first);
+      for _ in 0..25 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(first.as_mut()).is_pending(),
+        "the re-issue pends on the held recovery — never an instant clean settle over the loss"
+      );
+      hold.release();
+      assert_eq!(
+        resolved(first).await,
+        CoverOutcome::Degraded,
+        "the first re-issue inherits the unobserved out-of-window loss"
+      );
+
+      // The second re-issue starts a fresh window against the (still degraded)
+      // claim: real re-arm work again, settling clean this time.
+      let keep_reads = enumerates_at(&rig, "/r/keep");
+      let drop_reads = enumerates_at(&rig, "/r/drop");
+      let second = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      assert_eq!(
+        resolved(second).await,
+        CoverOutcome::Applied,
+        "the clean re-issue re-proves the claim"
+      );
+      assert!(
+        enumerates_at(&rig, "/r/keep") > keep_reads && enumerates_at(&rig, "/r/drop") > drop_reads,
+        "the re-issue re-arms the FULL retained set against the degraded claim"
+      );
+    }
+
+    /// A saturated, continuously-refilled command channel must not starve op
+    /// completions: op results are polled before commands, so a held grow's
+    /// arm still lands, its scope still settles, and the awaited ack still
+    /// resolves while the spam continues. Under the old command-first arm
+    /// order this ack hangs until the `resolved` deadline trips: each spam
+    /// command is a reply-less SetCover whose reconcile walks the scope's
+    /// whole watch table (the cover here spans dozens of watches), so
+    /// consuming one costs far more than producing one and the slot-filling
+    /// spammers keep the command branch ready at every loop-top poll — the
+    /// starvation is a cost ratio, which is why cheap spam (a ghost unwatch)
+    /// cannot reproduce it: the tight consume loop out-races production and
+    /// the branch reads not-ready often enough for op results to slip in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_flood_does_not_starve_op_completions() {
+      use std::sync::atomic::{AtomicBool, Ordering};
+
+      // A scope wide enough that every spam reconcile's watch-table walk has
+      // real cost: keep + drop + 30 filler directories. The cold inventory
+      // (32 `Created`s) stays under the rig's 64-slot event channel, so no
+      // lag Rescan can pollute the fence verdict.
+      let filler: Vec<String> = (0..30).map(|i| format!("/r/d{i:02}")).collect();
+      let mut children: Vec<(&str, u64)> = vec![("/r/keep", 11), ("/r/drop", 12)];
+      children.extend(
+        filler
+          .iter()
+          .enumerate()
+          .map(|(i, p)| (p.as_str(), 100 + i as u64)),
+      );
+      let (rig, scope) = covered_rig(&children).await;
+      let full_cover: Vec<&str> = children.iter().map(|(p, _)| *p).collect();
+      let without_drop: Vec<&str> = full_cover
+        .iter()
+        .copied()
+        .filter(|p| *p != "/r/drop")
+        .collect();
+
+      // Prune /r/drop only (instant clean settle), then grow it back with the
+      // arms held: the ack now waits on op completions — the root's re-arm
+      // cascade and the parked /r/drop arm — that the flood will try to starve.
+      let ack = send_set_cover(&rig, scope, &without_drop).await;
+      assert_eq!(resolved(ack).await, CoverOutcome::Applied);
+      let hold = rig.fs.hold_arms();
+      let ack = send_set_cover(&rig, scope, &full_cover).await;
+      // The reconcile has been applied once its re-arm read of the root
+      // re-executed (its second /r enumerate); the /r/drop arm it queued is
+      // parked on the hold.
+      settle(|| enumerates_at(&rig, "/r") >= 2).await;
+
+      // Saturate the 16-slot command channel with reply-less SetCovers of the
+      // scope's own full cover — each reconcile re-walks every watch against
+      // every retained prefix and changes nothing (the delta against the
+      // recorded cover is empty, nothing is outside it, no fence is opened) —
+      // continuously refilled from tasks that fill EVERY free slot per wakeup.
+      let stop = std::sync::Arc::new(AtomicBool::new(false));
+      let spam_cover: Vec<PathBuf> = full_cover.iter().map(PathBuf::from).collect();
+      let mut spammers = Vec::new();
+      for _ in 0..4 {
+        let commands = rig.commands.clone();
+        let stop = std::sync::Arc::clone(&stop);
+        let spam_cover = spam_cover.clone();
+        spammers.push(tokio::spawn(async move {
+          while !stop.load(Ordering::Relaxed) {
+            loop {
+              match commands.try_send(Command::SetCover {
+                scope,
+                retained: spam_cover.clone(),
+                reply: None,
+              }) {
+                Ok(()) => {}
+                Err(async_channel::TrySendError::Full(_)) => break,
+                Err(async_channel::TrySendError::Closed(_)) => return,
+              }
+            }
+            tokio::task::yield_now().await;
+          }
+        }));
+      }
+      // Let the flood establish before the held op completes.
+      tokio::time::sleep(Duration::from_millis(100)).await;
+      hold.release();
+
+      // The op results and the settlement make progress under sustained
+      // command pressure: the ack resolves within the bounded await.
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "op completions and fence settlements outrank the command flood"
+      );
+      stop.store(true, Ordering::Relaxed);
+      for spammer in spammers {
+        let _ = spammer.await;
+      }
+    }
   }
 }
 

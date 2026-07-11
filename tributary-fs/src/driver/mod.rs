@@ -323,22 +323,22 @@ const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
 }
 
 /// Resolves every parked set-cover acknowledgement whose fence has settled —
-/// the loop-top (and close-drain) choke point. A fence is opened only when a
-/// reply exists, so every reported settlement finds its sender unless the
-/// close path already dropped it.
+/// the loop-top (and close-drain) choke point. It first prunes the parked
+/// senders whose receiver is gone (the caller cancelled its `set_cover`
+/// await): the fence itself still settles and updates the core's cover
+/// bookkeeping, but nobody is left to answer, and on a scope that stays busy
+/// the abandoned sender would otherwise pin memory until that settle. The
+/// prune is O(parked) per pass, and it means a reported settlement may
+/// legitimately find no sender.
 fn resolve_cover_settlements(
   core: &mut DriverCore,
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
 ) {
+  cover_replies.retain(|_, reply| !reply.is_canceled());
   for (fence, settle) in core.poll_cover_settlements() {
-    let reply = cover_replies.remove(&fence);
-    debug_assert!(
-      reply.is_some(),
-      "every opened fence parks exactly one reply"
-    );
-    if let Some(reply) = reply {
-      // The caller may have cancelled its await; settlement already updated
-      // the core's cover bookkeeping either way.
+    // A missing sender is a cancelled caller (pruned above, or dropped at
+    // close); settlement already updated the core's bookkeeping either way.
+    if let Some(reply) = cover_replies.remove(&fence) {
       let _ = reply.send(settle_outcome(settle));
     }
   }
@@ -1189,56 +1189,19 @@ pub(crate) async fn run<R, F>(
     .fuse();
     futures_util::pin_mut!(timer);
 
+    // Arm order is the starvation fence: INTERNAL, self-limiting inputs drain
+    // before externally replenishable ones. Op results and grant unwinds are
+    // completions of work this loop itself dispatched (bounded by what is
+    // outstanding), and the core deadline only fires at instants the core armed
+    // and re-arms strictly later — none can stay ready forever, so polling them
+    // first cannot starve the later arms. The COMMAND channel can: a saturated,
+    // continuously-refilled mailbox keeps a command-first order permanently
+    // ready, so arm/enumerate completions are never consumed, scopes never
+    // settle, and every reconciled SetCover appends fence + reply state without
+    // bound. Commands still outrank the source-event stream (the one order that
+    // is load-bearing the other way): events are budget-backpressured but
+    // effectively endless, and Close arrives on the command channel.
     futures_util::select_biased! {
-      cmd = commands.recv().fuse() => match cmd {
-        Ok(Command::Watch { root, interest, reply }) => {
-          let requested = root.clone();
-          let scope = core.on_watch(root, interest, config.profile);
-          watch_replies.insert(scope, PendingWatch { requested, reply });
-        }
-        Ok(Command::Unwatch { scope, reply }) => {
-          if handles.contains_key(&scope) || watch_replies.contains_key(&scope) {
-            // The awaited form records its waiter (answered at scope-dead); the reply-less
-            // `request_unwatch` tears down identically but registers none.
-            if let Some(reply) = reply {
-              unwatch_replies.insert(scope, reply);
-            }
-            core.on_unwatch(scope);
-          } else if let Some(reply) = reply {
-            // Unknown scope: only the awaited form is answered — the reply-less request is
-            // fire-and-forget, so a no-op teardown is silently complete.
-            let _ = reply.send(false);
-          }
-        }
-        Ok(Command::SetCover { scope, retained, reply }) => {
-          // In-place bidirectional coverage reconcile. The core is the authority on whether
-          // a reconcile ran: every refusal — unknown scope, not yet publicly live,
-          // kernel-recursive profile, refused cover — comes back as a typed `Noop` and is
-          // acknowledged IMMEDIATELY, never fenced. A reconcile that RAN parks its reply
-          // under a fence opened right here, before any other core input, so the fence
-          // inherits exactly this reconcile's window (a born-lossy coalesced grow
-          // included); the loop-top `resolve_cover_settlements` answers it once the
-          // scope's re-arm work quiesces. A reply-less reconcile (`request_set_cover`)
-          // opens no fence — its window still feeds the settlement bookkeeping,
-          // unacknowledged.
-          match core.on_set_cover(scope, &retained) {
-            CoverReconcile::Reconciling => {
-              if let Some(reply) = reply {
-                let fence = core.open_cover_fence(scope);
-                cover_replies.insert(fence, reply);
-              }
-            }
-            CoverReconcile::Noop(reason) => {
-              if let Some(reply) = reply {
-                let _ = reply.send(noop_outcome(reason));
-              }
-            }
-          }
-        }
-        Ok(Command::Close { reply }) => break Some(reply),
-        // The watcher facade dropped: same orderly teardown, nobody to tell.
-        Err(_) => break None,
-      },
       res = op_rx.recv().fuse() => {
         match res.expect("the driver holds a sender") {
           OpResult::Spawned { scope, result } => {
@@ -1410,6 +1373,55 @@ pub(crate) async fn run<R, F>(
         }
       },
       _ = timer => core.on_timeout(now()),
+      cmd = commands.recv().fuse() => match cmd {
+        Ok(Command::Watch { root, interest, reply }) => {
+          let requested = root.clone();
+          let scope = core.on_watch(root, interest, config.profile);
+          watch_replies.insert(scope, PendingWatch { requested, reply });
+        }
+        Ok(Command::Unwatch { scope, reply }) => {
+          if handles.contains_key(&scope) || watch_replies.contains_key(&scope) {
+            // The awaited form records its waiter (answered at scope-dead); the reply-less
+            // `request_unwatch` tears down identically but registers none.
+            if let Some(reply) = reply {
+              unwatch_replies.insert(scope, reply);
+            }
+            core.on_unwatch(scope);
+          } else if let Some(reply) = reply {
+            // Unknown scope: only the awaited form is answered — the reply-less request is
+            // fire-and-forget, so a no-op teardown is silently complete.
+            let _ = reply.send(false);
+          }
+        }
+        Ok(Command::SetCover { scope, retained, reply }) => {
+          // In-place bidirectional coverage reconcile. The core is the authority on whether
+          // a reconcile ran: every refusal — unknown scope, not yet publicly live,
+          // kernel-recursive profile, refused cover — comes back as a typed `Noop` and is
+          // acknowledged IMMEDIATELY, never fenced. A reconcile that RAN parks its reply
+          // under a fence opened right here, before any other core input, so the fence
+          // inherits exactly this reconcile's window (a born-lossy coalesced grow
+          // included); the loop-top `resolve_cover_settlements` answers it once the
+          // scope's re-arm work quiesces. A reply-less reconcile (`request_set_cover`)
+          // opens no fence — its window still feeds the settlement bookkeeping,
+          // unacknowledged.
+          match core.on_set_cover(scope, &retained) {
+            CoverReconcile::Reconciling => {
+              if let Some(reply) = reply {
+                let fence = core.open_cover_fence(scope);
+                cover_replies.insert(fence, reply);
+              }
+            }
+            CoverReconcile::Noop(reason) => {
+              if let Some(reply) = reply {
+                let _ = reply.send(noop_outcome(reason));
+              }
+            }
+          }
+        }
+        Ok(Command::Close { reply }) => break Some(reply),
+        // The watcher facade dropped: same orderly teardown, nobody to tell.
+        Err(_) => break None,
+      },
       msg = os.next() => {
         if let Some((scope, msg)) = msg {
           match msg {

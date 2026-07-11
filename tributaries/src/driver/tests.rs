@@ -1270,6 +1270,106 @@ async fn grow_then_unwatch_non_root_reprunes() {
   );
 }
 
+/// A live-root source `Rescan` degrades the root's NARROWED retained-cover record to the
+/// empty cover: the loss signal means the recorded claim may span a hole, so a newcomer
+/// that would have classified Covered-INSIDE (committing with NO grow — silently unwatched
+/// over the hole) instead classifies Covered-OUTSIDE and drives a coverage-re-proving grow.
+/// Fail-on-old: without the degrade, the post-`Rescan` newcomer under the retained cover
+/// commits with zero `Grow` calls and its subtree stays dead until an unrelated reconcile.
+#[tokio::test]
+async fn source_rescan_degrades_the_retained_cover_so_newcomers_regrow() {
+  let mut h = Harness::new();
+
+  // Narrow the wide /a root to {/a/b}: widen /a over /a/b, then drop the widening /a (PRUNE).
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+  h.unwatch(s_a).expect("unwatch the widening /a");
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b")]),
+    "the prune narrowed the record to {{/a/b}}"
+  );
+  let _ = h.drain();
+
+  // Baseline: a newcomer INSIDE the retained cover commits with no grow.
+  let _s_inside = h
+    .watch("/a/b/deep", Interest::all())
+    .await
+    .expect("a covered-inside newcomer commits");
+  assert!(
+    !h.owner
+      .source
+      .calls()
+      .iter()
+      .any(|c| matches!(c, Call::Grow(handle, _) if *handle == wide)),
+    "inside the retained cover no grow is needed"
+  );
+
+  // The source signals coverage loss on the LIVE root (an overflow / failed re-arm
+  // Rescan): mirror the loop's live-root sequence — retire (no-op, the root is live),
+  // degrade, fan out.
+  let loss = rescan_event(wide, "/a/b", 1);
+  assert!(
+    !h.owner.retire_if_dead(&loss),
+    "a live root's Rescan is not a retirement"
+  );
+  h.owner.degrade_retained_cover_on_rescan(&loss);
+  h.owner.fan_out_and_push(&loss);
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![]),
+    "the narrowed record degraded to the empty cover — it claims nothing below the root"
+  );
+  let _ = h.drain();
+
+  // A newcomer that WOULD have been covered-inside now re-proves coverage via grow, and
+  // the record broadens exactly to the grown cover.
+  let _s2 = h
+    .watch("/a/b/deeper", Interest::all())
+    .await
+    .expect("the post-loss newcomer commits through a re-proving grow");
+  let grows: Vec<Call> = h
+    .owner
+    .source
+    .calls()
+    .into_iter()
+    .filter(|c| matches!(c, Call::Grow(handle, _) if *handle == wide))
+    .collect();
+  assert_eq!(
+    grows.len(),
+    1,
+    "the post-loss newcomer drove exactly one grow"
+  );
+  let Call::Grow(_, grown) = &grows[0] else {
+    unreachable!("filtered to grows");
+  };
+  assert!(
+    grown
+      .iter()
+      .any(|k| key("/a/b/deeper").starts_with(k.as_slice())),
+    "the grown antichain covers the newcomer, got {grown:?}"
+  );
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/b/deeper")),
+    "the newcomer's subtree is genuinely covered after the grow"
+  );
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(grown.clone()),
+    "the record broadened exactly to the grown cover"
+  );
+}
+
 /// Grow-before-commit (ratified R1): a Covered-outside newcomer whose awaited [`Source::grow`]
 /// FAILS fails the `watch()` with the retryable `CoverageIncomplete` — never a committed
 /// subscription whose subtree has no kernel backing and no retry owner. The record is NOT broadened

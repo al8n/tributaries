@@ -2520,6 +2520,29 @@ fn set_cover_refuses_unknown_and_kernel_recursive_scopes() {
   );
 }
 
+/// A kernel-recursive scope's `Rescan` churn creates NO set-cover loss memory:
+/// its coverage never narrows (`on_set_cover` refuses it before recording
+/// anything), so `applied_cover` is never `Some`, there is no claim to
+/// degrade, and the route-time loss handling skips the scope entirely rather
+/// than cycling map entries on every overflow.
+#[test]
+fn kernel_recursive_rescan_creates_no_loss_memory() {
+  let (mut core, scope) = live_core();
+  core.on_root_overflow(scope, at(2));
+  let effects = drain(&mut core);
+  assert!(
+    emits(&effects).iter().any(|c| c.kind().is_rescan()),
+    "the overflow's covering Rescan is delivered: {effects:?}"
+  );
+  assert!(
+    core.cover_fences.is_empty(),
+    "no loss-memory entry for a kernel-recursive scope"
+  );
+  let state = core.scopes.get(&scope).unwrap();
+  assert_eq!(state.applied_cover, None);
+  assert_eq!(state.settle_floor, None);
+}
+
 mod lowering {
   use super::*;
 
@@ -4141,12 +4164,14 @@ mod descending {
     );
   }
 
-  /// A `Rescan` passing `route_event` inside the window degrades the fence,
-  /// and the lossy settle REWINDS `applied_cover` to the settle floor — so
-  /// re-issuing the same cover computes a NON-empty broadening delta and the
-  /// grow re-attempts. This is the applied-cover-lie regression: without the
-  /// rewind, the re-issue would compute an empty delta and settle clean over
-  /// the hole the failed arm left.
+  /// A `Rescan` passing `route_event` inside the window degrades the fence
+  /// AND immediately degrades the coverage claim to the EMPTY cover (the
+  /// `Rescan`'s cause is opaque — an overflow recovery can drop a survivor,
+  /// so no narrower claim is provable) — so re-issuing the same cover
+  /// computes a FULL broadening delta and the grow re-attempts. This is the
+  /// applied-cover-lie regression: without the degrade, the re-issue would
+  /// compute an empty delta and settle clean over the hole the failed arm
+  /// left.
   #[test]
   fn lossy_window_degrades_and_rewinds_the_applied_cover() {
     let (mut core, scope, _root) = shrunk_to_keep();
@@ -4197,7 +4222,8 @@ mod descending {
       "the failed arm stands a covering Rescan: {effects:?}"
     );
     // The failure ended the obligation (dropped-with-standing-Rescan): the
-    // fence settles Degraded and the applied cover rewinds to the floor.
+    // fence settles Degraded. The Rescan already degraded the claim at route
+    // time, so the settle-time rewind lands on the same degraded floor.
     assert_eq!(
       core.poll_cover_settlements(),
       vec![(fence, CoverSettle::Degraded)]
@@ -4205,13 +4231,13 @@ mod descending {
     let state = core.scopes.get(&scope).unwrap();
     assert_eq!(
       state.applied_cover,
-      Some(vec![p("/r/keep")]),
-      "the lossy settle rewinds the applied cover to the provable floor"
+      Some(Vec::new()),
+      "the loss degrades the claim to the empty cover — nothing below the root is claimed"
     );
     assert_eq!(
       state.settle_floor,
-      Some(vec![p("/r/keep")]),
-      "the floor stays on a lossy settle — it IS the floor"
+      Some(Vec::new()),
+      "the settle floor folds down with the degraded claim"
     );
     // The regression: re-issuing the SAME cover must re-attempt the grow.
     assert_eq!(
@@ -4223,7 +4249,7 @@ mod descending {
       effects
         .iter()
         .any(|e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r"))),
-      "the rewound cover yields a non-empty broadening delta — the grow re-attempts: {effects:?}"
+      "the degraded claim yields a full broadening delta — the grow re-attempts: {effects:?}"
     );
   }
 
@@ -4294,9 +4320,9 @@ mod descending {
   /// The reply-less-reconcile interaction, both directions: (i) a coalesced
   /// reconcile with NO fence of its own (`request_set_cover` is reply-less)
   /// still marks every ALREADY-PENDING fence of the scope lossy; (ii) the loss
-  /// memory clears with the settle observation, so a fence opened for a LATER
-  /// reconcile — after the latent obligation escalated and quiesced — resolves
-  /// `Applied`: nothing leaks across windows.
+  /// memory clears with the settle OBSERVATION, so a fence opened for a LATER
+  /// reconcile — after the latent obligation escalated, quiesced, and was
+  /// observed — resolves `Applied`: nothing leaks past an observation.
   #[test]
   fn reply_less_coalesce_marks_pending_fences_and_clears_at_settle() {
     let (mut core, scope, root_watch) = shrunk_to_keep();
@@ -4356,8 +4382,9 @@ mod descending {
     assert!(core.cover_fences.is_empty());
 
     // The latent obligation completes: the dirtied cold read escalates (a
-    // covering Rescan plus a counted re-arm retry). With no fence entry the
-    // Rescan marks nothing — the rewind above already under-claimed.
+    // covering Rescan plus a counted re-arm retry). The Rescan records fresh
+    // loss memory — an entry of its own, no reconcile needed — and degrades
+    // the rewound claim to the empty cover.
     core.on_enumerated(cold, listed(Vec::new()));
     let effects = drain(&mut core);
     assert!(
@@ -4365,8 +4392,16 @@ mod descending {
       "the dirtied read's completion emits the covering Rescan: {effects:?}"
     );
     assert!(
-      core.cover_fences.is_empty(),
-      "a Rescan with no unobserved reconcile records nothing"
+      core
+        .cover_fences
+        .get(&scope)
+        .is_some_and(|entry| entry.lossy),
+      "the Rescan records loss memory even with no unobserved reconcile"
+    );
+    assert_eq!(
+      core.scopes.get(&scope).unwrap().applied_cover,
+      Some(Vec::new()),
+      "the Rescan degrades the claim to the empty cover"
     );
     let retry = effects
       .iter()
@@ -4378,10 +4413,17 @@ mod descending {
     core.on_enumerated(retry, listed(Vec::new()));
     let _ = drain(&mut core);
     assert!(core.monitor.rearm_settled(scope), "the escalation quiesced");
+    // The settle OBSERVATION clears the Rescan's pending-empty entry (no fence
+    // to resolve) — only now does the loss memory stop marking new fences.
+    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    assert!(
+      core.cover_fences.is_empty(),
+      "the observation clears the entry the Rescan created"
+    );
 
-    // (ii) A LATER reconcile's fence starts clean: the memory did not leak.
-    // The rewound cover makes /r/drop a real broadening delta again; its watch
-    // is now Live, so the re-arm is counted work that settles clean.
+    // (ii) A LATER reconcile's fence starts clean: the observed memory did not
+    // leak. The degraded claim makes BOTH prefixes a real broadening delta;
+    // the watches are Live, so the re-arms are counted work that settles clean.
     assert_eq!(
       core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
       CoverReconcile::Reconciling
@@ -4391,7 +4433,7 @@ mod descending {
     assert_eq!(
       core.poll_cover_settlements(),
       vec![(later, CoverSettle::Applied)],
-      "the cleared memory does not leak onto a later unrelated fence"
+      "the observed memory does not leak onto a later fence"
     );
   }
 
@@ -4480,6 +4522,182 @@ mod descending {
       core.poll_cover_settlements(),
       Vec::new(),
       "resolution is one-shot"
+    );
+  }
+
+  /// Answers every enumerate in `effects` (the root with `root_listing`,
+  /// children empty), then quiesces whatever that feeds — the overflow-recovery
+  /// helper for the out-of-window loss suites, whose assertions need the
+  /// drained effects before the cascade is served.
+  fn serve_enumerates_then_quiesce(core: &mut DriverCore, effects: &[Effect]) {
+    for effect in effects {
+      if let Effect::Enumerate { req, path, .. } = effect {
+        let listing = if path.as_path() == Path::new("/r") {
+          root_listing()
+        } else {
+          Vec::new()
+        };
+        core.on_enumerated(*req, listed(listing));
+      }
+    }
+    run_cascade(core, &BTreeMap::from([("/r", root_listing())]));
+  }
+
+  /// Out-of-window coverage loss: a covering `Rescan` landing AFTER a clean
+  /// settle observation and BEFORE the next reconcile — no fence entry exists
+  /// — must not leave `applied_cover` falsely authoritative. The `Rescan`
+  /// creates the loss-memory entry and immediately degrades the claim to the
+  /// EMPTY cover, so re-issuing the IDENTICAL cover computes a full broadening
+  /// delta and re-arms the retained set; without the degrade the re-issue's
+  /// delta is empty — no repair, an instant clean settle, `Applied` over the
+  /// hole. The honest two-step: the first re-issue's fence inherits the
+  /// pre-reissue loss memory and settles `Degraded`; the second re-issue after
+  /// that observation settles `Applied`.
+  #[test]
+  fn out_of_window_loss_degrades_the_claim_and_the_reissue_reproves() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    // Grow back to {keep, drop} and OBSERVE the clean settle: the claim is
+    // truthful and no fence entry remains — the out-of-window start state.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Applied)]
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "no fence entry survives the clean settle"
+    );
+
+    // The out-of-window loss: an overflow's covering Rescan with no reconcile
+    // in flight. The recovery re-arm itself quiesces cleanly — the standing
+    // Rescan is the only loss evidence left behind.
+    core.on_root_overflow(scope, at(9));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the overflow stands a public covering Rescan: {effects:?}"
+    );
+    serve_enumerates_then_quiesce(&mut core, &effects);
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "the overflow recovery quiesced — the loss is fully out-of-window"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.applied_cover,
+      Some(Vec::new()),
+      "the loss degrades the claim immediately: nothing below the root is claimed"
+    );
+    assert_eq!(
+      state.settle_floor,
+      Some(Vec::new()),
+      "the settle floor folds down with the claim"
+    );
+    assert!(
+      core
+        .cover_fences
+        .get(&scope)
+        .is_some_and(|entry| entry.lossy),
+      "the Rescan created the loss-memory entry no reconcile had opened"
+    );
+
+    // First re-issue of the IDENTICAL cover: the degraded claim yields a FULL
+    // broadening delta, so both retained prefixes re-arm.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let first = core.open_cover_fence(scope);
+    let effects = drain(&mut core);
+    for retained in ["/r/keep", "/r/drop"] {
+      assert!(
+        effects.iter().any(
+          |e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new(retained))
+        ),
+        "the re-issue re-arms {retained} against the degraded claim: {effects:?}"
+      );
+    }
+    serve_enumerates_then_quiesce(&mut core, &effects);
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(first, CoverSettle::Degraded)],
+      "the first re-issue inherits the pre-reissue loss memory"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.applied_cover,
+      Some(Vec::new()),
+      "the lossy settle rewinds to the degraded floor — the claim stays unproven"
+    );
+
+    // Second re-issue after the observation: a fresh window, a full delta
+    // again, and a clean settle that finally re-proves the claim.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let second = core.open_cover_fence(scope);
+    let effects = drain(&mut core);
+    serve_enumerates_then_quiesce(&mut core, &effects);
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(second, CoverSettle::Applied)],
+      "the clean re-issue applies honestly"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(state.applied_cover, Some(vec![p("/r/keep"), p("/r/drop")]));
+    assert_eq!(
+      state.settle_floor, state.applied_cover,
+      "the clean settle resets the floor to the re-proven claim"
+    );
+    assert!(core.cover_fences.is_empty());
+  }
+
+  /// The entry-creating mark cannot leak: an out-of-window `Rescan` on a scope
+  /// with NO narrowing record creates a pending-empty loss-memory entry and
+  /// degrades nothing (there is no claim — a never-narrowed scope self-heals
+  /// through the Monitor's own re-arm), and the next settle observation clears
+  /// the entry exactly like any other, reporting no fences.
+  #[test]
+  fn out_of_window_loss_without_a_claim_clears_at_the_next_observation() {
+    let (mut core, scope, req, _root) = live_descending();
+    core.on_enumerated(req, listed(root_listing()));
+    run_cascade(&mut core, &BTreeMap::new());
+    assert!(core.monitor.rearm_settled(scope));
+
+    core.on_root_overflow(scope, at(5));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the overflow stands a public covering Rescan: {effects:?}"
+    );
+    serve_enumerates_then_quiesce(&mut core, &effects);
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.applied_cover, None,
+      "a never-narrowed scope has no claim to degrade"
+    );
+    assert_eq!(state.settle_floor, None);
+    assert!(
+      core
+        .cover_fences
+        .get(&scope)
+        .is_some_and(|entry| entry.lossy),
+      "the loss memory is recorded even with no reconcile in flight"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "a pending-empty entry resolves no fence"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "the observation clears the entry — nothing leaks"
     );
   }
 }

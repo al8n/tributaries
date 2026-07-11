@@ -936,6 +936,32 @@ where
     self.publish();
   }
 
+  /// Degrades a NARROWED retained-cover record (`Some(cover)`) for the root `handle` to the
+  /// EMPTY cover — the claim that nothing below the root is source-covered — so every later
+  /// newcomer under it classifies Covered-OUTSIDE and re-proves coverage through
+  /// [`grow`](crate::LocalSource::grow) before its commit broadens the record again. The
+  /// response to a live-root source `Rescan`: the loss signal means the recorded claim may
+  /// span a hole, and trusting it would commit newcomers with no kernel backing. A
+  /// never-narrowed record (`None` — full coverage, healed by the source's own re-arm
+  /// machinery), an already-empty record, and an unknown handle are untouched.
+  pub(crate) fn degrade_retained_cover(&mut self, handle: H) {
+    let Some(root_key) = self.by_handle.get(&handle).cloned() else {
+      return;
+    };
+    let Some(record) = self.index.get(&root_key) else {
+      return;
+    };
+    if record.retained_cover.as_ref().is_none_or(Vec::is_empty) {
+      return;
+    }
+    let mut record = record.clone();
+    record.retained_cover = Some(Vec::new());
+    let mut txn = self.index.txn();
+    txn.insert(root_key.as_slice(), record);
+    self.index = txn.commit();
+    self.publish();
+  }
+
   /// The retained cover last recorded for the root `handle` (see
   /// [`set_retained_cover`](Self::set_retained_cover)): `Some(cover)` when the source coverage was
   /// narrowed to the antichain `cover`, `None` for full coverage or an unknown handle. The by-handle

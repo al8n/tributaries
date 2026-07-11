@@ -1119,6 +1119,7 @@ where
         // root) returns `false` and fans out normally here.
         Some(event) => {
           if !owner.retire_if_dead(&event) {
+            owner.degrade_retained_cover_on_rescan(&event);
             owner.fan_out_and_push(&event);
           }
           Flow::Continue
@@ -2423,6 +2424,24 @@ where
   /// same dead handle (e.g. the `Rescan` after a `Removed` already retired the root) finds no
   /// live root, so [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan)
   /// returns early and nothing is double-retired.
+  /// A live-root source `Rescan` is a coverage-loss signal from the layer that owns the
+  /// kernel watches: whatever narrowing the retained-cover record claims for that root may
+  /// now span the lost region — trusting it would let a later newcomer classify
+  /// Covered-INSIDE and commit without a [`grow`](LocalSource::grow), silently unwatched.
+  /// Degrade a narrowed record (`Some(cover)`) to the EMPTY cover — claiming nothing below
+  /// the root — so the next newcomer under it classifies Covered-OUTSIDE and drives `grow`,
+  /// which re-proves coverage against the source's own (equally degraded) claim before the
+  /// commit broadens anything. A never-narrowed record (`None`) has no stale claim: the
+  /// source's own re-arm machinery heals plain overflow, and the delivered `Rescan` already
+  /// tells every subscriber to re-scan. Umbrella-minted `Rescan`s (sheds, re-points,
+  /// terminals) never pass through the source-drain path, so no spurious degrade can occur.
+  fn degrade_retained_cover_on_rescan(&mut self, raw: &SourceEvent<C, S::Handle>) {
+    if !raw.kind().is_rescan() {
+      return;
+    }
+    self.subsumer.degrade_retained_cover(raw.handle());
+  }
+
   fn retire_if_dead(&mut self, raw: &SourceEvent<C, S::Handle>) -> bool {
     // A still-live root: normal fan-out (an overflow `Rescan` on a live root is NOT a retirement).
     if self.source.root_key(raw.handle()).is_some() {
