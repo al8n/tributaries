@@ -1370,6 +1370,81 @@ async fn source_rescan_degrades_the_retained_cover_so_newcomers_regrow() {
   );
 }
 
+/// An unwatch after the degrade must NOT resurrect the coverage claim: the shrink detector
+/// re-prunes only when the survivor antichain is CONTAINED by the recorded cover, and after
+/// a degrade to the empty cover no survivor is — the survivors' keys are membership, not
+/// proof of coverage, and the fire-and-forget prune never establishes any. Fail-on-old:
+/// containment unchecked, the sibling unwatch "shrank" the empty record to the survivor
+/// antichain and recorded it as authoritative, so the follow-up newcomer classified
+/// Covered-INSIDE, skipped the grow, and committed over the unproven region.
+#[tokio::test]
+async fn post_degrade_unwatch_keeps_the_record_degraded_until_a_grow_re_proves() {
+  let mut h = Harness::new();
+
+  // A wide /a root narrowed to {/a/b}, then grown to {/a/b, /a/c} via a covered-outside watch.
+  let _s_b = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_a = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  let wide = h
+    .owner
+    .subsumer
+    .roots()
+    .find(|(k, _)| *k == key("/a").as_slice())
+    .map(|(_, handle)| handle)
+    .expect("the wide /a root is live");
+  h.unwatch(s_a).expect("unwatch the widening /a");
+  let s_c = h
+    .watch("/a/c", Interest::all())
+    .await
+    .expect("watch /a/c grows the cover");
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the grown record names both survivors"
+  );
+  let _ = h.drain();
+
+  // The source signals coverage loss; the claim degrades to the empty cover.
+  let loss = rescan_event(wide, "/a", 1);
+  assert!(!h.owner.retire_if_dead(&loss));
+  h.owner.degrade_retained_cover_on_rescan(&loss);
+  h.owner.fan_out_and_push(&loss);
+  assert_eq!(h.owner.subsumer.retained_cover_of(wide), Some(vec![]));
+  let calls_before = h.owner.source.calls().len();
+
+  // A sibling unwatch must neither re-prune nor resurrect the claim.
+  h.unwatch(s_c).expect("unwatch the /a/c sibling");
+  assert_eq!(
+    h.owner.subsumer.retained_cover_of(wide),
+    Some(vec![]),
+    "the record stays degraded across the unwatch — survivors are not proof of coverage"
+  );
+  assert!(
+    !h.owner.source.calls()[calls_before..]
+      .iter()
+      .any(|c| matches!(c, Call::SetCover(handle, _) if *handle == wide)),
+    "no reclaim prune is issued against a degraded record"
+  );
+
+  // The next newcomer under the surviving cover still re-proves coverage via grow.
+  let _s2 = h
+    .watch("/a/b/x", Interest::all())
+    .await
+    .expect("the post-unwatch newcomer commits through a re-proving grow");
+  let grows: Vec<Call> = h.owner.source.calls()[calls_before..]
+    .iter()
+    .filter(|c| matches!(c, Call::Grow(handle, _) if *handle == wide))
+    .cloned()
+    .collect();
+  assert_eq!(grows.len(), 1, "the newcomer drove the re-proving grow");
+  assert!(
+    h.owner.source.actual_covers(wide, &key("/a/b/x")),
+    "the newcomer's subtree is genuinely covered after the grow"
+  );
+}
+
 /// Grow-before-commit (ratified R1): a Covered-outside newcomer whose awaited [`Source::grow`]
 /// FAILS fails the `watch()` with the retryable `CoverageIncomplete` — never a committed
 /// subscription whose subtree has no kernel backing and no retry owner. The record is NOT broadened
