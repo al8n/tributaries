@@ -1043,3 +1043,35 @@ mod lifecycle {
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
+
+/// Forcing another platform's primitive fails the watch with the typed
+/// [`SourceError::ForeignBackend`](crate::SourceError::ForeignBackend) — never
+/// a silent ignore and never a fallback. The real seam rejects the selection
+/// before any platform spawn (or its FFI) runs, so the refusal is identical on
+/// every host.
+#[cfg(not(miri))]
+#[tokio::test]
+async fn foreign_backend_is_a_typed_spawn_error() {
+  let foreign = if cfg!(target_os = "linux") {
+    crate::Backend::Rdcw
+  } else {
+    crate::Backend::Inotify
+  };
+  let dir = scratch_dir("foreign-backend");
+  let watcher =
+    Watcher::<TokioRuntime>::new(WatcherOptions::new().with_backend(foreign)).expect("build");
+
+  let err = watcher
+    .watch(&dir, Interest::all())
+    .await
+    .expect_err("a foreign selection can never start");
+  assert!(
+    matches!(
+      err,
+      WatchRootError::Source(crate::SourceError::ForeignBackend { requested }) if requested == foreign
+    ),
+    "{err:?}"
+  );
+  watcher.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&dir);
+}

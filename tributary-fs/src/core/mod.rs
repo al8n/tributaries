@@ -1187,8 +1187,12 @@ impl DriverCore {
           // Kernel-recursive: the live stream IS the root's coverage, so the
           // spawn doubles as the root's watch-result AND the moment the caller's
           // grant commits inline — public delivery begins here. fanotify's one
-          // superblock mark covers the whole root exactly like FSEvents.
-          BackendKind::FsEvents | BackendKind::Fanotify => {
+          // superblock mark and the Windows primitives' subtree streams cover
+          // the whole root exactly like FSEvents.
+          BackendKind::FsEvents
+          | BackendKind::Fanotify
+          | BackendKind::Rdcw
+          | BackendKind::UsnJournal => {
             state.publicly_live = true;
             self.monitor.on_watch_result(watch, Ok(()));
           }
@@ -1869,6 +1873,22 @@ impl DriverCore {
           batch.trailing.push(Planned::Over(Scope::Root(scope)));
         }
         batch
+      }
+      // No Windows payload variant exists yet (it lands with the os::windows
+      // pump), so a batch reaching a Windows-profiled scope is a seam bug in
+      // its entirety: every event degrades to the covering root rescan,
+      // never a wrong lowering.
+      BackendKind::Rdcw | BackendKind::UsnJournal => {
+        debug_assert!(false, "no source feeds a Windows-profiled scope yet");
+        drop(events);
+        PendingBatch {
+          items: Vec::new(),
+          awaiting: 0,
+          trailing: vec![Planned::Over(Scope::Root(scope))],
+          permit: None,
+          deferred_unmounts: Vec::new(),
+          evidenced: BTreeMap::new(),
+        }
       }
     }
   }
@@ -2817,9 +2837,11 @@ fn path_bytes(path: &Path) -> &[u8] {
 fn caps_for(backend: BackendKind) -> Capabilities {
   let caps = Capabilities::new().with_supports_push().with_native_move();
   match backend {
-    // Both kernel-recursive backends register the KR profile: one native
+    // Every kernel-recursive backend registers the KR profile: one native
     // stream covers the whole root, so the Monitor never descends.
-    BackendKind::FsEvents | BackendKind::Fanotify => caps.with_kernel_recursive(),
+    BackendKind::FsEvents | BackendKind::Fanotify | BackendKind::Rdcw | BackendKind::UsnJournal => {
+      caps.with_kernel_recursive()
+    }
     BackendKind::Inotify => caps,
   }
 }

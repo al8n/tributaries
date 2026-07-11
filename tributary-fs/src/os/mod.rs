@@ -43,6 +43,7 @@ pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
 /// registration intended against it, and the `Backend::Auto` probe records the
 /// selection it settled on here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackendKind {
   /// macOS FSEvents — kernel-recursive; flag words are hints.
   FsEvents,
@@ -53,6 +54,15 @@ pub enum BackendKind {
   /// selected by `Backend::Auto` when its preconditions hold, or forced by
   /// [`Backend::Fanotify`].
   Fanotify,
+  /// Windows `ReadDirectoryChangesW` — kernel-recursive, unprivileged; the
+  /// per-volume fallback when the USN journal is unusable, or forced by
+  /// [`Backend::Rdcw`].
+  Rdcw,
+  /// Windows USN change journal — kernel-recursive, journal-cursor sourced;
+  /// volume-handle access effectively requires elevation. Selected by
+  /// `Backend::Auto` when its per-volume preconditions hold, or forced by
+  /// [`Backend::UsnJournal`].
+  UsnJournal,
 }
 
 impl BackendKind {
@@ -63,6 +73,8 @@ impl BackendKind {
       Self::FsEvents => "fsevents",
       Self::Inotify => "inotify",
       Self::Fanotify => "fanotify",
+      Self::Rdcw => "rdcw",
+      Self::UsnJournal => "usn-journal",
     }
   }
 
@@ -70,7 +82,10 @@ impl BackendKind {
   /// as opposed to the descending, per-directory inotify profile.
   #[must_use]
   pub const fn is_kernel_recursive(&self) -> bool {
-    matches!(self, Self::FsEvents | Self::Fanotify)
+    matches!(
+      self,
+      Self::FsEvents | Self::Fanotify | Self::Rdcw | Self::UsnJournal
+    )
   }
 }
 
@@ -227,28 +242,39 @@ impl BackendStatsShared {
 /// `Some` only for a fanotify source.
 pub(crate) type BackendStatsHandle = std::sync::Arc<BackendStatsShared>;
 
-/// The Linux watch primitive a [`Watcher`](crate::Watcher) should use for each
+/// The watch primitive a [`Watcher`](crate::Watcher) should use for each
 /// root, chosen through [`WatcherOptions::backend`](crate::WatcherOptions::backend).
 ///
-/// [`Auto`](Self::Auto) is the default: the spawn barrier probes for
+/// [`Auto`](Self::Auto) is the default and is native on every platform: the
+/// spawn barrier resolves it to the host's primitive — Linux probes for
 /// fanotify-FILESYSTEM (privileged, kernel-recursive) and falls back to inotify
-/// (unprivileged, the Linux 4.11 baseline) at the first failing probe — a per-root decision
-/// made once, before the stream goes live, never retried. The two explicit
-/// variants pin the choice: [`Inotify`](Self::Inotify) skips the probe;
-/// [`Fanotify`](Self::Fanotify) runs it and surfaces the first failure as a
-/// typed spawn error rather than falling back.
+/// (unprivileged, the Linux 4.11 baseline) at the first failing probe; macOS
+/// resolves to FSEvents; Windows prefers the USN journal per volume and falls
+/// back to `ReadDirectoryChangesW` — a per-root decision made once, before the
+/// stream goes live, never retried.
 ///
-/// macOS ignores this — FSEvents is its one backend.
+/// An explicit variant pins one platform's primitive. On the platform that owns
+/// it, forcing either skips the probe (inotify, RDCW) or hardens it (fanotify,
+/// USN journal — the first failing precondition is a typed spawn error, never a
+/// fallback). On any other platform a forced variant fails the spawn with
+/// [`ForeignBackend`](SourceError::ForeignBackend) — never a silent ignore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Backend {
-  /// Probe for fanotify, fall back to inotify — the per-root default.
+  /// Resolve the host's primitive at the spawn barrier — the per-root default.
   #[default]
   Auto,
-  /// inotify — per-directory, unprivileged; the probe is skipped.
+  /// Linux inotify — per-directory, unprivileged; the probe is skipped.
   Inotify,
-  /// fanotify-FILESYSTEM — kernel-recursive, privileged; a failing precondition
-  /// is a typed spawn error, not a fallback.
+  /// Linux fanotify-FILESYSTEM — kernel-recursive, privileged; a failing
+  /// precondition is a typed spawn error, not a fallback.
   Fanotify,
+  /// Windows `ReadDirectoryChangesW` — kernel-recursive, unprivileged.
+  Rdcw,
+  /// Windows USN change journal — kernel-recursive; volume-handle access
+  /// effectively requires elevation, and a failing precondition is a typed
+  /// spawn error, not a fallback.
+  UsnJournal,
 }
 
 impl Backend {
@@ -259,6 +285,8 @@ impl Backend {
       Self::Auto => "auto",
       Self::Inotify => "inotify",
       Self::Fanotify => "fanotify",
+      Self::Rdcw => "rdcw",
+      Self::UsnJournal => "usn-journal",
     }
   }
 
@@ -278,6 +306,32 @@ impl Backend {
   #[must_use]
   pub const fn is_fanotify(&self) -> bool {
     matches!(self, Self::Fanotify)
+  }
+
+  /// Whether the selection forces `ReadDirectoryChangesW`.
+  #[must_use]
+  pub const fn is_rdcw(&self) -> bool {
+    matches!(self, Self::Rdcw)
+  }
+
+  /// Whether the selection forces the USN change journal.
+  #[must_use]
+  pub const fn is_usn_journal(&self) -> bool {
+    matches!(self, Self::UsnJournal)
+  }
+
+  /// Whether this selection can start on the compiling host platform:
+  /// [`Auto`](Self::Auto) everywhere (the barrier resolves it), an explicit
+  /// variant only on the platform whose primitive it names. The real spawn
+  /// seam rejects a foreign selection with
+  /// [`SourceError::ForeignBackend`] before any platform code reads it.
+  #[must_use]
+  pub const fn native_to_host(&self) -> bool {
+    match self {
+      Self::Auto => true,
+      Self::Inotify | Self::Fanotify => cfg!(target_os = "linux"),
+      Self::Rdcw | Self::UsnJournal => cfg!(target_os = "windows"),
+    }
   }
 }
 
@@ -439,11 +493,11 @@ pub(crate) struct SourceConfig {
   pub(crate) latency: Duration,
   /// Capacity of the callback→driver channel, in callback batches.
   pub(crate) channel_capacity: NonZeroUsize,
-  /// Which Linux backend the spawn barrier selects. Ignored on macOS (FSEvents
-  /// is the one backend); on Linux [`Backend::Auto`] probes for fanotify and
-  /// falls back to inotify, while the explicit variants pin the choice.
-  // Only the linux backend reads this; every other build sees it as dead.
-  #[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
+  /// The per-root backend selection the spawn barrier honors. The real spawn
+  /// seam rejects a selection foreign to the host
+  /// ([`SourceError::ForeignBackend`]) before any platform code reads it; on
+  /// Linux [`Backend::Auto`] probes for fanotify and falls back to inotify,
+  /// while the explicit variants pin the choice.
   pub(crate) backend: Backend,
   /// The fanotify admission-map directory cap (design §4.9); `None` = uncapped.
   /// A seed/reseed walk that would exceed it makes fanotify unviable (fall back
@@ -600,6 +654,14 @@ pub enum SourceError {
     /// The precondition stage that failed.
     stage: ProbeStage,
   },
+  /// The forced backend names another platform's primitive, so it can never
+  /// start on this host. [`Backend::Auto`] is never foreign — the spawn
+  /// barrier resolves it to the host's own primitive.
+  #[error("the {} backend does not exist on this platform", requested.as_str())]
+  ForeignBackend {
+    /// The foreign selection.
+    requested: Backend,
+  },
   /// The decode callback panicked; the stream is poisoned.
   #[error("the event callback panicked")]
   CallbackPanic,
@@ -635,5 +697,55 @@ impl ResumeToken {
   /// A token is only valid for resuming against the identical UUID.
   pub(crate) const fn device_uuid(&self) -> Option<[u8; 16]> {
     self.device_uuid
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{Backend, BackendKind};
+
+  #[test]
+  fn backend_tags_are_stable() {
+    assert_eq!(Backend::Auto.as_str(), "auto");
+    assert_eq!(Backend::Inotify.as_str(), "inotify");
+    assert_eq!(Backend::Fanotify.as_str(), "fanotify");
+    assert_eq!(Backend::Rdcw.as_str(), "rdcw");
+    assert_eq!(Backend::UsnJournal.as_str(), "usn-journal");
+    assert_eq!(BackendKind::FsEvents.as_str(), "fsevents");
+    assert_eq!(BackendKind::Inotify.as_str(), "inotify");
+    assert_eq!(BackendKind::Fanotify.as_str(), "fanotify");
+    assert_eq!(BackendKind::Rdcw.as_str(), "rdcw");
+    assert_eq!(BackendKind::UsnJournal.as_str(), "usn-journal");
+  }
+
+  #[test]
+  fn inotify_is_the_one_descending_profile() {
+    assert!(BackendKind::FsEvents.is_kernel_recursive());
+    assert!(!BackendKind::Inotify.is_kernel_recursive());
+    assert!(BackendKind::Fanotify.is_kernel_recursive());
+    assert!(BackendKind::Rdcw.is_kernel_recursive());
+    assert!(BackendKind::UsnJournal.is_kernel_recursive());
+  }
+
+  #[test]
+  fn auto_is_native_everywhere_and_explicit_variants_are_host_scoped() {
+    assert!(Backend::Auto.native_to_host());
+    let linux = cfg!(target_os = "linux");
+    let windows = cfg!(target_os = "windows");
+    assert_eq!(Backend::Inotify.native_to_host(), linux);
+    assert_eq!(Backend::Fanotify.native_to_host(), linux);
+    assert_eq!(Backend::Rdcw.native_to_host(), windows);
+    assert_eq!(Backend::UsnJournal.native_to_host(), windows);
+  }
+
+  #[test]
+  fn predicates_name_their_variant() {
+    assert!(Backend::Auto.is_auto());
+    assert!(Backend::Inotify.is_inotify());
+    assert!(Backend::Fanotify.is_fanotify());
+    assert!(Backend::Rdcw.is_rdcw());
+    assert!(Backend::UsnJournal.is_usn_journal());
+    assert!(!Backend::Auto.is_rdcw());
+    assert!(!Backend::Rdcw.is_usn_journal());
   }
 }

@@ -785,6 +785,11 @@ impl FsOps for RealFs {
   type Handle = SourceHandle;
 
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
+    if !config.backend.native_to_host() {
+      return Err(SourceError::ForeignBackend {
+        requested: config.backend,
+      });
+    }
     // The spawn itself mints the RootMeta — canonical root, device, and the
     // mount seed are all finalized BEFORE the stream starts delivering, so
     // the metadata is a safe authority for every event on the queue; deriving
@@ -1298,9 +1303,13 @@ pub(crate) async fn run<R, F>(
                     }
                   }
                   // Kernel-recursive: the live stream IS the coverage, so the
-                  // grant commits inline. fanotify's superblock mark covers the
-                  // whole root exactly like FSEvents.
-                  BackendKind::FsEvents | BackendKind::Fanotify => {
+                  // grant commits inline. fanotify's superblock mark and the
+                  // Windows primitives' subtree streams cover the whole root
+                  // exactly like FSEvents.
+                  BackendKind::FsEvents
+                  | BackendKind::Fanotify
+                  | BackendKind::Rdcw
+                  | BackendKind::UsnJournal => {
                     let owned = match pending {
                       Some(pending) => {
                         commit_grant(pending, scope, canonical_root, &unwind_tx)
@@ -1747,6 +1756,9 @@ fn clone_error(err: &SourceError) -> SourceError {
     },
     SourceError::StartFailed => SourceError::StartFailed,
     SourceError::BackendProbeFailed { stage } => SourceError::BackendProbeFailed { stage: *stage },
+    SourceError::ForeignBackend { requested } => SourceError::ForeignBackend {
+      requested: *requested,
+    },
     SourceError::CallbackPanic => SourceError::CallbackPanic,
   }
 }

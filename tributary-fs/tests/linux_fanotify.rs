@@ -1211,7 +1211,7 @@ async fn selection_matrix_auto_self_probes() {
       "fanotify was selected without CAP_SYS_ADMIN — the FILESYSTEM mark cannot have passed"
     ),
     BackendKind::Inotify => { /* the fallback: valid in either mode */ }
-    BackendKind::FsEvents => panic!("FSEvents is impossible on Linux"),
+    other => panic!("{other} is impossible on Linux"),
   }
   if privileged {
     assert_eq!(

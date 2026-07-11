@@ -66,8 +66,9 @@ impl WatcherOptions {
   /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
   pub const MAX_EXCLUSIONS: usize = crate::os::MAX_EXCLUSIONS;
 
-  /// The default per-root backend selection: [`Backend::Auto`] — probe for
-  /// fanotify-FILESYSTEM, fall back to inotify (Linux; ignored on macOS).
+  /// The default per-root backend selection: [`Backend::Auto`] — resolved to
+  /// the host's own primitive at the spawn barrier (Linux probes for
+  /// fanotify-FILESYSTEM and falls back to inotify).
   pub const DEFAULT_BACKEND: Backend = Backend::Auto;
 
   /// The default periodic root-liveness interval (30 s) — the detection-latency
@@ -231,12 +232,15 @@ impl WatcherOptions {
 
   /// The per-root backend selection.
   ///
-  /// On Linux, [`Backend::Auto`] (the default) probes for fanotify-FILESYSTEM
-  /// per root inside the pre-start barrier and falls back to inotify at the
-  /// first failing probe; [`Backend::Inotify`] and [`Backend::Fanotify`] pin
-  /// the choice (a forced `Fanotify` whose preconditions do not hold fails its
-  /// `watch` with a typed [`WatchRootError::Source`](crate::WatchRootError::Source),
-  /// never a silent fallback). macOS ignores this — FSEvents is its one backend.
+  /// [`Backend::Auto`] (the default) resolves to the host's own primitive
+  /// inside the pre-start barrier — on Linux it probes for fanotify-FILESYSTEM
+  /// per root and falls back to inotify at the first failing probe. An explicit
+  /// variant pins one platform's primitive: forced-and-failing preconditions
+  /// surface as a typed
+  /// [`WatchRootError::Source`](crate::WatchRootError::Source) (never a silent
+  /// fallback), and forcing a variant on a platform that does not own it fails
+  /// the same way with [`SourceError::ForeignBackend`](crate::SourceError::ForeignBackend)
+  /// (never a silent ignore).
   #[inline]
   pub const fn backend(&self) -> Backend {
     self.backend
