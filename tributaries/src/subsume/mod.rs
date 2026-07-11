@@ -556,7 +556,7 @@ where
     // rules out any strict descendant. The covering root is armed `Interest::all`
     // (design §4), so it carries every kind this newcomer could ask for.
     if let Some(record) = self.index.get_ancestor(key) {
-      // Covered-OUTSIDE (set-cover ): the covering root's source coverage was narrowed (`retained_cover`
+      // Covered-OUTSIDE (the set-cover reconcile): the covering root's source coverage was narrowed (`retained_cover`
       // is `Some`) to prefixes NONE of which is an ancestor-or-equal of this newcomer's key. The
       // source pruned that region, so `commit_watch` — which arms nothing — would leave the newcomer
       // advertised-yet-uncovered until the driver's awaited grow lands (applied before the watch
@@ -655,7 +655,7 @@ where
           handle: fs_root,
           subscribers: std::vec![*sub],
           // A freshly-armed root covers its whole key (`Interest::all`) — full coverage, never
-          // narrowed (set-cover ).
+          // narrowed (a set-cover prune).
           retained_cover: None,
         };
         let mut txn = self.index.txn();
@@ -906,7 +906,7 @@ where
     Some(antichain(subscriber_keys))
   }
 
-  /// Records the source's ACTUAL coverage for the root `handle` (set-cover ) — the bookkeeping
+  /// Records the source's ACTUAL coverage for the root `handle` (the set-cover record) — the bookkeeping
   /// [`plan_watch`](Self::plan_watch) reads to decide a `Covered` newcomer's
   /// [`outside_cover`](WatchOutcome::Covered::outside_cover). `Some(cover)` records a narrowing to the
   /// antichain `cover`; `None` records **full** coverage — a fresh/widened root (never narrowed) or a
