@@ -15,3 +15,4 @@ pub(super) mod fanotify;
 pub(super) mod fsevents;
 pub(super) mod inotify;
 pub(super) mod rdcw;
+pub(super) mod usn;

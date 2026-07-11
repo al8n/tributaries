@@ -72,6 +72,11 @@ pub(crate) fn is_unc_remote(path: &std::path::Path) -> bool {
 pub(crate) enum RawWindowsEvent {
   /// One `ReadDirectoryChangesW` event after rename pairing.
   Rdcw(RdcwEvent),
+  /// One admitted USN journal event.
+  // The journal source constructs this once it lands; the core lowering
+  // and its suites already consume it.
+  #[allow(dead_code)]
+  Usn(usn::UsnAdmitted),
 }
 
 /// One completion buffer's full pure pipeline — decode, pair, and wrap into

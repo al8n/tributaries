@@ -5866,3 +5866,184 @@ mod rdcw_lowering {
     );
   }
 }
+
+/// The USN lowering: admitted journal events on a kernel-recursive Windows
+/// scope — pre-resolved targets lower directly, atomic renames through the
+/// counter-cookie path, the root death and the map overflow as terminals.
+mod usn_lowering {
+  use super::*;
+  use crate::os::windows::{
+    RawWindowsEvent,
+    usn::{UsnAdmitted, UsnTarget, reason},
+  };
+
+  fn payload(events: Vec<UsnAdmitted>) -> BatchPayload {
+    BatchPayload::detached(
+      events
+        .into_iter()
+        .map(|event| SourceEvent::Windows(RawWindowsEvent::Usn(event)))
+        .collect(),
+    )
+  }
+
+  fn live_scope(core: &mut DriverCore) -> ScopeId {
+    let scope = core.on_watch(
+      PathBuf::from("/r"),
+      Interest::all(),
+      BackendKind::UsnJournal,
+    );
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::UsnJournal,
+      }),
+    );
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    scope
+  }
+
+  fn resolved(components: &[&str]) -> UsnTarget {
+    UsnTarget::Resolved(components.iter().map(|c| (*c).to_owned()).collect())
+  }
+
+  #[test]
+  fn deltas_lower_by_the_verb_partition() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(
+      scope,
+      payload(vec![
+        UsnAdmitted::Single {
+          delta: reason::FILE_CREATE | reason::DATA_EXTEND,
+          target: resolved(&["a", "new.txt"]),
+          is_dir: false,
+        },
+        UsnAdmitted::Single {
+          delta: reason::DATA_OVERWRITE,
+          target: resolved(&["a", "new.txt"]),
+          is_dir: false,
+        },
+        UsnAdmitted::Single {
+          delta: reason::SECURITY_CHANGE,
+          target: resolved(&["a"]),
+          is_dir: true,
+        },
+      ]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 3, "{emitted:?}");
+    assert!(emitted[0].kind().is_created(), "structural wins the merge");
+    assert_eq!(emitted[0].location(), &loc(&["a", "new.txt"]));
+    assert!(emitted[1].kind().is_modified());
+    assert!(
+      emitted[2].kind().is_modified(),
+      "Attrib folds to the consumer's Modified: {emitted:?}"
+    );
+  }
+
+  #[test]
+  fn an_admitted_rename_becomes_one_moved() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(
+      scope,
+      payload(vec![UsnAdmitted::Renamed {
+        old: resolved(&["a", "old.txt"]),
+        new: resolved(&["b", "new.txt"]),
+        is_dir: false,
+      }]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(
+      emitted[0].kind().moved_from(),
+      Some(&loc(&["a", "old.txt"]))
+    );
+    assert_eq!(emitted[0].location(), &loc(&["b", "new.txt"]));
+  }
+
+  #[test]
+  fn hard_links_ground_through_a_located_rescan() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(
+      scope,
+      payload(vec![UsnAdmitted::Single {
+        delta: reason::HARD_LINK_CHANGE,
+        target: resolved(&["a", "linked"]),
+        is_dir: false,
+      }]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1);
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&["a", "linked"]),
+      "link-count direction is grounded by the re-read: {emitted:?}"
+    );
+  }
+
+  #[test]
+  fn escalations_cover_the_parent() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(
+      scope,
+      payload(vec![UsnAdmitted::Single {
+        delta: reason::DATA_OVERWRITE,
+        target: UsnTarget::EscalateAt(vec!["a".into()]),
+        is_dir: false,
+      }]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&["a"]),
+      "{emitted:?}"
+    );
+  }
+
+  #[test]
+  fn the_root_death_ends_the_scope_loudly() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(scope, payload(vec![UsnAdmitted::RootDeath]), at(1));
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(
+      emitted
+        .iter()
+        .any(|c| c.kind().is_removed() || c.kind().is_rescan()),
+      "the death owes its terminal delivery: {emitted:?}"
+    );
+  }
+
+  #[test]
+  fn a_map_overflow_covers_the_root() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(scope, payload(vec![UsnAdmitted::MapOverflow]), at(1));
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1);
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&[]),
+      "{emitted:?}"
+    );
+  }
+}
