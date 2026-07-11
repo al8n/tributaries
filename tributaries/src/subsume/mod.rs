@@ -195,9 +195,9 @@ pub(crate) type Shared<C, V, H> = Arc<ArcSwap<Published<C, V, H>>>;
 /// subscription's own interest is a fan-out gate held in its [`SubRecord`].
 ///
 /// It also records the [`retained_cover`](Self::retained_cover) — the source's **actual coverage**
-/// for this root (set-cover ) — so [`plan_watch`](Subsumer::plan_watch) can tell whether a later
+/// for this root (set-cover) — so [`plan_watch`](Subsumer::plan_watch) can tell whether a later
 /// `Covered` newcomer falls OUTSIDE that (possibly-narrowed) coverage and so needs an awaited
-/// [`Source::grow`](crate::Source::grow) to reclaim real coverage before the watch returns.
+/// [`Source::grow`](crate::Source::grow) to reclaim real coverage before the watch can commit.
 #[derive(Debug, Clone)]
 pub(crate) struct RootRecord<C, H> {
   /// The root's key (== its radix key).
@@ -206,15 +206,16 @@ pub(crate) struct RootRecord<C, H> {
   pub(crate) handle: H,
   /// Every caller subscription this root serves, in registration order.
   pub(crate) subscribers: Vec<Subscription>,
-  /// The source's ACTUAL coverage for this root (set-cover ): `None` = **full** coverage (a
+  /// The source's ACTUAL coverage for this root (set-cover): `None` = **full** coverage (a
   /// fresh/widened root never narrowed, or one grown back to its own key — the cancel-equivalent),
   /// `Some(cover)` = narrowed to the prefix-free antichain `cover`. Kept EXACT — it names the source's
   /// true current coverage, not an optimistic projection — because it is updated in lockstep with the
   /// source's applied coverage via [`set_retained_cover`](Subsumer::set_retained_cover): NARROWED on a
   /// [`Source::set_cover`](crate::Source::set_cover) PRUNE issue (fire-and-forget, so recorded
   /// pessimistically at issue — narrow-on-issue), and BROADENED on a
-  /// [`Source::grow`](crate::Source::grow) RETURN (awaited and applied-before-return, so broadening at
-  /// that instant matches live coverage — broaden-on-return). Read by
+  /// [`Source::grow`](crate::Source::grow) **`Ok`** (awaited and applied before that `Ok`, so
+  /// broadening at that instant matches live coverage — broaden-on-`Ok`; a failed grow broadens
+  /// nothing, since the watch aborts uncommitted — R1). Read by
   /// [`plan_watch`](Subsumer::plan_watch): a `Covered` newcomer under NONE of a `Some` cover's
   /// prefixes lies in a pruned region the source no longer backs, so its commit regains no real
   /// coverage until an awaited grow lands ([`WatchOutcome::Covered::outside_cover`]).
@@ -222,7 +223,7 @@ pub(crate) struct RootRecord<C, H> {
 }
 
 impl<C, H> RootRecord<C, H> {
-  /// Whether `key` falls OUTSIDE this root's actual coverage (set-cover ) — the
+  /// Whether `key` falls OUTSIDE this root's actual coverage (set-cover) — the
   /// [`outside_cover`](WatchOutcome::Covered::outside_cover) accessor
   /// [`plan_watch`](Subsumer::plan_watch) folds into a `Covered` outcome: `true` iff the root was
   /// **narrowed** ([`retained_cover`](Self::retained_cover) is `Some`) and `key` lies under NONE of
@@ -252,14 +253,15 @@ pub(crate) enum WatchOutcome<C, H> {
     fs_root: H,
     /// The new subscription.
     sub: Subscription,
-    /// Whether the newcomer's key falls OUTSIDE the covering root's actual coverage (set-cover ):
+    /// Whether the newcomer's key falls OUTSIDE the covering root's actual coverage (set-cover):
     /// `true` iff the root was **narrowed** ([`retained_cover`](RootRecord::retained_cover) is
     /// `Some`) and the newcomer's key lies under NONE of its retained prefixes — the source pruned
-    /// that region, so this `Covered` commit (which arms nothing) regains no real kernel coverage on
-    /// its own. The driver then AWAITS a [`Source::grow`](crate::Source::grow) to a fresh cover that
-    /// includes the newcomer, applied-before-return, so coverage is live before the watch returns (no
-    /// bridging `Rescan` needed). `false` when the root is at full coverage (`None`) or the newcomer
-    /// is already inside the retained cover — the source already backs it.
+    /// that region, so a `Covered` commit (which arms nothing) would regain no real kernel coverage
+    /// on its own. The driver then AWAITS a [`Source::grow`](crate::Source::grow) to a fresh cover
+    /// that includes the newcomer BEFORE committing (grow-before-commit, R1): on `Ok` coverage is
+    /// live before the watch returns (no bridging `Rescan` needed); on `Err` the watch fails with
+    /// nothing committed and the record unbroadened. `false` when the root is at full coverage
+    /// (`None`) or the newcomer is already inside the retained cover — the source already backs it.
     outside_cover: bool,
   },
   /// The key is a strict ancestor of one or more existing roots, which it subsumes.
@@ -856,24 +858,30 @@ where
     }
   }
 
-  /// The retained cover naming every live subscriber of the root `handle`, recomputed from the root's
-  /// **current** membership — or `None` when a live subscriber's key still equals the root's own key
-  /// (legitimately pinning the whole coverage). `Some` is the minimal prefix-free [`antichain`] of
-  /// every live subscriber's key (the narrowest set under which they all still sit); a handle naming
-  /// no live root is `None` (nothing to cover).
+  /// The retained cover naming every live subscriber of the root `handle` — plus the
+  /// `newcomer` key when one is supplied — recomputed from the root's **current** membership; or
+  /// `None` when one of those keys still equals the root's own key (legitimately pinning the whole
+  /// coverage). `Some` is the minimal prefix-free [`antichain`] of the collected keys (the narrowest
+  /// set under which they all still sit); a handle naming no live root is `None` (nothing to cover).
   ///
-  /// The driver reads this on a **Covered-outside** commit to compute the fresh cover it GROWS the
-  /// source up to (set-cover ): the newcomer arms nothing, so the umbrella recomputes the current cover —
-  /// which now INCLUDES the newcomer — awaits [`Source::grow`](crate::Source::grow) to it (applied
-  /// before return), then records it via [`set_retained_cover`](Self::set_retained_cover) so the
-  /// record broadens EXACTLY to the source's live coverage. `None` means a subscriber now pins the
-  /// root at its own key, so the driver grows back to the **cancel-equivalent** (the root's own key —
+  /// The driver reads this on a **Covered-outside** watch to compute the fresh cover it GROWS the
+  /// source up to (set-cover, grow-BEFORE-commit): the newcomer arms nothing AND is **not yet
+  /// committed** when the grow is issued — the umbrella only broadens state after the awaited grow
+  /// returns `Ok` — so its key is passed **explicitly** as `newcomer` rather than read from the
+  /// committed membership. On the grow's `Ok` the driver commits and records the same cover via
+  /// [`set_retained_cover`](Self::set_retained_cover), so the record broadens EXACTLY to the
+  /// source's live coverage. `None` means a key (a survivor's, or the newcomer's own) pins the root
+  /// at its own key, so the driver grows back to the **cancel-equivalent** (the root's own key —
   /// full coverage) and records `None`. Unlike [`detect_shrink`](Self::detect_shrink) (which decides
   /// reclaim from a *departing* key on an unwatch), this is a pure membership query.
-  pub(crate) fn retained_cover_for(&self, handle: H) -> Option<Vec<Vec<C>>> {
+  pub(crate) fn retained_cover_for(
+    &self,
+    handle: H,
+    newcomer: Option<&[C]>,
+  ) -> Option<Vec<Vec<C>>> {
     let root_key = self.by_handle.get(&handle)?;
     let record = self.index.get(root_key)?;
-    let subscriber_keys: Vec<Vec<C>> = record
+    let mut subscriber_keys: Vec<Vec<C>> = record
       .subscribers
       .iter()
       .map(|s| {
@@ -884,7 +892,10 @@ where
           .expect("a live root's subscriber is live in the side table")
       })
       .collect();
-    // A subscriber still at the root key keeps the whole coverage legitimately watched — not
+    if let Some(extra) = newcomer {
+      subscriber_keys.push(extra.to_vec());
+    }
+    // A key still at the root key keeps the whole coverage legitimately watched — not
     // over-broad; the driver grows back to the cancel-equivalent (full coverage) instead.
     if subscriber_keys
       .iter()
@@ -905,8 +916,9 @@ where
   /// holds, so the record stays EXACT: NARROWED on a [`Source::set_cover`](crate::Source::set_cover)
   /// PRUNE issue (the over-broad-unwatch shrink and the non-root re-prune — narrow-on-issue, safe
   /// pessimism for a fire-and-forget prune) and BROADENED on a [`Source::grow`](crate::Source::grow)
-  /// RETURN (the Covered-outside grow and its cancel-equivalent — broaden-on-return, when the awaited
-  /// grow has already applied, so the record never runs ahead of live coverage). A no-op for an
+  /// **`Ok`** (the Covered-outside grow and its cancel-equivalent — broaden-on-`Ok`, when the awaited
+  /// grow has already applied, so the record never runs ahead of live coverage; a failed grow
+  /// broadens NOTHING — the watch is aborted instead, ratified R1). A no-op for an
   /// unknown handle (nothing to record). Republishes so the read plane's `roots` snapshot stays in
   /// lockstep with the index (no [`WatchView`] reader consults `retained_cover`, but the two planes
   /// are always swapped together — design §5).

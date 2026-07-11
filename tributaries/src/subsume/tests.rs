@@ -553,7 +553,7 @@ fn retained_cover_for_tracks_current_membership() {
 
   // The /a subscriber still pins the wide root at its own key → not over-broad → None.
   assert_eq!(
-    s.retained_cover_for(wide),
+    s.retained_cover_for(wide, None),
     None,
     "a subscriber at the root key pins it — not over-broad, so the re-issue is the cancel-equivalent"
   );
@@ -561,14 +561,14 @@ fn retained_cover_for_tracks_current_membership() {
   // Drop the /a subscriber: the wide root now serves only the narrower /a/b, /a/c → over-broad.
   s.plan_unwatch(s_a).expect("unwatch the widening /a");
   assert_eq!(
-    s.retained_cover_for(wide),
+    s.retained_cover_for(wide, None),
     Some(vec![key("/a/b"), key("/a/c")]),
     "the recomputed cover is the CURRENT survivor antichain"
   );
 
   // An unknown handle names no live root → nothing to reclaim.
   assert_eq!(
-    s.retained_cover_for(9999),
+    s.retained_cover_for(9999, None),
     None,
     "an unknown handle has no cover"
   );
@@ -593,7 +593,7 @@ fn retained_cover_for_collapses_nested_survivors() {
   s.plan_unwatch(s_a).expect("unwatch the widening /a");
 
   assert_eq!(
-    s.retained_cover_for(wide),
+    s.retained_cover_for(wide, None),
     Some(vec![key("/a/b")]),
     "nested survivors /a/b and /a/b/c collapse to the single cover /a/b"
   );
@@ -618,7 +618,7 @@ fn retained_cover_for_includes_a_newly_covered_subscriber() {
   s.commit_watch(&outcome, wide, &key("/a"));
   s.plan_unwatch(s_a).expect("unwatch the widening /a");
   assert_eq!(
-    s.retained_cover_for(wide),
+    s.retained_cover_for(wide, None),
     Some(vec![key("/a/b")]),
     "before the covered newcomer, the cover is just the /a/b survivor"
   );
@@ -627,9 +627,57 @@ fn retained_cover_for_includes_a_newly_covered_subscriber() {
   let (rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
   assert_eq!(rc, wide, "the covered /a/c rides the wide root");
   assert_eq!(
-    s.retained_cover_for(wide),
+    s.retained_cover_for(wide, None),
     Some(vec![key("/a/b"), key("/a/c")]),
     "the covered /a/c JOINS the recomputed cover — the fresh membership, not the stale {{/a/b}}"
+  );
+}
+
+/// The explicit-`newcomer` parameter (grow-before-commit, R1): a Covered-outside newcomer's key is
+/// NOT yet committed when the driver computes the grow cover, so it joins the query explicitly —
+/// the cover is the survivors' antichain PLUS the newcomer, nested keys collapsing exactly as
+/// committed membership does, and a newcomer at the root's own key reports `None` (it pins the
+/// root — the driver grows the cancel-equivalent). The committed membership is untouched by the
+/// query (it is pure).
+#[test]
+fn retained_cover_for_joins_the_explicit_newcomer_before_commit() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  // Make /a over-broad, serving only /a/b: widen /a over /a/b, then drop the /a sub.
+  let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
+  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let s_a = match &outcome {
+    WatchOutcome::Widen { sub, .. } => *sub,
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  let wide = h.mint();
+  s.commit_watch(&outcome, wide, &key("/a"));
+  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+
+  // An uncommitted newcomer under a pruned region joins the cover explicitly.
+  assert_eq!(
+    s.retained_cover_for(wide, Some(&key("/a/c"))),
+    Some(vec![key("/a/b"), key("/a/c")]),
+    "the pre-commit newcomer's key joins the survivors' antichain"
+  );
+  // A newcomer nested under a survivor collapses into it (antichain minimality).
+  assert_eq!(
+    s.retained_cover_for(wide, Some(&key("/a/b/deep"))),
+    Some(vec![key("/a/b")]),
+    "a newcomer under a survivor prefix collapses into the existing cover"
+  );
+  // A newcomer at the root's own key pins the root: the driver grows the cancel-equivalent.
+  assert_eq!(
+    s.retained_cover_for(wide, Some(&key("/a"))),
+    None,
+    "a newcomer at the root key reports None — grow back to full coverage"
+  );
+  // The query is pure: the committed membership (and its cover) is unchanged.
+  assert_eq!(
+    s.retained_cover_for(wide, None),
+    Some(vec![key("/a/b")]),
+    "the explicit-newcomer query committed nothing"
   );
 }
 

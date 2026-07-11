@@ -8,7 +8,7 @@
 //! everything here is the binding's own business.
 
 use std::{
-  collections::{HashSet, VecDeque},
+  collections::{HashMap, HashSet, VecDeque},
   ffi::OsString,
   path::PathBuf,
   vec::Vec,
@@ -16,8 +16,8 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
-  Event as FsEvent, EventKind as FsEventKind, RootHandle, SourceError, WatchRootError, Watcher,
-  WatcherOptions,
+  CoverOutcome, Event as FsEvent, EventKind as FsEventKind, RootHandle, SkipReason, SourceError,
+  UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
 };
 use tributary_proto::Interest;
 
@@ -79,6 +79,25 @@ pub struct FsSource<R: RuntimeLite> {
   /// "`root_key` is `None` from `disarm` until the handle is fully gone" holds unbroken while the set
   /// stays bounded by in-flight releases.
   pending_set: HashSet<RootHandle>,
+  /// Prunes ([`set_cover`](Source::set_cover) requests) the watcher's control channel was momentarily
+  /// too full to accept — the contract's full-channel deferral (clause 3), **latest-wins per handle**
+  /// (clause 6): a re-request for a queued handle REPLACES its stale snapshot, and an awaited
+  /// [`grow`](Source::grow) for the handle REMOVES the queued prune outright (the grow's fresh cover
+  /// is newer and its applied coverage authoritative). Re-forwarded via
+  /// [`flush_deferred_prunes`](Self::flush_deferred_prunes) at the next op that touches the watcher
+  /// (`set_cover`, `grow`, `disarm`, `arm`). Bounded by the live-root count (one entry per handle);
+  /// entries for since-dead roots self-drain on the next flush (the reply-less request enqueues and
+  /// the driver skips the unknown scope). Losslessness is NOT required here (clause 5): entries still
+  /// queued at `Drop` are simply dropped — an unpruned root is merely over-broad, self-healing.
+  deferred_prunes: HashMap<RootHandle, Vec<PathBuf>>,
+  /// Awaited [`Watcher::set_cover`] round-trips [`grow`](Source::grow) actually performed — proves
+  /// the kernel-recursive short-circuit skipped the round-trip.
+  #[cfg(test)]
+  cover_round_trips: usize,
+  /// Deferred prunes successfully re-forwarded by [`flush_deferred_prunes`](Self::flush_deferred_prunes)
+  /// — distinguishes a grow's SUPERSEDED (removed, never forwarded) queued prune from a flushed one.
+  #[cfg(test)]
+  deferred_forwards: usize,
 }
 
 impl<R: RuntimeLite> core::fmt::Debug for FsSource<R> {
@@ -107,7 +126,44 @@ impl<R: RuntimeLite> FsSource<R> {
       pending_releases: VecDeque::new(),
       enqueued: Vec::new(),
       pending_set: HashSet::new(),
+      deferred_prunes: HashMap::new(),
+      #[cfg(test)]
+      cover_round_trips: 0,
+      #[cfg(test)]
+      deferred_forwards: 0,
     })
+  }
+
+  /// Queues a prune the control channel refused (momentarily full), **latest-wins per handle**
+  /// ([`Source::set_cover`] contract clause 6): a newer request for the same handle replaces the
+  /// stale snapshot, so a later flush never applies an outdated cover.
+  fn defer_prune(&mut self, handle: RootHandle, retained: Vec<PathBuf>) {
+    self.deferred_prunes.insert(handle, retained);
+  }
+
+  /// Re-forwards every deferred prune the control channel now has room for — the re-forward half of
+  /// the full-channel deferral ([`Source::set_cover`] contract clause 3), called at the top of every
+  /// op that touches the watcher (`set_cover`, `grow`, `disarm`, `arm`). Purely non-blocking: each
+  /// entry is handed over via the reply-less [`Watcher::request_set_cover`] `try_send`; an entry the
+  /// channel still refuses stays queued for the next flush (or is dropped at `Drop` — clause 5,
+  /// losslessness not required for a prune).
+  fn flush_deferred_prunes(&mut self) {
+    // Split-borrow: the watcher is a shared reborrow so `retain` can mutate the map.
+    let watcher = &self.watcher;
+    #[cfg(test)]
+    let mut forwards = 0usize;
+    self.deferred_prunes.retain(|handle, retained| {
+      let enqueued = watcher.request_set_cover(*handle, retained.clone());
+      #[cfg(test)]
+      if enqueued {
+        forwards += 1;
+      }
+      !enqueued
+    });
+    #[cfg(test)]
+    {
+      self.deferred_forwards += forwards;
+    }
   }
 }
 
@@ -169,6 +225,9 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
         .pending_set
         .retain(|handle| watcher.root_path(*handle).is_some());
     }
+    // An arm touches the watcher, so re-forward any full-channel-deferred prunes first
+    // (set_cover contract clause 3) — non-blocking `try_send`s, nothing awaited.
+    self.flush_deferred_prunes();
 
     // (a) OPPORTUNISTIC NON-BLOCKING application: hand a HARD-BOUNDED few pending releases to the
     // watcher's control channel via the reply-less `request_unwatch` (a `try_send`). On acceptance
@@ -296,51 +355,149 @@ impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
     // the named conflict, so it is only applied opportunistically. The `pending_set` mirror makes the
     // handle logically dead the instant this returns — `root_key` answers `None`. Idempotent by the
     // set: re-requesting an already-pending (or unknown/dead) handle is a no-op.
+    //
+    // A queued PRUNE of the released handle is superseded by the release (set_cover contract
+    // clause 4 — the whole root is going away), and a disarm is a watcher-touching op, so the other
+    // deferred prunes get their non-blocking re-forward here too (clause 3).
+    self.deferred_prunes.remove(&handle);
+    self.flush_deferred_prunes();
     if self.pending_set.insert(handle) {
       let root_path = self.watcher.root_path(handle);
       self.pending_releases.push_back((handle, root_path));
     }
   }
 
-  /// **Deferred no-op safe-disable.** The awaited GROW half of in-place coverage
-  /// reconcile is disabled for the fs source. `grow`'s hard contract is met **vacuously** here:
-  /// [`arm`](Self::arm) arms every root `Interest::all` over its **whole subtree** and this source's
-  /// actual coverage never narrows below a root (its [`set_cover`](Self::set_cover) is the matching
-  /// no-op), so every `retained` key already lies inside a live root's coverage — there is nothing to
-  /// grow back, and clause 1 ("coverage is live on return") holds trivially.
+  /// The awaited GROW half of in-place coverage reconcile, over the watcher's
+  /// **effect-completion fence**: [`Watcher::set_cover`]'s acknowledgement resolves when the
+  /// reconcile has *settled* — every re-armed watch live, or a loss already signaled in-band —
+  /// never at effect-queue time, which is exactly the applied-before-`Ok` fence the trait's
+  /// clause 1 demands. A kernel-recursive root (fanotify / FSEvents) short-circuits to `Ok`
+  /// before the round-trip: its single whole-subtree stream never narrowed, so there is nothing
+  /// to grow back ([`Watcher::backend_of`] is the a-priori report; the driver's own
+  /// [`Recursive`](CoverOutcome::Recursive) answer stays authoritative if the report races a
+  /// backend change and the round-trip runs anyway).
   ///
-  /// # Why disabled, not merely defaulted
+  /// A grow for `handle` supersedes its queued full-channel-deferred prune (set_cover contract
+  /// clause 6 — the grow's fresh cover is newer), and as a watcher-touching op re-forwards the
+  /// other deferred prunes first (clause 3).
   ///
-  /// The awaited, now crate-internal `Watcher::set_cover` this method used to drive
-  /// does NOT provide the correctness fence clause 1 demands: it returns when the fs core has
-  /// **QUEUED** the re-arm effects onto its driver, not when the kernel watches backing `retained` are
-  /// **live** — so a write between the ack and the effect landing could still be missed — and a failed
-  /// grow was silently swallowed (its result ignored). A correctness-grade `grow` needs an
-  /// **effect-completion token** the fs core does not yet mint; wiring that fence is deferred to a
-  /// dedicated follow-up. Until then the fs source stays on its self-healing whole-subtree coverage,
-  /// where the no-op is provably correct. The [`Source`] contract, the umbrella semantics, and the
-  /// [`Watcher`] plumbing all remain correct and tested — only this binding defers.
-  async fn grow(&mut self, handle: RootHandle, retained: &[Vec<OsString>]) {
-    let _ = (handle, retained);
+  /// # Errors
+  ///
+  /// The settled outcome maps per the trait's error contract — on every `Err` the fs layer has
+  /// already emitted the dominating in-band `Rescan` wherever one is owed, and the umbrella
+  /// keeps its record unbroadened and fails the watch retryably:
+  ///
+  /// - [`Degraded`](CoverOutcome::Degraded) → [`WatchError::CoverageIncomplete`]: the reconcile
+  ///   settled but coverage loss was signaled inside the window, so some `retained` key may not
+  ///   be backed;
+  /// - [`Skipped(UnknownRoot)`](SkipReason::UnknownRoot) → a [`FaultKind::NotFound`] fault: the
+  ///   covering root died concurrently with this grow (root death, stream fatal). Deliberately
+  ///   NOT `CoverageIncomplete` — nothing degraded; the root is *gone* — and the caller's retry
+  ///   re-plans, finds the dead root via `root_key`, retires it with terminal `Rescan`s, and
+  ///   arms fresh. `Err(UnknownRoot)` (the watcher's foreign-handle pre-check) maps the same
+  ///   way: either form means "no such root here";
+  /// - [`Closed`](FsUnwatchError::Closed) → [`WatchError::Closed`], including a close mid-fence
+  ///   (the ratified close semantics drop parked acknowledgements);
+  /// - [`Skipped(NotLive)`](SkipReason::NotLive) / [`Skipped(RefusedCover)`](SkipReason::RefusedCover)
+  ///   are unreachable from the umbrella (a `Covered` grow implies a committed, publicly-live
+  ///   root, and the umbrella's covers are never empty or out-of-root): `debug_assert!` tripwires
+  ///   plus a conservative fault in release.
+  async fn grow(
+    &mut self,
+    handle: RootHandle,
+    retained: &[Vec<OsString>],
+  ) -> Result<(), WatchError> {
+    // Supersede this handle's queued prune BEFORE the flush, so a stale narrower cover is never
+    // re-forwarded ahead of (or instead of) this grow's fresh one.
+    self.deferred_prunes.remove(&handle);
+    self.flush_deferred_prunes();
+    // Kernel-recursive short-circuit: coverage never narrowed, nothing to reconcile — skip the
+    // command round-trip inside the caller-bounded reconcile.
+    if self
+      .watcher
+      .backend_of(handle)
+      .is_some_and(|backend| backend.is_kernel_recursive())
+    {
+      return Ok(());
+    }
+    let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
+    #[cfg(test)]
+    {
+      self.cover_round_trips += 1;
+    }
+    match self.watcher.set_cover(handle, paths).await {
+      Ok(CoverOutcome::Applied | CoverOutcome::Recursive) => Ok(()),
+      Ok(CoverOutcome::Degraded) => Err(WatchError::CoverageIncomplete),
+      Ok(CoverOutcome::Skipped(SkipReason::UnknownRoot)) => Err(WatchError::source(
+        SourceFault::new(FaultKind::NotFound).with_source(format!(
+          "the covering root (scope {}) died before the grow could be applied",
+          handle.scope()
+        )),
+      )),
+      Ok(CoverOutcome::Skipped(reason)) => {
+        // NotLive / RefusedCover (or a future skip): unreachable from the umbrella — a grow is
+        // only ever issued for a committed live root with a non-empty in-root cover — so a hit
+        // here is an umbrella bug, not a runtime condition. Trip loudly in debug; fail the
+        // watch conservatively in release (prior coverage is untouched, the record does not
+        // broaden, the retry re-plans).
+        debug_assert!(
+          false,
+          "FsSource::grow was skipped ({reason}) — the umbrella issued a grow for a root that \
+           is not publicly live or with a refused cover"
+        );
+        Err(WatchError::source(
+          SourceFault::new(FaultKind::Other).with_source(format!(
+            "the coverage grow was skipped ({reason}) without reconciling"
+          )),
+        ))
+      }
+      // An unknown future settled outcome: fail conservatively (no broaden, retryable) with the
+      // outcome preserved in the fault's message.
+      Ok(outcome) => Err(WatchError::source(
+        SourceFault::new(FaultKind::Other)
+          .with_source(format!("unrecognized coverage-grow outcome ({outcome})")),
+      )),
+      // The foreign-handle pre-check — "no such root of this watcher", same answer as a
+      // concurrently-dead root.
+      Err(err @ FsUnwatchError::UnknownRoot) => Err(WatchError::source(
+        SourceFault::new(FaultKind::NotFound).with_source(err),
+      )),
+      // Closed, or closed/died mid-fence: the uniform closed signal.
+      Err(FsUnwatchError::Closed) => Err(WatchError::Closed),
+      // An unknown future error case degrades conservatively, the whole fs error preserved.
+      Err(err) => Err(WatchError::source(
+        SourceFault::new(FaultKind::Other).with_source(err),
+      )),
+    }
   }
 
-  /// **Deferred no-op safe-disable.** The PRUNE half of in-place coverage reconcile is
-  /// disabled for the fs source. A no-op is a **conforming** `set_cover` (contract clause 5, "purely
-  /// an optimization" — correctness never depends on it): leaving a root at full-subtree coverage
-  /// merely keeps it over-broad, which is correctness-neutral and self-healing, so this source
-  /// reclaims no kernel budget for now but loses no event.
+  /// The PRUNE half of in-place coverage reconcile: forwarded to the watcher the instant it is
+  /// called via the NON-BLOCKING, reply-less [`Watcher::request_set_cover`] `try_send` (contract
+  /// clause 3 — prompt), falling back to the **latest-wins per-handle deferral queue** only when
+  /// the control channel is momentarily full (re-forwarded at the next watcher-touching op; a
+  /// [`grow`](Self::grow) of the handle supersedes its queued prune — clause 6). The driver
+  /// applies a reply-less reconcile exactly like the awaited one, latest-wins by FIFO order, so
+  /// a prune followed by an awaited grow always ends at the grow's fresh cover.
   ///
-  /// # Why disabled, not merely defaulted
-  ///
-  /// It stands down together with its awaited GROW counterpart [`grow`](Self::grow): the prune cannot
-  /// be safely restored until the fs core mints an **effect-completion token** for the acked
-  /// `Watcher::set_cover` (now crate-internal; it returns at effect-QUEUE time, not
-  /// when the kernel watches are live), so both halves defer rather than pruning coverage
-  /// a not-yet-correct `grow` could not restore. Deferred to a dedicated follow-up. The [`Source`]
-  /// contract, the umbrella semantics, and the [`Watcher`] plumbing all remain correct and tested —
-  /// only this binding defers.
+  /// A handle whose [`disarm`](Self::disarm) was already requested is logically dead, so its
+  /// prune is skipped outright — superseded by the release (clause 4: the whole root is going
+  /// away). No result and no fence: a lost or deferred prune merely leaves the root over-broad,
+  /// which is correctness-neutral and self-healing (clause 5).
   fn set_cover(&mut self, handle: RootHandle, retained: &[Vec<OsString>]) {
-    let _ = (handle, retained);
+    if self.pending_set.contains(&handle) {
+      return;
+    }
+    // This request SUPERSEDES any queued older snapshot for the same handle (latest-wins,
+    // clause 6) — drop it BEFORE the flush. Were the stale entry left for the flush, a full
+    // channel there followed by room for the direct request below would leave the stale
+    // snapshot queued BEHIND the newer applied one, and a later flush would re-apply it —
+    // exactly the older-snapshot regression the clause forbids.
+    self.deferred_prunes.remove(&handle);
+    self.flush_deferred_prunes();
+    let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
+    if !self.watcher.request_set_cover(handle, paths.clone()) {
+      self.defer_prune(handle, paths);
+    }
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, RootHandle>> {

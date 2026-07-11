@@ -566,6 +566,68 @@ async fn deleted_root_is_retired_and_can_be_rewatched() {
   w.close().await.expect("close");
 }
 
+/// The set-cover effect-completion fence over the public API — issue #17's exact loss, now
+/// impossible. Sub A pins the root at its own key; sub B covers `/keep`. Unwatching A leaves
+/// the shared root over-broad, so the umbrella issues the fire-and-forget PRUNE down to
+/// `{/keep}` (a descending backend reclaims the kernel watches under `/drop`). A later
+/// `watch(/drop/deep)` is then Covered-OUTSIDE the narrowed cover, so the umbrella AWAITS
+/// [`Source::grow`] before committing — and the fs binding's ack resolves at **watch-live**,
+/// never at effect-queue time, with the grow ordered after the prune on the watcher's one FIFO
+/// control channel. A write into `/drop/deep` **immediately** after `watch()` returns — no
+/// settle, no convergence wait; the immediacy IS the fence's guarantee ("changes from now on",
+/// dated from the return) — must reach the newcomer as a genuine event, with no `Rescan`
+/// standing in for a lost write. Pre-fence, the grow ack resolved at effect-QUEUE time, so this
+/// write raced the re-arm cascade and was silently lost on inotify.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn covered_outside_grow_fence_delivers_an_immediate_write() {
+  let (_dir, root) = scratch("grow-fence");
+  let keep = root.join("keep");
+  let deep = root.join("drop").join("deep");
+  std::fs::create_dir_all(&keep).expect("create keep");
+  std::fs::create_dir_all(&deep).expect("create drop/deep");
+
+  let mut w = watcher(TributariesOptions::new());
+
+  // Sub A pins the root at its own key; sub B covers /keep. Both ride the one kernel root.
+  let sub_a = w
+    .watch(key(&root), (), WatchOptions::new())
+    .await
+    .expect("watch the root");
+  let _sub_b = w
+    .watch(key(&keep), (), WatchOptions::new())
+    .await
+    .expect("watch /keep");
+
+  // Unwatch A: the root survives for B but is over-broad — the prune to {/keep} fires.
+  w.unwatch(sub_a)
+    .await
+    .expect("unwatch the root-key subscription");
+
+  // Covered-OUTSIDE watch of the pruned region: the awaited grow re-arms /drop/deep and the
+  // watch returns only once that coverage is live.
+  let newcomer = w
+    .watch(key(&deep), (), WatchOptions::new())
+    .await
+    .expect("the covered-outside watch grows and commits");
+
+  // Write IMMEDIATELY on return — deliberately no wait of any kind between watch() and the
+  // write; only the delivery observation below is convergence-style.
+  let file = deep.join("immediate.txt");
+  std::fs::write(&file, b"payload").expect("write into the regrown subtree");
+
+  let observed = wait_for(&mut w, |e| {
+    e.subscription() == newcomer && !e.is_rescan() && reaches(e, &file)
+  })
+  .await;
+  assert!(
+    observed.is_some(),
+    "the write issued immediately after the covered-outside watch returned is delivered to the \
+     newcomer as a genuine event — the grow fence left no request→apply window to lose it in"
+  );
+
+  w.close().await.expect("close");
+}
+
 /// A coverage-loss `Rescan` reaches EVERY subscriber of the affected root (design §8).
 /// Deleting the watched root surfaces its terminal `Rescan` (or `Removed`) to every
 /// subscription of that root, bypassing coverage narrowing.

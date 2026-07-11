@@ -582,6 +582,9 @@ impl<C, V, R: RuntimeLite, H> Tributaries<C, V, R, H> {
   /// - [`WatchError::CanonicalRace`] when the source's committed key diverged from the planned
   ///   one and changed subsumption — a retryable race;
   /// - [`WatchError::Source`] when arming the source watch fails;
+  /// - [`WatchError::CoverageIncomplete`] when the key is covered by a root whose coverage was
+  ///   narrowed and the awaited coverage grow could not be applied — nothing was committed and
+  ///   the coverage record did not broaden; retryable;
   /// - [`WatchError::Closed`] when the owner is gone.
   pub async fn watch(
     &self,
@@ -1512,49 +1515,84 @@ where
         // events arrive under — closing the old Covered-path silent-loss where a raw non-canonical
         // key was committed and then never matched a canonical event.
         let (fs_root, sub, outside_cover) = (*fs_root, *sub, *outside_cover);
-        self.subsumer.commit_watch(&outcome, fs_root, key);
-        self.filters.insert(sub, filter);
-        self.register_debounce(sub, debounce);
-        // Covered-OUTSIDE grow (set-cover ): the covering root's source coverage was NARROWED
-        // below this newcomer's key by an earlier prune, so this `Covered` commit — which arms nothing
-        // — regains no real kernel coverage on its own. GROW the source back up to a fresh cover that
-        // INCLUDES the newcomer, and AWAIT it inside this caller-bounded reconcile (invariant I1, the
-        // ratified fence — exactly like `arm`). The grow is applied-BEFORE-return, so the newcomer's
-        // subtree is live before `watch()` returns and NO bridging `Rescan` is owed: a new watch is
-        // "changes from now on", and there is no enqueue→apply window in which a write under the
-        // newly-covered subtree could be silently lost — the close (a full control channel that
-        // deferred a fire-and-forget re-issue behind an already-flushed bridge dropped exactly that
-        // write). The record then broadens EXACTLY here, on grow-RETURN — never optimistically at
-        // issuance — so it always names the source's true current coverage: a second Covered newcomer
-        // landing before this grow completes still classifies OUTSIDE the old narrow record and grows
-        // in turn, and one landing after sees the exact broadened record and is correctly INSIDE.
-        // Because the grow is awaited-and-applied there is no window to be pessimistic about. When the
-        // newcomer is already inside the retained cover, or the root was never narrowed
+        // Covered-OUTSIDE grow, grow-BEFORE-commit (set-cover, ratified R1): the covering root's
+        // source coverage was NARROWED below this newcomer's key by an earlier prune, so a `Covered`
+        // commit — which arms nothing — would regain no real kernel coverage on its own. GROW the
+        // source back up to a fresh cover that INCLUDES the newcomer's key — passed EXPLICITLY,
+        // since nothing is committed yet — and AWAIT it inside this caller-bounded reconcile
+        // (invariant I1, the ratified fence — exactly like `arm`; the owner runs the reconcile to
+        // completion, so no other command can classify against the uncommitted state mid-await).
+        //
+        // - On `Ok` the grow is applied-before-return, so the newcomer's subtree is live before
+        //   `watch()` returns and NO bridging `Rescan` is owed: a new watch is "changes from now
+        //   on", and there is no request→apply window in which a write under the newly-covered
+        //   subtree could be silently lost. Only then commit, and record the grown cover EXACTLY —
+        //   the record broadens on grow-`Ok`, never optimistically at issuance, so it always names
+        //   the source's true current coverage: a second Covered newcomer landing later still
+        //   classifies against the exact record (OUTSIDE the old narrow one only until this commit
+        //   lands — reconciles never interleave — and correctly INSIDE the broadened one after).
+        // - On `Err` the watch FAILS instead: coverage for the newcomer's subtree could not be
+        //   restored, and committing anyway would publish a subscription whose subtree has no
+        //   kernel backing and no retry owner — the parked-Rescan retry timer retries DELIVERY,
+        //   never coverage, so nothing would ever re-drive the grow (the same honesty as the
+        //   DeadOnArrival choke point). The record is NOT broadened, so the next newcomer under
+        //   the pruned region classifies outside-cover and re-issues the grow (self-healing), and
+        //   the not-yet-committed plan unwinds through `abort_watch` — the identical pre-commit
+        //   state the dead-covering-root re-plan above aborts from — leaking no reservation and
+        //   orphaning no grant (none was minted). Existing subscribers lost nothing silently: the
+        //   source owes them its in-band dominating Rescan on every degraded grow (grow's error
+        //   contract).
+        //
+        // When the newcomer is already inside the retained cover, or the root was never narrowed
         // (`outside_cover == false`), the source already backs it and no grow is issued. On a
-        // whole-subtree source `grow` is the default no-op (its actual coverage never shrank), so this
-        // is inert there. Only `Covered` needs any of this: `Widen`/`Disjoint` each arm a FRESH root
-        // at full coverage.
-        if outside_cover {
-          match self.subsumer.retained_cover_for(fs_root) {
+        // whole-subtree source `grow` is the default `Ok` no-op (its actual coverage never
+        // shrank), so this is inert there. Only `Covered` needs any of this: `Widen`/`Disjoint`
+        // each arm a FRESH root at full coverage.
+        //
+        // `record_cover` is `Some(record)` when a grow succeeded and the retained-cover record
+        // must be set to `record` after the commit: `Some(cover)` for the fresh
+        // survivors+newcomer antichain, `None` for the cancel-equivalent (full coverage).
+        let record_cover = if outside_cover {
+          match self.subsumer.retained_cover_for(fs_root, Some(key)) {
             Some(cover) => {
-              // Grow to the fresh survivor+newcomer antichain, then record it EXACTLY — the record now
-              // matches the source's live coverage (applied-before-return).
-              self.source.grow(fs_root, &cover).await;
-              self.subsumer.set_retained_cover(fs_root, Some(cover));
+              if let Err(err) = self.source.grow(fs_root, &cover).await {
+                self.subsumer.abort_watch(&outcome);
+                return Err(err);
+              }
+              Some(Some(cover))
             }
             None => {
-              // A subscriber now pins the root at its OWN key: grow back to FULL coverage (the
-              // cancel-equivalent) and record `None`.
-              if let Some(root_key) = self
+              // A key (a survivor's, or the newcomer's own — it equals the root key) pins the
+              // root at its OWN key: grow back to FULL coverage (the cancel-equivalent) and
+              // record `None`.
+              match self
                 .subsumer
                 .entry(fs_root)
                 .map(|record| record.key.clone())
               {
-                self.source.grow(fs_root, &[root_key]).await;
-                self.subsumer.set_retained_cover(fs_root, None);
+                Some(root_key) => {
+                  if let Err(err) = self.source.grow(fs_root, &[root_key]).await {
+                    self.subsumer.abort_watch(&outcome);
+                    return Err(err);
+                  }
+                  Some(None)
+                }
+                // Unreachable in practice — the re-plan loop just validated the covering root
+                // live, and nothing ran since (the owner is single-threaded) — but if the record
+                // is somehow gone there is nothing to grow or re-record: commit as a plain
+                // Covered, exactly as the pre-reorder code did.
+                None => None,
               }
             }
           }
+        } else {
+          None
+        };
+        self.subsumer.commit_watch(&outcome, fs_root, key);
+        self.filters.insert(sub, filter);
+        self.register_debounce(sub, debounce);
+        if let Some(cover) = record_cover {
+          self.subsumer.set_retained_cover(fs_root, cover);
         }
         Ok(sub)
       }
@@ -2122,9 +2160,9 @@ where
   /// instead (parked unchanged at its own epoch, never re-minted).
   ///
   /// This is the sole overflow-shed primitive now: a `Covered`-outside newcomer no longer bridges
-  /// through here — set-cover grows the source's coverage with an **awaited**, applied-before-return
-  /// [`Source::grow`], so the newcomer's coverage is live before `watch()` returns and owes no
-  /// bridging `Rescan`.
+  /// through here — set-cover grows the source's coverage with an **awaited** [`Source::grow`]
+  /// applied before its `Ok` (a failed grow fails the watch instead, grow-before-commit R1), so a
+  /// committed newcomer's coverage is live before `watch()` returns and owes no bridging `Rescan`.
   ///
   /// Looks up `sub`'s covered key (the subtree the consumer must re-enumerate) and its recorded
   /// caller value, mints a **non-rebasing** strictly-dominating epoch
