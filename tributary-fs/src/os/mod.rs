@@ -367,6 +367,8 @@ pub(crate) enum SourceEvent {
   FsEvents(RawOsEvent),
   /// One decoded, anchor-attributed Linux record.
   Linux(linux::RawLinuxEvent),
+  /// One decoded, pump-paired Windows record.
+  Windows(windows::RawWindowsEvent),
 }
 
 impl From<RawOsEvent> for SourceEvent {

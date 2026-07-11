@@ -40,15 +40,24 @@ impl RdcwAction {
 }
 
 /// A record's watch-relative name, decoded from UTF-16LE.
+///
+/// Components are split on the `\` separators FIRST, at the code-unit level
+/// (`0x005C` can never be part of a surrogate pair), then decoded one by one —
+/// so an undecodable component still leaves every ancestor above it named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RdcwName {
-  /// Every component decoded to strict UTF-8, split on the `\` separators the
-  /// kernel delivers. Components are never empty and never carry a separator.
+  /// Every component decoded to strict UTF-8. Components are never empty and
+  /// never carry a separator.
   Utf8(Vec<String>),
-  /// The name cannot become UTF-8 (an unpaired surrogate — WTF-16 that has no
-  /// Unicode spelling): the lowering escalates the record to a located rescan
-  /// of its PARENT, never a lossy transliteration.
-  Escalate,
+  /// A component cannot become UTF-8 (an unpaired surrogate — WTF-16 that has
+  /// no Unicode spelling): `prefix` is the decodable ancestor chain above it
+  /// (empty = the undecodable component sits directly under the root), and
+  /// the lowering escalates to a located rescan THERE — never a lossy
+  /// transliteration.
+  Escalate {
+    /// The decoded components above the first undecodable one.
+    prefix: Vec<String>,
+  },
 }
 
 /// One decoded record.
@@ -74,11 +83,8 @@ pub(crate) struct RdcwRecord {
 
 impl RdcwRecord {
   /// Whether the extended attributes mark the object as a directory
-  /// (`FILE_ATTRIBUTE_DIRECTORY`); `None` on basic records — the lowering
-  /// grounds the kind another way.
-  // Consumed by the lowering in the next stage; the decode contract is
-  // pinned by the twins first.
-  #[allow(dead_code)]
+  /// (`FILE_ATTRIBUTE_DIRECTORY`); `None` on basic records — the record's
+  /// directory-ness stays unknown, the FSEvents no-hint default.
   pub(crate) fn is_dir(&self) -> Option<bool> {
     self.attributes.map(|attrs| attrs & 0x10 != 0)
   }
@@ -100,6 +106,25 @@ pub(crate) struct DecodedBuffer {
 const BASIC_HEADER: usize = 12;
 /// The fixed prefix of a `FILE_NOTIFY_EXTENDED_INFORMATION` record.
 const EXTENDED_HEADER: usize = 84;
+
+/// Decodes a watch-relative UTF-16LE name into components: separator split at
+/// the code-unit level first, then strict per-component decode, so the
+/// escalation point of a WTF-16 component keeps its decodable ancestors.
+fn decode_name(units: &[u16]) -> RdcwName {
+  let mut components = Vec::new();
+  for component in units.split(|&unit| unit == u16::from(b'\\')) {
+    if component.is_empty() {
+      continue;
+    }
+    match char::decode_utf16(component.iter().copied()).collect::<Result<String, _>>() {
+      Ok(decoded) => components.push(decoded),
+      Err(_) => {
+        return RdcwName::Escalate { prefix: components };
+      }
+    }
+  }
+  RdcwName::Utf8(components)
+}
 
 #[inline]
 fn load_u32(buf: &[u8], at: usize) -> u32 {
@@ -174,16 +199,7 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
       .chunks_exact(2)
       .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
       .collect();
-    let name = match char::decode_utf16(units).collect::<Result<String, _>>() {
-      Ok(joined) => RdcwName::Utf8(
-        joined
-          .split('\\')
-          .filter(|component| !component.is_empty())
-          .map(str::to_owned)
-          .collect(),
-      ),
-      Err(_) => RdcwName::Escalate,
-    };
+    let name = decode_name(&units);
 
     records.push(RdcwRecord {
       action,
@@ -314,7 +330,25 @@ mod tests {
     push_record(&mut buf, false, 0, 3, &[0xD800, u16::from(b'x')]);
     let decoded = decode_records(&buf, false);
     assert!(!decoded.lossy, "a WTF-16 name is a valid record");
-    assert_eq!(decoded.records[0].name, RdcwName::Escalate);
+    assert_eq!(
+      decoded.records[0].name,
+      RdcwName::Escalate { prefix: vec![] }
+    );
+  }
+
+  #[test]
+  fn escalation_keeps_the_decodable_ancestors() {
+    let mut name = utf16("a\\b\\");
+    name.push(0xDC00); // an unpaired low surrogate as the leaf component
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 3, &name);
+    let decoded = decode_records(&buf, false);
+    assert_eq!(
+      decoded.records[0].name,
+      RdcwName::Escalate {
+        prefix: vec!["a".into(), "b".into()],
+      }
+    );
   }
 
   #[test]

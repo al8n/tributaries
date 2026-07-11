@@ -5,10 +5,13 @@
 //! records are precise verbs with native cookies and lower directly (see
 //! [`inotify`]); fanotify records are precise verbs on a kernel-recursive
 //! stream, lowered to root-relative targets with interned-FID identity and
-//! atomic rename pairing (see [`fanotify`]). The shared vocabulary
-//! (`PendingBatch`, `Planned`, the trust and identity policies) stays in the
-//! core — a lowering produces inputs, it never owns state.
+//! atomic rename pairing (see [`fanotify`]); RDCW records are precise verbs
+//! with watch-relative names, pump-paired renames, and per-component
+//! escalation (see [`rdcw`]). The shared vocabulary (`PendingBatch`,
+//! `Planned`, the trust and identity policies) stays in the core — a lowering
+//! produces inputs, it never owns state.
 
 pub(super) mod fanotify;
 pub(super) mod fsevents;
 pub(super) mod inotify;
+pub(super) mod rdcw;
