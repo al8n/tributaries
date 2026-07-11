@@ -32,7 +32,13 @@ use std::sync::{
 // backend-gated `TransportState`; the always-compiled RAII types
 // (`BudgetPermit`, `OverflowAck`) use `AtomicUsize`. Gating the import to that
 // same cfg keeps a backend-less build (wasm lib) warning-clean.
-#[cfg(any(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(miri)), test))]
+#[cfg(any(
+  all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(miri)
+  ),
+  test
+))]
 use std::sync::atomic::AtomicBool;
 
 use super::SourceError;
@@ -43,7 +49,13 @@ use super::SourceError;
 // mirrors that consumer's exact cfg so a build with no backend carries none of
 // it, while the interleaving/protocol suites compile it everywhere under test
 // (including miri).
-#[cfg(any(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(miri)), test))]
+#[cfg(any(
+  all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(miri)
+  ),
+  test
+))]
 #[derive(Debug)]
 pub(crate) struct TransportState {
   /// Batches currently enqueued (or being processed); the budget cap bounds
@@ -66,7 +78,13 @@ pub(crate) struct TransportState {
   fatal_sent: AtomicBool,
 }
 
-#[cfg(any(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(miri)), test))]
+#[cfg(any(
+  all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(miri)
+  ),
+  test
+))]
 impl TransportState {
   /// A fresh transport allowing `budget` batches in flight.
   pub(crate) fn new(budget: usize) -> Self {
@@ -116,7 +134,13 @@ impl TransportState {
 #[derive(Debug)]
 pub(crate) struct BudgetPermit(Arc<AtomicUsize>);
 
-#[cfg(any(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(miri)), test))]
+#[cfg(any(
+  all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(miri)
+  ),
+  test
+))]
 impl BudgetPermit {
   /// Claims a slot, or `None` when the budget is exhausted.
   fn acquire(transport: &TransportState) -> Option<Self> {
@@ -213,7 +237,13 @@ impl Drop for OverflowAck {
 // the variants as never built. The driver consumes every variant on all
 // platforms; cfg-gating them would fracture that match.
 #[cfg_attr(
-  not(any(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(miri)), test)),
+  not(any(
+    all(
+      any(target_os = "macos", target_os = "linux", target_os = "windows"),
+      not(miri)
+    ),
+    test
+  )),
   allow(dead_code)
 )]
 #[derive(Debug)]
@@ -250,7 +280,13 @@ pub(crate) type EventReceiver<E> = async_channel::Receiver<SourceMessage<E>>;
 /// BEHIND it (the batch's own staleness is not covered by the prior signal,
 /// which rescanned as of its earlier queue position). A batch refused over
 /// budget degrades to a loss instead and does not advance the position.
-#[cfg(any(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(miri)), test))]
+#[cfg(any(
+  all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(miri)
+  ),
+  test
+))]
 pub(crate) fn forward_batch<E, S>(
   transport: &TransportState,
   events: Vec<E>,
@@ -287,7 +323,13 @@ pub(crate) fn forward_batch<E, S>(
 /// re-arms it (the driver acknowledging, a refused send, a drain) OR a `Batch`
 /// supersedes it. A loss postdating an interposed batch finds the low bit clear
 /// again and elects a FRESH `Overflow`, so the batch's staleness is covered.
-#[cfg(any(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(miri)), test))]
+#[cfg(any(
+  all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(miri)
+  ),
+  test
+))]
 pub(crate) fn signal_loss<E, S>(transport: &TransportState, mut send: S)
 where
   S: FnMut(SourceMessage<E>) -> bool,
@@ -310,7 +352,13 @@ where
 }
 
 /// Enqueues the stream's one terminal `Fatal`, at most once ever.
-#[cfg(any(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(miri)), test))]
+#[cfg(any(
+  all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(miri)
+  ),
+  test
+))]
 pub(crate) fn signal_fatal_once<E, S>(transport: &TransportState, err: SourceError, mut send: S)
 where
   S: FnMut(SourceMessage<E>) -> bool,

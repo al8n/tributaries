@@ -684,7 +684,7 @@ fn kind_of_mode(mode: u32) -> tributary_proto::FileKind {
 fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
   match stat_sample(root) {
     Ok(sample) => (
-      RootLiveness::Present(RootIdentity::new(sample.dev, sample.ino)),
+      RootLiveness::Present(RootIdentity::new(sample.dev, sample.ino.into())),
       sample.frame,
     ),
     Err(rustix::io::Errno::NOENT) => (RootLiveness::Missing, None),
@@ -699,7 +699,7 @@ fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
 #[cfg(not(all(target_os = "linux", not(miri))))]
 fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
   let liveness = match std::fs::symlink_metadata(root) {
-    Ok(meta) => RootLiveness::Present(RootIdentity::new(dev_of(&meta), ino_of(&meta))),
+    Ok(meta) => RootLiveness::Present(RootIdentity::new(dev_of(&meta), ino_of(&meta).into())),
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => RootLiveness::Missing,
     Err(_) => RootLiveness::Unreadable,
   };

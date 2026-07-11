@@ -292,7 +292,11 @@ mod pin {
     for (ancestor, identity) in nested.ancestors().skip(1).zip(&ancestors) {
       let meta = std::fs::metadata(ancestor).expect("stat the ancestor path");
       assert_eq!(identity.dev(), meta.dev(), "ancestor device matches");
-      assert_eq!(identity.ino(), meta.ino(), "ancestor inode matches");
+      assert_eq!(
+        identity.ino(),
+        u128::from(meta.ino()),
+        "ancestor inode matches"
+      );
     }
     assert_eq!(
       ancestors.len(),
@@ -486,7 +490,7 @@ mod pin {
         let fd = open_no_symlinks(ancestor, ancestor_final_flags())
           .expect("the component walk pins the ancestor");
         let stat = rustix::fs::fstat(&fd).expect("fstat the walked ancestor");
-        RootIdentity::new(stat.st_dev, stat.st_ino)
+        RootIdentity::new(stat.st_dev, stat.st_ino.into())
       })
       .collect();
     assert_eq!(

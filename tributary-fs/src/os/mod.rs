@@ -31,9 +31,18 @@ pub(crate) use macos::{Source, SourceHandle, mounts_under};
 #[cfg(all(target_os = "linux", not(miri)))]
 pub(crate) use linux::{Source, SourceHandle, mounts_under};
 
-#[cfg(any(not(any(target_os = "macos", target_os = "linux")), miri))]
+#[cfg(all(target_os = "windows", not(miri)))]
+pub(crate) use windows::{Source, SourceHandle, mounts_under};
+
+#[cfg(any(
+  not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+  miri
+))]
 mod unsupported;
-#[cfg(any(not(any(target_os = "macos", target_os = "linux")), miri))]
+#[cfg(any(
+  not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+  miri
+))]
 pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
 
 pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
@@ -408,7 +417,7 @@ pub(crate) const MAX_EXCLUSIONS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RootIdentity {
   dev: u64,
-  ino: u64,
+  ino: u128,
 }
 
 impl RootIdentity {
@@ -416,7 +425,7 @@ impl RootIdentity {
   /// metadata or minted by test harnesses; on a platform with neither the
   /// wrapped pair is the harmless `(0, 0)` its callers already synthesize
   /// (`dev_of`/`ino_of`/`identity_of`), and no real stream ever mints one.
-  pub(crate) const fn new(dev: u64, ino: u64) -> Self {
+  pub(crate) const fn new(dev: u64, ino: u128) -> Self {
     Self { dev, ino }
   }
 
@@ -425,8 +434,10 @@ impl RootIdentity {
     self.dev
   }
 
-  /// The identified object's inode.
-  pub(crate) const fn ino(&self) -> u64 {
+  /// The identified object's inode (or 128-bit file id — ReFS ids exceed
+  /// 64 bits, and a folded id would re-open the collision the registry's
+  /// disjointness rests on; Unix inodes zero-extend).
+  pub(crate) const fn ino(&self) -> u128 {
     self.ino
   }
 }

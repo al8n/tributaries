@@ -597,12 +597,12 @@ impl FsOps for FakeFs {
       let nodes = self.state.nodes.lock().unwrap();
       nodes
         .get(&root)
-        .map(|node| RootIdentity::new(node.dev, node.ino))
+        .map(|node| RootIdentity::new(node.dev, node.ino.into()))
     };
     let identity = sealed.unwrap_or_else(|| {
       RootIdentity::new(
         u64::MAX,
-        self.state.spawns.load(Ordering::SeqCst) as u64 + 1,
+        self.state.spawns.load(Ordering::SeqCst) as u128 + 1,
       )
     });
     self.state.spawn_order.lock().unwrap().push("meta_sealed");
@@ -663,7 +663,7 @@ impl FsOps for FakeFs {
       (_, Some((kind, _, _))) if !kind.is_dir() => {
         Some(SourceError::NotADirectory { root: root.clone() })
       }
-      (_, Some((_, ino, dev))) if RootIdentity::new(dev, ino) != identity => {
+      (_, Some((_, ino, dev))) if RootIdentity::new(dev, ino.into()) != identity => {
         Some(SourceError::RootReplaced { root: root.clone() })
       }
       (_, Some(_)) => None,
@@ -682,7 +682,7 @@ impl FsOps for FakeFs {
         .ancestors()
         .skip(1)
         .filter_map(|ancestor| nodes.get(ancestor))
-        .map(|node| RootIdentity::new(node.dev, node.ino))
+        .map(|node| RootIdentity::new(node.dev, node.ino.into()))
         .collect()
     };
     let meta = RootMeta {
@@ -740,7 +740,7 @@ impl FsOps for FakeFs {
       .lock()
       .unwrap()
       .get(root)
-      .map(|node| (RootIdentity::new(node.dev, node.ino), node.mnt_id));
+      .map(|node| (RootIdentity::new(node.dev, node.ino.into()), node.mnt_id));
     let (root_liveness, root_mnt_id) = match self.state.root_liveness.lock().unwrap().as_ref() {
       Some(override_liveness) => (*override_liveness, None),
       None => match sampled {
