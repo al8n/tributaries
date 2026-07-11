@@ -1894,21 +1894,21 @@ impl DriverCore {
         }
         batch
       }
-      // No USN payload variant exists yet (it lands with the journal
-      // backend), so a batch reaching a USN-profiled scope is a seam bug in
-      // its entirety: every event degrades to the covering root rescan,
-      // never a wrong lowering.
       BackendKind::UsnJournal => {
-        debug_assert!(false, "no source feeds a USN-profiled scope yet");
-        drop(events);
-        PendingBatch {
-          items: Vec::new(),
-          awaiting: 0,
-          trailing: vec![Planned::Over(Scope::Root(scope))],
-          permit: None,
-          deferred_unmounts: Vec::new(),
-          evidenced: BTreeMap::new(),
+        let mut usn = Vec::with_capacity(events.len());
+        let mut mismatched = false;
+        for ev in events {
+          match ev {
+            SourceEvent::Windows(RawWindowsEvent::Usn(event)) => usn.push(event),
+            _ => mismatched = true,
+          }
         }
+        let mut batch = self.compile_usn(state, scope, usn);
+        if mismatched {
+          debug_assert!(false, "a non-USN event reached a USN scope");
+          batch.trailing.push(Planned::Over(Scope::Root(scope)));
+        }
+        batch
       }
     }
   }
