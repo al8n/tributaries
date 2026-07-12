@@ -19,7 +19,8 @@ use std::{
 
 use windows_sys::Win32::{
   Foundation::{
-    ERROR_IO_PENDING, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_NO_MORE_FILES, GENERIC_READ, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
   },
   Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
@@ -27,8 +28,9 @@ use windows_sys::Win32::{
     FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
     FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FileAttributeTagInfo,
-    FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING,
-    ReadDirectoryChangesExW, ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
+    FileBasicInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
+    GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, ReadDirectoryChangesExW,
+    ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
   },
   System::{
     IO::{
@@ -493,4 +495,43 @@ pub(super) unsafe fn issue_journal_read(
     }
   }
   Ok(())
+}
+
+/// Reads one directory-enumeration page THROUGH the handle
+/// (`FileIdExtdDirectoryInfo`): `Ok(Some(bytes))` = a page landed in
+/// `buffer`, `Ok(None)` = the listing is exhausted. `restart` selects the
+/// restart class for the first page. Enumerating through the handle — never
+/// a path — is what binds the walk to the verified directory OBJECT.
+pub(crate) fn read_directory_page(
+  handle: BorrowedHandle<'_>,
+  buffer: &mut [u8],
+  restart: bool,
+) -> io::Result<Option<usize>> {
+  let class = if restart {
+    FileIdExtdDirectoryRestartInfo
+  } else {
+    FileIdExtdDirectoryInfo
+  };
+  // SAFETY: the handle is live; the buffer is writable for its full length
+  // and the class matches the record layout the kernel writes.
+  let ok = unsafe {
+    GetFileInformationByHandleEx(
+      handle.as_raw_handle() as HANDLE,
+      class,
+      buffer.as_mut_ptr().cast(),
+      u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+    )
+  };
+  if ok == 0 {
+    // SAFETY: reads the calling thread's last-error slot.
+    let error = unsafe { GetLastError() };
+    if error == ERROR_NO_MORE_FILES {
+      return Ok(None);
+    }
+    return Err(io::Error::from_raw_os_error(error as i32));
+  }
+  // The kernel does not report bytes written; the chain's own
+  // NextEntryOffset walk terminates it, so the full buffer is handed to
+  // the bounds-proven decoder.
+  Ok(Some(buffer.len()))
 }
