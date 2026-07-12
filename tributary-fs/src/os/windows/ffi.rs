@@ -58,11 +58,11 @@ pub(super) const NOTIFY_FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
 /// spawn bracket's capture, read from the PINNED handle so it can never name
 /// a different object than the stream watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct HandleIdentity {
+pub(crate) struct HandleIdentity {
   /// The volume serial the handle lives on.
-  pub(super) volume_serial: u64,
+  pub(crate) volume_serial: u64,
   /// The full 128-bit file reference number (exact on ReFS; NTFS zero-extends).
-  pub(super) file_id: u128,
+  pub(crate) file_id: u128,
 }
 
 /// Encodes `path` as the NUL-terminated UTF-16 the wide APIs take.
@@ -75,7 +75,7 @@ fn wide(path: &Path) -> Vec<u16> {
 /// must never pin the root against mutation or deletion — the
 /// held-fd-perturbs-teardown hazard class), backup semantics (directories
 /// refuse `CreateFileW` without it), and OVERLAPPED for the pump's reads.
-pub(super) fn open_directory(path: &Path) -> io::Result<OwnedHandle> {
+pub(crate) fn open_directory(path: &Path) -> io::Result<OwnedHandle> {
   let wide = wide(path);
   // SAFETY: `wide` is NUL-terminated and outlives the call; no security
   // attributes and no template handle are passed (null is the documented
@@ -130,7 +130,7 @@ pub(super) fn is_directory(handle: BorrowedHandle<'_>) -> io::Result<bool> {
 }
 
 /// The `(volume serial, 128-bit id)` identity of the open object.
-pub(super) fn identity_of(handle: BorrowedHandle<'_>) -> io::Result<HandleIdentity> {
+pub(crate) fn identity_of(handle: BorrowedHandle<'_>) -> io::Result<HandleIdentity> {
   let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
   // SAFETY: `info` is a properly-sized, writable FILE_ID_INFO and the class
   // constant matches the struct; the handle is live for the call.

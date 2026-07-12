@@ -701,10 +701,36 @@ fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
 /// mount frame (no mount-id notion off Linux — the macOS refresh executor inherits
 /// this, and its core descent fences on device alone). Kept a single stat so the
 /// identity is still one object's, matching the Linux helper's atomicity.
-#[cfg(not(all(target_os = "linux", not(miri))))]
+#[cfg(all(
+  not(all(target_os = "linux", not(miri))),
+  not(all(target_os = "windows", not(miri)))
+))]
 fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
   let liveness = match std::fs::symlink_metadata(root) {
     Ok(meta) => RootLiveness::Present(RootIdentity::new(dev_of(&meta), ino_of(&meta).into())),
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => RootLiveness::Missing,
+    Err(_) => RootLiveness::Unreadable,
+  };
+  (liveness, None)
+}
+
+/// The Windows sample: the identity must be the SAME `(volume serial,
+/// 128-bit file id)` the spawn barrier minted into `RootMeta` — a stat-based
+/// `(0, 0)` here would make the birth refresh classify every healthy root
+/// as replaced. Read through the same pinned-handle helper the barrier
+/// uses; the open itself is the liveness verdict.
+#[cfg(all(target_os = "windows", not(miri)))]
+fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
+  let liveness = match crate::os::windows::ffi::open_directory(root) {
+    Ok(handle) => {
+      use std::os::windows::io::AsHandle;
+      match crate::os::windows::ffi::identity_of(handle.as_handle()) {
+        Ok(identity) => {
+          RootLiveness::Present(RootIdentity::new(identity.volume_serial, identity.file_id))
+        }
+        Err(_) => RootLiveness::Unreadable,
+      }
+    }
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => RootLiveness::Missing,
     Err(_) => RootLiveness::Unreadable,
   };

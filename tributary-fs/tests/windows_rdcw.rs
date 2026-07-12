@@ -335,3 +335,44 @@ async fn journal_wrap_degrades_to_rescan() {
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The birth refresh must AGREE with the spawn barrier's identity: a healthy
+/// root survives it registered, delivers no unsolicited terminal Rescan, and
+/// still flows a CONCRETE (non-Rescan) event afterwards. Pins the
+/// stat-versus-handle identity representation staying in one system.
+#[tokio::test]
+async fn a_healthy_root_survives_its_birth_refresh() {
+  let root = scratch_root("birth");
+  let mut w = watcher();
+  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+
+  // Give the post-spawn refresh (and any misclassified death it would
+  // cause) time to land, while asserting nothing terminal arrives.
+  let quiet = tokio::time::timeout(Duration::from_secs(3), w.next()).await;
+  if let Ok(Some(event)) = &quiet {
+    assert!(
+      !matches!(event.kind(), EventKind::Rescan),
+      "an unsolicited root Rescan right after registration is the birth \
+       refresh misclassifying a healthy root: {event:?}"
+    );
+  }
+  assert!(
+    w.backend_of(handle).is_some(),
+    "the scope must survive its birth refresh registered"
+  );
+
+  // And the stream still delivers CONCRETE events — a covering Rescan is
+  // not accepted here, so a terminal-then-rescan death cannot fake this.
+  let file = root.join("post-refresh.txt");
+  std::fs::write(&file, b"x").expect("create");
+  assert!(
+    wait_for(&mut w, |e| !matches!(e.kind(), EventKind::Rescan)
+      && e.path() == file)
+    .await
+    .is_some(),
+    "a concrete post-refresh event flows"
+  );
+
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
