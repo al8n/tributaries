@@ -76,17 +76,14 @@ fn covers(event: &Event, target: &Path) -> bool {
   }
 }
 
-/// The backend report: a live root on Windows runs RDCW.
+/// A FORCED RDCW selection reports itself — the unprivileged arm stays
+/// selectable and honest even where Auto would prefer the journal.
 #[tokio::test]
-async fn selection_reports_rdcw() {
+async fn forced_rdcw_reports_itself() {
   let root = scratch_root("select");
-  let w = watcher();
+  let w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Rdcw)).expect("build");
   let handle = w.watch(&root, Interest::all()).await.expect("watch");
-  assert_eq!(
-    w.backend_of(handle).expect("live root").as_str(),
-    "rdcw",
-    "the Windows platform default is RDCW until the USN backend lands"
-  );
+  assert_eq!(w.backend_of(handle).expect("live root").as_str(), "rdcw");
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);
 }
@@ -340,11 +337,19 @@ async fn journal_wrap_degrades_to_rescan() {
 /// root survives it registered, delivers no unsolicited terminal Rescan, and
 /// still flows a CONCRETE (non-Rescan) event afterwards. Pins the
 /// stat-versus-handle identity representation staying in one system.
-#[tokio::test]
-async fn a_healthy_root_survives_its_birth_refresh() {
-  let root = scratch_root("birth");
-  let mut w = watcher();
-  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+async fn birth_refresh_survives(backend: Backend, tag: &str) {
+  let root = scratch_root(tag);
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(backend)).expect("build");
+  let handle = match w.watch(&root, Interest::all()).await {
+    Ok(handle) => handle,
+    Err(err) if backend.is_usn_journal() => {
+      // The journal arm's preconditions legitimately fail off the elevated
+      // runners (no volume access); the RDCW leg still pins the refresh.
+      eprintln!("SKIP birth_refresh({tag}): the forced journal refused ({err})");
+      return;
+    }
+    Err(err) => panic!("watch: {err}"),
+  };
 
   // Give the post-spawn refresh (and any misclassified death it would
   // cause) time to land, while asserting nothing terminal arrives.
@@ -375,4 +380,14 @@ async fn a_healthy_root_survives_its_birth_refresh() {
 
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn a_healthy_rdcw_root_survives_its_birth_refresh() {
+  birth_refresh_survives(Backend::Rdcw, "birth-rdcw").await;
+}
+
+#[tokio::test]
+async fn a_healthy_usn_root_survives_its_birth_refresh() {
+  birth_refresh_survives(Backend::UsnJournal, "birth-usn").await;
 }
