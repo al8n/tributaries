@@ -414,6 +414,7 @@ pub(crate) trait ScopeRegistry: Send + Sync + 'static {
     identity: RootIdentity,
     ancestors: &[RootIdentity],
     reserved: Option<&Path>,
+    exempt: Option<ScopeId>,
   ) -> Option<PathBuf>;
 }
 
@@ -1273,6 +1274,7 @@ pub(crate) async fn run<R, F>(
                 identity,
                 &ancestors,
                 pending.as_ref().map(|p| p.requested.as_path()),
+                None,
               ) {
                 // Never goes live: tear the fresh stream down inside the
                 // pending accounting and end the scope like a failed spawn.
