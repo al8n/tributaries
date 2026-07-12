@@ -70,7 +70,7 @@ enum WalkStall {
 /// the walk restarts the whole attempt — no local repair is complete.
 fn seed_walk(
   canonical: &Path,
-  root_frn: u128,
+  root_identity: ffi::HandleIdentity,
   max_directories: Option<usize>,
 ) -> Result<FrnMap, ProbeStage> {
   const ATTEMPTS: usize = 3;
@@ -79,12 +79,14 @@ fn seed_walk(
       Ok(root) => root,
       Err(_) => return Err(ProbeStage::Walk),
     };
+    // The FULL identity — file ids are unique only within a volume, so an
+    // FRN-alone match could bless a same-numbered object elsewhere.
     match ffi::identity_of(root.as_handle()) {
-      Ok(identity) if identity.file_id == root_frn => {}
+      Ok(identity) if identity == root_identity => {}
       _ => return Err(ProbeStage::Walk),
     }
-    let mut map = FrnMap::new(root_frn, max_directories);
-    match walk_under(&mut map, canonical.to_path_buf(), root, root_frn) {
+    let mut map = FrnMap::new(root_identity.file_id, max_directories);
+    match walk_under(&mut map, canonical.to_path_buf(), root, root_identity) {
       Ok(()) => return Ok(map),
       Err(WalkStall::Vanished) => continue,
       Err(WalkStall::Broken) => return Err(ProbeStage::Walk),
@@ -101,10 +103,12 @@ fn walk_under(
   map: &mut FrnMap,
   anchor_path: PathBuf,
   anchor: OwnedHandle,
-  anchor_frn: u128,
+  anchor_identity: ffi::HandleIdentity,
 ) -> Result<(), WalkStall> {
+  let volume_serial = anchor_identity.volume_serial;
   let mut page = vec![0u8; 64 * 1024];
-  let mut queue: Vec<(PathBuf, OwnedHandle, u128)> = vec![(anchor_path, anchor, anchor_frn)];
+  let mut queue: Vec<(PathBuf, OwnedHandle, u128)> =
+    vec![(anchor_path, anchor, anchor_identity.file_id)];
   while let Some((dir_path, handle, dir_frn)) = queue.pop() {
     let mut restart = true;
     loop {
@@ -138,15 +142,24 @@ fn walk_under(
           super::usn::map::LearnOutcome::Learned => {}
           _ => return Err(WalkStall::Broken),
         }
-        // The one per-child open, immediately verified against the
-        // ENUMERATED id: an impostor at the joined path mismatches.
+        // The one per-child open: NO-FOLLOW (a reparse point that raced
+        // in must be seen as itself, never resolved to a foreign target)
+        // and verified against the ENUMERATED id on the WATCHED volume —
+        // an impostor at the joined path mismatches on either coordinate.
         let child_path = dir_path.join(&name);
-        let opened = match ffi::open_directory(&child_path) {
+        let opened = match ffi::open_directory_no_follow(&child_path) {
           Ok(opened) => opened,
           Err(_) => return Err(WalkStall::Vanished),
         };
+        // A reparse point that appeared since the enumeration is a
+        // containment boundary the enumeration missed: the world moved.
+        match ffi::is_reparse_point(opened.as_handle()) {
+          Ok(false) => {}
+          Ok(true) | Err(_) => return Err(WalkStall::Vanished),
+        }
         match ffi::identity_of(opened.as_handle()) {
-          Ok(identity) if identity.file_id == child.frn => {}
+          Ok(identity)
+            if identity.file_id == child.frn && identity.volume_serial == volume_serial => {}
           _ => return Err(WalkStall::Vanished),
         }
         queue.push((child_path, opened, child.frn));
@@ -161,13 +174,20 @@ fn walk_under(
 /// handle-bound core walks below it. Any stall — vanished paths, identity
 /// mismatches, lossy pages — escalates to the caller, whose one answer is
 /// the full reseed spine.
-fn walk_into(map: &mut FrnMap, dir: &Path, frn: u128) -> Result<(), ()> {
-  let anchor = ffi::open_directory(dir).map_err(|_| ())?;
+fn walk_into(map: &mut FrnMap, dir: &Path, frn: u128, volume_serial: u64) -> Result<(), ()> {
+  // No-follow: a moved-in reparse point must be seen as itself — its
+  // TARGET (possibly another volume, possibly a same-numbered FRN there)
+  // is never walked.
+  let anchor = ffi::open_directory_no_follow(dir).map_err(|_| ())?;
+  match ffi::is_reparse_point(anchor.as_handle()) {
+    Ok(false) => {}
+    Ok(true) | Err(_) => return Err(()),
+  }
   let anchor_identity = ffi::identity_of(anchor.as_handle()).map_err(|_| ())?;
-  if anchor_identity.file_id != frn {
+  if anchor_identity.file_id != frn || anchor_identity.volume_serial != volume_serial {
     return Err(());
   }
-  walk_under(map, dir.to_path_buf(), anchor, frn).map_err(|_| ())
+  walk_under(map, dir.to_path_buf(), anchor, anchor_identity).map_err(|_| ())
 }
 
 /// What the journal pump owns: the pinned I/O state of one volume stream.
@@ -249,7 +269,7 @@ pub(super) fn spawn(
   if facts.min_major > 3 || facts.max_major < 2 {
     return Err(ProbeStage::JournalActive);
   }
-  let map = seed_walk(&canonical, identity.file_id, config.max_map_directories)?;
+  let map = seed_walk(&canonical, identity, config.max_map_directories)?;
 
   // The probe held: everything past here is a hard spawn outcome.
   let probed = ProbedVolume {
@@ -509,7 +529,14 @@ fn run(io_state: &mut JournalIo, admission: &mut UsnAdmission, root: &Path, shar
             for component in &components {
               path.push(component);
             }
-            if walk_into(admission.map_mut(), &path, *frn).is_err() {
+            if walk_into(
+              admission.map_mut(),
+              &path,
+              *frn,
+              io_state.root_identity.volume_serial,
+            )
+            .is_err()
+            {
               walk_failed = true;
             }
           }
@@ -569,18 +596,18 @@ fn reseed(
   let Ok(facts) = ffi::query_journal(io_state.query.as_handle()) else {
     return false;
   };
-  let root_frn = {
+  {
     let Ok(handle) = ffi::open_directory(root) else {
       return false;
     };
     match ffi::identity_of(handle.as_handle()) {
       // The re-opened path must still name the STARTUP object: a
       // replacement here is the original root's death, never a rebind.
-      Ok(identity) if identity == io_state.root_identity => identity.file_id,
+      Ok(identity) if identity == io_state.root_identity => {}
       _ => return false,
     }
-  };
-  let Ok(map) = seed_walk(root, root_frn, io_state.max_directories) else {
+  }
+  let Ok(map) = seed_walk(root, io_state.root_identity, io_state.max_directories) else {
     return false;
   };
   io_state.journal_id = facts.journal_id;

@@ -24,12 +24,12 @@ use windows_sys::Win32::{
   },
   Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES,
-    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FileAttributeTagInfo,
-    FileBasicInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
-    GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, ReadDirectoryChangesExW,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+    FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY,
+    FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
+    FileAttributeTagInfo, FileBasicInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo,
+    FileIdInfo, GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, ReadDirectoryChangesExW,
     ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
   },
   System::{
@@ -98,6 +98,33 @@ pub(crate) fn open_directory(path: &Path) -> io::Result<OwnedHandle> {
   }
   // SAFETY: the handle is freshly returned by a successful CreateFileW and
   // owned by no one else; OwnedHandle takes over its closure.
+  Ok(unsafe { OwnedHandle::from_raw_handle(raw as _) })
+}
+
+/// Opens a directory WITHOUT following a reparse point at the leaf
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`): the walks' child open, which must land
+/// on the object the parent's enumeration named — never on a junction or
+/// symlink TARGET, whose volume and identity are someone else's.
+pub(crate) fn open_directory_no_follow(path: &Path) -> io::Result<OwnedHandle> {
+  let wide = wide(path);
+  // SAFETY: `wide` is NUL-terminated and outlives the call; null security
+  // attributes and template are the documented "none".
+  let raw = unsafe {
+    CreateFileW(
+      wide.as_ptr(),
+      GENERIC_READ | FILE_LIST_DIRECTORY,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      std::ptr::null(),
+      OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REPARSE_POINT,
+      std::ptr::null_mut(),
+    )
+  };
+  if raw == INVALID_HANDLE_VALUE {
+    return Err(io::Error::last_os_error());
+  }
+  // SAFETY: freshly returned by a successful CreateFileW, owned by no one
+  // else; OwnedHandle takes over closure.
   Ok(unsafe { OwnedHandle::from_raw_handle(raw as _) })
 }
 
