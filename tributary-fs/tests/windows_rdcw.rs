@@ -377,21 +377,38 @@ async fn journal_wrap_degrades_to_rescan() {
     "the journal loss surfaces its covering rescan"
   );
 
-  // The scope survived the reseed REGISTERED — a terminal death Rescan
-  // cannot satisfy this — and delivery continues with a CONCRETE event:
-  // a queued loss or terminal Rescan cannot satisfy that either.
-  assert!(
-    w.backend_of(handle).is_some(),
-    "the scope must survive the wrap reseed registered"
-  );
+  // Journal deletion races the pump's reseed: the re-query lands either
+  // AFTER the recreate (reseed re-anchors onto the new journal — the scope
+  // survives) or INSIDE the deleted window (reseed fails — the ratified
+  // terminal-fatal, and a REWATCH re-probes). Both are designed outcomes;
+  // silence or a wedge is the only failure. Either way, delivery must
+  // resume with a CONCRETE event no queued or terminal Rescan can fake.
+  let mut w = if w.backend_of(handle).is_some() {
+    w
+  } else {
+    // The terminal path: the dead scope was reported (the Rescan above);
+    // the rewatch must start cleanly against the recreated journal.
+    w.close().await.expect("close the dead-scope watcher");
+    let fresh =
+      TokioWatcher::new(WatcherOptions::new().with_backend(Backend::UsnJournal)).expect("build");
+    let handle = fresh
+      .watch(&root, Interest::all())
+      .await
+      .expect("the rewatch re-probes onto the recreated journal");
+    assert_eq!(
+      fresh.backend_of(handle).expect("live").as_str(),
+      "usn-journal"
+    );
+    fresh
+  };
   let probe = root.join("alive.txt");
-  std::fs::write(&probe, b"x").expect("post-wrap create");
+  std::fs::write(&probe, b"x").expect("post-loss create");
   assert!(
     wait_for(&mut w, |e| !matches!(e.kind(), EventKind::Rescan)
       && e.path() == probe)
     .await
     .is_some(),
-    "a concrete post-reseed event flows"
+    "a concrete post-loss event flows"
   );
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);

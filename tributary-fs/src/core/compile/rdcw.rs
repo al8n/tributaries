@@ -127,21 +127,21 @@ impl DriverCore {
     new: &RdcwRecord,
   ) -> Vec<Planned> {
     let (old_resolved, new_resolved) = (resolve(&old.name), resolve(&new.name));
-    if let (Resolved::Target(_), Resolved::Target(_)) = (&old_resolved, &new_resolved) {
-      let Some(root) = state.root.as_deref() else {
-        return vec![Planned::Over(Scope::Root(scope))];
-      };
-      let absolute = |name: &RdcwName| {
-        let RdcwName::Utf8(components) = name else {
-          unreachable!("both ends resolved as targets");
-        };
-        components
-          .iter()
-          .fold(root.to_path_buf(), |path, component| path.join(component))
-      };
-      return self.plan_rename(state, scope, &absolute(&old.name), &absolute(&new.name));
+    if let (Resolved::Target(from), Resolved::Target(to)) = (old_resolved, new_resolved) {
+      // Both ends are in-root, already root-relative: mint the counter
+      // cookie and emit the adjacent pair directly — the fanotify path's
+      // (Target, Target) arm, without a lossy absolute-path round-trip
+      // (host path separators must never decide a lowering).
+      let cookie = self.next_cookie();
+      let from_rec = OsRecord::new(state.watch, RecordKind::MovedFrom)
+        .with_target(from)
+        .with_cookie(cookie);
+      let to_rec = OsRecord::new(state.watch, RecordKind::MovedTo)
+        .with_target(to)
+        .with_cookie(cookie);
+      return vec![Planned::Rec(from_rec), Planned::Rec(to_rec)];
     }
-
+    let (old_resolved, new_resolved) = (resolve(&old.name), resolve(&new.name));
     // At least one end escalated (or named the root — the seam surprise):
     // cover each end at the tightest location it still names.
     let mut planned = Vec::with_capacity(2);
