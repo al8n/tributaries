@@ -298,9 +298,16 @@ async fn journal_wrap_degrades_to_rescan() {
   let root = root.canonicalize().expect("canonicalize wrap root");
   // The wrap volume EXISTS to exercise the journal: force the selection so
   // a probe, seed, or startup regression fails the cell instead of quietly
-  // riding the RDCW fallback while CI stays green.
-  let mut w =
-    TokioWatcher::new(WatcherOptions::new().with_backend(Backend::UsnJournal)).expect("build");
+  // riding the RDCW fallback while CI stays green. Capacities exceed the
+  // WHOLE churn, so neither the consumer channel nor the transport budget
+  // can overflow — the awaited Rescan can only be journal truncation.
+  let mut w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::UsnJournal)
+      .with_event_capacity(std::num::NonZeroUsize::new(65_536).unwrap())
+      .with_os_batch_capacity(std::num::NonZeroUsize::new(4_096).unwrap()),
+  )
+  .expect("build");
   let handle = w
     .watch(&root, Interest::all())
     .await
