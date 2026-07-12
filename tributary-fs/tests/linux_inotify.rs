@@ -506,3 +506,61 @@ async fn close_quiesces_under_sustained_traffic() {
      not after an EAGAIN that never comes: {closed:?}"
   );
 }
+
+/// Widening `x/y` → `x` on the descending backend: the pre-arm + rebind
+/// commit bridges the swap with one covering `Rescan`, the rebuilt tree is
+/// live on the NEW inotify instance (writes under old and new ground both
+/// deliver), and repeated swaps neither leak watch descriptors into refusals
+/// nor strand the old coverage — the old root re-watches cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_root_widens_and_rebinds() {
+  let root = scratch_root("replace-widen");
+  let sub = root.join("y");
+  std::fs::create_dir_all(sub.join("deep")).expect("create tree");
+  let mut w = watcher();
+  let handle = w.watch(&sub, Interest::all()).await.expect("watch");
+  std::fs::write(sub.join("pre.txt"), b"pre").expect("write pre");
+
+  w.replace_root(handle, &root)
+    .await
+    .expect("the swap commits");
+  assert_eq!(w.root_path(handle), Some(root.clone()));
+  let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == root).await;
+  assert!(covering.is_some(), "the covering Rescan arrives");
+
+  // The rebuilt (re-armed) tree is live on the new instance: old ground...
+  let old_ground = sub.join("deep").join("old-ground.txt");
+  std::fs::write(&old_ground, b"x").expect("write old ground");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &old_ground)).await.is_some(),
+    "the old subtree is re-armed on the new fd"
+  );
+  // ...and newly covered ground alike.
+  let outside = root.join("outside.txt");
+  std::fs::write(&outside, b"x").expect("write outside");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &outside)).await.is_some(),
+    "newly covered ground is live"
+  );
+
+  // Swap back (narrowing) and once more: watch bookkeeping survives cycles —
+  // a leak of the old fd's descriptors would surface as arm refusals here.
+  for _ in 0..3 {
+    w.replace_root(handle, &sub).await.expect("narrow commits");
+    w.replace_root(handle, &root).await.expect("widen commits");
+  }
+  let probe = root.join("after-cycles.txt");
+  std::fs::write(&probe, b"x").expect("write probe");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &probe)).await.is_some(),
+    "coverage is live after swap cycles"
+  );
+
+  match w.watch(&sub, Interest::all()).await {
+    Err(tributary_fs::WatchRootError::Overlaps { existing, .. }) => assert_eq!(existing, root),
+    other => panic!("the widened coverage must contain the old root: {other:?}"),
+  }
+  w.unwatch(handle).await.expect("unwatch");
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}

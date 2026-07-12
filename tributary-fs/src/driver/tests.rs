@@ -741,20 +741,74 @@ async fn storm_no_silent_loss_converges() {
 
 async fn storm_seed(seed: u64) {
   let rig = rig_with_capacity(4);
-  let _scope = watch(&rig, "/r").await;
+  rig.fs.put("/r/w", FileKind::Dir, 2);
+  let scope = watch(&rig, "/r/w").await;
   let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(1);
   let mut next_ino = 100u64;
   let mut next_id = 1u64;
   let mut live: Vec<(PathBuf, u64)> = Vec::new();
   let mut view: BTreeSet<PathBuf> = BTreeSet::new();
   let mut last_epoch: Option<Epoch> = None;
+  let mut last_root: Option<PathBuf> = None;
+  let mut current_root = PathBuf::from("/r/w");
 
   for _ in 0..30 {
+    // The replace perturbation: ~1/8 of iterations swap the root between
+    // /r/w and /r (widen, then occasionally back). Convergence and epoch
+    // order must survive the swap; the commit Rescan re-reads the world.
+    if xorshift(&mut s).is_multiple_of(8) {
+      let target = if current_root == Path::new("/r/w") {
+        PathBuf::from("/r")
+      } else {
+        PathBuf::from("/r/w")
+      };
+      let (reply, mut on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: target.clone(),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(target.clone()),
+          reply,
+        })
+        .await
+        .unwrap();
+      // Keep the pipe draining while the swap settles: the commit Rescan
+      // must never deadlock against a full consumer channel.
+      let outcome = loop {
+        match tokio::time::timeout(Duration::from_millis(50), &mut on_reply).await {
+          Ok(res) => break res.expect("driver replies"),
+          Err(_) => {
+            if let Ok(Ok((_, root, change))) =
+              tokio::time::timeout(Duration::from_millis(10), rig.events.recv()).await
+            {
+              apply(
+                &rig,
+                &mut view,
+                &mut last_epoch,
+                &mut last_root,
+                &root,
+                &change,
+              );
+            }
+          }
+        }
+      };
+      assert!(
+        outcome.is_ok(),
+        "seed {seed}: the storm swap commits: {outcome:?}"
+      );
+      current_root = target;
+      // The storm's own mutation pool narrows with the coverage; the VIEW
+      // re-bases only when the consumer OBSERVES the flip (in `apply`).
+      live.retain(|(p, _)| p.starts_with(&current_root));
+      continue;
+    }
     let mut events = Vec::new();
     match xorshift(&mut s) % 4 {
       0 | 1 => {
         next_ino += 1;
-        let path = PathBuf::from(format!("/r/f{next_ino}"));
+        let path = current_root.join(format!("f{next_ino}"));
         rig.fs.put(&path, FileKind::File, next_ino);
         next_id += 1;
         events.push(ev(path.to_str().unwrap(), created(), next_id, next_ino));
@@ -771,7 +825,7 @@ async fn storm_seed(seed: u64) {
         let i = (xorshift(&mut s) as usize) % live.len();
         let (old, ino) = live.swap_remove(i);
         next_ino += 1;
-        let new = PathBuf::from(format!("/r/g{next_ino}"));
+        let new = current_root.join(format!("g{next_ino}"));
         rig.fs.remove(&old);
         rig.fs.put(&new, FileKind::File, ino);
         next_id += 1;
@@ -785,16 +839,23 @@ async fn storm_seed(seed: u64) {
     // Perturb: one in six batches is lost at decode — the mutation happened,
     // only its report vanished, and the in-order loss signal must cover it.
     if xorshift(&mut s).is_multiple_of(6) {
-      rig.fs.send_lossy("/r");
+      rig.fs.send_lossy(&current_root);
     } else {
-      rig.fs.send_batch("/r", events);
+      rig.fs.send_batch(&current_root, events);
     }
     // A sometimes-lagging consumer: drain a few events only occasionally.
     if xorshift(&mut s).is_multiple_of(3) {
       for _ in 0..(xorshift(&mut s) % 4) {
         match tokio::time::timeout(Duration::from_millis(100), rig.events.recv()).await {
           Ok(Ok((_, root, change))) => {
-            apply(&rig, &mut view, &mut last_epoch, &root, &change);
+            apply(
+              &rig,
+              &mut view,
+              &mut last_epoch,
+              &mut last_root,
+              &root,
+              &change,
+            );
           }
           _ => break,
         }
@@ -811,13 +872,20 @@ async fn storm_seed(seed: u64) {
   while let Ok(Ok((_, root, change))) =
     tokio::time::timeout(Duration::from_millis(300), rig.events.recv()).await
   {
-    apply(&rig, &mut view, &mut last_epoch, &root, &change);
+    apply(
+      &rig,
+      &mut view,
+      &mut last_epoch,
+      &mut last_root,
+      &root,
+      &change,
+    );
   }
 
-  let tree = rig.fs.files_under("/r");
+  let tree = rig.fs.files_under(&current_root);
   assert_eq!(
     view, tree,
-    "seed {seed}: the reconstructed view converges to the tree"
+    "seed {seed}: the reconstructed view converges to the tree under {current_root:?}"
   );
 }
 
@@ -825,9 +893,20 @@ fn apply(
   rig: &Rig,
   view: &mut BTreeSet<PathBuf>,
   last_epoch: &mut Option<Epoch>,
+  last_root: &mut Option<PathBuf>,
   root: &Path,
   change: &Change,
 ) {
+  // A delivery-root flip IS the observable root replacement: re-base the
+  // view to the new coverage. In-order delivery makes this exact — the
+  // lane gate guarantees no old-world delivery can follow the commit
+  // Rescan, so the flip happens at the world boundary.
+  if last_root.as_deref() != Some(root) {
+    if last_root.is_some() {
+      view.retain(|p| p.starts_with(root));
+    }
+    *last_root = Some(root.to_path_buf());
+  }
   if let Some(prev) = *last_epoch {
     assert!(
       change.epoch() >= prev,
@@ -1506,6 +1585,7 @@ mod descending {
     let _scope = watch(&rig, "/r").await;
     let mut view: BTreeSet<PathBuf> = BTreeSet::new();
     let mut last_epoch: Option<Epoch> = None;
+    let mut last_root: Option<PathBuf> = None;
     let mut live: Vec<PathBuf> = Vec::new();
 
     for _ in 0..24 {
@@ -1559,7 +1639,14 @@ mod descending {
         for _ in 0..(xorshift(&mut s) % 4) {
           match tokio::time::timeout(Duration::from_millis(100), rig.events.recv()).await {
             Ok(Ok((_, root, change))) => {
-              apply_descending(&rig, &mut view, &mut last_epoch, &root, &change);
+              apply_descending(
+                &rig,
+                &mut view,
+                &mut last_epoch,
+                &mut last_root,
+                &root,
+                &change,
+              );
             }
             _ => break,
           }
@@ -1577,7 +1664,14 @@ mod descending {
     while let Ok(Ok((_, root, change))) =
       tokio::time::timeout(Duration::from_millis(200), rig.events.recv()).await
     {
-      apply_descending(&rig, &mut view, &mut last_epoch, &root, &change);
+      apply_descending(
+        &rig,
+        &mut view,
+        &mut last_epoch,
+        &mut last_root,
+        &root,
+        &change,
+      );
     }
     let tree = rig.fs.files_under("/r");
     assert_eq!(
@@ -1593,10 +1687,11 @@ mod descending {
     rig: &Rig,
     view: &mut BTreeSet<PathBuf>,
     last_epoch: &mut Option<Epoch>,
+    last_root: &mut Option<PathBuf>,
     root: &Path,
     change: &Change,
   ) {
-    apply(rig, view, last_epoch, root, change);
+    apply(rig, view, last_epoch, last_root, root, change);
   }
 
   /// An inotify rig writing transitions into `registry`, for the deferred-grant

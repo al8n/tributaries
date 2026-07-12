@@ -386,3 +386,52 @@ async fn rewatch_after_root_death_succeeds() {
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&outer);
 }
+
+/// Widening `x/y` → `x` under live churn: the handle survives, a covering
+/// `Rescan` naming the new root arrives (pre-swap writes under `y` are
+/// delivered or dominated by it), post-swap writes OUTSIDE the old subtree
+/// deliver, `root_path` flips, the backend stays FSEvents, and the old root
+/// is immediately re-watchable as its own scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_root_widens_under_live_churn() {
+  let root = scratch_root("replace-widen");
+  let sub = root.join("y");
+  std::fs::create_dir_all(&sub).expect("create sub");
+  let mut w = watcher();
+  let handle = w.watch(&sub, Interest::all()).await.expect("watch");
+  assert_eq!(w.root_path(handle), Some(sub.clone()));
+  let backend = w.backend_of(handle).expect("a live backend");
+
+  // Live churn right up to the swap.
+  std::fs::write(sub.join("pre.txt"), b"pre").expect("write pre");
+
+  w.replace_root(handle, &root)
+    .await
+    .expect("the swap commits");
+  assert_eq!(w.root_path(handle), Some(root.clone()), "the view re-roots");
+  assert_eq!(w.backend_of(handle), Some(backend));
+
+  // The commit's covering Rescan names the new root — everything under it
+  // (the pre-swap write included) is re-read by contract.
+  let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == root).await;
+  assert!(covering.is_some(), "the covering Rescan arrives");
+
+  // Post-swap: a write OUTSIDE the old subtree delivers under the new root.
+  let outside = root.join("outside.txt");
+  std::fs::write(&outside, b"post").expect("write outside");
+  let seen = wait_for(&mut w, |e| covers(e, &outside)).await;
+  assert!(seen.is_some(), "newly covered ground is live");
+
+  // The registry entry was OVERWRITTEN, not left at the old root: a watch
+  // of the old (now nested) root refuses naming the NEW coverage.
+  match w.watch(&sub, Interest::all()).await {
+    Err(err) => match err {
+      tributary_fs::WatchRootError::Overlaps { existing, .. } => assert_eq!(existing, root),
+      other => panic!("expected Overlaps naming the new root, got {other:?}"),
+    },
+    Ok(_) => panic!("the widened coverage must contain the old root"),
+  }
+  w.unwatch(handle).await.expect("unwatch");
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
