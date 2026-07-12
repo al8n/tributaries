@@ -603,6 +603,55 @@ impl Monitor {
     self.inherit_rearm(watch)
   }
 
+  /// Rebinds `scope`'s root to a NEW transport in place — the descending
+  /// half of a root replace. The root node survives with its `WatchId`,
+  /// scope, and interest; everything else is old-world state that died with
+  /// the retired stream and is dropped here:
+  ///
+  /// - Every descended child subtree is dropped (their kernel watches lived
+  ///   on the old transport; the queued `Unwatch`s are dead-but-harmless on
+  ///   the new one — watch ids are never reused, so a stale disarm can name
+  ///   nothing live).
+  /// - Pending move halves are purged whole-scope, exactly as
+  ///   [`unregister_root`](Self::unregister_root) does: no old-world
+  ///   destination can validly arrive on the new transport.
+  /// - The root resets to a pending arm that CONTINUES a re-arm
+  ///   (a counted obligation, so [`rearm_settled`](Self::rearm_settled)
+  ///   holds `false` until the rebuild quiesces): the caller has already
+  ///   armed the new root on the new transport and replays that outcome via
+  ///   [`on_watch_result`](Self::on_watch_result), whose post-arm enumerate
+  ///   rebuilds coverage re-arm-flavored — no `Created` spam, the caller's
+  ///   covering `Rescan` already stands for the world change.
+  ///
+  /// Returns the surviving root `WatchId`, or `None` for an unknown scope or
+  /// a [`kernel_recursive`](Capabilities::kernel_recursive) one (a KR swap
+  /// replaces the stream whole; there is no per-directory book to rebind).
+  pub fn rebind_root(&mut self, scope: ScopeId) -> Option<WatchId> {
+    let root = *self.roots.get(&scope)?;
+    if !self.scope_descends(scope) {
+      return None;
+    }
+    let children: std::vec::Vec<WatchId> = self
+      .nodes
+      .get(&root)
+      .map(|node| node.children.iter().copied().collect())
+      .unwrap_or_default();
+    for child in children {
+      self.drop_subtree(child);
+    }
+    self.purge_scope_pending_moves(scope);
+    // An old-world root read that will never be reported must not leak its
+    // request slot (`drop_subtree` does this for children; the root survives).
+    if let Some(NodeState::Enumerating { req, .. }) = self.nodes.get(&root).map(|node| node.state) {
+      self.pending_enumerate.remove(&req);
+    }
+    self.set_state(root, NodeState::Arming { rearm: true });
+    if let Some(node) = self.nodes.get_mut(&root) {
+      node.identity = None;
+    }
+    Some(root)
+  }
+
   /// Whether `scope` has no outstanding re-arm work: no node of the scope is
   /// pending an arm that continues a re-arm or holds an in-flight re-arm read.
   /// O(1).

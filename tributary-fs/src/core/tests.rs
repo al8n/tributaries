@@ -900,6 +900,7 @@ fn identity_minting_respects_devices_and_mounts() {
     mounts_authoritative: true,
     refresh_pending: false,
     refresh_stale: false,
+    refresh_world_stale: false,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -936,6 +937,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     mounts_authoritative: false,
     refresh_pending: false,
     refresh_stale: false,
+    refresh_world_stale: false,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -2559,6 +2561,7 @@ mod lowering {
       mounts_authoritative: true,
       refresh_pending: false,
       refresh_stale: false,
+      refresh_world_stale: false,
       lag: LagState::Normal,
       park: Park::default(),
       resume_poisoned: false,
@@ -3956,6 +3959,54 @@ mod descending {
   /// already observed settled and CLEAN: `drop`'s watch is pruned and
   /// `applied_cover == settle_floor == {/r/keep}` — the shared start of the
   /// grow-fence suites.
+  /// An open cover fence whose grow re-arm is still outstanding when a root
+  /// replace commits: the commit is a whole-scope loss (the covering
+  /// Rescan), so once the rebound world's rebuild quiesces the fence
+  /// settles `Degraded` — never `Applied` over work the rebind cut, never
+  /// wedged open.
+  #[test]
+  fn an_open_cover_fence_settles_degraded_across_a_replace() {
+    let (mut core, scope, root_watch) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    assert!(!core.monitor.rearm_settled(scope));
+    assert_eq!(core.poll_cover_settlements(), Vec::new());
+
+    // The replace commits mid-fence: /r moves to /r2 on a new transport.
+    core.on_root_replaced(
+      scope,
+      RootMeta {
+        root: PathBuf::from("/r2"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      },
+      at(3),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "the rebound root's rebuild is counted work — the fence still pends"
+    );
+
+    // The driver replays the pre-armed outcome; the rebuild quiesces.
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(99));
+    run_cascade(&mut core, &BTreeMap::from([("/r2", Vec::new())]));
+    assert!(core.monitor.rearm_settled(scope));
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Degraded)],
+      "the commit's loss memory resolves the fence honestly"
+    );
+  }
+
   fn shrunk_to_keep() -> (DriverCore, ScopeId, WatchId) {
     let (mut core, scope, req, root_watch) = live_descending();
     core.on_enumerated(req, listed(root_listing()));
@@ -6185,5 +6236,194 @@ mod root_replaced {
         .all(|c| !c.kind().is_created() && !c.kind().is_removed()),
       "no old-world verb is fabricated after the cut: {effects:?}"
     );
+  }
+  /// A mount refresh in flight across the commit carries the REPLACED
+  /// world's facts — its liveness verdict included. The cross-world gate
+  /// discards it whole (the old object's identity must never read as the
+  /// new root's death) and re-reads the live world.
+  #[test]
+  fn an_in_flight_refresh_across_the_commit_cannot_kill_the_swapped_scope() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = core.on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Rdcw);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(scope, Ok(meta("/a/b", 1, 1, BackendKind::Rdcw)));
+    // The birth refresh is dispatched and STILL OUT when the commit lands.
+    let _ = drain(&mut core);
+    core.on_root_replaced(scope, meta("/a", 1, 2, BackendKind::Rdcw), at(1));
+    let _ = drain(&mut core);
+
+    // The old-world completion: alive, but at the OLD identity (1, 1) —
+    // without the gate this reads as the (1, 2) root replaced, and kills.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      core.scopes.contains_key(&scope),
+      "the swapped scope survives the cross-world verdict"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::RefreshMounts { scope: s, .. } if *s == scope)),
+      "the live world is re-read: {effects:?}"
+    );
+    assert!(
+      emits(&effects).is_empty(),
+      "no fabricated death or churn: {effects:?}"
+    );
+
+    // The re-read reports the LIVE world — the new identity installs
+    // authority; the same verdict that killed above is now death evidence
+    // no gate discards (same world, real facts).
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 2)),
+        root_mnt_id: None,
+      },
+      at(3),
+    );
+    let _ = drain(&mut core);
+    assert!(core.scopes.contains_key(&scope));
+    let state = core.scopes.get(&scope).unwrap();
+    assert!(
+      state.mounts_authoritative,
+      "the live read installed authority"
+    );
+  }
+
+  /// The descending commit: the world swaps, the per-directory book rebinds
+  /// (children dropped with the old transport), the covering Rescan stands,
+  /// and the replayed pre-arm outcome rebuilds coverage RE-ARM flavored —
+  /// arms without announcements, the Rescan already said everything.
+  #[test]
+  fn a_descending_commit_rebinds_and_rebuilds_rearm_flavored() {
+    fn entry(name: &str, kind: FileKind, dev: u64, ino: u64) -> crate::core::RawDirEntry {
+      crate::core::RawDirEntry {
+        name: name.as_bytes().to_vec(),
+        kind,
+        dev,
+        ino,
+        mnt_id: None,
+      }
+    }
+    fn listed(entries: Vec<crate::core::RawDirEntry>) -> crate::core::RawEnumerate {
+      crate::core::RawEnumerate::Listed {
+        entries,
+        complete: true,
+      }
+    }
+    use crate::os::linux::WatchOutcome;
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = core.on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Inotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(scope, Ok(meta("/a/b", 1, 1, BackendKind::Inotify)));
+    let effects = drain(&mut core);
+    let root_watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if path.as_path() == Path::new("/a/b") && watch == parent => Some(*watch),
+        _ => None,
+      })
+      .expect("the descending root arms through the effect path");
+    core.on_watch_installed(root_watch, WatchOutcome::Installed(1));
+    let effects = drain(&mut core);
+    let req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/a/b") => Some(*req),
+        _ => None,
+      })
+      .expect("the cold read");
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let effects = drain(&mut core);
+    let child = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/a/b/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the discovered child arms");
+    core.on_watch_installed(child, WatchOutcome::Installed(2));
+    let effects = drain(&mut core);
+    let child_req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/a/b/sub") => {
+          Some(*req)
+        }
+        _ => None,
+      })
+      .expect("the child read");
+    core.on_enumerated(child_req, listed(vec![]));
+    let _ = drain(&mut core);
+
+    // The commit: /a/b widens to /a on a new transport the driver already
+    // pre-armed. The core owes the Rescan and the refresh — but NO arm: the
+    // rebound root awaits the replay.
+    core.on_root_replaced(scope, meta("/a", 1, 1, BackendKind::Inotify), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "the covering Rescan at the new root: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::RefreshMounts { scope: s, .. } if *s == scope)),
+      "authority fails closed until the new world's refresh: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .all(|e| !matches!(e, Effect::AddWatch { .. })),
+      "the rebound root waits for the replayed pre-arm: {effects:?}"
+    );
+
+    // The replay: coverage rebuilds on the new transport, re-arm flavored.
+    core.on_watch_installed(root_watch, WatchOutcome::Installed(9));
+    let effects = drain(&mut core);
+    let rebuild = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, watch, path } if path.as_path() == Path::new("/a") => {
+          Some((*req, *watch))
+        }
+        _ => None,
+      })
+      .expect("the rebuild reads the NEW root: {effects:?}");
+    assert_eq!(rebuild.1, root_watch, "the same surviving watch id");
+    core.on_enumerated(
+      rebuild.0,
+      listed(vec![
+        entry("b", FileKind::Dir, 1, 1),
+        entry("sub2", FileKind::Dir, 1, 21),
+      ]),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().all(|c| !c.kind().is_created()),
+      "a re-arm rebuild announces nothing: {effects:?}"
+    );
+    for path in ["/a/b", "/a/sub2"] {
+      assert!(
+        effects
+          .iter()
+          .any(|e| matches!(e, Effect::AddWatch { path: p, .. } if p.as_path() == Path::new(path))),
+        "the rebuild re-arms {path}: {effects:?}"
+      );
+    }
   }
 }
