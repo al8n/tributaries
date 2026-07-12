@@ -76,7 +76,11 @@ fn seed_walk(
       };
       for entry in entries {
         let entry = entry.map_err(|_| ProbeStage::Walk)?;
-        admit_walk_entry(&mut map, &mut queue, &entry, dir_frn).map_err(|_| ProbeStage::Walk)?;
+        match admit_walk_entry(&mut map, &mut queue, &entry, dir_frn) {
+          Ok(()) => {}
+          Err(WalkStall::Vanished) => continue 'attempt,
+          Err(WalkStall::Broken) => return Err(ProbeStage::Walk),
+        }
       }
     }
     return Ok(map);
@@ -112,24 +116,39 @@ fn walk_into(map: &mut FrnMap, dir: &Path, frn: u128) -> Result<(), ()> {
     for entry in entries {
       match admit_walk_entry(map, &mut queue, &entry.map_err(|_| ())?, dir_frn) {
         Ok(()) => {}
-        Err(()) => return Err(()),
+        // Vanished and Broken alike: a live walk has one escalation — the
+        // reseed spine re-walks the world as it now is.
+        Err(_) => return Err(()),
       }
     }
   }
   Ok(())
 }
 
+/// Why a walk could not admit an entry.
+enum WalkStall {
+  /// The entry's path stopped resolving mid-walk: the tree mutated under
+  /// the walk — possibly at an ANCESTOR, stranding this stale path while
+  /// the ancestor stays mapped. NO local repair is complete (the R12/R13
+  /// class): the seed walk restarts its whole attempt, a live walk
+  /// escalates to the reseed spine. There is deliberately NO benign-skip
+  /// outcome for a disappearance.
+  Vanished,
+  /// An indeterminate or refusing probe (access denied, unreadable
+  /// metadata, an unnameable directory, the cap): the walk fails closed.
+  Broken,
+}
+
 /// One walk entry's admission, shared by the seed walk and the live subtree
-/// walk: directories admit (or the walk refuses), files skip, and every
-/// indeterminate metadata outcome is a refusal — an unreadable EXISTING
-/// directory must never become a silently unmapped subtree.
+/// walk: directories admit or the walk stalls — files and containment
+/// boundaries pass, everything else is a [`WalkStall`].
 fn admit_walk_entry(
   map: &mut FrnMap,
   queue: &mut Vec<(PathBuf, u128)>,
   entry: &std::fs::DirEntry,
   dir_frn: u128,
-) -> Result<(), ()> {
-  let kind = entry.file_type().map_err(|_| ())?;
+) -> Result<(), WalkStall> {
+  let kind = entry.file_type().map_err(|_| WalkStall::Broken)?;
   if !kind.is_dir() || kind.is_symlink() {
     return Ok(());
   }
@@ -137,27 +156,28 @@ fn admit_walk_entry(
   let child = match ffi::open_directory(&child_path) {
     Ok(child) => child,
     Err(_) => {
-      // Only a PROVEN disappearance is a benign race; an access-denied or
-      // indeterminate probe is a completeness refusal.
       return match child_path.try_exists() {
-        Ok(false) => Ok(()),
-        Ok(true) | Err(_) => Err(()),
+        // The entry vanished between enumeration and open — or an
+        // ancestor rename strandeded its joined path. Either way the
+        // walk's world moved: restart/escalate, never skip.
+        Ok(false) => Err(WalkStall::Vanished),
+        Ok(true) | Err(_) => Err(WalkStall::Broken),
       };
     }
   };
   // A reparse point (junction/mount) is a containment boundary: never
   // descended, never mapped. An indeterminate query refuses.
-  if ffi::is_reparse_point(child.as_handle()).map_err(|_| ())? {
+  if ffi::is_reparse_point(child.as_handle()).map_err(|_| WalkStall::Broken)? {
     return Ok(());
   }
-  let child_identity = ffi::identity_of(child.as_handle()).map_err(|_| ())?;
+  let child_identity = ffi::identity_of(child.as_handle()).map_err(|_| WalkStall::Broken)?;
   let name = entry.file_name();
   let Some(name) = name.to_str() else {
-    return Err(());
+    return Err(WalkStall::Broken);
   };
   match map.learn(child_identity.file_id, dir_frn, name.to_owned()) {
     super::usn::map::LearnOutcome::Learned => {}
-    _ => return Err(()),
+    _ => return Err(WalkStall::Broken),
   }
   queue.push((child_path, child_identity.file_id));
   Ok(())
