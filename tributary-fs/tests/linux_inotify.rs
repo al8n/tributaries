@@ -146,7 +146,13 @@ async fn churn_converges() {
 async fn rename_pairs_into_moved() {
   let root = scratch_root("rename");
   std::fs::write(root.join("old.txt"), b"x").unwrap();
-  let mut w = watcher();
+  // This cell pins PAIRING correctness, not window tightness: when the two
+  // rename halves split across reader batches, a sanitizer-slowed host can
+  // stretch the gap past the default move window, and the halves then
+  // LEGALLY degrade to Removed + Created — a different contract than the
+  // one under test. A generous window keeps the cell about the pairing.
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_move_window(Duration::from_secs(10)))
+    .expect("build watcher");
   let _h = w.watch(&root, Interest::all()).await.expect("watch");
 
   std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
