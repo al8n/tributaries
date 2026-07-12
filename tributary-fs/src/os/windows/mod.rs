@@ -13,6 +13,8 @@ pub(crate) mod ffi;
 pub(crate) mod rdcw;
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) mod source;
+#[cfg(all(target_os = "windows", not(miri)))]
+pub(crate) mod usn_source;
 // The journal source consumes this next; the twins pin its contracts first.
 #[allow(dead_code)]
 pub(crate) mod usn;
@@ -73,9 +75,9 @@ pub(crate) enum RawWindowsEvent {
   /// One `ReadDirectoryChangesW` event after rename pairing.
   Rdcw(RdcwEvent),
   /// One admitted USN journal event.
-  // The journal source constructs this once it lands; the core lowering
-  // and its suites already consume it.
-  #[allow(dead_code)]
+  // The journal source (windows-only) is the production constructor; on
+  // every other host the core suites construct it directly.
+  #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
   Usn(usn::UsnAdmitted),
 }
 

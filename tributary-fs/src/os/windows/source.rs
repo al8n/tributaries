@@ -202,6 +202,23 @@ impl Source {
         source,
       })?;
 
+    // The per-root backend dispatch: the journal arm is preferred under
+    // Auto (privileged, per volume) and falls to RDCW at its first failing
+    // probe stage; forcing it surfaces that stage typed instead.
+    match config.backend {
+      super::super::Backend::UsnJournal => {
+        return super::usn_source::spawn(&config, canonical, &handle, identity)
+          .map_err(|stage| SourceError::BackendProbeFailed { stage })?;
+      }
+      super::super::Backend::Auto => {
+        if let Ok(spawned) = super::usn_source::spawn(&config, canonical.clone(), &handle, identity)
+        {
+          return spawned;
+        }
+      }
+      _ => {}
+    }
+
     let port = ffi::iocp_new().map_err(|_| SourceError::CreateFailed)?;
     ffi::iocp_associate(port.as_handle(), handle.as_handle(), KEY_READ)
       .map_err(|_| SourceError::CreateFailed)?;
@@ -350,6 +367,20 @@ pub(crate) struct SourceHandle {
 }
 
 impl SourceHandle {
+  /// Assembles a handle around a running pump — the journal arm builds the
+  /// same teardown shape over its own thread and port.
+  pub(super) fn assemble(
+    pump: JoinHandle<()>,
+    control_port: OwnedHandle,
+    shared: Arc<PumpShared>,
+  ) -> Self {
+    Self {
+      pump: Some(pump),
+      control: ControlPost { port: control_port },
+      shared,
+    }
+  }
+
   /// The resume point minted so far. RDCW has no journal to resume from.
   // Journal resume is deferred surface, mirrored across every backend.
   #[allow(dead_code)]
