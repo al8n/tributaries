@@ -296,13 +296,16 @@ async fn journal_wrap_degrades_to_rescan() {
   let root = PathBuf::from(&base).join(format!("wrap-{}", std::process::id()));
   std::fs::create_dir_all(&root).expect("wrap scratch");
   let root = root.canonicalize().expect("canonicalize wrap root");
-  let mut w = watcher();
-  let handle = w.watch(&root, Interest::all()).await.expect("watch");
-  if w.backend_of(handle).expect("live").as_str() != "usn-journal" {
-    eprintln!("SKIP journal_wrap_degrades_to_rescan: the wrap volume did not select USN");
-    w.close().await.expect("close");
-    return;
-  }
+  // The wrap volume EXISTS to exercise the journal: force the selection so
+  // a probe, seed, or startup regression fails the cell instead of quietly
+  // riding the RDCW fallback while CI stays green.
+  let mut w =
+    TokioWatcher::new(WatcherOptions::new().with_backend(Backend::UsnJournal)).expect("build");
+  let handle = w
+    .watch(&root, Interest::all())
+    .await
+    .expect("the prepared wrap volume must start the forced journal");
+  assert_eq!(w.backend_of(handle).expect("live").as_str(), "usn-journal");
 
   // Churn well past the 1 MiB journal cap.
   for round in 0..256 {
