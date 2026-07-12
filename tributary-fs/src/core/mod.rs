@@ -1420,6 +1420,60 @@ impl DriverCore {
     self.drain_monitor();
   }
 
+  /// Commits a root replacement on a live KERNEL-RECURSIVE scope: the new
+  /// stream's [`RootMeta`] replaces the scope's world (root bytes, device,
+  /// mount frame, identity, mount seed), and everything the OLD world still
+  /// owed is resolved by domination — the loss-path cut. Parked work and
+  /// in-flight probes were compiled against the old root's bytes, so they
+  /// are dropped, not re-addressed; the epoch-bumped full-root `Rescan` the
+  /// cut emits instructs the consumer to re-read the (widened) world, which
+  /// covers the old subtree's swap window and the newly covered delta alike.
+  ///
+  /// The scope's KR profile must be preserved (the driver refuses a
+  /// descending↔KR flip as `BackendDiverged` before this input is reached);
+  /// a KR→KR backend change (a replace landing on another volume under the
+  /// windows Auto ladder) re-profiles exactly like `on_stream_spawned`.
+  // The driver's replace orchestration (the next commit) is the production
+  // caller; the core suites pin the commit's semantics first.
+  #[allow(dead_code)]
+  pub(crate) fn on_root_replaced(&mut self, scope: ScopeId, meta: RootMeta, now: Instant) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    debug_assert!(
+      state.profile.is_kernel_recursive() && meta.backend.is_kernel_recursive(),
+      "replace never crosses lowering profiles; the driver refuses BackendDiverged"
+    );
+    let watch = state.watch;
+    let backend = meta.backend;
+    if backend != state.profile {
+      state.profile = backend;
+      self.monitor.reprofile_root(scope, caps_for(backend));
+    }
+
+    // The world swap — the on_stream_spawned adoption, on a live scope.
+    let root = Arc::new(meta.root);
+    self.watch_paths.insert(watch, Arc::clone(&root));
+    state.root = Some(root);
+    state.root_dev = Some(meta.root_dev);
+    state.root_mnt_id = meta.root_mnt_id;
+    state.identity = Some(meta.identity);
+    state.mounts = meta.mounts;
+    // The old world's authority cannot vouch for the new root's mounts:
+    // trust fails closed until the refresh this commit arms completes.
+    state.mounts_authoritative = false;
+    Self::arm_refresh(&mut self.effects, scope, state);
+
+    // The cut: old-world parked work and probes are dominated, and the
+    // Monitor turns the swap into the epoch-bumped covering Rescan.
+    state.park.active = None;
+    state.park.queued.clear();
+    Self::trust_lost(&mut self.effects, scope, state);
+    self.probes.retain(|_, ctx| ctx.scope != scope);
+    self.monitor.on_overflow(Scope::Root(scope), now);
+    self.drain_monitor();
+  }
+
   /// Feeds a transport-level loss signal for `scope` (a dropped batch, the
   /// handle's overflow latch): parked work is dominated and dropped, and the
   /// Monitor turns the loss into an epoch-bumped `Rescan`.

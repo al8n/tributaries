@@ -6047,3 +6047,143 @@ mod usn_lowering {
     );
   }
 }
+
+/// The replace commit on a kernel-recursive scope: the world swaps, the old
+/// world's owed work is dominated by the epoch-bumped covering Rescan, and
+/// deliveries flow under the NEW root immediately.
+mod root_replaced {
+  use super::*;
+  use crate::os::windows::{RawWindowsEvent, RdcwAction, RdcwEvent, RdcwName, RdcwRecord};
+
+  fn meta(root: &str, dev: u64, ino: u128, backend: BackendKind) -> RootMeta {
+    RootMeta {
+      root: PathBuf::from(root),
+      root_dev: dev,
+      root_mnt_id: None,
+      mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(dev, ino),
+      ancestors: Vec::new(),
+      backend,
+    }
+  }
+
+  fn live_kr_scope(core: &mut DriverCore) -> ScopeId {
+    let scope = core.on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Rdcw);
+    let _ = drain(core);
+    core.on_stream_spawned(scope, Ok(meta("/a/b", 1, 1, BackendKind::Rdcw)));
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    scope
+  }
+
+  fn rdcw_payload(action: RdcwAction, components: &[&str]) -> BatchPayload {
+    BatchPayload::detached(vec![SourceEvent::Windows(RawWindowsEvent::Rdcw(
+      RdcwEvent::Single(RdcwRecord {
+        action,
+        name: RdcwName::Utf8(components.iter().map(|c| (*c).to_owned()).collect()),
+        file_id: None,
+        parent_id: None,
+        attributes: None,
+        reparse_tag: None,
+      }),
+    ))])
+  }
+
+  #[test]
+  fn the_commit_swaps_the_world_and_covers_by_domination() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_kr_scope(&mut core);
+
+    // Pre-replace: an event lowers under the OLD root.
+    core.on_batch(scope, rdcw_payload(RdcwAction::Added, &["pre.txt"]), at(1));
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(emitted[0].kind().is_created());
+
+    // The replace commit: /a/b widens to /a on the same device.
+    core.on_root_replaced(scope, meta("/a", 1, 1, BackendKind::Rdcw), at(2));
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert!(
+      emitted
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "the commit emits the covering full-root Rescan: {emitted:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::RefreshMounts { scope: s, .. } if *s == scope)),
+      "the new world re-arms its mount refresh: {effects:?}"
+    );
+
+    // Post-replace: deliveries carry the NEW canonical root...
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(3));
+    let _ = drain(&mut core);
+    core.on_batch(scope, rdcw_payload(RdcwAction::Added, &["post.txt"]), at(4));
+    let effects = drain(&mut core);
+    let delivered = effects.iter().find_map(|e| match e {
+      Effect::Emit { root, change, .. } => Some((root.clone(), change.clone())),
+      _ => None,
+    });
+    let (root, change) = delivered.expect("the post-replace event delivers");
+    assert_eq!(root.as_path(), Path::new("/a"), "the delivery root swapped");
+    assert!(change.kind().is_created());
+    assert_eq!(change.location(), &loc(&["post.txt"]));
+  }
+
+  #[test]
+  fn parked_probe_work_is_cut_never_readdressed() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    // An FSEvents scope: its ambiguous flag words PARK batches on probes.
+    let scope = core.on_watch(
+      PathBuf::from("/a/b"),
+      Interest::all(),
+      BackendKind::FsEvents,
+    );
+    let _ = drain(&mut core);
+    core.on_stream_spawned(scope, Ok(meta("/a/b", 1, 1, BackendKind::FsEvents)));
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+
+    // An ambiguous event parks awaiting its grounding probe.
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        "/a/b/mystery.txt",
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_REMOVED]),
+        7,
+        0,
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let parked = probes(&effects);
+    assert!(
+      !parked.is_empty(),
+      "the ambiguous event grounds through a probe: {effects:?}"
+    );
+
+    // The replace lands while the probe is in flight: the parked batch is
+    // dominated. The probe's LATE result must then be a no-op.
+    core.on_root_replaced(scope, meta("/a", 1, 1, BackendKind::FsEvents), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "the cut covers the parked work"
+    );
+    // The late probe result addressed to the purged context is dropped.
+    core.on_probe_result(parked[0].0, ProbeOutcome::Missing, at(3));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .all(|c| !c.kind().is_created() && !c.kind().is_removed()),
+      "no old-world verb is fabricated after the cut: {effects:?}"
+    );
+  }
+}
