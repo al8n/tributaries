@@ -1167,19 +1167,30 @@ pub(crate) async fn run<R, F>(
   // marker — the receiver-disconnect fact itself, which a dropped sender
   // would otherwise erase silently.
   let mut os: SelectAll<
-    futures_util::stream::BoxStream<'static, (ScopeId, Option<SourceMessage>)>,
+    futures_util::stream::BoxStream<'static, (ScopeId, u64, Option<SourceMessage>)>,
   > = SelectAll::new();
   // The guard keeps the SelectAll from ever emptying: an empty SelectAll
   // reports termination, which would spin the loop's stream arm.
   os.push(futures_util::stream::pending().boxed());
   let mut handles: BTreeMap<ScopeId, F::Handle> = BTreeMap::new();
+  // Each spawned stream is one delivery LANE, tagged by a per-driver
+  // generation: a scope's current lane is the one whose messages reach the
+  // core. Today exactly one lane exists per scope for its whole life;
+  // replace_root retires a lane and installs a successor under the SAME
+  // scope, and a retired lane's stragglers are dropped here (dominated by
+  // the replace commit's covering Rescan) — its end marker is not a death.
+  let mut lanes: BTreeMap<ScopeId, u64> = BTreeMap::new();
+  let mut next_lane: u64 = 0;
   // Blocking-pool work that owns — or is about to own — a native stream:
   // spawns dispatched but not yet returned, teardowns dispatched but not yet
   // confirmed. Close quiesces BOTH alongside the live handles: a spawn still
   // in flight can otherwise start a native source after the close reply, and
-  // an unconfirmed teardown is a stream still winding down.
+  // an unconfirmed teardown is a stream still winding down. Teardowns COUNT
+  // rather than flag: a replace can have the retired lane's teardown in
+  // flight while the scope is live on its successor, so one scope may owe
+  // several confirmations.
   let mut pending_spawns: BTreeSet<ScopeId> = BTreeSet::new();
-  let mut pending_teardowns: BTreeSet<ScopeId> = BTreeSet::new();
+  let mut pending_teardowns: BTreeMap<ScopeId, usize> = BTreeMap::new();
   let mut watch_replies: BTreeMap<ScopeId, PendingWatch> = BTreeMap::new();
   // Descending-profile grants held between spawn success and the ROOT's
   // watch-result: the spawned source starts with no watches, so "live" — the
@@ -1278,7 +1289,7 @@ pub(crate) async fn run<R, F>(
               ) {
                 // Never goes live: tear the fresh stream down inside the
                 // pending accounting and end the scope like a failed spawn.
-                pending_teardowns.insert(scope);
+                *pending_teardowns.entry(scope).or_insert(0) += 1;
                 let tx = op_tx.clone();
                 let handle = spawned.handle;
                 R::spawn_blocking_detach(move || {
@@ -1303,11 +1314,16 @@ pub(crate) async fn run<R, F>(
                 // query the same counters the reader writes.
                 let stats = spawned.handle.backend_stats();
                 handles.insert(scope, spawned.handle);
+                let lane = next_lane;
+                next_lane += 1;
+                lanes.insert(scope, lane);
                 os.push(
                   spawned
                     .receiver
-                    .map(move |msg| (scope, Some(msg)))
-                    .chain(futures_util::stream::once(async move { (scope, None) }))
+                    .map(move |msg| (scope, lane, Some(msg)))
+                    .chain(futures_util::stream::once(async move {
+                      (scope, lane, None)
+                    }))
                     .boxed(),
                 );
                 // The registry learns the scope is live BEFORE the grant can
@@ -1409,7 +1425,12 @@ pub(crate) async fn run<R, F>(
           core.on_enumerated(req, raw);
         }
         OpResult::TornDown { scope } => {
-            pending_teardowns.remove(&scope);
+            if let Some(owed) = pending_teardowns.get_mut(&scope) {
+              *owed -= 1;
+              if *owed == 0 {
+                pending_teardowns.remove(&scope);
+              }
+            }
             if let Some(reply) = unwatch_replies.remove(&scope) {
               let _ = reply.send(true);
             }
@@ -1476,7 +1497,15 @@ pub(crate) async fn run<R, F>(
         Err(_) => break None,
       },
       msg = os.next() => {
-        if let Some((scope, msg)) = msg {
+        if let Some((scope, lane, msg)) = msg {
+          // A retired lane's stragglers are dropped whole: the replace
+          // commit's covering Rescan dominates them, and the retired end
+          // marker is a teardown artifact, never a death. (Today every
+          // scope has exactly one lane for its whole life, so this gate
+          // never fires — pinned by the existing suites.)
+          if lanes.get(&scope) != Some(&lane) {
+            continue;
+          }
           match msg {
             // The payload travels whole: its budget slot is released by the
             // core exactly when the batch settles or is discarded, so parked
@@ -1519,7 +1548,7 @@ pub(crate) async fn run<R, F>(
   // channel.
   for (scope, handle) in std::mem::take(&mut handles) {
     registry.scope_dead(scope);
-    pending_teardowns.insert(scope);
+    *pending_teardowns.entry(scope).or_insert(0) += 1;
     let tx = op_tx.clone();
     R::spawn_blocking_detach(move || {
       handle.shutdown();
@@ -1530,7 +1559,12 @@ pub(crate) async fn run<R, F>(
     while !(pending_teardowns.is_empty() && pending_spawns.is_empty()) {
       match op_rx.recv().await {
         Ok(OpResult::TornDown { scope }) => {
-          pending_teardowns.remove(&scope);
+          if let Some(owed) = pending_teardowns.get_mut(&scope) {
+            *owed -= 1;
+            if *owed == 0 {
+              pending_teardowns.remove(&scope);
+            }
+          }
           if let Some(reply) = unwatch_replies.remove(&scope) {
             let _ = reply.send(true);
           }
@@ -1551,7 +1585,7 @@ pub(crate) async fn run<R, F>(
         Ok(OpResult::Spawned { scope, result }) => {
           pending_spawns.remove(&scope);
           if let Ok(spawned) = result {
-            pending_teardowns.insert(scope);
+            *pending_teardowns.entry(scope).or_insert(0) += 1;
             let tx = op_tx.clone();
             R::spawn_blocking_detach(move || {
               spawned.handle.shutdown();
@@ -1597,7 +1631,7 @@ pub(crate) async fn run<R, F>(
   // outcome fabricated over a torn-down driver.
   resolve_cover_settlements(&mut core, &mut cover_replies);
   if let Some(reply) = close_reply {
-    let _ = reply.send(pending_teardowns.len() + pending_spawns.len());
+    let _ = reply.send(pending_teardowns.values().sum::<usize>() + pending_spawns.len());
   }
 }
 
@@ -1610,7 +1644,7 @@ fn execute_effects<R, F>(
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
   handles: &mut BTreeMap<ScopeId, F::Handle>,
   pending_spawns: &mut BTreeSet<ScopeId>,
-  pending_teardowns: &mut BTreeSet<ScopeId>,
+  pending_teardowns: &mut BTreeMap<ScopeId, usize>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
@@ -1664,7 +1698,7 @@ fn execute_effects<R, F>(
             })));
         }
         if let Some(handle) = handles.remove(&scope) {
-          pending_teardowns.insert(scope);
+          *pending_teardowns.entry(scope).or_insert(0) += 1;
           let tx = op_tx.clone();
           R::spawn_blocking_detach(move || {
             handle.shutdown();
