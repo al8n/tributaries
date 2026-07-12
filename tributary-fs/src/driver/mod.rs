@@ -129,6 +129,13 @@ pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant,
 /// One watch awaiting its spawn result: the reply channel plus the root the
 /// watcher reserved, so the final-root revalidation can exclude this watch's
 /// own reservation from the conflict check.
+/// One in-flight root replacement: the reservation the commit releases and
+/// the caller's reply.
+struct ReplaceState {
+  reservation: crate::watcher::ReservationGuard,
+  reply: futures_channel::oneshot::Sender<Result<(), crate::error::ReplaceRootError>>,
+}
+
 struct PendingWatch {
   requested: PathBuf,
   reply: WatchReply,
@@ -295,6 +302,23 @@ pub(crate) enum Command {
     /// both identically; a reply-less reconcile opens no fence, though its window still
     /// feeds the settlement bookkeeping (loss memory, floor rewind).
     reply: Option<futures_channel::oneshot::Sender<CoverOutcome>>,
+  },
+  /// Replace a live root's coverage with `root` (make-before-break): the
+  /// new stream goes live before the old one is retired, the `RootHandle`,
+  /// scope, and epoch stream survive, and the commit's epoch-bumped
+  /// full-root `Rescan` instructs the consumer to re-read the widened
+  /// world. The reservation travels WITH the command: the driver releases
+  /// it at commit or failure, so cancelling the caller's future abandons
+  /// only the notification, never the reservation or the swap.
+  Replace {
+    /// The live scope whose root is being replaced.
+    scope: ScopeId,
+    /// The canonicalized replacement root.
+    root: PathBuf,
+    /// The reservation covering `root` (exempting `scope`).
+    reservation: crate::watcher::ReservationGuard,
+    /// Resolved at commit, or with the typed failure.
+    reply: futures_channel::oneshot::Sender<Result<(), crate::error::ReplaceRootError>>,
   },
   /// Orderly shutdown; resolves when every stream is torn down.
   Close {
@@ -1191,6 +1215,16 @@ pub(crate) async fn run<R, F>(
   // several confirmations.
   let mut pending_spawns: BTreeSet<ScopeId> = BTreeSet::new();
   let mut pending_teardowns: BTreeMap<ScopeId, usize> = BTreeMap::new();
+  // In-flight root replacements, keyed by the (live) scope being widened:
+  // the reservation parks here until the commit or failure releases it, and
+  // the OpResult::Spawned router below diverts a replace-spawn's result away
+  // from the birth path.
+  let mut replace_states: BTreeMap<ScopeId, ReplaceState> = BTreeMap::new();
+  // Each live scope's committed backend — the commit-time profile gate: a
+  // replacement whose spawn resolved to a different LOWERING PROFILE
+  // (descending↔KR) is refused as BackendDiverged, because a live scope
+  // never swaps lowering profiles.
+  let mut scope_backends: BTreeMap<ScopeId, BackendKind> = BTreeMap::new();
   let mut watch_replies: BTreeMap<ScopeId, PendingWatch> = BTreeMap::new();
   // Descending-profile grants held between spawn success and the ROOT's
   // watch-result: the spawned source starts with no watches, so "live" — the
@@ -1220,6 +1254,7 @@ pub(crate) async fn run<R, F>(
       &mut handles,
       &mut pending_spawns,
       &mut pending_teardowns,
+      &mut scope_backends,
       &events,
       &mut unwatch_replies,
       &mut deferred_grants,
@@ -1265,6 +1300,33 @@ pub(crate) async fn run<R, F>(
         match res.expect("the driver holds a sender") {
           OpResult::Spawned { scope, result } => {
             pending_spawns.remove(&scope);
+            if let Some(replace) = replace_states.remove(&scope) {
+              let outcome = commit_replace::<R, F>(
+                &mut core,
+                &ops,
+                &op_tx,
+                &mut handles,
+                &mut lanes,
+                &mut next_lane,
+                &mut pending_teardowns,
+                &mut os,
+                &registry,
+                &scope_backends,
+                scope,
+                result,
+                replace.reservation.path(),
+                &now,
+              );
+              if let Ok(backend) = &outcome {
+                scope_backends.insert(scope, *backend);
+              }
+              // The reservation releases HERE — commit or failure alike —
+              // after the registry overwrite (commit) has already made the
+              // new coverage visible, so the path is covered continuously.
+              drop(replace.reservation);
+              let _ = replace.reply.send(outcome.map(|_| ()));
+              continue;
+            }
             match result {
             Ok(spawned) => {
               let canonical_root = spawned.meta.root.clone();
@@ -1334,6 +1396,7 @@ pub(crate) async fn run<R, F>(
                 // scope dying before the caller polls its grant simply yields
                 // a dead-on-arrival handle.
                 registry.scope_live(scope, &canonical_root, identity, &ancestors, backend, stats);
+                scope_backends.insert(scope, backend);
                 match backend {
                   // Descending: the stream is live but covers NOTHING until
                   // the root's kernel watch arms; the grant defers to the
@@ -1452,6 +1515,36 @@ pub(crate) async fn run<R, F>(
           let requested = root.clone();
           let scope = core.on_watch(root, interest, config.profile);
           watch_replies.insert(scope, PendingWatch { requested, reply });
+        }
+        Ok(Command::Replace {
+          scope,
+          root,
+          reservation,
+          reply,
+        }) => {
+          if !handles.contains_key(&scope) {
+            let _ = reply.send(Err(crate::error::ReplaceRootError::UnknownRoot));
+          } else if replace_states.contains_key(&scope) {
+            let _ = reply.send(Err(crate::error::ReplaceRootError::ReplaceInFlight));
+          } else {
+            // Dispatch the replacement spawn through the SAME blocking-pool
+            // accounting a birth spawn uses; the Spawned router diverts the
+            // result to the commit tail by the replace_states key.
+            pending_spawns.insert(scope);
+            let mut source_config = SourceConfig::new(vec![root]);
+            source_config.exclusions = config.exclusions.clone();
+            source_config.latency = config.latency;
+            source_config.channel_capacity = config.os_batch_capacity;
+            source_config.backend = config.backend;
+            source_config.max_map_directories = config.max_map_directories;
+            let ops_for_spawn = ops.clone();
+            let tx = op_tx.clone();
+            R::spawn_blocking_detach(move || {
+              let result = ops_for_spawn.spawn_source(source_config);
+              let _ = tx.try_send(OpResult::Spawned { scope, result });
+            });
+            replace_states.insert(scope, ReplaceState { reservation, reply });
+          }
         }
         Ok(Command::Unwatch { scope, reply }) => {
           if handles.contains_key(&scope) || watch_replies.contains_key(&scope) {
@@ -1618,6 +1711,7 @@ pub(crate) async fn run<R, F>(
     &mut handles,
     &mut pending_spawns,
     &mut pending_teardowns,
+    &mut scope_backends,
     &events,
     &mut unwatch_replies,
     &mut deferred_grants,
@@ -1635,6 +1729,136 @@ pub(crate) async fn run<R, F>(
   }
 }
 
+/// Commits (or refuses) one root replacement whose spawn just resolved.
+/// Every failure path tears the NEW stream down inside the counted
+/// accounting and leaves the old root untouched — atomic-on-failure.
+/// Success retires the old stream (counted), installs the new lane, and
+/// feeds the core's [`on_root_replaced`](DriverCore::on_root_replaced) cut.
+#[allow(clippy::too_many_arguments)]
+fn commit_replace<R, F>(
+  core: &mut DriverCore,
+  ops: &F,
+  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  handles: &mut BTreeMap<ScopeId, F::Handle>,
+  lanes: &mut BTreeMap<ScopeId, u64>,
+  next_lane: &mut u64,
+  pending_teardowns: &mut BTreeMap<ScopeId, usize>,
+  os: &mut SelectAll<
+    futures_util::stream::BoxStream<'static, (ScopeId, u64, Option<SourceMessage>)>,
+  >,
+  registry: &impl ScopeRegistry,
+  scope_backends: &BTreeMap<ScopeId, BackendKind>,
+  scope: ScopeId,
+  result: Result<SpawnedSource<F::Handle>, SourceError>,
+  reserved: &Path,
+  now: &impl Fn() -> Instant,
+) -> Result<BackendKind, crate::error::ReplaceRootError>
+where
+  R: RuntimeLite,
+  F: FsOps,
+{
+  use crate::error::ReplaceRootError;
+
+  let spawned = match result {
+    Ok(spawned) => spawned,
+    Err(err) => return Err(ReplaceRootError::Source(err)),
+  };
+  let mut retire_new = Some(spawned);
+  let outcome = (|| {
+    let spawned = retire_new.as_ref().expect("present until committed");
+    // Death wins: the old root died (or was unwatched) while the
+    // replacement was starting — the scope ended through its normal
+    // lifecycle and is never resurrected.
+    if !handles.contains_key(&scope) {
+      return Err(ReplaceRootError::Retired);
+    }
+    // A live scope never swaps lowering profiles. (Descending rebind lands
+    // with the D1 commit; until then a descending old profile refuses
+    // through the same gate.)
+    let backend = spawned.meta.backend;
+    let old_kr = scope_backends
+      .get(&scope)
+      .is_some_and(BackendKind::is_kernel_recursive);
+    if !old_kr || !backend.is_kernel_recursive() {
+      return Err(ReplaceRootError::BackendDiverged);
+    }
+    // The single-writer final check: the spawn re-canonicalized, so the
+    // FINAL root's disjointness (exempting this scope AND the command's own
+    // reservation) is settled here, immediately before commit.
+    if let Some(existing) = registry.final_root_conflict(
+      &spawned.meta.root,
+      spawned.meta.identity,
+      &spawned.meta.ancestors,
+      Some(reserved),
+      Some(scope),
+    ) {
+      return Err(ReplaceRootError::Overlaps {
+        path: spawned.meta.root.clone(),
+        existing,
+      });
+    }
+    Ok(())
+  })();
+
+  match outcome {
+    Err(err) => {
+      // Refused: the new stream never becomes the scope's lane — tear it
+      // down inside the counted accounting.
+      if let Some(spawned) = retire_new.take() {
+        *pending_teardowns.entry(scope).or_insert(0) += 1;
+        let tx = op_tx.clone();
+        R::spawn_blocking_detach(move || {
+          spawned.handle.shutdown();
+          let _ = tx.try_send(OpResult::TornDown { scope });
+        });
+      }
+      Err(err)
+    }
+    Ok(()) => {
+      let spawned = retire_new.take().expect("present until committed");
+      // Make-before-break: the new stream is live; retire the old one now,
+      // inside the counted accounting.
+      if let Some(old) = handles.remove(&scope) {
+        *pending_teardowns.entry(scope).or_insert(0) += 1;
+        let tx = op_tx.clone();
+        R::spawn_blocking_detach(move || {
+          old.shutdown();
+          let _ = tx.try_send(OpResult::TornDown { scope });
+        });
+      }
+      ops.detach_scope(scope);
+      ops.attach_scope(scope, spawned.handle.scope_port());
+      let backend = spawned.meta.backend;
+      let stats = spawned.handle.backend_stats();
+      handles.insert(scope, spawned.handle);
+      let lane = *next_lane;
+      *next_lane += 1;
+      lanes.insert(scope, lane);
+      os.push(
+        spawned
+          .receiver
+          .map(move |msg| (scope, lane, Some(msg)))
+          .chain(futures_util::stream::once(
+            async move { (scope, lane, None) },
+          ))
+          .boxed(),
+      );
+      // Registry overwrite BEFORE the core commit — the same program order
+      // birth uses, on the same single-writer task.
+      registry.scope_live(
+        scope,
+        &spawned.meta.root,
+        spawned.meta.identity,
+        &spawned.meta.ancestors,
+        backend,
+        stats,
+      );
+      core.on_root_replaced(scope, spawned.meta, now());
+      Ok(backend)
+    }
+  }
+}
+
 /// Executes the core's queued effects, feeding each outcome straight back.
 #[allow(clippy::too_many_arguments)]
 fn execute_effects<R, F>(
@@ -1645,6 +1869,7 @@ fn execute_effects<R, F>(
   handles: &mut BTreeMap<ScopeId, F::Handle>,
   pending_spawns: &mut BTreeSet<ScopeId>,
   pending_teardowns: &mut BTreeMap<ScopeId, usize>,
+  scope_backends: &mut BTreeMap<ScopeId, BackendKind>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
@@ -1681,6 +1906,7 @@ fn execute_effects<R, F>(
         });
       }
       Effect::TeardownStream { scope } => {
+        scope_backends.remove(&scope);
         // Every scope end — explicit unwatch, root death, stream fatal —
         // funnels through this effect: reclaim the registry entry, so a dead
         // root stops participating in liveness checks immediately. The arm

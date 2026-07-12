@@ -1433,9 +1433,6 @@ impl DriverCore {
   /// descending↔KR flip as `BackendDiverged` before this input is reached);
   /// a KR→KR backend change (a replace landing on another volume under the
   /// windows Auto ladder) re-profiles exactly like `on_stream_spawned`.
-  // The driver's replace orchestration (the next commit) is the production
-  // caller; the core suites pin the commit's semantics first.
-  #[allow(dead_code)]
   pub(crate) fn on_root_replaced(&mut self, scope: ScopeId, meta: RootMeta, now: Instant) {
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;

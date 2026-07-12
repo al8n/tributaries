@@ -161,3 +161,56 @@ impl CloseError {
     matches!(self, Self::NotQuiesced { .. })
   }
 }
+
+/// Why [`Watcher::replace_root`](crate::Watcher::replace_root) failed. The
+/// operation is atomic-on-failure: every variant leaves the old root's
+/// coverage untouched.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReplaceRootError {
+  /// The new root does not exist.
+  #[error("replacement root {} does not exist", path.display())]
+  NotFound {
+    /// The path as the caller supplied it.
+    path: PathBuf,
+  },
+  /// The new root exists but is not a directory.
+  #[error("replacement root {} is not a directory", path.display())]
+  NotADirectory {
+    /// The canonicalized path.
+    path: PathBuf,
+  },
+  /// The new root overlaps a DIFFERENT live (or reserved) root. The root
+  /// being replaced is exempt — overlapping it is the operation's point.
+  #[error("replacement root {} overlaps live root {}", path.display(), existing.display())]
+  Overlaps {
+    /// The canonicalized new root.
+    path: PathBuf,
+    /// The conflicting coverage.
+    existing: PathBuf,
+  },
+  /// The handle does not name a live root of this watcher.
+  #[error("the handle does not name a live root of this watcher")]
+  UnknownRoot,
+  /// A replace is already in flight on this root.
+  #[error("a replace is already in flight on this root")]
+  ReplaceInFlight,
+  /// The new root resolved to a different lowering profile than the live
+  /// scope runs (a descending↔kernel-recursive flip, e.g. a Linux
+  /// `Backend::Auto` landing on fanotify for one volume and inotify for the
+  /// other). A live scope never swaps lowering profiles; unwatch + watch is
+  /// the sanctioned transition.
+  #[error("the replacement resolved to a different lowering profile")]
+  BackendDiverged,
+  /// The root died (or was unwatched) while the replacement was starting —
+  /// death wins, and the scope ended through its normal lifecycle. The new
+  /// stream was torn down; retry against a fresh `watch`.
+  #[error("the root died while the replacement was starting")]
+  Retired,
+  /// The watcher is closed.
+  #[error("the watcher is closed")]
+  Closed,
+  /// The replacement stream could not start.
+  #[error(transparent)]
+  Source(#[from] SourceError),
+}
