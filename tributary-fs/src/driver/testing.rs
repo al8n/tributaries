@@ -867,6 +867,7 @@ impl ScopeRegistry for NullRegistry {
     _identity: RootIdentity,
     _ancestors: &[RootIdentity],
     _reserved: Option<&Path>,
+    _exempt: Option<ScopeId>,
   ) -> Option<PathBuf> {
     None
   }
@@ -920,6 +921,7 @@ impl ScopeRegistry for RecordingRegistry {
     _identity: RootIdentity,
     _ancestors: &[RootIdentity],
     _reserved: Option<&Path>,
+    _exempt: Option<ScopeId>,
   ) -> Option<PathBuf> {
     None
   }

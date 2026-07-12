@@ -275,13 +275,23 @@ impl RootSet {
   /// ancestor identities, which only the spawn barrier reads: the driver's
   /// [`ScopeRegistry::final_root_conflict`] settles those before anything
   /// goes live.
-  fn overlap_of(&self, candidate: &Path, identity: Option<RootIdentity>) -> Option<PathBuf> {
-    let live = self.entries.values().find(|entry| {
-      candidate.starts_with(entry.path.as_path())
-        || entry.path.starts_with(candidate)
-        || Some(entry.identity) == identity
+  ///
+  /// `exempt` excludes ONE live scope from the check — the root a
+  /// `replace_root` is replacing: its coverage is the thing being widened,
+  /// so overlapping IT is the operation's whole point, never a conflict.
+  fn overlap_of(
+    &self,
+    candidate: &Path,
+    identity: Option<RootIdentity>,
+    exempt: Option<ScopeId>,
+  ) -> Option<PathBuf> {
+    let live = self.entries.iter().find(|(scope, entry)| {
+      Some(**scope) != exempt
+        && (candidate.starts_with(entry.path.as_path())
+          || entry.path.starts_with(candidate)
+          || Some(entry.identity) == identity)
     });
-    if let Some(entry) = live {
+    if let Some((_, entry)) = live {
       return Some(entry.path.as_ref().clone());
     }
     self
@@ -336,16 +346,18 @@ impl ScopeRegistry for RegistryWriter {
     identity: RootIdentity,
     ancestors: &[RootIdentity],
     reserved: Option<&Path>,
+    exempt: Option<ScopeId>,
   ) -> Option<PathBuf> {
     let set = self.roots.read().unwrap_or_else(PoisonError::into_inner);
-    let live = set.entries.values().find(|entry| {
-      final_root.starts_with(entry.path.as_path())
-        || entry.path.starts_with(final_root)
-        || entry.identity == identity
-        || ancestors.contains(&entry.identity)
-        || entry.ancestors.contains(&identity)
+    let live = set.entries.iter().find(|(scope, entry)| {
+      Some(**scope) != exempt
+        && (final_root.starts_with(entry.path.as_path())
+          || entry.path.starts_with(final_root)
+          || entry.identity == identity
+          || ancestors.contains(&entry.identity)
+          || entry.ancestors.contains(&identity))
     });
-    if let Some(entry) = live {
+    if let Some((_, entry)) = live {
       return Some(entry.path.as_ref().clone());
     }
     set
@@ -385,14 +397,16 @@ impl Reservation {
   /// Reserves `path`, or reports the covering root when it overlaps. The
   /// pre-flight identity lets two concurrent spelling-aliased `watch` calls
   /// collide right here — the first reserver wins deterministically — instead
-  /// of both spending a spawn to lose at the driver's final check.
+  /// of both spending a spawn to lose at the driver's final check. `exempt`
+  /// is `replace_root`'s own scope (see [`RootSet::overlap_of`]).
   fn take(
     roots: &Arc<RwLock<RootSet>>,
     path: PathBuf,
     identity: Option<RootIdentity>,
+    exempt: Option<ScopeId>,
   ) -> Result<Self, WatchRootError> {
     let mut set = roots.write().unwrap_or_else(PoisonError::into_inner);
-    if let Some(existing) = set.overlap_of(&path, identity) {
+    if let Some(existing) = set.overlap_of(&path, identity, exempt) {
       return Err(WatchRootError::Overlaps { path, existing });
     }
     set.pending.push(PendingRoot {
@@ -617,7 +631,7 @@ impl<R> Watcher<R> {
     // cancellation on either side of the reply: a reply finding no receiver
     // is torn down by the driver directly, and a delivered-but-never-polled
     // reply unwinds through its `WatchGrant`.
-    let reservation = Reservation::take(&self.roots, canonical.clone(), identity)?;
+    let reservation = Reservation::take(&self.roots, canonical.clone(), identity, None)?;
 
     let (reply, response) = futures_channel::oneshot::channel();
     let sent = self

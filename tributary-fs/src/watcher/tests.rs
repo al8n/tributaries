@@ -155,9 +155,9 @@ fn reservations_collide_on_object_identity() {
   use crate::os::RootIdentity;
   let roots = Arc::new(RwLock::new(RootSet::default()));
   let id = RootIdentity::new(1, 42);
-  let first =
-    Reservation::take(&roots, PathBuf::from("/spelling/One"), Some(id)).expect("first spelling");
-  let err = Reservation::take(&roots, PathBuf::from("/spelling/one"), Some(id))
+  let first = Reservation::take(&roots, PathBuf::from("/spelling/One"), Some(id), None)
+    .expect("first spelling");
+  let err = Reservation::take(&roots, PathBuf::from("/spelling/one"), Some(id), None)
     .expect_err("one object, two spellings");
   assert!(
     matches!(err, WatchRootError::Overlaps { existing, .. } if existing.as_path() == Path::new("/spelling/One"))
@@ -178,12 +178,12 @@ fn reservations_collide_on_object_identity() {
         stats: None,
       },
     );
-  let err = Reservation::take(&roots, PathBuf::from("/live/root"), Some(id))
+  let err = Reservation::take(&roots, PathBuf::from("/live/root"), Some(id), None)
     .expect_err("aliases a live root");
   assert!(
     matches!(err, WatchRootError::Overlaps { existing, .. } if existing.as_path() == Path::new("/live/Root"))
   );
-  assert!(Reservation::take(&roots, PathBuf::from("/elsewhere"), None).is_ok());
+  assert!(Reservation::take(&roots, PathBuf::from("/elsewhere"), None, None).is_ok());
 }
 
 /// Same-watcher handles for scopes the registry does not know answer `None`
@@ -1074,4 +1074,117 @@ async fn foreign_backend_is_a_typed_spawn_error() {
   );
   watcher.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The replace exemption: a reservation (and the live-set check under it)
+/// excludes exactly ONE scope — the root being replaced — so widening onto
+/// an ancestor of ONLY that root reserves cleanly, while any OTHER live
+/// root's coverage still conflicts.
+#[test]
+fn reservation_exemption_excludes_exactly_the_replaced_scope() {
+  let roots = Arc::new(RwLock::new(RootSet::default()));
+  let replaced = ScopeId::new(core::num::NonZeroU64::new(7).unwrap());
+  let bystander = ScopeId::new(core::num::NonZeroU64::new(9).unwrap());
+  {
+    let mut set = roots.write().unwrap();
+    set.entries.insert(
+      replaced,
+      RootEntry {
+        path: Arc::new(PathBuf::from("/a/b")),
+        identity: RootIdentity::new(1, 10),
+        ancestors: vec![RootIdentity::new(1, 1)].into(),
+        backend: crate::os::BackendKind::FsEvents,
+        stats: None,
+      },
+    );
+    set.entries.insert(
+      bystander,
+      RootEntry {
+        path: Arc::new(PathBuf::from("/c/d")),
+        identity: RootIdentity::new(1, 20),
+        ancestors: vec![RootIdentity::new(1, 2)].into(),
+        backend: crate::os::BackendKind::FsEvents,
+        stats: None,
+      },
+    );
+  }
+
+  // Widening /a/b -> /a: overlaps ONLY the replaced scope — exempt passes.
+  let widened = Reservation::take(&roots, PathBuf::from("/a"), None, Some(replaced))
+    .expect("the replaced scope's own coverage never conflicts");
+  drop(widened);
+
+  // Without the exemption the same take conflicts (today's watch behavior).
+  let err = Reservation::take(&roots, PathBuf::from("/a"), None, None)
+    .expect_err("un-exempted overlap still conflicts");
+  assert!(matches!(err, WatchRootError::Overlaps { .. }));
+
+  // The exemption is NOT a blank check: /c (the bystander's ancestor)
+  // still conflicts even with the replaced scope exempted.
+  let err = Reservation::take(&roots, PathBuf::from("/c"), None, Some(replaced))
+    .expect_err("another live root's coverage still conflicts");
+  assert!(matches!(err, WatchRootError::Overlaps { .. }));
+
+  // Identity aliasing is exempted the same way: a candidate that IS the
+  // replaced root's object (same identity, different spelling) passes...
+  let aliased = Reservation::take(
+    &roots,
+    PathBuf::from("/A/B"),
+    Some(RootIdentity::new(1, 10)),
+    Some(replaced),
+  )
+  .expect("the replaced object under another spelling is exempt");
+  drop(aliased);
+  // ...while the bystander's object never does.
+  let err = Reservation::take(
+    &roots,
+    PathBuf::from("/elsewhere"),
+    Some(RootIdentity::new(1, 20)),
+    Some(replaced),
+  )
+  .expect_err("a bystander's object identity still conflicts");
+  assert!(matches!(err, WatchRootError::Overlaps { .. }));
+}
+
+/// The final-root gate honors the same exemption on the single-writer side:
+/// ancestor-identity containment against the replaced scope is exempt,
+/// against anyone else it conflicts.
+#[test]
+fn final_root_conflict_exemption_mirrors_the_reservation() {
+  let roots = Arc::new(RwLock::new(RootSet::default()));
+  let replaced = ScopeId::new(core::num::NonZeroU64::new(7).unwrap());
+  {
+    let mut set = roots.write().unwrap();
+    set.entries.insert(
+      replaced,
+      RootEntry {
+        path: Arc::new(PathBuf::from("/a/b")),
+        identity: RootIdentity::new(1, 10),
+        ancestors: vec![RootIdentity::new(1, 1)].into(),
+        backend: crate::os::BackendKind::FsEvents,
+        stats: None,
+      },
+    );
+  }
+  let writer = RegistryWriter {
+    roots: Arc::clone(&roots),
+  };
+  // /a contains /a/b (and /a IS the replaced root's recorded ancestor
+  // identity): exempted, no conflict.
+  assert_eq!(
+    writer.final_root_conflict(
+      Path::new("/a"),
+      RootIdentity::new(1, 1),
+      &[],
+      None,
+      Some(replaced),
+    ),
+    None
+  );
+  // Un-exempted, the same check conflicts.
+  assert!(
+    writer
+      .final_root_conflict(Path::new("/a"), RootIdentity::new(1, 1), &[], None, None)
+      .is_some()
+  );
 }
