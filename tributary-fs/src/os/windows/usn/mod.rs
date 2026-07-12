@@ -378,11 +378,27 @@ impl UsnAdmission {
       if record.reason & reason::FILE_DELETE != 0 {
         self.map.forget(record.frn);
       }
-      if record.reason & reason::REPARSE_POINT_CHANGE != 0 && self.map.contains(record.frn) {
-        // A mapped directory turning into (or out of) a reparse point is a
-        // containment change: drop the subtree and let the located rescan
-        // re-establish what is really below.
-        self.map.forget(record.frn);
+      if record.reason & reason::REPARSE_POINT_CHANGE != 0 {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if record.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+          // The directory BECAME a reparse boundary: drop the subtree; the
+          // located rescan re-establishes what is really below.
+          self.map.forget(record.frn);
+        } else if let UsnName::Utf8(name) = &record.name {
+          // The boundary was REMOVED — an ordinary directory now stands
+          // where the map holds nothing: learn the anchor and demand its
+          // walk, exactly like a move-in, or the subtree stays blind.
+          if self.map.learn(record.frn, record.parent, name.clone()) == LearnOutcome::OverCapacity {
+            out.push(UsnAdmitted::MapOverflow);
+            return;
+          }
+          if let UsnTarget::Resolved(components) = &target {
+            out.push(UsnAdmitted::MovedInSubtree {
+              frn: record.frn,
+              target: components.clone(),
+            });
+          }
+        }
       }
     }
 
@@ -1012,6 +1028,64 @@ mod r9_regressions {
     assert!(
       matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
       if c == &["b".to_owned(), "landed".to_owned(), "child".to_owned()])
+    );
+  }
+}
+
+#[cfg(test)]
+mod r10_regressions {
+  use super::{
+    UsnAdmission, UsnAdmitted, UsnTarget,
+    decode::{UsnName, UsnRecord},
+    map::FrnMap,
+    reason,
+  };
+
+  /// A reparse boundary REMOVED mid-stream: the now-ordinary directory is
+  /// learned and its walk demanded — never a permanently blind subtree.
+  #[test]
+  fn a_removed_reparse_boundary_demands_its_walk() {
+    let mut map = FrnMap::new(1, None);
+    map.seed([(10, 1, "a".into())]);
+    let mut adm = UsnAdmission::new(map, 64);
+    let mut out = Vec::new();
+    // FRN 70 was a junction under a: excluded from the map. The boundary
+    // is removed (no reparse attribute anymore).
+    adm.admit(
+      UsnRecord {
+        frn: 70,
+        parent: 10,
+        usn: 0,
+        reason: reason::REPARSE_POINT_CHANGE | reason::CLOSE,
+        source_info: 0,
+        attributes: 0x10,
+        name: UsnName::Utf8("was-junction".into()),
+      },
+      &mut out,
+    );
+    assert!(
+      out.iter().any(
+        |e| matches!(e, UsnAdmitted::MovedInSubtree { frn: 70, target }
+        if target == &["a".to_owned(), "was-junction".to_owned()])
+      ),
+      "{out:?}"
+    );
+    out.clear();
+    adm.admit(
+      UsnRecord {
+        frn: 80,
+        parent: 70,
+        usn: 0,
+        reason: reason::FILE_CREATE,
+        source_info: 0,
+        attributes: 0x20,
+        name: UsnName::Utf8("child".into()),
+      },
+      &mut out,
+    );
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
+      if c == &["a".to_owned(), "was-junction".to_owned(), "child".to_owned()])
     );
   }
 }
