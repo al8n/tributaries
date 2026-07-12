@@ -2991,6 +2991,118 @@ mod replace {
     assert!(on_reply1.await.expect("driver replies").is_ok());
   }
 
+  /// The unwatch fence is per-scope QUIESCENCE: a replace's retired old
+  /// stream is still shutting down when the unwatch starts, and its earlier
+  /// completion must NOT resolve the unwatch — only the last teardown of the
+  /// scope does.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn unwatch_resolves_only_at_scope_teardown_quiescence() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // The swap commits while its old-stream teardown parks on gate1.
+    let gate1 = rig.fs.hold_teardowns();
+    assert!(replace(&rig, scope, "/r").await.is_ok());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The unwatch's own teardown parks on gate2 (a fresh gate: the parked
+    // old-stream thread keeps waiting on the one it cloned at park time).
+    let gate2 = rig.fs.hold_teardowns();
+    let (reply, mut on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The old-stream straggler completes FIRST; the unwatch must keep
+    // pending until the CURRENT stream is down too.
+    gate1.release();
+    settle(|| rig.fs.shutdowns() == 1).await;
+    assert_eq!(rig.fs.shutdowns(), 1, "only the straggler completed");
+    assert!(
+      futures_util::poll!(&mut on_reply).is_pending(),
+      "a straggler's completion must not resolve the unwatch"
+    );
+
+    gate2.release();
+    assert!(on_reply.await.unwrap(), "resolved at quiescence");
+    settle(|| rig.fs.shutdowns() == 2).await;
+  }
+
+  /// The commit linearization contract, pinned: a death still QUEUED on the
+  /// old lane when the commit lands is dominated whole — the swap reports
+  /// success and the covering Rescan re-reads the (new) world; the old
+  /// world's fate concerns nothing the scope still covers. The race is
+  /// irreducible (a death can always sit in the kernel buffer, not yet in
+  /// any queue), so the driver's serialization decides — and BOTH orders
+  /// are safe: a death processed first wins (`death_wins_a_mid_swap_
+  /// unwatch`), a death queued behind the commit is moot, and a death of
+  /// the LIVE world always arrives on the new lane, which is never
+  /// suppressed (the tail of this cell).
+  #[tokio::test(start_paused = true)]
+  async fn a_queued_old_lane_death_is_dominated_by_the_commit() {
+    let registry = RecordingRegistry::default();
+    let rig = rig_with(64, registry.clone());
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // Park the replacement spawn; queue the old stream's death while the
+    // driver cannot run (paused current-thread runtime — it advances only
+    // at our awaits); then let the spawn finish on the REAL-clock pool
+    // while the driver is still frozen. At the next await both queues are
+    // ready and the biased select commits BEFORE consuming the death.
+    let gate = rig.fs.hold_spawns();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply,
+      })
+      .await
+      .unwrap();
+    // Let the driver process the command and PARK the spawn on the gate
+    // (the send resolves on channel capacity alone, before the driver ran).
+    for _ in 0..8 {
+      tokio::task::yield_now().await;
+    }
+    rig.fs.send_fatal("/r/sub");
+    gate.release();
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+      on_reply.await.expect("driver replies").is_ok(),
+      "the commit wins the serialization"
+    );
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), Path::new("/r"));
+    assert!(change.kind().is_rescan(), "the covering Rescan: {change:?}");
+    assert_eq!(registry.dead(), [], "the old world's death is moot");
+
+    // The scope is genuinely alive on the new lane...
+    rig
+      .fs
+      .send_batch("/r", vec![ev("/r/live.txt", created(), 9, 19)]);
+    let (s, _root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert!(change.kind().is_created());
+
+    // ...and a death of the LIVE world is never suppressed: deaths are only
+    // ever reordered around the commit, never lost.
+    rig.fs.disconnect("/r");
+    settle(|| registry.dead() == [scope]).await;
+    assert_eq!(registry.dead(), [scope], "the new lane's death lands");
+  }
+
   #[tokio::test(start_paused = true)]
   async fn an_unknown_scope_is_refused() {
     let rig = rig_with_capacity(64);
