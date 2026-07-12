@@ -56,29 +56,32 @@ fn seed_walk(
   root_frn: u128,
   max_directories: Option<usize>,
 ) -> Result<FrnMap, ProbeStage> {
-  let mut map = FrnMap::new(root_frn, max_directories);
-  let mut queue = vec![(canonical.to_path_buf(), root_frn)];
-  while let Some((dir_path, dir_frn)) = queue.pop() {
-    let entries = match std::fs::read_dir(&dir_path) {
-      Ok(entries) => entries,
-      Err(err) if err.kind() == io::ErrorKind::NotFound => {
-        // The directory vanished (or was renamed) after its parent's
-        // enumeration LEARNED it: a mapped anchor with unwalked
-        // descendants would be falsely complete — a later in-root rename
-        // would reparent it and bypass the absent-FRN demand-walk. Forget
-        // the anchor; the journal replay re-learns it through the
-        // move-in/demand-walk path with the walk it owes.
-        map.forget(dir_frn);
-        continue;
+  // A queued directory whose path stops opening mid-walk means the tree
+  // mutated under the walk — and not necessarily AT that directory: an
+  // ANCESTOR rename strands every queued descendant's stale path while the
+  // ancestor itself stays mapped, so replay would reparent it with no walk
+  // owed. No local repair is complete; the walk restarts against the tree
+  // as it now is, and refuses if the churn outruns it.
+  const ATTEMPTS: usize = 3;
+  'attempt: for _ in 0..ATTEMPTS {
+    let mut map = FrnMap::new(root_frn, max_directories);
+    let mut queue = vec![(canonical.to_path_buf(), root_frn)];
+    while let Some((dir_path, dir_frn)) = queue.pop() {
+      let entries = match std::fs::read_dir(&dir_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound && dir_frn != root_frn => {
+          continue 'attempt;
+        }
+        Err(_) => return Err(ProbeStage::Walk),
+      };
+      for entry in entries {
+        let entry = entry.map_err(|_| ProbeStage::Walk)?;
+        admit_walk_entry(&mut map, &mut queue, &entry, dir_frn).map_err(|_| ProbeStage::Walk)?;
       }
-      Err(_) => return Err(ProbeStage::Walk),
-    };
-    for entry in entries {
-      let entry = entry.map_err(|_| ProbeStage::Walk)?;
-      admit_walk_entry(&mut map, &mut queue, &entry, dir_frn).map_err(|_| ProbeStage::Walk)?;
     }
+    return Ok(map);
   }
-  Ok(map)
+  Err(ProbeStage::Walk)
 }
 
 /// Walks one moved-in subtree into the live map (the seed walk's shape,

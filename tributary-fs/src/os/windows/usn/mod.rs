@@ -491,9 +491,14 @@ impl UsnAdmission {
         }
         (true, false) => self.map.forget(new.frn),
         (false, true) => {
-          if let UsnName::Utf8(name) = &new.name
-            && self.map.learn(new.frn, new.parent, name.clone()) == LearnOutcome::OverCapacity
-          {
+          // A directory arriving from outside with a name the vocabulary
+          // cannot carry could never anchor its standing tree: map death,
+          // exactly like its in-root sibling cells.
+          let UsnName::Utf8(name) = &new.name else {
+            out.push(UsnAdmitted::MapOverflow);
+            return;
+          };
+          if self.map.learn(new.frn, new.parent, name.clone()) == LearnOutcome::OverCapacity {
             out.push(UsnAdmitted::MapOverflow);
             return;
           }
@@ -1210,6 +1215,52 @@ mod r11_regressions {
     assert!(
       matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
       if c == &["a".to_owned(), "arrived".to_owned(), "child".to_owned()])
+    );
+  }
+}
+
+#[cfg(test)]
+mod r12_regressions {
+  use super::{
+    UsnAdmission, UsnAdmitted,
+    decode::{UsnName, UsnRecord},
+    map::FrnMap,
+    reason,
+  };
+
+  /// An out-to-in directory move whose NEW name has no spelling is map
+  /// death — never a bare parent rescan over a standing unmapped tree.
+  #[test]
+  fn an_unnameable_move_in_is_map_death() {
+    let mut map = FrnMap::new(1, None);
+    map.seed([(10, 1, "a".into())]);
+    let mut adm = UsnAdmission::new(map, 64);
+    let mut out = Vec::new();
+    let dir = |frn, parent, mask, name| UsnRecord {
+      frn,
+      parent,
+      usn: 0,
+      reason: mask,
+      source_info: 0,
+      attributes: 0x10,
+      name,
+    };
+    adm.admit(
+      dir(
+        70,
+        999,
+        reason::RENAME_OLD_NAME,
+        UsnName::Utf8("ext".into()),
+      ),
+      &mut out,
+    );
+    adm.admit(
+      dir(70, 10, reason::RENAME_NEW_NAME, UsnName::Escalate),
+      &mut out,
+    );
+    assert!(
+      out.iter().any(|e| matches!(e, UsnAdmitted::MapOverflow)),
+      "{out:?}"
     );
   }
 }
