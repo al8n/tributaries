@@ -1683,7 +1683,13 @@ pub(crate) async fn run<R, F>(
                 pending_teardowns.remove(&scope);
               }
             }
-            if let Some(reply) = unwatch_replies.remove(&scope) {
+            // The unwatch fence is per-scope QUIESCENCE: a replace can leave
+            // an old or refused stream shutting down beside the current one,
+            // and an earlier straggler's completion must not resolve the
+            // unwatch while the stream unwatch retired is still going down.
+            if !pending_teardowns.contains_key(&scope)
+              && let Some(reply) = unwatch_replies.remove(&scope)
+            {
               let _ = reply.send(true);
             }
           }
@@ -1868,7 +1874,10 @@ pub(crate) async fn run<R, F>(
               pending_teardowns.remove(&scope);
             }
           }
-          if let Some(reply) = unwatch_replies.remove(&scope) {
+          // The same per-scope quiescence fence as the live arm.
+          if !pending_teardowns.contains_key(&scope)
+            && let Some(reply) = unwatch_replies.remove(&scope)
+          {
             let _ = reply.send(true);
           }
         }
