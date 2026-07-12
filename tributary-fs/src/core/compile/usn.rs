@@ -76,20 +76,22 @@ impl DriverCore {
       UsnAdmitted::Renamed { old, new, is_dir } => {
         match (old, new) {
           (UsnTarget::Resolved(old_c), UsnTarget::Resolved(new_c)) => {
-            let Some(root) = state.root.as_deref() else {
-              return vec![Planned::Over(Scope::Root(scope))];
-            };
-            let join = |components: &[String]| {
-              components
-                .iter()
-                .fold(root.to_path_buf(), |path, component| path.join(component))
-            };
-            // A directory moved IN from outside arrives as a pre-degraded
-            // Single (never here), so this pair is in-root: the reparent
-            // carried the subtree, nothing extra is owed, and the Monitor's
-            // own class handling threads `is_dir` through the pair.
-            let _ = is_dir;
-            self.plan_rename(state, scope, &join(&old_c), &join(&new_c))
+            // Both ends are in-root, already root-relative: mint the
+            // counter cookie and emit the adjacent pair directly (host
+            // path separators must never decide a lowering). A directory
+            // moved IN from outside arrives as a pre-degraded Single
+            // (never here); the reparent carried the subtree, and the
+            // Monitor's own class handling threads `is_dir` through.
+            let cookie = self.next_cookie();
+            let from_rec = OsRecord::new(state.watch, RecordKind::MovedFrom)
+              .with_target(location_of(&old_c))
+              .with_cookie(cookie)
+              .with_is_dir(is_dir);
+            let to_rec = OsRecord::new(state.watch, RecordKind::MovedTo)
+              .with_target(location_of(&new_c))
+              .with_cookie(cookie)
+              .with_is_dir(is_dir);
+            vec![Planned::Rec(from_rec), Planned::Rec(to_rec)]
           }
           // An escalated end covers its deepest named location; the other
           // end still plans as its half's membership verb through the
