@@ -225,6 +225,17 @@ pub(crate) enum UsnAdmitted {
   /// The subject IS the root anchor and the record is structural: the
   /// scope's death (delete or rename of the watched root).
   RootDeath,
+  /// A directory moved IN from outside the root: its subtree is unmapped
+  /// until the source walks it, and the walk window is covered by a located
+  /// rescan at the target. The lowering emits the cover; the source runs
+  /// the walk (or escalates to a full reseed when it cannot complete).
+  MovedInSubtree {
+    /// The directory's FRN — the walk's map anchor.
+    frn: u128,
+    /// The directory's root-relative components — the walk's path anchor
+    /// and the rescan's location.
+    target: Vec<String>,
+  },
   /// The map could no longer stay complete (a live learn overflowed the
   /// directory cap): the source must die rather than go blind.
   MapOverflow,
@@ -265,6 +276,13 @@ impl UsnAdmission {
     if fresh == 0 {
       return;
     }
+    // The record forwards its FRESH bits only: cumulative masks would
+    // re-report every prior session fact on each new record, and structural
+    // priority would then eat the genuinely new content bit.
+    let record = UsnRecord {
+      reason: fresh,
+      ..record
+    };
     let mut paired = Vec::new();
     self.pairer.push(record, fresh, &mut paired);
     for event in paired {
@@ -291,7 +309,7 @@ impl UsnAdmission {
       // same way.
       UsnEvent::WidowOld(record) => {
         let synthetic = UsnRecord {
-          reason: reason::FILE_DELETE,
+          reason: reason::FILE_DELETE | (record.reason & (reason::MODIFY | reason::ATTRIB)),
           ..record
         };
         self.admit_single(synthetic, out);
@@ -299,7 +317,7 @@ impl UsnAdmission {
       // A widowed NEW arrived from nowhere visible: a create.
       UsnEvent::WidowNew(record) => {
         let synthetic = UsnRecord {
-          reason: reason::FILE_CREATE,
+          reason: reason::FILE_CREATE | (record.reason & (reason::MODIFY | reason::ATTRIB)),
           ..record
         };
         self.admit_single(synthetic, out);
@@ -416,9 +434,16 @@ impl UsnAdmission {
             out.push(UsnAdmitted::MapOverflow);
             return;
           }
-          // A directory moved IN brings an unmapped subtree: the pending
-          // walk is the source's duty; the admitted event's located rescan
-          // covers the window either way.
+          // A directory moved IN brings an unmapped subtree: demand the
+          // walk and cover its window with a located rescan at the target.
+          if let Some(new_target) = &new_end
+            && let UsnTarget::Resolved(components) = new_target
+          {
+            out.push(UsnAdmitted::MovedInSubtree {
+              frn: new.frn,
+              target: components.clone(),
+            });
+          }
         }
         (false, false) => {}
       }
@@ -733,5 +758,113 @@ mod admission_tests {
       &mut out,
     );
     assert!(out.is_empty());
+  }
+}
+
+#[cfg(test)]
+mod r1_regressions {
+  use super::{
+    UsnAdmission, UsnAdmitted, UsnTarget,
+    decode::{UsnName, UsnRecord},
+    map::FrnMap,
+    reason,
+  };
+
+  const ROOT: u128 = 1;
+
+  fn admission() -> UsnAdmission {
+    let mut map = FrnMap::new(ROOT, None);
+    map.seed([(10, ROOT, "a".into())]);
+    UsnAdmission::new(map, 64)
+  }
+
+  fn record(frn: u128, parent: u128, reason_mask: u32, attrs: u32, name: &str) -> UsnRecord {
+    UsnRecord {
+      frn,
+      parent,
+      usn: 0,
+      reason: reason_mask,
+      source_info: 0,
+      attributes: attrs,
+      name: UsnName::Utf8(name.into()),
+    }
+  }
+
+  /// A cumulative CREATE|DATA_EXTEND after an emitted CREATE reports the
+  /// Modified fact — never a second Created that eats it.
+  #[test]
+  fn cumulative_masks_forward_fresh_bits_only() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(record(50, 10, reason::FILE_CREATE, 0x20, "f"), &mut out);
+    assert!(matches!(&out[0], UsnAdmitted::Single { delta, .. }
+      if *delta == reason::FILE_CREATE));
+
+    out.clear();
+    adm.admit(
+      record(50, 10, reason::FILE_CREATE | reason::DATA_EXTEND, 0x20, "f"),
+      &mut out,
+    );
+    assert_eq!(out.len(), 1);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { delta, .. }
+      if *delta == reason::DATA_EXTEND),
+      "only the fresh content bit forwards: {out:?}"
+    );
+  }
+
+  /// A widowed half keeps its fresh content bits alongside the synthetic
+  /// membership verb.
+  #[test]
+  fn widows_keep_their_content_bits() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(
+      record(
+        50,
+        10,
+        reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE,
+        0x20,
+        "f",
+      ),
+      &mut out,
+    );
+    adm.flush(&mut out);
+    assert_eq!(out.len(), 1);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { delta, .. }
+      if delta & reason::FILE_DELETE != 0 && delta & reason::DATA_OVERWRITE != 0),
+      "{out:?}"
+    );
+  }
+
+  /// A directory moved IN from outside demands its subtree walk and the
+  /// covering located rescan at the target.
+  #[test]
+  fn a_moved_in_directory_demands_its_walk() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(
+      record(70, 999, reason::RENAME_OLD_NAME, 0x10, "ext"),
+      &mut out,
+    );
+    adm.admit(
+      record(70, 10, reason::RENAME_NEW_NAME, 0x10, "in"),
+      &mut out,
+    );
+    assert!(
+      out.iter().any(
+        |e| matches!(e, UsnAdmitted::MovedInSubtree { frn: 70, target }
+        if target == &["a".to_owned(), "in".to_owned()])
+      ),
+      "{out:?}"
+    );
+    // The moved-in top is mapped: its children admit immediately.
+    out.clear();
+    adm.admit(record(80, 70, reason::FILE_CREATE, 0x20, "child"), &mut out);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
+      if c == &["a".to_owned(), "in".to_owned(), "child".to_owned()])
+    );
   }
 }

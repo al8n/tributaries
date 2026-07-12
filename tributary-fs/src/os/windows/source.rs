@@ -225,7 +225,7 @@ impl Source {
 
     let buffer_len = config.channel_capacity.get().max(1) * 1024;
     let buffer_len = buffer_len.clamp(4 * 1024, 64 * 1024);
-    let mut io_state = PumpIo {
+    let io_state = PumpIo {
       handle,
       port,
       buffers: [
@@ -239,14 +239,6 @@ impl Source {
       active: 0,
       extended: true,
     };
-
-    // The first issue doubles as the record-layout probe: a kernel or
-    // filesystem without the extended class refuses the issue itself, and
-    // the stream falls back to the basic layout once, before it is live.
-    if io_state.issue().is_err() {
-      io_state.extended = false;
-      io_state.issue().map_err(|_| SourceError::StartFailed)?;
-    }
 
     let (queue_tx, queue_rx) = async_channel::unbounded();
     let shared = Arc::new(PumpShared {
@@ -425,10 +417,25 @@ fn spawn_pump(io_state: PumpIo, shared: Arc<PumpShared>) -> Result<JoinHandle<()
     .name("tributary-fs.rdcw".into())
     .spawn(move || {
       let mut io_state = io_state;
+      // The FIRST issue happens here, after every fallible setup step: no
+      // pinned read can exist for a spawn that fails to start its pump. It
+      // doubles as the record-layout probe — a kernel or filesystem without
+      // the extended class refuses the issue itself, and the stream falls
+      // back to the basic layout once, before anything is delivered.
+      if io_state.issue().is_err() {
+        io_state.extended = false;
+        if io_state.issue().is_err() {
+          shared.fatal(SourceError::StartFailed);
+          return;
+        }
+      }
       let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&mut io_state, &shared);
       }));
       if outcome.is_err() {
+        // A panicked pump cannot prove its read's pin ended: leak the I/O
+        // state rather than drop memory the kernel may still write.
+        std::mem::forget(io_state);
         shared.fatal(SourceError::CallbackPanic);
       }
     })

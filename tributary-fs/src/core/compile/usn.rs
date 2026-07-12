@@ -64,6 +64,15 @@ impl DriverCore {
       // acceptable, so the whole root degrades to the covering rescan (the
       // source dies alongside; this record is the in-band cover).
       UsnAdmitted::MapOverflow => vec![Planned::Over(Scope::Root(scope))],
+      // A moved-in directory's subtree is unmapped until the source's walk
+      // completes: the located rescan owns that window (and re-enumerates
+      // whatever the walk could not see happen).
+      UsnAdmitted::MovedInSubtree { target, .. } => {
+        vec![Planned::Over(located(
+          state.watch,
+          Some(location_of(&target)),
+        ))]
+      }
       UsnAdmitted::Renamed { old, new, is_dir } => {
         match (old, new) {
           (UsnTarget::Resolved(old_c), UsnTarget::Resolved(new_c)) => {
