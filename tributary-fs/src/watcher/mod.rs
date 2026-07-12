@@ -18,7 +18,7 @@ use tributary_proto::{Change, Interest, ScopeId};
 
 use crate::{
   driver::{Command, DriverConfig, RealFs, ScopeRegistry, run},
-  error::{BuildError, CloseError, UnwatchError, WatchRootError},
+  error::{BuildError, CloseError, ReplaceRootError, UnwatchError, WatchRootError},
   event::Event,
   options::WatcherOptions,
   os::{BackendKind, BackendStats, RootIdentity, SourceError},
@@ -388,10 +388,17 @@ impl ScopeRegistry for RegistryWriter {
 /// ([`ScopeRegistry::final_root_conflict`]) is the authority on what actually
 /// goes live.
 #[derive(Debug)]
-struct Reservation {
+pub(crate) struct Reservation {
   roots: Arc<RwLock<RootSet>>,
   path: PathBuf,
 }
+
+/// The reservation guard as the driver holds it during a replace: the
+/// watcher takes it (with the replaced scope exempted) before the command
+/// round-trip, and the DRIVER drops it at commit or failure — so cancelling
+/// the caller's future can never release the new root's reservation out
+/// from under an in-flight swap.
+pub(crate) type ReservationGuard = Reservation;
 
 impl Reservation {
   /// Reserves `path`, or reports the covering root when it overlaps. The
@@ -418,6 +425,25 @@ impl Reservation {
       roots: Arc::clone(roots),
       path,
     })
+  }
+}
+
+impl Reservation {
+  /// The reserved canonical path — the driver's final-check self-exemption
+  /// for the reservation a `Replace` command itself carries.
+  pub(crate) fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// A detached guard over an isolated set — the driver suites' stand-in
+  /// (reservation SEMANTICS have their own suites; the driver only drops
+  /// the guard it is handed).
+  #[cfg(test)]
+  pub(crate) fn detached_for_tests(path: PathBuf) -> Self {
+    Self {
+      roots: Arc::new(RwLock::new(RootSet::default())),
+      path,
+    }
   }
 }
 
@@ -663,6 +689,93 @@ impl<R> Watcher<R> {
       Err(_) => {
         self.driver_gone();
         Err(WatchRootError::Closed)
+      }
+    }
+  }
+
+  /// Replaces `root`'s coverage with `new_root` — the sanctioned transition
+  /// between disjoint coverage states (the canonical case: widening `/a/b`
+  /// to `/a`). The `RootHandle`, scope, and epoch stream survive; on
+  /// kernel-recursive backends the swap is make-before-break (the new
+  /// stream is live before the old one is retired), and the commit delivers
+  /// one epoch-bumped full-root `Rescan` instructing the consumer to
+  /// re-read the widened world — which covers the swap window and the newly
+  /// covered delta alike. Locations are relative to
+  /// [`root_path(handle)`](Self::root_path) at delivery time.
+  ///
+  /// Atomic-on-failure: every error leaves the old root's coverage
+  /// untouched. NOT cancel-abortive: the reservation travels with the
+  /// command and the driver commits independently, so dropping this future
+  /// abandons the notification, never the swap.
+  ///
+  /// # Errors
+  ///
+  /// [`ReplaceRootError::NotFound`] / [`NotADirectory`](ReplaceRootError::NotADirectory)
+  /// when `new_root` cannot anchor a watch;
+  /// [`Overlaps`](ReplaceRootError::Overlaps) when it overlaps a DIFFERENT
+  /// live root (the replaced root is exempt);
+  /// [`UnknownRoot`](ReplaceRootError::UnknownRoot) /
+  /// [`ReplaceInFlight`](ReplaceRootError::ReplaceInFlight) for handle
+  /// misuse; [`BackendDiverged`](ReplaceRootError::BackendDiverged) when the
+  /// replacement resolves to a different lowering profile;
+  /// [`Retired`](ReplaceRootError::Retired) when the root died mid-swap
+  /// (death wins — retry with a fresh [`watch`](Self::watch));
+  /// [`Closed`](ReplaceRootError::Closed) once the watcher is closed;
+  /// [`Source`](ReplaceRootError::Source) when the replacement stream could
+  /// not start.
+  pub async fn replace_root(
+    &self,
+    root: RootHandle,
+    new_root: impl Into<PathBuf>,
+  ) -> Result<(), ReplaceRootError> {
+    if root.instance() != self.instance {
+      return Err(ReplaceRootError::UnknownRoot);
+    }
+    let supplied = new_root.into();
+    let canonical = std::fs::canonicalize(&supplied).map_err(|err| {
+      if err.kind() == std::io::ErrorKind::NotFound {
+        ReplaceRootError::NotFound { path: supplied }
+      } else {
+        ReplaceRootError::Source(SourceError::RootUnavailable {
+          root: supplied,
+          source: err,
+        })
+      }
+    })?;
+    let meta = std::fs::metadata(&canonical).ok();
+    if !meta.as_ref().is_some_and(|meta| meta.is_dir()) {
+      return Err(ReplaceRootError::NotADirectory { path: canonical });
+    }
+    let identity = meta.as_ref().and_then(identity_of);
+    let reservation =
+      Reservation::take(&self.roots, canonical.clone(), identity, Some(root.scope())).map_err(
+        |err| match err {
+          WatchRootError::Overlaps { path, existing } => {
+            ReplaceRootError::Overlaps { path, existing }
+          }
+          _ => ReplaceRootError::UnknownRoot,
+        },
+      )?;
+
+    let (reply, response) = futures_channel::oneshot::channel();
+    let sent = self
+      .commands
+      .send(Command::Replace {
+        scope: root.scope(),
+        root: canonical,
+        reservation,
+        reply,
+      })
+      .await;
+    if sent.is_err() {
+      self.driver_gone();
+      return Err(ReplaceRootError::Closed);
+    }
+    match response.await {
+      Ok(outcome) => outcome,
+      Err(_) => {
+        self.driver_gone();
+        Err(ReplaceRootError::Closed)
       }
     }
   }

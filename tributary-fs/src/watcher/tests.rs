@@ -1042,6 +1042,300 @@ mod lifecycle {
     watcher.close().await.expect("close");
     let _ = std::fs::remove_dir_all(&dir);
   }
+
+  /// The public swap contract end to end: the handle survives, the registry
+  /// view flips old → new, the old path is immediately re-watchable, and the
+  /// same handle still unwatches afterwards.
+  #[tokio::test(start_paused = true)]
+  async fn replace_root_swaps_the_registry_view() {
+    let (dir_a, canon_a) = scratch("replace-old");
+    let (dir_b, canon_b) = scratch("replace-new");
+    let fs = FakeFs::new(1);
+    fs.put(&canon_a, FileKind::Dir, 1);
+    fs.put(&canon_b, FileKind::Dir, 2);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let handle = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+    let backend = watcher.backend_of(handle).expect("a live backend");
+
+    watcher
+      .replace_root(handle, &dir_b)
+      .await
+      .expect("the swap commits");
+    settle(|| fs.shutdowns() == 1).await;
+    assert_eq!(watcher.registry_len(), 1, "one scope throughout");
+    assert_eq!(
+      watcher.root_path(handle).as_deref(),
+      Some(canon_b.as_path()),
+      "the view re-roots"
+    );
+    assert_eq!(watcher.backend_of(handle), Some(backend));
+
+    // The old coverage is released: the old path watches afresh.
+    let fresh = watcher
+      .watch(&dir_a, Interest::all())
+      .await
+      .expect("the old root is free again");
+    watcher.unwatch(fresh).await.expect("unwatch the fresh");
+
+    watcher.unwatch(handle).await.expect("the handle survives");
+    settle(|| watcher.registry_len() == 0).await;
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+  }
+
+  /// The awaited error contract: each refusal shape surfaces typed, with the
+  /// watch untouched.
+  #[tokio::test(start_paused = true)]
+  async fn replace_root_refusals_are_typed_and_atomic() {
+    let (dir_a, canon_a) = scratch("refuse-old");
+    let (dir_v, canon_v) = scratch("refuse-victim");
+    let file = dir_a.join("plain.txt");
+    std::fs::write(&file, b"x").expect("a plain file");
+    let fs = FakeFs::new(1);
+    fs.put(&canon_a, FileKind::Dir, 1);
+    fs.put(&canon_v, FileKind::Dir, 2);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+    let handle = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+    let _victim = watcher.watch(&dir_v, Interest::all()).await.expect("watch");
+
+    // A new root that does not exist.
+    let missing = dir_a.join("nope");
+    assert!(matches!(
+      watcher.replace_root(handle, &missing).await,
+      Err(ReplaceRootError::NotFound { .. })
+    ));
+    // A new root that is not a directory.
+    assert!(matches!(
+      watcher.replace_root(handle, &file).await,
+      Err(ReplaceRootError::NotADirectory { .. })
+    ));
+    // A handle from another watcher instance.
+    let other_fs = FakeFs::new(1);
+    other_fs.put(&canon_v, FileKind::Dir, 2);
+    let other =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), other_fs.clone()).expect("build");
+    let foreign = other.watch(&dir_v, Interest::all()).await.expect("watch");
+    assert!(matches!(
+      watcher.replace_root(foreign, &dir_v).await,
+      Err(ReplaceRootError::UnknownRoot)
+    ));
+    other.close().await.expect("close other");
+    // A new root that overlaps ANOTHER live watch — refused at reservation
+    // time, exemption notwithstanding.
+    match watcher.replace_root(handle, &dir_v).await {
+      Err(ReplaceRootError::Overlaps { path, existing }) => {
+        assert_eq!(path, canon_v);
+        assert_eq!(existing, canon_v);
+      }
+      other => panic!("expected Overlaps, got {other:?}"),
+    }
+
+    // Every refusal left the watch untouched.
+    assert_eq!(watcher.registry_len(), 2);
+    assert_eq!(
+      watcher.root_path(handle).as_deref(),
+      Some(canon_a.as_path())
+    );
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_v);
+  }
+
+  /// Cancellation at each await boundary of `replace_root`, crossed with the
+  /// spawn fates. Once the command is sent the driver owns the swap — a
+  /// dropped future abandons only the NOTIFICATION: a viable swap still
+  /// commits, a failed one still unwinds. In every arm the reservation is
+  /// released, `registry_len` holds at 1, and `root_path` reports the old
+  /// root or the new one — never neither.
+  #[tokio::test(start_paused = true)]
+  async fn replace_cancellation_at_every_await_point_leaves_consistent_state() {
+    // Dropped before the first poll: nothing was reserved, nothing was sent.
+    {
+      let (dir_a, canon_a) = scratch("rc-unpolled-old");
+      let (dir_b, _canon_b) = scratch("rc-unpolled-new");
+      let fs = FakeFs::new(1);
+      fs.put(&canon_a, FileKind::Dir, 1);
+      fs.put(&std::fs::canonicalize(&dir_b).unwrap(), FileKind::Dir, 2);
+      let watcher =
+        Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+      let handle = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+
+      drop(watcher.replace_root(handle, &dir_b));
+      assert_eq!(
+        watcher.root_path(handle).as_deref(),
+        Some(canon_a.as_path())
+      );
+      let fresh = watcher
+        .watch(&dir_b, Interest::all())
+        .await
+        .expect("no reservation lingers");
+      watcher.unwatch(fresh).await.expect("unwatch");
+      watcher.close().await.expect("close");
+      let _ = std::fs::remove_dir_all(&dir_a);
+      let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // Dropped post-send while the spawn is HELD: the driver still commits.
+    // Mid-window the view reports the OLD root — never neither.
+    for drop_after_settle in [false, true] {
+      let (dir_a, canon_a) = scratch(if drop_after_settle {
+        "rc-unpolled-reply-old"
+      } else {
+        "rc-held-old"
+      });
+      let (dir_b, canon_b) = scratch(if drop_after_settle {
+        "rc-unpolled-reply-new"
+      } else {
+        "rc-held-new"
+      });
+      let fs = FakeFs::new(1);
+      fs.put(&canon_a, FileKind::Dir, 1);
+      fs.put(&canon_b, FileKind::Dir, 2);
+      let watcher =
+        Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+      let handle = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+
+      let gate = (!drop_after_settle).then(|| fs.hold_spawns());
+      {
+        let mut fut = Box::pin(watcher.replace_root(handle, &dir_b));
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+        if drop_after_settle {
+          // The reply is delivered but never polled out.
+          settle(|| fs.shutdowns() == 1).await;
+        } else {
+          assert_eq!(
+            watcher.root_path(handle).as_deref(),
+            Some(canon_a.as_path()),
+            "mid-swap the view is the OLD root, never neither"
+          );
+        }
+        // The future drops here — the notification is abandoned.
+      }
+      if let Some(gate) = &gate {
+        gate.release();
+      }
+      settle(|| fs.shutdowns() == 1 && watcher.root_path(handle).as_deref() == Some(&canon_b))
+        .await;
+      assert_eq!(watcher.registry_len(), 1);
+      assert_eq!(
+        watcher.root_path(handle).as_deref(),
+        Some(canon_b.as_path()),
+        "the abandoned swap still committed (drop_after_settle={drop_after_settle})"
+      );
+      let fresh = watcher
+        .watch(&dir_a, Interest::all())
+        .await
+        .expect("the old coverage was released");
+      watcher.unwatch(fresh).await.expect("unwatch");
+      watcher.close().await.expect("close");
+      let _ = std::fs::remove_dir_all(&dir_a);
+      let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // Dropped post-send and the spawn FAILS: the driver unwinds — the old
+    // watch is untouched and the reservation is released.
+    {
+      let (dir_a, canon_a) = scratch("rc-fail-old");
+      let (dir_b, canon_b) = scratch("rc-fail-new");
+      let fs = FakeFs::new(1);
+      fs.put(&canon_a, FileKind::Dir, 1);
+      // canon_b exists on the REAL fs but not in the fake: the spawn fails.
+      let watcher =
+        Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+      let handle = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+
+      {
+        let mut fut = Box::pin(watcher.replace_root(handle, &dir_b));
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+      }
+      // The release is observable as the error KIND flipping: `Overlaps`
+      // names the still-held reservation, while a fresh Source failure can
+      // only come from an attempt that RESERVED canon_b itself.
+      let mut released = false;
+      for _ in 0..500 {
+        match watcher.watch(&dir_b, Interest::all()).await {
+          Err(WatchRootError::Overlaps { .. }) => {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+          }
+          Err(_) => {
+            released = true;
+            break;
+          }
+          Ok(_) => panic!("canon_b is not in the fake tree yet"),
+        }
+      }
+      assert!(released, "the failed replace releases its reservation");
+      assert_eq!(
+        watcher.root_path(handle).as_deref(),
+        Some(canon_a.as_path()),
+        "the failed swap left the old root"
+      );
+      // And the path is genuinely re-watchable once the root exists.
+      fs.put(&canon_b, FileKind::Dir, 2);
+      let fresh = watcher
+        .watch(&dir_b, Interest::all())
+        .await
+        .expect("re-watchable after the unwind");
+      watcher.unwatch(fresh).await.expect("unwatch");
+      watcher.close().await.expect("close");
+      let _ = std::fs::remove_dir_all(&dir_a);
+      let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // Dropped post-send and the FINAL check conflicts (the backend
+    // re-canonicalizes onto a bystander's tree): the driver unwinds, both
+    // watches untouched, the refused stream torn down.
+    {
+      let (dir_a, canon_a) = scratch("rc-conflict-old");
+      let (dir_b, canon_b) = scratch("rc-conflict-new");
+      let (dir_v, canon_v) = scratch("rc-conflict-victim");
+      let fs = FakeFs::new(1);
+      fs.put(&canon_a, FileKind::Dir, 1);
+      fs.put(&canon_b, FileKind::Dir, 2);
+      fs.put(&canon_v, FileKind::Dir, 3);
+      fs.put(canon_v.join("sub"), FileKind::Dir, 4);
+      let watcher =
+        Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+      let handle = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
+      let victim = watcher.watch(&dir_v, Interest::all()).await.expect("watch");
+      let spawned_before = fs.spawns();
+
+      fs.remap_spawn_root(&canon_b, canon_v.join("sub"));
+      {
+        let mut fut = Box::pin(watcher.replace_root(handle, &dir_b));
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+      }
+      settle(|| fs.spawns() == spawned_before + 1 && fs.shutdowns() == 1).await;
+      assert_eq!(fs.shutdowns(), 1, "the refused replacement is torn down");
+      assert_eq!(watcher.registry_len(), 2, "both watches survive");
+      assert_eq!(
+        watcher.root_path(handle).as_deref(),
+        Some(canon_a.as_path())
+      );
+      assert_eq!(
+        watcher.root_path(victim).as_deref(),
+        Some(canon_v.as_path())
+      );
+      // The canon_b reservation was released: a fresh watch of dir_b gets
+      // all the way to the FINAL check (the remap still redirects it into
+      // the victim), not a reservation-time refusal against canon_b itself.
+      match watcher.watch(&dir_b, Interest::all()).await {
+        Err(WatchRootError::Overlaps { path, existing }) => {
+          assert_eq!(path, canon_v.join("sub"), "the FINAL root is reported");
+          assert_eq!(existing, canon_v);
+        }
+        other => panic!("expected the final-check Overlaps, got {other:?}"),
+      }
+      watcher.close().await.expect("close");
+      let _ = std::fs::remove_dir_all(&dir_a);
+      let _ = std::fs::remove_dir_all(&dir_b);
+      let _ = std::fs::remove_dir_all(&dir_v);
+    }
+  }
 }
 
 /// Forcing another platform's primitive fails the watch with the typed

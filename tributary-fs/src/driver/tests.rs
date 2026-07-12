@@ -2398,3 +2398,306 @@ mod enumerate_one_sample {
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
+
+/// The replace orchestration end to end over the fake platform: the swap
+/// commits make-before-break, the handle/scope survive, the covering Rescan
+/// arrives, and post-swap events deliver under the new root.
+mod replace {
+  use super::*;
+
+  async fn replace(
+    rig: &Rig,
+    scope: ScopeId,
+    new_root: &str,
+  ) -> Result<(), crate::error::ReplaceRootError> {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from(new_root),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from(new_root)),
+        reply,
+      })
+      .await
+      .unwrap();
+    on_reply.await.expect("driver replies")
+  }
+
+  /// `next_event` plus the delivery's canonical root.
+  async fn next_rooted(rig: &Rig) -> (ScopeId, Arc<PathBuf>, Change) {
+    tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
+      .await
+      .expect("an event arrives")
+      .expect("the stream is open")
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn the_swap_commits_and_the_scope_survives() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // Live pre-swap delivery under the old root.
+    rig
+      .fs
+      .send_batch("/r/sub", vec![ev("/r/sub/pre.txt", created(), 1, 11)]);
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), Path::new("/r/sub"));
+    assert!(change.kind().is_created());
+    let pre_epoch = change.epoch();
+
+    // The swap: /r/sub widens to /r; the commit's covering Rescan arrives
+    // on the SAME scope, rooted at the NEW path, on a LATER epoch.
+    assert!(replace(&rig, scope, "/r").await.is_ok());
+    settle(|| rig.fs.shutdowns() == 1).await;
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope, "the scope survives the swap");
+    assert_eq!(root.as_path(), Path::new("/r"), "deliveries re-root");
+    assert!(change.kind().is_rescan(), "the covering Rescan: {change:?}");
+    assert!(
+      change.epoch() > pre_epoch,
+      "the epoch is monotone across the swap"
+    );
+
+    // Post-swap events flow from the NEW stream under the new root.
+    rig
+      .fs
+      .send_batch("/r", vec![ev("/r/post.txt", created(), 2, 12)]);
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), Path::new("/r"));
+    assert!(change.kind().is_created());
+    assert_eq!(change.location(), &loc(&["post.txt"]));
+
+    // Unwatch after the replace tears exactly the surviving (new) stream.
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(on_reply.await.unwrap(), "the swapped scope is unwatchable");
+    settle(|| rig.fs.shutdowns() == 2).await;
+    assert_eq!(rig.fs.shutdowns(), 2);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_narrowing_replace_commits() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r").await;
+
+    // /r narrows to /r/sub: the exemption clears the self-overlap and the
+    // commit re-roots the scope downward.
+    assert!(replace(&rig, scope, "/r/sub").await.is_ok());
+    settle(|| rig.fs.shutdowns() == 1).await;
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), Path::new("/r/sub"));
+    assert!(change.kind().is_rescan());
+
+    rig
+      .fs
+      .send_batch("/r/sub", vec![ev("/r/sub/in.txt", created(), 5, 15)]);
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), Path::new("/r/sub"));
+    assert_eq!(change.location(), &loc(&["in.txt"]));
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_late_old_stream_batch_after_the_commit_is_dropped_by_its_lane() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // Hold teardowns: the commit retires the old handle but its stream stays
+    // alive (its shutdown is parked), so a post-commit batch on the OLD
+    // stream is consumable — and must be dropped by the lane gate.
+    let gate = rig.fs.hold_teardowns();
+    assert!(replace(&rig, scope, "/r").await.is_ok());
+    let (s, _root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert!(change.kind().is_rescan(), "the commit Rescan first");
+
+    rig
+      .fs
+      .send_batch("/r/sub", vec![ev("/r/sub/stale.txt", created(), 7, 17)]);
+    // An ordering probe on the NEW lane: if the stale batch were going to
+    // deliver, it would arrive before this later send.
+    rig
+      .fs
+      .send_batch("/r", vec![ev("/r/probe.txt", created(), 8, 18)]);
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(
+      root.as_path(),
+      Path::new("/r"),
+      "only the new lane delivers"
+    );
+    assert_eq!(change.location(), &loc(&["probe.txt"]));
+
+    gate.release();
+    settle(|| rig.fs.shutdowns() == 1).await;
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn close_mid_swap_counts_both_streams() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // The replacement spawn is parked when close arrives: the drain must
+    // account for the old stream AND the orphaned replacement.
+    let gate = rig.fs.hold_spawns();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply,
+      })
+      .await
+      .unwrap();
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    gate.release();
+    assert!(on_close.await.is_ok(), "close settles");
+    settle(|| rig.fs.shutdowns() == 2).await;
+    assert_eq!(rig.fs.shutdowns(), 2, "both streams are torn down");
+    // The abandoned replace resolves Closed, not silence.
+    assert!(matches!(
+      on_reply.await,
+      Ok(Err(crate::error::ReplaceRootError::Closed)) | Err(_)
+    ));
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_failed_spawn_leaves_the_old_root_untouched() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // "/missing" is not in the fake tree: the replacement spawn fails and
+    // the swap is atomic-on-failure.
+    let outcome = replace(&rig, scope, "/missing").await;
+    assert!(
+      matches!(outcome, Err(crate::error::ReplaceRootError::Source(_))),
+      "{outcome:?}"
+    );
+
+    // The old stream still delivers — coverage untouched.
+    rig
+      .fs
+      .send_batch("/r/sub", vec![ev("/r/sub/still.txt", created(), 3, 13)]);
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), Path::new("/r/sub"));
+    assert!(change.kind().is_created());
+    assert_eq!(rig.fs.shutdowns(), 0, "no stream was torn down");
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn death_wins_a_mid_swap_unwatch() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // Hold the replacement spawn so the unwatch lands first.
+    let gate = rig.fs.hold_spawns();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply,
+      })
+      .await
+      .unwrap();
+    let (unwatch_reply, on_unwatch) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(unwatch_reply),
+      })
+      .await
+      .unwrap();
+    assert!(on_unwatch.await.unwrap(), "the unwatch wins");
+    gate.release();
+    let outcome = on_reply.await.expect("driver replies");
+    assert!(
+      matches!(outcome, Err(crate::error::ReplaceRootError::Retired)),
+      "death wins: {outcome:?}"
+    );
+    // Both the old stream (unwatch) and the orphaned replacement are torn
+    // down inside the counted accounting.
+    settle(|| rig.fs.shutdowns() == 2).await;
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_second_replace_in_flight_is_refused() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    let gate = rig.fs.hold_spawns();
+    let (reply1, on_reply1) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply: reply1,
+      })
+      .await
+      .unwrap();
+    let (reply2, on_reply2) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply: reply2,
+      })
+      .await
+      .unwrap();
+    assert!(
+      matches!(
+        on_reply2.await.expect("driver replies"),
+        Err(crate::error::ReplaceRootError::ReplaceInFlight)
+      ),
+      "the second replace refuses"
+    );
+    gate.release();
+    assert!(on_reply1.await.expect("driver replies").is_ok());
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn an_unknown_scope_is_refused() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let _scope = watch(&rig, "/r/sub").await;
+    let ghost = ScopeId::new(core::num::NonZeroU64::new(999).unwrap());
+    let outcome = replace(&rig, ghost, "/r").await;
+    assert!(
+      matches!(outcome, Err(crate::error::ReplaceRootError::UnknownRoot)),
+      "{outcome:?}"
+    );
+  }
+}

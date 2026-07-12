@@ -54,7 +54,7 @@ mod options;
 mod os;
 mod watcher;
 
-pub use error::{BuildError, CloseError, UnwatchError, WatchRootError};
+pub use error::{BuildError, CloseError, ReplaceRootError, UnwatchError, WatchRootError};
 pub use event::{Event, EventKind, MovedEvent};
 pub use options::WatcherOptions;
 pub use os::{Backend, BackendKind, BackendStats, ProbeStage, SourceError};
