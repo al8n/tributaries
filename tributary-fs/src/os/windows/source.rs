@@ -471,7 +471,11 @@ fn run(io_state: &mut PumpIo, shared: &PumpShared) {
     let completion = match ffi::iocp_wait(io_state.port.as_handle(), timeout) {
       Ok(completion) => completion,
       Err(err) => {
+        // A wait failure dequeued NOTHING: the outstanding read's pin is
+        // unproven, so the teardown drain (cancel → drain-to-exact →
+        // leak-on-failure) must run before the I/O state can drop.
         shared.fatal(SourceError::ReadFailed { source: err });
+        teardown_drain(io_state);
         return;
       }
     };
