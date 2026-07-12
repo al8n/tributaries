@@ -338,17 +338,33 @@ async fn journal_wrap_degrades_to_rescan() {
 /// still flows a CONCRETE (non-Rescan) event afterwards. Pins the
 /// stat-versus-handle identity representation staying in one system.
 async fn birth_refresh_survives(backend: Backend, tag: &str) {
-  let root = scratch_root(tag);
+  // On a zoo host the journal leg runs on the journal-enabled NTFS volume
+  // and a forced-USN startup failure is a FAILURE — the elevated runners
+  // are exactly where this arm must prove itself.
+  let zoo = std::env::var_os("TRIBUTARY_ZOO_NTFS");
+  let root = match (&zoo, backend.is_usn_journal()) {
+    (Some(base), true) => {
+      let dir = PathBuf::from(base).join(format!("birth-{}", std::process::id()));
+      std::fs::create_dir_all(&dir).expect("zoo scratch");
+      dir.canonicalize().expect("canonicalize zoo root")
+    }
+    _ => scratch_root(tag),
+  };
   let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(backend)).expect("build");
   let handle = match w.watch(&root, Interest::all()).await {
     Ok(handle) => handle,
-    Err(err) if backend.is_usn_journal() => {
-      // The journal arm's preconditions legitimately fail off the elevated
-      // runners (no volume access); the RDCW leg still pins the refresh.
-      eprintln!("SKIP birth_refresh({tag}): the forced journal refused ({err})");
+    // ONLY the typed probe refusal is a legitimate skip, and only with no
+    // prepared elevated environment: every other error — CreateFailed,
+    // StartFailed, the identity bracket — is a real USN regression.
+    Err(tributary_fs::WatchRootError::Source(err))
+      if backend.is_usn_journal()
+        && zoo.is_none()
+        && matches!(err, tributary_fs::SourceError::BackendProbeFailed { .. }) =>
+    {
+      eprintln!("SKIP birth_refresh({tag}): the forced journal's probe refused ({err})");
       return;
     }
-    Err(err) => panic!("watch: {err}"),
+    Err(err) => panic!("watch({tag}): {err}"),
   };
 
   // Give the post-spawn refresh (and any misclassified death it would
