@@ -95,19 +95,79 @@ fn seed_walk(
         // resolvable children: completeness refuses, the probe falls.
         return Err(ProbeStage::Walk);
       };
-      map.seed([(child_identity.file_id, dir_frn, name.to_owned())]);
+      match map.learn(child_identity.file_id, dir_frn, name.to_owned()) {
+        super::usn::map::LearnOutcome::Learned => {}
+        // Over the cap, the map can no longer be complete; an unmapped
+        // parent here is a walk-order bug — either way the walk refuses
+        // rather than returns a born-blind map.
+        _ => return Err(ProbeStage::Walk),
+      }
       queue.push((child_path, child_identity.file_id));
     }
   }
   Ok(map)
 }
 
+/// Walks one moved-in subtree into the live map (the seed walk's shape,
+/// anchored at the moved directory). An incomplete walk is an error — the
+/// caller escalates to the full reseed spine rather than run blind.
+fn walk_into(map: &mut FrnMap, dir: &Path, frn: u128) -> Result<(), ()> {
+  let mut queue = vec![(dir.to_path_buf(), frn)];
+  while let Some((dir_path, dir_frn)) = queue.pop() {
+    let entries = match std::fs::read_dir(&dir_path) {
+      Ok(entries) => entries,
+      Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+      Err(_) => return Err(()),
+    };
+    for entry in entries {
+      let Ok(entry) = entry else {
+        return Err(());
+      };
+      let Ok(kind) = entry.file_type() else {
+        continue;
+      };
+      if !kind.is_dir() || kind.is_symlink() {
+        continue;
+      }
+      let child_path = entry.path();
+      let Ok(child) = ffi::open_directory(&child_path) else {
+        if child_path.exists() {
+          return Err(());
+        }
+        continue;
+      };
+      if ffi::is_reparse_point(child.as_handle()).unwrap_or(true) {
+        continue;
+      }
+      let Ok(child_identity) = ffi::identity_of(child.as_handle()) else {
+        return Err(());
+      };
+      let name = entry.file_name();
+      let Some(name) = name.to_str() else {
+        return Err(());
+      };
+      match map.learn(child_identity.file_id, dir_frn, name.to_owned()) {
+        super::usn::map::LearnOutcome::Learned => {}
+        _ => return Err(()),
+      }
+      queue.push((child_path, child_identity.file_id));
+    }
+  }
+  Ok(())
+}
+
 /// What the journal pump owns: the pinned I/O state of one volume stream.
 struct JournalIo {
   volume: OwnedHandle,
+  /// A SECOND volume handle, never associated with the port: every
+  /// re-query runs on it, so no query completion can ever be dequeued as
+  /// (or ahead of) the one outstanding read's packet.
+  query: OwnedHandle,
   port: OwnedHandle,
   journal_id: u64,
   cursor: i64,
+  /// The configured directory cap, preserved across reseeds.
+  max_directories: Option<usize>,
   read: Box<READ_USN_JOURNAL_DATA_V1>,
   buffer: Box<[u8]>,
   overlapped: Box<OVERLAPPED>,
@@ -164,22 +224,30 @@ pub(super) fn spawn(
     return Err(ProbeStage::VolumeAccess);
   };
   let volume = ffi::open_volume(drive).map_err(|_| ProbeStage::VolumeAccess)?;
-  let facts = ffi::query_journal(volume.as_handle()).map_err(|_| ProbeStage::JournalActive)?;
+  // The query twin: never port-associated, so its completions can never be
+  // dequeued as the outstanding read's packet.
+  let query = ffi::open_volume(drive).map_err(|_| ProbeStage::VolumeAccess)?;
+  let facts = ffi::query_journal(query.as_handle()).map_err(|_| ProbeStage::JournalActive)?;
   if facts.min_major > 3 || facts.max_major < 2 {
     return Err(ProbeStage::JournalActive);
   }
   let map = seed_walk(&canonical, identity.file_id, config.max_map_directories)?;
 
   // The probe held: everything past here is a hard spawn outcome.
-  Ok(start(
-    config,
-    canonical,
-    root_handle,
-    identity,
+  let probed = ProbedVolume {
     volume,
+    query,
     facts,
-    map,
-  ))
+  };
+  Ok(start(config, canonical, root_handle, identity, probed, map))
+}
+
+/// What the probe hands the starter: the two volume handles and the
+/// journal facts they were probed with.
+struct ProbedVolume {
+  volume: OwnedHandle,
+  query: OwnedHandle,
+  facts: ffi::JournalFacts,
 }
 
 fn start(
@@ -187,27 +255,32 @@ fn start(
   canonical: PathBuf,
   root_handle: &OwnedHandle,
   identity: ffi::HandleIdentity,
-  volume: OwnedHandle,
-  facts: ffi::JournalFacts,
+  probed: ProbedVolume,
   map: FrnMap,
 ) -> Result<(SourceHandle, EventReceiver, RootMeta), SourceError> {
+  let ProbedVolume {
+    volume,
+    query,
+    facts,
+  } = probed;
   let port = ffi::iocp_new().map_err(|_| SourceError::CreateFailed)?;
   ffi::iocp_associate(port.as_handle(), volume.as_handle(), KEY_READ)
     .map_err(|_| SourceError::CreateFailed)?;
 
   let buffer_len = (config.channel_capacity.get().max(1) * 1024).clamp(4 * 1024, 64 * 1024);
-  let mut io_state = JournalIo {
+  let io_state = JournalIo {
     volume,
+    query,
     port,
     journal_id: facts.journal_id,
     // Live-only: history is the consumer's crawl, exactly like FSEvents'
     // SinceNow default.
     cursor: facts.next_usn,
+    max_directories: config.max_map_directories,
     read: Box::new(unsafe { std::mem::zeroed() }),
     buffer: vec![0u8; buffer_len].into_boxed_slice(),
     overlapped: Box::new(unsafe { std::mem::zeroed() }),
   };
-  io_state.issue().map_err(|_| SourceError::StartFailed)?;
 
   let (queue_tx, queue_rx) = async_channel::unbounded();
   let shared = Arc::new(PumpShared {
@@ -285,10 +358,19 @@ fn spawn_pump(
     .spawn(move || {
       let mut io_state = io_state;
       let mut admission = admission;
+      // The FIRST issue happens here, after every fallible setup step: no
+      // pinned read can exist for a spawn that fails to start its pump.
+      if io_state.issue().is_err() {
+        shared.fatal(SourceError::StartFailed);
+        return;
+      }
       let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&mut io_state, &mut admission, &root, &shared);
       }));
       if outcome.is_err() {
+        // A panicked pump cannot prove its read's pin ended: leak the I/O
+        // state rather than drop memory the kernel may still write.
+        std::mem::forget(io_state);
         shared.fatal(SourceError::CallbackPanic);
       }
     })
@@ -325,16 +407,30 @@ fn run(io_state: &mut JournalIo, admission: &mut UsnAdmission, root: &Path, shar
       ffi::Completion::Packet {
         key: KEY_CONTROL, ..
       } => {
-        // Stop-belt → cancel → drain the read's final completion → drop.
-        ffi::cancel_io(io_state.volume.as_handle());
-        let _ = ffi::iocp_wait(io_state.port.as_handle(), 5_000);
+        teardown_drain(io_state);
         return;
       }
-      ffi::Completion::Packet { bytes, error, .. } => {
+      ffi::Completion::Packet {
+        bytes,
+        error,
+        overlapped,
+        ..
+      } => {
+        if overlapped != (&raw mut *io_state.overlapped).cast() {
+          // Not the outstanding read's packet: a stray completion must
+          // never be decoded as (or advance the cursor of) the read.
+          debug_assert!(false, "a stray packet reached the journal pump");
+          continue;
+        }
         if let Some(code) = error {
           if shared.stopped() {
             return;
           }
+          // The pairing carry predates the loss: widow it in-band FIRST, so
+          // no half can pair across (or surface after) the gap signal.
+          let mut widowed = Vec::new();
+          admission.flush(&mut widowed);
+          forward(shared, widowed, false);
           // Journal-side truncation (wrap, purge, ID change) funnels into
           // the reseed spine; a journal that cannot be re-anchored (deleted,
           // inactive) is terminal.
@@ -356,6 +452,25 @@ fn run(io_state: &mut JournalIo, admission: &mut UsnAdmission, root: &Path, shar
         for record in decoded.records {
           admission.admit(record, &mut admitted);
         }
+        if decoded.lossy {
+          // The carry's partner may sit in the refused remainder: widow it
+          // ahead of the loss signal `forward` is about to raise.
+          admission.flush(&mut admitted);
+        }
+        // Moved-in subtrees demand their walks BEFORE later records are
+        // read: journal order resumes against a map that knows them.
+        let mut walk_failed = false;
+        for event in &admitted {
+          if let UsnAdmitted::MovedInSubtree { frn, target } = event {
+            let mut path = root.to_path_buf();
+            for component in target {
+              path.push(component);
+            }
+            if walk_into(admission.map_mut(), &path, *frn).is_err() {
+              walk_failed = true;
+            }
+          }
+        }
         let map_died = admitted
           .iter()
           .any(|event| matches!(event, UsnAdmitted::MapOverflow));
@@ -374,7 +489,7 @@ fn run(io_state: &mut JournalIo, admission: &mut UsnAdmission, root: &Path, shar
           // (the core's death lifecycle owns the rest).
           return;
         }
-        if decoded.lossy {
+        if decoded.lossy || walk_failed {
           if !reseed(io_state, admission, root, shared) {
             shared.fatal(SourceError::StartFailed);
             return;
@@ -402,7 +517,7 @@ fn reseed(
   shared: &PumpShared,
 ) -> bool {
   transport::signal_loss::<SourceEvent, _>(&shared.transport, |msg| shared.send(msg));
-  let Ok(facts) = ffi::query_journal(io_state.volume.as_handle()) else {
+  let Ok(facts) = ffi::query_journal(io_state.query.as_handle()) else {
     return false;
   };
   let root_frn = {
@@ -414,11 +529,39 @@ fn reseed(
       Err(_) => return false,
     }
   };
-  let Ok(map) = seed_walk(root, root_frn, None) else {
+  let Ok(map) = seed_walk(root, root_frn, io_state.max_directories) else {
     return false;
   };
   io_state.journal_id = facts.journal_id;
   io_state.cursor = facts.next_usn;
   *admission.map_mut() = map;
   true
+}
+
+/// The teardown drain: cancel the outstanding read, then consume its final
+/// completion so the pin provably ends before the handles close. A drain
+/// that cannot prove the end LEAKS the pinned boxes — the kernel may still
+/// write through them, so freeing would be the bug.
+fn teardown_drain(io_state: &mut JournalIo) {
+  ffi::cancel_io(io_state.volume.as_handle());
+  for _ in 0..16 {
+    match ffi::iocp_wait(io_state.port.as_handle(), 5_000) {
+      Ok(ffi::Completion::Packet { overlapped, .. })
+        if overlapped == (&raw mut *io_state.overlapped).cast() =>
+      {
+        return;
+      }
+      Ok(ffi::Completion::Packet { .. }) => {}
+      Ok(ffi::Completion::TimedOut) | Err(_) => break,
+    }
+  }
+  let buffer = std::mem::replace(&mut io_state.buffer, Vec::new().into_boxed_slice());
+  Box::leak(buffer);
+  let read = std::mem::replace(&mut io_state.read, Box::new(unsafe { std::mem::zeroed() }));
+  Box::leak(read);
+  let overlapped = std::mem::replace(
+    &mut io_state.overlapped,
+    Box::new(unsafe { std::mem::zeroed() }),
+  );
+  Box::leak(overlapped);
 }
