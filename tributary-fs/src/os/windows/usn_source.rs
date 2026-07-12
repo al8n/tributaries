@@ -161,6 +161,10 @@ struct JournalIo {
   port: OwnedHandle,
   journal_id: u64,
   cursor: i64,
+  /// The startup identity of the watched root: every reseed re-open must
+  /// still name THIS object, or the scope would silently rebind to a
+  /// replacement tree while the original root's death goes unreported.
+  root_identity: ffi::HandleIdentity,
   /// The configured directory cap, preserved across reseeds.
   max_directories: Option<usize>,
   read: Box<READ_USN_JOURNAL_DATA_V1>,
@@ -271,6 +275,7 @@ fn start(
     // Live-only: history is the consumer's crawl, exactly like FSEvents'
     // SinceNow default.
     cursor: facts.next_usn,
+    root_identity: identity,
     max_directories: config.max_map_directories,
     read: Box::new(unsafe { std::mem::zeroed() }),
     buffer: vec![0u8; buffer_len].into_boxed_slice(),
@@ -550,8 +555,10 @@ fn reseed(
       return false;
     };
     match ffi::identity_of(handle.as_handle()) {
-      Ok(identity) => identity.file_id,
-      Err(_) => return false,
+      // The re-opened path must still name the STARTUP object: a
+      // replacement here is the original root's death, never a rebind.
+      Ok(identity) if identity == io_state.root_identity => identity.file_id,
+      _ => return false,
     }
   };
   let Ok(map) = seed_walk(root, root_frn, io_state.max_directories) else {
