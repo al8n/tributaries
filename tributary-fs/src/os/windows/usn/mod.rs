@@ -106,8 +106,12 @@ impl SessionTable {
       }
       self.last.insert(record.frn, record.reason);
     }
-    // CLOSE itself is session GC, never a reportable fact.
-    fresh & !reason::CLOSE
+    // CLOSE itself is session GC, never a reportable fact. The reparse
+    // bit is TOPOLOGY: an add-then-remove within one session carries the
+    // same bit twice, and suppressing the second would skip the
+    // boundary-removed learn-and-walk — so it always passes through (its
+    // map actions are safe to re-run).
+    (fresh & !reason::CLOSE) | (record.reason & reason::REPARSE_POINT_CHANGE)
   }
 
   /// How many sessions the table currently tracks.
@@ -322,13 +326,24 @@ impl UsnAdmission {
         };
         self.admit_single(synthetic, out);
       }
-      // A widowed NEW arrived from nowhere visible: a create.
+      // A widowed NEW arrived from nowhere visible: a create — and for a
+      // directory, a MOVE-IN: whatever subtree it carried was never
+      // mapped (a startup or reseed cursor can fall between rename
+      // halves), so the walk must be demanded like any other arrival.
       UsnEvent::WidowNew(record) => {
+        let is_dir = record.is_dir();
+        let frn = record.frn;
         let synthetic = UsnRecord {
           reason: reason::FILE_CREATE | (record.reason & (reason::MODIFY | reason::ATTRIB)),
           ..record
         };
         self.admit_single(synthetic, out);
+        if is_dir && let Some(components) = self.map.resolve_dir(frn) {
+          out.push(UsnAdmitted::MovedInSubtree {
+            frn,
+            target: components,
+          });
+        }
       }
     }
   }
@@ -368,12 +383,18 @@ impl UsnAdmission {
     // used the pre-state), but keeping it adjacent keeps journal order and
     // map state in lockstep.
     if record.is_dir() {
-      if record.reason & reason::FILE_CREATE != 0
-        && let UsnName::Utf8(name) = &record.name
-        && self.map.learn(record.frn, record.parent, name.clone()) == LearnOutcome::OverCapacity
-      {
-        out.push(UsnAdmitted::MapOverflow);
-        return;
+      if record.reason & reason::FILE_CREATE != 0 {
+        let UsnName::Utf8(name) = &record.name else {
+          // A structural directory whose name the vocabulary cannot carry
+          // can never anchor resolvable children: the map cannot stay
+          // complete, so the source dies under the root cover.
+          out.push(UsnAdmitted::MapOverflow);
+          return;
+        };
+        if self.map.learn(record.frn, record.parent, name.clone()) == LearnOutcome::OverCapacity {
+          out.push(UsnAdmitted::MapOverflow);
+          return;
+        }
       }
       if record.reason & reason::FILE_DELETE != 0 {
         self.map.forget(record.frn);
@@ -384,10 +405,16 @@ impl UsnAdmission {
           // The directory BECAME a reparse boundary: drop the subtree; the
           // located rescan re-establishes what is really below.
           self.map.forget(record.frn);
-        } else if let UsnName::Utf8(name) = &record.name {
+        } else {
           // The boundary was REMOVED — an ordinary directory now stands
           // where the map holds nothing: learn the anchor and demand its
-          // walk, exactly like a move-in, or the subtree stays blind.
+          // walk, exactly like a move-in, or the subtree stays blind. A
+          // name the vocabulary cannot carry cannot anchor children — map
+          // death, never a silent skip.
+          let UsnName::Utf8(name) = &record.name else {
+            out.push(UsnAdmitted::MapOverflow);
+            return;
+          };
           if self.map.learn(record.frn, record.parent, name.clone()) == LearnOutcome::OverCapacity {
             out.push(UsnAdmitted::MapOverflow);
             return;
@@ -455,10 +482,11 @@ impl UsnAdmission {
             }
           } else {
             // An in-root directory whose new name has no spelling cannot
-            // stay mapped (its children would resolve through a name the
-            // vocabulary cannot carry): drop the subtree; the located
-            // rescan covers it.
-            self.map.forget(new.frn);
+            // stay mapped — and the STANDING tree below it would go blind
+            // the moment it is forgotten. The map cannot stay complete:
+            // map death under the root cover.
+            out.push(UsnAdmitted::MapOverflow);
+            return;
           }
         }
         (true, false) => self.map.forget(new.frn),
@@ -1086,6 +1114,102 @@ mod r10_regressions {
     assert!(
       matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
       if c == &["a".to_owned(), "was-junction".to_owned(), "child".to_owned()])
+    );
+  }
+}
+
+#[cfg(test)]
+mod r11_regressions {
+  use super::{
+    UsnAdmission, UsnAdmitted, UsnTarget,
+    decode::{UsnName, UsnRecord},
+    map::FrnMap,
+    reason,
+  };
+
+  fn dir(frn: u128, parent: u128, mask: u32, name: &str) -> UsnRecord {
+    UsnRecord {
+      frn,
+      parent,
+      usn: 0,
+      reason: mask,
+      source_info: 0,
+      attributes: 0x10,
+      name: UsnName::Utf8(name.into()),
+    }
+  }
+
+  fn admission() -> UsnAdmission {
+    let mut map = FrnMap::new(1, None);
+    map.seed([(10, 1, "a".into())]);
+    UsnAdmission::new(map, 64)
+  }
+
+  /// A reparse add-then-remove within ONE open session: the cumulative
+  /// second bit must still run the boundary-removed learn-and-walk.
+  #[test]
+  fn a_reparse_toggle_in_one_session_still_walks() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    // Boundary added (reparse attribute set): the mapped dir drops.
+    adm.admit(
+      UsnRecord {
+        attributes: 0x410,
+        ..dir(10, 1, reason::REPARSE_POINT_CHANGE, "a")
+      },
+      &mut out,
+    );
+    out.clear();
+    // Same session (no CLOSE between): boundary removed again.
+    adm.admit(
+      dir(10, 1, reason::REPARSE_POINT_CHANGE | reason::CLOSE, "a"),
+      &mut out,
+    );
+    assert!(
+      out
+        .iter()
+        .any(|e| matches!(e, UsnAdmitted::MovedInSubtree { frn: 10, .. })),
+      "the cumulative bit must not suppress the removal's walk: {out:?}"
+    );
+  }
+
+  /// A structural directory whose name has no spelling is map death.
+  #[test]
+  fn an_unnameable_directory_creation_is_map_death() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(
+      UsnRecord {
+        name: UsnName::Escalate,
+        ..dir(70, 10, reason::FILE_CREATE, "")
+      },
+      &mut out,
+    );
+    assert!(
+      out.iter().any(|e| matches!(e, UsnAdmitted::MapOverflow)),
+      "{out:?}"
+    );
+  }
+
+  /// A widowed directory NEW half is a move-in: the anchor learns AND the
+  /// subtree walk is demanded (a cursor can start between rename halves).
+  #[test]
+  fn a_widowed_directory_new_half_demands_its_walk() {
+    let mut adm = admission();
+    let mut out = Vec::new();
+    adm.admit(dir(70, 10, reason::RENAME_NEW_NAME, "arrived"), &mut out);
+    assert!(
+      out.iter().any(
+        |e| matches!(e, UsnAdmitted::MovedInSubtree { frn: 70, target }
+        if target == &["a".to_owned(), "arrived".to_owned()])
+      ),
+      "{out:?}"
+    );
+    out.clear();
+    adm.admit(dir(80, 70, reason::FILE_CREATE, "child"), &mut out);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
+      if c == &["a".to_owned(), "arrived".to_owned(), "child".to_owned()])
     );
   }
 }

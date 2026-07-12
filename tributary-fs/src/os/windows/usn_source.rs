@@ -61,7 +61,16 @@ fn seed_walk(
   while let Some((dir_path, dir_frn)) = queue.pop() {
     let entries = match std::fs::read_dir(&dir_path) {
       Ok(entries) => entries,
-      Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+      Err(err) if err.kind() == io::ErrorKind::NotFound => {
+        // The directory vanished (or was renamed) after its parent's
+        // enumeration LEARNED it: a mapped anchor with unwalked
+        // descendants would be falsely complete — a later in-root rename
+        // would reparent it and bypass the absent-FRN demand-walk. Forget
+        // the anchor; the journal replay re-learns it through the
+        // move-in/demand-walk path with the walk it owes.
+        map.forget(dir_frn);
+        continue;
+      }
       Err(_) => return Err(ProbeStage::Walk),
     };
     for entry in entries {
