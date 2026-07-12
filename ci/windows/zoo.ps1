@@ -51,7 +51,15 @@ function New-ZooVolume {
 
 $ntfs = New-ZooVolume -Name 'ZOONTFS' -FileSystem 'ntfs' -SizeMB 512
 $fat32 = New-ZooVolume -Name 'ZOOFAT' -FileSystem 'fat32' -SizeMB 256
+# The sacrificial wrap volume: a deliberately tiny journal so the wrap cell
+# can force truncation without gigabytes of churn.
+$wrap = New-ZooVolume -Name 'ZOOWRAP' -FileSystem 'ntfs' -SizeMB 256
+fsutil usn createjournal "m=1048576" "a=262144" $wrap.TrimEnd('\')
+if ($LASTEXITCODE -ne 0) {
+  throw 'creating the sacrificial journal failed'
+}
 
 "TRIBUTARY_ZOO_NTFS=$ntfs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 "TRIBUTARY_ZOO_FAT32=$fat32" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-Write-Host "zoo ready: ntfs=$ntfs fat32=$fat32"
+"TRIBUTARY_ZOO_WRAP=$wrap" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+Write-Host "zoo ready: ntfs=$ntfs fat32=$fat32 wrap=$wrap"

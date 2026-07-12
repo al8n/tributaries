@@ -262,3 +262,76 @@ async fn zoo_volumes_flow() {
     let _ = std::fs::remove_dir_all(&root);
   }
 }
+
+/// The journal arm: on an elevated runner the NTFS zoo volume (or the
+/// workspace volume) selects the USN backend under Auto; unprivileged hosts
+/// legally fall back to RDCW — both selections must flow events.
+#[tokio::test]
+async fn auto_selection_flows_on_either_arm() {
+  let root = scratch_root("auto-arm");
+  let mut w = watcher();
+  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+  let backend = w.backend_of(handle).expect("live root");
+  assert!(
+    matches!(backend.as_str(), "rdcw" | "usn-journal"),
+    "the windows Auto arm selects a windows primitive: {backend}"
+  );
+
+  let file = root.join("auto.txt");
+  std::fs::write(&file, b"x").expect("create");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &file)).await.is_some(),
+    "{backend}: the create is delivered"
+  );
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
+
+/// [verify] journal wrap: churn on the sacrificial tiny-journal volume until
+/// it truncates; the stream must surface the loss as a Rescan and keep
+/// delivering afterwards — never silence, never a wedge.
+#[tokio::test]
+async fn journal_wrap_degrades_to_rescan() {
+  let Some(base) = std::env::var_os("TRIBUTARY_ZOO_WRAP") else {
+    eprintln!("SKIP journal_wrap_degrades_to_rescan: TRIBUTARY_ZOO_WRAP is unset");
+    return;
+  };
+  let root = PathBuf::from(&base).join(format!("wrap-{}", std::process::id()));
+  std::fs::create_dir_all(&root).expect("wrap scratch");
+  let root = root.canonicalize().expect("canonicalize wrap root");
+  let mut w = watcher();
+  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+  if w.backend_of(handle).expect("live").as_str() != "usn-journal" {
+    eprintln!("SKIP journal_wrap_degrades_to_rescan: the wrap volume did not select USN");
+    w.close().await.expect("close");
+    return;
+  }
+
+  // Churn well past the 1 MiB journal cap.
+  for round in 0..256 {
+    for i in 0..64 {
+      let f = root.join(format!("churn-{round}-{i}.tmp"));
+      std::fs::write(&f, b"xxxxxxxx").ok();
+      std::fs::remove_file(&f).ok();
+    }
+  }
+  assert!(
+    wait_for(&mut w, |e| matches!(e.kind(), EventKind::Rescan))
+      .await
+      .is_some(),
+    "the wrap surfaces its covering rescan"
+  );
+
+  // The stream survives: a fresh create still arrives.
+  let probe = root.join("alive.txt");
+  std::fs::write(&probe, b"x").expect("post-wrap create");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &probe)
+      || matches!(e.kind(), EventKind::Rescan))
+    .await
+    .is_some(),
+    "delivery continues after the reseed"
+  );
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
