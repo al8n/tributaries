@@ -82,6 +82,9 @@ objc2-core-services = { version = "0.3", default-features = false, features = [
 # System_IO: OVERLAPPED + the completion-port calls (the pump's wait/wake).
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  # CreateFileW's signature names SECURITY_ATTRIBUTES, so windows-sys gates
+  # the function itself behind the security feature.
+  "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Ioctl",
