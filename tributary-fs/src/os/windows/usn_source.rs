@@ -47,140 +47,127 @@ fn drive_of(root: &Path) -> Option<char> {
   None
 }
 
-/// Walks the subtree under `canonical`, building the directory-FRN map.
-/// One open per directory (the batched id-enumeration is a recorded
-/// deferral); a directory that vanishes mid-walk is a benign race, an
-/// unreadable EXISTING one refuses completeness.
+/// Why a walk stalled.
+enum WalkStall {
+  /// The walked world moved underneath the walk (a vanished or replaced
+  /// object, an identity mismatch, the anchor dying): the seed walk
+  /// restarts its whole attempt, a live walk escalates to the reseed
+  /// spine. There is deliberately NO benign-skip outcome.
+  Vanished,
+  /// An indeterminate or refusing outcome (a lossy enumeration page, an
+  /// unnameable directory, the cap): the walk fails closed.
+  Broken,
+}
+
+/// Walks the subtree under `canonical`, building the directory-FRN map by
+/// HANDLE-BOUND enumeration: children are listed through each directory's
+/// retained handle (`FileIdExtdDirectoryInfo` — names, attributes, and
+/// 128-bit ids come from the enumeration itself), and the only per-child
+/// open is immediately verified against the enumerated FRN. No path is
+/// ever re-opened to LIST anything, so a replacement directory installed
+/// at a walked path can never be enumerated in the original's place; a
+/// verify mismatch is a [`WalkStall::Vanished`]. The tree mutating under
+/// the walk restarts the whole attempt — no local repair is complete.
 fn seed_walk(
   canonical: &Path,
   root_frn: u128,
   max_directories: Option<usize>,
 ) -> Result<FrnMap, ProbeStage> {
-  // A queued directory whose path stops opening mid-walk means the tree
-  // mutated under the walk — and not necessarily AT that directory: an
-  // ANCESTOR rename strands every queued descendant's stale path while the
-  // ancestor itself stays mapped, so replay would reparent it with no walk
-  // owed. No local repair is complete; the walk restarts against the tree
-  // as it now is, and refuses if the churn outruns it.
   const ATTEMPTS: usize = 3;
-  'attempt: for _ in 0..ATTEMPTS {
-    let mut map = FrnMap::new(root_frn, max_directories);
-    let mut queue = vec![(canonical.to_path_buf(), root_frn)];
-    while let Some((dir_path, dir_frn)) = queue.pop() {
-      let entries = match std::fs::read_dir(&dir_path) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound && dir_frn != root_frn => {
-          continue 'attempt;
-        }
-        Err(_) => return Err(ProbeStage::Walk),
-      };
-      for entry in entries {
-        let entry = entry.map_err(|_| ProbeStage::Walk)?;
-        match admit_walk_entry(&mut map, &mut queue, &entry, dir_frn) {
-          Ok(()) => {}
-          Err(WalkStall::Vanished) => continue 'attempt,
-          Err(WalkStall::Broken) => return Err(ProbeStage::Walk),
-        }
-      }
+  for _ in 0..ATTEMPTS {
+    let root = match ffi::open_directory(canonical) {
+      Ok(root) => root,
+      Err(_) => return Err(ProbeStage::Walk),
+    };
+    match ffi::identity_of(root.as_handle()) {
+      Ok(identity) if identity.file_id == root_frn => {}
+      _ => return Err(ProbeStage::Walk),
     }
-    return Ok(map);
+    let mut map = FrnMap::new(root_frn, max_directories);
+    match walk_under(&mut map, canonical.to_path_buf(), root, root_frn) {
+      Ok(()) => return Ok(map),
+      Err(WalkStall::Vanished) => continue,
+      Err(WalkStall::Broken) => return Err(ProbeStage::Walk),
+    }
   }
   Err(ProbeStage::Walk)
 }
 
-/// Walks one moved-in subtree into the live map (the seed walk's shape,
-/// anchored at the moved directory). The anchor's identity is verified
-/// against the requested FRN — a missing or replaced anchor, like every
-/// indeterminate metadata failure below it, is an error: the caller
-/// escalates to the full reseed spine rather than run blind.
+/// The shared handle-bound walk core: enumerates `anchor` (already
+/// identity-verified by the caller) and every mapped descendant through
+/// their retained handles, learning each directory child by its enumerated
+/// FRN before its own (verified) open.
+fn walk_under(
+  map: &mut FrnMap,
+  anchor_path: PathBuf,
+  anchor: OwnedHandle,
+  anchor_frn: u128,
+) -> Result<(), WalkStall> {
+  let mut page = vec![0u8; 64 * 1024];
+  let mut queue: Vec<(PathBuf, OwnedHandle, u128)> = vec![(anchor_path, anchor, anchor_frn)];
+  while let Some((dir_path, handle, dir_frn)) = queue.pop() {
+    let mut restart = true;
+    loop {
+      let filled = match ffi::read_directory_page(handle.as_handle(), &mut page, restart) {
+        Ok(Some(len)) => len,
+        Ok(None) => break,
+        // The handle is live by construction, so an enumeration failure is
+        // the object dying underneath it (dismount, delete-pended): the
+        // world moved.
+        Err(_) => return Err(WalkStall::Vanished),
+      };
+      restart = false;
+      let decoded = super::dirscan::decode_page(&page[..filled]);
+      if decoded.lossy {
+        return Err(WalkStall::Broken);
+      }
+      for child in decoded.children {
+        if !child.is_dir() {
+          continue;
+        }
+        if child.is_reparse() {
+          // A containment boundary: never descended, never mapped.
+          continue;
+        }
+        let Some(name) = child.name else {
+          // A directory whose name has no Unicode spelling can never
+          // anchor resolvable children: fail closed.
+          return Err(WalkStall::Broken);
+        };
+        match map.learn(child.frn, dir_frn, name.clone()) {
+          super::usn::map::LearnOutcome::Learned => {}
+          _ => return Err(WalkStall::Broken),
+        }
+        // The one per-child open, immediately verified against the
+        // ENUMERATED id: an impostor at the joined path mismatches.
+        let child_path = dir_path.join(&name);
+        let opened = match ffi::open_directory(&child_path) {
+          Ok(opened) => opened,
+          Err(_) => return Err(WalkStall::Vanished),
+        };
+        match ffi::identity_of(opened.as_handle()) {
+          Ok(identity) if identity.file_id == child.frn => {}
+          _ => return Err(WalkStall::Vanished),
+        }
+        queue.push((child_path, opened, child.frn));
+      }
+    }
+  }
+  Ok(())
+}
+
+/// Walks one moved-in (or revealed) subtree into the live map: the anchor's
+/// identity is verified against the requested FRN, then the shared
+/// handle-bound core walks below it. Any stall — vanished paths, identity
+/// mismatches, lossy pages — escalates to the caller, whose one answer is
+/// the full reseed spine.
 fn walk_into(map: &mut FrnMap, dir: &Path, frn: u128) -> Result<(), ()> {
   let anchor = ffi::open_directory(dir).map_err(|_| ())?;
   let anchor_identity = ffi::identity_of(anchor.as_handle()).map_err(|_| ())?;
   if anchor_identity.file_id != frn {
     return Err(());
   }
-  drop(anchor);
-  let mut queue = vec![(dir.to_path_buf(), frn)];
-  while let Some((dir_path, dir_frn)) = queue.pop() {
-    let entries = match std::fs::read_dir(&dir_path) {
-      Ok(entries) => entries,
-      // A verified (or already-mapped) directory whose path no longer
-      // opens was renamed between verification and enumeration: its
-      // descendants would stay unmapped while the map carries the top —
-      // a blind subtree. The walk refuses; the reseed spine re-walks the
-      // world as it now is. (The probe-time seed walk may skip a vanished
-      // directory — nothing depends on its map yet and the cursor
-      // pre-dates the walk — but a LIVE walk may not.)
-      Err(_) => return Err(()),
-    };
-    for entry in entries {
-      match admit_walk_entry(map, &mut queue, &entry.map_err(|_| ())?, dir_frn) {
-        Ok(()) => {}
-        // Vanished and Broken alike: a live walk has one escalation — the
-        // reseed spine re-walks the world as it now is.
-        Err(_) => return Err(()),
-      }
-    }
-  }
-  Ok(())
-}
-
-/// Why a walk could not admit an entry.
-enum WalkStall {
-  /// The entry's path stopped resolving mid-walk: the tree mutated under
-  /// the walk — possibly at an ANCESTOR, stranding this stale path while
-  /// the ancestor stays mapped. NO local repair is complete (the R12/R13
-  /// class): the seed walk restarts its whole attempt, a live walk
-  /// escalates to the reseed spine. There is deliberately NO benign-skip
-  /// outcome for a disappearance.
-  Vanished,
-  /// An indeterminate or refusing probe (access denied, unreadable
-  /// metadata, an unnameable directory, the cap): the walk fails closed.
-  Broken,
-}
-
-/// One walk entry's admission, shared by the seed walk and the live subtree
-/// walk: directories admit or the walk stalls — files and containment
-/// boundaries pass, everything else is a [`WalkStall`].
-fn admit_walk_entry(
-  map: &mut FrnMap,
-  queue: &mut Vec<(PathBuf, u128)>,
-  entry: &std::fs::DirEntry,
-  dir_frn: u128,
-) -> Result<(), WalkStall> {
-  let kind = entry.file_type().map_err(|_| WalkStall::Broken)?;
-  if !kind.is_dir() || kind.is_symlink() {
-    return Ok(());
-  }
-  let child_path = entry.path();
-  let child = match ffi::open_directory(&child_path) {
-    Ok(child) => child,
-    Err(_) => {
-      return match child_path.try_exists() {
-        // The entry vanished between enumeration and open — or an
-        // ancestor rename strandeded its joined path. Either way the
-        // walk's world moved: restart/escalate, never skip.
-        Ok(false) => Err(WalkStall::Vanished),
-        Ok(true) | Err(_) => Err(WalkStall::Broken),
-      };
-    }
-  };
-  // A reparse point (junction/mount) is a containment boundary: never
-  // descended, never mapped. An indeterminate query refuses.
-  if ffi::is_reparse_point(child.as_handle()).map_err(|_| WalkStall::Broken)? {
-    return Ok(());
-  }
-  let child_identity = ffi::identity_of(child.as_handle()).map_err(|_| WalkStall::Broken)?;
-  let name = entry.file_name();
-  let Some(name) = name.to_str() else {
-    return Err(WalkStall::Broken);
-  };
-  match map.learn(child_identity.file_id, dir_frn, name.to_owned()) {
-    super::usn::map::LearnOutcome::Learned => {}
-    _ => return Err(WalkStall::Broken),
-  }
-  queue.push((child_path, child_identity.file_id));
-  Ok(())
+  walk_under(map, dir.to_path_buf(), anchor, frn).map_err(|_| ())
 }
 
 /// What the journal pump owns: the pinned I/O state of one volume stream.

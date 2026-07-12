@@ -8,6 +8,7 @@
 //! thread) is `cfg(all(target_os = "windows", not(miri)))` and reduces every
 //! completion to these types as early as possible.
 
+pub(crate) mod dirscan;
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) mod ffi;
 pub(crate) mod rdcw;
