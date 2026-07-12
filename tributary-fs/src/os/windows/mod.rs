@@ -8,6 +8,9 @@
 //! thread) is `cfg(all(target_os = "windows", not(miri)))` and reduces every
 //! completion to these types as early as possible.
 
+// The windows walks are the production consumers; on every other host only
+// the twins reach the decoder.
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
 pub(crate) mod dirscan;
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) mod ffi;
