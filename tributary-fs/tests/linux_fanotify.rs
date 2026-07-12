@@ -1874,3 +1874,48 @@ async fn close_quiesces_under_sustained_traffic() {
      not after an EAGAIN that never comes: {closed:?}"
   );
 }
+
+/// A kernel-recursive swap on fanotify: widening the root keeps the KR
+/// profile, the covering `Rescan` bridges the swap, newly covered ground is
+/// live under the fresh superblock mark, and `backend_stats` is re-pointed
+/// at the replacement's counters.
+#[tokio::test]
+async fn replace_root_swaps_the_mark_and_repoints_stats() {
+  let Some(mount) = ext4_loopback() else {
+    eprintln!("SKIP replace_root_swaps_the_mark_and_repoints_stats: no ext4 loopback");
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "replace");
+  let sub = root.join("y");
+  std::fs::create_dir_all(&sub).unwrap();
+  let Some((mut w, handle)) = fanotify_watcher(&sub).await else {
+    return;
+  };
+  assert!(w.backend_stats(handle).is_some(), "stats before the swap");
+
+  w.replace_root(handle, &root)
+    .await
+    .expect("the swap commits");
+  assert_eq!(w.root_path(handle), Some(root.clone()));
+  assert_eq!(
+    w.backend_of(handle).expect("live").as_str(),
+    "fanotify",
+    "KR stays KR"
+  );
+  assert!(
+    w.backend_stats(handle).is_some(),
+    "stats re-point at the replacement stream"
+  );
+  let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == root).await;
+  assert!(covering.is_some(), "the covering Rescan arrives");
+
+  let outside = root.join("outside.txt");
+  std::fs::write(&outside, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| covers(e, &outside)).await.is_some(),
+    "newly covered ground is live under the new mark"
+  );
+}

@@ -488,3 +488,81 @@ async fn a_healthy_rdcw_root_survives_its_birth_refresh() {
 async fn a_healthy_usn_root_survives_its_birth_refresh() {
   birth_refresh_survives(Backend::UsnJournal, "birth-usn").await;
 }
+
+/// A same-volume replace keeps the backend: widening the root re-runs the
+/// spawn (and under a FORCED RDCW selection resolves RDCW again), the
+/// covering `Rescan` bridges the swap, and newly covered ground is live
+/// under the fresh subtree stream.
+#[tokio::test]
+async fn replace_root_same_volume_keeps_the_backend() {
+  let root = scratch_root("replace");
+  let sub = root.join("y");
+  std::fs::create_dir_all(&sub).expect("mkdir");
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Rdcw)).expect("build");
+  let handle = w.watch(&sub, Interest::all()).await.expect("watch");
+  assert_eq!(w.backend_of(handle).expect("live").as_str(), "rdcw");
+
+  w.replace_root(handle, &root)
+    .await
+    .expect("the swap commits");
+  assert_eq!(w.root_path(handle), Some(root.clone()), "the view re-roots");
+  assert_eq!(
+    w.backend_of(handle).expect("live").as_str(),
+    "rdcw",
+    "a same-volume swap keeps the backend"
+  );
+  let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == root).await;
+  assert!(covering.is_some(), "the covering Rescan arrives");
+
+  let outside = root.join("outside.txt");
+  std::fs::write(&outside, b"x").expect("write outside");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &outside)).await.is_some(),
+    "newly covered ground is live"
+  );
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
+
+/// [verify] cross-volume replace under Auto: the selection ladder re-runs
+/// per spawn, so the backend may legitimately flip rdcw ↔ usn-journal with
+/// runner elevation. Pinned is only the KR contract — the swap commits, the
+/// covering `Rescan` arrives, the resolved backend is one of the two KR
+/// arms, and the new volume is live. Zoo-gated like the other volume cells.
+#[tokio::test]
+async fn replace_root_cross_volume_reruns_the_ladder() {
+  let Some(base) = std::env::var_os("TRIBUTARY_ZOO_NTFS") else {
+    eprintln!("SKIP replace_root_cross_volume_reruns_the_ladder: TRIBUTARY_ZOO_NTFS is unset");
+    return;
+  };
+  let old_root = scratch_root("replace-xvol");
+  let new_root = PathBuf::from(&base).join(format!("replace-{}", std::process::id()));
+  std::fs::create_dir_all(&new_root).expect("zoo scratch");
+  let new_root = new_root.canonicalize().expect("canonicalize zoo root");
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Auto)).expect("build");
+  let handle = w.watch(&old_root, Interest::all()).await.expect("watch");
+  let before = w.backend_of(handle).expect("live").as_str().to_owned();
+
+  w.replace_root(handle, &new_root)
+    .await
+    .expect("the swap commits");
+  assert_eq!(w.root_path(handle), Some(new_root.clone()));
+  let after = w.backend_of(handle).expect("live").as_str().to_owned();
+  assert!(
+    matches!(after.as_str(), "rdcw" | "usn-journal"),
+    "a KR arm resolves: {after}"
+  );
+  eprintln!("cross-volume ladder: {before} -> {after} (elevation-dependent)");
+  let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == new_root).await;
+  assert!(covering.is_some(), "the covering Rescan arrives");
+
+  let probe = new_root.join("xvol.txt");
+  std::fs::write(&probe, b"x").expect("create");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &probe)).await.is_some(),
+    "the new volume is live"
+  );
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&new_root);
+  let _ = std::fs::remove_dir_all(&old_root);
+}
