@@ -420,11 +420,22 @@ impl UsnAdmission {
       match (old_parent.is_some(), new_parent.is_some()) {
         (true, true) => {
           if let UsnName::Utf8(name) = &new.name {
-            if !self.map.reparent(new.frn, new.parent, name.clone())
-              && self.map.learn(new.frn, new.parent, name.clone()) == LearnOutcome::OverCapacity
-            {
-              out.push(UsnAdmitted::MapOverflow);
-              return;
+            if !self.map.reparent(new.frn, new.parent, name.clone()) {
+              // The FRN was absent (a directory the seed walk raced past —
+              // renamed between its parent's enumeration and its own): its
+              // descendants were never mapped, so learning the top alone
+              // would leave a blind subtree. Demand the walk exactly like
+              // an out-to-in move.
+              if self.map.learn(new.frn, new.parent, name.clone()) == LearnOutcome::OverCapacity {
+                out.push(UsnAdmitted::MapOverflow);
+                return;
+              }
+              if let Some(UsnTarget::Resolved(components)) = &new_end {
+                out.push(UsnAdmitted::MovedInSubtree {
+                  frn: new.frn,
+                  target: components.clone(),
+                });
+              }
             }
           } else {
             // An in-root directory whose new name has no spelling cannot
@@ -953,6 +964,54 @@ mod r2_regressions {
       adm.map_mut().resolve_dir(70),
       Some(vec!["b".to_owned()]),
       "the MAP (the walk's anchor) already tracks the rename"
+    );
+  }
+}
+
+#[cfg(test)]
+mod r9_regressions {
+  use super::{
+    UsnAdmission, UsnAdmitted, UsnTarget,
+    decode::{UsnName, UsnRecord},
+    map::FrnMap,
+    reason,
+  };
+
+  /// A directory the seed walk raced past (renamed between its parent's
+  /// enumeration and its own): the in-root rename replay learns the absent
+  /// FRN AND demands the subtree walk — never a mapped top over a blind
+  /// subtree.
+  #[test]
+  fn an_unmapped_in_root_rename_demands_its_walk() {
+    let mut map = FrnMap::new(1, None);
+    map.seed([(10, 1, "a".into()), (20, 1, "b".into())]);
+    let mut adm = UsnAdmission::new(map, 64);
+    let mut out = Vec::new();
+    let dir = |frn, parent, mask, name: &str| UsnRecord {
+      frn,
+      parent,
+      usn: 0,
+      reason: mask,
+      source_info: 0,
+      attributes: 0x10,
+      name: UsnName::Utf8(name.into()),
+    };
+    // FRN 70 was never seeded (the race), yet both rename ends are in-root.
+    adm.admit(dir(70, 10, reason::RENAME_OLD_NAME, "raced"), &mut out);
+    adm.admit(dir(70, 20, reason::RENAME_NEW_NAME, "landed"), &mut out);
+    assert!(
+      out.iter().any(
+        |e| matches!(e, UsnAdmitted::MovedInSubtree { frn: 70, target }
+        if target == &["b".to_owned(), "landed".to_owned()])
+      ),
+      "{out:?}"
+    );
+    // And its children admit through the learned chain.
+    out.clear();
+    adm.admit(dir(80, 70, reason::FILE_CREATE, "child"), &mut out);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
+      if c == &["b".to_owned(), "landed".to_owned(), "child".to_owned()])
     );
   }
 }
