@@ -231,19 +231,27 @@ async fn foreign_backend_is_typed() {
     .watch(&root, Interest::all())
     .await
     .expect_err("fanotify does not exist on Windows");
-  assert!(format!("{err}").contains("fanotify"));
+  assert!(
+    matches!(
+      &err,
+      tributary_fs::WatchRootError::Source(tributary_fs::SourceError::ForeignBackend {
+        requested: Backend::Fanotify,
+      })
+    ),
+    "{err:?}"
+  );
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The zoo cells: the same verb flow on each scratch volume the zoo built.
+/// The zoo cells: the verb flow on the identity-bearing volume, and the
+/// typed refusal on the identity-less one — FAT32 reports no stable file
+/// ids (`FileIdInfo` refuses), so the identity bracket cannot hold and the
+/// barrier refuses the watch rather than run without `RootReplaced`
+/// detection or registry disjointness. A recorded v1 boundary.
 #[tokio::test]
 async fn zoo_volumes_flow() {
-  for var in ["TRIBUTARY_ZOO_NTFS", "TRIBUTARY_ZOO_FAT32"] {
-    let Some(base) = std::env::var_os(var) else {
-      eprintln!("SKIP zoo_volumes_flow: {var} is unset (no zoo)");
-      continue;
-    };
+  if let Some(base) = std::env::var_os("TRIBUTARY_ZOO_NTFS") {
     let root = PathBuf::from(&base).join(format!("watch-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("zoo scratch");
     let root = root.canonicalize().expect("canonicalize zoo root");
@@ -253,10 +261,34 @@ async fn zoo_volumes_flow() {
     std::fs::write(&file, b"x").expect("create");
     assert!(
       wait_for(&mut w, |e| covers(e, &file)).await.is_some(),
-      "{var}: the create is delivered"
+      "ntfs zoo: the create is delivered"
     );
     w.close().await.expect("close");
     let _ = std::fs::remove_dir_all(&root);
+  } else {
+    eprintln!("SKIP zoo_volumes_flow: TRIBUTARY_ZOO_NTFS is unset (no zoo)");
+  }
+
+  if let Some(base) = std::env::var_os("TRIBUTARY_ZOO_FAT32") {
+    let root = PathBuf::from(&base).join(format!("watch-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("zoo scratch");
+    let root = root.canonicalize().expect("canonicalize zoo root");
+    let w = watcher();
+    let err = w
+      .watch(&root, Interest::all())
+      .await
+      .expect_err("an identity-less filesystem cannot hold the bracket");
+    assert!(
+      matches!(
+        &err,
+        tributary_fs::WatchRootError::Source(tributary_fs::SourceError::RootUnavailable { .. })
+      ),
+      "{err:?}"
+    );
+    w.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&root);
+  } else {
+    eprintln!("SKIP zoo_volumes_flow: TRIBUTARY_ZOO_FAT32 is unset (no zoo)");
   }
 }
 
@@ -314,27 +346,35 @@ async fn journal_wrap_degrades_to_rescan() {
     .expect("the prepared wrap volume must start the forced journal");
   assert_eq!(w.backend_of(handle).expect("live").as_str(), "usn-journal");
 
-  // Churn well past the 1 MiB journal cap, paced so the consumer keeps
-  // draining — the wrap must come from JOURNAL truncation, not from a
-  // competing callback-capacity overflow.
-  for round in 0..256 {
-    for i in 0..64 {
-      let f = root.join(format!("churn-{round}-{i}.tmp"));
-      std::fs::write(&f, b"xxxxxxxx").ok();
-      std::fs::remove_file(&f).ok();
-    }
-    if round % 16 == 0 {
-      while tokio::time::timeout(Duration::from_millis(1), w.next())
-        .await
-        .is_ok()
-      {}
-    }
-  }
+  // A live pump's cursor rides the journal's edge, so churn alone cannot
+  // reliably wrap PAST the reader (truncation behind the cursor is
+  // harmless — the first executor run proved the pump keeps up). The
+  // deterministic loss trigger is the journal ID CHANGE: delete and
+  // recreate the journal under the live watch; the next read's ID
+  // mismatch takes the same loss → reseed → covering-rescan spine a wrap
+  // does. (The runner is Administrator; fsutil owns the volume state.)
+  let drive = base
+    .to_str()
+    .and_then(|s| s.get(..2))
+    .expect("the zoo exports a drive-lettered root")
+    .to_owned();
+  let delete = std::process::Command::new("fsutil")
+    .args(["usn", "deletejournal", "/d", &drive])
+    .status()
+    .expect("fsutil runs");
+  assert!(delete.success(), "deleting the sacrificial journal");
+  let recreate = std::process::Command::new("fsutil")
+    .args(["usn", "createjournal", "m=1048576", "a=262144", &drive])
+    .status()
+    .expect("fsutil runs");
+  assert!(recreate.success(), "recreating the sacrificial journal");
+  // Post-loss activity gives the (re-anchored) stream something to read.
+  std::fs::write(root.join("post-loss.txt"), b"x").expect("post-loss create");
   assert!(
     wait_for(&mut w, |e| matches!(e.kind(), EventKind::Rescan))
       .await
       .is_some(),
-    "the wrap surfaces its covering rescan"
+    "the journal loss surfaces its covering rescan"
   );
 
   // The scope survived the reseed REGISTERED — a terminal death Rescan

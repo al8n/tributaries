@@ -114,3 +114,7 @@ required-features = ["_integration"]
 [[test]]
 name = "linux_fanotify"
 required-features = ["_integration"]
+
+[[test]]
+name = "windows_rdcw"
+required-features = ["_integration"]

@@ -98,6 +98,11 @@ jobs:
             ${{ runner.os }}-cross-
       - name: Install Rust
         run: rustup update stable && rustup default stable
+      - name: Install mingw (i686 windows-gnu)
+        # windows-sys emits import libraries through dlltool on the i686 gnu
+        # target (x86_64 uses raw-dylib and needs nothing).
+        if: matrix.target == 'i686-pc-windows-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-i686
       - name: cargo build --target ${{ matrix.target }}
         run: |
           rustup target add ${{ matrix.target }}
