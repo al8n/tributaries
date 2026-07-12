@@ -50,6 +50,12 @@ function New-ZooVolume {
 }
 
 $ntfs = New-ZooVolume -Name 'ZOONTFS' -FileSystem 'ntfs' -SizeMB 512
+# Journal creation is an explicit operation: a fresh NTFS volume carries no
+# guarantee of an active journal, and the forced-USN cells demand one.
+fsutil usn createjournal "m=8388608" "a=1048576" $ntfs.TrimEnd('\')
+if ($LASTEXITCODE -ne 0) {
+  throw 'creating the NTFS zoo journal failed'
+}
 $fat32 = New-ZooVolume -Name 'ZOOFAT' -FileSystem 'fat32' -SizeMB 256
 # The sacrificial wrap volume: a deliberately tiny journal so the wrap cell
 # can force truncation without gigabytes of churn.
