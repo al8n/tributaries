@@ -76,7 +76,7 @@ pub(crate) mod reason {
 #[derive(Debug)]
 pub(crate) struct SessionTable {
   last: std::collections::BTreeMap<u128, u32>,
-  cap: usize,
+  pub(self) cap: usize,
 }
 
 impl SessionTable {
@@ -297,6 +297,14 @@ impl UsnAdmission {
     for event in paired {
       self.lower_paired(event, out);
     }
+  }
+
+  /// Resets the cumulative-reason history — the reseed boundary's duty.
+  /// The cursor jumps across an unobserved interval, so a session's
+  /// remembered bits may describe an open that CLOSEd inside the gap; a
+  /// post-gap session re-reporting the same bit must not be suppressed.
+  pub(crate) fn reset_sessions(&mut self) {
+    self.sessions = SessionTable::new(self.sessions.cap);
   }
 
   fn lower_paired(&mut self, event: UsnEvent, out: &mut Vec<UsnAdmitted>) {
@@ -865,6 +873,86 @@ mod r1_regressions {
     assert!(
       matches!(&out[0], UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }
       if c == &["a".to_owned(), "in".to_owned(), "child".to_owned()])
+    );
+  }
+}
+
+#[cfg(test)]
+mod r2_regressions {
+  use super::{
+    UsnAdmission, UsnAdmitted,
+    decode::{UsnName, UsnRecord},
+    map::FrnMap,
+    reason,
+  };
+
+  const ROOT: u128 = 1;
+
+  fn record(frn: u128, parent: u128, reason_mask: u32, name: &str) -> UsnRecord {
+    UsnRecord {
+      frn,
+      parent,
+      usn: 0,
+      reason: reason_mask,
+      source_info: 0,
+      attributes: 0x20,
+      name: UsnName::Utf8(name.into()),
+    }
+  }
+
+  /// A pre-loss bit whose CLOSE fell inside the gap must re-report after
+  /// the reseed boundary resets the session history.
+  #[test]
+  fn reseed_resets_cumulative_history() {
+    let mut map = FrnMap::new(ROOT, None);
+    map.seed([(10, ROOT, "a".into())]);
+    let mut adm = UsnAdmission::new(map, 64);
+    let mut out = Vec::new();
+    adm.admit(record(50, 10, reason::DATA_EXTEND, "f"), &mut out);
+    assert_eq!(out.len(), 1);
+
+    // The gap: the CLOSE was skipped, the reseed boundary resets.
+    adm.reset_sessions();
+    out.clear();
+    adm.admit(record(50, 10, reason::DATA_EXTEND, "f"), &mut out);
+    assert!(
+      matches!(&out[0], UsnAdmitted::Single { delta, .. }
+        if *delta == reason::DATA_EXTEND),
+      "the post-gap session re-reports: {out:?}"
+    );
+  }
+
+  /// A move-in followed by an in-root rename in the SAME buffer: the map's
+  /// resolution (the walk's anchor) tracks the rename, not the stale
+  /// move-in target.
+  #[test]
+  fn same_buffer_move_in_then_rename_tracks_the_map() {
+    let mut map = FrnMap::new(ROOT, None);
+    map.seed([(10, ROOT, "a".into())]);
+    let mut adm = UsnAdmission::new(map, 64);
+    let mut out = Vec::new();
+    let dir = |frn, parent, mask, name: &str| UsnRecord {
+      attributes: 0x10,
+      ..record(frn, parent, mask, name)
+    };
+    adm.admit(dir(70, 999, reason::RENAME_OLD_NAME, "ext"), &mut out);
+    adm.admit(dir(70, 10, reason::RENAME_NEW_NAME, "in"), &mut out);
+    adm.admit(dir(70, 10, reason::RENAME_OLD_NAME, "in"), &mut out);
+    adm.admit(dir(70, ROOT, reason::RENAME_NEW_NAME, "b"), &mut out);
+
+    let stale = out.iter().find_map(|e| match e {
+      UsnAdmitted::MovedInSubtree { frn, target } => Some((*frn, target.clone())),
+      _ => None,
+    });
+    assert_eq!(
+      stale,
+      Some((70, vec!["a".to_owned(), "in".to_owned()])),
+      "the EVENT keeps its historical target (the rescan's location)"
+    );
+    assert_eq!(
+      adm.map_mut().resolve_dir(70),
+      Some(vec!["b".to_owned()]),
+      "the MAP (the walk's anchor) already tracks the rename"
     );
   }
 }

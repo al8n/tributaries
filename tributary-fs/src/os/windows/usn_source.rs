@@ -65,53 +65,25 @@ fn seed_walk(
       Err(_) => return Err(ProbeStage::Walk),
     };
     for entry in entries {
-      let Ok(entry) = entry else {
-        return Err(ProbeStage::Walk);
-      };
-      let Ok(kind) = entry.file_type() else {
-        continue;
-      };
-      if !kind.is_dir() || kind.is_symlink() {
-        continue;
-      }
-      let child_path = entry.path();
-      let Ok(child) = ffi::open_directory(&child_path) else {
-        if child_path.exists() {
-          return Err(ProbeStage::Walk);
-        }
-        continue;
-      };
-      // A reparse point (junction/mount) is a containment boundary: never
-      // descended, never mapped.
-      if ffi::is_reparse_point(child.as_handle()).unwrap_or(true) {
-        continue;
-      }
-      let Ok(child_identity) = ffi::identity_of(child.as_handle()) else {
-        return Err(ProbeStage::Walk);
-      };
-      let name = entry.file_name();
-      let Some(name) = name.to_str() else {
-        // A directory whose name has no Unicode spelling cannot anchor
-        // resolvable children: completeness refuses, the probe falls.
-        return Err(ProbeStage::Walk);
-      };
-      match map.learn(child_identity.file_id, dir_frn, name.to_owned()) {
-        super::usn::map::LearnOutcome::Learned => {}
-        // Over the cap, the map can no longer be complete; an unmapped
-        // parent here is a walk-order bug — either way the walk refuses
-        // rather than returns a born-blind map.
-        _ => return Err(ProbeStage::Walk),
-      }
-      queue.push((child_path, child_identity.file_id));
+      let entry = entry.map_err(|_| ProbeStage::Walk)?;
+      admit_walk_entry(&mut map, &mut queue, &entry, dir_frn).map_err(|_| ProbeStage::Walk)?;
     }
   }
   Ok(map)
 }
 
 /// Walks one moved-in subtree into the live map (the seed walk's shape,
-/// anchored at the moved directory). An incomplete walk is an error — the
-/// caller escalates to the full reseed spine rather than run blind.
+/// anchored at the moved directory). The anchor's identity is verified
+/// against the requested FRN — a missing or replaced anchor, like every
+/// indeterminate metadata failure below it, is an error: the caller
+/// escalates to the full reseed spine rather than run blind.
 fn walk_into(map: &mut FrnMap, dir: &Path, frn: u128) -> Result<(), ()> {
+  let anchor = ffi::open_directory(dir).map_err(|_| ())?;
+  let anchor_identity = ffi::identity_of(anchor.as_handle()).map_err(|_| ())?;
+  if anchor_identity.file_id != frn {
+    return Err(());
+  }
+  drop(anchor);
   let mut queue = vec![(dir.to_path_buf(), frn)];
   while let Some((dir_path, dir_frn)) = queue.pop() {
     let entries = match std::fs::read_dir(&dir_path) {
@@ -120,39 +92,56 @@ fn walk_into(map: &mut FrnMap, dir: &Path, frn: u128) -> Result<(), ()> {
       Err(_) => return Err(()),
     };
     for entry in entries {
-      let Ok(entry) = entry else {
-        return Err(());
-      };
-      let Ok(kind) = entry.file_type() else {
-        continue;
-      };
-      if !kind.is_dir() || kind.is_symlink() {
-        continue;
+      match admit_walk_entry(map, &mut queue, &entry.map_err(|_| ())?, dir_frn) {
+        Ok(()) => {}
+        Err(()) => return Err(()),
       }
-      let child_path = entry.path();
-      let Ok(child) = ffi::open_directory(&child_path) else {
-        if child_path.exists() {
-          return Err(());
-        }
-        continue;
-      };
-      if ffi::is_reparse_point(child.as_handle()).unwrap_or(true) {
-        continue;
-      }
-      let Ok(child_identity) = ffi::identity_of(child.as_handle()) else {
-        return Err(());
-      };
-      let name = entry.file_name();
-      let Some(name) = name.to_str() else {
-        return Err(());
-      };
-      match map.learn(child_identity.file_id, dir_frn, name.to_owned()) {
-        super::usn::map::LearnOutcome::Learned => {}
-        _ => return Err(()),
-      }
-      queue.push((child_path, child_identity.file_id));
     }
   }
+  Ok(())
+}
+
+/// One walk entry's admission, shared by the seed walk and the live subtree
+/// walk: directories admit (or the walk refuses), files skip, and every
+/// indeterminate metadata outcome is a refusal — an unreadable EXISTING
+/// directory must never become a silently unmapped subtree.
+fn admit_walk_entry(
+  map: &mut FrnMap,
+  queue: &mut Vec<(PathBuf, u128)>,
+  entry: &std::fs::DirEntry,
+  dir_frn: u128,
+) -> Result<(), ()> {
+  let kind = entry.file_type().map_err(|_| ())?;
+  if !kind.is_dir() || kind.is_symlink() {
+    return Ok(());
+  }
+  let child_path = entry.path();
+  let child = match ffi::open_directory(&child_path) {
+    Ok(child) => child,
+    Err(_) => {
+      // Only a PROVEN disappearance is a benign race; an access-denied or
+      // indeterminate probe is a completeness refusal.
+      return match child_path.try_exists() {
+        Ok(false) => Ok(()),
+        Ok(true) | Err(_) => Err(()),
+      };
+    }
+  };
+  // A reparse point (junction/mount) is a containment boundary: never
+  // descended, never mapped. An indeterminate query refuses.
+  if ffi::is_reparse_point(child.as_handle()).map_err(|_| ())? {
+    return Ok(());
+  }
+  let child_identity = ffi::identity_of(child.as_handle()).map_err(|_| ())?;
+  let name = entry.file_name();
+  let Some(name) = name.to_str() else {
+    return Err(());
+  };
+  match map.learn(child_identity.file_id, dir_frn, name.to_owned()) {
+    super::usn::map::LearnOutcome::Learned => {}
+    _ => return Err(()),
+  }
+  queue.push((child_path, child_identity.file_id));
   Ok(())
 }
 
@@ -293,7 +282,21 @@ fn start(
     .try_clone()
     .map_err(|_| SourceError::CreateFailed)?;
   let admission = UsnAdmission::new(map, SESSION_CAP);
-  let pump = spawn_pump(io_state, admission, canonical.clone(), Arc::clone(&shared))?;
+  // The startup handshake: the pump reports its first issue before spawn
+  // can commit, so a refused journal read is a SPAWN failure, never a
+  // successful-but-dead source.
+  let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+  let pump = spawn_pump(
+    io_state,
+    admission,
+    canonical.clone(),
+    Arc::clone(&shared),
+    started_tx,
+  )?;
+  if !started_rx.recv().unwrap_or(false) {
+    let _ = pump.join();
+    return Err(SourceError::StartFailed);
+  }
   let source_handle = SourceHandle::assemble(pump, control_port, shared);
 
   // The post-live re-proof: the pinned handle's object cannot change, so
@@ -352,6 +355,7 @@ fn spawn_pump(
   admission: UsnAdmission,
   root: PathBuf,
   shared: Arc<PumpShared>,
+  started: std::sync::mpsc::SyncSender<bool>,
 ) -> Result<std::thread::JoinHandle<()>, SourceError> {
   std::thread::Builder::new()
     .name("tributary-fs.usn".into())
@@ -360,10 +364,12 @@ fn spawn_pump(
       let mut admission = admission;
       // The FIRST issue happens here, after every fallible setup step: no
       // pinned read can exist for a spawn that fails to start its pump.
+      // The handshake makes the outcome part of the spawn barrier.
       if io_state.issue().is_err() {
-        shared.fatal(SourceError::StartFailed);
+        let _ = started.send(false);
         return;
       }
+      let _ = started.send(true);
       let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&mut io_state, &mut admission, &root, &shared);
       }));
@@ -426,14 +432,9 @@ fn run(io_state: &mut JournalIo, admission: &mut UsnAdmission, root: &Path, shar
           if shared.stopped() {
             return;
           }
-          // The pairing carry predates the loss: widow it in-band FIRST, so
-          // no half can pair across (or surface after) the gap signal.
-          let mut widowed = Vec::new();
-          admission.flush(&mut widowed);
-          forward(shared, widowed, false);
           // Journal-side truncation (wrap, purge, ID change) funnels into
-          // the reseed spine; a journal that cannot be re-anchored (deleted,
-          // inactive) is terminal.
+          // the reseed spine (which widows the carry and resets sessions
+          // first); a journal that cannot be re-anchored is terminal.
           if !reseed(io_state, admission, root, shared) {
             shared.fatal(SourceError::ReadFailed {
               source: io::Error::from_raw_os_error(code),
@@ -458,12 +459,20 @@ fn run(io_state: &mut JournalIo, admission: &mut UsnAdmission, root: &Path, shar
           admission.flush(&mut admitted);
         }
         // Moved-in subtrees demand their walks BEFORE later records are
-        // read: journal order resumes against a map that knows them.
+        // read: journal order resumes against a map that knows them. The
+        // walk anchors at the FRN's CURRENT map location (a later record in
+        // the same buffer may have reparented it — the event's captured
+        // target is the RESCAN's location, never the walk's), and a
+        // directory the map no longer knows was moved out again: nothing
+        // left to walk.
         let mut walk_failed = false;
         for event in &admitted {
-          if let UsnAdmitted::MovedInSubtree { frn, target } = event {
+          if let UsnAdmitted::MovedInSubtree { frn, .. } = event {
+            let Some(components) = admission.map_mut().resolve_dir(*frn) else {
+              continue;
+            };
             let mut path = root.to_path_buf();
-            for component in target {
+            for component in &components {
               path.push(component);
             }
             if walk_into(admission.map_mut(), &path, *frn).is_err() {
@@ -516,6 +525,12 @@ fn reseed(
   root: &Path,
   shared: &PumpShared,
 ) -> bool {
+  // The pairing carry predates the gap: widow it in-band FIRST, and drop
+  // the cumulative-reason history whose CLOSEs may sit inside the gap.
+  let mut widowed = Vec::new();
+  admission.flush(&mut widowed);
+  forward(shared, widowed, false);
+  admission.reset_sessions();
   transport::signal_loss::<SourceEvent, _>(&shared.transport, |msg| shared.send(msg));
   let Ok(facts) = ffi::query_journal(io_state.query.as_handle()) else {
     return false;

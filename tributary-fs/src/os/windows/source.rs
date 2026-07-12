@@ -252,7 +252,15 @@ impl Source {
         .try_clone()
         .map_err(|_| SourceError::CreateFailed)?,
     };
-    let pump = spawn_pump(io_state, Arc::clone(&shared))?;
+    // The startup handshake: the pump reports its first issue before spawn
+    // can commit, so a refused stream is a SPAWN failure, never a
+    // successful-but-dead source.
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+    let pump = spawn_pump(io_state, Arc::clone(&shared), started_tx)?;
+    if !started_rx.recv().unwrap_or(false) {
+      let _ = pump.join();
+      return Err(SourceError::StartFailed);
+    }
 
     // From here the stream is live; failures tear it down through the one
     // proven teardown path (the handle) before rejecting.
@@ -412,7 +420,11 @@ impl Drop for SourceHandle {
 }
 
 /// Starts the pump thread.
-fn spawn_pump(io_state: PumpIo, shared: Arc<PumpShared>) -> Result<JoinHandle<()>, SourceError> {
+fn spawn_pump(
+  io_state: PumpIo,
+  shared: Arc<PumpShared>,
+  started: std::sync::mpsc::SyncSender<bool>,
+) -> Result<JoinHandle<()>, SourceError> {
   std::thread::Builder::new()
     .name("tributary-fs.rdcw".into())
     .spawn(move || {
@@ -421,14 +433,16 @@ fn spawn_pump(io_state: PumpIo, shared: Arc<PumpShared>) -> Result<JoinHandle<()
       // pinned read can exist for a spawn that fails to start its pump. It
       // doubles as the record-layout probe — a kernel or filesystem without
       // the extended class refuses the issue itself, and the stream falls
-      // back to the basic layout once, before anything is delivered.
+      // back to the basic layout once, before anything is delivered. The
+      // handshake makes the outcome part of the spawn barrier.
       if io_state.issue().is_err() {
         io_state.extended = false;
         if io_state.issue().is_err() {
-          shared.fatal(SourceError::StartFailed);
+          let _ = started.send(false);
           return;
         }
       }
+      let _ = started.send(true);
       let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&mut io_state, &shared);
       }));
