@@ -88,7 +88,13 @@ fn walk_into(map: &mut FrnMap, dir: &Path, frn: u128) -> Result<(), ()> {
   while let Some((dir_path, dir_frn)) = queue.pop() {
     let entries = match std::fs::read_dir(&dir_path) {
       Ok(entries) => entries,
-      Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+      // A verified (or already-mapped) directory whose path no longer
+      // opens was renamed between verification and enumeration: its
+      // descendants would stay unmapped while the map carries the top —
+      // a blind subtree. The walk refuses; the reseed spine re-walks the
+      // world as it now is. (The probe-time seed walk may skip a vanished
+      // directory — nothing depends on its map yet and the cursor
+      // pre-dates the walk — but a LIVE walk may not.)
       Err(_) => return Err(()),
     };
     for entry in entries {
@@ -404,7 +410,11 @@ fn run(io_state: &mut JournalIo, admission: &mut UsnAdmission, root: &Path, shar
     let completion = match ffi::iocp_wait(io_state.port.as_handle(), u32::MAX) {
       Ok(completion) => completion,
       Err(err) => {
+        // A wait failure dequeued NOTHING: the outstanding read's pin is
+        // unproven, so the teardown drain (cancel → drain-to-exact →
+        // leak-on-failure) must run before the I/O state can drop.
         shared.fatal(SourceError::ReadFailed { source: err });
+        teardown_drain(io_state);
         return;
       }
     };
