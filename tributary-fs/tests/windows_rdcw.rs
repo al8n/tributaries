@@ -307,12 +307,20 @@ async fn journal_wrap_degrades_to_rescan() {
     .expect("the prepared wrap volume must start the forced journal");
   assert_eq!(w.backend_of(handle).expect("live").as_str(), "usn-journal");
 
-  // Churn well past the 1 MiB journal cap.
+  // Churn well past the 1 MiB journal cap, paced so the consumer keeps
+  // draining — the wrap must come from JOURNAL truncation, not from a
+  // competing callback-capacity overflow.
   for round in 0..256 {
     for i in 0..64 {
       let f = root.join(format!("churn-{round}-{i}.tmp"));
       std::fs::write(&f, b"xxxxxxxx").ok();
       std::fs::remove_file(&f).ok();
+    }
+    if round % 16 == 0 {
+      while tokio::time::timeout(Duration::from_millis(1), w.next())
+        .await
+        .is_ok()
+      {}
     }
   }
   assert!(
@@ -322,15 +330,21 @@ async fn journal_wrap_degrades_to_rescan() {
     "the wrap surfaces its covering rescan"
   );
 
-  // The stream survives: a fresh create still arrives.
+  // The scope survived the reseed REGISTERED — a terminal death Rescan
+  // cannot satisfy this — and delivery continues with a CONCRETE event:
+  // a queued loss or terminal Rescan cannot satisfy that either.
+  assert!(
+    w.backend_of(handle).is_some(),
+    "the scope must survive the wrap reseed registered"
+  );
   let probe = root.join("alive.txt");
   std::fs::write(&probe, b"x").expect("post-wrap create");
   assert!(
-    wait_for(&mut w, |e| covers(e, &probe)
-      || matches!(e.kind(), EventKind::Rescan))
+    wait_for(&mut w, |e| !matches!(e.kind(), EventKind::Rescan)
+      && e.path() == probe)
     .await
     .is_some(),
-    "delivery continues after the reseed"
+    "a concrete post-reseed event flows"
   );
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);
