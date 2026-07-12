@@ -587,6 +587,14 @@ struct ScopeState {
   /// predate the newly-lost window, so its result is discarded and one more
   /// refresh re-arms.
   refresh_stale: bool,
+  /// A root REPLACE committed while a refresh was in flight: that snapshot
+  /// describes the replaced world, so EVERYTHING it carries — the liveness
+  /// verdict included — is about an object this scope no longer watches.
+  /// Its result is discarded whole and one refresh re-arms against the live
+  /// world. Distinct from [`refresh_stale`](Self::refresh_stale), which
+  /// gates only the table/frame: same-world death evidence must survive a
+  /// loss, but a cross-world verdict must not survive a replace.
+  refresh_world_stale: bool,
   lag: LagState,
   park: Park,
   /// The journal id counter wrapped; any minted resume token is invalid.
@@ -796,6 +804,7 @@ impl DriverCore {
         mounts_authoritative: false,
         refresh_pending: false,
         refresh_stale: false,
+        refresh_world_stale: false,
         lag: LagState::Normal,
         park: Park::default(),
         resume_poisoned: false,
@@ -1420,25 +1429,32 @@ impl DriverCore {
     self.drain_monitor();
   }
 
-  /// Commits a root replacement on a live KERNEL-RECURSIVE scope: the new
-  /// stream's [`RootMeta`] replaces the scope's world (root bytes, device,
-  /// mount frame, identity, mount seed), and everything the OLD world still
-  /// owed is resolved by domination — the loss-path cut. Parked work and
+  /// Commits a root replacement on a live scope: the new stream's
+  /// [`RootMeta`] replaces the scope's world (root bytes, device, mount
+  /// frame, identity, mount seed), and everything the OLD world still owed
+  /// is resolved by domination — the loss-path cut. Parked work and
   /// in-flight probes were compiled against the old root's bytes, so they
   /// are dropped, not re-addressed; the epoch-bumped full-root `Rescan` the
   /// cut emits instructs the consumer to re-read the (widened) world, which
   /// covers the old subtree's swap window and the newly covered delta alike.
   ///
-  /// The scope's KR profile must be preserved (the driver refuses a
+  /// The scope's LOWERING must be preserved (the driver refuses a
   /// descending↔KR flip as `BackendDiverged` before this input is reached);
   /// a KR→KR backend change (a replace landing on another volume under the
-  /// windows Auto ladder) re-profiles exactly like `on_stream_spawned`.
+  /// windows Auto ladder) re-profiles exactly like `on_stream_spawned`. On a
+  /// descending scope the per-directory book rebinds
+  /// ([`Monitor::rebind_root`]): the driver has ALREADY armed the new root
+  /// on the new transport and replays that outcome via
+  /// [`on_watch_installed`](Self::on_watch_installed) immediately after this
+  /// input — the re-arm-flavored rebuild it kicks off restores coverage
+  /// without re-announcing content the commit `Rescan` already covers.
   pub(crate) fn on_root_replaced(&mut self, scope: ScopeId, meta: RootMeta, now: Instant) {
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;
     };
-    debug_assert!(
-      state.profile.is_kernel_recursive() && meta.backend.is_kernel_recursive(),
+    debug_assert_eq!(
+      state.profile.is_kernel_recursive(),
+      meta.backend.is_kernel_recursive(),
       "replace never crosses lowering profiles; the driver refuses BackendDiverged"
     );
     let watch = state.watch;
@@ -1457,7 +1473,11 @@ impl DriverCore {
     state.identity = Some(meta.identity);
     state.mounts = meta.mounts;
     // The old world's authority cannot vouch for the new root's mounts:
-    // trust fails closed until the refresh this commit arms completes.
+    // trust fails closed until the refresh this commit arms completes. A
+    // refresh already in flight was addressed to the REPLACED root — mark it
+    // cross-world so its completion (liveness verdict included) is discarded
+    // rather than judging the new identity by the old object.
+    state.refresh_world_stale = state.refresh_pending;
     state.mounts_authoritative = false;
     Self::arm_refresh(&mut self.effects, scope, state);
 
@@ -1467,8 +1487,21 @@ impl DriverCore {
     state.park.queued.clear();
     Self::trust_lost(&mut self.effects, scope, state);
     self.probes.retain(|_, ctx| ctx.scope != scope);
+    // Descending: the per-directory book was built on the retired
+    // transport — rebind it (children dropped, root reset to a counted
+    // re-arm) BEFORE the overflow cut, whose re-arm kickoff then folds into
+    // the reset root instead of re-reading the old tree.
+    if !backend.is_kernel_recursive() {
+      self.monitor.rebind_root(scope);
+    }
     self.monitor.on_overflow(Scope::Root(scope), now);
     self.drain_monitor();
+  }
+
+  /// The root `WatchId` of a live scope — the anchor the driver pre-arms on
+  /// the replacement transport before committing a descending replace.
+  pub(crate) fn root_watch(&self, scope: ScopeId) -> Option<WatchId> {
+    self.scopes.get(&scope).map(|state| state.watch)
   }
 
   /// Feeds a transport-level loss signal for `scope` (a dropped batch, the
@@ -1546,6 +1579,18 @@ impl DriverCore {
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;
     };
+    // The cross-world gate precedes even the death gate: this completion was
+    // addressed to a root this scope REPLACED, so its liveness verdict is
+    // about the old object — evidence for a world that ended at the commit,
+    // not death evidence for the new one. Discard it whole and re-read the
+    // live world (trust is already closed since the commit).
+    if state.refresh_world_stale {
+      state.refresh_world_stale = false;
+      state.refresh_pending = false;
+      state.refresh_stale = false;
+      Self::trust_lost(&mut self.effects, scope, state);
+      return;
+    }
     state.refresh_pending = false;
 
     // Root-liveness FIRST, unconditionally — BEFORE the stale gate. A dead root

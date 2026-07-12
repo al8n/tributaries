@@ -112,6 +112,14 @@ fn renamed() -> FsEventFlags {
   FsEventFlags::new(FsEventFlags::ITEM_RENAMED.bits() | FsEventFlags::ITEM_IS_FILE.bits())
 }
 
+/// `next_event` plus the delivery's canonical root.
+async fn next_rooted(rig: &Rig) -> (ScopeId, Arc<PathBuf>, Change) {
+  tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
+    .await
+    .expect("an event arrives")
+    .expect("the stream is open")
+}
+
 async fn next_event(rig: &Rig) -> (ScopeId, Change) {
   let (scope, _root, change) = tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
     .await
@@ -2255,6 +2263,214 @@ mod descending {
       }
     }
   }
+
+  /// The descending replace end to end: the new root pre-arms on the NEW
+  /// transport (the arms ledger shows it), the commit delivers exactly one
+  /// covering Rescan, the rebuild re-arms the new tree, and post-swap
+  /// records deliver under the new root on the surviving scope.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_descending_replace_rebinds_on_a_fresh_transport() {
+    let rig = inotify_rig();
+    rig.fs.put("/r2", FileKind::Dir, 20);
+    rig.fs.put("/r2/sub", FileKind::Dir, 21);
+    let scope = watch(&rig, "/r").await;
+    let root_arm = rig.fs.arms().first().cloned().expect("the birth root arm");
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(on_reply.await.expect("driver replies").is_ok());
+    settle(|| rig.fs.shutdowns() == 1).await;
+
+    // The pre-arm rode the SAME surviving WatchId to the new root.
+    let arms = rig.fs.arms();
+    assert!(
+      arms
+        .iter()
+        .any(|(w, p)| *w == root_arm.0 && p == std::path::Path::new("/r2")),
+      "the new root pre-armed on the surviving watch id: {arms:?}"
+    );
+
+    // Exactly one covering Rescan, re-rooted.
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), std::path::Path::new("/r2"));
+    assert!(change.kind().is_rescan(), "{change:?}");
+
+    // The rebuild walked the new tree and re-armed it — announcing nothing.
+    settle(|| {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r2/sub"))
+    })
+    .await;
+    assert!(
+      rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == std::path::Path::new("/r2/sub")),
+      "the rebuild re-arms the new tree: {:?}",
+      rig.fs.arms()
+    );
+
+    // Post-swap records deliver under the new root.
+    rig.fs.send_inotify_batch(
+      "/r2",
+      vec![attributed(&[root_arm.0], IN_CREATE, b"post.txt")],
+    );
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), std::path::Path::new("/r2"));
+    assert!(change.kind().is_created());
+    assert_eq!(change.location(), &loc(&["post.txt"]));
+  }
+
+  /// A refused pre-arm unwinds atomically: the caller gets the typed source
+  /// failure, the replacement is torn down inside the accounting, and the
+  /// old tree keeps delivering.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_failed_pre_arm_unwinds_and_the_old_tree_survives() {
+    let rig = inotify_rig();
+    rig.fs.put("/r2", FileKind::Dir, 20);
+    rig
+      .fs
+      .fail_watch_at("/r2", tributary_proto::WatchError::NoSpace);
+    let scope = watch(&rig, "/r").await;
+    let root_arm = rig.fs.arms().first().cloned().expect("the birth root arm");
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    let outcome = on_reply.await.expect("driver replies");
+    assert!(
+      matches!(outcome, Err(crate::error::ReplaceRootError::Source(_))),
+      "{outcome:?}"
+    );
+    settle(|| rig.fs.shutdowns() == 1).await;
+    assert_eq!(rig.fs.shutdowns(), 1, "only the refused replacement died");
+
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_arm.0], IN_CREATE, b"still.txt")],
+    );
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), std::path::Path::new("/r"));
+    assert!(change.kind().is_created());
+  }
+
+  /// Close lands while the pre-arm is parked on the blocking pool: the sweep
+  /// retires the spawned-but-uncommitted replacement inside the counted
+  /// accounting — both streams torn down, the replace answered Closed.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_during_the_pre_arm_counts_both_streams() {
+    let rig = inotify_rig();
+    rig.fs.put("/r2", FileKind::Dir, 20);
+    let scope = watch(&rig, "/r").await;
+
+    let gate = rig.fs.hold_arms();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    // The replacement spawned and its pre-arm is parked.
+    settle(|| rig.fs.spawns() == 2).await;
+
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    // Close settles while the pre-arm is STILL PARKED: the sweep alone must
+    // account for the held replacement (releasing first would race the
+    // commit against the close and sometimes swap successfully — a
+    // different, also-legal ordering this cell is not about).
+    assert!(on_close.await.is_ok(), "close settles");
+    settle(|| rig.fs.shutdowns() == 2).await;
+    assert_eq!(rig.fs.shutdowns(), 2, "old stream AND held replacement");
+    assert!(matches!(
+      on_reply.await,
+      Ok(Err(crate::error::ReplaceRootError::Closed)) | Err(_)
+    ));
+    gate.release();
+  }
+
+  /// The lowering gate, both diagonals: a replacement resolving to a
+  /// different recursiveness than the live scope refuses as
+  /// BackendDiverged, the old coverage untouched, the fresh stream retired.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_lowering_flip_is_refused_both_ways() {
+    // Descending → kernel-recursive.
+    let rig = inotify_rig();
+    rig.fs.put("/r2", FileKind::Dir, 20);
+    let scope = watch(&rig, "/r").await;
+    rig.fs.spawn_backend(BackendKind::Fanotify);
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(matches!(
+      on_reply.await.expect("driver replies"),
+      Err(crate::error::ReplaceRootError::BackendDiverged)
+    ));
+    settle(|| rig.fs.shutdowns() == 1).await;
+
+    // Kernel-recursive → descending.
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r2", FileKind::Dir, 20);
+    let scope = watch(&rig, "/r").await;
+    rig.fs.spawn_backend(BackendKind::Inotify);
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(matches!(
+      on_reply.await.expect("driver replies"),
+      Err(crate::error::ReplaceRootError::BackendDiverged)
+    ));
+    settle(|| rig.fs.shutdowns() == 1).await;
+  }
 }
 
 /// The Linux one-sample enumerate: `list_dir`/`dir_entry_stat` build each
@@ -2422,14 +2638,6 @@ mod replace {
       .await
       .unwrap();
     on_reply.await.expect("driver replies")
-  }
-
-  /// `next_event` plus the delivery's canonical root.
-  async fn next_rooted(rig: &Rig) -> (ScopeId, Arc<PathBuf>, Change) {
-    tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
-      .await
-      .expect("an event arrives")
-      .expect("the stream is open")
   }
 
   #[tokio::test(start_paused = true)]

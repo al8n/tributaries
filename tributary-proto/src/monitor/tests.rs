@@ -7102,3 +7102,160 @@ fn drop_subtree_mid_rearm_cascade_settles() {
   assert!(m.rearm_settled(s), "an unregistered scope is settled");
   m.assert_invariants();
 }
+
+/// `rebind_root` drops the descended book (those kernel watches died with
+/// the old transport), keeps the root's `WatchId`, and resets it to a
+/// pending arm that CONTINUES a re-arm: the caller replays the new
+/// transport's arm outcome and the rebuild announces nothing — the commit
+/// `Rescan` the caller emits already stands for the world change.
+#[test]
+fn rebind_root_resets_the_root_and_drops_the_book() {
+  let mut m = per_dir();
+  let (root, w_a) = root_with_live_child(&mut m, scope(1), "a");
+
+  assert_eq!(m.rebind_root(scope(1)), Some(root), "the WatchId survives");
+  assert!(m.is_watched(root));
+  assert!(!m.is_watched(w_a), "children die with the old transport");
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions
+      .iter()
+      .any(|a| matches!(a, Action::Unwatch(id) if *id == w_a)),
+    "the dropped child's unwatch is queued: {actions:?}"
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "the reset root is a counted obligation"
+  );
+
+  // The replayed arm outcome starts the re-arm-flavored rebuild.
+  m.on_watch_result(root, Ok(()));
+  let req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the rebuild read");
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().all(|c| !c.kind().is_created()),
+    "a re-arm rebuild announces nothing: {events:?}"
+  );
+  let child = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the child re-arms on the new transport");
+  assert_ne!(child, w_a, "a fresh watch id");
+  m.on_watch_result(child, Ok(()));
+  let child_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the child rebuild read");
+  m.on_enumerate(child_req, EnumerateResult::Ok(vec![]));
+  let _ = drain_actions(&mut m);
+  assert!(m.rearm_settled(scope(1)), "the rebuild quiesced");
+}
+
+/// A rebind is whole-world: an old-world move half can never pair on the
+/// new transport, so it is purged — the pairing deadline then resolves
+/// NOTHING (no fabricated `Removed` for a world that no longer exists).
+#[test]
+fn rebind_root_purges_pending_move_halves() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("gone"))
+      .with_cookie(cookie(9)),
+    at(10),
+  );
+  assert_eq!(m.rebind_root(scope(1)), Some(root));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().all(|c| !c.kind().is_removed()),
+    "a purged half resolves nothing: {events:?}"
+  );
+}
+
+/// The rebind vocabulary is descending-only: a kernel-recursive scope swaps
+/// its stream whole (no per-directory book), and an unknown scope has
+/// nothing to rebind.
+#[test]
+fn rebind_root_refuses_kernel_recursive_and_unknown_scopes() {
+  let mut kr = kernel_recursive();
+  let _root = live_root(&mut kr, scope(1));
+  assert_eq!(kr.rebind_root(scope(1)), None);
+
+  let mut m = per_dir();
+  assert_eq!(m.rebind_root(scope(9)), None);
+}
+
+/// A rebind lands while the root's own read is in flight: the request slot
+/// is reclaimed, and the stale result — arriving after the reset — is
+/// dropped rather than reconciled into the new world.
+#[test]
+fn rebind_root_disowns_an_in_flight_root_read() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+
+  assert_eq!(m.rebind_root(scope(1)), Some(root));
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("stale"), FileKind::Dir)]),
+  );
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions.iter().all(|a| a.as_watch().is_none()),
+    "a disowned read arms nothing: {actions:?}"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().all(|c| !c.kind().is_created()),
+    "and announces nothing: {events:?}"
+  );
+}
+
+/// An arm outcome that crosses a rebind: the child it was for died with the
+/// old transport, so the late result is ignored whole — no fabricated
+/// events, no second Rescan, no re-arm accounting drift.
+#[test]
+fn a_late_arm_result_for_a_rebound_child_is_ignored() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  let child = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the child arm is in flight");
+  let _ = drain_events(&mut m);
+
+  assert_eq!(m.rebind_root(scope(1)), Some(root));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_watch_result(child, Ok(()));
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "a dead arm starts nothing"
+  );
+  assert!(drain_events(&mut m).is_empty(), "and announces nothing");
+}
