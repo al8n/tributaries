@@ -3235,4 +3235,105 @@ mod replace {
       "{outcome:?}"
     );
   }
+
+  /// The unwatch quiescence fence holds under the OTHER ordering: the old
+  /// root DIES (removing the handle) while a replacement is still spawning,
+  /// and only THEN does unwatch arrive. It must not answer immediately while
+  /// the replacement stream is coming up — it parks until the replacement is
+  /// torn down, then reports the scope gone (UnknownRoot).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn unwatch_after_root_death_waits_for_the_replacement() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // A replace is in flight, its spawn held on the blocking pool.
+    let gate = rig.fs.hold_spawns();
+    let (reply, on_replace) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply,
+      })
+      .await
+      .unwrap();
+    // The command is processed (replace_states populated) before the death,
+    // since the biased select drains the command channel ahead of the source
+    // stream.
+    for _ in 0..8 {
+      tokio::task::yield_now().await;
+    }
+
+    // The OLD root dies while the replacement is still spawning: the death
+    // path tears the original handle down.
+    rig.fs.send_fatal("/r/sub");
+    settle(|| rig.fs.shutdowns() == 1).await;
+
+    // Unwatch arrives AFTER the handle is gone: the scope is NOT quiescent (a
+    // replacement is still coming up), so the reply must park, not answer.
+    let (ureply, mut on_unwatch) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(ureply),
+      })
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+      futures_util::poll!(&mut on_unwatch).is_pending(),
+      "unwatch must wait for the still-spawning replacement, not answer at once"
+    );
+
+    // Release: the replacement resolves Retired and is torn down; only then
+    // does the unwatch resolve, reporting the dead scope as UnknownRoot.
+    gate.release();
+    assert!(matches!(
+      on_replace.await.expect("driver replies"),
+      Err(crate::error::ReplaceRootError::Retired)
+    ));
+    assert!(
+      !on_unwatch.await.unwrap(),
+      "the dead scope resolves UnknownRoot, only at quiescence"
+    );
+    settle(|| rig.fs.shutdowns() == 2).await;
+    assert_eq!(rig.fs.shutdowns(), 2, "old stream AND the replacement");
+  }
+
+  /// Whole-scope teardown reclaims the delivery lane: repeated watch/unwatch
+  /// churn leaves no lane entry behind, so `lanes` stays bounded for the
+  /// driver's lifetime (scope ids never recycle).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn watch_unwatch_churn_leaves_no_lane_entry() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    for _ in 0..16 {
+      let scope = watch(&rig, "/r/sub").await;
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      assert!(on_reply.await.unwrap(), "each cycle tears down cleanly");
+    }
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugLaneCount { reply })
+      .await
+      .unwrap();
+    assert_eq!(
+      on_reply.await.unwrap(),
+      0,
+      "every retired scope reclaimed its lane — no unbounded growth"
+    );
+  }
 }
