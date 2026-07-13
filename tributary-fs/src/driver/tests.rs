@@ -3631,7 +3631,10 @@ mod replace {
 
 /// The sync-cookie substrate on a kernel-recursive root: no re-arm work means
 /// the settle fence is trivially met, so the write lands at once; the unlink
-/// is a reply-less fire-and-forget; and a read-only tree refuses typed.
+/// is a reply-less fire-and-forget; and a read-only tree refuses typed. The
+/// driver OWNS every cookie it writes until a `RemoveCookie` unlinks it, so a
+/// cookie whose reply the caller abandoned is still reaped when the scope's
+/// stream tears down or the driver exits — never leaked.
 mod sync_cookie {
   use super::*;
 
@@ -3720,5 +3723,69 @@ mod sync_cookie {
       sync_root(&rig, ghost, "/r", ".tributaries-sync-1-7-3").await,
       Err(crate::error::SyncRootError::UnknownRoot)
     ));
+  }
+
+  // The driver owns every cookie it writes: even with NO `RemoveCookie` — the
+  // abandoned-after-send case where the caller loses the path — the cookie is
+  // unlinked when the driver tears down. This is the guarantee that lets the
+  // umbrella source drop its own cookie-removes queue entirely.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_written_cookie_is_reaped_when_the_driver_tears_down() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-1-7-4")
+      .await
+      .expect("the write lands");
+    assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
+    assert!(
+      rig.fs.cookie_removes().is_empty(),
+      "no RemoveCookie was sent — the cookie is still the driver's to reap"
+    );
+
+    // Close WITHOUT ever removing the cookie: the driver's terminal reap must
+    // unlink it before the close reply lands.
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig.commands.send(Command::Close { reply }).await.unwrap();
+    let _ = on_reply.await;
+
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      vec![path],
+      "the driver reaped its written cookie at teardown"
+    );
+  }
+
+  // A cookie whose scope is retired mid-life (unwatch, not close) is reaped by
+  // that scope's stream teardown — the same ownership, one scope at a time.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_written_cookie_is_reaped_when_its_scope_is_retired() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-1-7-5")
+      .await
+      .expect("the write lands");
+    assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
+
+    // Retire the scope with no RemoveCookie: the stream teardown reaps the
+    // cookie the scope still owns (a reply-less, off-reactor unlink).
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(on_reply.await.unwrap(), "the live scope was unwatched");
+
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      vec![path],
+      "the retiring scope's stream teardown reaped its written cookie"
+    );
   }
 }
