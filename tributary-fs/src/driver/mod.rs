@@ -333,14 +333,14 @@ pub(crate) enum Command {
   /// A test-only snapshot of per-scope bookkeeping the suites assert is
   /// reclaimed on teardown (the live delivery-lane count), so a leak of that
   /// state under watch/unwatch churn is provable rather than inferred.
-  #[cfg(test)]
+  #[cfg(all(test, feature = "tokio"))]
   DebugLaneCount {
     reply: futures_channel::oneshot::Sender<usize>,
   },
   /// A test-only count of the awaited-unwatch waiters parked for `scope`, so a
   /// suite can prove an issue-and-cancel storm leaves the waiter vector
   /// bounded rather than growing without limit.
-  #[cfg(test)]
+  #[cfg(all(test, feature = "tokio"))]
   DebugUnwatchWaiters {
     scope: ScopeId,
     reply: futures_channel::oneshot::Sender<usize>,
@@ -1944,11 +1944,11 @@ pub(crate) async fn run<R, F>(
           }
         }
         Ok(Command::Close { reply }) => break Some(reply),
-        #[cfg(test)]
+        #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugLaneCount { reply }) => {
           let _ = reply.send(lanes.len());
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugUnwatchWaiters { scope, reply }) => {
           let _ = reply.send(unwatch_replies.get(&scope).map_or(0, Vec::len));
         }

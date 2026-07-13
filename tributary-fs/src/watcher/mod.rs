@@ -438,7 +438,7 @@ impl Reservation {
   /// A detached guard over an isolated set — the driver suites' stand-in
   /// (reservation SEMANTICS have their own suites; the driver only drops
   /// the guard it is handed).
-  #[cfg(test)]
+  #[cfg(all(test, feature = "tokio"))]
   pub(crate) fn detached_for_tests(path: PathBuf) -> Self {
     Self {
       roots: Arc::new(RwLock::new(RootSet::default())),
