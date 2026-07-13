@@ -691,17 +691,21 @@ pub enum SourceError {
 }
 
 /// Where a dead stream's successor can resume from: the last in-sync journal
-/// event id plus the device UUID that scopes its validity. Consuming this is
-/// a later refinement; sources only mint it.
+/// event id plus the device UUID that scopes its validity.
+///
+/// A root replacement consumes one: the driver takes the retiring stream's
+/// token at command time and hands it to the replacement's spawn, so the
+/// backend replays the swap window from the journal instead of leaving it to
+/// the commit `Rescan` alone. The replay is best-effort by construction — a
+/// wrapped id space mints no token, a purged journal replays nothing, and a
+/// token is only ever honored against its own device — so the `Rescan` still
+/// stands and the consumer contract is unchanged: delivery only gets denser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResumeToken {
   last_good: u64,
   device_uuid: Option<[u8; 16]>,
 }
 
-// Journal resume is deferred surface: sources mint tokens from day one so the
-// capability can land without a redesign, but nothing consumes them yet.
-#[allow(dead_code)]
 impl ResumeToken {
   /// Builds a token from a last-good event id and its device UUID.
   pub(crate) const fn new(last_good: u64, device_uuid: Option<[u8; 16]>) -> Self {

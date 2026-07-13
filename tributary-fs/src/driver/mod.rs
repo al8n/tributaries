@@ -632,6 +632,16 @@ pub(crate) trait SourceControl: Send + 'static {
   fn backend_stats(&self) -> Option<crate::os::BackendStatsHandle> {
     None
   }
+
+  /// Where a successor stream could resume this one's journal from, when the
+  /// backend keeps one and its ids are still valid. A root replacement takes
+  /// this from the RETIRING stream and hands it to the replacement's spawn,
+  /// so the swap window is replayed from the journal rather than left to the
+  /// commit `Rescan` alone. `None` — the default, and every backend without a
+  /// journal — simply means live-only: the `Rescan` still covers the window.
+  fn resume_token(&self) -> Option<crate::os::ResumeToken> {
+    None
+  }
 }
 
 impl SourceControl for SourceHandle {
@@ -647,6 +657,14 @@ impl SourceControl for SourceHandle {
   #[cfg(all(target_os = "linux", not(miri)))]
   fn backend_stats(&self) -> Option<crate::os::BackendStatsHandle> {
     SourceHandle::backend_stats(self)
+  }
+
+  // Every source but the Linux ones mints a resume point (inotify and
+  // fanotify have no journal to resume from, so they keep the `None`
+  // default). FSEvents is the one backend that actually replays from it.
+  #[cfg(not(all(target_os = "linux", not(miri))))]
+  fn resume_token(&self) -> Option<crate::os::ResumeToken> {
+    SourceHandle::resume_token(self)
   }
 }
 
@@ -1860,6 +1878,16 @@ pub(crate) async fn run<R, F>(
                 // result to the commit tail by the replace_states key.
                 pending_spawns.insert(scope);
                 let mut source_config = SourceConfig::new(vec![root]);
+                // The swap window rides the journal, not just the covering
+                // Rescan: the RETIRING stream's resume point is taken here —
+                // the one moment it is provably still live (the branch above
+                // proved the handle) — and handed to the replacement's spawn,
+                // which replays from it. Taking it EARLY only widens the
+                // replay (an earlier id replays more), and duplicates are
+                // always legal; a backend with no journal, a wrapped id
+                // space, or a foreign device simply mints/honors nothing and
+                // the `Rescan` covers the window as before.
+                source_config.since = handles.get(&scope).and_then(SourceControl::resume_token);
                 source_config.exclusions = config.exclusions.clone();
                 source_config.latency = config.latency;
                 source_config.channel_capacity = config.os_batch_capacity;

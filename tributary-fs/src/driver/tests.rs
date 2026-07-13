@@ -3518,6 +3518,34 @@ mod replace {
     );
   }
 
+  /// The swap window rides the journal: the replacement spawn inherits the
+  /// RETIRING stream's resume point, so a journal-bearing backend replays the
+  /// window instead of leaning on the covering `Rescan` alone. A birth spawn
+  /// carries none (there is nothing to resume from).
+  #[tokio::test(start_paused = true)]
+  async fn a_replacement_spawn_inherits_the_retiring_resume_point() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    // The live stream mints a journal point, as FSEvents does.
+    let token = crate::os::ResumeToken::new(4242, Some([7u8; 16]));
+    rig.fs.mint_resume_token(token);
+
+    let scope = watch(&rig, "/r/sub").await;
+    assert_eq!(
+      rig.fs.spawn_resume_points(),
+      vec![None],
+      "a birth spawn has nothing to resume from"
+    );
+
+    assert!(replace(&rig, scope, "/r").await.is_ok());
+    settle(|| rig.fs.shutdowns() == 1).await;
+    assert_eq!(
+      rig.fs.spawn_resume_points(),
+      vec![None, Some(token)],
+      "the replacement resumes the retiring stream's journal point"
+    );
+  }
+
   /// Whole-scope teardown reclaims the delivery lane: repeated watch/unwatch
   /// churn leaves no lane entry behind, so `lanes` stays bounded for the
   /// driver's lifetime (scope ids never recycle).
