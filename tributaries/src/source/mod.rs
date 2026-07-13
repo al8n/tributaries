@@ -37,7 +37,10 @@ use std::vec::Vec;
 
 use tributary_proto::{ChangeId, Epoch, Location};
 
-use crate::{error::WatchError, event::EventKind};
+use crate::{
+  error::{SyncError, WatchError},
+  event::EventKind,
+};
 
 #[cfg(feature = "fs")]
 mod fs;
@@ -491,6 +494,62 @@ pub trait LocalSource<C> {
   /// `next`, itself an `async_channel` receive, which is cancel-safe by construction.
   fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>>;
 
+  /// Places a **sync-barrier cookie** under `dir_key` for the root `handle`, returning the
+  /// cookie's canonical key. AWAITED, and it resolves at **write-complete — never at
+  /// observe**: the cookie's event arrives through the very [`next`](Self::next) pump the
+  /// owner would otherwise be blocking, so awaiting the observation here would deadlock by
+  /// construction. Observation is the owner's funnel-driven business.
+  ///
+  /// The cookie's whole purpose is the kernel event its creation mints: that event rides the
+  /// root's ordered queue BEHIND every change the backend reported before the write, so
+  /// observing it proves those changes have already exited the pipeline. A source whose
+  /// backend cannot report an in-band marker cannot offer the barrier and keeps the default
+  /// ([`SyncError::Unsupported`]) — an honest refusal, never a pretend barrier.
+  ///
+  /// `token` identifies the sync (instance + pid + seq); the binding renders it into whatever
+  /// a marker is called in its namespace, and must ensure [`is_sync_artifact`](Self::is_sync_artifact)
+  /// answers `true` for the key it returns. A source that must park the write behind its own
+  /// coverage-settle machinery does so INSIDE this await (the fs binding parks on the
+  /// per-directory re-arm fence), which is exactly why the initiation is awaited and bounded
+  /// like [`grow`](Self::grow).
+  fn begin_sync(
+    &mut self,
+    handle: Self::Handle,
+    dir_key: &[C],
+    token: SyncToken,
+  ) -> impl Future<Output = Result<Vec<C>, SyncError>> {
+    let _ = (handle, dir_key, token);
+    async { Err(SyncError::Unsupported) }
+  }
+
+  /// Reaps a cookie [`begin_sync`](Self::begin_sync) placed — SYNCHRONOUS, non-blocking,
+  /// fire-and-forget, in the [`disarm`](Self::disarm) mold. Idempotent (a cookie already gone
+  /// is success) and eventual (the unlink need not have landed when this returns).
+  ///
+  /// The unlink mints its own event; that event is suppressed by the reserved-namespace rule
+  /// ([`is_sync_artifact`](Self::is_sync_artifact)), NOT by any pending-sync bookkeeping — by
+  /// the time it arrives, the sync it belonged to is already resolved and forgotten.
+  fn end_sync(&mut self, handle: Self::Handle, cookie_key: &[C]) {
+    let _ = (handle, cookie_key);
+  }
+
+  /// Whether `key` names an artifact of the sync-barrier machinery — a cookie, whoever wrote
+  /// it. A SYNCHRONOUS classify probe in the [`root_key`](Self::root_key) mold.
+  ///
+  /// The umbrella suppresses every matching event from consumer streams, before fan-out and
+  /// before the coalescer, and uses the match to resolve pending syncs. The suppression is
+  /// **namespace-total, not own-pending-only**: two watcher instances may legitimately watch
+  /// one tree, and instance A's cookies must never surface as user files on instance B's
+  /// stream — nor must our own already-resolved cookies' unlink events, nor a crashed
+  /// process's leftovers.
+  ///
+  /// A `Rescan` is NEVER suppressed, whatever its key: the umbrella checks that first, because
+  /// a Rescan is coverage information and is structurally unmaskable.
+  fn is_sync_artifact(&self, key: &[C]) -> bool {
+    let _ = key;
+    false
+  }
+
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
   /// or retired — a **synchronous** liveness probe (mirroring the `tributary-fs`
   /// watcher's `root_path`, which reads a live registry snapshot without I/O).
@@ -646,9 +705,74 @@ pub trait Source<C> {
   /// note on the [trait](Self)).
   fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>> + Send;
 
+  /// Places a **sync-barrier cookie** under `dir_key` for the root `handle`, returning the
+  /// cookie's canonical key. AWAITED, and it resolves at **write-complete — never at
+  /// observe**: the cookie's event arrives through the very [`next`](Self::next) pump the
+  /// owner would otherwise be blocking, so awaiting the observation here would deadlock by
+  /// construction. Observation is the owner's funnel-driven business.
+  ///
+  /// The cookie's whole purpose is the kernel event its creation mints: that event rides the
+  /// root's ordered queue BEHIND every change the backend reported before the write, so
+  /// observing it proves those changes have already exited the pipeline. A source whose
+  /// backend cannot report an in-band marker cannot offer the barrier and keeps the default
+  /// ([`SyncError::Unsupported`]) — an honest refusal, never a pretend barrier.
+  ///
+  /// `token` identifies the sync (instance + pid + seq); the binding renders it into whatever
+  /// a marker is called in its namespace, and must ensure [`is_sync_artifact`](Self::is_sync_artifact)
+  /// answers `true` for the key it returns. A source that must park the write behind its own
+  /// coverage-settle machinery does so INSIDE this await (the fs binding parks on the
+  /// per-directory re-arm fence), which is exactly why the initiation is awaited and bounded
+  /// like [`grow`](Self::grow).
+  fn begin_sync(
+    &mut self,
+    handle: Self::Handle,
+    dir_key: &[C],
+    token: SyncToken,
+  ) -> impl Future<Output = Result<Vec<C>, SyncError>> + Send {
+    let _ = (handle, dir_key, token);
+    async { Err(SyncError::Unsupported) }
+  }
+
+  /// Reaps a cookie [`begin_sync`](Self::begin_sync) placed — SYNCHRONOUS, non-blocking,
+  /// fire-and-forget, in the [`disarm`](Self::disarm) mold. Idempotent (a cookie already gone
+  /// is success) and eventual (the unlink need not have landed when this returns).
+  ///
+  /// The unlink mints its own event; that event is suppressed by the reserved-namespace rule
+  /// ([`is_sync_artifact`](Self::is_sync_artifact)), NOT by any pending-sync bookkeeping — by
+  /// the time it arrives, the sync it belonged to is already resolved and forgotten.
+  fn end_sync(&mut self, handle: Self::Handle, cookie_key: &[C]) {
+    let _ = (handle, cookie_key);
+  }
+
+  /// Whether `key` names an artifact of the sync-barrier machinery — a cookie, whoever wrote
+  /// it. A SYNCHRONOUS classify probe in the [`root_key`](Self::root_key) mold.
+  ///
+  /// The umbrella suppresses every matching event from consumer streams, before fan-out and
+  /// before the coalescer, and uses the match to resolve pending syncs. The suppression is
+  /// **namespace-total, not own-pending-only**: two watcher instances may legitimately watch
+  /// one tree, and instance A's cookies must never surface as user files on instance B's
+  /// stream — nor must our own already-resolved cookies' unlink events, nor a crashed
+  /// process's leftovers.
+  ///
+  /// A `Rescan` is NEVER suppressed, whatever its key: the umbrella checks that first, because
+  /// a Rescan is coverage information and is structurally unmaskable.
+  fn is_sync_artifact(&self, key: &[C]) -> bool {
+    let _ = key;
+    false
+  }
+
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
   /// or retired — a synchronous liveness probe. Contract-identical to
   /// [`LocalSource::root_key`].
+  /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
+  /// or retired — a **synchronous** liveness probe (mirroring the `tributary-fs`
+  /// watcher's `root_path`, which reads a live registry snapshot without I/O).
+  ///
+  /// The owner uses it to tell a **terminal** coverage-loss signal (the root vanished —
+  /// `root_key` is `None`, so the root is retired, freeing its index / filter / epoch
+  /// state) from an **overflow** re-enumeration (the root is still live — `root_key` is
+  /// `Some`, so the root is kept and the consumer re-enumerates). Because it is out of
+  /// band, it never races the event stream the owner drives (design §4, I4).
   fn root_key(&self, handle: Self::Handle) -> Option<Vec<C>>;
 }
 
@@ -693,6 +817,98 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 
   fn root_key(&self, handle: Self::Handle) -> Option<Vec<C>> {
     <T as Source<C>>::root_key(self, handle)
+  }
+
+  fn begin_sync(
+    &mut self,
+    handle: Self::Handle,
+    dir_key: &[C],
+    token: SyncToken,
+  ) -> impl Future<Output = Result<Vec<C>, SyncError>> {
+    <T as Source<C>>::begin_sync(self, handle, dir_key, token)
+  }
+
+  fn end_sync(&mut self, handle: Self::Handle, cookie_key: &[C]) {
+    <T as Source<C>>::end_sync(self, handle, cookie_key)
+  }
+
+  fn is_sync_artifact(&self, key: &[C]) -> bool {
+    <T as Source<C>>::is_sync_artifact(self, key)
+  }
+}
+
+/// The identity of one sync barrier, minted by the owner: unique across
+/// concurrent syncs (`seq`), across watcher instances in one process
+/// (`instance`), and across processes (`pid`).
+///
+/// The umbrella is generic over the key component `C` and cannot know what a
+/// path looks like, so it hands this token to the binding and the BINDING
+/// renders the cookie's name from it (the fs binding:
+/// `.tributaries-sync-<instance>-<pid>-<seq>`). That keeps the reserved
+/// namespace — and its suppression rule — at the layer that owns path shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyncToken {
+  instance: u64,
+  pid: u32,
+  seq: u64,
+}
+
+impl SyncToken {
+  /// Mints a token from the owner's instance brand, the process id, and a
+  /// per-owner monotonic sequence number.
+  pub const fn new(instance: u64, pid: u32, seq: u64) -> Self {
+    Self { instance, pid, seq }
+  }
+
+  /// The owner's process-global instance brand.
+  pub const fn instance(&self) -> u64 {
+    self.instance
+  }
+
+  /// The process that minted the cookie. A crashed prior process's leftovers
+  /// carry a dead pid, so they collide with nothing.
+  pub const fn pid(&self) -> u32 {
+    self.pid
+  }
+
+  /// The per-owner monotonic sequence number: unique across concurrent syncs.
+  pub const fn seq(&self) -> u64 {
+    self.seq
+  }
+}
+
+/// How a `Tributaries::sync` barrier was met.
+///
+/// Both variants are success — the promise is *deliverable-or-dominated*, and
+/// this only says which arm satisfied it, so a caller that must distinguish
+/// "I can read my deltas" from "I must re-enumerate" need not inspect the
+/// stream to find out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SyncOutcome {
+  /// The cookie's own event was observed: every change that happened before
+  /// the sync call has been emitted to the stream (subject to the
+  /// subscription's interest and filter gates).
+  Delivered,
+  /// A covering `Rescan` stood in for the cookie — a loss ate the cookie's
+  /// event, or the root died — so the barrier is met by re-enumeration
+  /// instead of by delivery. The `Rescan` is on the stream (or durably parked
+  /// ahead of every later delta), so the caller's obligation is to re-read,
+  /// not to worry.
+  Dominated,
+}
+
+impl SyncOutcome {
+  /// Whether the cookie itself was observed.
+  #[inline]
+  pub const fn is_delivered(&self) -> bool {
+    matches!(self, Self::Delivered)
+  }
+
+  /// Whether a covering `Rescan` stood in for the cookie.
+  #[inline]
+  pub const fn is_dominated(&self) -> bool {
+    matches!(self, Self::Dominated)
   }
 }
 
