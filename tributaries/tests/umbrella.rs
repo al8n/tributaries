@@ -32,6 +32,7 @@ use std::{
   time::Duration,
 };
 
+use futures_util::FutureExt;
 use tempfile::TempDir;
 use tributaries::{
   Debounce, DebounceConfig, Event, Filter, Subscription, TokioTributaries, TributariesOptions,
@@ -752,5 +753,82 @@ async fn stalled_then_resumed_consumer_gets_a_rescan_no_silent_loss() {
     "the resumed consumer receives the shed's dominating Rescan (no silent loss)"
   );
 
+  w.close().await.expect("close");
+}
+
+/// The sync barrier's promise, end to end against the real kernel: after
+/// `sync` resolves, every change made BEFORE the call is already deliverable —
+/// a plain drain finds them all, with no sleeping and no polling. The cookie
+/// that establishes the barrier is itself never delivered (the reserved
+/// namespace is suppressed), and the barrier resolves `Delivered`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_resolves_once_pre_call_changes_are_deliverable() {
+  let (_tmp, root) = scratch("sync-barrier");
+  let mut w = watcher(TributariesOptions::new());
+  let sub = w
+    .watch(key(&root), (), WatchOptions::new())
+    .await
+    .expect("watch");
+
+  // The changes the barrier must account for — made BEFORE the sync call.
+  for i in 0..8 {
+    std::fs::write(root.join(format!("pre-{i}.txt")), b"x").expect("write");
+  }
+
+  let outcome = w
+    .sync(sub, Duration::from_secs(20))
+    .await
+    .expect("the barrier is established");
+  assert!(
+    outcome.is_delivered() || outcome.is_dominated(),
+    "the barrier is met by delivery or by domination: {outcome:?}"
+  );
+
+  // Now DRAIN what is already deliverable — no sleeps, no retries. Every
+  // pre-sync write must be accounted for: named directly, or covered by a
+  // Rescan that obliges re-enumeration.
+  let mut seen = std::collections::HashSet::new();
+  let mut rescanned = false;
+  while let Some(event) = w.next().now_or_never().flatten() {
+    if event.kind().is_rescan() {
+      rescanned = true;
+    }
+    if let Some(leaf) = event.key().last().and_then(|c| c.to_str()) {
+      assert!(
+        !leaf.starts_with(".tributaries-sync-"),
+        "a sync cookie must NEVER surface on a consumer stream: {leaf}"
+      );
+      seen.insert(leaf.to_owned());
+    }
+  }
+  for i in 0..8 {
+    let name = format!("pre-{i}.txt");
+    assert!(
+      seen.contains(&name) || rescanned,
+      "the barrier promised {name} was deliverable, but a plain drain missed it (seen: {seen:?})"
+    );
+  }
+
+  w.close().await.expect("close");
+}
+
+/// A sync on a subscription the caller has already unwatched refuses typed —
+/// a caller-unwatch owes no `Rescan`, so the barrier could never be met
+/// honestly, and the API says so rather than hanging or lying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_on_a_dead_subscription_refuses_typed() {
+  let (_tmp, root) = scratch("sync-dead");
+  let w = watcher(TributariesOptions::new());
+  let sub = w
+    .watch(key(&root), (), WatchOptions::new())
+    .await
+    .expect("watch");
+  w.unwatch(sub).await.expect("unwatch");
+
+  let err = w
+    .sync(sub, Duration::from_secs(5))
+    .await
+    .expect_err("a dead subscription cannot be synced");
+  assert!(err.is_unknown_subscription(), "{err:?}");
   w.close().await.expect("close");
 }

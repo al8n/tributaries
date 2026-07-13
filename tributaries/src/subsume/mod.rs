@@ -1079,6 +1079,16 @@ where
     self.subs.get(&sub).map(|record| record.key.as_slice())
   }
 
+  /// The ROOT a live subscription rides — the handle its events (and its sync
+  /// cookie) belong to. One subscription never spans roots, so this is total
+  /// for a live sub and `None` once it is gone.
+  pub(crate) fn subscription_root(&self, sub: Subscription) -> Option<H>
+  where
+    H: Copy,
+  {
+    self.subs.get(&sub).map(|record| record.root)
+  }
+
   /// The [`Interest`] a live subscription was registered with, if any — the fan-out
   /// gate (design §4/§5) applied to every non-`Rescan` delivery. Every root is armed
   /// [`Interest::all`], so this narrows *delivery*, never the kernel watch.

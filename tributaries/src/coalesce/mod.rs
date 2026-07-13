@@ -611,7 +611,7 @@ where
   /// flushed entries climbing in epoch as the FIFO ready queue replays them ahead of the
   /// signal that flushed them, so the subscription's delivered epochs never go backwards
   /// (design §8).
-  fn flush_subscription(&mut self, sub: Subscription, now: Instant) {
+  pub(crate) fn flush_subscription(&mut self, sub: Subscription, now: Instant) {
     let mut entries = self.subscription_entries(sub);
     entries.sort_by_key(|(seq, _)| *seq);
     let flushed = entries.len();

@@ -421,7 +421,7 @@ impl UnwatchError {
   }
 }
 
-/// Why `Tributaries::sync` could not establish the barrier.
+/// Why [`sync`](crate::Tributaries::sync) could not establish the barrier.
 ///
 /// The barrier is kernel-mediated: a cookie file is written under the
 /// subscription's coverage, and its own event — riding the root's ordered

@@ -42,12 +42,12 @@ use tributary_fs::{RootHandle, WatcherOptions};
 
 use crate::{
   coalesce::Coalescer,
-  error::{CloseError, UnwatchError, WatchError},
+  error::{CloseError, SyncError, UnwatchError, WatchError},
   event::Event,
   filter::{Filter, FilterInput},
   options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
   route::RoutableEvent,
-  source::{Armed, LocalSource, Source, SourceEvent},
+  source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
   subscription::Subscription,
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
   view::WatchView,
@@ -107,6 +107,30 @@ enum Command<C, V> {
     /// The reply channel: success, or why the drop failed.
     reply: futures_channel::oneshot::Sender<Result<(), UnwatchError>>,
   },
+  /// Establish a sync barrier on `sub`: place a cookie under its coverage and
+  /// resolve once that cookie's own event has exited the pipeline (or a
+  /// covering `Rescan` has dominated it).
+  Sync {
+    /// The subscription the barrier is for.
+    sub: Subscription,
+    /// Resolved at OBSERVATION (or domination), not at cookie-write: the
+    /// owner parks it in `pending_syncs` until the funnel matches.
+    reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
+  },
+}
+
+/// One in-flight sync barrier: the cookie the owner is waiting to see, whose
+/// subscription (and root) it belongs to, and the caller's parked reply.
+struct PendingSync<C, H> {
+  /// The cookie's canonical key — matched EXACTLY against arriving events.
+  cookie_key: Vec<C>,
+  /// The subscription whose barrier this is.
+  sub: Subscription,
+  /// The root the cookie was written under: a root death dominates it.
+  root: H,
+  /// Resolved `Delivered` when the cookie is seen, `Dominated` when a covering
+  /// `Rescan` (or a root death) stands in for it.
+  reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
 }
 
 /// A reply-less grant-resolution notice on the [`Owner`]'s dedicated [`cleanup_rx`](Owner::cleanup_rx)
@@ -493,6 +517,8 @@ where
       // Eager when the watcher-global debounce is on; a per-subscription Custom
       // override instantiates it lazily at commit otherwise (`register_debounce`).
       coalescer: debounce.map(|config| Coalescer::new(Some(config))),
+      pending_syncs: Vec::new(),
+      sync_seq: 0,
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -744,6 +770,75 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   }
 }
 
+/// The timed barrier lives in its OWN `R`-bounded block: the handle plane is
+/// deliberately runtime-free, and a timeout needs a timer. A method-scoped
+/// bound changes no auto-traits and touches no other method.
+impl<C, V, R, H> Tributaries<C, V, R, H>
+where
+  R: RuntimeLite,
+{
+  /// Establishes a **sync barrier** on `sub` and resolves once it is met.
+  ///
+  /// After this resolves `Ok`, every filesystem change under the
+  /// subscription's key that happened **before this call began** is either
+  /// already emitted into the event stream (an ordinary delivery, subject to
+  /// the sub's interest and filter gates), or dominated by a `Rescan` that is
+  /// itself on the stream — or durably parked such that no later delta of the
+  /// sub can precede it. [`SyncOutcome`] says which arm met it.
+  ///
+  /// The barrier is kernel-mediated, not an owner-side drain: a cookie file is
+  /// written under the subscription's coverage, and its own event — riding the
+  /// root's ordered queue behind every change the backend reported before the
+  /// write — is what proves those changes have exited the pipeline. An
+  /// owner-side flush alone could never bound the kernel queue, and this API
+  /// deliberately does not pretend otherwise.
+  ///
+  /// It does NOT promise: anything about changes CONCURRENT with the call
+  /// (only happened-before); any cross-root or cross-subscription ordering;
+  /// that the consumer has DRAINED (resolution means deliverable-or-dominated,
+  /// so a single task may `sync().await` and then read); anything for events
+  /// the sub's interest or filter gates reject; nor durability (it is an
+  /// event-visibility barrier, not an `fsync`).
+  ///
+  /// Dropping this future (or timing out) is safe: it abandons only the reply
+  /// wait. The owner reaps the abandoned cookie, whose events are suppressed
+  /// by the reserved namespace regardless.
+  ///
+  /// # Errors
+  ///
+  /// [`SyncError::UnknownSubscription`] when `sub` is not live;
+  /// [`Unsupported`](SyncError::Unsupported) when the source offers no
+  /// barrier; [`CookieWrite`](SyncError::CookieWrite) when the cookie cannot
+  /// be written (a read-only tree is `PermissionDenied` — the honest refusal);
+  /// [`CookieDirUncovered`](SyncError::CookieDirUncovered) when the resolved
+  /// cookie directory is outside the sub's coverage;
+  /// [`Retired`](SyncError::Retired) when the CALLER unwatched the sub while
+  /// the sync was pending (a root DEATH instead resolves
+  /// [`Dominated`](SyncOutcome::Dominated)); [`Timeout`](SyncError::Timeout);
+  /// [`Closed`](SyncError::Closed).
+  pub async fn sync(
+    &self,
+    sub: Subscription,
+    timeout: core::time::Duration,
+  ) -> Result<SyncOutcome, SyncError> {
+    let (reply, response) = futures_channel::oneshot::channel();
+    if self
+      .commands
+      .send(Command::Sync { sub, reply })
+      .await
+      .is_err()
+    {
+      return Err(SyncError::Closed);
+    }
+    match R::timeout(timeout, response).await {
+      Ok(Ok(outcome)) => outcome,
+      // The owner dropped the reply: it closed (or died) mid-barrier.
+      Ok(Err(_)) => Err(SyncError::Closed),
+      Err(_) => Err(SyncError::Timeout),
+    }
+  }
+}
+
 #[cfg(feature = "fs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
 impl<R: RuntimeLite> Tributaries<OsString, (), R, RootHandle> {
@@ -852,6 +947,13 @@ where
   /// is `Some`, lazily by the first committed [`Custom`](Debounce::Custom) override, and
   /// **never** otherwise — the zero-cost claim for consumers who never opt in anywhere.
   coalescer: Option<Coalescer<C, V>>,
+  /// Sync barriers awaiting their cookie's event (or a dominating `Rescan`).
+  /// Bounded by concurrent syncs, which the command mailbox bounds; a caller
+  /// that drops its future (or times out) has its entry reaped at the next
+  /// funnel pass by the cancelled-reply check.
+  pending_syncs: Vec<PendingSync<C, S::Handle>>,
+  /// The per-owner monotonic cookie sequence — the `seq` of every `SyncToken`.
+  sync_seq: u64,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of the dedicated **high-priority shutdown signal**: a
   /// [`close`](Tributaries::close) sends its [`CloseReply`] here, NOT the command mailbox. The
@@ -974,6 +1076,11 @@ where
   // stream ends. A consumer-initiated close or a dropped last handle owes nothing (the
   // consumer asked to stop / nobody is left), and must never block teardown on a full channel.
   let (closing, drain_owed) = loop {
+    // Reap barriers whose caller went away (timed out, or dropped the future):
+    // their cookies are inert — namespace-suppressed forever — so this map
+    // stays bounded by LIVE waiters, never by every sync ever issued.
+    owner.prune_abandoned_syncs();
+
     // The dedicated shutdown signal is checked FIRST every iteration, non-blockingly, BEFORE the
     // flush and the fairness valve: a requested close breaks to teardown without waiting
     // even one command dispatch or one forced data-plane service, so it can never be starved behind
@@ -1259,6 +1366,10 @@ where
       }
       Ok(Command::Unwatch { sub, reply }) => {
         self.on_unwatch(sub, reply);
+        Flow::Continue
+      }
+      Ok(Command::Sync { sub, reply }) => {
+        self.on_sync(sub, reply).await;
         Flow::Continue
       }
       // Every handle dropped: same orderly teardown, nobody to confirm it to. Nobody is left to
@@ -1846,6 +1957,11 @@ where
   /// [`UnwatchError::UnknownSubscription`] for a foreign/forged handle or an already-retired
   /// subscription (its owner-local cleanup still ran).
   fn release_subscription(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
+    // A CALLER unwatch owes no `Rescan`, so a barrier on this sub can never be
+    // met honestly — fail it typed rather than resolve it over a subscription
+    // that is going away. (A ROOT DEATH is the asymmetric case: its terminal
+    // `Rescan` dominates, so those resolve `Dominated`.)
+    self.retire_syncs_of_subscription(sub);
     // Reject a foreign/forged handle BEFORE mutating any state: a `Subscription` minted by a
     // DIFFERENT watcher instance carries a different brand even when its `ScopeId` collides with a
     // live local subscription's (every owner mints scope ids from 1). Without this brand check the
@@ -2053,6 +2169,10 @@ where
   ///
   /// A no-op if `handle` is not a live root.
   fn retire_root_with_terminal_rescan(&mut self, handle: S::Handle) {
+    // The root is gone and every subscriber is durably owed a terminal
+    // `Rescan` — which dominates anything a cookie could have proven. Resolve
+    // this root's barriers by domination rather than stranding them.
+    self.dominate_syncs_of_root(handle);
     // Capture the root's key + subscribers while it is still recorded; force_remove is deferred
     // until every owed terminal Rescan is durably parked.
     let Some((root_key, subscribers)) = self
@@ -2428,8 +2548,171 @@ where
   /// signal can never reach subscribers with the stale claim left standing on either path.
   fn consume_source_event(&mut self, event: &SourceEvent<C, S::Handle>) {
     if !self.retire_if_dead(event) {
+      // A `Rescan` is NEVER suppressed, whatever its key — it is coverage
+      // information, structurally unmaskable — but it CAN dominate a pending
+      // cookie: a loss that ate the cookie's own event elects a covering
+      // signal at that position instead, and re-enumeration meets the barrier
+      // just as delivery would.
+      if event.kind().is_rescan() {
+        self.dominate_pending_syncs(event);
+      } else if self.source.is_sync_artifact(event.key()) {
+        // A cookie — ours, another instance's, or a crashed process's
+        // leftover (and the unlink events of all of them). CONSUMED here:
+        // never fanned out, never coalesced, never delivered. Suppression is
+        // namespace-total, so it can never depend on the pending map.
+        self.resolve_matching_pending_sync(event);
+        return;
+      }
       self.degrade_retained_cover_on_rescan(event);
       self.fan_out_and_push(event);
+    }
+  }
+
+  /// Initiates one sync barrier: place the cookie (awaited, caller-bounded,
+  /// resolving at WRITE-complete) and park the caller's reply until the funnel
+  /// sees the cookie's own event — or a covering `Rescan` dominates it.
+  ///
+  /// The subscription's own key IS the cookie's directory hint: the binding
+  /// owns path shapes (it resolves a file key to its parent), and the key is
+  /// always inside the root's retained cover — the ROOT's directory need not
+  /// be, since set-cover pruning can leave it outside actual kernel coverage.
+  async fn on_sync(
+    &mut self,
+    sub: Subscription,
+    reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
+  ) {
+    let (Some(root), Some(dir_key)) = (
+      self.subsumer.subscription_root(sub),
+      self.subsumer.subscription_key(sub).map(<[C]>::to_vec),
+    ) else {
+      let _ = reply.send(Err(SyncError::UnknownSubscription));
+      return;
+    };
+    self.sync_seq += 1;
+    let token = SyncToken::new(sub.instance().get(), std::process::id(), self.sync_seq);
+    // Awaited here — never the OBSERVATION, which arrives through the very
+    // `next` pump this owner drives (awaiting it would deadlock by
+    // construction). The binding parks the write behind its own coverage
+    // settle fence, which is why this initiation is bounded like `grow`.
+    match self.source.begin_sync(root, &dir_key, token).await {
+      Ok(cookie_key) => self.pending_syncs.push(PendingSync {
+        cookie_key,
+        sub,
+        root,
+        reply,
+      }),
+      Err(err) => {
+        let _ = reply.send(Err(err));
+      }
+    }
+  }
+
+  /// The cookie arrived: everything the backend reported before its write has
+  /// already exited the pipeline ahead of it (per-source FIFO). Flush what the
+  /// debounce still holds for that subscription, then resolve its barrier
+  /// `Delivered`.
+  fn resolve_matching_pending_sync(&mut self, event: &SourceEvent<C, S::Handle>) {
+    let Some(idx) = self
+      .pending_syncs
+      .iter()
+      .position(|pending| pending.cookie_key.as_slice() == event.key())
+    else {
+      return;
+    };
+    let pending = self.pending_syncs.swap_remove(idx);
+    self.flush_subscription_now(pending.sub);
+    let _ = pending.reply.send(Ok(SyncOutcome::Delivered));
+    self.reap_cookie(pending.root, &pending.cookie_key);
+  }
+
+  /// A live-root `Rescan` at or above a pending cookie's key stands in for it:
+  /// the loss that ate the cookie already owes the subscriber a
+  /// re-enumeration, which is the barrier — met by domination rather than by
+  /// delivery.
+  fn dominate_pending_syncs(&mut self, event: &SourceEvent<C, S::Handle>) {
+    let at = event.key();
+    let mut i = 0;
+    while i < self.pending_syncs.len() {
+      if self.pending_syncs[i].cookie_key.starts_with(at) {
+        let pending = self.pending_syncs.swap_remove(i);
+        self.flush_subscription_now(pending.sub);
+        let _ = pending.reply.send(Ok(SyncOutcome::Dominated));
+        self.reap_cookie(pending.root, &pending.cookie_key);
+      } else {
+        i += 1;
+      }
+    }
+  }
+
+  /// Resolves every barrier riding `root` as `Dominated` — the root died, and
+  /// `retire_if_dead` has already parked each subscriber a durable terminal
+  /// `Rescan` that dominates anything the cookie would have proven.
+  fn dominate_syncs_of_root(&mut self, root: S::Handle)
+  where
+    S::Handle: PartialEq,
+  {
+    let mut i = 0;
+    while i < self.pending_syncs.len() {
+      if self.pending_syncs[i].root == root {
+        let pending = self.pending_syncs.swap_remove(i);
+        let _ = pending.reply.send(Ok(SyncOutcome::Dominated));
+      } else {
+        i += 1;
+      }
+    }
+  }
+
+  /// Fails every barrier of `sub` typed — the CALLER unwatched it, which owes
+  /// no `Rescan`, so the barrier cannot be met honestly. (Asymmetric with a
+  /// root death, which resolves `Dominated`.)
+  fn retire_syncs_of_subscription(&mut self, sub: Subscription) {
+    let mut i = 0;
+    while i < self.pending_syncs.len() {
+      if self.pending_syncs[i].sub == sub {
+        let pending = self.pending_syncs.swap_remove(i);
+        let _ = pending.reply.send(Err(SyncError::Retired));
+      } else {
+        i += 1;
+      }
+    }
+  }
+
+  /// Drops barriers whose caller went away (timed out, or dropped the future):
+  /// the cookie is inert — its events are suppressed by the namespace forever
+  /// — so the entry is simply reaped, keeping the map bounded by LIVE waiters
+  /// rather than by total syncs ever issued.
+  fn prune_abandoned_syncs(&mut self) {
+    let mut i = 0;
+    while i < self.pending_syncs.len() {
+      if self.pending_syncs[i].reply.is_canceled() {
+        let pending = self.pending_syncs.swap_remove(i);
+        self.reap_cookie(pending.root, &pending.cookie_key);
+      } else {
+        i += 1;
+      }
+    }
+  }
+
+  /// Reaps a resolved (or abandoned) cookie — fire-and-forget, in the `disarm`
+  /// mold. Its unlink event is suppressed by the namespace, never by the
+  /// pending map (which no longer holds it).
+  fn reap_cookie(&mut self, root: S::Handle, cookie_key: &[C]) {
+    self.source.end_sync(root, cookie_key);
+  }
+
+  /// Emits everything the debounce is holding for ONE subscription, in
+  /// admission (= epoch) order — the barrier's flush stage. Other
+  /// subscriptions' buffers are untouched.
+  fn flush_subscription_now(&mut self, sub: Subscription) {
+    let Some(coalescer) = self.coalescer.as_mut() else {
+      return;
+    };
+    let now: Instant = R::now().into();
+    coalescer.flush_subscription(sub, now);
+    let mut due = Vec::new();
+    coalescer.drain_ready(now, &mut due);
+    for event in due {
+      self.try_emit(event);
     }
   }
 
@@ -2742,6 +3025,9 @@ where
       }
       Command::Unwatch { reply, .. } => {
         let _ = reply.send(Err(UnwatchError::Closed));
+      }
+      Command::Sync { reply, .. } => {
+        let _ = reply.send(Err(SyncError::Closed));
       }
     }
   }

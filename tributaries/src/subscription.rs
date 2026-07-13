@@ -23,6 +23,12 @@ use tributary_proto::ScopeId;
 pub struct InstanceId(NonZeroU64);
 
 impl InstanceId {
+  /// The raw brand — the component a sync cookie's name carries so two watcher
+  /// instances in one process never mint colliding markers.
+  pub(crate) const fn get(&self) -> u64 {
+    self.0.get()
+  }
+
   /// Mints the next process-global instance id — called once per owner at construction.
   ///
   /// A monotonic `fetch_add` over a process-global [`AtomicU64`]: the fetched previous value plus

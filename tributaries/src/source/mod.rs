@@ -877,7 +877,7 @@ impl SyncToken {
   }
 }
 
-/// How a `Tributaries::sync` barrier was met.
+/// How a [`sync`](crate::Tributaries::sync) barrier was met.
 ///
 /// Both variants are success — the promise is *deliverable-or-dominated*, and
 /// this only says which arm satisfied it, so a caller that must distinguish
