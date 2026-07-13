@@ -422,6 +422,8 @@ fn resolve_cover_settlements<R, F>(
   ops: &F,
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
+  written_cookies: &mut BTreeMap<ScopeId, Vec<PathBuf>>,
+  shutdown: &std::sync::Arc<core::sync::atomic::AtomicBool>,
   live: &dyn Fn(ScopeId) -> bool,
 ) where
   R: RuntimeLite,
@@ -464,13 +466,35 @@ fn resolve_cover_settlements<R, F>(
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
       }
+      // Record the cookie the write is about to create BEFORE dispatching it:
+      // the path is deterministic from dir+name, so ownership never rides the
+      // reply oneshot. A caller that abandons the reply after the write lands
+      // loses the path, but the driver still holds it here and reaps it at
+      // scope or driver teardown.
+      written_cookies
+        .entry(cookie.scope)
+        .or_default()
+        .push(cookie.dir.join(&cookie.name));
       let ops = ops.clone();
+      let shutdown = shutdown.clone();
       R::spawn_blocking_detach(move || {
         let ParkedCookie {
           dir, name, reply, ..
         } = cookie;
         match ops.write_cookie(&dir, &name) {
           Ok(path) => {
+            // This write may have landed AFTER the driver's terminal sweep
+            // already unlinked its recorded paths — the sweep would then have
+            // found nothing and this file would outlive the driver, with no
+            // channel left to ask for its removal. The handshake that closes
+            // it: the sweep sets the flag BEFORE unlinking, and the write
+            // checks it AFTER creating the file. Seeing it set, reap here;
+            // seeing it clear means the file already existed when the sweep
+            // ran, so the sweep took it. Neither order leaks.
+            if shutdown.load(core::sync::atomic::Ordering::SeqCst) {
+              ops.remove_cookie(&path);
+              return;
+            }
             // A caller that abandoned the sync (timed out, dropped the future)
             // has dropped this reply receiver. The cookie file was still
             // written, so reap it immediately rather than leak it — the write
@@ -1546,6 +1570,22 @@ pub(crate) async fn run<R, F>(
   // `Command::SyncRoot`): the write dispatches to the blocking pool once the
   // scope's re-arm work quiesces, whatever the settle's verdict.
   let mut parked_cookies: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
+  // Every cookie this driver has written and not yet removed, keyed by the
+  // scope it belongs to. The driver OWNS each written cookie from the moment
+  // its write dispatches until a `RemoveCookie` unlinks it, the scope's stream
+  // tears down, or the driver exits — so a write whose reply the caller
+  // abandoned after `reply.send` (the value never polled out, so no path ever
+  // reaches a `RemoveCookie`) is still reaped, and no source-side queue is
+  // needed. Bounded by live-scope in-flight cookies: writes and removes both
+  // serialize through this driver's command stream, a dead scope's cookies are
+  // reaped when its stream tears down, and any remainder at driver exit.
+  let mut written_cookies: BTreeMap<ScopeId, Vec<PathBuf>> = BTreeMap::new();
+  // Raised once, just before the terminal sweep unlinks `written_cookies`, and
+  // read by every dispatched cookie write right after it creates its file: the
+  // handshake that stops a write still in the blocking pool from outliving the
+  // driver that dispatched it (the sweep would unlink a path whose file does
+  // not exist yet, and no channel is left to ask for its removal afterwards).
+  let cookie_shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
   // driver keeps a sender so grants can always be minted, which is fine —
   // exit is driven by the COMMAND channel, and this receiver merely pends.
@@ -1565,6 +1605,7 @@ pub(crate) async fn run<R, F>(
       &events,
       &mut unwatch_replies,
       &mut deferred_grants,
+      &mut written_cookies,
       &registry,
       &now,
     );
@@ -1579,6 +1620,8 @@ pub(crate) async fn run<R, F>(
       &ops,
       &mut cover_replies,
       &mut parked_cookies,
+      &mut written_cookies,
+      &cookie_shutdown,
       &|scope| handles.contains_key(&scope),
     );
     // Reclaim canceled awaited-unwatch waiters at the same choke point, so an
@@ -2129,6 +2172,13 @@ pub(crate) async fn run<R, F>(
           }
         }
         Ok(Command::RemoveCookie { path }) => {
+          // The driver owns every cookie it wrote until removed or teardown;
+          // this remove drops that ownership. Cookie sets are tiny (in-flight
+          // syncs), so the linear scan across scopes is cheap.
+          written_cookies.retain(|_, paths| {
+            paths.retain(|p| p != &path);
+            !paths.is_empty()
+          });
           let ops = ops.clone();
           R::spawn_blocking_detach(move || ops.remove_cookie(&path));
         }
@@ -2218,6 +2268,23 @@ pub(crate) async fn run<R, F>(
       });
     }
   }
+  // The terminal cookie guarantee: unlink every cookie this driver ever wrote
+  // and has not yet removed before it exits — including one whose write reply
+  // the caller abandoned after the write landed, which no `RemoveCookie` will
+  // ever arrive for. Synchronous on this shutdown path so the removal is done
+  // by the time the driver returns; the set is tiny (in-flight syncs) and each
+  // unlink is idempotent.
+  //
+  // The flag is raised BEFORE the sweep, and a still-running write checks it
+  // AFTER creating its file: a write that lands past this sweep then reaps
+  // itself, and one that lands before it is already recorded here. So no
+  // dispatched write can outlive the driver, however the two interleave.
+  cookie_shutdown.store(true, core::sync::atomic::Ordering::SeqCst);
+  for (_scope, paths) in std::mem::take(&mut written_cookies) {
+    for path in &paths {
+      ops.remove_cookie(path);
+    }
+  }
   let drain = async {
     while !(pending_teardowns.is_empty() && pending_spawns.is_empty()) {
       match op_rx.recv().await {
@@ -2302,6 +2369,7 @@ pub(crate) async fn run<R, F>(
     &events,
     &mut unwatch_replies,
     &mut deferred_grants,
+    &mut written_cookies,
     &registry,
     &now,
   );
@@ -2315,6 +2383,8 @@ pub(crate) async fn run<R, F>(
     &ops,
     &mut cover_replies,
     &mut parked_cookies,
+    &mut written_cookies,
+    &cookie_shutdown,
     &|_| false,
   );
   if let Some(reply) = close_reply {
@@ -2506,6 +2576,7 @@ fn execute_effects<R, F>(
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
+  written_cookies: &mut BTreeMap<ScopeId, Vec<PathBuf>>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
 ) where
@@ -2554,6 +2625,17 @@ fn execute_effects<R, F>(
         // (the scope died before coverage ever started).
         registry.scope_dead(scope);
         ops.detach_scope(scope);
+        // Reap every cookie this scope still owns: its stream is retiring, so
+        // no `RemoveCookie` will arrive for a write whose reply was abandoned.
+        // Off the reactor (an unlink is blocking I/O) and idempotent.
+        if let Some(paths) = written_cookies.remove(&scope) {
+          let ops = ops.clone();
+          R::spawn_blocking_detach(move || {
+            for path in paths {
+              ops.remove_cookie(&path);
+            }
+          });
+        }
         if let Some(DeferredGrant { pending, root }) = deferred_grants.remove(&scope) {
           let _ = pending
             .reply

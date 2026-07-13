@@ -91,12 +91,6 @@ pub struct FsSource<R> {
   /// the driver skips the unknown scope). Losslessness is NOT required here (clause 5): entries still
   /// queued at `Drop` are simply dropped — an unpruned root is merely over-broad, self-healing.
   deferred_prunes: HashMap<RootHandle, Vec<PathBuf>>,
-  /// Cookie unlinks the control channel momentarily refused, retried on the
-  /// next watcher-touching op alongside the deferred prunes. Bounded by
-  /// concurrent syncs (the command mailbox bounds those); a hard cap guards
-  /// against pathological churn — past it the oldest unlink is dropped, which
-  /// only leaves one inert namespace-suppressed file behind, never a hang.
-  deferred_cookie_removes: Vec<PathBuf>,
   /// Awaited [`Watcher::set_cover`] round-trips [`grow`](Source::grow) actually performed — proves
   /// the kernel-recursive short-circuit skipped the round-trip.
   #[cfg(test)]
@@ -134,7 +128,6 @@ impl<R: RuntimeLite> FsSource<R> {
       enqueued: Vec::new(),
       pending_set: HashSet::new(),
       deferred_prunes: HashMap::new(),
-      deferred_cookie_removes: Vec::new(),
       #[cfg(test)]
       cover_round_trips: 0,
       #[cfg(test)]
@@ -146,18 +139,6 @@ impl<R: RuntimeLite> FsSource<R> {
 // The deferral queue and the Source seam below are channel and registry work:
 // no method names an `R` item (the runtime bound lives on `new`, the one
 // place the watcher driver is spawned).
-impl<R> Drop for FsSource<R> {
-  fn drop(&mut self) {
-    // A residue of cookie unlinks the control channel never accepted must not
-    // survive this source: unlink each directly (best-effort — a gone file or
-    // an unreadable path is fine). The events these unlinks would mint are
-    // suppressed by the reserved namespace regardless of who observes them.
-    for path in &self.deferred_cookie_removes {
-      let _ = std::fs::remove_file(path);
-    }
-  }
-}
-
 impl<R> FsSource<R> {
   /// Queues a prune the control channel refused (momentarily full), **latest-wins per handle**
   /// ([`Source::set_cover`] contract clause 6): a newer request for the same handle replaces the
@@ -173,16 +154,6 @@ impl<R> FsSource<R> {
   /// channel still refuses stays queued for the next flush (or is dropped at `Drop` — clause 5,
   /// losslessness not required for a prune).
   fn flush_deferred_prunes(&mut self) {
-    // Retry refused cookie unlinks first — a resolved sync's marker must not
-    // linger. Each is reply-less and idempotent; one the channel still refuses
-    // stays queued for the next flush (or is dropped at the cap / at `Drop`,
-    // leaving only an inert suppressed file).
-    if !self.deferred_cookie_removes.is_empty() {
-      let watcher = &self.watcher;
-      self
-        .deferred_cookie_removes
-        .retain(|path| !watcher.request_remove_cookie(path.clone()));
-    }
     // Split-borrow: the watcher is a shared reborrow so `retain` can mutate the map.
     let watcher = &self.watcher;
     #[cfg(test)]
@@ -536,15 +507,6 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, RootHandle>> {
-    // Opportunistic drain: retry any queued cookie unlinks the control channel
-    // had refused, so a resolved sync's marker is reaped promptly even on an
-    // otherwise idle watcher (no dedicated worker needed).
-    if !self.deferred_cookie_removes.is_empty() {
-      let watcher = &self.watcher;
-      self
-        .deferred_cookie_removes
-        .retain(|path| !watcher.request_remove_cookie(path.clone()));
-    }
     let raw = self.watcher.next().await?;
     Some(SourceEvent::from_fs(&raw))
   }
@@ -613,19 +575,15 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   fn end_sync(&mut self, _handle: RootHandle, cookie_key: &[OsString]) {
-    // Fire-and-forget in the `disarm` mold. On a momentarily-full channel the
-    // unlink is QUEUED for retry on the next watcher-touching op — not dropped
-    // — so a cookie is not silently leaked; the retry queue is bounded by
-    // concurrent syncs, with a hard cap as a final backstop.
+    // Best-effort in the `disarm` mold: a prompt hint to reap the cookie now.
+    // The driver OWNS every cookie it wrote and guarantees the unlink at scope
+    // or driver teardown, so a momentarily-refused request needs no source-side
+    // queue — the cookie simply waits for that terminal reap, never leaked.
+    // Runtime-free by design (this seam carries no `R` bound): the
+    // runtime-bearing cleanup lives in the driver.
     let path = key_to_path(cookie_key);
     self.flush_deferred_prunes();
-    if !self.watcher.request_remove_cookie(path.clone()) {
-      // Queue for retry — NEVER dropped: dropping a unique unlink would leak a
-      // file. The queue is bounded by the number of resolved-but-unreaped
-      // syncs, which the umbrella command mailbox bounds; a residue at teardown
-      // is unlinked directly by this source's `Drop`.
-      self.deferred_cookie_removes.push(path);
-    }
+    let _ = self.watcher.request_remove_cookie(path);
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
