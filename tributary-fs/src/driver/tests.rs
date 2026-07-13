@@ -3369,6 +3369,70 @@ mod replace {
     settle(|| rig.fs.shutdowns() == 1).await;
   }
 
+  /// The waiter vector is reclaimed, not merely accrued: an issue-and-cancel
+  /// storm of duplicate unwatches against a scope whose teardown is STALLED
+  /// leaves the parked-waiter vector bounded (the loop-top prune drops
+  /// canceled senders), while a genuinely-awaited waiter still resolves.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn canceled_duplicate_unwatches_stay_bounded() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // Hold the teardown so the scope never quiesces during the storm.
+    let gate = rig.fs.hold_teardowns();
+
+    // One genuinely-awaited unwatch whose receiver is kept alive.
+    let (survivor, on_survivor) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(survivor),
+      })
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The storm: each duplicate command is accepted, then its receiver
+    // dropped (canceled). Without the prune these would accrue without bound
+    // while the teardown stays held.
+    for _ in 0..200 {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      drop(on_reply);
+      tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (q, on_q) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugUnwatchWaiters { scope, reply: q })
+      .await
+      .unwrap();
+    let parked = on_q.await.unwrap();
+    assert!(
+      parked <= 3,
+      "canceled waiters are reclaimed each loop-top, not accrued: {parked}"
+    );
+
+    // The genuinely-awaited waiter still resolves with its verdict.
+    gate.release();
+    assert!(
+      on_survivor.await.expect("the survivor is answered"),
+      "the live waiter resolves true at quiescence"
+    );
+    settle(|| rig.fs.shutdowns() == 1).await;
+  }
+
   /// Whole-scope teardown reclaims the delivery lane: repeated watch/unwatch
   /// churn leaves no lane entry behind, so `lanes` stays bounded for the
   /// driver's lifetime (scope ids never recycle).
