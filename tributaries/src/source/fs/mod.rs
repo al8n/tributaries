@@ -16,8 +16,9 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
-  CoverOutcome, Event as FsEvent, EventKind as FsEventKind, RootHandle, SkipReason, SourceError,
-  SyncRootError, UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
+  CoverOutcome, Event as FsEvent, EventKind as FsEventKind, ReplaceRootError, RootHandle,
+  SkipReason, SourceError, SyncRootError, UnwatchError as FsUnwatchError, WatchRootError, Watcher,
+  WatcherOptions,
 };
 use tributary_proto::Interest;
 
@@ -510,6 +511,34 @@ impl<R> Source<OsString> for FsSource<R> {
     Some(SourceEvent::from_fs(&raw))
   }
 
+  async fn replace(
+    &mut self,
+    handle: RootHandle,
+    new_key: &[OsString],
+  ) -> Result<Armed<OsString, RootHandle>, WatchError> {
+    // Any op that touches the watcher re-forwards deferred prunes first, so a
+    // stale narrower cover never trails behind the widened root.
+    self.flush_deferred_prunes();
+    let new_root = key_to_path(new_key);
+    // Make-before-break inside the fs layer: the replacement stream is live
+    // BEFORE the old one retires, and the commit delivers one epoch-bumped
+    // full-root `Rescan`. Atomic on failure — every error leaves the old
+    // root's coverage untouched, which is exactly what lets the umbrella fall
+    // back to release-and-rearm.
+    match self.watcher.replace_root(handle, new_root.clone()).await {
+      // The handle is PRESERVED (that is the point): the root the umbrella
+      // already records simply covers more ground now.
+      Ok(()) => {
+        let canonical = self
+          .watcher
+          .root_path(handle)
+          .ok_or_else(|| WatchError::Source(SourceFault::new(FaultKind::NotFound)))?;
+        Ok(Armed::new(handle, path_components(&canonical)))
+      }
+      Err(err) => Err(replace_error_to_watch_error(err, &new_root)),
+    }
+  }
+
   async fn begin_sync(
     &mut self,
     handle: RootHandle,
@@ -636,6 +665,32 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
     _ => FaultKind::Other,
   };
   WatchError::source(SourceFault::new(kind).with_source(err))
+}
+
+/// Classifies a failed in-place root replacement into the neutral vocabulary.
+/// Every variant is honest and NON-fatal to the caller's watch: the umbrella
+/// falls back to release-and-rearm on any of them, because `replace_root` is
+/// atomic on failure — the old root's coverage is exactly as it was.
+fn replace_error_to_watch_error(err: ReplaceRootError, root: &std::path::Path) -> WatchError {
+  let kind = match err {
+    ReplaceRootError::NotFound { .. } => FaultKind::NotFound,
+    ReplaceRootError::NotADirectory { .. } => FaultKind::NotADirectory,
+    ReplaceRootError::Overlaps { .. } => FaultKind::Conflict,
+    // A live scope never swaps lowering profiles, and a root that died (or a
+    // replace already in flight) is not something to retry in place — the
+    // release-and-rearm fallback handles all of them.
+    ReplaceRootError::BackendDiverged
+    | ReplaceRootError::Retired
+    | ReplaceRootError::UnknownRoot
+    | ReplaceRootError::ReplaceInFlight => FaultKind::Unsupported,
+    ReplaceRootError::Closed => return WatchError::Closed,
+    ReplaceRootError::Source(source) => {
+      return WatchError::Source(SourceFault::new(FaultKind::Other).with_source(source));
+    }
+    _ => FaultKind::Other,
+  };
+  let _ = root;
+  WatchError::Source(SourceFault::new(kind))
 }
 
 /// The reserved sync-cookie namespace. A leaf component starting with this is

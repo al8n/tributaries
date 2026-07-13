@@ -42,6 +42,10 @@ fn components(path: &Path) -> Vec<OsString> {
 enum Call {
   Arm(PathBuf),
   Disarm(u32),
+  /// An in-place root RETARGET (the gapless widen): the preserved handle and the
+  /// wider key it now covers. Distinguishable from the release-and-rearm dance
+  /// (a `Disarm` followed by an `Arm`) precisely because it is neither.
+  Replace(u32, PathBuf),
   /// An in-place coverage PRUNE request: the root handle and the retained cover (the survivor
   /// antichain) the driver forwarded (the set-cover design v3, the shrink-in-place seam).
   SetCover(u32, Vec<Vec<OsString>>),
@@ -72,6 +76,10 @@ struct FakeSource {
   /// Each live handle's fs-authoritative canonical key ([`Source::root_key`] reports it,
   /// and [`Source::arm`] returns it). `None` once the root is disarmed or killed.
   canonical: HashMap<u32, Vec<OsString>>,
+  /// Whether this source supports the gapless in-place widen ([`Source::replace`]).
+  /// OFF by default, so every existing cell keeps exercising the release-and-rearm
+  /// path; the adoption cells turn it on.
+  supports_replace: bool,
   /// How many of the next `arm` calls to fail, decremented on each failed arm.
   fail_arms: u32,
   /// How many of the next `grow` calls to fail with [`WatchError::CoverageIncomplete`],
@@ -113,6 +121,7 @@ impl FakeSource {
       calls: Vec::new(),
       live: HashMap::new(),
       canonical: HashMap::new(),
+      supports_replace: false,
       fail_arms: 0,
       fail_grows: 0,
       dead_on_arrival_arms: 0,
@@ -302,6 +311,24 @@ impl Source<OsString> for FakeSource {
     self.canonical.insert(handle, canonical_key.clone());
     self.live.insert(handle, path);
     Ok(Armed::new(handle, canonical_key))
+  }
+
+  async fn replace(
+    &mut self,
+    handle: u32,
+    new_key: &[OsString],
+  ) -> Result<Armed<OsString, u32>, WatchError> {
+    if !self.supports_replace {
+      return Err(WatchError::source(SourceFault::new(FaultKind::Unsupported)));
+    }
+    let path: PathBuf = new_key.iter().collect();
+    self.calls.push(Call::Replace(handle, path.clone()));
+    // Make-before-break, modeled: the SAME handle now covers the wider key, and
+    // the old coverage is never dropped in between.
+    self.live.insert(handle, path.clone());
+    let canonical: Vec<OsString> = new_key.to_vec();
+    self.canonical.insert(handle, canonical.clone());
+    Ok(Armed::new(handle, canonical))
   }
 
   fn disarm(&mut self, handle: u32) {
@@ -619,6 +646,76 @@ async fn a_foreign_subscription_cannot_unwatch_a_local_one_with_a_colliding_scop
 /// wider root cannot be armed while a subsumed one is live, so the widen must **disarm the
 /// subsumed roots BEFORE arming the wider root**. The brief coverage gap is closed by the
 /// dominating `Rescan` each re-pointed subscription receives.
+#[tokio::test]
+async fn widen_prefers_the_gapless_in_place_replace_when_the_source_offers_it() {
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+
+  let s_narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let s_wide = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+
+  // NO disarm, NO second arm: the root was retargeted in place, so its coverage
+  // was never dropped — the gap the release-and-rearm dance opens does not exist.
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Replace(1, PathBuf::from("/a")),
+    ],
+    "a widen the source can do in place must never release-and-rearm"
+  );
+
+  // The root is now keyed at the WIDER path — under the SAME (preserved) handle.
+  let roots: Vec<(PathBuf, u32)> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, handle)| (PathBuf::from_iter(k), handle))
+    .collect();
+  assert_eq!(
+    roots,
+    vec![(PathBuf::from("/a"), 1)],
+    "one root, widened, on the preserved handle"
+  );
+
+  // The re-pointed subscriber is still rebased with its dominating Rescan: its
+  // root changed, so its view must re-base even though no coverage was lost.
+  let rescans: Vec<Subscription> = h
+    .drain()
+    .into_iter()
+    .filter(|e| e.kind().is_rescan())
+    .map(|e| e.subscription())
+    .collect();
+  assert!(
+    rescans.contains(&s_narrow),
+    "the re-pointed subscription is rebased onto the wider root: {rescans:?}"
+  );
+  let _ = s_wide;
+}
+
+/// A source that cannot widen in place (the default) keeps the old dance — the
+/// adoption is a pure optimization, never a behavior change.
+#[tokio::test]
+async fn widen_falls_back_to_release_and_rearm_without_replace_support() {
+  let mut h = Harness::new();
+  // `supports_replace` is off by default.
+  let _narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Disarm(1),
+      Call::Arm(PathBuf::from("/a")),
+    ],
+    "without in-place support the widen still releases and re-arms"
+  );
+}
+
 #[tokio::test]
 async fn widen_disarms_subsumed_before_arming_the_wider_root() {
   let mut h = Harness::new();
