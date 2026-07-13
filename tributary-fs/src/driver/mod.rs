@@ -28,10 +28,13 @@
 //! way: one object, one sample.
 
 use std::{
-  collections::{BTreeMap, BTreeSet},
+  collections::{BTreeMap, BTreeSet, HashMap},
   num::NonZeroUsize,
   path::{Path, PathBuf},
-  sync::Arc,
+  sync::{
+    Arc, Mutex, MutexGuard, PoisonError,
+    atomic::{AtomicBool, Ordering},
+  },
   time::Duration,
 };
 
@@ -126,11 +129,6 @@ impl DriverConfig {
 /// success.
 pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant, WatchRootError>>;
 
-/// One in-flight root replacement: the reservation the commit releases and
-/// the caller's reply. A descending replace parks its spawned-but-uncommitted
-/// replacement in `arming` while the new root's pre-arm runs on the blocking
-/// pool ([`FsOps::preflight_arm`]); a kernel-recursive replace commits
-/// straight off its spawn and never populates it.
 /// One sync-cookie write parked on its scope's coverage-settle fence: the
 /// write dispatches when the fence settles (either verdict), and its reply
 /// carries the cookie's path back to the caller at write-complete.
@@ -141,6 +139,204 @@ struct ParkedCookie {
   reply: futures_channel::oneshot::Sender<Result<PathBuf, crate::error::SyncRootError>>,
 }
 
+/// Every cookie file the driver has written and not yet removed, keyed BY PATH
+/// so a removal is O(1) — never a scan of every scope's list.
+///
+/// Shared with the blocking pool: a dispatched write publishes the path it
+/// ACTUALLY landed at into this same map (see [`CookieGuard::claim`]), because
+/// only the write knows it — a cookie for a covered FILE subscription lands in
+/// the file's PARENT, so a path computed before the write can be the wrong one.
+/// Publishing under the lock the sweeps take the map under is what makes the
+/// two unorderable operations safe: no interleaving can leave a created file
+/// that nobody owns.
+type CookieLedger = Arc<Mutex<HashMap<PathBuf, ScopeId>>>;
+
+/// Locks the ledger, ignoring poisoning: every critical section is a single map
+/// mutation that cannot leave the map half-written, and the terminal sweep runs
+/// from a [`Drop`] — where unwrapping a poisoned lock would abort the process
+/// mid-unwind instead of reaping the cookies.
+fn lock_ledger(ledger: &CookieLedger) -> MutexGuard<'_, HashMap<PathBuf, ScopeId>> {
+  ledger.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The ownership half one dispatched cookie write carries into the blocking
+/// pool: the ledger it hands its file to, and the two flags that can refuse the
+/// handover.
+struct CookieGuard {
+  scope: ScopeId,
+  ledger: CookieLedger,
+  /// The registry is gone (driver returned, panicked, or was cancelled).
+  shutdown: Arc<AtomicBool>,
+  /// This write's scope is retiring (its stream is being torn down).
+  retiring: Arc<AtomicBool>,
+}
+
+impl CookieGuard {
+  /// Hands a just-created cookie to the registry, which then owns it. `false`
+  /// means the handover was REFUSED — the registry is gone or the scope is
+  /// retiring, so its sweep has already passed this path by and the caller must
+  /// unlink the file itself.
+  ///
+  /// The refusal check and the insert are ONE critical section against the
+  /// sweeps, and every sweep raises its flag BEFORE taking the ledger. So a
+  /// claim that lands after a sweep took the map necessarily observes the raised
+  /// flag and refuses (the write reaps itself), and one that lands before it is
+  /// in the map that sweep takes. There is no third interleaving: a created file
+  /// is always owned by exactly one of the two.
+  fn claim(&self, path: &Path) -> bool {
+    let mut ledger = lock_ledger(&self.ledger);
+    if self.shutdown.load(Ordering::SeqCst) || self.retiring.load(Ordering::SeqCst) {
+      return false;
+    }
+    ledger.insert(path.to_path_buf(), self.scope);
+    true
+  }
+
+  /// Hands a claimed cookie back — the caller unlinks it. A sweep racing this
+  /// simply finds nothing to unlink, and the caller's unlink still runs.
+  fn release(&self, path: &Path) {
+    lock_ledger(&self.ledger).remove(path);
+  }
+}
+
+/// Owns every cookie this driver has written and not yet removed. Ownership is
+/// the registry's, never the reply oneshot's: a caller that abandons its sync
+/// cannot strand a file, and neither can a scope that dies under an in-flight
+/// write.
+///
+/// The three sweeps that end a cookie's life all run through here — a
+/// `RemoveCookie` ([`forget`](Self::forget) + unlink), a scope's stream teardown
+/// ([`retire_scope`](Self::retire_scope)), and the driver's exit (this type's
+/// [`Drop`]) — and each raises its flag before taking the paths, so a write
+/// still in the blocking pool can never slip a file past the sweep that was
+/// supposed to reap it.
+struct CookieRegistry<F: FsOps> {
+  ops: F,
+  /// Raised once, before the terminal sweep. A write in the pool re-checks it
+  /// while claiming its file, so a write can never outlive the registry that
+  /// dispatched it.
+  shutdown: Arc<AtomicBool>,
+  ledger: CookieLedger,
+  /// Per-scope retirement flags, cloned into each dispatched write. Raised
+  /// BEFORE a retiring scope's cookies are unlinked, so a write that lands
+  /// afterwards reaps itself instead of surviving. The entry is dropped with the
+  /// scope (the write holds its own clone), so this never accrues dead scopes.
+  retiring: HashMap<ScopeId, Arc<AtomicBool>>,
+  /// Each live scope's canonical root — the FLOOR its cookies may never be
+  /// written above (see [`cookie_dir`]). Dropped with the scope, like the flags.
+  roots: HashMap<ScopeId, PathBuf>,
+}
+
+impl<F: FsOps> CookieRegistry<F> {
+  fn new(ops: F) -> Self {
+    Self {
+      ops,
+      shutdown: Arc::new(AtomicBool::new(false)),
+      ledger: CookieLedger::default(),
+      retiring: HashMap::new(),
+      roots: HashMap::new(),
+    }
+  }
+
+  /// `scope`'s stream is live under `root` — recorded on the SAME transitions
+  /// the scope registry learns them on (birth, and a replace's commit, which
+  /// widens the root under a surviving scope).
+  fn scope_live(&mut self, scope: ScopeId, root: PathBuf) {
+    self.roots.insert(scope, root);
+  }
+
+  /// The root a cookie for `scope` must stay inside. `None` for a scope with no
+  /// live stream — nothing to write a barrier on.
+  fn root_of(&self, scope: ScopeId) -> Option<&Path> {
+    self.roots.get(&scope).map(PathBuf::as_path)
+  }
+
+  /// The ownership handle one dispatched write carries, minting the scope's
+  /// retirement flag on demand. Taken at dispatch, so the flags cover the whole
+  /// in-flight window: everything that retires the cookie between here and the
+  /// write's landing is visible to the write itself.
+  fn dispatch_guard(&mut self, scope: ScopeId) -> CookieGuard {
+    CookieGuard {
+      scope,
+      ledger: Arc::clone(&self.ledger),
+      shutdown: Arc::clone(&self.shutdown),
+      retiring: Arc::clone(self.retiring.entry(scope).or_default()),
+    }
+  }
+
+  /// Drops a cookie's record: the caller has taken over its removal. O(1) — the
+  /// ledger is keyed by path, so this never scans a scope's cookies.
+  fn forget(&mut self, path: &Path) {
+    lock_ledger(&self.ledger).remove(path);
+  }
+
+  /// Retires `scope`: raise its flag FIRST — a write still in the pool then
+  /// finds its claim refused and reaps itself, rather than landing a file into a
+  /// scope nothing will sweep again — then take back and unlink every cookie the
+  /// scope still owns. The unlinks are blocking I/O, so they go off-reactor; the
+  /// FLAG, which is what orders this against the pool, is raised synchronously
+  /// before they are dispatched.
+  fn retire_scope<R>(&mut self, scope: ScopeId)
+  where
+    R: RuntimeLite,
+  {
+    if let Some(flag) = self.retiring.remove(&scope) {
+      flag.store(true, Ordering::SeqCst);
+    }
+    self.roots.remove(&scope);
+    let mut reap = Vec::new();
+    lock_ledger(&self.ledger).retain(|path, owner| {
+      let retired = *owner == scope;
+      if retired {
+        reap.push(path.clone());
+      }
+      !retired
+    });
+    if reap.is_empty() {
+      return;
+    }
+    let ops = self.ops.clone();
+    R::spawn_blocking_detach(move || {
+      for path in reap {
+        ops.remove_cookie(&path);
+      }
+    });
+  }
+
+  /// How many cookies the registry currently owns — the leak oracle: a failed
+  /// write, an abandoned reply, a retired scope, and a `RemoveCookie` must all
+  /// leave it exactly as they found it.
+  #[cfg(all(test, feature = "tokio"))]
+  fn len(&self) -> usize {
+    lock_ledger(&self.ledger).len()
+  }
+}
+
+impl<F: FsOps> Drop for CookieRegistry<F> {
+  fn drop(&mut self) {
+    // The terminal guarantee, honored on EVERY exit — normal return, panic, or
+    // task cancellation — which is the whole reason ownership lives in a type
+    // with a Drop rather than in hand-rolled bookkeeping at the exit paths.
+    //
+    // The flag is raised BEFORE the map is taken, and a write claims its file
+    // under the same lock: a claim that beat the take is in the map this sweep
+    // unlinks; one that lost it sees the flag and reaps itself. Neither order
+    // leaks. The unlinks are synchronous — the set is tiny (in-flight syncs),
+    // each is idempotent, and a detached spawn from a cancelled task is not
+    // guaranteed to run at all.
+    self.shutdown.store(true, Ordering::SeqCst);
+    let owned = std::mem::take(&mut *lock_ledger(&self.ledger));
+    for path in owned.into_keys() {
+      self.ops.remove_cookie(&path);
+    }
+  }
+}
+
+/// One in-flight root replacement: the reservation the commit releases and
+/// the caller's reply. A descending replace parks its spawned-but-uncommitted
+/// replacement in `arming` while the new root's pre-arm runs on the blocking
+/// pool ([`FsOps::preflight_arm`]); a kernel-recursive replace commits
+/// straight off its spawn and never populates it.
 struct ReplaceState<H> {
   reservation: crate::watcher::ReservationGuard,
   reply: futures_channel::oneshot::Sender<Result<(), crate::error::ReplaceRootError>>,
@@ -381,6 +577,15 @@ pub(crate) enum Command {
     scope: ScopeId,
     reply: futures_channel::oneshot::Sender<usize>,
   },
+  /// A test-only count of the cookies the driver still OWNS, so a suite can
+  /// prove that a failed write, an abandoned reply, a retired scope, and a
+  /// `RemoveCookie` each leave the registry exactly as they found it — a leak
+  /// (or unbounded growth under repeated failure) is then provable rather than
+  /// inferred from the unlinks.
+  #[cfg(all(test, feature = "tokio"))]
+  DebugCookieCount {
+    reply: futures_channel::oneshot::Sender<usize>,
+  },
 }
 
 /// Lowers a refused cover reconcile to the public outcome — answered at
@@ -422,8 +627,7 @@ fn resolve_cover_settlements<R, F>(
   ops: &F,
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
-  written_cookies: &mut BTreeMap<ScopeId, Vec<PathBuf>>,
-  shutdown: &std::sync::Arc<core::sync::atomic::AtomicBool>,
+  cookies: &mut CookieRegistry<F>,
   live: &dyn Fn(ScopeId) -> bool,
 ) where
   R: RuntimeLite,
@@ -462,48 +666,51 @@ fn resolve_cover_settlements<R, F>(
     // report the cookie on).
     if let Some(cookie) = parked_cookies.remove(&fence) {
       let _ = settle;
-      if !live(cookie.scope) {
+      // The root the cookie must stay inside — and, being recorded on the same
+      // transitions the stream is, a second proof the scope is live.
+      let Some(root) = cookies
+        .root_of(cookie.scope)
+        .filter(|_| live(cookie.scope))
+        .map(Path::to_path_buf)
+      else {
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
-      }
-      // Record the cookie the write is about to create BEFORE dispatching it:
-      // the path is deterministic from dir+name, so ownership never rides the
-      // reply oneshot. A caller that abandons the reply after the write lands
-      // loses the path, but the driver still holds it here and reaps it at
-      // scope or driver teardown.
-      written_cookies
-        .entry(cookie.scope)
-        .or_default()
-        .push(cookie.dir.join(&cookie.name));
+      };
+      // The guard is taken HERE, at dispatch, so the flags it carries cover the
+      // whole in-flight window: a teardown or a driver exit between this line
+      // and the write's landing is visible to the write itself.
+      let guard = cookies.dispatch_guard(cookie.scope);
       let ops = ops.clone();
-      let shutdown = shutdown.clone();
       R::spawn_blocking_detach(move || {
         let ParkedCookie {
           dir, name, reply, ..
         } = cookie;
-        match ops.write_cookie(&dir, &name) {
+        match ops.write_cookie(&root, &dir, &name) {
           Ok(path) => {
-            // This write may have landed AFTER the driver's terminal sweep
-            // already unlinked its recorded paths — the sweep would then have
-            // found nothing and this file would outlive the driver, with no
-            // channel left to ask for its removal. The handshake that closes
-            // it: the sweep sets the flag BEFORE unlinking, and the write
-            // checks it AFTER creating the file. Seeing it set, reap here;
-            // seeing it clear means the file already existed when the sweep
-            // ran, so the sweep took it. Neither order leaks.
-            if shutdown.load(core::sync::atomic::Ordering::SeqCst) {
+            // Hand the file to the registry — the path the write ACTUALLY
+            // landed at, which only the write knows (a covered FILE
+            // subscription's cookie lands in the parent). A refused claim means
+            // the registry is gone or the scope is retiring: its sweep has
+            // already passed this path, so the file must not survive.
+            if !guard.claim(&path) {
               ops.remove_cookie(&path);
+              let _ = reply.send(Err(crate::error::SyncRootError::Retired));
               return;
             }
             // A caller that abandoned the sync (timed out, dropped the future)
-            // has dropped this reply receiver. The cookie file was still
-            // written, so reap it immediately rather than leak it — the write
-            // completing late must not outlive the barrier that asked for it.
+            // has dropped this reply receiver and will never ask for this
+            // cookie's removal. Give the record back and reap the file — the
+            // write completing late must not outlive the barrier that asked for
+            // it.
             if let Err(Ok(path)) = reply.send(Ok(path)) {
+              guard.release(&path);
               ops.remove_cookie(&path);
             }
           }
           Err(source) => {
+            // Nothing was created and nothing was claimed, so the registry is
+            // exactly as the dispatch found it — which is what keeps repeated
+            // failed syncs on a long-lived scope from growing it.
             let _ = reply.send(Err(crate::error::SyncRootError::Write {
               path: dir.join(&name),
               source,
@@ -626,13 +833,19 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// `lstat`s one path (blocking).
   fn probe(&self, path: &Path) -> ProbeOutcome;
 
-  /// Creates the sync cookie `name` inside `dir` (blocking), returning the
-  /// path it landed at. The cookie's whole purpose is the kernel event its
-  /// creation mints: it rides the root's ordered queue behind every change
-  /// the backend reported before it, so observing it proves those changes
+  /// Creates the sync cookie `name` for `dir`, inside `root` (blocking),
+  /// returning the path it landed at. The cookie's whole purpose is the kernel
+  /// event its creation mints: it rides the root's ordered queue behind every
+  /// change the backend reported before it, so observing it proves those changes
   /// have already exited the pipeline. A read-only tree fails here with
   /// `PermissionDenied` — the honest refusal.
-  fn write_cookie(&self, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error>;
+  ///
+  /// `dir` is the SUBSCRIPTION's key, which a covered FILE subscription makes a
+  /// file: the cookie then lands in the containing directory instead, and never
+  /// above `root` (see [`cookie_dir`]). So the RETURNED path is the only
+  /// authority on where the cookie went — `dir.join(name)` is not, and nothing
+  /// may record ownership of a cookie by predicting its path.
+  fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error>;
 
   /// Unlinks a sync cookie (blocking, fire-and-forget). Idempotent: a cookie
   /// already gone (a crash leftover reaped by someone else, a racing sync) is
@@ -1066,6 +1279,42 @@ impl RealFs {
   }
 }
 
+/// The directory a sync cookie for `dir` actually lands in: `dir` itself when it
+/// IS one, its containing directory otherwise — never above `root`.
+///
+/// The cookie key a sync carries is the subscription's own, and a FILE
+/// subscription is validly covered (it commits under an armed ancestor) — so
+/// `dir` can name a file, and creating `file/.tributaries-sync-…` inside it would
+/// fail ENOTDIR instead of establishing a barrier. The cookie goes BESIDE such a
+/// subscription instead, and the caller learns the real location from the
+/// returned path.
+///
+/// `root` is the FLOOR, and it is load-bearing rather than defensive. The
+/// watcher proved `dir` is INSIDE the root, so the parent of a `dir` strictly
+/// under the root is inside it too — but the parent of the ROOT is not, and a
+/// root that has just died (deleted, or replaced by a file) is exactly a `dir`
+/// that fails the directory test. Without the floor, a sync racing a root death
+/// would place a cookie in the root's PARENT: outside the watched tree, where no
+/// event can be reported and nothing else would have any business writing. With
+/// it, such a write answers the typed failure instead — the honest outcome for a
+/// barrier on a root that is gone.
+///
+/// One sample, symlink NOT followed: a symlinked directory is not a directory
+/// here, and deliberately so — a cookie written through it would be created
+/// under the link's TARGET and its event reported outside this root, never
+/// meeting the barrier.
+fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
+  match std::fs::symlink_metadata(dir) {
+    Ok(meta) if meta.is_dir() => dir,
+    _ => match dir.parent() {
+      Some(parent) if parent.starts_with(root) => parent,
+      // No containing directory inside the root: `dir` IS the root (or has no
+      // parent at all). Keep `dir` — the create then fails honestly.
+      _ => dir,
+    },
+  }
+}
+
 impl FsOps for RealFs {
   type Handle = SourceHandle;
 
@@ -1108,8 +1357,8 @@ impl FsOps for RealFs {
     }
   }
 
-  fn write_cookie(&self, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
-    let path = dir.join(name);
+  fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
+    let path = cookie_dir(root, dir).join(name);
     // create_new: a cookie name is minted unique (instance + pid + seq), so an
     // existing file at that path is a foreign artifact or a name collision —
     // never something to silently overwrite.
@@ -1570,22 +1819,13 @@ pub(crate) async fn run<R, F>(
   // `Command::SyncRoot`): the write dispatches to the blocking pool once the
   // scope's re-arm work quiesces, whatever the settle's verdict.
   let mut parked_cookies: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
-  // Every cookie this driver has written and not yet removed, keyed by the
-  // scope it belongs to. The driver OWNS each written cookie from the moment
-  // its write dispatches until a `RemoveCookie` unlinks it, the scope's stream
-  // tears down, or the driver exits — so a write whose reply the caller
-  // abandoned after `reply.send` (the value never polled out, so no path ever
-  // reaches a `RemoveCookie`) is still reaped, and no source-side queue is
-  // needed. Bounded by live-scope in-flight cookies: writes and removes both
-  // serialize through this driver's command stream, a dead scope's cookies are
-  // reaped when its stream tears down, and any remainder at driver exit.
-  let mut written_cookies: BTreeMap<ScopeId, Vec<PathBuf>> = BTreeMap::new();
-  // Raised once, just before the terminal sweep unlinks `written_cookies`, and
-  // read by every dispatched cookie write right after it creates its file: the
-  // handshake that stops a write still in the blocking pool from outliving the
-  // driver that dispatched it (the sweep would unlink a path whose file does
-  // not exist yet, and no channel is left to ask for its removal afterwards).
-  let cookie_shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+  // The OWNER of every cookie this driver writes, from the write's landing until
+  // a `RemoveCookie` unlinks it, its scope's stream tears down, or this local
+  // drops. Ownership never rides the reply oneshot, so a caller that abandons
+  // its sync cannot strand a file and no source-side removal queue is needed;
+  // and because the sweep is a `Drop`, a panicking or CANCELLED driver task
+  // reaps its cookies exactly like a returning one.
+  let mut cookies = CookieRegistry::new(ops.clone());
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
   // driver keeps a sender so grants can always be minted, which is fine —
   // exit is driven by the COMMAND channel, and this receiver merely pends.
@@ -1605,7 +1845,7 @@ pub(crate) async fn run<R, F>(
       &events,
       &mut unwatch_replies,
       &mut deferred_grants,
-      &mut written_cookies,
+      &mut cookies,
       &registry,
       &now,
     );
@@ -1620,8 +1860,7 @@ pub(crate) async fn run<R, F>(
       &ops,
       &mut cover_replies,
       &mut parked_cookies,
-      &mut written_cookies,
-      &cookie_shutdown,
+      &mut cookies,
       &|scope| handles.contains_key(&scope),
     );
     // Reclaim canceled awaited-unwatch waiters at the same choke point, so an
@@ -1709,6 +1948,7 @@ pub(crate) async fn run<R, F>(
               }
               if backend.is_kernel_recursive() {
                 let replace = replace_states.remove(&scope).expect("just checked");
+                let widened = spawned.meta.root.clone();
                 let outcome = commit_replace::<R, F>(
                   &mut core,
                   &ops,
@@ -1727,6 +1967,10 @@ pub(crate) async fn run<R, F>(
                 );
                 if let Ok(backend) = &outcome {
                   scope_backends.insert(scope, *backend);
+                  // The scope survives the swap under a WIDER root: the cookie
+                  // floor moves with it, or a sync under the new root would find
+                  // no containing directory inside the old one.
+                  cookies.scope_live(scope, widened);
                 }
                 // The reservation releases HERE — commit or failure alike —
                 // after the registry overwrite (commit) has already made the
@@ -1854,6 +2098,9 @@ pub(crate) async fn run<R, F>(
                 // a dead-on-arrival handle.
                 registry.scope_live(scope, &canonical_root, identity, &ancestors, backend, stats);
                 scope_backends.insert(scope, backend);
+                // The cookie floor travels with the stream: a sync for this
+                // scope may write inside this root, never above it.
+                cookies.scope_live(scope, canonical_root.clone());
                 match backend {
                   // Descending: the stream is live but covers NOTHING until
                   // the root's kernel watch arms; the grant defers to the
@@ -1950,6 +2197,7 @@ pub(crate) async fn run<R, F>(
             drop(replace.reservation);
             continue;
           };
+          let widened = spawned.meta.root.clone();
           let outcome = if !handles.contains_key(&scope) {
             // Death wins: the scope ended while the pre-arm was in flight.
             retire_refused::<R, F>(&op_tx, &mut pending_teardowns, scope, spawned);
@@ -1985,6 +2233,9 @@ pub(crate) async fn run<R, F>(
           };
           if let Ok(backend) = &outcome {
             scope_backends.insert(scope, *backend);
+            // The cookie floor follows the committed root (see the
+            // kernel-recursive commit above).
+            cookies.scope_live(scope, widened);
           }
           drop(replace.reservation);
           let _ = replace.reply.send(outcome.map(|_| ()));
@@ -2172,13 +2423,9 @@ pub(crate) async fn run<R, F>(
           }
         }
         Ok(Command::RemoveCookie { path }) => {
-          // The driver owns every cookie it wrote until removed or teardown;
-          // this remove drops that ownership. Cookie sets are tiny (in-flight
-          // syncs), so the linear scan across scopes is cheap.
-          written_cookies.retain(|_, paths| {
-            paths.retain(|p| p != &path);
-            !paths.is_empty()
-          });
+          // The registry's ownership of this cookie ends here: forget it (O(1) —
+          // the ledger is keyed by path), then unlink off the reactor.
+          cookies.forget(&path);
           let ops = ops.clone();
           R::spawn_blocking_detach(move || ops.remove_cookie(&path));
         }
@@ -2186,6 +2433,10 @@ pub(crate) async fn run<R, F>(
         #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugLaneCount { reply }) => {
           let _ = reply.send(lanes.len());
+        }
+        #[cfg(all(test, feature = "tokio"))]
+        Ok(Command::DebugCookieCount { reply }) => {
+          let _ = reply.send(cookies.len());
         }
         #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugUnwatchWaiters { scope, reply }) => {
@@ -2266,23 +2517,6 @@ pub(crate) async fn run<R, F>(
         spawned.handle.shutdown();
         let _ = tx.try_send(OpResult::TornDown { scope });
       });
-    }
-  }
-  // The terminal cookie guarantee: unlink every cookie this driver ever wrote
-  // and has not yet removed before it exits — including one whose write reply
-  // the caller abandoned after the write landed, which no `RemoveCookie` will
-  // ever arrive for. Synchronous on this shutdown path so the removal is done
-  // by the time the driver returns; the set is tiny (in-flight syncs) and each
-  // unlink is idempotent.
-  //
-  // The flag is raised BEFORE the sweep, and a still-running write checks it
-  // AFTER creating its file: a write that lands past this sweep then reaps
-  // itself, and one that lands before it is already recorded here. So no
-  // dispatched write can outlive the driver, however the two interleave.
-  cookie_shutdown.store(true, core::sync::atomic::Ordering::SeqCst);
-  for (_scope, paths) in std::mem::take(&mut written_cookies) {
-    for path in &paths {
-      ops.remove_cookie(path);
     }
   }
   let drain = async {
@@ -2369,7 +2603,7 @@ pub(crate) async fn run<R, F>(
     &events,
     &mut unwatch_replies,
     &mut deferred_grants,
-    &mut written_cookies,
+    &mut cookies,
     &registry,
     &now,
   );
@@ -2377,16 +2611,21 @@ pub(crate) async fn run<R, F>(
   // drain resolves with its honest verdict instead of spuriously reading as
   // `Closed`. Whatever is still pending drops with `cover_replies` — the
   // ratified close-mid-fence semantics: the caller sees `Closed`, never an
-  // outcome fabricated over a torn-down driver.
+  // outcome fabricated over a torn-down driver. No cookie can be dispatched
+  // here (no scope is live to this poll), so the registry may retire next.
   resolve_cover_settlements::<R, F>(
     &mut core,
     &ops,
     &mut cover_replies,
     &mut parked_cookies,
-    &mut written_cookies,
-    &cookie_shutdown,
+    &mut cookies,
     &|_| false,
   );
+  // The terminal sweep runs HERE rather than at the end of the scope, so an
+  // answered close PROVES the cookies are reaped. This is only the sweep's
+  // SCHEDULING: the guarantee is the registry's `Drop`, which a panicking or
+  // cancelled driver — one that never reaches this line — runs just the same.
+  drop(cookies);
   if let Some(reply) = close_reply {
     let _ = reply.send(pending_teardowns.values().sum::<usize>() + pending_spawns.len());
   }
@@ -2576,7 +2815,7 @@ fn execute_effects<R, F>(
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
-  written_cookies: &mut BTreeMap<ScopeId, Vec<PathBuf>>,
+  cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
 ) where
@@ -2625,17 +2864,12 @@ fn execute_effects<R, F>(
         // (the scope died before coverage ever started).
         registry.scope_dead(scope);
         ops.detach_scope(scope);
-        // Reap every cookie this scope still owns: its stream is retiring, so
-        // no `RemoveCookie` will arrive for a write whose reply was abandoned.
-        // Off the reactor (an unlink is blocking I/O) and idempotent.
-        if let Some(paths) = written_cookies.remove(&scope) {
-          let ops = ops.clone();
-          R::spawn_blocking_detach(move || {
-            for path in paths {
-              ops.remove_cookie(&path);
-            }
-          });
-        }
+        // The scope's cookies retire with its stream: no `RemoveCookie` will
+        // arrive for a write whose reply was abandoned, and there will be no
+        // stream left to report one on. The registry raises the scope's flag
+        // before it unlinks, so a write still in the pool reaps itself rather
+        // than landing a file behind this sweep.
+        cookies.retire_scope::<R>(scope);
         if let Some(DeferredGrant { pending, root }) = deferred_grants.remove(&scope) {
           let _ = pending
             .reply

@@ -29,6 +29,10 @@ use std::{
   ffi::OsString,
   hash::Hash,
   marker::PhantomData,
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
   time::{Duration, Instant},
   vec::Vec,
 };
@@ -117,6 +121,13 @@ enum Command<C, V> {
 struct SyncRequest {
   /// The subscription the barrier is for.
   sub: Subscription,
+  /// The shared [`loss_gen`](Owner::loss_gen) snapshotted by [`Tributaries::sync`] BEFORE this
+  /// request was enqueued — the barrier's loss window therefore opens at the CALLER'S CALL, not at
+  /// the owner's install. Compared against the live generation in [`Owner::on_sync`]: any coverage
+  /// loss the owner processed while this request sat in the mailbox moves the generation, so the
+  /// barrier is `Dominated` even when that loss has since published-and-cleared and left no trace
+  /// in the install-time debt maps or the per-subscription loss serial.
+  loss_gen_at_call: u64,
   /// Resolved at OBSERVATION (or domination), not at cookie-write: the owner parks it in
   /// `pending_syncs` until the funnel matches. The caller's deadline is enforced by the `R::timeout`
   /// in [`Tributaries::sync`], never here.
@@ -138,9 +149,12 @@ struct PendingSync<C, H> {
   /// so the barrier is met by re-enumeration — `Dominated`, not `Delivered`,
   /// even when no debt remains parked at the instant of resolution.
   loss_serial_at_install: u64,
-  /// Debt already stood for this subscription when the barrier was installed — a
-  /// pre-call loss the cookie cannot un-owe, so the barrier must resolve
-  /// `Dominated` regardless of the flush.
+  /// A loss the cookie cannot un-owe already stood when the barrier was installed, so the barrier
+  /// must resolve `Dominated` regardless of the flush. Two shapes fold into this one flag:
+  /// standing parked debt (a pre-call loss still owed at install), and a **generation change
+  /// across the caller's call-to-install window** — a loss the owner processed while the request
+  /// sat in the mailbox, which may have published-and-cleared before install and so left neither
+  /// standing debt nor a serial the install-time snapshot could still see advance.
   dominated_at_install: bool,
   /// Resolved `Delivered` when the cookie is seen, `Dominated` when a covering
   /// `Rescan` (or a root death) stands in for it.
@@ -320,6 +334,14 @@ pub struct Tributaries<C, V, R, H> {
   /// `Send` for all `C`/`V`. Cloned and dropped in lockstep with `commands`, so the last handle
   /// dropped closes both.
   sync_commands: async_channel::Sender<SyncRequest>,
+  /// The shared **coverage-loss generation**, bumped by the owner's single loss choke point
+  /// ([`Owner::note_loss`]) and readable by any handle without touching the owner.
+  ///
+  /// [`sync`](Self::sync) snapshots it BEFORE enqueueing its request, so the barrier's loss window
+  /// opens at the caller's call rather than at the owner's install — closing the window in which
+  /// the owner processes a loss for the sub (whose kernel event predates the call), publishes and
+  /// clears it, and only then dispatches the queued request onto a state that looks pristine.
+  loss_gen: Arc<AtomicU64>,
   /// The dedicated **high-priority shutdown signal**: [`close`](Self::close) sends its
   /// [`CloseReply`] here, never the command mailbox, so a requested shutdown can never be starved
   /// behind the `Watch`/`Unwatch` backlog. It is checked at the TOP priority in every place
@@ -367,6 +389,7 @@ impl<C, V, R, H> Clone for Tributaries<C, V, R, H> {
     Self {
       commands: self.commands.clone(),
       sync_commands: self.sync_commands.clone(),
+      loss_gen: Arc::clone(&self.loss_gen),
       closes: self.closes.clone(),
       events: self.events.clone(),
       view: self.view.clone(),
@@ -525,6 +548,10 @@ where
     // (cloned into each grant), so the channel never closes while the owner lives — the old weak
     // `commands` self-clone (and its `upgrade() == None` orphan branch) is gone.
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
+    // The shared coverage-loss generation, minted ONCE here and held by both planes: the owner
+    // bumps it at its single loss choke point (`note_loss`), and every handle clone reads it in
+    // `sync` to stamp the barrier's window with the caller's call instead of the owner's install.
+    let loss_gen = Arc::new(AtomicU64::new(0));
     let owner = Owner {
       source,
       subsumer,
@@ -546,6 +573,7 @@ where
       sync_seq: 0,
       sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       loss_serial: HashMap::new(),
+      loss_gen: Arc::clone(&loss_gen),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -560,6 +588,7 @@ where
       Self {
         commands: command_tx,
         sync_commands: sync_command_tx,
+        loss_gen,
         closes: close_tx,
         events: event_rx,
         view,
@@ -859,7 +888,18 @@ where
     // `begin_sync`) could blow the deadline unbounded. Clone the sender before the async block so it
     // borrows no `self` across the await.
     let tx = self.sync_commands.clone();
-    let req = SyncRequest { sub, reply };
+    // Snapshot the shared coverage-loss generation BEFORE the request is enqueued: this is what
+    // makes the barrier's loss window start HERE, at the caller's call, rather than at the owner's
+    // install. Any loss the owner processes for ANY subscription while this request waits in the
+    // mailbox moves the generation, and `on_sync` reads the divergence as domination — so a loss
+    // whose kernel event predates this call can no longer publish-and-clear itself into invisibility
+    // before the barrier is installed and be reported as a false `Delivered`.
+    let loss_gen_at_call = self.loss_gen.load(Ordering::SeqCst);
+    let req = SyncRequest {
+      sub,
+      loss_gen_at_call,
+      reply,
+    };
     match R::timeout(timeout, async move {
       if tx.send(req).await.is_err() {
         return Err(SyncError::Closed);
@@ -1005,12 +1045,37 @@ where
   /// and cleared from `needs_rescan`. Bounded by live subs (cleaned on
   /// retirement).
   loss_serial: HashMap<Subscription, u64>,
+  /// The **shared coverage-loss generation**: a global monotonic counter bumped by
+  /// [`note_loss`](Self::note_loss) — the same choke point that bumps the per-subscription
+  /// [`loss_serial`](Self::loss_serial) — and shared with every [`Tributaries`] handle, which reads
+  /// it in [`sync`](Tributaries::sync) BEFORE enqueueing a [`SyncRequest`].
+  ///
+  /// It exists because the per-subscription serial can only be snapshotted at INSTALL, which leaves
+  /// the caller's call-to-install window uncovered: the owner can process a loss for the sub (whose
+  /// kernel event predates the call), park it, publish it and clear it — all while the request sits
+  /// in the mailbox — so that at install the serial has *already* advanced and the debt maps are
+  /// empty again. Both install-time probes then read a pristine state and the cookie reports a false
+  /// `Delivered` for a pre-call change that was never emitted. Comparing the live generation against
+  /// the CALLER'S snapshot closes that window structurally, rather than patching one loss shape at a
+  /// time.
+  ///
+  /// It is deliberately GLOBAL, not per-subscription: a loss on an UNRELATED subscription inside the
+  /// window also dominates this barrier. That yields a false `Dominated` (the caller merely
+  /// re-enumerates — safe), never a false `Delivered`, and the imprecision is bounded by a window of
+  /// a few owner-loop iterations. The precise per-subscription `loss_serial` still governs the long
+  /// install-to-resolve window, where precision is worth having. Correctness beats precision here.
+  loss_gen: Arc<AtomicU64>,
   commands: async_channel::Receiver<Command<C, V>>,
-  /// The receive end of sync's **dedicated** admission mailbox (the concrete [`SyncRequest`]). The
-  /// [`run`] loop dispatches each to [`on_sync`](Self::on_sync) from its own `select!` arm, so a sync
-  /// no longer rides the key/value-bearing [`Command`] mailbox — which is what lets
-  /// [`Tributaries::sync`] bound admission inside `R::timeout`. Its senders drop with the public
-  /// handles; a closed receiver merely disables the arm (teardown stays governed by the command
+  /// The receive end of sync's **dedicated** admission mailbox (the concrete [`SyncRequest`]), so a
+  /// sync no longer rides the key/value-bearing [`Command`] mailbox — which is what lets
+  /// [`Tributaries::sync`] bound admission inside `R::timeout`.
+  ///
+  /// The [`run`] loop dispatches from it on TWO paths, and both are needed: a non-blocking
+  /// take-at-most-one at the top of every iteration (the fairness path — the biased `select!` polls
+  /// the command mailbox first, so a sustained command flood would otherwise starve the sync arm
+  /// indefinitely), and its own `select!` arm (the wake path — what serves a sync that is the only
+  /// ready work on an idle loop). Its senders drop with the public handles; a closed receiver merely
+  /// disables the arm and is inert to the loop-top take (teardown stays governed by the command
   /// channel and the close signal), and any request still queued at teardown is replied `Closed`.
   sync_commands: async_channel::Receiver<SyncRequest>,
   /// The receive end of the dedicated **high-priority shutdown signal**: a
@@ -1117,7 +1182,11 @@ enum Flow {
 /// [`cleanup_rx`](Owner::cleanup_rx) channel at the **second** priority (below close, above the
 /// mailbox): a top-of-iteration full [`drain_pending_cleanup`](Owner::drain_pending_cleanup)
 /// AND a `select!` arm between close and commands. The command mailbox is otherwise biased above the
-/// data plane so `watch`/`unwatch` are not starved by a busy event stream. On a close request, a
+/// data plane so `watch`/`unwatch` are not starved by a busy event stream — and the two control
+/// mailboxes get FAIR service, because the biased `select!` alone would let a continuously-ready
+/// command mailbox starve the sync arm forever: at most one queued sync is taken non-blockingly at
+/// the top of each iteration and dispatched inline, against the at-most-one command the `select!`
+/// below dispatches, so the two are served 1:1 under any flood. On a close request, a
 /// dropped last handle (the command channel closed), or the source draining (`next` yields `None`), it
 /// breaks, flushes the coalesced tail (no-silent-loss), and tears down — dropping the [`Owner`] (and
 /// its source, whose own `Drop` performs the orderly source teardown). Nothing is owed to `Drop`.
@@ -1163,6 +1232,26 @@ where
         Err(async_channel::TryRecvError::Closed) => close_open = false,
         Err(async_channel::TryRecvError::Empty) => {}
       }
+    }
+
+    // MAILBOX FAIRNESS between the two control planes. The `select!` below is biased, and
+    // `commands.recv()` is polled ahead of the sync arm — so a CONTINUOUSLY-ready command mailbox
+    // means the sync arm never wins and an admitted `SyncRequest` sits until its caller's deadline
+    // expires, even though the owner is perfectly healthy. (The command-fairness valve does not help:
+    // it forces one SOURCE service, then returns to the same ordering.) So take at most ONE queued
+    // sync per iteration here, non-blockingly, and dispatch it inline. The biased `select!` below
+    // dispatches at most one command per iteration, so this yields 1:1 service between the two
+    // control mailboxes under any command flood — no starvation — while leaving close/cleanup
+    // priority and the source-service valve exactly as they were.
+    //
+    // The `select!`'s sync arm STAYS: it is what wakes an otherwise-idle loop when a sync is the only
+    // ready work (this `try_recv` cannot block). A closed mailbox is inert here — `Err(Closed)` and
+    // `Err(Empty)` alike fall through, driving neither teardown (the COMMAND channel closing remains
+    // the dropped-handles signal) nor a spin.
+    if let Ok(req) = owner.sync_commands.try_recv() {
+      owner
+        .on_sync(req.sub, req.loss_gen_at_call, req.reply)
+        .await;
     }
 
     // Grant resolution is drained SECOND — below the close check, above the flush and the command
@@ -1303,10 +1392,12 @@ where
       }
       maybe_req = sync_arm.fuse() => match maybe_req {
         // A sync request on the dedicated mailbox: dispatch inline exactly as the old command-borne
-        // `Sync` did, counting it a control-plane win against the fairness valve.
+        // `Sync` did, counting it a control-plane win against the fairness valve. This arm is what
+        // wakes an IDLE loop on a sync; a sync arriving under a command flood is served by the
+        // loop-top drain above, which the biased select can never starve.
         Some(req) => {
           command_streak += 1;
-          owner.on_sync(req.sub, req.reply).await;
+          owner.on_sync(req.sub, req.loss_gen_at_call, req.reply).await;
           Flow::Continue
         }
         // The sync mailbox closed (every handle dropped): disable the arm and let the command channel
@@ -2434,6 +2525,14 @@ where
       return;
     };
     for &sub in &subscribers {
+      // Route the park through the ONE loss choke point (like every other park), so both loss clocks
+      // move: this is a genuine coverage loss — a root death, or a rollback whose preserved stream
+      // was retargeted away and back with no `Rescan`, silently dropping whatever the old stream
+      // still had queued, INCLUDING changes that predate a caller's in-flight `sync()`. Parking
+      // straight into `merge_max` without noting it left the shared generation still, so such a
+      // caller's barrier could install onto a state that looked pristine and report a false
+      // `Delivered`. `dominate_syncs_of_root` below only reaches barriers ALREADY installed.
+      self.note_loss(sub);
       let value = self.subsumer.subscription_value(sub).cloned();
       let epoch = self.epochs.shed_rescan(sub);
       let target = if self.unclaimed.contains(&sub) {
@@ -2519,6 +2618,46 @@ where
     }
   }
 
+  /// The single **coverage-loss choke point**: records that `sub` just lost coverage — its change
+  /// is now owed as a dominating `Rescan` rather than as a delivery — and moves BOTH loss clocks a
+  /// pending sync reads.
+  ///
+  /// - the per-subscription sticky [`loss_serial`](Self::loss_serial), snapshotted at INSTALL, so a
+  ///   loss during the install-to-resolve window resolves the barrier `Dominated` even after the
+  ///   parked debt has been published and cleared;
+  /// - the shared [`loss_gen`](Self::loss_gen), snapshotted by the CALLER in
+  ///   [`Tributaries::sync`], so a loss the owner processes in the call-to-install window — which
+  ///   the install-time snapshot is structurally blind to — dominates the barrier too.
+  ///
+  /// Every path that leaves a subscription owing a re-enumeration instead of a delivery must route
+  /// through here, and exactly one bump site is what keeps the two clocks in step: the ordinary
+  /// delta suppressed behind standing debt ([`try_emit`](Self::try_emit)), the overflow shed
+  /// ([`park_rescan`](Self::park_rescan)), the already-minted `Rescan` parked unchanged
+  /// ([`park_rescan_event`](Self::park_rescan_event)), and the terminal/rollback `Rescan` parked for
+  /// every subscriber of a root ([`rescan_live_root`](Self::rescan_live_root)). A `Rescan` that is
+  /// successfully DELIVERED is not a loss to note here — it is on the stream, and the
+  /// `dominate_syncs_*` family resolves the barriers riding it.
+  fn note_loss(&mut self, sub: Subscription) {
+    *self.loss_serial.entry(sub).or_insert(0) += 1;
+    self.loss_gen.fetch_add(1, Ordering::SeqCst);
+  }
+
+  /// Advances ONLY the shared generation — never a subscription's `loss_serial` — for a `Rescan`
+  /// that is **delivered** rather than parked: it stands in for the barriers already installed
+  /// under it (which the `dominate_*` family resolves directly), and it must equally stand in for
+  /// one whose caller had already CALLED but whose install has not run yet. Without this, that
+  /// caller's barrier would find no debt parked, an unmoved `loss_serial`, and a clean flush, and
+  /// would report `Delivered` for a change the `Rescan` replaced — the very asymmetry the
+  /// installed case is careful to avoid.
+  ///
+  /// The serial is deliberately left alone. A `Rescan` fans out to every subscriber of its root,
+  /// so bumping the serial here would move it for SIBLING subscriptions and silently redefine
+  /// their install-to-resolve window; the shared generation only governs the call-to-install
+  /// window, where over-domination costs a caller nothing but a re-enumeration.
+  fn note_domination(&self) {
+    self.loss_gen.fetch_add(1, Ordering::SeqCst);
+  }
+
   /// Sheds `sub` to a parked dominating [`Rescan`](crate::EventKind::Rescan) — the
   /// per-subscription overflow shed after an **ordinary delta** to it found the channel full
   /// (design backpressure doc), mirroring the fs layer's `LagState::Lagged` one level up. An
@@ -2542,13 +2681,6 @@ where
   ///
   /// A subscription with no live key (raced retirement) is not parked — a stale parked
   /// `Rescan` would be co-retired anyway, and there is no subtree left to name.
-  /// Records that `sub` just lost coverage to a parked `Rescan` — bumps its
-  /// sticky loss serial so a pending sync installed before this loss resolves
-  /// `Dominated` even after the parked debt is published and cleared.
-  fn note_loss(&mut self, sub: Subscription) {
-    *self.loss_serial.entry(sub).or_insert(0) += 1;
-  }
-
   fn park_rescan(&mut self, sub: Subscription) {
     self.note_loss(sub);
     let Some(key) = self.subsumer.subscription_key(sub).map(<[C]>::to_vec) else {
@@ -2837,9 +2969,14 @@ where
   /// owns path shapes (it resolves a file key to its parent), and the key is
   /// always inside the root's retained cover — the ROOT's directory need not
   /// be, since set-cover pruning can leave it outside actual kernel coverage.
+  ///
+  /// `loss_gen_at_call` is the shared [`loss_gen`](Self::loss_gen) the CALLER snapshotted before it
+  /// enqueued the request; comparing it against the live generation is what makes the barrier's loss
+  /// window open at the call rather than here.
   async fn on_sync(
     &mut self,
     sub: Subscription,
+    loss_gen_at_call: u64,
     reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
   ) {
     let (Some(root), Some(dir_key)) = (
@@ -2888,11 +3025,27 @@ where
     match self.source.begin_sync(root, &dir_key, token).await {
       Ok(cookie_key) => {
         let loss_serial_at_install = self.loss_serial.get(&sub).copied().unwrap_or(0);
-        // Debt already standing for this sub at install is a pre-call loss the cookie cannot
-        // un-owe: even if it publishes-and-clears before the cookie (leaving the serial unchanged
-        // and `needs_rescan` empty at resolution), the barrier must still resolve `Dominated`.
-        let dominated_at_install =
-          self.needs_rescan.contains_key(&sub) || self.suppressed_rescan.contains_key(&sub);
+        // Domination the cookie cannot un-owe, decided from the CALLER'S call rather than from this
+        // install — the two probes cover disjoint halves of the pre-cookie past:
+        //
+        // - standing parked debt: a loss still owed at install (it publishing-and-clearing before
+        //   the cookie would leave the serial unchanged and `needs_rescan` empty at resolution, so
+        //   only this snapshot still separates it from a clean sync);
+        // - a moved loss GENERATION: a loss the owner processed while the request sat in the
+        //   mailbox. Its kernel event predates the caller's `sync()`, yet it can have parked,
+        //   published and cleared entirely inside that window — advancing `loss_serial` BEFORE the
+        //   snapshot above is taken and emptying the debt maps again — so neither the standing-debt
+        //   probe nor the install-to-resolve `lost_during_window` comparison can see it. Only the
+        //   caller's own pre-enqueue snapshot can.
+        //
+        // The generation is GLOBAL, so a loss on an UNRELATED subscription inside that window
+        // dominates this barrier too. That is a deliberate conservatism: it costs a false
+        // `Dominated` (the caller re-enumerates — safe), never a false `Delivered`; the window is a
+        // few owner-loop iterations wide; and the precise per-subscription `loss_serial` still
+        // governs the long install-to-resolve window. Correctness beats precision here.
+        let dominated_at_install = self.needs_rescan.contains_key(&sub)
+          || self.suppressed_rescan.contains_key(&sub)
+          || self.loss_gen.load(Ordering::SeqCst) != loss_gen_at_call;
         self.pending_syncs.push(PendingSync {
           cookie_key,
           sub,
@@ -2951,6 +3104,9 @@ where
   /// re-enumeration, which is the barrier — met by domination rather than by
   /// delivery.
   fn dominate_pending_syncs(&mut self, event: &SourceEvent<C, S::Handle>) {
+    // Reached only for a `Rescan` (the caller gates on it), so this is the delivered-`Rescan`
+    // choke point: a barrier already CALLED but not yet installed must be dominated by it too.
+    self.note_domination();
     let at = event.key();
     let mut i = 0;
     while i < self.pending_syncs.len() {
@@ -2974,6 +3130,7 @@ where
   where
     S::Handle: PartialEq,
   {
+    self.note_domination();
     let mut i = 0;
     while i < self.pending_syncs.len() {
       if self.pending_syncs[i].root == root {
@@ -2994,6 +3151,7 @@ where
   /// barrier, so it must not wait for a cookie whose stream may have moved
   /// under it.
   fn dominate_syncs_of_subscription(&mut self, sub: Subscription) {
+    self.note_domination();
     let mut i = 0;
     while i < self.pending_syncs.len() {
       if self.pending_syncs[i].sub == sub {

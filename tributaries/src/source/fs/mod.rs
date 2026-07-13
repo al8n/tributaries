@@ -516,8 +516,13 @@ impl<R> Source<OsString> for FsSource<R> {
     handle: RootHandle,
     new_key: &[OsString],
   ) -> Result<Armed<OsString, RootHandle>, WatchError> {
-    // Any op that touches the watcher re-forwards deferred prunes first, so a
-    // stale narrower cover never trails behind the widened root.
+    // Supersede this handle's queued prune BEFORE the flush, exactly as `grow`
+    // does: the widen re-covers this root, so a prune still holding the OLD
+    // retained set is stale. Left queued, a later watcher-touching op would
+    // re-forward it AFTER the replace committed and narrow the widened root
+    // back to the old subtree — a silent coverage loss with no `Rescan`. A
+    // dropped prune is merely over-broad coverage, which self-heals.
+    self.deferred_prunes.remove(&handle);
     self.flush_deferred_prunes();
     let new_root = key_to_path(new_key);
     // Make-before-break inside the fs layer: the replacement stream is live

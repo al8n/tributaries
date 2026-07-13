@@ -569,6 +569,7 @@ impl Harness {
       sync_seq: 0,
       sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       loss_serial: HashMap::new(),
+      loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -5152,6 +5153,7 @@ impl OwnerU64 {
       sync_seq: 0,
       sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       loss_serial: HashMap::new(),
+      loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -5688,6 +5690,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     sync_seq: 0,
     sync_nonce_seed: std::collections::hash_map::RandomState::new(),
     loss_serial: HashMap::new(),
+    loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
@@ -5853,6 +5856,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     sync_seq: 0,
     sync_nonce_seed: std::collections::hash_map::RandomState::new(),
     loss_serial: HashMap::new(),
+    loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
@@ -6994,9 +6998,12 @@ async fn a_barrier_installed_over_existing_debt_resolves_dominated() {
   );
 
   // Install the barrier through the REAL `on_sync` path, so it snapshots `dominated_at_install` from
-  // the standing debt (the loss serial is snapshot too, but will not advance during the window).
+  // the standing debt (the loss serial is snapshot too, but will not advance during the window). The
+  // caller's generation snapshot is taken here, AFTER the park, so only the standing debt can force
+  // the domination — the property this cell pins.
+  let loss_gen_at_call = h.owner.loss_gen.load(core::sync::atomic::Ordering::SeqCst);
   let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
-  h.owner.on_sync(sub, reply_tx).await;
+  h.owner.on_sync(sub, loss_gen_at_call, reply_tx).await;
   assert!(
     !h.owner.source.ended_syncs.contains(&key("/a/cookie-1")),
     "the cookie is still pending — not yet reaped"
@@ -7024,6 +7031,125 @@ async fn a_barrier_installed_over_existing_debt_resolves_dominated() {
     h.owner.source.ended_syncs,
     vec![key("/a/cookie-1")],
     "the resolved barrier's cookie is reaped"
+  );
+}
+
+/// A covering `Rescan` DELIVERED (never parked) between the caller's `sync()` call and the barrier's
+/// install dominates it too. An already-installed barrier riding that same `Rescan` resolves
+/// `Dominated` (the `dominate_*` family does it directly); a barrier whose caller had merely CALLED
+/// must not resolve `Delivered` for the change that `Rescan` replaced, or the outcome would depend on
+/// how the owner's loop happened to interleave the request with the event.
+///
+/// The delivered path leaves NO trace the install-time probes can read — nothing parks, so the debt
+/// maps stay empty and the per-subscription `loss_serial` never moves. Only the shared generation,
+/// advanced at the domination choke point, still carries it.
+#[tokio::test]
+async fn a_delivered_rescan_between_the_call_and_the_install_resolves_dominated() {
+  use core::sync::atomic::Ordering;
+
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  // The caller snapshots the shared generation, exactly as `Tributaries::sync` does before enqueueing.
+  let loss_gen_at_call = h.owner.loss_gen.load(Ordering::SeqCst);
+
+  // A source `Rescan` is consumed and DELIVERED while the request still sits in the mailbox.
+  h.owner
+    .consume_source_event(&rescan_event(handle, "/a", 10));
+  assert!(
+    !h.owner.needs_rescan.contains_key(&sub) && !h.owner.suppressed_rescan.contains_key(&sub),
+    "the Rescan was delivered, not parked — no standing debt for the install to snapshot"
+  );
+  assert_eq!(
+    h.owner.loss_serial.get(&sub).copied().unwrap_or(0),
+    0,
+    "a delivered Rescan never moves the per-subscription serial — the long-window probe is blind too"
+  );
+
+  // Install with the caller's stale snapshot, then deliver the cookie over the pristine-looking state.
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.on_sync(sub, loss_gen_at_call, reply_tx).await;
+  h.owner
+    .consume_source_event(&source_created(handle, "/a/cookie-1", 20));
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "a Rescan delivered between the caller's sync() call and the install resolves Dominated"
+  );
+  assert_eq!(
+    h.owner.source.ended_syncs,
+    vec![key("/a/cookie-1")],
+    "the dominated barrier's cookie is reaped"
+  );
+}
+
+/// The CALL-to-INSTALL window: a loss the owner processes AFTER the caller's `sync()` enqueued its
+/// request but BEFORE the owner dispatches it resolves the barrier `Dominated`.
+///
+/// This is the window neither install-time probe can see, and it is why the barrier's loss window is
+/// anchored at the caller's call (the shared `loss_gen` snapshot [`super::Tributaries::sync`] takes
+/// before it sends) rather than at the install. The loss here parks, publishes and clears entirely
+/// inside the window, so by the time `on_sync` runs, `needs_rescan`/`suppressed_rescan` are empty
+/// again (no standing debt to snapshot) AND the per-subscription loss serial has already advanced
+/// (so the install-to-resolve `lost_during_window` comparison sees no change). Yet the lost change
+/// is PRE-CALL — its kernel event predates the caller's `sync()` — so it must never be reported as a
+/// clean `Delivered`.
+///
+/// Fail-on-old (no `loss_gen` term in `dominated_at_install`): both install-time probes read a
+/// pristine state and the cookie's flush is clean, so the barrier reports `Delivered` — the bug.
+#[tokio::test]
+async fn a_loss_between_the_call_and_the_install_resolves_dominated() {
+  use core::sync::atomic::Ordering;
+
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  // The caller snapshots the shared loss generation exactly as `Tributaries::sync` does — BEFORE the
+  // request is enqueued — and the owner has not dispatched it yet.
+  let loss_gen_at_call = h.owner.loss_gen.load(Ordering::SeqCst);
+
+  // The owner now processes a PRE-CALL loss while the request sits in the mailbox: the sub sheds to
+  // a parked Rescan, which then publishes and clears. Both install-time probes are now blind to it.
+  h.owner.park_rescan(sub);
+  h.owner.flush_pending_rescans();
+  assert!(
+    !h.owner.needs_rescan.contains_key(&sub) && !h.owner.suppressed_rescan.contains_key(&sub),
+    "the loss published and cleared before the barrier is installed — no standing debt to snapshot"
+  );
+  assert_ne!(
+    h.owner.loss_serial.get(&sub).copied().unwrap_or(0),
+    0,
+    "the loss serial ALREADY advanced, so the install-to-resolve comparison cannot see this loss"
+  );
+
+  // Install with the caller's STALE snapshot — exactly what the queued `SyncRequest` carries.
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.on_sync(sub, loss_gen_at_call, reply_tx).await;
+
+  // The cookie arrives over a state that looks pristine. Only the call-time generation still knows.
+  h.owner
+    .consume_source_event(&source_created(handle, "/a/cookie-1", 20));
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "a loss processed between the caller's sync() call and the barrier's install resolves \
+     Dominated, never a false Delivered"
   );
 }
 
@@ -7160,5 +7286,104 @@ async fn a_sync_times_out_when_never_observed() {
   assert!(
     matches!(result, Err(SyncError::Timeout)),
     "a barrier whose cookie is never observed times out: {result:?}"
+  );
+}
+
+/// A SATURATING control-plane flood: it keeps the command mailbox continuously non-empty by
+/// REFILLING the slot the owner just drained, and stops only once the channel closes.
+///
+/// Each command is an `Unwatch` of an ALREADY-RETIRED subscription: the owner answers it
+/// `UnknownSubscription` without arming, disarming, or minting any state, so the flood is pure
+/// control-plane pressure that allocates nothing however long it runs. (The shared
+/// [`spawn_command_flood`] gives up on the first full mailbox, so it cannot hold a *prefilled* one
+/// saturated — which is precisely the condition under test here.)
+fn spawn_saturating_command_flood(
+  commands: async_channel::Sender<super::Command<OsString, ()>>,
+  retired: Subscription,
+) -> tokio::task::JoinHandle<()> {
+  tokio::spawn(async move {
+    loop {
+      let (reply, response) = futures_channel::oneshot::channel();
+      drop(response);
+      match commands.try_send(super::Command::Unwatch {
+        sub: retired,
+        reply,
+      }) {
+        Ok(()) => {}
+        // A FULL mailbox is the goal, not a stop condition: yield, then refill the slot the owner
+        // took, so the biased select never observes the mailbox empty.
+        Err(async_channel::TrySendError::Full(_)) => tokio::task::yield_now().await,
+        // The owner is gone.
+        Err(async_channel::TrySendError::Closed(_)) => return,
+      }
+    }
+  })
+}
+
+/// Ordinary command traffic must not starve the sync mailbox. The run loop's `select!` is biased and
+/// polls `commands.recv()` ahead of the sync arm, so a CONTINUOUSLY-ready command mailbox means the
+/// sync arm never wins: an admitted `SyncRequest` would sit until its caller's deadline expired even
+/// though the owner is perfectly healthy. (The command-fairness valve does not help — it forces one
+/// SOURCE service, then returns to the same ordering.) The loop-top take-at-most-one sync drain gives
+/// the two control mailboxes 1:1 service, so the barrier resolves under any flood.
+///
+/// Run against the REAL `run` loop: the mailbox is prefilled to its full configured depth AND held
+/// saturated by a refilling flood for the whole barrier.
+///
+/// Fail-on-old (no loop-top sync drain): the sync arm never wins against the saturated mailbox, so
+/// the barrier starves and the caller's `R::timeout` fires — `Err(Timeout)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_flood_does_not_starve_the_sync_mailbox() {
+  use crate::source::SyncOutcome;
+
+  let source = SyncSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    pending: VecDeque::new(),
+    observe: true,
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> = super::Tributaries::with_source(
+    source,
+    // A deep BOUNDED mailbox, so the prefill below is a genuinely deep backlog the flood can hold
+    // saturated — the shape a starved sync arm would never get out from under.
+    TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(500).unwrap()),
+  );
+  let sub = w
+    .watch(key("/a"), (), WatchOptions::new())
+    .await
+    .expect("watch /a");
+
+  // A retired subscription for the flood to re-unwatch: answered `UnknownSubscription`, so every
+  // flood command is pure control-plane pressure that mints no state.
+  let retired = w
+    .watch(key("/doomed"), (), WatchOptions::new())
+    .await
+    .expect("watch /doomed");
+  w.unwatch(retired).await.expect("retire /doomed");
+
+  // Saturate the mailbox to its full depth BEFORE the sync is issued, then keep it saturated: the
+  // command arm is ready at every single poll of the biased select from here on.
+  for _ in 0..500 {
+    let (reply, response) = futures_channel::oneshot::channel();
+    drop(response);
+    w.commands
+      .try_send(super::Command::Unwatch {
+        sub: retired,
+        reply,
+      })
+      .expect("prefill the command backlog");
+  }
+  let flood = spawn_saturating_command_flood(w.commands.clone(), retired);
+
+  // The barrier is served by the loop-top fair drain, never by the starved sync arm.
+  let outcome = tokio::time::timeout(Duration::from_secs(10), w.sync(sub, Duration::from_secs(5)))
+    .await
+    .expect("the outer test deadline is not hit — the sync resolves or its own timeout fires");
+  flood.abort();
+  let outcome = outcome.expect("the sync resolves rather than starving behind the command flood");
+  assert!(
+    matches!(outcome, SyncOutcome::Delivered),
+    "the barrier resolves cleanly under the flood — no loss occurred, so the deliberately GLOBAL \
+     loss generation must not fire spuriously on unrelated control-plane traffic: {outcome:?}"
   );
 }

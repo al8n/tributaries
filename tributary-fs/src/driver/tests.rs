@@ -3631,10 +3631,12 @@ mod replace {
 
 /// The sync-cookie substrate on a kernel-recursive root: no re-arm work means
 /// the settle fence is trivially met, so the write lands at once; the unlink
-/// is a reply-less fire-and-forget; and a read-only tree refuses typed. The
-/// driver OWNS every cookie it writes until a `RemoveCookie` unlinks it, so a
-/// cookie whose reply the caller abandoned is still reaped when the scope's
-/// stream tears down or the driver exits — never leaked.
+/// is a reply-less fire-and-forget; and a read-only tree refuses typed.
+///
+/// The registry OWNS every cookie the driver writes — never the reply oneshot —
+/// so no interleaving strands a file: an abandoned reply, a scope retiring under
+/// an in-flight write, a failed write, and the driver's own death (close OR
+/// cancellation) each leave zero cookies on disk and zero records behind.
 mod sync_cookie {
   use super::*;
 
@@ -3656,6 +3658,68 @@ mod sync_cookie {
       .await
       .unwrap();
     on_reply.await.expect("the driver replies")
+  }
+
+  /// Dispatches a sync without awaiting it, holding on to the reply receiver —
+  /// the caller can then abandon it, or retire the scope, while the write is
+  /// still in the pool.
+  async fn sync_root_pending(
+    rig: &Rig,
+    scope: ScopeId,
+    dir: &str,
+    name: &str,
+  ) -> futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>> {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::SyncRoot {
+        scope,
+        dir: PathBuf::from(dir),
+        name: name.to_owned(),
+        reply,
+      })
+      .await
+      .unwrap();
+    on_reply
+  }
+
+  /// How many cookies the driver still OWNS. The leak oracle: every path that
+  /// ends a cookie's life must leave this back where it found it — an unlinked
+  /// file with a live record is a slow leak, and a record per failed attempt is
+  /// unbounded growth.
+  async fn cookie_count(rig: &Rig) -> usize {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugCookieCount { reply })
+      .await
+      .unwrap();
+    on_reply.await.expect("the driver replies")
+  }
+
+  /// A live rig whose DRIVER TASK the caller keeps, so a cell can drop the
+  /// driver future outright — the cancellation path, which no orderly close
+  /// tail ever reaches.
+  fn cancellable_rig() -> (Rig, tokio::task::JoinHandle<()>) {
+    let fs = FakeFs::new(1);
+    fs.put("/r", FileKind::Dir, 1);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    let driver = tokio::spawn(run::<TokioRuntime, FakeFs>(
+      config(),
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      NullRegistry,
+    ));
+    (
+      Rig {
+        fs,
+        commands: cmd_tx,
+        events: ev_rx,
+      },
+      driver,
+    )
   }
 
   #[tokio::test(flavor = "multi_thread")]
@@ -3738,6 +3802,11 @@ mod sync_cookie {
       .await
       .expect("the write lands");
     assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the registry owns the landed cookie"
+    );
     assert!(
       rig.fs.cookie_removes().is_empty(),
       "no RemoveCookie was sent — the cookie is still the driver's to reap"
@@ -3786,6 +3855,330 @@ mod sync_cookie {
       rig.fs.cookie_removes(),
       vec![path],
       "the retiring scope's stream teardown reaped its written cookie"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "and it took the record with it — a retired scope leaves nothing behind"
+    );
+  }
+
+  // A write that FAILS creates no file, so it claims nothing. This is what keeps
+  // a long-lived scope's registry bounded: the old ledger recorded the path
+  // BEFORE dispatching the write and never took it back on failure, so a
+  // read-only tree grew it by one path per attempt, forever.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_failed_cookie_write_records_nothing() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    rig
+      .fs
+      .fail_cookie_writes(std::io::ErrorKind::PermissionDenied);
+
+    for attempt in 0..8 {
+      let outcome = sync_root(
+        &rig,
+        scope,
+        "/r",
+        &format!(".tributaries-sync-1-8-1-{attempt}"),
+      )
+      .await;
+      assert!(
+        matches!(outcome, Err(crate::error::SyncRootError::Write { .. })),
+        "the read-only tree refuses every attempt"
+      );
+      assert_eq!(
+        cookie_count(&rig).await,
+        0,
+        "a failed write records nothing — repeated failures cannot grow the registry (attempt {attempt})"
+      );
+    }
+    assert!(
+      rig.fs.cookie_writes().is_empty(),
+      "no file was ever created"
+    );
+    assert!(
+      rig.fs.cookie_removes().is_empty(),
+      "and none had to be reaped"
+    );
+  }
+
+  // The caller abandons its sync (a timeout, a dropped future) AFTER the write
+  // was dispatched: the file lands into a reply nobody holds. The write reaps it
+  // and hands the record back — an unlinked file left recorded would be a leak
+  // of a different kind (a sweep chasing a path that no longer exists, forever).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_abandoned_cookie_reply_reaps_and_forgets() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    // Hold the write in the pool: abandoning the reply EARLIER would be the
+    // parked-fence prune (no write is ever dispatched), which reaps nothing
+    // because nothing was written.
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-1-8-2").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      1,
+      "the write reached the pool before the caller walked away"
+    );
+
+    drop(on_reply);
+    hold.release();
+
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    let written = rig.fs.cookie_writes();
+    assert_eq!(written.len(), 1, "the write really did land");
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      written,
+      "the abandoned cookie was reaped by the write itself"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no file survives a sync nobody is listening for"
+    );
+    assert_eq!(cookie_count(&rig).await, 0, "and the record went with it");
+  }
+
+  // The scope retires while its write is still in the blocking pool: the
+  // teardown's sweep runs BEFORE the file exists, so the sweep alone cannot
+  // reap it. The retirement flag is what closes the window — raised before the
+  // sweep, checked by the write as it hands the file over, so the write reaps
+  // itself instead of landing a cookie behind a sweep that already ran.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cookie_written_for_a_retiring_scope_reaps_itself() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-1-8-3").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      1,
+      "the write is in the pool, its file not yet created"
+    );
+
+    // Retire the scope UNDER the in-flight write.
+    let (reply, on_unwatch) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(on_unwatch.await.unwrap(), "the live scope was unwatched");
+    assert!(
+      rig.fs.cookie_writes().is_empty(),
+      "the retirement got there first — the sweep found nothing to unlink"
+    );
+
+    hold.release();
+    assert!(
+      matches!(
+        on_reply.await.expect("the driver replies"),
+        Err(crate::error::SyncRootError::Retired)
+      ),
+      "a cookie the dead scope could never report is refused, not silently placed"
+    );
+
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      rig.fs.cookie_writes(),
+      "the late write reaped the file it had just created"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no cookie outlives the scope it was written for"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "and nothing was recorded for a scope that will never be swept again"
+    );
+  }
+
+  // A FILE subscription is validly covered (it commits under an armed
+  // ancestor), so the cookie key a sync carries can name a file. Writing inside
+  // it would fail ENOTDIR and leave the caller with no barrier at all; the
+  // cookie lands beside it instead — still under the root, so its create event
+  // is still reported on this root's stream.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_covered_file_subscription_writes_its_cookie_in_the_parent_directory() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    rig.fs.put("/r/sub/notes.txt", FileKind::File, 3);
+
+    let path = sync_root(&rig, scope, "/r/sub/notes.txt", ".tributaries-sync-1-8-4")
+      .await
+      .expect("a covered file subscription can still place its barrier");
+    assert_eq!(
+      path,
+      PathBuf::from("/r/sub/.tributaries-sync-1-8-4"),
+      "the cookie lands in the file's containing directory"
+    );
+    assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
+
+    // The barrier still works: the cookie's own create rides this root's queue.
+    rig.fs.send_batch(
+      "/r",
+      vec![ev("/r/sub/.tributaries-sync-1-8-4", created(), 1, 9001)],
+    );
+    let (got, change) = next_event(&rig).await;
+    assert_eq!(got, scope);
+    assert!(change.kind().is_created());
+    assert_eq!(change.location(), &loc(&["sub", ".tributaries-sync-1-8-4"]));
+
+    // And the registry owns the path the write ACTUALLY landed at — the
+    // caller's remove (keyed off that same returned path) finds it.
+    assert_eq!(cookie_count(&rig).await, 1);
+    rig
+      .commands
+      .send(Command::RemoveCookie { path: path.clone() })
+      .await
+      .unwrap();
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(rig.fs.cookie_removes(), vec![path]);
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the remove dropped the record it named"
+    );
+  }
+
+  // The terminal sweep is a `Drop`, so it is not a step of the orderly close
+  // that a cancelled (or panicking) driver task can skip: dropping the driver
+  // future where it stands still reaps every cookie it owns.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cancelled_driver_task_still_sweeps_its_cookies() {
+    let (rig, driver) = cancellable_rig();
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-1-8-5")
+      .await
+      .expect("the write lands");
+    assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
+    assert!(rig.fs.cookie_removes().is_empty());
+
+    // No Close, no orderly tail — the driver future is dropped mid-flight.
+    driver.abort();
+    assert!(
+      driver.await.unwrap_err().is_cancelled(),
+      "the driver was cancelled, not run to completion"
+    );
+
+    // The Drop ran inside the cancellation, before the join resolved.
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      vec![path],
+      "a cancelled driver still sweeps the cookies it owns"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no cookie outlives the driver that wrote it"
+    );
+  }
+
+  // The write-versus-sweep race, from the far side: the driver is ALREADY GONE
+  // when the write creates its file, so the sweep it should have been caught by
+  // ran before the file existed — and there is no driver left to tell about it.
+  // The shutdown flag is the whole handshake: raised before the sweep takes the
+  // paths, checked by the write as it hands its file over, so the write reaps
+  // itself. Nothing else can: this file would otherwise outlive the process's
+  // watcher with no channel left to ask for its removal.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_write_landing_after_the_driver_is_gone_reaps_itself() {
+    let (rig, driver) = cancellable_rig();
+    let scope = watch(&rig, "/r").await;
+
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-1-8-6").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      1,
+      "the write is in the pool, its file not yet created"
+    );
+
+    // The driver dies UNDER the in-flight write: its sweep finds an empty
+    // registry (nothing is recorded until a write lands), and it is not around
+    // to be told about what happens next.
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
+    assert!(
+      rig.fs.cookie_writes().is_empty(),
+      "the sweep ran before the file existed — it had nothing to unlink"
+    );
+
+    hold.release();
+    assert!(
+      matches!(
+        on_reply.await.expect("the write still answers its caller"),
+        Err(crate::error::SyncRootError::Retired)
+      ),
+      "a barrier no live driver could report is refused"
+    );
+
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      rig.fs.cookie_writes(),
+      "the write reaped the file it created after its driver was gone"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no dispatched write can outlive the registry that dispatched it"
+    );
+  }
+
+  // The containing-directory fallback may never climb ABOVE the root. The
+  // watcher proves `dir` is inside the root, so the parent of a `dir` strictly
+  // under it is inside it too — but the ROOT's parent is not, and a root that
+  // died under an in-flight sync is exactly a `dir` that is no longer a
+  // directory. Unclamped, that sync would drop a cookie in the root's parent:
+  // outside the watched tree, unreportable, and litter in someone else's
+  // directory. The typed failure is the honest answer instead.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cookie_never_climbs_above_the_root() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    // The root's parent is a perfectly good directory — which is exactly the
+    // hazard: nothing but the floor stops the fallback from writing into it.
+    rig.fs.put("/", FileKind::Dir, 99);
+
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-1-8-7").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+
+    // The root dies under the parked write, before the driver has processed its
+    // death — the window in which the write still believes the scope is live.
+    rig.fs.remove("/r");
+    hold.release();
+
+    match on_reply.await.expect("the driver replies") {
+      Err(crate::error::SyncRootError::Write { path, source }) => {
+        assert_eq!(
+          path,
+          PathBuf::from("/r/.tributaries-sync-1-8-7"),
+          "the refusal names the location the caller asked for"
+        );
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+      }
+      other => panic!("expected a typed write refusal, got {other:?}"),
+    }
+    assert!(
+      rig.fs.cookie_writes().is_empty(),
+      "no cookie was created for a root that is gone"
+    );
+    assert!(
+      rig.fs.files_under("/").is_empty(),
+      "and nothing landed ABOVE the root, where no event could ever report it"
     );
   }
 }

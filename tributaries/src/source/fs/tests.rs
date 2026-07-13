@@ -754,6 +754,25 @@ mod integration {
       "the stale same-handle snapshot was REMOVED, never re-forwarded (latest-wins, clause 6)"
     );
 
+    // A `replace` SUPERSEDES the handle's queued prune as well. The retarget re-covers the root,
+    // so a snapshot holding the OLD retained set is stale — re-forwarded after the replace
+    // committed, it would narrow the re-covered root back to the old subtree, a silent coverage
+    // loss with no `Rescan` to redeem it.
+    let (_dir_moved, moved) = scratch();
+    source.defer_prune(armed.handle(), vec![drop_dir.clone()]);
+    source
+      .replace(armed.handle(), &path_components(&moved))
+      .await
+      .expect("retarget the root");
+    assert!(
+      source.deferred_prunes.is_empty(),
+      "the replace superseded the handle's queued prune"
+    );
+    assert_eq!(
+      source.deferred_forwards, 0,
+      "the superseded prune was REMOVED, never re-forwarded around the replace"
+    );
+
     // A deferred prune IS re-forwarded at the next watcher-touching op on OTHER handles
     // (clause 3): an unrelated arm flushes it.
     source.defer_prune(armed.handle(), vec![keep.clone()]);
