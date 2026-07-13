@@ -330,6 +330,13 @@ pub(crate) enum Command {
     /// grace — 0 means native-stream quiescence was proven.
     reply: futures_channel::oneshot::Sender<usize>,
   },
+  /// A test-only snapshot of per-scope bookkeeping the suites assert is
+  /// reclaimed on teardown (the live delivery-lane count), so a leak of that
+  /// state under watch/unwatch churn is provable rather than inferred.
+  #[cfg(test)]
+  DebugLaneCount {
+    reply: futures_channel::oneshot::Sender<usize>,
+  },
 }
 
 /// Lowers a refused cover reconcile to the public outcome — answered at
@@ -1355,7 +1362,12 @@ pub(crate) async fn run<R, F>(
   // not the fd. A grant here resolves at `WatchInstalled`, at stream
   // teardown (the scope died first), or by dropping at close (`Closed`).
   let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
-  let mut unwatch_replies: BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>> =
+  // Awaited unwatch replies parked until the scope is fully quiescent, each
+  // paired with the verdict to send then: `true` for a live scope this
+  // unwatch tears down, `false` (UnknownRoot) for a scope whose root already
+  // died while a replacement was still resolving — the reply still waits for
+  // that replacement's teardown, but reports the scope gone.
+  let mut unwatch_replies: BTreeMap<ScopeId, (futures_channel::oneshot::Sender<bool>, bool)> =
     BTreeMap::new();
   // Awaited set-cover acknowledgements parked under their settlement fences
   // (see `Command::SetCover`): resolved by `resolve_cover_settlements` at the
@@ -1378,7 +1390,7 @@ pub(crate) async fn run<R, F>(
       &mut pending_spawns,
       &mut pending_teardowns,
       &mut scope_backends,
-      &lanes,
+      &mut lanes,
       &events,
       &mut unwatch_replies,
       &mut deferred_grants,
@@ -1445,9 +1457,9 @@ pub(crate) async fn run<R, F>(
                     &pending_spawns,
                     &pending_teardowns,
                     &replace_states,
-                  ) && let Some(reply) = unwatch_replies.remove(&scope)
+                  ) && let Some((reply, verdict)) = unwatch_replies.remove(&scope)
                   {
-                    let _ = reply.send(true);
+                    let _ = reply.send(verdict);
                   }
                   continue;
                 }
@@ -1774,9 +1786,9 @@ pub(crate) async fn run<R, F>(
               &pending_spawns,
               &pending_teardowns,
               &replace_states,
-            ) && let Some(reply) = unwatch_replies.remove(&scope)
+            ) && let Some((reply, verdict)) = unwatch_replies.remove(&scope)
             {
-              let _ = reply.send(true);
+              let _ = reply.send(verdict);
             }
           }
         }
@@ -1836,15 +1848,30 @@ pub(crate) async fn run<R, F>(
         }
         Ok(Command::Unwatch { scope, reply }) => {
           if handles.contains_key(&scope) || watch_replies.contains_key(&scope) {
-            // The awaited form records its waiter (answered at scope-dead); the reply-less
-            // `request_unwatch` tears down identically but registers none.
+            // A live scope: the awaited form records its waiter (answered at
+            // quiescence with `true`); the reply-less `request_unwatch` tears
+            // down identically but registers none.
             if let Some(reply) = reply {
-              unwatch_replies.insert(scope, reply);
+              unwatch_replies.insert(scope, (reply, true));
             }
             core.on_unwatch(scope);
+          } else if pending_spawns.contains(&scope)
+            || pending_teardowns.contains_key(&scope)
+            || replace_states.contains_key(&scope)
+          {
+            // The live handle already died (root death / fatal) but the scope
+            // is NOT yet quiescent — a replacement is still spawning or
+            // pre-arming, or a teardown is still draining. The death path
+            // already tore the original stream down and a replacement resolves
+            // to `Retired` and is torn down; there is nothing more to trigger.
+            // Park the reply for quiescence rather than reporting the scope
+            // gone while a native stream is still coming up, and answer
+            // UnknownRoot (`false`) — the root died.
+            if let Some(reply) = reply {
+              unwatch_replies.insert(scope, (reply, false));
+            }
           } else if let Some(reply) = reply {
-            // Unknown scope: only the awaited form is answered — the reply-less request is
-            // fire-and-forget, so a no-op teardown is silently complete.
+            // Genuinely unknown: never watched, or already fully quiesced.
             let _ = reply.send(false);
           }
         }
@@ -1874,6 +1901,10 @@ pub(crate) async fn run<R, F>(
           }
         }
         Ok(Command::Close { reply }) => break Some(reply),
+        #[cfg(test)]
+        Ok(Command::DebugLaneCount { reply }) => {
+          let _ = reply.send(lanes.len());
+        }
         // The watcher facade dropped: same orderly teardown, nobody to tell.
         Err(_) => break None,
       },
@@ -1968,9 +1999,9 @@ pub(crate) async fn run<R, F>(
           // the two obligations that can still be outstanding in the drain.
           if !pending_spawns.contains(&scope)
             && !pending_teardowns.contains_key(&scope)
-            && let Some(reply) = unwatch_replies.remove(&scope)
+            && let Some((reply, verdict)) = unwatch_replies.remove(&scope)
           {
-            let _ = reply.send(true);
+            let _ = reply.send(verdict);
           }
         }
         Ok(OpResult::Probed { probe, outcome }) => core.on_probe_result(probe, outcome, now()),
@@ -2026,7 +2057,7 @@ pub(crate) async fn run<R, F>(
     &mut pending_spawns,
     &mut pending_teardowns,
     &mut scope_backends,
-    &lanes,
+    &mut lanes,
     &events,
     &mut unwatch_replies,
     &mut deferred_grants,
@@ -2208,9 +2239,9 @@ fn execute_effects<R, F>(
   pending_spawns: &mut BTreeSet<ScopeId>,
   pending_teardowns: &mut BTreeMap<ScopeId, usize>,
   scope_backends: &mut BTreeMap<ScopeId, BackendKind>,
-  lanes: &BTreeMap<ScopeId, u64>,
+  lanes: &mut BTreeMap<ScopeId, u64>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
-  unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
+  unwatch_replies: &mut BTreeMap<ScopeId, (futures_channel::oneshot::Sender<bool>, bool)>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
@@ -2246,6 +2277,12 @@ fn execute_effects<R, F>(
       }
       Effect::TeardownStream { scope } => {
         scope_backends.remove(&scope);
+        // The delivery lane (the transport generation) is reclaimed with the
+        // scope — scope ids are never reused, so leaving it would grow `lanes`
+        // unbounded under ordinary watch/unwatch churn. A late control batch
+        // for the gone scope then resolves no lane and refuses (the `u64::MAX`
+        // sentinel), exactly the right answer for a torn-down transport.
+        lanes.remove(&scope);
         // Every scope end — explicit unwatch, root death, stream fatal —
         // funnels through this effect: reclaim the registry entry, so a dead
         // root stops participating in liveness checks immediately. The arm
@@ -2269,9 +2306,9 @@ fn execute_effects<R, F>(
             handle.shutdown();
             let _ = tx.try_send(OpResult::TornDown { scope });
           });
-        } else if let Some(reply) = unwatch_replies.remove(&scope) {
+        } else if let Some((reply, verdict)) = unwatch_replies.remove(&scope) {
           // No stream ever existed (a failed spawn); the unwatch is complete.
-          let _ = reply.send(true);
+          let _ = reply.send(verdict);
         }
       }
       Effect::AddWatch {
