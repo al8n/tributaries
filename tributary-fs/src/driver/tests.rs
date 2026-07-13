@@ -3433,6 +3433,79 @@ mod replace {
     settle(|| rig.fs.shutdowns() == 1).await;
   }
 
+  /// Close must resolve a parked unwatch even when the last obligation is a
+  /// FAILED replacement spawn — which enqueues no teardown. The drain's
+  /// spawn arm re-checks quiescence (like the live loop's), so the waiter
+  /// gets its recorded verdict instead of dropping as `Closed` (a false
+  /// driver-death report despite a clean teardown).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_resolves_a_parked_unwatch_when_the_replacement_spawn_fails() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // A replacement spawn that WILL fail (/missing is not in the fake tree),
+    // held so Close begins while it is still in flight.
+    let gate = rig.fs.hold_spawns();
+    let (rep_reply, on_replace) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/missing"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from(
+          "/missing",
+        )),
+        reply: rep_reply,
+      })
+      .await
+      .unwrap();
+    for _ in 0..8 {
+      tokio::task::yield_now().await;
+    }
+
+    // An awaited unwatch parks its waiter (handle still present → verdict
+    // `true`); its own teardown completes but the waiter stays held on the
+    // in-flight spawn.
+    let (uw_reply, on_unwatch) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(uw_reply),
+      })
+      .await
+      .unwrap();
+    settle(|| rig.fs.shutdowns() == 1).await;
+
+    // Close begins while the failing spawn is still held.
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Release: the spawn fails, the drain reaches quiescence, and the parked
+    // unwatch resolves with its VERDICT, never a channel closure.
+    gate.release();
+    assert!(on_close.await.is_ok(), "close settles");
+    assert!(
+      on_unwatch
+        .await
+        .expect("the waiter is answered, not dropped as Closed"),
+      "the unwatch resolves its recorded verdict"
+    );
+    // The abandoned replace caller is resolved (its reservation and reply
+    // dropped at the close sweep), never left hanging.
+    let replace_outcome = on_replace.await;
+    assert!(
+      replace_outcome.is_err() || matches!(replace_outcome, Ok(Err(_))),
+      "{replace_outcome:?}"
+    );
+  }
+
   /// Whole-scope teardown reclaims the delivery lane: repeated watch/unwatch
   /// churn leaves no lane entry behind, so `lanes` stays bounded for the
   /// driver's lifetime (scope ids never recycle).

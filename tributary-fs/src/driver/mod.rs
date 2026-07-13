@@ -2071,6 +2071,14 @@ pub(crate) async fn run<R, F>(
               let _ = tx.try_send(OpResult::TornDown { scope });
             });
           }
+          // A FAILED spawn enqueues no teardown, so — exactly as the live
+          // loop's spawn-failed arm does — a parked unwatch waiting on this
+          // scope would otherwise never be re-checked and would drop as
+          // `Closed` at return. Resolve it here if the failed spawn was the
+          // scope's last obligation.
+          if !pending_spawns.contains(&scope) && !pending_teardowns.contains_key(&scope) {
+            resolve_unwatch_waiters(&mut unwatch_replies, scope);
+          }
         }
         // A pre-arm outcome for a replace the close sweep already retired:
         // nothing left to commit or unwind.
