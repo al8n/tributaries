@@ -192,8 +192,11 @@ pub enum SyncRootError {
     #[source]
     source: std::io::Error,
   },
-  /// The root died (or was unwatched) while the cookie write was parked on
-  /// the coverage-settle fence.
+  /// The barrier outlived the coverage it was to be written under: the root died (or was
+  /// unwatched) while the write was parked on the coverage-settle fence, or the scope retired —
+  /// or the driver itself shut down — while the write was already in flight. In the latter cases
+  /// the cookie file is unlinked again before this is reported, so a refused barrier never leaves
+  /// a marker behind.
   #[error("the root died while the sync cookie was pending")]
   Retired,
   /// The watcher is closed.

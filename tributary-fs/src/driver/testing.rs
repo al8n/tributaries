@@ -109,6 +109,14 @@ struct FakeState {
   /// When set, every cookie write fails with this error kind (the read-only
   /// tree, modeled).
   cookie_write_failure: Mutex<Option<std::io::ErrorKind>>,
+  /// Cookie writes that reached the blocking pool, counted before any hold — the
+  /// observable that a write is IN FLIGHT, which is what a cell racing a
+  /// retirement or an abandoned reply against it must wait for.
+  cookie_dispatches: AtomicUsize,
+  /// When set, `write_cookie` parks until the gate releases: the window in which
+  /// a test retires the scope, drops the reply, or tears the driver down while
+  /// the write is still in the pool.
+  cookie_write_hold: Mutex<Option<HoldGate>>,
   /// The resume point every live fake handle mints — the journal-bearing
   /// backends' `SourceControl::resume_token`, modeled.
   resume_token: Mutex<Option<crate::os::ResumeToken>>,
@@ -167,6 +175,8 @@ impl Default for FakeState {
       cookie_writes: Mutex::default(),
       cookie_removes: Mutex::default(),
       cookie_write_failure: Mutex::default(),
+      cookie_dispatches: AtomicUsize::new(0),
+      cookie_write_hold: Mutex::default(),
       resume_token: Mutex::default(),
       spawn_resume_points: Mutex::default(),
       stale_arms: Mutex::default(),
@@ -540,6 +550,21 @@ impl FakeFs {
   /// Fails every subsequent cookie write with `kind` — the read-only tree.
   pub(crate) fn fail_cookie_writes(&self, kind: std::io::ErrorKind) {
     *self.state.cookie_write_failure.lock().unwrap() = Some(kind);
+  }
+
+  /// Cookie writes dispatched to the pool so far (counted before any hold), so a
+  /// cell can prove a write is IN FLIGHT before racing something against it.
+  pub(crate) fn cookie_dispatches(&self) -> usize {
+    self.state.cookie_dispatches.load(Ordering::SeqCst)
+  }
+
+  /// Holds every subsequent cookie write in the blocking pool until the returned
+  /// gate is released — the window a retirement, an abandoned reply, or a driver
+  /// teardown races the write in.
+  pub(crate) fn hold_cookie_writes(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.cookie_write_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
   }
 
   /// Makes every live fake handle mint `token` as its resume point — a
@@ -990,11 +1015,40 @@ impl FsOps for FakeFs {
     self.arm_one(scope, watch, watch, path, name, expected)
   }
 
-  fn write_cookie(&self, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
-    let path = dir.join(name);
+  fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
+    // The dispatch is counted BEFORE the hold: a cell that must race a scope
+    // retirement (or an abandoned reply) against a write in flight needs to know
+    // the write is parked in the pool, not still queued behind its settle fence.
+    self.state.cookie_dispatches.fetch_add(1, Ordering::SeqCst);
+    self.park_on(&self.state.cookie_write_hold);
     if let Some(kind) = *self.state.cookie_write_failure.lock().unwrap() {
       return Err(std::io::Error::new(kind, "cookie write refused"));
     }
+    // The real `cookie_dir` resolution, mirrored: a covered FILE subscription's
+    // key names a file, so the cookie lands BESIDE it rather than failing ENOTDIR
+    // inside it — and never above the root, whose own parent is outside the tree.
+    // The lock is released before the `put` below re-takes it.
+    let path = {
+      let nodes = self.state.nodes.lock().unwrap();
+      let target = match nodes.get(dir) {
+        Some(node) if node.kind.is_dir() => dir,
+        _ => match dir.parent() {
+          Some(parent) if parent.starts_with(root) => parent,
+          _ => dir,
+        },
+      };
+      // A real `create_new` fails when the containing directory is not there (or
+      // is not one): ENOENT/ENOTDIR. The fake refuses too, or a cell could
+      // "place a barrier" into thin air — a root that died under an in-flight
+      // sync is exactly that case.
+      if !nodes.get(target).is_some_and(|node| node.kind.is_dir()) {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::NotFound,
+          "the cookie directory is gone",
+        ));
+      }
+      target.join(name)
+    };
     // The cookie is a real object in the fake tree, exactly as a real create
     // is: a test can then inject its kernel event like any other file's.
     let ino = self.state.wd_seq.fetch_add(1, Ordering::SeqCst) as u64 + 9000;
