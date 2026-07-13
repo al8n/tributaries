@@ -1487,6 +1487,13 @@ impl DriverCore {
     state.park.queued.clear();
     Self::trust_lost(&mut self.effects, scope, state);
     self.probes.retain(|_, ctx| ctx.scope != scope);
+    // Old-world enumerate contexts are dominated too: a descending replace's
+    // in-flight reads will never return (their Monitor slots are dropped by
+    // `rebind_root` below), and a late result would otherwise lower against
+    // the NEW world before the Monitor rejects its now-unknown request.
+    // Reclaim them exactly as teardown does; the rebuild's fresh reads are
+    // recorded below in `drain_monitor`.
+    self.enum_reqs.retain(|_, (s, _)| *s != scope);
     // Descending: the per-directory book was built on the retired
     // transport — rebind it (children dropped, root reset to a counted
     // re-arm) BEFORE the overflow cut, whose re-arm kickoff then folds into

@@ -488,11 +488,13 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// is caught at the refresh cadence without any new timer or effect.
   fn refresh_mounts(&self, root: &Path) -> MountRefresh;
 
-  /// Attaches the arm/disarm port of `scope`'s freshly spawned source, so the
-  /// descending executors can route to its reader. A no-op for executors
-  /// (fakes) that answer arms themselves.
-  fn attach_scope(&self, scope: ScopeId, port: ScopePort) {
-    let _ = (scope, port);
+  /// Attaches the arm/disarm port of `scope`'s freshly spawned source under
+  /// its transport `generation` (the delivery lane), so the descending
+  /// executors can route to its reader AND recognize a control batch left
+  /// over from a prior transport. A no-op for executors (fakes) that answer
+  /// arms themselves.
+  fn attach_scope(&self, scope: ScopeId, port: ScopePort, generation: u64) {
+    let _ = (scope, port, generation);
   }
 
   /// Detaches `scope`'s port (and any transient state keyed under it) at
@@ -522,12 +524,18 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// [`add_watch`](Self::add_watch)/[`remove_watch`](Self::remove_watch) — the
   /// right shape for a fake with no transport; the real inotify source
   /// overrides it to ship the whole batch as ONE control message so N arms cost
-  /// at most one reader wake.
+  /// at most one reader wake. `generation` is the transport generation the
+  /// batch was emitted for; the real source refuses a batch whose generation
+  /// no longer matches the attached port (a leftover of a replaced
+  /// transport). The default ignores it — a fake answers arms itself and has
+  /// no transport to leak.
   fn batch_control(
     &self,
     scope: ScopeId,
+    generation: u64,
     requests: Vec<ControlRequest>,
   ) -> Vec<(WatchId, WatchOutcome)> {
+    let _ = generation;
     let mut outcomes = Vec::new();
     for request in requests {
       match request {
@@ -791,9 +799,14 @@ fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
 pub(crate) struct RealFs {
   /// Per-scope arm/disarm ports of live descending sources, attached at
   /// spawn success and detached at stream teardown. Kernel-recursive scopes
-  /// attach `Inert` and never route arm traffic.
+  /// attach `Inert` and never route arm traffic. Each port carries the
+  /// TRANSPORT GENERATION it was attached under (the scope's delivery lane):
+  /// a control batch is dispatched with the generation current at emission,
+  /// and a batch whose generation no longer matches the attached port is
+  /// stale — a leftover of the pre-replace transport — and must not arm the
+  /// replacement's fd nor publish an anchor into the swapped scope.
   #[cfg(all(target_os = "linux", not(miri)))]
-  ports: std::sync::Arc<std::sync::RwLock<BTreeMap<ScopeId, ScopePort>>>,
+  ports: std::sync::Arc<std::sync::RwLock<BTreeMap<ScopeId, (u64, ScopePort)>>>,
   /// Transient `O_PATH` anchors returned by arms (keyed by the globally
   /// unique watch, valued with the owning scope for teardown reclamation),
   /// held only until the watch's cold enumerate consumes them
@@ -806,6 +819,21 @@ pub(crate) struct RealFs {
 impl RealFs {
   pub(crate) fn new() -> Self {
     Self::default()
+  }
+
+  /// The transport generation currently attached for `scope`, or a sentinel
+  /// (`u64::MAX`) when no descending port is attached — a value no real lane
+  /// generation reaches, so a control op resolving it fails the front-check
+  /// and refuses rather than arming a nonexistent transport.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn current_generation(&self, scope: ScopeId) -> u64 {
+    self
+      .ports
+      .read()
+      .unwrap()
+      .get(&scope)
+      .map(|(generation, _)| *generation)
+      .unwrap_or(u64::MAX)
   }
 
   /// Builds one arm request, resolving the parent's still-held transient anchor
@@ -929,20 +957,25 @@ impl FsOps for RealFs {
     }
   }
   #[cfg(all(target_os = "linux", not(miri)))]
-  fn attach_scope(&self, scope: ScopeId, port: ScopePort) {
-    self.ports.write().unwrap().insert(scope, port);
+  fn attach_scope(&self, scope: ScopeId, port: ScopePort, generation: u64) {
+    self
+      .ports
+      .write()
+      .unwrap()
+      .insert(scope, (generation, port));
   }
 
   #[cfg(all(target_os = "linux", not(miri)))]
   fn detach_scope(&self, scope: ScopeId) {
+    // Purge the port AND this scope's anchors under the anchors lock held
+    // across both: a concurrent `batch_control` publishes an anchor only
+    // while holding this same lock and only after re-confirming the port's
+    // generation, so it cannot slip a fresh anchor in AFTER this purge (it
+    // would find the generation already gone). Lock order everywhere is
+    // anchors-then-ports.
+    let mut anchors = self.anchors.lock().unwrap();
     self.ports.write().unwrap().remove(&scope);
-    // In-flight transient anchors of the dead scope close here; their
-    // enumerates (if any still land) fall back to path-based listing.
-    self
-      .anchors
-      .lock()
-      .unwrap()
-      .retain(|_, (anchor_scope, _)| *anchor_scope != scope);
+    anchors.retain(|_, (anchor_scope, _)| *anchor_scope != scope);
   }
 
   // Arm/disarm route through the live source's control path (the reader owns
@@ -959,9 +992,14 @@ impl FsOps for RealFs {
     name: &Segment,
     expected: Option<ExpectedObject>,
   ) -> WatchOutcome {
+    // A direct single arm runs against the CURRENT transport (the caller is
+    // synchronous, not a leftover batch), so it adopts the attached
+    // generation rather than one captured earlier.
+    let generation = self.current_generation(scope);
     self
       .batch_control(
         scope,
+        generation,
         vec![ControlRequest::Arm {
           watch,
           parent,
@@ -991,7 +1029,8 @@ impl FsOps for RealFs {
 
   #[cfg(all(target_os = "linux", not(miri)))]
   fn remove_watch(&self, scope: ScopeId, watch: WatchId) {
-    self.batch_control(scope, vec![ControlRequest::Disarm { watch }]);
+    let generation = self.current_generation(scope);
+    self.batch_control(scope, generation, vec![ControlRequest::Disarm { watch }]);
   }
 
   #[cfg(not(all(target_os = "linux", not(miri))))]
@@ -1005,23 +1044,31 @@ impl FsOps for RealFs {
   fn batch_control(
     &self,
     scope: ScopeId,
+    generation: u64,
     requests: Vec<ControlRequest>,
   ) -> Vec<(WatchId, WatchOutcome)> {
     use crate::os::linux::ControlOp;
 
-    let Some(ScopePort::Inotify(port)) = self.ports.read().unwrap().get(&scope).cloned() else {
-      // No live descending port (a kernel-recursive source, or an arm racing
-      // its own stream teardown): every arm answers the honest typed refusal,
-      // and disarms — whose kernel watches die with the closing fd — no-op.
-      return requests
-        .iter()
-        .filter_map(|request| match request {
-          ControlRequest::Arm { watch, .. } => {
-            Some((*watch, WatchOutcome::Failed(WatchError::Gone)))
-          }
-          ControlRequest::Disarm { .. } => None,
-        })
-        .collect();
+    // GENERATION FRONT-CHECK: a batch whose generation no longer matches the
+    // attached port is a leftover of a transport a replace has since
+    // retired. Its arms must NOT install on the replacement's fd (they name
+    // old-world paths), and its disarms are moot (their kernel watches died
+    // with the old fd). The one live case that also lands here is a
+    // kernel-recursive or teardown-racing scope with no descending port —
+    // both refuse identically.
+    let port = match self.ports.read().unwrap().get(&scope) {
+      Some((attached, ScopePort::Inotify(port))) if *attached == generation => port.clone(),
+      _ => {
+        return requests
+          .iter()
+          .filter_map(|request| match request {
+            ControlRequest::Arm { watch, .. } => {
+              Some((*watch, WatchOutcome::Failed(WatchError::Gone)))
+            }
+            ControlRequest::Disarm { .. } => None,
+          })
+          .collect();
+      }
     };
 
     // Build the control ops in emission order, remembering each arm's watch so
@@ -1052,12 +1099,26 @@ impl FsOps for RealFs {
     }
 
     let replies = port.batch(ops);
-    // Store each arm's returned transient anchor (held until its cold enumerate
-    // consumes it) and pair its outcome with its watch.
+    // Publish each arm's transient anchor (held until its cold enumerate
+    // consumes it) under the anchors lock, re-confirming the generation still
+    // matches WHILE holding it. A replace committing during `port.batch`
+    // above swaps the port under a NEW generation; without this re-check a
+    // late insert would resurrect an anchor `detach_scope` just purged. The
+    // lock is held across the ports read so the check and the insert are
+    // atomic against `detach_scope` (which purges under the same lock).
     let mut outcomes = Vec::with_capacity(arm_watches.len());
+    let mut anchors = self.anchors.lock().unwrap();
+    let still_current = self
+      .ports
+      .read()
+      .unwrap()
+      .get(&scope)
+      .is_some_and(|(attached, _)| *attached == generation);
     for (watch, reply) in arm_watches.into_iter().zip(replies) {
-      if let Some(anchor) = reply.anchor {
-        self.anchors.lock().unwrap().insert(watch, (scope, anchor));
+      if let Some(anchor) = reply.anchor
+        && still_current
+      {
+        anchors.insert(watch, (scope, anchor));
       }
       outcomes.push((watch, reply.outcome));
     }
@@ -1317,6 +1378,7 @@ pub(crate) async fn run<R, F>(
       &mut pending_spawns,
       &mut pending_teardowns,
       &mut scope_backends,
+      &lanes,
       &events,
       &mut unwatch_replies,
       &mut deferred_grants,
@@ -1371,6 +1433,22 @@ pub(crate) async fn run<R, F>(
                   let _ = replace
                     .reply
                     .send(Err(crate::error::ReplaceRootError::Source(err)));
+                  // A failed replacement spawn is the one resolution that
+                  // enqueues NO teardown (there is nothing to retire), so a
+                  // concurrent unwatch waiting on this scope would never be
+                  // re-checked by a TornDown — resolve it here if the failed
+                  // spawn was the last obligation. Every other resolution
+                  // ends in a counted teardown whose TornDown re-checks.
+                  if scope_quiesced(
+                    scope,
+                    &handles,
+                    &pending_spawns,
+                    &pending_teardowns,
+                    &replace_states,
+                  ) && let Some(reply) = unwatch_replies.remove(&scope)
+                  {
+                    let _ = reply.send(true);
+                  }
                   continue;
                 }
               };
@@ -1508,18 +1586,21 @@ pub(crate) async fn run<R, F>(
                 }
               } else {
                 core.on_stream_spawned(scope, Ok(spawned.meta));
+                // Mint the transport generation (the delivery lane) FIRST so
+                // the port attaches under it: the descending root's first
+                // AddWatch is dispatched carrying this same generation.
+                let lane = next_lane;
+                next_lane += 1;
+                lanes.insert(scope, lane);
                 // The arm/disarm port attaches before any effect of this
                 // spawn can execute, so a descending root's first AddWatch
-                // always finds its scope routed.
-                ops.attach_scope(scope, spawned.handle.scope_port());
+                // always finds its scope routed under the current generation.
+                ops.attach_scope(scope, spawned.handle.scope_port(), lane);
                 // The live stats handle (fanotify only) is captured before the
                 // handle is stored, so the registry can hand a `backend_stats`
                 // query the same counters the reader writes.
                 let stats = spawned.handle.backend_stats();
                 handles.insert(scope, spawned.handle);
-                let lane = next_lane;
-                next_lane += 1;
-                lanes.insert(scope, lane);
                 os.push(
                   spawned
                     .receiver
@@ -1683,12 +1764,17 @@ pub(crate) async fn run<R, F>(
                 pending_teardowns.remove(&scope);
               }
             }
-            // The unwatch fence is per-scope QUIESCENCE: a replace can leave
-            // an old or refused stream shutting down beside the current one,
-            // and an earlier straggler's completion must not resolve the
-            // unwatch while the stream unwatch retired is still going down.
-            if !pending_teardowns.contains_key(&scope)
-              && let Some(reply) = unwatch_replies.remove(&scope)
+            // The unwatch fence is per-scope QUIESCENCE across EVERY native
+            // obligation — a straggler teardown, a replacement still
+            // spawning or pre-arming, or a committed handle — not merely the
+            // one stream this TornDown retired.
+            if scope_quiesced(
+              scope,
+              &handles,
+              &pending_spawns,
+              &pending_teardowns,
+              &replace_states,
+            ) && let Some(reply) = unwatch_replies.remove(&scope)
             {
               let _ = reply.send(true);
             }
@@ -1852,10 +1938,11 @@ pub(crate) async fn run<R, F>(
   }
   // A descending replace's pre-arm holds a spawned-but-uncommitted stream
   // the maps above no longer cover: retire it inside the same accounting.
-  // The caller's reply drops with `replace_states` at return — `Closed`.
-  for (scope, replace) in replace_states.iter_mut() {
+  // Drain `replace_states` whole so the scope-quiescence fence below no
+  // longer counts these as outstanding replace obligations; each entry's
+  // reservation and reply drop here — the caller sees `Closed`.
+  for (scope, mut replace) in std::mem::take(&mut replace_states) {
     if let Some(spawned) = replace.arming.take() {
-      let scope = *scope;
       *pending_teardowns.entry(scope).or_insert(0) += 1;
       let tx = op_tx.clone();
       R::spawn_blocking_detach(move || {
@@ -1874,8 +1961,13 @@ pub(crate) async fn run<R, F>(
               pending_teardowns.remove(&scope);
             }
           }
-          // The same per-scope quiescence fence as the live arm.
-          if !pending_teardowns.contains_key(&scope)
+          // The same per-scope quiescence fence as the live arm. Close has
+          // already drained `handles` and `replace_states` (both provably
+          // empty here), and referencing the non-`Sync` handle map inside
+          // this future would poison its `Send`ness — so the fence reduces to
+          // the two obligations that can still be outstanding in the drain.
+          if !pending_spawns.contains(&scope)
+            && !pending_teardowns.contains_key(&scope)
             && let Some(reply) = unwatch_replies.remove(&scope)
           {
             let _ = reply.send(true);
@@ -1934,6 +2026,7 @@ pub(crate) async fn run<R, F>(
     &mut pending_spawns,
     &mut pending_teardowns,
     &mut scope_backends,
+    &lanes,
     &events,
     &mut unwatch_replies,
     &mut deferred_grants,
@@ -1949,6 +2042,25 @@ pub(crate) async fn run<R, F>(
   if let Some(reply) = close_reply {
     let _ = reply.send(pending_teardowns.values().sum::<usize>() + pending_spawns.len());
   }
+}
+
+/// Whether `scope` holds NO outstanding native obligation — no live handle,
+/// no spawn in flight, no counted teardown, and no replace mid-commit. This
+/// is the unwatch fence: a replace can leave the current handle down while a
+/// replacement is still spawning or pre-arming (and will itself end in a
+/// counted teardown), so the unwatch reply must wait for the whole scope to
+/// go quiet, not merely for the one stream the unwatch retired.
+fn scope_quiesced<H>(
+  scope: ScopeId,
+  handles: &BTreeMap<ScopeId, H>,
+  pending_spawns: &BTreeSet<ScopeId>,
+  pending_teardowns: &BTreeMap<ScopeId, usize>,
+  replace_states: &BTreeMap<ScopeId, ReplaceState<H>>,
+) -> bool {
+  !handles.contains_key(&scope)
+    && !pending_spawns.contains(&scope)
+    && !pending_teardowns.contains_key(&scope)
+    && !replace_states.contains_key(&scope)
 }
 
 /// Retires a spawned-but-refused replacement stream inside the counted
@@ -2045,14 +2157,17 @@ where
       let _ = tx.try_send(OpResult::TornDown { scope });
     });
   }
-  ops.detach_scope(scope);
-  ops.attach_scope(scope, spawned.handle.scope_port());
-  let backend = spawned.meta.backend;
-  let stats = spawned.handle.backend_stats();
-  handles.insert(scope, spawned.handle);
+  // Mint the replacement's transport generation FIRST, then detach the old
+  // port and attach the new one under it: any old-generation control batch
+  // still in flight now fails the front-check against this newer generation.
   let lane = *next_lane;
   *next_lane += 1;
   lanes.insert(scope, lane);
+  ops.detach_scope(scope);
+  ops.attach_scope(scope, spawned.handle.scope_port(), lane);
+  let backend = spawned.meta.backend;
+  let stats = spawned.handle.backend_stats();
+  handles.insert(scope, spawned.handle);
   os.push(
     spawned
       .receiver
@@ -2093,6 +2208,7 @@ fn execute_effects<R, F>(
   pending_spawns: &mut BTreeSet<ScopeId>,
   pending_teardowns: &mut BTreeMap<ScopeId, usize>,
   scope_backends: &mut BTreeMap<ScopeId, BackendKind>,
+  lanes: &BTreeMap<ScopeId, u64>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, futures_channel::oneshot::Sender<bool>>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
@@ -2237,12 +2353,17 @@ fn execute_effects<R, F>(
   // Dispatch each scope's collected arms/disarms as ONE batch on the blocking
   // pool: the source ships it as a single control message (one potential reader
   // wake for the whole batch), and each arm still feeds back its own
-  // `WatchInstalled`. Disarms are fire-and-forget (no reply).
+  // `WatchInstalled`. Disarms are fire-and-forget (no reply). The scope's
+  // CURRENT transport generation is captured here, at emission, and carried
+  // into the batch: if a replace swaps the transport before this batch runs,
+  // it fails the generation check and neither arms the replacement's fd nor
+  // publishes a stale anchor into the swapped scope.
   for (scope, requests) in control_batches {
     let ops = ops.clone();
     let tx = op_tx.clone();
+    let generation = lanes.get(&scope).copied().unwrap_or(u64::MAX);
     R::spawn_blocking_detach(move || {
-      for (watch, outcome) in ops.batch_control(scope, requests) {
+      for (watch, outcome) in ops.batch_control(scope, generation, requests) {
         let _ = tx.try_send(OpResult::WatchInstalled { watch, outcome });
       }
     });

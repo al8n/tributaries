@@ -2482,7 +2482,7 @@ mod descending {
     rig.fs.put("/r2", FileKind::Dir, 20);
     let scope = watch(&rig, "/r").await;
 
-    let gate = rig.fs.hold_arms();
+    let gate = rig.fs.hold_prearms();
     let (reply, on_reply) = futures_channel::oneshot::channel();
     rig
       .commands
@@ -2565,6 +2565,112 @@ mod descending {
       Err(crate::error::ReplaceRootError::BackendDiverged)
     ));
     settle(|| rig.fs.shutdowns() == 1).await;
+  }
+
+  /// The transport-generation fence: an old-world discovery arm dispatched
+  /// before a descending replace, but completing AFTER the swap, must NOT
+  /// install on the replacement's fd — it names an old-world path and belongs
+  /// to a transport the swap retired. Held on `arm_hold` across the commit
+  /// (whose pre-arm rides its own gate), the batch runs against the new
+  /// generation and is refused, landing nothing on the new transport.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_stale_discovery_arm_across_a_replace_lands_nothing() {
+    const IN_ISDIR: u32 = 0x4000_0000;
+    let rig = inotify_rig();
+    rig.fs.put("/r2", FileKind::Dir, 40);
+    rig.fs.put("/r2/child", FileKind::Dir, 41);
+    let scope = watch(&rig, "/r").await;
+    settle(|| !rig.fs.enumerates().is_empty()).await;
+    let root_watch = rig
+      .fs
+      .enumerates()
+      .first()
+      .map(|(watch, _)| *watch)
+      .expect("the root enumerated");
+
+    // Freeze discovery arms, then discover a new OLD-world directory: its arm
+    // batch is dispatched carrying the current (pre-replace) generation and
+    // parks here.
+    let hold = rig.fs.hold_arms();
+    rig.fs.put("/r/newdir", FileKind::Dir, 30);
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_watch], IN_CREATE | IN_ISDIR, b"newdir")],
+    );
+    for _ in 0..30 {
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+      !rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r/newdir")),
+      "the discovery arm is parked, not yet landed"
+    );
+
+    // Commit the replace: its pre-arm rides `prearm_hold` (not held), so the
+    // swap completes and bumps the transport generation while the discovery
+    // batch is still parked on `arm_hold`.
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(on_reply.await.expect("driver replies").is_ok());
+    settle(|| rig.fs.shutdowns() == 1).await;
+
+    // Release: the parked old-world batch runs against the NEW generation and
+    // is refused, while the rebuild arms the new tree.
+    hold.release();
+    settle(|| {
+      rig
+        .fs
+        .stale_arms()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r/newdir"))
+    })
+    .await;
+    assert!(
+      rig
+        .fs
+        .stale_arms()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r/newdir")),
+      "the stale discovery arm was refused: {:?}",
+      rig.fs.stale_arms()
+    );
+    assert!(
+      !rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r/newdir")),
+      "and it never installed on any transport"
+    );
+    settle(|| {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r2/child"))
+    })
+    .await;
+    assert!(
+      rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r2/child")),
+      "the rebuild armed the new tree on the new transport"
+    );
   }
 }
 
@@ -2911,7 +3017,11 @@ mod replace {
     assert_eq!(rig.fs.shutdowns(), 0, "no stream was torn down");
   }
 
-  #[tokio::test(start_paused = true)]
+  // Real-clock (not start_paused): the replacement spawn is HELD on a blocking
+  // thread across a `settle`, and tokio will not auto-advance paused time while
+  // a blocking task is outstanding — so this cell runs on the multi-thread
+  // runtime where the held thread and the driver make real concurrent progress.
+  #[tokio::test(flavor = "multi_thread")]
   async fn death_wins_a_mid_swap_unwatch() {
     let rig = rig_with_capacity(64);
     rig.fs.put("/r/sub", FileKind::Dir, 2);
@@ -2930,7 +3040,7 @@ mod replace {
       })
       .await
       .unwrap();
-    let (unwatch_reply, on_unwatch) = futures_channel::oneshot::channel();
+    let (unwatch_reply, mut on_unwatch) = futures_channel::oneshot::channel();
     rig
       .commands
       .send(Command::Unwatch {
@@ -2939,7 +3049,12 @@ mod replace {
       })
       .await
       .unwrap();
-    assert!(on_unwatch.await.unwrap(), "the unwatch wins");
+    settle(|| rig.fs.shutdowns() == 1).await;
+    assert!(
+      futures_util::poll!(&mut on_unwatch).is_pending(),
+      "unwatch waits for the held replacement, not just the retired stream"
+    );
+
     gate.release();
     let outcome = on_reply.await.expect("driver replies");
     assert!(
@@ -2947,7 +3062,12 @@ mod replace {
       "death wins: {outcome:?}"
     );
     // Both the old stream (unwatch) and the orphaned replacement are torn
-    // down inside the counted accounting.
+    // down inside the counted accounting; the unwatch resolves only now, at
+    // full scope quiescence.
+    assert!(
+      on_unwatch.await.unwrap(),
+      "the unwatch resolves once the scope is quiescent"
+    );
     settle(|| rig.fs.shutdowns() == 2).await;
   }
 
