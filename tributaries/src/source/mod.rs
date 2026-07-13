@@ -925,13 +925,29 @@ pub struct SyncToken {
   instance: u64,
   pid: u32,
   seq: u64,
+  nonce: u64,
 }
 
 impl SyncToken {
-  /// Mints a token from the owner's instance brand, the process id, and a
-  /// per-owner monotonic sequence number.
-  pub const fn new(instance: u64, pid: u32, seq: u64) -> Self {
-    Self { instance, pid, seq }
+  /// Mints a token from the owner's instance brand, the process id, a
+  /// per-owner monotonic sequence number, and an **unguessable per-sync
+  /// nonce**.
+  ///
+  /// The nonce is load-bearing, not decoration: without it the cookie's name
+  /// is a deterministic function of `(instance, pid, seq)`, so another writer
+  /// under the same tree could predict the next name, create-then-delete it,
+  /// and leave a stale event that a later sync would match — falsely
+  /// completing the barrier ahead of a real pre-call change. An owner-secret
+  /// nonce makes the name unpredictable, so the only event ever carrying a
+  /// sync's key is that sync's own cookie create — which per-source FIFO
+  /// places after every change that happened before it.
+  pub const fn new(instance: u64, pid: u32, seq: u64, nonce: u64) -> Self {
+    Self {
+      instance,
+      pid,
+      seq,
+      nonce,
+    }
   }
 
   /// The owner's process-global instance brand.
@@ -948,6 +964,12 @@ impl SyncToken {
   /// The per-owner monotonic sequence number: unique across concurrent syncs.
   pub const fn seq(&self) -> u64 {
     self.seq
+  }
+
+  /// The unguessable per-sync nonce — the component an external writer cannot
+  /// predict, so it cannot pre-create a colliding marker.
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
   }
 }
 

@@ -91,6 +91,12 @@ pub struct FsSource<R> {
   /// the driver skips the unknown scope). Losslessness is NOT required here (clause 5): entries still
   /// queued at `Drop` are simply dropped — an unpruned root is merely over-broad, self-healing.
   deferred_prunes: HashMap<RootHandle, Vec<PathBuf>>,
+  /// Cookie unlinks the control channel momentarily refused, retried on the
+  /// next watcher-touching op alongside the deferred prunes. Bounded by
+  /// concurrent syncs (the command mailbox bounds those); a hard cap guards
+  /// against pathological churn — past it the oldest unlink is dropped, which
+  /// only leaves one inert namespace-suppressed file behind, never a hang.
+  deferred_cookie_removes: Vec<PathBuf>,
   /// Awaited [`Watcher::set_cover`] round-trips [`grow`](Source::grow) actually performed — proves
   /// the kernel-recursive short-circuit skipped the round-trip.
   #[cfg(test)]
@@ -128,6 +134,7 @@ impl<R: RuntimeLite> FsSource<R> {
       enqueued: Vec::new(),
       pending_set: HashSet::new(),
       deferred_prunes: HashMap::new(),
+      deferred_cookie_removes: Vec::new(),
       #[cfg(test)]
       cover_round_trips: 0,
       #[cfg(test)]
@@ -154,6 +161,16 @@ impl<R> FsSource<R> {
   /// channel still refuses stays queued for the next flush (or is dropped at `Drop` — clause 5,
   /// losslessness not required for a prune).
   fn flush_deferred_prunes(&mut self) {
+    // Retry refused cookie unlinks first — a resolved sync's marker must not
+    // linger. Each is reply-less and idempotent; one the channel still refuses
+    // stays queued for the next flush (or is dropped at the cap / at `Drop`,
+    // leaving only an inert suppressed file).
+    if !self.deferred_cookie_removes.is_empty() {
+      let watcher = &self.watcher;
+      self
+        .deferred_cookie_removes
+        .retain(|path| !watcher.request_remove_cookie(path.clone()));
+    }
     // Split-borrow: the watcher is a shared reborrow so `retain` can mutate the map.
     let watcher = &self.watcher;
     #[cfg(test)]
@@ -575,11 +592,21 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   fn end_sync(&mut self, _handle: RootHandle, cookie_key: &[OsString]) {
-    // Fire-and-forget in the `disarm` mold: a refused (momentarily full)
-    // channel simply drops the reap — the cookie is inert (its events are
-    // suppressed by the namespace forever) and the next sync's leftovers are
-    // reaped opportunistically. Losslessness is not required for an unlink.
-    let _ = self.watcher.request_remove_cookie(key_to_path(cookie_key));
+    // Fire-and-forget in the `disarm` mold. On a momentarily-full channel the
+    // unlink is QUEUED for retry on the next watcher-touching op — not dropped
+    // — so a cookie is not silently leaked; the retry queue is bounded by
+    // concurrent syncs, with a hard cap as a final backstop.
+    const REMOVE_QUEUE_CAP: usize = 4096;
+    let path = key_to_path(cookie_key);
+    self.flush_deferred_prunes();
+    if !self.watcher.request_remove_cookie(path.clone()) {
+      if self.deferred_cookie_removes.len() >= REMOVE_QUEUE_CAP {
+        // Backstop: drop the oldest queued unlink rather than grow without
+        // bound — it leaves one inert, namespace-suppressed file, never a hang.
+        self.deferred_cookie_removes.remove(0);
+      }
+      self.deferred_cookie_removes.push(path);
+    }
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
@@ -706,11 +733,15 @@ const COOKIE_PREFIX: &str = ".tributaries-sync-";
 /// processes (pid) — so a crashed prior process's leftovers collide with
 /// nothing.
 fn cookie_name(token: SyncToken) -> String {
+  // The trailing nonce (lowercase hex) is what makes the name unpredictable to
+  // any other writer — see `SyncToken::new`. `is_sync_artifact` still matches
+  // on the reserved prefix alone, so the whole namespace stays suppressed.
   format!(
-    "{COOKIE_PREFIX}{}-{}-{}",
+    "{COOKIE_PREFIX}{}-{}-{}-{:016x}",
     token.instance(),
     token.pid(),
-    token.seq()
+    token.seq(),
+    token.nonce()
   )
 }
 
