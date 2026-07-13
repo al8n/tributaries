@@ -8,6 +8,32 @@ All notable changes to this workspace are documented here. The format is based o
 
 ### Added
 
+- **`tributaries`** — a caller-visible **sync barrier** (#23): `Tributaries::sync(sub,
+  timeout)` resolves once every change made under the subscription's key BEFORE the
+  call is deliverable. It is kernel-mediated, not an owner-side drain: a cookie file
+  is written under the subscription's coverage and its own event — riding the root's
+  ordered queue behind every change the backend reported before the write — is what
+  proves those changes have exited the pipeline. `SyncOutcome::{Delivered, Dominated}`
+  distinguishes "read your deltas" from "a covering `Rescan` stood in; re-enumerate".
+  Cookies are suppressed from every consumer stream by a reserved namespace
+  (`.tributaries-sync-`), on every instance, always — including foreign instances'
+  and crash leftovers. Three defaulted `Source`/`LocalSource` capability methods
+  (`begin_sync`, `end_sync`, `is_sync_artifact`) carry it; a source without the
+  capability refuses `SyncError::Unsupported` rather than pretending. The fs binding
+  parks the cookie write on the coverage-settle fence, so a descending backend cannot
+  place the marker while a subtree's watch is mid-re-arm.
+
+- **`tributary-fs`** — `Watcher::sync_root` / `request_remove_cookie`, the
+  settle-fenced cookie substrate beneath the umbrella's barrier (#23).
+
+- **`tributary-fs`** — a root replacement now **replays its swap window from the
+  retiring stream's journal** (#27): the driver takes the old stream's resume point
+  at command time and hands it to the replacement's spawn, so FSEvents replays the
+  window instead of leaving it to the covering `Rescan` alone. Best-effort by
+  construction (a wrapped id space mints no token, a purged journal replays nothing,
+  a foreign device is never honored), so the `Rescan` still stands — delivery only
+  gets denser.
+
 - **`tributary-proto`** — the kernel-recursive addressing vocabulary the FSEvents
   driver (`tributary-fs`) lowers into:
   - `OsRecord` now addresses its object by a watch-relative multi-segment
