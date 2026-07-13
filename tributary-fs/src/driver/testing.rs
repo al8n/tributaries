@@ -102,6 +102,13 @@ struct FakeState {
   /// control batch carrying a different generation is a leftover of a
   /// replaced transport and is refused, modeling the real source's fence.
   scope_generation: Mutex<BTreeMap<ScopeId, u64>>,
+  /// Cookies written and removed, in call order — the observable that a sync
+  /// placed (and reaped) its marker.
+  cookie_writes: Mutex<Vec<PathBuf>>,
+  cookie_removes: Mutex<Vec<PathBuf>>,
+  /// When set, every cookie write fails with this error kind (the read-only
+  /// tree, modeled).
+  cookie_write_failure: Mutex<Option<std::io::ErrorKind>>,
   /// The resume point every live fake handle mints — the journal-bearing
   /// backends' `SourceControl::resume_token`, modeled.
   resume_token: Mutex<Option<crate::os::ResumeToken>>,
@@ -157,6 +164,9 @@ impl Default for FakeState {
       spawn_backend: Mutex::new(BackendKind::FsEvents),
       arms: Mutex::default(),
       scope_generation: Mutex::default(),
+      cookie_writes: Mutex::default(),
+      cookie_removes: Mutex::default(),
+      cookie_write_failure: Mutex::default(),
       resume_token: Mutex::default(),
       spawn_resume_points: Mutex::default(),
       stale_arms: Mutex::default(),
@@ -515,6 +525,21 @@ impl FakeFs {
   /// transport generation — the observable that the generation fence held.
   pub(crate) fn stale_arms(&self) -> Vec<(WatchId, PathBuf)> {
     self.state.stale_arms.lock().unwrap().clone()
+  }
+
+  /// Cookies written so far, in call order.
+  pub(crate) fn cookie_writes(&self) -> Vec<PathBuf> {
+    self.state.cookie_writes.lock().unwrap().clone()
+  }
+
+  /// Cookies unlinked so far, in call order.
+  pub(crate) fn cookie_removes(&self) -> Vec<PathBuf> {
+    self.state.cookie_removes.lock().unwrap().clone()
+  }
+
+  /// Fails every subsequent cookie write with `kind` — the read-only tree.
+  pub(crate) fn fail_cookie_writes(&self, kind: std::io::ErrorKind) {
+    *self.state.cookie_write_failure.lock().unwrap() = Some(kind);
   }
 
   /// Makes every live fake handle mint `token` as its resume point — a
@@ -963,6 +988,29 @@ impl FsOps for FakeFs {
   ) -> WatchOutcome {
     self.park_on(&self.state.prearm_hold);
     self.arm_one(scope, watch, watch, path, name, expected)
+  }
+
+  fn write_cookie(&self, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
+    let path = dir.join(name);
+    if let Some(kind) = *self.state.cookie_write_failure.lock().unwrap() {
+      return Err(std::io::Error::new(kind, "cookie write refused"));
+    }
+    // The cookie is a real object in the fake tree, exactly as a real create
+    // is: a test can then inject its kernel event like any other file's.
+    let ino = self.state.wd_seq.fetch_add(1, Ordering::SeqCst) as u64 + 9000;
+    self.put(&path, FileKind::File, ino);
+    self.state.cookie_writes.lock().unwrap().push(path.clone());
+    Ok(path)
+  }
+
+  fn remove_cookie(&self, path: &Path) {
+    self.remove(path);
+    self
+      .state
+      .cookie_removes
+      .lock()
+      .unwrap()
+      .push(path.to_path_buf());
   }
 
   fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {
