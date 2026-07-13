@@ -80,6 +80,19 @@
 //! // Re-scope what `project` delivers at any time — no re-watch:
 //! handle.swap(|_| true);
 //!
+//! // A SYNC BARRIER: after this resolves, every change made under `project`
+//! // BEFORE the call is deliverable — read the stream and you will see it.
+//! // Kernel-mediated (a cookie file whose own event rides the ordered queue
+//! // behind those changes), never a hopeful sleep; the cookie is suppressed
+//! // from the stream. `SyncOutcome` says whether the barrier was met by
+//! // delivery or by a covering `Rescan` (re-enumerate then).
+//! let outcome = tributaries
+//!   .sync(project, std::time::Duration::from_secs(5))
+//!   .await?;
+//! if outcome.is_dominated() {
+//!   // A loss stood a Rescan in for the cookie: re-read rather than replay.
+//! }
+//!
 //! while let Some(event) = tributaries.next().await {
 //!   // `event.subscription()` is `project` or `logs`; a `Rescan` reaches every
 //!   // subscriber of the affected root regardless of filter (coverage loss).

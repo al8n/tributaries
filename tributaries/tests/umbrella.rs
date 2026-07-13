@@ -832,3 +832,54 @@ async fn sync_on_a_dead_subscription_refuses_typed() {
   assert!(err.is_unknown_subscription(), "{err:?}");
   w.close().await.expect("close");
 }
+
+/// The barrier flushes the DEBOUNCE too: a settle coalescer holds deltas back
+/// on its timer, so a sync that resolved without flushing them would promise a
+/// delivery the consumer could not yet read. After `sync`, the pre-call writes
+/// are deliverable immediately — no waiting for the settle window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_flushes_the_debounce_for_its_subscription() {
+  let (_tmp, root) = scratch("sync-debounce");
+  // A long settle window: without the barrier's flush, nothing would be
+  // deliverable for a whole second.
+  let mut w = watcher(
+    TributariesOptions::new().debounce(
+      DebounceConfig::new()
+        .with_quiet_window(Duration::from_secs(1))
+        .with_max_hold(Duration::from_secs(5)),
+    ),
+  );
+  let sub = w
+    .watch(key(&root), (), WatchOptions::new())
+    .await
+    .expect("watch");
+
+  std::fs::write(root.join("held.txt"), b"x").expect("write");
+
+  let outcome = w
+    .sync(sub, Duration::from_secs(20))
+    .await
+    .expect("the barrier is established");
+  assert!(
+    outcome.is_delivered() || outcome.is_dominated(),
+    "{outcome:?}"
+  );
+
+  // Deliverable NOW — the barrier flushed what the debounce was holding.
+  let mut seen = false;
+  let mut rescanned = false;
+  while let Some(event) = w.next().now_or_never().flatten() {
+    if event.kind().is_rescan() {
+      rescanned = true;
+    }
+    if event.key().last().and_then(|c| c.to_str()) == Some("held.txt") {
+      seen = true;
+    }
+  }
+  assert!(
+    seen || rescanned,
+    "the barrier must flush the sub's debounced deltas, not promise over them"
+  );
+
+  w.close().await.expect("close");
+}
