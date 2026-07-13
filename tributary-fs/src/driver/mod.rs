@@ -337,6 +337,14 @@ pub(crate) enum Command {
   DebugLaneCount {
     reply: futures_channel::oneshot::Sender<usize>,
   },
+  /// A test-only count of the awaited-unwatch waiters parked for `scope`, so a
+  /// suite can prove an issue-and-cancel storm leaves the waiter vector
+  /// bounded rather than growing without limit.
+  #[cfg(test)]
+  DebugUnwatchWaiters {
+    scope: ScopeId,
+    reply: futures_channel::oneshot::Sender<usize>,
+  },
 }
 
 /// Lowers a refused cover reconcile to the public outcome — answered at
@@ -393,6 +401,24 @@ fn resolve_cover_settlements(
       let _ = reply.send(settle_outcome(settle));
     }
   }
+}
+
+/// Drops CANCELLED awaited-unwatch waiters (the caller dropped its future, so
+/// the reply receiver is gone) from every scope's parked vector, removing
+/// now-empty scope entries — the loop-top (and close-drain) choke point,
+/// analogous to [`resolve_cover_settlements`]'s cancel prune. A `RootHandle`
+/// is `Copy`, so a caller can issue-and-cancel `unwatch` repeatedly against a
+/// scope whose teardown or replacement is stalled; without this prune each
+/// canceled sender would accrue until quiescence (the bounded command mailbox
+/// caps instantaneous traffic, never the total). A surviving (still-awaited)
+/// waiter keeps its verdict and resolves at quiescence. O(parked) per pass.
+fn prune_canceled_unwatch_waiters(
+  unwatch_replies: &mut BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>>,
+) {
+  unwatch_replies.retain(|_, waiters| {
+    waiters.retain(|(reply, _)| !reply.is_canceled());
+    !waiters.is_empty()
+  });
 }
 
 /// A spawned native source, as the blocking pool hands it back.
@@ -1408,6 +1434,10 @@ pub(crate) async fn run<R, F>(
     // rewind always lands before the next reconcile computes its broadening
     // delta, and a teardown-folded `Degraded` is delivered promptly.
     resolve_cover_settlements(&mut core, &mut cover_replies);
+    // Reclaim canceled awaited-unwatch waiters at the same choke point, so an
+    // issue-and-cancel storm against a stalled scope cannot grow its waiter
+    // vector without bound.
+    prune_canceled_unwatch_waiters(&mut unwatch_replies);
 
     let deadline = core
       .poll_timeout()
@@ -1917,6 +1947,10 @@ pub(crate) async fn run<R, F>(
         #[cfg(test)]
         Ok(Command::DebugLaneCount { reply }) => {
           let _ = reply.send(lanes.len());
+        }
+        #[cfg(test)]
+        Ok(Command::DebugUnwatchWaiters { scope, reply }) => {
+          let _ = reply.send(unwatch_replies.get(&scope).map_or(0, Vec::len));
         }
         // The watcher facade dropped: same orderly teardown, nobody to tell.
         Err(_) => break None,
