@@ -17,13 +17,13 @@ use std::{
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
   CoverOutcome, Event as FsEvent, EventKind as FsEventKind, RootHandle, SkipReason, SourceError,
-  UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
+  SyncRootError, UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
 };
 use tributary_proto::Interest;
 
-use super::{Armed, Source, SourceEvent};
+use super::{Armed, Source, SourceEvent, SyncToken};
 use crate::{
-  error::{BuildError, FaultKind, SourceFault, WatchError},
+  error::{BuildError, FaultKind, SourceFault, SyncError, WatchError},
   event::{EventKind, path_components},
 };
 
@@ -510,6 +510,59 @@ impl<R> Source<OsString> for FsSource<R> {
     Some(SourceEvent::from_fs(&raw))
   }
 
+  async fn begin_sync(
+    &mut self,
+    handle: RootHandle,
+    dir_key: &[OsString],
+    token: SyncToken,
+  ) -> Result<Vec<OsString>, SyncError> {
+    // Any op that touches the watcher first re-forwards deferred prunes, so a
+    // stale narrower cover never trails behind this write.
+    self.flush_deferred_prunes();
+    let name = cookie_name(token);
+    let dir = key_to_path(dir_key);
+    // The fs watcher parks the write on the root's coverage-settle fence and
+    // resolves at write-complete — never at observe. That is exactly the
+    // bounded initiation this seam promises.
+    match self.watcher.sync_root(handle, dir, name).await {
+      Ok(path) => Ok(path_components(&path)),
+      Err(err) => Err(match err {
+        SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
+        SyncRootError::DirOutsideRoot { .. } => SyncError::CookieDirUncovered,
+        SyncRootError::Write { source, .. } => {
+          let kind = match source.kind() {
+            std::io::ErrorKind::NotFound => FaultKind::NotFound,
+            std::io::ErrorKind::PermissionDenied => FaultKind::PermissionDenied,
+            _ => FaultKind::Other,
+          };
+          SyncError::CookieWrite(SourceFault::new(kind).with_source(source))
+        }
+        SyncRootError::Closed => SyncError::Closed,
+        // The fs error type is `#[non_exhaustive]`: a variant added later is a
+        // failed write until it is classified here, never a silent success.
+        _ => SyncError::CookieWrite(SourceFault::new(FaultKind::Other)),
+      }),
+    }
+  }
+
+  fn end_sync(&mut self, _handle: RootHandle, cookie_key: &[OsString]) {
+    // Fire-and-forget in the `disarm` mold: a refused (momentarily full)
+    // channel simply drops the reap — the cookie is inert (its events are
+    // suppressed by the namespace forever) and the next sync's leftovers are
+    // reaped opportunistically. Losslessness is not required for an unlink.
+    let _ = self.watcher.request_remove_cookie(key_to_path(cookie_key));
+  }
+
+  fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+    // The reserved namespace, matched on the LEAF component only (never a
+    // substring of an interior directory): every cookie of every instance,
+    // ours and foreign, live and crash-leftover — always suppressed, always.
+    key
+      .last()
+      .and_then(|leaf| leaf.to_str())
+      .is_some_and(|leaf| leaf.starts_with(COOKIE_PREFIX))
+  }
+
   fn root_key(&self, handle: RootHandle) -> Option<Vec<OsString>> {
     // A requested release is logically dead immediately (contract clause 3), even while its
     // transport teardown is still queued: answer `None` for a pending handle before consulting the
@@ -583,6 +636,27 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
     _ => FaultKind::Other,
   };
   WatchError::source(SourceFault::new(kind).with_source(err))
+}
+
+/// The reserved sync-cookie namespace. A leaf component starting with this is
+/// an artifact of the barrier machinery — whoever wrote it — and is suppressed
+/// from every consumer stream, on every instance, always. (Watchman's
+/// `.watchman-cookie-` precedent.) A real user file whose leaf collides is
+/// suppressed too: that is the documented cost of a reserved namespace, and it
+/// beats leaking foreign instances' cookies as user events.
+const COOKIE_PREFIX: &str = ".tributaries-sync-";
+
+/// Renders a cookie's file name from the owner's token. Unique across
+/// concurrent syncs (seq), watcher instances in one process (instance), and
+/// processes (pid) — so a crashed prior process's leftovers collide with
+/// nothing.
+fn cookie_name(token: SyncToken) -> String {
+  format!(
+    "{COOKIE_PREFIX}{}-{}-{}",
+    token.instance(),
+    token.pid(),
+    token.seq()
+  )
 }
 
 /// Rebuilds a filesystem path from key components — the reverse of

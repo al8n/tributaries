@@ -166,12 +166,14 @@ mod view;
 
 pub use demux::{Demux, Lane};
 pub use driver::Tributaries;
-pub use error::{BuildError, CloseError, FaultKind, SourceFault, UnwatchError, WatchError};
+pub use error::{
+  BuildError, CloseError, FaultKind, SourceFault, SyncError, UnwatchError, WatchError,
+};
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
 pub use interest::Interest;
 pub use options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions};
-pub use source::{Armed, LocalSource, Source, SourceEvent};
+pub use source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken};
 pub use subscription::{InstanceId, Subscription};
 pub use view::{Snapshot, WatchView};
 

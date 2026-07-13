@@ -806,3 +806,38 @@ mod integration {
     );
   }
 }
+
+/// The reserved namespace is the binding's business: it renders a cookie's
+/// name from the owner's token and classifies EVERY leaf in that namespace as
+/// an artifact — ours, another instance's, or a crashed process's leftover —
+/// while an ordinary file (or a name merely containing the prefix deeper in
+/// the path) is never one.
+#[tokio::test]
+async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
+  use std::ffi::OsString;
+
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::WatcherOptions;
+
+  use crate::{Source, SyncToken, source::FsSource};
+
+  let source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
+  let key =
+    |parts: &[&str]| -> Vec<OsString> { parts.iter().map(|p| OsString::from(*p)).collect() };
+
+  // Our own cookie, rendered from a token.
+  let name = super::cookie_name(SyncToken::new(7, 42, 3));
+  assert_eq!(name, ".tributaries-sync-7-42-3");
+  assert!(source.is_sync_artifact(&key(&["/", "r", &name])));
+
+  // A FOREIGN instance's cookie, and a crashed process's leftover: both are
+  // suppressed too — the namespace is total, never own-pending-only.
+  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-9-999-1"])));
+  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-0-1-0"])));
+
+  // Ordinary files are not artifacts — including one whose PARENT directory
+  // carries the prefix (the match is on the leaf, never an interior component).
+  assert!(!source.is_sync_artifact(&key(&["/", "r", "a.txt"])));
+  assert!(!source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-7-42-3", "inner.txt"])));
+  assert!(!source.is_sync_artifact(&key(&["/", "r", "not-a-.tributaries-sync-1"])));
+}

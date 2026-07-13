@@ -421,6 +421,92 @@ impl UnwatchError {
   }
 }
 
+/// Why `Tributaries::sync` could not establish the barrier.
+///
+/// The barrier is kernel-mediated: a cookie file is written under the
+/// subscription's coverage, and its own event — riding the root's ordered
+/// queue behind every change the backend reported before it — is what proves
+/// those changes have exited the pipeline. Every variant here is a failure to
+/// establish that proof, never a silent half-barrier.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SyncError {
+  /// The handle does not name a live subscription of this watcher.
+  #[error("the subscription is not live")]
+  UnknownSubscription,
+  /// The source does not implement the barrier capability. A source with no
+  /// writable in-band marker cannot offer a kernel-mediated barrier, and this
+  /// says so rather than pretending an owner-side drain is one.
+  #[error("this source does not support a sync barrier")]
+  Unsupported,
+  /// The cookie could not be written. A read-only tree surfaces as
+  /// [`FaultKind::PermissionDenied`] — honest: a tree with no writable covered
+  /// location cannot support a kernel-mediated barrier at all.
+  #[error("could not write the sync cookie: {0}")]
+  CookieWrite(#[source] SourceFault),
+  /// The resolved cookie directory lies outside the subscription's root, or
+  /// outside the coverage its root actually retains — a cookie written there
+  /// could never be reported on this subscription's stream.
+  #[error("the sync cookie directory is not inside the subscription's coverage")]
+  CookieDirUncovered,
+  /// The subscription was unwatched by its caller while the sync was pending.
+  /// A caller-unwatch owes no `Rescan`, so the barrier cannot be met honestly
+  /// (a ROOT DEATH is different: its terminal `Rescan` dominates, and the sync
+  /// resolves [`Dominated`](crate::SyncOutcome::Dominated)).
+  #[error("the subscription was unwatched while the sync was pending")]
+  Retired,
+  /// The deadline elapsed before the cookie was observed.
+  #[error("the sync barrier timed out")]
+  Timeout,
+  /// The watcher is closed.
+  #[error("the watcher is closed")]
+  Closed,
+}
+
+impl SyncError {
+  /// Whether this is [`UnknownSubscription`](Self::UnknownSubscription).
+  #[inline]
+  pub const fn is_unknown_subscription(&self) -> bool {
+    matches!(self, Self::UnknownSubscription)
+  }
+
+  /// Whether this is [`Unsupported`](Self::Unsupported).
+  #[inline]
+  pub const fn is_unsupported(&self) -> bool {
+    matches!(self, Self::Unsupported)
+  }
+
+  /// Whether this is [`CookieWrite`](Self::CookieWrite).
+  #[inline]
+  pub const fn is_cookie_write(&self) -> bool {
+    matches!(self, Self::CookieWrite(_))
+  }
+
+  /// Whether this is [`CookieDirUncovered`](Self::CookieDirUncovered).
+  #[inline]
+  pub const fn is_cookie_dir_uncovered(&self) -> bool {
+    matches!(self, Self::CookieDirUncovered)
+  }
+
+  /// Whether this is [`Retired`](Self::Retired).
+  #[inline]
+  pub const fn is_retired(&self) -> bool {
+    matches!(self, Self::Retired)
+  }
+
+  /// Whether this is [`Timeout`](Self::Timeout).
+  #[inline]
+  pub const fn is_timeout(&self) -> bool {
+    matches!(self, Self::Timeout)
+  }
+
+  /// Whether this is [`Closed`](Self::Closed).
+  #[inline]
+  pub const fn is_closed(&self) -> bool {
+    matches!(self, Self::Closed)
+  }
+}
+
 /// Why an orderly [`close`](crate::Tributaries::close) could not be confirmed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
