@@ -166,8 +166,17 @@ impl Source {
     #[cfg(debug_assertions)]
     ffi::mark_stream_queue(&queue);
 
+    // A resume point is honored only against the device that minted it: the
+    // journal id space is per-device, so replaying an id from another volume
+    // (a cross-volume replace) would name unrelated history. A foreign or
+    // unknowable device falls back to live-only — the commit `Rescan` still
+    // covers the window, so the fallback loses nothing but density.
     let since = config
       .since
+      .filter(|token| match (token.device_uuid(), device_uuid) {
+        (Some(minted), Some(current)) => minted == current,
+        _ => false,
+      })
       .map(|token| token.last_good())
       .unwrap_or(kFSEventStreamEventIdSinceNow);
     let stream = ffi::create_scheduled_stream(&shared, &roots, since, config.latency, &queue)?;
@@ -322,8 +331,8 @@ pub(crate) struct SourceHandle {
 
 impl SourceHandle {
   /// The resume point minted so far, if the journal ids are still valid.
-  // Journal resume is deferred surface; minted, not yet consumed.
-  #[allow(dead_code)]
+  /// A wrapped id space (or a stream that never delivered) mints nothing —
+  /// the successor then starts live-only and leans on the covering `Rescan`.
   pub(crate) fn resume_token(&self) -> Option<ResumeToken> {
     if self.shared.ids_wrapped.load(Ordering::Acquire) {
       return None;

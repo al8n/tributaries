@@ -102,6 +102,12 @@ struct FakeState {
   /// control batch carrying a different generation is a leftover of a
   /// replaced transport and is refused, modeling the real source's fence.
   scope_generation: Mutex<BTreeMap<ScopeId, u64>>,
+  /// The resume point every live fake handle mints — the journal-bearing
+  /// backends' `SourceControl::resume_token`, modeled.
+  resume_token: Mutex<Option<crate::os::ResumeToken>>,
+  /// The `since` each spawn was configured with, in spawn order: the
+  /// observable that a replacement inherited the retiring stream's point.
+  spawn_resume_points: Mutex<Vec<Option<crate::os::ResumeToken>>>,
   /// Arms refused because their batch carried a stale (replaced) transport
   /// generation — the observable of the fence, in call order.
   stale_arms: Mutex<Vec<(WatchId, PathBuf)>>,
@@ -151,6 +157,8 @@ impl Default for FakeState {
       spawn_backend: Mutex::new(BackendKind::FsEvents),
       arms: Mutex::default(),
       scope_generation: Mutex::default(),
+      resume_token: Mutex::default(),
+      spawn_resume_points: Mutex::default(),
       stale_arms: Mutex::default(),
       disarms: Mutex::default(),
       enumerates: Mutex::default(),
@@ -509,6 +517,17 @@ impl FakeFs {
     self.state.stale_arms.lock().unwrap().clone()
   }
 
+  /// Makes every live fake handle mint `token` as its resume point — a
+  /// journal-bearing backend, modeled.
+  pub(crate) fn mint_resume_token(&self, token: crate::os::ResumeToken) {
+    *self.state.resume_token.lock().unwrap() = Some(token);
+  }
+
+  /// The `since` each spawn was configured with, in spawn order.
+  pub(crate) fn spawn_resume_points(&self) -> Vec<Option<crate::os::ResumeToken>> {
+    self.state.spawn_resume_points.lock().unwrap().clone()
+  }
+
   /// The non-parking core of one arm: record it, then model object
   /// correctness (identity mismatch and alias) and mint a watch descriptor,
   /// exactly as [`add_watch`](FsOps::add_watch) does once past the hold.
@@ -586,6 +605,10 @@ pub(crate) struct FakeHandle {
 }
 
 impl SourceControl for FakeHandle {
+  fn resume_token(&self) -> Option<crate::os::ResumeToken> {
+    *self.state.resume_token.lock().unwrap()
+  }
+
   fn shutdown(mut self) {
     // The wedge gate parks INSIDE the call, after the handle moved in —
     // exactly the phase where no Drop backstop can exist. Drop itself never
@@ -617,6 +640,15 @@ impl FsOps for FakeFs {
   type Handle = FakeHandle;
 
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
+    // Record the resume point this spawn was configured with, BEFORE any hold
+    // or outcome: a replacement inheriting the retiring stream's point is the
+    // observable, and it exists whether or not the spawn goes on to succeed.
+    self
+      .state
+      .spawn_resume_points
+      .lock()
+      .unwrap()
+      .push(config.since);
     // The hold gate parks the whole spawn — before any outcome is decided —
     // so a test can race close() against a spawn that is dispatched but not
     // yet returned.

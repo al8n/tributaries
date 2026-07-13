@@ -435,3 +435,48 @@ async fn replace_root_widens_under_live_churn() {
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The swap window is REPLAYED, not merely rescanned: the replacement stream
+/// resumes the retiring one's FSEvents journal point, so a write made just
+/// before the swap arrives as a concrete change under the new root — not only
+/// as the covering `Rescan`. Best-effort by construction (a purged journal
+/// falls back to the `Rescan`), so the cell asserts the pre-swap object is
+/// covered AND that at least one non-`Rescan` change names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_root_replays_the_swap_window_from_the_journal() {
+  let root = scratch_root("replace-replay");
+  let sub = root.join("y");
+  std::fs::create_dir_all(&sub).expect("create sub");
+  let mut w = watcher();
+  let handle = w.watch(&sub, Interest::all()).await.expect("watch");
+
+  // Prime the stream so it has a journal point to resume FROM (a stream that
+  // never delivered mints no token).
+  let primer = sub.join("primer.txt");
+  std::fs::write(&primer, b"p").expect("write primer");
+  assert!(
+    wait_for(&mut w, |e| covers(e, &primer)).await.is_some(),
+    "the stream is live and has minted a resume point"
+  );
+
+  // The write the swap must not lose: made under the OLD root, immediately
+  // before the replace commits.
+  let pre = sub.join("pre-swap.txt");
+  std::fs::write(&pre, b"x").expect("write pre-swap");
+
+  w.replace_root(handle, &root)
+    .await
+    .expect("the swap commits");
+
+  // The journal replay delivers it as a CONCRETE change (the covering Rescan
+  // would also "cover" it — this asserts the denser delivery the resume buys).
+  let replayed = wait_for(&mut w, |e| !e.is_rescan() && e.path() == pre).await;
+  assert!(
+    replayed.is_some(),
+    "the pre-swap write is replayed from the journal, not only rescanned"
+  );
+
+  w.unwatch(handle).await.expect("unwatch");
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
