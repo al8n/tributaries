@@ -1934,6 +1934,55 @@ mod descending {
       (rig, scope)
     }
 
+    /// The sync cookie's write is parked on the SAME settle fence a cover ack
+    /// rides: under a descending backend with re-arm work in flight, the
+    /// cookie must not land until the coverage quiesces — otherwise a
+    /// pre-sync change inside a mid-re-arm subtree was never kernel-reported
+    /// and no queue ordering covers it. Once the re-arm settles, the write
+    /// lands and the caller gets the cookie's path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_cookie_write_parks_on_the_settle_fence() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+
+      // Stall the grow: /r/drop's re-install parks on the blocking pool, so
+      // the scope is NOT settled.
+      let hold = rig.fs.hold_arms();
+      let _ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+
+      let (reply, mut on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from("/r"),
+          name: ".tributaries-sync-1-2-3".to_owned(),
+          reply,
+        })
+        .await
+        .unwrap();
+      for _ in 0..40 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(&mut on_reply).is_pending(),
+        "the cookie write waits for the coverage to settle"
+      );
+      assert!(
+        rig.fs.cookie_writes().is_empty(),
+        "nothing was written while the re-arm was in flight"
+      );
+
+      hold.release();
+      let path = on_reply
+        .await
+        .expect("the driver replies")
+        .expect("the write lands once settled");
+      assert_eq!(path, PathBuf::from("/r/.tributaries-sync-1-2-3"));
+      assert_eq!(rig.fs.cookie_writes(), vec![path]);
+    }
+
     /// Shrinks the live rig to `{/r/keep}` and awaits the ack: a prune grows
     /// nothing, so the fence settles at the next loop top, clean.
     async fn shrunk_to_keep(rig: &Rig, scope: ScopeId) {
@@ -3577,5 +3626,99 @@ mod replace {
       0,
       "every retired scope reclaimed its lane — no unbounded growth"
     );
+  }
+}
+
+/// The sync-cookie substrate on a kernel-recursive root: no re-arm work means
+/// the settle fence is trivially met, so the write lands at once; the unlink
+/// is a reply-less fire-and-forget; and a read-only tree refuses typed.
+mod sync_cookie {
+  use super::*;
+
+  async fn sync_root(
+    rig: &Rig,
+    scope: ScopeId,
+    dir: &str,
+    name: &str,
+  ) -> Result<PathBuf, crate::error::SyncRootError> {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::SyncRoot {
+        scope,
+        dir: PathBuf::from(dir),
+        name: name.to_owned(),
+        reply,
+      })
+      .await
+      .unwrap();
+    on_reply.await.expect("the driver replies")
+  }
+
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_kernel_recursive_root_writes_the_cookie_at_once() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-1-7-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(path, PathBuf::from("/r/.tributaries-sync-1-7-1"));
+    assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
+
+    // The cookie is a real object now: its create event flows like any file's,
+    // which is exactly what makes it a barrier marker.
+    rig
+      .fs
+      .send_batch("/r", vec![ev(path.to_str().unwrap(), created(), 1, 9001)]);
+    let (s, change) = next_event(&rig).await;
+    assert_eq!(s, scope);
+    assert!(change.kind().is_created());
+    assert_eq!(
+      change.location(),
+      &loc(&[".tributaries-sync-1-7-1"]),
+      "the cookie's own event rides the root's ordered queue"
+    );
+
+    // And it reaps, idempotently.
+    rig
+      .commands
+      .send(Command::RemoveCookie { path: path.clone() })
+      .await
+      .unwrap();
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(rig.fs.cookie_removes(), vec![path]);
+  }
+
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_read_only_tree_refuses_the_cookie_typed() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    rig
+      .fs
+      .fail_cookie_writes(std::io::ErrorKind::PermissionDenied);
+
+    let outcome = sync_root(&rig, scope, "/r", ".tributaries-sync-1-7-2").await;
+    match outcome {
+      Err(crate::error::SyncRootError::Write { path, source }) => {
+        assert_eq!(path, PathBuf::from("/r/.tributaries-sync-1-7-2"));
+        assert_eq!(
+          source.kind(),
+          std::io::ErrorKind::PermissionDenied,
+          "a read-only tree is the honest refusal, not a silent half-barrier"
+        );
+      }
+      other => panic!("expected a typed write refusal, got {other:?}"),
+    }
+  }
+
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_dead_root_refuses_the_cookie() {
+    let rig = rig_with_capacity(64);
+    let ghost = ScopeId::new(core::num::NonZeroU64::new(404).unwrap());
+    assert!(matches!(
+      sync_root(&rig, ghost, "/r", ".tributaries-sync-1-7-3").await,
+      Err(crate::error::SyncRootError::UnknownRoot)
+    ));
   }
 }

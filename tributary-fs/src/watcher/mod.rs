@@ -18,7 +18,7 @@ use tributary_proto::{Change, Interest, ScopeId};
 
 use crate::{
   driver::{Command, DriverConfig, RealFs, ScopeRegistry, run},
-  error::{BuildError, CloseError, ReplaceRootError, UnwatchError, WatchRootError},
+  error::{BuildError, CloseError, ReplaceRootError, SyncRootError, UnwatchError, WatchRootError},
   event::Event,
   options::WatcherOptions,
   os::{BackendKind, BackendStats, RootIdentity, SourceError},
@@ -860,6 +860,96 @@ impl<R> Watcher<R> {
         scope: root.scope(),
         reply: None,
       })
+      .is_ok()
+  }
+  /// Places a **sync cookie** — the kernel-mediated barrier marker — inside
+  /// `dir` (which must lie within `root`'s coverage) and resolves with the
+  /// path it landed at, at WRITE-complete.
+  ///
+  /// The cookie's whole value is the event its creation mints: that event
+  /// rides the root's ordered queue BEHIND every change the backend reported
+  /// before the write, so a caller that watches for the cookie on its own
+  /// stream learns that all of those changes have already exited the
+  /// pipeline. This method never waits for the observation — doing so from
+  /// inside the watcher would deadlock the very stream the cookie must
+  /// arrive on. Observation is the caller's (or the umbrella's) job.
+  ///
+  /// The write is parked on the scope's coverage-settle fence: under a
+  /// descending backend, a change inside a subtree whose per-directory watch
+  /// is mid-re-arm was never kernel-reported and no queue ordering covers it,
+  /// so the cookie must not be written until every re-arm terminal is
+  /// armed-live or dropped-with-a-standing-`Rescan`. A kernel-recursive root
+  /// has no re-arm work and writes immediately. A DEGRADED settle still
+  /// writes: the loss already stood a covering `Rescan` ahead of the cookie,
+  /// so the barrier holds by domination.
+  ///
+  /// Reap the cookie with [`request_remove_cookie`](Self::request_remove_cookie)
+  /// once it has been observed. Both the create and the unlink are suppressed
+  /// from consumer streams by the reserved-namespace rule at the layer that
+  /// owns the namespace.
+  ///
+  /// # Errors
+  ///
+  /// [`SyncRootError::UnknownRoot`] for a foreign or dead handle;
+  /// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) when `dir` is not
+  /// inside the root; [`Write`](SyncRootError::Write) when the create fails
+  /// (a read-only tree surfaces as `PermissionDenied`);
+  /// [`Retired`](SyncRootError::Retired) when the root died while the write
+  /// was parked; [`Closed`](SyncRootError::Closed) once the watcher is closed.
+  pub async fn sync_root(
+    &self,
+    root: RootHandle,
+    dir: impl Into<PathBuf>,
+    name: impl Into<String>,
+  ) -> Result<PathBuf, SyncRootError> {
+    if root.instance() != self.instance {
+      return Err(SyncRootError::UnknownRoot);
+    }
+    let dir = dir.into();
+    // The cookie must be reportable on THIS root's stream: a directory outside
+    // its coverage could never mint an event the caller will see.
+    let Some(root_path) = self.root_path(root) else {
+      return Err(SyncRootError::UnknownRoot);
+    };
+    if !dir.starts_with(&root_path) {
+      return Err(SyncRootError::DirOutsideRoot {
+        dir,
+        root: root_path,
+      });
+    }
+
+    let (reply, response) = futures_channel::oneshot::channel();
+    if self
+      .commands
+      .send(Command::SyncRoot {
+        scope: root.scope(),
+        dir,
+        name: name.into(),
+        reply,
+      })
+      .await
+      .is_err()
+    {
+      self.driver_gone();
+      return Err(SyncRootError::Closed);
+    }
+    match response.await {
+      Ok(outcome) => outcome,
+      Err(_) => {
+        self.driver_gone();
+        Err(SyncRootError::Closed)
+      }
+    }
+  }
+
+  /// Reaps a sync cookie — a NON-BLOCKING, reply-less fire-and-forget unlink
+  /// in the [`request_set_cover`](Self::request_set_cover) mold. Idempotent:
+  /// a cookie already gone is success. Reports whether the control channel
+  /// accepted the request, nothing about when the unlink lands.
+  pub fn request_remove_cookie(&self, path: impl Into<PathBuf>) -> bool {
+    self
+      .commands
+      .try_send(Command::RemoveCookie { path: path.into() })
       .is_ok()
   }
 

@@ -162,6 +162,45 @@ impl CloseError {
   }
 }
 
+/// Why [`Watcher::sync_root`](crate::Watcher::sync_root) could not place a
+/// sync cookie. The barrier's *observation* is the caller's job (the cookie's
+/// event arrives on the stream); this error covers only the placement.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SyncRootError {
+  /// The handle does not name a live root of this watcher.
+  #[error("the handle does not name a live root of this watcher")]
+  UnknownRoot,
+  /// The cookie directory is not inside the root's coverage — a cookie
+  /// written there could never be reported on this root's stream.
+  #[error("cookie directory {} is outside root {}", dir.display(), root.display())]
+  DirOutsideRoot {
+    /// The requested cookie directory.
+    dir: PathBuf,
+    /// The root it must be inside.
+    root: PathBuf,
+  },
+  /// The cookie could not be written. A read-only tree surfaces here as
+  /// [`std::io::ErrorKind::PermissionDenied`] — the honest refusal: a tree
+  /// with no writable covered location cannot support a kernel-mediated
+  /// barrier at all.
+  #[error("could not write sync cookie {}: {source}", path.display())]
+  Write {
+    /// The cookie path the write was attempted at.
+    path: PathBuf,
+    /// The underlying failure.
+    #[source]
+    source: std::io::Error,
+  },
+  /// The root died (or was unwatched) while the cookie write was parked on
+  /// the coverage-settle fence.
+  #[error("the root died while the sync cookie was pending")]
+  Retired,
+  /// The watcher is closed.
+  #[error("the watcher is closed")]
+  Closed,
+}
+
 /// Why [`Watcher::replace_root`](crate::Watcher::replace_root) failed. The
 /// operation is atomic-on-failure: every variant leaves the old root's
 /// coverage untouched.

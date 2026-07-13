@@ -131,6 +131,16 @@ pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant,
 /// replacement in `arming` while the new root's pre-arm runs on the blocking
 /// pool ([`FsOps::preflight_arm`]); a kernel-recursive replace commits
 /// straight off its spawn and never populates it.
+/// One sync-cookie write parked on its scope's coverage-settle fence: the
+/// write dispatches when the fence settles (either verdict), and its reply
+/// carries the cookie's path back to the caller at write-complete.
+struct ParkedCookie {
+  scope: ScopeId,
+  dir: PathBuf,
+  name: String,
+  reply: futures_channel::oneshot::Sender<Result<PathBuf, crate::error::SyncRootError>>,
+}
+
 struct ReplaceState<H> {
   reservation: crate::watcher::ReservationGuard,
   reply: futures_channel::oneshot::Sender<Result<(), crate::error::ReplaceRootError>>,
@@ -324,6 +334,32 @@ pub(crate) enum Command {
     /// Resolved at commit, or with the typed failure.
     reply: futures_channel::oneshot::Sender<Result<(), crate::error::ReplaceRootError>>,
   },
+  /// Place a sync cookie under `dir` for `scope`, resolving with the path it
+  /// landed at. The write PARKS on the scope's coverage-settle fence: under a
+  /// descending backend a pre-sync write inside a subtree whose per-directory
+  /// watch is mid-re-arm was never kernel-reported, and no queue ordering
+  /// covers it — settling first means every re-arm terminal is armed-live or
+  /// dropped-with-a-standing-`Rescan`. A kernel-recursive scope is trivially
+  /// settled, so the write dispatches at once. A `Degraded` settle still
+  /// writes: the covering `Rescan` the loss already emitted rides the queue
+  /// ahead of the cookie, so the barrier is met by domination.
+  SyncRoot {
+    /// The root the cookie must be reported on.
+    scope: ScopeId,
+    /// The directory to place it in (validated inside the root by the watcher).
+    dir: PathBuf,
+    /// The minted cookie name (the caller owns the reserved namespace).
+    name: String,
+    /// Resolved with the cookie's path at WRITE-complete — never at observe
+    /// (the observation arrives on the caller's own event stream).
+    reply: futures_channel::oneshot::Sender<Result<PathBuf, crate::error::SyncRootError>>,
+  },
+  /// Unlink a sync cookie (reply-less, fire-and-forget). The unlink's own
+  /// event is suppressed by the reserved namespace, not by any bookkeeping.
+  RemoveCookie {
+    /// The cookie to reap.
+    path: PathBuf,
+  },
   /// Orderly shutdown; resolves when every stream is torn down.
   Close {
     /// Resolved with the number of teardowns still wedged past the close
@@ -381,17 +417,32 @@ const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
 /// (the bounded mailbox limits instantaneous traffic, never the total). The
 /// prune is O(parked) per pass, and it means a reported settlement may
 /// legitimately find no sender (a caller dropped at close).
-fn resolve_cover_settlements(
+fn resolve_cover_settlements<R, F>(
   core: &mut DriverCore,
+  ops: &F,
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
-) {
+  parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
+  live: &dyn Fn(ScopeId) -> bool,
+) where
+  R: RuntimeLite,
+  F: FsOps,
+{
   let mut abandoned = std::collections::BTreeSet::new();
   cover_replies.retain(|fence, reply| {
-    let live = !reply.is_canceled();
-    if !live {
+    let alive = !reply.is_canceled();
+    if !alive {
       abandoned.insert(*fence);
     }
-    live
+    alive
+  });
+  // A cancelled sync (the caller dropped its future) abandons its fence the
+  // same way — the cookie is simply never written.
+  parked_cookies.retain(|fence, cookie| {
+    let alive = !cookie.reply.is_canceled();
+    if !alive {
+      abandoned.insert(*fence);
+    }
+    alive
   });
   core.abandon_cover_fences(&abandoned);
   for (fence, settle) in core.poll_cover_settlements() {
@@ -399,6 +450,34 @@ fn resolve_cover_settlements(
     // updated the core's bookkeeping either way.
     if let Some(reply) = cover_replies.remove(&fence) {
       let _ = reply.send(settle_outcome(settle));
+      continue;
+    }
+    // The settle-fenced cookie write. BOTH verdicts write: a `Degraded`
+    // settle means a loss already stood a covering `Rescan` that rides the
+    // queue ahead of this cookie, so the barrier is still met — by
+    // domination rather than by delivery. Only a scope that DIED loses its
+    // write (its fences degrade at teardown, and there is no stream left to
+    // report the cookie on).
+    if let Some(cookie) = parked_cookies.remove(&fence) {
+      let _ = settle;
+      if !live(cookie.scope) {
+        let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
+        continue;
+      }
+      let ops = ops.clone();
+      R::spawn_blocking_detach(move || {
+        let ParkedCookie {
+          dir, name, reply, ..
+        } = cookie;
+        let outcome =
+          ops
+            .write_cookie(&dir, &name)
+            .map_err(|source| crate::error::SyncRootError::Write {
+              path: dir.join(&name),
+              source,
+            });
+        let _ = reply.send(outcome);
+      });
     }
   }
 }
@@ -513,6 +592,20 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// `lstat`s one path (blocking).
   fn probe(&self, path: &Path) -> ProbeOutcome;
+
+  /// Creates the sync cookie `name` inside `dir` (blocking), returning the
+  /// path it landed at. The cookie's whole purpose is the kernel event its
+  /// creation mints: it rides the root's ordered queue behind every change
+  /// the backend reported before it, so observing it proves those changes
+  /// have already exited the pipeline. A read-only tree fails here with
+  /// `PermissionDenied` — the honest refusal.
+  fn write_cookie(&self, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error>;
+
+  /// Unlinks a sync cookie (blocking, fire-and-forget). Idempotent: a cookie
+  /// already gone (a crash leftover reaped by someone else, a racing sync) is
+  /// success. The unlink's own event is suppressed by the reserved namespace,
+  /// never by any pending-cookie bookkeeping.
+  fn remove_cookie(&self, path: &Path);
 
   /// Re-reads the live mount table strictly under `root` AND re-stats the root
   /// itself (blocking): the mount prefixes, whether the read was authoritative,
@@ -982,6 +1075,23 @@ impl FsOps for RealFs {
     }
   }
 
+  fn write_cookie(&self, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
+    let path = dir.join(name);
+    // create_new: a cookie name is minted unique (instance + pid + seq), so an
+    // existing file at that path is a foreign artifact or a name collision —
+    // never something to silently overwrite.
+    std::fs::OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .open(&path)?;
+    Ok(path)
+  }
+
+  fn remove_cookie(&self, path: &Path) {
+    // Idempotent by contract: an already-gone cookie is success.
+    let _ = std::fs::remove_file(path);
+  }
+
   fn refresh_mounts(&self, root: &Path) -> MountRefresh {
     let (mounts, authoritative) = match crate::os::mounts_under(root) {
       Some(mounts) => (mounts, true),
@@ -1423,6 +1533,10 @@ pub(crate) async fn run<R, F>(
   // caller sees `Closed` through the dropped-reply mapping).
   let mut cover_replies: BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>> =
     BTreeMap::new();
+  // Sync-cookie writes parked under the SAME settlement fences (see
+  // `Command::SyncRoot`): the write dispatches to the blocking pool once the
+  // scope's re-arm work quiesces, whatever the settle's verdict.
+  let mut parked_cookies: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
   // driver keeps a sender so grants can always be minted, which is fine —
   // exit is driven by the COMMAND channel, and this receiver merely pends.
@@ -1451,7 +1565,13 @@ pub(crate) async fn run<R, F>(
     // any new command is processed — so a lossy settle's `applied_cover`
     // rewind always lands before the next reconcile computes its broadening
     // delta, and a teardown-folded `Degraded` is delivered promptly.
-    resolve_cover_settlements(&mut core, &mut cover_replies);
+    resolve_cover_settlements::<R, F>(
+      &mut core,
+      &ops,
+      &mut cover_replies,
+      &mut parked_cookies,
+      &|scope| handles.contains_key(&scope),
+    );
     // Reclaim canceled awaited-unwatch waiters at the same choke point, so an
     // issue-and-cancel storm against a stalled scope cannot grow its waiter
     // vector without bound.
@@ -1971,6 +2091,38 @@ pub(crate) async fn run<R, F>(
             }
           }
         }
+        Ok(Command::SyncRoot {
+          scope,
+          dir,
+          name,
+          reply,
+        }) => {
+          if !handles.contains_key(&scope) {
+            let _ = reply.send(Err(crate::error::SyncRootError::UnknownRoot));
+          } else {
+            // Park the write on a settle fence opened right here — the same
+            // fence a reconcile's ack rides, so it inherits this moment's
+            // window. A kernel-recursive scope has no re-arm work, so the
+            // fence settles at the very next loop-top poll and the write
+            // dispatches immediately; a descending scope waits for its
+            // in-flight re-arms to quiesce, which is precisely the ordering
+            // the barrier needs.
+            let fence = core.open_cover_fence(scope);
+            parked_cookies.insert(
+              fence,
+              ParkedCookie {
+                scope,
+                dir,
+                name,
+                reply,
+              },
+            );
+          }
+        }
+        Ok(Command::RemoveCookie { path }) => {
+          let ops = ops.clone();
+          R::spawn_blocking_detach(move || ops.remove_cookie(&path));
+        }
         Ok(Command::Close { reply }) => break Some(reply),
         #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugLaneCount { reply }) => {
@@ -2149,7 +2301,13 @@ pub(crate) async fn run<R, F>(
   // `Closed`. Whatever is still pending drops with `cover_replies` — the
   // ratified close-mid-fence semantics: the caller sees `Closed`, never an
   // outcome fabricated over a torn-down driver.
-  resolve_cover_settlements(&mut core, &mut cover_replies);
+  resolve_cover_settlements::<R, F>(
+    &mut core,
+    &ops,
+    &mut cover_replies,
+    &mut parked_cookies,
+    &|_| false,
+  );
   if let Some(reply) = close_reply {
     let _ = reply.send(pending_teardowns.values().sum::<usize>() + pending_spawns.len());
   }
