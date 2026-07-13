@@ -80,6 +80,36 @@ fn covers(event: &Event, path: &Path) -> bool {
   event.is_rescan() && path.starts_with(event.path())
 }
 
+/// Converges on live coverage of `dir`: creates a fresh file there and waits
+/// briefly for its delivery, retrying until one lands. A descending re-arm
+/// (a `replace_root` widen rebuilds the tree on a new inotify instance)
+/// descends asynchronously, so a single create in a not-yet-armed directory
+/// is lost — inotify never re-delivers a create that predates its watch — but
+/// once the re-arm reaches `dir`, a subsequent create is delivered. Returns
+/// `false` only if coverage never becomes live within the retry budget.
+async fn coverage_becomes_live(watcher: &mut TokioWatcher, dir: &Path, tag: &str) -> bool {
+  for attempt in 0..40 {
+    let probe = dir.join(format!("{tag}-{attempt}.txt"));
+    if std::fs::write(&probe, b"x").is_err() {
+      return false;
+    }
+    let seen = tokio::time::timeout(Duration::from_millis(500), async {
+      while let Some(event) = watcher.next().await {
+        if covers(&event, &probe) {
+          return true;
+        }
+      }
+      false
+    })
+    .await
+    .unwrap_or(false);
+    if seen {
+      return true;
+    }
+  }
+  false
+}
+
 /// Snapshot-and-set one `/proc/sys` knob; `None` = unwritable (unprivileged).
 fn sysctl_swap(knob: &str, value: &str) -> Option<String> {
   let path = format!("/proc/sys/{knob}");
@@ -528,18 +558,15 @@ async fn replace_root_widens_and_rebinds() {
   let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == root).await;
   assert!(covering.is_some(), "the covering Rescan arrives");
 
-  // The rebuilt (re-armed) tree is live on the new instance: old ground...
-  let old_ground = sub.join("deep").join("old-ground.txt");
-  std::fs::write(&old_ground, b"x").expect("write old ground");
+  // The rebuilt (re-armed) tree is live on the new instance once the
+  // descending re-arm reaches each directory — the DEEP old subtree (armed
+  // last) and the newly covered ground directly under the new root alike.
   assert!(
-    wait_for(&mut w, |e| covers(e, &old_ground)).await.is_some(),
+    coverage_becomes_live(&mut w, &sub.join("deep"), "old-ground").await,
     "the old subtree is re-armed on the new fd"
   );
-  // ...and newly covered ground alike.
-  let outside = root.join("outside.txt");
-  std::fs::write(&outside, b"x").expect("write outside");
   assert!(
-    wait_for(&mut w, |e| covers(e, &outside)).await.is_some(),
+    coverage_becomes_live(&mut w, &root, "outside").await,
     "newly covered ground is live"
   );
 
@@ -549,10 +576,8 @@ async fn replace_root_widens_and_rebinds() {
     w.replace_root(handle, &sub).await.expect("narrow commits");
     w.replace_root(handle, &root).await.expect("widen commits");
   }
-  let probe = root.join("after-cycles.txt");
-  std::fs::write(&probe, b"x").expect("write probe");
   assert!(
-    wait_for(&mut w, |e| covers(e, &probe)).await.is_some(),
+    coverage_becomes_live(&mut w, &root, "after-cycles").await,
     "coverage is live after swap cycles"
   );
 
