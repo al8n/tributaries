@@ -1366,8 +1366,12 @@ pub(crate) async fn run<R, F>(
   // paired with the verdict to send then: `true` for a live scope this
   // unwatch tears down, `false` (UnknownRoot) for a scope whose root already
   // died while a replacement was still resolving — the reply still waits for
-  // that replacement's teardown, but reports the scope gone.
-  let mut unwatch_replies: BTreeMap<ScopeId, (futures_channel::oneshot::Sender<bool>, bool)> =
+  // that replacement's teardown, but reports the scope gone. A `RootHandle`
+  // is `Copy`, so ONE scope can accrue several awaited unwatches (a second
+  // arriving before the first quiesces); every waiter is kept and resolved
+  // together — dropping one would surface to its caller as `Closed`, which
+  // the watcher reads as driver death and would wrongly clear the registry.
+  let mut unwatch_replies: BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>> =
     BTreeMap::new();
   // Awaited set-cover acknowledgements parked under their settlement fences
   // (see `Command::SetCover`): resolved by `resolve_cover_settlements` at the
@@ -1457,9 +1461,8 @@ pub(crate) async fn run<R, F>(
                     &pending_spawns,
                     &pending_teardowns,
                     &replace_states,
-                  ) && let Some((reply, verdict)) = unwatch_replies.remove(&scope)
-                  {
-                    let _ = reply.send(verdict);
+                  ) {
+                    resolve_unwatch_waiters(&mut unwatch_replies, scope);
                   }
                   continue;
                 }
@@ -1786,9 +1789,8 @@ pub(crate) async fn run<R, F>(
               &pending_spawns,
               &pending_teardowns,
               &replace_states,
-            ) && let Some((reply, verdict)) = unwatch_replies.remove(&scope)
-            {
-              let _ = reply.send(verdict);
+            ) {
+              resolve_unwatch_waiters(&mut unwatch_replies, scope);
             }
           }
         }
@@ -1817,42 +1819,49 @@ pub(crate) async fn run<R, F>(
         }) => {
           if !handles.contains_key(&scope) {
             let _ = reply.send(Err(crate::error::ReplaceRootError::UnknownRoot));
-          } else if replace_states.contains_key(&scope) {
-            let _ = reply.send(Err(crate::error::ReplaceRootError::ReplaceInFlight));
           } else {
-            // Dispatch the replacement spawn through the SAME blocking-pool
-            // accounting a birth spawn uses; the Spawned router diverts the
-            // result to the commit tail by the replace_states key.
-            pending_spawns.insert(scope);
-            let mut source_config = SourceConfig::new(vec![root]);
-            source_config.exclusions = config.exclusions.clone();
-            source_config.latency = config.latency;
-            source_config.channel_capacity = config.os_batch_capacity;
-            source_config.backend = config.backend;
-            source_config.max_map_directories = config.max_map_directories;
-            let ops_for_spawn = ops.clone();
-            let tx = op_tx.clone();
-            R::spawn_blocking_detach(move || {
-              let result = ops_for_spawn.spawn_source(source_config);
-              let _ = tx.try_send(OpResult::Spawned { scope, result });
-            });
-            replace_states.insert(
-              scope,
-              ReplaceState {
-                reservation,
-                reply,
-                arming: None,
-              },
-            );
+            match replace_states.entry(scope) {
+              std::collections::btree_map::Entry::Occupied(_) => {
+                let _ = reply.send(Err(crate::error::ReplaceRootError::ReplaceInFlight));
+              }
+              std::collections::btree_map::Entry::Vacant(slot) => {
+                // Dispatch the replacement spawn through the SAME blocking-pool
+                // accounting a birth spawn uses; the Spawned router diverts the
+                // result to the commit tail by the replace_states key.
+                pending_spawns.insert(scope);
+                let mut source_config = SourceConfig::new(vec![root]);
+                source_config.exclusions = config.exclusions.clone();
+                source_config.latency = config.latency;
+                source_config.channel_capacity = config.os_batch_capacity;
+                source_config.backend = config.backend;
+                source_config.max_map_directories = config.max_map_directories;
+                let ops_for_spawn = ops.clone();
+                let tx = op_tx.clone();
+                R::spawn_blocking_detach(move || {
+                  let result = ops_for_spawn.spawn_source(source_config);
+                  let _ = tx.try_send(OpResult::Spawned { scope, result });
+                });
+                slot.insert(ReplaceState {
+                  reservation,
+                  reply,
+                  arming: None,
+                });
+              }
+            }
           }
         }
         Ok(Command::Unwatch { scope, reply }) => {
           if handles.contains_key(&scope) || watch_replies.contains_key(&scope) {
             // A live scope: the awaited form records its waiter (answered at
             // quiescence with `true`); the reply-less `request_unwatch` tears
-            // down identically but registers none.
+            // down identically but registers none. Waiters ACCUMULATE — a
+            // duplicate unwatch of the same handle joins the queue, never
+            // evicts an earlier waiter.
             if let Some(reply) = reply {
-              unwatch_replies.insert(scope, (reply, true));
+              unwatch_replies
+                .entry(scope)
+                .or_default()
+                .push((reply, true));
             }
             core.on_unwatch(scope);
           } else if pending_spawns.contains(&scope)
@@ -1866,9 +1875,13 @@ pub(crate) async fn run<R, F>(
             // to `Retired` and is torn down; there is nothing more to trigger.
             // Park the reply for quiescence rather than reporting the scope
             // gone while a native stream is still coming up, and answer
-            // UnknownRoot (`false`) — the root died.
+            // UnknownRoot (`false`) — the root died. Waiters accumulate here
+            // too (a duplicate must not evict an earlier one).
             if let Some(reply) = reply {
-              unwatch_replies.insert(scope, (reply, false));
+              unwatch_replies
+                .entry(scope)
+                .or_default()
+                .push((reply, false));
             }
           } else if let Some(reply) = reply {
             // Genuinely unknown: never watched, or already fully quiesced.
@@ -1997,11 +2010,8 @@ pub(crate) async fn run<R, F>(
           // empty here), and referencing the non-`Sync` handle map inside
           // this future would poison its `Send`ness — so the fence reduces to
           // the two obligations that can still be outstanding in the drain.
-          if !pending_spawns.contains(&scope)
-            && !pending_teardowns.contains_key(&scope)
-            && let Some((reply, verdict)) = unwatch_replies.remove(&scope)
-          {
-            let _ = reply.send(verdict);
+          if !pending_spawns.contains(&scope) && !pending_teardowns.contains_key(&scope) {
+            resolve_unwatch_waiters(&mut unwatch_replies, scope);
           }
         }
         Ok(OpResult::Probed { probe, outcome }) => core.on_probe_result(probe, outcome, now()),
@@ -2072,6 +2082,22 @@ pub(crate) async fn run<R, F>(
   resolve_cover_settlements(&mut core, &mut cover_replies);
   if let Some(reply) = close_reply {
     let _ = reply.send(pending_teardowns.values().sum::<usize>() + pending_spawns.len());
+  }
+}
+
+/// Resolves and drops EVERY awaited unwatch parked for `scope`, each with
+/// its own verdict (`true` for a live unwatch, `false` for an already-dead
+/// scope). Called only once the scope is quiescent; a `RootHandle` is `Copy`
+/// so more than one waiter can be queued, and all must be answered — a
+/// dropped sender reads to its caller as driver death.
+fn resolve_unwatch_waiters(
+  unwatch_replies: &mut BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>>,
+  scope: ScopeId,
+) {
+  if let Some(waiters) = unwatch_replies.remove(&scope) {
+    for (reply, verdict) in waiters {
+      let _ = reply.send(verdict);
+    }
   }
 }
 
@@ -2241,7 +2267,7 @@ fn execute_effects<R, F>(
   scope_backends: &mut BTreeMap<ScopeId, BackendKind>,
   lanes: &mut BTreeMap<ScopeId, u64>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
-  unwatch_replies: &mut BTreeMap<ScopeId, (futures_channel::oneshot::Sender<bool>, bool)>,
+  unwatch_replies: &mut BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
@@ -2306,9 +2332,10 @@ fn execute_effects<R, F>(
             handle.shutdown();
             let _ = tx.try_send(OpResult::TornDown { scope });
           });
-        } else if let Some((reply, verdict)) = unwatch_replies.remove(&scope) {
-          // No stream ever existed (a failed spawn); the unwatch is complete.
-          let _ = reply.send(verdict);
+        } else {
+          // No stream ever existed (a failed spawn); every awaited unwatch is
+          // complete now.
+          resolve_unwatch_waiters(unwatch_replies, scope);
         }
       }
       Effect::AddWatch {

@@ -3304,6 +3304,71 @@ mod replace {
     assert_eq!(rig.fs.shutdowns(), 2, "old stream AND the replacement");
   }
 
+  /// A `RootHandle` is `Copy`, so one scope can accrue several awaited
+  /// unwatches. Every parked waiter must be kept and resolved — dropping one
+  /// would surface to its caller as `Closed`, which the watcher reads as
+  /// driver death. Two unwatches of the same scope, the teardown held: both
+  /// pend, then resolve with their OWN verdicts (the first tore it down =
+  /// `true`, the duplicate found it already dying = `false`), neither closed.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn duplicate_awaited_unwatches_all_resolve_none_dropped() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // Hold the teardown so the scope stays non-quiescent between the two
+    // unwatches (the first removes the handle; the second then lands in the
+    // outstanding-obligation branch that used to OVERWRITE the first waiter).
+    let gate = rig.fs.hold_teardowns();
+    let (r1, mut on1) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(r1),
+      })
+      .await
+      .unwrap();
+    // Let the handle be removed and the held teardown dispatched.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (r2, mut on2) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(r2),
+      })
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Both waiters pend while the teardown is held, and NEITHER is dropped
+    // (a dropped sender would resolve as an error, not `Pending`).
+    assert!(
+      futures_util::poll!(&mut on1).is_pending(),
+      "the first waiter is still parked, not dropped"
+    );
+    assert!(
+      futures_util::poll!(&mut on2).is_pending(),
+      "the second waiter is queued beside the first, not overwriting it"
+    );
+
+    gate.release();
+    assert!(
+      on1
+        .await
+        .expect("the first waiter is answered, never Closed"),
+      "the first unwatch tore the scope down"
+    );
+    assert!(
+      !on2
+        .await
+        .expect("the second waiter is answered, never Closed"),
+      "the duplicate resolves UnknownRoot"
+    );
+    settle(|| rig.fs.shutdowns() == 1).await;
+  }
+
   /// Whole-scope teardown reclaims the delivery lane: repeated watch/unwatch
   /// churn leaves no lane entry behind, so `lanes` stays bounded for the
   /// driver's lifetime (scope ids never recycle).

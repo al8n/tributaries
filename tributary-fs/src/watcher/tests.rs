@@ -599,6 +599,65 @@ mod lifecycle {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
+  /// A `RootHandle` is `Copy`, so a caller can await two unwatches of the
+  /// same root. Both resolve honestly (the first tears it down, the duplicate
+  /// is `UnknownRoot`) and — the load-bearing part — neither is dropped: a
+  /// dropped reply reads as driver death, which would wrongly CLEAR the whole
+  /// registry and erase an UNRELATED live root's overlap fence.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_duplicate_unwatch_never_clears_an_unrelated_root() {
+    let (dir_a, canon_a) = scratch("dup-a");
+    let (dir_b, canon_b) = scratch("dup-b");
+    let fs = FakeFs::new(1);
+    fs.put(&canon_a, FileKind::Dir, 1);
+    fs.put(&canon_b, FileKind::Dir, 2);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+    let handle_a = watcher
+      .watch(&dir_a, Interest::all())
+      .await
+      .expect("watch A");
+    let handle_b = watcher
+      .watch(&dir_b, Interest::all())
+      .await
+      .expect("watch B");
+
+    // Hold the teardown so A stays non-quiescent across both unwatches.
+    let gate = fs.hold_teardowns();
+    let mut u1 = Box::pin(watcher.unwatch(handle_a));
+    assert!(futures_util::poll!(u1.as_mut()).is_pending());
+    // Let the first unwatch remove the handle and dispatch the held teardown
+    // before the duplicate lands in the outstanding-obligation branch.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut u2 = Box::pin(watcher.unwatch(handle_a));
+    assert!(futures_util::poll!(u2.as_mut()).is_pending());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    gate.release();
+    u1.await.expect("the first unwatch succeeds");
+    assert!(
+      matches!(u2.await, Err(UnwatchError::UnknownRoot)),
+      "the duplicate is UnknownRoot, never a Closed that reads as driver death"
+    );
+
+    // The unrelated root B survived: its entry is intact AND its overlap
+    // fence still rejects a colliding watch — proof the registry was never
+    // cleared.
+    assert_eq!(
+      watcher.root_path(handle_b).as_deref(),
+      Some(canon_b.as_path())
+    );
+    let err = watcher
+      .watch(&dir_b, Interest::all())
+      .await
+      .expect_err("B is still registered, so a re-watch overlaps");
+    assert!(matches!(err, WatchRootError::Overlaps { .. }), "{err:?}");
+
+    watcher.close().await.expect("close");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+  }
+
   /// Cancellation at each await boundary of `watch()` — before the grant
   /// exists and with it delivered-but-unpolled — leaves no reservation, no
   /// orphan stream, and no registry entry, and the path watches afresh.
@@ -1159,7 +1218,7 @@ mod lifecycle {
       let (dir_b, _canon_b) = scratch("rc-unpolled-new");
       let fs = FakeFs::new(1);
       fs.put(&canon_a, FileKind::Dir, 1);
-      fs.put(&std::fs::canonicalize(&dir_b).unwrap(), FileKind::Dir, 2);
+      fs.put(std::fs::canonicalize(&dir_b).unwrap(), FileKind::Dir, 2);
       let watcher =
         Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
       let handle = watcher.watch(&dir_a, Interest::all()).await.expect("watch");
