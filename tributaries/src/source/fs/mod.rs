@@ -146,6 +146,18 @@ impl<R: RuntimeLite> FsSource<R> {
 // The deferral queue and the Source seam below are channel and registry work:
 // no method names an `R` item (the runtime bound lives on `new`, the one
 // place the watcher driver is spawned).
+impl<R> Drop for FsSource<R> {
+  fn drop(&mut self) {
+    // A residue of cookie unlinks the control channel never accepted must not
+    // survive this source: unlink each directly (best-effort — a gone file or
+    // an unreadable path is fine). The events these unlinks would mint are
+    // suppressed by the reserved namespace regardless of who observes them.
+    for path in &self.deferred_cookie_removes {
+      let _ = std::fs::remove_file(path);
+    }
+  }
+}
+
 impl<R> FsSource<R> {
   /// Queues a prune the control channel refused (momentarily full), **latest-wins per handle**
   /// ([`Source::set_cover`] contract clause 6): a newer request for the same handle replaces the
@@ -524,6 +536,15 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, RootHandle>> {
+    // Opportunistic drain: retry any queued cookie unlinks the control channel
+    // had refused, so a resolved sync's marker is reaped promptly even on an
+    // otherwise idle watcher (no dedicated worker needed).
+    if !self.deferred_cookie_removes.is_empty() {
+      let watcher = &self.watcher;
+      self
+        .deferred_cookie_removes
+        .retain(|path| !watcher.request_remove_cookie(path.clone()));
+    }
     let raw = self.watcher.next().await?;
     Some(SourceEvent::from_fs(&raw))
   }
@@ -596,15 +617,13 @@ impl<R> Source<OsString> for FsSource<R> {
     // unlink is QUEUED for retry on the next watcher-touching op — not dropped
     // — so a cookie is not silently leaked; the retry queue is bounded by
     // concurrent syncs, with a hard cap as a final backstop.
-    const REMOVE_QUEUE_CAP: usize = 4096;
     let path = key_to_path(cookie_key);
     self.flush_deferred_prunes();
     if !self.watcher.request_remove_cookie(path.clone()) {
-      if self.deferred_cookie_removes.len() >= REMOVE_QUEUE_CAP {
-        // Backstop: drop the oldest queued unlink rather than grow without
-        // bound — it leaves one inert, namespace-suppressed file, never a hang.
-        self.deferred_cookie_removes.remove(0);
-      }
+      // Queue for retry — NEVER dropped: dropping a unique unlink would leak a
+      // file. The queue is bounded by the number of resolved-but-unreaped
+      // syncs, which the umbrella command mailbox bounds; a residue at teardown
+      // is unlinked directly by this source's `Drop`.
       self.deferred_cookie_removes.push(path);
     }
   }

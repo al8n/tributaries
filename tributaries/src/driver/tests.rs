@@ -541,6 +541,7 @@ impl Harness {
       pending_syncs: Vec::new(),
       sync_seq: 0,
       sync_nonce_seed: std::collections::hash_map::RandomState::new(),
+      loss_serial: HashMap::new(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -5118,6 +5119,7 @@ impl OwnerU64 {
       pending_syncs: Vec::new(),
       sync_seq: 0,
       sync_nonce_seed: std::collections::hash_map::RandomState::new(),
+      loss_serial: HashMap::new(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -5650,6 +5652,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     pending_syncs: Vec::new(),
     sync_seq: 0,
     sync_nonce_seed: std::collections::hash_map::RandomState::new(),
+    loss_serial: HashMap::new(),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
@@ -5812,6 +5815,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     pending_syncs: Vec::new(),
     sync_seq: 0,
     sync_nonce_seed: std::collections::hash_map::RandomState::new(),
+    loss_serial: HashMap::new(),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
@@ -6627,6 +6631,7 @@ async fn a_rescan_dominates_a_pending_sync_and_the_rescan_is_published() {
     cookie_key: key("/a/cookie-1"),
     sub,
     root: handle,
+    loss_serial_at_install: 0,
     reply: reply_tx,
   });
 
@@ -6675,6 +6680,7 @@ async fn a_cookie_delivered_over_existing_rescan_debt_resolves_dominated() {
     cookie_key: key("/a/cookie-1"),
     sub,
     root: handle,
+    loss_serial_at_install: 0,
     reply: reply_tx,
   });
   h.owner
@@ -6706,6 +6712,7 @@ async fn an_unwatched_subscription_reaps_its_pending_cookie() {
     cookie_key: key("/a/cookie-1"),
     sub,
     root: handle,
+    loss_serial_at_install: 0,
     reply: reply_tx,
   });
 
@@ -6774,5 +6781,95 @@ async fn a_diverging_in_place_widen_rolls_back_and_keeps_old_coverage() {
   assert!(
     h.owner.subsumer.subscription_root(s_narrow).is_some(),
     "the old subscription is still live on the restored root"
+  );
+}
+
+/// R2-d — a delta shed to a parked Rescan for a pre-cookie change, then
+/// PUBLISHED (cleared from needs_rescan) before the cookie, still resolves the
+/// barrier `Dominated`: the sticky loss serial advanced during the window, so
+/// even with no debt left parked at resolution the caller is told to
+/// re-enumerate rather than trust a false `Delivered`.
+#[tokio::test]
+async fn a_loss_published_before_the_cookie_still_resolves_dominated() {
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::bounded(4);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  // Install the barrier FIRST (snapshots the loss serial at 0).
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-1"),
+    sub,
+    root: handle,
+    loss_serial_at_install: h.owner.loss_serial.get(&sub).copied().unwrap_or(0),
+    reply: reply_tx,
+  });
+
+  // A loss during the window: fill the channel, shed a delta to a parked
+  // Rescan, then drain the channel so the parked Rescan PUBLISHES and clears.
+  for i in 0..4 {
+    h.owner.try_emit(modified_event(sub, "/a/fill", i));
+  }
+  h.owner.try_emit(modified_event(sub, "/a/lost", 9)); // sheds -> parked
+  assert!(h.owner.needs_rescan.contains_key(&sub));
+  let _ = h.drain(); // free the channel
+  h.owner.flush_pending_rescans(); // publish the parked Rescan -> clears needs_rescan
+  assert!(
+    !h.owner.needs_rescan.contains_key(&sub),
+    "the parked Rescan was published and cleared"
+  );
+
+  // The cookie arrives with NO debt parked — but the serial advanced, so
+  // Dominated, not a false Delivered.
+  h.owner
+    .consume_source_event(&source_created(handle, "/a/cookie-1", 20));
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "a loss published before the cookie must still yield Dominated"
+  );
+}
+
+/// R2-a — a widen's re-pointed subscription with a pending sync resolves
+/// `Dominated` at commit time (its stream re-based onto the wider root), never
+/// waiting for a cookie on the old handle.
+#[tokio::test]
+async fn a_widen_resolves_the_repointed_subscriptions_pending_sync() {
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  let s_narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let handle = h.owner.subsumer.subscription_root(s_narrow).expect("live");
+
+  // A pending sync on the narrow sub.
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/b/cookie-1"),
+    sub: s_narrow,
+    root: handle,
+    loss_serial_at_install: 0,
+    reply: reply_tx,
+  });
+
+  // Widen /a/b -> /a: s_narrow is re-pointed onto the wider root.
+  let _wide = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "the re-pointed subscription's barrier resolves Dominated at the widen"
   );
 }

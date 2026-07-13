@@ -129,6 +129,12 @@ struct PendingSync<C, H> {
   sub: Subscription,
   /// The root the cookie was written under: a root death dominates it.
   root: H,
+  /// The subscription's loss serial at the moment this sync was installed. If
+  /// the sub's serial has ADVANCED by resolution time, a coverage loss touched
+  /// it DURING the barrier's window (parked then possibly already published),
+  /// so the barrier is met by re-enumeration — `Dominated`, not `Delivered`,
+  /// even when no debt remains parked at the instant of resolution.
+  loss_serial_at_install: u64,
   /// Resolved `Delivered` when the cookie is seen, `Dominated` when a covering
   /// `Rescan` (or a root death) stands in for it.
   reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
@@ -521,6 +527,7 @@ where
       pending_syncs: Vec::new(),
       sync_seq: 0,
       sync_nonce_seed: std::collections::hash_map::RandomState::new(),
+      loss_serial: HashMap::new(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -824,6 +831,12 @@ where
     timeout: core::time::Duration,
   ) -> Result<SyncOutcome, SyncError> {
     let (reply, response) = futures_channel::oneshot::channel();
+    // Admission first: the command mailbox is bounded and drained by the owner
+    // (whose only inline stall — a `begin_sync` — is itself fence-bounded), so
+    // `send` completes in bounded time. It cannot ride inside the `R::timeout`
+    // below because `async_channel::Send` is `!Send` and `R::timeout` requires
+    // a `Send` future; the observation deadline is what the caller's timeout
+    // governs.
     if self
       .commands
       .send(Command::Sync { sub, reply })
@@ -960,6 +973,14 @@ where
   /// other process, so a per-sync nonce derived from it (hashing `sync_seq`)
   /// is unpredictable externally — the cookie name cannot be pre-created.
   sync_nonce_seed: std::collections::hash_map::RandomState,
+  /// Per-subscription monotonic **loss serial**, bumped every time the sub
+  /// sheds a delta to (or overflows) a parked `Rescan`, and NEVER decremented
+  /// on publish. A pending sync snapshots it at install; if it has advanced by
+  /// resolution, a loss covered pre-cookie changes during the barrier and the
+  /// barrier is `Dominated` even if the parked debt has since been published
+  /// and cleared from `needs_rescan`. Bounded by live subs (cleaned on
+  /// retirement).
+  loss_serial: HashMap<Subscription, u64>,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of the dedicated **high-priority shutdown signal**: a
   /// [`close`](Tributaries::close) sends its [`CloseReply`] here, NOT the command mailbox. The
@@ -1020,6 +1041,14 @@ where
   /// be drained mid-unwind and are necessarily lost on a panic; emptying the plane is the achievable
   /// guarantee.
   fn drop(&mut self) {
+    // Best-effort reap of any cookie still pending — a panic from a caller
+    // callback (a `Filter`) unwinds through here, bypassing the normal-exit
+    // `reap_all_pending_syncs`, and the marker files must not survive. Each
+    // `end_sync` is fire-and-forget (a non-panicking `try_send`), so it cannot
+    // double-panic while unwinding.
+    for pending in std::mem::take(&mut self.pending_syncs) {
+      self.source.end_sync(pending.root, &pending.cookie_key);
+    }
     self.subsumer.publish_empty();
   }
 }
@@ -1791,18 +1820,26 @@ where
           // strand an old subscriber. The handle is PRESERVED and its
           // subscribers are still committed to it — so we must NOT disarm it
           // (that was the strand bug). ROLL THE RETARGET BACK to the sole
-          // root's original key, restoring its exact pre-widen coverage on
-          // the same handle, then abort the newcomer.
-          if self.source.replace(handle, &only_key).await.is_ok() {
+          // root's original key, and accept the rollback ONLY when it restored
+          // the handle to that EXACT key — a rollback that itself diverges (an
+          // `Ok` at a different key) is not a restore.
+          let restored = matches!(
+            self.source.replace(handle, &only_key).await,
+            Ok(armed) if armed.canonical_key() == only_key.as_slice()
+          );
+          if restored {
             self.subsumer.abort_watch(&outcome);
             return Err(canonical_race());
           }
-          // The rollback ITSELF raced (a double canonicalization pathology):
-          // the handle can no longer be restored to its old coverage, so its
-          // subscribers genuinely lost their ground. Retire the root with a
-          // dominating terminal `Rescan` so each subscriber re-enumerates and
-          // learns its coverage changed — never a silent strand — then abort.
+          // The rollback did not restore the original coverage — it diverged
+          // again (a double canonicalization pathology) or failed atomically,
+          // leaving the handle watching somewhere its old subscribers do not
+          // cover. Retire the root with a durable dominating terminal `Rescan`
+          // so each subscriber re-enumerates, THEN release the still-live
+          // source watch — otherwise it leaks coverage and trips future
+          // overlap checks (never a silent strand).
           self.retire_root_with_terminal_rescan(handle);
+          self.source.disarm(handle);
           self.subsumer.abort_watch(&outcome);
           return Err(canonical_race());
         }
@@ -1908,6 +1945,13 @@ where
       rescans.push(event);
     }
     self.push_all(rescans);
+    // Each re-pointed subscription now carries a durable dominating `Rescan`
+    // (published or parked by `push_all`): resolve any barrier riding it
+    // `Dominated`, so a pending sync does not wait for a cookie on a stream
+    // that just re-based onto the wider root.
+    for &moved in repointed {
+      self.dominate_syncs_of_subscription(moved);
+    }
   }
 
   /// Registers a freshly-committed subscription's [`Debounce`] posture with the
@@ -2073,6 +2117,7 @@ where
     self.needs_rescan.remove(&sub);
     self.suppressed_rescan.remove(&sub);
     self.unclaimed.remove(&sub);
+    self.loss_serial.remove(&sub);
     if let Some(coalescer) = self.coalescer.as_mut() {
       // FORGET, not drop: the subscription is ending, so its registered debounce policy
       // goes with its buffered deltas — unlike the still-live shed paths (a widen/restore
@@ -2142,6 +2187,7 @@ where
   fn retire_sub_state(&mut self, sub: Subscription) {
     self.filters.remove(&sub);
     self.epochs.remove(sub);
+    self.loss_serial.remove(&sub);
   }
 
   /// Restores the pre-widen armed state after a widen disarmed its subsumed roots but then
@@ -2203,7 +2249,7 @@ where
           // subscriber (raw epochs restarted at zero) with a dominating Rescan.
           self.subsumer.rebind_root(old, new_handle);
           let mut rescans = Vec::with_capacity(subscribers.len());
-          for sub in subscribers {
+          for &sub in &subscribers {
             // As in the widen path: the restore re-point Rescan dominates the subscriber's
             // buffered pre-widen coalescer deltas, so drop them before delivering it — else a
             // buffered delta can flush ahead of the Rescan on a full channel and park one epoch
@@ -2220,6 +2266,13 @@ where
             rescans.push(event);
           }
           self.push_all(rescans);
+          // Each re-bound subscriber now carries a durable dominating restore
+          // `Rescan`: resolve any barrier riding it `Dominated` (its stream
+          // re-based onto the fresh handle), rather than waiting for a cookie
+          // whose old handle is dead.
+          for &sub in &subscribers {
+            self.dominate_syncs_of_subscription(sub);
+          }
         }
         Ok((new_handle, _diverged)) => {
           // Re-armed, but at a divergent key we cannot cleanly rebind: request release of the stray
@@ -2388,7 +2441,15 @@ where
   ///
   /// A subscription with no live key (raced retirement) is not parked — a stale parked
   /// `Rescan` would be co-retired anyway, and there is no subtree left to name.
+  /// Records that `sub` just lost coverage to a parked `Rescan` — bumps its
+  /// sticky loss serial so a pending sync installed before this loss resolves
+  /// `Dominated` even after the parked debt is published and cleared.
+  fn note_loss(&mut self, sub: Subscription) {
+    *self.loss_serial.entry(sub).or_insert(0) += 1;
+  }
+
   fn park_rescan(&mut self, sub: Subscription) {
+    self.note_loss(sub);
     let Some(key) = self.subsumer.subscription_key(sub).map(<[C]>::to_vec) else {
       return;
     };
@@ -2425,6 +2486,7 @@ where
   /// dominated.
   fn park_rescan_event(&mut self, ev: Event<C, V>) {
     let sub = ev.subscription();
+    self.note_loss(sub);
     let target = if self.unclaimed.contains(&sub) {
       &mut self.suppressed_rescan
     } else {
@@ -2723,12 +2785,16 @@ where
     // away cancels the parked write via the fence's cancelled-reply prune;
     // a since-installed pending sync is reaped at the loop-top prune. (O5.)
     match self.source.begin_sync(root, &dir_key, token).await {
-      Ok(cookie_key) => self.pending_syncs.push(PendingSync {
-        cookie_key,
-        sub,
-        root,
-        reply,
-      }),
+      Ok(cookie_key) => {
+        let loss_serial_at_install = self.loss_serial.get(&sub).copied().unwrap_or(0);
+        self.pending_syncs.push(PendingSync {
+          cookie_key,
+          sub,
+          root,
+          loss_serial_at_install,
+          reply,
+        });
+      }
       Err(err) => {
         let _ = reply.send(Err(err));
       }
@@ -2751,7 +2817,13 @@ where
       return;
     };
     let pending = self.pending_syncs.swap_remove(idx);
-    let outcome = if self.flush_subscription_now(pending.sub) {
+    // A loss touched the sub DURING the barrier (serial advanced) — even if
+    // its parked Rescan has since been published and cleared — OR debt remains
+    // after the flush: either way re-enumeration stands in for delivery.
+    let lost_during_window =
+      self.loss_serial.get(&pending.sub).copied().unwrap_or(0) != pending.loss_serial_at_install;
+    let clean = self.flush_subscription_now(pending.sub) && !lost_during_window;
+    let outcome = if clean {
       SyncOutcome::Delivered
     } else {
       SyncOutcome::Dominated
@@ -2793,6 +2865,24 @@ where
         let _ = pending.reply.send(Ok(SyncOutcome::Dominated));
         // Best-effort reap even on a dead root: the file may linger (the
         // directory outlived the watch), and `remove_cookie` is idempotent.
+        self.reap_cookie(pending.root, &pending.cookie_key);
+      } else {
+        i += 1;
+      }
+    }
+  }
+
+  /// Resolves every barrier of `sub` as `Dominated` and reaps its cookie —
+  /// used when the subscription has just been handed a durable dominating
+  /// `Rescan` (a widen re-point, a restore rebind): re-enumeration meets the
+  /// barrier, so it must not wait for a cookie whose stream may have moved
+  /// under it.
+  fn dominate_syncs_of_subscription(&mut self, sub: Subscription) {
+    let mut i = 0;
+    while i < self.pending_syncs.len() {
+      if self.pending_syncs[i].sub == sub {
+        let pending = self.pending_syncs.swap_remove(i);
+        let _ = pending.reply.send(Ok(SyncOutcome::Dominated));
         self.reap_cookie(pending.root, &pending.cookie_key);
       } else {
         i += 1;

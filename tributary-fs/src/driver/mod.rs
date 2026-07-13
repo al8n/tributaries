@@ -469,14 +469,23 @@ fn resolve_cover_settlements<R, F>(
         let ParkedCookie {
           dir, name, reply, ..
         } = cookie;
-        let outcome =
-          ops
-            .write_cookie(&dir, &name)
-            .map_err(|source| crate::error::SyncRootError::Write {
+        match ops.write_cookie(&dir, &name) {
+          Ok(path) => {
+            // A caller that abandoned the sync (timed out, dropped the future)
+            // has dropped this reply receiver. The cookie file was still
+            // written, so reap it immediately rather than leak it — the write
+            // completing late must not outlive the barrier that asked for it.
+            if let Err(Ok(path)) = reply.send(Ok(path)) {
+              ops.remove_cookie(&path);
+            }
+          }
+          Err(source) => {
+            let _ = reply.send(Err(crate::error::SyncRootError::Write {
               path: dir.join(&name),
               source,
-            });
-        let _ = reply.send(outcome);
+            }));
+          }
+        }
       });
     }
   }
