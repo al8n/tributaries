@@ -826,8 +826,16 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
     |parts: &[&str]| -> Vec<OsString> { parts.iter().map(|p| OsString::from(*p)).collect() };
 
   // Our own cookie, rendered from a token.
-  let name = super::cookie_name(SyncToken::new(7, 42, 3));
-  assert_eq!(name, ".tributaries-sync-7-42-3");
+  let name = super::cookie_name(SyncToken::new(7, 42, 3, 0xdead_beef));
+  assert_eq!(name, ".tributaries-sync-7-42-3-00000000deadbeef");
+  // The trailing nonce is what an external writer cannot predict — but
+  // classification keys on the reserved PREFIX alone, so a cookie is a cookie
+  // whatever its nonce.
+  assert!(source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-7-42-3-00000000deadbeef"
+  ])));
   assert!(source.is_sync_artifact(&key(&["/", "r", &name])));
 
   // A FOREIGN instance's cookie, and a crashed process's leftover: both are

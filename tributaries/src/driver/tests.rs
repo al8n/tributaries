@@ -80,6 +80,8 @@ struct FakeSource {
   /// OFF by default, so every existing cell keeps exercising the release-and-rearm
   /// path; the adoption cells turn it on.
   supports_replace: bool,
+  /// Cookie keys handed to `end_sync` — the reap ledger (F5).
+  ended_syncs: Vec<Vec<OsString>>,
   /// How many of the next `arm` calls to fail, decremented on each failed arm.
   fail_arms: u32,
   /// How many of the next `grow` calls to fail with [`WatchError::CoverageIncomplete`],
@@ -122,6 +124,7 @@ impl FakeSource {
       live: HashMap::new(),
       canonical: HashMap::new(),
       supports_replace: false,
+      ended_syncs: Vec::new(),
       fail_arms: 0,
       fail_grows: 0,
       dead_on_arrival_arms: 0,
@@ -313,6 +316,18 @@ impl Source<OsString> for FakeSource {
     Ok(Armed::new(handle, canonical_key))
   }
 
+  fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+    // The fake's reserved namespace: a leaf starting with `cookie-`.
+    key
+      .last()
+      .and_then(|leaf| leaf.to_str())
+      .is_some_and(|leaf| leaf.starts_with("cookie-"))
+  }
+
+  fn end_sync(&mut self, _handle: u32, cookie_key: &[OsString]) {
+    self.ended_syncs.push(cookie_key.to_vec());
+  }
+
   async fn replace(
     &mut self,
     handle: u32,
@@ -323,10 +338,18 @@ impl Source<OsString> for FakeSource {
     }
     let path: PathBuf = new_key.iter().collect();
     self.calls.push(Call::Replace(handle, path.clone()));
-    // Make-before-break, modeled: the SAME handle now covers the wider key, and
-    // the old coverage is never dropped in between.
-    self.live.insert(handle, path.clone());
-    let canonical: Vec<OsString> = new_key.to_vec();
+    // The canonical key honors the retarget override (mirroring `arm`), so a
+    // test can model an fs-side canonicalization race the `fs_path_preserves_plan`
+    // guard must catch — the divergent-widen rollback path.
+    let canonical_path = self
+      .retarget
+      .get(&path)
+      .cloned()
+      .unwrap_or_else(|| path.clone());
+    let canonical: Vec<OsString> = components(&canonical_path);
+    // Make-before-break, modeled: the SAME handle now covers the (canonical)
+    // key, and the old coverage is never dropped in between.
+    self.live.insert(handle, canonical_path);
     self.canonical.insert(handle, canonical.clone());
     Ok(Armed::new(handle, canonical))
   }
@@ -517,6 +540,7 @@ impl Harness {
       coalescer,
       pending_syncs: Vec::new(),
       sync_seq: 0,
+      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -5093,6 +5117,7 @@ impl OwnerU64 {
       coalescer,
       pending_syncs: Vec::new(),
       sync_seq: 0,
+      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -5624,6 +5649,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     coalescer: None,
     pending_syncs: Vec::new(),
     sync_seq: 0,
+    sync_nonce_seed: std::collections::hash_map::RandomState::new(),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
@@ -5785,6 +5811,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     coalescer: None,
     pending_syncs: Vec::new(),
     sync_seq: 0,
+    sync_nonce_seed: std::collections::hash_map::RandomState::new(),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
@@ -6577,4 +6604,175 @@ async fn source_drain_close_is_surfaced_under_sustained_command_flood() {
     "close() completes once the drain surfaced and acked its close, under the flood"
   );
   flood.abort();
+}
+
+/// F2 + F3 — a `Rescan` at or above a pending cookie's key resolves that
+/// barrier `Dominated`, and it does so only AFTER the `Rescan` itself is
+/// published to the stream (structurally: `consume_source_event` fans out
+/// before it dominates). The postcondition proves both: the caller's reply is
+/// `Dominated` AND the covering `Rescan` is drainable, never a reply that
+/// outran its cover.
+#[tokio::test]
+async fn a_rescan_dominates_a_pending_sync_and_the_rescan_is_published() {
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-1"),
+    sub,
+    root: handle,
+    reply: reply_tx,
+  });
+
+  h.owner.consume_source_event(&rescan_event(handle, "/a", 5));
+
+  let events = h.drain();
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "the covering Rescan is on the stream: {events:?}"
+  );
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "the barrier resolved Dominated, not Delivered"
+  );
+}
+
+/// F3 — a cookie that is delivered while its subscription already carries a
+/// parked `Rescan` (an earlier loss) resolves `Dominated`, not `Delivered`:
+/// the caller must re-enumerate, so reporting a clean delivery would risk
+/// stale state.
+#[tokio::test]
+async fn a_cookie_delivered_over_existing_rescan_debt_resolves_dominated() {
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  // A bounded, stalled channel so a fanned Rescan sheds to `needs_rescan`.
+  let mut h = Harness::bounded(1);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  // Fill the channel, then a Rescan sheds the sub to a parked (needs_rescan) Rescan.
+  h.owner.try_emit(modified_event(sub, "/a/x", 1));
+  h.owner.consume_source_event(&rescan_event(handle, "/a", 2));
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the sub carries parked Rescan debt"
+  );
+
+  // Now the cookie arrives. Delivery cannot be clean while a Rescan is owed.
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-1"),
+    sub,
+    root: handle,
+    reply: reply_tx,
+  });
+  h.owner
+    .consume_source_event(&source_created(handle, "/a/cookie-1", 3));
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "a cookie delivered over Rescan debt is Dominated"
+  );
+}
+
+/// F5 — a CALLER unwatch of a subscription with a pending sync fails the
+/// barrier `Retired` AND reaps its cookie file (the root is still live, so the
+/// marker is real and must not leak).
+#[tokio::test]
+async fn an_unwatched_subscription_reaps_its_pending_cookie() {
+  use futures_util::FutureExt;
+
+  use crate::error::SyncError;
+
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-1"),
+    sub,
+    root: handle,
+    reply: reply_tx,
+  });
+
+  h.owner.release_subscription(sub).expect("unwatch");
+
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Err(SyncError::Retired)))
+    ),
+    "the caller-unwatched barrier fails Retired"
+  );
+  assert_eq!(
+    h.owner.source.ended_syncs,
+    vec![key("/a/cookie-1")],
+    "the cookie is reaped, not leaked"
+  );
+}
+
+/// F6 — an in-place widen whose retarget canonicalizes to a key that does NOT
+/// contain the subsumed root ROLLS THE HANDLE BACK to its original coverage
+/// (never disarms it while old subscribers are committed) and refuses the
+/// newcomer with a canonicalization race.
+#[tokio::test]
+async fn a_diverging_in_place_widen_rolls_back_and_keeps_old_coverage() {
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+
+  let s_narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+
+  // The widen of /a canonicalizes to /z — which does NOT contain /a/b, so it
+  // would strand s_narrow. The rollback must restore /a/b on the same handle.
+  h.owner
+    .source
+    .retarget
+    .insert(PathBuf::from("/a"), PathBuf::from("/z"));
+
+  let err = h
+    .watch("/a", Interest::all())
+    .await
+    .expect_err("the diverging widen is refused");
+  assert!(matches!(err, WatchError::CanonicalRace), "{err:?}");
+
+  // The preserved handle was NEVER disarmed — no Disarm in the ledger.
+  assert!(
+    !h.owner
+      .source
+      .calls()
+      .iter()
+      .any(|c| matches!(c, Call::Disarm(_))),
+    "the preserved handle must not be disarmed while old subscribers remain: {:?}",
+    h.owner.source.calls()
+  );
+  // s_narrow still has its coverage: the root is keyed back at /a/b.
+  let roots: Vec<PathBuf> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
+  assert_eq!(
+    roots,
+    vec![PathBuf::from("/a/b")],
+    "the sole root is rolled back to its original coverage"
+  );
+  assert!(
+    h.owner.subsumer.subscription_root(s_narrow).is_some(),
+    "the old subscription is still live on the restored root"
+  );
 }

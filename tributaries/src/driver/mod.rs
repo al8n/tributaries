@@ -114,7 +114,8 @@ enum Command<C, V> {
     /// The subscription the barrier is for.
     sub: Subscription,
     /// Resolved at OBSERVATION (or domination), not at cookie-write: the
-    /// owner parks it in `pending_syncs` until the funnel matches.
+    /// owner parks it in `pending_syncs` until the funnel matches. The
+    /// caller's deadline is enforced at the outer level (`Tributaries::sync`).
     reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
   },
 }
@@ -519,6 +520,7 @@ where
       coalescer: debounce.map(|config| Coalescer::new(Some(config))),
       pending_syncs: Vec::new(),
       sync_seq: 0,
+      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -954,6 +956,10 @@ where
   pending_syncs: Vec<PendingSync<C, S::Handle>>,
   /// The per-owner monotonic cookie sequence — the `seq` of every `SyncToken`.
   sync_seq: u64,
+  /// The owner's secret hasher seed: OS-random at construction, unknown to any
+  /// other process, so a per-sync nonce derived from it (hashing `sync_seq`)
+  /// is unpredictable externally — the cookie name cannot be pre-created.
+  sync_nonce_seed: std::collections::hash_map::RandomState,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of the dedicated **high-priority shutdown signal**: a
   /// [`close`](Tributaries::close) sends its [`CloseReply`] here, NOT the command mailbox. The
@@ -1248,6 +1254,11 @@ where
       } => break (closing, drain_owed),
     }
   };
+
+  // Reap every cookie still riding a pending sync: their callers will see the
+  // dropped reply as `Closed`, but the marker FILES must not survive the owner
+  // (their names are unique, so unreaped they accrue in the watched trees).
+  owner.reap_all_pending_syncs();
 
   // Whichever close we owe an acknowledgement: the loop-break close (consumer-initiated, from the
   // dedicated close arm), or a close that interrupted the source-drain retry (returned by
@@ -1754,21 +1765,44 @@ where
         // `replace` is atomic on failure, so ANY error — including the default
         // "this source cannot widen in place" — falls through to the old dance with
         // the old root's coverage untouched. Nothing has been disarmed yet.
+        // Capture the sole subsumed root's key BEFORE the retarget, so a
+        // canonicalization race can be rolled back exactly.
         let in_place = match unwatch.as_slice() {
-          [only] => self.source.replace(*only, key).await.ok(),
+          [only] => self
+            .source
+            .root_key(*only)
+            .map(|only_key| (*only, only_key)),
           _ => None,
         };
-        if let Some(armed) = in_place {
+        // A retarget that fails resolves `Err` and falls through to
+        // release-and-rearm — the source left the old root's coverage
+        // untouched (atomic on failure), and nothing has been disarmed yet.
+        if let Some((only, only_key)) = in_place
+          && let Ok(armed) = self.source.replace(only, key).await
+        {
           let handle = armed.handle();
           let fs_key = armed.canonical_key().to_vec();
           if self.subsumer.fs_path_preserves_plan(&fs_key, unwatch) {
             self.commit_widen(&outcome, handle, &fs_key, sub, filter, debounce, &repointed);
             return Ok(sub);
           }
-          // The in-place widen committed a key the plan does not preserve (a
-          // canonicalization race). The source's own root is now that key, so the
-          // release-and-rearm fallback would fight it — abort honestly instead.
-          self.source.disarm(handle);
+          // A canonicalization race: the retarget committed a key that does
+          // NOT contain every subsumed root, so the widened coverage would
+          // strand an old subscriber. The handle is PRESERVED and its
+          // subscribers are still committed to it — so we must NOT disarm it
+          // (that was the strand bug). ROLL THE RETARGET BACK to the sole
+          // root's original key, restoring its exact pre-widen coverage on
+          // the same handle, then abort the newcomer.
+          if self.source.replace(handle, &only_key).await.is_ok() {
+            self.subsumer.abort_watch(&outcome);
+            return Err(canonical_race());
+          }
+          // The rollback ITSELF raced (a double canonicalization pathology):
+          // the handle can no longer be restored to its old coverage, so its
+          // subscribers genuinely lost their ground. Retire the root with a
+          // dominating terminal `Rescan` so each subscriber re-enumerates and
+          // learns its coverage changed — never a silent strand — then abort.
+          self.retire_root_with_terminal_rescan(handle);
           self.subsumer.abort_watch(&outcome);
           return Err(canonical_race());
         }
@@ -2225,10 +2259,6 @@ where
   ///
   /// A no-op if `handle` is not a live root.
   fn retire_root_with_terminal_rescan(&mut self, handle: S::Handle) {
-    // The root is gone and every subscriber is durably owed a terminal
-    // `Rescan` — which dominates anything a cookie could have proven. Resolve
-    // this root's barriers by domination rather than stranding them.
-    self.dominate_syncs_of_root(handle);
     // Capture the root's key + subscribers while it is still recorded; force_remove is deferred
     // until every owed terminal Rescan is durably parked.
     let Some((root_key, subscribers)) = self
@@ -2259,6 +2289,13 @@ where
         coalescer.forget_subscription(sub);
       }
     }
+    // Every subscriber's dominating terminal `Rescan` is now durable in
+    // `needs_rescan` (or `suppressed_rescan` for an unclaimed sub). ONLY NOW
+    // resolve this root's pending barriers `Dominated`: a caller waking on
+    // another thread then re-enumerates against a `Rescan` that is already
+    // parked ahead of any later delta — never the prohibited half-barrier of
+    // a reply that outruns its covering `Rescan`.
+    self.dominate_syncs_of_root(handle);
     // The owed Rescans are now durable: tear the dead root out of the index and free each
     // subscriber's per-sub filter + epoch state (the parked `needs_rescan` entry is kept).
     for sub in self.subsumer.force_remove_root(handle) {
@@ -2604,23 +2641,28 @@ where
   /// signal can never reach subscribers with the stale claim left standing on either path.
   fn consume_source_event(&mut self, event: &SourceEvent<C, S::Handle>) {
     if !self.retire_if_dead(event) {
-      // A `Rescan` is NEVER suppressed, whatever its key — it is coverage
-      // information, structurally unmaskable — but it CAN dominate a pending
-      // cookie: a loss that ate the cookie's own event elects a covering
-      // signal at that position instead, and re-enumeration meets the barrier
-      // just as delivery would.
-      if event.kind().is_rescan() {
-        self.dominate_pending_syncs(event);
-      } else if self.source.is_sync_artifact(event.key()) {
-        // A cookie — ours, another instance's, or a crashed process's
-        // leftover (and the unlink events of all of them). CONSUMED here:
-        // never fanned out, never coalesced, never delivered. Suppression is
-        // namespace-total, so it can never depend on the pending map.
+      // A cookie (ours, another instance's, or a crashed process's leftover —
+      // and the unlink events of all of them) is CONSUMED here: never fanned
+      // out, never coalesced, never delivered. Suppression is namespace-total,
+      // so it can never depend on the pending map. A `Rescan` is never a
+      // cookie (checked first), because it is coverage information and is
+      // structurally unmaskable.
+      if !event.kind().is_rescan() && self.source.is_sync_artifact(event.key()) {
         self.resolve_matching_pending_sync(event);
         return;
       }
       self.degrade_retained_cover_on_rescan(event);
       self.fan_out_and_push(event);
+      // A `Rescan` can DOMINATE a pending cookie — a loss that ate the
+      // cookie's own event elects a covering signal at that position, and
+      // re-enumeration meets the barrier just as delivery would. It is
+      // resolved ONLY NOW, strictly AFTER `fan_out_and_push` has published or
+      // durably parked the `Rescan`: a barrier that resolved first would let
+      // a caller waking on another thread drain past a `Rescan` that is not
+      // yet in the channel or `needs_rescan` — the prohibited half-barrier.
+      if event.kind().is_rescan() {
+        self.dominate_pending_syncs(event);
+      }
     }
   }
 
@@ -2645,11 +2687,41 @@ where
       return;
     };
     self.sync_seq += 1;
-    let token = SyncToken::new(sub.instance().get(), std::process::id(), self.sync_seq);
-    // Awaited here — never the OBSERVATION, which arrives through the very
+    // An unguessable nonce keyed by the owner's OS-random secret: another
+    // writer under the tree cannot predict it, so it cannot pre-create a
+    // colliding marker whose stale event would falsely complete this sync.
+    let nonce = {
+      use std::hash::{BuildHasher, Hasher};
+      let mut hasher = self.sync_nonce_seed.build_hasher();
+      hasher.write_u64(self.sync_seq);
+      hasher.finish()
+    };
+    let token = SyncToken::new(
+      sub.instance().get(),
+      std::process::id(),
+      self.sync_seq,
+      nonce,
+    );
+    // Awaited INLINE — never the OBSERVATION, which arrives through the very
     // `next` pump this owner drives (awaiting it would deadlock by
-    // construction). The binding parks the write behind its own coverage
-    // settle fence, which is why this initiation is bounded like `grow`.
+    // construction). The inline await is FORCED by the `&mut self.source` +
+    // conditional-`Send` seam, exactly as it is for `arm` and `grow`: a timer
+    // wrapper is infeasible here, because `R::timeout` requires the inner
+    // future to be `Send` (which `LocalSource::begin_sync` is not) while
+    // `R::timeout_local` is unconditionally `!Send` (which would break the
+    // `Send` promise `parts()` makes on the `Source` path). So there is no
+    // generic timer that preserves the run future's conditional `Send`.
+    //
+    // This is bounded, not an unbounded wedge: `begin_sync` parks the cookie
+    // write on the fs coverage-settle fence, which the SEPARATE fs-driver task
+    // resolves in at most `REARM_MAX_RETRIES` steps (each terminal is
+    // armed-live or degraded-with-a-standing-`Rescan`), independent of this
+    // owner's state; a root dying mid-park replies `Retired`. So it resolves
+    // in bounded time however this owner is otherwise occupied. The caller's
+    // deadline is enforced at the OUTER level (`Tributaries::sync` wraps the
+    // response in `R::timeout` — the `Send` path), and a caller that walks
+    // away cancels the parked write via the fence's cancelled-reply prune;
+    // a since-installed pending sync is reaped at the loop-top prune. (O5.)
     match self.source.begin_sync(root, &dir_key, token).await {
       Ok(cookie_key) => self.pending_syncs.push(PendingSync {
         cookie_key,
@@ -2665,8 +2737,11 @@ where
 
   /// The cookie arrived: everything the backend reported before its write has
   /// already exited the pipeline ahead of it (per-source FIFO). Flush what the
-  /// debounce still holds for that subscription, then resolve its barrier
-  /// `Delivered`.
+  /// debounce still holds for that subscription, then resolve the barrier —
+  /// `Delivered` when that flush was clean, `Dominated` when the subscription
+  /// owes a `Rescan` instead (an earlier loss, or a delta shed to a parked
+  /// `Rescan` by a full channel during the flush): the caller must re-read,
+  /// not replay, so telling it `Delivered` would risk stale state.
   fn resolve_matching_pending_sync(&mut self, event: &SourceEvent<C, S::Handle>) {
     let Some(idx) = self
       .pending_syncs
@@ -2676,8 +2751,12 @@ where
       return;
     };
     let pending = self.pending_syncs.swap_remove(idx);
-    self.flush_subscription_now(pending.sub);
-    let _ = pending.reply.send(Ok(SyncOutcome::Delivered));
+    let outcome = if self.flush_subscription_now(pending.sub) {
+      SyncOutcome::Delivered
+    } else {
+      SyncOutcome::Dominated
+    };
+    let _ = pending.reply.send(Ok(outcome));
     self.reap_cookie(pending.root, &pending.cookie_key);
   }
 
@@ -2712,6 +2791,9 @@ where
       if self.pending_syncs[i].root == root {
         let pending = self.pending_syncs.swap_remove(i);
         let _ = pending.reply.send(Ok(SyncOutcome::Dominated));
+        // Best-effort reap even on a dead root: the file may linger (the
+        // directory outlived the watch), and `remove_cookie` is idempotent.
+        self.reap_cookie(pending.root, &pending.cookie_key);
       } else {
         i += 1;
       }
@@ -2727,6 +2809,8 @@ where
       if self.pending_syncs[i].sub == sub {
         let pending = self.pending_syncs.swap_remove(i);
         let _ = pending.reply.send(Err(SyncError::Retired));
+        // The root lives on — the cookie is a real file that must not leak.
+        self.reap_cookie(pending.root, &pending.cookie_key);
       } else {
         i += 1;
       }
@@ -2756,20 +2840,37 @@ where
     self.source.end_sync(root, cookie_key);
   }
 
+  /// Reaps every still-pending cookie at owner teardown — the marker files must
+  /// not outlive the owner.
+  fn reap_all_pending_syncs(&mut self) {
+    for pending in std::mem::take(&mut self.pending_syncs) {
+      self.source.end_sync(pending.root, &pending.cookie_key);
+    }
+  }
+
   /// Emits everything the debounce is holding for ONE subscription, in
   /// admission (= epoch) order — the barrier's flush stage. Other
   /// subscriptions' buffers are untouched.
-  fn flush_subscription_now(&mut self, sub: Subscription) {
-    let Some(coalescer) = self.coalescer.as_mut() else {
-      return;
-    };
+  /// Emits everything the debounce holds for `sub`, in admission (= epoch)
+  /// order, and reports whether that delivery was **clean**: `true` when the
+  /// subscription owes NO dominating `Rescan` afterward, `false` when it does
+  /// — either it already carried `needs_rescan` debt (an earlier loss), or a
+  /// full event channel forced `try_emit` to shed a delta to a parked `Rescan`
+  /// during this very flush. A `false` means the barrier is met by
+  /// re-enumeration, not by delivery, so the caller must be told `Dominated`.
+  fn flush_subscription_now(&mut self, sub: Subscription) -> bool {
     let now: Instant = R::now().into();
-    coalescer.flush_subscription(sub, now);
     let mut due = Vec::new();
-    coalescer.drain_ready(now, &mut due);
+    if let Some(coalescer) = self.coalescer.as_mut() {
+      coalescer.flush_subscription(sub, now);
+      coalescer.drain_ready(now, &mut due);
+    }
     for event in due {
       self.try_emit(event);
     }
+    // Debt after the flush — pre-existing OR just shed by a full channel —
+    // means a `Rescan` stands in for delivery: not a clean deliver.
+    !self.needs_rescan.contains_key(&sub)
   }
 
   /// A live-root source `Rescan` is a coverage-loss signal from the layer that owns the
