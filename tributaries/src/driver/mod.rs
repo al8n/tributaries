@@ -107,17 +107,20 @@ enum Command<C, V> {
     /// The reply channel: success, or why the drop failed.
     reply: futures_channel::oneshot::Sender<Result<(), UnwatchError>>,
   },
-  /// Establish a sync barrier on `sub`: place a cookie under its coverage and
-  /// resolve once that cookie's own event has exited the pipeline (or a
-  /// covering `Rescan` has dominated it).
-  Sync {
-    /// The subscription the barrier is for.
-    sub: Subscription,
-    /// Resolved at OBSERVATION (or domination), not at cookie-write: the
-    /// owner parks it in `pending_syncs` until the funnel matches. The
-    /// caller's deadline is enforced at the outer level (`Tributaries::sync`).
-    reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
-  },
+}
+
+/// A **sync-barrier request** riding sync's OWN mailbox — deliberately concrete (no `C`/`V`), so
+/// `async_channel::Send<SyncRequest>` is unconditionally `Send` and [`Tributaries::sync`] can bound
+/// admission AND observation inside one `R::timeout`. The public [`Command`] mailbox carries
+/// key/value-bearing variants whose `async_channel::Send` is not `Send` for all `C`/`V`, so a sync's
+/// admission must never queue behind it — hence its own channel.
+struct SyncRequest {
+  /// The subscription the barrier is for.
+  sub: Subscription,
+  /// Resolved at OBSERVATION (or domination), not at cookie-write: the owner parks it in
+  /// `pending_syncs` until the funnel matches. The caller's deadline is enforced by the `R::timeout`
+  /// in [`Tributaries::sync`], never here.
+  reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
 }
 
 /// One in-flight sync barrier: the cookie the owner is waiting to see, whose
@@ -135,6 +138,10 @@ struct PendingSync<C, H> {
   /// so the barrier is met by re-enumeration — `Dominated`, not `Delivered`,
   /// even when no debt remains parked at the instant of resolution.
   loss_serial_at_install: u64,
+  /// Debt already stood for this subscription when the barrier was installed — a
+  /// pre-call loss the cookie cannot un-owe, so the barrier must resolve
+  /// `Dominated` regardless of the flush.
+  dominated_at_install: bool,
   /// Resolved `Delivered` when the cookie is seen, `Dominated` when a covering
   /// `Rescan` (or a root death) stands in for it.
   reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
@@ -307,6 +314,12 @@ pub struct Tributaries<C, V, R, H> {
   /// it tears down (design driver-golden doc, Close/Drop). `close` does **not** ride here — see
   /// [`closes`](Self::closes).
   commands: async_channel::Sender<Command<C, V>>,
+  /// Sync's **dedicated** admission mailbox, carrying the concrete [`SyncRequest`] (no `C`/`V`).
+  /// [`sync`](Self::sync) sends here so its whole admission-plus-observation rides inside one
+  /// `R::timeout` — impossible over [`commands`](Self::commands), whose `async_channel::Send` is not
+  /// `Send` for all `C`/`V`. Cloned and dropped in lockstep with `commands`, so the last handle
+  /// dropped closes both.
+  sync_commands: async_channel::Sender<SyncRequest>,
   /// The dedicated **high-priority shutdown signal**: [`close`](Self::close) sends its
   /// [`CloseReply`] here, never the command mailbox, so a requested shutdown can never be starved
   /// behind the `Watch`/`Unwatch` backlog. It is checked at the TOP priority in every place
@@ -353,6 +366,7 @@ impl<C, V, R, H> Clone for Tributaries<C, V, R, H> {
   fn clone(&self) -> Self {
     Self {
       commands: self.commands.clone(),
+      sync_commands: self.sync_commands.clone(),
       closes: self.closes.clone(),
       events: self.events.clone(),
       view: self.view.clone(),
@@ -497,6 +511,10 @@ where
     // (`watch`/`unwatch` are caller-cancellable up to admission); `close` never queues
     // here — it rides its own dedicated channel below.
     let (command_tx, command_rx) = async_channel::bounded(command_capacity.get());
+    // Sync's dedicated admission mailbox, the SAME capacity as the command mailbox. Its item type is
+    // concrete (`SyncRequest`, no `C`/`V`), so `async_channel::Send<SyncRequest>` is `Send` for every
+    // `C`/`V` — exactly what lets `Tributaries::sync` bound admission inside `R::timeout`.
+    let (sync_command_tx, sync_command_rx) = async_channel::bounded(command_capacity.get());
     // The dedicated shutdown signal, bounded at one slot: the first close wins, and any
     // racing close resolves to `Stopped` once the owner is gone. It carries ONLY close replies, so
     // the command backlog can never delay it.
@@ -531,6 +549,7 @@ where
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
+      sync_commands: sync_command_rx,
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
@@ -540,6 +559,7 @@ where
     (
       Self {
         commands: command_tx,
+        sync_commands: sync_command_tx,
         closes: close_tx,
         events: event_rx,
         view,
@@ -831,24 +851,28 @@ where
     timeout: core::time::Duration,
   ) -> Result<SyncOutcome, SyncError> {
     let (reply, response) = futures_channel::oneshot::channel();
-    // Admission first: the command mailbox is bounded and drained by the owner
-    // (whose only inline stall — a `begin_sync` — is itself fence-bounded), so
-    // `send` completes in bounded time. It cannot ride inside the `R::timeout`
-    // below because `async_channel::Send` is `!Send` and `R::timeout` requires
-    // a `Send` future; the observation deadline is what the caller's timeout
-    // governs.
-    if self
-      .commands
-      .send(Command::Sync { sub, reply })
-      .await
-      .is_err()
+    // Sync's OWN mailbox carries the concrete `SyncRequest`, so this send future is `Send` for every
+    // `C`/`V` and BOTH admission and observation ride inside one `R::timeout`: the caller's deadline
+    // now bounds getting into the mailbox too, not just the wait for the cookie. Over the
+    // key/value-bearing command mailbox that was impossible — its `Send` is `!Send`, so admission sat
+    // OUTSIDE the timeout and an arbitrarily deep sync backlog (or an admitted sync stalled in inline
+    // `begin_sync`) could blow the deadline unbounded. Clone the sender before the async block so it
+    // borrows no `self` across the await.
+    let tx = self.sync_commands.clone();
+    let req = SyncRequest { sub, reply };
+    match R::timeout(timeout, async move {
+      if tx.send(req).await.is_err() {
+        return Err(SyncError::Closed);
+      }
+      match response.await {
+        Ok(outcome) => outcome,
+        // The owner dropped the reply: it closed (or died) mid-barrier.
+        Err(_) => Err(SyncError::Closed),
+      }
+    })
+    .await
     {
-      return Err(SyncError::Closed);
-    }
-    match R::timeout(timeout, response).await {
-      Ok(Ok(outcome)) => outcome,
-      // The owner dropped the reply: it closed (or died) mid-barrier.
-      Ok(Err(_)) => Err(SyncError::Closed),
+      Ok(res) => res,
       Err(_) => Err(SyncError::Timeout),
     }
   }
@@ -982,6 +1006,13 @@ where
   /// retirement).
   loss_serial: HashMap<Subscription, u64>,
   commands: async_channel::Receiver<Command<C, V>>,
+  /// The receive end of sync's **dedicated** admission mailbox (the concrete [`SyncRequest`]). The
+  /// [`run`] loop dispatches each to [`on_sync`](Self::on_sync) from its own `select!` arm, so a sync
+  /// no longer rides the key/value-bearing [`Command`] mailbox — which is what lets
+  /// [`Tributaries::sync`] bound admission inside `R::timeout`. Its senders drop with the public
+  /// handles; a closed receiver merely disables the arm (teardown stays governed by the command
+  /// channel and the close signal), and any request still queued at teardown is replied `Closed`.
+  sync_commands: async_channel::Receiver<SyncRequest>,
   /// The receive end of the dedicated **high-priority shutdown signal**: a
   /// [`close`](Tributaries::close) sends its [`CloseReply`] here, NOT the command mailbox. The
   /// [`run`] loop and [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) check it at
@@ -1105,6 +1136,11 @@ where
   // dropped-handles teardown signal). So on a closed close channel the arm just disables itself
   // (stops winning the biased select) and defers to the command channel.
   let mut close_open = true;
+  // Whether sync's dedicated admission mailbox is still open. Its senders drop in lockstep with the
+  // public command senders, so it closes when every handle is dropped — but, like the close signal,
+  // that is NOT itself a teardown signal (the command channel closing remains the dropped-handles
+  // one). A closed sync mailbox merely disables its arm.
+  let mut sync_open = true;
   // The loop yields `(reply, drain_owed)`: `reply` is the close acknowledgement (if any);
   // `drain_owed` is true only on a **source drain** (the source's `next` yielded `None` while
   // a consumer is still attached), which owes that consumer every parked Rescan before the
@@ -1217,6 +1253,21 @@ where
     let cleanup_rx = &owner.cleanup_rx;
     let cleanup_arm = async move { cleanup_rx.recv().await };
 
+    // Sync's dedicated admission arm, borrowing ONLY the sync receiver (disjoint from the close/
+    // cleanup/commands/source borrows the other arms take). It sits just below the command arm —
+    // control-plane, above the data plane — and on a closed mailbox (every handle dropped) resolves
+    // `None` to disable itself, deferring teardown to the command channel (mirroring the close arm),
+    // never spinning the biased select.
+    let sync_commands = &owner.sync_commands;
+    let sync_arm = async move {
+      if sync_open {
+        // `Ok(req)` → a sync request; `Err` (mailbox closed) → `None` = disable the arm.
+        sync_commands.recv().await.ok()
+      } else {
+        futures_util::future::pending::<Option<SyncRequest>>().await
+      }
+    };
+
     // The one owner `select!`: acknowledge a close, apply a grant resolution, dispatch a command, pump
     // one source event, or fire the settle/retry timer — whichever is ready. The close arm is FIRST (a
     // requested shutdown wins over everything); the cleanup arm is next (grant resolution outranks the
@@ -1250,6 +1301,21 @@ where
         command_streak += 1;
         owner.dispatch_command(cmd).await
       }
+      maybe_req = sync_arm.fuse() => match maybe_req {
+        // A sync request on the dedicated mailbox: dispatch inline exactly as the old command-borne
+        // `Sync` did, counting it a control-plane win against the fairness valve.
+        Some(req) => {
+          command_streak += 1;
+          owner.on_sync(req.sub, req.reply).await;
+          Flow::Continue
+        }
+        // The sync mailbox closed (every handle dropped): disable the arm and let the command channel
+        // observe its own close — the sync channel closing is not a teardown signal on its own.
+        None => {
+          sync_open = false;
+          Flow::Continue
+        }
+      },
       raw = owner.source.next().fuse() => { command_streak = 0; match raw {
         // A terminal event on a **dead root** (the source has forgotten its handle) retires that
         // root through the unified park-terminal-Rescan-then-retire primitive — which durably owes
@@ -1288,6 +1354,14 @@ where
   // dropped reply as `Closed`, but the marker FILES must not survive the owner
   // (their names are unique, so unreaped they accrue in the watched trees).
   owner.reap_all_pending_syncs();
+
+  // Fail every sync request still queued on the dedicated admission mailbox. Sync has its own channel
+  // now, so — mirroring the old teardown reply of `Closed` to a queued `Command::Sync` — each
+  // undispatched `SyncRequest` is answered `Closed` here, so its caller resolves promptly instead of
+  // waiting out its own deadline. An undispatched request placed no cookie, so none leaks.
+  while let Ok(req) = owner.sync_commands.try_recv() {
+    let _ = req.reply.send(Err(SyncError::Closed));
+  }
 
   // Whichever close we owe an acknowledgement: the loop-break close (consumer-initiated, from the
   // dedicated close arm), or a close that interrupted the source-drain retry (returned by
@@ -1406,10 +1480,6 @@ where
       }
       Ok(Command::Unwatch { sub, reply }) => {
         self.on_unwatch(sub, reply);
-        Flow::Continue
-      }
-      Ok(Command::Sync { sub, reply }) => {
-        self.on_sync(sub, reply).await;
         Flow::Continue
       }
       // Every handle dropped: same orderly teardown, nobody to confirm it to. Nobody is left to
@@ -1828,6 +1898,14 @@ where
             Ok(armed) if armed.canonical_key() == only_key.as_slice()
           );
           if restored {
+            // The sole live root is rolled back to its original key on the PRESERVED handle — but it
+            // was retargeted to the divergent wider key and back, and `Source::replace` emits no
+            // `Rescan`, so any change under it during that window was silently missed. Treat the
+            // rollback as a stream rebind: owe every subscriber a durable dominating `Rescan` and
+            // resolve their pending syncs `Dominated`, WITHOUT retiring the root (it stays live at
+            // `only_key`). `replace` preserves the handle, so the subsumer still keys the sole root's
+            // subscribers by `handle` — exactly the coordinate `rescan_live_root` enumerates.
+            self.rescan_live_root(handle);
             self.subsumer.abort_watch(&outcome);
             return Err(canonical_race());
           }
@@ -2312,24 +2390,50 @@ where
   ///
   /// A no-op if `handle` is not a live root.
   fn retire_root_with_terminal_rescan(&mut self, handle: S::Handle) {
-    // Capture the root's key + subscribers while it is still recorded; force_remove is deferred
-    // until every owed terminal Rescan is durably parked.
+    // Owe every subscriber a dominating terminal `Rescan` and resolve their pending syncs
+    // `Dominated` while the root is still recorded — the shared live-root core — BEFORE freeing any
+    // subsumer state, so a full channel can never drop an owed terminal Rescan.
+    self.rescan_live_root(handle);
+    // The owed Rescans are now durable: tear the dead root out of the index and free each
+    // subscriber's per-sub filter + epoch state (the parked `needs_rescan` entry is kept). FORGET
+    // each sub's coalescer policy too — `rescan_live_root` only DROPPED its buffered deltas (keeping
+    // the policy for the live-root path), and terminal retirement ends the subscription.
+    for sub in self.subsumer.force_remove_root(handle) {
+      if let Some(coalescer) = self.coalescer.as_mut() {
+        coalescer.forget_subscription(sub);
+      }
+      self.retire_sub_state(sub);
+    }
+  }
+
+  /// Owes every subscriber of a **still-live** root a durable dominating terminal
+  /// [`Rescan`](crate::EventKind::Rescan) and resolves each of its pending barriers `Dominated` —
+  /// WITHOUT retiring the root. The park-for-each-sub +
+  /// [`dominate_syncs_of_root`](Self::dominate_syncs_of_root) core shared by two callers:
+  /// [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan) (which then
+  /// force-removes the root) and the in-place-widen exact-rollback (which keeps the root LIVE at its
+  /// original key after a divergent retarget was rolled back — a silent coverage gap the preserved
+  /// stream's [`replace`](crate::Source::replace) never signals, so a `Rescan` must stand in).
+  ///
+  /// For each subscriber it parks a dominating terminal `Rescan` straight into `needs_rescan` (or
+  /// `suppressed_rescan` for an unclaimed sub) via [`merge_max`] — the root's key (captured while it
+  /// is recorded) + a strictly-dominating [`shed_rescan`](epoch::EpochLedger::shed_rescan) epoch + the
+  /// subscriber's baked value — so a full channel cannot drop it and it stays attributable, and DROPS
+  /// the sub's now-suspect buffered coalescer deltas while KEEPING its policy (the sub stays live on
+  /// this path; the retiring caller forgets the policy itself after force-removal). Every owed `Rescan`
+  /// is parked BEFORE the syncs are dominated, so a caller waking on another thread re-enumerates
+  /// against a `Rescan` already parked ahead of any later delta — never a reply that outruns its cover.
+  ///
+  /// A no-op if `root` is not a live recorded root.
+  fn rescan_live_root(&mut self, root: S::Handle) {
     let Some((root_key, subscribers)) = self
       .subsumer
-      .entry(handle)
+      .entry(root)
       .map(|record| (record.key.clone(), record.subscribers.clone()))
     else {
       return;
     };
     for &sub in &subscribers {
-      // Park a dominating terminal Rescan straight into `needs_rescan` (the root's key + a
-      // strictly-dominating epoch + the subscriber's baked value), independent of any later
-      // lookup, so a full channel cannot drop it AND the flushed Rescan stays attributable once
-      // `force_remove_root` (below) frees the sub's subsumer state — after which
-      // `subscription_value` is gone, so the value MUST be captured here while the sub is still
-      // live. FORGET the sub in the coalescer — its now-suspect buffered deltas (the Rescan
-      // dominates and re-enumerates them) AND its registered debounce policy, since terminal
-      // retirement ends the subscription (the forget twin of `release_subscription`).
       let value = self.subsumer.subscription_value(sub).cloned();
       let epoch = self.epochs.shed_rescan(sub);
       let target = if self.unclaimed.contains(&sub) {
@@ -2338,22 +2442,13 @@ where
         &mut self.needs_rescan
       };
       merge_max(target, sub, root_key.clone(), epoch, value);
+      // DROP (not forget) the buffered deltas: the sub stays live here, so its registered debounce
+      // policy must keep governing later events. A retiring caller forgets the policy afterward.
       if let Some(coalescer) = self.coalescer.as_mut() {
-        coalescer.forget_subscription(sub);
+        coalescer.drop_subscription(sub);
       }
     }
-    // Every subscriber's dominating terminal `Rescan` is now durable in
-    // `needs_rescan` (or `suppressed_rescan` for an unclaimed sub). ONLY NOW
-    // resolve this root's pending barriers `Dominated`: a caller waking on
-    // another thread then re-enumerates against a `Rescan` that is already
-    // parked ahead of any later delta — never the prohibited half-barrier of
-    // a reply that outruns its covering `Rescan`.
-    self.dominate_syncs_of_root(handle);
-    // The owed Rescans are now durable: tear the dead root out of the index and free each
-    // subscriber's per-sub filter + epoch state (the parked `needs_rescan` entry is kept).
-    for sub in self.subsumer.force_remove_root(handle) {
-      self.retire_sub_state(sub);
-    }
+    self.dominate_syncs_of_root(root);
   }
 
   /// Fans one raw source event out to its covering, admitting subscribers and pushes the
@@ -2398,6 +2493,12 @@ where
       // never re-enumerated (no silent loss under backpressure).
       if ev.is_rescan() {
         self.park_rescan_event(ev);
+      } else {
+        // A suppressed ordinary delta is still a coverage loss for the sub: advance its sticky
+        // loss serial (the rescan-merge path already does so, inside `park_rescan_event`). A
+        // barrier installed BEFORE this suppression then observes the advance and resolves
+        // `Dominated`, never a false `Delivered` for a change it hid behind the parked `Rescan`.
+        self.note_loss(sub);
       }
       return;
     }
@@ -2787,11 +2888,17 @@ where
     match self.source.begin_sync(root, &dir_key, token).await {
       Ok(cookie_key) => {
         let loss_serial_at_install = self.loss_serial.get(&sub).copied().unwrap_or(0);
+        // Debt already standing for this sub at install is a pre-call loss the cookie cannot
+        // un-owe: even if it publishes-and-clears before the cookie (leaving the serial unchanged
+        // and `needs_rescan` empty at resolution), the barrier must still resolve `Dominated`.
+        let dominated_at_install =
+          self.needs_rescan.contains_key(&sub) || self.suppressed_rescan.contains_key(&sub);
         self.pending_syncs.push(PendingSync {
           cookie_key,
           sub,
           root,
           loss_serial_at_install,
+          dominated_at_install,
           reply,
         });
       }
@@ -2817,19 +2924,26 @@ where
       return;
     };
     let pending = self.pending_syncs.swap_remove(idx);
-    // A loss touched the sub DURING the barrier (serial advanced) — even if
-    // its parked Rescan has since been published and cleared — OR debt remains
-    // after the flush: either way re-enumeration stands in for delivery.
+    // A loss touched the sub DURING the barrier (serial advanced) — even if its parked Rescan has
+    // since been published and cleared — OR debt already stood at install (a pre-call loss the cookie
+    // cannot un-owe): either way re-enumeration stands in for delivery.
     let lost_during_window =
       self.loss_serial.get(&pending.sub).copied().unwrap_or(0) != pending.loss_serial_at_install;
-    let clean = self.flush_subscription_now(pending.sub) && !lost_during_window;
+    let dominated_at_install = pending.dominated_at_install;
+    // Reap the cookie BEFORE the flush. Its observation already happened (its own event is what
+    // matched here), and `flush_subscription_now` can UNWIND — it runs `R::now` and clones/orders
+    // caller key/value types in the coalescer. Reaping first keeps a flush panic from leaking the
+    // marker: once swap-removed, this entry is out of `pending_syncs`, so `Owner::drop` (which reaps
+    // only entries still in the vector) would never reap it. The outcome still uses the flush result.
+    self.reap_cookie(pending.root, &pending.cookie_key);
+    let clean =
+      self.flush_subscription_now(pending.sub) && !lost_during_window && !dominated_at_install;
     let outcome = if clean {
       SyncOutcome::Delivered
     } else {
       SyncOutcome::Dominated
     };
     let _ = pending.reply.send(Ok(outcome));
-    self.reap_cookie(pending.root, &pending.cookie_key);
   }
 
   /// A live-root `Rescan` at or above a pending cookie's key stands in for it:
@@ -2842,9 +2956,11 @@ where
     while i < self.pending_syncs.len() {
       if self.pending_syncs[i].cookie_key.starts_with(at) {
         let pending = self.pending_syncs.swap_remove(i);
+        // Reap BEFORE the (unwinding-capable) flush: once swap-removed, `Owner::drop` no longer reaps
+        // this entry, so a flush panic must not precede the reap or the marker leaks.
+        self.reap_cookie(pending.root, &pending.cookie_key);
         self.flush_subscription_now(pending.sub);
         let _ = pending.reply.send(Ok(SyncOutcome::Dominated));
-        self.reap_cookie(pending.root, &pending.cookie_key);
       } else {
         i += 1;
       }
@@ -3272,9 +3388,6 @@ where
       }
       Command::Unwatch { reply, .. } => {
         let _ = reply.send(Err(UnwatchError::Closed));
-      }
-      Command::Sync { reply, .. } => {
-        let _ = reply.send(Err(SyncError::Closed));
       }
     }
   }

@@ -19,7 +19,7 @@ use crate::{
   filter::Filter,
   interest::Interest,
   options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
-  source::{Armed, Source, SourceEvent},
+  source::{Armed, Source, SourceEvent, SyncToken},
   subscription::Subscription,
   subsume::Subsumer,
 };
@@ -80,6 +80,11 @@ struct FakeSource {
   /// OFF by default, so every existing cell keeps exercising the release-and-rearm
   /// path; the adoption cells turn it on.
   supports_replace: bool,
+  /// Whether this source offers the sync barrier ([`Source::begin_sync`]). OFF by default (the trait
+  /// default is `Unsupported`), so the cells that push a [`super::PendingSync`] directly are
+  /// unaffected; a cell driving the real `on_sync`/end-to-end install path turns it on, and
+  /// `begin_sync` then returns a deterministic `<dir>/cookie-<seq>` key the test can deliver.
+  supports_sync: bool,
   /// Cookie keys handed to `end_sync` — the reap ledger (F5).
   ended_syncs: Vec<Vec<OsString>>,
   /// How many of the next `arm` calls to fail, decremented on each failed arm.
@@ -124,6 +129,7 @@ impl FakeSource {
       live: HashMap::new(),
       canonical: HashMap::new(),
       supports_replace: false,
+      supports_sync: false,
       ended_syncs: Vec::new(),
       fail_arms: 0,
       fail_grows: 0,
@@ -328,6 +334,23 @@ impl Source<OsString> for FakeSource {
     self.ended_syncs.push(cookie_key.to_vec());
   }
 
+  async fn begin_sync(
+    &mut self,
+    _handle: u32,
+    dir_key: &[OsString],
+    token: SyncToken,
+  ) -> Result<Vec<OsString>, crate::error::SyncError> {
+    if !self.supports_sync {
+      return Err(crate::error::SyncError::Unsupported);
+    }
+    // A deterministic cookie key under the sub's directory: `<dir>/cookie-<seq>`. The seq makes it
+    // predictable so a test can deliver the matching artifact event; `is_sync_artifact` (a `cookie-`
+    // leaf) both suppresses that event and resolves the barrier on it.
+    let mut cookie_key = dir_key.to_vec();
+    cookie_key.push(OsString::from(format!("cookie-{}", token.seq())));
+    Ok(cookie_key)
+  }
+
   async fn replace(
     &mut self,
     handle: u32,
@@ -493,6 +516,9 @@ struct Harness {
   /// Kept alive so the owner's command receiver never observes a closed channel (the loop
   /// is not run here; reconcile is driven directly).
   _commands: async_channel::Sender<super::Command<OsString, ()>>,
+  /// Kept alive so the owner's sync-admission receiver never observes a closed channel (the loop
+  /// is not run here; the sync primitives are driven directly).
+  _sync_commands: async_channel::Sender<super::SyncRequest>,
   /// The dedicated close signal's sender: kept alive so the owner's close receiver
   /// never observes a closed channel, and used by the close-under-teardown tests to inject a close
   /// exactly as `Tributaries::close` does — `try_send(reply)` on this channel, never a command.
@@ -521,6 +547,7 @@ impl Harness {
       None => async_channel::unbounded(),
     };
     let (command_tx, command_rx) = async_channel::unbounded();
+    let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
     let (close_tx, close_rx) = async_channel::bounded(1);
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
     let owner = Owner {
@@ -545,6 +572,7 @@ impl Harness {
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
+      sync_commands: sync_command_rx,
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
@@ -555,6 +583,7 @@ impl Harness {
       owner,
       events: event_rx,
       _commands: command_tx,
+      _sync_commands: sync_command_tx,
       closes: close_tx,
     }
   }
@@ -5089,6 +5118,8 @@ struct OwnerU64 {
   events: async_channel::Receiver<Event<OsString, u64>>,
   /// Kept alive so the owner's command receiver never observes a closed channel.
   _commands: async_channel::Sender<super::Command<OsString, u64>>,
+  /// Kept alive so the owner's sync-admission receiver never observes a closed channel.
+  _sync_commands: async_channel::Sender<super::SyncRequest>,
   /// Kept alive so the owner's close receiver never observes a closed channel (these rigs drive
   /// primitives directly and never inject a close).
   _closes: async_channel::Sender<super::CloseReply>,
@@ -5099,6 +5130,7 @@ impl OwnerU64 {
   fn new(capacity: usize, coalescer: Option<Coalescer<OsString, u64>>) -> Self {
     let (event_tx, event_rx) = async_channel::bounded(capacity);
     let (command_tx, command_rx) = async_channel::unbounded();
+    let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
     let (close_tx, close_rx) = async_channel::bounded(1);
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
     let owner = Owner {
@@ -5123,6 +5155,7 @@ impl OwnerU64 {
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
+      sync_commands: sync_command_rx,
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
@@ -5133,6 +5166,7 @@ impl OwnerU64 {
       owner,
       events: event_rx,
       _commands: command_tx,
+      _sync_commands: sync_command_tx,
       _closes: close_tx,
     }
   }
@@ -5626,6 +5660,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
 
   let (event_tx, _event_rx) = async_channel::unbounded::<Event<OsString, ()>>();
   let (command_tx, command_rx) = async_channel::unbounded::<super::Command<OsString, ()>>();
+  let (_sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
   let (_close_tx, close_rx) = async_channel::bounded::<super::CloseReply>(1);
   let (cleanup_tx, cleanup_rx) = async_channel::unbounded::<super::Cleanup>();
   let mut owner = Owner {
@@ -5656,6 +5691,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
+    sync_commands: sync_command_rx,
     closes: close_rx,
     events: event_tx,
     #[cfg(debug_assertions)]
@@ -5788,6 +5824,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
 
   let (event_tx, event_rx) = async_channel::unbounded::<Event<OsString, ()>>();
   let (command_tx, command_rx) = async_channel::unbounded::<super::Command<OsString, ()>>();
+  let (_sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
   let (close_tx, close_rx) = async_channel::bounded::<super::CloseReply>(1);
   let (cleanup_tx, cleanup_rx) = async_channel::unbounded::<super::Cleanup>();
   let (trigger_tx, trigger_rx) = async_channel::unbounded::<ReplyRx>();
@@ -5819,6 +5856,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
+    sync_commands: sync_command_rx,
     closes: close_rx,
     events: event_tx,
     #[cfg(debug_assertions)]
@@ -6632,6 +6670,7 @@ async fn a_rescan_dominates_a_pending_sync_and_the_rescan_is_published() {
     sub,
     root: handle,
     loss_serial_at_install: 0,
+    dominated_at_install: false,
     reply: reply_tx,
   });
 
@@ -6681,6 +6720,7 @@ async fn a_cookie_delivered_over_existing_rescan_debt_resolves_dominated() {
     sub,
     root: handle,
     loss_serial_at_install: 0,
+    dominated_at_install: false,
     reply: reply_tx,
   });
   h.owner
@@ -6713,6 +6753,7 @@ async fn an_unwatched_subscription_reaps_its_pending_cookie() {
     sub,
     root: handle,
     loss_serial_at_install: 0,
+    dominated_at_install: false,
     reply: reply_tx,
   });
 
@@ -6738,10 +6779,32 @@ async fn an_unwatched_subscription_reaps_its_pending_cookie() {
 /// newcomer with a canonicalization race.
 #[tokio::test]
 async fn a_diverging_in_place_widen_rolls_back_and_keeps_old_coverage() {
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
   let mut h = Harness::new();
   h.owner.source.supports_replace = true;
 
   let s_narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let handle = h
+    .owner
+    .subsumer
+    .subscription_root(s_narrow)
+    .expect("live root");
+
+  // A pending sync on the sole root's subscriber, installed BEFORE the widen. The exact rollback
+  // retargets the preserved stream away and back with NO Rescan, silently missing any change in that
+  // window — so the barrier must resolve `Dominated` (re-enumerate), never strand to timeout.
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/b/cookie-1"),
+    sub: s_narrow,
+    root: handle,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: reply_tx,
+  });
 
   // The widen of /a canonicalizes to /z — which does NOT contain /a/b, so it
   // would strand s_narrow. The rollback must restore /a/b on the same handle.
@@ -6782,6 +6845,34 @@ async fn a_diverging_in_place_widen_rolls_back_and_keeps_old_coverage() {
     h.owner.subsumer.subscription_root(s_narrow).is_some(),
     "the old subscription is still live on the restored root"
   );
+
+  // The rollback rebinds the sole live root's stream: its subscriber's pending sync resolves
+  // `Dominated` (re-enumeration meets the barrier), its cookie is reaped, and it owes a dominating
+  // `Rescan` that publishes and clears once the consumer drains.
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "the sole root's pending sync resolves Dominated after the exact rollback"
+  );
+  assert_eq!(
+    h.owner.source.ended_syncs,
+    vec![key("/a/b/cookie-1")],
+    "the dominated barrier's cookie is reaped"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&s_narrow),
+    "s_narrow owes a dominating Rescan for the silently-missed retarget window"
+  );
+  h.owner.flush_pending_rescans();
+  let events = h.drain();
+  assert!(
+    events
+      .iter()
+      .any(|e| e.subscription() == s_narrow && e.kind().is_rescan()),
+    "s_narrow receives the dominating Rescan: {events:?}"
+  );
 }
 
 /// R2-d — a delta shed to a parked Rescan for a pre-cookie change, then
@@ -6806,6 +6897,7 @@ async fn a_loss_published_before_the_cookie_still_resolves_dominated() {
     sub,
     root: handle,
     loss_serial_at_install: h.owner.loss_serial.get(&sub).copied().unwrap_or(0),
+    dominated_at_install: false,
     reply: reply_tx,
   });
 
@@ -6856,6 +6948,7 @@ async fn a_widen_resolves_the_repointed_subscriptions_pending_sync() {
     sub: s_narrow,
     root: handle,
     loss_serial_at_install: 0,
+    dominated_at_install: false,
     reply: reply_tx,
   });
 
@@ -6871,5 +6964,201 @@ async fn a_widen_resolves_the_repointed_subscriptions_pending_sync() {
       Some(Ok(Ok(SyncOutcome::Dominated)))
     ),
     "the re-pointed subscription's barrier resolves Dominated at the widen"
+  );
+}
+
+/// F1 — a barrier installed over debt that ALREADY stood at install (a change lost BEFORE the
+/// barrier) resolves `Dominated`, even after that parked Rescan publishes-and-clears before the
+/// cookie: at resolution the loss serial is unchanged AND `needs_rescan` is empty, so ONLY the
+/// install-time `dominated_at_install` snapshot separates it from a genuinely clean sync. A pre-call
+/// loss is exactly what the barrier must not hide behind a false `Delivered`.
+///
+/// Fail-on-old (no `dominated_at_install`): the published-and-cleared debt leaves a clean flush and
+/// an unchanged serial, so the barrier reports `Delivered` — the bug.
+#[tokio::test]
+async fn a_barrier_installed_over_existing_debt_resolves_dominated() {
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  // Pre-install debt: the sub already owes a parked Rescan (a change lost before ANY barrier).
+  h.owner.park_rescan(sub);
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the sub owes a parked Rescan before the barrier is installed"
+  );
+
+  // Install the barrier through the REAL `on_sync` path, so it snapshots `dominated_at_install` from
+  // the standing debt (the loss serial is snapshot too, but will not advance during the window).
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.on_sync(sub, reply_tx).await;
+  assert!(
+    !h.owner.source.ended_syncs.contains(&key("/a/cookie-1")),
+    "the cookie is still pending — not yet reaped"
+  );
+
+  // The pre-install Rescan publishes and clears BEFORE the cookie: no debt parked and the serial
+  // unchanged at resolution, so only the install-time snapshot can still force Dominated.
+  h.owner.flush_pending_rescans();
+  assert!(
+    !h.owner.needs_rescan.contains_key(&sub),
+    "the pre-install Rescan published and cleared"
+  );
+
+  // The cookie arrives clean-looking — but the pre-call loss the install captured wins.
+  h.owner
+    .consume_source_event(&source_created(handle, "/a/cookie-1", 20));
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "a barrier installed over pre-existing debt resolves Dominated, not a false Delivered"
+  );
+  assert_eq!(
+    h.owner.source.ended_syncs,
+    vec![key("/a/cookie-1")],
+    "the resolved barrier's cookie is reaped"
+  );
+}
+
+/// A source for the END-TO-END sync tests: arms roots live, offers the barrier
+/// ([`Source::begin_sync`]) returning a deterministic `<dir>/cookie-<seq>` key, and — when `observe`
+/// is set — queues that cookie's own artifact event so the driver's funnel matches and resolves the
+/// barrier `Delivered`. With `observe` cleared the cookie is never reported, so the barrier can only
+/// resolve via the caller's `R::timeout`. `next` parks when its queue is empty, keeping the run loop
+/// alive to answer `close`/further requests.
+struct SyncSource {
+  next_handle: u32,
+  live: HashMap<u32, Vec<OsString>>,
+  pending: VecDeque<SourceEvent<OsString, u32>>,
+  observe: bool,
+}
+
+impl Source<OsString> for SyncSource {
+  type Handle = u32;
+
+  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    Ok(key.to_vec())
+  }
+
+  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    self.next_handle += 1;
+    let handle = self.next_handle;
+    self.live.insert(handle, key.to_vec());
+    Ok(Armed::new(handle, key.to_vec()))
+  }
+
+  fn disarm(&mut self, handle: u32) {
+    self.live.remove(&handle);
+  }
+
+  fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+    key
+      .last()
+      .and_then(|leaf| leaf.to_str())
+      .is_some_and(|leaf| leaf.starts_with("cookie-"))
+  }
+
+  async fn begin_sync(
+    &mut self,
+    handle: u32,
+    dir_key: &[OsString],
+    token: SyncToken,
+  ) -> Result<Vec<OsString>, crate::error::SyncError> {
+    let mut cookie_key = dir_key.to_vec();
+    cookie_key.push(OsString::from(format!("cookie-{}", token.seq())));
+    if self.observe {
+      // Report the cookie's own create so the funnel matches it and resolves the barrier.
+      self.pending.push_back(SourceEvent::new(
+        handle,
+        cookie_key.clone(),
+        EventKind::Created,
+        Location::new(),
+        Epoch::new(1),
+        Some(ChangeId::new(NonZeroU64::MIN)),
+      ));
+    }
+    Ok(cookie_key)
+  }
+
+  async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+    if let Some(event) = self.pending.pop_front() {
+      Some(event)
+    } else {
+      // Park so the run loop survives to answer `close` and later requests.
+      std::future::pending::<Option<SourceEvent<OsString, u32>>>().await
+    }
+  }
+
+  fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+    self.live.get(&handle).cloned()
+  }
+}
+
+/// F4 — a sync admitted through the DEDICATED mailbox (no longer the key/value-bearing command
+/// mailbox) still runs end to end: [`Tributaries::sync`](super::Tributaries::sync) sends a
+/// `SyncRequest`, the run loop's sync arm dispatches `on_sync`, the cookie's own event arrives, and
+/// the barrier resolves `Delivered` on a clean flush — proving the rewired admission+observation path.
+#[tokio::test]
+async fn a_sync_admitted_through_the_dedicated_mailbox_still_resolves() {
+  use crate::source::SyncOutcome;
+
+  let source = SyncSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    pending: VecDeque::new(),
+    observe: true,
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+  let sub = w
+    .watch(key("/a"), (), WatchOptions::new())
+    .await
+    .expect("watch /a");
+
+  let outcome = tokio::time::timeout(Duration::from_secs(5), w.sync(sub, Duration::from_secs(5)))
+    .await
+    .expect("the sync resolves within the test deadline")
+    .expect("the sync succeeds");
+  assert!(
+    matches!(outcome, SyncOutcome::Delivered),
+    "a clean end-to-end sync via the dedicated mailbox resolves Delivered: {outcome:?}"
+  );
+}
+
+/// F4 — the caller's deadline bounds the barrier: a sync whose cookie is never observed resolves
+/// `Err(Timeout)` (the `R::timeout` wrapping admission-plus-observation fires), never a hang.
+#[tokio::test]
+async fn a_sync_times_out_when_never_observed() {
+  use crate::error::SyncError;
+
+  let source = SyncSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    pending: VecDeque::new(),
+    observe: false,
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+  let sub = w
+    .watch(key("/a"), (), WatchOptions::new())
+    .await
+    .expect("watch /a");
+
+  let result = tokio::time::timeout(
+    Duration::from_secs(5),
+    w.sync(sub, Duration::from_millis(100)),
+  )
+  .await
+  .expect("the outer test deadline is not hit — the inner sync timeout fires first");
+  assert!(
+    matches!(result, Err(SyncError::Timeout)),
+    "a barrier whose cookie is never observed times out: {result:?}"
   );
 }
