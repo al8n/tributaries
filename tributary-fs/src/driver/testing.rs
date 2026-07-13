@@ -4,7 +4,7 @@
 //! unmodified.
 
 use std::{
-  collections::HashMap,
+  collections::{BTreeMap, HashMap},
   num::NonZeroU64,
   path::{Path, PathBuf},
   sync::{
@@ -18,6 +18,7 @@ use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
 use crate::{
   core::{ExpectedObject, MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
+  driver::ControlRequest,
   os::{
     BackendKind, RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError, SourceEvent,
     SourceMessage,
@@ -97,6 +98,13 @@ struct FakeState {
   spawn_backend: Mutex<BackendKind>,
   /// Per-directory arms executed, in call order.
   arms: Mutex<Vec<(WatchId, PathBuf)>>,
+  /// The transport generation attached per scope (the delivery lane): a
+  /// control batch carrying a different generation is a leftover of a
+  /// replaced transport and is refused, modeling the real source's fence.
+  scope_generation: Mutex<BTreeMap<ScopeId, u64>>,
+  /// Arms refused because their batch carried a stale (replaced) transport
+  /// generation — the observable of the fence, in call order.
+  stale_arms: Mutex<Vec<(WatchId, PathBuf)>>,
   /// Per-directory disarms executed.
   disarms: Mutex<Vec<WatchId>>,
   /// Enumerates executed, in call order.
@@ -110,9 +118,15 @@ struct FakeState {
   /// When set, `enumerate` parks until the gate releases (the
   /// close-versus-in-flight-enumerate cell).
   enumerate_hold: Mutex<Option<HoldGate>>,
-  /// When set, `add_watch` parks until the gate releases (the
-  /// close-versus-in-flight-arm cell).
+  /// When set, `add_watch` and a discovery/re-arm `batch_control` park until
+  /// the gate releases (the close-versus-in-flight-arm and
+  /// stale-batch-across-replace cells).
   arm_hold: Mutex<Option<HoldGate>>,
+  /// When set, `preflight_arm` (a descending replace's pre-arm on the new
+  /// transport) parks until the gate releases — distinct from `arm_hold` so a
+  /// test can freeze in-flight discovery batches while letting the commit's
+  /// pre-arm proceed.
+  prearm_hold: Mutex<Option<HoldGate>>,
   /// The synthetic kernel-watch-descriptor sequence.
   wd_seq: AtomicUsize,
 }
@@ -136,6 +150,8 @@ impl Default for FakeState {
       teardown_hold: Mutex::default(),
       spawn_backend: Mutex::new(BackendKind::FsEvents),
       arms: Mutex::default(),
+      scope_generation: Mutex::default(),
+      stale_arms: Mutex::default(),
       disarms: Mutex::default(),
       enumerates: Mutex::default(),
       watch_failures: Mutex::default(),
@@ -143,6 +159,7 @@ impl Default for FakeState {
       enumerate_answers: Mutex::default(),
       enumerate_hold: Mutex::default(),
       arm_hold: Mutex::default(),
+      prearm_hold: Mutex::default(),
       wd_seq: AtomicUsize::new(0),
     }
   }
@@ -462,17 +479,70 @@ impl FakeFs {
     HoldRelease { gate }
   }
 
-  /// Holds every subsequent arm until released (the close-versus-in-flight-
-  /// arm cell).
+  /// Holds every subsequent arm (`add_watch` and discovery/re-arm
+  /// `batch_control`) until released — the close-versus-in-flight-arm and
+  /// stale-batch-across-replace cells.
   pub(crate) fn hold_arms(&self) -> HoldRelease {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
     *self.state.arm_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
 
+  /// Holds every subsequent `preflight_arm` (a descending replace's pre-arm
+  /// on the new transport) until released — distinct from
+  /// [`hold_arms`](Self::hold_arms) so a test can freeze in-flight discovery
+  /// batches while the commit's pre-arm still proceeds.
+  pub(crate) fn hold_prearms(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.prearm_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
   /// Per-directory arms executed so far.
   pub(crate) fn arms(&self) -> Vec<(WatchId, PathBuf)> {
     self.state.arms.lock().unwrap().clone()
+  }
+
+  /// Arms refused so far because their batch carried a stale (replaced)
+  /// transport generation — the observable that the generation fence held.
+  pub(crate) fn stale_arms(&self) -> Vec<(WatchId, PathBuf)> {
+    self.state.stale_arms.lock().unwrap().clone()
+  }
+
+  /// The non-parking core of one arm: record it, then model object
+  /// correctness (identity mismatch and alias) and mint a watch descriptor,
+  /// exactly as [`add_watch`](FsOps::add_watch) does once past the hold.
+  fn arm_one(
+    &self,
+    _scope: ScopeId,
+    watch: WatchId,
+    _parent: WatchId,
+    path: &Path,
+    _name: &Segment,
+    expected: Option<ExpectedObject>,
+  ) -> WatchOutcome {
+    self
+      .state
+      .arms
+      .lock()
+      .unwrap()
+      .push((watch, path.to_path_buf()));
+    if let Some(err) = self.state.watch_failures.lock().unwrap().get(path) {
+      return WatchOutcome::Failed(*err);
+    }
+    if let Some(expected) = expected {
+      let current = self.state.nodes.lock().unwrap().get(path).copied();
+      let matches =
+        current.is_some_and(|node| node.dev == expected.dev && node.ino == expected.ino.get());
+      if !matches {
+        return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
+      }
+    }
+    if let Some(wd) = self.state.watch_aliases.lock().unwrap().get(path) {
+      return WatchOutcome::Aliased(*wd);
+    }
+    let wd = self.state.wd_seq.fetch_add(1, Ordering::SeqCst) as i32 + 1;
+    WatchOutcome::Installed(wd)
   }
 
   /// Per-directory disarms executed so far.
@@ -756,47 +826,111 @@ impl FsOps for FakeFs {
     }
   }
 
+  fn attach_scope(&self, scope: ScopeId, _port: crate::os::ScopePort, generation: u64) {
+    self
+      .state
+      .scope_generation
+      .lock()
+      .unwrap()
+      .insert(scope, generation);
+  }
+
+  fn detach_scope(&self, scope: ScopeId) {
+    self.state.scope_generation.lock().unwrap().remove(&scope);
+  }
+
   fn add_watch(
     &self,
-    _scope: ScopeId,
+    scope: ScopeId,
     watch: WatchId,
-    _parent: WatchId,
+    parent: WatchId,
     path: &Path,
-    _name: &Segment,
+    name: &Segment,
     expected: Option<ExpectedObject>,
   ) -> WatchOutcome {
     self.park_on(&self.state.arm_hold);
-    self
+    self.arm_one(scope, watch, parent, path, name, expected)
+  }
+
+  // The batch entry the driver calls, carrying the transport GENERATION the
+  // batch was emitted for. The parking happens ONCE here (the hold point a
+  // test uses to freeze a batch across a replace), then the generation is
+  // re-read: a batch whose generation no longer matches the attached
+  // transport is a leftover of a replaced stream and refuses every arm,
+  // exactly as the real source does — landing nothing on the new transport.
+  fn batch_control(
+    &self,
+    scope: ScopeId,
+    generation: u64,
+    requests: Vec<ControlRequest>,
+  ) -> Vec<(WatchId, WatchOutcome)> {
+    self.park_on(&self.state.arm_hold);
+    let attached = self
       .state
-      .arms
+      .scope_generation
       .lock()
       .unwrap()
-      .push((watch, path.to_path_buf()));
-    if let Some(err) = self.state.watch_failures.lock().unwrap().get(path) {
-      return WatchOutcome::Failed(*err);
+      .get(&scope)
+      .copied();
+    if attached != Some(generation) {
+      return requests
+        .into_iter()
+        .filter_map(|request| match request {
+          ControlRequest::Arm { watch, path, .. } => {
+            self
+              .state
+              .stale_arms
+              .lock()
+              .unwrap()
+              .push((watch, path.to_path_buf()));
+            Some((
+              watch,
+              WatchOutcome::Failed(tributary_proto::WatchError::Gone),
+            ))
+          }
+          ControlRequest::Disarm { .. } => None,
+        })
+        .collect();
     }
-    // Object-correctness, modeled: the real reader fstats the opened anchor and
-    // refuses a mismatch. The fake compares the arm's expected `(dev, ino)`
-    // against the object currently at `path` in the fake tree — an object
-    // replaced between the enumerate and this arm is refused as `Gone`, driving
-    // the same drop+rescan heal.
-    if let Some(expected) = expected {
-      let current = self.state.nodes.lock().unwrap().get(path).copied();
-      let matches =
-        current.is_some_and(|node| node.dev == expected.dev && node.ino == expected.ino.get());
-      if !matches {
-        return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
+    let mut outcomes = Vec::new();
+    for request in requests {
+      match request {
+        ControlRequest::Arm {
+          watch,
+          parent,
+          name,
+          path,
+          expected,
+        } => outcomes.push((
+          watch,
+          self.arm_one(scope, watch, parent, path.as_path(), &name, expected),
+        )),
+        ControlRequest::Disarm { watch } => self.state.disarms.lock().unwrap().push(watch),
       }
     }
-    if let Some(wd) = self.state.watch_aliases.lock().unwrap().get(path) {
-      return WatchOutcome::Aliased(*wd);
-    }
-    let wd = self.state.wd_seq.fetch_add(1, Ordering::SeqCst) as i32 + 1;
-    WatchOutcome::Installed(wd)
+    outcomes
   }
 
   fn remove_watch(&self, _scope: ScopeId, watch: WatchId) {
     self.state.disarms.lock().unwrap().push(watch);
+  }
+
+  // A descending replace's pre-arm of the new root on its fresh transport,
+  // BEFORE the port is attached under the scope. It parks on its OWN gate
+  // (not `arm_hold`) so a test can freeze concurrent discovery batches while
+  // this pre-arm still commits. The generation fence does not apply — this
+  // arms the explicit new-stream port, which no other batch can reach.
+  fn preflight_arm(
+    &self,
+    _port: &crate::os::ScopePort,
+    scope: ScopeId,
+    watch: WatchId,
+    path: &Path,
+    name: &Segment,
+    expected: Option<ExpectedObject>,
+  ) -> WatchOutcome {
+    self.park_on(&self.state.prearm_hold);
+    self.arm_one(scope, watch, watch, path, name, expected)
   }
 
   fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {
