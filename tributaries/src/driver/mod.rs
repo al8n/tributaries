@@ -1741,6 +1741,38 @@ where
       } => {
         let sub = *sub;
         let repointed = repointed.clone();
+        // GAPLESS FIRST: when the widen subsumes exactly ONE root, ask the source
+        // to retarget it IN PLACE. The fs binding does that make-before-break (the
+        // replacement stream is live before the old retires), so no window exists
+        // where the old subtree is unwatched — a strict improvement on the
+        // release-and-rearm below, whose gap the re-point `Rescan` can only cover,
+        // never un-lose. The handle is PRESERVED, which is sound exactly because
+        // no fresh handle is minted (nothing can alias it), and `commit_watch`
+        // re-keys by handle remove-then-insert, so the surviving handle lands back
+        // in `by_handle` under the WIDER key.
+        //
+        // `replace` is atomic on failure, so ANY error — including the default
+        // "this source cannot widen in place" — falls through to the old dance with
+        // the old root's coverage untouched. Nothing has been disarmed yet.
+        let in_place = match unwatch.as_slice() {
+          [only] => self.source.replace(*only, key).await.ok(),
+          _ => None,
+        };
+        if let Some(armed) = in_place {
+          let handle = armed.handle();
+          let fs_key = armed.canonical_key().to_vec();
+          if self.subsumer.fs_path_preserves_plan(&fs_key, unwatch) {
+            self.commit_widen(&outcome, handle, &fs_key, sub, filter, debounce, &repointed);
+            return Ok(sub);
+          }
+          // The in-place widen committed a key the plan does not preserve (a
+          // canonicalization race). The source's own root is now that key, so the
+          // release-and-rearm fallback would fight it — abort honestly instead.
+          self.source.disarm(handle);
+          self.subsumer.abort_watch(&outcome);
+          return Err(canonical_race());
+        }
+
         // Unwatch-old-then-arm-new (design §4): the source rejects a root overlapping a
         // live one, so the wider root cannot be armed while a subsumed one is live.
         // Request release of the subsumed watches first — the source applies every requested
@@ -1786,38 +1818,62 @@ where
         // its `by_handle` insert cannot clobber a live entry. A contract-violating source is caught
         // by the arm choke point's exhaustive observed-handle tripwire before this
         // commit is ever reached.
-        self.subsumer.commit_watch(&outcome, handle, &fs_key);
-        self.filters.insert(sub, filter);
-        self.register_debounce(sub, debounce);
-        // Rebase each re-pointed subscription onto the wider root (design §8): its
-        // synthetic dominating Rescan strictly dominates its pre-widen stream while the
-        // new root's genuine events tie-or-exceed it, and names the widened root to
-        // re-enumerate — closing the unwatch→arm coverage gap.
-        let mut rescans = Vec::with_capacity(repointed.len());
-        for moved in repointed {
-          // The re-point Rescan re-enumerates the whole subscription, so it dominates any
-          // pre-widen deltas still buffered in the coalescer. Drop them before delivering it:
-          // otherwise, on a full channel, a buffered delta flushes ahead of the Rescan (the
-          // coalescer admits before `try_emit` suppresses) and parks at a fresh `shed_rescan`
-          // one epoch above the new root's raw-0, sorting the Rescan behind it and silently
-          // dropping post-widen events (the coalescer sibling of the re-point-epoch calibration).
-          // DROP, not forget: the re-pointed subscription stays live on the wider root, so its
-          // registered debounce policy must keep governing its post-widen events.
-          if let Some(coalescer) = self.coalescer.as_mut() {
-            coalescer.drop_subscription(moved);
-          }
-          let rescan = self.epochs.repoint(moved);
-          let mut event = Event::rescan(moved, fs_key.clone(), rescan);
-          // The specific re-pointed subscription owns this Rescan (its key is invariant under the
-          // widen, so its own value is still recorded); bake it so attribution is the sub's own
-          // value, not the widening root's (design §3).
-          event.set_value(self.subsumer.subscription_value(moved).cloned());
-          rescans.push(event);
-        }
-        self.push_all(rescans);
+        self.commit_widen(&outcome, handle, &fs_key, sub, filter, debounce, &repointed);
         Ok(sub)
       }
     }
+  }
+
+  /// The shared commit tail of a widen, whichever way its wider root was obtained:
+  /// freshly armed (release-and-rearm) or retargeted IN PLACE
+  /// ([`Source::replace`] — same handle, no coverage gap).
+  ///
+  /// The subsumer's `by_handle` re-key is remove-then-insert, so a PRESERVED handle
+  /// lands back under the wider key rather than being dropped — which is exactly why
+  /// the in-place path needs no separate index surgery.
+  ///
+  /// Every re-pointed subscription is rebased onto the wider root with a synthetic
+  /// dominating `Rescan` (design §8): it strictly dominates that sub's pre-widen
+  /// stream while the new root's genuine events tie-or-exceed it, and names the
+  /// widened root to re-enumerate. It is owed on BOTH paths — the release-and-rearm
+  /// gap makes it a loss cover, and the in-place path (no gap) still changes the
+  /// sub's root, so its view must re-base.
+  #[allow(clippy::too_many_arguments)]
+  fn commit_widen(
+    &mut self,
+    outcome: &WatchOutcome<C, S::Handle>,
+    handle: S::Handle,
+    fs_key: &[C],
+    sub: Subscription,
+    filter: Filter<C>,
+    debounce: Debounce,
+    repointed: &[Subscription],
+  ) {
+    self.subsumer.commit_watch(outcome, handle, fs_key);
+    self.filters.insert(sub, filter);
+    self.register_debounce(sub, debounce);
+    let mut rescans = Vec::with_capacity(repointed.len());
+    for &moved in repointed {
+      // The re-point Rescan re-enumerates the whole subscription, so it dominates any
+      // pre-widen deltas still buffered in the coalescer. Drop them before delivering it:
+      // otherwise, on a full channel, a buffered delta flushes ahead of the Rescan (the
+      // coalescer admits before `try_emit` suppresses) and parks at a fresh `shed_rescan`
+      // one epoch above the new root's raw-0, sorting the Rescan behind it and silently
+      // dropping post-widen events (the coalescer sibling of the re-point-epoch calibration).
+      // DROP, not forget: the re-pointed subscription stays live on the wider root, so its
+      // registered debounce policy must keep governing its post-widen events.
+      if let Some(coalescer) = self.coalescer.as_mut() {
+        coalescer.drop_subscription(moved);
+      }
+      let rescan = self.epochs.repoint(moved);
+      let mut event = Event::rescan(moved, fs_key.to_vec(), rescan);
+      // The specific re-pointed subscription owns this Rescan (its key is invariant under the
+      // widen, so its own value is still recorded); bake it so attribution is the sub's own
+      // value, not the widening root's (design §3).
+      event.set_value(self.subsumer.subscription_value(moved).cloned());
+      rescans.push(event);
+    }
+    self.push_all(rescans);
   }
 
   /// Registers a freshly-committed subscription's [`Debounce`] posture with the

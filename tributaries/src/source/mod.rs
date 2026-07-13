@@ -494,6 +494,39 @@ pub trait LocalSource<C> {
   /// `next`, itself an `async_channel` receive, which is cancel-safe by construction.
   fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>>;
 
+  /// Retargets an armed root **in place** — the same `handle`, a new (necessarily WIDER)
+  /// key — returning the handle unchanged alongside the key the source committed to.
+  ///
+  /// This is the gapless alternative to release-and-rearm. The umbrella's widen would
+  /// otherwise [`disarm`](Self::disarm) the subsumed roots and [`arm`](Self::arm) a wider
+  /// one, which drops kernel coverage for the window between them — a gap the re-pointed
+  /// subscribers' dominating `Rescan` covers but cannot un-lose. A source that can widen
+  /// its own root make-before-break (the fs binding does: `Watcher::replace_root` brings the
+  /// replacement stream up BEFORE retiring the old one) offers it here instead.
+  ///
+  /// **The handle is PRESERVED, deliberately** — this is the one sanctioned exception to the
+  /// generation-unique [`Handle`](Self::Handle) contract, and it is sound precisely because
+  /// no fresh handle is minted: nothing can alias, and the umbrella re-keys its record in
+  /// place rather than dropping and re-inserting.
+  ///
+  /// **Atomic on failure**: every error MUST leave the old root's coverage exactly as it was,
+  /// because the umbrella falls back to the release-and-rearm path on ANY error — including
+  /// the default's [`FaultKind::Unsupported`](crate::FaultKind::Unsupported), which is simply
+  /// "this source cannot widen in place; do it the old way". A source that cannot promise
+  /// atomicity must not implement this method.
+  fn replace(
+    &mut self,
+    handle: Self::Handle,
+    new_key: &[C],
+  ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> {
+    let _ = (handle, new_key);
+    async {
+      Err(WatchError::Source(crate::error::SourceFault::new(
+        crate::error::FaultKind::Unsupported,
+      )))
+    }
+  }
+
   /// Places a **sync-barrier cookie** under `dir_key` for the root `handle`, returning the
   /// cookie's canonical key. AWAITED, and it resolves at **write-complete — never at
   /// observe**: the cookie's event arrives through the very [`next`](Self::next) pump the
@@ -705,6 +738,39 @@ pub trait Source<C> {
   /// note on the [trait](Self)).
   fn next(&mut self) -> impl Future<Output = Option<SourceEvent<C, Self::Handle>>> + Send;
 
+  /// Retargets an armed root **in place** — the same `handle`, a new (necessarily WIDER)
+  /// key — returning the handle unchanged alongside the key the source committed to.
+  ///
+  /// This is the gapless alternative to release-and-rearm. The umbrella's widen would
+  /// otherwise [`disarm`](Self::disarm) the subsumed roots and [`arm`](Self::arm) a wider
+  /// one, which drops kernel coverage for the window between them — a gap the re-pointed
+  /// subscribers' dominating `Rescan` covers but cannot un-lose. A source that can widen
+  /// its own root make-before-break (the fs binding does: `Watcher::replace_root` brings the
+  /// replacement stream up BEFORE retiring the old one) offers it here instead.
+  ///
+  /// **The handle is PRESERVED, deliberately** — this is the one sanctioned exception to the
+  /// generation-unique [`Handle`](Self::Handle) contract, and it is sound precisely because
+  /// no fresh handle is minted: nothing can alias, and the umbrella re-keys its record in
+  /// place rather than dropping and re-inserting.
+  ///
+  /// **Atomic on failure**: every error MUST leave the old root's coverage exactly as it was,
+  /// because the umbrella falls back to the release-and-rearm path on ANY error — including
+  /// the default's [`FaultKind::Unsupported`](crate::FaultKind::Unsupported), which is simply
+  /// "this source cannot widen in place; do it the old way". A source that cannot promise
+  /// atomicity must not implement this method.
+  fn replace(
+    &mut self,
+    handle: Self::Handle,
+    new_key: &[C],
+  ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> + Send {
+    let _ = (handle, new_key);
+    async {
+      Err(WatchError::Source(crate::error::SourceFault::new(
+        crate::error::FaultKind::Unsupported,
+      )))
+    }
+  }
+
   /// Places a **sync-barrier cookie** under `dir_key` for the root `handle`, returning the
   /// cookie's canonical key. AWAITED, and it resolves at **write-complete — never at
   /// observe**: the cookie's event arrives through the very [`next`](Self::next) pump the
@@ -817,6 +883,14 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 
   fn root_key(&self, handle: Self::Handle) -> Option<Vec<C>> {
     <T as Source<C>>::root_key(self, handle)
+  }
+
+  fn replace(
+    &mut self,
+    handle: Self::Handle,
+    new_key: &[C],
+  ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> {
+    <T as Source<C>>::replace(self, handle, new_key)
   }
 
   fn begin_sync(

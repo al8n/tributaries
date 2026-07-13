@@ -26,6 +26,17 @@ All notable changes to this workspace are documented here. The format is based o
 - **`tributary-fs`** — `Watcher::sync_root` / `request_remove_cookie`, the
   settle-fenced cookie substrate beneath the umbrella's barrier (#23).
 
+- **`tributaries`** — a **gapless widen** (#29): `Source::replace` (defaulted
+  `Unsupported`) retargets an armed root in place, and the umbrella's widen now prefers
+  it whenever exactly one root is subsumed. The fs binding implements it with
+  `Watcher::replace_root`, which is make-before-break — so the coverage window that
+  release-and-rearm opened (the old subtree unwatched between `disarm` and the wider
+  `arm`, covered by the re-point `Rescan` but not un-lost) is gone. The handle is
+  deliberately PRESERVED, the one sanctioned exception to the generation-unique handle
+  contract; it is sound precisely because no fresh handle is minted. `replace` is atomic
+  on failure, so any error — including a source that simply cannot do it — falls back to
+  the old dance with the old root's coverage untouched.
+
 - **`tributary-fs`** — a root replacement now **replays its swap window from the
   retiring stream's journal** (#27): the driver takes the old stream's resume point
   at command time and hands it to the replacement's spawn, so FSEvents replays the
