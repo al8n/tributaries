@@ -728,12 +728,20 @@ fn xorshift(s: &mut u64) -> u64 {
 /// events (honoring Rescans as re-reads) converges to the tree, with
 /// per-scope epochs monotone. `TRIBUTARY_FS_STORM_SEEDS` scales the seed
 /// count (64 in CI; run 1024 nightly).
+///
+/// Under miri the default drops to ONE seed: miri never reuses an address, so
+/// 64 seeds' worth of path and tree churn exhausts a 32-bit target's whole
+/// address space (i686 dies with "no more free addresses"). Miri is here to
+/// find UB, and one seed drives every code path the others do — the
+/// statistical convergence coverage is the native runs' job, where the full
+/// seed count still runs.
 #[tokio::test(start_paused = true)]
 async fn storm_no_silent_loss_converges() {
+  let default_seeds: u64 = if cfg!(miri) { 1 } else { 64 };
   let seeds: u64 = std::env::var("TRIBUTARY_FS_STORM_SEEDS")
     .ok()
     .and_then(|v| v.parse().ok())
-    .unwrap_or(64);
+    .unwrap_or(default_seeds);
   for seed in 1..=seeds {
     storm_seed(seed).await;
   }
@@ -1564,12 +1572,16 @@ mod descending {
   /// The tree-equality storm under the descending profile: the fake driver
   /// services enumerates against the fake tree, arms fail sporadically, and
   /// listings degrade — the consumer's reconstructed view still converges.
+  ///
+  /// One seed under miri, for the address-space reason `storm_no_silent_loss_
+  /// converges` documents.
   #[tokio::test(flavor = "multi_thread")]
   async fn descending_storm_converges() {
+    let default_seeds: u64 = if cfg!(miri) { 1 } else { 8 };
     let seeds: u64 = std::env::var("TRIBUTARY_FS_STORM_SEEDS")
       .ok()
       .and_then(|v| v.parse().ok())
-      .unwrap_or(8);
+      .unwrap_or(default_seeds);
     for seed in 1..=seeds {
       descending_storm_seed(seed).await;
     }
