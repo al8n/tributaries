@@ -1168,6 +1168,34 @@ enum Flow {
   },
 }
 
+/// [`Owner::on_sync`]'s verdict for the [`run`] loop. The cookie write ([`Source::begin_sync`]) is
+/// awaited under a race against the caller's cancellation and the owner's close signal, so a backend
+/// write that never returns (a hung FUSE/NFS mount) can no longer wedge the loop — a timed-out sync
+/// frees the owner within the caller's own deadline, and a close during a held write tears down at
+/// once instead of waiting the write out.
+enum SyncAdmit {
+  /// The barrier was parked (awaiting its cookie), errored to its caller, or abandoned because the
+  /// caller went away — either way the owner keeps looping.
+  Done,
+  /// A close won the race while the write was in flight: its consumed [`CloseReply`] rides back so the
+  /// [`run`] loop drives teardown exactly as its own close arm would. The barrier is abandoned and its
+  /// caller (if any is left) sees `Closed`.
+  CloseRequested(CloseReply),
+}
+
+/// Which arm of [`Owner::on_sync`]'s admission race resolved, carrying only OWNED data out of the
+/// `select`. The cancellation arm holds `&mut reply` for the race's whole duration, so `reply` cannot
+/// be moved or sent until the `select` block ends; funneling the winner through this owned enum defers
+/// every use of `reply` to after that borrow is released.
+enum SyncStep<C> {
+  /// A [`CloseReply`] arrived on the dedicated close signal.
+  Close(CloseReply),
+  /// The caller dropped its `sync()` wait (timed out or cancelled), or every handle went away.
+  Canceled,
+  /// The cookie write finished: the cookie's canonical key to park a [`PendingSync`] on, or the error.
+  Began(Result<Vec<C>, SyncError>),
+}
+
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
 /// fan out a raw source event, or drain the coalescer's due entries — whichever is ready, each to
 /// completion. The only source calls it awaits are [`next`](LocalSource::next) (one cancel-safe
@@ -1249,9 +1277,14 @@ where
     // `Err(Empty)` alike fall through, driving neither teardown (the COMMAND channel closing remains
     // the dropped-handles signal) nor a spin.
     if let Ok(req) = owner.sync_commands.try_recv() {
-      owner
+      // A close can win the race inside `on_sync`'s in-flight cookie write: thread its reply back and
+      // break to teardown exactly as the top-of-iteration close check above does.
+      if let SyncAdmit::CloseRequested(reply) = owner
         .on_sync(req.sub, req.loss_gen_at_call, req.reply)
-        .await;
+        .await
+      {
+        break (Some(reply), false);
+      }
     }
 
     // Grant resolution is drained SECOND — below the close check, above the flush and the command
@@ -1397,8 +1430,15 @@ where
         // loop-top drain above, which the biased select can never starve.
         Some(req) => {
           command_streak += 1;
-          owner.on_sync(req.sub, req.loss_gen_at_call, req.reply).await;
-          Flow::Continue
+          match owner.on_sync(req.sub, req.loss_gen_at_call, req.reply).await {
+            SyncAdmit::Done => Flow::Continue,
+            // A close won the race inside the in-flight cookie write: break to teardown carrying its
+            // reply, exactly as the dedicated close arm above does.
+            SyncAdmit::CloseRequested(reply) => Flow::Break {
+              closing: Some(reply),
+              drain_owed: false,
+            },
+          }
         }
         // The sync mailbox closed (every handle dropped): disable the arm and let the command channel
         // observe its own close — the sync channel closing is not a teardown signal on its own.
@@ -3037,21 +3077,21 @@ where
     &mut self,
     sub: Subscription,
     loss_gen_at_call: u64,
-    reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
-  ) {
+    mut reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
+  ) -> SyncAdmit {
     // The caller's `sync()` deadline can fire during admission — dropping the response receiver —
     // before the owner ever dispatches this request. Minting a token, awaiting `begin_sync`, and
     // parking a PendingSync for a reply nobody will read is wasted cookie work and a strand the
     // loop-top prune must later reap. A canceled reply owes nothing: skip it before any cookie work.
     if reply.is_canceled() {
-      return;
+      return SyncAdmit::Done;
     }
     let (Some(root), Some(dir_key)) = (
       self.subsumer.subscription_root(sub),
       self.subsumer.subscription_key(sub).map(<[C]>::to_vec),
     ) else {
       let _ = reply.send(Err(SyncError::UnknownSubscription));
-      return;
+      return SyncAdmit::Done;
     };
     self.sync_seq += 1;
     // An unguessable nonce keyed by the owner's OS-random secret: another
@@ -3069,28 +3109,55 @@ where
       self.sync_seq,
       nonce,
     );
-    // Awaited INLINE — never the OBSERVATION, which arrives through the very
-    // `next` pump this owner drives (awaiting it would deadlock by
-    // construction). The inline await is FORCED by the `&mut self.source` +
-    // conditional-`Send` seam, exactly as it is for `arm` and `grow`: a timer
-    // wrapper is infeasible here, because `R::timeout` requires the inner
-    // future to be `Send` (which `LocalSource::begin_sync` is not) while
-    // `R::timeout_local` is unconditionally `!Send` (which would break the
-    // `Send` promise `parts()` makes on the `Source` path). So there is no
-    // generic timer that preserves the run future's conditional `Send`.
+    // The cookie write is AWAITED here — never the OBSERVATION, which arrives through the very `next`
+    // pump this owner drives (awaiting that would deadlock by construction). The await is FORCED onto
+    // this loop by the `&mut self.source` + conditional-`Send` seam, exactly as `arm`/`grow` are:
+    // `R::timeout` needs a `Send` inner future (which `LocalSource::begin_sync` is not) and
+    // `R::timeout_local` is unconditionally `!Send` (which would break the `Send` promise `parts()`
+    // makes on the `Source` path), so no generic timer can bound the write while preserving the run
+    // future's conditional `Send`.
     //
-    // This is bounded, not an unbounded wedge: `begin_sync` parks the cookie
-    // write on the fs coverage-settle fence, which the SEPARATE fs-driver task
-    // resolves in at most `REARM_MAX_RETRIES` steps (each terminal is
-    // armed-live or degraded-with-a-standing-`Rescan`), independent of this
-    // owner's state; a root dying mid-park replies `Retired`. So it resolves
-    // in bounded time however this owner is otherwise occupied. The caller's
-    // deadline is enforced at the OUTER level (`Tributaries::sync` wraps the
-    // response in `R::timeout` — the `Send` path), and a caller that walks
-    // away cancels the parked write via the fence's cancelled-reply prune;
-    // a since-installed pending sync is reaped at the loop-top prune. (O5.)
-    match self.source.begin_sync(root, &dir_key, token).await {
-      Ok(cookie_key) => {
+    // So instead of a timer, RACE the write against two unconditionally-`Send` signals: the caller's
+    // `reply.cancellation()` and the owner's close receiver. A held write (a hung FUSE/NFS mount) can
+    // then no longer wedge the loop — cancellation frees the owner within the caller's own deadline,
+    // and a close tears down at once. The seam is preserved precisely because both extra arms are
+    // `Send` for every source: a `select` of them and `begin_sync` is `Send` iff `begin_sync` is, so
+    // the combined future keeps EXACTLY the conditional `Send` the run loop needs (the compile-time
+    // owner-`Send` assertions still hold). A cookie the write had already begun self-reaps as the
+    // dropped `begin_sync` future unwinds the fs write; a since-parked pending sync is reaped at the
+    // loop-top prune.
+    let step = {
+      // Split-borrow the two owner fields the race touches so they stay disjoint: the close arm reads
+      // `&self.closes`, `begin_sync` reborrows `&mut self.source`, and the cancellation arm borrows
+      // `&mut reply` (a local, disjoint from both). Every use of `reply` is deferred to AFTER this
+      // block, once the cancellation future's borrow of it is released.
+      let closes = &self.closes;
+      let source = &mut self.source;
+      futures_util::select_biased! {
+        // Close outranks everything: a requested shutdown abandons the in-flight write. A CLOSED close
+        // channel means every handle is gone (the caller with them), so it lands as an abandon, not a
+        // threaded close — no one is left to acknowledge, and the command channel drives teardown.
+        close = closes.recv().fuse() => match close {
+          Ok(close_reply) => SyncStep::Close(close_reply),
+          Err(_) => SyncStep::Canceled,
+        },
+        // The caller timed out or dropped its `sync()` wait: its receiver is gone.
+        () = reply.cancellation().fuse() => SyncStep::Canceled,
+        // The backend write completed (or failed).
+        res = source.begin_sync(root, &dir_key, token).fuse() => SyncStep::Began(res),
+      }
+    };
+
+    match step {
+      // Thread the close back so the run loop's teardown consumes it exactly once — no loss, no
+      // double-acknowledge.
+      SyncStep::Close(close_reply) => SyncAdmit::CloseRequested(close_reply),
+      // Abandon: drop `reply` without parking or writing further. The caller is gone (timeout, drop,
+      // or every handle away); a cookie the write began self-reaps as the dropped write unwinds, and
+      // the cookie's own event — should it still arrive — is suppressed as a sync artifact, so nothing
+      // spurious is delivered.
+      SyncStep::Canceled => SyncAdmit::Done,
+      SyncStep::Began(Ok(cookie_key)) => {
         let loss_serial_at_install = self.loss_serial.get(&sub).copied().unwrap_or(0);
         // Domination the cookie cannot un-owe, decided from the CALLER'S call rather than from this
         // install — the two probes cover disjoint halves of the pre-cookie past:
@@ -3121,9 +3188,11 @@ where
           dominated_at_install,
           reply,
         });
+        SyncAdmit::Done
       }
-      Err(err) => {
+      SyncStep::Began(Err(err)) => {
         let _ = reply.send(Err(err));
+        SyncAdmit::Done
       }
     }
   }

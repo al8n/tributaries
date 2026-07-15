@@ -7622,3 +7622,171 @@ async fn a_command_flood_does_not_starve_the_sync_mailbox() {
      loss generation must not fire spuriously on unrelated control-plane traffic: {outcome:?}"
   );
 }
+
+/// A source for the HELD-write tests: it arms roots live and offers the barrier
+/// ([`Source::begin_sync`]), but `begin_sync` first parks on a gate the test holds shut — modelling a
+/// hung backend write (a stuck FUSE/NFS mount) that never returns. `next` parks when idle, keeping the
+/// run loop alive so the race's cancellation and close arms can free the owner.
+struct HeldBeginSyncSource {
+  next_handle: u32,
+  live: HashMap<u32, Vec<OsString>>,
+  /// `begin_sync` awaits one token here before returning the cookie. The tests never send (and keep
+  /// the paired sender alive so the channel stays open rather than erroring), so the write stays held
+  /// for the whole test — the only thing that frees the owner is the race, never the write completing.
+  begin_gate: async_channel::Receiver<()>,
+}
+
+impl Source<OsString> for HeldBeginSyncSource {
+  type Handle = u32;
+
+  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    Ok(key.to_vec())
+  }
+
+  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    self.next_handle += 1;
+    let handle = self.next_handle;
+    self.live.insert(handle, key.to_vec());
+    Ok(Armed::new(handle, key.to_vec()))
+  }
+
+  fn disarm(&mut self, handle: u32) {
+    self.live.remove(&handle);
+  }
+
+  fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+    key
+      .last()
+      .and_then(|leaf| leaf.to_str())
+      .is_some_and(|leaf| leaf.starts_with("cookie-"))
+  }
+
+  async fn begin_sync(
+    &mut self,
+    _handle: u32,
+    dir_key: &[OsString],
+    token: SyncToken,
+  ) -> Result<Vec<OsString>, crate::error::SyncError> {
+    // Park on the test's gate: the write is held until the test releases it (it never does), so the
+    // owner would wedge here forever under an inline `begin_sync().await`.
+    let _ = self.begin_gate.recv().await;
+    let mut cookie_key = dir_key.to_vec();
+    cookie_key.push(OsString::from(format!("cookie-{}", token.seq())));
+    Ok(cookie_key)
+  }
+
+  async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+    // Park so the run loop survives to service the race and later commands.
+    std::future::pending::<Option<SourceEvent<OsString, u32>>>().await
+  }
+
+  fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+    self.live.get(&handle).cloned()
+  }
+}
+
+/// A held backend write must not wedge the owner. When the caller's `sync()` deadline fires and drops
+/// its response, the race's cancellation arm frees the owner within the caller's own timeout, so the
+/// owner resumes servicing its mailbox — a follow-up command resolves promptly.
+///
+/// Fail-on-old (the inline `begin_sync().await`): after the caller is gone the owner stays parked in
+/// the held write forever, so the follow-up watch never resolves and this test hangs to its bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_sync_frees_the_owner_when_the_caller_drops() {
+  use crate::error::SyncError;
+
+  // The gate the test holds shut: `begin_sync` parks on it forever, modelling a hung backend write.
+  let (_begin_tx, begin_rx) = async_channel::unbounded::<()>();
+  let source = HeldBeginSyncSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    begin_gate: begin_rx,
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+  let sub = w
+    .watch(key("/a"), (), WatchOptions::new())
+    .await
+    .expect("watch /a");
+
+  // The owner dispatches this sync and parks in the held write's race. The caller's deadline fires,
+  // dropping the response — which (only with the race) fires the owner's cancellation arm and frees
+  // it. A generous outer bound proves the INNER sync timeout is what returns, not a hang.
+  let result = tokio::time::timeout(
+    Duration::from_secs(10),
+    w.sync(sub, Duration::from_millis(300)),
+  )
+  .await
+  .expect("the outer bound is not hit — the inner sync timeout returns");
+  assert!(
+    matches!(result, Err(SyncError::Timeout)),
+    "the held sync times out: {result:?}"
+  );
+
+  // The owner must not be wedged in the abandoned write: a subsequent command is serviced promptly.
+  // Under the old inline await this watch never resolves (the owner is still parked in the held
+  // `begin_sync`), so the bound below fires and the test fails.
+  tokio::time::timeout(
+    Duration::from_secs(5),
+    w.watch(key("/b"), (), WatchOptions::new()),
+  )
+  .await
+  .expect(
+    "the owner services a command after the timed-out sync — it is not wedged in the held write",
+  )
+  .expect("the follow-up watch succeeds");
+  assert!(
+    w.view().is_watched(&key("/b")),
+    "the follow-up watch committed — the owner resumed servicing the mailbox after freeing itself"
+  );
+}
+
+/// A close during a held write tears down at once — it does not wait the write out. The close arm in
+/// `on_sync`'s race outranks the parked `begin_sync`, so a `close` on the dedicated signal wins and
+/// rides back to drive teardown, and the abandoned sync's caller then sees the owner gone.
+///
+/// This is the close-race form's guarantee: with a cancellation-only race, this close would instead
+/// block behind the held write until the sync's own (long-lived) caller went away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_during_a_held_sync_tears_down_promptly() {
+  use crate::error::SyncError;
+
+  let (_begin_tx, begin_rx) = async_channel::unbounded::<()>();
+  let source = HeldBeginSyncSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    begin_gate: begin_rx,
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+  let sub = w
+    .watch(key("/a"), (), WatchOptions::new())
+    .await
+    .expect("watch /a");
+
+  // A sync with a LONG deadline on a background task, so it never self-cancels: the owner parks in the
+  // held write, and the ONLY thing that can free it is the close under test.
+  let syncer = {
+    let w = w.clone();
+    tokio::spawn(async move { w.sync(sub, Duration::from_secs(30)).await })
+  };
+  // Let the owner dispatch the sync and park in the held `begin_sync` before the close arrives.
+  tokio::time::sleep(Duration::from_millis(200)).await;
+
+  // Close must resolve WITHOUT the gate ever opening: the close arm outranks the parked write.
+  tokio::time::timeout(Duration::from_secs(5), w.close())
+    .await
+    .expect("close tears down promptly while the write is held — it does not wait the write out")
+    .expect("close acknowledges");
+
+  // The abandoned held sync resolves once the owner tore down: on_sync returned its close verdict
+  // without ever sending on the sync's reply, so the dropped reply surfaces `Closed` to the caller.
+  let sync_result = tokio::time::timeout(Duration::from_secs(5), syncer)
+    .await
+    .expect("the held sync resolves once the owner tore down")
+    .expect("sync task");
+  assert!(
+    matches!(sync_result, Err(SyncError::Closed)),
+    "the abandoned held sync resolves Closed after the close-driven teardown: {sync_result:?}"
+  );
+}

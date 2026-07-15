@@ -4265,6 +4265,48 @@ mod sync_cookie {
     );
   }
 
+  // Containment is not merely lexical. A cookie directory whose SPELLING sits
+  // under the root but whose real path escapes it — an ALREADY-EXISTING
+  // intermediate symlink `<root>/link` pointing outside, needing no swap — passes
+  // the lexical check yet must be refused. The write canonicalizes the directory
+  // (resolving the link) and verifies the result is beneath the canonical root
+  // before creating anything, so no cookie lands outside the watched tree, where
+  // its create event could never be reported on this root's stream.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_preexisting_intermediate_symlink_dir_is_refused() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    // `/r/link` is an existing symlink to `/outside`, so `/r/link/sub` really is
+    // `/outside/sub`: it exists as a directory and its spelling passes the lexical
+    // containment check, but it canonicalizes OUTSIDE the root.
+    rig.fs.put("/r/link/sub", FileKind::Dir, 2);
+    rig.fs.resolve_cookie_dir_to("/r/link/sub", "/outside/sub");
+
+    match sync_root(&rig, scope, "/r/link/sub", ".tributaries-sync-1-9-7").await {
+      Err(crate::error::SyncRootError::Write { source, .. }) => {
+        assert_eq!(
+          source.kind(),
+          std::io::ErrorKind::Other,
+          "the write refuses a directory that resolves outside the root"
+        );
+      }
+      other => panic!("expected a refused write, got {other:?}"),
+    }
+    assert!(
+      rig.fs.cookie_writes().is_empty(),
+      "no cookie was created for a directory outside the root"
+    );
+    assert!(
+      rig.fs.files_under("/outside").is_empty(),
+      "and nothing landed outside the watched tree"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "nothing was claimed for a barrier that could not be written"
+    );
+  }
+
   // A write dispatched under the pre-replace root carries the generation current
   // at DISPATCH; a replace commit bumps it, so the write's claim is refused and
   // its file reaped — never a cookie the new stream could not report. Without the
@@ -4323,6 +4365,89 @@ mod sync_cookie {
       cookie_count(&rig).await,
       0,
       "and nothing was recorded for a barrier that never claimed"
+    );
+  }
+
+  // The generation bump that revokes a stale cookie write must land AT the lane
+  // swap, not at the run loop's post-commit call. A write RELEASED in the window
+  // after the swap — the new stream is live, the old lane retired — but before
+  // that later call would otherwise claim under the still-old generation and
+  // strand its barrier on the retired lane. The bump moved INTO `commit_replace`,
+  // before the swap and under the ledger lock, so a claim in this window reads the
+  // new generation and is refused. The gated registry freezes the owner loop at
+  // the commit's registry overwrite — after the swap, before the post-commit
+  // cookie call — which is exactly the window; the write is released there.
+  //
+  // MUST FAIL (the write wrongly commits, replying `Ok`) if the bump sits at the
+  // old post-commit site: frozen here, that site has not run, so the generation
+  // still matches the one the write captured.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_write_released_after_the_stream_swap_but_before_the_old_bump_site_is_revoked() {
+    let registry = GatedRegistry::default();
+    let rig = rig_with(64, registry.clone());
+    rig.fs.put("/r2", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r").await;
+
+    // The write is dispatched under the current root — its guard captures
+    // generation 0 — and parks in the pool, its file not yet created.
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-1-9-9").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+
+    // Freeze the owner loop at the replace commit's registry overwrite — PAST the
+    // lane swap (and, with the fix, past the generation bump), BEFORE the run
+    // loop's post-commit cookie call.
+    let commit = registry.hold_scope_live();
+    let (reply, on_replace) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    settle(|| registry.scope_live_frozen()).await;
+    assert!(
+      registry.scope_live_frozen(),
+      "the owner loop is frozen in the commit, past the swap"
+    );
+
+    // Release the held write INTO that window: with the bump at the swap, the
+    // live generation has already moved past the one the write captured, so the
+    // claim is refused — never a barrier committed to the retired lane.
+    hold.release();
+    assert!(
+      matches!(
+        on_reply.await.expect("the write answers its caller"),
+        Err(crate::error::SyncRootError::Retired)
+      ),
+      "a write released after the swap is revoked, not committed under the stale generation"
+    );
+
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      rig.fs.cookie_writes(),
+      "the revoked write reaped the file it had created"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no cookie survives on the superseded root"
+    );
+
+    // Let the frozen commit finish; the barrier count is back to zero.
+    commit.release();
+    on_replace
+      .await
+      .expect("driver replies")
+      .expect("the swap commits");
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "nothing was recorded for a barrier that never claimed"
     );
   }
 
