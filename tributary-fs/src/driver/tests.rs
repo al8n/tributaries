@@ -14,6 +14,7 @@ use crate::os::{FsEventFlags, RawOsEvent};
 struct Rig {
   fs: FakeFs,
   commands: async_channel::Sender<Command>,
+  cookie_removes: async_channel::Sender<PathBuf>,
   events: async_channel::Receiver<(ScopeId, Arc<PathBuf>, Change)>,
 }
 
@@ -43,17 +44,20 @@ fn rig_with(event_capacity: usize, registry: impl ScopeRegistry) -> Rig {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  let (reap_tx, reap_rx) = async_channel::unbounded();
   let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     config(),
     fs.clone(),
     cmd_rx,
+    reap_rx,
     ev_tx,
     registry,
   ));
   Rig {
     fs,
     commands: cmd_tx,
+    cookie_removes: reap_tx,
     events: ev_rx,
   }
 }
@@ -979,17 +983,20 @@ async fn spawn_seed_carries_a_preexisting_submount() {
   fs.put("/r", FileKind::Dir, 1);
   fs.seed_mounts(vec![PathBuf::from("/r/vol")]);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  let (reap_tx, reap_rx) = async_channel::unbounded();
   let (ev_tx, ev_rx) = async_channel::bounded(64);
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     config(),
     fs.clone(),
     cmd_rx,
+    reap_rx,
     ev_tx,
     NullRegistry,
   ));
   let rig = Rig {
     fs,
     commands: cmd_tx,
+    cookie_removes: reap_tx,
     events: ev_rx,
   };
   watch(&rig, "/r").await;
@@ -1293,17 +1300,20 @@ mod descending {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (reap_tx, reap_rx) = async_channel::unbounded();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       inotify_config(),
       fs.clone(),
       cmd_rx,
+      reap_rx,
       ev_tx,
       NullRegistry,
     ));
     Rig {
       fs,
       commands: cmd_tx,
+      cookie_removes: reap_tx,
       events: ev_rx,
     }
   }
@@ -1713,17 +1723,20 @@ mod descending {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (reap_tx, reap_rx) = async_channel::unbounded();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       inotify_config(),
       fs.clone(),
       cmd_rx,
+      reap_rx,
       ev_tx,
       registry,
     ));
     Rig {
       fs,
       commands: cmd_tx,
+      cookie_removes: reap_tx,
       events: ev_rx,
     }
   }
@@ -3704,11 +3717,13 @@ mod sync_cookie {
     let fs = FakeFs::new(1);
     fs.put("/r", FileKind::Dir, 1);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (reap_tx, reap_rx) = async_channel::unbounded();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
     let driver = tokio::spawn(run::<TokioRuntime, FakeFs>(
       config(),
       fs.clone(),
       cmd_rx,
+      reap_rx,
       ev_tx,
       NullRegistry,
     ));
@@ -3716,6 +3731,7 @@ mod sync_cookie {
       Rig {
         fs,
         commands: cmd_tx,
+        cookie_removes: reap_tx,
         events: ev_rx,
       },
       driver,
@@ -3747,12 +3763,8 @@ mod sync_cookie {
       "the cookie's own event rides the root's ordered queue"
     );
 
-    // And it reaps, idempotently.
-    rig
-      .commands
-      .send(Command::RemoveCookie { path: path.clone() })
-      .await
-      .unwrap();
+    // And it reaps, idempotently — on the dedicated cleanup lane.
+    rig.cookie_removes.send(path.clone()).await.unwrap();
     settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert_eq!(rig.fs.cookie_removes(), vec![path]);
   }
@@ -3789,7 +3801,7 @@ mod sync_cookie {
     ));
   }
 
-  // The driver owns every cookie it writes: even with NO `RemoveCookie` — the
+  // The driver owns every cookie it writes: even with NO removal request — the
   // abandoned-after-send case where the caller loses the path — the cookie is
   // unlinked when the driver tears down. This is the guarantee that lets the
   // umbrella source drop its own cookie-removes queue entirely.
@@ -3809,7 +3821,7 @@ mod sync_cookie {
     );
     assert!(
       rig.fs.cookie_removes().is_empty(),
-      "no RemoveCookie was sent — the cookie is still the driver's to reap"
+      "no removal was requested — the cookie is still the driver's to reap"
     );
 
     // Close WITHOUT ever removing the cookie: the driver's terminal reap must
@@ -3837,7 +3849,7 @@ mod sync_cookie {
       .expect("the write lands");
     assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
 
-    // Retire the scope with no RemoveCookie: the stream teardown reaps the
+    // Retire the scope with no removal request: the stream teardown reaps the
     // cookie the scope still owns (a reply-less, off-reactor unlink).
     let (reply, on_reply) = futures_channel::oneshot::channel();
     rig
@@ -4038,11 +4050,7 @@ mod sync_cookie {
     // And the registry owns the path the write ACTUALLY landed at — the
     // caller's remove (keyed off that same returned path) finds it.
     assert_eq!(cookie_count(&rig).await, 1);
-    rig
-      .commands
-      .send(Command::RemoveCookie { path: path.clone() })
-      .await
-      .unwrap();
+    rig.cookie_removes.send(path.clone()).await.unwrap();
     settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert_eq!(rig.fs.cookie_removes(), vec![path]);
     assert_eq!(
@@ -4180,5 +4188,210 @@ mod sync_cookie {
       rig.fs.files_under("/").is_empty(),
       "and nothing landed ABOVE the root, where no event could ever report it"
     );
+  }
+
+  // A cookie NAME that is not a single normal component would escape the
+  // directory the barrier was validated for once joined — refused before any
+  // write, never a silent placement outside coverage.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cookie_name_with_a_separator_is_refused() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    assert!(
+      matches!(
+        sync_root(&rig, scope, "/r", "sub/evil").await,
+        Err(crate::error::SyncRootError::BadCookieName { .. })
+      ),
+      "a name with a separator is a contract violation, not a barrier"
+    );
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      0,
+      "the write was refused before it could reach the pool"
+    );
+    assert_eq!(cookie_count(&rig).await, 0);
+  }
+
+  // A directory that only appears inside the root through `..` traversal —
+  // `/r/../outside` starts_with `/r` component-wise, yet escapes the tree once
+  // folded — is refused, closing the lexical escape a plain `starts_with` misses.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cookie_dir_escaping_via_dotdot_is_refused() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    assert!(
+      matches!(
+        sync_root(&rig, scope, "/r/../outside", ".tributaries-sync-1-9-8").await,
+        Err(crate::error::SyncRootError::DirOutsideRoot { .. })
+      ),
+      "a `..`-escaping directory is outside the root, however it lexes"
+    );
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      0,
+      "the write was refused before it could reach the pool"
+    );
+    assert_eq!(cookie_count(&rig).await, 0);
+  }
+
+  // O_NOFOLLOW on the create: a symlink swapped in where the cookie is to land
+  // is refused rather than followed to a target that could sit outside the root,
+  // where its create event would never meet the barrier.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_final_component_symlink_is_not_followed() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    // An adversary places a symlink at the exact path the cookie would take.
+    rig
+      .fs
+      .put("/r/.tributaries-sync-1-9-6", FileKind::Symlink, 77);
+
+    match sync_root(&rig, scope, "/r", ".tributaries-sync-1-9-6").await {
+      Err(crate::error::SyncRootError::Write { source, .. }) => {
+        assert_eq!(
+          source.kind(),
+          std::io::ErrorKind::AlreadyExists,
+          "the create refuses the symlink instead of following it"
+        );
+      }
+      other => panic!("expected a refused create, got {other:?}"),
+    }
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "nothing was claimed for a barrier that could not be written"
+    );
+  }
+
+  // A write dispatched under the pre-replace root carries the generation current
+  // at DISPATCH; a replace commit bumps it, so the write's claim is refused and
+  // its file reaped — never a cookie the new stream could not report. Without the
+  // generation check the stale write would claim, strand its barrier, and leave a
+  // file outside coverage.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_write_dispatched_under_the_old_root_is_revoked_after_replace() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r2", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r").await;
+
+    // The write is dispatched — its guard captures generation 0 — and parks in
+    // the pool on the hold gate.
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-1-9-5").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+
+    // Replace the root BEFORE the write lands: the commit bumps the generation.
+    let (reply, on_replace) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    on_replace
+      .await
+      .expect("driver replies")
+      .expect("the swap commits");
+
+    // Release the held write: it completes under the SUPERSEDED generation and
+    // must not claim.
+    hold.release();
+    assert!(
+      matches!(
+        on_reply.await.expect("the driver replies"),
+        Err(crate::error::SyncRootError::Retired)
+      ),
+      "a write under the old root is revoked, not silently committed"
+    );
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      rig.fs.cookie_writes(),
+      "the revoked write reaped the file it had created"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no cookie survives under the superseded root"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "and nothing was recorded for a barrier that never claimed"
+    );
+  }
+
+  // The completed-cookie reap rides a DEDICATED lane, so a saturated command
+  // channel can never drop it. With the 16-slot command channel provably full,
+  // every reap still lands and the registry returns to zero while the scope stays
+  // live. A single-threaded runtime makes the saturation deterministic: the fill
+  // burst yields nowhere, so the driver cannot drain a slot until the next await.
+  // MUST hang (or leak) if the removal rode the command channel.
+  #[tokio::test(flavor = "current_thread")]
+  async fn saturated_command_channel_still_reaps_completed_cookies() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    // Complete several syncs; the registry now owns their cookies.
+    let mut cookies = Vec::new();
+    for seq in 0..4 {
+      let name = format!(".tributaries-sync-1-9-9-{seq}");
+      cookies.push(
+        sync_root(&rig, scope, "/r", &name)
+          .await
+          .expect("the write lands"),
+      );
+    }
+    assert_eq!(cookie_count(&rig).await, cookies.len());
+
+    // Saturate the 16-slot command channel: this burst never awaits, so on a
+    // single-threaded runtime the driver cannot drain a slot mid-fill.
+    for _ in 0..16 {
+      let (reply, _rx) = futures_channel::oneshot::channel::<usize>();
+      rig
+        .commands
+        .try_send(Command::DebugCookieCount { reply })
+        .expect("a command slot is free");
+    }
+    let (reply, _rx) = futures_channel::oneshot::channel::<usize>();
+    assert!(
+      rig
+        .commands
+        .try_send(Command::DebugCookieCount { reply })
+        .is_err(),
+      "the command channel is saturated"
+    );
+
+    // Every completed cookie reaps through the DEDICATED lane — admitted despite
+    // the jammed command channel.
+    for path in &cookies {
+      rig
+        .cookie_removes
+        .try_send(path.clone())
+        .expect("the cleanup lane always admits");
+    }
+
+    // Draining the fillers frees the command channel; the reaps land, the
+    // registry empties, and the scope is still live.
+    settle(|| rig.fs.cookie_removes().len() == cookies.len()).await;
+    let mut reaped = rig.fs.cookie_removes();
+    reaped.sort();
+    let mut expected = cookies.clone();
+    expected.sort();
+    assert_eq!(reaped, expected, "every completed cookie was unlinked");
+    assert_eq!(cookie_count(&rig).await, 0, "the registry returned to zero");
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no cookie file lingers"
+    );
+    // The scope never died — a fresh barrier still lands.
+    sync_root(&rig, scope, "/r", ".tributaries-sync-1-9-9-live")
+      .await
+      .expect("the scope is still live after the reaps");
   }
 }

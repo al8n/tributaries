@@ -2821,11 +2821,26 @@ where
       let mut event = Event::rescan(sub, parked.key.clone(), parked.epoch);
       event.set_value(parked.value.clone());
       match self.events.try_send(event) {
-        Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {
+        Ok(()) => {
+          // The PUBLISH half of the same invariant `note_domination` enforces at the
+          // delivered-`Rescan` choke point: a parked re-enumeration reaching the stream IS a
+          // delivered covering `Rescan`, so any barrier whose caller's `sync()` preceded it must be
+          // dominated by it too. A caller who snapshotted the generation AFTER this debt parked (its
+          // bump already folded into the snapshot) and installs after this publish-and-clear would
+          // otherwise find an empty debt map, an unmoved `loss_serial`, and a clean flush — and
+          // falsely resolve `Delivered` for a pre-call re-enumeration this publish just handed it.
+          // Advancing the shared generation here is the only trace that survives the clear.
+          self.note_domination();
+          self.needs_rescan.remove(&sub);
+        }
+        Err(async_channel::TrySendError::Closed(_)) => {
+          // Teardown: the consumer is gone, so nothing was published — clear the entry WITHOUT
+          // dominating (no re-enumeration reached any barrier).
           self.needs_rescan.remove(&sub);
         }
         Err(async_channel::TrySendError::Full(_)) => {
-          // The channel filled: retry THIS key (inclusive) next tick.
+          // The channel filled: retry THIS key (inclusive) next tick. Not published, so no
+          // domination.
           self.flush_cursor = Some(sub);
           return;
         }
@@ -2946,6 +2961,17 @@ where
         self.resolve_matching_pending_sync(event);
         return;
       }
+      // A make-before-break `replace` commits an epoch-bumped full-root `Rescan` on the PRESERVED
+      // handle for each leg, so a diverging-then-rolled-back widen leaves a stale `Rescan` whose key
+      // names the transient divergent root the handle no longer watches. `retire_if_dead` saw the
+      // handle LIVE (rolled back to its current root), so this reaches here as a live-root `Rescan`;
+      // fanning or parking it at its stale, DISJOINT key would merge into the rollback's parked debt
+      // and widen the owed re-enumeration to their common ancestor (up to `/`). The handle's CURRENT
+      // `root_key` is authoritative: clamp such a disjoint live-root `Rescan` to it (a current-root
+      // `Rescan` correctly and safely dominates everything under the live root), so BOTH the fan-out
+      // and the domination below use the safe current-root key.
+      let clamped = self.clamp_disjoint_live_root_rescan(event);
+      let event = clamped.as_ref().unwrap_or(event);
       self.degrade_retained_cover_on_rescan(event);
       self.fan_out_and_push(event);
       // A `Rescan` can DOMINATE a pending cookie — a loss that ate the
@@ -2959,6 +2985,40 @@ where
         self.dominate_pending_syncs(event);
       }
     }
+  }
+
+  /// A live-root `Rescan` whose key is DISJOINT from the handle's current
+  /// [`root_key`](LocalSource::root_key) is the stale transient-root artifact a make-before-break
+  /// [`replace`](LocalSource::replace)/rollback left on the preserved handle (see
+  /// [`consume_source_event`](Self::consume_source_event)); return a copy clamped to the current root
+  /// so it dominates the live root's subtree without widening any parked debt to a common ancestor.
+  ///
+  /// Returns `None` — use the event unchanged — for a non-`Rescan`, a handle with no live root, or a
+  /// `Rescan` already at/under the current root or an ancestor of it (either already covers the live
+  /// root's subtree correctly and safely).
+  fn clamp_disjoint_live_root_rescan(
+    &self,
+    event: &SourceEvent<C, S::Handle>,
+  ) -> Option<SourceEvent<C, S::Handle>> {
+    if !event.kind().is_rescan() {
+      return None;
+    }
+    let root_key = self.source.root_key(event.handle())?;
+    let key = event.key();
+    // Disjoint = the `Rescan`'s key is neither at/under the current root (`key` has `root_key` as a
+    // prefix) nor an ancestor of it (`root_key` has `key` as a prefix). Only a disjoint key is the
+    // stale transient-root event; a `Rescan` on either side of the current root already covers it.
+    if key.starts_with(root_key.as_slice()) || root_key.starts_with(key) {
+      return None;
+    }
+    Some(SourceEvent::new(
+      event.handle(),
+      root_key,
+      event.kind().clone(),
+      event.location().clone(),
+      event.epoch(),
+      event.change_id(),
+    ))
   }
 
   /// Initiates one sync barrier: place the cookie (awaited, caller-bounded,
@@ -2979,6 +3039,13 @@ where
     loss_gen_at_call: u64,
     reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
   ) {
+    // The caller's `sync()` deadline can fire during admission — dropping the response receiver —
+    // before the owner ever dispatches this request. Minting a token, awaiting `begin_sync`, and
+    // parking a PendingSync for a reply nobody will read is wasted cookie work and a strand the
+    // loop-top prune must later reap. A canceled reply owes nothing: skip it before any cookie work.
+    if reply.is_canceled() {
+      return;
+    }
     let (Some(root), Some(dir_key)) = (
       self.subsumer.subscription_root(sub),
       self.subsumer.subscription_key(sub).map(<[C]>::to_vec),
@@ -3107,10 +3174,18 @@ where
     // Reached only for a `Rescan` (the caller gates on it), so this is the delivered-`Rescan`
     // choke point: a barrier already CALLED but not yet installed must be dominated by it too.
     self.note_domination();
-    let at = event.key();
+    // Dominate by the AFFECTED SUBSCRIPTION, not by cookie-path ancestry. A raw source `Rescan` is
+    // fanned out to EVERY subscriber of its root, bypassing coverage and filter (`route::fan_out`),
+    // so it re-enumerates every one of that root's subscribers regardless of where each cookie sits.
+    // Domination must match that delivery exactly: a pending sync riding this root (`root` == the
+    // event's handle) owes a re-enumeration the `Rescan` stands in for. The old cookie-prefix rule
+    // (`cookie_key.starts_with(event.key())`) under-killed — a barrier for `/r` (cookie `/r/.cookie`)
+    // is NOT dominated by a descendant loss `Rescan(/r/x)`, because `/r/.cookie` does not start with
+    // `/r/x` — so the barrier falsely resolved `Delivered` though the subscriber owes a re-scan.
+    let handle = event.handle();
     let mut i = 0;
     while i < self.pending_syncs.len() {
-      if self.pending_syncs[i].cookie_key.starts_with(at) {
+      if self.pending_syncs[i].root == handle {
         let pending = self.pending_syncs.swap_remove(i);
         // Reap BEFORE the (unwinding-capable) flush: once swap-removed, `Owner::drop` no longer reaps
         // this entry, so a flush panic must not precede the reap or the marker leaks.

@@ -490,6 +490,11 @@ pub struct Watcher<R> {
   /// This watcher's handle brand (see [`RootHandle`]).
   instance: u64,
   commands: async_channel::Sender<Command>,
+  /// The DEDICATED completed-cookie cleanup lane, separate from `commands` so a
+  /// saturated command channel can never drop a reap. Unbounded — admission is
+  /// guaranteed — and bounded in practice by the in-flight resolved syncs the
+  /// driver drains it against.
+  cookie_removes: async_channel::Sender<PathBuf>,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
   // `fn() -> R`, not `R`: the watcher holds no runtime value, so its auto
@@ -547,6 +552,10 @@ impl<R: RuntimeLite> Watcher<R> {
     ops: impl crate::driver::FsOps,
   ) -> Result<Self, BuildError> {
     let (command_tx, command_rx) = async_channel::bounded(16);
+    // Unbounded so completed-cookie removals are admitted regardless of command
+    // traffic; the driver drains it every loop iteration, so it stays bounded by
+    // the in-flight resolved syncs and cannot accrue.
+    let (cookie_remove_tx, cookie_remove_rx) = async_channel::unbounded();
     let (event_tx, event_rx) = async_channel::bounded(options.event_capacity().get());
     let roots = Arc::new(RwLock::new(RootSet::default()));
     // The registry's entries are written only by the driver task: live at
@@ -555,10 +564,18 @@ impl<R: RuntimeLite> Watcher<R> {
     let registry = RegistryWriter {
       roots: Arc::clone(&roots),
     };
-    R::spawn_detach(run::<R, _>(config, ops, command_rx, event_tx, registry));
+    R::spawn_detach(run::<R, _>(
+      config,
+      ops,
+      command_rx,
+      cookie_remove_rx,
+      event_tx,
+      registry,
+    ));
     Ok(Self {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
+      cookie_removes: cookie_remove_tx,
       events: Box::pin(event_rx),
       roots,
       _runtime: PhantomData,
@@ -891,11 +908,13 @@ impl<R> Watcher<R> {
   /// # Errors
   ///
   /// [`SyncRootError::UnknownRoot`] for a foreign or dead handle;
-  /// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) when `dir` is not
-  /// inside the root; [`Write`](SyncRootError::Write) when the create fails
-  /// (a read-only tree surfaces as `PermissionDenied`);
-  /// [`Retired`](SyncRootError::Retired) when the root died while the write
-  /// was parked; [`Closed`](SyncRootError::Closed) once the watcher is closed.
+  /// [`BadCookieName`](SyncRootError::BadCookieName) when `name` is not a single
+  /// normal component; [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) when
+  /// `dir` is not inside the root (including via `..` traversal);
+  /// [`Write`](SyncRootError::Write) when the create fails (a read-only tree
+  /// surfaces as `PermissionDenied`); [`Retired`](SyncRootError::Retired) when
+  /// the root died while the write was parked; [`Closed`](SyncRootError::Closed)
+  /// once the watcher is closed.
   pub async fn sync_root(
     &self,
     root: RootHandle,
@@ -906,12 +925,20 @@ impl<R> Watcher<R> {
       return Err(SyncRootError::UnknownRoot);
     }
     let dir = dir.into();
+    let name = name.into();
+    // The name the caller supplies must be a single normal component — a
+    // separator, `..`, or absolute name would escape the directory on a join.
+    if !crate::driver::is_normal_cookie_name(&name) {
+      return Err(SyncRootError::BadCookieName { name });
+    }
     // The cookie must be reportable on THIS root's stream: a directory outside
-    // its coverage could never mint an event the caller will see.
+    // its coverage could never mint an event the caller will see. Containment is
+    // checked on LEXICALLY NORMALIZED components — a plain `starts_with` accepts
+    // `<root>/../outside`, which escapes the tree.
     let Some(root_path) = self.root_path(root) else {
       return Err(SyncRootError::UnknownRoot);
     };
-    if !dir.starts_with(&root_path) {
+    if !crate::driver::cookie_dir_within_root(&root_path, &dir) {
       return Err(SyncRootError::DirOutsideRoot {
         dir,
         root: root_path,
@@ -924,7 +951,7 @@ impl<R> Watcher<R> {
       .send(Command::SyncRoot {
         scope: root.scope(),
         dir,
-        name: name.into(),
+        name,
         reply,
       })
       .await
@@ -944,13 +971,18 @@ impl<R> Watcher<R> {
 
   /// Reaps a sync cookie — a NON-BLOCKING, reply-less fire-and-forget unlink
   /// in the [`request_set_cover`](Self::request_set_cover) mold. Idempotent:
-  /// a cookie already gone is success. Reports whether the control channel
-  /// accepted the request, nothing about when the unlink lands.
-  pub fn request_remove_cookie(&self, path: impl Into<PathBuf>) -> bool {
-    self
-      .commands
-      .try_send(Command::RemoveCookie { path: path.into() })
-      .is_ok()
+  /// a cookie already gone is success.
+  ///
+  /// Admission is GUARANTEED: the removal rides a DEDICATED unbounded lane, not
+  /// the shared command channel, so a burst of watch/unwatch/sync traffic can
+  /// never drop the reap. The driver OWNS every cookie it wrote and unlinks it
+  /// at scope or driver teardown regardless, so even a request to an
+  /// already-closed driver leaks nothing.
+  pub fn request_remove_cookie(&self, path: impl Into<PathBuf>) {
+    // Unbounded, so `try_send` refuses only once the driver is gone — and its
+    // terminal sweep has already reaped (or will reap) the file, so the dropped
+    // request strands nothing.
+    let _ = self.cookie_removes.try_send(path.into());
   }
 
   /// Reconciles a watched root's per-directory coverage to the `retained` cover **in place**,

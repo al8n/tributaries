@@ -172,13 +172,25 @@ pub enum SyncRootError {
   #[error("the handle does not name a live root of this watcher")]
   UnknownRoot,
   /// The cookie directory is not inside the root's coverage — a cookie
-  /// written there could never be reported on this root's stream.
+  /// written there could never be reported on this root's stream. Also raised
+  /// when the directory only *appears* inside the root through `..` traversal
+  /// (`<root>/../outside`), which a lexical `starts_with` would accept.
   #[error("cookie directory {} is outside root {}", dir.display(), root.display())]
   DirOutsideRoot {
     /// The requested cookie directory.
     dir: PathBuf,
     /// The root it must be inside.
     root: PathBuf,
+  },
+  /// The cookie name is not a single normal filename component — it holds a
+  /// path separator, a `.`/`..`, or is absolute or empty. A name like this
+  /// would escape the directory the barrier was validated for, so it is refused
+  /// before any write. The umbrella mints names that never trip this; a caller
+  /// that hits it violated the reserved-namespace contract.
+  #[error("cookie name {name:?} is not a single normal filename component")]
+  BadCookieName {
+    /// The offending name as supplied.
+    name: String,
   },
   /// The cookie could not be written. A read-only tree surfaces here as
   /// [`std::io::ErrorKind::PermissionDenied`] — the honest refusal: a tree
