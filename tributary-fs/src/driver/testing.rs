@@ -9,7 +9,7 @@ use std::{
   path::{Path, PathBuf},
   sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
   },
 };
 
@@ -117,6 +117,12 @@ struct FakeState {
   /// a test retires the scope, drops the reply, or tears the driver down while
   /// the write is still in the pool.
   cookie_write_hold: Mutex<Option<HoldGate>>,
+  /// Cookie directories that CANONICALIZE elsewhere — the fake's model of an
+  /// intermediate symlink. A spelled directory maps to the real path it resolves
+  /// to, so `write_cookie` can mirror the production canonicalize-and-verify: a
+  /// directory that resolves outside the root is refused even though its spelling
+  /// sits under it. An unmapped directory canonicalizes to itself.
+  canonical_dirs: Mutex<HashMap<PathBuf, PathBuf>>,
   /// The resume point every live fake handle mints — the journal-bearing
   /// backends' `SourceControl::resume_token`, modeled.
   resume_token: Mutex<Option<crate::os::ResumeToken>>,
@@ -177,6 +183,7 @@ impl Default for FakeState {
       cookie_write_failure: Mutex::default(),
       cookie_dispatches: AtomicUsize::new(0),
       cookie_write_hold: Mutex::default(),
+      canonical_dirs: Mutex::default(),
       resume_token: Mutex::default(),
       spawn_resume_points: Mutex::default(),
       stale_arms: Mutex::default(),
@@ -550,6 +557,21 @@ impl FakeFs {
   /// Fails every subsequent cookie write with `kind` — the read-only tree.
   pub(crate) fn fail_cookie_writes(&self, kind: std::io::ErrorKind) {
     *self.state.cookie_write_failure.lock().unwrap() = Some(kind);
+  }
+
+  /// Models an intermediate symlink: a cookie write whose resolved directory is
+  /// `spelled` canonicalizes to `canonical`, so the fake's beneath check runs
+  /// against the real target — a `canonical` outside the root is refused, matching
+  /// production's `std::fs::canonicalize` before the containment test.
+  pub(crate) fn resolve_cookie_dir_to(
+    &self,
+    spelled: impl AsRef<Path>,
+    canonical: impl AsRef<Path>,
+  ) {
+    self.state.canonical_dirs.lock().unwrap().insert(
+      spelled.as_ref().to_path_buf(),
+      canonical.as_ref().to_path_buf(),
+    );
   }
 
   /// Cookie writes dispatched to the pool so far (counted before any hold), so a
@@ -1047,7 +1069,25 @@ impl FsOps for FakeFs {
           "the cookie directory is gone",
         ));
       }
-      let path = target.join(name);
+      // Canonicalize the resolved directory (resolving any modeled intermediate
+      // symlink) and verify it is BENEATH the root — the production
+      // canonicalize-and-verify, mirrored. A directory whose real target escapes
+      // the root is refused even though its spelling sits under it. The cookie
+      // lands at the CANONICAL path, so the record names where it truly went.
+      let canonical_dir = self
+        .state
+        .canonical_dirs
+        .lock()
+        .unwrap()
+        .get(target)
+        .cloned()
+        .unwrap_or_else(|| target.to_path_buf());
+      if !canonical_dir.starts_with(root) {
+        return Err(std::io::Error::other(
+          "the cookie directory resolves outside the watched root",
+        ));
+      }
+      let path = canonical_dir.join(name);
       // O_NOFOLLOW on the real create, mirrored: a symlink swapped in where the
       // cookie is to land is refused rather than followed to a target that could
       // sit outside the root. The fake models the refusal (it holds no symlink
@@ -1196,6 +1236,69 @@ impl ScopeRegistry for RecordingRegistry {
   fn scope_dead(&self, scope: ScopeId) {
     self.state.lock().unwrap().1.push(scope);
   }
+
+  fn final_root_conflict(
+    &self,
+    _final_root: &Path,
+    _identity: RootIdentity,
+    _ancestors: &[RootIdentity],
+    _reserved: Option<&Path>,
+    _exempt: Option<ScopeId>,
+  ) -> Option<PathBuf> {
+    None
+  }
+}
+
+/// A registry that can FREEZE the owner loop inside a `scope_live` call — the
+/// commit's registry overwrite, which `commit_replace` runs AFTER the lane swap.
+/// A test arms the gate once birth is past, so only the replace's commit parks,
+/// letting a test act in the exact window between the swap and the run loop's
+/// post-commit cookie call. The gate blocks the owner-loop thread, so the test
+/// must run on a multi-worker runtime.
+#[derive(Clone, Default)]
+pub(crate) struct GatedRegistry {
+  hold: Arc<Mutex<Option<HoldGate>>>,
+  entered: Arc<AtomicBool>,
+}
+
+impl GatedRegistry {
+  /// Freezes the NEXT `scope_live` (the replace commit's, called after the lane
+  /// swap) until the returned gate is released.
+  pub(crate) fn hold_scope_live(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
+  /// Whether a gated `scope_live` has entered its park — the owner loop is frozen
+  /// mid-commit, past the swap.
+  pub(crate) fn scope_live_frozen(&self) -> bool {
+    self.entered.load(Ordering::SeqCst)
+  }
+}
+
+impl ScopeRegistry for GatedRegistry {
+  fn scope_live(
+    &self,
+    _scope: ScopeId,
+    _root: &Path,
+    _identity: RootIdentity,
+    _ancestors: &[RootIdentity],
+    _backend: BackendKind,
+    _stats: Option<crate::os::BackendStatsHandle>,
+  ) {
+    let gate = self.hold.lock().unwrap().clone();
+    if let Some(gate) = gate {
+      self.entered.store(true, Ordering::SeqCst);
+      let (held, cvar) = &*gate;
+      let mut parked = held.lock().unwrap();
+      while *parked {
+        parked = cvar.wait(parked).unwrap();
+      }
+    }
+  }
+
+  fn scope_dead(&self, _scope: ScopeId) {}
 
   fn final_root_conflict(
     &self,

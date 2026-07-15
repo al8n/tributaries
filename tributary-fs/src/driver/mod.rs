@@ -245,11 +245,13 @@ struct CookieRegistry<F: FsOps> {
   /// written above (see [`cookie_dir`]). Dropped with the scope, like the flags.
   roots: HashMap<ScopeId, PathBuf>,
   /// Each live scope's root GENERATION, cloned into each dispatched write and
-  /// bumped on every replace commit (which overwrites the root under a surviving
-  /// scope). A write claims only while the generation still matches the one it
-  /// captured, so a barrier dispatched under a superseded root reaps itself
-  /// rather than landing a cookie the current stream could never observe.
-  /// Dropped with the scope, like the flags and the root.
+  /// bumped at every replace commit's lane swap (see
+  /// [`advance_generation_locked`](Self::advance_generation_locked)), under the
+  /// ledger lock so the bump is atomic with a claim. A write claims only while
+  /// the generation still matches the one it captured, so a barrier dispatched
+  /// under a superseded root reaps itself rather than landing a cookie the
+  /// current stream could never observe. Dropped with the scope, like the flags
+  /// and the root.
   generations: HashMap<ScopeId, Arc<AtomicU64>>,
 }
 
@@ -267,21 +269,34 @@ impl<F: FsOps> CookieRegistry<F> {
 
   /// `scope`'s stream is live under `root` — recorded on the SAME transitions
   /// the scope registry learns them on (birth, and a replace's commit, which
-  /// overwrites the root under a surviving scope). The commit ALSO bumps the
-  /// scope's root generation, so a write dispatched under the previous root
-  /// finds its claim refused rather than landing outside the new coverage.
+  /// overwrites the root under a surviving scope). Birth establishes generation
+  /// 0; a replace's commit RE-records the root here but no longer bumps the
+  /// generation — the bump moved to the lane swap itself
+  /// ([`advance_generation_locked`](Self::advance_generation_locked), taken
+  /// under the ledger lock), so it is atomic with a concurrent claim and lands
+  /// at the swap's linearization point rather than in this post-commit call.
   fn scope_live(&mut self, scope: ScopeId, root: PathBuf) {
     self.roots.insert(scope, root);
-    // Birth establishes generation 0; a replace's commit — the only other
-    // caller — reaches an already-present entry and bumps it, revoking every
-    // write still in flight under the pre-replace root.
-    match self.generations.entry(scope) {
-      std::collections::hash_map::Entry::Occupied(entry) => {
-        entry.get().fetch_add(1, Ordering::SeqCst);
-      }
-      std::collections::hash_map::Entry::Vacant(entry) => {
-        entry.insert(Arc::new(AtomicU64::new(0)));
-      }
+    self
+      .generations
+      .entry(scope)
+      .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+  }
+
+  /// Bumps `scope`'s root generation under the LEDGER LOCK — the same lock
+  /// [`CookieGuard::claim`] takes to read it — so a bump and a claim cannot
+  /// interleave: a claim either completes before the bump (sees the OLD
+  /// generation, and the stream that generation names is still the current one)
+  /// or after it (sees the new generation and refuses). Called at the replace
+  /// commit's lane swap, so the generation transition IS the swap's
+  /// linearization point: a write dispatched under the retiring root can never
+  /// claim once the new stream is live, and one that already claimed belongs to
+  /// the still-current old stream. A scope with no generation entry has no
+  /// dispatched writes to revoke, so a missing entry is a no-op.
+  fn advance_generation_locked(&self, scope: ScopeId) {
+    let _ledger = lock_ledger(&self.ledger);
+    if let Some(generation) = self.generations.get(&scope) {
+      generation.fetch_add(1, Ordering::SeqCst);
     }
   }
 
@@ -1477,7 +1492,27 @@ impl FsOps for RealFs {
   }
 
   fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
-    let path = cookie_dir(root, dir).join(name);
+    // Resolve the cookie DIRECTORY, then CANONICALIZE it: `canonicalize` follows
+    // every symlink in the path, so an ALREADY-EXISTING intermediate symlink
+    // (`<root>/link/sub` where `link` targets outside) is resolved to where the
+    // cookie would truly land — the lexical containment check upstream never sees
+    // that, because component-wise the spelling still sits under the root.
+    // Canonicalizing the root too makes the beneath test compare two paths from
+    // the SAME resolver (identical prefix form on every platform). Both blocking
+    // calls run on the driver's blocking pool, never the owner loop, so a hung
+    // mount cannot wedge it. `canonicalize` requires the target to exist; a cookie
+    // directory that is gone is already a typed write failure, so the valid case
+    // is unchanged.
+    let canonical_dir = std::fs::canonicalize(cookie_dir(root, dir))?;
+    let canonical_root = std::fs::canonicalize(root)?;
+    if !canonical_dir.starts_with(&canonical_root) {
+      // The real directory escapes the watched root — its cookie's create event
+      // could never reach this root's stream. Refuse before creating anything.
+      return Err(std::io::Error::other(
+        "the cookie directory resolves outside the watched root",
+      ));
+    }
+    let path = canonical_dir.join(name);
     // create_new: a cookie name is minted unique (instance + pid + seq), so an
     // existing file at that path is a foreign artifact or a name collision —
     // never something to silently overwrite.
@@ -1489,15 +1524,16 @@ impl FsOps for RealFs {
     // create_new (O_EXCL) already refuses an existing final symlink; O_NOFOLLOW
     // makes that refusal explicit and errno-honest.
     //
-    // RESIDUAL — an intermediate DIRECTORY component swapped for a symlink
-    // between `cookie_dir`'s validation and this open is still followed by the
-    // path-based resolution: this open is not beneath-confined. Closing it fully
-    // needs a beneath-anchored traversal (Linux `openat2(RESOLVE_BENEATH |
+    // Canonicalizing the directory closes the PRE-EXISTING intermediate-symlink
+    // escape (every intermediate link is resolved before the beneath check), and
+    // O_NOFOLLOW + create_new guard the final component. RESIDUAL — a symlink
+    // swapped INTO an intermediate directory AFTER `canonicalize` but BEFORE this
+    // open (a genuine sub-microsecond TOCTOU) is still followable, because a
+    // path-based open is not beneath-anchored. Closing that last window needs a
+    // beneath-anchored traversal (Linux `openat2(RESOLVE_BENEATH |
     // RESOLVE_NO_SYMLINKS)`, or per-component `openat` with `O_NOFOLLOW` from a
     // pinned root-directory fd), which this crate does not yet thread a per-scope
-    // root fd for. The lexical hardening upstream still refuses a `..`-escaping
-    // directory and a non-normal name, so only a live-swapped intermediate
-    // symlink remains.
+    // root fd for. Only that post-canonicalize swap remains.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
       use std::os::unix::fs::OpenOptionsExt;
@@ -2103,6 +2139,7 @@ pub(crate) async fn run<R, F>(
                   &mut pending_teardowns,
                   &mut os,
                   &registry,
+                  &cookies,
                   scope,
                   spawned,
                   replace.reservation.path(),
@@ -2113,9 +2150,10 @@ pub(crate) async fn run<R, F>(
                   scope_backends.insert(scope, *backend);
                   // Any barrier still parked under coverage the new root has
                   // moved out from under is revoked BEFORE the commit records the
-                  // new root; then the cookie floor and generation move with the
-                  // scope (bumping the generation revokes writes already in the
-                  // pool under the old root).
+                  // new root; the generation that revokes writes already in the
+                  // pool under the old root was bumped inside `commit_replace`, at
+                  // the lane swap. This only RE-records the cookie floor for the
+                  // widened root.
                   revoke_uncovered_parked_cookies(&mut core, &mut parked_cookies, scope, &widened);
                   cookies.scope_live(scope, widened);
                 }
@@ -2371,6 +2409,7 @@ pub(crate) async fn run<R, F>(
               &mut pending_teardowns,
               &mut os,
               &registry,
+              &cookies,
               scope,
               spawned,
               replace.reservation.path(),
@@ -2380,9 +2419,11 @@ pub(crate) async fn run<R, F>(
           };
           if let Ok(backend) = &outcome {
             scope_backends.insert(scope, *backend);
-            // The cookie floor and generation follow the committed root (see the
-            // kernel-recursive commit above), and parked barriers the new root no
-            // longer covers are revoked first.
+            // The cookie floor follows the committed root (see the kernel-
+            // recursive commit above); the generation that revokes in-flight
+            // writes under the old root was already bumped inside `commit_replace`
+            // at the lane swap. Parked barriers the new root no longer covers are
+            // revoked first.
             revoke_uncovered_parked_cookies(&mut core, &mut parked_cookies, scope, &widened);
             cookies.scope_live(scope, widened);
           }
@@ -2897,6 +2938,7 @@ fn commit_replace<R, F>(
     futures_util::stream::BoxStream<'static, (ScopeId, u64, Option<SourceMessage>)>,
   >,
   registry: &impl ScopeRegistry,
+  cookies: &CookieRegistry<F>,
   scope: ScopeId,
   spawned: SpawnedSource<F::Handle>,
   reserved: &Path,
@@ -2938,6 +2980,13 @@ where
       let _ = tx.try_send(OpResult::TornDown { scope });
     });
   }
+  // Bump the cookie root generation AT the lane swap, under the ledger lock: a
+  // write dispatched under the retiring root can no longer claim once the new
+  // stream is live (it sees the newer generation and self-reaps), while one
+  // that already claimed belongs to the still-current old stream. This IS the
+  // swap's linearization point — the transport generation mint below is its
+  // control-plane twin.
+  cookies.advance_generation_locked(scope);
   // Mint the replacement's transport generation FIRST, then detach the old
   // port and attach the new one under it: any old-generation control batch
   // still in flight now fails the front-check against this newer generation.
