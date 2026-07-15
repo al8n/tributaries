@@ -16,11 +16,14 @@ fn _assert_watcher_sync<R: RuntimeLite>() {
 /// platform), so registration protocols are observable in isolation.
 fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>) {
   let (command_tx, command_rx) = async_channel::bounded(16);
+  // No driver task drains it; these protocol tests never reap a cookie.
+  let (cookie_remove_tx, _cookie_remove_rx) = async_channel::unbounded();
   let (_event_tx, event_rx) = async_channel::bounded::<(ScopeId, Arc<PathBuf>, Change)>(4);
   (
     Watcher {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
+      cookie_removes: cookie_remove_tx,
       events: Box::pin(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
       _runtime: PhantomData,

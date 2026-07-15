@@ -1047,7 +1047,21 @@ impl FsOps for FakeFs {
           "the cookie directory is gone",
         ));
       }
-      target.join(name)
+      let path = target.join(name);
+      // O_NOFOLLOW on the real create, mirrored: a symlink swapped in where the
+      // cookie is to land is refused rather than followed to a target that could
+      // sit outside the root. The fake models the refusal (it holds no symlink
+      // targets, so "not followed" is intrinsic) so the contract is exercised.
+      if matches!(
+        nodes.get(&path).map(|node| node.kind),
+        Some(FileKind::Symlink)
+      ) {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::AlreadyExists,
+          "refusing to follow a symlink at the cookie path",
+        ));
+      }
+      path
     };
     // The cookie is a real object in the fake tree, exactly as a real create
     // is: a test can then inject its kernel event like any other file's.

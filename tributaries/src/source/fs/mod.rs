@@ -580,15 +580,16 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   fn end_sync(&mut self, _handle: RootHandle, cookie_key: &[OsString]) {
-    // Best-effort in the `disarm` mold: a prompt hint to reap the cookie now.
-    // The driver OWNS every cookie it wrote and guarantees the unlink at scope
-    // or driver teardown, so a momentarily-refused request needs no source-side
-    // queue — the cookie simply waits for that terminal reap, never leaked.
-    // Runtime-free by design (this seam carries no `R` bound): the
-    // runtime-bearing cleanup lives in the driver.
+    // A prompt hint to reap the cookie now, on the driver's DEDICATED cleanup
+    // lane: admission is GUARANTEED (the lane is unbounded), so a burst of
+    // control traffic can no longer drop the reap. The driver OWNS every cookie
+    // it wrote and unlinks it at scope or driver teardown regardless, so even a
+    // reap to an already-closed driver leaks nothing. Runtime-free by design
+    // (this seam carries no `R` bound): the runtime-bearing cleanup lives in the
+    // driver.
     let path = key_to_path(cookie_key);
     self.flush_deferred_prunes();
-    let _ = self.watcher.request_remove_cookie(path);
+    self.watcher.request_remove_cookie(path);
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {

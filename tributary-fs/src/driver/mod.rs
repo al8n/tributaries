@@ -33,7 +33,7 @@ use std::{
   path::{Path, PathBuf},
   sync::{
     Arc, Mutex, MutexGuard, PoisonError,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
   },
   time::Duration,
 };
@@ -169,23 +169,42 @@ struct CookieGuard {
   shutdown: Arc<AtomicBool>,
   /// This write's scope is retiring (its stream is being torn down).
   retiring: Arc<AtomicBool>,
+  /// The scope's live root generation, shared with the registry. A replace
+  /// commit bumps it under the SURVIVING scope, so a write dispatched under the
+  /// pre-replace root carries a now-stale [`dispatched_generation`].
+  ///
+  /// [`dispatched_generation`]: Self::dispatched_generation
+  generation: Arc<AtomicU64>,
+  /// The generation current when this write was dispatched. A claim finding the
+  /// live generation moved past this one is refused: the root the cookie was to
+  /// be reported on is gone, and its create event could never reach the current
+  /// stream.
+  dispatched_generation: u64,
 }
 
 impl CookieGuard {
   /// Hands a just-created cookie to the registry, which then owns it. `false`
-  /// means the handover was REFUSED — the registry is gone or the scope is
-  /// retiring, so its sweep has already passed this path by and the caller must
-  /// unlink the file itself.
+  /// means the handover was REFUSED — the registry is gone, the scope is
+  /// retiring, or the scope's root generation has moved past the one this write
+  /// was dispatched under — so a sweep has already passed this path by, or the
+  /// root the cookie belongs to is gone; either way the caller must unlink the
+  /// file itself.
   ///
   /// The refusal check and the insert are ONE critical section against the
   /// sweeps, and every sweep raises its flag BEFORE taking the ledger. So a
   /// claim that lands after a sweep took the map necessarily observes the raised
   /// flag and refuses (the write reaps itself), and one that lands before it is
   /// in the map that sweep takes. There is no third interleaving: a created file
-  /// is always owned by exactly one of the two.
+  /// is always owned by exactly one of the two. The generation is one more
+  /// refusal reason inside this SAME section, never a new race: a replace commit
+  /// bumps it, so a write whose captured generation is stale reaps itself
+  /// exactly as a retired one does.
   fn claim(&self, path: &Path) -> bool {
     let mut ledger = lock_ledger(&self.ledger);
-    if self.shutdown.load(Ordering::SeqCst) || self.retiring.load(Ordering::SeqCst) {
+    if self.shutdown.load(Ordering::SeqCst)
+      || self.retiring.load(Ordering::SeqCst)
+      || self.generation.load(Ordering::SeqCst) != self.dispatched_generation
+    {
       return false;
     }
     ledger.insert(path.to_path_buf(), self.scope);
@@ -204,8 +223,8 @@ impl CookieGuard {
 /// cannot strand a file, and neither can a scope that dies under an in-flight
 /// write.
 ///
-/// The three sweeps that end a cookie's life all run through here — a
-/// `RemoveCookie` ([`forget`](Self::forget) + unlink), a scope's stream teardown
+/// The three sweeps that end a cookie's life all run through here — a completed-
+/// cookie reap ([`forget`](Self::forget) + unlink), a scope's stream teardown
 /// ([`retire_scope`](Self::retire_scope)), and the driver's exit (this type's
 /// [`Drop`]) — and each raises its flag before taking the paths, so a write
 /// still in the blocking pool can never slip a file past the sweep that was
@@ -225,6 +244,13 @@ struct CookieRegistry<F: FsOps> {
   /// Each live scope's canonical root — the FLOOR its cookies may never be
   /// written above (see [`cookie_dir`]). Dropped with the scope, like the flags.
   roots: HashMap<ScopeId, PathBuf>,
+  /// Each live scope's root GENERATION, cloned into each dispatched write and
+  /// bumped on every replace commit (which overwrites the root under a surviving
+  /// scope). A write claims only while the generation still matches the one it
+  /// captured, so a barrier dispatched under a superseded root reaps itself
+  /// rather than landing a cookie the current stream could never observe.
+  /// Dropped with the scope, like the flags and the root.
+  generations: HashMap<ScopeId, Arc<AtomicU64>>,
 }
 
 impl<F: FsOps> CookieRegistry<F> {
@@ -235,14 +261,28 @@ impl<F: FsOps> CookieRegistry<F> {
       ledger: CookieLedger::default(),
       retiring: HashMap::new(),
       roots: HashMap::new(),
+      generations: HashMap::new(),
     }
   }
 
   /// `scope`'s stream is live under `root` — recorded on the SAME transitions
   /// the scope registry learns them on (birth, and a replace's commit, which
-  /// widens the root under a surviving scope).
+  /// overwrites the root under a surviving scope). The commit ALSO bumps the
+  /// scope's root generation, so a write dispatched under the previous root
+  /// finds its claim refused rather than landing outside the new coverage.
   fn scope_live(&mut self, scope: ScopeId, root: PathBuf) {
     self.roots.insert(scope, root);
+    // Birth establishes generation 0; a replace's commit — the only other
+    // caller — reaches an already-present entry and bumps it, revoking every
+    // write still in flight under the pre-replace root.
+    match self.generations.entry(scope) {
+      std::collections::hash_map::Entry::Occupied(entry) => {
+        entry.get().fetch_add(1, Ordering::SeqCst);
+      }
+      std::collections::hash_map::Entry::Vacant(entry) => {
+        entry.insert(Arc::new(AtomicU64::new(0)));
+      }
+    }
   }
 
   /// The root a cookie for `scope` must stay inside. `None` for a scope with no
@@ -256,11 +296,20 @@ impl<F: FsOps> CookieRegistry<F> {
   /// in-flight window: everything that retires the cookie between here and the
   /// write's landing is visible to the write itself.
   fn dispatch_guard(&mut self, scope: ScopeId) -> CookieGuard {
+    let generation = Arc::clone(
+      self
+        .generations
+        .entry(scope)
+        .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+    );
+    let dispatched_generation = generation.load(Ordering::SeqCst);
     CookieGuard {
       scope,
       ledger: Arc::clone(&self.ledger),
       shutdown: Arc::clone(&self.shutdown),
       retiring: Arc::clone(self.retiring.entry(scope).or_default()),
+      generation,
+      dispatched_generation,
     }
   }
 
@@ -284,6 +333,9 @@ impl<F: FsOps> CookieRegistry<F> {
       flag.store(true, Ordering::SeqCst);
     }
     self.roots.remove(&scope);
+    // The generation is per-scope and dies with it — a retired scope's writes
+    // are already revoked by the flag above, so the generation has no work left.
+    self.generations.remove(&scope);
     let mut reap = Vec::new();
     lock_ledger(&self.ledger).retain(|path, owner| {
       let retired = *owner == scope;
@@ -304,8 +356,8 @@ impl<F: FsOps> CookieRegistry<F> {
   }
 
   /// How many cookies the registry currently owns — the leak oracle: a failed
-  /// write, an abandoned reply, a retired scope, and a `RemoveCookie` must all
-  /// leave it exactly as they found it.
+  /// write, an abandoned reply, a retired scope, and a completed-cookie reap must
+  /// all leave it exactly as they found it.
   #[cfg(all(test, feature = "tokio"))]
   fn len(&self) -> usize {
     lock_ledger(&self.ledger).len()
@@ -550,12 +602,6 @@ pub(crate) enum Command {
     /// (the observation arrives on the caller's own event stream).
     reply: futures_channel::oneshot::Sender<Result<PathBuf, crate::error::SyncRootError>>,
   },
-  /// Unlink a sync cookie (reply-less, fire-and-forget). The unlink's own
-  /// event is suppressed by the reserved namespace, not by any bookkeeping.
-  RemoveCookie {
-    /// The cookie to reap.
-    path: PathBuf,
-  },
   /// Orderly shutdown; resolves when every stream is torn down.
   Close {
     /// Resolved with the number of teardowns still wedged past the close
@@ -579,9 +625,9 @@ pub(crate) enum Command {
   },
   /// A test-only count of the cookies the driver still OWNS, so a suite can
   /// prove that a failed write, an abandoned reply, a retired scope, and a
-  /// `RemoveCookie` each leave the registry exactly as they found it — a leak
-  /// (or unbounded growth under repeated failure) is then provable rather than
-  /// inferred from the unlinks.
+  /// completed-cookie reap each leave the registry exactly as they found it — a
+  /// leak (or unbounded growth under repeated failure) is then provable rather
+  /// than inferred from the unlinks.
   #[cfg(all(test, feature = "tokio"))]
   DebugCookieCount {
     reply: futures_channel::oneshot::Sender<usize>,
@@ -720,6 +766,37 @@ fn resolve_cover_settlements<R, F>(
       });
     }
   }
+}
+
+/// Revokes every barrier still PARKED for `scope` whose directory the just-
+/// committed replacement root no longer covers. A replace overwrites the root
+/// under a surviving scope; a parked write whose directory now sits outside that
+/// coverage would place a cookie the current stream could never observe, so it is
+/// dropped and answered `Retired` rather than left to strand. Its settle fence is
+/// abandoned in the core alongside — the same prune `resolve_cover_settlements`
+/// runs for a cancelled reply, and equally untouching of loss memory and settle
+/// floor. A parked write STILL inside the (widened) root is kept: it dispatches
+/// normally under the bumped generation. The DISPATCHED counterpart — a write
+/// already in the pool — is revoked instead by the generation the same commit
+/// bumped, checked when it claims.
+fn revoke_uncovered_parked_cookies(
+  core: &mut DriverCore,
+  parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
+  scope: ScopeId,
+  new_root: &Path,
+) {
+  let mut abandoned = std::collections::BTreeSet::new();
+  for (fence, cookie) in parked_cookies.iter() {
+    if cookie.scope == scope && !cookie_dir_within_root(new_root, &cookie.dir) {
+      abandoned.insert(*fence);
+    }
+  }
+  for fence in &abandoned {
+    if let Some(cookie) = parked_cookies.remove(fence) {
+      let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
+    }
+  }
+  core.abandon_cover_fences(&abandoned);
 }
 
 /// Drops CANCELLED awaited-unwatch waiters (the caller dropped its future, so
@@ -1315,6 +1392,48 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
   }
 }
 
+/// Whether a minted cookie NAME is exactly one normal filename component — no
+/// separators, no `.`/`..`, not absolute, not empty. The umbrella mints
+/// `.tributaries-sync-…`, always normal; anything else is a contract violation
+/// that must be refused BEFORE it reaches a path join, where an absolute or
+/// `..` name would escape the directory the barrier was validated for.
+pub(crate) fn is_normal_cookie_name(name: &str) -> bool {
+  let mut components = Path::new(name).components();
+  matches!(
+    (components.next(), components.next()),
+    (Some(std::path::Component::Normal(_)), None)
+  )
+}
+
+/// `path` with its `.`/`..` components folded lexically (no filesystem access),
+/// or `None` if a `..` would climb above the path's anchor. Purely lexical, so
+/// it is safe to run inline on the owner's thread — the containment decision it
+/// feeds never touches a possibly-hung mount.
+fn lexically_normalized(path: &Path) -> Option<PathBuf> {
+  let mut out = PathBuf::new();
+  for component in path.components() {
+    match component {
+      std::path::Component::ParentDir => {
+        if !out.pop() {
+          return None;
+        }
+      }
+      std::path::Component::CurDir => {}
+      other => out.push(other.as_os_str()),
+    }
+  }
+  Some(out)
+}
+
+/// Whether a cookie directory lies within `root` once `.`/`..` are folded
+/// lexically. This REPLACES a plain `starts_with`, which accepts `/r/../outside`
+/// (component-wise, `/r/../outside` does start with `/r`) and would place a
+/// barrier outside the watched tree. `root` is canonical (no `.`/`..`), so a
+/// lexical prefix test on the folded `dir` is exact.
+pub(crate) fn cookie_dir_within_root(root: &Path, dir: &Path) -> bool {
+  lexically_normalized(dir).is_some_and(|dir| dir.starts_with(root))
+}
+
 impl FsOps for RealFs {
   type Handle = SourceHandle;
 
@@ -1362,10 +1481,29 @@ impl FsOps for RealFs {
     // create_new: a cookie name is minted unique (instance + pid + seq), so an
     // existing file at that path is a foreign artifact or a name collision —
     // never something to silently overwrite.
-    std::fs::OpenOptions::new()
-      .write(true)
-      .create_new(true)
-      .open(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // O_NOFOLLOW on the FINAL component: a symlink swapped in where the cookie is
+    // to land is refused (ELOOP) rather than followed to a target that could sit
+    // outside the root, where its create event would never meet the barrier.
+    // create_new (O_EXCL) already refuses an existing final symlink; O_NOFOLLOW
+    // makes that refusal explicit and errno-honest.
+    //
+    // RESIDUAL — an intermediate DIRECTORY component swapped for a symlink
+    // between `cookie_dir`'s validation and this open is still followed by the
+    // path-based resolution: this open is not beneath-confined. Closing it fully
+    // needs a beneath-anchored traversal (Linux `openat2(RESOLVE_BENEATH |
+    // RESOLVE_NO_SYMLINKS)`, or per-component `openat` with `O_NOFOLLOW` from a
+    // pinned root-directory fd), which this crate does not yet thread a per-scope
+    // root fd for. The lexical hardening upstream still refuses a `..`-escaping
+    // directory and a non-normal name, so only a live-swapped intermediate
+    // symlink remains.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+      use std::os::unix::fs::OpenOptionsExt;
+      options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(&path)?;
     Ok(path)
   }
 
@@ -1732,10 +1870,16 @@ enum OpResult<H> {
 /// Runs one watcher's driver loop until `commands` closes or a `Close`
 /// command arrives. Consumes the command receiver and the event sender; the
 /// sender dropping is the consumer's end-of-stream.
+///
+/// `cookie_removes` is the DEDICATED completed-cookie cleanup lane, separate
+/// from `commands` so a saturated command channel can never drop a reap (see
+/// the arm below). It is unbounded, and bounded in practice by the in-flight
+/// resolved syncs the loop drains it against — it cannot accrue.
 pub(crate) async fn run<R, F>(
   config: DriverConfig,
   ops: F,
   commands: async_channel::Receiver<Command>,
+  cookie_removes: async_channel::Receiver<PathBuf>,
   events: async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   registry: impl ScopeRegistry,
 ) where
@@ -1820,8 +1964,8 @@ pub(crate) async fn run<R, F>(
   // scope's re-arm work quiesces, whatever the settle's verdict.
   let mut parked_cookies: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
   // The OWNER of every cookie this driver writes, from the write's landing until
-  // a `RemoveCookie` unlinks it, its scope's stream tears down, or this local
-  // drops. Ownership never rides the reply oneshot, so a caller that abandons
+  // a completed-cookie reap unlinks it, its scope's stream tears down, or this
+  // local drops. Ownership never rides the reply oneshot, so a caller that abandons
   // its sync cannot strand a file and no source-side removal queue is needed;
   // and because the sweep is a `Drop`, a panicking or CANCELLED driver task
   // reaps its cookies exactly like a returning one.
@@ -1967,9 +2111,12 @@ pub(crate) async fn run<R, F>(
                 );
                 if let Ok(backend) = &outcome {
                   scope_backends.insert(scope, *backend);
-                  // The scope survives the swap under a WIDER root: the cookie
-                  // floor moves with it, or a sync under the new root would find
-                  // no containing directory inside the old one.
+                  // Any barrier still parked under coverage the new root has
+                  // moved out from under is revoked BEFORE the commit records the
+                  // new root; then the cookie floor and generation move with the
+                  // scope (bumping the generation revokes writes already in the
+                  // pool under the old root).
+                  revoke_uncovered_parked_cookies(&mut core, &mut parked_cookies, scope, &widened);
                   cookies.scope_live(scope, widened);
                 }
                 // The reservation releases HERE — commit or failure alike —
@@ -2233,8 +2380,10 @@ pub(crate) async fn run<R, F>(
           };
           if let Ok(backend) = &outcome {
             scope_backends.insert(scope, *backend);
-            // The cookie floor follows the committed root (see the
-            // kernel-recursive commit above).
+            // The cookie floor and generation follow the committed root (see the
+            // kernel-recursive commit above), and parked barriers the new root no
+            // longer covers are revoked first.
+            revoke_uncovered_parked_cookies(&mut core, &mut parked_cookies, scope, &widened);
             cookies.scope_live(scope, widened);
           }
           drop(replace.reservation);
@@ -2400,34 +2549,47 @@ pub(crate) async fn run<R, F>(
           name,
           reply,
         }) => {
-          if !handles.contains_key(&scope) {
-            let _ = reply.send(Err(crate::error::SyncRootError::UnknownRoot));
-          } else {
-            // Park the write on a settle fence opened right here — the same
-            // fence a reconcile's ack rides, so it inherits this moment's
-            // window. A kernel-recursive scope has no re-arm work, so the
-            // fence settles at the very next loop-top poll and the write
-            // dispatches immediately; a descending scope waits for its
-            // in-flight re-arms to quiesce, which is precisely the ordering
-            // the barrier needs.
-            let fence = core.open_cover_fence(scope);
-            parked_cookies.insert(
-              fence,
-              ParkedCookie {
-                scope,
-                dir,
-                name,
-                reply,
-              },
-            );
+          // The scope's canonical root, only for a live scope — the FLOOR the
+          // cookie directory must stay within and a proof the scope exists.
+          let live_root = handles
+            .contains_key(&scope)
+            .then(|| cookies.root_of(scope).map(Path::to_path_buf))
+            .flatten();
+          match live_root {
+            None => {
+              let _ = reply.send(Err(crate::error::SyncRootError::UnknownRoot));
+            }
+            Some(root) => {
+              // The cookie NAME is one normal component (the umbrella mints
+              // `.tributaries-sync-…`); a separator, `..`, or absolute name is a
+              // contract violation refused before it can escape on a join. The
+              // DIRECTORY must lie within the root once `.`/`..` are folded — the
+              // containment a plain `starts_with` misses for `<root>/../out`.
+              if !is_normal_cookie_name(&name) {
+                let _ = reply.send(Err(crate::error::SyncRootError::BadCookieName { name }));
+              } else if !cookie_dir_within_root(&root, &dir) {
+                let _ = reply.send(Err(crate::error::SyncRootError::DirOutsideRoot { dir, root }));
+              } else {
+                // Park the write on a settle fence opened right here — the same
+                // fence a reconcile's ack rides, so it inherits this moment's
+                // window. A kernel-recursive scope has no re-arm work, so the
+                // fence settles at the very next loop-top poll and the write
+                // dispatches immediately; a descending scope waits for its
+                // in-flight re-arms to quiesce, which is precisely the ordering
+                // the barrier needs.
+                let fence = core.open_cover_fence(scope);
+                parked_cookies.insert(
+                  fence,
+                  ParkedCookie {
+                    scope,
+                    dir,
+                    name,
+                    reply,
+                  },
+                );
+              }
+            }
           }
-        }
-        Ok(Command::RemoveCookie { path }) => {
-          // The registry's ownership of this cookie ends here: forget it (O(1) —
-          // the ledger is keyed by path), then unlink off the reactor.
-          cookies.forget(&path);
-          let ops = ops.clone();
-          R::spawn_blocking_detach(move || ops.remove_cookie(&path));
         }
         Ok(Command::Close { reply }) => break Some(reply),
         #[cfg(all(test, feature = "tokio"))]
@@ -2444,6 +2606,22 @@ pub(crate) async fn run<R, F>(
         }
         // The watcher facade dropped: same orderly teardown, nobody to tell.
         Err(_) => break None,
+      },
+      // The DEDICATED completed-cookie cleanup lane, ranked below `commands` so
+      // it can never starve a Close, and above the source stream. Its admission
+      // is guaranteed (unbounded), so a saturated command channel can no longer
+      // drop a reap. A closed lane leaves this inert: the watcher drops both
+      // senders together, so `commands` (higher-priority) fires its `break None`
+      // first — this arm is never selected on the way out, and any reap still
+      // buffered is reaped by the terminal registry sweep. Ends the registry's
+      // ownership of the cookie: forget the record (O(1), keyed by path), then
+      // unlink off-reactor.
+      reap = cookie_removes.recv().fuse() => {
+        if let Ok(path) = reap {
+          cookies.forget(&path);
+          let ops = ops.clone();
+          R::spawn_blocking_detach(move || ops.remove_cookie(&path));
+        }
       },
       msg = os.next() => {
         if let Some((scope, lane, msg)) = msg {
@@ -2864,7 +3042,7 @@ fn execute_effects<R, F>(
         // (the scope died before coverage ever started).
         registry.scope_dead(scope);
         ops.detach_scope(scope);
-        // The scope's cookies retire with its stream: no `RemoveCookie` will
+        // The scope's cookies retire with its stream: no cleanup reap will
         // arrive for a write whose reply was abandoned, and there will be no
         // stream left to report one on. The registry raises the scope's flag
         // before it unlinks, so a write still in the pool reaps itself rather

@@ -119,6 +119,14 @@ struct FakeSource {
   /// cancel-equivalent); a `Some(cover)` covers exactly the union of the retained prefixes'
   /// subtrees. Queried by [`actual_covers`](Self::actual_covers).
   actual_cover: HashMap<u32, Vec<Vec<OsString>>>,
+  /// The handle's raw event stream, drained by [`next`](Source::next). A successful
+  /// [`replace`](Source::replace) ENQUEUES one epoch-bumped full-root `Rescan` here, mirroring the
+  /// real `FsSource::replace` commit — the fidelity that surfaces a stale transient-root `Rescan`
+  /// left on the preserved handle by a diverging-then-rolled-back widen.
+  pending_events: VecDeque<SourceEvent<OsString, u32>>,
+  /// The next raw epoch a `replace`-emitted `Rescan` carries — bumped per replace so each commit's
+  /// full-root Rescan is "epoch-bumped" like the real source's.
+  next_replace_epoch: u64,
 }
 
 impl FakeSource {
@@ -138,6 +146,8 @@ impl FakeSource {
       canonicalize: HashMap::new(),
       reuse_next_handle: None,
       actual_cover: HashMap::new(),
+      pending_events: VecDeque::new(),
+      next_replace_epoch: 1,
     }
   }
 
@@ -374,6 +384,21 @@ impl Source<OsString> for FakeSource {
     // key, and the old coverage is never dropped in between.
     self.live.insert(handle, canonical_path);
     self.canonical.insert(handle, canonical.clone());
+    // Model the real `FsSource::replace`: a successful make-before-break commit delivers ONE
+    // epoch-bumped full-root `Rescan` on the PRESERVED handle, keyed at the committed canonical root.
+    // A diverging widen enqueues `Rescan(divergent)`, then its rollback enqueues `Rescan(restored)`,
+    // both riding this one preserved handle — the fidelity that surfaces the stale transient-root
+    // Rescan the umbrella must clamp.
+    let epoch = self.next_replace_epoch;
+    self.next_replace_epoch += 1;
+    self.pending_events.push_back(SourceEvent::new(
+      handle,
+      canonical.clone(),
+      EventKind::Rescan,
+      Location::new(),
+      Epoch::new(epoch),
+      Some(ChangeId::new(NonZeroU64::MIN)),
+    ));
     Ok(Armed::new(handle, canonical))
   }
 
@@ -417,7 +442,9 @@ impl Source<OsString> for FakeSource {
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
-    None
+    // Drain the handle's raw event stream (a `replace`-emitted full-root `Rescan`), or `None` once
+    // empty — the source-drained signal every existing cell already relied on.
+    self.pending_events.pop_front()
   }
 
   fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
@@ -7150,6 +7177,214 @@ async fn a_loss_between_the_call_and_the_install_resolves_dominated() {
     ),
     "a loss processed between the caller's sync() call and the barrier's install resolves \
      Dominated, never a false Delivered"
+  );
+}
+
+/// A parked Rescan PUBLISHED in the call-to-install window resolves the barrier `Dominated`, not a
+/// false `Delivered`. The caller snapshots the shared generation AFTER a pre-call loss parked (so the
+/// park's bump is already folded into the snapshot); the owner then publishes-and-clears that parked
+/// Rescan while the request sits in the mailbox. Publishing a parked re-enumeration is a DELIVERED
+/// covering Rescan, so it must dominate a barrier whose `sync()` preceded it — the publish half of the
+/// same invariant `note_domination` enforces at the delivered-Rescan choke point.
+///
+/// Fail-on-old (the publish did not advance the generation): by install the debt map is empty, the
+/// per-sub loss serial was snapshotted after the park's bump (so it never appears to move), and the
+/// generation still equals the caller's snapshot — every probe reads a pristine state and the cookie's
+/// flush is clean, so the barrier reports `Delivered` for a pre-call re-enumeration the caller must
+/// still process.
+#[tokio::test]
+async fn a_parked_rescan_published_in_the_call_window_resolves_dominated() {
+  use core::sync::atomic::Ordering;
+
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  // A pre-call loss parks debt for the sub — its kernel event predates the caller's `sync()`.
+  h.owner.park_rescan(sub);
+  assert!(
+    h.owner.needs_rescan.contains_key(&sub),
+    "the pre-call loss parked debt"
+  );
+
+  // The caller snapshots the shared generation AFTER the park — so the park's bump is already folded
+  // in, exactly as `Tributaries::sync` sees it for a loss that happened before the call.
+  let loss_gen_at_call = h.owner.loss_gen.load(Ordering::SeqCst);
+
+  // The owner publishes-and-clears the parked Rescan while the request still sits in the mailbox (the
+  // call-to-install window). Without the publish-half domination this advances NEITHER the generation
+  // the caller snapshotted NOR the per-sub serial (snapshotted after the park's bump), so both
+  // install-time probes go blind.
+  h.owner.flush_pending_rescans();
+  assert!(
+    !h.owner.needs_rescan.contains_key(&sub),
+    "the parked Rescan published and cleared before the barrier installs"
+  );
+
+  // Install with the caller's stale snapshot, then deliver the cookie over the now-pristine state.
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.on_sync(sub, loss_gen_at_call, reply_tx).await;
+  h.owner
+    .consume_source_event(&source_created(handle, "/a/cookie-1", 20));
+
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "a parked Rescan published in the call-to-install window resolves Dominated, not a false Delivered"
+  );
+}
+
+/// An installed barrier is dominated by a DESCENDANT Rescan. A barrier for `/r` (cookie `/r/.cookie`)
+/// that receives a Rescan at `/r/x` (a descendant coverage loss) must resolve `Dominated`: a raw
+/// source Rescan fans out to every subscriber of its root, so the `/r` subscriber owes a
+/// re-enumeration the Rescan stands in for — regardless of where its cookie sits.
+///
+/// Fail-on-old (domination keyed on cookie-path ancestry, `cookie_key.starts_with(event.key())`):
+/// `/r/.cookie` does not start with `/r/x`, so the barrier is not dominated and falsely resolves
+/// `Delivered` (here the reply is simply left unresolved).
+#[tokio::test]
+async fn an_installed_barrier_is_dominated_by_a_descendant_rescan() {
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  let sub = h.watch("/r", Interest::all()).await.expect("watch /r");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/r/.cookie"),
+    sub,
+    root: handle,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: reply_tx,
+  });
+
+  // A DESCENDANT loss: a Rescan at /r/x re-enumerates a subtree the /r subscriber owns, but its
+  // cookie /r/.cookie does not start with /r/x — the old cookie-prefix rule missed exactly this.
+  h.owner
+    .consume_source_event(&rescan_event(handle, "/r/x", 5));
+
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "a descendant-loss Rescan dominates the /r barrier by subscription, not by cookie ancestry"
+  );
+}
+
+/// A stale transient-root Rescan left on the preserved handle by a diverging-then-rolled-back in-place
+/// widen is CLAMPED to the live root, so it never widens a parked debt to a common ancestor. The
+/// diverging `replace(/a → /z)` and the rollback `replace(→ /a/b)` each commit a full-root Rescan on
+/// the one preserved handle (the fake now models the real `FsSource`); the stale `Rescan(/z)` rides a
+/// handle whose CURRENT root is the rolled-back `/a/b`, disjoint from `/z`.
+///
+/// Fail-on-old (no clamp): pumping the stale `Rescan(/z)` merges its `/z` key into the rollback's
+/// parked `/a/b` debt at their common ancestor (the root `/`), over-owing a re-enumeration of the
+/// whole tree. With the clamp the stale key is rewritten to the live root, so the debt stays `/a/b`.
+#[tokio::test]
+async fn a_transient_root_rescan_after_a_widen_rollback_is_clamped_to_the_live_root() {
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+
+  let s_narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let handle = h
+    .owner
+    .subsumer
+    .subscription_root(s_narrow)
+    .expect("live root");
+
+  // The widen of /a canonicalizes to the DIVERGENT /z (which does not contain /a/b), so the widen
+  // rolls back to /a/b on the preserved handle. Each `replace` enqueues one full-root Rescan on the
+  // handle's stream: Rescan(/z) from the divergent retarget, then Rescan(/a/b) from the rollback.
+  h.owner
+    .source
+    .retarget
+    .insert(PathBuf::from("/a"), PathBuf::from("/z"));
+  let err = h
+    .watch("/a", Interest::all())
+    .await
+    .expect_err("the diverging widen is refused");
+  assert!(matches!(err, WatchError::CanonicalRace), "{err:?}");
+
+  // The rollback already parked s_narrow's dominating Rescan at its exact /a/b coverage, and the
+  // preserved handle's CURRENT root_key is the rolled-back /a/b.
+  assert_eq!(
+    h.owner.needs_rescan.get(&s_narrow).map(|p| p.key.clone()),
+    Some(key("/a/b")),
+    "the rollback owes s_narrow a Rescan at its exact /a/b coverage"
+  );
+  assert_eq!(h.owner.source.root_key(handle), Some(key("/a/b")));
+
+  // Pump the replace-emitted stream: the stale transient-root Rescan(/z) then the rollback's
+  // Rescan(/a/b), both riding the live handle.
+  let mut pumped = Vec::new();
+  while let Some(ev) = h.owner.source.next().await {
+    pumped.push(ev);
+  }
+  assert_eq!(
+    pumped.len(),
+    2,
+    "each replace enqueued one full-root Rescan: {pumped:?}"
+  );
+  for ev in &pumped {
+    h.owner.consume_source_event(ev);
+  }
+
+  // The owed re-enumeration for s_narrow stays at /a/b: the clamp rewrote the stale disjoint /z to
+  // the live root, so merging it never widened the debt to a common ancestor (`/`).
+  assert_eq!(
+    h.owner.needs_rescan.get(&s_narrow).map(|p| p.key.clone()),
+    Some(key("/a/b")),
+    "the stale /z Rescan was clamped to the live root; the debt never widened to a common ancestor"
+  );
+}
+
+/// `on_sync` skips an already-canceled reply. If the caller's `sync()` deadline fires during
+/// admission — dropping the response receiver — the owner must not mint a token, await `begin_sync`,
+/// or park a PendingSync for a reply nobody will read.
+#[tokio::test]
+async fn on_sync_skips_an_already_canceled_barrier() {
+  use crate::{error::SyncError, source::SyncOutcome};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  // The caller already timed out during admission: its response receiver is dropped, so the reply
+  // sender reports canceled before the owner does any cookie work.
+  let (reply_tx, reply_rx) = futures_channel::oneshot::channel::<Result<SyncOutcome, SyncError>>();
+  drop(reply_rx);
+  assert!(
+    reply_tx.is_canceled(),
+    "the reply is canceled before on_sync runs"
+  );
+
+  h.owner.on_sync(sub, 0, reply_tx).await;
+
+  assert!(
+    h.owner.pending_syncs.is_empty(),
+    "no PendingSync is parked for an already-canceled reply"
+  );
+  // `on_sync` increments `sync_seq` before minting the token / calling `begin_sync`, so an unmoved
+  // seq proves the skip precedes any cookie work.
+  assert_eq!(
+    h.owner.sync_seq, 0,
+    "no token was minted — the skip precedes begin_sync"
+  );
+  assert!(
+    h.owner.source.ended_syncs.is_empty(),
+    "no cookie was written, so none is reaped"
   );
 }
 
