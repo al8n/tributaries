@@ -5965,18 +5965,23 @@ mod sync_cookie {
   // relative to the confirm" — asserted below against the torn read that yields 0.
   #[tokio::test(flavor = "multi_thread")]
   async fn close_obligation_count_forecloses_a_false_ok_zero() {
-    fn insert_owned(reg: &CookieRegistry<FakeFs>, scope: u64, name: &str, path: &str) {
+    fn insert_owned(reg: &CookieRegistry<FakeFs>, scope: u64, name: &str, path: &str) -> CookieId {
       let mut inner = lock_ledger(&reg.ledger);
+      inner.next_cookie_id += 1;
+      let id = CookieId(inner.next_cookie_id);
       let path = PathBuf::from(path);
       inner.owned.insert(
         path.clone(),
         CookieRecord {
           scope: ScopeId::new(NonZeroU64::new(scope).unwrap()),
           name: name.to_owned(),
+          id,
+          last_failure_seq: 0,
           state: RemovalState::Owned,
         },
       );
       inner.names.insert(name.to_owned(), path);
+      id
     }
     fn writes_in_flight(pairs: &[(u64, &str)]) -> BTreeMap<ScopeId, String> {
       pairs
@@ -5994,10 +5999,10 @@ mod sync_cookie {
     // 2 has an in-flight write of the SAME name — one name across two live paths,
     // which only a direct fs-API caller can produce.
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    insert_owned(&reg, 1, "N", "/r1/N");
+    let id_n = insert_owned(&reg, 1, "N", "/r1/N");
     let in_flight = writes_in_flight(&[(2, "N")]);
     assert_eq!(
-      reg.close_obligation_count(&in_flight),
+      reg.obligation_count(&in_flight),
       1,
       "an outstanding obligation is counted — never a false 0"
     );
@@ -6006,9 +6011,9 @@ mod sync_cookie {
     // record's unlink confirming: drop that record (the confirm) and the same
     // obligation is STILL counted, now as the in-flight write whose name the
     // ledger no longer holds. Both snapshot points yield 1.
-    lock_ledger(&reg.ledger).drop_record(&PathBuf::from("/r1/N"));
+    lock_ledger(&reg.ledger).drop_record_if(&PathBuf::from("/r1/N"), id_n);
     assert_eq!(
-      reg.close_obligation_count(&in_flight),
+      reg.obligation_count(&in_flight),
       1,
       "after the confirm the same obligation is still counted, via the in-flight write"
     );
@@ -6017,7 +6022,7 @@ mod sync_cookie {
     // read `names` first, let an owned unlink confirm, THEN read `owned` — sums to
     // a FALSE 0 with obligation "N" still in flight. This is the read the single
     // snapshot above makes unrepresentable.
-    insert_owned(&reg, 1, "N", "/r1/N");
+    let id_n = insert_owned(&reg, 1, "N", "/r1/N");
     let names_snapshot = {
       let inner = lock_ledger(&reg.ledger);
       in_flight
@@ -6025,7 +6030,7 @@ mod sync_cookie {
         .filter(|name| !inner.names.contains_key(*name))
         .count()
     };
-    lock_ledger(&reg.ledger).drop_record(&PathBuf::from("/r1/N"));
+    lock_ledger(&reg.ledger).drop_record_if(&PathBuf::from("/r1/N"), id_n);
     let owned_snapshot = lock_ledger(&reg.ledger).owned.len();
     assert_eq!(
       names_snapshot + owned_snapshot,
@@ -6037,7 +6042,7 @@ mod sync_cookie {
     // once.
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
     assert_eq!(
-      reg.close_obligation_count(&writes_in_flight(&[(1, "M")])),
+      reg.obligation_count(&writes_in_flight(&[(1, "M")])),
       1,
       "an unclaimed in-flight write is one obligation"
     );
@@ -6048,7 +6053,7 @@ mod sync_cookie {
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
     insert_owned(&reg, 1, "M", "/r/M");
     assert_eq!(
-      reg.close_obligation_count(&writes_in_flight(&[(1, "M")])),
+      reg.obligation_count(&writes_in_flight(&[(1, "M")])),
       1,
       "a claimed self-reap is one obligation, counted once and never twice"
     );
@@ -6109,5 +6114,768 @@ mod sync_cookie {
       rig.fs.files_under("/r").contains(&path),
       "the hung-then-failing cookie persists — the residual close counted honestly, never reaped and never falsely reported gone"
     );
+  }
+
+  // ==== R11-3: the forced same-path ABA and the id guards (cells 1–4) ====
+
+  // The flagship R11-3 cell, forced deterministically. A confirmed unlink for a
+  // record that has since been REPLACED at the same path (a direct-API name
+  // reuse recreating the file after the old unlink physically ran) must NOT drop
+  // the successor: the id guard on the confirm-drop makes the stale completion a
+  // no-op. Without it, the stale confirm deletes the live successor record — an
+  // untracked file on disk plus a false `Ok(0)` at close (Codex's exact repro).
+  //
+  // Fail-on-old (the confirm-drop's id guard removed): the stale confirm's
+  // path-only drop deletes the successor record — the count drops to 0 with the
+  // file still present, and the final close would report `Ok(0)` over `P`.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_confirmed_unlink_for_a_replaced_record_does_not_drop_it() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    let name = ".tributaries-sync-aba-1";
+
+    // First incarnation: write N → P, settle its `CookieWriteDone` (gate open).
+    let path = sync_root(&rig, scope, "/r", name)
+      .await
+      .expect("the first write lands");
+    assert_eq!(path, PathBuf::from("/r/.tributaries-sync-aba-1"));
+    settle_cookie_count(&rig, 1).await;
+
+    // Reap it, but HOLD the pool job at the R11-3 preemption window: the unlink
+    // syscall has run (the file is gone) but the job has not yet taken the
+    // ledger lock to confirm-drop.
+    let hold = rig.fs.hold_cookie_remove_confirms();
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
+    settle(|| !rig.fs.files_under("/r").contains(&path) && rig.fs.cookie_remove_dispatches() == 1)
+      .await;
+    assert!(
+      !rig.fs.files_under("/r").contains(&path),
+      "the unlink syscall ran — the file is gone at the preemption window"
+    );
+    assert_eq!(rig.fs.cookie_remove_dispatches(), 1);
+
+    // Second incarnation, SAME dir and name — a direct-API name reuse (the rig
+    // drives `SyncRoot`, so this is in contract for the test). `create_new`
+    // succeeds (the file is gone), and the claim overwrites the fileless
+    // predecessor record with a fresh incarnation.
+    let path2 = admit_sync(&rig, scope, "/r", name).await;
+    assert_eq!(path2, path, "the successor lands at the same reused path");
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "one record at P — the successor incarnation"
+    );
+
+    // Release the held confirm: the first unlink's job resumes and confirm-drops
+    // — but for the STALE incarnation, so the id guard refuses it.
+    hold.release();
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    // Let the stale confirm-drop and its `CookieRemoveDone` fully land.
+    for _ in 0..24 {
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the stale confirm was refused by id — the successor record survives"
+    );
+    assert!(
+      rig.fs.files_under("/r").contains(&path),
+      "the successor's file survives the stale confirm"
+    );
+
+    // The successor reaps normally now, and close proves quiescence.
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
+    settle(|| rig.fs.files_under("/r").is_empty() && !rig.fs.cookie_removes().is_empty()).await;
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the successor is confirmed gone"
+    );
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig.commands.send(Command::Close { reply }).await.unwrap();
+    let pending = on_reply.await.expect("the driver replies");
+    assert_eq!(
+      pending, 0,
+      "close proves quiescence — no untracked file, no false Ok(0)"
+    );
+  }
+
+  // A stale self-reap (carrying an incarnation id that no longer matches the
+  // record at the path) must NEVER physically unlink the path: the successor's
+  // live file (or whatever now lives there) is not ours to delete.
+  //
+  // Fail-on-old is STRUCTURAL: the old `self_reap(refusal: bool)` has no id, and
+  // with an ABSENT record its `None => {}` fall-through unlinks `P` outright
+  // (`cookie_remove_dispatches == 1`) — the wrong-file-delete the id guard closes.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_stale_self_reap_never_unlinks_a_successor_cookie() {
+    let fs = FakeFs::new(1);
+    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let scope = ScopeId::new(NonZeroU64::new(7).unwrap());
+    let name = ".tributaries-sync-stale-selfreap";
+    let path = PathBuf::from("/r").join(name);
+
+    // A real claim inserts record M (Owned) at P.
+    let guard = reg.dispatch_guard(scope, name.to_owned());
+    let m = guard.claim(&path).expect("the claim lands");
+    let stale = CookieId(m.0 + 999);
+
+    // Case A: record M present, self-reap with a STALE id — no unlink, untouched.
+    let residual = self_reap(&fs, &guard, path.clone(), Some(stale));
+    assert!(
+      residual.is_none(),
+      "a stale-id self-reap yields no residual"
+    );
+    assert_eq!(
+      fs.cookie_remove_dispatches(),
+      0,
+      "no unlink was attempted for a stale id"
+    );
+    assert!(reg.owns_id(&path, m), "the live record M is untouched");
+
+    // Case B: NO record at P (a racing cancel confirmed our record away, a
+    // successor could own the path) — a stale self-reap still must not unlink.
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      inner.owned.clear();
+      inner.names.clear();
+    }
+    let residual = self_reap(&fs, &guard, path.clone(), Some(stale));
+    assert!(
+      residual.is_none(),
+      "an absent-record self-reap yields no residual"
+    );
+    assert_eq!(
+      fs.cookie_remove_dispatches(),
+      0,
+      "no unlink for an absent record either — never a wrong-file delete"
+    );
+  }
+
+  // A stale removal FAILURE (a `CookieRemoveDone{confirmed:false}` for an
+  // incarnation the record no longer is) must not bump the successor's attempts
+  // nor deschedule its live retry; a stale CONFIRM must not deschedule it either.
+  // Only the matching-id confirm clears the slot.
+  //
+  // Fail-on-old is STRUCTURAL: the old `record_remove_failed(path)` /
+  // `on_cookie_remove_done(path, …)` carry no id, so the stale failure bumps
+  // attempts to 3 and both stale arms remove the path-keyed slot.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_stale_remove_failure_does_not_touch_the_successors_state() {
+    let fs = FakeFs::new(1);
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let cfg = tuned_config();
+    let scope = ScopeId::new(NonZeroU64::new(3).unwrap());
+    let name = ".tributaries-sync-stale-fail";
+    let path = PathBuf::from("/r").join(name);
+    let m = CookieId(42);
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      inner.owned.insert(
+        path.clone(),
+        CookieRecord {
+          scope,
+          name: name.to_owned(),
+          id: m,
+          last_failure_seq: 5,
+          state: RemovalState::RemoveFailed { attempts: 2 },
+        },
+      );
+      inner.names.insert(name.to_owned(), path.clone());
+    }
+    let slot_at = Instant::from_origin(Duration::from_secs(100));
+    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
+    pending.insert(path.clone(), RetrySlot { at: slot_at, id: m });
+
+    let k = CookieId(m.0 + 1); // a stale successor id
+    let now = Instant::from_origin(Duration::from_secs(0));
+
+    // Stale failure (id K): attempts stay 2; the live slot is untouched.
+    on_cookie_remove_done(&reg, &mut pending, &cfg, path.clone(), k, false, now, false);
+    assert!(
+      matches!(
+        lock_ledger(&reg.ledger).owned.get(&path).map(|r| &r.state),
+        Some(RemovalState::RemoveFailed { attempts: 2 })
+      ),
+      "a stale failure never bumps the successor's attempts"
+    );
+    assert_eq!(
+      pending.get(&path).map(|s| s.at),
+      Some(slot_at),
+      "the live slot's deadline is untouched"
+    );
+    assert_eq!(
+      pending.get(&path).map(|s| s.id),
+      Some(m),
+      "the live slot still names M"
+    );
+
+    // Stale confirm (id K): the live slot is NOT descheduled.
+    on_cookie_remove_done(&reg, &mut pending, &cfg, path.clone(), k, true, now, false);
+    assert!(
+      pending.contains_key(&path),
+      "a stale confirm never deschedules M's live retry"
+    );
+
+    // Matching confirm (id M): M's own slot is cleared.
+    on_cookie_remove_done(&reg, &mut pending, &cfg, path.clone(), m, true, now, false);
+    assert!(
+      !pending.contains_key(&path),
+      "M's own confirm clears M's slot"
+    );
+  }
+
+  // The internal `Targeted`/`RetryDue` dispatches are id-matched: only a request
+  // carrying the record's CURRENT incarnation id transitions it. `Explicit` (the
+  // public path-addressed contract) dispatches the record currently at the path.
+  //
+  // Fail-on-old is STRUCTURAL: the `Targeted(id)`/`RetryDue(id)` variants do not
+  // exist, and old `RetryDue` dispatches any `RemoveFailed` at the path.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn retry_and_targeted_dispatch_are_id_matched() {
+    let fs = FakeFs::new(1);
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let scope = ScopeId::new(NonZeroU64::new(9).unwrap());
+    let path = PathBuf::from("/r/.tributaries-sync-idmatch");
+    let m = CookieId(100);
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      inner.owned.insert(
+        path.clone(),
+        CookieRecord {
+          scope,
+          name: "n".to_owned(),
+          id: m,
+          last_failure_seq: 1,
+          state: RemovalState::RemoveFailed { attempts: 1 },
+        },
+      );
+    }
+    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
+    let k = CookieId(m.0 + 7);
+
+    // A stale RetryDue is a no-op.
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      let d = CookieRegistry::<FakeFs>::removal_decision_locked(
+        &mut inner,
+        &mut pending,
+        &path,
+        RemovalRequest::RetryDue(k),
+      );
+      assert!(d.is_none(), "a stale RetryDue dispatches nothing");
+      assert!(matches!(
+        inner.owned.get(&path).map(|r| &r.state),
+        Some(RemovalState::RemoveFailed { attempts: 1 })
+      ));
+    }
+    // A stale Targeted is a no-op.
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      let d = CookieRegistry::<FakeFs>::removal_decision_locked(
+        &mut inner,
+        &mut pending,
+        &path,
+        RemovalRequest::Targeted(k),
+      );
+      assert!(d.is_none(), "a stale Targeted dispatches nothing");
+      assert!(matches!(
+        inner.owned.get(&path).map(|r| &r.state),
+        Some(RemovalState::RemoveFailed { attempts: 1 })
+      ));
+    }
+    // A matching Targeted re-arms the parked record.
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      let d = CookieRegistry::<FakeFs>::removal_decision_locked(
+        &mut inner,
+        &mut pending,
+        &path,
+        RemovalRequest::Targeted(m),
+      );
+      assert_eq!(d, Some(m), "a matching Targeted dispatches M");
+      assert!(matches!(
+        inner.owned.get(&path).map(|r| &r.state),
+        Some(RemovalState::Removing { attempts: 0 })
+      ));
+    }
+    // `Explicit` on a fresh `Owned` record dispatches (public semantics pinned).
+    let fresh = PathBuf::from("/r/.tributaries-sync-idmatch-2");
+    let f = CookieId(200);
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      inner.owned.insert(
+        fresh.clone(),
+        CookieRecord {
+          scope,
+          name: "n2".to_owned(),
+          id: f,
+          last_failure_seq: 0,
+          state: RemovalState::Owned,
+        },
+      );
+      let d = CookieRegistry::<FakeFs>::removal_decision_locked(
+        &mut inner,
+        &mut pending,
+        &fresh,
+        RemovalRequest::Explicit,
+      );
+      assert_eq!(
+        d,
+        Some(f),
+        "Explicit dispatches the record currently at the path"
+      );
+      assert!(matches!(
+        inner.owned.get(&fresh).map(|r| &r.state),
+        Some(RemovalState::Removing { attempts: 0 })
+      ));
+    }
+  }
+
+  // ==== R11-1: fair, refusing-scope-first recovery re-arm (cells 5–7) ====
+
+  /// How many of `scope`'s records are PARKED (`RemoveFailed`, unscheduled) — the
+  /// recovery-fairness oracle.
+  async fn parked_for(rig: &Rig, scope: ScopeId) -> usize {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugCookieParkedFor { scope, reply })
+      .await
+      .unwrap();
+    on_reply.await.expect("the driver replies")
+  }
+
+  // The deterministic pin for R11-1's selection order (cell 6). `rearm_parked_batch`
+  // serves the REFUSING scope first (its own budget) and then the rest
+  // least-recently-FAILED-first — with `last_failure_seq` refreshed on every
+  // failure so repeat offenders sink behind records that have not failed since a
+  // mount recovered. Removes are armed to FAIL, so no async unlink ever drops a
+  // record: the SYNCHRONOUS `Removing` transition rearm performs under the
+  // decision lock is a fully deterministic oracle for which records were served.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn rearm_serves_least_recently_failed_first() {
+    fn insert_owned_rec(
+      reg: &CookieRegistry<FakeFs>,
+      scope: ScopeId,
+      name: &str,
+      path: &Path,
+    ) -> CookieId {
+      let mut inner = lock_ledger(&reg.ledger);
+      inner.next_cookie_id += 1;
+      let id = CookieId(inner.next_cookie_id);
+      inner.owned.insert(
+        path.to_path_buf(),
+        CookieRecord {
+          scope,
+          name: name.to_owned(),
+          id,
+          last_failure_seq: 0,
+          state: RemovalState::Owned,
+        },
+      );
+      inner.names.insert(name.to_owned(), path.to_path_buf());
+      id
+    }
+    fn is_removing(reg: &CookieRegistry<FakeFs>, path: &Path) -> bool {
+      matches!(
+        lock_ledger(&reg.ledger).owned.get(path).map(|r| &r.state),
+        Some(RemovalState::Removing { .. })
+      )
+    }
+    fn is_parked(reg: &CookieRegistry<FakeFs>, path: &Path) -> bool {
+      matches!(
+        lock_ledger(&reg.ledger).owned.get(path).map(|r| &r.state),
+        Some(RemovalState::RemoveFailed { .. })
+      )
+    }
+
+    let sa = ScopeId::new(NonZeroU64::new(1).unwrap()); // scope A
+    let sb = ScopeId::new(NonZeroU64::new(2).unwrap()); // scope B
+    let sc = ScopeId::new(NonZeroU64::new(3).unwrap()); // scope C (refusing, no parked)
+    let a1 = PathBuf::from("/a/a1");
+    let a2 = PathBuf::from("/a/a2");
+    let b1 = PathBuf::from("/b/b1");
+
+    let fs = FakeFs::new(1);
+    fs.fail_next_cookie_removes(1_000_000);
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
+    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
+
+    // Fail each in order: last_failure_seq = 1, 2, 3 for a1, a2, b1.
+    let ida1 = insert_owned_rec(&reg, sa, "a1", &a1);
+    let ida2 = insert_owned_rec(&reg, sa, "a2", &a2);
+    let idb1 = insert_owned_rec(&reg, sb, "b1", &b1);
+    assert_eq!(reg.record_remove_failed(&a1, ida1), Some(1)); // seq 1
+    assert_eq!(reg.record_remove_failed(&a2, ida2), Some(1)); // seq 2
+    assert_eq!(reg.record_remove_failed(&b1, idb1), Some(1)); // seq 3
+
+    // Refusing = C (no parked of C): others = a1,a2,b1 by seq → [a1,a2] (limit 2).
+    let n = reg.rearm_parked_batch::<TokioRuntime>(&op_tx, &mut pending, sc, 2);
+    assert_eq!(n, 2, "two records re-armed");
+    assert!(is_removing(&reg, &a1), "a1 (seq1) served");
+    assert!(is_removing(&reg, &a2), "a2 (seq2) served");
+    assert!(
+      is_parked(&reg, &b1),
+      "b1 (seq3) not served — LRU picks the two oldest"
+    );
+
+    // Re-fail a1, a2 (now Removing → RemoveFailed) so their seqs become 4, 5 —
+    // BEHIND b1's seq 3: the refresh-on-failure rule sinks repeat offenders.
+    assert_eq!(reg.record_remove_failed(&a1, ida1), Some(1)); // seq 4
+    assert_eq!(reg.record_remove_failed(&a2, ida2), Some(1)); // seq 5
+    let n = reg.rearm_parked_batch::<TokioRuntime>(&op_tx, &mut pending, sc, 2);
+    assert_eq!(n, 2);
+    assert!(
+      is_removing(&reg, &b1),
+      "b1 (now oldest at seq3) served this round"
+    );
+    assert!(is_removing(&reg, &a1), "a1 (seq4) served");
+    assert!(
+      is_parked(&reg, &a2),
+      "a2 (seq5, newest failure) sinks to the back"
+    );
+
+    // The two-budget rule: refusing = A, all three parked → a1,a2 (mine) AND b1
+    // (others' separate budget) — up to 2·limit dispatches per refusal.
+    let fs2 = FakeFs::new(1);
+    fs2.fail_next_cookie_removes(1_000_000);
+    let reg2 = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs2.clone());
+    let (op_tx2, _op_rx2) = async_channel::unbounded::<OpResult<FakeHandle>>();
+    let mut pending2: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
+    let ja1 = insert_owned_rec(&reg2, sa, "a1", &a1);
+    let ja2 = insert_owned_rec(&reg2, sa, "a2", &a2);
+    let jb1 = insert_owned_rec(&reg2, sb, "b1", &b1);
+    reg2.record_remove_failed(&a1, ja1);
+    reg2.record_remove_failed(&a2, ja2);
+    reg2.record_remove_failed(&b1, jb1);
+    let n = reg2.rearm_parked_batch::<TokioRuntime>(&op_tx2, &mut pending2, sa, 2);
+    assert_eq!(
+      n, 3,
+      "the refusing scope's budget and the others' budget are separate (≤ 2·limit)"
+    );
+    assert!(
+      is_removing(&reg2, &a1),
+      "A's a1 served under the mine-budget"
+    );
+    assert!(
+      is_removing(&reg2, &a2),
+      "A's a2 served under the mine-budget"
+    );
+    assert!(
+      is_removing(&reg2, &b1),
+      "B's b1 served under the SEPARATE others-budget"
+    );
+  }
+
+  /// The R11-1 recovery-fairness config: a low per-scope backlog cap, a budget of
+  /// one, and a fast retry so records park and re-arm in real (multi-thread) time.
+  fn rearm_fairness_config() -> DriverConfig {
+    DriverConfig {
+      cookie_retry_base: Duration::from_millis(1),
+      cookie_retry_cap: Duration::from_millis(4),
+      cookie_retry_budget: 1,
+      cookie_backlog_cap: 2,
+      cookie_global_cap: 128,
+      ..config()
+    }
+  }
+
+  // A cap refusal re-arms the REFUSING scope's own parked backlog FIRST, so a
+  // scope whose mount recovered drains its backlog and is re-admitted even while
+  // OTHER scopes' still-failing residue dominates the ledger — the R11-1 property
+  // end-to-end through the rig. `/rb` recovers; `/ra` (and a churned pad) keep
+  // failing; `/rb` is served within a few refusals regardless.
+  //
+  // Fail-on-old is OVERWHELMING-PROBABILITY, not certain (old selection rides
+  // HashMap iteration order over the whole ledger; padding `/ra`'s side so the
+  // old first-`limit` batch is almost surely all-`/ra` makes `/rb` starve, but a
+  // seed could still serve it). The DETERMINISTIC pin of the selection order is
+  // the unit `rearm_serves_least_recently_failed_first` above.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cap_refusal_rearms_the_refusing_scopes_parked_records_first() {
+    let rig = rig_with_config(64, rearm_fairness_config());
+    rig.fs.put("/ra", FileKind::Dir, 200);
+    rig.fs.put("/rb", FileKind::Dir, 201);
+    rig.fs.put("/pad", FileKind::Dir, 202);
+    let ra = watch(&rig, "/ra").await;
+    let rb = watch(&rig, "/rb").await;
+    // Both mounts fail their unlinks; a churned pad dominates the ledger.
+    rig.fs.fail_cookie_removes_under("/ra");
+    rig.fs.fail_cookie_removes_under("/rb");
+    rig.fs.fail_cookie_removes_under("/pad");
+
+    // Park two records on each of /ra and /rb (sequentially, so failure order is
+    // deterministic: ra1, ra2, rb1, rb2).
+    for i in 0..2 {
+      let path = admit_sync(&rig, ra, "/ra", &format!(".tributaries-sync-ra-{i}")).await;
+      rig
+        .cookie_removes
+        .send(CookieReap::Remove(path))
+        .await
+        .unwrap();
+      settle_removes_parked(&rig).await;
+    }
+    for i in 0..2 {
+      let path = admit_sync(&rig, rb, "/rb", &format!(".tributaries-sync-rb-{i}")).await;
+      rig
+        .cookie_removes
+        .send(CookieReap::Remove(path))
+        .await
+        .unwrap();
+      settle_removes_parked(&rig).await;
+    }
+
+    // Pad /ra's side of the ledger: ≥ 8 parked records across churned (retired)
+    // scopes, so the old scope-blind selection is almost surely all-non-rb.
+    for j in 0..8 {
+      let root = format!("/pad/p{j}");
+      rig.fs.put(&root, FileKind::Dir, 300 + j as u64);
+      let scope = watch(&rig, &root).await;
+      let path = admit_sync(&rig, scope, &root, &format!(".tributaries-sync-pad-{j}")).await;
+      rig
+        .cookie_removes
+        .send(CookieReap::Remove(path))
+        .await
+        .unwrap();
+      settle_removes_parked(&rig).await;
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      let _ = on_reply.await;
+      settle_removes_parked(&rig).await;
+    }
+    assert_eq!(
+      parked_for(&rig, rb).await,
+      2,
+      "/rb has two parked records before recovery"
+    );
+    assert_eq!(parked_for(&rig, ra).await, 2, "/ra has two parked records");
+
+    // /rb's mount recovers.
+    rig.fs.clear_cookie_remove_failures_under("/rb");
+
+    // Loop: each refused sync kicks rearm(refusing=rb); its mine-half re-arms
+    // /rb's own backlog, which confirms on the recovered mount and drops.
+    let mut admitted = None;
+    for _ in 0..3 {
+      match sync_root(&rig, rb, "/rb", ".tributaries-sync-rb-recover").await {
+        Ok(path) => {
+          admitted = Some(path);
+          break;
+        }
+        Err(crate::error::SyncRootError::CleanupBacklog) => {
+          settle(|| rig.fs.files_under("/rb").is_empty()).await;
+        }
+        Err(other) => panic!("unexpected sync error: {other:?}"),
+      }
+    }
+    assert!(
+      admitted.is_some(),
+      "the recovered /rb was admitted within 3 attempts — its own backlog was re-armed first"
+    );
+
+    // The still-failing residue is HONESTLY parked — no lockout, and /rb was
+    // served despite the pad dominating the ledger.
+    settle_removes_parked(&rig).await;
+    assert_eq!(
+      parked_for(&rig, ra).await,
+      2,
+      "/ra's still-failing residue stays parked — never starved rb, never falsely drained"
+    );
+  }
+
+  // Cell 7: the R10 recovery/global-cap cells
+  // (`churn_across_retired_scopes_is_bounded_by_the_global_cap`,
+  // `a_recovered_fs_drains_the_backlog_and_admits_new_syncs`) stay green
+  // UNMODIFIED — R11-1 is a strict superset (still re-armed on every refusal,
+  // still bounded, now prioritized + starvation-free). No new cell; validated by
+  // the full-suite run.
+
+  // ==== R11-2: the whole-lifecycle global cap (cells 8–10) ====
+
+  // Hung (blocking, unclaimed) cookie WRITES count against the global cap: the
+  // admission gauge is the whole lifecycle — `obligation_count(writes_in_flight)`
+  // + `parked_cookies.len()` — not just claimed `owned` records. Three held
+  // writes fill a cap of 3, so the fourth is refused promptly (an honest,
+  // retryable `Busy`) rather than piling a fourth blocking job on the pool.
+  //
+  // Fail-on-old (the gauge reverted to `cookies.unremoved()`): with the writes
+  // held, `unremoved() == 0` (nothing claimed), so the 4th write is admitted,
+  // dispatched, and PARKS behind the hold — its reply never resolves, and the
+  // prompt-error assertion times out. Deterministic.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn hung_writes_count_against_the_global_cap() {
+    // global_cap = 3, backlog_cap = 8 (the per-scope cap never binds — each scope
+    // owns at most one in-flight write).
+    let rig = rig_with_config(64, low_global_cap_config());
+    let mut scopes = Vec::new();
+    for i in 1..=4 {
+      let root = format!("/r{i}");
+      rig.fs.put(&root, FileKind::Dir, 400 + i as u64);
+      scopes.push((root.clone(), watch(&rig, &root).await));
+    }
+
+    // Every cookie write hangs in the pool — a genuinely backlogged/hung fs.
+    let hold = rig.fs.hold_cookie_writes();
+
+    // r1, r2, r3 each admit, park, and dispatch a blocking write into the held
+    // pool; settle the dispatch growth so each is counted before the next.
+    let mut pending_replies = Vec::new();
+    for (i, (root, scope)) in scopes.iter().take(3).enumerate() {
+      let reply =
+        sync_root_pending(&rig, *scope, root, &format!(".tributaries-sync-hung-{i}")).await;
+      pending_replies.push(reply);
+      let want = i + 1;
+      settle(|| rig.fs.cookie_dispatches() >= want).await;
+      assert_eq!(
+        rig.fs.cookie_dispatches(),
+        want,
+        "each held write is dispatched and counted before the next admission"
+      );
+    }
+
+    // The 4th sync: the gauge is `obligation_count` (3 unclaimed hung writes) +
+    // parked (0) = 3 ≥ cap → refused PROMPTLY, never queued behind the hold.
+    let (root4, scope4) = &scopes[3];
+    let r4_reply = sync_root_pending(&rig, *scope4, root4, ".tributaries-sync-hung-4").await;
+    let r4 = tokio::time::timeout(Duration::from_secs(3), r4_reply)
+      .await
+      .expect("the 4th admission refusal resolves promptly, never pends behind the write hold")
+      .expect("the driver replies");
+    assert!(
+      matches!(r4, Err(crate::error::SyncRootError::CleanupBacklog)),
+      "the 4th hung write is refused — hung writes count against the whole-lifecycle cap, got {r4:?}"
+    );
+
+    // Cleanup: release the hold so the held writes drain, then drop the receivers.
+    hold.release();
+    settle(|| rig.fs.cookie_writes().len() >= 3).await;
+    drop(pending_replies);
+  }
+
+  // The admission gauge counts each obligation exactly ONCE — a claimed self-reap
+  // (name in `names` AND in `writes_in_flight`) is one physical obligation, and
+  // the parked-cookies term is disjoint from both — so the whole-lifecycle sum is
+  // `obligation_count + parked`, never a naive `owned + writes + parked`.
+  //
+  // GUARD CELL: its fail-on-old target is a NAIVE widening (which would
+  // double-count the claimed self-reap and read 3, a spurious refusal), NOT
+  // e8269c7 — e8269c7's failure is cell 8. It pins the reuse of the proven dedup.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn the_admission_gauge_counts_each_obligation_once() {
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
+    // A claimed self-reap: name "M" in `names` (claim landed) AND in
+    // `writes_in_flight` (its CookieWriteDone hasn't cleared the gate).
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      inner.next_cookie_id += 1;
+      let id = CookieId(inner.next_cookie_id);
+      let path = PathBuf::from("/r/M");
+      inner.owned.insert(
+        path.clone(),
+        CookieRecord {
+          scope: ScopeId::new(NonZeroU64::new(1).unwrap()),
+          name: "M".to_owned(),
+          id,
+          last_failure_seq: 0,
+          state: RemovalState::Removing { attempts: 0 },
+        },
+      );
+      inner.names.insert("M".to_owned(), path);
+    }
+    let in_flight: BTreeMap<ScopeId, String> =
+      [(ScopeId::new(NonZeroU64::new(1).unwrap()), "M".to_owned())]
+        .into_iter()
+        .collect();
+    assert_eq!(
+      reg.obligation_count(&in_flight),
+      1,
+      "the claimed self-reap is deduped to one obligation, never counted twice"
+    );
+    // The admission gauge adds `parked_cookies.len()`. With one parked write (no
+    // record, no `writes_in_flight` entry — disjoint), the gauge is 2, never 3.
+    let parked_len = 1usize;
+    assert_eq!(
+      reg.obligation_count(&in_flight) + parked_len,
+      2,
+      "the whole-lifecycle gauge counts each stage once — a naive owned+writes+parked would read 3"
+    );
+  }
+
+  /// Cell 10's config: a global cap of 2 (backlog never binds), so one claimed
+  /// self-reap plus one fresh sync sit exactly at the boundary the dedup governs.
+  fn double_bar_config() -> DriverConfig {
+    DriverConfig {
+      cookie_retry_base: Duration::from_millis(5),
+      cookie_retry_cap: Duration::from_millis(20),
+      cookie_retry_budget: 3,
+      cookie_backlog_cap: 8,
+      cookie_global_cap: 2,
+      ..config()
+    }
+  }
+
+  // A claimed self-reap that is still mid-unlink (in BOTH `writes_in_flight` and
+  // `owned`) must count as ONE against the cap, not two — so a second scope's
+  // sync is admitted at a cap of 2 rather than double-barred by the same physical
+  // obligation appearing in two places.
+  //
+  // GUARD CELL: old code also admits (it counts `owned == 1`), so this does not
+  // fail on e8269c7; it pins the dedup against a naive `owned + writes + parked`
+  // widening (which would read 2 and wrongly refuse scope 2).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_claimed_self_reap_does_not_double_bar_admission() {
+    let rig = rig_with_config(64, double_bar_config());
+    rig.fs.put("/r1", FileKind::Dir, 500);
+    rig.fs.put("/r2", FileKind::Dir, 501);
+    let s1 = watch(&rig, "/r1").await;
+    let s2 = watch(&rig, "/r2").await;
+
+    // Stage scope 1's claimed-but-reply-failed self-reap, parked mid-unlink.
+    let hold_w = rig.fs.hold_cookie_writes();
+    let r1_reply = sync_root_pending(&rig, s1, "/r1", ".tributaries-sync-double-1").await;
+    settle(|| rig.fs.cookie_dispatches() >= 1).await;
+    drop(r1_reply); // the caller abandons the sync — reply.send will fail
+    let hold_r = rig.fs.hold_cookie_removes();
+    hold_w.release(); // the write proceeds: it claims, reply.send fails, self-reap unlinks
+    settle(|| rig.fs.cookie_remove_dispatches() >= 1).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      1,
+      "the claimed self-reap parked mid-unlink — in both writes_in_flight and owned"
+    );
+
+    // Scope 2 admits: the gauge dedups the one physical obligation to 1 < 2. A
+    // naive owned(1)+writes(1)+parked(0)=2 would wrongly refuse it.
+    let path2 = admit_sync(&rig, s2, "/r2", ".tributaries-sync-double-2").await;
+    assert_eq!(
+      path2,
+      PathBuf::from("/r2/.tributaries-sync-double-2"),
+      "scope 2 is admitted and completes — the claimed self-reap did not double-bar the cap"
+    );
+
+    // Cleanup: release the unlink so the self-reap confirms and drains.
+    hold_r.release();
+    settle(|| rig.fs.cookie_removes().iter().any(|p| p.starts_with("/r1"))).await;
   }
 }
