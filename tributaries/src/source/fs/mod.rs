@@ -571,6 +571,10 @@ impl<R> Source<OsString> for FsSource<R> {
           };
           SyncError::CookieWrite(SourceFault::new(kind).with_source(source))
         }
+        // A second sync raced one already in flight for this root: no physical write happened, and it
+        // is a transient, retryable refusal — surfaced as the dedicated `Busy` rather than a
+        // write-failure the caller might read as terminal.
+        SyncRootError::WriteInFlight => SyncError::Busy,
         SyncRootError::Closed => SyncError::Closed,
         // The fs error type is `#[non_exhaustive]`: a variant added later is a
         // failed write until it is classified here, never a silent success.

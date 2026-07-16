@@ -3134,17 +3134,23 @@ where
       let closes = &self.closes;
       let source = &mut self.source;
       futures_util::select_biased! {
-        // Close outranks everything: a requested shutdown abandons the in-flight write. A CLOSED close
-        // channel means every handle is gone (the caller with them), so it lands as an abandon, not a
-        // threaded close — no one is left to acknowledge, and the command channel drives teardown.
+        // The write is polled FIRST so a result that is ALREADY ready wins over a simultaneously-ready
+        // cancellation or close: the fs driver may have buffered its `Ok(path)` (its own
+        // `reply.send(Ok)` already succeeded, so its send-failure self-reap will NOT run), and dropping
+        // that ready result unread would strand the cookie it names. Taking it here means an abandoned
+        // caller's cookie is reaped deterministically below, never orphaned. A still-PENDING write (a
+        // hung mount) is not ready, so close and cancellation below still win and free the owner — the
+        // bias only decides a tie, and only a completed write can tie.
+        res = source.begin_sync(root, &dir_key, token).fuse() => SyncStep::Began(res),
+        // Close outranks cancellation: a requested shutdown abandons a still-in-flight write. A CLOSED
+        // close channel means every handle is gone (the caller with them), so it lands as an abandon,
+        // not a threaded close — no one is left to acknowledge, and the command channel drives teardown.
         close = closes.recv().fuse() => match close {
           Ok(close_reply) => SyncStep::Close(close_reply),
           Err(_) => SyncStep::Canceled,
         },
         // The caller timed out or dropped its `sync()` wait: its receiver is gone.
         () = reply.cancellation().fuse() => SyncStep::Canceled,
-        // The backend write completed (or failed).
-        res = source.begin_sync(root, &dir_key, token).fuse() => SyncStep::Began(res),
       }
     };
 
@@ -3158,36 +3164,7 @@ where
       // spurious is delivered.
       SyncStep::Canceled => SyncAdmit::Done,
       SyncStep::Began(Ok(cookie_key)) => {
-        let loss_serial_at_install = self.loss_serial.get(&sub).copied().unwrap_or(0);
-        // Domination the cookie cannot un-owe, decided from the CALLER'S call rather than from this
-        // install — the two probes cover disjoint halves of the pre-cookie past:
-        //
-        // - standing parked debt: a loss still owed at install (it publishing-and-clearing before
-        //   the cookie would leave the serial unchanged and `needs_rescan` empty at resolution, so
-        //   only this snapshot still separates it from a clean sync);
-        // - a moved loss GENERATION: a loss the owner processed while the request sat in the
-        //   mailbox. Its kernel event predates the caller's `sync()`, yet it can have parked,
-        //   published and cleared entirely inside that window — advancing `loss_serial` BEFORE the
-        //   snapshot above is taken and emptying the debt maps again — so neither the standing-debt
-        //   probe nor the install-to-resolve `lost_during_window` comparison can see it. Only the
-        //   caller's own pre-enqueue snapshot can.
-        //
-        // The generation is GLOBAL, so a loss on an UNRELATED subscription inside that window
-        // dominates this barrier too. That is a deliberate conservatism: it costs a false
-        // `Dominated` (the caller re-enumerates — safe), never a false `Delivered`; the window is a
-        // few owner-loop iterations wide; and the precise per-subscription `loss_serial` still
-        // governs the long install-to-resolve window. Correctness beats precision here.
-        let dominated_at_install = self.needs_rescan.contains_key(&sub)
-          || self.suppressed_rescan.contains_key(&sub)
-          || self.loss_gen.load(Ordering::SeqCst) != loss_gen_at_call;
-        self.pending_syncs.push(PendingSync {
-          cookie_key,
-          sub,
-          root,
-          loss_serial_at_install,
-          dominated_at_install,
-          reply,
-        });
+        self.admit_begun_cookie(cookie_key, sub, root, loss_gen_at_call, reply);
         SyncAdmit::Done
       }
       SyncStep::Began(Err(err)) => {
@@ -3195,6 +3172,57 @@ where
         SyncAdmit::Done
       }
     }
+  }
+
+  /// Admits a COMPLETED cookie write (its `begin_sync` returned `Ok`): reaps it inline when the caller
+  /// has ALREADY gone, otherwise parks the [`PendingSync`].
+  ///
+  /// The reap path is why the write is polled first in [`on_sync`](Self::on_sync)'s race: the fs driver
+  /// may buffer a successful `Ok(path)` reply just as the caller's deadline fires, and taking that ready
+  /// result (rather than dropping it for the simultaneously-ready cancellation) is the ONLY thing that
+  /// frees its file — the driver already saw its own `reply.send(Ok)` succeed, so its send-failure
+  /// self-reap will not run. Skipping the install also spares `pending_syncs` an entry the loop-top
+  /// prune would immediately reap.
+  fn admit_begun_cookie(
+    &mut self,
+    cookie_key: Vec<C>,
+    sub: Subscription,
+    root: S::Handle,
+    loss_gen_at_call: u64,
+    reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
+  ) {
+    if reply.is_canceled() {
+      self.source.end_sync(root, &cookie_key);
+      return;
+    }
+    let loss_serial_at_install = self.loss_serial.get(&sub).copied().unwrap_or(0);
+    // Domination the cookie cannot un-owe, decided from the CALLER'S call rather than from this
+    // install — the two probes cover disjoint halves of the pre-cookie past:
+    //
+    // - standing parked debt: a loss still owed at install (it publishing-and-clearing before the
+    //   cookie would leave the serial unchanged and `needs_rescan` empty at resolution, so only this
+    //   snapshot still separates it from a clean sync);
+    // - a moved loss GENERATION: a loss the owner processed while the request sat in the mailbox. Its
+    //   kernel event predates the caller's `sync()`, yet it can have parked, published and cleared
+    //   entirely inside that window — advancing `loss_serial` BEFORE the snapshot above is taken and
+    //   emptying the debt maps again — so neither the standing-debt probe nor the install-to-resolve
+    //   `lost_during_window` comparison can see it. Only the caller's own pre-enqueue snapshot can.
+    //
+    // The generation is GLOBAL, so a loss on an UNRELATED subscription inside that window dominates
+    // this barrier too. That is a deliberate conservatism: it costs a false `Dominated` (the caller
+    // re-enumerates — safe), never a false `Delivered`; the window is a few owner-loop iterations wide;
+    // and the precise per-subscription `loss_serial` still governs the long install-to-resolve window.
+    let dominated_at_install = self.needs_rescan.contains_key(&sub)
+      || self.suppressed_rescan.contains_key(&sub)
+      || self.loss_gen.load(Ordering::SeqCst) != loss_gen_at_call;
+    self.pending_syncs.push(PendingSync {
+      cookie_key,
+      sub,
+      root,
+      loss_serial_at_install,
+      dominated_at_install,
+      reply,
+    });
   }
 
   /// The cookie arrived: everything the backend reported before its write has

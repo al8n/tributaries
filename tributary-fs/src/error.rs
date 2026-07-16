@@ -133,17 +133,21 @@ pub enum CloseError {
   /// torn down externally); streams are still reclaimed at process exit.
   #[error("the driver stopped before confirming the shutdown")]
   Stopped,
-  /// The close grace expired with stream work still executing on the blocking
-  /// pool: teardowns still inside their `shutdown` calls, or spawns that may
-  /// already own a live stream (the backend starts the stream and then
-  /// performs post-live metadata reads inside the same call). Neither proves
-  /// quiescence at reply time. Their reclamation stories differ: a wedged
-  /// teardown's stream is unreachable until the call returns (the OS reclaims
-  /// at process exit), while a wedged spawn's stream is reclaimed by its
-  /// undeliverable result dropping the handle once the wedge clears.
-  #[error("{pending} stream operation(s) still executing when the close grace expired")]
+  /// The close grace expired with blocking-pool work still executing:
+  /// teardowns still inside their `shutdown` calls, spawns that may already own
+  /// a live stream (the backend starts the stream and then performs post-live
+  /// metadata reads inside the same call), or a physical sync-cookie unlink the
+  /// close swept as a tracked job. None proves quiescence at reply time. Their
+  /// reclamation stories differ: a wedged teardown's stream is unreachable until
+  /// the call returns (the OS reclaims at process exit), a wedged spawn's stream
+  /// is reclaimed by its undeliverable result dropping the handle once the wedge
+  /// clears, and a wedged cookie unlink leaves its file until the mount unwedges
+  /// (the registry's best-effort terminal sweep retries it) — but close reports
+  /// the outstanding count honestly rather than hanging on any of them.
+  #[error("{pending} operation(s) still executing when the close grace expired")]
   NotQuiesced {
-    /// How many spawns and teardowns were still executing at grace expiry.
+    /// How many spawns, teardowns, and physical cookie operations were still
+    /// executing at grace expiry.
     pending: usize,
   },
 }
@@ -204,6 +208,13 @@ pub enum SyncRootError {
     #[source]
     source: std::io::Error,
   },
+  /// A physical cookie write for this root is already in flight. The barrier is
+  /// single-flighted per root: at most one physical write may be outstanding at
+  /// a time, so a caller that times out and retries cannot pile unbounded
+  /// blocking writes against a hung mount. Retry once the outstanding write
+  /// resolves.
+  #[error("a sync cookie write is already in flight for this root")]
+  WriteInFlight,
   /// The barrier outlived the coverage it was to be written under: the root died (or was
   /// unwatched) while the write was parked on the coverage-settle fence, or the scope retired —
   /// or the driver itself shut down — while the write was already in flight. In the latter cases

@@ -117,6 +117,17 @@ struct FakeState {
   /// a test retires the scope, drops the reply, or tears the driver down while
   /// the write is still in the pool.
   cookie_write_hold: Mutex<Option<HoldGate>>,
+  /// The next N cookie REMOVES fail with a transient error (a hung/faulty
+  /// unlink), so a cell can prove the record is RETAINED and the path retried
+  /// rather than orphaned. Decremented per failed remove.
+  cookie_remove_failures: AtomicUsize,
+  /// Cookie removes that reached the blocking pool, counted before any hold —
+  /// the observable that an unlink is IN FLIGHT, which a cell racing a close (or
+  /// a Drop) against a hung terminal unlink must wait for.
+  cookie_remove_dispatches: AtomicUsize,
+  /// When set, `remove_cookie` parks until the gate releases: the window a
+  /// close (or a cancelled driver's Drop) races against a hung terminal unlink.
+  cookie_remove_hold: Mutex<Option<HoldGate>>,
   /// Cookie directories that CANONICALIZE elsewhere — the fake's model of an
   /// intermediate symlink. A spelled directory maps to the real path it resolves
   /// to, so `write_cookie` can mirror the production canonicalize-and-verify: a
@@ -183,6 +194,9 @@ impl Default for FakeState {
       cookie_write_failure: Mutex::default(),
       cookie_dispatches: AtomicUsize::new(0),
       cookie_write_hold: Mutex::default(),
+      cookie_remove_failures: AtomicUsize::new(0),
+      cookie_remove_dispatches: AtomicUsize::new(0),
+      cookie_remove_hold: Mutex::default(),
       canonical_dirs: Mutex::default(),
       resume_token: Mutex::default(),
       spawn_resume_points: Mutex::default(),
@@ -559,6 +573,13 @@ impl FakeFs {
     *self.state.cookie_write_failure.lock().unwrap() = Some(kind);
   }
 
+  /// Fails the next `n` cookie REMOVES with a transient error, then lets removes
+  /// succeed again — a flaky/hung unlink, so a cell can prove the record is
+  /// retained and the path retried until it clears.
+  pub(crate) fn fail_next_cookie_removes(&self, n: usize) {
+    self.state.cookie_remove_failures.store(n, Ordering::SeqCst);
+  }
+
   /// Models an intermediate symlink: a cookie write whose resolved directory is
   /// `spelled` canonicalizes to `canonical`, so the fake's beneath check runs
   /// against the real target — a `canonical` outside the root is refused, matching
@@ -580,12 +601,29 @@ impl FakeFs {
     self.state.cookie_dispatches.load(Ordering::SeqCst)
   }
 
+  /// Cookie removes dispatched to the pool so far (counted before any hold), so
+  /// a cell can prove a terminal unlink is IN FLIGHT before racing a close (or a
+  /// Drop) against it.
+  pub(crate) fn cookie_remove_dispatches(&self) -> usize {
+    self.state.cookie_remove_dispatches.load(Ordering::SeqCst)
+  }
+
   /// Holds every subsequent cookie write in the blocking pool until the returned
   /// gate is released — the window a retirement, an abandoned reply, or a driver
   /// teardown races the write in.
   pub(crate) fn hold_cookie_writes(&self) -> HoldRelease {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
     *self.state.cookie_write_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
+  /// Holds every subsequent cookie REMOVE in the blocking pool until the
+  /// returned gate is released — a hung terminal unlink, so a cell can prove a
+  /// close reports `NotQuiesced` within its grace rather than wedging, and that
+  /// a cancelled driver's `Drop` does not block on it.
+  pub(crate) fn hold_cookie_removes(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.cookie_remove_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
 
@@ -1111,7 +1149,34 @@ impl FsOps for FakeFs {
     Ok(path)
   }
 
-  fn remove_cookie(&self, path: &Path) {
+  fn remove_cookie(&self, path: &Path) -> Result<(), std::io::Error> {
+    // Counted BEFORE the hold: a cell racing a close (or a cancelled driver's
+    // Drop) against a hung terminal unlink needs to know the unlink is parked in
+    // the pool, not still queued.
+    self
+      .state
+      .cookie_remove_dispatches
+      .fetch_add(1, Ordering::SeqCst);
+    self.park_on(&self.state.cookie_remove_hold);
+    // A transient unlink failure: the tree KEEPS the node (no `remove` below), so
+    // the record is retained and a retry can still find and unlink it — never a
+    // silently orphaned file. Decrement-if-positive, atomic against concurrent
+    // remove jobs on the pool.
+    let mut budget = self.state.cookie_remove_failures.load(Ordering::SeqCst);
+    loop {
+      if budget == 0 {
+        break;
+      }
+      match self.state.cookie_remove_failures.compare_exchange(
+        budget,
+        budget - 1,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+      ) {
+        Ok(_) => return Err(std::io::Error::other("cookie remove refused")),
+        Err(actual) => budget = actual,
+      }
+    }
     self.remove(path);
     self
       .state
@@ -1119,6 +1184,7 @@ impl FsOps for FakeFs {
       .lock()
       .unwrap()
       .push(path.to_path_buf());
+    Ok(())
   }
 
   fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {

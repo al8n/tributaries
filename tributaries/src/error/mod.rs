@@ -458,6 +458,12 @@ pub enum SyncError {
   /// The deadline elapsed before the cookie was observed.
   #[error("the sync barrier timed out")]
   Timeout,
+  /// Another barrier is already in flight for this subscription's root. At most
+  /// one physical cookie write per root may be outstanding, so that a hung
+  /// backend cannot accumulate blocking writes. This is transient and
+  /// RETRYABLE — retry once the in-flight barrier resolves.
+  #[error("another sync barrier is already in flight for this root")]
+  Busy,
   /// The watcher is closed.
   #[error("the watcher is closed")]
   Closed,
@@ -498,6 +504,12 @@ impl SyncError {
   #[inline]
   pub const fn is_timeout(&self) -> bool {
     matches!(self, Self::Timeout)
+  }
+
+  /// Whether this is [`Busy`](Self::Busy) — the retryable "another barrier is in flight" refusal.
+  #[inline]
+  pub const fn is_busy(&self) -> bool {
+    matches!(self, Self::Busy)
   }
 
   /// Whether this is [`Closed`](Self::Closed).
