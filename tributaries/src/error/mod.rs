@@ -458,11 +458,16 @@ pub enum SyncError {
   /// The deadline elapsed before the cookie was observed.
   #[error("the sync barrier timed out")]
   Timeout,
-  /// Another barrier is already in flight for this subscription's root. At most
-  /// one physical cookie write per root may be outstanding, so that a hung
-  /// backend cannot accumulate blocking writes. This is transient and
-  /// RETRYABLE — retry once the in-flight barrier resolves.
-  #[error("another sync barrier is already in flight for this root")]
+  /// The barrier could not start because the subscription's root is momentarily
+  /// busy: another barrier is already in flight for it (at most one physical
+  /// cookie write per root may be outstanding, so a hung backend cannot
+  /// accumulate blocking writes), OR the root's cookie cleanup is backlogged (a
+  /// failing unlink the driver is retrying has filled the per-root cookie
+  /// budget). Both are transient and RETRYABLE — retry once the outstanding
+  /// work resolves.
+  #[error(
+    "the subscription's root is busy (a barrier is in flight or its cookie cleanup is backlogged)"
+  )]
   Busy,
   /// The watcher is closed.
   #[error("the watcher is closed")]

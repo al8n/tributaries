@@ -55,6 +55,54 @@ enum Call {
   Grow(u32, Vec<Vec<OsString>>),
 }
 
+/// One step of a scripted [`FakeSource::begin_sync`] poll: consumed one-per-poll of the
+/// scripted future so a cell can force finding 1's inter-arm race deterministically under
+/// manual noop-waker polling.
+enum ScriptStep {
+  /// The poll returns `Pending` — the write is still in flight.
+  Pending,
+  /// The poll SIDE-EFFECT-DELIVERS the cookie key (models the fs worker's `reply.send(Ok)`
+  /// landing) yet STILL returns `Pending`: the delivered-but-unread cookie is now physical,
+  /// but this `select` pass will move on to poll a later arm — the exact "the fs sent Ok
+  /// between select arm 1 and arm 3 of one pass" interleave.
+  PendingThenComplete,
+  /// The poll resolves `Ready` with the cookie key — the ordinary completion, so a cell can
+  /// pin the write-first bias winning a tie against a simultaneously-ready cancellation.
+  Ready,
+}
+
+/// The hand-rolled future a scripted [`FakeSource::begin_sync`] awaits: each poll consumes one
+/// [`ScriptStep`], so polling the enclosing `on_sync` future advances the write one arm-race pass
+/// at a time. Borrows the source's script and its delivery sink (disjoint fields) for the life of
+/// the `begin_sync` call.
+struct ScriptedBegin<'a> {
+  script: &'a mut VecDeque<ScriptStep>,
+  delivered: &'a mut Vec<Vec<OsString>>,
+  cookie_key: Vec<OsString>,
+}
+
+impl std::future::Future for ScriptedBegin<'_> {
+  type Output = Vec<OsString>;
+
+  fn poll(
+    self: std::pin::Pin<&mut Self>,
+    _cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Vec<OsString>> {
+    // All fields are `Unpin`, so the pin projects trivially.
+    let this = self.get_mut();
+    match this.script.pop_front() {
+      Some(ScriptStep::Ready) => std::task::Poll::Ready(this.cookie_key.clone()),
+      Some(ScriptStep::PendingThenComplete) => {
+        // The write's `reply.send(Ok)` succeeds as a side effect, yet the arm still parks:
+        // the physical cookie exists but this pass will poll a later, ready arm.
+        this.delivered.push(this.cookie_key.clone());
+        std::task::Poll::Pending
+      }
+      Some(ScriptStep::Pending) | None => std::task::Poll::Pending,
+    }
+  }
+}
+
 /// A fake [`Source`] over `u32` handles: it records every arm/disarm in order (so a test
 /// can assert the widen sequence), can be told to fail the *next* arm (so a test can drive
 /// the arm-failure path), can be told to return the *next* arm **dead-on-arrival** (a
@@ -87,6 +135,23 @@ struct FakeSource {
   supports_sync: bool,
   /// Cookie keys handed to `end_sync` — the reap ledger (F5).
   ended_syncs: Vec<Vec<OsString>>,
+  /// Tokens handed to `cancel_sync` — the abandon-arm ledger. Records the
+  /// token an `on_sync` abandon (a caller timeout or a close) hands the source
+  /// so a cell can prove a delivered-but-unread cookie is freed by TOKEN, not
+  /// by the path the owner never learned.
+  cancelled_syncs: Vec<SyncToken>,
+  /// The token the most recent `begin_sync` was minted with — the same token an
+  /// abandon then cancels, recorded so a cell can assert the cancel names EXACTLY
+  /// the sync that began (the nonce is owner-random and unreconstructable).
+  begun_token: Option<SyncToken>,
+  /// A hand-driven `begin_sync` poll schedule (empty = the ordinary immediate
+  /// `Ok(cookie_key)`). Each step drives ONE poll of the scripted future so a
+  /// cell can force finding 1's inter-arm race under manual noop-waker polling.
+  sync_script: VecDeque<ScriptStep>,
+  /// Cookie keys the scripted `begin_sync` SIDE-EFFECT-DELIVERED (a
+  /// [`ScriptStep::PendingThenComplete`] poll): the fs worker's `reply.send(Ok)`
+  /// landing modeled as a physical delivery that the `select` pass never reads.
+  fs_delivered: Vec<Vec<OsString>>,
   /// How many of the next `arm` calls to fail, decremented on each failed arm.
   fail_arms: u32,
   /// How many of the next `grow` calls to fail with [`WatchError::CoverageIncomplete`],
@@ -139,6 +204,10 @@ impl FakeSource {
       supports_replace: false,
       supports_sync: false,
       ended_syncs: Vec::new(),
+      cancelled_syncs: Vec::new(),
+      begun_token: None,
+      sync_script: VecDeque::new(),
+      fs_delivered: Vec::new(),
       fail_arms: 0,
       fail_grows: 0,
       dead_on_arrival_arms: 0,
@@ -344,6 +413,13 @@ impl Source<OsString> for FakeSource {
     self.ended_syncs.push(cookie_key.to_vec());
   }
 
+  fn cancel_sync(&mut self, _handle: u32, token: SyncToken) {
+    // The abandon-arm ledger: an `on_sync` timeout or close hands the token here, and only
+    // this call can free a cookie whose delivered-but-unread write the owner never got a path
+    // for. Overrides the seam's defaulted no-op.
+    self.cancelled_syncs.push(token);
+  }
+
   async fn begin_sync(
     &mut self,
     _handle: u32,
@@ -353,12 +429,29 @@ impl Source<OsString> for FakeSource {
     if !self.supports_sync {
       return Err(crate::error::SyncError::Unsupported);
     }
+    // The token the abandon arm will later cancel — recorded so a cell can prove the cancel
+    // names EXACTLY the sync that began (the nonce is owner-random, so the token cannot be
+    // reconstructed from outside).
+    self.begun_token = Some(token);
     // A deterministic cookie key under the sub's directory: `<dir>/cookie-<seq>`. The seq makes it
     // predictable so a test can deliver the matching artifact event; `is_sync_artifact` (a `cookie-`
     // leaf) both suppresses that event and resolves the barrier on it.
     let mut cookie_key = dir_key.to_vec();
     cookie_key.push(OsString::from(format!("cookie-{}", token.seq())));
-    Ok(cookie_key)
+    // With no script this is the ordinary immediate completion. A script drives the poll
+    // schedule by hand so a cell can force finding 1's inter-arm race: a poll that
+    // side-effect-delivers the cookie yet returns `Pending`, letting a later ready arm win the
+    // same `select` pass.
+    if self.sync_script.is_empty() {
+      return Ok(cookie_key);
+    }
+    let delivered = ScriptedBegin {
+      script: &mut self.sync_script,
+      delivered: &mut self.fs_delivered,
+      cookie_key,
+    }
+    .await;
+    Ok(delivered)
   }
 
   async fn replace(
@@ -7443,6 +7536,202 @@ async fn on_sync_skips_an_already_canceled_barrier() {
   assert!(
     h.owner.source.ended_syncs.is_empty(),
     "no cookie was written, so none is reaped"
+  );
+}
+
+/// Finding 1, the inter-arm race forced deterministically: the fs write COMPLETES (delivers its
+/// cookie) between the `select_biased!` pass that polls `begin_sync` and that same pass's
+/// cancellation arm. A scripted `begin_sync` future side-effect-delivers the cookie key yet still
+/// returns `Pending`, so the now-ready cancellation wins the SAME pass — the exact "the fs sent Ok
+/// between select arm 1 and arm 3 of one pass" interleave. The owner never learned the cookie's
+/// path (only a completed `begin_sync` returns it), so the ONLY thing that can free the physical
+/// cookie is `cancel_sync(token)` on the abandon arm.
+///
+/// Fail-on-old (drop the `cancel_sync` on the cancellation arm): `cancelled_syncs` is empty and the
+/// delivered cookie is orphaned — the leak the whole token-cancel handshake exists to close.
+#[tokio::test]
+async fn a_write_completing_between_its_poll_and_the_cancel_poll_is_cancelled_by_token() {
+  use core::sync::atomic::Ordering;
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  h.owner.source.sync_script =
+    VecDeque::from([ScriptStep::Pending, ScriptStep::PendingThenComplete]);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  let loss_gen = h.owner.loss_gen.load(Ordering::SeqCst);
+  let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut fut = Box::pin(h.owner.on_sync(sub, loss_gen, reply_tx));
+
+  // Pass #1: `begin_sync`'s first scripted step is `Pending`, and the caller is still waiting
+  // (its receiver is alive) so the cancellation arm is pending too — the whole pass parks. This
+  // models R7-1's healthy ordering: nothing is ready, so nothing is dropped.
+  assert!(
+    fut.as_mut().poll(&mut cx).is_pending(),
+    "the write is in flight and the caller still waits — the pass parks"
+  );
+
+  // The caller's deadline fires: its response receiver drops. On the NEXT pass the write's
+  // scripted step delivers the cookie (side effect) yet returns `Pending`, and the now-ready
+  // cancellation wins the SAME pass; the write future — holding a ready, unread delivery — is
+  // dropped with the `select`.
+  drop(reply_rx);
+  let admit = fut.as_mut().poll(&mut cx);
+  assert!(
+    matches!(admit, Poll::Ready(super::SyncAdmit::Done)),
+    "the cancellation arm resolves the abandoned barrier in the same pass"
+  );
+  drop(fut);
+
+  let token = h
+    .owner
+    .source
+    .begun_token
+    .expect("begin_sync minted the token");
+  assert_eq!(
+    h.owner.source.fs_delivered,
+    vec![key("/a/cookie-1")],
+    "the write DID complete and deliver its cookie between the two arm polls"
+  );
+  assert!(
+    h.owner.source.ended_syncs.is_empty(),
+    "no path-precise reap was possible — the owner never learned the cookie key"
+  );
+  assert_eq!(
+    h.owner.source.cancelled_syncs,
+    vec![token],
+    "the token cancel is the ONLY thing that frees the delivered-but-unread cookie"
+  );
+  assert!(
+    h.owner.pending_syncs.is_empty(),
+    "the abandoned barrier parked nothing (leak oracle)"
+  );
+}
+
+/// The close-arm companion to the inter-arm race: same scripted delivery, but a CLOSE arrives
+/// while the write is in flight instead of the caller timing out. On the pass where the write
+/// side-effect-delivers its cookie, the close arm — ranked ABOVE cancellation — wins, threading its
+/// reply back for teardown AND token-cancelling the delivered-but-unread cookie.
+///
+/// Fail-on-old (drop the `cancel_sync` on the close arm): `cancelled_syncs` is empty and the
+/// delivered cookie is orphaned across the close.
+#[tokio::test]
+async fn a_write_completing_between_its_poll_and_the_cancel_poll_is_cancelled_by_token_close_arm() {
+  use core::sync::atomic::Ordering;
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  h.owner.source.sync_script =
+    VecDeque::from([ScriptStep::Pending, ScriptStep::PendingThenComplete]);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  let loss_gen = h.owner.loss_gen.load(Ordering::SeqCst);
+  // The caller stays alive (its receiver is held), so only the close can win the race.
+  let (reply_tx, _reply_rx) = futures_channel::oneshot::channel();
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut fut = Box::pin(h.owner.on_sync(sub, loss_gen, reply_tx));
+
+  assert!(
+    fut.as_mut().poll(&mut cx).is_pending(),
+    "the write is in flight and no close is queued — the pass parks"
+  );
+
+  // A close is requested on the dedicated signal while the write is in flight. On the next pass
+  // the write delivers its cookie (side effect) yet returns `Pending`, and the close arm wins the
+  // SAME pass.
+  let (close_reply, _close_resp) =
+    futures_channel::oneshot::channel::<Result<(), super::CloseError>>();
+  h.closes
+    .try_send(close_reply)
+    .expect("queue the close on the dedicated signal");
+
+  let admit = fut.as_mut().poll(&mut cx);
+  assert!(
+    matches!(admit, Poll::Ready(super::SyncAdmit::CloseRequested(_))),
+    "the close arm consumes its reply and abandons the in-flight write"
+  );
+  drop(fut);
+
+  let token = h
+    .owner
+    .source
+    .begun_token
+    .expect("begin_sync minted the token");
+  assert_eq!(
+    h.owner.source.fs_delivered,
+    vec![key("/a/cookie-1")],
+    "the write delivered its cookie between the two arm polls"
+  );
+  assert!(
+    h.owner.source.ended_syncs.is_empty(),
+    "the owner never learned the cookie key — no path-precise reap"
+  );
+  assert_eq!(
+    h.owner.source.cancelled_syncs,
+    vec![token],
+    "the close abandon token-cancels the delivered-but-unread cookie"
+  );
+  assert!(
+    h.owner.pending_syncs.is_empty(),
+    "the abandoned barrier parked nothing (leak oracle)"
+  );
+}
+
+/// The guard that keeps the token cancel from firing spuriously: when the write is READY on the
+/// pass (not merely side-effect-delivering), the write-first bias makes it win the tie over a
+/// simultaneously-ready cancellation — R7-1's ordering — and a completed cookie for a gone caller
+/// is reaped by PATH (`end_sync`), never token-cancelled. This proves the cancel is confined to the
+/// abandon arms, not the admit path.
+#[tokio::test]
+async fn a_ready_write_still_wins_the_tie_and_is_not_token_cancelled() {
+  use core::sync::atomic::Ordering;
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  h.owner.source.sync_script = VecDeque::from([ScriptStep::Pending, ScriptStep::Ready]);
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  let loss_gen = h.owner.loss_gen.load(Ordering::SeqCst);
+  let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut fut = Box::pin(h.owner.on_sync(sub, loss_gen, reply_tx));
+
+  assert!(
+    fut.as_mut().poll(&mut cx).is_pending(),
+    "the write is in flight; the caller still waits — the pass parks"
+  );
+
+  // The caller's deadline fires — but on the next pass the write is READY, and the write-first
+  // bias makes it win the tie over the simultaneously-ready cancellation. A completed cookie for a
+  // gone caller is reaped by PATH, never token-cancelled.
+  drop(reply_rx);
+  let admit = fut.as_mut().poll(&mut cx);
+  assert!(
+    matches!(admit, Poll::Ready(super::SyncAdmit::Done)),
+    "the ready write wins the tie and admits"
+  );
+  drop(fut);
+
+  assert_eq!(
+    h.owner.source.ended_syncs,
+    vec![key("/a/cookie-1")],
+    "the completed cookie is reaped by PATH — the R7-1 write-first outcome"
+  );
+  assert!(
+    h.owner.source.cancelled_syncs.is_empty(),
+    "a completed write is NOT token-cancelled — the cancel fires only on abandon"
+  );
+  assert!(
+    h.owner.source.fs_delivered.is_empty(),
+    "the Ready step resolves the write; it does not side-effect-deliver"
+  );
+  assert!(
+    h.owner.pending_syncs.is_empty(),
+    "the gone caller's cookie is reaped inline, not parked (leak oracle)"
   );
 }
 

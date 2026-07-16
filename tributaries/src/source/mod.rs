@@ -566,6 +566,20 @@ pub trait LocalSource<C> {
     let _ = (handle, cookie_key);
   }
 
+  /// Abandons the sync identified by `token` — SYNCHRONOUS, non-blocking, fire-and-forget, in the
+  /// [`end_sync`](Self::end_sync)/[`disarm`](Self::disarm) mold. Called when the owner abandons an
+  /// IN-FLIGHT [`begin_sync`](Self::begin_sync) (the caller timed out, or a close won the owner's
+  /// race): the owner never learned the cookie's key — only a completed `begin_sync` returns it — but
+  /// it still knows the `token` it minted, and the binding recovers the sync's identity from it.
+  ///
+  /// The binding must ensure a cookie this sync ALREADY created — even one whose completion the owner
+  /// never read — is eventually removed, and that a write still in flight leaves no cookie behind when
+  /// it lands. Idempotent; a token whose sync already fully resolved is a no-op. Best-effort on an
+  /// abnormal teardown, exactly like `end_sync`.
+  fn cancel_sync(&mut self, handle: Self::Handle, token: SyncToken) {
+    let _ = (handle, token);
+  }
+
   /// Whether `key` names an artifact of the sync-barrier machinery — a cookie, whoever wrote
   /// it. A SYNCHRONOUS classify probe in the [`root_key`](Self::root_key) mold.
   ///
@@ -810,6 +824,20 @@ pub trait Source<C> {
     let _ = (handle, cookie_key);
   }
 
+  /// Abandons the sync identified by `token` — SYNCHRONOUS, non-blocking, fire-and-forget, in the
+  /// [`end_sync`](Self::end_sync)/[`disarm`](Self::disarm) mold. Called when the owner abandons an
+  /// IN-FLIGHT [`begin_sync`](Self::begin_sync) (the caller timed out, or a close won the owner's
+  /// race): the owner never learned the cookie's key — only a completed `begin_sync` returns it — but
+  /// it still knows the `token` it minted, and the binding recovers the sync's identity from it.
+  ///
+  /// The binding must ensure a cookie this sync ALREADY created — even one whose completion the owner
+  /// never read — is eventually removed, and that a write still in flight leaves no cookie behind when
+  /// it lands. Idempotent; a token whose sync already fully resolved is a no-op. Best-effort on an
+  /// abnormal teardown, exactly like `end_sync`.
+  fn cancel_sync(&mut self, handle: Self::Handle, token: SyncToken) {
+    let _ = (handle, token);
+  }
+
   /// Whether `key` names an artifact of the sync-barrier machinery — a cookie, whoever wrote
   /// it. A SYNCHRONOUS classify probe in the [`root_key`](Self::root_key) mold.
   ///
@@ -904,6 +932,10 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 
   fn end_sync(&mut self, handle: Self::Handle, cookie_key: &[C]) {
     <T as Source<C>>::end_sync(self, handle, cookie_key)
+  }
+
+  fn cancel_sync(&mut self, handle: Self::Handle, token: SyncToken) {
+    <T as Source<C>>::cancel_sync(self, handle, token)
   }
 
   fn is_sync_artifact(&self, key: &[C]) -> bool {

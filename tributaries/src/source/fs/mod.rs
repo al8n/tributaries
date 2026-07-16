@@ -575,6 +575,10 @@ impl<R> Source<OsString> for FsSource<R> {
         // is a transient, retryable refusal — surfaced as the dedicated `Busy` rather than a
         // write-failure the caller might read as terminal.
         SyncRootError::WriteInFlight => SyncError::Busy,
+        // The root's cookie cleanup is backlogged (too many unremoved cookies —
+        // a failing unlink the driver is retrying). No physical write happened;
+        // it is transient and retryable, the same shape as `WriteInFlight`.
+        SyncRootError::CleanupBacklog => SyncError::Busy,
         SyncRootError::Closed => SyncError::Closed,
         // The fs error type is `#[non_exhaustive]`: a variant added later is a
         // failed write until it is classified here, never a silent success.
@@ -594,6 +598,18 @@ impl<R> Source<OsString> for FsSource<R> {
     let path = key_to_path(cookie_key);
     self.flush_deferred_prunes();
     self.watcher.request_remove_cookie(path);
+  }
+
+  fn cancel_sync(&mut self, _handle: RootHandle, token: SyncToken) {
+    // The owner abandoned an in-flight `begin_sync` and never learned the cookie
+    // path — but it minted the token, so re-render the unique cookie NAME and
+    // hand it to the driver on the DEDICATED cleanup lane. The driver reaps the
+    // cookie if the write already landed, tombstones the name if the write is
+    // still in the pool (so its claim self-reaps), or drops the request if the
+    // sync already resolved. Runtime-free (a pure render + a `try_send`), like
+    // `end_sync`; the runtime-bearing cleanup lives in the driver.
+    self.flush_deferred_prunes();
+    self.watcher.request_cancel_sync(cookie_name(token));
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
