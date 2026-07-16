@@ -1110,12 +1110,15 @@ impl DriverCore {
   }
 
   /// Reports every set-cover fence that has settled since the last poll: each
-  /// scope with an unobserved reconcile whose re-arm work quiesced
-  /// ([`Monitor::rearm_settled`]) resolves ALL its pending fences at this one
-  /// settle instant — in FIFO open order, each with its recorded lossiness
-  /// ([`Applied`](CoverSettle::Applied) / [`Degraded`](CoverSettle::Degraded))
-  /// — plus every fence a scope teardown already resolved `Degraded`. The
-  /// driver polls this at its loop top, after feeding results back.
+  /// scope with an unobserved reconcile whose coverage work quiesced
+  /// ([`Monitor::coverage_settled`] — the counted re-arm work of
+  /// [`Monitor::rearm_settled`], plus the held-move and latent-cold-read
+  /// windows a sync cookie must not dispatch inside) resolves ALL its pending
+  /// fences at this one settle instant — in FIFO open order, each with its
+  /// recorded lossiness ([`Applied`](CoverSettle::Applied) /
+  /// [`Degraded`](CoverSettle::Degraded)) — plus every fence a scope teardown
+  /// already resolved `Degraded`. The driver polls this at its loop top,
+  /// after feeding results back.
   ///
   /// The settle observation is also where the applied-cover lie is repaired:
   /// a LOSSY window rewinds `applied_cover` to the settle floor (the provable
@@ -1127,7 +1130,7 @@ impl DriverCore {
     let mut settled = std::mem::take(&mut self.settled_covers);
     let scopes: Vec<ScopeId> = self.cover_fences.keys().copied().collect();
     for scope in scopes {
-      if !self.monitor.rearm_settled(scope) {
+      if !self.monitor.coverage_settled(scope) {
         continue;
       }
       let Some(entry) = self.cover_fences.remove(&scope) else {
@@ -1157,6 +1160,21 @@ impl DriverCore {
       }
     }
     settled
+  }
+
+  /// The cookie dispatch's deficit seam: re-signals `scope`'s standing
+  /// terminal coverage deficits through the Monitor (one fresh epoch-bumped
+  /// covering `Rescan` per site plus a bounded heal kick —
+  /// [`Monitor::resignal_coverage_deficits`]), then drains, so the `Rescan`
+  /// effects are queued BEFORE the caller dispatches the parked cookie write.
+  /// Returns whether anything was re-signaled; a no-op for a scope with no
+  /// deficit or a kernel-recursive one.
+  pub(crate) fn resignal_coverage_deficits(&mut self, scope: ScopeId) -> bool {
+    let signaled = self.monitor.resignal_coverage_deficits(scope);
+    if signaled {
+      self.drain_monitor();
+    }
+    signaled
   }
 
   /// Feeds the blocking spawn's outcome for `scope`'s stream.

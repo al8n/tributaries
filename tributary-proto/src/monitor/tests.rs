@@ -3516,7 +3516,7 @@ fn random_op_storm_holds_invariants_and_terminates() {
       m.assert_invariants();
 
       let now = at(step + 1);
-      match rng() % 6 {
+      match rng() % 7 {
         0 => {
           let w = watches[(rng() as usize) % watches.len()];
           let res = if rng() % 8 == 0 {
@@ -3561,6 +3561,13 @@ fn random_op_storm_holds_invariants_and_terminates() {
         }
         3 => m.on_overflow(scopes[(rng() as usize) % scopes.len()].clone(), now),
         4 => m.handle_timeout(at(step + 1 + rng() % 400)),
+        5 => {
+          // The barrier's dispatch-time deficit re-signal, interleaved with
+          // everything else: the optimistic clear, the heal kicks, and the
+          // bridge flush must hold the invariants under any schedule.
+          let s = if rng() % 2 == 0 { scope(1) } else { scope(2) };
+          let _ = m.resignal_coverage_deficits(s);
+        }
         _ => {
           let w = watches[(rng() as usize) % watches.len()];
           m.on_os_record(OsRecord::new(w, RecordKind::Ignored), now);
@@ -7258,4 +7265,753 @@ fn a_late_arm_result_for_a_rebound_child_is_ignored() {
     "a dead arm starts nothing"
   );
   assert!(drain_events(&mut m).is_empty(), "and announces nothing");
+}
+
+// ---------------------------------------------------------------------------
+// Barrier honesty: level-persistent coverage deficits (the F1/F2 class).
+//
+// A sync barrier's fence reads `coverage_settled`, and its cookie dispatch
+// re-signals `resignal_coverage_deficits` — these cells pin the Monitor half
+// of the no-false-`Delivered` property: every bridge window closes with a
+// covering `Rescan`, every standing hole re-signals ahead of a dispatch, and
+// the two fence gates (holds, latent cold reads) hold the window open.
+// ---------------------------------------------------------------------------
+
+/// Installs a live, enumerated child directory `name` under `parent` — the
+/// realistic precondition for the hole/hold cells (a settled subtree).
+fn live_child_dir(m: &mut Monitor, parent: WatchId, name: &str) -> WatchId {
+  m.on_os_record(
+    OsRecord::new(parent, RecordKind::Created)
+      .with_name(seg(name))
+      .with_is_dir(true),
+    at(1),
+  );
+  let child = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  m.on_watch_result(child, Ok(()));
+  let boot = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == child)
+        .map(|e| e.req())
+    })
+    .expect("the armed child cold-enumerates");
+  m.on_enumerate(boot, EnumerateResult::Ok(vec![]));
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+  child
+}
+
+/// A1 (F1): the replace-rebuild bridge window closes with ONE root `Rescan`
+/// whose epoch strictly dominates the commit `Rescan`'s — so a change that
+/// landed after the commit but before a rebuilt directory's watch armed is ≤
+/// a delivered `Rescan`. Fails on old: the stream ended at the commit
+/// `Rescan`, and the whole bridge interval was silently lost.
+#[test]
+fn a_replace_rebuild_settle_emits_a_closing_rescan() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // The descending replace, as the core drives it: rebind, then the commit
+  // overflow (whose re-arm kickoff folds into the reset root's pending arm).
+  assert_eq!(m.rebind_root(scope(1)), Some(root));
+  m.on_overflow(Scope::Root(scope(1)), at(1));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "exactly the commit Rescan: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  let commit_epoch = events[0].epoch();
+  let _ = drain_actions(&mut m);
+
+  // The driver replays the pre-armed root; its re-arm read lists a fresh
+  // directory `a` — the bridge: `a`'s content changes are dark until its
+  // watch arms, and the re-arm read suppresses `Created`.
+  m.on_watch_result(root, Ok(()));
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the rebound root re-arm-enumerates");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "the fresh install keeps the window open"
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the rebuild announces nothing mid-window"
+  );
+  let a_watch = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the rebuilt directory arms");
+  m.on_watch_result(a_watch, Ok(()));
+  assert!(drain_events(&mut m).is_empty());
+  let a_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the rebuilt directory re-arm-enumerates");
+
+  // The settle edge: the window was lossy (commit Rescan) AND armed
+  // suppressed coverage (`a`) — the closing Rescan covers the bridge.
+  m.on_enumerate(a_read, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(scope(1)));
+  assert!(m.coverage_settled(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    1,
+    "the settle edge emits ONE closing Rescan: {events:?}"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  assert!(
+    events[0].epoch() > commit_epoch,
+    "the closing Rescan strictly dominates the commit"
+  );
+}
+
+/// A2 (regrow guard, fail-on-overreach): a clean prune-then-regrow window —
+/// `fresh_rearm` set, no loss — emits NO `Rescan` and no `Created`. Guards
+/// the two-bit conjunction: firing on `fresh_rearm` alone would degrade
+/// every set-cover regrow of pruned coverage.
+#[test]
+fn a_clean_regrow_window_emits_nothing() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let a = live_child_dir(&mut m, root, "a");
+
+  // The umbrella prune, then the grow back.
+  assert!(m.drop_watch_subtree(a));
+  let _ = drain_actions(&mut m);
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the grow re-arm-enumerates the ancestor");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  let fresh = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the pruned directory re-installs");
+  m.on_watch_result(fresh, Ok(()));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the re-installed directory re-arm-enumerates");
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a clean regrow owes nothing — no Rescan, no Created"
+  );
+}
+
+/// A3 (F2a): a child arm failure records a standing slot hole past its edge
+/// `Rescan`; the dispatch-time re-signal emits a fresh covering `Rescan` at
+/// the hole plus a bounded heal kick and optimistically clears it; a re-fail
+/// re-records (with its own edge `Rescan`); a heal closes the window with the
+/// closing `Rescan` and empties the book. Fails on old: after the edge
+/// `Rescan`, `rearm_settled` is instantly and permanently true with nothing
+/// recorded — the paired assertions document the fixed lie.
+#[test]
+fn an_arm_refused_slot_is_recorded_resignaled_and_healed() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // Open the hole: discovery installs `a`, the kernel refuses the watch.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let a1 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  let _ = drain_events(&mut m);
+  m.on_watch_result(a1, Err(WatchError::NoSpace));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "the edge Rescan: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  let edge_epoch = events[0].epoch();
+
+  // The fixed lie, documented: the scope reads settled while the darkness
+  // stands — only the deficit book carries the fact.
+  assert!(m.rearm_settled(scope(1)));
+  assert!(m.coverage_settled(scope(1)));
+  assert!(m.has_coverage_deficit(scope(1)));
+
+  // The dispatch-time re-signal: a fresh covering Rescan at the hole's
+  // CURRENT location, one heal kick at the parent, the entry cleared.
+  assert!(m.resignal_coverage_deficits(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "one covering Rescan per site: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  assert!(events[0].epoch() > edge_epoch, "epoch-bumped, not a replay");
+  let kick = drain_actions(&mut m);
+  assert!(
+    kick
+      .iter()
+      .any(|a| a.as_enumerate().is_some_and(|e| e.dir() == root)),
+    "the heal kick re-reads the hole's parent: {kick:?}"
+  );
+  assert!(
+    !m.has_coverage_deficit(scope(1)),
+    "the re-signaled entry is optimistically cleared"
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "the kick is counted work — the next fence parks on it"
+  );
+
+  // The kick re-installs the slot; the arm fails again: the failure edge
+  // re-records the hole (its own edge Rescan included) BEFORE the settle.
+  let kick_req = kick
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the kicked read");
+  m.on_enumerate(
+    kick_req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  let a2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the heal re-installs the slot");
+  m.on_watch_result(a2, Err(WatchError::NoSpace));
+  assert!(m.has_coverage_deficit(scope(1)), "the re-fail re-records");
+  assert!(m.rearm_settled(scope(1)));
+  let events = drain_events(&mut m);
+  // The re-fail's edge Rescan at the hole, then the window's closing Rescan
+  // at the root (lossy + armed-suppressed — both bits).
+  assert_eq!(events.len(), 2, "{events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &Location::new());
+  assert!(events[1].epoch() > events[0].epoch());
+
+  // Heal: re-signal again, and this time the arm succeeds. The heal window
+  // closes with the closing Rescan and the book stays empty.
+  assert!(m.resignal_coverage_deficits(scope(1)));
+  let _ = drain_events(&mut m);
+  let kick_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the second heal kick");
+  m.on_enumerate(
+    kick_req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  let a3 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the heal re-installs the slot again");
+  m.on_watch_result(a3, Ok(()));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the healed slot re-arm-enumerates");
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "the heal's closing Rescan: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  assert!(!m.has_coverage_deficit(scope(1)), "the hole is healed");
+  assert!(
+    !m.resignal_coverage_deficits(scope(1)),
+    "a healed scope re-signals nothing"
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "and a no-op re-signal emits nothing"
+  );
+  m.assert_invariants();
+}
+
+/// A4 (F2b): an exhausted re-arm read records a standing interior hole; the
+/// re-signal emits at the interior and kicks a fresh read; a clean completion
+/// that installs a gap-created directory closes the window with the closing
+/// `Rescan`. Fails on old: after the standing `Rescan`, nothing is recorded
+/// and nothing precedes a later sync's cookie.
+#[test]
+fn an_exhausted_read_interior_is_recorded_resignaled_and_healed() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // Discovery installs and arms `a`; its reads fail to exhaustion
+  // (the cold read plus REARM_MAX_RETRIES re-arm retries).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let a = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  let _ = drain_events(&mut m);
+  m.on_watch_result(a, Ok(()));
+  for round in 0..=REARM_MAX_RETRIES {
+    let req = drain_actions(&mut m)
+      .iter()
+      .find_map(|x| x.as_enumerate().filter(|e| e.dir() == a).map(|e| e.req()))
+      .unwrap_or_else(|| panic!("round {round}: a read is outstanding"));
+    m.on_enumerate(req, EnumerateResult::Failed(IoClass::Permission));
+    let events = drain_events(&mut m);
+    assert!(
+      events.iter().any(|e| e.kind().is_rescan()),
+      "round {round}: each incomplete read stands a Rescan: {events:?}"
+    );
+  }
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "exhaustion queues no further retry"
+  );
+  assert!(m.rearm_settled(scope(1)), "the node stays Live");
+  assert!(m.has_coverage_deficit(scope(1)), "the interior is recorded");
+
+  // Re-signal: a covering Rescan at the interior plus a kicked read of it.
+  assert!(m.resignal_coverage_deficits(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  let kick_req = drain_actions(&mut m)
+    .iter()
+    .find_map(|x| x.as_enumerate().filter(|e| e.dir() == a).map(|e| e.req()))
+    .expect("the heal kick re-reads the interior");
+  assert!(!m.has_coverage_deficit(scope(1)), "optimistically cleared");
+  assert!(!m.rearm_settled(scope(1)), "the kick is counted");
+
+  // The heal: a clean read listing the gap-created directory `b` — its
+  // suppressed install is exactly what the closing Rescan must cover.
+  m.on_enumerate(
+    kick_req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::Dir)]),
+  );
+  let b = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the gap-created directory installs");
+  m.on_watch_result(b, Ok(()));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the fresh install re-arm-enumerates");
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "the closing Rescan: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  assert!(!m.has_coverage_deficit(scope(1)));
+  assert!(!m.resignal_coverage_deficits(scope(1)));
+  m.assert_invariants();
+}
+
+/// A5 (record heal): a delivered `Removed` for a recorded hole's slot clears
+/// the deficit — the consumer converged on the removal, so the next
+/// re-signal is a no-op. Book-lifecycle precision.
+#[test]
+fn a_removed_record_clears_a_recorded_slot_hole() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let a = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  m.on_watch_result(a, Err(WatchError::NoSpace));
+  assert!(m.has_coverage_deficit(scope(1)));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(2),
+  );
+  assert!(
+    !m.has_coverage_deficit(scope(1)),
+    "the delivered removal converged the slot"
+  );
+  assert!(!m.resignal_coverage_deficits(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "just the Removed itself: {events:?}");
+  assert!(events[0].kind().is_removed());
+  m.assert_invariants();
+}
+
+/// A6 (collapse): past `DEFICIT_CAP` fine entries the book collapses to a
+/// whole-scope marker — ONE root `Rescan` plus ONE root re-arm kick per
+/// re-signal, whatever the failure count — and re-failures after the kicked
+/// crawl re-record. Bounds memory and re-signal work under mass failure.
+#[test]
+fn a_mass_failure_collapses_the_book_to_one_root_resignal() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // DEFICIT_CAP + 1 refused arms: the 17th record collapses the book.
+  for i in 0..=DEFICIT_CAP {
+    let name = std::format!("d{i:02}");
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::Created)
+        .with_name(seg(&name))
+        .with_is_dir(true),
+      at(1 + i as u64),
+    );
+    let w = drain_actions(&mut m)
+      .iter()
+      .find_map(|a| a.as_watch().map(|w| w.id()))
+      .expect("each discovered directory arms");
+    m.on_watch_result(w, Err(WatchError::NoSpace));
+    let _ = drain_events(&mut m);
+  }
+  assert!(m.has_coverage_deficit(scope(1)));
+
+  // One root Rescan, one root kick — never one per hole.
+  assert!(m.resignal_coverage_deficits(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "ONE root Rescan: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  let kicks = drain_actions(&mut m);
+  let reads: Vec<ReqId> = kicks
+    .iter()
+    .filter_map(|a| a.as_enumerate().map(|e| e.req()))
+    .collect();
+  assert_eq!(reads.len(), 1, "ONE root re-arm kick: {kicks:?}");
+  assert!(!m.has_coverage_deficit(scope(1)), "the marker is consumed");
+
+  // The kicked crawl re-attempts everything; still-broken slots re-record
+  // through their own failure edges (and collapse again past the cap).
+  let listing: Vec<DirEntry> = (0..=DEFICIT_CAP)
+    .map(|i| DirEntry::new(seg(&std::format!("d{i:02}")), FileKind::Dir))
+    .collect();
+  m.on_enumerate(reads[0], EnumerateResult::Ok(listing));
+  let arms: Vec<WatchId> = drain_actions(&mut m)
+    .iter()
+    .filter_map(|a| a.as_watch().map(|w| w.id()))
+    .collect();
+  assert_eq!(arms.len(), 1 + DEFICIT_CAP, "every hole re-attempts");
+  for w in arms {
+    m.on_watch_result(w, Err(WatchError::NoSpace));
+  }
+  assert!(m.has_coverage_deficit(scope(1)), "re-failures re-record");
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().all(|e| e.kind().is_rescan()),
+    "failure edges and the closing Rescan only: {events:?}"
+  );
+  assert_eq!(
+    events.last().map(|e| e.location()),
+    Some(&Location::new()),
+    "the lossy, fresh-armed window closes at the root: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// A7 (hijack): a pure grow whose direct target is a COLD-arming node (a
+/// discovery racing the grow) converts it re-arm-flavored — suppressing the
+/// cold `Created`s — so the conversion site stands a `Rescan` and the window
+/// closes with the closing `Rescan`. Fails on old: zero `Rescan`s — the
+/// suppressed discovery was silent loss.
+#[test]
+fn a_grow_hijacking_a_cold_arming_node_stands_covering_rescans() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // The racing discovery: `a` is installed and still arming (cold).
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let a = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  let _ = drain_events(&mut m);
+
+  // The grow lands on it: the conversion-site Rescan stands first.
+  assert!(m.rearm_watch_subtree(a).is_started());
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "the conversion-site Rescan: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+
+  // The post-arm read is re-arm-flavored: content is reconciled, never
+  // announced — the file emits nothing, the directory installs suppressed.
+  m.on_watch_result(a, Ok(()));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|x| x.as_enumerate().filter(|e| e.dir() == a).map(|e| e.req()))
+    .expect("the converted node reads re-arm-flavored");
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("f"), FileKind::File),
+      DirEntry::new(seg("b"), FileKind::Dir),
+    ]),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the hijacked discovery is Created-suppressed"
+  );
+  let b = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the suppressed child directory is reconciled");
+  m.on_watch_result(b, Ok(()));
+  let b_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the cascade reads the child");
+  m.on_enumerate(b_read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "the closing Rescan: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  m.assert_invariants();
+}
+
+/// A8 (the two fence gates): `coverage_settled` is false across a held move
+/// source (until pairing or timeout) and across a latent coalesced cold read
+/// (until its completion's escalation drains) — the exact windows where
+/// `rearm_settled` reads true while a covering `Rescan` is still owed.
+#[test]
+fn coverage_settled_gates_holds_and_latent_cold_reads() {
+  // Half 1: the hold, resolved by PAIRING.
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let _d = live_child_dir(&mut m, root, "d");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert!(m.rearm_settled(scope(1)), "a hold is not counted work");
+  assert!(!m.coverage_settled(scope(1)), "but it gates the fence");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(20),
+  );
+  assert!(
+    m.coverage_settled(scope(1)),
+    "a clean pairing releases the gate"
+  );
+  m.assert_invariants();
+
+  // Half 1b: the hold, resolved by TIMEOUT.
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let _d = live_child_dir(&mut m, root, "d");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert!(!m.coverage_settled(scope(1)));
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  assert!(
+    m.coverage_settled(scope(1)),
+    "the stranded half's resolution releases the gate"
+  );
+  m.assert_invariants();
+
+  // Half 2: the latent coalesced cold read.
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let d = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  m.on_watch_result(d, Ok(()));
+  let cold = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the cold discovery read is in flight");
+  let _ = drain_events(&mut m);
+  // A located loss folds its re-arm into the in-flight cold read: the
+  // kickoff is Coalesced and `rearm_settled` keeps reading true.
+  m.on_overflow(SubtreeScope::new(d).into(), at(2));
+  assert!(m.rearm_settled(scope(1)), "the folded obligation is latent");
+  assert!(!m.coverage_settled(scope(1)), "but it gates the fence");
+  let _ = drain_events(&mut m);
+  // The completion escalates: a covering Rescan plus a COUNTED retry — the
+  // gate hands over to `rearm_settled` with no unfenced instant.
+  m.on_enumerate(cold, EnumerateResult::Ok(vec![]));
+  assert!(!m.coverage_settled(scope(1)), "the escalation is counted");
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "the dirtied completion stands its Rescan: {events:?}"
+  );
+  let retry = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the escalation's counted retry");
+  m.on_enumerate(retry, EnumerateResult::Ok(vec![]));
+  assert!(m.coverage_settled(scope(1)), "the escalation drained");
+  m.assert_invariants();
+}
+
+/// A9 (teardown GC): every new map — bridge flags, deficit book, held
+/// counts, latent reads — is reclaimed with its scope, so a torn-down scope
+/// leaves no residue and a fresh registration starts clean. (The recount and
+/// anchor-liveness properties themselves run inside `assert_invariants`,
+/// exercised by the storm and by every cell here.)
+#[test]
+fn teardown_reclaims_all_barrier_bookkeeping() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // A standing hole, a held source, and a latent cold read, all at once.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let a = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("a arms");
+  m.on_watch_result(a, Err(WatchError::NoSpace));
+  let _d = live_child_dir(&mut m, root, "d");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("c"))
+      .with_is_dir(true),
+    at(3),
+  );
+  let c = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("c arms");
+  m.on_watch_result(c, Ok(()));
+  let _ = drain_actions(&mut m);
+  m.on_overflow(SubtreeScope::new(c).into(), at(4));
+  assert!(m.has_coverage_deficit(scope(1)));
+  assert!(!m.coverage_settled(scope(1)));
+
+  m.unregister_root(scope(1));
+  assert!(!m.has_coverage_deficit(scope(1)));
+  assert!(
+    m.coverage_settled(scope(1)),
+    "a dead scope is trivially settled"
+  );
+  assert!(!m.resignal_coverage_deficits(scope(1)));
+  m.assert_invariants();
+}
+
+/// A10 (organic pure-grow heal): a clean grow crawl that re-installs a
+/// standing hole's slot closes its window with the closing `Rescan` — the
+/// heal-clear edge sets BOTH bits itself, because the loss fact travels with
+/// the book entry, not with a sticky `saw_rescan`. Contrast A2 (the same
+/// grow with no hole emits nothing). Fails on old: the clean crawl
+/// re-installs suppressed and emits NOTHING — the hole's dark interval is
+/// never covered.
+#[test]
+fn an_organic_grow_healing_a_hole_emits_the_closing_rescan() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  // The hole: discovery installs `a`, the kernel refuses the watch.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let a1 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  m.on_watch_result(a1, Err(WatchError::NoSpace));
+  let _ = drain_events(&mut m);
+  assert!(m.has_coverage_deficit(scope(1)));
+
+  // An otherwise-clean grow reaches the hole: no Rescan of its own, but the
+  // slot re-install is the heal edge.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the grow re-arm-enumerates");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  let a2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the hole's slot re-installs");
+  m.on_watch_result(a2, Ok(()));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the healed slot re-arm-enumerates");
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "nothing is announced mid-window"
+  );
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    1,
+    "the heal window closes with the closing Rescan: {events:?}"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  assert!(!m.has_coverage_deficit(scope(1)), "the hole is gone");
+  m.assert_invariants();
 }

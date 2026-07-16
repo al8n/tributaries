@@ -84,6 +84,70 @@ impl NodeState {
   }
 }
 
+/// Fine-grained [`DeficitBook`] entries per scope before the book collapses to a
+/// whole-scope marker. Bounds re-signal work and memory under mass failure (an
+/// inotify watch-limit exhaustion mid-crawl records one hole per refused arm).
+const DEFICIT_CAP: usize = 16;
+
+/// Per-scope bridge-window bookkeeping: an entry exists only while at least one
+/// bit is set, and only ever for a descending scope.
+///
+/// `saw_rescan` records that a `Rescan` passed for the scope since its last
+/// settle edge; `fresh_rearm` that a node entered `Arming { rearm: true }` (a
+/// `Created`-suppressed fresh install) in the same window. At the settle edge
+/// ([`Monitor::settle_bridges`]) the CONJUNCTION emits one closing `Rescan`:
+/// the window was both lossy and armed suppressed coverage, so a change that
+/// landed after the window's opening `Rescan` but before a bridge directory's
+/// watch armed — recorded by nothing, suppressed by the re-arm read — is ≤ the
+/// closing `Rescan` a sync barrier's fence must observe. Either bit alone must
+/// NOT fire: `saw_rescan` alone is a lossy window that armed nothing fresh
+/// (every watch stayed armed, post-`Rescan` changes were recorded live), and
+/// `fresh_rearm` alone is a pure set-cover regrow of pruned coverage (the
+/// region was outside every committed claim; firing would degrade every
+/// prune/regrow cycle).
+#[derive(Debug, Clone, Copy, Default)]
+struct BridgeFlags {
+  saw_rescan: bool,
+  fresh_rearm: bool,
+}
+
+/// Per-scope standing terminal coverage deficits: level-persistent darkness
+/// whose one edge `Rescan` (emitted when the deficit opened) does not cover
+/// changes landing while it stands. An entry exists only while non-empty (or
+/// collapsed), and only ever for a descending scope.
+///
+/// The book is what lets the cookie-dispatch seam
+/// ([`Monitor::resignal_coverage_deficits`]) put a fresh covering `Rescan`
+/// ahead of every sync cookie written over the darkness, so a barrier can
+/// never resolve delivered over a change the deficit hid.
+#[derive(Debug, Default)]
+struct DeficitBook {
+  /// Arm-refused slots: `(parent, name)` has an on-disk directory the kernel
+  /// refused to watch (the failed install's subtree was dropped).
+  slots: BTreeMap<WatchId, BTreeSet<Segment>>,
+  /// Exhausted-read interiors: this live watch's content could not be
+  /// reconciled within the bounded retries; gap-created descendants under it
+  /// may be unarmed.
+  interiors: BTreeSet<WatchId>,
+  /// The fine-grained book overflowed [`DEFICIT_CAP`]: the whole scope is
+  /// suspect, re-signaled as one root `Rescan` plus one root re-arm kick.
+  /// While set the fine sets stay empty (collapse absorbs new records).
+  collapsed: bool,
+}
+
+impl DeficitBook {
+  /// Whether the book carries nothing — neither fine entries nor the
+  /// collapsed marker — and can be garbage-collected.
+  fn is_clear(&self) -> bool {
+    !self.collapsed && self.slots.is_empty() && self.interiors.is_empty()
+  }
+
+  /// Total fine-grained entries (slot holes plus interiors).
+  fn fine_len(&self) -> usize {
+    self.slots.values().map(BTreeSet::len).sum::<usize>() + self.interiors.len()
+  }
+}
+
 /// One node in the parent-relative watch tree.
 ///
 /// Paths are reconstructed by walking `parent` links to a root, so a node stores
@@ -325,6 +389,27 @@ pub struct Monitor {
   /// such a source's destination gets a `Rescan` and a re-arm rather than a silent move.
   dirtied_holds: BTreeSet<WatchId>,
 
+  /// Per-scope bridge-window flags (see [`BridgeFlags`]), flushed into a
+  /// closing `Rescan` at the scope's settle edge by
+  /// [`settle_bridges`](Self::settle_bridges).
+  bridge: BTreeMap<ScopeId, BridgeFlags>,
+  /// Per-scope standing terminal deficits (see [`DeficitBook`]), consumed by
+  /// [`resignal_coverage_deficits`](Self::resignal_coverage_deficits) and read
+  /// by [`has_coverage_deficit`](Self::has_coverage_deficit).
+  deficits: BTreeMap<ScopeId, DeficitBook>,
+  /// Per-scope count of detached-and-held move sources — the O(1) backing for
+  /// the holds conjunct of [`coverage_settled`](Self::coverage_settled).
+  /// Mirrors [`held_sources`](Self::held_sources) membership exactly, at its
+  /// three mutation sites.
+  held_by_scope: BTreeMap<ScopeId, usize>,
+  /// In-flight COLD reads carrying a coalesced re-arm obligation
+  /// ([`RearmKickoff::Coalesced`]), keyed by the read's unique [`ReqId`] — the
+  /// one latency [`rearm_settled`](Self::rearm_settled) deliberately does not
+  /// count, gated instead by the latent conjunct of
+  /// [`coverage_settled`](Self::coverage_settled). Removal mirrors
+  /// [`pending_enumerate`](Self::pending_enumerate) removal exactly.
+  latent_cold: BTreeMap<ReqId, ScopeId>,
+
   actions: VecDeque<Action>,
   events: VecDeque<Change>,
 }
@@ -350,6 +435,10 @@ impl Monitor {
       pending_moves: BTreeMap::new(),
       held_sources: BTreeSet::new(),
       dirtied_holds: BTreeSet::new(),
+      bridge: BTreeMap::new(),
+      deficits: BTreeMap::new(),
+      held_by_scope: BTreeMap::new(),
+      latent_cold: BTreeMap::new(),
       actions: VecDeque::new(),
       events: VecDeque::new(),
     }
@@ -522,7 +611,13 @@ impl Monitor {
       self.purge_scope_pending_moves(scope);
       self.scope_interests.remove(&scope);
       self.scope_profiles.remove(&scope);
+      // Terminal machinery owns coverage from here: the bridge window and the
+      // deficit book die with the scope (per-node drops already emptied the
+      // book's fine entries; this also reclaims a collapsed marker).
+      self.bridge.remove(&scope);
+      self.deficits.remove(&scope);
     }
+    self.settle_bridges();
   }
 
   /// Drops the watch subtree rooted at a **non-root** per-directory node `watch`,
@@ -550,14 +645,16 @@ impl Monitor {
   /// per-directory children — only its root node — so the driver never finds a
   /// non-root node to pass here, and shrink is naturally a no-op for it.
   pub fn drop_watch_subtree(&mut self, watch: WatchId) -> bool {
-    match self.nodes.get(&watch) {
+    let dropped = match self.nodes.get(&watch) {
       // A root (no parent) is never pruned in place; an unknown watch is already gone.
       Some(node) if node.parent.is_some() => {
         self.drop_subtree(watch);
         true
       }
       _ => false,
-    }
+    };
+    self.settle_bridges();
+    dropped
   }
 
   /// Re-arms the live per-directory watch subtree rooted at `watch` — the in-place **grow**
@@ -600,7 +697,24 @@ impl Monitor {
     if !self.scope_descends(scope) {
       return RearmKickoff::Refused;
     }
-    self.inherit_rearm(watch)
+    // The grow-hijack conversion: a COLD-arming target (a discovery racing
+    // this grow) is about to be converted re-arm-flavored, suppressing the
+    // `Created`s its post-arm read would have announced — in a window that may
+    // otherwise be clean. Stand the covering `Rescan` at the conversion site
+    // so the window's closing `Rescan` (the conversion sets `fresh_rearm`)
+    // has its loss half. Deliberately here and not in `inherit_rearm`:
+    // install-then-convert is the normal crawl sequence, and crawl-internal
+    // conversions already sit inside `saw_rescan` windows — emitting per
+    // gap-directory would spam one `Rescan` each.
+    if matches!(
+      self.nodes.get(&watch).map(|node| node.state),
+      Some(NodeState::Arming { rearm: false })
+    ) {
+      self.emit_rescan(scope, self.location_of(watch));
+    }
+    let kick = self.inherit_rearm(watch);
+    self.settle_bridges();
+    kick
   }
 
   /// Rebinds `scope`'s root to a NEW transport in place — the descending
@@ -640,15 +754,25 @@ impl Monitor {
       self.drop_subtree(child);
     }
     self.purge_scope_pending_moves(scope);
+    // The old world's standing deficits die with its transport: the commit's
+    // covering `Rescan` plus the full re-arm rebuild re-attempt everything,
+    // and a still-broken site re-records through its own failure edge. The
+    // BRIDGE entry deliberately survives — the commit `Rescan` the caller
+    // emits right after re-sets `saw_rescan` anyway, and the root reset below
+    // sets `fresh_rearm`; the flush cannot fire mid-rebind because the method
+    // ends with the root counted.
+    self.deficits.remove(&scope);
     // An old-world root read that will never be reported must not leak its
     // request slot (`drop_subtree` does this for children; the root survives).
     if let Some(NodeState::Enumerating { req, .. }) = self.nodes.get(&root).map(|node| node.state) {
       self.pending_enumerate.remove(&req);
+      self.latent_cold.remove(&req);
     }
     self.set_state(root, NodeState::Arming { rearm: true });
     if let Some(node) = self.nodes.get_mut(&root) {
       node.identity = None;
     }
+    self.settle_bridges();
     Some(root)
   }
 
@@ -673,9 +797,137 @@ impl Monitor {
     !self.rearm_pending.contains_key(&scope)
   }
 
+  /// Whether `scope` is settled for BARRIER purposes: no counted re-arm work
+  /// ([`rearm_settled`](Self::rearm_settled)), no detached-and-held move
+  /// source (whose suppressed records' covering `Rescan` has not been emitted
+  /// yet — it is owed only at the hold's pairing or timeout resolution), and
+  /// no in-flight cold read carrying a coalesced re-arm obligation (the one
+  /// latency `rearm_settled` deliberately does not count; its completion
+  /// escalates into a covering `Rescan` plus a counted retry). A fence built
+  /// on the bare re-arm predicate would settle inside either window and
+  /// dispatch a sync cookie no covering `Rescan` precedes. Trivially `true`
+  /// for a kernel-recursive scope (none of the three states is reachable) and
+  /// for an unknown or torn-down one.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn coverage_settled(&self, scope: ScopeId) -> bool {
+    self.rearm_settled(scope) && self.holds_settled(scope) && self.latent_settled(scope)
+  }
+
+  /// Whether `scope` has a standing terminal coverage deficit: an arm-refused
+  /// slot, an exhausted-read interior, or a collapsed whole-scope marker.
+  /// Such darkness is level-persistent — its opening `Rescan` does not cover
+  /// changes landing while it stands — so a sync cookie dispatched over it
+  /// must first
+  /// [`resignal_coverage_deficits`](Self::resignal_coverage_deficits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn has_coverage_deficit(&self, scope: ScopeId) -> bool {
+    self.deficits.contains_key(&scope)
+  }
+
+  /// Re-signals every standing terminal deficit of `scope`: emits one
+  /// epoch-bumped covering `Rescan` per site at the site's CURRENT location
+  /// (the scope root when the book collapsed), kicks one bounded re-arm at
+  /// each site's healing anchor, and optimistically clears the re-signaled
+  /// entries — a still-broken site re-records itself through its own failure
+  /// edge, with a fresh edge `Rescan`, before the kicked (counted) work can
+  /// settle. A site currently inside a held (mid-move) subtree keeps its
+  /// entry and dirties the hold instead, like every other held-subtree
+  /// activity: a `Rescan` there would name the stale pre-move path.
+  ///
+  /// Returns whether anything was re-signaled. A no-op (`false`) for a scope
+  /// with no deficit, an unknown scope, or a kernel-recursive one.
+  pub fn resignal_coverage_deficits(&mut self, scope: ScopeId) -> bool {
+    let signaled = self.resignal_deficits(scope);
+    self.settle_bridges();
+    signaled
+  }
+
+  /// Whether `scope` has no detached-and-held move source. O(1).
+  fn holds_settled(&self, scope: ScopeId) -> bool {
+    !self.held_by_scope.contains_key(&scope)
+  }
+
+  /// Whether `scope` has no in-flight cold read carrying a coalesced re-arm
+  /// obligation. O(latent) — the set is empty outside a loss racing a cold
+  /// discovery.
+  fn latent_settled(&self, scope: ScopeId) -> bool {
+    !self.latent_cold.values().any(|s| *s == scope)
+  }
+
+  /// [`resignal_coverage_deficits`](Self::resignal_coverage_deficits) minus
+  /// the public entry point's bridge flush.
+  fn resignal_deficits(&mut self, scope: ScopeId) -> bool {
+    let Some(&root) = self.roots.get(&scope) else {
+      return false;
+    };
+    if !self.scope_descends(scope) {
+      return false;
+    }
+    let Some(book) = self.deficits.get(&scope) else {
+      return false;
+    };
+    if book.collapsed {
+      // The whole scope is suspect: one root-covering `Rescan`, one full-tree
+      // heal probe (bounded — `start_rearm` refuses a pending or dead root,
+      // whose own arm outcome re-attempts coverage anyway).
+      self.emit_rescan(scope, Location::new());
+      let _ = self.start_rearm(root);
+      self.deficits.remove(&scope);
+      return true;
+    }
+    // Snapshot the sites: each emission and kick below mutates the monitor
+    // (and the entry removals mutate the book).
+    let interiors: std::vec::Vec<WatchId> = book.interiors.iter().copied().collect();
+    let slots: std::vec::Vec<(WatchId, Segment)> = book
+      .slots
+      .iter()
+      .flat_map(|(parent, names)| names.iter().map(|name| (*parent, name.clone())))
+      .collect();
+    let mut signaled = false;
+    for dir in interiors {
+      if let Some(hold) = self.in_held_subtree(dir) {
+        self.dirtied_holds.insert(hold);
+        continue;
+      }
+      self.emit_rescan(scope, self.location_of(dir));
+      let _ = self.start_rearm(dir);
+      if let Some(book) = self.deficits.get_mut(&scope) {
+        book.interiors.remove(&dir);
+      }
+      signaled = true;
+    }
+    for (parent, name) in slots {
+      if let Some(hold) = self.in_held_subtree(parent) {
+        self.dirtied_holds.insert(hold);
+        continue;
+      }
+      self.emit_rescan(scope, self.location_of(parent).child(name.clone()));
+      let _ = self.start_rearm(parent);
+      if let Some(book) = self.deficits.get_mut(&scope)
+        && let Some(names) = book.slots.get_mut(&parent)
+      {
+        names.remove(&name);
+        if names.is_empty() {
+          book.slots.remove(&parent);
+        }
+      }
+      signaled = true;
+    }
+    self.gc_deficit_book(scope);
+    signaled
+  }
+
   /// Ingests one normalized event.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn on_os_record(&mut self, rec: OsRecord, now: Instant) {
+    self.ingest_record(rec, now);
+    self.settle_bridges();
+  }
+
+  /// [`on_os_record`](Self::on_os_record) minus the public entry point's
+  /// bridge flush, which must run after ALL of a record's cascading —
+  /// including the fenced early returns.
+  fn ingest_record(&mut self, rec: OsRecord, now: Instant) {
     let Some(scope) = self.scope_of(rec.watch()) else {
       return;
     };
@@ -807,6 +1059,16 @@ impl Monitor {
   /// Handles the result of an [`Action::Enumerate`].
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn on_enumerate(&mut self, req: ReqId, res: EnumerateResult) {
+    self.ingest_enumerate(req, res);
+    self.settle_bridges();
+  }
+
+  /// [`on_enumerate`](Self::on_enumerate) minus the public entry point's
+  /// bridge flush, which must run after ALL of a result's cascading.
+  fn ingest_enumerate(&mut self, req: ReqId, res: EnumerateResult) {
+    // The read resolved (or was superseded): it can no longer carry a latent
+    // coalesced obligation. Mirrors the `pending_enumerate` removal below.
+    self.latent_cold.remove(&req);
     let Some(dir) = self.pending_enumerate.remove(&req) else {
       return;
     };
@@ -851,6 +1113,11 @@ impl Monitor {
       self.handle_incomplete_enumerate(dir, scope, &res, attempts, held.is_none());
       return;
     }
+
+    // A CLEAN completion fully reconciled this interior: a standing
+    // exhausted-read deficit for it is healed (the P2 clear edge; bridge bits
+    // iff the healing read was re-arm-flavored — see `clear_interior_deficit`).
+    self.clear_interior_deficit(scope, dir, kind == EnumKind::Rearm);
 
     match kind {
       // A cold read on a held dir is coverage-only; route it as a re-arm (no `Created`).
@@ -934,12 +1201,21 @@ impl Monitor {
       // permanently-unreadable directory escalates to the standing `Rescan` after a
       // bounded number of tries rather than spinning the driver.
       self.queue_enumerate(dir, EnumKind::Rearm, attempts + 1);
+    } else if deliver {
+      // Retries exhausted — the node stays `Live` and the `Rescan` stands. It is
+      // re-attempted the next time a reconciliation trigger for its scope re-arms it (a
+      // fresh overflow, an ancestor's incomplete read cascading down, or a sync
+      // cookie's deficit re-signal). A dedicated degraded state with its own backoff
+      // timer, so a transiently-unreadable directory self-heals without waiting for
+      // the next trigger, is a later refinement.
+      //
+      // The unreconciled interior is LEVEL-PERSISTENT darkness (gap-created
+      // descendants under it were never armed), so record it past its standing
+      // `Rescan`. The held case records nothing: the pairing re-arms the subtree
+      // fresh or the timeout tears it down behind a delivered `Removed`, and a
+      // post-pairing re-exhaustion is non-held and records then.
+      self.record_interior_deficit(scope, dir);
     }
-    // else: retries exhausted — the node stays `Live` and the `Rescan` stands. It is
-    // re-attempted the next time a reconciliation trigger for its scope re-arms it (a
-    // fresh overflow, or an ancestor's incomplete read cascading down). A dedicated
-    // degraded state with its own backoff timer, so a transiently-unreadable directory
-    // self-heals without waiting for the next trigger, is a later refinement.
   }
 
   /// Queues an [`Action::Enumerate`] for `dir` and moves it to
@@ -1002,9 +1278,15 @@ impl Monitor {
           },
         );
         // A dirtied re-arm read is already a counted obligation; a dirtied COLD read
-        // hides this trigger from the settle counter until its completion escalates.
+        // hides this trigger from the settle counter until its completion escalates —
+        // so it is tracked latent, holding the scope's barrier fence
+        // (`coverage_settled`) across the one window where `rearm_settled` reads
+        // true while a re-walk obligation is in flight.
         match kind {
-          EnumKind::Cold => RearmKickoff::Coalesced,
+          EnumKind::Cold => {
+            self.latent_cold.insert(req, scope);
+            RearmKickoff::Coalesced
+          }
           EnumKind::Rearm => RearmKickoff::Started,
         }
       }
@@ -1111,6 +1393,13 @@ impl Monitor {
   /// I/O failure — none may leave a node registered-but-not-live and silent.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn on_watch_result(&mut self, id: WatchId, res: Result<(), WatchError>) {
+    self.ingest_watch_result(id, res);
+    self.settle_bridges();
+  }
+
+  /// [`on_watch_result`](Self::on_watch_result) minus the public entry
+  /// point's bridge flush — a failed arm's drop can be the settle edge.
+  fn ingest_watch_result(&mut self, id: WatchId, res: Result<(), WatchError>) {
     let Some(node) = self.nodes.get_mut(&id) else {
       return;
     };
@@ -1157,6 +1446,18 @@ impl Monitor {
           self.invalidate_root(scope, id);
         } else {
           self.emit_rescan(scope, self.location_of(id));
+          // The refused slot is a LEVEL-PERSISTENT hole: the `Rescan` above
+          // covers only changes up to now, while the on-disk directory stays
+          // dark until something re-occupies or re-arms the slot. Record it
+          // (both links are `Some` — the node is a non-root) so every sync
+          // cookie dispatched over the darkness re-signals it first.
+          if let Some((parent, name)) = self
+            .nodes
+            .get(&id)
+            .and_then(|node| node.parent.zip(node.name.clone()))
+          {
+            self.record_slot_deficit(scope, parent, name);
+          }
           self.drop_subtree(id);
         }
       }
@@ -1219,6 +1520,7 @@ impl Monitor {
         }
       }
     }
+    self.settle_bridges();
   }
 
   /// Marks every held move source in `scope` (or all held sources, when `None`) dirtied,
@@ -1392,6 +1694,7 @@ impl Monitor {
         self.resolve_stored_half(pending);
       }
     }
+    self.settle_bridges();
   }
 
   /// Dequeues the next [`Action`] for the driver to execute, if any.
@@ -1476,8 +1779,13 @@ impl Monitor {
         if let Some(src) = src {
           self.detach_child(src);
           // Fence the held subtree from delivery: a record on it during the window would
-          // reconstruct through the stale pre-move path (see `in_held_subtree`).
-          self.held_sources.insert(src);
+          // reconstruct through the stale pre-move path (see `in_held_subtree`). The hold
+          // also gates the scope's barrier fence (`coverage_settled`): a record suppressed
+          // under it owes its covering `Rescan` only at resolution, so no sync cookie may
+          // dispatch before then.
+          if self.held_sources.insert(src) {
+            self.held_by_scope_inc(scope);
+          }
         }
         let pending = PendingMove {
           from_parent,
@@ -1555,7 +1863,9 @@ impl Monitor {
             // during it decides if the O(1) reparent alone suffices or the destination
             // must also be re-scanned. (A failed reparent drops `src`, whose teardown
             // also clears these sets, so removing here first is just the paired case.)
-            self.held_sources.remove(&src);
+            if self.held_sources.remove(&src) {
+              self.held_by_scope_dec(scope);
+            }
             let dirtied = self.dirtied_holds.remove(&src);
             if self.can_reparent(src, rec.watch()) && self.reparent(src, rec.watch(), name.clone())
             {
@@ -1936,6 +2246,12 @@ impl Monitor {
         if let Some(stale) = self.child_watch(parent, name) {
           self.drop_subtree(stale);
         }
+        // The slot's object is gone (or a never-watched file): a recorded
+        // arm-refused hole there is moot. No bridge bits — a record-driven
+        // emptying was DELIVERED (the consumer converges on the removal), and
+        // an enumerate-driven one happens inside a window whose own `Rescan`s
+        // carry the bits.
+        let _ = self.remove_slot_deficit(scope, parent, name);
       }
     }
   }
@@ -2027,6 +2343,10 @@ impl Monitor {
   fn invalidate_root(&mut self, scope: ScopeId, root: WatchId) {
     self.drop_subtree(root);
     self.purge_scope_pending_moves(scope);
+    // As for `unregister_root`: the caller's unconditional `Rescan` plus the
+    // teardown own coverage now — no bridge window or deficit book survives.
+    self.bridge.remove(&scope);
+    self.deficits.remove(&scope);
   }
 
   fn on_delete_self(&mut self, scope: ScopeId, rec: &OsRecord) {
@@ -2094,6 +2414,11 @@ impl Monitor {
   }
 
   fn emit_rescan(&mut self, scope: ScopeId, location: Location) {
+    // The bridge window learns of the loss FIRST, before the coalesce check:
+    // a trigger whose `Rescan` folds into a still-queued twin is still a loss
+    // in this window (the twin is undelivered, so the window's closing
+    // `Rescan` must still postdate it).
+    self.bridge_saw_rescan(scope);
     // A `Rescan` IS the reconciliation trigger: bump the generation FIRST so the Rescan,
     // and every later change for this scope, strictly dominates what the consumer holds.
     // But the coalesce is decided BEFORE the bump: a trigger whose Rescan would coalesce
@@ -2230,6 +2555,11 @@ impl Monitor {
     if node.state.is_rearm() {
       self.rearm_pending_inc(node.scope);
     }
+    // A node BORN into `Arming { rearm: true }` is the same suppressed fresh
+    // install as a transition into it (see `set_state`).
+    if matches!(node.state, NodeState::Arming { rearm: true }) {
+      self.bridge_fresh_rearm(node.scope);
+    }
     self.nodes.insert(id, node);
   }
 
@@ -2247,6 +2577,20 @@ impl Monitor {
     // child watch already covering `(parent, name)`.
     if self.child_index.contains_key(&(parent, name.clone())) {
       return;
+    }
+    // The slot-heal clear edge (the P2↔P1 interlock): occupying a recorded
+    // arm-refused hole heals it, and the hole's dark interval is covered only
+    // by the window's closing `Rescan` — so the heal sets BOTH bridge bits
+    // itself, order-robustly (an organic pure grow reaching the hole has no
+    // `Rescan` of its own). This is the ONE funnel every slot occupation
+    // passes through: `reconcile_slot`'s `Dir` arm, `rearm_enumerate`'s
+    // direct installs, and the incomplete-read reconciles all route here. (A
+    // record-driven cold re-install lands here too and sets the bits; its
+    // `Removed`+`Created` records already converged the consumer, so the
+    // resulting closing `Rescan` is redundant-but-legal, and rare.)
+    if self.remove_slot_deficit(scope, parent, &name) {
+      self.bridge_saw_rescan(scope);
+      self.bridge_fresh_rearm(scope);
     }
     let id = WatchId::new(self.watch_ids.mint());
     self.insert_node(
@@ -2320,10 +2664,16 @@ impl Monitor {
       // reverse map to grow without bound under repeated drop-while-enumerating.
       if let NodeState::Enumerating { req, .. } = node.state {
         self.pending_enumerate.remove(&req);
+        self.latent_cold.remove(&req);
       }
       // A dropped watch is no longer a held move source.
-      self.held_sources.remove(&id);
+      if self.held_sources.remove(&id) {
+        self.held_by_scope_dec(node.scope);
+      }
       self.dirtied_holds.remove(&id);
+      // Its deficit anchors die with it (see `drop_node_deficits` for why no
+      // bridge bits are owed here).
+      self.drop_node_deficits(node.scope, id);
       self.actions.push_back(Action::Unwatch(id));
     }
     // NOTE: a narrow subtree drop deliberately does NOT purge pending move halves.
@@ -2407,8 +2757,17 @@ impl Monitor {
     };
     let was = node.state.is_rearm();
     let is = state.is_rearm();
+    let entered_fresh = matches!(state, NodeState::Arming { rearm: true })
+      && !matches!(node.state, NodeState::Arming { rearm: true });
     let scope = node.scope;
     node.state = state;
+    // A node ENTERING `Arming { rearm: true }` is a `Created`-suppressed
+    // fresh install (or a cold→re-arm conversion whose discovery is now
+    // suppressed): the bridge window armed coverage whose content only a
+    // closing `Rescan` can instruct the consumer to re-read.
+    if entered_fresh {
+      self.bridge_fresh_rearm(scope);
+    }
     if was == is {
       return;
     }
@@ -2432,6 +2791,175 @@ impl Monitor {
       if *count == 0 {
         self.rearm_pending.remove(&scope);
       }
+    }
+  }
+
+  /// Counts one detached-and-held move source of `scope` — called iff the
+  /// `held_sources` insert actually inserted, so the count mirrors membership.
+  fn held_by_scope_inc(&mut self, scope: ScopeId) {
+    *self.held_by_scope.entry(scope).or_insert(0) += 1;
+  }
+
+  /// Counts one held move source of `scope` released — called iff the
+  /// `held_sources` remove actually removed, dropping the entry at zero.
+  fn held_by_scope_dec(&mut self, scope: ScopeId) {
+    if let Some(count) = self.held_by_scope.get_mut(&scope) {
+      *count -= 1;
+      if *count == 0 {
+        self.held_by_scope.remove(&scope);
+      }
+    }
+  }
+
+  /// Flushes every bridge window whose scope has settled — the tail of every
+  /// public mutating entry point, AFTER all synchronous cascading, so the
+  /// transient mid-call zero-crossings of the re-arm counter (a linear-chain
+  /// rebuild zeroes it at every level) are never observed. Cross-method
+  /// transient zeros cannot occur: a window's frontier is always counted —
+  /// each completing input re-raises the counter within its own call (an arm
+  /// success queues its read; a read completion installs-and-inherits), and
+  /// an un-arrived arm result holds `Arming { rearm: true }`.
+  ///
+  /// At each settle edge: a scope whose root is gone drops its entry
+  /// (teardown machinery owns coverage from there); a scope with BOTH bits
+  /// set emits the closing `Rescan` at the scope root (see [`BridgeFlags`]
+  /// for why the conjunction); either way the entry is removed — the window
+  /// is over, and a lossy window that armed nothing fresh must not leak its
+  /// `saw_rescan` into a later unrelated grow (a standing hole's loss fact
+  /// survives in the [`DeficitBook`] and re-enters through the heal edges).
+  /// The emit itself re-sets `saw_rescan`; removing the entry AFTER it leaves
+  /// the next window a clean slate.
+  fn settle_bridges(&mut self) {
+    if self.bridge.is_empty() {
+      return;
+    }
+    let flagged: std::vec::Vec<ScopeId> = self.bridge.keys().copied().collect();
+    for scope in flagged {
+      if !self.rearm_settled(scope) {
+        continue;
+      }
+      if self.roots.contains_key(&scope) {
+        let flags = self.bridge.get(&scope).copied().unwrap_or_default();
+        if flags.saw_rescan && flags.fresh_rearm {
+          self.emit_rescan(scope, Location::new());
+        }
+      }
+      self.bridge.remove(&scope);
+    }
+  }
+
+  /// Marks `scope`'s bridge window lossy — a `Rescan` passed. Set FIRST in
+  /// [`emit_rescan`](Self::emit_rescan) (a coalesced trigger is still a loss
+  /// in this window); a no-op for a kernel-recursive scope.
+  fn bridge_saw_rescan(&mut self, scope: ScopeId) {
+    if self.scope_descends(scope) {
+      self.bridge.entry(scope).or_default().saw_rescan = true;
+    }
+  }
+
+  /// Marks `scope`'s bridge window as having armed suppressed coverage — a
+  /// node entered `Arming { rearm: true }`. Fed by the two state funnels
+  /// ([`set_state`](Self::set_state) / [`insert_node`](Self::insert_node));
+  /// the descending gate is a belt (the state is unreachable elsewhere).
+  fn bridge_fresh_rearm(&mut self, scope: ScopeId) {
+    if self.scope_descends(scope) {
+      self.bridge.entry(scope).or_default().fresh_rearm = true;
+    }
+  }
+
+  /// Records an arm-refused slot hole `(parent, name)` in `scope`'s deficit
+  /// book (see [`DeficitBook::slots`]). The caller has already emitted the
+  /// edge `Rescan`; this carries the level-persistent fact past it.
+  fn record_slot_deficit(&mut self, scope: ScopeId, parent: WatchId, name: Segment) {
+    if !self.scope_descends(scope) {
+      return;
+    }
+    let book = self.deficits.entry(scope).or_default();
+    if book.collapsed {
+      return;
+    }
+    book.slots.entry(parent).or_default().insert(name);
+    Self::enforce_deficit_cap(book);
+  }
+
+  /// Records an exhausted-read interior hole for `dir` in `scope`'s book
+  /// (see [`DeficitBook::interiors`]).
+  fn record_interior_deficit(&mut self, scope: ScopeId, dir: WatchId) {
+    if !self.scope_descends(scope) {
+      return;
+    }
+    let book = self.deficits.entry(scope).or_default();
+    if book.collapsed {
+      return;
+    }
+    book.interiors.insert(dir);
+    Self::enforce_deficit_cap(book);
+  }
+
+  /// Collapses a book past [`DEFICIT_CAP`] to the whole-scope marker, keeping
+  /// memory and re-signal work bounded under mass failure.
+  fn enforce_deficit_cap(book: &mut DeficitBook) {
+    if book.fine_len() > DEFICIT_CAP {
+      book.slots.clear();
+      book.interiors.clear();
+      book.collapsed = true;
+    }
+  }
+
+  /// Removes a recorded slot hole, reporting whether one was recorded. No
+  /// bridge bits: the record-driven clears (a delivered `Removed`/`File`
+  /// occupant) converged the consumer on their own.
+  fn remove_slot_deficit(&mut self, scope: ScopeId, parent: WatchId, name: &Segment) -> bool {
+    let Some(book) = self.deficits.get_mut(&scope) else {
+      return false;
+    };
+    let Some(names) = book.slots.get_mut(&parent) else {
+      return false;
+    };
+    let removed = names.remove(name);
+    if names.is_empty() {
+      book.slots.remove(&parent);
+    }
+    self.gc_deficit_book(scope);
+    removed
+  }
+
+  /// The interior-heal clear edge: a CLEAN completion for `dir` reconciled
+  /// the interior a standing deficit said was dark. When the healing read was
+  /// re-arm-flavored its content was `Created`-suppressed, so the heal sets
+  /// BOTH bridge bits — the P2↔P1 interlock that guarantees the window closes
+  /// with a covering `Rescan` even when it was otherwise clean (an organic
+  /// pure grow reaching the hole). A clean COLD completion announced its
+  /// content and sets nothing.
+  fn clear_interior_deficit(&mut self, scope: ScopeId, dir: WatchId, rearm: bool) {
+    let Some(book) = self.deficits.get_mut(&scope) else {
+      return;
+    };
+    let removed = book.interiors.remove(&dir);
+    self.gc_deficit_book(scope);
+    if removed && rearm {
+      self.bridge_saw_rescan(scope);
+      self.bridge_fresh_rearm(scope);
+    }
+  }
+
+  /// Drops the fine entries anchored at a dying node — `drop_subtree`'s hook.
+  /// No bridge bits: the drop is record-delivered (converged), crawl-covered
+  /// (the rebuild's own installs re-set the bits), an umbrella prune
+  /// (unsubscribed by contract), or a teardown (terminal `Rescan`).
+  fn drop_node_deficits(&mut self, scope: ScopeId, id: WatchId) {
+    if let Some(book) = self.deficits.get_mut(&scope) {
+      book.interiors.remove(&id);
+      book.slots.remove(&id);
+      self.gc_deficit_book(scope);
+    }
+  }
+
+  /// Removes an emptied, uncollapsed book — the entry-present-only-while-
+  /// non-empty invariant.
+  fn gc_deficit_book(&mut self, scope: ScopeId) {
+    if self.deficits.get(&scope).is_some_and(DeficitBook::is_clear) {
+      self.deficits.remove(&scope);
     }
   }
 
@@ -2576,6 +3104,114 @@ impl Monitor {
       self.rearm_pending, recount,
       "the re-arm-pending counter matches a from-scratch recount"
     );
+    // The per-scope held-source counter equals a from-scratch recount of
+    // `held_sources` grouped by scope (its exact mirror, no zero entries).
+    let mut held_recount: BTreeMap<ScopeId, usize> = BTreeMap::new();
+    for held in &self.held_sources {
+      let scope = self
+        .scope_of(*held)
+        .expect("a held source is a live node (checked above)");
+      *held_recount.entry(scope).or_insert(0) += 1;
+    }
+    assert_eq!(
+      self.held_by_scope, held_recount,
+      "the held-by-scope counter matches a from-scratch recount"
+    );
+    // A bridge entry exists only for a registered, descending scope, and only
+    // while at least one bit is set (the flush removes it at every settle
+    // edge; a root-less scope is trivially settled, so none can linger).
+    for (scope, flags) in &self.bridge {
+      assert!(
+        flags.saw_rescan || flags.fresh_rearm,
+        "a bridge entry carries at least one set bit"
+      );
+      assert!(
+        self.roots.contains_key(scope),
+        "a bridge entry's scope has a registered root"
+      );
+      assert!(
+        self.scope_descends(*scope),
+        "a bridge entry's scope descends"
+      );
+    }
+    // A deficit book exists only for a registered, descending scope; it is
+    // non-empty or collapsed (never both: collapse absorbs the fine entries);
+    // its fine count respects the cap; and every anchor is a live node of the
+    // book's scope (`drop_subtree` reclaims a dying node's entries).
+    for (scope, book) in &self.deficits {
+      assert!(
+        self.roots.contains_key(scope),
+        "a deficit book's scope has a registered root"
+      );
+      assert!(
+        self.scope_descends(*scope),
+        "a deficit book's scope descends"
+      );
+      assert!(
+        !book.is_clear(),
+        "a deficit book is present only while non-empty (or collapsed)"
+      );
+      if book.collapsed {
+        assert!(
+          book.slots.is_empty() && book.interiors.is_empty(),
+          "a collapsed book holds no fine entries"
+        );
+      }
+      assert!(
+        book.fine_len() <= DEFICIT_CAP,
+        "the fine-grained book respects DEFICIT_CAP"
+      );
+      for (parent, names) in &book.slots {
+        assert!(!names.is_empty(), "no empty slot-hole set is retained");
+        let node = self
+          .nodes
+          .get(parent)
+          .expect("a slot hole's parent anchor is a live node");
+        assert_eq!(
+          node.scope, *scope,
+          "a slot hole's parent anchor belongs to the book's scope"
+        );
+      }
+      for dir in &book.interiors {
+        let node = self
+          .nodes
+          .get(dir)
+          .expect("an interior hole's anchor is a live node");
+        assert_eq!(
+          node.scope, *scope,
+          "an interior hole's anchor belongs to the book's scope"
+        );
+      }
+    }
+    // Every latent cold read is an outstanding request whose node still names
+    // it, reads COLD, was dirtied by the coalesced trigger, and belongs to the
+    // recorded scope — the exact mirror of the insert edge.
+    for (req, scope) in &self.latent_cold {
+      let dir = self
+        .pending_enumerate
+        .get(req)
+        .expect("a latent cold read is an outstanding enumerate");
+      let node = self
+        .nodes
+        .get(dir)
+        .expect("a pending enumerate maps to a live node (checked above)");
+      assert_eq!(
+        node.scope, *scope,
+        "a latent cold read belongs to the scope it was recorded under"
+      );
+      assert!(
+        matches!(
+          node.state,
+          NodeState::Enumerating {
+            req: r,
+            kind: EnumKind::Cold,
+            dirty: true,
+            ..
+          } if r == *req
+        ),
+        "a latent cold read's node holds the dirtied cold read"
+      );
+    }
   }
 
   fn location_of(&self, id: WatchId) -> Location {

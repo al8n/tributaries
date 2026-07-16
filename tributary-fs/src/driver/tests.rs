@@ -2172,14 +2172,27 @@ mod descending {
       rig.fs.heal_watch_at("/r/drop");
       let attempts = arms_at(&rig, "/r/drop");
       let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      // The re-attempted grow HEALS the standing arm-refused hole, and a heal
+      // window owes the hole's dark interval a closing Rescan — so this
+      // window is honestly Degraded (the caller's contract: re-issue once
+      // more), never a clean claim over darkness the failed arm left.
       assert_eq!(
         resolved(ack).await,
-        CoverOutcome::Applied,
-        "the re-issued grow settles clean over re-attempted coverage"
+        CoverOutcome::Degraded,
+        "the grow that heals the hole degrades — its closing Rescan is owed"
       );
       assert!(
         arms_at(&rig, "/r/drop") > attempts,
         "the rewound cover made the delta non-empty — the arm was re-attempted"
+      );
+
+      // The NEXT re-issue finds no hole and no fresh installs — survivors
+      // only — and settles clean: the degrade is self-resolving.
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "the hole-free re-issue settles clean over re-attempted coverage"
       );
     }
 
@@ -2511,11 +2524,12 @@ mod descending {
       "the new root pre-armed on the surviving watch id: {arms:?}"
     );
 
-    // Exactly one covering Rescan, re-rooted.
+    // The commit's covering Rescan, re-rooted.
     let (s, root, change) = next_rooted(&rig).await;
     assert_eq!(s, scope);
     assert_eq!(root.as_path(), std::path::Path::new("/r2"));
     assert!(change.kind().is_rescan(), "{change:?}");
+    let commit_epoch = change.epoch();
 
     // The rebuild walked the new tree and re-armed it — announcing nothing.
     settle(|| {
@@ -2534,6 +2548,19 @@ mod descending {
         .any(|(_, p)| p == std::path::Path::new("/r2/sub")),
       "the rebuild re-arms the new tree: {:?}",
       rig.fs.arms()
+    );
+
+    // The rebuild's settle closes the bridge window: a change landing after
+    // the commit but before a rebuilt watch armed is recorded by nothing and
+    // suppressed by the re-arm read, so the window owes a SECOND root Rescan
+    // whose epoch strictly dominates the commit's (replace = commit + close).
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!(s, scope);
+    assert_eq!(root.as_path(), std::path::Path::new("/r2"));
+    assert!(change.kind().is_rescan(), "{change:?}");
+    assert!(
+      change.epoch() > commit_epoch,
+      "the closing Rescan strictly dominates the commit: {change:?}"
     );
 
     // Post-swap records deliver under the new root.
@@ -2788,6 +2815,507 @@ mod descending {
         .any(|(_, p)| p == Path::new("/r2/child")),
       "the rebuild armed the new tree on the new transport"
     );
+  }
+
+  /// The barrier-honesty acceptance cells: on the descending backend, a sync
+  /// cookie must never dispatch ahead of the covering `Rescan` a
+  /// level-persistent deficit owes — a replace-rebuild bridge (C1), a standing
+  /// arm-refused or exhausted-read hole (C2/C3, bounded per C4), a held move
+  /// source (C5), or a latent coalesced cold read (C6). The umbrella turns any
+  /// delivered scope `Rescan` ordered ahead of the cookie's event into
+  /// `SyncOutcome::Dominated` through its two proven choke points
+  /// (`dominate_pending_syncs`, the `loss_gen` install snapshot), so the
+  /// queue-order facts pinned here are exactly the inputs barrier honesty
+  /// needs.
+  mod barrier_honesty {
+    use super::*;
+    use crate::os::linux::{RawInotifyEvent, RawLinuxEvent, inotify::decode::InotifyMask};
+
+    const IN_CREATE: u32 = 0x0000_0100;
+    const IN_MOVED_FROM: u32 = 0x0000_0040;
+    const IN_MOVED_TO: u32 = 0x0000_0080;
+    const IN_ISDIR: u32 = 0x4000_0000;
+
+    /// Dispatches a sync without awaiting it, returning the pending reply.
+    async fn sync_pending(
+      rig: &Rig,
+      scope: ScopeId,
+      dir: &str,
+      name: &str,
+    ) -> futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>> {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from(dir),
+          name: name.to_owned(),
+          reply,
+        })
+        .await
+        .unwrap();
+      on_reply
+    }
+
+    /// Dispatches a sync and awaits its cookie path, retrying the retryable
+    /// single-flight refusal (the previous write's `CookieWriteDone` is
+    /// asynchronous relative to its reply) and bounding the whole await so a
+    /// wedged fence fails the cell instead of hanging the suite.
+    async fn sync_ok(rig: &Rig, scope: ScopeId, dir: &str, name: &str) -> PathBuf {
+      for _ in 0..400 {
+        let pending = sync_pending(rig, scope, dir, name).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), pending)
+          .await
+          .expect("the sync resolves in bounded time — never parked forever")
+          .expect("the driver replies");
+        match outcome {
+          Ok(path) => return path,
+          Err(crate::error::SyncRootError::WriteInFlight) => {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+          }
+          Err(other) => panic!("unexpected sync error: {other:?}"),
+        }
+      }
+      panic!("the single-flight gate never admitted the sync");
+    }
+
+    /// Asserts the parked sync stays pending across generous scheduler slices
+    /// with `written` cookie writes on disk — the fence gate observable.
+    async fn assert_parked(
+      rig: &Rig,
+      pending: &mut futures_channel::oneshot::Receiver<
+        Result<PathBuf, crate::error::SyncRootError>,
+      >,
+      written: usize,
+    ) {
+      for _ in 0..40 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(&mut *pending).is_pending(),
+        "the sync is parked on the coverage gate"
+      );
+      assert_eq!(
+        rig.fs.cookie_writes().len(),
+        written,
+        "no cookie is written while the gate holds"
+      );
+    }
+
+    /// Reads events until a `Rescan` with an epoch strictly above `floor`
+    /// arrives, returning its epoch — the "a fresh covering Rescan precedes
+    /// the cookie" observable (the event was queued before the write
+    /// dispatched; `next_event`'s deadline fails the cell when it never comes).
+    async fn next_rescan_above(rig: &Rig, floor: Epoch) -> Epoch {
+      loop {
+        let (_scope, change) = next_event(rig).await;
+        if change.kind().is_rescan() && change.epoch() > floor {
+          return change.epoch();
+        }
+      }
+    }
+
+    /// Drains the event channel until it stays quiet across a settle window,
+    /// returning the highest `Rescan` epoch seen (or `floor`).
+    async fn drain_to_quiet(rig: &Rig, floor: Epoch) -> Epoch {
+      let mut top = floor;
+      let mut quiet = 0u32;
+      while quiet < 20 {
+        match rig.events.try_recv() {
+          Ok((_scope, _root, change)) => {
+            quiet = 0;
+            if change.kind().is_rescan() && change.epoch() > top {
+              top = change.epoch();
+            }
+          }
+          Err(_) => {
+            quiet += 1;
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+          }
+        }
+      }
+      top
+    }
+
+    /// C1 (F1, flagship): a sync issued while the replace rebuild is held
+    /// parks; a change landing in the held window (`put` with NO batch — dark:
+    /// its directory's watch is not armed yet, and the re-arm read suppresses
+    /// it) is covered by the closing `Rescan` the rebuild's settle emits, with
+    /// an epoch strictly above the commit's, QUEUED before the cookie write
+    /// dispatches. Fails on old: only the commit `Rescan` ever arrives and the
+    /// cookie precedes any later `Rescan` — the umbrella would read
+    /// `Delivered` over the dark change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_across_a_replace_rebuild_is_covered_by_the_closing_rescan() {
+      let rig = inotify_rig();
+      rig.fs.put("/r2", FileKind::Dir, 20);
+      rig.fs.put("/r2/a", FileKind::Dir, 21);
+      let scope = watch(&rig, "/r").await;
+      settle(|| {
+        rig
+          .fs
+          .enumerates()
+          .iter()
+          .any(|(_, p)| p == std::path::Path::new("/r"))
+      })
+      .await;
+
+      // Hold the rebuild's reads, then commit the replace.
+      let hold = rig.fs.hold_enumerates();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r2"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+          reply,
+        })
+        .await
+        .unwrap();
+      assert!(on_reply.await.expect("driver replies").is_ok());
+      let (_s, change) = next_event(&rig).await;
+      assert!(change.kind().is_rescan(), "the commit Rescan: {change:?}");
+      let commit_epoch = change.epoch();
+
+      // The barrier over the held rebuild parks; the dark change lands.
+      let mut pending = sync_pending(&rig, scope, "/r2", ".tributaries-sync-c1").await;
+      assert_parked(&rig, &mut pending, 0).await;
+      rig.fs.put("/r2/a/f", FileKind::File, 30);
+
+      // Release: the rebuild settles, the closing Rescan is queued, and only
+      // then does the write dispatch.
+      hold.release();
+      let path = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .expect("the sync resolves once the rebuild settles")
+        .expect("the driver replies")
+        .expect("the write lands");
+      let closing = next_rescan_above(&rig, commit_epoch).await;
+      assert!(closing > commit_epoch);
+      assert_eq!(rig.fs.cookie_writes(), vec![path]);
+    }
+
+    /// C2 (F2a, flagship): a sync over a standing arm-refused hole completes
+    /// (never parked forever) with a FRESH covering `Rescan` — epoch strictly
+    /// above the failure's — queued ahead of its cookie write, plus a bounded
+    /// heal re-attempt of the refused arm; after the hole heals, the healing
+    /// window closes with the closing `Rescan`, and a deficit-free sync adds
+    /// no `Rescan` at all. Fails on old: after the failure's one edge
+    /// `Rescan`, NOTHING precedes any later sync's cookie — the umbrella would
+    /// read `Delivered` over changes in the permanently-dark subtree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_over_an_arm_refused_hole_resignals_then_heals() {
+      let fs = FakeFs::new(1);
+      fs.put("/r", FileKind::Dir, 1);
+      fs.put("/r/a", FileKind::Dir, 11);
+      fs.fail_watch_at("/r/a", tributary_proto::WatchError::NoSpace);
+      let rig = inotify_rig_fs(fs);
+      let scope = watch(&rig, "/r").await;
+
+      // Boot: the refused arm's edge Rescan.
+      let edge = next_rescan_above(&rig, Epoch::START).await;
+      let arms_before = arms_at(&rig, "/r/a");
+
+      // Sync #1 over the standing hole: the refreshing Rescan precedes the
+      // cookie, and the heal kick re-attempts the arm (which fails again).
+      let path1 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c2-1").await;
+      let refreshed = next_rescan_above(&rig, edge).await;
+      assert_eq!(
+        rig.fs.cookie_writes(),
+        vec![path1],
+        "the write landed behind the refreshing Rescan"
+      );
+      settle(|| arms_at(&rig, "/r/a") > arms_before).await;
+      assert!(
+        arms_at(&rig, "/r/a") > arms_before,
+        "the heal kick re-attempted the refused arm"
+      );
+      let top = drain_to_quiet(&rig, refreshed).await;
+
+      // Heal, then sync #2: its re-signal + heal kick succeed, and the healing
+      // window closes with the closing Rescan.
+      rig.fs.heal_watch_at("/r/a");
+      let _path2 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c2-2").await;
+      let after_heal = next_rescan_above(&rig, top).await;
+      let quiet = drain_to_quiet(&rig, after_heal).await;
+
+      // Sync #3 over the healed scope: no deficit, no new Rescan.
+      let _path3 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c2-3").await;
+      let end = drain_to_quiet(&rig, quiet).await;
+      assert_eq!(end, quiet, "a deficit-free sync adds no Rescan");
+    }
+
+    /// C3 (F2b): a sync over an exhausted-read interior re-signals a fresh
+    /// covering `Rescan` and kicks a fresh read per degraded sync; once the
+    /// directory reads cleanly, a later sync adds nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_over_an_exhausted_read_interior_resignals_then_heals() {
+      let fs = FakeFs::new(1);
+      fs.put("/r", FileKind::Dir, 1);
+      fs.put("/r/a", FileKind::Dir, 11);
+      // The boot read and its bounded retries all fail: exhaustion.
+      for _ in 0..3 {
+        fs.enumerate_answer(
+          "/r/a",
+          crate::core::RawEnumerate::Failed(IoClass::Permission),
+        );
+      }
+      let rig = inotify_rig_fs(fs);
+      let scope = watch(&rig, "/r").await;
+      settle(|| enumerates_at(&rig, "/r/a") == 3).await;
+      assert_eq!(enumerates_at(&rig, "/r/a"), 3, "the read exhausted");
+      let floor = drain_to_quiet(&rig, Epoch::START).await;
+
+      // Sync #1: the still-failing interior re-signals and re-reads (the kick
+      // burns another failure ladder), staying degraded.
+      for _ in 0..3 {
+        rig.fs.enumerate_answer(
+          "/r/a",
+          crate::core::RawEnumerate::Failed(IoClass::Permission),
+        );
+      }
+      let reads = enumerates_at(&rig, "/r/a");
+      let _path1 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c3-1").await;
+      let refreshed = next_rescan_above(&rig, floor).await;
+      settle(|| enumerates_at(&rig, "/r/a") > reads).await;
+      assert!(
+        enumerates_at(&rig, "/r/a") > reads,
+        "the heal kick re-read the interior"
+      );
+      let top = drain_to_quiet(&rig, refreshed).await;
+
+      // Sync #2: the queued failures are burned — the kicked read now serves
+      // the real (clean) directory and the interior heals.
+      let _path2 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c3-2").await;
+      let after_heal = next_rescan_above(&rig, top).await;
+      let quiet = drain_to_quiet(&rig, after_heal).await;
+
+      // Sync #3: healed — no new Rescan.
+      let _path3 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c3-3").await;
+      let end = drain_to_quiet(&rig, quiet).await;
+      assert_eq!(end, quiet, "a healed interior owes later syncs nothing");
+    }
+
+    /// C4 (no-loop): a PERMANENTLY broken hole never parks a sync forever —
+    /// each of two sequential syncs completes in bounded time, each preceded
+    /// by its own fresh covering `Rescan` (strictly increasing epochs): an
+    /// unbounded sequence of honest `Dominated` barriers, never a wedged one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn syncs_over_a_permanently_broken_hole_stay_bounded() {
+      let fs = FakeFs::new(1);
+      fs.put("/r", FileKind::Dir, 1);
+      fs.put("/r/a", FileKind::Dir, 11);
+      fs.fail_watch_at("/r/a", tributary_proto::WatchError::NoSpace);
+      let rig = inotify_rig_fs(fs);
+      let scope = watch(&rig, "/r").await;
+      let edge = next_rescan_above(&rig, Epoch::START).await;
+
+      let _path1 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c4-1").await;
+      let first = next_rescan_above(&rig, edge).await;
+      let top = drain_to_quiet(&rig, first).await;
+      let _path2 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c4-2").await;
+      let second = next_rescan_above(&rig, top).await;
+      assert!(second > first, "each sync re-signals its own fresh Rescan");
+      assert_eq!(rig.fs.cookie_writes().len(), 2, "both writes landed");
+    }
+
+    /// C5 (P3, hold gate): a sync issued mid-rename-hold parks — the
+    /// suppressed under-hold record's covering `Rescan` is emitted only at the
+    /// pairing — and dispatches only after the pairing's `Rescan` is queued.
+    /// The rig's move window is stretched far past the parked-assertion's
+    /// real-time slices, so it is the PAIRING that releases the gate, never
+    /// the timeout racing the assertion. Fails on old: `rearm_settled` never
+    /// counted the hold, the cookie was written mid-window, and the pairing
+    /// `Rescan` arrived AFTER it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_mid_hold_parks_until_the_pairing_rescan() {
+      let fs = FakeFs::new(1);
+      fs.put("/r", FileKind::Dir, 1);
+      fs.put("/r/d", FileKind::Dir, 11);
+      fs.spawn_backend(BackendKind::Inotify);
+      let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+      let (reap_tx, reap_rx) = async_channel::unbounded();
+      let (ev_tx, ev_rx) = async_channel::bounded(64);
+      tokio::spawn(run::<TokioRuntime, FakeFs>(
+        DriverConfig {
+          move_window: Duration::from_secs(60),
+          ..inotify_config()
+        },
+        fs.clone(),
+        cmd_rx,
+        reap_rx,
+        ev_tx,
+        NullRegistry,
+      ));
+      let rig = Rig {
+        fs,
+        commands: cmd_tx,
+        cookie_removes: reap_tx,
+        events: ev_rx,
+      };
+      let scope = watch(&rig, "/r").await;
+      settle(|| {
+        rig
+          .fs
+          .arms()
+          .iter()
+          .any(|(_, p)| p == std::path::Path::new("/r/d"))
+      })
+      .await;
+      let root_watch = rig.fs.arms().first().cloned().expect("the root arm").0;
+      let d_watch = rig
+        .fs
+        .arms()
+        .iter()
+        .find(|(_, p)| p == std::path::Path::new("/r/d"))
+        .expect("the child arm")
+        .0;
+      let floor = drain_to_quiet(&rig, Epoch::START).await;
+
+      // The on-disk rename happens first, then its source half arrives: the
+      // watched directory detaches-and-holds for the pairing window.
+      rig.fs.remove("/r/d");
+      rig.fs.put("/r/e", FileKind::Dir, 11);
+      rig.fs.send_inotify_batch(
+        "/r",
+        vec![RawLinuxEvent::Inotify {
+          anchors: vec![root_watch],
+          event: RawInotifyEvent {
+            wd: 1,
+            mask: InotifyMask(IN_MOVED_FROM | IN_ISDIR),
+            cookie: 7,
+            name: Some(b"d".to_vec()),
+          },
+        }],
+      );
+      // A record under the held source: suppressed (stale pre-move path), so
+      // its covering Rescan is owed at the pairing.
+      rig.fs.send_inotify_batch(
+        "/r",
+        vec![RawLinuxEvent::Inotify {
+          anchors: vec![d_watch],
+          event: RawInotifyEvent {
+            wd: 2,
+            mask: InotifyMask(IN_CREATE),
+            cookie: 0,
+            name: Some(b"x".to_vec()),
+          },
+        }],
+      );
+      // A delivered sentinel behind the hold on the same FIFO stream: seeing
+      // it proves the MovedFrom was ingested — the command channel is polled
+      // ahead of source batches, so without it the sync below could be
+      // admitted (and its fence settle) before the hold even exists.
+      rig.fs.send_inotify_batch(
+        "/r",
+        vec![RawLinuxEvent::Inotify {
+          anchors: vec![root_watch],
+          event: RawInotifyEvent {
+            wd: 1,
+            mask: InotifyMask(IN_CREATE),
+            cookie: 0,
+            name: Some(b"z".to_vec()),
+          },
+        }],
+      );
+      loop {
+        let (_s, change) = next_event(&rig).await;
+        if change.kind().is_created() && change.location() == &loc(&["z"]) {
+          break;
+        }
+      }
+
+      // The barrier mid-hold: parked, nothing written.
+      let mut pending = sync_pending(&rig, scope, "/r", ".tributaries-sync-c5").await;
+      assert_parked(&rig, &mut pending, 0).await;
+
+      // The pairing resolves the hold: its Rescan (the dirtied-hold cover at
+      // the destination) is queued, the re-arm settles, the write dispatches.
+      rig.fs.send_inotify_batch(
+        "/r",
+        vec![RawLinuxEvent::Inotify {
+          anchors: vec![root_watch],
+          event: RawInotifyEvent {
+            wd: 1,
+            mask: InotifyMask(IN_MOVED_TO | IN_ISDIR),
+            cookie: 7,
+            name: Some(b"e".to_vec()),
+          },
+        }],
+      );
+      let path = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .expect("the sync resolves once the hold pairs")
+        .expect("the driver replies")
+        .expect("the write lands");
+      let _pairing = next_rescan_above(&rig, floor).await;
+      assert_eq!(rig.fs.cookie_writes(), vec![path]);
+    }
+
+    /// C6 (P4, latent gate): a loss re-arm folded into an in-flight COLD read
+    /// leaves `rearm_settled` true while the re-walk obligation is latent — a
+    /// sync issued in that window parks, and dispatches only after the
+    /// completion's escalation (and the window's closing `Rescan`) are queued.
+    /// Fails on old: the fence settled during the latency and the cookie beat
+    /// the escalation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_during_a_coalesced_latent_rearm_parks_until_escalation() {
+      let fs = FakeFs::new(1);
+      fs.put("/r", FileKind::Dir, 1);
+      fs.put("/r/sub", FileKind::Dir, 11);
+      fs.spawn_backend(BackendKind::Inotify);
+      // Hold the boot cold read in flight before the loss arrives.
+      let hold = fs.hold_enumerates();
+      let rig = inotify_rig_fs(fs);
+      let scope = watch(&rig, "/r").await;
+
+      // The loss folds its re-arm into the held cold read (Coalesced).
+      rig.fs.send_lossy("/r");
+      let (_s, change) = next_event(&rig).await;
+      assert!(change.kind().is_rescan(), "the overflow Rescan: {change:?}");
+      let overflow_epoch = change.epoch();
+
+      // The barrier inside the latent window: parked, nothing written.
+      let mut pending = sync_pending(&rig, scope, "/r", ".tributaries-sync-c6").await;
+      assert_parked(&rig, &mut pending, 0).await;
+
+      // Release: the dirtied completion escalates (covering Rescan + counted
+      // retry), the suppressed re-walk closes with the closing Rescan, and
+      // only then does the write dispatch.
+      hold.release();
+      let path = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .expect("the sync resolves once the escalation drains")
+        .expect("the driver replies")
+        .expect("the write lands");
+      let escalation = next_rescan_above(&rig, overflow_epoch).await;
+      assert!(escalation > overflow_epoch);
+      assert_eq!(rig.fs.cookie_writes(), vec![path]);
+    }
+
+    /// Arms executed at `path` so far.
+    fn arms_at(rig: &Rig, path: &str) -> usize {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .filter(|(_, p)| p == std::path::Path::new(path))
+        .count()
+    }
+
+    /// Enumerates executed at `path` so far.
+    fn enumerates_at(rig: &Rig, path: &str) -> usize {
+      rig
+        .fs
+        .enumerates()
+        .iter()
+        .filter(|(_, p)| p == std::path::Path::new(path))
+        .count()
+    }
   }
 }
 

@@ -1473,11 +1473,15 @@ fn resolve_cover_settlements<R, F>(
       continue;
     }
     // The settle-fenced cookie write. BOTH verdicts write: a `Degraded`
-    // settle means a loss already stood a covering `Rescan` that rides the
-    // queue ahead of this cookie, so the barrier is still met — by
-    // domination rather than by delivery. Only a scope that DIED loses its
-    // write (its fences degrade at teardown, and there is no stream left to
-    // report the cookie on).
+    // settle means a WINDOW loss already stood a covering `Rescan` that
+    // rides the queue ahead of this cookie, and any LEVEL-PERSISTENT
+    // deficit (an arm-refused slot, an exhausted-read interior — darkness
+    // that outlives its edge `Rescan`) is re-signaled below before the
+    // write dispatches — so a covering `Rescan` rides the queue ahead of
+    // this cookie in EVERY case, and the barrier is met by domination
+    // rather than by delivery. Only a scope that DIED loses its write (its
+    // fences degrade at teardown, and there is no stream left to report the
+    // cookie on).
     if let Some(cookie) = parked_cookies.remove(&fence) {
       let _ = settle;
       // The root the cookie must stay inside — and, being recorded on the same
@@ -1490,6 +1494,13 @@ fn resolve_cover_settlements<R, F>(
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
       };
+      // F2: a standing terminal deficit means this scope has dark coverage
+      // no past `Rescan` covers going forward. Re-signal it NOW — the fresh
+      // epoch-bumped `Rescan`s enter the effect queue ahead of anything the
+      // cookie write can cause (its own record arrives only via a later
+      // batch input), and the loop-top `execute_effects` flushes them to the
+      // consumer before that record can be routed.
+      let _ = core.resignal_coverage_deficits(cookie.scope);
       // The dispatched write is a TRACKED, single-flighted job: mark the scope
       // in flight (a second sync is refused until this resolves), recording the
       // rendered cookie NAME (so a cancel can probe "is this name a dispatched
