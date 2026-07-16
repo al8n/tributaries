@@ -4353,11 +4353,13 @@ mod descending {
 
   /// The F0 amendment end-to-end: a grow landing on a directory whose COLD
   /// read is in flight coalesces into the dirty bit — a latent obligation the
-  /// settle counter deliberately does not see, so the scope reads settled
+  /// re-arm counter deliberately does not see, so `rearm_settled` reads true
   /// while the coverage work is outstanding. The fence opened for that
-  /// reconcile resolves `Degraded` (lossy from birth) even though NO Rescan
-  /// passed in its window — without the born-lossy memory this poll would
-  /// resolve `Applied` over the latent hole.
+  /// reconcile is GATED across the latency (`coverage_settled` counts the
+  /// latent read — a settle inside it would dispatch a sync cookie the
+  /// escalation's covering `Rescan` does not precede) and resolves `Degraded`
+  /// once the escalation drains: the born-lossy memory marked it at open, and
+  /// the escalation `Rescan` marks it again — never `Applied` over the hole.
   #[test]
   fn coalesced_grow_makes_the_fence_lossy_from_birth() {
     let (mut core, scope, root_watch) = shrunk_to_keep();
@@ -4383,15 +4385,16 @@ mod descending {
       })
       .expect("cold discovery arms the re-created directory");
     core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(9));
-    assert!(
-      drain(&mut core).iter().any(
-        |e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/drop"))
-      ),
-      "the cold read is in flight"
-    );
+    let cold = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/drop") => Some(*req),
+        _ => None,
+      })
+      .expect("the cold read is in flight");
     assert!(
       core.monitor.rearm_settled(scope),
-      "a cold read is not re-arm work — the scope reads settled"
+      "a cold read is not re-arm work — the counter reads settled"
     );
     // The grow's delta lands exactly on the in-flight cold read: Coalesced.
     assert_eq!(
@@ -4401,17 +4404,48 @@ mod descending {
     let fence = core.open_cover_fence(scope);
     assert!(
       core.monitor.rearm_settled(scope),
-      "the latent obligation is invisible to the settle counter"
+      "the latent obligation is invisible to the re-arm counter"
+    );
+    assert!(
+      !core.monitor.coverage_settled(scope),
+      "but not to the fence predicate"
     );
     assert_eq!(
       core.poll_cover_settlements(),
+      Vec::new(),
+      "the fence is gated across the latent read — no settle inside the window"
+    );
+    // The completion escalates: a covering Rescan plus a COUNTED retry — the
+    // gate hands over to the re-arm counter with no unfenced instant.
+    core.on_enumerated(cold, listed(Vec::new()));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the dirtied read's completion emits the covering Rescan: {effects:?}"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "the escalation's counted retry keeps the fence parked"
+    );
+    let retry = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/drop") => Some(*req),
+        _ => None,
+      })
+      .expect("the escalated re-arm retry read");
+    core.on_enumerated(retry, listed(Vec::new()));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.poll_cover_settlements(),
       vec![(fence, CoverSettle::Degraded)],
-      "a Coalesced kickoff makes the fence lossy from birth"
+      "the drained window resolves Degraded — born-lossy, and Rescan-marked"
     );
     assert_eq!(
       core.scopes.get(&scope).unwrap().applied_cover,
-      Some(vec![p("/r/keep")]),
-      "the born-lossy settle rewinds to the floor like any lossy settle"
+      Some(Vec::new()),
+      "the mid-window escalation Rescan degraded the claim to the empty cover"
     );
   }
 
@@ -4462,27 +4496,22 @@ mod descending {
       .expect("the cold read is in flight");
 
     // (i) The REPLY-LESS grow coalesces into the cold read: no fence of its
-    // own, but the already-pending fence is marked and resolves Degraded.
+    // own, but the already-pending fence is marked lossy — and GATED across
+    // the latent read (`coverage_settled`), so it cannot resolve inside the
+    // window the coalesced obligation leaves dark.
     assert_eq!(
       core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
       CoverReconcile::Reconciling
     );
     assert_eq!(
       core.poll_cover_settlements(),
-      vec![(pending, CoverSettle::Degraded)],
-      "a reply-less coalesce degrades the fences already pending"
+      Vec::new(),
+      "the latent obligation gates the settle — no fence resolves inside it"
     );
-    assert_eq!(
-      core.scopes.get(&scope).unwrap().applied_cover,
-      Some(vec![p("/r/keep")]),
-      "the lossy settle rewound the reply-less over-claim"
-    );
-    assert!(core.cover_fences.is_empty());
 
     // The latent obligation completes: the dirtied cold read escalates (a
-    // covering Rescan plus a counted re-arm retry). The Rescan records fresh
-    // loss memory — an entry of its own, no reconcile needed — and degrades
-    // the rewound claim to the empty cover.
+    // covering Rescan plus a counted re-arm retry). The Rescan re-marks the
+    // still-parked fence and degrades the over-claim to the empty cover.
     core.on_enumerated(cold, listed(Vec::new()));
     let effects = drain(&mut core);
     assert!(
@@ -4494,7 +4523,7 @@ mod descending {
         .cover_fences
         .get(&scope)
         .is_some_and(|entry| entry.lossy),
-      "the Rescan records loss memory even with no unobserved reconcile"
+      "the coalesce and its escalation record the loss memory"
     );
     assert_eq!(
       core.scopes.get(&scope).unwrap().applied_cover,
@@ -4511,12 +4540,16 @@ mod descending {
     core.on_enumerated(retry, listed(Vec::new()));
     let _ = drain(&mut core);
     assert!(core.monitor.rearm_settled(scope), "the escalation quiesced");
-    // The settle OBSERVATION clears the Rescan's pending-empty entry (no fence
-    // to resolve) — only now does the loss memory stop marking new fences.
-    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    // The settle OBSERVATION resolves the marked fence Degraded and clears
+    // the loss memory with it.
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(pending, CoverSettle::Degraded)],
+      "a reply-less coalesce degrades the fences already pending"
+    );
     assert!(
       core.cover_fences.is_empty(),
-      "the observation clears the entry the Rescan created"
+      "the observation clears the entry with the fences"
     );
 
     // (ii) A LATER reconcile's fence starts clean: the observed memory did not
@@ -4532,6 +4565,266 @@ mod descending {
       core.poll_cover_settlements(),
       vec![(later, CoverSettle::Applied)],
       "the observed memory does not leak onto a later fence"
+    );
+  }
+
+  /// B1 (F1 fence): a sync-shaped fence opened across a descending replace
+  /// pends through the WHOLE rebuild, and the routed event sequence carries
+  /// the commit `Rescan` … the closing `Rescan` (strictly higher epoch)
+  /// BEFORE the settle observation that would dispatch a cookie — so a
+  /// bridge-window change (dark until its directory's watch armed,
+  /// suppressed by the re-arm read) is ≤ a `Rescan` that precedes every
+  /// dispatched write. Fails on old: the stream ended at the commit `Rescan`.
+  #[test]
+  fn a_fence_across_a_replace_sees_the_closing_rescan_before_settling() {
+    let (mut core, scope, req, root_watch) = live_descending();
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    let fence = core.open_cover_fence(scope);
+    core.on_root_replaced(
+      scope,
+      RootMeta {
+        root: PathBuf::from("/r2"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      },
+      at(3),
+    );
+    let effects = drain(&mut core);
+    let commit_epoch = emits(&effects)
+      .iter()
+      .find(|c| c.kind().is_rescan())
+      .map(|c| c.epoch())
+      .expect("the commit Rescan is routed");
+    assert_eq!(core.poll_cover_settlements(), Vec::new());
+
+    // The driver replays the pre-armed root; its re-arm read lists a fresh
+    // directory `a` — the bridge. The fence pends until `a`'s own read lands.
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(99));
+    let rearm = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r2") => Some(*req),
+        _ => None,
+      })
+      .expect("the rebound root re-arm-enumerates");
+    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    core.on_enumerated(rearm, listed(vec![entry("a", FileKind::Dir, 1, 21)]));
+    let a_watch = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r2/a") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the rebuilt directory arms");
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "the fresh install keeps the fence parked"
+    );
+    core.on_watch_installed(a_watch, crate::os::linux::WatchOutcome::Installed(2));
+    let a_read = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r2/a") => Some(*req),
+        _ => None,
+      })
+      .expect("the rebuilt directory re-arm-enumerates");
+    assert_eq!(core.poll_cover_settlements(), Vec::new());
+
+    // The settle edge: the closing Rescan is ROUTED (in the effect queue) by
+    // the same input that drained the last obligation — strictly before any
+    // settlement poll can observe the settle and dispatch a parked cookie.
+    core.on_enumerated(a_read, listed(Vec::new()));
+    let effects = drain(&mut core);
+    let closing = emits(&effects)
+      .iter()
+      .find(|c| c.kind().is_rescan())
+      .map(|c| c.epoch())
+      .expect("the closing Rescan is routed at the settle edge");
+    assert!(
+      closing > commit_epoch,
+      "the closing Rescan strictly dominates the commit"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Degraded)],
+      "only then does the fence resolve (the commit made the window lossy)"
+    );
+  }
+
+  /// B2 (F2 seam): the core's dispatch-side re-signal — a standing
+  /// arm-refused hole yields one epoch-bumped covering `Rescan` at the
+  /// hole's path, already drained into the effect queue when the call
+  /// returns (ahead of any write the caller dispatches next), plus a bounded
+  /// heal kick; a second call is a no-op. Fails on old: the seam did not
+  /// exist — after the failure's edge `Rescan`, nothing preceded a cookie.
+  #[test]
+  fn resignal_puts_a_fresh_covering_rescan_in_the_effects_before_returning() {
+    let (mut core, scope, req, _root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the discovered directory arms");
+    core.on_watch_installed(
+      add,
+      crate::os::linux::WatchOutcome::Failed(WatchError::NoSpace),
+    );
+    let effects = drain(&mut core);
+    let edge_epoch = emits(&effects)
+      .iter()
+      .find(|c| c.kind().is_rescan())
+      .map(|c| c.epoch())
+      .expect("the failure's edge Rescan is routed");
+
+    assert!(
+      core.resignal_coverage_deficits(scope),
+      "the hole re-signals"
+    );
+    let effects = drain(&mut core);
+    let fresh = emits(&effects)
+      .iter()
+      .find(|c| c.kind().is_rescan())
+      .cloned()
+      .expect("the covering Rescan is queued before the call returned");
+    assert_eq!(
+      fresh.location(),
+      &Location::from_segments([Segment::new("sub")])
+    );
+    assert!(
+      fresh.epoch() > edge_epoch,
+      "epoch-bumped — a fresh instruction, not the edge replayed"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r"))),
+      "the bounded heal kick re-reads the hole's parent: {effects:?}"
+    );
+    assert!(
+      !core.resignal_coverage_deficits(scope),
+      "the re-signaled entry was cleared — a second call is a no-op"
+    );
+  }
+
+  /// B3 (P3 fence): a fence opened over a detached-and-held move source
+  /// pends until the hold resolves — pairing or timeout — and then settles
+  /// under the existing verdict rules (a clean hold's window stays clean).
+  /// Fails on old: `rearm_settled` never counted the hold, so the fence
+  /// settled mid-window and a cookie could beat the resolution's covering
+  /// `Rescan`. (The latent-cold twin gate is pinned by
+  /// `coalesced_grow_makes_the_fence_lossy_from_birth`.)
+  #[test]
+  fn a_fence_pends_across_a_held_move_source_until_resolution() {
+    // Pairing resolution.
+    let (mut core, scope, req, root_watch) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("d", FileKind::Dir, 1, 11)]));
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, .. } => Some(*watch),
+        _ => None,
+      })
+      .expect("the discovered directory arms");
+    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    let cold = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/d") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed child cold-enumerates");
+    core.on_enumerated(cold, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_MOVED_FROM | IN_ISDIR,
+        7,
+        Some(b"d"),
+      )],
+      at(5),
+    );
+    let _ = drain(&mut core);
+    let fence = core.open_cover_fence(scope);
+    assert!(core.monitor.rearm_settled(scope), "a hold is not counted");
+    assert_eq!(
+      core.poll_cover_settlements(),
+      Vec::new(),
+      "but the fence is gated across it"
+    );
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_MOVED_TO | IN_ISDIR,
+        7,
+        Some(b"e"),
+      )],
+      at(10),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Applied)],
+      "a clean pairing releases the gate under the existing verdict rules"
+    );
+
+    // Timeout resolution.
+    let (mut core, scope, req, root_watch) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("d", FileKind::Dir, 1, 11)]));
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, .. } => Some(*watch),
+        _ => None,
+      })
+      .expect("the discovered directory arms");
+    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    let cold = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/d") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed child cold-enumerates");
+    core.on_enumerated(cold, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_MOVED_FROM | IN_ISDIR,
+        9,
+        Some(b"d"),
+      )],
+      at(5),
+    );
+    let _ = drain(&mut core);
+    let fence = core.open_cover_fence(scope);
+    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    core.on_timeout(at(5) + WINDOW);
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.poll_cover_settlements(),
+      vec![(fence, CoverSettle::Applied)],
+      "the stranded half's resolution releases the gate"
     );
   }
 
