@@ -133,21 +133,24 @@ pub enum CloseError {
   /// torn down externally); streams are still reclaimed at process exit.
   #[error("the driver stopped before confirming the shutdown")]
   Stopped,
-  /// The close grace expired with blocking-pool work still executing:
-  /// teardowns still inside their `shutdown` calls, spawns that may already own
-  /// a live stream (the backend starts the stream and then performs post-live
-  /// metadata reads inside the same call), or a physical sync-cookie unlink the
-  /// close swept as a tracked job. None proves quiescence at reply time. Their
-  /// reclamation stories differ: a wedged teardown's stream is unreachable until
-  /// the call returns (the OS reclaims at process exit), a wedged spawn's stream
-  /// is reclaimed by its undeliverable result dropping the handle once the wedge
-  /// clears, and a wedged cookie unlink leaves its file until the mount unwedges
-  /// (the registry's best-effort terminal sweep retries it) — but close reports
-  /// the outstanding count honestly rather than hanging on any of them.
-  #[error("{pending} operation(s) still executing when the close grace expired")]
+  /// The close grace expired with work still OUTSTANDING: teardowns still inside
+  /// their `shutdown` calls, spawns that may already own a live stream (the
+  /// backend starts the stream and then performs post-live metadata reads inside
+  /// the same call), or a sync cookie the driver wrote but could not CONFIRM
+  /// removed within the grace — an unlink still in flight, or one whose retries
+  /// the grace outran (a parked record awaiting the terminal sweep is counted
+  /// too: it is owned-and-unremoved, not merely executing). None proves
+  /// quiescence at reply time. Their reclamation stories differ: a wedged
+  /// teardown's stream is unreachable until the call returns (the OS reclaims at
+  /// process exit), a wedged spawn's stream is reclaimed by its undeliverable
+  /// result dropping the handle once the wedge clears, and an unremoved cookie
+  /// leaves its file until the mount unwedges (the registry's best-effort
+  /// terminal sweep retries it) — but close reports the outstanding count
+  /// honestly rather than hanging on any of them.
+  #[error("{pending} operation(s) still outstanding when the close grace expired")]
   NotQuiesced {
-    /// How many spawns, teardowns, and physical cookie operations were still
-    /// executing at grace expiry.
+    /// How many stream spawns/teardowns and owned-but-unconfirmed cookies were
+    /// still outstanding at grace expiry.
     pending: usize,
   },
 }

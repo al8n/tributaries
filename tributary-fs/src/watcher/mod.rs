@@ -544,6 +544,7 @@ impl<R: RuntimeLite> Watcher<R> {
       cookie_retry_cap: DriverConfig::DEFAULT_COOKIE_RETRY_CAP,
       cookie_retry_budget: DriverConfig::DEFAULT_COOKIE_RETRY_BUDGET,
       cookie_backlog_cap: DriverConfig::DEFAULT_COOKIE_BACKLOG_CAP,
+      cookie_global_cap: DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
     };
     Self::spawn_with(options, config, RealFs::new())
   }
@@ -611,6 +612,7 @@ impl<R: RuntimeLite> Watcher<R> {
       cookie_retry_cap: DriverConfig::DEFAULT_COOKIE_RETRY_CAP,
       cookie_retry_budget: DriverConfig::DEFAULT_COOKIE_RETRY_BUDGET,
       cookie_backlog_cap: DriverConfig::DEFAULT_COOKIE_BACKLOG_CAP,
+      cookie_global_cap: DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
     };
     Self::spawn_with(options, config, ops)
   }
@@ -1232,25 +1234,32 @@ impl<R> Watcher<R> {
 
   /// Closes the watcher: tears every native stream down — including streams
   /// still being spawned or torn down on the blocking pool, which are settled
-  /// inside the close accounting — drains what already arrived, and resolves
-  /// once the driver has quiesced. The final drain into a full event buffer
-  /// is best-effort, and quiescence is bounded by a ~1 s grace: a blocking
-  /// pool wedged past it no longer holds the close. `Ok` PROVES every native
-  /// stream was torn down — a spawn or teardown wedged past the grace is
-  /// reported, never papered over (a wedged spawn may already own a live
-  /// stream: the backend starts it and then runs post-live metadata reads
-  /// inside the same call).
+  /// inside the close accounting — sweeps every cookie the driver ever wrote and
+  /// waits for each unlink to CONFIRM (retrying a transiently-failing one within
+  /// the grace), drains what already arrived, and resolves once the driver has
+  /// quiesced. The final drain into a full event buffer is best-effort, and
+  /// quiescence is bounded by a ~1 s grace: a blocking pool wedged past it no
+  /// longer holds the close.
+  ///
+  /// `Ok` PROVES two things: every native stream was torn down, AND every sync
+  /// cookie this watcher ever wrote was confirmed removed from disk. A stream
+  /// spawn/teardown or a cookie unlink still outstanding past the grace is
+  /// reported, never papered over (a wedged spawn may already own a live stream:
+  /// the backend starts it and then runs post-live metadata reads inside the same
+  /// call).
   ///
   /// # Errors
   ///
-  /// [`CloseError::Stopped`] when the driver stopped before confirming (a
-  /// panic or an external teardown) — including when the close command
-  /// cannot be delivered at all — and [`CloseError::NotQuiesced`] when
-  /// stream spawns or teardowns were still executing at grace expiry — those
-  /// streams stay live until their wedged calls return (a wedged spawn's
-  /// stream self-reclaims via its dropped result once the wedge clears; a
-  /// wedged teardown's is unreachable until the call returns); the OS
-  /// reclaims at process exit either way.
+  /// [`CloseError::Stopped`] when the driver stopped before confirming (a panic
+  /// or an external teardown) — including when the close command cannot be
+  /// delivered at all — and [`CloseError::NotQuiesced`] when work was still
+  /// outstanding at grace expiry: stream spawns or teardowns still executing, or
+  /// cookies not yet confirmed removed (a hung unlink, or one whose retries the
+  /// grace outran). A wedged stream stays live until its call returns (a wedged
+  /// spawn's self-reclaims via its dropped result once the wedge clears; a wedged
+  /// teardown's is unreachable until the call returns); an unremoved cookie is
+  /// still swept best-effort as the driver drops. The OS reclaims streams at
+  /// process exit either way.
   pub async fn close(self) -> Result<(), CloseError> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self.commands.send(Command::Close { reply }).await.is_err() {

@@ -37,6 +37,7 @@ fn config() -> DriverConfig {
     cookie_retry_cap: Duration::from_secs(5),
     cookie_retry_budget: 8,
     cookie_backlog_cap: 8,
+    cookie_global_cap: 128,
   }
 }
 
@@ -49,6 +50,7 @@ fn tuned_config() -> DriverConfig {
     cookie_retry_cap: Duration::from_millis(20),
     cookie_retry_budget: 3,
     cookie_backlog_cap: 3,
+    cookie_global_cap: 64,
     ..config()
   }
 }
@@ -3815,6 +3817,7 @@ mod sync_cookie {
       cookie_retry_cap: Duration::from_millis(200),
       cookie_retry_budget: 3,
       cookie_backlog_cap: 8,
+      cookie_global_cap: 128,
       ..config()
     }
   }
@@ -4649,7 +4652,10 @@ mod sync_cookie {
   // fire-and-forget unlink ignored every error, silently stranding the file.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_transient_unlink_failure_retains_the_cookie_until_it_succeeds() {
-    let rig = rig_with_capacity(64);
+    // The retain config's 200ms base gives a comfortable window to observe the
+    // RETAINED record before the driver's own retry fires (the default 100ms
+    // base would race that observation).
+    let rig = rig_with_config(64, retain_config());
     let scope = watch(&rig, "/r").await;
 
     let path = sync_root(&rig, scope, "/r", ".tributaries-sync-4-1-1")
@@ -5479,6 +5485,340 @@ mod sync_cookie {
       rig.fs.cookie_remove_dispatches(),
       2,
       "exactly the failed attempt and the drain's own retry"
+    );
+  }
+
+  /// A config whose GLOBAL cookie cap is the low bound while the per-scope cap
+  /// sits well above it, so a churn of fresh scopes — each owning at most one
+  /// cookie — can only ever be refused by the watcher-wide ceiling.
+  fn low_global_cap_config() -> DriverConfig {
+    DriverConfig {
+      cookie_retry_base: Duration::from_millis(5),
+      cookie_retry_cap: Duration::from_millis(20),
+      cookie_retry_budget: 3,
+      cookie_backlog_cap: 8,
+      cookie_global_cap: 3,
+      ..config()
+    }
+  }
+
+  /// A config whose retry backoff climbs fast under a large cap and a generous
+  /// budget, so a few consecutive unlink failures park a record on a deadline
+  /// BEYOND the close grace — the state the close-sweep deadline clamp rescues.
+  fn far_backoff_config() -> DriverConfig {
+    DriverConfig {
+      cookie_retry_base: Duration::from_millis(400),
+      cookie_retry_cap: Duration::from_secs(5),
+      cookie_retry_budget: 8,
+      cookie_backlog_cap: 8,
+      cookie_global_cap: 128,
+      ..config()
+    }
+  }
+
+  // The global cookie cap ceilings total owned cookies across every scope, live
+  // or retired. A sync → failing-cleanup → unwatch → rewatch churn mints a fresh
+  // scope each round, and a fresh scope's own per-scope backlog is always one, so
+  // only a watcher-wide ceiling can bound the residue the retired scopes leave.
+  // Once the cap is reached a further sync is refused `CleanupBacklog`, and the
+  // owned count never climbs past it however long the churn runs.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn churn_across_retired_scopes_is_bounded_by_the_global_cap() {
+    let rig = rig_with_config(64, low_global_cap_config());
+    // Every unlink fails forever, so each round's cookie survives its scope's
+    // retirement and adds to the global residue.
+    rig.fs.fail_next_cookie_removes(1_000_000);
+
+    let cap = low_global_cap_config().cookie_global_cap;
+    let mut admitted = 0usize;
+    // Churn several rounds past the cap, each on a fresh sibling root.
+    for i in 0..(cap + 3) {
+      let root = format!("/ra{i}");
+      rig.fs.put(&root, FileKind::Dir, 100 + i as u64);
+      let scope = watch(&rig, &root).await;
+      let name = format!(".tributaries-sync-A-{i}");
+      match sync_root(&rig, scope, &root, &name).await {
+        Ok(path) => {
+          admitted += 1;
+          // Ask for the cookie's removal; it fails permanently, so the owned
+          // record is retained across the unwatch below.
+          rig
+            .cookie_removes
+            .send(CookieReap::Remove(path))
+            .await
+            .unwrap();
+        }
+        Err(crate::error::SyncRootError::CleanupBacklog) => {}
+        Err(other) => panic!("unexpected sync error: {other:?}"),
+      }
+      // Retire the scope. Its failing cookie record stays owned — a retired scope
+      // no longer re-arms it, but the file is never orphaned.
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      let _ = on_reply.await;
+      assert!(
+        cookie_count(&rig).await <= cap,
+        "the global cap bounds total owned cookies across retired scopes"
+      );
+    }
+
+    assert_eq!(
+      admitted, cap,
+      "exactly the cap's worth of syncs land before the global ceiling refuses"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      cap,
+      "the residue sits exactly at the global cap, never beyond it"
+    );
+
+    // With the cap reached, one more sync on yet another fresh scope is refused
+    // retryably — whatever scope owns the residue.
+    rig.fs.put("/ra-final", FileKind::Dir, 999);
+    let scope = watch(&rig, "/ra-final").await;
+    assert!(
+      matches!(
+        sync_root(&rig, scope, "/ra-final", ".tributaries-sync-A-final").await,
+        Err(crate::error::SyncRootError::CleanupBacklog)
+      ),
+      "a fresh scope is refused because the GLOBAL residue is at the cap"
+    );
+  }
+
+  // The dedicated cleanup lane makes steady progress even under a saturating
+  // command flood. The live loop's select is command-biased, so without a
+  // loop-top fairness drain a caller that keeps the bounded command mailbox
+  // continuously ready would starve queued reaps — cookies would linger owned.
+  // Form: a sustained real flood (a spawned task that never lets the command
+  // channel drain) racing a reap for a live owned cookie.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_command_flood_does_not_starve_the_cleanup_lane() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-B-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // Saturate the bounded command channel continuously with a cheap command the
+    // driver answers synchronously and statelessly, so the biased select always
+    // finds `commands` ready at poll time.
+    let commands = rig.commands.clone();
+    let flood = tokio::spawn(async move {
+      loop {
+        let (reply, _drop) = futures_channel::oneshot::channel();
+        if commands
+          .send(Command::DebugCookieCount { reply })
+          .await
+          .is_err()
+        {
+          break;
+        }
+      }
+    });
+
+    // Under the sustained flood, request the reap on the dedicated lane.
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
+
+    // The loop-top fairness drain services it regardless of the flood: the unlink
+    // is dispatched and confirms. Observed fs-side — the flooded command channel
+    // cannot carry an observation command through.
+    settle(|| rig.fs.cookie_removes().contains(&path)).await;
+    flood.abort();
+
+    assert!(
+      rig.fs.cookie_removes().contains(&path),
+      "the queued reap was serviced despite the command flood"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the cookie file is gone"
+    );
+    // And the registry no longer owns it.
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(cookie_count(&rig).await, 0, "the cookie is no longer owned");
+  }
+
+  // The registry's abnormal-path Drop dispatches a best-effort unlink only for a
+  // record with NO unlink already in flight. A cookie the close sweep already
+  // moved to `Removing` (its unlink hung past the grace) has one — a second
+  // unlink for the same path is exactly the duplicate the single-flight choke
+  // point forbids. So a hung cookie is dispatched exactly ONCE across the whole
+  // close.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_dispatches_exactly_one_unlink_for_a_hung_cookie() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let _path = sync_root(&rig, scope, "/r", ".tributaries-sync-C-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // The terminal unlink hangs: the close sweep dispatches it and it never
+    // confirms within the grace, so the record stays `Removing` through the Drop.
+    let hold = rig.fs.hold_cookie_removes();
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close returns within the grace, never wedged on a hung unlink")
+      .expect("the driver replied");
+    assert_eq!(pending, 1, "the hung cookie is counted once");
+
+    // The Drop has already run — it precedes the close reply. Give any erroneous
+    // second dispatch time to reach the pool, then prove it never happened: the
+    // sweep's single unlink is the only one.
+    settle(|| rig.fs.cookie_remove_dispatches() >= 2).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      1,
+      "the sweep dispatched one unlink; the Drop skipped the still-Removing record"
+    );
+
+    // Released, the one hung unlink completes and the file is gone.
+    hold.release();
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    assert!(rig.fs.files_under("/r").is_empty());
+  }
+
+  // A write whose `reply.send(Ok)` fails after it CLAIMED its record is one
+  // physical obligation that briefly appears in two places: the claimed record
+  // (state `Removing`, its self-reap unlink in flight) AND its scope's still-open
+  // `writes_in_flight` slot (cleared only when the write's `CookieWriteDone`
+  // lands, which the hung unlink defers). The close count must tally it ONCE.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_counts_a_held_self_reap_obligation_once() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    // Hold the write in the pool so the reply receiver can be dropped in the
+    // window after dispatch (the scope is in `writes_in_flight`) but before the
+    // write lands. The parked write is already past the cover-fence cancel prune,
+    // so it still writes, claims, and then finds its reply send failed.
+    let write_hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-D-1").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      1,
+      "the write is dispatched and parked"
+    );
+
+    // Arm the self-reap's unlink to hang, drop the receiver, then release the
+    // write: it lands, claims (the scope is live), its `reply.send(Ok)` fails, and
+    // its self-reap transitions the record to `Removing` and hangs in the unlink.
+    let remove_hold = rig.fs.hold_cookie_removes();
+    drop(on_reply);
+    write_hold.release();
+    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      1,
+      "the self-reap's unlink is in flight, held"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the claimed record is owned, its scope still in flight"
+    );
+
+    // Close: the one obligation is counted once, not once per place it appears.
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close returns within the grace")
+      .expect("the driver replied");
+    assert_eq!(
+      pending, 1,
+      "one physical obligation — the held self-reap — counted once, not twice"
+    );
+
+    // Release the hung unlink so the parked pool thread can finish.
+    remove_hold.release();
+  }
+
+  // A cookie whose unlink has failed several times sits on an exponential-backoff
+  // deadline that can exceed the close grace. The close sweep pulls every pending
+  // retry forward to one base delay, so a record on a far deadline is still
+  // retried inside the grace — and on a recovered fs the retry confirms, so close
+  // proves quiescence instead of reporting a spurious NotQuiesced.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_retries_a_pre_existing_long_backoff_within_the_grace() {
+    let rig = rig_with_config(64, far_backoff_config());
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-E-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // Fail the unlink three times: with a 400ms base the third failure parks the
+    // record on a ~1.6s retry deadline, well past the 1s grace. The fourth attempt
+    // (the fs has recovered) would succeed, but it is scheduled far out.
+    rig.fs.fail_next_cookie_removes(3);
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
+    settle(|| rig.fs.cookie_remove_dispatches() >= 3).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      3,
+      "exactly three failed attempts"
+    );
+
+    // Let the third failure's reschedule land, and confirm the far retry has NOT
+    // auto-fired: the record waits on a deadline beyond the grace.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      3,
+      "the far retry has not fired — the record waits on a >1s deadline"
+    );
+    assert_eq!(cookie_count(&rig).await, 1, "the cookie is still owned");
+
+    // Close: the sweep clamps the far deadline into the grace; the retry fires and
+    // confirms against the recovered fs.
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close returns within the grace")
+      .expect("the driver replied");
+    assert_eq!(
+      pending, 0,
+      "the clamped retry confirmed inside the grace — no spurious NotQuiesced"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the cookie file is gone at reply time"
     );
   }
 }
