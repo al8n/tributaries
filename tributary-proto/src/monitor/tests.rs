@@ -8015,3 +8015,214 @@ fn an_organic_grow_healing_a_hole_emits_the_closing_rescan() {
   assert!(!m.has_coverage_deficit(scope(1)), "the hole is gone");
   m.assert_invariants();
 }
+
+/// Installs a live child directory `name` under `parent` whose interior
+/// deficit is then opened and stood: a located overflow re-arms it and its
+/// reads exhaust the bounded retries, leaving the standing edge `Rescan` and
+/// the recorded interior hole. The child was RECORD-installed, so it carries
+/// no identity (as inotify-compiled records never do) — every later crawl
+/// diff over the parent drops and rebuilds it. Returns the child's `WatchId`
+/// and the standing edge `Rescan`'s epoch; events and actions are drained.
+fn identityless_child_with_interior_deficit(
+  m: &mut Monitor,
+  parent: WatchId,
+  name: &str,
+) -> (WatchId, Epoch) {
+  let child = live_child_dir(m, parent, name);
+  m.on_overflow(SubtreeScope::new(child).into(), at(2));
+  for round in 0..=REARM_MAX_RETRIES {
+    let req = drain_actions(m)
+      .iter()
+      .find_map(|x| {
+        x.as_enumerate()
+          .filter(|e| e.dir() == child)
+          .map(|e| e.req())
+      })
+      .unwrap_or_else(|| panic!("round {round}: a re-arm read is outstanding"));
+    m.on_enumerate(req, EnumerateResult::Failed(IoClass::Permission));
+  }
+  assert!(m.rearm_settled(m.scope_of(child).unwrap()));
+  assert!(m.has_coverage_deficit(m.scope_of(child).unwrap()));
+  let edge_epoch = drain_events(m)
+    .iter()
+    .filter(|e| e.kind().is_rescan())
+    .map(|e| e.epoch())
+    .max()
+    .expect("the exhaustion stood an edge Rescan");
+  let _ = drain_actions(m);
+  (child, edge_epoch)
+}
+
+/// The organic-drop carry (fail-on-old): a deficit whose ANCHOR node a clean
+/// crawl drops must not be erased without a trace. A record-installed
+/// directory has no identity, so every crawl over its parent drops and
+/// rebuilds it (`identity_matches` cannot confirm survival). When such a
+/// node anchors a standing interior hole and the darkness heals on disk
+/// before the crawl, the erased entry leaves a PURE grow window with no
+/// `saw_rescan` and an empty book — the old code emitted no closing `Rescan`
+/// and the next sync resolved a false `Delivered` over whatever landed in
+/// the dark interval. The fix re-anchors the erased loss at the surviving
+/// parent slot, which the crawl's own re-install heals through the
+/// `install_child` interlock: the window must end with a closing `Rescan`
+/// (or a still-recorded deficit).
+#[test]
+fn a_crawl_drop_of_a_deficit_anchor_carries_the_loss() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let (_p, edge_epoch) = identityless_child_with_interior_deficit(&mut m, root, "p");
+
+  // (A change lands under the dark, unarmed interior of `p`; then the disk
+  // heals. Neither produces a record — that is the point.)
+
+  // An unrelated PURE set-cover grow crawls the parent: the diff cannot
+  // confirm the identity-less `p`, drops it — erasing the interior entry —
+  // and rebuilds the slot `Created`-suppressed.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the grow re-arm-enumerates the parent");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("p"), FileKind::Dir).with_node(ident(7)),
+    ]),
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "the suppressed rebuild keeps the window open — no fence settles here"
+  );
+  let p2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the dropped slot re-installs");
+  m.on_watch_result(p2, Ok(()));
+  // The healed interior reads clean, listing the gap directory the dark
+  // interval hid; its install is `Created`-suppressed like the rest.
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p2).map(|e| e.req()))
+    .expect("the rebuilt directory re-arm-enumerates");
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Dir)]),
+  );
+  let g = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the gap directory installs");
+  m.on_watch_result(g, Ok(()));
+  let g_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == g).map(|e| e.req()))
+    .expect("the gap directory re-arm-enumerates");
+  m.on_enumerate(g_read, EnumerateResult::Ok(vec![]));
+
+  // The settle edge. Honesty demands the erased darkness leave a trace a
+  // sync must observe: a closing Rescan ahead of any cookie, or a deficit
+  // still recorded for the dispatch re-signal. The old code had neither.
+  assert!(m.rearm_settled(scope(1)));
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()) || m.has_coverage_deficit(scope(1)),
+    "an organically erased deficit must close with a Rescan or stay recorded: {events:?}"
+  );
+  // The carry's exact shape: the re-anchored slot heals through the install
+  // interlock, so the window closes with ONE root-located Rescan strictly
+  // dominating the edge, and the book is empty.
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  assert!(events[0].epoch() > edge_epoch);
+  assert!(!m.has_coverage_deficit(scope(1)));
+  m.assert_invariants();
+}
+
+/// The carry's overreach guard (the A2 companion): a crawl that drops and
+/// rebuilds an identity-unconfirmable child with NO recorded deficit under
+/// it owes nothing. The carry fires only on an ACTUAL erasure, so a pure
+/// grow over healthy record-installed coverage still emits NOTHING and no
+/// phantom deficit appears.
+#[test]
+fn a_crawl_rebuild_of_a_deficit_free_child_emits_nothing() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let _p = live_child_dir(&mut m, root, "p");
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the grow re-arm-enumerates the parent");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("p"), FileKind::Dir).with_node(ident(7)),
+    ]),
+  );
+  let p2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the dropped slot re-installs");
+  m.on_watch_result(p2, Ok(()));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p2).map(|e| e.req()))
+    .expect("the rebuilt directory re-arm-enumerates");
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a deficit-free rebuild owes nothing — no Rescan, no Created"
+  );
+  assert!(
+    !m.has_coverage_deficit(scope(1)),
+    "and books no phantom hole"
+  );
+  m.assert_invariants();
+}
+
+/// The carry when the crawl does NOT rebuild the slot (the name vanished
+/// from the listing): the loss fact stays booked at the surviving parent —
+/// a sync dispatched before the in-flight `Removed` lands re-signals it —
+/// and the `Removed`'s arrival clears it silently (record convergence, no
+/// spurious `Rescan`).
+#[test]
+fn a_crawl_drop_without_rebuild_keeps_the_loss_booked() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let (_p, _edge) = identityless_child_with_interior_deficit(&mut m, root, "p");
+
+  // The grow's crawl no longer lists `p`: the anchor drops with nothing
+  // installed in its place, and the window settles clean.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the grow re-arm-enumerates the parent");
+  m.on_enumerate(rearm, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the vanished subtree owes no Rescan of its own"
+  );
+  assert!(
+    m.has_coverage_deficit(scope(1)),
+    "the erased interior re-anchored at the parent slot"
+  );
+
+  // The vanish's own record converges the consumer and clears the carry.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("p"))
+      .with_is_dir(true),
+    at(3),
+  );
+  assert!(!m.has_coverage_deficit(scope(1)));
+  assert!(!m.resignal_coverage_deficits(scope(1)));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "just the Removed itself: {events:?}");
+  assert!(events[0].kind().is_removed());
+  m.assert_invariants();
+}
