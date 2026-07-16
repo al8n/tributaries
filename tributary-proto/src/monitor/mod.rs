@@ -122,8 +122,11 @@ struct BridgeFlags {
 /// never resolve delivered over a change the deficit hid.
 #[derive(Debug, Default)]
 struct DeficitBook {
-  /// Arm-refused slots: `(parent, name)` has an on-disk directory the kernel
-  /// refused to watch (the failed install's subtree was dropped).
+  /// Slot holes: `(parent, name)`'s on-disk subtree is not covered — the
+  /// kernel refused the install (the failed subtree was dropped), or an
+  /// organic crawl dropped a deficit-carrying child there and re-anchored
+  /// the erased loss pending the slot's rebuild or its removal record
+  /// ([`Monitor::drop_subtree_for_crawl_rebuild`]).
   slots: BTreeMap<WatchId, BTreeSet<Segment>>,
   /// Exhausted-read interiors: this live watch's content could not be
   /// reconciled within the bounded retries; gap-created descendants under it
@@ -1359,7 +1362,7 @@ impl Monitor {
       if survives {
         let _ = self.inherit_rearm(child);
       } else {
-        self.drop_subtree(child);
+        self.drop_subtree_for_crawl_rebuild(child);
       }
     }
     // Install a fresh watch for every present directory now lacking one (a survivor keeps
@@ -2620,7 +2623,14 @@ impl Monitor {
     ));
   }
 
-  fn drop_subtree(&mut self, root: WatchId) {
+  /// Drops the watch subtree rooted at `root`, queuing an
+  /// [`Action::Unwatch`] per removed node. Returns whether the walk erased
+  /// any recorded deficit entry — consumed only by
+  /// [`drop_subtree_for_crawl_rebuild`](Self::drop_subtree_for_crawl_rebuild);
+  /// every other caller's coverage story already accounts for the dropped
+  /// anchors (see [`drop_node_deficits`](Self::drop_node_deficits)).
+  fn drop_subtree(&mut self, root: WatchId) -> bool {
+    let mut erased = false;
     let mut stack = std::vec::Vec::new();
     stack.push(root);
     while let Some(id) = stack.pop() {
@@ -2671,9 +2681,10 @@ impl Monitor {
         self.held_by_scope_dec(node.scope);
       }
       self.dirtied_holds.remove(&id);
-      // Its deficit anchors die with it (see `drop_node_deficits` for why no
-      // bridge bits are owed here).
-      self.drop_node_deficits(node.scope, id);
+      // Its deficit anchors die with it; report a real erasure so the one
+      // caller with no coverage story of its own can carry the loss (see
+      // `drop_node_deficits` / `drop_subtree_for_crawl_rebuild`).
+      erased |= self.drop_node_deficits(node.scope, id);
       self.actions.push_back(Action::Unwatch(id));
     }
     // NOTE: a narrow subtree drop deliberately does NOT purge pending move halves.
@@ -2683,6 +2694,43 @@ impl Monitor {
     // from_parent)`) suppresses the stale `Removed` if no destination ever comes.
     // Whole-scope teardown purges instead — see `unregister_root` /
     // `purge_scope_pending_moves`.
+    erased
+  }
+
+  /// [`drop_subtree`](Self::drop_subtree) for `rearm_enumerate`'s
+  /// non-survivor branch — the one drop with NO coverage story of its own:
+  /// nothing is delivered for it, and the crawl rebuilds the slot
+  /// `Created`-suppressed, so a real deficit erased with the subtree would
+  /// vanish without a trace. If the darkness had healed on disk before the
+  /// crawl, the rebuild then reads clean inside a possibly PURE grow window
+  /// — no `saw_rescan`, so no closing `Rescan` — and the next sync would
+  /// observe a settled, deficit-free scope and resolve a false `Delivered`
+  /// over whatever the dark interval hid.
+  ///
+  /// Carry the loss instead: re-anchor it as a slot hole at the SURVIVING
+  /// parent. The crawl's own re-install of that slot heals it through the
+  /// [`install_child`](Self::install_child) interlock (both bridge bits →
+  /// the window's closing `Rescan` covers the whole dark interval), and a
+  /// slot the crawl does not rebuild (the name vanished) stays booked for
+  /// the dispatch re-signal until the in-flight `Removed` converges it. A
+  /// drop that erased nothing carries nothing, so a clean rebuild of
+  /// deficit-free coverage stays silent and pure prune/regrow flows are
+  /// unaffected. Every other `drop_subtree` context (record-delivered
+  /// churn, held-subtree resolution, umbrella prune, teardown, root
+  /// invalidation) keeps the bare call: those erasures are converged,
+  /// covered at the hold's resolution, out of contract, or terminal.
+  fn drop_subtree_for_crawl_rebuild(&mut self, child: WatchId) {
+    let anchor = self.nodes.get(&child).and_then(|node| {
+      node
+        .parent
+        .zip(node.name.clone())
+        .map(|(parent, name)| (node.scope, parent, name))
+    });
+    if self.drop_subtree(child)
+      && let Some((scope, parent, name)) = anchor
+    {
+      self.record_slot_deficit(scope, parent, name);
+    }
   }
 
   /// Drops every pending move half belonging to `scope`. Called only on whole-scope
@@ -2867,9 +2915,13 @@ impl Monitor {
     }
   }
 
-  /// Records an arm-refused slot hole `(parent, name)` in `scope`'s deficit
-  /// book (see [`DeficitBook::slots`]). The caller has already emitted the
-  /// edge `Rescan`; this carries the level-persistent fact past it.
+  /// Records a slot hole `(parent, name)` in `scope`'s deficit book (see
+  /// [`DeficitBook::slots`]): an arm-refused install, or an organically
+  /// erased deficit re-anchored by
+  /// [`drop_subtree_for_crawl_rebuild`](Self::drop_subtree_for_crawl_rebuild).
+  /// The hole's edge `Rescan` already stands (emitted at the arm failure,
+  /// or when the re-anchored deficit was originally recorded); this carries
+  /// the level-persistent fact past it.
   fn record_slot_deficit(&mut self, scope: ScopeId, parent: WatchId, name: Segment) {
     if !self.scope_descends(scope) {
       return;
@@ -2943,16 +2995,24 @@ impl Monitor {
     }
   }
 
-  /// Drops the fine entries anchored at a dying node — `drop_subtree`'s hook.
-  /// No bridge bits: the drop is record-delivered (converged), crawl-covered
-  /// (the rebuild's own installs re-set the bits), an umbrella prune
-  /// (unsubscribed by contract), or a teardown (terminal `Rescan`).
-  fn drop_node_deficits(&mut self, scope: ScopeId, id: WatchId) {
-    if let Some(book) = self.deficits.get_mut(&scope) {
-      book.interiors.remove(&id);
-      book.slots.remove(&id);
-      self.gc_deficit_book(scope);
-    }
+  /// Drops the fine entries anchored at a dying node — `drop_subtree`'s
+  /// hook — reporting whether any were actually recorded. No bridge bits
+  /// here: a record-delivered drop converged, a held-subtree drop is covered
+  /// at the hold's resolution, an umbrella prune is unsubscribed by
+  /// contract, and a teardown ends in a terminal `Rescan`. A crawl rebuild
+  /// has no such story — its re-installs re-set the bits only for a deficit
+  /// anchored at a SURVIVING parent, never for one whose anchor dies with
+  /// the subtree — so
+  /// [`drop_subtree_for_crawl_rebuild`](Self::drop_subtree_for_crawl_rebuild)
+  /// re-anchors a reported erasure at the surviving parent instead.
+  fn drop_node_deficits(&mut self, scope: ScopeId, id: WatchId) -> bool {
+    let Some(book) = self.deficits.get_mut(&scope) else {
+      return false;
+    };
+    let interior = book.interiors.remove(&id);
+    let slots = book.slots.remove(&id).is_some();
+    self.gc_deficit_book(scope);
+    interior || slots
   }
 
   /// Removes an emptied, uncollapsed book — the entry-present-only-while-
