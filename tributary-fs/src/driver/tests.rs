@@ -5952,12 +5952,12 @@ mod sync_cookie {
 
   // The close obligation count is taken from ONE ledger snapshot, so it can never
   // report a false `Ok(0)` over a live obligation. The foreclosed race: an owned
-  // record's unlink confirming BETWEEN a read of `names` (which excluded an
-  // in-flight same-name write as the claimed-record de-dup) and a read of `owned`
+  // record's unlink confirming BETWEEN a read of the owned IDS (which excluded a
+  // same-id in-flight write as the claimed-record de-dup) and a read of `owned`
   // drops a TWO-snapshot count to zero while that write is still outstanding.
   //
-  // Form (b), the direct unit: the two-scope same-name race is reachable only
-  // through the direct fs API (the umbrella mints per-sync-unique names) and the
+  // Form (b), the direct unit: the claimed-self-reap race — one write present in
+  // BOTH the ledger and `writes_in_flight` under a single incarnation id — and the
   // inter-snapshot window cannot be forced deterministically through the driver,
   // so the ledger state is built directly and the count asserted at each snapshot
   // point. Faithful because the count is the whole of what close reports, and the
@@ -5983,24 +5983,26 @@ mod sync_cookie {
       inner.names.insert(name.to_owned(), path);
       id
     }
-    fn writes_in_flight(pairs: &[(u64, &str)]) -> BTreeMap<ScopeId, String> {
-      pairs
+    fn writes_in_flight(
+      entries: &[(u64, &str, CookieId)],
+    ) -> BTreeMap<ScopeId, (String, CookieId)> {
+      entries
         .iter()
-        .map(|(scope, name)| {
+        .map(|(scope, name, id)| {
           (
             ScopeId::new(NonZeroU64::new(*scope).unwrap()),
-            (*name).to_owned(),
+            ((*name).to_owned(), *id),
           )
         })
         .collect()
     }
 
-    // The race state: scope 1 OWNS cookie "N" (its unlink unconfirmed) while scope
-    // 2 has an in-flight write of the SAME name — one name across two live paths,
-    // which only a direct fs-API caller can produce.
+    // The race state: scope 1's write both CLAIMED its record "N" (id X, unlink
+    // unconfirmed) AND still sits in `writes_in_flight` under that same id X — a
+    // reply-failed self-reap mid-flight, the one obligation the dedup governs.
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
     let id_n = insert_owned(&reg, 1, "N", "/r1/N");
-    let in_flight = writes_in_flight(&[(2, "N")]);
+    let in_flight = writes_in_flight(&[(1, "N", id_n)]);
     assert_eq!(
       reg.obligation_count(&in_flight),
       1,
@@ -6009,8 +6011,8 @@ mod sync_cookie {
 
     // The single snapshot is immune to WHERE it falls relative to the owned
     // record's unlink confirming: drop that record (the confirm) and the same
-    // obligation is STILL counted, now as the in-flight write whose name the
-    // ledger no longer holds. Both snapshot points yield 1.
+    // obligation is STILL counted, now as the in-flight write whose id the ledger
+    // no longer owns. Both snapshot points yield 1.
     lock_ledger(&reg.ledger).drop_record_if(&PathBuf::from("/r1/N"), id_n);
     assert_eq!(
       reg.obligation_count(&in_flight),
@@ -6019,43 +6021,61 @@ mod sync_cookie {
     );
 
     // The foreclosed hazard, made representable: the REPLACED two-snapshot form —
-    // read `names` first, let an owned unlink confirm, THEN read `owned` — sums to
-    // a FALSE 0 with obligation "N" still in flight. This is the read the single
-    // snapshot above makes unrepresentable.
+    // read the owned IDS first (they dedup the same-id in-flight write out), let
+    // the owned unlink confirm, THEN read `owned` — sums to a FALSE 0 with
+    // obligation "N" still in flight. This is the read the single snapshot above
+    // makes unrepresentable.
     let id_n = insert_owned(&reg, 1, "N", "/r1/N");
-    let names_snapshot = {
+    let in_flight = writes_in_flight(&[(1, "N", id_n)]);
+    let ids_snapshot = {
       let inner = lock_ledger(&reg.ledger);
+      let owned_ids: std::collections::HashSet<CookieId> =
+        inner.owned.values().map(|rec| rec.id).collect();
       in_flight
         .values()
-        .filter(|name| !inner.names.contains_key(*name))
+        .filter(|(_, id)| !owned_ids.contains(id))
         .count()
     };
     lock_ledger(&reg.ledger).drop_record_if(&PathBuf::from("/r1/N"), id_n);
     let owned_snapshot = lock_ledger(&reg.ledger).owned.len();
     assert_eq!(
-      names_snapshot + owned_snapshot,
+      ids_snapshot + owned_snapshot,
       0,
       "a read straddling the confirm sums to a FALSE 0 — the single snapshot reads 1 at both points"
     );
 
-    // An UNCLAIMED in-flight write (no ledger record) is one obligation, counted
-    // once.
+    // An UNCLAIMED in-flight write (no owned record bears its id) is one
+    // obligation, counted once.
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
     assert_eq!(
-      reg.obligation_count(&writes_in_flight(&[(1, "M")])),
+      reg.obligation_count(&writes_in_flight(&[(1, "M", CookieId(999))])),
       1,
       "an unclaimed in-flight write is one obligation"
     );
 
-    // A CLAIMED self-reap — its `reply.send` failed, so it both claimed its record
-    // AND still sits in `writes_in_flight` under the same scope and name — is ONE
+    // A CLAIMED self-reap — its `reply.send` failed, so it both claimed record
+    // id X AND still sits in `writes_in_flight` under that same id — is ONE
     // physical obligation, counted once rather than once per place it appears.
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    insert_owned(&reg, 1, "M", "/r/M");
+    let id_m = insert_owned(&reg, 1, "M", "/r/M");
     assert_eq!(
-      reg.obligation_count(&writes_in_flight(&[(1, "M")])),
+      reg.obligation_count(&writes_in_flight(&[(1, "M", id_m)])),
       1,
       "a claimed self-reap is one obligation, counted once and never twice"
+    );
+
+    // Two DISTINCT in-flight writes reusing ONE name across disjoint scopes (a
+    // direct-API name reuse — the umbrella never mints it) are TWO physical
+    // obligations: each carries its own dispatch id, so id-dedup counts both where
+    // the old name-dedup collapsed them to one (R12-F3).
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
+    assert_eq!(
+      reg.obligation_count(&writes_in_flight(&[
+        (1, "N", CookieId(1)),
+        (2, "N", CookieId(2))
+      ])),
+      2,
+      "two distinct same-name in-flight writes each count once — id-dedup, never name-dedup"
     );
   }
 
@@ -6773,20 +6793,106 @@ mod sync_cookie {
     drop(pending_replies);
   }
 
-  // The admission gauge counts each obligation exactly ONCE — a claimed self-reap
-  // (name in `names` AND in `writes_in_flight`) is one physical obligation, and
-  // the parked-cookies term is disjoint from both — so the whole-lifecycle sum is
-  // `obligation_count + parked`, never a naive `owned + writes + parked`.
+  // R12-F3: the global cookie cap dedups in-flight writes by INCARNATION ID, not
+  // NAME, so a direct-fs-API caller reusing ONE cookie name across many disjoint
+  // scopes cannot bypass it. The public `sync_root` API permits the same normal
+  // name on disjoint scopes; once one owned cookie named N exists, the old
+  // NAME-dedup excluded EVERY in-flight write named N (its name sat in `names`), so
+  // k same-name held writes on k scopes each contributed 0 — an unbounded
+  // blocking-pool / `writes_in_flight` bypass. Under id-dedup each held write
+  // carries a distinct DISPATCH id, so it is counted and the cap binds. (The
+  // umbrella is unaffected — it mints per-sync-unique names.)
   //
-  // GUARD CELL: its fail-on-old target is a NAIVE widening (which would
-  // double-count the claimed self-reap and read 3, a spurious refusal), NOT
-  // e8269c7 — e8269c7's failure is cell 8. It pins the reuse of the proven dedup.
+  // Fail-on-old (obligation_count reverted to name-dedup): the owned N puts N in
+  // `names`, so every same-name held write is excluded, `obligation_count` stays
+  // pinned at 1, the gauge never reaches the cap, the (cap+1)-th sync is ADMITTED,
+  // its held write PARKS behind the hold, and the prompt-refusal assertion times
+  // out. Deterministic via the write hold.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn same_name_writes_on_disjoint_scopes_each_count_against_the_global_cap() {
+    // global_cap = 3, backlog_cap = 8 (the per-scope cap never binds — one cookie
+    // per scope).
+    let rig = rig_with_config(64, low_global_cap_config());
+    let cap = low_global_cap_config().cookie_global_cap;
+    // The ONE cookie name reused across every disjoint scope — exactly the
+    // direct-API pattern the umbrella never produces.
+    let shared = ".tributaries-sync-shared";
+
+    // cap + 1 disjoint scopes, each separately rooted so the shared name lands at a
+    // DISTINCT path per scope (name reuse across live paths — direct-API only).
+    let mut scopes = Vec::new();
+    for i in 0..=cap {
+      let root = format!("/rs{i}");
+      rig.fs.put(&root, FileKind::Dir, 700 + i as u64);
+      scopes.push((root.clone(), watch(&rig, &root).await));
+    }
+
+    // Scope 0's sync COMPLETES and leaves cookie N owned (unlink unconfirmed): this
+    // is what puts N into `names` and triggered the old name-dedup bypass.
+    let (root0, scope0) = &scopes[0];
+    let owned = admit_sync(&rig, *scope0, root0, shared).await;
+    assert_eq!(owned, PathBuf::from(format!("{root0}/{shared}")));
+    settle_cookie_count(&rig, 1).await;
+
+    // From here every write hangs in the pool. The owned N holds one obligation;
+    // each held write named N must add one MORE (by its own id), never be masked.
+    let hold = rig.fs.hold_cookie_writes();
+
+    // Syncs on scopes 1..cap, all named N: each admits and dispatches a held write.
+    // With owned(1) + (cap-1) held writes the gauge reaches the cap.
+    let mut pending = Vec::new();
+    for (j, (root, scope)) in scopes[1..cap].iter().enumerate() {
+      let reply = sync_root_pending(&rig, *scope, root, shared).await;
+      pending.push(reply);
+      // owned N's completed write (1) + this held write and its predecessors.
+      let want = j + 2;
+      settle(|| rig.fs.cookie_dispatches() >= want).await;
+      assert_eq!(
+        rig.fs.cookie_dispatches(),
+        want,
+        "each same-name held write is dispatched and counted by id before the next admission"
+      );
+    }
+
+    // The (cap+1)-th sync (scope `cap`), still named N: the gauge is owned(1) +
+    // (cap-1) held = cap ≥ cap → refused PROMPTLY. Under name-dedup it would be
+    // admitted (every held write masked by the owned N's name) and park behind the
+    // hold, timing this out.
+    let (root_last, scope_last) = &scopes[cap];
+    let last_reply = sync_root_pending(&rig, *scope_last, root_last, shared).await;
+    let last = tokio::time::timeout(Duration::from_secs(3), last_reply)
+      .await
+      .expect("the (cap+1)-th refusal resolves promptly, never pends behind the write hold")
+      .expect("the driver replies");
+    assert!(
+      matches!(last, Err(crate::error::SyncRootError::CleanupBacklog)),
+      "the same-name write past the cap is refused — id-dedup counts each once, got {last:?}"
+    );
+
+    // Cleanup: release the hold so the held writes drain, then drop the receivers.
+    hold.release();
+    settle(|| rig.fs.cookie_writes().len() >= cap).await;
+    drop(pending);
+  }
+
+  // The admission gauge counts each obligation exactly ONCE — a claimed self-reap
+  // (its owned record and its in-flight write sharing one incarnation id) is one
+  // physical obligation, and the parked-cookies term is disjoint from both — so
+  // the whole-lifecycle sum is `obligation_count + parked`, never a naive
+  // `owned + writes + parked`. It ALSO pins id-dedup (R12-F3): an owned record
+  // plus a DISTINCT same-name write on another scope counts two, not one.
+  //
+  // GUARD CELL: its fail-on-old targets are a NAIVE widening (which would
+  // double-count the claimed self-reap and read 3, a spurious refusal) and the old
+  // NAME-dedup (which would mask the distinct same-name write and read 1) — NOT
+  // e8269c7, whose failure is cell 8. It pins the dedup, now keyed by id.
   #[tokio::test(flavor = "multi_thread")]
   async fn the_admission_gauge_counts_each_obligation_once() {
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    // A claimed self-reap: name "M" in `names` (claim landed) AND in
-    // `writes_in_flight` (its CookieWriteDone hasn't cleared the gate).
-    {
+    // A claimed self-reap: record "M" (id X) owned (claim landed) AND its write
+    // still in `writes_in_flight` under that SAME id X (its CookieWriteDone hasn't
+    // cleared the gate).
+    let id = {
       let mut inner = lock_ledger(&reg.ledger);
       inner.next_cookie_id += 1;
       let id = CookieId(inner.next_cookie_id);
@@ -6802,11 +6908,14 @@ mod sync_cookie {
         },
       );
       inner.names.insert("M".to_owned(), path);
-    }
-    let in_flight: BTreeMap<ScopeId, String> =
-      [(ScopeId::new(NonZeroU64::new(1).unwrap()), "M".to_owned())]
-        .into_iter()
-        .collect();
+      id
+    };
+    let in_flight: BTreeMap<ScopeId, (String, CookieId)> = [(
+      ScopeId::new(NonZeroU64::new(1).unwrap()),
+      ("M".to_owned(), id),
+    )]
+    .into_iter()
+    .collect();
     assert_eq!(
       reg.obligation_count(&in_flight),
       1,
@@ -6819,6 +6928,43 @@ mod sync_cookie {
       reg.obligation_count(&in_flight) + parked_len,
       2,
       "the whole-lifecycle gauge counts each stage once — a naive owned+writes+parked would read 3"
+    );
+
+    // R12-F3: the dedup key is the incarnation ID, not the name. An owned record
+    // named N (id X) plus a DISTINCT in-flight write reusing that NAME on another
+    // scope (id Y ≠ X — the direct-API name reuse the umbrella never produces) is
+    // TWO obligations: the write's id is not owned, so it is NOT masked by the
+    // owned record's shared name. Old name-dedup read 1 here (the bypass).
+    let reg2 = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
+    let x = {
+      let mut inner = lock_ledger(&reg2.ledger);
+      inner.next_cookie_id += 1;
+      let x = CookieId(inner.next_cookie_id);
+      let path = PathBuf::from("/r1/N");
+      inner.owned.insert(
+        path.clone(),
+        CookieRecord {
+          scope: ScopeId::new(NonZeroU64::new(1).unwrap()),
+          name: "N".to_owned(),
+          id: x,
+          last_failure_seq: 0,
+          state: RemovalState::Owned,
+        },
+      );
+      inner.names.insert("N".to_owned(), path);
+      x
+    };
+    let y = CookieId(x.0 + 1); // a DISTINCT write's dispatch id, same name N
+    let same_name_distinct: BTreeMap<ScopeId, (String, CookieId)> = [(
+      ScopeId::new(NonZeroU64::new(2).unwrap()),
+      ("N".to_owned(), y),
+    )]
+    .into_iter()
+    .collect();
+    assert_eq!(
+      reg2.obligation_count(&same_name_distinct),
+      2,
+      "an owned cookie plus a distinct same-name in-flight write count TWO — id-dedup, not name (R12-F3)"
     );
   }
 

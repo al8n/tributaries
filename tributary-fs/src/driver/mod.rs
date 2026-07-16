@@ -181,7 +181,7 @@ struct ParkedCookie {
 /// conditioned on the id still matching — the record-level mirror of the
 /// per-scope root generation (R6-5): stale actors become no-ops instead of
 /// acting on the wrong incarnation.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct CookieId(u64);
 
 /// Everything the pool and the driver must observe atomically about cookies:
@@ -215,11 +215,14 @@ struct LedgerInner {
   /// Bounded by dispatched writes (at most one per scope) and swept on every
   /// write completion.
   cancelled: HashSet<String>,
-  /// The id mint (§1.1). Bumped under this mutex at every record INSERT — the
-  /// two insert sites are [`CookieGuard::claim`] and `self_reap`'s
-  /// failed-unlink re-assertion, both pool-side, both already under the lock.
-  /// `u64` monotone, driver-lifetime only (no persistence, no wraparound
-  /// concern), so no two record incarnations ever share an id.
+  /// The id mint (§1.1). Bumped under this mutex ONCE per physical write, at
+  /// DISPATCH ([`CookieRegistry::dispatch_guard`]) — the id rides the guard from
+  /// there through the [`CookieGuard::claim`] that adopts it and any `self_reap`
+  /// re-assertion, so one write carries one id across its whole lifecycle and the
+  /// global cap can dedup an in-flight write against its own owned record by id
+  /// rather than by the reusable name (R12-F3). `u64` monotone, driver-lifetime
+  /// only (no persistence, no wraparound concern), so no two write incarnations
+  /// ever share an id.
   next_cookie_id: u64,
   /// The LRU clock for recovery re-arm ordering (R11-1). Bumped under this
   /// mutex at every transition INTO `RemoveFailed`, stamping the failing
@@ -346,6 +349,13 @@ struct CookieGuard {
   /// The rendered cookie name this write will create — the cancel key, and the
   /// `names` index entry a successful claim inserts.
   name: String,
+  /// This write's incarnation id (§1.1), minted at DISPATCH under the ledger lock
+  /// (the SINGLE mint site) and carried from here: the [`claim`](Self::claim) that
+  /// adopts it stamps it on the record, and a `self_reap` re-assertion reuses it —
+  /// so the write's `writes_in_flight` entry and its owned record share one id,
+  /// which the global cap dedups on so a reused name cannot mask a distinct write
+  /// (R12-F3).
+  id: CookieId,
   ledger: CookieLedger,
   /// The registry is gone (driver returned, panicked, or was cancelled).
   shutdown: Arc<AtomicBool>,
@@ -397,10 +407,11 @@ impl CookieGuard {
     {
       return None;
     }
-    // Mint this incarnation's id inside the same critical section as the
-    // insert (§2.1) — the record-level mirror of R6-5's per-scope generation.
-    inner.next_cookie_id += 1;
-    let id = CookieId(inner.next_cookie_id);
+    // Adopt this write's DISPATCH id (§1.1) — minted once, under this same ledger
+    // lock, at `dispatch_guard`, the record-level mirror of R6-5's per-scope
+    // generation — rather than minting a second here: the claim stamps the guard's
+    // id onto the record so one physical write carries one id from dispatch through
+    // ownership. Still monotone and unique-per-write.
     // The insert MAY overwrite an existing record at this path. That is
     // deliberate and safe: production `write_cookie` creates with `create_new`,
     // so a claim reaches a path only when no file existed there — any prior
@@ -417,13 +428,13 @@ impl CookieGuard {
       CookieRecord {
         scope: self.scope,
         name: self.name.clone(),
-        id,
+        id: self.id,
         last_failure_seq: 0,
         state: RemovalState::Owned,
       },
     );
     inner.names.insert(self.name.clone(), path.to_path_buf());
-    Some(id)
+    Some(self.id)
   }
 }
 
@@ -533,10 +544,16 @@ impl<F: FsOps> CookieRegistry<F> {
   }
 
   /// The ownership handle one dispatched write carries, minting the scope's
-  /// retirement flag on demand. Taken at dispatch, so the flags cover the whole
-  /// in-flight window: everything that retires the cookie between here and the
-  /// write's landing is visible to the write itself. `name` is the rendered
-  /// cookie name — the claim's `names` index entry and the cancel key.
+  /// retirement flag on demand AND this write's incarnation id (§1.1). Taken at
+  /// dispatch, so the flags cover the whole in-flight window: everything that
+  /// retires the cookie between here and the write's landing is visible to the
+  /// write itself. The id is minted here — the SINGLE mint site — under the ledger
+  /// lock, so it is atomic with a concurrent claim's read of the counter and the
+  /// write names its own obligation from dispatch (the claim that adopts it and
+  /// any self-reap re-assertion reuse it); this is what lets the global cap dedup
+  /// an in-flight write against its owned record by id, not by the reusable name
+  /// (R12-F3). `name` is the rendered cookie name — the claim's `names` index
+  /// entry and the cancel key.
   fn dispatch_guard(&mut self, scope: ScopeId, name: String) -> CookieGuard {
     let generation = Arc::clone(
       self
@@ -545,12 +562,19 @@ impl<F: FsOps> CookieRegistry<F> {
         .or_insert_with(|| Arc::new(AtomicU64::new(0))),
     );
     let dispatched_generation = generation.load(Ordering::SeqCst);
+    let retiring = Arc::clone(self.retiring.entry(scope).or_default());
+    let id = {
+      let mut inner = lock_ledger(&self.ledger);
+      inner.next_cookie_id += 1;
+      CookieId(inner.next_cookie_id)
+    };
     CookieGuard {
       scope,
       name,
+      id,
       ledger: Arc::clone(&self.ledger),
       shutdown: Arc::clone(&self.shutdown),
-      retiring: Arc::clone(self.retiring.entry(scope).or_default()),
+      retiring,
       generation,
       dispatched_generation,
     }
@@ -574,11 +598,13 @@ impl<F: FsOps> CookieRegistry<F> {
 
   /// The count of outstanding PHYSICAL cookie obligations, computed from ONE
   /// ledger snapshot so the two halves cannot race: every owned record (each an
-  /// unconfirmed removal), PLUS every in-flight write whose name is NOT already
-  /// an owned record. A write whose `reply.send` failed CLAIMED its record (so
-  /// its name IS owned, state `Removing`) yet still sits in `writes_in_flight`
-  /// until its `CookieWriteDone` lands — counting it via the ledger alone avoids
-  /// double-tallying that one physical obligation.
+  /// unconfirmed removal), PLUS every in-flight write whose incarnation id is NOT
+  /// already an owned record's. The dedup key is the ID (§1.1) — minted at
+  /// dispatch and carried by the write — NOT the reusable name: a write whose
+  /// `reply.send` failed CLAIMED its record (state `Removing`) yet still sits in
+  /// `writes_in_flight` until its `CookieWriteDone` lands, and because its record
+  /// bears its own id it is deduped, so that one physical obligation is tallied
+  /// via the ledger alone.
   ///
   /// Serves BOTH the close reply (a `NotQuiesced` count) AND `SyncRoot`
   /// admission (the whole-lifecycle global cap, §4.1 — `obligation_count +
@@ -588,18 +614,22 @@ impl<F: FsOps> CookieRegistry<F> {
   ///
   /// Taking both halves under a SINGLE lock is what forecloses a false `Ok(0)`:
   /// with two snapshots, an owned record's unlink could confirm BETWEEN reading
-  /// `names` (which excluded an in-flight same-name write) and reading
+  /// the owned ids (which excluded a same-id in-flight write) and reading
   /// `owned.len()`, dropping the count to zero while that write is still blocked.
-  /// One snapshot keeps the invariant "every `names` entry points at a live
-  /// `owned` record", so a non-empty obligation is always counted by exactly one
-  /// side. (A direct-fs-API caller reusing ONE name across two live paths can
-  /// still be under-counted by one — never to zero — a conservative imprecision
-  /// the umbrella never reaches, since it mints per-sync-unique names.)
-  fn obligation_count(&self, writes_in_flight: &BTreeMap<ScopeId, String>) -> usize {
+  /// One snapshot keeps the invariant "an id in `writes_in_flight` that names a
+  /// live `owned` record is counted by exactly one side". Deduping by id, not
+  /// name, is what makes the count EXACT for a direct-fs-API caller reusing ONE
+  /// name across many disjoint scopes: each such physical write carries a distinct
+  /// dispatch id, so k same-name in-flight writes count k — not the ≤ 1 the old
+  /// name dedup collapsed them to, which let them bypass the global cap unboundedly
+  /// (R12-F3). (The orthogonal one-name-two-paths NEWEST-WINS imprecision lives in
+  /// cancel-by-name's `names` index, not here, and is unchanged.)
+  fn obligation_count(&self, writes_in_flight: &BTreeMap<ScopeId, (String, CookieId)>) -> usize {
     let inner = lock_ledger(&self.ledger);
+    let owned_ids: HashSet<CookieId> = inner.owned.values().map(|rec| rec.id).collect();
     let unclaimed_writes = writes_in_flight
       .values()
-      .filter(|name| !inner.names.contains_key(*name))
+      .filter(|(_, id)| !owned_ids.contains(id))
       .count();
     unclaimed_writes + inner.owned.len()
   }
@@ -808,7 +838,7 @@ impl<F: FsOps> CookieRegistry<F> {
     &self,
     op_tx: &async_channel::Sender<OpResult<F::Handle>>,
     pending_retries: &mut BTreeMap<PathBuf, RetrySlot>,
-    writes_in_flight: &BTreeMap<ScopeId, String>,
+    writes_in_flight: &BTreeMap<ScopeId, (String, CookieId)>,
     name: &str,
   ) -> CancelDisposition
   where
@@ -828,7 +858,10 @@ impl<F: FsOps> CookieRegistry<F> {
           RemovalRequest::Explicit,
         );
         decision.map(|id| (path, id))
-      } else if writes_in_flight.values().any(|in_flight| in_flight == name) {
+      } else if writes_in_flight
+        .values()
+        .any(|(in_flight, _)| in_flight == name)
+      {
         // DISPATCHED, not yet claimed: tombstone it (T11). The claim consumes
         // it (T12) or `CookieWriteDone` sweeps it.
         inner.cancelled.insert(name.to_owned());
@@ -1408,7 +1441,7 @@ fn resolve_cover_settlements<R, F>(
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   cookies: &mut CookieRegistry<F>,
-  writes_in_flight: &mut BTreeMap<ScopeId, String>,
+  writes_in_flight: &mut BTreeMap<ScopeId, (String, CookieId)>,
   live: &dyn Fn(ScopeId) -> bool,
 ) where
   R: RuntimeLite,
@@ -1458,15 +1491,18 @@ fn resolve_cover_settlements<R, F>(
         continue;
       };
       // The dispatched write is a TRACKED, single-flighted job: mark the scope
-      // in flight (a second sync is refused until this resolves), keyed by the
-      // rendered cookie NAME so a cancel can probe "is this name a dispatched
-      // write". An outstanding write holds close in `NotQuiesced` (the close
-      // reply counts `writes_in_flight`) rather than letting it wedge on a hung
-      // mount. The guard is taken HERE, at dispatch, so the flags it carries
-      // cover the whole in-flight window: a teardown or a driver exit between
-      // this line and the write's landing is visible to the write itself.
-      writes_in_flight.insert(cookie.scope, cookie.name.clone());
+      // in flight (a second sync is refused until this resolves), recording the
+      // rendered cookie NAME (so a cancel can probe "is this name a dispatched
+      // write") AND the write's DISPATCH id (so the global cap dedups this
+      // in-flight write against its own owned record by id, not by the reusable
+      // name — R12-F3). An outstanding write holds close in `NotQuiesced` (the
+      // close reply counts `writes_in_flight`) rather than letting it wedge on a
+      // hung mount. The guard is taken HERE FIRST, at dispatch, so the flags it
+      // carries cover the whole in-flight window — a teardown or a driver exit
+      // between this line and the write's landing is visible to the write itself —
+      // and its freshly minted id is the one recorded alongside the name.
       let guard = cookies.dispatch_guard(cookie.scope, cookie.name.clone());
+      writes_in_flight.insert(cookie.scope, (cookie.name.clone(), guard.id));
       let ops = ops.clone();
       let tx = op_tx.clone();
       let scope = cookie.scope;
@@ -1539,7 +1575,8 @@ fn resolve_cover_settlements<R, F>(
 ///
 /// `claimed = None` — the claim was REFUSED, so no record exists and no
 /// dispatcher can race us (`names` never learned this path); a failed unlink
-/// INSERTS the failed record with a FRESH id. `claimed = Some(id)` — the reply
+/// INSERTS the failed record with the guard's DISPATCH id (no record ever adopted
+/// it, so it is free and unique). `claimed = Some(id)` — the reply
 /// send FAILED, so OUR claim inserted record `id` in `Owned`, and a racing
 /// token-cancel may already have moved it to `Removing` and dispatched its own
 /// unlink (the caller-gone event that fails `reply.send` is the same event that
@@ -1604,15 +1641,16 @@ fn self_reap<F: FsOps>(
           Some((path.clone(), id))
         }
         None => {
-          // Refusal case: RE-ASSERT ownership with a FRESH id — this insert is a
-          // record birth, exactly like a claim (and it deliberately ignores the
-          // shutdown/retiring flags, as today: it is what keeps a failing unlink
-          // from orphaning the file). It may overwrite a stale fileless record
-          // at this path — same argument as §2.1 (our create_new proved no file
-          // existed before ours). A post-`Drop` insert is the accepted
+          // Refusal case: RE-ASSERT ownership with the guard's DISPATCH id — the
+          // claim was refused, so no record ever adopted that id, and this is the
+          // SAME physical write re-asserting the file it just created. This insert
+          // is a record birth, exactly like a claim (and it deliberately ignores
+          // the shutdown/retiring flags, as today: it is what keeps a failing
+          // unlink from orphaning the file). It may overwrite a stale fileless
+          // record at this path — same argument as §2.1 (our create_new proved no
+          // file existed before ours). A post-`Drop` insert is the accepted
           // abnormal-path best-effort.
-          inner.next_cookie_id += 1;
-          let id = CookieId(inner.next_cookie_id);
+          let id = guard.id;
           inner.failure_clock += 1;
           let seq = inner.failure_clock;
           inner.names.insert(guard.name.clone(), path.clone());
@@ -2845,7 +2883,7 @@ fn handle_cookie_reap<R, F>(
   cookies: &CookieRegistry<F>,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
   pending_retries: &mut BTreeMap<PathBuf, RetrySlot>,
-  writes_in_flight: &BTreeMap<ScopeId, String>,
+  writes_in_flight: &BTreeMap<ScopeId, (String, CookieId)>,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   core: &mut DriverCore,
 ) where
@@ -3054,14 +3092,16 @@ pub(crate) async fn run<R, F>(
   let mut parked_cookies: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
   // Scopes with a DISPATCHED physical cookie write outstanding — the single-
   // flight gate — each mapped to that write's rendered cookie NAME (the cancel
-  // handler's "is this name a dispatched write" probe). A `Command::SyncRoot`
-  // for a scope already in here (or with a write still parked) is refused
-  // `WriteInFlight` rather than dispatching a second, so a caller that times out
-  // and retries cannot pile unbounded blocking writes against a hung mount. Set
-  // at write dispatch, cleared when the write's `CookieWriteDone` lands; still
-  // at most one entry per scope. `writes_in_flight.len()` is the close reply's
-  // in-pool-write count (no ledger record exists yet, so it is not double-counted).
-  let mut writes_in_flight: BTreeMap<ScopeId, String> = BTreeMap::new();
+  // handler's "is this name a dispatched write" probe) and its DISPATCH
+  // incarnation id (the id the global cap dedups this in-flight write on, against
+  // its own owned record — R12-F3). A `Command::SyncRoot` for a scope already in
+  // here (or with a write still parked) is refused `WriteInFlight` rather than
+  // dispatching a second, so a caller that times out and retries cannot pile
+  // unbounded blocking writes against a hung mount. Set at write dispatch, cleared
+  // when the write's `CookieWriteDone` lands; still at most one entry per scope.
+  // `writes_in_flight.len()` is the close reply's in-pool-write count (no ledger
+  // record exists yet, so it is not double-counted).
+  let mut writes_in_flight: BTreeMap<ScopeId, (String, CookieId)> = BTreeMap::new();
   // The cookie-unlink retry SCHEDULE: only paths with a due-in-future retry
   // appear, mapped to a slot carrying the deadline AND the incarnation the slot
   // was scheduled for (the attempt count rides the ledger record, so the close
@@ -3774,8 +3814,9 @@ pub(crate) async fn run<R, F>(
                 // once — a parked (not-yet-dispatched) write, a blocking write in
                 // flight, and an owned-but-unconfirmed record — the three terms
                 // disjoint by construction (a claimed write is deduped into the
-                // owned term via `names`, and a parked cookie has neither a record
-                // nor a `writes_in_flight` entry). Admission increments Φ by
+                // owned term by its incarnation id, not its name — R12-F3 — and a
+                // parked cookie has neither a record nor a `writes_in_flight`
+                // entry). Admission increments Φ by
                 // exactly one only under Φ < cap, and no other event increases it,
                 // so Φ ≤ cap at every point (§4.3): the ledger is bounded by a
                 // FLAT cap, blocking cookie-write jobs in flight ≤ Φ ≤ cap (the
