@@ -4062,7 +4062,10 @@ mod sync_cookie {
 
   // The terminal sweep is a `Drop`, so it is not a step of the orderly close
   // that a cancelled (or panicking) driver task can skip: dropping the driver
-  // future where it stands still reaps every cookie it owns.
+  // future where it stands still reaps every cookie it owns — now DETACHED (a
+  // best-effort off-reactor unlink), never a synchronous unlink that could
+  // wedge the unwind. The runtime outlives the aborted task, so the detached
+  // reap still runs.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_cancelled_driver_task_still_sweeps_its_cookies() {
     let (rig, driver) = cancellable_rig();
@@ -4081,11 +4084,13 @@ mod sync_cookie {
       "the driver was cancelled, not run to completion"
     );
 
-    // The Drop ran inside the cancellation, before the join resolved.
+    // The abnormal-path Drop DISPATCHED its sweep detached (never blocking the
+    // unwind); the still-live runtime runs it, reaping the cookie shortly after.
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert_eq!(
       rig.fs.cookie_removes(),
       vec![path],
-      "a cancelled driver still sweeps the cookies it owns"
+      "a cancelled driver still sweeps the cookies it owns, best-effort off-reactor"
     );
     assert!(
       rig.fs.files_under("/r").is_empty(),
@@ -4518,5 +4523,236 @@ mod sync_cookie {
     sync_root(&rig, scope, "/r", ".tributaries-sync-1-9-9-live")
       .await
       .expect("the scope is still live after the reaps");
+  }
+
+  // A transient unlink failure must not orphan the cookie: the record is
+  // RETAINED (dropped only when the unlink confirms) so the path stays eligible
+  // for a later sweep, and a retry eventually removes it. The old fire-and-forget
+  // unlink ignored every error, silently stranding the file with no record.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_transient_unlink_failure_retains_the_cookie_until_it_succeeds() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-4-1-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1, "the registry owns the cookie");
+
+    // The next unlink fails once; the reap dispatches it and it is refused.
+    rig.fs.fail_next_cookie_removes(1);
+    rig.cookie_removes.send(path.clone()).await.unwrap();
+    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      1,
+      "the unlink reached the pool and was refused"
+    );
+    assert!(
+      rig.fs.cookie_removes().is_empty(),
+      "a failed unlink records no removal"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the record is RETAINED across the transient failure — never orphaned"
+    );
+    assert!(
+      !rig.fs.files_under("/r").is_empty(),
+      "the file is still on disk, still eligible for a retry"
+    );
+
+    // A retry (the reap is re-requested) now succeeds and drops the record.
+    rig.cookie_removes.send(path.clone()).await.unwrap();
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert!(
+      rig.fs.cookie_removes().contains(&path),
+      "the retried unlink removed the cookie"
+    );
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the record dropped only once the unlink confirmed"
+    );
+  }
+
+  // Single-flight per scope: while one physical write is outstanding, a second
+  // sync is refused `WriteInFlight` rather than dispatching another — so a caller
+  // that times out and retries cannot pile unbounded blocking writes against a
+  // hung mount. Once the first write resolves the gate reopens.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_second_sync_while_a_write_is_in_flight_is_refused() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    // Hold the first write in the pool: the scope is now IN FLIGHT.
+    let hold = rig.fs.hold_cookie_writes();
+    let first = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-2-1-1").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      1,
+      "the first write is dispatched and outstanding"
+    );
+
+    // A second sync for the SAME scope is refused, never dispatched.
+    assert!(
+      matches!(
+        sync_root(&rig, scope, "/r", ".tributaries-sync-2-1-2").await,
+        Err(crate::error::SyncRootError::WriteInFlight)
+      ),
+      "a second sync while a write is in flight is refused single-flight"
+    );
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      1,
+      "the refusal never reached the pool — still exactly one write dispatched"
+    );
+
+    // Release the first write: it lands.
+    hold.release();
+    let path = first
+      .await
+      .expect("the driver replies")
+      .expect("the first write lands");
+    assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
+
+    // The gate reopens once the write fully resolves; a caller retries the
+    // (retryable) refusal until admitted.
+    let mut again = None;
+    for _ in 0..200 {
+      match sync_root(&rig, scope, "/r", ".tributaries-sync-2-1-3").await {
+        Ok(fresh) => {
+          again = Some(fresh);
+          break;
+        }
+        Err(crate::error::SyncRootError::WriteInFlight) => {
+          tokio::task::yield_now().await;
+          tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Err(other) => panic!("unexpected sync error: {other:?}"),
+      }
+    }
+    let again = again.expect("the single-flight gate reopened after the first write");
+    assert_ne!(again, path, "the second barrier is its own cookie");
+  }
+
+  // A physical write still outstanding at close makes close report `NotQuiesced`
+  // with the write counted — honest, never an indefinite hang. The write rides
+  // the same `pending_cookie_ops` accounting a teardown does.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_outstanding_cookie_write_makes_close_report_not_quiesced() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    // Hold a write in the pool: it is outstanding when close begins.
+    let hold = rig.fs.hold_cookie_writes();
+    let _on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-2-2-1").await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close resolves at the grace boundary, not an indefinite hang")
+      .expect("the driver replied");
+    assert_eq!(
+      pending, 1,
+      "the outstanding write is counted — close is honest, not wedged"
+    );
+
+    // The held write, released after close, self-reaps against the raised
+    // shutdown flag: no cookie file survives.
+    hold.release();
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the late write reaped the file it created"
+    );
+  }
+
+  // A hung TERMINAL unlink must never wedge close: the orderly sweep dispatches
+  // it as a tracked, grace-covered job, so close returns `NotQuiesced` within the
+  // grace instead of blocking forever inside a synchronous Drop.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_hung_terminal_unlink_does_not_wedge_close() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-3-1-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // The terminal unlink hangs.
+    let hold = rig.fs.hold_cookie_removes();
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close returns within the grace, never wedged on a hung unlink")
+      .expect("the driver replied");
+    assert_eq!(
+      pending, 1,
+      "the hung terminal unlink is counted, not papered over"
+    );
+
+    // Released, the unlink completes and the cookie is gone.
+    hold.release();
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert!(rig.fs.cookie_removes().contains(&path));
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the hung unlink completed once the mount unwedged"
+    );
+  }
+
+  // The abnormal-path Drop dispatches its unlinks DETACHED, so it never blocks
+  // the unwind: a cancelled driver whose terminal unlink is hung still returns
+  // promptly (the OLD synchronous Drop would hang here forever), and the reap is
+  // still ATTEMPTED best-effort off-reactor.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cancelled_driver_with_a_hung_unlink_does_not_block_its_drop() {
+    let (rig, driver) = cancellable_rig();
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-3-2-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(rig.fs.cookie_writes(), vec![path.clone()]);
+
+    // The terminal unlink hangs, then the driver is cancelled: Drop must not
+    // block on the unlink.
+    let hold = rig.fs.hold_cookie_removes();
+    driver.abort();
+    let joined = tokio::time::timeout(Duration::from_secs(5), driver).await;
+    assert!(
+      joined.is_ok(),
+      "Drop dispatched its unlink detached — the unwind was never blocked on the hung remove"
+    );
+    assert!(joined.unwrap().unwrap_err().is_cancelled());
+
+    // The reap was still attempted (detached, parked on the hung mount).
+    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      1,
+      "the abnormal-path Drop still dispatches the reap best-effort"
+    );
+
+    // Released, the detached unlink completes.
+    hold.release();
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert!(rig.fs.cookie_removes().contains(&path));
   }
 }

@@ -7061,6 +7061,64 @@ async fn a_barrier_installed_over_existing_debt_resolves_dominated() {
   );
 }
 
+/// A cookie write that completes for a caller who has ALREADY gone is reaped inline, never parked and
+/// never orphaned. This is the `on_sync` race's write-first outcome: the fs backend buffered its
+/// successful `Ok(path)` just as the caller's deadline fired, so its own send-failure self-reap will
+/// not run — reaping here is the only thing that frees the file.
+///
+/// Fail-on-old (drop the caller-gone check in `admit_begun_cookie`): the completed cookie is parked as
+/// a `PendingSync` no one waits on and its file is never `end_sync`ed here — both assertions fail.
+#[tokio::test]
+async fn a_completed_cookie_for_a_gone_caller_is_reaped_not_installed() {
+  use crate::{error::SyncError, source::SyncOutcome};
+
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  let (reply_tx, reply_rx) = futures_channel::oneshot::channel::<Result<SyncOutcome, SyncError>>();
+  drop(reply_rx);
+  let loss_gen_at_call = h.owner.loss_gen.load(core::sync::atomic::Ordering::SeqCst);
+  h.owner
+    .admit_begun_cookie(key("/a/cookie-1"), sub, handle, loss_gen_at_call, reply_tx);
+
+  assert!(
+    h.owner.pending_syncs.is_empty(),
+    "a completed cookie for a gone caller parks no barrier"
+  );
+  assert_eq!(
+    h.owner.source.ended_syncs,
+    vec![key("/a/cookie-1")],
+    "the completed cookie is reaped inline, never orphaned"
+  );
+}
+
+/// The companion: a completed cookie for a caller still waiting IS parked (and not reaped), so the
+/// caller-gone reap above is genuinely gated on the cancellation, not unconditional.
+#[tokio::test]
+async fn a_completed_cookie_for_a_live_caller_is_parked_not_reaped() {
+  use crate::{error::SyncError, source::SyncOutcome};
+
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  let (reply_tx, _reply_rx) = futures_channel::oneshot::channel::<Result<SyncOutcome, SyncError>>();
+  let loss_gen_at_call = h.owner.loss_gen.load(core::sync::atomic::Ordering::SeqCst);
+  h.owner
+    .admit_begun_cookie(key("/a/cookie-1"), sub, handle, loss_gen_at_call, reply_tx);
+
+  assert_eq!(
+    h.owner.pending_syncs.len(),
+    1,
+    "a live caller's barrier is parked to await its cookie"
+  );
+  assert!(
+    h.owner.source.ended_syncs.is_empty(),
+    "and its cookie is not reaped while the caller still waits"
+  );
+}
+
 /// A covering `Rescan` DELIVERED (never parked) between the caller's `sync()` call and the barrier's
 /// install dominates it too. An already-installed barrier riding that same `Rescan` resolves
 /// `Dominated` (the `dominate_*` family does it directly); a barrier whose caller had merely CALLED

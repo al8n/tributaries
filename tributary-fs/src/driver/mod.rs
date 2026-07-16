@@ -151,6 +151,11 @@ struct ParkedCookie {
 /// that nobody owns.
 type CookieLedger = Arc<Mutex<HashMap<PathBuf, ScopeId>>>;
 
+/// A detached-blocking-job spawner, captured from the driver's runtime so the
+/// registry's [`Drop`] can dispatch its best-effort abnormal-path unlinks
+/// off-reactor without an `R` type parameter in scope.
+type DetachedSpawner = Box<dyn Fn(Box<dyn FnOnce() + Send>) + Send>;
+
 /// Locks the ledger, ignoring poisoning: every critical section is a single map
 /// mutation that cannot leave the map half-written, and the terminal sweep runs
 /// from a [`Drop`] — where unwrapping a poisoned lock would abort the process
@@ -223,17 +228,24 @@ impl CookieGuard {
 /// cannot strand a file, and neither can a scope that dies under an in-flight
 /// write.
 ///
-/// The three sweeps that end a cookie's life all run through here — a completed-
-/// cookie reap ([`forget`](Self::forget) + unlink), a scope's stream teardown
-/// ([`retire_scope`](Self::retire_scope)), and the driver's exit (this type's
-/// [`Drop`]) — and each raises its flag before taking the paths, so a write
-/// still in the blocking pool can never slip a file past the sweep that was
-/// supposed to reap it.
+/// Every physical unlink that ends a cookie's life is a TRACKED, counted job:
+/// its ledger record is dropped only once the unlink CONFIRMS (success, or a
+/// file already gone), so a transient failure retains the record for a later
+/// sweep rather than silently orphaning the file. The reaps that end a cookie
+/// — a completed-cookie reap and a scope's stream teardown
+/// ([`retire_scope`](Self::retire_scope)), and the orderly close's
+/// [`sweep_owned`](Self::sweep_owned) — each raise their flag before taking the
+/// paths, so a write still in the blocking pool can never slip a file past the
+/// sweep that was supposed to reap it. This type's [`Drop`] is the
+/// ABNORMAL-path backstop only (a panic or a task cancellation, where no close
+/// grace exists): it dispatches its remaining unlinks DETACHED so it can never
+/// block the very unwind it runs under.
 struct CookieRegistry<F: FsOps> {
   ops: F,
-  /// Raised once, before the terminal sweep. A write in the pool re-checks it
-  /// while claiming its file, so a write can never outlive the registry that
-  /// dispatched it.
+  /// Raised before the registry stops accepting handovers — at the orderly
+  /// close's sweep and, as the abnormal-path backstop, in [`Drop`]. A write in
+  /// the pool re-checks it while claiming its file, so a write can never outlive
+  /// the registry that dispatched it.
   shutdown: Arc<AtomicBool>,
   ledger: CookieLedger,
   /// Per-scope retirement flags, cloned into each dispatched write. Raised
@@ -253,10 +265,19 @@ struct CookieRegistry<F: FsOps> {
   /// current stream could never observe. Dropped with the scope, like the flags
   /// and the root.
   generations: HashMap<ScopeId, Arc<AtomicU64>>,
+  /// Spawns a detached blocking job. Captured from the driver's runtime at
+  /// construction so [`Drop`] — which has no `R` in scope — can dispatch its
+  /// best-effort abnormal-path unlinks OFF-reactor. Unlinking synchronously in
+  /// Drop would, on a hung mount, wedge the very unwind (a panic or a task
+  /// cancellation) the Drop is running under; a detached job cannot.
+  spawn_detached: DetachedSpawner,
 }
 
 impl<F: FsOps> CookieRegistry<F> {
-  fn new(ops: F) -> Self {
+  fn new<R>(ops: F) -> Self
+  where
+    R: RuntimeLite,
+  {
     Self {
       ops,
       shutdown: Arc::new(AtomicBool::new(false)),
@@ -264,6 +285,7 @@ impl<F: FsOps> CookieRegistry<F> {
       retiring: HashMap::new(),
       roots: HashMap::new(),
       generations: HashMap::new(),
+      spawn_detached: Box::new(|job| R::spawn_blocking_detach(job)),
     }
   }
 
@@ -328,20 +350,60 @@ impl<F: FsOps> CookieRegistry<F> {
     }
   }
 
-  /// Drops a cookie's record: the caller has taken over its removal. O(1) — the
-  /// ledger is keyed by path, so this never scans a scope's cookies.
-  fn forget(&mut self, path: &Path) {
-    lock_ledger(&self.ledger).remove(path);
+  /// The scope that owns the cookie at `path`, if the registry still holds its
+  /// record — the reap lane's key from a bare path to the scope a tracked unlink
+  /// counts against. `None` means the cookie was already reaped (its record
+  /// dropped on a confirmed removal), so the reap is idempotently nothing.
+  fn owner_of(&self, path: &Path) -> Option<ScopeId> {
+    lock_ledger(&self.ledger).get(path).copied()
+  }
+
+  /// Dispatches ONE physical unlink of `path` (owned by `scope`) as a TRACKED,
+  /// counted `pending_cookie_ops` job — mirroring a teardown's counted
+  /// accounting, so an outstanding unlink holds close in `NotQuiesced` and can
+  /// never wedge it. The record is dropped ONLY when the unlink CONFIRMS
+  /// (`Ok`/already gone): a transient failure RETAINS it, so the path stays
+  /// eligible for the terminal sweep rather than orphaning the file. Completion
+  /// — success or failure — sends `CookieOpDone` to decrement the count.
+  fn dispatch_remove<R>(
+    &self,
+    op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+    pending_cookie_ops: &mut BTreeMap<ScopeId, usize>,
+    scope: ScopeId,
+    path: PathBuf,
+  ) where
+    R: RuntimeLite,
+  {
+    *pending_cookie_ops.entry(scope).or_insert(0) += 1;
+    let ops = self.ops.clone();
+    let ledger = Arc::clone(&self.ledger);
+    let tx = op_tx.clone();
+    R::spawn_blocking_detach(move || {
+      if ops.remove_cookie(&path).is_ok() {
+        // Confirmed gone (or already gone): drop the record. A transient error
+        // keeps it, so a later sweep retries instead of stranding the file.
+        lock_ledger(&ledger).remove(&path);
+      }
+      let _ = tx.try_send(OpResult::CookieOpDone {
+        scope,
+        write: false,
+      });
+    });
   }
 
   /// Retires `scope`: raise its flag FIRST — a write still in the pool then
   /// finds its claim refused and reaps itself, rather than landing a file into a
-  /// scope nothing will sweep again — then take back and unlink every cookie the
-  /// scope still owns. The unlinks are blocking I/O, so they go off-reactor; the
-  /// FLAG, which is what orders this against the pool, is raised synchronously
-  /// before they are dispatched.
-  fn retire_scope<R>(&mut self, scope: ScopeId)
-  where
+  /// scope nothing will sweep again — then dispatch a TRACKED unlink for every
+  /// cookie the scope still owns. The records are KEPT until each unlink
+  /// confirms (`dispatch_remove` drops them), so a transient failure cannot
+  /// orphan the file. The FLAG, which is what orders this against the pool, is
+  /// raised synchronously before the unlinks are dispatched.
+  fn retire_scope<R>(
+    &mut self,
+    scope: ScopeId,
+    op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+    pending_cookie_ops: &mut BTreeMap<ScopeId, usize>,
+  ) where
     R: RuntimeLite,
   {
     if let Some(flag) = self.retiring.remove(&scope) {
@@ -351,23 +413,44 @@ impl<F: FsOps> CookieRegistry<F> {
     // The generation is per-scope and dies with it — a retired scope's writes
     // are already revoked by the flag above, so the generation has no work left.
     self.generations.remove(&scope);
-    let mut reap = Vec::new();
-    lock_ledger(&self.ledger).retain(|path, owner| {
-      let retired = *owner == scope;
-      if retired {
-        reap.push(path.clone());
-      }
-      !retired
-    });
-    if reap.is_empty() {
-      return;
+    let reap: Vec<PathBuf> = lock_ledger(&self.ledger)
+      .iter()
+      .filter(|(_, owner)| **owner == scope)
+      .map(|(path, _)| path.clone())
+      .collect();
+    for path in reap {
+      self.dispatch_remove::<R>(op_tx, pending_cookie_ops, scope, path);
     }
-    let ops = self.ops.clone();
-    R::spawn_blocking_detach(move || {
-      for path in reap {
-        ops.remove_cookie(&path);
-      }
-    });
+  }
+
+  /// Raises the shutdown flag WITHOUT sweeping — the orderly close's first step,
+  /// so a write landing during the close drain finds its claim refused and reaps
+  /// itself (inside its own tracked job) rather than landing a cookie owned but
+  /// unswept behind the sweep below.
+  fn begin_shutdown(&self) {
+    self.shutdown.store(true, Ordering::SeqCst);
+  }
+
+  /// Dispatches a TRACKED unlink for every cookie the registry still owns — the
+  /// orderly close's sweep, run BEFORE the registry is dropped so the close
+  /// grace COVERS the unlinks: a hung mount then makes close report
+  /// `NotQuiesced` honestly rather than wedging, and each record is dropped as
+  /// its unlink confirms. Run after [`begin_shutdown`](Self::begin_shutdown), so
+  /// nothing new can land unswept behind it.
+  fn sweep_owned<R>(
+    &self,
+    op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+    pending_cookie_ops: &mut BTreeMap<ScopeId, usize>,
+  ) where
+    R: RuntimeLite,
+  {
+    let owned: Vec<(PathBuf, ScopeId)> = lock_ledger(&self.ledger)
+      .iter()
+      .map(|(path, scope)| (path.clone(), *scope))
+      .collect();
+    for (path, scope) in owned {
+      self.dispatch_remove::<R>(op_tx, pending_cookie_ops, scope, path);
+    }
   }
 
   /// How many cookies the registry currently owns — the leak oracle: a failed
@@ -381,21 +464,30 @@ impl<F: FsOps> CookieRegistry<F> {
 
 impl<F: FsOps> Drop for CookieRegistry<F> {
   fn drop(&mut self) {
-    // The terminal guarantee, honored on EVERY exit — normal return, panic, or
-    // task cancellation — which is the whole reason ownership lives in a type
-    // with a Drop rather than in hand-rolled bookkeeping at the exit paths.
+    // The ABNORMAL-path backstop — a panic or a task cancellation, where no
+    // orderly close ran its tracked sweep. On the NORMAL path the close already
+    // swept every owned cookie as a grace-covered job, so this finds the ledger
+    // empty (or only records whose unlink transiently failed) and merely raises
+    // the flag one more, idempotent, time.
     //
     // The flag is raised BEFORE the map is taken, and a write claims its file
     // under the same lock: a claim that beat the take is in the map this sweep
     // unlinks; one that lost it sees the flag and reaps itself. Neither order
-    // leaks. The unlinks are synchronous — the set is tiny (in-flight syncs),
-    // each is idempotent, and a detached spawn from a cancelled task is not
-    // guaranteed to run at all.
+    // leaks. The unlinks are DETACHED, never synchronous: a synchronous unlink
+    // on a hung mount would wedge the very unwind this Drop runs under. A
+    // detached job may not run on a cancelled runtime — the accepted best-effort
+    // for the abnormal path, which by construction cannot block.
     self.shutdown.store(true, Ordering::SeqCst);
     let owned = std::mem::take(&mut *lock_ledger(&self.ledger));
-    for path in owned.into_keys() {
-      self.ops.remove_cookie(&path);
+    if owned.is_empty() {
+      return;
     }
+    let ops = self.ops.clone();
+    (self.spawn_detached)(Box::new(move || {
+      for path in owned.into_keys() {
+        let _ = ops.remove_cookie(&path);
+      }
+    }));
   }
 }
 
@@ -683,12 +775,16 @@ const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
 /// (the bounded mailbox limits instantaneous traffic, never the total). The
 /// prune is O(parked) per pass, and it means a reported settlement may
 /// legitimately find no sender (a caller dropped at close).
+#[allow(clippy::too_many_arguments)]
 fn resolve_cover_settlements<R, F>(
   core: &mut DriverCore,
   ops: &F,
+  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   cookies: &mut CookieRegistry<F>,
+  writes_in_flight: &mut BTreeSet<ScopeId>,
+  pending_cookie_ops: &mut BTreeMap<ScopeId, usize>,
   live: &dyn Fn(ScopeId) -> bool,
 ) where
   R: RuntimeLite,
@@ -737,11 +833,19 @@ fn resolve_cover_settlements<R, F>(
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
       };
-      // The guard is taken HERE, at dispatch, so the flags it carries cover the
-      // whole in-flight window: a teardown or a driver exit between this line
-      // and the write's landing is visible to the write itself.
+      // The dispatched write is a TRACKED, single-flighted job: mark the scope
+      // in flight (a second sync is refused until this resolves) and count it in
+      // the close grace, so an outstanding write holds close in `NotQuiesced`
+      // rather than letting it wedge on a hung mount. The guard is taken HERE, at
+      // dispatch, so the flags it carries cover the whole in-flight window: a
+      // teardown or a driver exit between this line and the write's landing is
+      // visible to the write itself.
+      writes_in_flight.insert(cookie.scope);
+      *pending_cookie_ops.entry(cookie.scope).or_insert(0) += 1;
       let guard = cookies.dispatch_guard(cookie.scope);
       let ops = ops.clone();
+      let tx = op_tx.clone();
+      let scope = cookie.scope;
       R::spawn_blocking_detach(move || {
         let ParkedCookie {
           dir, name, reply, ..
@@ -754,18 +858,16 @@ fn resolve_cover_settlements<R, F>(
             // the registry is gone or the scope is retiring: its sweep has
             // already passed this path, so the file must not survive.
             if !guard.claim(&path) {
-              ops.remove_cookie(&path);
+              let _ = ops.remove_cookie(&path);
               let _ = reply.send(Err(crate::error::SyncRootError::Retired));
-              return;
-            }
-            // A caller that abandoned the sync (timed out, dropped the future)
-            // has dropped this reply receiver and will never ask for this
-            // cookie's removal. Give the record back and reap the file — the
-            // write completing late must not outlive the barrier that asked for
-            // it.
-            if let Err(Ok(path)) = reply.send(Ok(path)) {
+            } else if let Err(Ok(path)) = reply.send(Ok(path)) {
+              // A caller that abandoned the sync (timed out, dropped the future)
+              // has dropped this reply receiver and will never ask for this
+              // cookie's removal. Give the record back and reap the file — the
+              // write completing late must not outlive the barrier that asked
+              // for it.
               guard.release(&path);
-              ops.remove_cookie(&path);
+              let _ = ops.remove_cookie(&path);
             }
           }
           Err(source) => {
@@ -778,6 +880,10 @@ fn resolve_cover_settlements<R, F>(
             }));
           }
         }
+        // Done, whatever the verdict: clear the single-flight gate and decrement
+        // the grace count — a second sync for this scope may now dispatch, and
+        // close no longer counts this write as outstanding.
+        let _ = tx.try_send(OpResult::CookieOpDone { scope, write: true });
       });
     }
   }
@@ -939,11 +1045,13 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// may record ownership of a cookie by predicting its path.
   fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error>;
 
-  /// Unlinks a sync cookie (blocking, fire-and-forget). Idempotent: a cookie
-  /// already gone (a crash leftover reaped by someone else, a racing sync) is
-  /// success. The unlink's own event is suppressed by the reserved namespace,
-  /// never by any pending-cookie bookkeeping.
-  fn remove_cookie(&self, path: &Path);
+  /// Unlinks a sync cookie (blocking). Idempotent: a cookie already gone (a
+  /// crash leftover reaped by someone else, a racing sync) maps to `Ok(())`.
+  /// Every OTHER failure is RETURNED so the caller can retain the cookie's
+  /// ledger record and let a later sweep retry the unlink, rather than silently
+  /// orphaning the file. The unlink's own event is suppressed by the reserved
+  /// namespace, never by any pending-cookie bookkeeping.
+  fn remove_cookie(&self, path: &Path) -> Result<(), std::io::Error>;
 
   /// Re-reads the live mount table strictly under `root` AND re-stats the root
   /// itself (blocking): the mount prefixes, whether the read was authoritative,
@@ -1543,9 +1651,15 @@ impl FsOps for RealFs {
     Ok(path)
   }
 
-  fn remove_cookie(&self, path: &Path) {
-    // Idempotent by contract: an already-gone cookie is success.
-    let _ = std::fs::remove_file(path);
+  fn remove_cookie(&self, path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::remove_file(path) {
+      // Idempotent by contract: an already-gone cookie is success.
+      Ok(()) => Ok(()),
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+      // A transient failure (a hung mount, a flipped permission) is reported,
+      // not swallowed, so the record survives for a later sweep to retry.
+      Err(err) => Err(err),
+    }
   }
 
   fn refresh_mounts(&self, root: &Path) -> MountRefresh {
@@ -1901,6 +2015,17 @@ enum OpResult<H> {
     req: ReqId,
     raw: RawEnumerate,
   },
+  /// One tracked physical cookie job — a WRITE or an unlink — finished (success
+  /// OR failure): decrement `pending_cookie_ops` for `scope`, so an outstanding
+  /// job holds close in `NotQuiesced` rather than letting it claim a false
+  /// quiescence. `write` distinguishes the single-flighted write, whose
+  /// completion also clears the scope's `writes_in_flight` gate — an unlink's
+  /// completion must NOT clear it, or a second write dispatched while the first
+  /// is still outstanding would slip past the single-flight bound.
+  CookieOpDone {
+    scope: ScopeId,
+    write: bool,
+  },
 }
 
 /// Runs one watcher's driver loop until `commands` closes or a `Close`
@@ -1999,13 +2124,26 @@ pub(crate) async fn run<R, F>(
   // `Command::SyncRoot`): the write dispatches to the blocking pool once the
   // scope's re-arm work quiesces, whatever the settle's verdict.
   let mut parked_cookies: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
+  // Scopes with a DISPATCHED physical cookie write outstanding — the single-
+  // flight gate. A `Command::SyncRoot` for a scope already in here (or with a
+  // write still parked) is refused `WriteInFlight` rather than dispatching a
+  // second, so a caller that times out and retries cannot pile unbounded
+  // blocking writes against a hung mount. Set at write dispatch, cleared when
+  // the write's `CookieOpDone` lands.
+  let mut writes_in_flight: BTreeSet<ScopeId> = BTreeSet::new();
+  // In-flight PHYSICAL cookie I/O — writes AND unlinks — counted like
+  // `pending_teardowns`, so the close grace covers every cookie job: an
+  // outstanding one holds close in `NotQuiesced` rather than letting a hung
+  // mount wedge it. Incremented at each dispatch, decremented by `CookieOpDone`.
+  let mut pending_cookie_ops: BTreeMap<ScopeId, usize> = BTreeMap::new();
   // The OWNER of every cookie this driver writes, from the write's landing until
   // a completed-cookie reap unlinks it, its scope's stream tears down, or this
   // local drops. Ownership never rides the reply oneshot, so a caller that abandons
   // its sync cannot strand a file and no source-side removal queue is needed;
-  // and because the sweep is a `Drop`, a panicking or CANCELLED driver task
-  // reaps its cookies exactly like a returning one.
-  let mut cookies = CookieRegistry::new(ops.clone());
+  // the orderly close sweeps owned cookies as tracked jobs, and the registry's
+  // `Drop` reaps any remainder best-effort so a panicking or CANCELLED driver
+  // task still cleans up.
+  let mut cookies = CookieRegistry::new::<R>(ops.clone());
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
   // driver keeps a sender so grants can always be minted, which is fine —
   // exit is driven by the COMMAND channel, and this receiver merely pends.
@@ -2020,6 +2158,7 @@ pub(crate) async fn run<R, F>(
       &mut handles,
       &mut pending_spawns,
       &mut pending_teardowns,
+      &mut pending_cookie_ops,
       &mut scope_backends,
       &mut lanes,
       &events,
@@ -2038,9 +2177,12 @@ pub(crate) async fn run<R, F>(
     resolve_cover_settlements::<R, F>(
       &mut core,
       &ops,
+      &op_tx,
       &mut cover_replies,
       &mut parked_cookies,
       &mut cookies,
+      &mut writes_in_flight,
+      &mut pending_cookie_ops,
       &|scope| handles.contains_key(&scope),
     );
     // Reclaim canceled awaited-unwatch waiters at the same choke point, so an
@@ -2454,6 +2596,20 @@ pub(crate) async fn run<R, F>(
               resolve_unwatch_waiters(&mut unwatch_replies, scope);
             }
           }
+        OpResult::CookieOpDone { scope, write } => {
+          if let Some(owed) = pending_cookie_ops.get_mut(&scope) {
+            *owed -= 1;
+            if *owed == 0 {
+              pending_cookie_ops.remove(&scope);
+            }
+          }
+          // Only a WRITE's completion lifts the single-flight gate; an unlink's
+          // must not, or a second write dispatched while the first is still
+          // outstanding would slip past the bound.
+          if write {
+            writes_in_flight.remove(&scope);
+          }
+        }
         }
       },
       unwound = unwind_rx.recv().fuse() => {
@@ -2610,6 +2766,18 @@ pub(crate) async fn run<R, F>(
                 let _ = reply.send(Err(crate::error::SyncRootError::BadCookieName { name }));
               } else if !cookie_dir_within_root(&root, &dir) {
                 let _ = reply.send(Err(crate::error::SyncRootError::DirOutsideRoot { dir, root }));
+              } else if writes_in_flight.contains(&scope)
+                || parked_cookies.values().any(|parked| parked.scope == scope)
+              {
+                // Single-flight per scope: refuse a second sync while one for
+                // this scope is anywhere in the pipeline — DISPATCHED (in
+                // `writes_in_flight`) or still PARKED on its settle fence. At
+                // most one physical write per scope can then be outstanding, so a
+                // caller that times out and retries cannot pile unbounded
+                // blocking writes against a hung mount. The scan is O(parked),
+                // and single-flight keeps `parked_cookies` to at most one entry
+                // per scope, so it is cheap.
+                let _ = reply.send(Err(crate::error::SyncRootError::WriteInFlight));
               } else {
                 // Park the write on a settle fence opened right here — the same
                 // fence a reconcile's ack rides, so it inherits this moment's
@@ -2655,13 +2823,15 @@ pub(crate) async fn run<R, F>(
       // senders together, so `commands` (higher-priority) fires its `break None`
       // first — this arm is never selected on the way out, and any reap still
       // buffered is reaped by the terminal registry sweep. Ends the registry's
-      // ownership of the cookie: forget the record (O(1), keyed by path), then
-      // unlink off-reactor.
+      // ownership of the cookie as a TRACKED, grace-covered unlink whose record
+      // is dropped only when the unlink confirms — a reap for a path the
+      // registry no longer owns (already reaped, or foreign) is idempotently
+      // nothing.
       reap = cookie_removes.recv().fuse() => {
-        if let Ok(path) = reap {
-          cookies.forget(&path);
-          let ops = ops.clone();
-          R::spawn_blocking_detach(move || ops.remove_cookie(&path));
+        if let Ok(path) = reap
+          && let Some(scope) = cookies.owner_of(&path)
+        {
+          cookies.dispatch_remove::<R>(&op_tx, &mut pending_cookie_ops, scope, path);
         }
       },
       msg = os.next() => {
@@ -2738,8 +2908,20 @@ pub(crate) async fn run<R, F>(
       });
     }
   }
+  // Sweep every cookie the registry owns as a TRACKED job BEFORE the grace, so a
+  // hung unlink makes close report `NotQuiesced` honestly rather than wedging —
+  // never a synchronous unlink in the registry's `Drop`. Raise the shutdown flag
+  // first: a write still in the pool then finds its claim refused and self-reaps
+  // (inside its own tracked job) rather than landing a cookie owned but unswept
+  // behind this sweep. Any in-flight write or reap dispatched earlier is already
+  // counted in `pending_cookie_ops`, so the drain below covers it too.
+  cookies.begin_shutdown();
+  cookies.sweep_owned::<R>(&op_tx, &mut pending_cookie_ops);
   let drain = async {
-    while !(pending_teardowns.is_empty() && pending_spawns.is_empty()) {
+    while !(pending_teardowns.is_empty()
+      && pending_spawns.is_empty()
+      && pending_cookie_ops.is_empty())
+    {
       match op_rx.recv().await {
         Ok(OpResult::TornDown { scope }) => {
           if let Some(owed) = pending_teardowns.get_mut(&scope) {
@@ -2792,22 +2974,37 @@ pub(crate) async fn run<R, F>(
         // A pre-arm outcome for a replace the close sweep already retired:
         // nothing left to commit or unwind.
         Ok(OpResult::RebindArmed { .. }) => {}
+        // A physical cookie job (write or unlink) finished: decrement the count
+        // the grace waits on. The single-flight gate is irrelevant now (no
+        // scope is live to admit a second sync), so this drain need not touch
+        // `writes_in_flight`.
+        Ok(OpResult::CookieOpDone { scope, write: _ }) => {
+          if let Some(owed) = pending_cookie_ops.get_mut(&scope) {
+            *owed -= 1;
+            if *owed == 0 {
+              pending_cookie_ops.remove(&scope);
+            }
+          }
+        }
         Err(_) => break,
       }
     }
   };
   // Grace expiry with work still pending means a wedged blocking pool: the
   // close reply goes out anyway (a wedged pool must not hang close forever),
-  // and it reports EVERY pending set — quiescence cannot be claimed while
-  // either is non-empty. A still-pending TEARDOWN already moved its handle
-  // INTO the wedged shutdown call, so nothing can reclaim that stream until
-  // the call returns. A still-pending SPAWN may ALREADY OWN A LIVE STREAM —
-  // the backend starts it and then performs post-live metadata reads inside
-  // the same call — and only self-reclaims once the wedge clears (its
-  // undeliverable result drops and the handle's Drop runs the teardown), so
-  // it is just as non-quiescent at reply time. One shared grace for both: a
-  // wedged FFI call rarely unwedges with more time, so a longer window would
-  // only delay the honest signal.
+  // and it reports EVERY pending set — quiescence cannot be claimed while any
+  // is non-empty. A still-pending TEARDOWN already moved its handle INTO the
+  // wedged shutdown call, so nothing can reclaim that stream until the call
+  // returns. A still-pending SPAWN may ALREADY OWN A LIVE STREAM — the backend
+  // starts it and then performs post-live metadata reads inside the same call —
+  // and only self-reclaims once the wedge clears (its undeliverable result
+  // drops and the handle's Drop runs the teardown), so it is just as
+  // non-quiescent at reply time. A still-pending COOKIE OP is a physical write
+  // or unlink the sweep dispatched; a hung mount leaves its file until it
+  // unwedges (the registry's best-effort Drop retries it), so it too is
+  // non-quiescent. One shared grace for all: a wedged FFI or FS call rarely
+  // unwedges with more time, so a longer window would only delay the honest
+  // signal.
   let _ = R::timeout(Duration::from_secs(1), drain).await;
   execute_effects::<R, F>(
     &mut core,
@@ -2817,6 +3014,7 @@ pub(crate) async fn run<R, F>(
     &mut handles,
     &mut pending_spawns,
     &mut pending_teardowns,
+    &mut pending_cookie_ops,
     &mut scope_backends,
     &mut lanes,
     &events,
@@ -2831,22 +3029,33 @@ pub(crate) async fn run<R, F>(
   // `Closed`. Whatever is still pending drops with `cover_replies` — the
   // ratified close-mid-fence semantics: the caller sees `Closed`, never an
   // outcome fabricated over a torn-down driver. No cookie can be dispatched
-  // here (no scope is live to this poll), so the registry may retire next.
+  // here (no scope is live to this poll, and shutdown already refuses claims),
+  // so the registry may retire next.
   resolve_cover_settlements::<R, F>(
     &mut core,
     &ops,
+    &op_tx,
     &mut cover_replies,
     &mut parked_cookies,
     &mut cookies,
+    &mut writes_in_flight,
+    &mut pending_cookie_ops,
     &|_| false,
   );
-  // The terminal sweep runs HERE rather than at the end of the scope, so an
-  // answered close PROVES the cookies are reaped. This is only the sweep's
-  // SCHEDULING: the guarantee is the registry's `Drop`, which a panicking or
-  // cancelled driver — one that never reaches this line — runs just the same.
+  // Drop the registry LAST. The orderly sweep above already dispatched a tracked
+  // unlink for every owned cookie under the grace, so on a healthy fs this finds
+  // the ledger empty; whatever a hung mount would not let go was already counted
+  // in the `NotQuiesced` reply below, and this `Drop` fires its best-effort
+  // DETACHED retry without blocking. The `Drop` is the guarantee's backstop: a
+  // panicking or cancelled driver — one that never reaches this line — still
+  // runs it, detached, on exit.
   drop(cookies);
   if let Some(reply) = close_reply {
-    let _ = reply.send(pending_teardowns.values().sum::<usize>() + pending_spawns.len());
+    let _ = reply.send(
+      pending_teardowns.values().sum::<usize>()
+        + pending_spawns.len()
+        + pending_cookie_ops.values().sum::<usize>(),
+    );
   }
 }
 
@@ -3037,6 +3246,7 @@ fn execute_effects<R, F>(
   handles: &mut BTreeMap<ScopeId, F::Handle>,
   pending_spawns: &mut BTreeSet<ScopeId>,
   pending_teardowns: &mut BTreeMap<ScopeId, usize>,
+  pending_cookie_ops: &mut BTreeMap<ScopeId, usize>,
   scope_backends: &mut BTreeMap<ScopeId, BackendKind>,
   lanes: &mut BTreeMap<ScopeId, u64>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
@@ -3094,9 +3304,9 @@ fn execute_effects<R, F>(
         // The scope's cookies retire with its stream: no cleanup reap will
         // arrive for a write whose reply was abandoned, and there will be no
         // stream left to report one on. The registry raises the scope's flag
-        // before it unlinks, so a write still in the pool reaps itself rather
-        // than landing a file behind this sweep.
-        cookies.retire_scope::<R>(scope);
+        // before it dispatches its tracked unlinks, so a write still in the pool
+        // reaps itself rather than landing a file behind this sweep.
+        cookies.retire_scope::<R>(scope, op_tx, pending_cookie_ops);
         if let Some(DeferredGrant { pending, root }) = deferred_grants.remove(&scope) {
           let _ = pending
             .reply
