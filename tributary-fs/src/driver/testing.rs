@@ -128,6 +128,17 @@ struct FakeState {
   /// When set, `remove_cookie` parks until the gate releases: the window a
   /// close (or a cancelled driver's Drop) races against a hung terminal unlink.
   cookie_remove_hold: Mutex<Option<HoldGate>>,
+  /// When set, `remove_cookie` parks AFTER the node is unlinked (so `files_under`
+  /// already reflects the removal) but BEFORE it records the remove and returns —
+  /// "the unlink syscall completed; the pool job has not yet taken the ledger
+  /// lock to confirm". The R11-3 preemption window: a successor can reclaim the
+  /// path here, and the parked job's later confirm must be refused by id.
+  cookie_remove_confirm_hold: Mutex<Option<HoldGate>>,
+  /// Path prefixes whose cookie removes fail PERSISTENTLY (without unlinking the
+  /// node), modeling a still-failing mount for one subtree while another has
+  /// recovered — the per-scope-recovery re-arm fairness cells. Checked after the
+  /// hold and before the global countdown knob and the unlink.
+  cookie_remove_failure_prefixes: Mutex<Vec<PathBuf>>,
   /// Cookie directories that CANONICALIZE elsewhere — the fake's model of an
   /// intermediate symlink. A spelled directory maps to the real path it resolves
   /// to, so `write_cookie` can mirror the production canonicalize-and-verify: a
@@ -197,6 +208,8 @@ impl Default for FakeState {
       cookie_remove_failures: AtomicUsize::new(0),
       cookie_remove_dispatches: AtomicUsize::new(0),
       cookie_remove_hold: Mutex::default(),
+      cookie_remove_confirm_hold: Mutex::default(),
+      cookie_remove_failure_prefixes: Mutex::default(),
       canonical_dirs: Mutex::default(),
       resume_token: Mutex::default(),
       spawn_resume_points: Mutex::default(),
@@ -625,6 +638,41 @@ impl FakeFs {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
     *self.state.cookie_remove_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
+  }
+
+  /// Holds every subsequent cookie remove AFTER the node is unlinked but BEFORE
+  /// the pool job takes the ledger lock to confirm — the R11-3 preemption
+  /// window, where a successor sync can reclaim the freed path before the stale
+  /// confirm lands. `files_under` flips at the gate; `cookie_removes()` records
+  /// only after release, so the two bracket the ABA window cleanly.
+  pub(crate) fn hold_cookie_remove_confirms(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    *self.state.cookie_remove_confirm_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
+  /// Fails every cookie remove whose path lies under `prefix`, PERSISTENTLY and
+  /// without unlinking the node — a still-failing mount subtree, so a cell can
+  /// hold one scope's backlog failing while another recovers.
+  pub(crate) fn fail_cookie_removes_under(&self, prefix: impl AsRef<Path>) {
+    self
+      .state
+      .cookie_remove_failure_prefixes
+      .lock()
+      .unwrap()
+      .push(prefix.as_ref().to_path_buf());
+  }
+
+  /// Clears a prefix armed by [`fail_cookie_removes_under`](Self::fail_cookie_removes_under)
+  /// — that subtree's mount recovered, so its removes succeed from here on.
+  pub(crate) fn clear_cookie_remove_failures_under(&self, prefix: impl AsRef<Path>) {
+    let prefix = prefix.as_ref();
+    self
+      .state
+      .cookie_remove_failure_prefixes
+      .lock()
+      .unwrap()
+      .retain(|armed| armed != prefix);
   }
 
   /// Makes every live fake handle mint `token` as its resume point — a
@@ -1144,6 +1192,18 @@ impl FsOps for FakeFs {
     // The cookie is a real object in the fake tree, exactly as a real create
     // is: a test can then inject its kernel event like any other file's.
     let ino = self.state.wd_seq.fetch_add(1, Ordering::SeqCst) as u64 + 9000;
+    // `create_new` fidelity (production parity): a create over an EXISTING node
+    // (any kind) fails `AlreadyExists`. This is what makes the R11-3 same-path
+    // reuse honest — a second write can only succeed once the old file's unlink
+    // physically ran, which is exactly when a claim may overwrite the fileless
+    // predecessor record. (The symlink refusal above already covers that kind;
+    // this is the general case.)
+    if self.state.nodes.lock().unwrap().contains_key(&path) {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "a cookie already exists at the path (create_new)",
+      ));
+    }
     self.put(&path, FileKind::File, ino);
     self.state.cookie_writes.lock().unwrap().push(path.clone());
     Ok(path)
@@ -1158,6 +1218,21 @@ impl FsOps for FakeFs {
       .cookie_remove_dispatches
       .fetch_add(1, Ordering::SeqCst);
     self.park_on(&self.state.cookie_remove_hold);
+    // A PERSISTENT per-subtree failure: this mount is still failing, so the node
+    // is KEPT (no `remove` below) and the record retained. Checked before the
+    // global countdown knob, so a subtree armed here fails whatever the budget.
+    if self
+      .state
+      .cookie_remove_failure_prefixes
+      .lock()
+      .unwrap()
+      .iter()
+      .any(|prefix| path.starts_with(prefix))
+    {
+      return Err(std::io::Error::other(
+        "cookie remove refused (failing subtree)",
+      ));
+    }
     // A transient unlink failure: the tree KEEPS the node (no `remove` below), so
     // the record is retained and a retry can still find and unlink it — never a
     // silently orphaned file. Decrement-if-positive, atomic against concurrent
@@ -1178,6 +1253,12 @@ impl FsOps for FakeFs {
       }
     }
     self.remove(path);
+    // The unlink syscall has completed (the node is gone; `files_under` reflects
+    // it), but the pool job has NOT yet taken the ledger lock to confirm: park
+    // here so a cell can slip a successor sync into the freed path and prove the
+    // stale confirm is refused by id (R11-3). `cookie_removes` records only
+    // after release, so it and `files_under` bracket the ABA window.
+    self.park_on(&self.state.cookie_remove_confirm_hold);
     self
       .state
       .cookie_removes
