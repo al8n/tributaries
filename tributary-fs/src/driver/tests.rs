@@ -14,7 +14,7 @@ use crate::os::{FsEventFlags, RawOsEvent};
 struct Rig {
   fs: FakeFs,
   commands: async_channel::Sender<Command>,
-  cookie_removes: async_channel::Sender<PathBuf>,
+  cookie_removes: async_channel::Sender<CookieReap>,
   events: async_channel::Receiver<(ScopeId, Arc<PathBuf>, Change)>,
 }
 
@@ -33,11 +33,52 @@ fn config() -> DriverConfig {
     // Inert for the fake spawns (no fanotify admission map); a real fanotify
     // spawn threads this into its SourceConfig.
     max_map_directories: None,
+    cookie_retry_base: Duration::from_millis(100),
+    cookie_retry_cap: Duration::from_secs(5),
+    cookie_retry_budget: 8,
+    cookie_backlog_cap: 8,
+  }
+}
+
+/// The cookie-retry cells' config: a fast backoff, a small attempt budget, and a low
+/// per-scope backlog cap, so the driver-owned retry, budget-park, and backlog-refusal
+/// paths run in real (multi-thread) time within a `settle` window.
+fn tuned_config() -> DriverConfig {
+  DriverConfig {
+    cookie_retry_base: Duration::from_millis(5),
+    cookie_retry_cap: Duration::from_millis(20),
+    cookie_retry_budget: 3,
+    cookie_backlog_cap: 3,
+    ..config()
   }
 }
 
 fn rig_with_capacity(event_capacity: usize) -> Rig {
   rig_with(event_capacity, NullRegistry)
+}
+
+/// A rig whose driver runs with an explicit [`DriverConfig`] — the cookie-retry cells override
+/// the backoff/budget/backlog knobs so their timings are fast and deterministic.
+fn rig_with_config(event_capacity: usize, config: DriverConfig) -> Rig {
+  let fs = FakeFs::new(1);
+  fs.put("/r", FileKind::Dir, 1);
+  let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  let (reap_tx, reap_rx) = async_channel::unbounded();
+  let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    config,
+    fs.clone(),
+    cmd_rx,
+    reap_rx,
+    ev_tx,
+    NullRegistry,
+  ));
+  Rig {
+    fs,
+    commands: cmd_tx,
+    cookie_removes: reap_tx,
+    events: ev_rx,
+  }
 }
 
 fn rig_with(event_capacity: usize, registry: impl ScopeRegistry) -> Rig {
@@ -3710,6 +3751,74 @@ mod sync_cookie {
     on_reply.await.expect("the driver replies")
   }
 
+  /// How many cancel tombstones the driver currently holds. The boundedness oracle: a tombstone
+  /// exists only for a write provably in the pool, and its own completion (or its claim) sweeps
+  /// it — so this returns to zero after every cancel ordering.
+  async fn cancel_tombstones(rig: &Rig) -> usize {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugCookieCancelTombstones { reply })
+      .await
+      .unwrap();
+    on_reply.await.expect("the driver replies")
+  }
+
+  /// Settles until the OWNED-cookie count reaches `target` — the async analogue of [`settle`],
+  /// for the ledger count that only a `Command` round-trip can read. Gives the real-clock
+  /// blocking pool scheduler slices under paused time.
+  async fn settle_cookie_count(rig: &Rig, target: usize) {
+    for _ in 0..200 {
+      if cookie_count(rig).await == target {
+        return;
+      }
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  }
+
+  /// Settles until the cancel-tombstone count reaches `target`.
+  async fn settle_tombstones(rig: &Rig, target: usize) {
+    for _ in 0..200 {
+      if cancel_tombstones(rig).await == target {
+        return;
+      }
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  }
+
+  /// Dispatches a sync, retrying the retryable `WriteInFlight` refusal until the single-flight
+  /// gate admits it (a completed write clears the gate on its own `CookieWriteDone`, which is
+  /// asynchronous relative to the reply). Panics on any other error.
+  async fn admit_sync(rig: &Rig, scope: ScopeId, dir: &str, name: &str) -> PathBuf {
+    for _ in 0..400 {
+      match sync_root(rig, scope, dir, name).await {
+        Ok(path) => return path,
+        Err(crate::error::SyncRootError::WriteInFlight) => {
+          tokio::task::yield_now().await;
+          tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Err(other) => panic!("unexpected sync error: {other:?}"),
+      }
+    }
+    panic!("the single-flight gate never admitted the sync");
+  }
+
+  /// The finding-2 retain cells' config: a retry delay LONG enough to observe the retained
+  /// `RemoveFailed` record before the driver's OWN retry fires, yet finite so that retry still
+  /// confirms within a [`settle`] window. (The `tuned_config`'s 5 ms retry would race the
+  /// retain observation.)
+  fn retain_config() -> DriverConfig {
+    DriverConfig {
+      cookie_retry_base: Duration::from_millis(200),
+      cookie_retry_cap: Duration::from_millis(200),
+      cookie_retry_budget: 3,
+      cookie_backlog_cap: 8,
+      ..config()
+    }
+  }
+
   /// A live rig whose DRIVER TASK the caller keeps, so a cell can drop the
   /// driver future outright — the cancellation path, which no orderly close
   /// tail ever reaches.
@@ -3764,7 +3873,11 @@ mod sync_cookie {
     );
 
     // And it reaps, idempotently — on the dedicated cleanup lane.
-    rig.cookie_removes.send(path.clone()).await.unwrap();
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
     settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert_eq!(rig.fs.cookie_removes(), vec![path]);
   }
@@ -4050,7 +4163,11 @@ mod sync_cookie {
     // And the registry owns the path the write ACTUALLY landed at — the
     // caller's remove (keyed off that same returned path) finds it.
     assert_eq!(cookie_count(&rig).await, 1);
-    rig.cookie_removes.send(path.clone()).await.unwrap();
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
     settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert_eq!(rig.fs.cookie_removes(), vec![path]);
     assert_eq!(
@@ -4502,7 +4619,7 @@ mod sync_cookie {
     for path in &cookies {
       rig
         .cookie_removes
-        .try_send(path.clone())
+        .try_send(CookieReap::Remove(path.clone()))
         .expect("the cleanup lane always admits");
     }
 
@@ -4527,8 +4644,9 @@ mod sync_cookie {
 
   // A transient unlink failure must not orphan the cookie: the record is
   // RETAINED (dropped only when the unlink confirms) so the path stays eligible
-  // for a later sweep, and a retry eventually removes it. The old fire-and-forget
-  // unlink ignored every error, silently stranding the file with no record.
+  // for a later sweep, and the DRIVER'S OWN backed-off retry — not a second
+  // request from the caller — eventually removes it (finding 3). The old
+  // fire-and-forget unlink ignored every error, silently stranding the file.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_transient_unlink_failure_retains_the_cookie_until_it_succeeds() {
     let rig = rig_with_capacity(64);
@@ -4541,7 +4659,11 @@ mod sync_cookie {
 
     // The next unlink fails once; the reap dispatches it and it is refused.
     rig.fs.fail_next_cookie_removes(1);
-    rig.cookie_removes.send(path.clone()).await.unwrap();
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
     settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
     assert_eq!(
       rig.fs.cookie_remove_dispatches(),
@@ -4562,12 +4684,18 @@ mod sync_cookie {
       "the file is still on disk, still eligible for a retry"
     );
 
-    // A retry (the reap is re-requested) now succeeds and drops the record.
-    rig.cookie_removes.send(path.clone()).await.unwrap();
-    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    // No second request is needed: the DRIVER OWNS the retry (finding 3). It re-dispatches the
+    // unlink on its own backed-off schedule, which now succeeds and drops the record — the
+    // requester never asks twice (the old design's requester-driven re-reap is gone).
+    settle(|| rig.fs.cookie_removes().contains(&path)).await;
     assert!(
       rig.fs.cookie_removes().contains(&path),
-      "the retried unlink removed the cookie"
+      "the driver's own retry removed the cookie with no second request"
+    );
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      2,
+      "exactly two dispatches: the failed attempt and the driver's own retry"
     );
     settle(|| rig.fs.files_under("/r").is_empty()).await;
     assert_eq!(
@@ -4754,5 +4882,603 @@ mod sync_cookie {
     hold.release();
     settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert!(rig.fs.cookie_removes().contains(&path));
+  }
+
+  // Finding 1 (fs half): a cancel for a cookie whose write LANDED and CLAIMED — its
+  // `reply.send(Ok)` succeeded because the caller's receiver was alive, so the write's own
+  // send-failure self-reap did NOT run — but the caller never read it reaps the OWNED cookie
+  // through the ledger. This is the delivered-but-unread cookie the umbrella's abandon arm names
+  // by token; without the cancel it would survive until teardown.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cancel_for_a_delivered_but_unread_cookie_reaps_it() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let name = ".tributaries-sync-1-1-1";
+    let path = PathBuf::from("/r").join(name);
+    // The write lands and CLAIMS while the caller's receiver is alive but unread.
+    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    settle(|| rig.fs.cookie_writes() == vec![path.clone()]).await;
+    settle_cookie_count(&rig, 1).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the write's Ok reply succeeded and the cookie is OWNED, unread"
+    );
+
+    // The caller walks away UNREAD. The driver already saw its send succeed, so nothing
+    // self-reaps — the cookie would survive without the token cancel.
+    drop(on_reply);
+
+    // The abandon arm cancels by NAME: the driver finds it OWNED and reaps it through the
+    // removal state machine.
+    rig
+      .cookie_removes
+      .send(CookieReap::Cancel(name.to_owned()))
+      .await
+      .unwrap();
+    settle(|| rig.fs.cookie_removes().contains(&path)).await;
+    assert!(
+      rig.fs.cookie_removes().contains(&path),
+      "the owned cookie was unlinked by the cancel"
+    );
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the record went with the confirmed unlink"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no file survives the cancel of a delivered-but-unread cookie"
+    );
+
+    // The gate and scope are unharmed — a fresh sync still lands.
+    admit_sync(&rig, scope, "/r", ".tributaries-sync-1-1-2").await;
+  }
+
+  // Finding 1 (fs half): a cancel that arrives while the write is STILL IN THE POOL tombstones
+  // the name; when the write lands, its claim consumes the tombstone and is REFUSED, so the write
+  // self-reaps the file it just created. The refusal is driven by the tombstone alone (the caller
+  // is kept alive), which is why the reply reads `Retired`.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cancel_while_the_write_is_in_the_pool_makes_it_self_reap() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let name = ".tributaries-sync-1-2-1";
+    // Hold the write in the pool: DISPATCHED, not yet claimed.
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      1,
+      "the write is in the pool, not yet claimed"
+    );
+
+    // Cancel by name while it is in the pool: it is not owned, so the driver TOMBSTONES it.
+    rig
+      .cookie_removes
+      .send(CookieReap::Cancel(name.to_owned()))
+      .await
+      .unwrap();
+    settle_tombstones(&rig, 1).await;
+    assert_eq!(
+      cancel_tombstones(&rig).await,
+      1,
+      "an in-pool write's cancel is a tombstone"
+    );
+
+    // Release the held write: its claim CONSUMES the tombstone and is refused, so it self-reaps
+    // the file and answers its still-held caller `Retired`.
+    hold.release();
+    assert!(
+      matches!(
+        on_reply.await.expect("the driver replies"),
+        Err(crate::error::SyncRootError::Retired)
+      ),
+      "the tombstone forced the claim to refuse — the reply is Retired"
+    );
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the refused write self-reaped the file it created"
+    );
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(cookie_count(&rig).await, 0, "nothing was left owned");
+    assert_eq!(
+      cancel_tombstones(&rig).await,
+      0,
+      "the tombstone was consumed by the claim — it never survives its write"
+    );
+  }
+
+  // The tombstone boundedness rule across all three cancel-versus-write orderings: an
+  // unknown-name cancel creates none, a cancel-then-complete's tombstone is consumed by the
+  // claim, and a complete-then-cancel is an owned reap that never tombstones. Each ends with zero
+  // outstanding tombstones — the bound `|cancelled| <= writes_in_flight` holds.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn cancel_tombstones_never_survive_their_writes() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    // Ordering A — cancel an UNKNOWN name: dropped, never a tombstone (the boundedness rule
+    // forbids a tombstone for a write not provably in flight).
+    rig
+      .cookie_removes
+      .send(CookieReap::Cancel(".tributaries-sync-nobody".to_owned()))
+      .await
+      .unwrap();
+    for _ in 0..8 {
+      tokio::task::yield_now().await;
+    }
+    assert_eq!(
+      cancel_tombstones(&rig).await,
+      0,
+      "a cancel for an unknown name creates no tombstone"
+    );
+
+    // Ordering B — cancel-then-complete: the tombstone is created while the write is in the pool,
+    // then CONSUMED by the refused claim.
+    {
+      let name = ".tributaries-sync-1-3-1";
+      let hold = rig.fs.hold_cookie_writes();
+      let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+      settle(|| rig.fs.cookie_dispatches() == 1).await;
+      rig
+        .cookie_removes
+        .send(CookieReap::Cancel(name.to_owned()))
+        .await
+        .unwrap();
+      settle_tombstones(&rig, 1).await;
+      assert_eq!(
+        cancel_tombstones(&rig).await,
+        1,
+        "the in-pool write's name is tombstoned"
+      );
+      hold.release();
+      let _ = on_reply.await;
+      settle_cookie_count(&rig, 0).await;
+      settle_tombstones(&rig, 0).await;
+      assert_eq!(
+        cancel_tombstones(&rig).await,
+        0,
+        "the claim consumed the tombstone — it never survives its write"
+      );
+    }
+
+    // Ordering C — complete-then-cancel: the write is OWNED first, so the later cancel reaps it
+    // directly and never creates a tombstone.
+    {
+      let name = ".tributaries-sync-1-3-2";
+      let path = admit_sync(&rig, scope, "/r", name).await;
+      settle_cookie_count(&rig, 1).await;
+      rig
+        .cookie_removes
+        .send(CookieReap::Cancel(name.to_owned()))
+        .await
+        .unwrap();
+      settle(|| rig.fs.cookie_removes().contains(&path)).await;
+      settle_cookie_count(&rig, 0).await;
+      assert_eq!(
+        cancel_tombstones(&rig).await,
+        0,
+        "an owned-then-cancelled cookie is reaped directly, never tombstoned"
+      );
+      assert!(
+        rig.fs.files_under("/r").is_empty(),
+        "the owned cookie was reaped by the cancel"
+      );
+    }
+  }
+
+  // Finding 2: a self-reap for an ABANDONED caller (its `reply.send(Ok)` fails) whose own unlink
+  // FAILS must RE-ASSERT ownership, never discard it — the record is retained as failed WHILE the
+  // file is still on disk, and the DRIVER'S OWN retry (no external request) later confirms it.
+  //
+  // Fail-on-old (the self-reap discards ownership on unlink failure): the record is gone with the
+  // file still on disk, so the `cookie_count == 1` retain assertion fails.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_failed_reply_abandon_self_reap_retains_ownership_and_retries() {
+    let rig = rig_with_config(64, retain_config());
+    let scope = watch(&rig, "/r").await;
+
+    let name = ".tributaries-sync-2-1-1";
+    // Hold the write, then abandon the caller so its `reply.send(Ok)` will FAIL when the write
+    // lands — the reply-fail self-reap path.
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    drop(on_reply);
+    // The self-reap's own unlink FAILS once.
+    rig.fs.fail_next_cookie_removes(1);
+    hold.release();
+
+    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      1,
+      "the self-reap attempt reached the pool and failed"
+    );
+    // The record is RETAINED as failed while the file is still present — never orphaned.
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "ownership is retained across the failed self-reap"
+    );
+    assert!(
+      !rig.fs.files_under("/r").is_empty(),
+      "the file is still on disk, still retry-owned"
+    );
+
+    // The driver retries ON ITS OWN and confirms — no external request.
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the driver's own retry removed the file"
+    );
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the record dropped only once the retry confirmed"
+    );
+  }
+
+  // Finding 2: a self-reap for a REFUSED claim (the scope retired under the in-flight write)
+  // whose unlink FAILS is OWNED as failed, and the retry that removes it is scope-INDEPENDENT —
+  // the scope is already gone, yet the driver still owns and drives the file to removal.
+  //
+  // Fail-on-old (the refused self-reap orphans a failed unlink): no record is inserted, so
+  // `cookie_count == 1` fails and the file is stranded forever.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_refused_claim_self_reap_failure_is_owned_and_retried() {
+    let rig = rig_with_config(64, retain_config());
+    let scope = watch(&rig, "/r").await;
+
+    let name = ".tributaries-sync-2-2-1";
+    // The write must be IN the pool before the scope retires (a still-parked write is revoked at
+    // its fence instead of self-reaping).
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+
+    // Retire the scope: the raised flag makes the landing write's claim REFUSE.
+    let (reply, on_unwatch) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(on_unwatch.await.unwrap(), "the live scope was unwatched");
+
+    // The refused self-reap's unlink FAILS once: the file must be OWNED as failed, not orphaned.
+    rig.fs.fail_next_cookie_removes(1);
+    hold.release();
+    assert!(
+      matches!(
+        on_reply.await.expect("the driver replies"),
+        Err(crate::error::SyncRootError::Retired)
+      ),
+      "the retiring scope refused the claim"
+    );
+
+    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the refused-and-failed self-reap OWNS the file, never orphans it"
+    );
+    assert!(
+      !rig.fs.files_under("/r").is_empty(),
+      "the file is still present, retry-owned"
+    );
+
+    // The retry is scope-INDEPENDENT — the scope is gone, yet the driver removes the file.
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the scope-independent retry removed the orphan-candidate"
+    );
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the record dropped once the retry confirmed"
+    );
+  }
+
+  // Finding 3: duplicate reap requests against a HUNG unlink coalesce to ONE job — the
+  // single-flight-per-path invariant. A caller that times out and storms 50 reaps against a wedged
+  // mount cannot pile 50 blocking unlink jobs (the pool-exhaustion re-creation Codex named).
+  //
+  // Fail-on-old (no coalescing): 50 dispatches.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn duplicate_reap_requests_for_a_hung_unlink_coalesce_to_one_job() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-3-1-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // The terminal unlink hangs; a caller storms 50 reap requests against it.
+    let hold = rig.fs.hold_cookie_removes();
+    for _ in 0..50 {
+      rig
+        .cookie_removes
+        .send(CookieReap::Remove(path.clone()))
+        .await
+        .unwrap();
+    }
+    // The first dispatches ONE unlink (now `Removing`); the other 49 coalesce.
+    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    for _ in 0..16 {
+      tokio::task::yield_now().await;
+    }
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      1,
+      "50 requests against a hung unlink coalesce to exactly ONE job"
+    );
+
+    // Released, the single unlink confirms and the record drops.
+    hold.release();
+    settle(|| rig.fs.cookie_removes().contains(&path)).await;
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(cookie_count(&rig).await, 0);
+  }
+
+  // Finding 3: a transient unlink failure is retried by the DRIVER, not the requester — ONE reap
+  // request suffices, and the driver's own backed-off retry drives the confirm.
+  //
+  // Fail-on-old (no retry owner): the file persists forever after its single failed dispatch.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_transient_unlink_failure_is_retried_by_the_driver_not_the_requester() {
+    let rig = rig_with_config(64, tuned_config());
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-3-2-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // ONE reap request; the first unlink fails transiently.
+    rig.fs.fail_next_cookie_removes(1);
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
+
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the driver's own retry removed the file after ONE request"
+    );
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(cookie_count(&rig).await, 0);
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      2,
+      "exactly two dispatches: the failed attempt and the driver's retry"
+    );
+  }
+
+  // Finding 3: past its attempt budget a failing unlink PARKS — it stops retrying (no CPU-spin)
+  // yet stays honestly OWNED, and an explicit reap RE-ARMS it with a fresh budget (T9).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn the_retry_budget_parks_without_spinning() {
+    let rig = rig_with_config(64, tuned_config()); // budget = 3
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-3-3-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // The unlink fails effectively forever.
+    rig.fs.fail_next_cookie_removes(10_000);
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
+
+    // One initial attempt plus a budget of 3 retries, then the record PARKS.
+    settle(|| rig.fs.cookie_remove_dispatches() == 4).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      4,
+      "one attempt plus a budget of 3 retries"
+    );
+
+    // Parked: over a generous window the count does NOT grow (no spin), and the cookie is owned.
+    for _ in 0..30 {
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      4,
+      "past the budget the record PARKS — no CPU-spinning retry"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the parked cookie is still honestly owned"
+    );
+
+    // A fresh explicit reap RE-ARMS the parked record with a fresh budget (T9): dispatches grow.
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path.clone()))
+      .await
+      .unwrap();
+    settle(|| rig.fs.cookie_remove_dispatches() >= 5).await;
+    assert!(
+      rig.fs.cookie_remove_dispatches() >= 5,
+      "an explicit reap re-arms a parked record (T9)"
+    );
+
+    // Close bridges to finding 4: the still-owned, unremovable cookie holds close in NotQuiesced.
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close returns within the grace")
+      .expect("the driver replied");
+    assert!(
+      pending >= 1,
+      "the still-owned, unremovable cookie holds close in NotQuiesced"
+    );
+  }
+
+  // Finding 3: a scope whose cookie cleanup is BACKLOGGED past the per-scope cap refuses new syncs
+  // with the retryable `CleanupBacklog` — the hard memory bound. On a recovered fs the backlog
+  // would drain and syncs resume; here it stays wedged so the cap is provably hit.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_backlogged_scope_refuses_new_syncs_retryably() {
+    let rig = rig_with_config(64, tuned_config()); // backlog_cap = 3
+    let scope = watch(&rig, "/r").await;
+
+    // Every unlink fails: the backlog fills with owned-but-unremovable cookies.
+    rig.fs.fail_next_cookie_removes(1_000_000);
+
+    // Fill the scope's backlog to the cap: three syncs, each reaped-but-failing.
+    for seq in 0..3 {
+      let name = format!(".tributaries-sync-3-4-{seq}");
+      let path = admit_sync(&rig, scope, "/r", &name).await;
+      rig
+        .cookie_removes
+        .send(CookieReap::Remove(path))
+        .await
+        .unwrap();
+      settle_cookie_count(&rig, seq + 1).await;
+      assert_eq!(
+        cookie_count(&rig).await,
+        seq + 1,
+        "the failing unlink keeps the cookie owned"
+      );
+    }
+
+    // The 4th sync is refused CleanupBacklog — a transient, retryable refusal with no physical
+    // write (drive past any lingering single-flight gate to reach the cap check).
+    let mut outcome = None;
+    for _ in 0..400 {
+      match sync_root(&rig, scope, "/r", ".tributaries-sync-3-4-cap").await {
+        Err(crate::error::SyncRootError::WriteInFlight) => {
+          tokio::task::yield_now().await;
+          tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        other => {
+          outcome = Some(other);
+          break;
+        }
+      }
+    }
+    assert!(
+      matches!(
+        outcome,
+        Some(Err(crate::error::SyncRootError::CleanupBacklog))
+      ),
+      "the backlogged scope refuses a new sync with the retryable CleanupBacklog, got {outcome:?}"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      3,
+      "the refusal wrote nothing — the ledger is unchanged at the cap"
+    );
+  }
+
+  // Finding 4: close reports NotQuiesced BECAUSE a cookie is still owned — a mount whose unlinks
+  // fail through every grace retry leaves the file, and close counts the LIVE LEDGER, not a job
+  // count that a failed unlink would have drained.
+  //
+  // Fail-on-old (close counts jobs, ignores the ledger): close returns 0 with the file still on
+  // disk — the `pending >= 1` assertion fails.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_reports_not_quiesced_while_a_cookie_survives_repeated_unlink_failures() {
+    let rig = rig_with_config(64, tuned_config());
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-4-1-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // Every unlink fails, through every grace retry.
+    rig.fs.fail_next_cookie_removes(100_000);
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close returns within the grace, never wedged")
+      .expect("the driver replied");
+
+    assert!(
+      pending >= 1,
+      "close reports NotQuiesced BECAUSE the cookie is still owned"
+    );
+    assert!(
+      rig.fs.files_under("/r").contains(&path),
+      "the file remains — the live ledger, not a drained job count, is the drain condition"
+    );
+  }
+
+  // Finding 4: a transiently-failing terminal unlink is RETRIED by the close drain INSIDE the
+  // grace — reply `Ok(0)` with the file already gone AT reply time, driven by the drain's own
+  // retry, not the registry `Drop`'s post-reply detached tail (whose completion the reply never
+  // waits for). The dispatch count is the discriminator: exactly the failed attempt plus the
+  // drain's retry.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_retries_a_transiently_failing_unlink_inside_the_grace() {
+    let rig = rig_with_config(64, tuned_config());
+    let scope = watch(&rig, "/r").await;
+
+    let _path = sync_root(&rig, scope, "/r", ".tributaries-sync-4-2-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // The terminal unlink fails ONCE; the drain's own retry (inside the grace) drives the confirm.
+    rig.fs.fail_next_cookie_removes(1);
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close returns within the grace")
+      .expect("the driver replied");
+
+    assert_eq!(
+      pending, 0,
+      "the transient failure was retried and confirmed INSIDE the grace"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the file is gone AT reply time — the drain's retry, not Drop's detached tail"
+    );
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      2,
+      "exactly the failed attempt and the drain's own retry"
+    );
   }
 }

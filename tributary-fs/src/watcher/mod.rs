@@ -17,7 +17,7 @@ use futures_core::Stream;
 use tributary_proto::{Change, Interest, ScopeId};
 
 use crate::{
-  driver::{Command, DriverConfig, RealFs, ScopeRegistry, run},
+  driver::{Command, CookieReap, DriverConfig, RealFs, ScopeRegistry, run},
   error::{BuildError, CloseError, ReplaceRootError, SyncRootError, UnwatchError, WatchRootError},
   event::Event,
   options::WatcherOptions,
@@ -490,11 +490,11 @@ pub struct Watcher<R> {
   /// This watcher's handle brand (see [`RootHandle`]).
   instance: u64,
   commands: async_channel::Sender<Command>,
-  /// The DEDICATED completed-cookie cleanup lane, separate from `commands` so a
-  /// saturated command channel can never drop a reap. Unbounded — admission is
+  /// The DEDICATED cookie cleanup lane, separate from `commands` so a saturated
+  /// command channel can never drop a reap or a cancel. Unbounded — admission is
   /// guaranteed — and bounded in practice by the in-flight resolved syncs the
   /// driver drains it against.
-  cookie_removes: async_channel::Sender<PathBuf>,
+  cookie_removes: async_channel::Sender<CookieReap>,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
   // `fn() -> R`, not `R`: the watcher holds no runtime value, so its auto
@@ -540,6 +540,10 @@ impl<R: RuntimeLite> Watcher<R> {
       backend: options.backend(),
       root_liveness_interval: options.root_liveness_interval(),
       max_map_directories: options.max_map_directories(),
+      cookie_retry_base: DriverConfig::DEFAULT_COOKIE_RETRY_BASE,
+      cookie_retry_cap: DriverConfig::DEFAULT_COOKIE_RETRY_CAP,
+      cookie_retry_budget: DriverConfig::DEFAULT_COOKIE_RETRY_BUDGET,
+      cookie_backlog_cap: DriverConfig::DEFAULT_COOKIE_BACKLOG_CAP,
     };
     Self::spawn_with(options, config, RealFs::new())
   }
@@ -603,6 +607,10 @@ impl<R: RuntimeLite> Watcher<R> {
       backend: options.backend(),
       root_liveness_interval: options.root_liveness_interval(),
       max_map_directories: options.max_map_directories(),
+      cookie_retry_base: DriverConfig::DEFAULT_COOKIE_RETRY_BASE,
+      cookie_retry_cap: DriverConfig::DEFAULT_COOKIE_RETRY_CAP,
+      cookie_retry_budget: DriverConfig::DEFAULT_COOKIE_RETRY_BUDGET,
+      cookie_backlog_cap: DriverConfig::DEFAULT_COOKIE_BACKLOG_CAP,
     };
     Self::spawn_with(options, config, ops)
   }
@@ -982,7 +990,30 @@ impl<R> Watcher<R> {
     // Unbounded, so `try_send` refuses only once the driver is gone — and its
     // terminal sweep has already reaped (or will reap) the file, so the dropped
     // request strands nothing.
-    let _ = self.cookie_removes.try_send(path.into());
+    let _ = self
+      .cookie_removes
+      .try_send(CookieReap::Remove(path.into()));
+  }
+
+  /// Cancels the sync whose cookie has the rendered `name` — a NON-BLOCKING,
+  /// reply-less fire-and-forget request in the
+  /// [`request_remove_cookie`](Self::request_remove_cookie) mold. The driver
+  /// reaps a delivered-but-unread cookie of this name, tombstones one whose
+  /// write is still in flight (so its claim self-reaps), or drops the request if
+  /// the sync already resolved. Idempotent; may arrive after the sync resolved
+  /// (then it is a no-op); never blocks.
+  ///
+  /// Public because the umbrella `FsSource` — in a different crate — calls it
+  /// from its `cancel_sync` seam method when the owner abandons an in-flight
+  /// sync (a caller timeout, or a close winning the race), so a cookie the write
+  /// already created but whose completion the owner never read can never orphan.
+  /// Admission is GUARANTEED (the dedicated unbounded lane), and the driver owns
+  /// every cookie it writes regardless, so a cancel to an already-closed driver
+  /// leaks nothing.
+  pub fn request_cancel_sync(&self, name: impl Into<String>) {
+    let _ = self
+      .cookie_removes
+      .try_send(CookieReap::Cancel(name.into()));
   }
 
   /// Reconciles a watched root's per-directory coverage to the `retained` cover **in place**,

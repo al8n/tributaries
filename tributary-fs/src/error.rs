@@ -215,6 +215,12 @@ pub enum SyncRootError {
   /// resolves.
   #[error("a sync cookie write is already in flight for this root")]
   WriteInFlight,
+  /// This root has too many unremoved cookies: its cleanup owner is retrying
+  /// failing unlinks (a pathological filesystem where writes succeed but unlinks
+  /// keep failing), and the per-root backlog cap has been reached. Retryable —
+  /// once the backlog drains, syncs resume with no operator action.
+  #[error("the root's sync cookie cleanup is backlogged; retry later")]
+  CleanupBacklog,
   /// The barrier outlived the coverage it was to be written under: the root died (or was
   /// unwatched) while the write was parked on the coverage-settle fence, or the scope retired —
   /// or the driver itself shut down — while the write was already in flight. In the latter cases

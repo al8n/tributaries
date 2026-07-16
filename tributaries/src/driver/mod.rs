@@ -3157,12 +3157,25 @@ where
     match step {
       // Thread the close back so the run loop's teardown consumes it exactly once — no loss, no
       // double-acknowledge.
-      SyncStep::Close(close_reply) => SyncAdmit::CloseRequested(close_reply),
+      SyncStep::Close(close_reply) => {
+        // Abandoning an in-flight write: hand the source the token so a cookie the write already
+        // created (a delivered-but-unread `Ok` — the fs `reply.send` succeeded, so its own
+        // self-reap will NOT run) is reaped, and one still in the pool tombstones so its claim
+        // self-reaps. The owner never learned the cookie key here (only a completed `begin_sync`
+        // returns it), so this token-cancel is the only thing that can free the file.
+        self.source.cancel_sync(root, token);
+        SyncAdmit::CloseRequested(close_reply)
+      }
       // Abandon: drop `reply` without parking or writing further. The caller is gone (timeout, drop,
       // or every handle away); a cookie the write began self-reaps as the dropped write unwinds, and
       // the cookie's own event — should it still arrive — is suppressed as a sync artifact, so nothing
       // spurious is delivered.
-      SyncStep::Canceled => SyncAdmit::Done,
+      SyncStep::Canceled => {
+        // Same as the close arm: the caller is gone and never received the cookie key, so cancel
+        // by token — the only handle on a write that may have landed after this arm won the race.
+        self.source.cancel_sync(root, token);
+        SyncAdmit::Done
+      }
       SyncStep::Began(Ok(cookie_key)) => {
         self.admit_begun_cookie(cookie_key, sub, root, loss_gen_at_call, reply);
         SyncAdmit::Done
