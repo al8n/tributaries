@@ -151,6 +151,45 @@ impl DeficitBook {
   }
 }
 
+/// Why a [`drop_subtree`](Monitor::drop_subtree) may erase the coverage
+/// deficits anchored in the dropped subtree — the discharge reason, named at
+/// every call site so the invariant is auditable in one place: **a recorded
+/// coverage deficit is discharged only by a fresh covering `Rescan`, a
+/// re-anchor, an explicit terminal teardown, or a proven-unsubscribed prune —
+/// never by a structural `Removed`/`File`/move a filtered subscription would
+/// not see.** A covering `Rescan` bypasses BOTH coverage and delivery filter
+/// (it reaches every subscriber regardless of interest); a structural record is
+/// interest- and filter-subject and can reach NONE, so it can never silently
+/// stand in for the darkness the deficit tracked.
+#[derive(Debug, Clone, Copy)]
+enum DeficitDischarge {
+  /// Stand a fresh covering `Rescan` (set both bridge bits so the window's
+  /// [`settle_bridges`](Monitor::settle_bridges) flush emits the closing
+  /// `Rescan`) for the dropped subtree's scope when the drop erases a real
+  /// deficit. The default for a record- or move-driven drop — a slot emptied
+  /// or replaced, a delete, an ignore, a move-out, a stale-destination replace
+  /// — whose only structural signal a `Modified`-only (or removal-filtering)
+  /// subscription would never observe.
+  CoveringRescan,
+  /// Re-anchor an erased deficit as a slot hole at the dropped child's
+  /// SURVIVING parent — the crawl-rebuild non-survivor branch, the one drop
+  /// with no coverage story of its own (see
+  /// [`drop_subtree_for_crawl_rebuild`](Monitor::drop_subtree_for_crawl_rebuild)).
+  /// The crawl's own re-install heals it through the
+  /// [`install_child`](Monitor::install_child) interlock, or it stays booked
+  /// for the dispatch re-signal until the vanish's `Removed` converges it.
+  Reanchor,
+  /// Terminal teardown of the scope (unregister, root invalidation, rebind):
+  /// the caller's unconditional terminal/commit `Rescan` and whole-book wipe
+  /// own coverage from here — the scope is gone, there is no barrier left to
+  /// lie to.
+  Teardown,
+  /// A proven-unsubscribed prune
+  /// ([`drop_watch_subtree`](Monitor::drop_watch_subtree)): the coverage is
+  /// outside every committed subscription, so no subscriber exists to lie to.
+  UnsubscribedPrune,
+}
+
 /// One node in the parent-relative watch tree.
 ///
 /// Paths are reconstructed by walking `parent` links to a root, so a node stores
@@ -605,7 +644,7 @@ impl Monitor {
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn unregister_root(&mut self, scope: ScopeId) {
     if let Some(root) = self.roots.remove(&scope) {
-      self.drop_subtree(root);
+      self.drop_subtree(root, DeficitDischarge::Teardown);
       // Whole-scope teardown: no destination in this scope can ever validly arrive,
       // so its pending move halves can never pair — purge them all (invariant b).
       // A *narrow* subtree drop does NOT purge (the `MovedTo` may still arrive at a
@@ -651,7 +690,7 @@ impl Monitor {
     let dropped = match self.nodes.get(&watch) {
       // A root (no parent) is never pruned in place; an unknown watch is already gone.
       Some(node) if node.parent.is_some() => {
-        self.drop_subtree(watch);
+        self.drop_subtree(watch, DeficitDischarge::UnsubscribedPrune);
         true
       }
       _ => false,
@@ -754,7 +793,7 @@ impl Monitor {
       .map(|node| node.children.iter().copied().collect())
       .unwrap_or_default();
     for child in children {
-      self.drop_subtree(child);
+      self.drop_subtree(child, DeficitDischarge::Teardown);
     }
     self.purge_scope_pending_moves(scope);
     // The old world's standing deficits die with its transport: the commit's
@@ -1118,9 +1157,10 @@ impl Monitor {
     }
 
     // A CLEAN completion fully reconciled this interior: a standing
-    // exhausted-read deficit for it is healed (the P2 clear edge; bridge bits
-    // iff the healing read was re-arm-flavored — see `clear_interior_deficit`).
-    self.clear_interior_deficit(scope, dir, kind == EnumKind::Rearm);
+    // exhausted-read deficit for it is healed (the P2 clear edge; the clear
+    // stands the closing `Rescan` when it removes a real entry — see
+    // `clear_interior_deficit`).
+    self.clear_interior_deficit(scope, dir);
 
     match kind {
       // A cold read on a held dir is coverage-only; route it as a re-arm (no `Created`).
@@ -1441,7 +1481,7 @@ impl Monitor {
       Err(_) => {
         if let Some(source) = self.in_held_subtree(id) {
           self.dirtied_holds.insert(source);
-          self.drop_subtree(id);
+          self.drop_subtree(id, DeficitDischarge::CoveringRescan);
         } else if self.is_root_watch(id) {
           // A refused ROOT install is a root invalidation like any other: Rescan, then
           // drop the tree AND purge the scope's pending halves.
@@ -1461,7 +1501,7 @@ impl Monitor {
           {
             self.record_slot_deficit(scope, parent, name);
           }
-          self.drop_subtree(id);
+          self.drop_subtree(id, DeficitDischarge::CoveringRescan);
         }
       }
     }
@@ -1823,7 +1863,7 @@ impl Monitor {
           rec.is_dir()
         };
         if let Some(src) = src {
-          self.drop_subtree(src);
+          self.drop_subtree(src, DeficitDischarge::CoveringRescan);
         }
         let from = self.record_location(rec);
         self.resolve_lost_source(scope, from, is_dir);
@@ -1893,7 +1933,7 @@ impl Monitor {
               // destination as a fresh move-in if its parent survived, else escalate
               // with a `Rescan` — never a `Moved` into a path we no longer cover.
               if self.is_watched(src) {
-                self.drop_subtree(src);
+                self.drop_subtree(src, DeficitDischarge::CoveringRescan);
               }
               if self.is_watched(rec.watch()) {
                 self.emit_pair(scope, to.clone(), &pending, class);
@@ -1953,7 +1993,7 @@ impl Monitor {
           }
           (None, held) => {
             if let Some(src) = held {
-              self.drop_subtree(src);
+              self.drop_subtree(src, DeficitDischarge::CoveringRescan);
             }
             self.emit_pair(scope, to.clone(), &pending, class);
             if let Some(from) = resolved_from.as_ref() {
@@ -2036,7 +2076,7 @@ impl Monitor {
   /// through the parent-link walk).
   fn resolve_stored_half(&mut self, pending: PendingMove) {
     if let Some(src) = pending.held {
-      self.drop_subtree(src);
+      self.drop_subtree(src, DeficitDischarge::CoveringRescan);
     }
     if self.is_watched(pending.from_parent) {
       let from = self.pending_from(&pending);
@@ -2123,7 +2163,7 @@ impl Monitor {
       // re-arm, or an outstanding re-arm read). Either way it must pass to the reparented
       // subtree, not vanish with the drop.
       inherit_rearm = self.has_rearm_obligation(stale);
-      self.drop_subtree(stale);
+      self.drop_subtree(stale, DeficitDischarge::CoveringRescan);
     }
     // Dropping the stale destination can have removed `child` itself (the held source
     // sat inside that slot). Only re-key when both endpoints survive.
@@ -2238,7 +2278,7 @@ impl Monitor {
         let mut inherit = false;
         if replace && let Some(stale) = existing {
           inherit = self.has_rearm_obligation(stale);
-          self.drop_subtree(stale);
+          self.drop_subtree(stale, DeficitDischarge::CoveringRescan);
         }
         self.install_child(parent, scope, name.clone(), true, identity);
         if inherit && let Some(fresh) = self.child_watch(parent, name) {
@@ -2247,13 +2287,16 @@ impl Monitor {
       }
       SlotOccupant::File | SlotOccupant::Gone => {
         if let Some(stale) = self.child_watch(parent, name) {
-          self.drop_subtree(stale);
+          self.drop_subtree(stale, DeficitDischarge::CoveringRescan);
         }
-        // The slot's object is gone (or a never-watched file): a recorded
-        // arm-refused hole there is moot. No bridge bits — a record-driven
-        // emptying was DELIVERED (the consumer converges on the removal), and
-        // an enumerate-driven one happens inside a window whose own `Rescan`s
-        // carry the bits.
+        // The slot's object is gone (or a never-watched file). A recorded
+        // arm-refused hole there is NOT converged by the emptying: the
+        // `Removed`/`File` record that drove it is interest- and
+        // filter-subject — a `Modified`-only (or removal-filtering)
+        // subscription never sees it — so it cannot stand in for the change
+        // the hole's darkness hid. `remove_slot_deficit` stands the covering
+        // `Rescan` (both bridge bits → the settle's closing `Rescan`, which
+        // bypasses interest and filter) when it removes a real entry.
         let _ = self.remove_slot_deficit(scope, parent, name);
       }
     }
@@ -2344,7 +2387,7 @@ impl Monitor {
   /// could reconcile a real directory as a file, silently losing coverage. The caller
   /// emits the unfiltered `Rescan` first (invariant: root invalidation never silent).
   fn invalidate_root(&mut self, scope: ScopeId, root: WatchId) {
-    self.drop_subtree(root);
+    self.drop_subtree(root, DeficitDischarge::Teardown);
     self.purge_scope_pending_moves(scope);
     // As for `unregister_root`: the caller's unconditional `Rescan` plus the
     // teardown own coverage now — no bridge window or deficit book survives.
@@ -2373,7 +2416,12 @@ impl Monitor {
     // for the trailing `Ignored`. A stale entry in the window between the two would
     // make a replacement `Created` at the same slot reuse it (discovery-reuse), and
     // the eventual `Ignored` teardown would then leave the replacement unwatched.
-    self.drop_subtree(rec.watch());
+    //
+    // The parent-side `Removed` this pairs with is interest- and filter-subject
+    // (a `Modified`-only subscription never sees it), so a deficit dying with
+    // the deleted subtree carries a covering `Rescan` rather than clearing
+    // silently.
+    self.drop_subtree(rec.watch(), DeficitDischarge::CoveringRescan);
   }
 
   fn on_ignored(&mut self, rec: &OsRecord) {
@@ -2388,7 +2436,10 @@ impl Monitor {
       self.invalidate_root(scope, rec.watch());
       return;
     }
-    self.drop_subtree(rec.watch());
+    // A non-root ignore is reported to the consumer by the live parent watch's
+    // `Removed` — interest- and filter-subject — so a deficit dying with the
+    // ignored subtree carries a covering `Rescan` rather than clearing silently.
+    self.drop_subtree(rec.watch(), DeficitDischarge::CoveringRescan);
   }
 
   fn emit_child(&mut self, scope: ScopeId, rec: &OsRecord, kind: ChangeKind) {
@@ -2583,18 +2634,16 @@ impl Monitor {
     }
     // The slot-heal clear edge (the P2↔P1 interlock): occupying a recorded
     // arm-refused hole heals it, and the hole's dark interval is covered only
-    // by the window's closing `Rescan` — so the heal sets BOTH bridge bits
-    // itself, order-robustly (an organic pure grow reaching the hole has no
-    // `Rescan` of its own). This is the ONE funnel every slot occupation
-    // passes through: `reconcile_slot`'s `Dir` arm, `rearm_enumerate`'s
-    // direct installs, and the incomplete-read reconciles all route here. (A
-    // record-driven cold re-install lands here too and sets the bits; its
-    // `Removed`+`Created` records already converged the consumer, so the
-    // resulting closing `Rescan` is redundant-but-legal, and rare.)
-    if self.remove_slot_deficit(scope, parent, &name) {
-      self.bridge_saw_rescan(scope);
-      self.bridge_fresh_rearm(scope);
-    }
+    // by the window's closing `Rescan` — so `remove_slot_deficit` stands both
+    // bridge bits itself when it removes a real entry, order-robustly (an
+    // organic pure grow reaching the hole has no `Rescan` of its own). This is
+    // the ONE funnel every slot occupation passes through: `reconcile_slot`'s
+    // `Dir` arm, `rearm_enumerate`'s direct installs, and the incomplete-read
+    // reconciles all route here. (A record-driven cold re-install lands here
+    // too and stands the bits; its `Removed`+`Created` records already
+    // converged an all-interest consumer, so the resulting closing `Rescan` is
+    // redundant-but-legal for it and honest for a filtered one.)
+    let _ = self.remove_slot_deficit(scope, parent, &name);
     let id = WatchId::new(self.watch_ids.mint());
     self.insert_node(
       id,
@@ -2624,12 +2673,31 @@ impl Monitor {
   }
 
   /// Drops the watch subtree rooted at `root`, queuing an
-  /// [`Action::Unwatch`] per removed node. Returns whether the walk erased
-  /// any recorded deficit entry — consumed only by
-  /// [`drop_subtree_for_crawl_rebuild`](Self::drop_subtree_for_crawl_rebuild);
-  /// every other caller's coverage story already accounts for the dropped
-  /// anchors (see [`drop_node_deficits`](Self::drop_node_deficits)).
-  fn drop_subtree(&mut self, root: WatchId) -> bool {
+  /// [`Action::Unwatch`] per removed node, and DISCHARGES any coverage
+  /// deficits the dropped nodes anchored per `discharge` (see
+  /// [`DeficitDischarge`]): a record- or move-driven drop stands a covering
+  /// `Rescan` — the structural record that drove it is interest- and
+  /// filter-subject and may reach no subscriber; a crawl rebuild re-anchors;
+  /// a terminal teardown or a proven-unsubscribed prune discharges silently
+  /// (no barrier left to lie to). The covering `Rescan` and the re-anchor
+  /// fire ONLY when the walk erased a real entry, so a deficit-free drop
+  /// stays silent (the A2 overreach guard).
+  fn drop_subtree(&mut self, root: WatchId, discharge: DeficitDischarge) {
+    // The dropped subtree's scope, and — for a re-anchor — the dropped
+    // child's surviving-parent slot: both captured BEFORE the walk erases
+    // them. Every node in a subtree shares the root's scope (scopes are
+    // disjoint roots), so the root's scope is where any erased deficit lived.
+    let root_scope = self.nodes.get(&root).map(|node| node.scope);
+    let reanchor = matches!(discharge, DeficitDischarge::Reanchor)
+      .then(|| {
+        self.nodes.get(&root).and_then(|node| {
+          node
+            .parent
+            .zip(node.name.clone())
+            .map(|(parent, name)| (node.scope, parent, name))
+        })
+      })
+      .flatten();
     let mut erased = false;
     let mut stack = std::vec::Vec::new();
     stack.push(root);
@@ -2694,7 +2762,36 @@ impl Monitor {
     // from_parent)`) suppresses the stale `Removed` if no destination ever comes.
     // Whole-scope teardown purges instead — see `unregister_root` /
     // `purge_scope_pending_moves`.
-    erased
+    //
+    // Discharge the erased darkness per the named reason. A drop that erased
+    // nothing owes nothing, so a clean prune/regrow of deficit-free coverage
+    // stays silent (A2).
+    if erased {
+      match discharge {
+        // A structural record a filtered subscription would not see cannot
+        // stand in for the darkness the deficit tracked: set both bridge bits
+        // so the window's closing `Rescan` (which bypasses interest AND
+        // filter) covers the whole dark interval for every subscriber.
+        DeficitDischarge::CoveringRescan => {
+          if let Some(scope) = root_scope {
+            self.bridge_saw_rescan(scope);
+            self.bridge_fresh_rearm(scope);
+          }
+        }
+        // Re-anchor the loss at the surviving parent slot; the crawl's own
+        // re-install heals it through `install_child`, or it stays booked for
+        // the dispatch re-signal until the vanish's `Removed` converges it.
+        DeficitDischarge::Reanchor => {
+          if let Some((scope, parent, name)) = reanchor {
+            self.record_slot_deficit(scope, parent, name);
+          }
+        }
+        // The scope is gone (its terminal/commit `Rescan` and whole-book wipe
+        // own coverage), or the coverage is outside every committed
+        // subscription: either way no barrier remains to lie to.
+        DeficitDischarge::Teardown | DeficitDischarge::UnsubscribedPrune => {}
+      }
+    }
   }
 
   /// [`drop_subtree`](Self::drop_subtree) for `rearm_enumerate`'s
@@ -2720,17 +2817,7 @@ impl Monitor {
   /// invalidation) keeps the bare call: those erasures are converged,
   /// covered at the hold's resolution, out of contract, or terminal.
   fn drop_subtree_for_crawl_rebuild(&mut self, child: WatchId) {
-    let anchor = self.nodes.get(&child).and_then(|node| {
-      node
-        .parent
-        .zip(node.name.clone())
-        .map(|(parent, name)| (node.scope, parent, name))
-    });
-    if self.drop_subtree(child)
-      && let Some((scope, parent, name)) = anchor
-    {
-      self.record_slot_deficit(scope, parent, name);
-    }
+    self.drop_subtree(child, DeficitDischarge::Reanchor);
   }
 
   /// Drops every pending move half belonging to `scope`. Called only on whole-scope
@@ -2958,9 +3045,16 @@ impl Monitor {
     }
   }
 
-  /// Removes a recorded slot hole, reporting whether one was recorded. No
-  /// bridge bits: the record-driven clears (a delivered `Removed`/`File`
-  /// occupant) converged the consumer on their own.
+  /// Removes a recorded slot hole, reporting whether one was recorded. When it
+  /// removes a REAL entry it stands the covering `Rescan` (both bridge bits →
+  /// the window's closing `Rescan`): the hole's darkness ends here — an
+  /// [`install_child`](Self::install_child) occupation heals it, or a
+  /// `Removed`/`File` occupant empties it — and every driver of that end is
+  /// either `Created`-suppressed (a re-arm install) or interest- and
+  /// filter-subject (a structural record a `Modified`-only subscription never
+  /// sees), so ONLY a covering `Rescan` (which bypasses interest AND filter)
+  /// can honestly discharge it. A no-op removal (no such entry) sets nothing,
+  /// so a clean occupation of a deficit-free slot stays silent (A2).
   fn remove_slot_deficit(&mut self, scope: ScopeId, parent: WatchId, name: &Segment) -> bool {
     let Some(book) = self.deficits.get_mut(&scope) else {
       return false;
@@ -2973,38 +3067,44 @@ impl Monitor {
       book.slots.remove(&parent);
     }
     self.gc_deficit_book(scope);
+    if removed {
+      self.bridge_saw_rescan(scope);
+      self.bridge_fresh_rearm(scope);
+    }
     removed
   }
 
-  /// The interior-heal clear edge: a CLEAN completion for `dir` reconciled
-  /// the interior a standing deficit said was dark. When the healing read was
-  /// re-arm-flavored its content was `Created`-suppressed, so the heal sets
-  /// BOTH bridge bits — the P2↔P1 interlock that guarantees the window closes
-  /// with a covering `Rescan` even when it was otherwise clean (an organic
-  /// pure grow reaching the hole). A clean COLD completion announced its
-  /// content and sets nothing.
-  fn clear_interior_deficit(&mut self, scope: ScopeId, dir: WatchId, rearm: bool) {
+  /// The interior-heal clear edge: a CLEAN completion for `dir` reconciled the
+  /// interior a standing deficit said was dark. When it removes a REAL entry
+  /// it stands the covering `Rescan` (both bridge bits → the window's closing
+  /// `Rescan`, the P2↔P1 interlock): a standing interior deficit is only ever
+  /// cleared by a re-arm read (the resignal heal-kick, or a cascade — a Live
+  /// interior never re-enters a fresh COLD read while its deficit stands),
+  /// whose content is `Created`-suppressed, so only a covering `Rescan` (which
+  /// bypasses interest AND filter) instructs a `Modified`-only subscription to
+  /// re-read the now-reconciled interior — even when the healing window was
+  /// otherwise clean (an organic pure grow reaching the hole). A no-op removal
+  /// sets nothing, so a clean read of a deficit-free interior stays silent (A2).
+  fn clear_interior_deficit(&mut self, scope: ScopeId, dir: WatchId) {
     let Some(book) = self.deficits.get_mut(&scope) else {
       return;
     };
     let removed = book.interiors.remove(&dir);
     self.gc_deficit_book(scope);
-    if removed && rearm {
+    if removed {
       self.bridge_saw_rescan(scope);
       self.bridge_fresh_rearm(scope);
     }
   }
 
   /// Drops the fine entries anchored at a dying node — `drop_subtree`'s
-  /// hook — reporting whether any were actually recorded. No bridge bits
-  /// here: a record-delivered drop converged, a held-subtree drop is covered
-  /// at the hold's resolution, an umbrella prune is unsubscribed by
-  /// contract, and a teardown ends in a terminal `Rescan`. A crawl rebuild
-  /// has no such story — its re-installs re-set the bits only for a deficit
-  /// anchored at a SURVIVING parent, never for one whose anchor dies with
-  /// the subtree — so
-  /// [`drop_subtree_for_crawl_rebuild`](Self::drop_subtree_for_crawl_rebuild)
-  /// re-anchors a reported erasure at the surviving parent instead.
+  /// hook — reporting whether any were actually recorded, so the caller can
+  /// discharge the erasure per its named [`DeficitDischarge`]: a record- or
+  /// move-driven drop stands a covering `Rescan` (the structural record is
+  /// filter-subject and may reach no subscriber); a crawl rebuild re-anchors
+  /// at the surviving parent; a teardown or unsubscribed prune discharges
+  /// silently. The hook itself sets no bits — the reason lives at the
+  /// `drop_subtree` call site, where the context is known.
   fn drop_node_deficits(&mut self, scope: ScopeId, id: WatchId) -> bool {
     let Some(book) = self.deficits.get_mut(&scope) else {
       return false;
