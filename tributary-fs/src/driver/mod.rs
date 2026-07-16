@@ -497,13 +497,74 @@ impl<F: FsOps> CookieRegistry<F> {
       .count()
   }
 
-  /// Whether the ledger already holds an owned record under this cookie `name` —
-  /// the close accounting's de-duplication probe. A write whose `reply.send`
-  /// failed CLAIMED its record (so it is in the ledger, state `Removing`) yet
-  /// still sits in `writes_in_flight` until its `CookieWriteDone` lands: without
-  /// this the close count would tally that one physical obligation twice.
-  fn has_name(&self, name: &str) -> bool {
-    lock_ledger(&self.ledger).names.contains_key(name)
+  /// The count of outstanding cookie obligations for the close reply, computed
+  /// from ONE ledger snapshot so the two halves cannot race: every owned record
+  /// (each an unconfirmed removal), PLUS every in-flight write whose name is NOT
+  /// already an owned record. A write whose `reply.send` failed CLAIMED its
+  /// record (so its name IS owned, state `Removing`) yet still sits in
+  /// `writes_in_flight` until its `CookieWriteDone` lands — counting it via the
+  /// ledger alone avoids double-tallying that one physical obligation.
+  ///
+  /// Taking both halves under a SINGLE lock is what forecloses a false `Ok(0)`:
+  /// with two snapshots, an owned record's unlink could confirm BETWEEN reading
+  /// `names` (which excluded an in-flight same-name write) and reading
+  /// `owned.len()`, dropping the count to zero while that write is still blocked.
+  /// One snapshot keeps the invariant "every `names` entry points at a live
+  /// `owned` record", so a non-empty obligation is always counted by exactly one
+  /// side. (A direct-fs-API caller reusing ONE name across two live paths can
+  /// still be under-counted by one — never to zero — a conservative imprecision
+  /// the umbrella never reaches, since it mints per-sync-unique names.)
+  fn close_obligation_count(&self, writes_in_flight: &BTreeMap<ScopeId, String>) -> usize {
+    let inner = lock_ledger(&self.ledger);
+    let unclaimed_writes = writes_in_flight
+      .values()
+      .filter(|name| !inner.names.contains_key(*name))
+      .count();
+    unclaimed_writes + inner.owned.len()
+  }
+
+  /// Re-arms up to `limit` PARKED removal records — `RemoveFailed` with no
+  /// scheduled retry (budget spent) — by re-dispatching each with a fresh budget.
+  /// The backlog-recovery driver: a parked record on a RETIRED scope has no live
+  /// scope to sweep it and no timer to retry it, so without this a since-recovered
+  /// filesystem would never drain those records and the global cap could lock out
+  /// every future sync permanently. Called at admission when a cap refusal is
+  /// imminent, so a caller hitting the backlog is what kicks recovery: the
+  /// re-armed records confirm on a recovered fs (freeing the cap for a later
+  /// sync) or re-park on a still-failing one (bounded work, ≤ `limit` unlinks,
+  /// and single-flight coalesces any already-`Removing` path). Returns how many
+  /// were re-armed.
+  fn rearm_parked_batch<R>(
+    &self,
+    op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+    pending_retries: &mut BTreeMap<PathBuf, Instant>,
+    limit: usize,
+  ) -> usize
+  where
+    R: RuntimeLite,
+  {
+    let parked: Vec<PathBuf> = {
+      let inner = lock_ledger(&self.ledger);
+      inner
+        .owned
+        .iter()
+        .filter(|(path, rec)| {
+          matches!(rec.state, RemovalState::RemoveFailed { .. })
+            && !pending_retries.contains_key(*path)
+        })
+        .map(|(path, _)| path.clone())
+        .take(limit)
+        .collect()
+    };
+    for path in &parked {
+      self.request_removal::<R>(
+        op_tx,
+        pending_retries,
+        path.clone(),
+        RemovalRequest::Explicit,
+      );
+    }
+    parked.len()
   }
 
   /// Spawns the ONE blocking unlink of `path` (already transitioned to
@@ -805,6 +866,17 @@ impl<F: FsOps> Drop for CookieRegistry<F> {
     // single-flight choke point forbids. A `Removing` record whose job never
     // lands on a cancelled runtime is the accepted abnormal-path residual, no
     // worse than any other detached job there.
+    //
+    // ACCEPTED RESIDUAL (orderly close): a `Removing` record whose unlink hangs
+    // PAST the ~1 s grace and only THEN fails is skipped here and gets no retry —
+    // its file persists. This is bounded and honestly reported: close already
+    // returned `NotQuiesced` counting that cookie (`close_obligation_count`
+    // tallies every owned record), and the residue is an inert, reserved-namespace
+    // (`is_sync_artifact`) file that never surfaces as a user event. Removing it
+    // after the fact would require a cleanup owner that outlives the driver task
+    // and awaits the hung unlink — disproportionate machinery for an inert file
+    // left by a pathological mount during shutdown. On a healthy fs the drain
+    // confirms every unlink within the grace and this branch reaps nothing.
     let reap: Vec<PathBuf> = owned
       .into_iter()
       .filter(|(_, rec)| !matches!(rec.state, RemovalState::Removing { .. }))
@@ -3401,6 +3473,19 @@ pub(crate) async fn run<R, F>(
                 // per concurrently-syncing scope (each admitted before its claim
                 // lands), self-correcting as those writes claim or fail — never
                 // unbounded growth.
+                //
+                // Kick recovery before refusing: re-arm a bounded batch of PARKED
+                // (budget-spent, unscheduled) records. A parked record on a
+                // RETIRED scope has no live scope to sweep it and no timer to
+                // retry it, so without this a since-recovered fs would never drain
+                // the backlog and the cap could refuse every future sync forever.
+                // The re-armed records confirm on a recovered fs (freeing the cap
+                // for a later sync) or re-park on a still-failing one — bounded work.
+                cookies.rearm_parked_batch::<R>(
+                  &op_tx,
+                  &mut pending_retries,
+                  config.cookie_backlog_cap,
+                );
                 let _ = reply.send(Err(crate::error::SyncRootError::CleanupBacklog));
               } else {
                 // Park the write on a settle fence opened right here — the same
@@ -3730,19 +3815,15 @@ pub(crate) async fn run<R, F>(
   // double-counted), and every owned-but-unconfirmed cookie whatever its state.
   // `Ok(0)` now proves every stream torn down AND every cookie this driver ever
   // wrote is CONFIRMED removed — the strengthened close guarantee.
-  // Count each physical obligation ONCE. A write still in `writes_in_flight`
-  // whose name the ledger already holds is a claimed-then-reply-failed self-reap
-  // — its record (state `Removing`) is already counted by `unremoved()` below, so
-  // excluding it here keeps close from reporting `pending = 2` for one hung
-  // unlink. An unclaimed in-flight write (no ledger record) is counted here, once.
-  let in_flight_unclaimed = writes_in_flight
-    .values()
-    .filter(|name| !cookies.has_name(name))
-    .count();
+  // Count each physical cookie obligation ONCE, from a SINGLE ledger snapshot: a
+  // claimed-then-reply-failed self-reap is in both `writes_in_flight` and the
+  // ledger, so counting it via the ledger alone avoids a `pending = 2` for one
+  // hung unlink — and taking both halves under one lock forecloses a false
+  // `Ok(0)` from an owned record confirming between two separate snapshots (see
+  // `close_obligation_count`).
   let outstanding = pending_teardowns.values().sum::<usize>()
     + pending_spawns.len()
-    + in_flight_unclaimed
-    + cookies.unremoved();
+    + cookies.close_obligation_count(&writes_in_flight);
   // Drop the registry LAST. The orderly sweep above already dispatched an unlink
   // for every owned cookie under the grace, so on a healthy fs this finds the
   // ledger empty; whatever a hung mount would not let go was already counted in

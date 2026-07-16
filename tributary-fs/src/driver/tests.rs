@@ -1,6 +1,6 @@
 use super::{testing::*, *};
 use std::{
-  collections::BTreeSet,
+  collections::{BTreeMap, BTreeSet},
   num::{NonZeroU64, NonZeroUsize},
   sync::Arc,
   time::Duration,
@@ -5819,6 +5819,295 @@ mod sync_cookie {
     assert!(
       rig.fs.files_under("/r").is_empty(),
       "the cookie file is gone at reply time"
+    );
+  }
+
+  /// Settles until cookie-remove dispatches STOP growing across a window longer
+  /// than the retry cap: every failing record has spent its budget and PARKED,
+  /// with no scheduled retry left to fire. Under a still-failing fs a stable
+  /// dispatch count is the proof that the backlog is fully parked — the
+  /// precondition the recovery cell must start from, since a record still inside
+  /// its budget would drain on the healed fs through the driver's OWN retry
+  /// timer, masking whether the admission-time re-arm did the work.
+  async fn settle_removes_parked(rig: &Rig) {
+    let mut last = usize::MAX;
+    for _ in 0..40 {
+      let now = rig.fs.cookie_remove_dispatches();
+      if now == last {
+        return;
+      }
+      last = now;
+      tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+  }
+
+  // A since-recovered filesystem DRAINS a global-cap-filling backlog of PARKED
+  // (budget-spent) records left on RETIRED scopes, and syncs resume — there is no
+  // permanent lockout. A parked record on a retired scope has no live scope to
+  // sweep it and no timer to retry it, so only the `SyncRoot`-admission re-arm —
+  // kicked right before a cap refusal — can ever retry it: the caller that hits
+  // the backlog is what drives recovery.
+  //
+  // Fail-on-old (the admission re-arm disabled): the parked records never retry,
+  // the owned count stays pinned at the cap, and every later sync stays refused —
+  // the drain settle times out and its `< cap` assertion fails.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_recovered_fs_drains_the_backlog_and_admits_new_syncs() {
+    // global_cap = 3 is the binding ceiling; backlog_cap = 8 never binds, since
+    // each scope below owns exactly one cookie.
+    let rig = rig_with_config(64, low_global_cap_config());
+    let cap = low_global_cap_config().cookie_global_cap;
+
+    // Every unlink fails while the backlog is built, so each scope's cookie
+    // survives its retirement and its removal budget spends down to a PARK.
+    rig.fs.fail_next_cookie_removes(1_000_000);
+
+    // Fill the GLOBAL cap with parked records spread across scopes that are then
+    // RETIRED: watch → sync (the write lands) → unwatch (the retire sweep reaps
+    // it, the reap fails through the whole budget, the record parks with no live
+    // scope left to re-arm it).
+    for i in 0..cap {
+      let root = format!("/rp{i}");
+      rig.fs.put(&root, FileKind::Dir, 200 + i as u64);
+      let scope = watch(&rig, &root).await;
+      let _path = sync_root(
+        &rig,
+        scope,
+        &root,
+        &format!(".tributaries-sync-r10-recover-{i}"),
+      )
+      .await
+      .expect("the write lands");
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      let _ = on_reply.await;
+      settle_cookie_count(&rig, i + 1).await;
+      assert_eq!(
+        cookie_count(&rig).await,
+        i + 1,
+        "the failing reap keeps the retired scope's cookie owned"
+      );
+    }
+    settle_removes_parked(&rig).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      cap,
+      "the residue sits exactly at the global cap, every record parked"
+    );
+
+    // At the cap a fresh live scope is refused retryably. On the fixed driver this
+    // refusal ALSO kicks the re-arm — the fs is still failing, so the re-armed
+    // records simply re-park and the cap holds.
+    rig.fs.put("/rk", FileKind::Dir, 900);
+    let kicker = watch(&rig, "/rk").await;
+    assert!(
+      matches!(
+        sync_root(&rig, kicker, "/rk", ".tributaries-sync-r10-recover-cap").await,
+        Err(crate::error::SyncRootError::CleanupBacklog)
+      ),
+      "a fresh scope is refused while the global residue is at the cap"
+    );
+    settle_removes_parked(&rig).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      cap,
+      "a still-failing fs drains nothing — the residue is parked back at the cap"
+    );
+
+    // The filesystem HEALS: unlinks succeed from here on.
+    rig.fs.fail_next_cookie_removes(0);
+
+    // The next sync attempt kicks the re-arm, which re-dispatches the parked
+    // records; they confirm against the healed fs and leave the ledger. The
+    // attempt itself is still refused — admission reads the cap before the drain
+    // it just kicked can land — but it is what drives recovery.
+    assert!(
+      matches!(
+        sync_root(&rig, kicker, "/rk", ".tributaries-sync-r10-recover-kick").await,
+        Err(crate::error::SyncRootError::CleanupBacklog)
+      ),
+      "the kicking sync is refused at admission, having re-armed the parked backlog"
+    );
+    settle_cookie_count(&rig, 0).await;
+    assert!(
+      cookie_count(&rig).await < cap,
+      "the recovered fs drained the parked backlog — no permanent lockout"
+    );
+
+    // Syncs resume, on the SAME driver and the SAME watch — no operator action.
+    let path = admit_sync(&rig, kicker, "/rk", ".tributaries-sync-r10-recover-ok").await;
+    assert_eq!(
+      path,
+      PathBuf::from("/rk/.tributaries-sync-r10-recover-ok"),
+      "a new sync lands once the backlog has drained"
+    );
+  }
+
+  // The close obligation count is taken from ONE ledger snapshot, so it can never
+  // report a false `Ok(0)` over a live obligation. The foreclosed race: an owned
+  // record's unlink confirming BETWEEN a read of `names` (which excluded an
+  // in-flight same-name write as the claimed-record de-dup) and a read of `owned`
+  // drops a TWO-snapshot count to zero while that write is still outstanding.
+  //
+  // Form (b), the direct unit: the two-scope same-name race is reachable only
+  // through the direct fs API (the umbrella mints per-sync-unique names) and the
+  // inter-snapshot window cannot be forced deterministically through the driver,
+  // so the ledger state is built directly and the count asserted at each snapshot
+  // point. Faithful because the count is the whole of what close reports, and the
+  // single-snapshot guarantee is exactly "1 wherever the atomic read falls
+  // relative to the confirm" — asserted below against the torn read that yields 0.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_obligation_count_forecloses_a_false_ok_zero() {
+    fn insert_owned(reg: &CookieRegistry<FakeFs>, scope: u64, name: &str, path: &str) {
+      let mut inner = lock_ledger(&reg.ledger);
+      let path = PathBuf::from(path);
+      inner.owned.insert(
+        path.clone(),
+        CookieRecord {
+          scope: ScopeId::new(NonZeroU64::new(scope).unwrap()),
+          name: name.to_owned(),
+          state: RemovalState::Owned,
+        },
+      );
+      inner.names.insert(name.to_owned(), path);
+    }
+    fn writes_in_flight(pairs: &[(u64, &str)]) -> BTreeMap<ScopeId, String> {
+      pairs
+        .iter()
+        .map(|(scope, name)| {
+          (
+            ScopeId::new(NonZeroU64::new(*scope).unwrap()),
+            (*name).to_owned(),
+          )
+        })
+        .collect()
+    }
+
+    // The race state: scope 1 OWNS cookie "N" (its unlink unconfirmed) while scope
+    // 2 has an in-flight write of the SAME name — one name across two live paths,
+    // which only a direct fs-API caller can produce.
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
+    insert_owned(&reg, 1, "N", "/r1/N");
+    let in_flight = writes_in_flight(&[(2, "N")]);
+    assert_eq!(
+      reg.close_obligation_count(&in_flight),
+      1,
+      "an outstanding obligation is counted — never a false 0"
+    );
+
+    // The single snapshot is immune to WHERE it falls relative to the owned
+    // record's unlink confirming: drop that record (the confirm) and the same
+    // obligation is STILL counted, now as the in-flight write whose name the
+    // ledger no longer holds. Both snapshot points yield 1.
+    lock_ledger(&reg.ledger).drop_record(&PathBuf::from("/r1/N"));
+    assert_eq!(
+      reg.close_obligation_count(&in_flight),
+      1,
+      "after the confirm the same obligation is still counted, via the in-flight write"
+    );
+
+    // The foreclosed hazard, made representable: the REPLACED two-snapshot form —
+    // read `names` first, let an owned unlink confirm, THEN read `owned` — sums to
+    // a FALSE 0 with obligation "N" still in flight. This is the read the single
+    // snapshot above makes unrepresentable.
+    insert_owned(&reg, 1, "N", "/r1/N");
+    let names_snapshot = {
+      let inner = lock_ledger(&reg.ledger);
+      in_flight
+        .values()
+        .filter(|name| !inner.names.contains_key(*name))
+        .count()
+    };
+    lock_ledger(&reg.ledger).drop_record(&PathBuf::from("/r1/N"));
+    let owned_snapshot = lock_ledger(&reg.ledger).owned.len();
+    assert_eq!(
+      names_snapshot + owned_snapshot,
+      0,
+      "a read straddling the confirm sums to a FALSE 0 — the single snapshot reads 1 at both points"
+    );
+
+    // An UNCLAIMED in-flight write (no ledger record) is one obligation, counted
+    // once.
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
+    assert_eq!(
+      reg.close_obligation_count(&writes_in_flight(&[(1, "M")])),
+      1,
+      "an unclaimed in-flight write is one obligation"
+    );
+
+    // A CLAIMED self-reap — its `reply.send` failed, so it both claimed its record
+    // AND still sits in `writes_in_flight` under the same scope and name — is ONE
+    // physical obligation, counted once rather than once per place it appears.
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
+    insert_owned(&reg, 1, "M", "/r/M");
+    assert_eq!(
+      reg.close_obligation_count(&writes_in_flight(&[(1, "M")])),
+      1,
+      "a claimed self-reap is one obligation, counted once and never twice"
+    );
+  }
+
+  // The accepted residual, asserted HONEST: an orderly-close unlink that hangs
+  // past the grace and only THEN fails is skipped by the registry `Drop` and its
+  // file persists — but close never claimed quiescence over it. Close counts every
+  // owned record, so the un-removed cookie comes back in `pending` (`NotQuiesced`)
+  // rather than being silently dropped or falsely reported `Ok`.
+  //
+  // This documents the residual's honesty; it does NOT assert the file is reaped.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_orderly_close_honestly_counts_a_hung_then_failing_unlink() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-r10-residual-1")
+      .await
+      .expect("the write lands");
+    assert_eq!(cookie_count(&rig).await, 1);
+
+    // The close-sweep unlink HANGS past the grace, and is armed to FAIL once
+    // finally released: a hung-then-failing terminal unlink whose file can never
+    // be reclaimed. The hold parks the job before the failure is consulted, so the
+    // whole grace elapses with the record `Removing`.
+    let hold = rig.fs.hold_cookie_removes();
+    rig.fs.fail_next_cookie_removes(1_000_000);
+
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+      .await
+      .expect("close returns within the grace, never wedged on the hung unlink")
+      .expect("the driver replied");
+    assert!(
+      pending >= 1,
+      "the hung-then-failing unlink is honestly counted as outstanding — never a false Ok"
+    );
+
+    // Exactly one unlink was dispatched: the `Drop` skipped the still-`Removing`
+    // record rather than duplicating a job the single-flight choke point forbids.
+    settle(|| rig.fs.cookie_remove_dispatches() >= 2).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      1,
+      "the sweep dispatched one unlink; the Drop skipped the still-Removing record"
+    );
+
+    // Release the hung unlink — armed to fail, so it confirms nothing and the file
+    // stays. The residual is real, and close already reported it in `pending`.
+    hold.release();
+    assert!(
+      rig.fs.files_under("/r").contains(&path),
+      "the hung-then-failing cookie persists — the residual close counted honestly, never reaped and never falsely reported gone"
     );
   }
 }
