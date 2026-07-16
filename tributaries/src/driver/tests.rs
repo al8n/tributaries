@@ -6858,6 +6858,73 @@ async fn a_cookie_delivered_over_existing_rescan_debt_resolves_dominated() {
   );
 }
 
+/// R13 — the interest/filter lens at the umbrella boundary (the end-to-end
+/// companion to the proto fail-on-old cells): a `Modified`-only subscription
+/// cannot be discharged by a structural `Removed` it never sees — only by the
+/// covering `Rescan` the Monitor now stands over an erased coverage deficit.
+/// The `Removed` for a dark child is FILTERED (never delivered) and does NOT
+/// dominate the pending sync; the covering `Rescan` IS delivered (Rescans
+/// bypass interest AND filter) and resolves the barrier `Dominated`. This
+/// proves the "reached the sub" half of the R13 fix: the covering `Rescan` the
+/// proto layer emits when a filter-subject record empties a hole DOES reach a
+/// filtered subscriber and dominate its sync, where the structural record —
+/// which two prior Monitor-level reviews assumed "converged the consumer" —
+/// provably could not.
+#[tokio::test]
+async fn a_covering_rescan_dominates_a_modified_only_sync_a_removed_cannot() {
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  // The umbrella's `Interest::new()` is deliver-everything (== all); a
+  // Modified-only subscription starts from `none` and opts in Modified alone.
+  let sub = h
+    .watch("/a", Interest::none().with_modified())
+    .await
+    .expect("watch /a modified-only");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-1"),
+    sub,
+    root: handle,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: reply_tx,
+  });
+
+  // A structural Removed for the dark child: FILTERED (a Modified-only sub
+  // never sees it) and it does NOT dominate the sync — a structural record a
+  // filtered sub cannot see must not discharge the barrier.
+  h.owner
+    .consume_source_event(&source_removed(handle, "/a/child", 5));
+  assert!(
+    h.drain().iter().all(|e| !e.kind().is_removed()),
+    "the Removed is filtered from the Modified-only sub"
+  );
+  assert!(
+    (&mut reply_rx).now_or_never().is_none(),
+    "a Removed the sub never sees does not resolve the barrier"
+  );
+
+  // The covering Rescan the Monitor now stands over the erased hole: delivered
+  // (it bypasses the filter) and dominating.
+  h.owner.consume_source_event(&rescan_event(handle, "/a", 6));
+  assert!(
+    h.drain().iter().any(|e| e.kind().is_rescan()),
+    "the covering Rescan reaches the Modified-only sub"
+  );
+  assert!(
+    matches!(
+      (&mut reply_rx).now_or_never(),
+      Some(Ok(Ok(SyncOutcome::Dominated)))
+    ),
+    "the barrier resolved Dominated via the covering Rescan, not a false Delivered"
+  );
+}
+
 /// F5 — a CALLER unwatch of a subscription with a pending sync fails the
 /// barrier `Retired` AND reaps its cookie file (the root is still live, so the
 /// marker is real and must not leak).

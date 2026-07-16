@@ -7628,8 +7628,17 @@ fn an_exhausted_read_interior_is_recorded_resignaled_and_healed() {
 /// A5 (record heal): a delivered `Removed` for a recorded hole's slot clears
 /// the deficit — the consumer converged on the removal, so the next
 /// re-signal is a no-op. Book-lifecycle precision.
+/// The R13 class-kill for the slot-emptying edge: a `Removed`/`File` record
+/// that clears a recorded arm-refused hole is NOT convergence for a filtered
+/// subscription. The removal is interest- and filter-subject — a
+/// `Modified`-only consumer never sees it — so it cannot stand in for the
+/// change the hole's darkness hid. The clear therefore stands a covering
+/// `Rescan` (root-located, epoch-bumped, filter-bypassing) so every subscriber
+/// re-reads. Fails on old: the record cleared the book silently — `events` was
+/// just the `Removed` — and a later sync over the dark change resolved a false
+/// `Delivered`.
 #[test]
-fn a_removed_record_clears_a_recorded_slot_hole() {
+fn a_removed_record_over_a_slot_hole_stands_a_covering_rescan() {
   let mut m = per_dir();
   let root = live_root_idle(&mut m, scope(1));
 
@@ -7653,14 +7662,162 @@ fn a_removed_record_clears_a_recorded_slot_hole() {
       .with_is_dir(true),
     at(2),
   );
+  // The book entry is cleared — a later re-signal finds nothing — but the
+  // clear stands a covering Rescan, so the darkness is not discharged silently.
   assert!(
     !m.has_coverage_deficit(scope(1)),
-    "the delivered removal converged the slot"
+    "the removal clears the book entry"
   );
   assert!(!m.resignal_coverage_deficits(scope(1)));
   let events = drain_events(&mut m);
-  assert_eq!(events.len(), 1, "just the Removed itself: {events:?}");
+  assert_eq!(
+    events.len(),
+    2,
+    "the Removed AND its covering Rescan: {events:?}"
+  );
   assert!(events[0].kind().is_removed());
+  assert_eq!(events[0].location(), &loc(&["a"]));
+  assert!(
+    events[1].kind().is_rescan(),
+    "the emptying stands a covering Rescan a filtered sub can see"
+  );
+  assert_eq!(events[1].location(), &Location::new());
+  assert!(
+    events[1].epoch() > events[0].epoch(),
+    "epoch-bumped, not a replay"
+  );
+  m.assert_invariants();
+}
+
+/// The R13 flagship at the INTEREST/FILTER lens — the closest faithful
+/// equivalent to a genuine descending umbrella regression (the umbrella's
+/// real-kernel harness cannot inject a per-directory arm failure, and its
+/// `FakeSource` sits ABOVE the deficit machinery; see the return note). A real
+/// `Modified`-only subscription drives the exact defect sequence: a child arm
+/// fails — its opening `Rescan` IS delivered (Rescans bypass the filter); a
+/// `Modified` beneath the now-dark child is lost (never recorded — the point);
+/// the child's `Removed` arrives. That `Removed` is interest-filtered — the
+/// `Modified`-only consumer never sees it — so it cannot account for the lost
+/// `Modified`. The emptying must instead stand a covering `Rescan`, which the
+/// filter cannot suppress, so the consumer re-reads and a sync here is
+/// dominated, never a false `Delivered`. Fails on old: the `Removed` cleared
+/// the hole silently, the filtered consumer received NOTHING after the opening
+/// `Rescan`, and the lost `Modified` — which postdates it — went uncovered.
+#[test]
+fn a_removed_over_a_hole_reaches_a_modified_only_subscription() {
+  let mut m = per_dir();
+  let mask = Interest::new().with_modified();
+  let root = m.register_root(scope(1), mask);
+  m.on_watch_result(root, Ok(()));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A child directory appears (its Created is FILTERED from delivery) and arms.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the Created is filtered from a Modified-only delivery"
+  );
+  let a = drain_actions(&mut m)
+    .iter()
+    .find_map(|x| x.as_watch().map(|w| w.id()))
+    .expect("the child arms despite the suppressed delivery");
+
+  // The arm fails: the opening Rescan IS delivered (Rescans bypass the filter),
+  // covering everything up to now — but not the change still to come.
+  m.on_watch_result(a, Err(WatchError::NoSpace));
+  let opening = drain_events(&mut m);
+  assert_eq!(
+    opening.len(),
+    1,
+    "the opening Rescan reaches even the filtered sub: {opening:?}"
+  );
+  assert!(opening[0].kind().is_rescan());
+  let opening_epoch = opening[0].epoch();
+  assert!(m.has_coverage_deficit(scope(1)));
+
+  // (A Modified lands beneath the dark, unarmed child, AFTER the opening
+  // Rescan — so that Rescan does not cover it. It is lost: no record reaches
+  // the Monitor because the child is unwatched. That is the point.)
+
+  // The child's Removed arrives. It is FILTERED (a Modified-only sub never sees
+  // a Removed), so it cannot account for the lost Modified — the emptying must
+  // stand a covering Rescan the filter cannot suppress.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let closing = drain_events(&mut m);
+  assert!(
+    closing.iter().all(|e| !e.kind().is_removed()),
+    "the Removed is filtered — the Modified-only sub never sees it: {closing:?}"
+  );
+  let rescan = closing
+    .iter()
+    .find(|e| e.kind().is_rescan())
+    .expect("the emptying stands a covering Rescan the filter cannot suppress");
+  assert!(
+    rescan.epoch() > opening_epoch,
+    "the covering Rescan postdates the opening one — it covers the lost Modified"
+  );
+  // The book is clear, so a later sync's re-signal finds nothing: the covering
+  // Rescan above is the sole (and sufficient) thing that dominates that sync.
+  assert!(!m.has_coverage_deficit(scope(1)));
+  assert!(!m.resignal_coverage_deficits(scope(1)));
+  m.assert_invariants();
+}
+
+/// The general structural-drop carry (R13): a `drop_subtree` driven by a
+/// structural record must not silently erase a deficit anchored in the dropped
+/// subtree. A live child accrues a standing interior hole; its parent then
+/// reports it `Removed`, dropping it. The drop erases the interior entry — but
+/// the `Removed` is interest- and filter-subject, so the erasure stands a
+/// covering `Rescan` (via `DeficitDischarge::CoveringRescan`) rather than
+/// vanishing. Fails on old: the drop cleared the interior silently and a later
+/// sync resolved a false `Delivered` over the darkness it hid.
+#[test]
+fn a_structural_removed_drop_of_a_deficit_anchor_stands_a_covering_rescan() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let (p, edge_epoch) = identityless_child_with_interior_deficit(&mut m, root, "p");
+  assert!(m.has_coverage_deficit(scope(1)));
+  assert!(m.is_watched(p));
+
+  // The parent reports the child gone: the drop erases the interior hole
+  // anchored at `p`. That erasure must carry — the Removed is filter-subject.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("p"))
+      .with_is_dir(true),
+    at(9),
+  );
+  assert!(!m.is_watched(p), "the reported-gone child is dropped");
+  assert!(
+    !m.has_coverage_deficit(scope(1)),
+    "the interior hole is erased with its anchor"
+  );
+  let events = drain_events(&mut m);
+  let rescan = events
+    .iter()
+    .find(|e| e.kind().is_rescan())
+    .expect("the structural drop stands a covering Rescan for the erased interior");
+  assert_eq!(rescan.location(), &Location::new());
+  assert!(
+    rescan.epoch() > edge_epoch,
+    "epoch-bumped past the hole's edge Rescan"
+  );
   m.assert_invariants();
 }
 
@@ -8186,8 +8343,11 @@ fn a_crawl_rebuild_of_a_deficit_free_child_emits_nothing() {
 /// The carry when the crawl does NOT rebuild the slot (the name vanished
 /// from the listing): the loss fact stays booked at the surviving parent —
 /// a sync dispatched before the in-flight `Removed` lands re-signals it —
-/// and the `Removed`'s arrival clears it silently (record convergence, no
-/// spurious `Rescan`).
+/// and the `Removed`'s arrival clears the re-anchored carry AND stands a
+/// covering `Rescan` (the removal is filter-subject, so a `Modified`-only sub
+/// that never saw it still learns the darkness ended). Fails on old: the
+/// clear was silent, so that filtered sub's next sync resolved a false
+/// `Delivered`.
 #[test]
 fn a_crawl_drop_without_rebuild_keeps_the_loss_booked() {
   let mut m = per_dir();
@@ -8212,7 +8372,9 @@ fn a_crawl_drop_without_rebuild_keeps_the_loss_booked() {
     "the erased interior re-anchored at the parent slot"
   );
 
-  // The vanish's own record converges the consumer and clears the carry.
+  // The vanish's own record clears the re-anchored carry — and, because that
+  // Removed is interest- and filter-subject, the clear stands a covering
+  // Rescan so a Modified-only sub that never saw the Removed still learns.
   m.on_os_record(
     OsRecord::new(root, RecordKind::Removed)
       .with_name(seg("p"))
@@ -8222,7 +8384,14 @@ fn a_crawl_drop_without_rebuild_keeps_the_loss_booked() {
   assert!(!m.has_coverage_deficit(scope(1)));
   assert!(!m.resignal_coverage_deficits(scope(1)));
   let events = drain_events(&mut m);
-  assert_eq!(events.len(), 1, "just the Removed itself: {events:?}");
+  assert_eq!(
+    events.len(),
+    2,
+    "the Removed AND its covering Rescan: {events:?}"
+  );
   assert!(events[0].kind().is_removed());
+  assert!(events[1].kind().is_rescan());
+  assert_eq!(events[1].location(), &Location::new());
+  assert!(events[1].epoch() > events[0].epoch());
   m.assert_invariants();
 }
