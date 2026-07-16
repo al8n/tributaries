@@ -108,8 +108,15 @@ pub(crate) struct DriverConfig {
   pub(crate) cookie_retry_budget: u8,
   /// Per-scope unremoved-cookie cap: at or above it, a new `SyncRoot` command
   /// is refused [`CleanupBacklog`](crate::error::SyncRootError::CleanupBacklog)
-  /// — the hard memory bound on the ledger.
+  /// — the per-scope memory bound on the ledger.
   pub(crate) cookie_backlog_cap: usize,
+  /// GLOBAL unremoved-cookie cap across every scope, live or retired: at or
+  /// above it a new `SyncRoot` is refused `CleanupBacklog` whatever scope owns
+  /// the residue. The per-scope cap resets for each fresh scope, so without this
+  /// a sync→failing-cleanup→unwatch→rewatch churn would grow `owned` without
+  /// bound across RETIRED scopes; this ceiling makes total ledger memory bounded
+  /// regardless of churn, and self-heals as the cleanup retries drain.
+  pub(crate) cookie_global_cap: usize,
 }
 
 impl DriverConfig {
@@ -121,6 +128,10 @@ impl DriverConfig {
   pub(crate) const DEFAULT_COOKIE_RETRY_BUDGET: u8 = 8;
   /// Per-scope unremoved-cookie cap (§1.9 default).
   pub(crate) const DEFAULT_COOKIE_BACKLOG_CAP: usize = 8;
+  /// Global unremoved-cookie cap across all scopes — several scopes' worth of
+  /// per-scope headroom, so ordinary multi-root use never trips it while a
+  /// permafailing-unlink churn stays bounded.
+  pub(crate) const DEFAULT_COOKIE_GLOBAL_CAP: usize = 128;
 
   /// The platform's native backend profile — PROVISIONAL under
   /// `Backend::Auto` (the resolved `RootMeta.backend` supersedes it at
@@ -204,9 +215,16 @@ impl LedgerInner {
   }
 
   /// Drops the record at `path` and its `names` index entry in lockstep — the
-  /// one place a record leaves `owned`, so the two maps can never diverge.
+  /// one place a record leaves `owned`, so the two maps can never diverge. The
+  /// `names` entry is removed only when it still points BACK to this path: the
+  /// umbrella mints per-sync-unique names (owner-global seq + nonce), so this is
+  /// always true for it, but a direct fs-API caller that reused one name across
+  /// two live paths must not have its surviving path's index clobbered by the
+  /// other's drop.
   fn drop_record(&mut self, path: &Path) {
-    if let Some(rec) = self.owned.remove(path) {
+    if let Some(rec) = self.owned.remove(path)
+      && self.names.get(&rec.name).map(PathBuf::as_path) == Some(path)
+    {
       self.names.remove(&rec.name);
     }
   }
@@ -479,6 +497,15 @@ impl<F: FsOps> CookieRegistry<F> {
       .count()
   }
 
+  /// Whether the ledger already holds an owned record under this cookie `name` —
+  /// the close accounting's de-duplication probe. A write whose `reply.send`
+  /// failed CLAIMED its record (so it is in the ledger, state `Removing`) yet
+  /// still sits in `writes_in_flight` until its `CookieWriteDone` lands: without
+  /// this the close count would tally that one physical obligation twice.
+  fn has_name(&self, name: &str) -> bool {
+    lock_ledger(&self.ledger).names.contains_key(name)
+  }
+
   /// Spawns the ONE blocking unlink of `path` (already transitioned to
   /// `Removing` under the ledger lock by the decision that called this). The
   /// job drops the record + name index ONLY on a CONFIRMED removal (`Ok` /
@@ -673,6 +700,14 @@ impl<F: FsOps> CookieRegistry<F> {
     for path in reap {
       self.request_removal::<R>(op_tx, pending_retries, path, RemovalRequest::Explicit);
     }
+    // A record whose unlink PERMANENTLY fails (a genuinely undeletable file —
+    // rare: we created it, so we hold its directory) parks here after its budget
+    // with no live scope left to re-arm it, lingering in `owned` until the driver
+    // closes or the fs recovers. That is the honest floor for "never orphan a
+    // file we cannot confirm gone" (the alternative is to FORGET it, i.e. leak
+    // the disk file). The dead-scope tail no longer grows without bound under
+    // watch/unwatch churn: the GLOBAL cookie cap (checked at `SyncRoot`
+    // admission) ceilings total `owned` across live AND retired scopes.
   }
 
   /// Raises the shutdown flag WITHOUT sweeping — the orderly close's first step,
@@ -763,12 +798,24 @@ impl<F: FsOps> Drop for CookieRegistry<F> {
     // guard); a self-reap whose unlink fails AFTER this point re-inserts into a
     // map nobody will read — the accepted abnormal-path best-effort (§2.5).
     let owned = std::mem::take(&mut lock_ledger(&self.ledger).owned);
-    if owned.is_empty() {
+    // Dispatch a best-effort unlink ONLY for records with NO unlink already in
+    // flight. A `Removing` record already has a job — the orderly-close drain's
+    // (which may be hung past the grace), or one spawned just before an abnormal
+    // cancel — and a second unlink for the same path is exactly the duplicate the
+    // single-flight choke point forbids. A `Removing` record whose job never
+    // lands on a cancelled runtime is the accepted abnormal-path residual, no
+    // worse than any other detached job there.
+    let reap: Vec<PathBuf> = owned
+      .into_iter()
+      .filter(|(_, rec)| !matches!(rec.state, RemovalState::Removing { .. }))
+      .map(|(path, _)| path)
+      .collect();
+    if reap.is_empty() {
       return;
     }
     let ops = self.ops.clone();
     (self.spawn_detached)(Box::new(move || {
-      for path in owned.into_keys() {
+      for path in reap {
         let _ = ops.remove_cookie(&path);
       }
     }));
@@ -2443,6 +2490,65 @@ fn dispatch_due_cookie_retries<R, F>(
   }
 }
 
+/// Services one dedicated-lane cleanup message — a `Remove` hint or a
+/// `Cancel`-by-name — through the removal state machine. Called from BOTH the
+/// live-loop's `cookie_removes` select arm AND a loop-top fairness drain, so a
+/// sustained command flood (the biased select polls `commands` first) cannot
+/// starve the cleanup lane: a queued reap is serviced once per iteration
+/// regardless, keeping cookies from lingering owned and the unbounded lane from
+/// backing up.
+fn handle_cookie_reap<R, F>(
+  reap: CookieReap,
+  cookies: &CookieRegistry<F>,
+  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  pending_retries: &mut BTreeMap<PathBuf, Instant>,
+  writes_in_flight: &BTreeMap<ScopeId, String>,
+  parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
+  core: &mut DriverCore,
+) where
+  R: RuntimeLite,
+  F: FsOps,
+{
+  match reap {
+    // A completed-cookie reap hint: route through the removal state machine — at
+    // most ONE unlink job per path ever, duplicates coalesce. A path the registry
+    // no longer owns is idempotently nothing.
+    CookieReap::Remove(path) => {
+      cookies.request_removal::<R>(op_tx, pending_retries, path, RemovalRequest::Explicit);
+    }
+    // A cancel-by-name: reap an owned cookie, tombstone an in-pool write, or
+    // (nothing owned/in-flight) abandon a still-parked write's fence — the whole
+    // owned/in-flight decision under ONE ledger lock (§2.4).
+    CookieReap::Cancel(name) => {
+      match cookies.cancel_locked::<R>(op_tx, pending_retries, writes_in_flight, &name) {
+        CancelDisposition::Handled => {}
+        CancelDisposition::MaybeParked => {
+          // A parked write of this name is abandoned exactly as the loop-top
+          // cancel prune abandons a cancelled reply (T13); a name matching nothing
+          // has already resolved — drop the cancel (no tombstone: the boundedness
+          // rule).
+          if let Some(fence) = parked_cookies
+            .iter()
+            .find(|(_, cookie)| cookie.name == name)
+            .map(|(fence, _)| *fence)
+          {
+            if let Some(parked) = parked_cookies.remove(&fence) {
+              // Answer the abandoned barrier `Retired`, as the uncovered-parked
+              // prune does — the umbrella's canceller already dropped this receiver
+              // (so the reply is a no-op there), but a direct-API caller learns its
+              // parked sync was cancelled rather than reading a bare `Closed`.
+              let _ = parked.reply.send(Err(crate::error::SyncRootError::Retired));
+            }
+            let mut abandoned = BTreeSet::new();
+            abandoned.insert(fence);
+            core.abandon_cover_fences(&abandoned);
+          }
+        }
+      }
+    }
+  }
+}
+
 /// Handles a `CookieRemoveDone` (§2.3), identical in the live arm and the close
 /// drain: a confirmed removal drops any stray schedule; a transient failure
 /// transitions the record to `RemoveFailed` and either SCHEDULES a backed-off
@@ -2628,6 +2734,25 @@ pub(crate) async fn run<R, F>(
     // top so a busy loop that never parks still drives them promptly (T8) — the
     // belt-and-suspenders the timer arm below shares.
     dispatch_due_cookie_retries::<R, F>(&cookies, &op_tx, &mut pending_retries, now());
+
+    // Fairness for the dedicated cleanup lane: the select below is command-biased
+    // (it polls `commands` before `cookie_removes`), so a caller that keeps the
+    // bounded command mailbox continuously ready would otherwise STARVE cleanup —
+    // cookies would linger owned and the unbounded lane back up without bound.
+    // Servicing at most ONE queued reap here, every iteration, guarantees the lane
+    // makes steady progress whatever the command load, while preserving the
+    // command/close priority the biased select gives.
+    if let Ok(reap) = cookie_removes.try_recv() {
+      handle_cookie_reap::<R, F>(
+        reap,
+        &cookies,
+        &op_tx,
+        &mut pending_retries,
+        &writes_in_flight,
+        &mut parked_cookies,
+        &mut core,
+      );
+    }
 
     // Set-cover settlements resolve at this one choke point — after the
     // previous arm's results fed the core and their effects drained, BEFORE
@@ -3260,13 +3385,22 @@ pub(crate) async fn run<R, F>(
                 // and single-flight keeps `parked_cookies` to at most one entry
                 // per scope, so it is cheap.
                 let _ = reply.send(Err(crate::error::SyncRootError::WriteInFlight));
-              } else if cookies.unremoved_for(scope) >= config.cookie_backlog_cap {
-                // The HARD memory bound (§4.3): this scope has too many
-                // unremoved cookies (writes succeed but unlinks keep failing).
+              } else if cookies.unremoved_for(scope) >= config.cookie_backlog_cap
+                || cookies.unremoved() >= config.cookie_global_cap
+              {
+                // The memory bound (§4.3), per-scope AND global: too many
+                // unremoved cookies (writes succeed but unlinks keep failing) for
+                // this scope, OR watcher-wide across every scope live or retired.
+                // The global ceiling is what bounds a sync→fail→unwatch→rewatch
+                // churn, whose fresh scopes would each get a fresh per-scope
+                // allowance while the retired scopes' failed records persist.
                 // Refuse retryably — the cleanup owner keeps retrying, and on a
                 // recovered fs the backlog drains and syncs resume with no
-                // operator action. `owned` can then never exceed
-                // `cookie_backlog_cap × live scopes` + one in-flight write each.
+                // operator action. The bound is admission-time, so `owned` can
+                // transiently overshoot the cap by at most one in-pipeline write
+                // per concurrently-syncing scope (each admitted before its claim
+                // lands), self-correcting as those writes claim or fail — never
+                // unbounded growth.
                 let _ = reply.send(Err(crate::error::SyncRootError::CleanupBacklog));
               } else {
                 // Park the write on a settle fence opened right here — the same
@@ -3318,48 +3452,16 @@ pub(crate) async fn run<R, F>(
       // `break None` first — this arm is never selected on the way out, and any
       // reap still buffered is reaped by the terminal registry sweep.
       reap = cookie_removes.recv().fuse() => {
-        match reap {
-          // A completed-cookie reap hint: route through the removal state
-          // machine — at most ONE unlink job per path ever, duplicates coalesce.
-          // A path the registry no longer owns is idempotently nothing.
-          Ok(CookieReap::Remove(path)) => {
-            cookies.request_removal::<R>(
-              &op_tx,
-              &mut pending_retries,
-              path,
-              RemovalRequest::Explicit,
-            );
-          }
-          // A cancel-by-name: reap an owned cookie, tombstone an in-pool write,
-          // or (nothing owned/in-flight) abandon a still-parked write's fence —
-          // the whole owned/in-flight decision under ONE ledger lock (§2.4).
-          Ok(CookieReap::Cancel(name)) => {
-            match cookies.cancel_locked::<R>(
-              &op_tx,
-              &mut pending_retries,
-              &writes_in_flight,
-              &name,
-            ) {
-              CancelDisposition::Handled => {}
-              CancelDisposition::MaybeParked => {
-                // A parked write of this name is abandoned exactly as the
-                // loop-top cancel prune abandons a cancelled reply (T13); a name
-                // matching nothing has already resolved — drop the cancel (no
-                // tombstone: the boundedness rule).
-                if let Some(fence) = parked_cookies
-                  .iter()
-                  .find(|(_, cookie)| cookie.name == name)
-                  .map(|(fence, _)| *fence)
-                {
-                  parked_cookies.remove(&fence);
-                  let mut abandoned = std::collections::BTreeSet::new();
-                  abandoned.insert(fence);
-                  core.abandon_cover_fences(&abandoned);
-                }
-              }
-            }
-          }
-          Err(_) => {}
+        if let Ok(reap) = reap {
+          handle_cookie_reap::<R, F>(
+            reap,
+            &cookies,
+            &op_tx,
+            &mut pending_retries,
+            &writes_in_flight,
+            &mut parked_cookies,
+            &mut core,
+          );
         }
       },
       msg = os.next() => {
@@ -3446,6 +3548,21 @@ pub(crate) async fn run<R, F>(
   // cannot miss it (finding 4, closed structurally rather than by counting).
   cookies.begin_shutdown();
   cookies.sweep_owned::<R>(&op_tx, &mut pending_retries);
+  // The sweep re-armed every `Owned`/parked record (dispatched now); a record
+  // still mid-backoff was coalesced and keeps its far retry deadline, which the
+  // ~1 s grace could outrun — close would then report `NotQuiesced` where a
+  // prompt retry inside the grace would have confirmed. Pull every remaining
+  // slot forward to one base delay so the drain's retry arm services it in time
+  // (the design's flat-base-during-close intent); a still-failing unlink still
+  // ends `NotQuiesced`, only never spuriously.
+  {
+    let floor = now() + config.cookie_retry_base;
+    for deadline in pending_retries.values_mut() {
+      if *deadline > floor {
+        *deadline = floor;
+      }
+    }
+  }
   let drain = async {
     loop {
       // The LIVE-ledger quiescence condition: an in-pool write (no record yet)
@@ -3613,9 +3730,18 @@ pub(crate) async fn run<R, F>(
   // double-counted), and every owned-but-unconfirmed cookie whatever its state.
   // `Ok(0)` now proves every stream torn down AND every cookie this driver ever
   // wrote is CONFIRMED removed — the strengthened close guarantee.
+  // Count each physical obligation ONCE. A write still in `writes_in_flight`
+  // whose name the ledger already holds is a claimed-then-reply-failed self-reap
+  // — its record (state `Removing`) is already counted by `unremoved()` below, so
+  // excluding it here keeps close from reporting `pending = 2` for one hung
+  // unlink. An unclaimed in-flight write (no ledger record) is counted here, once.
+  let in_flight_unclaimed = writes_in_flight
+    .values()
+    .filter(|name| !cookies.has_name(name))
+    .count();
   let outstanding = pending_teardowns.values().sum::<usize>()
     + pending_spawns.len()
-    + writes_in_flight.len()
+    + in_flight_unclaimed
     + cookies.unremoved();
   // Drop the registry LAST. The orderly sweep above already dispatched an unlink
   // for every owned cookie under the grace, so on a healthy fs this finds the
