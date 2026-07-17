@@ -6498,17 +6498,19 @@ mod sync_cookie {
       inner.next_cookie_id += 1;
       let id = CookieId(inner.next_cookie_id);
       let path = PathBuf::from(path);
-      inner.owned.insert(
-        path.clone(),
-        CookieRecord {
+      inner.obligations.insert(
+        id,
+        Obligation {
           scope: ScopeId::new(NonZeroU64::new(scope).unwrap()),
           name: name.to_owned(),
           id,
+          path: Some(path.clone()),
           last_failure_seq: 0,
           state: RemovalState::Owned,
         },
       );
-      inner.names.insert(name.to_owned(), path);
+      inner.by_name.insert(name.to_owned(), id);
+      inner.by_path.insert(path, id);
       id
     }
     fn writes_in_flight(
@@ -6541,7 +6543,7 @@ mod sync_cookie {
     // record's unlink confirming: drop that record (the confirm) and the same
     // obligation is STILL counted, now as the in-flight write whose id the ledger
     // no longer owns. Both snapshot points yield 1.
-    lock_ledger(&reg.ledger).drop_record_if(&PathBuf::from("/r1/N"), id_n);
+    lock_ledger(&reg.ledger).retire(id_n, Reaped::ConfirmedGone);
     assert_eq!(
       reg.obligation_count(&in_flight),
       1,
@@ -6558,14 +6560,14 @@ mod sync_cookie {
     let ids_snapshot = {
       let inner = lock_ledger(&reg.ledger);
       let owned_ids: std::collections::HashSet<CookieId> =
-        inner.owned.values().map(|rec| rec.id).collect();
+        inner.obligations.keys().copied().collect();
       in_flight
         .values()
         .filter(|(_, id)| !owned_ids.contains(id))
         .count()
     };
-    lock_ledger(&reg.ledger).drop_record_if(&PathBuf::from("/r1/N"), id_n);
-    let owned_snapshot = lock_ledger(&reg.ledger).owned.len();
+    lock_ledger(&reg.ledger).retire(id_n, Reaped::ConfirmedGone);
+    let owned_snapshot = lock_ledger(&reg.ledger).obligations.len();
     assert_eq!(
       ids_snapshot + owned_snapshot,
       0,
@@ -6708,14 +6710,15 @@ mod sync_cookie {
 
     // Second incarnation, SAME dir and name — a direct-API name reuse (the rig
     // drives `SyncRoot`, so this is in contract for the test). `create_new`
-    // succeeds (the file is gone), and the claim overwrites the fileless
-    // predecessor record with a fresh incarnation.
+    // succeeds (the file is gone), and the claim lands a FRESH incarnation keyed
+    // by its own id: the predecessor's held-`Removing` record keeps its own key,
+    // so both are tracked at once — the ledger count is pessimistic-honest.
     let path2 = admit_sync(&rig, scope, "/r", name).await;
     assert_eq!(path2, path, "the successor lands at the same reused path");
     assert_eq!(
       cookie_count(&rig).await,
-      1,
-      "one record at P — the successor incarnation"
+      2,
+      "both incarnations are tracked — the predecessor is not displaced by the successor's claim"
     );
 
     // Release the held confirm: the first unlink's job resumes and confirm-drops
@@ -6760,6 +6763,143 @@ mod sync_cookie {
     );
   }
 
+  // The birth-overwrite hazard, forced deterministically: write A creates its
+  // file and its CLAIM is delayed; A's file is externally deleted; a same-path
+  // write B (a different scope) lands and claims the live file; THEN A's delayed
+  // claim fires. Because each claim inserts a record keyed by its own unique
+  // incarnation id, A's late claim can never displace B's live record — the two
+  // coexist under distinct keys, and both reach a typed terminal.
+  //
+  // Fail-on-old: with the claim keyed by PATH (an insert that overwrites the
+  // record at the landing path), A's late claim OVERWRITES B's live record — the
+  // record-identity assertion (B's id still owns its `Owned` state) fails.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_delayed_claim_never_displaces_a_live_same_path_successor() {
+    let fs = FakeFs::new(1);
+    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let scope_a = ScopeId::new(NonZeroU64::new(1).unwrap());
+    let scope_b = ScopeId::new(NonZeroU64::new(2).unwrap());
+    let name = ".tributaries-sync-h1";
+    let path = PathBuf::from("/r").join(name);
+
+    // Write A dispatched and created its file at P; its claim is not run yet.
+    let guard_a = reg.dispatch_guard(scope_a, name.to_owned());
+    fs.put(&path, FileKind::File, 1);
+    // A's file is externally deleted before A ever claims.
+    fs.remove(&path);
+
+    // Write B (a different scope) lands at the SAME path and claims: its file is
+    // the live one now.
+    let guard_b = reg.dispatch_guard(scope_b, name.to_owned());
+    fs.put(&path, FileKind::File, 2);
+    let id_b = guard_b.claim(&path).expect("B claims the live file");
+    {
+      let inner = lock_ledger(&reg.ledger);
+      assert_eq!(inner.obligations.len(), 1, "only B is tracked so far");
+      assert_eq!(inner.by_path.get(&path), Some(&id_b), "by_path names B");
+    }
+
+    // A's delayed claim finally fires.
+    let id_a = guard_a.claim(&path).expect("A's late claim is admitted");
+    assert_ne!(id_a, id_b, "A and B are distinct incarnations");
+    {
+      let inner = lock_ledger(&reg.ledger);
+      // B's live record survives by IDENTITY — its own id still owns its state.
+      assert!(
+        matches!(
+          inner.obligations.get(&id_b).map(|ob| &ob.state),
+          Some(RemovalState::Owned)
+        ),
+        "B's live record is never displaced by A's late claim"
+      );
+      assert!(
+        inner.obligations.contains_key(&id_a),
+        "A's record coexists under its own key"
+      );
+      // Pessimistic-honest: both obligations are counted, never one dropped.
+      assert_eq!(inner.obligations.len(), 2, "both incarnations are tracked");
+      // Newest-claim-wins on the index; the displaced entry never destroys B.
+      assert_eq!(inner.by_path.get(&path), Some(&id_a), "by_path names A now");
+    }
+
+    // Both incarnations reach a typed terminal, and physical state converges.
+    let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
+    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
+    reg.sweep_owned::<TokioRuntime>(&op_tx, &mut pending);
+    settle(|| reg.len() == 0 && fs.files_under("/r").is_empty()).await;
+    assert_eq!(reg.len(), 0, "both incarnations are retired");
+    assert!(fs.files_under("/r").is_empty(), "the physical file is gone");
+  }
+
+  // A confirmed unlink for an incarnation that has since been REPLACED at the
+  // same path must retire ONLY its own incarnation: the retire is keyed by id, so
+  // a stale confirm for N structurally cannot touch a successor M that reclaimed
+  // the path.
+  //
+  // Fail-on-old: with a path-keyed drop (retire whoever currently occupies the
+  // record's path), the stale confirm for N deletes the live successor M — the
+  // survivor assertion fails.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_confirm_retire_is_id_keyed_and_spares_a_same_path_successor() {
+    let fs = FakeFs::new(1);
+    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let scope_n = ScopeId::new(NonZeroU64::new(1).unwrap());
+    let scope_m = ScopeId::new(NonZeroU64::new(2).unwrap());
+    let name = ".tributaries-sync-aba-structural";
+    let path = PathBuf::from("/r").join(name);
+
+    // Incarnation N claims P, then its removal is in flight (its unlink ran, so
+    // the file is gone) but its confirm has not yet landed.
+    let guard_n = reg.dispatch_guard(scope_n, name.to_owned());
+    fs.put(&path, FileKind::File, 1);
+    let id_n = guard_n.claim(&path).expect("N claims P");
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      inner
+        .obligations
+        .get_mut(&id_n)
+        .expect("N's record is present")
+        .state = RemovalState::Removing { attempts: 0 };
+    }
+    fs.remove(&path); // N's unlink physically ran
+
+    // Incarnation M reclaims the same path and owns the live file.
+    let guard_m = reg.dispatch_guard(scope_m, name.to_owned());
+    fs.put(&path, FileKind::File, 2);
+    let id_m = guard_m.claim(&path).expect("M reclaims P");
+
+    // N's stale confirm lands: retire N. Keyed by id, it removes only N.
+    lock_ledger(&reg.ledger).retire(id_n, Reaped::ConfirmedGone);
+    {
+      let inner = lock_ledger(&reg.ledger);
+      assert!(!inner.obligations.contains_key(&id_n), "N is retired");
+      assert!(
+        matches!(
+          inner.obligations.get(&id_m).map(|ob| &ob.state),
+          Some(RemovalState::Owned)
+        ),
+        "the successor M survives the stale confirm for N"
+      );
+      assert_eq!(
+        inner.by_path.get(&path),
+        Some(&id_m),
+        "by_path still names M"
+      );
+    }
+    assert!(
+      fs.files_under("/r").contains(&path),
+      "M's live file survives the stale confirm"
+    );
+
+    // M reaps normally to a typed terminal; physical state converges.
+    let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
+    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
+    reg.sweep_owned::<TokioRuntime>(&op_tx, &mut pending);
+    settle(|| reg.len() == 0 && fs.files_under("/r").is_empty()).await;
+    assert_eq!(reg.len(), 0, "M is confirmed gone");
+    assert!(fs.files_under("/r").is_empty(), "the physical file is gone");
+  }
+
   // A stale self-reap (carrying an incarnation id that no longer matches the
   // record at the path) must NEVER physically unlink the path: the successor's
   // live file (or whatever now lives there) is not ours to delete.
@@ -6797,8 +6937,9 @@ mod sync_cookie {
     // successor could own the path) — a stale self-reap still must not unlink.
     {
       let mut inner = lock_ledger(&reg.ledger);
-      inner.owned.clear();
-      inner.names.clear();
+      inner.obligations.clear();
+      inner.by_path.clear();
+      inner.by_name.clear();
     }
     let residual = self_reap(&fs, &guard, path.clone(), Some(stale));
     assert!(
@@ -6831,17 +6972,19 @@ mod sync_cookie {
     let m = CookieId(42);
     {
       let mut inner = lock_ledger(&reg.ledger);
-      inner.owned.insert(
-        path.clone(),
-        CookieRecord {
+      inner.obligations.insert(
+        m,
+        Obligation {
           scope,
           name: name.to_owned(),
           id: m,
+          path: Some(path.clone()),
           last_failure_seq: 5,
           state: RemovalState::RemoveFailed { attempts: 2 },
         },
       );
-      inner.names.insert(name.to_owned(), path.clone());
+      inner.by_name.insert(name.to_owned(), m);
+      inner.by_path.insert(path.clone(), m);
     }
     let slot_at = Instant::from_origin(Duration::from_secs(100));
     let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
@@ -6854,7 +6997,10 @@ mod sync_cookie {
     on_cookie_remove_done(&reg, &mut pending, &cfg, path.clone(), k, false, now, false);
     assert!(
       matches!(
-        lock_ledger(&reg.ledger).owned.get(&path).map(|r| &r.state),
+        lock_ledger(&reg.ledger)
+          .obligations
+          .get(&m)
+          .map(|ob| &ob.state),
         Some(RemovalState::RemoveFailed { attempts: 2 })
       ),
       "a stale failure never bumps the successor's attempts"
@@ -6900,16 +7046,19 @@ mod sync_cookie {
     let m = CookieId(100);
     {
       let mut inner = lock_ledger(&reg.ledger);
-      inner.owned.insert(
-        path.clone(),
-        CookieRecord {
+      inner.obligations.insert(
+        m,
+        Obligation {
           scope,
           name: "n".to_owned(),
           id: m,
+          path: Some(path.clone()),
           last_failure_seq: 1,
           state: RemovalState::RemoveFailed { attempts: 1 },
         },
       );
+      inner.by_name.insert("n".to_owned(), m);
+      inner.by_path.insert(path.clone(), m);
     }
     let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
     let k = CookieId(m.0 + 7);
@@ -6920,12 +7069,11 @@ mod sync_cookie {
       let d = CookieRegistry::<FakeFs>::removal_decision_locked(
         &mut inner,
         &mut pending,
-        &path,
-        RemovalRequest::RetryDue(k),
+        &RemovalRequest::RetryDue(k),
       );
       assert!(d.is_none(), "a stale RetryDue dispatches nothing");
       assert!(matches!(
-        inner.owned.get(&path).map(|r| &r.state),
+        inner.obligations.get(&m).map(|ob| &ob.state),
         Some(RemovalState::RemoveFailed { attempts: 1 })
       ));
     }
@@ -6935,12 +7083,11 @@ mod sync_cookie {
       let d = CookieRegistry::<FakeFs>::removal_decision_locked(
         &mut inner,
         &mut pending,
-        &path,
-        RemovalRequest::Targeted(k),
+        &RemovalRequest::Targeted(k),
       );
       assert!(d.is_none(), "a stale Targeted dispatches nothing");
       assert!(matches!(
-        inner.owned.get(&path).map(|r| &r.state),
+        inner.obligations.get(&m).map(|ob| &ob.state),
         Some(RemovalState::RemoveFailed { attempts: 1 })
       ));
     }
@@ -6950,12 +7097,15 @@ mod sync_cookie {
       let d = CookieRegistry::<FakeFs>::removal_decision_locked(
         &mut inner,
         &mut pending,
-        &path,
-        RemovalRequest::Targeted(m),
+        &RemovalRequest::Targeted(m),
       );
-      assert_eq!(d, Some(m), "a matching Targeted dispatches M");
+      assert_eq!(
+        d.map(|(_, id)| id),
+        Some(m),
+        "a matching Targeted dispatches M"
+      );
       assert!(matches!(
-        inner.owned.get(&path).map(|r| &r.state),
+        inner.obligations.get(&m).map(|ob| &ob.state),
         Some(RemovalState::Removing { attempts: 0 })
       ));
     }
@@ -6964,29 +7114,31 @@ mod sync_cookie {
     let f = CookieId(200);
     {
       let mut inner = lock_ledger(&reg.ledger);
-      inner.owned.insert(
-        fresh.clone(),
-        CookieRecord {
+      inner.obligations.insert(
+        f,
+        Obligation {
           scope,
           name: "n2".to_owned(),
           id: f,
+          path: Some(fresh.clone()),
           last_failure_seq: 0,
           state: RemovalState::Owned,
         },
       );
+      inner.by_name.insert("n2".to_owned(), f);
+      inner.by_path.insert(fresh.clone(), f);
       let d = CookieRegistry::<FakeFs>::removal_decision_locked(
         &mut inner,
         &mut pending,
-        &fresh,
-        RemovalRequest::Explicit,
+        &RemovalRequest::Explicit(fresh.clone()),
       );
       assert_eq!(
-        d,
+        d.map(|(_, id)| id),
         Some(f),
         "Explicit dispatches the record currently at the path"
       );
       assert!(matches!(
-        inner.owned.get(&fresh).map(|r| &r.state),
+        inner.obligations.get(&f).map(|ob| &ob.state),
         Some(RemovalState::Removing { attempts: 0 })
       ));
     }
@@ -7024,28 +7176,40 @@ mod sync_cookie {
       let mut inner = lock_ledger(&reg.ledger);
       inner.next_cookie_id += 1;
       let id = CookieId(inner.next_cookie_id);
-      inner.owned.insert(
-        path.to_path_buf(),
-        CookieRecord {
+      inner.obligations.insert(
+        id,
+        Obligation {
           scope,
           name: name.to_owned(),
           id,
+          path: Some(path.to_path_buf()),
           last_failure_seq: 0,
           state: RemovalState::Owned,
         },
       );
-      inner.names.insert(name.to_owned(), path.to_path_buf());
+      inner.by_name.insert(name.to_owned(), id);
+      inner.by_path.insert(path.to_path_buf(), id);
       id
     }
     fn is_removing(reg: &CookieRegistry<FakeFs>, path: &Path) -> bool {
+      let inner = lock_ledger(&reg.ledger);
       matches!(
-        lock_ledger(&reg.ledger).owned.get(path).map(|r| &r.state),
+        inner
+          .by_path
+          .get(path)
+          .and_then(|id| inner.obligations.get(id))
+          .map(|ob| &ob.state),
         Some(RemovalState::Removing { .. })
       )
     }
     fn is_parked(reg: &CookieRegistry<FakeFs>, path: &Path) -> bool {
+      let inner = lock_ledger(&reg.ledger);
       matches!(
-        lock_ledger(&reg.ledger).owned.get(path).map(|r| &r.state),
+        inner
+          .by_path
+          .get(path)
+          .and_then(|id| inner.obligations.get(id))
+          .map(|ob| &ob.state),
         Some(RemovalState::RemoveFailed { .. })
       )
     }
@@ -7067,9 +7231,9 @@ mod sync_cookie {
     let ida1 = insert_owned_rec(&reg, sa, "a1", &a1);
     let ida2 = insert_owned_rec(&reg, sa, "a2", &a2);
     let idb1 = insert_owned_rec(&reg, sb, "b1", &b1);
-    assert_eq!(reg.record_remove_failed(&a1, ida1), Some(1)); // seq 1
-    assert_eq!(reg.record_remove_failed(&a2, ida2), Some(1)); // seq 2
-    assert_eq!(reg.record_remove_failed(&b1, idb1), Some(1)); // seq 3
+    assert_eq!(reg.record_remove_failed(ida1), Some(1)); // seq 1
+    assert_eq!(reg.record_remove_failed(ida2), Some(1)); // seq 2
+    assert_eq!(reg.record_remove_failed(idb1), Some(1)); // seq 3
 
     // Refusing = C (no parked of C): others = a1,a2,b1 by seq → [a1,a2] (limit 2).
     let n = reg.rearm_parked_batch::<TokioRuntime>(&op_tx, &mut pending, sc, 2);
@@ -7083,8 +7247,8 @@ mod sync_cookie {
 
     // Re-fail a1, a2 (now Removing → RemoveFailed) so their seqs become 4, 5 —
     // BEHIND b1's seq 3: the refresh-on-failure rule sinks repeat offenders.
-    assert_eq!(reg.record_remove_failed(&a1, ida1), Some(1)); // seq 4
-    assert_eq!(reg.record_remove_failed(&a2, ida2), Some(1)); // seq 5
+    assert_eq!(reg.record_remove_failed(ida1), Some(1)); // seq 4
+    assert_eq!(reg.record_remove_failed(ida2), Some(1)); // seq 5
     let n = reg.rearm_parked_batch::<TokioRuntime>(&op_tx, &mut pending, sc, 2);
     assert_eq!(n, 2);
     assert!(
@@ -7107,9 +7271,9 @@ mod sync_cookie {
     let ja1 = insert_owned_rec(&reg2, sa, "a1", &a1);
     let ja2 = insert_owned_rec(&reg2, sa, "a2", &a2);
     let jb1 = insert_owned_rec(&reg2, sb, "b1", &b1);
-    reg2.record_remove_failed(&a1, ja1);
-    reg2.record_remove_failed(&a2, ja2);
-    reg2.record_remove_failed(&b1, jb1);
+    reg2.record_remove_failed(ja1);
+    reg2.record_remove_failed(ja2);
+    reg2.record_remove_failed(jb1);
     let n = reg2.rearm_parked_batch::<TokioRuntime>(&op_tx2, &mut pending2, sa, 2);
     assert_eq!(
       n, 3,
@@ -7425,17 +7589,19 @@ mod sync_cookie {
       inner.next_cookie_id += 1;
       let id = CookieId(inner.next_cookie_id);
       let path = PathBuf::from("/r/M");
-      inner.owned.insert(
-        path.clone(),
-        CookieRecord {
+      inner.obligations.insert(
+        id,
+        Obligation {
           scope: ScopeId::new(NonZeroU64::new(1).unwrap()),
           name: "M".to_owned(),
           id,
+          path: Some(path.clone()),
           last_failure_seq: 0,
           state: RemovalState::Removing { attempts: 0 },
         },
       );
-      inner.names.insert("M".to_owned(), path);
+      inner.by_name.insert("M".to_owned(), id);
+      inner.by_path.insert(path, id);
       id
     };
     let in_flight: BTreeMap<ScopeId, (String, CookieId)> = [(
@@ -7469,17 +7635,19 @@ mod sync_cookie {
       inner.next_cookie_id += 1;
       let x = CookieId(inner.next_cookie_id);
       let path = PathBuf::from("/r1/N");
-      inner.owned.insert(
-        path.clone(),
-        CookieRecord {
+      inner.obligations.insert(
+        x,
+        Obligation {
           scope: ScopeId::new(NonZeroU64::new(1).unwrap()),
           name: "N".to_owned(),
           id: x,
+          path: Some(path.clone()),
           last_failure_seq: 0,
           state: RemovalState::Owned,
         },
       );
-      inner.names.insert("N".to_owned(), path);
+      inner.by_name.insert("N".to_owned(), x);
+      inner.by_path.insert(path, x);
       x
     };
     let y = CookieId(x.0 + 1); // a DISTINCT write's dispatch id, same name N
