@@ -5802,6 +5802,122 @@ mod sync_cookie {
     admit_sync(&rig, scope, "/r", ".tributaries-sync-1-1-2").await;
   }
 
+  // A reap mark that lands while a record is Removing COALESCES (the mark stays) and spends the
+  // record's sole capacity-1 wake token. If that arming then fails all the way to its budget, the
+  // failing completion SERVICES the standing mark — consumes it into exactly one fresh arming —
+  // rather than parking the record stranded with the mark set but no wake and no deadline. Without
+  // this, an idle watcher would retain the cookie until an unrelated event or teardown.
+  //
+  // Fail-on-old (schedule_retry parks a marked record past the budget without consuming the mark):
+  // the mark stays set with an empty wake channel and `retry_at` None, so no sweep and no retry ever
+  // re-examine it — `reap_marks` never returns to 0 and the settle-then-assert fails.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_standing_reap_mark_is_serviced_at_retry_exhaustion() {
+    let mut config = tuned_config();
+    config.cookie_retry_budget = 0; // one attempt per arming, then exhaustion
+    let rig = rig_with_config(64, config);
+    let scope = watch(&rig, "/r").await;
+    let path = admit_sync(&rig, scope, "/r", ".tributaries-sync-strand").await;
+    settle_cookie_count(&rig, 1).await;
+
+    // Every unlink fails; hold them so the first reap's dispatched unlink is frozen mid-flight.
+    rig.fs.fail_cookie_removes_under("/r");
+    let hold = rig.fs.hold_cookie_removes();
+
+    // Reap 1 (Owned + mark): the sweep clears the mark, moves the record to Removing, and spawns the
+    // (now-held) unlink.
+    rig.cleanup.request_remove(&path);
+    settle_reap_marks(&rig, 0).await;
+    assert_eq!(
+      reap_marks(&rig).await,
+      0,
+      "the Owned reap dispatched and cleared its own mark",
+    );
+
+    // Reap 2 (Removing + mark): coalesces onto the in-flight unlink — the mark STAYS, and its sole
+    // wake token is spent by the coalescing sweep.
+    rig.cleanup.request_cancel(".tributaries-sync-strand");
+    settle_reap_marks(&rig, 1).await;
+    assert_eq!(
+      reap_marks(&rig).await,
+      1,
+      "the second request's mark stands on the Removing record",
+    );
+
+    // Release: the held unlink runs, FAILS, the record parks, and its completion exhausts the
+    // (zero) budget — the point where a standing mark is serviced.
+    hold.release();
+
+    // NEW: the exhaustion clause consumes the standing mark. OLD: it is stranded at 1, with no wake
+    // and no deadline to ever revisit it.
+    settle_reap_marks(&rig, 0).await;
+    assert_eq!(
+      reap_marks(&rig).await,
+      0,
+      "the standing mark is serviced (consumed) at the failing arming's budget exhaustion",
+    );
+
+    // No leak: the serviced record is a normal parked obligation — a fresh reap on a healed fs reaps
+    // it to its typed terminal.
+    rig.fs.clear_cookie_remove_failures_under("/r");
+    rig.cleanup.request_remove(&path);
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the serviced-then-healed cookie reaps to its terminal",
+    );
+    assert!(rig.fs.files_under("/r").is_empty(), "no file survives");
+    assert_census_balances(&rig, "a serviced standing reap mark").await;
+  }
+
+  // Spin guard: servicing a standing mark grants EXACTLY ONE fresh arming (the mark is consumed in
+  // the same critical section as the grant), so a permafailing unlink cannot loop fail -> re-arm ->
+  // fail. After the one serviced arming also exhausts, the record parks UNMARKED — the accepted
+  // demand-driven floor — and stays there.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn servicing_a_standing_mark_grants_exactly_one_fresh_arming() {
+    let mut config = tuned_config();
+    config.cookie_retry_budget = 0;
+    let rig = rig_with_config(64, config);
+    let scope = watch(&rig, "/r").await;
+    let path = admit_sync(&rig, scope, "/r", ".tributaries-sync-spin").await;
+    settle_cookie_count(&rig, 1).await;
+
+    rig.fs.fail_cookie_removes_under("/r"); // stays failing for the whole cell
+    let hold = rig.fs.hold_cookie_removes();
+    rig.cleanup.request_remove(&path);
+    settle_reap_marks(&rig, 0).await;
+    rig.cleanup.request_cancel(".tributaries-sync-spin");
+    settle_reap_marks(&rig, 1).await;
+    hold.release();
+
+    // The mark is consumed into one fresh arming; that arming also fails and the record parks
+    // UNMARKED — no fail -> re-arm loop keeps re-setting the mark.
+    settle_reap_marks(&rig, 0).await;
+    assert_eq!(
+      reap_marks(&rig).await,
+      0,
+      "the mark is consumed, not re-set in a loop"
+    );
+
+    // Over a generous window the state is stable: the mark stays 0 and the record stays one parked
+    // obligation (a spin would keep re-marking or churn the count).
+    for _ in 0..20 {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(reap_marks(&rig).await, 0, "no re-arm loop re-sets the mark");
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the unremovable cookie is one stable parked obligation",
+    );
+    assert!(
+      !rig.fs.files_under("/r").is_empty(),
+      "the file is still on the failing fs",
+    );
+  }
+
   // Finding 1 (fs half): a cancel that arrives while the write is STILL IN THE POOL marks that
   // write's own obligation; when the write lands, its claim reads the mark and is REFUSED, so the
   // write self-reaps the file it just created. The refusal is driven by the mark alone (the caller

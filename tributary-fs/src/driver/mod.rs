@@ -102,9 +102,12 @@ pub(crate) struct DriverConfig {
   pub(crate) cookie_retry_base: Duration,
   /// The cookie-unlink backoff ceiling.
   pub(crate) cookie_retry_cap: Duration,
-  /// Max unlink attempts per arming; then the record PARKS (`RemoveFailed`,
-  /// unscheduled) until an explicit re-arm (a fresh reap/cancel, a retire
-  /// sweep, or the close sweep). Never a spin.
+  /// Max unlink attempts per arming; then an UNMARKED record PARKS
+  /// (`RemoveFailed`, unscheduled) until an explicit re-arm (a fresh reap/cancel,
+  /// a retire sweep, or the close sweep). A record still carrying a reap mark is
+  /// serviced into one fresh arming at that exhaustion instead (see
+  /// [`CookieRegistry::schedule_retry`]). Never a spin — the fresh arming
+  /// consumes the mark.
   pub(crate) cookie_retry_budget: u8,
   /// Per-scope unremoved-cookie cap: at or above it, a new `SyncRoot` command
   /// is refused [`CleanupBacklog`](crate::error::SyncRootError::CleanupBacklog)
@@ -451,11 +454,14 @@ enum Phase {
   /// the record leaves this phase only once that job's syscall has returned.
   Removing { attempts: u8 },
   /// The last unlink failed. `Some(retry_at)` = SCHEDULED (the driver, which
-  /// owns the clock, stamped the deadline); `None` = PARKED — budget exhausted,
-  /// or the failure has not been scheduled yet — awaiting an explicit re-arm (a
-  /// fresh reap/cancel request, a retire sweep, the close sweep, or the recovery
-  /// re-arm batch). Never CPU-spinning. The deadline rides the record it belongs
-  /// to, so no schedule can outlive, mismatch, or clobber its incarnation.
+  /// owns the clock, stamped the deadline); `None` = PARKED — budget exhausted
+  /// for an UNMARKED record (one still carrying a reap mark is serviced into one
+  /// fresh arming at that exhaustion instead of parking, see
+  /// [`CookieRegistry::schedule_retry`]), or the failure has not been scheduled
+  /// yet — awaiting an explicit re-arm (a fresh reap/cancel request, a retire
+  /// sweep, the close sweep, or the recovery re-arm batch). Never CPU-spinning.
+  /// The deadline rides the record it belongs to, so no schedule can outlive,
+  /// mismatch, or clobber its incarnation.
   RemoveFailed {
     attempts: u8,
     retry_at: Option<Instant>,
@@ -583,6 +589,12 @@ pub(crate) struct CookieIngress {
 /// - the channel is CLOSED ⇒ the driver is gone ⇒ its terminal sweep (the orderly
 ///   close's, or the registry's `Drop` backstop) already owns every record
 ///   regardless of any bit.
+///
+/// A bit a sweep SEES but cannot act on immediately — a `Removing`/scheduled
+/// record it can only coalesce onto — is not lost either: it rides the record,
+/// and the arming that owns the record services it (retire, or a consume into one
+/// fresh arming at budget exhaustion — see [`CookieRegistry::schedule_retry`]).
+/// A seen bit is therefore a serviced bit, not merely a seen one.
 ///
 /// The retire and close sweeps remain the promptness backstop for every residual
 /// scheduling gap, exactly as before.
@@ -728,7 +740,10 @@ impl CookieGuard {
   /// in this same section: a cancel that named this obligation while its write
   /// was still in the pool forces the claim to refuse and self-reap, closing the
   /// "delivered-but-unread cookie orphaned by a raced cancel" window. The mark
-  /// needs no consuming — it lives on the record it refuses and dies with it.
+  /// rides the record it refuses: usually the self-reap that follows retires the
+  /// record and the mark dies with it, but if that unlink fails the record
+  /// survives carrying the mark, which the failing arming's budget-exhaustion
+  /// completion then services (see [`CookieRegistry::schedule_retry`]).
   ///
   /// An ABSENT record means the abnormal-path [`Drop`] already took the ledger;
   /// its flag is raised before that take, so this refuses on either observation
@@ -1232,7 +1247,10 @@ impl<F: FsOps> CookieRegistry<F> {
   ///   against; it dies with the record.
   /// - `Removing` / SCHEDULED `RemoveFailed` — an unlink or a deadline already
   ///   owns this record's fate, so the request COALESCES onto it. The mark stays,
-  ///   so a later failure leaves a record any subsequent wake re-arms.
+  ///   and the arming that owns the record services it: on retire the mark dies
+  ///   with the record, and on budget exhaustion the failing completion consumes
+  ///   the mark into one fresh arming ([`CookieRegistry::schedule_retry`]) — not
+  ///   dependent on a subsequent wake.
   /// - PARKED `RemoveFailed` — budget-spent and unscheduled: the request re-arms it
   ///   with a fresh budget, which is the demand edge that makes a fresh reap or
   ///   cancel accelerate a stalled backlog.
@@ -1297,9 +1315,13 @@ impl<F: FsOps> CookieRegistry<F> {
 
   /// Schedules incarnation `id`'s retry after a failed unlink — the driver is the
   /// only writer of deadlines, because it is the only holder of the clock. A
-  /// record PARKED within its budget takes `now + backoff(attempts)`; past the
-  /// budget it stays parked (no schedule, zero CPU) awaiting an explicit re-arm.
-  /// Any other phase — retired by a racing confirm, or already re-armed into
+  /// record PARKED within its budget takes `now + backoff(attempts)`. Past the
+  /// budget an UNMARKED record stays parked (no schedule, zero CPU) awaiting an
+  /// explicit re-arm; a record that still carries a STANDING reap mark is
+  /// serviced here instead — the mark is consumed into exactly one fresh arming,
+  /// scheduled due-now, because the wake that carried it may already have been
+  /// spent by a coalescing sweep while an earlier arming owned the record. Any
+  /// other phase — retired by a racing confirm, or already re-armed into
   /// `Removing` by a sweep — is a stale report and touches nothing. `flat` uses
   /// the flat base delay during the close drain (the ~1 s grace bounds attempts
   /// there).
@@ -1316,6 +1338,18 @@ impl<F: FsOps> CookieRegistry<F> {
       return;
     };
     if *attempts > config.cookie_retry_budget {
+      // Budget exhausted: the record would park. A standing reap mark is serviced
+      // in this same critical section — consumed into exactly one fresh arming
+      // (attempts 0, `Targeted` re-arm semantics), scheduled due-now for the
+      // existing retry machinery to dispatch. Set-then-consume can never lose a
+      // request; consume-then-park can never spin. An unmarked record parks.
+      if ob.reap_requested {
+        ob.reap_requested = false;
+        ob.phase = Phase::RemoveFailed {
+          attempts: 0,
+          retry_at: Some(now),
+        };
+      }
       return;
     }
     let delay = if flat {
