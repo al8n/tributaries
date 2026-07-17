@@ -266,8 +266,14 @@ struct LedgerInner {
   /// from the token it minted. Inserted at BIRTH, so a cancel-by-name always has
   /// a target whatever the obligation's phase — including a write still in the
   /// pool, which is what lets the reap mark ride the record instead of a
-  /// free-standing tombstone. One entry per record; removed with the record while
-  /// it still points back to that id (newest-birth-wins on a hostile name reuse).
+  /// free-standing tombstone. Public admission REFUSES a second live obligation
+  /// under a name this map already holds (`NameInUse`), so at most one live record
+  /// carries any name: this map is an injection from names to live records, and
+  /// cancel-by-name resolves to the unique holder rather than a
+  /// most-recently-born guess. One entry per record; the point-back check at
+  /// retire (removed only while it still names that id) is retained as the
+  /// defensive rule for state minted below the public surface (tests, future
+  /// internal callers).
   by_name: HashMap<String, CookieId>,
   /// The id mint (§1.1). Bumped under this mutex ONCE per admitted sync, at
   /// ADMISSION ([`CookieRegistry::admit_parked`]) — the ONE site that inserts a
@@ -766,12 +772,14 @@ impl CookieGuard {
     // subscription's cookie lands in the PARENT), which is what the sweeps and a
     // public path-addressed removal then resolve through.
     //
-    // `by_path` MAY overwrite an entry left by an older incarnation at this path
-    // (a hostile same-path reuse — direct-fs-API name reuse only; umbrella names
-    // are per-sync-unique). Newest-claim-wins: the displaced id's record is left
-    // untouched (we cannot know which file-at-P history is live), and it reaches
-    // its terminal through the id-addressed sweeps, which unlink P on its behalf
-    // and earn its confirm.
+    // `by_path` MAY overwrite an entry left by an older incarnation at this path.
+    // Two live records at one path require two live same-name obligations (the
+    // path is `dir.join(name)`), which public admission now refuses before birth
+    // (`NameInUse`): this overwrite is therefore unreachable through the public
+    // surface and retained defensively for state minted below it. Newest-claim-wins
+    // if it does occur: the displaced id's record is left untouched (we cannot know
+    // which file-at-P history is live), and it reaches its terminal through the
+    // id-addressed sweeps, which unlink P on its behalf and earn its confirm.
     let landed = path.to_path_buf();
     ob.path = Some(landed.clone());
     ob.phase = Phase::Owned;
@@ -921,9 +929,13 @@ impl<F: FsOps> CookieRegistry<F> {
         phase: Phase::Parked { fence },
       },
     );
-    // Newest-birth-wins on a hostile same-name reuse: the displaced record
-    // keeps its own key and its own terminal — only cancel-by-name's lookup is
-    // imprecise, and only for a direct-API caller reusing one name.
+    // Public admission refuses a second live obligation under a name already
+    // held (the command handler's `name_in_use` probe → `NameInUse`), so this
+    // insert can no longer displace a live same-name record through the public
+    // surface. The unconditional insert is retained for state minted BELOW that
+    // surface (tests, future internal callers); there, the point-back discipline
+    // at retire keeps the id-keyed machinery correct even under a hand-built
+    // same-name pair.
     inner.by_name.insert(name, id);
     #[cfg(all(test, feature = "tokio"))]
     {
@@ -1038,6 +1050,18 @@ impl<F: FsOps> CookieRegistry<F> {
       .obligations
       .values()
       .any(|ob| ob.scope == scope && matches!(ob.phase, Phase::Parked { .. } | Phase::InPool))
+  }
+
+  /// Whether a LIVE obligation already holds this rendered cookie name —
+  /// the cancel-by-name injectivity gate. `by_name` membership IS liveness:
+  /// entries are inserted only at admission (which now requires absence) and
+  /// removed exactly at that record's retire, so every phase from `Parked`
+  /// through `RemoveFailed` holds its name, and a name is freed only at the
+  /// holder's typed terminal. A name with no live holder — including one whose
+  /// holder just retired — admits, so SEQUENTIAL reuse of a name is unrefused;
+  /// only a second CONCURRENT live holder is. One hash lookup, no fs I/O.
+  fn name_in_use(&self, name: &str) -> bool {
+    lock_ledger(&self.ledger).by_name.contains_key(name)
   }
 
   /// Re-arms PARKED removal records at a cap refusal — refusing-scope-FIRST,
@@ -4171,6 +4195,25 @@ pub(crate) async fn run<R, F>(
                 // blocking writes against a hung mount. ONE O(cap) probe over the
                 // one ledger, because both stages are one record there.
                 let _ = reply.send(Err(crate::error::SyncRootError::WriteInFlight));
+              } else if cookies.name_in_use(&name) {
+                // A LIVE obligation of this watcher already holds this rendered
+                // name. `by_name` maps a name to ONE incarnation, so admitting a
+                // second same-name obligation would redirect it — a cancel-by-name
+                // meant for the holder could then reap the newcomer (another root's
+                // sync), and the displaced holder would be unaddressable-by-name
+                // until teardown. Refuse before birth: with no two live same-name
+                // obligations, `by_name` is an injection and cancel-by-name is
+                // exact. The name frees at the holder's typed terminal, so
+                // sequential reuse admits; concurrent syncs need distinct names (the
+                // umbrella mints per-sync-unique names, so it never trips this).
+                //
+                // Ordered AFTER `WriteInFlight` so a same-scope retry while the
+                // predecessor is still `Parked`/`InPool` keeps reading the transient
+                // single-flight signal (renaming is not its remedy), and BEFORE the
+                // caps so a permanently name-blocked request is neither mis-reported
+                // as transient capacity pressure nor allowed to spuriously re-arm the
+                // recovery batch. A refused admission creates nothing.
+                let _ = reply.send(Err(crate::error::SyncRootError::NameInUse { name }));
               } else if cookies.unremoved_for(scope) >= config.cookie_backlog_cap
                 || cookies.unremoved() >= config.cookie_global_cap
               {

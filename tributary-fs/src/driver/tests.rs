@@ -5635,6 +5635,197 @@ mod sync_cookie {
     assert_ne!(again, path, "the second barrier is its own cookie");
   }
 
+  // A live sync obligation holds its rendered cookie name against EVERY other
+  // admission for that name watcher-wide — including a DIFFERENT scope's. Two live
+  // same-name obligations would make `by_name` redirect, so a cancel-by-name meant
+  // for the holder could reap the newcomer (another root's sync) and strand the
+  // holder until teardown. Refusing the second admission `NameInUse` keeps
+  // `by_name` an injection: a cancel-by-name resolves to the unique live holder and
+  // reaps it to its terminal — no scope teardown involved.
+  //
+  // Fail-on-old (the unconditional `by_name` insert): the cross-scope admission
+  // returns `Ok` and displaces the name, so the `NameInUse` assertion fails
+  // IMMEDIATELY — no settle-hang.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_live_cookie_name_is_refused_across_scopes_and_cancel_by_name_reaps_the_holder() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/ra", FileKind::Dir, 100);
+    rig.fs.put("/rb", FileKind::Dir, 101);
+    let scope_a = watch(&rig, "/ra").await;
+    let scope_b = watch(&rig, "/rb").await;
+    let name = ".tributaries-sync-shared-name";
+
+    // A admits and owns its cookie under `name` at /ra.
+    let path_a = admit_sync(&rig, scope_a, "/ra", name).await;
+    assert_eq!(path_a, PathBuf::from("/ra/.tributaries-sync-shared-name"));
+    settle_cookie_count(&rig, 1).await;
+
+    // B — a DIFFERENT scope — is refused `NameInUse`: A's live obligation holds the
+    // name watcher-wide.
+    assert!(
+      matches!(
+        sync_root(&rig, scope_b, "/rb", name).await,
+        Err(crate::error::SyncRootError::NameInUse { .. })
+      ),
+      "a second live obligation under a held name is refused across scopes"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the refused admission minted no record — still exactly A's one obligation"
+    );
+
+    // Cancel BY NAME: with B refused, `by_name` names only A, so the cancel is
+    // unambiguous and reaps the delivered-but-unread A to its terminal.
+    rig.cleanup.request_cancel(name);
+    settle(|| rig.fs.files_under("/ra").is_empty() && !rig.fs.cookie_removes().is_empty()).await;
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "cancel-by-name reaped the holder A"
+    );
+    assert!(
+      rig.fs.files_under("/ra").is_empty(),
+      "A's cookie file is gone"
+    );
+    assert_census_balances(&rig, "cross-scope name refusal then cancel-by-name").await;
+  }
+
+  // A cookie name is bound to its holder only until that holder reaches a typed
+  // terminal. Once the holder's cookie is confirmed removed the name is free and a
+  // fresh sync reuses it. But while a holder is still live — here its unlink
+  // dispatched and HELD mid-flight, a `Removing` record whose `by_name` entry
+  // stands until retire — a fresh sync under that name is refused `NameInUse`, not
+  // `WriteInFlight` (the record is neither `Parked` nor `InPool`). Releasing the
+  // unlink retires the holder, frees the name, and the retry admits.
+  //
+  // Fail-on-old (the unconditional `by_name` insert): the held-window sync is
+  // admitted `Ok` instead of `NameInUse` — the assertion fails immediately.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cookie_name_frees_at_its_holders_terminal_so_sequential_reuse_admits() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    let name = ".tributaries-sync-reuse";
+
+    // First holder: write, own, then reap and CONFIRM — the name frees at retire.
+    let path = admit_sync(&rig, scope, "/r", name).await;
+    settle_cookie_count(&rig, 1).await;
+    rig.cleanup.request_remove(&path);
+    settle(|| rig.fs.files_under("/r").is_empty() && !rig.fs.cookie_removes().is_empty()).await;
+    settle_cookie_count(&rig, 0).await;
+
+    // Sequential reuse of the freed name admits.
+    let reused = admit_sync(&rig, scope, "/r", name).await;
+    assert_eq!(
+      reused, path,
+      "the freed name is reusable — sequential reuse admits"
+    );
+    settle_cookie_count(&rig, 1).await;
+
+    // The transient window: reap the second holder but HOLD its unlink in the pool,
+    // so the record sits `Removing` with its `by_name` entry still standing.
+    let hold = rig.fs.hold_cookie_removes();
+    rig.cleanup.request_remove(&reused);
+    settle(|| rig.fs.cookie_remove_dispatches() == 2).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      2,
+      "the second unlink is dispatched and held mid-flight"
+    );
+
+    // A fresh sync under the still-held name is refused `NameInUse` — the holder is
+    // live (`Removing`), so `has_pending_write` is false and the single-flight
+    // signal does not apply. Capture the outcome, then RELEASE the hold before
+    // asserting: a failed assertion (the fail-on-old path) must not strand the held
+    // blocking job, which would wedge the runtime's shutdown rather than fail fast.
+    let held_window = sync_root(&rig, scope, "/r", name).await;
+    hold.release();
+    assert!(
+      matches!(
+        held_window,
+        Err(crate::error::SyncRootError::NameInUse { .. })
+      ),
+      "a fresh sync under a name whose holder is still mid-unlink is refused NameInUse"
+    );
+
+    // The released unlink lets the holder confirm, retire, and free the name; the
+    // retry admits.
+    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    settle_cookie_count(&rig, 0).await;
+    let again = admit_sync(&rig, scope, "/r", name).await;
+    assert_eq!(
+      again, path,
+      "once the holder retires the name frees and the retry admits"
+    );
+
+    // Clean the last holder so close proves quiescence.
+    rig.cleanup.request_remove(&again);
+    settle_cookie_count(&rig, 0).await;
+    assert_census_balances(&rig, "sequential reuse across a held then freed name").await;
+  }
+
+  // The refusal ORDER at admission: `WriteInFlight` precedes `NameInUse`, and a
+  // `NameInUse` refusal creates nothing. While a same-scope write is still in the
+  // pipeline (`Parked`/`InPool`) a same-name retry reads the transient
+  // single-flight signal `WriteInFlight` — renaming is not its remedy. Only once
+  // the holder leaves the pipeline (here, `Owned`) does a same-name admission read
+  // the permanent `NameInUse`, and that refusal mints no record and no census
+  // birth.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn write_in_flight_precedes_name_in_use_and_a_refusal_creates_nothing() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    let name = ".tributaries-sync-order";
+
+    // Hold the first write in the pool: the holder is `InPool`, its name already in
+    // `by_name` (inserted at birth). A same-name retry reads `WriteInFlight`, NOT
+    // `NameInUse` — the single-flight signal wins while the write is pending.
+    let hold = rig.fs.hold_cookie_writes();
+    let first = sync_root_pending(&rig, scope, "/r", name).await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    assert!(
+      matches!(
+        sync_root(&rig, scope, "/r", name).await,
+        Err(crate::error::SyncRootError::WriteInFlight)
+      ),
+      "a same-name retry while the write is in the pool reads WriteInFlight, not NameInUse"
+    );
+
+    // Release the write: the holder becomes `Owned`.
+    hold.release();
+    let path = first
+      .await
+      .expect("the driver replies")
+      .expect("the first write lands");
+    settle_cookie_count(&rig, 1).await;
+    let (before, live_before) = cookie_census(&rig).await;
+
+    // Now a same-name admission reads `NameInUse` — the write is no longer pending.
+    assert!(
+      matches!(
+        sync_root(&rig, scope, "/r", name).await,
+        Err(crate::error::SyncRootError::NameInUse { .. })
+      ),
+      "once the holder is Owned a same-name admission reads NameInUse"
+    );
+
+    // The refusal created nothing: the live count and the census birth tally are
+    // exactly where they were.
+    let (after, live_after) = cookie_census(&rig).await;
+    assert_eq!(
+      live_after, live_before,
+      "the NameInUse refusal minted no record"
+    );
+    assert_eq!(after.births, before.births, "…and no census birth");
+    assert_eq!(cookie_count(&rig).await, 1, "still exactly the one holder");
+
+    // Cleanup for a quiescent close.
+    rig.cleanup.request_remove(&path);
+    settle_cookie_count(&rig, 0).await;
+    assert_census_balances(&rig, "order and no-residue on a NameInUse refusal").await;
+  }
+
   // A physical write still outstanding at close makes close report `NotQuiesced`
   // with the write counted — honest, never an indefinite hang. The write rides
   // the same `pending_cookie_ops` accounting a teardown does.
@@ -6948,90 +7139,107 @@ mod sync_cookie {
 
   // ==== R11-3: the forced same-path ABA and the id guards (cells 1–4) ====
 
-  // The flagship R11-3 cell, forced deterministically. A confirmed unlink for a
-  // record that has since been REPLACED at the same path (a direct-API name
-  // reuse recreating the file after the old unlink physically ran) must NOT drop
-  // the successor: the id guard on the confirm-drop makes the stale completion a
-  // no-op. Without it, the stale confirm deletes the live successor record — an
-  // untracked file on disk plus a false `Ok(0)` at close (Codex's exact repro).
+  // The flagship id guard, pinned at the registry harness. Public admission now
+  // refuses a second live obligation under a held name (`NameInUse`), so two live
+  // same-name records can no longer be minted through `sync_root` — but the guard
+  // that protects a same-path successor from a predecessor's stale confirm must
+  // stay pinned where the state IS constructible: straight against the registry,
+  // which admits and claims below the admission refusal.
   //
-  // Fail-on-old (the confirm-drop's id guard removed): the stale confirm's
-  // path-only drop deletes the successor record — the count drops to 0 with the
-  // file still present, and the final close would report `Ok(0)` over `P`.
+  // A confirmed unlink for a record since REPLACED at its path (a predecessor whose
+  // unlink physically ran, then a successor reclaiming the freed path) must NOT
+  // drop the successor: the pool job's confirm-drop is keyed by INCARNATION id, so
+  // the stale confirm retires only the predecessor. This drives the REAL unlink job
+  // through the held preemption window, so the id guard is exercised at the actual
+  // confirm-drop site, not a stand-in.
+  //
+  // Fail-on-old (a path-keyed confirm-drop): releasing the held confirm removes
+  // whoever now occupies the path — the successor — so the count drops to 0 with
+  // the file still present and the survivor assertion fails.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_confirmed_unlink_for_a_replaced_record_does_not_drop_it() {
-    let rig = rig_with_capacity(64);
-    let scope = watch(&rig, "/r").await;
+    let fs = FakeFs::new(1);
+    let mut reg = registry(fs.clone());
+    let mut core = fence_source();
+    let scope_pred = ScopeId::new(NonZeroU64::new(1).unwrap());
+    let scope_succ = ScopeId::new(NonZeroU64::new(2).unwrap());
     let name = ".tributaries-sync-aba-1";
+    let path = PathBuf::from("/r").join(name);
+    let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
 
-    // First incarnation: write N → P, settle its `CookieWriteDone` (gate open).
-    let path = sync_root(&rig, scope, "/r", name)
-      .await
-      .expect("the first write lands");
-    assert_eq!(path, PathBuf::from("/r/.tributaries-sync-aba-1"));
-    settle_cookie_count(&rig, 1).await;
+    // Predecessor: admit, land its file at P, claim it Owned.
+    let guard_pred = dispatched_guard(&mut reg, &mut core, scope_pred, name);
+    fs.put(&path, FileKind::File, 1);
+    let id_pred = guard_pred.claim(&path).expect("the predecessor claims P");
 
-    // Reap it, but HOLD the pool job at the R11-3 preemption window: the unlink
-    // syscall has run (the file is gone) but the job has not yet taken the
-    // ledger lock to confirm-drop.
-    let hold = rig.fs.hold_cookie_remove_confirms();
-    rig.cleanup.request_remove(&path);
-    settle(|| !rig.fs.files_under("/r").contains(&path) && rig.fs.cookie_remove_dispatches() == 1)
-      .await;
+    // Reap it, but HOLD the pool job at the preemption window: the unlink syscall
+    // has run (the file is gone) but the job has not yet taken the ledger lock to
+    // confirm-drop.
+    let hold = fs.hold_cookie_remove_confirms();
+    reg.request_removal::<TokioRuntime>(&op_tx, RemovalRequest::Targeted(id_pred));
+    settle(|| !fs.files_under("/r").contains(&path) && fs.cookie_remove_dispatches() == 1).await;
     assert!(
-      !rig.fs.files_under("/r").contains(&path),
+      !fs.files_under("/r").contains(&path),
       "the unlink syscall ran — the file is gone at the preemption window"
     );
-    assert_eq!(rig.fs.cookie_remove_dispatches(), 1);
 
-    // Second incarnation, SAME dir and name — a direct-API name reuse (the rig
-    // drives `SyncRoot`, so this is in contract for the test). `create_new`
-    // succeeds (the file is gone), and the claim lands a FRESH incarnation keyed
-    // by its own id: the predecessor's held-`Removing` record keeps its own key,
-    // so both are tracked at once — the ledger count is pessimistic-honest.
-    let path2 = admit_sync(&rig, scope, "/r", name).await;
-    assert_eq!(path2, path, "the successor lands at the same reused path");
+    // Successor, SAME path: admit, recreate the freed file, claim it. Keyed by its
+    // own id; the predecessor's held-`Removing` record keeps its own key, so both
+    // are tracked at once — the ledger count is pessimistic-honest.
+    let guard_succ = dispatched_guard(&mut reg, &mut core, scope_succ, name);
+    fs.put(&path, FileKind::File, 2);
+    let id_succ = guard_succ.claim(&path).expect("the successor reclaims P");
+    assert_ne!(
+      id_pred, id_succ,
+      "predecessor and successor are distinct incarnations"
+    );
     assert_eq!(
-      cookie_count(&rig).await,
+      reg.len(),
       2,
-      "both incarnations are tracked — the predecessor is not displaced by the successor's claim"
+      "both incarnations are tracked — the successor's claim displaces neither record"
     );
 
-    // Release the held confirm: the first unlink's job resumes and confirm-drops
-    // — but for the STALE incarnation, so the id guard refuses it.
+    // Release the held confirm: the predecessor's job resumes and confirm-drops —
+    // but keyed by its own id, so the stale confirm cannot touch the successor.
     hold.release();
-    settle(|| !rig.fs.cookie_removes().is_empty()).await;
-    // Let the stale confirm-drop and its `CookieRemoveDone` fully land.
+    settle(|| reg.len() == 1).await;
+    // Let the stale confirm-drop and its report fully land.
     for _ in 0..24 {
       tokio::task::yield_now().await;
       tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(
-      cookie_count(&rig).await,
+      reg.len(),
       1,
       "the stale confirm was refused by id — the successor record survives"
     );
     assert!(
-      rig.fs.files_under("/r").contains(&path),
+      matches!(
+        lock_ledger(&reg.ledger)
+          .obligations
+          .get(&id_succ)
+          .map(|ob| &ob.phase),
+        Some(Phase::Owned)
+      ),
+      "the successor is still Owned"
+    );
+    assert!(
+      !lock_ledger(&reg.ledger).obligations.contains_key(&id_pred),
+      "the predecessor is retired by its own id"
+    );
+    assert!(
+      fs.files_under("/r").contains(&path),
       "the successor's file survives the stale confirm"
     );
 
-    // The successor reaps normally now, and close proves quiescence.
-    rig.cleanup.request_remove(&path);
-    settle(|| rig.fs.files_under("/r").is_empty() && !rig.fs.cookie_removes().is_empty()).await;
-    settle_cookie_count(&rig, 0).await;
-    assert_eq!(
-      cookie_count(&rig).await,
-      0,
-      "the successor is confirmed gone"
-    );
-
-    let (reply, on_reply) = futures_channel::oneshot::channel();
-    rig.commands.send(Command::Close { reply }).await.unwrap();
-    let pending = on_reply.await.expect("the driver replies");
-    assert_eq!(
-      pending, 0,
-      "close proves quiescence — no untracked file, no false Ok(0)"
+    // The successor reaps normally to a typed terminal; physical state converges.
+    reg.request_removal::<TokioRuntime>(&op_tx, RemovalRequest::Targeted(id_succ));
+    settle(|| reg.len() == 0 && fs.files_under("/r").is_empty()).await;
+    assert_eq!(reg.len(), 0, "the successor is confirmed gone");
+    let (census, live) = reg.census();
+    assert!(
+      census.balances(live),
+      "every incarnation reached a typed terminal"
     );
   }
 
@@ -7784,32 +7992,26 @@ mod sync_cookie {
     drop(pending_replies);
   }
 
-  // R12-F3: the global cookie cap dedups in-flight writes by INCARNATION ID, not
-  // NAME, so a direct-fs-API caller reusing ONE cookie name across many disjoint
-  // scopes cannot bypass it. The public `sync_root` API permits the same normal
-  // name on disjoint scopes; once one owned cookie named N exists, the old
-  // NAME-dedup excluded EVERY in-flight write named N (its name sat in `names`), so
-  // k same-name held writes on k scopes each contributed 0 — an unbounded
-  // blocking-pool bypass. Each write now holds its OWN id-keyed obligation from dispatch, so
-  // k same-name held writes are k records and the cap binds — the bypass is unrepresentable
-  // rather than guarded. (The umbrella is unaffected — it mints per-sync-unique names.)
+  // The global cookie cap counts every in-flight write by its own INCARNATION id,
+  // never collapsing distinct writes into one gauge slot: k held writes across k
+  // disjoint scopes are k records, so the cap binds at the (cap+1)-th admission and
+  // a caller cannot flood the blocking pool past it. The property is ID-COUNTING,
+  // so it is pinned with DISTINCT names — a caller reusing ONE name across live
+  // obligations is now refused `NameInUse` before a second same-name write can even
+  // be dispatched (folded below; the umbrella mints per-sync-unique names, so it
+  // never trips either path).
   //
-  // Fail-on-old (a gauge that collapsed same-name writes): the owned N would mask every
-  // same-name held write, the gauge would stay pinned at 1, the (cap+1)-th sync would be
-  // ADMITTED, its held write would PARK behind the hold, and the prompt-refusal assertion
-  // would time out. Deterministic via the write hold.
+  // Fail-on-old (a gauge that collapsed writes): the (cap+1)-th sync would be
+  // ADMITTED, its held write would PARK behind the hold, and the prompt-refusal
+  // assertion would time out. Deterministic via the write hold.
   #[tokio::test(flavor = "multi_thread")]
-  async fn same_name_writes_on_disjoint_scopes_each_count_against_the_global_cap() {
+  async fn distinct_name_writes_on_disjoint_scopes_each_count_against_the_global_cap() {
     // global_cap = 3, backlog_cap = 8 (the per-scope cap never binds — one cookie
     // per scope).
     let rig = rig_with_config(64, low_global_cap_config());
     let cap = low_global_cap_config().cookie_global_cap;
-    // The ONE cookie name reused across every disjoint scope — exactly the
-    // direct-API pattern the umbrella never produces.
-    let shared = ".tributaries-sync-shared";
 
-    // cap + 1 disjoint scopes, each separately rooted so the shared name lands at a
-    // DISTINCT path per scope (name reuse across live paths — direct-API only).
+    // cap + 1 disjoint scopes, each separately rooted.
     let mut scopes = Vec::new();
     for i in 0..=cap {
       let root = format!("/rs{i}");
@@ -7817,46 +8019,66 @@ mod sync_cookie {
       scopes.push((root.clone(), watch(&rig, &root).await));
     }
 
-    // Scope 0's sync COMPLETES and leaves cookie N owned (unlink unconfirmed): this
-    // is what puts N into `names` and triggered the old name-dedup bypass.
+    // Scope 0's sync COMPLETES and leaves one cookie owned (unlink unconfirmed).
     let (root0, scope0) = &scopes[0];
-    let owned = admit_sync(&rig, *scope0, root0, shared).await;
-    assert_eq!(owned, PathBuf::from(format!("{root0}/{shared}")));
+    let owned = admit_sync(&rig, *scope0, root0, ".tributaries-sync-distinct-0").await;
+    assert_eq!(
+      owned,
+      PathBuf::from(format!("{root0}/.tributaries-sync-distinct-0"))
+    );
     settle_cookie_count(&rig, 1).await;
 
-    // From here every write hangs in the pool. The owned N holds one obligation;
-    // each held write named N must add one MORE (by its own id), never be masked.
+    // Folded: a second admission reusing the held name is refused `NameInUse`
+    // before it can mint a record — a same-name flood cannot even begin (the
+    // cross-scope refusal is pinned end-to-end in
+    // `a_live_cookie_name_is_refused_across_scopes_and_cancel_by_name_reaps_the_holder`).
+    let (root1, scope1) = &scopes[1];
+    assert!(
+      matches!(
+        sync_root(&rig, *scope1, root1, ".tributaries-sync-distinct-0").await,
+        Err(crate::error::SyncRootError::NameInUse { .. })
+      ),
+      "a second live obligation under the held name is refused NameInUse, never dispatched"
+    );
+
+    // From here every write hangs in the pool; each DISTINCTLY named held write must
+    // add one MORE obligation (by its own id), never be masked.
     let hold = rig.fs.hold_cookie_writes();
 
-    // Syncs on scopes 1..cap, all named N: each admits and dispatches a held write.
-    // With owned(1) + (cap-1) held writes the gauge reaches the cap.
+    // Syncs on scopes 1..cap, each distinctly named: each admits and dispatches a
+    // held write. With owned(1) + (cap-1) held writes the gauge reaches the cap.
     let mut pending = Vec::new();
     for (j, (root, scope)) in scopes[1..cap].iter().enumerate() {
-      let reply = sync_root_pending(&rig, *scope, root, shared).await;
+      let name = format!(".tributaries-sync-distinct-{}", j + 1);
+      let reply = sync_root_pending(&rig, *scope, root, &name).await;
       pending.push(reply);
-      // owned N's completed write (1) + this held write and its predecessors.
+      // owned's completed write (1) + this held write and its predecessors.
       let want = j + 2;
       settle(|| rig.fs.cookie_dispatches() >= want).await;
       assert_eq!(
         rig.fs.cookie_dispatches(),
         want,
-        "each same-name held write is dispatched and counted by id before the next admission"
+        "each distinct-name held write is dispatched and counted by id before the next admission"
       );
     }
 
-    // The (cap+1)-th sync (scope `cap`), still named N: the gauge is owned(1) +
-    // (cap-1) held = cap ≥ cap → refused PROMPTLY. Under name-dedup it would be
-    // admitted (every held write masked by the owned N's name) and park behind the
-    // hold, timing this out.
+    // The (cap+1)-th sync (scope `cap`), distinctly named: the gauge is owned(1) +
+    // (cap-1) held = cap ≥ cap → refused PROMPTLY, never parked behind the hold.
     let (root_last, scope_last) = &scopes[cap];
-    let last_reply = sync_root_pending(&rig, *scope_last, root_last, shared).await;
+    let last_reply = sync_root_pending(
+      &rig,
+      *scope_last,
+      root_last,
+      ".tributaries-sync-distinct-last",
+    )
+    .await;
     let last = tokio::time::timeout(Duration::from_secs(3), last_reply)
       .await
       .expect("the (cap+1)-th refusal resolves promptly, never pends behind the write hold")
       .expect("the driver replies");
     assert!(
       matches!(last, Err(crate::error::SyncRootError::CleanupBacklog)),
-      "the same-name write past the cap is refused — id-dedup counts each once, got {last:?}"
+      "the write past the cap is refused — id-counting counts each once, got {last:?}"
     );
 
     // Cleanup: release the hold so the held writes drain, then drop the receivers.
