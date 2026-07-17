@@ -315,26 +315,32 @@ async fn registry_reclaims_on_unwatch_cycles() {
 }
 
 /// `request_set_cover` is the non-blocking, REPLY-LESS prompt path: it `try_send`s a
-/// reply-less `SetCover` and reports whether the control channel accepted it — `true` with room,
-/// `false` when full or closed (or foreign), never blocking or panicking.
+/// reply-less `SetCover` and reports the tri-state [`RequestOutcome`] — `Enqueued` with room,
+/// `Busy` when the channel is momentarily full (the caller retries), and `Rejected` when it can
+/// NEVER be enqueued (a foreign brand or a closed watcher — the caller drops the intent).
+/// Distinguishing `Busy` from `Rejected` is what lets a caller retry genuine backpressure while
+/// dropping never-valid work; collapsing them (the retired `bool`) was the growth vector.
+/// Never blocks or panics.
 #[tokio::test]
 async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
   let (watcher, commands) = manual_watcher();
   let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
 
-  // A foreign handle is refused without touching the channel.
+  // A foreign handle is REJECTED (never retryable) without touching the channel.
   let foreign = RootHandle::new(
     watcher.instance.wrapping_add(1),
     ScopeId::new(1.try_into().unwrap()),
   );
-  assert!(
-    !watcher.request_set_cover(foreign, vec![PathBuf::from("/r/a")]),
-    "a foreign handle is refused"
+  assert_eq!(
+    watcher.request_set_cover(foreign, vec![PathBuf::from("/r/a")]),
+    RequestOutcome::Rejected,
+    "a foreign handle is rejected — never retryable"
   );
 
-  // With room, the prompt request enqueues a REPLY-LESS SetCover and reports success.
-  assert!(
+  // With room, the prompt request ENQUEUES a REPLY-LESS SetCover.
+  assert_eq!(
     watcher.request_set_cover(handle, vec![PathBuf::from("/r/a")]),
+    RequestOutcome::Enqueued,
     "the channel has room"
   );
   match commands.try_recv().expect("a command was enqueued") {
@@ -353,44 +359,58 @@ async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
     _ => panic!("expected a SetCover command"),
   }
 
-  // Saturate the bounded(16) channel: further prompts are refused (false), never blocking.
+  // Saturate the bounded(16) channel: a full channel is BUSY (transient — the caller retries, it
+  // does NOT drop the request), never blocking.
   for _ in 0..16 {
-    assert!(watcher.request_set_cover(handle, vec![PathBuf::from("/r/full")]));
+    assert_eq!(
+      watcher.request_set_cover(handle, vec![PathBuf::from("/r/full")]),
+      RequestOutcome::Enqueued
+    );
   }
-  assert!(
-    !watcher.request_set_cover(handle, vec![PathBuf::from("/r/overflow")]),
-    "a full channel refuses the prompt"
+  assert_eq!(
+    watcher.request_set_cover(handle, vec![PathBuf::from("/r/overflow")]),
+    RequestOutcome::Busy,
+    "a full channel is Busy — a genuine caller retries, never dropped"
   );
 
-  // A closed channel is likewise refused, never a panic.
+  // A closed channel is REJECTED (the driver is gone — never retryable), never a panic.
   drop(commands);
-  assert!(
-    !watcher.request_set_cover(handle, vec![PathBuf::from("/r/closed")]),
-    "a closed channel refuses the prompt"
+  assert_eq!(
+    watcher.request_set_cover(handle, vec![PathBuf::from("/r/closed")]),
+    RequestOutcome::Rejected,
+    "a closed channel is rejected — retrying can never succeed"
   );
 }
 
-/// `request_unwatch` is the non-blocking, REPLY-LESS teardown twin of the awaited `unwatch` (
-/// ): it `try_send`s a reply-less `Unwatch` and reports whether the control channel accepted it —
-/// `true` with room, `false` when full or closed (or foreign) — never blocking or panicking. The
-/// enqueued command carries `reply: None`, marking it fire-and-forget for the driver.
+/// `request_unwatch` is the non-blocking, REPLY-LESS teardown twin of the awaited `unwatch`: it
+/// `try_send`s a reply-less `Unwatch` and reports the tri-state [`RequestOutcome`] — `Enqueued`
+/// with room, `Busy` when the channel is momentarily full (the caller retries), and `Rejected`
+/// when it can NEVER be enqueued (a foreign brand or a closed watcher — the caller drops the
+/// intent). Distinguishing `Busy` from `Rejected` is what lets a caller retry genuine backpressure
+/// while dropping never-valid work; collapsing them (the retired `bool`) was the growth vector.
+/// The enqueued command carries `reply: None`, marking it fire-and-forget for the driver.
 #[tokio::test]
 async fn request_unwatch_is_reply_less_and_reports_channel_capacity() {
   let (watcher, commands) = manual_watcher();
   let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
 
-  // A foreign handle is refused without touching the channel.
+  // A foreign handle is REJECTED (never retryable) without touching the channel.
   let foreign = RootHandle::new(
     watcher.instance.wrapping_add(1),
     ScopeId::new(1.try_into().unwrap()),
   );
-  assert!(
-    !watcher.request_unwatch(foreign),
-    "a foreign handle is refused"
+  assert_eq!(
+    watcher.request_unwatch(foreign),
+    RequestOutcome::Rejected,
+    "a foreign handle is rejected — never retryable"
   );
 
-  // With room, the request enqueues a REPLY-LESS Unwatch and reports success.
-  assert!(watcher.request_unwatch(handle), "the channel has room");
+  // With room, the request ENQUEUES a REPLY-LESS Unwatch.
+  assert_eq!(
+    watcher.request_unwatch(handle),
+    RequestOutcome::Enqueued,
+    "the channel has room"
+  );
   match commands.try_recv().expect("a command was enqueued") {
     Command::Unwatch { scope, reply } => {
       assert_eq!(scope, handle.scope());
@@ -402,20 +422,23 @@ async fn request_unwatch_is_reply_less_and_reports_channel_capacity() {
     _ => panic!("expected an Unwatch command"),
   }
 
-  // Saturate the bounded(16) channel: further requests are refused (false), never blocking.
+  // Saturate the bounded(16) channel: a full channel is BUSY (transient — the caller retries, it
+  // does NOT drop the request), never blocking.
   for _ in 0..16 {
-    assert!(watcher.request_unwatch(handle));
+    assert_eq!(watcher.request_unwatch(handle), RequestOutcome::Enqueued);
   }
-  assert!(
-    !watcher.request_unwatch(handle),
-    "a full channel refuses the request"
+  assert_eq!(
+    watcher.request_unwatch(handle),
+    RequestOutcome::Busy,
+    "a full channel is Busy — a genuine caller retries, never dropped"
   );
 
-  // A closed channel is likewise refused, never a panic.
+  // A closed channel is REJECTED (the driver is gone — never retryable), never a panic.
   drop(commands);
-  assert!(
-    !watcher.request_unwatch(handle),
-    "a closed channel refuses the request"
+  assert_eq!(
+    watcher.request_unwatch(handle),
+    RequestOutcome::Rejected,
+    "a closed channel is rejected — retrying can never succeed"
   );
 }
 

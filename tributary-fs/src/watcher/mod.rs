@@ -71,6 +71,29 @@ impl RootHandle {
   }
 }
 
+/// The disposition of a non-blocking, reply-less control request
+/// ([`request_unwatch`](Watcher::request_unwatch),
+/// [`request_set_cover`](Watcher::request_set_cover)).
+///
+/// It splits the fire-and-forget outcome into the distinction a caller must act on:
+/// [`Busy`](Self::Busy) is TRANSIENT — the control channel is momentarily full, so the caller
+/// re-tries at its next opportunity — whereas [`Rejected`](Self::Rejected) is PERMANENT — a foreign
+/// handle's brand, or a closed watcher, can never accept the request, so the intent must be dropped.
+/// Collapsing the two (reading every non-acceptance as retryable backpressure) is what lets a
+/// foreign handle be re-queued forever; keeping them apart at the boundary lets every present and
+/// future caller drop never-valid work at its door while still honoring genuine backpressure.
+#[must_use]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestOutcome {
+  /// Accepted onto the control channel.
+  Enqueued,
+  /// The control channel is momentarily full — retry at the next opportunity.
+  Busy,
+  /// The request can never be enqueued: a foreign handle (another watcher's
+  /// brand) or a closed watcher. Do not retry; drop the intent.
+  Rejected,
+}
+
 /// How an awaited coverage reconcile ([`Watcher::set_cover`]) completed.
 ///
 /// The acknowledgement is an **effect-completion fence**: for a reconcile that
@@ -874,20 +897,28 @@ impl<R> Watcher<R> {
   /// control channel, that awaited `unwatch` resolves only once the driver has processed this
   /// teardown and reclaimed the registry entry.
   ///
-  /// Returns `false` when the control channel is full (the caller re-tries at its next
-  /// opportunity) or closed, or when `root` is a foreign handle; `true` when the request was
-  /// enqueued. Never blocks and never panics.
-  pub fn request_unwatch(&self, root: RootHandle) -> bool {
+  /// Reports the request's [`RequestOutcome`]: [`Enqueued`](RequestOutcome::Enqueued) when the
+  /// control channel accepted it; [`Busy`](RequestOutcome::Busy) when the channel is momentarily
+  /// full, so the caller re-tries at its next opportunity; [`Rejected`](RequestOutcome::Rejected)
+  /// when the request can NEVER be enqueued — `root` is a foreign handle (another watcher's brand)
+  /// or the watcher is closed — so the caller must drop the intent rather than retry. Never blocks
+  /// and never panics.
+  pub fn request_unwatch(&self, root: RootHandle) -> RequestOutcome {
+    // A foreign handle's scope number can name THIS watcher's unrelated root — reject it (never
+    // retryable) before touching the channel, exactly as the awaited `unwatch` does.
     if root.instance() != self.instance {
-      return false;
+      return RequestOutcome::Rejected;
     }
-    self
-      .commands
-      .try_send(Command::Unwatch {
-        scope: root.scope(),
-        reply: None,
-      })
-      .is_ok()
+    match self.commands.try_send(Command::Unwatch {
+      scope: root.scope(),
+      reply: None,
+    }) {
+      Ok(()) => RequestOutcome::Enqueued,
+      // A momentarily full channel is TRANSIENT — the caller re-tries at its next opportunity.
+      Err(async_channel::TrySendError::Full(_)) => RequestOutcome::Busy,
+      // A closed channel means the driver is gone — retrying can never succeed.
+      Err(async_channel::TrySendError::Closed(_)) => RequestOutcome::Rejected,
+    }
   }
   /// Places a **sync cookie** — the kernel-mediated barrier marker — inside
   /// `dir` (which must lie within `root`'s coverage) and resolves with the
@@ -1122,28 +1153,36 @@ impl<R> Watcher<R> {
   ///
   /// The driver applies a reply-less `SetCover` exactly like the awaited one — the same in-place
   /// bidirectional reconcile, the same latest-wins ordering against other covers of the root —
-  /// it simply sends no acknowledgement: `true` says the request was ENQUEUED, nothing about
-  /// when (or whether) the retained cover's kernel coverage is live. A caller that must know —
-  /// to write into a just-regrown subtree without racing the re-arm — awaits
-  /// [`set_cover`](Self::set_cover) instead, whose acknowledgement is the effect-completion
+  /// it simply sends no acknowledgement: an [`Enqueued`](RequestOutcome::Enqueued) outcome says the
+  /// request was accepted, nothing about when (or whether) the retained cover's kernel coverage is
+  /// live. A caller that must know — to write into a just-regrown subtree without racing the re-arm
+  /// — awaits [`set_cover`](Self::set_cover) instead, whose acknowledgement is the effect-completion
   /// fence; a reconcile requested here still participates in that fence's bookkeeping (its
   /// window is observed at the next settlement), it just has no reply to resolve.
   ///
-  /// Returns `false` when the control channel is full (the caller re-tries at its next
-  /// opportunity) or closed, or when `root` is a foreign handle; `true` when the request was
-  /// enqueued. Never blocks and never panics.
-  pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> bool {
+  /// Reports the request's [`RequestOutcome`]: [`Enqueued`](RequestOutcome::Enqueued) when the
+  /// control channel accepted it; [`Busy`](RequestOutcome::Busy) when the channel is momentarily
+  /// full, so the caller re-tries at its next opportunity; [`Rejected`](RequestOutcome::Rejected)
+  /// when the request can NEVER be enqueued — `root` is a foreign handle (another watcher's brand)
+  /// or the watcher is closed — so the caller must drop the intent rather than retry. Never blocks
+  /// and never panics.
+  pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> RequestOutcome {
+    // A foreign handle's scope number can name THIS watcher's unrelated root — reject it (never
+    // retryable) before touching the channel, exactly as the awaited `set_cover` does.
     if root.instance() != self.instance {
-      return false;
+      return RequestOutcome::Rejected;
     }
-    self
-      .commands
-      .try_send(Command::SetCover {
-        scope: root.scope(),
-        retained,
-        reply: None,
-      })
-      .is_ok()
+    match self.commands.try_send(Command::SetCover {
+      scope: root.scope(),
+      retained,
+      reply: None,
+    }) {
+      Ok(()) => RequestOutcome::Enqueued,
+      // A momentarily full channel is TRANSIENT — the caller re-tries at its next opportunity.
+      Err(async_channel::TrySendError::Full(_)) => RequestOutcome::Busy,
+      // A closed channel means the driver is gone — retrying can never succeed.
+      Err(async_channel::TrySendError::Closed(_)) => RequestOutcome::Rejected,
+    }
   }
 
   /// The driver is gone (its command channel closed without an orderly

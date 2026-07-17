@@ -824,6 +824,295 @@ mod integration {
       "downcast_ref recovers the same concrete fs error"
     );
   }
+
+  /// (S1-i) HOSTILE FOREIGN-FLOOD — bounds the `disarm`/`set_cover` deferral structures at their doors. A hostile
+  /// direct caller floods both with FRESH, distinct FOREIGN brands (handles minted by a SECOND
+  /// watcher, so `root_path` answers `None` for every one). Each dies at its door, so none of the
+  /// four deferral structures grows with the flood size `N` — they stay bounded by the live-OWN-root
+  /// count (here 1, and this source never disarms its own root, so the bound is 0).
+  ///
+  /// Fail-on-old: against the genuine pre-S1 code (the fire-and-forget `bool` everywhere, no doors)
+  /// both structures grow monotonically to `N` and the `<= 1` bound assertions fail. Reverting only
+  /// the `disarm` door regrows `pending_releases` on its own; the `set_cover` half needs the whole
+  /// `bool` collapse (the door AND the request-site `Rejected` arm), because with the tri-state kept
+  /// a foreign `set_cover` is `Rejected`, never `Busy`, so nothing defers even with the door gone.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_hostile_foreign_flood_stays_bounded() {
+    const N: usize = 8;
+    // This source (A) with exactly ONE live own root — the whole flood is foreign, so nothing it
+    // admits can land in a deferral structure.
+    let (_dir_own, own) = scratch();
+    let mut source =
+      FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource A");
+    source
+      .arm(&path_components(&own))
+      .await
+      .expect("arm the one own root");
+
+    // A SECOND source (B) mints 2N distinct FOREIGN brands, split into DISJOINT sets for the disarm
+    // flood and the set_cover flood: a `disarm` dead-marks its handle in `pending_set`, which would
+    // early-return a later `set_cover` of the SAME handle — so sharing brands would mask the
+    // set_cover door's growth under the old code and defeat the fail-on-old.
+    let (_dir_b, parent_b) = scratch();
+    let mut foreign =
+      FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource B");
+    let mut disarm_brands = Vec::new();
+    let mut cover_brands = Vec::new();
+    for i in 0..(2 * N) {
+      let sub = parent_b.join(format!("f{i}"));
+      std::fs::create_dir_all(&sub).expect("create foreign subroot");
+      let handle = foreign
+        .arm(&path_components(&sub))
+        .await
+        .expect("arm foreign subroot")
+        .handle();
+      if i % 2 == 0 {
+        disarm_brands.push(handle);
+      } else {
+        cover_brands.push(handle);
+      }
+    }
+
+    // The flood: every brand is a fresh, distinct FOREIGN handle — the exact unbounded-growth vector.
+    let cover = path_components(&own);
+    for &fh in &disarm_brands {
+      source.disarm(fh);
+    }
+    for &fh in &cover_brands {
+      source.set_cover(fh, std::slice::from_ref(&cover));
+    }
+
+    // Every foreign disarm/prune died at its door: none of the four structures grew with N.
+    assert!(
+      source.pending_releases.len() <= 1,
+      "pending_releases stays bounded by live own roots — foreign disarms dropped at the door \
+       (flood N={N}), got {}",
+      source.pending_releases.len()
+    );
+    assert!(
+      source.enqueued.len() <= 1,
+      "enqueued stays bounded (nothing foreign was ever handed over), got {}",
+      source.enqueued.len()
+    );
+    assert!(
+      source.pending_set.len() <= 1,
+      "pending_set stays bounded — a foreign disarm never dead-marks (flood N={N}), got {}",
+      source.pending_set.len()
+    );
+    assert!(
+      source.deferred_prunes.len() <= 1,
+      "deferred_prunes stays bounded — foreign prunes dropped at the door (flood N={N}), got {}",
+      source.deferred_prunes.len()
+    );
+  }
+
+  /// (S1-ii) FRONT-WEDGE — prevents permanent starvation of genuine releases. A foreign brand
+  /// sitting at the FRONT of `pending_releases` (injected directly: the `disarm` door would refuse it
+  /// at entry, so this white-box setup exercises the drain-side belt-and-suspenders kill) must not
+  /// wedge the queue. The opportunistic drain sees the foreign `request_unwatch` as `Rejected`, DROPS
+  /// it, and CONTINUES — so the genuine release queued behind it is handed to the in-flight sidecar
+  /// on the SAME arm.
+  ///
+  /// Fail-on-old: revert the drain's `Rejected`-drop to a re-front-and-break and the foreign entry
+  /// re-fronts forever — the genuine release never reaches the sidecar and the drain assertion fails
+  /// (no hang: a single bounded arm, then the structures are inspected).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_front_wedge_foreign_entry_does_not_starve_genuine_release() {
+    let (_dir_a, root_a) = scratch();
+    let mut source =
+      FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource A");
+    // A GENUINE own live root to release.
+    let genuine = source
+      .arm(&path_components(&root_a))
+      .await
+      .expect("arm the genuine root")
+      .handle();
+
+    // A FOREIGN brand from a second watcher.
+    let (_dir_b, root_b) = scratch();
+    let mut foreign_src =
+      FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource B");
+    let foreign = foreign_src
+      .arm(&path_components(&root_b))
+      .await
+      .expect("arm the foreign root")
+      .handle();
+
+    // Inject the foreign entry at the FRONT, then queue the genuine release behind it via a real
+    // `disarm` (its door passes — the root is live) → order [foreign, genuine].
+    source
+      .pending_releases
+      .push_back((foreign, Some(root_b.clone())));
+    source.pending_set.insert(foreign);
+    source.disarm(genuine);
+    assert_eq!(
+      source.pending_releases.len(),
+      2,
+      "the foreign wedge sits ahead of the genuine release"
+    );
+
+    // Arm a DISJOINT key: the opportunistic drain (budget 2) drops the foreign (Rejected) and hands
+    // over the genuine (Enqueued) on this same arm.
+    let (_dir_d, d) = scratch();
+    source
+      .arm(&path_components(&d))
+      .await
+      .expect("arm the disjoint trigger");
+
+    assert!(
+      source.enqueued.iter().any(|(h, _)| *h == genuine),
+      "the genuine release drained past the foreign wedge into the in-flight sidecar"
+    );
+    assert!(
+      !source.pending_releases.iter().any(|(h, _)| *h == foreign),
+      "the foreign entry was DROPPED, not re-fronted (no permanent wedge)"
+    );
+    assert!(
+      !source.pending_set.contains(&foreign),
+      "the foreign entry's dead-mark went with it"
+    );
+  }
+
+  /// (S1-iii) DEAD-OWN DISARM DOOR. Disarming a handle whose OWN root has already died (the watcher
+  /// tore it down, so `root_path` answers `None`) drops the disarm at the door: nothing is queued or
+  /// dead-marked, and both `root_key` and `root_path` keep answering `None` for it (no panic, no
+  /// leak, no wedge).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_dead_own_disarm_door_retains_nothing() {
+    // An outer dir holds the watched root so deleting the root does not unlink the tempdir out from
+    // under the still-open handle.
+    let (_dir, outer) = scratch();
+    let root = outer.join("watched");
+    std::fs::create_dir_all(&root).expect("create the watched root");
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    let handle = source
+      .arm(&path_components(&root))
+      .await
+      .expect("arm the watched root")
+      .handle();
+    std::fs::remove_dir_all(&root).expect("delete the watched root");
+
+    // Wait (bounded) until the watcher forgets the dead root — `root_key` answering `None` is the
+    // source-level observation that the driver tore it down.
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while source.root_key(handle).is_some() {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the deleted root was never torn down"
+      );
+      tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Disarm the now-dead handle: the door drops it entirely.
+    source.disarm(handle);
+    assert!(
+      source.pending_releases.is_empty(),
+      "a dead-own disarm queues no release"
+    );
+    assert!(
+      !source.pending_set.contains(&handle),
+      "a dead-own disarm leaves no dead-mark"
+    );
+    assert_eq!(
+      source.root_key(handle),
+      None,
+      "root_key still answers None for the dead handle"
+    );
+    assert_eq!(
+      source.watcher.root_path(handle),
+      None,
+      "root_path still answers None for the dead handle"
+    );
+  }
+
+  /// (S1-iv) BUSY PRESERVED. A genuine release that meets a momentarily FULL control channel must be
+  /// re-fronted and RETRIED — never dropped (dropping is reserved for `Rejected`/never-valid work).
+  /// On a CURRENT-THREAD runtime the driver cannot run between synchronous calls, so the channel is
+  /// filled deterministically: the arm's drain sees `Busy`, re-fronts the genuine release (it stays
+  /// queued, nothing enqueued), and the NEXT arm — after the channel drained during the previous
+  /// arm's blocking watch — hands it over. This is exactly the old full-channel backpressure,
+  /// unchanged.
+  #[tokio::test(flavor = "current_thread")]
+  async fn fs_source_busy_release_re_fronts_and_retries() {
+    let (_dir, parent) = scratch();
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+
+    // Four disjoint sibling roots: one to flood the channel (kept live, never disarmed), one genuine
+    // release, and two disjoint arm triggers.
+    let make = |name: &str| {
+      let p = parent.join(name);
+      std::fs::create_dir_all(&p).expect("create subroot");
+      p
+    };
+    let fill = make("fill");
+    let rel = make("rel");
+    let trig1 = make("trig1");
+    let trig2 = make("trig2");
+    let fill_h = source
+      .arm(&path_components(&fill))
+      .await
+      .expect("arm the fill root")
+      .handle();
+    let rel_h = source
+      .arm(&path_components(&rel))
+      .await
+      .expect("arm the release root")
+      .handle();
+
+    // Fill the control channel to capacity via prompt `set_cover` on the live fill root. The driver
+    // is not scheduled between these synchronous calls (current-thread, no await), so the moment one
+    // call DEFERS (its `request_set_cover` returned `Busy`) the channel is full — robust to the exact
+    // capacity.
+    let fill_cover = path_components(&fill);
+    let mut guard = 0;
+    while source.deferred_prunes.is_empty() {
+      source.set_cover(fill_h, std::slice::from_ref(&fill_cover));
+      guard += 1;
+      assert!(
+        guard < 1000,
+        "the bounded channel should fill well before this"
+      );
+    }
+
+    // Queue a genuine release behind the now-full channel.
+    source.disarm(rel_h);
+    assert!(
+      source.pending_releases.iter().any(|(h, _)| *h == rel_h),
+      "the genuine release is queued"
+    );
+
+    // Arm a disjoint trigger: the drain hits the FULL channel, gets `Busy`, and RE-FRONTS the genuine
+    // release (it is NOT dropped). The watch's own blocking send then drains the channel (the driver
+    // runs during that await), but the drain already broke — the release stays queued.
+    source
+      .arm(&path_components(&trig1))
+      .await
+      .expect("arm the first trigger");
+    assert!(
+      source.pending_releases.iter().any(|(h, _)| *h == rel_h),
+      "a Busy drain RE-FRONTS the genuine release — Busy is not Rejected, so it is never dropped"
+    );
+    assert!(
+      !source.enqueued.iter().any(|(h, _)| *h == rel_h),
+      "the Busy release was not handed over"
+    );
+
+    // Arm another disjoint trigger: the channel drained during the previous arm, so the drain now
+    // gets `Enqueued` and hands the genuine release over — the retry succeeds (semantics unchanged).
+    source
+      .arm(&path_components(&trig2))
+      .await
+      .expect("arm the second trigger");
+    assert!(
+      source.enqueued.iter().any(|(h, _)| *h == rel_h),
+      "the re-fronted release drains on the next opportunity — Busy backpressure retries, unchanged"
+    );
+    assert!(
+      !source.pending_releases.iter().any(|(h, _)| *h == rel_h),
+      "the genuine release left the queue once the channel had room"
+    );
+  }
 }
 
 /// The reserved namespace is the binding's business: it renders a cookie's
