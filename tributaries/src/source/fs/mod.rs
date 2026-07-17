@@ -16,9 +16,9 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
-  CoverOutcome, Event as FsEvent, EventKind as FsEventKind, ReplaceRootError, RootHandle,
-  SkipReason, SourceError, SyncRootError, UnwatchError as FsUnwatchError, WatchRootError, Watcher,
-  WatcherOptions,
+  CoverOutcome, Event as FsEvent, EventKind as FsEventKind, ReplaceRootError, RequestOutcome,
+  RootHandle, SkipReason, SourceError, SyncRootError, UnwatchError as FsUnwatchError,
+  WatchRootError, Watcher, WatcherOptions,
 };
 use tributary_proto::Interest;
 
@@ -52,10 +52,14 @@ pub struct FsSource<R> {
   /// (identity-aware — it catches case/normalization aliases) and retrying. The only release work a
   /// single arm AWAITS is (2) — bounded by that arm's OWN overlapping conflicts, never the (disjoint)
   /// backlog — so a caller-bounded `Watch`, and any [`close`](crate::Tributaries::close) queued behind
-  /// it, never waits on unrelated teardown latency. A `None` path means the root
-  /// was already torn down when disarmed; it can never be the *named* conflict, so it is applied only
-  /// opportunistically (or at `Drop`, where the [`Watcher`]'s own teardown releases every live root).
-  /// Bounded in practice by the live-root count: each generation-unique handle is released at most once.
+  /// it, never waits on unrelated teardown latency. The [`disarm`](Source::disarm) DOOR drops any
+  /// release whose root already answered [`root_path`](tributary_fs::Watcher::root_path) `None` (a
+  /// foreign brand or an already-torn-down own root), so every entry here carries `Some(path)` and
+  /// names a live-at-disarm root of THIS instance — the stored path is always present for the (2)
+  /// exact-match (the `Option` is the shape shared with [`enqueued`](Self::enqueued); the door makes
+  /// `Some` an invariant, not merely a possibility). Bounded by the live-root count: each
+  /// generation-unique handle is released at most once, and a hostile `disarm(fresh_foreign)` flood
+  /// adds nothing — every foreign disarm dies at the door.
   pending_releases: VecDeque<(RootHandle, Option<PathBuf>)>,
   /// Requested releases whose reply-less [`request_unwatch`](tributary_fs::Watcher::request_unwatch)
   /// the control channel ACCEPTED but the watcher registry may not yet reflect — the **in-flight**
@@ -159,12 +163,23 @@ impl<R> FsSource<R> {
     #[cfg(test)]
     let mut forwards = 0usize;
     self.deferred_prunes.retain(|handle, retained| {
-      let enqueued = watcher.request_set_cover(*handle, retained.clone());
-      #[cfg(test)]
-      if enqueued {
-        forwards += 1;
+      match watcher.request_set_cover(*handle, retained.clone()) {
+        // Forwarded onto the control channel — drop the deferral (its work is on its way).
+        RequestOutcome::Enqueued => {
+          #[cfg(test)]
+          {
+            forwards += 1;
+          }
+          false
+        }
+        // The channel is momentarily full — keep the deferral for the next flush (clause 3). This
+        // is the ONLY retain: a genuinely full channel is transient, so a genuine prune re-tries.
+        RequestOutcome::Busy => true,
+        // A dead or foreign root (never enqueueable): pruning it is pointless (clause 5 does not
+        // require prune losslessness). DROP it — a retained never-valid entry drives the
+        // monotone growth (the retired `bool` read this as backpressure and re-tried it forever).
+        RequestOutcome::Rejected => false,
       }
-      !enqueued
     });
     #[cfg(test)]
     {
@@ -253,12 +268,24 @@ impl<R> Source<OsString> for FsSource<R> {
         break;
       };
       // `entry.0` is `Copy` (a `RootHandle`), so the try_send borrows nothing of `entry`.
-      if self.watcher.request_unwatch(entry.0) {
-        self.enqueued.push(entry);
-      } else {
-        // Channel full/closed: return the entry to the FRONT (FIFO preserved) and stop.
-        self.pending_releases.push_front(entry);
-        break;
+      match self.watcher.request_unwatch(entry.0) {
+        // Accepted onto the control channel: move queue → in-flight sidecar (the success path).
+        RequestOutcome::Enqueued => self.enqueued.push(entry),
+        // The channel is momentarily full: return the entry to the FRONT (FIFO preserved) and
+        // stop — the driver drains concurrently, so a later arm retries it (backpressure, clause
+        // 5's eventual application). This is the ONLY re-front: a full channel is transient.
+        RequestOutcome::Busy => {
+          self.pending_releases.push_front(entry);
+          break;
+        }
+        // Never enqueueable — a foreign brand or a closed watcher. DROP the entry AND its
+        // dead-mark, then CONTINUE (do NOT re-front): re-fronting a never-valid entry wedges the
+        // queue permanently and starves every genuine release behind it.
+        // The `disarm` door already keeps foreign brands out of the queue; this is the
+        // belt-and-suspenders drain-side kill, and it lets the genuine releases behind it drain.
+        RequestOutcome::Rejected => {
+          self.pending_set.remove(&entry.0);
+        }
       }
     }
     // (b)+(c) Arm the root, resolving on demand any `Overlaps` the watcher reports against a
@@ -356,20 +383,29 @@ impl<R> Source<OsString> for FsSource<R> {
     // released root's canonical path captured NOW, while the root is still live in the registry — never
     // apply it inline. A later `arm` hands it to the watcher via the NON-BLOCKING `request_unwatch`
     // (the common path, which awaits nothing), or — if that arm's key overlaps this release — resolves
-    // the conflict the watcher NAMES by awaiting exactly its `unwatch` (contract clause 2); `Drop` releases whatever is left (the `Watcher`'s own teardown reclaims every live
-    // root). A `None` path means the root is already gone (`root_path` answers `None`): it can never be
-    // the named conflict, so it is only applied opportunistically. The `pending_set` mirror makes the
-    // handle logically dead the instant this returns — `root_key` answers `None`. Idempotent by the
-    // set: re-requesting an already-pending (or unknown/dead) handle is a no-op.
+    // the conflict the watcher NAMES by awaiting exactly its `unwatch` (contract clause 2); `Drop`
+    // releases whatever is left (the `Watcher`'s own teardown reclaims every live root). The
+    // `pending_set` mirror makes the handle logically dead the instant this returns — `root_key`
+    // answers `None`. Idempotent by the set: re-requesting an already-pending handle is a no-op.
     //
     // A queued PRUNE of the released handle is superseded by the release (set_cover contract
     // clause 4 — the whole root is going away), and a disarm is a watcher-touching op, so the other
     // deferred prunes get their non-blocking re-forward here too (clause 3).
     self.deferred_prunes.remove(&handle);
     self.flush_deferred_prunes();
+    // DOOR: `root_path` answers `None` for a foreign brand OR an already-torn-down own handle. Drop
+    // the disarm ENTIRELY for either — no `pending_releases` entry, no `pending_set` mark: a
+    // `None`-path entry can never be the named `Overlaps` conflict (its only effect was a no-op
+    // `request_unwatch`), and `root_key` correctness is preserved because `root_path` already
+    // answers `None` for the handle. Post-door invariant: every `pending_releases` entry carries
+    // `Some(path)` and names a live-at-disarm root of THIS instance — so the queue (and its
+    // `pending_set` mirror) is bounded by the live-root count, and a hostile `disarm(fresh_foreign)`
+    // flood retains nothing (every foreign disarm dies at the door).
+    let Some(root_path) = self.watcher.root_path(handle) else {
+      return;
+    };
     if self.pending_set.insert(handle) {
-      let root_path = self.watcher.root_path(handle);
-      self.pending_releases.push_back((handle, root_path));
+      self.pending_releases.push_back((handle, Some(root_path)));
     }
   }
 
@@ -493,6 +529,13 @@ impl<R> Source<OsString> for FsSource<R> {
     if self.pending_set.contains(&handle) {
       return;
     }
+    // DOOR: `root_path` answers `None` for a foreign brand OR an already-torn-down own root. A prune
+    // of such a root is pointless — clause 5 does not require prune losslessness — so drop it at the
+    // door rather than queue or defer it. Deferring never-valid work drives the monotone
+    // `deferred_prunes` growth.
+    if self.watcher.root_path(handle).is_none() {
+      return;
+    }
     // This request SUPERSEDES any queued older snapshot for the same handle (latest-wins,
     // clause 6) — drop it BEFORE the flush. Were the stale entry left for the flush, a full
     // channel there followed by room for the direct request below would leave the stale
@@ -501,8 +544,15 @@ impl<R> Source<OsString> for FsSource<R> {
     self.deferred_prunes.remove(&handle);
     self.flush_deferred_prunes();
     let paths: Vec<PathBuf> = retained.iter().map(|key| key_to_path(key)).collect();
-    if !self.watcher.request_set_cover(handle, paths.clone()) {
-      self.defer_prune(handle, paths);
+    match self.watcher.request_set_cover(handle, paths.clone()) {
+      // Forwarded onto the control channel — nothing to defer.
+      RequestOutcome::Enqueued => {}
+      // The channel is momentarily full: fall back to the latest-wins deferral queue (clause 3),
+      // re-forwarded at the next watcher-touching op.
+      RequestOutcome::Busy => self.defer_prune(handle, paths),
+      // A closed watcher (the door already excluded foreign/dead roots): never enqueueable, so
+      // drop rather than defer — a deferral that can never forward grows without bound.
+      RequestOutcome::Rejected => {}
     }
   }
 
