@@ -218,6 +218,17 @@ pub enum SyncRootError {
   /// resolves.
   #[error("a sync cookie write is already in flight for this root")]
   WriteInFlight,
+  /// A live sync obligation of this watcher already holds this cookie name —
+  /// admitting a second would make cancel-by-name ambiguous and could target
+  /// another root's sync. The name is freed when the holding obligation reaches
+  /// its terminal (its cookie confirmed removed, or the sync retired), so
+  /// sequential reuse of a name admits; concurrent syncs need distinct names
+  /// (the umbrella's minted names are always distinct).
+  #[error("cookie name {name:?} is already held by a live sync of this watcher")]
+  NameInUse {
+    /// The contested name as supplied.
+    name: String,
+  },
   /// This root has too many unremoved cookies: its cleanup owner is retrying
   /// failing unlinks (a pathological filesystem where writes succeed but unlinks
   /// keep failing), and the per-root backlog cap has been reached. Retryable —
