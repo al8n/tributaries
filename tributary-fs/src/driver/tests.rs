@@ -4682,10 +4682,10 @@ mod sync_cookie {
     panic!("the single-flight gate never admitted the sync");
   }
 
-  /// The finding-2 retain cells' config: a retry delay LONG enough to observe the retained
-  /// `RemoveFailed` record before the driver's OWN retry fires, yet finite so that retry still
-  /// confirms within a [`settle`] window. (The `tuned_config`'s 5 ms retry would race the
-  /// retain observation.)
+  /// The finding-2 retain cells' config: a retry delay comfortably inside a [`settle`] window's
+  /// budget, so the driver's own retry still confirms without a hang. The cells bracket their
+  /// retained-state observation with holds rather than timing it against this delay, so no
+  /// specific value is load-bearing for their determinism.
   fn retain_config() -> DriverConfig {
     DriverConfig {
       cookie_retry_base: Duration::from_millis(200),
@@ -5519,9 +5519,6 @@ mod sync_cookie {
   // fire-and-forget unlink ignored every error, silently stranding the file.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_transient_unlink_failure_retains_the_cookie_until_it_succeeds() {
-    // The retain config's 200ms base gives a comfortable window to observe the
-    // RETAINED record before the driver's own retry fires (the default 100ms
-    // base would race that observation).
     let rig = rig_with_config(64, retain_config());
     let scope = watch(&rig, "/r").await;
 
@@ -5530,32 +5527,51 @@ mod sync_cookie {
       .expect("the write lands");
     assert_eq!(cookie_count(&rig).await, 1, "the registry owns the cookie");
 
-    // The next unlink fails once; the reap dispatches it and it is refused.
+    // Hold every remove so the first (about to be refused) dispatch is captured in flight,
+    // deterministically, rather than racing the driver's own retry to observe it.
+    let hold = rig.fs.hold_cookie_removes();
     rig.fs.fail_next_cookie_removes(1);
     rig.cleanup.request_remove(&path);
     settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    let first_dispatch = rig.fs.cookie_remove_dispatches();
+
+    // Arm a hold for the driver's OWN retry BEFORE releasing the first attempt, so that whenever
+    // its backoff fires — however long the test task stalls in between — the retry is captured
+    // in flight too, rather than racing the RETAINED-state observation below.
+    let retry_hold = rig.fs.hold_cookie_removes();
+    hold.release();
+
+    settle(|| rig.fs.cookie_remove_dispatches() == 2).await;
+    let dispatches_before_retry_runs = rig.fs.cookie_remove_dispatches();
+    let removed_before_retry = rig.fs.cookie_removes();
+    let retained_count = cookie_count(&rig).await;
+    let file_present = !rig.fs.files_under("/r").is_empty();
+    retry_hold.release();
+
     assert_eq!(
-      rig.fs.cookie_remove_dispatches(),
-      1,
+      first_dispatch, 1,
       "the unlink reached the pool and was refused"
     );
     assert!(
-      rig.fs.cookie_removes().is_empty(),
+      removed_before_retry.is_empty(),
       "a failed unlink records no removal"
     );
     assert_eq!(
-      cookie_count(&rig).await,
-      1,
+      retained_count, 1,
       "the record is RETAINED across the transient failure — never orphaned"
     );
     assert!(
-      !rig.fs.files_under("/r").is_empty(),
+      file_present,
       "the file is still on disk, still eligible for a retry"
     );
+    assert_eq!(
+      dispatches_before_retry_runs, 2,
+      "exactly two dispatches so far: the failed attempt and the driver's own retry, held before it runs"
+    );
 
-    // No second request is needed: the DRIVER OWNS the retry (finding 3). It re-dispatches the
-    // unlink on its own backed-off schedule, which now succeeds and drops the record — the
-    // requester never asks twice (the old design's requester-driven re-reap is gone).
+    // No second request is needed: the DRIVER OWNS the retry (finding 3). Released, it succeeds
+    // and drops the record — the requester never asks twice (the old design's requester-driven
+    // re-reap is gone).
     settle(|| rig.fs.cookie_removes().contains(&path)).await;
     assert!(
       rig.fs.cookie_removes().contains(&path),
@@ -5564,7 +5580,7 @@ mod sync_cookie {
     assert_eq!(
       rig.fs.cookie_remove_dispatches(),
       2,
-      "exactly two dispatches: the failed attempt and the driver's own retry"
+      "still exactly two dispatches: the failed attempt and the driver's own retry"
     );
     settle(|| rig.fs.files_under("/r").is_empty()).await;
     assert_eq!(
@@ -6092,6 +6108,15 @@ mod sync_cookie {
       "the mark is consumed, not re-set in a loop"
     );
 
+    // The real dispatch count is the discriminator an unconditional re-arm spin would fail: one
+    // attempt at budget 0, plus exactly the one serviced arming's own attempt — never a third.
+    settle(|| rig.fs.cookie_remove_dispatches() == 2).await;
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      2,
+      "exactly two attempts: the original arming and the one arming the serviced mark granted"
+    );
+
     // Over a generous window the state is stable: the mark stays 0 and the record stays one parked
     // obligation (a spin would keep re-marking or churn the count).
     for _ in 0..20 {
@@ -6107,6 +6132,95 @@ mod sync_cookie {
       !rig.fs.files_under("/r").is_empty(),
       "the file is still on the failing fs",
     );
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      2,
+      "still exactly two dispatches after the stability window — a spin would have kept climbing"
+    );
+  }
+
+  // The mark/wake protocol's OTHER completion route: a cancel that lands while a write sits in
+  // the pool marks that write's own in-pool record, and the sole wake token is consumed by the
+  // coalescing sweep that finds it InPool (the mark is what the landing claim is meant to read).
+  // If the claim then refuses on that mark and its self-reap's own unlink ALSO fails, the record
+  // survives parked with the mark STILL SET, so its completion reaches `schedule_retry` through
+  // the write-done call site rather than the remove-done one every mark+retry-exhaustion cell
+  // above drives. This pins the single-request, umbrella-reachable shape: the one servicing
+  // clause must consume the mark from either call site, not just the remove-done one.
+  //
+  // Fail-on-old (schedule_retry parks a marked record past the budget without consuming the
+  // mark): the mark stays set with an empty wake channel and `retry_at` None, so nothing left
+  // ever re-examines it — `reap_marks` never returns to 0 and the bounded settle-then-assert
+  // below fails (does not hang).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_mark_surviving_a_refused_claims_failed_self_reap_is_serviced_at_write_done() {
+    let mut config = tuned_config();
+    config.cookie_retry_budget = 0;
+    let rig = rig_with_config(64, config);
+    let scope = watch(&rig, "/r").await;
+
+    let name = ".tributaries-sync-strand-writedone";
+    let path = PathBuf::from("/r").join(name);
+
+    // Hold the write in the pool: DISPATCHED, not yet claimed.
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    settle(|| rig.fs.cookie_dispatches() == 1).await;
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      1,
+      "the write is in the pool, not yet claimed"
+    );
+
+    // Cancel by name while it is in the pool: marks the InPool record, and the sole wake token is
+    // consumed by the coalescing sweep that finds it InPool.
+    rig.cleanup.request_cancel(name);
+    settle_reap_marks(&rig, 1).await;
+    assert_eq!(
+      reap_marks(&rig).await,
+      1,
+      "an in-pool write's cancel marks its own obligation"
+    );
+
+    // Arm the unlink to fail BEFORE releasing the write: the refused claim's self-reap must fail
+    // too, so the record survives parked instead of retiring with the mark.
+    rig.fs.fail_cookie_removes_under("/r");
+
+    // Release: the claim reads the mark and REFUSES; the self-reap re-asserts the record and
+    // unlinks; that unlink FAILS; the record parks RemoveFailed still carrying the mark, and its
+    // `CookieWriteDone` reaches `schedule_retry` with attempts 1 > budget 0 — exhaustion at the
+    // write-done call site.
+    hold.release();
+    assert!(
+      matches!(
+        on_reply.await.expect("the driver replies"),
+        Err(crate::error::SyncRootError::Retired)
+      ),
+      "the mark forced the claim to refuse — the reply is Retired"
+    );
+
+    // NEW: the exhaustion clause consumes the standing mark from this call site too. OLD: it
+    // stays stranded at 1, with no wake and no deadline to ever revisit it — this bounded
+    // settle-then-assert is the fail-fast discriminator.
+    settle_reap_marks(&rig, 0).await;
+    assert_eq!(
+      reap_marks(&rig).await,
+      0,
+      "the mark survived the failed self-reap and is serviced at the write-done exhaustion"
+    );
+
+    // No leak: heal the fs, a fresh reap drives the serviced-then-parked record to its typed
+    // terminal.
+    rig.fs.clear_cookie_remove_failures_under("/r");
+    rig.cleanup.request_remove(&path);
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the serviced-then-healed cookie reaps to its terminal"
+    );
+    assert!(rig.fs.files_under("/r").is_empty(), "no file survives");
+    assert_census_balances(&rig, "a mark serviced at write-done exhaustion").await;
   }
 
   // Finding 1 (fs half): a cancel that arrives while the write is STILL IN THE POOL marks that
@@ -6256,30 +6370,40 @@ mod sync_cookie {
     let name = ".tributaries-sync-2-1-1";
     // Hold the write, then abandon the caller so its `reply.send(Ok)` will FAIL when the write
     // lands — the reply-fail self-reap path.
-    let hold = rig.fs.hold_cookie_writes();
+    let write_hold = rig.fs.hold_cookie_writes();
     let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
     settle(|| rig.fs.cookie_dispatches() == 1).await;
     drop(on_reply);
-    // The self-reap's own unlink FAILS once.
+    // The self-reap's own unlink FAILS once. Hold every remove so its dispatch is captured in
+    // flight, deterministically, rather than racing the driver's own retry to observe it.
     rig.fs.fail_next_cookie_removes(1);
-    hold.release();
-
+    let remove_hold = rig.fs.hold_cookie_removes();
+    write_hold.release();
     settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+
+    // Arm a hold for the driver's OWN retry BEFORE releasing the self-reap's attempt, so that
+    // whenever its backoff fires — however long the test task stalls in between — the retry is
+    // captured in flight too, rather than racing the RETAINED-state observation below.
+    let retry_hold = rig.fs.hold_cookie_removes();
+    remove_hold.release();
+
+    settle(|| rig.fs.cookie_remove_dispatches() == 2).await;
+    let dispatches_before_retry_runs = rig.fs.cookie_remove_dispatches();
+    let retained_count = cookie_count(&rig).await;
+    let file_present = !rig.fs.files_under("/r").is_empty();
+    retry_hold.release();
+
     assert_eq!(
-      rig.fs.cookie_remove_dispatches(),
-      1,
-      "the self-reap attempt reached the pool and failed"
+      dispatches_before_retry_runs, 2,
+      "the self-reap attempt reached the pool and failed, then the driver's own retry \
+       dispatched, held before it runs"
     );
     // The record is RETAINED as failed while the file is still present — never orphaned.
     assert_eq!(
-      cookie_count(&rig).await,
-      1,
+      retained_count, 1,
       "ownership is retained across the failed self-reap"
     );
-    assert!(
-      !rig.fs.files_under("/r").is_empty(),
-      "the file is still on disk, still retry-owned"
-    );
+    assert!(file_present, "the file is still on disk, still retry-owned");
 
     // The driver retries ON ITS OWN and confirms — no external request.
     settle(|| rig.fs.files_under("/r").is_empty()).await;
@@ -6309,7 +6433,7 @@ mod sync_cookie {
     let name = ".tributaries-sync-2-2-1";
     // The write must be IN the pool before the scope retires (a still-parked write is revoked at
     // its fence instead of self-reaping).
-    let hold = rig.fs.hold_cookie_writes();
+    let write_hold = rig.fs.hold_cookie_writes();
     let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
     settle(|| rig.fs.cookie_dispatches() == 1).await;
 
@@ -6326,26 +6450,42 @@ mod sync_cookie {
     assert!(on_unwatch.await.unwrap(), "the live scope was unwatched");
 
     // The refused self-reap's unlink FAILS once: the file must be OWNED as failed, not orphaned.
+    // Hold every remove so the self-reap's dispatch is captured in flight, deterministically,
+    // rather than racing the driver's own retry to observe it. The claim-refused path runs its
+    // self-reap to completion BEFORE sending the write's reply, so `remove_hold` must release —
+    // letting that first attempt actually fail — before `on_reply` is awaited below, or the
+    // reply would never come.
     rig.fs.fail_next_cookie_removes(1);
-    hold.release();
+    let remove_hold = rig.fs.hold_cookie_removes();
+    write_hold.release();
+    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+
+    // Arm a hold for the driver's OWN retry BEFORE releasing the self-reap's attempt, so that
+    // whenever its backoff fires — however long the test task stalls in between — the retry is
+    // captured in flight too, rather than racing the RETAINED-state observation below.
+    let retry_hold = rig.fs.hold_cookie_removes();
+    remove_hold.release();
+    let claim_reply = on_reply.await.expect("the driver replies");
+
+    settle(|| rig.fs.cookie_remove_dispatches() == 2).await;
+    let dispatches_before_retry_runs = rig.fs.cookie_remove_dispatches();
+    let owned_count = cookie_count(&rig).await;
+    let file_present = !rig.fs.files_under("/r").is_empty();
+    retry_hold.release();
+
     assert!(
-      matches!(
-        on_reply.await.expect("the driver replies"),
-        Err(crate::error::SyncRootError::Retired)
-      ),
+      matches!(claim_reply, Err(crate::error::SyncRootError::Retired)),
       "the retiring scope refused the claim"
     );
-
-    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
     assert_eq!(
-      cookie_count(&rig).await,
-      1,
+      dispatches_before_retry_runs, 2,
+      "the refused self-reap failed, then the driver's own retry dispatched, held before it runs"
+    );
+    assert_eq!(
+      owned_count, 1,
       "the refused-and-failed self-reap OWNS the file, never orphans it"
     );
-    assert!(
-      !rig.fs.files_under("/r").is_empty(),
-      "the file is still present, retry-owned"
-    );
+    assert!(file_present, "the file is still present, retry-owned");
 
     // The retry is scope-INDEPENDENT — the scope is gone, yet the driver removes the file.
     settle(|| rig.fs.files_under("/r").is_empty()).await;

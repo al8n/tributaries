@@ -955,8 +955,12 @@ impl<R> Watcher<R> {
   /// normal component; [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) when
   /// `dir` is not inside the root (including via `..` traversal);
   /// [`Write`](SyncRootError::Write) when the create fails (a read-only tree
-  /// surfaces as `PermissionDenied`); [`Retired`](SyncRootError::Retired) when
-  /// the root died while the write was parked; [`Closed`](SyncRootError::Closed)
+  /// surfaces as `PermissionDenied`); [`WriteInFlight`](SyncRootError::WriteInFlight)
+  /// when a physical write for this root is already in flight;
+  /// [`NameInUse`](SyncRootError::NameInUse) when a live sync of this watcher
+  /// already holds `name`; [`CleanupBacklog`](SyncRootError::CleanupBacklog) when
+  /// the root's cookie cleanup backlog cap is reached; [`Retired`](SyncRootError::Retired)
+  /// when the root died while the write was parked; [`Closed`](SyncRootError::Closed)
   /// once the watcher is closed.
   pub async fn sync_root(
     &self,
