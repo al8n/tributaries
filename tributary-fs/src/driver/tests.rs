@@ -2487,6 +2487,288 @@ mod descending {
         let _ = spammer.await;
       }
     }
+
+    // A parked sync is a ledger obligation from admission. Birth is admission,
+    // not dispatch: a sync admitted onto its settle fence is a full obligation —
+    // counted by the global cap Φ, marked by a cancel, swept by teardown and
+    // close — before any write reaches the pool. These cells hold a sync PARKED
+    // (a held grow keeps the scope un-settled) and pin the pre-dispatch lifecycle
+    // end to end. The birth-at-dispatch predecessor has no record for a parked
+    // sync, so `park_a_sync`'s count assertion is the shared fail-on-old
+    // discriminator for every cell below.
+
+    /// The ledger's live obligation count, read end to end (the global gauge Φ).
+    async fn debug_cookie_count(rig: &Rig) -> usize {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugCookieCount { reply })
+        .await
+        .unwrap();
+      on_reply.await.expect("the driver replies")
+    }
+
+    /// The birth/terminal census paired with the live record count.
+    async fn debug_census(rig: &Rig) -> (Census, usize) {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugCookieCensus { reply })
+        .await
+        .unwrap();
+      on_reply.await.expect("the driver replies")
+    }
+
+    /// Settles until the ledger holds exactly `target` obligations.
+    async fn settle_count(rig: &Rig, target: usize) {
+      for _ in 0..200 {
+        if debug_cookie_count(rig).await == target {
+          return;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    }
+
+    /// Admits a sync that PARKS on its scope's coverage-settle fence: a held grow
+    /// keeps `/r/drop`'s re-install in flight, so the coverage never settles and
+    /// the admitted write cannot dispatch. Returns the arm hold (release it to let
+    /// the fence settle) and the caller's reply receiver.
+    ///
+    /// The sync is genuinely ADMITTED — its obligation is born and parked — but no
+    /// write has reached the pool. The `count == 1` assertion here is the whole
+    /// suite's fail-on-old anchor: on birth-at-dispatch a parked sync has no
+    /// record, so this count stays 0 and every cell below fails.
+    async fn park_a_sync(
+      rig: &Rig,
+      scope: ScopeId,
+      name: &str,
+    ) -> (
+      HoldRelease,
+      futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>>,
+    ) {
+      let hold = rig.fs.hold_arms();
+      let _ack = send_set_cover(rig, scope, &["/r/keep", "/r/drop"]).await;
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from("/r"),
+          name: name.to_owned(),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle_count(rig, 1).await;
+      assert_eq!(
+        debug_cookie_count(rig).await,
+        1,
+        "a parked sync is a counted obligation from admission, before any write dispatches"
+      );
+      assert!(
+        rig.fs.cookie_writes().is_empty(),
+        "no write is dispatched while the sync is parked"
+      );
+      (hold, on_reply)
+    }
+
+    /// The parked obligation is a counted, pre-physical record, and its dispatch
+    /// is a TRANSITION of that record — never a second birth. Admission births it
+    /// `Parked`, the settle moves it `Parked → InPool` under the SAME id, and the
+    /// census counts exactly one birth across the whole life.
+    ///
+    /// Fail-on-old (birth-at-dispatch): while parked there is no record, so
+    /// `park_a_sync`'s `count == 1` — and the census `births == 1` here — both fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_sync_is_one_counted_obligation_and_dispatch_only_transitions_it() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+      let (hold, on_reply) = park_a_sync(&rig, scope, ".tributaries-sync-parked-1").await;
+
+      // The birth is counted structurally, with no dispatch yet.
+      let (census, live) = debug_census(&rig).await;
+      assert_eq!(
+        (census.births, live),
+        (1, 1),
+        "admission births the parked obligation; the global gauge counts it in one term"
+      );
+      assert!(
+        census.balances(live),
+        "the census balances a parked, pre-physical record"
+      );
+
+      // Release the fence: the SAME record transitions to the pool and its write
+      // lands. Dispatch is a transition, not a birth.
+      hold.release();
+      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the write lands once the fence settles")
+        .expect("the driver replies")
+        .expect("the parked sync dispatches and claims");
+      assert_eq!(path, PathBuf::from("/r/.tributaries-sync-parked-1"));
+      let (census, _) = debug_census(&rig).await;
+      assert_eq!(
+        census.births, 1,
+        "the settle moved the record Parked → InPool under one id — one birth for the whole life"
+      );
+    }
+
+    /// T13: cancelling a sync while it is PARKED marks its obligation and retires
+    /// it `NeverCreated` — nothing physical was ever created — answering the caller
+    /// `Retired`, dispatching no write, unlinking nothing. The cancel folds into
+    /// the phase machine: the mark rides the record, the driver's reap handling
+    /// retires it.
+    ///
+    /// Fail-on-old (birth-at-dispatch): the parked sync has no record to mark or
+    /// count, so the census `(births, never_created) == (1, 1)` fails (it is
+    /// `(0, 0)`), as does `park_a_sync`'s count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_of_a_parked_sync_retires_it_never_created() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+      let name = ".tributaries-sync-parked-cancel";
+      let (hold, on_reply) = park_a_sync(&rig, scope, name).await;
+
+      // Cancel by name while parked: the reap lane marks the obligation and the
+      // driver retires it pre-physically, answering the caller Retired.
+      rig
+        .cookie_removes
+        .send(CookieReap::Cancel(name.to_owned()))
+        .await
+        .unwrap();
+      assert!(
+        matches!(
+          tokio::time::timeout(Duration::from_secs(5), on_reply)
+            .await
+            .expect("the cancel resolves the parked caller")
+            .expect("the driver replies"),
+          Err(crate::error::SyncRootError::Retired)
+        ),
+        "a cancel of a parked sync answers Retired"
+      );
+
+      settle_count(&rig, 0).await;
+      let (census, live) = debug_census(&rig).await;
+      assert_eq!(
+        (census.births, census.never_created, live),
+        (1, 1, 0),
+        "the parked obligation earns the pre-physical NeverCreated terminal"
+      );
+      assert!(
+        census.balances(live),
+        "births = terminals + live across the cancel"
+      );
+      assert!(
+        rig.fs.cookie_writes().is_empty(),
+        "no write was ever dispatched for the cancelled parked sync"
+      );
+      assert!(
+        rig.fs.cookie_removes().is_empty(),
+        "and nothing physical existed to unlink — a parked record is never unlinked"
+      );
+      // Release the held arm so the pool drains; nothing more can dispatch.
+      hold.release();
+    }
+
+    /// Tearing down a scope while its sync is PARKED retires the obligation
+    /// `NeverCreated` and answers the caller `Retired`: the teardown degrades the
+    /// sync's fence, and the next settle observation finds the scope gone, reaching
+    /// the same pre-physical terminal — no write ever dispatched, nothing to unlink.
+    ///
+    /// Fail-on-old (birth-at-dispatch): no record is born or counted for the parked
+    /// sync, so the census `(births, never_created) == (1, 1)` fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unwatching_a_scope_with_a_parked_sync_retires_it_never_created() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+      let (hold, on_reply) = park_a_sync(&rig, scope, ".tributaries-sync-parked-unwatch").await;
+
+      let (reply, on_unwatch) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      assert!(
+        matches!(
+          tokio::time::timeout(Duration::from_secs(5), on_reply)
+            .await
+            .expect("the teardown resolves the parked caller")
+            .expect("the driver replies"),
+          Err(crate::error::SyncRootError::Retired)
+        ),
+        "a scope torn down under a parked sync answers it Retired"
+      );
+
+      settle_count(&rig, 0).await;
+      let (census, live) = debug_census(&rig).await;
+      assert_eq!(
+        (census.births, census.never_created, live),
+        (1, 1, 0),
+        "the torn-down scope's parked obligation earns NeverCreated"
+      );
+      assert!(
+        census.balances(live),
+        "births = terminals + live across the teardown"
+      );
+      assert!(
+        rig.fs.cookie_writes().is_empty() && rig.fs.cookie_removes().is_empty(),
+        "no write was dispatched and nothing physical existed to unlink"
+      );
+      hold.release();
+      let _ = tokio::time::timeout(Duration::from_secs(5), on_unwatch).await;
+    }
+
+    /// Closing while a sync is PARKED retires the obligation (the close sweep
+    /// reaches it before the drain) and answers the caller `Retired`, so a
+    /// pre-physical record never wedges close nor is mistaken for a hung cookie:
+    /// close reports a clean quiescent count.
+    ///
+    /// Fail-on-old (birth-at-dispatch): the parked sync has no record, so
+    /// `park_a_sync`'s `count == 1` before close fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_with_a_parked_sync_retires_it_and_reports_quiescent() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+      let (hold, on_reply) = park_a_sync(&rig, scope, ".tributaries-sync-parked-close").await;
+
+      // The parked obligation is counted right up to the close sweep.
+      assert_eq!(
+        debug_cookie_count(&rig).await,
+        1,
+        "the parked sync is a counted obligation the close sweep must resolve"
+      );
+
+      let (reply, on_close) = futures_channel::oneshot::channel();
+      rig.commands.send(Command::Close { reply }).await.unwrap();
+      assert!(
+        matches!(
+          tokio::time::timeout(Duration::from_secs(5), on_reply)
+            .await
+            .expect("close resolves the parked caller")
+            .expect("the driver replies"),
+          Err(crate::error::SyncRootError::Retired)
+        ),
+        "close answers a parked sync Retired"
+      );
+      let outstanding = tokio::time::timeout(Duration::from_secs(5), on_close)
+        .await
+        .expect("close returns within grace")
+        .expect("the driver replies");
+      assert_eq!(
+        outstanding, 0,
+        "the parked obligation was retired at close, never counted as a non-quiesced cookie"
+      );
+      assert!(
+        rig.fs.cookie_writes().is_empty() && rig.fs.cookie_removes().is_empty(),
+        "no write was dispatched and nothing physical existed to unlink"
+      );
+      hold.release();
+    }
   }
 
   /// The descending replace end to end: the new root pre-arms on the NEW
@@ -4242,6 +4524,31 @@ mod sync_cookie {
       .await
       .unwrap();
     on_reply.await.expect("the driver replies")
+  }
+
+  /// A throwaway core, only for minting the settle fences a direct-registry cell's
+  /// admissions park on — these cells build a ledger state by hand, with no driver
+  /// loop to settle anything.
+  fn fence_source() -> DriverCore {
+    DriverCore::new(Duration::from_millis(1), Duration::from_secs(30))
+  }
+
+  /// Admits one sync and dispatches its write, straight against the registry: the
+  /// two steps a live driver runs — BIRTH at admission (parked on a fence) and the
+  /// `Parked → InPool` transition at that fence's settle — for the cells that need
+  /// an in-pool write without a driver loop. Panics if the dispatch refuses, which
+  /// for a freshly admitted, unmarked obligation cannot happen.
+  fn dispatched_guard(
+    reg: &mut CookieRegistry<FakeFs>,
+    core: &mut DriverCore,
+    scope: ScopeId,
+    name: &str,
+  ) -> CookieGuard {
+    let fence = core.open_cover_fence(scope);
+    let id = reg.admit_parked(scope, name.to_owned(), fence);
+    reg
+      .dispatch_guard(scope, id)
+      .expect("a freshly admitted obligation dispatches")
   }
 
   /// Dispatches a sync without awaiting it, holding on to the reply receiver —
@@ -6682,20 +6989,21 @@ mod sync_cookie {
   async fn a_delayed_claim_never_displaces_a_live_same_path_successor() {
     let fs = FakeFs::new(1);
     let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut core = fence_source();
     let scope_a = ScopeId::new(NonZeroU64::new(1).unwrap());
     let scope_b = ScopeId::new(NonZeroU64::new(2).unwrap());
     let name = ".tributaries-sync-h1";
     let path = PathBuf::from("/r").join(name);
 
     // Write A dispatched and created its file at P; its claim is not run yet.
-    let guard_a = reg.dispatch_guard(scope_a, name.to_owned());
+    let guard_a = dispatched_guard(&mut reg, &mut core, scope_a, name);
     fs.put(&path, FileKind::File, 1);
     // A's file is externally deleted before A ever claims.
     fs.remove(&path);
 
     // Write B (a different scope) lands at the SAME path and claims: its file is
     // the live one now.
-    let guard_b = reg.dispatch_guard(scope_b, name.to_owned());
+    let guard_b = dispatched_guard(&mut reg, &mut core, scope_b, name);
     fs.put(&path, FileKind::File, 2);
     let id_b = guard_b.claim(&path).expect("B claims the live file");
     {
@@ -6764,6 +7072,7 @@ mod sync_cookie {
   async fn a_confirm_retire_is_id_keyed_and_spares_a_same_path_successor() {
     let fs = FakeFs::new(1);
     let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut core = fence_source();
     let scope_n = ScopeId::new(NonZeroU64::new(1).unwrap());
     let scope_m = ScopeId::new(NonZeroU64::new(2).unwrap());
     let name = ".tributaries-sync-aba-structural";
@@ -6771,7 +7080,7 @@ mod sync_cookie {
 
     // Incarnation N claims P, then its removal is in flight (its unlink ran, so
     // the file is gone) but its confirm has not yet landed.
-    let guard_n = reg.dispatch_guard(scope_n, name.to_owned());
+    let guard_n = dispatched_guard(&mut reg, &mut core, scope_n, name);
     fs.put(&path, FileKind::File, 1);
     let id_n = guard_n.claim(&path).expect("N claims P");
     {
@@ -6785,7 +7094,7 @@ mod sync_cookie {
     fs.remove(&path); // N's unlink physically ran
 
     // Incarnation M reclaims the same path and owns the live file.
-    let guard_m = reg.dispatch_guard(scope_m, name.to_owned());
+    let guard_m = dispatched_guard(&mut reg, &mut core, scope_m, name);
     fs.put(&path, FileKind::File, 2);
     let id_m = guard_m.claim(&path).expect("M reclaims P");
 
@@ -6831,12 +7140,13 @@ mod sync_cookie {
   async fn a_stale_self_reap_never_unlinks_a_successor_cookie() {
     let fs = FakeFs::new(1);
     let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut core = fence_source();
     let scope = ScopeId::new(NonZeroU64::new(7).unwrap());
     let name = ".tributaries-sync-stale-selfreap";
     let path = PathBuf::from("/r").join(name);
 
     // A real claim inserts record M (Owned) at P.
-    let guard = reg.dispatch_guard(scope, name.to_owned());
+    let guard = dispatched_guard(&mut reg, &mut core, scope, name);
     let m = guard.claim(&path).expect("the claim lands");
     let stale = CookieId(m.0 + 999);
 
@@ -7353,15 +7663,15 @@ mod sync_cookie {
   // ==== R11-2: the whole-lifecycle global cap (cells 8–10) ====
 
   // Hung (blocking, unclaimed) cookie WRITES count against the global cap: the
-  // admission gauge is the whole lifecycle — every dispatched write is a counted obligation
-  // + `parked_cookies.len()` — not just claimed `owned` records. Three held
+  // admission gauge Φ is the whole lifecycle in one term — every dispatched write
+  // is a counted `InPool` obligation, not just claimed `owned` records. Three held
   // writes fill a cap of 3, so the fourth is refused promptly (an honest,
   // retryable `Busy`) rather than piling a fourth blocking job on the pool.
   //
-  // Fail-on-old (the gauge reverted to `cookies.unremoved()`): with the writes
-  // held, `unremoved() == 0` (nothing claimed), so the 4th write is admitted,
-  // dispatched, and PARKS behind the hold — its reply never resolves, and the
-  // prompt-error assertion times out. Deterministic.
+  // Fail-on-old (the gauge counted only claimed records): with the writes held,
+  // nothing is claimed, so the gauge would read 0, the 4th write would be
+  // admitted, dispatched, and PARK behind the hold — its reply never resolving,
+  // and the prompt-error assertion timing out. Deterministic.
   #[tokio::test(flavor = "multi_thread")]
   async fn hung_writes_count_against_the_global_cap() {
     // global_cap = 3, backlog_cap = 8 (the per-scope cap never binds — each scope
@@ -7566,17 +7876,18 @@ mod sync_cookie {
   async fn the_write_gate_opens_at_the_claim_and_never_uncounts_the_obligation() {
     let fs = FakeFs::new(1);
     let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut core = fence_source();
     let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
     let other = ScopeId::new(NonZeroU64::new(2).unwrap());
     let path = PathBuf::from("/r/.tributaries-sync-gate");
 
     // Dispatch: the write's obligation is born `InPool`, shutting its own scope's gate.
-    let guard = reg.dispatch_guard(scope, ".tributaries-sync-gate".to_owned());
+    let guard = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-gate");
     assert!(
-      reg.has_in_pool_write(scope),
+      reg.has_pending_write(scope),
       "a dispatched write shuts its scope's gate"
     );
-    assert!(!reg.has_in_pool_write(other), "the gate is per scope");
+    assert!(!reg.has_pending_write(other), "the gate is per scope");
     assert_eq!(
       reg.unremoved(),
       1,
@@ -7587,7 +7898,7 @@ mod sync_cookie {
     // whole of the widening.
     let id = guard.claim(&path).expect("the claim lands");
     assert!(
-      !reg.has_in_pool_write(scope),
+      !reg.has_pending_write(scope),
       "the gate opens at the claim, not at the completion tail"
     );
     assert!(
@@ -7605,9 +7916,9 @@ mod sync_cookie {
 
     // A second write for the scope may now dispatch: ONE write job (this one) alongside the
     // first write's completing tail — never two write jobs.
-    let second = reg.dispatch_guard(scope, ".tributaries-sync-gate-2".to_owned());
+    let second = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-gate-2");
     assert!(
-      reg.has_in_pool_write(scope),
+      reg.has_pending_write(scope),
       "the second write shuts the gate again"
     );
     assert_eq!(reg.unremoved(), 2, "both obligations are counted");
@@ -7616,7 +7927,7 @@ mod sync_cookie {
     // with it — the other way out of `InPool`.
     lock_ledger(&reg.ledger).retire(second.id, Reaped::NeverCreated);
     assert!(
-      !reg.has_in_pool_write(scope),
+      !reg.has_pending_write(scope),
       "a never-created write's terminal opens the gate"
     );
     assert_eq!(reg.unremoved(), 1, "…and leaves nothing counted behind it");
@@ -7756,15 +8067,16 @@ mod sync_cookie {
   async fn the_abnormal_backstop_types_and_counts_what_it_sweeps() {
     let fs = FakeFs::new(1);
     let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut core = fence_source();
     let ledger = Arc::clone(&reg.ledger);
     let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
 
     // One claimed cookie, and one write still in the pool.
-    let claimed = reg.dispatch_guard(scope, ".tributaries-sync-abnormal-1".to_owned());
+    let claimed = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-abnormal-1");
     let path = PathBuf::from("/r/.tributaries-sync-abnormal-1");
     fs.put(&path, FileKind::File, 1);
     claimed.claim(&path).expect("the claim lands");
-    let _in_pool = reg.dispatch_guard(scope, ".tributaries-sync-abnormal-2".to_owned());
+    let _in_pool = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-abnormal-2");
     assert_eq!(reg.unremoved(), 2, "both obligations are counted");
 
     drop(reg);
