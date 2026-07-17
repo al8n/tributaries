@@ -1268,7 +1268,10 @@ impl<F: FsOps> CookieRegistry<F> {
   ///   terminal is the caller-answering one [`retire_parked_cookies`] runs.
   /// - `InPool` — only the write knows where its cookie will land, so nothing is
   ///   dispatched. The mark is what its claim reads, refuses on, and self-reaps
-  ///   against; it dies with the record.
+  ///   against; it usually dies with the record, but if that self-reap's unlink
+  ///   fails the record survives carrying the mark, which the failing arming's
+  ///   budget-exhaustion completion then services (see
+  ///   [`CookieRegistry::schedule_retry`]).
   /// - `Removing` / SCHEDULED `RemoveFailed` — an unlink or a deadline already
   ///   owns this record's fate, so the request COALESCES onto it. The mark stays,
   ///   and the arming that owns the record services it: on retire the mark dies
