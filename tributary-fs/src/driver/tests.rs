@@ -1,6 +1,6 @@
 use super::{testing::*, *};
 use std::{
-  collections::{BTreeMap, BTreeSet},
+  collections::BTreeSet,
   num::{NonZeroU64, NonZeroUsize},
   sync::Arc,
   time::Duration,
@@ -4281,17 +4281,41 @@ mod sync_cookie {
     on_reply.await.expect("the driver replies")
   }
 
-  /// How many cancel tombstones the driver currently holds. The boundedness oracle: a tombstone
-  /// exists only for a write provably in the pool, and its own completion (or its claim) sweeps
-  /// it — so this returns to zero after every cancel ordering.
-  async fn cancel_tombstones(rig: &Rig) -> usize {
+  /// How many obligations the driver currently holds a reap mark on. The boundedness oracle: a
+  /// mark can only be set on an obligation that exists, and dies with it — so this returns to
+  /// zero after every cancel ordering, whatever the interleaving.
+  async fn reap_marks(rig: &Rig) -> usize {
     let (reply, on_reply) = futures_channel::oneshot::channel();
     rig
       .commands
-      .send(Command::DebugCookieCancelTombstones { reply })
+      .send(Command::DebugCookieReapMarks { reply })
       .await
       .unwrap();
     on_reply.await.expect("the driver replies")
+  }
+
+  /// The birth/terminal census plus the live record count — the census-equation oracle.
+  async fn cookie_census(rig: &Rig) -> (Census, usize) {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugCookieCensus { reply })
+      .await
+      .unwrap();
+    on_reply.await.expect("the driver replies")
+  }
+
+  /// Asserts the census equation over everything the driver has done so far: every obligation ever
+  /// born is accounted for exactly once — by one of the three typed terminals, or as a record still
+  /// live. It can only hold if EVERY removal went through `retire` naming its evidence, so it is
+  /// the standing structural proof that no obligation ever vanishes untyped.
+  async fn assert_census_balances(rig: &Rig, scenario: &str) -> Census {
+    let (census, live) = cookie_census(rig).await;
+    assert!(
+      census.balances(live),
+      "census equation broken after {scenario}: {census:?} with {live} live",
+    );
+    census
   }
 
   /// Settles until the OWNED-cookie count reaches `target` — the async analogue of [`settle`],
@@ -4307,10 +4331,10 @@ mod sync_cookie {
     }
   }
 
-  /// Settles until the cancel-tombstone count reaches `target`.
-  async fn settle_tombstones(rig: &Rig, target: usize) {
+  /// Settles until the reap-mark count reaches `target`.
+  async fn settle_reap_marks(rig: &Rig, target: usize) {
     for _ in 0..200 {
-      if cancel_tombstones(rig).await == target {
+      if reap_marks(rig).await == target {
         return;
       }
       tokio::task::yield_now().await;
@@ -5471,10 +5495,13 @@ mod sync_cookie {
     admit_sync(&rig, scope, "/r", ".tributaries-sync-1-1-2").await;
   }
 
-  // Finding 1 (fs half): a cancel that arrives while the write is STILL IN THE POOL tombstones
-  // the name; when the write lands, its claim consumes the tombstone and is REFUSED, so the write
-  // self-reaps the file it just created. The refusal is driven by the tombstone alone (the caller
+  // Finding 1 (fs half): a cancel that arrives while the write is STILL IN THE POOL marks that
+  // write's own obligation; when the write lands, its claim reads the mark and is REFUSED, so the
+  // write self-reaps the file it just created. The refusal is driven by the mark alone (the caller
   // is kept alive), which is why the reply reads `Retired`.
+  //
+  // Fail-on-old (the claim ignores its record's mark): the claim is admitted, the cookie survives
+  // as an owned record, and both the `Retired` reply and the empty-directory assertion fail.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_cancel_while_the_write_is_in_the_pool_makes_it_self_reap() {
     let rig = rig_with_capacity(64);
@@ -5491,28 +5518,35 @@ mod sync_cookie {
       "the write is in the pool, not yet claimed"
     );
 
-    // Cancel by name while it is in the pool: it is not owned, so the driver TOMBSTONES it.
+    // Cancel by name while it is in the pool: the write's obligation exists (it was born at
+    // dispatch), so the cancel MARKS it. Nothing is dispatched — only the write knows where its
+    // cookie will land.
     rig
       .cookie_removes
       .send(CookieReap::Cancel(name.to_owned()))
       .await
       .unwrap();
-    settle_tombstones(&rig, 1).await;
+    settle_reap_marks(&rig, 1).await;
     assert_eq!(
-      cancel_tombstones(&rig).await,
+      reap_marks(&rig).await,
       1,
-      "an in-pool write's cancel is a tombstone"
+      "an in-pool write's cancel marks its own obligation"
+    );
+    assert_eq!(
+      rig.fs.cookie_remove_dispatches(),
+      0,
+      "nothing is unlinked for a write whose path nobody knows yet"
     );
 
-    // Release the held write: its claim CONSUMES the tombstone and is refused, so it self-reaps
-    // the file and answers its still-held caller `Retired`.
+    // Release the held write: its claim READS the mark and is refused, so it self-reaps the file
+    // and answers its still-held caller `Retired`.
     hold.release();
     assert!(
       matches!(
         on_reply.await.expect("the driver replies"),
         Err(crate::error::SyncRootError::Retired)
       ),
-      "the tombstone forced the claim to refuse — the reply is Retired"
+      "the mark forced the claim to refuse — the reply is Retired"
     );
     settle(|| rig.fs.files_under("/r").is_empty()).await;
     assert!(
@@ -5522,23 +5556,25 @@ mod sync_cookie {
     settle_cookie_count(&rig, 0).await;
     assert_eq!(cookie_count(&rig).await, 0, "nothing was left owned");
     assert_eq!(
-      cancel_tombstones(&rig).await,
+      reap_marks(&rig).await,
       0,
-      "the tombstone was consumed by the claim — it never survives its write"
+      "the mark died with the record it marked — it never survives its write"
     );
+    assert_census_balances(&rig, "a cancelled in-pool write").await;
   }
 
-  // The tombstone boundedness rule across all three cancel-versus-write orderings: an
-  // unknown-name cancel creates none, a cancel-then-complete's tombstone is consumed by the
-  // claim, and a complete-then-cancel is an owned reap that never tombstones. Each ends with zero
-  // outstanding tombstones — the bound `|cancelled| <= writes_in_flight` holds.
+  // The reap mark's boundedness rule across all three cancel-versus-write orderings: an
+  // unknown-name cancel marks nothing, a cancel-then-complete's mark is what refuses the claim,
+  // and a complete-then-cancel marks the owned record the same cancel reaps. Each ends with zero
+  // outstanding marks — the bound holds by construction, because a mark exists only as a field of
+  // a live obligation and cannot outlive it.
   #[tokio::test(flavor = "multi_thread")]
-  async fn cancel_tombstones_never_survive_their_writes() {
+  async fn reap_marks_never_survive_their_writes() {
     let rig = rig_with_capacity(64);
     let scope = watch(&rig, "/r").await;
 
-    // Ordering A — cancel an UNKNOWN name: dropped, never a tombstone (the boundedness rule
-    // forbids a tombstone for a write not provably in flight).
+    // Ordering A — cancel an UNKNOWN name: dropped at the lookup. There is no obligation of that
+    // name, so there is nothing a mark could even be stored on.
     rig
       .cookie_removes
       .send(CookieReap::Cancel(".tributaries-sync-nobody".to_owned()))
@@ -5548,13 +5584,13 @@ mod sync_cookie {
       tokio::task::yield_now().await;
     }
     assert_eq!(
-      cancel_tombstones(&rig).await,
+      reap_marks(&rig).await,
       0,
-      "a cancel for an unknown name creates no tombstone"
+      "a cancel for an unknown name marks nothing"
     );
 
-    // Ordering B — cancel-then-complete: the tombstone is created while the write is in the pool,
-    // then CONSUMED by the refused claim.
+    // Ordering B — cancel-then-complete: the mark lands on the in-pool write's obligation, and the
+    // refused claim acts on it.
     {
       let name = ".tributaries-sync-1-3-1";
       let hold = rig.fs.hold_cookie_writes();
@@ -5565,25 +5601,25 @@ mod sync_cookie {
         .send(CookieReap::Cancel(name.to_owned()))
         .await
         .unwrap();
-      settle_tombstones(&rig, 1).await;
+      settle_reap_marks(&rig, 1).await;
       assert_eq!(
-        cancel_tombstones(&rig).await,
+        reap_marks(&rig).await,
         1,
-        "the in-pool write's name is tombstoned"
+        "the in-pool write's own obligation carries the mark"
       );
       hold.release();
       let _ = on_reply.await;
       settle_cookie_count(&rig, 0).await;
-      settle_tombstones(&rig, 0).await;
+      settle_reap_marks(&rig, 0).await;
       assert_eq!(
-        cancel_tombstones(&rig).await,
+        reap_marks(&rig).await,
         0,
-        "the claim consumed the tombstone — it never survives its write"
+        "the mark died with its record — it never survives its write"
       );
     }
 
-    // Ordering C — complete-then-cancel: the write is OWNED first, so the later cancel reaps it
-    // directly and never creates a tombstone.
+    // Ordering C — complete-then-cancel: the write is OWNED first, so the cancel marks that record
+    // and reaps it through the phase machine in the same critical section.
     {
       let name = ".tributaries-sync-1-3-2";
       let path = admit_sync(&rig, scope, "/r", name).await;
@@ -5596,15 +5632,16 @@ mod sync_cookie {
       settle(|| rig.fs.cookie_removes().contains(&path)).await;
       settle_cookie_count(&rig, 0).await;
       assert_eq!(
-        cancel_tombstones(&rig).await,
+        reap_marks(&rig).await,
         0,
-        "an owned-then-cancelled cookie is reaped directly, never tombstoned"
+        "the reaped record took its mark with it"
       );
       assert!(
         rig.fs.files_under("/r").is_empty(),
         "the owned cookie was reaped by the cancel"
       );
     }
+    assert_census_balances(&rig, "the three cancel orderings").await;
   }
 
   // Finding 2: a self-reap for an ABANDONED caller (its `reply.send(Ok)` fails) whose own unlink
@@ -6226,18 +6263,17 @@ mod sync_cookie {
     assert!(rig.fs.files_under("/r").is_empty());
   }
 
-  // A write whose `reply.send(Ok)` fails after it CLAIMED its record is one
-  // physical obligation that briefly appears in two places: the claimed record
-  // (state `Removing`, its self-reap unlink in flight) AND its scope's still-open
-  // `writes_in_flight` slot (cleared only when the write's `CookieWriteDone`
-  // lands, which the hung unlink defers). The close count must tally it ONCE.
+  // A write whose `reply.send(Ok)` fails after it CLAIMED its record is ONE physical
+  // obligation — one record, phase `Removing`, its self-reap unlink in flight — from its
+  // dispatch to its terminal, even though its `CookieWriteDone` is still outstanding behind
+  // the hung unlink. The close count tallies it once because there is only one thing to count.
   #[tokio::test(flavor = "multi_thread")]
   async fn close_counts_a_held_self_reap_obligation_once() {
     let rig = rig_with_capacity(64);
     let scope = watch(&rig, "/r").await;
 
     // Hold the write in the pool so the reply receiver can be dropped in the
-    // window after dispatch (the scope is in `writes_in_flight`) but before the
+    // window after dispatch (the scope's obligation is `InPool`) but before the
     // write lands. The parked write is already past the cover-fence cancel prune,
     // so it still writes, claims, and then finds its reply send failed.
     let write_hold = rig.fs.hold_cookie_writes();
@@ -6478,137 +6514,6 @@ mod sync_cookie {
     );
   }
 
-  // The close obligation count is taken from ONE ledger snapshot, so it can never
-  // report a false `Ok(0)` over a live obligation. The foreclosed race: an owned
-  // record's unlink confirming BETWEEN a read of the owned IDS (which excluded a
-  // same-id in-flight write as the claimed-record de-dup) and a read of `owned`
-  // drops a TWO-snapshot count to zero while that write is still outstanding.
-  //
-  // Form (b), the direct unit: the claimed-self-reap race — one write present in
-  // BOTH the ledger and `writes_in_flight` under a single incarnation id — and the
-  // inter-snapshot window cannot be forced deterministically through the driver,
-  // so the ledger state is built directly and the count asserted at each snapshot
-  // point. Faithful because the count is the whole of what close reports, and the
-  // single-snapshot guarantee is exactly "1 wherever the atomic read falls
-  // relative to the confirm" — asserted below against the torn read that yields 0.
-  #[tokio::test(flavor = "multi_thread")]
-  async fn close_obligation_count_forecloses_a_false_ok_zero() {
-    fn insert_owned(reg: &CookieRegistry<FakeFs>, scope: u64, name: &str, path: &str) -> CookieId {
-      let mut inner = lock_ledger(&reg.ledger);
-      inner.next_cookie_id += 1;
-      let id = CookieId(inner.next_cookie_id);
-      let path = PathBuf::from(path);
-      inner.obligations.insert(
-        id,
-        Obligation {
-          scope: ScopeId::new(NonZeroU64::new(scope).unwrap()),
-          name: name.to_owned(),
-          id,
-          path: Some(path.clone()),
-          last_failure_seq: 0,
-          state: RemovalState::Owned,
-        },
-      );
-      inner.by_name.insert(name.to_owned(), id);
-      inner.by_path.insert(path, id);
-      id
-    }
-    fn writes_in_flight(
-      entries: &[(u64, &str, CookieId)],
-    ) -> BTreeMap<ScopeId, (String, CookieId)> {
-      entries
-        .iter()
-        .map(|(scope, name, id)| {
-          (
-            ScopeId::new(NonZeroU64::new(*scope).unwrap()),
-            ((*name).to_owned(), *id),
-          )
-        })
-        .collect()
-    }
-
-    // The race state: scope 1's write both CLAIMED its record "N" (id X, unlink
-    // unconfirmed) AND still sits in `writes_in_flight` under that same id X — a
-    // reply-failed self-reap mid-flight, the one obligation the dedup governs.
-    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    let id_n = insert_owned(&reg, 1, "N", "/r1/N");
-    let in_flight = writes_in_flight(&[(1, "N", id_n)]);
-    assert_eq!(
-      reg.obligation_count(&in_flight),
-      1,
-      "an outstanding obligation is counted — never a false 0"
-    );
-
-    // The single snapshot is immune to WHERE it falls relative to the owned
-    // record's unlink confirming: drop that record (the confirm) and the same
-    // obligation is STILL counted, now as the in-flight write whose id the ledger
-    // no longer owns. Both snapshot points yield 1.
-    lock_ledger(&reg.ledger).retire(id_n, Reaped::ConfirmedGone);
-    assert_eq!(
-      reg.obligation_count(&in_flight),
-      1,
-      "after the confirm the same obligation is still counted, via the in-flight write"
-    );
-
-    // The foreclosed hazard, made representable: the REPLACED two-snapshot form —
-    // read the owned IDS first (they dedup the same-id in-flight write out), let
-    // the owned unlink confirm, THEN read `owned` — sums to a FALSE 0 with
-    // obligation "N" still in flight. This is the read the single snapshot above
-    // makes unrepresentable.
-    let id_n = insert_owned(&reg, 1, "N", "/r1/N");
-    let in_flight = writes_in_flight(&[(1, "N", id_n)]);
-    let ids_snapshot = {
-      let inner = lock_ledger(&reg.ledger);
-      let owned_ids: std::collections::HashSet<CookieId> =
-        inner.obligations.keys().copied().collect();
-      in_flight
-        .values()
-        .filter(|(_, id)| !owned_ids.contains(id))
-        .count()
-    };
-    lock_ledger(&reg.ledger).retire(id_n, Reaped::ConfirmedGone);
-    let owned_snapshot = lock_ledger(&reg.ledger).obligations.len();
-    assert_eq!(
-      ids_snapshot + owned_snapshot,
-      0,
-      "a read straddling the confirm sums to a FALSE 0 — the single snapshot reads 1 at both points"
-    );
-
-    // An UNCLAIMED in-flight write (no owned record bears its id) is one
-    // obligation, counted once.
-    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    assert_eq!(
-      reg.obligation_count(&writes_in_flight(&[(1, "M", CookieId(999))])),
-      1,
-      "an unclaimed in-flight write is one obligation"
-    );
-
-    // A CLAIMED self-reap — its `reply.send` failed, so it both claimed record
-    // id X AND still sits in `writes_in_flight` under that same id — is ONE
-    // physical obligation, counted once rather than once per place it appears.
-    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    let id_m = insert_owned(&reg, 1, "M", "/r/M");
-    assert_eq!(
-      reg.obligation_count(&writes_in_flight(&[(1, "M", id_m)])),
-      1,
-      "a claimed self-reap is one obligation, counted once and never twice"
-    );
-
-    // Two DISTINCT in-flight writes reusing ONE name across disjoint scopes (a
-    // direct-API name reuse — the umbrella never mints it) are TWO physical
-    // obligations: each carries its own dispatch id, so id-dedup counts both where
-    // the old name-dedup collapsed them to one (R12-F3).
-    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    assert_eq!(
-      reg.obligation_count(&writes_in_flight(&[
-        (1, "N", CookieId(1)),
-        (2, "N", CookieId(2))
-      ])),
-      2,
-      "two distinct same-name in-flight writes each count once — id-dedup, never name-dedup"
-    );
-  }
-
   // The accepted residual, asserted HONEST: an orderly-close unlink that hangs
   // past the grace and only THEN fails is skipped by the registry `Drop` and its
   // file persists — but close never claimed quiescence over it. Close counts every
@@ -6795,7 +6700,19 @@ mod sync_cookie {
     let id_b = guard_b.claim(&path).expect("B claims the live file");
     {
       let inner = lock_ledger(&reg.ledger);
-      assert_eq!(inner.obligations.len(), 1, "only B is tracked so far");
+      // Both writes are tracked from their dispatch; only B has claimed a path.
+      assert_eq!(
+        inner.obligations.len(),
+        2,
+        "both dispatched writes are tracked"
+      );
+      assert!(
+        matches!(
+          inner.obligations.get(&guard_a.id).map(|ob| &ob.phase),
+          Some(Phase::InPool)
+        ),
+        "A's write is still in the pool"
+      );
       assert_eq!(inner.by_path.get(&path), Some(&id_b), "by_path names B");
     }
 
@@ -6807,8 +6724,8 @@ mod sync_cookie {
       // B's live record survives by IDENTITY — its own id still owns its state.
       assert!(
         matches!(
-          inner.obligations.get(&id_b).map(|ob| &ob.state),
-          Some(RemovalState::Owned)
+          inner.obligations.get(&id_b).map(|ob| &ob.phase),
+          Some(Phase::Owned)
         ),
         "B's live record is never displaced by A's late claim"
       );
@@ -6824,11 +6741,15 @@ mod sync_cookie {
 
     // Both incarnations reach a typed terminal, and physical state converges.
     let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
-    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
-    reg.sweep_owned::<TokioRuntime>(&op_tx, &mut pending);
+    reg.sweep_owned::<TokioRuntime>(&op_tx);
     settle(|| reg.len() == 0 && fs.files_under("/r").is_empty()).await;
     assert_eq!(reg.len(), 0, "both incarnations are retired");
     assert!(fs.files_under("/r").is_empty(), "the physical file is gone");
+    let (census, live) = reg.census();
+    assert!(
+      census.balances(live),
+      "every incarnation reached a typed terminal"
+    );
   }
 
   // A confirmed unlink for an incarnation that has since been REPLACED at the
@@ -6859,7 +6780,7 @@ mod sync_cookie {
         .obligations
         .get_mut(&id_n)
         .expect("N's record is present")
-        .state = RemovalState::Removing { attempts: 0 };
+        .phase = Phase::Removing { attempts: 0 };
     }
     fs.remove(&path); // N's unlink physically ran
 
@@ -6875,8 +6796,8 @@ mod sync_cookie {
       assert!(!inner.obligations.contains_key(&id_n), "N is retired");
       assert!(
         matches!(
-          inner.obligations.get(&id_m).map(|ob| &ob.state),
-          Some(RemovalState::Owned)
+          inner.obligations.get(&id_m).map(|ob| &ob.phase),
+          Some(Phase::Owned)
         ),
         "the successor M survives the stale confirm for N"
       );
@@ -6893,8 +6814,7 @@ mod sync_cookie {
 
     // M reaps normally to a typed terminal; physical state converges.
     let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
-    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
-    reg.sweep_owned::<TokioRuntime>(&op_tx, &mut pending);
+    reg.sweep_owned::<TokioRuntime>(&op_tx);
     settle(|| reg.len() == 0 && fs.files_under("/r").is_empty()).await;
     assert_eq!(reg.len(), 0, "M is confirmed gone");
     assert!(fs.files_under("/r").is_empty(), "the physical file is gone");
@@ -6921,17 +6841,19 @@ mod sync_cookie {
     let stale = CookieId(m.0 + 999);
 
     // Case A: record M present, self-reap with a STALE id — no unlink, untouched.
-    let residual = self_reap(&fs, &guard, path.clone(), Some(stale));
-    assert!(
-      residual.is_none(),
-      "a stale-id self-reap yields no residual"
-    );
+    self_reap(&fs, &guard, path.clone(), Some(stale));
     assert_eq!(
       fs.cookie_remove_dispatches(),
       0,
       "no unlink was attempted for a stale id"
     );
-    assert!(reg.owns_id(&path, m), "the live record M is untouched");
+    assert!(
+      lock_ledger(&reg.ledger)
+        .obligations
+        .get(&m)
+        .is_some_and(|ob| matches!(ob.phase, Phase::Owned) && ob.path.as_deref() == Some(&*path)),
+      "the live record M is untouched"
+    );
 
     // Case B: NO record at P (a racing cancel confirmed our record away, a
     // successor could own the path) — a stale self-reap still must not unlink.
@@ -6941,11 +6863,7 @@ mod sync_cookie {
       inner.by_path.clear();
       inner.by_name.clear();
     }
-    let residual = self_reap(&fs, &guard, path.clone(), Some(stale));
-    assert!(
-      residual.is_none(),
-      "an absent-record self-reap yields no residual"
-    );
+    self_reap(&fs, &guard, path.clone(), Some(stale));
     assert_eq!(
       fs.cookie_remove_dispatches(),
       0,
@@ -6953,14 +6871,15 @@ mod sync_cookie {
     );
   }
 
-  // A stale removal FAILURE (a `CookieRemoveDone{confirmed:false}` for an
-  // incarnation the record no longer is) must not bump the successor's attempts
-  // nor deschedule its live retry; a stale CONFIRM must not deschedule it either.
-  // Only the matching-id confirm clears the slot.
+  // A stale removal report (for an incarnation the ledger no longer holds) must touch NOTHING of
+  // the successor that reclaimed its path: not its attempts, not the LRU clock, not its live
+  // deadline. Both halves of the completion split are id-guarded — the pool-side failure TRUTH
+  // (`record_remove_failed`, written by the job that performed the unlink) and the driver-side
+  // SCHEDULING (`on_cookie_remove_done`, the only writer of deadlines).
   //
-  // Fail-on-old is STRUCTURAL: the old `record_remove_failed(path)` /
-  // `on_cookie_remove_done(path, …)` carry no id, so the stale failure bumps
-  // attempts to 3 and both stale arms remove the path-keyed slot.
+  // Fail-on-old is STRUCTURAL: the old `record_remove_failed(path)` / `on_cookie_remove_done(path,
+  // …)` carry no id, so the stale failure bumps attempts to 3 and both stale arms remove the
+  // path-keyed slot.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_stale_remove_failure_does_not_touch_the_successors_state() {
     let fs = FakeFs::new(1);
@@ -6970,6 +6889,9 @@ mod sync_cookie {
     let name = ".tributaries-sync-stale-fail";
     let path = PathBuf::from("/r").join(name);
     let m = CookieId(42);
+    // M is SCHEDULED: its deadline is a field of its own record, so no other
+    // incarnation can address, clobber, or inherit it.
+    let scheduled = Instant::from_origin(Duration::from_secs(100));
     {
       let mut inner = lock_ledger(&reg.ledger);
       inner.obligations.insert(
@@ -6979,55 +6901,50 @@ mod sync_cookie {
           name: name.to_owned(),
           id: m,
           path: Some(path.clone()),
+          reap_requested: false,
           last_failure_seq: 5,
-          state: RemovalState::RemoveFailed { attempts: 2 },
+          phase: Phase::RemoveFailed {
+            attempts: 2,
+            retry_at: Some(scheduled),
+          },
         },
       );
       inner.by_name.insert(name.to_owned(), m);
       inner.by_path.insert(path.clone(), m);
+      inner.failure_clock = 5;
     }
-    let slot_at = Instant::from_origin(Duration::from_secs(100));
-    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
-    pending.insert(path.clone(), RetrySlot { at: slot_at, id: m });
-
     let k = CookieId(m.0 + 1); // a stale successor id
     let now = Instant::from_origin(Duration::from_secs(0));
 
-    // Stale failure (id K): attempts stay 2; the live slot is untouched.
-    on_cookie_remove_done(&reg, &mut pending, &cfg, path.clone(), k, false, now, false);
+    // The pool-side half: a stale failure writes no truth at all.
+    assert_eq!(
+      lock_ledger(&reg.ledger).record_remove_failed(k),
+      None,
+      "a stale failure reports no attempt count — it transitioned nothing"
+    );
+    // The driver-side half: neither a stale failure nor a stale confirm schedules anything.
+    on_cookie_remove_done(&reg, &cfg, k, false, now, false);
+    on_cookie_remove_done(&reg, &cfg, k, true, now, false);
+
+    let inner = lock_ledger(&reg.ledger);
     assert!(
       matches!(
-        lock_ledger(&reg.ledger)
-          .obligations
-          .get(&m)
-          .map(|ob| &ob.state),
-        Some(RemovalState::RemoveFailed { attempts: 2 })
+        inner.obligations.get(&m).map(|ob| &ob.phase),
+        Some(Phase::RemoveFailed {
+          attempts: 2,
+          retry_at: Some(at),
+        }) if *at == scheduled
       ),
-      "a stale failure never bumps the successor's attempts"
+      "M keeps its attempts AND its own live deadline through both stale reports"
     );
     assert_eq!(
-      pending.get(&path).map(|s| s.at),
-      Some(slot_at),
-      "the live slot's deadline is untouched"
+      inner.failure_clock, 5,
+      "a stale failure never advances the LRU clock"
     );
     assert_eq!(
-      pending.get(&path).map(|s| s.id),
-      Some(m),
-      "the live slot still names M"
-    );
-
-    // Stale confirm (id K): the live slot is NOT descheduled.
-    on_cookie_remove_done(&reg, &mut pending, &cfg, path.clone(), k, true, now, false);
-    assert!(
-      pending.contains_key(&path),
-      "a stale confirm never deschedules M's live retry"
-    );
-
-    // Matching confirm (id M): M's own slot is cleared.
-    on_cookie_remove_done(&reg, &mut pending, &cfg, path.clone(), m, true, now, false);
-    assert!(
-      !pending.contains_key(&path),
-      "M's own confirm clears M's slot"
+      inner.obligations.get(&m).map(|ob| ob.last_failure_seq),
+      Some(5),
+      "…nor refreshes the successor's LRU key"
     );
   }
 
@@ -7053,60 +6970,60 @@ mod sync_cookie {
           name: "n".to_owned(),
           id: m,
           path: Some(path.clone()),
+          reap_requested: false,
           last_failure_seq: 1,
-          state: RemovalState::RemoveFailed { attempts: 1 },
+          phase: Phase::RemoveFailed {
+            attempts: 1,
+            retry_at: None,
+          },
         },
       );
       inner.by_name.insert("n".to_owned(), m);
       inner.by_path.insert(path.clone(), m);
     }
-    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
     let k = CookieId(m.0 + 7);
 
     // A stale RetryDue is a no-op.
     {
       let mut inner = lock_ledger(&reg.ledger);
-      let d = CookieRegistry::<FakeFs>::removal_decision_locked(
-        &mut inner,
-        &mut pending,
-        &RemovalRequest::RetryDue(k),
-      );
+      let d =
+        CookieRegistry::<FakeFs>::removal_decision_locked(&mut inner, &RemovalRequest::RetryDue(k));
       assert!(d.is_none(), "a stale RetryDue dispatches nothing");
       assert!(matches!(
-        inner.obligations.get(&m).map(|ob| &ob.state),
-        Some(RemovalState::RemoveFailed { attempts: 1 })
+        inner.obligations.get(&m).map(|ob| &ob.phase),
+        Some(Phase::RemoveFailed {
+          attempts: 1,
+          retry_at: None
+        })
       ));
     }
     // A stale Targeted is a no-op.
     {
       let mut inner = lock_ledger(&reg.ledger);
-      let d = CookieRegistry::<FakeFs>::removal_decision_locked(
-        &mut inner,
-        &mut pending,
-        &RemovalRequest::Targeted(k),
-      );
+      let d =
+        CookieRegistry::<FakeFs>::removal_decision_locked(&mut inner, &RemovalRequest::Targeted(k));
       assert!(d.is_none(), "a stale Targeted dispatches nothing");
       assert!(matches!(
-        inner.obligations.get(&m).map(|ob| &ob.state),
-        Some(RemovalState::RemoveFailed { attempts: 1 })
+        inner.obligations.get(&m).map(|ob| &ob.phase),
+        Some(Phase::RemoveFailed {
+          attempts: 1,
+          retry_at: None
+        })
       ));
     }
     // A matching Targeted re-arms the parked record.
     {
       let mut inner = lock_ledger(&reg.ledger);
-      let d = CookieRegistry::<FakeFs>::removal_decision_locked(
-        &mut inner,
-        &mut pending,
-        &RemovalRequest::Targeted(m),
-      );
+      let d =
+        CookieRegistry::<FakeFs>::removal_decision_locked(&mut inner, &RemovalRequest::Targeted(m));
       assert_eq!(
         d.map(|(_, id)| id),
         Some(m),
         "a matching Targeted dispatches M"
       );
       assert!(matches!(
-        inner.obligations.get(&m).map(|ob| &ob.state),
-        Some(RemovalState::Removing { attempts: 0 })
+        inner.obligations.get(&m).map(|ob| &ob.phase),
+        Some(Phase::Removing { attempts: 0 })
       ));
     }
     // `Explicit` on a fresh `Owned` record dispatches (public semantics pinned).
@@ -7121,15 +7038,15 @@ mod sync_cookie {
           name: "n2".to_owned(),
           id: f,
           path: Some(fresh.clone()),
+          reap_requested: false,
           last_failure_seq: 0,
-          state: RemovalState::Owned,
+          phase: Phase::Owned,
         },
       );
       inner.by_name.insert("n2".to_owned(), f);
       inner.by_path.insert(fresh.clone(), f);
       let d = CookieRegistry::<FakeFs>::removal_decision_locked(
         &mut inner,
-        &mut pending,
         &RemovalRequest::Explicit(fresh.clone()),
       );
       assert_eq!(
@@ -7138,8 +7055,8 @@ mod sync_cookie {
         "Explicit dispatches the record currently at the path"
       );
       assert!(matches!(
-        inner.obligations.get(&f).map(|ob| &ob.state),
-        Some(RemovalState::Removing { attempts: 0 })
+        inner.obligations.get(&f).map(|ob| &ob.phase),
+        Some(Phase::Removing { attempts: 0 })
       ));
     }
   }
@@ -7162,9 +7079,13 @@ mod sync_cookie {
   // serves the REFUSING scope first (its own budget) and then the rest
   // least-recently-FAILED-first — with `last_failure_seq` refreshed on every
   // failure so repeat offenders sink behind records that have not failed since a
-  // mount recovered. Removes are armed to FAIL, so no async unlink ever drops a
-  // record: the SYNCHRONOUS `Removing` transition rearm performs under the
-  // decision lock is a fully deterministic oracle for which records were served.
+  // mount recovered.
+  //
+  // Every unlink is HELD in the pool and armed to FAIL, so a served record sits in
+  // `Removing` until the hold releases: no job can confirm a record away, and none
+  // can write its own failure back over it. The SYNCHRONOUS `Removing` transition
+  // rearm performs under the decision lock is then a fully deterministic oracle for
+  // which records were served.
   #[tokio::test(flavor = "multi_thread")]
   async fn rearm_serves_least_recently_failed_first() {
     fn insert_owned_rec(
@@ -7183,8 +7104,9 @@ mod sync_cookie {
           name: name.to_owned(),
           id,
           path: Some(path.to_path_buf()),
+          reap_requested: false,
           last_failure_seq: 0,
-          state: RemovalState::Owned,
+          phase: Phase::Owned,
         },
       );
       inner.by_name.insert(name.to_owned(), id);
@@ -7198,8 +7120,8 @@ mod sync_cookie {
           .by_path
           .get(path)
           .and_then(|id| inner.obligations.get(id))
-          .map(|ob| &ob.state),
-        Some(RemovalState::Removing { .. })
+          .map(|ob| &ob.phase),
+        Some(Phase::Removing { .. })
       )
     }
     fn is_parked(reg: &CookieRegistry<FakeFs>, path: &Path) -> bool {
@@ -7209,8 +7131,8 @@ mod sync_cookie {
           .by_path
           .get(path)
           .and_then(|id| inner.obligations.get(id))
-          .map(|ob| &ob.state),
-        Some(RemovalState::RemoveFailed { .. })
+          .map(|ob| &ob.phase),
+        Some(Phase::RemoveFailed { retry_at: None, .. })
       )
     }
 
@@ -7223,20 +7145,21 @@ mod sync_cookie {
 
     let fs = FakeFs::new(1);
     fs.fail_next_cookie_removes(1_000_000);
+    let hold = fs.hold_cookie_removes();
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
     let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
-    let mut pending: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
 
     // Fail each in order: last_failure_seq = 1, 2, 3 for a1, a2, b1.
     let ida1 = insert_owned_rec(&reg, sa, "a1", &a1);
     let ida2 = insert_owned_rec(&reg, sa, "a2", &a2);
     let idb1 = insert_owned_rec(&reg, sb, "b1", &b1);
-    assert_eq!(reg.record_remove_failed(ida1), Some(1)); // seq 1
-    assert_eq!(reg.record_remove_failed(ida2), Some(1)); // seq 2
-    assert_eq!(reg.record_remove_failed(idb1), Some(1)); // seq 3
+    let fail = |id| lock_ledger(&reg.ledger).record_remove_failed(id);
+    assert_eq!(fail(ida1), Some(1)); // seq 1
+    assert_eq!(fail(ida2), Some(1)); // seq 2
+    assert_eq!(fail(idb1), Some(1)); // seq 3
 
     // Refusing = C (no parked of C): others = a1,a2,b1 by seq → [a1,a2] (limit 2).
-    let n = reg.rearm_parked_batch::<TokioRuntime>(&op_tx, &mut pending, sc, 2);
+    let n = reg.rearm_parked_batch::<TokioRuntime>(&op_tx, sc, 2);
     assert_eq!(n, 2, "two records re-armed");
     assert!(is_removing(&reg, &a1), "a1 (seq1) served");
     assert!(is_removing(&reg, &a2), "a2 (seq2) served");
@@ -7247,9 +7170,9 @@ mod sync_cookie {
 
     // Re-fail a1, a2 (now Removing → RemoveFailed) so their seqs become 4, 5 —
     // BEHIND b1's seq 3: the refresh-on-failure rule sinks repeat offenders.
-    assert_eq!(reg.record_remove_failed(ida1), Some(1)); // seq 4
-    assert_eq!(reg.record_remove_failed(ida2), Some(1)); // seq 5
-    let n = reg.rearm_parked_batch::<TokioRuntime>(&op_tx, &mut pending, sc, 2);
+    assert_eq!(fail(ida1), Some(1)); // seq 4
+    assert_eq!(fail(ida2), Some(1)); // seq 5
+    let n = reg.rearm_parked_batch::<TokioRuntime>(&op_tx, sc, 2);
     assert_eq!(n, 2);
     assert!(
       is_removing(&reg, &b1),
@@ -7265,16 +7188,16 @@ mod sync_cookie {
     // (others' separate budget) — up to 2·limit dispatches per refusal.
     let fs2 = FakeFs::new(1);
     fs2.fail_next_cookie_removes(1_000_000);
+    let hold2 = fs2.hold_cookie_removes();
     let reg2 = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs2.clone());
     let (op_tx2, _op_rx2) = async_channel::unbounded::<OpResult<FakeHandle>>();
-    let mut pending2: BTreeMap<PathBuf, RetrySlot> = BTreeMap::new();
     let ja1 = insert_owned_rec(&reg2, sa, "a1", &a1);
     let ja2 = insert_owned_rec(&reg2, sa, "a2", &a2);
     let jb1 = insert_owned_rec(&reg2, sb, "b1", &b1);
-    reg2.record_remove_failed(ja1);
-    reg2.record_remove_failed(ja2);
-    reg2.record_remove_failed(jb1);
-    let n = reg2.rearm_parked_batch::<TokioRuntime>(&op_tx2, &mut pending2, sa, 2);
+    for id in [ja1, ja2, jb1] {
+      lock_ledger(&reg2.ledger).record_remove_failed(id);
+    }
+    let n = reg2.rearm_parked_batch::<TokioRuntime>(&op_tx2, sa, 2);
     assert_eq!(
       n, 3,
       "the refusing scope's budget and the others' budget are separate (≤ 2·limit)"
@@ -7291,6 +7214,10 @@ mod sync_cookie {
       is_removing(&reg2, &b1),
       "B's b1 served under the SEPARATE others-budget"
     );
+
+    // Let the held unlink jobs finish so no pool thread outlives the cell.
+    hold.release();
+    hold2.release();
   }
 
   /// The R11-1 recovery-fairness config: a low per-scope backlog cap, a budget of
@@ -7426,7 +7353,7 @@ mod sync_cookie {
   // ==== R11-2: the whole-lifecycle global cap (cells 8–10) ====
 
   // Hung (blocking, unclaimed) cookie WRITES count against the global cap: the
-  // admission gauge is the whole lifecycle — `obligation_count(writes_in_flight)`
+  // admission gauge is the whole lifecycle — every dispatched write is a counted obligation
   // + `parked_cookies.len()` — not just claimed `owned` records. Three held
   // writes fill a cap of 3, so the fourth is refused promptly (an honest,
   // retryable `Busy`) rather than piling a fourth blocking job on the pool.
@@ -7466,8 +7393,8 @@ mod sync_cookie {
       );
     }
 
-    // The 4th sync: the gauge is `obligation_count` (3 unclaimed hung writes) +
-    // parked (0) = 3 ≥ cap → refused PROMPTLY, never queued behind the hold.
+    // The 4th sync: the gauge is `unremoved()` (3 hung in-pool writes) + parked (0)
+    // = 3 ≥ cap → refused PROMPTLY, never queued behind the hold.
     let (root4, scope4) = &scopes[3];
     let r4_reply = sync_root_pending(&rig, *scope4, root4, ".tributaries-sync-hung-4").await;
     let r4 = tokio::time::timeout(Duration::from_secs(3), r4_reply)
@@ -7491,15 +7418,14 @@ mod sync_cookie {
   // name on disjoint scopes; once one owned cookie named N exists, the old
   // NAME-dedup excluded EVERY in-flight write named N (its name sat in `names`), so
   // k same-name held writes on k scopes each contributed 0 — an unbounded
-  // blocking-pool / `writes_in_flight` bypass. Under id-dedup each held write
-  // carries a distinct DISPATCH id, so it is counted and the cap binds. (The
-  // umbrella is unaffected — it mints per-sync-unique names.)
+  // blocking-pool bypass. Each write now holds its OWN id-keyed obligation from dispatch, so
+  // k same-name held writes are k records and the cap binds — the bypass is unrepresentable
+  // rather than guarded. (The umbrella is unaffected — it mints per-sync-unique names.)
   //
-  // Fail-on-old (obligation_count reverted to name-dedup): the owned N puts N in
-  // `names`, so every same-name held write is excluded, `obligation_count` stays
-  // pinned at 1, the gauge never reaches the cap, the (cap+1)-th sync is ADMITTED,
-  // its held write PARKS behind the hold, and the prompt-refusal assertion times
-  // out. Deterministic via the write hold.
+  // Fail-on-old (a gauge that collapsed same-name writes): the owned N would mask every
+  // same-name held write, the gauge would stay pinned at 1, the (cap+1)-th sync would be
+  // ADMITTED, its held write would PARK behind the hold, and the prompt-refusal assertion
+  // would time out. Deterministic via the write hold.
   #[tokio::test(flavor = "multi_thread")]
   async fn same_name_writes_on_disjoint_scopes_each_count_against_the_global_cap() {
     // global_cap = 3, backlog_cap = 8 (the per-scope cap never binds — one cookie
@@ -7567,103 +7493,6 @@ mod sync_cookie {
     drop(pending);
   }
 
-  // The admission gauge counts each obligation exactly ONCE — a claimed self-reap
-  // (its owned record and its in-flight write sharing one incarnation id) is one
-  // physical obligation, and the parked-cookies term is disjoint from both — so
-  // the whole-lifecycle sum is `obligation_count + parked`, never a naive
-  // `owned + writes + parked`. It ALSO pins id-dedup (R12-F3): an owned record
-  // plus a DISTINCT same-name write on another scope counts two, not one.
-  //
-  // GUARD CELL: its fail-on-old targets are a NAIVE widening (which would
-  // double-count the claimed self-reap and read 3, a spurious refusal) and the old
-  // NAME-dedup (which would mask the distinct same-name write and read 1) — NOT
-  // e8269c7, whose failure is cell 8. It pins the dedup, now keyed by id.
-  #[tokio::test(flavor = "multi_thread")]
-  async fn the_admission_gauge_counts_each_obligation_once() {
-    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    // A claimed self-reap: record "M" (id X) owned (claim landed) AND its write
-    // still in `writes_in_flight` under that SAME id X (its CookieWriteDone hasn't
-    // cleared the gate).
-    let id = {
-      let mut inner = lock_ledger(&reg.ledger);
-      inner.next_cookie_id += 1;
-      let id = CookieId(inner.next_cookie_id);
-      let path = PathBuf::from("/r/M");
-      inner.obligations.insert(
-        id,
-        Obligation {
-          scope: ScopeId::new(NonZeroU64::new(1).unwrap()),
-          name: "M".to_owned(),
-          id,
-          path: Some(path.clone()),
-          last_failure_seq: 0,
-          state: RemovalState::Removing { attempts: 0 },
-        },
-      );
-      inner.by_name.insert("M".to_owned(), id);
-      inner.by_path.insert(path, id);
-      id
-    };
-    let in_flight: BTreeMap<ScopeId, (String, CookieId)> = [(
-      ScopeId::new(NonZeroU64::new(1).unwrap()),
-      ("M".to_owned(), id),
-    )]
-    .into_iter()
-    .collect();
-    assert_eq!(
-      reg.obligation_count(&in_flight),
-      1,
-      "the claimed self-reap is deduped to one obligation, never counted twice"
-    );
-    // The admission gauge adds `parked_cookies.len()`. With one parked write (no
-    // record, no `writes_in_flight` entry — disjoint), the gauge is 2, never 3.
-    let parked_len = 1usize;
-    assert_eq!(
-      reg.obligation_count(&in_flight) + parked_len,
-      2,
-      "the whole-lifecycle gauge counts each stage once — a naive owned+writes+parked would read 3"
-    );
-
-    // R12-F3: the dedup key is the incarnation ID, not the name. An owned record
-    // named N (id X) plus a DISTINCT in-flight write reusing that NAME on another
-    // scope (id Y ≠ X — the direct-API name reuse the umbrella never produces) is
-    // TWO obligations: the write's id is not owned, so it is NOT masked by the
-    // owned record's shared name. Old name-dedup read 1 here (the bypass).
-    let reg2 = CookieRegistry::<FakeFs>::new::<TokioRuntime>(FakeFs::new(1));
-    let x = {
-      let mut inner = lock_ledger(&reg2.ledger);
-      inner.next_cookie_id += 1;
-      let x = CookieId(inner.next_cookie_id);
-      let path = PathBuf::from("/r1/N");
-      inner.obligations.insert(
-        x,
-        Obligation {
-          scope: ScopeId::new(NonZeroU64::new(1).unwrap()),
-          name: "N".to_owned(),
-          id: x,
-          path: Some(path.clone()),
-          last_failure_seq: 0,
-          state: RemovalState::Owned,
-        },
-      );
-      inner.by_name.insert("N".to_owned(), x);
-      inner.by_path.insert(path, x);
-      x
-    };
-    let y = CookieId(x.0 + 1); // a DISTINCT write's dispatch id, same name N
-    let same_name_distinct: BTreeMap<ScopeId, (String, CookieId)> = [(
-      ScopeId::new(NonZeroU64::new(2).unwrap()),
-      ("N".to_owned(), y),
-    )]
-    .into_iter()
-    .collect();
-    assert_eq!(
-      reg2.obligation_count(&same_name_distinct),
-      2,
-      "an owned cookie plus a distinct same-name in-flight write count TWO — id-dedup, not name (R12-F3)"
-    );
-  }
-
   /// Cell 10's config: a global cap of 2 (backlog never binds), so one claimed
   /// self-reap plus one fresh sync sit exactly at the boundary the dedup governs.
   fn double_bar_config() -> DriverConfig {
@@ -7677,14 +7506,12 @@ mod sync_cookie {
     }
   }
 
-  // A claimed self-reap that is still mid-unlink (in BOTH `writes_in_flight` and
-  // `owned`) must count as ONE against the cap, not two — so a second scope's
-  // sync is admitted at a cap of 2 rather than double-barred by the same physical
-  // obligation appearing in two places.
+  // A claimed self-reap that is still mid-unlink counts as ONE against the cap — so a second
+  // scope's sync is admitted at a cap of 2 rather than double-barred by one physical
+  // obligation. One write has one record for its whole life, so this holds by construction.
   //
-  // GUARD CELL: old code also admits (it counts `owned == 1`), so this does not
-  // fail on e8269c7; it pins the dedup against a naive `owned + writes + parked`
-  // widening (which would read 2 and wrongly refuse scope 2).
+  // GUARD CELL: it pins the gauge against any widening that would tally one physical write
+  // more than once (reading 2 here, and wrongly refusing scope 2).
   #[tokio::test(flavor = "multi_thread")]
   async fn a_claimed_self_reap_does_not_double_bar_admission() {
     let rig = rig_with_config(64, double_bar_config());
@@ -7704,11 +7531,11 @@ mod sync_cookie {
     assert_eq!(
       rig.fs.cookie_remove_dispatches(),
       1,
-      "the claimed self-reap parked mid-unlink — in both writes_in_flight and owned"
+      "the claimed self-reap parked mid-unlink, its write's completion still outstanding"
     );
 
-    // Scope 2 admits: the gauge dedups the one physical obligation to 1 < 2. A
-    // naive owned(1)+writes(1)+parked(0)=2 would wrongly refuse it.
+    // Scope 2 admits: the one physical obligation is one record, so the gauge is 1 < 2. A
+    // widening that counted its write and its record separately would read 2 and refuse.
     let path2 = admit_sync(&rig, s2, "/r2", ".tributaries-sync-double-2").await;
     assert_eq!(
       path2,
@@ -7719,5 +7546,244 @@ mod sync_cookie {
     // Cleanup: release the unlink so the self-reap confirms and drains.
     hold_r.release();
     settle(|| rig.fs.cookie_removes().iter().any(|p| p.starts_with("/r1"))).await;
+  }
+  // The single-flight write gate is a PHASE PROBE over the one ledger: a scope with an
+  // obligation `InPool` refuses a second sync, and the gate opens the moment that write leaves
+  // `InPool` — at its CLAIM, or at the typed terminal of a write that created nothing — rather
+  // than at the tail of its completion message. A scope can therefore transiently hold one write
+  // JOB plus one COMPLETING TAIL (a claimed write whose completion is still in flight). That is
+  // the ACCEPTED WIDENING, and the bound the gate exists for still holds: at most one
+  // `write_cookie` syscall per scope is ever outstanding, so a caller that times out and retries
+  // still cannot pile blocking writes against a hung mount (pinned end-to-end by
+  // `a_second_sync_while_a_write_is_in_flight_is_refused`).
+  //
+  // Through the whole widened window the obligation stays COUNTED: the claim moves the record's
+  // PHASE, never its existence, so nothing physical is ever invisible to the close count.
+  //
+  // Fail-on-old (the claim leaves its record `InPool` instead of transitioning it to `Owned`):
+  // the gate never reopens and the "opens at the claim" assertion fails.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn the_write_gate_opens_at_the_claim_and_never_uncounts_the_obligation() {
+    let fs = FakeFs::new(1);
+    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+    let other = ScopeId::new(NonZeroU64::new(2).unwrap());
+    let path = PathBuf::from("/r/.tributaries-sync-gate");
+
+    // Dispatch: the write's obligation is born `InPool`, shutting its own scope's gate.
+    let guard = reg.dispatch_guard(scope, ".tributaries-sync-gate".to_owned());
+    assert!(
+      reg.has_in_pool_write(scope),
+      "a dispatched write shuts its scope's gate"
+    );
+    assert!(!reg.has_in_pool_write(other), "the gate is per scope");
+    assert_eq!(
+      reg.unremoved(),
+      1,
+      "the in-pool write is a counted obligation from the instant it can create a file"
+    );
+
+    // The CLAIM opens the gate — before this write's completion message is sent, which is the
+    // whole of the widening.
+    let id = guard.claim(&path).expect("the claim lands");
+    assert!(
+      !reg.has_in_pool_write(scope),
+      "the gate opens at the claim, not at the completion tail"
+    );
+    assert!(
+      lock_ledger(&reg.ledger)
+        .obligations
+        .get(&id)
+        .is_some_and(|ob| matches!(ob.phase, Phase::Owned)),
+      "the claim moved the record's phase, not its existence"
+    );
+    assert_eq!(
+      reg.unremoved(),
+      1,
+      "the claimed obligation is still counted — never a false Ok(0) across the window"
+    );
+
+    // A second write for the scope may now dispatch: ONE write job (this one) alongside the
+    // first write's completing tail — never two write jobs.
+    let second = reg.dispatch_guard(scope, ".tributaries-sync-gate-2".to_owned());
+    assert!(
+      reg.has_in_pool_write(scope),
+      "the second write shuts the gate again"
+    );
+    assert_eq!(reg.unremoved(), 2, "both obligations are counted");
+
+    // A write that created NOTHING opens the gate at its typed terminal, taking its obligation
+    // with it — the other way out of `InPool`.
+    lock_ledger(&reg.ledger).retire(second.id, Reaped::NeverCreated);
+    assert!(
+      !reg.has_in_pool_write(scope),
+      "a never-created write's terminal opens the gate"
+    );
+    assert_eq!(reg.unremoved(), 1, "…and leaves nothing counted behind it");
+  }
+
+  // THE CENSUS EQUATION, over every shape a cookie's life can take on one driver: births =
+  // ConfirmedGone + NeverCreated + AbnormalResidual + live. It holds only if every obligation
+  // that ever left the ledger left through a typed `retire` naming its evidence — so it is the
+  // standing structural proof that no obligation can vanish untyped, and the per-variant
+  // assertions pin that each terminal is the RIGHT type rather than merely some type.
+  //
+  // Fail-on-old (any removal that bypasses the typed terminal — e.g. a bare
+  // `obligations.remove(&id)` on a confirm): the births no longer balance and the equation fails
+  // at the first scenario that exercises it.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn every_obligation_is_born_counted_and_typed_out() {
+    let rig = rig_with_config(64, tuned_config());
+    let scope = watch(&rig, "/r").await;
+
+    let census = assert_census_balances(&rig, "a fresh driver").await;
+    assert_eq!(census, Census::default(), "nothing is born before a sync");
+
+    // 1. A completed sync, then its reap: born at dispatch, confirmed gone at its unlink.
+    let path = admit_sync(&rig, scope, "/r", ".tributaries-sync-census-1").await;
+    settle_cookie_count(&rig, 1).await;
+    let census = assert_census_balances(&rig, "a completed sync").await;
+    assert_eq!(census.births, 1, "the write's obligation was born");
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path))
+      .await
+      .unwrap();
+    settle_cookie_count(&rig, 0).await;
+    let census = assert_census_balances(&rig, "a reaped cookie").await;
+    assert_eq!(
+      (census.births, census.confirmed_gone),
+      (1, 1),
+      "a reaped cookie earns ConfirmedGone from its own syscall"
+    );
+
+    // 2. A cancel while the write is IN THE POOL: the refused claim self-reaps, and the file it
+    //    created is confirmed gone — the obligation never leaks, whatever the interleaving.
+    let name = ".tributaries-sync-census-2";
+    let hold = rig.fs.hold_cookie_writes();
+    let dispatched = rig.fs.cookie_dispatches();
+    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    settle(|| rig.fs.cookie_dispatches() == dispatched + 1).await;
+    assert_eq!(
+      cookie_census(&rig).await.0.births,
+      2,
+      "the in-pool write is already born"
+    );
+    rig
+      .cookie_removes
+      .send(CookieReap::Cancel(name.to_owned()))
+      .await
+      .unwrap();
+    settle_reap_marks(&rig, 1).await;
+    hold.release();
+    let _ = on_reply.await;
+    settle_cookie_count(&rig, 0).await;
+    let census = assert_census_balances(&rig, "a cancelled in-pool write").await;
+    assert_eq!(
+      (census.births, census.confirmed_gone),
+      (2, 2),
+      "the refused claim's self-reap confirmed its own file gone"
+    );
+
+    // 3. An ABANDONED reply: the claim lands, `reply.send` fails, the self-reap confirms.
+    let hold = rig.fs.hold_cookie_writes();
+    let dispatched = rig.fs.cookie_dispatches();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-census-3").await;
+    settle(|| rig.fs.cookie_dispatches() == dispatched + 1).await;
+    drop(on_reply);
+    hold.release();
+    settle_cookie_count(&rig, 0).await;
+    let census = assert_census_balances(&rig, "an abandoned reply").await;
+    assert_eq!(
+      (census.births, census.confirmed_gone),
+      (3, 3),
+      "an abandoned sync's cookie is confirmed gone, never orphaned"
+    );
+
+    // 4. A HUNG unlink: the obligation stays LIVE and the equation absorbs it there — the term
+    //    that keeps the count honest while physical work is still outstanding.
+    let path = admit_sync(&rig, scope, "/r", ".tributaries-sync-census-4").await;
+    settle_cookie_count(&rig, 1).await;
+    let hold = rig.fs.hold_cookie_removes();
+    let unlinked = rig.fs.cookie_remove_dispatches();
+    rig
+      .cookie_removes
+      .send(CookieReap::Remove(path))
+      .await
+      .unwrap();
+    settle(|| rig.fs.cookie_remove_dispatches() == unlinked + 1).await;
+    let (census, live) = cookie_census(&rig).await;
+    assert!(
+      census.balances(live),
+      "a hung unlink balances as a LIVE record"
+    );
+    assert_eq!(
+      (census.births, live),
+      (4, 1),
+      "the obligation is still counted while its unlink hangs"
+    );
+    hold.release();
+    settle_cookie_count(&rig, 0).await;
+    let census = assert_census_balances(&rig, "a released hung unlink").await;
+    assert_eq!((census.births, census.confirmed_gone), (4, 4));
+
+    // 5. A FAILED write (last: the fake's write failure is permanent): nothing physical was ever
+    //    created, so the obligation retires as NeverCreated — a distinct, evidenced terminal.
+    rig
+      .fs
+      .fail_cookie_writes(std::io::ErrorKind::PermissionDenied);
+    assert!(
+      matches!(
+        sync_root(&rig, scope, "/r", ".tributaries-sync-census-5").await,
+        Err(crate::error::SyncRootError::Write { .. })
+      ),
+      "the write fails typed"
+    );
+    settle_cookie_count(&rig, 0).await;
+    let census = assert_census_balances(&rig, "a failed write").await;
+    assert_eq!(
+      (census.births, census.confirmed_gone, census.never_created),
+      (5, 4, 1),
+      "a write that created nothing retires NeverCreated, never as a confirmed removal"
+    );
+  }
+
+  // The abnormal-path backstop's terminal is typed and counted too: a `Drop` with no orderly
+  // close takes every remaining record as an AbnormalResidual, so even the path that exists
+  // BECAUSE the driver died accounts for what it swept. Read through a ledger handle cloned
+  // before the drop — the census outlives the registry, as the equation requires.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn the_abnormal_backstop_types_and_counts_what_it_sweeps() {
+    let fs = FakeFs::new(1);
+    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let ledger = Arc::clone(&reg.ledger);
+    let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+
+    // One claimed cookie, and one write still in the pool.
+    let claimed = reg.dispatch_guard(scope, ".tributaries-sync-abnormal-1".to_owned());
+    let path = PathBuf::from("/r/.tributaries-sync-abnormal-1");
+    fs.put(&path, FileKind::File, 1);
+    claimed.claim(&path).expect("the claim lands");
+    let _in_pool = reg.dispatch_guard(scope, ".tributaries-sync-abnormal-2".to_owned());
+    assert_eq!(reg.unremoved(), 2, "both obligations are counted");
+
+    drop(reg);
+    let (census, live) = {
+      let inner = lock_ledger(&ledger);
+      (inner.census, inner.obligations.len())
+    };
+    assert!(
+      census.balances(live),
+      "the backstop's sweep balances the census"
+    );
+    assert_eq!(
+      (census.births, census.abnormal_residual, live),
+      (2, 2, 0),
+      "every record the backstop took is counted as the abnormal residual it is"
+    );
+    // The claimed cookie's file is reaped best-effort; the pathless in-pool write is covered by
+    // the raised flag, which makes its claim refuse and the write reap its own file.
+    settle(|| fs.files_under("/r").is_empty()).await;
+    assert!(fs.files_under("/r").is_empty(), "the swept file is gone");
   }
 }
