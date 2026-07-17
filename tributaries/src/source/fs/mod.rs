@@ -638,9 +638,11 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   fn end_sync(&mut self, _handle: RootHandle, cookie_key: &[OsString]) {
-    // A prompt hint to reap the cookie now, on the driver's DEDICATED cleanup
-    // lane: admission is GUARANTEED (the lane is unbounded), so a burst of
-    // control traffic can no longer drop the reap. The driver OWNS every cookie
+    // A prompt request to reap the cookie now: it MARKS the obligation the driver
+    // has held since it admitted the sync, so admission is guaranteed by type —
+    // there is no queue a burst of control traffic could saturate. This path came
+    // from the `begin_sync` reply, and the write published it before that reply
+    // was sent, so the mark always finds its record. The driver OWNS every cookie
     // it wrote and unlinks it at scope or driver teardown regardless, so even a
     // reap to an already-closed driver leaks nothing. Runtime-free by design
     // (this seam carries no `R` bound): the runtime-bearing cleanup lives in the
@@ -652,11 +654,12 @@ impl<R> Source<OsString> for FsSource<R> {
 
   fn cancel_sync(&mut self, _handle: RootHandle, token: SyncToken) {
     // The owner abandoned an in-flight `begin_sync` and never learned the cookie
-    // path — but it minted the token, so re-render the unique cookie NAME and
-    // hand it to the driver on the DEDICATED cleanup lane. The driver reaps the
-    // cookie if the write already landed, tombstones the name if the write is
-    // still in the pool (so its claim self-reaps), or drops the request if the
-    // sync already resolved. Runtime-free (a pure render + a `try_send`), like
+    // path — but it minted the token, so re-render the unique cookie NAME, which
+    // the driver records at ADMISSION and therefore always resolves. The driver
+    // reaps the cookie if the write already landed, refuses the claim of a write
+    // still in the pool (so it self-reaps the file it creates), retires a sync
+    // whose write was never dispatched, or drops the request if the sync already
+    // resolved. Runtime-free (a pure render, a lock, and a `try_send`), like
     // `end_sync`; the runtime-bearing cleanup lives in the driver.
     self.flush_deferred_prunes();
     self.watcher.request_cancel_sync(cookie_name(token));

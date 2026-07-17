@@ -223,10 +223,11 @@ impl Census {
 }
 
 /// Everything the pool and the driver must observe atomically about cookies:
-/// one mutex, so a claim, a reap request, and a record transition can never
-/// interleave (see [`CookieGuard::claim`] and the cancel handler). Replaces the
-/// bare `HashMap<PathBuf, ScopeId>` the ledger was before the lifecycle state
-/// machine.
+/// one mutex, so a claim, a reap-request mark, and a record transition can never
+/// interleave (see [`CookieGuard::claim`] and [`CookieIngress::mark`]). Shared
+/// with the watcher handle as the cleanup ingress ([`cookie_ingress`]), so a
+/// public reap or cancel is a transition on this same state. Replaces the bare
+/// `HashMap<PathBuf, ScopeId>` the ledger was before the lifecycle state machine.
 struct LedgerInner {
   /// Every cookie obligation the driver has admitted and not yet retired, keyed
   /// by its immutable incarnation id. The ONE insert site is the sync's ADMISSION
@@ -463,6 +464,197 @@ enum Phase {
 
 type CookieLedger = Arc<Mutex<LedgerInner>>;
 
+/// Mints the cookie-cleanup ingress: ONE ledger, shared between the watcher
+/// HANDLE and its driver task, plus the **capacity-1** coalescing wake the handle
+/// rings after marking an obligation. The two halves are created together — at
+/// the watcher's spawn, alongside the command channel — because the handle side
+/// must address the very records the driver admits.
+///
+/// This pair REPLACES the dedicated cleanup queue the public reap and cancel used
+/// to feed. That queue had to be unbounded (a bounded one once refused a removal
+/// and orphaned the file it named), while every dedup and ownership resolution
+/// happened only after dequeue — so nothing bounded the QUEUE, and a flood of
+/// duplicate or unknown requests allocated one caller-sized message apiece. The
+/// tension is not resolved by sizing a channel; it is dissolved by moving the
+/// request onto the obligation it names. Because a record now exists from
+/// admission to its typed terminal ([`CookieRegistry::admit_parked`]), a cleanup
+/// request has somewhere to LIVE: it is one bool on already-counted state, so
+/// there is no queue to bound and no admission to refuse.
+pub(crate) fn cookie_ingress() -> (CookieIngress, CookieWake) {
+  let ledger: CookieLedger = Arc::new(Mutex::new(LedgerInner::new()));
+  // Capacity 1, and the token is a bare `()`: it carries no request — it only says
+  // "some bit changed, sweep". A second wake against a full channel is therefore
+  // not a dropped request but a COALESCED one: the pending token's sweep has not
+  // run yet, so it will see every bit set before it takes the lock (§3.4).
+  let (wake_tx, wake_rx) = async_channel::bounded(1);
+  (
+    CookieIngress {
+      ledger: Arc::clone(&ledger),
+      wake: wake_tx,
+    },
+    CookieWake {
+      ledger,
+      wake: wake_rx,
+    },
+  )
+}
+
+/// The HANDLE side of the cookie-cleanup ingress: the shared ledger, and the wake.
+///
+/// Every public cleanup request — [`request_remove_cookie`] and
+/// [`request_cancel_sync`] — is exactly this: resolve the caller's address to an
+/// obligation through a projection, set that obligation's reap mark, ring the
+/// wake. It creates nothing, decides nothing, dispatches nothing, and retains
+/// nothing; the driver owns every reaction, on records it already owns.
+///
+/// [`request_remove_cookie`]: crate::Watcher::request_remove_cookie
+/// [`request_cancel_sync`]: crate::Watcher::request_cancel_sync
+///
+/// # A hostile flood retains NOTHING — structurally, not by draining
+///
+/// Per call: one mutex critical section (an O(1) projection lookup and, at most,
+/// one bool store on a PRE-EXISTING record) and one `try_send` into a capacity-1
+/// channel. No queue exists to grow, no entry is created, and an unaddressable
+/// target touches nothing at all — it does not even wake. The retained-memory
+/// delta of `loop { request_remove_cookie(random) }` is therefore ZERO, and the
+/// whole ingress-reachable state is `obligations` (≤ the global cap, enforced at
+/// admission, where a refusal creates nothing) plus one wake slot. Crucially this
+/// holds even when the driver is NEVER SCHEDULED — a current-thread runtime whose
+/// caller never yields — because the bound is a property of the SHAPE, not of a
+/// drain keeping up with a producer.
+///
+/// # A genuine request can never be refused — by TYPE
+///
+/// A genuine request names an obligation this watcher admitted, and both public
+/// addresses become valid strictly before a caller can legitimately hold them:
+/// `by_path` is filled by the claim, whose mutex section precedes the `sync_root`
+/// reply that is the ONLY place a caller learns the path (claim-before-reply);
+/// `by_name` is filled at admission, before `sync_root` can even be answered. The
+/// ingress locks the same mutex those writes took, so it observes them.
+///
+/// There is then no refusal edge on the genuine path: a mutex lock cannot fail
+/// (poisoning is absorbed — [`lock_ledger`]), a bool store cannot fail, and the
+/// wake is not load-bearing for admission (only for promptness — see
+/// [`CookieWake`]). There is NO CAPACITY ANYWHERE on the genuine path: the
+/// obligation IS the storage, so "never refuse a genuine unlink" and "bound the
+/// ingress" stop competing. The old lane could guarantee only one of them —
+/// unbounded bought admission at the cost of the bound; bounded would have traded
+/// it back.
+///
+/// # The door's trade-off, stated
+///
+/// An UNADDRESSABLE target — a path or name matching no live obligation — is
+/// dropped right here rather than queued to be discovered a no-op later. This is
+/// exact rather than heuristic, because the ledger is birth-to-terminal complete:
+/// an unknown address provably names no obligation of this watcher. The one
+/// caller-visible nuance: a caller that PREDICTS a cookie path before its
+/// `sync_root` reply arrives (possible only by re-deriving `dir.join(name)`
+/// out-of-contract) is dropped at the door where it would once have been queued
+/// and then found to be a no-op — the same net effect, now by construction.
+///
+/// The rule this generalizes to, for any lane added later: **every queue's
+/// occupancy must derive from a counted obligation or a driver-minted grant;
+/// anything else needs a door.**
+///
+/// Cloneable: it is a handle over shared state, and every clone addresses the one
+/// ledger. Nothing about the mechanism is per-holder.
+#[derive(Clone)]
+pub(crate) struct CookieIngress {
+  ledger: CookieLedger,
+  /// The capacity-1 wake. `Sender`, so the driver's `recv` observes the close
+  /// when the watcher drops — the same shape the command channel uses.
+  wake: async_channel::Sender<()>,
+}
+
+/// The DRIVER side of the cookie-cleanup ingress: the same ledger its registry is
+/// built around, and the wake it parks on.
+///
+/// # No request can be lost
+///
+/// The ingress orders **set the bit (under the mutex) → `try_send`**; the driver
+/// orders **`recv` → lock and sweep**. Given a bit set at instant *t*:
+///
+/// - the `try_send` SUCCEEDS ⇒ a token exists ⇒ some later `recv` consumes it, and
+///   the sweep that follows acquires the lock after our release ⇒ it sees our bit;
+/// - the `try_send` finds the channel FULL ⇒ a token was already enqueued and not
+///   yet consumed at *t* ⇒ the `recv` that consumes it happens no earlier than
+///   *t*, so the sweep following it locks after our release ⇒ it sees our bit.
+///   This is why a full wake is coalescing rather than lossy;
+/// - the channel is CLOSED ⇒ the driver is gone ⇒ its terminal sweep (the orderly
+///   close's, or the registry's `Drop` backstop) already owns every record
+///   regardless of any bit.
+///
+/// The retire and close sweeps remain the promptness backstop for every residual
+/// scheduling gap, exactly as before.
+pub(crate) struct CookieWake {
+  ledger: CookieLedger,
+  wake: async_channel::Receiver<()>,
+}
+
+impl CookieIngress {
+  /// Marks the obligation `resolve` names — the whole ingress. The lookup and the
+  /// store are ONE critical section, so no claim can interleave between them: a
+  /// cancel either finds the record already claimed (and the wake sweep reaps the
+  /// cookie through the phase machine) or marks it in time for
+  /// [`CookieGuard::claim`] to read the mark and refuse. There is no third
+  /// interleaving, and no second decision point that could disagree with the
+  /// driver — because this makes no decision at all.
+  ///
+  /// The mark is idempotent and monotone within a request cycle: set here, cleared
+  /// only by the driver, in the same critical section in which it ACTS on it.
+  fn mark(&self, resolve: impl FnOnce(&LedgerInner) -> Option<CookieId>) {
+    {
+      let mut inner = lock_ledger(&self.ledger);
+      let Some(id) = resolve(&inner) else {
+        // Unaddressable: not an obligation of this watcher. Nothing to store it
+        // on, and nothing to tell the driver about — drop it at the door.
+        return;
+      };
+      let Some(ob) = inner.obligations.get_mut(&id) else {
+        return;
+      };
+      ob.reap_requested = true;
+    }
+    // Ring the wake with the lock RELEASED: the critical section above must stay
+    // pure memory (no allocation, no I/O, no waker work), and the release is what
+    // the no-lost-request argument orders the send against (see [`CookieWake`]).
+    // A full channel means a wake is already pending, which is precisely the wake
+    // that will observe the bit just set — so ignoring the result is correct, not
+    // lossy. A closed channel means the driver is gone and its terminal sweep owns
+    // every record.
+    let _ = self.wake.try_send(());
+  }
+
+  /// Reaps the cookie at `path` — the public completed-cookie request, resolved
+  /// through the projection the claim filled.
+  pub(crate) fn request_remove(&self, path: &Path) {
+    self.mark(|inner| inner.by_path.get(path).copied());
+  }
+
+  /// Cancels the sync whose rendered cookie file is `name` — the public
+  /// cancel-by-name request. `by_name` is populated at ADMISSION, so this always
+  /// has a target whatever the obligation's phase: a sync still parked on its
+  /// fence, a write still in the pool, or a cookie already owned.
+  pub(crate) fn request_cancel(&self, name: &str) {
+    self.mark(|inner| inner.by_name.get(name).copied());
+  }
+
+  /// The live obligation count as the HANDLE sees it — the flood cell's oracle: it
+  /// reads the very ledger a public request transitions, so "the flood retained
+  /// nothing" is asserted on the structure itself rather than inferred from
+  /// process memory.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn ledger_len(&self) -> usize {
+    lock_ledger(&self.ledger).obligations.len()
+  }
+
+  /// How many wake tokens are outstanding — never more than 1 by construction.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn wake_len(&self) -> usize {
+    self.wake.len()
+  }
+}
+
 /// A detached-blocking-job spawner, captured from the driver's runtime so the
 /// registry's [`Drop`] can dispatch its best-effort abnormal-path unlinks
 /// off-reactor without an `R` type parameter in scope. `Send + Sync` (the
@@ -624,14 +816,17 @@ struct CookieRegistry<F: FsOps> {
 }
 
 impl<F: FsOps> CookieRegistry<F> {
-  fn new<R>(ops: F) -> Self
+  /// Takes the ledger rather than minting one: it is created at the watcher's
+  /// spawn ([`cookie_ingress`]) and shared with the handle, whose public cleanup
+  /// requests are transitions on the records this registry admits.
+  fn new<R>(ops: F, ledger: CookieLedger) -> Self
   where
     R: RuntimeLite,
   {
     Self {
       ops,
       shutdown: Arc::new(AtomicBool::new(false)),
-      ledger: Arc::new(Mutex::new(LedgerInner::new())),
+      ledger,
       retiring: HashMap::new(),
       roots: HashMap::new(),
       generations: HashMap::new(),
@@ -939,25 +1134,23 @@ impl<F: FsOps> CookieRegistry<F> {
   /// caller must now spawn an unlink, having transitioned that record to
   /// `Removing` here. Single-flight-per-record follows because only a state that
   /// is not already `Removing` can dispatch, and the transition happens before
-  /// the job exists. The cancel handler calls this inside its OWN critical
-  /// section (so the whole cancel decision is one lock acquisition); every other
+  /// the job exists. The wake sweep calls this inside its OWN critical
+  /// section (so one whole pass is one lock acquisition); every other
   /// producer routes through [`request_removal`](Self::request_removal).
   ///
-  /// `Explicit(path)` is path-addressed by contract (public `Remove(path)`): it
-  /// resolves `by_path` to the record CURRENTLY at the path. `Targeted(id)` and
-  /// `RetryDue(id)` address the incarnation directly, so a record displaced from
-  /// `by_path` by a same-path successor is still reachable, and a retired one is
-  /// a no-op — a stale internal actor never touches a successor incarnation.
+  /// EVERY request is id-addressed: no path-addressed removal decision exists in
+  /// the driver at all, because the one PUBLIC path-addressed request resolves
+  /// `by_path` at the door — under this same mutex, in the same critical section
+  /// that marks the record it found ([`CookieIngress::request_remove`]). So a
+  /// record displaced from `by_path` by a same-path successor stays reachable, and
+  /// a retired one is a no-op: a stale actor never touches a successor
+  /// incarnation.
   fn removal_decision_locked(
     inner: &mut LedgerInner,
     req: &RemovalRequest,
   ) -> Option<(PathBuf, CookieId)> {
-    // Resolve the target incarnation: the current occupant of a path for the
-    // public request, the named id itself for the internal ones. A missing
-    // record — already retired, or a foreign/unknown path — is idempotently
-    // nothing.
+    // A record that is missing — already retired — is idempotently nothing.
     let id = match req {
-      RemovalRequest::Explicit(path) => *inner.by_path.get(path.as_path())?,
       RemovalRequest::Targeted(id) | RemovalRequest::RetryDue(id) => *id,
     };
     let ob = inner.obligations.get_mut(&id)?;
@@ -969,24 +1162,21 @@ impl<F: FsOps> CookieRegistry<F> {
     // its pre-physical terminal, and an in-pool one reaps itself against the flags.
     let path = ob.path.clone()?;
     let attempts = match (&ob.phase, req) {
-      // Owned: a public request or a targeted sweep dispatches a fresh removal;
+      // Owned: a marked record or a targeted sweep dispatches a fresh removal;
       // a retry for a not-yet-failed record is a no-op.
-      (Phase::Owned, RemovalRequest::Explicit(_) | RemovalRequest::Targeted(_)) => Some(0),
+      (Phase::Owned, RemovalRequest::Targeted(_)) => Some(0),
       (Phase::Owned, RemovalRequest::RetryDue(_)) => None,
-      // RemoveFailed, SCHEDULED (its own retry owns it): coalesce for a public
-      // request or a targeted sweep; the due retry itself dispatches.
+      // RemoveFailed, SCHEDULED (its own retry owns it): coalesce for a marked
+      // record or a targeted sweep; the due retry itself dispatches.
       (
         Phase::RemoveFailed {
           retry_at: Some(_), ..
         },
-        RemovalRequest::Explicit(_) | RemovalRequest::Targeted(_),
+        RemovalRequest::Targeted(_),
       ) => None,
-      // RemoveFailed, PARKED: a public request or a targeted sweep RE-ARMS with a
+      // RemoveFailed, PARKED: a marked record or a targeted sweep RE-ARMS with a
       // fresh budget.
-      (
-        Phase::RemoveFailed { retry_at: None, .. },
-        RemovalRequest::Explicit(_) | RemovalRequest::Targeted(_),
-      ) => Some(0),
+      (Phase::RemoveFailed { retry_at: None, .. }, RemovalRequest::Targeted(_)) => Some(0),
       // The retry dispatcher fired for a due record: dispatch it preserving the
       // attempt count toward the budget.
       (Phase::RemoveFailed { attempts, .. }, RemovalRequest::RetryDue(_)) => Some(*attempts),
@@ -1004,10 +1194,10 @@ impl<F: FsOps> CookieRegistry<F> {
     Some((path, id))
   }
 
-  /// The ONE unlink dispatch point routed to by the reap lane, `retire_scope`,
-  /// `sweep_owned`, and the retry dispatcher (the cancel handler uses the
-  /// `_locked` core directly). Decides under the ledger lock, spawns after
-  /// unlock.
+  /// The ONE unlink dispatch point routed to by `retire_scope`, `sweep_owned`,
+  /// the recovery re-arm, and the retry dispatcher (the wake sweep uses the
+  /// `_locked` core directly, so one pass is one lock acquisition). Decides under
+  /// the ledger lock, spawns after unlock.
   fn request_removal<R>(
     &self,
     op_tx: &async_channel::Sender<OpResult<F::Handle>>,
@@ -1024,39 +1214,52 @@ impl<F: FsOps> CookieRegistry<F> {
     }
   }
 
-  /// The under-one-lock half of a cancel-by-NAME (§2.4/§2.6): resolves the name
-  /// to its obligation and MARKS it, then decides its removal, all in ONE
-  /// critical section — so no claim can interleave between the lookup and the
-  /// mark. The owned-case unlink spawn happens AFTER unlock.
+  /// The PHYSICAL half of the wake sweep: ONE O(ledger) pass that routes every
+  /// MARKED obligation through the same phase machine every other producer routes
+  /// through, deciding under the lock and spawning after it is released — the
+  /// invariable rule, since an unlink on a hung mount under this mutex would
+  /// serialize every other critical section behind it, the caller-facing ingress
+  /// included.
   ///
-  /// The mark is set whatever the phase, and each phase's own owner reacts to it:
-  /// a claimed record is reaped through the phase machine right here; a write
-  /// still IN THE POOL has no path, so nothing is dispatched here — its claim
-  /// reads the mark, refuses, and the write self-reaps the file it created; a
-  /// sync still PARKED on its fence has no path either — the driver's parked
-  /// sweep reads the mark and retires it pre-physically, and its dispatch would
-  /// refuse on the same mark. The mark is inert for a record whose claim has
-  /// already run, and it dies with the record either way.
+  /// The mark is cleared EXACTLY when the sweep acts on it — i.e. iff the decision
+  /// transitioned the record to `Removing` and this call will spawn its unlink.
+  /// That equivalence is what each surviving mark then means:
   ///
-  /// A name matching NO obligation has already fully resolved: since `by_name` is
-  /// populated at ADMISSION, a still-parked sync always has a record here, so
-  /// there is nothing to look aside for and the cancel is simply dropped —
-  /// nothing is recorded for a sync that does not exist (the boundedness rule).
-  fn cancel_locked<R>(&self, op_tx: &async_channel::Sender<OpResult<F::Handle>>, name: &str)
+  /// - `Parked` — pre-physical, so nothing is dispatched (no path, no file). Its
+  ///   terminal is the caller-answering one [`retire_parked_cookies`] runs.
+  /// - `InPool` — only the write knows where its cookie will land, so nothing is
+  ///   dispatched. The mark is what its claim reads, refuses on, and self-reaps
+  ///   against; it dies with the record.
+  /// - `Removing` / SCHEDULED `RemoveFailed` — an unlink or a deadline already
+  ///   owns this record's fate, so the request COALESCES onto it. The mark stays,
+  ///   so a later failure leaves a record any subsequent wake re-arms.
+  /// - PARKED `RemoveFailed` — budget-spent and unscheduled: the request re-arms it
+  ///   with a fresh budget, which is the demand edge that makes a fresh reap or
+  ///   cancel accelerate a stalled backlog.
+  fn sweep_reap_marks<R>(&self, op_tx: &async_channel::Sender<OpResult<F::Handle>>)
   where
     R: RuntimeLite,
   {
-    let dispatch = {
+    let dispatch: Vec<(PathBuf, CookieId)> = {
       let mut inner = lock_ledger(&self.ledger);
-      let Some(&id) = inner.by_name.get(name) else {
-        return;
-      };
-      if let Some(ob) = inner.obligations.get_mut(&id) {
-        ob.reap_requested = true;
-      }
-      Self::removal_decision_locked(&mut inner, &RemovalRequest::Targeted(id))
+      let marked: Vec<CookieId> = inner
+        .obligations
+        .values()
+        .filter(|ob| ob.reap_requested)
+        .map(|ob| ob.id)
+        .collect();
+      marked
+        .into_iter()
+        .filter_map(|id| {
+          let decided = Self::removal_decision_locked(&mut inner, &RemovalRequest::Targeted(id))?;
+          if let Some(ob) = inner.obligations.get_mut(&id) {
+            ob.reap_requested = false;
+          }
+          Some(decided)
+        })
+        .collect()
     };
-    if let Some((path, id)) = dispatch {
+    for (path, id) in dispatch {
       self.spawn_unlink::<R>(op_tx, path, id);
     }
   }
@@ -1251,23 +1454,20 @@ impl<F: FsOps> CookieRegistry<F> {
 }
 
 /// Which producer is asking [`CookieRegistry::removal_decision_locked`] to
-/// remove a cookie — the three callers with different addressing/re-arm
-/// semantics.
+/// remove a cookie — the two callers with different addressing/re-arm
+/// semantics. Both address ONE incarnation by id: with the cleanup queue gone,
+/// the public path-addressed request resolves its path to an id at the door, so
+/// no path-addressed removal decision survives here.
 #[derive(Clone)]
 enum RemovalRequest {
-  /// A PUBLIC path-addressed request — the reap-lane `Remove(path)`: acts on the
-  /// record CURRENTLY at the path, resolved through `by_path` under the same
-  /// lock as the decision. That is the request's honest contract ("remove the
-  /// cookie at this path") — the one deliberately path-addressed removal left.
+  /// A targeted request — a marked record on the wake sweep, a retire sweep, the
+  /// close sweep, a recovery re-arm: addresses one incarnation by id, and a no-op
+  /// if that incarnation has been retired (a sweep never touches a successor
+  /// incarnation it did not select — it may belong to a different, live scope).
   /// `Owned` dispatches; a PARKED `RemoveFailed` re-arms with a fresh budget; a
-  /// scheduled `RemoveFailed` or a `Removing` coalesces; a write still in the
-  /// pool has no path, so it is unreachable this way and reaps itself.
-  Explicit(PathBuf),
-  /// An INTERNAL targeted request — cancel-by-name, retire sweep, close sweep,
-  /// recovery re-arm: addresses one incarnation by id. Same transition table as
-  /// `Explicit`, and a no-op if that incarnation has been retired — an internal
-  /// sweep never touches a successor incarnation it did not select (it may
-  /// belong to a different, live scope).
+  /// scheduled `RemoveFailed` or a `Removing` coalesces; a sync still parked and a
+  /// write still in the pool are pre-physical, so neither is addressable for
+  /// removal — the pool write reaps itself against the flags and the mark.
   Targeted(CookieId),
   /// The retry dispatcher, firing a due deadline: dispatches only a
   /// `RemoveFailed` record, PRESERVING its attempt count toward the budget; a
@@ -1753,8 +1953,13 @@ fn resolve_cover_settlements<R, F>(
     if let Some(cookie) = parked_cookies.remove(&fence) {
       let _ = settle;
       // The obligation this fence carries: born at its sync's admission, so it is
-      // always here — the routing entry above and the record move in lockstep.
+      // always here — the routing entry above and the record move in lockstep,
+      // which is why nothing below has to tolerate a missing record. Should that
+      // lockstep ever be broken by a later change, the caller is still ANSWERED
+      // rather than left to read a bare `Closed` off a dropped reply: no routing
+      // entry may be discarded without resolving the barrier it carries.
       let Some((id, scope, name)) = cookies.parked_on(fence) else {
+        let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
       };
       // The root the cookie must stay inside — and, being recorded on the same
@@ -3072,18 +3277,6 @@ enum OpResult<H> {
   },
 }
 
-/// The dedicated cleanup lane's message: the completed-cookie reap hint plus a
-/// cancel-by-name request, so a delivered-but-unread write can never orphan its
-/// cookie. Same channel, same guarantees (unbounded, admission guaranteed,
-/// ranked below `commands` and above the source stream).
-pub(crate) enum CookieReap {
-  /// Unlink the cookie at `path` (the completed-cookie reap hint).
-  Remove(PathBuf),
-  /// Cancel the sync whose cookie NAME this is: reap it if owned, tombstone it
-  /// if still in the pool, drop the request if unknown.
-  Cancel(String),
-}
-
 /// The earlier of two optional deadlines (the core's timer and the earliest due
 /// cookie retry), in proto-`Instant` space.
 fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
@@ -3121,15 +3314,26 @@ fn dispatch_due_cookie_retries<R, F>(
   }
 }
 
-/// Services one dedicated-lane cleanup message — a `Remove` hint or a
-/// `Cancel`-by-name — through the removal state machine. Called from BOTH the
-/// live-loop's `cookie_removes` select arm AND a loop-top fairness drain, so a
-/// sustained command flood (the biased select polls `commands` first) cannot
-/// starve the cleanup lane: a queued reap is serviced once per iteration
-/// regardless, keeping cookies from lingering owned and the unbounded lane from
-/// backing up.
-fn handle_cookie_reap<R, F>(
-  reap: CookieReap,
+/// The driver's WHOLE reaction to the public cleanup ingress: one pass over the
+/// reap marks, servicing every request that has landed since the last pass.
+///
+/// The wake that triggers this carries no request — it only says "some bit
+/// changed" — so the sweep re-reads the marks rather than a queue, and requests
+/// against one record naturally coalesce into one action. It costs one O(ledger)
+/// pass, which the global cap bounds, and it is self-limiting (each action clears
+/// the mark that caused it), so the biased select's arm order stays a valid
+/// starvation fence.
+///
+/// Both halves take the marks as their whole selection, so neither needs to be
+/// told which request arrived:
+///
+/// - the PHYSICAL half dispatches an unlink for every marked record that has a
+///   file and no removal already in flight;
+/// - the PRE-PHYSICAL half retires every marked record still PARKED on its settle
+///   fence, answering its barrier `Retired` and abandoning the fence — so a sync
+///   cancelled before its write was ever dispatched creates no file at all, which
+///   is the same refusal its claim would have made, one phase earlier.
+fn sweep_reap_requests<R, F>(
   cookies: &CookieRegistry<F>,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
@@ -3138,27 +3342,8 @@ fn handle_cookie_reap<R, F>(
   R: RuntimeLite,
   F: FsOps,
 {
-  match reap {
-    // A completed-cookie reap hint: route through the phase machine — at most ONE
-    // unlink job per record ever, duplicates coalesce. A path the registry no
-    // longer owns is idempotently nothing.
-    CookieReap::Remove(path) => {
-      cookies.request_removal::<R>(op_tx, RemovalRequest::Explicit(path));
-    }
-    // A cancel-by-name: mark the named obligation — whatever its phase — and reap
-    // it through the phase machine, the whole decision under ONE ledger lock
-    // (§2.4). A name matching no obligation has already resolved and is dropped.
-    CookieReap::Cancel(name) => {
-      cookies.cancel_locked::<R>(op_tx, &name);
-      // A cancel that named a still-PARKED sync marked its obligation and
-      // dispatched nothing — only a record with a path has a file to unlink. The
-      // mark is acted on here: the obligation is retired pre-physically, its
-      // barrier answered `Retired`, and its fence abandoned, so no write is ever
-      // made for a sync already cancelled (T13). Marked records are the sweep's
-      // whole selection, so this needs no name of its own.
-      retire_parked_cookies(core, parked_cookies, cookies, &|ob, _| ob.reap_requested);
-    }
-  }
+  cookies.sweep_reap_marks::<R>(op_tx);
+  retire_parked_cookies(core, parked_cookies, cookies, &|ob, _| ob.reap_requested);
 }
 
 /// Handles a `CookieRemoveDone` (§2.3), identical in the live arm and the close
@@ -3186,21 +3371,27 @@ fn on_cookie_remove_done<F: FsOps>(
 /// command arrives. Consumes the command receiver and the event sender; the
 /// sender dropping is the consumer's end-of-stream.
 ///
-/// `cookie_removes` is the DEDICATED cookie cleanup lane, separate from
-/// `commands` so a saturated command channel can never drop a reap or a cancel
-/// (see the arm below). It is unbounded, and bounded in practice by the
-/// in-flight resolved syncs the loop drains it against — it cannot accrue.
+/// `cleanup` is this driver's half of the cookie-cleanup ingress
+/// ([`cookie_ingress`]): the ledger it shares with the watcher handle, and the
+/// coalescing wake the handle rings after marking one of this driver's own
+/// obligations. There is no cleanup QUEUE — a public reap or cancel is a
+/// transition on an already-counted record, so it can neither be refused nor
+/// accrue, whatever the command traffic or the runtime's scheduling.
 pub(crate) async fn run<R, F>(
   config: DriverConfig,
   ops: F,
   commands: async_channel::Receiver<Command>,
-  cookie_removes: async_channel::Receiver<CookieReap>,
+  cleanup: CookieWake,
   events: async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   registry: impl ScopeRegistry,
 ) where
   R: RuntimeLite,
   F: FsOps,
 {
+  let CookieWake {
+    ledger,
+    wake: reap_wake,
+  } = cleanup;
   let mut core = DriverCore::new(
     config.effective_move_window(),
     config.root_liveness_interval,
@@ -3278,17 +3469,24 @@ pub(crate) async fn run<R, F>(
   // `Command::SyncRoot`): the write dispatches to the blocking pool once the
   // scope's re-arm work quiesces, whatever the settle's verdict.
   let mut parked_cookies: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
-  // The OWNER of every cookie this driver writes, from its write's DISPATCH —
-  // the instant a file can start existing — until that obligation earns a typed
-  // terminal, its scope's stream tears down, or this local drops. Every gauge the
-  // cookie lifecycle needs is a probe of this one ledger: the single-flight write
-  // gate, the per-scope backlog, the global cap, the retry schedule, and the close
+  // The OWNER of every cookie this driver writes, from its sync's ADMISSION —
+  // before any file can exist — until that obligation earns a typed terminal, its
+  // scope's stream tears down, or this local drops. Every gauge the cookie
+  // lifecycle needs is a probe of this one ledger: the single-flight write gate,
+  // the per-scope backlog, the global cap, the retry schedule, and the close
   // count. Ownership never rides the reply oneshot, so a caller that abandons its
   // sync cannot strand a file and no source-side removal queue is needed; the
   // orderly close sweeps owned cookies as tracked jobs, and the registry's `Drop`
   // reaps any remainder best-effort so a panicking or CANCELLED driver task still
   // cleans up.
-  let mut cookies = CookieRegistry::new::<R>(ops.clone());
+  //
+  // The ledger is the SHARED half of the cleanup ingress rather than this task's
+  // private state: the watcher handle marks the records this registry admits, so
+  // both are views on one store under one mutex — the same sharing shape the root
+  // set has. It outlives this task inside the handle's `Arc`, which is inert: with
+  // the driver gone, a mark lands on an empty ledger (the terminal sweep already
+  // retired everything) and the wake `try_send` finds a closed channel.
+  let mut cookies = CookieRegistry::new::<R>(ops.clone(), ledger);
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
   // driver keeps a sender so grants can always be minted, which is fine —
   // exit is driven by the COMMAND channel, and this receiver merely pends.
@@ -3318,15 +3516,16 @@ pub(crate) async fn run<R, F>(
     // belt-and-suspenders the timer arm below shares.
     dispatch_due_cookie_retries::<R, F>(&cookies, &op_tx, now());
 
-    // Fairness for the dedicated cleanup lane: the select below is command-biased
-    // (it polls `commands` before `cookie_removes`), so a caller that keeps the
-    // bounded command mailbox continuously ready would otherwise STARVE cleanup —
-    // cookies would linger owned and the unbounded lane back up without bound.
-    // Servicing at most ONE queued reap here, every iteration, guarantees the lane
-    // makes steady progress whatever the command load, while preserving the
-    // command/close priority the biased select gives.
-    if let Ok(reap) = cookie_removes.try_recv() {
-      handle_cookie_reap::<R, F>(reap, &cookies, &op_tx, &mut parked_cookies, &mut core);
+    // Fairness for the cleanup ingress: the select below is command-biased (it
+    // polls `commands` before the wake), so a caller that keeps the bounded
+    // command mailbox continuously ready would otherwise STARVE cleanup and leave
+    // cookies lingering owned. Consuming a PENDING wake here, every iteration,
+    // guarantees cleanup makes steady progress whatever the command load, while
+    // preserving the command/close priority the biased select gives. Cheap by
+    // construction: no wake pending means no request has landed since the last
+    // sweep, so this is one non-blocking probe.
+    if reap_wake.try_recv().is_ok() {
+      sweep_reap_requests::<R, F>(&cookies, &op_tx, &mut parked_cookies, &mut core);
     }
 
     // Set-cover settlements resolve at this one choke point — after the
@@ -4023,16 +4222,17 @@ pub(crate) async fn run<R, F>(
         // The watcher facade dropped: same orderly teardown, nobody to tell.
         Err(_) => break None,
       },
-      // The DEDICATED cookie cleanup lane, ranked below `commands` so it can
-      // never starve a Close, and above the source stream. Its admission is
-      // guaranteed (unbounded), so a saturated command channel can no longer
-      // drop a reap or a cancel. A closed lane leaves this inert: the watcher
-      // drops both senders together, so `commands` (higher-priority) fires its
-      // `break None` first — this arm is never selected on the way out, and any
-      // reap still buffered is reaped by the terminal registry sweep.
-      reap = cookie_removes.recv().fuse() => {
-        if let Ok(reap) = reap {
-          handle_cookie_reap::<R, F>(reap, &cookies, &op_tx, &mut parked_cookies, &mut core);
+      // The cookie-cleanup wake, ranked below `commands` so it can never starve a
+      // Close, and above the source stream. It cannot drop a request whatever the
+      // command load: the request is already ON its record before this fires, and
+      // this only says one has landed. A closed wake leaves this inert: the
+      // watcher drops the wake and the command sender together, so `commands`
+      // (higher-priority) fires its `break None` first — this arm is never
+      // selected on the way out, and the terminal sweep below owns every record
+      // regardless of any mark.
+      wake = reap_wake.recv().fuse() => {
+        if wake.is_ok() {
+          sweep_reap_requests::<R, F>(&cookies, &op_tx, &mut parked_cookies, &mut core);
         }
       },
       msg = os.next() => {

@@ -16,14 +16,14 @@ fn _assert_watcher_sync<R: RuntimeLite>() {
 /// platform), so registration protocols are observable in isolation.
 fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>) {
   let (command_tx, command_rx) = async_channel::bounded(16);
-  // No driver task drains it; these protocol tests never reap a cookie.
-  let (cookie_remove_tx, _cookie_remove_rx) = async_channel::unbounded();
+  // No driver task holds the other half; these protocol tests never reap a cookie.
+  let (cleanup, _cookie_wake) = crate::driver::cookie_ingress();
   let (_event_tx, event_rx) = async_channel::bounded::<(ScopeId, Arc<PathBuf>, Change)>(4);
   (
     Watcher {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
-      cookie_removes: cookie_remove_tx,
+      cleanup,
       events: Box::pin(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
       _runtime: PhantomData,
@@ -1420,6 +1420,62 @@ mod lifecycle {
       let _ = std::fs::remove_dir_all(&dir_b);
       let _ = std::fs::remove_dir_all(&dir_v);
     }
+  }
+
+  /// A hostile flood of the PUBLIC cleanup requests retains NOTHING — the whole
+  /// point of the cleanup ingress being a mark on a counted obligation rather than
+  /// a queue.
+  ///
+  /// The cell is deliberately the WORST case for a queue: a current-thread runtime
+  /// on which the driver task, though spawned, is NEVER SCHEDULED — the flooding
+  /// caller holds the only thread and awaits nothing — so no drain can rescue the
+  /// bound. Against the old design (an unbounded lane fed by zero-validation
+  /// `try_send`s, with dedup only after dequeue) this is precisely the reported
+  /// growth vector: every one of these calls would allocate and retain one
+  /// caller-sized message.
+  ///
+  /// The assertions are the STRUCTURAL quantities rather than process memory
+  /// (which is not deterministic): the ledger is the only place a cleanup request
+  /// can live, and the wake is the only channel the ingress touches.
+  ///
+  /// Fail-on-old: with the door removed and the wake unbounded (the old lane's
+  /// shape — enqueue anything, resolve later), the wake grows to one entry per
+  /// call and the `<= 1` assertion fails on the very first check.
+  #[tokio::test(flavor = "current_thread")]
+  async fn a_hostile_cleanup_flood_retains_nothing_with_the_driver_unscheduled() {
+    let fs = FakeFs::new(1);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    // Nothing is awaited from here on: on a current-thread runtime the driver task
+    // cannot run at all, so every bound below is proven WITHOUT a drain.
+    for i in 0..100_000u64 {
+      watcher.request_remove_cookie(PathBuf::from(format!("/r/.tributaries-sync-{i}")));
+      watcher.request_cancel_sync(format!(".tributaries-sync-{i}"));
+      // Duplicates of one target are the other half of the vector: the old lane
+      // queued each one, because it deduplicated only after dequeue.
+      watcher.request_remove_cookie(PathBuf::from("/r/.tributaries-sync-dup"));
+      watcher.request_cancel_sync(".tributaries-sync-dup");
+    }
+
+    assert_eq!(
+      watcher.cleanup.ledger_len(),
+      0,
+      "no request created an obligation: the flood addressed nothing this watcher \
+       ever admitted, so it had nowhere to be stored"
+    );
+    assert!(
+      watcher.cleanup.wake_len() <= 1,
+      "the wake is capacity-1 and carries no request, so 400k calls cannot grow it \
+       past one token: {}",
+      watcher.cleanup.wake_len()
+    );
+
+    // The driver is still perfectly healthy: the flood cost it nothing to ignore,
+    // and a genuine sync still admits (its refusals were never consumed).
+    let watched = watcher.registry_len();
+    assert_eq!(watched, 0, "no root was ever watched");
+    watcher.close().await.expect("close");
   }
 }
 

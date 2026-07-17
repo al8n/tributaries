@@ -14,7 +14,10 @@ use crate::os::{FsEventFlags, RawOsEvent};
 struct Rig {
   fs: FakeFs,
   commands: async_channel::Sender<Command>,
-  cookie_removes: async_channel::Sender<CookieReap>,
+  /// The watcher handle's half of the cookie-cleanup ingress: the suites drive
+  /// the PUBLIC reap and cancel through exactly what `Watcher` calls, on the very
+  /// ledger this rig's driver admits into.
+  cleanup: CookieIngress,
   events: async_channel::Receiver<(ScopeId, Arc<PathBuf>, Change)>,
 }
 
@@ -65,20 +68,20 @@ fn rig_with_config(event_capacity: usize, config: DriverConfig) -> Rig {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
-  let (reap_tx, reap_rx) = async_channel::unbounded();
+  let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     config,
     fs.clone(),
     cmd_rx,
-    reap_rx,
+    cookie_wake,
     ev_tx,
     NullRegistry,
   ));
   Rig {
     fs,
     commands: cmd_tx,
-    cookie_removes: reap_tx,
+    cleanup,
     events: ev_rx,
   }
 }
@@ -87,20 +90,20 @@ fn rig_with(event_capacity: usize, registry: impl ScopeRegistry) -> Rig {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
-  let (reap_tx, reap_rx) = async_channel::unbounded();
+  let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     config(),
     fs.clone(),
     cmd_rx,
-    reap_rx,
+    cookie_wake,
     ev_tx,
     registry,
   ));
   Rig {
     fs,
     commands: cmd_tx,
-    cookie_removes: reap_tx,
+    cleanup,
     events: ev_rx,
   }
 }
@@ -1026,20 +1029,20 @@ async fn spawn_seed_carries_a_preexisting_submount() {
   fs.put("/r", FileKind::Dir, 1);
   fs.seed_mounts(vec![PathBuf::from("/r/vol")]);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
-  let (reap_tx, reap_rx) = async_channel::unbounded();
+  let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(64);
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     config(),
     fs.clone(),
     cmd_rx,
-    reap_rx,
+    cookie_wake,
     ev_tx,
     NullRegistry,
   ));
   let rig = Rig {
     fs,
     commands: cmd_tx,
-    cookie_removes: reap_tx,
+    cleanup,
     events: ev_rx,
   };
   watch(&rig, "/r").await;
@@ -1343,20 +1346,20 @@ mod descending {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
-    let (reap_tx, reap_rx) = async_channel::unbounded();
+    let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       inotify_config(),
       fs.clone(),
       cmd_rx,
-      reap_rx,
+      cookie_wake,
       ev_tx,
       NullRegistry,
     ));
     Rig {
       fs,
       commands: cmd_tx,
-      cookie_removes: reap_tx,
+      cleanup,
       events: ev_rx,
     }
   }
@@ -1766,20 +1769,20 @@ mod descending {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
-    let (reap_tx, reap_rx) = async_channel::unbounded();
+    let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       inotify_config(),
       fs.clone(),
       cmd_rx,
-      reap_rx,
+      cookie_wake,
       ev_tx,
       registry,
     ));
     Rig {
       fs,
       commands: cmd_tx,
-      cookie_removes: reap_tx,
+      cleanup,
       events: ev_rx,
     }
   }
@@ -2630,13 +2633,9 @@ mod descending {
       let name = ".tributaries-sync-parked-cancel";
       let (hold, on_reply) = park_a_sync(&rig, scope, name).await;
 
-      // Cancel by name while parked: the reap lane marks the obligation and the
-      // driver retires it pre-physically, answering the caller Retired.
-      rig
-        .cookie_removes
-        .send(CookieReap::Cancel(name.to_owned()))
-        .await
-        .unwrap();
+      // Cancel by name while parked: the ingress marks the obligation and the
+      // driver's wake sweep retires it pre-physically, answering the caller Retired.
+      rig.cleanup.request_cancel(name);
       assert!(
         matches!(
           tokio::time::timeout(Duration::from_secs(5), on_reply)
@@ -3420,7 +3419,7 @@ mod descending {
       fs.put("/r/d", FileKind::Dir, 11);
       fs.spawn_backend(BackendKind::Inotify);
       let (cmd_tx, cmd_rx) = async_channel::bounded(16);
-      let (reap_tx, reap_rx) = async_channel::unbounded();
+      let (cleanup, cookie_wake) = cookie_ingress();
       let (ev_tx, ev_rx) = async_channel::bounded(64);
       tokio::spawn(run::<TokioRuntime, FakeFs>(
         DriverConfig {
@@ -3429,14 +3428,14 @@ mod descending {
         },
         fs.clone(),
         cmd_rx,
-        reap_rx,
+        cookie_wake,
         ev_tx,
         NullRegistry,
       ));
       let rig = Rig {
         fs,
         commands: cmd_tx,
-        cookie_removes: reap_tx,
+        cleanup,
         events: ev_rx,
       };
       let scope = watch(&rig, "/r").await;
@@ -4533,6 +4532,23 @@ mod sync_cookie {
     DriverCore::new(Duration::from_millis(1), Duration::from_secs(30))
   }
 
+  /// A registry over a ledger nothing else holds — the cells that drive the
+  /// registry directly and never exercise the public cleanup ingress.
+  fn registry(fs: FakeFs) -> CookieRegistry<FakeFs> {
+    let (_, wake) = cookie_ingress();
+    CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs, wake.ledger)
+  }
+
+  /// A registry and the HANDLE-side ingress over ONE shared ledger — the pair
+  /// `spawn_with` mints in production, so a registry-level cell can drive the real
+  /// public request against real records with no driver loop in between (the wake
+  /// half is returned so the cell owns the token stream).
+  fn registry_with_ingress(fs: FakeFs) -> (CookieRegistry<FakeFs>, CookieIngress, CookieWake) {
+    let (cleanup, wake) = cookie_ingress();
+    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs, Arc::clone(&wake.ledger));
+    (reg, cleanup, wake)
+  }
+
   /// Admits one sync and dispatches its write, straight against the registry: the
   /// two steps a live driver runs — BIRTH at admission (parked on a fence) and the
   /// `Parked → InPool` transition at that fence's settle — for the cells that need
@@ -4688,13 +4704,13 @@ mod sync_cookie {
     let fs = FakeFs::new(1);
     fs.put("/r", FileKind::Dir, 1);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
-    let (reap_tx, reap_rx) = async_channel::unbounded();
+    let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
     let driver = tokio::spawn(run::<TokioRuntime, FakeFs>(
       config(),
       fs.clone(),
       cmd_rx,
-      reap_rx,
+      cookie_wake,
       ev_tx,
       NullRegistry,
     ));
@@ -4702,7 +4718,7 @@ mod sync_cookie {
       Rig {
         fs,
         commands: cmd_tx,
-        cookie_removes: reap_tx,
+        cleanup,
         events: ev_rx,
       },
       driver,
@@ -4734,12 +4750,8 @@ mod sync_cookie {
       "the cookie's own event rides the root's ordered queue"
     );
 
-    // And it reaps, idempotently — on the dedicated cleanup lane.
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    // And it reaps, idempotently — through the public cleanup ingress.
+    rig.cleanup.request_remove(&path);
     settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert_eq!(rig.fs.cookie_removes(), vec![path]);
   }
@@ -5025,11 +5037,7 @@ mod sync_cookie {
     // And the registry owns the path the write ACTUALLY landed at — the
     // caller's remove (keyed off that same returned path) finds it.
     assert_eq!(cookie_count(&rig).await, 1);
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
     settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert_eq!(rig.fs.cookie_removes(), vec![path]);
     assert_eq!(
@@ -5435,12 +5443,13 @@ mod sync_cookie {
     );
   }
 
-  // The completed-cookie reap rides a DEDICATED lane, so a saturated command
-  // channel can never drop it. With the 16-slot command channel provably full,
-  // every reap still lands and the registry returns to zero while the scope stays
-  // live. A single-threaded runtime makes the saturation deterministic: the fill
-  // burst yields nowhere, so the driver cannot drain a slot until the next await.
-  // MUST hang (or leak) if the removal rode the command channel.
+  // The completed-cookie reap never touches the command channel, so a saturated
+  // one cannot drop it: the request is a mark on the obligation itself. With the
+  // 16-slot command channel provably full, every reap still lands and the registry
+  // returns to zero while the scope stays live. A single-threaded runtime makes
+  // the saturation deterministic: the fill burst yields nowhere, so the driver
+  // cannot drain a slot until the next await. MUST hang (or leak) if the removal
+  // rode the command channel.
   #[tokio::test(flavor = "current_thread")]
   async fn saturated_command_channel_still_reaps_completed_cookies() {
     let rig = rig_with_capacity(64);
@@ -5476,13 +5485,12 @@ mod sync_cookie {
       "the command channel is saturated"
     );
 
-    // Every completed cookie reaps through the DEDICATED lane — admitted despite
-    // the jammed command channel.
+    // Every completed cookie reaps despite the jammed command channel — and the
+    // request cannot even be expressed as a refusal: it is a mark on a record the
+    // driver already holds, so there is no channel here to jam and no outcome to
+    // check.
     for path in &cookies {
-      rig
-        .cookie_removes
-        .try_send(CookieReap::Remove(path.clone()))
-        .expect("the cleanup lane always admits");
+      rig.cleanup.request_remove(path);
     }
 
     // Draining the fillers frees the command channel; the reaps land, the
@@ -5524,11 +5532,7 @@ mod sync_cookie {
 
     // The next unlink fails once; the reap dispatches it and it is refused.
     rig.fs.fail_next_cookie_removes(1);
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
     settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
     assert_eq!(
       rig.fs.cookie_remove_dispatches(),
@@ -5777,11 +5781,7 @@ mod sync_cookie {
 
     // The abandon arm cancels by NAME: the driver finds it OWNED and reaps it through the
     // removal state machine.
-    rig
-      .cookie_removes
-      .send(CookieReap::Cancel(name.to_owned()))
-      .await
-      .unwrap();
+    rig.cleanup.request_cancel(name);
     settle(|| rig.fs.cookie_removes().contains(&path)).await;
     assert!(
       rig.fs.cookie_removes().contains(&path),
@@ -5828,11 +5828,7 @@ mod sync_cookie {
     // Cancel by name while it is in the pool: the write's obligation exists (it was born at
     // dispatch), so the cancel MARKS it. Nothing is dispatched — only the write knows where its
     // cookie will land.
-    rig
-      .cookie_removes
-      .send(CookieReap::Cancel(name.to_owned()))
-      .await
-      .unwrap();
+    rig.cleanup.request_cancel(name);
     settle_reap_marks(&rig, 1).await;
     assert_eq!(
       reap_marks(&rig).await,
@@ -5882,11 +5878,7 @@ mod sync_cookie {
 
     // Ordering A — cancel an UNKNOWN name: dropped at the lookup. There is no obligation of that
     // name, so there is nothing a mark could even be stored on.
-    rig
-      .cookie_removes
-      .send(CookieReap::Cancel(".tributaries-sync-nobody".to_owned()))
-      .await
-      .unwrap();
+    rig.cleanup.request_cancel(".tributaries-sync-nobody");
     for _ in 0..8 {
       tokio::task::yield_now().await;
     }
@@ -5903,11 +5895,7 @@ mod sync_cookie {
       let hold = rig.fs.hold_cookie_writes();
       let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
       settle(|| rig.fs.cookie_dispatches() == 1).await;
-      rig
-        .cookie_removes
-        .send(CookieReap::Cancel(name.to_owned()))
-        .await
-        .unwrap();
+      rig.cleanup.request_cancel(name);
       settle_reap_marks(&rig, 1).await;
       assert_eq!(
         reap_marks(&rig).await,
@@ -5931,11 +5919,7 @@ mod sync_cookie {
       let name = ".tributaries-sync-1-3-2";
       let path = admit_sync(&rig, scope, "/r", name).await;
       settle_cookie_count(&rig, 1).await;
-      rig
-        .cookie_removes
-        .send(CookieReap::Cancel(name.to_owned()))
-        .await
-        .unwrap();
+      rig.cleanup.request_cancel(name);
       settle(|| rig.fs.cookie_removes().contains(&path)).await;
       settle_cookie_count(&rig, 0).await;
       assert_eq!(
@@ -6088,11 +6072,7 @@ mod sync_cookie {
     // The terminal unlink hangs; a caller storms 50 reap requests against it.
     let hold = rig.fs.hold_cookie_removes();
     for _ in 0..50 {
-      rig
-        .cookie_removes
-        .send(CookieReap::Remove(path.clone()))
-        .await
-        .unwrap();
+      rig.cleanup.request_remove(&path);
     }
     // The first dispatches ONE unlink (now `Removing`); the other 49 coalesce.
     settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
@@ -6128,11 +6108,7 @@ mod sync_cookie {
 
     // ONE reap request; the first unlink fails transiently.
     rig.fs.fail_next_cookie_removes(1);
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
 
     settle(|| rig.fs.files_under("/r").is_empty()).await;
     assert!(
@@ -6162,11 +6138,7 @@ mod sync_cookie {
 
     // The unlink fails effectively forever.
     rig.fs.fail_next_cookie_removes(10_000);
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
 
     // One initial attempt plus a budget of 3 retries, then the record PARKS.
     settle(|| rig.fs.cookie_remove_dispatches() == 4).await;
@@ -6193,11 +6165,7 @@ mod sync_cookie {
     );
 
     // A fresh explicit reap RE-ARMS the parked record with a fresh budget (T9): dispatches grow.
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
     settle(|| rig.fs.cookie_remove_dispatches() >= 5).await;
     assert!(
       rig.fs.cookie_remove_dispatches() >= 5,
@@ -6236,11 +6204,7 @@ mod sync_cookie {
     for seq in 0..3 {
       let name = format!(".tributaries-sync-3-4-{seq}");
       let path = admit_sync(&rig, scope, "/r", &name).await;
-      rig
-        .cookie_removes
-        .send(CookieReap::Remove(path))
-        .await
-        .unwrap();
+      rig.cleanup.request_remove(&path);
       settle_cookie_count(&rig, seq + 1).await;
       assert_eq!(
         cookie_count(&rig).await,
@@ -6414,11 +6378,7 @@ mod sync_cookie {
           admitted += 1;
           // Ask for the cookie's removal; it fails permanently, so the owned
           // record is retained across the unwatch below.
-          rig
-            .cookie_removes
-            .send(CookieReap::Remove(path))
-            .await
-            .unwrap();
+          rig.cleanup.request_remove(&path);
         }
         Err(crate::error::SyncRootError::CleanupBacklog) => {}
         Err(other) => panic!("unexpected sync error: {other:?}"),
@@ -6464,14 +6424,14 @@ mod sync_cookie {
     );
   }
 
-  // The dedicated cleanup lane makes steady progress even under a saturating
-  // command flood. The live loop's select is command-biased, so without a
-  // loop-top fairness drain a caller that keeps the bounded command mailbox
-  // continuously ready would starve queued reaps — cookies would linger owned.
-  // Form: a sustained real flood (a spawned task that never lets the command
-  // channel drain) racing a reap for a live owned cookie.
+  // Cleanup makes steady progress even under a saturating command flood. The live
+  // loop's select is command-biased, so without the loop-top fairness check a
+  // caller that keeps the bounded command mailbox continuously ready would starve
+  // the wake — cookies would linger owned with their marks set. Form: a sustained
+  // real flood (a spawned task that never lets the command channel drain) racing a
+  // reap for a live owned cookie.
   #[tokio::test(flavor = "multi_thread")]
-  async fn a_command_flood_does_not_starve_the_cleanup_lane() {
+  async fn a_command_flood_does_not_starve_the_cleanup_sweep() {
     let rig = rig_with_capacity(64);
     let scope = watch(&rig, "/r").await;
 
@@ -6497,22 +6457,18 @@ mod sync_cookie {
       }
     });
 
-    // Under the sustained flood, request the reap on the dedicated lane.
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    // Under the sustained flood, mark the cookie for reaping.
+    rig.cleanup.request_remove(&path);
 
-    // The loop-top fairness drain services it regardless of the flood: the unlink
-    // is dispatched and confirms. Observed fs-side — the flooded command channel
+    // The loop-top fairness check sweeps it regardless of the flood: the unlink is
+    // dispatched and confirms. Observed fs-side — the flooded command channel
     // cannot carry an observation command through.
     settle(|| rig.fs.cookie_removes().contains(&path)).await;
     flood.abort();
 
     assert!(
       rig.fs.cookie_removes().contains(&path),
-      "the queued reap was serviced despite the command flood"
+      "the marked reap was swept despite the command flood"
     );
     assert!(
       rig.fs.files_under("/r").is_empty(),
@@ -6649,11 +6605,7 @@ mod sync_cookie {
     // record on a ~1.6s retry deadline, well past the 1s grace. The fourth attempt
     // (the fs has recovered) would succeed, but it is scheduled far out.
     rig.fs.fail_next_cookie_removes(3);
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
     settle(|| rig.fs.cookie_remove_dispatches() >= 3).await;
     assert_eq!(
       rig.fs.cookie_remove_dispatches(),
@@ -6907,11 +6859,7 @@ mod sync_cookie {
     // syscall has run (the file is gone) but the job has not yet taken the
     // ledger lock to confirm-drop.
     let hold = rig.fs.hold_cookie_remove_confirms();
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
     settle(|| !rig.fs.files_under("/r").contains(&path) && rig.fs.cookie_remove_dispatches() == 1)
       .await;
     assert!(
@@ -6953,11 +6901,7 @@ mod sync_cookie {
     );
 
     // The successor reaps normally now, and close proves quiescence.
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path.clone()))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
     settle(|| rig.fs.files_under("/r").is_empty() && !rig.fs.cookie_removes().is_empty()).await;
     settle_cookie_count(&rig, 0).await;
     assert_eq!(
@@ -6988,7 +6932,7 @@ mod sync_cookie {
   #[tokio::test(flavor = "multi_thread")]
   async fn a_delayed_claim_never_displaces_a_live_same_path_successor() {
     let fs = FakeFs::new(1);
-    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut reg = registry(fs.clone());
     let mut core = fence_source();
     let scope_a = ScopeId::new(NonZeroU64::new(1).unwrap());
     let scope_b = ScopeId::new(NonZeroU64::new(2).unwrap());
@@ -7071,7 +7015,7 @@ mod sync_cookie {
   #[tokio::test(flavor = "multi_thread")]
   async fn a_confirm_retire_is_id_keyed_and_spares_a_same_path_successor() {
     let fs = FakeFs::new(1);
-    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut reg = registry(fs.clone());
     let mut core = fence_source();
     let scope_n = ScopeId::new(NonZeroU64::new(1).unwrap());
     let scope_m = ScopeId::new(NonZeroU64::new(2).unwrap());
@@ -7139,7 +7083,7 @@ mod sync_cookie {
   #[tokio::test(flavor = "multi_thread")]
   async fn a_stale_self_reap_never_unlinks_a_successor_cookie() {
     let fs = FakeFs::new(1);
-    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut reg = registry(fs.clone());
     let mut core = fence_source();
     let scope = ScopeId::new(NonZeroU64::new(7).unwrap());
     let name = ".tributaries-sync-stale-selfreap";
@@ -7193,7 +7137,7 @@ mod sync_cookie {
   #[tokio::test(flavor = "multi_thread")]
   async fn a_stale_remove_failure_does_not_touch_the_successors_state() {
     let fs = FakeFs::new(1);
-    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let reg = registry(fs.clone());
     let cfg = tuned_config();
     let scope = ScopeId::new(NonZeroU64::new(3).unwrap());
     let name = ".tributaries-sync-stale-fail";
@@ -7258,16 +7202,18 @@ mod sync_cookie {
     );
   }
 
-  // The internal `Targeted`/`RetryDue` dispatches are id-matched: only a request
-  // carrying the record's CURRENT incarnation id transitions it. `Explicit` (the
-  // public path-addressed contract) dispatches the record currently at the path.
+  // Every removal dispatch is id-matched: only a request carrying the record's
+  // CURRENT incarnation id transitions it. The public path-addressed contract is
+  // preserved through the ingress, which resolves the path to an id — so "remove
+  // the cookie at this path" still acts on the record currently at the path, and
+  // does so without a path-addressed decision existing in the driver at all.
   //
   // Fail-on-old is STRUCTURAL: the `Targeted(id)`/`RetryDue(id)` variants do not
   // exist, and old `RetryDue` dispatches any `RemoveFailed` at the path.
   #[tokio::test(flavor = "multi_thread")]
   async fn retry_and_targeted_dispatch_are_id_matched() {
     let fs = FakeFs::new(1);
-    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let (reg, cleanup, _wake) = registry_with_ingress(fs.clone());
     let scope = ScopeId::new(NonZeroU64::new(9).unwrap());
     let path = PathBuf::from("/r/.tributaries-sync-idmatch");
     let m = CookieId(100);
@@ -7336,7 +7282,10 @@ mod sync_cookie {
         Some(Phase::Removing { attempts: 0 })
       ));
     }
-    // `Explicit` on a fresh `Owned` record dispatches (public semantics pinned).
+    // The PUBLIC path-addressed request on a fresh `Owned` record dispatches
+    // (public semantics pinned). The path resolves to an id at the door, so what
+    // reaches the decision is the same id-addressed request every internal
+    // producer makes.
     let fresh = PathBuf::from("/r/.tributaries-sync-idmatch-2");
     let f = CookieId(200);
     {
@@ -7355,14 +7304,23 @@ mod sync_cookie {
       );
       inner.by_name.insert("n2".to_owned(), f);
       inner.by_path.insert(fresh.clone(), f);
-      let d = CookieRegistry::<FakeFs>::removal_decision_locked(
-        &mut inner,
-        &RemovalRequest::Explicit(fresh.clone()),
-      );
+    }
+    cleanup.request_remove(&fresh);
+    assert!(
+      lock_ledger(&reg.ledger)
+        .obligations
+        .get(&f)
+        .is_some_and(|ob| ob.reap_requested),
+      "the path resolved to the record currently at it, and marked THAT record"
+    );
+    {
+      let mut inner = lock_ledger(&reg.ledger);
+      let d =
+        CookieRegistry::<FakeFs>::removal_decision_locked(&mut inner, &RemovalRequest::Targeted(f));
       assert_eq!(
         d.map(|(_, id)| id),
         Some(f),
-        "Explicit dispatches the record currently at the path"
+        "the marked record at the path dispatches"
       );
       assert!(matches!(
         inner.obligations.get(&f).map(|ob| &ob.phase),
@@ -7456,7 +7414,7 @@ mod sync_cookie {
     let fs = FakeFs::new(1);
     fs.fail_next_cookie_removes(1_000_000);
     let hold = fs.hold_cookie_removes();
-    let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let reg = registry(fs.clone());
     let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
 
     // Fail each in order: last_failure_seq = 1, 2, 3 for a1, a2, b1.
@@ -7499,7 +7457,7 @@ mod sync_cookie {
     let fs2 = FakeFs::new(1);
     fs2.fail_next_cookie_removes(1_000_000);
     let hold2 = fs2.hold_cookie_removes();
-    let reg2 = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs2.clone());
+    let reg2 = registry(fs2.clone());
     let (op_tx2, _op_rx2) = async_channel::unbounded::<OpResult<FakeHandle>>();
     let ja1 = insert_owned_rec(&reg2, sa, "a1", &a1);
     let ja2 = insert_owned_rec(&reg2, sa, "a2", &a2);
@@ -7571,20 +7529,12 @@ mod sync_cookie {
     // deterministic: ra1, ra2, rb1, rb2).
     for i in 0..2 {
       let path = admit_sync(&rig, ra, "/ra", &format!(".tributaries-sync-ra-{i}")).await;
-      rig
-        .cookie_removes
-        .send(CookieReap::Remove(path))
-        .await
-        .unwrap();
+      rig.cleanup.request_remove(&path);
       settle_removes_parked(&rig).await;
     }
     for i in 0..2 {
       let path = admit_sync(&rig, rb, "/rb", &format!(".tributaries-sync-rb-{i}")).await;
-      rig
-        .cookie_removes
-        .send(CookieReap::Remove(path))
-        .await
-        .unwrap();
+      rig.cleanup.request_remove(&path);
       settle_removes_parked(&rig).await;
     }
 
@@ -7595,11 +7545,7 @@ mod sync_cookie {
       rig.fs.put(&root, FileKind::Dir, 300 + j as u64);
       let scope = watch(&rig, &root).await;
       let path = admit_sync(&rig, scope, &root, &format!(".tributaries-sync-pad-{j}")).await;
-      rig
-        .cookie_removes
-        .send(CookieReap::Remove(path))
-        .await
-        .unwrap();
+      rig.cleanup.request_remove(&path);
       settle_removes_parked(&rig).await;
       let (reply, on_reply) = futures_channel::oneshot::channel();
       rig
@@ -7875,7 +7821,7 @@ mod sync_cookie {
   #[tokio::test(flavor = "multi_thread")]
   async fn the_write_gate_opens_at_the_claim_and_never_uncounts_the_obligation() {
     let fs = FakeFs::new(1);
-    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut reg = registry(fs.clone());
     let mut core = fence_source();
     let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
     let other = ScopeId::new(NonZeroU64::new(2).unwrap());
@@ -7955,11 +7901,7 @@ mod sync_cookie {
     settle_cookie_count(&rig, 1).await;
     let census = assert_census_balances(&rig, "a completed sync").await;
     assert_eq!(census.births, 1, "the write's obligation was born");
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
     settle_cookie_count(&rig, 0).await;
     let census = assert_census_balances(&rig, "a reaped cookie").await;
     assert_eq!(
@@ -7980,11 +7922,7 @@ mod sync_cookie {
       2,
       "the in-pool write is already born"
     );
-    rig
-      .cookie_removes
-      .send(CookieReap::Cancel(name.to_owned()))
-      .await
-      .unwrap();
+    rig.cleanup.request_cancel(name);
     settle_reap_marks(&rig, 1).await;
     hold.release();
     let _ = on_reply.await;
@@ -8017,11 +7955,7 @@ mod sync_cookie {
     settle_cookie_count(&rig, 1).await;
     let hold = rig.fs.hold_cookie_removes();
     let unlinked = rig.fs.cookie_remove_dispatches();
-    rig
-      .cookie_removes
-      .send(CookieReap::Remove(path))
-      .await
-      .unwrap();
+    rig.cleanup.request_remove(&path);
     settle(|| rig.fs.cookie_remove_dispatches() == unlinked + 1).await;
     let (census, live) = cookie_census(&rig).await;
     assert!(
@@ -8066,7 +8000,7 @@ mod sync_cookie {
   #[tokio::test(flavor = "multi_thread")]
   async fn the_abnormal_backstop_types_and_counts_what_it_sweeps() {
     let fs = FakeFs::new(1);
-    let mut reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs.clone());
+    let mut reg = registry(fs.clone());
     let mut core = fence_source();
     let ledger = Arc::clone(&reg.ledger);
     let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
@@ -8097,5 +8031,415 @@ mod sync_cookie {
     // the raised flag, which makes its claim refuse and the write reap its own file.
     settle(|| fs.files_under("/r").is_empty()).await;
     assert!(fs.files_under("/r").is_empty(), "the swept file is gone");
+  }
+
+  // A genuine reap is PROMPT: an otherwise idle driver — parked in its select with no deadline
+  // armed, no command inbound, no event flowing — is woken by the request itself and confirms the
+  // unlink, earning the `ConfirmedGone` terminal from its own syscall.
+  //
+  // The cell deliberately observes fs-side only until the terminal has landed: any command
+  // (a count probe included) would itself wake the driver and mask what is under test.
+  //
+  // Fail-on-old (no wake arm — the request lands on the record but rings nothing): the idle driver
+  // parks forever on `pending()`, the unlink never dispatches, and the settle times out with the
+  // cookie still on disk.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_genuine_reap_wakes_an_idle_driver_and_confirms_gone() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-prompt")
+      .await
+      .expect("the write lands");
+    // Let the driver go fully idle: the sync resolved, so nothing is scheduled and nothing is
+    // pending. From here only the cleanup wake can move it.
+    settle(|| rig.fs.cookie_writes().contains(&path)).await;
+    assert!(
+      rig.fs.cookie_removes().is_empty(),
+      "nothing is reaped before it is asked for"
+    );
+
+    // The request the umbrella's `end_sync` makes, on the path the sync's own reply returned.
+    rig.cleanup.request_remove(&path);
+
+    // One wake cycle later the unlink has run — observed fs-side, so no command of ours can be
+    // what woke the driver.
+    settle(|| rig.fs.cookie_removes().contains(&path)).await;
+    assert!(
+      rig.fs.cookie_removes().contains(&path),
+      "the wake alone drove an idle driver to reap the cookie"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the file is gone, not merely dispatched"
+    );
+
+    settle_cookie_count(&rig, 0).await;
+    let census = assert_census_balances(&rig, "a genuine prompt reap").await;
+    assert_eq!(
+      (census.births, census.confirmed_gone),
+      (1, 1),
+      "the reap earned ConfirmedGone from its own syscall verdict"
+    );
+  }
+
+  // The wake sweep's phase table, cell by cell: a mark on EACH phase resolves to EXACTLY ONE
+  // outcome — never two, never none. Scripted at the registry level so each cell is a chosen
+  // interleaving rather than a scheduler race, and asserted on the PHASE (which the sweep writes
+  // under the lock, synchronously) rather than on a pool job's timing.
+  //
+  // Together these are every way a cancel can race the machine: the mark racing the DISPATCH
+  // (parked), racing the CLAIM (in pool), landing on an owned cookie, racing an unlink already in
+  // flight, and racing a failed record whether or not a retry owns it.
+  //
+  // Fail-on-old (the mark not read at the dispatch decision, as a free-standing tombstone set was
+  // not): the parked cell dispatches a write for a sync already cancelled.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_mark_resolves_to_exactly_one_outcome_per_phase() {
+    let fs = FakeFs::new(1);
+    let (mut reg, cleanup, _wake) = registry_with_ingress(fs.clone());
+    let mut core = fence_source();
+    let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<<FakeFs as FsOps>::Handle>>();
+    let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+    let phase_of = |reg: &CookieRegistry<FakeFs>, id: CookieId| -> String {
+      let inner = lock_ledger(&reg.ledger);
+      let ob = inner.obligations.get(&id).expect("the record stands");
+      match ob.phase {
+        Phase::Parked { .. } => "parked".to_owned(),
+        Phase::InPool => "in_pool".to_owned(),
+        Phase::Owned => "owned".to_owned(),
+        Phase::Removing { attempts } => format!("removing({attempts})"),
+        Phase::RemoveFailed { attempts, retry_at } => {
+          format!("failed({attempts},{})", retry_at.is_some())
+        }
+      }
+    };
+
+    // PARKED + mark: the mark races the dispatch, and the dispatch refuses on it — the sync is
+    // retired pre-physically, so no write is ever made and no file can exist to unlink.
+    {
+      let name = ".tributaries-sync-phase-parked";
+      let fence = core.open_cover_fence(scope);
+      let id = reg.admit_parked(scope, name.to_owned(), fence);
+      cleanup.request_cancel(name);
+      assert!(
+        reg.dispatch_guard(scope, id).is_none(),
+        "a marked parked sync must never be dispatched"
+      );
+      assert!(
+        !lock_ledger(&reg.ledger).obligations.contains_key(&id),
+        "…it is retired right there, pre-physically"
+      );
+      assert!(fs.cookie_writes().is_empty(), "nothing was ever written");
+    }
+
+    // IN POOL + mark: only the write knows where its cookie will land, so the sweep dispatches
+    // nothing and the mark SURVIVES — it is what the claim reads and refuses on.
+    let in_pool = {
+      let name = ".tributaries-sync-phase-inpool";
+      let guard = dispatched_guard(&mut reg, &mut core, scope, name);
+      let id = guard.id;
+      cleanup.request_cancel(name);
+      reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
+      assert_eq!(
+        phase_of(&reg, id),
+        "in_pool",
+        "the sweep dispatched nothing"
+      );
+      assert!(
+        lock_ledger(&reg.ledger).obligations[&id].reap_requested,
+        "the mark stays for the claim to refuse on"
+      );
+      let path = PathBuf::from("/r").join(name);
+      fs.put(&path, FileKind::File, 1);
+      assert!(
+        guard.claim(&path).is_none(),
+        "the claim refuses on the mark"
+      );
+      (guard, path)
+    };
+
+    let hold = fs.hold_cookie_removes();
+    // OWNED + mark: exactly one unlink is dispatched, and the mark dies with the action it caused.
+    let owned = {
+      let name = ".tributaries-sync-phase-owned";
+      let guard = dispatched_guard(&mut reg, &mut core, scope, name);
+      let id = guard.id;
+      let path = PathBuf::from("/r").join(name);
+      fs.put(&path, FileKind::File, 1);
+      guard.claim(&path).expect("the claim lands");
+      cleanup.request_remove(&path);
+      reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
+      assert_eq!(
+        phase_of(&reg, id),
+        "removing(0)",
+        "one unlink was dispatched"
+      );
+      assert!(
+        !lock_ledger(&reg.ledger).obligations[&id].reap_requested,
+        "the mark is cleared exactly as it is acted on"
+      );
+
+      // REMOVING + mark: a second request while that unlink is in flight COALESCES — no second
+      // unlink is ever dispatched for one record — and the mark stays, so the failure path
+      // still has a standing request to re-arm against.
+      cleanup.request_remove(&path);
+      reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
+      assert_eq!(
+        phase_of(&reg, id),
+        "removing(0)",
+        "a marked Removing record dispatches nothing: no double unlink per record"
+      );
+      assert!(
+        lock_ledger(&reg.ledger).obligations[&id].reap_requested,
+        "…and the mark survives for the failure path to observe"
+      );
+      id
+    };
+
+    // REMOVE-FAILED, PARKED + mark: budget spent and no retry scheduled — the request RE-ARMS it
+    // with a fresh budget. This is the demand edge that keeps a stalled backlog drainable.
+    {
+      lock_ledger(&reg.ledger).record_remove_failed(owned);
+      assert_eq!(phase_of(&reg, owned), "failed(1,false)", "parked as failed");
+      reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
+      assert_eq!(
+        phase_of(&reg, owned),
+        "removing(0)",
+        "the standing mark re-armed the parked record with a fresh budget"
+      );
+    }
+
+    // REMOVE-FAILED, SCHEDULED + mark: the retry deadline already owns it, so the request
+    // coalesces onto that rather than racing a second unlink against it.
+    {
+      lock_ledger(&reg.ledger).record_remove_failed(owned);
+      // Attempt 1, not 2: the re-arm above restarted the budget, which is what a fresh request
+      // for a parked record is entitled to.
+      reg.schedule_retry(
+        &tuned_config(),
+        owned,
+        Instant::from_origin(Duration::ZERO),
+        false,
+      );
+      assert_eq!(
+        phase_of(&reg, owned),
+        "failed(1,true)",
+        "a retry is scheduled"
+      );
+      cleanup.request_remove(&PathBuf::from("/r/.tributaries-sync-phase-owned"));
+      reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
+      assert_eq!(
+        phase_of(&reg, owned),
+        "failed(1,true)",
+        "a scheduled record is left to its own retry"
+      );
+    }
+    hold.release();
+
+    // The in-pool write's refused claim still reaps the file it created: exactly one of the three
+    // outcomes fired per record, and nothing leaked.
+    let (guard, path) = in_pool;
+    self_reap(&fs, &guard, path, None);
+    settle(|| fs.files_under("/r").len() <= 1).await;
+  }
+
+  // No request can be lost, INCLUDING the one whose wake finds the channel already full.
+  // The ingress orders set-the-bit then `try_send`; the driver orders `recv` then lock-and-sweep.
+  // So a `try_send` that finds a token pending has NOT lost its request: that pending token's
+  // sweep has not taken the lock yet, and when it does it sees every bit set before it — which is
+  // exactly why a capacity-1 wake can coalesce without dropping anything.
+  //
+  // Driven with no driver loop at all, so the ordering under test is the PROTOCOL's rather than a
+  // scheduler's: the wake is consumed by hand, exactly once, and must serve BOTH requests.
+  //
+  // Fail-on-old (a wake that carried the request, as the lane's messages did): one token can only
+  // name one target, so the second request would need its own queue slot — the whole reason the
+  // lane could not be bounded.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_request_whose_wake_finds_the_channel_full_rides_the_pending_sweep() {
+    let fs = FakeFs::new(1);
+    let (mut reg, cleanup, wake) = registry_with_ingress(fs.clone());
+    let mut core = fence_source();
+    let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+    let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<<FakeFs as FsOps>::Handle>>();
+
+    // Two owned cookies — two independent obligations, each addressable by its own path.
+    let mut owned = |name: &str| {
+      let guard = dispatched_guard(&mut reg, &mut core, scope, name);
+      let path = PathBuf::from("/r").join(name);
+      fs.put(&path, FileKind::File, 1);
+      guard.claim(&path).expect("the claim lands");
+      path
+    };
+    let first = owned(".tributaries-sync-wake-1");
+    let second = owned(".tributaries-sync-wake-2");
+
+    // The first request fills the capacity-1 wake.
+    cleanup.request_remove(&first);
+    assert_eq!(wake.wake.len(), 1, "the first request rang the wake");
+
+    // The second finds the wake FULL. Its `try_send` therefore fails — and that is precisely the
+    // case the protocol has to survive, because no second token can exist to carry it.
+    cleanup.request_remove(&second);
+    assert_eq!(
+      wake.wake.len(),
+      1,
+      "a full wake coalesces: it never grows past its one token"
+    );
+    assert_eq!(
+      lock_ledger(&reg.ledger)
+        .obligations
+        .values()
+        .filter(|ob| ob.reap_requested)
+        .count(),
+      2,
+      "both requests landed ON their records — the wake carries no request, so a full \
+       channel cannot lose one"
+    );
+
+    // ONE recv, ONE sweep — everything a driver would do for the single pending token.
+    assert!(
+      wake.wake.try_recv().is_ok(),
+      "the pending token is consumed"
+    );
+    assert!(
+      wake.wake.try_recv().is_err(),
+      "and it was the only one — no second wake exists to service the second request"
+    );
+    let hold = fs.hold_cookie_removes();
+    reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
+
+    // That single sweep serviced BOTH: each record is Removing, and neither mark survives the
+    // action it caused.
+    for (path, id) in [(&first, 1u64), (&second, 2)] {
+      let inner = lock_ledger(&reg.ledger);
+      let ob = inner
+        .obligations
+        .get(&CookieId(id))
+        .expect("the record stands until its unlink confirms");
+      assert!(
+        matches!(ob.phase, Phase::Removing { attempts: 0 }),
+        "{path:?} was dispatched by the pending token's sweep"
+      );
+      assert!(
+        !ob.reap_requested,
+        "the mark is cleared exactly as the sweep acts on it"
+      );
+    }
+    hold.release();
+    settle(|| fs.cookie_removes().len() == 2).await;
+    let mut reaped = fs.cookie_removes();
+    reaped.sort();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(
+      reaped, expected,
+      "both cookies were unlinked by the one sweep"
+    );
+  }
+
+  // Close stays bounded and HONEST while the public ingress hammers it. The flood cannot delay
+  // the close (it enqueues nothing the drain must service), cannot wedge it (every request is a
+  // lock-and-store the driver never has to answer), and cannot corrupt its count: the reply still
+  // reports the one genuine obligation whose unlink is hung, because the count is the ledger
+  // itself rather than a gauge the flood could skew.
+  //
+  // Fail-on-old: the flood's messages pile into the cleanup lane, which the close drain must then
+  // service before it can quiesce.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn close_is_bounded_and_honest_while_the_ingress_hammers() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let path = sync_root(&rig, scope, "/r", ".tributaries-sync-close-flood")
+      .await
+      .expect("the write lands");
+    // One genuine, GENUINELY stuck obligation: its unlink hangs past the grace, so close must
+    // report exactly one non-quiesced cookie — the honest count the flood must not move.
+    let hold = rig.fs.hold_cookie_removes();
+    rig.fs.fail_next_cookie_removes(1_000_000);
+    rig.cleanup.request_remove(&path);
+    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+
+    // Hammer the ingress throughout the close, from another task: unknown paths, unknown names,
+    // and the live cookie's own path over and over.
+    let flooder = {
+      let cleanup = rig.cleanup.clone();
+      let live = path.clone();
+      tokio::spawn(async move {
+        for i in 0..200_000u64 {
+          cleanup.request_remove(&PathBuf::from(format!("/r/.tributaries-sync-x{i}")));
+          cleanup.request_cancel(&format!(".tributaries-sync-x{i}"));
+          cleanup.request_remove(&live);
+          if i % 4096 == 0 {
+            tokio::task::yield_now().await;
+          }
+        }
+      })
+    };
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply })
+      .await
+      .expect("the close command lands");
+    let outstanding = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      .await
+      .expect("close returns within its grace despite the flood")
+      .expect("the driver replies");
+    assert_eq!(
+      outstanding, 1,
+      "close counts the ONE genuinely hung cookie — the flood addressed nothing countable, \
+       so it cannot inflate the count, and the hung unlink cannot be hidden from it"
+    );
+
+    flooder.abort();
+    hold.release();
+  }
+
+  // The ingress after an ABNORMAL driver death is inert, and leaks nothing. The handle keeps its
+  // half of the ledger alive, so a late reap or cancel still runs — against an empty ledger, since
+  // the `Drop` backstop already swept every record and typed it. The wake's `try_send` finds a
+  // closed channel and is a no-op. Nothing is retained, nothing panics, and the files are gone.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn the_ingress_after_a_driver_death_is_inert_and_leaks_nothing() {
+    let fs = FakeFs::new(1);
+    let (mut reg, cleanup, wake) = registry_with_ingress(fs.clone());
+    let mut core = fence_source();
+    let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+
+    let guard = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-dead-1");
+    let path = PathBuf::from("/r/.tributaries-sync-dead-1");
+    fs.put(&path, FileKind::File, 1);
+    guard.claim(&path).expect("the claim lands");
+    assert_eq!(reg.unremoved(), 1, "the obligation is counted");
+
+    // The driver dies abnormally: its registry and its half of the wake drop together, exactly as
+    // a panicked or cancelled driver task's locals would.
+    drop(reg);
+    drop(wake);
+    settle(|| fs.files_under("/r").is_empty()).await;
+    assert!(
+      fs.files_under("/r").is_empty(),
+      "the Drop backstop swept the file"
+    );
+
+    // The public ingress still answers — it cannot fail, cannot block, and cannot panic — and it
+    // finds nothing, because the backstop's typed terminal already removed every record.
+    cleanup.request_remove(&path);
+    cleanup.request_cancel(".tributaries-sync-dead-1");
+    cleanup.request_remove(&PathBuf::from("/r/.tributaries-sync-never"));
+    assert_eq!(
+      cleanup.ledger_len(),
+      0,
+      "the ledger the handle still holds is empty, and the late requests added nothing to it"
+    );
+    assert_eq!(
+      cleanup.wake_len(),
+      0,
+      "a closed wake swallows the token: the driver that would have read it is gone"
+    );
   }
 }

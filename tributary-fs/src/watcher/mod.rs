@@ -17,7 +17,7 @@ use futures_core::Stream;
 use tributary_proto::{Change, Interest, ScopeId};
 
 use crate::{
-  driver::{Command, CookieReap, DriverConfig, RealFs, ScopeRegistry, run},
+  driver::{Command, CookieIngress, DriverConfig, RealFs, ScopeRegistry, run},
   error::{BuildError, CloseError, ReplaceRootError, SyncRootError, UnwatchError, WatchRootError},
   event::Event,
   options::WatcherOptions,
@@ -513,11 +513,12 @@ pub struct Watcher<R> {
   /// This watcher's handle brand (see [`RootHandle`]).
   instance: u64,
   commands: async_channel::Sender<Command>,
-  /// The DEDICATED cookie cleanup lane, separate from `commands` so a saturated
-  /// command channel can never drop a reap or a cancel. Unbounded — admission is
-  /// guaranteed — and bounded in practice by the in-flight resolved syncs the
-  /// driver drains it against.
-  cookie_removes: async_channel::Sender<CookieReap>,
+  /// The cookie-cleanup ingress: the driver's own obligation ledger, shared under
+  /// one mutex (the same sharing shape `roots` has), plus a coalescing wake. A
+  /// public reap or cancel is a mark ON the obligation it names — never a message
+  /// about it — so it rides no channel that a command burst could saturate, and no
+  /// channel that a flood could grow.
+  cleanup: CookieIngress,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
   // `fn() -> R`, not `R`: the watcher holds no runtime value, so its auto
@@ -580,10 +581,11 @@ impl<R: RuntimeLite> Watcher<R> {
     ops: impl crate::driver::FsOps,
   ) -> Result<Self, BuildError> {
     let (command_tx, command_rx) = async_channel::bounded(16);
-    // Unbounded so completed-cookie removals are admitted regardless of command
-    // traffic; the driver drains it every loop iteration, so it stays bounded by
-    // the in-flight resolved syncs and cannot accrue.
-    let (cookie_remove_tx, cookie_remove_rx) = async_channel::unbounded();
+    // The cookie-cleanup ingress: ONE ledger, minted HERE and shared between this
+    // handle and the driver task below, because a public cleanup request must
+    // address the very records that driver admits. Its two halves are created
+    // together for the same reason the command channel's are.
+    let (cleanup, cookie_wake) = crate::driver::cookie_ingress();
     let (event_tx, event_rx) = async_channel::bounded(options.event_capacity().get());
     let roots = Arc::new(RwLock::new(RootSet::default()));
     // The registry's entries are written only by the driver task: live at
@@ -596,14 +598,14 @@ impl<R: RuntimeLite> Watcher<R> {
       config,
       ops,
       command_rx,
-      cookie_remove_rx,
+      cookie_wake,
       event_tx,
       registry,
     ));
     Ok(Self {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
-      cookie_removes: cookie_remove_tx,
+      cleanup,
       events: Box::pin(event_rx),
       roots,
       _runtime: PhantomData,
@@ -1014,39 +1016,50 @@ impl<R> Watcher<R> {
   /// in the [`request_set_cover`](Self::request_set_cover) mold. Idempotent:
   /// a cookie already gone is success.
   ///
-  /// Admission is GUARANTEED: the removal rides a DEDICATED unbounded lane, not
-  /// the shared command channel, so a burst of watch/unwatch/sync traffic can
-  /// never drop the reap. The driver OWNS every cookie it wrote and unlinks it
-  /// at scope or driver teardown regardless, so even a request to an
-  /// already-closed driver leaks nothing.
+  /// Admission is GUARANTEED, and by TYPE rather than by sizing: the request is
+  /// not a message about the cookie but a MARK ON IT — one bool on the obligation
+  /// the driver has held since it admitted the sync. There is no queue to fill and
+  /// no capacity to refuse, so no burst of watch/unwatch/sync traffic and no
+  /// hostile flood can drop a genuine reap. A caller can only learn `path` from
+  /// the [`sync_root`](Self::sync_root) that returned it, and the write publishes
+  /// the landing path before that reply is sent, so a legitimately-held path
+  /// always resolves.
+  ///
+  /// The driver OWNS every cookie it wrote and unlinks it at scope or driver
+  /// teardown regardless, so even a request to an already-closed driver leaks
+  /// nothing.
+  ///
+  /// # An unknown path is dropped, not queued
+  ///
+  /// A path naming no live cookie of this watcher is dropped right here — the same
+  /// net effect as before (it was a no-op then too, merely discovered later), now
+  /// by construction. The one nuance: a caller that PREDICTS a cookie's path
+  /// before its `sync_root` reply arrives — possible only by re-deriving it
+  /// out-of-contract — is dropped rather than acted on. Reap the path the reply
+  /// gave you.
   pub fn request_remove_cookie(&self, path: impl Into<PathBuf>) {
-    // Unbounded, so `try_send` refuses only once the driver is gone — and its
-    // terminal sweep has already reaped (or will reap) the file, so the dropped
-    // request strands nothing.
-    let _ = self
-      .cookie_removes
-      .try_send(CookieReap::Remove(path.into()));
+    self.cleanup.request_remove(&path.into());
   }
 
   /// Cancels the sync whose cookie has the rendered `name` — a NON-BLOCKING,
   /// reply-less fire-and-forget request in the
   /// [`request_remove_cookie`](Self::request_remove_cookie) mold. The driver
-  /// reaps a delivered-but-unread cookie of this name, tombstones one whose
-  /// write is still in flight (so its claim self-reaps), or drops the request if
-  /// the sync already resolved. Idempotent; may arrive after the sync resolved
-  /// (then it is a no-op); never blocks.
+  /// reaps a delivered-but-unread cookie of this name, refuses the claim of one
+  /// whose write is still in flight (so it self-reaps), retires one whose write
+  /// was never dispatched, or drops the request if the sync already resolved.
+  /// Idempotent; may arrive after the sync resolved (then it is a no-op); never
+  /// blocks.
   ///
   /// Public because the umbrella `FsSource` — in a different crate — calls it
   /// from its `cancel_sync` seam method when the owner abandons an in-flight
   /// sync (a caller timeout, or a close winning the race), so a cookie the write
   /// already created but whose completion the owner never read can never orphan.
-  /// Admission is GUARANTEED (the dedicated unbounded lane), and the driver owns
-  /// every cookie it writes regardless, so a cancel to an already-closed driver
-  /// leaks nothing.
+  /// Admission is GUARANTEED — the name is recorded when the sync is admitted, so
+  /// a cancel has a record to mark whatever the sync's stage, including a write
+  /// still in the pool — and the driver owns every cookie it writes regardless, so
+  /// a cancel to an already-closed driver leaks nothing.
   pub fn request_cancel_sync(&self, name: impl Into<String>) {
-    let _ = self
-      .cookie_removes
-      .try_send(CookieReap::Cancel(name.into()));
+    self.cleanup.request_cancel(&name.into());
   }
 
   /// Reconciles a watched root's per-directory coverage to the `retained` cover **in place**,
