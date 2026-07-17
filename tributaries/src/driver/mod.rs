@@ -1196,6 +1196,49 @@ enum SyncStep<C> {
   Began(Result<Vec<C>, SyncError>),
 }
 
+/// [`Owner::reconcile_watch`]'s early exit. The in-place widen's retarget
+/// ([`Source::replace`]) and its rollback are awaited under a race against the owner's close signal —
+/// exactly as the cookie write is in [`Owner::on_sync`] — so a backend retarget that never returns (a
+/// hung FUSE/NFS mount) can no longer wedge the loop: a close during a held replace tears down at once
+/// instead of waiting the retarget out.
+///
+/// It rides the `Err` channel because every variant ABANDONS the reconcile, leaving the committing
+/// paths (`Ok(sub)`) untouched: [`Failed`](Self::Failed) is the ordinary [`WatchError`] each
+/// pre-existing exit already returned — a [`From`] impl keeps those sites, and `canonicalize_key`'s
+/// `?`, verbatim — and [`CloseRequested`](Self::CloseRequested) diverts to teardown.
+#[derive(Debug)]
+enum ReconcileStop {
+  /// The reconcile failed: the error for the `watch()` caller.
+  Failed(WatchError),
+  /// A close won the race while an in-place widen `replace` was in flight: its consumed
+  /// [`CloseReply`] rides back so [`Owner::dispatch_command`] hands the [`run`] loop the same
+  /// [`Flow::Break`] its own close arm produces. The widen is abandoned and the `watch()` caller's
+  /// dropped reply surfaces `Closed`.
+  CloseRequested(CloseReply),
+}
+
+impl From<WatchError> for ReconcileStop {
+  fn from(err: WatchError) -> Self {
+    Self::Failed(err)
+  }
+}
+
+/// Which arm of [`Owner::replace_racing_close`]'s race resolved, carrying only OWNED data out of the
+/// `select` so both borrows it takes (`&self.closes`, `&mut self.source`) are released before the
+/// winner is used — the same discipline [`SyncStep`] keeps.
+enum ReplaceStep<C, H> {
+  /// A [`CloseReply`] arrived on the dedicated close signal: thread it back to teardown.
+  Close(CloseReply),
+  /// The close channel closed — every handle is gone. Like [`SyncStep::Canceled`], that is an
+  /// ABANDON rather than a threaded close: no one is left to acknowledge, and the command channel —
+  /// whose sender drops in lockstep with the close sender — stays the dropped-handles teardown
+  /// signal, exactly as [`on_sync`](Owner::on_sync) leaves it.
+  HandlesGone,
+  /// The retarget finished: the armed root it committed, or the error that falls through to
+  /// release-and-rearm.
+  Replaced(Result<Armed<C, H>, WatchError>),
+}
+
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
 /// fan out a raw source event, or drain the coalescer's due entries — whichever is ready, each to
 /// completion. The only source calls it awaits are [`next`](LocalSource::next) (one cancel-safe
@@ -1592,9 +1635,13 @@ where
   /// priority below the dedicated close and cleanup arms — so shutdown and grant resolution both
   /// outrank a queued command (invariant II). The mailbox now carries ONLY the two
   /// caller-reply commands ([`Watch`](Command::Watch)/[`Unwatch`](Command::Unwatch)); grant
-  /// resolution moved to the dedicated [`cleanup_rx`](Self::cleanup_rx) channel. The only teardown
-  /// break here is the dropped-last-handle one (`Err`); a close is handled by the
-  /// [`closes`](Self::closes) arm, never as a command.
+  /// resolution moved to the dedicated [`cleanup_rx`](Self::cleanup_rx) channel.
+  ///
+  /// It breaks to teardown on two signals, neither of them a close command (a close is never a
+  /// command — it rides the dedicated [`closes`](Self::closes) channel): the dropped-last-handle
+  /// `Err`, and a close that [`on_watch`](Self::on_watch) THREADED back after winning the race
+  /// inside an in-flight in-place widen [`replace`](Source::replace) — that reply was consumed off
+  /// the close channel mid-reconcile, so this break is the one path that delivers it to teardown.
   async fn dispatch_command(
     &mut self,
     cmd: Result<Command<C, V>, async_channel::RecvError>,
@@ -1605,10 +1652,16 @@ where
         value,
         options,
         reply,
-      }) => {
-        self.on_watch(key, value, options, reply).await;
-        Flow::Continue
-      }
+      }) => match self.on_watch(key, value, options, reply).await {
+        None => Flow::Continue,
+        // A close won the race inside an in-flight in-place widen `replace`: break to teardown
+        // carrying its reply, exactly as the dedicated close arm — and `on_sync`'s threaded close —
+        // does. Consumer-initiated, so it owes no source-drain pass.
+        Some(close_reply) => Flow::Break {
+          closing: Some(close_reply),
+          drain_owed: false,
+        },
+      },
       Ok(Command::Unwatch { sub, reply }) => {
         self.on_unwatch(sub, reply);
         Flow::Continue
@@ -1697,13 +1750,18 @@ where
   /// weak-`commands`-upgrade dance (and its "every handle gone at send time → no caller can observe
   /// the reply" orphan branch) is gone: the owner is running this reconcile, so it is alive, and the
   /// cleanup channel it keeps is open.
+  ///
+  /// Returns the [`CloseReply`] of a close that won the race inside an in-flight in-place widen
+  /// [`replace`](Source::replace) (see [`replace_racing_close`](Self::replace_racing_close)), for
+  /// [`dispatch_command`](Self::dispatch_command) to turn into the [`Flow::Break`] the [`run`] loop's
+  /// own close arm produces — and [`None`] whenever the reconcile settled, which is every other case.
   async fn on_watch(
     &mut self,
     key: Vec<C>,
     value: V,
     options: WatchOptions<C>,
     reply: futures_channel::oneshot::Sender<Result<WatchGrant, WatchError>>,
-  ) {
+  ) -> Option<CloseReply> {
     match self.reconcile_watch(&key, value, options).await {
       Ok(sub) => {
         // Hand the committed subscription back inside a grant carrying a clone of the owner's strong
@@ -1732,9 +1790,19 @@ where
           // Unreachable (we always send `Ok`): no grant in flight, nothing to record or orphan.
           Err(Err(_)) => {}
         }
+        None
       }
-      Err(err) => {
+      Err(ReconcileStop::Failed(err)) => {
         let _ = reply.send(Err(err));
+        None
+      }
+      // A close won inside an in-flight in-place widen `replace`: the widen is abandoned, so there is
+      // no subscription to grant and no grant to orphan. DROP the caller's reply rather than send on
+      // it — a dropped sender is exactly what `watch()` reads as `Closed` (the same way an abandoned
+      // held sync's caller sees it) — and hand the reply up to drive teardown.
+      Err(ReconcileStop::CloseRequested(close_reply)) => {
+        drop(reply);
+        Some(close_reply)
       }
     }
   }
@@ -1780,7 +1848,7 @@ where
     key: &[C],
     value: V,
     options: WatchOptions<C>,
-  ) -> Result<Subscription, WatchError> {
+  ) -> Result<Subscription, ReconcileStop> {
     let (interest, filter, debounce) = options.into_parts();
     // RETIRED-DEBT ADMISSION GATE. The invariant this enforces, stated
     // honestly: retirement CONVERTS a live subscription's state into one retired parked
@@ -1801,7 +1869,7 @@ where
       .filter(|&&sub| self.subsumer.subscription_key(sub).is_none())
       .count();
     if retired_debt >= Self::RETIRED_RESCAN_DEBT_LIMIT {
-      return Err(WatchError::RescanBacklog);
+      return Err(WatchError::RescanBacklog.into());
     }
     // Canonicalize the caller key at the single arm-and-key choke point, BEFORE classification
     // (invariant I2 — "one fs-canonical coordinate at one choke point"). Every downstream step —
@@ -1908,7 +1976,7 @@ where
             Some(cover) => {
               if let Err(err) = self.source.grow(fs_root, &cover).await {
                 self.subsumer.abort_watch(&outcome);
-                return Err(err);
+                return Err(err.into());
               }
               Some(Some(cover))
             }
@@ -1924,7 +1992,7 @@ where
                 Some(root_key) => {
                   if let Err(err) = self.source.grow(fs_root, &[root_key]).await {
                     self.subsumer.abort_watch(&outcome);
-                    return Err(err);
+                    return Err(err.into());
                   }
                   Some(None)
                 }
@@ -1953,7 +2021,7 @@ where
           Ok(armed) => armed,
           Err(err) => {
             self.subsumer.abort_watch(&outcome);
-            return Err(err);
+            return Err(err.into());
           }
         };
         // Re-key onto the source's authoritative canonical key (invariant I2). A
@@ -1963,7 +2031,7 @@ where
         if !self.subsumer.fs_path_preserves_plan(&fs_key, &[]) {
           self.source.disarm(handle);
           self.subsumer.abort_watch(&outcome);
-          return Err(canonical_race());
+          return Err(canonical_race().into());
         }
         // A fresh arm's handle is generation-unique (see `Source::Handle`), so it is absent from the
         // reverse index and `commit_watch`'s `by_handle` insert cannot clobber a live root's entry.
@@ -2004,12 +2072,42 @@ where
             .map(|only_key| (*only, only_key)),
           _ => None,
         };
-        // A retarget that fails resolves `Err` and falls through to
-        // release-and-rearm — the source left the old root's coverage
+        // The retarget is RACED against the owner's close signal (see
+        // [`replace_racing_close`](Self::replace_racing_close)): a mount that hangs
+        // in `replace` must not wedge the run loop and with it `close()`. ONLY a
+        // close diverts — every replace-completes path below is exactly the
+        // pre-race one — and the caller's own cancellation is deliberately not
+        // raced (it cannot reach the owner, and abandoning a retarget outside a
+        // teardown would strand the source at the wider key).
+        //
+        // `retargeted` is `Some` only when the sole subsumed root's retarget
+        // COMMITTED. A retarget that fails resolves `Err` → `None` and falls
+        // through to release-and-rearm — the source left the old root's coverage
         // untouched (atomic on failure), and nothing has been disarmed yet.
-        if let Some((only, only_key)) = in_place
-          && let Ok(armed) = self.source.replace(only, key).await
-        {
+        let retargeted = match in_place {
+          Some((only, only_key)) => match self.replace_racing_close(only, key).await {
+            ReplaceStep::Replaced(Ok(armed)) => Some((armed, only_key)),
+            ReplaceStep::Replaced(Err(_)) => None,
+            // A close won while the retarget was in flight: abandon the widen (the
+            // plan unwinds exactly as every other non-committing exit unwinds it)
+            // and ride the reply back so the run loop tears down through its own
+            // close path. The `watch()` caller's dropped reply surfaces `Closed`.
+            ReplaceStep::Close(close_reply) => {
+              self.subsumer.abort_watch(&outcome);
+              return Err(ReconcileStop::CloseRequested(close_reply));
+            }
+            // Every handle is gone, so there is no reply to thread and nobody to
+            // acknowledge: abandon the widen and fail the watch `Closed` — the
+            // error's own "every handle dropped" case — leaving the command channel
+            // to drive teardown, exactly as `on_sync` leaves it.
+            ReplaceStep::HandlesGone => {
+              self.subsumer.abort_watch(&outcome);
+              return Err(WatchError::Closed.into());
+            }
+          },
+          None => None,
+        };
+        if let Some((armed, only_key)) = retargeted {
           let handle = armed.handle();
           let fs_key = armed.canonical_key().to_vec();
           if self.subsumer.fs_path_preserves_plan(&fs_key, unwatch) {
@@ -2024,10 +2122,25 @@ where
           // root's original key, and accept the rollback ONLY when it restored
           // the handle to that EXACT key — a rollback that itself diverges (an
           // `Ok` at a different key) is not a restore.
-          let restored = matches!(
-            self.source.replace(handle, &only_key).await,
-            Ok(armed) if armed.canonical_key() == only_key.as_slice()
-          );
+          //
+          // The rollback is raced against close for the same reason the retarget
+          // above is: a mount that hangs HERE would wedge the loop just as surely.
+          // A close abandons the rollback, leaving the handle at the divergent
+          // wider key — which strands nothing, because the reply rides back to a
+          // teardown that drops the source and reclaims that stream outright.
+          let restored = match self.replace_racing_close(handle, &only_key).await {
+            ReplaceStep::Replaced(res) => {
+              matches!(res, Ok(armed) if armed.canonical_key() == only_key.as_slice())
+            }
+            ReplaceStep::Close(close_reply) => {
+              self.subsumer.abort_watch(&outcome);
+              return Err(ReconcileStop::CloseRequested(close_reply));
+            }
+            ReplaceStep::HandlesGone => {
+              self.subsumer.abort_watch(&outcome);
+              return Err(WatchError::Closed.into());
+            }
+          };
           if restored {
             // The sole live root is rolled back to its original key on the PRESERVED handle — but it
             // was retargeted to the divergent wider key and back, and `Source::replace` emits no
@@ -2038,7 +2151,7 @@ where
             // subscribers by `handle` — exactly the coordinate `rescan_live_root` enumerates.
             self.rescan_live_root(handle);
             self.subsumer.abort_watch(&outcome);
-            return Err(canonical_race());
+            return Err(canonical_race().into());
           }
           // The rollback did not restore the original coverage — it diverged
           // again (a double canonicalization pathology) or failed atomically,
@@ -2050,7 +2163,7 @@ where
           self.retire_root_with_terminal_rescan(handle);
           self.source.disarm(handle);
           self.subsumer.abort_watch(&outcome);
-          return Err(canonical_race());
+          return Err(canonical_race().into());
         }
 
         // Unwatch-old-then-arm-new (design §4): the source rejects a root overlapping a
@@ -2076,7 +2189,7 @@ where
             let restore = self.restore_disarmed_roots(unwatch);
             restore.await;
             self.subsumer.abort_watch(&outcome);
-            return Err(err);
+            return Err(err.into());
           }
         };
         let (handle, fs_key) = armed;
@@ -2091,7 +2204,7 @@ where
           let restore = self.restore_disarmed_roots(unwatch);
           restore.await;
           self.subsumer.abort_watch(&outcome);
-          return Err(canonical_race());
+          return Err(canonical_race().into());
         }
         // The wider arm's handle is generation-unique (see `Source::Handle`): it aliases none of the
         // still-recorded subsumed roots `commit_watch` is about to drop, nor any other live root, so
@@ -2101,6 +2214,67 @@ where
         self.commit_widen(&outcome, handle, &fs_key, sub, filter, debounce, &repointed);
         Ok(sub)
       }
+    }
+  }
+
+  /// Awaits one [`Source::replace`] under a race against the owner's dedicated close signal, so a
+  /// backend retarget that never returns cannot wedge the run loop — and with it `close()`, whose
+  /// contract is bounded teardown latency. The in-place widen's two retargets are the owner's only
+  /// unbounded source awaits outside [`on_sync`](Self::on_sync)'s cookie write, which is raced for
+  /// exactly the same reason.
+  ///
+  /// The await is FORCED onto this loop by the `&mut self.source` + conditional-`Send` seam, exactly
+  /// as that write is: [`R::timeout`](RuntimeLite::timeout) needs a `Send` inner future (which
+  /// [`LocalSource::replace`] is not) and `R::timeout_local` is unconditionally `!Send` (which would
+  /// break the `Send` promise [`Tributaries::parts`] makes on the [`Source`] path), so no generic timer
+  /// can bound the retarget while preserving the run future's conditional `Send`. So instead of a
+  /// timer, RACE it against the unconditionally-`Send` close receiver: a `select` of the two is `Send`
+  /// iff `replace` is, so the combined future keeps EXACTLY the conditional `Send` the run loop needs —
+  /// [`parts`](Tributaries::parts)' promise still proves out and `parts_local` still withholds it, so
+  /// both compile-time owner-`Send` assertions still hold.
+  ///
+  /// ONLY the close is raced — deliberately NOT the `watch()` caller's cancellation, unlike `on_sync`:
+  ///
+  /// - there is nothing to race. The owner holds the `watch()` reply SENDER and runs this reconcile to
+  ///   completion; a caller that drops its `watch()` wait drops only the reply RECEIVER, which cannot
+  ///   interrupt the owner. (`on_sync` races `reply.cancellation()` precisely because a sync's caller
+  ///   TIMEOUT must free the owner within the caller's own deadline — a `watch` has no such deadline.)
+  /// - it would not be cancellation-safe. [`Source::replace`] is NOT cancel-abortive: dropping the
+  ///   future abandons only the notification, never the swap — the fs driver still commits the lane
+  ///   retarget it parked. Abandoning one OUTSIDE a teardown would therefore leave the source committed
+  ///   to the wider key while this reconcile unwound the widen: a divergent fs-vs-umbrella coverage
+  ///   strand. Under a close that divergence cannot outlive the race — the won close breaks the loop
+  ///   straight to teardown, which drops the source, and the fs driver's close sweep reclaims every
+  ///   in-flight replace (its parked reservation, its pre-armed stream, and its committed one alike)
+  ///   before it returns.
+  ///
+  /// So a hung mount's owner is freed by `close()` — the bounded contract — and by nothing else.
+  async fn replace_racing_close(
+    &mut self,
+    handle: S::Handle,
+    new_key: &[C],
+  ) -> ReplaceStep<C, S::Handle> {
+    // Split-borrow the two owner fields the race touches so they stay disjoint: the close arm reads
+    // `&self.closes` while `replace` reborrows `&mut self.source`. Both futures are dropped with this
+    // block, so the winner is used against a fully released `self`.
+    let closes = &self.closes;
+    let source = &mut self.source;
+    futures_util::select_biased! {
+      // Close is polled FIRST — a requested shutdown wins over everything, exactly as in the run
+      // loop's own biased `select!`. So a close already queued when this race begins abandons the
+      // retarget before `replace` is ever polled: the request is never even issued.
+      //
+      // Unlike `on_sync`'s write — which is polled first because dropping an ALREADY-ready `Ok(path)`
+      // would strand the cookie FILE it names, a resource that outlives the process — a ready-but-
+      // dropped `Armed` here names a source STREAM, and the only arm that can drop one is this close,
+      // which tears down at once: the fs driver's close sweep reclaims that stream (committed or not)
+      // during the very teardown this reply drives. So the tie costs a discarded retarget, never a
+      // leak, and close keeps the strictest bound.
+      close = closes.recv().fuse() => match close {
+        Ok(close_reply) => ReplaceStep::Close(close_reply),
+        Err(_) => ReplaceStep::HandlesGone,
+      },
+      res = source.replace(handle, new_key).fuse() => ReplaceStep::Replaced(res),
     }
   }
 

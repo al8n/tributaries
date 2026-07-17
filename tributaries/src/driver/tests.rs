@@ -722,7 +722,18 @@ impl Harness {
     path: &str,
     options: WatchOptions<OsString>,
   ) -> Result<Subscription, WatchError> {
-    self.owner.reconcile_watch(&key(path), (), options).await
+    self
+      .owner
+      .reconcile_watch(&key(path), (), options)
+      .await
+      .map_err(|stop| match stop {
+        super::ReconcileStop::Failed(err) => err,
+        // These harness owners are driven directly — nothing ever sends on their close signal — so
+        // the in-place widen's close race cannot fire here.
+        super::ReconcileStop::CloseRequested(_) => {
+          unreachable!("no close is sent to a directly-driven harness owner")
+        }
+      })
   }
 
   fn unwatch(&mut self, sub: Subscription) -> Result<(), UnwatchError> {
@@ -8203,4 +8214,149 @@ async fn a_close_during_a_held_sync_tears_down_promptly() {
     matches!(sync_result, Err(SyncError::Closed)),
     "the abandoned held sync resolves Closed after the close-driven teardown: {sync_result:?}"
   );
+}
+
+/// A source for the HELD-RETARGET tests: it arms roots live and offers the in-place widen
+/// ([`Source::replace`]), but `replace` first parks on a gate the test holds shut — modelling a hung
+/// backend retarget (a stuck FUSE/NFS mount) that never returns. `next` parks when idle, keeping the
+/// run loop alive so the race's close arm can free the owner.
+struct HeldReplaceSource {
+  next_handle: u32,
+  live: HashMap<u32, Vec<OsString>>,
+  /// `replace` awaits one token here before returning. The tests never send (and keep the paired
+  /// sender alive so the channel stays open rather than erroring), so the retarget stays held for the
+  /// whole test — the only thing that frees the owner is the race, never the retarget completing.
+  replace_gate: async_channel::Receiver<()>,
+  /// When `Some`, the FIRST `replace` skips the gate and commits at this key instead. Pointed
+  /// somewhere that contains NO subsumed root, it is the canonicalization race that drives the owner
+  /// into the widen's ROLLBACK retarget — so the SECOND `replace`, the rollback, is the held one.
+  first_replace_diverges_to: Option<Vec<OsString>>,
+  /// `replace` calls so far, so the divergent form above can hold the rollback rather than the widen.
+  replace_calls: u32,
+}
+
+impl Source<OsString> for HeldReplaceSource {
+  type Handle = u32;
+
+  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    Ok(key.to_vec())
+  }
+
+  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    self.next_handle += 1;
+    let handle = self.next_handle;
+    self.live.insert(handle, key.to_vec());
+    Ok(Armed::new(handle, key.to_vec()))
+  }
+
+  fn disarm(&mut self, handle: u32) {
+    self.live.remove(&handle);
+  }
+
+  async fn replace(
+    &mut self,
+    handle: u32,
+    new_key: &[OsString],
+  ) -> Result<Armed<OsString, u32>, WatchError> {
+    self.replace_calls += 1;
+    // The divergent form: commit the widen's retarget at a key the plan does not preserve, so the
+    // owner rolls back — and the rollback below is what parks on the gate.
+    if self.replace_calls == 1
+      && let Some(divergent) = self.first_replace_diverges_to.clone()
+    {
+      self.live.insert(handle, divergent.clone());
+      return Ok(Armed::new(handle, divergent));
+    }
+    // Park on the test's gate: the retarget is held until the test releases it (it never does), so
+    // the owner would wedge here forever under an inline `replace().await`.
+    let _ = self.replace_gate.recv().await;
+    self.live.insert(handle, new_key.to_vec());
+    Ok(Armed::new(handle, new_key.to_vec()))
+  }
+
+  async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+    // Park so the run loop survives to service the race and later commands.
+    std::future::pending::<Option<SourceEvent<OsString, u32>>>().await
+  }
+
+  fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+    self.live.get(&handle).cloned()
+  }
+}
+
+/// Drives a widen that takes the IN-PLACE [`Source::replace`] path against a source whose retarget is
+/// held forever, then closes: shared by the two held-retarget tests, which differ only in WHICH of the
+/// widen's two `replace` awaits is the held one. Asserts the finding's acceptance both ways — `close()`
+/// resolves without the gate ever opening, and the abandoned widen's `watch()` sees `Closed`.
+async fn assert_a_held_retarget_does_not_wedge_close(
+  first_replace_diverges_to: Option<Vec<OsString>>,
+) {
+  // The gate the test holds shut: `replace` parks on it forever, modelling a hung backend retarget.
+  let (_replace_tx, replace_rx) = async_channel::unbounded::<()>();
+  let source = HeldReplaceSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    replace_gate: replace_rx,
+    first_replace_diverges_to,
+    replace_calls: 0,
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new());
+  // The SOLE root the widen below subsumes — which is what sends it down the in-place retarget path
+  // (`unwatch.as_slice()` matching `[only]`) rather than release-and-rearm.
+  w.watch(key("/a/b"), (), WatchOptions::new())
+    .await
+    .expect("watch /a/b");
+
+  // The widen on a background task, so it never goes away on its own: the owner parks in the held
+  // retarget, and the ONLY thing that can free it is the close under test. (A `watch` caller has no
+  // deadline to self-cancel on — and could not interrupt the owner if it did, which is exactly why
+  // the race is close-only.)
+  let widener = {
+    let w = w.clone();
+    tokio::spawn(async move { w.watch(key("/a"), (), WatchOptions::new()).await })
+  };
+  // Let the owner dispatch the widen and park in the held `replace` before the close arrives.
+  tokio::time::sleep(Duration::from_millis(200)).await;
+
+  // Close must resolve WITHOUT the gate ever opening: the close arm outranks the parked retarget.
+  tokio::time::timeout(Duration::from_secs(5), w.close())
+    .await
+    .expect("close tears down promptly while the retarget is held — it does not wait it out")
+    .expect("close acknowledges");
+
+  // The abandoned widen resolves once the owner tore down: the reconcile returned its close verdict
+  // without ever sending on the watch's reply, so the dropped reply surfaces `Closed` to the caller.
+  let watch_result = tokio::time::timeout(Duration::from_secs(5), widener)
+    .await
+    .expect("the held widen resolves once the owner tore down")
+    .expect("widen task");
+  assert!(
+    matches!(watch_result, Err(WatchError::Closed)),
+    "the abandoned held widen resolves Closed after the close-driven teardown: {watch_result:?}"
+  );
+}
+
+/// A held in-place widen RETARGET must not wedge the owner. The owner parks in the held `replace`
+/// mid-reconcile; the close on the dedicated signal wins that race, rides back through
+/// `dispatch_command` as the same `Flow::Break` the run loop's own close arm produces, and tears down
+/// — so `close()`'s bounded-latency contract holds even against a mount that never answers.
+///
+/// Fail-on-old (the inline `self.source.replace(only, key).await`): the owner stays parked in the held
+/// retarget forever, so the run loop never polls `closes` again and `close()` hangs to its bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_in_place_replace_does_not_wedge_close() {
+  assert_a_held_retarget_does_not_wedge_close(None).await;
+}
+
+/// The widen's ROLLBACK retarget is raced too. Here the first `replace` COMMITS at `/z` — a key
+/// containing none of the subsumed roots, so `fs_path_preserves_plan` rejects it and the owner rolls
+/// the retarget back — and it is that rollback which hangs. Both of the widen's `replace` awaits are
+/// therefore proven close-interruptible, not just the first.
+///
+/// Fail-on-old (the inline rollback `self.source.replace(handle, &only_key).await`): same wedge, one
+/// await later — `close()` hangs to its bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_in_place_replace_rollback_does_not_wedge_close() {
+  assert_a_held_retarget_does_not_wedge_close(Some(key("/z"))).await;
 }
