@@ -670,7 +670,10 @@ impl CookieIngress {
   }
 
   /// Reaps the cookie at `path` — the public completed-cookie request, resolved
-  /// through the projection the claim filled.
+  /// through the projection the claim filled. `by_path` names the path's CURRENT
+  /// holder, so a remove delayed across one incarnation's retire and a same-path
+  /// successor's claim (two syncs reusing one name in one dir) reaps the successor;
+  /// [`request_cancel`](Self::request_cancel) is the incarnation-precise form.
   pub(crate) fn request_remove(&self, path: &Path) {
     self.mark(|inner| inner.by_path.get(path).copied());
   }

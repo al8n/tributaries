@@ -1132,6 +1132,18 @@ impl<R> Watcher<R> {
   /// before its `sync_root` reply arrives — possible only by re-deriving it
   /// out-of-contract — is dropped rather than acted on. Reap the path the reply
   /// gave you.
+  ///
+  /// # Path addresses the path's CURRENT holder
+  ///
+  /// A path resolves to whatever live cookie occupies it NOW, not the incarnation
+  /// live when the request was issued. A sync's cookie path is `dir.join(name)`, so
+  /// two syncs that reuse one `name` in one `dir` sequentially share a path: a reap
+  /// delayed across the first sync's retirement and a second sync's claim of the
+  /// same path reaps the SECOND. This is harmless for the intended reap-what-you-were-
+  /// -given use, and cannot arise for the umbrella (its cookie names are per-sync
+  /// unique). A caller that both reuses names and needs incarnation precision reaps
+  /// through its [`SyncTicket`] instead — [`request_cancel_sync`](Self::request_cancel_sync)
+  /// addresses exactly one incarnation for all time and is a no-op after it resolves.
   pub fn request_remove_cookie(&self, path: impl Into<PathBuf>) {
     self.cleanup.request_remove(&path.into());
   }
