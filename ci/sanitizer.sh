@@ -12,14 +12,25 @@ TARGET="x86_64-unknown-linux-gnu"
 #   $1  which : asan-lsan | msan | tsan | all   (default: all)
 WHICH="${1:-all}"
 
+# `close_quiesces_under_sustained_traffic` drives an UNBOUNDED real-kernel producer
+# thread (raw write/remove syscalls) that only stops once close() returns, racing an
+# instrumented reader. Every sanitizer slows the reader/runtime but not the syscall
+# producer, so the producer outpaces the drain and the cell can livelock to a job
+# timeout — intermittently, under ASan/LSan and TSan alike (it has cancelled `main`'s
+# own sanitizer run this way). It runs unimpeded on the native integration job, and
+# its deterministic correctness twin `close_is_bounded_and_honest_while_the_ingress_hammers`
+# covers the property in the lib suite under every sanitizer. Skip only this one cell
+# wherever an instrumented build runs the integration binaries.
+SANITIZER_SKIP=(-- --skip close_quiesces_under_sustained_traffic)
+
 run_asan_lsan() {
   # Run address sanitizer
   RUSTFLAGS="-Z sanitizer=address" \
-  cargo test --tests --target "$TARGET" --all-features
+  cargo test --tests --target "$TARGET" --all-features "${SANITIZER_SKIP[@]}"
 
   # Run leak sanitizer
   RUSTFLAGS="-Z sanitizer=leak" \
-  cargo test --tests --target "$TARGET" --all-features
+  cargo test --tests --target "$TARGET" --all-features "${SANITIZER_SKIP[@]}"
 }
 
 run_msan() {
@@ -37,19 +48,11 @@ run_msan() {
 }
 
 run_tsan() {
-  # Run thread sanitizer (requires -Zbuild-std for instrumented std).
-  #
-  # `close_quiesces_under_sustained_traffic` is a real-kernel liveness smoke test:
-  # a producer thread saturates the ingress while close drains it. Under TSan's
-  # adversarial thread scheduling the producer can outpace the drain and the cell
-  # livelocks (a 6 h job timeout rather than a finish). It completes under ASan /
-  # LSan and on the native integration job, and its deterministic correctness twin
-  # `close_is_bounded_and_honest_while_the_ingress_hammers` runs green under TSan in
-  # the lib suite — so skip only this one cell here, keeping every other cell's
-  # TSan coverage of the real backend reader / driver handoff.
+  # Run thread sanitizer (requires -Zbuild-std for instrumented std). The
+  # sustained-traffic liveness cell is skipped for the reason documented on
+  # SANITIZER_SKIP above.
   RUSTFLAGS="-Z sanitizer=thread" \
-  cargo -Zbuild-std test --tests --target "$TARGET" --all-features -- \
-    --skip close_quiesces_under_sustained_traffic
+  cargo -Zbuild-std test --tests --target "$TARGET" --all-features "${SANITIZER_SKIP[@]}"
 }
 
 case "$WHICH" in
