@@ -118,6 +118,11 @@ pub struct FsSource<R> {
   /// — distinguishes a grow's SUPERSEDED (removed, never forwarded) queued prune from a flushed one.
   #[cfg(test)]
   deferred_forwards: usize,
+  /// [`Watcher::request_cancel_sync`] calls [`cancel_sync`](Source::cancel_sync) actually issued —
+  /// distinguishes a stale/mismatched-token cancel (touches nothing) from a matching-token cancel of
+  /// a live entry, which removes it and fires the watcher-side cancel.
+  #[cfg(test)]
+  sync_cancels_requested: usize,
 }
 
 impl<R> core::fmt::Debug for FsSource<R> {
@@ -152,6 +157,8 @@ impl<R: RuntimeLite> FsSource<R> {
       cover_round_trips: 0,
       #[cfg(test)]
       deferred_forwards: 0,
+      #[cfg(test)]
+      sync_cancels_requested: 0,
     })
   }
 }
@@ -690,21 +697,28 @@ impl<R> Source<OsString> for FsSource<R> {
   fn cancel_sync(&mut self, handle: RootHandle, token: SyncToken) {
     // The owner abandoned an in-flight `begin_sync` and never learned the cookie
     // path — but `begin_sync` recorded the watcher-minted ticket for this handle
-    // before it awaited, so take it and cancel by that ticket: the incarnation-
+    // before it awaited, so peek it and cancel by that ticket: the incarnation-
     // precise address the driver records at ADMISSION and therefore always resolves
     // while the sync is live. The stored token is the incarnation guard — a cancel
     // whose token does not match the recorded one is stale (a later incarnation
-    // superseded it) and dropped, and a missing entry means the sync already
+    // superseded it), and the entry is removed and the cancel issued ONLY on a
+    // match, so a stale cancel leaves a live successor's entry INTACT for that
+    // successor's own cancel to find; a missing entry means the sync already
     // returned (nothing to cancel). The driver reaps the cookie if the write
     // already landed, refuses the claim of a write still in the pool (so it
     // self-reaps the file it creates), retires a sync whose write was never
     // dispatched, or drops the request if the sync already resolved. Runtime-free
-    // (a map take, a lock, and a `try_send`), like `end_sync`; the runtime-bearing
+    // (a map lookup, a lock, and a `try_send`), like `end_sync`; the runtime-bearing
     // cleanup lives in the driver.
     self.flush_deferred_prunes();
-    if let Some((stored, ticket)) = self.pending_syncs.remove(&handle)
+    if let Some(&(stored, ticket)) = self.pending_syncs.get(&handle)
       && stored == token
     {
+      self.pending_syncs.remove(&handle);
+      #[cfg(test)]
+      {
+        self.sync_cancels_requested += 1;
+      }
       self.watcher.request_cancel_sync(ticket);
     }
   }
