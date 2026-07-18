@@ -3941,10 +3941,14 @@ mod replace {
     assert!(on_close.await.is_ok(), "close settles");
     settle(|| rig.fs.shutdowns() == 2).await;
     assert_eq!(rig.fs.shutdowns(), 2, "both streams are torn down");
-    // The abandoned replace resolves Closed, not silence.
+    // Both resolutions of the replace/close race are legal linearizations:
+    // close-first — the drain drops the reply (`Err(_)`, surfaced as `Closed`);
+    // commit-first — the spawn result beats the queued Close through the op-biased
+    // select, the swap fully commits, and close then tears down the committed lane
+    // (the shutdowns()==2 asserts above pin both-streams accounting either way).
     assert!(matches!(
       on_reply.await,
-      Ok(Err(crate::error::ReplaceRootError::Closed)) | Err(_)
+      Ok(Ok(())) | Ok(Err(crate::error::ReplaceRootError::Closed)) | Err(_)
     ));
   }
 
@@ -5937,7 +5941,7 @@ mod sync_cookie {
 
     // Hold a write in the pool: it is outstanding when close begins.
     let hold = rig.fs.hold_cookie_writes();
-    let _on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-2-2-1").await;
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-2-2-1").await;
     settle(|| rig.fs.cookie_dispatches() == 1).await;
 
     let (close_reply, on_close) = futures_channel::oneshot::channel();
@@ -5955,14 +5959,21 @@ mod sync_cookie {
       "the outstanding write is counted — close is honest, not wedged"
     );
 
-    // The held write, released after close, self-reaps against the raised
-    // shutdown flag: no cookie file survives.
+    // The released write's claim is refused against the raised shutdown flag, and
+    // its self-reap unlink happens-before the sync reply is sent — so awaiting the
+    // reply is the deterministic reap witness (no settle race on the create window).
     hold.release();
-    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    let outcome = on_reply.await;
     assert!(
-      rig.fs.files_under("/r").is_empty(),
+      matches!(outcome, Ok(Err(crate::error::SyncRootError::Retired))),
+      "{outcome:?}"
+    );
+    assert_eq!(
+      rig.fs.cookie_removes().len(),
+      1,
       "the late write reaped the file it created"
     );
+    assert!(rig.fs.files_under("/r").is_empty());
   }
 
   // A hung TERMINAL unlink must never wedge close: the orderly sweep dispatches
@@ -9174,7 +9185,14 @@ mod sync_cookie {
       let cleanup = rig.cleanup.clone();
       let live = path.clone();
       tokio::spawn(async move {
-        for i in 0..200_000u64 {
+        // Under miri the flood must shrink: miri never reuses an address, so a
+        // 200k-iteration flood exhausts the 32-bit address space (i686), and its
+        // sheer volume starves miri's cooperative scheduler into a blocking-pool
+        // deadlock. A small flood exercises the same property — a hostile ingress
+        // inflates nothing countable and wedges no close (the `outstanding == 1`
+        // assertion is flood-count-independent).
+        let flood: u64 = if cfg!(miri) { 64 } else { 200_000 };
+        for i in 0..flood {
           cleanup.request_remove(&PathBuf::from(format!("/r/.tributaries-sync-x{i}")));
           cleanup.request_cancel(ticket());
           cleanup.request_remove(&live);
