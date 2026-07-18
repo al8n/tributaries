@@ -24,6 +24,7 @@ fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>)
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
       cleanup,
+      sync_tickets: Arc::new(AtomicU64::new(0)),
       events: Box::pin(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
       _runtime: PhantomData,
@@ -379,6 +380,47 @@ async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
     watcher.request_set_cover(handle, vec![PathBuf::from("/r/closed")]),
     RequestOutcome::Rejected,
     "a closed channel is rejected — retrying can never succeed"
+  );
+}
+
+/// A [`SyncTicket`] minted by a DIFFERENT watcher is refused by `sync_root` synchronously — before
+/// any command is sent — in the foreign-handle door idiom: a foreign ticket's sequence is unrelated
+/// to this watcher's numbering, so honoring it could alias one of this watcher's incarnations. The
+/// ticket-brand check precedes any root lookup, so a synthetic live-branded handle reaches it.
+#[tokio::test]
+async fn sync_root_refuses_a_foreign_ticket_at_the_door() {
+  let (watcher, commands) = manual_watcher();
+  let (other, _other_commands) = manual_watcher();
+  let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
+
+  // A ticket minted by the OTHER watcher — a foreign brand — is refused ForeignTicket.
+  let foreign = other.mint_sync_ticket();
+  assert!(
+    matches!(
+      watcher
+        .sync_root(handle, "/r", ".tributaries-sync-foreign", foreign)
+        .await,
+      Err(SyncRootError::ForeignTicket)
+    ),
+    "a foreign-brand ticket is refused ForeignTicket"
+  );
+  assert!(
+    commands.try_recv().is_err(),
+    "the foreign ticket sent no command — the refusal is synchronous, at the door"
+  );
+
+  // This watcher's OWN ticket clears the ticket door: it then falls through to the root lookup
+  // (which this manual watcher has no live root for), so the answer is UnknownRoot, never
+  // ForeignTicket — the brand, not all tickets, is what ForeignTicket refuses.
+  let own = watcher.mint_sync_ticket();
+  assert!(
+    matches!(
+      watcher
+        .sync_root(handle, "/r", ".tributaries-sync-own", own)
+        .await,
+      Err(SyncRootError::UnknownRoot)
+    ),
+    "this watcher's own ticket clears the foreign-ticket door"
   );
 }
 
@@ -1449,13 +1491,17 @@ mod lifecycle {
 
     // Nothing is awaited from here on: on a current-thread runtime the driver task
     // cannot run at all, so every bound below is proven WITHOUT a drain.
+    //
+    // One reused ticket is the duplicate-target half of the vector: the old lane
+    // queued each duplicate, because it deduplicated only after dequeue.
+    let dup = watcher.mint_sync_ticket();
     for i in 0..100_000u64 {
       watcher.request_remove_cookie(PathBuf::from(format!("/r/.tributaries-sync-{i}")));
-      watcher.request_cancel_sync(format!(".tributaries-sync-{i}"));
-      // Duplicates of one target are the other half of the vector: the old lane
-      // queued each one, because it deduplicated only after dequeue.
+      // A freshly minted, never-admitted ticket resolves nothing — it addresses no
+      // record this watcher ever admitted, so the flood retains nothing through it.
+      watcher.request_cancel_sync(watcher.mint_sync_ticket());
       watcher.request_remove_cookie(PathBuf::from("/r/.tributaries-sync-dup"));
-      watcher.request_cancel_sync(".tributaries-sync-dup");
+      watcher.request_cancel_sync(dup);
     }
 
     assert_eq!(

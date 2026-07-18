@@ -54,7 +54,7 @@ use crate::{
     Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, Source, SourceConfig,
     SourceError, SourceHandle, SourceMessage, linux::WatchOutcome,
   },
-  watcher::{CoverOutcome, SkipReason},
+  watcher::{CoverOutcome, SkipReason, SyncTicket},
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -275,6 +275,20 @@ struct LedgerInner {
   /// defensive rule for state minted below the public surface (tests, future
   /// internal callers).
   by_name: HashMap<String, CookieId>,
+  /// Ticket sequence -> incarnation id, for the incarnation-precise cancel/reap a
+  /// [`request_cancel_sync`] addresses. Unlike `by_name`, a ticket sequence is
+  /// minted once by the watcher and NEVER re-minted, so this map carries temporal
+  /// identity the name axis cannot: a delayed cancel through a ticket resolves that
+  /// ticket's own incarnation whatever its phase, or nothing once it has retired —
+  /// it can never resolve a same-name successor. Inserted at BIRTH (the same single
+  /// critical section as `by_name`) and removed at that record's retire. Public
+  /// admission REFUSES a second live obligation under a sequence this map already
+  /// holds (`TicketInUse`), so it is an injection from live sequences to live
+  /// records. A projection of counted records — one entry per live obligation, +8
+  /// bytes each, bounded by the global cap — never a gauge.
+  ///
+  /// [`request_cancel_sync`]: crate::Watcher::request_cancel_sync
+  by_ticket: HashMap<u64, CookieId>,
   /// The id mint (§1.1). Bumped under this mutex ONCE per admitted sync, at
   /// ADMISSION ([`CookieRegistry::admit_parked`]) — the ONE site that inserts a
   /// record, so mint and birth are one step and an id can never be minted for a
@@ -299,6 +313,7 @@ impl LedgerInner {
       obligations: HashMap::new(),
       by_path: HashMap::new(),
       by_name: HashMap::new(),
+      by_ticket: HashMap::new(),
       next_cookie_id: 0,
       failure_clock: 0,
       #[cfg(all(test, feature = "tokio"))]
@@ -306,7 +321,7 @@ impl LedgerInner {
     }
   }
 
-  /// Removes incarnation `id` and its two index entries — the ONLY way a record
+  /// Removes incarnation `id` and its three index entries — the ONLY way a record
   /// leaves the ledger. Because the record is keyed by its id, the removal is
   /// structural: a confirm for incarnation N can never delete a successor M that
   /// reclaimed the same path (M has a different key). Returns the removed record
@@ -317,7 +332,9 @@ impl LedgerInner {
   /// umbrella mints per-sync-unique names (owner-global seq + nonce), so this is
   /// always true for it, but a direct fs-API caller that reused one name across
   /// two live incarnations must not have the survivor's index clobbered by the
-  /// other's retire.
+  /// other's retire. The `by_ticket` point-back is uniform with the others though
+  /// a displacement there is unmintable: a ticket sequence is minted once and never
+  /// repeats, so `by_ticket[seq]` can only ever have named THIS record.
   fn retire(&mut self, id: CookieId, reaped: Reaped) -> Option<Obligation> {
     let ob = self.obligations.remove(&id)?;
     #[cfg(all(test, feature = "tokio"))]
@@ -331,6 +348,9 @@ impl LedgerInner {
     }
     if self.by_name.get(&ob.name) == Some(&id) {
       self.by_name.remove(&ob.name);
+    }
+    if self.by_ticket.get(&ob.ticket) == Some(&id) {
+      self.by_ticket.remove(&ob.ticket);
     }
     Some(ob)
   }
@@ -394,11 +414,16 @@ enum Reaped {
 
 /// One cookie obligation's ledger record: the scope it belongs to, its rendered
 /// name (kept so retiring the record can also drop its `by_name` index without
-/// recomputation), its immutable incarnation identity, the path it landed at, the
-/// reap mark, its LRU re-arm key, and its lifecycle phase.
+/// recomputation), the ticket sequence keying it (kept for the same reason on the
+/// `by_ticket` index), its immutable incarnation identity, the path it landed at,
+/// the reap mark, its LRU re-arm key, and its lifecycle phase.
 struct Obligation {
   scope: ScopeId,
   name: String,
+  /// The [`SyncTicket`] sequence this admission was keyed by (kept so retiring the
+  /// record can also drop its `by_ticket` index without recomputation). Minted once
+  /// by the watcher and never re-minted, so it names this incarnation alone.
+  ticket: u64,
   /// Immutable incarnation identity — also this record's ledger key. Never
   /// changes for the life of the record; a same-path successor gets a fresh one.
   id: CookieId,
@@ -537,12 +562,13 @@ pub(crate) fn cookie_ingress() -> (CookieIngress, CookieWake) {
 ///
 /// # A genuine request can never be refused — by TYPE
 ///
-/// A genuine request names an obligation this watcher admitted, and both public
-/// addresses become valid strictly before a caller can legitimately hold them:
+/// A genuine request names an obligation this watcher admitted, and every public
+/// address becomes valid strictly before a caller can legitimately hold it:
 /// `by_path` is filled by the claim, whose mutex section precedes the `sync_root`
 /// reply that is the ONLY place a caller learns the path (claim-before-reply);
-/// `by_name` is filled at admission, before `sync_root` can even be answered. The
-/// ingress locks the same mutex those writes took, so it observes them.
+/// `by_ticket` is filled at admission, before `sync_root` can even be answered, so
+/// a cancel through the ticket the caller passed always resolves while the sync is
+/// live. The ingress locks the same mutex those writes took, so it observes them.
 ///
 /// There is then no refusal edge on the genuine path: a mutex lock cannot fail
 /// (poisoning is absorbed — [`lock_ledger`]), a bool store cannot fail, and the
@@ -555,7 +581,7 @@ pub(crate) fn cookie_ingress() -> (CookieIngress, CookieWake) {
 ///
 /// # The door's trade-off, stated
 ///
-/// An UNADDRESSABLE target — a path or name matching no live obligation — is
+/// An UNADDRESSABLE target — a path or ticket matching no live obligation — is
 /// dropped right here rather than queued to be discovered a no-op later. This is
 /// exact rather than heuristic, because the ledger is birth-to-terminal complete:
 /// an unknown address provably names no obligation of this watcher. The one
@@ -649,12 +675,16 @@ impl CookieIngress {
     self.mark(|inner| inner.by_path.get(path).copied());
   }
 
-  /// Cancels the sync whose rendered cookie file is `name` — the public
-  /// cancel-by-name request. `by_name` is populated at ADMISSION, so this always
-  /// has a target whatever the obligation's phase: a sync still parked on its
-  /// fence, a write still in the pool, or a cookie already owned.
-  pub(crate) fn request_cancel(&self, name: &str) {
-    self.mark(|inner| inner.by_name.get(name).copied());
+  /// Cancels the sync `ticket` keys — the public incarnation-precise cancel/reap.
+  /// `by_ticket` is populated at ADMISSION, so this always has a target whatever
+  /// the obligation's phase: a sync still parked on its fence, a write still in the
+  /// pool, or a cookie already owned. Because a ticket sequence is minted once and
+  /// never re-minted, it resolves that one incarnation or — once it has retired —
+  /// nothing, never a same-name successor. The watcher already dropped a
+  /// foreign-brand ticket at its door, so a sequence reaching here belongs to this
+  /// ledger's numbering.
+  pub(crate) fn request_cancel(&self, ticket: SyncTicket) {
+    self.mark(|inner| inner.by_ticket.get(&ticket.seq()).copied());
   }
 
   /// The live obligation count as the HANDLE sees it — the flood cell's oracle: it
@@ -898,22 +928,31 @@ impl<F: FsOps> CookieRegistry<F> {
 
   /// BIRTHS one cookie obligation, PARKED on the settle fence its sync was
   /// admitted under, and returns its incarnation id. The id, the record, and its
-  /// `by_name` entry are all created HERE — the SINGLE birth site, and the single
-  /// id mint — under the ledger lock, so:
+  /// `by_name` and `by_ticket` entries are all created HERE — the SINGLE birth
+  /// site, and the single id mint — under the ledger lock, so:
   ///
   /// - every admitted sync is a COUNTED obligation from the instant its caller
   ///   can address it, so the global cap sees a parked sync and a dispatched
   ///   write alike, in one term, with no second gauge to keep in step;
-  /// - a cancel-by-name always has a target, whatever the phase — which is why
-  ///   the reap mark can ride the record instead of a free-standing tombstone,
-  ///   and why cancelling a sync whose write has not been dispatched needs no
-  ///   lookaside scan of the driver's parked-routing local;
+  /// - a cancel through the sync's ticket always has a target, whatever the phase
+  ///   — which is why the reap mark can ride the record instead of a free-standing
+  ///   tombstone, and why cancelling a sync whose write has not been dispatched
+  ///   needs no lookaside scan of the driver's parked-routing local;
   /// - an insert can never displace a live obligation, since the id is minted
   ///   with it and is unique by construction.
   ///
+  /// `ticket` is the caller's [`SyncTicket`] sequence — the `by_ticket` key an
+  /// incarnation-precise cancel resolves through.
+  ///
   /// Called only AFTER every admission refusal has passed: a refused sync must
   /// create nothing at all.
-  fn admit_parked(&mut self, scope: ScopeId, name: String, fence: FenceId) -> CookieId {
+  fn admit_parked(
+    &mut self,
+    scope: ScopeId,
+    name: String,
+    ticket: u64,
+    fence: FenceId,
+  ) -> CookieId {
     let mut inner = lock_ledger(&self.ledger);
     inner.next_cookie_id += 1;
     let id = CookieId(inner.next_cookie_id);
@@ -922,6 +961,7 @@ impl<F: FsOps> CookieRegistry<F> {
       Obligation {
         scope,
         name: name.clone(),
+        ticket,
         id,
         path: None,
         reap_requested: false,
@@ -937,6 +977,12 @@ impl<F: FsOps> CookieRegistry<F> {
     // at retire keeps the id-keyed machinery correct even under a hand-built
     // same-name pair.
     inner.by_name.insert(name, id);
+    // The ticket sequence, likewise inserted here in the same critical section.
+    // Public admission refuses a second live obligation under a sequence already
+    // held (`ticket_in_use` → `TicketInUse`), and a sequence is never re-minted,
+    // so this map is an injection from live sequences to live records — a cancel
+    // through a ticket resolves that one incarnation for all time.
+    inner.by_ticket.insert(ticket, id);
     #[cfg(all(test, feature = "tokio"))]
     {
       inner.census.births += 1;
@@ -1052,16 +1098,32 @@ impl<F: FsOps> CookieRegistry<F> {
       .any(|ob| ob.scope == scope && matches!(ob.phase, Phase::Parked { .. } | Phase::InPool))
   }
 
-  /// Whether a LIVE obligation already holds this rendered cookie name —
-  /// the cancel-by-name injectivity gate. `by_name` membership IS liveness:
-  /// entries are inserted only at admission (which now requires absence) and
-  /// removed exactly at that record's retire, so every phase from `Parked`
-  /// through `RemoveFailed` holds its name, and a name is freed only at the
-  /// holder's typed terminal. A name with no live holder — including one whose
-  /// holder just retired — admits, so SEQUENTIAL reuse of a name is unrefused;
-  /// only a second CONCURRENT live holder is. One hash lookup, no fs I/O.
+  /// Whether a LIVE obligation already holds this rendered cookie name — the
+  /// PHYSICAL-identity gate. With cancel addressed by ticket rather than by name,
+  /// this gate's load-bearing role is no longer cancel disambiguation but the
+  /// physical file: one live obligation per name ⇒ per path ⇒ no two live syncs
+  /// contend one cookie file (the claim's `by_path` displacement and the
+  /// create_new/unlink collisions stay unmintable through the public surface).
+  /// `by_name` membership IS liveness: entries are inserted only at admission
+  /// (which now requires absence) and removed exactly at that record's retire, so
+  /// every phase from `Parked` through `RemoveFailed` holds its name, and a name is
+  /// freed only at the holder's typed terminal. A name with no live holder —
+  /// including one whose holder just retired — admits, so SEQUENTIAL reuse of a
+  /// name is unrefused; only a second CONCURRENT live holder is. One hash lookup,
+  /// no fs I/O.
   fn name_in_use(&self, name: &str) -> bool {
     lock_ledger(&self.ledger).by_name.contains_key(name)
+  }
+
+  /// Whether a LIVE obligation already holds this ticket sequence — the ticket
+  /// single-use gate. Mirrors [`name_in_use`](Self::name_in_use): `by_ticket`
+  /// membership is liveness, inserted at admission and removed at retire, so this
+  /// refuses only a second CONCURRENTLY-live obligation under one sequence (a
+  /// caller passing one ticket to two live syncs). A sequence whose holder has
+  /// retired admits — but since the watcher never re-mints a sequence, that never
+  /// arises for a conforming caller. One hash lookup, no fs I/O.
+  fn ticket_in_use(&self, ticket: u64) -> bool {
+    lock_ledger(&self.ledger).by_ticket.contains_key(&ticket)
   }
 
   /// Re-arms PARKED removal records at a cap refusal — refusing-scope-FIRST,
@@ -1818,6 +1880,10 @@ pub(crate) enum Command {
     dir: PathBuf,
     /// The minted cookie name (the caller owns the reserved namespace).
     name: String,
+    /// The watcher-minted ticket keying this admission — the `by_ticket` address a
+    /// later cancel resolves through. Its foreign-brand refusal is the watcher's
+    /// synchronous door, so a ticket reaching here is always this watcher's.
+    ticket: SyncTicket,
     /// Resolved with the cookie's path at WRITE-complete — never at observe
     /// (the observation arrives on the caller's own event stream).
     reply: futures_channel::oneshot::Sender<Result<PathBuf, crate::error::SyncRootError>>,
@@ -4167,6 +4233,7 @@ pub(crate) async fn run<R, F>(
           scope,
           dir,
           name,
+          ticket,
           reply,
         }) => {
           // The scope's canonical root, only for a live scope — the FLOOR the
@@ -4200,23 +4267,36 @@ pub(crate) async fn run<R, F>(
                 let _ = reply.send(Err(crate::error::SyncRootError::WriteInFlight));
               } else if cookies.name_in_use(&name) {
                 // A LIVE obligation of this watcher already holds this rendered
-                // name. `by_name` maps a name to ONE incarnation, so admitting a
-                // second same-name obligation would redirect it — a cancel-by-name
-                // meant for the holder could then reap the newcomer (another root's
-                // sync), and the displaced holder would be unaddressable-by-name
-                // until teardown. Refuse before birth: with no two live same-name
-                // obligations, `by_name` is an injection and cancel-by-name is
-                // exact. The name frees at the holder's typed terminal, so
-                // sequential reuse admits; concurrent syncs need distinct names (the
-                // umbrella mints per-sync-unique names, so it never trips this).
+                // name. `by_name` maps a name to ONE incarnation ⇒ ONE path, so
+                // admitting a second same-name obligation would put two live syncs
+                // on one cookie file — the `create_new`/unlink collisions and the
+                // `by_path` displacement the physical machinery must never face.
+                // Refuse before birth: with no two live same-name obligations, one
+                // cookie file has one live owner. The name frees at the holder's
+                // typed terminal, so sequential reuse admits; concurrent syncs need
+                // distinct names (the umbrella mints per-sync-unique names, so it
+                // never trips this).
                 //
                 // Ordered AFTER `WriteInFlight` so a same-scope retry while the
                 // predecessor is still `Parked`/`InPool` keeps reading the transient
-                // single-flight signal (renaming is not its remedy), and BEFORE the
-                // caps so a permanently name-blocked request is neither mis-reported
-                // as transient capacity pressure nor allowed to spuriously re-arm the
-                // recovery batch. A refused admission creates nothing.
+                // single-flight signal (renaming is not its remedy), and BEFORE both
+                // `TicketInUse` and the caps so a permanently name-blocked request is
+                // neither mis-reported as transient capacity pressure nor allowed to
+                // spuriously re-arm the recovery batch — and so a name+ticket
+                // collision reads `NameInUse` first, keeping every earlier pinned
+                // outcome verbatim. A refused admission creates nothing.
                 let _ = reply.send(Err(crate::error::SyncRootError::NameInUse { name }));
+              } else if cookies.ticket_in_use(ticket.seq()) {
+                // A LIVE obligation of this watcher already holds this ticket
+                // sequence — the caller passed one ticket to two concurrently-live
+                // syncs. `by_ticket` maps a sequence to ONE incarnation, so admitting
+                // a second under it would make the sequence's cancel ambiguous.
+                // Refuse before birth (both are permanent-shaped caller errors, name
+                // first so the name-gate outcomes stay verbatim), and BEFORE the caps
+                // so it is not mis-reported as transient pressure nor allowed to
+                // re-arm the recovery batch. A refusal creates nothing, so the SAME
+                // ticket stays valid for a retry (refusal is not admission).
+                let _ = reply.send(Err(crate::error::SyncRootError::TicketInUse {}));
               } else if cookies.unremoved_for(scope) >= config.cookie_backlog_cap
                 || cookies.unremoved() >= config.cookie_global_cap
               {
@@ -4250,10 +4330,10 @@ pub(crate) async fn run<R, F>(
                 // ADMITTED — and admission is BIRTH. Every refusal above has
                 // passed, so this sync becomes an obligation right here, before its
                 // caller can hold any address for it: from this line the global cap
-                // counts it, the single-flight gate stands on it, a cancel naming
-                // it has a record to mark, and the close reply cannot miss it. A
-                // REFUSED admission creates nothing at all — the reason a hostile
-                // flood of refused syncs cannot mint state.
+                // counts it, the single-flight gate stands on it, a cancel through
+                // its ticket has a record to mark, and the close reply cannot miss
+                // it. A REFUSED admission creates nothing at all — the reason a
+                // hostile flood of refused syncs cannot mint state.
                 //
                 // The write parks on a settle fence opened right here — the same
                 // fence a reconcile's ack rides, so it inherits this moment's
@@ -4263,7 +4343,7 @@ pub(crate) async fn run<R, F>(
                 // in-flight re-arms to quiesce, which is precisely the ordering
                 // the barrier needs.
                 let fence = core.open_cover_fence(scope);
-                cookies.admit_parked(scope, name, fence);
+                cookies.admit_parked(scope, name, ticket.seq(), fence);
                 // The routing half: which caller this fence answers, and where its
                 // cookie is to be written. Inserted in the same step as the record
                 // it belongs to, and removed in the same step it leaves `Parked` —

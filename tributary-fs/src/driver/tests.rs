@@ -158,6 +158,17 @@ fn removed() -> FsEventFlags {
   FsEventFlags::new(FsEventFlags::ITEM_REMOVED.bits() | FsEventFlags::ITEM_IS_FILE.bits())
 }
 
+/// Mints a fresh, unique [`SyncTicket`] for a direct-`Command` cell. The driver
+/// suites drive `Command::SyncRoot` with no `Watcher` to mint through, so they draw
+/// sequences from one process-monotonic counter under a fixed brand: the driver
+/// never inspects the brand (the foreign-ticket door is the watcher's), only the
+/// sequence, which `by_ticket`/`TicketInUse` key on. A fresh call is a distinct
+/// incarnation; a cell that needs a reused ticket binds one and passes it twice.
+fn ticket() -> SyncTicket {
+  static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+  SyncTicket::new(1, SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 fn renamed() -> FsEventFlags {
   FsEventFlags::new(FsEventFlags::ITEM_RENAMED.bits() | FsEventFlags::ITEM_IS_FILE.bits())
 }
@@ -2016,6 +2027,7 @@ mod descending {
           scope,
           dir: PathBuf::from("/r"),
           name: ".tributaries-sync-1-2-3".to_owned(),
+          ticket: ticket(),
           reply,
         })
         .await
@@ -2542,10 +2554,24 @@ mod descending {
     /// write has reached the pool. The `count == 1` assertion here is the whole
     /// suite's fail-on-old anchor: on birth-at-dispatch a parked sync has no
     /// record, so this count stays 0 and every cell below fails.
+    /// Parks a sync under a fresh ticket (see [`park_a_sync_keyed`] for the
+    /// cancel-by-ticket form).
     async fn park_a_sync(
       rig: &Rig,
       scope: ScopeId,
       name: &str,
+    ) -> (
+      HoldRelease,
+      futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>>,
+    ) {
+      park_a_sync_keyed(rig, scope, name, ticket()).await
+    }
+
+    async fn park_a_sync_keyed(
+      rig: &Rig,
+      scope: ScopeId,
+      name: &str,
+      ticket: SyncTicket,
     ) -> (
       HoldRelease,
       futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>>,
@@ -2559,6 +2585,7 @@ mod descending {
           scope,
           dir: PathBuf::from("/r"),
           name: name.to_owned(),
+          ticket,
           reply,
         })
         .await
@@ -2631,11 +2658,12 @@ mod descending {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
       let name = ".tributaries-sync-parked-cancel";
-      let (hold, on_reply) = park_a_sync(&rig, scope, name).await;
+      let t = ticket();
+      let (hold, on_reply) = park_a_sync_keyed(&rig, scope, name, t).await;
 
-      // Cancel by name while parked: the ingress marks the obligation and the
+      // Cancel by ticket while parked: the ingress marks the obligation and the
       // driver's wake sweep retires it pre-physically, answering the caller Retired.
-      rig.cleanup.request_cancel(name);
+      rig.cleanup.request_cancel(t);
       assert!(
         matches!(
           tokio::time::timeout(Duration::from_secs(5), on_reply)
@@ -3131,6 +3159,8 @@ mod descending {
           scope,
           dir: PathBuf::from(dir),
           name: name.to_owned(),
+          // These cells never cancel by ticket, so a fresh per-call ticket suffices.
+          ticket: ticket(),
           reply,
         })
         .await
@@ -4505,11 +4535,24 @@ mod replace {
 mod sync_cookie {
   use super::*;
 
+  /// Admits a sync under a fresh, unique ticket — the common form for a cell that
+  /// does not later cancel by ticket. A cell that DOES cancel binds its own ticket
+  /// and calls [`sync_root_keyed`].
   async fn sync_root(
     rig: &Rig,
     scope: ScopeId,
     dir: &str,
     name: &str,
+  ) -> Result<PathBuf, crate::error::SyncRootError> {
+    sync_root_keyed(rig, scope, dir, name, ticket()).await
+  }
+
+  async fn sync_root_keyed(
+    rig: &Rig,
+    scope: ScopeId,
+    dir: &str,
+    name: &str,
+    ticket: SyncTicket,
   ) -> Result<PathBuf, crate::error::SyncRootError> {
     let (reply, on_reply) = futures_channel::oneshot::channel();
     rig
@@ -4518,6 +4561,7 @@ mod sync_cookie {
         scope,
         dir: PathBuf::from(dir),
         name: name.to_owned(),
+        ticket,
         reply,
       })
       .await
@@ -4554,14 +4598,26 @@ mod sync_cookie {
   /// `Parked → InPool` transition at that fence's settle — for the cells that need
   /// an in-pool write without a driver loop. Panics if the dispatch refuses, which
   /// for a freshly admitted, unmarked obligation cannot happen.
+  /// Admits and dispatches a sync under a fresh ticket sequence, straight against
+  /// the registry (see [`dispatched_guard_keyed`] for the cancel-by-ticket form).
   fn dispatched_guard(
     reg: &mut CookieRegistry<FakeFs>,
     core: &mut DriverCore,
     scope: ScopeId,
     name: &str,
   ) -> CookieGuard {
+    dispatched_guard_keyed(reg, core, scope, name, ticket().seq())
+  }
+
+  fn dispatched_guard_keyed(
+    reg: &mut CookieRegistry<FakeFs>,
+    core: &mut DriverCore,
+    scope: ScopeId,
+    name: &str,
+    ticket: u64,
+  ) -> CookieGuard {
     let fence = core.open_cover_fence(scope);
-    let id = reg.admit_parked(scope, name.to_owned(), fence);
+    let id = reg.admit_parked(scope, name.to_owned(), ticket, fence);
     reg
       .dispatch_guard(scope, id)
       .expect("a freshly admitted obligation dispatches")
@@ -4570,11 +4626,23 @@ mod sync_cookie {
   /// Dispatches a sync without awaiting it, holding on to the reply receiver —
   /// the caller can then abandon it, or retire the scope, while the write is
   /// still in the pool.
+  /// Dispatches a sync under a fresh ticket without awaiting it (see
+  /// [`sync_root_keyed`] for the cancel-by-ticket form).
   async fn sync_root_pending(
     rig: &Rig,
     scope: ScopeId,
     dir: &str,
     name: &str,
+  ) -> futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>> {
+    sync_root_pending_keyed(rig, scope, dir, name, ticket()).await
+  }
+
+  async fn sync_root_pending_keyed(
+    rig: &Rig,
+    scope: ScopeId,
+    dir: &str,
+    name: &str,
+    ticket: SyncTicket,
   ) -> futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>> {
     let (reply, on_reply) = futures_channel::oneshot::channel();
     rig
@@ -4583,6 +4651,7 @@ mod sync_cookie {
         scope,
         dir: PathBuf::from(dir),
         name: name.to_owned(),
+        ticket,
         reply,
       })
       .await
@@ -4668,9 +4737,24 @@ mod sync_cookie {
   /// Dispatches a sync, retrying the retryable `WriteInFlight` refusal until the single-flight
   /// gate admits it (a completed write clears the gate on its own `CookieWriteDone`, which is
   /// asynchronous relative to the reply). Panics on any other error.
+  /// Admits a sync under a fresh ticket, retrying `WriteInFlight` (see
+  /// [`admit_sync_keyed`] for the cancel-by-ticket form).
   async fn admit_sync(rig: &Rig, scope: ScopeId, dir: &str, name: &str) -> PathBuf {
+    admit_sync_keyed(rig, scope, dir, name, ticket()).await
+  }
+
+  async fn admit_sync_keyed(
+    rig: &Rig,
+    scope: ScopeId,
+    dir: &str,
+    name: &str,
+    ticket: SyncTicket,
+  ) -> PathBuf {
     for _ in 0..400 {
-      match sync_root(rig, scope, dir, name).await {
+      // Reuse the SAME ticket across retries: a `WriteInFlight` refusal admits
+      // nothing, so the ticket is unconsumed and a retry through it is not
+      // `TicketInUse`.
+      match sync_root_keyed(rig, scope, dir, name, ticket).await {
         Ok(path) => return path,
         Err(crate::error::SyncRootError::WriteInFlight) => {
           tokio::task::yield_now().await;
@@ -5652,18 +5736,17 @@ mod sync_cookie {
   }
 
   // A live sync obligation holds its rendered cookie name against EVERY other
-  // admission for that name watcher-wide — including a DIFFERENT scope's. Two live
-  // same-name obligations would make `by_name` redirect, so a cancel-by-name meant
-  // for the holder could reap the newcomer (another root's sync) and strand the
-  // holder until teardown. Refusing the second admission `NameInUse` keeps
-  // `by_name` an injection: a cancel-by-name resolves to the unique live holder and
-  // reaps it to its terminal — no scope teardown involved.
+  // admission for that name watcher-wide — including a DIFFERENT scope's. The gate's
+  // role is PHYSICAL identity: one live obligation per name ⇒ per path, so two live
+  // syncs never contend one cookie file. Refusing the second admission `NameInUse`
+  // keeps `by_name` an injection; the holder is then reaped incarnation-precisely
+  // through its own TICKET, to its terminal — no scope teardown involved.
   //
   // Fail-on-old (the unconditional `by_name` insert): the cross-scope admission
   // returns `Ok` and displaces the name, so the `NameInUse` assertion fails
   // IMMEDIATELY — no settle-hang.
   #[tokio::test(flavor = "multi_thread")]
-  async fn a_live_cookie_name_is_refused_across_scopes_and_cancel_by_name_reaps_the_holder() {
+  async fn a_live_cookie_name_is_refused_across_scopes_and_cancel_by_ticket_reaps_the_holder() {
     let rig = rig_with_capacity(64);
     rig.fs.put("/ra", FileKind::Dir, 100);
     rig.fs.put("/rb", FileKind::Dir, 101);
@@ -5671,8 +5754,9 @@ mod sync_cookie {
     let scope_b = watch(&rig, "/rb").await;
     let name = ".tributaries-sync-shared-name";
 
-    // A admits and owns its cookie under `name` at /ra.
-    let path_a = admit_sync(&rig, scope_a, "/ra", name).await;
+    // A admits and owns its cookie under `name` at /ra, keyed by its own ticket.
+    let ta = ticket();
+    let path_a = admit_sync_keyed(&rig, scope_a, "/ra", name, ta).await;
     assert_eq!(path_a, PathBuf::from("/ra/.tributaries-sync-shared-name"));
     settle_cookie_count(&rig, 1).await;
 
@@ -5691,21 +5775,21 @@ mod sync_cookie {
       "the refused admission minted no record — still exactly A's one obligation"
     );
 
-    // Cancel BY NAME: with B refused, `by_name` names only A, so the cancel is
-    // unambiguous and reaps the delivered-but-unread A to its terminal.
-    rig.cleanup.request_cancel(name);
+    // Cancel BY TICKET: A's ticket resolves A alone and reaps the delivered-but-unread
+    // holder to its terminal.
+    rig.cleanup.request_cancel(ta);
     settle(|| rig.fs.files_under("/ra").is_empty() && !rig.fs.cookie_removes().is_empty()).await;
     settle_cookie_count(&rig, 0).await;
     assert_eq!(
       cookie_count(&rig).await,
       0,
-      "cancel-by-name reaped the holder A"
+      "cancel-by-ticket reaped the holder A"
     );
     assert!(
       rig.fs.files_under("/ra").is_empty(),
       "A's cookie file is gone"
     );
-    assert_census_balances(&rig, "cross-scope name refusal then cancel-by-name").await;
+    assert_census_balances(&rig, "cross-scope name refusal then cancel-by-ticket").await;
   }
 
   // A cookie name is bound to its holder only until that holder reaches a typed
@@ -5972,8 +6056,9 @@ mod sync_cookie {
 
     let name = ".tributaries-sync-1-1-1";
     let path = PathBuf::from("/r").join(name);
+    let t = ticket();
     // The write lands and CLAIMS while the caller's receiver is alive but unread.
-    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    let on_reply = sync_root_pending_keyed(&rig, scope, "/r", name, t).await;
     settle(|| rig.fs.cookie_writes() == vec![path.clone()]).await;
     settle_cookie_count(&rig, 1).await;
     assert_eq!(
@@ -5986,9 +6071,9 @@ mod sync_cookie {
     // self-reaps — the cookie would survive without the token cancel.
     drop(on_reply);
 
-    // The abandon arm cancels by NAME: the driver finds it OWNED and reaps it through the
+    // The abandon arm cancels by TICKET: the driver finds it OWNED and reaps it through the
     // removal state machine.
-    rig.cleanup.request_cancel(name);
+    rig.cleanup.request_cancel(t);
     settle(|| rig.fs.cookie_removes().contains(&path)).await;
     assert!(
       rig.fs.cookie_removes().contains(&path),
@@ -6024,7 +6109,8 @@ mod sync_cookie {
     config.cookie_retry_budget = 0; // one attempt per arming, then exhaustion
     let rig = rig_with_config(64, config);
     let scope = watch(&rig, "/r").await;
-    let path = admit_sync(&rig, scope, "/r", ".tributaries-sync-strand").await;
+    let t = ticket();
+    let path = admit_sync_keyed(&rig, scope, "/r", ".tributaries-sync-strand", t).await;
     settle_cookie_count(&rig, 1).await;
 
     // Every unlink fails; hold them so the first reap's dispatched unlink is frozen mid-flight.
@@ -6043,7 +6129,7 @@ mod sync_cookie {
 
     // Reap 2 (Removing + mark): coalesces onto the in-flight unlink — the mark STAYS, and its sole
     // wake token is spent by the coalescing sweep.
-    rig.cleanup.request_cancel(".tributaries-sync-strand");
+    rig.cleanup.request_cancel(t);
     settle_reap_marks(&rig, 1).await;
     assert_eq!(
       reap_marks(&rig).await,
@@ -6088,14 +6174,15 @@ mod sync_cookie {
     config.cookie_retry_budget = 0;
     let rig = rig_with_config(64, config);
     let scope = watch(&rig, "/r").await;
-    let path = admit_sync(&rig, scope, "/r", ".tributaries-sync-spin").await;
+    let t = ticket();
+    let path = admit_sync_keyed(&rig, scope, "/r", ".tributaries-sync-spin", t).await;
     settle_cookie_count(&rig, 1).await;
 
     rig.fs.fail_cookie_removes_under("/r"); // stays failing for the whole cell
     let hold = rig.fs.hold_cookie_removes();
     rig.cleanup.request_remove(&path);
     settle_reap_marks(&rig, 0).await;
-    rig.cleanup.request_cancel(".tributaries-sync-spin");
+    rig.cleanup.request_cancel(t);
     settle_reap_marks(&rig, 1).await;
     hold.release();
 
@@ -6164,7 +6251,8 @@ mod sync_cookie {
 
     // Hold the write in the pool: DISPATCHED, not yet claimed.
     let hold = rig.fs.hold_cookie_writes();
-    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    let t = ticket();
+    let on_reply = sync_root_pending_keyed(&rig, scope, "/r", name, t).await;
     settle(|| rig.fs.cookie_dispatches() == 1).await;
     assert_eq!(
       rig.fs.cookie_dispatches(),
@@ -6172,9 +6260,9 @@ mod sync_cookie {
       "the write is in the pool, not yet claimed"
     );
 
-    // Cancel by name while it is in the pool: marks the InPool record, and the sole wake token is
+    // Cancel by ticket while it is in the pool: marks the InPool record, and the sole wake token is
     // consumed by the coalescing sweep that finds it InPool.
-    rig.cleanup.request_cancel(name);
+    rig.cleanup.request_cancel(t);
     settle_reap_marks(&rig, 1).await;
     assert_eq!(
       reap_marks(&rig).await,
@@ -6238,7 +6326,8 @@ mod sync_cookie {
     let name = ".tributaries-sync-1-2-1";
     // Hold the write in the pool: DISPATCHED, not yet claimed.
     let hold = rig.fs.hold_cookie_writes();
-    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    let t = ticket();
+    let on_reply = sync_root_pending_keyed(&rig, scope, "/r", name, t).await;
     settle(|| rig.fs.cookie_dispatches() == 1).await;
     assert_eq!(
       rig.fs.cookie_dispatches(),
@@ -6246,10 +6335,10 @@ mod sync_cookie {
       "the write is in the pool, not yet claimed"
     );
 
-    // Cancel by name while it is in the pool: the write's obligation exists (it was born at
+    // Cancel by ticket while it is in the pool: the write's obligation exists (it was born at
     // dispatch), so the cancel MARKS it. Nothing is dispatched — only the write knows where its
     // cookie will land.
-    rig.cleanup.request_cancel(name);
+    rig.cleanup.request_cancel(t);
     settle_reap_marks(&rig, 1).await;
     assert_eq!(
       reap_marks(&rig).await,
@@ -6288,25 +6377,26 @@ mod sync_cookie {
   }
 
   // The reap mark's boundedness rule across all three cancel-versus-write orderings: an
-  // unknown-name cancel marks nothing, a cancel-then-complete's mark is what refuses the claim,
+  // unknown-ticket cancel marks nothing, a cancel-then-complete's mark is what refuses the claim,
   // and a complete-then-cancel marks the owned record the same cancel reaps. Each ends with zero
   // outstanding marks — the bound holds by construction, because a mark exists only as a field of
-  // a live obligation and cannot outlive it.
+  // a live obligation and cannot outlive it. Every phase (parked-then-in-pool, owned) reaps through
+  // the sync's own ticket.
   #[tokio::test(flavor = "multi_thread")]
   async fn reap_marks_never_survive_their_writes() {
     let rig = rig_with_capacity(64);
     let scope = watch(&rig, "/r").await;
 
-    // Ordering A — cancel an UNKNOWN name: dropped at the lookup. There is no obligation of that
-    // name, so there is nothing a mark could even be stored on.
-    rig.cleanup.request_cancel(".tributaries-sync-nobody");
+    // Ordering A — cancel an UNKNOWN ticket (never admitted): dropped at the lookup. There is no
+    // obligation for that sequence, so there is nothing a mark could even be stored on.
+    rig.cleanup.request_cancel(ticket());
     for _ in 0..8 {
       tokio::task::yield_now().await;
     }
     assert_eq!(
       reap_marks(&rig).await,
       0,
-      "a cancel for an unknown name marks nothing"
+      "a cancel for an unknown ticket marks nothing"
     );
 
     // Ordering B — cancel-then-complete: the mark lands on the in-pool write's obligation, and the
@@ -6314,9 +6404,10 @@ mod sync_cookie {
     {
       let name = ".tributaries-sync-1-3-1";
       let hold = rig.fs.hold_cookie_writes();
-      let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+      let t = ticket();
+      let on_reply = sync_root_pending_keyed(&rig, scope, "/r", name, t).await;
       settle(|| rig.fs.cookie_dispatches() == 1).await;
-      rig.cleanup.request_cancel(name);
+      rig.cleanup.request_cancel(t);
       settle_reap_marks(&rig, 1).await;
       assert_eq!(
         reap_marks(&rig).await,
@@ -6338,9 +6429,10 @@ mod sync_cookie {
     // and reaps it through the phase machine in the same critical section.
     {
       let name = ".tributaries-sync-1-3-2";
-      let path = admit_sync(&rig, scope, "/r", name).await;
+      let t = ticket();
+      let path = admit_sync_keyed(&rig, scope, "/r", name, t).await;
       settle_cookie_count(&rig, 1).await;
-      rig.cleanup.request_cancel(name);
+      rig.cleanup.request_cancel(t);
       settle(|| rig.fs.cookie_removes().contains(&path)).await;
       settle_cookie_count(&rig, 0).await;
       assert_eq!(
@@ -6354,6 +6446,170 @@ mod sync_cookie {
       );
     }
     assert_census_balances(&rig, "the three cancel orderings").await;
+  }
+
+  // Incarnation-addressed cancel closes the SEQUENTIAL same-name window a name-addressed cancel
+  // could not. A cancel is minted for A, then delayed on the caller's thread ACROSS A's retirement
+  // AND a successor B's admission under the SAME freed name. Addressed by A's ticket, the delayed
+  // cancel resolves A's (retired) incarnation — nothing — so B, a genuinely distinct sync holding
+  // its own ticket, is never marked: the documented "a cancel after resolution is a no-op" holds by
+  // construction, not by a caller convention.
+  //
+  // Fail-on-old: the pre-fix name-addressed cancel resolved `by_name[n]` at MARK time, which by
+  // then names B, so the same delayed cancel would mark B — reads `reap_marks == 1` immediately,
+  // the wrong-target kill. The imprecise (name) address is INEXPRESSIBLE on the ticket API, so the
+  // cell pins the no-op via the marks probe fail-FAST (no settle-hang).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_delayed_cancel_for_a_retired_sync_never_touches_a_same_name_successor() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    let name = ".tributaries-sync-seq-reuse";
+
+    // A admits and owns its cookie under `name`, keyed by ticket tA.
+    let ta = ticket();
+    let path_a = admit_sync_keyed(&rig, scope, "/r", name, ta).await;
+    settle_cookie_count(&rig, 1).await;
+
+    // A reaches its typed terminal: reap-and-confirm frees the name (and retires tA's record).
+    rig.cleanup.request_remove(&path_a);
+    settle_cookie_count(&rig, 0).await;
+
+    // B — a genuinely distinct sync — admits under the SAME freed name with its own ticket tB.
+    // Sequential reuse of a freed name still admits.
+    let tb = ticket();
+    let _path_b = admit_sync_keyed(&rig, scope, "/r", name, tb).await;
+    settle_cookie_count(&rig, 1).await;
+
+    // The DELAYED cancel for A lands now — across A's retire and B's re-admit of the name. It is
+    // addressed by tA, which mapped to A's (now retired) incarnation alone, so it resolves nothing:
+    // B is never marked. One Debug round-trip settles the ingress's wake sweep; assert fail-FAST.
+    rig.cleanup.request_cancel(ta);
+    settle_reap_marks(&rig, 0).await;
+    assert_eq!(
+      reap_marks(&rig).await,
+      0,
+      "the delayed cancel for retired A resolved nothing — the successor B carries no mark"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "B is live and uncancelled — the same-name successor is untouched"
+    );
+
+    // B completes normally through its own reap: it was never harmed by the delayed cancel.
+    rig.cleanup.request_remove(&PathBuf::from("/r").join(name));
+    settle_cookie_count(&rig, 0).await;
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "B reaped normally — nothing left"
+    );
+    assert_census_balances(&rig, "a delayed cancel across sequential same-name reuse").await;
+  }
+
+  // The ticket refusals and their order. (1) One ticket passed to two concurrently-live syncs is
+  // refused `TicketInUse` — a ticket is single-use. (2) A name+ticket double collision reads
+  // `NameInUse` first (the pinned order UnknownRoot → BadCookieName → DirOutsideRoot →
+  // WriteInFlight → NameInUse → TicketInUse → CleanupBacklog → admit). (3) A refusal creates
+  // nothing, so the SAME ticket admits later once its contended holder retires — no re-mint dance.
+  //
+  // Fail-on-old (no `TicketInUse` arm): the second same-ticket admission returns `Ok` and displaces
+  // `by_ticket`, so the `TicketInUse` assertion fails IMMEDIATELY — no settle-hang.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_ticket_is_single_use_and_ordered_after_the_name_gate() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/ra", FileKind::Dir, 200);
+    rig.fs.put("/rb", FileKind::Dir, 201);
+    let scope_a = watch(&rig, "/ra").await;
+    let scope_b = watch(&rig, "/rb").await;
+
+    // A owns a cookie under `name_a` on /ra, keyed by ticket `t`.
+    let t = ticket();
+    let name_a = ".tributaries-sync-ticket-a";
+    let path_a = admit_sync_keyed(&rig, scope_a, "/ra", name_a, t).await;
+    settle_cookie_count(&rig, 1).await;
+
+    // (1) The SAME ticket on a second live sync — a DIFFERENT scope and a DIFFERENT name, so
+    // neither `WriteInFlight` (per-scope) nor `NameInUse` can fire first — is refused `TicketInUse`.
+    let name_b = ".tributaries-sync-ticket-b";
+    assert!(
+      matches!(
+        sync_root_keyed(&rig, scope_b, "/rb", name_b, t).await,
+        Err(crate::error::SyncRootError::TicketInUse {})
+      ),
+      "one ticket on two concurrently-live syncs is refused TicketInUse"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "the TicketInUse refusal minted no record"
+    );
+
+    // (2) A name AND ticket double collision reads `NameInUse` first — name is ordered before
+    // ticket, keeping every earlier pinned outcome verbatim.
+    assert!(
+      matches!(
+        sync_root_keyed(&rig, scope_a, "/ra", name_a, t).await,
+        Err(crate::error::SyncRootError::NameInUse { .. })
+      ),
+      "a name+ticket collision reads NameInUse — name is ordered before ticket"
+    );
+
+    // (3) The SAME ticket `t` — refused twice above — still admits once its holder A retires (a
+    // refusal burns nothing). Reap A to free `name_a` and `t`, then admit B under `t`.
+    rig.cleanup.request_remove(&path_a);
+    settle_cookie_count(&rig, 0).await;
+    let path_b = admit_sync_keyed(&rig, scope_b, "/rb", name_b, t).await;
+    assert_eq!(
+      path_b,
+      PathBuf::from("/rb/.tributaries-sync-ticket-b"),
+      "the twice-refused ticket admits once its holder retired — the refusals burned nothing"
+    );
+
+    rig.cleanup.request_remove(&path_b);
+    settle_cookie_count(&rig, 0).await;
+    assert_census_balances(&rig, "ticket single-use, name ordering, and retry").await;
+  }
+
+  // The PATH axis keeps the temporal ABA the ticket axis closes — the DOCUMENTED imprecision of
+  // `request_remove_cookie(path)` for a caller that reuses names sequentially. A remove for A,
+  // delayed across A's retire and B's claim of the SAME path (same dir + same name ⇒ same path),
+  // resolves the path's CURRENT holder — B — and reaps it. The incarnation-precise form is the
+  // ticket (`request_cancel_sync`), which leaves B untouched under this same interleaving (see
+  // `a_delayed_cancel_for_a_retired_sync_never_touches_a_same_name_successor`).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_delayed_path_remove_can_reap_a_same_path_successor_the_documented_imprecision() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+    let name = ".tributaries-sync-path-reuse";
+    let path = PathBuf::from("/r").join(name);
+
+    // A owns the cookie at `path`.
+    let ta = ticket();
+    let path_a = admit_sync_keyed(&rig, scope, "/r", name, ta).await;
+    assert_eq!(path_a, path);
+    settle_cookie_count(&rig, 1).await;
+
+    // A retires (its cookie confirmed removed); the path frees.
+    rig.cleanup.request_remove(&path);
+    settle_cookie_count(&rig, 0).await;
+
+    // B claims the SAME path (same name) — a distinct incarnation with its own ticket.
+    let tb = ticket();
+    let path_b = admit_sync_keyed(&rig, scope, "/r", name, tb).await;
+    assert_eq!(path_b, path);
+    settle_cookie_count(&rig, 1).await;
+
+    // A delayed remove for A, addressed by the SHARED path, resolves the path's CURRENT holder — B
+    // — and reaps it. This is the path form's documented imprecision; the ticket form does not have
+    // it.
+    rig.cleanup.request_remove(&path);
+    settle(|| rig.fs.cookie_removes().contains(&path)).await;
+    settle_cookie_count(&rig, 0).await;
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "the path-addressed remove reaped the current holder B"
+    );
+    assert_census_balances(&rig, "a delayed path remove reaps a same-path successor").await;
   }
 
   // Finding 2: a self-reap for an ABANDONED caller (its `reply.send(Ok)` fails) whose own unlink
@@ -7681,6 +7937,7 @@ mod sync_cookie {
         Obligation {
           scope,
           name: name.to_owned(),
+          ticket: m.0,
           id: m,
           path: Some(path.clone()),
           reap_requested: false,
@@ -7752,6 +8009,7 @@ mod sync_cookie {
         Obligation {
           scope,
           name: "n".to_owned(),
+          ticket: m.0,
           id: m,
           path: Some(path.clone()),
           reap_requested: false,
@@ -7823,6 +8081,7 @@ mod sync_cookie {
         Obligation {
           scope,
           name: "n2".to_owned(),
+          ticket: f.0,
           id: f,
           path: Some(fresh.clone()),
           reap_requested: false,
@@ -7898,6 +8157,7 @@ mod sync_cookie {
         Obligation {
           scope,
           name: name.to_owned(),
+          ticket: id.0,
           id,
           path: Some(path.to_path_buf()),
           reap_requested: false,
@@ -8457,14 +8717,15 @@ mod sync_cookie {
     let name = ".tributaries-sync-census-2";
     let hold = rig.fs.hold_cookie_writes();
     let dispatched = rig.fs.cookie_dispatches();
-    let on_reply = sync_root_pending(&rig, scope, "/r", name).await;
+    let t = ticket();
+    let on_reply = sync_root_pending_keyed(&rig, scope, "/r", name, t).await;
     settle(|| rig.fs.cookie_dispatches() == dispatched + 1).await;
     assert_eq!(
       cookie_census(&rig).await.0.births,
       2,
       "the in-pool write is already born"
     );
-    rig.cleanup.request_cancel(name);
+    rig.cleanup.request_cancel(t);
     settle_reap_marks(&rig, 1).await;
     hold.release();
     let _ = on_reply.await;
@@ -8661,9 +8922,10 @@ mod sync_cookie {
     // retired pre-physically, so no write is ever made and no file can exist to unlink.
     {
       let name = ".tributaries-sync-phase-parked";
+      let t = ticket();
       let fence = core.open_cover_fence(scope);
-      let id = reg.admit_parked(scope, name.to_owned(), fence);
-      cleanup.request_cancel(name);
+      let id = reg.admit_parked(scope, name.to_owned(), t.seq(), fence);
+      cleanup.request_cancel(t);
       assert!(
         reg.dispatch_guard(scope, id).is_none(),
         "a marked parked sync must never be dispatched"
@@ -8679,9 +8941,10 @@ mod sync_cookie {
     // nothing and the mark SURVIVES — it is what the claim reads and refuses on.
     let in_pool = {
       let name = ".tributaries-sync-phase-inpool";
-      let guard = dispatched_guard(&mut reg, &mut core, scope, name);
+      let t = ticket();
+      let guard = dispatched_guard_keyed(&mut reg, &mut core, scope, name, t.seq());
       let id = guard.id;
-      cleanup.request_cancel(name);
+      cleanup.request_cancel(t);
       reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
       assert_eq!(
         phase_of(&reg, id),
@@ -8904,7 +9167,7 @@ mod sync_cookie {
     rig.cleanup.request_remove(&path);
     settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
 
-    // Hammer the ingress throughout the close, from another task: unknown paths, unknown names,
+    // Hammer the ingress throughout the close, from another task: unknown paths, unknown tickets,
     // and the live cookie's own path over and over.
     let flooder = {
       let cleanup = rig.cleanup.clone();
@@ -8912,7 +9175,7 @@ mod sync_cookie {
       tokio::spawn(async move {
         for i in 0..200_000u64 {
           cleanup.request_remove(&PathBuf::from(format!("/r/.tributaries-sync-x{i}")));
-          cleanup.request_cancel(&format!(".tributaries-sync-x{i}"));
+          cleanup.request_cancel(ticket());
           cleanup.request_remove(&live);
           if i % 4096 == 0 {
             tokio::task::yield_now().await;
@@ -8952,7 +9215,14 @@ mod sync_cookie {
     let mut core = fence_source();
     let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
 
-    let guard = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-dead-1");
+    let t = ticket();
+    let guard = dispatched_guard_keyed(
+      &mut reg,
+      &mut core,
+      scope,
+      ".tributaries-sync-dead-1",
+      t.seq(),
+    );
     let path = PathBuf::from("/r/.tributaries-sync-dead-1");
     fs.put(&path, FileKind::File, 1);
     guard.claim(&path).expect("the claim lands");
@@ -8971,7 +9241,7 @@ mod sync_cookie {
     // The public ingress still answers — it cannot fail, cannot block, and cannot panic — and it
     // finds nothing, because the backstop's typed terminal already removed every record.
     cleanup.request_remove(&path);
-    cleanup.request_cancel(".tributaries-sync-dead-1");
+    cleanup.request_cancel(t);
     cleanup.request_remove(&PathBuf::from("/r/.tributaries-sync-never"));
     assert_eq!(
       cleanup.ledger_len(),
