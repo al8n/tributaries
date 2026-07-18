@@ -178,6 +178,13 @@ pub enum SyncRootError {
   /// The handle does not name a live root of this watcher.
   #[error("the handle does not name a live root of this watcher")]
   UnknownRoot,
+  /// The [`SyncTicket`](crate::SyncTicket) was minted by a DIFFERENT watcher.
+  /// Refused synchronously, before any write: a ticket's sequence numbering is
+  /// per-watcher, so honoring a foreign one would let it alias one of this
+  /// watcher's incarnations. Mint the ticket from the same watcher the sync runs
+  /// on ([`Watcher::mint_sync_ticket`](crate::Watcher::mint_sync_ticket)).
+  #[error("the sync ticket was minted by a different watcher")]
+  ForeignTicket,
   /// The cookie directory is not inside the root's coverage — a cookie
   /// written there could never be reported on this root's stream. Also raised
   /// when the directory only *appears* inside the root through `..` traversal
@@ -229,6 +236,15 @@ pub enum SyncRootError {
     /// The contested name as supplied.
     name: String,
   },
+  /// A LIVE sync obligation of this watcher already holds this
+  /// [`SyncTicket`](crate::SyncTicket) — the caller passed one ticket to two
+  /// concurrently-live syncs. A ticket is single-use; mint a fresh one per
+  /// [`sync_root`](crate::Watcher::sync_root). The ticket is freed when the holding
+  /// obligation reaches its terminal, and this refusal creates nothing, so the
+  /// SAME ticket may be retried after a transient refusal (a
+  /// [`CleanupBacklog`](Self::CleanupBacklog)) without re-minting.
+  #[error("the sync ticket is already held by a live sync of this watcher")]
+  TicketInUse {},
   /// This root has too many unremoved cookies: its cleanup owner is retrying
   /// failing unlinks (a pathological filesystem where writes succeed but unlinks
   /// keep failing), and the per-root backlog cap has been reached. Retryable —

@@ -17,7 +17,7 @@ use std::{
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
   CoverOutcome, Event as FsEvent, EventKind as FsEventKind, ReplaceRootError, RequestOutcome,
-  RootHandle, SkipReason, SourceError, SyncRootError, UnwatchError as FsUnwatchError,
+  RootHandle, SkipReason, SourceError, SyncRootError, SyncTicket, UnwatchError as FsUnwatchError,
   WatchRootError, Watcher, WatcherOptions,
 };
 use tributary_proto::Interest;
@@ -95,6 +95,21 @@ pub struct FsSource<R> {
   /// the driver skips the unknown scope). Losslessness is NOT required here (clause 5): entries still
   /// queued at `Drop` are simply dropped — an unpruned root is merely over-broad, self-healing.
   deferred_prunes: HashMap<RootHandle, Vec<PathBuf>>,
+  /// The ticket (and the token that minted it) for each root's IN-FLIGHT
+  /// [`begin_sync`](Source::begin_sync) — the incarnation-precise cancel address
+  /// the abandonment path consumes. [`begin_sync`](Source::begin_sync) inserts the
+  /// entry BEFORE it awaits [`Watcher::sync_root`] and removes it on a normal
+  /// return (Ok or Err); if that future is DROPPED mid-await (a caller cancel or a
+  /// close won the owner's race), the entry deliberately REMAINS, and
+  /// [`cancel_sync`](Source::cancel_sync) takes it to address the sync by the
+  /// watcher-minted [`SyncTicket`] — the only precise handle on a write the owner
+  /// abandoned before it learned the cookie path. The stored [`SyncToken`] is the
+  /// umbrella-level incarnation guard: a `cancel_sync` whose token does not match
+  /// the stored one is stale (for an older incarnation) and dropped. Bounded by the
+  /// live-root count, and in practice ≤ 1 (the owner awaits `begin_sync` inline, so
+  /// at most one sync is in flight at a time); entries for since-released roots are
+  /// pruned at the top of [`arm`](Source::arm) alongside `pending_set`/`enqueued`.
+  pending_syncs: HashMap<RootHandle, (SyncToken, SyncTicket)>,
   /// Awaited [`Watcher::set_cover`] round-trips [`grow`](Source::grow) actually performed — proves
   /// the kernel-recursive short-circuit skipped the round-trip.
   #[cfg(test)]
@@ -132,6 +147,7 @@ impl<R: RuntimeLite> FsSource<R> {
       enqueued: Vec::new(),
       pending_set: HashSet::new(),
       deferred_prunes: HashMap::new(),
+      pending_syncs: HashMap::new(),
       #[cfg(test)]
       cover_round_trips: 0,
       #[cfg(test)]
@@ -245,6 +261,14 @@ impl<R> Source<OsString> for FsSource<R> {
       self
         .pending_set
         .retain(|handle| watcher.root_path(*handle).is_some());
+      // A released/retired root can never have another in-flight sync cancelled
+      // against it, so drop its cancel-address entry here too (belt-and-suspenders:
+      // the abandonment path already removes it via `cancel_sync`, and the owner's
+      // teardown drops the whole source). Keeps `pending_syncs` bounded by the live
+      // handles, exactly like `pending_set`/`enqueued`.
+      self
+        .pending_syncs
+        .retain(|handle, _| watcher.root_path(*handle).is_some());
     }
     // An arm touches the watcher, so re-forward any full-channel-deferred prunes first
     // (set_cover contract clause 3) — non-blocking `try_send`s, nothing awaited.
@@ -605,10 +629,21 @@ impl<R> Source<OsString> for FsSource<R> {
     self.flush_deferred_prunes();
     let name = cookie_name(token);
     let dir = key_to_path(dir_key);
+    // Mint the cancel address and record it BEFORE the await: if this future is
+    // dropped mid-await (a caller cancel or a close won the owner's race), the
+    // entry deliberately REMAINS for `cancel_sync` to consume — the owner never
+    // learned the cookie path, so the ticket is the only precise handle on a write
+    // that may still land. The token is stored beside it as the incarnation guard.
+    let ticket = self.watcher.mint_sync_ticket();
+    self.pending_syncs.insert(handle, (token, ticket));
     // The fs watcher parks the write on the root's coverage-settle fence and
     // resolves at write-complete — never at observe. That is exactly the
     // bounded initiation this seam promises.
-    match self.watcher.sync_root(handle, dir, name).await {
+    let result = self.watcher.sync_root(handle, dir, name, ticket).await;
+    // A NORMAL return (Ok or Err) means the sync resolved server-side, so drop the
+    // in-flight entry here; only the dropped-future path above leaves it behind.
+    self.pending_syncs.remove(&handle);
+    match result {
       Ok(path) => Ok(path_components(&path)),
       Err(err) => Err(match err {
         SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
@@ -652,17 +687,26 @@ impl<R> Source<OsString> for FsSource<R> {
     self.watcher.request_remove_cookie(path);
   }
 
-  fn cancel_sync(&mut self, _handle: RootHandle, token: SyncToken) {
+  fn cancel_sync(&mut self, handle: RootHandle, token: SyncToken) {
     // The owner abandoned an in-flight `begin_sync` and never learned the cookie
-    // path — but it minted the token, so re-render the unique cookie NAME, which
-    // the driver records at ADMISSION and therefore always resolves. The driver
-    // reaps the cookie if the write already landed, refuses the claim of a write
-    // still in the pool (so it self-reaps the file it creates), retires a sync
-    // whose write was never dispatched, or drops the request if the sync already
-    // resolved. Runtime-free (a pure render, a lock, and a `try_send`), like
-    // `end_sync`; the runtime-bearing cleanup lives in the driver.
+    // path — but `begin_sync` recorded the watcher-minted ticket for this handle
+    // before it awaited, so take it and cancel by that ticket: the incarnation-
+    // precise address the driver records at ADMISSION and therefore always resolves
+    // while the sync is live. The stored token is the incarnation guard — a cancel
+    // whose token does not match the recorded one is stale (a later incarnation
+    // superseded it) and dropped, and a missing entry means the sync already
+    // returned (nothing to cancel). The driver reaps the cookie if the write
+    // already landed, refuses the claim of a write still in the pool (so it
+    // self-reaps the file it creates), retires a sync whose write was never
+    // dispatched, or drops the request if the sync already resolved. Runtime-free
+    // (a map take, a lock, and a `try_send`), like `end_sync`; the runtime-bearing
+    // cleanup lives in the driver.
     self.flush_deferred_prunes();
-    self.watcher.request_cancel_sync(cookie_name(token));
+    if let Some((stored, ticket)) = self.pending_syncs.remove(&handle)
+      && stored == token
+    {
+      self.watcher.request_cancel_sync(ticket);
+    }
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
