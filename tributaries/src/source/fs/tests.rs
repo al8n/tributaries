@@ -1132,7 +1132,7 @@ mod integration {
     // tokenB — mirroring what `begin_sync` leaves behind for an abandoned in-flight sync.
     let token_a = SyncToken::new(1, 1, 1, 0xA);
     let token_b = SyncToken::new(1, 1, 2, 0xB);
-    let ticket_b = source.watcher.mint_sync_ticket();
+    let (_, ticket_b) = source.watcher.mint_sync_ticket();
     source.pending_syncs.insert(handle, (token_b, ticket_b));
 
     // A STALE cancel for the OLD incarnation (tokenA != tokenB): must be a pure no-op. Against the

@@ -17,8 +17,8 @@ use std::{
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
   CoverOutcome, Event as FsEvent, EventKind as FsEventKind, ReplaceRootError, RequestOutcome,
-  RootHandle, SkipReason, SourceError, SyncRootError, SyncTicket, UnwatchError as FsUnwatchError,
-  WatchRootError, Watcher, WatcherOptions,
+  RootHandle, SkipReason, SourceError, SyncRootDenied, SyncRootError, SyncTicket,
+  UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
 };
 use tributary_proto::Interest;
 
@@ -641,18 +641,22 @@ impl<R> Source<OsString> for FsSource<R> {
     // entry deliberately REMAINS for `cancel_sync` to consume — the owner never
     // learned the cookie path, so the ticket is the only precise handle on a write
     // that may still land. The token is stored beside it as the incarnation guard.
-    let ticket = self.watcher.mint_sync_ticket();
+    let (admission, ticket) = self.watcher.mint_sync_ticket();
     self.pending_syncs.insert(handle, (token, ticket));
     // The fs watcher parks the write on the root's coverage-settle fence and
     // resolves at write-complete — never at observe. That is exactly the
-    // bounded initiation this seam promises.
-    let result = self.watcher.sync_root(handle, dir, name, ticket).await;
+    // bounded initiation this seam promises. The move-only admission is consumed
+    // by the call; the `Copy` ticket stays recorded above for the abandonment
+    // cancel.
+    let result = self.watcher.sync_root(handle, dir, name, admission).await;
     // A NORMAL return (Ok or Err) means the sync resolved server-side, so drop the
     // in-flight entry here; only the dropped-future path above leaves it behind.
     self.pending_syncs.remove(&handle);
     match result {
       Ok(path) => Ok(path_components(&path)),
-      Err(err) => Err(match err {
+      // The umbrella never retries `sync_root` at this level, so a returned
+      // admission is dropped; the mapping is over the carried `error`.
+      Err(SyncRootDenied { error, .. }) => Err(match error {
         SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
         SyncRootError::DirOutsideRoot { .. } => SyncError::CookieDirUncovered,
         SyncRootError::Write { source, .. } => {

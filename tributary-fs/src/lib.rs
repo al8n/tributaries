@@ -60,7 +60,10 @@ pub use error::{
 pub use event::{Event, EventKind, MovedEvent};
 pub use options::WatcherOptions;
 pub use os::{Backend, BackendKind, BackendStats, ProbeStage, SourceError};
-pub use watcher::{CoverOutcome, RequestOutcome, RootHandle, SkipReason, SyncTicket, Watcher};
+pub use watcher::{
+  CoverOutcome, RequestOutcome, RootHandle, SkipReason, SyncAdmission, SyncRootDenied, SyncTicket,
+  Watcher,
+};
 
 pub use tributary_proto::{ChangeId, Epoch, Interest, Location, ScopeId, Segment};
 

@@ -383,45 +383,134 @@ async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
   );
 }
 
-/// A [`SyncTicket`] minted by a DIFFERENT watcher is refused by `sync_root` synchronously — before
-/// any command is sent — in the foreign-handle door idiom: a foreign ticket's sequence is unrelated
-/// to this watcher's numbering, so honoring it could alias one of this watcher's incarnations. The
-/// ticket-brand check precedes any root lookup, so a synthetic live-branded handle reaches it.
+/// A [`SyncAdmission`] minted by a DIFFERENT watcher is refused by `sync_root` synchronously —
+/// before any command is sent — in the foreign-handle door idiom: a foreign admission's sequence is
+/// unrelated to this watcher's numbering, so honoring it could alias one of this watcher's
+/// incarnations. The admission-brand check precedes any root lookup, so a synthetic live-branded
+/// handle reaches it. Both door refusals are pre-birth, so each hands the admission back
+/// ([`SyncRootDenied::admission`] is `Some`) for a same-sequence retry.
 #[tokio::test]
 async fn sync_root_refuses_a_foreign_ticket_at_the_door() {
   let (watcher, commands) = manual_watcher();
   let (other, _other_commands) = manual_watcher();
   let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
 
-  // A ticket minted by the OTHER watcher — a foreign brand — is refused ForeignTicket.
-  let foreign = other.mint_sync_ticket();
+  // An admission minted by the OTHER watcher — a foreign brand — is refused ForeignTicket, and the
+  // pre-birth refusal hands the admission back.
+  let (foreign, _foreign_ticket) = other.mint_sync_ticket();
   assert!(
     matches!(
       watcher
         .sync_root(handle, "/r", ".tributaries-sync-foreign", foreign)
         .await,
-      Err(SyncRootError::ForeignTicket)
+      Err(SyncRootDenied {
+        error: SyncRootError::ForeignTicket,
+        admission: Some(_)
+      })
     ),
-    "a foreign-brand ticket is refused ForeignTicket"
+    "a foreign-brand admission is refused ForeignTicket and handed back for retry"
   );
   assert!(
     commands.try_recv().is_err(),
-    "the foreign ticket sent no command — the refusal is synchronous, at the door"
+    "the foreign admission sent no command — the refusal is synchronous, at the door"
   );
 
-  // This watcher's OWN ticket clears the ticket door: it then falls through to the root lookup
+  // This watcher's OWN admission clears the admission door: it then falls through to the root lookup
   // (which this manual watcher has no live root for), so the answer is UnknownRoot, never
-  // ForeignTicket — the brand, not all tickets, is what ForeignTicket refuses.
-  let own = watcher.mint_sync_ticket();
+  // ForeignTicket — the brand, not all admissions, is what ForeignTicket refuses. UnknownRoot is
+  // pre-birth too, so its admission also comes back.
+  let (own, _own_ticket) = watcher.mint_sync_ticket();
   assert!(
     matches!(
       watcher
         .sync_root(handle, "/r", ".tributaries-sync-own", own)
         .await,
-      Err(SyncRootError::UnknownRoot)
+      Err(SyncRootDenied {
+        error: SyncRootError::UnknownRoot,
+        admission: Some(_)
+      })
     ),
-    "this watcher's own ticket clears the foreign-ticket door"
+    "this watcher's own admission clears the foreign-ticket door"
   );
+}
+
+/// The pre/post-birth Some/None classification, pinned per variant at the single audit point
+/// (`SyncRootDenied::classify`). A refusal raised BEFORE the sync is admitted (the synchronous door
+/// errors and the reply-borne refusals) hands the admission back — `Some`, and it is the SAME
+/// admission (its sequence is preserved), so a retry keeps the sequence and its paired cancel
+/// ticket. A post-birth or ambiguous outcome — `Write` (admitted then retired), `Retired`, `Closed`,
+/// and, by the `_ => None` default, any future variant — consumes it (`None`), the fail-safe
+/// direction that forces a re-mint rather than re-presenting a spent sequence.
+///
+/// Fail-on-old: move any pre-birth variant into the default arm (or `Write`/`Retired`/`Closed` into
+/// the returned set) and its assertion flips immediately — this match is the only place the
+/// classification can drift.
+#[tokio::test]
+async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
+  let (watcher, _commands) = manual_watcher();
+
+  // Every refusal that fires before admission returns the SAME admission (sequence preserved) for a
+  // same-sequence retry.
+  let pre_birth = [
+    SyncRootError::UnknownRoot,
+    SyncRootError::ForeignTicket,
+    SyncRootError::BadCookieName { name: "x".into() },
+    SyncRootError::DirOutsideRoot {
+      dir: PathBuf::from("/d"),
+      root: PathBuf::from("/r"),
+    },
+    SyncRootError::WriteInFlight,
+    SyncRootError::NameInUse { name: "x".into() },
+    SyncRootError::TicketInUse {},
+    SyncRootError::CleanupBacklog,
+  ];
+  for error in pre_birth {
+    let (admission, ticket) = watcher.mint_sync_ticket();
+    let seq = ticket.seq();
+    let denied = SyncRootDenied::classify(error, admission);
+    let returned = denied.admission.unwrap_or_else(|| {
+      panic!(
+        "{:?} is pre-birth and must return the admission",
+        denied.error
+      )
+    });
+    assert_eq!(
+      returned.seq(),
+      seq,
+      "the returned admission keeps the original sequence for a same-sequence retry: {:?}",
+      denied.error
+    );
+  }
+
+  // Post-birth or ambiguous: the sequence is spent (or its fate unknown), so the admission is
+  // consumed and a retry must re-mint. `Write` retires its record before replying (the sequence is
+  // burned), `Retired` is a post-admission terminal, and `Closed` is fail-safe.
+  let post_birth = [
+    SyncRootError::Write {
+      path: PathBuf::from("/r/.tributaries-sync-x"),
+      source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    },
+    SyncRootError::Retired,
+    SyncRootError::Closed,
+  ];
+  for error in post_birth {
+    let (admission, _ticket) = watcher.mint_sync_ticket();
+    let denied = SyncRootDenied::classify(error, admission);
+    assert!(
+      denied.admission.is_none(),
+      "{:?} is post-birth/ambiguous and must consume the admission",
+      denied.error
+    );
+  }
+}
+
+/// [`SyncAdmission`] is plain `Send + Sync` data (two `u64`s), so it holds across `sync_root`'s await
+/// without perturbing the future's `Send` — the seam the umbrella's owner-send asserts depend on.
+#[allow(dead_code)]
+fn _assert_sync_admission_is_send_sync() {
+  fn is_send_sync<T: Send + Sync>() {}
+  is_send_sync::<SyncAdmission>();
+  is_send_sync::<SyncRootDenied>();
 }
 
 /// `request_unwatch` is the non-blocking, REPLY-LESS teardown twin of the awaited `unwatch`: it
@@ -1494,12 +1583,12 @@ mod lifecycle {
     //
     // One reused ticket is the duplicate-target half of the vector: the old lane
     // queued each duplicate, because it deduplicated only after dequeue.
-    let dup = watcher.mint_sync_ticket();
+    let (_, dup) = watcher.mint_sync_ticket();
     for i in 0..100_000u64 {
       watcher.request_remove_cookie(PathBuf::from(format!("/r/.tributaries-sync-{i}")));
       // A freshly minted, never-admitted ticket resolves nothing — it addresses no
       // record this watcher ever admitted, so the flood retains nothing through it.
-      watcher.request_cancel_sync(watcher.mint_sync_ticket());
+      watcher.request_cancel_sync(watcher.mint_sync_ticket().1);
       watcher.request_remove_cookie(PathBuf::from("/r/.tributaries-sync-dup"));
       watcher.request_cancel_sync(dup);
     }
@@ -1522,6 +1611,98 @@ mod lifecycle {
     let watched = watcher.registry_len();
     assert_eq!(watched, 0, "no root was ever watched");
     watcher.close().await.expect("close");
+  }
+
+  /// The returned-admission retry contract, end to end over the real driver: a pre-birth refusal
+  /// hands the admission back, and re-presenting it retries under the SAME sequence — a refusal
+  /// burns nothing. A admits under `name`; a second sync under the same `name` with a FRESH
+  /// admission is refused `NameInUse` (A's write already completed, so it is the name gate, not
+  /// single-flight) and that refusal returns the admission; once A is reaped and the name frees,
+  /// the returned admission admits under its original sequence.
+  ///
+  /// Fail-on-old: neuter `SyncRootDenied::classify` to always-`None` and the `expect` on the
+  /// returned admission fails FAST — there is nothing to retry with, and the move-only admission
+  /// cannot be reconstructed.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_pre_birth_refusal_returns_the_admission_for_a_same_sequence_retry() {
+    let (dir, canonical) = scratch("admission-retry");
+    let fs = FakeFs::new(1);
+    fs.put(&canonical, FileKind::Dir, 1);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+    let handle = watcher
+      .watch(&dir, Interest::all())
+      .await
+      .expect("watch the root");
+
+    let name = ".tributaries-sync-admission-retry";
+
+    // A admits under `name` and writes its cookie (the reply resolves at write-complete).
+    let (a1, _t1) = watcher.mint_sync_ticket();
+    let path_a = watcher
+      .sync_root(handle, &canonical, name, a1)
+      .await
+      .expect("A admits and writes its cookie");
+
+    // A second sync under the SAME name, with a FRESH admission, is refused NameInUse — a pre-birth
+    // refusal that hands the admission back for a same-sequence retry.
+    let (a2, t2) = watcher.mint_sync_ticket();
+    let seq2 = t2.seq();
+    let denied = watcher
+      .sync_root(handle, &canonical, name, a2)
+      .await
+      .expect_err("a second sync under a live name is refused");
+    assert!(
+      matches!(denied.error, SyncRootError::NameInUse { .. }),
+      "the second same-name sync is refused NameInUse, got {:?}",
+      denied.error
+    );
+    let mut admission = denied
+      .admission
+      .expect("a pre-birth NameInUse refusal returns the admission for a same-sequence retry");
+    assert_eq!(
+      admission.seq(),
+      seq2,
+      "the returned admission keeps its original sequence"
+    );
+
+    // Reap A to free the name, then RETRY with the returned admission. Each NameInUse hands it back
+    // (the contract), so the SAME sequence is re-presented without a re-mint until A retires and the
+    // name frees — then it admits under seq2. Bounded so a wedged reap fails the cell, never hangs.
+    watcher.request_remove_cookie(path_a.clone());
+    let mut attempts = 0;
+    let path_b = loop {
+      attempts += 1;
+      assert!(attempts <= 500, "A did not retire within the retry budget");
+      match watcher.sync_root(handle, &canonical, name, admission).await {
+        Ok(path) => break path,
+        Err(denied) => {
+          assert!(
+            matches!(denied.error, SyncRootError::NameInUse { .. }),
+            "while A drains the only expected refusal is NameInUse, got {:?}",
+            denied.error
+          );
+          admission = denied
+            .admission
+            .expect("every NameInUse hands the admission back for retry");
+          assert_eq!(
+            admission.seq(),
+            seq2,
+            "the sequence is preserved across every retry"
+          );
+          tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+      }
+    };
+    assert_eq!(
+      path_b, path_a,
+      "the retry admits under the same name — the returned admission burned nothing"
+    );
+
+    // Close proves every cookie this watcher wrote (A's, then the retry's incarnation under seq2)
+    // was confirmed removed.
+    watcher.close().await.expect("close removes every cookie");
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }
 
