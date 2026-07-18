@@ -706,6 +706,11 @@ pub(crate) struct ResumeToken {
   device_uuid: Option<[u8; 16]>,
 }
 
+// The journal-replay token is consumed by the macOS FSEvents backend (and, for
+// `new`, the cross-platform driver resume tests); on every other target the type
+// is interface scaffolding — `SourceControl::resume_token` returns `Option<Self>`
+// uniformly — so its accessors are legitimately unused there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl ResumeToken {
   /// Builds a token from a last-good event id and its device UUID.
   pub(crate) const fn new(last_good: u64, device_uuid: Option<[u8; 16]>) -> Self {
