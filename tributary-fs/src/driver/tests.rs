@@ -5532,7 +5532,7 @@ mod sync_cookie {
     let hold = rig.fs.hold_cookie_removes();
     rig.fs.fail_next_cookie_removes(1);
     rig.cleanup.request_remove(&path);
-    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    settle(|| rig.fs.cookie_remove_dispatches() == 1 && hold.captured() == 1).await;
     let first_dispatch = rig.fs.cookie_remove_dispatches();
 
     // Arm a hold for the driver's OWN retry BEFORE releasing the first attempt, so that whenever
@@ -6379,7 +6379,7 @@ mod sync_cookie {
     rig.fs.fail_next_cookie_removes(1);
     let remove_hold = rig.fs.hold_cookie_removes();
     write_hold.release();
-    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    settle(|| rig.fs.cookie_remove_dispatches() == 1 && remove_hold.captured() == 1).await;
 
     // Arm a hold for the driver's OWN retry BEFORE releasing the self-reap's attempt, so that
     // whenever its backoff fires — however long the test task stalls in between — the retry is
@@ -6458,7 +6458,7 @@ mod sync_cookie {
     rig.fs.fail_next_cookie_removes(1);
     let remove_hold = rig.fs.hold_cookie_removes();
     write_hold.release();
-    settle(|| rig.fs.cookie_remove_dispatches() == 1).await;
+    settle(|| rig.fs.cookie_remove_dispatches() == 1 && remove_hold.captured() == 1).await;
 
     // Arm a hold for the driver's OWN retry BEFORE releasing the self-reap's attempt, so that
     // whenever its backoff fires — however long the test task stalls in between — the retry is
@@ -6498,6 +6498,70 @@ mod sync_cookie {
       cookie_count(&rig).await,
       0,
       "the record dropped once the retry confirmed"
+    );
+  }
+
+  // A plain std::thread regression pinning the property the three cells above now settle on
+  // before installing a superseding hold: a job that has CAPTURED a gate (cloned it and
+  // committed to parking on it) can never be stolen by a gate installed afterward, even though
+  // the dispatch counter alone only proves a dispatch happened, not which gate it bound to.
+  //
+  // The original race (preemption between the dispatch increment and the gate clone) cannot be
+  // forced deterministically without an injection hook, so this test instead pins the
+  // capture-before-supersede contract the ack provides: every bounded wait below fails fast at
+  // its deadline rather than hanging, so a regression here is a clear assertion failure, not a
+  // wedged test binary.
+  #[test]
+  fn a_hold_gate_is_captured_before_it_can_be_superseded() {
+    let fs = FakeFs::new(1);
+    let hold = fs.hold_cookie_removes();
+
+    let worker = {
+      let fs = fs.clone();
+      std::thread::spawn(move || {
+        fs.remove_cookie(Path::new("/x"))
+          .expect("the unlink succeeds");
+      })
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fs.cookie_remove_dispatches() != 1 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the dispatch never reached the pool"
+      );
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    while hold.captured() != 1 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the dispatch never captured its gate — the ack ordering regressed"
+      );
+      std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Install a superseding gate BEFORE releasing the first — exactly the handoff the three
+    // cells above perform.
+    let retry_hold = fs.hold_cookie_removes();
+    hold.release();
+
+    // If the ack were unsound, the worker could have bound to `retry_hold` instead, and the
+    // release above would have freed nobody: the worker would hang forever, and this poll fails
+    // fast instead of wedging the test binary.
+    while !worker.is_finished() {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the worker never completed — a superseding gate stole the capture"
+      );
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    worker.join().expect("the worker thread does not panic");
+
+    assert_eq!(
+      retry_hold.captured(),
+      0,
+      "the superseding gate captured nothing: the first attempt had already committed to its \
+       own gate before the second was installed"
     );
   }
 
