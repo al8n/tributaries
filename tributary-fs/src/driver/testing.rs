@@ -26,8 +26,11 @@ use crate::{
   },
 };
 
-/// A parked-work gate: the held flag plus its wakeup.
-type HoldGate = Arc<(Mutex<bool>, Condvar)>;
+/// A parked-work gate: the held flag, its wakeup, and a monotonic count of
+/// jobs that have CAPTURED (cloned and committed to) this exact gate — the
+/// proof a test needs before it may install a superseding gate without
+/// racing a job that is still choosing which gate slot to park on.
+type HoldGate = Arc<(Mutex<bool>, Condvar, AtomicUsize)>;
 
 /// One fake filesystem object.
 #[derive(Debug, Clone, Copy)]
@@ -458,7 +461,7 @@ impl FakeFs {
   /// Holds every subsequent spawn on the blocking pool until the returned
   /// gate is released.
   pub(crate) fn hold_spawns(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.spawn_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -466,7 +469,7 @@ impl FakeFs {
   /// Holds every subsequent `shutdown` on the blocking pool until the
   /// returned gate is released.
   pub(crate) fn hold_teardowns(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.teardown_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -474,7 +477,7 @@ impl FakeFs {
   /// Holds every subsequent spawn AFTER its stream goes live but before the
   /// spawn returns — the post-live metadata phase of the real backend.
   pub(crate) fn hold_spawns_post_live(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.post_live_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -536,7 +539,7 @@ impl FakeFs {
   /// Holds every subsequent enumerate until released (the close-versus-
   /// in-flight-enumerate cell).
   pub(crate) fn hold_enumerates(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.enumerate_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -545,7 +548,7 @@ impl FakeFs {
   /// `batch_control`) until released — the close-versus-in-flight-arm and
   /// stale-batch-across-replace cells.
   pub(crate) fn hold_arms(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.arm_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -555,7 +558,7 @@ impl FakeFs {
   /// [`hold_arms`](Self::hold_arms) so a test can freeze in-flight discovery
   /// batches while the commit's pre-arm still proceeds.
   pub(crate) fn hold_prearms(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.prearm_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -625,7 +628,7 @@ impl FakeFs {
   /// gate is released — the window a retirement, an abandoned reply, or a driver
   /// teardown races the write in.
   pub(crate) fn hold_cookie_writes(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.cookie_write_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -635,7 +638,7 @@ impl FakeFs {
   /// close reports `NotQuiesced` within its grace rather than wedging, and that
   /// a cancelled driver's `Drop` does not block on it.
   pub(crate) fn hold_cookie_removes(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.cookie_remove_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -646,7 +649,7 @@ impl FakeFs {
   /// confirm lands. `files_under` flips at the gate; `cookie_removes()` records
   /// only after release, so the two bracket the ABA window cleanly.
   pub(crate) fn hold_cookie_remove_confirms(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.cookie_remove_confirm_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -735,7 +738,12 @@ impl FakeFs {
   fn park_on(&self, hold: &Mutex<Option<HoldGate>>) {
     let gate = hold.lock().unwrap().clone();
     if let Some(gate) = gate {
-      let (held, cvar) = &*gate;
+      // The parked-on-THIS-gate ack, committed right after the clone binds
+      // the job to this exact gate instance: a caller observing the count
+      // through the same `Arc` knows a later-installed gate can never
+      // retroactively steal this job.
+      gate.2.fetch_add(1, Ordering::SeqCst);
+      let (held, cvar, _) = &*gate;
       let mut parked = held.lock().unwrap();
       while *parked {
         parked = cvar.wait(parked).unwrap();
@@ -751,9 +759,19 @@ pub(crate) struct HoldRelease {
 
 impl HoldRelease {
   pub(crate) fn release(&self) {
-    let (held, cvar) = &*self.gate;
+    let (held, cvar, _) = &*self.gate;
     *held.lock().unwrap() = false;
     cvar.notify_all();
+  }
+
+  /// Jobs that have captured this gate via [`FakeFs::park_on`] — cloned it
+  /// and committed to parking on (or passing through) THIS instance. Proves
+  /// a dispatch has bound to this gate, not merely that a dispatch happened;
+  /// a test settles on this before installing a superseding hold, closing
+  /// the window where the new gate could otherwise capture an attempt that
+  /// was still choosing which gate to park on.
+  pub(crate) fn captured(&self) -> usize {
+    self.gate.2.load(Ordering::SeqCst)
   }
 }
 
@@ -773,7 +791,7 @@ impl SourceControl for FakeHandle {
     // waits, or a failing test would hang its own teardown.
     let gate = self.state.teardown_hold.lock().unwrap().clone();
     if let Some(gate) = gate {
-      let (held, cvar) = &*gate;
+      let (held, cvar, _) = &*gate;
       let mut parked = held.lock().unwrap();
       while *parked {
         parked = cvar.wait(parked).unwrap();
@@ -812,7 +830,7 @@ impl FsOps for FakeFs {
     // yet returned.
     let hold = self.state.spawn_hold.lock().unwrap().clone();
     if let Some(gate) = hold {
-      let (held, cvar) = &*gate;
+      let (held, cvar, _) = &*gate;
       let mut parked = held.lock().unwrap();
       while *parked {
         parked = cvar.wait(parked).unwrap();
@@ -885,7 +903,7 @@ impl FsOps for FakeFs {
     // exactly the phase the close accounting must count as non-quiescent.
     let post_live = self.state.post_live_hold.lock().unwrap().clone();
     if let Some(gate) = post_live {
-      let (held, cvar) = &*gate;
+      let (held, cvar, _) = &*gate;
       let mut parked = held.lock().unwrap();
       while *parked {
         parked = cvar.wait(parked).unwrap();
@@ -1412,7 +1430,7 @@ impl GatedRegistry {
   /// Freezes the NEXT `scope_live` (the replace commit's, called after the lane
   /// swap) until the returned gate is released.
   pub(crate) fn hold_scope_live(&self) -> HoldRelease {
-    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new()));
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
@@ -1437,7 +1455,7 @@ impl ScopeRegistry for GatedRegistry {
     let gate = self.hold.lock().unwrap().clone();
     if let Some(gate) = gate {
       self.entered.store(true, Ordering::SeqCst);
-      let (held, cvar) = &*gate;
+      let (held, cvar, _) = &*gate;
       let mut parked = held.lock().unwrap();
       while *parked {
         parked = cvar.wait(parked).unwrap();
