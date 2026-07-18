@@ -71,25 +71,31 @@ impl RootHandle {
   }
 }
 
-/// An opaque, single-use cancellation/reap key for one
-/// [`sync_root`](Watcher::sync_root) admission, minted by THIS watcher before the
-/// sync is requested.
+/// An opaque, `Copy` cancellation/reap key for one
+/// [`sync_root`](Watcher::sync_root) admission, minted by THIS watcher and paired
+/// at mint with the move-only [`SyncAdmission`] that admits the same sequence.
 ///
-/// A ticket is never reused: [`mint_sync_ticket`](Watcher::mint_sync_ticket)
-/// draws from a per-watcher monotonic sequence, so a ticket addresses **at most
-/// one incarnation, ever** — a cancel through it targets its own sync or nothing.
-/// That is what makes [`request_cancel_sync`](Watcher::request_cancel_sync)'s "a
-/// cancel after the sync resolved is a no-op" true by construction: a cookie NAME
-/// is freed at its holder's terminal and re-bindable (sequential reuse admits), so
-/// a cancel delayed across the holder's retirement and a successor's admission
-/// under the same name would resolve the SUCCESSOR — but a ticket's sequence is
-/// bound to one incarnation for all time, so the delayed cancel resolves the
-/// retired sync (a true no-op), never the successor.
+/// The pair splits the two authorities a sync needs. The [`SyncAdmission`]
+/// **admits once**: [`sync_root`](Watcher::sync_root) consumes it by value, so the
+/// type system forbids presenting one sequence to two admissions. The `SyncTicket`
+/// **cancels forever**: [`request_cancel_sync`](Watcher::request_cancel_sync) takes
+/// it — being `Copy`, the caller keeps it across the sync's whole life — and marks
+/// the sequence's obligation at any phase, a no-op once the sync has retired.
 ///
-/// Opaque and `Copy`: its fields are the minting watcher's brand and the mint
-/// sequence, both private. It carries no path and no server-side state until the
-/// sync it keys is admitted, so minting one — even in a flood — retains nothing.
-/// Exported like [`RootHandle`].
+/// A ticket addresses **at most one incarnation, ever** — now by construction, not
+/// by convention. [`mint_sync_ticket`](Watcher::mint_sync_ticket) draws a
+/// per-watcher monotonic sequence that is never re-minted, and the paired
+/// admission is move-only, so that sequence is admitted at most once across all
+/// time. A cookie NAME, by contrast, is freed at its holder's terminal and
+/// re-bindable (sequential reuse admits), so a cancel delayed across a holder's
+/// retirement and a same-name successor's admission would resolve the SUCCESSOR —
+/// but the successor holds a DIFFERENT ticket, so a delayed cancel through this one
+/// resolves the retired sync (a true no-op), never the successor.
+///
+/// Opaque: its fields are the minting watcher's brand and the mint sequence, both
+/// private. It carries no path and no server-side state until the sync it keys is
+/// admitted, so minting one — even in a flood — retains nothing. Exported like
+/// [`RootHandle`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SyncTicket {
   /// The minting watcher's brand — a ticket presented to a DIFFERENT watcher is
@@ -116,6 +122,121 @@ impl SyncTicket {
   /// The per-watcher mint sequence — the ledger's `by_ticket` key.
   pub(crate) const fn seq(&self) -> u64 {
     self.seq
+  }
+}
+
+/// An opaque, **move-only** capability admitting exactly one
+/// [`sync_root`](Watcher::sync_root) call, minted by THIS watcher and paired at
+/// mint with the [`SyncTicket`] that cancels the same sequence.
+///
+/// It admits **once**: [`sync_root`](Watcher::sync_root) consumes it by value, and
+/// the type carries no `Clone`, no `Copy`, and no `Drop`, so safe Rust cannot
+/// present one admission — hence one mint sequence — to two admissions. That is
+/// what turns "a ticket addresses at most one incarnation, ever" (see
+/// [`SyncTicket`]) into a compile-time theorem: `by_ticket[seq]` is written at most
+/// once, so a delayed [`request_cancel_sync`](Watcher::request_cancel_sync) can
+/// only ever resolve that sequence's own incarnation or nothing.
+///
+/// A pre-birth refusal HANDS THE ADMISSION BACK
+/// ([`SyncRootDenied::admission`]): the refusal admitted nothing, so the same
+/// sequence may be re-presented (retry under the same ticket). Carrying **no**
+/// `Drop` obligation, it is a pure capability — leaking one (drop,
+/// [`mem::forget`](std::mem::forget)) simply means its sequence is never admitted,
+/// which retains nothing server-side. Plain `Send` data — its two private fields
+/// are the watcher brand and the mint sequence — so it holds across
+/// [`sync_root`](Watcher::sync_root)'s await without perturbing the future's
+/// `Send`. Exported like [`SyncTicket`].
+#[derive(Debug)]
+pub struct SyncAdmission {
+  /// The minting watcher's brand — an admission presented to a DIFFERENT watcher
+  /// is refused at the door ([`SyncRootError::ForeignTicket`]), never aliasing
+  /// that watcher's unrelated sequence numbering.
+  instance: u64,
+  /// The per-watcher monotonic mint sequence, never re-minted and — being
+  /// move-only — admitted at most once: the wire ticket
+  /// [`sync_root`](Watcher::sync_root) builds and the ledger's `by_ticket` key.
+  seq: u64,
+}
+
+impl SyncAdmission {
+  /// Mints an admission under the issuing watcher's brand and sequence. The sole
+  /// constructor, called only by [`mint_sync_ticket`](Watcher::mint_sync_ticket),
+  /// which mints the paired [`SyncTicket`] from the same brand and sequence.
+  pub(crate) const fn new(instance: u64, seq: u64) -> Self {
+    Self { instance, seq }
+  }
+
+  /// The issuing watcher's brand.
+  pub(crate) const fn instance(&self) -> u64 {
+    self.instance
+  }
+
+  /// The per-watcher mint sequence — the wire ticket
+  /// [`sync_root`](Watcher::sync_root) builds and the ledger's `by_ticket` key.
+  pub(crate) const fn seq(&self) -> u64 {
+    self.seq
+  }
+}
+
+/// Why a [`sync_root`](Watcher::sync_root) call did not place a cookie, plus — for
+/// a refusal that provably created nothing — the [`SyncAdmission`] handed back for
+/// a same-sequence retry.
+///
+/// `admission` is `Some` **iff** the refusal is provably PRE-BIRTH: a synchronous
+/// door refusal, or a driver refusal raised before the sync was admitted
+/// ([`WriteInFlight`](SyncRootError::WriteInFlight),
+/// [`NameInUse`](SyncRootError::NameInUse),
+/// [`TicketInUse`](SyncRootError::TicketInUse),
+/// [`CleanupBacklog`](SyncRootError::CleanupBacklog), and the reply-borne
+/// [`UnknownRoot`](SyncRootError::UnknownRoot) /
+/// [`BadCookieName`](SyncRootError::BadCookieName) /
+/// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot)). Such a refusal burns
+/// nothing, so re-present the returned admission to
+/// [`sync_root`](Watcher::sync_root) to retry under the SAME sequence — the paired
+/// [`SyncTicket`] stays valid. `None` means the sequence is spent or its fate is
+/// ambiguous — the write was admitted then retired
+/// ([`Write`](SyncRootError::Write)), the sync reached a post-birth terminal
+/// ([`Retired`](SyncRootError::Retired)), or the watcher is
+/// [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
+/// [`mint_sync_ticket`](Watcher::mint_sync_ticket).
+#[derive(Debug)]
+pub struct SyncRootDenied {
+  /// The placement failure — the same vocabulary the pre-split
+  /// [`sync_root`](Watcher::sync_root) returned directly.
+  pub error: SyncRootError,
+  /// The admission handed back for a same-sequence retry: `Some` iff `error` is a
+  /// provably pre-birth refusal (see the type docs), `None` when the sequence is
+  /// spent or its fate is ambiguous.
+  pub admission: Option<SyncAdmission>,
+}
+
+impl SyncRootDenied {
+  /// Wraps a [`sync_root`](Watcher::sync_root) refusal, returning the admission for
+  /// a same-sequence retry only when `error` is provably PRE-BIRTH (the refusal
+  /// created nothing); otherwise the sequence is spent (or its fate ambiguous) and
+  /// the admission is consumed. The SINGLE audit point for the pre/post-birth
+  /// classification: a variant not listed here consumes the admission by default,
+  /// so a future refusal is fail-safe — an unnecessary re-mint, never a reused
+  /// sequence. Post-birth by construction and therefore deliberately absent from
+  /// the returned set: `Write` (admitted, then retired before the reply — the
+  /// sequence is burned), `Retired` (a post-admission terminal), and `Closed`.
+  pub(crate) fn classify(error: SyncRootError, admission: SyncAdmission) -> Self {
+    let admission = if matches!(
+      error,
+      SyncRootError::UnknownRoot
+        | SyncRootError::ForeignTicket
+        | SyncRootError::BadCookieName { .. }
+        | SyncRootError::DirOutsideRoot { .. }
+        | SyncRootError::WriteInFlight
+        | SyncRootError::NameInUse { .. }
+        | SyncRootError::TicketInUse {}
+        | SyncRootError::CleanupBacklog
+    ) {
+      Some(admission)
+    } else {
+      None
+    };
+    Self { error, admission }
   }
 }
 
@@ -979,18 +1100,25 @@ impl<R> Watcher<R> {
     }
   }
 
-  /// Mints a fresh [`SyncTicket`] to pass to a [`sync_root`](Self::sync_root)
-  /// call and, later, to [`request_cancel_sync`](Self::request_cancel_sync).
+  /// Mints a fresh [`SyncAdmission`]/[`SyncTicket`] pair for one
+  /// [`sync_root`](Self::sync_root): the move-only admission
+  /// [`sync_root`](Self::sync_root) consumes to admit the sync, and the `Copy`
+  /// ticket held back for [`request_cancel_sync`](Self::request_cancel_sync). Both
+  /// carry the SAME mint sequence, so the ticket cancels exactly the incarnation
+  /// the admission admits.
   ///
-  /// Pure memory: one `Relaxed` atomic increment, no channel, no allocation. A
-  /// ticket has no server-side state until the sync it keys is admitted, so
-  /// minting a flood of tickets that are never used retains nothing. The mint is
-  /// monotonic and driver-lifetime, so a ticket is never re-minted — the property
-  /// that makes a cancel through it address at most one incarnation ever.
-  pub fn mint_sync_ticket(&self) -> SyncTicket {
-    SyncTicket::new(
-      self.instance,
-      self.sync_tickets.fetch_add(1, Ordering::Relaxed),
+  /// Pure memory: one `Relaxed` atomic increment, no channel, no allocation.
+  /// Neither half has server-side state until the sync the admission admits is
+  /// born, so minting a flood that is never used retains nothing. The mint is
+  /// monotonic and driver-lifetime, so a sequence is never re-minted — and, the
+  /// admission being move-only, that sequence is admitted at most once: the two
+  /// facts that make a cancel through the ticket address at most one incarnation,
+  /// ever.
+  pub fn mint_sync_ticket(&self) -> (SyncAdmission, SyncTicket) {
+    let seq = self.sync_tickets.fetch_add(1, Ordering::Relaxed);
+    (
+      SyncAdmission::new(self.instance, seq),
+      SyncTicket::new(self.instance, seq),
     )
   }
 
@@ -1017,70 +1145,100 @@ impl<R> Watcher<R> {
   ///
   /// Reap the cookie with [`request_remove_cookie`](Self::request_remove_cookie)
   /// once it has been observed, or cancel/reap it incarnation-precisely with
-  /// [`request_cancel_sync`](Self::request_cancel_sync) through `ticket`. Both the
-  /// create and the unlink are suppressed from consumer streams by the
-  /// reserved-namespace rule at the layer that owns the namespace.
+  /// [`request_cancel_sync`](Self::request_cancel_sync) through the paired
+  /// [`SyncTicket`]. Both the create and the unlink are suppressed from consumer
+  /// streams by the reserved-namespace rule at the layer that owns the namespace.
   ///
-  /// `ticket` is a fresh [`SyncTicket`] from
-  /// [`mint_sync_ticket`](Self::mint_sync_ticket): it keys THIS admission for a
-  /// later [`request_cancel_sync`](Self::request_cancel_sync). Mint one per call —
-  /// passing one ticket to two concurrently-live syncs is refused
-  /// ([`TicketInUse`](SyncRootError::TicketInUse)).
+  /// `admission` is the move-only [`SyncAdmission`] half of a fresh
+  /// [`mint_sync_ticket`](Self::mint_sync_ticket) pair, consumed BY VALUE to admit
+  /// THIS sync. The type system thus forbids presenting one admission — one mint
+  /// sequence — to two syncs, so a later cancel through the paired ticket can never
+  /// alias a second incarnation. A pre-birth refusal hands the admission back in
+  /// [`SyncRootDenied`] for a same-sequence retry (a refusal burns nothing); see
+  /// the Errors section.
   ///
   /// # Errors
   ///
+  /// Every failure is a [`SyncRootDenied`] carrying one of these
+  /// [`SyncRootError`]s and — for a provably pre-birth refusal — the
+  /// [`SyncAdmission`] to retry under the same sequence:
   /// [`SyncRootError::UnknownRoot`] for a foreign or dead handle;
-  /// [`ForeignTicket`](SyncRootError::ForeignTicket) when `ticket` was minted by a
-  /// different watcher; [`BadCookieName`](SyncRootError::BadCookieName) when `name`
-  /// is not a single normal component; [`DirOutsideRoot`](SyncRootError::DirOutsideRoot)
-  /// when `dir` is not inside the root (including via `..` traversal);
-  /// [`Write`](SyncRootError::Write) when the create fails (a read-only tree
-  /// surfaces as `PermissionDenied`); [`WriteInFlight`](SyncRootError::WriteInFlight)
-  /// when a physical write for this root is already in flight;
-  /// [`NameInUse`](SyncRootError::NameInUse) when a live sync of this watcher
-  /// already holds `name`; [`TicketInUse`](SyncRootError::TicketInUse) when a live
-  /// sync of this watcher already holds `ticket`;
+  /// [`ForeignTicket`](SyncRootError::ForeignTicket) when `admission` was minted by
+  /// a different watcher; [`BadCookieName`](SyncRootError::BadCookieName) when
+  /// `name` is not a single normal component;
+  /// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) when `dir` is not inside the
+  /// root (including via `..` traversal); [`Write`](SyncRootError::Write) when the
+  /// create fails (a read-only tree surfaces as `PermissionDenied`);
+  /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this
+  /// root is already in flight; [`NameInUse`](SyncRootError::NameInUse) when a live
+  /// sync of this watcher already holds `name`;
+  /// [`TicketInUse`](SyncRootError::TicketInUse) when a live sync of this watcher
+  /// already holds this admission's sequence;
   /// [`CleanupBacklog`](SyncRootError::CleanupBacklog) when the root's cookie
   /// cleanup backlog cap is reached; [`Retired`](SyncRootError::Retired) when the
   /// root died while the write was parked; [`Closed`](SyncRootError::Closed) once
-  /// the watcher is closed.
+  /// the watcher is closed. The admission is returned (retryable) for every refusal
+  /// except [`Write`](SyncRootError::Write), [`Retired`](SyncRootError::Retired),
+  /// and [`Closed`](SyncRootError::Closed), whose sequence is spent — re-mint to
+  /// retry those.
   pub async fn sync_root(
     &self,
     root: RootHandle,
     dir: impl Into<PathBuf>,
     name: impl Into<String>,
-    ticket: SyncTicket,
-  ) -> Result<PathBuf, SyncRootError> {
+    admission: SyncAdmission,
+  ) -> Result<PathBuf, SyncRootDenied> {
     if root.instance() != self.instance {
-      return Err(SyncRootError::UnknownRoot);
+      return Err(SyncRootDenied::classify(
+        SyncRootError::UnknownRoot,
+        admission,
+      ));
     }
-    // A ticket minted by a DIFFERENT watcher must be refused before the send: its
-    // sequence numbering is unrelated to this watcher's `by_ticket`, so honoring
-    // it would let a foreign ticket alias one of our incarnations. Same synchronous
-    // door as the foreign-handle check above.
-    if ticket.instance() != self.instance {
-      return Err(SyncRootError::ForeignTicket);
+    // An admission minted by a DIFFERENT watcher must be refused before the send:
+    // its sequence numbering is unrelated to this watcher's `by_ticket`, so honoring
+    // it would let a foreign sequence alias one of our incarnations. Same
+    // synchronous door as the foreign-handle check above.
+    if admission.instance() != self.instance {
+      return Err(SyncRootDenied::classify(
+        SyncRootError::ForeignTicket,
+        admission,
+      ));
     }
     let dir = dir.into();
     let name = name.into();
     // The name the caller supplies must be a single normal component — a
     // separator, `..`, or absolute name would escape the directory on a join.
     if !crate::driver::is_normal_cookie_name(&name) {
-      return Err(SyncRootError::BadCookieName { name });
+      return Err(SyncRootDenied::classify(
+        SyncRootError::BadCookieName { name },
+        admission,
+      ));
     }
     // The cookie must be reportable on THIS root's stream: a directory outside
     // its coverage could never mint an event the caller will see. Containment is
     // checked on LEXICALLY NORMALIZED components — a plain `starts_with` accepts
     // `<root>/../outside`, which escapes the tree.
     let Some(root_path) = self.root_path(root) else {
-      return Err(SyncRootError::UnknownRoot);
+      return Err(SyncRootDenied::classify(
+        SyncRootError::UnknownRoot,
+        admission,
+      ));
     };
     if !crate::driver::cookie_dir_within_root(&root_path, &dir) {
-      return Err(SyncRootError::DirOutsideRoot {
-        dir,
-        root: root_path,
-      });
+      return Err(SyncRootDenied::classify(
+        SyncRootError::DirOutsideRoot {
+          dir,
+          root: root_path,
+        },
+        admission,
+      ));
     }
+
+    // The wire is UNCHANGED: build the seq-bearing ticket the driver still keys
+    // `by_ticket` on FROM the admission (a plain read of its two fields, no move),
+    // so the affine admission stays in this frame across the await — "returning" it
+    // on a refusal is then a local move, never a trip across the channel.
+    let ticket = SyncTicket::new(admission.instance(), admission.seq());
 
     let (reply, response) = futures_channel::oneshot::channel();
     if self
@@ -1096,13 +1254,17 @@ impl<R> Watcher<R> {
       .is_err()
     {
       self.driver_gone();
-      return Err(SyncRootError::Closed);
+      return Err(SyncRootDenied::classify(SyncRootError::Closed, admission));
     }
     match response.await {
-      Ok(outcome) => outcome,
+      // Admitted and written: the admission is spent — drop it, return the path.
+      Ok(Ok(path)) => Ok(path),
+      // A server-side refusal: `classify` returns the admission iff it is provably
+      // pre-birth (the single audit point for the pre/post-birth split).
+      Ok(Err(error)) => Err(SyncRootDenied::classify(error, admission)),
       Err(_) => {
         self.driver_gone();
-        Err(SyncRootError::Closed)
+        Err(SyncRootDenied::classify(SyncRootError::Closed, admission))
       }
     }
   }
@@ -1155,17 +1317,21 @@ impl<R> Watcher<R> {
   /// one whose write is still in flight (so it self-reaps), or retires one whose
   /// write was never dispatched. Idempotent; never blocks.
   ///
-  /// `ticket` must be the one passed to the [`sync_root`](Self::sync_root) call
-  /// being cancelled. Because a ticket's sequence is minted once and never
-  /// re-minted, it addresses exactly one incarnation for all time:
+  /// `ticket` must be the one paired at mint with the [`SyncAdmission`] passed to
+  /// the [`sync_root`](Self::sync_root) call being cancelled. Because that sequence
+  /// is minted once and never re-minted AND the paired admission is move-only (so
+  /// the sequence is admitted at most once), the ticket addresses exactly one
+  /// incarnation for all time:
   ///
   /// - a foreign ticket (another watcher's brand) resolves nothing — dropped at
   ///   the door, so it can never alias one of this watcher's incarnations;
   /// - after the sync reaches its terminal the ticket resolves nothing — the
   ///   documented "a cancel after resolution is a no-op" is now true BY
-  ///   CONSTRUCTION, not by a caller convention: a successor admitted under the
-  ///   same cookie NAME holds a different ticket and is unreachable through this
-  ///   one, so a delayed cancel can never kill it.
+  ///   CONSTRUCTION, not by a caller convention: the move-only admission makes
+  ///   presenting one sequence twice a compile error, so `by_ticket[seq]` is
+  ///   written at most once, and a successor admitted under the same cookie NAME
+  ///   holds a DIFFERENT ticket and is unreachable through this one — a delayed
+  ///   cancel can never kill it.
   ///
   /// Public because the umbrella `FsSource` — in a different crate — calls it from
   /// its `cancel_sync` seam method when the owner abandons an in-flight sync (a

@@ -236,13 +236,14 @@ pub enum SyncRootError {
     /// The contested name as supplied.
     name: String,
   },
-  /// A LIVE sync obligation of this watcher already holds this
-  /// [`SyncTicket`](crate::SyncTicket) — the caller passed one ticket to two
-  /// concurrently-live syncs. A ticket is single-use; mint a fresh one per
-  /// [`sync_root`](crate::Watcher::sync_root). The ticket is freed when the holding
-  /// obligation reaches its terminal, and this refusal creates nothing, so the
-  /// SAME ticket may be retried after a transient refusal (a
-  /// [`CleanupBacklog`](Self::CleanupBacklog)) without re-minting.
+  /// A LIVE sync obligation of this watcher already holds this admission's mint
+  /// sequence. From the safe [`sync_root`](crate::Watcher::sync_root) API this is
+  /// now unreachable — the move-only [`SyncAdmission`](crate::SyncAdmission) makes
+  /// presenting one sequence to two syncs a compile error — so it is retained as a
+  /// driver-internal invariant. The refusal is pre-birth and creates nothing, so
+  /// [`sync_root`](crate::Watcher::sync_root) hands the admission back in
+  /// [`SyncRootDenied`](crate::SyncRootDenied) for a same-sequence retry; the
+  /// paired [`SyncTicket`](crate::SyncTicket) remains the forever cancel key.
   #[error("the sync ticket is already held by a live sync of this watcher")]
   TicketInUse {},
   /// This root has too many unremoved cookies: its cleanup owner is retrying
