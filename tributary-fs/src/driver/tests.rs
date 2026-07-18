@@ -4220,12 +4220,12 @@ mod replace {
       })
       .await
       .unwrap();
-    // The command is processed (replace_states populated) before the death,
-    // since the biased select drains the command channel ahead of the source
-    // stream.
-    for _ in 0..8 {
-      tokio::task::yield_now().await;
-    }
+    // Wait until the replacement spawn has actually been dispatched — the fake
+    // records its resume point at dispatch, before the hold gate parks it — so
+    // `replace_states` is populated before the death arrives. A fixed yield count
+    // is not a barrier under a loaded multi-thread runtime (the driver task may
+    // not have run yet); this condition is.
+    settle(|| rig.fs.spawn_resume_points().len() == 2).await;
 
     // The OLD root dies while the replacement is still spawning: the death
     // path tears the original handle down.
