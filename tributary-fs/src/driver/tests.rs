@@ -4824,7 +4824,7 @@ mod sync_cookie {
     // which is exactly what makes it a barrier marker.
     rig
       .fs
-      .send_batch("/r", vec![ev(path.to_str().unwrap(), created(), 1, 9001)]);
+      .send_batch("/r", vec![ev("/r/.tributaries-sync-1-7-1", created(), 1, 9001)]);
     let (s, change) = next_event(&rig).await;
     assert_eq!(s, scope);
     assert!(change.kind().is_created());
