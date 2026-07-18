@@ -87,7 +87,7 @@ mod integration {
   use super::super::{FsSource, OPPORTUNISTIC_RELEASE_HANDOFFS, key_to_path};
   use crate::{
     event::path_components,
-    source::{Source, SourceEvent},
+    source::{Source, SourceEvent, SyncToken},
   };
 
   /// Generous ceiling for one expected observation; CI runners are slow and FSEvents
@@ -1111,6 +1111,54 @@ mod integration {
     assert!(
       !source.pending_releases.iter().any(|(h, _)| *h == rel_h),
       "the genuine release left the queue once the channel had room"
+    );
+  }
+
+  /// A STALE cancel — an OLDER incarnation's token — must never consume a LATER incarnation's
+  /// `pending_syncs` entry. `cancel_sync` inspects the stored token before removing anything, so a
+  /// token mismatch touches nothing and the live entry survives intact for its own incarnation's
+  /// matching cancel; only a matching token removes the entry and fires the watcher-side cancel.
+  #[tokio::test(flavor = "current_thread")]
+  async fn fs_source_cancel_sync_stale_token_leaves_current_entry_intact() {
+    let (_dir, root) = scratch();
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+    let handle = source
+      .arm(&path_components(&root))
+      .await
+      .expect("arm the root")
+      .handle();
+
+    // Arrange the CURRENT incarnation's entry directly — a real watcher-minted ticket paired with
+    // tokenB — mirroring what `begin_sync` leaves behind for an abandoned in-flight sync.
+    let token_a = SyncToken::new(1, 1, 1, 0xA);
+    let token_b = SyncToken::new(1, 1, 2, 0xB);
+    let ticket_b = source.watcher.mint_sync_ticket();
+    source.pending_syncs.insert(handle, (token_b, ticket_b));
+
+    // A STALE cancel for the OLD incarnation (tokenA != tokenB): must be a pure no-op. Against the
+    // pre-fix remove-first code, the very next assertion fails immediately (fail-fast, no hang) —
+    // the mismatched cancel had already removed the entry before comparing the token.
+    source.cancel_sync(handle, token_a);
+    assert_eq!(
+      source.pending_syncs.get(&handle),
+      Some(&(token_b, ticket_b)),
+      "a stale/mismatched-token cancel must leave the current incarnation's entry INTACT"
+    );
+    assert_eq!(
+      source.sync_cancels_requested, 0,
+      "a stale/mismatched-token cancel must issue no watcher-side cancel"
+    );
+
+    // The MATCHING cancel (tokenB): removes the entry and fires exactly one watcher-side cancel.
+    source.cancel_sync(handle, token_b);
+    assert_eq!(
+      source.pending_syncs.get(&handle),
+      None,
+      "a matching-token cancel removes the entry"
+    );
+    assert_eq!(
+      source.sync_cancels_requested, 1,
+      "a matching-token cancel issues exactly one watcher-side cancel"
     );
   }
 }
