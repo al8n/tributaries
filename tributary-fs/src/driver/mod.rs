@@ -333,8 +333,11 @@ impl LedgerInner {
   /// always true for it, but a direct fs-API caller that reused one name across
   /// two live incarnations must not have the survivor's index clobbered by the
   /// other's retire. The `by_ticket` point-back is uniform with the others though
-  /// a displacement there is unmintable: a ticket sequence is minted once and never
-  /// repeats, so `by_ticket[seq]` can only ever have named THIS record.
+  /// a displacement is unmintable through the public API: a watcher-minted ticket
+  /// sequence is issued once, never repeats, and the move-only admission makes
+  /// presenting it to two syncs a compile error — so through the public surface
+  /// `by_ticket[seq]` can only ever have named THIS record (the driver-test harness
+  /// forges wire tickets below that surface, where a displacement is representable).
   fn retire(&mut self, id: CookieId, reaped: Reaped) -> Option<Obligation> {
     let ob = self.obligations.remove(&id)?;
     #[cfg(all(test, feature = "tokio"))]
