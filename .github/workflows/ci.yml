@@ -258,6 +258,10 @@ jobs:
       matrix:
         which: [asan-lsan, msan, tsan]
     runs-on: ubuntu-latest
+    # A passing shard finishes in a few minutes; this bounds a pathological
+    # livelock (a producer/drain cell under TSan's adversarial scheduling) to a
+    # fast failure instead of the 6 h GitHub job ceiling.
+    timeout-minutes: 45
     env:
       # The storm cells converge statistically over many seeds; under sanitizer
       # instrumentation the full 64-seed sweep dominates the job's runtime. The
