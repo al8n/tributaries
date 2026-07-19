@@ -456,6 +456,55 @@ impl Source {
     }
   }
 
+  /// The spawn barrier's METADATA half with NO stream creation — what a
+  /// same-transport widen commits with. Identical discipline to
+  /// [`spawn`](Self::spawn): canonicalize, then PIN the root
+  /// ([`pin_root`]: `RESOLVE_NO_SYMLINKS`) and ground every fact on the pin —
+  /// the statx floor, the locality gate, the identity and mount frame — plus
+  /// the trust-reducing mount seed and the ancestor identities. The backend is
+  /// pinned to inotify: the widen route never re-runs the `Auto` ladder (the
+  /// live stream IS the backend), which is also how the KR↔descending
+  /// diagonal stays structurally unreachable on it.
+  pub(crate) fn resolve_root_meta(supplied: &Path) -> Result<super::RootMeta, super::SourceError> {
+    let canonical =
+      std::fs::canonicalize(supplied).map_err(|source| super::SourceError::RootUnavailable {
+        root: supplied.to_path_buf(),
+        source,
+      })?;
+    let root_fd = pin_root(&canonical)?;
+    require_statx(root_fd.as_fd(), &canonical)?;
+    if root_is_remote(&root_fd, &canonical)? {
+      return Err(super::SourceError::RootUnavailable {
+        root: canonical,
+        source: std::io::Error::new(
+          std::io::ErrorKind::Unsupported,
+          "network and virtual filesystems deliver no reliable events",
+        ),
+      });
+    }
+    let stat = rustix::fs::fstat(&root_fd).map_err(|err| super::SourceError::RootUnavailable {
+      root: canonical.clone(),
+      source: err.into(),
+    })?;
+    let root_mnt_id =
+      root_mount_id(root_fd.as_fd()).map_err(|err| super::SourceError::RootUnavailable {
+        root: canonical.clone(),
+        source: err.into(),
+      })?;
+    let identity = super::RootIdentity::new(stat.st_dev, stat.st_ino.into());
+    let mounts = mounts_under(&canonical).unwrap_or_default();
+    let ancestors = ancestor_identities(&canonical)?;
+    Ok(super::RootMeta {
+      root: canonical,
+      root_dev: stat.st_dev,
+      root_mnt_id,
+      mounts,
+      identity,
+      ancestors,
+      backend: super::BackendKind::Inotify,
+    })
+  }
+
   /// The inotify branch (no probe). `canonical` is the dispatcher's already
   /// canonicalized, already locality-checked root, and `root_fd` its pin — the
   /// inotify barrier reads its root identity from the pin (the same grounded

@@ -652,6 +652,91 @@ struct ScopeState {
   /// [`broadening_delta`] and settle clean over a hole; under-claiming only
   /// costs redundant re-reads.
   settle_floor: Option<Vec<PathBuf>>,
+  /// A same-transport widen's WITNESSED WINDOW (INV-ROOT), open from the
+  /// reservation of the widened root's watch id to the commit gate. The
+  /// reserved watch is pre-armed on the LIVE lane under a Monitor-unknown id,
+  /// so its kernel records would drop silently at the Monitor's unknown-watch
+  /// guard; the inotify lowering (`plan_inotify`) intercepts them HERE
+  /// instead — before the guard: a death record taints the window, benign
+  /// churn is counted and left to the post-commit cold read. Every scope loss signal ([`on_root_overflow`](DriverCore::on_root_overflow))
+  /// taints too — a loss may have carried the death records themselves. The
+  /// commit ([`on_root_widened`](DriverCore::on_root_widened)) consumes the
+  /// window and refuses a tainted one into the stream-replace fallback, so
+  /// the barrier never certifies over a binding whose window was not
+  /// provably clean — verification by witness, never by an out-of-band
+  /// identity sample (which cannot distinguish a live watch from an IGNORED
+  /// one over a same-identity rebind).
+  pending_widen: Option<PendingWiden>,
+}
+
+/// The witnessed window of one pending same-transport widen (INV-ROOT): the
+/// reserved root's binding is provably live at the commit iff the window saw
+/// neither a reserved death record nor a scope loss signal. Created by
+/// [`begin_widen_watch`](DriverCore::begin_widen_watch) BEFORE the pre-arm
+/// dispatch (so no reserved-attributed record can predate it), consumed by the
+/// commit gate, cleared by [`abort_widen_watch`](DriverCore::abort_widen_watch)
+/// on a failed pre-arm and by [`on_root_replaced`](DriverCore::on_root_replaced)
+/// when the fallback replace commits over it.
+#[derive(Debug)]
+struct PendingWiden {
+  /// The reserved root [`WatchId`] the pre-arm bound on the live lane.
+  reserved: WatchId,
+  /// The witness verdict: `Some` once the window tainted. First cause wins —
+  /// the earliest signal is the one that ended the window's cleanliness.
+  tainted: Option<TaintCause>,
+  /// Benign (non-death) reserved records the latch consumed — the churn the
+  /// post-commit cold read converges. Diagnostic surface for the fallback.
+  benign: u32,
+}
+
+impl PendingWiden {
+  fn taint(&mut self, cause: TaintCause) {
+    self.tainted.get_or_insert(cause);
+  }
+}
+
+/// Why a witnessed widen window tainted (INV-ROOT) — the diagnostic the
+/// fallback carries, mirroring the transport `Fatal`'s carried class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaintCause {
+  /// The reserved root's own death record: `Ignored` (⊇ unmount), `MoveSelf`,
+  /// or `DeleteSelf`, attributed to the reserved watch inside the window.
+  RootDeath(RecordKind),
+  /// A transport loss signal for the scope (overflow, decode loss, budget
+  /// refusal) — the window may have lost the death records themselves, so it
+  /// can no longer witness their absence.
+  Loss,
+}
+
+/// A tainted window's diagnostics, carried on the commit refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WidenTaint {
+  /// What ended the window's cleanliness.
+  pub(crate) cause: TaintCause,
+  /// How many benign reserved records the latch consumed before the verdict.
+  pub(crate) benign: u32,
+}
+
+/// How [`on_root_widened`](DriverCore::on_root_widened) disposed of a
+/// same-transport widen commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum WidenCommit {
+  /// The splice applied; the widen is live on the same transport.
+  Committed,
+  /// The witnessed window tainted (INV-ROOT): a reserved death record or a
+  /// scope loss signal landed between the reservation and this commit, so
+  /// the binding cannot be proven live. Core and Monitor are untouched
+  /// except that the spent window is consumed; the caller disarms the
+  /// pre-armed descriptor and falls back to the general stream replace,
+  /// whose spawn barrier re-establishes the binding from scratch. A
+  /// LEGITIMATE outcome, never a driver bug.
+  TaintedWindow(WidenTaint),
+  /// A violated precondition on a path the driver's gates make unreachable —
+  /// core and Monitor bit-identical (the window entry included), the caller
+  /// treats it loudly and falls back to the stream replace, whose commit
+  /// clears the leftover window.
+  Refused,
 }
 
 impl ScopeState {
@@ -812,6 +897,7 @@ impl DriverCore {
         liveness_deadline: None,
         applied_cover: None,
         settle_floor: None,
+        pending_widen: None,
       },
     );
     self.watch_scopes.insert(watch, scope);
@@ -1126,11 +1212,25 @@ impl DriverCore {
   /// window resets the floor to the now-truthful `applied_cover`. Either way
   /// the scope's fence entry — pending fences and loss memory — is cleared:
   /// no fence state outlives its settle.
+  /// The settle-fence gate: exactly the Monitor's barrier predicate
+  /// ([`Monitor::coverage_settled`]), with no core-side conjunct. The widen
+  /// window needs none: pre-commit, fences certify the OLD world, whose
+  /// coverage is genuinely live and unchanged (the zero-gap half); the commit
+  /// itself is gated on the witnessed window (INV-ROOT —
+  /// [`on_root_widened`](Self::on_root_widened)), so by the time a fence can
+  /// consult this gate over the widened world the binding was proven live at
+  /// the commit or the widen fell back to a fresh spawn barrier. A scope with
+  /// no state resolves through the teardown fold below, never through this
+  /// gate.
+  fn barrier_settled(&self, scope: ScopeId) -> bool {
+    self.monitor.coverage_settled(scope)
+  }
+
   pub(crate) fn poll_cover_settlements(&mut self) -> Vec<(FenceId, CoverSettle)> {
     let mut settled = std::mem::take(&mut self.settled_covers);
     let scopes: Vec<ScopeId> = self.cover_fences.keys().copied().collect();
     for scope in scopes {
-      if !self.monitor.coverage_settled(scope) {
+      if !self.barrier_settled(scope) {
         continue;
       }
       let Some(entry) = self.cover_fences.remove(&scope) else {
@@ -1496,6 +1596,12 @@ impl DriverCore {
     // cross-world so its completion (liveness verdict included) is discarded
     // rather than judging the new identity by the old object.
     state.refresh_world_stale = state.refresh_pending;
+    // A replace commit ends any witnessed widen window outright: the fallback
+    // route lands here with the tainted (or refused) window still recorded,
+    // and the replacement's own spawn barrier re-established the binding from
+    // scratch — leaking the dead window would poison a FUTURE widen's
+    // reservation (INV-ROOT leg (i)).
+    state.pending_widen = None;
     state.mounts_authoritative = false;
     Self::arm_refresh(&mut self.effects, scope, state);
 
@@ -1529,6 +1635,260 @@ impl DriverCore {
     self.scopes.get(&scope).map(|state| state.watch)
   }
 
+  /// A live scope's canonical root — the commit-time authority the driver's
+  /// widen predicate (old ⊂ new) compares against.
+  pub(crate) fn root_path(&self, scope: ScopeId) -> Option<Arc<PathBuf>> {
+    self.scopes.get(&scope).and_then(|state| state.root.clone())
+  }
+
+  /// A live scope's mount frame `(root_dev, root_mnt_id)` — the same-frame
+  /// conjunct of the widen predicate: the enumerate lowering marks any entry
+  /// across the scope's frame [`FileKind::Other`] and the reconcile drops the
+  /// watch in such a slot, so widening over a differing frame would actively
+  /// tear the adopted coverage down. `None` for a scope with no live stream.
+  pub(crate) fn root_frame(&self, scope: ScopeId) -> Option<(u64, Option<u64>)> {
+    self
+      .scopes
+      .get(&scope)
+      .and_then(|state| state.root_dev.map(|dev| (dev, state.root_mnt_id)))
+  }
+
+  /// Mints the watch id a same-transport widen pre-arms on the LIVE port
+  /// before its commit — see [`Monitor::reserve_watch_id`].
+  pub(crate) fn reserve_watch_id(&mut self) -> WatchId {
+    self.monitor.reserve_watch_id()
+  }
+
+  /// Opens the witnessed window for a same-transport widen (INV-ROOT): from
+  /// this instant every record the transport attributes to `reserved` is
+  /// intercepted by the inotify lowering (a death record taints, benign churn
+  /// is counted) and every scope loss signal taints — so the commit gate can
+  /// prove, not sample, that the reserved binding is still live. MUST be
+  /// called before the pre-arm is dispatched: the reader registers the kernel
+  /// wd against `reserved` at arm execution, and no attributed record may
+  /// predate the window that witnesses it. Single-flight per scope (the
+  /// driver's `replace_states` already serializes replaces).
+  pub(crate) fn begin_widen_watch(&mut self, scope: ScopeId, reserved: WatchId) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    debug_assert!(
+      state.pending_widen.is_none(),
+      "replaces are single-flight per scope; a stale window may not leak into a fresh widen"
+    );
+    state.pending_widen = Some(PendingWiden {
+      reserved,
+      tainted: None,
+      benign: 0,
+    });
+  }
+
+  /// Closes a witnessed window whose widen will not commit — a failed or
+  /// retired pre-arm, or the loud impossible-path fallback. Idempotent; a
+  /// scope torn down meanwhile has no state and nothing to clear (the window
+  /// died with it).
+  pub(crate) fn abort_widen_watch(&mut self, scope: ScopeId) {
+    if let Some(state) = self.scopes.get_mut(&scope) {
+      state.pending_widen = None;
+    }
+  }
+
+  /// Commits a same-transport WIDEN on a live descending scope: the world meta
+  /// swaps to the new (containing) root and the Monitor splices the new root
+  /// ABOVE the old one ([`Monitor::widen_root`]) — the old subtree's watches,
+  /// states, reads, move halves, and deficits all ride across untouched on the
+  /// unchanged stream, which is the zero-gap guarantee. Deliberately absent,
+  /// each a loss signal the D1 replace commit
+  /// ([`on_root_replaced`](Self::on_root_replaced)) must produce and this
+  /// commit must NOT: no park/probe/enumerate cut (the inotify lowering parks
+  /// nothing and its watch-anchored records are immune to the root flip), no
+  /// covering `Rescan`, no epoch bump, no cover-claim reset (`applied_cover`
+  /// keeps the old claim — resetting to `None` would claim full coverage over
+  /// regions a prior `set_cover` pruned, and the next reconcile's broadening
+  /// delta against `None` would grow nothing over the hole; keeping it merely
+  /// under-claims the freshly-armed slice, the safe direction).
+  ///
+  /// The caller (the driver's widen commit) has ALREADY armed `reserved` on
+  /// the live transport and replays that outcome via
+  /// [`on_watch_installed`](Self::on_watch_installed) immediately after this
+  /// input; the replay's cold enumerate discovers the newly covered ground as
+  /// `Created`s — a birth-equivalent window, dominated by nothing.
+  ///
+  /// Returns how the commit was disposed of ([`WidenCommit`]).
+  /// [`TaintedWindow`](WidenCommit::TaintedWindow) is the witnessed-window
+  /// gate (INV-ROOT): a reserved death record or a scope loss signal landed
+  /// between the reservation and this commit, so the reserved binding cannot
+  /// be proven live — the splice is refused with the core and Monitor
+  /// untouched except for the spent window, and the caller (which owes no
+  /// loudness — this is a legitimate outcome) disarms the pre-armed
+  /// descriptor and falls back to the general stream replace, re-establishing
+  /// the binding through a fresh spawn barrier.
+  /// [`Refused`](WidenCommit::Refused) — a violated precondition on a path
+  /// the driver's gates make unreachable — leaves the core and the Monitor
+  /// bit-identical, the window entry included (every refusal is decided
+  /// before the first mutation), and the caller MUST treat it loudly: the
+  /// widen falls back to the general stream replace (the driver clears the
+  /// leftover window and keeps the registry on the OLD root — the widened
+  /// entry publishes only after a `Committed`). A silent `Ok` over a refused
+  /// splice would be a registry/core root divergence on the barrier-honesty
+  /// path.
+  pub(crate) fn on_root_widened(
+    &mut self,
+    scope: ScopeId,
+    meta: RootMeta,
+    reserved: WatchId,
+    now: Instant,
+  ) -> WidenCommit {
+    let liveness = self.root_liveness_interval;
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return WidenCommit::Refused;
+    };
+    // The witnessed-window gate (INV-ROOT), FIRST: the window verdict is
+    // prior to the splice's shape — a tainted window refuses regardless of
+    // how well-formed the commit is, because the thing being committed (the
+    // reserved binding) can no longer be proven live. Only the taint verdict
+    // consumes the window (its defined semantics: the window is spent, the
+    // fallback re-establishes); every later refusal leaves it intact for the
+    // fallback commit to clear, preserving the bit-identical contract.
+    match &state.pending_widen {
+      Some(pending) if pending.reserved != reserved => {
+        debug_assert!(false, "the committed reservation is the window's own");
+        return WidenCommit::Refused;
+      }
+      Some(pending) => {
+        if pending.tainted.is_some() {
+          let spent = state.pending_widen.take().expect("just observed Some");
+          return WidenCommit::TaintedWindow(WidenTaint {
+            cause: spent.tainted.expect("just observed tainted"),
+            benign: spent.benign,
+          });
+        }
+      }
+      None => {
+        debug_assert!(false, "a widen commit follows its begin_widen_watch");
+        return WidenCommit::Refused;
+      }
+    }
+    debug_assert!(
+      !state.profile.is_kernel_recursive() && state.profile == meta.backend,
+      "a widen never crosses profiles or backends"
+    );
+    // The inotify lowering settles every batch inline (no probes, no park), so
+    // there is no compiled old-root-relative state to cut or re-base. A future
+    // probing/parking descending backend must revisit this keep-list.
+    debug_assert!(
+      state.park.active.is_none() && state.park.queued.is_empty(),
+      "the descending profile parks nothing"
+    );
+
+    // The adopted chain: the old root's location relative to the new root. The
+    // driver validated strict containment and UTF-8 before dispatching the
+    // pre-arm; re-derive defensively and refuse untouched on any violation —
+    // the driver falls back to the stream replace, whose commit publishes
+    // spawn-minted truth (the registry still names the old root: the widened
+    // entry publishes only after this commit succeeds).
+    let Some(old_root) = state.root.clone() else {
+      return WidenCommit::Refused;
+    };
+    let Ok(rel) = old_root.strip_prefix(meta.root.as_path()) else {
+      debug_assert!(false, "the driver routes only strict widens here");
+      return WidenCommit::Refused;
+    };
+    let mut chain = Vec::new();
+    for component in rel.components() {
+      let std::path::Component::Normal(os) = component else {
+        debug_assert!(
+          false,
+          "a canonical strict suffix has only normal components"
+        );
+        return WidenCommit::Refused;
+      };
+      let Some(name) = os.to_str() else {
+        debug_assert!(false, "the driver refuses a non-UTF-8 chain");
+        return WidenCommit::Refused;
+      };
+      chain.push(Segment::new(name));
+    }
+    if chain.is_empty() {
+      debug_assert!(false, "the driver refuses an equal-root widen");
+      return WidenCommit::Refused;
+    }
+    let rel_location = Location::from_segments(chain.iter().cloned());
+    // The adopted node's identity, in the enumerate-mint space (the bare inode
+    // — see `mint`): the old root sits on the scope's own device by the widen
+    // predicate, so the device-trust gate is satisfied by construction.
+    let old_identity = state
+      .identity
+      .and_then(|id| u64::try_from(id.ino()).ok())
+      .and_then(NonZeroU64::new)
+      .map(Identity::new);
+    if self
+      .monitor
+      .widen_root(scope, reserved, chain, old_identity)
+      .is_none()
+    {
+      debug_assert!(false, "a live descending scope accepts its widen splice");
+      return WidenCommit::Refused;
+    }
+
+    // Watch bookkeeping: the new root joins the maps, the old subtree's
+    // entries stay — `watch_paths` are absolute, so nothing is rewritten.
+    let root = Arc::new(meta.root);
+    self.watch_scopes.insert(reserved, scope);
+    self.watch_paths.insert(reserved, Arc::clone(&root));
+    state.watch = reserved;
+
+    // The world swap — the same adoption `on_root_replaced` performs, minus
+    // every cut: the new root is a different object, so mount trust fails
+    // closed until the refresh this arms completes, and an in-flight refresh
+    // was addressed to the OLD root and must be discarded on completion.
+    state.root = Some(root);
+    state.root_dev = Some(meta.root_dev);
+    state.root_mnt_id = meta.root_mnt_id;
+    state.identity = Some(meta.identity);
+    state.mounts = meta.mounts;
+    state.refresh_world_stale = state.refresh_pending;
+    // The witnessed window is CONSUMED by the commit (INV-ROOT): it was clean
+    // through the taint gate above, the splice landed, and from here the
+    // reserved id is a KNOWN root — its death records run the ordinary
+    // in-band funnel, so the commit is a regime boundary, never a flush (a
+    // death record still queued at this instant invalidates the widened root
+    // honestly when it drains). The proof the window discharges: the pre-arm
+    // bound the right object (open-verify-install + the post-arm bracket), a
+    // binding bound right that later dies or moves emits a death record or
+    // its loss is signalled, and neither happened — so the binding is live
+    // and correctly placed NOW, with no out-of-band sample consulted.
+    state.pending_widen = None;
+    Self::trust_lost(&mut self.effects, scope, state);
+    Self::arm_liveness(state, liveness, now);
+
+    // The one re-base: a lag-parked Rescan was minted against the old root and
+    // may be LOCATED (a deficit re-signal, an incomplete read); delivered
+    // post-commit it rides the NEW delivery root, so its location gains the
+    // adopted prefix. (D1 never needs this — its commit parks a fresh
+    // dominating ROOT Rescan whose location is empty.)
+    if let LagState::Lagged {
+      parked: Some(change),
+      ..
+    } = &mut state.lag
+    {
+      debug_assert!(change.kind().is_rescan(), "only Rescans park under lag");
+      *change = Change::new(
+        change.id(),
+        scope,
+        rel_location.clone().join(change.location()),
+        change.kind().clone(),
+        change.epoch(),
+      );
+    }
+
+    // The chain arms and the replayed root arm's cold read lower through the
+    // ordinary drain — the live port is the attached port, so no transport
+    // work exists here at all.
+    self.drain_monitor();
+    WidenCommit::Committed
+  }
+
   /// Feeds a transport-level loss signal for `scope` (a dropped batch, the
   /// handle's overflow latch): parked work is dominated and dropped, and the
   /// Monitor turns the loss into an epoch-bumped `Rescan`.
@@ -1536,6 +1896,15 @@ impl DriverCore {
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;
     };
+    // The witnessed window's loss leg (INV-ROOT): a loss inside the widen
+    // window may have carried the reserved root's own death records, so the
+    // window can no longer witness their absence — taint it (coarse by
+    // design: attribution of a loss is unknowable, so any scope loss taints).
+    // The tainted commit falls back to the stream replace, whose covering
+    // Rescan + fresh spawn barrier own the lost window anyway.
+    if let Some(pending) = state.pending_widen.as_mut() {
+      pending.taint(TaintCause::Loss);
+    }
     state.park.active = None;
     state.park.queued.clear();
     Self::trust_lost(&mut self.effects, scope, state);
@@ -1643,8 +2012,15 @@ impl DriverCore {
       self.drain_monitor();
       return;
     }
-
-    // The root is alive past the death gate. The stale gate governs EVERYTHING this
+    // Alive past the death gate. Deliberately NOT a barrier release edge: a
+    // single-sample identity match proves the PATH still names the same
+    // object, never that OUR watch is still its live binding (a same-identity
+    // unmount+rebind passes it with the watch IGNORED), so no settle fence
+    // may read anything from this positive. The widen's binding is proven at
+    // its commit by the witnessed window instead (INV-ROOT); this gate's sole
+    // job is the negative verdict above — a mismatch runs the death funnel.
+    //
+    // The stale gate governs EVERYTHING this
     // snapshot carries — the mount-TABLE install below AND the descent FRAME adopted
     // after it. A newer loss overlapped this read, so its snapshot may predate the
     // lost window; `refresh_mounts` reads the table and re-stats the frame in ONE

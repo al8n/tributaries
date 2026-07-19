@@ -10,7 +10,9 @@ use tributary_proto::{MoveCookie, OsRecord, RecordKind, Scope, Segment, WatchId}
 
 use crate::os::linux::{RawInotifyEvent, RawLinuxEvent};
 
-use super::super::{DriverCore, Item, PendingBatch, Planned, ScopeId, ScopeState, located};
+use super::super::{
+  DriverCore, Item, PendingBatch, Planned, ScopeId, ScopeState, TaintCause, located,
+};
 
 impl DriverCore {
   /// Lowers one inotify batch. Every item is immediate (`awaiting == 0`), so
@@ -48,7 +50,7 @@ impl DriverCore {
 
 /// Plans one attributed inotify record, fanned out per anchor.
 fn plan_inotify(
-  state: &ScopeState,
+  state: &mut ScopeState,
   scope: ScopeId,
   anchors: &[WatchId],
   event: &RawInotifyEvent,
@@ -63,6 +65,29 @@ fn plan_inotify(
   }
   let mut planned = Vec::with_capacity(anchors.len());
   for &anchor in anchors {
+    // The witnessed window's record leg (INV-ROOT): a record attributed to a
+    // pending widen's RESERVED root is consumed HERE — before the Monitor's
+    // unknown-watch guard would drop it silently. A death record (`Ignored`
+    // ⊇ unmount, `MoveSelf`, `DeleteSelf`) taints the window, so the commit
+    // gate refuses the same-fd splice and the fallback's spawn barrier
+    // re-establishes the binding; benign churn is counted and converges
+    // through the post-commit cold read exactly as it always did. Nothing is
+    // ever planned for the reserved anchor — pre-commit it has no node, and
+    // the taint is the record's entire meaning.
+    if let Some(pending) = state.pending_widen.as_mut()
+      && pending.reserved == anchor
+    {
+      if mask.is_ignored() || mask.unmount() {
+        pending.taint(TaintCause::RootDeath(RecordKind::Ignored));
+      } else if mask.move_self() {
+        pending.taint(TaintCause::RootDeath(RecordKind::MoveSelf));
+      } else if mask.delete_self() {
+        pending.taint(TaintCause::RootDeath(RecordKind::DeleteSelf));
+      } else {
+        pending.benign = pending.benign.saturating_add(1);
+      }
+      continue;
+    }
     // Self-events first: they carry no name and resolve the watch itself.
     // An unmount ends the watch's coverage exactly like the kernel's own
     // trailing IN_IGNORED (which then finds the node already gone — a no-op).
@@ -107,7 +132,6 @@ fn plan_inotify(
     }
     planned.push(Planned::Rec(rec));
   }
-  let _ = state;
   planned
 }
 

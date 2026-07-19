@@ -924,13 +924,27 @@ impl<R> Watcher<R> {
 
   /// Replaces `root`'s coverage with `new_root` — the sanctioned transition
   /// between disjoint coverage states (the canonical case: widening `/a/b`
-  /// to `/a`). The `RootHandle`, scope, and epoch stream survive; on
-  /// kernel-recursive backends the swap is make-before-break (the new
-  /// stream is live before the old one is retired), and the commit delivers
-  /// one epoch-bumped full-root `Rescan` instructing the consumer to
-  /// re-read the widened world — which covers the swap window and the newly
-  /// covered delta alike. Locations are relative to
-  /// [`root_path(handle)`](Self::root_path) at delivery time.
+  /// to `/a`). The `RootHandle`, scope, and epoch stream survive. Two commit
+  /// shapes:
+  ///
+  /// - **A WIDENING replace on the descending (inotify) backend** — the old
+  ///   root strictly inside the new, same mount frame — is CONTINUOUS: the
+  ///   live stream is kept and the new root adopted above the old one, so
+  ///   coverage of the old subtree never gaps, no covering `Rescan` is
+  ///   emitted, no epoch is bumped, and every change recorded before the
+  ///   swap is still individually delivered (a
+  ///   [`sync_root`](Self::sync_root) barrier across the widen resolves by
+  ///   delivery, not domination). The newly covered ground is announced as
+  ///   `Created` discovery, exactly like a fresh watch's initial crawl.
+  /// - **Every other replace** (kernel-recursive backends, and disjoint or
+  ///   narrowing targets on the descending backend) is make-before-break:
+  ///   the new stream is live before the old one is retired, and the commit
+  ///   delivers one epoch-bumped full-root `Rescan` instructing the consumer
+  ///   to re-read the (re-rooted) world — which covers the swap window and
+  ///   the newly covered delta alike.
+  ///
+  /// Locations are relative to [`root_path(handle)`](Self::root_path) at
+  /// delivery time.
   ///
   /// Atomic-on-failure: every error leaves the old root's coverage
   /// untouched. NOT cancel-abortive: the reservation travels with the

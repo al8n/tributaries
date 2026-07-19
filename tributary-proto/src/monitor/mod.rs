@@ -451,6 +451,28 @@ pub struct Monitor {
   /// [`coverage_settled`](Self::coverage_settled). Removal mirrors
   /// [`pending_enumerate`](Self::pending_enumerate) removal exactly.
   latent_cold: BTreeMap<ReqId, ScopeId>,
+  /// Unverified same-transport adoption edges: a widen re-keyed the scope's
+  /// OLD root under this NAME at a freshly-minted chain parent whose kernel
+  /// watch was not yet armed at the re-key, so a slot mutation in that window
+  /// is recorded by nobody. Keyed by the chain parent, whose first complete
+  /// read must positively re-confirm the edge (the adopted node's own
+  /// `identity` carries the expected object). Consumed by
+  /// [`resolve_adoption`](Self::resolve_adoption); an entry also dies with its
+  /// keyed node (`drop_subtree`) and with a root rebind
+  /// ([`rebind_root`](Self::rebind_root) — the depth-one widen keys the marker
+  /// on the surviving root itself). Every removal funnels through
+  /// `take_adoption_marker` so the settle counter below cannot drift.
+  pending_adoptions: BTreeMap<WatchId, Segment>,
+  /// Per-scope count of unverified adoption edges — the O(1) backing for the
+  /// adoptions conjunct of [`coverage_settled`](Self::coverage_settled). An
+  /// unverified edge is coverage the barrier must not certify: until the
+  /// tail's first complete read confirms it (or a mismatch/erasure stands its
+  /// covering signal), a change under the adopted subtree may have mutated
+  /// the UNWATCHED chain — recorded by nobody — so a sync cookie dispatched
+  /// over the window could resolve delivered across an undelivered
+  /// transition. Mirrors [`pending_adoptions`](Self::pending_adoptions)
+  /// membership exactly (asserted by the test invariant checker).
+  adopting_by_scope: BTreeMap<ScopeId, usize>,
 
   actions: VecDeque<Action>,
   events: VecDeque<Change>,
@@ -481,6 +503,8 @@ impl Monitor {
       deficits: BTreeMap::new(),
       held_by_scope: BTreeMap::new(),
       latent_cold: BTreeMap::new(),
+      pending_adoptions: BTreeMap::new(),
+      adopting_by_scope: BTreeMap::new(),
       actions: VecDeque::new(),
       events: VecDeque::new(),
     }
@@ -814,8 +838,145 @@ impl Monitor {
     if let Some(node) = self.nodes.get_mut(&root) {
       node.identity = None;
     }
+    // A depth-one widen keys its adoption marker on the ROOT itself, which this
+    // rebind keeps — purge it, or a stale marker would fire on the rebound
+    // root's next cold read. Chain-keyed markers died with the children above.
+    // The rebind's own commit `Rescan` (the caller emits it) owns coverage.
+    let _ = self.take_adoption_marker(root, scope);
     self.settle_bridges();
     Some(root)
+  }
+
+  /// Mints a fresh [`WatchId`] with NO node behind it — the handle a driver
+  /// pre-arms on a LIVE transport before a same-transport widen commit
+  /// ([`widen_root`](Self::widen_root)). Records arriving for the id before the
+  /// commit are dropped by the unknown-watch guard (coverage of the widened
+  /// ground contractually begins at the commit; the post-commit cold read
+  /// converges everything the drop skipped). Ids are never reused, so an
+  /// abandoned reservation burns an integer and nothing else — there is no
+  /// node to unwind, which is what keeps a failed pre-arm perfectly atomic.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn reserve_watch_id(&mut self) -> WatchId {
+    WatchId::new(self.watch_ids.mint())
+  }
+
+  /// Commits a same-transport WIDEN of `scope`'s root: mints `reserved` (a
+  /// [`reserve_watch_id`](Self::reserve_watch_id) handle the driver has ALREADY
+  /// armed on the live transport) as the scope's new root ABOVE the current
+  /// one, mints the connecting chain named by `chain` (the old root's location
+  /// relative to the new root, top-down, non-empty), and ADOPTS the old root
+  /// node at the chain's tail — a single O(depth) edge splice that touches no
+  /// old-subtree node, disarms nothing, purges nothing, bumps no epoch, and
+  /// emits no change. That is the zero-gap half of the descending widen: every
+  /// old watch keeps recording on the unchanged transport, and every delivery
+  /// reconstructs through the new chain at its unchanged absolute path.
+  ///
+  /// What changes, exhaustively: the new root and chain nodes are inserted
+  /// (each chain node an ordinary cold pending-arm child with its
+  /// `Action::Watch` queued; the new root queues NOTHING — the caller
+  /// replays its pre-arm outcome via [`on_watch_result`](Self::on_watch_result),
+  /// whose post-arm COLD enumerate discovers the newly covered ground as
+  /// `Created`s), the old root's `parent`/`name` re-key under the tail, its
+  /// node identity becomes `old_identity` (the replaced world's root identity —
+  /// children carry identities, and the first read of the tail verifies the
+  /// edge against it), and `roots` re-points. Everything else — the old
+  /// subtree's states and children, pending enumerates, pending move halves,
+  /// held sources, the deficit book, the bridge window, the scope's epoch,
+  /// interest, and profile — is deliberately untouched: the old world did not
+  /// end, so nothing of it may be discharged.
+  ///
+  /// The chain's kernel watches arm strictly AFTER this splice, so a slot
+  /// mutation in that window is recorded by nobody; the adoption marker minted
+  /// here makes the tail's first complete read re-confirm the adopted edge and
+  /// escalate loudly on any mismatch (`resolve_adoption`) rather than trust a
+  /// silently stale reconstruction.
+  ///
+  /// Returns the new root's id (`reserved`), or `None` for an unknown scope, a
+  /// [`kernel_recursive`](Capabilities::kernel_recursive) one (a KR widen has
+  /// no per-directory book — the stream swap owns it), an empty `chain`, or a
+  /// `reserved` id that already names a node (all driver bugs, refused rather
+  /// than corrupting the tree). Every `None` is decided strictly BEFORE the
+  /// first mutation, so a refused widen leaves the Monitor bit-identical and
+  /// the caller free to fall back to the stream replace; past that point the
+  /// splice is infallible by construction and any broken invariant panics
+  /// loudly rather than committing a partial tree.
+  pub fn widen_root(
+    &mut self,
+    scope: ScopeId,
+    reserved: WatchId,
+    chain: std::vec::Vec<Segment>,
+    old_identity: Option<Identity>,
+  ) -> Option<WatchId> {
+    let old_root = *self.roots.get(&scope)?;
+    if !self.scope_descends(scope) {
+      return None;
+    }
+    // An empty chain would make old and new the same node — not a widen.
+    let (last, connectors) = chain.split_last()?;
+    if self.nodes.contains_key(&reserved) {
+      debug_assert!(false, "a reserved widen id is never a live node");
+      return None;
+    }
+    // The new root: a plain parentless directory node, cold-arming. Born
+    // through the standard funnel (non-re-arm: no counter, no bridge bit) and
+    // WITHOUT a queued watch action — the driver already holds its arm outcome.
+    self.insert_node(
+      reserved,
+      WatchNode {
+        parent: None,
+        name: None,
+        scope,
+        is_dir: true,
+        identity: None,
+        state: NodeState::Arming { rearm: false },
+        children: BTreeSet::new(),
+      },
+    );
+    // The connecting chain, top-down, as ordinary cold discoveries: each queues
+    // its arm through the normal control path (the live port is the attached
+    // port — no transport special-casing), and each cold read announces the
+    // genuinely new ground as `Created` (a re-arm flavor would suppress the
+    // announcements with no covering `Rescan` standing — silent loss).
+    // Top-down order also lets the driver derive each child's absolute path
+    // from a parent already recorded in the same drain.
+    let mut tail = reserved;
+    for seg in connectors {
+      self.install_child(tail, scope, seg.clone(), true, None);
+      // Infallible by construction: the parent was minted THIS call with an
+      // empty slot, so `install_child` cannot have skipped. Every refusal this
+      // method can report (`None`) happens strictly BEFORE the first mutation;
+      // past that point a broken invariant must be a loud panic, never a
+      // silently partial splice a release build would carry forward.
+      tail = self
+        .child_watch(tail, seg)
+        .expect("a fresh chain slot always installs");
+    }
+    // adopt_child: re-key the old root under the tail. `reparent` is the
+    // existing O(1) move splice; its stale-destination and inheritance branches
+    // are vacuous here (the tail's slot is freshly minted and empty), and the
+    // acyclic precondition holds trivially (the tail is not in the old
+    // subtree). The old root's state and children ride along untouched.
+    // Infallible by the same argument as the chain mints: both endpoints were
+    // fetched or minted this call — loud beats partial.
+    debug_assert!(self.can_reparent(old_root, tail));
+    debug_assert!(!self.child_index.contains_key(&(tail, last.clone())));
+    assert!(
+      self.reparent(old_root, tail, last.clone()),
+      "both splice endpoints are live by construction"
+    );
+    if let Some(node) = self.nodes.get_mut(&old_root) {
+      node.identity = old_identity;
+    }
+    self.roots.insert(scope, reserved);
+    // The dark-window tripwire: the tail's first complete read must
+    // re-confirm the adopted edge (see the type doc and `resolve_adoption`).
+    // The marker also holds [`coverage_settled`](Self::coverage_settled) down
+    // from this instant, so a sync cookie cannot dispatch over the unverified
+    // window — the connecting arms and reads are deliberately cold and would
+    // otherwise leave the barrier nothing to wait on.
+    self.record_adoption_marker(tail, last.clone(), scope);
+    self.settle_bridges();
+    Some(reserved)
   }
 
   /// Whether `scope` has no outstanding re-arm work: no node of the scope is
@@ -842,17 +1003,26 @@ impl Monitor {
   /// Whether `scope` is settled for BARRIER purposes: no counted re-arm work
   /// ([`rearm_settled`](Self::rearm_settled)), no detached-and-held move
   /// source (whose suppressed records' covering `Rescan` has not been emitted
-  /// yet — it is owed only at the hold's pairing or timeout resolution), and
-  /// no in-flight cold read carrying a coalesced re-arm obligation (the one
+  /// yet — it is owed only at the hold's pairing or timeout resolution), no
+  /// in-flight cold read carrying a coalesced re-arm obligation (the one
   /// latency `rearm_settled` deliberately does not count; its completion
-  /// escalates into a covering `Rescan` plus a counted retry). A fence built
-  /// on the bare re-arm predicate would settle inside either window and
-  /// dispatch a sync cookie no covering `Rescan` precedes. Trivially `true`
-  /// for a kernel-recursive scope (none of the three states is reachable) and
-  /// for an unknown or torn-down one.
+  /// escalates into a covering `Rescan` plus a counted retry), and no
+  /// UNVERIFIED same-transport adoption edge (a widen's connecting chain is
+  /// deliberately cold — uncounted by the re-arm predicate — yet until the
+  /// tail's first complete read verifies the adopted edge, a chain mutation
+  /// from the commit's dark window may still be both unrecorded and
+  /// unsignalled; the marker releases only at positive verification or
+  /// together with the mismatch's covering `Rescan`/re-arm/deficit). A fence
+  /// built on the bare re-arm predicate would settle inside any of these
+  /// windows and dispatch a sync cookie no covering `Rescan` precedes.
+  /// Trivially `true` for a kernel-recursive scope (none of the four states
+  /// is reachable) and for an unknown or torn-down one.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn coverage_settled(&self, scope: ScopeId) -> bool {
-    self.rearm_settled(scope) && self.holds_settled(scope) && self.latent_settled(scope)
+    self.rearm_settled(scope)
+      && self.holds_settled(scope)
+      && self.latent_settled(scope)
+      && self.adoptions_settled(scope)
   }
 
   /// Whether `scope` has a standing terminal coverage deficit: an arm-refused
@@ -887,6 +1057,34 @@ impl Monitor {
   /// Whether `scope` has no detached-and-held move source. O(1).
   fn holds_settled(&self, scope: ScopeId) -> bool {
     !self.held_by_scope.contains_key(&scope)
+  }
+
+  /// Whether `scope` has no unverified same-transport adoption edge. O(1).
+  fn adoptions_settled(&self, scope: ScopeId) -> bool {
+    !self.adopting_by_scope.contains_key(&scope)
+  }
+
+  /// Records the widen's unverified adoption edge at its chain parent — the
+  /// one insert site, paired with [`take_adoption_marker`](Self::take_adoption_marker).
+  fn record_adoption_marker(&mut self, parent: WatchId, name: Segment, scope: ScopeId) {
+    let evicted = self.pending_adoptions.insert(parent, name);
+    debug_assert!(evicted.is_none(), "widen tails are freshly minted");
+    *self.adopting_by_scope.entry(scope).or_insert(0) += 1;
+  }
+
+  /// Removes the adoption marker keyed at `parent` (if any), keeping the
+  /// per-scope settle counter in lockstep — the ONE removal funnel, so no
+  /// path can release the barrier conjunct without going through it.
+  fn take_adoption_marker(&mut self, parent: WatchId, scope: ScopeId) -> Option<Segment> {
+    let name = self.pending_adoptions.remove(&parent)?;
+    match self.adopting_by_scope.get_mut(&scope) {
+      Some(count) if *count > 1 => *count -= 1,
+      Some(_) => {
+        self.adopting_by_scope.remove(&scope);
+      }
+      None => debug_assert!(false, "the adoption counter mirrors the marker map"),
+    }
+    Some(name)
   }
 
   /// Whether `scope` has no in-flight cold read carrying a coalesced re-arm
@@ -1162,6 +1360,11 @@ impl Monitor {
     // `clear_interior_deficit`).
     self.clear_interior_deficit(scope, dir);
 
+    // A pending same-transport adoption edge resolves on this — the parent's
+    // first complete read (an incomplete or dirtied read returned above with
+    // the marker intact, so the bounded retries keep re-checking).
+    self.resolve_adoption(dir, scope, kind, held.is_some(), &res);
+
     match kind {
       // A cold read on a held dir is coverage-only; route it as a re-arm (no `Created`).
       EnumKind::Rearm | EnumKind::Cold if held.is_some() => self.rearm_enumerate(dir, scope, &res),
@@ -1244,7 +1447,18 @@ impl Monitor {
       // permanently-unreadable directory escalates to the standing `Rescan` after a
       // bounded number of tries rather than spinning the driver.
       self.queue_enumerate(dir, EnumKind::Rearm, attempts + 1);
-    } else if deliver {
+      return;
+    }
+    // Retries exhausted with an adoption edge still unverified: hand the
+    // marker to the deficit machinery rather than wedge the barrier — the
+    // standing `Rescan` above plus the interior deficit recorded below ARE
+    // the edge's covering signal now (every later sync re-signals the
+    // darkness before its cookie), whereas a marker kept past the bounded
+    // retries would hold `coverage_settled` down with no read left to ever
+    // release it. A held dir routes the same way: the hold's own pairing
+    // resolution re-scans and re-arms the destination.
+    let _ = self.take_adoption_marker(dir, scope);
+    if deliver {
       // Retries exhausted — the node stays `Live` and the `Rescan` stands. It is
       // re-attempted the next time a reconciliation trigger for its scope re-arms it (a
       // fresh overflow, an ancestor's incomplete read cascading down, or a sync
@@ -1417,6 +1631,64 @@ impl Monitor {
         if let Some(fresh) = self.child_watch(dir, entry.name()) {
           let _ = self.inherit_rearm(fresh);
         }
+      }
+    }
+  }
+
+  /// Resolves a pending same-transport adoption edge against `dir`'s first
+  /// COMPLETE read: the adopted slot's only unwatched window is the widen's
+  /// commit→arm gap, so this one verification closes the no-silent-loss hole
+  /// that gap opens. Every complete read consumes the marker; the outcomes:
+  ///
+  /// - **confirmed** — the adopted node still occupies the slot, the listing
+  ///   names it as a directory, and identity does not POSITIVELY differ
+  ///   (absent identity is never "differs", matching every other reconcile):
+  ///   the edge is verified, silently.
+  /// - **stale edge** — the node occupies the slot but the name vanished from
+  ///   the complete listing or its identity positively differs: the adopted
+  ///   subtree's true path is unknowable (the moved-root problem — its
+  ///   descendants would keep delivering at reconstructed-stale paths), so
+  ///   escalate the scope root: one epoch-bumped covering `Rescan` plus a
+  ///   counted re-arm, whose identity-diffing rebuild replaces the stale edge.
+  ///   Loud, D1-equivalent, never silent.
+  /// - **recorded death** — the adopted node is GONE (its own self-events tore
+  ///   it down mid-window) with no parent watch armed to mint the parent-side
+  ///   `Removed`: stand a located `Rescan` at the vacated slot so the
+  ///   consumer's re-read converges the ghost. A re-occupied slot additionally
+  ///   installs through the caller's ordinary reconcile.
+  ///
+  /// A re-arm-flavored (or held, hence re-arm-routed) completion consumes the
+  /// marker as HANDLED: `rearm_enumerate` prunes a vanished name and
+  /// identity-diffs a survivor itself, which resolves the edge through the
+  /// crawl-rebuild machinery and its own coverage story.
+  fn resolve_adoption(
+    &mut self,
+    dir: WatchId,
+    scope: ScopeId,
+    kind: EnumKind,
+    held: bool,
+    res: &EnumerateResult,
+  ) {
+    let Some(name) = self.take_adoption_marker(dir, scope) else {
+      return;
+    };
+    if kind == EnumKind::Rearm || held {
+      return;
+    }
+    let entry = res.entries().iter().find(|entry| *entry.name() == name);
+    match self.child_watch(dir, &name) {
+      Some(adopted) => {
+        let confirmed = entry
+          .is_some_and(|entry| entry.is_dir() && !self.identity_differs(adopted, entry.node()));
+        if confirmed {
+          return;
+        }
+        if let Some(&root) = self.roots.get(&scope) {
+          self.rescan_and_rearm(scope, root);
+        }
+      }
+      None => {
+        self.emit_rescan(scope, self.location_of(dir).child(name));
       }
     }
   }
@@ -2749,6 +3021,19 @@ impl Monitor {
         self.held_by_scope_dec(node.scope);
       }
       self.dirtied_holds.remove(&id);
+      // An adoption edge awaiting this node's read dies with it — and an
+      // UNVERIFIED adoption is erased COVERAGE, exactly like an erased
+      // deficit: the adopted subtree's watches are being disarmed while its
+      // edge was never positively confirmed, so the disappearance may be
+      // wholly unrecorded (the dark window's mutation had no armed parent to
+      // record it, and the drop's driving signal — a cold listing's slot
+      // reconcile — delivers no re-read instruction of its own). Fold it into
+      // `erased` so the discharge switch below stands the covering signal:
+      // a record/reconcile-driven drop sets both bridge bits (the settle
+      // flush's closing root `Rescan`), a crawl rebuild re-anchors a slot
+      // deficit at the surviving parent, and a terminal teardown or
+      // proven-unsubscribed prune stays silent by its own ownership argument.
+      erased |= self.take_adoption_marker(id, node.scope).is_some();
       // Its deficit anchors die with it; report a real erasure so the one
       // caller with no coverage story of its own can carry the loss (see
       // `drop_node_deficits` / `drop_subtree_for_crawl_rebuild`).
@@ -3343,6 +3628,29 @@ impl Monitor {
         );
       }
     }
+    // Every same-transport adoption marker keys a LIVE directory node of a
+    // DESCENDING scope (`drop_subtree`, `rebind_root`, and the read-resolution
+    // paths reclaim it with its parent). One scope MAY carry several markers
+    // at once — back-to-back widens splice a fresh tail above the previous one
+    // before its first read resolves — but never two on one parent (widen
+    // tails are freshly minted; the map keying enforces it structurally).
+    let mut adopting: BTreeMap<ScopeId, usize> = BTreeMap::new();
+    for parent in self.pending_adoptions.keys() {
+      let node = self
+        .nodes
+        .get(parent)
+        .expect("an adoption marker keys a live node");
+      assert!(node.is_dir, "an adoption marker keys a directory");
+      assert!(
+        self.scope_descends(node.scope),
+        "an adoption marker's scope descends"
+      );
+      *adopting.entry(node.scope).or_insert(0) += 1;
+    }
+    assert_eq!(
+      adopting, self.adopting_by_scope,
+      "the adoption settle counter mirrors the marker map exactly"
+    );
     // Every latent cold read is an outstanding request whose node still names
     // it, reads COLD, was dirtied by the coalesced trigger, and belongs to the
     // recorded scope — the exact mirror of the insert edge.

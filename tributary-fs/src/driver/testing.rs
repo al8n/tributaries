@@ -157,6 +157,15 @@ struct FakeState {
   /// Arms refused because their batch carried a stale (replaced) transport
   /// generation — the observable of the fence, in call order.
   stale_arms: Mutex<Vec<(WatchId, PathBuf)>>,
+  /// `preflight_arm` ENTRIES (bumped before any hold parks the call) — the
+  /// observable that a widen's witnessed window is already OPEN
+  /// (`begin_widen_watch` runs in the same handler that dispatches the
+  /// pre-arm), so a cell can inject a loss provably inside the window.
+  prearm_entries: AtomicUsize,
+  /// `probe` calls executed — the widen cells' observable that the pre-arm's
+  /// post-arm bracket ran, i.e. the `WidenArmed` completion is about to land
+  /// on the op channel (only the `try_send` remains after the probe).
+  probes: AtomicUsize,
   /// Per-directory disarms executed.
   disarms: Mutex<Vec<WatchId>>,
   /// Enumerates executed, in call order.
@@ -179,6 +188,14 @@ struct FakeState {
   /// test can freeze in-flight discovery batches while letting the commit's
   /// pre-arm proceed.
   prearm_hold: Mutex<Option<HoldGate>>,
+  /// When set, `refresh_mounts` parks until the gate releases — the
+  /// root-binding verification cells hold the widen's commit-armed refresh so
+  /// the barrier's unverified window is observable.
+  refresh_hold: Mutex<Option<HoldGate>>,
+  /// A node swapped in AFTER a `preflight_arm` executes but BEFORE its
+  /// post-arm re-stat — the deterministic model of a root replaced between
+  /// the kernel arm and the stale-Installed bracket's probe.
+  prearm_swap: Mutex<Option<(PathBuf, FakeNode)>>,
   /// The synthetic kernel-watch-descriptor sequence.
   wd_seq: AtomicUsize,
 }
@@ -217,6 +234,8 @@ impl Default for FakeState {
       resume_token: Mutex::default(),
       spawn_resume_points: Mutex::default(),
       stale_arms: Mutex::default(),
+      prearm_entries: AtomicUsize::new(0),
+      probes: AtomicUsize::new(0),
       disarms: Mutex::default(),
       enumerates: Mutex::default(),
       watch_failures: Mutex::default(),
@@ -225,6 +244,8 @@ impl Default for FakeState {
       enumerate_hold: Mutex::default(),
       arm_hold: Mutex::default(),
       prearm_hold: Mutex::default(),
+      refresh_hold: Mutex::default(),
+      prearm_swap: Mutex::default(),
       wd_seq: AtomicUsize::new(0),
     }
   }
@@ -553,6 +574,30 @@ impl FakeFs {
     HoldRelease { gate }
   }
 
+  /// Holds every subsequent `refresh_mounts` until released, so a cell can
+  /// observe the widen's barrier across the unverified root-binding window
+  /// (the commit-armed refresh is the verification edge).
+  pub(crate) fn hold_refreshes(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
+    *self.state.refresh_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
+  /// Swaps the node at `path` right after the NEXT `preflight_arm` executes —
+  /// between the kernel arm and the stale-Installed bracket's re-stat, the
+  /// race the bracket exists to refuse.
+  pub(crate) fn swap_after_prearm(&self, path: impl AsRef<Path>, kind: FileKind, ino: u64) {
+    *self.state.prearm_swap.lock().unwrap() = Some((
+      path.as_ref().to_path_buf(),
+      FakeNode {
+        kind,
+        ino,
+        dev: self.root_dev,
+        mnt_id: self.root_mnt_id,
+      },
+    ));
+  }
+
   /// Holds every subsequent `preflight_arm` (a descending replace's pre-arm
   /// on the new transport) until released — distinct from
   /// [`hold_arms`](Self::hold_arms) so a test can freeze in-flight discovery
@@ -572,6 +617,19 @@ impl FakeFs {
   /// transport generation — the observable that the generation fence held.
   pub(crate) fn stale_arms(&self) -> Vec<(WatchId, PathBuf)> {
     self.state.stale_arms.lock().unwrap().clone()
+  }
+
+  /// `preflight_arm` entries so far (a HELD pre-arm counts on entry): once
+  /// non-zero, the widen's witnessed window is provably open — the pre-arm
+  /// dispatch and `begin_widen_watch` share one handler.
+  pub(crate) fn prearm_entries(&self) -> usize {
+    self.state.prearm_entries.load(Ordering::SeqCst)
+  }
+
+  /// `probe` calls executed so far (the widen pre-arm's post-arm bracket is
+  /// one) — see the field doc.
+  pub(crate) fn probes(&self) -> usize {
+    self.state.probes.load(Ordering::SeqCst)
   }
 
   /// Cookies written so far, in call order.
@@ -983,6 +1041,7 @@ impl FsOps for FakeFs {
   }
 
   fn probe(&self, path: &Path) -> ProbeOutcome {
+    self.state.probes.fetch_add(1, Ordering::SeqCst);
     match self.state.nodes.lock().unwrap().get(path) {
       Some(node) => ProbeOutcome::Present {
         kind: node.kind,
@@ -994,6 +1053,7 @@ impl FsOps for FakeFs {
   }
 
   fn refresh_mounts(&self, root: &Path) -> MountRefresh {
+    self.park_on(&self.state.refresh_hold);
     self.state.refreshes.fetch_add(1, Ordering::SeqCst);
     let (mounts, authoritative) = self
       .state
@@ -1137,8 +1197,67 @@ impl FsOps for FakeFs {
     name: &Segment,
     expected: Option<ExpectedObject>,
   ) -> WatchOutcome {
+    // Entry counts BEFORE the hold parks: reaching here proves the witnessed
+    // window is open (see `prearm_entries`).
+    self.state.prearm_entries.fetch_add(1, Ordering::SeqCst);
     self.park_on(&self.state.prearm_hold);
-    self.arm_one(scope, watch, watch, path, name, expected)
+    let outcome = self.arm_one(scope, watch, watch, path, name, expected);
+    // The arm→re-stat race, modeled deterministically: the swap lands after
+    // the kernel arm bound its object, before the bracket's probe.
+    if let Some((path, node)) = self.state.prearm_swap.lock().unwrap().take() {
+      self.state.nodes.lock().unwrap().insert(path, node);
+    }
+    outcome
+  }
+
+  // The no-spawn meta half of the barrier, mirrored: canonicalize (the remap
+  // table), require the object, refuse a non-directory, and seal identity,
+  // frame, ancestors, and the mount seed from the node map. The FRAME comes
+  // from the node itself (unlike a spawn's fake-global default), so a
+  // `put_on_mount` old world exercises the driver's same-frame re-validation.
+  fn resolve_root_meta(&self, path: &Path) -> Result<RootMeta, SourceError> {
+    let nodes = self.state.nodes.lock().unwrap();
+    if !nodes.contains_key(path) {
+      return Err(SourceError::RootUnavailable {
+        root: path.to_path_buf(),
+        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+      });
+    }
+    let root = self
+      .state
+      .spawn_remaps
+      .lock()
+      .unwrap()
+      .get(path)
+      .cloned()
+      .unwrap_or_else(|| path.to_path_buf());
+    let Some(node) = nodes.get(&root) else {
+      return Err(SourceError::RootUnavailable {
+        root,
+        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+      });
+    };
+    if !node.kind.is_dir() {
+      return Err(SourceError::NotADirectory { root });
+    }
+    let identity = RootIdentity::new(node.dev, node.ino.into());
+    let root_dev = node.dev;
+    let root_mnt_id = node.mnt_id;
+    let ancestors = root
+      .ancestors()
+      .skip(1)
+      .filter_map(|ancestor| nodes.get(ancestor))
+      .map(|node| RootIdentity::new(node.dev, node.ino.into()))
+      .collect();
+    Ok(RootMeta {
+      root,
+      root_dev,
+      root_mnt_id,
+      mounts: self.state.spawn_mounts.lock().unwrap().clone(),
+      identity,
+      ancestors,
+      backend: *self.state.spawn_backend.lock().unwrap(),
+    })
   }
 
   fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
