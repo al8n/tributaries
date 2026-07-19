@@ -269,6 +269,11 @@ jobs:
       # sanitizers are here to find memory/thread errors, and a few seeds drive the
       # same code paths — the full sweep still runs on the native `test` legs.
       TRIBUTARY_FS_STORM_SEEDS: 8
+      # The real-kernel cells' budgets are sized for native speed; sanitizer
+      # instrumentation slows the runtime several fold while the producer's raw
+      # syscalls keep their pace, so the kernel-event waits and the move-pairing
+      # window need proportionally more room to stay honest rather than flaky.
+      TRIBUTARY_FS_TIMING_SCALE: 6
     steps:
       - uses: actions/checkout@v7
       - name: Cache cargo build and registry

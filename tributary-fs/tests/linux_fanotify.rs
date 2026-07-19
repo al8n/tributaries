@@ -35,6 +35,23 @@ use tributary_fs::{Backend, BackendKind, Event, Interest, TokioWatcher, WatcherO
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
 
+/// Scales every real-kernel timing budget in this binary. Under sanitizer
+/// instrumentation the runtime is slowed several fold while the raw syscalls the
+/// producer issues are not, so a fixed budget that is generous natively becomes
+/// marginal: the CI sanitizer job sets this so the cells keep their coverage
+/// instead of being skipped. Unset (native runs) it is 1 and nothing changes.
+fn timing_scale() -> u32 {
+  std::env::var("TRIBUTARY_FS_TIMING_SCALE")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .filter(|n| *n > 0)
+    .unwrap_or(1)
+}
+
+fn scaled(d: Duration) -> Duration {
+  d * timing_scale()
+}
+
 /// The container-native mount point of the shared ext4 loopback. Under the
 /// tmpfs `TMPDIR` so nothing leaks onto the host filesystem.
 fn loopback_mount() -> PathBuf {
@@ -132,7 +149,7 @@ async fn wait_for(
   watcher: &mut TokioWatcher,
   mut pred: impl FnMut(&Event) -> bool,
 ) -> Option<Event> {
-  tokio::time::timeout(DEADLINE, async {
+  tokio::time::timeout(scaled(DEADLINE), async {
     while let Some(event) = watcher.next().await {
       if pred(&event) {
         return Some(event);
@@ -1126,7 +1143,7 @@ async fn unmount_under_watch_quiesces_without_panic() {
   w.unwatch(h).await.expect("unwatch");
   // Drain the scope's terminal delivery (the pre-unwatch `alive.txt` event and
   // the terminal `Rescan` may still flush — legitimate, not fabricated).
-  let _ = tokio::time::timeout(Duration::from_secs(2), async {
+  let _ = tokio::time::timeout(scaled(Duration::from_secs(2)), async {
     while w.next().await.is_some() {}
   })
   .await;
@@ -1338,9 +1355,9 @@ async fn unmount_under_live_watch_dies_via_refresh() {
   // tick to fire a refresh, find the root gone, and lower the death lifecycle.
   // The SOLE success signal is the handle being reclaimed (dead-on-arrival). No
   // loss, no openat trick: the tick is the entire mechanism under test.
-  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  let deadline = std::time::Instant::now() + scaled(Duration::from_secs(20));
   while w.backend_of(handle).is_some() && std::time::Instant::now() < deadline {
-    let _ = tokio::time::timeout(Duration::from_millis(300), w.next()).await;
+    let _ = tokio::time::timeout(scaled(Duration::from_millis(300)), w.next()).await;
   }
 
   assert!(
@@ -1594,7 +1611,7 @@ async fn file_churn_keeps_a_bounded_map() {
     // Drain opportunistically so the reader makes progress and the channel does
     // not back up (this is a liveness smoke, not a delivery assertion).
     if i % 256 == 0 {
-      let _ = tokio::time::timeout(Duration::from_millis(1), w.next()).await;
+      let _ = tokio::time::timeout(scaled(Duration::from_millis(1)), w.next()).await;
     }
   }
 
@@ -1762,7 +1779,7 @@ async fn ancestor_self_bind_cycle_terminates() {
   // unbounded recursion would hang here and trip the timeout, whereas the cycle
   // guard returns promptly whether the walk mapped the tree (watcher live) or hit
   // the viability fallback.
-  let started = tokio::time::timeout(DEADLINE, async {
+  let started = tokio::time::timeout(scaled(DEADLINE), async {
     let options = WatcherOptions::new().with_backend(Backend::Fanotify);
     let watcher = TokioWatcher::new(options).expect("build watcher");
     let outcome = watcher.watch(&root, Interest::all()).await;
@@ -1865,7 +1882,7 @@ async fn close_quiesces_under_sustained_traffic() {
     "events flow under the producer before close"
   );
 
-  let closed = tokio::time::timeout(DEADLINE, w.close()).await;
+  let closed = tokio::time::timeout(scaled(DEADLINE), w.close()).await;
   stop.store(true, Ordering::Relaxed);
   producer.join().expect("producer joins");
   assert!(
