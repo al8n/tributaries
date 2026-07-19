@@ -31,6 +31,23 @@ use tributary_fs::{Backend, Event, Interest, TokioWatcher, WatcherOptions};
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
 
+/// Scales every real-kernel timing budget in this binary. Under sanitizer
+/// instrumentation the runtime is slowed several fold while the raw syscalls the
+/// producer issues are not, so a fixed budget that is generous natively becomes
+/// marginal: the CI sanitizer job sets this so the cells keep their coverage
+/// instead of being skipped. Unset (native runs) it is 1 and nothing changes.
+fn timing_scale() -> u32 {
+  std::env::var("TRIBUTARY_FS_TIMING_SCALE")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .filter(|n| *n > 0)
+    .unwrap_or(1)
+}
+
+fn scaled(d: Duration) -> Duration {
+  d * timing_scale()
+}
+
 /// A fresh scratch root under `TMPDIR` (the container mounts a tmpfs there,
 /// keeping every test on container-native paths), canonicalized so event
 /// paths and expectations share one byte form.
@@ -58,7 +75,7 @@ async fn wait_for(
   watcher: &mut TokioWatcher,
   mut pred: impl FnMut(&Event) -> bool,
 ) -> Option<Event> {
-  tokio::time::timeout(DEADLINE, async {
+  tokio::time::timeout(scaled(DEADLINE), async {
     while let Some(event) = watcher.next().await {
       if pred(&event) {
         return Some(event);
@@ -93,7 +110,7 @@ async fn coverage_becomes_live(watcher: &mut TokioWatcher, dir: &Path, tag: &str
     if std::fs::write(&probe, b"x").is_err() {
       return false;
     }
-    let seen = tokio::time::timeout(Duration::from_millis(500), async {
+    let seen = tokio::time::timeout(scaled(Duration::from_millis(500)), async {
       while let Some(event) = watcher.next().await {
         if covers(&event, &probe) {
           return true;
@@ -155,7 +172,7 @@ async fn churn_converges() {
   let top = root.join("top.txt");
   let mut saw_deep = false;
   let mut saw_top = false;
-  let _ = tokio::time::timeout(DEADLINE, async {
+  let _ = tokio::time::timeout(scaled(DEADLINE), async {
     while let Some(event) = w.next().await {
       saw_deep |= covers(&event, &deep);
       saw_top |= covers(&event, &top);
@@ -181,8 +198,9 @@ async fn rename_pairs_into_moved() {
   // stretch the gap past the default move window, and the halves then
   // LEGALLY degrade to Removed + Created — a different contract than the
   // one under test. A generous window keeps the cell about the pairing.
-  let mut w = TokioWatcher::new(WatcherOptions::new().with_move_window(Duration::from_secs(10)))
-    .expect("build watcher");
+  let mut w =
+    TokioWatcher::new(WatcherOptions::new().with_move_window(scaled(Duration::from_secs(10))))
+      .expect("build watcher");
   let _h = w.watch(&root, Interest::all()).await.expect("watch");
 
   std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
@@ -527,7 +545,7 @@ async fn close_quiesces_under_sustained_traffic() {
     "events flow under the producer before close"
   );
 
-  let closed = tokio::time::timeout(DEADLINE, w.close()).await;
+  let closed = tokio::time::timeout(scaled(DEADLINE), w.close()).await;
   stop.store(true, Ordering::Relaxed);
   producer.join().expect("producer joins");
   assert!(
