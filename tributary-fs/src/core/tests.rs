@@ -886,6 +886,265 @@ fn newer_rescan_replaces_the_parked_one() {
   assert_eq!(emits(&drain(&mut core)).len(), 1, "flow resumed");
 }
 
+/// INV-PARK: a LOCATED Rescan minted while lagged (here a flagless-word
+/// escalation; a deficit re-signal and an incomplete read route identically)
+/// must not replace the parked root-covering instruction — the coverages
+/// merge, keeping the root location while adopting the newer mint's epoch.
+/// Fails on old: newest-wins parked the located slice, so events dropped
+/// outside it were promised a re-enumeration that no longer covered them.
+#[test]
+fn a_located_rescan_under_lag_keeps_the_parked_root_coverage() {
+  let (mut core, scope) = live_core();
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 3)],
+    at(1),
+  );
+  let first = emits(&drain(&mut core))
+    .first()
+    .cloned()
+    .cloned()
+    .expect("the created event emits");
+
+  // Lag entry parks the root-covering Rescan (epoch e+1); the parked offer
+  // is deliberately NOT drained, so the merge below lands pre-offer.
+  core.on_delivery(scope, Delivery::Refused, at(2));
+  // A flagless word escalates to a LOCATED Rescan at [sub] (epoch e+2)
+  // while the scope is lagged.
+  core.on_batch_events(scope, vec![ev("/r/sub", FsEventFlags::new(0), 2, 0)], at(3));
+
+  let effects = drain(&mut core);
+  let offered = emits(&effects);
+  assert_eq!(
+    offered.len(),
+    1,
+    "one parked instruction offers: {effects:?}"
+  );
+  assert!(offered[0].kind().is_rescan());
+  assert!(
+    offered[0].location().is_empty(),
+    "the parked coverage stays at the root — the located mint merged, it did \
+     not replace: {:?}",
+    offered[0]
+  );
+  assert_eq!(
+    offered[0].epoch().as_u64(),
+    first.epoch().as_u64() + 2,
+    "the merged instruction adopts the located mint's (newest) epoch"
+  );
+}
+
+/// A merge landing while the parked offer is IN FLIGHT: accepting the stale
+/// offer must not end the lag — the merged (wider, newer) instruction
+/// re-offers and only its acceptance returns the scope to normal flow.
+/// Fails on old: the in-flight/idle handling survives, but the re-offer was
+/// the located slice, not the root-covering merge.
+#[test]
+fn accepting_a_stale_offer_re_offers_the_merged_parked_rescan() {
+  let (mut core, scope) = live_core();
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 3)],
+    at(1),
+  );
+  let first = emits(&drain(&mut core))
+    .first()
+    .cloned()
+    .cloned()
+    .expect("the created event emits");
+  core.on_delivery(scope, Delivery::Refused, at(2));
+  // The parked root Rescan is offered — in flight at epoch e+1.
+  let stale = emits(&drain(&mut core))
+    .first()
+    .cloned()
+    .cloned()
+    .expect("the parked Rescan offers");
+  assert!(stale.location().is_empty());
+
+  // A located mint merges while the offer is in flight (epoch e+2).
+  core.on_batch_events(scope, vec![ev("/r/sub", FsEventFlags::new(0), 2, 0)], at(3));
+  // The stale acceptance names a superseded epoch: the lag holds and the
+  // merged instruction becomes offerable immediately.
+  core.on_delivery(scope, Delivery::Accepted, at(4));
+  let effects = drain(&mut core);
+  let merged = emits(&effects);
+  assert_eq!(merged.len(), 1, "the merged Rescan re-offers: {effects:?}");
+  assert!(merged[0].kind().is_rescan());
+  assert!(
+    merged[0].location().is_empty(),
+    "root coverage survives the in-flight merge: {:?}",
+    merged[0]
+  );
+  assert_eq!(merged[0].epoch().as_u64(), first.epoch().as_u64() + 2);
+
+  // Accepting the CURRENT instruction ends the lag.
+  core.on_delivery(scope, Delivery::Accepted, at(5));
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/c", flags(&[FsEventFlags::ITEM_CREATED]), 3, 5)],
+    at(6),
+  );
+  let effects = drain(&mut core);
+  let flowed = emits(&effects);
+  assert_eq!(flowed.len(), 1, "flow resumed");
+  assert!(flowed[0].kind().is_created());
+}
+
+/// The covering-merge lattice: location = the longest common prefix (the
+/// join of the two subtree coverages), id + epoch = the newer change's, and
+/// neither input's coverage ever narrows.
+#[test]
+fn covering_merge_joins_coverage_and_adopts_the_newest_mint() {
+  use tributary_proto::{ChangeId, ChangeKind, Epoch};
+  let id = |n: u64| ChangeId::new(NonZeroU64::new(n).unwrap());
+  let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+  let rescan = |n: u64, location: Location, epoch: u64| {
+    Change::new(
+      id(n),
+      scope,
+      location,
+      ChangeKind::Rescan,
+      Epoch::new(epoch),
+    )
+  };
+  let cases: &[(&[&str], &[&str], &[&str])] = &[
+    (&[], &["a", "b"], &[]),                           // root × located → root
+    (&["a", "b"], &[], &[]),                           // located × root → root (newer covers)
+    (&["a"], &["a", "b"], &["a"]),                     // newer nested in prev → prev coverage
+    (&["a", "b"], &["a"], &["a"]),                     // newer contains prev → newer coverage
+    (&["a", "x"], &["b", "y"], &[]),                   // disjoint → the root joins them
+    (&["a", "b", "c"], &["a", "b", "d"], &["a", "b"]), // deep common ancestor
+    (&["a"], &["a"], &["a"]),                          // equal → unchanged coverage
+  ];
+  for (prev_loc, newer_loc, want) in cases {
+    let prev = rescan(1, loc(prev_loc), 1);
+    let newer = rescan(2, loc(newer_loc), 2);
+    let merged = DriverCore::covering_merge(&prev, newer);
+    assert_eq!(
+      merged.location(),
+      &loc(want),
+      "join of {prev_loc:?} and {newer_loc:?}"
+    );
+    assert!(merged.kind().is_rescan());
+    assert_eq!(merged.id(), id(2), "the newer mint's id");
+    assert_eq!(merged.epoch(), Epoch::new(2), "the newer mint's epoch");
+    // The join covers both inputs: each input location extends it.
+    for input in [prev_loc, newer_loc] {
+      assert!(
+        loc(input).starts_with(merged.location()),
+        "{input:?} is inside the merged coverage {want:?}"
+      );
+    }
+  }
+}
+
+/// A consumer unwatch of a lagged scope promotes the parked instruction into
+/// the dying set: after a located mint the promoted terminal must still
+/// cover the root — the drops it licenses were scope-wide. Fails on old: the
+/// narrowed located slice was promoted, so the terminal promise shrank below
+/// the drop set (a consumer unwatch mints no terminal Rescan of its own to
+/// heal it, unlike the death funnels).
+#[test]
+fn unwatch_of_a_narrowed_lagged_scope_promotes_root_coverage() {
+  let (mut core, scope) = live_core();
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 3)],
+    at(1),
+  );
+  let first = emits(&drain(&mut core))
+    .first()
+    .cloned()
+    .cloned()
+    .expect("the created event emits");
+  core.on_delivery(scope, Delivery::Refused, at(2));
+  // The located mint lands while lagged, pre-offer.
+  core.on_batch_events(scope, vec![ev("/r/sub", FsEventFlags::new(0), 2, 0)], at(3));
+
+  core.on_unwatch(scope);
+  assert!(
+    core.dying_contains(scope),
+    "the parked instruction survives"
+  );
+  let effects = drain(&mut core);
+  let terminal = emits(&effects)
+    .first()
+    .cloned()
+    .cloned()
+    .expect("the dying terminal offers");
+  assert!(terminal.kind().is_rescan());
+  assert!(
+    terminal.location().is_empty(),
+    "the terminal promise covers the root: {terminal:?}"
+  );
+  assert_eq!(terminal.epoch().as_u64(), first.epoch().as_u64() + 2);
+  core.on_delivery(scope, Delivery::Accepted, at(4));
+  assert!(!core.dying_contains(scope), "the acceptance retires it");
+}
+
+/// The epoch-announcement contract across a lag with located mints: no
+/// delivered change ever carries a generation that no delivered Rescan
+/// announced (the merged instruction announces the maximal folded epoch).
+/// A property guard, not an old-vs-new discriminator — the pre-fix break was
+/// coverage, not epochs.
+#[test]
+fn delivered_epochs_are_always_announced_by_a_delivered_rescan() {
+  let (mut core, scope) = live_core();
+  let mut delivered: Vec<Change> = Vec::new();
+  let deliver_all = |core: &mut DriverCore, delivered: &mut Vec<Change>, t: u64| {
+    for change in emits(&drain(core)) {
+      delivered.push(change.clone());
+      core.on_delivery(scope, Delivery::Accepted, at(t));
+    }
+  };
+
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 3)],
+    at(1),
+  );
+  deliver_all(&mut core, &mut delivered, 1);
+  // Lag entry, then TWO located mints folded into the parked instruction.
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/b", flags(&[FsEventFlags::ITEM_CREATED]), 2, 4)],
+    at(2),
+  );
+  let _ = drain(&mut core);
+  core.on_delivery(scope, Delivery::Refused, at(3));
+  core.on_batch_events(scope, vec![ev("/r/sub", FsEventFlags::new(0), 3, 0)], at(4));
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/other/x", FsEventFlags::new(0), 4, 0)],
+    at(5),
+  );
+  deliver_all(&mut core, &mut delivered, 6);
+  // Post-lag flow rides the announced generation.
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/c", flags(&[FsEventFlags::ITEM_CREATED]), 5, 6)],
+    at(7),
+  );
+  deliver_all(&mut core, &mut delivered, 7);
+
+  assert!(
+    delivered.iter().any(|c| c.kind().is_rescan()),
+    "the lag delivered its instruction: {delivered:?}"
+  );
+  let mut announced = tributary_proto::Epoch::START;
+  for change in &delivered {
+    if change.kind().is_rescan() {
+      announced = announced.max(change.epoch());
+    } else {
+      assert!(
+        change.epoch() <= announced,
+        "{change:?} rides a generation no delivered Rescan announced \
+         (announced {announced:?}) in {delivered:?}"
+      );
+    }
+  }
+}
+
 #[test]
 fn identity_minting_respects_devices_and_mounts() {
   let state = ScopeState {
@@ -4723,6 +4982,68 @@ mod descending {
     );
   }
 
+  /// The cookie seam under lag (INV-PARK): the pre-dispatch deficit
+  /// re-signal mints a LOCATED covering `Rescan`; on a lagged scope it must
+  /// fold into the parked root instruction, not replace it — the barrier's
+  /// one delivered instruction still covers every scope-wide drop the lag
+  /// licenses. Fails on old: newest-wins parked the deficit's slice, so the
+  /// sync's Rescan no longer covered writes outside it.
+  #[test]
+  fn a_deficit_resignal_under_lag_merges_into_the_parked_root_rescan() {
+    let (mut core, scope, req, root_watch) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let add = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the discovered directory arms");
+    core.on_watch_installed(
+      add,
+      crate::os::linux::WatchOutcome::Failed(WatchError::NoSpace),
+    );
+    let edge_epoch = emits(&drain(&mut core))
+      .iter()
+      .find(|c| c.kind().is_rescan())
+      .map(|c| c.epoch())
+      .expect("the refused arm's edge Rescan is routed");
+
+    // A refused delivery enters lag; the parked offer is not drained, so the
+    // re-signal below merges pre-offer.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root_watch], IN_CREATE, 0, Some(b"f.txt"))],
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_delivery(scope, Delivery::Refused, at(2));
+
+    assert!(
+      core.resignal_coverage_deficits(scope),
+      "the standing hole re-signals ahead of the cookie dispatch"
+    );
+    let effects = drain(&mut core);
+    let offered = emits(&effects);
+    assert_eq!(
+      offered.len(),
+      1,
+      "one parked instruction offers: {effects:?}"
+    );
+    assert!(offered[0].kind().is_rescan());
+    assert!(
+      offered[0].location().is_empty(),
+      "the re-signal merged into the root coverage: {:?}",
+      offered[0]
+    );
+    assert!(
+      offered[0].epoch() > edge_epoch,
+      "the merged instruction rides the re-signal's fresh epoch"
+    );
+  }
+
   /// B3 (P3 fence): a fence opened over a detached-and-held move source
   /// pends until the hold resolves — pairing or timeout — and then settles
   /// under the existing verdict rules (a clean hold's window stays clean).
@@ -6936,8 +7257,14 @@ mod root_widened {
     let _ = root_watch;
   }
 
+  /// A lag-parked Rescan crossing the commit is the WIDENED scope's drop
+  /// license (INV-PARK): post-commit the lag keeps dropping scope-wide —
+  /// added ground and its cold-read discoveries included — so the parked
+  /// instruction re-parks at the NEW root, never merely re-based under the
+  /// adopted prefix. Fails on old: the prefix-joined location covered only
+  /// the old subtree while licensing widened-scope drops.
   #[test]
-  fn a_lag_parked_rescan_is_rebased_at_the_commit() {
+  fn a_lag_parked_rescan_widens_to_the_new_root_at_the_commit() {
     let (mut core, scope, root_watch, _boot) = live_at("/r/sub", 1, true);
 
     // Refuse a delivery: the scope goes lagged and parks a dominating Rescan
@@ -6968,9 +7295,9 @@ mod root_widened {
     let _reserved = widen(&mut core, scope, meta("/r", 9), at(3));
     let _ = drain(&mut core);
 
-    // The retry offers the parked Rescan under the NEW root — its location
-    // re-based to the adopted prefix, so it still covers exactly the old
-    // world it was minted for.
+    // The retry offers the parked Rescan under the NEW root — re-parked at
+    // the widened root itself, so it covers the old world it was minted for
+    // AND the added ground whose changes the standing lag keeps dropping.
     core.on_timeout(at(10_000));
     let effects = drain(&mut core);
     let offered = effects
@@ -6983,10 +7310,10 @@ mod root_widened {
       })
       .unwrap_or_else(|| panic!("the parked Rescan re-offers: {effects:?}"));
     assert_eq!(offered.0.as_path(), Path::new("/r"));
-    assert_eq!(
-      offered.1.location(),
-      &loc(&["sub"]),
-      "the parked instruction gained the adopted prefix"
+    assert!(
+      offered.1.location().is_empty(),
+      "the parked license covers the widened root, not the adopted prefix: {:?}",
+      offered.1
     );
   }
 
