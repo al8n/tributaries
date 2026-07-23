@@ -80,9 +80,9 @@ use std::{
 };
 
 use tributary_proto::{
-  Capabilities, Change, DirEntry, EnumerateResult, FileKind, Identity, Instant, Interest, IoClass,
-  Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope, ScopeId, Segment,
-  SubtreeScope, WatchError, WatchId,
+  Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, FileKind, Identity, Instant,
+  Interest, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope, ScopeId,
+  Segment, SubtreeScope, WatchError, WatchId,
 };
 
 use crate::os::{
@@ -491,8 +491,17 @@ struct ProbeCtx {
 const DELIVERY_RETRY: Duration = Duration::from_millis(25);
 
 /// The consumer-lag state of one scope. Events are only ever dropped while a
-/// strictly-greater-epoch `Rescan` is parked and undelivered, so the
-/// consumer's post-`Rescan` re-enumeration provably covers them.
+/// dominating `Rescan` is parked and undelivered, so the consumer's
+/// post-`Rescan` re-enumeration provably covers them.
+///
+/// INV-PARK: the parked coverage never narrows while the lag stands. Every
+/// `Rescan` routed while lagged — including a LOCATED one (a deficit
+/// re-signal, an incomplete read, a failed arm) — is folded in by
+/// [`DriverCore::covering_merge`]: the location becomes the join of the two
+/// subtree coverages (their longest common prefix) and the id + epoch become
+/// the newest mint's. So the promised drop set only ever grows, and the one
+/// delivered instruction carries an epoch that dominates everything dropped
+/// under it.
 #[derive(Debug)]
 enum LagState {
   /// Deliveries flow.
@@ -1813,7 +1822,6 @@ impl DriverCore {
       debug_assert!(false, "the driver refuses an equal-root widen");
       return WidenCommit::Refused;
     }
-    let rel_location = Location::from_segments(chain.iter().cloned());
     // The adopted node's identity, in the enumerate-mint space (the bare inode
     // — see `mint`): the old root sits on the scope's own device by the widen
     // predicate, so the device-trust gate is satisfied by construction.
@@ -1862,11 +1870,15 @@ impl DriverCore {
     Self::trust_lost(&mut self.effects, scope, state);
     Self::arm_liveness(state, liveness, now);
 
-    // The one re-base: a lag-parked Rescan was minted against the old root and
-    // may be LOCATED (a deficit re-signal, an incomplete read); delivered
-    // post-commit it rides the NEW delivery root, so its location gains the
-    // adopted prefix. (D1 never needs this — its commit parks a fresh
-    // dominating ROOT Rescan whose location is empty.)
+    // A lag-parked Rescan crosses the commit as the WIDENED scope's drop
+    // license: while the lag stands, route_event keeps dropping scope-wide —
+    // from here that includes the added ground and its cold-read discoveries
+    // — so the parked instruction is re-parked at the NEW root (empty
+    // location, id + epoch kept), never merely re-based under the adopted
+    // prefix: a prefix-joined location would cover only the old subtree
+    // while licensing widened-scope drops (INV-PARK). An over-wide
+    // re-enumeration is the honest direction. (D1 needs neither — its commit
+    // parks a fresh dominating ROOT Rescan through the overflow cut.)
     if let LagState::Lagged {
       parked: Some(change),
       ..
@@ -1876,7 +1888,7 @@ impl DriverCore {
       *change = Change::new(
         change.id(),
         scope,
-        rel_location.clone().join(change.location()),
+        Location::new(),
         change.kind().clone(),
         change.epoch(),
       );
@@ -2747,6 +2759,41 @@ impl DriverCore {
     }
   }
 
+  /// The covering merge of two same-scope `Rescan`s (INV-PARK): the location
+  /// becomes their longest common prefix — the join of the two subtree
+  /// coverages, since a shorter location covers MORE — and the id + epoch
+  /// become the newer change's, so the merged instruction still licenses
+  /// every drop either input licensed while its epoch dominates everything
+  /// dropped. Never narrows either input. Callers pass the later-minted
+  /// change as `newer`: route order is mint order, and every routed `Rescan`
+  /// carries a freshly bumped epoch, so `newer`'s epoch is the greater one.
+  fn covering_merge(prev: &Change, newer: Change) -> Change {
+    debug_assert!(
+      prev.kind().is_rescan() && newer.kind().is_rescan(),
+      "only Rescans carry a drop license to merge"
+    );
+    let shared = prev
+      .location()
+      .segments()
+      .iter()
+      .zip(newer.location().segments())
+      .take_while(|(a, b)| a == b)
+      .count();
+    if shared == newer.location().len() {
+      // Newer's location is a prefix of prev's (or equal): it already covers
+      // everything prev promised.
+      return newer;
+    }
+    let location = Location::from_segments(newer.location().segments()[..shared].iter().cloned());
+    Change::new(
+      newer.id(),
+      newer.scope(),
+      location,
+      ChangeKind::Rescan,
+      newer.epoch(),
+    )
+  }
+
   fn mint_probe(&mut self, scope: ScopeId, purpose: ProbePurpose) -> ProbeId {
     self.probe_seq += 1;
     let probe = ProbeId(self.probe_seq);
@@ -2865,8 +2912,20 @@ impl DriverCore {
               live || (parked.is_none() && queued.is_none()),
               "a never-live scope emits nothing to promote"
             );
+            // Both present is structurally dead today — a Lagged scope
+            // queues no emits and a Normal one parks nothing — but if both
+            // ever exist the terminal promise must not narrow to whichever
+            // carries the newer epoch: the coverages merge (INV-PARK) and
+            // the promotion rides the newer mint's root.
             let terminal = match (parked, queued) {
-              (Some(a), Some(b)) => Some(if b.1.epoch() > a.1.epoch() { b } else { a }),
+              (Some(a), Some(b)) => {
+                let ((_, older), (root, newer)) = if b.1.epoch() > a.1.epoch() {
+                  (a, b)
+                } else {
+                  (b, a)
+                };
+                Some((root, Self::covering_merge(&older, newer)))
+              }
               (a, b) => a.or(b),
             };
             if live && let Some((root, change)) = terminal {
@@ -3005,9 +3064,17 @@ impl DriverCore {
       }
       LagState::Lagged { parked, .. } => {
         if change.kind().is_rescan() {
-          // The newest dominating Rescan wins; everything else the scope
-          // produces while lagged is covered by it and dropped.
-          *parked = Some(change);
+          // Fold the new Rescan into the parked one (INV-PARK): a located
+          // mint (a deficit re-signal, an incomplete read, a failed arm)
+          // must not shrink the drop set the parked instruction promised, so
+          // the coverages join while the id + epoch advance to the newest
+          // mint. Everything non-Rescan the scope produces while lagged
+          // stays covered by the never-narrowing parked instruction and is
+          // dropped.
+          *parked = Some(match parked.take() {
+            None => change,
+            Some(prev) => Self::covering_merge(&prev, change),
+          });
         }
       }
     }
