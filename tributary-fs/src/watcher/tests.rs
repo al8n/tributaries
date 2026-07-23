@@ -656,7 +656,57 @@ mod lifecycle {
     (dir, canonical)
   }
 
-  /// Gives the driver and blocking pool scheduler slices under paused time.
+  /// How much REAL time one settle round hands to the threads the runtime does
+  /// not schedule, before [`timing_scale`] is applied. Sized for the slowest
+  /// step such a thread can owe a predicate: the driver creates a reaper thread
+  /// on demand, so the first teardown of a run must fit an OS thread spawn, its
+  /// first scheduling onto a CPU, and the teardown itself — and on an
+  /// oversubscribed machine the scheduling latency alone is a scheduler
+  /// quantum, hundreds of microseconds to low milliseconds.
+  const SETTLE_ROUND_SLICE: Duration = Duration::from_millis(2);
+
+  /// Scales the real-clock slice, sharing the workspace's timing knob with the
+  /// real-kernel suites. Instrumented builds (the sanitizer lanes set this) slow
+  /// a thread's spawn and its teardown work several fold while a fixed
+  /// wall-clock slice does not stretch to match. Unset it is 1.
+  fn timing_scale() -> u32 {
+    std::env::var("TRIBUTARY_FS_TIMING_SCALE")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .filter(|n| *n > 0)
+      .unwrap_or(1)
+  }
+
+  fn settle_round_slice() -> Duration {
+    static SLICE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SLICE.get_or_init(|| SETTLE_ROUND_SLICE * timing_scale())
+  }
+
+  /// Gives the driver, the blocking pool and the driver's teardown reaper
+  /// scheduler slices under paused time — 200 rounds, so a fully expired budget
+  /// is 200 × [`SETTLE_ROUND_SLICE`].
+  ///
+  /// # Why a round costs REAL time under a paused clock
+  ///
+  /// These cells run on a current-thread runtime with `start_paused = true`, so
+  /// the driver task and the test share one thread and the virtual sleep below
+  /// hands the driver its next timer at no wall-clock cost. That covers
+  /// everything the runtime schedules — and stops exactly there. A stream
+  /// teardown runs on the driver's teardown reaper, an ordinary OS thread no
+  /// runtime clock governs, and while this task is inside an `await` the
+  /// runtime, not that thread, is on the CPU. A round therefore splits in two:
+  /// the awaits let the driver reach the point where it hands work off, and
+  /// [`SETTLE_ROUND_SLICE`] of real sleep is the window in which the thread it
+  /// handed to can run. More rounds cannot substitute for a wider window — the
+  /// loop returns as soon as `done` holds, so an observable published a beat
+  /// after the one this predicate names has only the CURRENT round's slice to
+  /// land in.
+  ///
+  /// This used to be implicit: while teardowns ran on the blocking pool, an
+  /// outstanding `spawn_blocking` inhibited the paused clock's auto-advance, so
+  /// the virtual sleep could not return until the pool went quiet. Off the pool
+  /// the runtime sees itself idle, auto-advances, and the budget collapses to
+  /// nothing unless the slice is spent deliberately.
   async fn settle(mut done: impl FnMut() -> bool) {
     for _ in 0..200 {
       if done() {
@@ -664,6 +714,7 @@ mod lifecycle {
       }
       tokio::task::yield_now().await;
       tokio::time::sleep(Duration::from_millis(10)).await;
+      std::thread::sleep(settle_round_slice());
     }
   }
 

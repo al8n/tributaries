@@ -62,7 +62,7 @@ pub mod fsevents;
 pub mod inotify;
 
 pub use action::{
-  Action, EnumerateCommand, StatChild, StatCommand, StatTarget, WatchChild, WatchCommand,
+  Action, EnumerateCommand, StatChild, StatCommand, StatTarget, WatchAck, WatchChild, WatchCommand,
   WatchTarget,
 };
 pub use capabilities::Capabilities;

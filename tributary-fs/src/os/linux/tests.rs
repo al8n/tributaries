@@ -625,3 +625,102 @@ mod pin {
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
+
+/// The control port's reply seam: what a caller can and cannot conclude from a
+/// batch that comes back. These drive a real `ControlPort` with the test thread
+/// playing the reader, so they run only on a Linux host (the container `unit`
+/// suite).
+#[cfg(all(target_os = "linux", not(miri)))]
+mod control_port {
+  use std::{ffi::OsString, sync::mpsc, thread};
+
+  use super::{
+    super::{
+      AnchorRequest, BatchOutcome, ControlOp, ControlPort, WatchOutcome, inotify::reader::Control,
+      wake::WakeState,
+    },
+    watch,
+  };
+
+  /// Sends `ops` through a port whose reader DEQUEUES the batch and then dies
+  /// without replying — dropping the reply sender is exactly what an unwinding
+  /// reader does, including one that dies part-way through the cut it owes the
+  /// batch. Returns what the caller, running on its own thread, came back with.
+  fn dequeued_then_died(ops: Vec<ControlOp>) -> BatchOutcome {
+    let (control_tx, control_rx) = mpsc::channel();
+    let wake = WakeState::new().expect("an eventfd backs the port's wake state");
+    let port = ControlPort::detached(control_tx, wake);
+    let caller = thread::spawn(move || port.batch(ops));
+    let dequeued = control_rx
+      .recv()
+      .expect("the batch reaches the reader before the caller blocks on its reply");
+    assert!(
+      matches!(dequeued, Control::Batch { .. }),
+      "the message the port sends is the batch itself"
+    );
+    drop(dequeued);
+    caller
+      .join()
+      .expect("the caller RETURNS on a dead reader rather than unwinding")
+  }
+
+  /// An ordering-proof round trip carries no arms, so it resolves none whether the
+  /// reader served it or died holding it: both come back as an empty vector. That
+  /// vector is why the answer cannot live inside the replies — read as one, a dead
+  /// reader's return certifies the pre-reply cut that never happened, and a barrier
+  /// settles clean over records nobody read.
+  #[test]
+  fn an_empty_batch_a_reader_died_holding_is_not_answered() {
+    let outcome = dequeued_then_died(Vec::new());
+    assert!(
+      outcome.replies.is_empty(),
+      "an empty batch resolves no arm — which is exactly what makes the replies mute here"
+    );
+    assert!(
+      !outcome.answered,
+      "a reader that died before replying answered NOTHING, and the empty vector cannot say so"
+    );
+  }
+
+  /// The arms of an unanswered batch are still replied to, one `Failed(Io)` each.
+  /// A Monitor node parked on its watch acknowledgement must be released whichever
+  /// way the reader went, so the answer is reported BESIDE the replies and never by
+  /// withholding them.
+  #[test]
+  fn every_arm_of_an_unanswered_batch_is_still_refused() {
+    let ops = vec![
+      ControlOp::Arm(AnchorRequest {
+        watch: watch(1),
+        parent: None,
+        name: OsString::from("/r"),
+        expected: None,
+      }),
+      ControlOp::Disarm(watch(2)),
+      ControlOp::Arm(AnchorRequest {
+        watch: watch(3),
+        parent: None,
+        name: OsString::from("/r/child"),
+        expected: None,
+      }),
+    ];
+
+    let outcome = dequeued_then_died(ops);
+    assert!(
+      !outcome.answered,
+      "the reader died holding the batch, so nothing in it is known to have run"
+    );
+    let refusals: Vec<_> = outcome
+      .replies
+      .iter()
+      .map(|reply| (reply.outcome, reply.anchor.is_some()))
+      .collect();
+    assert_eq!(
+      refusals,
+      vec![
+        (WatchOutcome::Failed(tributary_proto::WatchError::Io), false),
+        (WatchOutcome::Failed(tributary_proto::WatchError::Io), false),
+      ],
+      "one refusal per ARM, index-aligned and anchorless — the disarm contributes none"
+    );
+  }
+}

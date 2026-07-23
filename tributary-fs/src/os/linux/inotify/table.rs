@@ -10,54 +10,60 @@
 //! exactly once), and the entry itself survives — draining — until the queued
 //! `IN_IGNORED` is consumed: `IN_IGNORED` is the guaranteed final event for a
 //! `wd` and therefore the authoritative erase point ([`WdTable::on_ignored`]).
+//! Its by-construction corollary: a draining tombstone exists only while the
+//! kernel can still OWE its marker, so proof that it cannot — the removal
+//! answering `EINVAL` on a valid owned fd — erases the entry immediately
+//! ([`WdTable::erase_dead`]).
 //!
-//! Generation safety across `wd` reuse: the kernel's cyclic `wd` allocator makes
-//! reuse of a still-draining `wd` remote (~2³¹ arms), but the table stays correct
-//! on its own regardless. Registering onto a draining `wd` REPLACES the tombstone
-//! with a fresh live entry AND records that one stale `IN_IGNORED` is still queued
-//! for the OLD watch — the next `IN_IGNORED` clears that pending mark WITHOUT
-//! erasing the new live anchor set (which would silently drop a live watch). The
-//! `IN_IGNORED` after that (impossible under the kernel's one-final-event
-//! contract, but not assumed) erases legitimately.
+//! # The adoption invariant (uniqueness safety without `wd` reuse)
 //!
-//! Attribution across the reuse window: the kernel queues a watch's final
-//! `IN_IGNORED` BEFORE the `wd` can be handed to a new `add_watch`, so the queue
-//! reads `old records…, old IN_IGNORED, new records…`. Between a reuse
-//! [`register`](WdTable::register) and the stale `IN_IGNORED` that closes it, a
-//! NON-`IN_IGNORED` record on the `wd` is therefore one of those OLD records:
-//! attributing it to the fresh anchor set would be a silent wrong-watch delivery.
-//! So while `pending_stale_ignored > 0` the `wd` is in an AMBIGUOUS window and
-//! [`attribute`](WdTable::attribute) returns [`Attribution::Ambiguous`] for every
-//! non-`IN_IGNORED` record — the reader fences it behind the loss barrier (a
-//! covering rescan re-enumerates and re-attributes truthfully) rather than
-//! guessing. Each stale `IN_IGNORED` still routes to
-//! [`on_ignored`](WdTable::on_ignored), decrementing the count; when it reaches
-//! zero the window closes and attribution resumes over the new set (whose own
-//! arm-enumerate already covered its initial state). Removals can stack, so
-//! `pending_stale_ignored` is a COUNT and the fence holds until the LAST stale
-//! marker drains — never a per-`wd` bool that a first IGNORED would clear early.
+//! A `wd` is ADOPTABLE only while this table maps nothing on it — and the
+//! reader makes that unconditional by never letting a `wd` be granted twice
+//! on one fd. The kernel's per-instance allocator (`inotify_new_watch`'s
+//! `idr_alloc_cyclic`, start 1) grants strictly increasing `wd`s until a
+//! grant past `i32::MAX` would wrap its cursor back over freed values; the
+//! reader tracks the high-water mark and REBUILDS the instance — a fresh fd
+//! and a fresh table, with a whole-instance loss signalled so the Monitor
+//! re-proves every retained binding on the new fd — before the cursor could
+//! get there (the reader's `Instance`). A table therefore maps only `wd`s
+//! its own fd granted below the wrap edge, every fresh install's `wd` is
+//! strictly greater than all of them, and the invariant every consumer leans
+//! on holds by construction:
 //!
-//! Loss recovery: a DECODE-level loss breaks the queue ordering every wd-window
-//! relies on. Two shapes: an `IN_Q_OVERFLOW` sentinel — the kernel dropped queued
-//! events (inotify(7)) — and a truncated / absurd-length / malformed record that
-//! stops the decode walk early, dropping the buffer tail after it. Either way,
-//! state that WAITS for a specific future marker can have that marker among the
-//! dropped bytes — and would then wait FOREVER. Two such windows exist: a reuse
-//! fence (`pending_stale_ignored`, counting down a stale `IN_IGNORED`) and a
-//! draining tombstone (awaiting its own final `IN_IGNORED`). [`WdTable::on_loss`]
-//! resets BOTH — clearing every pending stale-ignored count and erasing every
-//! draining tombstone — because the covering rescan the loss triggers (re-enumerate
-//! + re-arm) rebuilds the table truthfully.
+//! *everything consumed on a mapped `wd` belongs to that mapping.*
 //!
-//! Invariant: no wd-table window may outlive an ordering-breaking loss. Live
-//! attribution sets are the only state that survives it — they never await a
-//! marker, so the rescan reconciles them without a reset. The distinction is sharp:
-//! the reset fires on a DECODE/kernel loss (ordering broken — the awaited marker may
-//! be gone), NEVER on the AMBIGUOUS-fence loss (a record dropped by
-//! [`attribute`](WdTable::attribute) while `pending_stale_ignored > 0`). The fence
-//! loss is the fence working WITH the ordering intact; resetting there would clear
-//! `pending_stale_ignored` before the stale `IN_IGNORED` drains and re-open the
-//! reuse misattribution the fence exists to prevent.
+//! Why this must be structural rather than handled: a stale mapping — a
+//! binding whose kernel watch died with its teardown records swallowed by a
+//! queue loss — may still have leftovers queued (its final `IN_IGNORED`, or
+//! pre-death records), and whether they are still coming is unknowable
+//! table-side. Any fresh binding sharing that `wd` could be erased by the
+//! surviving marker (a silently unwatched live subtree under a settleable
+//! barrier), and any fence provisioned against the marker must guess whether
+//! a loss dropped it — wrong in one direction or the other. With `wd`s never
+//! re-granted, no such sharing can exist to be disposed of.
+//!
+//! - An `IN_IGNORED` consumed on a mapped `wd` is the mapping's own final
+//!   marker: erasing the entry and fanning its remaining live anchors into
+//!   the kernel-teardown funnel is truthful — a live-mapped entry whose watch
+//!   died lost its OBJECT with it (deletion or unmount is the only way a
+//!   kernel watch dies underneath a mapping this table did not drain itself).
+//!   On an unmapped `wd` the marker no-ops.
+//! - A record consumed on a mapped `wd` is the mapping's own traffic and fans
+//!   out to its live anchors; on an unmapped or draining `wd` it addresses a
+//!   watch the core already dropped and is skipped without loss.
+//!
+//! Loss recovery: a DECODE-level loss (an `IN_Q_OVERFLOW` sentinel — the
+//! kernel dropped queued events, inotify(7) — or a truncated / absurd-length /
+//! malformed record that stops the decode walk) can drop a draining
+//! tombstone's awaited `IN_IGNORED`, and nothing else would ever reap the
+//! tombstone. [`WdTable::on_loss`] erases every draining tombstone: safe even
+//! when the marker actually survived behind the sentinel, because the erased
+//! `wd` is never granted again on this fd (no-wrap), so the straggling marker
+//! no-ops on the unmapped `wd` unconditionally, and the covering rescan the
+//! loss triggers rebuilds coverage truthfully. Live entries are left intact —
+//! they await no marker: a live mapping whose markers were dropped is
+//! reconciled by that same rescan's binding re-proof (its anchor's re-add
+//! supersedes the binding, or its parent's re-enumerate reports the removal).
 
 use std::collections::BTreeMap;
 
@@ -74,36 +80,12 @@ pub(crate) enum DrainDecision {
   KeepWd,
 }
 
-/// The attribution outcome for one decoded NON-`IN_IGNORED` record on a `wd`
-/// (the `IN_IGNORED` marker itself routes through [`WdTable::on_ignored`], never
-/// here).
-#[derive(Debug)]
-pub(crate) enum Attribution<'a> {
-  /// The record fans out to these live anchors. Empty for an unknown or fully
-  /// drained `wd` — the caller skips it without loss (the core's own liveness
-  /// already dropped that watch).
-  Attributed(&'a [WatchId]),
-  /// The `wd` is in the AMBIGUOUS REUSE WINDOW: a fresh anchor set was installed
-  /// over a not-yet-drained old incarnation whose stale `IN_IGNORED` is still
-  /// queued ahead of any of the new watch's events (see the module invariant).
-  /// This record therefore belongs to the OLD watch, so attributing it to the
-  /// new set would be a silent wrong-watch delivery; the caller fences it behind
-  /// the loss barrier (a covering rescan re-attributes truthfully) instead.
-  Ambiguous,
-}
-
-/// One `wd`'s bookkeeping: the anchors still attributing, whether the
-/// kernel-side removal was already issued, and how many stale `IN_IGNORED`s from
-/// a previous (drained) incarnation of this `wd` are still queued ahead of this
-/// live entry.
+/// One `wd`'s bookkeeping: the anchors still attributing, and whether the
+/// kernel-side removal was already issued.
 #[derive(Debug, Default)]
 struct WdEntry {
   live: Vec<WatchId>,
   draining: bool,
-  /// Stale `IN_IGNORED`s a previous incarnation left queued. Registering onto a
-  /// draining `wd` bumps this so the next IGNORED clears the tombstone remnant
-  /// WITHOUT erasing this fresh live set. Non-zero only across a `wd`-reuse race.
-  pending_stale_ignored: u32,
 }
 
 /// The `wd ↔ anchors` table (attribution below the core, per the proto's
@@ -120,58 +102,82 @@ impl WdTable {
     Self::default()
   }
 
-  /// Records a freshly-installed kernel watch backing `anchor`.
-  ///
-  /// Registering onto a DRAINING `wd` (a fresh install landed on a `wd` whose
-  /// tombstone still awaits its `IN_IGNORED`) is a `wd`-reuse race: the tombstone
-  /// is replaced with a fresh live entry and the stale IGNORED is remembered
-  /// (`pending_stale_ignored`) so it clears the remnant rather than erasing the
-  /// new anchor. A live entry just appends.
+  /// The `wd` currently backing `anchor`, if any — the reader's rebind
+  /// pre-check (a re-add landing on a different `wd` supersedes this binding).
+  pub(crate) fn wd_of(&self, anchor: WatchId) -> Option<i32> {
+    self.by_anchor.get(&anchor).copied()
+  }
+
+  /// Records a FRESHLY-INSTALLED kernel watch backing `anchor`. Only an
+  /// UNMAPPED `wd` is ever adopted (the module's adoption invariant): a
+  /// fresh install's `wd` is granted strictly past every `wd` this table
+  /// maps, because the reader rebuilds the instance before the allocator
+  /// could wrap. A prior binding of `anchor` on a different `wd` must be
+  /// drained by the caller first ([`begin_drain`](Self::begin_drain)).
   pub(crate) fn register(&mut self, wd: i32, anchor: WatchId) {
-    let entry = self.entries.entry(wd).or_default();
-    if entry.draining {
-      // The old incarnation's IGNORED is still queued; step out of draining into
-      // a fresh live generation and mark that one IGNORED must be absorbed.
-      entry.draining = false;
-      entry.live.clear();
-      entry.pending_stale_ignored = entry.pending_stale_ignored.saturating_add(1);
-    }
-    entry.live.push(anchor);
+    debug_assert!(
+      !self.entries.contains_key(&wd),
+      "a fresh install's wd is granted past every mapped one (no-wrap)"
+    );
+    debug_assert!(
+      !self.by_anchor.contains_key(&anchor),
+      "a rebind drains the old binding before registering"
+    );
+    self.entries.entry(wd).or_default().live.push(anchor);
     self.by_anchor.insert(anchor, wd);
   }
 
   /// Records an additional anchor onto an EXISTING `wd` — the `EEXIST`
-  /// aliasing path (one inode reached through two names). `EEXIST` is returned
-  /// by the kernel only for a LIVE watch, so the target entry is never draining
-  /// here; the shared `register` path handles it either way.
+  /// aliasing path (one inode reached through two names, or a re-add of a
+  /// binding that was live all along). `EEXIST` is the kernel's proof the
+  /// watch is LIVE, and every live watch on the fd was adopted through
+  /// [`register`](Self::register), so its `wd` is mapped live here (the
+  /// reader refuses the `EEXIST` path's one counterexample — the target
+  /// watch dying between the probe and the re-add turns the re-add into a
+  /// fresh create on a fresh, unmapped `wd` — before it can reach this
+  /// aliasing). An anchor already on the entry keeps a single live slot (the
+  /// re-add dedup — a duplicate would fan every record out twice).
   pub(crate) fn alias(&mut self, wd: i32, anchor: WatchId) {
     debug_assert!(
-      self.entries.get(&wd).is_some_and(|entry| !entry.draining),
-      "EEXIST aliasing targets a live kernel watch, never a draining tombstone"
+      self.is_live(wd),
+      "EEXIST aliasing targets a live mapped watch"
     );
-    self.register(wd, anchor);
-  }
-
-  /// The attribution decision for a NON-`IN_IGNORED` record on `wd`.
-  ///
-  /// [`Attribution::Ambiguous`] while the `wd` is in the reuse window
-  /// (`pending_stale_ignored > 0`, per the module invariant): the record may
-  /// belong to the OLD incarnation queued ahead of its stale `IN_IGNORED`, so it
-  /// is fenced to loss rather than mis-attributed to the fresh set. Otherwise
-  /// [`Attribution::Attributed`] over the live anchor set — empty for an unknown
-  /// or fully drained `wd` (a late record for an unwatched anchor is dropped by
-  /// the core's own liveness checks).
-  pub(crate) fn attribute(&self, wd: i32) -> Attribution<'_> {
-    match self.entries.get(&wd) {
-      Some(entry) if entry.pending_stale_ignored > 0 => Attribution::Ambiguous,
-      Some(entry) => Attribution::Attributed(&entry.live),
-      None => Attribution::Attributed(&[]),
+    debug_assert!(
+      self.by_anchor.get(&anchor).is_none_or(|bound| *bound == wd),
+      "a cross-wd rebind drains the old binding before aliasing"
+    );
+    let entry = self.entries.entry(wd).or_default();
+    self.by_anchor.insert(anchor, wd);
+    if entry.live.contains(&anchor) {
+      return;
     }
+    entry.live.push(anchor);
   }
 
-  /// Whether `wd` is known at all — live or draining.
+  /// The anchors a NON-`IN_IGNORED` record on `wd` fans out to (the
+  /// `IN_IGNORED` marker itself routes through [`on_ignored`](Self::on_ignored),
+  /// never here). Empty for an unknown or draining `wd` — the record addresses
+  /// a watch the core already dropped, and the caller skips it without loss.
+  pub(crate) fn attribute(&self, wd: i32) -> &[WatchId] {
+    self
+      .entries
+      .get(&wd)
+      .map_or(&[], |entry| entry.live.as_slice())
+  }
+
+  /// Whether `wd` is known at all — live or draining. A known `wd` is not
+  /// adoptable — and a fresh install can never land on one, its grant being
+  /// strictly past every mapped `wd` (the module's adoption invariant).
   pub(crate) fn contains(&self, wd: i32) -> bool {
     self.entries.contains_key(&wd)
+  }
+
+  /// Whether `wd` is mapped with live anchors (not draining) — the aliasing
+  /// gate: an `EEXIST` re-add's `wd` must land here, anything else is a
+  /// fresh create in disguise (its target watch died between the two adds)
+  /// and is refused.
+  pub(crate) fn is_live(&self, wd: i32) -> bool {
+    self.entries.get(&wd).is_some_and(|entry| !entry.draining)
   }
 
   /// Removes `anchor` from attribution. Returns
@@ -194,22 +200,18 @@ impl WdTable {
     }
   }
 
-  /// Consumes the `wd`'s `IN_IGNORED` — the authoritative erase. Returns the
+  /// Consumes an `IN_IGNORED` on `wd` — the authoritative erase. Returns the
   /// anchors that were still live (kernel-initiated teardown fans an
   /// `Ignored` record out to each); empty when the teardown was self-induced
-  /// and the anchors already drained.
+  /// and the anchors already drained, or when the `wd` is unmapped (a marker
+  /// straggling behind its entry's erase — a refused disguised-create's
+  /// removal marker, or a tombstone's own after a loss reaped it — no-ops
+  /// harmlessly).
   ///
-  /// A STALE IGNORED left over from a drained incarnation this `wd` was reused
-  /// for is absorbed instead of erasing: it clears one `pending_stale_ignored`
-  /// and leaves the fresh live set (and its `by_anchor` links) intact, so a
-  /// live watch that reused the `wd` is never silently dropped.
+  /// The marker always belongs to the mapping it lands on (the adoption
+  /// invariant), so erasing here can never take down a binding the marker did
+  /// not address.
   pub(crate) fn on_ignored(&mut self, wd: i32) -> Vec<WatchId> {
-    if let Some(entry) = self.entries.get_mut(&wd)
-      && entry.pending_stale_ignored > 0
-    {
-      entry.pending_stale_ignored -= 1;
-      return Vec::new();
-    }
     let Some(entry) = self.entries.remove(&wd) else {
       return Vec::new();
     };
@@ -219,34 +221,49 @@ impl WdTable {
     entry.live
   }
 
-  /// Resets all transient reuse-window / ordering state after a DECODE-level loss —
-  /// an `IN_Q_OVERFLOW` sentinel or a truncated / absurd-length / malformed record
-  /// that dropped the decode tail.
+  /// Erases every draining tombstone after a DECODE-level loss — an
+  /// `IN_Q_OVERFLOW` sentinel or a truncated / absurd-length / malformed
+  /// record that dropped the decode tail.
   ///
-  /// Such a loss means bytes the stream would have carried are gone (inotify(7)): the
-  /// marker a window is counting on — a stale `IN_IGNORED` a reuse fence decrements
-  /// ([`Self::register`]) or a draining tombstone's own final `IN_IGNORED` — may be
-  /// among the dropped, so it can NEVER arrive and the window would strand forever
-  /// (a stuck `pending_stale_ignored` fences every future record on the reused `wd`
-  /// to [`Attribution::Ambiguous`] → loss, a permanent livelock; a stranded
-  /// tombstone leaks and re-traps the `wd` on its next reuse). The loss already
-  /// drives the covering rescan (re-enumerate + re-arm), which rebuilds the table
-  /// truthfully, so the recovery is to drop the window state: clear every
-  /// `pending_stale_ignored` and erase every draining tombstone. Live attribution
-  /// sets are left intact — they never await a marker, and the rescan reconciles
-  /// them. A draining tombstone has an empty live set and no `by_anchor` link
-  /// pointing at it (both cleared when its last anchor drained), so erasing it keeps
-  /// the reverse index consistent.
-  ///
-  /// Called ONLY for a DECODE loss (the queue ordering is broken). The
-  /// ambiguous-fence loss — [`attribute`](Self::attribute) dropping a record while
-  /// `pending_stale_ignored > 0`, ordering INTACT — must NOT call this: it would
-  /// clear the fence before its stale `IN_IGNORED` drains and mis-attribute the
-  /// reused `wd`'s old records to the new watch.
+  /// Such a loss means bytes the stream would have carried are gone
+  /// (inotify(7)): a tombstone's awaited final `IN_IGNORED` may be among
+  /// them, and nothing else ever reaps a tombstone — it would strand as a
+  /// leaked entry for the fd's whole life. Erasing is safe even when the
+  /// marker actually survived (queued behind the sentinel): the erased `wd`
+  /// is never granted again on this fd (no-wrap), so the straggling marker
+  /// is consumed as an unmapped no-op ([`on_ignored`](Self::on_ignored)) —
+  /// no fresh binding can ever stand where it lands. Live entries are left
+  /// intact — they never await a marker, and the covering rescan the loss
+  /// triggers reconciles them (a re-add supersedes a dead one, a
+  /// re-enumerate reports its object's removal). A draining tombstone has an
+  /// empty live set and no `by_anchor` link pointing at it (both cleared
+  /// when its last anchor drained), so erasing it keeps the reverse index
+  /// consistent.
   pub(crate) fn on_loss(&mut self) {
-    self.entries.retain(|_wd, entry| {
-      entry.pending_stale_ignored = 0;
-      !entry.draining
-    });
+    self.entries.retain(|_wd, entry| !entry.draining);
+  }
+
+  /// Erases ONE draining tombstone whose marker the kernel can no longer owe:
+  /// `inotify_rm_watch` answered `EINVAL` on a valid owned fd, which is the
+  /// kernel's statement that no such watch exists — so either its `IN_IGNORED`
+  /// is already queued (the benign auto-removal race) or a queue loss
+  /// swallowed it, and nothing else would ever reap the entry.
+  ///
+  /// A draining tombstone exists only while the kernel can still owe its
+  /// marker; proof that it cannot erases it at once. Safe in both cases by the
+  /// module's adoption invariant, exactly as [`on_loss`](Self::on_loss) is: the
+  /// erased `wd` is never granted again on this fd, so a marker that DID
+  /// survive is consumed as an unmapped no-op, and records arriving between
+  /// now and that marker were already skipped identically under `draining` and
+  /// under unmapped.
+  pub(crate) fn erase_dead(&mut self, wd: i32) {
+    debug_assert!(
+      self
+        .entries
+        .get(&wd)
+        .is_some_and(|entry| entry.draining && entry.live.is_empty()),
+      "only a draining tombstone is erased by proof of a marker the kernel cannot owe"
+    );
+    self.entries.remove(&wd);
   }
 }

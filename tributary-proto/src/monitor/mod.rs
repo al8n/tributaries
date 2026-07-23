@@ -1,6 +1,6 @@
 //! The primitive-agnostic top half: the `Monitor` state machine.
 
-use core::time::Duration;
+use core::{num::NonZeroU64, time::Duration};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
@@ -36,7 +36,15 @@ enum EnumKind {
   /// Discovery of a freshly-armed directory — each entry is a new `Created`.
   Cold,
   /// A rescan re-arm — reconcile the watch set without emitting `Created`.
-  Rearm,
+  /// `reprove` carries the binding-re-proof flavor down the retained chain
+  /// (see [`NodeState::Arming`]): a reprove-flavored read's kept survivors are
+  /// re-added, not merely re-read — a whole-tree kernel death (an unmount)
+  /// leaves every retained descendant identity-matched yet unbound, so the
+  /// flavor must reach the leaves.
+  Rearm {
+    /// Whether kept survivors of this read must re-prove their bindings.
+    reprove: bool,
+  },
 }
 
 /// The coverage lifecycle of one watched directory. Exactly one variant holds at a
@@ -49,7 +57,19 @@ enum NodeState {
   /// The `Action::Watch` is queued but not yet acknowledged. `rearm` records that the
   /// post-arm enumerate must continue a rescan re-arm (the old `rearming` membership),
   /// so it is `Created`-suppressed rather than a cold discovery.
-  Arming { rearm: bool },
+  ///
+  /// `reprove` marks the arm as a binding RE-PROOF of an already-tracked node
+  /// on a [`lossy_watch_teardown`](Capabilities::lossy_watch_teardown)
+  /// backend: the node's kernel binding may have died with its teardown
+  /// record swallowed by a queue loss, so only the re-add's acknowledgement —
+  /// stamped against the scope's loss generation — may return it to `Live`.
+  /// A reprove arm is always re-arm-flavored (`reprove` implies `rearm`), and
+  /// unlike a fresh install it does NOT mark the bridge window at entry: the
+  /// window's `fresh_rearm` bit is set at the ACK, iff the outcome was
+  /// [`Installed`](crate::WatchAck::Installed) (a genuinely re-established
+  /// binding — there was a dark window to close). An all-`Aliased` recovery
+  /// therefore costs no closing `Rescan`.
+  Arming { rearm: bool, reprove: bool },
   /// Live (armed), with no enumerate outstanding.
   Live,
   /// Live, with an enumerate outstanding under `req`. `kind` selects discovery vs
@@ -75,9 +95,9 @@ impl NodeState {
   const fn is_rearm(self) -> bool {
     matches!(
       self,
-      Self::Arming { rearm: true }
+      Self::Arming { rearm: true, .. }
         | Self::Enumerating {
-          kind: EnumKind::Rearm,
+          kind: EnumKind::Rearm { .. },
           ..
         }
     )
@@ -270,8 +290,14 @@ struct PendingMove {
 /// backend instance, and disjoint roots may live on separate instances whose
 /// cookies collide, so the cookie is namespaced by its [`ScopeId`]: a destination
 /// may consume a source only under the identical composite key (invariant d). The
-/// tuple derives `Ord` from both components, so it keys a `BTreeMap`.
+/// tuple derives `Ord` from both components, so it keys a `BTreeMap` — scope-major,
+/// which lays one scope's halves out as a single contiguous range (what
+/// [`Monitor::moves_settled`] tests, without a mirror counter to keep in step).
 type PendingKey = (ScopeId, MoveCookie);
+
+/// The least cookie any backend can mint, and so the lower bound of a scope's
+/// contiguous range of [`PendingKey`]s.
+const FIRST_COOKIE: MoveCookie = MoveCookie::new(NonZeroU64::MIN);
 
 /// A delivery-dedup key: a change is suppressed only if an identical one is still
 /// queued. Two changes are "identical" when they share a scope, location, kind
@@ -408,6 +434,14 @@ pub struct Monitor {
   pending_enumerate: BTreeMap<ReqId, WatchId>,
   /// Half-resolved renames awaiting their destination, keyed by `(scope, cookie)`.
   ///
+  /// A parked half is a transition already consumed from the backend whose normalized
+  /// change is still unwritten — which of `Moved`, `Removed` or nothing it becomes is
+  /// unknown until the destination arrives or the window elapses. So membership here
+  /// is also the moves conjunct of [`coverage_settled`](Self::coverage_settled)
+  /// ([`moves_settled`](Self::moves_settled)): a barrier that certified over a parked
+  /// half would let the change land behind a sync cookie the consumer has already
+  /// treated as final.
+  ///
   /// Four lifecycle invariants hold, each enforced at the site noted:
   /// (a) a half pairs only with a same-scope destination before its deadline
   /// (`on_moved_to`); (b) a half whose source is no longer watched never emits a
@@ -473,6 +507,36 @@ pub struct Monitor {
   /// transition. Mirrors [`pending_adoptions`](Self::pending_adoptions)
   /// membership exactly (asserted by the test invariant checker).
   adopting_by_scope: BTreeMap<ScopeId, usize>,
+  /// Per-scope monotone count of coverage-work ACQUISITIONS — the epoch
+  /// [`coverage_work_epoch`](Self::coverage_work_epoch) reports. Bumped at the
+  /// one funnel through which each of the stores behind
+  /// [`coverage_settled`](Self::coverage_settled) gains an entry for the
+  /// scope, and never on a release, so the value moves exactly when the
+  /// barrier could have gone
+  /// from settled back to unsettled. Absent means 0 (no coverage work ever
+  /// acquired). Entries die with the scope, like every other per-scope
+  /// generation: scope ids are never reused, so a fresh registration starting
+  /// at 0 cannot collide with anything stamped by a dead one.
+  coverage_work_epochs: BTreeMap<ScopeId, u64>,
+  /// Per-scope loss generation on a
+  /// [`lossy_watch_teardown`](Capabilities::lossy_watch_teardown) profile:
+  /// bumped at every scope-level [`on_overflow`](Self::on_overflow), before
+  /// the recovery's re-adds are issued. Absent means generation 0 (no loss
+  /// yet). The generation is what makes a binding acknowledgement a PROOF:
+  /// an ACK counts only if the arm it answers was issued under the CURRENT
+  /// generation — an arm in flight across a loss may certify a binding that
+  /// loss killed with its teardown swallowed, so its ACK re-issues instead
+  /// (see [`reprove_stamps`](Self::reprove_stamps)). Entries die with the
+  /// scope (unregister / root invalidation).
+  loss_gens: BTreeMap<ScopeId, u64>,
+  /// The loss generation each outstanding reprove arm was issued under —
+  /// keyed by the arming node, mirroring `Arming { reprove: true }`
+  /// membership exactly (asserted by the test invariant checker). A stamp
+  /// older than the scope's current generation marks the arm's `Ok` ACK
+  /// stale: the watch action is re-issued under the current generation and
+  /// the node stays `Arming`. Bounded by the transport's per-ack-cycle loss
+  /// dedup — each re-issue consumes one loss edge.
+  reprove_stamps: BTreeMap<WatchId, u64>,
 
   actions: VecDeque<Action>,
   events: VecDeque<Change>,
@@ -505,6 +569,9 @@ impl Monitor {
       latent_cold: BTreeMap::new(),
       pending_adoptions: BTreeMap::new(),
       adopting_by_scope: BTreeMap::new(),
+      coverage_work_epochs: BTreeMap::new(),
+      loss_gens: BTreeMap::new(),
+      reprove_stamps: BTreeMap::new(),
       actions: VecDeque::new(),
       events: VecDeque::new(),
     }
@@ -548,6 +615,59 @@ impl Monitor {
       .copied()
       .unwrap_or(self.capabilities)
       .kernel_recursive()
+  }
+
+  /// Whether a scope-level loss on `scope` must re-prove every retained
+  /// kernel binding by an acknowledged re-add: the profile descends AND its
+  /// watches' teardown records can be lost with the queue
+  /// ([`lossy_watch_teardown`](Capabilities::lossy_watch_teardown)).
+  fn scope_reproves_bindings(&self, scope: ScopeId) -> bool {
+    let profile = self
+      .scope_profiles
+      .get(&scope)
+      .copied()
+      .unwrap_or(self.capabilities);
+    !profile.kernel_recursive() && profile.lossy_watch_teardown()
+  }
+
+  /// The current loss generation of `scope` (0 before any loss).
+  fn loss_gen(&self, scope: ScopeId) -> u64 {
+    self.loss_gens.get(&scope).copied().unwrap_or(0)
+  }
+
+  /// Whether a funnel that KEEPS a retained node of `scope` must keep it
+  /// reproof-flavored: the profile re-proves bindings AND a loss is on record.
+  /// At generation 0 no queue loss ever occurred, and on a
+  /// [`lossy_watch_teardown`](Capabilities::lossy_watch_teardown) backend a
+  /// silent binding death REQUIRES one (a teardown record is only ever lost
+  /// WITH the queue, and every queue loss surfaces as a scope-level overflow
+  /// that bumps the generation) — so a plain re-arm is provably sufficient
+  /// there, and every reprove arm carries generation ≥ 1.
+  fn scope_needs_reproof(&self, scope: ScopeId) -> bool {
+    self.scope_reproves_bindings(scope) && self.loss_gen(scope) > 0
+  }
+
+  /// One coverage-heal kick at `dir` — reinstall-flavored when the scope's
+  /// retained bindings need re-proof ([`scope_needs_reproof`](Self::scope_needs_reproof)),
+  /// the plain enumerate re-arm otherwise. Every deficit heal routes through
+  /// this, so a heal can never silently downgrade a binding proof to a read:
+  /// the darkness a deficit records may have absorbed the very loss that
+  /// killed the anchor's retained subtree, and the healing crawl must then
+  /// re-add what it keeps, not merely re-list it.
+  fn heal_kick(&mut self, scope: ScopeId, dir: WatchId) {
+    if self.scope_needs_reproof(scope) {
+      self.start_reinstall(dir);
+    } else {
+      let _ = self.start_rearm(dir);
+    }
+  }
+
+  /// Advances `scope`'s loss generation — called at each scope-level loss on
+  /// a binding-re-proving profile, BEFORE the recovery's re-adds are issued,
+  /// so every arm already in flight becomes stale (its install may predate
+  /// this loss) while the recovery's own arms stamp current.
+  fn bump_loss_gen(&mut self, scope: ScopeId) {
+    *self.loss_gens.entry(scope).or_insert(0) += 1;
   }
 
   /// Whether a watch handle is currently registered (live or pending).
@@ -604,7 +724,10 @@ impl Monitor {
         scope,
         is_dir: true,
         identity: None,
-        state: NodeState::Arming { rearm: false },
+        state: NodeState::Arming {
+          rearm: false,
+          reprove: false,
+        },
         children: BTreeSet::new(),
       },
     );
@@ -679,9 +802,13 @@ impl Monitor {
       self.scope_profiles.remove(&scope);
       // Terminal machinery owns coverage from here: the bridge window and the
       // deficit book die with the scope (per-node drops already emptied the
-      // book's fine entries; this also reclaims a collapsed marker).
+      // book's fine entries; this also reclaims a collapsed marker), and so do
+      // its loss and coverage-work generations (scope ids are never reused, so
+      // neither can be confused with a later scope's).
       self.bridge.remove(&scope);
       self.deficits.remove(&scope);
+      self.loss_gens.remove(&scope);
+      self.coverage_work_epochs.remove(&scope);
     }
     self.settle_bridges();
   }
@@ -774,7 +901,7 @@ impl Monitor {
     // gap-directory would spam one `Rescan` each.
     if matches!(
       self.nodes.get(&watch).map(|node| node.state),
-      Some(NodeState::Arming { rearm: false })
+      Some(NodeState::Arming { rearm: false, .. })
     ) {
       self.emit_rescan(scope, self.location_of(watch));
     }
@@ -824,9 +951,12 @@ impl Monitor {
     // covering `Rescan` plus the full re-arm rebuild re-attempt everything,
     // and a still-broken site re-records through its own failure edge. The
     // BRIDGE entry deliberately survives — the commit `Rescan` the caller
-    // emits right after re-sets `saw_rescan` anyway, and the root reset below
-    // sets `fresh_rearm`; the flush cannot fire mid-rebind because the method
-    // ends with the root counted.
+    // emits right after re-sets `saw_rescan` anyway, and the window's
+    // `fresh_rearm` half is re-established by the rebuild: the root reset
+    // below sets it when the root was not already re-arm-flavored, while a
+    // root caught mid-reproof gets it from the rebuild's fresh installs or
+    // its own `Installed` replay acknowledgement instead. The flush cannot
+    // fire mid-rebind because the method ends with the root counted.
     self.deficits.remove(&scope);
     // An old-world root read that will never be reported must not leak its
     // request slot (`drop_subtree` does this for children; the root survives).
@@ -834,7 +964,17 @@ impl Monitor {
       self.pending_enumerate.remove(&req);
       self.latent_cold.remove(&req);
     }
-    self.set_state(root, NodeState::Arming { rearm: true });
+    self.set_state(
+      root,
+      NodeState::Arming {
+        rearm: true,
+        reprove: false,
+      },
+    );
+    // The reset arm is answered by the caller's NEW-transport replay — a
+    // fresh proof by construction, not a reprove — so any stamp an in-flight
+    // OLD-transport re-add left behind must not judge it.
+    self.reprove_stamps.remove(&root);
     if let Some(node) = self.nodes.get_mut(&root) {
       node.identity = None;
     }
@@ -928,7 +1068,10 @@ impl Monitor {
         scope,
         is_dir: true,
         identity: None,
-        state: NodeState::Arming { rearm: false },
+        state: NodeState::Arming {
+          rearm: false,
+          reprove: false,
+        },
         children: BTreeSet::new(),
       },
     );
@@ -1000,29 +1143,71 @@ impl Monitor {
     !self.rearm_pending.contains_key(&scope)
   }
 
-  /// Whether `scope` is settled for BARRIER purposes: no counted re-arm work
-  /// ([`rearm_settled`](Self::rearm_settled)), no detached-and-held move
-  /// source (whose suppressed records' covering `Rescan` has not been emitted
-  /// yet — it is owed only at the hold's pairing or timeout resolution), no
-  /// in-flight cold read carrying a coalesced re-arm obligation (the one
-  /// latency `rearm_settled` deliberately does not count; its completion
-  /// escalates into a covering `Rescan` plus a counted retry), and no
-  /// UNVERIFIED same-transport adoption edge (a widen's connecting chain is
-  /// deliberately cold — uncounted by the re-arm predicate — yet until the
-  /// tail's first complete read verifies the adopted edge, a chain mutation
-  /// from the commit's dark window may still be both unrecorded and
+  /// Whether `scope` is settled for BARRIER purposes: whether the monitor
+  /// still holds any transition of `scope` it has not put on the wire. There
+  /// are five ways to hold one, and this is their conjunction — no counted
+  /// re-arm work ([`rearm_settled`](Self::rearm_settled)); no
+  /// detached-and-held move source (whose suppressed records' covering
+  /// `Rescan` has not been emitted yet — it is owed only at the hold's pairing
+  /// or timeout resolution); no in-flight cold read carrying a coalesced
+  /// re-arm obligation (the one latency `rearm_settled` deliberately does not
+  /// count; its completion escalates into a covering `Rescan` plus a counted
+  /// retry); no UNVERIFIED same-transport adoption edge (a widen's connecting
+  /// chain is deliberately cold — uncounted by the re-arm predicate — yet
+  /// until the tail's first complete read verifies the adopted edge, a chain
+  /// mutation from the commit's dark window may still be both unrecorded and
   /// unsignalled; the marker releases only at positive verification or
-  /// together with the mismatch's covering `Rescan`/re-arm/deficit). A fence
+  /// together with the mismatch's covering `Rescan`/re-arm/deficit); and no
+  /// half-resolved rename still parked for its pairing window — a `MovedFrom`
+  /// the monitor has consumed and cannot normalize until its destination
+  /// arrives or the window elapses, which for an ordinary file takes no hold
+  /// and so is counted by nothing else.
+  ///
+  /// The first four are coverage the monitor cannot yet vouch for; the fifth
+  /// is a change it has already taken off the backend and not yet delivered.
+  /// One predicate carries both because they falsify the same claim: a fence
   /// built on the bare re-arm predicate would settle inside any of these
-  /// windows and dispatch a sync cookie no covering `Rescan` precedes.
-  /// Trivially `true` for a kernel-recursive scope (none of the four states
-  /// is reachable) and for an unknown or torn-down one.
+  /// windows and dispatch a sync cookie that neither a covering `Rescan` nor
+  /// the transition itself precedes — and a consumer may finalize state on
+  /// that cookie, so a change landing behind it arrives after the state it
+  /// belongs to.
+  ///
+  /// A kernel-recursive scope reaches none of the first four states, so its
+  /// barrier rests on the parked-rename conjunct alone; an unknown or
+  /// torn-down scope is trivially settled.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn coverage_settled(&self, scope: ScopeId) -> bool {
     self.rearm_settled(scope)
       && self.holds_settled(scope)
       && self.latent_settled(scope)
       && self.adoptions_settled(scope)
+      && self.moves_settled(scope)
+  }
+
+  /// `scope`'s coverage-work epoch: a monotone count of how many times the
+  /// scope has ACQUIRED work that [`coverage_settled`](Self::coverage_settled)
+  /// counts — a re-arm obligation, a detached-and-held move source, an
+  /// in-flight cold read carrying a coalesced re-arm obligation, an unverified
+  /// adoption edge, or a parked rename half. Releasing such work never moves
+  /// it. 0 for an unknown or torn-down scope, and reading it allocates nothing.
+  ///
+  /// This exists so an ordering proof taken over a settled scope can be BOUND
+  /// to the state that made it settled, instead of to an enumeration of the
+  /// edges that could unsettle it. Each conjunct is "this store holds no entry
+  /// for the scope", so the barrier can only go settled → unsettled by one of
+  /// them GAINING an entry, which is exactly what bumps
+  /// this counter. A holder that stamped the epoch while the scope was settled
+  /// and finds the same value later therefore knows the barrier never re-opened
+  /// in between — whatever the conjunct was, and however many conjuncts there
+  /// come to be.
+  ///
+  /// Its converse is what makes it usable rather than merely safe: a settled
+  /// scope acquiring no work leaves the epoch fixed, so a stamp taken over a
+  /// quiescent scope stays valid and the holder converges instead of chasing a
+  /// moving value.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn coverage_work_epoch(&self, scope: ScopeId) -> u64 {
+    self.coverage_work_epochs.get(&scope).copied().unwrap_or(0)
   }
 
   /// Whether `scope` has a standing terminal coverage deficit: an arm-refused
@@ -1070,6 +1255,7 @@ impl Monitor {
     let evicted = self.pending_adoptions.insert(parent, name);
     debug_assert!(evicted.is_none(), "widen tails are freshly minted");
     *self.adopting_by_scope.entry(scope).or_insert(0) += 1;
+    self.acquired_coverage_work(scope);
   }
 
   /// Removes the adoption marker keyed at `parent` (if any), keeping the
@@ -1094,6 +1280,58 @@ impl Monitor {
     !self.latent_cold.values().any(|s| *s == scope)
   }
 
+  /// Records the in-flight cold read `req` of `scope` as carrying a coalesced
+  /// re-arm obligation — the ONE insert funnel for
+  /// [`latent_cold`](Self::latent_cold), paired with the removals that mirror
+  /// `pending_enumerate`. Re-dirtying a read already tracked here gains the
+  /// scope nothing, so only a genuine membership gain counts as acquired work.
+  fn latent_cold_insert(&mut self, req: ReqId, scope: ScopeId) {
+    if self.latent_cold.insert(req, scope).is_none() {
+      self.acquired_coverage_work(scope);
+    }
+  }
+
+  /// Whether `scope` has no half-resolved rename parked in
+  /// [`pending_moves`](Self::pending_moves). O(log n): the store is keyed
+  /// scope-major, so the scope's halves are one contiguous range and the
+  /// predicate is just "is that range non-empty".
+  ///
+  /// Reading membership directly, rather than mirroring it in a per-scope
+  /// counter, is what makes this conjunct safe to add. A half leaves the store
+  /// four different ways — a destination consuming it (`on_moved_to`, pairing
+  /// or past-window alike), its window expiring (`handle_timeout`), a same-key
+  /// half displacing it (`park_pending_move`), and the whole-scope
+  /// [`purge_scope_pending_moves`](Self::purge_scope_pending_moves) its three
+  /// teardown callers share — and a mirror that missed any one of them would
+  /// hold the barrier, and every fence resting on it, down forever.
+  fn moves_settled(&self, scope: ScopeId) -> bool {
+    self
+      .pending_moves
+      .range((scope, FIRST_COOKIE)..)
+      .next()
+      .is_none_or(|((half_scope, _), _)| *half_scope != scope)
+  }
+
+  /// Parks a half-resolved rename under `(scope, cookie)` — the ONE insert
+  /// funnel for [`pending_moves`](Self::pending_moves) — returning the
+  /// same-key half it displaced, for the caller to resolve.
+  ///
+  /// Only a genuine membership gain counts as acquired coverage work: a
+  /// displacement leaves the range non-empty on both sides of the insert, so
+  /// the scope was already unsettled and no proof can have been taken over it.
+  fn park_pending_move(
+    &mut self,
+    scope: ScopeId,
+    cookie: MoveCookie,
+    pending: PendingMove,
+  ) -> Option<PendingMove> {
+    let displaced = self.pending_moves.insert((scope, cookie), pending);
+    if displaced.is_none() {
+      self.acquired_coverage_work(scope);
+    }
+    displaced
+  }
+
   /// [`resignal_coverage_deficits`](Self::resignal_coverage_deficits) minus
   /// the public entry point's bridge flush.
   fn resignal_deficits(&mut self, scope: ScopeId) -> bool {
@@ -1108,10 +1346,10 @@ impl Monitor {
     };
     if book.collapsed {
       // The whole scope is suspect: one root-covering `Rescan`, one full-tree
-      // heal probe (bounded — `start_rearm` refuses a pending or dead root,
-      // whose own arm outcome re-attempts coverage anyway).
+      // heal probe (bounded — a pending root's own arm outcome re-attempts
+      // coverage anyway), binding-re-proving where the profile demands it.
       self.emit_rescan(scope, Location::new());
-      let _ = self.start_rearm(root);
+      self.heal_kick(scope, root);
       self.deficits.remove(&scope);
       return true;
     }
@@ -1130,7 +1368,7 @@ impl Monitor {
         continue;
       }
       self.emit_rescan(scope, self.location_of(dir));
-      let _ = self.start_rearm(dir);
+      self.heal_kick(scope, dir);
       if let Some(book) = self.deficits.get_mut(&scope) {
         book.interiors.remove(&dir);
       }
@@ -1142,7 +1380,7 @@ impl Monitor {
         continue;
       }
       self.emit_rescan(scope, self.location_of(parent).child(name.clone()));
-      let _ = self.start_rearm(parent);
+      self.heal_kick(scope, parent);
       if let Some(book) = self.deficits.get_mut(&scope)
         && let Some(names) = book.slots.get_mut(&parent)
       {
@@ -1349,8 +1587,12 @@ impl Monitor {
       // record raced (`dirty`) so its listing is a possibly-stale snapshot: reconcile what
       // is visible, cascade the re-arm into every child, bounded-retry to complete the
       // watch set, and — unless the dir is held — emit a `Rescan` for the unreadable
-      // content (a held dir's `Rescan` would point at the stale path).
-      self.handle_incomplete_enumerate(dir, scope, &res, attempts, held.is_none());
+      // content (a held dir's `Rescan` would point at the stale path). The retry
+      // keeps a reprove flavor: the survivors' re-adds ride the eventual
+      // complete read, so dropping the flavor here would silently downgrade
+      // the binding proof to an enumerate.
+      let reprove = matches!(kind, EnumKind::Rearm { reprove: true });
+      self.handle_incomplete_enumerate(dir, scope, &res, attempts, held.is_none(), reprove);
       return;
     }
 
@@ -1366,10 +1608,16 @@ impl Monitor {
     self.resolve_adoption(dir, scope, kind, held.is_some(), &res);
 
     match kind {
-      // A cold read on a held dir is coverage-only; route it as a re-arm (no `Created`).
-      EnumKind::Rearm | EnumKind::Cold if held.is_some() => self.rearm_enumerate(dir, scope, &res),
+      // A cold read on a held dir is coverage-only; route it as a re-arm (no
+      // `Created`). A reprove flavor rides through (`Rearm { reprove }`): a
+      // held dir's own binding is never a reinstall target, but its read's
+      // survivors are ordinary in-slot children whose proof must not be lost.
+      EnumKind::Rearm { reprove } if held.is_some() => {
+        self.rearm_enumerate(dir, scope, &res, reprove)
+      }
+      EnumKind::Cold if held.is_some() => self.rearm_enumerate(dir, scope, &res, false),
       // A complete re-arm: prune vanished, arm new, cascade — without emitting `Created`.
-      EnumKind::Rearm => self.rearm_enumerate(dir, scope, &res),
+      EnumKind::Rearm { reprove } => self.rearm_enumerate(dir, scope, &res, reprove),
       // A complete cold enumerate: discovery — emit `Created` and install per-directory.
       EnumKind::Cold => {
         for entry in res.entries() {
@@ -1407,6 +1655,7 @@ impl Monitor {
     res: &EnumerateResult,
     attempts: u8,
     deliver: bool,
+    reprove: bool,
   ) {
     // Reconcile every VISIBLE entry (a `Failed` read surfaces none): install or keep a
     // directory, and — for a name the listing now positively reports as a non-directory
@@ -1426,16 +1675,27 @@ impl Monitor {
     // detached-and-held move source (mid-move, out of `child_index` but still in the
     // adjacency set at its pre-move parent). A Partial listing may omit a still-present
     // child, and a persistently-Failed read never re-reads at all, so a gap-created
-    // descendant under any child would otherwise stay unwatched. `inherit_rearm` /
-    // `start_rearm` coalesce, so this cannot stack duplicate work across the bounded
-    // retries.
+    // descendant under any child would otherwise stay unwatched. On a REPROVE
+    // read the in-slot cascade must be the re-add, not the plain re-arm: this
+    // path may be the survivors' ONLY visit (an exhausted read never
+    // completes, and its completion is what would have re-added them), and an
+    // enumerate cascade would let a whole kept subtree reach `Live` on dead
+    // bindings with no post-loss acknowledgement. A detached-and-held child
+    // keeps the plain transfer — a held node is never a re-add target; its
+    // pairing resolution owns the reproof. `inherit_rearm` / `start_rearm` /
+    // `start_reinstall` all coalesce, so this cannot stack duplicate work
+    // across the bounded retries.
     let children: std::vec::Vec<WatchId> = self
       .nodes
       .get(&dir)
       .map(|node| node.children.iter().copied().collect())
       .unwrap_or_default();
     for child in children {
-      let _ = self.inherit_rearm(child);
+      if reprove && self.is_slot_child(dir, child) {
+        self.start_reinstall(child);
+      } else {
+        let _ = self.inherit_rearm(child);
+      }
     }
     // A held dir's `Rescan` would point at its stale pre-move path, so it is suppressed
     // (the pairing reparent re-scans the real destination); coverage above still retries.
@@ -1443,10 +1703,11 @@ impl Monitor {
       self.emit_rescan(scope, self.location_of(dir));
     }
     if attempts < REARM_MAX_RETRIES {
-      // Retry as a re-arm read (`Created`-suppressed); the count carries on the node so a
-      // permanently-unreadable directory escalates to the standing `Rescan` after a
-      // bounded number of tries rather than spinning the driver.
-      self.queue_enumerate(dir, EnumKind::Rearm, attempts + 1);
+      // Retry as a re-arm read (`Created`-suppressed, reprove flavor kept); the
+      // count carries on the node so a permanently-unreadable directory
+      // escalates to the standing `Rescan` after a bounded number of tries
+      // rather than spinning the driver.
+      self.queue_enumerate(dir, EnumKind::Rearm { reprove }, attempts + 1);
       return;
     }
     // Retries exhausted with an adoption edge still unverified: hand the
@@ -1516,7 +1777,7 @@ impl Monitor {
     }
     match self.nodes.get(&dir).map(|node| node.state) {
       Some(NodeState::Live) => {
-        self.queue_enumerate(dir, EnumKind::Rearm, 0);
+        self.queue_enumerate(dir, EnumKind::Rearm { reprove: false }, 0);
         RearmKickoff::Started
       }
       // Dirty the in-flight read AND reset its retry budget: the bounded ceiling is
@@ -1541,10 +1802,10 @@ impl Monitor {
         // true while a re-walk obligation is in flight.
         match kind {
           EnumKind::Cold => {
-            self.latent_cold.insert(req, scope);
+            self.latent_cold_insert(req, scope);
             RearmKickoff::Coalesced
           }
-          EnumKind::Rearm => RearmKickoff::Started,
+          EnumKind::Rearm { .. } => RearmKickoff::Started,
         }
       }
       _ => RearmKickoff::Refused,
@@ -1561,9 +1822,16 @@ impl Monitor {
       // Live (idle or enumerating): start_rearm reads now or dirties the in-flight read.
       Some(NodeState::Live) | Some(NodeState::Enumerating { .. }) => self.start_rearm(watch),
       // Still arming: its post-arm enumerate must continue the re-arm, so mark it —
-      // a counted obligation (`Arming { rearm: true }`).
-      Some(NodeState::Arming { .. }) => {
-        self.set_state(watch, NodeState::Arming { rearm: true });
+      // a counted obligation (`Arming { rearm: true }`). A reprove flavor
+      // already on the node rides along untouched (with its stamp).
+      Some(NodeState::Arming { reprove, .. }) => {
+        self.set_state(
+          watch,
+          NodeState::Arming {
+            rearm: true,
+            reprove,
+          },
+        );
         RearmKickoff::Started
       }
       // Dead — nothing to transfer.
@@ -1584,7 +1852,21 @@ impl Monitor {
   /// while one whose name vanished, whose identity changed, or whose identity cannot be
   /// confirmed is dropped and its slot rebuilt. Absent any identity this degrades to
   /// rebuilding every affected child — the safe default.
-  fn rearm_enumerate(&mut self, dir: WatchId, scope: ScopeId, res: &EnumerateResult) {
+  ///
+  /// A `reprove`-flavored read tightens the survivor rule: an identity match
+  /// proves only that the NAME still holds the same object, never that OUR
+  /// watch is still its live binding (an unmount+same-fs-remount matches every
+  /// identity over a tree of dead watches), so each kept survivor is RE-ADDED
+  /// ([`start_reinstall`](Self::start_reinstall)) rather than merely re-read.
+  /// Fresh installs are unchanged either way — their install acknowledgement
+  /// is their proof, and a fresh node has no retained descendants to flavor.
+  fn rearm_enumerate(
+    &mut self,
+    dir: WatchId,
+    scope: ScopeId,
+    res: &EnumerateResult,
+    reprove: bool,
+  ) {
     // Index the fresh listing's directories by name → identity.
     let present: BTreeMap<Segment, Option<Identity>> = res
       .entries()
@@ -1614,7 +1896,11 @@ impl Monitor {
         .and_then(|name| present.get(name).copied())
         .is_some_and(|fresh| self.identity_matches(child, fresh));
       if survives {
-        let _ = self.inherit_rearm(child);
+        if reprove {
+          self.start_reinstall(child);
+        } else {
+          let _ = self.inherit_rearm(child);
+        }
       } else {
         self.drop_subtree_for_crawl_rebuild(child);
       }
@@ -1672,7 +1958,7 @@ impl Monitor {
     let Some(name) = self.take_adoption_marker(dir, scope) else {
       return;
     };
-    if kind == EnumKind::Rearm || held {
+    if matches!(kind, EnumKind::Rearm { .. }) || held {
       return;
     }
     let entry = res.entries().iter().find(|entry| *entry.name() == name);
@@ -1698,7 +1984,18 @@ impl Monitor {
   /// On success the node becomes live and — when the core descends and the node
   /// is a directory — an [`Action::Enumerate`] is queued. The ordering "watch
   /// armed strictly before readdir" is a state-machine invariant, so the
-  /// enumerate is only ever queued *after* this success.
+  /// enumerate is only ever queued *after* this success. The
+  /// [`WatchAck`](crate::WatchAck) says HOW the arm bound: for a binding
+  /// re-proof (a loss-triggered re-add on a
+  /// [`lossy_watch_teardown`](Capabilities::lossy_watch_teardown) profile) an
+  /// [`Installed`](crate::WatchAck::Installed) proves the old binding was dead
+  /// or rebound — a dark window the settle edge's closing `Rescan` must cover —
+  /// while an [`Aliased`](crate::WatchAck::Aliased) proves it was live all
+  /// along; for a first-time install the distinction carries nothing. A
+  /// reprove `Ok` counts only when the arm was issued under the scope's
+  /// CURRENT loss generation: a stale acknowledgement may certify a binding a
+  /// later loss killed with its teardown swallowed, so the watch action is
+  /// re-issued and the node stays pending.
   ///
   /// Every non-success result is treated as coverage loss: the node and its
   /// subtree are dropped and a [`ChangeKind::Rescan`] is emitted for the affected
@@ -1707,14 +2004,14 @@ impl Monitor {
   /// watch-limit refusal, a permission denial, a vanished target, or any other
   /// I/O failure — none may leave a node registered-but-not-live and silent.
   #[cfg_attr(not(tarpaulin), inline)]
-  pub fn on_watch_result(&mut self, id: WatchId, res: Result<(), WatchError>) {
+  pub fn on_watch_result(&mut self, id: WatchId, res: Result<crate::WatchAck, WatchError>) {
     self.ingest_watch_result(id, res);
     self.settle_bridges();
   }
 
   /// [`on_watch_result`](Self::on_watch_result) minus the public entry
   /// point's bridge flush — a failed arm's drop can be the settle edge.
-  fn ingest_watch_result(&mut self, id: WatchId, res: Result<(), WatchError>) {
+  fn ingest_watch_result(&mut self, id: WatchId, res: Result<crate::WatchAck, WatchError>) {
     let Some(node) = self.nodes.get_mut(&id) else {
       return;
     };
@@ -1722,13 +2019,35 @@ impl Monitor {
     let is_dir = node.is_dir;
 
     match res {
-      Ok(()) => {
+      Ok(ack) => {
         // Only a pending (Arming) watch transitions to live. A duplicate or late `Ok` on
         // an already-armed node is ignored, not replayed: resetting it to `Live` would
         // clobber an outstanding `Enumerating` read and orphan its request.
-        let NodeState::Arming { rearm } = node.state else {
+        let NodeState::Arming { rearm, reprove } = node.state else {
           return;
         };
+        if reprove {
+          // A re-established binding is the positive proof of a dark window:
+          // between the loss and this install nothing recorded the subtree,
+          // so the settle edge owes the closing `Rescan` (the bit deliberately
+          // NOT set at entry for a reprove arm). Set even when the stamp below
+          // is stale — the window this ACK witnessed was real regardless, and
+          // the settle edge always postdates the final counted ACK.
+          if ack.is_installed() {
+            self.bridge_fresh_rearm(scope);
+          }
+          // The ACK-postdates-loss stamp: an arm issued before the scope's
+          // latest loss may certify a binding that loss killed with its
+          // teardown swallowed. Such an `Ok` is not proof — re-issue the
+          // watch under the current generation and stay pending. Bounded by
+          // the transport's per-ack-cycle loss dedup: each re-issue consumes
+          // one loss edge.
+          if self.reprove_stamps.get(&id).copied() != Some(self.loss_gen(scope)) {
+            self.queue_reinstall(id, scope);
+            return;
+          }
+          self.reprove_stamps.remove(&id);
+        }
         self.set_state(id, NodeState::Live);
         if is_dir && self.scope_descends(scope) {
           // Continue a rescan re-arm into this freshly-armed directory if it was installed
@@ -1737,7 +2056,11 @@ impl Monitor {
           // hold before the result returns, so tag it as a re-arm now (the intent persists
           // on `Enumerating.kind`). A cold discovery would else emit false `Created` for
           // pre-existing destination children after the move.
-          if rearm || self.in_held_subtree(id).is_some() {
+          if reprove {
+            // A re-proved binding's read carries the flavor on: its kept
+            // survivors are re-added in turn, so the proof reaches the leaves.
+            self.queue_enumerate(id, EnumKind::Rearm { reprove: true }, 0);
+          } else if rearm || self.in_held_subtree(id).is_some() {
             let _ = self.start_rearm(id);
           } else {
             self.queue_enumerate(id, EnumKind::Cold, 0);
@@ -1782,6 +2105,19 @@ impl Monitor {
   /// Turns a notification-queue overflow into a [`ChangeKind::Rescan`] covering
   /// exactly the affected scope AND reconciles the proto's own watch set for it, so
   /// nothing is silently lost and no post-overflow subtree is left unwatched.
+  ///
+  /// On a [`lossy_watch_teardown`](Capabilities::lossy_watch_teardown)
+  /// descending profile, a scope-level loss ([`Scope::Root`] and the
+  /// [`Scope::All`] arm) additionally RE-PROVES every retained kernel binding:
+  /// the dropped window may have carried per-watch teardown records (an
+  /// unmount's whole tree of them), so an identity-matched survivor may be
+  /// kernel-dead and only an acknowledged re-add — issued under the loss
+  /// generation this input bumps — may keep it. The re-adds ride the states
+  /// [`rearm_settled`](Self::rearm_settled) already counts, so
+  /// [`coverage_settled`](Self::coverage_settled) (and every barrier built on
+  /// it) cannot settle before every binding acknowledgement lands. Located
+  /// ([`Scope::Subtree`]) overflows carry no kernel-loss evidence and never
+  /// re-prove.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn on_overflow(&mut self, scope: Scope, _now: Instant) {
     match scope {
@@ -1793,7 +2129,7 @@ impl Monitor {
           // unheld pending half's window was interleaved (the root location prefixes
           // every source).
           self.dirty_pending_sources_touching(scope_id, &Location::new(), None, None);
-          self.rescan_and_rearm(scope_id, root);
+          self.scope_loss_recovery(scope_id, root);
         }
         // The root re-arm may build temporary destination coverage for a held source's
         // move; the pairing reparent would drop it and re-arm nothing if the temp re-arm
@@ -1807,7 +2143,7 @@ impl Monitor {
         // (the `Subtree` arm below guards symmetrically via `scope_of`).
         if let Some(&root) = self.roots.get(&scope_id) {
           self.dirty_pending_sources_touching(scope_id, &Location::new(), None, None);
-          self.rescan_and_rearm(scope_id, root);
+          self.scope_loss_recovery(scope_id, root);
           self.dirty_held_sources(Some(scope_id));
         }
       }
@@ -1992,6 +2328,122 @@ impl Monitor {
     let _ = self.start_rearm(dir);
   }
 
+  /// One scope-level loss recovery: the covering root `Rescan` plus the watch-set
+  /// reconcile — as a binding-re-proving reinstall on a
+  /// [`lossy_watch_teardown`](Capabilities::lossy_watch_teardown) profile (the
+  /// loss generation is bumped FIRST, so every arm already in flight is stale
+  /// and the recovery's own re-adds stamp current), as the plain enumerate
+  /// re-arm otherwise. The `Rescan` is minted before the reinstall either way:
+  /// lag entry relies on the mint being synchronous with the loss input.
+  fn scope_loss_recovery(&mut self, scope: ScopeId, root: WatchId) {
+    if !self.scope_reproves_bindings(scope) {
+      self.rescan_and_rearm(scope, root);
+      return;
+    }
+    self.bump_loss_gen(scope);
+    self.emit_rescan(scope, self.location_of(root));
+    self.start_reinstall(root);
+  }
+
+  /// Requires `watch`'s kernel binding to be re-proven by an acknowledged
+  /// re-add — the only sound instrument for "is OUR watch the live binding of
+  /// what the path names" on a backend whose teardown records are losable.
+  /// The node enters `Arming { rearm: true, reprove: true }` (counted, so the
+  /// scope reads unsettled until the acknowledgement chain completes) and the
+  /// re-add is issued stamped with the current loss generation:
+  ///
+  /// - **Live** — issue the re-add; the post-ACK read continues the reproof
+  ///   downward.
+  /// - **Enumerating** (re-arm or cold) — the read's snapshot cannot vouch for
+  ///   the binding it rode on, so supersede it: the orphaned request is
+  ///   dropped by the existing name-the-request rule (and a latent coalesced
+  ///   obligation is reclaimed — the reproof is a counted successor), and the
+  ///   re-add is issued.
+  /// - **Arming** — coalesce: one watch action per node is outstanding by
+  ///   construction, and the in-flight arm predates the loss, so it is left
+  ///   stamped stale (a missing stamp, or one from an earlier generation) —
+  ///   its `Ok` ACK re-issues under the current generation instead of
+  ///   counting. The node is marked reprove so the stamp rule applies.
+  ///
+  /// Dead nodes have nothing to re-prove. Held (mid-move) subtrees are never
+  /// targeted: the scope entry point re-adds only the root (never held), and
+  /// the crawl re-adds only in-slot survivors.
+  fn start_reinstall(&mut self, watch: WatchId) {
+    let Some(scope) = self.scope_of(watch) else {
+      return;
+    };
+    match self.nodes.get(&watch).map(|node| node.state) {
+      Some(NodeState::Live) => {
+        self.set_state(
+          watch,
+          NodeState::Arming {
+            rearm: true,
+            reprove: true,
+          },
+        );
+        self.queue_reinstall(watch, scope);
+      }
+      Some(NodeState::Enumerating { req, .. }) => {
+        self.pending_enumerate.remove(&req);
+        self.latent_cold.remove(&req);
+        self.set_state(
+          watch,
+          NodeState::Arming {
+            rearm: true,
+            reprove: true,
+          },
+        );
+        self.queue_reinstall(watch, scope);
+      }
+      Some(NodeState::Arming { .. }) => {
+        // The in-flight arm becomes the reproof vehicle: one watch action per
+        // node is outstanding, so nothing new is issued. A plain arm was
+        // issued before this trigger's generation bump — stamp it one behind
+        // (provably stale), so its ACK re-issues under the current generation
+        // instead of counting. An existing reprove stamp is kept: it already
+        // records that arm's true issue generation.
+        self.set_state(
+          watch,
+          NodeState::Arming {
+            rearm: true,
+            reprove: true,
+          },
+        );
+        // Every reproof trigger runs with a loss on record ([`scope_needs_reproof`]
+        // gates the heal and pairing funnels; the scope-loss entry bumps first),
+        // so the one-behind stamp is genuinely BEHIND — a saturated 0 == 0
+        // would let the in-flight ACK count without a postdating proof.
+        //
+        // [`scope_needs_reproof`]: Self::scope_needs_reproof
+        debug_assert!(
+          self.loss_gen(scope) > 0,
+          "a binding reproof is only ever triggered past a recorded loss"
+        );
+        let stale = self.loss_gen(scope).saturating_sub(1);
+        self.reprove_stamps.entry(watch).or_insert(stale);
+      }
+      None => {}
+    }
+  }
+
+  /// Issues the re-add [`Action::Watch`] for a reprove-arming node — the
+  /// root's own re-add as [`WatchTarget::RearmRoot`](crate::action::WatchTarget::RearmRoot)
+  /// (never the stream-spawning root bootstrap), a child's through its
+  /// existing `(parent, name)` addressing — and stamps it with the scope's
+  /// current loss generation.
+  fn queue_reinstall(&mut self, watch: WatchId, scope: ScopeId) {
+    let Some(node) = self.nodes.get(&watch) else {
+      return;
+    };
+    let target = match node.parent.zip(node.name.clone()) {
+      Some((parent, name)) => crate::action::WatchTarget::child(parent, name),
+      None => crate::action::WatchTarget::RearmRoot(scope),
+    };
+    let mask = Self::coverage_mask(self.scope_interest(scope));
+    self.actions.push_back(Action::watch(watch, target, mask));
+    self.reprove_stamps.insert(watch, self.loss_gen(scope));
+  }
+
   /// Advances time, resolving move halves whose pairing window has elapsed: an
   /// unpaired source becomes a [`ChangeKind::Removed`] (a watched-directory
   /// source's subtree was already dropped when it moved away, in `on_moved_from`).
@@ -2101,6 +2553,19 @@ impl Monitor {
           if self.held_sources.insert(src) {
             self.held_by_scope_inc(scope);
           }
+          // A hold born while the scope's binding reproof is unsettled leaves
+          // the recovery's reach (the crawl re-adds only in-slot survivors),
+          // and an in-slot subtree is unproven only while an ancestor's
+          // reproof is still counted — so this detach is exactly where an
+          // unproven retained subtree can escape the crawl. Born-dirty the
+          // hold: its pairing then re-adds the reparented source instead of
+          // trusting the O(1) carry-over, so a kernel-dead subtree cannot
+          // reach `Live` with no post-loss acknowledgement. Re-dirtying an
+          // already-flavored or already-proven source costs its pairing one
+          // bounded re-add; a settled scope pays nothing.
+          if self.scope_needs_reproof(scope) && !self.rearm_settled(scope) {
+            self.dirtied_holds.insert(src);
+          }
         }
         let pending = PendingMove {
           from_parent,
@@ -2121,7 +2586,7 @@ impl Monitor {
         // reused/colliding cookie collides on this composite key. The displaced
         // half can no longer be paired, so it resolves on its own rather than
         // being silently overwritten.
-        if let Some(displaced) = self.pending_moves.insert((scope, cookie), pending) {
+        if let Some(displaced) = self.park_pending_move(scope, cookie, pending) {
           self.resolve_stored_half(displaced);
         }
       }
@@ -2195,8 +2660,20 @@ impl Monitor {
               if dirtied {
                 // Records under the moved subtree were suppressed at the stale path:
                 // re-scan the destination and re-arm the subtree to recover them.
+                // A scope-level loss during the hold also DIRTIES it (the
+                // recovery deliberately skips a held subtree), so on a
+                // binding-re-proving scope with a loss on record the re-arm
+                // must be the re-add: the reparented source is in-slot at the
+                // destination now, and its acknowledged re-add — resolved
+                // through the live path — is what re-proves the subtree the
+                // recovery could not reach (a plain read would keep every
+                // identity-matched descendant on possibly-dead bindings).
                 self.emit_rescan(scope, to);
-                let _ = self.inherit_rearm(src);
+                if self.scope_needs_reproof(scope) {
+                  self.start_reinstall(src);
+                } else {
+                  let _ = self.inherit_rearm(src);
+                }
               }
             } else {
               // Not reparentable: a dead or cyclic held source, or a reparent that
@@ -2662,9 +3139,12 @@ impl Monitor {
     self.drop_subtree(root, DeficitDischarge::Teardown);
     self.purge_scope_pending_moves(scope);
     // As for `unregister_root`: the caller's unconditional `Rescan` plus the
-    // teardown own coverage now — no bridge window or deficit book survives.
+    // teardown own coverage now — no bridge window, deficit book, loss
+    // generation, or coverage-work generation survives.
     self.bridge.remove(&scope);
     self.deficits.remove(&scope);
+    self.loss_gens.remove(&scope);
+    self.coverage_work_epochs.remove(&scope);
   }
 
   fn on_delete_self(&mut self, scope: ScopeId, rec: &OsRecord) {
@@ -2882,8 +3362,19 @@ impl Monitor {
       self.rearm_pending_inc(node.scope);
     }
     // A node BORN into `Arming { rearm: true }` is the same suppressed fresh
-    // install as a transition into it (see `set_state`).
-    if matches!(node.state, NodeState::Arming { rearm: true }) {
+    // install as a transition into it (see `set_state`). No node is ever born
+    // reproving — a reproof targets an already-tracked binding.
+    debug_assert!(
+      !matches!(node.state, NodeState::Arming { reprove: true, .. }),
+      "a freshly-minted node has no prior binding to re-prove"
+    );
+    if matches!(
+      node.state,
+      NodeState::Arming {
+        rearm: true,
+        reprove: false
+      }
+    ) {
       self.bridge_fresh_rearm(node.scope);
     }
     self.nodes.insert(id, node);
@@ -2925,7 +3416,10 @@ impl Monitor {
         scope,
         is_dir,
         identity,
-        state: NodeState::Arming { rearm: false },
+        state: NodeState::Arming {
+          rearm: false,
+          reprove: false,
+        },
         children: BTreeSet::new(),
       },
     );
@@ -3021,6 +3515,8 @@ impl Monitor {
         self.held_by_scope_dec(node.scope);
       }
       self.dirtied_holds.remove(&id);
+      // A dropped reprove arm's outstanding stamp dies with the node.
+      self.reprove_stamps.remove(&id);
       // An adoption edge awaiting this node's read dies with it — and an
       // UNVERIFIED adoption is erased COVERAGE, exactly like an erased
       // deficit: the adopted subtree's watches are being disarmed while its
@@ -3105,9 +3601,15 @@ impl Monitor {
     self.drop_subtree(child, DeficitDischarge::Reanchor);
   }
 
-  /// Drops every pending move half belonging to `scope`. Called only on whole-scope
-  /// teardown ([`unregister_root`](Self::unregister_root)), where no destination in
-  /// the scope can ever validly arrive, so no half can pair (invariant b).
+  /// Drops every pending move half belonging to `scope`. Called only where the
+  /// scope's whole world ends — consumer teardown ([`unregister_root`](Self::unregister_root)),
+  /// OS-driven root loss ([`invalidate_root`](Self::invalidate_root)), and a transport
+  /// swap's rebuild ([`rebind_root`](Self::rebind_root)) — so no destination the halves
+  /// could pair with can ever validly arrive (invariant b). Each caller emits or owns a
+  /// covering `Rescan` for the whole scope, which is what lets the halves go
+  /// undelivered: this releases the moves conjunct of
+  /// [`coverage_settled`](Self::coverage_settled) wholesale, and the barrier may only
+  /// re-open on coverage no longer under discussion.
   fn purge_scope_pending_moves(&mut self, scope: ScopeId) {
     self
       .pending_moves
@@ -3177,14 +3679,24 @@ impl Monitor {
     };
     let was = node.state.is_rearm();
     let is = state.is_rearm();
-    let entered_fresh = matches!(state, NodeState::Arming { rearm: true })
-      && !matches!(node.state, NodeState::Arming { rearm: true });
+    let entered_fresh = matches!(
+      state,
+      NodeState::Arming {
+        rearm: true,
+        reprove: false
+      }
+    ) && !matches!(node.state, NodeState::Arming { rearm: true, .. });
     let scope = node.scope;
     node.state = state;
     // A node ENTERING `Arming { rearm: true }` is a `Created`-suppressed
     // fresh install (or a cold→re-arm conversion whose discovery is now
     // suppressed): the bridge window armed coverage whose content only a
-    // closing `Rescan` can instruct the consumer to re-read.
+    // closing `Rescan` can instruct the consumer to re-read. A REPROVE entry
+    // deliberately sets nothing here — whether a dark window existed is
+    // unknown until its acknowledgement, which sets the bit iff the binding
+    // was re-established (`Installed`); marking at entry would cost one
+    // closing `Rescan` per ordinary overflow recovery whose bindings were all
+    // live.
     if entered_fresh {
       self.bridge_fresh_rearm(scope);
     }
@@ -3198,9 +3710,20 @@ impl Monitor {
     }
   }
 
+  /// Advances `scope`'s coverage-work epoch — called from EVERY funnel through
+  /// which one of [`coverage_settled`](Self::coverage_settled)'s stores gains
+  /// an entry for the scope, and from nowhere else. Anything that adds a
+  /// further conjunct owes its acquisition funnel a call here, or a proof
+  /// stamped with this epoch would survive the very window the new conjunct
+  /// exists to hold open.
+  fn acquired_coverage_work(&mut self, scope: ScopeId) {
+    *self.coverage_work_epochs.entry(scope).or_insert(0) += 1;
+  }
+
   /// Counts one node of `scope` entering a re-arm-flavored state.
   fn rearm_pending_inc(&mut self, scope: ScopeId) {
     *self.rearm_pending.entry(scope).or_insert(0) += 1;
+    self.acquired_coverage_work(scope);
   }
 
   /// Counts one node of `scope` leaving a re-arm-flavored state (or being removed
@@ -3218,6 +3741,7 @@ impl Monitor {
   /// `held_sources` insert actually inserted, so the count mirrors membership.
   fn held_by_scope_inc(&mut self, scope: ScopeId) {
     *self.held_by_scope.entry(scope).or_insert(0) += 1;
+    self.acquired_coverage_work(scope);
   }
 
   /// Counts one held move source of `scope` released — called iff the
@@ -3419,6 +3943,26 @@ impl Monitor {
     }
   }
 
+  /// The `(name, identity)` of every in-slot child watch of `dir` — the
+  /// directory listing a faithful read of a filesystem matching the tree
+  /// would return. For the property storms, whose enumerate results must
+  /// track the tree through moves for identity-matched survivors to arise.
+  #[cfg(test)]
+  fn slot_children(&self, dir: WatchId) -> std::vec::Vec<(Segment, Option<Identity>)> {
+    let Some(node) = self.nodes.get(&dir) else {
+      return std::vec::Vec::new();
+    };
+    node
+      .children
+      .iter()
+      .filter(|child| self.is_slot_child(dir, **child))
+      .filter_map(|child| {
+        let child = self.nodes.get(child)?;
+        Some((child.name.clone()?, child.identity))
+      })
+      .collect()
+  }
+
   /// Whether `dir` has a rescan re-arm read outstanding — the successor to the old
   /// `rearm_dirs` membership, for white-box tests.
   #[cfg(test)]
@@ -3426,7 +3970,7 @@ impl Monitor {
     matches!(
       self.nodes.get(&dir).map(|node| node.state),
       Some(NodeState::Enumerating {
-        kind: EnumKind::Rearm,
+        kind: EnumKind::Rearm { .. },
         ..
       })
     )
@@ -3651,6 +4195,30 @@ impl Monitor {
       adopting, self.adopting_by_scope,
       "the adoption settle counter mirrors the marker map exactly"
     );
+    // The reprove-stamp map mirrors `Arming { reprove: true }` membership
+    // exactly: every outstanding reproof is stamped, no stamp outlives its
+    // arm, and a reproof is always re-arm-flavored.
+    let mut reproving: BTreeSet<WatchId> = BTreeSet::new();
+    for (id, node) in &self.nodes {
+      if let NodeState::Arming { rearm, reprove } = node.state {
+        assert!(rearm || !reprove, "a reprove arm is always re-arm-flavored");
+        if reprove {
+          reproving.insert(*id);
+        }
+      }
+    }
+    assert_eq!(
+      self.reprove_stamps.keys().copied().collect::<BTreeSet<_>>(),
+      reproving,
+      "the reprove-stamp map mirrors reprove-arming membership exactly"
+    );
+    for (id, stamp) in &self.reprove_stamps {
+      let scope = self.scope_of(*id).expect("a stamped arm is a live node");
+      assert!(
+        *stamp <= self.loss_gen(scope),
+        "no stamp postdates its scope's loss generation"
+      );
+    }
     // Every latent cold read is an outstanding request whose node still names
     // it, reads COLD, was dirtied by the coalesced trigger, and belongs to the
     // recorded scope — the exact mirror of the insert edge.
