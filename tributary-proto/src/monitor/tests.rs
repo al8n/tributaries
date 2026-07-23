@@ -8395,3 +8395,771 @@ fn a_crawl_drop_without_rebuild_keeps_the_loss_booked() {
   assert!(events[1].epoch() > events[0].epoch());
   m.assert_invariants();
 }
+
+// ---------------------------------------------------------------------------
+// Same-transport widen: `widen_root` + the adoption tripwire.
+// ---------------------------------------------------------------------------
+
+/// A live, idle descending root with one armed, idle child directory `kid`
+/// (identity 70) — the old world every widen cell adopts.
+fn widen_base(m: &mut Monitor, s: ScopeId) -> (WatchId, WatchId) {
+  let root = live_root_idle(m, s);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("kid"))
+      .with_is_dir(true)
+      .with_node(ident(70)),
+    at(1),
+  );
+  let kid = arm_named_child(m, root, "kid");
+  let _ = drain_events(m);
+  (root, kid)
+}
+
+/// Arms the queued child watch `(parent, name)` and settles its cold read.
+fn arm_named_child(m: &mut Monitor, parent: WatchId, name: &str) -> WatchId {
+  let id = drain_actions(m)
+    .iter()
+    .filter_map(|a| a.as_watch())
+    .find(|c| {
+      c.target()
+        .as_child()
+        .is_some_and(|ch| ch.parent() == parent && ch.name().as_str() == name)
+    })
+    .map(|c| c.id())
+    .expect("the child watch was queued");
+  m.on_watch_result(id, Ok(()));
+  let boot = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == id).map(|e| e.req()))
+    .expect("the child cold read was queued");
+  m.on_enumerate(boot, EnumerateResult::Ok(Vec::new()));
+  id
+}
+
+/// The outstanding enumerate request reading `dir`.
+fn read_of(m: &mut Monitor, dir: WatchId) -> ReqId {
+  drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == dir).map(|e| e.req()))
+    .expect("the read was queued")
+}
+
+#[test]
+fn widen_root_depth_one_splices_without_touching_the_old_subtree() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+
+  // Epoch baseline: the widen must not dominate anything after this.
+  m.on_os_record(
+    OsRecord::new(old_root, RecordKind::Created).with_name(seg("pre.txt")),
+    at(2),
+  );
+  let pre = drain_events(&mut m).pop().expect("pre-widen delivery");
+  assert!(pre.kind().is_created());
+  assert_eq!(pre.location(), &loc(&["pre.txt"]));
+
+  let reserved = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1))),
+    Some(reserved)
+  );
+  m.assert_invariants();
+
+  // The commit itself: no action (a depth-one widen mints no chain and the new
+  // root's arm is the caller's), no event, no epoch bump, no counted work, and
+  // the old subtree bit-identical (both watches live, no Unwatch queued). The
+  // UNVERIFIED adoption is the one thing standing: it holds the BARRIER
+  // predicate (never the re-arm one) until the tail's read confirms the edge.
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "the splice queues nothing"
+  );
+  assert!(drain_events(&mut m).is_empty(), "the splice emits nothing");
+  assert!(m.rearm_settled(s), "the splice counts no re-arm work");
+  assert!(
+    !m.coverage_settled(s),
+    "the unverified adoption holds the barrier"
+  );
+  assert!(m.is_watched(old_root) && m.is_watched(kid));
+
+  // Old-subtree deliveries reconstruct through the adopted edge at the SAME
+  // epoch — continuity, not domination.
+  m.on_os_record(
+    OsRecord::new(old_root, RecordKind::Created).with_name(seg("x.txt")),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(kid, RecordKind::Created).with_name(seg("y.txt")),
+    at(3),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 2, "{events:?}");
+  assert_eq!(events[0].location(), &loc(&["b", "x.txt"]));
+  assert_eq!(events[1].location(), &loc(&["b", "kid", "y.txt"]));
+  assert_eq!(
+    events[0].epoch(),
+    pre.epoch(),
+    "no reconciliation generation bump"
+  );
+
+  // The replayed pre-arm brings the new root live and starts its COLD read;
+  // its confirming completion releases the barrier.
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  assert!(
+    m.coverage_settled(s),
+    "positive verification releases the barrier"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn widen_root_deep_chain_arms_top_down_and_adopts_at_the_tail() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid) = widen_base(&mut m, s);
+
+  let reserved = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(
+      s,
+      reserved,
+      vec![seg("b"), seg("c"), seg("d")],
+      Some(ident(1))
+    ),
+    Some(reserved)
+  );
+  m.assert_invariants();
+
+  // Exactly the two connector arms, top-down: (reserved, "b") then (b, "c").
+  let actions = drain_actions(&mut m);
+  let watches: Vec<_> = actions.iter().filter_map(|a| a.as_watch()).collect();
+  assert_eq!(watches.len(), 2, "{actions:?}");
+  let b = watches[0].id();
+  assert!(
+    watches[0]
+      .target()
+      .as_child()
+      .is_some_and(|ch| ch.parent() == reserved && ch.name().as_str() == "b")
+  );
+  assert!(
+    watches[1]
+      .target()
+      .as_child()
+      .is_some_and(|ch| ch.parent() == b && ch.name().as_str() == "c")
+  );
+  assert!(drain_events(&mut m).is_empty());
+
+  // The adopted edge sits at the tail: deliveries reconstruct the full chain.
+  m.on_os_record(
+    OsRecord::new(old_root, RecordKind::Created).with_name(seg("f")),
+    at(2),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events[0].location(), &loc(&["b", "c", "d", "f"]));
+  m.assert_invariants();
+}
+
+#[test]
+fn adoption_confirmed_by_a_matching_listing_stays_silent() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+      DirEntry::new(seg("fresh"), FileKind::Dir).with_node(ident(9)),
+    ]),
+  );
+  // Cold discovery announces the newly covered ground as state facts; the
+  // adopted slot is REUSED (no rebuild, no rescan) and its interior untouched.
+  let events = drain_events(&mut m);
+  assert!(events.iter().all(|e| e.kind().is_created()), "{events:?}");
+  assert!(m.is_watched(old_root) && m.is_watched(kid));
+  let actions = drain_actions(&mut m);
+  let armed: Vec<_> = actions.iter().filter_map(|a| a.as_watch()).collect();
+  assert_eq!(
+    armed.len(),
+    1,
+    "only the genuinely new slot arms: {actions:?}"
+  );
+  assert!(
+    armed[0]
+      .target()
+      .as_child()
+      .is_some_and(|ch| ch.name().as_str() == "fresh")
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn adoption_name_vanished_escalates_the_scope_root() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+
+  // The adopted name is absent from a COMPLETE listing: the subtree's true
+  // path is unknowable — one covering root Rescan plus a counted re-arm.
+  m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "{events:?}"
+  );
+  assert!(!m.rearm_settled(s), "the escalation is counted work");
+  m.assert_invariants();
+}
+
+#[test]
+fn adoption_identity_mismatch_escalates_the_scope_root() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(99)),
+    ]),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "a positively different object at the adopted slot is a stale edge: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn adoption_after_a_recorded_death_stands_a_located_rescan() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+
+  // The adopted subtree dies through its own records mid-window — with no
+  // armed parent to mint the parent-side Removed.
+  m.on_os_record(OsRecord::new(old_root, RecordKind::DeleteSelf), at(2));
+  assert!(!m.is_watched(old_root));
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["b"])),
+    "the unrecorded final teardown owes the vacated slot a re-read: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn adoption_slot_reoccupied_rescans_and_installs_the_new_object() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.on_os_record(OsRecord::new(old_root, RecordKind::DeleteSelf), at(2));
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(100)),
+    ]),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["b"])),
+    "{events:?}"
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["b"])),
+    "{events:?}"
+  );
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions.iter().filter_map(|a| a.as_watch()).any(|c| {
+      c.target()
+        .as_child()
+        .is_some_and(|ch| ch.parent() == reserved && ch.name().as_str() == "b")
+    }),
+    "the new occupant arms through the ordinary reconcile: {actions:?}"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn a_partial_first_read_keeps_the_adoption_pending() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+
+  // An incomplete first read must not silently confirm the edge: the bounded
+  // retry (re-arm-flavored) re-checks, and its prune resolves the stale edge
+  // through the crawl-rebuild machinery.
+  m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+  let _ = drain_events(&mut m);
+  let retry = read_of(&mut m, reserved);
+  m.on_enumerate(retry, EnumerateResult::Ok(Vec::new()));
+  assert!(
+    !m.is_watched(old_root),
+    "the vanished adopted edge is pruned, never silently trusted"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn widen_preserves_a_pending_move_across_the_commit() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+
+  // A watched-directory source detaches-and-holds before the widen...
+  m.on_os_record(
+    OsRecord::new(old_root, RecordKind::MovedFrom)
+      .with_name(seg("kid"))
+      .with_is_dir(true)
+      .with_cookie(cookie(5)),
+    at(2),
+  );
+  let reserved = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1))),
+    Some(reserved)
+  );
+  assert!(m.is_watched(kid), "the held source rides across the widen");
+
+  // ...and its destination pairs AFTER it, on the same transport, with both
+  // sides reconstructed through the adopted chain.
+  m.on_os_record(
+    OsRecord::new(old_root, RecordKind::MovedTo)
+      .with_name(seg("kid2"))
+      .with_is_dir(true)
+      .with_cookie(cookie(5)),
+    at(3),
+  );
+  let events = drain_events(&mut m);
+  let moved = events
+    .iter()
+    .find(|e| e.kind().is_moved())
+    .expect("the pair resolves as a Moved");
+  assert_eq!(moved.location(), &loc(&["b", "kid2"]));
+  assert_eq!(moved.kind().moved_from(), Some(&loc(&["b", "kid"])));
+  m.assert_invariants();
+}
+
+#[test]
+fn widen_preserves_the_deficit_book_and_its_resignal_addressing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid) = widen_base(&mut m, s);
+
+  // A refused arm records level-persistent darkness under the OLD world.
+  m.on_os_record(
+    OsRecord::new(old_root, RecordKind::Created)
+      .with_name(seg("dark"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let dark = drain_actions(&mut m)
+    .iter()
+    .filter_map(|a| a.as_watch())
+    .find(|c| {
+      c.target()
+        .as_child()
+        .is_some_and(|ch| ch.name().as_str() == "dark")
+    })
+    .map(|c| c.id())
+    .expect("the dark slot's arm was queued");
+  m.on_watch_result(dark, Err(WatchError::NoSpace));
+  let _ = drain_events(&mut m);
+  assert!(m.has_coverage_deficit(s));
+
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  assert!(
+    m.has_coverage_deficit(s),
+    "the old world's standing darkness survives — nothing of it was discharged"
+  );
+  assert!(m.resignal_coverage_deficits(s));
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["b", "dark"])),
+    "the re-signal addresses the slot through the adopted chain: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn widen_refuses_kr_unknown_and_empty_chains() {
+  let mut m = kernel_recursive();
+  let s = scope(1);
+  let root = m.register_root(s, Interest::all());
+  m.on_watch_result(root, Ok(()));
+  let _ = drain_actions(&mut m);
+  let reserved = m.reserve_watch_id();
+  assert_eq!(m.widen_root(s, reserved, vec![seg("b")], None), None);
+
+  let mut m = per_dir();
+  let reserved = m.reserve_watch_id();
+  assert_eq!(m.widen_root(scope(9), reserved, vec![seg("b")], None), None);
+
+  let s = scope(1);
+  let _root = live_root_idle(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  assert_eq!(m.widen_root(s, reserved, Vec::new(), None), None);
+  let other = m.reserve_watch_id();
+  assert_ne!(reserved, other, "reservations are never reused");
+}
+
+#[test]
+fn rebind_after_a_depth_one_widen_purges_the_marker() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+
+  // A D1 rebind of the widened scope keeps the (new) root node; the adoption
+  // marker keyed on it must die with the old world, and the rebound root's
+  // re-arm-flavored rebuild proceeds without an adoption escalation.
+  assert_eq!(m.rebind_root(s), Some(reserved));
+  let _ = drain_events(&mut m);
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_rescan()),
+    "no stale adoption escalation after the rebind: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn widen_while_the_old_root_is_enumerating_reconciles_the_late_read() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let old_root = live_root(&mut m, s);
+  let boot = read_of(&mut m, old_root);
+
+  let reserved = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1))),
+    Some(reserved)
+  );
+
+  // The outstanding old-world read survives the splice and reconciles under
+  // the adopted node, addressed through the chain.
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("late"), FileKind::Dir).with_node(ident(4)),
+    ]),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["b", "late"])),
+    "{events:?}"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn back_to_back_widens_keep_independent_adoption_markers() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid) = widen_base(&mut m, s);
+
+  // Two widens splice before either tail's first read resolves: one scope
+  // carries TWO live adoption markers (on distinct, freshly-minted tails).
+  let first = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, first, vec![seg("b")], Some(ident(1))),
+    Some(first)
+  );
+  let second = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, second, vec![seg("mid")], Some(ident(1))),
+    Some(second)
+  );
+  m.assert_invariants();
+
+  // Deliveries reconstruct through BOTH adopted edges immediately.
+  m.on_os_record(
+    OsRecord::new(old_root, RecordKind::Created).with_name(seg("x.txt")),
+    at(2),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events[0].location(), &loc(&["mid", "b", "x.txt"]));
+
+  // Each marker resolves independently and silently on its own confirming
+  // read — inner first, then outer.
+  m.on_watch_result(second, Ok(()));
+  let outer = read_of(&mut m, second);
+  m.on_enumerate(
+    outer,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("mid"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  m.on_watch_result(first, Ok(()));
+  let inner = read_of(&mut m, first);
+  m.on_enumerate(
+    inner,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_rescan()),
+    "both confirmations are silent: {events:?}"
+  );
+  assert!(m.is_watched(old_root));
+  m.assert_invariants();
+}
+
+#[test]
+fn an_unverified_adoption_holds_the_barrier_through_retries() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  assert!(!m.coverage_settled(s), "unverified from the commit instant");
+
+  // An INCOMPLETE first read must not release the barrier: the marker stays
+  // (the retry re-checks) and the bounded retry is itself counted work.
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+  let _ = drain_events(&mut m);
+  assert!(!m.coverage_settled(s), "an incomplete read keeps the hold");
+
+  // The incomplete read queued BOTH the bounded retry and the cascade into
+  // the adopted child; settle that cascade first, then let the retry confirm.
+  let actions = drain_actions(&mut m);
+  let retry = actions
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == reserved)
+        .map(|e| e.req())
+    })
+    .expect("the bounded retry was queued");
+  let cascade = actions
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == old_root)
+        .map(|e| e.req())
+    })
+    .expect("the incomplete read cascades into the adopted child");
+  m.on_enumerate(cascade, EnumerateResult::Ok(Vec::new()));
+  assert!(!m.coverage_settled(s), "the marker still holds");
+
+  // The retry (re-arm-flavored) confirms the survivor by identity and hands
+  // the obligation to the counted rearm cascade; the barrier releases only
+  // once THAT quiesces — never before the edge is positively verified.
+  m.on_enumerate(
+    retry,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  assert!(m.is_watched(old_root), "the confirmed survivor is kept");
+  assert!(
+    !m.coverage_settled(s),
+    "the survivor's cascaded re-arm is still counted"
+  );
+  let down = read_of(&mut m, old_root);
+  m.on_enumerate(down, EnumerateResult::Ok(Vec::new()));
+  let _ = drain_events(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "verification plus a quiesced cascade releases the barrier"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn a_mismatch_releases_the_barrier_only_with_its_escalation_standing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+
+  // The adopted name vanished: the marker resolves WITH the root Rescan
+  // emitted and the counted root re-arm installed — so the scope stays
+  // unsettled past the marker's removal, and by the time it settles the
+  // covering signal is already ahead of any cookie.
+  m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "{events:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "the escalation's counted re-arm holds the barrier"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn a_connector_reconciled_away_stands_the_closing_rescan() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("a"), seg("b")], Some(ident(1))),
+    Some(reserved)
+  );
+  let _ = drain_actions(&mut m);
+  m.on_watch_result(reserved, Ok(()));
+  let req = read_of(&mut m, reserved);
+
+  // The dark window replaced the connector with a FILE: the widened root's
+  // cold listing reconciles the slot, which tears down the connector, the
+  // adopted old tree, and the pending marker in one drop — an erased
+  // UNVERIFIED adoption, discharged like an erased deficit: the settle
+  // flush's closing root Rescan stands, loudly, where silence would have
+  // disarmed every old watch with no signal at all.
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::File)]),
+  );
+  assert!(!m.is_watched(old_root) && !m.is_watched(kid));
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "the erased adoption owes the closing root Rescan: {events:?}"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "with the signal standing, the barrier honestly settles"
+  );
+  m.assert_invariants();
+}
+
+#[test]
+fn an_exhausted_tail_read_hands_the_marker_to_the_deficit() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.on_watch_result(reserved, Ok(()));
+
+  // A permanently unreadable widened root: the bounded retries exhaust. The
+  // marker must hand off to the standing `Rescan` + interior deficit — the
+  // barrier then resolves DEGRADED (the dispatch re-signal covers the cookie)
+  // instead of wedging forever on a read that will never complete. The tail
+  // keeps answering Partial; every cascaded read into the (readable) adopted
+  // subtree completes clean.
+  for _ in 0..3 {
+    assert!(!m.coverage_settled(s), "unresolved while retries remain");
+    let mut fed_tail = false;
+    for (req, dir) in drain_actions(&mut m)
+      .iter()
+      .filter_map(|a| a.as_enumerate().map(|e| (e.req(), e.dir())))
+    {
+      if dir == reserved {
+        m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+        fed_tail = true;
+      } else {
+        m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+      }
+    }
+    assert!(fed_tail, "the tail read is outstanding");
+  }
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "the exhaustion's covering Rescan stands: {events:?}"
+  );
+  // The incomplete completions cascaded COUNTED re-arms into the adopted
+  // subtree — bounded, completable work (the adopted dirs are readable);
+  // drain it. The marker itself is gone: nothing un-completable remains.
+  for _ in 0..8 {
+    let reads: Vec<ReqId> = drain_actions(&mut m)
+      .iter()
+      .filter_map(|a| a.as_enumerate().map(|e| e.req()))
+      .collect();
+    if reads.is_empty() {
+      break;
+    }
+    for req in reads {
+      m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+    }
+  }
+  let _ = drain_events(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "the exhausted marker no longer wedges the barrier: rearm_settled={} deficit={}",
+    m.rearm_settled(s),
+    m.has_coverage_deficit(s),
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the darkness is booked for the dispatch re-signal"
+  );
+  m.assert_invariants();
+}

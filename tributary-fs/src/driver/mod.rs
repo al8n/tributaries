@@ -29,6 +29,7 @@
 
 use std::{
   collections::{BTreeMap, BTreeSet, HashMap},
+  io::Write as _,
   num::NonZeroUsize,
   path::{Path, PathBuf},
   sync::{
@@ -47,7 +48,8 @@ use tributary_proto::{
 use crate::{
   core::{
     CoverNoop, CoverReconcile, CoverSettle, Delivery, DriverCore, Effect, ExpectedObject, FenceId,
-    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness,
+    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, WidenCommit,
+    WidenTaint,
   },
   error::WatchRootError,
   os::{
@@ -1672,15 +1674,84 @@ impl<F: FsOps> Drop for CookieRegistry<F> {
   }
 }
 
-/// One in-flight root replacement: the reservation the commit releases and
-/// the caller's reply. A descending replace parks its spawned-but-uncommitted
-/// replacement in `arming` while the new root's pre-arm runs on the blocking
-/// pool ([`FsOps::preflight_arm`]); a kernel-recursive replace commits
-/// straight off its spawn and never populates it.
+/// One in-flight root replacement: the reservation the commit releases, the
+/// caller's reply, and which of the two replace shapes is running (`mode`).
 struct ReplaceState<H> {
   reservation: crate::watcher::ReservationGuard,
   reply: futures_channel::oneshot::Sender<Result<(), crate::error::ReplaceRootError>>,
-  arming: Option<SpawnedSource<H>>,
+  mode: ReplaceMode<H>,
+}
+
+/// The two replace shapes.
+enum ReplaceMode<H> {
+  /// The general replace: a fresh stream spawns and the commit swaps lanes. A
+  /// descending replace parks its spawned-but-uncommitted replacement in
+  /// `arming` while the new root's pre-arm runs on the blocking pool
+  /// ([`FsOps::preflight_arm`]); a kernel-recursive replace commits straight
+  /// off its spawn and never populates it.
+  NewFd { arming: Option<SpawnedSource<H>> },
+  /// The same-transport WIDEN (descending only, old root strictly inside the
+  /// new): no stream is ever spawned — the live fd gains the new root's watch
+  /// and the Monitor adopts the old tree in place, so the commit swaps no
+  /// lane, bumps no generation, and retires nothing. Holding no native
+  /// handle, this mode needs no close-sweep teardown; an armed-but-refused
+  /// reservation's watch descriptor dies with the scope's own stream.
+  SameFd { phase: SameFdPhase },
+}
+
+/// A widen commit's applied shape: committed, or fallen back — a TAINTED
+/// witnessed window (INV-ROOT, the legitimate refusal) or the core's
+/// pre-mutation guards (the impossible path made visible instead of a silent
+/// `Ok`). Either fallback leaves the core, the Monitor, AND the registry
+/// untouched — the widened entry publishes only at a commit (Golden-2), so
+/// the OLD entry keeps naming the live truth through the whole fallback and
+/// through a fallback failure. The caller converts the obligation to the
+/// general stream replace: its commit overwrites the entry with spawn-minted
+/// truth and its failure taxonomy answers the caller.
+enum WidenOutcome {
+  /// The core and Monitor spliced; the widen is live on the same transport.
+  Committed,
+  /// Fall back to the new-stream replace under the caller's original
+  /// reservation. `Some` carries a tainted window's witness diagnostics (the
+  /// taint cause plus the benign reserved records the latch consumed) — read
+  /// only by the env-gated widen diagnostic today, mirroring the transport
+  /// `Fatal`'s carried class; `None` is the impossible-path core refusal.
+  FallBack(Option<WidenTaint>),
+}
+
+/// Where a same-transport widen stands.
+enum SameFdPhase {
+  /// The no-spawn [`RootMeta`] resolve ([`FsOps::resolve_root_meta`]) is on
+  /// the blocking pool.
+  MetaPending,
+  ///`reserved` is pre-arming the widened root on the LIVE port; `meta` is the
+  /// resolved, re-validated world the commit will adopt.
+  Arming { reserved: WatchId, meta: RootMeta },
+  /// The pre-arm succeeded and the commit is CATCHING UP to the lane: the
+  /// NORMAL source arm processes the scope's queued messages one per loop
+  /// iteration — benign records deliver at the (still current) old root,
+  /// death records and losses taint through the two INV-ROOT funnels — and
+  /// `remaining` counts down the queued-length snapshot taken at
+  /// [`OpResult::WidenArmed`]. The commit fires at the first loop top AFTER
+  /// the effect flush with `remaining == 0` and the lane not dead-pending
+  /// ([`resolve_widen_catchups`]); a scope death en route resolves the widen
+  /// `Retired` through the same liveness gate every path uses. This is the
+  /// by-construction shape that retired the synchronous drain: ordering
+  /// (Golden-1), lane death (G2-1), boundedness (G2-2), and delivery
+  /// coordinates (G3-1) are all properties of the arm's own frame — one
+  /// message per iteration, effects flushed between, death only via the end
+  /// marker — so none of them exists as a separate obligation here.
+  CatchUp {
+    reserved: WatchId,
+    meta: RootMeta,
+    /// The pre-arm outcome the commit replays (`Installed`/`Aliased`).
+    replay: WatchOutcome,
+    /// Prefix messages still to be processed by the arm before the commit
+    /// may read the witnessed window. Strictly decreasing; post-snapshot
+    /// arrivals are NOT counted — they are transport-concurrent with the
+    /// commit and ride the post-commit known-root regime.
+    remaining: usize,
+  },
 }
 
 /// One watch awaiting its spawn result: the reply channel plus the root the
@@ -2526,6 +2597,17 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// only under a descending profile; `watch` addresses the directory object
   /// for executors that resolve anchors rather than paths.
   fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate;
+
+  /// Resolves the [`RootMeta`] a same-transport widen commits with — the spawn
+  /// barrier's metadata half with NO stream creation: canonicalize, pin,
+  /// locality gate, identity and mount frame from the pin, mount seed, and
+  /// ancestor identities (blocking). Reached only for a widening replace on a
+  /// live DESCENDING scope, whose stream the commit keeps; the default refuses
+  /// — a platform with no descending backend never routes here.
+  fn resolve_root_meta(&self, path: &Path) -> Result<RootMeta, SourceError> {
+    let _ = path;
+    Err(SourceError::Unsupported)
+  }
 }
 
 /// The control surface of a live stream handle.
@@ -2660,18 +2742,32 @@ struct StatSample {
 /// that object on the device belt.
 ///
 /// The path is resolved the same way `symlink_metadata` was, so an anchor
-/// (`/proc/self/fd/N`) enumerate reads every fact THROUGH the pinned fd too. Any
-/// errno propagates unchanged (notably `NOENT`), keeping the callers'
-/// `Missing`/raced-away meanings.
+/// (`/proc/self/fd/N`) enumerate reads every fact THROUGH the pinned fd too.
+///
+/// An interrupted syscall (`EINTR`) is RETRIED in place — a signal cutting the
+/// `statx` short is not a raced-away entry, and letting it surface as an error
+/// would let `dir_entry_stat`/`list_dir` mint a spurious `Partial` enumerate (a
+/// raced-away `None`) whose honest dirty cold-read escalates to a root-`[]`
+/// `Rescan` on freshly-covered ground. Signal-storm runners (sanitizer
+/// stop-the-world, slow CI) inject exactly this. Every OTHER errno propagates
+/// unchanged (notably `NOENT`), keeping the callers' `Missing`/raced-away
+/// meanings — a genuine vanished entry is still Partial, an interrupted read
+/// never is.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn stat_sample(path: &Path) -> Result<StatSample, rustix::io::Errno> {
   use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
-  let stx = statx(
-    rustix::fs::CWD,
-    path,
-    AtFlags::SYMLINK_NOFOLLOW,
-    StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
-  )?;
+  let stx = loop {
+    match statx(
+      rustix::fs::CWD,
+      path,
+      AtFlags::SYMLINK_NOFOLLOW,
+      StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+    ) {
+      Ok(stx) => break stx,
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(err) => return Err(err),
+    }
+  };
   Ok(StatSample {
     kind: kind_of_mode(u32::from(stx.stx_mode)),
     dev: makedev(stx.stx_dev_major, stx.stx_dev_minor),
@@ -3261,6 +3357,11 @@ impl FsOps for RealFs {
     reply.outcome
   }
 
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn resolve_root_meta(&self, path: &Path) -> Result<RootMeta, SourceError> {
+    Source::resolve_root_meta(path)
+  }
+
   fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {
     // Consume the watch's transient anchor when one is still held: the
     // listing then reads THROUGH the armed object (/proc re-opens an O_PATH
@@ -3324,12 +3425,32 @@ fn list_dir(path: &Path) -> RawEnumerate {
     let Ok(entry) = entry else {
       // The read was cut short mid-directory; what was seen still
       // reconciles, and the incomplete flag drives the Monitor's retry.
+      if std::env::var("TRIBUTARY_FS_WIDEN_DEBUG").is_ok() {
+        // Best-effort: a diagnostic must never unwind the driver (a closed log
+        // pipe would otherwise abort a widen mid-recovery), so discard write errors.
+        let _ = writeln!(
+          std::io::stderr().lock(),
+          "[tributary-fs widen-debug] enumerate PARTIAL at {} (readdir cut short mid-directory) \
+           — the Monitor escalates this dirty cold-read to a Rescan",
+          path.display()
+        );
+      }
       complete = false;
       break;
     };
     let entry_path = entry.path();
     let Some((kind, dev, ino, mnt_id)) = dir_entry_stat(&entry_path) else {
       // A raced-away entry: the listing no longer reflects one name.
+      if std::env::var("TRIBUTARY_FS_WIDEN_DEBUG").is_ok() {
+        let _ = writeln!(
+          std::io::stderr().lock(),
+          "[tributary-fs widen-debug] enumerate PARTIAL at {} (entry {} stat gave None — a \
+           genuine raced-away entry post-EINTR-retry) — the Monitor escalates this dirty \
+           cold-read to a Rescan",
+          path.display(),
+          entry_path.display()
+        );
+      }
       complete = false;
       continue;
     };
@@ -3383,6 +3504,18 @@ enum OpResult<H> {
   /// still owns the scope. Routed to the replace commit, never to the core's
   /// ordinary watch-result path.
   RebindArmed {
+    scope: ScopeId,
+    outcome: WatchOutcome,
+  },
+  /// A same-transport widen's no-spawn [`RootMeta`] resolve finished. It owns
+  /// no native stream, so a straggler after the close sweep is dropped whole.
+  ReplaceMeta {
+    scope: ScopeId,
+    result: Result<RootMeta, SourceError>,
+  },
+  /// A same-transport widen's pre-arm of the widened root on the LIVE port
+  /// resolved: commit, or unwind with the old coverage untouched.
+  WidenArmed {
     scope: ScopeId,
     outcome: WatchOutcome,
   },
@@ -3546,6 +3679,14 @@ pub(crate) async fn run<R, F>(
   // reports termination, which would spin the loop's stream arm.
   os.push(futures_util::stream::pending().boxed());
   let mut handles: BTreeMap<ScopeId, F::Handle> = BTreeMap::new();
+  // Per-scope clones of the CURRENT lane's message channel, kept as PURE
+  // OBSERVERS — never received from. A widen's catch-up commit
+  // ([`SameFdPhase::CatchUp`]) reads `len()` once at `WidenArmed` for its
+  // finite-prefix snapshot and `is_closed()` at the commit check for the
+  // dead-lane wait; the messages themselves are consumed only by the source
+  // arm, one per iteration, in its own frame. Re-bound at every lane swap
+  // (`commit_replace`), removed with the stream at teardown.
+  let mut source_taps: BTreeMap<ScopeId, EventReceiver> = BTreeMap::new();
   // Each spawned stream is one delivery LANE, tagged by a per-driver
   // generation: a scope's current lane is the one whose messages reach the
   // core. Today exactly one lane exists per scope for its whole life;
@@ -3636,6 +3777,7 @@ pub(crate) async fn run<R, F>(
       &mut pending_teardowns,
       &mut scope_backends,
       &mut lanes,
+      &mut source_taps,
       &events,
       &mut unwatch_replies,
       &mut deferred_grants,
@@ -3643,6 +3785,56 @@ pub(crate) async fn run<R, F>(
       &registry,
       &now,
     );
+
+    // Widen catch-up commits resolve HERE — strictly after the effect flush
+    // above, which is load-bearing: the prefix's deliveries have already
+    // reached the consumer at their pre-commit (old-root) coordinates, so
+    // the root flip below can never precede a delivery it re-frames (G3-1
+    // by construction; see `resolve_widen_catchups`).
+    if resolve_widen_catchups::<R, F>(
+      &mut core,
+      &ops,
+      &config,
+      &op_tx,
+      &handles,
+      &mut pending_spawns,
+      &pending_teardowns,
+      &scope_backends,
+      &source_taps,
+      &mut replace_states,
+      &mut unwatch_replies,
+      &mut parked_cookies,
+      &mut cookies,
+      &registry,
+      &now,
+    ) {
+      // A commit just enqueued its own post-splice effects (the widened
+      // root's cold-read enumerate above all) AFTER the flush above ran —
+      // flush once more so a quiescent widen cannot park with the newly
+      // covered ground stranded unread behind an already-resolved `Ok`.
+      // Nothing between the first flush and the commit can enqueue an emit,
+      // so this second flush carries only post-commit (new-world) effects —
+      // the G3-1 pre/post ordering is untouched. Conditional: one extra
+      // flush per RESOLVED widen, never a steady-state cost.
+      execute_effects::<R, F>(
+        &mut core,
+        &ops,
+        &config,
+        &op_tx,
+        &mut handles,
+        &mut pending_spawns,
+        &mut pending_teardowns,
+        &mut scope_backends,
+        &mut lanes,
+        &mut source_taps,
+        &events,
+        &mut unwatch_replies,
+        &mut deferred_grants,
+        &mut cookies,
+        &registry,
+        &now,
+      );
+    }
 
     // Service any cookie-unlink retries now due, opportunistically at the loop
     // top so a busy loop that never parks still drives them promptly (T8) — the
@@ -3679,6 +3871,58 @@ pub(crate) async fn run<R, F>(
     // issue-and-cancel storm against a stalled scope cannot grow its waiter
     // vector without bound.
     prune_canceled_unwatch_waiters(&mut unwatch_replies);
+
+    // Catch-up fairness (G4-1, predicate exactness G5-1): a catching-up
+    // widen resolves only through source-arm progress, but the select below
+    // polls COMMANDS before the source stream — a caller keeping the
+    // bounded command mailbox continuously ready (the documented,
+    // test-pinned capability: `command_flood_does_not_starve_op_completions`)
+    // would then starve it forever: the widen never resolves, its reply
+    // never fires, and the stuck ReplaceState pins the single-flight gate
+    // and the root reservation. The guarantee: while any scope is STILL IN
+    // CatchUp after the resolver above ran, ONE ready source item is
+    // ingested here per iteration — through the same `ingest_source_item`
+    // frame the arm uses (latch, ledger, end marker) — and the loop RE-TOPS
+    // instead of selecting, so the item's effects flush and the commit
+    // check runs before anything can park (without the re-top, consuming
+    // the LAST awaited item here would park the loop under quiescence with
+    // the resolution forever pending).
+    //
+    // The arming predicate is membership in CatchUp itself — never a
+    // refinement of it. The resolver just removed every scope whose
+    // resolution needs NO further source progress (`remaining == 0` on an
+    // open lane commits; a dead scope retires), so a scope still in the
+    // phase is, exhaustively, either draining its prefix
+    // (`remaining > 0`) or awaiting a closed lane's end marker
+    // (`remaining == 0`, tap closed — the marker routes `on_source_fatal`
+    // and the NEXT resolver pass retires it): both need exactly this poll.
+    // Arming on membership rather than on `remaining > 0` closes the
+    // closed-tail wedge (a flood starving the end marker) BY CONSTRUCTION:
+    // any wait sub-state the phase could ever grow is in the phase, so it
+    // is armed — there is no refinement left to miss. One message per
+    // fully-flushed iteration — never a synchronous drain (G2-2) — and
+    // every message still crosses the taint latch before `remaining` can
+    // reach zero (INV-ROOT's prefix-before-commit ordering). The explicit
+    // bound: the poll runs a bounded number of flushed iterations — on the
+    // order of N × ready lanes for a prefix of N (the merged stream
+    // interleaves lanes fairly), plus a closed lane's FINITE tail (no
+    // sender exists, so it cannot be re-fed) — because post-snapshot
+    // arrivals never extend `remaining` and the poll self-disarms the
+    // moment the resolver removes the phase. Commands — Close above all —
+    // therefore wait at most that same bounded run, and the normal
+    // command-over-source bias resumes at the resolution.
+    let catching_up = replace_states.values().any(|state| {
+      matches!(
+        &state.mode,
+        ReplaceMode::SameFd {
+          phase: SameFdPhase::CatchUp { .. }
+        }
+      )
+    });
+    if catching_up && let core::task::Poll::Ready(Some(item)) = futures_util::poll!(os.next()) {
+      ingest_source_item::<F>(&mut core, &lanes, &mut replace_states, &handles, item, &now);
+      continue;
+    }
 
     // The one deadline arm serves BOTH the core's timer and the earliest due
     // cookie-unlink retry: an IDLE driver with one `RemoveFailed` cookie would
@@ -3773,6 +4017,7 @@ pub(crate) async fn run<R, F>(
                   &mut next_lane,
                   &mut pending_teardowns,
                   &mut os,
+                  &mut source_taps,
                   &registry,
                   &cookies,
                   scope,
@@ -3832,10 +4077,16 @@ pub(crate) async fn run<R, F>(
                   dev: spawned.meta.identity.dev(),
                   ino,
                 });
-              replace_states
-                .get_mut(&scope)
-                .expect("just checked")
-                .arming = Some(spawned);
+              match &mut replace_states.get_mut(&scope).expect("just checked").mode {
+                ReplaceMode::NewFd { arming } => *arming = Some(spawned),
+                ReplaceMode::SameFd { .. } => {
+                  // Unreachable: the widen route never dispatches a spawn.
+                  // Retire the stray stream defensively rather than leak it.
+                  debug_assert!(false, "a same-transport widen spawns nothing");
+                  retire_refused::<R, F>(&op_tx, &mut pending_teardowns, scope, spawned);
+                  continue;
+                }
+              }
               let ops_for_arm = ops.clone();
               let tx = op_tx.clone();
               R::spawn_blocking_detach(move || {
@@ -3900,6 +4151,7 @@ pub(crate) async fn run<R, F>(
                 // query the same counters the reader writes.
                 let stats = spawned.handle.backend_stats();
                 handles.insert(scope, spawned.handle);
+                source_taps.insert(scope, spawned.receiver.clone());
                 os.push(
                   spawned
                     .receiver
@@ -4009,11 +4261,14 @@ pub(crate) async fn run<R, F>(
           core.on_watch_installed(watch, outcome);
         }
         OpResult::RebindArmed { scope, outcome } => {
-          let Some(mut replace) = replace_states.remove(&scope) else {
+          let Some(replace) = replace_states.remove(&scope) else {
             // Swept by close (its stream already retired) or never ours.
             continue;
           };
-          let Some(spawned) = replace.arming.take() else {
+          let ReplaceMode::NewFd {
+            arming: Some(spawned),
+          } = replace.mode
+          else {
             drop(replace.reservation);
             continue;
           };
@@ -4043,6 +4298,7 @@ pub(crate) async fn run<R, F>(
               &mut next_lane,
               &mut pending_teardowns,
               &mut os,
+              &mut source_taps,
               &registry,
               &cookies,
               scope,
@@ -4064,6 +4320,234 @@ pub(crate) async fn run<R, F>(
           }
           drop(replace.reservation);
           let _ = replace.reply.send(outcome.map(|_| ()));
+        }
+        OpResult::ReplaceMeta { scope, result } => {
+          if !replace_states.contains_key(&scope) {
+            // Swept by close; the resolve owned nothing.
+            continue;
+          }
+          let meta = match result {
+            Ok(meta) => meta,
+            Err(err) => {
+              let replace = replace_states.remove(&scope).expect("just checked");
+              drop(replace.reservation);
+              let _ = replace
+                .reply
+                .send(Err(crate::error::ReplaceRootError::Source(err)));
+              // Like a failed replacement spawn: no teardown was enqueued, so
+              // a parked unwatch must be re-checked here.
+              if scope_quiesced(
+                scope,
+                &handles,
+                &pending_spawns,
+                &pending_teardowns,
+                &replace_states,
+              ) {
+                resolve_unwatch_waiters(&mut unwatch_replies, scope);
+              }
+              continue;
+            }
+          };
+          if !handles.contains_key(&scope) {
+            // Death wins while the meta resolved.
+            let replace = replace_states.remove(&scope).expect("just checked");
+            drop(replace.reservation);
+            let _ = replace
+              .reply
+              .send(Err(crate::error::ReplaceRootError::Retired));
+            if scope_quiesced(
+              scope,
+              &handles,
+              &pending_spawns,
+              &pending_teardowns,
+              &replace_states,
+            ) {
+              resolve_unwatch_waiters(&mut unwatch_replies, scope);
+            }
+            continue;
+          }
+          // Re-validate against the CANONICAL meta: still a strict,
+          // representable widen, on the live scope's own mount frame, AND with
+          // no resolved mount prefix covering the old root — the enumerate
+          // lowering marks a cross-frame entry `Other` and the reconcile drops
+          // the watch in such a slot, so a boundary at the root OR anywhere on
+          // the CONNECTING CHAIN would make the crawl actively tear the
+          // adopted coverage down. The frame equality of the endpoints covers
+          // the chain only when both mount ids are known (a mount instance is
+          // a connected subtree); the seed check closes the unknown-id degrade
+          // and the seed's own read is fresher than the spawn-time frames.
+          let still_widen = core.root_path(scope).is_some_and(|old| {
+            widen_predicate(&old, &meta.root)
+              && !meta.mounts.iter().any(|m| old.starts_with(m))
+          }) && core.root_frame(scope).is_some_and(|(dev, mnt)| {
+              meta.root_dev == dev
+                && match (meta.root_mnt_id, mnt) {
+                  (Some(new_mnt), Some(old_mnt)) => new_mnt == old_mnt,
+                  // Either frame unknown: the device belt governs alone — the
+                  // codebase's existing pre-5.8 degrade, inherited unchanged.
+                  _ => true,
+                }
+            });
+          if !still_widen {
+            // Fall back to the general new-stream replace: dispatch the spawn
+            // the admission would have, under the same accounting.
+            replace_states.get_mut(&scope).expect("just checked").mode =
+              ReplaceMode::NewFd { arming: None };
+            dispatch_replace_spawn::<R, F>(
+              &ops,
+              &op_tx,
+              &config,
+              &handles,
+              &mut pending_spawns,
+              scope,
+              meta.root,
+            );
+            continue;
+          }
+          // Reserve the widened root's watch id, OPEN ITS WITNESSED WINDOW
+          // (INV-ROOT), and pre-arm it on the LIVE port. The id is unknown to
+          // the Monitor until the commit, so the arm cannot ride the ordinary
+          // effect path — but its records are NOT dropped: the window is
+          // opened before the pre-arm can register the kernel wd, so every
+          // record the transport attributes to the reserved id is intercepted
+          // at the core's compile stage (a death record taints the window;
+          // benign slice churn is consumed and converges through the
+          // post-commit cold read), and every scope loss signal taints too.
+          // The commit then gates on the clean window: the arm confirmed the
+          // meta's object (plus the stale-Installed bracket below), and a
+          // binding bound right that later dies or moves emits a death record
+          // or a loss — so a clean window PROVES the binding live at the
+          // commit, and a tainted one falls back to the stream replace whose
+          // spawn barrier re-establishes it from scratch.
+          let reserved = core.reserve_watch_id();
+          core.begin_widen_watch(scope, reserved);
+          let port = handles
+            .get(&scope)
+            .expect("checked live above")
+            .scope_port();
+          let path = meta.root.clone();
+          let name = Segment::new(
+            path
+              .file_name()
+              .and_then(|name| name.to_str())
+              .unwrap_or("/"),
+          );
+          let expected = u64::try_from(meta.identity.ino())
+            .ok()
+            .and_then(core::num::NonZeroU64::new)
+            .map(|ino| ExpectedObject {
+              dev: meta.identity.dev(),
+              ino,
+            });
+          replace_states.get_mut(&scope).expect("just checked").mode = ReplaceMode::SameFd {
+            phase: SameFdPhase::Arming { reserved, meta },
+          };
+          let ops_for_arm = ops.clone();
+          let tx = op_tx.clone();
+          R::spawn_blocking_detach(move || {
+            let mut outcome =
+              ops_for_arm.preflight_arm(&port, scope, reserved, &path, &name, expected);
+            // The stale-Installed bracket: the arm's own open-then-verify ran
+            // at ARM time, and the commit must never accept that outcome
+            // alone — re-stat the path NOW, so an object swapped in right
+            // after the arm is refused here (the descriptor disarmed, the
+            // caller typed) instead of committed with the root watch bound to
+            // the DEPARTED object. This is the cheap EARLY refusal and one
+            // half of INV-ROOT's live-at-commit proof (the arm bound the
+            // right object); the window this probe cannot close (probe →
+            // commit) is closed by the witnessed window itself — a swap in it
+            // emits a death record on the reserved wd (or its loss is
+            // signalled), which taints the window and refuses the commit.
+            if let (WatchOutcome::Installed(_) | WatchOutcome::Aliased(_), Some(want)) =
+              (&outcome, expected)
+            {
+              let matches = matches!(
+                ops_for_arm.probe(&path),
+                ProbeOutcome::Present { kind, file_id: Some(id), dev }
+                  if kind.is_dir() && dev == want.dev && id == want.ino
+              );
+              if !matches {
+                ops_for_arm.remove_watch(scope, reserved);
+                outcome = WatchOutcome::Failed(WatchError::Gone);
+              }
+            }
+            let _ = tx.try_send(OpResult::WidenArmed { scope, outcome });
+          });
+        }
+        OpResult::WidenArmed { scope, outcome } => {
+          let Some(replace) = replace_states.remove(&scope) else {
+            // Swept by close: the armed descriptor died with the scope's
+            // stream in the sweep.
+            continue;
+          };
+          let ReplaceMode::SameFd {
+            phase: SameFdPhase::Arming { reserved, meta },
+          } = replace.mode
+          else {
+            debug_assert!(false, "WidenArmed only follows a widen pre-arm");
+            core.abort_widen_watch(scope);
+            drop(replace.reservation);
+            continue;
+          };
+          let resolution = if !handles.contains_key(&scope) || core.root_watch(scope).is_none() {
+            // Death wins: the stream died with the fd (or the old world
+            // already ended core-side). Nothing to tear down that the death
+            // funnel does not already own; the witnessed window closes with
+            // the widen it belonged to.
+            core.abort_widen_watch(scope);
+            Err(crate::error::ReplaceRootError::Retired)
+          } else if let WatchOutcome::Failed(err) = outcome {
+            // The live transport could not cover the widened root: unwind
+            // with nothing installed, the old coverage untouched, and the
+            // witnessed window closed (nothing will commit over it).
+            core.abort_widen_watch(scope);
+            Err(crate::error::ReplaceRootError::Source(
+              SourceError::RootUnavailable {
+                root: meta.root.clone(),
+                source: arm_failure(err),
+              },
+            ))
+          } else {
+            // The pre-arm holds: the commit now CATCHES UP to the lane
+            // instead of jumping it. The queued-length snapshot is the
+            // finite prefix the NORMAL source arm must process first —
+            // benign records deliver at the still-current old root (their
+            // truthful pre-commit coordinates), death records and losses
+            // taint through the INV-ROOT funnels — and the commit fires at
+            // a loop top once the prefix is consumed
+            // ([`resolve_widen_catchups`]). Nothing resolves here.
+            let remaining = source_taps.get(&scope).map_or(0, EventReceiver::len);
+            replace_states.insert(
+              scope,
+              ReplaceState {
+                reservation: replace.reservation,
+                reply: replace.reply,
+                mode: ReplaceMode::SameFd {
+                  phase: SameFdPhase::CatchUp {
+                    reserved,
+                    meta,
+                    replay: outcome,
+                    remaining,
+                  },
+                },
+              },
+            );
+            continue;
+          };
+          // A failed or retired pre-arm resolves immediately: no teardown is
+          // enqueued, so a parked unwatch is re-checked exactly as after a
+          // failed replacement spawn.
+          if scope_quiesced(
+            scope,
+            &handles,
+            &pending_spawns,
+            &pending_teardowns,
+            &replace_states,
+          ) {
+            resolve_unwatch_waiters(&mut unwatch_replies, scope);
+          }
+          drop(replace.reservation);
+          let _ = replace.reply.send(resolution);
         }
         OpResult::Enumerated { req, raw } => {
           core.on_enumerated(req, raw);
@@ -4137,36 +4621,56 @@ pub(crate) async fn run<R, F>(
                 let _ = reply.send(Err(crate::error::ReplaceRootError::ReplaceInFlight));
               }
               std::collections::btree_map::Entry::Vacant(slot) => {
+                // The route fork: a WIDEN (old root strictly inside the new,
+                // representable chain) on a live DESCENDING scope keeps its
+                // stream — no spawn, the same-transport commit. Everything
+                // else (KR, narrowing, disjoint, equal, non-UTF-8 chain — and,
+                // at the meta re-validation, a differing mount frame) takes
+                // the general new-stream path below.
+                let descending = !scope_backends
+                  .get(&scope)
+                  .is_some_and(BackendKind::is_kernel_recursive);
+                let widen = descending
+                  && core
+                    .root_path(scope)
+                    .is_some_and(|old| widen_predicate(&old, &root));
+                if widen {
+                  // The no-spawn meta resolve. NOT counted in
+                  // `pending_spawns`: it owns no native stream, so a
+                  // post-close straggler is droppable whole.
+                  let ops_for_meta = ops.clone();
+                  let tx = op_tx.clone();
+                  let path = root;
+                  R::spawn_blocking_detach(move || {
+                    let result = ops_for_meta.resolve_root_meta(&path);
+                    let _ = tx.try_send(OpResult::ReplaceMeta { scope, result });
+                  });
+                  slot.insert(ReplaceState {
+                    reservation,
+                    reply,
+                    mode: ReplaceMode::SameFd {
+                      phase: SameFdPhase::MetaPending,
+                    },
+                  });
+                  continue;
+                }
                 // Dispatch the replacement spawn through the SAME blocking-pool
-                // accounting a birth spawn uses; the Spawned router diverts the
+                // accounting a birth spawn uses (resume point included — see
+                // `dispatch_replace_spawn`); the Spawned router diverts the
                 // result to the commit tail by the replace_states key.
-                pending_spawns.insert(scope);
-                let mut source_config = SourceConfig::new(vec![root]);
-                // The swap window rides the journal, not just the covering
-                // Rescan: the RETIRING stream's resume point is taken here —
-                // the one moment it is provably still live (the branch above
-                // proved the handle) — and handed to the replacement's spawn,
-                // which replays from it. Taking it EARLY only widens the
-                // replay (an earlier id replays more), and duplicates are
-                // always legal; a backend with no journal, a wrapped id
-                // space, or a foreign device simply mints/honors nothing and
-                // the `Rescan` covers the window as before.
-                source_config.since = handles.get(&scope).and_then(SourceControl::resume_token);
-                source_config.exclusions = config.exclusions.clone();
-                source_config.latency = config.latency;
-                source_config.channel_capacity = config.os_batch_capacity;
-                source_config.backend = config.backend;
-                source_config.max_map_directories = config.max_map_directories;
-                let ops_for_spawn = ops.clone();
-                let tx = op_tx.clone();
-                R::spawn_blocking_detach(move || {
-                  let result = ops_for_spawn.spawn_source(source_config);
-                  let _ = tx.try_send(OpResult::Spawned { scope, result });
-                });
+                dispatch_replace_spawn::<R, F>(
+                  &ops,
+                  &op_tx,
+                  &config,
+                  &handles,
+                  &mut pending_spawns,
+                  scope,
+                  root,
+                );
                 slot.insert(ReplaceState {
                   reservation,
                   reply,
-                  arming: None,
+                  mode: ReplaceMode::NewFd { arming: None },
                 });
               }
             }
@@ -4402,41 +4906,8 @@ pub(crate) async fn run<R, F>(
         }
       },
       msg = os.next() => {
-        if let Some((scope, lane, msg)) = msg {
-          // A retired lane's stragglers are dropped whole: the replace
-          // commit's covering Rescan dominates them, and the retired end
-          // marker is a teardown artifact, never a death. (Today every
-          // scope has exactly one lane for its whole life, so this gate
-          // never fires — pinned by the existing suites.)
-          if lanes.get(&scope) != Some(&lane) {
-            continue;
-          }
-          match msg {
-            // The payload travels whole: its budget slot is released by the
-            // core exactly when the batch settles or is discarded, so parked
-            // events stay inside the transport budget.
-            Some(SourceMessage::Batch(payload)) => core.on_batch(scope, payload, now()),
-            // The queue is the source's ONE ordered lane, so everything the
-            // signal postdates was already handled above it — no drain, no
-            // barrier, nothing to reason about. Dropping the ack BEFORE
-            // acting re-arms the dedup: a loss racing it either rides a
-            // fresh message or is covered by the rescan this becomes.
-            Some(SourceMessage::Overflow(ack)) => {
-              drop(ack);
-              core.on_root_overflow(scope, now());
-            }
-            Some(SourceMessage::Fatal(_)) => core.on_source_fatal(scope, now()),
-            // The receiver disconnected while the stream should still be
-            // live: the source died without managing to say so (its sender
-            // dropped) — a dead stream, not a teardown of ours (that path
-            // removes the handle before the disconnect can arrive). The end
-            // marker fires only after the queue yielded everything it held.
-            None => {
-              if handles.contains_key(&scope) {
-                core.on_source_fatal(scope, now());
-              }
-            }
-          }
+        if let Some(item) = msg {
+          ingest_source_item::<F>(&mut core, &lanes, &mut replace_states, &handles, item, &now);
         }
       },
     }
@@ -4465,8 +4936,11 @@ pub(crate) async fn run<R, F>(
   // Drain `replace_states` whole so the scope-quiescence fence below no
   // longer counts these as outstanding replace obligations; each entry's
   // reservation and reply drop here — the caller sees `Closed`.
-  for (scope, mut replace) in std::mem::take(&mut replace_states) {
-    if let Some(spawned) = replace.arming.take() {
+  for (scope, replace) in std::mem::take(&mut replace_states) {
+    if let ReplaceMode::NewFd {
+      arming: Some(spawned),
+    } = replace.mode
+    {
       *pending_teardowns.entry(scope).or_insert(0) += 1;
       let tx = op_tx.clone();
       R::spawn_blocking_detach(move || {
@@ -4474,6 +4948,9 @@ pub(crate) async fn run<R, F>(
         let _ = tx.try_send(OpResult::TornDown { scope });
       });
     }
+    // A same-transport widen holds no native stream: its pre-armed watch
+    // descriptor (if any) dies with the scope's own stream in the sweep
+    // above, and the dropped reservation/reply surface `Closed`.
   }
   // Route every cookie the registry owns through the removal state machine
   // BEFORE the grace, so a hung unlink makes close report `NotQuiesced` honestly
@@ -4563,6 +5040,10 @@ pub(crate) async fn run<R, F>(
           // A pre-arm outcome for a replace the close sweep already retired:
           // nothing left to commit or unwind.
           Ok(OpResult::RebindArmed { .. }) => {}
+          // A widen's meta resolve or live-port pre-arm straggling past the
+          // sweep: neither owns a stream — the armed descriptor (if any) died
+          // with the scope's own teardown.
+          Ok(OpResult::ReplaceMeta { .. }) | Ok(OpResult::WidenArmed { .. }) => {}
           // A dispatched write finished during the drain: its own verdict is
           // already on its record, so if a FAILED self-reap parked it
           // `RemoveFailed`, schedule its retry at the flat base so the drain's own
@@ -4622,6 +5103,7 @@ pub(crate) async fn run<R, F>(
     &mut pending_teardowns,
     &mut scope_backends,
     &mut lanes,
+    &mut source_taps,
     &events,
     &mut unwatch_replies,
     &mut deferred_grants,
@@ -4720,6 +5202,68 @@ fn retire_refused<R, F>(
   });
 }
 
+/// Dispatches a general replace's replacement spawn under the birth
+/// accounting — the shared tail of the admission's new-stream route and both
+/// same-transport fallbacks (a re-validation miss at the meta, a refused core
+/// commit). The swap window rides the journal, not just the covering Rescan:
+/// the RETIRING stream's resume point is taken here — while the handle is
+/// provably still live — and handed to the replacement's spawn, which replays
+/// from it. Taking it EARLY only widens the replay, and duplicates are always
+/// legal; a backend with no journal, a wrapped id space, or a foreign device
+/// simply mints/honors nothing and the `Rescan` covers the window as before.
+fn dispatch_replace_spawn<R, F>(
+  ops: &F,
+  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  config: &DriverConfig,
+  handles: &BTreeMap<ScopeId, F::Handle>,
+  pending_spawns: &mut BTreeSet<ScopeId>,
+  scope: ScopeId,
+  root: PathBuf,
+) where
+  R: RuntimeLite,
+  F: FsOps,
+{
+  pending_spawns.insert(scope);
+  let mut source_config = SourceConfig::new(vec![root]);
+  source_config.since = handles.get(&scope).and_then(SourceControl::resume_token);
+  source_config.exclusions = config.exclusions.clone();
+  source_config.latency = config.latency;
+  source_config.channel_capacity = config.os_batch_capacity;
+  source_config.backend = config.backend;
+  source_config.max_map_directories = config.max_map_directories;
+  let ops = ops.clone();
+  let tx = op_tx.clone();
+  R::spawn_blocking_detach(move || {
+    let result = ops.spawn_source(source_config);
+    let _ = tx.try_send(OpResult::Spawned { scope, result });
+  });
+}
+
+/// Whether replacing `old` with `new` is a same-transport WIDEN candidate:
+/// the old root lies STRICTLY inside the new one and the connecting chain is
+/// representable (every relative component is normal UTF-8 — the proto's
+/// `Segment` vocabulary). Both paths are canonical at every call site, so the
+/// lexical prefix test is object-true. A non-candidate silently takes the
+/// general new-stream replace, whose semantics need no chain.
+fn widen_predicate(old: &Path, new: &Path) -> bool {
+  if old == new {
+    return false;
+  }
+  old.strip_prefix(new).is_ok_and(|rel| {
+    let mut any = false;
+    for component in rel.components() {
+      let std::path::Component::Normal(os) = component else {
+        return false;
+      };
+      if os.to_str().is_none() {
+        return false;
+      }
+      any = true;
+    }
+    any
+  })
+}
+
 /// Lowers a pre-arm refusal into the io flavor
 /// [`SourceError::RootUnavailable`] carries.
 fn arm_failure(err: WatchError) -> std::io::Error {
@@ -4730,6 +5274,314 @@ fn arm_failure(err: WatchError) -> std::io::Error {
     _ => std::io::ErrorKind::Other,
   };
   std::io::Error::new(kind, err.as_str())
+}
+
+/// Applies one source-lane message to the core — the ONE body both the run
+/// loop's source arm and the widen commit's lane drain use, so the two can
+/// never diverge. (The lane's `None` end marker is a stream artifact, not a
+/// channel message, so only the arm can see it and it stays there.)
+fn apply_source_message(
+  core: &mut DriverCore,
+  scope: ScopeId,
+  msg: SourceMessage,
+  now: &impl Fn() -> Instant,
+) {
+  match msg {
+    // The payload travels whole: its budget slot is released by the
+    // core exactly when the batch settles or is discarded, so parked
+    // events stay inside the transport budget.
+    SourceMessage::Batch(payload) => core.on_batch(scope, payload, now()),
+    // The queue is the source's ONE ordered lane, so everything the
+    // signal postdates was already handled above it — no drain, no
+    // barrier, nothing to reason about. Dropping the ack BEFORE
+    // acting re-arms the dedup: a loss racing it either rides a
+    // fresh message or is covered by the rescan this becomes.
+    SourceMessage::Overflow(ack) => {
+      drop(ack);
+      core.on_root_overflow(scope, now());
+    }
+    SourceMessage::Fatal(_) => core.on_source_fatal(scope, now()),
+  }
+}
+
+/// Routes one item yielded by the merged source stream — the ONE body the
+/// select's source arm and the catch-up fairness poll share, so the two
+/// ingestion sites can never diverge: the retired-lane gate, the message
+/// application (with the catch-up ledger decrement), and the end-marker
+/// death path.
+fn ingest_source_item<F: FsOps>(
+  core: &mut DriverCore,
+  lanes: &BTreeMap<ScopeId, u64>,
+  replace_states: &mut BTreeMap<ScopeId, ReplaceState<F::Handle>>,
+  handles: &BTreeMap<ScopeId, F::Handle>,
+  item: (ScopeId, u64, Option<SourceMessage>),
+  now: &impl Fn() -> Instant,
+) {
+  let (scope, lane, msg) = item;
+  // A retired lane's stragglers are dropped whole: the replace commit's
+  // covering Rescan dominates them, and the retired end marker is a
+  // teardown artifact, never a death. (Today every scope has exactly one
+  // lane for its whole life, so this gate never fires — pinned by the
+  // existing suites.)
+  if lanes.get(&scope) != Some(&lane) {
+    return;
+  }
+  match msg {
+    Some(msg) => {
+      apply_source_message(core, scope, msg, now);
+      // The catch-up ledger: one prefix message consumed in the arm's own
+      // frame — delivered, tainted, or funneled exactly as any other.
+      // Saturating: post-snapshot arrivals are transport-concurrent with
+      // the pending commit and must not extend its wait (they ride the
+      // post-commit regime).
+      if let Some(ReplaceState {
+        mode:
+          ReplaceMode::SameFd {
+            phase: SameFdPhase::CatchUp { remaining, .. },
+          },
+        ..
+      }) = replace_states.get_mut(&scope)
+      {
+        *remaining = remaining.saturating_sub(1);
+      }
+    }
+    // The receiver disconnected while the stream should still be live: the
+    // source died without managing to say so (its sender dropped) — a dead
+    // stream, not a teardown of ours (that path removes the handle before
+    // the disconnect can arrive). The end marker fires only after the queue
+    // yielded everything it held.
+    None => {
+      if handles.contains_key(&scope) {
+        core.on_source_fatal(scope, now());
+      }
+    }
+  }
+}
+
+/// Resolves every widen whose commit is CATCHING UP to its lane
+/// ([`SameFdPhase::CatchUp`]) — called at the loop top strictly AFTER
+/// [`execute_effects`] has flushed, which is load-bearing: the prefix's
+/// deliveries (queued by the source arm at the still-current OLD root) have
+/// then already reached the consumer, so no emit ever straddles the root
+/// flip (G3-1 by construction). Per scope, in order:
+///
+/// - a DEAD scope — the stream gone, or the core state torn down by a death
+///   the arm processed en route — resolves the widen `Retired` through the
+///   same liveness gate every widen path uses; the witnessed window closes
+///   with it and nothing was ever published (Golden-2's deferred publish);
+/// - a scope whose prefix is consumed (`remaining == 0`) and whose lane is
+///   not DEAD-PENDING commits: a closed tap means the source died with its
+///   end marker still queued behind the prefix — committing now would jump
+///   that death, so the check WAITS one iteration for the arm's marker path
+///   to route the fatal (G2-1's single death funnel), after which the
+///   liveness gate above answers `Retired`;
+/// - anything else keeps waiting: the arm is still consuming the prefix,
+///   one message per iteration with full effect flushes between (G2-2's
+///   boundedness is the snapshot: `remaining` strictly decreases, so the
+///   commit's delay is exactly the pre-commit backlog).
+///
+/// The commit itself is [`commit_widen`], unchanged: conflict check →
+/// witnessed-window gate → splice → deferred registry publish → replay.
+///
+/// Returns whether any catch-up RESOLVED (committed, fell back, retired, or
+/// errored) in this call: a committed widen enqueues its own post-splice
+/// effects — the widened root's cold-read enumerate above all — AFTER the
+/// loop's flush already ran, so the caller must flush once more before the
+/// loop parks, or a quiescent widen would strand the newly covered ground
+/// unread behind an already-resolved `Ok`. (The non-commit resolutions
+/// enqueue no core effects today; reporting them too costs one no-op flush
+/// per widen and keeps the contract robust if they ever do.)
+#[allow(clippy::too_many_arguments)]
+fn resolve_widen_catchups<R, F>(
+  core: &mut DriverCore,
+  ops: &F,
+  config: &DriverConfig,
+  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  handles: &BTreeMap<ScopeId, F::Handle>,
+  pending_spawns: &mut BTreeSet<ScopeId>,
+  pending_teardowns: &BTreeMap<ScopeId, usize>,
+  scope_backends: &BTreeMap<ScopeId, BackendKind>,
+  source_taps: &BTreeMap<ScopeId, EventReceiver>,
+  replace_states: &mut BTreeMap<ScopeId, ReplaceState<F::Handle>>,
+  unwatch_replies: &mut BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>>,
+  parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
+  cookies: &mut CookieRegistry<F>,
+  registry: &impl ScopeRegistry,
+  now: &impl Fn() -> Instant,
+) -> bool
+where
+  R: RuntimeLite,
+  F: FsOps,
+{
+  let mut resolved_any = false;
+  let catching_up: Vec<ScopeId> = replace_states
+    .iter()
+    .filter(|(_, state)| {
+      matches!(
+        state.mode,
+        ReplaceMode::SameFd {
+          phase: SameFdPhase::CatchUp { .. }
+        }
+      )
+    })
+    .map(|(scope, _)| *scope)
+    .collect();
+  for scope in catching_up {
+    let dead = !handles.contains_key(&scope) || core.root_watch(scope).is_none();
+    if !dead {
+      let (ready, lane_dying) = match replace_states.get(&scope) {
+        Some(ReplaceState {
+          mode:
+            ReplaceMode::SameFd {
+              phase: SameFdPhase::CatchUp { remaining, .. },
+            },
+          ..
+        }) => {
+          // A live catching-up scope always has its lane tap — tap and
+          // handle are inserted and removed together. A future refactor
+          // breaking that pairing would otherwise wedge this widen silently
+          // in the conservative wait below.
+          debug_assert!(
+            source_taps.contains_key(&scope),
+            "a live catching-up scope keeps its lane tap"
+          );
+          (
+            *remaining == 0,
+            // A closed tap with the scope still alive: the end marker is
+            // queued behind the prefix — wait for the arm to route it.
+            source_taps.get(&scope).is_none_or(EventReceiver::is_closed),
+          )
+        }
+        _ => continue,
+      };
+      if !ready || lane_dying {
+        continue;
+      }
+    }
+    let Some(replace) = replace_states.remove(&scope) else {
+      continue;
+    };
+    let ReplaceMode::SameFd {
+      phase:
+        SameFdPhase::CatchUp {
+          reserved,
+          meta,
+          replay,
+          ..
+        },
+    } = replace.mode
+    else {
+      debug_assert!(false, "just matched CatchUp above");
+      continue;
+    };
+    resolved_any = true;
+    let widened = meta.root.clone();
+    let outcome = if dead {
+      // Death won during the catch-up: the arm's one end-marker/death path
+      // already ran the funnel; the witnessed window closes with the widen.
+      core.abort_widen_watch(scope);
+      Err(crate::error::ReplaceRootError::Retired)
+    } else {
+      let backend = *scope_backends
+        .get(&scope)
+        .expect("a live scope has a committed backend");
+      let stats = handles
+        .get(&scope)
+        .expect("checked live above")
+        .backend_stats();
+      commit_widen::<R, F>(
+        core,
+        ops,
+        registry,
+        scope,
+        meta,
+        reserved,
+        replace.reservation.path(),
+        replay,
+        backend,
+        stats,
+        now,
+      )
+    };
+    let resolution = match outcome {
+      Ok(WidenOutcome::Committed) => {
+        // The cookie floor follows the committed root. The widen uncovers
+        // nothing (old ⊂ new), so the parked-barrier revoke is a provable
+        // no-op — kept for uniformity with the stream-replace commits.
+        // Deliberately absent: the generation bump and the lane swap — the
+        // stream did not retire, and an in-flight cookie write under the
+        // old root must still claim on it.
+        revoke_uncovered_parked_cookies(core, parked_cookies, cookies, scope, &widened);
+        cookies.scope_live(scope, widened);
+        Ok(())
+      }
+      Ok(WidenOutcome::FallBack(taint)) => {
+        // Diagnostic (env-gated, off by default): name WHY the same-fd widen
+        // fell back to the general stream replace so a CI re-flake attributes
+        // the escalation to this producer. A tainted window carries its
+        // INV-ROOT cause; `None` is the core's impossible-path refusal.
+        if std::env::var("TRIBUTARY_FS_WIDEN_DEBUG").is_ok() {
+          // Best-effort: a diagnostic must never unwind the driver mid-fallback.
+          let mut err = std::io::stderr().lock();
+          match &taint {
+            Some(t) => {
+              let _ = writeln!(
+                err,
+                "[tributary-fs widen-debug] same-fd widen FELL BACK to stream-replace: \
+                 tainted window (cause={:?}, benign={})",
+                t.cause, t.benign
+              );
+            }
+            None => {
+              let _ = writeln!(
+                err,
+                "[tributary-fs widen-debug] same-fd widen FELL BACK to stream-replace: \
+                 core impossible-path refusal"
+              );
+            }
+          }
+        }
+        // The splice did not land — a TAINTED witnessed window (INV-ROOT's
+        // legitimate refusal, `taint` carrying the witness diagnostics) or
+        // the core's impossible-path refusal (already loud inside
+        // `commit_widen`). The registry still names the OLD root — the live
+        // truth — through the whole fallback (Golden-2: the widened entry
+        // publishes only at a commit), so a fallback whose spawn FAILS
+        // leaves admission consistent. The caller's obligation converts to
+        // the general stream replace: its commit overwrites the entry with
+        // spawn-minted truth (clearing any leftover window), its failure
+        // taxonomy answers the caller, and its fresh spawn barrier
+        // re-establishes the root binding the window could not prove. The
+        // reservation and reply ride along on the re-parked state; nothing
+        // resolves here.
+        dispatch_replace_spawn::<R, F>(ops, op_tx, config, handles, pending_spawns, scope, widened);
+        replace_states.insert(
+          scope,
+          ReplaceState {
+            reservation: replace.reservation,
+            reply: replace.reply,
+            mode: ReplaceMode::NewFd { arming: None },
+          },
+        );
+        continue;
+      }
+      Err(err) => Err(err),
+    };
+    // No resolution here enqueues a teardown, so a parked unwatch is
+    // re-checked exactly as after a failed replacement spawn.
+    if scope_quiesced(
+      scope,
+      handles,
+      pending_spawns,
+      pending_teardowns,
+      replace_states,
+    ) {
+      resolve_unwatch_waiters(unwatch_replies, scope);
+    }
+    drop(replace.reservation);
+    let _ = replace.reply.send(resolution);
+  }
+  resolved_any
 }
 
 /// Commits (or refuses) one root replacement that already passed the
@@ -4753,6 +5605,7 @@ fn commit_replace<R, F>(
   os: &mut SelectAll<
     futures_util::stream::BoxStream<'static, (ScopeId, u64, Option<SourceMessage>)>,
   >,
+  source_taps: &mut BTreeMap<ScopeId, EventReceiver>,
   registry: &impl ScopeRegistry,
   cookies: &CookieRegistry<F>,
   scope: ScopeId,
@@ -4814,6 +5667,9 @@ where
   let backend = spawned.meta.backend;
   let stats = spawned.handle.backend_stats();
   handles.insert(scope, spawned.handle);
+  // The lane's drain tap re-binds with the lane: a widen commit on the NEW
+  // stream drains this queue, and the retired lane's old clone drops here.
+  source_taps.insert(scope, spawned.receiver.clone());
   os.push(
     spawned
       .receiver
@@ -4843,6 +5699,116 @@ where
   Ok(backend)
 }
 
+/// Commits (or refuses) one same-transport WIDEN whose pre-arm succeeded on
+/// the live port. The commit is the D1 shape minus everything stream-shaped —
+/// no lane swap, no generation bump, no handle retirement, no covering
+/// `Rescan` — because nothing retires: the core splices the new root above
+/// the old one and only then the registry publishes the widened root
+/// (atomic-on-failure: every non-committed path leaves the OLD entry — the
+/// live truth — in place for the fallback or the caller's error)
+/// ([`on_root_widened`](DriverCore::on_root_widened)), and the pre-armed
+/// outcome replays so the widened root's COLD read discovers the new ground.
+/// The one refusal with something to unwind is the final-root conflict: the
+/// pre-armed watch descriptor sits on a stream that KEEPS living, so it is
+/// disarmed rather than left to attribute noise for the scope's lifetime.
+#[allow(clippy::too_many_arguments)]
+fn commit_widen<R, F>(
+  core: &mut DriverCore,
+  ops: &F,
+  registry: &impl ScopeRegistry,
+  scope: ScopeId,
+  meta: RootMeta,
+  reserved: WatchId,
+  reserved_path: &Path,
+  replay: WatchOutcome,
+  backend: BackendKind,
+  stats: Option<crate::os::BackendStatsHandle>,
+  now: &impl Fn() -> Instant,
+) -> Result<WidenOutcome, crate::error::ReplaceRootError>
+where
+  R: RuntimeLite,
+  F: FsOps,
+{
+  // The single-writer final check, exempting this scope and the command's own
+  // reservation — the same authority order the stream-replace commit uses.
+  if let Some(existing) = registry.final_root_conflict(
+    &meta.root,
+    meta.identity,
+    &meta.ancestors,
+    Some(reserved_path),
+    Some(scope),
+  ) {
+    let err = crate::error::ReplaceRootError::Overlaps {
+      path: meta.root.clone(),
+      existing,
+    };
+    // The widen ends here with the OLD world live: close its witnessed
+    // window with it, or the leaked entry would poison a future widen's
+    // reservation on this scope.
+    core.abort_widen_watch(scope);
+    let ops = ops.clone();
+    R::spawn_blocking_detach(move || ops.remove_watch(scope, reserved));
+    return Err(err);
+  }
+  // The registry publish is DEFERRED to the Committed arm (Golden-2:
+  // atomic-on-failure): publishing the widened root before the gate decided
+  // left the entry naming a root nobody covers on every non-committed path —
+  // and a tainted fallback whose D1 spawn then FAILED would return the error
+  // with the corrupt entry in place, poisoning root_path and every later
+  // overlap admission. The whole check→commit→publish sequence runs
+  // synchronously on the single-writer task, so no reader can observe a gap;
+  // the fields the publish needs are captured here because the core commit
+  // consumes `meta`.
+  let published_root = meta.root.clone();
+  let published_identity = meta.identity;
+  let published_ancestors = meta.ancestors.clone();
+  match core.on_root_widened(scope, meta, reserved, now()) {
+    WidenCommit::Committed => {
+      // The splice landed: NOW the registry names the widened root — the
+      // same single-writer program order as birth and the stream replace
+      // (decision complete, then publish, then the caller can observe).
+      registry.scope_live(
+        scope,
+        &published_root,
+        published_identity,
+        &published_ancestors,
+        backend,
+        stats,
+      );
+      // Replay the pre-armed outcome: the widened root leaves its pending arm
+      // and its cold enumerate begins on the unchanged transport.
+      core.on_watch_installed(reserved, replay);
+      Ok(WidenOutcome::Committed)
+    }
+    WidenCommit::TaintedWindow(taint) => {
+      // The witnessed window tainted (INV-ROOT): a reserved death record or a
+      // scope loss landed between the reservation and this commit, so the
+      // pre-armed binding cannot be proven live — a LEGITIMATE refusal, never
+      // a bug. Disarm the descriptor (mirroring the conflict path above: the
+      // live stream keeps running until the fallback retires it) and hand the
+      // obligation to the general stream replace, whose fresh spawn barrier
+      // re-establishes the binding the window could not prove.
+      let ops = ops.clone();
+      R::spawn_blocking_detach(move || ops.remove_watch(scope, reserved));
+      Ok(WidenOutcome::FallBack(Some(taint)))
+    }
+    WidenCommit::Refused => {
+      // The impossible path, loud: a violated precondition refused the splice
+      // with the core, Monitor, and registry all untouched (the publish is
+      // deferred to Committed, so the OLD entry — the live truth — stands).
+      // Close the window (the fallback spawn may FAIL, and a leaked entry
+      // would poison a later widen), disarm the pre-armed descriptor, and
+      // hand the obligation to the general stream replace (see
+      // [`WidenOutcome`]).
+      debug_assert!(false, "a live descending scope accepts its widen commit");
+      core.abort_widen_watch(scope);
+      let ops = ops.clone();
+      R::spawn_blocking_detach(move || ops.remove_watch(scope, reserved));
+      Ok(WidenOutcome::FallBack(None))
+    }
+  }
+}
+
 /// Executes the core's queued effects, feeding each outcome straight back.
 #[allow(clippy::too_many_arguments)]
 fn execute_effects<R, F>(
@@ -4855,6 +5821,7 @@ fn execute_effects<R, F>(
   pending_teardowns: &mut BTreeMap<ScopeId, usize>,
   scope_backends: &mut BTreeMap<ScopeId, BackendKind>,
   lanes: &mut BTreeMap<ScopeId, u64>,
+  source_taps: &mut BTreeMap<ScopeId, EventReceiver>,
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
@@ -4899,6 +5866,9 @@ fn execute_effects<R, F>(
         // for the gone scope then resolves no lane and refuses (the `u64::MAX`
         // sentinel), exactly the right answer for a torn-down transport.
         lanes.remove(&scope);
+        // The lane's drain tap dies with the lane — a clone kept past this
+        // point would grow the map unbounded under watch/unwatch churn.
+        source_taps.remove(&scope);
         // Every scope end — explicit unwatch, root death, stream fatal —
         // funnels through this effect: reclaim the registry entry, so a dead
         // root stops participating in liveness checks immediately. The arm

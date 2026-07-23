@@ -3628,6 +3628,2151 @@ mod descending {
         .count()
     }
   }
+
+  /// The same-transport WIDEN (D2): a widening replace on the descending
+  /// backend keeps the live stream — no spawn, no teardown, no lane swap, no
+  /// covering Rescan — and the old subtree's coverage rides across
+  /// continuously while the newly covered ground is discovered cold.
+  mod widen {
+    use super::*;
+
+    async fn replace(
+      rig: &Rig,
+      scope: ScopeId,
+      new_root: &str,
+    ) -> Result<(), crate::error::ReplaceRootError> {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from(new_root),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from(
+            new_root,
+          )),
+          reply,
+        })
+        .await
+        .unwrap();
+      on_reply.await.expect("driver replies")
+    }
+
+    /// The flagship no-gap cell: the widen commits on the SAME stream (one
+    /// spawn ever, zero shutdowns), emits NO Rescan and bumps NO epoch, keeps
+    /// delivering old-subtree records on the surviving watch — re-rooted and
+    /// chain-prefixed at their unchanged absolute paths — and announces the
+    /// newly covered ground as cold `Created` discovery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widening_replace_keeps_the_stream_and_dominates_nothing() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      rig.fs.put("/r/sub/deep/leaf", FileKind::Dir, 6);
+      rig.fs.put("/r/other", FileKind::Dir, 4);
+      rig.fs.put("/r/other/kid", FileKind::Dir, 5);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+
+      // Let the birth crawl finish before driving records: consuming `deep`'s
+      // and `deep/leaf`'s discoveries proves the root's AND `deep`'s cold
+      // reads completed (a record racing an in-flight read would dirty it into
+      // the ordinary escalation Rescan — a different story than the widen's).
+      for expected in [loc(&["deep"]), loc(&["deep", "leaf"])] {
+        let (s, root, change) = next_rooted(&rig).await;
+        assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
+        assert!(change.kind().is_created());
+        assert_eq!(change.location(), &expected);
+      }
+
+      // A pre-widen delivery pins the epoch the widen must NOT dominate.
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[sub_watch], IN_CREATE, b"pre.txt")],
+      );
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
+      assert!(change.kind().is_created());
+      let pre_epoch = change.epoch();
+
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      assert_eq!(rig.fs.spawns(), 1, "the widen spawns nothing");
+      assert_eq!(rig.fs.shutdowns(), 0, "the widen retires nothing");
+
+      // The widened root pre-armed on the live port and cold-read: the newly
+      // covered ground announces as Created (state facts) all the way down —
+      // the adopted slot is reused (its interior is never re-read) — and
+      // NOTHING is a Rescan. Waiting for `other/kid` also proves `other`'s own
+      // cold read completed, so the record below cannot race (and dirty) it.
+      let mut seen_other = false;
+      let mut seen_sub_entry = false;
+      let mut seen_other_kid = false;
+      while !(seen_other && seen_sub_entry && seen_other_kid) {
+        let (s, root, change) = next_rooted(&rig).await;
+        assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+        assert!(
+          change.kind().is_created(),
+          "the widen's discovery is Created-only, never a Rescan: {change:?}"
+        );
+        seen_other |= change.location() == &loc(&["other"]);
+        seen_sub_entry |= change.location() == &loc(&["sub"]);
+        seen_other_kid |= change.location() == &loc(&["other", "kid"]);
+      }
+
+      // Continuity: the SAME kernel watches keep recording the old subtree —
+      // root and interior alike — re-rooted under the widened path at the SAME
+      // epoch, at their unchanged absolute paths.
+      let deep_watch = rig
+        .fs
+        .arms()
+        .iter()
+        .find(|(_, p)| p == std::path::Path::new("/r/sub/deep"))
+        .expect("the old interior armed at birth")
+        .0;
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[sub_watch], IN_CREATE, b"post.txt")],
+      );
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+      assert!(change.kind().is_created());
+      assert_eq!(change.location(), &loc(&["sub", "post.txt"]));
+      assert_eq!(
+        change.epoch(),
+        pre_epoch,
+        "no reconciliation generation bump across the widen"
+      );
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[deep_watch], IN_CREATE, b"d.txt")],
+      );
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+      assert_eq!(change.location(), &loc(&["sub", "deep", "d.txt"]));
+
+      // The widened ground is genuinely armed: records under it deliver.
+      let other_watch = rig
+        .fs
+        .arms()
+        .iter()
+        .find(|(_, p)| p == std::path::Path::new("/r/other"))
+        .expect("the new ground armed")
+        .0;
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[other_watch], IN_CREATE, b"new.txt")],
+      );
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+      assert_eq!(change.location(), &loc(&["other", "new.txt"]));
+
+      // Unwatch tears exactly the ONE stream that ever existed.
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      assert!(on_reply.await.unwrap());
+      settle(|| rig.fs.shutdowns() == 1).await;
+      assert_eq!(rig.fs.spawns(), 1);
+    }
+
+    /// A failed meta resolve answers the typed source error and leaves the old
+    /// world untouched — no spawn, no teardown, coverage still delivering.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widen_meta_failure_unwinds_with_the_old_world_untouched() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      // Fence the birth crawl (see the flagship cell): the root's read is
+      // complete once its discovery delivers, so later records cannot dirty it.
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      rig.fs.remove("/r");
+      let err = replace(&rig, scope, "/r")
+        .await
+        .expect_err("the meta fails");
+      assert!(
+        matches!(err, crate::error::ReplaceRootError::Source(_)),
+        "{err:?}"
+      );
+      assert_eq!(rig.fs.spawns(), 1);
+      assert_eq!(rig.fs.shutdowns(), 0);
+
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[sub_watch], IN_CREATE, b"alive.txt")],
+      );
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
+      assert_eq!(change.location(), &loc(&["alive.txt"]));
+    }
+
+    /// A failed live-port pre-arm unwinds atomically: nothing was installed,
+    /// nothing retires, and the old coverage keeps delivering.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widen_pre_arm_failure_unwinds_with_the_old_coverage_untouched() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      rig
+        .fs
+        .fail_watch_at("/r", tributary_proto::WatchError::NoSpace);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      // Fence the birth crawl (see the flagship cell).
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let err = replace(&rig, scope, "/r").await.expect_err("the arm fails");
+      assert!(
+        matches!(err, crate::error::ReplaceRootError::Source(_)),
+        "{err:?}"
+      );
+      assert_eq!(rig.fs.spawns(), 1, "no fallback spawn on an arm failure");
+      assert_eq!(rig.fs.shutdowns(), 0);
+
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[sub_watch], IN_CREATE, b"alive.txt")],
+      );
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
+      assert_eq!(change.location(), &loc(&["alive.txt"]));
+    }
+
+    /// A widen whose resolved target sits on a DIFFERENT mount frame falls
+    /// back to the general stream replace: the enumerate lowering would mark
+    /// the adopted slot `Other` and tear the old coverage down, so the driver
+    /// re-validates the frame at the meta and routes D1 — observable as the
+    /// replacement spawn, the old stream's retirement, and the commit Rescan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cross_frame_widen_falls_back_to_the_stream_replace() {
+      let rig = inotify_rig_mnt(5);
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      let scope = watch(&rig, "/r/sub").await;
+      // The widened root lives on another mount instance (a bind/submount
+      // seam between old and new), same device.
+      rig.fs.put_on_mount("/r", FileKind::Dir, 1, 7);
+
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      settle(|| rig.fs.shutdowns() == 1).await;
+      assert_eq!(rig.fs.spawns(), 2, "the fallback took the new-stream path");
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+      assert!(
+        change.kind().is_rescan(),
+        "the stream replace bridges with its covering Rescan: {change:?}"
+      );
+    }
+
+    /// Death wins mid-widen: a scope torn down while the pre-arm is parked
+    /// answers `Retired`, and a parked unwatch resolves at quiescence — the
+    /// widen's obligation is counted by the same fence as every other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn death_during_the_widen_pre_arm_answers_retired() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      let scope = watch(&rig, "/r/sub").await;
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+
+      // The unwatch tears the live stream while the pre-arm is parked; its
+      // reply waits for the widen obligation to quiesce.
+      let (ureply, on_unwatch) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(ureply),
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.shutdowns() == 1).await;
+      hold.release();
+
+      assert!(
+        matches!(
+          on_reply.await.expect("driver replies"),
+          Err(crate::error::ReplaceRootError::Retired)
+        ),
+        "death wins over the in-flight widen"
+      );
+      assert!(
+        on_unwatch.await.unwrap(),
+        "the unwatch resolves at quiescence"
+      );
+      assert_eq!(rig.fs.spawns(), 1);
+    }
+
+    /// Repeated widens ride the one stream end to end: two same-transport
+    /// commits, one spawn ever, nothing retired until the final unwatch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_widens_reuse_the_one_stream() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/a", FileKind::Dir, 5);
+      rig.fs.put("/r/a/b", FileKind::Dir, 6);
+      let scope = watch(&rig, "/r/a/b").await;
+
+      assert!(replace(&rig, scope, "/r/a").await.is_ok());
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      assert_eq!(rig.fs.spawns(), 1, "both widens kept the stream");
+      assert_eq!(rig.fs.shutdowns(), 0);
+
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      assert!(on_reply.await.unwrap());
+      settle(|| rig.fs.shutdowns() == 1).await;
+      assert_eq!(rig.fs.spawns(), 1);
+    }
+
+    /// The no-generation-bump observable: a cookie write dispatched BEFORE
+    /// the widen still CLAIMS after it — the stream never retired, so the
+    /// write's claim generation is still current. (A stream replace bumps the
+    /// generation at its lane swap and such a write self-reaps instead.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pre_widen_cookie_write_claims_after_the_commit() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      // Fence the birth crawl (see the flagship cell).
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      // Park the write IN THE POOL: dispatched under the pre-widen world,
+      // claiming only after the commit.
+      let hold = rig.fs.hold_cookie_writes();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from("/r/sub"),
+          name: ".tributaries-sync-widen-claim".to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.cookie_dispatches() == 1).await;
+
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      assert_eq!(rig.fs.shutdowns(), 0, "the widen retires nothing");
+      hold.release();
+
+      let path = on_reply
+        .await
+        .expect("the driver replies")
+        .expect("the pre-widen write claims after the commit");
+      assert_eq!(path, PathBuf::from("/r/sub/.tributaries-sync-widen-claim"));
+      assert_eq!(rig.fs.cookie_writes(), vec![path]);
+    }
+
+    const IN_MOVE_SELF: u32 = 0x0000_0800;
+
+    /// The Codex R1 finding-1 cell: a sync admitted after a deep widen PARKS
+    /// until the adoption tripwire resolves. The old root moved during the
+    /// dark window (its parent was never armed, so the move is unrecorded and
+    /// its queued `MoveSelf` is the deliberate non-root no-op) — without the
+    /// adoptions settle conjunct the cookie would dispatch immediately and
+    /// resolve Delivered across the undelivered move; with it, the write
+    /// waits, the mismatch's covering root Rescan lands, and only then does
+    /// the barrier resolve.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_across_an_unverified_adoption_parks_until_the_tripwire_resolves() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/a", FileKind::Dir, 10);
+      rig.fs.put("/r/a/b", FileKind::Dir, 11);
+      rig.fs.put("/r/a/b/deep", FileKind::Dir, 12);
+      let scope = watch(&rig, "/r/a/b").await;
+      let old_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      // Fence the birth crawl (see the flagship cell).
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      // Freeze every post-commit read: the tripwire cannot resolve.
+      let hold = rig.fs.hold_enumerates();
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+
+      // The dark-window move: `/r/a/b` renames to `/r/a/b2` with nobody armed
+      // at `/r/a`; the old root's own MoveSelf is the non-root no-op.
+      rig.fs.remove("/r/a/b/deep");
+      rig.fs.remove("/r/a/b");
+      rig.fs.put("/r/a/b2", FileKind::Dir, 11);
+      rig.fs.put("/r/a/b2/deep", FileKind::Dir, 12);
+      rig
+        .fs
+        .send_inotify_batch("/r/a/b", vec![attributed(&[old_watch], IN_MOVE_SELF, b"")]);
+
+      let (reply, mut on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from("/r"),
+          name: ".tributaries-sync-adopt".to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      for _ in 0..40 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(&mut on_reply).is_pending(),
+        "the barrier waits for the unverified adoption"
+      );
+      assert_eq!(
+        rig.fs.cookie_dispatches(),
+        0,
+        "no write dispatches over the unverified window"
+      );
+
+      // Release: the tail's listing lacks the adopted name — the escalation's
+      // covering root Rescan lands, the counted rebuild quiesces, and only
+      // then does the write dispatch and the barrier resolve.
+      hold.release();
+      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the sync resolves once the tripwire settled")
+        .expect("the driver replies")
+        .expect("the write lands");
+      assert_eq!(rig.fs.cookie_writes(), vec![path]);
+      let mut saw_covering = false;
+      for _ in 0..200 {
+        if let Ok(Ok((s, root, change))) = tokio::time::timeout(Duration::from_millis(50), async {
+          Ok::<_, ()>(next_rooted(&rig).await)
+        })
+        .await
+        {
+          if s == scope && root.as_path() == std::path::Path::new("/r") && change.kind().is_rescan()
+          {
+            saw_covering = true;
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+      assert!(saw_covering, "the mismatch's covering Rescan was delivered");
+    }
+
+    /// The Codex R1 finding-2 cell: a connector replaced by a FILE during the
+    /// dark window. The widened root's cold listing reconciles the slot and
+    /// tears down the connector, the adopted old tree, and the pending
+    /// tripwire in one drop — which must stand the closing covering Rescan
+    /// (an erased unverified adoption is erased coverage), never disarm the
+    /// old watches in silence. The scope stays serviceable: a later sync
+    /// resolves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connector_turned_file_tears_down_loudly() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/a", FileKind::Dir, 10);
+      rig.fs.put("/r/a/b", FileKind::Dir, 11);
+      rig.fs.put("/r/a/b/deep", FileKind::Dir, 12);
+      let scope = watch(&rig, "/r/a/b").await;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_enumerates();
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      rig.fs.remove("/r/a/b/deep");
+      rig.fs.remove("/r/a/b");
+      rig.fs.remove("/r/a");
+      rig.fs.put("/r/a", FileKind::File, 40);
+      hold.release();
+
+      // The closing root Rescan is the teardown's honesty.
+      loop {
+        let (s, root, change) = next_rooted(&rig).await;
+        if s == scope && root.as_path() == std::path::Path::new("/r") && change.kind().is_rescan() {
+          break;
+        }
+      }
+      // The old coverage was disarmed — loudly, and the scope still serves.
+      settle(|| !rig.fs.disarms().is_empty()).await;
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from("/r"),
+          name: ".tributaries-sync-after-teardown".to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the sync resolves after the loud teardown")
+        .expect("the driver replies")
+        .expect("the write lands");
+      assert!(rig.fs.cookie_writes().contains(&path));
+    }
+
+    /// The ratified F-C chain extension: a resolved mount prefix covering the
+    /// old root sits ON the connecting chain, so the widen must fall back to
+    /// the stream replace — the chain crawl would `Other`-lower the connector
+    /// and destroy the adopted coverage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mount_on_the_connecting_chain_falls_back_to_the_stream_replace() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/a", FileKind::Dir, 10);
+      rig.fs.put("/r/a/b", FileKind::Dir, 11);
+      let scope = watch(&rig, "/r/a/b").await;
+      // The widen target's meta resolves with a mount seeded AT the connector.
+      rig.fs.seed_mounts(vec![PathBuf::from("/r/a")]);
+
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      settle(|| rig.fs.shutdowns() == 1).await;
+      assert_eq!(rig.fs.spawns(), 2, "the fallback took the new-stream path");
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+      assert!(
+        change.kind().is_rescan(),
+        "the stream replace bridges with its covering Rescan: {change:?}"
+      );
+    }
+
+    /// INV-ROOT's happy-path dividend: a CLEAN witnessed window's commit
+    /// already proved the reserved binding live, so a sync after the widen
+    /// certifies as soon as the Monitor's own conjuncts clear — with the
+    /// mount refresh HELD the whole time. The retired design serialized
+    /// this behind a refresh round-trip; the deleted `root_verified`
+    /// conjunct must not silently return.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clean_widen_window_certifies_without_the_refresh() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      // Park the verification edge, then widen and let the adoption confirm
+      // (the slice discovery delivering proves the widened root's read ran).
+      let hold = rig.fs.hold_refreshes();
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      loop {
+        let (s, root, change) = next_rooted(&rig).await;
+        assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+        if change.location() == &loc(&["sub"]) {
+          break;
+        }
+      }
+
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from("/r"),
+          name: ".tributaries-sync-verify".to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      // The refreshes stay HELD: the clean window's commit is the whole
+      // verification, so the sync certifies without one.
+      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("a clean widen window certifies without the refresh")
+        .expect("the driver replies")
+        .expect("the write lands");
+      assert_eq!(rig.fs.cookie_writes(), vec![path]);
+      hold.release();
+    }
+
+    /// W5/W6 end-to-end — the witnessed window's loss leg: a transport loss
+    /// drained while the pre-arm is parked taints the window, so the commit
+    /// refuses the same-fd splice and the obligation falls back to the
+    /// general stream replace — a fresh fd whose spawn barrier re-establishes
+    /// the binding the window could not prove — while the pre-armed
+    /// descriptor is disarmed rather than left attributing noise (OQ5).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lossy_widen_window_falls_back_to_the_stream_replace() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      // Park the pre-arm, dispatch the widen, and wait for the pre-arm to be
+      // ENTERED: the witnessed window is provably open from here (the
+      // reservation and the pre-arm dispatch share one handler).
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // The loss, provably inside the window; waiting out the overflow ack
+      // proves the driver consumed it (the core latched) before the release.
+      rig.fs.send_lossy("/r/sub");
+      settle(|| !rig.fs.overflow_pending("/r/sub")).await;
+      assert!(
+        !rig.fs.overflow_pending("/r/sub"),
+        "could not stage the interleaving: the loss must drain into the witnessed window before release"
+      );
+      hold.release();
+
+      // The tainted commit falls back: the caller still resolves Ok — through
+      // the stream replace's commit — on a SECOND spawn, with the first
+      // stream retired and the pre-armed descriptor disarmed.
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the fallback replace resolves the caller")
+        .expect("the driver replies");
+      assert!(
+        resolved.is_ok(),
+        "the fallback commit answers Ok: {resolved:?}"
+      );
+      assert_eq!(rig.fs.spawns(), 2, "the tainted widen re-spawned");
+      settle(|| rig.fs.shutdowns() == 1).await;
+      // "/r" armed twice, strictly ordered: the released PRE-ARM gates the
+      // fallback (its outcome is what the tainted commit refuses), so the
+      // first "/r" arm is the reserved descriptor and the second is the
+      // fallback's own root arm on the fresh transport.
+      let r_arms: Vec<WatchId> = rig
+        .fs
+        .arms()
+        .iter()
+        .filter(|(_, path)| path == std::path::Path::new("/r"))
+        .map(|(watch, _)| *watch)
+        .collect();
+      assert!(
+        r_arms.len() >= 2,
+        "pre-arm then fallback root arm: {r_arms:?}"
+      );
+      settle(|| rig.fs.disarms().contains(&r_arms[0])).await;
+      assert!(
+        rig.fs.disarms().contains(&r_arms[0]),
+        "the pre-armed descriptor is disarmed on the tainted path (OQ5): {:?} not in {:?}",
+        r_arms[0],
+        rig.fs.disarms()
+      );
+
+      // The D1 bridge dominates the fallback window: a covering Rescan
+      // reaches the consumer under the widened root.
+      loop {
+        let (s, root, change) = next_rooted(&rig).await;
+        if s == scope && root.as_path() == std::path::Path::new("/r") && change.kind().is_rescan() {
+          break;
+        }
+      }
+    }
+
+    /// A widen rig whose registry publications are observable — the Golden-2
+    /// cells read which root each publish named.
+    fn inotify_rig_registry(registry: impl ScopeRegistry) -> Rig {
+      let fs = FakeFs::new(1);
+      fs.put("/r", FileKind::Dir, 1);
+      fs.spawn_backend(BackendKind::Inotify);
+      let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+      let (cleanup, cookie_wake) = cookie_ingress();
+      let (ev_tx, ev_rx) = async_channel::bounded(64);
+      tokio::spawn(run::<TokioRuntime, FakeFs>(
+        inotify_config(),
+        fs.clone(),
+        cmd_rx,
+        cookie_wake,
+        ev_tx,
+        registry,
+      ));
+      Rig {
+        fs,
+        commands: cmd_tx,
+        cleanup,
+        events: ev_rx,
+      }
+    }
+
+    /// The last root the registry published for `scope`, if any.
+    fn last_published(registry: &RecordingRegistry, scope: ScopeId) -> Option<PathBuf> {
+      registry
+        .live()
+        .into_iter()
+        .filter(|(s, _, _)| *s == scope)
+        .map(|(_, root, _)| root)
+        .next_back()
+    }
+
+    /// The two INV-ROOT funnels, at the core gate: a reserved-root death
+    /// record and a transport `Overflow` each taint the witnessed window when
+    /// the source arm ingests them ([`apply_source_message`], the shared body
+    /// the catch-up runs one message per loop iteration) BEFORE the commit gate
+    /// reads. The record leg reads TAINTED `RootDeath`, the loss leg `Loss` —
+    /// never a stale clean verdict. End to end this is the catch-up phase (the
+    /// arm processes the prefix, then [`resolve_widen_catchups`] reads the
+    /// tainted window and falls back); see
+    /// `a_loss_queued_at_widen_ready_orders_behind_the_commit_cut`.
+    #[test]
+    fn a_queued_loss_taints_the_widen_commit_gate() {
+      use crate::{
+        core::{TaintCause, WidenCommit, WidenTaint},
+        os::transport::{TransportState, forward_batch},
+      };
+      use tributary_proto::RecordKind;
+
+      fn live_core_at(root: &str) -> (DriverCore, ScopeId) {
+        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+        let scope = core.on_watch(
+          PathBuf::from(root),
+          tributary_proto::Interest::all(),
+          BackendKind::Inotify,
+        );
+        while core.poll_effect().is_some() {}
+        core.on_stream_spawned(
+          scope,
+          Ok(RootMeta {
+            root: PathBuf::from(root),
+            root_dev: 1,
+            root_mnt_id: None,
+            mounts: Vec::new(),
+            identity: crate::os::RootIdentity::new(1, 1),
+            ancestors: Vec::new(),
+            backend: BackendKind::Inotify,
+          }),
+        );
+        let root_watch = loop {
+          match core.poll_effect() {
+            Some(crate::core::Effect::AddWatch { watch, parent, .. }) if watch == parent => {
+              break watch;
+            }
+            Some(_) => continue,
+            None => panic!("the descending root arms"),
+          }
+        };
+        core.on_watch_installed(root_watch, WatchOutcome::Installed(1));
+        while core.poll_effect().is_some() {}
+        (core, scope)
+      }
+      fn widen_meta(root: &str) -> RootMeta {
+        RootMeta {
+          root: PathBuf::from(root),
+          root_dev: 1,
+          root_mnt_id: None,
+          mounts: Vec::new(),
+          identity: crate::os::RootIdentity::new(1, 9),
+          ancestors: Vec::new(),
+          backend: BackendKind::Inotify,
+        }
+      }
+      let at = || tributary_proto::Instant::from_origin(Duration::from_millis(5));
+
+      // Leg A — a reserved-root DEATH RECORD, ingested by the arm's own body.
+      let (mut core, scope) = live_core_at("/r/sub");
+      let reserved = core.reserve_watch_id();
+      core.begin_widen_watch(scope, reserved);
+      crate::driver::apply_source_message(
+        &mut core,
+        scope,
+        crate::os::SourceMessage::Batch(crate::os::BatchPayload::detached(vec![
+          crate::os::SourceEvent::Linux(RawLinuxEvent::Inotify {
+            anchors: vec![reserved],
+            event: RawInotifyEvent {
+              wd: 7,
+              mask: InotifyMask(0x0000_8000), // IN_IGNORED
+              cookie: 0,
+              name: None,
+            },
+          }),
+        ])),
+        &at,
+      );
+      assert_eq!(
+        core.on_root_widened(scope, widen_meta("/r"), reserved, at()),
+        WidenCommit::TaintedWindow(WidenTaint {
+          cause: TaintCause::RootDeath(RecordKind::Ignored),
+          benign: 0,
+        }),
+        "a reserved death record taints before the commit gate reads"
+      );
+
+      // Leg B — a transport OVERFLOW (a real election, ack and all).
+      let (mut core, scope) = live_core_at("/q/sub");
+      let reserved = core.reserve_watch_id();
+      core.begin_widen_watch(scope, reserved);
+      let transport = TransportState::new(4);
+      let mut minted = Vec::new();
+      forward_batch::<crate::os::SourceEvent, _>(&transport, Vec::new(), true, |msg| {
+        minted.push(msg);
+        true
+      });
+      let overflow = minted
+        .pop()
+        .expect("a lossy empty batch elects an Overflow");
+      assert!(matches!(overflow, crate::os::SourceMessage::Overflow(_)));
+      crate::driver::apply_source_message(&mut core, scope, overflow, &at);
+      assert_eq!(
+        core.on_root_widened(scope, widen_meta("/q"), reserved, at()),
+        WidenCommit::TaintedWindow(WidenTaint {
+          cause: TaintCause::Loss,
+          benign: 0,
+        }),
+        "a transport Overflow taints before the commit gate reads"
+      );
+    }
+
+    /// The queued-loss race end to end, DETERMINISTIC: the loss and the
+    /// widen-ready completion are BOTH queued when the (single-threaded,
+    /// test-starved) driver loop next runs, so `select_biased!` provably
+    /// services `WidenArmed` with the `Overflow` still unprocessed on the
+    /// source lane. Under the catch-up phase the loss is simply IN THE PREFIX:
+    /// `WidenArmed` snapshots it into `remaining`, the source arm taints the
+    /// window through the loss funnel, and the commit — resolving only once the
+    /// prefix is consumed — reads TAINTED and falls back to the stream replace,
+    /// never committing over the unwitnessed loss.
+    #[tokio::test]
+    async fn a_loss_queued_at_widen_ready_orders_behind_the_commit_cut() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // SYNCHRONOUS section: this test owns the runtime's ONLY thread, so
+      // the driver loop cannot run until the next await. Queue the loss,
+      // release the pre-arm, and wait (blocking) for the pool thread to run
+      // the post-arm bracket — after the probe only the WidenArmed
+      // `try_send` remains, and the stall gives it ample time to land. Both
+      // messages are then queued before the loop ever wakes.
+      rig.fs.send_lossy("/r/sub");
+      let probes_before = rig.fs.probes();
+      hold.release();
+      for _ in 0..5_000 {
+        if rig.fs.probes() > probes_before {
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+      }
+      assert!(rig.fs.probes() > probes_before, "the bracket probe ran");
+      std::thread::sleep(Duration::from_millis(50));
+
+      // First await: the loop wakes with BOTH ready; the op arm wins the
+      // biased select and snapshots the loss into `remaining`; the source arm
+      // taints the window before the catch-up commit reads it.
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the fallback replace resolves the caller")
+        .expect("the driver replies");
+      assert!(
+        resolved.is_ok(),
+        "the fallback commit answers Ok: {resolved:?}"
+      );
+      assert_eq!(
+        rig.fs.spawns(),
+        2,
+        "the queued loss tainted the window: the widen fell back, never committed"
+      );
+      settle(|| rig.fs.shutdowns() == 1).await;
+    }
+
+    /// Golden-2, the held-fallback interim: a tainted widen's D1 fallback is
+    /// dispatched but its spawn is HELD — the registry must keep naming the
+    /// OLD root (the live truth) through the whole interim, and adopt the
+    /// widened root only when the fallback COMMITS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tainted_fallback_keeps_the_registry_on_the_old_root_until_its_commit() {
+      let registry = RecordingRegistry::default();
+      let rig = inotify_rig_registry(registry.clone());
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+      assert_eq!(
+        last_published(&registry, scope),
+        Some(PathBuf::from("/r/sub")),
+        "birth published the old root"
+      );
+
+      let spawns_hold = rig.fs.hold_spawns();
+      let prearm_hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+      rig.fs.send_lossy("/r/sub");
+      settle(|| !rig.fs.overflow_pending("/r/sub")).await;
+      prearm_hold.release();
+
+      // The tainted fallback's spawn is dispatched (its resume point records
+      // before the hold parks it): the widened root must NOT be published.
+      settle(|| rig.fs.spawn_resume_points().len() == 2).await;
+      assert_eq!(
+        last_published(&registry, scope),
+        Some(PathBuf::from("/r/sub")),
+        "the tainted interim never publishes the widened root"
+      );
+
+      spawns_hold.release();
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the fallback resolves")
+        .expect("the driver replies");
+      assert!(resolved.is_ok(), "{resolved:?}");
+      settle(|| last_published(&registry, scope) == Some(PathBuf::from("/r"))).await;
+    }
+
+    /// Golden-2, the failure exit: the tainted fallback's D1 spawn FAILS —
+    /// the caller gets the error, the registry still names the OLD root, and
+    /// the old stream's coverage keeps delivering (atomic-on-failure: the
+    /// entry always names the root that is actually covered).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_tainted_fallback_keeps_the_registry_on_the_old_root() {
+      let registry = RecordingRegistry::default();
+      let rig = inotify_rig_registry(registry.clone());
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let spawns_hold = rig.fs.hold_spawns();
+      let prearm_hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+      rig.fs.send_lossy("/r/sub");
+      settle(|| !rig.fs.overflow_pending("/r/sub")).await;
+      prearm_hold.release();
+      settle(|| rig.fs.spawn_resume_points().len() == 2).await;
+
+      // The widened root vanishes while the fallback spawn is parked: the
+      // released spawn fails, the replace surfaces the error — and the
+      // registry never adopted a root nobody covers.
+      rig.fs.remove("/r");
+      spawns_hold.release();
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the failed fallback resolves")
+        .expect("the driver replies");
+      assert!(
+        matches!(resolved, Err(crate::error::ReplaceRootError::Source(_))),
+        "the fallback spawn failure surfaces typed: {resolved:?}"
+      );
+      assert_eq!(
+        last_published(&registry, scope),
+        Some(PathBuf::from("/r/sub")),
+        "the registry still names the root that is actually covered"
+      );
+
+      // The old coverage never blinked: the surviving stream still delivers.
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[sub_watch], IN_CREATE, b"still-alive.txt")],
+      );
+      loop {
+        let (s, root, change) = next_rooted(&rig).await;
+        if s == scope
+          && root.as_path() == std::path::Path::new("/r/sub")
+          && change.location() == &loc(&["still-alive.txt"])
+        {
+          break;
+        }
+      }
+    }
+
+    /// G2-1: a lane whose source DIED (sender dropped, end marker still
+    /// unprocessed) is never a clean widen window. Deterministic via the
+    /// starved current-thread runtime: the disconnect and the widen-ready
+    /// completion are both pending when the loop wakes, the biased select
+    /// services `WidenArmed` first (parking the catch-up), and the closed lane
+    /// keeps the commit WAITING (`resolve_widen_catchups`) while the source
+    /// arm's end-marker path routes `on_source_fatal` — so the liveness gate
+    /// answers `Retired`, publishes nothing, and spawns nothing.
+    #[tokio::test]
+    async fn a_disconnected_lane_retires_the_widen_before_the_commit() {
+      let registry = RecordingRegistry::default();
+      let rig = inotify_rig_registry(registry.clone());
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // SYNCHRONOUS section (single-threaded runtime, loop starved): the
+      // source dies, then the pre-arm releases; only after the bracket probe
+      // and a generous stall does the test yield — the loop wakes with the
+      // dead lane's end marker and `WidenArmed` BOTH pending, and op-bias
+      // services the completion first (parking the catch-up).
+      rig.fs.disconnect("/r/sub");
+      let probes_before = rig.fs.probes();
+      hold.release();
+      for _ in 0..5_000 {
+        if rig.fs.probes() > probes_before {
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+      }
+      assert!(rig.fs.probes() > probes_before, "the bracket probe ran");
+      std::thread::sleep(Duration::from_millis(50));
+
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the dead-lane widen resolves")
+        .expect("the driver replies");
+      assert!(
+        matches!(resolved, Err(crate::error::ReplaceRootError::Retired)),
+        "a dead transport retires the widen, never commits over it: {resolved:?}"
+      );
+      assert_eq!(
+        last_published(&registry, scope),
+        Some(PathBuf::from("/r/sub")),
+        "the widened root is never published over a dead lane"
+      );
+      assert_eq!(
+        rig.fs.spawns(),
+        1,
+        "no fallback: the scope died, nothing re-spawns"
+      );
+      // The death is honest: the terminal Rescan reaches the consumer.
+      loop {
+        let (s, _root, change) = next_rooted(&rig).await;
+        if s == scope && change.kind().is_rescan() {
+          break;
+        }
+      }
+    }
+
+    /// G2-2 under real load: the catch-up commit does BOUNDED work when a
+    /// producer refills the (unbounded) lane as fast as the source arm drains
+    /// it — the commit waits only for the `remaining` snapshot (post-snapshot
+    /// arrivals ride the post-commit regime), never "until the flood pauses".
+    /// A continuously-flooding source must not starve the widen reply (nor
+    /// commands behind it): the replace resolves PROMPTLY whatever verdict the
+    /// flood forced (a budget-refused batch degrades to a loss, which legally
+    /// taints the window into the D1 fallback — promptness, not the verdict, is
+    /// the pin). The exact `remaining` count-down is pinned deterministically by
+    /// `a_catch_up_delivers_its_prefix_at_the_old_root_then_flips`; this cell
+    /// catches gross liveness regressions the timing there cannot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hot_lane_widen_catches_up_bounded_and_replies_promptly() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // The flood: THREE dedicated OS threads refill the lane at full tilt
+      // (no yields) for the whole commit window — benign records on the
+      // KNOWN old watch, so only the catch-up bound is under test.
+      let stop = std::sync::Arc::new(AtomicBool::new(false));
+      let floods: Vec<_> = (0..3)
+        .map(|_| {
+          let fs = rig.fs.clone();
+          let stop = std::sync::Arc::clone(&stop);
+          std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+              fs.send_inotify_batch(
+                "/r/sub",
+                vec![attributed(&[sub_watch], IN_CREATE, b"flood.txt")],
+              );
+            }
+          })
+        })
+        .collect();
+      hold.release();
+
+      // The pin: the reply is PROMPT — the catch-up waited on a finite prefix
+      // snapshot, not "until the flood pauses".
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("a hot lane must not starve the widen reply")
+        .expect("the driver replies");
+      assert!(
+        resolved.is_ok(),
+        "the widen resolves under load: {resolved:?}"
+      );
+      stop.store(true, Ordering::SeqCst);
+      for flood in floods {
+        flood.join().expect("the flood thread stops");
+      }
+    }
+
+    /// The catch-up ingests the prefix through [`apply_source_message`] — the
+    /// same body the source arm runs, one message at a time — so a reserved
+    /// death record LAST behind three benign records still taints the window
+    /// (the prefix is never partial), and a source DEATH tears the scope down
+    /// core-side (root watch gone, stream teardown enqueued), so a catch-up
+    /// over a dead lane can only answer `Retired`, never commit over it. The
+    /// `remaining` snapshot/decrement that bounds the catch-up is pinned
+    /// separately (`catch_up_remaining_counts_the_prefix_and_saturates` and the
+    /// starved `the_catch_up_delivers_the_whole_prefix_before_the_commit`).
+    #[test]
+    fn a_death_behind_benign_records_taints_and_a_source_death_retires() {
+      use crate::core::{TaintCause, WidenCommit, WidenTaint};
+      use tributary_proto::RecordKind;
+
+      fn unit_core_at(root: &str) -> (DriverCore, ScopeId, tributary_proto::WatchId) {
+        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+        let scope = core.on_watch(
+          PathBuf::from(root),
+          tributary_proto::Interest::all(),
+          BackendKind::Inotify,
+        );
+        while core.poll_effect().is_some() {}
+        core.on_stream_spawned(
+          scope,
+          Ok(RootMeta {
+            root: PathBuf::from(root),
+            root_dev: 1,
+            root_mnt_id: None,
+            mounts: Vec::new(),
+            identity: crate::os::RootIdentity::new(1, 1),
+            ancestors: Vec::new(),
+            backend: BackendKind::Inotify,
+          }),
+        );
+        let root_watch = loop {
+          match core.poll_effect() {
+            Some(crate::core::Effect::AddWatch { watch, parent, .. }) if watch == parent => {
+              break watch;
+            }
+            Some(_) => continue,
+            None => panic!("the descending root arms"),
+          }
+        };
+        core.on_watch_installed(root_watch, WatchOutcome::Installed(1));
+        while core.poll_effect().is_some() {}
+        (core, scope, root_watch)
+      }
+      fn benign(watch: tributary_proto::WatchId, name: &[u8]) -> crate::os::SourceMessage {
+        crate::os::SourceMessage::Batch(crate::os::BatchPayload::detached(vec![
+          crate::os::SourceEvent::Linux(attributed(&[watch], IN_CREATE, name)),
+        ]))
+      }
+      fn reserved_death(reserved: tributary_proto::WatchId, mask: u32) -> crate::os::SourceMessage {
+        crate::os::SourceMessage::Batch(crate::os::BatchPayload::detached(vec![
+          crate::os::SourceEvent::Linux(RawLinuxEvent::Inotify {
+            anchors: vec![reserved],
+            event: RawInotifyEvent {
+              wd: 7,
+              mask: InotifyMask(mask),
+              cookie: 0,
+              name: None,
+            },
+          }),
+        ]))
+      }
+      let at = || tributary_proto::Instant::from_origin(Duration::from_millis(5));
+
+      // Leg 1 — the death record LAST behind three benign records still
+      // taints: the catch-up processes the WHOLE prefix (never a partial one).
+      let (mut core, scope, root_watch) = unit_core_at("/r/sub");
+      let reserved = core.reserve_watch_id();
+      core.begin_widen_watch(scope, reserved);
+      for name in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
+        crate::driver::apply_source_message(&mut core, scope, benign(root_watch, name), &at);
+      }
+      crate::driver::apply_source_message(
+        &mut core,
+        scope,
+        reserved_death(reserved, 0x0000_8000), // IN_IGNORED
+        &at,
+      );
+      assert_eq!(
+        core.on_root_widened(
+          scope,
+          RootMeta {
+            root: PathBuf::from("/r"),
+            root_dev: 1,
+            root_mnt_id: None,
+            mounts: Vec::new(),
+            identity: crate::os::RootIdentity::new(1, 9),
+            ancestors: Vec::new(),
+            backend: BackendKind::Inotify,
+          },
+          reserved,
+          at(),
+        ),
+        WidenCommit::TaintedWindow(WidenTaint {
+          cause: TaintCause::RootDeath(RecordKind::Ignored),
+          benign: 0,
+        }),
+        "the LAST prefix message still taints — the prefix is never partial"
+      );
+
+      // Leg 2 — a source DEATH: the reserved MoveSelf taints the window but
+      // does NOT tear the scope down; the lane then closes with its end marker
+      // and the source arm's `None` path routes the fatal — the scope's core
+      // state is gone BEFORE any commit gate could read a window, so the
+      // catch-up can only answer `Retired`.
+      let (mut core, scope, root_watch) = unit_core_at("/q/sub");
+      let reserved = core.reserve_watch_id();
+      core.begin_widen_watch(scope, reserved);
+      crate::driver::apply_source_message(&mut core, scope, benign(root_watch, b"pre-death"), &at);
+      crate::driver::apply_source_message(
+        &mut core,
+        scope,
+        reserved_death(reserved, 0x0000_0800), // IN_MOVE_SELF
+        &at,
+      );
+      assert!(
+        core.root_watch(scope).is_some(),
+        "a reserved move-self taints but does not tear the scope down"
+      );
+      core.on_source_fatal(scope, at());
+      assert!(
+        core.root_watch(scope).is_none(),
+        "the source death tore the scope down before any gate could read"
+      );
+      let mut torn_down = false;
+      while let Some(effect) = core.poll_effect() {
+        torn_down |=
+          matches!(effect, crate::core::Effect::TeardownStream { scope: s } if s == scope);
+      }
+      assert!(
+        torn_down,
+        "the death funnel tears the dead scope's stream down"
+      );
+    }
+
+    /// The catch-up's boundedness is `remaining`: the queued-length snapshot
+    /// taken at `WidenArmed`, counted down one per loop iteration by the source
+    /// arm until the commit fires (G2-2). This unit-pins the two arithmetic
+    /// pieces — the snapshot reads the lane's queued length
+    /// (`EventReceiver::len`), and the decrement SATURATES so a post-snapshot
+    /// arrival (transport-concurrent with the commit) never underflows the
+    /// wait.
+    ///
+    /// Scope, stated honestly: the live `remaining` lives in the run loop's
+    /// own `replace_states`, so no test (and no test-only accessor) can read
+    /// the running loop's copy — this cell pins the PHASE FIELD's semantics
+    /// against the same expressions production uses, and the behavioural
+    /// count-down (snapshot N, N deliveries, then the commit) is pinned end to
+    /// end by `a_catch_up_delivers_its_prefix_at_the_old_root_then_flips`.
+    #[test]
+    fn catch_up_remaining_counts_the_prefix_and_saturates() {
+      // (a) The snapshot source: `WidenArmed` reads the lane's queued length,
+      // so a three-message prefix snapshots `remaining == 3`.
+      let (tx, rx) = async_channel::unbounded::<crate::os::SourceMessage>();
+      for _ in 0..3 {
+        tx.try_send(crate::os::SourceMessage::Batch(
+          crate::os::BatchPayload::detached(Vec::new()),
+        ))
+        .unwrap();
+      }
+      assert_eq!(rx.len(), 3, "the snapshot reads the queued prefix length");
+
+      // (b) The decrement: one prefix message consumed per iteration, saturating.
+      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+      let reserved = core.reserve_watch_id();
+      let mut phase = crate::driver::SameFdPhase::CatchUp {
+        reserved,
+        meta: RootMeta {
+          root: PathBuf::from("/r"),
+          root_dev: 1,
+          root_mnt_id: None,
+          mounts: Vec::new(),
+          identity: crate::os::RootIdentity::new(1, 9),
+          ancestors: Vec::new(),
+          backend: BackendKind::Inotify,
+        },
+        replay: WatchOutcome::Installed(1),
+        remaining: rx.len(),
+      };
+      for expected in [2usize, 1, 0] {
+        if let crate::driver::SameFdPhase::CatchUp { remaining, .. } = &mut phase {
+          *remaining = remaining.saturating_sub(1);
+        }
+        let crate::driver::SameFdPhase::CatchUp { remaining, .. } = &phase else {
+          unreachable!("constructed CatchUp");
+        };
+        assert_eq!(*remaining, expected, "one prefix message consumed");
+      }
+      // A post-snapshot arrival: the decrement saturates, never underflows.
+      if let crate::driver::SameFdPhase::CatchUp { remaining, .. } = &mut phase {
+        *remaining = remaining.saturating_sub(1);
+      }
+      let crate::driver::SameFdPhase::CatchUp { remaining, .. } = &phase else {
+        unreachable!("constructed CatchUp");
+      };
+      assert_eq!(
+        *remaining, 0,
+        "saturates: a post-snapshot arrival never underflows the commit's wait"
+      );
+    }
+
+    /// The catch-up commit is BOUNDED by `remaining` AND never straddles the
+    /// root flip (G2-2 + G3-1), deterministic on the starved current-thread
+    /// runtime: THREE benign creates queued before `WidenArmed` are the prefix
+    /// (`remaining == 3`); the source arm delivers each at the still-current
+    /// OLD root — unprefixed and in order — and the commit fires only once the
+    /// whole prefix is consumed, so the reply resolves AFTER the last old-root
+    /// delivery. A create AFTER the commit delivers at the NEW root,
+    /// chain-prefixed. Discriminates: were the prefix jumped (the pre-catch-up
+    /// op-bias that processed lane messages at the commit), these creates would
+    /// land at `/r` as `sub/xN`, or only after the reply.
+    #[tokio::test]
+    async fn a_catch_up_delivers_its_prefix_at_the_old_root_then_flips() {
+      let registry = RecordingRegistry::default();
+      let rig = inotify_rig_registry(registry.clone());
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // SYNCHRONOUS section (single-threaded runtime, loop starved): THREE
+      // benign creates queue on the live lane, then the pre-arm releases; only
+      // after the bracket probe and a generous stall does the test yield, so
+      // the loop wakes with the whole prefix AND `WidenArmed` pending. The op
+      // arm snapshots `remaining == 3` and the source arm catches up first.
+      for name in [b"x1".as_slice(), b"x2".as_slice(), b"x3".as_slice()] {
+        rig
+          .fs
+          .send_inotify_batch("/r/sub", vec![attributed(&[sub_watch], IN_CREATE, name)]);
+      }
+      let probes_before = rig.fs.probes();
+      hold.release();
+      for _ in 0..5_000 {
+        if rig.fs.probes() > probes_before {
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+      }
+      assert!(rig.fs.probes() > probes_before, "the bracket probe ran");
+      std::thread::sleep(Duration::from_millis(50));
+
+      // The whole prefix delivers at the OLD root, in order, before the flip.
+      for name in ["x1", "x2", "x3"] {
+        let (s, root, change) = next_rooted(&rig).await;
+        assert_eq!(
+          (s, root.as_path()),
+          (scope, std::path::Path::new("/r/sub")),
+          "a pre-commit create delivers at the old root: {change:?}"
+        );
+        assert!(change.kind().is_created(), "{change:?}");
+        assert_eq!(
+          change.location(),
+          &loc(&[name]),
+          "unprefixed old-root coordinates"
+        );
+      }
+
+      // The commit fired only after the whole prefix — the reply resolves now.
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the catch-up commit resolves the caller")
+        .expect("the driver replies");
+      assert!(resolved.is_ok(), "the clean catch-up commits: {resolved:?}");
+      assert_eq!(rig.fs.spawns(), 1, "the widen kept the one stream");
+      settle(|| last_published(&registry, scope) == Some(PathBuf::from("/r"))).await;
+
+      // A create AFTER the commit delivers at the NEW root, chain-prefixed.
+      rig
+        .fs
+        .send_inotify_batch("/r/sub", vec![attributed(&[sub_watch], IN_CREATE, b"y")]);
+      loop {
+        let (s, root, change) = next_rooted(&rig).await;
+        if s == scope
+          && root.as_path() == std::path::Path::new("/r")
+          && change.location() == &loc(&["sub", "y"])
+        {
+          break;
+        }
+      }
+    }
+
+    /// G3-1 for a `Moved`, whose delivered `ChangeKind::Moved(Location)`
+    /// carries an old-root-relative SOURCE as well as its destination: a
+    /// same-batch rename pair queued before `WidenArmed` is caught up and
+    /// delivered at the OLD root with BOTH coordinates unprefixed, before the
+    /// flip; a rename AFTER the commit delivers both under the NEW root,
+    /// chain-prefixed. Neither half straddles.
+    #[tokio::test]
+    async fn a_move_queued_before_the_widen_delivers_at_the_old_root() {
+      fn move_pair(watch: WatchId, cookie: u32, from: &[u8], to: &[u8]) -> Vec<RawLinuxEvent> {
+        const IN_MOVED_FROM: u32 = 0x0000_0040;
+        const IN_MOVED_TO: u32 = 0x0000_0080;
+        vec![
+          RawLinuxEvent::Inotify {
+            anchors: vec![watch],
+            event: RawInotifyEvent {
+              wd: 1,
+              mask: InotifyMask(IN_MOVED_FROM),
+              cookie,
+              name: Some(from.to_vec()),
+            },
+          },
+          RawLinuxEvent::Inotify {
+            anchors: vec![watch],
+            event: RawInotifyEvent {
+              wd: 1,
+              mask: InotifyMask(IN_MOVED_TO),
+              cookie,
+              name: Some(to.to_vec()),
+            },
+          },
+        ]
+      }
+
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // SYNCHRONOUS: a same-batch rename pair (ONE queued message) on the live
+      // lane, then release. Its native cookie pairs the halves into a single
+      // Moved the catch-up delivers at the old root before the flip.
+      rig
+        .fs
+        .send_inotify_batch("/r/sub", move_pair(sub_watch, 7, b"from", b"to"));
+      let probes_before = rig.fs.probes();
+      hold.release();
+      for _ in 0..5_000 {
+        if rig.fs.probes() > probes_before {
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+      }
+      assert!(rig.fs.probes() > probes_before, "the bracket probe ran");
+      std::thread::sleep(Duration::from_millis(50));
+
+      // The Moved delivers at the OLD root, BOTH coordinates unprefixed.
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!(
+        (s, root.as_path()),
+        (scope, std::path::Path::new("/r/sub")),
+        "old root before the flip: {change:?}"
+      );
+      assert_eq!(change.location(), &loc(&["to"]), "destination unprefixed");
+      assert_eq!(
+        change.kind().moved_from(),
+        Some(&loc(&["from"])),
+        "source unprefixed: {change:?}"
+      );
+
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the catch-up commit resolves the caller")
+        .expect("the driver replies");
+      assert!(resolved.is_ok(), "the clean catch-up commits: {resolved:?}");
+
+      // A rename AFTER the commit delivers both halves under the NEW root.
+      rig
+        .fs
+        .send_inotify_batch("/r/sub", move_pair(sub_watch, 9, b"from2", b"to2"));
+      loop {
+        let (s, root, change) = next_rooted(&rig).await;
+        if s == scope && change.kind().is_moved() && change.location() == &loc(&["sub", "to2"]) {
+          assert_eq!(root.as_path(), std::path::Path::new("/r"));
+          assert_eq!(
+            change.kind().moved_from(),
+            Some(&loc(&["sub", "from2"])),
+            "post-commit source is chain-prefixed: {change:?}"
+          );
+          break;
+        }
+      }
+    }
+
+    /// The catch-up's death path: a scope that DIES mid-catch-up (the stream's
+    /// terminal `Fatal` queued behind a benign prefix, so the death is IN the
+    /// prefix) delivers the benign record at the old root, then the source
+    /// arm routes the fatal through the ordinary funnel — the liveness gate in
+    /// [`resolve_widen_catchups`] then answers `Retired`, publishes NO widened
+    /// root (Golden-2's deferred publish), and the terminal Rescan reaches the
+    /// consumer. No fallback: the scope died, nothing re-spawns. (The
+    /// CLOSED-lane sibling — death with no queued marker — is
+    /// `a_disconnected_lane_retires_the_widen_before_the_commit`.)
+    #[tokio::test]
+    async fn a_scope_death_mid_catch_up_retires_the_widen() {
+      let registry = RecordingRegistry::default();
+      let rig = inotify_rig_registry(registry.clone());
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // SYNCHRONOUS: a benign prefix, THEN the stream's terminal Fatal, all
+      // queued before the loop wakes — the scope dies WHILE the catch-up drains
+      // the prefix (`remaining` started at 2).
+      rig
+        .fs
+        .send_inotify_batch("/r/sub", vec![attributed(&[sub_watch], IN_CREATE, b"x")]);
+      rig.fs.send_fatal("/r/sub");
+      let probes_before = rig.fs.probes();
+      hold.release();
+      for _ in 0..5_000 {
+        if rig.fs.probes() > probes_before {
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+      }
+      assert!(rig.fs.probes() > probes_before, "the bracket probe ran");
+      std::thread::sleep(Duration::from_millis(50));
+
+      // The prefix delivered at the old root before the death routed.
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
+      assert!(
+        change.kind().is_created() && change.location() == &loc(&["x"]),
+        "{change:?}"
+      );
+
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the dead-scope widen resolves")
+        .expect("the driver replies");
+      assert!(
+        matches!(resolved, Err(crate::error::ReplaceRootError::Retired)),
+        "died mid-catch-up retires: {resolved:?}"
+      );
+      assert_eq!(
+        rig.fs.spawns(),
+        1,
+        "no fallback: the scope died, nothing re-spawns"
+      );
+      assert_eq!(
+        last_published(&registry, scope),
+        Some(PathBuf::from("/r/sub")),
+        "no widened publish over a dead scope"
+      );
+
+      // The death is honest: the terminal Rescan reaches the consumer.
+      loop {
+        let (s, _root, change) = next_rooted(&rig).await;
+        if s == scope && change.kind().is_rescan() {
+          break;
+        }
+      }
+    }
+
+    /// G4-1: a caller flooding the bounded command mailbox with reply-less
+    /// `SetCover` requests cannot starve a catching-up widen. The flood runs
+    /// on PARALLEL workers (a current-thread flood cannot refill the mailbox
+    /// while the driver drains it without yielding — the starvation is a
+    /// multi-worker phenomenon, exactly production's shape), and the flood
+    /// itself pins the prefix in place: with commands continuously ready the
+    /// source arm is never selected, so the queued prefix survives to the
+    /// `WidenArmed` snapshot (`remaining > 0`), and only the fairness poll —
+    /// one prefix message per fully-flushed iteration, command pressure
+    /// notwithstanding — can drain it. The pin: `replace_root` resolves
+    /// WHILE the flood continues.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_command_flood_cannot_starve_the_catch_up_commit() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // The flood, ESTABLISHED before anything else can move: dedicated OS
+      // threads keep the bounded mailbox saturated with `send_blocking` —
+      // the instant the driver consumes a command, a parked sender completes,
+      // so the lane never gaps the way runtime-scheduled tasks do. Each
+      // command is a reply-less SetCover for a GHOST scope — an UnknownScope
+      // no-op, pure command pressure with no effect on the widen. Waiting
+      // for the mailbox to FILL proves the lane is owned before the prefix
+      // queues.
+      let ghost = ScopeId::new(core::num::NonZeroU64::new(999_999).unwrap());
+      let flood_stop = std::sync::Arc::new(AtomicBool::new(false));
+      let floods: Vec<_> = (0..2)
+        .map(|_| {
+          let commands = rig.commands.clone();
+          let stop = std::sync::Arc::clone(&flood_stop);
+          std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+              if commands
+                .send_blocking(Command::SetCover {
+                  scope: ghost,
+                  retained: vec![PathBuf::from("/nowhere")],
+                  reply: None,
+                })
+                .is_err()
+              {
+                break;
+              }
+            }
+          })
+        })
+        .collect();
+      settle(|| rig.commands.len() >= 16).await;
+
+      // The prefix queues UNDER the flood (the saturated command lane keeps
+      // the source arm unselected, so these survive to the snapshot), then
+      // the pre-arm releases: `WidenArmed` outranks commands and snapshots
+      // `remaining > 0`.
+      for name in [b"f1".as_slice(), b"f2".as_slice(), b"f3".as_slice()] {
+        rig
+          .fs
+          .send_inotify_batch("/r/sub", vec![attributed(&[sub_watch], IN_CREATE, name)]);
+      }
+      hold.release();
+
+      // The pin: the widen resolves while the flood runs — only the
+      // fairness poll can have drained the prefix.
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the catch-up commit is never starved by a command flood")
+        .expect("the driver replies");
+      assert!(
+        resolved.is_ok(),
+        "the widen committed under flood: {resolved:?}"
+      );
+      assert_eq!(rig.fs.spawns(), 1, "the widen kept the one stream");
+      flood_stop.store(true, Ordering::SeqCst);
+      for flood in floods {
+        flood.join().expect("the flood thread stops");
+      }
+    }
+
+    /// G4-1's inversion guard: the fairness poll must not hand a SOURCE
+    /// flood the loop. Post-snapshot arrivals never extend `remaining`, so
+    /// the poll runs at most prefix-length iterations and Close — a command
+    /// — resolves promptly even while a producer floods the lane end to end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_flood_cannot_starve_close_during_catch_up() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+      // Seed a modest prefix, then keep the lane HOT with a dedicated
+      // producer thread for the whole close window.
+      for name in [b"s1".as_slice(), b"s2".as_slice(), b"s3".as_slice()] {
+        rig
+          .fs
+          .send_inotify_batch("/r/sub", vec![attributed(&[sub_watch], IN_CREATE, name)]);
+      }
+      let stop = std::sync::Arc::new(AtomicBool::new(false));
+      let flood = {
+        let fs = rig.fs.clone();
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+          while !stop.load(Ordering::SeqCst) {
+            fs.send_inotify_batch(
+              "/r/sub",
+              vec![attributed(&[sub_watch], IN_CREATE, b"hot.txt")],
+            );
+          }
+        })
+      };
+      hold.release();
+
+      // Close while the lane floods: the fairness poll is bounded by the
+      // snapshot, so the command lane comes back and Close resolves.
+      let (close_reply, on_close) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Close { reply: close_reply })
+        .await
+        .unwrap();
+      let wedged = tokio::time::timeout(Duration::from_secs(15), on_close)
+        .await
+        .expect("Close is never starved by a source flood during catch-up")
+        .expect("the close reply resolves");
+      assert_eq!(wedged, 0, "every stream quiesced at close");
+      stop.store(true, Ordering::SeqCst);
+      flood.join().expect("the flood thread stops");
+      // The widen resolved one way or the other — committed before the
+      // close won the command lane, or swept by it — never left dangling.
+      let resolved = tokio::time::timeout(Duration::from_secs(5), on_reply).await;
+      assert!(
+        resolved.is_ok(),
+        "the widen reply resolved (committed or swept at close)"
+      );
+    }
+
+    /// G5-1, entry path (a) COMBINED with the G4 flood: the lane dies (and
+    /// empties) BEFORE `WidenArmed`, so the phase enters with
+    /// `remaining == 0` and only the end marker left — the state the narrow
+    /// `remaining > 0` arming missed. Under a saturated command mailbox the
+    /// membership-armed poll must still consume the marker, route the
+    /// source death, and retire the widen — publishing nothing — while the
+    /// flood continues.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_command_flood_cannot_starve_a_dead_lane_retire() {
+      let registry = RecordingRegistry::default();
+      let rig = inotify_rig_registry(registry.clone());
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // The saturated command lane, established before anything can move.
+      let ghost = ScopeId::new(core::num::NonZeroU64::new(999_999).unwrap());
+      let flood_stop = std::sync::Arc::new(AtomicBool::new(false));
+      let floods: Vec<_> = (0..2)
+        .map(|_| {
+          let commands = rig.commands.clone();
+          let stop = std::sync::Arc::clone(&flood_stop);
+          std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+              if commands
+                .send_blocking(Command::SetCover {
+                  scope: ghost,
+                  retained: vec![PathBuf::from("/nowhere")],
+                  reply: None,
+                })
+                .is_err()
+              {
+                break;
+              }
+            }
+          })
+        })
+        .collect();
+      settle(|| rig.commands.len() >= 16).await;
+
+      // The lane dies EMPTY before the pre-arm completes: the snapshot will
+      // read zero and only the end marker remains.
+      rig.fs.disconnect("/r/sub");
+      hold.release();
+
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("a dead-lane retire is never starved by a command flood")
+        .expect("the driver replies");
+      assert!(
+        matches!(resolved, Err(crate::error::ReplaceRootError::Retired)),
+        "the dead lane retires the widen under flood: {resolved:?}"
+      );
+      assert_eq!(
+        last_published(&registry, scope),
+        Some(PathBuf::from("/r/sub")),
+        "the widened root is never published over a dead lane"
+      );
+      assert_eq!(rig.fs.spawns(), 1, "no fallback: the scope died");
+      flood_stop.store(true, Ordering::SeqCst);
+      for flood in floods {
+        flood.join().expect("the flood thread stops");
+      }
+    }
+
+    /// G5-1, entry path (b), deterministic: the poll itself drains the LAST
+    /// queued message of a closing lane — `remaining` hits zero with the
+    /// end marker still pending, exactly where the narrow arming would
+    /// disarm. Membership arming keeps polling: the marker routes the
+    /// source death and the widen retires, with the drained message still
+    /// delivered at its truthful old-root coordinates first.
+    #[tokio::test]
+    async fn a_closing_lane_drained_by_the_poll_still_retires() {
+      let registry = RecordingRegistry::default();
+      let rig = inotify_rig_registry(registry.clone());
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_prearms();
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+          reply,
+        })
+        .await
+        .unwrap();
+      settle(|| rig.fs.prearm_entries() == 1).await;
+
+      // SYNCHRONOUS section (single-threaded runtime, loop starved): one
+      // benign message queues, then the lane DIES behind it, then the
+      // pre-arm releases — the loop wakes with `WidenArmed`, a one-message
+      // prefix, and the end marker all pending.
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[sub_watch], IN_CREATE, b"last.txt")],
+      );
+      rig.fs.disconnect("/r/sub");
+      let probes_before = rig.fs.probes();
+      hold.release();
+      for _ in 0..5_000 {
+        if rig.fs.probes() > probes_before {
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+      }
+      assert!(rig.fs.probes() > probes_before, "the bracket probe ran");
+      std::thread::sleep(Duration::from_millis(50));
+
+      // The drained prefix message still delivers at the OLD root before
+      // anything else — the truthful pre-death rendering.
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!(
+        (s, root.as_path()),
+        (scope, std::path::Path::new("/r/sub")),
+        "the closing lane's last message delivers at the old root: {change:?}"
+      );
+      assert!(change.kind().is_created(), "{change:?}");
+      assert_eq!(change.location(), &loc(&["last.txt"]));
+
+      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the poll consumes the end marker past remaining == 0")
+        .expect("the driver replies");
+      assert!(
+        matches!(resolved, Err(crate::error::ReplaceRootError::Retired)),
+        "the closing lane retires the widen: {resolved:?}"
+      );
+      assert_eq!(
+        last_published(&registry, scope),
+        Some(PathBuf::from("/r/sub")),
+        "nothing was published over the dead lane"
+      );
+      assert_eq!(rig.fs.spawns(), 1, "no fallback: the scope died");
+    }
+
+    /// The refresh death gate as the POST-COMMIT belt (its barrier conjunct
+    /// is retired — INV-ROOT owns the window): the object at the widened
+    /// path is replaced AFTER a clean commit with its records silently
+    /// absent (the fake emits none — the standing #33 shape; in the window
+    /// itself the record would have TAINTED and the commit refused, see the
+    /// core `widen_window_*` cells). The delayed refresh's fresh stat then
+    /// detects the divergence and the death funnel runs — terminal Rescan,
+    /// scope death — so nothing the divergence hid stays silently
+    /// uncovered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_post_commit_root_divergence_dies_by_the_refresh_belt() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      let hold = rig.fs.hold_refreshes();
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      loop {
+        let (s, root, change) = next_rooted(&rig).await;
+        assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+        if change.location() == &loc(&["sub"]) {
+          break;
+        }
+      }
+      // The post-commit swap: a different object now owns the widened path;
+      // the old subtree remains attached beneath it, and no record drains
+      // (the standing-class shape the refresh belt exists for).
+      rig.fs.replace_root_node("/r", 99, None);
+
+      hold.release();
+      // The released refresh's fresh stat finds the divergence: the death
+      // funnel's terminal Rescan reaches the consumer and the scope ends.
+      loop {
+        let (s, _root, change) = next_rooted(&rig).await;
+        if s == scope && change.kind().is_rescan() {
+          break;
+        }
+      }
+      settle(|| rig.fs.shutdowns() == 1).await;
+    }
+
+    /// The stale-Installed bracket: the root object is swapped between the
+    /// kernel arm and the bracket's re-stat — the widen is refused typed, the
+    /// armed descriptor is reclaimed, and the old coverage never blinks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_root_swapped_between_arm_and_probe_is_refused() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      let sub_watch = rig
+        .fs
+        .arms()
+        .first()
+        .cloned()
+        .expect("the birth root arm")
+        .0;
+      let (_, _, change) = next_rooted(&rig).await;
+      assert_eq!(change.location(), &loc(&["deep"]));
+
+      rig.fs.swap_after_prearm("/r", FileKind::Dir, 99);
+      let err = replace(&rig, scope, "/r")
+        .await
+        .expect_err("the bracket refuses");
+      assert!(
+        matches!(err, crate::error::ReplaceRootError::Source(_)),
+        "{err:?}"
+      );
+      assert_eq!(rig.fs.spawns(), 1);
+      assert_eq!(rig.fs.shutdowns(), 0);
+      settle(|| !rig.fs.disarms().is_empty()).await;
+
+      rig.fs.send_inotify_batch(
+        "/r/sub",
+        vec![attributed(&[sub_watch], IN_CREATE, b"alive.txt")],
+      );
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
+      assert_eq!(change.location(), &loc(&["alive.txt"]));
+    }
+  }
 }
 
 /// The Linux one-sample enumerate: `list_dir`/`dir_entry_stat` build each

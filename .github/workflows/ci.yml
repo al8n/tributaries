@@ -258,6 +258,13 @@ jobs:
       fail-fast: false
       matrix:
         which: [asan-lsan, msan, tsan]
+        # TSan's stop-the-world instrumentation slows the runtime far more than
+        # ASan/LSan/MSan, so its real-kernel timing cells (notably the
+        # cross-directory move-pairing) need a larger budget than the shared
+        # default to stay honest rather than flaky.
+        include:
+          - which: tsan
+            timing_scale: 12
     runs-on: ubuntu-latest
     # A passing shard finishes in a few minutes; this bounds a pathological
     # livelock (a producer/drain cell under TSan's adversarial scheduling) to a
@@ -273,7 +280,9 @@ jobs:
       # instrumentation slows the runtime several fold while the producer's raw
       # syscalls keep their pace, so the kernel-event waits and the move-pairing
       # window need proportionally more room to stay honest rather than flaky.
-      TRIBUTARY_FS_TIMING_SCALE: 6
+      # TSan is the slowest instrument, so it takes a larger scale (see the
+      # matrix `include`); the others use the shared default.
+      TRIBUTARY_FS_TIMING_SCALE: ${{ matrix.timing_scale || 6 }}
     steps:
       - uses: actions/checkout@v7
       - name: Cache cargo build and registry

@@ -70,6 +70,17 @@ fn watcher() -> TokioWatcher {
   TokioWatcher::new(WatcherOptions::new()).expect("build watcher")
 }
 
+/// A watcher pinned to the inotify (descending) backend. The D2 same-fd widen
+/// continuity is inotify-specific; under `CAP_SYS_ADMIN` (root / sudo /
+/// privileged CI) `Backend::Auto` selects fanotify, which is kernel-recursive
+/// and legitimately Rescan-BRIDGES a widen (the whole widen surfaces as one
+/// structural Rescan) — so cells asserting the same-fd continuous DELIVERY
+/// (distinct from that structural bridge) must pin inotify rather than take the
+/// ambient backend.
+fn inotify_watcher() -> TokioWatcher {
+  TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify)).expect("build watcher")
+}
+
 /// Waits until an event satisfying `pred` arrives, or the deadline lapses.
 async fn wait_for(
   watcher: &mut TokioWatcher,
@@ -555,45 +566,87 @@ async fn close_quiesces_under_sustained_traffic() {
   );
 }
 
-/// Widening `x/y` → `x` on the descending backend: the pre-arm + rebind
-/// commit bridges the swap with one covering `Rescan`, the rebuilt tree is
-/// live on the NEW inotify instance (writes under old and new ground both
-/// deliver), and repeated swaps neither leak watch descriptors into refusals
-/// nor strand the old coverage — the old root re-watches cleanly.
+/// Widening `x/y` → `x` on the descending backend is CONTINUOUS (the
+/// same-transport commit): the live stream is kept and the old subtree keeps
+/// delivering at its unchanged absolute paths, while the newly covered ground
+/// goes live via cold discovery. The STRICT no-Rescan / no-epoch-bump contract
+/// is pinned deterministically by the hermetic cell
+/// `a_widening_replace_keeps_the_stream_and_dominates_nothing`; here — on a real
+/// kernel — an honest root-`[]` `Rescan` (a dirty cold-read escalation on the
+/// freshly-covered ground) is TOLERATED as a covering delivery, but a misaddress
+/// or a lost write is not. Narrowing back is the stream-replace (Rescan-bridged)
+/// path, and repeated swap cycles neither leak watch descriptors into refusals
+/// nor strand coverage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replace_root_widens_and_rebinds() {
   let root = scratch_root("replace-widen");
   let sub = root.join("y");
   std::fs::create_dir_all(sub.join("deep")).expect("create tree");
-  let mut w = watcher();
+  let mut w = inotify_watcher();
   let handle = w.watch(&sub, Interest::all()).await.expect("watch");
-  std::fs::write(sub.join("pre.txt"), b"pre").expect("write pre");
+  // Settle the birth crawl before the swap so the widen's own window is the
+  // only thing under test.
+  assert!(
+    coverage_becomes_live(&mut w, &sub.join("deep"), "birth").await,
+    "the birth crawl reaches the deep old ground"
+  );
 
   w.replace_root(handle, &root)
     .await
     .expect("the swap commits");
   assert_eq!(w.root_path(handle), Some(root.clone()));
-  let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == root).await;
-  assert!(covering.is_some(), "the covering Rescan arrives");
 
-  // The rebuilt (re-armed) tree is live on the new instance once the
-  // descending re-arm reaches each directory — the DEEP old subtree (armed
-  // last) and the newly covered ground directly under the new root alike.
+  // Zero-gap continuity (the point of D2): a write under the OLD subtree lands
+  // at its EXACT unchanged absolute path on the SAME stream after the widen.
+  // The strict no-Rescan / no-epoch-bump contract is pinned deterministically by
+  // the hermetic cell `a_widening_replace_keeps_the_stream_and_dominates_nothing`;
+  // a real kernel under a signal storm may additionally escalate a dirty
+  // cold-read of the fresh ground into an honest root-`[]` `Rescan` (which covers
+  // `post` by ancestry) — tolerated via `covers`. A MISADDRESSED delivery or a
+  // LOST write covers `post` by neither and fails the deadline below.
+  let post = sub.join("post-widen.txt");
+  std::fs::write(&post, b"post").expect("write post");
+  let delivered = tokio::time::timeout(scaled(DEADLINE), async {
+    while let Some(event) = w.next().await {
+      if covers(&event, &post) {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    delivered,
+    "the old subtree delivers across the widen — at its exact path, or via an honest covering Rescan"
+  );
+
+  // The deep old ground stayed live, and the newly covered ground is armed
+  // by the cold crawl.
   assert!(
     coverage_becomes_live(&mut w, &sub.join("deep"), "old-ground").await,
-    "the old subtree is re-armed on the new fd"
+    "the old subtree's interior coverage rode across the widen"
   );
   assert!(
     coverage_becomes_live(&mut w, &root, "outside").await,
     "newly covered ground is live"
   );
 
-  // Swap back (narrowing) and once more: watch bookkeeping survives cycles —
-  // a leak of the old fd's descriptors would surface as arm refusals here.
+  // Narrowing back is the stream-replace path — Rescan-bridged.
+  w.replace_root(handle, &sub).await.expect("narrow commits");
+  let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == sub).await;
+  assert!(
+    covering.is_some(),
+    "a narrowing replace bridges with a Rescan"
+  );
+
+  // Swap cycles: watch bookkeeping survives — a leak of descriptors (or a
+  // stranded adoption) would surface as arm refusals or dead coverage here.
   for _ in 0..3 {
-    w.replace_root(handle, &sub).await.expect("narrow commits");
     w.replace_root(handle, &root).await.expect("widen commits");
+    w.replace_root(handle, &sub).await.expect("narrow commits");
   }
+  w.replace_root(handle, &root).await.expect("final widen");
   assert!(
     coverage_becomes_live(&mut w, &root, "after-cycles").await,
     "coverage is live after swap cycles"
@@ -606,4 +659,307 @@ async fn replace_root_widens_and_rebinds() {
   w.unwatch(handle).await.expect("unwatch");
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The barrier-honesty headline (INV-ROOT): a change under the old subtree made
+/// BEFORE a widening replace is either individually DELIVERED at its exact path
+/// or DOMINATED by an honest `Rescan`, and a `sync_root` cookie written after the
+/// widen resolves the barrier strictly behind it on the one surviving kernel
+/// queue. The barrier NEVER certifies `Delivered` over a change it neither
+/// delivered nor dominated. The strict no-Rescan continuity is pinned by the
+/// hermetic cell; a signal-storm kernel's honest dirty-read `Rescan` is the
+/// domination signal, tolerated here — never a false Delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sync_barrier_across_a_widen_resolves_by_delivery() {
+  let root = scratch_root("widen-sync");
+  let sub = root.join("y");
+  std::fs::create_dir_all(&sub).expect("create tree");
+  let mut w = inotify_watcher();
+  let handle = w.watch(&sub, Interest::all()).await.expect("watch");
+  assert!(
+    coverage_becomes_live(&mut w, &sub, "birth").await,
+    "the birth crawl settles"
+  );
+
+  // The pre-widen change: written, recorded by the live stream, NOT consumed.
+  let pre = sub.join("before-the-widen.txt");
+  std::fs::write(&pre, b"x").expect("write pre");
+
+  w.replace_root(handle, &root)
+    .await
+    .expect("the widen commits");
+  assert_eq!(w.root_path(handle), Some(root.clone()));
+
+  // The barrier: the cookie's create rides the SAME queue behind the pre-widen
+  // change, so the cookie resolves the barrier. INV-ROOT — the barrier must
+  // NEVER certify `Delivered` over a change it did not deliver — holds two ways:
+  // the pre-widen change is DELIVERED at its exact path before the cookie, OR an
+  // honest root-`[]` `Rescan` DOMINATES it (covers `pre` by ancestry), re-obliging
+  // its re-enumeration. A signal-storm kernel can emit that dominating Rescan; it
+  // is tolerated because it IS the domination signal, not a false Delivered. The
+  // one dishonest ending — the cookie reached with `pre` NEITHER delivered NOR
+  // dominated — is a false Delivered and fails the assertion below.
+  let (admission, _ticket) = w.mint_sync_ticket();
+  let cookie = w
+    .sync_root(handle, root.clone(), ".tributaries-sync-widen", admission)
+    .await
+    .expect("the cookie writes");
+  let barrier_honest = tokio::time::timeout(scaled(DEADLINE), async {
+    let mut saw_pre = false;
+    let mut dominated = false;
+    while let Some(event) = w.next().await {
+      if event.is_rescan() && pre.starts_with(event.path()) {
+        // An honest Rescan at the root (an ancestor of `pre`) dominates the
+        // pre-widen change: the barrier resolves by domination, not delivery.
+        dominated = true;
+      }
+      if event.path() == pre {
+        saw_pre = true;
+      }
+      if event.path() == cookie {
+        // The barrier resolves here. Honest iff `pre` was already delivered or
+        // an honest Rescan dominated it; a bare cookie is a false Delivered.
+        return saw_pre || dominated;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    barrier_honest,
+    "the barrier resolves honestly — the pre-widen change is DELIVERED before the cookie, \
+     or an honest Rescan dominates it; never a false Delivered over lost coverage"
+  );
+
+  // The freshly covered ground goes live via the widen's cold discovery.
+  assert!(
+    coverage_becomes_live(&mut w, &root, "fresh").await,
+    "newly covered ground is live after the widen"
+  );
+
+  w.unwatch(handle).await.expect("unwatch");
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A DEEP widen (`r/a/b/c` → `r`) adopts across a multi-segment chain: the old
+/// subtree keeps delivering at its exact absolute paths, the connecting interior
+/// and the fresh ground both go live, and the handle reports the new root. The
+/// strict no-Rescan continuity is pinned hermetically
+/// (`a_widening_replace_keeps_the_stream_and_dominates_nothing`); on a real
+/// kernel an honest root-`[]` `Rescan` (a dirty cold-read escalation) is
+/// tolerated as a covering delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deep_widen_adopts_across_the_chain() {
+  let root = scratch_root("deep-widen");
+  let old = root.join("a").join("b").join("c");
+  std::fs::create_dir_all(&old).expect("create tree");
+  let mut w = inotify_watcher();
+  let handle = w.watch(&old, Interest::all()).await.expect("watch");
+  assert!(
+    coverage_becomes_live(&mut w, &old, "birth").await,
+    "the birth crawl settles"
+  );
+
+  w.replace_root(handle, &root)
+    .await
+    .expect("the deep widen commits");
+  assert_eq!(w.root_path(handle), Some(root.clone()));
+
+  // Zero-gap continuity across the multi-segment chain: the old subtree's write
+  // lands at its EXACT unchanged absolute path on the same stream. The strict
+  // no-Rescan contract is pinned hermetically (see
+  // `a_widening_replace_keeps_the_stream_and_dominates_nothing`); a signal-storm
+  // kernel may escalate a dirty cold-read of the fresh ground to an honest
+  // root-`[]` `Rescan` covering `post` — tolerated via `covers`. A misaddressed
+  // delivery or a lost write covers `post` by neither and fails the deadline.
+  let post = old.join("across.txt");
+  std::fs::write(&post, b"x").expect("write across");
+  let delivered = tokio::time::timeout(scaled(DEADLINE), async {
+    while let Some(event) = w.next().await {
+      if covers(&event, &post) {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    delivered,
+    "the adopted subtree delivers across the deep widen — at its exact path, or via an honest covering Rescan"
+  );
+
+  // The connecting chain and the fresh ground both armed.
+  assert!(
+    coverage_becomes_live(&mut w, &root.join("a").join("b"), "chain").await,
+    "the connecting interior is covered"
+  );
+  assert!(
+    coverage_becomes_live(&mut w, &root, "fresh").await,
+    "the fresh ground is covered"
+  );
+
+  w.unwatch(handle).await.expect("unwatch");
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A DISJOINT replace stays on the stream-replace path: the commit bridges
+/// with its covering Rescan and the new ground goes live on the new stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disjoint_replace_stays_rescan_bridged() {
+  let a = scratch_root("disjoint-a");
+  let b = scratch_root("disjoint-b");
+  let mut w = watcher();
+  let handle = w.watch(&a, Interest::all()).await.expect("watch");
+  assert!(coverage_becomes_live(&mut w, &a, "birth").await);
+
+  w.replace_root(handle, &b).await.expect("the swap commits");
+  assert_eq!(w.root_path(handle), Some(b.clone()));
+  let covering = wait_for(&mut w, |e| e.is_rescan() && e.path() == b).await;
+  assert!(
+    covering.is_some(),
+    "a disjoint replace bridges with a Rescan"
+  );
+  assert!(coverage_becomes_live(&mut w, &b, "new-ground").await);
+
+  w.unwatch(handle).await.expect("unwatch");
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&a);
+  let _ = std::fs::remove_dir_all(&b);
+}
+
+/// Suite 8 (privileged, CI: `linux-verify.sh inotify-priv`) — the kernel W1 of
+/// docs/2026-07-19-d2-golden-root-binding.md, end to end: an ext4 loopback is
+/// unmounted and remounted on the SAME loop device (identity-preserving —
+/// `(dev, ino)` of the root survive the cycle while every inotify watch on the
+/// superblock is destroyed) RACING a widening `replace_root` onto it. Whatever
+/// the interleaving, the witnessed-window commit gate (INV-ROOT) forbids the
+/// one dishonest ending — a certified-live widen whose root binding died
+/// silently — so a post-cycle write under the old subtree must ALWAYS become
+/// observable: delivered by live coverage, or covered by a `Rescan`
+/// (domination / the death funnel / the tainted-window fallback bridge).
+/// Silence within the deadline is the false-certification class and fails.
+///
+/// The race is swept across jittered offsets: each iteration is one
+/// interleaving sample, and EVERY sample must end honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn widen_over_unmount_rebind_is_never_silently_certified() {
+  use std::process::Command;
+
+  if !privileged_or_skip("widen_over_unmount_rebind_is_never_silently_certified") {
+    return;
+  }
+
+  // Build a private ext4 loopback pinned to an EXPLICIT loop device, so the
+  // remount preserves `st_dev` (an auto-allocated `-o loop` remount could land
+  // on a different loop minor and mint a different identity — the W2 shape,
+  // not W1's same-identity rebind).
+  let image =
+    std::env::temp_dir().join(format!("tributary-fs-widen-w1-{}.img", std::process::id()));
+  let dd = Command::new("dd")
+    .args([
+      "if=/dev/zero",
+      &format!("of={}", image.display()),
+      "bs=1M",
+      "count=16",
+    ])
+    .status();
+  if !dd.map(|s| s.success()).unwrap_or(false) {
+    eprintln!("SKIP widen_over_unmount_rebind: dd refused");
+    return;
+  }
+  if !Command::new("mkfs.ext4")
+    .args(["-q", "-F"])
+    .arg(&image)
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
+  {
+    eprintln!("SKIP widen_over_unmount_rebind: mkfs.ext4 unavailable");
+    return;
+  }
+  let loopdev = match Command::new("losetup")
+    .args(["-f", "--show"])
+    .arg(&image)
+    .output()
+  {
+    Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    _ => {
+      eprintln!("SKIP widen_over_unmount_rebind: losetup unavailable");
+      let _ = std::fs::remove_file(&image);
+      return;
+    }
+  };
+  let mount = scratch_root("widen-w1-mnt");
+  let mounted = Command::new("mount")
+    .arg(&loopdev)
+    .arg(&mount)
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false);
+  if !mounted {
+    eprintln!("SKIP widen_over_unmount_rebind: loop mount refused");
+    let _ = Command::new("losetup").arg("-d").arg(&loopdev).status();
+    let _ = std::fs::remove_file(&image);
+    return;
+  }
+
+  for (round, delay_ms) in [0_u64, 15, 45].into_iter().enumerate() {
+    // Fresh layout per round, persisted on the image across the cycle.
+    let root = mount.join(format!("w1-{round}"));
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).expect("layout");
+    let mut w = watcher();
+    let handle = w.watch(&sub, Interest::all()).await.expect("watch sub");
+    assert!(coverage_becomes_live(&mut w, &sub, "birth").await);
+
+    // The race: the widen onto `root` vs the identity-preserving mount cycle.
+    let widen = w.replace_root(handle, &root);
+    let cycle = {
+      let loopdev = loopdev.clone();
+      let mount = mount.clone();
+      tokio::task::spawn_blocking(move || {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        // A busy umount (the watcher's fds do not pin it; scratch cwd could)
+        // retries briefly; failure to cycle skips the round's race (the widen
+        // then just commits normally — a valid, if uninteresting, sample).
+        for _ in 0..50 {
+          if Command::new("umount")
+            .arg(&mount)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+          {
+            break;
+          }
+          std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = Command::new("mount").arg(&loopdev).arg(&mount).status();
+      })
+    };
+    let widened = widen.await;
+    cycle.await.expect("mount cycle task");
+
+    // Whatever the interleaving produced, the ending must be observable: a
+    // probe write under the (re-mounted) old subtree is delivered or covered
+    // by a Rescan at it or any ancestor — never silence over dead coverage.
+    let probe = sub.join(format!("probe-{round}.txt"));
+    let _ = std::fs::write(&probe, b"w1");
+    let observed = wait_for(&mut w, |event| covers(event, &probe)).await;
+    assert!(
+      observed.is_some(),
+      "round {round} (widen: {widened:?}): the mount cycle must surface — \
+       delivered coverage or a covering Rescan, never silent false-certification"
+    );
+
+    let _ = w.close().await;
+  }
+
+  let _ = Command::new("umount").arg(&mount).status();
+  let _ = Command::new("losetup").arg("-d").arg(&loopdev).status();
+  let _ = std::fs::remove_file(&image);
+  let _ = std::fs::remove_dir_all(&mount);
 }

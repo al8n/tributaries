@@ -908,6 +908,7 @@ fn identity_minting_respects_devices_and_mounts() {
     liveness_deadline: None,
     applied_cover: None,
     settle_floor: None,
+    pending_widen: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -945,6 +946,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     liveness_deadline: None,
     applied_cover: None,
     settle_floor: None,
+    pending_widen: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -2569,6 +2571,7 @@ mod lowering {
       liveness_deadline: None,
       applied_cover: None,
       settle_floor: None,
+      pending_widen: None,
     }
   }
 
@@ -6718,5 +6721,844 @@ mod root_replaced {
         "the rebuild re-arms {path}: {effects:?}"
       );
     }
+  }
+}
+
+/// The same-transport WIDEN commit (`on_root_widened`): the world splices
+/// above the live root with NO cut — no covering Rescan, no epoch bump, no
+/// park/probe/read purge — and every old-subtree delivery re-roots at its
+/// unchanged absolute path.
+mod root_widened {
+  use super::*;
+  use crate::{
+    core::{RawDirEntry, RawEnumerate},
+    os::linux::{RawInotifyEvent, RawLinuxEvent, inotify::decode::InotifyMask},
+  };
+
+  const IN_CREATE: u32 = 0x0000_0100;
+
+  fn inotify(anchors: &[WatchId], mask: u32, name: &[u8]) -> RawLinuxEvent {
+    RawLinuxEvent::Inotify {
+      anchors: anchors.to_vec(),
+      event: RawInotifyEvent {
+        wd: 1,
+        mask: InotifyMask(mask),
+        cookie: 0,
+        name: Some(name.to_vec()),
+      },
+    }
+  }
+
+  fn meta(root: &str, ino: u128) -> RootMeta {
+    RootMeta {
+      root: PathBuf::from(root),
+      root_dev: 1,
+      root_mnt_id: None,
+      mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(1, ino),
+      ancestors: Vec::new(),
+      backend: BackendKind::Inotify,
+    }
+  }
+
+  /// Opens the witnessed window and commits the widen — the driver's
+  /// begin → pre-arm → commit order, minus the transport. The window stays
+  /// clean unless the cell taints it in between, so the commit applies.
+  fn widen(core: &mut DriverCore, scope: ScopeId, meta: RootMeta, now: Instant) -> WatchId {
+    let reserved = core.reserve_watch_id();
+    core.begin_widen_watch(scope, reserved);
+    assert_eq!(
+      core.on_root_widened(scope, meta, reserved, now),
+      WidenCommit::Committed
+    );
+    reserved
+  }
+
+  /// A live descending scope rooted at `root`, its root armed; the birth cold
+  /// read (returned) is fed empty unless `feed_boot` is false — the
+  /// outstanding-read survival cell keeps it in flight across the widen.
+  fn live_at(root: &str, ino: u128, feed_boot: bool) -> (DriverCore, ScopeId, WatchId, ReqId) {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = core.on_watch(PathBuf::from(root), Interest::all(), BackendKind::Inotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(scope, Ok(meta(root, ino)));
+    let effects = drain(&mut core);
+    let root_watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, parent, .. } if watch == parent => Some(*watch),
+        _ => None,
+      })
+      .expect("the descending root arms through the effect path");
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    let effects = drain(&mut core);
+    let req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, .. } => Some(*req),
+        _ => None,
+      })
+      .expect("the armed root cold-enumerates");
+    if feed_boot {
+      core.on_enumerated(
+        req,
+        RawEnumerate::Listed {
+          entries: Vec::new(),
+          complete: true,
+        },
+      );
+      let _ = drain(&mut core);
+    }
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+    (core, scope, root_watch, req)
+  }
+
+  #[test]
+  fn the_commit_splices_the_world_without_domination() {
+    let (mut core, scope, root_watch, _boot) = live_at("/r/sub", 1, true);
+
+    // Pre-widen: a delivery under the old root pins the epoch.
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(inotify(
+        &[root_watch],
+        IN_CREATE,
+        b"pre.txt",
+      ))]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !emits(&effects).is_empty(),
+      "pre feed produced: {effects:?}"
+    );
+    let pre = emits(&effects)[0].clone();
+    assert!(pre.kind().is_created());
+
+    let reserved = widen(&mut core, scope, meta("/r", 9), at(2));
+    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().all(|c| !c.kind().is_rescan()),
+      "the widen emits no covering Rescan: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::Enumerate { .. })),
+      "the widened root cold-reads: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::RefreshMounts { scope: s, .. } if *s == scope)),
+      "the new world re-arms its mount refresh: {effects:?}"
+    );
+
+    // Post-widen: the SAME watch delivers, re-rooted and chain-prefixed at the
+    // same absolute path, on the SAME epoch — continuity, not domination.
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(inotify(
+        &[root_watch],
+        IN_CREATE,
+        b"post.txt",
+      ))]),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    let delivered = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Emit { root, change, .. } => Some((root.clone(), change.clone())),
+        _ => None,
+      })
+      .expect("the old subtree keeps delivering");
+    assert_eq!(delivered.0.as_path(), Path::new("/r"));
+    assert_eq!(delivered.1.location(), &loc(&["sub", "post.txt"]));
+    assert_eq!(delivered.1.epoch(), pre.epoch(), "no generation bump");
+  }
+
+  #[test]
+  fn a_deep_widen_arms_the_connecting_chain() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/a/b", 1, true);
+
+    let reserved = widen(&mut core, scope, meta("/r", 9), at(1));
+    let effects = drain(&mut core);
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { parent, path, .. }
+          if *parent == reserved && path.as_path() == Path::new("/r/a")
+      )),
+      "the connector arms under the new root at its absolute path: {effects:?}"
+    );
+    let _ = scope;
+  }
+
+  #[test]
+  fn an_outstanding_old_world_read_survives_the_commit() {
+    let (mut core, scope, root_watch, boot) = live_at("/r/sub", 1, false);
+    // The birth cold read of /r/sub is still in flight.
+    let _reserved = widen(&mut core, scope, meta("/r", 9), at(1));
+    let _ = drain(&mut core);
+
+    // It resolves AFTER the commit and reconciles under the adopted node —
+    // addressed through the chain, with the discovered child armed.
+    core.on_enumerated(
+      boot,
+      RawEnumerate::Listed {
+        entries: vec![RawDirEntry {
+          name: b"kid".to_vec(),
+          kind: FileKind::Dir,
+          dev: 1,
+          ino: 5,
+          mnt_id: None,
+        }],
+        complete: true,
+      },
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_created() && c.location() == &loc(&["sub", "kid"])),
+      "the late read reconciles through the adopted chain: {effects:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/sub/kid")
+      )),
+      "the discovered child arms at its absolute path: {effects:?}"
+    );
+    let _ = root_watch;
+  }
+
+  #[test]
+  fn a_lag_parked_rescan_is_rebased_at_the_commit() {
+    let (mut core, scope, root_watch, _boot) = live_at("/r/sub", 1, true);
+
+    // Refuse a delivery: the scope goes lagged and parks a dominating Rescan
+    // minted against the OLD world (root-located: empty location).
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(inotify(
+        &[root_watch],
+        IN_CREATE,
+        b"x.txt",
+      ))]),
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_delivery(scope, Delivery::Refused, at(1));
+    // The lag's dominating Rescan offers once (minted against the OLD world,
+    // root-located) — refuse it too, so it parks across the widen.
+    let offered = drain(&mut core);
+    assert!(
+      offered
+        .iter()
+        .any(|e| matches!(e, Effect::Emit { change, .. } if change.kind().is_rescan())),
+      "{offered:?}"
+    );
+    core.on_delivery(scope, Delivery::Refused, at(2));
+    let _ = drain(&mut core);
+
+    let _reserved = widen(&mut core, scope, meta("/r", 9), at(3));
+    let _ = drain(&mut core);
+
+    // The retry offers the parked Rescan under the NEW root — its location
+    // re-based to the adopted prefix, so it still covers exactly the old
+    // world it was minted for.
+    core.on_timeout(at(10_000));
+    let effects = drain(&mut core);
+    let offered = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Emit { root, change, .. } if change.kind().is_rescan() => {
+          Some((root.clone(), change.clone()))
+        }
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("the parked Rescan re-offers: {effects:?}"));
+    assert_eq!(offered.0.as_path(), Path::new("/r"));
+    assert_eq!(
+      offered.1.location(),
+      &loc(&["sub"]),
+      "the parked instruction gained the adopted prefix"
+    );
+  }
+
+  #[test]
+  fn a_refused_widen_reports_and_mutates_nothing() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let reserved = core.reserve_watch_id();
+    // No such scope: the refusal is REPORTED (never a silent unit return), so
+    // the driver's commit can translate it into the loud stream-replace
+    // fallback instead of replying Ok over a registry/core divergence.
+    assert_eq!(
+      core.on_root_widened(
+        ScopeId::new(core::num::NonZeroU64::new(77).unwrap()),
+        meta("/r", 9),
+        reserved,
+        at(1),
+      ),
+      WidenCommit::Refused
+    );
+  }
+
+  #[test]
+  fn the_cover_claim_survives_the_widen() {
+    let (mut core, scope, _root_watch, boot) = live_at("/r/sub", 1, false);
+    // Two armed children under the old root.
+    core.on_enumerated(
+      boot,
+      RawEnumerate::Listed {
+        entries: vec![
+          RawDirEntry {
+            name: b"keep".to_vec(),
+            kind: FileKind::Dir,
+            dev: 1,
+            ino: 21,
+            mnt_id: None,
+          },
+          RawDirEntry {
+            name: b"a".to_vec(),
+            kind: FileKind::Dir,
+            dev: 1,
+            ino: 22,
+            mnt_id: None,
+          },
+        ],
+        complete: true,
+      },
+    );
+    let effects = drain(&mut core);
+    for child in ["/r/sub/keep", "/r/sub/a"] {
+      let watch = effects
+        .iter()
+        .find_map(|e| match e {
+          Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new(child) => {
+            Some(*watch)
+          }
+          _ => None,
+        })
+        .unwrap_or_else(|| panic!("{child} arms: {effects:?}"));
+      core.on_watch_installed(watch, crate::os::linux::WatchOutcome::Installed(9));
+    }
+    let reads: Vec<ReqId> = drain(&mut core)
+      .iter()
+      .filter_map(|e| match e {
+        Effect::Enumerate { req, .. } => Some(*req),
+        _ => None,
+      })
+      .collect();
+    for req in reads {
+      core.on_enumerated(
+        req,
+        RawEnumerate::Listed {
+          entries: Vec::new(),
+          complete: true,
+        },
+      );
+    }
+    let _ = drain(&mut core);
+
+    // Narrow the cover: `a` is pruned and the claim records `[keep]`.
+    assert!(matches!(
+      core.on_set_cover(scope, &[PathBuf::from("/r/sub/keep")]),
+      CoverReconcile::Reconciling
+    ));
+    let effects = drain(&mut core);
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::RemoveWatch { .. })),
+      "the narrowed cover prunes the outside subtree: {effects:?}"
+    );
+
+    // The widen: the claim must ride across UNCHANGED (ratified (c)). A
+    // D1-style reset to `None` would claim full coverage over the pruned
+    // ground, and the re-cover below would compute an EMPTY broadening delta
+    // — leaving the hole dark behind a clean claim.
+    let reserved = widen(&mut core, scope, meta("/r", 9), at(2));
+    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    let _ = drain(&mut core);
+
+    // Re-covering the pruned ground computes a REAL delta against the
+    // preserved claim: the grow re-arms it — the observable of preservation.
+    assert!(matches!(
+      core.on_set_cover(
+        scope,
+        &[PathBuf::from("/r/sub/keep"), PathBuf::from("/r/sub/a")]
+      ),
+      CoverReconcile::Reconciling
+    ));
+    let effects = drain(&mut core);
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::Enumerate { .. })),
+      "the preserved claim re-arms the previously pruned ground: {effects:?}"
+    );
+  }
+
+  /// The barrier gate ≡ [`Monitor::coverage_settled`] — the deleted
+  /// `root_verified` conjunct cannot silently return. A CLEAN witnessed
+  /// window's commit (INV-ROOT) already proved the reserved binding live, so
+  /// once the Monitor's conjuncts clear (adoption verified, cold reads done)
+  /// a fence resolves `Applied` WITHOUT any mount refresh — the happy path no
+  /// longer serializes certification behind a refresh round-trip.
+  #[test]
+  fn barrier_is_coverage_settled() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = widen(&mut core, scope, meta("/r", 1), at(2));
+    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    let effects = drain(&mut core);
+    let req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, .. } => Some(*req),
+        _ => None,
+      })
+      .expect("the widened root cold-reads");
+
+    // Mid-window (the Monitor's own conjuncts still pending): the fence holds
+    // on coverage_settled alone — the two predicates agree.
+    let fence = core.open_cover_fence(scope);
+    assert_eq!(
+      core.barrier_settled(scope),
+      core.monitor.coverage_settled(scope),
+      "the barrier gate is exactly the Monitor's predicate"
+    );
+    assert!(
+      core.poll_cover_settlements().is_empty(),
+      "the unresolved adoption holds the fence"
+    );
+
+    // Positive adoption verification: every Monitor conjunct clears — and the
+    // fence resolves Applied with NO refresh ever fed.
+    core.on_enumerated(
+      req,
+      RawEnumerate::Listed {
+        entries: vec![RawDirEntry {
+          name: b"sub".to_vec(),
+          kind: FileKind::Dir,
+          dev: 1,
+          ino: 1,
+          mnt_id: None,
+        }],
+        complete: true,
+      },
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.barrier_settled(scope),
+      core.monitor.coverage_settled(scope),
+      "the settled side agrees too — no hidden conjunct"
+    );
+    let settled = core.poll_cover_settlements();
+    assert_eq!(
+      settled,
+      vec![(fence, CoverSettle::Applied)],
+      "a clean widen window certifies without the refresh"
+    );
+  }
+
+  /// The refresh death gate SURVIVES as the steady-state negative belt (its
+  /// positive is never consulted — INV-ROOT owns the widen window): a
+  /// POST-COMMIT refresh finding a different object at the widened path runs
+  /// the death funnel — terminal Rescan, stream teardown — and an unresolved
+  /// fence degrades with it, never certifying over the divergence.
+  #[test]
+  fn a_stale_root_binding_dies_before_the_barrier_clears() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = widen(&mut core, scope, meta("/r", 1), at(2));
+    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    let effects = drain(&mut core);
+    let req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, .. } => Some(*req),
+        _ => None,
+      })
+      .expect("the widened root cold-reads");
+    core.on_enumerated(
+      req,
+      RawEnumerate::Listed {
+        entries: vec![RawDirEntry {
+          name: b"sub".to_vec(),
+          kind: FileKind::Dir,
+          dev: 1,
+          ino: 1,
+          mnt_id: None,
+        }],
+        complete: true,
+      },
+    );
+    let _ = drain(&mut core);
+    let fence = core.open_cover_fence(scope);
+
+    // The refresh finds a DIFFERENT object at the widened path — a
+    // post-commit divergence whose own records have not drained (the standing
+    // in-band funnel would otherwise have run already). The death funnel runs
+    // — terminal Rescan, stream teardown — and the unresolved fence degrades:
+    // the barrier never certifies over the divergence.
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 99)),
+        root_mnt_id: None,
+      },
+      at(3),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the death funnel's terminal Rescan: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the stale-bound stream tears down: {effects:?}"
+    );
+    let settled = core.poll_cover_settlements();
+    assert_eq!(
+      settled,
+      vec![(fence, CoverSettle::Degraded)],
+      "the barrier resolves degraded, never Delivered over the gap"
+    );
+  }
+
+  // ───────────────────────── the witnessed window (INV-ROOT) ─────────────────────────
+  //
+  // One deterministic cell per failure-table row of
+  // docs/2026-07-19-d2-golden-root-binding.md: the reserved root's records
+  // are intercepted at the compile latch (never dropped at the Monitor's
+  // unknown-watch guard), every scope loss taints, and the commit gates on
+  // the clean window — so no barrier can certify over a binding whose window
+  // was not provably clean, with the statx identity never consulted.
+
+  const IN_DELETE_SELF: u32 = 0x0000_0400;
+  const IN_MOVE_SELF: u32 = 0x0000_0800;
+  const IN_UNMOUNT: u32 = 0x0000_2000;
+  const IN_IGNORED: u32 = 0x0000_8000;
+
+  /// A nameless self-event record attributed to `anchor`.
+  fn self_event(anchor: WatchId, mask: u32) -> RawLinuxEvent {
+    RawLinuxEvent::Inotify {
+      anchors: vec![anchor],
+      event: RawInotifyEvent {
+        wd: 2,
+        mask: InotifyMask(mask),
+        cookie: 0,
+        name: None,
+      },
+    }
+  }
+
+  /// Opens a witnessed window on a live scope — the driver's reservation
+  /// step, without committing.
+  fn open_window(core: &mut DriverCore, scope: ScopeId) -> WatchId {
+    let reserved = core.reserve_watch_id();
+    core.begin_widen_watch(scope, reserved);
+    reserved
+  }
+
+  /// W1 — the row that killed statx: the filesystem under the widened root is
+  /// unmounted and remounted with the SAME identity inside the window. The
+  /// reserved watch's `IN_UNMOUNT`/`IN_IGNORED` land at the compile latch
+  /// (they would have been dropped at the unknown-watch guard), a fresh
+  /// identity-MATCHING refresh changes nothing — path identity does not prove
+  /// the watch installed — and the commit refuses into the fallback with the
+  /// old world untouched.
+  #[test]
+  fn widen_window_unmount_rebind_refuses() {
+    let (mut core, scope, root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = open_window(&mut core, scope);
+
+    // The unmount burst on the reserved wd: IN_UNMOUNT then the final
+    // IN_IGNORED, both lowered to the death latch.
+    core.on_inotify_events(
+      scope,
+      vec![
+        self_event(reserved, IN_UNMOUNT),
+        self_event(reserved, IN_IGNORED),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a window record is consumed, never delivered: {effects:?}"
+    );
+
+    // The remounted fs re-stats to the SAME identity — the exact sample the
+    // retired root_verified instrument would have certified on. It must not
+    // matter: the death was witnessed in-band.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let _ = drain(&mut core);
+
+    assert_eq!(
+      core.on_root_widened(scope, meta("/r", 1), reserved, at(3)),
+      WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::RootDeath(RecordKind::Ignored),
+        benign: 0,
+      }),
+      "a matching identity never overrides the witnessed death"
+    );
+
+    // The refusal left the old world bit-identical and live: the old root
+    // still delivers on its unchanged watch.
+    assert_eq!(
+      core.root_path(scope).expect("scope lives").as_path(),
+      Path::new("/r/sub"),
+      "no splice landed"
+    );
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(inotify(
+        &[root_watch],
+        IN_CREATE,
+        b"after.txt",
+      ))]),
+      at(4),
+    );
+    let effects = drain(&mut core);
+    let change = emits(&effects)
+      .first()
+      .cloned()
+      .cloned()
+      .expect("the old coverage never blinked");
+    assert!(change.kind().is_created());
+    assert_eq!(change.location(), &loc(&["after.txt"]));
+  }
+
+  /// W2 — the R2 counterexample at its root: the reserved root is swapped
+  /// away inside the window. Its `IN_MOVE_SELF` taints and the commit refuses
+  /// at once — no refresh round-trip, no held fences.
+  #[test]
+  fn widen_window_moveself_refuses() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = open_window(&mut core, scope);
+    core.on_inotify_events(scope, vec![self_event(reserved, IN_MOVE_SELF)], at(1));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.on_root_widened(scope, meta("/r", 1), reserved, at(2)),
+      WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::RootDeath(RecordKind::MoveSelf),
+        benign: 0,
+      })
+    );
+  }
+
+  /// W3 — the rename ABA: the reserved root moves away and back (same inode,
+  /// watch alive, statx matches — every sampling verifier passes it). The
+  /// witnessed window restores root-move strictness: both `MOVE_SELF`s taint,
+  /// the first cause wins, and the commit refuses.
+  #[test]
+  fn widen_window_aba_moveself_refuses() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = open_window(&mut core, scope);
+    core.on_inotify_events(
+      scope,
+      vec![
+        self_event(reserved, IN_MOVE_SELF),
+        self_event(reserved, IN_MOVE_SELF),
+      ],
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.on_root_widened(scope, meta("/r", 1), reserved, at(3)),
+      WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::RootDeath(RecordKind::MoveSelf),
+        benign: 0,
+      }),
+      "an ABA'd root refuses even though the object is back at the path"
+    );
+  }
+
+  /// W4 — delete + inode-recycle: the reserved root is removed and a new
+  /// object with a COLLIDING `(dev, ino)` appears at the path. Identity
+  /// sampling is constitutionally blind to the reuse; the witnessed
+  /// `DELETE_SELF` is not.
+  #[test]
+  fn widen_window_deleteself_refuses() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = open_window(&mut core, scope);
+    core.on_inotify_events(
+      scope,
+      vec![
+        self_event(reserved, IN_DELETE_SELF),
+        self_event(reserved, IN_IGNORED),
+      ],
+      at(1),
+    );
+    let _ = drain(&mut core);
+    // The recycled inode re-stats to the same identity as the dead object.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.on_root_widened(scope, meta("/r", 1), reserved, at(3)),
+      WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::RootDeath(RecordKind::DeleteSelf),
+        benign: 0,
+      }),
+      "the FIRST death record is the recorded cause, not the trailing Ignored"
+    );
+  }
+
+  /// W5 — a loss signal inside the window, with NO reserved record at all:
+  /// the loss may have carried the death records themselves, so the window
+  /// can no longer witness their absence. Coarse by design — any scope loss
+  /// taints — and the follow-up refresh's matching identity again changes
+  /// nothing.
+  #[test]
+  fn widen_window_overflow_taints() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = open_window(&mut core, scope);
+    core.on_root_overflow(scope, at(1));
+    let _ = drain(&mut core);
+    // The loss-armed refresh completes alive-and-matching — the R3-2 shape.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.on_root_widened(scope, meta("/r", 1), reserved, at(3)),
+      WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::Loss,
+        benign: 0,
+      }),
+      "an unattributable loss taints the whole window"
+    );
+  }
+
+  /// W9 — benign new-ground churn commits: non-death records on the reserved
+  /// wd are consumed by the latch (counted, never delivered, never fed to the
+  /// Monitor) and the clean window commits; the post-commit cold read owns
+  /// the convergence. A death record AFTER the benign run still refuses, and
+  /// the taint carries the benign count — the fallback's diagnostics.
+  #[test]
+  fn widen_window_benign_churn_commits() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = open_window(&mut core, scope);
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(&[reserved], IN_CREATE, b"fresh.txt"),
+        inotify(&[reserved], IN_CREATE, b"other"),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "window churn is consumed, never delivered: {effects:?}"
+    );
+    assert_eq!(
+      core.on_root_widened(scope, meta("/r", 1), reserved, at(2)),
+      WidenCommit::Committed,
+      "benign churn never taints"
+    );
+    // The replayed arm's cold read converges the new ground as Created.
+    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    let effects = drain(&mut core);
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::Enumerate { .. })),
+      "the widened root cold-reads the churned ground: {effects:?}"
+    );
+
+    // The diagnostics leg: benign records preceding a death are counted on
+    // the taint the fallback carries.
+    let (mut core, scope, _root_watch, _boot) = live_at("/q/sub", 1, true);
+    let reserved = open_window(&mut core, scope);
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(&[reserved], IN_CREATE, b"a"),
+        inotify(&[reserved], IN_CREATE, b"b"),
+        self_event(reserved, IN_IGNORED),
+      ],
+      at(1),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.on_root_widened(scope, meta("/q", 1), reserved, at(2)),
+      WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::RootDeath(RecordKind::Ignored),
+        benign: 2,
+      })
+    );
+  }
+
+  /// W10/W11 (post-commit regime) — the commit is a regime boundary, not a
+  /// flush: a death record drained AFTER a clean commit lands on the
+  /// now-KNOWN root and runs the ordinary invalidation funnel — terminal
+  /// Rescan, stream teardown — never silence.
+  #[test]
+  fn widen_death_after_commit_invalidates() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = widen(&mut core, scope, meta("/r", 1), at(1));
+    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    let _ = drain(&mut core);
+
+    // The same record that TAINTS pre-commit INVALIDATES post-commit.
+    core.on_inotify_events(scope, vec![self_event(reserved, IN_IGNORED)], at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the known-root death funnel's terminal Rescan: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the widened stream tears down honestly: {effects:?}"
+    );
+  }
+
+  /// The window lifecycle: abort clears (a fresh begin follows without
+  /// tripping the single-flight assert), a tainted commit consumes, the
+  /// fallback replace commit clears a leftover window, and unknown scopes
+  /// are no-ops — no path leaks an entry into a later widen's reservation.
+  #[test]
+  fn widen_begin_abort_lifecycle() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+
+    // abort → a fresh begin is legal (the failed-pre-arm unwind).
+    let _first = open_window(&mut core, scope);
+    core.abort_widen_watch(scope);
+    let second = open_window(&mut core, scope);
+
+    // A tainted commit CONSUMES the window — the next begin is legal too.
+    core.on_root_overflow(scope, at(1));
+    let _ = drain(&mut core);
+    assert!(matches!(
+      core.on_root_widened(scope, meta("/r", 1), second, at(2)),
+      WidenCommit::TaintedWindow(_)
+    ));
+    let _third = open_window(&mut core, scope);
+
+    // The fallback replace commit clears a leftover window outright.
+    core.on_root_replaced(scope, meta("/w", 7), at(3));
+    let _ = drain(&mut core);
+    let _fourth = open_window(&mut core, scope);
+    core.abort_widen_watch(scope);
+
+    // Unknown scopes: both entry points are silent no-ops.
+    let ghost = ScopeId::new(core::num::NonZeroU64::new(4_040).unwrap());
+    core.begin_widen_watch(
+      ghost,
+      WatchId::new(core::num::NonZeroU64::new(9_990).unwrap()),
+    );
+    core.abort_widen_watch(ghost);
   }
 }
