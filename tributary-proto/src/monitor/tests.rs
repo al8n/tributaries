@@ -3476,7 +3476,13 @@ fn record_racing_an_enumerate_forces_a_rescan() {
 /// a `proptest` dependency (which the `no_std` feature matrix would fight).
 #[test]
 fn random_op_storm_holds_invariants_and_terminates() {
-  for seed in 1..=64u64 {
+  // A storm's seeds are statistical convergence coverage, and that is the native
+  // runs' job: one seed drives every code path the rest do, while sixty-odd seeds'
+  // worth of tree churn exhausts a 32-bit target's entire address space under miri
+  // (i686 dies with "no more free addresses"). Miri is here to find UB, so it runs
+  // the shape once.
+  let seeds: u64 = if cfg!(miri) { 1 } else { 64 };
+  for seed in 1..=seeds {
     let mut m = per_dir();
     let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345);
     let mut rng = || {
@@ -5235,7 +5241,13 @@ fn located_overflow_on_unknown_watch_is_dropped() {
 /// enumerates), and drain to a fixpoint under every schedule.
 #[test]
 fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
-  for seed in 1..=64u64 {
+  // A storm's seeds are statistical convergence coverage, and that is the native
+  // runs' job: one seed drives every code path the rest do, while sixty-odd seeds'
+  // worth of tree churn exhausts a 32-bit target's entire address space under miri
+  // (i686 dies with "no more free addresses"). Miri is here to find UB, so it runs
+  // the shape once.
+  let seeds: u64 = if cfg!(miri) { 1 } else { 64 };
+  for seed in 1..=seeds {
     let mut m = kernel_recursive();
     let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(7);
     let mut rng = || {
@@ -6671,7 +6683,13 @@ fn overflow_rearm_respects_scope_profile() {
 /// ceiling holds per scope, and the machine drains to a fixpoint.
 #[test]
 fn mixed_profile_storm_holds_invariants_and_terminates() {
-  for seed in 1..=64u64 {
+  // A storm's seeds are statistical convergence coverage, and that is the native
+  // runs' job: one seed drives every code path the rest do, while sixty-odd seeds'
+  // worth of tree churn exhausts a 32-bit target's entire address space under miri
+  // (i686 dies with "no more free addresses"). Miri is here to find UB, so it runs
+  // the shape once.
+  let seeds: u64 = if cfg!(miri) { 1 } else { 64 };
+  for seed in 1..=seeds {
     let mut m = kernel_recursive();
     let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(41);
     let mut rng = || {
@@ -10166,7 +10184,13 @@ fn reproving_storm_settles_only_over_postdating_acks() {
   // Guards the harness against going vacuous: a post-loss settle edge — the
   // one place the invariant bites — must actually be reached.
   let mut settle_edges_checked = 0u64;
-  for seed in 1..=96u64 {
+  // A storm's seeds are statistical convergence coverage, and that is the native
+  // runs' job: one seed drives every code path the rest do, while sixty-odd seeds'
+  // worth of tree churn exhausts a 32-bit target's entire address space under miri
+  // (i686 dies with "no more free addresses"). Miri is here to find UB, so it runs
+  // the shape once.
+  let seeds: u64 = if cfg!(miri) { 1 } else { 96 };
+  for seed in 1..=seeds {
     let mut m = reproving();
     let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(97_531);
     let mut rng = move || {

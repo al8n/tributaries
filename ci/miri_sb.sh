@@ -49,18 +49,50 @@ case "$TARGET" in
     ;;
 esac
 
-# Full address reuse alone does not fit the whole workspace in one i686 process, so
-# the constrained target splits into disjoint, exhaustive shards — each its own
-# process with a fresh address space. The partition covers every workspace test
-# exactly once: `rest` is every crate except tributary-fs; the four `fs-*` groups
-# partition tributary-fs by test-name prefix. Unsharded targets pass no group and
-# keep their single-pass coverage.
+# The suite runs one shard per process, and the partition covers every workspace
+# test exactly once: the four `fs-*` groups partition tributary-fs by test-name
+# prefix, the two `proto-monitor-*` groups partition the monitor suite, and `rest`
+# is everything else outside tributary-fs.
+#
+# The 32-bit target FORCED this — full address reuse alone does not fit the whole
+# workspace in one i686 process — but every target runs the same partition. A
+# shard is its own process with a fresh address space, so the split that rescues
+# i686 also keeps each job short on the emulated targets, where interpreting the
+# whole workspace in one pass makes a single late failure cost the entire run's
+# feedback. Keeping one partition rather than a per-target special case is also
+# what stops a target from quietly growing past a limit its neighbours already hit.
+#
+# Passing no group runs the whole workspace in a single pass. CI never does; it is
+# kept for a local run that wants one process.
+#
+# The monitor suite is one flat module, so its halves split on the first letter of
+# the test name. Only the FIRST half enumerates letters; the second is its
+# complement, expressed as skips. That asymmetry is deliberate — a test named
+# outside the enumerated range still lands in the second shard rather than falling
+# through a gap, so the partition stays exhaustive as the suite grows.
 case "$TEST_GROUP" in
   "")
     cargo miri test --all-targets --target "$TARGET"
     ;;
   rest)
-    cargo miri test --all-targets --workspace --exclude tributary-fs --target "$TARGET"
+    cargo miri test --all-targets --workspace --exclude tributary-fs --target "$TARGET" -- \
+      --skip monitor::tests::
+    ;;
+  proto-monitor-head)
+    cargo miri test -p tributary-proto --lib --target "$TARGET" -- \
+      monitor::tests::a monitor::tests::b monitor::tests::c monitor::tests::d monitor::tests::e monitor::tests::f monitor::tests::g monitor::tests::h monitor::tests::i
+    ;;
+  proto-monitor-tail)
+    cargo miri test -p tributary-proto --lib --target "$TARGET" -- monitor::tests:: \
+      --skip monitor::tests::a \
+      --skip monitor::tests::b \
+      --skip monitor::tests::c \
+      --skip monitor::tests::d \
+      --skip monitor::tests::e \
+      --skip monitor::tests::f \
+      --skip monitor::tests::g \
+      --skip monitor::tests::h \
+      --skip monitor::tests::i
     ;;
   fs-rest)
     cargo miri test -p tributary-fs --all-targets --target "$TARGET" -- --skip driver::
