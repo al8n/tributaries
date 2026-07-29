@@ -21,6 +21,14 @@ on:
   schedule: 
     - cron: "0 1 1 * *"
 
+# A newer commit on the same ref makes the older run's result obsolete: it can
+# only ever report on code nobody will merge, while holding runner capacity the
+# current commit is waiting for. Superseded runs are therefore cancelled — but
+# never on the trunk, where every commit's result is a record worth keeping and
+# nothing supersedes it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
