@@ -99,10 +99,10 @@ feature of its own.
 
 ```toml
 [dependencies]
-tributary-proto = "0.2"                                                # std (default)
+tributary-proto = "0.1"                                                # std (default)
 
 # no_std with a global allocator:
-tributary-proto = { version = "0.2", default-features = false }
+tributary-proto = { version = "0.1", default-features = false }
 ```
 
 The minimum supported Rust version (MSRV) is **1.95** (edition 2024).

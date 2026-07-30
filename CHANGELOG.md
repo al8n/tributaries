@@ -4,7 +4,7 @@ All notable changes to this workspace are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates adhere to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0]
 
 ### Added
 
@@ -80,10 +80,6 @@ All notable changes to this workspace are documented here. The format is based o
     enforcement, orderly `close()`; watching means "changes from now on".
   - macOS integration suite (convergence-style, real FSEvents) atop the
     hermetic fake-filesystem loop tests and the pure sans-I/O core tests.
-
-## [0.1.0]
-
-### Added
 
 - **`tributary-proto`** — the pure `no_std` (+`alloc`) Sans-I/O state machine at
   the heart of the `tributaries` filesystem-notification stack. The `Monitor` is

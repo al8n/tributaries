@@ -96,7 +96,7 @@ watching reports `Unsupported`.
 
 ```toml
 [dependencies]
-tributaries = { version = "0.2", features = ["tokio"] }
+tributaries = { version = "0.1", features = ["tokio"] }
 ```
 
 The minimum supported Rust version (MSRV) is **1.95** (edition 2024).

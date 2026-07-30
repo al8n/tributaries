@@ -32,7 +32,7 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 thiserror = "2"
-tributary-proto = { version = "0.2", path = "../tributary-proto" }
+tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
 tokio = { version = "1", features = [

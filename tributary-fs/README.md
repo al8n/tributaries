@@ -67,7 +67,7 @@ returns `SourceError::Unsupported`.
 
 ```toml
 [dependencies]
-tributary-fs = { version = "0.2", features = ["tokio"] }
+tributary-fs = { version = "0.1", features = ["tokio"] }
 ```
 
 The minimum supported Rust version (MSRV) is **1.95** (edition 2024).
