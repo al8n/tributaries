@@ -1514,7 +1514,14 @@ async fn widen_over_unmount_rebind_is_never_silently_certified() {
   let loopdev = fixture.loopdev().to_owned();
   let mount = fixture.mount().to_path_buf();
 
-  for (round, delay_ms) in [0_u64, 15, 45].into_iter().enumerate() {
+  const OFFSETS_MS: [u64; 3] = [0, 15, 45];
+  // A round STAGES only once the cycle has handed back a filesystem the round
+  // can assert over. Counting that is what keeps the closing assertion's claim
+  // true: this cell's whole subject is an ending it must OBSERVE, so a run in
+  // which no round ever reached one has proven nothing and must not be green.
+  let mut staged = 0usize;
+
+  for (round, delay_ms) in OFFSETS_MS.into_iter().enumerate() {
     // Fresh layout per round, persisted on the image across the cycle.
     let root = mount.join(format!("w1-{round}"));
     let sub = root.join("sub");
@@ -1544,17 +1551,58 @@ async fn widen_over_unmount_rebind_is_never_silently_certified() {
           }
           std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = Command::new("mount").arg(&loopdev).arg(&mount).status();
+        // Reported rather than discarded: whether the superblock came back is
+        // what decides that the round has an ending to demand at all, and a
+        // re-mount the environment refused is the harness failing to stage the
+        // experiment, not the product failing to keep its promise.
+        Command::new("mount")
+          .arg(&loopdev)
+          .arg(&mount)
+          .status()
+          .map(|s| s.success())
+          .unwrap_or(false)
       })
     };
     let widened = widen.await;
-    cycle.await.expect("mount cycle task");
+    let remounted = cycle.await.expect("mount cycle task");
 
-    // Whatever the interleaving produced, the ending must be observable: a
+    // The demand below is only honest over staging that actually happened, and
+    // the re-mount's exit status does not establish that in either direction: a
+    // cycle whose umount was refused leaves the re-mount failing over a
+    // mountpoint that never stopped being mounted (the filesystem is there and
+    // the round stands), while a re-mount that exited zero still says nothing
+    // about the path this round writes. So the staging is read from what the
+    // round actually depends on. The kernel's own table must show a filesystem
+    // back at the mountpoint, so the probe lands on the image rather than on the
+    // bare directory a mount shadows; and the probe write must itself succeed,
+    // which is the only proof that its parent directory is present and accepts a
+    // create. A round that cannot stage that has no ending to wait for — nothing
+    // was ever created, so the wait can only run to its deadline — and asserting
+    // there would report the harness's own missing filesystem as the product's
+    // silence, which is indistinguishable from the defect this cell hunts.
+    let probe = sub.join(format!("probe-{round}.txt"));
+    if mount_state(&mount) != Some(true) {
+      eprintln!(
+        "SKIP round {round}: the cycle left nothing mounted at {} (the re-mount reported success: \
+         {remounted}), so the round has no filesystem to assert the widen's ending over",
+        mount.display()
+      );
+      let _ = w.close().await;
+      continue;
+    }
+    if let Err(err) = std::fs::write(&probe, b"w1") {
+      eprintln!(
+        "SKIP round {round}: the probe under the re-mounted subtree could not be created ({err}), \
+         so nothing was staged for the stream to surface"
+      );
+      let _ = w.close().await;
+      continue;
+    }
+    staged += 1;
+
+    // Whatever the interleaving produced, the ending must be observable: the
     // probe write under the (re-mounted) old subtree is delivered or covered
     // by a Rescan at it or any ancestor — never silence over dead coverage.
-    let probe = sub.join(format!("probe-{round}.txt"));
-    let _ = std::fs::write(&probe, b"w1");
     let observed = wait_for(&mut w, |event| covers(event, &probe)).await;
     assert!(
       observed.is_some(),
@@ -1566,6 +1614,16 @@ async fn widen_over_unmount_rebind_is_never_silently_certified() {
   }
 
   fixture.close();
+  // A run whose every round lost its staging never put the commit gate under a
+  // mount cycle at all, and a cell that asserted nothing must not report the
+  // same green as one that asserted and held.
+  assert!(
+    staged > 0,
+    "staged 0 of {} rounds: no round kept a usable filesystem across the mount cycle, so this run \
+     established nothing about the widen and says nothing about false certification — see the SKIP \
+     lines for which staging step failed",
+    OFFSETS_MS.len()
+  );
 }
 
 /// Whether `path` is a mount point right now, read from the kernel's own table
