@@ -49,10 +49,19 @@ jobs:
         run: |
           cargo install tokeit --force
       
-      - name: Count total lines of code
+      - name: Count lines of code (workspace total + each crate)
         run: |
+          set -euo pipefail
           tokeit --lang rust
-      - name: Upload total loc to GitHub Gist
+          mv tokeit.json loc-tributaries.json
+          # The umbrella crate's badge shows the workspace total, so only the two
+          # non-umbrella crates need a count of their own.
+          for c in tributary-fs tributary-proto; do
+            ( cd "$c" && tokeit --lang rust )
+            mv "$c/tokeit.json" "loc-$c.json"
+          done
+
+      - name: Upload all loc to the gist in one request
         # Skipped on forks / when the gist token is not configured, so the run does
         # not fail on a missing secret.
         if: ${{ env.GIST_PAT != '' }}
@@ -61,13 +70,18 @@ jobs:
           github-token: ${{ env.GIST_PAT }}
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync('tokeit.json', 'utf8');
             const gistId = '327b2a8aef9003246e45c6e47fe63937';
-            await github.rest.gists.update({
-              gist_id: gistId,
-              files: {
-                "tributaries": {
-                  content: output
-                }
-              }
-            });
+            // Gist file `tributaries` is the workspace total (which is also what the
+            // umbrella crate's badge shows); the rest are per-crate. These names
+            // match the LoC badge URLs in the READMEs (…/raw/<name>). The gists API
+            // accepts every file in one PATCH, so one request avoids the per-crate
+            // rate-limit storm.
+            const crates = ['tributary-fs', 'tributary-proto'];
+            const files = {
+              tributaries: { content: fs.readFileSync('loc-tributaries.json', 'utf8') },
+            };
+            for (const c of crates) {
+              files[c] = { content: fs.readFileSync(`loc-${c}.json`, 'utf8') };
+            }
+            await github.rest.gists.update({ gist_id: gistId, files });
+            console.log('Gist updated');

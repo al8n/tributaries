@@ -1,47 +1,4 @@
-//! Filesystem source crate for the `tributaries` stack.
-//!
-//! `tributary-fs` is the `std`, async driver layer over the Sans-I/O
-//! [`tributary-proto`] Monitor: it performs the real OS filesystem watching
-//! and lowers raw kernel events into the Monitor's normalized vocabulary. The
-//! first backend is macOS FSEvents — kernel-recursive, one native stream per
-//! watched root — with every unsafe platform call confined to the internal
-//! `os` module behind a platform-neutral seam.
-//!
-//! The crate is runtime-agnostic through [`agnostic_lite::RuntimeLite`]:
-//! enable the `tokio` (or `smol`) feature and use the [`TokioWatcher`]
-//! ([`SmolWatcher`]) alias, or bring any other `RuntimeLite` implementation.
-//! On platforms without a backend the crate still compiles; watching returns
-//! [`SourceError::Unsupported`].
-//!
-//! # Quick start
-//!
-//! ```no_run
-//! # #[cfg(feature = "tokio")]
-//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! use tributary_fs::{Interest, TokioWatcher, WatcherOptions};
-//!
-//! let mut watcher = TokioWatcher::new(WatcherOptions::new())?;
-//! let root = watcher.watch("/path/to/project", Interest::all()).await?;
-//! println!("watching {:?}", watcher.root_path(root));
-//! while let Some(event) = watcher.next().await {
-//!   println!("{}: {}", event.kind(), event.path().display());
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # The two contracts
-//!
-//! - **Watching means "changes from now on."** No initial inventory is
-//!   delivered. Consumers that need a snapshot start the watch first, then
-//!   crawl — see [`Watcher::watch`].
-//! - **Loss is never silent.** Every coverage gap surfaces as a
-//!   [`Rescan`](EventKind::Rescan) event whose [`Event::epoch`] dominates
-//!   everything delivered before it — see [`Event::epoch`] for the
-//!   re-enumeration contract.
-//!
-//! [`tributary-proto`]: tributary_proto
-
+#![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
