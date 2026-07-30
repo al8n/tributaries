@@ -8119,7 +8119,13 @@ fn teardown_reclaims_all_barrier_bookkeeping() {
   assert!(m.has_coverage_deficit(scope(1)));
   assert!(!m.coverage_settled(scope(1)));
 
-  assert!(m.coverage_work_epoch(scope(1)) > 0, "work was acquired");
+  // The floor an unknown scope reads. Named through the private field because
+  // nothing outside this module can name a coverage-work epoch at all.
+  let never_acquired = CoverageWorkEpoch(0);
+  assert!(
+    m.coverage_work_epoch(scope(1)) > never_acquired,
+    "work was acquired"
+  );
 
   m.unregister_root(scope(1));
   assert!(!m.has_coverage_deficit(scope(1)));
@@ -8129,7 +8135,7 @@ fn teardown_reclaims_all_barrier_bookkeeping() {
   );
   assert_eq!(
     m.coverage_work_epoch(scope(1)),
-    0,
+    never_acquired,
     "and holds no coverage-work generation"
   );
   assert!(!m.resignal_coverage_deficits(scope(1)));

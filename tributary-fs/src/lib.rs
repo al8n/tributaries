@@ -9,6 +9,7 @@ mod error;
 mod event;
 mod options;
 mod os;
+mod stamped;
 mod watcher;
 
 pub use error::{
