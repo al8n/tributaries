@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/al8n/tributaries"
 documentation = "https://docs.rs/tributary-proto"
-description = "Pure Sans-I/O state machine (the brain) for the tributaries filesystem-notification stack."
-categories = ["filesystem", "no-std", "no-std::no-alloc"]
-keywords = ["filesystem", "notify", "sans-io", "no_std"]
+description = "Sans-I/O state machine for filesystem notification: a primitive-agnostic watch tree, move normalization, and overflow recovery with no I/O of its own."
+categories = ["filesystem", "asynchronous", "no-std"]
+keywords = ["filesystem", "notify", "sans-io", "no-std", "watcher"]
 
 [features]
 default = ["std"]

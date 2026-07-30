@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/al8n/tributaries"
 documentation = "https://docs.rs/tributaries"
-description = "The public top-level crate of the tributaries stack: subsumes overlapping watch subscriptions into the disjoint roots tributary-fs requires, and attributes each event back to every covering subscription."
+description = "Cross-platform filesystem notification: overlapping watch subscriptions are subsumed into disjoint roots, and every event is attributed back to each subscription covering it."
 categories = ["filesystem", "asynchronous"]
-keywords = ["filesystem", "notify", "watcher", "subsume"]
+keywords = ["filesystem", "notify", "watcher", "fsevents", "inotify"]
 
 [features]
 default = ["fs"]
