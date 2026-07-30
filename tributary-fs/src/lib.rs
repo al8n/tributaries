@@ -67,6 +67,13 @@ pub use watcher::{
 
 pub use tributary_proto::{ChangeId, Epoch, Interest, Location, ScopeId, Segment};
 
+// Test-only surface for the real-kernel integration suites: forcing an
+// inotify instance rebuild deterministically requires lowering the reader's
+// descriptor threshold, which no production configuration exposes.
+#[cfg(all(target_os = "linux", not(miri), any(test, feature = "_integration")))]
+#[doc(hidden)]
+pub use os::linux::inotify::reader::override_rebuild_threshold_for_tests;
+
 /// A [`Watcher`] driven by the tokio runtime.
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]

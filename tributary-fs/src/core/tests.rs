@@ -7,6 +7,15 @@ const WINDOW: Duration = Duration::from_millis(100);
 /// this far, so it is inert everywhere except the fanotify liveness-tick suite.
 const LIVENESS: Duration = Duration::from_secs(30);
 
+/// No scope holds counted-but-unread lane items, which is what every cell that
+/// is not about the residue deferral means by "the driver polls".
+static NO_RESIDUE: BTreeSet<ScopeId> = BTreeSet::new();
+/// The steady-state settlement pass: a live boundary whose source drain spent
+/// every item it counted.
+const DRAINED: SettlePass<'static> = SettlePass::Live {
+  unspent: &NO_RESIDUE,
+};
+
 fn at(ms: u64) -> Instant {
   Instant::from_origin(Duration::from_millis(ms))
 }
@@ -2783,13 +2792,23 @@ fn set_cover_refuses_unknown_and_kernel_recursive_scopes() {
   );
 }
 
-/// A kernel-recursive scope's `Rescan` churn creates NO set-cover loss memory:
-/// its coverage never narrows (`on_set_cover` refuses it before recording
-/// anything), so `applied_cover` is never `Some`, there is no claim to
-/// degrade, and the route-time loss handling skips the scope entirely rather
-/// than cycling map entries on every overflow.
+/// A kernel-recursive scope's loss `Rescan` DOES create set-cover loss memory,
+/// even though its coverage never narrows.
+///
+/// The narrowing argument only covers `applied_cover`: `on_set_cover` refuses a
+/// kernel-recursive scope before recording anything, so there is no coverage
+/// claim to rewind, and both `applied_cover` and `settle_floor` stay `None`.
+/// It does NOT cover the fence, because `sync_root` opens a cover fence for any
+/// scope without consulting the profile. Skipping the mark therefore left a real
+/// queue overflow invisible to a pending sync fence, which then resolved clean
+/// over a window the kernel had already dropped events from.
+///
+/// The entry costs one map slot per LOSS — a kernel-recursive scope's only
+/// `Rescan` sources are a real loss and a root death, not churn — and the next
+/// settlement poll removes it whether or not a fence was pending, so it is loss
+/// memory, not a leak.
 #[test]
-fn kernel_recursive_rescan_creates_no_loss_memory() {
+fn kernel_recursive_loss_rescan_marks_loss_memory() {
   let (mut core, scope) = live_core();
   core.on_root_overflow(scope, at(2));
   let effects = drain(&mut core);
@@ -2798,12 +2817,28 @@ fn kernel_recursive_rescan_creates_no_loss_memory() {
     "the overflow's covering Rescan is delivered: {effects:?}"
   );
   assert!(
-    core.cover_fences.is_empty(),
-    "no loss-memory entry for a kernel-recursive scope"
+    core
+      .cover_fences
+      .get(&scope)
+      .is_some_and(|entry| entry.lossy),
+    "the overflow marks the scope's loss memory lossy, so a sync fence opened \
+     across this window cannot resolve clean"
   );
   let state = core.scopes.get(&scope).unwrap();
-  assert_eq!(state.applied_cover, None);
+  assert_eq!(
+    state.applied_cover, None,
+    "a kernel-recursive scope still records no coverage claim"
+  );
   assert_eq!(state.settle_floor, None);
+  assert_eq!(
+    core.poll_cover_settlements(DRAINED),
+    Vec::new(),
+    "no fence was pending, so the poll yields nothing"
+  );
+  assert!(
+    core.cover_fences.is_empty(),
+    "and it clears the entry rather than accumulating one per loss"
+  );
 }
 
 mod lowering {
@@ -3223,6 +3258,7 @@ mod descending {
   const IN_DELETE: u32 = 0x0000_0200;
   const IN_MOVED_FROM: u32 = 0x0000_0040;
   const IN_MOVED_TO: u32 = 0x0000_0080;
+  const IN_MOVE_SELF: u32 = 0x0000_0800;
   const IN_ISDIR: u32 = 0x4000_0000;
   const IN_IGNORED: u32 = 0x0000_8000;
 
@@ -3381,6 +3417,316 @@ mod descending {
     assert!(
       emits(&effects).iter().any(|c| c.kind().is_rescan()),
       "a refused arm is never a silent blind spot: {effects:?}"
+    );
+  }
+
+  /// A transport loss on the inotify profile re-proves the root binding by a
+  /// re-add mapped through the SELF-PARENTED root-arm shape — carrying the
+  /// barrier identity as `expected`, so a different-object rebind fails the
+  /// open-verify — and never a stream (re)spawn. The re-arm read runs only
+  /// once the re-add acknowledges.
+  #[test]
+  fn a_scope_loss_reissues_the_root_binding_before_the_rearm_read() {
+    let (mut core, scope, req, root_watch) = live_descending();
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_root_overflow(scope, at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the loss stands its covering Rescan: {effects:?}"
+    );
+    assert!(
+      !effects
+        .iter()
+        .any(|e| matches!(e, Effect::SpawnStream { .. })),
+      "a re-add never respawns the stream: {effects:?}"
+    );
+    assert!(
+      !effects
+        .iter()
+        .any(|e| matches!(e, Effect::Enumerate { .. })),
+      "no read runs before the binding acknowledges: {effects:?}"
+    );
+    let expected = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          expected,
+          ..
+        } if *watch == root_watch && watch == parent && path.as_path() == Path::new("/r") => {
+          Some(*expected)
+        }
+        _ => None,
+      })
+      .expect("the root re-add rides the self-parented arm shape");
+    assert_eq!(
+      expected.map(|e| (e.dev, e.ino.get())),
+      Some((1, 1)),
+      "the re-add carries the barrier identity, so a different-object rebind fails Gone"
+    );
+
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Aliased(1));
+    let read = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the acknowledged binding re-arm-reads");
+    core.on_enumerated(read, listed(Vec::new()));
+    let _ = drain(&mut core);
+    assert!(core.monitor.rearm_settled(scope));
+  }
+
+  /// A cover fence opened mid-recovery cannot settle before the binding
+  /// acknowledgement chain completes — the free barrier gating: the re-add
+  /// rides the states the settle counter already counts.
+  #[test]
+  fn a_fence_opened_mid_recovery_waits_for_the_binding_ack() {
+    let (mut core, scope, req, root_watch) = live_descending();
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_root_overflow(scope, at(2));
+    let _ = drain(&mut core);
+    let fence = core.open_cover_fence(scope);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the un-acknowledged re-add holds the fence"
+    );
+
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Aliased(1));
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the acknowledged binding's read still holds it"
+    );
+    let read = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the reproof read");
+    core.on_enumerated(read, listed(Vec::new()));
+    let _ = drain(&mut core);
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "the fence resolves only past the full acknowledgement chain (lossy window)"
+    );
+  }
+
+  /// Arms `sub` under a live descending scope, settles it, then runs the
+  /// scope-loss reproof up to `sub`'s re-add: returns the core with the
+  /// re-add DISPATCHED, ready for its acknowledgement — or its refusal.
+  fn reproving_child() -> (DriverCore, ScopeId, WatchId, WatchId) {
+    let (mut core, scope, req, root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let sub = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the discovered directory is armed");
+    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Installed(2));
+    let read = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/sub") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed child cold-enumerates");
+    core.on_enumerated(read, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    // Scope loss: the reproof storm re-adds the root, whose acknowledged
+    // re-add re-reads the tree and re-adds the kept survivor.
+    core.on_root_overflow(scope, at(2));
+    let _ = drain(&mut core);
+    core.on_watch_installed(root, crate::os::linux::WatchOutcome::Aliased(1));
+    let read = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the acknowledged root re-add re-reads");
+    core.on_enumerated(read, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    assert!(
+      drain(&mut core).iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { watch, path, .. }
+          if path.as_path() == Path::new("/r/sub") && *watch == sub
+      )),
+      "the kept survivor is re-added"
+    );
+    (core, scope, sub, root)
+  }
+
+  /// Finishes `sub`'s reproof read (found in `effects`, the drain that
+  /// followed its acknowledgement) and asserts the recovery settles with the
+  /// binding standing.
+  fn settle_reproved_child(
+    core: &mut DriverCore,
+    scope: ScopeId,
+    sub: WatchId,
+    effects: &[Effect],
+  ) {
+    let read = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/sub") => Some(*req),
+        _ => None,
+      })
+      .expect("the re-proved child re-reads");
+    core.on_enumerated(read, listed(Vec::new()));
+    let _ = drain(core);
+    assert!(core.monitor.rearm_settled(scope));
+    assert!(
+      core.scope_of_watch(sub).is_some(),
+      "the re-proved binding stands"
+    );
+    assert!(
+      !core.resignal_coverage_deficits(scope),
+      "no deficit is booked against the re-proved slot"
+    );
+  }
+
+  /// The survivor re-add's happy path: an `Aliased` acknowledgement (the
+  /// binding was live all along) continues into the reproof read and the
+  /// recovery settles with the binding standing and no deficit booked.
+  #[test]
+  fn an_acknowledged_survivor_readd_settles_the_recovery() {
+    let (mut core, scope, sub, _root) = reproving_child();
+    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Aliased(2));
+    let effects = drain(&mut core);
+    settle_reproved_child(&mut core, scope, sub, &effects);
+  }
+
+  /// A survivor re-add REFUSED mid-reproof (`Failed(Io)` — the reader's
+  /// `wd`-collision refusal, among other transient installs): the slot lands
+  /// in the install-refusal funnel, never a silent drop — a located covering
+  /// `Rescan` stands, the watch is released, and the darkness is
+  /// level-persistent (the pre-cookie seam re-signals it rather than
+  /// certifying delivery over the unwatched slot). The refusal is not an
+  /// acknowledgement: nothing re-proves the binding until a retry's real ACK.
+  #[test]
+  fn a_refused_survivor_readd_stands_a_located_rescan_and_a_persistent_deficit() {
+    let (mut core, scope, sub, _root) = reproving_child();
+    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Failed(WatchError::Io));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["sub"])),
+      "the refused re-add stands its located covering Rescan: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::RemoveWatch { watch, .. } if *watch == sub)),
+      "the refused slot's watch is released: {effects:?}"
+    );
+    assert!(
+      core.resignal_coverage_deficits(scope),
+      "the refused slot is booked as a standing deficit"
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["sub"])),
+      "the re-signal covers the still-dark slot: {effects:?}"
+    );
+  }
+
+  /// The refusal's retry makes progress: the deficit re-signal heal-kicks the
+  /// slot's healing anchor (reproof-flavored — the anchor re-adds, its
+  /// acknowledged read re-arms the slot fresh); the retry's REAL
+  /// acknowledgement (its next `add_watch` steps past the refused `wd`) is
+  /// what re-covers the slot — the deficit then stops re-signaling.
+  #[test]
+  fn a_refused_readd_heals_through_the_deficit_retry() {
+    let (mut core, scope, sub, root) = reproving_child();
+    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Failed(WatchError::Io));
+    let _ = drain(&mut core);
+
+    assert!(core.resignal_coverage_deficits(scope));
+    assert!(
+      drain(&mut core).iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { watch, parent, .. } if watch == parent && *watch == root
+      )),
+      "the heal kick re-proves the healing anchor's binding"
+    );
+    core.on_watch_installed(root, crate::os::linux::WatchOutcome::Aliased(1));
+    let read = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the acknowledged anchor re-reads the refused slot's level");
+    core.on_enumerated(read, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+    let retry = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the heal re-arms the slot");
+    core.on_watch_installed(retry, crate::os::linux::WatchOutcome::Installed(3));
+    let read = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/sub") => Some(*req),
+        _ => None,
+      })
+      .expect("the retried arm's ACK continues into its read");
+    core.on_enumerated(read, listed(Vec::new()));
+    let _ = drain(&mut core);
+    assert!(core.monitor.rearm_settled(scope));
+    assert!(
+      !core.resignal_coverage_deficits(scope),
+      "the retry's real ACK re-covered the slot — no standing deficit"
+    );
+  }
+
+  /// A cover fence spanning a refusal never certifies clean: the refused
+  /// re-add resolves the recovery with a lossy window, so the fence settles
+  /// `Degraded` — the covering `Rescan` owns the truth — never `Applied` over
+  /// the momentarily unwatched slot.
+  #[test]
+  fn a_fence_spanning_a_refused_readd_settles_degraded_never_applied() {
+    let (mut core, scope, sub, _root) = reproving_child();
+    let fence = core.open_cover_fence(scope);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the un-answered re-add holds the fence"
+    );
+    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Failed(WatchError::Io));
+    let _ = drain(&mut core);
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "a refusal inside the window degrades the fence — never Applied"
     );
   }
 
@@ -3984,7 +4330,23 @@ mod descending {
       emits(&effects).iter().any(|c| c.kind().is_rescan()),
       "the frame change reconciles with a covering rescan: {effects:?}"
     );
-    let req2 = effects
+    // The frame-change replay is a scope-level loss on the inotify profile,
+    // so the root's binding is re-proven first: the reconcile's re-read comes
+    // only once the re-add acknowledges.
+    let readd = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if watch == parent && path.as_path() == Path::new("/r") => Some(*watch),
+        _ => None,
+      })
+      .expect("the frame-change reconcile re-proves the root binding");
+    core.on_watch_installed(readd, crate::os::linux::WatchOutcome::Aliased(1));
+    let req2 = drain(&mut core)
       .iter()
       .find_map(|e| match e {
         Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
@@ -4235,7 +4597,7 @@ mod descending {
     );
     let fence = core.open_cover_fence(scope);
     assert!(!core.monitor.rearm_settled(scope));
-    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
 
     // The replace commits mid-fence: /r moves to /r2 on a new transport.
     core.on_root_replaced(
@@ -4253,7 +4615,7 @@ mod descending {
     );
     let _ = drain(&mut core);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "the rebound root's rebuild is counted work — the fence still pends"
     );
@@ -4262,8 +4624,10 @@ mod descending {
     core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(99));
     run_cascade(&mut core, &BTreeMap::from([("/r2", Vec::new())]));
     assert!(core.monitor.rearm_settled(scope));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Degraded)],
       "the commit's loss memory resolves the fence honestly"
     );
@@ -4290,12 +4654,775 @@ mod descending {
     // A shrink grows nothing, so the scope reads settled at once: the
     // observation is immediate, fence-less, and clean — it resets the floor
     // to the applied cover and clears the scope's fence entry.
-    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    // A LIVE verdict of either kind also owes the ordering proof the driver buys
+    // with one empty control batch per window — the request that latches it in
+    // flight, then the batch reply the reader's queue cut precedes — so every
+    // sans-I/O cell expecting one performs those two steps itself.
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
     let state = core.scopes.get(&scope).unwrap();
     assert_eq!(state.applied_cover, Some(vec![p("/r/keep")]));
     assert_eq!(state.settle_floor, Some(vec![p("/r/keep")]));
     assert!(core.cover_fences.is_empty());
     (core, scope, root_watch)
+  }
+
+  /// A predecessor's completion cannot prove a request made after it.
+  ///
+  /// The completion signal is per scope, and a scope's batches are a QUEUE: a
+  /// batch still recorded as running can complete after a later proof request has
+  /// been queued and latched. Its cut was taken before that request existed, so
+  /// licensing the request from it would certify over anything the kernel
+  /// committed in between — the same false-clean defect, reached through the
+  /// completion rather than through the snapshot.
+  ///
+  /// The request therefore carries a token and only its own completion closes it.
+  /// A predecessor's token cannot match, however close behind it arrives.
+  ///
+  /// Mutation witness: make `prove_cut` accept any in-flight request regardless of
+  /// token and the stale completion below certifies the window.
+  #[test]
+  fn a_predecessor_completion_cannot_prove_a_later_request() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let pending = core.open_cover_fence(scope);
+
+    // The request this window actually owes, token 7.
+    core.mark_cut_inflight(scope, 7);
+
+    // A predecessor batch — dispatched before the request existed, so carrying an
+    // earlier token — completes now.
+    core.prove_cut(scope, 6);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "a cut taken before this request existed does not prove it"
+    );
+
+    // The request's own completion does.
+    core.prove_cut(scope, 7);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(pending, CoverSettle::Applied)],
+      "and the matching completion releases the window"
+    );
+  }
+
+  /// A reconcile extending the window invalidates the proof taken before it.
+  ///
+  /// The latch lives on the scope's ENTRY, which every fence of one unsettled
+  /// window shares — so a proof bought for the window as it then stood would,
+  /// unreset, license whatever a later reconcile added to it. That is the same
+  /// defect one level up: the added work's own terminal proof is routinely an
+  /// enumerate, which never crosses the reader, so a record the kernel committed
+  /// during it would be certified over by the earlier batch's reply.
+  ///
+  /// Staged without opening a second fence, so only the reconcile's own reset can
+  /// be what withholds the verdict — a fence opened here would carry an ordinal
+  /// beyond the proof's reach, and this cell must not be able to pass on that
+  /// instead. Staged on a PRUNE, which
+  /// is the coverage move the epoch binding cannot see: a drop only releases
+  /// work, so no acquisition funnel fires and the scope reads the same epoch
+  /// either side of it — asserted below, so the reset stays the only candidate.
+  ///
+  /// Mutation witness: drop the reset at `on_set_cover`'s entry-ensure and the
+  /// pending fence resolves `Applied` on a proof taken over the coverage the
+  /// shrink then dropped.
+  #[test]
+  fn a_reconcile_invalidates_a_proof_taken_before_it() {
+    let (mut core, scope, req, _root) = live_descending();
+    core.on_enumerated(req, listed(root_listing()));
+    run_cascade(&mut core, &BTreeMap::new());
+
+    // The full cover: nothing is outside it and the never-pruned initial claim
+    // already covers it, so this opens the window without moving any coverage.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let pending = core.open_cover_fence(scope);
+    let epoch = core.monitor.coverage_work_epoch(scope);
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+
+    // The window is re-opened by a reconcile that drops `/r/drop`'s subtree. No
+    // new fence joins and the epoch stands still, so the only thing that can
+    // withhold the verdict below is this reconcile's own reset.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    assert!(
+      drain(&mut core)
+        .iter()
+        .any(|e| matches!(e, Effect::RemoveWatch { .. })),
+      "the shrink prunes /r/drop"
+    );
+    assert_eq!(
+      core.monitor.coverage_work_epoch(scope),
+      epoch,
+      "a prune only releases coverage work, so the epoch cannot flag it"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the proof predates the reconcile that extended this window"
+    );
+
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(pending, CoverSettle::Applied)],
+      "and the re-proven window resolves the fence it actually covers"
+    );
+  }
+
+  /// A reconcile that moves no coverage cannot invalidate the proof taken before
+  /// it — the exact counterpart of the cell above, and the reason that one is
+  /// conditional rather than unconditional.
+  ///
+  /// A re-issue of an already-applied cover grows nothing and prunes nothing, so
+  /// it extends the window by nothing: the standing proof orders precisely the
+  /// window that remains, and re-asking would buy no ordering. Invalidating there
+  /// is not merely a wasted round trip. `set_cover` requests need not be
+  /// acknowledged, so a caller may issue them faster than a cut completes — and
+  /// against an unconditional reset, EVERY completed proof lands on a latch a
+  /// later re-issue has already reset. The window would then never settle clean
+  /// under sustained same-cover traffic, and its fences would never resolve: not
+  /// a slow path, an indefinite one.
+  ///
+  /// Retention rides on that: pending fences and their callers' parked replies
+  /// only ever drain at a settle, so a window that cannot settle accumulates them
+  /// for as long as the traffic lasts. Asserted here as the entry vanishing at
+  /// the settle — with it go every pending tuple and every parked reply.
+  ///
+  /// Mutation witness: reset unconditionally and the flood below leaves the fence
+  /// unresolved forever, however many proofs complete.
+  #[test]
+  fn a_reconcile_moving_no_coverage_keeps_the_proof_taken_before_it() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+
+    // A window with nothing to grow and nothing left to prune: it quiesces the
+    // instant it opens, so the ordering proof is the only thing between it and a
+    // clean verdict.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let pending = core.open_cover_fence(scope);
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "the settled clean window owes a proof"
+    );
+    core.mark_cut_inflight(scope, 1);
+
+    // Reply-less re-issues of the same cover, arriving while that request is out.
+    // Each is a whole reconcile — validated, walked, recorded — that moves no
+    // coverage at all.
+    for _ in 0..64 {
+      assert_eq!(
+        core.on_set_cover(scope, &[p("/r/keep")]),
+        CoverReconcile::Reconciling
+      );
+    }
+    assert_eq!(
+      core.cover_fences[&scope].pending.len(),
+      1,
+      "a reply-less reconcile opens no fence, so the traffic retains nothing"
+    );
+
+    // The reply the window has been waiting on lands behind all of it, and the
+    // traffic keeps arriving afterwards.
+    core.prove_cut(scope, 1);
+    for _ in 0..64 {
+      assert_eq!(
+        core.on_set_cover(scope, &[p("/r/keep")]),
+        CoverReconcile::Reconciling
+      );
+    }
+
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(pending, CoverSettle::Applied)],
+      "the proof still orders the window the traffic never changed"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "and the settle drains the entry, so nothing is retained past it"
+    );
+  }
+
+  /// A fence may not inherit an ordering proof older than itself.
+  ///
+  /// The proof one empty control batch buys is scoped to the window as it stood
+  /// when the request was made. A fence opened afterwards covers a LATER window,
+  /// so anything the kernel committed between the two is outside what that proof
+  /// ordered — and certifying the new fence from it would certify over exactly
+  /// the records the proof existed to surface. The fence's open ordinal is what
+  /// excludes it: the ordinal sits beyond the proof's mark, so the proof
+  /// licenses it nothing and the driver asks again.
+  ///
+  /// Staged on a zero-work re-issue — the same cover, so nothing grows and
+  /// nothing prunes and the barrier reads settled at once. That window has no
+  /// counted work to hook a proof onto, which is why it cannot be covered by
+  /// making the cascade end in an acknowledged arm.
+  ///
+  /// Mutation witness: let a standing proof license every pending fence rather
+  /// than only those it reaches, and the later fence resolves `Applied` on a
+  /// proof taken before it existed.
+  #[test]
+  fn a_fence_never_inherits_a_proof_older_than_itself() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling,
+      "a re-issue of the same cover still opens a window"
+    );
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+
+    let later = core.open_cover_fence(scope);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the later fence may not certify on a proof taken before it existed"
+    );
+
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(later, CoverSettle::Applied)],
+      "and once the window it actually covers is proven, it resolves"
+    );
+  }
+
+  /// A proof settles the fences it was requested behind, however many join the
+  /// window while it is out.
+  ///
+  /// Scoping a proof to the window as it stood at the REQUEST cuts both ways: a
+  /// fence opened afterwards is outside what the proof ordered, and a fence
+  /// already pending is squarely inside it. Reading only the first half — by
+  /// discarding the whole proof the moment any successor fence joins the
+  /// entry — starves the very fences that proof was bought for. Successors can
+  /// arrive faster than a cut completes, and then every reply lands on a latch
+  /// some later fence has already cleared, so the window never settles clean at
+  /// all and the callers parked behind it are never answered.
+  ///
+  /// The open ordinal reads both halves at once. The reply below licenses its
+  /// own tranche and nothing beyond it: the fence it was requested behind
+  /// resolves, and the four that joined afterwards wait for a successor of
+  /// their own — which they are offered the moment it lands.
+  ///
+  /// Mutation witness: discard the proof whenever a fence opens and the first
+  /// fence never resolves, though the proof it asked for completes.
+  #[test]
+  fn a_proof_settles_the_tranche_it_was_requested_behind() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+
+    // The window the request is made for: one fence, on a re-issue that grows
+    // nothing and prunes nothing, so it quiesces the instant it opens and the
+    // ordering proof is the only thing between it and a clean verdict.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let first = core.open_cover_fence(scope);
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "the settled clean window owes a proof"
+    );
+    core.mark_cut_inflight(scope, 1);
+
+    // Acknowledged covers keep arriving while that batch is out, each opening
+    // its own fence onto the same entry. The driver sends only what it is
+    // offered, and the request already out is not offered again.
+    let later: Vec<FenceId> = (0..4)
+      .map(|_| {
+        assert_eq!(
+          core.on_set_cover(scope, &[p("/r/keep")]),
+          CoverReconcile::Reconciling
+        );
+        core.open_cover_fence(scope)
+      })
+      .collect();
+
+    // The reply lands, ordering exactly the window the first fence covers.
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(first, CoverSettle::Applied)],
+      "the fence the proof was requested behind settles clean, and the fences \
+       that opened after the request do not ride it"
+    );
+
+    // Those are offered a successor at once — a window may never be left
+    // holding fences with nothing asked for them.
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "the fences beyond the proof's reach ask again"
+    );
+    core.mark_cut_inflight(scope, 2);
+    core.prove_cut(scope, 2);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      later
+        .iter()
+        .map(|fence| (*fence, CoverSettle::Applied))
+        .collect::<Vec<_>>(),
+      "and the successor resolves the tranche that outlived the first proof"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "the last pending fence going drains the entry"
+    );
+  }
+
+  /// Acknowledged covers arriving faster than a cut completes still resolve,
+  /// and retain only what one flight can accumulate.
+  ///
+  /// This is the liveness half of scoping a proof to the fences it was
+  /// requested behind. Each request licenses everything pending at the instant
+  /// it was latched, and the fences that join behind it are offered a successor
+  /// the moment it lands — so a fence waits on the first request latched after
+  /// it opened, and on no more than the one round trip already in flight,
+  /// whatever the arrival rate. Retention follows: what a window holds is the
+  /// fences of a single flight, not of the traffic.
+  ///
+  /// What that rules out is a window that never settles at all. Pending fences
+  /// and their callers' parked replies drain only at a settle, so under a rule
+  /// that lets a new fence discard the standing request — cancelling it before
+  /// its reply can land — a scope taking steady acknowledged covers wastes
+  /// every proof, resolves no fence, and grows its retained state with the
+  /// traffic. That is not a slow path but an indefinite one.
+  ///
+  /// Mutation witness: discard the proof whenever a fence opens and the window
+  /// retains the whole traffic instead of one flight's worth of it.
+  #[test]
+  fn acknowledged_covers_outpacing_the_cut_resolve_in_bounded_state() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+
+    // The driver's loop, one round per iteration: an acknowledged cover arrives
+    // and opens a fence, whatever reply is due lands, settlements are polled,
+    // and the loop top offers the scope a cut which the driver commits to
+    // sending. A reply takes three rounds, so fences arrive three times faster
+    // than the proofs that license them.
+    const FLIGHT: usize = 3;
+    const ARRIVALS: usize = 64;
+
+    let mut token = 0;
+    let mut due: Option<(usize, u64)> = None;
+    let mut displaced = 0;
+    let mut opened = Vec::new();
+    let mut settled = Vec::new();
+
+    for round in 0..ARRIVALS + 4 * FLIGHT {
+      if round < ARRIVALS {
+        assert_eq!(
+          core.on_set_cover(scope, &[p("/r/keep")]),
+          CoverReconcile::Reconciling
+        );
+        opened.push(core.open_cover_fence(scope));
+      }
+      if let Some((lands, out)) = due
+        && lands == round
+      {
+        core.prove_cut(scope, out);
+        due = None;
+      }
+      settled.extend(core.poll_cover_settlements(DRAINED));
+
+      let held = core
+        .cover_fences
+        .get(&scope)
+        .map_or(0, |entry| entry.pending.len());
+      assert!(
+        held <= 2 * FLIGHT,
+        "round {round}: the window retains the fences of one flight, not of \
+         the whole traffic ({held} held)"
+      );
+      let offered = core.covers_awaiting_cut();
+      assert!(
+        held == 0 || due.is_some() || !offered.is_empty(),
+        "round {round}: {held} fences wait with no proof out and none offered"
+      );
+      if !offered.is_empty() {
+        // The driver sends what it is offered; a request still out would have
+        // its reply orphaned by the overwrite.
+        displaced += usize::from(due.is_some());
+        token += 1;
+        core.mark_cut_inflight(scope, token);
+        due = Some((round + FLIGHT, token));
+      }
+    }
+
+    assert_eq!(
+      displaced, 0,
+      "no request out was ever displaced by a fence that joined behind it"
+    );
+    assert_eq!(
+      settled,
+      opened
+        .iter()
+        .map(|fence| (*fence, CoverSettle::Applied))
+        .collect::<Vec<_>>(),
+      "every fence the traffic opened settled clean, in open order"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "and the last one going drained the entry"
+    );
+  }
+
+  /// Latching the successor a later fence needs does not spend the proof its
+  /// predecessors have already earned.
+  ///
+  /// A proven prefix and a request out for the fences beyond it are two
+  /// different claims, and the driver's loop is what makes keeping them apart
+  /// load-bearing: it latches the cuts it is offered at the loop top and
+  /// resolves settlements below that, so the successor a mid-flight fence needs
+  /// is always latched BEFORE the tranche its predecessor proved gets to
+  /// resolve. Held in one slot the two are indistinguishable, and the successor
+  /// erases an authority already earned — leaving the fence that bought it
+  /// waiting on a reply that says nothing about it.
+  ///
+  /// Staged on re-issues of the applied cover, which grow nothing and prune
+  /// nothing: each window quiesces the instant it opens, so the ordering proof
+  /// is the only thing between its fences and a clean verdict.
+  ///
+  /// Mutation witness: let the latch clear the proven prefix and the first fence
+  /// never resolves, though the cut it was waiting on completed before the
+  /// successor existed.
+  #[test]
+  fn a_latched_successor_never_spends_the_proof_it_follows() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+
+    // The window the first request is made for.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let first = core.open_cover_fence(scope);
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "the settled clean window owes a proof"
+    );
+    core.mark_cut_inflight(scope, 1);
+
+    // A second acknowledged cover joins the entry while that batch is out, so
+    // its fence sits past everything the request can license.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let second = core.open_cover_fence(scope);
+
+    // The reply lands, and the driver's next loop top offers and latches the
+    // successor the second fence needs before it resolves anything.
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "the fence beyond the proof's reach asks for its own"
+    );
+    core.mark_cut_inflight(scope, 2);
+
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(first, CoverSettle::Applied)],
+      "the fence the landed proof was requested behind still settles on it"
+    );
+
+    core.prove_cut(scope, 2);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(second, CoverSettle::Applied)],
+      "and the successor resolves the fence it was latched for"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "the last pending fence going drains the entry"
+    );
+  }
+
+  /// A window taking one new fence per proof round resolves every one of them,
+  /// holding the fences of a single flight rather than of the whole traffic.
+  ///
+  /// The liveness this shape tests is the driver's own: successors are latched
+  /// at the loop top, ABOVE the settlement resolved below, so every proof lands
+  /// with a successor latched on top of it before the fences it licenses are
+  /// allowed to resolve. If that successor spent the proof, no round would ever
+  /// resolve a fence, and each would add one more to the entry: not a slow path
+  /// but an indefinite one, with every caller's parked reply retained behind it,
+  /// under nothing more exotic than a steady stream of acknowledged covers.
+  ///
+  /// Keeping the two apart bounds it instead. Each request licenses everything
+  /// pending when it was latched and the prefix keeps what it earns, so a fence
+  /// waits on the first request latched after it opened and on no more than the
+  /// one round trip already out, whatever the arrival rate.
+  ///
+  /// Mutation witness: let the latch clear the proven prefix and the window
+  /// retains every fence the traffic ever opened, resolving none of them.
+  #[test]
+  fn a_fence_a_proof_round_still_resolves_in_bounded_state() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+
+    // The driver's loop, one round per iteration and in its order: commands are
+    // taken (an acknowledged cover arrives and opens a fence), results are fed
+    // back (whatever reply is due lands), the loop top offers a cut which the
+    // driver commits to sending, and settlements resolve underneath it.
+    const FLIGHT: usize = 3;
+    const ARRIVALS: usize = 64;
+
+    let mut token = 0;
+    let mut due: Option<(usize, u64)> = None;
+    let mut displaced = 0;
+    let mut opened = Vec::new();
+    let mut settled = Vec::new();
+
+    for round in 0..ARRIVALS + 4 * FLIGHT {
+      if round < ARRIVALS {
+        assert_eq!(
+          core.on_set_cover(scope, &[p("/r/keep")]),
+          CoverReconcile::Reconciling
+        );
+        opened.push(core.open_cover_fence(scope));
+      }
+      if let Some((lands, out)) = due
+        && lands == round
+      {
+        core.prove_cut(scope, out);
+        due = None;
+      }
+      for _ in core.covers_awaiting_cut() {
+        // The driver sends what it is offered; a request still out would have
+        // its reply orphaned by the one that displaced it.
+        displaced += usize::from(due.is_some());
+        token += 1;
+        core.mark_cut_inflight(scope, token);
+        due = Some((round + FLIGHT, token));
+      }
+      settled.extend(core.poll_cover_settlements(DRAINED));
+
+      let held = core
+        .cover_fences
+        .get(&scope)
+        .map_or(0, |entry| entry.pending.len());
+      assert!(
+        held <= 2 * FLIGHT,
+        "round {round}: the window retains the fences of one flight, not of \
+         the whole traffic ({held} held)"
+      );
+      assert!(
+        held == 0 || due.is_some(),
+        "round {round}: {held} fences ended the round with nothing out to \
+         license them"
+      );
+    }
+
+    assert_eq!(
+      displaced, 0,
+      "no request out was ever displaced by a fence that joined behind it"
+    );
+    assert_eq!(
+      settled,
+      opened
+        .iter()
+        .map(|fence| (*fence, CoverSettle::Applied))
+        .collect::<Vec<_>>(),
+      "every fence the traffic opened settled clean, in open order"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "and the last one going drained the entry"
+    );
+  }
+
+  /// Coverage work acquired and released under a standing proof invalidates it.
+  ///
+  /// The barrier is a conjunction over several kinds of coverage work, so it can
+  /// go settled → UNSETTLED → settled again without any reconcile and without
+  /// any new fence — the two window changes that reset the latch at their own
+  /// site. This is that path, end to end and through the conjunct
+  /// `rearm_settled` deliberately does not count: the reader forwards a
+  /// `MovedFrom` under a proof already taken, the settle-edge drain turns it
+  /// into a held-source obligation, and a paired `MovedTo` releases it.
+  ///
+  /// The window that re-opened is a real one. An overflow the kernel committed
+  /// after the cut can still be sitting unread across that whole round, and the
+  /// lane snapshot the drain sees is empty — so a proof kept valid through it
+  /// would suppress the second cut and certify `Applied` over exactly the record
+  /// the proof existed to surface, irreversibly. Binding the proof to the
+  /// scope's coverage-work epoch is what makes the round visible: the hold's
+  /// acquisition moves the epoch, the release does not move it back, and the
+  /// stale proof licenses nothing.
+  ///
+  /// Mutation witness: accept any `Proven` regardless of epoch and the fence
+  /// resolves `Applied` here, ahead of the loss below.
+  #[test]
+  fn a_hold_and_release_invalidates_a_proof_taken_before_it() {
+    let (mut core, scope, root_watch) = shrunk_to_keep();
+
+    // A window with nothing to grow: it quiesces the instant it opens, so the
+    // ordering proof is the only thing between it and a clean verdict.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let pending = core.open_cover_fence(scope);
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "the settled clean window owes a proof"
+    );
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert!(
+      core.covers_awaiting_cut().is_empty(),
+      "which the batch reply supplies"
+    );
+
+    // The proven cut forwards a `MovedFrom`; ingesting it detaches and holds
+    // the source, which re-opens the barrier with no reconcile in sight.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_MOVED_FROM | IN_ISDIR,
+        7,
+        Some(b"keep"),
+      )],
+      at(5),
+    );
+    let _ = drain(&mut core);
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "a hold is not counted re-arm work"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "but the hold gates the fence"
+    );
+
+    // The pairing releases the hold; the barrier reads settled again, and the
+    // lane the drain snapshots is empty either way.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_MOVED_TO | IN_ISDIR,
+        7,
+        Some(b"kept"),
+      )],
+      at(10),
+    );
+    let _ = drain(&mut core);
+    assert!(
+      core.barrier_settled(scope),
+      "the pairing releases the barrier"
+    );
+
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "a proof taken before the hold's round cannot certify across it"
+    );
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "so the window is offered a fresh cut instead"
+    );
+
+    // What that second cut is for: the record the kernel held across the round
+    // reaches the fence as loss, where the stale proof would have already
+    // certified the window clean over it.
+    core.on_root_overflow(scope, at(11));
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([("/r", vec![entry("kept", FileKind::Dir, 1, 11)])]),
+    );
+    // Taking that loss does not excuse the window from the cut: it is offered
+    // one over the epoch the recovery moved, and only the reply releases the
+    // fence.
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "a degraded window owes the same ordering proof a clean one does"
+    );
+    core.mark_cut_inflight(scope, 2);
+    core.prove_cut(scope, 2);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(pending, CoverSettle::Degraded)],
+      "the fence reports the loss it had not yet certified over"
+    );
+  }
+
+  /// A scope that settles and then stays settled converges: its coverage-work
+  /// epoch stops moving, so the next proof taken over it survives to certify.
+  ///
+  /// This is the liveness half of binding the proof to that epoch. Invalidating
+  /// on every acquisition is only safe if a quiescent scope acquires nothing —
+  /// otherwise the fence would chase a moving value and a clean window could
+  /// never resolve. Coverage work is acquired at the four funnels and released
+  /// everywhere else, and a release never moves the epoch, so quiescence alone
+  /// is enough: no consumer silence and no timer is required.
+  #[test]
+  fn a_settled_scope_holds_its_epoch_still_so_a_proof_sticks() {
+    let (mut core, scope, root_watch) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let pending = core.open_cover_fence(scope);
+
+    // Idle churn that acquires no coverage work: a plain file `Created` under
+    // a live directory reconciles a slot and starts nothing.
+    let epoch = core.monitor.coverage_work_epoch(scope);
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root_watch], IN_CREATE, 0, Some(b"f.txt"))],
+      at(5),
+    );
+    let _ = drain(&mut core);
+    assert!(core.barrier_settled(scope), "the scope is still settled");
+    assert_eq!(
+      core.monitor.coverage_work_epoch(scope),
+      epoch,
+      "and acquired nothing, so the epoch stands still"
+    );
+
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    let quiet = core.monitor.coverage_work_epoch(scope);
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root_watch], IN_CREATE, 0, Some(b"g.txt"))],
+      at(6),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.monitor.coverage_work_epoch(scope),
+      quiet,
+      "more of the same churn still acquires nothing"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(pending, CoverSettle::Applied)],
+      "so the proof taken over the quiet window certifies it"
+    );
   }
 
   /// `on_set_cover` validates the retained cover against the LIVE scope root
@@ -4453,7 +5580,7 @@ mod descending {
       "the grow started counted re-arm work"
     );
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "the fence pends while the cascade runs"
     );
@@ -4461,8 +5588,10 @@ mod descending {
     // (`keep` is identity-kept, never re-armed).
     run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
     assert!(core.monitor.rearm_settled(scope));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Applied)]
     );
     let state = core.scopes.get(&scope).unwrap();
@@ -4474,6 +5603,343 @@ mod descending {
     assert!(
       core.cover_fences.is_empty(),
       "settling clears the scope's fence state"
+    );
+  }
+
+  /// The clean verdict's CERTIFICATION gate: a settled CLEAN window is withheld
+  /// — never degraded, never lost — when the boundary may not certify
+  /// ([`SettlePass::Closing`], the close drain), because there is no stream
+  /// left to certify against. The withheld pass promotes no floor and KEEPS the
+  /// fence, so the resolution is deferred: the driver's dropped reply then
+  /// reads `Closed` rather than a verdict minted over a scope being torn down.
+  /// A LOSSY window resolves regardless at THIS boundary — nothing may be held
+  /// over at close, where no later pass would ever answer it.
+  #[test]
+  fn a_settle_the_boundary_may_not_certify_is_withheld_not_degraded() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    assert!(core.monitor.rearm_settled(scope), "the cascade quiesced");
+    let floor_before = core.scopes.get(&scope).unwrap().settle_floor.clone();
+
+    assert_eq!(
+      core.poll_cover_settlements(SettlePass::Closing),
+      Vec::new(),
+      "the quiesced CLEAN window is withheld while the boundary may not certify"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.settle_floor, floor_before,
+      "the withheld pass promotes no floor — nothing was certified"
+    );
+    assert_ne!(
+      state.settle_floor, state.applied_cover,
+      "the grow's claim is still un-certified while the verdict is withheld"
+    );
+    assert!(
+      core.cover_fences.contains_key(&scope),
+      "the withheld fence is kept, not dropped"
+    );
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Applied)],
+      "a boundary that may certify then certifies exactly once"
+    );
+
+    // The lossy twin: a marked window resolves even where a clean one is withheld.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let lossy = core.open_cover_fence(scope);
+    core
+      .cover_fences
+      .get_mut(&scope)
+      .expect("the fence entry exists")
+      .mark_lossy();
+    run_cascade(&mut core, &BTreeMap::new());
+    assert_eq!(
+      core.poll_cover_settlements(SettlePass::Closing),
+      vec![(lossy, CoverSettle::Degraded)],
+      "a lossy window reports its honest verdict regardless"
+    );
+  }
+
+  /// The residue gate: while a scope's own lane still holds items the settle
+  /// edge COUNTED and did not read, no verdict that ANSWERS a caller may
+  /// resolve for it — the LOSSY one included.
+  ///
+  /// A degraded verdict is not falsifiable by more loss, which is why the close
+  /// boundary above resolves it freely. It is falsifiable by DEATH. An unread
+  /// terminal `Fatal` among those counted items has not yet folded the fence,
+  /// so the scope's liveness still reads live everywhere a live verdict is
+  /// consumed; and a `Degraded` is a LIVE verdict, dispatching the fence's
+  /// parked cookie write exactly as an `Applied` does. Answering `Ok` there
+  /// mints a barrier the dead stream can never report — precisely the
+  /// successful-but-unsatisfiable oneshot [`CoverSettle::Dead`] exists to
+  /// refuse.
+  ///
+  /// Three facts are pinned, in order: the withhold keeps the fence INTACT (a
+  /// deferral, never a decision); the set is per SCOPE, so a neighbour's
+  /// backlog decides nothing here; and ingesting the residue resolves the very
+  /// fence that was withheld — `Dead`, through the already-settled list no
+  /// deferral gates — so the deferral cannot outlive the residue that caused
+  /// it and cannot swallow the answer.
+  ///
+  /// The close boundary is a different pass and is pinned by the cell above:
+  /// it refuses the clean verdict but defers NOTHING, because a fence held
+  /// over there would strand its caller forever. [`SettlePass::Closing`]
+  /// carries no residue set at all, so that separation is structural.
+  ///
+  /// Mutation witness: let a lossy window resolve while its scope holds
+  /// residual counted items (drop the `withholds` gate, or apply it only to
+  /// clean windows) and the first poll below reports `Degraded` — the verdict
+  /// that dispatches the cookie — for a scope whose death is still unread.
+  #[test]
+  fn a_lossy_settle_is_withheld_while_its_scope_holds_unread_lane_items() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    let elsewhere = ScopeId::new(NonZeroU64::new(4242).unwrap());
+    assert_ne!(scope, elsewhere, "the neighbour is a different scope");
+
+    // A settled LOSSY window — the shape whose verdict answers a caller and
+    // dispatches its parked cookie.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let first = core.open_cover_fence(scope);
+    core
+      .cover_fences
+      .get_mut(&scope)
+      .expect("the fence entry exists")
+      .mark_lossy();
+    run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    assert!(
+      core.barrier_settled(scope),
+      "staging: the window must be SETTLED, or every poll below is vacuously empty"
+    );
+    // The window's ordering proof is bought first — where the driver's loop top
+    // latches it, above the settlement it resolves below — so the residue gate
+    // this cell is about is the only thing that can withhold the verdict.
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+
+    assert_eq!(
+      core.poll_cover_settlements(SettlePass::Live {
+        unspent: &BTreeSet::from([scope])
+      }),
+      Vec::new(),
+      "a settled lossy window whose scope still owes counted lane items resolves \
+       nothing — a death may be sitting in exactly those items"
+    );
+    assert!(
+      core.cover_fences.contains_key(&scope),
+      "the withheld fence is KEPT, so the caller is deferred rather than decided"
+    );
+
+    // Per scope, not global: a neighbour's residue is about a neighbour's lane.
+    assert_eq!(
+      core.poll_cover_settlements(SettlePass::Live {
+        unspent: &BTreeSet::from([elsewhere])
+      }),
+      vec![(first, CoverSettle::Degraded)],
+      "another scope's unread items defer nothing here"
+    );
+
+    // A second settled lossy window, withheld the same way — and this time the
+    // residue really is the terminal Fatal.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    let second = core.open_cover_fence(scope);
+    core
+      .cover_fences
+      .get_mut(&scope)
+      .expect("the fence entry exists")
+      .mark_lossy();
+    run_cascade(&mut core, &BTreeMap::new());
+    assert!(
+      core.barrier_settled(scope),
+      "staging: the second window settled"
+    );
+    core.mark_cut_inflight(scope, 2);
+    core.prove_cut(scope, 2);
+    let residue = SettlePass::Live {
+      unspent: &BTreeSet::from([scope]),
+    };
+    assert_eq!(
+      core.poll_cover_settlements(residue),
+      Vec::new(),
+      "withheld again — the gate is a standing property of the residue, not a one-shot"
+    );
+
+    // Reading the residue is what decides it: the terminal Fatal folds the
+    // fence, and the SAME pass that withheld the live verdict reports the death.
+    core.on_source_fatal(scope, at(5));
+    assert!(
+      drain(&mut core)
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the terminal Fatal funnels the scope's teardown"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(residue),
+      vec![(second, CoverSettle::Dead)],
+      "the withheld fence resolves Dead once its residue is read — the answer the \
+       caller had to get instead of a Degraded that would have dispatched its cookie"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "no fence state outlives the scope"
+    );
+  }
+
+  /// A LOSSY window owes the ordering proof exactly as a clean one does, and is
+  /// offered one — the same rule read from both sides.
+  ///
+  /// More loss genuinely cannot falsify a degraded verdict, which is what the
+  /// old exemption rested on. That is a statement about LOSS and silent about
+  /// DEATH. A `Degraded` is a LIVE verdict: it answers its caller and
+  /// dispatches the fence's parked sync cookie exactly as an `Applied` does. So
+  /// a scope whose root died while the record saying so sits unread in the
+  /// kernel queue would be answered `Ok` for a cookie written into a directory
+  /// nothing watches — and the loss that degraded the window covers nothing
+  /// that happened after it. Only the cut surfaces a kernel-resident record;
+  /// the settle-edge drain sees an empty lane and reads spent.
+  ///
+  /// Both halves are pinned together because either alone is a defect. Requiring
+  /// the proof without OFFERING it parks every lossy fence forever, and its
+  /// caller's parked reply with it: the offer and the settle gate carry the same
+  /// exemption and no other, so a fence that must have a proof is always asked
+  /// for one.
+  ///
+  /// Mutation witness: exempt the lossy window on either side. Exempted at the
+  /// settle gate, the first poll below mints `Degraded` with no proof in hand;
+  /// exempted at the offer, the window is never asked for a cut and the fence
+  /// never resolves at all.
+  #[test]
+  fn a_lossy_fence_is_not_licensed_without_a_current_cut_proof() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+
+    // A settled LOSSY window: the shape whose verdict answers a caller and
+    // dispatches its parked cookie.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    core
+      .cover_fences
+      .get_mut(&scope)
+      .expect("the fence entry exists")
+      .mark_lossy();
+    run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    assert!(
+      core.barrier_settled(scope),
+      "staging: the window must be SETTLED, or every poll below is vacuously empty"
+    );
+
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "a degraded verdict is a live verdict, so its window owes the cut"
+    );
+    assert!(
+      core.cover_fences.contains_key(&scope),
+      "the unproven fence is KEPT — the window is retried, never decided"
+    );
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "and it is asked for one, which is what keeps the requirement live"
+    );
+
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "the proof licenses the window; its public verdict is unchanged by owing one"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "the last pending fence going drains the entry"
+    );
+  }
+
+  /// What that cut is FOR: a root death the kernel still holds reaches the fence
+  /// ahead of its verdict, so the fence resolves `Dead` — refusing the parked
+  /// cookie — where the exempted window answered `Degraded` and dispatched it.
+  ///
+  /// The staging is the reachable shape of the defect. The window is degraded by
+  /// a loss; its coverage work quiesces OFF the reader (an enumerate completes
+  /// on the blocking pool and crosses no lane), so the settle-edge drain reads
+  /// spent and every liveness map still says the scope is alive; and the root's
+  /// own `IN_MOVE_SELF` is kernel-resident throughout. Withholding the verdict
+  /// for want of the proof is precisely what leaves room for the reader's
+  /// pre-reply cut to put that record on the lane, which is what the record
+  /// arriving ahead of the batch's completion models here.
+  ///
+  /// Mutation witness: exempt the lossy window at the settle gate and the first
+  /// poll answers its caller over a root that is already gone.
+  #[test]
+  fn an_unread_root_death_under_a_lossy_fence_is_caught_by_the_cut_it_owes() {
+    let (mut core, scope, root_watch) = shrunk_to_keep();
+
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    core
+      .cover_fences
+      .get_mut(&scope)
+      .expect("the fence entry exists")
+      .mark_lossy();
+    run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    assert!(
+      core.barrier_settled(scope),
+      "staging: the coverage work quiesced, and it quiesced off the reader"
+    );
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the degraded window is withheld for want of its ordering proof"
+    );
+
+    // The reader cuts its kernel queue onto the lane BEFORE answering any batch,
+    // so the root's own death is ingested ahead of the proof that batch mints.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root_watch], IN_MOVE_SELF, 0, None)],
+      at(5),
+    );
+    assert!(
+      drain(&mut core)
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the root's own move is the scope's death"
+    );
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Dead)],
+      "the fence reports the death the cut surfaced — the verdict that REFUSES \
+       the parked cookie, never the Degraded that would have written it into a \
+       directory nothing watches"
+    );
+    assert!(
+      core.cover_fences.is_empty(),
+      "no fence state outlives the scope"
     );
   }
 
@@ -4505,14 +5971,16 @@ mod descending {
     );
     assert!(!entry.lossy, "abandonment never fabricates loss memory");
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "the surviving fence still pends on the stalled cascade"
     );
     // Quiesce: only the survivor resolves, with the clean-settle repair intact.
     run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(survivor, CoverSettle::Applied)]
     );
     let state = core.scopes.get(&scope).unwrap();
@@ -4584,8 +6052,10 @@ mod descending {
     // The failure ended the obligation (dropped-with-standing-Rescan): the
     // fence settles Degraded. The Rescan already degraded the claim at route
     // time, so the settle-time rewind lands on the same degraded floor.
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Degraded)]
     );
     let state = core.scopes.get(&scope).unwrap();
@@ -4673,7 +6143,7 @@ mod descending {
       "but not to the fence predicate"
     );
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "the fence is gated across the latent read — no settle inside the window"
     );
@@ -4686,7 +6156,7 @@ mod descending {
       "the dirtied read's completion emits the covering Rescan: {effects:?}"
     );
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "the escalation's counted retry keeps the fence parked"
     );
@@ -4699,8 +6169,10 @@ mod descending {
       .expect("the escalated re-arm retry read");
     core.on_enumerated(retry, listed(Vec::new()));
     let _ = drain(&mut core);
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Degraded)],
       "the drained window resolves Degraded — born-lossy, and Rescan-marked"
     );
@@ -4766,7 +6238,7 @@ mod descending {
       CoverReconcile::Reconciling
     );
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "the latent obligation gates the settle — no fence resolves inside it"
     );
@@ -4804,8 +6276,10 @@ mod descending {
     assert!(core.monitor.rearm_settled(scope), "the escalation quiesced");
     // The settle OBSERVATION resolves the marked fence Degraded and clears
     // the loss memory with it.
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(pending, CoverSettle::Degraded)],
       "a reply-less coalesce degrades the fences already pending"
     );
@@ -4823,8 +6297,10 @@ mod descending {
     );
     let later = core.open_cover_fence(scope);
     run_cascade(&mut core, &BTreeMap::new());
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(later, CoverSettle::Applied)],
       "the observed memory does not leak onto a later fence"
     );
@@ -4863,11 +6339,29 @@ mod descending {
       .find(|c| c.kind().is_rescan())
       .map(|c| c.epoch())
       .expect("the commit Rescan is routed");
-    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
 
-    // The driver replays the pre-armed root; its re-arm read lists a fresh
+    // The driver replays the pre-armed root; the commit's synthetic loss
+    // postdates that pre-arm on the inotify profile, so the replay's ACK is
+    // stale under the stamp rule and one re-add re-proves the binding on the
+    // NEW transport before the re-arm read runs. Its read then lists a fresh
     // directory `a` — the bridge. The fence pends until `a`'s own read lands.
     core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(99));
+    let readd = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if watch == parent && path.as_path() == Path::new("/r2") => Some(*watch),
+        _ => None,
+      })
+      .expect("the rebound root's binding is re-proven post-commit");
+    assert_eq!(readd, root_watch, "the re-add names the surviving root");
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
+    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Aliased(99));
     let rearm = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -4875,7 +6369,7 @@ mod descending {
         _ => None,
       })
       .expect("the rebound root re-arm-enumerates");
-    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
     core.on_enumerated(rearm, listed(vec![entry("a", FileKind::Dir, 1, 21)]));
     let a_watch = drain(&mut core)
       .iter()
@@ -4887,7 +6381,7 @@ mod descending {
       })
       .expect("the rebuilt directory arms");
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "the fresh install keeps the fence parked"
     );
@@ -4899,7 +6393,7 @@ mod descending {
         _ => None,
       })
       .expect("the rebuilt directory re-arm-enumerates");
-    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
 
     // The settle edge: the closing Rescan is ROUTED (in the effect queue) by
     // the same input that drained the last obligation — strictly before any
@@ -4915,8 +6409,10 @@ mod descending {
       closing > commit_epoch,
       "the closing Rescan strictly dominates the commit"
     );
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Degraded)],
       "only then does the fence resolve (the commit made the window lossy)"
     );
@@ -5088,7 +6584,7 @@ mod descending {
     let fence = core.open_cover_fence(scope);
     assert!(core.monitor.rearm_settled(scope), "a hold is not counted");
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "but the fence is gated across it"
     );
@@ -5103,8 +6599,10 @@ mod descending {
       at(10),
     );
     let _ = drain(&mut core);
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Applied)],
       "a clean pairing releases the gate under the existing verdict rules"
     );
@@ -5142,11 +6640,13 @@ mod descending {
     );
     let _ = drain(&mut core);
     let fence = core.open_cover_fence(scope);
-    assert_eq!(core.poll_cover_settlements(), Vec::new());
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
     core.on_timeout(at(5) + WINDOW);
     let _ = drain(&mut core);
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Applied)],
       "the stranded half's resolution releases the gate"
     );
@@ -5181,7 +6681,7 @@ mod descending {
     );
     let second = core.open_cover_fence(scope);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "both fences pend on the same scope settle"
     );
@@ -5191,8 +6691,10 @@ mod descending {
       entry("extra", FileKind::Dir, 1, 13),
     ];
     run_cascade(&mut core, &BTreeMap::from([("/r", listing)]));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![
         (first, CoverSettle::Applied),
         (second, CoverSettle::Applied)
@@ -5206,11 +6708,16 @@ mod descending {
     );
   }
 
-  /// Scope teardown mid-fence: the pending fences resolve `Degraded` (the
-  /// terminal Rescan covers the caller) at the NEXT settlement poll — the
-  /// driver's one choke point — and no fence state survives the scope.
+  /// Scope teardown mid-fence: the pending fences resolve `Dead` (the terminal
+  /// Rescan covers the caller) at the NEXT settlement poll — the driver's one
+  /// choke point — and no fence state survives the scope.
+  ///
+  /// `Dead` rather than `Degraded` because the driver's liveness maps still read
+  /// live at this instant: the teardown only QUEUED its `TeardownStream`. A
+  /// consumer that must refuse a dead scope reads the fact off the verdict, which
+  /// is the only place it exists yet.
   #[test]
-  fn teardown_mid_fence_degrades_and_clears() {
+  fn teardown_mid_fence_resolves_dead_and_clears() {
     let (mut core, scope, _root) = shrunk_to_keep();
     assert_eq!(
       core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
@@ -5225,34 +6732,41 @@ mod descending {
       "the unwatch tears the scope down mid-cascade"
     );
     assert_eq!(
-      core.poll_cover_settlements(),
-      vec![(fence, CoverSettle::Degraded)],
-      "teardown mid-fence resolves Degraded at the next poll"
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Dead)],
+      "teardown mid-fence resolves Dead at the next poll"
     );
     assert!(
       core.cover_fences.is_empty(),
       "no fence state outlives the scope"
     );
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "resolution is one-shot"
     );
   }
 
-  /// Answers every enumerate in `effects` (the root with `root_listing`,
-  /// children empty), then quiesces whatever that feeds — the overflow-recovery
-  /// helper for the out-of-window loss suites, whose assertions need the
-  /// drained effects before the cascade is served.
+  /// Answers every arm and enumerate in `effects` (arms as `Aliased` — the
+  /// ordinary all-bindings-live recovery; the root's listing is
+  /// `root_listing`, children empty), then quiesces whatever that feeds — the
+  /// overflow-recovery helper for the out-of-window loss suites, whose
+  /// assertions need the drained effects before the cascade is served.
   fn serve_enumerates_then_quiesce(core: &mut DriverCore, effects: &[Effect]) {
     for effect in effects {
-      if let Effect::Enumerate { req, path, .. } = effect {
-        let listing = if path.as_path() == Path::new("/r") {
-          root_listing()
-        } else {
-          Vec::new()
-        };
-        core.on_enumerated(*req, listed(listing));
+      match effect {
+        Effect::AddWatch { watch, .. } => {
+          core.on_watch_installed(*watch, crate::os::linux::WatchOutcome::Aliased(900));
+        }
+        Effect::Enumerate { req, path, .. } => {
+          let listing = if path.as_path() == Path::new("/r") {
+            root_listing()
+          } else {
+            Vec::new()
+          };
+          core.on_enumerated(*req, listed(listing));
+        }
+        _ => {}
       }
     }
     run_cascade(core, &BTreeMap::from([("/r", root_listing())]));
@@ -5279,8 +6793,10 @@ mod descending {
     );
     let fence = core.open_cover_fence(scope);
     run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Applied)]
     );
     assert!(
@@ -5338,8 +6854,10 @@ mod descending {
       );
     }
     serve_enumerates_then_quiesce(&mut core, &effects);
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(first, CoverSettle::Degraded)],
       "the first re-issue inherits the pre-reissue loss memory"
     );
@@ -5359,8 +6877,10 @@ mod descending {
     let second = core.open_cover_fence(scope);
     let effects = drain(&mut core);
     serve_enumerates_then_quiesce(&mut core, &effects);
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       vec![(second, CoverSettle::Applied)],
       "the clean re-issue applies honestly"
     );
@@ -5405,8 +6925,13 @@ mod descending {
         .is_some_and(|entry| entry.lossy),
       "the loss memory is recorded even with no reconcile in flight"
     );
+    // The repair rides the entry's removal, which is a settle observation like
+    // any other and rests on the same ordering proof — a pending-empty entry has
+    // no fence to exclude, so any proof under the current epoch reaches it.
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
     assert_eq!(
-      core.poll_cover_settlements(),
+      core.poll_cover_settlements(DRAINED),
       Vec::new(),
       "a pending-empty entry resolves no fence"
     );
@@ -7009,8 +8534,25 @@ mod root_replaced {
       "the rebound root waits for the replayed pre-arm: {effects:?}"
     );
 
-    // The replay: coverage rebuilds on the new transport, re-arm flavored.
+    // The replay: the commit's synthetic loss postdates the pre-arm on the
+    // inotify profile, so its ACK is stale under the stamp rule — one re-add
+    // re-proves the binding on the new transport, and only its own ACK
+    // unlocks the re-arm-flavored rebuild.
     core.on_watch_installed(root_watch, WatchOutcome::Installed(9));
+    let readd = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if watch == parent && path.as_path() == Path::new("/a") => Some(*watch),
+        _ => None,
+      })
+      .expect("the rebound root's binding is re-proven post-commit");
+    assert_eq!(readd, root_watch, "the re-add names the surviving root");
+    core.on_watch_installed(root_watch, WatchOutcome::Aliased(9));
     let effects = drain(&mut core);
     let rebuild = effects
       .iter()
@@ -7460,7 +9002,7 @@ mod root_widened {
       "the barrier gate is exactly the Monitor's predicate"
     );
     assert!(
-      core.poll_cover_settlements().is_empty(),
+      core.poll_cover_settlements(DRAINED).is_empty(),
       "the unresolved adoption holds the fence"
     );
 
@@ -7485,7 +9027,9 @@ mod root_widened {
       core.monitor.coverage_settled(scope),
       "the settled side agrees too — no hidden conjunct"
     );
-    let settled = core.poll_cover_settlements();
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    let settled = core.poll_cover_settlements(DRAINED);
     assert_eq!(
       settled,
       vec![(fence, CoverSettle::Applied)],
@@ -7553,11 +9097,13 @@ mod root_widened {
         .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
       "the stale-bound stream tears down: {effects:?}"
     );
-    let settled = core.poll_cover_settlements();
+    let settled = core.poll_cover_settlements(DRAINED);
     assert_eq!(
       settled,
-      vec![(fence, CoverSettle::Degraded)],
-      "the barrier resolves degraded, never Delivered over the gap"
+      vec![(fence, CoverSettle::Dead)],
+      "the root died under the fence, so the barrier resolves Dead — never \
+       Delivered over the gap, and never a bare Degraded that would leave a \
+       parked consumer to re-derive the death from maps that still read live"
     );
   }
 

@@ -28,7 +28,7 @@
 //! way: one object, one sample.
 
 use std::{
-  collections::{BTreeMap, BTreeSet, HashMap},
+  collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
   io::Write as _,
   num::NonZeroUsize,
   path::{Path, PathBuf},
@@ -48,8 +48,8 @@ use tributary_proto::{
 use crate::{
   core::{
     CoverNoop, CoverReconcile, CoverSettle, Delivery, DriverCore, Effect, ExpectedObject, FenceId,
-    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, WidenCommit,
-    WidenTaint,
+    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, SettlePass,
+    WidenCommit, WidenTaint,
   },
   error::WatchRootError,
   os::{
@@ -1468,11 +1468,14 @@ impl<F: FsOps> CookieRegistry<F> {
   /// file.
   ///
   /// A sync still PARKED on its fence is pre-physical, so there is nothing here to
-  /// unlink and nothing to revoke by flag: dropping `roots` above is what retires
-  /// it. Its fence was resolved `Degraded` by the same teardown, so the next
-  /// settle observation finds the scope gone, retires the record `NeverCreated`
-  /// and answers its barrier `Retired` — the ONE site that resolves a parked sync,
-  /// caller reply and ledger record in the same step.
+  /// unlink and nothing to revoke by flag. Its fence was resolved `Dead` by the
+  /// same teardown, and the next settle observation reads that VERDICT — not the
+  /// maps this function clears — to retire the record `NeverCreated` and answer its
+  /// barrier `Retired`, the ONE site that resolves a parked sync, caller reply and
+  /// ledger record in the same step. Which is why the ordering between this
+  /// function and that observation no longer matters: when a death is ingested
+  /// inside the settle-edge drain, the observation runs while `roots` and `handles`
+  /// still read live, and only the verdict carries the truth.
   fn retire_scope<R>(&mut self, scope: ScopeId, op_tx: &async_channel::Sender<OpResult<F::Handle>>)
   where
     R: RuntimeLite,
@@ -1797,15 +1800,22 @@ fn commit_grant(
 /// Lowers a failed ROOT arm to the registration vocabulary: the caller asked
 /// to watch a directory that was validated at spawn, so an arm failure is a
 /// race (the object vanished) or an environment limit.
+///
+/// The io error carries BOTH halves of what the caller needs: the situation in
+/// its message, and the cause in its [`kind`](std::io::Error::kind) — from
+/// [`arm_error_kind`], the same mapping [`arm_failure`] answers the
+/// `replace_root`/widen pre-arm refusals with, so a watch-limit `ENOSPC` is
+/// dispatchable as [`std::io::ErrorKind::StorageFull`] here too instead of
+/// collapsing into an untyped `Other`.
 fn arm_grant_error(err: WatchError, requested: PathBuf, root: PathBuf) -> WatchRootError {
   match err {
     WatchError::NotFound | WatchError::Gone => WatchRootError::NotFound { path: requested },
     err => WatchRootError::Source(SourceError::RootUnavailable {
       root,
-      source: std::io::Error::other(format!(
-        "the root watch could not be armed ({})",
-        err.as_str()
-      )),
+      source: std::io::Error::new(
+        arm_error_kind(err),
+        format!("the root watch could not be armed ({})", err.as_str()),
+      ),
     }),
   }
 }
@@ -2038,7 +2048,12 @@ const fn noop_outcome(reason: CoverNoop) -> CoverOutcome {
 const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
   match settle {
     CoverSettle::Applied => CoverOutcome::Applied,
-    CoverSettle::Degraded => CoverOutcome::Degraded,
+    // A caller awaiting `set_cover` asked whether coverage is complete, and a
+    // dead scope's answer to that is the one it already had before `Dead`
+    // existed: the retained cover is not proven, and the terminal `Rescan`
+    // dominates the gap. The distinction `Dead` carries is only actionable for
+    // the parked-cookie barrier, which reads the settle directly.
+    CoverSettle::Degraded | CoverSettle::Dead => CoverOutcome::Degraded,
   }
 }
 
@@ -2117,6 +2132,7 @@ fn resolve_cover_settlements<R, F>(
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   cookies: &mut CookieRegistry<F>,
   live: &dyn Fn(ScopeId) -> bool,
+  pass: SettlePass<'_>,
 ) where
   R: RuntimeLite,
   F: FsOps,
@@ -2137,25 +2153,29 @@ fn resolve_cover_settlements<R, F>(
   retire_parked_cookies(core, parked_cookies, cookies, &|_, parked| {
     parked.reply.is_canceled()
   });
-  for (fence, settle) in core.poll_cover_settlements() {
+  for (fence, settle) in core.poll_cover_settlements(pass) {
     // A missing sender is a caller dropped at close; settlement already
     // updated the core's bookkeeping either way.
     if let Some(reply) = cover_replies.remove(&fence) {
       let _ = reply.send(settle_outcome(settle));
       continue;
     }
-    // The settle-fenced cookie write. BOTH verdicts write: a `Degraded`
+    // The settle-fenced cookie write. Both LIVE verdicts write: a `Degraded`
     // settle means a WINDOW loss already stood a covering `Rescan` that
     // rides the queue ahead of this cookie, and any LEVEL-PERSISTENT
     // deficit (an arm-refused slot, an exhausted-read interior — darkness
     // that outlives its edge `Rescan`) is re-signaled below before the
     // write dispatches — so a covering `Rescan` rides the queue ahead of
     // this cookie in EVERY case, and the barrier is met by domination
-    // rather than by delivery. Only a scope that DIED loses its write (its
-    // fences degrade at teardown, and there is no stream left to report the
-    // cookie on).
+    // rather than by delivery. Only a scope that DIED loses its write, and
+    // it says so in the verdict itself (`Dead`): there is no stream left to
+    // report the cookie on.
+    //
+    // Which is why both live verdicts are minted only behind the scope's
+    // ordering proof: the cut puts whatever the kernel held — a root's own
+    // death among it — on the lane ahead of the verdict, so a scope that reads
+    // live to the dispatch below was live at the cut rather than merely unread.
     if let Some(cookie) = parked_cookies.remove(&fence) {
-      let _ = settle;
       // The obligation this fence carries: born at its sync's admission, so it is
       // always here — the routing entry above and the record move in lockstep,
       // which is why nothing below has to tolerate a missing record. Should that
@@ -2166,6 +2186,23 @@ fn resolve_cover_settlements<R, F>(
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
       };
+      // The scope died under this fence. Take the verdict's word for it rather
+      // than the liveness maps below: the teardown that produced `Dead` only
+      // QUEUED its `TeardownStream`, and `resolve_cover_settlements` runs with no
+      // `execute_effects` between, so `handles`, `root_of` and `retiring` all
+      // still read live for a scope that is already gone. Consulting them here
+      // dispatched a write and answered the caller `Ok` for a cookie no live
+      // stream could ever report — a successful but unsatisfiable barrier.
+      //
+      // Nothing physical was created for a parked cookie, so the obligation earns
+      // the same pre-physical terminal the scope-died branch below gives it, in
+      // the same step that answers the barrier. The fence needs no abandoning: it
+      // already settled to reach this line.
+      if matches!(settle, CoverSettle::Dead) {
+        lock_ledger(&cookies.ledger).retire(id, Reaped::NeverCreated);
+        let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
+        continue;
+      }
       // The root the cookie must stay inside — and, being recorded on the same
       // transitions the stream is, a second proof the scope is live.
       let Some(root) = cookies
@@ -2173,10 +2210,16 @@ fn resolve_cover_settlements<R, F>(
         .filter(|_| live(scope))
         .map(Path::to_path_buf)
       else {
-        // The scope died under the parked sync. Nothing physical was ever created
-        // for it — no write was dispatched — so the obligation earns the
-        // pre-physical terminal here, in the same step that answers its barrier.
-        // The fence needs no abandoning: it already settled to reach this line.
+        // Defence in depth for a death that reaches here WITHOUT folding into the
+        // settle: the `Dead` verdict above intercepts every teardown ordering
+        // currently constructible, because the verdict travels with the fence and
+        // so does not depend on when `TeardownStream` runs. Kept for any future
+        // death path that clears these maps without minting a verdict.
+        //
+        // Nothing physical was ever created for the sync — no write was dispatched
+        // — so the obligation earns the pre-physical terminal here, in the same
+        // step that answers its barrier. The fence needs no abandoning: it already
+        // settled to reach this line.
         lock_ledger(&cookies.ledger).retire(id, Reaped::NeverCreated);
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
@@ -2465,11 +2508,130 @@ pub(crate) enum ControlRequest {
   Disarm { watch: WatchId },
 }
 
+/// One arm's resolution out of a control batch.
+pub(crate) struct ArmResolution {
+  pub(crate) watch: WatchId,
+  pub(crate) outcome: WatchOutcome,
+}
+
+/// What one control batch came back with: its arms' resolutions, and — told
+/// apart from them — whether the executor ANSWERED it.
+///
+/// The resolutions alone cannot carry the second fact. A batch with no arms
+/// resolves nothing, so one the executor served and one whose reader died both
+/// come back empty — and the empty batch is exactly the ordering-proof round
+/// trip, whose entire meaning is that the reader reached it and cut its kernel
+/// queue onto the lane first. An empty vector must not mean both "the cut
+/// happened" and "nobody was left to cut", so
+/// [`answered`](Self::answered) travels beside the payload and picks the
+/// returning batch's [`ControlBatchEnd`] at [`submit_control_batch`].
+pub(crate) struct ControlBatchOutcome {
+  /// One entry per `Arm` in the batch, in emission order. Filled on EVERY path,
+  /// answered or not: a refused arm still returns the outcome its Monitor node
+  /// is parked on, so no registration is stranded by a batch nobody served.
+  pub(crate) resolutions: Vec<ArmResolution>,
+  /// Whether the executor answered this batch. False means the reader was gone
+  /// or died before replying, so the batch's ops are not known to have run and
+  /// nothing about the stream's ordering may be inferred from its return. A
+  /// deliberate refusal IS an answer — a batch the source declines at its
+  /// generation front-check ran nothing, and says so in every resolution.
+  pub(crate) answered: bool,
+}
+
+/// The sink one dispatched control batch reports its [`ControlBatchOutcome`]
+/// through, exactly once, from whoever ends up producing it: each arm's
+/// `WatchInstalled` and then the batch's `ControlBatchDone`, straight onto the
+/// driver's result channel.
+///
+/// It REPORTS rather than rendezvous-ing back to the thread that dispatched the
+/// batch, and that is the whole point. An executor whose reader answers batches
+/// can leave one outstanding for as long as the filesystem under it stays wedged,
+/// and a driver can hold arbitrarily many at once — one per transport a replace
+/// retired out from under a stuck reader. Anything that WAITS for such an outcome
+/// is a resource spent per stuck batch: a parked pool worker starves the live
+/// generation's arms and its ordering proof of any fixed-width pool, and a parked
+/// task competes for scheduling with the driver's own loop, whose completions
+/// must outrank command pressure. Reporting spends neither: the sink travels WITH
+/// the batch, and the thread that finally produces the outcome hands it to the
+/// driver in one non-blocking send.
+///
+/// DESTROYING the sink without a report is itself a report. The completion is
+/// emitted by the drop, so an executor that stops part-way through a batch still
+/// advances the scope's queue rather than wedging it — and what it advances the
+/// queue with is [`ControlBatchEnd::Unwound`], because how far such a batch got,
+/// and what its callers are still owed, is exactly what is unknown.
+///
+/// The two messages ride the same FIFO channel in that order, so the driver has
+/// ingested every arm result before the completion releases the scope's successor.
+pub(crate) struct ControlAnswer<H> {
+  op_tx: async_channel::Sender<OpResult<H>>,
+  scope: ScopeId,
+  /// The transport generation this batch was emitted for, echoed back so the
+  /// driver can tell this completion from one whose generation it has since
+  /// retired.
+  generation: u64,
+  /// The ordering-proof request this batch carries, echoed back so the driver can
+  /// tell this completion from a predecessor's.
+  cut_token: Option<u64>,
+  /// Overwritten only once an outcome has arrived and said which end it was. The
+  /// drop fires on an unwind too, so what this carries until then must be the end
+  /// that assumes least — and that is exactly [`ControlBatchEnd`]'s default.
+  end: ControlBatchEnd,
+}
+
+impl<H> ControlAnswer<H> {
+  /// Reports `outcome`: every arm's resolution, then — as this sink drops — the
+  /// batch's end.
+  pub(crate) fn resolve(mut self, outcome: ControlBatchOutcome) {
+    for resolution in outcome.resolutions {
+      let _ = self.op_tx.try_send(OpResult::WatchInstalled {
+        watch: resolution.watch,
+        outcome: resolution.outcome,
+        scope: self.scope,
+        generation: self.generation,
+      });
+    }
+    // An outcome ARRIVING is not enough on its own to say the batch ran: a reader
+    // that dies between dequeuing a batch and replying to it produces an outcome
+    // with nothing to show for it, and for the ordering-proof round trip — which
+    // carries no arms, so it resolves nothing either way — that outcome is
+    // indistinguishable from a served batch's. `answered` is what separates them,
+    // so it decides between the two ends an ARRIVAL can report: a batch nobody
+    // answered never licenses a cut that did not happen.
+    //
+    // Neither collapses into the destroyed-sink case. A batch that reports at all
+    // has fed every arm it carried back, refused or not, where a destroyed sink
+    // reaches that loop never — and the driver owes the two different terminals.
+    self.end = if outcome.answered {
+      ControlBatchEnd::Answered
+    } else {
+      ControlBatchEnd::Unanswered
+    };
+  }
+}
+
+impl<H> Drop for ControlAnswer<H> {
+  fn drop(&mut self) {
+    let _ = self.op_tx.try_send(OpResult::ControlBatchDone {
+      scope: self.scope,
+      generation: self.generation,
+      cut_token: self.cut_token,
+      end: self.end,
+    });
+  }
+}
+
 /// The blocking-pool side of the platform: spawn, teardown, and stat. A
 /// test implementation runs the whole driver loop against a fake filesystem.
 pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// The live-stream handle type.
   type Handle: SourceControl;
+
+  /// The transient directory handle one enumerate reads THROUGH: the arm's
+  /// `O_PATH` anchor on the descending Linux backend, and nothing at all on a
+  /// platform that lists by path. It travels to the blocking pool, so it must
+  /// be owned outright.
+  type Anchor: Send + 'static;
 
   /// Starts the native source (blocking).
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError>;
@@ -2538,7 +2700,15 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   fn remove_watch(&self, scope: ScopeId, watch: WatchId);
 
   /// Executes one scope's batch of arms/disarms (blocking) and returns each
-  /// arm's outcome, in order. The default runs them one-by-one through
+  /// arm's outcome, in order, together with whether the batch was ANSWERED at
+  /// all.
+  ///
+  /// This is the entry for a caller whose thread is its own to spend on the
+  /// executor's reply. The driver's per-scope batches take
+  /// [`dispatch_control`](Self::dispatch_control) instead, and that distinction
+  /// is a liveness one — see there.
+  ///
+  /// The default runs them one-by-one through
   /// [`add_watch`](Self::add_watch)/[`remove_watch`](Self::remove_watch) — the
   /// right shape for a fake with no transport; the real inotify source
   /// overrides it to ship the whole batch as ONE control message so N arms cost
@@ -2546,13 +2716,13 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// batch was emitted for; the real source refuses a batch whose generation
   /// no longer matches the attached port (a leftover of a replaced
   /// transport). The default ignores it — a fake answers arms itself and has
-  /// no transport to leak.
+  /// no transport to leak, so it always answers.
   fn batch_control(
     &self,
     scope: ScopeId,
     generation: u64,
     requests: Vec<ControlRequest>,
-  ) -> Vec<(WatchId, WatchOutcome)> {
+  ) -> ControlBatchOutcome {
     let _ = generation;
     let mut outcomes = Vec::new();
     for request in requests {
@@ -2563,14 +2733,49 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
           name,
           path,
           expected,
-        } => outcomes.push((
+        } => outcomes.push(ArmResolution {
           watch,
-          self.add_watch(scope, watch, parent, &path, &name, expected),
-        )),
+          outcome: self.add_watch(scope, watch, parent, &path, &name, expected),
+        }),
         ControlRequest::Disarm { watch } => self.remove_watch(scope, watch),
       }
     }
-    outcomes
+    ControlBatchOutcome {
+      resolutions: outcomes,
+      answered: true,
+    }
+  }
+
+  /// Hands one scope's control batch to the executor, arranging for `answer` to
+  /// carry the batch's outcome once it is known.
+  ///
+  /// MUST NOT WAIT FOR AN EXECUTOR'S REPLY. The caller is a worker of the shared
+  /// blocking pool, whose width [`RuntimeLite`] promises nothing about — a single
+  /// worker is a legal pool — and a backend whose READER answers batches can leave
+  /// one outstanding indefinitely: a reader already inside a syscall against a
+  /// wedged filesystem observes neither the batch nor its own shutdown until the
+  /// kernel returns. Waiting here would spend one worker per such batch, and a
+  /// driver can hold arbitrarily many at once, one for every transport a replace
+  /// retired out from under a stuck reader. Retiring a generation releases the
+  /// scope's serialization slot, so the replacement's arms and its ordering proof
+  /// are free to be submitted the instant the swap commits — but a pool those
+  /// dead waits have filled leaves them nothing to run on, and the new root stays
+  /// partially armed with every clean fence latched on a proof that never
+  /// executes. So hand the batch over, resolve `answer` from wherever the outcome
+  /// is actually produced, and return.
+  ///
+  /// The default RUNS the batch here and resolves the answer with it, which is
+  /// exactly right for an executor that answers arms itself — a fake, or any
+  /// platform with no control transport. Such a batch waits on no reader at all,
+  /// so its work is bounded by the batch and the worker is released with it.
+  fn dispatch_control(
+    &self,
+    scope: ScopeId,
+    generation: u64,
+    requests: Vec<ControlRequest>,
+    answer: ControlAnswer<Self::Handle>,
+  ) {
+    answer.resolve(self.batch_control(scope, generation, requests));
   }
 
   /// Arms `watch` at `path` on an EXPLICIT port — the not-yet-attached
@@ -2593,10 +2798,35 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
     self.add_watch(scope, watch, watch, path, name, expected)
   }
 
+  /// Takes `watch`'s transient directory anchor, TRANSFERRING ownership to the
+  /// caller. The driver calls this at the instant it dispatches the watch's
+  /// enumerate and moves the result into that one blocking job, so an anchor
+  /// belongs to exactly one read and is released by it — never left in a shared
+  /// table where a later read could find it gone.
+  ///
+  /// A `WatchId` is NOT a sufficient key for the release. An id outlives the
+  /// binding it names: loss recovery re-adds the very same id, so a read that
+  /// recovery superseded — whose blocking job cannot be cancelled — would
+  /// otherwise reach into the table on its way out and claim the anchor a LATER
+  /// arm published for a LATER read. That read then lists the absolute path
+  /// instead, which a rename can point at a different directory, and the
+  /// identities it derives bind foreign children to the original node. The
+  /// transport generation cannot separate the two: a loss re-proof re-arms on
+  /// the SAME transport, so both sides carry the identical generation.
+  ///
+  /// `None` — the default, and every executor that lists by path — means the
+  /// read falls back to the absolute path.
+  fn take_enumerate_anchor(&self, watch: WatchId) -> Option<Self::Anchor> {
+    let _ = watch;
+    None
+  }
+
   /// Reads one directory — entries with their stat facts (blocking). Reached
-  /// only under a descending profile; `watch` addresses the directory object
-  /// for executors that resolve anchors rather than paths.
-  fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate;
+  /// only under a descending profile. `watch` names the node the listing
+  /// answers for; `anchor` is the transient handle
+  /// [taken](Self::take_enumerate_anchor) for THIS read, and the listing goes
+  /// through it whenever there is one.
+  fn enumerate(&self, watch: WatchId, anchor: Option<Self::Anchor>, path: &Path) -> RawEnumerate;
 
   /// Resolves the [`RootMeta`] a same-transport widen commits with — the spawn
   /// barrier's metadata half with NO stream creation: canonicalize, pin,
@@ -2612,7 +2842,15 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
 /// The control surface of a live stream handle.
 pub(crate) trait SourceControl: Send + 'static {
-  /// Quiesces and destroys the stream (blocking, bounded).
+  /// Quiesces and destroys the stream: signals the reader and WAITS for it to
+  /// finish, so a caller that returns from here may assume nothing of this
+  /// stream is still running.
+  ///
+  /// The wait has no bound. A backend with a reader thread observes its
+  /// shutdown only between operations, so one already inside a blocking syscall
+  /// against a wedged filesystem returns when the kernel says so. That is why
+  /// the driver runs every call to this on the [`TeardownReaper`] and never on
+  /// the blocking pool the live generation's work shares.
   fn shutdown(self);
 
   /// The clonable arm/disarm port of this source, `Inert` when the backend
@@ -2855,6 +3093,12 @@ fn root_liveness_and_frame(root: &Path) -> (RootLiveness, Option<u64>) {
   (liveness, None)
 }
 
+/// Every live arm's transient `O_PATH` anchor, keyed by its watch: the owning
+/// scope (teardown reclamation) and the transport generation that published it,
+/// beside the fd.
+#[cfg(all(target_os = "linux", not(miri)))]
+type AnchorTable = BTreeMap<WatchId, (ScopeId, u64, std::os::fd::OwnedFd)>;
+
 /// The real platform: `Source::spawn` + `lstat`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RealFs {
@@ -2868,13 +3112,18 @@ pub(crate) struct RealFs {
   /// replacement's fd nor publish an anchor into the swapped scope.
   #[cfg(all(target_os = "linux", not(miri)))]
   ports: std::sync::Arc<std::sync::RwLock<BTreeMap<ScopeId, (u64, ScopePort)>>>,
-  /// Transient `O_PATH` anchors returned by arms (keyed by the globally
-  /// unique watch, valued with the owning scope for teardown reclamation),
-  /// held only until the watch's cold enumerate consumes them
-  /// (anchor-relative readdir), so fd usage stays O(in-flight operations) —
-  /// never O(tree).
+  /// Transient `O_PATH` anchors returned by arms, held only until the watch's
+  /// cold enumerate is dispatched and takes ownership of one (anchor-relative
+  /// readdir), so fd usage stays O(in-flight operations) — never O(tree).
+  ///
+  /// The recorded generation is what makes a removal safe to apply out of order.
+  /// A watch id is unique for the driver's life, but not to one WORLD: a
+  /// replace's rebind keeps the root's id and re-arms it on the new transport,
+  /// so a batch of the retired generation can name an id whose anchor now
+  /// belongs to the replacement. Stamping the publisher lets a removal tell
+  /// those apart.
   #[cfg(all(target_os = "linux", not(miri)))]
-  anchors: std::sync::Arc<std::sync::Mutex<BTreeMap<WatchId, (ScopeId, std::os::fd::OwnedFd)>>>,
+  anchors: std::sync::Arc<std::sync::Mutex<AnchorTable>>,
 }
 
 impl RealFs {
@@ -2931,7 +3180,7 @@ impl RealFs {
         .lock()
         .unwrap()
         .get(&parent)
-        .and_then(|(_, fd)| fd.try_clone().ok())
+        .and_then(|(_, _, fd)| fd.try_clone().ok())
     };
     match parent_anchor {
       Some(fd) => crate::os::linux::AnchorRequest {
@@ -2948,6 +3197,203 @@ impl RealFs {
       },
     }
   }
+
+  /// Resolves `scope`'s control port and translates one batch's requests into
+  /// the reader's ops plus the anchor-map plan the answer will be replayed
+  /// through — everything a batch can do BEFORE it reaches the reader. `Err`
+  /// carries the finished outcome of a batch that never gets that far.
+  ///
+  /// GENERATION FRONT-CHECK: a batch whose generation no longer matches the
+  /// attached port is a leftover of a transport a replace has since retired. Its
+  /// arms must NOT install on the replacement's fd (they name old-world paths),
+  /// and its disarms are moot (their kernel watches died with the old fd). The
+  /// one live case that also lands here is a kernel-recursive or teardown-racing
+  /// scope with no descending port — both refuse identically.
+  ///
+  /// The refusal is itself an ANSWER, and reports as one: it is this executor's
+  /// own decision, taken in full knowledge, and it leaves every arm resolved and
+  /// the kernel untouched. Only a reader that never spoke is unanswered.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  #[allow(clippy::type_complexity)]
+  fn translate_control(
+    &self,
+    scope: ScopeId,
+    generation: u64,
+    requests: Vec<ControlRequest>,
+  ) -> Result<
+    (
+      crate::os::linux::ControlPort,
+      Vec<crate::os::linux::ControlOp>,
+      Vec<Publication>,
+    ),
+    ControlBatchOutcome,
+  > {
+    use crate::os::linux::ControlOp;
+
+    let port = match self.ports.read().unwrap().get(&scope) {
+      Some((attached, ScopePort::Inotify(port))) if *attached == generation => port.clone(),
+      _ => {
+        return Err(ControlBatchOutcome {
+          resolutions: requests
+            .iter()
+            .filter_map(|request| match request {
+              ControlRequest::Arm { watch, .. } => Some(ArmResolution {
+                watch: *watch,
+                outcome: WatchOutcome::Failed(WatchError::Gone),
+              }),
+              ControlRequest::Disarm { .. } => None,
+            })
+            .collect(),
+          answered: true,
+        });
+      }
+    };
+
+    // Deferring the removal leaves a disarmed watch's anchor readable as a
+    // PARENT for the remainder of this translation, so a later arm under it
+    // resolves through the pinned object rather than the absolute path. That
+    // direction is the safe one: the anchor is object-pinned, and a doomed
+    // parent answers ENOENT — the same honest refusal the path fallback gives,
+    // which the Monitor's NotFound re-arm heals.
+    let mut ops = Vec::with_capacity(requests.len());
+    let mut plan = Vec::with_capacity(requests.len());
+    for request in requests {
+      match request {
+        ControlRequest::Arm {
+          watch,
+          parent,
+          name,
+          path,
+          expected,
+        } => {
+          ops.push(ControlOp::Arm(
+            self.build_arm_request(watch, parent, &path, &name, expected),
+          ));
+          plan.push(Publication::Arm(watch));
+        }
+        ControlRequest::Disarm { watch } => {
+          ops.push(ControlOp::Disarm(watch));
+          plan.push(Publication::Disarm(watch));
+        }
+      }
+    }
+    Ok((port, ops, plan))
+  }
+
+  /// Replays `plan` against the batch's answer IN THE BATCH'S OWN ORDER under the
+  /// anchors lock: each arm publishes its transient anchor (held until its cold
+  /// enumerate consumes it), each disarm applies its removal where the core placed
+  /// it. Returns the arms' resolutions in that same order, carrying the answer's
+  /// own `answered` through untouched — that is the reader's report, and the
+  /// anchor bookkeeping here neither establishes it nor can stand in for it.
+  ///
+  /// Runs wherever the outcome was produced: on the caller's thread for a
+  /// blocking batch, on the reader's for a dispatched one, and on whichever
+  /// thread destroys a batch no reader served. It takes two short locks and
+  /// touches no filesystem, so no caller of it can be delayed by anything but
+  /// another replay. Three properties it preserves, and why each still holds:
+  ///
+  /// REPLY ALIGNMENT. The replies are index-aligned to the `Arm` entries in
+  /// order, and to nothing else: the reader pushes exactly one reply per `Arm` —
+  /// including a failed one for every arm a mid-batch teardown left un-executed —
+  /// and none for a `Disarm`, and a dead reader answers one per arm as well. The
+  /// plan lists the arms in that identical order, so consuming ONE reply at each
+  /// `Arm` position and none at a `Disarm` position IS that index alignment —
+  /// walked rather than zipped.
+  ///
+  /// THE GENERATION RE-CHECK. The insert is gated on the port carrying
+  /// `generation`, re-read WHILE the anchors lock is held. A replace committing
+  /// while the batch was with the reader swaps the port under a NEW generation and
+  /// `detach_scope` purges this scope's anchors under this SAME lock, so holding it
+  /// across the check and every insert is precisely what stops a late insert from
+  /// resurrecting an anchor that purge just removed (lock order is
+  /// anchors-then-ports, as everywhere). One read covers the whole replay because
+  /// nothing releases the lock inside it. The REMOVALS are gated on the PUBLISHER
+  /// instead: a batch reclaims what its own generation (or an older one) put there,
+  /// and refuses an anchor a newer generation published. Nothing leaks either way —
+  /// the anchor a removal declines is owned by the live world, which consumes it at
+  /// its cold enumerate or purges it at `detach_scope` — while an ungated removal
+  /// would let a batch stalled across a replace close the replacement's anchor for
+  /// the one id a rebind carries between worlds, the root's.
+  ///
+  /// `ArmResolution` ORDER. Outcomes are pushed at arm positions only, and the plan
+  /// preserves the arms' relative order. Its consumers are position-sensitive —
+  /// `add_watch` takes the FIRST resolution of its single-arm batch, and
+  /// `submit_control_batch` feeds each `WatchInstalled` back in this order.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn publish_arm_anchors(
+    &self,
+    scope: ScopeId,
+    generation: u64,
+    plan: Vec<Publication>,
+    outcome: crate::os::linux::BatchOutcome,
+  ) -> ControlBatchOutcome {
+    let crate::os::linux::BatchOutcome { replies, answered } = outcome;
+    let mut outcomes = Vec::with_capacity(replies.len());
+    let mut anchors = self.anchors.lock().unwrap();
+    let still_current = self
+      .ports
+      .read()
+      .unwrap()
+      .get(&scope)
+      .is_some_and(|(attached, _)| *attached == generation);
+    let mut replies = replies.into_iter();
+    for entry in plan {
+      match entry {
+        Publication::Arm(watch) => {
+          // The reply count matches the arm count on every path above, so this
+          // never runs dry; if it somehow did, the remaining REMOVALS must still
+          // apply rather than be abandoned with their fds.
+          let Some(reply) = replies.next() else {
+            continue;
+          };
+          if let Some(anchor) = reply.anchor
+            && still_current
+          {
+            anchors.insert(watch, (scope, generation, anchor));
+          }
+          outcomes.push(ArmResolution {
+            watch,
+            outcome: reply.outcome,
+          });
+        }
+        Publication::Disarm(watch) => {
+          if anchors
+            .get(&watch)
+            .is_some_and(|(_, published, _)| *published <= generation)
+          {
+            anchors.remove(&watch);
+          }
+        }
+      }
+    }
+    ControlBatchOutcome {
+      resolutions: outcomes,
+      answered,
+    }
+  }
+}
+
+/// One control request's anchor-map mutation, recorded at translation and
+/// applied when the batch's answer comes back.
+///
+/// A disarm must NOT drop its anchor during translation. The batch has not run
+/// yet, so the anchor its own arm publishes does not exist to be dropped — and
+/// publishing every arm AFTER the batch put that insert on the far side of the
+/// removal. An `Arm(w), Disarm(w)` pair in one batch (rapid create/delete/create
+/// churn on one slot mints exactly that) therefore ended with `w`'s anchor
+/// RESURRECTED: `w`'s id is retired, so no cold enumerate ever consumes it, and
+/// its `O_PATH` fd was held for the life of the scope. Repetition walked the
+/// process to `RLIMIT_NOFILE`, where real arms and binding re-proofs start
+/// failing. Recording the order and replaying it is what makes the map end in
+/// the state the batch's own order dictates, in both directions.
+#[cfg(all(target_os = "linux", not(miri)))]
+enum Publication {
+  /// Publish `watch`'s anchor from the reply occupying this arm's position among
+  /// the batch's `Arm` entries.
+  Arm(WatchId),
+  /// Drop `watch`'s transient anchor.
+  Disarm(WatchId),
 }
 
 /// The directory a sync cookie for `dir` actually lands in: `dir` itself when it
@@ -3030,6 +3476,14 @@ pub(crate) fn cookie_dir_within_root(root: &Path, dir: &Path) -> bool {
 
 impl FsOps for RealFs {
   type Handle = SourceHandle;
+
+  /// The `O_PATH` fd an arm published. Off the descending backend no anchor is
+  /// ever minted, and an uninhabited type says so in the type system: every
+  /// `Option<Self::Anchor>` there is provably `None`.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  type Anchor = std::os::fd::OwnedFd;
+  #[cfg(not(all(target_os = "linux", not(miri))))]
+  type Anchor = std::convert::Infallible;
 
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
     if !config.backend.native_to_host() {
@@ -3177,7 +3631,7 @@ impl FsOps for RealFs {
     // anchors-then-ports.
     let mut anchors = self.anchors.lock().unwrap();
     self.ports.write().unwrap().remove(&scope);
-    anchors.retain(|_, (anchor_scope, _)| *anchor_scope != scope);
+    anchors.retain(|_, (anchor_scope, _, _)| *anchor_scope != scope);
   }
 
   // Arm/disarm route through the live source's control path (the reader owns
@@ -3210,9 +3664,10 @@ impl FsOps for RealFs {
           expected,
         }],
       )
+      .resolutions
       .into_iter()
       .next()
-      .map(|(_, outcome)| outcome)
+      .map(|resolution| resolution.outcome)
       .unwrap_or(WatchOutcome::Failed(WatchError::Gone))
   }
 
@@ -3242,89 +3697,46 @@ impl FsOps for RealFs {
   // through it, so anchor bookkeeping and the control envelope live in exactly
   // one place. The whole batch becomes ONE `Control::Batch` message, so a drain
   // cycle that produces N arms wakes the reader at most once.
+  //
+  // This is the blocking entry, for the direct single-op callers that own their
+  // thread outright. The driver's own per-scope batches take `dispatch_control`
+  // instead: same translation, same publication, but the reader's answer is
+  // awaited by nobody's thread.
   #[cfg(all(target_os = "linux", not(miri)))]
   fn batch_control(
     &self,
     scope: ScopeId,
     generation: u64,
     requests: Vec<ControlRequest>,
-  ) -> Vec<(WatchId, WatchOutcome)> {
-    use crate::os::linux::ControlOp;
+  ) -> ControlBatchOutcome {
+    match self.translate_control(scope, generation, requests) {
+      Err(refused) => refused,
+      Ok((port, ops, plan)) => self.publish_arm_anchors(scope, generation, plan, port.batch(ops)),
+    }
+  }
 
-    // GENERATION FRONT-CHECK: a batch whose generation no longer matches the
-    // attached port is a leftover of a transport a replace has since
-    // retired. Its arms must NOT install on the replacement's fd (they name
-    // old-world paths), and its disarms are moot (their kernel watches died
-    // with the old fd). The one live case that also lands here is a
-    // kernel-recursive or teardown-racing scope with no descending port —
-    // both refuse identically.
-    let port = match self.ports.read().unwrap().get(&scope) {
-      Some((attached, ScopePort::Inotify(port))) if *attached == generation => port.clone(),
-      _ => {
-        return requests
-          .iter()
-          .filter_map(|request| match request {
-            ControlRequest::Arm { watch, .. } => {
-              Some((*watch, WatchOutcome::Failed(WatchError::Gone)))
-            }
-            ControlRequest::Disarm { .. } => None,
-          })
-          .collect();
-      }
-    };
-
-    // Build the control ops in emission order, remembering each arm's watch so
-    // the reader's index-aligned replies map back to their outcomes. Disarms
-    // drop the watch's transient anchor here (the reader issues the kernel
-    // removal).
-    let mut ops = Vec::with_capacity(requests.len());
-    let mut arm_watches = Vec::new();
-    for request in requests {
-      match request {
-        ControlRequest::Arm {
-          watch,
-          parent,
-          name,
-          path,
-          expected,
-        } => {
-          ops.push(ControlOp::Arm(
-            self.build_arm_request(watch, parent, &path, &name, expected),
-          ));
-          arm_watches.push(watch);
-        }
-        ControlRequest::Disarm { watch } => {
-          self.anchors.lock().unwrap().remove(&watch);
-          ops.push(ControlOp::Disarm(watch));
-        }
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn dispatch_control(
+    &self,
+    scope: ScopeId,
+    generation: u64,
+    requests: Vec<ControlRequest>,
+    answer: ControlAnswer<Self::Handle>,
+  ) {
+    match self.translate_control(scope, generation, requests) {
+      Err(refused) => answer.resolve(refused),
+      Ok((port, ops, plan)) => {
+        // The reader owns the answer from here. It replies when it has run the
+        // batch, and a batch no reader survives to serve is answered by the
+        // message's own destruction — so the publication below runs wherever the
+        // outcome is actually produced, and this call returns to the pool with
+        // nothing of the batch still owed to the thread it was made on.
+        let ops_handle = self.clone();
+        port.dispatch(ops, move |outcome| {
+          answer.resolve(ops_handle.publish_arm_anchors(scope, generation, plan, outcome));
+        });
       }
     }
-
-    let replies = port.batch(ops);
-    // Publish each arm's transient anchor (held until its cold enumerate
-    // consumes it) under the anchors lock, re-confirming the generation still
-    // matches WHILE holding it. A replace committing during `port.batch`
-    // above swaps the port under a NEW generation; without this re-check a
-    // late insert would resurrect an anchor `detach_scope` just purged. The
-    // lock is held across the ports read so the check and the insert are
-    // atomic against `detach_scope` (which purges under the same lock).
-    let mut outcomes = Vec::with_capacity(arm_watches.len());
-    let mut anchors = self.anchors.lock().unwrap();
-    let still_current = self
-      .ports
-      .read()
-      .unwrap()
-      .get(&scope)
-      .is_some_and(|(attached, _)| *attached == generation);
-    for (watch, reply) in arm_watches.into_iter().zip(replies) {
-      if let Some(anchor) = reply.anchor
-        && still_current
-      {
-        anchors.insert(watch, (scope, anchor));
-      }
-      outcomes.push((watch, reply.outcome));
-    }
-    outcomes
   }
 
   #[cfg(all(target_os = "linux", not(miri)))]
@@ -3345,7 +3757,10 @@ impl FsOps for RealFs {
     let ops = vec![ControlOp::Arm(
       self.build_arm_request(watch, watch, path, name, expected),
     )];
-    let Some(reply) = port.batch(ops).pop() else {
+    // A pre-arm needs no `answered`: a reader that never served it answers its one
+    // arm `Failed(Io)`, and the commit is decided by that outcome alone — it
+    // refuses into the stream-replace fallback either way.
+    let Some(reply) = port.batch(ops).replies.pop() else {
       return WatchOutcome::Failed(WatchError::Gone);
     };
     // The anchor is deliberately DROPPED, not stored: the commit's
@@ -3354,6 +3769,13 @@ impl FsOps for RealFs {
     // The post-commit root enumerate falls back to path-based listing — a
     // new root renamed inside that window reads as the root dying right
     // after the swap, healed loudly by the refresh-cadence liveness check.
+    //
+    // A WIDEN pre-arm runs on the LIVE fd, where the reader's no-wrap gate
+    // applies as everywhere: an instance at its rebuild threshold is swapped
+    // for a fresh fd first, and the swap's whole-instance loss signal taints
+    // the (already-open) widen window — the commit then refuses into the
+    // stream-replace fallback, the old coverage untouched. A replace pre-arm
+    // runs on a freshly spawned fd far from the threshold.
     reply.outcome
   }
 
@@ -3362,23 +3784,36 @@ impl FsOps for RealFs {
     Source::resolve_root_meta(path)
   }
 
-  fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {
-    // Consume the watch's transient anchor when one is still held: the
-    // listing then reads THROUGH the armed object (/proc re-opens an O_PATH
-    // fd), immune to a rename between the arm and this read. The anchor
-    // closes on scope exit either way — fd usage stays O(in-flight).
-    #[cfg(all(target_os = "linux", not(miri)))]
-    {
-      use std::os::fd::AsRawFd;
-      let anchor = self.anchors.lock().unwrap().remove(&watch);
-      if let Some((_, anchor)) = anchor {
-        let via = PathBuf::from(format!("/proc/self/fd/{}", anchor.as_raw_fd()));
-        let listed = list_dir(&via);
-        drop(anchor);
-        return listed;
-      }
-    }
-    let _ = watch;
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn take_enumerate_anchor(&self, watch: WatchId) -> Option<Self::Anchor> {
+    self
+      .anchors
+      .lock()
+      .unwrap()
+      .remove(&watch)
+      .map(|(_, _, anchor)| anchor)
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn enumerate(&self, _watch: WatchId, anchor: Option<Self::Anchor>, path: &Path) -> RawEnumerate {
+    use std::os::fd::AsRawFd;
+
+    // With an anchor in hand the listing reads THROUGH the armed object
+    // (`/proc` re-opens an `O_PATH` fd), immune to a rename between the arm and
+    // this read; the path fallback is the honest best effort when the arm
+    // published none. Either way the fd is released when this read returns —
+    // and with the job if it is dropped unrun — so usage stays O(in-flight).
+    let Some(anchor) = anchor else {
+      return list_dir(path);
+    };
+    let via = PathBuf::from(format!("/proc/self/fd/{}", anchor.as_raw_fd()));
+    let listed = list_dir(&via);
+    drop(anchor);
+    listed
+  }
+
+  #[cfg(not(all(target_os = "linux", not(miri))))]
+  fn enumerate(&self, _watch: WatchId, _anchor: Option<Self::Anchor>, path: &Path) -> RawEnumerate {
     list_dir(path)
   }
 }
@@ -3478,6 +3913,34 @@ fn inode_of(meta: &std::fs::Metadata) -> (Option<std::num::NonZeroU64>, u64) {
   }
 }
 
+/// How a dispatched control batch ENDED. The completion's fail-closed policy is
+/// judged on this, so the two ways of NOT running are kept apart: they differ in
+/// how much they leave unknown, which is the whole input to that judgement.
+///
+/// [`Unwound`](Self::Unwound) is the DEFAULT because the completion is emitted by
+/// a guard that fires on drop. Until an outcome has arrived to record an end
+/// from, the only honest thing to say about the batch is that nothing is known
+/// about it, so the value carried in the meantime must be the one that assumes
+/// least.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ControlBatchEnd {
+  /// No outcome ever arrived: the executor stopped part-way through the batch,
+  /// destroying the answer sink instead of resolving it. Neither how far it got
+  /// nor which of its callers were answered survives that — the arm results ride
+  /// the outcome — and no later fact bounds either.
+  #[default]
+  Unwound,
+  /// The outcome ARRIVED, reporting that no reader served the batch: the control
+  /// channel was already closed, or the reader unwound before replying. Every arm
+  /// it carried still came back refused, so no caller is left waiting on it, and
+  /// whatever a dying reader may have half-run is confined to the one transport
+  /// the batch was addressed to.
+  Unanswered,
+  /// The executor served the batch, so its reader cut the kernel queue onto the
+  /// lane before replying — the only end that can carry an ordering proof.
+  Answered,
+}
+
 /// One blocking operation's result, shipped back to the select loop.
 enum OpResult<H> {
   Spawned {
@@ -3495,9 +3958,18 @@ enum OpResult<H> {
   TornDown {
     scope: ScopeId,
   },
+  /// One arm's outcome from a dispatched control batch. `scope` and
+  /// `generation` name the transport lane the batch was emitted for: a reply
+  /// whose generation no longer matches the scope's current lane is a
+  /// leftover of a replaced transport and is dropped whole — with root
+  /// re-adds occurring mid-life, a stale synthesized `Failed` reaching the
+  /// core against the REBOUND root (which keeps its `WatchId` across a
+  /// rebind) would spuriously invalidate the fresh world.
   WatchInstalled {
     watch: WatchId,
     outcome: WatchOutcome,
+    scope: ScopeId,
+    generation: u64,
   },
   /// A descending replace's pre-arm resolved: the new root's kernel watch on
   /// the REPLACEMENT transport installed (or refused) while the old stream
@@ -3540,6 +4012,45 @@ enum OpResult<H> {
   CookieRemoveDone {
     id: CookieId,
     confirmed: bool,
+  },
+  /// A dispatched control batch reached an end — answered, unanswered, or never
+  /// answered at all: the driver clears the scope's in-flight mark and submits its
+  /// next queued batch, so a generation's batches run strictly one-at-a-time in
+  /// emission order WITHOUT a pool worker ever blocking on another batch — the
+  /// wait lives here, in the async loop, not on a parked blocking-pool thread.
+  /// Emitted AFTER the batch's [`WatchInstalled`](OpResult::WatchInstalled)
+  /// replies (same FIFO `op_tx`), so the driver has ingested every reply before it
+  /// releases the successor; fs-driver-local, so `tributary-proto` is untouched.
+  ControlBatchDone {
+    scope: ScopeId,
+    /// The transport generation this batch was emitted for, echoed back so the
+    /// completion can be told from one belonging to a generation a replace has
+    /// since retired.
+    ///
+    /// Scope alone cannot say that. A batch of a retired generation publishes
+    /// nothing into the swapped scope, but it still completes eventually — and
+    /// a completion read as the CURRENT batch's would clear a mark it does not
+    /// own, release a successor twice over, and certify an ordering proof with
+    /// a cut taken on a transport that no longer exists.
+    generation: u64,
+    /// The ordering-proof request this batch was carrying, if any.
+    ///
+    /// A completion keyed only by scope cannot say WHICH request it answers, and
+    /// the scope's batches are a queue: a predecessor still recorded as running
+    /// can complete after a proof request has already been queued and latched,
+    /// and its cut — taken before that request existed — would license it. The
+    /// token makes the completion self-identifying, so only the batch that
+    /// actually carried the request can close it.
+    cut_token: Option<u64>,
+    /// How the batch ended: served, returned unserved, or never returned at all.
+    ///
+    /// The guard fires whether the call returns or unwinds, and a return says
+    /// nothing by itself, so neither a panic on the pool nor a reader that died
+    /// before replying can be read as a cut. The two of them are still not one
+    /// fact — an unwind leaves the kernel state it may have half-written
+    /// unknown, where an unserved return leaves nothing unknown at all — and the
+    /// completion's terminal turns on that difference.
+    end: ControlBatchEnd,
   },
 }
 
@@ -3654,6 +4165,17 @@ pub(crate) async fn run<R, F>(
   R: RuntimeLite,
   F: FsOps,
 {
+  // Secured BEFORE anything that could produce a stream. Retiring one JOINS its
+  // reader — an unbounded wait that must never run on this task — and the reaper
+  // is the only executor that can absorb it; see [`TeardownReaper`] for why
+  // counting on the blocking pool being wide is not an option. A driver that
+  // cannot get one has no honest way to retire what it would admit, so it admits
+  // nothing: it returns here, before a single source exists, and the watcher
+  // reads the closed command channel and ended event stream exactly as it reads
+  // any dead driver.
+  let Ok(reaper) = TeardownReaper::new() else {
+    return;
+  };
   let CookieWake {
     ledger,
     wake: reap_wake,
@@ -3695,14 +4217,14 @@ pub(crate) async fn run<R, F>(
   // the replace commit's covering Rescan) — its end marker is not a death.
   let mut lanes: BTreeMap<ScopeId, u64> = BTreeMap::new();
   let mut next_lane: u64 = 0;
-  // Blocking-pool work that owns — or is about to own — a native stream:
-  // spawns dispatched but not yet returned, teardowns dispatched but not yet
-  // confirmed. Close quiesces BOTH alongside the live handles: a spawn still
-  // in flight can otherwise start a native source after the close reply, and
-  // an unconfirmed teardown is a stream still winding down. Teardowns COUNT
-  // rather than flag: a replace can have the retired lane's teardown in
-  // flight while the scope is live on its successor, so one scope may owe
-  // several confirmations.
+  // Off-loop work that owns — or is about to own — a native stream: spawns
+  // dispatched to the blocking pool but not yet returned, teardowns handed to
+  // `reaper` but not yet confirmed. Close quiesces BOTH alongside the live
+  // handles: a spawn still in flight can otherwise start a native source after
+  // the close reply, and an unconfirmed teardown is a stream still winding down.
+  // Teardowns COUNT rather than flag: a replace can have the retired lane's
+  // teardown in flight while the scope is live on its successor, so one scope may
+  // owe several confirmations.
   let mut pending_spawns: BTreeSet<ScopeId> = BTreeSet::new();
   let mut pending_teardowns: BTreeMap<ScopeId, usize> = BTreeMap::new();
   // In-flight root replacements, keyed by the (live) scope being widened:
@@ -3722,6 +4244,34 @@ pub(crate) async fn run<R, F>(
   // not the fd. A grant here resolves at `WatchInstalled`, at stream
   // teardown (the scope died first), or by dropping at close (`Closed`).
   let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
+  // Each scope's CONTROL QUEUE: arm/disarm batches WAITING to dispatch behind
+  // the scope's in-flight one, in emission (FIFO) order, each carrying the
+  // transport generation it was emitted for. The batch currently RUNNING is
+  // owned by its pool closure — not held here — so this queue holds only its
+  // successors; `control_inflight` maps a scope to the GENERATION of its
+  // running batch. The driver submits a scope's next batch only when the
+  // running one's `ControlBatchDone` lands, so a generation's batches execute
+  // strictly one-at-a-time in emission order (a disarm emitted after a re-add
+  // can never run — and orphan the re-add's kernel watch + O_PATH anchor —
+  // ahead of it) WITHOUT any blocking-pool worker ever parking to wait on
+  // another batch: the wait is this driver-held queue, in the async loop, so
+  // ordering is immune to the pool's start order and worker bound (a
+  // worker-parked chain deadlocks a bounded, non-FIFO pool). Cross-scope
+  // batches stay concurrent, and so do batches separated by a transport swap —
+  // see [`kick_control_queue`] for why serializing across one would buy no
+  // ordering and cost liveness. That release is only part of the liveness: it
+  // frees the replacement's batches to be submitted, and what leaves the pool
+  // with a worker for them to run on is that a retired transport occupies none —
+  // nothing waits for its stuck batch (`ControlAnswer`) and its teardown joins on
+  // `reaper` below. Both reclaimed at teardown
+  // (scope ids are never reused); a completion for a torn-down scope finds
+  // neither and is inert.
+  // Mints one identity per ordering-proof request, so a completion can say which
+  // request it answers. Monotone for the driver's life: a token is never reused,
+  // so a stale completion can only ever fail to match.
+  let mut cut_token_seq: u64 = 0;
+  let mut pending_control: PendingControl = BTreeMap::new();
+  let mut control_inflight: ControlInflight = BTreeMap::new();
   // Awaited unwatch replies parked until the scope is fully quiescent, each
   // paired with the verdict to send then: `true` for a live scope this
   // unwatch tears down, `false` (UnknownRoot) for a scope whose root already
@@ -3772,6 +4322,7 @@ pub(crate) async fn run<R, F>(
       &ops,
       &config,
       &op_tx,
+      &reaper,
       &mut handles,
       &mut pending_spawns,
       &mut pending_teardowns,
@@ -3781,6 +4332,8 @@ pub(crate) async fn run<R, F>(
       &events,
       &mut unwatch_replies,
       &mut deferred_grants,
+      &mut pending_control,
+      &mut control_inflight,
       &mut cookies,
       &registry,
       &now,
@@ -3821,6 +4374,7 @@ pub(crate) async fn run<R, F>(
         &ops,
         &config,
         &op_tx,
+        &reaper,
         &mut handles,
         &mut pending_spawns,
         &mut pending_teardowns,
@@ -3830,6 +4384,8 @@ pub(crate) async fn run<R, F>(
         &events,
         &mut unwatch_replies,
         &mut deferred_grants,
+        &mut pending_control,
+        &mut control_inflight,
         &mut cookies,
         &registry,
         &now,
@@ -3853,11 +4409,119 @@ pub(crate) async fn run<R, F>(
       sweep_reap_requests::<R, F>(&cookies, &op_tx, &mut parked_cookies, &mut core);
     }
 
+    // The settle observation's loss fence. Loss signals ride the source
+    // queue while the arm ACKs that quiesce a barrier ride `op_rx`, and the
+    // two are UNORDERED: a source that elects a loss and then answers an arm
+    // batch (an inotify instance rebuild enqueues its whole-instance
+    // `Overflow`, swaps the fd, and only then replies to the very batch that
+    // tripped it) has its ACKs ingested by the op-first select while the
+    // loss is still queued — the stamp rule cannot refuse them (it compares
+    // against the INGESTED generation), so without this fence the
+    // observation below would certify `Applied` over bindings that loss
+    // voided, an uncorrectable oneshot. The fence: when — and only when — an
+    // observation is due, ingest everything the source had ALREADY queued at
+    // drain start, so any such loss lands first (the fence turns lossy, the
+    // reprove re-holds the barrier) and only arrivals genuinely after that
+    // instant can trail the verdict. The bound is the [`SourceSnapshot`]
+    // taken here — per-lane drain-start content, the catch-up commit's own
+    // snapshot discipline — so a producer re-enqueuing between every poll
+    // pair stretches a pass by the fair-interleave factor at most, never
+    // into an unbounded run deferring the resolve and the select below; a
+    // genuinely backlogged queue is instead worked down across re-topped
+    // passes with the resolution, effect flushes, and commands interleaved.
+    // The queued loss is inside the snapshot BY the fence's own ordering —
+    // it was enqueued before the settling ACK, which was ingested before
+    // this observation came due — so the cap can only ever exclude
+    // post-settle arrivals, and a single `Pending` poll when nothing is
+    // queued keeps the fence inert; the select's starvation fences (ops over
+    // commands over the stream) are untouched everywhere else.
+    // What the drain LEFT is what gates the resolve below, and it is deliberately
+    // not the same fact as `drained`. A `Pending` poll is NOT proof the counted
+    // items are gone: the merged stream is a `FuturesUnordered` fan-in, which may
+    // legally answer `Pending` while a ready item exists — a concurrent wake that
+    // lands mid-poll is enqueued for a LATER poll, and `poll!` takes only one. So
+    // an item counted in this snapshot can still be resident when the loop breaks,
+    // and no live verdict for its scope may rest on a lane nobody finished
+    // reading: a clean one would mint a false certificate over a loss the fence's
+    // own ordering placed INSIDE the snapshot, omitting its `Rescan`, and a lossy
+    // one would answer its caller — dispatching a parked cookie write — over a
+    // terminal `Fatal` that may be sitting in exactly those unread items.
+    //
+    // Per SCOPE, because the residue is per lane: `SourceSnapshot` budgets every
+    // live scope's lane separately, so one busy scope's backlog defers only its
+    // own windows and never a neighbour's. Deaths are unaffected either way — a
+    // teardown fold resolves through the core's already-settled list, which no
+    // deferral touches. The snapshot is retaken every pass, so the deferral cannot
+    // outlive the residue that caused it.
+    let mut source_unspent = BTreeSet::new();
+    let observed_over_drained_source = core.cover_settlement_due() && {
+      let mut snapshot = SourceSnapshot::taken(&lanes, &source_taps);
+      let mut drained = false;
+      while !snapshot.spent() {
+        let core::task::Poll::Ready(Some(item)) = futures_util::poll!(os.next()) else {
+          break;
+        };
+        snapshot.consume(item.0, item.1);
+        ingest_source_item::<F>(&mut core, &lanes, &mut replace_states, &handles, item, &now);
+        drained = true;
+      }
+      source_unspent = snapshot.unspent_scopes();
+      drained
+    };
+
     // Set-cover settlements resolve at this one choke point — after the
     // previous arm's results fed the core and their effects drained, BEFORE
     // any new command is processed — so a lossy settle's `applied_cover`
     // rewind always lands before the next reconcile computes its broadening
-    // delta, and a teardown-folded `Degraded` is delivered promptly.
+    // delta, and a teardown-folded `Dead` is delivered promptly. The
+    // barrier predicate and the loss memory this resolution reads are fed
+    // synchronously by the drain above, so resolving ahead of the drained
+    // items' effect flush stays honest — but only for the scopes the drain
+    // actually finished, which is what `source_unspent` withholds.
+    // A quiesced barrier has proven its coverage was rebuilt, not that the
+    // kernel had nothing queued while it was: the terminal proof is routinely an
+    // enumerate, which completes on the blocking pool and never crosses the
+    // reader, and a re-issued or pruning cover can quiesce with no counted work
+    // at all. Either way a record the kernel has committed but nobody has read
+    // yet sits in NO lane, so the drain above reads spent and would resolve over
+    // it.
+    //
+    // One empty batch per such fence closes it, using the cut the reader
+    // already performs before answering any batch — so the ordering is bought
+    // by the round trip, not by anything the batch carries, and no new reader
+    // mechanism appears. It rides `pending_control`, so it keeps per-scope
+    // emission order behind whatever arms are already queued; the reply flips
+    // the fence at `ControlBatchDone` and the next pass certifies honestly.
+    // Asked once per WINDOW, not per fence: a reconcile extending the window and
+    // a fence joining it both reset the latch, and the scope's coverage-work
+    // epoch moving retires whatever it holds, so a proof never outlives the work
+    // it ordered. Asked for a LOSSY window too — the cut surfaces an unread
+    // death, which a degraded verdict is as vulnerable to as a clean one, and
+    // which its cookie dispatch would otherwise be answered over. Never asked
+    // for a scope whose stream is gone. Those invalidations are also what makes
+    // the enqueue below COALESCE rather than append — see [`queue_cut_proof`].
+    for scope in core.covers_awaiting_cut() {
+      // A stream that is already gone has nothing to ask, and latching a request
+      // no batch carries would park the fence on a reply that never comes. Skip
+      // it unlatched — it reappears next pass, and if the scope stays gone its
+      // teardown folds the fence rather than leaving it waiting.
+      if !handles.contains_key(&scope) {
+        continue;
+      }
+      let lane = lanes.get(&scope).copied().unwrap_or(u64::MAX);
+      cut_token_seq += 1;
+      let token = cut_token_seq;
+      queue_cut_proof(&mut pending_control, scope, lane, token);
+      core.mark_cut_inflight(scope, token);
+      kick_control_queue::<R, F>(
+        &ops,
+        &op_tx,
+        &mut pending_control,
+        &mut control_inflight,
+        &lanes,
+        scope,
+      );
+    }
     resolve_cover_settlements::<R, F>(
       &mut core,
       &ops,
@@ -3866,11 +4530,101 @@ pub(crate) async fn run<R, F>(
       &mut parked_cookies,
       &mut cookies,
       &|scope| handles.contains_key(&scope),
+      SettlePass::Live {
+        unspent: &source_unspent,
+      },
     );
     // Reclaim canceled awaited-unwatch waiters at the same choke point, so an
     // issue-and-cancel storm against a stalled scope cannot grow its waiter
     // vector without bound.
     prune_canceled_unwatch_waiters(&mut unwatch_replies);
+
+    // The deadline is computed HERE, above both source-drain re-tops, because
+    // the bounded-service gate below has to see a DUE one. Nothing between
+    // this point and the `sleep_until` that consumes it feeds the core: the
+    // catch-up poll re-tops instead of falling through, so a pass that reaches
+    // the timer has ingested nothing since this read. Both arms live in proto-
+    // `Instant` space; the runtime conversion happens once, at the arm.
+    let due_at = min_instant(core.poll_timeout(), cookies.min_retry_at());
+
+    // THE BOUNDED-SERVICE INVARIANT, which both source-drain phases below owe:
+    // internal completions (`op_rx`), grant unwinds, commands, and the deadline
+    // are serviced within a BOUNDED number of source-drain passes — no
+    // `continue` re-top may loop indefinitely while one of them is pending. The
+    // select is the ONLY consumer of all four, so every re-top defers them; a
+    // pass of either phase is finite, but a SEQUENCE of passes is not, and an
+    // unconditional re-top under a producer that keeps any lane ready defers
+    // them forever. The two phases discharge the invariant differently, each
+    // the way its own resolution works:
+    //
+    // - the loss fence's drain (immediately below) re-tops only while NOTHING
+    //   is ready here, so its bound is ONE further pass. Its resolution is an
+    //   internal completion, so a readiness gate is exactly right: the phase
+    //   cannot progress by re-topping past the very input it waits for.
+    // - the widen catch-up's forced poll (further below) is bounded instead by
+    //   its own finite work — a prefix snapshot and a closed lane's finite tail
+    //   — and is armed on MEMBERSHIP in the phase, so no wait sub-state can be
+    //   missed. It must NOT yield to a ready command: it exists because a
+    //   saturated command mailbox keeps the select off the source arm (G4-1).
+    //
+    // Every disjunct below makes a select arm ready by construction — this loop
+    // is the sole consumer of all three channels, a closed command channel
+    // makes `recv` return `Err` (the orderly-exit edge, which an emptiness test
+    // alone would miss), and an elapsed `sleep_until` completes on its first
+    // poll — so the select cannot park in this state: it services the
+    // highest-priority ready arm and the loop re-tops with the drained items'
+    // effects flushed. The arm order (ops over commands over the stream) is
+    // untouched. The cleanup wake needs no disjunct: the loop top probes and
+    // sweeps it every pass already, re-top or not.
+    //
+    // Barrier honesty is NOT weakened by bounding the re-tops, because this
+    // gate is consulted strictly AFTER the drain and the resolve it protects.
+    // Every pass in which a settlement is due still (a) takes a fresh per-lane
+    // snapshot and drains it to exhaustion, then (b) resolves — in that order,
+    // unconditionally. A loss enqueued before the ACK that made the settlement
+    // due is therefore queued at every such pass's drain start, inside its
+    // snapshot, and ingested ahead of the verdict. What this gate changes is
+    // only what happens after the resolve: whether the pass re-tops or lets
+    // the select run first. No clean resolve can move earlier than the drain
+    // that covers it.
+    let service_ready = !op_rx.is_empty()
+      || !unwind_rx.is_empty()
+      || !commands.is_empty()
+      || commands.is_closed()
+      || due_at.is_some_and(|at| at <= now());
+
+    // Anything the loss fence drained left its effects queued and may have
+    // consumed a widen's awaited prefix tail: RE-TOP — exactly the catch-up
+    // poll's flush discipline — so `execute_effects` and the commit check run
+    // before the loop can park on them. Bounded by the invariant above: each
+    // pass consumes real queued input, and the re-top yields to the select the
+    // moment anything is ready there — so the arm ACKs and re-arm reads this
+    // fence's own clean settle waits for, the `SetCover` / `SyncRoot` reply it
+    // gates, `Close`, and the deadline are each serviced within one further
+    // pass, whatever the lane traffic.
+    //
+    // ARGUED, NOT PINNED — no cell proves the following; it is a reading of the
+    // code, recorded so a future reader can attack it rather than inherit it as
+    // fact. With the settle-edge observation gate retired, the re-top appears to
+    // be defence-in-depth rather than a liveness necessity: `cover_settlement_due`
+    // is `cover_fences.keys().any(|scope| barrier_settled(*scope))`, so arming
+    // requires a fence whose barrier is ALREADY settled; and every path that
+    // opens a NEW fence (`SetCover`, `SyncRoot`, the cookie claim) arrives
+    // through the select this re-top skips, so nothing inside a re-top run can
+    // arm it afresh.
+    //
+    // What the resolve does with an armed fence is now two-valued, and only one
+    // branch clears it: a fence still awaiting its ordering proof is DEFERRED
+    // with its entry intact, so `cover_settlement_due` stays armed across the
+    // passes that proof takes. That does not restore the necessity — a deferred
+    // fence arms the drain but the drain re-tops only on freshly DRAINED input,
+    // and a deferral drains nothing — but it does mean the re-top is no longer
+    // one-pass-bounded by the resolve alone. The gate is kept because it is
+    // correct and cheap, and because it states the accepted property directly —
+    // not because the argument above is proven.
+    if observed_over_drained_source && !service_ready {
+      continue;
+    }
 
     // Catch-up fairness (G4-1, predicate exactness G5-1): a catching-up
     // widen resolves only through source-arm progress, but the select below
@@ -3911,6 +4665,10 @@ pub(crate) async fn run<R, F>(
     // moment the resolver removes the phase. Commands — Close above all —
     // therefore wait at most that same bounded run, and the normal
     // command-over-source bias resumes at the resolution.
+    //
+    // This is that invariant's phase-2 discharge: the bound is the finite
+    // prefix plus a closed lane's finite tail, and the predicate is
+    // deliberately un-refined so no wait sub-state can be missed.
     let catching_up = replace_states.values().any(|state| {
       matches!(
         &state.mode,
@@ -3926,10 +4684,10 @@ pub(crate) async fn run<R, F>(
 
     // The one deadline arm serves BOTH the core's timer and the earliest due
     // cookie-unlink retry: an IDLE driver with one `RemoveFailed` cookie would
-    // otherwise park forever and never retry (finding 3). Both live in proto-
-    // `Instant` space; take their min, then convert once for `sleep_until`.
-    let deadline = min_instant(core.poll_timeout(), cookies.min_retry_at())
-      .map(|d| origin + d.elapsed_since_origin());
+    // otherwise park forever and never retry (finding 3). Their min was taken
+    // above the re-top gate (which needs to see a DUE deadline) in proto-
+    // `Instant` space; convert it once, here, for `sleep_until`.
+    let deadline = due_at.map(|d| origin + d.elapsed_since_origin());
     let timer = async {
       match deadline {
         Some(at) => {
@@ -4000,7 +4758,7 @@ pub(crate) async fn run<R, F>(
               };
               if let Some(err) = refusal {
                 let replace = replace_states.remove(&scope).expect("just checked");
-                retire_refused::<R, F>(&op_tx, &mut pending_teardowns, scope, spawned);
+                retire_refused::<F>(&op_tx, &reaper, &mut pending_teardowns, scope, spawned);
                 drop(replace.reservation);
                 let _ = replace.reply.send(Err(err));
                 continue;
@@ -4008,10 +4766,11 @@ pub(crate) async fn run<R, F>(
               if backend.is_kernel_recursive() {
                 let replace = replace_states.remove(&scope).expect("just checked");
                 let widened = spawned.meta.root.clone();
-                let outcome = commit_replace::<R, F>(
+                let outcome = commit_replace::<F>(
                   &mut core,
                   &ops,
                   &op_tx,
+                  &reaper,
                   &mut handles,
                   &mut lanes,
                   &mut next_lane,
@@ -4052,7 +4811,7 @@ pub(crate) async fn run<R, F>(
                 // The handle map says live but the core disagrees — refuse
                 // without committing anything.
                 let replace = replace_states.remove(&scope).expect("just checked");
-                retire_refused::<R, F>(&op_tx, &mut pending_teardowns, scope, spawned);
+                retire_refused::<F>(&op_tx, &reaper, &mut pending_teardowns, scope, spawned);
                 drop(replace.reservation);
                 let _ = replace
                   .reply
@@ -4083,7 +4842,7 @@ pub(crate) async fn run<R, F>(
                   // Unreachable: the widen route never dispatches a spawn.
                   // Retire the stray stream defensively rather than leak it.
                   debug_assert!(false, "a same-transport widen spawns nothing");
-                  retire_refused::<R, F>(&op_tx, &mut pending_teardowns, scope, spawned);
+                  retire_refused::<F>(&op_tx, &reaper, &mut pending_teardowns, scope, spawned);
                   continue;
                 }
               }
@@ -4123,7 +4882,7 @@ pub(crate) async fn run<R, F>(
                 *pending_teardowns.entry(scope).or_insert(0) += 1;
                 let tx = op_tx.clone();
                 let handle = spawned.handle;
-                R::spawn_blocking_detach(move || {
+                reaper.reap(move || {
                   handle.shutdown();
                   let _ = tx.try_send(OpResult::TornDown { scope });
                 });
@@ -4235,12 +4994,23 @@ pub(crate) async fn run<R, F>(
           OpResult::MountsRefreshed { scope, refresh } => {
             core.on_mounts_refreshed(scope, refresh, now())
           }
-          OpResult::WatchInstalled { watch, outcome } => {
-          // A deferred registration grant riding on this arm resolves FIRST,
-          // so a failed root arm answers the caller before the core's
-          // teardown effects run (which would otherwise answer it again). A
-          // deferred scope has no children yet (nothing enumerates before
-          // the root is live), so any arm landing on it IS the root's.
+          OpResult::WatchInstalled {
+            watch,
+            outcome,
+            scope,
+            generation,
+          } => {
+          // A deferred registration grant riding on this arm resolves FIRST —
+          // before the stale-transport fence below: grant ownership is
+          // scope-keyed, not lane-keyed, and the caller's registration future
+          // has exactly this reply to wait on — fencing it would strand the
+          // future forever, while answering it with a superseded arm's outcome
+          // is honest (an `Err` is a retryable refusal; an `Ok` commits a
+          // handle whose world the swap already re-arms). A failed root arm
+          // answering here also precedes the core's teardown effects, which
+          // would otherwise answer the caller again. A deferred scope has no
+          // children yet (nothing enumerates before the root is live), so any
+          // arm landing on it IS the root's.
           let deferred_scope = core
             .scope_of_watch(watch)
             .filter(|scope| deferred_grants.contains_key(scope));
@@ -4257,6 +5027,17 @@ pub(crate) async fn run<R, F>(
                 let _ = pending.reply.send(Err(arm_grant_error(err, pending.requested, root)));
               }
             }
+          }
+          // STALE-TRANSPORT FENCE, reply side (the dispatch-side twin lives in
+          // `batch_control`'s front-check): a reply whose generation no longer
+          // matches the scope's current lane answered against a transport a
+          // replace has since retired. Everything it says is old-world — above
+          // all a synthesized `Failed` for the ROOT, whose `WatchId` survives
+          // the rebind, which would invalidate the fresh world it never
+          // touched. A same-transport widen swaps no lane, so its in-flight
+          // re-adds pass untouched.
+          if lanes.get(&scope).copied() != Some(generation) {
+            continue;
           }
           core.on_watch_installed(watch, outcome);
         }
@@ -4275,13 +5056,13 @@ pub(crate) async fn run<R, F>(
           let widened = spawned.meta.root.clone();
           let outcome = if !handles.contains_key(&scope) {
             // Death wins: the scope ended while the pre-arm was in flight.
-            retire_refused::<R, F>(&op_tx, &mut pending_teardowns, scope, spawned);
+            retire_refused::<F>(&op_tx, &reaper, &mut pending_teardowns, scope, spawned);
             Err(crate::error::ReplaceRootError::Retired)
           } else if let WatchOutcome::Failed(err) = outcome {
             // The new transport could not cover the new root: unwind, the
             // old coverage untouched.
             let root = spawned.meta.root.clone();
-            retire_refused::<R, F>(&op_tx, &mut pending_teardowns, scope, spawned);
+            retire_refused::<F>(&op_tx, &reaper, &mut pending_teardowns, scope, spawned);
             Err(crate::error::ReplaceRootError::Source(
               SourceError::RootUnavailable {
                 root,
@@ -4289,10 +5070,11 @@ pub(crate) async fn run<R, F>(
               },
             ))
           } else {
-            commit_replace::<R, F>(
+            commit_replace::<F>(
               &mut core,
               &ops,
               &op_tx,
+              &reaper,
               &mut handles,
               &mut lanes,
               &mut next_lane,
@@ -4582,6 +5364,126 @@ pub(crate) async fn run<R, F>(
         }
         OpResult::CookieRemoveDone { id, confirmed } => {
           on_cookie_remove_done(&cookies, &config, id, confirmed, now(), false);
+        }
+        OpResult::ControlBatchDone {
+          scope,
+          generation,
+          cut_token,
+          end,
+        } => {
+          // The batch has reached an end — its outcome arrived, or its answer sink
+          // was destroyed unresolved — and whatever `WatchInstalled` replies it
+          // produced are already ingested, ahead of this on the FIFO channel: clear the mark
+          // and release the next queued batch, in emission order. A torn-down
+          // scope holds no queue and no mark, so this re-creates NO state and
+          // submits nothing — the completion is inert. This — not a parked pool
+          // worker — IS the serialization wait, so the mechanism never deadlocks a
+          // bounded, non-FIFO pool.
+          //
+          // Only the batch the mark NAMES may act on it. A batch whose generation
+          // a replace has retired can still be inside its syscall while the
+          // replacement's own batches run, so its completion must not clear a mark
+          // it does not own nor release a successor a second time — the mark is
+          // the newer batch's wait, and honouring it twice would put two
+          // current-generation batches on the pool at once and lose their emission
+          // order.
+          let holds_mark = control_inflight.get(&scope) == Some(&generation);
+          if holds_mark {
+            control_inflight.remove(&scope);
+          }
+          match end {
+            ControlBatchEnd::Unwound => {
+              // The batch stopped somewhere inside itself, so its native
+              // operations may have run in part and its kernel state is unknown —
+              // a later batch would be submitted over it blind. The arm results
+              // this scope's nodes are waiting on are lost with it: they are fed
+              // back on the return path, which this batch never reached.
+              //
+              // Withholding the proof is not enough on its own: a fence latched on
+              // a request whose batch died can never reach `Proven`, is no longer
+              // offered by `covers_awaiting_cut`, and would hold a live `set_cover`
+              // or sync forever. So this fails CLOSED to the one terminal that
+              // resolves everything the scope is owed: the teardown fold answers
+              // its fences `Dead`, its pending grants resolve as failures, and its
+              // queued batches are dropped rather than run over unknown state.
+              //
+              // Judged WITHOUT regard to generation, unlike everything else here.
+              // An unwind reports only that the batch stopped, so how far it got —
+              // and what its callers are still owed — is exactly what is unknown,
+              // and no generation comparison bounds that: whatever it half-wrote,
+              // it wrote through a port, and a swap since then retracts none of it.
+              pending_control.remove(&scope);
+              core.on_source_fatal(scope, now());
+            }
+            ControlBatchEnd::Unanswered if !generation_retired(&lanes, scope, generation) => {
+              // The batch belongs to the scope's CURRENT transport, and the reader
+              // that was to serve it is gone. Its own callers are answered — every
+              // arm came back refused — but the scope cannot go on: its next batch
+              // is addressed to the same absent reader, no fence of its can ever be
+              // proven, and whatever parks on one would wait forever. So the
+              // terminal is the same one an unwind takes, reached for a different
+              // reason: it is what resolves everything the scope is owed.
+              pending_control.remove(&scope);
+              core.on_source_fatal(scope, now());
+            }
+            ControlBatchEnd::Unanswered => {
+              // The reader that went missing served a transport the scope has
+              // ALREADY swapped away from, so its absence is the ordinary end of a
+              // retired world rather than a live one's failure. Whatever it may
+              // have half-run before it died, it ran against that transport's own
+              // fd, whose kernel watches die with it and whose anchors the swap
+              // purged — none of it reaches the replacement's reader, fd or queue.
+              // Failing closed here would kill a live lane on its predecessor's
+              // word, after `replace_root` has already reported success to its
+              // caller.
+              //
+              // It certifies nothing either. No reader cut a queue for it, so the
+              // mark it may have owned is released above with no proof attached and
+              // the live lane's fences still wait on a round trip of their own.
+              if holds_mark {
+                kick_control_queue::<R, F>(
+                  &ops,
+                  &op_tx,
+                  &mut pending_control,
+                  &mut control_inflight,
+                  &lanes,
+                  scope,
+                );
+              }
+            }
+            ControlBatchEnd::Answered => {
+              if holds_mark {
+                // The reader cuts its kernel queue onto the lane before answering
+                // ANY batch, so a batch that RAN and carried this scope's
+                // outstanding proof request is an ordering proof: whatever the
+                // kernel held when it was served is already ingested ahead of this
+                // completion.
+                //
+                // All three conjuncts are load-bearing. Without the token a
+                // PREDECESSOR still recorded as running could complete after a
+                // later request was queued and latched, and its cut — taken before
+                // that request existed — would license it. Without the ANSWER a
+                // batch that unwound, or whose reader died before replying, would
+                // do the same: the guard fires on the unwind, and on the very batch
+                // that carries no arms a dead reader's return carries no
+                // resolutions to give it away. And without the mark a RETIRED
+                // generation's completion would license the proof with a cut taken
+                // on a transport the scope no longer reads, which orders nothing
+                // about the one it does.
+                if let Some(token) = cut_token {
+                  core.prove_cut(scope, token);
+                }
+                kick_control_queue::<R, F>(
+                  &ops,
+                  &op_tx,
+                  &mut pending_control,
+                  &mut control_inflight,
+                  &lanes,
+                  scope,
+                );
+              }
+            }
+          }
         }
         }
       },
@@ -4924,9 +5826,21 @@ pub(crate) async fn run<R, F>(
   // channel.
   for (scope, handle) in std::mem::take(&mut handles) {
     registry.scope_dead(scope);
+    // The same detachment normal `TeardownStream` performs, at the same point
+    // relative to the registry reclaim: `attach_scope` runs only where a handle
+    // is stored, so this sweep covers every attached scope. Without it the arm
+    // port and the scope's retained anchors stay in the executor's maps until
+    // the LAST detached job holding an `ops` clone finishes — and enumerate,
+    // probe and refresh jobs are deliberately not in the close tally, so a
+    // stalled one could keep them alive long past an `Ok(0)` reply. A late
+    // control batch for the gone scope now answers the same typed refusal it
+    // answers after an ordinary teardown, which is the right answer for a
+    // transport this sweep is closing. Nothing here is counted, so the reply's
+    // arithmetic below is untouched.
+    ops.detach_scope(scope);
     *pending_teardowns.entry(scope).or_insert(0) += 1;
     let tx = op_tx.clone();
-    R::spawn_blocking_detach(move || {
+    reaper.reap(move || {
       handle.shutdown();
       let _ = tx.try_send(OpResult::TornDown { scope });
     });
@@ -4943,7 +5857,7 @@ pub(crate) async fn run<R, F>(
     {
       *pending_teardowns.entry(scope).or_insert(0) += 1;
       let tx = op_tx.clone();
-      R::spawn_blocking_detach(move || {
+      reaper.reap(move || {
         spawned.handle.shutdown();
         let _ = tx.try_send(OpResult::TornDown { scope });
       });
@@ -4977,6 +5891,13 @@ pub(crate) async fn run<R, F>(
   // time (the design's flat-base-during-close intent); a still-failing unlink
   // still ends `NotQuiesced`, only never spuriously.
   cookies.pull_retries_forward(now() + config.cookie_retry_base);
+  // The grace is ONE budget, and the drain below spends it in two places, so it
+  // is anchored once here on the clock the blocking work it is waiting for
+  // actually runs against. `R::timeout` bounds the wait for everything that
+  // reports over `op_rx`; this deadline bounds the wait for the reaper, whose
+  // threads no runtime timer governs.
+  let grace = Duration::from_secs(1);
+  let grace_ends = std::time::Instant::now() + grace;
   let drain = async {
     loop {
       // The LIVE-ledger quiescence condition: every cookie obligation — a write
@@ -4986,6 +5907,30 @@ pub(crate) async fn run<R, F>(
       // could create anything, and only a typed terminal removes it.
       if pending_teardowns.is_empty() && pending_spawns.is_empty() && cookies.unremoved() == 0 {
         break;
+      }
+      // Teardown completions arrive over `op_rx` like every other result, but
+      // they are PRODUCED by reaper threads, which no runtime timer governs.
+      // Parking on the channel alone would therefore let a runtime whose timer is
+      // virtual retire the whole grace before those threads had any real time at
+      // all, and close would report a teardown outstanding that was microseconds
+      // from done. So the drain buys them time on their own clock — but one SHORT
+      // SLICE per round, never the rest of the grace. That wait is synchronous:
+      // spending the grace inside it would let a single wedged teardown stop close
+      // from consuming the completions that already landed and from servicing a
+      // due cookie retry, and on a current-thread runtime it would hold the
+      // executor outright for a second. Every slice is clipped to the shared
+      // deadline, so all of them together still spend one grace; the round arm
+      // below returns the drain here for the next one; and the loop's own exit
+      // condition is unchanged, so close still observes every teardown before it
+      // reports quiesced. Every teardown a slice returns on has already sent its
+      // `TornDown`, so the arms below pick those completions up without waiting.
+      let awaiting_reaper = !pending_teardowns.is_empty();
+      // A result already queued is progress the drain can make without spending
+      // any real time at all, so it takes that first.
+      if awaiting_reaper && op_rx.is_empty() {
+        reaper.settle(
+          REAPER_GRACE_SLICE.min(grace_ends.saturating_duration_since(std::time::Instant::now())),
+        );
       }
       futures_util::select_biased! {
         res = op_rx.recv().fuse() => match res {
@@ -5006,7 +5951,9 @@ pub(crate) async fn run<R, F>(
             }
           }
           Ok(OpResult::Probed { probe, outcome }) => core.on_probe_result(probe, outcome, now()),
-          Ok(OpResult::WatchInstalled { watch, outcome }) => {
+          Ok(OpResult::WatchInstalled { watch, outcome, .. }) => {
+            // Every scope is ending here, so a stale reply can only
+            // accelerate a teardown already owed — no lane fence needed.
             core.on_watch_installed(watch, outcome);
           }
           Ok(OpResult::Enumerated { req, raw }) => core.on_enumerated(req, raw),
@@ -5023,7 +5970,7 @@ pub(crate) async fn run<R, F>(
             if let Ok(spawned) = result {
               *pending_teardowns.entry(scope).or_insert(0) += 1;
               let tx = op_tx.clone();
-              R::spawn_blocking_detach(move || {
+              reaper.reap(move || {
                 spawned.handle.shutdown();
                 let _ = tx.try_send(OpResult::TornDown { scope });
               });
@@ -5059,6 +6006,11 @@ pub(crate) async fn run<R, F>(
           Ok(OpResult::CookieRemoveDone { id, confirmed }) => {
             on_cookie_remove_done(&cookies, &config, id, confirmed, now(), true);
           }
+          // A control batch finished during the grace: every scope is ending,
+          // so the queue does not advance — its remaining batches are the
+          // documented best-effort remainder that dies with the core (arms leave
+          // a dead node Arming; disarms are moot once the fd closes). Inert.
+          Ok(OpResult::ControlBatchDone { .. }) => {}
           Err(_) => break,
         },
         // Service due cookie-unlink retries inside the grace. No arm fires when
@@ -5074,6 +6026,20 @@ pub(crate) async fn run<R, F>(
         .fuse() => {
           dispatch_due_cookie_retries::<R, F>(&cookies, &op_tx, now());
         },
+        // Ends the round while a teardown is outstanding, so the drain goes back
+        // for another slice above instead of parking on arms that no executor
+        // this runtime schedules is feeding. Inert once the teardowns are done —
+        // everything left then reports over a clock the runtime does govern — and
+        // bounded by the close timeout either way, so it can neither spin nor
+        // stretch the grace.
+        () = async {
+          if awaiting_reaper {
+            R::sleep(REAPER_GRACE_SLICE).await;
+          } else {
+            futures_util::future::pending::<()>().await;
+          }
+        }
+        .fuse() => {},
       }
     }
   };
@@ -5092,12 +6058,13 @@ pub(crate) async fn run<R, F>(
   // non-quiescent. One shared grace for all: a wedged FFI or FS call rarely
   // unwedges with more time, so a longer window would only delay the honest
   // signal.
-  let _ = R::timeout(Duration::from_secs(1), drain).await;
+  let _ = R::timeout(grace, drain).await;
   execute_effects::<R, F>(
     &mut core,
     &ops,
     &config,
     &op_tx,
+    &reaper,
     &mut handles,
     &mut pending_spawns,
     &mut pending_teardowns,
@@ -5107,17 +6074,46 @@ pub(crate) async fn run<R, F>(
     &events,
     &mut unwatch_replies,
     &mut deferred_grants,
+    &mut pending_control,
+    &mut control_inflight,
     &mut cookies,
     &registry,
     &now,
   );
-  // One final settlement poll: a fence whose re-arm work quiesced during the
-  // drain resolves with its honest verdict instead of spuriously reading as
-  // `Closed`. Whatever is still pending drops with `cover_replies` — the
-  // ratified close-mid-fence semantics: the caller sees `Closed`, never an
-  // outcome fabricated over a torn-down driver. No cookie can be dispatched
-  // here (no scope is live to this poll, and shutdown already refuses claims),
-  // so the registry may retire next.
+  // One final settlement poll: a DEGRADED fence whose re-arm work quiesced
+  // during the drain resolves with its honest verdict instead of spuriously
+  // reading as `Closed`. Whatever is still pending drops with `cover_replies`
+  // — the ratified close-mid-fence semantics: the caller sees `Closed`, never
+  // an outcome fabricated over a torn-down driver. A CLEAN fence is `Closed`
+  // here too, by the same rule: this poll runs as [`SettlePass::Closing`], and
+  // the sweep above tore every stream down — there is no stream left to
+  // certify against, so the boundary withholds the verdict rather than
+  // certifying over a scope it is tearing down. `Closed` is the
+  // honest no-verdict; the degraded resolutions (the common close-mid-recovery
+  // shape) are untouched — and unlike the live loop's pass, this one defers
+  // NOTHING for a lane it did not finish reading, because it is the last pass
+  // there will ever be and a held-over fence would strand its caller here.
+  // No cookie can be dispatched here (no scope is live to this
+  // poll, and shutdown already refuses claims), so the registry may retire
+  // next. The drain above serviced only `op_rx`, so the same loss fence the
+  // live loop's settle observation holds applies here: an ACK that landed during
+  // the grace can postdate a loss still on the source queue, and an honest
+  // verdict must ingest that loss first — bounded by the same
+  // [`SourceSnapshot`], which holds every such loss (it was queued before
+  // its ACK, so before this drain starts) while keeping a producer still
+  // feeding a lane from wedging close past its grace. The drained items'
+  // effects die with the core — the documented best-effort remainder — but
+  // their loss memory and barrier state feed this poll.
+  if core.cover_settlement_due() {
+    let mut snapshot = SourceSnapshot::taken(&lanes, &source_taps);
+    while !snapshot.spent() {
+      let core::task::Poll::Ready(Some(item)) = futures_util::poll!(os.next()) else {
+        break;
+      };
+      snapshot.consume(item.0, item.1);
+      ingest_source_item::<F>(&mut core, &lanes, &mut replace_states, &handles, item, &now);
+    }
+  }
   resolve_cover_settlements::<R, F>(
     &mut core,
     &ops,
@@ -5126,6 +6122,7 @@ pub(crate) async fn run<R, F>(
     &mut parked_cookies,
     &mut cookies,
     &|_| false,
+    SettlePass::Closing,
   );
   // The close reply counts every distinct outstanding obligation exactly once:
   // a straggler teardown/spawn, and every cookie obligation the ledger still
@@ -5183,20 +6180,332 @@ fn scope_quiesced<H>(
     && !replace_states.contains_key(&scope)
 }
 
+/// The most reaper threads one driver may hold at once, the baseline thread
+/// included. A teardown is short on a healthy filesystem and a driver usually
+/// retires one stream at a time, so this cap binds only when several transports
+/// are wedged simultaneously; what it is here for is root churn, which can
+/// retire streams faster than they finish quiescing and would otherwise grow
+/// threads without bound. Past the cap teardowns queue and start as reapers free
+/// up.
+const MAX_TEARDOWN_REAPERS: usize = 4;
+
+/// How much REAL time one close-drain round hands to the teardown reaper before
+/// returning to the drain's own arms.
+///
+/// Short enough that a wedged teardown delays a landed completion or a due
+/// cookie retry by no more than a round, long enough that a healthy one — an OS
+/// thread's scheduling plus a `close(2)` — usually finishes inside the first,
+/// and either way it divides the close grace into a bounded number of rounds.
+const REAPER_GRACE_SLICE: Duration = Duration::from_millis(5);
+
+#[cfg(test)]
+thread_local! {
+  /// Test seam: while set, a [`TeardownReaper`] built on this thread refuses
+  /// every thread creation, standing in for an OS that will not give the driver
+  /// one.
+  ///
+  /// A driver's reaper is built in the driver's own prologue, on the first poll
+  /// of its task, so arming this on the thread a current-thread runtime drives
+  /// that task from reaches exactly that driver — and no other, since the flag
+  /// never leaves the thread it was set on.
+  static REFUSE_REAPER_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The executor stream teardowns run on — deliberately NOT the runtime's
+/// blocking pool.
+///
+/// Tearing a stream down JOINS its reader thread, and that wait has no bound:
+/// the reader observes its shutdown only BETWEEN operations, so one already
+/// admitted into a blocking syscall against a wedged filesystem (a hung mount, a
+/// dead NFS server) returns when the kernel says so and not before. The blocking
+/// pool is where the LIVE generation's control batches, spawns and enumerates
+/// run, and [`RuntimeLite`] promises nothing about its width — a handful of
+/// workers is a legal pool, and the control queue's ordering argument already
+/// assumes exactly that.
+///
+/// Sharing the two would let a scope's DEAD transports hold the workers its LIVE
+/// one needs. A join parked on a wedged reader occupies a worker for as long as
+/// the filesystem stays wedged, and root churn retires transports faster than
+/// they quiesce, so enough of them occupy any bounded pool — and then a committed
+/// replacement's arms and its ordering proof, work nothing is serializing any
+/// more, simply never start: the new root stays partially armed and every fence
+/// waits on a proof that has no worker to run on. Releasing the serialization
+/// slot across a transport swap frees that work LOGICALLY; running the joins off
+/// the pool is one of the two things that leave capacity for it to actually run.
+/// The other is that a control batch's own wait for its reader costs no worker
+/// either — see [`FsOps::dispatch_control`].
+///
+/// The FIRST thread is secured when the reaper is built, before the driver has
+/// admitted a single source, and lives until the reaper drops. That ordering is
+/// what makes submission TOTAL: a teardown can never be handed to a reaper with
+/// no thread to run it on, so submission never has to choose between running an
+/// unbounded join on its caller — the driver's own task, and on a current-thread
+/// runtime the whole executor with it — and abandoning a live stream. A driver
+/// that cannot secure the baseline can uphold none of this and admits nothing.
+///
+/// Beyond the baseline, threads are created on demand up to
+/// [`MAX_TEARDOWN_REAPERS`] and then reused, so a driver retiring one stream at a
+/// time holds exactly one. They live until the reaper drops with the driver loop,
+/// which is also why that drop only signals: joining them there would import the
+/// very unbounded wait this type exists to keep off the driver's executors, at
+/// the moment the driver is leaving.
+///
+/// Moving the joins off the pool must not change WHETHER close observes them, so
+/// the reaper also tracks how many teardowns are still unfinished and lets close
+/// park on that count for short slices of its grace — see [`Self::settle`].
+struct TeardownReaper {
+  inner: Arc<ReaperInner>,
+}
+
+struct ReaperInner {
+  state: Mutex<ReaperState>,
+  ready: std::sync::Condvar,
+  settled: std::sync::Condvar,
+  /// Every thread creation against this reaper fails. Test-only: see
+  /// [`REFUSE_REAPER_THREADS`].
+  #[cfg(test)]
+  refuse_threads: bool,
+}
+
+struct ReaperState {
+  /// Teardowns submitted but not yet claimed by a reaper, oldest first.
+  queue: VecDeque<Box<dyn FnOnce() + Send>>,
+  /// Reapers alive: running a teardown or on their way to the queue for one.
+  threads: usize,
+  /// Reapers INSIDE a teardown. Every other live reaper is headed for the queue,
+  /// so `threads - busy` is exactly how many of the queued teardowns already have
+  /// a claimant — a growth signal that holds a steady driver at its baseline
+  /// thread without depending on a just-created thread having reached its wait.
+  busy: usize,
+  /// Teardowns submitted whose closure has not yet returned — queued ones
+  /// included, so a teardown waiting behind the thread cap counts exactly like
+  /// one already inside its join.
+  outstanding: usize,
+  /// No further teardown will be submitted, so a reaper that finds the queue
+  /// empty exits instead of waiting. Queued work still drains first.
+  closed: bool,
+}
+
+impl TeardownReaper {
+  /// Builds a reaper holding its baseline thread.
+  ///
+  /// # Errors
+  ///
+  /// The OS refused the thread. The caller has no executor that can absorb a
+  /// stream teardown and so must not start one.
+  fn new() -> std::io::Result<Self> {
+    let inner = Arc::new(ReaperInner {
+      // The baseline counts as alive from here, before it exists, so the growth
+      // rule below never mistakes a thread that has not reached its wait yet for
+      // one the driver still owes.
+      state: Mutex::new(ReaperState {
+        queue: VecDeque::new(),
+        threads: 1,
+        busy: 0,
+        outstanding: 0,
+        closed: false,
+      }),
+      ready: std::sync::Condvar::new(),
+      settled: std::sync::Condvar::new(),
+      #[cfg(test)]
+      refuse_threads: REFUSE_REAPER_THREADS.with(std::cell::Cell::get),
+    });
+    spawn_reaper(&inner)?;
+    Ok(Self { inner })
+  }
+
+  /// A reaper holding NO thread and refusing to create one — the state
+  /// [`Self::new`] refuses to return, built directly so a cell can pin what
+  /// submission does when the OS will not give the driver a thread.
+  ///
+  /// Gated exactly as the suite that calls it: the driver's cells need a
+  /// runtime, so on a build carrying a different one this has no caller and
+  /// would read as dead code.
+  #[cfg(all(test, feature = "tokio"))]
+  fn without_threads() -> Self {
+    Self {
+      inner: Arc::new(ReaperInner {
+        state: Mutex::new(ReaperState {
+          queue: VecDeque::new(),
+          threads: 0,
+          busy: 0,
+          outstanding: 0,
+          closed: false,
+        }),
+        ready: std::sync::Condvar::new(),
+        settled: std::sync::Condvar::new(),
+        refuse_threads: true,
+      }),
+    }
+  }
+
+  /// Queues `teardown` for a reaper thread.
+  ///
+  /// Never runs it here, on any path. The caller is the driver's own task, and
+  /// the join a teardown performs has no bound, so executing one on this side of
+  /// the handoff is precisely the freeze this type exists to prevent.
+  ///
+  /// The teardown is never abandoned either. Dropping the closure would drop the
+  /// stream handle it carries, and that handle's own `Drop` performs the SAME
+  /// join — wherever the drop happened, and with no `TornDown` to show for it —
+  /// so there is no such thing as cheaply discarding one. It is queued, counted
+  /// among the outstanding teardowns from here, and claimed by a reaper: the
+  /// baseline thread guarantees one exists to claim it.
+  fn reap(&self, teardown: impl FnOnce() + Send + 'static) {
+    let mut state = self.lock();
+    state.queue.push_back(Box::new(teardown));
+    state.outstanding += 1;
+    // One reaper per teardown that has no claimant yet, up to the cap: every live
+    // reaper not inside a teardown is already headed for the queue, so a steady
+    // driver stays at its baseline thread and a burst grows only as far as the
+    // cap.
+    let grow =
+      state.queue.len() > state.threads - state.busy && state.threads < MAX_TEARDOWN_REAPERS;
+    if grow {
+      state.threads += 1;
+    }
+    drop(state);
+    self.inner.ready.notify_one();
+    if !grow {
+      return;
+    }
+    if spawn_reaper(&self.inner).is_err() {
+      // The OS refused a thread. Hand the reservation back and leave the teardown
+      // queued: the baseline reaper — or any other still alive — inherits it on
+      // finishing its own, and until then it stays counted, so close reports it
+      // rather than losing it.
+      self.lock().threads -= 1;
+    }
+  }
+
+  /// Gives the reaper threads up to `budget` of REAL time, returning as soon as
+  /// one of the outstanding teardowns completes — or at once when none is
+  /// outstanding. Reports whether every teardown submitted so far has RUN TO
+  /// COMPLETION: its join returned and its `TornDown` already handed to the
+  /// driver's result channel.
+  ///
+  /// Close needs this because the two waits it can perform are on different
+  /// clocks. Every completion reaches the driver over its result channel, but
+  /// the teardown ones are produced by reaper threads, whose progress the
+  /// runtime's timer does not track: a runtime whose timer is virtual may retire
+  /// the entire close grace while those threads have had no real time at all,
+  /// and close would then report a teardown outstanding that was microseconds
+  /// from done. So the drain buys them time on the clock they actually run
+  /// against.
+  ///
+  /// This parks the CALLER, which is the driver's own task, so whatever budget a
+  /// caller passes is time the driver spends servicing nothing else — hence a
+  /// SLICE, spent repeatedly, rather than one whole grace at once. It touches no
+  /// blocking-pool worker, so it cannot recreate the contention this type exists
+  /// to prevent.
+  fn settle(&self, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    let mut state = self.lock();
+    // Any completion is progress the caller can act on — its `TornDown` is
+    // already queued — so the wait ends there rather than holding out for the
+    // wedged remainder.
+    let entered = state.outstanding;
+    while state.outstanding > 0 && state.outstanding == entered {
+      let now = std::time::Instant::now();
+      if now >= deadline {
+        return false;
+      }
+      (state, _) = self
+        .inner
+        .settled
+        .wait_timeout(state, deadline - now)
+        .unwrap_or_else(PoisonError::into_inner);
+    }
+    state.outstanding == 0
+  }
+
+  fn lock(&self) -> MutexGuard<'_, ReaperState> {
+    self
+      .inner
+      .state
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+  }
+}
+
+/// Starts one reaper thread against `inner`, which must already be counted in
+/// [`ReaperState::threads`].
+fn spawn_reaper(inner: &Arc<ReaperInner>) -> std::io::Result<()> {
+  #[cfg(test)]
+  {
+    if inner.refuse_threads {
+      return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+    }
+  }
+  let inner = Arc::clone(inner);
+  std::thread::Builder::new()
+    .name("tributary-teardown".to_owned())
+    .spawn(move || reap_loop(&inner))
+    .map(drop)
+}
+
+/// Retires one teardown from the outstanding count and frees the reaper that ran
+/// it, waking [`TeardownReaper::settle`]. Called only after the teardown's closure
+/// has RETURNED, so a settle that observes the drop also observes the `TornDown`
+/// that closure sent.
+fn finish_teardown(inner: &ReaperInner) {
+  let mut state = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
+  state.busy -= 1;
+  state.outstanding -= 1;
+  drop(state);
+  inner.settled.notify_all();
+}
+
+impl Drop for TeardownReaper {
+  fn drop(&mut self) {
+    let mut state = self.lock();
+    state.closed = true;
+    drop(state);
+    self.inner.ready.notify_all();
+  }
+}
+
+fn reap_loop(inner: &ReaperInner) {
+  loop {
+    let teardown = {
+      let mut state = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
+      loop {
+        if let Some(teardown) = state.queue.pop_front() {
+          state.busy += 1;
+          break teardown;
+        }
+        if state.closed {
+          state.threads -= 1;
+          return;
+        }
+        state = inner
+          .ready
+          .wait(state)
+          .unwrap_or_else(PoisonError::into_inner);
+      }
+    };
+    // Run outside the lock: this call is the unbounded join the reaper exists to
+    // absorb, and holding the lock across it would park every submission — the
+    // driver's own task included — behind the wedged filesystem.
+    teardown();
+    finish_teardown(inner);
+  }
+}
+
 /// Retires a spawned-but-refused replacement stream inside the counted
 /// teardown accounting: it never becomes the scope's lane.
-fn retire_refused<R, F>(
+fn retire_refused<F>(
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  reaper: &TeardownReaper,
   pending_teardowns: &mut BTreeMap<ScopeId, usize>,
   scope: ScopeId,
   spawned: SpawnedSource<F::Handle>,
 ) where
-  R: RuntimeLite,
   F: FsOps,
 {
   *pending_teardowns.entry(scope).or_insert(0) += 1;
   let tx = op_tx.clone();
-  R::spawn_blocking_detach(move || {
+  reaper.reap(move || {
     spawned.handle.shutdown();
     let _ = tx.try_send(OpResult::TornDown { scope });
   });
@@ -5264,16 +6573,28 @@ fn widen_predicate(old: &Path, new: &Path) -> bool {
   })
 }
 
-/// Lowers a pre-arm refusal into the io flavor
-/// [`SourceError::RootUnavailable`] carries.
-fn arm_failure(err: WatchError) -> std::io::Error {
-  let kind = match err {
+/// The io flavor an arm refusal lowers to — the ONE mapping every arm-failure
+/// reply uses, so a consumer dispatches on the cause identically whichever
+/// path answered it: [`arm_failure`] (the `replace_root`/widen pre-arm
+/// replies) and [`arm_grant_error`] (`watch()`'s deferred root grant). These
+/// two must not diverge again: lowering either through
+/// `std::io::Error::other` stamps [`std::io::ErrorKind::Other`]
+/// unconditionally, which erases the difference between a watch-limit
+/// `ENOSPC`, a permission refusal and a plain I/O failure on that path alone,
+/// leaving the cause readable only as a substring of the message.
+const fn arm_error_kind(err: WatchError) -> std::io::ErrorKind {
+  match err {
     WatchError::NotFound | WatchError::Gone => std::io::ErrorKind::NotFound,
     WatchError::Permission => std::io::ErrorKind::PermissionDenied,
     WatchError::NoSpace => std::io::ErrorKind::StorageFull,
     _ => std::io::ErrorKind::Other,
-  };
-  std::io::Error::new(kind, err.as_str())
+  }
+}
+
+/// Lowers a pre-arm refusal into the io flavor
+/// [`SourceError::RootUnavailable`] carries.
+fn arm_failure(err: WatchError) -> std::io::Error {
+  std::io::Error::new(arm_error_kind(err), err.as_str())
 }
 
 /// Applies one source-lane message to the core — the ONE body both the run
@@ -5355,6 +6676,96 @@ fn ingest_source_item<F: FsOps>(
         core.on_source_fatal(scope, now());
       }
     }
+  }
+}
+
+/// The settle-edge loss fence's drain bound: how much each CURRENT delivery
+/// lane held when a drain pass began — the same drain-start snapshot
+/// discipline the widen catch-up commit uses ([`SameFdPhase::CatchUp`]'s
+/// `remaining`), so a producer re-enqueuing between consecutive driver polls
+/// extends a pass only by the merged stream's fair-interleave factor, never
+/// indefinitely.
+///
+/// The bound is per lane, not one global count, and that is load-bearing:
+/// [`SelectAll`] interleaves READY lanes fairly rather than globally FIFO, so
+/// under a total-count cap a burst arriving on one lane after the snapshot
+/// could spend the whole cap while an item queued BEFORE the snapshot on
+/// another lane — the loss the fence exists to ingest — was still waiting its
+/// rotation. Per-lane budgets make the pass end (short of the queue going
+/// momentarily empty, the strictly stronger exit) only once every lane has
+/// yielded everything it held at the snapshot, whatever the interleaving.
+///
+/// Soundness (the fence's happens-before): a loss enqueued before the ACK
+/// that armed the settle observation is still queued — on its live scope's
+/// current lane, whose tap counts it — when the snapshot is taken, so it is
+/// inside the budget and the pass cannot end before ingesting it. What the
+/// budget excludes is exactly the arrivals AFTER drain start, which postdate
+/// that ACK and legitimately trail the verdict. Items outside every budget
+/// (a retired lane's finite, sender-less stragglers; post-snapshot arrivals)
+/// are still ingested when yielded — they just don't extend the pass.
+///
+/// Termination: every budget unit is backed by an item the merged stream
+/// will yield — `len()` counts queued messages whose sole consumer is this
+/// task, and the `is_closed` unit counts the lane's `None` end marker, which
+/// fires once the queue empties (a tap whose marker was already consumed is
+/// removed with its lane by the teardown flush before the next pass, so no
+/// unit is ever phantom). A backed lane stays ready until it yields, and the
+/// fair interleave yields it within one rotation, so a pass polls at most
+/// (outstanding × lanes)-ish items before every budget is spent.
+struct SourceSnapshot {
+  /// Items still owed per `(scope, current lane)` — absent means spent, or
+  /// never counted (a retired lane, a lane that was empty at the snapshot).
+  budgets: BTreeMap<(ScopeId, u64), usize>,
+  /// The sum of `budgets` — the pass ends when it reaches zero.
+  outstanding: usize,
+}
+
+impl SourceSnapshot {
+  /// Counts what every live scope's current lane holds RIGHT NOW: the tap's
+  /// queued length, plus one for a closed lane's still-queued end marker.
+  fn taken(lanes: &BTreeMap<ScopeId, u64>, source_taps: &BTreeMap<ScopeId, EventReceiver>) -> Self {
+    let mut budgets = BTreeMap::new();
+    let mut outstanding = 0;
+    for (scope, tap) in source_taps {
+      let Some(lane) = lanes.get(scope) else {
+        continue;
+      };
+      let queued = tap.len() + usize::from(tap.is_closed());
+      if queued > 0 {
+        budgets.insert((*scope, *lane), queued);
+        outstanding += queued;
+      }
+    }
+    Self {
+      budgets,
+      outstanding,
+    }
+  }
+
+  /// Spends one budget unit for a yielded item; an untracked or already-spent
+  /// lane's item costs nothing (it is post-snapshot or a retired straggler).
+  fn consume(&mut self, scope: ScopeId, lane: u64) {
+    if let Some(budget) = self.budgets.get_mut(&(scope, lane)) {
+      *budget -= 1;
+      self.outstanding -= 1;
+      if *budget == 0 {
+        self.budgets.remove(&(scope, lane));
+      }
+    }
+  }
+
+  /// Whether every counted item has been drained — the pass's bound.
+  fn spent(&self) -> bool {
+    self.outstanding == 0
+  }
+
+  /// The scopes whose lane still owes items — a spent budget is removed by
+  /// [`consume`](Self::consume), so a scope drops out the instant its counted
+  /// items are all ingested. This is the settlement pass's withholding set:
+  /// per scope, because a lane's residue says nothing about any other scope's
+  /// window.
+  fn unspent_scopes(&self) -> BTreeSet<ScopeId> {
+    self.budgets.keys().map(|(scope, _)| *scope).collect()
   }
 }
 
@@ -5594,10 +7005,11 @@ where
 /// commit then replays the pre-armed root outcome (`replay`) so the rebound
 /// root's re-arm-flavored rebuild starts on the new transport.
 #[allow(clippy::too_many_arguments)]
-fn commit_replace<R, F>(
+fn commit_replace<F>(
   core: &mut DriverCore,
   ops: &F,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  reaper: &TeardownReaper,
   handles: &mut BTreeMap<ScopeId, F::Handle>,
   lanes: &mut BTreeMap<ScopeId, u64>,
   next_lane: &mut u64,
@@ -5615,7 +7027,6 @@ fn commit_replace<R, F>(
   now: &impl Fn() -> Instant,
 ) -> Result<BackendKind, crate::error::ReplaceRootError>
 where
-  R: RuntimeLite,
   F: FsOps,
 {
   use crate::error::ReplaceRootError;
@@ -5635,16 +7046,20 @@ where
       existing,
     };
     // Refused: the new stream never becomes the scope's lane.
-    retire_refused::<R, F>(op_tx, pending_teardowns, scope, spawned);
+    retire_refused::<F>(op_tx, reaper, pending_teardowns, scope, spawned);
     return Err(err);
   }
 
   // Make-before-break: the new stream is live; retire the old one now,
-  // inside the counted accounting.
+  // inside the counted accounting. The retirement goes to the reaper rather
+  // than the blocking pool because the old reader is exactly the thread the
+  // replacement is being spawned to escape: joining it there would let a
+  // stuck-on-a-dead-filesystem transport consume the workers the replacement's
+  // own arms and ordering proof need (see [`TeardownReaper`]).
   if let Some(old) = handles.remove(&scope) {
     *pending_teardowns.entry(scope).or_insert(0) += 1;
     let tx = op_tx.clone();
-    R::spawn_blocking_detach(move || {
+    reaper.reap(move || {
       old.shutdown();
       let _ = tx.try_send(OpResult::TornDown { scope });
     });
@@ -5809,6 +7224,296 @@ where
   }
 }
 
+/// One scope's queued control batches: the lane generation each was emitted
+/// under, its ops, and the ordering-proof request it carries (`None` for an
+/// ordinary arm or disarm batch, which owes no proof).
+///
+/// The deque carries ONE invariant, which both enqueue paths
+/// ([`queue_control_batch`] and [`queue_cut_proof`]) restore before they return:
+/// no two ADJACENT ordinary entries share a generation. Proofs are themselves
+/// coalesced to at most one per scope, so that caps the queue at one ordinary
+/// entry per generation it carries plus that single proof — and only a transport
+/// swap mints a generation, so no volume of directory churn can add an entry at
+/// all.
+///
+/// The cap is what keeps a barrier reachable. Enqueue rate is set by that churn;
+/// drain rate is one batch per scope at a time, each paying for the reader's
+/// pre-reply kernel-queue cut. Uncapped, a local producer minting create/delete
+/// traffic faster than batches complete grows the queue without bound, and the
+/// ordering proof a set-cover or sync waits on sits BEHIND all of it — a barrier
+/// starved for as long as the churn lasts, with every completed arm's `O_PATH`
+/// anchor held open until its disarm, stuck behind the same backlog, finally
+/// runs. Capped, the proof is always reached after at most one finite batch.
+///
+/// The invariant is restored by MERGING. The one thing ever dropped is an
+/// obsolete proof, which carries no requests and is owed to nobody (see
+/// [`queue_cut_proof`]); dropping an ordinary entry would strand every
+/// registration waiting on an arm it carried, because even a refused arm returns
+/// the outcome its Monitor node is parked on. So what is capped is the NUMBER of
+/// queued batches, not the work inside them: a coalesced batch's own request
+/// vector still grows under sustained churn, unchanged from dispatching every
+/// batch straight to the blocking pool, where the same payloads accumulated in
+/// the pool's own queue instead.
+type PendingControl = BTreeMap<ScopeId, VecDeque<(u64, Vec<ControlRequest>, Option<u64>)>>;
+
+/// Each scope with a control batch dispatched and not yet completed, mapped to
+/// the transport GENERATION that batch was emitted for — the wait
+/// [`kick_control_queue`] holds its queue on.
+///
+/// The generation is half the key, not bookkeeping. Serialization exists to keep
+/// emission order among batches that can reach the same transport, and only
+/// same-generation batches can: a batch whose generation a replace has retired
+/// fails the source's front-check and publishes nothing into the swapped scope,
+/// so it can neither reorder against a newer batch nor orphan anything one of
+/// them arms. Holding a scope's queue on it would therefore buy no ordering while
+/// costing all of the scope's control liveness — an arm blocked inside a syscall
+/// on a hung or retired filesystem is observed only BETWEEN operations, so a
+/// scope-keyed wait would leave the replacement root partially armed and every
+/// clean fence latched for as long as that syscall takes to return, which on a
+/// dead mount is indefinitely.
+type ControlInflight = BTreeMap<ScopeId, u64>;
+
+/// Whether `generation` names a transport `scope` has already swapped away from,
+/// judged against the scope's CURRENT delivery lane.
+///
+/// A scope with no lane resolves the `u64::MAX` sentinel — a value no real lane
+/// reaches — so a batch emitted for a live lane reads retired the moment its
+/// stream is torn down, and a batch emitted with the sentinel itself (no stream)
+/// reads current, which is harmless: such a scope holds no queue to release.
+fn generation_retired(lanes: &BTreeMap<ScopeId, u64>, scope: ScopeId, generation: u64) -> bool {
+  lanes.get(&scope).copied().unwrap_or(u64::MAX) != generation
+}
+
+/// Appends `entry` to `queue`, MERGING it into the tail instead when both are
+/// ordinary batches of one generation — the single rule that maintains
+/// [`PendingControl`]'s adjacency invariant, shared by both enqueue paths.
+///
+/// Appending onto the tail's request vector places the entry's ops exactly where
+/// a separate trailing entry would have run them, so emission order is untouched:
+/// a disarm emitted after a re-add still cannot run ahead of it and orphan its
+/// kernel watch. Nor can a merge ever reach a RUNNING batch, because this queue
+/// holds only UN-SUBMITTED work — [`kick_control_queue`] pops the front out of the
+/// deque before handing it to the pool, so anything still in the deque is by
+/// construction not executing.
+///
+/// Only the SAME generation may merge. A transport swap bumps the generation, and
+/// a batch carries the generation captured at ITS emission so a stale batch fails
+/// the source's front-check and publishes nothing into the swapped scope; merging
+/// across that boundary would hand the older generation's requests to a newer one,
+/// arming the replacement's fd with watches that were refused by construction.
+///
+/// A proof neither absorbs a merge nor rides into one. An EMPTY batch IS the pure
+/// ordering proof: giving it requests, or moving its requests elsewhere, changes
+/// what the reader is being asked to prove.
+fn push_coalesced(
+  queue: &mut VecDeque<(u64, Vec<ControlRequest>, Option<u64>)>,
+  entry: (u64, Vec<ControlRequest>, Option<u64>),
+) {
+  let (generation, requests, cut_token) = entry;
+  if cut_token.is_none()
+    && let Some((queued_generation, queued, None)) = queue.back_mut()
+    && *queued_generation == generation
+  {
+    queued.extend(requests);
+    return;
+  }
+  queue.push_back((generation, requests, cut_token));
+}
+
+/// Queues `scope`'s ordering-proof request, COALESCING it with any proof
+/// successor already waiting, so the scope holds at most one in flight plus one
+/// queued however hard the latch churns.
+///
+/// The proof latch is invalidated three ways: a reconcile putting new work into
+/// the window and a newly opened fence whose window starts later than the proof
+/// each reset it to `Unproven`, and the scope's coverage-work epoch moving
+/// retires whatever it holds where it stands. A scope whose in-flight proof is
+/// slow therefore re-enters `covers_awaiting_cut` on EVERY such invalidation, and
+/// appending a batch per one grows the scope's queue with the REQUEST count:
+/// the bounded command mailbox limits only instantaneous input, the abandoned-
+/// fence prune never touches these, and when traffic stops every obsolete token
+/// still has to cross the reader serially before the newest one can prove —
+/// unbounded memory and an O(N) barrier delay.
+///
+/// A queued proof entry is provably obsolete the moment a new request is minted
+/// for the same scope. Minting requires a latch that does not already answer for
+/// the scope's current epoch, and it OVERWRITES the latch with the fresh token —
+/// so the queued entry's own token, stamped when it was queued, is no longer the
+/// one the latch names and can no longer close anything
+/// ([`DriverCore::prove_cut`] matches the live request's token, under the epoch
+/// it was stamped with). Dropping it loses no work and no reply either: a proof
+/// batch carries no requests — an empty batch mutates nothing — and only a
+/// SUBMITTED batch owes a `ControlBatchDone`, so an entry that never left this
+/// queue is owed to nobody.
+///
+/// Dropping those obsolete proofs is also what can leave two ordinary entries
+/// NEWLY adjacent — they were separated by a proof that no longer exists — so the
+/// survivors are re-laid through [`push_coalesced`] before the fresh request goes
+/// on. Without that compaction each proof/churn alternation would strand one more
+/// unmergeable entry in the queue permanently, and the barrier the proof serves
+/// would drift back behind an unbounded run of them: exactly the accumulation
+/// [`PendingControl`]'s invariant exists to forbid.
+///
+/// Merging across a removed proof is safe for the same reason merging at the back
+/// is. Two ordinary entries were emitted in queue order, so appending the later
+/// one's requests onto the earlier one's vector preserves that order exactly, and
+/// the proof that used to sit between them has already been established as
+/// obsolete — nothing that had to run between them remains. Same-generation-only
+/// still applies, unchanged.
+///
+/// The fresh request is then appended at the BACK, exactly where an
+/// un-coalesced one would land, so emission order behind the scope's queued arms
+/// and disarms is untouched: coalescing removes obsolete entries and fuses
+/// same-generation neighbours, it never moves a live request forward past one
+/// that must precede it.
+fn queue_cut_proof(pending_control: &mut PendingControl, scope: ScopeId, lane: u64, token: u64) {
+  let queue = pending_control.entry(scope).or_default();
+  queue.retain(|(_, _, carried)| carried.is_none());
+  let mut compacted = VecDeque::with_capacity(queue.len());
+  for entry in queue.drain(..) {
+    push_coalesced(&mut compacted, entry);
+  }
+  *queue = compacted;
+  queue.push_back((lane, Vec::new(), Some(token)));
+}
+
+/// Queues one drain's arms and disarms for `scope`, COALESCING them into the
+/// batch already waiting at the BACK of its queue whenever that batch shares
+/// their generation and carries no ordering proof.
+///
+/// This is [`PendingControl`]'s invariant seen from the churn side: `execute_effects`
+/// groups a whole drain into one batch per scope, so an un-coalesced enqueue adds
+/// an entry per drain and a producer churning directories faster than batches
+/// complete pushes the barrier's ordering proof behind an unbounded run of them.
+/// Merging at the tail is what makes the queue's depth independent of how hard the
+/// tree is churned; [`push_coalesced`] carries the rule and the reasoning that
+/// keeps the merge order-preserving and generation-safe.
+fn queue_control_batch(
+  pending_control: &mut PendingControl,
+  scope: ScopeId,
+  generation: u64,
+  requests: Vec<ControlRequest>,
+) {
+  push_coalesced(
+    pending_control.entry(scope).or_default(),
+    (generation, requests, None),
+  );
+}
+
+/// Dispatches ONE control batch: hands it to the executor on the blocking pool,
+/// carrying the [`ControlAnswer`] that will report its outcome and release the
+/// scope's NEXT queued batch.
+///
+/// The handoff takes a pool worker and gives it back. [`FsOps::dispatch_control`]
+/// is contracted never to wait for a reader, so its cost is the batch's own
+/// translation — or, for an executor that answers arms itself, the batch itself —
+/// and the sink then travels on to whoever produces the outcome. Nothing here, on
+/// the pool or anywhere else, waits for that: an executor that never answers costs
+/// this driver a live `ControlAnswer` and not one unit of any executor, which is
+/// what lets a scope carry arbitrarily many batches stranded on transports it has
+/// already retired without denying its LIVE generation the pool.
+///
+/// The ordering the serialization needs is unaffected, because it never depended
+/// on where the outcome was awaited: the predecessor's completion is consumed by
+/// the DRIVER — which submits the successor on its `ControlBatchDone` — never by a
+/// parked worker, so emission ordering holds on ANY `RuntimeLite` pool, FIFO or
+/// not, bounded or not, with no risk of the bounded/non-FIFO deadlock a
+/// worker-parked chain invites (W successors could occupy every worker while each
+/// waits on a still-queued predecessor).
+fn submit_control_batch<R, F>(
+  ops: &F,
+  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  scope: ScopeId,
+  generation: u64,
+  requests: Vec<ControlRequest>,
+  cut_token: Option<u64>,
+) where
+  R: RuntimeLite,
+  F: FsOps,
+{
+  let ops = ops.clone();
+  let answer = ControlAnswer {
+    op_tx: op_tx.clone(),
+    scope,
+    generation,
+    cut_token,
+    end: ControlBatchEnd::default(),
+  };
+  R::spawn_blocking_detach(move || ops.dispatch_control(scope, generation, requests, answer));
+}
+
+/// The single point a control batch moves from a scope's driver-held queue onto
+/// the blocking pool: submits the front batch when nothing the queue must wait
+/// for is running, otherwise leaves it queued for the running batch's
+/// `ControlBatchDone` to release. Draining an emptied queue drops its entry so a
+/// live scope keeps no residual control state (scope ids are never reused). A
+/// no-op when the queue is empty (a torn-down or never-seen scope holds no queue
+/// and no mark, so a late completion kicks nothing) — completion-drives-next,
+/// never worker-blocks-on-next.
+///
+/// The queue waits on the running batch only while that batch's generation is
+/// still the scope's CURRENT transport. Serializing across a swap would buy no
+/// ordering: a batch of a retired generation fails the source's front-check and
+/// publishes nothing into the swapped scope, so it can neither reorder against a
+/// newer batch nor orphan a watch one of them arms. What it would cost is the
+/// scope's entire control liveness, because a batch is not preemptible — an arm
+/// blocked in a syscall on a hung or retired filesystem returns when the kernel
+/// says so, and reader shutdown is observed only BETWEEN operations. Holding on
+/// it would leave the replacement root partially armed and every clean fence
+/// latched for that whole time. So a retired running batch releases the queue,
+/// and the batch that goes out claims the mark under ITS OWN generation, which
+/// is what keeps the completions unambiguous.
+///
+/// Releasing the queue frees the replacement's work LOGICALLY; the work still has
+/// to find an executor to run on, and on a narrow pool it may find none. Two
+/// things stop that, and both are about a retired transport costing the pool
+/// nothing: NOTHING waits for the stalled batch's reader — its outcome is reported
+/// by whoever produces it (see [`FsOps::dispatch_control`]) — and the swap's
+/// teardown, a join on the very reader that batch is stuck inside, runs off the
+/// pool entirely (see [`TeardownReaper`]). A pool those two could between them
+/// occupy would have nothing left for the work this release just freed, and the
+/// liveness would be handed straight back.
+///
+/// At most one CURRENT-generation batch is therefore in flight per scope, which
+/// is the ordering guarantee stated exactly: the mark is claimed by every
+/// submission and cleared only by the completion that matches it, so a second
+/// current-generation batch can be submitted only after the first has completed.
+/// Retired batches may overlap each other and a current one, and that is the
+/// point — every one of them refuses at the front-check before it touches the
+/// transport.
+fn kick_control_queue<R, F>(
+  ops: &F,
+  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  pending_control: &mut PendingControl,
+  control_inflight: &mut ControlInflight,
+  lanes: &BTreeMap<ScopeId, u64>,
+  scope: ScopeId,
+) where
+  R: RuntimeLite,
+  F: FsOps,
+{
+  if control_inflight
+    .get(&scope)
+    .is_some_and(|running| !generation_retired(lanes, scope, *running))
+  {
+    // A batch of the live transport is running; its ControlBatchDone releases
+    // the next.
+    return;
+  }
+  let Some((generation, requests, cut_token)) = pending_control
+    .get_mut(&scope)
+    .and_then(VecDeque::pop_front)
+  else {
+    // Nothing queued (idle scope, or its queue was just torn down).
+    return;
+  };
+  if pending_control.get(&scope).is_some_and(VecDeque::is_empty) {
+    pending_control.remove(&scope);
+  }
+  control_inflight.insert(scope, generation);
+  submit_control_batch::<R, F>(ops, op_tx, scope, generation, requests, cut_token);
+}
+
 /// Executes the core's queued effects, feeding each outcome straight back.
 #[allow(clippy::too_many_arguments)]
 fn execute_effects<R, F>(
@@ -5816,6 +7521,7 @@ fn execute_effects<R, F>(
   ops: &F,
   config: &DriverConfig,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  reaper: &TeardownReaper,
   handles: &mut BTreeMap<ScopeId, F::Handle>,
   pending_spawns: &mut BTreeSet<ScopeId>,
   pending_teardowns: &mut BTreeMap<ScopeId, usize>,
@@ -5825,6 +7531,8 @@ fn execute_effects<R, F>(
   events: &async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   unwatch_replies: &mut BTreeMap<ScopeId, Vec<(futures_channel::oneshot::Sender<bool>, bool)>>,
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
+  pending_control: &mut PendingControl,
+  control_inflight: &mut ControlInflight,
   cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
@@ -5837,6 +7545,16 @@ fn execute_effects<R, F>(
   // one control message (one potential reader wake) instead of N. Non-control
   // effects still dispatch inline in emission order.
   let mut control_batches: BTreeMap<ScopeId, Vec<ControlRequest>> = BTreeMap::new();
+  // Scopes torn down during THIS drain. The post-drain control dispatch
+  // consults it so a scope that died mid-drain is never handed a fresh batch:
+  // teardown already reclaimed its lane and dropped its control queue + in-flight
+  // mark, scope ids are never reused, and nothing would ever remove state
+  // re-inserted for it — so an entry left here would grow `pending_control` /
+  // `control_inflight` unbounded under root churn. A control op collected for the
+  // scope EARLIER in this same drain (a child re-add or disarm ahead of the
+  // root's DELETE_SELF) must not resurrect its queue; the dead scope's batch is
+  // dropped rather than dispatched.
+  let mut torn_down: BTreeSet<ScopeId> = BTreeSet::new();
   while let Some(effect) = core.poll_effect() {
     match effect {
       Effect::SpawnStream { scope, root } => {
@@ -5866,6 +7584,21 @@ fn execute_effects<R, F>(
         // for the gone scope then resolves no lane and refuses (the `u64::MAX`
         // sentinel), exactly the right answer for a torn-down transport.
         lanes.remove(&scope);
+        // The control queue and in-flight mark die with the lane for the same
+        // reason: a torn-down scope dispatches no further batches, so a residual
+        // entry would only grow these maps unbounded under watch/unwatch churn.
+        // Any batch already ON the pool keeps running and completes; its
+        // ControlBatchDone then finds no queue and no mark and is inert (it
+        // re-creates NO state). Dropping the queue here is not enough on its own:
+        // a control op for this scope collected EARLIER in the same drain still
+        // sits in `control_batches`, and the post-drain dispatch would submit it
+        // (re-marking the dead scope in-flight). Recording the teardown makes
+        // that dispatch skip the scope, so after a drain that tore a scope down
+        // NO per-scope control state remains for it — within the tearing drain,
+        // not only across later ones.
+        pending_control.remove(&scope);
+        control_inflight.remove(&scope);
+        torn_down.insert(scope);
         // The lane's drain tap dies with the lane — a clone kept past this
         // point would grow the map unbounded under watch/unwatch churn.
         source_taps.remove(&scope);
@@ -5894,7 +7627,7 @@ fn execute_effects<R, F>(
         if let Some(handle) = handles.remove(&scope) {
           *pending_teardowns.entry(scope).or_insert(0) += 1;
           let tx = op_tx.clone();
-          R::spawn_blocking_detach(move || {
+          reaper.reap(move || {
             handle.shutdown();
             let _ = tx.try_send(OpResult::TornDown { scope });
           });
@@ -5941,10 +7674,20 @@ fn execute_effects<R, F>(
         // Droppable at close: a listing that never lands leaves the Monitor
         // node Enumerating; the scope teardown clears its pending request.
         // No OS resource is held by a readdir.
+        //
+        // The watch's transient anchor is TAKEN here — synchronously, in the
+        // same step that turns the core's decision into a job — and MOVED into
+        // that job, which is what binds it to this one read (see
+        // [`FsOps::take_enumerate_anchor`]). Superseding this read cannot
+        // cancel its already-detached job, so leaving the anchor in a shared
+        // table for the job to claim later would let it take a successor's.
+        // Ownership travelling with the job also means a job dropped unrun
+        // closes what it holds.
+        let anchor = ops.take_enumerate_anchor(watch);
         let ops = ops.clone();
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {
-          let raw = ops.enumerate(watch, &path);
+          let raw = ops.enumerate(watch, anchor, &path);
           let _ = tx.try_send(OpResult::Enumerated { req, raw });
         });
       }
@@ -5989,14 +7732,43 @@ fn execute_effects<R, F>(
   // it fails the generation check and neither arms the replacement's fd nor
   // publishes a stale anchor into the swapped scope.
   for (scope, requests) in control_batches {
-    let ops = ops.clone();
-    let tx = op_tx.clone();
+    // A scope torn down earlier in THIS drain dispatches no further batches:
+    // its queue and in-flight mark are already reclaimed, its Monitor node is
+    // gone (a dropped arm result just leaves that dead node Arming), and every
+    // wd on its closed fd is reclaimed by the stream teardown. Skipping keeps
+    // the no-residual invariant — after a drain that tore a scope down, NO
+    // per-scope control state remains for it — which queuing-then-submitting
+    // below would break by re-marking a dead scope in-flight. The generation
+    // fence stays intact for LIVE scopes (a transport swap bumps the lane, not
+    // tears it down); only the torn-down scope's stale batch is dropped, which
+    // the fence would refuse anyway once the lane resolved to the `u64::MAX`
+    // sentinel.
+    if torn_down.contains(&scope) {
+      continue;
+    }
+    // The scope's CURRENT transport generation is captured here, at emission,
+    // and carried into the batch: if a replace swaps the transport before this
+    // batch runs, it fails the generation check and neither arms the
+    // replacement's fd nor publishes a stale anchor into the swapped scope.
     let generation = lanes.get(&scope).copied().unwrap_or(u64::MAX);
-    R::spawn_blocking_detach(move || {
-      for (watch, outcome) in ops.batch_control(scope, generation, requests) {
-        let _ = tx.try_send(OpResult::WatchInstalled { watch, outcome });
-      }
-    });
+    // Enqueue this batch in EMISSION order behind the scope's earlier ones, then
+    // submit the queue's front unless a batch of the scope's CURRENT transport
+    // is still running. A batch only executes once its same-generation
+    // predecessor has reached an end (both the reader execution AND the anchor
+    // publication done) — the driver submits the successor on that
+    // completion signal, so the two never reorder (a disarm emitted after a
+    // re-add can never run ahead of it and orphan its kernel watch + O_PATH
+    // anchor) — yet NO blocking-pool worker ever parks waiting for another
+    // batch: the wait is this driver-held queue, not a pool thread, so the
+    // serialization is immune to the pool's start order and worker bound (a
+    // worker-parked chain deadlocks a bounded, non-FIFO pool). A batch stranded
+    // on a retired transport holds nothing back — see [`kick_control_queue`].
+    // The enqueue COALESCES into the queue's trailing same-generation batch
+    // rather than appending unconditionally, so churn arriving faster than
+    // batches complete cannot push the ordering proof behind an unbounded run of
+    // them — see [`queue_control_batch`].
+    queue_control_batch(pending_control, scope, generation, requests);
+    kick_control_queue::<R, F>(ops, op_tx, pending_control, control_inflight, lanes, scope);
   }
 }
 

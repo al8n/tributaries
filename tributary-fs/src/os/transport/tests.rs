@@ -276,7 +276,12 @@ fn every_small_interleaving_holds_the_transport_contract() {
 /// random driver interleavings.
 #[test]
 fn random_schedules_hold_the_transport_contract() {
-  for seed in 1..=64u64 {
+  // Seeds are statistical convergence coverage, which is the native runs' job:
+  // one seed drives every code path the rest do, while sixty-odd seeds' worth of
+  // churn is enough to exhaust a 32-bit target's whole address space under miri.
+  // Miri is here to find UB, so it runs the shape once.
+  let seeds: u64 = if cfg!(miri) { 1 } else { 64 };
+  for seed in 1..=seeds {
     let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(11);
     let mut rng = || {
       s ^= s << 13;

@@ -315,6 +315,30 @@ pub(crate) enum CoverNoop {
 }
 
 /// How one settled set-cover fence reports its window.
+///
+/// # What a clean settle certifies, and what it cannot
+///
+/// [`Applied`](Self::Applied) is an IRREVERSIBLE claim about remote
+/// asynchronous state, so its exact reach is worth stating. Three surfaces ride
+/// it and are uncorrectable once it is reported: the acknowledgement itself
+/// (its oneshot has one constructor and no retraction), the settle-fenced
+/// cookie dispatch's pre-write contract ("a covering `Rescan` rides the queue
+/// ahead of this cookie"), and the settle-floor promotion the clean verdict
+/// performs (`settle_floor := applied_cover`, the claim a later lossy settle
+/// rewinds to). What is NOT at stake is the end-to-end sync verdict: a
+/// `Delivered` cannot be falsely certified through a settle, because the
+/// cookie's own event travels the scope's single ordered lane behind any loss
+/// that preceded its write, and the umbrella's two loss clocks (the per-sub
+/// serial and the shared generation snapshotted before the install) resolve
+/// every such race `Dominated`.
+///
+/// Certification over remote state always leaves a final
+/// [observation, certify] instant, so the guarantee is stated against the
+/// window's PROOFS: a fence settles `Applied` only when every counted proof
+/// its window rests on postdates every loss the kernel had committed by that
+/// proof's execution. A loss committed after those proofs is observed at its
+/// own ingest, which marks pending fences lossy, degrades the claim and the
+/// floor, and re-proves the scope before any later settle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoverSettle {
   /// The reconcile's re-arm work quiesced with no loss signal in the window:
@@ -322,10 +346,105 @@ pub(crate) enum CoverSettle {
   /// this moment are delivered.
   Applied,
   /// The reconcile settled, but the window was lossy — a covering `Rescan`
-  /// passed, a grow kickoff coalesced into an in-flight cold read, or the
-  /// scope tore down mid-fence. Coverage may be partial; the `Rescan`
-  /// (terminal, for teardown) dominates the gap.
+  /// passed or a grow kickoff coalesced into an in-flight cold read. Coverage
+  /// may be partial; the `Rescan` dominates the gap.
   Degraded,
+  /// The scope died under this fence: the teardown fold resolved it and there
+  /// is no stream left to report anything on.
+  ///
+  /// Minted at the single place death is known SYNCHRONOUSLY — the teardown
+  /// fold — so the fact travels with the verdict. A consumer that must not act
+  /// on a dead scope reads it here instead of re-deriving it from driver maps
+  /// that only a later `TeardownStream` execution clears, which is what let a
+  /// parked barrier be answered over a scope that was already gone.
+  ///
+  /// Weaker than [`Degraded`](Self::Degraded) for any caller that only asks
+  /// "was coverage complete" — both answer no — so the public
+  /// `set_cover` outcome maps it to `Degraded` and is unchanged by its
+  /// introduction.
+  Dead,
+}
+
+/// Which boundary a [`poll_cover_settlements`](DriverCore::poll_cover_settlements)
+/// pass speaks for, and therefore which verdicts it is entitled to mint.
+///
+/// # The residue rule
+///
+/// A live pass runs behind a source drain bounded by a per-lane snapshot, and
+/// that drain can legitimately end with counted items still resident: the
+/// merged fan-in may answer `Pending` while a ready item exists. The scopes
+/// whose own lane still holds such items ride here, and for each of them this
+/// pass mints NOTHING — not a clean verdict and not a lossy one.
+///
+/// Withholding the LOSSY verdict too is the part worth stating, because a
+/// degraded verdict is not falsifiable by more loss. It is falsifiable by
+/// DEATH: an unread terminal `Fatal` sitting in exactly those counted items
+/// has not yet folded the scope's fence to [`Dead`](CoverSettle::Dead), so a
+/// [`Degraded`](CoverSettle::Degraded) minted over it ANSWERS a caller —
+/// dispatching its parked cookie write on a stream that is already gone, the
+/// successful-but-unsatisfiable barrier `Dead` exists to refuse. So the rule
+/// is by scope, not by verdict: while a scope's own lane holds counted-but-
+/// unconsumed items, no settlement that answers a caller may resolve for it.
+///
+/// The residue set is per SCOPE rather than one global flag because the items
+/// are per lane: a busy scope's backlog says nothing about another scope's
+/// window, and coupling them would defer an unrelated fence for as long as the
+/// neighbour keeps producing.
+///
+/// # Liveness
+///
+/// The deferral cannot outlive the residue that caused it. The snapshot is
+/// retaken every pass, so a scope whose lane drains spends immediately and
+/// resolves on the next one; and if the residue IS the terminal `Fatal`,
+/// ingesting it folds the fence to `Dead`, which resolves through the already-
+/// settled path this gate never touches. Either way the next pass answers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SettlePass<'a> {
+  /// The driver's live loop top: verdicts are minted against streams that are
+  /// still running, so a clean window may certify — except for the scopes in
+  /// `unspent`, whose settled fences are all held over to a later pass.
+  Live {
+    /// Scopes whose current delivery lane still holds items this pass's source
+    /// snapshot counted but its drain did not ingest.
+    unspent: &'a BTreeSet<ScopeId>,
+  },
+  /// The driver's close drain: every stream has been torn down, so there is
+  /// nothing left to certify a clean window against and the boundary withholds
+  /// that verdict. Nothing may be DEFERRED here, though — this is the last
+  /// pass there will ever be, and a held-over fence would strand its caller's
+  /// reply forever — so a lossy window still reports its honest verdict, and
+  /// owes no ordering proof to do it (see [`Self::owes_cut_proof`]).
+  Closing,
+}
+
+impl SettlePass<'_> {
+  /// Whether this pass may mint a clean certificate at all.
+  const fn certifies_clean(self) -> bool {
+    matches!(self, Self::Live { .. })
+  }
+
+  /// Whether a verdict minted here is acted on against a LIVE stream, and so
+  /// rests on the ordering proof every live verdict owes (see [`CutProof`]).
+  ///
+  /// Only the loop-top pass does. By the close drain every stream has already
+  /// been torn down: no reader is left to cut a kernel queue and answer the
+  /// batch that would mint a proof, and no verdict this pass reports can reach
+  /// a stream — the close drain dispatches no cookie and answers a parked one
+  /// with its pre-physical terminal. So the proof is both unobtainable and
+  /// unnecessary here, and demanding it would do the one thing the last pass may
+  /// not: park a caller's reply on a round trip that can never complete.
+  const fn owes_cut_proof(self) -> bool {
+    matches!(self, Self::Live { .. })
+  }
+
+  /// Whether `scope`'s settled fences are held over rather than resolved —
+  /// true only for a live pass's unspent scopes, never at close.
+  fn withholds(self, scope: ScopeId) -> bool {
+    match self {
+      Self::Live { unspent } => unspent.contains(&scope),
+      Self::Closing => false,
+    }
+  }
 }
 
 /// One scope's pending set-cover fence bookkeeping.
@@ -364,25 +483,350 @@ pub(crate) enum CoverSettle {
 /// unsettled window ride each other's re-arm work, so none of them can claim
 /// a cleaner window than the scope's.
 ///
+/// # The tranche rule
+///
+/// One ordering proof does not necessarily speak for every fence the entry
+/// holds: it licenses only those that were already open when it was requested
+/// (see [`CutProof`]). Fences therefore carry the ordinal they were opened at,
+/// and because they are held in open order the ones a proof licenses are always
+/// a PREFIX of the list. A settle observation resolves that prefix and leaves
+/// the rest pending, with their accrued lossiness intact, to be offered a
+/// successor proof.
+///
+/// The entry itself — the scope's loss memory, and the applied-cover repair
+/// that rides its removal — is spent only when the LAST pending fence goes. A
+/// claim is never promoted over a stretch of the window no proof has ordered
+/// yet, and the loss memory a straggler may still need is never cleared out
+/// from under it.
+///
 /// [`RearmKickoff::Coalesced`]: tributary_proto::RearmKickoff::Coalesced
 #[derive(Debug, Default)]
 struct CoverFence {
-  /// Pending fences in open (FIFO) order, each carrying its own lossy flag —
-  /// inherited from `lossy` at open, then marked by later loss events.
-  pending: Vec<(FenceId, bool)>,
+  /// Pending fences in open (FIFO) order, so their ordinals ascend and the
+  /// fences one proof licenses are a prefix.
+  pending: Vec<PendingFence>,
   /// The scope's loss memory since the last settle observation (see the
   /// lossy-window rule above).
   lossy: bool,
+  /// Open ordinals minted for this entry so far. Per entry, which is the only
+  /// scale the tranche rule compares at: a proof's mark lives on this same
+  /// entry and dies with it.
+  opened: u64,
+  /// How far a clean verdict is licensed, and what is out to license the rest —
+  /// see [`CutProof`].
+  cut: CutProof,
+}
+
+/// One fence awaiting its scope's settle.
+#[derive(Debug, Clone, Copy)]
+struct PendingFence {
+  /// The id the driver parked this caller's reply under.
+  fence: FenceId,
+  /// Whether this fence's window has taken loss — inherited from the entry's
+  /// memory at open, then set by every later loss event.
+  lossy: bool,
+  /// Where this fence sits in its entry's open order, counted from one. An
+  /// ordering proof licenses exactly the fences it reaches (see [`CutProof`]).
+  opened: u64,
 }
 
 impl CoverFence {
+  /// Records `fence` as pending: it takes the next open ordinal and inherits
+  /// the loss memory the scope has accrued since its last settle observation.
+  fn open(&mut self, fence: FenceId) {
+    self.opened += 1;
+    self.pending.push(PendingFence {
+      fence,
+      lossy: self.lossy,
+      opened: self.opened,
+    });
+  }
+
   /// Records one loss event: remembered until the next settle observation and
   /// stamped onto every pending fence.
   fn mark_lossy(&mut self) {
     self.lossy = true;
-    for (_, lossy) in &mut self.pending {
-      *lossy = true;
+    for pending in &mut self.pending {
+      pending.lossy = true;
     }
+  }
+
+  /// The newest pending fence's ordinal — the mark a proof must reach to
+  /// license this entry's whole pending set.
+  ///
+  /// Zero when nothing is pending. Such an entry still owes a proof before its
+  /// settle observation may repair the applied-cover claim, but it has no fence
+  /// to exclude, so any proof taken under the current epoch reaches it.
+  fn high_water(&self) -> u64 {
+    self.pending.last().map_or(0, |pending| pending.opened)
+  }
+}
+
+/// Whether this fence has forced the source to surface what the kernel already
+/// holds, which is what a CLEAN verdict rests on.
+///
+/// The barrier's counted work — arms, re-arms, enumerates — proves the coverage
+/// was rebuilt. It does NOT prove the kernel had nothing queued while that
+/// happened: an enumerate completes on the blocking pool and never crosses the
+/// reader, and a re-issued or pruning cover can settle with no counted work at
+/// all. In both cases the settle-edge drain sees only what the reader has
+/// ALREADY forwarded, so a record the kernel committed but nobody has read yet
+/// sits in no lane and the drain reads trivially spent.
+///
+/// One empty control batch closes that: the reader cuts its kernel queue onto
+/// the lane before answering ANY batch, so the reply is an ordering proof —
+/// whatever the kernel held is ingested ahead of it.
+///
+/// # What one proof licenses
+///
+/// A proof speaks for the WINDOW AS IT STOOD WHEN THE REQUEST WAS MADE — not
+/// for all time and not for the scope at large — so it licenses a clean verdict
+/// on one condition, read along both axes that window has:
+///
+/// **A proof licenses a fence iff the fence was already pending when the proof
+/// was requested AND the scope has acquired no coverage work since.**
+///
+/// The two halves are the same statement about the same instant. The request
+/// records the scope's coverage-work epoch ([`Monitor::coverage_work_epoch`])
+/// and the open ordinal of the newest fence then pending — one [`CutMark`] —
+/// and the reply's proof inherits it whole. Work acquired afterwards moves the
+/// epoch and voids the proof outright; a fence opened afterwards takes a higher
+/// ordinal and is simply not among those it speaks for — the earlier fences it
+/// genuinely ordered keep it. Neither half is a special case of the other: work
+/// can be acquired with no fence opening, and a fence can open with no work
+/// acquired at all.
+///
+/// Both are checked against the scope AS IT READS NOW rather than against a
+/// list of events that invalidate a proof, which is what makes the rule total:
+/// nothing has to hunt down the marks a scope holds when its epoch moves,
+/// because a mark stamped under a departed epoch licenses nothing wherever it
+/// sits, and an epoch never returns.
+///
+/// # A request is not a proof
+///
+/// A request and the proof it will mint are therefore kept apart, and the entry
+/// holds both at once: the PROVEN PREFIX — the strongest mark a completed cut
+/// has earned, which is the only thing that licenses a verdict — and the
+/// SUCCESSOR IN FLIGHT, the request out for the fences that prefix does not
+/// reach. Latching a successor records that a request exists and nothing more:
+/// authority already earned is not evidence about a window still being ordered,
+/// so it can neither be spent by one nor lowered by one. A completed request
+/// retires into the prefix and only ever moves it forward — across an epoch its
+/// mark replaces the prefix outright, since carrying an older stamp's reach onto
+/// a newer one would claim an ordering that cut never took, and within one epoch
+/// the further reach wins.
+///
+/// Holding one slot for both would confuse a claim with an answer, and the
+/// driver's loop makes that fatal rather than merely lossy: it latches the
+/// successors it is offered ABOVE the settlement it resolves below, so a window
+/// taking one new fence per round would have every successor erase the proof
+/// that had just landed for its predecessors, and no fence would ever resolve.
+///
+/// # Why a binding and not a list
+///
+/// The barrier ([`Monitor::coverage_settled`]) is a conjunction over several
+/// kinds of coverage work, each of them "the scope holds none of this". So it
+/// can go settled → unsettled → settled again through work the proof knows
+/// nothing about: a proven cut forwards a `MovedFrom` whose held-source
+/// obligation is created only when the settle-edge drain ingests it, and a
+/// paired `MovedTo` then releases the hold. An overflow the kernel committed
+/// after the cut can still be sitting unread across that whole round, and a
+/// proof kept valid through it would certify exactly the record it existed to
+/// surface. Enumerating such edges cannot be made to hold: the enumeration is
+/// complete only until the barrier grows another conjunct.
+///
+/// So the proof carries the scope's coverage-work epoch
+/// ([`Monitor::coverage_work_epoch`]) — a counter that advances whenever the
+/// scope acquires work ANY conjunct counts — and licenses a clean verdict only
+/// while the scope still reads that epoch. Since a conjunct can only turn from
+/// settled to unsettled by acquiring work, an unchanged epoch means the window
+/// the cut ordered was never re-opened, for every conjunct at once.
+///
+/// # Convergence
+///
+/// A scope that keeps acquiring work keeps invalidating proofs, which costs
+/// nothing: it is not settled, so it is offered no fence and asked for no
+/// proof. The epoch does NOT move on a release, so a scope that settles and
+/// then stays settled holds it fixed, and the next proof taken over it survives
+/// to certify. Progress therefore needs only quiescence, not quiet.
+///
+/// The ordinal converges for a reason of its own, and it is why a request
+/// already in flight is never displaced by a fence opened behind it: every
+/// request licenses every fence pending at the instant it was latched, so each
+/// completed proof resolves at least the whole tranche that was waiting when it
+/// left, and the fences that joined behind it are offered a successor the
+/// moment it lands ([`covers_awaiting_cut`](DriverCore::covers_awaiting_cut)
+/// compares the proven prefix's reach against the newest pending ordinal).
+/// Arrival rate therefore cannot outrun resolution: a fence waits on the first
+/// request latched after it opened, and on no more than one round trip beyond
+/// the one already out.
+///
+/// # What the epoch does not cover
+///
+/// A reconcile whose prune drops a watch subtree MOVES coverage without
+/// acquiring any: a drop only releases work, so no funnel bumps the epoch, yet
+/// the window is no longer the one the proof was taken over. That one discards
+/// the latch at its own site — proven prefix and request in flight alike, since
+/// neither speaks for the window that remains. Without it a proof spent on one
+/// cascade would license a second cascade joining the same entry: the whole
+/// defect, one level up.
+///
+/// A reconcile that grows nothing and prunes nothing is NOT one of them, and
+/// must not reset. It leaves the window exactly as the standing proof found it,
+/// so that proof still orders every record the window can hold. Discarding it
+/// there would buy no ordering at all, and would cost far more than a round
+/// trip: such re-issues can arrive faster than a cut completes, so every proof
+/// that completed would land on a latch some later re-issue had already reset,
+/// and the window would never settle clean.
+///
+/// A newly opened fence is not one of them either, and for a stronger reason: it
+/// needs no reset at all. Its ordinal already places it outside every standing
+/// request's reach, which is strictly more precise than resetting — the coarser
+/// rule threw away a proof that was still perfectly good for the fences it had
+/// ordered, so a scope taking acknowledged covers faster than a cut completes
+/// lost every proof to the next fence and settled none of them.
+///
+/// It is deliberately NOT the retired settle-edge observation gate: there is no
+/// observation record to hold valid, no serial, no lane generation and no
+/// completion flag, and the ordering is bought by a cut the reader already
+/// performs rather than by a new mechanism.
+///
+/// # Why a lossy window owes one too
+///
+/// The proof is owed for the WINDOW, not for the claim the verdict will make.
+/// More loss genuinely cannot falsify a degraded verdict — but the cut is not
+/// there to surface loss, it is there to surface whatever the kernel holds
+/// unread, and that includes DEATH. A root renamed away while its
+/// `IN_MOVE_SELF` sits unread in the kernel queue is a scope that no longer
+/// exists, and a `Degraded` is a LIVE verdict: it answers its caller and
+/// dispatches the parked cookie write, which then lands in a recreated,
+/// unmonitored directory and is reported `Ok` for a record no stream can ever
+/// deliver. The scope's death is processed afterwards, and the loss that
+/// degraded the window covers nothing that happened after it. The omitted cut is
+/// exactly what would have put that record on the lane first, folding the fence
+/// to [`CoverSettle::Dead`] and refusing the cookie. So every live fence asks,
+/// whatever verdict it is heading for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct CutProof {
+  /// The prefix already proven: the strongest mark a completed cut has earned
+  /// for this entry, and the only thing here that licenses a verdict. `None`
+  /// until one lands.
+  proven: Option<CutMark>,
+  /// The request out for the fences `proven` does not reach. At most one is ever
+  /// out, and what the window does behind it leaves it alone.
+  in_flight: Option<CutRequest>,
+}
+
+/// The window one cut speaks for, stamped at the instant its request was
+/// committed to and inherited unchanged by the proof it mints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CutMark {
+  /// The scope's [`Monitor::coverage_work_epoch`] then. The mark licenses
+  /// nothing at any other epoch.
+  epoch: u64,
+  /// The open ordinal of the newest fence then pending, and so the last fence
+  /// this cut reaches.
+  covers: u64,
+}
+
+/// A cut that has been asked for: the token of the batch carrying the request,
+/// and the mark that batch's completion earns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CutRequest {
+  /// Identifies the request, so only the completion of the batch that actually
+  /// carried it can close this one.
+  token: u64,
+  /// What the reply will prove — the window as it stood when the request was
+  /// committed to, never as it stands when the reply lands.
+  mark: CutMark,
+}
+
+impl CutMark {
+  /// The stronger of two marks: a later epoch wins outright, and within one
+  /// epoch the further reach does.
+  ///
+  /// Reaches never merge across epochs. Only one epoch is ever current, so the
+  /// older stamp already licenses nothing, and carrying its reach onto the newer
+  /// one would claim an ordering the newer cut never took.
+  const fn strongest(self, other: Self) -> Self {
+    if other.epoch > self.epoch || (other.epoch == self.epoch && other.covers > self.covers) {
+      other
+    } else {
+      self
+    }
+  }
+
+  /// How far this mark licenses a CLEAN verdict at `epoch` — nothing at all
+  /// unless it was stamped under exactly the coverage work the scope still
+  /// holds.
+  const fn reach(self, epoch: u64) -> Option<u64> {
+    if self.epoch == epoch {
+      Some(self.covers)
+    } else {
+      None
+    }
+  }
+}
+
+impl CutProof {
+  /// Whether this latch already speaks for every fence through `high_water` at
+  /// `epoch`, and so owes no fresh cut.
+  ///
+  /// A request stamped under the current epoch does, whatever has opened behind
+  /// it: it will license everything that was pending when it left, and asking
+  /// again would only orphan it — a scope taking fences steadily would then
+  /// cancel every request before its reply could land, and the fences it was
+  /// bought for would wait on a reply nothing can close. The proven prefix does
+  /// only as far as its reach, so fences opened past it are what provoke a
+  /// successor once nothing is out. Anything stamped under an epoch the scope
+  /// has since left speaks for nothing, a request included, because its reply
+  /// could only ever mint a proof that is stale on arrival.
+  const fn answers_for(self, epoch: u64, high_water: u64) -> bool {
+    match (self.in_flight, self.proven) {
+      (Some(request), _) if request.mark.epoch == epoch => true,
+      (_, Some(proven)) => proven.epoch == epoch && proven.covers >= high_water,
+      _ => false,
+    }
+  }
+
+  /// The open ordinal through which a CLEAN verdict is licensed at `epoch`.
+  ///
+  /// Only the proven prefix licenses anything, and only as far as the tranche
+  /// its request was made behind. A stale prefix and a request still out both
+  /// license nothing: the fences beyond withhold, and the window asks again.
+  const fn licenses_through(self, epoch: u64) -> Option<u64> {
+    match self.proven {
+      Some(proven) => proven.reach(epoch),
+      None => None,
+    }
+  }
+
+  /// Puts `token`'s request out for `mark`'s window. The proven prefix is left
+  /// exactly as it stands: a successor is a claim about a window still being
+  /// ordered, never evidence against one already ordered.
+  fn latch(&mut self, token: u64, mark: CutMark) {
+    self.in_flight = Some(CutRequest { token, mark });
+  }
+
+  /// Retires the request in flight into the proven prefix, raising it to that
+  /// request's mark — but only for the token actually out, so every other
+  /// completion is inert.
+  fn prove(&mut self, token: u64) {
+    let Some(request) = self.in_flight.take_if(|request| request.token == token) else {
+      return;
+    };
+    self.proven = Some(
+      self
+        .proven
+        .map_or(request.mark, |proven| proven.strongest(request.mark)),
+    );
+  }
+
+  /// Discards everything the latch holds — proven prefix and request in flight
+  /// alike — because the window they were taken over is no longer the one this
+  /// entry stands for.
+  fn invalidate(&mut self) {
+    *self = Self::default();
   }
 }
 
@@ -795,13 +1239,19 @@ pub(crate) struct DriverCore {
   /// reconcile OR an unobserved loss signal — created by every `Reconciling`
   /// [`on_set_cover`](Self::on_set_cover) (acked or not, so a reply-less
   /// reconcile's window is still observed and its loss memory still clears)
-  /// and by every public scope `Rescan` of a descending scope (so an
+  /// and by every public scope `Rescan`, whatever the profile (so an
   /// out-of-window loss is remembered, not dropped with the window), removed
   /// by the settle observation or the scope's teardown. No entry may outlive
   /// its scope.
+  ///
+  /// A kernel-recursive scope takes the mark too: `sync_root` fences any
+  /// profile, so exempting it left a real queue overflow invisible to a
+  /// pending sync fence.
   cover_fences: BTreeMap<ScopeId, CoverFence>,
-  /// Fences a scope teardown resolved (always [`CoverSettle::Degraded`] — the
-  /// terminal `Rescan` covers the caller), folded into the next
+  /// Fences a scope teardown resolved (always [`CoverSettle::Dead`] — the
+  /// terminal `Rescan` covers the caller, and the verdict carries the death
+  /// itself because the `TeardownStream` that clears the driver's liveness
+  /// maps is only queued at that point), folded into the next
   /// [`poll_cover_settlements`](Self::poll_cover_settlements) so the driver
   /// consumes every resolution at its one loop-top choke point.
   settled_covers: Vec<(FenceId, CoverSettle)>,
@@ -1069,11 +1519,15 @@ impl DriverCore {
       })
       .collect();
     outside.sort_unstable_by_key(|(depth, _)| *depth);
+    // Whether the shrink half actually dropped coverage — the Monitor's own answer, not an
+    // inference from the requested cover, because a cover naming subtrees this scope no longer
+    // watches prunes nothing.
+    let mut pruned = false;
     for (_, watch) in outside {
       // A node an ancestor's drop already reclaimed is no longer watched — skip it (the
       // shallow-first order guarantees the ancestor was processed first).
       if self.monitor.is_watched(watch) {
-        self.monitor.drop_watch_subtree(watch);
+        pruned |= self.monitor.drop_watch_subtree(watch);
       }
     }
 
@@ -1133,10 +1587,13 @@ impl DriverCore {
     // counter deliberately does not see: the scope can read settled while the obligation is
     // latent, so the fence window is lossy FROM BIRTH (the F0 amendment).
     let mut coalesced = false;
+    // Whether the grow half actually recorded a re-arm obligation — again the Monitor's answer:
+    // a `Refused` kickoff (a target the tree no longer holds) grows nothing.
+    let mut grew = false;
     for watch in targets {
-      if self.monitor.rearm_watch_subtree(watch).is_coalesced() {
-        coalesced = true;
-      }
+      let kickoff = self.monitor.rearm_watch_subtree(watch);
+      coalesced |= kickoff.is_coalesced();
+      grew |= !kickoff.is_refused();
     }
 
     // Fence bookkeeping BEFORE the drain, so an entry exists when any change this reconcile
@@ -1146,6 +1603,22 @@ impl DriverCore {
     // every already-pending fence and is inherited by any fence opened before the scope next
     // settles (see [`CoverFence`]).
     let fence = self.cover_fences.entry(scope).or_default();
+    // A reconcile that MOVED coverage extended the window past whatever a standing
+    // ordering proof was taken over, so that proof licenses nothing about what it
+    // now holds. Reset it: the proof is asked for again at the next quiescence, and
+    // a reply still in flight for the spent request finds `Unproven` and correctly
+    // no-ops. The epoch binding does not subsume this — a prune only RELEASES work,
+    // so no funnel bumps the epoch even though the coverage under the proof changed.
+    //
+    // A reconcile that grew nothing and pruned nothing extended nothing, and its
+    // window is exactly the one the standing proof already orders. Invalidating
+    // there would be worse than a wasted round trip: reply-less re-issues of a
+    // settled cover can arrive faster than a cut completes, so every completed
+    // proof would land on a latch a later re-issue had already reset, and the
+    // window would never settle clean at all (see [`CutProof`]).
+    if pruned || grew {
+      fence.cut.invalidate();
+    }
     if coalesced {
       fence.mark_lossy();
     }
@@ -1178,20 +1651,26 @@ impl DriverCore {
   /// reconcile's window: it inherits the scope's loss memory accrued since the
   /// last settle observation — including a born-lossy `Coalesced` grow — per
   /// [`CoverFence`]'s rule.
+  ///
+  /// The fence takes the entry's next open ordinal, and that is what keeps it
+  /// from inheriting an ordering proof older than itself: a proof licenses only
+  /// the fences that were already pending when it was requested, and this one
+  /// was not (see [`CutProof`]). Standing proofs and requests in flight are
+  /// left untouched — they still order the fences they were bought for, and the
+  /// successor this fence needs is asked for once they land.
   pub(crate) fn open_cover_fence(&mut self, scope: ScopeId) -> FenceId {
     self.fence_seq += 1;
     let fence = FenceId(self.fence_seq);
-    let entry = self.cover_fences.entry(scope).or_default();
-    entry.pending.push((fence, entry.lossy));
+    self.cover_fences.entry(scope).or_default().open(fence);
     fence
   }
 
-  /// Drops the pending tuples of `abandoned` fences — callers that cancelled their
-  /// `set_cover` await before the settle. Only the per-fence tuples go: the scope's
+  /// Drops the pending records of `abandoned` fences — callers that cancelled their
+  /// `set_cover` await before the settle. Only the per-fence records go: the scope's
   /// loss memory, its settle-floor bookkeeping, and every still-awaited fence stay
   /// untouched, so the settle observation's cover repair is unaffected. Without this,
   /// a caller repeatedly issuing-and-cancelling against a scope whose re-arm work is
-  /// stalled would accumulate one pending tuple per processed request indefinitely —
+  /// stalled would accumulate one pending record per processed request indefinitely —
   /// the bounded command mailbox limits only instantaneous traffic, never the total.
   pub(crate) fn abandon_cover_fences(&mut self, abandoned: &std::collections::BTreeSet<FenceId>) {
     if abandoned.is_empty() {
@@ -1200,7 +1679,7 @@ impl DriverCore {
     for entry in self.cover_fences.values_mut() {
       entry
         .pending
-        .retain(|(fence, _)| !abandoned.contains(fence));
+        .retain(|pending| !abandoned.contains(&pending.fence));
     }
   }
 
@@ -1212,15 +1691,27 @@ impl DriverCore {
   /// fences at this one settle instant — in FIFO open order, each with its
   /// recorded lossiness ([`Applied`](CoverSettle::Applied) /
   /// [`Degraded`](CoverSettle::Degraded)) — plus every fence a scope teardown
-  /// already resolved `Degraded`. The driver polls this at its loop top,
-  /// after feeding results back.
+  /// already resolved [`Dead`](CoverSettle::Dead). The driver polls this at
+  /// its loop top, after feeding results back.
+  ///
+  /// A settled scope resolves the fences its ordering proof licenses — the
+  /// prefix of its pending list the proof was requested behind (see
+  /// [`CutProof`]) — and holds any that opened past it, which are offered a
+  /// successor proof and resolve at a later pass. A lossy window owes that proof
+  /// exactly as a clean one does: what the cut surfaces is an unread death, and
+  /// a `Degraded` dispatches its caller's cookie onto a stream just as an
+  /// `Applied` does. Only a scope that can obtain no proof is exempt — a
+  /// kernel-recursive one, whose control batches never reach a reader — and it
+  /// resolves whole.
   ///
   /// The settle observation is also where the applied-cover lie is repaired:
   /// a LOSSY window rewinds `applied_cover` to the settle floor (the provable
   /// under-claim, so a re-issue recomputes a real broadening delta); a CLEAN
-  /// window resets the floor to the now-truthful `applied_cover`. Either way
-  /// the scope's fence entry — pending fences and loss memory — is cleared:
-  /// no fence state outlives its settle.
+  /// window resets the floor to the now-truthful `applied_cover`. That repair
+  /// rides the entry's removal, so it waits for the LAST pending fence: a claim
+  /// is never promoted over a stretch of the window no proof has ordered yet.
+  /// Once the entry goes, no fence state outlives it — pending fences and loss
+  /// memory alike.
   /// The settle-fence gate: exactly the Monitor's barrier predicate
   /// ([`Monitor::coverage_settled`]), with no core-side conjunct. The widen
   /// window needs none: pre-commit, fences certify the OLD world, whose
@@ -1235,37 +1726,287 @@ impl DriverCore {
     self.monitor.coverage_settled(scope)
   }
 
-  pub(crate) fn poll_cover_settlements(&mut self) -> Vec<(FenceId, CoverSettle)> {
+  /// Whether the next [`poll_cover_settlements`](Self::poll_cover_settlements)
+  /// would OBSERVE at least one scope — some scope with fence bookkeeping
+  /// whose coverage barrier currently holds. The driver consults this before
+  /// resolving so it can first ingest every source message already queued:
+  /// loss signals and arm ACKs travel on two unordered channels, and an
+  /// observation taken while a loss for the scope is queued-but-unseen would
+  /// certify a clean window the loss already voided (and reset the settle
+  /// floor to a cover the loss is about to invalidate). Teardown-folded
+  /// settles need no such fence — their verdict is already `Dead`, which more
+  /// loss cannot falsify — so they do not arm this probe. They are still
+  /// delivered promptly: the driver's loop-top resolve is unconditional.
+  pub(crate) fn cover_settlement_due(&self) -> bool {
+    self
+      .cover_fences
+      .keys()
+      .any(|scope| self.barrier_settled(*scope))
+  }
+
+  /// The scopes whose barrier has quiesced but which have not yet forced the
+  /// source to surface what the kernel holds — see [`CutProof`].
+  ///
+  /// Reporting does NOT latch: the caller may decline a scope — a stream that is
+  /// already gone has nothing to ask — and a request spent on a batch nobody
+  /// sends could only ever be closed by a reply that never comes, parking the
+  /// fence until its scope dies. So the caller latches with
+  /// [`mark_cut_inflight`](Self::mark_cut_inflight) once it has committed to
+  /// sending, and a declined scope simply reappears here next pass.
+  ///
+  /// A LOSSY fence is returned like any other, and the offer is the half of that
+  /// rule that keeps it live: the settle gate below requires a proof of every
+  /// live fence, so a fence that is never OFFERED one would wait for it forever.
+  /// The two sides carry the same exemption and no other, which is what makes
+  /// "asked for iff required" hold rather than merely be intended.
+  ///
+  /// A scope whose latch does not speak for its whole pending set IS returned,
+  /// for either of the two reasons a latch can fall short: the coverage work it
+  /// was stamped against has moved on, so it licenses nothing at all; or a
+  /// fence has opened past the tranche the proven prefix reaches, so it licenses
+  /// nothing for THAT fence. Either way a fence would otherwise wait on a reply
+  /// that cannot certify it. A request still in flight under the current epoch
+  /// is not re-asked for — see [`CutProof`]'s convergence rule, which is what
+  /// bounds a fence's wait however fast fences arrive.
+  ///
+  /// Those two cases leave no gap between them, which is the property a fence's
+  /// liveness rests on: a settled clean window holding a fence its prefix does
+  /// not reach is offered a cut unless one is already out under the current
+  /// epoch, and both ways that request can end — its own completion, which
+  /// raises the prefix, and the epoch moving out from under it, which retires
+  /// it where it stands — put the window straight back here.
+  ///
+  /// The offer and the latch below share one predicate, so the caller can
+  /// always latch what it was offered.
+  pub(crate) fn covers_awaiting_cut(&self) -> Vec<ScopeId> {
+    self
+      .cover_fences
+      .iter()
+      .filter(|(scope, entry)| {
+        self.cut_proof_required(**scope)
+          && self.barrier_settled(**scope)
+          && !entry
+            .cut
+            .answers_for(self.coverage_epoch(**scope), entry.high_water())
+      })
+      .map(|(scope, _)| *scope)
+      .collect()
+  }
+
+  /// The coverage-work epoch a cut proof for `scope` is stamped with and
+  /// checked against — see [`CutProof`].
+  fn coverage_epoch(&self, scope: ScopeId) -> u64 {
+    self.monitor.coverage_work_epoch(scope)
+  }
+
+  /// Whether `scope`'s live verdicts need an ordering proof at all.
+  ///
+  /// Only a per-directory-watch scope can hold an unread kernel queue a fence
+  /// would resolve over, and only such a scope has a control port whose batch a
+  /// reader answers — so a kernel-recursive scope can neither need the proof nor
+  /// obtain one, and asking would strand its settles rather than protect them. A
+  /// scope whose state is gone needs nothing: its fences resolve at the teardown
+  /// fold.
+  fn cut_proof_required(&self, scope: ScopeId) -> bool {
+    self
+      .scopes
+      .get(&scope)
+      .is_some_and(|state| !state.profile.is_kernel_recursive())
+  }
+
+  /// Latches `scope`'s fence as having the ordering-proof request `token` in
+  /// flight, so it is asked for exactly one however many passes the reply takes.
+  /// Called only once the caller has committed to sending that batch.
+  ///
+  /// The request is stamped with the scope's CURRENT coverage-work epoch and
+  /// with the newest ordinal currently pending — the tranche this proof will be
+  /// able to license — both of which its proof inherits and is checked against
+  /// at the settle, so the caller needs no bookkeeping of its own. Latching is
+  /// refused only when the latch already speaks for that pair, which is exactly
+  /// when [`covers_awaiting_cut`](Self::covers_awaiting_cut) would not have
+  /// offered the scope: what it offers, this always latches. Latching displaces
+  /// whatever request was out, so the batch that carried it can no longer prove
+  /// anything — which is why an in-flight request under the current epoch is
+  /// never displaced merely because a fence opened behind it. The proven prefix
+  /// is untouched either way: a successor asks about the fences beyond it and
+  /// says nothing about the ones it already reaches.
+  pub(crate) fn mark_cut_inflight(&mut self, scope: ScopeId, token: u64) {
+    let epoch = self.coverage_epoch(scope);
+    if let Some(entry) = self.cover_fences.get_mut(&scope) {
+      let covers = entry.high_water();
+      if !entry.cut.answers_for(epoch, covers) {
+        entry.cut.latch(token, CutMark { epoch, covers });
+      }
+    }
+  }
+
+  /// Records that `scope`'s source answered a control batch, whose reply the
+  /// reader's pre-reply cut precedes — so anything the kernel held is now on
+  /// the lane, ahead of this.
+  ///
+  /// Only the request actually in flight is closed, and only by its OWN token —
+  /// which is what makes every stale completion inert. A window extended by a
+  /// reconcile discards the latch, so a reply for the request that predated it
+  /// matches nothing; and a PREDECESSOR batch of the same scope, whose cut was
+  /// taken before this request existed, carries a different token and cannot
+  /// close it either. The caller supplies the token only for a batch that ran to
+  /// completion, so an unwinding batch proves nothing.
+  ///
+  /// The proof inherits the REQUEST's epoch and mark, not the scope's now: the
+  /// cut ordered the window as it stood when the request was committed to, so
+  /// work the scope acquired while the batch was out is outside it and must
+  /// leave the proof stale rather than be absorbed into it, and a fence opened
+  /// while the batch was out is outside it and must wait for a successor rather
+  /// than be swept into this one. It RAISES the proven prefix (see
+  /// [`CutProof`]), so a completion can only ever extend what the entry has
+  /// earned.
+  pub(crate) fn prove_cut(&mut self, scope: ScopeId, token: u64) {
+    if let Some(entry) = self.cover_fences.get_mut(&scope) {
+      entry.cut.prove(token);
+    }
+  }
+
+  /// Resolves every settled fence the [`SettlePass`] entitles this boundary to
+  /// mint, and holds the rest over WITH THEIR ENTRIES INTACT — a deferred
+  /// window is retried, never degraded and never lost.
+  ///
+  /// Deaths are not gated by any of it: a teardown fold and the seam-bug path
+  /// both resolve [`Dead`](CoverSettle::Dead) through the already-settled list
+  /// this function drains unconditionally, so a scope held over below still
+  /// reports its death at the very pass that reads it.
+  ///
+  /// - a live pass whose drain SPENT the scope's counted items resolves
+  ///   everything, subject to the window's own ordering proof — owed by a lossy
+  ///   window as much as by a clean one, since both dispatch a caller's cookie;
+  /// - a live pass with counted items still resident on that scope's lane
+  ///   resolves NOTHING for it — including a lossy window, whose `Degraded`
+  ///   would answer a caller over a death that may be sitting in exactly those
+  ///   items (see [`SettlePass`]);
+  /// - the close pass refuses the clean verdict — no stream is left to certify
+  ///   against — while still reporting a lossy window honestly, because a
+  ///   deferral at close would strand its caller's reply forever.
+  pub(crate) fn poll_cover_settlements(
+    &mut self,
+    pass: SettlePass<'_>,
+  ) -> Vec<(FenceId, CoverSettle)> {
     let mut settled = std::mem::take(&mut self.settled_covers);
     let scopes: Vec<ScopeId> = self.cover_fences.keys().copied().collect();
     for scope in scopes {
       if !self.barrier_settled(scope) {
         continue;
       }
-      let Some(entry) = self.cover_fences.remove(&scope) else {
+      // The residue deferral: this scope's lane still holds items the pass
+      // counted and did not read, and an unread terminal `Fatal` among them
+      // makes a live verdict of EITHER kind a claim about a stream that is
+      // already gone. Both deferrals here keep the entry INTACT, so a window
+      // they catch is retried rather than decided.
+      if pass.withholds(scope) {
+        continue;
+      }
+      // The certification deferral, which IS clean-only: the close pass has no
+      // stream left to certify a clean window against, so it holds that verdict
+      // over rather than minting it. A lossy window is not withheld here — it
+      // has nothing to certify, its floor move is the rewind, and this is the
+      // last pass its caller will ever be answered by.
+      if !pass.certifies_clean()
+        && self
+          .cover_fences
+          .get(&scope)
+          .is_some_and(|entry| !entry.lossy)
+      {
+        continue;
+      }
+      // The counted work quiescing proves the coverage was rebuilt; it does not
+      // prove the kernel had nothing queued while that happened. Until a fence
+      // has an ordering proof, any live verdict would rest on the drain having
+      // seen a lane the reader may not have filled yet.
+      //
+      // How far the proof reaches decides how much of the entry may resolve.
+      // Both of its bounds are checked against the scope as it reads NOW: it
+      // must have been taken over the coverage work the scope currently holds —
+      // a proof stamped before the scope acquired and released more of it
+      // ordered an earlier window, and the record it would certify over may
+      // still be kernel-resident — and it reaches only the fences that were
+      // already pending when it was requested. A stale proof is therefore no
+      // proof at all, and an unreached fence withholds; both reappear in
+      // `covers_awaiting_cut`.
+      //
+      // A LOSSY window owes the same proof. More loss cannot falsify its
+      // degraded verdict, but the cut does not surface loss — it surfaces
+      // whatever the kernel still holds, death included, and a `Degraded` is a
+      // live verdict that dispatches its caller's parked cookie exactly as an
+      // `Applied` does. A root renamed away and its pathname recreated while
+      // `IN_MOVE_SELF` sits unread would otherwise take that write into an
+      // unmonitored directory and answer `Ok` for a record no stream can report,
+      // with the scope's death processed only afterwards and the earlier loss
+      // covering nothing that happened after it.
+      //
+      // Two cases are exempt, and neither is about the verdict. A
+      // KERNEL-RECURSIVE scope can obtain no proof at all: its control batches
+      // carry no inotify port, so the source refuses them without ever reaching
+      // a reader, and requiring one would defer its settles forever. The
+      // consequence is recorded honestly: the kernel-resident leg of this defect
+      // stays open on such a backend, where it is currently unreachable because
+      // the scope records no coverage claim and takes no `set_cover` fence —
+      // only a `sync_root` opens one, and a sync's own ordering rests on the
+      // single ordered lane instead. The CLOSE pass is exempt for the mirror
+      // reason (see [`SettlePass::owes_cut_proof`]): every stream is already
+      // torn down, so no reader can answer and no verdict can dispatch. Both
+      // exempt cases reach every fence they hold, so they always resolve whole.
+      let Some(entry) = self.cover_fences.get(&scope) else {
         continue;
       };
-      // Teardown removes the entry with its scope, so a live entry always has scope
-      // state; a scope-less entry is a seam bug — degrade its fences rather than
-      // report `Applied` for coverage nobody backs.
-      let mut dead = false;
-      if let Some(state) = self.scopes.get_mut(&scope) {
-        if entry.lossy {
-          state.applied_cover = state.settle_floor.clone();
-        } else {
-          state.settle_floor = state.applied_cover.clone();
-        }
+      let through = if self.cut_proof_required(scope) && pass.owes_cut_proof() {
+        let Some(reach) = entry.cut.licenses_through(self.coverage_epoch(scope)) else {
+          continue;
+        };
+        reach
       } else {
-        debug_assert!(false, "a fence entry never outlives its scope");
-        dead = true;
+        entry.high_water()
+      };
+      let Some(entry) = self.cover_fences.get_mut(&scope) else {
+        continue;
+      };
+      // Ordinals ascend with open order, so the licensed fences are exactly a
+      // prefix; the rest stay pending, keeping the lossiness they have accrued,
+      // and are decided by their own successor proof.
+      let split = entry
+        .pending
+        .partition_point(|pending| pending.opened <= through);
+      let resolving: Vec<PendingFence> = entry.pending.drain(..split).collect();
+      let lossy = entry.lossy;
+      let spent = entry.pending.is_empty();
+      // Teardown removes the entry with its scope, so a live entry always has scope
+      // state; a scope-less entry is a seam bug — resolve its fences `Dead` rather
+      // than report `Applied` for coverage nobody backs. Such an entry is exempt
+      // above (a scope with no state can obtain no proof), so it always resolves
+      // whole and reaches the repair below rather than lingering half-settled.
+      let mut dead = false;
+      if spent {
+        self.cover_fences.remove(&scope);
+        if let Some(state) = self.scopes.get_mut(&scope) {
+          if lossy {
+            state.applied_cover = state.settle_floor.clone();
+          } else {
+            state.settle_floor = state.applied_cover.clone();
+          }
+        } else {
+          debug_assert!(false, "a fence entry never outlives its scope");
+          dead = true;
+        }
       }
-      for (fence, lossy) in entry.pending {
-        let settle = if lossy || dead {
+      for pending in resolving {
+        // A scope-less entry means exactly what the teardown fold means — no scope
+        // backs this fence — so it mints the same verdict rather than a weaker one
+        // that a consumer would have to disambiguate.
+        let settle = if dead {
+          CoverSettle::Dead
+        } else if pending.lossy {
           CoverSettle::Degraded
         } else {
           CoverSettle::Applied
         };
-        settled.push((fence, settle));
+        settled.push((pending.fence, settle));
       }
     }
     settled
@@ -1331,7 +2072,9 @@ impl DriverCore {
           | BackendKind::Rdcw
           | BackendKind::UsnJournal => {
             state.publicly_live = true;
-            self.monitor.on_watch_result(watch, Ok(()));
+            self
+              .monitor
+              .on_watch_result(watch, Ok(tributary_proto::WatchAck::Installed));
           }
           // Descending: the source starts with NO watches (nothing may be
           // delivered before the Monitor's own watch flow runs), so the
@@ -1398,8 +2141,13 @@ impl DriverCore {
   }
 
   pub(crate) fn on_watch_installed(&mut self, watch: WatchId, outcome: WatchOutcome) {
+    // The fresh-vs-aliased bit is carried through, not collapsed: a binding
+    // re-proof keys its dark-window verdict on it (`Installed` = the old
+    // binding was dead or rebound, so the settle edge owes the closing
+    // `Rescan`; `Aliased` = live all along, no window).
     let res = match outcome {
-      WatchOutcome::Installed(_) | WatchOutcome::Aliased(_) => Ok(()),
+      WatchOutcome::Installed(_) => Ok(tributary_proto::WatchAck::Installed),
+      WatchOutcome::Aliased(_) => Ok(tributary_proto::WatchAck::Aliased),
       WatchOutcome::Failed(err) => Err(err),
     };
     // A descending scope's ROOT arm succeeding is the moment its coverage — and
@@ -2830,6 +3578,48 @@ impl DriverCore {
               .map(|state| state.requested.clone())
               .unwrap_or_default();
             self.effects.push_back(Effect::SpawnStream { scope, root });
+          } else if let Some(scope) = cmd.target().rearm_root() {
+            // A root binding re-proof: re-add the EXISTING root's kernel watch
+            // on the LIVE source — the self-parented root-arm shape the spawn
+            // path uses, never a stream (re)spawn. `expected` is the barrier
+            // identity, so a different-object rebind at the same path fails
+            // the arm's open-verify as `Gone` into the root-invalidation
+            // funnel — the death the identity-sampling liveness gate cannot
+            // see.
+            let Some(state) = self.scopes.get(&scope) else {
+              debug_assert!(false, "a root re-add names a live scope");
+              continue;
+            };
+            debug_assert_eq!(
+              state.watch,
+              cmd.id(),
+              "a root re-add names the current root"
+            );
+            let Some(root) = state.root.clone() else {
+              debug_assert!(false, "a root re-add follows a committed spawn");
+              continue;
+            };
+            let name = root
+              .file_name()
+              .and_then(|name| name.to_str())
+              .unwrap_or("/");
+            let expected = state.identity.and_then(|identity| {
+              u64::try_from(identity.ino())
+                .ok()
+                .and_then(NonZeroU64::new)
+                .map(|ino| ExpectedObject {
+                  dev: identity.dev(),
+                  ino,
+                })
+            });
+            self.effects.push_back(Effect::AddWatch {
+              scope,
+              watch: cmd.id(),
+              parent: cmd.id(),
+              name: Segment::new(name),
+              path: root,
+              expected,
+            });
           } else if let Some(child) = cmd.target().as_child() {
             let parent = child.parent();
             let (Some(&scope), Some(parent_path)) = (
@@ -2940,13 +3730,19 @@ impl DriverCore {
             }
             // Scope teardown mid-fence (unwatch, root death — every teardown funnels
             // through this arm): the reconcile's work dies with the scope, so every
-            // pending fence resolves `Degraded` — the terminal `Rescan` above covers
-            // the caller — folded into the next settlement poll so the driver keeps
-            // its one choke point. The entry is removed with the scope: no fence
-            // state outlives it.
+            // pending fence resolves `Dead` — the terminal `Rescan` above covers the
+            // caller — folded into the next settlement poll so the driver keeps its
+            // one choke point. The entry is removed with the scope: no fence state
+            // outlives it.
+            //
+            // `Dead` rather than `Degraded` because this is the one place the death
+            // is known synchronously, while the `TeardownStream` that clears the
+            // driver's liveness maps is merely QUEUED. A consumer polling this
+            // settlement therefore cannot re-derive the fact from those maps — they
+            // still read live — so it has to travel in the verdict.
             if let Some(entry) = self.cover_fences.remove(&scope) {
-              for (fence, _) in entry.pending {
-                self.settled_covers.push((fence, CoverSettle::Degraded));
+              for pending in entry.pending {
+                self.settled_covers.push((pending.fence, CoverSettle::Dead));
               }
             }
             self.probes.retain(|_, ctx| ctx.scope != scope);
@@ -3038,15 +3834,21 @@ impl DriverCore {
     //   survivor). A never-narrowed scope (`applied_cover == None`) has no stale
     //   claim to degrade; its coverage self-heals through the Monitor's own re-arm.
     //
-    // A kernel-recursive scope needs neither: its whole-subtree stream never narrows
+    // A kernel-recursive scope's whole-subtree stream never narrows
     // (`on_set_cover` refuses it before recording anything, so its `applied_cover`
-    // is never `Some`) and no fence ever opens for it, so creating loss memory for
-    // its churn `Rescan`s would only cycle map entries. Conservative by design for
-    // descending scopes: an unrelated churn `Rescan` degrades too (the caller
-    // self-heals by re-issuing). Both routes below deliver the `Rescan` (emitted, or
-    // parked as the lag's dominating change), so a marked window is never a signal
-    // the consumer didn't also get.
-    if change.kind().is_rescan() && !state.profile.is_kernel_recursive() {
+    // is never `Some`), but that buys it no exemption here: `sync_root` opens a
+    // cover fence for ANY scope without consulting the profile, so a KR scope can
+    // hold a pending fence, and skipping its loss memory let a real
+    // `FAN_Q_OVERFLOW` resolve that fence `Applied` over a window the kernel had
+    // already dropped events from. The cost is at most ONE entry per scope,
+    // cleared at the next settle observation — and a kernel-recursive scope's
+    // `Rescan` sources are all genuine loss windows rather than churn: a real
+    // queue overflow, a root death, and a root replace's cut. Conservative by
+    // design for descending scopes: an unrelated churn `Rescan` degrades too (the
+    // caller self-heals by re-issuing). Both routes below deliver the `Rescan`
+    // (emitted, or parked as the lag's dominating change), so a marked window is
+    // never a signal the consumer didn't also get.
+    if change.kind().is_rescan() {
       self.cover_fences.entry(scope).or_default().mark_lossy();
       if state.applied_cover.is_some() {
         state.applied_cover = Some(Vec::new());
@@ -3426,7 +4228,11 @@ fn caps_for(backend: BackendKind) -> Capabilities {
     BackendKind::FsEvents | BackendKind::Fanotify | BackendKind::Rdcw | BackendKind::UsnJournal => {
       caps.with_kernel_recursive()
     }
-    BackendKind::Inotify => caps,
+    // inotify's per-watch teardown records (`IN_IGNORED`, unmount included)
+    // ride the same queue an `IN_Q_OVERFLOW` empties, so a loss can leave
+    // retained watches kernel-dead with no record of it: a scope-level loss
+    // must re-prove every retained binding by an acknowledged re-add.
+    BackendKind::Inotify => caps.with_lossy_watch_teardown(),
   }
 }
 

@@ -17,6 +17,7 @@ pub struct Capabilities {
   versioned: bool,
   needs_poll: bool,
   kernel_recursive: bool,
+  lossy_watch_teardown: bool,
 }
 
 impl Capabilities {
@@ -30,6 +31,7 @@ impl Capabilities {
       versioned: false,
       needs_poll: false,
       kernel_recursive: false,
+      lossy_watch_teardown: false,
     }
   }
 
@@ -74,6 +76,22 @@ impl Capabilities {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn kernel_recursive(&self) -> bool {
     self.kernel_recursive
+  }
+
+  /// Whether a kernel watch's terminal record can be dropped together with the
+  /// notification queue, so a queue loss may leave the backend's per-watch
+  /// bindings dead with no record of their death.
+  ///
+  /// On such a backend (inotify: an unmount's `IN_IGNORED`s ride the same
+  /// queue an `IN_Q_OVERFLOW` empties) a retained watch that survives a loss
+  /// recovery by identity match may be kernel-dead, so a loss-triggered re-arm
+  /// must re-prove every retained binding by an acknowledged re-add rather
+  /// than keep it on the identity evidence alone. `false` for backends whose
+  /// watch teardown is signalled out of band of the losable queue
+  /// (kernel-recursive streams die loudly as a whole).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn lossy_watch_teardown(&self) -> bool {
+    self.lossy_watch_teardown
   }
 }
 
@@ -166,6 +184,14 @@ impl Capabilities {
     update_kernel_recursive,
     maybe_kernel_recursive,
     clear_kernel_recursive
+  );
+  capability_flag!(
+    lossy_watch_teardown,
+    set_lossy_watch_teardown,
+    with_lossy_watch_teardown,
+    update_lossy_watch_teardown,
+    maybe_lossy_watch_teardown,
+    clear_lossy_watch_teardown
   );
 }
 

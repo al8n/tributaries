@@ -43,11 +43,23 @@ impl WatchChild {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WatchTarget {
-  /// A disjoint watched root, identified by its scope.
+  /// A disjoint watched root, identified by its scope. Establishing a root is
+  /// the bootstrap: the driver starts the scope's native source and arms the
+  /// root on it.
   Root(ScopeId),
   /// A child of an already-watched directory (used when the core descends, i.e.
   /// the backend is not kernel-recursive).
   Child(WatchChild),
+  /// Re-add the kernel watch of `scope`'s EXISTING root on its LIVE source —
+  /// never a source (re)start. Issued when a loss on a
+  /// [`lossy_watch_teardown`](crate::Capabilities::lossy_watch_teardown)
+  /// backend forces the root's binding to be re-proven: the driver resolves
+  /// the scope's live root path and installs the watch through the ordinary
+  /// arm path, and the acknowledgement answers whether the binding was still
+  /// live ([`WatchAck::Aliased`]) or had to be re-established
+  /// ([`WatchAck::Installed`]). A distinct variant so a re-add can never be
+  /// confused with the stream-spawning [`Root`](Self::Root) bootstrap.
+  RearmRoot(ScopeId),
 }
 
 impl WatchTarget {
@@ -57,7 +69,7 @@ impl WatchTarget {
     Self::Child(WatchChild::new(parent, name))
   }
 
-  /// Whether this targets a disjoint root.
+  /// Whether this targets a disjoint root's bootstrap.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_root(&self) -> bool {
     matches!(self, Self::Root(_))
@@ -69,12 +81,29 @@ impl WatchTarget {
     matches!(self, Self::Child(_))
   }
 
-  /// The root scope, if this targets a root.
+  /// Whether this re-adds an existing root's kernel watch.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_rearm_root(&self) -> bool {
+    matches!(self, Self::RearmRoot(_))
+  }
+
+  /// The root scope, if this targets a root's bootstrap. `None` for a
+  /// [`RearmRoot`](Self::RearmRoot): a re-add must never be executed as a
+  /// source start.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn root(&self) -> Option<ScopeId> {
     match self {
       Self::Root(id) => Some(*id),
-      Self::Child(_) => None,
+      _ => None,
+    }
+  }
+
+  /// The root scope, if this re-adds an existing root's kernel watch.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn rearm_root(&self) -> Option<ScopeId> {
+    match self {
+      Self::RearmRoot(id) => Some(*id),
+      _ => None,
     }
   }
 
@@ -83,8 +112,42 @@ impl WatchTarget {
   pub const fn as_child(&self) -> Option<&WatchChild> {
     match self {
       Self::Child(child) => Some(child),
-      Self::Root(_) => None,
+      _ => None,
     }
+  }
+}
+
+/// How a successful [`Action::Watch`] bound its target, reported through
+/// `Monitor::on_watch_result`'s `Ok`.
+///
+/// The distinction carries real information only for a re-add of an
+/// already-tracked watch (a binding re-proof on a
+/// [`lossy_watch_teardown`](crate::Capabilities::lossy_watch_teardown)
+/// backend): [`Installed`](Self::Installed) means the target was NOT bound
+/// when the arm ran — the old binding was dead (or bound elsewhere) and a
+/// window of unrecorded changes may precede this acknowledgement — while
+/// [`Aliased`](Self::Aliased) means the binding was live all along and
+/// nothing was missed. A first-time install reports [`Installed`](Self::Installed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WatchAck {
+  /// A kernel watch was freshly created by this arm.
+  Installed,
+  /// The target was already watched; the arm attached to the existing live
+  /// binding (the `EEXIST` aliasing path).
+  Aliased,
+}
+
+impl WatchAck {
+  /// Whether this arm freshly created its kernel watch.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_installed(&self) -> bool {
+    matches!(self, Self::Installed)
+  }
+
+  /// Whether this arm attached to an already-live binding.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_aliased(&self) -> bool {
+    matches!(self, Self::Aliased)
   }
 }
 

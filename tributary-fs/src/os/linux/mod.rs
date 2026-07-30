@@ -103,7 +103,7 @@ use tributary_proto::WatchId;
 
 pub(crate) use fanotify::AdmittedEvent;
 pub(crate) use inotify::decode::RawInotifyEvent;
-use inotify::table::{Attribution, WdTable};
+use inotify::table::WdTable;
 
 /// The decoded Linux event payload — the platform's transport `E` once the
 /// seam flips.
@@ -163,24 +163,24 @@ pub(crate) struct AttributedBatch {
 ///
 /// - An overflow sentinel (`wd == -1`) carries no attribution: it marks the
 ///   batch lost and is not forwarded — the ordered loss signal covers it. It also
-///   RESETS the table's reuse-window / draining state ([`WdTable::on_loss`]) at the
+///   reaps the table's draining tombstones ([`WdTable::on_loss`]) at the
 ///   sentinel's in-order position: an overflow can drop the very `IN_IGNORED` a
-///   window awaits, so no window may outlive it (the covering rescan rebuilds the
-///   table truthfully). This is one of two DECODE-level (ordering-breaking) losses
-///   that reset the windows; a decode-truncation is the other, which the reader
-///   applies once the decoded prefix is attributed (gated on `decoded.lossy`). The
-///   AMBIGUOUS-fence loss below leaves the ordering intact and does NOT reset.
-/// - `IN_IGNORED` is the `wd`'s final record: it consumes the table entry
+///   tombstone awaits, and nothing else would ever erase it. This is one of two
+///   DECODE-level losses that reap; a decode-truncation is the other, which the
+///   reader applies once the decoded prefix is attributed (gated on
+///   `decoded.lossy`).
+/// - `IN_IGNORED` is a `wd`'s final record: it consumes the table entry
 ///   ([`WdTable::on_ignored`]) and forwards to the anchors that were still
 ///   live (a kernel-initiated teardown); a self-induced teardown whose
-///   anchors already drained forwards nothing.
+///   anchors already drained forwards nothing, and a marker on an unmapped
+///   `wd` (straggling behind its entry's erase) no-ops. The marker always
+///   belongs to the mapping it lands on — the table's adoption invariant: a
+///   fresh install's `wd` is granted past every mapped one (the reader
+///   rebuilds the instance before the allocator can wrap), so no stale
+///   marker can ever address a fresh binding.
 /// - Any other record fans out to the `wd`'s live anchors; a record on a
 ///   draining or unknown `wd` addresses a watch the core already dropped and
-///   is skipped without loss. A record on a `wd` in the REUSE WINDOW (a fresh
-///   anchor set installed over a not-yet-drained old incarnation —
-///   [`Attribution::Ambiguous`]) is instead marked lost: it may belong to the
-///   old watch, so it is fenced behind the covering rescan rather than
-///   mis-attributed to the new set.
+///   is skipped without loss.
 pub(crate) fn attribute_events(
   decoded: Vec<RawInotifyEvent>,
   table: &mut WdTable,
@@ -189,16 +189,12 @@ pub(crate) fn attribute_events(
   let mut lost = false;
   for event in decoded {
     if event.mask.is_overflow() {
-      // The kernel dropped queued events (inotify(7)); a stale `IN_IGNORED` a reuse
-      // fence is counting down — or a draining tombstone's own final marker — may be
-      // among the dropped, so reset the wd table's window state HERE, at the
-      // sentinel's in-order position: after any in-buffer marker that preceded it.
-      // This is one of the two ordering-breaking (DECODE-level) losses that reset the
-      // windows; a decode-truncation is the other, applied by the reader once the
-      // decoded prefix is attributed (gated on `decoded.lossy`). The ambiguous-fence
-      // loss below leaves the queue ordering intact and must NOT reset. Without the
-      // reset a stuck fence would convert every future record on the reused `wd` to
-      // loss forever; the covering rescan this loss triggers rebuilds the table.
+      // The kernel dropped queued events (inotify(7)); a draining tombstone's
+      // awaited final marker may be among the dropped, so reap the tombstones
+      // HERE, at the sentinel's in-order position: after any in-buffer marker
+      // that preceded it. This is one of the two DECODE-level losses that
+      // reap; a decode-truncation is the other, applied by the reader once
+      // the decoded prefix is attributed (gated on `decoded.lossy`).
       table.on_loss();
       lost = true;
       continue;
@@ -210,19 +206,12 @@ pub(crate) fn attribute_events(
       }
       continue;
     }
-    match table.attribute(event.wd) {
-      Attribution::Attributed([]) => continue,
-      Attribution::Attributed(anchors) => {
-        events.push(RawLinuxEvent::Inotify {
-          anchors: anchors.to_vec(),
-          event,
-        });
-      }
-      // The `wd` is in the reuse window: this record may belong to the OLD
-      // (draining) watch queued ahead of its stale `IN_IGNORED`, so fence it
-      // behind the loss barrier — the covering rescan re-attributes truthfully —
-      // rather than delivering it to the wrong (new) watch.
-      Attribution::Ambiguous => lost = true,
+    let anchors = table.attribute(event.wd);
+    if !anchors.is_empty() {
+      events.push(RawLinuxEvent::Inotify {
+        anchors: anchors.to_vec(),
+        event,
+      });
     }
   }
   AttributedBatch { events, lost }
@@ -361,7 +350,7 @@ pub(crate) enum WatchOutcome {
 pub(crate) use inotify::reader::ControlOp;
 #[cfg(all(target_os = "linux", not(miri)))]
 #[allow(unused_imports)]
-pub(crate) use inotify_source::{AnchorRequest, ArmReply, ControlPort};
+pub(crate) use inotify_source::{AnchorRequest, ArmReply, BatchOutcome, BatchReply, ControlPort};
 
 /// The Linux spawn dispatcher: routes to the requested per-root backend. The
 /// seam names one `Source`/`SourceHandle` per platform, so both Linux
@@ -1171,36 +1160,92 @@ mod inotify_source {
     wake: Arc<WakeState>,
   }
 
+  /// What one control batch came back with: the arms' replies, and — told apart
+  /// from them — whether the READER is what produced them.
+  ///
+  /// The replies alone cannot carry the second fact. A batch with no arms has no
+  /// replies either, so one the reader served and one whose reader died both
+  /// come back as an empty vector; and the empty batch is exactly the
+  /// ordering-proof round trip, whose entire meaning is that the reader reached
+  /// it and cut its kernel queue onto the lane first. An empty vector must not
+  /// mean both "the cut happened" and "nobody was left to cut", so
+  /// [`answered`](Self::answered) carries that apart from the payload.
+  #[derive(Debug)]
+  pub(crate) struct BatchOutcome {
+    /// Index-aligned to the batch's `Arm` entries, in order — a `Disarm`
+    /// produces none. Filled on EVERY path, answered or not: a parked
+    /// registration is owed its watch result whether or not the reader survived.
+    pub(crate) replies: Vec<ArmReply>,
+    /// Whether the reader itself answered this batch. False means the reader was
+    /// already gone or died before replying, so the batch's ops are not known to
+    /// have run and nothing about the ordering of the stream may be inferred
+    /// from its return.
+    pub(crate) answered: bool,
+  }
+
   impl ControlPort {
-    /// Sends one batch of arms/disarms and returns the arms' outcomes in order
-    /// (index-aligned to the `Arm` entries — disarms produce no reply). One
+    /// Enqueues one batch of arms/disarms, arranging for `deliver` to receive
+    /// the arms' outcomes in order (index-aligned to the `Arm` entries — disarms
+    /// produce no reply) together with whether the reader answered at all. One
     /// message, one potential wake, N results: the reader executes the whole
-    /// batch in a single pass between reads. Blocks until the reader replies;
-    /// callers run it on the blocking pool. A dead reader answers `Failed(Io)`
+    /// batch in a single pass between reads. A dead reader answers `Failed(Io)`
     /// for every arm — the scope's stream death carries the real signal.
+    ///
+    /// RETURNS AS SOON AS THE BATCH IS ENQUEUED, and never waits for the reader.
+    /// That wait has no bound: a reader already admitted into a syscall against a
+    /// wedged filesystem observes nothing — not this batch, not its own shutdown
+    /// — until the kernel returns. A caller that held its thread across it would
+    /// spend one unit of whatever executor dispatched the batch for as long as
+    /// the filesystem stays wedged, and a driver can have arbitrarily many such
+    /// batches outstanding at once, one per transport it has retired out from
+    /// under a stuck reader. `deliver` is instead invoked by whoever ends up
+    /// OWNING the batch — the reader when it replies, or the destruction of a
+    /// message no reader survived to serve (see [`BatchReply`]).
     ///
     /// Enqueue-then-conditional-wake is the wake-elision contract: the message
     /// lands on the channel BEFORE [`WakeState::wake_if_parked`] checks the
     /// park flag, so a reader about to block cannot miss it (the lost-wakeup
     /// argument lives on [`WakeState`]).
-    pub(crate) fn batch(&self, ops: Vec<ControlOp>) -> Vec<ArmReply> {
+    pub(crate) fn dispatch(
+      &self,
+      ops: Vec<ControlOp>,
+      deliver: impl FnOnce(BatchOutcome) + Send + 'static,
+    ) {
+      let arm_count = ops
+        .iter()
+        .filter(|op| matches!(op, ControlOp::Arm(_)))
+        .count();
+      let reply = BatchReply::new(arm_count, deliver);
+      if let Err(mpsc::SendError(undelivered)) = self.control.send(Control::Batch { ops, reply }) {
+        // The reader is already gone. Destroying the message answers the batch
+        // through the sink's own drop, so a closed channel needs no separate
+        // reply path — and cannot leave an arm unanswered by taking one.
+        drop(undelivered);
+        return;
+      }
+      self.wake.wake_if_parked();
+    }
+
+    /// [`dispatch`](Self::dispatch) awaited on the CALLING thread, for the
+    /// callers that own one outright and have no completion to park on: a
+    /// replace's pre-arm, and the single-op smoke helpers.
+    ///
+    /// Every batch the driver emits on behalf of a scope goes through
+    /// `dispatch` instead. The wait below is the unbounded one, so a caller
+    /// reaching for this is asserting that its thread is its own to spend.
+    pub(crate) fn batch(&self, ops: Vec<ControlOp>) -> BatchOutcome {
       let arm_count = ops
         .iter()
         .filter(|op| matches!(op, ControlOp::Arm(_)))
         .count();
       let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-      if self
-        .control
-        .send(Control::Batch {
-          ops,
-          reply: reply_tx,
-        })
-        .is_err()
-      {
-        return dead_replies(arm_count);
-      }
-      self.wake.wake_if_parked();
-      reply_rx.recv().unwrap_or_else(|_| dead_replies(arm_count))
+      self.dispatch(ops, move |outcome| {
+        let _ = reply_tx.send(outcome);
+      });
+      // The sink answers on every path, its own destruction included, so the
+      // receive cannot come back empty; the fallback keeps the reply contract
+      // total rather than relying on that.
+      reply_rx.recv().unwrap_or_else(|_| dead_batch(arm_count))
     }
 
     /// Installs (or aliases) one kernel watch. A single-entry [`batch`]; the
@@ -1211,6 +1256,7 @@ mod inotify_source {
     pub(crate) fn add_watch(&self, request: AnchorRequest) -> ArmReply {
       self
         .batch(vec![ControlOp::Arm(request)])
+        .replies
         .into_iter()
         .next()
         .unwrap_or(ArmReply {
@@ -1227,16 +1273,91 @@ mod inotify_source {
     pub(crate) fn remove_watch(&self, anchor: WatchId) {
       let _ = self.batch(vec![ControlOp::Disarm(anchor)]);
     }
+
+    /// A port onto an explicit control channel, standing in for a live source's
+    /// so a test can play the reader — including by dying like one.
+    #[cfg(all(test, target_os = "linux", not(miri)))]
+    pub(crate) fn detached(control: mpsc::Sender<Control>, wake: Arc<WakeState>) -> Self {
+      Self { control, wake }
+    }
   }
 
-  /// A reader-is-dead reply for every arm in a batch that never landed.
-  fn dead_replies(arm_count: usize) -> Vec<ArmReply> {
-    (0..arm_count)
-      .map(|_| ArmReply {
-        outcome: WatchOutcome::Failed(WatchError::Io),
-        anchor: None,
-      })
-      .collect()
+  /// The answer for a batch no reader ran: `Failed(Io)` for every arm it
+  /// carried, marked as never answered. Each arm is still replied to, because a
+  /// Monitor node parked on a watch acknowledgement must be released whichever
+  /// way the reader went; `answered` is what keeps those replies from reading as
+  /// work the reader performed.
+  fn dead_batch(arm_count: usize) -> BatchOutcome {
+    BatchOutcome {
+      replies: (0..arm_count)
+        .map(|_| ArmReply {
+          outcome: WatchOutcome::Failed(WatchError::Io),
+          anchor: None,
+        })
+        .collect(),
+      answered: false,
+    }
+  }
+
+  /// The sink one dispatched control batch's outcome leaves through, exactly
+  /// once, from whoever ends up OWNING the batch.
+  ///
+  /// Ownership is what carries the obligation, which is why the obligation
+  /// cannot be dropped on the floor. A batch no reader survives to dequeue is
+  /// destroyed along with the control channel, and a reader that unwinds holding
+  /// one destroys it on the way out; this type's `Drop` is what turns either
+  /// destruction into the refusal every arm's caller is parked on. So a
+  /// dispatcher needs no dead-reader path of its own, and no registration can be
+  /// stranded by a reader that died between the send and the reply.
+  pub(crate) struct BatchReply {
+    /// The batch's `Arm` count. Kept here because the ops are gone by the time
+    /// an un-dequeued message drops, and the refusals must still be one per arm
+    /// so they stay index-aligned to them.
+    arm_count: usize,
+    /// Taken by whichever of [`answer`](Self::answer) and the drop runs first;
+    /// the other then finds `None` and delivers nothing.
+    deliver: Option<Box<dyn FnOnce(BatchOutcome) + Send>>,
+  }
+
+  impl BatchReply {
+    pub(crate) fn new(
+      arm_count: usize,
+      deliver: impl FnOnce(BatchOutcome) + Send + 'static,
+    ) -> Self {
+      Self {
+        arm_count,
+        deliver: Some(Box::new(deliver)),
+      }
+    }
+
+    /// The READER's own answer: `replies` are index-aligned to the batch's `Arm`
+    /// entries, and the reader cut its kernel queue onto the lane before
+    /// reaching here, so this — and only this — is the end a caller may read an
+    /// ordering proof out of.
+    pub(crate) fn answer(mut self, replies: Vec<ArmReply>) {
+      if let Some(deliver) = self.deliver.take() {
+        deliver(BatchOutcome {
+          replies,
+          answered: true,
+        });
+      }
+    }
+  }
+
+  impl Drop for BatchReply {
+    fn drop(&mut self) {
+      // Nobody answered: the sink is being destroyed with a message no reader
+      // dequeued, or with a reader that unwound holding it — possibly part-way
+      // through the cut it owed the batch. Nothing it would have done is known to
+      // have happened, so the outcome reports that BESIDE the replies rather than
+      // through them: folded in, the fact would vanish on the arm-less
+      // ordering-proof round trip, whose served and unserved returns are one
+      // identical empty vector, and a barrier would certify clean over a cut that
+      // never ran.
+      if let Some(deliver) = self.deliver.take() {
+        deliver(dead_batch(self.arm_count));
+      }
+    }
   }
 
   /// A live inotify source. Dropping it tears the reader down; prefer
@@ -1264,8 +1385,15 @@ mod inotify_source {
       self.port.remove_watch(anchor)
     }
 
-    /// Stops the reader and closes the instance. The reader exits at its next
-    /// wake, so this blocks for at most one in-flight read + decode.
+    /// Stops the reader and closes the instance, JOINING the reader thread —
+    /// so nothing of this source is still running when it returns.
+    ///
+    /// The reader exits at its next wake, which on a healthy filesystem costs
+    /// one in-flight read + decode. It is not a bound: the flag and the
+    /// `Shutdown` message are both observed only BETWEEN operations, so a reader
+    /// already admitted into an arm's `inotify_add_watch` against a wedged mount
+    /// returns when the kernel says so and this waits exactly that long. The
+    /// driver therefore never performs this join on its blocking pool.
     pub(crate) fn shutdown(mut self) {
       self.teardown();
     }

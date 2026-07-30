@@ -1,6 +1,6 @@
 use super::{
   decode::{DecodeOutcome, InotifyMask, decode_events},
-  table::{Attribution, DrainDecision, WdTable},
+  table::{DrainDecision, WdTable},
 };
 use tributary_proto::WatchId;
 
@@ -141,26 +141,21 @@ mod decode {
 mod table {
   use super::*;
 
-  /// The anchors the table would fan a NON-IGNORED record on `wd` to, or `None`
-  /// when the `wd` is in the ambiguous reuse window (fenced to loss) — a compact
-  /// stand-in for matching [`Attribution`] at each assertion site.
-  fn attributed(t: &WdTable, wd: i32) -> Option<Vec<WatchId>> {
-    match t.attribute(wd) {
-      Attribution::Attributed(anchors) => Some(anchors.to_vec()),
-      Attribution::Ambiguous => None,
-    }
+  /// The anchors the table fans a NON-IGNORED record on `wd` to.
+  fn attributed(t: &WdTable, wd: i32) -> Vec<WatchId> {
+    t.attribute(wd).to_vec()
   }
 
   #[test]
   fn register_then_ignored_erases_and_fans_out() {
     let mut t = WdTable::new();
     t.register(7, watch(1));
-    assert_eq!(attributed(&t, 7), Some(vec![watch(1)]));
+    assert_eq!(attributed(&t, 7), vec![watch(1)]);
 
     let fanned = t.on_ignored(7);
     assert_eq!(fanned, vec![watch(1)]);
     assert!(
-      attributed(&t, 7).is_some_and(|a| a.is_empty()),
+      attributed(&t, 7).is_empty(),
       "IGNORED is the authoritative erase"
     );
   }
@@ -170,7 +165,7 @@ mod table {
     let mut t = WdTable::new();
     t.register(7, watch(1));
     t.alias(7, watch(2)); // the EEXIST path: same inode reached twice
-    assert_eq!(attributed(&t, 7), Some(vec![watch(1), watch(2)]));
+    assert_eq!(attributed(&t, 7), vec![watch(1), watch(2)]);
 
     let fanned = t.on_ignored(7);
     assert_eq!(fanned, vec![watch(1), watch(2)]);
@@ -189,7 +184,7 @@ mod table {
     );
     assert_eq!(
       attributed(&t, 7),
-      Some(vec![watch(2)]),
+      vec![watch(2)],
       "the drained anchor stops attributing"
     );
 
@@ -206,9 +201,10 @@ mod table {
     t.register(7, watch(1));
     assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
 
-    // Between rm_watch and the queued IN_IGNORED the entry still exists
-    // (attribution answers empty — the anchor was unwatched — but the wd is
-    // known, so a re-registration cannot collide).
+    // Between rm_watch and the queued IN_IGNORED the entry still exists:
+    // attribution answers empty (the anchor was unwatched), but the wd stays
+    // mapped until its marker — and no fresh install can land on it (grants
+    // are monotone below the rebuild threshold).
     assert!(t.contains(7), "draining entry survives until IGNORED");
     assert_eq!(
       t.begin_drain(watch(1)),
@@ -221,53 +217,75 @@ mod table {
     assert!(!t.contains(7));
   }
 
-  /// A `wd`-reuse race: a fresh install lands on a `wd` whose tombstone still
-  /// awaits its stale `IN_IGNORED`. Registering must revive the entry as a fresh
-  /// live generation, and the stale IGNORED must be ABSORBED — it clears the
-  /// remnant without erasing the new anchor (which would silently drop a live
-  /// watch, the exact loss this generation-correctness prevents).
+  /// The adoption invariant's data: a mapped `wd` — live or draining — is
+  /// never adoptable (and never granted again: a fresh install's `wd`
+  /// outgrows it), and only the consumed `IN_IGNORED` frees it.
   #[test]
-  fn register_onto_draining_survives_the_stale_ignored() {
+  fn a_mapped_wd_is_never_adoptable_until_its_marker_is_consumed() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert!(t.contains(7), "a live mapping refuses adoption");
+    assert!(t.is_live(7));
+
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    assert!(t.contains(7), "a draining tombstone still refuses adoption");
+    assert!(!t.is_live(7), "a tombstone is not an aliasing target");
+
+    let _ = t.on_ignored(7);
+    assert!(!t.contains(7), "the consumed marker frees the wd");
+    assert!(!t.is_live(7));
+  }
+
+  /// The tombstone the kernel can no longer owe a marker for: `erase_dead` is
+  /// the `EINVAL` proof's erase. It frees the `wd` at once — a marker the loss
+  /// swallowed would otherwise strand the entry for the fd's whole life — and
+  /// leaves the reverse index consistent, so a marker that DID survive behind
+  /// the sentinel no-ops on the unmapped `wd` and the next drain of the same
+  /// anchor re-issues nothing.
+  #[test]
+  fn erase_dead_frees_a_tombstone_whose_marker_can_never_come() {
     let mut t = WdTable::new();
     t.register(7, watch(1));
     assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
-    assert!(t.contains(7), "the tombstone awaits its IGNORED");
-
-    // The kernel recycled wd 7 for a brand-new watch before the old IGNORED
-    // landed. The fresh install replaces the tombstone with a live entry, but
-    // the `wd` is now in the AMBIGUOUS reuse window: a non-IGNORED record here
-    // could be an OLD (drained-watch) record queued ahead of the stale IGNORED,
-    // so it is fenced to loss, never attributed to the new watch.
-    t.register(7, watch(2));
     assert!(
-      matches!(t.attribute(7), Attribution::Ambiguous),
-      "a record in the reuse window is fenced, not attributed to the new watch"
+      t.contains(7),
+      "the tombstone stands until it is proven dead"
     );
 
-    // The OLD incarnation's IGNORED arrives: it is absorbed, not honored.
-    let fanned = t.on_ignored(7);
+    t.erase_dead(7);
+    assert!(!t.contains(7), "the proof frees the wd immediately");
+    assert!(!t.is_live(7));
     assert!(
-      fanned.is_empty(),
-      "the stale IGNORED fans to nobody (it belonged to the drained watch)"
+      t.wd_of(watch(1)).is_none(),
+      "the drained anchor keeps no reverse-index entry"
     );
     assert_eq!(
-      attributed(&t, 7),
-      Some(vec![watch(2)]),
-      "the new anchor survives the stale IGNORED and attribution resumes"
+      t.begin_drain(watch(1)),
+      DrainDecision::KeepWd,
+      "an erased tombstone re-issues no kernel removal"
+    );
+    assert!(
+      t.on_ignored(7).is_empty(),
+      "a surviving marker no-ops on the unmapped wd"
     );
 
-    // The new watch's own eventual IGNORED erases legitimately.
-    let fanned = t.on_ignored(7);
-    assert_eq!(
-      fanned,
-      vec![watch(2)],
-      "the live watch's own IGNORED erases"
-    );
+    // The erase is per-`wd`: a sibling tombstone is untouched (only the loss
+    // reap is wholesale).
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    t.register(9, watch(2));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    assert_eq!(t.begin_drain(watch(2)), DrainDecision::RemoveWd(9));
+    t.erase_dead(7);
     assert!(!t.contains(7));
+    assert!(
+      t.contains(9),
+      "the sibling tombstone still awaits its marker"
+    );
   }
 
-  /// A PLAIN draining entry (no reuse) still erases on its IGNORED — the reuse
-  /// handling must not change the ordinary self-induced teardown.
+  /// A PLAIN draining entry still erases on its IGNORED — the ordinary
+  /// self-induced teardown.
   #[test]
   fn plain_drain_still_erases_on_ignored() {
     let mut t = WdTable::new();
@@ -281,143 +299,47 @@ mod table {
     assert!(!t.contains(7), "the plain drain's IGNORED erases the entry");
   }
 
-  /// The kernel contract guarantees exactly one final `IN_IGNORED` per `wd`, so a
-  /// SECOND IGNORED after a reuse-absorbed one cannot happen — but if it did, it
-  /// erases legitimately rather than corrupting state.
+  /// A stale LIVE mapping (its kernel watch died with its markers still
+  /// queued) is erased by its OWN marker, fanning the kernel teardown out to
+  /// its anchors — and a SECOND marker on the then-unmapped `wd` (a
+  /// straggler behind the genuine one) no-ops. Because the `wd` is never
+  /// granted again (the no-wrap invariant), no replacement binding can stand
+  /// on it for either marker to erase — the post-loss stale marker can only
+  /// ever clear the stale mapping it belongs to.
   #[test]
-  fn second_ignored_after_reuse_erases() {
+  fn a_stale_mappings_markers_erase_only_the_stale_mapping() {
     let mut t = WdTable::new();
     t.register(7, watch(1));
-    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
-    t.register(7, watch(2));
+    // The kernel watch behind wd 7 dies (object deleted; markers queued or
+    // dropped behind an overflow). A queue loss lands first: live mappings
+    // survive it.
+    t.on_loss();
+    assert_eq!(attributed(&t, 7), vec![watch(1)]);
 
-    // First IGNORED: absorbed as the stale remnant.
-    assert!(t.on_ignored(7).is_empty());
-    assert_eq!(attributed(&t, 7), Some(vec![watch(2)]));
-
-    // A (contract-impossible) second IGNORED erases the live entry.
-    assert_eq!(t.on_ignored(7), vec![watch(2)]);
+    // The stale mapping's own marker arrives late (it was queued behind the
+    // overflow sentinel): it erases the mapping and fans the teardown.
+    assert_eq!(t.on_ignored(7), vec![watch(1)]);
     assert!(!t.contains(7));
+
+    // A straggling duplicate marker trails it: the wd is unmapped, so the
+    // straggler no-ops — nothing else can be addressed by it.
+    assert!(t.on_ignored(7).is_empty());
+    assert!(
+      !t.contains(7),
+      "a straggling marker maps nothing into being"
+    );
   }
 
   #[test]
   fn unknown_wd_attributes_to_nobody() {
     let t = WdTable::new();
-    assert!(attributed(&t, 99).is_some_and(|a| a.is_empty()));
+    assert!(attributed(&t, 99).is_empty());
   }
 
-  /// The fence's happy path stated on its own: a NON-IGNORED record on a `wd` in
-  /// the reuse window is [`Attribution::Ambiguous`] (→ the reader's loss barrier),
-  /// the stale IGNORED then closes the window, and a post-window record on the new
-  /// anchor attributes normally. This is the exact old-CREATE-before-stale-IGNORED
-  /// ordering the kernel produces on a recycled `wd`.
-  #[test]
-  fn reuse_window_fences_records_then_resumes() {
-    let mut t = WdTable::new();
-    t.register(7, watch(1));
-    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
-    t.register(7, watch(2)); // wd 7 recycled; watch(1)'s IGNORED still queued
-
-    // An OLD record (watch(1)'s CREATE) queued ahead of the stale IGNORED still
-    // carries wd 7 — fenced, never handed to watch(2).
-    assert_eq!(
-      attributed(&t, 7),
-      None,
-      "a record in the reuse window is ambiguous, fenced to loss"
-    );
-
-    // The stale IGNORED closes the window without erasing the new set.
-    assert!(
-      t.on_ignored(7).is_empty(),
-      "the stale IGNORED fans to nobody"
-    );
-
-    // A post-window record now attributes to the new watch normally.
-    assert_eq!(
-      attributed(&t, 7),
-      Some(vec![watch(2)]),
-      "attribution resumes for the new watch once the window closes"
-    );
-  }
-
-  /// A DOUBLE reuse: two incarnations were torn down while a third is live, so two
-  /// stale `IN_IGNORED`s are queued ahead of the new watch's events. The fence must
-  /// hold across BOTH markers — the count, not a bool, is what keeps a first IGNORED
-  /// from re-opening attribution to the wrong (second-drained) watch's records.
-  #[test]
-  fn double_reuse_fences_until_both_stale_ignoreds_drain() {
-    let mut t = WdTable::new();
-    t.register(7, watch(1));
-    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
-    t.register(7, watch(2)); // one stale IGNORED pending
-    assert_eq!(t.begin_drain(watch(2)), DrainDecision::RemoveWd(7));
-    t.register(7, watch(3)); // two stale IGNOREDs pending
-
-    assert_eq!(
-      attributed(&t, 7),
-      None,
-      "two stale IGNOREDs pending: records are fenced"
-    );
-    // First stale IGNORED absorbed; ONE still pending, so still fenced.
-    assert!(t.on_ignored(7).is_empty());
-    assert_eq!(
-      attributed(&t, 7),
-      None,
-      "one stale IGNORED still pending: the fence holds (a bool would have lifted it)"
-    );
-    // Second stale IGNORED absorbed; the window finally closes.
-    assert!(t.on_ignored(7).is_empty());
-    assert_eq!(
-      attributed(&t, 7),
-      Some(vec![watch(3)]),
-      "both stale markers drained: attribution resumes over the new set"
-    );
-
-    // The live watch's own IGNORED still erases legitimately.
-    assert_eq!(t.on_ignored(7), vec![watch(3)]);
-    assert!(!t.contains(7));
-  }
-
-  /// The stranding case: the reuse fence must NOT outlive an `IN_Q_OVERFLOW`. A
-  /// `wd` recycled onto a draining tombstone records
-  /// `pending_stale_ignored` and fences every record to [`Attribution::Ambiguous`]
-  /// until the stale `IN_IGNORED` decrements it — but an overflow can DROP that
-  /// marker (inotify(7)), so without a reset the fence stays up FOREVER, converting
-  /// every future record on the reused `wd` to loss (a permanent livelock under the
-  /// very overflow the covering rescan is meant to heal). `on_loss` clears the
-  /// window so attribution resumes over the new set.
-  #[test]
-  fn overflow_clears_a_stuck_reuse_fence() {
-    let mut t = WdTable::new();
-    t.register(7, watch(1));
-    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
-    t.register(7, watch(2)); // wd 7 recycled; watch(1)'s IGNORED still queued
-    assert_eq!(
-      attributed(&t, 7),
-      None,
-      "the reuse window fences records before the overflow"
-    );
-
-    // The overflow drops the stale IGNORED the fence was counting down — it will
-    // never arrive. The reset clears the window so the fence cannot strand.
-    t.on_loss();
-    assert_eq!(
-      attributed(&t, 7),
-      Some(vec![watch(2)]),
-      "after the overflow reset the reused wd attributes to the new watch, not Ambiguous forever"
-    );
-
-    // The new watch's own eventual IGNORED still erases legitimately (the dropped
-    // stale marker never comes).
-    assert_eq!(t.on_ignored(7), vec![watch(2)]);
-    assert!(!t.contains(7));
-  }
-
-  /// A draining tombstone awaits its own `IN_IGNORED` to erase; an overflow can drop
-  /// that marker, stranding the tombstone forever (a leak, and a latent trap — a
-  /// later reuse of the `wd` would set up a fresh fence for an IGNORED that was
-  /// already dropped). `on_loss` erases draining tombstones so the `wd` is clean
-  /// for the rescan's re-arm.
+  /// A draining tombstone awaits its own `IN_IGNORED` to erase; a queue loss
+  /// can drop that marker, and nothing else reaps a tombstone. `on_loss`
+  /// erases draining tombstones so the `wd` is clean for the rescan's
+  /// re-arm.
   #[test]
   fn overflow_resolves_a_draining_tombstone() {
     let mut t = WdTable::new();
@@ -425,53 +347,46 @@ mod table {
     assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
     assert!(t.contains(7), "the tombstone awaits its IGNORED");
 
-    // The overflow may have dropped that IGNORED; the reset erases the tombstone
-    // rather than letting it strand.
+    // The overflow may have dropped that IGNORED; the reap erases the
+    // tombstone rather than letting it strand.
     t.on_loss();
     assert!(
       !t.contains(7),
       "the draining tombstone is resolved, not stranded"
     );
 
-    // A later reuse of the wd now starts a CLEAN live entry — no fence waiting on a
-    // marker that was already dropped.
+    // The structure itself accepts a clean re-registration of the freed wd
+    // (a FRESH instance's table starts empty anyway; on one live fd the
+    // no-wrap invariant means no re-grant ever reaches this).
     t.register(7, watch(2));
     assert_eq!(
       attributed(&t, 7),
-      Some(vec![watch(2)]),
-      "the reused wd attributes immediately — the stale-marker trap is gone"
+      vec![watch(2)],
+      "the reused wd attributes immediately"
     );
   }
 
-  /// The compound window: a `wd` whose CURRENT incarnation has itself drained (a
-  /// draining tombstone) WHILE a stale `IN_IGNORED` from an earlier incarnation is
-  /// still pending — one overflow can drop BOTH awaited markers. The reset clears the
-  /// pending count AND erases the tombstone in a single pass.
+  /// Reaping a tombstone EARLY — its marker actually survived, queued behind
+  /// the loss sentinel — is safe: the straggling marker no-ops on the
+  /// unmapped `wd` (never granted again on this fd, so no fresh binding can
+  /// be standing there).
   #[test]
-  fn overflow_clears_pending_count_and_tombstone_together() {
+  fn a_tombstone_reaped_early_leaves_its_marker_a_noop() {
     let mut t = WdTable::new();
     t.register(7, watch(1));
-    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7)); // tombstone
-    t.register(7, watch(2)); // pending = 1, live = [watch(2)]
-    assert_eq!(t.begin_drain(watch(2)), DrainDecision::RemoveWd(7)); // live empties: draining again, pending still 1
-    assert!(t.contains(7));
-    assert_eq!(
-      attributed(&t, 7),
-      None,
-      "a still-pending stale marker fences even while the entry drains"
-    );
-
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
     t.on_loss();
-    assert!(
-      !t.contains(7),
-      "the overflow clears the pending count and erases the tombstone in one pass"
-    );
+    assert!(!t.contains(7));
+
+    // The marker the reap presumed dropped arrives after all.
+    assert!(t.on_ignored(7).is_empty(), "the straggler fans to nobody");
+    assert!(!t.contains(7));
   }
 
-  /// The overflow reset touches only WINDOW state (reuse fences + draining
-  /// tombstones): a plain live entry — and its alias fan-out — keeps attributing
-  /// across an overflow. Its events are lost for that buffer, but the `wd → anchors`
-  /// mapping is truth the rescan reconciles, never something to tear down.
+  /// The loss reap touches only draining tombstones: a live entry — and its
+  /// alias fan-out — keeps attributing across a loss. Its events are lost for
+  /// that buffer, but the `wd → anchors` mapping is truth the rescan
+  /// reconciles, never something to tear down.
   #[test]
   fn overflow_leaves_a_plain_live_entry_intact() {
     let mut t = WdTable::new();
@@ -481,34 +396,49 @@ mod table {
     t.on_loss();
     assert_eq!(
       attributed(&t, 7),
-      Some(vec![watch(1), watch(2)]),
-      "a live entry and its alias fan-out survive the overflow reset unchanged"
+      vec![watch(1), watch(2)],
+      "a live entry and its alias fan-out survive the loss reap unchanged"
     );
     // Teardown still flows normally afterwards.
     assert_eq!(t.on_ignored(7), vec![watch(1), watch(2)]);
     assert!(!t.contains(7));
   }
 
-  /// Loss specificity: `on_loss` is a reader decision for a DECODE-level loss (an
-  /// `IN_Q_OVERFLOW` sentinel or a decode-truncation). Absent any such loss the reset
-  /// is never called, and a reuse fence still fences until its stale IGNORED drains
-  /// normally — the non-loss fence behavior is unchanged (the ambiguous fence does
-  /// NOT reset itself).
+  /// The re-add `EEXIST` path: aliasing an anchor already on the entry is a
+  /// no-op — a duplicate would fan every record out twice.
   #[test]
-  fn reuse_fence_without_loss_still_drains_via_ignored() {
+  fn an_alias_readd_of_a_present_anchor_dedups() {
     let mut t = WdTable::new();
     t.register(7, watch(1));
-    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
-    t.register(7, watch(2));
-    assert_eq!(attributed(&t, 7), None, "fenced while pending");
-
-    // No loss reset: the stale IGNORED itself closes the window, exactly as before.
-    assert!(t.on_ignored(7).is_empty());
+    t.alias(7, watch(1));
     assert_eq!(
       attributed(&t, 7),
-      Some(vec![watch(2)]),
-      "the fence lifts on the stale IGNORED, not on any loss reset"
+      vec![watch(1)],
+      "the re-added anchor appears once"
     );
+    assert_eq!(
+      t.on_ignored(7),
+      vec![watch(1)],
+      "one teardown record per anchor"
+    );
+  }
+
+  /// The reverse index tracks a rebind: draining the old binding then
+  /// registering on a new `wd` moves the anchor, with the old entry left
+  /// draining for its own marker.
+  #[test]
+  fn wd_of_follows_a_cross_wd_rebind() {
+    let mut t = WdTable::new();
+    t.register(7, watch(1));
+    assert_eq!(t.wd_of(watch(1)), Some(7));
+    assert_eq!(t.begin_drain(watch(1)), DrainDecision::RemoveWd(7));
+    assert_eq!(t.wd_of(watch(1)), None);
+    t.register(9, watch(1));
+    assert_eq!(t.wd_of(watch(1)), Some(9));
+    assert_eq!(attributed(&t, 9), vec![watch(1)]);
+    // The old tombstone still resolves through its own marker.
+    assert!(t.on_ignored(7).is_empty());
+    assert!(!t.contains(7));
   }
 }
 

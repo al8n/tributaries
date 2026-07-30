@@ -4,15 +4,20 @@
 //! unmodified.
 
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, BTreeSet, HashMap},
+  future::Future,
   num::NonZeroU64,
   path::{Path, PathBuf},
   sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
   },
+  time::Duration,
 };
 
+use agnostic_lite::{
+  AsyncBlockingSpawner, LocalRuntimeLite, RuntimeLite, Yielder, tokio::TokioRuntime,
+};
 use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 
 use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
@@ -50,6 +55,28 @@ pub(crate) struct FakeNode {
 struct FakeSource {
   sender: async_channel::Sender<SourceMessage>,
   transport: Arc<crate::os::transport::TransportState>,
+  /// A loss the KERNEL has committed that no reader has forwarded yet — staged
+  /// by [`FakeFs::stage_kernel_loss`]. It sits in NO queue, so no
+  /// `SourceSnapshot` counts it and no drain can ingest it; the next control
+  /// batch this source answers flushes it onto the queue, mirroring the real
+  /// reader's cut of its kernel queue onto the lane before any batch reply.
+  /// [`FakeFs::send_lossy`] models the other side of that cut — a loss already
+  /// forwarded, and so already countable.
+  pending_kernel_loss: AtomicBool,
+}
+
+/// Elects one whole-batch decode loss on `transport` and forwards it down
+/// `sender` — the real protocol's in-order `Overflow`, shared by the
+/// already-forwarded injection ([`FakeFs::send_lossy`]) and the staged
+/// kernel-resident one, so both losses reach the queue by the same path and
+/// differ only in WHEN.
+fn forward_lossy(
+  transport: &crate::os::transport::TransportState,
+  sender: &async_channel::Sender<SourceMessage>,
+) {
+  crate::os::transport::forward_batch(transport, Vec::new(), true, |msg| {
+    sender.try_send(msg).is_ok()
+  });
 }
 
 struct FakeState {
@@ -166,10 +193,63 @@ struct FakeState {
   /// post-arm bracket ran, i.e. the `WidenArmed` completion is about to land
   /// on the op channel (only the `try_send` remains after the probe).
   probes: AtomicUsize,
+  /// Every [`batch_control`](FsOps::batch_control) ENTRY, in call order: the
+  /// scope it named and how many requests it carried. Recorded at the very top,
+  /// before any hold parks the call, so it counts batches SUBMITTED rather than
+  /// batches that got as far as executing — which is what a cell proving a dead
+  /// scope submits nothing further has to read. The request count discriminates
+  /// the shapes: a batch carrying ZERO requests is by construction the
+  /// ordering-proof round trip (no arm, no disarm — nothing but the reply), so a
+  /// cell can prove the batch it froze is that one and not an arm or disarm batch.
+  control_batches: Mutex<Vec<(ScopeId, usize)>>,
+  /// When set, the next [`batch_control`](FsOps::batch_control) for this scope
+  /// UNWINDS instead of returning — see
+  /// [`panic_next_control_batch`](FakeFs::panic_next_control_batch). One-shot:
+  /// taken (and cleared) when it fires.
+  batch_panic_arm: Mutex<Option<ScopeId>>,
+  /// When set, the next [`batch_control`](FsOps::batch_control) for this scope
+  /// RETURNS UNANSWERED, having executed nothing — see
+  /// [`kill_next_control_reader`](FakeFs::kill_next_control_reader). One-shot,
+  /// like the panic arm.
+  reader_death_arm: Mutex<Option<ScopeId>>,
+  /// When set, the next [`dispatch_control`](FsOps::dispatch_control) for this
+  /// scope is TAKEN and never answered — see
+  /// [`strand_next_control_reader`](FakeFs::strand_next_control_reader).
+  /// One-shot, like the arms above it.
+  reader_strand_arm: Mutex<Option<ScopeId>>,
+  /// Batches a stranded reader took: `(scope, request count)` and the answer
+  /// sink nobody will ever resolve. Holding the sink here is what keeps the
+  /// batch outstanding — dropping it would answer the batch as an unwind — so
+  /// these live for the fake's whole life.
+  stranded_batches: Mutex<Vec<(ScopeId, usize, super::ControlAnswer<FakeHandle>)>>,
   /// Per-directory disarms executed.
   disarms: Mutex<Vec<WatchId>>,
+  /// The set of watches whose kernel watch is currently INSTALLED in the fake's
+  /// model: an arm success inserts, a disarm removes. Unlike the append-only
+  /// `arms`/`disarms` logs, this reflects the live watch table, so a watch left
+  /// armed with no matching disarm (a re-add/disarm reorder orphan) shows up
+  /// here as a residual entry.
+  live_watches: Mutex<BTreeSet<WatchId>>,
+  /// When set, an arm EXECUTION whose path matches parks until the gate
+  /// releases — distinct from `arm_hold` (which freezes the whole batch,
+  /// disarms included) so a cell can freeze ONE watch's re-add while a
+  /// same-scope disarm batch races it.
+  arm_exec_hold: Mutex<Option<(PathBuf, HoldGate)>>,
   /// Enumerates executed, in call order.
   enumerates: Mutex<Vec<(WatchId, PathBuf)>>,
+  /// The transient anchor each armed watch currently has PUBLISHED, mirroring
+  /// the real executor's `O_PATH` anchor table: an arm that installs publishes
+  /// a fresh id, a disarm drops it, and an enumerate's dispatch takes it. The
+  /// ids are unique across the fake's life, so two publications for one watch
+  /// are distinguishable — which is the whole point, since a `WatchId` is
+  /// re-added under its own name after a loss.
+  anchors: Mutex<BTreeMap<WatchId, u64>>,
+  /// The publication id sequence feeding `anchors`.
+  anchor_seq: AtomicUsize,
+  /// Each executed enumerate's `(watch, anchor it was handed)`, in call order —
+  /// so a cell can prove WHICH publication a listing read through, and that a
+  /// listing entitled to one was not left listing the path.
+  enumerate_anchors: Mutex<Vec<(WatchId, Option<u64>)>>,
   /// Paths whose next arm fails with the given error (persistent).
   watch_failures: Mutex<HashMap<PathBuf, tributary_proto::WatchError>>,
   /// Paths whose arms resolve `Aliased` (the EEXIST fan-out outcome).
@@ -179,6 +259,11 @@ struct FakeState {
   /// When set, `enumerate` parks until the gate releases (the
   /// close-versus-in-flight-enumerate cell).
   enumerate_hold: Mutex<Option<HoldGate>>,
+  /// When set, an enumerate whose path matches parks until the gate releases —
+  /// distinct from `enumerate_hold` (which freezes every listing) so a cell can
+  /// strand ONE directory's read while the recovery re-reads that drive its
+  /// re-add still run.
+  enumerate_exec_hold: Mutex<Option<(PathBuf, HoldGate)>>,
   /// When set, `add_watch` and a discovery/re-arm `batch_control` park until
   /// the gate releases (the close-versus-in-flight-arm and
   /// stale-batch-across-replace cells).
@@ -236,12 +321,23 @@ impl Default for FakeState {
       stale_arms: Mutex::default(),
       prearm_entries: AtomicUsize::new(0),
       probes: AtomicUsize::new(0),
+      control_batches: Mutex::default(),
+      batch_panic_arm: Mutex::default(),
+      reader_death_arm: Mutex::default(),
+      reader_strand_arm: Mutex::default(),
+      stranded_batches: Mutex::default(),
       disarms: Mutex::default(),
+      live_watches: Mutex::default(),
+      arm_exec_hold: Mutex::default(),
       enumerates: Mutex::default(),
+      anchors: Mutex::default(),
+      anchor_seq: AtomicUsize::new(0),
+      enumerate_anchors: Mutex::default(),
       watch_failures: Mutex::default(),
       watch_aliases: Mutex::default(),
       enumerate_answers: Mutex::default(),
       enumerate_hold: Mutex::default(),
+      enumerate_exec_hold: Mutex::default(),
       arm_hold: Mutex::default(),
       prearm_hold: Mutex::default(),
       refresh_hold: Mutex::default(),
@@ -375,12 +471,59 @@ impl FakeFs {
   }
 
   /// Injects a decode-loss callback (every entry undecodable): the loss rides
-  /// the queue as an in-order `Overflow`.
+  /// the queue as an in-order `Overflow` — i.e. ALREADY FORWARDED, so the
+  /// driver's settle-edge drain counts and ingests it with no control round
+  /// trip. [`stage_kernel_loss`](Self::stage_kernel_loss) is the other side.
   pub(crate) fn send_lossy(&self, root: impl AsRef<Path>) {
     let (sender, transport) = self.source_of(root);
-    crate::os::transport::forward_batch(&transport, Vec::new(), true, |msg| {
-      sender.try_send(msg).is_ok()
-    });
+    forward_lossy(&transport, &sender);
+  }
+
+  /// Stages a KERNEL-RESIDENT loss on `root`'s source: the kernel has committed
+  /// an overflow and nothing has read it out. It enters no queue, so it is in no
+  /// lane, no `SourceSnapshot` counts it, and no drain — however many passes it
+  /// takes — can ingest it. Only a control batch this source answers flushes it,
+  /// strictly before that batch's reply, exactly where the real reader cuts its
+  /// kernel queue onto the lane. One-shot: the flush clears the flag.
+  pub(crate) fn stage_kernel_loss(&self, root: impl AsRef<Path>) {
+    let sources = self.state.sources.lock().unwrap();
+    let source = sources
+      .get(root.as_ref())
+      .and_then(|spawned| spawned.last())
+      .expect("a source was spawned for the root");
+    source.pending_kernel_loss.store(true, Ordering::SeqCst);
+  }
+
+  /// Forwards every source's staged kernel-resident loss, if any, onto its
+  /// queue. Called from the fake's [`batch_control`](FsOps::batch_control) at
+  /// the real reader's cut point — after the batch's own work, before its reply
+  /// — so a staged loss is on the lane strictly ahead of the completion the
+  /// driver reads as its ordering proof. A no-op when nothing is staged, which
+  /// is every other cell in the suite.
+  ///
+  /// Deliberately scope-agnostic: a proof batch carries NO requests, so nothing
+  /// in it names a root, and the fake keeps no scope→root map (a widen keeps its
+  /// source under the OLD root, so one built from root arms would drift). Any
+  /// batch reply therefore flushes every staged loss — stage one per cell, on
+  /// the root whose window is under test.
+  fn flush_staged_kernel_losses(&self) {
+    let staged: Vec<(
+      async_channel::Sender<SourceMessage>,
+      Arc<crate::os::transport::TransportState>,
+    )> = {
+      let sources = self.state.sources.lock().unwrap();
+      sources
+        .values()
+        .flatten()
+        .filter(|source| source.pending_kernel_loss.swap(false, Ordering::SeqCst))
+        .map(|source| (source.sender.clone(), Arc::clone(&source.transport)))
+        .collect()
+    };
+    // Forwarded OUTSIDE the map lock: the protocol's own permit accounting and
+    // the queue send must not run under a lock a concurrent spawn also takes.
+    for (sender, transport) in staged {
+      forward_lossy(&transport, &sender);
+    }
   }
 
   /// Injects the stream's terminal `Fatal`.
@@ -562,6 +705,16 @@ impl FakeFs {
   pub(crate) fn hold_enumerates(&self) -> HoldRelease {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.enumerate_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
+  /// Holds every subsequent enumerate OF `path` until released, leaving other
+  /// directories' listings free — so a cell can strand one watch's read on the
+  /// pool while the recovery that re-adds that same watch runs to completion.
+  pub(crate) fn hold_enumerates_at(&self, path: impl AsRef<Path>) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
+    *self.state.enumerate_exec_hold.lock().unwrap() =
+      Some((path.as_ref().to_path_buf(), Arc::clone(&gate)));
     HoldRelease { gate }
   }
 
@@ -765,6 +918,10 @@ impl FakeFs {
       .lock()
       .unwrap()
       .push((watch, path.to_path_buf()));
+    // Freeze THIS arm's execution if a path-targeted hold matches: a cell can
+    // stall one watch's re-add mid-batch (its batch's completion signal pending)
+    // while a same-scope disarm batch races it.
+    self.park_arm_exec(path);
     if let Some(err) = self.state.watch_failures.lock().unwrap().get(path) {
       return WatchOutcome::Failed(*err);
     }
@@ -776,6 +933,15 @@ impl FakeFs {
         return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
       }
     }
+    // The arm installs (or aliases) a kernel watch: record it live, so a reorder
+    // that installs it AFTER its disarm already ran shows as a residual entry.
+    self.state.live_watches.lock().unwrap().insert(watch);
+    // The arm also publishes its transient anchor, as the real executor does
+    // from the arm's reply. The id is fresh every time: re-arming a watch the
+    // core re-added supersedes the previous publication rather than renewing it,
+    // so a listing can be told apart by WHICH publication it read through.
+    let anchor = self.state.anchor_seq.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+    self.state.anchors.lock().unwrap().insert(watch, anchor);
     if let Some(wd) = self.state.watch_aliases.lock().unwrap().get(path) {
       return WatchOutcome::Aliased(*wd);
     }
@@ -783,14 +949,292 @@ impl FakeFs {
     WatchOutcome::Installed(wd)
   }
 
+  /// Parks an arm's execution on the path-targeted [`FakeFs::hold_arm_exec_at`]
+  /// gate — a no-op unless a gate is installed for exactly this `path`.
+  fn park_arm_exec(&self, path: &Path) {
+    self.park_on_path(&self.state.arm_exec_hold, path);
+  }
+
+  /// Parks on a PATH-TARGETED gate — a no-op unless the installed gate names
+  /// exactly this `path`. The capture is committed after the clone binds the
+  /// job to that gate instance, on the same reasoning as [`FakeFs::park_on`].
+  fn park_on_path(&self, hold: &Mutex<Option<(PathBuf, HoldGate)>>, path: &Path) {
+    let gate = hold
+      .lock()
+      .unwrap()
+      .as_ref()
+      .filter(|(held, _)| held == path)
+      .map(|(_, gate)| Arc::clone(gate));
+    if let Some(gate) = gate {
+      gate.2.fetch_add(1, Ordering::SeqCst);
+      let (held, cvar, _) = &*gate;
+      let mut parked = held.lock().unwrap();
+      while *parked {
+        parked = cvar.wait(parked).unwrap();
+      }
+    }
+  }
+
+  /// The watches the fake currently models as INSTALLED (armed, not yet
+  /// disarmed) — a residual entry is a reorder orphan.
+  pub(crate) fn live_watches(&self) -> BTreeSet<WatchId> {
+    self.state.live_watches.lock().unwrap().clone()
+  }
+
+  /// Holds every subsequent arm EXECUTION at `path` until released, leaving
+  /// same-scope disarm batches free — the re-add-versus-prune reorder cell.
+  pub(crate) fn hold_arm_exec_at(&self, path: impl AsRef<Path>) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
+    *self.state.arm_exec_hold.lock().unwrap() =
+      Some((path.as_ref().to_path_buf(), Arc::clone(&gate)));
+    HoldRelease { gate }
+  }
+
   /// Per-directory disarms executed so far.
   pub(crate) fn disarms(&self) -> Vec<WatchId> {
     self.state.disarms.lock().unwrap().clone()
   }
 
+  /// Every control batch SUBMITTED so far, in call order, as
+  /// `(scope, request count)`. Counted at the entry to
+  /// [`batch_control`](FsOps::batch_control) — before any hold — so a batch frozen
+  /// on a gate, or one that unwinds, is already here. A zero-request entry is the
+  /// ordering-proof round trip.
+  pub(crate) fn control_batches(&self) -> Vec<(ScopeId, usize)> {
+    self.state.control_batches.lock().unwrap().clone()
+  }
+
+  /// Arms the next [`batch_control`](FsOps::batch_control) for `scope` to UNWIND
+  /// instead of returning — the pool worker itself dying part-way through a batch.
+  /// [`kill_next_control_reader`](Self::kill_next_control_reader) is the other way
+  /// a batch goes unanswered, and the two are not interchangeable.
+  ///
+  /// ONE-SHOT, and scope-keyed: the arm is taken when it fires, so exactly one
+  /// batch dies and every later batch (this scope's or another's) behaves
+  /// normally. The arm lives in this fake's own state, which no other rig shares,
+  /// so it cannot reach another cell either.
+  ///
+  /// The panic is taken with NO [`FakeState`] lock held. That is load-bearing
+  /// rather than tidy: a `panic!` under one of these mutexes would POISON it, and
+  /// every later `lock().unwrap()` in the fake — including the one
+  /// [`HoldRelease::release`] needs to free a parked pool job — would panic in
+  /// turn, replacing the cell's report with an unrelated cascade.
+  pub(crate) fn panic_next_control_batch(&self, scope: ScopeId) {
+    *self.state.batch_panic_arm.lock().unwrap() = Some(scope);
+  }
+
+  /// Arms the next [`batch_control`](FsOps::batch_control) for `scope` to RETURN
+  /// having never been answered — the reader dying between dequeuing the batch and
+  /// replying to it, which the pool worker cannot see as anything but a normal
+  /// return.
+  ///
+  /// Distinct from [`panic_next_control_batch`](Self::panic_next_control_batch),
+  /// and not reachable through it: a panic unwinds the worker, which the completion
+  /// guard reports by itself. Here the worker returns, so the ONLY thing separating
+  /// this from a batch the reader served is the outcome's `answered` — and on the
+  /// ordering-proof round trip, which carries no arms, the two returns resolve an
+  /// identically empty vector.
+  ///
+  /// The batch executes NOTHING: no arm, no disarm, and no staged-loss flush,
+  /// because a reader that died before replying never cut its kernel queue onto the
+  /// lane. Its arms are still answered `Failed(Io)`, exactly as the real port
+  /// answers a batch its reader never ran, so no registration is stranded.
+  ///
+  /// ONE-SHOT and scope-keyed, like the panic arm.
+  pub(crate) fn kill_next_control_reader(&self, scope: ScopeId) {
+    *self.state.reader_death_arm.lock().unwrap() = Some(scope);
+  }
+
+  /// Takes the one-shot
+  /// [`kill_next_control_reader`](Self::kill_next_control_reader) arm if it names
+  /// `scope`.
+  fn take_reader_death(&self, scope: ScopeId) -> bool {
+    Self::take_scope_arm(&self.state.reader_death_arm, scope)
+  }
+
+  /// Arms the next DISPATCHED control batch for `scope` to be taken by a reader
+  /// that never answers it: neither its ops nor its reply ever happen, and the
+  /// batch stays outstanding for the rest of the fake's life.
+  ///
+  /// This is the reader wedged inside a syscall against a hung filesystem — the
+  /// one that observes nothing, not the batch and not its own shutdown, until the
+  /// kernel returns. It is distinct from every other way a batch fails to run,
+  /// and the distinction is the point: a
+  /// [`panic`](Self::panic_next_control_batch) unwinds the dispatching worker and
+  /// a [`reader death`](Self::kill_next_control_reader) answers it refused, so
+  /// both give the worker back and both reach a terminal. This one gives the
+  /// worker back and reaches NO terminal, which is precisely what a fixed-width
+  /// pool must survive arbitrarily many of.
+  ///
+  /// ONE-SHOT and scope-keyed, like the arms beside it.
+  pub(crate) fn strand_next_control_reader(&self, scope: ScopeId) {
+    *self.state.reader_strand_arm.lock().unwrap() = Some(scope);
+  }
+
+  /// Every batch a stranded reader took and never answered, as
+  /// `(scope, request count)`.
+  pub(crate) fn stranded_control_batches(&self) -> Vec<(ScopeId, usize)> {
+    self
+      .state
+      .stranded_batches
+      .lock()
+      .unwrap()
+      .iter()
+      .map(|(scope, requests, _)| (*scope, *requests))
+      .collect()
+  }
+
+  /// Records one SUBMITTED batch, at the top of whichever entry received it and
+  /// before any hold, gate or arm can divert it — so a batch frozen on a gate,
+  /// one that unwinds, and one a stranded reader keeps are all already counted.
+  fn record_control_batch(&self, scope: ScopeId, requests: usize) {
+    self
+      .state
+      .control_batches
+      .lock()
+      .unwrap()
+      .push((scope, requests));
+  }
+
+  /// Runs one control batch to its outcome, carrying the transport GENERATION it
+  /// was emitted for. The parking happens ONCE here (the hold point a test uses
+  /// to freeze a batch across a replace), then the generation is re-read: a batch
+  /// whose generation no longer matches the attached transport is a leftover of a
+  /// replaced stream and refuses every arm, exactly as the real source does —
+  /// landing nothing on the new transport.
+  fn run_control_batch(
+    &self,
+    scope: ScopeId,
+    generation: u64,
+    requests: Vec<ControlRequest>,
+  ) -> super::ControlBatchOutcome {
+    self.park_on(&self.state.arm_hold);
+    // The pool worker dying part-way through a batch, modeled at the one place it
+    // is observable: this call UNWINDS instead of returning, so the completion
+    // guard fires with its default end and no arm result is fed back. Taken
+    // BELOW the hold, so a cell can freeze one batch on a gate, arm the death
+    // while it is parked, and have the death land on the NEXT batch — the frozen
+    // one is already past this line.
+    if self.take_batch_panic(scope) {
+      panic!("the fake's control reader dies inside batch_control for {scope:?}");
+    }
+    // The READER dying between dequeuing the batch and replying to it — the other
+    // way a batch goes unanswered, and the one the worker cannot see. It returns
+    // normally with every arm refused and nothing executed: no arm, no disarm, and
+    // NO staged-loss flush, since the cut belongs to the reply this reader never
+    // sent. Only `answered` tells this apart from a served batch, and on the
+    // ordering-proof round trip it is the only thing that could.
+    if self.take_reader_death(scope) {
+      return super::ControlBatchOutcome {
+        resolutions: requests
+          .iter()
+          .filter_map(|request| match request {
+            ControlRequest::Arm { watch, .. } => Some(super::ArmResolution {
+              watch: *watch,
+              outcome: WatchOutcome::Failed(tributary_proto::WatchError::Io),
+            }),
+            ControlRequest::Disarm { .. } => None,
+          })
+          .collect(),
+        answered: false,
+      };
+    }
+    let attached = self
+      .state
+      .scope_generation
+      .lock()
+      .unwrap()
+      .get(&scope)
+      .copied();
+    if attached != Some(generation) {
+      // A deliberate refusal, so it ANSWERS: nothing ran, every arm says so, and
+      // the fake is the one that decided it — exactly as the real source reports
+      // its own generation front-check.
+      return super::ControlBatchOutcome {
+        resolutions: requests
+          .into_iter()
+          .filter_map(|request| match request {
+            ControlRequest::Arm { watch, path, .. } => {
+              self
+                .state
+                .stale_arms
+                .lock()
+                .unwrap()
+                .push((watch, path.to_path_buf()));
+              Some(super::ArmResolution {
+                watch,
+                outcome: WatchOutcome::Failed(tributary_proto::WatchError::Gone),
+              })
+            }
+            ControlRequest::Disarm { .. } => None,
+          })
+          .collect(),
+        answered: true,
+      };
+    }
+    let mut outcomes = Vec::new();
+    for request in requests {
+      match request {
+        ControlRequest::Arm {
+          watch,
+          parent,
+          name,
+          path,
+          expected,
+        } => outcomes.push(super::ArmResolution {
+          watch,
+          outcome: self.arm_one(scope, watch, parent, path.as_path(), &name, expected),
+        }),
+        ControlRequest::Disarm { watch } => {
+          self.state.disarms.lock().unwrap().push(watch);
+          self.state.live_watches.lock().unwrap().remove(&watch);
+          self.state.anchors.lock().unwrap().remove(&watch);
+        }
+      }
+    }
+    // The reader's pre-reply cut, modeled at its real position: a loss the
+    // kernel had already committed reaches the queue HERE — past this batch's
+    // work, before the completion the driver sees — so the reply is an ordering
+    // proof rather than an unrelated round trip. A batch REFUSED for a stale
+    // generation, or one whose reader died, returned above without reaching this
+    // line, exactly as a real batch no reader served crosses nothing and so cuts
+    // nothing.
+    self.flush_staged_kernel_losses();
+    super::ControlBatchOutcome {
+      resolutions: outcomes,
+      answered: true,
+    }
+  }
+
+  /// Takes the one-shot [`panic_next_control_batch`](Self::panic_next_control_batch)
+  /// arm if it names `scope`. Separate from the `panic!` itself so the lock guard is
+  /// released before the unwind starts.
+  fn take_batch_panic(&self, scope: ScopeId) -> bool {
+    Self::take_scope_arm(&self.state.batch_panic_arm, scope)
+  }
+
+  /// Takes a one-shot scope-keyed arm if it names `scope`, leaving it disarmed.
+  fn take_scope_arm(arm: &Mutex<Option<ScopeId>>, scope: ScopeId) -> bool {
+    let mut armed = arm.lock().unwrap();
+    if *armed == Some(scope) {
+      *armed = None;
+      true
+    } else {
+      false
+    }
+  }
+
   /// Enumerates executed so far.
   pub(crate) fn enumerates(&self) -> Vec<(WatchId, PathBuf)> {
     self.state.enumerates.lock().unwrap().clone()
+  }
+
+  /// Each executed enumerate's `(watch, anchor publication it read through)`,
+  /// in execution order. A `None` is a listing that fell back to the absolute
+  /// path, and two entries sharing an id would be two listings over one
+  /// publication.
+  pub(crate) fn enumerate_anchors(&self) -> Vec<(WatchId, Option<u64>)> {
+    self.state.enumerate_anchors.lock().unwrap().clone()
   }
 
   fn park_on(&self, hold: &Mutex<Option<HoldGate>>) {
@@ -811,8 +1255,29 @@ impl FakeFs {
 }
 
 /// Releases work parked by [`FakeFs::hold_spawns`] / [`FakeFs::hold_teardowns`].
+///
+/// # The gate opens on drop, and that is load-bearing
+///
+/// A held gate parks a blocking-pool job on a condition variable. If a cell
+/// panics — which is exactly what a cell does when it FINDS the defect it exists
+/// to catch — an explicit `release()` placed after the assertions never runs, the
+/// parked job never wakes, and the runtime's shutdown waits on it forever. The
+/// intended fail-fast report becomes a hung test binary instead, and the defect
+/// is reported as a timeout with no assertion text at all.
+///
+/// Releasing on `Drop` makes every unwind path open the gate, so a cell cannot
+/// wedge the binary by holding one. `release()` stays available for the cells that
+/// open a gate mid-test and keep testing afterwards, and it is idempotent: it
+/// stores `false` and notifies, so an explicit call followed by the drop is
+/// harmless.
 pub(crate) struct HoldRelease {
   gate: HoldGate,
+}
+
+impl Drop for HoldRelease {
+  fn drop(&mut self) {
+    self.release();
+  }
 }
 
 impl HoldRelease {
@@ -846,9 +1311,12 @@ impl SourceControl for FakeHandle {
   fn shutdown(mut self) {
     // The wedge gate parks INSIDE the call, after the handle moved in —
     // exactly the phase where no Drop backstop can exist. Drop itself never
-    // waits, or a failing test would hang its own teardown.
+    // waits, or a failing test would hang its own teardown. The bind is
+    // acknowledged exactly as `park_on` does, so a cell can settle on the
+    // shutdown having parked (the observable that a close broke the loop).
     let gate = self.state.teardown_hold.lock().unwrap().clone();
     if let Some(gate) = gate {
+      gate.2.fetch_add(1, Ordering::SeqCst);
       let (held, cvar, _) = &*gate;
       let mut parked = held.lock().unwrap();
       while *parked {
@@ -872,6 +1340,8 @@ impl Drop for FakeHandle {
 
 impl FsOps for FakeFs {
   type Handle = FakeHandle;
+  /// The fake's stand-in for an `O_PATH` fd: the publication id its arm minted.
+  type Anchor = u64;
 
   fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
     // Record the resume point this spawn was configured with, BEFORE any hold
@@ -953,7 +1423,11 @@ impl FsOps for FakeFs {
       .unwrap()
       .entry(root.clone())
       .or_default()
-      .push(FakeSource { sender, transport });
+      .push(FakeSource {
+        sender,
+        transport,
+        pending_kernel_loss: AtomicBool::new(false),
+      });
     self.state.spawn_order.lock().unwrap().push("stream_live");
     self.state.spawns.fetch_add(1, Ordering::SeqCst);
     // The post-live wedge parks HERE — the stream is live and injectable, the
@@ -1120,67 +1594,51 @@ impl FsOps for FakeFs {
     self.arm_one(scope, watch, parent, path, name, expected)
   }
 
-  // The batch entry the driver calls, carrying the transport GENERATION the
-  // batch was emitted for. The parking happens ONCE here (the hold point a
-  // test uses to freeze a batch across a replace), then the generation is
-  // re-read: a batch whose generation no longer matches the attached
-  // transport is a leftover of a replaced stream and refuses every arm,
-  // exactly as the real source does — landing nothing on the new transport.
+  // The blocking batch entry: the fake answers its own arms, so it needs no
+  // reader and the whole batch runs here.
   fn batch_control(
     &self,
     scope: ScopeId,
     generation: u64,
     requests: Vec<ControlRequest>,
-  ) -> Vec<(WatchId, WatchOutcome)> {
-    self.park_on(&self.state.arm_hold);
-    let attached = self
-      .state
-      .scope_generation
-      .lock()
-      .unwrap()
-      .get(&scope)
-      .copied();
-    if attached != Some(generation) {
-      return requests
-        .into_iter()
-        .filter_map(|request| match request {
-          ControlRequest::Arm { watch, path, .. } => {
-            self
-              .state
-              .stale_arms
-              .lock()
-              .unwrap()
-              .push((watch, path.to_path_buf()));
-            Some((
-              watch,
-              WatchOutcome::Failed(tributary_proto::WatchError::Gone),
-            ))
-          }
-          ControlRequest::Disarm { .. } => None,
-        })
-        .collect();
+  ) -> super::ControlBatchOutcome {
+    self.record_control_batch(scope, requests.len());
+    self.run_control_batch(scope, generation, requests)
+  }
+
+  // The entry the DRIVER calls. Answering inline is what an executor with no
+  // reader does, and the fake is one — so unless a reader has been stranded on
+  // this batch, this is `batch_control` with the outcome handed to the sink.
+  fn dispatch_control(
+    &self,
+    scope: ScopeId,
+    generation: u64,
+    requests: Vec<ControlRequest>,
+    answer: super::ControlAnswer<FakeHandle>,
+  ) {
+    self.record_control_batch(scope, requests.len());
+    // A reader that took the batch and will not answer: park the sink, unexecuted,
+    // and RETURN. Returning is the whole model — a wedged reader holds the batch,
+    // not the thread that handed it over — so the caller's worker is free while the
+    // batch stays outstanding forever. Taken above the generation front-check
+    // because a reader stuck in a syscall stops reading long before it could form
+    // an opinion about which transport the batch names.
+    if Self::take_scope_arm(&self.state.reader_strand_arm, scope) {
+      self
+        .state
+        .stranded_batches
+        .lock()
+        .unwrap()
+        .push((scope, requests.len(), answer));
+      return;
     }
-    let mut outcomes = Vec::new();
-    for request in requests {
-      match request {
-        ControlRequest::Arm {
-          watch,
-          parent,
-          name,
-          path,
-          expected,
-        } => outcomes.push((
-          watch,
-          self.arm_one(scope, watch, parent, path.as_path(), &name, expected),
-        )),
-        ControlRequest::Disarm { watch } => self.state.disarms.lock().unwrap().push(watch),
-      }
-    }
-    outcomes
+    answer.resolve(self.run_control_batch(scope, generation, requests));
   }
 
   fn remove_watch(&self, _scope: ScopeId, watch: WatchId) {
     self.state.disarms.lock().unwrap().push(watch);
+    self.state.live_watches.lock().unwrap().remove(&watch);
+    self.state.anchors.lock().unwrap().remove(&watch);
   }
 
   // A descending replace's pre-arm of the new root on its fresh transport,
@@ -1405,14 +1863,28 @@ impl FsOps for FakeFs {
     Ok(())
   }
 
-  fn enumerate(&self, watch: WatchId, path: &Path) -> RawEnumerate {
+  fn take_enumerate_anchor(&self, watch: WatchId) -> Option<Self::Anchor> {
+    self.state.anchors.lock().unwrap().remove(&watch)
+  }
+
+  fn enumerate(&self, watch: WatchId, anchor: Option<Self::Anchor>, path: &Path) -> RawEnumerate {
     self.park_on(&self.state.enumerate_hold);
+    self.park_on_path(&self.state.enumerate_exec_hold, path);
     self
       .state
       .enumerates
       .lock()
       .unwrap()
       .push((watch, path.to_path_buf()));
+    // Recorded past both holds, so the log runs in EXECUTION order while the
+    // anchor each entry carries was decided back at dispatch — the pairing a
+    // cell needs to race a stranded listing against a re-add.
+    self
+      .state
+      .enumerate_anchors
+      .lock()
+      .unwrap()
+      .push((watch, anchor));
     if let Some(answer) = self
       .state
       .enumerate_answers
@@ -1593,5 +2065,283 @@ impl ScopeRegistry for GatedRegistry {
     _exempt: Option<ScopeId>,
   ) -> Option<PathBuf> {
     None
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A bounded, NON-FIFO blocking-pool runtime — the adversarial scheduler the
+// per-scope control dispatch must survive.
+//
+// `tributary-fs` is generic over an arbitrary `RuntimeLite`, whose
+// `spawn_blocking_detach` promises NO start-order for detached blocking work
+// and may be bounded to a handful of workers. `TokioRuntime`'s pool is large
+// and roughly FIFO, so it can never exercise the failure a bounded LIFO pool
+// invites: a chain that parks a pool worker to wait on another batch deadlocks
+// once every worker parks on a predecessor still queued behind it. This runtime
+// delegates EVERYTHING to `TokioRuntime` except detached blocking work, which
+// it routes through a process-global pool of a FIXED, small worker count that
+// dispatches submissions newest-first (LIFO) and behind a start gate a test
+// opens once its batches have accumulated.
+// ---------------------------------------------------------------------------
+
+/// The bounded LIFO pool behind [`NonFifoRuntime`]. Workers pull the
+/// most-recently submitted job first, and only once the gate is open — so a
+/// test can freeze the pool, let a run of same-scope control batches pile up,
+/// then release them into the worst-case (successors-before-predecessor) start
+/// order.
+struct NonFifoPool {
+  inner: Mutex<NonFifoInner>,
+  cv: Condvar,
+}
+
+struct NonFifoInner {
+  /// Workers idle until this is set — the accumulate-then-release gate.
+  open: bool,
+  /// Submitted jobs, popped newest-first (LIFO).
+  stack: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+impl NonFifoPool {
+  fn run_worker(&self) {
+    loop {
+      let job = {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+          if inner.open
+            && let Some(job) = inner.stack.pop()
+          {
+            break job;
+          }
+          inner = self.cv.wait(inner).unwrap();
+        }
+      };
+      // Run OUTSIDE the lock: the job may block (the old in-pool chain parks
+      // here in a predecessor's receiver), and it must not hold the pool lock.
+      job();
+    }
+  }
+}
+
+/// The one installed pool. `spawn_blocking_detach` is a static method with no
+/// receiver, so the pool it feeds lives here; a test installs one before the
+/// driver it drives dispatches any blocking work.
+static NON_FIFO_POOL: Mutex<Option<Arc<NonFifoPool>>> = Mutex::new(None);
+
+fn submit_to_non_fifo_pool(job: Box<dyn FnOnce() + Send>) {
+  let pool = NON_FIFO_POOL
+    .lock()
+    .unwrap()
+    .clone()
+    .expect("install_non_fifo_pool before the NonFifoRuntime driver dispatches blocking work");
+  pool.inner.lock().unwrap().stack.push(job);
+  pool.cv.notify_one();
+}
+
+/// A test's handle to the installed [`NonFifoPool`]'s start gate.
+pub(crate) struct NonFifoPoolHandle {
+  pool: Arc<NonFifoPool>,
+}
+
+impl NonFifoPoolHandle {
+  /// Freezes the pool: every subsequent submission accumulates undispatched
+  /// until [`open_gate`](Self::open_gate).
+  pub(crate) fn close_gate(&self) {
+    self.pool.inner.lock().unwrap().open = false;
+  }
+
+  /// Releases the accumulated jobs into the pool's bounded, newest-first
+  /// workers.
+  pub(crate) fn open_gate(&self) {
+    self.pool.inner.lock().unwrap().open = true;
+    self.pool.cv.notify_all();
+  }
+}
+
+/// Installs a fresh bounded LIFO pool with `workers` worker threads (open), and
+/// returns a handle to its gate. The worker threads are detached and outlive
+/// the call; the process reaps them at exit (one install per test binary).
+pub(crate) fn install_non_fifo_pool(workers: usize) -> NonFifoPoolHandle {
+  let pool = Arc::new(NonFifoPool {
+    inner: Mutex::new(NonFifoInner {
+      open: true,
+      stack: Vec::new(),
+    }),
+    cv: Condvar::new(),
+  });
+  for _ in 0..workers {
+    let pool = Arc::clone(&pool);
+    std::thread::spawn(move || pool.run_worker());
+  }
+  *NON_FIFO_POOL.lock().unwrap() = Some(Arc::clone(&pool));
+  NonFifoPoolHandle { pool }
+}
+
+/// `TokioRuntime`'s blocking spawner — the source for every associated type and
+/// non-blocking method this runtime reuses.
+type TokioBlocking = <TokioRuntime as LocalRuntimeLite>::BlockingSpawner;
+
+/// A blocking spawner whose DETACHED path feeds the bounded LIFO
+/// [`NonFifoPool`]; everything else mirrors Tokio's (the driver only ever
+/// dispatches control/spawn/enumerate work through `spawn_blocking_detach`).
+#[derive(Clone, Copy)]
+pub(crate) struct NonFifoBlockingSpawner;
+
+impl Yielder for NonFifoBlockingSpawner {
+  fn yield_now() -> impl Future<Output = ()> + Send {
+    <TokioBlocking as Yielder>::yield_now()
+  }
+  fn yield_now_local() -> impl Future<Output = ()> {
+    <TokioBlocking as Yielder>::yield_now_local()
+  }
+}
+
+impl AsyncBlockingSpawner for NonFifoBlockingSpawner {
+  type JoinHandle<R>
+    = <TokioBlocking as AsyncBlockingSpawner>::JoinHandle<R>
+  where
+    R: Send + 'static;
+
+  fn spawn_blocking<F, R>(f: F) -> Self::JoinHandle<R>
+  where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+  {
+    <TokioBlocking as AsyncBlockingSpawner>::spawn_blocking(f)
+  }
+
+  fn spawn_blocking_detach<F, R>(f: F)
+  where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+  {
+    submit_to_non_fifo_pool(Box::new(move || {
+      let _ = f();
+    }));
+  }
+}
+
+/// A `RuntimeLite` identical to [`TokioRuntime`] except that detached blocking
+/// work runs on the bounded, LIFO [`NonFifoPool`]. Used to drive the real
+/// driver loop under a pool that gives no FIFO start-order guarantee.
+#[derive(Clone, Copy)]
+pub(crate) struct NonFifoRuntime;
+
+impl LocalRuntimeLite for NonFifoRuntime {
+  type LocalSpawner = <TokioRuntime as LocalRuntimeLite>::LocalSpawner;
+  type BlockingSpawner = NonFifoBlockingSpawner;
+  type Instant = <TokioRuntime as LocalRuntimeLite>::Instant;
+  type LocalInterval = <TokioRuntime as LocalRuntimeLite>::LocalInterval;
+  type LocalSleep = <TokioRuntime as LocalRuntimeLite>::LocalSleep;
+  type LocalDelay<F>
+    = <TokioRuntime as LocalRuntimeLite>::LocalDelay<F>
+  where
+    F: Future;
+  type LocalTimeout<F>
+    = <TokioRuntime as LocalRuntimeLite>::LocalTimeout<F>
+  where
+    F: Future;
+
+  fn new() -> Self {
+    Self
+  }
+  fn name() -> &'static str {
+    "non-fifo"
+  }
+  fn fqname() -> &'static str {
+    "tributary_fs::driver::testing::NonFifoRuntime"
+  }
+  fn block_on<F: Future>(f: F) -> F::Output {
+    TokioRuntime::block_on(f)
+  }
+  fn interval_local(period: Duration) -> Self::LocalInterval {
+    TokioRuntime::interval_local(period)
+  }
+  fn interval_local_at(start: Self::Instant, period: Duration) -> Self::LocalInterval {
+    TokioRuntime::interval_local_at(start, period)
+  }
+  fn sleep_local(duration: Duration) -> Self::LocalSleep {
+    TokioRuntime::sleep_local(duration)
+  }
+  fn sleep_local_until(instant: Self::Instant) -> Self::LocalSleep {
+    TokioRuntime::sleep_local_until(instant)
+  }
+  fn delay_local<F>(duration: Duration, fut: F) -> Self::LocalDelay<F>
+  where
+    F: Future,
+  {
+    TokioRuntime::delay_local(duration, fut)
+  }
+  fn delay_local_at<F>(deadline: Self::Instant, fut: F) -> Self::LocalDelay<F>
+  where
+    F: Future,
+  {
+    TokioRuntime::delay_local_at(deadline, fut)
+  }
+  fn timeout_local<F>(duration: Duration, fut: F) -> Self::LocalTimeout<F>
+  where
+    F: Future,
+  {
+    TokioRuntime::timeout_local(duration, fut)
+  }
+  fn timeout_local_at<F>(deadline: Self::Instant, fut: F) -> Self::LocalTimeout<F>
+  where
+    F: Future,
+  {
+    TokioRuntime::timeout_local_at(deadline, fut)
+  }
+}
+
+impl RuntimeLite for NonFifoRuntime {
+  type Spawner = <TokioRuntime as RuntimeLite>::Spawner;
+  type AfterSpawner = <TokioRuntime as RuntimeLite>::AfterSpawner;
+  type Interval = <TokioRuntime as RuntimeLite>::Interval;
+  type Sleep = <TokioRuntime as RuntimeLite>::Sleep;
+  type Delay<F>
+    = <TokioRuntime as RuntimeLite>::Delay<F>
+  where
+    F: Future + Send;
+  type Timeout<F>
+    = <TokioRuntime as RuntimeLite>::Timeout<F>
+  where
+    F: Future + Send;
+
+  fn yield_now() -> impl Future<Output = ()> + Send {
+    TokioRuntime::yield_now()
+  }
+  fn interval(period: Duration) -> Self::Interval {
+    TokioRuntime::interval(period)
+  }
+  fn interval_at(start: Self::Instant, period: Duration) -> Self::Interval {
+    TokioRuntime::interval_at(start, period)
+  }
+  fn sleep(duration: Duration) -> Self::Sleep {
+    TokioRuntime::sleep(duration)
+  }
+  fn sleep_until(instant: Self::Instant) -> Self::Sleep {
+    TokioRuntime::sleep_until(instant)
+  }
+  fn delay<F>(duration: Duration, fut: F) -> Self::Delay<F>
+  where
+    F: Future + Send,
+  {
+    TokioRuntime::delay(duration, fut)
+  }
+  fn delay_at<F>(deadline: Self::Instant, fut: F) -> Self::Delay<F>
+  where
+    F: Future + Send,
+  {
+    TokioRuntime::delay_at(deadline, fut)
+  }
+  fn timeout<F>(duration: Duration, fut: F) -> Self::Timeout<F>
+  where
+    F: Future + Send,
+  {
+    TokioRuntime::timeout(duration, fut)
+  }
+  fn timeout_at<F>(deadline: Self::Instant, fut: F) -> Self::Timeout<F>
+  where
+    F: Future + Send,
+  {
+    TokioRuntime::timeout_at(deadline, fut)
   }
 }
