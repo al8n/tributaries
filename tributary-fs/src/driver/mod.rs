@@ -3358,6 +3358,11 @@ impl RealFs {
           });
         }
         Publication::Disarm(watch) => {
+          // An ORDERING comparison, and deliberately not the equality a stamped
+          // read would impose: a batch reclaims what its own generation or an
+          // OLDER one published and refuses only a NEWER publication. Narrowed
+          // to equality it would decline removals the batch is obliged to make,
+          // holding their `O_PATH` anchors open until the scope is detached.
           if anchors
             .get(&watch)
             .is_some_and(|(_, published, _)| *published <= generation)
@@ -7271,6 +7276,16 @@ type PendingControl = BTreeMap<ScopeId, VecDeque<(u64, Vec<ControlRequest>, Opti
 /// scope-keyed wait would leave the replacement root partially armed and every
 /// clean fence latched for as long as that syscall takes to return, which on a
 /// dead mount is indefinitely.
+///
+/// The generation is held bare rather than inside a
+/// [`Stamped`](crate::stamped::Stamped), which would guard nothing here: the
+/// mark's whole content IS its generation, so such a wrapper has no value to
+/// withhold and every read of it would go through the stamp regardless. Nor is
+/// there one incarnation for it to be read against — the two questions asked of
+/// the mark compare it to different things, the scope's CURRENT lane in
+/// [`kick_control_queue`] (is a batch this queue must wait for still running?)
+/// and a COMPLETING batch's own generation at its `ControlBatchDone` (is this the
+/// batch the mark names?).
 type ControlInflight = BTreeMap<ScopeId, u64>;
 
 /// Whether `generation` names a transport `scope` has already swapped away from,

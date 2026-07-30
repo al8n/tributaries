@@ -82,15 +82,18 @@ use std::{
 use tributary_proto::{
   Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, FileKind, Identity, Instant,
   Interest, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope, ScopeId,
-  Segment, SubtreeScope, WatchError, WatchId,
+  Segment, SubtreeScope, WatchError, WatchId, monitor::CoverageWorkEpoch,
 };
 
-use crate::os::{
-  BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, SourceError,
-  SourceEvent,
-  linux::{RawLinuxEvent, WatchOutcome},
-  transport::BudgetPermit,
-  windows::RawWindowsEvent,
+use crate::{
+  os::{
+    BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, SourceError,
+    SourceEvent,
+    linux::{RawLinuxEvent, WatchOutcome},
+    transport::BudgetPermit,
+    windows::RawWindowsEvent,
+  },
+  stamped::Stamped,
 };
 
 mod compile;
@@ -719,15 +722,18 @@ struct CutProof {
 
 /// The window one cut speaks for, stamped at the instant its request was
 /// committed to and inherited unchanged by the proof it mints.
+///
+/// The stamp is the scope's [`Monitor::coverage_work_epoch`] at that instant, and
+/// the value it carries is the open ordinal of the newest fence then pending —
+/// the last fence this cut reaches. Keeping the reach [`Stamped`] is what makes
+/// the epoch check unskippable rather than merely required: the mark licenses
+/// nothing at any other epoch, there is no way to read the reach at all without
+/// naming the epoch it is being read under, and the epoch cannot be named
+/// without reading it off the Monitor — a [`CoverageWorkEpoch`] is unforgeable
+/// here, so no site can satisfy the check with the stamp the mark already
+/// carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct CutMark {
-  /// The scope's [`Monitor::coverage_work_epoch`] then. The mark licenses
-  /// nothing at any other epoch.
-  epoch: u64,
-  /// The open ordinal of the newest fence then pending, and so the last fence
-  /// this cut reaches.
-  covers: u64,
-}
+struct CutMark(Stamped<CoverageWorkEpoch, u64>);
 
 /// A cut that has been asked for: the token of the batch carrying the request,
 /// and the mark that batch's completion earns.
@@ -742,14 +748,24 @@ struct CutRequest {
 }
 
 impl CutMark {
+  /// The mark a cut taken under coverage-work epoch `epoch` earns: it reaches
+  /// the fences through open ordinal `covers` and no further.
+  const fn new(epoch: CoverageWorkEpoch, covers: u64) -> Self {
+    Self(Stamped::new(epoch, covers))
+  }
+
   /// The stronger of two marks: a later epoch wins outright, and within one
   /// epoch the further reach does.
   ///
   /// Reaches never merge across epochs. Only one epoch is ever current, so the
   /// older stamp already licenses nothing, and carrying its reach onto the newer
-  /// one would claim an ordering the newer cut never took.
-  const fn strongest(self, other: Self) -> Self {
-    if other.epoch > self.epoch || (other.epoch == self.epoch && other.covers > self.covers) {
+  /// one would claim an ordering the newer cut never took. The comparison
+  /// therefore decides which mark is kept WHOLE and nothing else, and it is made
+  /// inside the stamped value so that neither reach has to be read out to make
+  /// it: a reach is still only ever read under an epoch the scope currently
+  /// holds.
+  fn strongest(self, other: Self) -> Self {
+    if other.0.supersedes(&self.0) {
       other
     } else {
       self
@@ -759,12 +775,8 @@ impl CutMark {
   /// How far this mark licenses a CLEAN verdict at `epoch` — nothing at all
   /// unless it was stamped under exactly the coverage work the scope still
   /// holds.
-  const fn reach(self, epoch: u64) -> Option<u64> {
-    if self.epoch == epoch {
-      Some(self.covers)
-    } else {
-      None
-    }
+  fn reach(self, epoch: CoverageWorkEpoch) -> Option<u64> {
+    self.0.current(epoch).copied()
   }
 }
 
@@ -781,10 +793,15 @@ impl CutProof {
   /// successor once nothing is out. Anything stamped under an epoch the scope
   /// has since left speaks for nothing, a request included, because its reply
   /// could only ever mint a proof that is stale on arrival.
-  const fn answers_for(self, epoch: u64, high_water: u64) -> bool {
+  fn answers_for(self, epoch: CoverageWorkEpoch, high_water: u64) -> bool {
     match (self.in_flight, self.proven) {
-      (Some(request), _) if request.mark.epoch == epoch => true,
-      (_, Some(proven)) => proven.epoch == epoch && proven.covers >= high_water,
+      // A request licenses its whole tranche or nothing, so its reach is not
+      // consulted — only whether it still speaks at this epoch at all.
+      (Some(request), _) if request.mark.reach(epoch).is_some() => true,
+      (_, Some(proven)) => match proven.reach(epoch) {
+        Some(covers) => covers >= high_water,
+        None => false,
+      },
       _ => false,
     }
   }
@@ -794,7 +811,7 @@ impl CutProof {
   /// Only the proven prefix licenses anything, and only as far as the tranche
   /// its request was made behind. A stale prefix and a request still out both
   /// license nothing: the fences beyond withhold, and the window asks again.
-  const fn licenses_through(self, epoch: u64) -> Option<u64> {
+  fn licenses_through(self, epoch: CoverageWorkEpoch) -> Option<u64> {
     match self.proven {
       Some(proven) => proven.reach(epoch),
       None => None,
@@ -1795,7 +1812,7 @@ impl DriverCore {
 
   /// The coverage-work epoch a cut proof for `scope` is stamped with and
   /// checked against — see [`CutProof`].
-  fn coverage_epoch(&self, scope: ScopeId) -> u64 {
+  fn coverage_epoch(&self, scope: ScopeId) -> CoverageWorkEpoch {
     self.monitor.coverage_work_epoch(scope)
   }
 
@@ -1835,7 +1852,7 @@ impl DriverCore {
     if let Some(entry) = self.cover_fences.get_mut(&scope) {
       let covers = entry.high_water();
       if !entry.cut.answers_for(epoch, covers) {
-        entry.cut.latch(token, CutMark { epoch, covers });
+        entry.cut.latch(token, CutMark::new(epoch, covers));
       }
     }
   }

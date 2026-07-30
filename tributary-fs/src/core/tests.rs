@@ -4668,6 +4668,113 @@ mod descending {
     (core, scope, root_watch)
   }
 
+  /// A mark licenses nothing outside the epoch it was stamped under.
+  ///
+  /// Every cell below rests on this, and it is a property of the TYPE rather than
+  /// of any protocol here: a `CutMark` keeps its reach stamped, so the reach
+  /// cannot be read at all without naming the epoch it is read under, and a mark
+  /// read under any other epoch yields nothing to license a verdict with. A site
+  /// that samples the window under one epoch and spends the sample under another
+  /// therefore cannot reach the false-clean defect by forgetting to re-check —
+  /// there is no accessor that skips the check.
+  ///
+  /// Both directions are asserted because the rule is EQUALITY and not recency: a
+  /// mark is exactly as silent under a stamp on either side of its own. Reading it
+  /// as an ordering instead would license a proof over coverage work the scope
+  /// acquired after the cut was taken, which is the whole defect.
+  ///
+  /// Asserted on a bare `u64` stamp rather than through `CutMark`: a production
+  /// mark stamps with a `CoverageWorkEpoch`, which only the Monitor mints and only
+  /// ever as the epoch a scope reads NOW, so naming three of them here would mean
+  /// driving a scope through two acquisitions just to buy stamps for a property
+  /// that belongs to the stamped value alone. That unforgeability is the other
+  /// half of the guarantee, and the compiler enforces it rather than this cell:
+  /// nothing recovers an incarnation from a sample, so no site can satisfy the
+  /// check with the stamp it is already holding.
+  ///
+  /// Mutation witness: let the stamped read yield its value whatever stamp it is
+  /// read under and both `None`s below become the reach.
+  #[test]
+  fn a_mark_licenses_nothing_outside_the_epoch_it_was_stamped_under() {
+    let sample = Stamped::new(7u64, 3u64);
+
+    assert_eq!(
+      sample.current(7),
+      Some(&3),
+      "the epoch it was stamped under reads the reach it earned"
+    );
+    assert_eq!(
+      sample.current(8),
+      None,
+      "coverage work moving the scope on leaves the mark licensing nothing"
+    );
+    assert_eq!(
+      sample.current(6),
+      None,
+      "and a stamp on the other side of its own is no more current, so the rule \
+       is equality rather than recency"
+    );
+
+    // Which of two samples is the stronger stays answerable — it is a question
+    // about the stamps, and within one stamp about the reaches — while answering
+    // it hands out neither reach, so it is never a licence to spend one.
+    assert!(
+      Stamped::new(8u64, 0u64).supersedes(&sample),
+      "a later epoch supersedes outright, however short its reach"
+    );
+    assert!(
+      !Stamped::new(6u64, 9u64).supersedes(&sample),
+      "and a departed epoch supersedes nothing, however far its reach"
+    );
+    assert!(
+      Stamped::new(7u64, 4u64).supersedes(&sample),
+      "while within one epoch the further reach wins"
+    );
+  }
+
+  /// Formatting a stamped sample discloses neither the reach nor its stamp.
+  ///
+  /// A `Debug` rendering is a read that costs no stamp, so a derived one would be
+  /// the whole guarantee's back door: a site could format a mark, lift the reach
+  /// out of the text, and license a verdict without ever naming the epoch it was
+  /// reading under. The stamp is withheld with it because these stamps are only
+  /// unforgeable as values — the `u64` used here renders as text that parses back
+  /// into a stamp, which is all a site needs to read a sample under the very
+  /// epoch that sample carries.
+  ///
+  /// Asserted on the impl rather than on a `CutMark` because that is where the
+  /// rendering is decided: every carrier of a stamped value wraps it in a single
+  /// field, so a derive there can only delegate here and has no field of its own
+  /// to disclose.
+  ///
+  /// Mutation witness: restore `#[derive(Debug)]` on the type and both the reach
+  /// and the stamp appear in the rendering below.
+  #[test]
+  fn formatting_a_stamped_sample_discloses_nothing() {
+    // Digit strings long enough that neither can turn up incidentally in a type
+    // name, a field count, or the other field's text.
+    let sample = Stamped::new(58_231_774u64, 90_460_913u64);
+    let compact = format!("{sample:?}");
+    let expanded = format!("{sample:#?}");
+
+    for rendering in [&compact, &expanded] {
+      assert!(
+        !rendering.contains("90460913"),
+        "the reach must not be recoverable from a rendering: {rendering}"
+      );
+      assert!(
+        !rendering.contains("58231774"),
+        "nor the stamp, which a site could parse back and read the reach under: \
+         {rendering}"
+      );
+    }
+
+    assert_eq!(
+      compact, "Stamped { .. }",
+      "and the rendering carries no other disclosure either"
+    );
+  }
+
   /// A predecessor's completion cannot prove a request made after it.
   ///
   /// The completion signal is per scope, and a scope's batches are a QUEUE: a

@@ -359,6 +359,47 @@ impl RearmKickoff {
   }
 }
 
+/// A scope's coverage-work epoch: an opaque count of the times that scope has
+/// ACQUIRED work [`Monitor::coverage_settled`] counts.
+///
+/// Only [`Monitor::coverage_work_epoch`] mints one and the count itself is never
+/// handed out, so the only way to name the epoch a scope reads NOW is to ask the
+/// monitor that owns it. Deliberately no constructor and no conversion from a
+/// raw counter: a holder of evidence stamped with an epoch can then compare that
+/// stamp against a value it had to OBSERVE, and cannot manufacture one to
+/// compare against instead.
+///
+/// One scope's epochs are ordered by acquisition, so a later one compares
+/// greater. Two different scopes' epochs are unrelated counts, and comparing
+/// them answers nothing.
+///
+/// Reading one off a monitor is the whole of the API:
+///
+/// ```
+/// use core::num::NonZeroU64;
+/// use tributary_proto::{Capabilities, Monitor, ScopeId};
+///
+/// let monitor = Monitor::new(Capabilities::new());
+/// let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+/// assert_eq!(
+///   monitor.coverage_work_epoch(scope),
+///   monitor.coverage_work_epoch(scope),
+/// );
+/// ```
+///
+/// Naming one any other way does not compile, which is what makes a holder's
+/// currency check unskippable rather than merely expected:
+///
+/// ```compile_fail,E0423
+/// use tributary_proto::monitor::CoverageWorkEpoch;
+///
+/// // No constructor, and the count is private: an epoch cannot be asserted,
+/// // only observed.
+/// let claimed = CoverageWorkEpoch(0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CoverageWorkEpoch(u64);
+
 /// The primitive-agnostic top half of the `tributaries` state machine.
 ///
 /// `Monitor` owns everything the design says must be written once and shared
@@ -1189,7 +1230,8 @@ impl Monitor {
   /// counts — a re-arm obligation, a detached-and-held move source, an
   /// in-flight cold read carrying a coalesced re-arm obligation, an unverified
   /// adoption edge, or a parked rename half. Releasing such work never moves
-  /// it. 0 for an unknown or torn-down scope, and reading it allocates nothing.
+  /// it. An unknown or torn-down scope reads the never-acquired floor, and
+  /// reading it allocates nothing.
   ///
   /// This exists so an ordering proof taken over a settled scope can be BOUND
   /// to the state that made it settled, instead of to an enumeration of the
@@ -1205,9 +1247,14 @@ impl Monitor {
   /// scope acquiring no work leaves the epoch fixed, so a stamp taken over a
   /// quiescent scope stays valid and the holder converges instead of chasing a
   /// moving value.
+  ///
+  /// The epoch is returned as an opaque [`CoverageWorkEpoch`] rather than as its
+  /// count, which is what makes the check above unskippable: a holder cannot
+  /// build the value this returns out of the stamp it already carries, so
+  /// establishing currency means reading the monitor.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn coverage_work_epoch(&self, scope: ScopeId) -> u64 {
-    self.coverage_work_epochs.get(&scope).copied().unwrap_or(0)
+  pub fn coverage_work_epoch(&self, scope: ScopeId) -> CoverageWorkEpoch {
+    CoverageWorkEpoch(self.coverage_work_epochs.get(&scope).copied().unwrap_or(0))
   }
 
   /// Whether `scope` has a standing terminal coverage deficit: an arm-refused
