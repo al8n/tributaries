@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/al8n/tributaries"
 documentation = "https://docs.rs/tributaries"
-description = "The public top-level crate of the tributaries stack: subsumes overlapping watch subscriptions into the disjoint roots tributary-fs requires, and attributes each event back to every covering subscription."
+description = "Cross-platform filesystem notification: overlapping watch subscriptions are subsumed into disjoint roots, and every event is attributed back to each subscription covering it."
 categories = ["filesystem", "asynchronous"]
-keywords = ["filesystem", "notify", "watcher", "subsume"]
+keywords = ["filesystem", "notify", "watcher", "fsevents", "inotify"]
 
 [features]
 default = ["fs"]
@@ -36,8 +36,8 @@ futures-util = { version = "0.3", default-features = false, features = [
 ] }
 iradix = "0.3"
 thiserror = "2"
-tributary-fs = { version = "0.2", path = "../tributary-fs", optional = true }
-tributary-proto = { version = "0.2", path = "../tributary-proto" }
+tributary-fs = { version = "0.1", path = "../tributary-fs", optional = true }
+tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
 # Mirror a real consumer's manifest: the indexer-shaped integration suite
@@ -49,7 +49,7 @@ tributary-proto = { version = "0.2", path = "../tributary-proto" }
 agnostic-lite = { version = "0.7", features = ["time"] }
 proptest = "1"
 tempfile = "3"
-tributary-fs = { version = "0.2", path = "../tributary-fs", features = ["tokio"] }
+tributary-fs = { version = "0.1", path = "../tributary-fs", features = ["tokio"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }

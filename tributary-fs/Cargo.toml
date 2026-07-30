@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/al8n/tributaries"
 documentation = "https://docs.rs/tributary-fs"
-description = "Filesystem source crate for the tributaries stack: the async driver over tributary-proto (macOS FSEvents backend)."
-categories = ["filesystem", "asynchronous", "os::macos-apis"]
-keywords = ["filesystem", "notify", "fsevents", "watcher"]
+description = "Async, runtime-agnostic filesystem watcher over the tributary-proto Sans-I/O core, with inotify, fanotify, FSEvents, ReadDirectoryChangesW and USN journal backends."
+categories = ["filesystem", "asynchronous", "os::linux-apis", "os::macos-apis", "os::windows-apis"]
+keywords = ["filesystem", "notify", "inotify", "fsevents", "watcher"]
 
 [features]
 tokio = ["agnostic-lite/tokio"]
@@ -32,7 +32,7 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 thiserror = "2"
-tributary-proto = { version = "0.2", path = "../tributary-proto" }
+tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
 tokio = { version = "1", features = [
