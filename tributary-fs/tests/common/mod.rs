@@ -27,6 +27,7 @@
 
 use std::{
   collections::BTreeSet,
+  io,
   path::{Path, PathBuf},
   time::Duration,
 };
@@ -86,7 +87,7 @@ impl Inventory {
   /// event obliged.
   pub fn seeded(root: &Path) -> Self {
     let mut entries = BTreeSet::new();
-    read_subtree(root, &mut entries);
+    inventory_subtree(root, &mut entries);
     Self {
       root: root.to_path_buf(),
       entries,
@@ -148,7 +149,7 @@ impl Inventory {
   /// for at all, `stale` is one whose undoing it never accounted for.
   pub fn disagreement(&self) -> Vec<String> {
     let mut truth = BTreeSet::new();
-    read_subtree(&self.root, &mut truth);
+    inventory_subtree(&self.root, &mut truth);
     let mut lines: Vec<String> = truth
       .difference(&self.entries)
       .map(|path| format!("unwitnessed {}", path.display()))
@@ -184,7 +185,7 @@ impl Inventory {
       Ok(meta) => {
         self.entries.insert(path.to_path_buf());
         if meta.is_dir() {
-          read_subtree(path, &mut self.entries);
+          model_subtree(path, &mut self.entries);
         }
       }
       Err(_) => self.forget(path),
@@ -207,7 +208,7 @@ impl Inventory {
     }
     self.forget(at);
     if at == self.root {
-      read_subtree(&self.root, &mut self.entries);
+      model_subtree(&self.root, &mut self.entries);
     } else {
       self.learn(at);
     }
@@ -219,25 +220,69 @@ impl Inventory {
   }
 }
 
+/// Adds every path below `dir` to `out`, `dir` itself excluded, or PANICS
+/// naming the enumeration that failed.
+///
+/// The panic is the point. This walk is what both the model's re-reads and the
+/// independent truth calculation stand on, so an enumeration failure lowered to
+/// "this directory was empty" would shrink BOTH sides by the same ground and
+/// leave them agreeing — a convergence claim reported with no successful
+/// inventory behind it. A test that cannot read the tree has no truth to compare
+/// against and must say so.
+fn inventory_subtree(dir: &Path, out: &mut BTreeSet<PathBuf>) {
+  if let Err(err) = read_subtree(dir, out) {
+    panic!("inventory: enumerating {} failed: {err}", dir.display());
+  }
+}
+
+/// The same walk for the MODEL's own re-reads, absorbing a `dir` that has
+/// already vanished.
+///
+/// The model folds events in behind a tree that is still moving, so a subtree
+/// gone by the time its event is applied is described by a later event rather
+/// than by this walk. Nothing else is absorbed: a re-read that fails for any
+/// other reason is the same blind enumeration [`inventory_subtree`] refuses.
+fn model_subtree(dir: &Path, out: &mut BTreeSet<PathBuf>) {
+  match read_subtree(dir, out) {
+    Ok(()) => {}
+    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+    Err(err) => panic!("inventory: re-reading {} failed: {err}", dir.display()),
+  }
+}
+
 /// Adds every path below `dir` to `out`, `dir` itself excluded.
 ///
 /// Symlinks are recorded but never followed: the model holds the tree the
 /// backends watch, and a link pointing out of the root is one entry rather than
-/// a subtree. A directory that cannot be read contributes nothing — the real
-/// tree races this walk, and a directory that vanished mid-walk is a fact some
-/// later event carries rather than a reason to abandon the model.
-fn read_subtree(dir: &Path, out: &mut BTreeSet<PathBuf>) {
-  let Ok(entries) = std::fs::read_dir(dir) else {
-    return;
-  };
-  for entry in entries.flatten() {
+/// a subtree.
+///
+/// `NotFound` — and only `NotFound` — is absorbed: the real tree races this
+/// walk, and an object that vanished mid-walk is a fact some later event carries
+/// rather than a reason to abandon the model. Every other failure is the
+/// enumeration itself breaking and travels to the caller.
+fn read_subtree(dir: &Path, out: &mut BTreeSet<PathBuf>) -> io::Result<()> {
+  for entry in std::fs::read_dir(dir)? {
+    let entry = match entry {
+      Ok(entry) => entry,
+      Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+      Err(err) => return Err(err),
+    };
     let path = entry.path();
-    let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+    let is_dir = match entry.file_type() {
+      Ok(kind) => kind.is_dir(),
+      Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+      Err(err) => return Err(err),
+    };
     out.insert(path.clone());
     if is_dir {
-      read_subtree(&path, out);
+      match read_subtree(&path, out) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+      }
     }
   }
+  Ok(())
 }
 
 /// Drives `inventory` off `watcher`'s stream until `settled` holds of the model,

@@ -53,12 +53,24 @@ fn scratch_root(tag: &str) -> PathBuf {
   dir.canonicalize().expect("canonicalize scratch root")
 }
 
-fn watcher() -> TokioWatcher {
-  // Pinned rather than left to `Auto`, which prefers the journal wherever one is
-  // enabled: every cell in this suite names a `ReadDirectoryChangesW` behaviour, so
-  // an Auto-selected USN source would let them pass while proving nothing about the
-  // backend they are written for.
+/// The constructor for every cell whose SUBJECT is a `ReadDirectoryChangesW`
+/// behaviour.
+///
+/// Pinned rather than left to `Auto`, which prefers the journal wherever one is
+/// enabled: an Auto-selected USN source would let such a cell pass while proving
+/// nothing about the backend it is written for.
+fn rdcw_watcher() -> TokioWatcher {
   TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Rdcw)).expect("build watcher")
+}
+
+/// The constructor for the cells whose subject IS the selection.
+///
+/// Deliberately NOT [`rdcw_watcher`]: a selection cell built on a pinned backend
+/// asserts about a choice its own constructor already made, which makes the
+/// assertion true by construction and the cell worthless. Nothing here may
+/// name a backend.
+fn auto_watcher() -> TokioWatcher {
+  TokioWatcher::new(WatcherOptions::new()).expect("build watcher")
 }
 
 /// Waits until an event satisfying `pred` arrives, or the deadline lapses.
@@ -81,7 +93,7 @@ async fn wait_for(
 #[tokio::test]
 async fn forced_rdcw_reports_itself() {
   let root = scratch_root("select");
-  let w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Rdcw)).expect("build");
+  let w = rdcw_watcher();
   let handle = w.watch(&root, Interest::all()).await.expect("watch");
   assert_eq!(w.backend_of(handle).expect("live root").as_str(), "rdcw");
   w.close().await.expect("close");
@@ -99,7 +111,7 @@ async fn forced_rdcw_reports_itself() {
 async fn verbs_flow_end_to_end() {
   let root = scratch_root("verbs");
   std::fs::create_dir_all(root.join("deep")).expect("mkdir");
-  let mut w = watcher();
+  let mut w = rdcw_watcher();
   let _handle = w.watch(&root, Interest::all()).await.expect("watch");
 
   let file = root.join("deep").join("probe.txt");
@@ -131,23 +143,46 @@ async fn verbs_flow_end_to_end() {
   let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A same-tree rename pairs into one Moved (or degrades to covered halves —
-/// both legal; what is NOT legal is silence on either end).
+/// A same-tree rename accounts for BOTH ends: one paired `Moved` naming the
+/// destination and carrying the source, or the documented degradation into a
+/// `Removed` on the source AND a `Created` on the destination.
+///
+/// Either end alone is a lost half, so neither alone settles this. Both proofs
+/// are [`delivered`] rather than `covers`: a `Rescan` at or above the root
+/// satisfies coverage of both paths at once without pairing anything, which
+/// would let a backend that decodes no rename at all pass the cell named for
+/// rename decoding.
 #[tokio::test]
-async fn renames_cover_both_ends() {
+async fn renames_deliver_both_ends() {
   let root = scratch_root("rename");
   let from = root.join("old.txt");
   std::fs::write(&from, b"x").expect("seed");
-  let mut w = watcher();
+  let mut w = rdcw_watcher();
   let _handle = w.watch(&root, Interest::all()).await.expect("watch");
 
   let to = root.join("new.txt");
   std::fs::rename(&from, &to).expect("rename");
+
+  // Accumulated across the drain rather than matched on one event: the
+  // degraded form spends its two halves on two separate events, so no single
+  // event can carry that proof.
+  let (mut paired, mut source_half, mut destination_half) = (false, false, false);
+  let settled = wait_for(&mut w, |e| {
+    match e.kind() {
+      EventKind::Moved(moved) if delivered(e, &to) && moved.from() == from.as_path() => {
+        paired = true;
+      }
+      EventKind::Removed if delivered(e, &from) => source_half = true,
+      EventKind::Created if delivered(e, &to) => destination_half = true,
+      _ => {}
+    }
+    paired || (source_half && destination_half)
+  })
+  .await;
   assert!(
-    wait_for(&mut w, |e| covers(e, &to) || covers(e, &from))
-      .await
-      .is_some(),
-    "a rename is observed on at least one end"
+    settled.is_some(),
+    "a rename accounts for both ends: paired={paired} removed_source={source_half} \
+     created_destination={destination_half}"
   );
 
   w.close().await.expect("close");
@@ -158,7 +193,7 @@ async fn renames_cover_both_ends() {
 #[tokio::test]
 async fn watch_unwatch_cycles_reclaim() {
   let root = scratch_root("cycles");
-  let w = watcher();
+  let w = rdcw_watcher();
   for _ in 0..8 {
     let handle = w.watch(&root, Interest::all()).await.expect("watch");
     w.unwatch(handle).await.expect("unwatch");
@@ -175,7 +210,7 @@ async fn root_delete_is_loud() {
   let root = parent.join("victim");
   std::fs::create_dir_all(&root).expect("mkdir");
   let root = root.canonicalize().expect("canonicalize");
-  let mut w = watcher();
+  let mut w = rdcw_watcher();
   let _handle = w.watch(&root, Interest::all()).await.expect("watch");
 
   std::fs::remove_dir_all(&root).expect("delete the watched root");
@@ -196,7 +231,7 @@ async fn root_delete_is_loud() {
 #[tokio::test]
 async fn overflow_degrades_to_rescan() {
   let root = scratch_root("overflow");
-  let mut w = watcher();
+  let mut w = rdcw_watcher();
   let _handle = w.watch(&root, Interest::all()).await.expect("watch");
 
   // A dense burst of tiny creates+removes: far more record bytes than one
@@ -224,7 +259,7 @@ async fn overflow_degrades_to_rescan() {
 /// dead watch.
 #[tokio::test]
 async fn unc_root_is_refused() {
-  let w = watcher();
+  let w = rdcw_watcher();
   let err = w
     .watch(Path::new(r"\\localhost\c$\Windows"), Interest::all())
     .await
@@ -267,7 +302,7 @@ async fn zoo_volumes_flow() {
     let root = PathBuf::from(&base).join(format!("watch-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("zoo scratch");
     let root = root.canonicalize().expect("canonicalize zoo root");
-    let mut w = watcher();
+    let mut w = rdcw_watcher();
     let _handle = w.watch(&root, Interest::all()).await.expect("watch");
     let file = root.join("zoo.txt");
     std::fs::write(&file, b"x").expect("create");
@@ -285,7 +320,7 @@ async fn zoo_volumes_flow() {
     let root = PathBuf::from(&base).join(format!("watch-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("zoo scratch");
     let root = root.canonicalize().expect("canonicalize zoo root");
-    let w = watcher();
+    let w = rdcw_watcher();
     let err = w
       .watch(&root, Interest::all())
       .await
@@ -307,10 +342,13 @@ async fn zoo_volumes_flow() {
 /// The journal arm: on an elevated runner the NTFS zoo volume (or the
 /// workspace volume) selects the USN backend under Auto; unprivileged hosts
 /// legally fall back to RDCW — both selections must flow events.
+///
+/// The one cell in this suite that must NOT pin a backend: it is the ladder
+/// itself under test, so it builds with [`auto_watcher`].
 #[tokio::test]
 async fn auto_selection_flows_on_either_arm() {
   let root = scratch_root("auto-arm");
-  let mut w = watcher();
+  let mut w = auto_watcher();
   let handle = w.watch(&root, Interest::all()).await.expect("watch");
   let backend = w.backend_of(handle).expect("live root");
   assert!(
@@ -504,7 +542,7 @@ async fn replace_root_same_volume_keeps_the_backend() {
   let root = scratch_root("replace");
   let sub = root.join("y");
   std::fs::create_dir_all(&sub).expect("mkdir");
-  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Rdcw)).expect("build");
+  let mut w = rdcw_watcher();
   let handle = w.watch(&sub, Interest::all()).await.expect("watch");
   assert_eq!(w.backend_of(handle).expect("live").as_str(), "rdcw");
 
@@ -545,7 +583,7 @@ async fn replace_root_cross_volume_reruns_the_ladder() {
   let new_root = PathBuf::from(&base).join(format!("replace-{}", std::process::id()));
   std::fs::create_dir_all(&new_root).expect("zoo scratch");
   let new_root = new_root.canonicalize().expect("canonicalize zoo root");
-  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Auto)).expect("build");
+  let mut w = auto_watcher();
   let handle = w.watch(&old_root, Interest::all()).await.expect("watch");
   let before = w.backend_of(handle).expect("live").as_str().to_owned();
 
