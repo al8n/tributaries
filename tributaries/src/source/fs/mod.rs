@@ -731,6 +731,11 @@ impl<R> Source<OsString> for FsSource<R> {
     // The reserved namespace, matched on the LEAF component only (never a
     // substring of an interior directory): every cookie of every instance,
     // ours and foreign, live and crash-leftover — always suppressed, always.
+    //
+    // The fs layer keeps its cookies in a DIRECTORY of this same namespace (it
+    // needs one nobody else may write). The leaf rule covers both ends of that:
+    // the directory's own create carries a leaf in the namespace, and so does
+    // every cookie inside it — so neither surfaces as a user change.
     key
       .last()
       .and_then(|leaf| leaf.to_str())

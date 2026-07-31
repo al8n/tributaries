@@ -346,10 +346,10 @@ impl LedgerInner {
     self.census.count(reaped);
     #[cfg(not(all(test, feature = "tokio")))]
     let _ = reaped;
-    if let Some(path) = ob.path.as_ref()
-      && self.by_path.get(path) == Some(&id)
+    if let Some(file) = ob.file.as_ref()
+      && self.by_path.get(file.path()) == Some(&id)
     {
-      self.by_path.remove(path);
+      self.by_path.remove(file.path());
     }
     if self.by_name.get(&ob.name) == Some(&id) {
       self.by_name.remove(&ob.name);
@@ -400,6 +400,542 @@ impl LedgerInner {
   }
 }
 
+/// The reserved-namespace stem of the cookie directory. The umbrella suppresses
+/// every event whose LEAF component starts with this same stem, so the directory's
+/// own create and the cookies inside it are both invisible to consumers — which is
+/// required, since the directory is this driver's artifact and not a user change.
+const COOKIE_DIR_PREFIX: &str = ".tributaries-sync-cookies";
+
+/// The directory a cookie is created inside, held OPEN for as long as any cookie
+/// created through it is outstanding.
+///
+/// # What it is for
+///
+/// The cookie must land inside the watched root, because the whole mechanism is
+/// the ordered kernel event its creation mints. That put every past cookie in a
+/// directory belonging to the WATCHED TREE, where anyone permitted to write may
+/// unlink a name and rebind it — and where, in consequence, no removal addressed
+/// by pathname could ever be safe.
+///
+/// This type takes that permission away. The directory is created by this driver,
+/// `0o700`, owned by the effective user: binding a name in it requires write
+/// permission on it, which the mode grants to nobody else. A cookie's name can
+/// therefore not be rebound between the removal's proof and its unlink, and both
+/// operations go through this descriptor rather than through the name — so not
+/// even an intermediate component of the path participates.
+///
+/// # Where it lives, and why not directly under the root
+///
+/// It is created inside the directory the sync named (see [`cookie_dir`]), not at
+/// the root. Under a DESCENDING backend a directory outside the scope's retained
+/// cover carries no kernel watch, and a cookie there would mint no event at all.
+/// A child of the sync's own directory is covered exactly when that directory is,
+/// so nesting adds no coverage requirement the caller did not already have; a
+/// directory at the root would add one the caller cannot satisfy.
+///
+/// # What a pre-existing directory must prove
+///
+/// A directory already standing at the name is VERIFIED, never adopted on faith:
+/// it must be a real directory (not a symlink — the open refuses to follow one),
+/// owned by this effective user, and carry no group or other permission bits. A
+/// directory failing any of those is refused and the sync reports a typed write
+/// failure. Adopting one instead would hand the whole argument above to whoever
+/// created it.
+///
+/// The name carries the effective uid so two users watching one shared tree get
+/// one directory EACH rather than one refusing the other forever; the ownership
+/// check then only ever fires on a directory somebody planted.
+///
+/// # What this does not give
+///
+/// The mode distinguishes USERS, so it cannot separate this process from another
+/// process running as the same user — including the watched tree's own owner. Such
+/// a peer can rebind a name inside the directory, or destroy the directory itself.
+/// Destroying it is harmless: this descriptor keeps referring to the directory it
+/// opened, and a cookie removal through a directory that is no longer linked finds
+/// the name absent and settles as already-gone, unlinking nothing. Rebinding is
+/// what [`CookieProof::Object`] is still checked for.
+#[derive(Debug)]
+pub(crate) struct CookieDir {
+  path: PathBuf,
+  /// Every `openat`/`unlinkat` runs against this, never against `path`.
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  fd: std::os::fd::OwnedFd,
+}
+
+impl CookieDir {
+  /// The directory's own path, for reporting a cookie's landing.
+  pub(crate) fn path(&self) -> &Path {
+    &self.path
+  }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl CookieDir {
+  /// Creates (or re-opens) the cookie directory inside `parent` and verifies what
+  /// it opened. Every check reads the OPENED DESCRIPTOR, never a second lookup of
+  /// the name: a check against a path would describe whatever the name denotes at
+  /// that instant rather than the directory the cookies are about to go into.
+  fn open_or_create(parent: &Path) -> Result<Self, std::io::Error> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    let path = parent.join(cookie_dir_name());
+    // `0o700` is the mode the whole argument rests on. A umask can only clear
+    // bits, so the created directory is never more permissive than asked; the
+    // verification below re-reads what was actually made either way.
+    match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+      Ok(()) => {}
+      // Already there — from an earlier sync, or from a previous run of this
+      // process. Verified below like any other pre-existing directory.
+      Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+      Err(err) => return Err(err),
+    }
+    // `O_DIRECTORY` refuses anything that is not a directory and `O_NOFOLLOW`
+    // refuses a symlink standing at the name, so what this descriptor refers to
+    // cannot have been redirected elsewhere.
+    let opened = std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+      .open(&path)?;
+    let meta = opened.metadata()?;
+    // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "the cookie directory is owned by another user",
+      ));
+    }
+    if meta.mode() & 0o077 != 0 {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "the cookie directory grants access beyond its owner",
+      ));
+    }
+    Ok(Self {
+      path,
+      fd: std::os::fd::OwnedFd::from(opened),
+    })
+  }
+
+  /// Creates `name` inside this directory and returns the descriptor the create
+  /// itself produced. `O_EXCL` refuses an existing name (a cookie name is minted
+  /// unique, so anything already there is foreign), `O_NOFOLLOW` states the same
+  /// refusal for a symlink explicitly, and `0o600` keeps the cookie as private as
+  /// the directory holding it.
+  fn create(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
+    self.open_at(
+      name,
+      libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+      0o600,
+    )
+  }
+
+  /// Opens whatever stands at `name` just far enough to read its identity.
+  ///
+  /// `O_NONBLOCK` is what makes this bounded: a plain `O_RDONLY` of a FIFO waits
+  /// for a writer FOREVER, which would wedge a blocking-pool thread on a removal
+  /// that should have settled in microseconds. With it, every object kind opens
+  /// (or fails) at once and reaches the identity comparison, where a FIFO — not
+  /// being the cookie — settles as displaced.
+  ///
+  /// `O_PATH` would be tighter still on Linux, but it does not exist on macOS and
+  /// `fstat` of an `O_PATH` descriptor is not answerable on every kernel, so one
+  /// portable form that is known to work everywhere is preferred to two.
+  fn open_for_classification(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
+    self.open_at(
+      name,
+      libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+      0,
+    )
+  }
+
+  /// Unlinks `name` from THIS directory. No component of any path is resolved, so
+  /// the entry removed is an entry of the directory this descriptor refers to and
+  /// of no other.
+  fn unlink(&self, name: &str) -> Result<(), std::io::Error> {
+    use std::os::fd::AsRawFd;
+
+    let name = cookie_c_name(name)?;
+    // SAFETY: `fd` is an open directory descriptor owned by `self`, `name` is a
+    // live NUL-terminated C string for the call, and `0` is a valid flag word for
+    // `unlinkat` (remove a non-directory entry).
+    let rc = unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) };
+    if rc == 0 {
+      return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+  }
+
+  fn open_at(
+    &self,
+    name: &str,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+  ) -> Result<std::fs::File, std::io::Error> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = cookie_c_name(name)?;
+    // SAFETY: `fd` is an open directory descriptor owned by `self`, `name` is a
+    // live NUL-terminated C string for the call, and `mode` is only consulted when
+    // `flags` carries `O_CREAT`.
+    let raw = unsafe { libc::openat(self.fd.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if raw < 0 {
+      return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh descriptor owned by nobody else, so the
+    // `File` takes sole ownership of it.
+    Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+  }
+}
+
+#[cfg(all(target_os = "windows", not(miri)))]
+impl CookieDir {
+  /// Creates (or re-opens) the cookie directory inside `parent`.
+  ///
+  /// Windows has no `openat`, and nothing here establishes the exclusive-write
+  /// argument the Unix implementation rests on: on this platform the directory is
+  /// a grouping and a reserved-namespace convenience, NOT the source of removal
+  /// safety. Safety here comes from the disposition being set on an already-open
+  /// handle whose identity is RE-verified first — see [`remove_anchored`].
+  fn open_or_create(parent: &Path) -> Result<Self, std::io::Error> {
+    let path = parent.join(cookie_dir_name());
+    match std::fs::create_dir(&path) {
+      Ok(()) => {}
+      Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+      Err(err) => return Err(err),
+    }
+    // A reparse point standing at the name would redirect every cookie out of the
+    // watched root, where its event could never reach the stream.
+    let meta = std::fs::symlink_metadata(&path)?;
+    if !meta.is_dir() {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "the cookie directory's name is held by something that is not a directory",
+      ));
+    }
+    Ok(Self { path })
+  }
+
+  /// Creates `name` inside this directory. `create_new` refuses an existing name,
+  /// and the reparse-point flag refuses to follow a link planted at it.
+  fn create(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+      DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // DELETE travels with the descriptor so the create's own handle can destroy
+    // what it made without resolving a name — the residue path's only object-exact
+    // removal on this platform. `access_mode` replaces the read/write bits, so
+    // `write` stays set for `create_new`'s sake (a create disposition without it is
+    // rejected) while the effective rights are exactly these two.
+    options.access_mode(FILE_GENERIC_WRITE | DELETE);
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(self.path.join(name))
+  }
+
+  /// Opens whatever stands at `name` with the LOWEST rights that still answer an
+  /// identity. Asking for DELETE here instead would let a sharing violation hide a
+  /// displacement behind a retry that can never converge; the DELETE-capable handle
+  /// is taken separately, and re-verified, only once the object has been proven.
+  ///
+  /// `FILE_FLAG_BACKUP_SEMANTICS` is required for a handle on a DIRECTORY, and a
+  /// directory is one of the things that can be standing at the name.
+  fn open_for_classification(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+      FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.access_mode(FILE_READ_ATTRIBUTES);
+    options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(self.path.join(name))
+  }
+
+  /// Opens `name` with DELETE rights, for the caller that has already classified
+  /// the object and will RE-verify this handle's identity before destroying it.
+  fn open_for_delete(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+      DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.access_mode(FILE_READ_ATTRIBUTES | DELETE);
+    options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(self.path.join(name))
+  }
+}
+
+/// A platform with NEITHER anchor primitive: no `openat`/`unlinkat`, and no
+/// handle-bound disposition. Every removal there would have to resolve a pathname,
+/// which is the deletion this whole design refuses to perform — so no cookie is
+/// created in the first place, and the sync reports an honest `Unsupported`
+/// instead of a barrier whose cleanup could destroy a stranger's file. Such a
+/// target has no working watch backend either (see `os::unsupported`), so nothing
+/// that worked before stops working.
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "macos",
+  all(target_os = "windows", not(miri))
+)))]
+impl CookieDir {
+  fn open_or_create(_parent: &Path) -> Result<Self, std::io::Error> {
+    Err(std::io::Error::new(
+      std::io::ErrorKind::Unsupported,
+      "this platform has no way to bind a cookie's removal to the object created",
+    ))
+  }
+
+  fn create(&self, _name: &str) -> Result<std::fs::File, std::io::Error> {
+    Err(std::io::Error::new(
+      std::io::ErrorKind::Unsupported,
+      "this platform has no way to bind a cookie's removal to the object created",
+    ))
+  }
+}
+
+/// The cookie directory's name: the reserved stem, plus the effective uid where
+/// there is one (see [`CookieDir`] for why it is part of the name).
+fn cookie_dir_name() -> String {
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  {
+    // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    format!("{COOKIE_DIR_PREFIX}-{euid}")
+  }
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  {
+    COOKIE_DIR_PREFIX.to_owned()
+  }
+}
+
+/// A cookie name as a C string, for the `*at` calls. An interior NUL is refused
+/// rather than silently truncating the name a removal would then address.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cookie_c_name(name: &str) -> Result<std::ffi::CString, std::io::Error> {
+  std::ffi::CString::new(name).map_err(|_| {
+    std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "a cookie name may not contain a NUL",
+    )
+  })
+}
+
+/// What authorizes a removal to destroy the object standing at a cookie's name.
+///
+/// Both variants are read together with the [`CookieDir`] the cookie was created
+/// through: the directory is what makes the name unbindable by anyone else, and
+/// this is what the removal additionally proves — or declines to prove — about
+/// the object it finds there.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CookieProof {
+  /// The create read this identity off its OWN descriptor. Every removal
+  /// re-reads the identity of whatever stands at the name and refuses unless it
+  /// matches, so a name that has somehow come to hold a different object is
+  /// settled as displaced instead of unlinked.
+  Object(RootIdentity),
+  /// The create could NOT read an identity, and the immediate destroy that
+  /// follows such a create also failed — so a file is on disk that nothing can
+  /// name an identity for. Minted at exactly one site (see [`FsOps::write_cookie`]).
+  ///
+  /// A removal under this proof compares nothing. What authorizes it instead is
+  /// the anchor the file was created through and which the record still holds:
+  /// on Unix the cookie directory's own descriptor, whose permissions deny every
+  /// other user the write access rebinding the name would require; on Windows the
+  /// create's own retained handle, which destroys that object with no name
+  /// resolved at all. Neither addresses a pathname a stranger could have rebound.
+  Anchor,
+}
+
+/// One sync cookie as a physical OBJECT: the directory it was created through,
+/// its name inside that directory, what authorizes its removal, and — for a
+/// cookie a real write minted — the descriptor that create returned, held OPEN
+/// until the obligation retires.
+///
+/// # Why the anchor, and not a pathname
+///
+/// A path is a handle on nothing. `remove_file(path)` performs a FRESH pathname
+/// resolution, so between proving what stands at a name and unlinking it the
+/// name can be rebound and the unlink destroys the successor — a stranger's data,
+/// irreversibly, on behalf of a sync that has nothing to do with it. That window
+/// is not sub-microsecond either: a preempted thread can sit in it indefinitely.
+/// No amount of extra verification closes it, because the verification and the
+/// unlink resolve the name twice.
+///
+/// So the removal does not address a pathname at all. Every operation on a cookie
+/// is anchored to the [`CookieDir`] descriptor the create was made through
+/// (`openat`/`unlinkat` on Unix, a handle-bound disposition on Windows), and that
+/// directory is one this driver created for itself with `0o700`. Rebinding a name
+/// inside it requires WRITE permission on it, and the permission model denies
+/// that to every user but the one this process runs as. The race is closed by the
+/// permission model, not by the size of a window.
+///
+/// [`path`](Self::path) is retained for REPORTING only — it is what the caller is
+/// told and what a path-addressed cleanup request resolves through. No removal
+/// ever resolves it.
+///
+/// # The pin, and why an identity alone proves nothing
+///
+/// Inode numbers and Windows file ids are ALLOCATOR slots, not names: each is
+/// handed back out once the object holding it is freed, and Windows states
+/// outright that file ids are not unique over time. An identity captured at
+/// create therefore proves nothing by itself — let the cookie be deleted, and the
+/// next create in that directory may be handed the very same slot under the very
+/// same name, and compare EQUAL to the cookie that is already gone.
+///
+/// Holding the create's own descriptor open is what makes the slot unfreeable:
+/// while any descriptor references the object the kernel cannot reissue its
+/// identity, so a successor at the name necessarily reads back a DIFFERENT one
+/// and the comparison correctly refuses.
+///
+/// The pin is an `Arc`, not an owned `File`: this value is cloned onto every
+/// removal job, and a `File` clone would `dup` a second descriptor per clone —
+/// multiplying the very cost the obligation cap is meant to bound. Every clone
+/// shares the one descriptor, which closes when the last of them dies. Since the
+/// ledger record holds one clone and each in-flight removal holds its own, the
+/// pin necessarily outlives the removal syscall that reads against it, which is
+/// what makes the comparison sound at removal time and not merely at create.
+///
+/// `dir` and `pin` are `None` only for a cookie minted BELOW the real write — the
+/// fake [`FsOps`] and hand-built ledger records — where no descriptor exists to
+/// hold. A real removal handed such a record refuses rather than falling back to a
+/// pathname.
+#[derive(Clone, Debug)]
+pub(crate) struct CookieFile {
+  path: PathBuf,
+  /// The directory descriptor every operation on this cookie is anchored to,
+  /// shared by every clone so one open directory serves the whole obligation.
+  dir: Option<Arc<CookieDir>>,
+  /// The cookie's name INSIDE `dir` — the only thing `openat`/`unlinkat` resolve,
+  /// and always a single normal component.
+  name: String,
+  proof: CookieProof,
+  /// Never read, and that is the point: its whole contribution is its `Drop`,
+  /// which is the instant the kernel becomes free to hand this object's identity
+  /// to someone else. On Windows it is read once more — it is the only object-exact
+  /// destroy that platform's [`CookieProof::Anchor`] residue has.
+  pin: Option<Arc<std::fs::File>>,
+}
+
+impl CookieFile {
+  /// Pairs a landed cookie's path with the identity of the object the create
+  /// returned, anchoring NOTHING: for a cookie with no real descriptor behind it.
+  /// The identity must still come from that create, never from a second lookup
+  /// of the path, which is the very race the pairing exists to close.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn new(path: PathBuf, identity: RootIdentity) -> Self {
+    let name = path
+      .file_name()
+      .map(|name| name.to_string_lossy().into_owned())
+      .unwrap_or_default();
+    Self {
+      path,
+      dir: None,
+      name,
+      proof: CookieProof::Object(identity),
+      pin: None,
+    }
+  }
+
+  /// The form a real create mints: the anchor it was created through, its name
+  /// inside that anchor, what authorizes its removal, and the create's own
+  /// descriptor — retained so the identity cannot be reissued to anyone else for
+  /// as long as this value (or any clone of it) lives.
+  fn anchored(dir: Arc<CookieDir>, name: &str, proof: CookieProof, handle: std::fs::File) -> Self {
+    Self {
+      path: dir.path().join(name),
+      dir: Some(dir),
+      name: name.to_owned(),
+      proof,
+      pin: Some(Arc::new(handle)),
+    }
+  }
+
+  /// Where the cookie landed — the authority on its location, since only the
+  /// write learns it (see [`FsOps::write_cookie`]). Reported to the caller; never
+  /// resolved by a removal.
+  pub(crate) fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// Which object the cookie IS, when its create could say. `None` is an
+  /// [`Anchor`](CookieProof::Anchor) residue, which no comparison can settle.
+  ///
+  /// The real removals read the proof directly and never go through here; this is
+  /// the fake's mirror of the same comparison.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) const fn identity(&self) -> Option<RootIdentity> {
+    match self.proof {
+      CookieProof::Object(identity) => Some(identity),
+      CookieProof::Anchor => None,
+    }
+  }
+
+  /// The retained descriptor, for the cell that has to prove the object outlives
+  /// the loss of its name — the property the whole proof rests on and the one
+  /// thing no filesystem-level observation can show from outside. Gated exactly
+  /// as that cell is: it runs against real inodes, so nowhere else.
+  #[cfg(all(test, feature = "tokio", unix, not(miri)))]
+  pub(crate) fn pinned_handle(&self) -> Option<&std::fs::File> {
+    self.pin.as_deref()
+  }
+}
+
+/// What one cookie removal PROVED about the name it was handed. Every variant is
+/// a success — the obligation retires on all three — but they are not the same
+/// fact, and collapsing them would hide the only one that means a foreign object
+/// is sitting where this driver's cookie used to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CookieRemoval {
+  /// The name still denoted this cookie, and it is now unlinked.
+  Unlinked,
+  /// Nothing is at the name: a cookie already reaped (a crash leftover someone
+  /// else swept, a racing sync). The idempotence contract.
+  AlreadyGone,
+  /// The name denotes a DIFFERENT object. This sync's cookie is gone from it and
+  /// a stranger holds it now, so nothing is unlinked — deleting it would destroy
+  /// data this driver never created and cannot restore.
+  Displaced,
+}
+
+/// Why a cookie write produced no usable cookie, and — the part that decides the
+/// obligation's fate — whether it left a FILE behind.
+///
+/// A write that fails before anything lands is a clean pre-physical failure, and
+/// its obligation retires having created nothing. A write that creates a file it
+/// then cannot identify tries to destroy that file at once; if THAT fails too, a
+/// cookie is on disk that no caller will ever ask about. Reporting such a write
+/// as though nothing had been created is what makes those files untracked and
+/// uncounted, so repeated attempts grow the tree without ever reaching the
+/// obligation cap that is supposed to bound them. The residue is therefore
+/// returned, and the caller admits it as an ordinary owned cookie whose removal
+/// is retried — counted the whole time.
+#[derive(Debug)]
+pub(crate) struct CookieWriteError {
+  /// The failure the sync reports, verbatim.
+  pub(crate) source: std::io::Error,
+  /// A file this write created, could not identify, and could not destroy. It is
+  /// still on disk, and whoever receives it OWNS it. Boxed so the failure path
+  /// costs a pointer rather than a whole cookie record on every `Result` the
+  /// write returns.
+  pub(crate) residue: Option<Box<CookieFile>>,
+}
+
+impl CookieWriteError {
+  /// The pre-physical failure: nothing of this write is on disk.
+  pub(crate) const fn clean(source: std::io::Error) -> Self {
+    Self {
+      source,
+      residue: None,
+    }
+  }
+}
+
 /// The typed terminal of a cookie obligation — the reason a [`retire`] removes a
 /// record, stated at every removal site so a removal can never be an untyped
 /// inference.
@@ -407,7 +943,10 @@ impl LedgerInner {
 /// [`retire`]: LedgerInner::retire
 #[derive(Clone, Copy, Debug)]
 enum Reaped {
-  /// The unlink returned `Ok` or already-gone — the file is confirmed removed.
+  /// The cookie is confirmed absent from its name: the unlink returned `Ok`, or
+  /// the name was already empty, or it now holds a DIFFERENT object
+  /// ([`CookieRemoval::Displaced`]) — under all three this incarnation's file is
+  /// gone from the only place this driver could ever address it.
   ConfirmedGone,
   /// Nothing physical was ever created for this incarnation: a write that
   /// failed before it landed a file.
@@ -432,15 +971,32 @@ struct Obligation {
   /// Immutable incarnation identity — also this record's ledger key. Never
   /// changes for the life of the record; a same-path successor gets a fresh one.
   id: CookieId,
-  /// The path the write landed the cookie at, learned only once the write
-  /// reports it. `None` while the sync is parked on its fence or its write is
-  /// still in the pool; `Some(P)` from the claim (or the refused claim's
-  /// self-reap) onward — the sweeps and the abnormal-path backstop unlink
-  /// through it, and `by_path` maps it back to this id. A pathless record is
-  /// exactly one for which no file can exist yet, so every sweep leaves it to
-  /// its own write (or, parked, to its pre-physical terminal) rather than
-  /// unlinking.
-  path: Option<PathBuf>,
+  /// The cookie the write landed — its path AND the identity of the object that
+  /// create made — learned only once the write reports it. `None` while the sync
+  /// is parked on its fence or its write is still in the pool; `Some(F)` from the
+  /// claim (or the refused claim's self-reap) onward — the sweeps and the
+  /// abnormal-path backstop unlink through it, and `by_path` maps its path back
+  /// to this id. A fileless record is exactly one for which no file can exist
+  /// yet, so every sweep leaves it to its own write (or, parked, to its
+  /// pre-physical terminal) rather than unlinking.
+  ///
+  /// The identity rides the record rather than being re-derived at removal time
+  /// because a removal can run arbitrarily long after the write — a retry
+  /// minutes later, a close-time sweep — and a second lookup of the path would
+  /// only ever describe whatever holds the name NOW, which proves nothing about
+  /// what this sync created.
+  ///
+  /// This field is also where the create's descriptor is PINNED (see
+  /// [`CookieFile`]): the record is the thing whose lifetime the pin must match,
+  /// because the identity has to stay unreissuable for exactly as long as some
+  /// removal may still compare against it. It is released when [`retire`] drops
+  /// this record — and, for a removal in flight at that instant, when that job's
+  /// own clone dies just after. One descriptor per landed cookie, so the live
+  /// descriptor count is the count of records with a landing, which
+  /// `cookie_global_cap` bounds along with the rest of the ledger.
+  ///
+  /// [`retire`]: LedgerInner::retire
+  file: Option<CookieFile>,
   /// This obligation must not survive: set by a cancel that names it, whatever
   /// its phase. It rides the record rather than a free-standing tombstone set,
   /// so it cannot be set for an obligation that does not exist, cannot be left
@@ -792,7 +1348,7 @@ impl CookieGuard {
   /// An ABSENT record means the abnormal-path [`Drop`] already took the ledger;
   /// its flag is raised before that take, so this refuses on either observation
   /// and the write reaps its own file.
-  fn claim(&self, path: &Path) -> Option<CookieId> {
+  fn claim(&self, file: &CookieFile) -> Option<CookieId> {
     let mut inner = lock_ledger(&self.ledger);
     let ob = inner.obligations.get_mut(&self.id)?;
     if ob.reap_requested
@@ -806,9 +1362,11 @@ impl CookieGuard {
     // lock — rather than inserting one: there is no insert-by-path anywhere, so
     // a claim can never displace another obligation. A same-path successor and
     // predecessor coexist under distinct keys, each retired by its own syscall
-    // verdict. The claim publishes the path only the write knows (a covered FILE
-    // subscription's cookie lands in the PARENT), which is what the sweeps and a
-    // public path-addressed removal then resolve through.
+    // verdict. The claim publishes the landing only the write knows (a covered
+    // FILE subscription's cookie lands in the PARENT) — path AND identity, so
+    // every later removal inherits the write's proof of which object it made.
+    // That is what the sweeps and a public path-addressed removal resolve
+    // through.
     //
     // `by_path` MAY overwrite an entry left by an older incarnation at this path.
     // Two live records at one path require two live same-name obligations (the
@@ -818,10 +1376,9 @@ impl CookieGuard {
     // if it does occur: the displaced id's record is left untouched (we cannot know
     // which file-at-P history is live), and it reaches its terminal through the
     // id-addressed sweeps, which unlink P on its behalf and earn its confirm.
-    let landed = path.to_path_buf();
-    ob.path = Some(landed.clone());
+    ob.file = Some(file.clone());
     ob.phase = Phase::Owned;
-    inner.by_path.insert(landed, self.id);
+    inner.by_path.insert(file.path().to_path_buf(), self.id);
     Some(self.id)
   }
 }
@@ -971,7 +1528,7 @@ impl<F: FsOps> CookieRegistry<F> {
         name: name.clone(),
         ticket,
         id,
-        path: None,
+        file: None,
         reap_requested: false,
         last_failure_seq: 0,
         phase: Phase::Parked { fence },
@@ -1187,31 +1744,32 @@ impl<F: FsOps> CookieRegistry<F> {
     rearmed
   }
 
-  /// Spawns the ONE blocking unlink of `path` for incarnation `id` (the record
+  /// Spawns the ONE blocking unlink of `file` for incarnation `id` (the record
   /// was already transitioned to `Removing` under the ledger lock by the
   /// decision that called this, which read `id` from the record inside that
   /// same section). The job writes the PHYSICAL VERDICT itself, under the ledger
-  /// mutex, before reporting anything: a confirmed removal (`Ok` / already gone)
-  /// retires incarnation `id` — a racing successor keeps its own key and is left
-  /// intact — and a transient failure parks the record as `RemoveFailed` so the
-  /// file is never orphaned. The `CookieRemoveDone` that follows carries the id
-  /// and drives SCHEDULING only: the driver owns the clock, so it alone stamps
-  /// the retry deadline. Truth therefore rides the job that learned it, and a
-  /// lost completion costs promptness (a parked record awaits a re-arm), never
-  /// ownership.
+  /// mutex, before reporting anything: a confirmed removal (unlinked, already
+  /// gone, or the name displaced by a foreign object) retires incarnation `id` —
+  /// a racing successor keeps its own key and is left intact — and a transient
+  /// failure parks the record as `RemoveFailed` so the file is never orphaned.
+  /// The `CookieRemoveDone` that follows carries the id and drives SCHEDULING
+  /// only: the driver owns the clock, so it alone stamps the retry deadline.
+  /// Truth therefore rides the job that learned it, and a lost completion costs
+  /// promptness (a parked record awaits a re-arm), never ownership.
   ///
-  /// ACCEPTED PHYSICAL RESIDUAL: the dispatched job targets `path` by NAME at
-  /// the fs level. If a successor recreates the file before this job's syscall
-  /// runs, the job unlinks the successor's FILE; the retire touches only
-  /// incarnation `id`, so the successor RECORD survives, its next unlink confirms
-  /// already-gone, and close accounting never lies. This needs same-path reuse —
-  /// direct-API name reuse only (umbrella names are per-sync-unique ⇒
-  /// per-sync-unique paths) — and is unfixable without handle-anchored unlink
-  /// semantics the platform APIs do not offer.
+  /// The job carries the write's own identity for the cookie — and, through its
+  /// clone of the record's [`CookieFile`], the create's descriptor, so that
+  /// identity is still the cookie's alone while this syscall runs. A successor
+  /// that reclaimed the name is therefore REFUSED rather than unlinked
+  /// ([`CookieRemoval::Displaced`]): the successor's file survives, its own
+  /// record still owns it, and this incarnation retires having proved its file is
+  /// no longer at the name. What remains unclosed is a Linux/macOS-only window
+  /// stated at `remove_verified`; Windows closes it by removing through the
+  /// verified handle.
   fn spawn_unlink<R>(
     &self,
     op_tx: &async_channel::Sender<OpResult<F::Handle>>,
-    path: PathBuf,
+    file: CookieFile,
     id: CookieId,
   ) where
     R: RuntimeLite,
@@ -1220,7 +1778,7 @@ impl<F: FsOps> CookieRegistry<F> {
     let ledger = Arc::clone(&self.ledger);
     let tx = op_tx.clone();
     R::spawn_blocking_detach(move || {
-      let confirmed = ops.remove_cookie(&path).is_ok();
+      let confirmed = ops.remove_cookie(&file).is_ok();
       {
         let mut inner = lock_ledger(&ledger);
         if confirmed {
@@ -1239,7 +1797,7 @@ impl<F: FsOps> CookieRegistry<F> {
     });
   }
 
-  /// The under-the-lock removal decision: returns `Some((path, id))` iff the
+  /// The under-the-lock removal decision: returns `Some((file, id))` iff the
   /// caller must now spawn an unlink, having transitioned that record to
   /// `Removing` here. Single-flight-per-record follows because only a state that
   /// is not already `Removing` can dispatch, and the transition happens before
@@ -1257,19 +1815,19 @@ impl<F: FsOps> CookieRegistry<F> {
   fn removal_decision_locked(
     inner: &mut LedgerInner,
     req: &RemovalRequest,
-  ) -> Option<(PathBuf, CookieId)> {
+  ) -> Option<(CookieFile, CookieId)> {
     // A record that is missing — already retired — is idempotently nothing.
     let id = match req {
       RemovalRequest::Targeted(id) | RemovalRequest::RetryDue(id) => *id,
     };
     let ob = inner.obligations.get_mut(&id)?;
-    // A record with no path has no file to unlink: its sync is still parked (no
+    // A record with no landing has no file to unlink: its sync is still parked (no
     // write has been dispatched, so nothing physical can exist), or its write is
     // in the pool and only that write can learn where its cookie landed. This one
     // line is what makes every sweep, retry and public removal structurally
     // incapable of unlinking for a pre-physical record: a parked record is left to
     // its pre-physical terminal, and an in-pool one reaps itself against the flags.
-    let path = ob.path.clone()?;
+    let file = ob.file.clone()?;
     let attempts = match (&ob.phase, req) {
       // Owned: a marked record or a targeted sweep dispatches a fresh removal;
       // a retry for a not-yet-failed record is a no-op.
@@ -1300,7 +1858,7 @@ impl<F: FsOps> CookieRegistry<F> {
     // inside the phase, so the transition retires it with no second structure to
     // keep in step and no chance of a schedule outliving its arming.
     ob.phase = Phase::Removing { attempts };
-    Some((path, id))
+    Some((file, id))
   }
 
   /// The ONE unlink dispatch point routed to by `retire_scope`, `sweep_owned`,
@@ -1318,8 +1876,8 @@ impl<F: FsOps> CookieRegistry<F> {
       let mut inner = lock_ledger(&self.ledger);
       Self::removal_decision_locked(&mut inner, &req)
     };
-    if let Some((path, id)) = decision {
-      self.spawn_unlink::<R>(op_tx, path, id);
+    if let Some((file, id)) = decision {
+      self.spawn_unlink::<R>(op_tx, file, id);
     }
   }
 
@@ -1355,7 +1913,7 @@ impl<F: FsOps> CookieRegistry<F> {
   where
     R: RuntimeLite,
   {
-    let dispatch: Vec<(PathBuf, CookieId)> = {
+    let dispatch: Vec<(CookieFile, CookieId)> = {
       let mut inner = lock_ledger(&self.ledger);
       let marked: Vec<CookieId> = inner
         .obligations
@@ -1374,8 +1932,8 @@ impl<F: FsOps> CookieRegistry<F> {
         })
         .collect()
     };
-    for (path, id) in dispatch {
-      self.spawn_unlink::<R>(op_tx, path, id);
+    for (file, id) in dispatch {
+      self.spawn_unlink::<R>(op_tx, file, id);
     }
   }
 
@@ -1655,14 +2213,14 @@ impl<F: FsOps> Drop for CookieRegistry<F> {
     // and awaits the hung unlink — disproportionate machinery for an inert file
     // left by a pathological mount during shutdown. On a healthy fs the drain
     // confirms every unlink within the grace and this branch reaps nothing.
-    let reap: Vec<PathBuf> = {
+    let reap: Vec<CookieFile> = {
       let mut inner = lock_ledger(&self.ledger);
       let ids: Vec<CookieId> = inner.obligations.keys().copied().collect();
       ids
         .into_iter()
         .filter_map(|id| inner.retire(id, Reaped::AbnormalResidual))
         .filter(|ob| !matches!(ob.phase, Phase::Removing { .. }))
-        .filter_map(|ob| ob.path)
+        .filter_map(|ob| ob.file)
         .collect()
     };
     if reap.is_empty() {
@@ -1670,8 +2228,12 @@ impl<F: FsOps> Drop for CookieRegistry<F> {
     }
     let ops = self.ops.clone();
     (self.spawn_detached)(Box::new(move || {
-      for path in reap {
-        let _ = ops.remove_cookie(&path);
+      // Best-effort, but never blind: each record carries the identity its own
+      // write captured, so even this last sweep unlinks only what it can prove
+      // is its own — the abnormal path is exactly where a stale path is most
+      // likely to have been reclaimed by someone else.
+      for file in reap {
+        let _ = ops.remove_cookie(&file);
       }
     }));
   }
@@ -2253,34 +2815,41 @@ fn resolve_cover_settlements<R, F>(
       R::spawn_blocking_detach(move || {
         let ParkedCookie { dir, reply } = cookie;
         match ops.write_cookie(&root, &dir, &name) {
-          Ok(path) => {
-            // Hand the file to the registry — the path the write ACTUALLY
-            // landed at, which only the write knows (a covered FILE
-            // subscription's cookie lands in the parent).
-            match guard.claim(&path) {
+          Ok(file) => {
+            // Hand the cookie to the registry — the path the write ACTUALLY
+            // landed at (which only the write knows: a covered FILE
+            // subscription's cookie lands in the parent) together with the
+            // identity of the object the create returned, so every later removal
+            // can prove the name is still that object before unlinking it.
+            match guard.claim(&file) {
               None => {
                 // A refused claim means a cancel named this obligation, the
                 // registry is gone, the scope is retiring, or the generation
                 // moved: its cookie must not survive, so the write self-reaps
-                // (never discarding ownership before the unlink confirms —
-                // finding 2's fix).
-                self_reap(&ops, &guard, path, None);
+                // (never discarding ownership before the unlink confirms).
+                self_reap(&ops, &guard, file, None);
                 let _ = reply.send(Err(crate::error::SyncRootError::Retired));
               }
               Some(id) => {
-                if let Err(Ok(path)) = reply.send(Ok(path)) {
+                // The caller names cookies by path, so only the path crosses the
+                // reply; the identity stays with the record, which is the only
+                // thing that ever unlinks.
+                if reply.send(Ok(file.path().to_path_buf())).is_err() {
                   // A caller that abandoned the sync (timed out, dropped the
                   // future) has dropped this reply receiver and will never ask
                   // for this cookie's removal. The write completing late must
                   // not outlive the barrier that asked for it: reap the file,
                   // but keep ownership (of incarnation `id`) until the unlink
                   // confirms.
-                  self_reap(&ops, &guard, path, Some(id));
+                  self_reap(&ops, &guard, file, Some(id));
                 }
               }
             }
           }
-          Err(source) => {
+          Err(CookieWriteError {
+            source,
+            residue: None,
+          }) => {
             // Nothing was created, so this incarnation reaches its terminal
             // having produced no file: retire it as never-created, IN THE JOB
             // that learned the fact. This is what keeps repeated failed syncs on
@@ -2288,6 +2857,27 @@ fn resolve_cover_settlements<R, F>(
             // record leaves only once nothing physical can exist, it can never
             // uncount a live obligation.
             lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
+            let _ = reply.send(Err(crate::error::SyncRootError::Write {
+              path: dir.join(&name),
+              source,
+            }));
+          }
+          Err(CookieWriteError {
+            source,
+            residue: Some(residue),
+          }) => {
+            // The write FAILED but left a file behind (it could not identify what
+            // it made, and could not destroy it either). Retiring `NeverCreated`
+            // here would be a lie with teeth: the file would stop counting against
+            // the obligation cap that bounds exactly this, and nothing would ever
+            // reap it. So the residue is admitted like any other owned cookie and
+            // then immediately self-reaped — the caller is being told the write
+            // failed and will never ask for this path, so nobody else ever will.
+            // A retry that fails again leaves the record `RemoveFailed`: counted,
+            // owned, and swept at the scope's teardown.
+            let residue = *residue;
+            let claimed = guard.claim(&residue);
+            self_reap(&ops, &guard, residue, claimed);
             let _ = reply.send(Err(crate::error::SyncRootError::Write {
               path: dir.join(&name),
               source,
@@ -2312,13 +2902,13 @@ fn resolve_cover_settlements<R, F>(
 /// owner of the clock — schedules the retry of a record left `RemoveFailed`.
 ///
 /// `claimed = None` — the claim was REFUSED. The record is still `InPool`: it is
-/// RE-ASSERTED here (its path published, so every sweep can find the file, and
-/// its phase moved to `Removing`) BEFORE the unlink, and that ordering is what
-/// keeps the accounting honest — the obligation is never momentarily invisible
-/// while its file is on disk, and a `Drop` landing mid-unlink skips it as it
-/// skips any `Removing` record. The re-assert deliberately ignores the
-/// shutdown/retiring flags that caused the refusal: it is what keeps a failing
-/// unlink from orphaning the file.
+/// RE-ASSERTED here (its landing published, so every sweep can find the file and
+/// prove which object it is, and its phase moved to `Removing`) BEFORE the
+/// unlink, and that ordering is what keeps the accounting honest — the
+/// obligation is never momentarily invisible while its file is on disk, and a
+/// `Drop` landing mid-unlink skips it as it skips any `Removing` record. The
+/// re-assert deliberately ignores the shutdown/retiring flags that caused the
+/// refusal: it is what keeps a failing unlink from orphaning the file.
 ///
 /// `claimed = Some(id)` — the reply send FAILED, so OUR claim left record `id`
 /// `Owned`, and a racing token-cancel may already have moved it to `Removing`
@@ -2330,7 +2920,7 @@ fn resolve_cover_settlements<R, F>(
 /// An ABSENT record (only the abnormal-path `Drop`'s take) leaves the refusal
 /// case a bare best-effort unlink of the file this write itself created, and the
 /// reply-fail case yielding: the record's fate is no longer ours to write.
-fn self_reap<F: FsOps>(ops: &F, guard: &CookieGuard, path: PathBuf, claimed: Option<CookieId>) {
+fn self_reap<F: FsOps>(ops: &F, guard: &CookieGuard, file: CookieFile, claimed: Option<CookieId>) {
   // The incarnation whose fate this reap writes. Both cases name this write's own
   // record — a claim returns the guard's id — but the reply-fail case addresses
   // the id the claim ACTUALLY returned, so a stale claimant can never transition
@@ -2344,12 +2934,13 @@ fn self_reap<F: FsOps>(ops: &F, guard: &CookieGuard, path: PathBuf, claimed: Opt
     match inner.obligations.get_mut(&id) {
       // Refusal case: the record never left `InPool` — only this write can learn
       // where its cookie landed, so no other actor could have moved it. Re-assert
-      // it, publishing the path so every sweep and the backstop can find the file.
-      // `by_path` follows the same newest-claim-wins rule a claim does.
+      // it, publishing the landing so every sweep and the backstop can find the
+      // file and prove it is ours. `by_path` follows the same newest-claim-wins
+      // rule a claim does.
       Some(ob) if matches!(ob.phase, Phase::InPool) => {
-        ob.path = Some(path.clone());
+        ob.file = Some(file.clone());
         ob.phase = Phase::Removing { attempts: 0 };
-        inner.by_path.insert(path.clone(), id);
+        inner.by_path.insert(file.path().to_path_buf(), id);
         true
       }
       // Reply-fail case: take the removal, or yield to whoever beat us.
@@ -2376,10 +2967,10 @@ fn self_reap<F: FsOps>(ops: &F, guard: &CookieGuard, path: PathBuf, claimed: Opt
   if !tracked {
     // A refused claim still unlinks the file it created — best-effort, and no
     // record's fate rides on it (the take already retired the record).
-    let _ = ops.remove_cookie(&path);
+    let _ = ops.remove_cookie(&file);
     return;
   }
-  if ops.remove_cookie(&path).is_ok() {
+  if ops.remove_cookie(&file).is_ok() {
     lock_ledger(&guard.ledger).retire(id, Reaped::ConfirmedGone);
   } else {
     // Retain as failed: the file is still on disk and this record still owns it.
@@ -2640,26 +3231,61 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   fn probe(&self, path: &Path) -> ProbeOutcome;
 
   /// Creates the sync cookie `name` for `dir`, inside `root` (blocking),
-  /// returning the path it landed at. The cookie's whole purpose is the kernel
-  /// event its creation mints: it rides the root's ordered queue behind every
-  /// change the backend reported before it, so observing it proves those changes
-  /// have already exited the pipeline. A read-only tree fails here with
-  /// `PermissionDenied` — the honest refusal.
+  /// returning WHERE it landed and what authorizes its later removal. The
+  /// cookie's whole purpose is the kernel event its creation mints: it rides the
+  /// root's ordered queue behind every change the backend reported before it, so
+  /// observing it proves those changes have already exited the pipeline. A
+  /// read-only tree fails here with `PermissionDenied` — the honest refusal.
   ///
   /// `dir` is the SUBSCRIPTION's key, which a covered FILE subscription makes a
-  /// file: the cookie then lands in the containing directory instead, and never
-  /// above `root` (see [`cookie_dir`]). So the RETURNED path is the only
+  /// file: the cookie then lands beside it instead, and never above `root` (see
+  /// [`cookie_dir`]). A real implementation then nests one more level, into the
+  /// private [`CookieDir`] it owns. So the RETURNED [`CookieFile`] is the only
   /// authority on where the cookie went — `dir.join(name)` is not, and nothing
   /// may record ownership of a cookie by predicting its path.
-  fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error>;
+  ///
+  /// The identity it carries MUST be read from the descriptor this create
+  /// returned, never from a second lookup of the path: a second lookup would
+  /// describe whatever holds the name at that later instant, which is precisely
+  /// the object the identity exists to distinguish the cookie FROM. A real
+  /// implementation also RETAINS that descriptor in the returned
+  /// [`CookieFile`], because an identity whose slot the allocator may reissue is
+  /// no proof at all — see there.
+  ///
+  /// FAIL-CLOSED on an object it cannot identify: an implementation that creates
+  /// a file but cannot read an identity off it must destroy that file and report
+  /// the error, never return a normally-proven [`CookieFile`]. If the destroy
+  /// ALSO fails, the file it left is handed back as
+  /// [`CookieWriteError::residue`] — never dropped on the floor, because a file
+  /// nobody records is a file nothing ever reaps and nothing ever counts.
+  fn write_cookie(
+    &self,
+    root: &Path,
+    dir: &Path,
+    name: &str,
+  ) -> Result<CookieFile, CookieWriteError>;
 
-  /// Unlinks a sync cookie (blocking). Idempotent: a cookie already gone (a
-  /// crash leftover reaped by someone else, a racing sync) maps to `Ok(())`.
-  /// Every OTHER failure is RETURNED so the caller can retain the cookie's
-  /// ledger record and let a later sweep retry the unlink, rather than silently
-  /// orphaning the file. The unlink's own event is suppressed by the reserved
-  /// namespace, never by any pending-cookie bookkeeping.
-  fn remove_cookie(&self, path: &Path) -> Result<(), std::io::Error>;
+  /// Removes a sync cookie (blocking) through the anchor it was created with,
+  /// first PROVING — where a proof exists — that the name still denotes the object
+  /// `cookie` records. The three successful verdicts are [`CookieRemoval`]'s:
+  /// unlinked, already gone, or displaced — and all three retire the obligation,
+  /// because under each one this driver's file is no longer at the name and no
+  /// later retry could change that.
+  ///
+  /// No implementation may remove a cookie by resolving a pathname. The anchor —
+  /// a directory descriptor on Unix, an already-open handle on Windows — is what
+  /// makes the object destroyed the object proven; a name resolved a second time
+  /// is a fresh lookup that could land anywhere.
+  ///
+  /// Idempotent: a cookie already gone (a crash leftover reaped by someone else,
+  /// a racing sync) maps to `AlreadyGone`. Every OTHER failure is RETURNED so the
+  /// caller can retain the cookie's ledger record and let a later sweep retry the
+  /// removal, rather than silently orphaning the file. That includes a failure to
+  /// READ the identity of whatever stands at the name: unprovable is not
+  /// displaced, and reporting it as a settled verdict would retire a record whose
+  /// file may still be on disk. The removal's own event is suppressed by the
+  /// reserved namespace, never by any pending-cookie bookkeeping.
+  fn remove_cookie(&self, cookie: &CookieFile) -> Result<CookieRemoval, std::io::Error>;
 
   /// Re-reads the live mount table strictly under `root` AND re-stats the root
   /// itself (blocking): the mount prefixes, whether the read was authoritative,
@@ -3529,67 +4155,96 @@ impl FsOps for RealFs {
     }
   }
 
-  fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
-    // Resolve the cookie DIRECTORY, then CANONICALIZE it: `canonicalize` follows
-    // every symlink in the path, so an ALREADY-EXISTING intermediate symlink
-    // (`<root>/link/sub` where `link` targets outside) is resolved to where the
-    // cookie would truly land — the lexical containment check upstream never sees
-    // that, because component-wise the spelling still sits under the root.
+  fn write_cookie(
+    &self,
+    root: &Path,
+    dir: &Path,
+    name: &str,
+  ) -> Result<CookieFile, CookieWriteError> {
+    // Resolve the directory the sync named — which is where the private cookie
+    // directory goes — then CANONICALIZE it: `canonicalize` follows every symlink
+    // in the path, so an ALREADY-EXISTING intermediate symlink (`<root>/link/sub`
+    // where `link` targets outside) is resolved to where the cookie would truly
+    // land — the lexical containment check upstream never sees that, because
+    // component-wise the spelling still sits under the root.
     // Canonicalizing the root too makes the beneath test compare two paths from
     // the SAME resolver (identical prefix form on every platform). Both blocking
     // calls run on the driver's blocking pool, never the owner loop, so a hung
     // mount cannot wedge it. `canonicalize` requires the target to exist; a cookie
     // directory that is gone is already a typed write failure, so the valid case
     // is unchanged.
-    let canonical_dir = std::fs::canonicalize(cookie_dir(root, dir))?;
-    let canonical_root = std::fs::canonicalize(root)?;
+    let canonical_dir =
+      std::fs::canonicalize(cookie_dir(root, dir)).map_err(CookieWriteError::clean)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(CookieWriteError::clean)?;
     if !canonical_dir.starts_with(&canonical_root) {
       // The real directory escapes the watched root — its cookie's create event
       // could never reach this root's stream. Refuse before creating anything.
-      return Err(std::io::Error::other(
+      return Err(CookieWriteError::clean(std::io::Error::other(
         "the cookie directory resolves outside the watched root",
-      ));
+      )));
     }
-    let path = canonical_dir.join(name);
-    // create_new: a cookie name is minted unique (instance + pid + seq), so an
-    // existing file at that path is a foreign artifact or a name collision —
-    // never something to silently overwrite.
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    // O_NOFOLLOW on the FINAL component: a symlink swapped in where the cookie is
-    // to land is refused (ELOOP) rather than followed to a target that could sit
-    // outside the root, where its create event would never meet the barrier.
-    // create_new (O_EXCL) already refuses an existing final symlink; O_NOFOLLOW
-    // makes that refusal explicit and errno-honest.
+    // This is the last path this write resolves. The private directory is opened
+    // once, and every operation on the cookie — this create, and every removal the
+    // obligation ever attempts — goes through its descriptor, which is what makes
+    // the cookie's name unbindable by anyone else (see [`CookieDir`]).
     //
-    // Canonicalizing the directory closes the PRE-EXISTING intermediate-symlink
-    // escape (every intermediate link is resolved before the beneath check), and
-    // O_NOFOLLOW + create_new guard the final component. RESIDUAL — a symlink
-    // swapped INTO an intermediate directory AFTER `canonicalize` but BEFORE this
-    // open (a genuine sub-microsecond TOCTOU) is still followable, because a
-    // path-based open is not beneath-anchored. Closing that last window needs a
-    // beneath-anchored traversal (Linux `openat2(RESOLVE_BENEATH |
-    // RESOLVE_NO_SYMLINKS)`, or per-component `openat` with `O_NOFOLLOW` from a
-    // pinned root-directory fd), which this crate does not yet thread a per-scope
-    // root fd for. Only that post-canonicalize swap remains.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-      use std::os::unix::fs::OpenOptionsExt;
-      options.custom_flags(libc::O_NOFOLLOW);
+    // A residual the canonicalize above does not close: a symlink swapped INTO an
+    // intermediate directory between `canonicalize` and this open is still
+    // followed, because a path-based open is not beneath-anchored. Bounded to what
+    // it can actually cause — the cookie could be placed under a directory other
+    // than the one the caller named, whose events the root's stream may never
+    // report, so the sync's barrier does not resolve. It cannot cause a deletion:
+    // whatever directory is opened is verified to be this user's before anything is
+    // created in it, and every removal is confined to that same descriptor.
+    let cookies =
+      Arc::new(CookieDir::open_or_create(&canonical_dir).map_err(CookieWriteError::clean)?);
+    let created = cookies.create(name).map_err(CookieWriteError::clean)?;
+    // The identity comes off the descriptor the create just returned — one
+    // `fstat` of the object we made, in obedience to the one-sample rule (see the
+    // module doc). Re-opening the name to read it would defeat the purpose: it
+    // could only ever describe whatever holds the name at that instant, which is
+    // exactly the thing the removal must be able to tell this cookie apart from.
+    match identity_of_handle(&created) {
+      // The descriptor travels INTO the record: for the whole life of the
+      // obligation it holds this object's identity slot out of the allocator's
+      // reach, which is what makes a later comparison against it mean anything
+      // (see `CookieFile`).
+      Ok(Some(identity)) => Ok(CookieFile::anchored(
+        cookies,
+        name,
+        CookieProof::Object(identity),
+        created,
+      )),
+      // A file exists and nothing can say WHICH file it is — either the platform
+      // has no identity to give or the read failed. Both are fail-closed the same
+      // way: destroy what we just made and report the write as failed, rather than
+      // admit a cookie no removal could ever tell apart from a successor. The
+      // sync's caller sees a typed, retryable write failure either way; whether a
+      // FILE survives is what the returned residue answers.
+      Ok(None) => Err(destroy_unidentified(
+        cookies,
+        name,
+        created,
+        std::io::Error::new(
+          std::io::ErrorKind::Unsupported,
+          "the cookie's filesystem answers no identity for an open descriptor",
+        ),
+      )),
+      Err(err) => Err(destroy_unidentified(cookies, name, created, err)),
     }
-    options.open(&path)?;
-    Ok(path)
   }
 
-  fn remove_cookie(&self, path: &Path) -> Result<(), std::io::Error> {
-    match std::fs::remove_file(path) {
-      // Idempotent by contract: an already-gone cookie is success.
-      Ok(()) => Ok(()),
-      Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-      // A transient failure (a hung mount, a flipped permission) is reported,
-      // not swallowed, so the record survives for a later sweep to retry.
-      Err(err) => Err(err),
-    }
+  fn remove_cookie(&self, cookie: &CookieFile) -> Result<CookieRemoval, std::io::Error> {
+    let Some(dir) = cookie.dir.as_deref() else {
+      // A record minted below the real write carries no anchor, so there is no
+      // removal this implementation may perform for it. Falling back to the
+      // pathname is exactly the deletion the anchor exists to forbid, and a
+      // returned failure keeps the record — the safe half of both.
+      return Err(std::io::Error::other(
+        "a cookie with no anchoring directory cannot be removed",
+      ));
+    };
+    remove_anchored(dir, &cookie.name, cookie.proof, cookie.pin.as_deref())
   }
 
   fn refresh_mounts(&self, root: &Path) -> MountRefresh {
@@ -3916,6 +4571,255 @@ fn inode_of(meta: &std::fs::Metadata) -> (Option<std::num::NonZeroU64>, u64) {
     let _ = meta;
     (None, 0)
   }
+}
+
+/// The identity of an OPEN object, read from the descriptor itself — one `fstat`
+/// (or its Windows equivalent on the handle), never a lookup of a path, so the
+/// answer can only ever name the object the caller already holds.
+///
+/// Three outcomes, kept apart because they demand opposite responses:
+///
+/// - `Err` — the read itself failed. Which object this is stays UNKNOWN, so no
+///   caller may settle anything on it; it propagates, and a removal retries.
+/// - `Ok(None)` — the platform or volume has no identity to give (a file id is
+///   not universal). A definite answer, and a definite absence of proof.
+/// - `Ok(Some(id))` — the object's identity.
+///
+/// Collapsing the first two into one is what makes an identity read fail OPEN:
+/// an `fstat` that errored would read as "this platform has none", and every
+/// consumer of that answer would then take the by-name branch it exists to
+/// avoid. A synthesized stand-in would be worse still — it compares EQUAL
+/// between two unrelated objects, licensing exactly the deletion the proof
+/// refuses.
+fn identity_of_handle(file: &std::fs::File) -> Result<Option<RootIdentity>, std::io::Error> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    Ok(Some(RootIdentity::new(meta.dev(), meta.ino().into())))
+  }
+  // The crate's one Windows identity read, shared with the source brackets:
+  // `(volume serial, 128-bit file id)`, wide enough for ReFS ids that a folded
+  // 64-bit index would collide.
+  #[cfg(all(target_os = "windows", not(miri)))]
+  {
+    use std::os::windows::io::AsHandle;
+    let identity = crate::os::windows::ffi::identity_of(file.as_handle())?;
+    // Zero and all-ones are Windows' two spellings of "this object has no file
+    // id", not ids. Admitting either would make every object that answers the
+    // same sentinel compare EQUAL to every other — one identity shared by
+    // unrelated files, which is the precise shape of the licence-to-delete this
+    // whole mechanism exists to withhold.
+    if identity.file_id == 0 || identity.file_id == u128::MAX {
+      return Ok(None);
+    }
+    Ok(Some(RootIdentity::new(
+      identity.volume_serial,
+      identity.file_id,
+    )))
+  }
+  #[cfg(not(any(unix, all(target_os = "windows", not(miri)))))]
+  {
+    let _ = file;
+    Ok(None)
+  }
+}
+
+/// Destroys the cookie `handle` refers to after its identity could not be read,
+/// and reports the write's failure — together with the FILE, if the destroy could
+/// not be completed.
+///
+/// A file that exists and cannot be identified must not survive if it can be
+/// helped: no later removal could tell it apart from a successor at its name. So
+/// it is destroyed HERE, while its own create is still on the stack, through the
+/// same anchor the create used — `unlinkat` against the private cookie directory
+/// on Unix, the create's own handle on Windows. Neither resolves a pathname, so
+/// neither can destroy something other than what this write made.
+///
+/// A destroy that FAILS leaves the file on disk, and reporting the write as
+/// though nothing had been created is what makes such files untracked and
+/// uncounted forever. It comes back as a residue instead, proven by its
+/// [`Anchor`](CookieProof::Anchor) and carrying the create's descriptor, so the
+/// object's identity slot stays reserved and every retry is still addressed to
+/// the anchor rather than to a name.
+fn destroy_unidentified(
+  dir: Arc<CookieDir>,
+  name: &str,
+  handle: std::fs::File,
+  err: std::io::Error,
+) -> CookieWriteError {
+  #[cfg(all(target_os = "windows", not(miri)))]
+  let destroyed = {
+    use std::os::windows::io::AsHandle;
+    crate::os::windows::ffi::delete_by_handle(handle.as_handle())
+  };
+  // The handle is deliberately still held across the unlink: the entry goes away,
+  // the OBJECT does not, so its identity slot stays out of the allocator's reach
+  // for as long as the residue below (if any) lives.
+  #[cfg(not(all(target_os = "windows", not(miri))))]
+  let destroyed = dir.unlink(name);
+  match destroyed {
+    Ok(()) => CookieWriteError::clean(err),
+    // Already gone: nothing survives this write either way.
+    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => CookieWriteError::clean(err),
+    Err(_) => CookieWriteError {
+      source: err,
+      residue: Some(Box::new(CookieFile::anchored(
+        dir,
+        name,
+        CookieProof::Anchor,
+        handle,
+      ))),
+    },
+  }
+}
+
+/// Removes `name` from the directory `dir` refers to, having first proved — where
+/// [`CookieProof::Object`] gives something to prove — that the object standing at
+/// the name is the cookie.
+///
+/// Nothing here resolves a pathname. `openat` and `unlinkat` both address an entry
+/// OF THE DIRECTORY THIS DESCRIPTOR REFERS TO, so no component of any path
+/// participates and the entry unlinked is an entry of the same directory the
+/// identity was read through. What forecloses a rebind BETWEEN those two calls is
+/// not their proximity — a preempted thread can sit between them indefinitely —
+/// but the directory's permissions: binding a name in it requires write access,
+/// and `0o700` grants that to this user alone.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_anchored(
+  dir: &CookieDir,
+  name: &str,
+  proof: CookieProof,
+  _pin: Option<&std::fs::File>,
+) -> Result<CookieRemoval, std::io::Error> {
+  if let CookieProof::Object(identity) = proof {
+    let standing = match dir.open_for_classification(name) {
+      Ok(file) => file,
+      // Idempotent by contract: an already-gone cookie is success.
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(CookieRemoval::AlreadyGone);
+      }
+      // A symlink standing at the name: `O_NOFOLLOW` refuses it, and a cookie is
+      // never a symlink (its own create refused one too), so this is a
+      // displacement and not a transient failure. Reporting it as a failure
+      // instead would arm a retry that can never converge.
+      Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+        return Ok(CookieRemoval::Displaced);
+      }
+      // Anything else leaves WHICH object stands at the name unknown — a socket's
+      // `ENXIO`, a resource limit, an I/O error. Unknown is not displaced, and
+      // settling a verdict on it would retire a record whose file is still there.
+      Err(err) => return Err(err),
+    };
+    // A FAILED read is returned for the same reason. `Ok(None)` — an object that
+    // answers no identity — IS a mismatch, since the pinned cookie has one and
+    // this thing does not.
+    if identity_of_handle(&standing)? != Some(identity) {
+      return Ok(CookieRemoval::Displaced);
+    }
+  }
+  match dir.unlink(name) {
+    Ok(()) => Ok(CookieRemoval::Unlinked),
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CookieRemoval::AlreadyGone),
+    // A transient failure (a hung mount, a flipped permission) is reported, not
+    // swallowed, so the record survives for a later sweep to retry.
+    Err(err) => Err(err),
+  }
+}
+
+/// Removes `name` from `dir` on the platform that HAS the primitive the two
+/// Unixes lack: a disposition set on an already-open handle destroys the object
+/// that handle refers to, with no name resolved at all.
+///
+/// Two opens, because one cannot do both jobs. The first asks for the LOWEST
+/// rights that answer an identity, so an object this process may not delete still
+/// reaches the comparison and settles as displaced instead of failing forever.
+/// The second asks for DELETE — and its identity is RE-READ before the
+/// disposition, because it is a second lookup of the name and a second lookup can
+/// land on a different object. Only a handle that has itself been proven is ever
+/// deleted through.
+///
+/// An [`Anchor`](CookieProof::Anchor) residue has no identity to prove and takes
+/// neither open: it is destroyed through the create's OWN retained handle, which
+/// is object-exact by construction. Without that handle there is nothing safe left
+/// to do, and the failure is returned so the record survives.
+#[cfg(all(target_os = "windows", not(miri)))]
+fn remove_anchored(
+  dir: &CookieDir,
+  name: &str,
+  proof: CookieProof,
+  pin: Option<&std::fs::File>,
+) -> Result<CookieRemoval, std::io::Error> {
+  use std::os::windows::io::AsHandle;
+
+  let CookieProof::Object(identity) = proof else {
+    let Some(created) = pin else {
+      return Err(std::io::Error::other(
+        "an unidentified cookie with no retained handle cannot be removed",
+      ));
+    };
+    return match crate::os::windows::ffi::delete_by_handle(created.as_handle()) {
+      Ok(()) => Ok(CookieRemoval::Unlinked),
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CookieRemoval::AlreadyGone),
+      Err(err) => Err(err),
+    };
+  };
+  let standing = match dir.open_for_classification(name) {
+    Ok(file) => file,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(CookieRemoval::AlreadyGone);
+    }
+    Err(err) => return Err(err),
+  };
+  if identity_of_handle(&standing)? != Some(identity) {
+    return Ok(CookieRemoval::Displaced);
+  }
+  drop(standing);
+  let deletable = match dir.open_for_delete(name) {
+    Ok(file) => file,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(CookieRemoval::AlreadyGone);
+    }
+    // A sharing violation on the DELETE open is transient by the caller's
+    // contract: the record survives for a later sweep.
+    Err(err) => return Err(err),
+  };
+  // The re-proof. Everything below this line destroys the object `deletable`
+  // refers to, so it is this handle's identity — not the first one's — that has to
+  // match.
+  if identity_of_handle(&deletable)? != Some(identity) {
+    return Ok(CookieRemoval::Displaced);
+  }
+  match crate::os::windows::ffi::delete_by_handle(deletable.as_handle()) {
+    Ok(()) => Ok(CookieRemoval::Unlinked),
+    // The object went away under us between the proof and the disposition: still
+    // the idempotent success, since this driver's file is gone from the only place
+    // it could ever address it.
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CookieRemoval::AlreadyGone),
+    // Anything else (a sharing violation, a read-only volume) is transient by the
+    // caller's contract: the record survives for a later sweep.
+    Err(err) => Err(err),
+  }
+}
+
+/// The platform with no anchor primitive at all. No cookie is ever created there
+/// (see [`CookieDir`]), so no removal is ever asked for; a request that reaches
+/// here anyway refuses rather than falling back to a pathname.
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "macos",
+  all(target_os = "windows", not(miri))
+)))]
+fn remove_anchored(
+  _dir: &CookieDir,
+  _name: &str,
+  _proof: CookieProof,
+  _pin: Option<&std::fs::File>,
+) -> Result<CookieRemoval, std::io::Error> {
+  Err(std::io::Error::new(
+    std::io::ErrorKind::Unsupported,
+    "this platform has no way to bind a cookie's removal to the object created",
+  ))
 }
 
 /// How a dispatched control batch ENDED. The completion's fail-closed policy is

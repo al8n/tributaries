@@ -19,18 +19,20 @@ use std::{
 
 use windows_sys::Win32::{
   Foundation::{
-    ERROR_IO_PENDING, ERROR_NO_MORE_FILES, GENERIC_READ, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NO_MORE_FILES,
+    ERROR_NOT_SUPPORTED, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
   },
   Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY,
-    FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-    FileAttributeTagInfo, FileBasicInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo,
-    FileIdInfo, GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, ReadDirectoryChangesExW,
-    ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
+    CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_ID_INFO,
+    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TYPE_DISK, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo,
+    FileDispositionInfoEx, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
+    GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, ReadDirectoryChangesExW,
+    ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation, SetFileInformationByHandle,
   },
   System::{
     IO::{
@@ -178,6 +180,68 @@ pub(crate) fn identity_of(handle: BorrowedHandle<'_>) -> io::Result<HandleIdenti
     volume_serial: info.VolumeSerialNumber,
     file_id: u128::from_le_bytes(info.FileId.Identifier),
   })
+}
+
+/// Destroys the object `handle` refers to — the primitive Linux and macOS do
+/// not have.
+///
+/// The disposition is set on an ALREADY-OPEN handle, so no name is resolved and
+/// nothing can be swapped in between a caller's verification of that handle and
+/// this call: the object destroyed is provably the object verified. A path-based
+/// delete offers no such guarantee, which is why every removal that has a handle
+/// should come through here.
+///
+/// POSIX semantics are asked for first, so the directory entry disappears at
+/// once even while other handles (the cookie's own pinned create) are still
+/// open. Where the filesystem or the OS build has no such flag, the classic
+/// disposition is the fallback and the entry instead survives until the last
+/// handle to the object closes — the object is unreachable by name either way,
+/// since the name is refused to every opener from this point on.
+pub(crate) fn delete_by_handle(handle: BorrowedHandle<'_>) -> io::Result<()> {
+  let raw = handle.as_raw_handle() as HANDLE;
+  let ex = FILE_DISPOSITION_INFO_EX {
+    Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+  };
+  // SAFETY: `ex` is a properly-sized, initialized FILE_DISPOSITION_INFO_EX and
+  // the class constant matches the struct; the handle is live for the call.
+  let ok = unsafe {
+    SetFileInformationByHandle(
+      raw,
+      FileDispositionInfoEx,
+      (&raw const ex).cast(),
+      size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+    )
+  };
+  if ok != 0 {
+    return Ok(());
+  }
+  let err = io::Error::last_os_error();
+  // Only "this build/filesystem does not know the Ex class" falls back. Every
+  // other failure — a sharing violation, a read-only volume — is the caller's to
+  // retry, and retrying it under a different class would just fail again while
+  // hiding which call reported what.
+  let unsupported = matches!(
+    err.raw_os_error().map(|code| code as u32),
+    Some(ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+  );
+  if !unsupported {
+    return Err(err);
+  }
+  let classic = FILE_DISPOSITION_INFO { DeleteFile: true };
+  // SAFETY: `classic` is a properly-sized, initialized FILE_DISPOSITION_INFO and
+  // the class constant matches the struct; the handle is live for the call.
+  let ok = unsafe {
+    SetFileInformationByHandle(
+      raw,
+      FileDispositionInfo,
+      (&raw const classic).cast(),
+      size_of::<FILE_DISPOSITION_INFO>() as u32,
+    )
+  };
+  if ok == 0 {
+    return Err(io::Error::last_os_error());
+  }
+  Ok(())
 }
 
 /// Creates a fresh completion port with single-thread concurrency — each

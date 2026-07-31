@@ -212,7 +212,11 @@ pub enum SyncRootError {
   /// barrier at all.
   #[error("could not write sync cookie {}: {source}", path.display())]
   Write {
-    /// The cookie path the write was attempted at.
+    /// Where the write was aimed — `dir` joined with the cookie name. It is a
+    /// DESCRIPTION of the request, not a landing: a cookie that succeeds lands
+    /// one level deeper, in the watcher's own reserved-namespace directory, and
+    /// only [`Watcher::sync_root`](crate::Watcher::sync_root)'s return value ever
+    /// says where.
     path: PathBuf,
     /// The underlying failure.
     #[source]

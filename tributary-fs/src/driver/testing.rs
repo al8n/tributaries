@@ -20,7 +20,9 @@ use agnostic_lite::{
 };
 use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 
-use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
+use super::{
+  CookieFile, CookieRemoval, CookieWriteError, FsOps, ScopeRegistry, SourceControl, SpawnedSource,
+};
 use crate::{
   core::{ExpectedObject, MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
   driver::ControlRequest,
@@ -139,6 +141,13 @@ struct FakeState {
   /// When set, every cookie write fails with this error kind (the read-only
   /// tree, modeled).
   cookie_write_failure: Mutex<Option<std::io::ErrorKind>>,
+  /// When set, every cookie write CREATES its file and then fails with this
+  /// error kind, handing the file back as the residue: the write that could not
+  /// identify what it made and could not destroy it either. Distinct from
+  /// [`cookie_write_failure`](Self::cookie_write_failure), which models a write
+  /// that left nothing on disk — the whole difference being whether the caller
+  /// may retire the obligation pre-physically.
+  cookie_write_strand: Mutex<Option<std::io::ErrorKind>>,
   /// Cookie writes that reached the blocking pool, counted before any hold — the
   /// observable that a write is IN FLIGHT, which is what a cell racing a
   /// retirement or an abandoned reply against it must wait for.
@@ -308,6 +317,7 @@ impl Default for FakeState {
       cookie_writes: Mutex::default(),
       cookie_removes: Mutex::default(),
       cookie_write_failure: Mutex::default(),
+      cookie_write_strand: Mutex::default(),
       cookie_dispatches: AtomicUsize::new(0),
       cookie_write_hold: Mutex::default(),
       cookie_remove_failures: AtomicUsize::new(0),
@@ -411,6 +421,23 @@ impl FakeFs {
 
   pub(crate) fn remove(&self, path: impl AsRef<Path>) {
     self.state.nodes.lock().unwrap().remove(path.as_ref());
+  }
+
+  /// The landing a `write_cookie` would have reported for the node standing at
+  /// `path` right now — for a cell that stages a cookie with [`put`](Self::put)
+  /// and hands it to a registry directly, below the write that normally mints
+  /// one. Identity is read from the node, so a cell that later replaces it gets
+  /// the replacement's, exactly as a real `fstat` would.
+  ///
+  /// An ABSENT node yields inode 0, which no cell and no fake write ever mints:
+  /// staging a cookie for a path with nothing at it is meant to match nothing.
+  pub(crate) fn cookie_at(&self, path: impl AsRef<Path>) -> CookieFile {
+    let path = path.as_ref().to_path_buf();
+    let identity = self.state.nodes.lock().unwrap().get(&path).map_or_else(
+      || RootIdentity::new(self.root_dev, 0),
+      |node| RootIdentity::new(node.dev, node.ino.into()),
+    );
+    CookieFile::new(path, identity)
   }
 
   /// Every regular file at or under `prefix`, for tree-equality oracles.
@@ -798,6 +825,14 @@ impl FakeFs {
   /// Fails every subsequent cookie write with `kind` — the read-only tree.
   pub(crate) fn fail_cookie_writes(&self, kind: std::io::ErrorKind) {
     *self.state.cookie_write_failure.lock().unwrap() = Some(kind);
+  }
+
+  /// Makes every subsequent cookie write CREATE its file and then fail with
+  /// `kind`, handing the file back as the residue — the created-but-unresolved
+  /// write. What a cell built on this proves is an accounting property: the file
+  /// exists, so the obligation may not be retired as though nothing had been made.
+  pub(crate) fn strand_cookie_writes(&self, kind: std::io::ErrorKind) {
+    *self.state.cookie_write_strand.lock().unwrap() = Some(kind);
   }
 
   /// Fails the next `n` cookie REMOVES with a transient error, then lets removes
@@ -1718,14 +1753,22 @@ impl FsOps for FakeFs {
     })
   }
 
-  fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
+  fn write_cookie(
+    &self,
+    root: &Path,
+    dir: &Path,
+    name: &str,
+  ) -> Result<CookieFile, CookieWriteError> {
     // The dispatch is counted BEFORE the hold: a cell that must race a scope
     // retirement (or an abandoned reply) against a write in flight needs to know
     // the write is parked in the pool, not still queued behind its settle fence.
     self.state.cookie_dispatches.fetch_add(1, Ordering::SeqCst);
     self.park_on(&self.state.cookie_write_hold);
     if let Some(kind) = *self.state.cookie_write_failure.lock().unwrap() {
-      return Err(std::io::Error::new(kind, "cookie write refused"));
+      return Err(CookieWriteError::clean(std::io::Error::new(
+        kind,
+        "cookie write refused",
+      )));
     }
     // The real `cookie_dir` resolution, mirrored: a covered FILE subscription's
     // key names a file, so the cookie lands BESIDE it rather than failing ENOTDIR
@@ -1745,10 +1788,10 @@ impl FsOps for FakeFs {
       // "place a barrier" into thin air — a root that died under an in-flight
       // sync is exactly that case.
       if !nodes.get(target).is_some_and(|node| node.kind.is_dir()) {
-        return Err(std::io::Error::new(
+        return Err(CookieWriteError::clean(std::io::Error::new(
           std::io::ErrorKind::NotFound,
           "the cookie directory is gone",
-        ));
+        )));
       }
       // Canonicalize the resolved directory (resolving any modeled intermediate
       // symlink) and verify it is BENEATH the root — the production
@@ -1764,9 +1807,9 @@ impl FsOps for FakeFs {
         .cloned()
         .unwrap_or_else(|| target.to_path_buf());
       if !canonical_dir.starts_with(root) {
-        return Err(std::io::Error::other(
+        return Err(CookieWriteError::clean(std::io::Error::other(
           "the cookie directory resolves outside the watched root",
-        ));
+        )));
       }
       let path = canonical_dir.join(name);
       // O_NOFOLLOW on the real create, mirrored: a symlink swapped in where the
@@ -1777,10 +1820,10 @@ impl FsOps for FakeFs {
         nodes.get(&path).map(|node| node.kind),
         Some(FileKind::Symlink)
       ) {
-        return Err(std::io::Error::new(
+        return Err(CookieWriteError::clean(std::io::Error::new(
           std::io::ErrorKind::AlreadyExists,
           "refusing to follow a symlink at the cookie path",
-        ));
+        )));
       }
       path
     };
@@ -1794,17 +1837,30 @@ impl FsOps for FakeFs {
     // predecessor record. (The symlink refusal above already covers that kind;
     // this is the general case.)
     if self.state.nodes.lock().unwrap().contains_key(&path) {
-      return Err(std::io::Error::new(
+      return Err(CookieWriteError::clean(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "a cookie already exists at the path (create_new)",
-      ));
+      )));
     }
     self.put(&path, FileKind::File, ino);
     self.state.cookie_writes.lock().unwrap().push(path.clone());
-    Ok(path)
+    // The identity of the node the create just made, mirroring the real `fstat`
+    // on the descriptor the create returned — a node the fake later replaces at
+    // this path gets a different `ino`, so the removal's proof is exercised
+    // against the same distinction production faces.
+    let identity = RootIdentity::new(self.root_dev, ino.into());
+    let file = CookieFile::new(path, identity);
+    if let Some(kind) = *self.state.cookie_write_strand.lock().unwrap() {
+      return Err(CookieWriteError {
+        source: std::io::Error::new(kind, "cookie write left an unresolved file"),
+        residue: Some(Box::new(file)),
+      });
+    }
+    Ok(file)
   }
 
-  fn remove_cookie(&self, path: &Path) -> Result<(), std::io::Error> {
+  fn remove_cookie(&self, cookie: &CookieFile) -> Result<CookieRemoval, std::io::Error> {
+    let path = cookie.path();
     // Counted BEFORE the hold: a cell racing a close (or a cancelled driver's
     // Drop) against a hung terminal unlink needs to know the unlink is parked in
     // the pool, not still queued.
@@ -1847,6 +1903,24 @@ impl FsOps for FakeFs {
         Err(actual) => budget = actual,
       }
     }
+    // The production identity proof, mirrored: a node standing at the path that is
+    // NOT the one the write created is left alone, whatever the cell put there.
+    // The knobs above are checked first because they model a failing unlink, which
+    // in production fails before any object is inspected.
+    let present = self
+      .state
+      .nodes
+      .lock()
+      .unwrap()
+      .get(path)
+      .map(|node| RootIdentity::new(node.dev, node.ino.into()));
+    if present.is_some_and(|found| Some(found) != cookie.identity()) {
+      return Ok(CookieRemoval::Displaced);
+    }
+    // An absent node still runs the removal below (a no-op on the tree): the
+    // already-gone case is idempotent success, and taking it through the same
+    // confirm hold and log keeps every cell's bracketing of that window intact.
+    let gone = present.is_none();
     self.remove(path);
     // The unlink syscall has completed (the node is gone; `files_under` reflects
     // it), but the pool job has NOT yet taken the ledger lock to confirm: park
@@ -1860,7 +1934,11 @@ impl FsOps for FakeFs {
       .lock()
       .unwrap()
       .push(path.to_path_buf());
-    Ok(())
+    Ok(if gone {
+      CookieRemoval::AlreadyGone
+    } else {
+      CookieRemoval::Unlinked
+    })
   }
 
   fn take_enumerate_anchor(&self, watch: WatchId) -> Option<Self::Anchor> {

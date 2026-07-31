@@ -1136,7 +1136,7 @@ impl<R> Watcher<R> {
     )
   }
 
-  /// Places a **sync cookie** — the kernel-mediated barrier marker — inside
+  /// Places a **sync cookie** — the kernel-mediated barrier marker — under
   /// `dir` (which must lie within `root`'s coverage) and resolves with the
   /// path it landed at, at WRITE-complete.
   ///
@@ -1147,6 +1147,16 @@ impl<R> Watcher<R> {
   /// pipeline. This method never waits for the observation — doing so from
   /// inside the watcher would deadlock the very stream the cookie must
   /// arrive on. Observation is the caller's (or the umbrella's) job.
+  ///
+  /// # The returned path is the only authority on where the cookie is
+  ///
+  /// The cookie does NOT land at `dir.join(name)`. It lands one level deeper, in
+  /// a reserved-namespace directory the watcher creates and owns inside `dir`,
+  /// because a cookie's removal must be anchored to a directory nobody else may
+  /// write — a name in a directory the watched tree owns can be rebound between
+  /// the removal's proof and its unlink, and no amount of re-checking closes
+  /// that. Reap what this call RETURNED; a path re-derived from `dir` and `name`
+  /// names nothing.
   ///
   /// The write is parked on the scope's coverage-settle fence: under a
   /// descending backend, a change inside a subtree whose per-directory watch
@@ -1312,14 +1322,14 @@ impl<R> Watcher<R> {
   /// # Path addresses the path's CURRENT holder
   ///
   /// A path resolves to whatever live cookie occupies it NOW, not the incarnation
-  /// live when the request was issued. A sync's cookie path is `dir.join(name)`, so
-  /// two syncs that reuse one `name` in one `dir` sequentially share a path: a reap
-  /// delayed across the first sync's retirement and a second sync's claim of the
-  /// same path reaps the SECOND. This is harmless for the intended reap-what-you-were-
-  /// -given use, and cannot arise for the umbrella (its cookie names are per-sync
-  /// unique). A caller that both reuses names and needs incarnation precision reaps
-  /// through its [`SyncTicket`] instead — [`request_cancel_sync`](Self::request_cancel_sync)
-  /// addresses exactly one incarnation for all time and is a no-op after it resolves.
+  /// live when the request was issued. Two syncs that reuse one `name` in one `dir`
+  /// sequentially land at one path: a reap delayed across the first sync's
+  /// retirement and a second sync's claim of the same path reaps the SECOND. This
+  /// is harmless for the intended reap-what-you-were-given use, and cannot arise
+  /// for the umbrella (its cookie names are per-sync unique). A caller that both
+  /// reuses names and needs incarnation precision reaps through its [`SyncTicket`]
+  /// instead — [`request_cancel_sync`](Self::request_cancel_sync) addresses exactly
+  /// one incarnation for all time and is a no-op after it resolves.
   pub fn request_remove_cookie(&self, path: impl Into<PathBuf>) {
     self.cleanup.request_remove(&path.into());
   }
