@@ -34,6 +34,10 @@ use tributary_fs::{
   WatcherOptions,
 };
 
+mod common;
+
+use common::{Inventory, covers, delivered, drive};
+
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -105,15 +109,6 @@ async fn wait_for(
   .flatten()
 }
 
-/// An event "covers" a path when it names it directly or is a `Rescan` at the
-/// path or one of its ancestors (a rescan obliges re-enumeration below it).
-fn covers(event: &Event, path: &Path) -> bool {
-  if event.path() == path {
-    return true;
-  }
-  event.is_rescan() && path.starts_with(event.path())
-}
-
 /// Converges on live coverage of `dir`: creates a fresh file there and waits
 /// briefly for its delivery, retrying until one lands. A descending re-arm
 /// (a `replace_root` widen rebuilds the tree on a new inotify instance)
@@ -145,35 +140,32 @@ async fn coverage_becomes_live(watcher: &mut TokioWatcher, dir: &Path, tag: &str
 }
 
 /// Converges on the CHILD'S OWN kernel watch DELIVERING for `dir`: creates a
-/// fresh probe file there and waits for that file's EXACT, non-`Rescan` event,
+/// fresh probe file there and waits for that file's exact [`delivered`] event,
 /// retrying with a new probe until one lands. `false` means no such delivery ever
 /// came.
 ///
 /// # Why this is not [`coverage_becomes_live`], and why nothing may substitute it
 ///
-/// The two answer different questions and are not interchangeable in the
-/// direction that matters. `coverage_becomes_live` stands on [`covers`], which
-/// accepts an ancestor `Rescan` — correct for what it is for, "the caller now owes
-/// a re-enumeration below here", which is all a re-arm handshake needs to see.
+/// The two ask the two questions [`covers`] and [`delivered`] exist to keep
+/// apart, and they are not interchangeable in the direction that matters.
+/// `coverage_becomes_live` asks only that the caller now owes a re-enumeration
+/// below here — all a re-arm handshake needs to see.
 ///
-/// But a located `Rescan` at or above `dir` is PRECISELY what the Monitor emits
-/// when it could not arm `dir` and dropped the subtree. So for any claim that
-/// `dir` itself is watched, an ancestor `Rescan` is not weak evidence in favour —
-/// it is evidence AGAINST, and accepting it inverts the test. Only the exact path
-/// can settle it: inotify attributes a create inside a directory to THAT
-/// directory's own watch descriptor, so an event naming the probe file itself is a
-/// positive observation that `dir`'s own kernel watch exists and is delivering.
-/// Nothing weaker entails it, which is why this predicate refuses `Rescan`s
-/// outright instead of ranking them.
+/// This asks that `dir` ITSELF is watched, and only the exact path can settle
+/// that. inotify attributes a create inside a directory to THAT directory's own
+/// watch descriptor, so an event naming the probe file is a positive observation
+/// that `dir`'s own kernel watch exists and is delivering, while an ancestor
+/// `Rescan` is precisely what the Monitor emits when it could NOT arm `dir` and
+/// dropped the subtree.
 async fn child_watch_delivers(watcher: &mut TokioWatcher, dir: &Path, tag: &str) -> bool {
   for attempt in 0..40 {
     let probe = dir.join(format!("{tag}-{attempt}.txt"));
     if std::fs::write(&probe, b"x").is_err() {
       return false;
     }
-    let delivered = tokio::time::timeout(scaled(Duration::from_millis(500)), async {
+    let arrived = tokio::time::timeout(scaled(Duration::from_millis(500)), async {
       while let Some(event) = watcher.next().await {
-        if !event.is_rescan() && event.path() == probe {
+        if delivered(&event, &probe) {
           return true;
         }
       }
@@ -181,7 +173,7 @@ async fn child_watch_delivers(watcher: &mut TokioWatcher, dir: &Path, tag: &str)
     })
     .await
     .unwrap_or(false);
-    if delivered {
+    if arrived {
       return true;
     }
   }
@@ -325,15 +317,30 @@ impl Drop for SysctlGuard {
   }
 }
 
-/// Suite 1 (§6.3): create/modify/remove churn converges through the
-/// descending profile — every mutated path ends covered. Both facts are
-/// collected in ONE pass over the stream (waiting twice would discard the
-/// events the second wait needs).
+/// Suite 1 (§6.3): create/modify/remove churn converges through the descending
+/// profile.
+///
+/// Convergence is asserted as what it MEANS — a consumer that obeyed the stream
+/// ends holding the real tree, the top-level file's creation and removal both
+/// accounted for — rather than as "something covering each mutated path
+/// arrived", which one root `Rescan` supplies for the entire subtree without
+/// decoding anything. That first claim is one a rescan-only backend legitimately
+/// satisfies, by re-reading its way to the same tree.
+///
+/// The deep create carries a second, stronger claim beside it: the descent
+/// reached `a/b` and the create was DELIVERED at that exact path — as the
+/// kernel's own `IN_CREATE`, or as the cold enumerate's `Created` when the arm
+/// landed after the write. A backend whose descent had stopped arming would
+/// converge and fail this.
+///
+/// Both facts are collected in ONE pass over the stream; a second wait would be
+/// looking for events the first already consumed.
 #[tokio::test]
 async fn churn_converges() {
   let root = scratch_root("churn");
   let mut w = watcher();
   let _h = w.watch(&root, Interest::all()).await.expect("watch");
+  let mut inventory = Inventory::seeded(&root);
 
   std::fs::create_dir_all(root.join("a/b")).unwrap();
   std::fs::write(root.join("a/b/one.txt"), b"1").unwrap();
@@ -341,21 +348,22 @@ async fn churn_converges() {
   std::fs::remove_file(root.join("top.txt")).unwrap();
 
   let deep = root.join("a/b/one.txt");
-  let top = root.join("top.txt");
-  let mut saw_deep = false;
-  let mut saw_top = false;
-  let _ = tokio::time::timeout(scaled(DEADLINE), async {
-    while let Some(event) = w.next().await {
-      saw_deep |= covers(&event, &deep);
-      saw_top |= covers(&event, &top);
-      if saw_deep && saw_top {
-        break;
-      }
-    }
+  let _ = drive(&mut w, &mut inventory, scaled(DEADLINE), |model| {
+    model.delivered_at(&deep) && model.disagreement().is_empty()
   })
   .await;
-  assert!(saw_deep, "the deep create is observed after descent");
-  assert!(saw_top, "the top-level churn is observed");
+
+  assert!(
+    inventory.disagreement().is_empty(),
+    "the consumer's view converged on the churned tree: {:?}",
+    inventory.disagreement()
+  );
+  assert!(
+    inventory.delivered_at(&deep),
+    "the deep create was delivered at {} rather than only covered ({} rescans discharged)",
+    deep.display(),
+    inventory.rescans()
+  );
 }
 
 /// Suite 2: native cookie pairing — a same-directory rename surfaces as one
@@ -4979,7 +4987,7 @@ async fn armed_or_renewed(w: &mut TokioWatcher, root: &Path, dir: &Path) -> Opti
         if event.is_rescan() && event.path() == root {
           return Some(true);
         }
-        if !event.is_rescan() && event.path() == probe {
+        if delivered(&event, &probe) {
           return Some(false);
         }
       }

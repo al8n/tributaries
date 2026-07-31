@@ -16,6 +16,10 @@ use std::{
 
 use tributary_fs::{Event, Interest, TokioWatcher, WatcherOptions};
 
+mod common;
+
+use common::{Inventory, covers, delivered, reconcile};
+
 /// Generous ceiling for one expected observation; macOS CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -58,46 +62,75 @@ async fn wait_for(
   .flatten()
 }
 
-/// An event "covers" a path when it names it directly or is a `Rescan` at the
-/// path or one of its ancestors (a rescan obliges re-enumeration below it).
-fn covers(event: &Event, path: &Path) -> bool {
-  event.path() == path || (event.is_rescan() && path.starts_with(event.path()))
-}
-
+/// Two claims about one churn, kept apart because a backend can honour either
+/// without the other.
+///
+/// The DECODE claim is that FSEvents' flag word became a verb naming the exact
+/// object: an appearance (`ITEM_CREATED`, or `ITEM_MODIFIED` when the write
+/// coalesced into the same record) and then a disappearance. The CONVERGENCE
+/// claim is that a consumer obeying the stream ends holding the real tree. A
+/// `Rescan` satisfies the second — by sending the consumer back to the
+/// filesystem, which is all it promises — and refutes nothing about the first,
+/// so the decode assertions refuse it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_and_remove_converge() {
   let root = scratch_root("create");
   let mut w = watcher();
   let handle = w.watch(&root, Interest::all()).await.expect("watch");
   assert_eq!(w.root_path(handle), Some(root.clone()));
+  let mut inventory = Inventory::seeded(&root);
 
   let file = root.join("a.txt");
   std::fs::write(&file, b"hello").expect("create");
   let seen = wait_for(&mut w, |e| {
-    covers(e, &file) && (e.kind().is_created() || e.kind().is_modified() || e.is_rescan())
+    delivered(e, &file) && (e.kind().is_created() || e.kind().is_modified())
   })
   .await;
   assert!(
     seen.is_some(),
-    "the creation of {} was observed",
+    "the creation of {} was delivered as a verb, not merely rescanned",
     file.display()
   );
+  inventory.apply(&seen.expect("the delivered create"));
 
   std::fs::remove_file(&file).expect("remove");
-  let seen = wait_for(&mut w, |e| {
-    covers(e, &file) && (e.kind().is_removed() || e.is_rescan())
-  })
-  .await;
+  let seen = wait_for(&mut w, |e| delivered(e, &file) && e.kind().is_removed()).await;
   assert!(
     seen.is_some(),
-    "the removal of {} was observed",
+    "the removal of {} was delivered as a verb, not merely rescanned",
     file.display()
+  );
+  inventory.apply(&seen.expect("the delivered removal"));
+
+  // Convergence needs a tree that OUTLIVES the churn to be a claim at all: the
+  // create and the removal cancel, so a model driven by them alone agrees with
+  // the empty root no matter what the stream said. A directory that arrives
+  // already holding a file gives it something to hold — the model can reach
+  // `keep/` only through the stream, by a delivered create or by re-reading
+  // under a covering `Rescan`, and both are legal ways for FSEvents to get
+  // there. Silence is not.
+  let kept = root.join("keep");
+  std::fs::create_dir(&kept).expect("create dir");
+  std::fs::write(kept.join("kept.txt"), b"stay").expect("create nested");
+  assert!(
+    reconcile(&mut w, &mut inventory, DEADLINE).await,
+    "the consumer converged on the real tree: {:?}",
+    inventory.disagreement()
   );
 
   w.close().await.expect("close");
   let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The rename vocabulary has exactly two legal endings, and both are
+/// DELIVERIES: the halves pair into one `Moved` naming where the object came
+/// from, or — when the two `ITEM_RENAMED` records land in different batches and
+/// the vanished source can no longer be vouched for — they degrade to a
+/// `Removed` plus a `Created`, which is the ending this cell's name calls
+/// documented. A `Rescan` over the destination is neither. It is what the
+/// backend emits when it could not say which of the two happened, so admitting
+/// it here would leave the cell unable to distinguish a working rename decode
+/// from no rename decode at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename_is_a_move_or_the_documented_degrade() {
   let root = scratch_root("rename");
@@ -109,22 +142,19 @@ async fn rename_is_a_move_or_the_documented_degrade() {
   std::fs::write(&from, b"payload").expect("create");
   assert!(
     wait_for(&mut w, |e| covers(e, &from)).await.is_some(),
-    "the creation was observed"
+    "the source object's ground is live before the rename"
   );
 
   std::fs::rename(&from, &to).expect("rename");
   let seen = wait_for(&mut w, |e| {
-    let paired_move = e
-      .kind()
-      .moved()
-      .is_some_and(|m| m.from() == from && e.path() == to);
-    let degraded_create = e.kind().is_created() && e.path() == to;
-    paired_move || degraded_create || covers(e, &to)
+    let paired_move = e.kind().moved().is_some_and(|m| m.from() == from);
+    delivered(e, &to) && (paired_move || e.kind().is_created())
   })
   .await;
   assert!(
     seen.is_some(),
-    "the rename surfaced as a Moved, its documented degrade, or a covering rescan"
+    "the rename surfaced as a Moved naming {} or as its documented degrade — not as a rescan",
+    from.display()
   );
 
   w.close().await.expect("close");
@@ -470,7 +500,7 @@ async fn replace_root_replays_the_swap_window_from_the_journal() {
 
   // The journal replay delivers it as a CONCRETE change (the covering Rescan
   // would also "cover" it — this asserts the denser delivery the resume buys).
-  let replayed = wait_for(&mut w, |e| !e.is_rescan() && e.path() == pre).await;
+  let replayed = wait_for(&mut w, |e| delivered(e, &pre)).await;
   assert!(
     replayed.is_some(),
     "the pre-swap write is replayed from the journal, not only rescanned"

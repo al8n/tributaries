@@ -29,6 +29,10 @@ use std::{
 
 use tributary_fs::{Backend, Event, EventKind, Interest, TokioWatcher, WatcherOptions};
 
+mod common;
+
+use common::{covers, delivered};
+
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -68,14 +72,6 @@ async fn wait_for(
   }
 }
 
-/// Whether the event names (or covers) `target`.
-fn covers(event: &Event, target: &Path) -> bool {
-  match event.kind() {
-    EventKind::Rescan => target.starts_with(event.path()),
-    _ => event.path() == target,
-  }
-}
-
 /// A FORCED RDCW selection reports itself — the unprivileged arm stays
 /// selectable and honest even where Auto would prefer the journal.
 #[tokio::test]
@@ -89,6 +85,12 @@ async fn forced_rdcw_reports_itself() {
 }
 
 /// Create → modify → remove under a nested tree: each verb is delivered.
+///
+/// The three `FILE_ACTION_*` words lower to `Created`/`Modified`/`Removed` with
+/// no probe in between, so each step names both the exact path and the verb it
+/// expects. A `Rescan` is not a weaker version of that answer — it is the pump's
+/// reply when it lost the records it would have decoded — so the whole cell
+/// would say nothing at all if one were admitted.
 #[tokio::test]
 async fn verbs_flow_end_to_end() {
   let root = scratch_root("verbs");
@@ -99,20 +101,26 @@ async fn verbs_flow_end_to_end() {
   let file = root.join("deep").join("probe.txt");
   std::fs::write(&file, b"one").expect("create");
   assert!(
-    wait_for(&mut w, |e| covers(e, &file)).await.is_some(),
-    "the create is delivered"
+    wait_for(&mut w, |e| delivered(e, &file) && e.kind().is_created())
+      .await
+      .is_some(),
+    "the create is delivered as Created"
   );
 
   std::fs::write(&file, b"two").expect("modify");
   assert!(
-    wait_for(&mut w, |e| covers(e, &file)).await.is_some(),
-    "the modify is delivered"
+    wait_for(&mut w, |e| delivered(e, &file) && e.kind().is_modified())
+      .await
+      .is_some(),
+    "the modify is delivered as Modified"
   );
 
   std::fs::remove_file(&file).expect("remove");
   assert!(
-    wait_for(&mut w, |e| covers(e, &file)).await.is_some(),
-    "the remove is delivered"
+    wait_for(&mut w, |e| delivered(e, &file) && e.kind().is_removed())
+      .await
+      .is_some(),
+    "the remove is delivered as Removed"
   );
 
   w.close().await.expect("close");
@@ -404,10 +412,7 @@ async fn journal_wrap_degrades_to_rescan() {
   let probe = root.join("alive.txt");
   std::fs::write(&probe, b"x").expect("post-loss create");
   assert!(
-    wait_for(&mut w, |e| !matches!(e.kind(), EventKind::Rescan)
-      && e.path() == probe)
-    .await
-    .is_some(),
+    wait_for(&mut w, |e| delivered(e, &probe)).await.is_some(),
     "a concrete post-loss event flows"
   );
   w.close().await.expect("close");
@@ -468,10 +473,7 @@ async fn birth_refresh_survives(backend: Backend, tag: &str) {
   let file = root.join("post-refresh.txt");
   std::fs::write(&file, b"x").expect("create");
   assert!(
-    wait_for(&mut w, |e| !matches!(e.kind(), EventKind::Rescan)
-      && e.path() == file)
-    .await
-    .is_some(),
+    wait_for(&mut w, |e| delivered(e, &file)).await.is_some(),
     "a concrete post-refresh event flows"
   );
 

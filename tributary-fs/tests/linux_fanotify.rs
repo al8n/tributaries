@@ -32,6 +32,10 @@ use std::{
 
 use tributary_fs::{Backend, BackendKind, Event, Interest, TokioWatcher, WatcherOptions};
 
+mod common;
+
+use common::{covers, delivered};
+
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -162,15 +166,6 @@ async fn wait_for(
   .flatten()
 }
 
-/// An event "covers" a path when it names it directly or is a `Rescan` at the
-/// path or one of its ancestors.
-fn covers(event: &Event, path: &Path) -> bool {
-  if event.path() == path {
-    return true;
-  }
-  event.is_rescan() && path.starts_with(event.path())
-}
-
 /// Guard that unmounts the shared loopback if THIS test mounted it, so a
 /// `--test-threads=1` run leaves nothing mounted after the last test.
 struct LoopbackGuard {
@@ -186,8 +181,15 @@ impl Drop for LoopbackGuard {
 }
 
 /// Suite 8 (§6.3): FID decode + identity cross-check. A create surfaces with
-/// its path, and repeated writes to the same object keep converging — the
-/// one-mint-scheme invariant, exercised end to end against real FID decoding.
+/// its path, and a follow-up write to the same object surfaces again under the
+/// same identity — the one-mint-scheme invariant, exercised end to end against
+/// real FID decoding.
+///
+/// Both observations must be DELIVERIES. The subject here is the decode itself:
+/// the kernel handed over a file handle and a parent handle, and the reader
+/// resolved them to this path under this root. A covering `Rescan` is what the
+/// reader emits when it could NOT resolve them, so a cell that accepted one
+/// would report a total FID-decode failure as a pass.
 #[tokio::test]
 async fn fid_decode_and_identity_roundtrip() {
   let Some(mount) = ext4_loopback() else {
@@ -207,16 +209,16 @@ async fn fid_decode_and_identity_roundtrip() {
 
   let deep = root.join("a/b/one.txt");
   assert!(
-    wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
-    "a deep create is observed through the kernel-recursive mark"
+    wait_for(&mut w, |e| delivered(e, &deep)).await.is_some(),
+    "a deep create is decoded to its path through the kernel-recursive mark"
   );
 
   // A metadata change on the same object surfaces too (its FID admits under the
   // learned directory).
   std::fs::write(root.join("a/b/one.txt"), b"22").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
-    "a follow-up write to the same object keeps flowing"
+    wait_for(&mut w, |e| delivered(e, &deep)).await.is_some(),
+    "a follow-up write to the same object decodes to the same path"
   );
 }
 
@@ -258,6 +260,11 @@ async fn rename_pairs_into_one_moved() {
 /// must arrive under the NEW directory path. This exercises the parent-relative
 /// FID map end to end: the descendant's admission resolves through the moved
 /// parent's updated link, never a stale absolute path.
+///
+/// Which makes both observations DELIVERIES: the subject is the path the map
+/// resolved to, and a `Rescan` carries no resolved path to judge. It is what the
+/// reader emits when the map could not answer at all — the failure this cell
+/// exists to detect.
 #[tokio::test]
 async fn dir_rename_reparents_descendant_paths() {
   let Some(mount) = ext4_loopback() else {
@@ -285,16 +292,18 @@ async fn dir_rename_reparents_descendant_paths() {
   let new_leaf = root.join("b/child/leaf.txt");
   std::fs::write(&new_leaf, b"after-rename").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &new_leaf)).await.is_some(),
+    wait_for(&mut w, |e| delivered(e, &new_leaf))
+      .await
+      .is_some(),
     "a pre-existing descendant resolves under the renamed directory's new path"
   );
 
-  // The consumer converges: a create of a brand-new file under the moved
-  // directory also lands at the new path (self-maintenance and seeding agree).
+  // A create of a brand-new file under the moved directory also lands at the
+  // new path (self-maintenance and seeding agree).
   let fresh = root.join("b/child/fresh.txt");
   std::fs::write(&fresh, b"new").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &fresh)).await.is_some(),
+    wait_for(&mut w, |e| delivered(e, &fresh)).await.is_some(),
     "a fresh create under the renamed directory also resolves at the new path"
   );
 }
@@ -348,8 +357,8 @@ async fn move_in_populated_dir_delivers_descendant_events() {
   let deep = root.join("incoming/nested/deep.txt");
   std::fs::write(&deep, b"after-move-in").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
-    "a pre-existing nested descendant of a moved-in directory is observed under its new path"
+    wait_for(&mut w, |e| delivered(e, &deep)).await.is_some(),
+    "a pre-existing nested descendant of a moved-in directory is delivered under its new path"
   );
   let _ = w.close().await;
 }
