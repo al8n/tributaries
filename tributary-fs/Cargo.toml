@@ -25,8 +25,8 @@ _integration = []
 [dependencies]
 agnostic-lite = { version = "0.7", features = ["time"] }
 async-channel = "2"
-futures-channel = "0.3"
-futures-core = "0.3"
+futures-channel = "0.3.31"
+futures-core = "0.3.31"
 futures-util = { version = "0.3", default-features = false, features = [
   "std",
   "async-await-macro",
@@ -35,7 +35,7 @@ thiserror = "2"
 tributary-proto = { version = "0.1", path = "../tributary-proto" }
 
 [dev-dependencies]
-tokio = { version = "1", features = [
+tokio = { version = "1.30", features = [
   "macros",
   "rt",
   "rt-multi-thread",
@@ -47,10 +47,10 @@ tokio = { version = "1", features = [
 # The watch-limit integration cell probes, via a private inotify fd, whether the
 # kernel actually enforces the `max_user_watches` shrink — some containerized
 # kernels accept (and echo back) the write yet never charge watches against it.
-libc = "0.2"
+libc = "0.2.171"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+libc = "0.2.171"
 # `fs` covers inotify + openat + statfs/fstatfs + stat/statat; `event` covers
 # eventfd + poll; `std` gives the OwnedFd / io::Error bridges. The backends
 # never call rustix's pipe/mount/process surfaces (the mountinfo seed is a
@@ -59,8 +59,8 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "event",
 
 [target.'cfg(target_os = "macos")'.dependencies]
 dispatch2 = "0.3"
-libc = "0.2"
-objc2-core-foundation = { version = "0.3", default-features = false, features = [
+libc = "0.2.171"
+objc2-core-foundation = { version = "0.3.1", default-features = false, features = [
   "std",
   "CFArray",
   "CFBase",

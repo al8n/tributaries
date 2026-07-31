@@ -70,6 +70,67 @@ jobs:
       # umbrella (the generic core: no fs, no runtime); pin it explicitly here.
       run: cargo clippy -p tributaries --no-default-features -- -D warnings
 
+  # The advertised `rust-version` is a support claim, and every other job
+  # installs the latest stable — so nothing would notice the workspace drifting
+  # past its own floor. This job is that gate: pinned, never updated in place.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache cargo build and registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95 --profile minimal --no-self-update
+      - name: Assert the pin still matches the manifest
+        # A raised `rust-version` against a stale pin here would leave the claim
+        # ungated again, which is the hole this job exists to close.
+        run: |
+          declared=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["rust_version"])')
+          if [ "$declared" != "1.95" ]; then
+            echo "::error::workspace rust-version is $declared but this job pins 1.95"
+            exit 1
+          fi
+      - name: Build every target at the MSRV
+        run: cargo +1.95 build --workspace --all-features --all-targets
+      - name: Test at the MSRV
+        # The `_integration` binaries are COMPILED by the build step above but
+        # not run here: they need `--test-threads=1` and privilege, and the
+        # dedicated Linux jobs own them.
+        run: |
+          cargo +1.95 test -p tributary-proto --all-features
+          cargo +1.95 test -p tributary-fs --features tokio,smol
+          cargo +1.95 test -p tributaries --features fs,tokio,smol
+
+  # A declared dependency floor is a claim too, and never an exercised one:
+  # cargo resolves the NEWEST compatible version, so a floor can sit years below
+  # anything that actually compiles and no job would notice. This one resolves
+  # every DIRECT dependency at its declared floor and builds there.
+  minimal-versions:
+    name: minimal-versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup update nightly --no-self-update && rustup default nightly
+      - name: Resolve every direct dependency at its floor
+        # Cargo.lock is not committed, so this resolves from the manifests
+        # alone and the lockfile it writes IS the assertion.
+        run: cargo +nightly generate-lockfile -Z direct-minimal-versions
+      - name: Show the floors that were selected
+        run: cargo tree --depth 1 --locked
+      - name: Build at the floors
+        run: cargo +nightly check --workspace --all-features --all-targets --locked
+
   # Run tests on some extra platforms
   cross:
     name: cross
@@ -193,6 +254,49 @@ jobs:
       # the matrix flags ever change.
       run: cargo test -p tributaries --no-default-features --features tokio --test indexer_shaped
 
+  # Every lifecycle/cancellation/close/timer contract lives in four in-crate
+  # test modules whose `cfg` names `feature = "tokio"` alone, so they compile
+  # out of every Smol build: a green Smol leg of the feature powerset proves
+  # nothing about Smol. This job runs those modules under Smol and ACCOUNTS for
+  # how many actually executed, so the gap is annotated on every run instead of
+  # passing silently, and turns into a hard failure the moment the gate widens.
+  smol-contracts:
+    name: smol-contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache cargo build and registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-smol-contracts-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-smol-contracts-
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Runtime contracts under smol
+        run: |
+          set -o pipefail
+          cargo test -p tributary-fs --no-default-features --features smol --lib \
+            -- driver::tests:: watcher::tests:: 2>&1 | tee fs.log
+          cargo test -p tributaries --no-default-features --features fs,smol --lib \
+            -- driver::tests:: demux::tests:: 2>&1 | tee umbrella.log
+      - name: Account for what Smol actually executed
+        run: |
+          executed=$(grep -ho 'test result: ok\. [0-9]\+ passed' fs.log umbrella.log \
+            | awk '{ sum += $4 } END { print sum + 0 }')
+          echo "runtime-contract tests executed under smol: $executed" >> "$GITHUB_STEP_SUMMARY"
+          if grep -rqF 'cfg(all(test, feature = "tokio"))' tributary-fs/src tributaries/src; then
+            echo "::warning::runtime-contract suites are still cfg-gated to feature = \"tokio\"; Smol executed $executed of them"
+          elif [ "$executed" -eq 0 ]; then
+            echo "::error::the tokio-only cfg gate is gone yet Smol executed no runtime-contract test"
+            exit 1
+          fi
+
   linux-integration:
     name: linux-integration
     runs-on: ubuntu-latest
@@ -222,6 +326,85 @@ jobs:
       # sudo unlocks the sysctl overflow/watch-limit cells and the bind-mount
       # aliasing cell; the tests snapshot and restore every knob they touch.
       run: sudo -E env "PATH=$PATH" cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1
+
+  # The fanotify backend had no hosted acceptance at all: the powerset `test`
+  # job excludes `_integration`, and `linux-integration` names only the inotify
+  # binary, so `linux_fanotify` was built and run nowhere.
+  linux-fanotify:
+    name: linux-fanotify
+    runs-on: ubuntu-latest
+    # Real-fanotify convergence suites over an ext4 loopback; a wedged kernel
+    # queue must fail the job, not idle out the runner.
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v7
+    - name: Cache cargo build and registry
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-linux-fanotify-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-linux-fanotify-
+          ${{ runner.os }}-linux-integration-
+    - name: Install Rust
+      run: rustup update stable --no-self-update && rustup default stable
+    - name: Probe the ext4 loopback the privileged cells need
+      # Every privileged cell builds an ext4 loopback and self-skips loudly if
+      # it cannot. Proving the runner can host one BEFORE the suite runs turns
+      # an image that lost loop devices into a named environment failure rather
+      # than a green run in which nothing was tested.
+      run: |
+        set -eux
+        img="$RUNNER_TEMP/loopback-probe.img"
+        mnt="$RUNNER_TEMP/loopback-probe"
+        dd if=/dev/zero of="$img" bs=1M count=16
+        mkfs.ext4 -q -F "$img"
+        mkdir -p "$mnt"
+        sudo mount -o loop "$img" "$mnt"
+        mountpoint -q "$mnt"
+        sudo umount "$mnt"
+        rm -f "$img"
+    - name: Fanotify (unprivileged)
+      # Default caps: the loopback cells skip here, but the Auto-probe FALLBACK
+      # arm and the forced-Fanotify-without-privilege typed error are reachable
+      # ONLY without CAP_SYS_ADMIN. Single-threaded by the suite's contract (the
+      # cells mount and unmount a shared loopback).
+      run: |
+        set -o pipefail
+        cargo test -p tributary-fs --all-features --test linux_fanotify \
+          -- --test-threads=1 --nocapture 2>&1 | tee fanotify-unpriv.log
+    - name: Fanotify (privileged)
+      # sudo unlocks CAP_SYS_ADMIN and the ext4 loopback, which is what makes
+      # the FID/identity, rename-pairing, superblock-filter and unmount-quiesce
+      # cells run at all.
+      run: |
+        set -o pipefail
+        sudo -E env "PATH=$PATH" cargo test -p tributary-fs --all-features \
+          --test linux_fanotify -- --test-threads=1 --nocapture 2>&1 | tee fanotify-priv.log
+    - name: Assert neither leg was vacuous
+      # Both legs exit 0 when every cell self-skips, which is exactly the
+      # silent pass this job exists to prevent: the privileged leg must not
+      # skip for a missing loopback, the unprivileged leg must really lack
+      # CAP_SYS_ADMIN, and both must have run tests.
+      run: |
+        if grep -q 'no ext4 loopback' fanotify-priv.log; then
+          grep 'no ext4 loopback' fanotify-priv.log
+          echo "::error::the privileged fanotify leg skipped its loopback cells"
+          exit 1
+        fi
+        if grep -q 'has CAP_SYS_ADMIN' fanotify-unpriv.log; then
+          echo "::error::the unprivileged fanotify leg ran with CAP_SYS_ADMIN"
+          exit 1
+        fi
+        for log in fanotify-unpriv.log fanotify-priv.log; do
+          if ! grep -q 'test result: ok\. [1-9][0-9]* passed' "$log"; then
+            echo "::error::$log records no passing test"
+            exit 1
+          fi
+        done
 
   windows-integration:
     name: windows-integration
@@ -464,6 +647,38 @@ jobs:
   #     # - name: Run valgrind foo
   #     #   run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all ./target/debug/foo
   #     #   working-directory: integration
+
+  # `license = "MIT OR Apache-2.0"` is a claim about the archive a consumer
+  # receives, and nothing checked it: both license texts lived only at the
+  # workspace root, so every packaged crate shipped with no license at all.
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Package each crate and prove it carries both licenses
+        # --no-verify: the members depend on each other at versions that need
+        # not be published yet, and this gate is about the archive's CONTENTS.
+        run: |
+          set -eu
+          # Asked for rather than assumed: a configured `target-dir` would move
+          # the archives out from under a hardcoded path and the loop would
+          # then prove nothing.
+          target_dir=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+          for crate in tributary-proto tributary-fs tributaries; do
+            cargo package -p "$crate" --no-verify --allow-dirty
+            archive=$(ls -1 "$target_dir"/package/"$crate"-*.crate)
+            for license in LICENSE-APACHE LICENSE-MIT; do
+              if ! tar tzf "$archive" | grep -qE "^$crate-[^/]+/$license\$"; then
+                echo "::error::$archive ships no $license"
+                exit 1
+              fi
+            done
+            echo "$archive carries both licenses"
+          done
 
   coverage:
     name: coverage

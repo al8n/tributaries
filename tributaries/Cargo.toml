@@ -29,7 +29,7 @@ smol = ["agnostic-lite/smol", "tributary-fs?/smol"]
 agnostic-lite = { version = "0.7", features = ["time"] }
 arc-swap = "1"
 async-channel = "2"
-futures-channel = "0.3"
+futures-channel = "0.3.31"
 futures-util = { version = "0.3", default-features = false, features = [
   "std",
   "async-await-macro",
@@ -52,7 +52,7 @@ tempfile = "3"
 tributary-fs = { version = "0.1", path = "../tributary-fs", features = ["tokio"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+tokio = { version = "1.30", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 
 # The pure-fs end-to-end suite needs the default fs binding and a runtime.
 [[test]]
