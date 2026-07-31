@@ -54,7 +54,11 @@ fn scratch_root(tag: &str) -> PathBuf {
 }
 
 fn watcher() -> TokioWatcher {
-  TokioWatcher::new(WatcherOptions::new()).expect("build watcher")
+  // Pinned rather than left to `Auto`, which prefers the journal wherever one is
+  // enabled: every cell in this suite names a `ReadDirectoryChangesW` behaviour, so
+  // an Auto-selected USN source would let them pass while proving nothing about the
+  // backend they are written for.
+  TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Rdcw)).expect("build watcher")
 }
 
 /// Waits until an event satisfying `pred` arrives, or the deadline lapses.
