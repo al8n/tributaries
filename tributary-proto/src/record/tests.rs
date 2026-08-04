@@ -1,5 +1,8 @@
 use super::*;
-use crate::path::{Location, Segment};
+use crate::{
+  id::Identity,
+  path::{Location, Segment},
+};
 use core::num::NonZeroU64;
 use std::{string::ToString, vec};
 
@@ -168,4 +171,110 @@ fn os_record_deep_target_reports_no_direct_name() {
     .with_target(Location::from_segments([Segment::new("only")]));
   assert_eq!(one.name(), Some(&Segment::new("only")));
   assert_eq!(one.depth(), 1);
+}
+
+#[test]
+fn evidence_of_a_kind_is_that_kind_alone() {
+  assert!(Evidence::of(RecordKind::Created).created());
+  assert!(Evidence::of(RecordKind::Removed).removed());
+  assert!(Evidence::of(RecordKind::Modified).modified());
+  assert!(Evidence::of(RecordKind::Attrib).attrib());
+  assert!(Evidence::of(RecordKind::MovedFrom).moved());
+  assert!(Evidence::of(RecordKind::MovedTo).moved());
+  assert!(Evidence::of(RecordKind::MoveSelf).moved());
+  // A watched object's own deletion IS a removal of it.
+  assert!(Evidence::of(RecordKind::DeleteSelf).removed());
+  // A teardown says nothing about the object, only about the watch.
+  assert!(Evidence::of(RecordKind::Ignored).is_empty());
+  assert!(Evidence::new().is_empty());
+  assert!(!Evidence::of(RecordKind::Created).removed());
+}
+
+#[test]
+fn evidence_union_only_ever_grows() {
+  let created = Evidence::new().with_created();
+  let attrib = Evidence::new().with_attrib();
+  let both = created.union(attrib);
+  assert!(both.created() && both.attrib());
+  assert_eq!(both.union(Evidence::new()), both);
+  assert_eq!(both.union(both), both);
+}
+
+#[test]
+fn evidence_admits_on_any_proven_fact() {
+  let both = Evidence::new().with_created().with_attrib();
+  assert!(both.admits(Interest::new().with_created()));
+  assert!(both.admits(Interest::new().with_attrib()));
+  assert!(!both.admits(Interest::new().with_modified()));
+  assert!(!Evidence::new().admits(Interest::all()));
+  assert!(!both.admits(Interest::new()));
+}
+
+#[test]
+fn evidence_primary_prefers_the_structural_verb() {
+  let mask = Evidence::new().with_created().with_modified().with_attrib();
+  assert_eq!(mask.primary(), Some(RecordKind::Created));
+  assert_eq!(
+    Evidence::new().with_removed().with_attrib().primary(),
+    Some(RecordKind::Removed)
+  );
+  assert_eq!(
+    Evidence::new().with_modified().with_attrib().primary(),
+    Some(RecordKind::Modified)
+  );
+  assert_eq!(
+    Evidence::new().with_attrib().primary(),
+    Some(RecordKind::Attrib)
+  );
+  // A move needs a direction no fact set carries, and nothing proves nothing.
+  assert_eq!(Evidence::new().with_moved().primary(), None);
+  assert_eq!(Evidence::new().primary(), None);
+}
+
+#[test]
+fn record_from_evidence_keeps_every_fact_and_derives_the_verb() {
+  let mask = Evidence::new().with_created().with_attrib();
+  let rec = OsRecord::proved(watch(1), mask).expect("a dirent fact names a verb");
+  assert_eq!(rec.kind(), RecordKind::Created);
+  assert_eq!(rec.evidence(), mask);
+  assert_eq!(OsRecord::proved(watch(1), Evidence::new()), None);
+  assert_eq!(
+    OsRecord::proved(watch(1), Evidence::new().with_moved()),
+    None
+  );
+}
+
+#[test]
+fn record_evidence_defaults_to_its_kind_and_only_widens() {
+  let rec = OsRecord::new(watch(1), RecordKind::MovedTo);
+  assert_eq!(rec.evidence(), Evidence::of(RecordKind::MovedTo));
+  let widened = rec.also_proved(Evidence::new().with_modified());
+  assert!(widened.evidence().moved() && widened.evidence().modified());
+  // `also_proved` unions; it cannot clear what was already stated.
+  let again = widened.also_proved(Evidence::new());
+  assert!(again.evidence().moved() && again.evidence().modified());
+}
+
+#[test]
+fn stat_result_reports_what_it_settles() {
+  let dir = StatResult::Ok(
+    StatEntry::new(FileKind::Dir).with_node(Identity::new(NonZeroU64::new(7).unwrap())),
+  );
+  assert!(dir.is_ok() && !dir.is_failed());
+  assert_eq!(dir.resolved(), Some(FileKind::Dir));
+  assert_eq!(dir.entry().unwrap().kind(), FileKind::Dir);
+  assert!(dir.entry().unwrap().is_dir());
+  assert_eq!(dir.entry().unwrap().node().unwrap().as_u64(), 7);
+  assert_eq!(dir.failure(), None);
+
+  // A kind the stat could not read settles nothing, exactly like a failure.
+  let unknown = StatResult::found(FileKind::Unknown);
+  assert!(unknown.is_ok());
+  assert_eq!(unknown.resolved(), None);
+
+  let failed = StatResult::Failed(IoClass::Permission);
+  assert!(failed.is_failed() && !failed.is_ok());
+  assert_eq!(failed.resolved(), None);
+  assert_eq!(failed.entry(), None);
+  assert_eq!(failed.failure(), Some(IoClass::Permission));
 }

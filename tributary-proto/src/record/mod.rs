@@ -7,6 +7,7 @@
 
 use crate::{
   id::{Identity, MoveCookie, WatchId},
+  interest::Interest,
   path::{Location, Segment},
 };
 use std::vec::Vec;
@@ -178,6 +179,206 @@ impl core::fmt::Display for RecordKind {
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.write_str(self.as_str())
+  }
+}
+
+/// Every independent fact one native event proved about its target.
+///
+/// A [`RecordKind`] names ONE verb, but a backend's raw event does not: a
+/// fanotify mask can carry `FAN_CREATE | FAN_ATTRIB`, an FSEvents flag word
+/// `ItemCreated | ItemXattrMod`, a USN reason delta `FILE_CREATE |
+/// BASIC_INFO_CHANGE`. Every one of those bits is a fact the kernel PROVED, and
+/// a lowering that resolves the mask to a single winning verb by priority
+/// throws the losers away — after which a subscriber interested only in a
+/// discarded fact is delivered nothing at all, with no
+/// [`Rescan`](crate::ChangeKind::Rescan) to cover the silence.
+///
+/// So a record carries the whole set, and admission tests ALL of it: a change
+/// is delivered when the subscriber wants the change's own kind **or** any
+/// fact its record proved ([`admits`](Self::admits)). Widening admission is
+/// always safe — over-delivery is the direction the [`Interest`] contract
+/// already allows — and it is what makes "a proven fact reaches every
+/// subscriber that asked for it" hold without multiplying one event into
+/// several changes.
+///
+/// The set's five facts are exactly the five subscribable kinds of
+/// [`Interest`], so admission is a plain intersection. A lowering builds one by
+/// mapping each native bit it tested, then takes the verb from the set
+/// ([`primary`](Self::primary)) rather than choosing one itself — the priority
+/// lives here, in the protocol, where every backend shares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Evidence {
+  created: bool,
+  removed: bool,
+  modified: bool,
+  attrib: bool,
+  moved: bool,
+}
+
+impl Evidence {
+  /// The empty set: an event that proved nothing.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      created: false,
+      removed: false,
+      modified: false,
+      attrib: false,
+      moved: false,
+    }
+  }
+
+  /// The singleton set a [`RecordKind`] proves on its own — what a record built
+  /// from a verb alone carries.
+  ///
+  /// Both move halves and a [`MoveSelf`](RecordKind::MoveSelf) prove
+  /// [`moved`](Self::moved); a [`DeleteSelf`](RecordKind::DeleteSelf) proves
+  /// [`removed`](Self::removed). [`Ignored`](RecordKind::Ignored) proves
+  /// NOTHING about the object — it is the watch's teardown, whose coverage
+  /// story is an unconditional `Rescan`, not a delivery.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn of(kind: RecordKind) -> Self {
+    let empty = Self::new();
+    match kind {
+      RecordKind::Created => empty.with_created(),
+      RecordKind::Removed | RecordKind::DeleteSelf => empty.with_removed(),
+      RecordKind::Modified => empty.with_modified(),
+      RecordKind::Attrib => empty.with_attrib(),
+      RecordKind::MovedFrom | RecordKind::MovedTo | RecordKind::MoveSelf => empty.with_moved(),
+      RecordKind::Ignored => empty,
+    }
+  }
+
+  /// Whether create was proven.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn created(&self) -> bool {
+    self.created
+  }
+
+  /// Whether removal was proven.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn removed(&self) -> bool {
+    self.removed
+  }
+
+  /// Whether a content / data change was proven.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn modified(&self) -> bool {
+    self.modified
+  }
+
+  /// Whether a metadata change (mode, owner, times, xattrs, links) was proven.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn attrib(&self) -> bool {
+    self.attrib
+  }
+
+  /// Whether a rename was proven.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn moved(&self) -> bool {
+    self.moved
+  }
+
+  /// Whether nothing at all was proven.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_empty(&self) -> bool {
+    !(self.created || self.removed || self.modified || self.attrib || self.moved)
+  }
+
+  /// The union of two fact sets — the ONLY way to combine evidence, so
+  /// carrying a record's evidence forward can never narrow it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn union(self, other: Self) -> Self {
+    Self {
+      created: self.created || other.created,
+      removed: self.removed || other.removed,
+      modified: self.modified || other.modified,
+      attrib: self.attrib || other.attrib,
+      moved: self.moved || other.moved,
+    }
+  }
+
+  /// Whether `interest` subscribes to ANY fact in this set — the admission
+  /// test. Empty evidence admits nothing.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn admits(&self, interest: Interest) -> bool {
+    (self.created && interest.created())
+      || (self.removed && interest.removed())
+      || (self.modified && interest.modified())
+      || (self.attrib && interest.attrib())
+      || (self.moved && interest.moved())
+  }
+
+  /// The dirent verb this set resolves to: the structural facts outrank the
+  /// content ones, since a create or a removal SUBSUMES whatever content or
+  /// metadata change the kernel merged into the same word, while the reverse
+  /// would report a lifecycle transition as an edit.
+  ///
+  /// `None` for a set naming no dirent fact — the empty set, or one proving
+  /// only [`moved`](Self::moved). A move needs a DIRECTION no fact set carries,
+  /// so a move half is minted from its verb
+  /// ([`OsRecord::new`](OsRecord::new)) and picks up its `moved` fact from
+  /// [`of`](Self::of).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn primary(&self) -> Option<RecordKind> {
+    if self.created {
+      Some(RecordKind::Created)
+    } else if self.removed {
+      Some(RecordKind::Removed)
+    } else if self.modified {
+      Some(RecordKind::Modified)
+    } else if self.attrib {
+      Some(RecordKind::Attrib)
+    } else {
+      None
+    }
+  }
+}
+
+macro_rules! evidence_flag {
+  ($field:ident, $set:ident, $with:ident, $maybe:ident) => {
+    #[doc = concat!("Records that `", stringify!($field), "` was proven.")]
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn $set(&mut self) -> &mut Self {
+      self.$field = true;
+      self
+    }
+
+    #[doc = concat!("Returns this set additionally proving `", stringify!($field), "`.")]
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
+    pub const fn $with(mut self) -> Self {
+      self.$field = true;
+      self
+    }
+
+    #[doc = concat!("Returns this set proving `", stringify!($field), "` iff `proven`.")]
+    ///
+    /// The per-bit form a lowering maps a native mask through, so translating a
+    /// mask is a total function over the bits it tests rather than a priority
+    /// contest that silently discards the losers.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
+    pub const fn $maybe(mut self, proven: bool) -> Self {
+      self.$field = proven;
+      self
+    }
+  };
+}
+
+impl Evidence {
+  evidence_flag!(created, set_created, with_created, maybe_created);
+  evidence_flag!(removed, set_removed, with_removed, maybe_removed);
+  evidence_flag!(modified, set_modified, with_modified, maybe_modified);
+  evidence_flag!(attrib, set_attrib, with_attrib, maybe_attrib);
+  evidence_flag!(moved, set_moved, with_moved, maybe_moved);
+}
+
+impl Default for Evidence {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::new()
   }
 }
 
@@ -374,6 +575,116 @@ impl EnumerateResult {
   }
 }
 
+/// What a driver's stat found: the object's kind, plus its identity when one
+/// could be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StatEntry {
+  kind: FileKind,
+  node: Option<Identity>,
+}
+
+impl StatEntry {
+  /// Builds an entry for a stat'd object of `kind`, with no object identity.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(kind: FileKind) -> Self {
+    Self { kind, node: None }
+  }
+
+  /// The stat'd object's kind.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn kind(&self) -> FileKind {
+    self.kind
+  }
+
+  /// The stat'd object's identity, if the driver could supply one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn node(&self) -> Option<Identity> {
+    self.node
+  }
+
+  /// Whether the stat'd object is a directory.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_dir(&self) -> bool {
+    self.kind.is_dir()
+  }
+
+  /// Returns this entry with its object [`Identity`] set.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_node(mut self, node: Identity) -> Self {
+    self.node = Some(node);
+    self
+  }
+}
+
+/// The outcome of a stat the core requested via
+/// [`Action::Stat`](crate::Action::Stat).
+///
+/// The core asks only when a listing left an object's kind
+/// [`Unknown`](FileKind::Unknown) — a kind it cannot act on, since an unwatched
+/// directory is a permanently blind subtree. Neither a
+/// [`Failed`](Self::Failed) result nor an answer that is itself `Unknown`
+/// resolves anything, so both leave the slot's coverage deficit standing and
+/// earn a covering [`Rescan`](crate::ChangeKind::Rescan): the core never
+/// re-asks in a loop, and the darkness is never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StatResult {
+  /// The target was stat'd.
+  Ok(StatEntry),
+  /// The target could not be stat'd.
+  Failed(IoClass),
+}
+
+impl StatResult {
+  /// Builds an [`Ok`](Self::Ok) result for a bare kind.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn found(kind: FileKind) -> Self {
+    Self::Ok(StatEntry::new(kind))
+  }
+
+  /// Whether the target was stat'd.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_ok(&self) -> bool {
+    matches!(self, Self::Ok(_))
+  }
+
+  /// Whether the stat failed.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_failed(&self) -> bool {
+    matches!(self, Self::Failed(_))
+  }
+
+  /// The stat'd entry, if this succeeded.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn entry(&self) -> Option<StatEntry> {
+    match self {
+      Self::Ok(entry) => Some(*entry),
+      Self::Failed(_) => None,
+    }
+  }
+
+  /// The failure class, if this is [`Failed`](Self::Failed).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn failure(&self) -> Option<IoClass> {
+    match self {
+      Self::Failed(class) => Some(*class),
+      Self::Ok(_) => None,
+    }
+  }
+
+  /// The kind this result settles the target to, or `None` when it settles
+  /// nothing — a failure, or an answer that is itself
+  /// [`Unknown`](FileKind::Unknown).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn resolved(&self) -> Option<FileKind> {
+    match self {
+      Self::Ok(entry) if !entry.kind.is_unknown() => Some(entry.kind),
+      _ => None,
+    }
+  }
+}
+
 /// A single normalized filesystem event, attributed to one established watch.
 ///
 /// This is the only event shape the core ingests. Every record carries the
@@ -402,6 +713,7 @@ impl EnumerateResult {
 pub struct OsRecord {
   watch: WatchId,
   kind: RecordKind,
+  evidence: Evidence,
   target: Option<Location>,
   is_dir: Option<bool>,
   cookie: Option<MoveCookie>,
@@ -413,6 +725,12 @@ impl OsRecord {
   /// self-event shape), unknown directory-ness, no move cookie, and no object
   /// identity.
   ///
+  /// Its [`evidence`](Self::evidence) is the singleton `kind` proves on its own
+  /// ([`Evidence::of`]) — the honest set for a backend whose events are precise
+  /// verbs. A backend whose one event can prove SEVERAL facts builds the set
+  /// instead ([`proved`](Self::proved), [`also_proved`](Self::also_proved)), so
+  /// nothing it observed is dropped on the way in.
+  ///
   /// Use the `with_*` builders to attach the affected child's name (or a deeper
   /// kernel-recursive target), the directory flag, a move-pairing cookie, or the
   /// affected object's identity.
@@ -421,10 +739,39 @@ impl OsRecord {
     Self {
       watch,
       kind,
+      evidence: Evidence::of(kind),
       target: None,
       is_dir: None,
       cookie: None,
       node: None,
+    }
+  }
+
+  /// Builds a record from the WHOLE fact set a native mask proved, taking its
+  /// [`kind`](Self::kind) from the set rather than from the lowering.
+  ///
+  /// This is the shape a mask-merging backend lowers through: it maps each bit
+  /// it tested into `evidence` and hands the set over, so choosing which verb
+  /// wins is the protocol's job ([`Evidence::primary`]) and the facts that did
+  /// not win still travel — no lowering has a priority chain in which to lose
+  /// one.
+  ///
+  /// `None` when `evidence` names no dirent fact: an event proving nothing
+  /// addresses nothing, and a lone [`moved`](Evidence::moved) has no direction,
+  /// so both would mean inventing a verb.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn proved(watch: WatchId, evidence: Evidence) -> Option<Self> {
+    match evidence.primary() {
+      Some(kind) => Some(Self {
+        watch,
+        kind,
+        evidence,
+        target: None,
+        is_dir: None,
+        cookie: None,
+        node: None,
+      }),
+      None => None,
     }
   }
 
@@ -434,10 +781,19 @@ impl OsRecord {
     self.watch
   }
 
-  /// The record's normalized kind.
+  /// The record's normalized kind — the ONE verb its coverage reconciliation
+  /// runs on. What it is ADMITTED on is the wider
+  /// [`evidence`](Self::evidence).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn kind(&self) -> RecordKind {
     self.kind
+  }
+
+  /// Every fact this record's native event proved. Always contains the
+  /// singleton [`kind`](Self::kind) implies, and never shrinks.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn evidence(&self) -> Evidence {
+    self.evidence
   }
 
   /// The affected object's watch-relative location, or `None` when the event
@@ -531,6 +887,19 @@ impl OsRecord {
   #[must_use]
   pub const fn with_node(mut self, node: Identity) -> Self {
     self.node = Some(node);
+    self
+  }
+
+  /// Returns this record additionally proving `more` — the facts its native
+  /// event carried alongside its verb (a rename word that also reported a
+  /// content change, a create mask that also reported an attribute one).
+  ///
+  /// A UNION, never an assignment: evidence only ever grows, so no builder in
+  /// the chain can drop a fact an earlier one stated.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn also_proved(mut self, more: Evidence) -> Self {
+    self.evidence = self.evidence.union(more);
     self
   }
 }
