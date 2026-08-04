@@ -1,7 +1,7 @@
 //! The consumer-facing watcher.
 
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, BTreeSet, HashMap},
   marker::PhantomData,
   path::{Path, PathBuf},
   pin::Pin,
@@ -227,6 +227,7 @@ impl SyncRootDenied {
         | SyncRootError::ForeignTicket
         | SyncRootError::BadCookieName { .. }
         | SyncRootError::DirOutsideRoot { .. }
+        | SyncRootError::DirExcluded { .. }
         | SyncRootError::WriteInFlight
         | SyncRootError::NameInUse { .. }
         | SyncRootError::TicketInUse {}
@@ -378,6 +379,14 @@ pub enum SkipReason {
   /// (a typo, a relative path, a stale path) — acting on either would prune
   /// the whole scope's coverage.
   RefusedCover,
+  /// This root already has the maximum number of awaited reconciles parked on a
+  /// coverage fence that has not settled. Each admitted call is retained — one
+  /// reply sender in the driver, one pending fence record in the core — until
+  /// its window settles, and a root whose native control round trip is stalled
+  /// never settles, so admission stops rather than growing driver state with
+  /// total calls. Nothing was reconciled and prior coverage is untouched;
+  /// retryable once the outstanding reconciles settle or their callers go away.
+  Backlogged,
 }
 
 impl SkipReason {
@@ -389,6 +398,7 @@ impl SkipReason {
       Self::UnknownRoot => "unknown_root",
       Self::NotLive => "not_live",
       Self::RefusedCover => "refused_cover",
+      Self::Backlogged => "backlogged",
     }
   }
 
@@ -402,6 +412,12 @@ impl SkipReason {
   #[inline]
   pub const fn is_not_live(&self) -> bool {
     matches!(self, Self::NotLive)
+  }
+
+  /// Whether this is [`Backlogged`](Self::Backlogged).
+  #[inline]
+  pub const fn is_backlogged(&self) -> bool {
+    matches!(self, Self::Backlogged)
   }
 
   /// Whether this is [`RefusedCover`](Self::RefusedCover).
@@ -440,6 +456,76 @@ struct PendingRoot {
   identity: Option<RootIdentity>,
 }
 
+// Registry entries INSPECTED by one conflict query or one release — the quantity the indexes
+// below exist to keep proportional to the candidate's depth rather than to the registry. Both
+// run under the registry's single write lock, so a full scan does not merely cost the caller:
+// it serializes every other admission, release and reader behind it, and it does so once per
+// root, making a batch of N disjoint roots quadratic in lock-held CPU.
+//
+// Thread-local so libtest's parallel cells cannot perturb one another's count (each test body
+// owns its thread).
+#[cfg(test)]
+thread_local! {
+  pub(crate) static REGISTRY_PROBES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Records that a registry query inspected `n` entries.
+#[cfg(test)]
+fn note_registry_probes(n: usize) {
+  REGISTRY_PROBES.with(|probes| probes.set(probes.get() + n));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_registry_probes(_n: usize) {}
+
+/// The first key in `index` that is a **strict descendant** of `path`, skipping any whose
+/// value the caller rejects.
+///
+/// [`Path`]'s [`Ord`] compares **components**, so every strict descendant of `path` sorts
+/// immediately after it and before any non-descendant that is greater — `/a/b/c` precedes both
+/// `/a/b.txt` and `/a/bc`, because the third component `b` precedes `b.txt` and `bc`. The walk
+/// may therefore stop at the first key that is not a descendant. (Byte ordering would not have
+/// this property; `descendants_are_adjacent_under_path_ordering` pins it.)
+fn descendant_in<'a, V>(
+  index: &'a BTreeMap<PathBuf, V>,
+  path: &Path,
+  mut accept: impl FnMut(&V) -> bool,
+) -> Option<&'a PathBuf> {
+  let mut probes = 0;
+  let found = index
+    .range::<Path, _>((
+      core::ops::Bound::Excluded(path),
+      core::ops::Bound::Unbounded,
+    ))
+    .inspect(|_| probes += 1)
+    .take_while(|(key, _)| key.starts_with(path))
+    .find(|(_, value)| accept(value))
+    .map(|(key, _)| key);
+  note_registry_probes(probes);
+  found
+}
+
+/// The nearest key in `index` that is an **ancestor-or-equal** of `path`, skipping any whose
+/// value the caller rejects — a walk up `path`'s own ancestors, so it costs the candidate's
+/// depth and a lookup each, never the registry's size.
+fn ancestor_in<'a, V>(
+  index: &'a BTreeMap<PathBuf, V>,
+  path: &Path,
+  mut accept: impl FnMut(&V) -> bool,
+) -> Option<&'a PathBuf> {
+  let mut probes = 0;
+  let found = path.ancestors().find_map(|ancestor| {
+    probes += 1;
+    index
+      .get_key_value(ancestor)
+      .filter(|(_, value)| accept(value))
+      .map(|(key, _)| key)
+  });
+  note_registry_probes(probes);
+  found
+}
+
 /// The watcher-side registry of live roots, keyed by scope. Entries exist
 /// exactly while their root is watched: every scope end (unwatch, root death,
 /// stream fatal, close) removes its entry, so the registry is bounded by the
@@ -450,19 +536,106 @@ struct PendingRoot {
 /// scope-live and scope-dead execute on that single task in program order, so
 /// an insert can never race a removal. The watcher side only reads entries
 /// (and owns the `pending` reservations, which no one else writes).
+///
+/// # Conflict indexes
+///
+/// Every predicate the disjointness check asks — "is some covered root an ancestor of this
+/// candidate", "a descendant of it", "the same object under another spelling", "an ancestor of
+/// it across spellings" — gets an index that answers it in `O(depth · log N)` or `O(1)`.
+///
+/// The scanned form these replace was `Θ(N)` per query on a registry of `N` roots, on **both**
+/// admission and release, all of it under one exclusive lock. Admitting `N` mutually disjoint
+/// roots therefore cost `N(N-1)/2` comparisons and releasing them another `N(N+1)/2`, with the
+/// whole registry — readers included — serialized behind each one.
 #[derive(Debug, Default)]
 struct RootSet {
   entries: BTreeMap<ScopeId, RootEntry>,
+  /// Live root path → its scope. Ordered, so containment in either direction is a bounded
+  /// probe rather than a scan (see [`descendant_in`] / [`ancestor_in`]).
+  live_by_path: BTreeMap<PathBuf, ScopeId>,
+  /// Live root **own** identity → its scope: the cross-spelling "same object" test.
+  live_by_identity: HashMap<RootIdentity, ScopeId>,
+  /// Live root **ancestor** identity → every scope whose root sits under that object. A set,
+  /// not a single scope: several disjoint live roots can share an ancestor.
+  live_by_ancestor: HashMap<RootIdentity, BTreeSet<ScopeId>>,
   /// Roots with a `watch` in flight, reserved so two concurrent overlapping
-  /// `watch` calls cannot both pass the disjointness check.
-  pending: Vec<PendingRoot>,
+  /// `watch` calls cannot both pass the disjointness check. Keyed by path so a release is a
+  /// single removal instead of a whole-vector retain under the write lock.
+  pending: BTreeMap<PathBuf, PendingRoot>,
+  /// Reserved identity → the path holding it: the pre-flight cross-spelling collision, so two
+  /// aliased concurrent `watch` calls settle here rather than both spending a spawn.
+  pending_by_identity: HashMap<RootIdentity, PathBuf>,
 }
 
 impl RootSet {
+  /// Records a live root: every index plus `entries`, so the two can never disagree. Any
+  /// entry this displaces (a re-live of the same scope) is unindexed first — the single
+  /// mutation point for a live root, so no caller can index half of one.
+  fn insert_live(&mut self, scope: ScopeId, entry: RootEntry) {
+    if let Some(previous) = self.entries.remove(&scope) {
+      self.unindex_live(scope, &previous);
+    }
+    self.index_live(scope, &entry);
+    self.entries.insert(scope, entry);
+  }
+
+  /// Records a live root in every index. The `entries` insert stays the caller's.
+  fn index_live(&mut self, scope: ScopeId, entry: &RootEntry) {
+    self.live_by_path.insert(entry.path.as_ref().clone(), scope);
+    self.live_by_identity.insert(entry.identity, scope);
+    for ancestor in entry.ancestors.iter() {
+      self
+        .live_by_ancestor
+        .entry(*ancestor)
+        .or_default()
+        .insert(scope);
+    }
+  }
+
+  /// Drops a live root from every index — the exact inverse of
+  /// [`index_live`](Self::index_live), so a scope's death leaves nothing behind that could
+  /// block a later admission forever.
+  fn unindex_live(&mut self, scope: ScopeId, entry: &RootEntry) {
+    self.live_by_path.remove(entry.path.as_path());
+    self.live_by_identity.remove(&entry.identity);
+    for ancestor in entry.ancestors.iter() {
+      if let Some(scopes) = self.live_by_ancestor.get_mut(ancestor) {
+        scopes.remove(&scope);
+        if scopes.is_empty() {
+          self.live_by_ancestor.remove(ancestor);
+        }
+      }
+    }
+  }
+
+  /// The live root that overlaps `candidate` by containment or by object identity, if any.
+  fn live_overlap(
+    &self,
+    candidate: &Path,
+    identity: Option<RootIdentity>,
+    exempt: Option<ScopeId>,
+  ) -> Option<PathBuf> {
+    let allowed = |scope: &ScopeId| Some(*scope) != exempt;
+    if let Some(path) = ancestor_in(&self.live_by_path, candidate, allowed) {
+      return Some(path.clone());
+    }
+    if let Some(path) = descendant_in(&self.live_by_path, candidate, allowed) {
+      return Some(path.clone());
+    }
+    let same_object = *identity
+      .and_then(|id| self.live_by_identity.get(&id))
+      .filter(|scope| allowed(scope))?;
+    note_registry_probes(1);
+    self
+      .entries
+      .get(&same_object)
+      .map(|entry| entry.path.as_ref().clone())
+  }
+
   /// The already-covered root (live or pending) that overlaps `candidate`, if
-  /// any. Two roots overlap when either contains the other by bytes — or when
+  /// any. Two roots overlap when either contains the other by path — or when
   /// they are one object under two spellings (`identity` equality), which
-  /// byte comparison cannot see on case- or normalization-insensitive
+  /// path comparison cannot see on case- or normalization-insensitive
   /// volumes. Ancestor containment across spellings needs the candidate's
   /// ancestor identities, which only the spawn barrier reads: the driver's
   /// [`ScopeRegistry::final_root_conflict`] settles those before anything
@@ -477,24 +650,19 @@ impl RootSet {
     identity: Option<RootIdentity>,
     exempt: Option<ScopeId>,
   ) -> Option<PathBuf> {
-    let live = self.entries.iter().find(|(scope, entry)| {
-      Some(**scope) != exempt
-        && (candidate.starts_with(entry.path.as_path())
-          || entry.path.starts_with(candidate)
-          || Some(entry.identity) == identity)
-    });
-    if let Some((_, entry)) = live {
-      return Some(entry.path.as_ref().clone());
+    if let Some(path) = self.live_overlap(candidate, identity, exempt) {
+      return Some(path);
     }
-    self
-      .pending
-      .iter()
-      .find(|reserved| {
-        candidate.starts_with(&reserved.path)
-          || reserved.path.starts_with(candidate)
-          || (identity.is_some() && reserved.identity == identity)
-      })
-      .map(|reserved| reserved.path.clone())
+    if let Some(path) = ancestor_in(&self.pending, candidate, |_| true) {
+      return Some(path.clone());
+    }
+    if let Some(path) = descendant_in(&self.pending, candidate, |_| true) {
+      return Some(path.clone());
+    }
+    identity.and_then(|id| {
+      note_registry_probes(1);
+      self.pending_by_identity.get(&id).cloned()
+    })
   }
 }
 
@@ -515,7 +683,7 @@ impl ScopeRegistry for RegistryWriter {
     stats: Option<crate::os::BackendStatsHandle>,
   ) {
     let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-    set.entries.insert(
+    set.insert_live(
       scope,
       RootEntry {
         path: Arc::new(root.to_path_buf()),
@@ -529,7 +697,9 @@ impl ScopeRegistry for RegistryWriter {
 
   fn scope_dead(&self, scope: ScopeId) {
     let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
-    set.entries.remove(&scope);
+    if let Some(entry) = set.entries.remove(&scope) {
+      set.unindex_live(scope, &entry);
+    }
   }
 
   fn final_root_conflict(
@@ -541,30 +711,53 @@ impl ScopeRegistry for RegistryWriter {
     exempt: Option<ScopeId>,
   ) -> Option<PathBuf> {
     let set = self.roots.read().unwrap_or_else(PoisonError::into_inner);
-    let live = set.entries.iter().find(|(scope, entry)| {
-      Some(**scope) != exempt
-        && (final_root.starts_with(entry.path.as_path())
-          || entry.path.starts_with(final_root)
-          || entry.identity == identity
-          || ancestors.contains(&entry.identity)
-          || entry.ancestors.contains(&identity))
-    });
-    if let Some((_, entry)) = live {
-      return Some(entry.path.as_ref().clone());
+    if let Some(path) = set.live_overlap(final_root, Some(identity), exempt) {
+      return Some(path);
     }
+    // The two cross-spelling ANCESTOR tests, each indexed rather than scanned: a live root that
+    // IS one of this candidate's ancestors under another spelling, and a live root whose own
+    // ancestors include this candidate's object.
+    let path_of = |scope: &ScopeId| {
+      note_registry_probes(1);
+      set
+        .entries
+        .get(scope)
+        .map(|entry| entry.path.as_ref().clone())
+    };
+    for ancestor in ancestors {
+      note_registry_probes(1);
+      if let Some(scope) = set
+        .live_by_identity
+        .get(ancestor)
+        .filter(|scope| Some(**scope) != exempt)
+      {
+        return path_of(scope);
+      }
+    }
+    note_registry_probes(1);
+    if let Some(scope) = set
+      .live_by_ancestor
+      .get(&identity)
+      .and_then(|scopes| scopes.iter().find(|scope| Some(**scope) != exempt))
+    {
+      return path_of(scope);
+    }
+    // A reservation holds at most one entry per path (an overlapping
+    // second take is rejected), so skipping by equality skips exactly
+    // the checking watch's own.
+    let not_self = |pending: &PendingRoot| Some(pending.path.as_path()) != reserved;
+    if let Some(path) = ancestor_in(&set.pending, final_root, not_self) {
+      return Some(path.clone());
+    }
+    if let Some(path) = descendant_in(&set.pending, final_root, not_self) {
+      return Some(path.clone());
+    }
+    note_registry_probes(1);
     set
-      .pending
-      .iter()
-      // A reservation holds at most one entry per path (an overlapping
-      // second take is rejected), so skipping by equality skips exactly
-      // the checking watch's own.
-      .filter(|pending| Some(pending.path.as_path()) != reserved)
-      .find(|pending| {
-        final_root.starts_with(&pending.path)
-          || pending.path.starts_with(final_root)
-          || pending.identity == Some(identity)
-      })
-      .map(|pending| pending.path.clone())
+      .pending_by_identity
+      .get(&identity)
+      .filter(|path| Some(path.as_path()) != reserved)
+      .cloned()
   }
 }
 
@@ -608,10 +801,16 @@ impl Reservation {
     if let Some(existing) = set.overlap_of(&path, identity, exempt) {
       return Err(WatchRootError::Overlaps { path, existing });
     }
-    set.pending.push(PendingRoot {
-      path: path.clone(),
-      identity,
-    });
+    if let Some(identity) = identity {
+      set.pending_by_identity.insert(identity, path.clone());
+    }
+    set.pending.insert(
+      path.clone(),
+      PendingRoot {
+        path: path.clone(),
+        identity,
+      },
+    );
     drop(set);
     Ok(Self {
       roots: Arc::clone(roots),
@@ -641,12 +840,16 @@ impl Reservation {
 
 impl Drop for Reservation {
   fn drop(&mut self) {
-    self
-      .roots
-      .write()
-      .unwrap_or_else(PoisonError::into_inner)
-      .pending
-      .retain(|pending| pending.path != self.path);
+    let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
+    // One keyed removal, not a retain over every reservation: release runs under the same
+    // exclusive lock admission does, so a scan here is a second quadratic term AND a second
+    // source of registry-wide stalling. Both indexes are cleared from THIS reservation's own
+    // record, so a concurrent alias that reserved after us cannot have its identity dropped.
+    if let Some(identity) = set.pending.remove(&self.path).and_then(|p| p.identity)
+      && set.pending_by_identity.get(&identity) == Some(&self.path)
+    {
+      set.pending_by_identity.remove(&identity);
+    }
   }
 }
 
@@ -723,29 +926,14 @@ impl<R: RuntimeLite> Watcher<R> {
   ///
   /// # Errors
   ///
-  /// [`BuildError::TooManyExclusions`] when the options carry more exclusion
-  /// directories than the OS honors
-  /// ([`WatcherOptions::MAX_EXCLUSIONS`]).
+  /// [`BuildError::InvalidOptions`] when any option lies outside its documented
+  /// range — checked HERE, before the event channel is allocated or the driver
+  /// task exists, so an out-of-range value can never reach the arithmetic or the
+  /// kernel call that has no answer for it. See
+  /// [`WatcherOptions::validate`].
   pub fn new(options: WatcherOptions) -> Result<Self, BuildError> {
-    let supplied = options.exclusions_slice().len();
-    if supplied > WatcherOptions::MAX_EXCLUSIONS {
-      return Err(BuildError::TooManyExclusions { supplied });
-    }
-    let config = DriverConfig {
-      latency: options.latency(),
-      move_window: options.move_window(),
-      os_batch_capacity: options.os_batch_capacity(),
-      exclusions: options.exclusions_slice().to_vec(),
-      profile: DriverConfig::platform_profile(),
-      backend: options.backend(),
-      root_liveness_interval: options.root_liveness_interval(),
-      max_map_directories: options.max_map_directories(),
-      cookie_retry_base: DriverConfig::DEFAULT_COOKIE_RETRY_BASE,
-      cookie_retry_cap: DriverConfig::DEFAULT_COOKIE_RETRY_CAP,
-      cookie_retry_budget: DriverConfig::DEFAULT_COOKIE_RETRY_BUDGET,
-      cookie_backlog_cap: DriverConfig::DEFAULT_COOKIE_BACKLOG_CAP,
-      cookie_global_cap: DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
-    };
+    options.validate()?;
+    let config = driver_config(&options, DriverConfig::platform_profile());
     Self::spawn_with(options, config, RealFs::new())
   }
 
@@ -795,28 +983,39 @@ impl<R: RuntimeLite> Watcher<R> {
     options: WatcherOptions,
     ops: impl crate::driver::FsOps,
   ) -> Result<Self, BuildError> {
-    let config = DriverConfig {
-      latency: options.latency(),
-      move_window: options.move_window(),
-      os_batch_capacity: options.os_batch_capacity(),
-      exclusions: options.exclusions_slice().to_vec(),
-      // The hermetic lifecycle suites drive the backend-agnostic scope
-      // machinery over the KR profile with FSEvents-shaped payloads,
-      // regardless of host — the descending profile has its own driver
-      // suites. Pinning here keeps them host-independent.
-      profile: crate::os::BackendKind::FsEvents,
-      // The fake spawn pins its backend directly (`FakeFs::spawn_backend`), so
-      // the selection knob is inert here.
-      backend: options.backend(),
-      root_liveness_interval: options.root_liveness_interval(),
-      max_map_directories: options.max_map_directories(),
-      cookie_retry_base: DriverConfig::DEFAULT_COOKIE_RETRY_BASE,
-      cookie_retry_cap: DriverConfig::DEFAULT_COOKIE_RETRY_CAP,
-      cookie_retry_budget: DriverConfig::DEFAULT_COOKIE_RETRY_BUDGET,
-      cookie_backlog_cap: DriverConfig::DEFAULT_COOKIE_BACKLOG_CAP,
-      cookie_global_cap: DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
-    };
+    options.validate()?;
+    // The hermetic lifecycle suites drive the backend-agnostic scope machinery
+    // over the KR profile with FSEvents-shaped payloads, regardless of host —
+    // the descending profile has its own driver suites. Pinning the profile here
+    // keeps them host-independent.
+    let config = driver_config(&options, crate::os::BackendKind::FsEvents);
     Self::spawn_with(options, config, ops)
+  }
+}
+
+/// The ONE lowering of public options into driver knobs, shared by the real
+/// constructor and the hermetic one so the two can never drift on what a knob
+/// means — only on the provisional lowering `profile`, which is the single thing
+/// they legitimately disagree about.
+///
+/// Callers have already run [`WatcherOptions::validate`]: every value here is in
+/// range, which is what makes the downstream arithmetic total.
+fn driver_config(options: &WatcherOptions, profile: crate::os::BackendKind) -> DriverConfig {
+  DriverConfig {
+    latency: options.latency(),
+    move_window: options.move_window(),
+    os_batch_capacity: options.os_batch_capacity(),
+    os_buffer_bytes: options.os_buffer_bytes(),
+    exclusions: options.exclusions_slice().to_vec(),
+    profile,
+    backend: options.backend(),
+    root_liveness_interval: options.root_liveness_interval(),
+    max_map_directories: options.max_map_directories(),
+    cookie_retry_base: DriverConfig::DEFAULT_COOKIE_RETRY_BASE,
+    cookie_retry_cap: DriverConfig::DEFAULT_COOKIE_RETRY_CAP,
+    cookie_retry_budget: DriverConfig::DEFAULT_COOKIE_RETRY_BUDGET,
+    cookie_backlog_cap: DriverConfig::DEFAULT_COOKIE_BACKLOG_CAP,
+    cookie_global_cap: DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
   }
 }
 
@@ -1031,6 +1230,14 @@ impl<R> Watcher<R> {
   /// - [`UnwatchError::UnknownRoot`] when the handle does not name a live
   ///   root of THIS watcher (never watched, already unwatched, torn down by
   ///   root death, or issued by a different watcher);
+  /// - [`UnwatchError::Backlogged`] when this root already holds the maximum
+  ///   number of awaited unwatches parked on a teardown that has not quiesced —
+  ///   retryable, and the teardown the first call triggered is unaffected;
+  /// - [`UnwatchError::NotQuiesced`] when the root is no longer watched but one
+  ///   of its teardowns UNWOUND, so nothing ever proved the native stream
+  ///   stopped. `Ok(())` is the release licence — it says the stream, its reader
+  ///   and its callbacks are gone — and this error is precisely the case where
+  ///   that cannot be said, so it is reported rather than folded into success;
   /// - [`UnwatchError::Closed`] when the watcher is already closed.
   pub async fn unwatch(&self, root: RootHandle) -> Result<(), UnwatchError> {
     // A foreign handle must be rejected before anything is sent: its scope
@@ -1054,8 +1261,16 @@ impl<R> Watcher<R> {
     match response.await {
       // The registry entry is reclaimed by the driver's scope-dead signal;
       // nothing to reconcile here on either outcome.
-      Ok(true) => Ok(()),
-      Ok(false) => {
+      Ok(crate::driver::UnwatchAck::Torn) => Ok(()),
+      // Refused before anything was parked: the driver's own state is unchanged,
+      // so there is no registry claim to reason about either way.
+      Ok(crate::driver::UnwatchAck::Backlogged) => Err(UnwatchError::Backlogged),
+      // The teardown ran and the registry entry is reclaimed exactly as for
+      // `Torn` — what is missing is the PROOF that the native stream stopped, so
+      // the one thing `Ok(())` licences (releasing what the stream can still
+      // reach) is withheld.
+      Ok(crate::driver::UnwatchAck::Unproven) => Err(UnwatchError::NotQuiesced),
+      Ok(crate::driver::UnwatchAck::Unknown) => {
         // The driver never knew the scope, so its single-writer registry
         // cannot still hold an entry for it.
         debug_assert!(
@@ -1136,7 +1351,7 @@ impl<R> Watcher<R> {
     )
   }
 
-  /// Places a **sync cookie** — the kernel-mediated barrier marker — inside
+  /// Places a **sync cookie** — the kernel-mediated barrier marker — under
   /// `dir` (which must lie within `root`'s coverage) and resolves with the
   /// path it landed at, at WRITE-complete.
   ///
@@ -1147,6 +1362,16 @@ impl<R> Watcher<R> {
   /// pipeline. This method never waits for the observation — doing so from
   /// inside the watcher would deadlock the very stream the cookie must
   /// arrive on. Observation is the caller's (or the umbrella's) job.
+  ///
+  /// # The returned path is the only authority on where the cookie is
+  ///
+  /// The cookie does NOT land at `dir.join(name)`. It lands one level deeper, in
+  /// a reserved-namespace directory the watcher creates and owns inside `dir`,
+  /// because a cookie's removal must be anchored to a directory nobody else may
+  /// write — a name in a directory the watched tree owns can be rebound between
+  /// the removal's proof and its unlink, and no amount of re-checking closes
+  /// that. Reap what this call RETURNED; a path re-derived from `dir` and `name`
+  /// names nothing.
   ///
   /// The write is parked on the scope's coverage-settle fence: under a
   /// descending backend, a change inside a subtree whose per-directory watch
@@ -1181,7 +1406,11 @@ impl<R> Watcher<R> {
   /// a different watcher; [`BadCookieName`](SyncRootError::BadCookieName) when
   /// `name` is not a single normal component;
   /// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) when `dir` is not inside the
-  /// root (including via `..` traversal); [`Write`](SyncRootError::Write) when the
+  /// root (including via `..` traversal);
+  /// [`DirExcluded`](SyncRootError::DirExcluded) when `dir` is inside the root but
+  /// under one of the configured exclusions, whose whole purpose is to keep that
+  /// subtree's events off the stream the barrier waits on;
+  /// [`Write`](SyncRootError::Write) when the
   /// create fails (a read-only tree surfaces as `PermissionDenied`);
   /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this
   /// root is already in flight; [`NameInUse`](SyncRootError::NameInUse) when a live
@@ -1312,14 +1541,14 @@ impl<R> Watcher<R> {
   /// # Path addresses the path's CURRENT holder
   ///
   /// A path resolves to whatever live cookie occupies it NOW, not the incarnation
-  /// live when the request was issued. A sync's cookie path is `dir.join(name)`, so
-  /// two syncs that reuse one `name` in one `dir` sequentially share a path: a reap
-  /// delayed across the first sync's retirement and a second sync's claim of the
-  /// same path reaps the SECOND. This is harmless for the intended reap-what-you-were-
-  /// -given use, and cannot arise for the umbrella (its cookie names are per-sync
-  /// unique). A caller that both reuses names and needs incarnation precision reaps
-  /// through its [`SyncTicket`] instead — [`request_cancel_sync`](Self::request_cancel_sync)
-  /// addresses exactly one incarnation for all time and is a no-op after it resolves.
+  /// live when the request was issued. Two syncs that reuse one `name` in one `dir`
+  /// sequentially land at one path: a reap delayed across the first sync's
+  /// retirement and a second sync's claim of the same path reaps the SECOND. This
+  /// is harmless for the intended reap-what-you-were-given use, and cannot arise
+  /// for the umbrella (its cookie names are per-sync unique). A caller that both
+  /// reuses names and needs incarnation precision reaps through its [`SyncTicket`]
+  /// instead — [`request_cancel_sync`](Self::request_cancel_sync) addresses exactly
+  /// one incarnation for all time and is a no-op after it resolves.
   pub fn request_remove_cookie(&self, path: impl Into<PathBuf>) {
     self.cleanup.request_remove(&path.into());
   }
@@ -1616,6 +1845,30 @@ impl<R> Watcher<R> {
   /// still swept best-effort as the driver drops. The OS reclaims streams at
   /// process exit either way.
   pub async fn close(self) -> Result<(), CloseError> {
+    self.close_in_place().await
+  }
+
+  /// [`close`](Self::close) for a watcher OWNED BY ANOTHER OBJECT — identical
+  /// operation, identical result, borrowing instead of consuming.
+  ///
+  /// `close` takes `self` so an orderly program cannot keep using a watcher it
+  /// has shut down, and that is the right default. It is the wrong shape for a
+  /// watcher embedded in a larger type that itself has no `self`-consuming
+  /// teardown seam: without this, such an owner can only end the watcher by
+  /// DROPPING it, which starts the same teardown but can neither await it nor
+  /// report it — so the lower layer's `NotQuiesced` evidence, the strongest
+  /// lifecycle fact this crate produces, is thrown away exactly where an upper
+  /// `close()` wanted to forward it. The standard `tributaries` filesystem
+  /// source is that owner.
+  ///
+  /// Calling it more than once is safe and honest rather than idempotent: the
+  /// first call closes the driver, so a second reports
+  /// [`Stopped`](CloseError::Stopped) — no quiescence was proven BY THAT CALL.
+  ///
+  /// # Errors
+  ///
+  /// Exactly as [`close`](Self::close).
+  pub async fn close_in_place(&self) -> Result<(), CloseError> {
     let (reply, response) = futures_channel::oneshot::channel();
     if self.commands.send(Command::Close { reply }).await.is_err() {
       // The receiver vanished while this watcher still held a sender: the

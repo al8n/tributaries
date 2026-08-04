@@ -39,8 +39,8 @@ fn pending_of(watcher: &Watcher<TokioRuntime>) -> Vec<PathBuf> {
     .read()
     .unwrap_or_else(PoisonError::into_inner)
     .pending
-    .iter()
-    .map(|reserved| reserved.path.clone())
+    .keys()
+    .cloned()
     .collect()
 }
 
@@ -171,8 +171,7 @@ fn reservations_collide_on_object_identity() {
   roots
     .write()
     .unwrap_or_else(PoisonError::into_inner)
-    .entries
-    .insert(
+    .insert_live(
       ScopeId::new(1.try_into().unwrap()),
       RootEntry {
         path: Arc::new(PathBuf::from("/live/Root")),
@@ -637,6 +636,35 @@ async fn set_cover_maps_a_dropped_reply_to_closed() {
   }
   let err = fut.await.expect_err("a dropped reply is Closed");
   assert!(err.is_closed(), "{err:?}");
+}
+
+/// `Ok(())` from `unwatch` is the release licence — it says the native stream,
+/// its reader and its callbacks have reached quiescence. A driver that answers
+/// [`UnwatchAck::Unproven`](crate::driver::UnwatchAck::Unproven) is saying the
+/// opposite: the teardown ran but nothing observed the stream stop. Lowering it
+/// to `Ok` would hand out that licence over a source that may still be running.
+///
+/// FAIL-ON-REVERT: map `Unproven` to `Ok(())` in `Watcher::unwatch` and this
+/// resolves successfully.
+#[tokio::test]
+async fn unwatch_reports_an_unproven_teardown_as_an_error() {
+  let (watcher, commands) = manual_watcher();
+  let handle = RootHandle::new(watcher.instance, ScopeId::new(1.try_into().unwrap()));
+
+  let mut fut = Box::pin(watcher.unwatch(handle));
+  assert!(futures_util::poll!(fut.as_mut()).is_pending());
+  match commands.try_recv().expect("the command was sent") {
+    Command::Unwatch { reply, .. } => {
+      let _ = reply
+        .expect("the awaited form carries a reply")
+        .send(crate::driver::UnwatchAck::Unproven);
+    }
+    _ => panic!("expected an Unwatch command"),
+  }
+  let err = fut
+    .await
+    .expect_err("an unproven teardown is not a successful unwatch");
+  assert!(err.is_not_quiesced(), "{err:?}");
 }
 
 mod lifecycle {
@@ -1152,6 +1180,10 @@ mod lifecycle {
       other => panic!("expected RootReplaced, got {other:?}"),
     }
     assert_eq!(fs.spawns(), 1, "the stream went live before the bracket");
+    // The rollback is retired by the driver's counted teardown, on a reaper
+    // thread, so it lands strictly after the caller's error — the whole point of
+    // routing it there rather than shutting it down inside the spawn.
+    settle(|| fs.shutdowns() == 1).await;
     assert_eq!(fs.shutdowns(), 1, "the just-live stream was torn down");
     assert_eq!(watcher.registry_len(), 0);
     assert!(
@@ -1800,7 +1832,7 @@ fn reservation_exemption_excludes_exactly_the_replaced_scope() {
   let bystander = ScopeId::new(core::num::NonZeroU64::new(9).unwrap());
   {
     let mut set = roots.write().unwrap();
-    set.entries.insert(
+    set.insert_live(
       replaced,
       RootEntry {
         path: Arc::new(PathBuf::from("/a/b")),
@@ -1810,7 +1842,7 @@ fn reservation_exemption_excludes_exactly_the_replaced_scope() {
         stats: None,
       },
     );
-    set.entries.insert(
+    set.insert_live(
       bystander,
       RootEntry {
         path: Arc::new(PathBuf::from("/c/d")),
@@ -1868,7 +1900,7 @@ fn final_root_conflict_exemption_mirrors_the_reservation() {
   let replaced = ScopeId::new(core::num::NonZeroU64::new(7).unwrap());
   {
     let mut set = roots.write().unwrap();
-    set.entries.insert(
+    set.insert_live(
       replaced,
       RootEntry {
         path: Arc::new(PathBuf::from("/a/b")),
@@ -1899,5 +1931,133 @@ fn final_root_conflict_exemption_mirrors_the_reservation() {
     writer
       .final_root_conflict(Path::new("/a"), RootIdentity::new(1, 1), &[], None, None)
       .is_some()
+  );
+}
+
+/// An out-of-range option is refused BEFORE anything is allocated or spawned:
+/// the ceilings exist because the value would otherwise reach an eager
+/// allocation or a native buffer length, where the failure is a panic (or a
+/// wrap) rather than an error.
+#[tokio::test]
+async fn construction_refuses_an_out_of_range_option() {
+  let huge = std::num::NonZeroUsize::new(usize::MAX).unwrap();
+  let err = Watcher::<TokioRuntime>::new(WatcherOptions::new().with_event_capacity(huge))
+    .expect_err("an unallocatable channel capacity is refused, not attempted");
+  assert!(err.is_invalid_options());
+  assert!(matches!(
+    err,
+    BuildError::InvalidOptions(crate::options::OptionsError::EventCapacityTooLarge {
+      supplied
+    }) if supplied == huge
+  ));
+
+  let err =
+    Watcher::<TokioRuntime>::new(
+      WatcherOptions::new().with_exclusions(vec![PathBuf::from("/x"); 9]),
+    )
+    .expect_err("too many exclusions is refused");
+  assert!(err.is_too_many_exclusions());
+
+  let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("the defaults build");
+  drop(watcher);
+}
+
+/// The finite admission-map cap is not just a documented number: the default
+/// options carry it all the way into the driver knobs every spawn reads, so a
+/// caller who names no cap still gets a bounded map.
+#[test]
+fn the_default_map_cap_reaches_the_driver_knobs() {
+  let config = driver_config(&WatcherOptions::new(), BackendKind::FsEvents);
+  assert_eq!(
+    config.max_map_directories,
+    Some(1_000_000),
+    "an uncapped default would make registration's memory a function of the tree"
+  );
+  assert_eq!(
+    config.os_buffer_bytes,
+    WatcherOptions::DEFAULT_OS_BUFFER_BYTES,
+    "the native buffer is threaded as bytes, never derived from a batch count"
+  );
+  assert_eq!(
+    config.os_batch_capacity,
+    WatcherOptions::DEFAULT_OS_BATCH_CAPACITY
+  );
+}
+
+/// The property the descendant probe rests on: [`Path`]'s [`Ord`] compares **components**, so
+/// every strict descendant of a path sorts immediately after it and before any non-descendant
+/// that is greater. If this ever became byte ordering, `/a/b.txt` would sort between `/a/b` and
+/// `/a/b/c` and the probe would stop before reaching a real conflict — admitting an
+/// overlapping root.
+#[test]
+fn descendants_are_adjacent_under_path_ordering() {
+  let base = PathBuf::from("/a/b");
+  let mut sorted = [
+    PathBuf::from("/a/bc"),
+    PathBuf::from("/a/b.txt"),
+    PathBuf::from("/a/b/c"),
+    base.clone(),
+    PathBuf::from("/a/b/c/d"),
+  ];
+  sorted.sort();
+  let after: Vec<&PathBuf> = sorted.iter().skip_while(|p| **p <= base).collect();
+  let descendants = after.iter().take_while(|p| p.starts_with(&base)).count();
+  assert_eq!(
+    descendants, 2,
+    "both descendants sort before any greater non-descendant: {after:?}"
+  );
+}
+
+/// Admitting and releasing `N` mutually **disjoint** root reservations is linear in registry
+/// entries inspected, not quadratic.
+///
+/// The probe is a deterministic counter, not a timer: `REGISTRY_PROBES` records how many
+/// registry entries each conflict query and each release inspected. Both run under one
+/// exclusive lock, so the scan cost is not merely the caller's — it stalls every other
+/// admission, release and reader for its duration.
+///
+/// Fail-on-old (`pending: Vec<PendingRoot>` scanned by `overlap_of` and retained by `Drop`):
+/// 512 disjoint reservations inspect ~131,000 entries admitting and another ~131,000
+/// releasing.
+#[test]
+fn disjoint_reservations_are_linear_in_registry_probes() {
+  use super::REGISTRY_PROBES;
+
+  const ROOTS: usize = 512;
+  let roots = Arc::new(RwLock::new(RootSet::default()));
+
+  REGISTRY_PROBES.with(|probes| probes.set(0));
+  let mut held = Vec::with_capacity(ROOTS);
+  for i in 0..ROOTS {
+    held.push(
+      Reservation::take(&roots, PathBuf::from(format!("/audit/{i:08}")), None, None)
+        .expect("mutually disjoint siblings never conflict"),
+    );
+  }
+  let admission = REGISTRY_PROBES.with(core::cell::Cell::get);
+
+  REGISTRY_PROBES.with(|probes| probes.set(0));
+  drop(held);
+  let release = REGISTRY_PROBES.with(core::cell::Cell::get);
+
+  assert!(
+    roots
+      .read()
+      .unwrap_or_else(PoisonError::into_inner)
+      .pending
+      .is_empty(),
+    "every reservation released"
+  );
+  // A disjoint candidate probes its own ancestor chain plus a bounded number of index
+  // lookups; nothing it does is proportional to how many other roots are in flight.
+  assert!(
+    admission <= ROOTS * 16,
+    "admitting {ROOTS} disjoint roots inspects {admission} entries — a scan would spend {}",
+    ROOTS * (ROOTS - 1) / 2
+  );
+  assert!(
+    release <= ROOTS * 4,
+    "releasing {ROOTS} disjoint roots inspects {release} entries — a retain would spend {}",
+    ROOTS * (ROOTS + 1) / 2
   );
 }
