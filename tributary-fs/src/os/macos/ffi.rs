@@ -66,14 +66,29 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
   let outcome = catch_unwind(AssertUnwindSafe(|| {
     // SAFETY: forwarded verbatim from the callback contract.
     let batch = unsafe { decode::decode_batch(num_events, event_paths, event_flags, event_ids) };
+    // The wrap latch is the one thing that must be recorded whatever becomes of
+    // the batch: it INVALIDATES every id, so observing it late could hand a
+    // successor an id from a reused space. The decode reads it off the raw flag
+    // words, so an entry that failed to decode or fell outside the batch's
+    // materialization budget still latches it.
+    if batch.ids_wrapped {
+      shared.ids_wrapped.store(true, Ordering::Release);
+    }
+    let mut reached = 0u64;
     for event in &batch.events {
-      if event.flags.event_ids_wrapped() {
-        shared.ids_wrapped.store(true, Ordering::Release);
-      }
+      // Id zero is the `ROOT_CHANGED` marker, not a journal position, and a
+      // lost-sync id is one the journal itself disowns.
       if event.event_id != 0 && !event.flags.lost_sync() {
-        shared.last_good.fetch_max(event.event_id, Ordering::AcqRel);
+        reached = reached.max(event.event_id);
       }
     }
+    // The position this batch REACHES is only staged here: it becomes the
+    // stream's resume point when the driver ingests this batch, and never if it
+    // does not. Advancing it at decode time would let the token pass over the
+    // very events an over-budget drop discarded.
+    let candidate = (reached != 0)
+      .then(|| crate::os::ResumeToken::fsevents(reached, shared.device_uuid))
+      .map(|token| (&shared.resume, token));
     // Never block the dispatch queue: an over-budget batch is dropped and the
     // loss rides the SAME ordered queue in-band — the queue is unbounded, so
     // a signal send cannot fail for capacity and cannot overtake the batches
@@ -83,11 +98,21 @@ pub(super) unsafe extern "C-unwind" fn event_callback(
       .into_iter()
       .map(crate::os::SourceEvent::FsEvents)
       .collect();
-    crate::os::transport::forward_batch(&shared.transport, events, batch.lossy, |msg| {
-      shared.queue.try_send(msg).is_ok()
-    });
+    crate::os::transport::forward_batch_resuming(
+      &shared.transport,
+      events,
+      batch.lossy,
+      candidate,
+      |msg| shared.queue.try_send(msg).is_ok(),
+    );
   }));
-  if outcome.is_err() {
+  // The payload is retired inside its own boundary rather than dropped as this frame
+  // returns. This is an `extern "C-unwind"` function FSEvents calls from its dispatch
+  // queue: a panicking payload destructor dropped here would unwind out of a foreign
+  // frame the runtime has no landing pad for, which is precisely the escape the
+  // containment above exists to deny.
+  if let Err(payload) = outcome {
+    let _ = tributary_proto::unwind::dispose_panic_payload(payload);
     // A decode bug must not abort the host process; poison the stream and
     // report the death in-band. The queue is unbounded, so the one terminal
     // Fatal cannot be dropped for capacity.
