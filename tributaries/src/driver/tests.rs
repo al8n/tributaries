@@ -601,9 +601,19 @@ struct PanicsOnDrop;
 
 impl Drop for PanicsOnDrop {
   fn drop(&mut self) {
-    panic!("a tenant's panic payload panics as it is disposed of");
+    std::panic::panic_any(ForgottenPayload);
   }
 }
+
+/// The payload [`PanicsOnDrop`]'s own disposal unwinds with.
+///
+/// A ZST, and that is the point. This is the payload a total disposal must
+/// [forget](core::mem::forget) — the operation that cuts the recursion runs no destructor — so by
+/// contract it is unreachable for the rest of the process. A zero-sized box allocates nothing, so
+/// the cells assert that containment while retaining nothing for a whole-process leak check to
+/// report. A `panic!("…")` message makes it a `Box<&'static str>` instead: 16 bytes per disposal
+/// that LeakSanitizer reports, in a suite where every OTHER retained allocation is a real defect.
+struct ForgottenPayload;
 
 /// How many `cookie-boom` cookies [`FakeSource::end_sync`] has been handed.
 ///

@@ -1604,9 +1604,20 @@ mod teardown_reaper {
 
   impl Drop for PanicsOnDrop {
     fn drop(&mut self) {
-      panic!("a teardown's panic payload panics as it is disposed of");
+      std::panic::panic_any(ForgottenPayload);
     }
   }
+
+  /// The payload [`PanicsOnDrop`]'s own disposal unwinds with.
+  ///
+  /// A ZST, and that is the point: this is the payload a total disposal must
+  /// [forget](std::mem::forget) — the operation that cuts the recursion runs no
+  /// destructor — so by contract it is unreachable for the rest of the process. A
+  /// zero-sized box allocates nothing, so the cell asserts that containment while
+  /// retaining nothing for a whole-process leak check to report. A `panic!("…")`
+  /// message makes it a `Box<&'static str>` instead: 16 bytes LeakSanitizer reports,
+  /// in a suite where every OTHER retained allocation is a real defect.
+  struct ForgottenPayload;
 
   /// The caught PAYLOAD is not the worker's data. A `panic_any` payload is any
   /// `Send + 'static` value the panicking code chose, so disposing of it runs that
@@ -1811,19 +1822,28 @@ mod teardown_reaper {
   struct ReapProbe {
     ran_on: std::sync::mpsc::Sender<String>,
     dropped_on: std::sync::mpsc::Sender<String>,
+    /// Set by the run, read by `Drop`: which of the two terminals this closure
+    /// reached. A run must SILENCE the drop report rather than suppress the drop —
+    /// the driver's own claimed closure is dropped after it runs, and a probe that
+    /// skipped its destructor would model a claimed closure as one that never
+    /// released the channels it holds.
+    ran: bool,
   }
 
   impl ReapProbe {
-    fn consume(self) {
+    fn consume(mut self) {
       let _ = self.ran_on.send(this_thread());
       // The run is the terminal: `Drop` still fires, and reporting from it too
       // would make a claimed closure indistinguishable from an abandoned one.
-      std::mem::forget(self);
+      self.ran = true;
     }
   }
 
   impl Drop for ReapProbe {
     fn drop(&mut self) {
+      if self.ran {
+        return;
+      }
       let _ = self.dropped_on.send(this_thread());
     }
   }
@@ -1877,7 +1897,11 @@ mod teardown_reaper {
 
     let (ran_on, on_run) = std::sync::mpsc::channel();
     let (dropped_on, on_drop) = std::sync::mpsc::channel();
-    let probe = ReapProbe { ran_on, dropped_on };
+    let probe = ReapProbe {
+      ran_on,
+      dropped_on,
+      ran: false,
+    };
     sink.reap(move || probe.consume());
 
     let ran = on_run.recv_timeout(Duration::from_secs(10));
