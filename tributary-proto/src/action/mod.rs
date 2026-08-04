@@ -7,7 +7,7 @@
 //! handle, and correlates each [`ReqId`] with the request it answers.
 
 use crate::{
-  id::{ReqId, ScopeId, WatchId},
+  id::{ArmAttempt, ReqId, ScopeId, WatchId},
   interest::Interest,
   path::Segment,
 };
@@ -152,10 +152,11 @@ impl WatchAck {
 }
 
 /// The payload of an [`Action::Watch`]: install `mask` on `target`, minting it
-/// as `id`.
+/// as `id`, under the arm attempt `attempt`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WatchCommand {
   id: WatchId,
+  attempt: ArmAttempt,
   target: WatchTarget,
   mask: Interest,
 }
@@ -163,14 +164,32 @@ pub struct WatchCommand {
 impl WatchCommand {
   /// Builds a watch command.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(id: WatchId, target: WatchTarget, mask: Interest) -> Self {
-    Self { id, target, mask }
+  pub const fn new(id: WatchId, attempt: ArmAttempt, target: WatchTarget, mask: Interest) -> Self {
+    Self {
+      id,
+      attempt,
+      target,
+      mask,
+    }
   }
 
   /// The proto-minted handle the driver should bind to the new raw watch.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn id(&self) -> WatchId {
     self.id
+  }
+
+  /// The attempt this arm is, to be echoed back through
+  /// [`on_watch_result`](crate::Monitor::on_watch_result).
+  ///
+  /// A [`WatchId`] outlives its bindings, so several attempts can name it over
+  /// time; the token must be CAPTURED here and reported with the outcome, not
+  /// re-read when the outcome lands — re-reading would answer for whichever arm
+  /// is current and reintroduce exactly the misattribution it exists to fence.
+  /// See [`ArmAttempt`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn attempt(&self) -> ArmAttempt {
+    self.attempt
   }
 
   /// What to watch.
@@ -321,7 +340,8 @@ impl StatCommand {
 /// The driver executes each action and reports the outcome back through the
 /// `Monitor::on_*` inputs (a [`Watch`](Self::Watch) is answered by
 /// [`on_watch_result`](crate::Monitor::on_watch_result), an
-/// [`Enumerate`](Self::Enumerate) by [`on_enumerate`](crate::Monitor::on_enumerate)).
+/// [`Enumerate`](Self::Enumerate) by [`on_enumerate`](crate::Monitor::on_enumerate),
+/// a [`Stat`](Self::Stat) by [`on_stat_result`](crate::Monitor::on_stat_result)).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Action {
@@ -337,15 +357,29 @@ pub enum Action {
   Unwatch(WatchId),
   /// Read a watched directory's entries.
   Enumerate(EnumerateCommand),
-  /// Stat a target.
+  /// Stat a target whose kind a listing could not settle.
+  ///
+  /// The core issues one only for a slot a
+  /// [`DirEntry`](crate::DirEntry) reported as
+  /// [`FileKind::Unknown`](crate::FileKind::Unknown): it cannot descend into
+  /// what it cannot classify, and guessing "not a directory" would leave a real
+  /// directory unwatched — a permanently blind subtree — while guessing
+  /// "directory" would arm a watch on every unclassifiable file. Until the
+  /// answer arrives the slot stands as a coverage deficit, so a driver that
+  /// never answers degrades to a re-signalled `Rescan` rather than to silence.
   Stat(StatCommand),
 }
 
 impl Action {
   /// Builds a [`Watch`](Self::Watch) action from its parts.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn watch(id: WatchId, target: WatchTarget, mask: Interest) -> Self {
-    Self::Watch(WatchCommand::new(id, target, mask))
+  pub const fn watch(
+    id: WatchId,
+    attempt: ArmAttempt,
+    target: WatchTarget,
+    mask: Interest,
+  ) -> Self {
+    Self::Watch(WatchCommand::new(id, attempt, target, mask))
   }
 
   /// Builds an [`Enumerate`](Self::Enumerate) action from its parts.
