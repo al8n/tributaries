@@ -20,13 +20,15 @@ use agnostic_lite::{
 };
 use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 
-use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
+use super::{
+  CookieFile, CookieRemoval, CookieWriteError, FsOps, ScopeRegistry, SourceControl, SpawnedSource,
+};
 use crate::{
   core::{ExpectedObject, MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
   driver::ControlRequest,
   os::{
     BackendKind, RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError, SourceEvent,
-    SourceMessage,
+    SourceMessage, SpawnFailed,
     linux::{RawLinuxEvent, WatchOutcome},
   },
 };
@@ -123,6 +125,24 @@ struct FakeState {
   /// close-versus-wedged-teardown cell needs a teardown whose handle has
   /// already moved into the call, where no Drop backstop can exist.
   teardown_hold: Mutex<Option<HoldGate>>,
+  /// How many further `SourceControl::shutdown` calls must UNWIND instead of
+  /// returning — the injected teardown panic the reaper's accounting is proven
+  /// against. Decremented by each panicking call.
+  panic_teardowns: AtomicUsize,
+  /// How many further `SourceControl::shutdown` calls must RETURN
+  /// [`Quiesce::Unproven`] — a backend that completed its teardown but could
+  /// not observe the stream's end, and retained native state rather than free
+  /// what the OS may still own. Distinct from `panic_teardowns` on the only
+  /// axis that matters: the call returns normally, so nothing but the answer
+  /// itself distinguishes it from a clean teardown. Decremented by each such
+  /// call.
+  unproven_teardowns: AtomicUsize,
+  /// The name of the thread that reclaimed the most recently retired stream,
+  /// whether through `shutdown` or the `Drop` backstop. The teardown contract is
+  /// about WHERE the unbounded join runs, so a cell proving a handle reached the
+  /// reaper — rather than being destroyed on the shared blocking pool — has to
+  /// read the executor, not merely the count.
+  reclaim_thread: Mutex<Option<String>>,
   /// The backend the next spawn's `RootMeta` claims (and thus the lowering
   /// profile the core confirms).
   spawn_backend: Mutex<BackendKind>,
@@ -139,6 +159,13 @@ struct FakeState {
   /// When set, every cookie write fails with this error kind (the read-only
   /// tree, modeled).
   cookie_write_failure: Mutex<Option<std::io::ErrorKind>>,
+  /// When set, every cookie write CREATES its file and then fails with this
+  /// error kind, handing the file back as the residue: the write that could not
+  /// identify what it made and could not destroy it either. Distinct from
+  /// [`cookie_write_failure`](Self::cookie_write_failure), which models a write
+  /// that left nothing on disk — the whole difference being whether the caller
+  /// may retire the obligation pre-physically.
+  cookie_write_strand: Mutex<Option<std::io::ErrorKind>>,
   /// Cookie writes that reached the blocking pool, counted before any hold — the
   /// observable that a write is IN FLIGHT, which is what a cell racing a
   /// retirement or an abandoned reply against it must wait for.
@@ -285,6 +312,13 @@ struct FakeState {
   wd_seq: AtomicUsize,
 }
 
+impl FakeState {
+  /// Records the thread reclaiming a stream — see [`FakeState::reclaim_thread`].
+  fn note_reclaim_thread(&self) {
+    *self.reclaim_thread.lock().unwrap() = std::thread::current().name().map(str::to_owned);
+  }
+}
+
 impl Default for FakeState {
   fn default() -> Self {
     Self {
@@ -302,12 +336,16 @@ impl Default for FakeState {
       spawn_hold: Mutex::default(),
       post_live_hold: Mutex::default(),
       teardown_hold: Mutex::default(),
+      panic_teardowns: AtomicUsize::new(0),
+      unproven_teardowns: AtomicUsize::new(0),
+      reclaim_thread: Mutex::default(),
       spawn_backend: Mutex::new(BackendKind::FsEvents),
       arms: Mutex::default(),
       scope_generation: Mutex::default(),
       cookie_writes: Mutex::default(),
       cookie_removes: Mutex::default(),
       cookie_write_failure: Mutex::default(),
+      cookie_write_strand: Mutex::default(),
       cookie_dispatches: AtomicUsize::new(0),
       cookie_write_hold: Mutex::default(),
       cookie_remove_failures: AtomicUsize::new(0),
@@ -411,6 +449,23 @@ impl FakeFs {
 
   pub(crate) fn remove(&self, path: impl AsRef<Path>) {
     self.state.nodes.lock().unwrap().remove(path.as_ref());
+  }
+
+  /// The landing a `write_cookie` would have reported for the node standing at
+  /// `path` right now — for a cell that stages a cookie with [`put`](Self::put)
+  /// and hands it to a registry directly, below the write that normally mints
+  /// one. Identity is read from the node, so a cell that later replaces it gets
+  /// the replacement's, exactly as a real `fstat` would.
+  ///
+  /// An ABSENT node yields inode 0, which no cell and no fake write ever mints:
+  /// staging a cookie for a path with nothing at it is meant to match nothing.
+  pub(crate) fn cookie_at(&self, path: impl AsRef<Path>) -> CookieFile {
+    let path = path.as_ref().to_path_buf();
+    let identity = self.state.nodes.lock().unwrap().get(&path).map_or_else(
+      || RootIdentity::new(self.root_dev, 0),
+      |node| RootIdentity::new(node.dev, node.ino.into()),
+    );
+    CookieFile::new(path, identity)
   }
 
   /// Every regular file at or under `prefix`, for tree-equality oracles.
@@ -638,6 +693,29 @@ impl FakeFs {
     HoldRelease { gate }
   }
 
+  /// Makes the next `count` teardowns UNWIND inside `shutdown`, before the
+  /// completion is counted — a backend whose quiescence call panics (an
+  /// invariant `expect`, a poisoned lock), which the reaper must contain
+  /// without corrupting its own accounting.
+  pub(crate) fn panic_teardowns(&self, count: usize) {
+    self.state.panic_teardowns.store(count, Ordering::SeqCst);
+  }
+
+  /// Makes the next `count` teardowns RETURN [`Quiesce::Unproven`] — a backend
+  /// whose `shutdown` ran to completion and still could not prove the stream
+  /// gone (the Windows pumps' panic-forget and undrained-cancellation paths,
+  /// which retain kernel-owned buffers and handles on purpose). They complete
+  /// like any other teardown, so a driver that reads the RETURN rather than the
+  /// answer cannot tell them apart from success.
+  pub(crate) fn unproven_teardowns(&self, count: usize) {
+    self.state.unproven_teardowns.store(count, Ordering::SeqCst);
+  }
+
+  /// The name of the thread that reclaimed the most recently retired stream.
+  pub(crate) fn reclaim_thread(&self) -> Option<String> {
+    self.state.reclaim_thread.lock().unwrap().clone()
+  }
+
   /// Holds every subsequent spawn AFTER its stream goes live but before the
   /// spawn returns — the post-live metadata phase of the real backend.
   pub(crate) fn hold_spawns_post_live(&self) -> HoldRelease {
@@ -798,6 +876,14 @@ impl FakeFs {
   /// Fails every subsequent cookie write with `kind` — the read-only tree.
   pub(crate) fn fail_cookie_writes(&self, kind: std::io::ErrorKind) {
     *self.state.cookie_write_failure.lock().unwrap() = Some(kind);
+  }
+
+  /// Makes every subsequent cookie write CREATE its file and then fail with
+  /// `kind`, handing the file back as the residue — the created-but-unresolved
+  /// write. What a cell built on this proves is an accounting property: the file
+  /// exists, so the obligation may not be retired as though nothing had been made.
+  pub(crate) fn strand_cookie_writes(&self, kind: std::io::ErrorKind) {
+    *self.state.cookie_write_strand.lock().unwrap() = Some(kind);
   }
 
   /// Fails the next `n` cookie REMOVES with a transient error, then lets removes
@@ -1129,8 +1215,9 @@ impl FakeFs {
         resolutions: requests
           .iter()
           .filter_map(|request| match request {
-            ControlRequest::Arm { watch, .. } => Some(super::ArmResolution {
+            ControlRequest::Arm { watch, attempt, .. } => Some(super::ArmResolution {
               watch: *watch,
+              attempt: *attempt,
               outcome: WatchOutcome::Failed(tributary_proto::WatchError::Io),
             }),
             ControlRequest::Disarm { .. } => None,
@@ -1154,7 +1241,12 @@ impl FakeFs {
         resolutions: requests
           .into_iter()
           .filter_map(|request| match request {
-            ControlRequest::Arm { watch, path, .. } => {
+            ControlRequest::Arm {
+              watch,
+              attempt,
+              path,
+              ..
+            } => {
               self
                 .state
                 .stale_arms
@@ -1163,6 +1255,7 @@ impl FakeFs {
                 .push((watch, path.to_path_buf()));
               Some(super::ArmResolution {
                 watch,
+                attempt,
                 outcome: WatchOutcome::Failed(tributary_proto::WatchError::Gone),
               })
             }
@@ -1177,12 +1270,14 @@ impl FakeFs {
       match request {
         ControlRequest::Arm {
           watch,
+          attempt,
           parent,
           name,
           path,
           expected,
         } => outcomes.push(super::ArmResolution {
           watch,
+          attempt,
           outcome: self.arm_one(scope, watch, parent, path.as_path(), &name, expected),
         }),
         ControlRequest::Disarm { watch } => {
@@ -1308,7 +1403,7 @@ impl SourceControl for FakeHandle {
     *self.state.resume_token.lock().unwrap()
   }
 
-  fn shutdown(mut self) {
+  fn shutdown(mut self) -> crate::os::Quiesce {
     // The wedge gate parks INSIDE the call, after the handle moved in —
     // exactly the phase where no Drop backstop can exist. Drop itself never
     // waits, or a failing test would hang its own teardown. The bind is
@@ -1323,8 +1418,34 @@ impl SourceControl for FakeHandle {
         parked = cvar.wait(parked).unwrap();
       }
     }
+    if self
+      .state
+      .panic_teardowns
+      .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+        left.checked_sub(1)
+      })
+      .is_ok()
+    {
+      self.shut = true;
+      panic!("injected teardown panic");
+    }
     self.shut = true;
+    self.state.note_reclaim_thread();
     self.state.shutdowns.fetch_add(1, Ordering::SeqCst);
+    // The counters above are the healthy path's, and this arm takes them too:
+    // an unproven teardown RAN. Only the answer differs, which is exactly the
+    // shape the driver has to key on.
+    if self
+      .state
+      .unproven_teardowns
+      .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+        left.checked_sub(1)
+      })
+      .is_ok()
+    {
+      return crate::os::Quiesce::Unproven;
+    }
+    crate::os::Quiesce::Proven
   }
 }
 
@@ -1333,6 +1454,7 @@ impl Drop for FakeHandle {
     // The real handle's Drop backstop, mirrored: an owner that never called
     // shutdown still reclaims the stream.
     if !self.shut {
+      self.state.note_reclaim_thread();
       self.state.shutdowns.fetch_add(1, Ordering::SeqCst);
     }
   }
@@ -1343,7 +1465,10 @@ impl FsOps for FakeFs {
   /// The fake's stand-in for an `O_PATH` fd: the publication id its arm minted.
   type Anchor = u64;
 
-  fn spawn_source(&self, config: SourceConfig) -> Result<SpawnedSource<Self::Handle>, SourceError> {
+  fn spawn_source(
+    &self,
+    config: SourceConfig,
+  ) -> Result<SpawnedSource<Self::Handle>, SpawnFailed<Self::Handle>> {
     // Record the resume point this spawn was configured with, BEFORE any hold
     // or outcome: a replacement inheriting the retiring stream's point is the
     // observable, and it exists whether or not the spawn goes on to succeed.
@@ -1368,10 +1493,13 @@ impl FsOps for FakeFs {
     // A root vanished before start is a clean spawn failure — the pre-start
     // half of the lifecycle contract (post-start deaths travel in-band).
     if !self.state.nodes.lock().unwrap().contains_key(&requested) {
-      return Err(SourceError::RootUnavailable {
-        root: requested,
-        source: std::io::Error::from(std::io::ErrorKind::NotFound),
-      });
+      return Err(
+        SourceError::RootUnavailable {
+          root: requested,
+          source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }
+        .into(),
+      );
     }
     // The backend re-canonicalizes at spawn; a configured remap mirrors a
     // root retargeted between the watcher's reservation and this point.
@@ -1389,7 +1517,7 @@ impl FsOps for FakeFs {
     if let Some(node) = self.state.nodes.lock().unwrap().get(&root)
       && !node.kind.is_dir()
     {
-      return Err(SourceError::NotADirectory { root });
+      return Err(SourceError::NotADirectory { root }.into());
     }
     // The pre-start barrier, mirrored from the real backend: the metadata is
     // sealed strictly before the source becomes injectable (`stream_live`),
@@ -1482,8 +1610,21 @@ impl FsOps for FakeFs {
       if let Some(spawned) = self.state.sources.lock().unwrap().get_mut(&root) {
         spawned.pop();
       }
-      self.state.shutdowns.fetch_add(1, Ordering::SeqCst);
-      return Err(err);
+      // The rollback is HANDED BACK live, never shut down here — the real
+      // barriers' shape. A backend that tore its own post-live stream down
+      // discarded the `Quiesce` its teardown answered, so a rollback that
+      // retained kernel-owned state reached no terminal, no backlog and no close
+      // reply. Returning the handle puts the retirement (and therefore the
+      // verdict) inside the driver's one counted submission. The `shutdowns`
+      // counter is deliberately NOT bumped here: it moves when the handle is
+      // actually torn down, on the reaper.
+      return Err(SpawnFailed::rolled_back(
+        err,
+        FakeHandle {
+          state: Arc::clone(&self.state),
+          shut: false,
+        },
+      ));
     }
     // Ancestor identities read after the stream is live, like the backend.
     let ancestors = {
@@ -1718,14 +1859,22 @@ impl FsOps for FakeFs {
     })
   }
 
-  fn write_cookie(&self, root: &Path, dir: &Path, name: &str) -> Result<PathBuf, std::io::Error> {
+  fn write_cookie(
+    &self,
+    root: &Path,
+    dir: &Path,
+    name: &str,
+  ) -> Result<CookieFile, CookieWriteError> {
     // The dispatch is counted BEFORE the hold: a cell that must race a scope
     // retirement (or an abandoned reply) against a write in flight needs to know
     // the write is parked in the pool, not still queued behind its settle fence.
     self.state.cookie_dispatches.fetch_add(1, Ordering::SeqCst);
     self.park_on(&self.state.cookie_write_hold);
     if let Some(kind) = *self.state.cookie_write_failure.lock().unwrap() {
-      return Err(std::io::Error::new(kind, "cookie write refused"));
+      return Err(CookieWriteError::clean(std::io::Error::new(
+        kind,
+        "cookie write refused",
+      )));
     }
     // The real `cookie_dir` resolution, mirrored: a covered FILE subscription's
     // key names a file, so the cookie lands BESIDE it rather than failing ENOTDIR
@@ -1745,10 +1894,10 @@ impl FsOps for FakeFs {
       // "place a barrier" into thin air — a root that died under an in-flight
       // sync is exactly that case.
       if !nodes.get(target).is_some_and(|node| node.kind.is_dir()) {
-        return Err(std::io::Error::new(
+        return Err(CookieWriteError::clean(std::io::Error::new(
           std::io::ErrorKind::NotFound,
           "the cookie directory is gone",
-        ));
+        )));
       }
       // Canonicalize the resolved directory (resolving any modeled intermediate
       // symlink) and verify it is BENEATH the root — the production
@@ -1764,9 +1913,9 @@ impl FsOps for FakeFs {
         .cloned()
         .unwrap_or_else(|| target.to_path_buf());
       if !canonical_dir.starts_with(root) {
-        return Err(std::io::Error::other(
+        return Err(CookieWriteError::clean(std::io::Error::other(
           "the cookie directory resolves outside the watched root",
-        ));
+        )));
       }
       let path = canonical_dir.join(name);
       // O_NOFOLLOW on the real create, mirrored: a symlink swapped in where the
@@ -1777,10 +1926,10 @@ impl FsOps for FakeFs {
         nodes.get(&path).map(|node| node.kind),
         Some(FileKind::Symlink)
       ) {
-        return Err(std::io::Error::new(
+        return Err(CookieWriteError::clean(std::io::Error::new(
           std::io::ErrorKind::AlreadyExists,
           "refusing to follow a symlink at the cookie path",
-        ));
+        )));
       }
       path
     };
@@ -1794,17 +1943,30 @@ impl FsOps for FakeFs {
     // predecessor record. (The symlink refusal above already covers that kind;
     // this is the general case.)
     if self.state.nodes.lock().unwrap().contains_key(&path) {
-      return Err(std::io::Error::new(
+      return Err(CookieWriteError::clean(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "a cookie already exists at the path (create_new)",
-      ));
+      )));
     }
     self.put(&path, FileKind::File, ino);
     self.state.cookie_writes.lock().unwrap().push(path.clone());
-    Ok(path)
+    // The identity of the node the create just made, mirroring the real `fstat`
+    // on the descriptor the create returned — a node the fake later replaces at
+    // this path gets a different `ino`, so the removal's proof is exercised
+    // against the same distinction production faces.
+    let identity = RootIdentity::new(self.root_dev, ino.into());
+    let file = CookieFile::new(path, identity);
+    if let Some(kind) = *self.state.cookie_write_strand.lock().unwrap() {
+      return Err(CookieWriteError {
+        source: std::io::Error::new(kind, "cookie write left an unresolved file"),
+        residue: Some(Box::new(file)),
+      });
+    }
+    Ok(file)
   }
 
-  fn remove_cookie(&self, path: &Path) -> Result<(), std::io::Error> {
+  fn remove_cookie(&self, cookie: &CookieFile) -> Result<CookieRemoval, std::io::Error> {
+    let path = cookie.path();
     // Counted BEFORE the hold: a cell racing a close (or a cancelled driver's
     // Drop) against a hung terminal unlink needs to know the unlink is parked in
     // the pool, not still queued.
@@ -1847,6 +2009,24 @@ impl FsOps for FakeFs {
         Err(actual) => budget = actual,
       }
     }
+    // The production identity proof, mirrored: a node standing at the path that is
+    // NOT the one the write created is left alone, whatever the cell put there.
+    // The knobs above are checked first because they model a failing unlink, which
+    // in production fails before any object is inspected.
+    let present = self
+      .state
+      .nodes
+      .lock()
+      .unwrap()
+      .get(path)
+      .map(|node| RootIdentity::new(node.dev, node.ino.into()));
+    if present.is_some_and(|found| Some(found) != cookie.identity()) {
+      return Ok(CookieRemoval::Displaced);
+    }
+    // An absent node still runs the removal below (a no-op on the tree): the
+    // already-gone case is idempotent success, and taking it through the same
+    // confirm hold and log keeps every cell's bracketing of that window intact.
+    let gone = present.is_none();
     self.remove(path);
     // The unlink syscall has completed (the node is gone; `files_under` reflects
     // it), but the pool job has NOT yet taken the ledger lock to confirm: park
@@ -1860,7 +2040,11 @@ impl FsOps for FakeFs {
       .lock()
       .unwrap()
       .push(path.to_path_buf());
-    Ok(())
+    Ok(if gone {
+      CookieRemoval::AlreadyGone
+    } else {
+      CookieRemoval::Unlinked
+    })
   }
 
   fn take_enumerate_anchor(&self, watch: WatchId) -> Option<Self::Anchor> {
