@@ -26,6 +26,9 @@ fn config() -> DriverConfig {
     latency: Duration::from_millis(10),
     move_window: Duration::from_millis(100),
     os_batch_capacity: NonZeroUsize::new(8).unwrap(),
+    // Inert for the fake spawns (no native read buffer); a real spawn threads
+    // this into its SourceConfig.
+    os_buffer_bytes: std::num::NonZeroU32::new(64 * 1024).unwrap(),
     exclusions: Vec::new(),
     profile: BackendKind::FsEvents,
     backend: Backend::Auto,
@@ -429,7 +432,7 @@ async fn unwatch_stops_one_root_and_replies() {
     })
     .await
     .unwrap();
-  assert!(on_reply.await.unwrap(), "the scope existed");
+  assert!(on_reply.await.unwrap().is_torn(), "the scope existed");
   assert_eq!(rig.fs.shutdowns(), 1);
 }
 
@@ -803,7 +806,7 @@ async fn registry_sees_live_then_dead_in_order() {
     })
     .await
     .unwrap();
-  assert!(on_reply.await.unwrap(), "the unwatch resolves");
+  assert!(on_reply.await.unwrap().is_torn(), "the unwatch resolves");
   assert_eq!(
     registry.dead(),
     [scope],
@@ -1531,6 +1534,369 @@ mod teardown_reaper {
       "and it admitted no root it could never retire"
     );
   }
+
+  /// A closure handed to the reaper is arbitrary: the driver's own teardown
+  /// submission reports its unwind as a terminal, but the spawn sink's handoff
+  /// closure has no such wrapper. So the WORKER itself must survive an unwind and
+  /// leave its accounting exact — otherwise one panicking closure permanently
+  /// removes a thread that `threads` still counts, and enough of them leave the
+  /// cap fully "occupied" by workers that no longer exist.
+  ///
+  /// FAIL-ON-REVERT: replace `reap_loop`'s claim guard and containment boundary
+  /// with `teardown(); finish_teardown(inner);` and the worker dies with the first
+  /// closure — the healthy one behind it is never claimed and `settle` never
+  /// reports quiescence.
+  #[test]
+  fn a_reaper_worker_survives_an_unwinding_closure_with_exact_accounting() {
+    let reaper = TeardownReaper::new().expect("the baseline thread starts");
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    reaper.reap(|| panic!("an uncontained teardown closure unwinds"));
+    let flag = Arc::clone(&ran);
+    reaper.reap(move || {
+      flag.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    // `settle` returns on ANY completion, so drive it to quiescence: what is
+    // proven is that both submissions retire, not that one does.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut quiesced = false;
+    while !quiesced && std::time::Instant::now() < deadline {
+      quiesced = reaper.settle(Duration::from_millis(50));
+    }
+    assert!(
+      quiesced,
+      "both submissions are retired: the unwind repaired its own accounting"
+    );
+    assert_eq!(
+      ran.load(std::sync::atomic::Ordering::SeqCst),
+      1,
+      "the healthy teardown queued behind the unwinding one still ran"
+    );
+  }
+
+  /// Drives `reaper` to full quiescence, or gives up after `budget`.
+  fn quiesce(reaper: &TeardownReaper, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    let mut quiesced = false;
+    while !quiesced && std::time::Instant::now() < deadline {
+      quiesced = reaper.settle(Duration::from_millis(20));
+    }
+    quiesced
+  }
+
+  /// Waits until `predicate` reads true of the reaper's state, or gives up.
+  fn settled_state(reaper: &TeardownReaper, predicate: impl Fn(&ReaperState) -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      if predicate(&reaper.lock()) {
+        return true;
+      }
+      if std::time::Instant::now() >= deadline {
+        return false;
+      }
+      std::thread::sleep(Duration::from_millis(2));
+    }
+  }
+
+  /// A legal `panic_any` payload whose own disposal unwinds.
+  struct PanicsOnDrop;
+
+  impl Drop for PanicsOnDrop {
+    fn drop(&mut self) {
+      panic!("a teardown's panic payload panics as it is disposed of");
+    }
+  }
+
+  /// The caught PAYLOAD is not the worker's data. A `panic_any` payload is any
+  /// `Send + 'static` value the panicking code chose, so disposing of it runs that
+  /// code's own destructor — and one that panics starts a SECOND unwind, in ordinary
+  /// control flow, one line past the boundary that just contained the first.
+  ///
+  /// That unwind leaves through `reap_loop` AFTER `ClaimedTeardown` has repaired
+  /// `busy`/`outstanding`, so the accounting looks perfectly healthy while the worker is
+  /// gone — and the abnormal escrow, reservoir, queue-drain and failed-delivery paths all
+  /// submit a raw `handle.shutdown()` with no wrapper of their own, so a backend that
+  /// panics with such a payload reaches this exactly.
+  ///
+  /// The instrument is the WORKER'S OWN IDENTITY, and it has to be: the
+  /// worker-lifetime guard repairs the accounting on any abnormal exit and the next
+  /// submission's growth rule then hands the queue a fresh thread, so "the healthy
+  /// teardown behind it still ran" is satisfied by a reaper that lost its worker and
+  /// replaced it. What the containment is for is that the worker never dies at all —
+  /// so both teardowns must run on the SAME thread, which a replacement can never
+  /// satisfy (a `ThreadId` is never reused).
+  ///
+  /// FAIL-ON-REVERT: dispose of the payload by letting `catch_unwind`'s `Err` fall out of
+  /// scope (`let _unwound = ...`) instead of handing it to the contained disposal, and the
+  /// second teardown reports a different thread — the first worker unwound out of its loop
+  /// and only the guard's repair kept the reaper serving at all.
+  #[test]
+  fn a_teardown_payload_whose_drop_panics_leaves_the_worker_and_its_accounting_intact() {
+    let reaper = TeardownReaper::new().expect("the baseline thread starts");
+    let workers: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let seen = Arc::clone(&workers);
+    reaper.reap(move || {
+      seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(std::thread::current().id());
+      std::panic::panic_any(PanicsOnDrop)
+    });
+    assert!(
+      quiesce(&reaper, Duration::from_secs(10)),
+      "the payload-panicking teardown retired its own obligation"
+    );
+    // The payload's disposal is asynchronous to that retirement — `ClaimedTeardown`
+    // releases first — so give the worker real time to die if it is going to. Without
+    // this the submission below can be claimed by a thread that was merely slow to leave.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let seen = Arc::clone(&workers);
+    reaper.reap(move || {
+      seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(std::thread::current().id());
+    });
+    assert!(
+      quiesce(&reaper, Duration::from_secs(10)),
+      "the healthy teardown behind the payload-panicking one retired too"
+    );
+
+    let workers = workers.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(workers.len(), 2, "both teardowns ran: {workers:?}");
+    assert_eq!(
+      workers[0], workers[1],
+      "the payload's disposal took the worker with it — the second teardown ran on a \
+       replacement rather than on the worker that contained the first: {workers:?}"
+    );
+    assert_eq!(
+      reaper.lock().threads,
+      1,
+      "and the reaper still counts exactly the workers it has"
+    );
+  }
+
+  /// Whatever kills a worker, `threads` must stop counting it.
+  ///
+  /// The counter is read as EXACT by the growth rule (`threads - busy` is how many queued
+  /// teardowns already have a claimant), so one phantom worker suppresses the growth that
+  /// would give real queued work a thread, and enough of them leave the cap fully
+  /// "occupied" by workers that do not exist. The decrement therefore cannot live on the
+  /// normal-exit path, which is one of the ways a worker can end.
+  ///
+  /// The unwind is INJECTED because the worker's own boundaries make an escaping one
+  /// unreachable through the closures it runs — which is the point: the guard is a promise
+  /// about every abnormal exit, including ones no closure can currently produce.
+  ///
+  /// FAIL-ON-REVERT: put the `threads` decrement back on `reap_loop`'s exit predicate and
+  /// drop the `LiveReaper` guard — the count below never reaches zero, and the healthy
+  /// teardown after it is queued against a claimant that does not exist.
+  #[test]
+  fn a_worker_that_exits_abnormally_stops_being_counted() {
+    let reaper = TeardownReaper::new().expect("the baseline thread starts");
+    reaper
+      .inner
+      .unwind_after_claim
+      .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    reaper.reap(|| {});
+    assert!(
+      settled_state(&reaper, |state| state.threads == 0),
+      "the worker unwound while `threads` still counted it"
+    );
+
+    // And the repair is not cosmetic: with the count honest, the next submission's growth
+    // rule sees queued work with no claimant and creates one.
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let flag = Arc::clone(&ran);
+    reaper.reap(move || {
+      flag.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert!(
+      quiesce(&reaper, Duration::from_secs(10)),
+      "a teardown submitted after the abnormal exit found a claimant"
+    );
+    assert_eq!(
+      ran.load(std::sync::atomic::Ordering::SeqCst),
+      1,
+      "and it ran"
+    );
+  }
+
+  /// A worker that leaves abnormally may have been the only claimant of a NON-EMPTY queue,
+  /// and every queued closure owns a live `SourceHandle`. Nothing guarantees a further
+  /// submission whose growth rule would create the replacement, so the queue would sit
+  /// unclaimed until the last sink released `ReaperInner` — destroying the closure, and
+  /// performing the native handle's unbounded join on whatever thread that release happened
+  /// to run on. So the exiting worker re-runs the growth rule itself.
+  ///
+  /// The queue is loaded while thread creation is REFUSED, which is what makes a teardown
+  /// sit behind a busy worker with no thread of its own; creation is restored before the
+  /// exit, so what the cell reads is the guard's own replacement and not a growth the
+  /// submission already performed.
+  ///
+  /// FAIL-ON-REVERT: reduce `LiveReaper::drop` to the bare `threads` decrement — the queued
+  /// teardown below is never claimed and `settle` never reports quiescence.
+  #[test]
+  fn a_worker_leaving_a_non_empty_queue_replaces_its_own_claimant() {
+    let reaper = TeardownReaper::new().expect("the baseline thread starts");
+    reaper
+      .inner
+      .unwind_after_claim
+      .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    // Occupy the only worker so the next submission has to queue.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+    reaper.reap(move || {
+      let _ = entered_tx.send(());
+      let _ = held.recv();
+    });
+    entered
+      .recv_timeout(Duration::from_secs(10))
+      .expect("the worker claimed the blocking teardown");
+
+    // The OS gives this reaper nothing more, so the submission below cannot grow itself a
+    // thread and lands in the queue behind the busy worker.
+    reaper
+      .inner
+      .refuse_threads
+      .store(true, std::sync::atomic::Ordering::SeqCst);
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let flag = Arc::clone(&ran);
+    reaper.reap(move || {
+      flag.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert_eq!(
+      {
+        let state = reaper.lock();
+        (state.threads, state.queue.len())
+      },
+      (1, 1),
+      "the queued teardown is behind the one busy worker, with no thread of its own"
+    );
+    reaper
+      .inner
+      .refuse_threads
+      .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Releasing the blocking teardown lets the worker retire it and then unwind.
+    drop(release);
+
+    assert!(
+      quiesce(&reaper, Duration::from_secs(10)),
+      "the abnormal exit left its queued teardown a claimant"
+    );
+    assert_eq!(
+      ran.load(std::sync::atomic::Ordering::SeqCst),
+      1,
+      "and the replacement ran it"
+    );
+    assert_eq!(
+      reaper.lock().threads,
+      1,
+      "with the count naming exactly the replacement"
+    );
+  }
+
+  /// What a teardown closure carries, and where it was destroyed.
+  ///
+  /// `Drop` is the whole instrument: a closure the reaper RUNS consumes this and
+  /// reports the thread it ran on, while a closure nobody ever claims is dropped
+  /// with the queue holding it — and in the driver that drop is a native handle's
+  /// unbounded join, on whatever thread released the last sink.
+  struct ReapProbe {
+    ran_on: std::sync::mpsc::Sender<String>,
+    dropped_on: std::sync::mpsc::Sender<String>,
+  }
+
+  impl ReapProbe {
+    fn consume(self) {
+      let _ = self.ran_on.send(this_thread());
+      // The run is the terminal: `Drop` still fires, and reporting from it too
+      // would make a claimed closure indistinguishable from an abandoned one.
+      std::mem::forget(self);
+    }
+  }
+
+  impl Drop for ReapProbe {
+    fn drop(&mut self) {
+      let _ = self.dropped_on.send(this_thread());
+    }
+  }
+
+  fn this_thread() -> String {
+    std::thread::current()
+      .name()
+      .unwrap_or("<unnamed>")
+      .to_owned()
+  }
+
+  /// A sink outlives the driver's reaper by design — a detached spawn job carries
+  /// one so a stream it cannot deliver still reaches a reaper thread instead of
+  /// being joined on the shared blocking pool. So the reaper must still HAVE a
+  /// thread when that late submission lands.
+  ///
+  /// It used to let its threads exit the moment the driver's `TeardownReaper`
+  /// dropped, leaving the late submission to create one — and when creation
+  /// failed the closure stayed queued with no claimant, until the last sink
+  /// dropped `ReaperInner` and with it the closure and the native handle inside
+  /// it. That drop performs the same unbounded join, on the pool worker releasing
+  /// the sink: the exact executor the reaper exists to keep it off.
+  ///
+  /// FAIL-ON-REVERT: exit on `owner_gone` alone (drop the `producers` term from
+  /// `reap_loop`'s exit predicate) and the baseline thread is gone before the
+  /// submission arrives; the refused growth strands it, and the closure is never
+  /// run at all — it is destroyed when the last sink releases `ReaperInner`.
+  #[test]
+  fn a_sink_outliving_its_reaper_still_has_a_thread_to_hand_a_stream_to() {
+    let reaper = TeardownReaper::new().expect("the baseline thread starts");
+    let sink = reaper.sink();
+    // The driver's loop is over; only the detached job's sink remains.
+    drop(reaper);
+    // REAL time for a thread to observe that and act on it. Without this wait the
+    // submission below races the exit and can be claimed by a thread that was
+    // merely slow to leave — which is how a rule that lets the last thread go
+    // still passes. What follows therefore tests the state each rule settles on.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while sink.reaper_threads() > 0 && std::time::Instant::now() < deadline {
+      std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+      sink.reaper_threads() > 0,
+      "the reaper let its last thread go while a producer could still submit — the \
+       next handoff has to CREATE its own claimant"
+    );
+
+    // And the OS will give this reaper nothing further — the failure mode the
+    // old exit rule made load-bearing.
+    sink.refuse_further_threads();
+
+    let (ran_on, on_run) = std::sync::mpsc::channel();
+    let (dropped_on, on_drop) = std::sync::mpsc::channel();
+    let probe = ReapProbe { ran_on, dropped_on };
+    sink.reap(move || probe.consume());
+
+    let ran = on_run.recv_timeout(Duration::from_secs(10));
+    assert!(
+      ran
+        .as_deref()
+        .is_ok_and(|on| on.starts_with("tributary-teardown")),
+      "the late handoff ran on {ran:?}, not on a reaper thread"
+    );
+
+    // Releasing the last producer is what finally lets the thread go, and it
+    // finds nothing left to destroy.
+    drop(sink);
+    assert!(
+      on_drop.recv_timeout(Duration::from_millis(200)).is_err(),
+      "the closure — and the native handle a real one carries — was destroyed \
+       rather than run"
+    );
+  }
 }
 
 mod descending {
@@ -1988,6 +2354,7 @@ mod descending {
           LANE,
           vec![ControlRequest::Arm {
             watch,
+            attempt: None,
             parent: watch,
             name: Segment::new("r"),
             path: Arc::new(PathBuf::from(path)),
@@ -5845,6 +6212,70 @@ mod descending {
         "and it is still the same live stream that did it"
       );
     }
+
+    /// An awaited `set_cover` is retained twice over — one reply sender in the
+    /// driver and one pending fence record in the core — until its coverage window
+    /// settles. Re-issuing an already-applied cover is a real reconcile, so a
+    /// caller can open fences against a scope whose control round trip is stalled
+    /// as fast as the driver drains its mailbox.
+    ///
+    /// FAIL-ON-REVERT: remove the `pending_cover_fences(..) >= MAX_PARKED_SETTLEMENTS`
+    /// arm from `Command::SetCover` and every reissue opens another fence — the
+    /// core's pending count grows with total admitted calls and nothing is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn awaited_set_covers_stop_at_the_parked_bound() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+
+      // Stall the scope's control round trip: no coverage window can settle.
+      let _stalled = rig.fs.hold_arms();
+
+      let mut waiters = Vec::new();
+      let mut refused = 0usize;
+      for _ in 0..(MAX_PARKED_SETTLEMENTS * 4) {
+        let (reply, on_reply) = futures_channel::oneshot::channel();
+        rig
+          .commands
+          .send(Command::SetCover {
+            scope,
+            retained: vec![PathBuf::from("/r/keep")],
+            reply: Some(reply),
+          })
+          .await
+          .unwrap();
+        waiters.push(on_reply);
+        tokio::task::yield_now().await;
+      }
+      tokio::time::sleep(Duration::from_millis(100)).await;
+
+      for waiter in &mut waiters {
+        if let core::task::Poll::Ready(Ok(outcome)) = futures_util::poll!(waiter) {
+          assert!(
+            matches!(
+              outcome,
+              crate::CoverOutcome::Skipped(crate::SkipReason::Backlogged)
+            ),
+            "the only resolved reconciles are the refused ones: {outcome:?}"
+          );
+          refused += 1;
+        }
+      }
+      assert!(
+        refused > 0,
+        "admission stops at the bound while the scope cannot settle"
+      );
+
+      let (q, on_q) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugPendingCoverFences { scope, reply: q })
+        .await
+        .unwrap();
+      let pending = on_q.await.unwrap();
+      assert!(
+        pending <= MAX_PARKED_SETTLEMENTS,
+        "the core retains at most the parked bound of fence records: {pending}"
+      );
+    }
   }
 
   /// The descending replace end to end: the new root pre-arms on the NEW
@@ -7099,7 +7530,7 @@ mod descending {
         })
         .await
         .unwrap();
-      assert!(on_reply.await.unwrap());
+      assert!(on_reply.await.unwrap().is_torn());
       settle(|| rig.fs.shutdowns() == 1).await;
       assert_eq!(rig.fs.spawns(), 1);
     }
@@ -7255,7 +7686,7 @@ mod descending {
         "death wins over the in-flight widen"
       );
       assert!(
-        on_unwatch.await.unwrap(),
+        on_unwatch.await.unwrap().is_torn(),
         "the unwatch resolves at quiescence"
       );
       assert_eq!(rig.fs.spawns(), 1);
@@ -7284,7 +7715,7 @@ mod descending {
         })
         .await
         .unwrap();
-      assert!(on_reply.await.unwrap());
+      assert!(on_reply.await.unwrap().is_torn());
       settle(|| rig.fs.shutdowns() == 1).await;
       assert_eq!(rig.fs.spawns(), 1);
     }
@@ -7729,7 +8160,11 @@ mod descending {
             None => panic!("the descending root arms"),
           }
         };
-        core.on_watch_installed(root_watch, WatchOutcome::Installed(1));
+        core.on_watch_installed(
+          root_watch,
+          core.arm_attempt(root_watch),
+          WatchOutcome::Installed(1),
+        );
         while core.poll_effect().is_some() {}
         (core, scope)
       }
@@ -8214,7 +8649,11 @@ mod descending {
             None => panic!("the descending root arms"),
           }
         };
-        core.on_watch_installed(root_watch, WatchOutcome::Installed(1));
+        core.on_watch_installed(
+          root_watch,
+          core.arm_attempt(root_watch),
+          WatchOutcome::Installed(1),
+        );
         while core.poll_effect().is_some() {}
         (core, scope, root_watch)
       }
@@ -8371,7 +8810,11 @@ mod descending {
             None => panic!("the descending root arms"),
           }
         };
-        core.on_watch_installed(root_watch, WatchOutcome::Installed(1));
+        core.on_watch_installed(
+          root_watch,
+          core.arm_attempt(root_watch),
+          WatchOutcome::Installed(1),
+        );
         while core.poll_effect().is_some() {}
         (scope, root_watch)
       }
@@ -8404,7 +8847,11 @@ mod descending {
           None => panic!("the created child arms"),
         }
       };
-      core.on_watch_installed(dead_child, WatchOutcome::Installed(2));
+      core.on_watch_installed(
+        dead_child,
+        core.arm_attempt(dead_child),
+        WatchOutcome::Installed(2),
+      );
       while core.poll_effect().is_some() {}
       // The scope that stays live through the drain: root armed, ready to arm a
       // child (its own control op) with no death.
@@ -8462,7 +8909,10 @@ mod descending {
       let mut source_taps: BTreeMap<ScopeId, EventReceiver> = BTreeMap::new();
       let mut unwatch_replies: BTreeMap<
         ScopeId,
-        Vec<(futures_channel::oneshot::Sender<bool>, bool)>,
+        Vec<(
+          futures_channel::oneshot::Sender<crate::driver::UnwatchAck>,
+          crate::driver::UnwatchAck,
+        )>,
       > = BTreeMap::new();
       let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
       let mut pending_control: crate::driver::PendingControl = BTreeMap::new();
@@ -9524,7 +9974,10 @@ mod replace {
       })
       .await
       .unwrap();
-    assert!(on_reply.await.unwrap(), "the swapped scope is unwatchable");
+    assert!(
+      on_reply.await.unwrap().is_torn(),
+      "the swapped scope is unwatchable"
+    );
     settle(|| rig.fs.shutdowns() == 2).await;
     assert_eq!(rig.fs.shutdowns(), 2);
   }
@@ -9706,7 +10159,7 @@ mod replace {
     // down inside the counted accounting; the unwatch resolves only now, at
     // full scope quiescence.
     assert!(
-      on_unwatch.await.unwrap(),
+      on_unwatch.await.unwrap().is_torn(),
       "the unwatch resolves once the scope is quiescent"
     );
     settle(|| rig.fs.shutdowns() == 2).await;
@@ -9792,7 +10245,7 @@ mod replace {
     );
 
     gate2.release();
-    assert!(on_reply.await.unwrap(), "resolved at quiescence");
+    assert!(on_reply.await.unwrap().is_torn(), "resolved at quiescence");
     settle(|| rig.fs.shutdowns() == 2).await;
   }
 
@@ -9938,7 +10391,7 @@ mod replace {
       Err(crate::error::ReplaceRootError::Retired)
     ));
     assert!(
-      !on_unwatch.await.unwrap(),
+      on_unwatch.await.unwrap().is_unknown(),
       "the dead scope resolves UnknownRoot, only at quiescence"
     );
     settle(|| rig.fs.shutdowns() == 2).await;
@@ -9998,13 +10451,15 @@ mod replace {
     assert!(
       on1
         .await
-        .expect("the first waiter is answered, never Closed"),
+        .expect("the first waiter is answered, never Closed")
+        .is_torn(),
       "the first unwatch tore the scope down"
     );
     assert!(
-      !on2
+      on2
         .await
-        .expect("the second waiter is answered, never Closed"),
+        .expect("the second waiter is answered, never Closed")
+        .is_unknown(),
       "the duplicate resolves UnknownRoot"
     );
     settle(|| rig.fs.shutdowns() == 1).await;
@@ -10068,8 +10523,11 @@ mod replace {
     // The genuinely-awaited waiter still resolves with its verdict.
     gate.release();
     assert!(
-      on_survivor.await.expect("the survivor is answered"),
-      "the live waiter resolves true at quiescence"
+      on_survivor
+        .await
+        .expect("the survivor is answered")
+        .is_torn(),
+      "the live waiter resolves Torn at quiescence"
     );
     settle(|| rig.fs.shutdowns() == 1).await;
   }
@@ -10138,7 +10596,8 @@ mod replace {
     assert!(
       on_unwatch
         .await
-        .expect("the waiter is answered, not dropped as Closed"),
+        .expect("the waiter is answered, not dropped as Closed")
+        .is_torn(),
       "the unwatch resolves its recorded verdict"
     );
     // The abandoned replace caller is resolved (its reservation and reply
@@ -10159,7 +10618,7 @@ mod replace {
     let rig = rig_with_capacity(64);
     rig.fs.put("/r/sub", FileKind::Dir, 2);
     // The live stream mints a journal point, as FSEvents does.
-    let token = crate::os::ResumeToken::new(4242, Some([7u8; 16]));
+    let token = crate::os::ResumeToken::fsevents(4242, Some([7u8; 16]));
     rig.fs.mint_resume_token(token);
 
     let scope = watch(&rig, "/r/sub").await;
@@ -10196,7 +10655,10 @@ mod replace {
         })
         .await
         .unwrap();
-      assert!(on_reply.await.unwrap(), "each cycle tears down cleanly");
+      assert!(
+        on_reply.await.unwrap().is_torn(),
+        "each cycle tears down cleanly"
+      );
     }
     let (reply, on_reply) = futures_channel::oneshot::channel();
     rig
@@ -10620,7 +11082,10 @@ mod sync_cookie {
       })
       .await
       .unwrap();
-    assert!(on_reply.await.unwrap(), "the live scope was unwatched");
+    assert!(
+      on_reply.await.unwrap().is_torn(),
+      "the live scope was unwatched"
+    );
 
     settle(|| !rig.fs.cookie_removes().is_empty()).await;
     assert_eq!(
@@ -10743,7 +11208,10 @@ mod sync_cookie {
       })
       .await
       .unwrap();
-    assert!(on_unwatch.await.unwrap(), "the live scope was unwatched");
+    assert!(
+      on_unwatch.await.unwrap().is_torn(),
+      "the live scope was unwatched"
+    );
     assert!(
       rig.fs.cookie_writes().is_empty(),
       "the retirement got there first — the sweep found nothing to unlink"
@@ -11002,6 +11470,77 @@ mod sync_cookie {
       "the write was refused before it could reach the pool"
     );
     assert_eq!(cookie_count(&rig).await, 0);
+  }
+
+  /// Containment is not observability. A cookie directory inside the root but
+  /// under an EXCLUSION would take the write and then have its event suppressed
+  /// by the very option that asked for the suppression, leaving the caller
+  /// parked on an event that cannot exist. Refused before birth — and only for
+  /// the excluded subtree, so the rest of the root still syncs.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cookie_dir_under_an_exclusion_is_refused() {
+    let rig = rig_with_config(
+      64,
+      DriverConfig {
+        exclusions: vec![PathBuf::from("/r/cache")],
+        ..config()
+      },
+    );
+    let scope = watch(&rig, "/r").await;
+
+    // The exclusion itself, a directory below it, and a spelling that only folds
+    // into it — the same lexical discipline containment already uses.
+    for dir in ["/r/cache", "/r/cache/deep", "/r/./cache"] {
+      match sync_root(&rig, scope, dir, ".tributaries-sync-1-9-1").await {
+        Err(crate::error::SyncRootError::DirExcluded { exclusion, .. }) => {
+          assert_eq!(exclusion, PathBuf::from("/r/cache"));
+        }
+        other => panic!("{dir} is excluded, so no barrier there is observable: {other:?}"),
+      }
+    }
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      0,
+      "the write was refused before it could reach the pool"
+    );
+    assert_eq!(cookie_count(&rig).await, 0);
+
+    // The refusal belongs to the exclusion, not to exclusions being configured:
+    // a covered directory outside every exclusion still places its barrier.
+    sync_root(&rig, scope, "/r", ".tributaries-sync-1-9-2")
+      .await
+      .expect("a directory outside every exclusion still syncs");
+    assert_eq!(rig.fs.cookie_dispatches(), 1);
+  }
+
+  /// A directory that merely shares a NAME PREFIX with an exclusion is not
+  /// inside it — the match is on components, so `/r/cached` survives `/r/cache`.
+  #[test]
+  fn an_exclusion_covers_a_subtree_not_a_name_prefix() {
+    let exclusions = vec![PathBuf::from("/r/cache"), PathBuf::from("relative/skip")];
+    let covered = |dir: &str| cookie_dir_excluded(&exclusions, Path::new(dir));
+
+    assert_eq!(covered("/r/cache"), Some(Path::new("/r/cache")));
+    assert_eq!(covered("/r/cache/deep/er"), Some(Path::new("/r/cache")));
+    assert_eq!(covered("/r/./cache"), Some(Path::new("/r/cache")));
+    assert_eq!(
+      covered("/r/cached"),
+      None,
+      "a name prefix is not a subtree — `/r/cached` is not under `/r/cache`"
+    );
+    assert_eq!(covered("/r/other"), None);
+    assert_eq!(covered("/r"), None, "the root itself is not excluded");
+    assert_eq!(
+      cookie_dir_excluded(&[], Path::new("/r/cache")),
+      None,
+      "no exclusions, nothing excluded"
+    );
+    assert_eq!(
+      covered("/relative/skip"),
+      None,
+      "a relative exclusion matches no absolute event path, so it suppresses \
+       nothing and refuses nothing"
+    );
   }
 
   // O_NOFOLLOW on the create: a symlink swapped in where the cookie is to land
@@ -12411,7 +12950,10 @@ mod sync_cookie {
       })
       .await
       .unwrap();
-    assert!(on_unwatch.await.unwrap(), "the live scope was unwatched");
+    assert!(
+      on_unwatch.await.unwrap().is_torn(),
+      "the live scope was unwatched"
+    );
 
     // The refused self-reap's unlink FAILS once: the file must be OWNED as failed, not orphaned.
     // Hold every remove so the self-reap's dispatch is captured in flight, deterministically,
@@ -12483,7 +13025,7 @@ mod sync_cookie {
     let worker = {
       let fs = fs.clone();
       std::thread::spawn(move || {
-        fs.remove_cookie(Path::new("/x"))
+        fs.remove_cookie(&fs.cookie_at("/x"))
           .expect("the unlink succeeds");
       })
     };
@@ -13422,7 +13964,9 @@ mod sync_cookie {
     // Predecessor: admit, land its file at P, claim it Owned.
     let guard_pred = dispatched_guard(&mut reg, &mut core, scope_pred, name);
     fs.put(&path, FileKind::File, 1);
-    let id_pred = guard_pred.claim(&path).expect("the predecessor claims P");
+    let id_pred = guard_pred
+      .claim(&fs.cookie_at(&path))
+      .expect("the predecessor claims P");
 
     // Reap it, but HOLD the pool job at the preemption window: the unlink syscall
     // has run (the file is gone) but the job has not yet taken the ledger lock to
@@ -13440,7 +13984,9 @@ mod sync_cookie {
     // are tracked at once — the ledger count is pessimistic-honest.
     let guard_succ = dispatched_guard(&mut reg, &mut core, scope_succ, name);
     fs.put(&path, FileKind::File, 2);
-    let id_succ = guard_succ.claim(&path).expect("the successor reclaims P");
+    let id_succ = guard_succ
+      .claim(&fs.cookie_at(&path))
+      .expect("the successor reclaims P");
     assert_ne!(
       id_pred, id_succ,
       "predecessor and successor are distinct incarnations"
@@ -13525,7 +14071,9 @@ mod sync_cookie {
     // the live one now.
     let guard_b = dispatched_guard(&mut reg, &mut core, scope_b, name);
     fs.put(&path, FileKind::File, 2);
-    let id_b = guard_b.claim(&path).expect("B claims the live file");
+    let id_b = guard_b
+      .claim(&fs.cookie_at(&path))
+      .expect("B claims the live file");
     {
       let inner = lock_ledger(&reg.ledger);
       // Both writes are tracked from their dispatch; only B has claimed a path.
@@ -13545,7 +14093,9 @@ mod sync_cookie {
     }
 
     // A's delayed claim finally fires.
-    let id_a = guard_a.claim(&path).expect("A's late claim is admitted");
+    let id_a = guard_a
+      .claim(&fs.cookie_at(&path))
+      .expect("A's late claim is admitted");
     assert_ne!(id_a, id_b, "A and B are distinct incarnations");
     {
       let inner = lock_ledger(&reg.ledger);
@@ -13602,7 +14152,7 @@ mod sync_cookie {
     // the file is gone) but its confirm has not yet landed.
     let guard_n = dispatched_guard(&mut reg, &mut core, scope_n, name);
     fs.put(&path, FileKind::File, 1);
-    let id_n = guard_n.claim(&path).expect("N claims P");
+    let id_n = guard_n.claim(&fs.cookie_at(&path)).expect("N claims P");
     {
       let mut inner = lock_ledger(&reg.ledger);
       inner
@@ -13616,7 +14166,7 @@ mod sync_cookie {
     // Incarnation M reclaims the same path and owns the live file.
     let guard_m = dispatched_guard(&mut reg, &mut core, scope_m, name);
     fs.put(&path, FileKind::File, 2);
-    let id_m = guard_m.claim(&path).expect("M reclaims P");
+    let id_m = guard_m.claim(&fs.cookie_at(&path)).expect("M reclaims P");
 
     // N's stale confirm lands: retire N. Keyed by id, it removes only N.
     lock_ledger(&reg.ledger).retire(id_n, Reaped::ConfirmedGone);
@@ -13667,11 +14217,11 @@ mod sync_cookie {
 
     // A real claim inserts record M (Owned) at P.
     let guard = dispatched_guard(&mut reg, &mut core, scope, name);
-    let m = guard.claim(&path).expect("the claim lands");
+    let m = guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
     let stale = CookieId(m.0 + 999);
 
     // Case A: record M present, self-reap with a STALE id — no unlink, untouched.
-    self_reap(&fs, &guard, path.clone(), Some(stale));
+    self_reap(&fs, &guard, fs.cookie_at(&path), Some(stale));
     assert_eq!(
       fs.cookie_remove_dispatches(),
       0,
@@ -13681,7 +14231,8 @@ mod sync_cookie {
       lock_ledger(&reg.ledger)
         .obligations
         .get(&m)
-        .is_some_and(|ob| matches!(ob.phase, Phase::Owned) && ob.path.as_deref() == Some(&*path)),
+        .is_some_and(|ob| matches!(ob.phase, Phase::Owned)
+          && ob.file.as_ref().map(CookieFile::path) == Some(&*path)),
       "the live record M is untouched"
     );
 
@@ -13693,7 +14244,7 @@ mod sync_cookie {
       inner.by_path.clear();
       inner.by_name.clear();
     }
-    self_reap(&fs, &guard, path.clone(), Some(stale));
+    self_reap(&fs, &guard, fs.cookie_at(&path), Some(stale));
     assert_eq!(
       fs.cookie_remove_dispatches(),
       0,
@@ -13731,7 +14282,7 @@ mod sync_cookie {
           name: name.to_owned(),
           ticket: m.0,
           id: m,
-          path: Some(path.clone()),
+          file: Some(fs.cookie_at(&path)),
           reap_requested: false,
           last_failure_seq: 5,
           phase: Phase::RemoveFailed {
@@ -13803,7 +14354,7 @@ mod sync_cookie {
           name: "n".to_owned(),
           ticket: m.0,
           id: m,
-          path: Some(path.clone()),
+          file: Some(fs.cookie_at(&path)),
           reap_requested: false,
           last_failure_seq: 1,
           phase: Phase::RemoveFailed {
@@ -13875,7 +14426,7 @@ mod sync_cookie {
           name: "n2".to_owned(),
           ticket: f.0,
           id: f,
-          path: Some(fresh.clone()),
+          file: Some(fs.cookie_at(&fresh)),
           reap_requested: false,
           last_failure_seq: 0,
           phase: Phase::Owned,
@@ -13951,7 +14502,7 @@ mod sync_cookie {
           name: name.to_owned(),
           ticket: id.0,
           id,
-          path: Some(path.to_path_buf()),
+          file: Some(CookieFile::new(path.to_path_buf(), RootIdentity::new(1, 0))),
           reap_requested: false,
           last_failure_seq: 0,
           phase: Phase::Owned,
@@ -14436,7 +14987,7 @@ mod sync_cookie {
 
     // The CLAIM opens the gate — before this write's completion message is sent, which is the
     // whole of the widening.
-    let id = guard.claim(&path).expect("the claim lands");
+    let id = guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
     assert!(
       !reg.has_pending_write(scope),
       "the gate opens at the claim, not at the completion tail"
@@ -14588,6 +15139,54 @@ mod sync_cookie {
     );
   }
 
+  // A write that FAILED but left a file behind is not a write that created nothing. The
+  // obligation stays counted, keeps owning the file, and never earns the pre-physical
+  // `NeverCreated` terminal — because that terminal is what would take the file out of the
+  // 128-record cap while it is still on disk, letting repeated attempts fill the tree with
+  // artifacts nothing tracks and nothing ever reaps.
+  //
+  // Removes are failed for the whole cell so the residue's own reap cannot converge: what is
+  // left standing at the end is exactly the state the accounting has to survive.
+  //
+  // Fail-on-old (a discarded residue, `NeverCreated` retired anyway): `never_created` is 1,
+  // `live` is 0, and the file is still there — uncounted.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_write_that_stranded_a_file_stays_counted() {
+    let rig = rig_with_config(64, tuned_config());
+    let scope = watch(&rig, "/r").await;
+    rig.fs.fail_next_cookie_removes(usize::MAX);
+    rig.fs.strand_cookie_writes(std::io::ErrorKind::Unsupported);
+
+    let denied = sync_root(&rig, scope, "/r", ".tributaries-sync-stranded").await;
+    // The retry the failing reap schedules keeps re-entering the pool; settle on the
+    // ledger rather than on quiescence, which this cell deliberately never reaches.
+    let (census, live) = cookie_census(&rig).await;
+    let files = rig.fs.files_under("/r");
+
+    assert!(
+      matches!(denied, Err(crate::error::SyncRootError::Write { .. })),
+      "the caller is told the write failed: it has no cookie and no barrier"
+    );
+    assert_eq!(
+      census.never_created, 0,
+      "a write that left a file on disk never earns the pre-physical terminal"
+    );
+    assert_eq!(
+      (census.births, live),
+      (1, 1),
+      "its obligation is still counted, so the file it stranded still counts against the cap"
+    );
+    assert!(
+      census.balances(live),
+      "births = terminals + live across a stranded write"
+    );
+    assert_eq!(
+      files.len(),
+      1,
+      "and the file is exactly what the live obligation is still accounting for"
+    );
+  }
+
   // The abnormal-path backstop's terminal is typed and counted too: a `Drop` with no orderly
   // close takes every remaining record as an AbnormalResidual, so even the path that exists
   // BECAUSE the driver died accounts for what it swept. Read through a ledger handle cloned
@@ -14604,7 +15203,9 @@ mod sync_cookie {
     let claimed = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-abnormal-1");
     let path = PathBuf::from("/r/.tributaries-sync-abnormal-1");
     fs.put(&path, FileKind::File, 1);
-    claimed.claim(&path).expect("the claim lands");
+    claimed
+      .claim(&fs.cookie_at(&path))
+      .expect("the claim lands");
     let _in_pool = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-abnormal-2");
     assert_eq!(reg.unremoved(), 2, "both obligations are counted");
 
@@ -14750,7 +15351,7 @@ mod sync_cookie {
       let path = PathBuf::from("/r").join(name);
       fs.put(&path, FileKind::File, 1);
       assert!(
-        guard.claim(&path).is_none(),
+        guard.claim(&fs.cookie_at(&path)).is_none(),
         "the claim refuses on the mark"
       );
       (guard, path)
@@ -14764,7 +15365,7 @@ mod sync_cookie {
       let id = guard.id;
       let path = PathBuf::from("/r").join(name);
       fs.put(&path, FileKind::File, 1);
-      guard.claim(&path).expect("the claim lands");
+      guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
       cleanup.request_remove(&path);
       reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
       assert_eq!(
@@ -14837,7 +15438,7 @@ mod sync_cookie {
     // The in-pool write's refused claim still reaps the file it created: exactly one of the three
     // outcomes fired per record, and nothing leaked.
     let (guard, path) = in_pool;
-    self_reap(&fs, &guard, path, None);
+    self_reap(&fs, &guard, fs.cookie_at(&path), None);
     settle(|| fs.files_under("/r").len() <= 1).await;
   }
 
@@ -14866,7 +15467,7 @@ mod sync_cookie {
       let guard = dispatched_guard(&mut reg, &mut core, scope, name);
       let path = PathBuf::from("/r").join(name);
       fs.put(&path, FileKind::File, 1);
-      guard.claim(&path).expect("the claim lands");
+      guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
       path
     };
     let first = owned(".tributaries-sync-wake-1");
@@ -15027,7 +15628,7 @@ mod sync_cookie {
     );
     let path = PathBuf::from("/r/.tributaries-sync-dead-1");
     fs.put(&path, FileKind::File, 1);
-    guard.claim(&path).expect("the claim lands");
+    guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
     assert_eq!(reg.unremoved(), 1, "the obligation is counted");
 
     // The driver dies abnormally: its registry and its half of the wake drop together, exactly as
@@ -15055,6 +15656,692 @@ mod sync_cookie {
       0,
       "a closed wake swallows the token: the driver that would have read it is gone"
     );
+  }
+
+  /// A cookie removal destroys the OBJECT the write created, never merely the
+  /// name it created it under — and it reaches that object through the directory
+  /// descriptor the create used, never by resolving a path a second time.
+  ///
+  /// Real files, real inodes, the real `FsOps`: the defects are a `remove_file`
+  /// addressed by pathname and a directory nobody owns, and no fake tree can
+  /// witness what a kernel does with a name whose object was swapped underneath
+  /// it — only the syscalls themselves can.
+  #[cfg(all(unix, not(miri)))]
+  mod identity {
+    use super::*;
+
+    /// A unique real directory for one cell, canonicalized so the production
+    /// beneath-check compares two paths resolved by the same resolver (the
+    /// system temp dir is itself a symlink on some hosts).
+    fn scratch(tag: &str) -> PathBuf {
+      use std::sync::atomic::{AtomicU32, Ordering};
+      static COUNTER: AtomicU32 = AtomicU32::new(0);
+      let dir = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonicalize temp dir")
+        .join(format!(
+          "tributary-fs-cookie-{}-{}-{}",
+          tag,
+          std::process::id(),
+          COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+      std::fs::create_dir_all(&dir).expect("create scratch dir");
+      dir
+    }
+
+    /// The replacement's contents, so the survivor is proven by what it HOLDS and
+    /// not merely by something existing at the name.
+    const STRANGER: &[u8] = b"a file the watcher never created";
+
+    /// The destructive case, as a peer running under the SAME user — the one
+    /// actor the directory's mode cannot exclude, and therefore the only one the
+    /// identity comparison still has to answer. It takes the cookie's name and
+    /// leaves its own file there; the removal must destroy nothing.
+    ///
+    /// Fail-on-old (an unlink addressed by name alone): the stranger's file is
+    /// deleted, and no error is reported anywhere, because from the caller's side
+    /// the removal succeeded exactly as it was asked to.
+    #[test]
+    fn a_reclaimed_cookie_name_is_never_unlinked() {
+      let root = scratch("displaced");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-displaced")
+        .expect("a cookie is created in a writable scratch root");
+
+      // Delete and recreate rather than truncate-and-rewrite: a fresh create is
+      // what mints a fresh inode, and a distinct inode under an identical
+      // pathname is precisely the difference the removal has to notice.
+      std::fs::remove_file(cookie.path()).expect("the cookie is removed by the stranger");
+      std::fs::write(cookie.path(), STRANGER).expect("the stranger takes the freed name");
+
+      let verdict = fs
+        .remove_cookie(&cookie)
+        .expect("a displaced name is a settled verdict, not a failure to retry");
+      let survivor = std::fs::read(cookie.path());
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert_eq!(
+        survivor.as_deref().ok(),
+        Some(STRANGER),
+        "the stranger's file must still be on disk: this removal had no proof it was the cookie"
+      );
+      assert_eq!(
+        verdict,
+        CookieRemoval::Displaced,
+        "the name is settled as displaced, so the obligation retires instead of retrying forever"
+      );
+    }
+
+    /// The ordinary path, which the refusal above must not have cost: an
+    /// untouched cookie is still unlinked, and reported as such. It also states
+    /// WHERE the cookie went — inside the private directory, inside the caller's
+    /// directory, inside the root — because the barrier only works while the
+    /// cookie's event rides the watched root's queue.
+    #[test]
+    fn an_untouched_cookie_is_unlinked() {
+      let root = scratch("unlinked");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-plain")
+        .expect("a cookie is created in a writable scratch root");
+      assert_eq!(
+        identity_of_handle(&std::fs::File::open(cookie.path()).expect("the cookie is readable"))
+          .expect("an identity reads off the open cookie"),
+        cookie.identity(),
+        "staging: the name denotes the created object, so the removal below proves something"
+      );
+      let holder = cookie
+        .path()
+        .parent()
+        .expect("the cookie has a containing directory");
+      assert!(
+        holder.starts_with(&root)
+          && holder
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .is_some_and(|leaf| leaf.starts_with(COOKIE_DIR_PREFIX)),
+        "the cookie lands in the driver's own directory, and that directory is inside \
+         the watched root — outside it, no event of the cookie could ever reach the stream"
+      );
+
+      let verdict = fs
+        .remove_cookie(&cookie)
+        .expect("an untouched cookie unlinks");
+      let present = cookie.path().exists();
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(!present, "the cookie this write created is gone from disk");
+      assert_eq!(
+        verdict,
+        CookieRemoval::Unlinked,
+        "the name still denoted the created object, so the unlink is the reported verdict"
+      );
+    }
+
+    /// Idempotence, unchanged by the proof: a cookie already reaped by someone
+    /// else is success, and the removal does not even reach the identity
+    /// comparison it has nothing to compare against.
+    #[test]
+    fn an_already_gone_cookie_is_success() {
+      let root = scratch("gone");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-gone")
+        .expect("a cookie is created in a writable scratch root");
+      std::fs::remove_file(cookie.path()).expect("someone else reaps it first");
+
+      let verdict = fs.remove_cookie(&cookie);
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert_eq!(
+        verdict.expect("an already-gone cookie is not a failure"),
+        CookieRemoval::AlreadyGone,
+        "the ledger record retires: nothing a later sweep could do would find this file"
+      );
+    }
+
+    /// The identity a create captures is an ALLOCATOR SLOT, not a name: once the
+    /// object holding it is freed the filesystem may hand the very same number to
+    /// an unrelated successor, and a removal comparing numbers alone would then
+    /// find its own identity standing on a stranger's file and delete it.
+    ///
+    /// What forecloses that is the descriptor the create keeps open for the life
+    /// of the obligation: an object with a live reference cannot have its slot
+    /// reissued, so every successor at the name necessarily reads back something
+    /// different and the comparison refuses.
+    ///
+    /// Fail-on-old (identity captured, descriptor dropped): after enough churn a
+    /// successor is handed the retired number, compares EQUAL, and is unlinked.
+    #[test]
+    fn a_recycled_identifier_never_authorizes_an_unlink() {
+      /// Create/delete cycles each half of the cell is allowed. Generous enough
+      /// that an allocator which reissues its most recently freed slot — the
+      /// common case — does so well inside it, small enough to stay instant.
+      const CHURN: usize = 256;
+
+      /// One create-then-read of `path`, leaving the file in place.
+      fn mint(path: &Path) -> RootIdentity {
+        let file = std::fs::OpenOptions::new()
+          .write(true)
+          .create_new(true)
+          .open(path)
+          .expect("the scratch name is free");
+        identity_of_handle(&file)
+          .expect("an identity reads off a freshly created file")
+          .expect("this filesystem answers identities")
+      }
+
+      let root = scratch("reuse");
+      let fs = RealFs::new();
+
+      // The CONTROL, run first and with nothing held open: the same delete-then-
+      // recreate cycle the cookie faces, but free to reuse. Its answer is what
+      // says how much the pinned half below proves on THIS filesystem — an
+      // allocator that mints monotonically (APFS) never reissues and would make
+      // the cookie safe by accident, while one that reuses the freed slot at once
+      // (ext4) leaves the held descriptor as the only thing standing between the
+      // removal and a stranger's file.
+      let control = root.join("control");
+      let freed = mint(&control);
+      std::fs::remove_file(&control).expect("the control's object is freed");
+      let mut reissues = false;
+      for _ in 0..CHURN {
+        let seen = mint(&control);
+        std::fs::remove_file(&control).expect("the control cycles");
+        if seen == freed {
+          reissues = true;
+          break;
+        }
+      }
+
+      // The cookie: created through the production write, so its descriptor is
+      // pinned by the `CookieFile` this cell holds for the whole cycle below.
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-reuse")
+        .expect("a cookie is created in a writable scratch root");
+      std::fs::remove_file(cookie.path()).expect("the stranger deletes the cookie");
+
+      // The property everything else rests on, and the only one observable on an
+      // allocator that never reissues: the object OUTLIVES the loss of its name,
+      // because this descriptor still references it. An allocator cannot hand a
+      // referenced object's slot to anyone, so the churn below is guaranteed to
+      // miss — the assertion after it states a consequence, this states the cause.
+      let held = cookie
+        .pinned_handle()
+        .expect("the create's descriptor is retained for the life of the cookie");
+      assert_eq!(
+        identity_of_handle(held).expect("the retained descriptor still answers"),
+        cookie.identity(),
+        "the created object is still alive and still itself after its name was destroyed"
+      );
+
+      // Churn the cookie's OWN name, which is where a reissued slot would do its
+      // damage: every occupant must read back as something other than the cookie.
+      let mut collided = false;
+      for _ in 0..CHURN {
+        let seen = mint(cookie.path());
+        std::fs::remove_file(cookie.path()).expect("the churn cycles");
+        if Some(seen) == cookie.identity() {
+          collided = true;
+          break;
+        }
+      }
+
+      // Leave a stranger standing at the name and ask for the removal, so the
+      // refusal is proven on the file that survives rather than on numbers alone.
+      std::fs::write(cookie.path(), STRANGER).expect("the stranger takes the name");
+      let verdict = fs
+        .remove_cookie(&cookie)
+        .expect("a displaced name is a settled verdict, not a failure to retry");
+      let survivor = std::fs::read(cookie.path());
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(
+        !collided,
+        "a successor was handed the pinned cookie's identity: the create's \
+         descriptor is not being held, so the removal's proof compares numbers \
+         a stranger can wear (this filesystem reissues freed identifiers: \
+         {reissues})"
+      );
+      assert_eq!(
+        survivor.as_deref().ok(),
+        Some(STRANGER),
+        "the stranger's file must still be on disk"
+      );
+      assert_eq!(
+        verdict,
+        CookieRemoval::Displaced,
+        "the name is settled as displaced, so the obligation retires instead of retrying forever"
+      );
+    }
+
+    /// A cookie that was CREATED but whose object could not be identified is
+    /// DESTROYED, not tracked. Nothing else is fail-closed: a tracked cookie with
+    /// no identity is a cookie no comparison can ever tell apart from a successor
+    /// at its name. The write reports the failure instead, which the sync already
+    /// models as a typed, retryable outcome.
+    ///
+    /// Fail-on-old (an identity read whose error was erased to "no identity"):
+    /// the write returns a cookie the ledger accepts, and its removal has nothing
+    /// to prove.
+    #[test]
+    fn an_unidentifiable_cookie_is_destroyed_rather_than_tracked() {
+      let root = scratch("unidentified");
+      let dir = Arc::new(CookieDir::open_or_create(&root).expect("the cookie directory opens"));
+      let name = ".tributaries-sync-unidentified";
+      let created = dir.create(name).expect("a cookie is created in it");
+      let path = dir.path().join(name);
+
+      let failure = destroy_unidentified(
+        Arc::clone(&dir),
+        name,
+        created,
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "no identity"),
+      );
+      let residue = path.exists();
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(
+        !residue,
+        "the unidentifiable cookie is gone: nothing is left for a later sweep to own"
+      );
+      assert!(
+        failure.residue.is_none(),
+        "and the write hands back no residue, because there is no file to account for"
+      );
+      assert_eq!(
+        failure.source.kind(),
+        std::io::ErrorKind::Unsupported,
+        "the write reports the identity failure verbatim, so the sync fails rather than degrading"
+      );
+    }
+
+    /// A removal that cannot reach the object it must prove returns the failure,
+    /// so its ledger record survives for a later sweep — and unlinks nothing in
+    /// the meantime. Only two open failures are settled verdicts: the name being
+    /// empty (idempotent success) and a symlink standing at it (displaced, and no
+    /// retry could ever converge). Everything else is unknown, and answering a
+    /// verdict on an unknown retires a record whose file is still on disk.
+    ///
+    /// The obstruction is a UNIX SOCKET at the cookie's name: `open` refuses one
+    /// on every Unix, and refuses it for EVERY caller — a permission-based
+    /// obstruction would be bypassed by the root the container suite runs as, and
+    /// would silently stop testing anything there.
+    ///
+    /// Fail-on-old (an unprovable open folded into `Displaced`): the record
+    /// retires as settled while a foreign object is still standing at its name —
+    /// the leak half of erasing the distinction between "not this object" and
+    /// "cannot tell".
+    #[test]
+    fn an_unprovable_name_is_returned_not_settled() {
+      let root = scratch("unprovable");
+      let dir = root.join("d");
+      std::fs::create_dir(&dir).expect("the cookie's own directory");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &dir, ".tributaries-sync-unprovable")
+        .expect("a cookie is created in a writable scratch root");
+
+      // Free the name, then move a socket onto it: nothing about the cookie's
+      // anchor changes, but what stands at the name can no longer be opened. The
+      // socket is bound SHORT and renamed in, because a bind address is capped
+      // near a hundred bytes and the cookie's own path is longer than that.
+      std::fs::remove_file(cookie.path()).expect("the cookie's name is freed");
+      let bound = std::env::temp_dir().join(format!("ts{}.s", std::process::id()));
+      let _ = std::fs::remove_file(&bound);
+      let socket = std::os::unix::net::UnixListener::bind(&bound).expect("a socket binds");
+      std::fs::rename(&bound, cookie.path()).expect("the socket takes the cookie's name");
+
+      let verdict = fs.remove_cookie(&cookie);
+      let survivor = cookie.path().exists();
+      drop(socket);
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(
+        verdict.is_err(),
+        "an unprovable removal is a failure to retry, never a settled verdict"
+      );
+      assert!(
+        survivor,
+        "nothing was unlinked: an object nothing could classify is still standing"
+      );
+    }
+
+    /// A FIFO at the cookie's name must not park the removal FOREVER. A blocking
+    /// `O_RDONLY` of a FIFO waits for a writer that never comes, and the thread it
+    /// waits on is one of the driver's blocking-pool threads — so the whole sync
+    /// machinery, not just this removal, stops. `O_NONBLOCK` is what bounds it,
+    /// and once the open returns the FIFO is simply not the cookie.
+    ///
+    /// Bounded by construction: the removal runs on its own thread and this cell
+    /// waits with a deadline, because the failure being tested IS a hang and an
+    /// unbounded cell would report it as a hung suite instead of a failed test.
+    ///
+    /// Fail-on-old (a blocking classification open): the join times out.
+    #[test]
+    fn a_fifo_at_a_cookie_name_never_parks_the_removal() {
+      /// Long enough that a loaded machine never trips it, short enough that a
+      /// genuine indefinite wait is reported rather than endured.
+      const DEADLINE: Duration = Duration::from_secs(20);
+
+      let root = scratch("fifo");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-fifo")
+        .expect("a cookie is created in a writable scratch root");
+      std::fs::remove_file(cookie.path()).expect("the cookie's name is freed");
+      let fifo = std::ffi::CString::new(cookie.path().as_os_str().as_encoded_bytes())
+        .expect("the scratch path holds no NUL");
+      // SAFETY: `fifo` is a live NUL-terminated C string for the call, and `0o600`
+      // is a valid mode word.
+      let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+      assert_eq!(made, 0, "the scratch tree accepts a FIFO");
+
+      // No writer is ever opened for this FIFO: a blocking open would therefore
+      // never return, which is exactly the state this cell must not enter.
+      let (tx, rx) = std::sync::mpsc::channel();
+      let worker = std::thread::spawn(move || {
+        let verdict = fs.remove_cookie(&cookie);
+        let _ = tx.send(verdict.map(|removal| (removal, cookie.path().exists())));
+      });
+      let answered = rx.recv_timeout(DEADLINE);
+      let outcome = answered.inspect(|_| {
+        worker.join().expect("the removal thread does not panic");
+      });
+      let cleaned = std::fs::remove_dir_all(&root);
+
+      let verdict = outcome.expect(
+        "the removal never answered: a FIFO standing at a cookie's name parked the \
+         classification open, and with it the blocking-pool thread it ran on",
+      );
+      assert_eq!(
+        verdict.expect("a FIFO is a classifiable object, not a transient failure"),
+        (CookieRemoval::Displaced, true),
+        "the FIFO is not the cookie, so it is settled as displaced and left on disk"
+      );
+      cleaned.expect("drop the scratch tree");
+    }
+
+    /// The unwind is anchored too. A path-based destroy re-resolves the cookie's
+    /// spelling, so a directory moved aside and rebuilt underneath it makes the
+    /// unwind delete whatever now stands at that spelling — a file it never
+    /// created. Anchored to the create's own directory descriptor, the unwind
+    /// destroys the object it made no matter what the name resolves to now.
+    ///
+    /// Fail-on-old (`remove_file(path)` after dropping the handle): the decoy is
+    /// destroyed and the cookie the write actually created survives — both halves
+    /// of the assertion invert.
+    #[test]
+    fn the_unwind_destroys_what_it_created_not_what_the_name_now_holds() {
+      let root = scratch("unwind-anchor");
+      let holder = root.join("d");
+      std::fs::create_dir(&holder).expect("the cookie's own directory");
+      let dir = Arc::new(CookieDir::open_or_create(&holder).expect("the cookie directory opens"));
+      let name = ".tributaries-sync-unwind-anchor";
+      let created = dir.create(name).expect("a cookie is created in it");
+      let created_at = dir.path().join(name);
+
+      // Move the whole directory aside and rebuild the ORIGINAL spelling around a
+      // decoy. Every path component the create used now resolves to something
+      // else; only the descriptor still refers to the directory the cookie is in.
+      let moved = root.join("moved");
+      std::fs::rename(&holder, &moved).expect("the cookie's directory moves aside");
+      let decoy_dir = created_at
+        .parent()
+        .expect("the cookie has a containing directory")
+        .to_path_buf();
+      std::fs::create_dir_all(&decoy_dir).expect("the original spelling is rebuilt");
+      let decoy = decoy_dir.join(name);
+      std::fs::write(&decoy, STRANGER).expect("a decoy takes the original spelling");
+
+      let failure = destroy_unidentified(
+        Arc::clone(&dir),
+        name,
+        created,
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "no identity"),
+      );
+      let real_survived = moved
+        .join(dir.path().file_name().expect("named"))
+        .join(name)
+        .exists();
+      let decoy_contents = std::fs::read(&decoy);
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert_eq!(
+        decoy_contents.as_deref().ok(),
+        Some(STRANGER),
+        "the decoy standing at the cookie's old spelling must be untouched: the unwind \
+         resolved a path instead of using the descriptor it created through"
+      );
+      assert!(
+        !real_survived,
+        "the file the create actually made is destroyed, wherever its name now leads"
+      );
+      assert!(
+        failure.residue.is_none(),
+        "the destroy succeeded, so there is no file left to account for"
+      );
+    }
+
+    /// The unwind reports what it could not destroy. A name it cannot unlink —
+    /// here a DIRECTORY, which `unlinkat` refuses without the removal flag — leaves
+    /// a file on disk, and a write that answered "nothing was created" would strand
+    /// it: uncounted, unreapable, and free to repeat.
+    ///
+    /// Fail-on-old (a discarded unlink result): the residue is `None` and the
+    /// created file is invisible to every later sweep.
+    #[test]
+    fn an_undestroyable_cookie_comes_back_as_a_residue() {
+      let root = scratch("unwind-residue");
+      let dir = Arc::new(CookieDir::open_or_create(&root).expect("the cookie directory opens"));
+      let name = ".tributaries-sync-unwind-residue";
+      let created = dir.create(name).expect("a cookie is created in it");
+      // Free the name and put a DIRECTORY there: `unlinkat` without
+      // `AT_REMOVEDIR` refuses one on every Unix, so the destroy below fails for a
+      // reason no privilege bypasses.
+      std::fs::remove_file(dir.path().join(name)).expect("the cookie's name is freed");
+      std::fs::create_dir(dir.path().join(name)).expect("a directory takes the name");
+
+      let failure = destroy_unidentified(
+        Arc::clone(&dir),
+        name,
+        created,
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "no identity"),
+      );
+      let residue = failure.residue;
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(
+        residue.is_some(),
+        "a destroy that failed must hand the file back: an unreported one is a file \
+         nothing counts and nothing ever reaps"
+      );
+      assert_eq!(
+        residue.and_then(|file| file.identity()),
+        None,
+        "and it is handed back proven by its anchor alone — there is no identity to compare"
+      );
+    }
+
+    /// One `Anchor` residue: created through the private directory, marked as the
+    /// write's failed destroy would mark it, and still holding the create's own
+    /// descriptor.
+    fn anchor_residue(dir: &Arc<CookieDir>, name: &str) -> CookieFile {
+      let created = dir.create(name).expect("a cookie is created in it");
+      CookieFile::anchored(Arc::clone(dir), name, CookieProof::Anchor, created)
+    }
+
+    /// An `Anchor` residue must never be retried BY NAME.
+    ///
+    /// The record exists because nothing could identify what the write created,
+    /// so the retry used to go straight to the anchored unlink with no comparison
+    /// at all — not even the displacement check an identified cookie gets. Being
+    /// anchored bounds WHERE that lands (inside the private directory) and
+    /// nothing else: the object at the name is whatever is at the name, and
+    /// destroying it is `remove_file(path)` minus only the path resolution.
+    ///
+    /// What replaces it is a promotion, not a weaker check: the identity is read
+    /// off the create's OWN retained descriptor, which is a lookup of nothing and
+    /// therefore names this write's object and no other. The removal then runs
+    /// the ordinary comparison and refuses.
+    ///
+    /// FAIL-ON-REVERT: send `CookieProof::Anchor` straight to `dir.unlink(name)`
+    /// again and the stranger's file is DELETED, with a clean `Unlinked` verdict
+    /// reported to a caller that asked only for its own cookie back.
+    #[test]
+    fn an_anchor_residue_is_never_retried_by_name() {
+      let root = scratch("anchor-displaced");
+      let dir = Arc::new(CookieDir::open_or_create(&root).expect("the cookie directory opens"));
+      let name = ".tributaries-sync-anchor-displaced";
+      let residue = anchor_residue(&dir, name);
+      let path = dir.path().join(name);
+
+      // A peer under the same user frees the name and leaves its own file there.
+      std::fs::remove_file(&path).expect("the residue's name is freed");
+      std::fs::write(&path, STRANGER).expect("the stranger takes the freed name");
+
+      let verdict = RealFs::new().remove_cookie(&residue);
+      let survivor = std::fs::read(&path);
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert_eq!(
+        survivor.as_deref().ok(),
+        Some(STRANGER),
+        "the stranger's file must still be on disk: this removal had no proof it was \
+         the residue"
+      );
+      assert_eq!(
+        verdict.expect("a promoted identity settles a verdict rather than failing"),
+        CookieRemoval::Displaced,
+        "the name is settled as displaced, so the obligation retires instead of \
+         retrying forever"
+      );
+    }
+
+    /// The refusal above must not cost convergence: an `Anchor` residue still
+    /// standing at its own name is promoted and UNLINKED, so the obligation
+    /// retires and the file leaves the tree.
+    ///
+    /// Not a fail-on-revert cell — the old by-name unlink removed this file too.
+    /// It is here so that a fix which simply refuses every `Anchor` removal (and
+    /// leaks the file forever, reporting it at every close) cannot pass.
+    #[test]
+    fn an_anchor_residue_at_its_own_name_still_unlinks() {
+      let root = scratch("anchor-unlink");
+      let dir = Arc::new(CookieDir::open_or_create(&root).expect("the cookie directory opens"));
+      let name = ".tributaries-sync-anchor-unlink";
+      let residue = anchor_residue(&dir, name);
+      let path = dir.path().join(name);
+
+      let verdict = RealFs::new().remove_cookie(&residue);
+      let present = path.exists();
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(!present, "the residue this write created is gone from disk");
+      assert_eq!(
+        verdict.expect("an untouched residue unlinks"),
+        CookieRemoval::Unlinked,
+        "the name still denoted the created object, so the unlink is the verdict"
+      );
+    }
+
+    /// And where there is nothing to promote FROM, the removal fails closed.
+    ///
+    /// A record with no retained descriptor can say nothing whatever about the
+    /// name it holds, so the only two answers are "unlink it anyway" and "report
+    /// it". Reporting keeps the ledger record, which is what makes close count
+    /// the residue honestly instead of claiming a file it never removed.
+    ///
+    /// FAIL-ON-REVERT: fall through to `dir.unlink(name)` and the file below is
+    /// destroyed and the call reports success.
+    #[test]
+    fn an_anchor_removal_with_nothing_to_promote_fails_closed() {
+      let root = scratch("anchor-closed");
+      let dir = CookieDir::open_or_create(&root).expect("the cookie directory opens");
+      let name = ".tributaries-sync-anchor-closed";
+      let path = dir.path().join(name);
+      std::fs::write(&path, STRANGER).expect("something stands at the name");
+
+      let verdict = remove_anchored(&dir, name, CookieProof::Anchor, None);
+      let survivor = std::fs::read(&path);
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(
+        verdict.is_err(),
+        "a removal with no evidence about the name is a reported failure, never a \
+         settled verdict"
+      );
+      assert_eq!(
+        survivor.as_deref().ok(),
+        Some(STRANGER),
+        "and it unlinked nothing"
+      );
+    }
+
+    /// The cookie directory is VERIFIED, never adopted. A directory already
+    /// standing at the name with permissions beyond its owner is refused, because
+    /// the whole race argument is that nobody else may bind a name inside it —
+    /// which is false the moment its mode says otherwise. The ownership half is
+    /// checked the same way, and exercised wherever this cell can actually make a
+    /// directory it does not own.
+    ///
+    /// Fail-on-old (a directory adopted on faith): the write succeeds into a
+    /// directory a stranger may write, and every removal through it is back to
+    /// racing a name.
+    #[test]
+    fn a_permissive_cookie_directory_is_refused() {
+      use std::os::unix::fs::PermissionsExt;
+
+      let root = scratch("dir-mode");
+      let fs = RealFs::new();
+      // Create it through the production path first, so the name and location are
+      // exactly the ones the next write will resolve.
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-dir-mode")
+        .expect("a cookie is created in a writable scratch root");
+      let cookie_dir = cookie
+        .path()
+        .parent()
+        .expect("the cookie has a containing directory")
+        .to_path_buf();
+      drop(cookie);
+
+      std::fs::set_permissions(&cookie_dir, std::fs::Permissions::from_mode(0o777))
+        .expect("the scratch tree accepts the widened mode");
+      let widened = fs.write_cookie(&root, &root, ".tributaries-sync-dir-mode-2");
+
+      // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
+      let root_user = unsafe { libc::geteuid() } == 0;
+      // Ownership can only be witnessed where this process may give a directory
+      // away; where it cannot, the mode half above is the whole cell.
+      let foreign = root_user.then(|| {
+        std::fs::set_permissions(&cookie_dir, std::fs::Permissions::from_mode(0o700))
+          .expect("the mode is restored before the ownership half");
+        let path = std::ffi::CString::new(cookie_dir.as_os_str().as_encoded_bytes())
+          .expect("the scratch path holds no NUL");
+        // SAFETY: `path` is a live NUL-terminated C string for the call; `uid 1`
+        // is a uid this process (running as root) may assign.
+        let given = unsafe { libc::chown(path.as_ptr(), 1, u32::MAX) };
+        assert_eq!(given, 0, "root may give the cookie directory away");
+        fs.write_cookie(&root, &root, ".tributaries-sync-dir-owner")
+      });
+      let _ = std::fs::set_permissions(&cookie_dir, std::fs::Permissions::from_mode(0o700));
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert_eq!(
+        widened.err().map(|failure| failure.source.kind()),
+        Some(std::io::ErrorKind::PermissionDenied),
+        "a cookie directory anyone may write is refused, not adopted"
+      );
+      if let Some(foreign) = foreign {
+        assert_eq!(
+          foreign.err().map(|failure| failure.source.kind()),
+          Some(std::io::ErrorKind::PermissionDenied),
+          "a cookie directory owned by somebody else is refused, not adopted"
+        );
+      }
+    }
   }
 }
 
@@ -15101,6 +16388,9 @@ mod control_batch_publication_order {
   fn arm(watch: WatchId, path: &Path) -> ControlRequest {
     ControlRequest::Arm {
       watch,
+      // A synthetic batch this test answers itself: nothing echoes the outcome
+      // back through the core's attempt fence.
+      attempt: None,
       parent: watch,
       name: Segment::new("churn"),
       path: Arc::new(path.to_path_buf()),
@@ -15147,7 +16437,7 @@ mod control_batch_publication_order {
   /// purge runs while the port is still the one the cell attached.
   fn teardown(fs: &RealFs, scope: ScopeId, spawned: SpawnedSource<SourceHandle>, root: &Path) {
     fs.detach_scope(scope);
-    spawned.handle.shutdown();
+    let _ = spawned.handle.shutdown();
     let _ = std::fs::remove_dir_all(root);
   }
 
@@ -15295,6 +16585,1836 @@ mod control_batch_publication_order {
     assert_eq!(
       anchored, 0,
       "every round's anchor was published and consumed in the batch's order, so none is retained"
+    );
+  }
+}
+
+/// Bounded ingress is not bounded retention: the driver admits a request past a
+/// fixed-capacity mailbox and then RETAINS its reply sender, fence record or
+/// native handle until a settlement it does not control. Every cell here pins one
+/// of those retained populations against the failure state that makes it grow —
+/// a native transport that will not quiesce.
+mod retention {
+  use super::*;
+
+  /// A teardown closure that UNWINDS must not corrupt the reaper.
+  ///
+  /// The worker used to call the arbitrary closure and only then retire the
+  /// operation, so an unwind killed the thread with `threads`, `busy` and
+  /// `outstanding` still counting it. Close parks on `outstanding`, and the
+  /// growth rule reads `threads - busy`, so both then reason from state that can
+  /// never be repaired: close reports a phantom obligation forever, and enough
+  /// unwinds leave `threads == busy == MAX_TEARDOWN_REAPERS` with no worker
+  /// alive to claim anything.
+  ///
+  /// FAIL-ON-REVERT: drop the RAII claim guard and the containment boundary in
+  /// `reap_loop` (back to `teardown(); finish_teardown(inner);`), and the healthy
+  /// teardown below is never reclaimed — the panicking worker is gone and the
+  /// close never resolves inside its deadline.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_panicking_teardown_does_not_strand_the_reaper() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/s", FileKind::Dir, 2);
+    let first = watch(&rig, "/r").await;
+    let second = watch(&rig, "/s").await;
+
+    // The first scope's teardown unwinds inside `shutdown`.
+    rig.fs.panic_teardowns(1);
+    let (reply, on_first) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope: first,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), on_first)
+        .await
+        .expect("the unwound teardown still retires its obligation")
+        .expect("the waiter is answered, never dropped")
+        .is_unproven(),
+      "an unwound teardown discharges its obligation — leaving it owed would make \
+       every later close report work that already stopped — but it proves nothing, \
+       so the waiter is answered with the unproven verdict rather than `Torn`"
+    );
+
+    // A LATER healthy teardown still runs: the worker survived the unwind, so the
+    // queue is still drainable.
+    let (reply, on_second) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope: second,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), on_second)
+        .await
+        .expect("a healthy teardown after a panic still completes")
+        .expect("the waiter is answered")
+        .is_torn(),
+      "the reaper keeps claiming work after containing an unwind"
+    );
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "exactly the healthy stream counted a completed shutdown"
+    );
+
+    // Close is BOUNDED and HONEST: it never waits on the discharged obligation,
+    // and it never reports `Ok` over a teardown whose quiescence was not proven.
+    let (reply, on_close) = futures_channel::oneshot::channel();
+    rig.commands.send(Command::Close { reply }).await.unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(10), on_close)
+      .await
+      .expect("close resolves — the phantom obligation is gone")
+      .expect("the driver replies");
+    assert_eq!(
+      pending, 1,
+      "the unproven teardown is reported, so close cannot claim quiescence over it"
+    );
+  }
+
+  /// A `shutdown` that RETURNS while reporting its quiescence unproven is the
+  /// same terminal as one that unwound.
+  ///
+  /// The unwind was never the only way to fail a teardown, and on Windows it is
+  /// not even the common one. Those pumps own overlapped reads, so between a
+  /// successful issue and the dequeue of that issue's completion the KERNEL owns
+  /// the buffer and the `OVERLAPPED`. A pump that panicked, or whose cancellation
+  /// drain never dequeued the read's final completion, therefore RETAINS that
+  /// memory (and, on the panic path, the directory and port handles with it)
+  /// rather than freeing what the kernel may still write into — and then returns
+  /// normally, because leaking is the memory-safe answer, not a crash.
+  ///
+  /// Reading the RETURN as success made the driver classify that leak as
+  /// `TornDown`: repeated failures grew unbounded native state while nothing was
+  /// incremented anywhere, and `unwatch` and `close` went on certifying
+  /// quiescence over streams nobody had observed stop. The leak stays; what
+  /// changes is that it is now reported.
+  ///
+  /// FAIL-ON-REVERT: choose the terminal in `submit_teardown` from the unwind
+  /// alone (`if unwound { TeardownFailed } else { TornDown }`) and every
+  /// assertion here flips — the waiters resolve `Torn` and close reports 0.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_teardown_that_returns_unproven_is_reported_like_one_that_unwound() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/s", FileKind::Dir, 2);
+    let first = watch(&rig, "/r").await;
+    let second = watch(&rig, "/s").await;
+
+    // The first scope's teardown COMPLETES — no unwind — and answers that it
+    // could not prove the stream gone.
+    rig.fs.unproven_teardowns(1);
+    assert!(
+      unwatch_ack(&rig, first).await.is_unproven(),
+      "a teardown that retained state it could not prove dead is not `Torn`, \
+       however normally its call returned"
+    );
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "and it RETURNED: the backend counted a completed shutdown, so this is not \
+       the unwind path in disguise"
+    );
+
+    // Latched per scope, exactly as an unwind latches: the scope is gone, and the
+    // arm that would otherwise answer `Unknown` still carries the fact.
+    assert!(
+      unwatch_ack(&rig, first).await.is_unproven(),
+      "the latch outlives the scope it names"
+    );
+
+    // Per scope, never global.
+    assert!(
+      unwatch_ack(&rig, second).await.is_torn(),
+      "a scope whose teardown proved its stream gone still reports proven quiescence"
+    );
+
+    // Close counts it for the rest of the driver's life and refuses to report
+    // `Ok` over it — while staying BOUNDED, because the obligation itself was
+    // discharged when the terminal landed.
+    let (reply, on_close) = futures_channel::oneshot::channel();
+    rig.commands.send(Command::Close { reply }).await.unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(10), on_close)
+      .await
+      .expect("close resolves — nothing is still owed")
+      .expect("the driver replies");
+    assert_eq!(
+      pending, 1,
+      "the unproven teardown is reported, so close cannot claim quiescence over it"
+    );
+  }
+
+  /// Sends one `Watch` and hands back the refusal it must produce.
+  async fn refused_watch(rig: &Rig, root: &str) -> WatchRootError {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from(root),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      .await
+      .expect("the watch resolves")
+      .expect("the driver replies");
+    match outcome {
+      Ok(grant) => {
+        // A grant that is dropped unread unwinds its stream, which would leave
+        // the cell racing a teardown it never asked for; defuse first, then fail.
+        grant.defuse();
+        panic!("this watch is expected to be refused");
+      }
+      Err(err) => err,
+    }
+  }
+
+  /// A spawn that fails AFTER its stream went live retires the rollback inside
+  /// the driver's COUNTED teardown, so an unproven rollback reaches the same
+  /// terminal a committed stream's failed teardown does.
+  ///
+  /// The barrier used to shut its own post-live stream down and discard the
+  /// `Quiesce` that call answered, on the reasoning that a failing spawn owns no
+  /// scope and owes no counted obligation. A Windows pump that cannot prove its
+  /// overlapped read's pin ended RETAINS the buffer and the handle — the correct
+  /// memory-safety choice — and returns normally, so that discard reduced a
+  /// retained buffer and handle to a plain spawn error: nothing counted it,
+  /// nothing bounded admission over it, and `close` still reported quiescence.
+  /// The scope not existing never made the retained state stop existing.
+  ///
+  /// FAIL-ON-REVERT: have the fake's post-live rejection tear its own stream
+  /// down and return a bare `SourceError` (the old barrier shape) and the
+  /// unproven ingest below never reaches 1 — close reports 0 over a rollback
+  /// nobody proved gone.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_post_live_spawn_failure_retires_its_rollback_under_the_counted_teardown() {
+    let rig = rig_with_capacity(64);
+    // The root's object is swapped the instant the stream goes live, so the
+    // barrier's post-live identity re-proof refuses with a RUNNING stream in
+    // hand — the phase the finding is about.
+    rig.fs.replace_at_live("/r", FileKind::Dir, 99);
+    // And that rollback's teardown completes without proving the stream gone.
+    rig.fs.unproven_teardowns(1);
+
+    let err = refused_watch(&rig, "/r").await;
+    assert!(
+      matches!(
+        err,
+        WatchRootError::Source(SourceError::RootReplaced { .. })
+      ),
+      "the post-live bracket refuses the swapped object: {err:?}"
+    );
+    assert_eq!(
+      rig.fs.spawns(),
+      1,
+      "staging: the stream went live before the bracket refused it"
+    );
+
+    // The stream is reclaimed by the driver's reaper — not inside the failing
+    // spawn, and not left running either.
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "the rollback is torn down through the driver, after the caller's error"
+    );
+    // And its verdict arrived as `TeardownFailed`, which is the whole point: the
+    // retained state is now counted somewhere.
+    settle_unproven(&rig, 1).await;
+
+    let (reply, on_close) = futures_channel::oneshot::channel();
+    rig.commands.send(Command::Close { reply }).await.unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(10), on_close)
+      .await
+      .expect("close resolves — the obligation is discharged, only unproven")
+      .expect("the driver replies");
+    assert_eq!(
+      pending, 1,
+      "close cannot claim quiescence over a rollback whose stream nobody proved gone"
+    );
+  }
+
+  /// Repeated post-live spawn failures that prove nothing BOUND admission.
+  ///
+  /// This is the accumulation the finding names. Each failure retains native
+  /// state; with the verdict discarded inside the spawn, nothing incremented and
+  /// the driver went on admitting new streams forever. Routed through the counted
+  /// teardown they reach `MAX_TEARDOWN_BACKLOG` like any other unproven teardown,
+  /// and the next watch is refused with the typed, retryable terminal.
+  ///
+  /// FAIL-ON-REVERT: let the post-live rejection reclaim its own stream and
+  /// return a bare error, and the backlog stays at 0 no matter how many failures
+  /// pile up — the watch below is admitted and answers `RootReplaced`.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn post_live_rollbacks_that_prove_nothing_bound_admission() {
+    let rig = rig_with_capacity(64);
+    rig.fs.unproven_teardowns(MAX_TEARDOWN_BACKLOG);
+    for n in 0..MAX_TEARDOWN_BACKLOG {
+      // A fresh object identity each round, so every spawn seals one identity
+      // and finds another once its stream is live.
+      rig.fs.replace_at_live("/r", FileKind::Dir, 100 + n as u64);
+      let err = refused_watch(&rig, "/r").await;
+      assert!(
+        matches!(
+          err,
+          WatchRootError::Source(SourceError::RootReplaced { .. })
+        ),
+        "round {n} refuses post-live: {err:?}"
+      );
+    }
+    settle_unproven(&rig, MAX_TEARDOWN_BACKLOG).await;
+
+    let err = refused_watch(&rig, "/r").await;
+    assert!(
+      matches!(err, WatchRootError::CleanupBacklog),
+      "past the bound a new stream is refused with the retryable terminal rather \
+       than admitted over state nothing can reclaim: {err:?}"
+    );
+  }
+
+  /// Queues one `Watch` and hands back its reply receiver WITHOUT waiting for
+  /// the outcome — the shape a burst needs, where several admissions are judged
+  /// before any of their spawns has returned.
+  async fn queue_watch(
+    rig: &Rig,
+    root: String,
+  ) -> futures_channel::oneshot::Receiver<Result<WatchGrant, WatchRootError>> {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from(root),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    on_reply
+  }
+
+  /// Reads the gauge admission compares against `MAX_TEARDOWN_BACKLOG`.
+  ///
+  /// Doubles as a mailbox BARRIER: the command channel is FIFO and the driver
+  /// judges one command per loop iteration, so when this answers, every command
+  /// queued ahead of it has already been admitted or refused.
+  async fn teardown_pressure(rig: &Rig) -> usize {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugTeardownPressure { reply })
+      .await
+      .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), on_reply)
+      .await
+      .expect("the driver answers")
+      .expect("the driver replies")
+  }
+
+  /// A DESCENDING rig — the profile whose `replace_root` can take the
+  /// same-transport widen route, which is the replacement window that owns no
+  /// spawn to reserve against.
+  fn descending_rig() -> Rig {
+    let fs = FakeFs::new(1);
+    fs.put("/r", FileKind::Dir, 1);
+    fs.spawn_backend(BackendKind::Inotify);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (cleanup, cookie_wake) = cookie_ingress();
+    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      DriverConfig {
+        profile: BackendKind::Inotify,
+        ..config()
+      },
+      fs.clone(),
+      cmd_rx,
+      cookie_wake,
+      ev_tx,
+      NullRegistry,
+    ));
+    Rig {
+      fs,
+      commands: cmd_tx,
+      cleanup,
+      events: ev_rx,
+    }
+  }
+
+  /// Drives `count` post-live spawn failures CONCURRENTLY and leaves every
+  /// rollback counted-but-UNPROVEN, so the pressure gauge settles at exactly
+  /// `count` and stays there for the driver's life — a stable floor a cell can
+  /// then push one further admission against.
+  async fn stage_unproven_backlog(rig: &Rig, count: usize) {
+    rig.fs.unproven_teardowns(count);
+    for n in 0..count {
+      rig
+        .fs
+        .put(format!("/stage/{n}"), FileKind::Dir, 5_000 + n as u64);
+    }
+    let spawned_before = rig.fs.spawns();
+    let hold = rig.fs.hold_spawns_post_live();
+    let mut queued = Vec::with_capacity(count);
+    for n in 0..count {
+      queued.push(queue_watch(rig, format!("/stage/{n}")).await);
+    }
+    assert!(
+      settle(|| rig.fs.spawns() == spawned_before + count).await,
+      "staging: every backlog spawn is parked with its stream already live"
+    );
+    for n in 0..count {
+      rig.fs.remove(format!("/stage/{n}"));
+    }
+    hold.release();
+    for on_reply in queued {
+      let outcome = tokio::time::timeout(Duration::from_secs(30), on_reply)
+        .await
+        .expect("every staged watch is answered")
+        .expect("the driver never drops a watch reply");
+      match outcome {
+        Ok(grant) => {
+          grant.defuse();
+          panic!("the root vanished under the live stream — the bracket must refuse");
+        }
+        Err(err) => assert!(
+          matches!(
+            err,
+            WatchRootError::Source(SourceError::RootUnavailable { .. })
+          ),
+          "staging: a backlog round refuses post-live rather than at admission: {err:?}"
+        ),
+      }
+    }
+  }
+
+  /// A BURST of watches racing one another's in-flight spawns cannot exceed the
+  /// backlog bound by the size of the burst.
+  ///
+  /// The sequential cell above cannot see this, and neither can any sequential
+  /// cell: it drives one post-live failure at a time, so each failure's teardown
+  /// is already counted before the next watch is judged. The defect lives in the
+  /// window where nothing has failed YET — a spawn owes no teardown until it
+  /// returns, so a gauge built only from landed obligations reads the same
+  /// below-limit value for every admission that races one window. All of them
+  /// pass, all of them then surrender a rollback into the counted path, and the
+  /// bound is overshot by however many were in flight.
+  ///
+  /// The post-live hold is what makes that window deterministic rather than a
+  /// timing accident: every admitted spawn parks with its stream LIVE and its
+  /// outcome undecided, so the whole cohort is genuinely simultaneous while the
+  /// admissions behind it are being judged.
+  ///
+  /// FAIL-ON-REVERT: drop the reservation term from `teardown_pressure` (return
+  /// the landed sum alone) and the staged gauge reads 0 with the whole burst in
+  /// flight, every watch is admitted, and the backlog settles at `BURST` — the
+  /// bound exceeded by exactly the burst size.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn concurrent_spawns_cannot_burst_past_the_teardown_backlog_bound() {
+    const BURST: usize = MAX_TEARDOWN_BACKLOG + 4;
+
+    let rig = rig_with_capacity(64);
+    // Each rollback's teardown completes WITHOUT proving its stream gone, so the
+    // obligation stays counted for the driver's life. That is what makes the
+    // final read below a settled fact rather than a sample of a draining
+    // backlog, which a burst would otherwise sweep through on its way past.
+    rig.fs.unproven_teardowns(BURST);
+    for n in 0..BURST {
+      rig
+        .fs
+        .put(format!("/burst/{n}"), FileKind::Dir, 1_000 + n as u64);
+    }
+
+    let post_live = rig.fs.hold_spawns_post_live();
+    let mut queued = Vec::with_capacity(BURST);
+    for n in 0..BURST {
+      queued.push(queue_watch(&rig, format!("/burst/{n}")).await);
+    }
+    let staged = teardown_pressure(&rig).await;
+
+    // Every watch has been judged. A REFUSAL is answered on the command arm, so
+    // its reply is already here; an ADMITTED watch answers only when its spawn
+    // returns, and every spawn is parked — so this split is exact, not a race.
+    let mut refusals = Vec::new();
+    let mut admitted = Vec::new();
+    for mut on_reply in queued {
+      match on_reply.try_recv() {
+        Ok(None) => admitted.push(on_reply),
+        Ok(Some(Ok(grant))) => {
+          grant.defuse();
+          panic!("an admitted watch cannot answer while its spawn is parked post-live");
+        }
+        Ok(Some(Err(err))) => refusals.push(err),
+        Err(_) => panic!("the driver never drops a watch reply"),
+      }
+    }
+    assert_eq!(
+      staged, MAX_TEARDOWN_BACKLOG,
+      "with the whole cohort in flight the gauge counts every reserved stream, so \
+       admission sees the pressure the burst is about to land rather than the zero \
+       it has landed so far"
+    );
+    assert_eq!(
+      admitted.len(),
+      MAX_TEARDOWN_BACKLOG,
+      "exactly the bound is admitted, whatever the burst size"
+    );
+    assert!(
+      refusals.len() == BURST - MAX_TEARDOWN_BACKLOG
+        && refusals
+          .iter()
+          .all(|err| matches!(err, WatchRootError::CleanupBacklog)),
+      "the overflow of the burst is refused with the typed retryable terminal: {refusals:?}"
+    );
+
+    // Now convert every reservation. The roots vanish under the parked spawns,
+    // so each identity bracket refuses with a RUNNING stream in hand and hands
+    // it back — the surrender that becomes a counted teardown.
+    assert!(
+      settle(|| rig.fs.spawns() == MAX_TEARDOWN_BACKLOG).await,
+      "staging: every admitted spawn is parked with its stream already live"
+    );
+    for n in 0..BURST {
+      rig.fs.remove(format!("/burst/{n}"));
+    }
+    post_live.release();
+
+    // The driver retires a surrendered stream BEFORE it answers the caller, so
+    // once the last reply is in, every rollback this burst produced is counted.
+    for on_reply in admitted {
+      let outcome = tokio::time::timeout(Duration::from_secs(30), on_reply)
+        .await
+        .expect("every admitted watch is answered")
+        .expect("the driver never drops a watch reply");
+      match outcome {
+        Ok(grant) => {
+          grant.defuse();
+          panic!("the root vanished under the live stream — the bracket must refuse");
+        }
+        Err(err) => assert!(
+          matches!(
+            err,
+            WatchRootError::Source(SourceError::RootUnavailable { .. })
+          ),
+          "the post-live bracket refuses the vanished root: {err:?}"
+        ),
+      }
+    }
+    assert_eq!(
+      teardown_pressure(&rig).await,
+      MAX_TEARDOWN_BACKLOG,
+      "the landed backlog is exactly the bound — the reservations converted \
+       one-for-one and none of the burst was admitted over the top of them"
+    );
+  }
+
+  /// A cohort of DESCENDING births parked on held ROOT ARMS holds its units of
+  /// the bound, so nothing is admitted over the top of it.
+  ///
+  /// The spawn term alone stops covering a descending birth the moment its spawn
+  /// RETURNS. What returns is a running stream the caller has not been handed and
+  /// cannot unwatch: the registration is still in flight, still the driver's own
+  /// work, and still fallible on both sides — the root arm can fail, and the
+  /// `watch()` future can be cancelled — with either outcome retiring the stream
+  /// into the counted teardown path. Between the spawn's return and the root
+  /// arm's resolution a gauge built from spawns and landed teardowns therefore
+  /// reads a below-limit value however many births are staged, and admission
+  /// walks straight past the bound; when the arms then fail, every staged stream
+  /// retires at once and lands the whole overshoot as retained handles and
+  /// readers.
+  ///
+  /// The concurrency is what makes this visible, and it is not the concurrency
+  /// the spawn-burst cell above stages. There every admission races ONE in-flight
+  /// spawn window, which `pending_spawns` already covers; the gap opens only once
+  /// those spawns RESOLVE, so the cohort has to be simultaneously past its spawns
+  /// and short of its grants. Holding the root arms puts it there deterministically
+  /// — every birth commits its stream, defers its grant, dispatches its root arm
+  /// and stops — and the admissions judged afterwards read a gauge whose spawn
+  /// reservations have all been released.
+  ///
+  /// FAIL-ON-REVERT: drop the `deferred_grants` term from `teardown_pressure` and
+  /// the staged gauge reads 0 with 64 live ungranted streams parked, every
+  /// overflow watch is ADMITTED, and the failed cohort lands `COHORT + OVERFLOW`
+  /// unproven teardowns — the bound exceeded by the overflow.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn held_root_arms_cannot_burst_past_the_teardown_backlog_bound() {
+    const COHORT: usize = MAX_TEARDOWN_BACKLOG;
+    const OVERFLOW: usize = 4;
+
+    let rig = descending_rig();
+    // Every teardown this cell converts completes WITHOUT proving its stream
+    // gone, so the landed backlog it ends on is a settled fact rather than a
+    // sample of a draining one. Sized for the OVERSHOOT as well as the cohort, so
+    // a reverted gauge is measured rather than accidentally bounded here.
+    rig.fs.unproven_teardowns(COHORT + OVERFLOW);
+    for n in 0..COHORT {
+      rig
+        .fs
+        .put(format!("/deferred/{n}"), FileKind::Dir, 2_000 + n as u64);
+    }
+
+    // Held from before the first spawn: the root arm is the first control batch a
+    // descending birth dispatches, so every admitted birth parks there with its
+    // stream live and its grant undelivered.
+    let arms = rig.fs.hold_arms();
+    let mut queued = Vec::with_capacity(COHORT);
+    for n in 0..COHORT {
+      queued.push(queue_watch(&rig, format!("/deferred/{n}")).await);
+    }
+    assert!(
+      settle(|| arms.captured() == COHORT).await,
+      "staging: every birth is past its spawn and parked on ITS root arm, so the \
+       whole cohort is simultaneously live, ungranted and unreserved by the spawn term"
+    );
+
+    // Doubles as the mailbox barrier: every watch above has been judged.
+    let staged = teardown_pressure(&rig).await;
+    assert_eq!(
+      staged, COHORT,
+      "the deferred cohort holds a unit each — the gauge counts the streams the \
+       driver is still on the hook for, not only the ones it has finished with"
+    );
+    for (n, on_reply) in queued.iter_mut().enumerate() {
+      assert!(
+        matches!(on_reply.try_recv(), Ok(None)),
+        "staging: cohort member {n} is admitted and still waiting on its root arm"
+      );
+    }
+
+    // Now the admissions the bound has to refuse. Their spawn reservations would
+    // be free — every cohort spawn has already returned — so only the deferred
+    // term can be holding them out.
+    for n in 0..OVERFLOW {
+      rig
+        .fs
+        .put(format!("/overflow/{n}"), FileKind::Dir, 3_000 + n as u64);
+    }
+    let mut overflow = Vec::with_capacity(OVERFLOW);
+    for n in 0..OVERFLOW {
+      overflow.push(queue_watch(&rig, format!("/overflow/{n}")).await);
+    }
+    assert_eq!(
+      teardown_pressure(&rig).await,
+      COHORT,
+      "the barrier proves every overflow watch has been judged, and the gauge is \
+       unchanged — none of them created anything"
+    );
+    let mut refusals = Vec::new();
+    for mut on_reply in overflow {
+      match on_reply.try_recv() {
+        Ok(None) => panic!(
+          "an overflow watch was ADMITTED over a cohort of live ungranted streams — \
+           the bound is bypassable for as long as the root arms are held"
+        ),
+        Ok(Some(Ok(grant))) => {
+          grant.defuse();
+          panic!("an admitted watch cannot answer while its root arm is parked");
+        }
+        Ok(Some(Err(err))) => refusals.push(err),
+        Err(_) => panic!("the driver never drops a watch reply"),
+      }
+    }
+    assert!(
+      refusals.len() == OVERFLOW
+        && refusals
+          .iter()
+          .all(|err| matches!(err, WatchRootError::CleanupBacklog)),
+      "every overflow admission is refused with the typed retryable terminal, \
+       before any state is touched: {refusals:?}"
+    );
+
+    // Convert the cohort the way the finding names: fail every held root arm, so
+    // each staged birth refuses the registration it never granted and retires the
+    // stream behind it. (A cancelled `watch()` future is the same conversion by
+    // the other door — the grant commit fails and unwinds the scope.)
+    for n in 0..COHORT {
+      rig
+        .fs
+        .fail_watch_at(format!("/deferred/{n}"), tributary_proto::WatchError::Io);
+    }
+    arms.release();
+    for on_reply in queued {
+      let outcome = tokio::time::timeout(Duration::from_secs(30), on_reply)
+        .await
+        .expect("every staged watch is answered")
+        .expect("the driver never drops a watch reply");
+      match outcome {
+        Ok(grant) => {
+          grant.defuse();
+          panic!("a root arm that failed cannot hand the caller coverage");
+        }
+        Err(err) => assert!(
+          matches!(
+            err,
+            WatchRootError::Source(SourceError::RootUnavailable { .. })
+          ),
+          "the deferred grant is refused with the arm's own failure: {err:?}"
+        ),
+      }
+    }
+
+    settle_unproven(&rig, COHORT).await;
+    assert_eq!(
+      teardown_pressure(&rig).await,
+      COHORT,
+      "the cohort retires together and lands exactly the bound — only the bounded \
+       number was ever admitted, so there is no overshoot to land"
+    );
+  }
+
+  /// A replacement in flight reserves its unit too, even before it owns a
+  /// stream to reserve against.
+  ///
+  /// The spawn term alone does not cover this. A same-transport WIDEN resolves
+  /// over the LIVE fd and dispatches no spawn at all, so for its whole meta and
+  /// pre-arm window it is invisible to a gauge built from spawns and landed
+  /// teardowns — and it is not free: its fallback dispatches the general
+  /// replacement spawn, and the general route retires the old stream on the very
+  /// commit that reports success. A cohort of widens therefore passes the same
+  /// below-limit state that a cohort of spawns did, and converts together
+  /// afterwards.
+  ///
+  /// FAIL-ON-REVERT: drop the `replace_states` term from `teardown_pressure`
+  /// (leave the spawn term in place) and the watch below is admitted — the
+  /// gauge reads only the staged floor and never sees the widen holding the
+  /// last unit.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_in_flight_replacement_holds_its_unit_of_the_backlog_bound() {
+    let rig = descending_rig();
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // One unit short of the bound, and permanently so.
+    stage_unproven_backlog(&rig, MAX_TEARDOWN_BACKLOG - 1).await;
+    assert_eq!(
+      teardown_pressure(&rig).await,
+      MAX_TEARDOWN_BACKLOG - 1,
+      "staging: the floor is one unit below the bound"
+    );
+
+    // The widen enters `replace_states` on its own command arm and is parked at
+    // the pre-arm, so it is in flight — owning no spawn — for the rest of the
+    // cell.
+    let hold = rig.fs.hold_prearms();
+    let (reply, on_replace) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply,
+      })
+      .await
+      .unwrap();
+
+    // FIFO mailbox, one command judged per loop iteration: this watch is judged
+    // strictly after the replace was admitted, so it reads the replace's
+    // reservation.
+    let err = refused_watch(&rig, "/r/other").await;
+    assert!(
+      matches!(err, WatchRootError::CleanupBacklog),
+      "the in-flight replacement holds the last unit, so a new stream is refused \
+       with the typed retryable terminal: {err:?}"
+    );
+
+    hold.release();
+    drop(on_replace);
+  }
+
+  /// Sends one awaited `Unwatch` and hands back its reply receiver.
+  async fn request_unwatch(
+    rig: &Rig,
+    scope: ScopeId,
+  ) -> futures_channel::oneshot::Receiver<crate::driver::UnwatchAck> {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    on_reply
+  }
+
+  async fn unwatch_ack(rig: &Rig, scope: ScopeId) -> crate::driver::UnwatchAck {
+    let on_reply = request_unwatch(rig, scope).await;
+    tokio::time::timeout(Duration::from_secs(10), on_reply)
+      .await
+      .expect("the unwatch resolves")
+      .expect("the waiter is answered, never dropped")
+  }
+
+  /// Waits until the DRIVER has ingested `target` unwound teardowns.
+  ///
+  /// Staging on the panicking thread does not work: the last observable a
+  /// panicking `shutdown` touches is reached BEFORE the unwind, and the panic
+  /// runtime's own reporting then runs for as long as symbolising a backtrace
+  /// takes — so a cell that continues there is racing the terminal, not ordered
+  /// after it.
+  async fn settle_unproven(rig: &Rig, target: usize) {
+    for _ in 0..200 {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugUnprovenTeardowns { reply })
+        .await
+        .unwrap();
+      let seen = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the driver answers")
+        .expect("the driver replies");
+      if seen >= target {
+        return;
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+      std::thread::sleep(settle_round_slice());
+    }
+    panic!("the driver never ingested {target} unwound teardown(s)");
+  }
+
+  /// An unwatch parked BEFORE the unwind is re-verdicted in place, and one
+  /// admitted after the scope is gone entirely still reports the unwind.
+  ///
+  /// A waiter carries the verdict its admission chose and resolves later, at
+  /// quiescence — so the unwind that voids that verdict lands in between and has
+  /// to rewrite it. Answering `Torn` here is the contradiction the close reply
+  /// already refuses to make: unwatch would license the caller to release
+  /// everything the stream can still reach, while close reports one teardown
+  /// whose quiescence nobody proved.
+  ///
+  /// FAIL-ON-REVERT: drop the `taint_unproven_scope` call from the live loop's
+  /// `TeardownFailed` arm and the parked waiter resolves `Torn`; drop
+  /// `admitted_verdict` from the `Command::Unwatch` immediate-answer arm and the
+  /// later unwatch resolves `Unknown`.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_unwound_teardown_re_verdicts_the_waiters_it_finds_and_those_that_follow() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    // The waiter is admitted while the scope is live and healthy, so its
+    // admission chooses `Torn`; the hold keeps it parked until the unwind lands.
+    let hold = rig.fs.hold_teardowns();
+    let parked = request_unwatch(&rig, scope).await;
+    assert!(
+      settle(|| hold.captured() == 1).await,
+      "staging: the scope's teardown is inside `shutdown` with the waiter parked"
+    );
+
+    rig.fs.panic_teardowns(1);
+    hold.release();
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), parked)
+        .await
+        .expect("the parked waiter is answered")
+        .expect("never dropped")
+        .is_unproven(),
+      "a waiter admitted before the unwind is re-verdicted, not resolved with the \
+       `Torn` its admission chose"
+    );
+
+    // Every obligation is retired and the scope is gone, so this one is answered
+    // immediately — on the arm that would otherwise report the root simply
+    // unknown, dropping the one fact the caller asked for.
+    assert!(
+      unwatch_ack(&rig, scope).await.is_unproven(),
+      "the latch outlives the scope it names"
+    );
+
+    // Per scope, never global: a scope whose every teardown was proven still
+    // reports proven quiescence.
+    rig.fs.put("/other", FileKind::Dir, 3);
+    let other = watch(&rig, "/other").await;
+    assert!(
+      unwatch_ack(&rig, other).await.is_torn(),
+      "an untainted scope is unaffected by another scope's unwind"
+    );
+  }
+
+  /// A replace retires the old lane make-before-break, so a scope can be LIVE on
+  /// a healthy successor while the stream it replaced was never proven gone. An
+  /// unwatch admitted in that window must not be admitted as `Torn`.
+  ///
+  /// The rewrite alone cannot cover this: the unwind has already been processed
+  /// when the waiter is admitted, so nothing will revisit it. The caller releases
+  /// against the SCOPE, and part of the scope was never accounted for.
+  ///
+  /// FAIL-ON-REVERT: drop `admitted_verdict` from the live-scope arm of
+  /// `Command::Unwatch` and the waiter below resolves `Torn` — its own teardown
+  /// was healthy, and the retired lane's unwind is no longer consulted.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_scope_tainted_while_live_admits_later_unwatches_as_unproven() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/alt", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r").await;
+
+    // The retiring lane's teardown parks on the first gate; the replace itself
+    // reports success without waiting for it.
+    let retiring = rig.fs.hold_teardowns();
+    let (reply, on_replace) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/alt"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/alt")),
+        reply,
+      })
+      .await
+      .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), on_replace)
+      .await
+      .expect("the replace resolves")
+      .expect("the driver replies")
+      .expect("make-before-break commits without waiting for the retired lane");
+    assert!(
+      settle(|| retiring.captured() == 1).await,
+      "staging: the retired lane's teardown is inside `shutdown`"
+    );
+
+    // A second gate takes every LATER teardown, so releasing the first one
+    // releases exactly the teardown that is about to unwind.
+    let successor = rig.fs.hold_teardowns();
+    rig.fs.panic_teardowns(1);
+    retiring.release();
+    // Staged on the DRIVER's own view of the unwind, so the unwatch below is
+    // genuinely admitted after the taint rather than racing it.
+    settle_unproven(&rig, 1).await;
+
+    // The scope is still live on its replacement, so this takes the live-scope
+    // admission arm — the one that chooses `Torn`.
+    let on_live_arm = request_unwatch(&rig, scope).await;
+    assert!(
+      settle(|| successor.captured() == 1).await,
+      "staging: the successor's own teardown runs, and it is healthy"
+    );
+
+    // The handle is gone now but the teardown is still owed, so this second
+    // unwatch takes the OTHER parking arm — the one that chooses `Unknown`.
+    let on_dead_arm = request_unwatch(&rig, scope).await;
+
+    successor.release();
+    for (waiter, arm) in [(on_live_arm, "live"), (on_dead_arm, "already-dead")] {
+      assert!(
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+          .await
+          .expect("the waiter is answered")
+          .expect("never dropped")
+          .is_unproven(),
+        "the scope carries the retired lane's unwind on the {arm} admission arm, \
+         even though the stream these unwatches wait on quiesced cleanly"
+      );
+    }
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "staging: exactly the successor's teardown completed a shutdown"
+    );
+  }
+
+  /// `MAX_TEARDOWN_REAPERS` bounds THREADS, not retained native handles.
+  /// A make-before-break `replace_root` retires the live stream and reports
+  /// success without waiting for it, so ordinary sequential replacements against
+  /// a wedged filesystem pile up handles nothing can reclaim.
+  ///
+  /// FAIL-ON-REVERT: remove the `teardown_pressure(..) >= MAX_TEARDOWN_BACKLOG`
+  /// arm from `Command::Replace` and every replacement is admitted — the loop
+  /// below runs to completion with no `CleanupBacklog` and the retained-handle
+  /// count grows past the bound.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_wedged_teardown_backlog_stops_replacement_admission() {
+    let rig = rig_with_capacity(64);
+    for n in 0..2 {
+      rig.fs.put(format!("/alt{n}"), FileKind::Dir, 100 + n);
+    }
+    let scope = watch(&rig, "/r").await;
+
+    // No teardown ever completes: the state the reaper exists to survive.
+    let _wedged = rig.fs.hold_teardowns();
+
+    let mut admitted = 0usize;
+    let mut refused = false;
+    for round in 0..(MAX_TEARDOWN_BACKLOG + 8) {
+      let root = if round % 2 == 0 { "/alt0" } else { "/alt1" };
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from(root),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from(root)),
+          reply,
+        })
+        .await
+        .unwrap();
+      match tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the replace resolves")
+        .expect("the driver replies")
+      {
+        Ok(()) => admitted += 1,
+        Err(crate::error::ReplaceRootError::CleanupBacklog) => {
+          refused = true;
+          break;
+        }
+        Err(other) => panic!("unexpected replace refusal: {other}"),
+      }
+    }
+    assert!(
+      refused,
+      "admission stops at the backlog bound; it admitted {admitted} replacements instead"
+    );
+    assert!(
+      admitted <= MAX_TEARDOWN_BACKLOG,
+      "retained streams stay within the bound: {admitted} admitted"
+    );
+
+    // A `watch` is the same shape — it admits a new stream, hence a teardown this
+    // driver will one day owe — so it is refused by the same bound.
+    let (reply, on_watch) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from("/alt0"),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(
+      matches!(
+        tokio::time::timeout(Duration::from_secs(10), on_watch)
+          .await
+          .expect("the watch resolves")
+          .expect("the driver replies"),
+        Err(crate::error::WatchRootError::CleanupBacklog)
+      ),
+      "a new root is a new teardown obligation, refused by the same bound"
+    );
+  }
+
+  /// A spawn whose result cannot be DELIVERED must not destroy its native
+  /// handle where it stands. The job runs on the runtime's shared blocking pool,
+  /// and a successful message owns a live stream whose `Drop` joins the reader it
+  /// just started — the unbounded join the teardown contract forbids on that
+  /// executor, where it starves every later spawn, enumerate, control and cookie
+  /// operation sharing the runtime.
+  ///
+  /// FAIL-ON-REVERT: restore `let _ = tx.try_send(OpResult::Spawned { .. })` in
+  /// the spawn job and the stream is reclaimed by the handle's `Drop` on the
+  /// blocking worker — the reclaiming thread is a pool worker, not
+  /// `tributary-teardown`.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_undeliverable_spawn_hands_its_stream_to_the_reaper() {
+    let rig = rig_with_capacity(64);
+    // Wedge the spawn AFTER its stream goes live — the backend's post-live
+    // metadata phase, where the job already owns a real transport.
+    let gate = rig.fs.hold_spawns_post_live();
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from("/r"),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    drop(on_reply);
+
+    // Close honestly reports the wedged spawn, then the driver returns and drops
+    // its result receiver.
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    assert_eq!(
+      tokio::time::timeout(Duration::from_secs(10), on_close)
+        .await
+        .expect("close resolves at its grace boundary")
+        .expect("the driver replies"),
+      1,
+      "staging: the post-live wedge is counted as non-quiescent"
+    );
+
+    // The wedge clears: the completed spawn finds its channel closed.
+    gate.release();
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "the undeliverable stream is reclaimed once the wedge clears"
+    );
+    let reclaimer = rig.fs.reclaim_thread().unwrap_or_default();
+    assert!(
+      reclaimer.starts_with("tributary-teardown"),
+      "the stream was reclaimed on {reclaimer:?}, not on the teardown reaper — a \
+       native join on the shared blocking pool is exactly what the contract forbids"
+    );
+  }
+
+  /// An awaited `unwatch` resolves only at quiescence, so duplicates of one
+  /// handle are RETAINED while a teardown is wedged. The 16-slot mailbox bounds
+  /// only requests waiting to be received; the driver keeps draining it and
+  /// parking every admitted caller.
+  ///
+  /// FAIL-ON-REVERT: remove the `MAX_PARKED_SETTLEMENTS` arm from
+  /// `Command::Unwatch` and the parked population grows with total admitted
+  /// calls — the census below far exceeds the bound and nothing is refused.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn duplicate_awaited_unwatches_stop_at_the_parked_bound() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+
+    // The teardown never quiesces, so no parked waiter is ever answered.
+    let _wedged = rig.fs.hold_teardowns();
+
+    // Retain every receiver: cancellation pruning cannot help a caller that is
+    // genuinely still waiting.
+    let mut waiters = Vec::new();
+    let mut refused = 0usize;
+    for _ in 0..(MAX_PARKED_SETTLEMENTS * 8) {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      waiters.push(on_reply);
+      tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    for waiter in &mut waiters {
+      if let core::task::Poll::Ready(Ok(ack)) = futures_util::poll!(waiter) {
+        assert!(
+          matches!(ack, crate::driver::UnwatchAck::Backlogged),
+          "the only resolved waiters are the refused ones — the rest are parked \
+           on a teardown that never quiesces"
+        );
+        refused += 1;
+      }
+    }
+    assert!(refused > 0, "admission stopped at the bound");
+
+    let (q, on_q) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugUnwatchWaiters { scope, reply: q })
+      .await
+      .unwrap();
+    let parked = on_q.await.unwrap();
+    assert!(
+      parked <= MAX_PARKED_SETTLEMENTS,
+      "the driver retains at most the parked bound, not one per admitted call: {parked}"
+    );
+  }
+
+  /// An enumerate is a bounded REQUEST whose retained size the filesystem
+  /// chooses. Uncapped, one directory written by someone else decides how much
+  /// memory the process holds; capped, the read reports itself INCOMPLETE, which
+  /// the Monitor already lowers to a bounded retry plus a covering `Rescan`.
+  ///
+  /// FAIL-ON-REVERT: remove the `entries.len() >= enumerate_entry_cap()` break
+  /// from `list_dir` and the listing reports every entry with `complete: true` —
+  /// the truncation, and with it the loss signal, disappears.
+  #[test]
+  fn an_oversized_directory_enumerates_as_an_incomplete_read() {
+    let dir = std::env::temp_dir().join(format!(
+      "tributary-fs-enumerate-bound-{}-{:?}",
+      std::process::id(),
+      std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the temp dir is created");
+    for n in 0..6u32 {
+      std::fs::write(dir.join(format!("f{n}")), b"x").expect("the entry is created");
+    }
+
+    let RawEnumerate::Listed { entries, complete } = list_dir(&dir) else {
+      panic!("the directory reads");
+    };
+    assert_eq!(entries.len(), 6, "staging: an unbounded read sees them all");
+    assert!(complete, "staging: an unbounded read is complete");
+
+    // The same directory, read under a bound below its size.
+    let (entries, complete) = crate::driver::ENUMERATE_ENTRY_CAP.with(|cap| {
+      cap.set(4);
+      let read = list_dir(&dir);
+      cap.set(crate::driver::MAX_ENUMERATE_ENTRIES);
+      match read {
+        RawEnumerate::Listed { entries, complete } => (entries.len(), complete),
+        RawEnumerate::Failed(class) => panic!("the directory reads: {class:?}"),
+      }
+    });
+    assert_eq!(entries, 4, "the retained listing stops at the bound");
+    assert!(
+      !complete,
+      "and reports itself INCOMPLETE, so the Monitor covers the remainder with a \
+       Rescan rather than silently omitting it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+}
+
+/// A driver that stops WITHOUT reaching its orderly close still holds native
+/// streams, and reclaiming one is an unbounded JOIN of its reader thread.
+///
+/// The close sweep is the only path that can pair a teardown with a counted
+/// obligation and a terminal, and three exits never reach it: the task's future
+/// is dropped (cancellation), the runtime is shut down and drops every task it
+/// holds, or the loop unwinds. On all three the frame's locals drop where they
+/// stand, and a handle's `Drop` backstop performs exactly the join the teardown
+/// reaper exists to keep off every executor the runtime owns.
+///
+/// The witness in every cell below is WHICH THREAD reclaimed the stream, and —
+/// where a wedge is staged — that a reaper thread is the one parked. The fake's
+/// `Drop` deliberately never parks on the teardown hold; only `shutdown` does,
+/// so a captured hold is proof the join went to the reaper rather than running
+/// inline.
+mod abnormal_exit {
+  use super::*;
+
+  /// A rig whose driver task handle the cell KEEPS, so it can end the driver
+  /// abnormally instead of through `Command::Close`.
+  fn detachable_rig_with(
+    config: DriverConfig,
+    fs: FakeFs,
+    registry: impl ScopeRegistry,
+  ) -> (Rig, tokio::task::JoinHandle<()>) {
+    fs.put("/r", FileKind::Dir, 1);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (cleanup, cookie_wake) = cookie_ingress();
+    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    let driver = tokio::spawn(run::<TokioRuntime, FakeFs>(
+      config,
+      fs.clone(),
+      cmd_rx,
+      cookie_wake,
+      ev_tx,
+      registry,
+    ));
+    (
+      Rig {
+        fs,
+        commands: cmd_tx,
+        cleanup,
+        events: ev_rx,
+      },
+      driver,
+    )
+  }
+
+  fn detachable_rig() -> (Rig, tokio::task::JoinHandle<()>) {
+    detachable_rig_with(config(), FakeFs::new(1), NullRegistry)
+  }
+
+  fn assert_reaped_off_the_runtime(fs: &FakeFs) {
+    let reclaimer = fs.reclaim_thread().unwrap_or_default();
+    assert!(
+      reclaimer.starts_with("tributary-teardown"),
+      "the stream was reclaimed on {reclaimer:?}, not on the teardown reaper — a \
+       native join on a thread the runtime owns is exactly what the contract forbids"
+    );
+  }
+
+  /// A CANCELLED driver task hands its live streams to the reaper.
+  ///
+  /// FAIL-ON-REVERT: hold `handles` in a plain local again (drop the
+  /// `StreamReservoir` guard) and the map drops in place — the stream is
+  /// reclaimed by its `Drop` backstop on the runtime worker that dropped the
+  /// task, so the reclaiming thread is `tokio-runtime-worker`.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cancelled_driver_hands_its_live_streams_to_the_reaper() {
+    let (rig, driver) = detachable_rig();
+    let _scope = watch(&rig, "/r").await;
+
+    driver.abort();
+    assert!(
+      driver.await.is_err(),
+      "staging: the task is dropped, never allowed to finish"
+    );
+
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "the abandoned stream is still reclaimed"
+    );
+    assert_reaped_off_the_runtime(&rig.fs);
+  }
+
+  /// An abandoned teardown that WEDGES must park a reaper thread, not the
+  /// runtime's. This is the whole point of the guard: the freeze it prevents is
+  /// only visible when the join does not return.
+  ///
+  /// FAIL-ON-REVERT: without the guard the handle's `Drop` runs inline instead
+  /// of `shutdown`, so nothing ever captures the hold and the stream reports a
+  /// completed reclamation while the wedge is still in force.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_wedged_abandoned_teardown_never_parks_the_runtime() {
+    let (rig, driver) = detachable_rig();
+    let _scope = watch(&rig, "/r").await;
+
+    let wedge = rig.fs.hold_teardowns();
+    driver.abort();
+    assert!(driver.await.is_err(), "staging: the task is dropped");
+
+    assert!(
+      settle(|| wedge.captured() == 1).await,
+      "the abandoned stream's join runs on a reaper thread, parked inside `shutdown`"
+    );
+    assert_eq!(
+      rig.fs.shutdowns(),
+      0,
+      "nothing completed while the join is wedged — and nothing was joined off the \
+       reaper either"
+    );
+    // The runtime this task was cancelled on is untouched by that wedge.
+    tokio::time::timeout(
+      Duration::from_secs(5),
+      tokio::time::sleep(Duration::from_millis(1)),
+    )
+    .await
+    .expect("the runtime still schedules while a native join is wedged");
+
+    wedge.release();
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "and it completes once the wedge clears"
+    );
+  }
+
+  /// A registry whose `scope_live` panics, so the driver task UNWINDS with the
+  /// just-born stream already in its handle map — the birth arm stores the
+  /// handle before it publishes the scope.
+  struct PanickingRegistry;
+
+  impl ScopeRegistry for PanickingRegistry {
+    fn scope_live(
+      &self,
+      _scope: ScopeId,
+      _root: &Path,
+      _identity: RootIdentity,
+      _ancestors: &[RootIdentity],
+      _backend: BackendKind,
+      _stats: Option<crate::os::BackendStatsHandle>,
+    ) {
+      panic!("an injected unwind out of the driver task");
+    }
+
+    fn scope_dead(&self, _scope: ScopeId) {}
+
+    fn final_root_conflict(
+      &self,
+      _final_root: &Path,
+      _identity: RootIdentity,
+      _ancestors: &[RootIdentity],
+      _reserved: Option<&Path>,
+      _exempt: Option<ScopeId>,
+    ) -> Option<PathBuf> {
+      None
+    }
+  }
+
+  /// A driver task that UNWINDS hands its live streams to the reaper.
+  ///
+  /// One panic is printed from the runtime worker while this cell runs: it is
+  /// the injected unwind, not a failure.
+  ///
+  /// FAIL-ON-REVERT: drop the `StreamReservoir` guard and the map unwinds in
+  /// place, joining the reader on the worker thread that was running the task.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_unwinding_driver_hands_its_live_streams_to_the_reaper() {
+    let (rig, driver) = detachable_rig_with(config(), FakeFs::new(1), PanickingRegistry);
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from("/r"),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    // The unwind happens between the handle's storage and the grant, so this
+    // caller sees a dropped sender rather than a reply.
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the driver dies rather than replying")
+        .is_err(),
+      "staging: the registry call unwound before the grant was sent"
+    );
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), driver)
+        .await
+        .expect("the task ends")
+        .is_err(),
+      "staging: the task ended by panicking"
+    );
+
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "the stream the unwind abandoned is still reclaimed"
+    );
+    assert_reaped_off_the_runtime(&rig.fs);
+  }
+
+  /// A RUNTIME SHUTDOWN drops every task it holds, including the driver's.
+  ///
+  /// Not a `#[tokio::test]`: the runtime under test is the one being dropped, so
+  /// the cell owns it and observes from an ordinary thread afterwards.
+  ///
+  /// FAIL-ON-REVERT: drop the `StreamReservoir` guard and the reclaiming thread
+  /// is whichever thread the runtime's shutdown dropped the task on.
+  #[test]
+  fn a_runtime_shutdown_hands_the_driver_streams_to_the_reaper() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(2)
+      .enable_all()
+      .build()
+      .expect("a runtime");
+    let fs = FakeFs::new(1);
+    fs.put("/r", FileKind::Dir, 1);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (cleanup, cookie_wake) = cookie_ingress();
+    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    runtime.spawn(run::<TokioRuntime, FakeFs>(
+      config(),
+      fs.clone(),
+      cmd_rx,
+      cookie_wake,
+      ev_tx,
+      NullRegistry,
+    ));
+    let rig = Rig {
+      fs: fs.clone(),
+      commands: cmd_tx,
+      cleanup,
+      events: ev_rx,
+    };
+    runtime.block_on(async {
+      let _scope = watch(&rig, "/r").await;
+    });
+
+    drop(runtime);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fs.shutdowns() == 0 && std::time::Instant::now() < deadline {
+      std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+      fs.shutdowns(),
+      1,
+      "the stream outliving its runtime is still reclaimed"
+    );
+    assert_reaped_off_the_runtime(&fs);
+  }
+
+  /// The replacement state is a stream reservoir too: a descending replace parks
+  /// its spawned-but-uncommitted stream there while the new root pre-arms, and
+  /// the handle map does not cover it.
+  ///
+  /// FAIL-ON-REVERT: guard only `handles` and exactly one of the two streams
+  /// reaches the reaper — the pre-armed replacement is reclaimed by its `Drop`
+  /// on the cancelling thread, so the hold captures one join instead of two and
+  /// a completed shutdown is reported while the wedge still stands.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cancelled_driver_hands_its_uncommitted_replacement_to_the_reaper() {
+    let fs = FakeFs::new(1);
+    fs.spawn_backend(BackendKind::Inotify);
+    let (rig, driver) = detachable_rig_with(
+      DriverConfig {
+        profile: BackendKind::Inotify,
+        ..config()
+      },
+      fs,
+      NullRegistry,
+    );
+    rig.fs.put("/r2", FileKind::Dir, 20);
+    let scope = watch(&rig, "/r").await;
+
+    // The replacement spawns and is parked in `arming` while its pre-arm runs.
+    let prearm = rig.fs.hold_prearms();
+    let (reply, _on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| rig.fs.prearm_entries() == 1).await,
+      "staging: the pre-arm is parked, so the uncommitted replacement is held in \
+       the replace state"
+    );
+
+    let wedge = rig.fs.hold_teardowns();
+    driver.abort();
+    assert!(driver.await.is_err(), "staging: the task is dropped");
+
+    assert!(
+      settle(|| wedge.captured() == 2).await,
+      "BOTH streams — the live one and the uncommitted replacement — are joined on \
+       reaper threads: {} captured",
+      wedge.captured()
+    );
+    assert_eq!(
+      rig.fs.shutdowns(),
+      0,
+      "neither was reclaimed inline while the wedge stands"
+    );
+
+    wedge.release();
+    prearm.release();
+    assert!(
+      settle(|| rig.fs.shutdowns() == 2).await,
+      "and both complete once the wedge clears"
+    );
+  }
+
+  /// A registry whose FINAL-ROOT CONFLICT check unwinds.
+  ///
+  /// That check is the first thing both stream commits do, and it runs while the
+  /// driver holds a just-spawned stream OUTSIDE every map — dequeued from the
+  /// result channel, not yet in `handles` and not in `replace_states`. It is
+  /// caller code, so it is exactly the shape that can unwind there, and the
+  /// reservoir guards cannot see the handle at that instant.
+  ///
+  /// `on_replacement` picks WHICH commit unwinds: the birth arm exempts no scope,
+  /// the replacement commit exempts the scope it is replacing.
+  struct PanickingConflictRegistry {
+    on_replacement: bool,
+  }
+
+  impl ScopeRegistry for PanickingConflictRegistry {
+    fn scope_live(
+      &self,
+      _scope: ScopeId,
+      _root: &Path,
+      _identity: RootIdentity,
+      _ancestors: &[RootIdentity],
+      _backend: BackendKind,
+      _stats: Option<crate::os::BackendStatsHandle>,
+    ) {
+    }
+
+    fn scope_dead(&self, _scope: ScopeId) {}
+
+    fn final_root_conflict(
+      &self,
+      _final_root: &Path,
+      _identity: RootIdentity,
+      _ancestors: &[RootIdentity],
+      _reserved: Option<&Path>,
+      exempt: Option<ScopeId>,
+    ) -> Option<PathBuf> {
+      assert!(
+        exempt.is_some() != self.on_replacement,
+        "an injected unwind out of the final-root conflict check"
+      );
+      None
+    }
+  }
+
+  /// A BIRTH that unwinds between the result channel and the handle map hands
+  /// its stream to the reaper.
+  ///
+  /// The stream is live from the moment the spawn returns it, and the birth arm
+  /// then runs the conflict check, mints the lane, attaches the scope's port and
+  /// reads the stats handle before it commits — a stretch of caller code and a
+  /// backend lock, either of which can unwind. A plain local there drops the
+  /// handle where it stands, and its `Drop` backstop is the unbounded reader join
+  /// on the runtime's own thread.
+  ///
+  /// One panic is printed from a runtime worker while this cell runs: it is the
+  /// injected unwind, not a failure.
+  ///
+  /// FAIL-ON-REVERT: bind the dequeued spawn to a plain local again (drop the
+  /// `EscrowedSpawn` in the birth arm) and nothing captures the hold — the
+  /// handle's `Drop` reclaims it inline on the worker running the task, so a
+  /// completed shutdown is reported while the wedge still stands.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_birth_unwinding_before_its_commit_hands_the_stream_to_the_reaper() {
+    let (rig, driver) = detachable_rig_with(
+      config(),
+      FakeFs::new(1),
+      PanickingConflictRegistry {
+        on_replacement: false,
+      },
+    );
+    let wedge = rig.fs.hold_teardowns();
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from("/r"),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the driver dies rather than replying")
+        .is_err(),
+      "staging: the conflict check unwound before the grant was sent"
+    );
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), driver)
+        .await
+        .expect("the task ends")
+        .is_err(),
+      "staging: the task ended by panicking"
+    );
+
+    assert!(
+      settle(|| wedge.captured() == 1).await,
+      "the in-transit stream's join runs on a reaper thread, parked inside \
+       `shutdown`: {} captured",
+      wedge.captured()
+    );
+    assert_eq!(
+      rig.fs.shutdowns(),
+      0,
+      "nothing was reclaimed inline while the wedge stands"
+    );
+
+    wedge.release();
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "and it completes once the wedge clears"
+    );
+  }
+
+  /// The REPLACEMENT COMMIT has the same window, and it holds two streams at
+  /// once: the live one the map still carries and the replacement the commit is
+  /// about to install. Only the first is in a reservoir.
+  ///
+  /// One panic is printed from a runtime worker while this cell runs: it is the
+  /// injected unwind, not a failure.
+  ///
+  /// FAIL-ON-REVERT: take the replacement by value again (drop the
+  /// `EscrowedSpawn` from `commit_replace`) and the hold captures ONE join — the
+  /// live stream, via the reservoir — while the replacement is reclaimed inline
+  /// by its `Drop` on the unwinding worker.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_replacement_commit_that_unwinds_hands_its_stream_to_the_reaper() {
+    let (rig, driver) = detachable_rig_with(
+      config(),
+      FakeFs::new(1),
+      PanickingConflictRegistry {
+        on_replacement: true,
+      },
+    );
+    rig.fs.put("/r2", FileKind::Dir, 20);
+    let scope = watch(&rig, "/r").await;
+
+    let wedge = rig.fs.hold_teardowns();
+    let (reply, _on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), driver)
+        .await
+        .expect("the task ends")
+        .is_err(),
+      "staging: the task ended by panicking"
+    );
+
+    assert!(
+      settle(|| wedge.captured() == 2).await,
+      "BOTH streams — the live one the reservoir holds and the uncommitted \
+       replacement the escrow does — are joined on reaper threads: {} captured",
+      wedge.captured()
+    );
+    assert_eq!(
+      rig.fs.shutdowns(),
+      0,
+      "neither was reclaimed inline while the wedge stands"
+    );
+
+    wedge.release();
+    assert!(
+      settle(|| rig.fs.shutdowns() == 2).await,
+      "and both complete once the wedge clears"
+    );
+  }
+
+  /// A registry whose scope reclaim unwinds — the close sweep's own caller code,
+  /// run once per live scope with that scope's stream already out of the map.
+  struct PanickingReclaimRegistry;
+
+  impl ScopeRegistry for PanickingReclaimRegistry {
+    fn scope_live(
+      &self,
+      _scope: ScopeId,
+      _root: &Path,
+      _identity: RootIdentity,
+      _ancestors: &[RootIdentity],
+      _backend: BackendKind,
+      _stats: Option<crate::os::BackendStatsHandle>,
+    ) {
+    }
+
+    fn scope_dead(&self, _scope: ScopeId) {
+      panic!("an injected unwind out of the close sweep");
+    }
+
+    fn final_root_conflict(
+      &self,
+      _final_root: &Path,
+      _identity: RootIdentity,
+      _ancestors: &[RootIdentity],
+      _reserved: Option<&Path>,
+      _exempt: Option<ScopeId>,
+    ) -> Option<PathBuf> {
+      None
+    }
+  }
+
+  /// The ORDERLY close sweep is not exempt from the rule either.
+  ///
+  /// It used to take the whole handle map (`std::mem::take`) and iterate the
+  /// result, so from its first line the reservoir covered nothing: an unwind out
+  /// of the per-scope reclaim or detach dropped the stream being swept AND every
+  /// stream the sweep had not reached, all in place, on the driver's own thread.
+  /// Draining one at a time leaves the remainder in the reservoir and the one in
+  /// flight in an escrow.
+  ///
+  /// Two roots, so the two halves are distinguishable: the first is the escrowed
+  /// one, the second is the one the sweep never reached.
+  ///
+  /// One panic is printed from a runtime worker while this cell runs: it is the
+  /// injected unwind, not a failure.
+  ///
+  /// FAIL-ON-REVERT: sweep `std::mem::take(&mut streams.handles)` again and
+  /// NEITHER stream reaches a reaper thread — both are reclaimed inline by their
+  /// `Drop` backstop while the wedge stands.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_close_sweep_that_unwinds_hands_every_stream_it_still_holds_to_the_reaper() {
+    let (rig, driver) = detachable_rig_with(config(), FakeFs::new(1), PanickingReclaimRegistry);
+    rig.fs.put("/r2", FileKind::Dir, 20);
+    let _first = watch(&rig, "/r").await;
+    let _second = watch(&rig, "/r2").await;
+
+    let wedge = rig.fs.hold_teardowns();
+    let (close_reply, _on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), driver)
+        .await
+        .expect("the task ends")
+        .is_err(),
+      "staging: the sweep's first reclaim unwound the task"
+    );
+
+    assert!(
+      settle(|| wedge.captured() == 2).await,
+      "both streams are joined on reaper threads — the one the sweep had in hand \
+       and the one it never reached: {} captured",
+      wedge.captured()
+    );
+    assert_eq!(
+      rig.fs.shutdowns(),
+      0,
+      "neither was reclaimed inline while the wedge stands"
+    );
+
+    wedge.release();
+    assert!(
+      settle(|| rig.fs.shutdowns() == 2).await,
+      "and both complete once the wedge clears"
+    );
+  }
+
+  /// A spawn result the driver ACCEPTED and never read owns a live stream too.
+  ///
+  /// `deliver_spawned` already covers the result that cannot be delivered — its
+  /// `try_send` fails and the handle goes to the sink. This is the other half:
+  /// the send SUCCEEDED, so the stream is sitting in the driver's own queue when
+  /// the queue is dropped.
+  ///
+  /// Staged on a current-thread runtime: the test body holds the very thread the
+  /// driver task runs on, so the pool's result provably lands in a queue the
+  /// driver has no opportunity to read. `abort` then drops the task's future
+  /// without polling it again.
+  ///
+  /// FAIL-ON-REVERT: drop the `OpQueue` guard and the queued result dies with the
+  /// channel — the handle's `Drop` reclaims it inline, so nothing captures the
+  /// hold and a completed shutdown is reported while the wedge still stands.
+  #[tokio::test]
+  async fn an_unread_spawn_result_hands_its_stream_to_the_reaper() {
+    let (rig, driver) = detachable_rig();
+    // Park the spawn AFTER its stream goes live, so the result is produced only
+    // when this cell releases it.
+    let gate = rig.fs.hold_spawns_post_live();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from("/r"),
+        interest: tributary_proto::Interest::all(),
+        reply,
+      })
+      .await
+      .unwrap();
+    drop(on_reply);
+    assert!(
+      settle(|| rig.fs.spawns() == 1).await,
+      "staging: the spawn is parked past the point its stream went live"
+    );
+
+    let wedge = rig.fs.hold_teardowns();
+    gate.release();
+    // The runtime thread is this one, and it is not going to an await: the pool
+    // job completes and its result queues unread.
+    std::thread::sleep(Duration::from_millis(200));
+    driver.abort();
+    assert!(
+      driver.await.is_err(),
+      "staging: the task is dropped unpolled"
+    );
+
+    assert!(
+      settle(|| wedge.captured() == 1).await,
+      "the unread result's stream is joined on a reaper thread"
+    );
+    assert_eq!(
+      rig.fs.shutdowns(),
+      0,
+      "it was not reclaimed inline while the wedge stands"
+    );
+
+    wedge.release();
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "and it completes once the wedge clears"
     );
   }
 }
