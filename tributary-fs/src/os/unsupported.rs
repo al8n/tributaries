@@ -33,7 +33,7 @@ pub(crate) enum SourceHandle {}
 
 impl SourceHandle {
   /// Tears the (nonexistent) stream down.
-  pub(crate) fn shutdown(self) {
+  pub(crate) fn shutdown(self) -> super::Quiesce {
     match self {}
   }
 

@@ -57,8 +57,11 @@ impl Model {
       return false;
     };
     match msg {
-      SourceMessage::Batch(payload) => {
+      SourceMessage::Batch(mut payload) => {
         self.processed.push((pos, Kind::Batch));
+        // The driver's ONE ingest body: the batch's resume candidate is
+        // published here and only here, immediately before the core takes it.
+        payload.acknowledge_resume();
         drop(payload);
       }
       SourceMessage::Overflow(ack) => {
@@ -446,4 +449,191 @@ fn budget_denial_degrades_to_an_in_order_overflow() {
   );
   while model.step_driver() {}
   assert_eq!(transport.in_flight(), 0);
+}
+
+/// The resume-acknowledgement suite: what a source may tell its successor to
+/// resume from, and — the whole point — what it may not.
+mod resume {
+  use super::*;
+  use crate::os::ResumeToken;
+
+  const DEVICE: Option<[u8; 16]> = Some([9u8; 16]);
+
+  fn at(id: u64) -> ResumeToken {
+    ResumeToken::fsevents(id, DEVICE)
+  }
+
+  /// One producer batch carrying the position it reaches.
+  fn forward_at(
+    transport: &TransportState,
+    resume: &Arc<ResumeShared>,
+    model: &mut Model,
+    events: usize,
+    lossy: bool,
+    reached: u64,
+  ) {
+    let events = (0..events).map(|_| raw("/r/a")).collect();
+    forward_batch_resuming(
+      transport,
+      events,
+      lossy,
+      Some((resume, at(reached))),
+      |msg| model.send(msg),
+    );
+  }
+
+  #[test]
+  fn a_staged_point_is_published_only_by_the_ingest() {
+    let transport = TransportState::new(4);
+    let resume = Arc::<ResumeShared>::default();
+    let mut model = Model::default();
+
+    forward_at(&transport, &resume, &mut model, 1, false, 100);
+    assert_eq!(
+      resume.published(),
+      None,
+      "a batch sitting in the queue has proven nothing"
+    );
+    assert!(model.step_driver());
+    assert_eq!(resume.published(), Some(at(100)), "the ingest published it");
+  }
+
+  /// The defect this whole mechanism exists for: a batch the budget refused
+  /// carries events NOBODY received, so the point may not travel over them —
+  /// not even on the back of a later batch that did land.
+  #[test]
+  fn a_budget_dropped_batch_never_carries_the_point_past_its_events() {
+    // One slot: the first batch holds it until the driver ingests it.
+    let transport = TransportState::new(1);
+    let resume = Arc::<ResumeShared>::default();
+    let mut model = Model::default();
+
+    forward_at(&transport, &resume, &mut model, 1, false, 100);
+    forward_at(&transport, &resume, &mut model, 1, false, 200);
+    assert_eq!(
+      model.queue.len(),
+      2,
+      "the over-budget batch degraded to an in-band Overflow behind the first"
+    );
+
+    assert!(model.step_driver(), "the batch that landed");
+    assert!(
+      model.step_driver(),
+      "the Overflow covering the one that did not"
+    );
+    assert_eq!(
+      resume.published(),
+      Some(at(100)),
+      "the point stopped at the last batch anyone received; 200 would have skipped \
+       the dropped batch's events"
+    );
+  }
+
+  #[test]
+  fn a_batch_the_driver_never_took_leaves_the_point_where_it_was() {
+    let transport = TransportState::new(4);
+    let resume = Arc::<ResumeShared>::default();
+    let mut model = Model::default();
+
+    forward_at(&transport, &resume, &mut model, 1, false, 100);
+    assert!(model.step_driver());
+    // The successor's spawn reads the point while this batch is still queued.
+    forward_at(&transport, &resume, &mut model, 1, false, 200);
+    assert_eq!(
+      resume.published(),
+      Some(at(100)),
+      "a queued batch is not an ingested one"
+    );
+  }
+
+  #[test]
+  fn a_lossy_batch_stages_nothing() {
+    let transport = TransportState::new(4);
+    let resume = Arc::<ResumeShared>::default();
+    let mut model = Model::default();
+
+    forward_at(&transport, &resume, &mut model, 1, true, 100);
+    while model.step_driver() {}
+    assert_eq!(
+      resume.published(),
+      None,
+      "no cursor separates the decoded records from the lost ones, so the point \
+       stays behind both"
+    );
+  }
+
+  #[test]
+  fn a_refused_send_stages_nothing() {
+    let transport = TransportState::new(4);
+    let resume = Arc::<ResumeShared>::default();
+    let mut model = Model {
+      closed: true,
+      ..Model::default()
+    };
+
+    forward_at(&transport, &resume, &mut model, 1, false, 100);
+    assert_eq!(
+      resume.published(),
+      None,
+      "a gone receiver received nothing to acknowledge"
+    );
+  }
+
+  #[test]
+  fn the_point_never_moves_backward_within_one_scope() {
+    let transport = TransportState::new(4);
+    let resume = Arc::<ResumeShared>::default();
+    let mut model = Model::default();
+
+    forward_at(&transport, &resume, &mut model, 1, false, 200);
+    assert!(model.step_driver());
+    forward_at(&transport, &resume, &mut model, 1, false, 100);
+    assert!(model.step_driver());
+    assert_eq!(resume.published(), Some(at(200)));
+  }
+
+  /// A re-anchored journal mints a numerically SMALLER cursor that is
+  /// nonetheless the only one its journal can honor, so a scope change
+  /// replaces rather than losing to the maximum.
+  #[test]
+  fn a_new_scope_replaces_the_point_outright() {
+    let transport = TransportState::new(4);
+    let resume = Arc::<ResumeShared>::default();
+    let mut model = Model::default();
+
+    forward_at(&transport, &resume, &mut model, 1, false, 900);
+    assert!(model.step_driver());
+
+    let reanchored = ResumeToken::usn(7, 5, 42);
+    forward_batch_resuming(
+      &transport,
+      vec![raw("/r/a")],
+      false,
+      Some((&resume, reanchored)),
+      |msg| model.send(msg),
+    );
+    assert!(model.step_driver());
+    assert_eq!(resume.published(), Some(reanchored));
+  }
+
+  /// The scoping rule the honoring side reads: a token answers only for the
+  /// journal that minted it, and never for another backend's.
+  #[test]
+  fn a_token_answers_only_within_its_own_scope() {
+    assert_eq!(at(100).fsevents_since(DEVICE), Some(100));
+    assert_eq!(at(100).fsevents_since(Some([1u8; 16])), None);
+    assert_eq!(at(100).fsevents_since(None), None);
+    assert_eq!(
+      ResumeToken::fsevents(100, None).fsevents_since(DEVICE),
+      None,
+      "a device with no UUID scopes nothing"
+    );
+    assert_eq!(at(100).usn_cursor(7, 42), None, "another backend's token");
+
+    let usn = ResumeToken::usn(7, 55, 42);
+    assert_eq!(usn.usn_cursor(7, 42), Some(55));
+    assert_eq!(usn.usn_cursor(8, 42), None, "a recreated journal");
+    assert_eq!(usn.usn_cursor(7, 43), None, "another volume");
+    assert_eq!(usn.fsevents_since(DEVICE), None);
+  }
 }
