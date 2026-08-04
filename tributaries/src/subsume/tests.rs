@@ -73,8 +73,8 @@ fn disjoint_paths_stay_separate() {
   assert_ne!(ra, rb, "unrelated paths get distinct roots");
   assert_ne!(sa, sb, "each watch mints a distinct subscription");
   assert_eq!(root_keys(&s), BTreeSet::from([key("/a"), key("/b")]));
-  assert_eq!(s.entry(ra).unwrap().subscribers, vec![sa]);
-  assert_eq!(s.entry(rb).unwrap().subscribers, vec![sb]);
+  assert_eq!(s.subscribers(ra), vec![sa]);
+  assert_eq!(s.subscribers(rb), vec![sb]);
   // The side table records each subscription's registration key.
   assert_eq!(s.subscription_key(sa), Some(key("/a").as_slice()));
   assert_eq!(s.subscription_key(sb), Some(key("/b").as_slice()));
@@ -107,7 +107,7 @@ fn descendant_is_covered() {
   s.commit_watch(&outcome, ra, &key("/a/b"));
 
   assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
-  assert_eq!(s.entry(ra).unwrap().subscribers, vec![sa, sb]);
+  assert_eq!(s.subscribers(ra), vec![sa, sb]);
   // The covered subscription records its own (narrower) key and its interest.
   assert_eq!(s.subscription_key(sb), Some(key("/a/b").as_slice()));
   assert_eq!(s.subscription_interest(sb), Some(Interest::all()));
@@ -147,7 +147,7 @@ fn ancestor_widens_and_repoints() {
   assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
   // The old narrow root is gone; both subs now ride the wider root.
   assert!(s.entry(narrow).is_none());
-  assert_eq!(s.entry(wide).unwrap().subscribers, vec![s_narrow, s_wide]);
+  assert_eq!(s.subscribers(wide), vec![s_narrow, s_wide]);
   assert_eq!(s.entry(wide).unwrap().key, key("/a"));
 }
 
@@ -166,7 +166,7 @@ fn unwatch_last_subscriber_empties_root() {
     s.plan_unwatch(sb),
     Some(UnwatchOutcome::Dropped { shrink: None })
   ));
-  assert_eq!(s.entry(ra).unwrap().subscribers, vec![sa]);
+  assert_eq!(s.subscribers(ra), vec![sa]);
 
   // Dropping the last subscriber empties (and removes) the root.
   assert!(matches!(
@@ -905,8 +905,11 @@ proptest! {
   fn no_zero_subscriber_root(ops in proptest::collection::vec(op_strategy(), 0..40)) {
     let (s, _live) = run(&ops);
     for (_key, handle) in s.roots() {
-      let entry = s.entry(handle).expect("indexed root has an entry");
-      prop_assert!(!entry.subscribers.is_empty(), "root {handle} has no subscribers");
+      s.entry(handle).expect("indexed root has an entry");
+      prop_assert!(
+        !s.subscribers(handle).is_empty(),
+        "root {handle} has no subscribers"
+      );
     }
   }
 
@@ -917,7 +920,7 @@ proptest! {
     let (s, live) = run(&ops);
     let engine_subs: HashSet<Subscription> = s
       .roots()
-      .flat_map(|(_k, h)| s.entry(h).unwrap().subscribers.clone())
+      .flat_map(|(_k, h)| s.subscribers(h).to_vec())
       .collect();
     let model_subs: HashSet<Subscription> = live.keys().copied().collect();
     prop_assert_eq!(engine_subs, model_subs);
@@ -976,5 +979,104 @@ fn cohort_retirement_clones_values_linearly() {
     "cohort retirement is linear in value clones (spent {spent} for {COHORT} — \
      the old per-subscriber path spent ~{})",
     COHORT * COHORT / 2
+  );
+}
+
+/// A cohort's **construction** is linear in caller-value clones, not quadratic. The
+/// retirement cell above deliberately zeroes the counter first, so it measures none of
+/// the cost of building the cohort — which was the larger half: a `Vec`-backed cover
+/// entry deep-cloned every value already present on every add.
+///
+/// Fail-on-old (`CoverEntry` holding `Vec<(Subscription, V)>`): 256 same-key admissions
+/// spend ~32,640 value clones before a single event is routed.
+#[test]
+fn cohort_construction_clones_values_linearly() {
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+
+  #[derive(Debug)]
+  struct CountedValue(Arc<AtomicUsize>);
+  impl Clone for CountedValue {
+    fn clone(&self) -> Self {
+      self.0.fetch_add(1, Ordering::Relaxed);
+      Self(Arc::clone(&self.0))
+    }
+  }
+
+  const COHORT: usize = 256;
+  let clones = Arc::new(AtomicUsize::new(0));
+  let mut s: Subsumer<OsString, CountedValue, u32> = Subsumer::new();
+  let k = key("/cohort");
+  for _ in 0..COHORT {
+    let outcome = s.plan_watch(&k, CountedValue(Arc::clone(&clones)), Interest::all());
+    let fs_root = match &outcome {
+      WatchOutcome::Covered { fs_root, .. } => *fs_root,
+      WatchOutcome::Widen { .. } | WatchOutcome::Disjoint { .. } => 1,
+    };
+    s.commit_watch(&outcome, fs_root, &k);
+  }
+
+  let spent = clones.load(Ordering::Relaxed);
+  assert!(
+    spent <= COHORT * 2,
+    "same-key cohort construction is linear in value clones (spent {spent} for {COHORT} — \
+     the Vec-backed entry spent ~{})",
+    COHORT * (COHORT - 1) / 2
+  );
+}
+
+/// Per-event attribution — `subscription_value`, called once for **every** delivery — is a
+/// point lookup, not a scan of the whole same-key cohort.
+///
+/// The probe is a deterministic counter, not a timer: `COHORT_VISITS` records how many
+/// cohort members each attribution lookup had to visit, and the assertion binds that to the
+/// lookup rather than to the cohort as `N` doubles.
+///
+/// Fail-on-old (`CoverEntry::value_of` linear-scanning a `Vec`): a lookup visits its own
+/// index's worth of members, so resolving all `N` costs `N(N+1)/2` visits — the per-event
+/// factor the finding names.
+#[test]
+fn per_event_attribution_does_not_scan_the_cohort() {
+  use super::COHORT_VISITS;
+
+  /// Cohort members visited while resolving the value of every member of an `n`-member
+  /// same-key cohort — exactly the attribution work one raw event to that cohort pays on
+  /// top of the `n` deliveries it owes.
+  fn visits_resolving_every_member(n: usize) -> usize {
+    let mut s: Subsumer<OsString, u32, u32> = Subsumer::new();
+    let k = key("/cohort");
+    let mut subs = Vec::new();
+    for i in 0..n {
+      let outcome = s.plan_watch(&k, i as u32, Interest::all());
+      let (fs_root, sub) = match &outcome {
+        WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
+        WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (1, *sub),
+      };
+      s.commit_watch(&outcome, fs_root, &k);
+      subs.push(sub);
+    }
+    COHORT_VISITS.with(|visits| visits.set(0));
+    for &sub in &subs {
+      assert!(s.subscription_value(sub).is_some(), "every member resolves");
+    }
+    COHORT_VISITS.with(core::cell::Cell::get)
+  }
+
+  // Resolving every member visits exactly one member per lookup, at both sizes — so the
+  // total is linear in the cohort and the PER-LOOKUP cost does not move when it doubles.
+  assert_eq!(
+    visits_resolving_every_member(64),
+    64,
+    "one visit per attribution lookup at 64 members (a scan would spend {})",
+    64 * 65 / 2
+  );
+  assert_eq!(
+    visits_resolving_every_member(512),
+    512,
+    "still one visit per lookup at 512 members — the per-delivery cost is independent of \
+     the cohort (a scan would spend {})",
+    512 * 513 / 2
   );
 }

@@ -33,6 +33,7 @@ enum Projection {
   Whole,
   MoveOut,
   MoveIn,
+  RescanClamped,
 }
 
 impl FakeEvent {
@@ -87,6 +88,29 @@ impl RoutableEvent<OsString> for FakeEvent {
   fn deliver_move_in(&self, sub: Subscription) -> (Subscription, Projection) {
     (sub, Projection::MoveIn)
   }
+
+  fn deliver_rescan_clamped(
+    &self,
+    sub: Subscription,
+    _key: &[OsString],
+  ) -> (Subscription, Projection) {
+    (sub, Projection::RescanClamped)
+  }
+
+  /// The fake delivery carries no location, so the coordinate anchor is immaterial here
+  /// (the rebase below is inert and the rebase itself is asserted in `route::tests`).
+  /// Reporting the key's own depth makes every subscriber's strip saturate to zero.
+  fn captured_root_depth(&self) -> usize {
+    self.key.len()
+  }
+
+  /// The fake delivery carries no location, so rebasing is inert here; the coordinate
+  /// rebase is asserted in `route::tests`.
+  fn rebase(&self, _delivered: &mut (Subscription, Projection), _strip: usize) {}
+
+  /// Unreachable with the anchor above (no subscriber can sit above the event's own key
+  /// depth and still cover it), and inert regardless — no location to drop.
+  fn anchor_at_root(&self, _delivered: &mut (Subscription, Projection)) {}
 }
 
 fn sub(id: u64) -> Subscription {
@@ -94,15 +118,16 @@ fn sub(id: u64) -> Subscription {
 }
 
 /// A root serving the given subscribers, each registered at its own key (the two
-/// inputs `stamp_and_fan_out`'s coverage step needs). The root path itself is
-/// immaterial — the coverage step keys on the subscribers and their own keys.
+/// inputs `stamp_and_fan_out`'s coverage step needs). The root itself never appears —
+/// coverage keys on the subscribers and their own keys, and the coordinate anchor rides
+/// on the event.
 struct Fixture {
   subscribers: Vec<Subscription>,
   keys: Vec<(Subscription, Vec<OsString>)>,
 }
 
 impl Fixture {
-  fn new(_root_path: &str, subscribers: &[(u64, &str)]) -> Self {
+  fn new(subscribers: &[(u64, &str)]) -> Self {
     let mut subs = Vec::new();
     let mut keys = Vec::new();
     for &(id, path) in subscribers {
@@ -188,7 +213,7 @@ impl Fixture {
 #[test]
 fn stamps_are_monotone_within_a_root() {
   let mut ledger = EpochLedger::new();
-  let fx = Fixture::new("/a", &[(1, "/a")]);
+  let fx = Fixture::new(&[(1, "/a")]);
   let s = sub(1);
 
   let mut stamps = Vec::new();
@@ -218,7 +243,7 @@ fn post_widen_new_root_events_are_not_dominated_by_the_widen_rescan() {
   let s = sub(1);
 
   // Root A serves subscription 1. Three events at fs epochs 0,1,2.
-  let root_a = Fixture::new("/a/b", &[(1, "/a/b")]);
+  let root_a = Fixture::new(&[(1, "/a/b")]);
   let mut pre_widen = Vec::new();
   for raw in 0..3 {
     let delivered = root_a.deliver(&mut ledger, &FakeEvent::change("/a/b/f"), Epoch::new(raw));
@@ -242,7 +267,7 @@ fn post_widen_new_root_events_are_not_dominated_by_the_widen_rescan() {
 
   // The newly-armed wider root /a now delivers genuine events, whose fs epochs
   // RESTART at 0,1 (per-ScopeId, fresh kernel arm). Rebasing stamps them at 3+0, 3+1.
-  let root_b = Fixture::new("/a", &[(1, "/a")]);
+  let root_b = Fixture::new(&[(1, "/a")]);
   let mut post_widen = Vec::new();
   for raw in 0..2 {
     let delivered = root_b.deliver(&mut ledger, &FakeEvent::change("/a/b/f"), Epoch::new(raw));
@@ -293,11 +318,11 @@ fn two_subscriptions_onto_one_new_root_rebase_independently() {
   let (s1, s2) = (sub(1), sub(2));
 
   // Drive the two subscriptions to DIFFERENT high-waters on their own narrow roots.
-  let root1 = Fixture::new("/a/b", &[(1, "/a/b")]);
+  let root1 = Fixture::new(&[(1, "/a/b")]);
   for raw in 0..5 {
     root1.deliver(&mut ledger, &FakeEvent::change("/a/b/f"), Epoch::new(raw));
   }
-  let root2 = Fixture::new("/a/c", &[(2, "/a/c")]);
+  let root2 = Fixture::new(&[(2, "/a/c")]);
   for raw in 0..2 {
     root2.deliver(&mut ledger, &FakeEvent::change("/a/c/f"), Epoch::new(raw));
   }
@@ -319,7 +344,7 @@ fn two_subscriptions_onto_one_new_root_rebase_independently() {
 
   // The SAME raw fs epoch 0 on the shared new root /a stamps DIFFERENTLY for each,
   // because each carries its own rebased base.
-  let shared = Fixture::new("/a", &[(1, "/a"), (2, "/a")]);
+  let shared = Fixture::new(&[(1, "/a"), (2, "/a")]);
   let delivered = shared.deliver(&mut ledger, &FakeEvent::change("/a/x"), Epoch::new(0));
   let stamp_of = |who: Subscription| {
     delivered
@@ -342,17 +367,17 @@ fn two_subscriptions_onto_one_new_root_rebase_independently() {
   assert!(stamp_of(s1) >= r1 && stamp_of(s2) >= r2);
 }
 
-/// A `Rescan` fs itself reports is stamped and fanned out to EVERY subscriber of the
-/// root (coverage bypassed), and its umbrella stamp dominates each subscriber's prior
-/// stream — the same dominance the synthetic widen Rescan gives, but for an
-/// fs-sourced one.
+/// A `Rescan` fs itself reports is stamped and fanned out to every subscriber its subtree
+/// INTERSECTS — bypassing the filter, not the geometry — and its umbrella stamp dominates
+/// each of those subscribers' prior stream, the same dominance the synthetic widen Rescan
+/// gives but for an fs-sourced one. A disjoint sibling is stamped not at all: it receives
+/// no delivery, so the loss must not perturb its epoch space either.
 #[test]
 fn fs_rescan_is_stamped_and_dominates_prior_stream() {
   let mut ledger = EpochLedger::new();
-  // Root /a serves /a and the narrower /a/b/deep (which a plain event at /a/x would
-  // NOT cover — but a Rescan reaches it anyway).
-  let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/b/deep")]);
-  let (s1, s2) = (sub(1), sub(2));
+  // Root /a serves /a, the narrower /a/b/deep, and /a/x/inner (which the loss contains).
+  let fx = Fixture::new(&[(1, "/a"), (2, "/a/b/deep"), (3, "/a/x/inner")]);
+  let (s1, s2, s3) = (sub(1), sub(2), sub(3));
 
   // Give /a a couple of prior events so its high-water is non-trivial.
   fx.deliver(&mut ledger, &FakeEvent::change("/a/x"), Epoch::new(0));
@@ -363,8 +388,8 @@ fn fs_rescan_is_stamped_and_dominates_prior_stream() {
     "plain event only covers /a"
   );
 
-  // A Rescan located at /a/x — which /a/b/deep does NOT cover — is delivered to BOTH,
-  // stamped in each subscriber's own space (from each one's base START, raw 2 → 2).
+  // A Rescan located at /a/x reaches /a (an ancestor of the loss) and /a/x/inner (which
+  // the loss contains), each stamped in its own space; /a/b/deep is disjoint from it.
   let delivered = fx.deliver(&mut ledger, &FakeEvent::rescan("/a/x"), Epoch::new(2));
   let stamp_of = |who: Subscription| delivered.iter().find(|(s, _)| *s == who).map(|(_, e)| *e);
   assert_eq!(
@@ -373,9 +398,14 @@ fn fs_rescan_is_stamped_and_dominates_prior_stream() {
     "the Rescan reaches /a and dominates its prior stamp of 1"
   );
   assert_eq!(
-    stamp_of(s2),
+    stamp_of(s3),
     Some(Epoch::new(2)),
-    "the Rescan reaches /a/b/deep despite coverage (loss is never narrowed away)"
+    "the Rescan reaches the contained /a/x/inner, clamped to its own key"
+  );
+  assert_eq!(
+    stamp_of(s2),
+    None,
+    "a disjoint sibling receives no recovery instruction, and so is never stamped"
   );
   assert!(
     stamp_of(s1).unwrap() > Epoch::new(1),
@@ -392,7 +422,7 @@ fn move_decomposition_stamps_each_projection() {
   let mut ledger = EpochLedger::new();
   let (s1, s2) = (sub(1), sub(2));
   // Two sibling subs on one root, at different high-waters so their stamps differ.
-  let fx = Fixture::new("/a", &[(1, "/a/src"), (2, "/a/dst")]);
+  let fx = Fixture::new(&[(1, "/a/src"), (2, "/a/dst")]);
   fx.deliver(&mut ledger, &FakeEvent::change("/a/src/x"), Epoch::new(3)); // s1 hw = 3
   fx.deliver(&mut ledger, &FakeEvent::change("/a/dst/x"), Epoch::new(1)); // s2 hw = 1
 
@@ -432,7 +462,7 @@ fn move_decomposition_stamps_each_projection() {
 fn shed_rescan_dominates_prior_stream_and_same_root_deltas_sort_at_or_above() {
   let mut ledger = EpochLedger::new();
   let s = sub(1);
-  let root = Fixture::new("/a", &[(1, "/a")]);
+  let root = Fixture::new(&[(1, "/a")]);
 
   // Same-root events at raw fs epochs 0..5 stamp 0..4 (base START), driving high-water to 4.
   let mut pre = Vec::new();
@@ -506,7 +536,7 @@ fn shed_rescan_dominates_prior_stream_and_same_root_deltas_sort_at_or_above() {
 fn post_shed_same_generation_event_is_not_dominated_by_the_shed_rescan() {
   let mut ledger = EpochLedger::new();
   let s = sub(1);
-  let root = Fixture::new("/a", &[(1, "/a")]);
+  let root = Fixture::new(&[(1, "/a")]);
 
   // Ordinary events in ONE reconciliation generation all carry the SAME raw fs epoch (0);
   // they stamp base + 0 = 0 and high-water stays 0.
@@ -552,7 +582,7 @@ fn post_shed_same_generation_event_is_not_dominated_by_the_shed_rescan() {
 fn source_rescan_strictly_dominates_a_post_shed_same_generation_event() {
   let mut ledger = EpochLedger::new();
   let s = sub(1);
-  let root = Fixture::new("/a", &[(1, "/a")]);
+  let root = Fixture::new(&[(1, "/a")]);
 
   // One generation of ordinary events (raw 0): stamp base + 0 = 0, high-water 0.
   root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(0));
@@ -596,7 +626,7 @@ fn source_rescan_strictly_dominates_a_post_shed_same_generation_event() {
 fn a_filtered_out_delivery_does_not_advance_high_water() {
   let mut ledger = EpochLedger::new();
   let s = sub(1);
-  let root = Fixture::new("/a", &[(1, "/a")]);
+  let root = Fixture::new(&[(1, "/a")]);
 
   // An admitted event at raw 0 stamps 0 and drives high-water to 0.
   let d0 = root.deliver(&mut ledger, &FakeEvent::change("/a/f"), Epoch::new(0));

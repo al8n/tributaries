@@ -85,7 +85,7 @@
 //! subscription's run contiguous and in epoch order.
 
 use std::{
-  collections::{BTreeMap, HashMap, VecDeque},
+  collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
   time::Instant,
   vec::Vec,
 };
@@ -95,6 +95,30 @@ use crate::{
   options::{Debounce, DebounceConfig},
   subscription::Subscription,
 };
+
+// Buffered entries INSPECTED by a deadline query (`next_deadline` / `drain_ready`) — the
+// quantity the deadline index exists to keep proportional to what is DUE rather than to what
+// is buffered. Both queries sit on the owner's hot path: one runs after every raw source
+// record, the other before every `select!`, so a full-buffer scan turns a settling burst into
+// a per-tick CPU multiplier — debounce amplifying the storm it exists to damp.
+//
+// Thread-local so libtest's parallel cells cannot perturb one another's count (each test body
+// owns its thread).
+#[cfg(test)]
+thread_local! {
+  pub(crate) static DEADLINE_VISITS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Records that a deadline query inspected `n` buffered entries.
+#[cfg(test)]
+fn note_deadline_visits(n: usize) {
+  DEADLINE_VISITS.with(|visits| visits.set(visits.get() + n));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+#[allow(clippy::inline_always)]
+fn note_deadline_visits(_n: usize) {}
 
 #[cfg(test)]
 mod tests;
@@ -180,6 +204,18 @@ pub(crate) struct Coalescer<C, V> {
   /// order within a subscription is by admission sequence (`Buffered::seq`), not this path
   /// key — see the [module docs](self#per-subscription-emission-order-design-8).
   buffer: BTreeMap<Key<C>, Buffered<C, V>>,
+  /// The **deadline index**: `(emit_at, key)` for every buffered entry, ordered by deadline.
+  /// Kept in exact lockstep with [`buffer`](Self::buffer) — every insert, every collapse that
+  /// moves a deadline, and every removal maintains it — so
+  /// [`next_deadline`](Self::next_deadline) reads the earliest deadline as the set's first
+  /// element and [`drain_ready`](Self::drain_ready) walks only the prefix that is actually due.
+  ///
+  /// Without it both queries scanned the whole buffer: the driver calls `drain_ready` after
+  /// **every** raw source record (even one that fanned out to nothing) and `next_deadline`
+  /// before **every** `select!`, so `T` ticks against `M` settling paths cost `Θ(T × M)` entry
+  /// inspections before any routing work — and raising `max_buffered` to absorb a bigger
+  /// workload turned a memory-headroom knob into a latency multiplier.
+  deadlines: BTreeSet<(Instant, Key<C>)>,
   /// Events that must emit *immediately*, in FIFO order: [`Moved`](EventKind::Moved)
   /// whole, a [`Rescan`](EventKind::Rescan), and the buffered entries a `Moved`/`Rescan`
   /// flushed. Each is tagged with the `now` it became ready (its effective `emit_at`),
@@ -212,6 +248,7 @@ where
       policies: HashMap::new(),
       per_sub_len: HashMap::new(),
       buffer: BTreeMap::new(),
+      deadlines: BTreeSet::new(),
       ready: VecDeque::new(),
       next_seq: 0,
     }
@@ -375,12 +412,16 @@ where
   /// The earliest instant at which some entry is due — the timer target the driver
   /// sleeps until (design §6). [`None`] when nothing is pending.
   ///
-  /// The minimum of every buffered entry's `emit_at` and the head of the ready queue
+  /// The minimum of the deadline index's first entry and the head of the ready queue
   /// (FIFO, and `now` is nondecreasing, so its front is the earliest-ready). A ready
   /// deadline is in the (recent) past, so the driver's sleep returns at once and it
   /// drains — that is how a `Rescan`/`Moved` bypasses the still-buffering bursts.
+  ///
+  /// One index probe, not a buffer scan: this runs before every owner `select!`.
   pub(crate) fn next_deadline(&self) -> Option<Instant> {
-    let buffered = self.buffer.values().map(|b| b.emit_at).min();
+    self.debug_check_index();
+    let buffered = self.deadlines.first().map(|(at, _)| *at);
+    note_deadline_visits(usize::from(buffered.is_some()));
     let ready = self.ready.front().map(|(at, _)| *at);
     match (buffered, ready) {
       (Some(a), Some(b)) => Some(a.min(b)),
@@ -411,18 +452,33 @@ where
     // order (admission is monotone), so a high-water consumer never sees a subscription's
     // epochs go backwards. Across subscriptions the order is free (independent epoch
     // spaces); keying on the subscription first keeps each one's run contiguous.
-    let mut due: Vec<(Subscription, u64, Key<C>)> = self
-      .buffer
-      .iter()
-      .filter(|(_, b)| b.emit_at <= now)
-      .map(|(k, b)| (k.0, b.seq, k.clone()))
-      .collect();
+    //
+    // The due set comes off the DEADLINE INDEX's ordered prefix, so a tick with nothing due
+    // inspects one entry rather than the whole buffer. The boundary probe (the first not-yet-due
+    // deadline) is what makes the walk stop; everything after it is strictly later.
+    let mut due: Vec<(Subscription, u64, Key<C>)> = Vec::new();
+    let mut visited = 0;
+    for (at, key) in &self.deadlines {
+      visited += 1;
+      if *at > now {
+        break;
+      }
+      let seq = self
+        .buffer
+        .get(key)
+        .expect("the index names a buffered entry")
+        .seq;
+      due.push((key.0, seq, key.clone()));
+    }
+    note_deadline_visits(visited);
     due.sort_by_key(|(sub, seq, _)| (*sub, *seq));
     for (_, _, key) in due {
       let entry = self.buffer.remove(&key).expect("key just collected");
+      self.deadlines.remove(&(entry.emit_at, key.clone()));
       self.dec_per_sub(key.0);
       out.push(entry.event);
     }
+    self.debug_check_index();
   }
 
   /// Appends *every* pending event to `out` regardless of deadline — the ready queue
@@ -437,6 +493,7 @@ where
     // The buffered tail in (subscription, admission-sequence) order — the same
     // per-subscription epoch order `drain_ready` keeps, so a teardown flush cannot deliver
     // a subscription's epochs out of order (design §8).
+    self.deadlines.clear();
     let mut tail: Vec<(Subscription, u64, Event<C, V>)> = std::mem::take(&mut self.buffer)
       .into_iter()
       .map(|((sub, _path), b)| (sub, b.seq, b.event))
@@ -493,11 +550,15 @@ where
         seq,
         event: ev,
       };
+      self.deadlines.insert((entry.emit_at, key.clone()));
       self.buffer.insert(key, entry);
       *self.per_sub_len.entry(sub).or_insert(0) += 1;
       return None;
     };
     let first_seen = buffered.first_seen;
+    // The index entry currently filed under this deadline; every arm below either moves it to
+    // the recomputed deadline or removes it, so the index never keeps a stale one.
+    let was_due_at = buffered.emit_at;
 
     match Self::collapse(buffered.event.kind(), ev.kind()) {
       Collapse::KeepBuffered => {
@@ -538,10 +599,32 @@ where
         // emit nothing. (The sequence taken above is simply left unused.) The removed
         // entry frees its fresh-entry slot.
         self.buffer.remove(&key);
+        self.deadlines.remove(&(was_due_at, key.clone()));
         self.dec_per_sub(key.0);
+        return None;
       }
     }
+    // A surviving collapse pushed the settle out: re-file the index entry under its new
+    // deadline. Reading the new value back from the buffer keeps the index and the entry from
+    // ever disagreeing about which deadline is filed.
+    let now_due_at = self.buffer.get(&key).expect("the entry survived").emit_at;
+    if now_due_at != was_due_at {
+      self.deadlines.remove(&(was_due_at, key.clone()));
+      self.deadlines.insert((now_due_at, key));
+    }
     None
+  }
+
+  /// The deadline index holds exactly one entry per buffered entry. Drift is the bug class
+  /// this representation introduces — an index entry left behind after a removal would resurrect
+  /// a deleted key on the next drain, and a missing one would strand a settling entry past its
+  /// deadline — so every mutation path is checked from the two hot queries.
+  fn debug_check_index(&self) {
+    debug_assert_eq!(
+      self.deadlines.len(),
+      self.buffer.len(),
+      "the deadline index drifted from the buffer"
+    );
   }
 
   /// Decrements `sub`'s fresh-entry count by one, dropping the map entry at zero
@@ -617,6 +700,7 @@ where
     let flushed = entries.len();
     for (_, key) in entries {
       let entry = self.buffer.remove(&key).expect("key just collected");
+      self.deadlines.remove(&(entry.emit_at, key));
       self.ready.push_back((now, entry.event));
     }
     // Every buffered entry of `sub` moved to the ready queue: its fresh-entry count
@@ -650,7 +734,9 @@ where
     let entries = self.subscription_entries(sub);
     let dropped = entries.len();
     for (_, key) in entries {
-      self.buffer.remove(&key);
+      if let Some(entry) = self.buffer.remove(&key) {
+        self.deadlines.remove(&(entry.emit_at, key));
+      }
     }
     // Every buffered entry of `sub` is gone: its fresh-entry count reconciles to zero —
     // the counter zeroing behind the shed path's "purge frees the cap" guarantee.

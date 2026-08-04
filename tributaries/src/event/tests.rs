@@ -68,6 +68,72 @@ fn non_rescan_at_an_ancestor_does_not_reach() {
   );
 }
 
+/// A whole move has TWO affected endpoints. Asking about the source — the only key a
+/// tracker of the moved-away object knows — must answer `true`, or that tracker is never
+/// told its file left and stays silently stale forever.
+#[test]
+fn a_whole_move_reaches_its_source_endpoint() {
+  let moved = ev(
+    "/a/new",
+    EventKind::Moved {
+      from: key("/a/old"),
+    },
+  );
+  assert!(
+    moved.reaches(&key("/a/new")),
+    "the destination is the event's own key"
+  );
+  assert!(
+    moved.reaches(&key("/a/old")),
+    "the move SOURCE is an affected endpoint: the object left that key"
+  );
+  assert!(
+    !moved.reaches(&key("/a/unrelated")),
+    "a key that is neither endpoint is not reached"
+  );
+}
+
+/// The source endpoint is an EXACT-key fact, not a subtree one: a move of `/a/old` does
+/// not oblige anything about `/a/old/child` (the whole subtree moved with it and is
+/// reported under the destination), so the endpoint test must not start behaving like a
+/// rescan.
+#[test]
+fn a_whole_move_does_not_reach_below_either_endpoint() {
+  let moved = ev(
+    "/a/new",
+    EventKind::Moved {
+      from: key("/a/old"),
+    },
+  );
+  assert!(
+    !moved.reaches(&key("/a/old/child")),
+    "only a Rescan propagates downward; a move endpoint is exact"
+  );
+  assert!(
+    !moved.reaches(&key("/a/new/child")),
+    "the destination endpoint is exact too"
+  );
+}
+
+/// The single-endpoint projections a move decomposes into carry no source key, so they
+/// reach only the key they name — the property that keeps `reaches` honest for a
+/// subscriber that saw only half the rename.
+#[test]
+fn a_move_projection_reaches_only_the_key_it_names() {
+  let move_out = ev("/a/old", EventKind::Removed);
+  assert!(move_out.reaches(&key("/a/old")));
+  assert!(
+    !move_out.reaches(&key("/a/new")),
+    "a move-out projection knows nothing of the destination"
+  );
+  let move_in = ev("/a/new", EventKind::Created);
+  assert!(move_in.reaches(&key("/a/new")));
+  assert!(
+    !move_in.reaches(&key("/a/old")),
+    "a move-in projection knows nothing of the source"
+  );
+}
+
 #[test]
 fn rescan_at_a_descendant_does_not_reach_the_ancestor_key() {
   let rescan = ev("/a/b/deep", EventKind::Rescan);

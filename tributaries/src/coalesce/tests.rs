@@ -1375,3 +1375,69 @@ fn buffered_entry_cap_bounds_high_cardinality_bursts() {
   );
   assert_eq!(coalescer.buffer.len(), 64, "still exactly at the cap");
 }
+
+/// The deadline queries cost what is DUE, not what is buffered.
+///
+/// The driver runs `drain_ready` after every raw source record and `next_deadline` before
+/// every `select!`, so with `M` settling paths a full-buffer scan makes `T` otherwise
+/// constant-work ticks cost `Θ(T × M)` inspections — debounce amplifying the storm it exists
+/// to damp. The probe is a deterministic counter, not a timer: `DEADLINE_VISITS` records how
+/// many buffered entries each query inspected.
+///
+/// Fail-on-old (`next_deadline` taking `.min()` over every value and `drain_ready` filtering
+/// the whole map): 200 idle ticks against a 512-entry buffer inspect ~204,800 entries.
+#[test]
+fn deadline_queries_do_not_scan_the_whole_buffer() {
+  use super::DEADLINE_VISITS;
+
+  const BUFFERED: usize = 512;
+  const IDLE_TICKS: usize = 200;
+
+  let s = sub(1);
+  let start = Instant::now();
+  // A quiet window far longer than the ticks below, so nothing is ever due during them.
+  let config = DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(7200))
+    .with_max_buffered(BUFFERED * 2);
+  let mut c: Coalescer<OsString, ()> = Coalescer::new(Some(config));
+  for i in 0..BUFFERED {
+    assert!(
+      c.admit(modified(s, &std::format!("/a/f{i}"), i as u64), start)
+        .is_none(),
+      "the buffer admits every distinct path under its cap"
+    );
+  }
+
+  // Idle ticks: nothing is due, so each query should inspect O(1) entries.
+  DEADLINE_VISITS.with(|visits| visits.set(0));
+  let mut out = Vec::new();
+  for _ in 0..IDLE_TICKS {
+    assert!(c.next_deadline().is_some(), "entries are still settling");
+    c.drain_ready(start, &mut out);
+  }
+  let idle_visits = DEADLINE_VISITS.with(core::cell::Cell::get);
+  assert!(
+    out.is_empty(),
+    "nothing was due, so nothing drained: {}",
+    out.len()
+  );
+  assert!(
+    idle_visits <= IDLE_TICKS * 4,
+    "an idle tick inspects a bounded number of buffered entries, not the buffer \
+     ({idle_visits} visits over {IDLE_TICKS} ticks against {BUFFERED} buffered — a full scan \
+     would spend {})",
+    IDLE_TICKS * BUFFERED * 2
+  );
+
+  // And a drain that IS due costs the due set, still not the buffer: pushing the clock past
+  // the whole window makes every entry due at once, which is the only time the walk is long.
+  DEADLINE_VISITS.with(|visits| visits.set(0));
+  c.drain_ready(start + Duration::from_secs(7201), &mut out);
+  let drain_visits = DEADLINE_VISITS.with(core::cell::Cell::get);
+  assert_eq!(out.len(), BUFFERED, "the whole buffer came due and drained");
+  assert!(
+    drain_visits <= BUFFERED + 1,
+    "a due drain inspects the due prefix ({drain_visits} for {BUFFERED} due)"
+  );
+}

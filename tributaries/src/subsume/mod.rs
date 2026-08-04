@@ -102,10 +102,10 @@ pub(crate) struct Published<C, V, H> {
 }
 
 /// One key's live-subscription coverage-plane entry: every live subscription registered at
-/// **exactly** this key, each paired with the caller value it carries, in registration order.
-/// The entry is present in [`Published::covers`] iff it holds at least one subscription (the key
-/// is removed when its last subscription drops), so its presence answers
-/// [`WatchView::is_watched`] and its [`value`](Self::value) answers attribution.
+/// **exactly** this key, each paired with the caller value it carries. The entry is present
+/// in [`Published::covers`] iff it holds at least one subscription (the key is removed when
+/// its last subscription drops), so its presence answers [`WatchView::is_watched`] and its
+/// [`value`](Self::value) answers attribution.
 ///
 /// A single stored value would not do: several subscriptions can share one key with **different**
 /// values (`watch("/a", A)` then `watch("/a", B)`), and one departing must restore the surviving
@@ -113,35 +113,72 @@ pub(crate) struct Published<C, V, H> {
 /// refcount. [`value`](Self::value) returns the **most-recent** (highest-id) live subscription's
 /// value, a deterministic tie-break that under monotonic ids is the last-installed surviving
 /// owner.
-#[derive(Clone)]
+///
+/// # Why a persistent trie and not a `Vec`
+///
+/// This entry lives inside an immutable radix value that is **cloned on every mutation** of the
+/// coverage plane and republished on every commit. A `Vec<(Subscription, V)>` makes that clone
+/// deep: registering `N` subscriptions at one key copies `N(N-1)/2` caller values, and `V` is
+/// caller-controlled and may be arbitrarily expensive. Worse, exact lookup and "most recent" were
+/// both linear scans, and exact lookup runs once **per delivery** — so one event on an `N`-member
+/// cohort cost `Θ(N²)` subscription comparisons on top of the `N` deliveries it owes.
+///
+/// Keying the cohort in its own [`Radix`] — by the subscription's `u64` id, whose big-endian byte
+/// decomposition orders lexicographically exactly as it does numerically — makes every one of
+/// those `O(log N)` or `O(1)`:
+///
+/// - cloning the entry is a structural-sharing root clone: `O(1)`, and it clones **no** `V`;
+/// - add and remove are single trie mutations;
+/// - [`value_of`](Self::value_of) is a point lookup, not a cohort scan;
+/// - [`value`](Self::value) is the trie's greatest key — the highest live id — read without
+///   visiting the rest of the cohort.
 pub(crate) struct CoverEntry<V> {
-  /// `(subscription, value)` for every live subscription at this exact key, in registration
-  /// order. Never empty while the entry is present (the key is removed on the last drop).
-  subs: Vec<(Subscription, V)>,
+  /// Every live subscription at this exact key, keyed by its `u64` id and valued by that
+  /// subscription's caller value. Never empty while the entry is present (the key is removed
+  /// on the last drop). Id order is registration order (ids are minted monotonically), so the
+  /// trie's greatest key is the most recently installed live owner.
+  subs: Radix<u8, V>,
+}
+
+// Cohort members visited by an attribution lookup (`CoverEntry::value` / `value_of`) — the
+// quantity this representation exists to hold constant. Attribution runs once per DELIVERED
+// EVENT, so a lookup that visits a cohort member per comparison makes one raw event to an
+// N-member cohort quadratic. A complexity regression reads this counter across a doubling
+// cohort and binds the per-lookup visit count to the lookup, not to the cohort.
+//
+// Thread-local so libtest's parallel cells cannot perturb one another's count (each test body
+// owns its thread).
+#[cfg(test)]
+thread_local! {
+  pub(crate) static COHORT_VISITS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Records that an attribution lookup visited `n` cohort members.
+#[cfg(test)]
+fn note_cohort_visits(n: usize) {
+  COHORT_VISITS.with(|visits| visits.set(visits.get() + n));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+#[allow(clippy::inline_always)]
+fn note_cohort_visits(_n: usize) {}
+
+// Hand-written rather than derived: the derive would demand `V: Clone`, but a `Radix` clone is
+// an `O(1)` structural-sharing root clone that touches no value at all. That is the whole point
+// of the representation — the coverage plane is cloned on every commit.
+impl<V> Clone for CoverEntry<V> {
+  fn clone(&self) -> Self {
+    Self {
+      subs: self.subs.clone(),
+    }
+  }
 }
 
 impl<V> CoverEntry<V> {
   /// An empty entry (no covering subscription yet).
   fn new() -> Self {
-    Self { subs: Vec::new() }
-  }
-
-  /// Records one more live subscription `sub` at this key, carrying `value`.
-  fn push(&mut self, sub: Subscription, value: V) {
-    self.subs.push((sub, value));
-  }
-
-  /// Drops `sub` from this key (a no-op if absent), leaving every other subscription sharing it
-  /// — so attribution falls back to a surviving owner rather than to nothing.
-  /// Drops every subscription in `departing` in ONE pass — the batch-retirement
-  /// primitive: a cohort retire clones this entry once and retains
-  /// through it once, instead of clone-per-subscriber.
-  fn remove_all(&mut self, departing: &std::collections::HashSet<Subscription>) {
-    self.subs.retain(|(sub, _)| !departing.contains(sub));
-  }
-
-  fn remove(&mut self, sub: Subscription) {
-    self.subs.retain(|(s, _)| *s != sub);
+    Self { subs: Radix::new() }
   }
 
   /// Whether no live subscription remains at this key (the caller then removes the key).
@@ -150,15 +187,17 @@ impl<V> CoverEntry<V> {
   }
 
   /// The attribution value: the **most-recent** (highest-id) live subscription's value — the
-  /// deterministic tie-break when several live subscriptions share this exact key. Never panics:
+  /// deterministic tie-break when several live subscriptions share this exact key. Read as the
+  /// cohort trie's greatest key, so it costs one descent rather than a scan. Never panics:
   /// a present entry always holds at least one subscription.
   pub(crate) fn value(&self) -> &V {
-    &self
+    // ONE member: the trie's greatest key is reached by descent, not by comparing the cohort.
+    note_cohort_visits(1);
+    self
       .subs
-      .iter()
-      .max_by_key(|(sub, _)| *sub)
+      .values_rev()
+      .next()
       .expect("a present cover entry holds at least one live subscription")
-      .1
   }
 
   /// This **exact** subscription's own caller value, if `sub` is one of the live subscriptions at
@@ -166,12 +205,43 @@ impl<V> CoverEntry<V> {
   /// [`value`](Self::value) (the longest/most-recent owner the wait-free view query returns): a
   /// delivered event is attributed to the *specific* subscription it was routed to, whose own
   /// value the driver bakes onto it. `None` if `sub` is not (or no longer) at this key.
+  ///
+  /// A point lookup: the driver calls it once per delivered event, so a cohort scan here is a
+  /// per-event factor of the cohort size.
   pub(crate) fn value_of(&self, sub: Subscription) -> Option<&V> {
-    self
-      .subs
-      .iter()
-      .find(|(s, _)| *s == sub)
-      .map(|(_, value)| value)
+    // AT MOST ONE member: a point lookup reaches its own entry or none, whatever the cohort
+    // size — the property the complexity regression binds.
+    let found = self.subs.get(&sub.id().as_u64());
+    note_cohort_visits(usize::from(found.is_some()));
+    found
+  }
+}
+
+impl<V: Clone> CoverEntry<V> {
+  /// Records one more live subscription `sub` at this key, carrying `value`.
+  fn push(&mut self, sub: Subscription, value: V) {
+    let mut txn = self.subs.txn();
+    txn.insert(&sub.id().as_u64(), value);
+    self.subs = txn.commit();
+  }
+
+  /// Drops `sub` from this key (a no-op if absent), leaving every other subscription sharing it
+  /// — so attribution falls back to a surviving owner rather than to nothing.
+  fn remove(&mut self, sub: Subscription) {
+    let mut txn = self.subs.txn();
+    txn.remove(&sub.id().as_u64());
+    self.subs = txn.commit();
+  }
+
+  /// Drops every subscription in `departing` under ONE transaction — the batch-retirement
+  /// primitive a cohort retire uses, so a whole root's departure is one commit rather than one
+  /// per departing member.
+  fn remove_all(&mut self, departing: &std::collections::HashSet<Subscription>) {
+    let mut txn = self.subs.txn();
+    for sub in departing {
+      txn.remove(&sub.id().as_u64());
+    }
+    self.subs = txn.commit();
   }
 }
 
@@ -184,10 +254,17 @@ pub(crate) type Shared<C, V, H> = Arc<ArcSwap<Published<C, V, H>>>;
 /// One live root's registry record — the value stored in the subsumption radix.
 ///
 /// It carries the root's `key` (its radix key, recovered when a dead/uncovered root's
-/// subscribers must be named a dominating loss `Rescan`), the armed `handle`, and every caller
-/// [`Subscription`] this root serves, in registration order.
+/// subscribers must be named a dominating loss `Rescan`) and the armed `handle`.
 ///
-/// It carries **no** caller value and **no** interest. Attribution
+/// It carries **no subscriber list**. The routing cohort is mutable — every `Covered` watch
+/// appends to it — while this record is an *immutable* radix value that must be cloned to be
+/// changed. Holding the growing `Vec` here made each admission copy the whole cohort, so
+/// registering `N` subscriptions under one root copied `N(N-1)/2` subscription ids before a
+/// single event was routed. The cohort lives in the engine's own
+/// [`root_subs`](Subsumer::root_subs) map instead, where an append is `O(1)` and the published
+/// snapshot receives this lean record; nothing on the read plane ever needed the list.
+///
+/// It carries **no** caller value and **no** interest either. Attribution
 /// ([`covering`](crate::WatchView::covering)) reads the owning value from the live-subscription
 /// [`covers`](Published::covers) plane, not from the armed root — an armed root can outlive the
 /// subscription whose value equalled it (design §5). And every umbrella root is armed
@@ -204,8 +281,6 @@ pub(crate) struct RootRecord<C, H> {
   pub(crate) key: Vec<C>,
   /// The armed root handle.
   pub(crate) handle: H,
-  /// Every caller subscription this root serves, in registration order.
-  pub(crate) subscribers: Vec<Subscription>,
   /// The source's ACTUAL coverage for this root (set-cover): `None` = **full** coverage (a
   /// fresh/widened root never narrowed, or one grown back to its own key — the cancel-equivalent),
   /// `Some(cover)` = narrowed to the prefix-free antichain `cover`. Kept EXACT — it names the source's
@@ -374,6 +449,12 @@ pub(crate) struct Subsumer<C, V, H> {
   covers: Radix<C, CoverEntry<V>>,
   /// Root handle → its radix key. The O(1) reverse lookup for [`entry`](Self::entry).
   by_handle: HashMap<H, Vec<C>>,
+  /// Root handle → every caller subscription that root serves, in registration order — the
+  /// **mutable routing cohort**, deliberately owner-local rather than a field of the immutable
+  /// [`RootRecord`]. Fan-out iterates it; admission appends to it. Kept in lockstep with
+  /// `by_handle`: an entry is created with its root, moved by [`rebind_root`](Self::rebind_root),
+  /// and dropped when the root is emptied or force-removed.
+  root_subs: HashMap<H, Vec<Subscription>>,
   /// Live subscription → the root it rides, its own key, and its interest.
   subs: HashMap<Subscription, SubRecord<C, H>>,
   /// Not-yet-committed plans, keyed by the id each `plan_watch` freshly minted. A plan
@@ -406,6 +487,7 @@ where
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("Subsumer")
       .field("by_handle", &self.by_handle)
+      .field("root_subs", &self.root_subs)
       .field("subs", &self.subs)
       .field("pending", &self.pending)
       .finish_non_exhaustive()
@@ -465,6 +547,7 @@ where
       index,
       covers,
       by_handle: HashMap::new(),
+      root_subs: HashMap::new(),
       subs: HashMap::new(),
       pending: HashMap::new(),
       instance: InstanceId::mint(),
@@ -577,7 +660,9 @@ where
     let mut unwatch = Vec::new();
     let mut repointed = Vec::new();
     for record in self.index.descendants(key) {
-      repointed.extend_from_slice(&record.subscribers);
+      if let Some(cohort) = self.root_subs.get(&record.handle) {
+        repointed.extend_from_slice(cohort);
+      }
       unwatch.push(record.handle);
     }
     if !unwatch.is_empty() {
@@ -620,16 +705,13 @@ where
           value,
           interest,
         } = self.take_pending(*sub);
-        let root_key = self
-          .by_handle
-          .get(&fs_root)
+        // The routing cohort is owner-local, so admitting a covered subscription is a push —
+        // the immutable root record is untouched and the radix is not re-committed at all.
+        self
+          .root_subs
+          .get_mut(&fs_root)
           .expect("covered root is live")
-          .clone();
-        let mut txn = self.index.txn();
-        let mut record = txn.get(&root_key).expect("covered root record").clone();
-        record.subscribers.push(*sub);
-        txn.insert(root_key.as_slice(), record);
-        self.index = txn.commit();
+          .push(*sub);
         // The covered subscription's own (narrower) key joins the coverage plane carrying its
         // OWN value — so `is_watched` stays truthful for it AND attribution resolves it to its
         // own value, never the covering root's (whose own watch may later depart, leaving the
@@ -653,7 +735,6 @@ where
         let record = RootRecord {
           key: root_key.clone(),
           handle: fs_root,
-          subscribers: std::vec![*sub],
           // A freshly-armed root covers its whole key (`Interest::all`) — full coverage, never
           // narrowed (a set-cover prune).
           retained_cover: None,
@@ -662,6 +743,7 @@ where
         txn.insert(root_key.as_slice(), record);
         self.index = txn.commit();
         self.by_handle.insert(fs_root, root_key.clone());
+        self.root_subs.insert(fs_root, std::vec![*sub]);
         // The disjoint root's own subscription joins the coverage plane carrying its value, so
         // attribution resolves the root and its descendants to it (the value plane lives on
         // `covers`, not the armed root — design §5).
@@ -692,7 +774,6 @@ where
         let record = RootRecord {
           key: root_key.clone(),
           handle: fs_root,
-          subscribers,
           // The wider root is freshly armed `Interest::all` over its whole key — full coverage,
           // never narrowed (any pending set_cover for the released subsumed handles is moot);
           // set-cover .
@@ -709,8 +790,10 @@ where
 
         for old in unwatch {
           self.by_handle.remove(old);
+          self.root_subs.remove(old);
         }
         self.by_handle.insert(fs_root, root_key.clone());
+        self.root_subs.insert(fs_root, subscribers);
         for &moved in repointed {
           self
             .subs
@@ -763,19 +846,22 @@ where
       .expect("live subscription's root is live")
       .clone();
 
-    let mut txn = self.index.txn();
-    let mut root = txn.get(&root_key).expect("live root record").clone();
-    root.subscribers.retain(|&s| s != sub);
-    let emptied = root.subscribers.is_empty();
-    // The surviving subscribers, captured before `root` is moved back into the index — the
-    // over-broadness detection reads their keys (each still live in `self.subs`).
-    let survivors = root.subscribers.clone();
+    // The routing cohort is owner-local: a departure is a retain over it, never a clone of the
+    // immutable root record.
+    let cohort = self
+      .root_subs
+      .get_mut(&record.root)
+      .expect("live subscription's root has a cohort");
+    cohort.retain(|&s| s != sub);
+    let emptied = cohort.is_empty();
+    // The surviving subscribers — the over-broadness detection reads their keys (each still
+    // live in `self.subs`).
+    let survivors = cohort.clone();
     if emptied {
+      let mut txn = self.index.txn();
       txn.remove(root_key.as_slice());
-    } else {
-      txn.insert(root_key.as_slice(), root);
+      self.index = txn.commit();
     }
-    self.index = txn.commit();
 
     // Drop this subscription from the coverage plane (the root may live on for its other,
     // narrower subscribers, and the key stays covered iff another live sub shares it).
@@ -783,6 +869,7 @@ where
 
     let outcome = if emptied {
       self.by_handle.remove(&record.root);
+      self.root_subs.remove(&record.root);
       UnwatchOutcome::RootEmptied {
         fs_root: record.root,
       }
@@ -889,9 +976,11 @@ where
     newcomer: Option<&[C]>,
   ) -> Option<Vec<Vec<C>>> {
     let root_key = self.by_handle.get(&handle)?;
-    let record = self.index.get(root_key)?;
-    let mut subscriber_keys: Vec<Vec<C>> = record
-      .subscribers
+    self.index.get(root_key)?;
+    let mut subscriber_keys: Vec<Vec<C>> = self
+      .root_subs
+      .get(&handle)
+      .map_or(&[][..], Vec::as_slice)
       .iter()
       .map(|s| {
         self
@@ -989,6 +1078,22 @@ where
     self.index.get(key)
   }
 
+  /// The live root `fs_root`'s key together with its **routing cohort** — the subscriber list
+  /// fan-out iterates, held owner-local rather than inside the immutable record (see
+  /// [`RootRecord`]). `None` for a handle naming no live root.
+  pub(crate) fn root_view(&self, fs_root: H) -> Option<(&[C], &[Subscription])> {
+    let key = self.by_handle.get(&fs_root)?;
+    let record = self.index.get(key)?;
+    let cohort = self.root_subs.get(&fs_root).map_or(&[][..], Vec::as_slice);
+    Some((record.key.as_slice(), cohort))
+  }
+
+  /// The routing cohort of the live root `fs_root` — empty for a handle naming no live root.
+  #[cfg(test)]
+  pub(crate) fn subscribers(&self, fs_root: H) -> &[Subscription] {
+    self.root_subs.get(&fs_root).map_or(&[][..], Vec::as_slice)
+  }
+
   /// Force-drops the root `handle` and every subscriber riding it, returning those
   /// subscribers so the driver can reclaim their per-subscription state (filter, epoch
   /// ledger) — the **dead-root retirement** (design §4, invariant I4). A watched root
@@ -1000,10 +1105,11 @@ where
       return Vec::new();
     };
     let mut txn = self.index.txn();
-    let record = txn
+    txn
       .remove(root_key.as_slice())
       .expect("force-removed root record");
     self.index = txn.commit();
+    let subscribers = self.root_subs.remove(&handle).unwrap_or_default();
     // Free the dead root's subscribers from the side table AND the coverage plane, so a
     // retired root's keys stop answering `is_watched` true (they cover nothing now).
     // BATCHED per cover key: the per-subscriber `cover_remove` cloned the
@@ -1015,7 +1121,7 @@ where
       Vec<C>,
       std::collections::HashSet<Subscription>,
     > = std::collections::BTreeMap::new();
-    for &sub in &record.subscribers {
+    for &sub in &subscribers {
       if let Some(sub_record) = self.subs.remove(&sub) {
         departing_by_key
           .entry(sub_record.key)
@@ -1036,7 +1142,7 @@ where
     }
     self.covers = txn.commit();
     self.publish();
-    record.subscribers
+    subscribers
   }
 
   /// Rebinds the live root `old` onto a fresh handle `new`, keeping its key, record, and
@@ -1060,16 +1166,17 @@ where
       return;
     };
     record.handle = new;
-    let subscribers = record.subscribers.clone();
     txn.insert(root_key.as_slice(), record);
     self.index = txn.commit();
     self.by_handle.remove(&old);
     self.by_handle.insert(new, root_key);
-    for sub in subscribers {
+    let subscribers = self.root_subs.remove(&old).unwrap_or_default();
+    for &sub in &subscribers {
       if let Some(side) = self.subs.get_mut(&sub) {
         side.root = new;
       }
     }
+    self.root_subs.insert(new, subscribers);
     self.publish();
   }
 

@@ -168,7 +168,8 @@ enum Control<C, V> {
 ///
 /// let w = TokioTributaries::new(WatcherOptions::new(), TributariesOptions::new())?;
 /// let project = key("/path/to/project");
-/// let sub = w.watch(project.clone(), (), WatchOptions::new()).await?;
+/// let manifest = key("/path/to/project/manifest.toml");
+/// let sub = w.watch(project, (), WatchOptions::new()).await?;
 ///
 /// // The demux CONSUMES one handle (the sole drainer); `w` stays behind for
 /// // watch/unwatch/close only — never for next().
@@ -179,9 +180,16 @@ enum Control<C, V> {
 /// // actor keeps the loss accounting (a dominating Rescan on overflow).
 /// let consumer = tokio::spawn(async move {
 ///   while let Some(event) = lane.recv().await {
-///     if event.reaches(&project) {
-///       // re-enumerate / re-read below `event.key()`
+///     // `reaches` is the endpoint/re-enumeration test for ONE tracked object: true when
+///     // the event names the manifest, when a rename moved the manifest AWAY (the move's
+///     // source endpoint), or when a Rescan at-or-above it obliges a re-read. Asking it
+///     // about the subscription ROOT instead would answer false for every ordinary change
+///     // below the root — the root is nobody's exact key.
+///     if event.reaches(&manifest) {
+///       // re-read the manifest
 ///     }
+///     // Anything else in the lane is a change somewhere under the watched root; the
+///     // lane already guarantees that, so a subtree test would be redundant here.
 ///   }
 ///   // None: the watcher closed and the lane's buffered tail is drained.
 /// });

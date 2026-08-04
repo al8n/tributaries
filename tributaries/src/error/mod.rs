@@ -301,6 +301,23 @@ pub enum WatchError {
      retry the watch"
   )]
   CoverageIncomplete,
+  /// This watch asked for a [`Filter`](crate::Filter) of its own, and the watcher's filter
+  /// plane is **retired**: it will never enter a caller predicate again, so the subscription
+  /// could only be created unfiltered.
+  ///
+  /// A predicate this watcher ran unwound, and the payload that panic carried could not be
+  /// disposed of either — its own destructor panicked, so the only containment left was to
+  /// leak it. Leaking is bounded to exactly one such payload per watcher precisely because the
+  /// plane latches here; a watcher that kept accepting filters would leak another every time a
+  /// caller re-created the subscription.
+  ///
+  /// **NOT retryable on this watcher**, and no coverage was lost to it: every live
+  /// subscription stays live and covered, each is owed a dominating
+  /// [`Rescan`](crate::EventKind::Rescan) reporting that its admission gate is gone, and
+  /// [`Filter::all`](crate::Filter::all) watches — which filter nothing and so can lose
+  /// nothing — are still admitted. A caller that needs filtering again builds a new watcher.
+  #[error("the watcher's filter plane is retired; this watch could only be created unfiltered")]
+  FilterRetired,
 }
 
 impl WatchError {
@@ -366,6 +383,14 @@ impl WatchError {
     matches!(self, Self::CoverageIncomplete)
   }
 
+  /// Whether this is [`FilterRetired`](Self::FilterRetired) — the watcher will never enter a
+  /// caller predicate again, so a watch asking for one is refused rather than silently
+  /// created unfiltered.
+  #[inline]
+  pub const fn is_filter_retired(&self) -> bool {
+    matches!(self, Self::FilterRetired)
+  }
+
   /// The classified fault this error carries, for the two fault-carrying variants
   /// ([`Canonicalize`](Self::Canonicalize) and [`Source`](Self::Source)).
   #[inline]
@@ -376,7 +401,8 @@ impl WatchError {
       | Self::CanonicalRace
       | Self::RescanBacklog
       | Self::Closed
-      | Self::CoverageIncomplete => None,
+      | Self::CoverageIncomplete
+      | Self::FilterRetired => None,
     }
   }
 
@@ -458,15 +484,27 @@ pub enum SyncError {
   /// The deadline elapsed before the cookie was observed.
   #[error("the sync barrier timed out")]
   Timeout,
-  /// The barrier could not start because the subscription's root is momentarily
-  /// busy: another barrier is already in flight for it (at most one physical
-  /// cookie write per root may be outstanding, so a hung backend cannot
-  /// accumulate blocking writes), OR the root's cookie cleanup is backlogged (a
-  /// failing unlink the driver is retrying has filled the per-root cookie
-  /// budget). Both are transient and RETRYABLE — retry once the outstanding
-  /// work resolves.
+  /// The barrier could not start because the watcher is momentarily busy in one
+  /// of three ways, all transient and RETRYABLE:
+  ///
+  /// - another barrier is already in flight for the subscription's root (at most
+  ///   one physical cookie write per root may be outstanding, so a hung backend
+  ///   cannot accumulate blocking writes);
+  /// - the root's cookie cleanup is backlogged (a failing unlink the driver is
+  ///   retrying has filled the per-root cookie budget);
+  /// - the watcher already holds the maximum number of in-flight barriers. A
+  ///   barrier is retained by the owner — and its cookie FILE by the filesystem —
+  ///   from the write until the cookie is observed, dominated, cancelled or
+  ///   retired, and the caller chooses the timeout, so admissions can outrun
+  ///   observations indefinitely. The bounded sync mailbox limits only requests
+  ///   waiting to be received, so the in-flight population is bounded here
+  ///   instead. Refused BEFORE any cookie is written, so a refusal leaves no
+  ///   marker behind.
+  ///
+  /// Retry once the outstanding work resolves.
   #[error(
-    "the subscription's root is busy (a barrier is in flight or its cookie cleanup is backlogged)"
+    "the watcher is busy (a barrier is in flight, cookie cleanup is backlogged, or too \
+           many barriers are outstanding)"
   )]
   Busy,
   /// The watcher is closed.
@@ -533,6 +571,13 @@ pub enum CloseError {
   /// tore the owner down.
   #[error("the watcher stopped before confirming the shutdown")]
   Stopped,
+  /// The owner shut down cleanly, but the SOURCE could not prove its own
+  /// quiescence. The watcher's own state is gone either way; what this reports is
+  /// that native resources the source owns — reader threads, OS handles, marker
+  /// files — may still be live, so a program that terminates its runtime on this
+  /// result abandons rather than completes that teardown.
+  #[error("the watcher closed but its source did not reach quiescence: {0}")]
+  Source(#[source] SourceCloseError),
 }
 
 impl CloseError {
@@ -540,5 +585,46 @@ impl CloseError {
   #[inline]
   pub const fn is_stopped(&self) -> bool {
     matches!(self, Self::Stopped)
+  }
+
+  /// Whether this is [`Source`](Self::Source).
+  #[inline]
+  pub const fn is_source(&self) -> bool {
+    matches!(self, Self::Source(_))
+  }
+}
+
+/// Why a [`Source`](crate::Source) could not prove quiescence at close — the
+/// result [`LocalSource::join_close`](crate::LocalSource::join_close) reports and
+/// [`Tributaries::close`](crate::Tributaries::close) forwards.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SourceCloseError {
+  /// The source's own machinery stopped before it could confirm the shutdown, so
+  /// nothing was proven about what it still held.
+  #[error("the source stopped before confirming its shutdown")]
+  Stopped,
+  /// The source's close bound expired with work still outstanding — native
+  /// streams still winding down, or marker files it wrote and could not confirm
+  /// removed. Reported honestly rather than waited out: an unbounded wait against
+  /// a wedged filesystem is what the bound exists to refuse.
+  #[error("{pending} source obligation(s) still outstanding at close")]
+  NotQuiesced {
+    /// How many obligations the source still owed.
+    pending: usize,
+  },
+}
+
+impl SourceCloseError {
+  /// Whether this is [`Stopped`](Self::Stopped).
+  #[inline]
+  pub const fn is_stopped(&self) -> bool {
+    matches!(self, Self::Stopped)
+  }
+
+  /// Whether this is [`NotQuiesced`](Self::NotQuiesced).
+  #[inline]
+  pub const fn is_not_quiesced(&self) -> bool {
+    matches!(self, Self::NotQuiesced { .. })
   }
 }

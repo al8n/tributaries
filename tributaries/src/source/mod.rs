@@ -38,7 +38,7 @@ use std::vec::Vec;
 use tributary_proto::{ChangeId, Epoch, Location};
 
 use crate::{
-  error::{SyncError, WatchError},
+  error::{SourceCloseError, SyncError, WatchError},
   event::EventKind,
 };
 
@@ -104,9 +104,18 @@ mod tests;
 ///   progress and resolve in **bounded time**. Both awaited methods run **only inside a
 ///   caller-initiated** `watch` reconcile, to completion (invariant I1); a wedged one blocks that one
 ///   reconcile until the source honors the contract (the caller may drop its own `watch` wait, but the
-///   umbrella still owns the in-flight reconcile) — never any unrelated backlog or a queued `close`,
-///   which ride their own paths. A source that makes any **hang indefinitely** violates the contract;
-///   that is the source's responsibility, not a bug the umbrella can `await`-around.
+///   umbrella still owns the in-flight reconcile) — never any unrelated backlog. A source that makes
+///   any **hang indefinitely** violates the contract; that is the source's responsibility, not a bug
+///   the umbrella can `await`-around.
+///
+///   The two AWAITED ones are additionally raced against the dedicated close signal, so violating
+///   their bound costs a wedged reconcile and nothing more — see the close-responsiveness guarantee
+///   below. [`canonicalize_key`](Self::canonicalize_key) is **synchronous**, and that difference is
+///   load-bearing rather than incidental: an actor cannot preempt a plain function call running on
+///   its own thread, so there is no race to arrange and the bound on it is a genuine REQUIREMENT with
+///   no umbrella-side backstop. Implement it as a pure, non-I/O transform wherever possible; a source
+///   that must touch the filesystem to canonicalize (as the stock filesystem binding does) is asking
+///   its callers to accept that a wedged mount can hold the owner inside that one call.
 /// - **Synchronous, non-blocking [`disarm`](Self::disarm)** — release is a fire-and-forget
 ///   **request** the umbrella never awaits (see its docs): it returns at once, queuing any async
 ///   teardown inside the source, and applies the release no later than the next [`arm`](Self::arm) or
@@ -120,8 +129,8 @@ mod tests;
 /// - **A wedged [`next`](Self::next) never blocks command processing.** The owner drives
 ///   [`next`](Self::next) as one arm of a biased `select!`; a `next()` that never resolves is simply
 ///   a pending arm — the loop still services the command mailbox and the dedicated close signal.
-/// - **Close-responsiveness against INTERNAL actions AND the command backlog, by construction
-///   (invariant II).** `close` rides a **dedicated high-priority signal** — a separate channel the
+/// - **Close-responsiveness against INTERNAL actions, the command backlog, AND a wedged awaited
+///   source call (invariant II).** `close` rides a **dedicated high-priority signal** — a separate channel the
 ///   owner checks at the TOP priority everywhere it selects (a non-blocking `try_recv` each iteration
 ///   AND the first `select!` arm, in both the run loop and the source-drain teardown), NOT the command
 ///   mailbox — so shutdown latency is **bounded independent of** how deep the unbounded `watch`/
@@ -132,6 +141,16 @@ mod tests;
 ///   returns no future, no cleanup path can wedge the owner, so the close is serviced with no
 ///   scheduling discipline to get wrong. Dropping every handle tears the owner down and drops the
 ///   source, whose own `Drop` applies any still-pending releases.
+///
+///   A caller-awaited `watch` reconcile is the one place the owner DOES await the source, and every
+///   await on that path — [`arm`](Self::arm), [`grow`](Self::grow), [`replace`](Self::replace) and
+///   [`begin_sync`](Self::begin_sync) — is a biased `select!` against that same dedicated close
+///   signal, close polled first. So a source that hangs one of them abandons its own reconcile when
+///   a close arrives and the owner proceeds straight to teardown; it cannot hold `close()` pending.
+///   The residual, stated plainly rather than papered over: a source's SYNCHRONOUS callbacks —
+///   [`canonicalize_key`](Self::canonicalize_key) above all, and a subscription's
+///   [`Filter`](crate::Filter) predicate — run on the owner's own thread with nothing to race
+///   against, so a call that never returns holds the owner and its close with it.
 /// - **No stranded or corrupt state.** A committed-but-unclaimed subscription is always reconciled
 ///   away (the `WatchGrant`, invariant I1); a subscription terminal-retired while unclaimed leaves no
 ///   lingering parked `Rescan` behind; and a released-then-re-`watch`ed key never
@@ -597,6 +616,34 @@ pub trait LocalSource<C> {
     false
   }
 
+  /// Begins this source's shutdown: SYNCHRONOUS, non-blocking, fire-and-forget, in the
+  /// [`disarm`](Self::disarm) mold. The owner calls it once, at teardown, before it awaits
+  /// [`join_close`](Self::join_close).
+  ///
+  /// Splitting initiation from the wait is what keeps close RESPONSIVE while still making it
+  /// HONEST: the owner can start the source's teardown at the instant it decides to stop, without
+  /// that decision itself being able to block. The default is a no-op — a source with nothing to
+  /// wind down needs no initiation.
+  fn begin_close(&mut self) {}
+
+  /// Awaits this source's QUIESCENCE and reports whether it was proven.
+  ///
+  /// The owner awaits this as the last step of its teardown and forwards the result to
+  /// [`Tributaries::close`](crate::Tributaries::close), so the caller's acknowledgement resolves
+  /// only once the source's own lifecycle result is known. Without such a seam an upper `close()`
+  /// can only acknowledge and then DROP the source, which starts a teardown it can neither await
+  /// nor report: a caller that terminates its runtime on that acknowledgement abandons native
+  /// threads, OS handles and marker files, and any non-quiescence the source could have reported is
+  /// permanently hidden.
+  ///
+  /// It must be BOUNDED. The owner has already stopped serving its close lane by the time this is
+  /// awaited, so a source that waits indefinitely here hangs `close()` — report the outstanding work
+  /// as [`SourceCloseError::NotQuiesced`] instead of waiting it out. The default is immediately
+  /// `Ok(())`: a source with no native resources is quiescent as soon as it is asked.
+  fn join_close(&mut self) -> impl Future<Output = Result<(), SourceCloseError>> {
+    async { Ok(()) }
+  }
+
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
   /// or retired — a **synchronous** liveness probe (mirroring the `tributary-fs`
   /// watcher's `root_path`, which reads a live registry snapshot without I/O).
@@ -858,6 +905,34 @@ pub trait Source<C> {
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
   /// or retired — a synchronous liveness probe. Contract-identical to
   /// [`LocalSource::root_key`].
+  /// Begins this source's shutdown: SYNCHRONOUS, non-blocking, fire-and-forget, in the
+  /// [`disarm`](Self::disarm) mold. The owner calls it once, at teardown, before it awaits
+  /// [`join_close`](Self::join_close).
+  ///
+  /// Splitting initiation from the wait is what keeps close RESPONSIVE while still making it
+  /// HONEST: the owner can start the source's teardown at the instant it decides to stop, without
+  /// that decision itself being able to block. The default is a no-op — a source with nothing to
+  /// wind down needs no initiation.
+  fn begin_close(&mut self) {}
+
+  /// Awaits this source's QUIESCENCE and reports whether it was proven.
+  ///
+  /// The owner awaits this as the last step of its teardown and forwards the result to
+  /// [`Tributaries::close`](crate::Tributaries::close), so the caller's acknowledgement resolves
+  /// only once the source's own lifecycle result is known. Without such a seam an upper `close()`
+  /// can only acknowledge and then DROP the source, which starts a teardown it can neither await
+  /// nor report: a caller that terminates its runtime on that acknowledgement abandons native
+  /// threads, OS handles and marker files, and any non-quiescence the source could have reported is
+  /// permanently hidden.
+  ///
+  /// It must be BOUNDED. The owner has already stopped serving its close lane by the time this is
+  /// awaited, so a source that waits indefinitely here hangs `close()` — report the outstanding work
+  /// as [`SourceCloseError::NotQuiesced`] instead of waiting it out. The default is immediately
+  /// `Ok(())`: a source with no native resources is quiescent as soon as it is asked.
+  fn join_close(&mut self) -> impl Future<Output = Result<(), SourceCloseError>> + Send {
+    async { Ok(()) }
+  }
+
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
   /// or retired — a **synchronous** liveness probe (mirroring the `tributary-fs`
   /// watcher's `root_path`, which reads a live registry snapshot without I/O).
@@ -911,6 +986,14 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 
   fn root_key(&self, handle: Self::Handle) -> Option<Vec<C>> {
     <T as Source<C>>::root_key(self, handle)
+  }
+
+  fn begin_close(&mut self) {
+    <T as Source<C>>::begin_close(self)
+  }
+
+  fn join_close(&mut self) -> impl Future<Output = Result<(), SourceCloseError>> {
+    <T as Source<C>>::join_close(self)
   }
 
   fn replace(
@@ -1118,6 +1201,23 @@ impl<C, H> SourceEvent<C, H> {
   /// change's root-relative location; `epoch` the raw source epoch; and `change_id` the
   /// change's unique id, when the source mints one (a source with no ids passes `None`
   /// rather than counterfeiting them — the fs binding passes `Some`).
+  ///
+  /// # `key` and `location` must agree
+  ///
+  /// `location` names the trailing components of `key` **below the root this change was
+  /// captured against** — so `key.len() - location.len()` is that root's depth, and the
+  /// umbrella reads the pair as the change's own coordinate anchor.
+  ///
+  /// It has to be the event's, not the root's-as-of-delivery: a source that retargets a
+  /// root in place ([`Source::replace`]) keeps the handle, so changes captured under the
+  /// **older, deeper** root are still delivered on it afterwards. The umbrella rebases
+  /// every delivery into the receiving subscription's own coordinate, and it derives the
+  /// amount to strip from this pair — so a `location` re-expressed against anything other
+  /// than the root in force when the change was recorded silently mis-places the
+  /// delivered [`Event::location`](crate::Event::location) and the
+  /// [`FilterInput::location`](crate::FilterInput::location) a caller's predicate reads.
+  /// A source that cannot express a location supplies the empty one, which is honest
+  /// (root-anchored, with `key` as the authoritative signal) rather than wrong.
   pub fn new(
     handle: H,
     key: Vec<C>,
@@ -1133,6 +1233,47 @@ impl<C, H> SourceEvent<C, H> {
       location,
       epoch,
       change_id,
+    }
+  }
+
+  /// This change re-keyed onto `root_key`, **root-anchored**: the key becomes `root_key`
+  /// and the location becomes the empty one. Everything else (handle, kind, epoch, change
+  /// id) rides along unchanged.
+  ///
+  /// # Why the location is restated rather than carried
+  ///
+  /// The capture anchor is the `key`/`location` **pair**, not either half: the umbrella
+  /// reads the depth of the root this change was measured against as
+  /// `key.len() - location.len()` (see the constructor's contract above and
+  /// [`RoutableEvent::captured_root_depth`](crate::route::RoutableEvent::captured_root_depth)).
+  /// Rewriting the key while keeping a location minted against a *different* root leaves a
+  /// pair that no longer describes any real coordinate: the inferred anchor is whatever the
+  /// two mismatched lengths happen to produce, and the location itself names components that
+  /// are not under the new key at all — a consumer joining it onto the key would be sent to
+  /// re-enumerate a subtree that never existed.
+  ///
+  /// So this is deliberately the ONLY way to re-key a raw [`SourceEvent`], and it takes a
+  /// **root**: a key that is by definition its own root has nothing below it, so the empty
+  /// location is both the honest statement and the one that keeps the pair coherent
+  /// (`root_key.len() - 0` is exactly the new root's depth). A transformation that wants to
+  /// move a change to some other key cannot express it here, which is the point — it would
+  /// have to state what its new location means. The two re-keying projections downstream of
+  /// this seam obey the same rule for the same reason: the move-out
+  /// ([`Event::source_move_out`](crate::Event)) and the clamped rescan re-key onto the move's
+  /// source endpoint and onto the subscription's own key respectively, and both root-anchor
+  /// the location rather than carry a foreign one onto the key they just rewrote.
+  pub(crate) fn rekeyed_at_root(&self, root_key: Vec<C>) -> Self
+  where
+    C: Clone,
+    H: Copy,
+  {
+    Self {
+      handle: self.handle,
+      key: root_key,
+      kind: self.kind.clone(),
+      location: Location::new(),
+      epoch: self.epoch,
+      change_id: self.change_id,
     }
   }
 

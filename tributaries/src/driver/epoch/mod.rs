@@ -179,9 +179,12 @@ impl EpochLedger {
   /// Coverage and filter admission are decided by the unchanged pure
   /// [`fan_out`](crate::route::fan_out): `event` reaches exactly the subscribers in
   /// `subscribers` whose key (resolved by `canonical_of`) covers it **and** whose
-  /// filter (`admits`) admits the minted delivery, plus — for a `Rescan` — *every*
-  /// subscriber of the root, bypassing both gates. `raw` is the event's raw fs epoch;
-  /// each admitted subscriber's delivery is stamped `epoch_base + raw` via
+  /// filter (`admits`) admits the minted delivery, plus — for a `Rescan` — every
+  /// subscriber whose subtree *intersects* the rescan's, bypassing content admission.
+  /// Fan-out rebases each delivery's location into its subscriber's own coordinate off
+  /// the **event's own** captured root depth, so the anchor never has to be threaded
+  /// through here. `raw` is the event's
+  /// raw fs epoch; each admitted subscriber's delivery is stamped `epoch_base + raw` via
   /// [`stamp`](Self::stamp), advancing that subscriber's high-water. Stamping runs
   /// *after* admission, so a filtered-out delivery never perturbs a subscription's
   /// epoch space.

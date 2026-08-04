@@ -133,6 +133,12 @@ struct FakeSource {
   /// unaffected; a cell driving the real `on_sync`/end-to-end install path turns it on, and
   /// `begin_sync` then returns a deterministic `<dir>/cookie-<seq>` key the test can deliver.
   supports_sync: bool,
+  /// When set, `grow` never resolves — a coverage widening against a hung mount,
+  /// the state the close race exists for.
+  grow_pending: bool,
+  /// Cookie writes this source actually performed, so a cell can prove a REFUSED
+  /// barrier left no marker behind.
+  begun_syncs: usize,
   /// Cookie keys handed to `end_sync` — the reap ledger (F5).
   ended_syncs: Vec<Vec<OsString>>,
   /// Tokens handed to `cancel_sync` — the abandon-arm ledger. Records the
@@ -203,6 +209,8 @@ impl FakeSource {
       canonical: HashMap::new(),
       supports_replace: false,
       supports_sync: false,
+      grow_pending: false,
+      begun_syncs: 0,
       ended_syncs: Vec::new(),
       cancelled_syncs: Vec::new(),
       begun_token: None,
@@ -411,6 +419,12 @@ impl Source<OsString> for FakeSource {
 
   fn end_sync(&mut self, _handle: u32, cookie_key: &[OsString]) {
     self.ended_syncs.push(cookie_key.to_vec());
+    // The reserved leaf a source-misbehaviour cell writes: the reap is recorded and then
+    // unwinds carrying a payload whose own disposal unwinds too.
+    if cookie_key.last().and_then(|leaf| leaf.to_str()) == Some("cookie-boom") {
+      BOOM_COOKIES_REAPED.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+      std::panic::panic_any(PanicsOnDrop);
+    }
   }
 
   fn cancel_sync(&mut self, _handle: u32, token: SyncToken) {
@@ -429,6 +443,7 @@ impl Source<OsString> for FakeSource {
     if !self.supports_sync {
       return Err(crate::error::SyncError::Unsupported);
     }
+    self.begun_syncs += 1;
     // The token the abandon arm will later cancel — recorded so a cell can prove the cancel
     // names EXACTLY the sync that began (the nonce is owner-random, so the token cannot be
     // reconstructed from outside).
@@ -526,6 +541,9 @@ impl Source<OsString> for FakeSource {
     // retained keys (the conservative model) — and reports the fs binding's degraded-fence error,
     // driving the grow-before-commit abort (R1).
     self.calls.push(Call::Grow(handle, retained.to_vec()));
+    if self.grow_pending {
+      core::future::pending::<()>().await;
+    }
     if self.fail_grows > 0 {
       self.fail_grows -= 1;
       return Err(WatchError::CoverageIncomplete);
@@ -576,6 +594,25 @@ fn modified_event(sub: Subscription, path: &str, epoch: u64) -> Event<OsString, 
 
 /// A raw `Modified` [`SourceEvent`] for `handle` at `path` — the cancel-safety test's queued
 /// changes, distinguished by key.
+/// A legal [`panic_any`](std::panic::panic_any) payload whose own disposal unwinds — the only
+/// shape that makes a containment boundary's `Err` dangerous, and so the instrument every
+/// payload-disposal cell reaches for.
+struct PanicsOnDrop;
+
+impl Drop for PanicsOnDrop {
+  fn drop(&mut self) {
+    panic!("a tenant's panic payload panics as it is disposed of");
+  }
+}
+
+/// How many `cookie-boom` cookies [`FakeSource::end_sync`] has been handed.
+///
+/// A process-wide counter because the ledger it would otherwise use lives inside the source,
+/// inside the owner being DROPPED — the very destructor under test. Only the owner-teardown
+/// reap cell writes the `cookie-boom` leaf, so no other cell can move it.
+static BOOM_COOKIES_REAPED: core::sync::atomic::AtomicUsize =
+  core::sync::atomic::AtomicUsize::new(0);
+
 fn source_modified(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, u32> {
   SourceEvent::new(
     handle,
@@ -675,6 +712,7 @@ impl Harness {
       subsumer: Subsumer::new(),
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
+      filter_payload_forgotten: false,
       needs_rescan: BTreeMap::new(),
       suppressed_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
@@ -943,8 +981,9 @@ async fn widen_disarms_subsumed_before_arming_the_wider_root() {
   );
   assert_eq!(
     rescans[0].path(),
-    Path::new("/a"),
-    "the Rescan names the widened root the consumer must re-enumerate"
+    Path::new("/a/b"),
+    "the Rescan names the SUBSCRIPTION's own subtree to re-enumerate, not the wider root \
+     it now rides — the coverage gap the widen opened is exactly what this sub owns"
   );
 }
 
@@ -1043,7 +1082,19 @@ async fn widen_emits_dominating_rescan_per_repointed_sub() {
   assert_eq!(rescans.len(), 2, "one Rescan per re-pointed subscription");
   for ev in &rescans {
     assert!(ev.is_rescan(), "the synthetic event is a Rescan");
-    assert_eq!(ev.path(), Path::new("/a"), "it names the widened root");
+    // Each re-pointed subscription is told to re-enumerate ITS OWN subtree, not the
+    // wider root it now rides: the disarm/re-arm gap made exactly its own coverage
+    // uncertain, and /a is not its to walk.
+    let own = if ev.subscription() == sb {
+      "/a/b"
+    } else {
+      "/a/c"
+    };
+    assert_eq!(
+      ev.path(),
+      Path::new(own),
+      "the re-point Rescan is scoped to the subscription, not to the widened root"
+    );
   }
   let by_sub: HashMap<Subscription, Epoch> = rescans
     .iter()
@@ -4063,8 +4114,11 @@ async fn stalled_consumer_parks_dominating_rescan_and_resumes() {
     "overflow parked a Rescan minted one past the high-water (strictly dominating)"
   );
 
-  // Further overflow while parked is SUPPRESSED and idempotent: no second Rescan is minted,
-  // the parked epoch is unchanged, and the channel is not probed again.
+  // Further overflow while parked is SUPPRESSED and collapses to the SAME parked slot — but
+  // its epoch advances to keep strictly dominating the newly-dropped event. It must: f3 was
+  // stamped at the high-water the first shed already reached, so a parked Rescan left at that
+  // epoch merely TIES it, and a tie is not dominated — a conforming consumer would keep f3's
+  // position and never re-read what f3 described.
   h.owner.try_emit(modified_event(sub, "/a/f3", 3));
   assert_eq!(
     h.owner.needs_rescan.len(),
@@ -4073,8 +4127,8 @@ async fn stalled_consumer_parks_dominating_rescan_and_resumes() {
   );
   assert_eq!(
     h.owner.needs_rescan.get(&sub).map(|p| p.epoch),
-    Some(Epoch::new(3)),
-    "the parked epoch is idempotent under repeated overflow"
+    Some(Epoch::new(4)),
+    "the parked epoch advances past the event this suppression just dropped"
   );
 
   // Resume: the consumer drains the two buffered (pre-overflow) deliveries.
@@ -4319,7 +4373,11 @@ async fn widen_repoint_rescan_parks_at_own_epoch_not_shed_when_channel_full() {
     .into_iter()
     .find(|e| e.subscription() == sb && e.is_rescan())
     .expect("the re-point Rescan was delivered");
-  assert_eq!(rescan.path(), Path::new("/a"), "it names the widened root");
+  assert_eq!(
+    rescan.path(),
+    Path::new("/a/b"),
+    "it names the re-pointed subscription's own key, not the widened root"
+  );
   let rescan_epoch = rescan.epoch();
   assert_eq!(
     rescan_epoch,
@@ -5270,6 +5328,7 @@ impl OwnerU64 {
       subsumer: Subsumer::new(),
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
+      filter_payload_forgotten: false,
       needs_rescan: BTreeMap::new(),
       suppressed_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
@@ -5492,9 +5551,17 @@ async fn consumer_unwatch_purges_buffered_coalescer_delta() {
 /// advertising a subscription whose owner task has died (the stale-read-plane mode). The single
 /// Drop guard covers the whole class at once: any unwind through the owner future runs it.
 ///
-/// Fail-on-old: with `impl Drop for Owner` removed, dropping the panicked owner leaves the last
-/// committed (non-empty) plane published, so the view still reports the sub watched → the final
-/// assertion FAILS.
+/// Fail-on-old: with `impl Drop for Owner` removed, dropping the owner leaves the last committed
+/// (non-empty) plane published, so the view still reports the sub watched → the final assertion
+/// FAILS.
+///
+/// The panicking filter here is also the containment witness: the fan-out RETURNS (it no longer
+/// unwinds the owner), so every other subscription and the control plane survive one tenant's
+/// broken predicate. The `ownership` module carries the full quarantine: containment
+/// (`a_panicking_filter_cannot_take_the_owner_or_a_healthy_lane_with_it`), its per-subscription
+/// blast radius (`quarantining_one_subscription_leaves_a_sibling_sharing_its_filter_intact`), and
+/// its ordering against the Rescan it owes
+/// (`a_filter_panic_under_debounce_releases_no_delta_after_its_rescan`).
 #[tokio::test]
 async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() {
   let mut h = Harness::new();
@@ -5519,18 +5586,12 @@ async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() 
     "the live watch is advertised while the sub is live"
   );
 
-  // Drive an event through fan-out so the filter panics and the owner primitive unwinds. Catch it
-  // so the test survives to observe the plane, exactly as a runtime drops a panicked task's future.
-  let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-    h.owner.fan_out_and_push(&source_modified(1, "/a/f", 0));
-  }));
-  assert!(
-    panicked.is_err(),
-    "the caller filter panicked, unwinding the owner"
-  );
+  // Drive an event through fan-out so the filter panics. The unwind is CONTAINED at the predicate,
+  // so this returns normally and the owner is still serving.
+  h.owner.fan_out_and_push(&source_modified(1, "/a/f", 0));
   assert!(
     view.is_watched(&key("/a")),
-    "the caught panic left the owner alive — the plane is unchanged until the owner drops"
+    "the contained panic left the owner alive — the plane is unchanged until the owner drops"
   );
   let _ = sub;
 
@@ -5544,6 +5605,52 @@ async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() 
   assert!(
     view.covering(&key("/a")).is_none(),
     "…and attribution resolves to nothing after the guard empties the plane"
+  );
+}
+
+/// The owner's teardown guard reaps every cookie still pending, each inside its own
+/// containment, so ONE misbehaving [`Source::end_sync`] cannot leave the rest of the marker
+/// files on disk. That containment hands back a PAYLOAD, and disposing of a payload runs the
+/// misbehaving source's own destructor — so dropping it here reintroduces exactly the escape
+/// the containment was built to close, one line further out and in the worst frame in the
+/// crate: this destructor also runs while the owner task is UNWINDING (a panicking caller
+/// callback is precisely how it is reached), where a second unwind is not a contained failure
+/// but an immediate process abort.
+///
+/// FAIL-ON-REVERT: contain with a bare `catch_unwind` and let its `Err` fall out of scope, and
+/// the first payload's destructor unwinds out of the teardown loop — the two cookies behind it
+/// are never reaped, and the unwind leaves through `drop(h)`.
+#[tokio::test]
+async fn owner_teardown_reaps_every_cookie_although_a_payload_panics_as_it_is_disposed_of() {
+  const COOKIES: usize = 3;
+
+  let mut h = Harness::new();
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+  let entered = BOOM_COOKIES_REAPED.load(core::sync::atomic::Ordering::SeqCst);
+  let mut replies = Vec::new();
+  for _ in 0..COOKIES {
+    let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+    replies.push(reply_rx);
+    h.owner.pending_syncs.push(super::PendingSync {
+      cookie_key: key("/a/cookie-boom"),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+  }
+
+  // The teardown guard: it publishes the empty plane, then reaps.
+  drop(h);
+
+  assert_eq!(
+    BOOM_COOKIES_REAPED.load(core::sync::atomic::Ordering::SeqCst) - entered,
+    COOKIES,
+    "a payload that panics as it is disposed of skipped the cookies queued behind it — each \
+     one is a marker file left on the caller's filesystem"
   );
 }
 
@@ -5807,6 +5914,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     subsumer: Subsumer::new(),
     epochs: EpochLedger::new(),
     filters: HashMap::new(),
+    filter_payload_forgotten: false,
     needs_rescan: BTreeMap::new(),
     suppressed_rescan: BTreeMap::new(),
     unclaimed: std::collections::HashSet::new(),
@@ -5973,6 +6081,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     subsumer: Subsumer::new(),
     epochs: EpochLedger::new(),
     filters: HashMap::new(),
+    filter_payload_forgotten: false,
     needs_rescan: BTreeMap::new(),
     suppressed_rescan: BTreeMap::new(),
     unclaimed: std::collections::HashSet::new(),
@@ -8359,4 +8468,1390 @@ async fn a_hung_in_place_replace_does_not_wedge_close() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hung_in_place_replace_rollback_does_not_wedge_close() {
   assert_a_held_retarget_does_not_wedge_close(Some(key("/z"))).await;
+}
+
+/// A raw `Modified` [`SourceEvent`] carrying a real root-relative `location` — the
+/// coordinate fan-out must rebase per subscriber. `location` is given as `/`-joined
+/// segments **relative to the armed root**, exactly as a source reports it.
+fn source_modified_at(
+  handle: u32,
+  path: &str,
+  location: &str,
+  epoch: u64,
+) -> SourceEvent<OsString, u32> {
+  let segments = location
+    .split('/')
+    .filter(|s| !s.is_empty())
+    .map(tributary_proto::Segment::new);
+  SourceEvent::new(
+    handle,
+    key(path),
+    EventKind::Modified,
+    Location::from_segments(segments),
+    Epoch::new(epoch),
+    Some(ChangeId::new(NonZeroU64::MIN)),
+  )
+}
+
+/// A raw `Rescan` [`SourceEvent`] carrying a real root-relative `location`, given as
+/// `/`-joined segments relative to the armed root it was captured against — the located
+/// coverage-loss signal a source emits for a subtree below its root.
+fn rescan_event_at(
+  handle: u32,
+  path: &str,
+  location: &str,
+  epoch: u64,
+) -> SourceEvent<OsString, u32> {
+  let segments = location
+    .split('/')
+    .filter(|s| !s.is_empty())
+    .map(tributary_proto::Segment::new);
+  SourceEvent::new(
+    handle,
+    key(path),
+    EventKind::Rescan,
+    Location::from_segments(segments),
+    Epoch::new(epoch),
+    Some(ChangeId::new(NonZeroU64::MIN)),
+  )
+}
+
+/// A rescan is a LOCATED statement — "coverage became uncertain at and below this key" —
+/// and routing it by geometry rather than by shared physical root is what keeps a
+/// per-subscription consumer inside its own boundary. These cells pin the three cases and
+/// the loss the disjoint one used to cause.
+mod rescan_geometry {
+  use super::*;
+
+  /// A rescan disjoint from a subscription is not delivered to it, while a sibling on the
+  /// same physical root that the loss DOES touch still receives it.
+  ///
+  /// Fail-on-old (fan-out pushed every rescan to every subscriber of the root): the
+  /// disjoint `/a/b/deep` receives `Rescan(/a/x)` — a path outside its watch, naming a
+  /// subtree it owns none of.
+  #[tokio::test]
+  async fn a_disjoint_located_rescan_is_not_delivered() {
+    let mut h = Harness::new();
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let deep = h
+      .watch("/a/b/deep", Interest::all())
+      .await
+      .expect("watch /a/b/deep");
+
+    h.owner.consume_source_event(&rescan_event(1, "/a/x", 1));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      1,
+      "only the subscription the loss touches is served: {delivered:?}"
+    );
+    assert_eq!(delivered[0].subscription(), wide);
+    assert_eq!(
+      delivered[0].path(),
+      Path::new("/a/x"),
+      "the covering subscription keeps the located key"
+    );
+    assert!(
+      !delivered.iter().any(|e| e.subscription() == deep),
+      "the disjoint sibling receives no instruction to inspect /a/x"
+    );
+  }
+
+  /// A rescan that CONTAINS a subscription still reaches it — a whole-root loss loses
+  /// nobody — but the instruction is clamped to that subscription's own key.
+  ///
+  /// Fail-on-old: the narrow subscriber is told to re-enumerate `/a`, which is neither its
+  /// data nor its business.
+  #[tokio::test]
+  async fn a_containing_rescan_is_clamped_to_the_subscription() {
+    let mut h = Harness::new();
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let deep = h
+      .watch("/a/b/deep", Interest::all())
+      .await
+      .expect("watch /a/b/deep");
+
+    h.owner.consume_source_event(&rescan_event(1, "/a", 1));
+
+    let delivered = h.drain();
+    let path_of = |who: Subscription| {
+      delivered
+        .iter()
+        .find(|e| e.subscription() == who)
+        .map(Event::path)
+    };
+    assert_eq!(delivered.len(), 2, "a root-wide loss reaches both");
+    assert_eq!(path_of(wide), Some(PathBuf::from("/a")));
+    assert_eq!(
+      path_of(deep),
+      Some(PathBuf::from("/a/b/deep")),
+      "the contained subscription re-enumerates ITS OWN subtree"
+    );
+  }
+
+  /// A pending sync on a subscription the located loss does not touch must NOT resolve
+  /// `Dominated`: domination stands in for a re-enumeration, and this subscriber is being
+  /// handed none.
+  ///
+  /// Fail-on-old (domination keyed on physical-root equality): the disjoint sibling's
+  /// barrier resolves `Dominated` for a recovery event it never receives.
+  #[tokio::test]
+  async fn a_disjoint_rescan_does_not_dominate_an_unaffected_barrier() {
+    use futures_util::FutureExt;
+
+    let mut h = Harness::new();
+    let touched = h.watch("/a/x", Interest::all()).await.expect("watch /a/x");
+    let untouched = h.watch("/a/y", Interest::all()).await.expect("watch /a/y");
+    // Both ride one root: /a/x arms it, /a/y widens to /a and re-points /a/x onto it.
+    h.watch("/a", Interest::all()).await.expect("watch /a");
+    let root = h
+      .owner
+      .subsumer
+      .subscription_root(touched)
+      .expect("a live subscription rides a root");
+    assert_eq!(
+      h.owner.subsumer.subscription_root(untouched),
+      Some(root),
+      "the two subscriptions share one physical root"
+    );
+    h.drain();
+
+    let (tx_touched, mut rx_touched) = futures_channel::oneshot::channel();
+    let (tx_untouched, mut rx_untouched) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key("/a/x/.cookie"),
+      sub: touched,
+      root,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: tx_touched,
+    });
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key("/a/y/.cookie"),
+      sub: untouched,
+      root,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: tx_untouched,
+    });
+
+    h.owner.consume_source_event(&rescan_event(root, "/a/x", 1));
+
+    assert!(
+      matches!(
+        (&mut rx_touched).now_or_never(),
+        Some(Ok(Ok(crate::source::SyncOutcome::Dominated)))
+      ),
+      "the barrier of the subscription the loss touched is dominated by it"
+    );
+    assert!(
+      (&mut rx_untouched).now_or_never().is_none(),
+      "the disjoint sibling's barrier is untouched — no re-enumeration was handed to it"
+    );
+    assert_eq!(
+      h.owner.pending_syncs.len(),
+      1,
+      "only the affected barrier was consumed"
+    );
+  }
+}
+
+/// Suppressing an event behind standing rescan debt is sound only while that debt
+/// actually covers it — spatially AND temporally. A parked debt is not always the whole
+/// subscription, and its epoch was minted before the event it is now being asked to
+/// stand in for, so both halves must be re-established at the moment of suppression.
+mod parked_debt {
+  use super::*;
+
+  /// The trace: a located `Rescan(/a/x)` parks on a full channel, then an ordinary change
+  /// in the DISJOINT sibling subtree `/a/y` is suppressed behind it. The parked debt must
+  /// widen to cover `/a/y/file` and advance past its stamp.
+  ///
+  /// Fail-on-old (`note_loss` alone): the retained `Rescan(/a/x)` neither reaches
+  /// `/a/y/file` nor postdates it, so the change disappears with no event and no covering
+  /// recovery instruction — a reconstructing consumer stays permanently stale.
+  #[tokio::test]
+  async fn a_later_sibling_loss_widens_the_parked_located_rescan() {
+    let mut h = Harness::bounded(1);
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+    // Fill the one slot, then park the located rescan behind it.
+    h.owner.fan_out_and_push(&source_modified(1, "/a/plug", 0));
+    h.owner.fan_out_and_push(&rescan_event(1, "/a/x", 1));
+    assert_eq!(
+      h.owner.needs_rescan.get(&sub).map(|p| p.key.clone()),
+      Some(key("/a/x")),
+      "the located rescan parked unchanged at its own key"
+    );
+
+    // The stamp the next raw-0 delivery will receive (the high-water clamp), captured
+    // before it is suppressed so the temporal half can be asserted exactly.
+    let suppressed_stamp = h.owner.epochs.stamp(sub, Epoch::new(0));
+    h.owner
+      .fan_out_and_push(&source_modified(1, "/a/y/file", 0));
+
+    let parked = h
+      .owner
+      .needs_rescan
+      .get(&sub)
+      .expect("debt is still parked");
+    assert_eq!(
+      parked.key,
+      key("/a"),
+      "the debt widened to the common ancestor covering BOTH losses"
+    );
+    assert!(
+      parked.epoch > suppressed_stamp,
+      "the debt's epoch strictly dominates the event it suppressed \
+       ({:?} vs {suppressed_stamp:?})",
+      parked.epoch
+    );
+
+    // And the delivered recovery instruction actually reaches the lost change.
+    assert_eq!(h.drain().len(), 1, "the plug drains");
+    h.owner.flush_pending_rescans();
+    let recovery = h.drain();
+    assert_eq!(recovery.len(), 1);
+    assert!(recovery[0].is_rescan());
+    assert!(
+      recovery[0].reaches(&key("/a/y/file")),
+      "the delivered Rescan covers the suppressed change: {:?}",
+      recovery[0].path()
+    );
+    assert!(recovery[0].epoch() > suppressed_stamp, "…and postdates it");
+  }
+
+  /// A whole move has two affected endpoints, and a suppression must widen the debt to
+  /// cover BOTH — the destination alone is not the change.
+  ///
+  /// Fail-on-old: the move's source endpoint `/a/src/f` is covered by neither the parked
+  /// key nor the widened one.
+  #[tokio::test]
+  async fn a_suppressed_move_widens_the_debt_over_both_endpoints() {
+    let mut h = Harness::bounded(1);
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+    h.owner.fan_out_and_push(&source_modified(1, "/a/plug", 0));
+    h.owner.fan_out_and_push(&rescan_event(1, "/a/dst/deep", 1));
+    assert_eq!(
+      h.owner.needs_rescan.get(&sub).map(|p| p.key.clone()),
+      Some(key("/a/dst/deep"))
+    );
+
+    h.owner
+      .fan_out_and_push(&source_moved(1, "/a/src/f", "/a/dst/f", 0));
+
+    let parked_key = h
+      .owner
+      .needs_rescan
+      .get(&sub)
+      .expect("debt is still parked")
+      .key
+      .clone();
+    assert_eq!(h.drain().len(), 1);
+    h.owner.flush_pending_rescans();
+    let recovery = h.drain();
+    assert!(
+      recovery[0].reaches(&key("/a/src/f")) && recovery[0].reaches(&key("/a/dst/f")),
+      "the widened debt covers both endpoints of the lost move: {:?} (parked {:?})",
+      recovery[0].path(),
+      parked_key
+    );
+  }
+
+  /// The same repair applies to an UNCLAIMED subscription, whose debt lives in the
+  /// separate `suppressed_rescan` partition — the suppression path must not repair only
+  /// one of the two maps.
+  ///
+  /// Fail-on-old: an unclaimed subscription's debt keeps its narrow key and stale epoch,
+  /// so its grant's first delivery after the claim is a Rescan that covers nothing lost.
+  #[tokio::test]
+  async fn an_unclaimed_subscriptions_parked_debt_widens_too() {
+    let mut h = Harness::bounded(1);
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.owner.unclaimed.insert(sub);
+
+    h.owner.fan_out_and_push(&source_modified(1, "/a/plug", 0));
+    h.owner.fan_out_and_push(&rescan_event(1, "/a/x", 1));
+    assert_eq!(
+      h.owner.suppressed_rescan.get(&sub).map(|p| p.key.clone()),
+      Some(key("/a/x")),
+      "an unclaimed sub's debt parks in the suppressed partition"
+    );
+
+    let suppressed_stamp = h.owner.epochs.stamp(sub, Epoch::new(0));
+    h.owner
+      .fan_out_and_push(&source_modified(1, "/a/y/file", 0));
+
+    let parked = h
+      .owner
+      .suppressed_rescan
+      .get(&sub)
+      .expect("the unclaimed debt is still parked");
+    assert_eq!(parked.key, key("/a"), "it widened to cover the later loss");
+    assert!(
+      parked.epoch > suppressed_stamp,
+      "and advanced past the event it suppressed"
+    );
+  }
+}
+
+/// The public `Location` must be relative to the key the caller watched, not to the
+/// mutable physical root underneath it — otherwise an unrelated `watch` silently
+/// re-coordinates a stable subscription and its filter starts rejecting.
+mod location_coordinate {
+  use super::*;
+
+  /// The same logical change, before and after an unrelated caller widens the shared
+  /// physical root, reports the SAME location to the unchanged subscription.
+  ///
+  /// Fail-on-old (the raw physical-root location was copied verbatim): the location grows
+  /// from `[x]` to `[b, x]` when somebody else watches the ancestor.
+  #[tokio::test]
+  async fn a_widen_does_not_move_an_unrelated_subscriptions_coordinate() {
+    let mut h = Harness::new();
+    let narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+    h.drain();
+
+    // Armed root == /a/b, so the source reports the change at location [x].
+    h.owner
+      .fan_out_and_push(&source_modified_at(1, "/a/b/x", "x", 0));
+    let before = h.drain();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].location().len(), 1, "one level below /a/b");
+
+    // An unrelated caller watches /a: the shared physical root widens to /a and /a/b is
+    // re-pointed onto it. /a/b's own key is untouched.
+    h.watch("/a", Interest::all()).await.expect("watch /a");
+    let root = h
+      .owner
+      .subsumer
+      .subscription_root(narrow)
+      .expect("the re-pointed subscription is live");
+    h.drain();
+
+    // The SAME logical change now arrives on the wider root, so its raw location is [b, x].
+    h.owner
+      .fan_out_and_push(&source_modified_at(root, "/a/b/x", "b/x", 1));
+    let after = h.drain();
+    let narrow_after = after
+      .iter()
+      .find(|e| e.subscription() == narrow)
+      .expect("the narrow subscription still receives the change");
+    assert_eq!(
+      narrow_after.location(),
+      before[0].location(),
+      "the subscription's coordinate is invariant under an unrelated widen"
+    );
+    let wide_after = after
+      .iter()
+      .find(|e| e.subscription() != narrow)
+      .expect("the widening subscription receives it too");
+    assert_eq!(
+      wide_after.location().len(),
+      2,
+      "the /a subscription's own coordinate is two levels deep — each sees its own"
+    );
+  }
+
+  /// The rebased coordinate is what the FILTER sees, so a one-level depth filter written
+  /// against the subscription's own key keeps admitting across the widen.
+  ///
+  /// Fail-on-old: after the widen the filter reads depth 2 and silently rejects every
+  /// future change, with no coverage-loss signal to explain the gap.
+  #[tokio::test]
+  async fn a_depth_filter_survives_an_unrelated_widen() {
+    let mut h = Harness::new();
+    let narrow = h
+      .watch_with(
+        "/a/b",
+        WatchOptions::new().with_filter(Filter::new(|input: &crate::FilterInput<'_, OsString>| {
+          input.location().len() == 1
+        })),
+      )
+      .await
+      .expect("watch /a/b with a one-level filter");
+    h.drain();
+
+    h.owner
+      .fan_out_and_push(&source_modified_at(1, "/a/b/x", "x", 0));
+    assert_eq!(h.drain().len(), 1, "the filter admits before the widen");
+
+    h.watch("/a", Interest::all()).await.expect("watch /a");
+    let root = h
+      .owner
+      .subsumer
+      .subscription_root(narrow)
+      .expect("the re-pointed subscription is live");
+    h.drain();
+
+    h.owner
+      .fan_out_and_push(&source_modified_at(root, "/a/b/x", "b/x", 1));
+    let after = h.drain();
+    assert!(
+      after.iter().any(|e| e.subscription() == narrow),
+      "the one-level filter still admits the same logical change after the widen: {after:?}"
+    );
+  }
+
+  /// An in-place widen preserves the source handle — and therefore the queue behind it —
+  /// so a change captured BEFORE the widen is drained after it, still carrying the
+  /// coordinate of the narrower root it was captured against. Rebasing it by the depth of
+  /// the root that is armed *now* over-strips it by the widen distance, re-coordinating
+  /// exactly the subscription whose key never moved.
+  ///
+  /// FAIL-ON-REVERT: rebase on `root_view`'s current root depth instead of the event's own
+  /// `captured_root_depth`, and the queued change reaches `/a/b` root-anchored — an empty
+  /// location for a change one level below it, and a one-level filter that stops admitting.
+  #[tokio::test]
+  async fn a_change_queued_across_an_in_place_widen_keeps_its_capture_coordinate() {
+    let mut h = Harness::new();
+    // The gapless widen: the root is retargeted in place, so handle 1 survives it.
+    h.owner.source.supports_replace = true;
+    let narrow = h
+      .watch_with(
+        "/a/b",
+        WatchOptions::new().with_filter(Filter::new(|input: &crate::FilterInput<'_, OsString>| {
+          input.location().len() == 1
+        })),
+      )
+      .await
+      .expect("watch /a/b with a one-level filter");
+    h.drain();
+
+    // Armed root == /a/b: the source reports this change at location [x].
+    h.owner
+      .fan_out_and_push(&source_modified_at(1, "/a/b/x", "x", 0));
+    let before = h.drain();
+    assert_eq!(before.len(), 1, "the filter admits before the widen");
+
+    // An unrelated caller widens the shared root to /a, in place.
+    h.watch("/a", Interest::all()).await.expect("watch /a");
+    assert_eq!(
+      h.owner.subsumer.subscription_root(narrow),
+      Some(1),
+      "staging: the widen was in place, so the handle — and its queue — survived"
+    );
+    h.drain();
+
+    // A change the source captured BEFORE the widen, drained only now: same handle, and
+    // its location is still measured against /a/b.
+    h.owner
+      .fan_out_and_push(&source_modified_at(1, "/a/b/x", "x", 1));
+    let after = h.drain();
+    let queued = after
+      .iter()
+      .find(|e| e.subscription() == narrow)
+      .expect("the one-level filter still admits the queued pre-widen change");
+    assert_eq!(
+      queued.location(),
+      before[0].location(),
+      "a change queued across the widen keeps the coordinate it was captured in"
+    );
+    assert_eq!(
+      queued.location().len(),
+      1,
+      "one level below /a/b, as captured"
+    );
+  }
+
+  /// The widener receives that same queued pre-widen change — and its own coordinate for
+  /// it is unstatable: the leading segments are not in the delivery, and the key is in the
+  /// source's component space rather than in canonical location segments. So the delivery
+  /// is anchored at the subscription root, leaving its absolute key authoritative, instead
+  /// of reporting `/a` + `[x]` for a change that is really at `/a/b/x`.
+  ///
+  /// FAIL-ON-REVERT: `saturating_sub` in `fan_out` instead of the `checked_sub` split, and
+  /// `/a` is handed the location `[x]` — a name-bearing path (`/a/x`) that never changed.
+  #[tokio::test]
+  async fn the_widener_is_anchored_for_a_change_it_cannot_coordinate() {
+    let mut h = Harness::new();
+    h.owner.source.supports_replace = true;
+    let narrow = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner
+      .fan_out_and_push(&source_modified_at(1, "/a/b/x", "x", 1));
+    let after = h.drain();
+    let at_widener = after
+      .iter()
+      .find(|e| e.subscription() == wide)
+      .expect("the widener covers the change and receives it");
+    assert!(
+      at_widener.location().is_empty(),
+      "the unstatable coordinate degrades to root-anchored, not to a wrong name: {:?}",
+      at_widener.location()
+    );
+    assert_eq!(
+      at_widener.path(),
+      Path::new("/a/b/x"),
+      "and the absolute key still says exactly what changed"
+    );
+    let at_narrow = after
+      .iter()
+      .find(|e| e.subscription() == narrow)
+      .expect("the subscription at the capture root receives it too");
+    assert_eq!(
+      at_narrow.location().len(),
+      1,
+      "the subscription the change was captured under keeps its exact coordinate"
+    );
+  }
+
+  /// The one transformation that rewrites a key — the clamp of a stale transient-root
+  /// `Rescan` onto the live root — must restate the coordinate with it. The stale event's
+  /// location was measured against the transient root, so carrying it onto the clamped key
+  /// leaves a pair that describes no root: the anchor is inferred from
+  /// `key.len() - location.len()`, and a deep location under a shallow live root underflows
+  /// it to zero.
+  ///
+  /// FAIL-ON-REVERT: re-key the clamp by hand (`SourceEvent::new(handle, root_key, kind,
+  /// event.location().clone(), ..)`) instead of `rekeyed_at_root`, and the subscription at
+  /// `/a` is told to re-enumerate `/a` at `[d2, d3]` — a subtree of its own watch the loss
+  /// never touched, whose real state it would then keep while believing it re-scanned.
+  #[tokio::test]
+  async fn a_clamped_transient_root_rescan_is_anchored_at_the_live_root() {
+    let mut h = Harness::new();
+    let at_root = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    // The stale artifact of a diverging-then-rolled-back in-place widen: a located `Rescan`
+    // deep under the transient root `/z`, riding a handle whose CURRENT root is `/a`.
+    h.owner
+      .consume_source_event(&rescan_event_at(1, "/z/d1/d2/d3", "d1/d2/d3", 1));
+
+    let delivered = h.drain();
+    let clamped = delivered
+      .iter()
+      .find(|e| e.subscription() == at_root)
+      .expect("the live root's subscriber receives the clamped re-enumeration");
+    assert!(clamped.kind().is_rescan());
+    assert_eq!(
+      clamped.path(),
+      Path::new("/a"),
+      "the clamp names the live root, never the transient one"
+    );
+    assert!(
+      clamped.location().is_empty(),
+      "the clamped key IS the subscription's root, so the coordinate is the empty one — \
+       not a leftover measured against /z: {:?}",
+      clamped.location()
+    );
+  }
+}
+
+/// The owner is both the semantic core AND the host for arbitrary caller code —
+/// a `Source` method, a subscription's `Filter` predicate — and it retains
+/// admitted control requests past a bounded ingress. Every cell here pins one of
+/// those seams against the failure state that exploits it.
+mod ownership {
+  use super::*;
+  use crate::driver::{MAX_PENDING_SYNCS, ReconcileStop};
+
+  /// The run loop selects a command and then awaits the whole reconcile
+  /// INSIDE that branch, so while `Source::arm` is pending the loop never returns
+  /// to its `select!` — the dedicated close lane exists but nothing polls it.
+  /// Close then stays pending for as long as the mount does, with the read plane
+  /// and every source resource still live.
+  ///
+  /// FAIL-ON-REVERT: drop the close arm from `Owner::arm`'s `select_biased!` (back
+  /// to `self.source.arm(key).await?`) and `close()` never resolves — the timeout
+  /// below fires, which is exactly the reproduction #49 filed.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_permanently_pending_arm_cannot_wedge_close() {
+    struct WedgedArmSource {
+      inner: FakeSource,
+      entered: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    }
+
+    impl Source<OsString> for WedgedArmSource {
+      type Handle = u32;
+
+      fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+        self.inner.canonicalize_key(key)
+      }
+
+      async fn arm(&mut self, _key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+        self
+          .entered
+          .store(true, core::sync::atomic::Ordering::SeqCst);
+        core::future::pending().await
+      }
+
+      fn disarm(&mut self, handle: u32) {
+        self.inner.disarm(handle);
+      }
+
+      async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+        core::future::pending().await
+      }
+
+      fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+        self.inner.root_key(handle)
+      }
+    }
+
+    let entered = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let w: crate::Tributaries<OsString, (), TokioRuntime, u32> = crate::Tributaries::with_source(
+      WedgedArmSource {
+        inner: FakeSource::new(),
+        entered: std::sync::Arc::clone(&entered),
+      },
+      TributariesOptions::new(),
+    );
+
+    let watching = {
+      let w = w.clone();
+      tokio::spawn(async move { w.watch(key("/a"), (), WatchOptions::new()).await })
+    };
+    // Settle on the owner being parked INSIDE the arm — the only state in which
+    // this proves anything.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !entered.load(core::sync::atomic::Ordering::SeqCst)
+      && std::time::Instant::now() < deadline
+    {
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+      entered.load(core::sync::atomic::Ordering::SeqCst),
+      "staging: the owner is parked inside Source::arm"
+    );
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), w.close())
+      .await
+      .expect("close resolves against a source that never returns from arm");
+    assert!(
+      closed.is_ok(),
+      "the close lane is honoured while an arm is wedged: {closed:?}"
+    );
+    // The abandoned reconcile's caller sees the watcher closed rather than hanging.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), watching).await;
+  }
+
+  /// The `grow` half of the same seam. `grow` is awaited on the Covered-outside
+  /// path with exactly the same run-loop shape, and the stock binding's `grow`
+  /// waits on the lower cover-settle fence — so a hung mount parks the owner
+  /// there just as it does in `arm`.
+  ///
+  /// FAIL-ON-REVERT: call `self.source.grow(..).await` directly instead of the
+  /// close-raced `Owner::grow` and this cell hangs — the queued close is never
+  /// observed and the assertion below is never reached.
+  #[tokio::test]
+  async fn a_queued_close_abandons_a_pending_grow() {
+    let mut h = Harness::new();
+    h.owner.source.grow_pending = true;
+    // A close is already queued on the dedicated signal, exactly as
+    // `Tributaries::close` leaves it.
+    let (reply, _on_close) = futures_channel::oneshot::channel();
+    h.closes.try_send(reply).expect("the close signal accepts");
+
+    let stop = h
+      .owner
+      .grow(1, &[key("/a")])
+      .await
+      .expect_err("a queued close abandons the pending grow");
+    assert!(
+      matches!(stop, ReconcileStop::CloseRequested(_)),
+      "the close wins the race and rides back to teardown: {stop:?}"
+    );
+  }
+
+  /// A per-subscription `Filter` predicate is arbitrary caller code run
+  /// inline in the ONE owner task. An unwind through it used to take the owner
+  /// with it — the shared event stream closes, every unrelated subscription
+  /// stops, and later `watch` calls answer `Closed` — so one tenant's broken
+  /// predicate denied service to every other.
+  ///
+  /// FAIL-ON-REVERT: call `filter.admits(..)` directly in `fan_out_raw`'s gate and
+  /// this cell unwinds at the fan-out below, never reaching an assertion.
+  #[test]
+  fn a_panicking_filter_cannot_take_the_owner_or_a_healthy_lane_with_it() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("the runtime builds");
+    runtime.block_on(async {
+      let mut h = Harness::new();
+      // A healthy subscription and a poisoned one, both covered by one root.
+      let healthy = h
+        .owner
+        .reconcile_watch(&key("/a"), (), WatchOptions::new())
+        .await
+        .expect("watch /a");
+      let poisoned = h
+        .owner
+        .reconcile_watch(
+          &key("/a/b"),
+          (),
+          WatchOptions::new().with_filter(Filter::new(|_| -> bool {
+            panic!("a tenant's filter predicate panics inside fan-out")
+          })),
+        )
+        .await
+        .expect("watch /a/b");
+
+      // One event covered by both. Reaching the line after this at all is the
+      // containment: the owner did not unwind.
+      h.owner.fan_out_and_push(&source_modified(1, "/a/b/f", 0));
+
+      let delivered: Vec<_> = core::iter::from_fn(|| h.events.try_recv().ok()).collect();
+      assert!(
+        delivered
+          .iter()
+          .any(|event| event.subscription() == healthy && !event.kind().is_rescan()),
+        "the healthy lane received its delivery — one tenant's filter cannot deny it service"
+      );
+
+      // The poisoned subscription's gate is retired (never entered again) and it is
+      // owed a dominating Rescan, so its consumer learns in-band that its view
+      // diverged rather than silently receiving a changed admission policy.
+      assert!(
+        h.owner
+          .needs_rescan
+          .contains_key(&poisoned)
+          .then_some(true)
+          .or_else(|| h
+            .owner
+            .suppressed_rescan
+            .contains_key(&poisoned)
+            .then_some(true))
+          .unwrap_or(
+            delivered
+              .iter()
+              .any(|event| { event.subscription() == poisoned && event.kind().is_rescan() })
+          ),
+        "the quarantined subscription is owed (or was delivered) a dominating Rescan"
+      );
+
+      // And the owner is still serving: a further watch reconciles normally.
+      h.owner
+        .reconcile_watch(&key("/c"), (), WatchOptions::new())
+        .await
+        .expect("the owner still serves after containing the panic");
+    });
+  }
+
+  /// The caught PAYLOAD is caller data too. `catch_unwind` hands back the value the panic
+  /// carried, and disposing of that box runs the value's own `Drop` — arbitrary caller code,
+  /// since a `panic_any` payload is any `Send + 'static` value the caller chose. Dropped in
+  /// the owner's own frame, one whose destructor panics starts a SECOND unwind that the
+  /// containment has already stopped guarding: the owner dies, the shared stream closes and
+  /// every unrelated subscription goes with it — precisely the blast radius the
+  /// per-subscription quarantine exists to prevent, reintroduced one line past the boundary.
+  ///
+  /// FAIL-ON-REVERT: dispose of the payload by binding it in `unwrap_or_else(|_| ..)` instead
+  /// of handing it to the contained `dispose_panic_payload`, and the fan-out below unwinds
+  /// through the owner, never reaching an assertion.
+  #[test]
+  fn a_panic_payload_whose_drop_panics_cannot_take_the_owner_with_it() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("the runtime builds");
+    runtime.block_on(async {
+      let mut h = Harness::new();
+      let healthy = h
+        .owner
+        .reconcile_watch(&key("/a"), (), WatchOptions::new())
+        .await
+        .expect("watch /a");
+      let poisoned = h
+        .owner
+        .reconcile_watch(
+          &key("/a/b"),
+          (),
+          WatchOptions::new().with_filter(Filter::new(|_| -> bool {
+            std::panic::panic_any(PanicsOnDrop)
+          })),
+        )
+        .await
+        .expect("watch /a/b");
+      h.drain();
+
+      // One event covered by both. Reaching the line after this at all is the containment of
+      // BOTH unwinds — the predicate's and its payload's disposal.
+      h.owner.fan_out_and_push(&source_modified(1, "/a/b/f", 0));
+
+      let delivered = h.drain();
+      assert!(
+        delivered
+          .iter()
+          .any(|event| event.subscription() == healthy && !event.kind().is_rescan()),
+        "the healthy lane received its delivery — a payload's destructor cannot deny it \
+         service either: {delivered:?}"
+      );
+      assert!(
+        h.owner
+          .filters
+          .get(&poisoned)
+          .is_some_and(|gate| gate.quarantined),
+        "the payload's own unwind did not cost the quarantine that the predicate's earned"
+      );
+      assert!(
+        h.owner.needs_rescan.contains_key(&poisoned)
+          || h.owner.suppressed_rescan.contains_key(&poisoned)
+          || delivered
+            .iter()
+            .any(|event| event.subscription() == poisoned && event.kind().is_rescan()),
+        "the quarantined subscription is still owed (or was delivered) a dominating Rescan"
+      );
+
+      // And the owner is still serving.
+      h.owner
+        .reconcile_watch(&key("/c"), (), WatchOptions::new())
+        .await
+        .expect("the owner still serves after containing the payload's unwind too");
+    });
+  }
+
+  /// Forgetting a payload is the last containment left when a payload's own destructor
+  /// panics, and it leaks that payload — an allocation of the caller's choosing, unreachable
+  /// for the rest of the process. Bounding that leak per SUBSCRIPTION bounds it in the shape
+  /// of the wrong resource: a subscription is a caller-churnable object, so
+  /// watch → panic once → release → repeat retains another arbitrary allocation every cycle,
+  /// with nothing between the caller and OOM.
+  ///
+  /// The bound therefore latches the OWNER's whole filter plane: one forgotten payload per
+  /// watcher, ever. A predicate is never entered again — which is what makes the bound hold
+  /// no matter how the caller churns — and a watch that ASKS for a filter is refused with a
+  /// typed terminal rather than silently created with a gate that will never run. Watches
+  /// that filter nothing lose nothing and stay admitted.
+  ///
+  /// FAIL-ON-REVERT: drop the owner latch (keep only the per-subscription quarantine) and the
+  /// predicate is entered once per cycle — eight forgotten payloads for eight cycles, and no
+  /// refusal at all.
+  #[test]
+  fn subscription_churn_cannot_accumulate_forgotten_filter_payloads() {
+    const CYCLES: usize = 8;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("the runtime builds");
+    runtime.block_on(async {
+      let mut h = Harness::new();
+      // Every entry into a panicking predicate is at most one forgotten payload, and no
+      // entry is none — so counting entries counts the leak.
+      let entries = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+      let mut admitted = 0usize;
+      let mut refused = 0usize;
+
+      for cycle in 0..CYCLES {
+        let hits = std::sync::Arc::clone(&entries);
+        let outcome = h
+          .watch_with(
+            "/a/b",
+            WatchOptions::new().with_filter(Filter::new(move |_| -> bool {
+              hits.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+              std::panic::panic_any(PanicsOnDrop)
+            })),
+          )
+          .await;
+        let Ok(sub) = outcome else {
+          let err = outcome.expect_err("refused");
+          assert!(
+            err.is_filter_retired(),
+            "cycle {cycle} was refused for the wrong reason: {err:?}"
+          );
+          refused += 1;
+          continue;
+        };
+        admitted += 1;
+        let root = h
+          .owner
+          .subsumer
+          .subscription_root(sub)
+          .expect("the fresh subscription has a root");
+        // One covered change: the predicate unwinds, its payload cannot be disposed of,
+        // and the owner has to forget it.
+        h.owner
+          .fan_out_and_push(&source_modified(root, "/a/b/f", cycle as u64));
+        h.drain();
+        h.unwatch(sub).expect("the subscription is released");
+      }
+
+      assert_eq!(
+        entries.load(core::sync::atomic::Ordering::SeqCst),
+        1,
+        "the panicking predicate was entered more than once across {CYCLES} churn cycles — \
+         each entry is another payload the owner has to forget"
+      );
+      assert_eq!(admitted, 1, "only the first filtered watch was admitted");
+      assert_eq!(
+        refused,
+        CYCLES - 1,
+        "every later filtered watch was refused with the typed terminal"
+      );
+
+      // The refusal is scoped to watches that actually ask for filtering: an unfiltered one
+      // can lose nothing to a retired filter plane, so it is still served.
+      h.watch_with("/c", WatchOptions::new())
+        .await
+        .expect("an unfiltered watch is unaffected by the retired filter plane");
+    });
+  }
+
+  /// The refusal at `watch` cannot be the bound on its own: a `Filter` slot is
+  /// hot-swappable, so a caller can be admitted with the admit-all default and install a
+  /// panicking predicate afterwards, through a handle it kept. The bound is the GATE's —
+  /// once the owner has forgotten a payload it enters no predicate at all — and the refusal
+  /// is only what keeps a caller from being silently unfiltered.
+  ///
+  /// FAIL-ON-REVERT: remove the latch check from the fan-out gate (leave only the refusal at
+  /// admission) and the swapped-in predicate runs, forgetting a second payload — through a
+  /// subscription no refusal could ever have caught.
+  #[test]
+  fn a_retired_filter_plane_enters_no_predicate_swapped_in_afterwards() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("the runtime builds");
+    runtime.block_on(async {
+      let mut h = Harness::new();
+
+      // Trip the latch once, exactly as a tenant's filter would.
+      let tripped = h
+        .watch_with(
+          "/a",
+          WatchOptions::new().with_filter(Filter::new(|_| -> bool {
+            std::panic::panic_any(PanicsOnDrop)
+          })),
+        )
+        .await
+        .expect("watch /a");
+      let tripped_root = h
+        .owner
+        .subsumer
+        .subscription_root(tripped)
+        .expect("/a is live");
+      h.owner
+        .fan_out_and_push(&source_modified(tripped_root, "/a/f", 0));
+      h.drain();
+      assert!(
+        h.owner.filter_payload_forgotten,
+        "staging: the owner had to forget the payload"
+      );
+
+      // And now the churn the refusal cannot see: each cycle is admitted while its filter is
+      // still the admit-all default, then has caller code swapped into that slot through the
+      // handle the caller kept. If the gate ever entered one, every cycle would forget
+      // another payload.
+      let entries = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+      let mut last = None;
+      for cycle in 0..4u64 {
+        let slot: Filter<OsString> = Filter::all();
+        let sub = h
+          .watch_with("/b", WatchOptions::new().with_filter(slot.clone()))
+          .await
+          .expect("an admit-all watch is still admitted");
+        let root = h.owner.subsumer.subscription_root(sub).expect("/b is live");
+        h.drain();
+        let hits = std::sync::Arc::clone(&entries);
+        slot.swap(move |_| -> bool {
+          hits.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+          std::panic::panic_any(PanicsOnDrop)
+        });
+        h.owner
+          .fan_out_and_push(&source_modified(root, "/b/f", cycle + 1));
+        last = Some((sub, root, h.drain()));
+        if cycle + 1 < 4 {
+          h.unwatch(sub).expect("the subscription is released");
+        }
+      }
+      let (sub, root, delivered) = last.expect("the loop ran");
+
+      assert_eq!(
+        entries.load(core::sync::atomic::Ordering::SeqCst),
+        0,
+        "the retired plane entered a predicate swapped in behind the refusal — one more \
+         forgotten payload per cycle, and the cycle is free"
+      );
+      assert!(
+        h.owner
+          .filters
+          .get(&sub)
+          .is_some_and(|gate| gate.quarantined),
+        "the subscription whose gate the latch retired is marked, exactly as one whose own \
+         predicate unwound"
+      );
+      assert!(
+        h.owner.needs_rescan.contains_key(&sub)
+          || h.owner.suppressed_rescan.contains_key(&sub)
+          || delivered
+            .iter()
+            .any(|event| event.subscription() == sub && event.kind().is_rescan()),
+        "and it is owed a dominating Rescan, so its consumer learns in-band that its \
+         admission gate is gone"
+      );
+
+      // Fail-open survives the latch exactly as it survives a predicate's own unwind: once
+      // the owed Rescan is published, later changes are DELIVERED — over-delivery, never a
+      // silent drop of what the swapped-in predicate would have rejected — and still without
+      // entering it.
+      h.owner.flush_pending_rescans();
+      h.drain();
+      h.owner.fan_out_and_push(&source_modified(root, "/b/g", 2));
+      let after = h.drain();
+      assert!(
+        after
+          .iter()
+          .any(|event| event.subscription() == sub && !event.kind().is_rescan()),
+        "a retired plane over-delivers rather than dropping silently: {after:?}"
+      );
+      assert_eq!(
+        entries.load(core::sync::atomic::Ordering::SeqCst),
+        0,
+        "and it still entered no predicate"
+      );
+    });
+  }
+
+  /// A `Filter` is a handle onto a SHARED predicate slot, and callers clone one across
+  /// subscriptions deliberately. Retiring a panicking predicate by writing admit-all into
+  /// that slot therefore retires it for every subscription registered from the same
+  /// filter value — while only the one that unwound is recorded as having lost coverage.
+  /// A tenant's filtering boundary would silently disappear because a DIFFERENT tenant's
+  /// predicate panicked, with no Rescan and no loss marker to say so.
+  ///
+  /// FAIL-ON-REVERT: quarantine by `filter.swap(|_| true)` instead of the
+  /// per-subscription mark, and the sibling stops running its predicate (the call count
+  /// freezes) and starts admitting what it was configured to reject.
+  #[test]
+  fn quarantining_one_subscription_leaves_a_sibling_sharing_its_filter_intact() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("the runtime builds");
+    runtime.block_on(async {
+      let mut h = Harness::new();
+      // ONE filter value, cloned across two disjoint subscriptions — the ordinary way a
+      // caller applies one policy to several watches. It panics on `boom`, rejects
+      // `hidden`, and admits everything else; the counter proves whether it ran at all.
+      let calls = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+      let shared = Filter::new({
+        let calls = std::sync::Arc::clone(&calls);
+        move |input: &crate::FilterInput<'_, OsString>| {
+          calls.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+          match input.key().last().and_then(|c| c.to_str()) {
+            Some("boom") => panic!("a tenant's filter predicate panics inside fan-out"),
+            Some("hidden") => false,
+            _ => true,
+          }
+        }
+      });
+      let poisoned = h
+        .watch_with("/a/x", WatchOptions::new().with_filter(shared.clone()))
+        .await
+        .expect("watch /a/x");
+      let sibling = h
+        .watch_with("/a/y", WatchOptions::new().with_filter(shared.clone()))
+        .await
+        .expect("watch /a/y");
+      h.drain();
+      // The two are disjoint, so each rides its own root.
+      let poisoned_root = h
+        .owner
+        .subsumer
+        .subscription_root(poisoned)
+        .expect("/a/x is live");
+      let sibling_root = h
+        .owner
+        .subsumer
+        .subscription_root(sibling)
+        .expect("/a/y is live");
+
+      // A change only /a/x covers: its predicate unwinds, and /a/x is quarantined.
+      h.owner
+        .fan_out_and_push(&source_modified(poisoned_root, "/a/x/boom", 0));
+      assert_eq!(
+        calls.load(core::sync::atomic::Ordering::SeqCst),
+        1,
+        "staging: exactly the poisoned subscription's invocation ran"
+      );
+      assert!(
+        h.owner.needs_rescan.contains_key(&poisoned)
+          || h.owner.suppressed_rescan.contains_key(&poisoned),
+        "the quarantined subscription is owed a dominating Rescan"
+      );
+
+      // The poisoned subscription's own gate is retired: caller code is never entered
+      // for it again, whatever arrives.
+      h.owner
+        .fan_out_and_push(&source_modified(poisoned_root, "/a/x/other", 1));
+      assert_eq!(
+        calls.load(core::sync::atomic::Ordering::SeqCst),
+        1,
+        "the quarantined subscription never re-enters the predicate that unwound"
+      );
+
+      // The sibling registered from a CLONE of the same filter is untouched: it still
+      // runs the predicate, and still rejects what that predicate rejects.
+      h.owner
+        .fan_out_and_push(&source_modified(sibling_root, "/a/y/hidden", 2));
+      assert_eq!(
+        calls.load(core::sync::atomic::Ordering::SeqCst),
+        2,
+        "the sibling's own gate still runs — the quarantine did not reach through the \
+         shared slot"
+      );
+      assert!(
+        !h.drain()
+          .iter()
+          .any(|event| event.subscription() == sibling),
+        "the sibling still rejects what its filter rejects — no filtering boundary was \
+         silently dropped"
+      );
+      assert!(
+        !h.owner.needs_rescan.contains_key(&sibling)
+          && !h.owner.suppressed_rescan.contains_key(&sibling),
+        "and it was never put under loss for somebody else's panic"
+      );
+
+      // Fail-open survives for the quarantined subscription itself: its debt is what it
+      // is owed, and once that Rescan is published its later changes are DELIVERED —
+      // over-delivery, never a silent drop of what its broken predicate would have
+      // rejected.
+      h.owner.flush_pending_rescans();
+      h.drain();
+      h.owner
+        .fan_out_and_push(&source_modified(poisoned_root, "/a/x/hidden", 3));
+      assert!(
+        h.drain()
+          .iter()
+          .any(|event| event.subscription() == poisoned && !event.kind().is_rescan()),
+        "a quarantined subscription admits what its retired predicate would have rejected"
+      );
+    });
+  }
+
+  /// The quarantine mints a `Rescan` that strictly dominates everything stamped before
+  /// it — including the delivery the panic itself fail-opened, which was stamped moments
+  /// earlier in the same fan-out. Under debounce, letting that delivery (or any entry
+  /// already buffered for the subscription) sit in the coalescer puts it behind a settle
+  /// window that outlives the Rescan's publication, so the timer releases a lower-epoch
+  /// delta AFTER the signal claiming to dominate it: a high-water consumer discards a
+  /// legitimate delivery, a naive one re-diverges past the enumeration.
+  ///
+  /// FAIL-ON-REVERT: drop the coalescer purge and push the fanned deliveries through
+  /// `push_all`, and the settle timer releases both epoch-0 deltas after the epoch-2
+  /// Rescan has already been delivered.
+  #[test]
+  fn a_filter_panic_under_debounce_releases_no_delta_after_its_rescan() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("the runtime builds");
+    runtime.block_on(async {
+      // Long enough that admission genuinely buffers across the panic, short enough to
+      // elapse inside this cell.
+      let cfg = DebounceConfig::new()
+        .with_quiet_window(Duration::from_millis(100))
+        .with_max_hold(Duration::from_millis(1000));
+      let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(cfg))));
+      let sub = h
+        .watch_with(
+          "/a",
+          WatchOptions::new().with_filter(Filter::new(
+            |input: &crate::FilterInput<'_, OsString>| {
+              if input.key().last().and_then(|c| c.to_str()) == Some("boom") {
+                panic!("a tenant's filter predicate panics inside fan-out");
+              }
+              true
+            },
+          )),
+        )
+        .await
+        .expect("watch /a");
+      h.drain();
+
+      // An admitted delta buffers behind the settle window.
+      h.owner.fan_out_and_push(&source_modified(1, "/a/early", 0));
+      assert!(
+        h.owner
+          .coalescer
+          .as_ref()
+          .is_some_and(|c| c.next_deadline().is_some()),
+        "staging: the admitted delta is buffered, not delivered"
+      );
+      assert!(
+        h.drain().is_empty(),
+        "staging: nothing escapes the settle window yet"
+      );
+
+      // The predicate unwinds on the next delta: it fails OPEN and the subscription is
+      // quarantined and owed a dominating Rescan.
+      h.owner.fan_out_and_push(&source_modified(1, "/a/boom", 0));
+      let debt = h
+        .owner
+        .needs_rescan
+        .get(&sub)
+        .expect("the quarantined subscription is owed a dominating Rescan")
+        .epoch;
+
+      // Nothing of this subscription is left behind its own debt: the older buffered
+      // entry was dropped, and the fail-opened delivery took the standing-debt gate
+      // rather than the coalescer.
+      assert!(
+        h.owner
+          .coalescer
+          .as_ref()
+          .is_some_and(|c| c.next_deadline().is_none()),
+        "the quarantined subscription holds nothing buffered behind its own Rescan"
+      );
+
+      // Publish the Rescan, then let the settle window elapse and drain what it holds.
+      h.owner.flush_pending_rescans();
+      let published = h.drain();
+      assert!(
+        published
+          .iter()
+          .any(|e| e.subscription() == sub && e.kind().is_rescan() && e.epoch() == debt),
+        "the dominating Rescan reaches the consumer: {published:?}"
+      );
+
+      tokio::time::sleep(Duration::from_millis(250)).await;
+      h.owner.drain_coalescer_due();
+      let tail = h.drain();
+      assert!(
+        tail
+          .iter()
+          .all(|e| e.subscription() != sub || e.epoch() >= debt),
+        "no delivery the Rescan dominates may follow it: {tail:?}"
+      );
+      assert!(
+        tail.is_empty(),
+        "and there is nothing left to release at all: {tail:?}"
+      );
+    });
+  }
+
+  /// The bounded sync mailbox limits requests waiting to be RECEIVED. Once
+  /// the owner drains one it retains the barrier — and a real cookie FILE — until
+  /// the cookie is observed, dominated, cancelled or retired, and the caller picks
+  /// its own timeout. Admissions can therefore outrun observations without bound.
+  ///
+  /// FAIL-ON-REVERT: remove the `pending_syncs.len() >= MAX_PENDING_SYNCS` arm from
+  /// `on_sync` and every admission parks — the pending population grows with total
+  /// admitted calls and nothing is refused.
+  #[tokio::test]
+  async fn sync_admission_stops_at_the_in_flight_bound() {
+    let mut h = Harness::new();
+    h.owner.source.supports_sync = true;
+    let sub = h
+      .owner
+      .reconcile_watch(&key("/a"), (), WatchOptions::new())
+      .await
+      .expect("watch /a");
+
+    // Every caller keeps waiting: the cookie is never observed, so no barrier
+    // resolves and nothing is ever reclaimed.
+    let mut refused = 0usize;
+    // Every receiver is RETAINED: cancellation reclaim cannot help a caller that
+    // is genuinely still waiting, which is the whole point of the bound.
+    let mut waiters = Vec::new();
+    for _ in 0..(MAX_PENDING_SYNCS * 2) {
+      let (reply, mut on_reply) = futures_channel::oneshot::channel();
+      h.owner.on_sync(sub, 0, reply).await;
+      match futures_util::poll!(&mut on_reply) {
+        core::task::Poll::Ready(Ok(Err(crate::error::SyncError::Busy))) => refused += 1,
+        core::task::Poll::Ready(other) => panic!("unexpected sync resolution: {other:?}"),
+        // Admitted and parked on a cookie that is never observed.
+        core::task::Poll::Pending => waiters.push(on_reply),
+      }
+    }
+    assert!(refused > 0, "admission stops at the in-flight bound");
+    assert!(
+      waiters.len() <= MAX_PENDING_SYNCS,
+      "at most the bound of callers are ever admitted: {}",
+      waiters.len()
+    );
+    assert!(
+      h.owner.pending_syncs.len() <= MAX_PENDING_SYNCS,
+      "the owner retains at most the bound, not one per admitted call: {}",
+      h.owner.pending_syncs.len()
+    );
+    assert!(
+      h.owner.source.begun_syncs <= MAX_PENDING_SYNCS,
+      "a refused barrier is refused BEFORE its cookie is written, so it leaves no \
+       marker on the filesystem: {} writes",
+      h.owner.source.begun_syncs
+    );
+  }
+
+  /// Upper `close()` used to acknowledge and only then DROP the source,
+  /// which starts the lower teardown but can neither await nor report it — so a
+  /// caller that terminates its runtime on that acknowledgement abandons native
+  /// threads and marker files, and the lower `NotQuiesced` evidence is hidden.
+  ///
+  /// FAIL-ON-REVERT: send `Ok(())` on the close reply instead of the source's
+  /// verdict and this cell sees a successful close over a source that reported it
+  /// was not quiescent.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn close_forwards_the_sources_quiescence_verdict() {
+    struct NotQuiescentSource {
+      inner: FakeSource,
+      joined: std::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl Source<OsString> for NotQuiescentSource {
+      type Handle = u32;
+
+      fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+        self.inner.canonicalize_key(key)
+      }
+
+      async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+        self.inner.arm(key).await
+      }
+
+      fn disarm(&mut self, handle: u32) {
+        self.inner.disarm(handle);
+      }
+
+      async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+        core::future::pending().await
+      }
+
+      fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+        self.inner.root_key(handle)
+      }
+
+      async fn join_close(&mut self) -> Result<(), crate::error::SourceCloseError> {
+        self
+          .joined
+          .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        Err(crate::error::SourceCloseError::NotQuiesced { pending: 3 })
+      }
+    }
+
+    let joined = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let w: crate::Tributaries<OsString, (), TokioRuntime, u32> = crate::Tributaries::with_source(
+      NotQuiescentSource {
+        inner: FakeSource::new(),
+        joined: std::sync::Arc::clone(&joined),
+      },
+      TributariesOptions::new(),
+    );
+    w.watch(key("/a"), (), WatchOptions::new())
+      .await
+      .expect("watch /a");
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), w.close())
+      .await
+      .expect("close resolves");
+    assert_eq!(
+      joined.load(core::sync::atomic::Ordering::SeqCst),
+      1,
+      "the owner awaited the source's join before acknowledging"
+    );
+    match closed {
+      Err(crate::error::CloseError::Source(err)) => assert!(
+        err.is_not_quiesced(),
+        "the source's own verdict is forwarded verbatim: {err:?}"
+      ),
+      other => panic!("close reported {other:?} over a source that proved nothing"),
+    }
+  }
 }

@@ -7,8 +7,15 @@
 //! located key, its kind, and (for the fs source) its path — the fully-typed `Filter<L>`
 //! location-parsing generic is deferred (design §7). The predicate lives behind an
 //! [`arc_swap::ArcSwap`] so it can be **hot-swapped** at any time without re-arming the kernel
-//! watch (a re-watch): the driver holds each subscription's `Filter` and [`swap`](Filter::swap)s
-//! the closure in place, and the next change admitted sees the new predicate.
+//! watch (a re-watch): the driver holds each subscription's `Filter`, a caller that kept a clone
+//! [`swap`](Filter::swap)s the closure in place, and the next change admitted sees the new
+//! predicate.
+//!
+//! That slot is shared by every clone, so a `swap` through it is a **whole-slot** act — right for
+//! a caller re-scoping its own subscriptions, wrong as a way to retire one subscription's gate.
+//! The driver never writes to it: the containment below is recorded per subscription, in the
+//! driver's own state, so one subscription's panicking predicate cannot change what a sibling
+//! sharing the same `Filter` admits.
 //!
 //! # The contract: a pre-delivery predicate over *what* changed, never *when* or *whose*
 //!
@@ -90,7 +97,13 @@ impl<'a, C> FilterInput<'a, C> {
     self.kind
   }
 
-  /// The change's location relative to its watched root.
+  /// The change's location relative to **the key this filter's subscription watches** —
+  /// the same rebased coordinate the delivered
+  /// [`Event::location`](crate::Event::location) carries, and for the same reason: the
+  /// physical armed root underneath a subscription is mutable watch-set topology, so a
+  /// predicate written against it would silently change meaning when an unrelated caller
+  /// watches an ancestor. Against the subscription's own key, a depth or location test
+  /// written once keeps admitting exactly what it admitted.
   #[inline]
   #[must_use]
   pub fn location(&self) -> &Location {
@@ -117,6 +130,26 @@ impl FilterInput<'_, std::ffi::OsString> {
 /// reads it from whatever task polls `next()`.
 type Predicate<C> = Arc<dyn Fn(&FilterInput<'_, C>) -> bool + Send + Sync>;
 
+/// The state every clone of one [`Filter`] shares: the hot-swappable predicate, and whether
+/// the caller ever asked for a predicate of its own.
+struct FilterSlot<C> {
+  predicate: ArcSwap<Predicate<C>>,
+  /// `false` only for a filter that is still the [`all`](Filter::all) default — a predicate
+  /// the driver supplies, whose evaluation is a constant `true` and can never unwind.
+  ///
+  /// The driver reads this to decide whether a watch is asking for filtering *at all*, so
+  /// that a watcher whose filter plane has been retired can refuse the watches that would
+  /// otherwise silently go unfiltered while leaving unfiltered ones — which lose nothing —
+  /// admitted. It rides the shared slot rather than the handle, exactly as the predicate
+  /// does: a [`swap`](Filter::swap) is a whole-slot act, so a default filter that any holder
+  /// swaps a predicate into is custom from then on, for every holder.
+  ///
+  /// Latching (never cleared by a later swap back to an admit-all closure) is deliberate: the
+  /// flag records that caller code has been installed here, and a caller that swapped once can
+  /// swap again at any moment.
+  custom: std::sync::atomic::AtomicBool,
+}
+
 /// A live-swappable admission predicate for one subscription (design §7), over a change's
 /// pre-delivery [`FilterInput`].
 ///
@@ -134,7 +167,7 @@ type Predicate<C> = Arc<dyn Fn(&FilterInput<'_, C>) -> bool + Send + Sync>;
 /// [`swap`](Filter::swap) through any handle is observed by every holder, which is what lets the
 /// driver keep a subscription's filter while the caller keeps a handle to re-scope it live.
 pub struct Filter<C> {
-  predicate: Arc<ArcSwap<Predicate<C>>>,
+  slot: Arc<FilterSlot<C>>,
 }
 
 impl<C> Filter<C> {
@@ -143,7 +176,7 @@ impl<C> Filter<C> {
   #[inline]
   #[must_use]
   pub fn all() -> Self {
-    Self::new(|_| true)
+    Self::from_predicate(|_| true, false)
   }
 
   /// A filter admitting exactly the changes for which `predicate` returns `true`.
@@ -154,12 +187,50 @@ impl<C> Filter<C> {
   /// (the driver evaluates it from the polling task and may [`swap`](Filter::swap) it across the
   /// async boundary). A [`Rescan`](EventKind::Rescan) never reaches it — coverage
   /// loss bypasses the filter (design §7/§8).
+  ///
+  /// # Callback contract
+  ///
+  /// The predicate is evaluated **inline in the watcher's single owner task**, once per candidate
+  /// delivery per subscription. That task also serves every other subscription, the source pump,
+  /// and the control plane, so the predicate must be:
+  ///
+  /// - **bounded and non-blocking.** It must not perform I/O, take a lock another task can hold,
+  ///   or otherwise park. An actor cannot preempt a synchronous function running on its own
+  ///   thread, so a predicate that does not return holds the whole watcher — its
+  ///   [`close`](crate::Tributaries::close) included — for as long as it runs. This is a
+  ///   requirement on the caller, not something the watcher can enforce.
+  /// - **panic-free — though a panic is contained.** If the predicate unwinds, the watcher does
+  ///   not: the unwind is caught, the change is ADMITTED (over-delivery, never silent loss), the
+  ///   admission gate **of the subscription whose delivery it unwound on** is permanently retired
+  ///   so the panicking code is never entered again for it, and that subscription is owed a
+  ///   dominating [`Rescan`](EventKind::Rescan) telling its consumer to re-enumerate. Every other
+  ///   subscription is unaffected — including one registered with a **clone of this same
+  ///   filter**: the retirement is recorded per subscription in the watcher's own state, never by
+  ///   writing admit-everything into the shared predicate slot, so a filter value reused across
+  ///   subscriptions never carries one of them's panic into another's admission.
   #[inline]
   #[must_use]
   pub fn new(predicate: impl Fn(&FilterInput<'_, C>) -> bool + Send + Sync + 'static) -> Self {
+    Self::from_predicate(predicate, true)
+  }
+
+  fn from_predicate(
+    predicate: impl Fn(&FilterInput<'_, C>) -> bool + Send + Sync + 'static,
+    custom: bool,
+  ) -> Self {
     Self {
-      predicate: Arc::new(ArcSwap::from_pointee(Arc::new(predicate) as Predicate<C>)),
+      slot: Arc::new(FilterSlot {
+        predicate: ArcSwap::from_pointee(Arc::new(predicate) as Predicate<C>),
+        custom: std::sync::atomic::AtomicBool::new(custom),
+      }),
     }
+  }
+
+  /// Whether caller code has ever been installed in this filter's shared slot — see
+  /// [`FilterSlot::custom`].
+  #[inline]
+  pub(crate) fn is_custom(&self) -> bool {
+    self.slot.custom.load(std::sync::atomic::Ordering::Relaxed)
   }
 
   /// Hot-swaps the predicate in place — every subsequent [`admits`](Self::admits) uses
@@ -170,7 +241,15 @@ impl<C> Filter<C> {
   /// holds) sees the change immediately — the slot is shared.
   #[inline]
   pub fn swap(&self, predicate: impl Fn(&FilterInput<'_, C>) -> bool + Send + Sync + 'static) {
+    // Marked custom BEFORE the predicate is installed, so no window exists in which caller
+    // code is reachable through this slot while the slot still reads as the admit-all
+    // default.
     self
+      .slot
+      .custom
+      .store(true, std::sync::atomic::Ordering::Relaxed);
+    self
+      .slot
       .predicate
       .store(Arc::new(Arc::new(predicate) as Predicate<C>));
   }
@@ -183,7 +262,7 @@ impl<C> Filter<C> {
   #[inline]
   #[must_use]
   pub fn admits(&self, input: &FilterInput<'_, C>) -> bool {
-    (self.predicate.load())(input)
+    (self.slot.predicate.load())(input)
   }
 }
 
@@ -193,7 +272,7 @@ impl<C> Clone for Filter<C> {
   #[inline]
   fn clone(&self) -> Self {
     Self {
-      predicate: Arc::clone(&self.predicate),
+      slot: Arc::clone(&self.slot),
     }
   }
 }
