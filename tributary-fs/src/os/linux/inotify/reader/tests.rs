@@ -306,6 +306,7 @@ mod liveness {
     let shared = ReaderShared {
       queue: tx,
       transport: TransportState::new(8),
+      buffer_bytes: 64 * 1024,
     };
     (shared, rx)
   }
@@ -1032,6 +1033,7 @@ mod rebuild {
     let shared = ReaderShared {
       queue: tx,
       transport: TransportState::new(8),
+      buffer_bytes: 64 * 1024,
     };
     (shared, rx)
   }
@@ -1478,6 +1480,7 @@ mod queue_cut {
     let shared = ReaderShared {
       queue: tx,
       transport: TransportState::new(1024),
+      buffer_bytes: 64 * 1024,
     };
     (shared, rx)
   }

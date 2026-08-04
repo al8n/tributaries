@@ -22,7 +22,7 @@
 //! |---------------------------------------|-------------------------------------|
 //! | Event drain (read → `EAGAIN`)         | preemptible BETWEEN reads           |
 //! | Reseed walk (`reseed_map`)            | bounded, must complete or blind→fatal |
-//! | Move-in subtree walk (`seed_moved_in_subtree`) | bounded, must complete or blind→fatal |
+//! | Move-in subtree walk (`seed_moved_in_subtree`) | bounded, must complete or blind→loss |
 //!
 //! The two walks are the bounded-must-complete case: each rebuilds (or extends) the
 //! FID map from a fresh directory enumerate, and the map swap is only sound once the
@@ -30,10 +30,15 @@
 //! half-built map, i.e. a silently-blind subtree, the exact class the whole stack
 //! prevents. So a shutdown landing mid-walk WAITS for the walk (checked between
 //! reads, after the current buffer's walk has finished): the walk is bounded by the
-//! root's directory count and either completes or escalates blind → fatal. Unlike
+//! root's directory count and either completes or concedes blindness. Unlike
 //! the inotify batch, a walk's work cannot be failed-reply'd away — there is no
 //! per-op grant to resolve, only a map that is whole or blind. This is why the
 //! inotify intra-batch preemption has no analog here.
+//!
+//! What a conceded walk COSTS differs by walk, and the difference is the recovery
+//! left: a move-in walk that fails still has a full reseed to fall back on, so it
+//! degrades to the loss barrier; the reseed IS that fallback, so its own failure is
+//! the terminal.
 
 use std::{
   os::fd::OwnedFd,
@@ -63,6 +68,9 @@ use super::{
 pub(crate) struct ReaderShared {
   pub(crate) queue: async_channel::Sender<crate::os::SourceMessage>,
   pub(crate) transport: transport::TransportState,
+  /// How many bytes one `read` of the instance may take, from the configured
+  /// native buffer size.
+  pub(crate) buffer_bytes: usize,
   /// The atomic stats the reader writes (map size, walk timings, memo tallies)
   /// and [`Watcher::backend_stats`](crate::Watcher::backend_stats) snapshots.
   pub(crate) stats: std::sync::Arc<BackendStatsShared>,
@@ -99,7 +107,13 @@ pub(crate) fn start(
       let outcome = catch_unwind(AssertUnwindSafe(|| {
         run(&fd, &wake, &control, &mut map, &reseed, &shared);
       }));
-      if outcome.is_err() {
+      // The payload is retired inside its own boundary. Dropped as this closure
+      // returns, one whose own `Drop` panics would unwind the thread body after the
+      // terminal below was already sent — and `shutdown` then JOINS this thread, so
+      // that payload would land on the teardown worker, which is the executor the
+      // whole teardown contract is built to keep unbounded and unguarded work off.
+      if let Err(payload) = outcome {
+        let _ = tributary_proto::unwind::dispose_panic_payload(payload);
         signal_fatal(&shared, SourceError::CallbackPanic);
       }
     })
@@ -121,8 +135,8 @@ fn run(
   shared: &ReaderShared,
 ) {
   // fanotify events are large (a metadata header plus variable-length FID
-  // records with names); 64 KiB holds a dense read of them.
-  let mut buf = vec![0u8; 64 * 1024];
+  // records with names); the 64 KiB default holds a dense read of them.
+  let mut buf = vec![0u8; shared.buffer_bytes];
   loop {
     // Announce the intent to block, then re-check for shutdown before polling
     // (the lost-wakeup guard — see `WakeState`; a shutdown enqueued before the
@@ -224,6 +238,7 @@ fn drain_events(
       map,
       &shared.stats,
       &shared.transport,
+      reseed.exclusions(),
       || reseed.walk(),
       |subtree, subtree_fid, budget| reseed.walk_subtree(subtree, subtree_fid, budget),
       |msg| shared.queue.try_send(msg).is_ok(),
@@ -254,11 +269,18 @@ fn drain_events(
 /// `reseed_walk` rebuilds the whole map from the root (a loss); `subtree_walk`
 /// maps one moved-in directory's descendants (its resolved current path, its FID,
 /// and the remaining directory budget). Both mirror `ReseedContext`'s methods.
+///
+/// `exclusions` is handed straight to [`classify`], which decides the fence BEFORE
+/// any map self-maintenance runs. Nothing is filtered here afterwards: an excluded
+/// event arrives as [`Admission::ExcludedDrop`] having mutated nothing, so this loop
+/// never sees a forwarded event the caller asked not to hear about, and — the
+/// property that matters — excluded activity never grew the map to get here.
 fn process_decoded<R, S, Q>(
   decoded: super::fid::DecodeOutcome,
   map: &mut FidMap,
   stats: &BackendStatsShared,
   transport: &transport::TransportState,
+  exclusions: &[std::path::PathBuf],
   reseed_walk: R,
   mut subtree_walk: S,
   mut send: Q,
@@ -282,17 +304,25 @@ where
   if !lossy {
     events.reserve(decoded.events.len());
     for event in &decoded.events {
-      match classify(map, event, &mut memo) {
+      match classify(map, event, &mut memo, exclusions) {
         // A forwarded event whose admission mutated no growing node, OR a root
         // self-event routed to the death lifecycle. A `LearnDir` may have grown the
         // map past its cap (design §4.9): a capped map that keeps eventing while
         // silently refusing to learn is the silent-loss shape, so an over-cap map is
         // the terminal `Fatal`, not run on blind. (The check is cheap and harmless
         // on the non-growing arms.)
-        Admission::Forward(event)
-        | Admission::LearnDir(event)
-        | Admission::ForgetDir(event)
-        | Admission::RootDeath(event) => {
+        Admission::RootDeath(event) => {
+          if map.over_capacity() {
+            signal_fatal_cap(transport, &mut send);
+            return false;
+          }
+          // Never suppressed. The root's own death is the scope's lifecycle, not
+          // its content: an exclusion covering the root (a caller excluding the
+          // very tree it watched) would otherwise silence the one record that says
+          // the watch is over.
+          events.push(fanotify_event(event));
+        }
+        Admission::Forward(event) | Admission::LearnDir(event) | Admission::ForgetDir(event) => {
           if map.over_capacity() {
             signal_fatal_cap(transport, &mut send);
             return false;
@@ -320,13 +350,24 @@ where
         //    and STILL pending (the flag is preserved across a re-parent), so the
         //    walk rebases to the new path;
         //  - otherwise the node is present and pending at its move-in destination.
-        // Therefore a `NotFound` at the resolved path means NO removal was processed
-        // by this reader, yet the directory is gone on disk (a later event in this
-        // same batch — the burst — already hit disk but not the reader). That is a
-        // genuine coverage hole, so the walk classifies it `Incomplete` and, after
-        // the single retry, escalates to the terminal `Fatal` (blind → fatal) — NOT
-        // a benign empty walk. Auto's next `watch()` then lands on inotify, which
-        // re-enumerates; a silent blind subtree is never left behind.
+        //
+        // A `NotFound` at the resolved path therefore means no removal was processed
+        // BY THIS READER, yet the directory is not there. That is the ordinary shape
+        // of a same-buffer move burst: move a populated `X` into `/root/a/X`, then to
+        // `/root/b/X` before the reader consumes the buffer, and the walk that runs at
+        // the FIRST record looks for a directory the SECOND record — still unread, but
+        // long since applied to disk — has already moved. The map is behind the disk,
+        // not blind to it, and the next record in this very buffer would have
+        // re-parented the node.
+        //
+        // So a failed walk is LOSS, not death. It degrades to the same per-buffer
+        // barrier every other loss takes: drop the buffer, reseed the whole map from
+        // the root, and signal `Overflow`. The reseed is a fresh enumerate of the live
+        // tree, so it finds the moved directory wherever it actually landed, and the
+        // covering rescan owes the consumer everything the dropped buffer could have
+        // said. `Fatal` is reserved for the failure of that FULL recovery
+        // (`reseed_after_loss`), which is the only failure that really does leave the
+        // source unable to see.
         Admission::Rename { event, seed } => {
           // The re-parent / move-in learn may have grown the map past its cap; check
           // it FIRST — before any walk — so an over-cap learn cannot even start one.
@@ -349,14 +390,13 @@ where
             });
             stats.record_walk(walk_micros(started));
             if matches!(outcome, SeedOutcome::Blind) {
-              transport::signal_fatal_once(
-                transport,
-                SourceError::ReadFailed {
-                  source: moved_in_blind_error(),
-                },
-                &mut send,
-              );
-              return false;
+              // The subtree could not be mapped from the path the map resolves it
+              // to. Take the loss barrier rather than the terminal: a reseed both
+              // repairs whatever the burst staled and covers it with a rescan,
+              // where killing the scope would strand every unrelated subscription
+              // on it over ordinary churn.
+              lossy = true;
+              break;
             }
             // The belt: the walk fenced its own production to the remaining budget,
             // so this only fires on the exact cap boundary — the same terminal a
@@ -373,6 +413,13 @@ where
         // DESIGN — distinct from the staleness a loss induces, which the reseed
         // below repairs.
         Admission::ForeignDrop => {}
+        // Inside the root but outside the REPORTED tree: the exclusion fence refused
+        // the event at the TOP of `classify`, so nothing was learned, re-parented,
+        // forgotten, or handed here as a subtree to walk. Excluded churn therefore
+        // costs this reader one path resolution and nothing else — it cannot grow the
+        // admission map toward the cap, and it cannot barrier the buffer, so no
+        // subscription outside the exclusion is ever affected by activity under it.
+        Admission::ExcludedDrop => {}
         // A classified loss: the selected action lacks a required field. Take the
         // per-buffer barrier — drop the whole buffer (any events pushed so far
         // included), reseed, and signal only `Overflow`.
@@ -538,7 +585,10 @@ enum SeedOutcome {
   /// pending flag (nothing owed). Both leave the map complete.
   Seeded,
   /// The walk failed twice: the moved-in subtree is only partially mapped, so the
-  /// source is blind under it. The caller escalates to the terminal `Fatal`.
+  /// map is stale under it. The caller degrades to the per-buffer LOSS barrier —
+  /// drop the buffer, reseed the whole map, signal `Overflow` — never straight to
+  /// the terminal, because the commonest cause is an ordinary same-buffer move
+  /// burst the reseed repairs.
   Blind,
 }
 
@@ -556,9 +606,10 @@ enum SeedOutcome {
 /// - its `pending_walk` flag is already CLEAR (an intervening event completed the
 ///   obligation): likewise cancelled;
 /// - otherwise walk from the resolved current path. A `NotFound` there is
-///   `Incomplete` (the node is still in-map and pending, so no rename-out was
-///   processed — a missing dir is a genuine hole, not a race), which folds to the
-///   retry-then-blind policy.
+///   `Incomplete` — the node is still in-map and pending, so THIS READER processed
+///   no removal, but a later record in the same unread buffer may already have
+///   moved the directory on disk — which folds to the retry-then-`Blind` policy and
+///   from there to the caller's loss barrier.
 ///
 /// On a successful walk the entries are ADDED (the moved dir itself is already
 /// learned) and its pending flag is cleared, keeping the completeness invariant at
@@ -590,16 +641,6 @@ where
     }
   }
   SeedOutcome::Blind
-}
-
-/// The error a blinding moved-in subtree walk escalates through the terminal
-/// `Fatal`: a foreign populated directory arrived but its descendants could not
-/// be mapped, so events under them would drop as outside-root forever — the
-/// silent-loss shape, refused honestly.
-fn moved_in_blind_error() -> std::io::Error {
-  std::io::Error::other(
-    "a directory moved into the watched root could not be walked; its subtree is blind",
-  )
 }
 
 #[cfg(test)]
