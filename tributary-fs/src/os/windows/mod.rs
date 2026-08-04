@@ -462,7 +462,13 @@ mod tests {
   /// and the verdict assertion fails while the leak assertion still passes —
   /// which is exactly the defect: the leak was never the bug, reporting it as
   /// success was.
+  ///
+  /// not(miri): the retention this cell ASSERTS is a leak, so Miri's
+  /// whole-process leak check reports the forgotten state as an error. The check
+  /// cannot be told an allocation is deliberately unreachable, and disabling it
+  /// for the shard would hide every unintended leak beside this one.
   #[test]
+  #[cfg_attr(miri, ignore = "asserts a deliberate leak Miri cannot whitelist")]
   fn a_panicking_pump_retains_its_state_and_reports_the_pin_unproven() {
     let dropped = Rc::new(Cell::new(false));
     let fatals = AtomicUsize::new(0);
@@ -493,7 +499,12 @@ mod tests {
 
   /// A panic payload whose own disposal unwinds must not carry the pump past
   /// the leak: the retention and the in-band terminal both still happen.
+  ///
+  /// not(miri): asserts the same deliberate retention as the cell above, and
+  /// additionally reaches the payload `forget` — two leaks Miri's whole-process
+  /// check reports and has no way to whitelist.
   #[test]
+  #[cfg_attr(miri, ignore = "asserts a deliberate leak Miri cannot whitelist")]
   fn a_pump_payload_whose_drop_panics_still_retains_and_reports() {
     struct PanicsOnDrop;
 
