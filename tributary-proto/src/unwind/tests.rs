@@ -5,9 +5,20 @@ struct PanicsOnDrop;
 
 impl Drop for PanicsOnDrop {
   fn drop(&mut self) {
-    panic!("a payload whose destructor unwinds");
+    std::panic::panic_any(ForgottenPayload);
   }
 }
+
+/// The payload [`PanicsOnDrop`]'s own disposal unwinds with.
+///
+/// A ZST, and that is the point. [`Forgotten`](PayloadDisposal::Forgotten) retires this payload
+/// with [`forget`](core::mem::forget) — the operation that cuts the recursion runs no destructor —
+/// so by contract it is unreachable for the rest of the process. A zero-sized box allocates
+/// nothing, so the cells below assert that disposal while retaining nothing for a whole-process
+/// leak check to report. A `panic!("…")` message makes it a `Box<&'static str>` instead: 16 bytes
+/// per disposal that Miri and LeakSanitizer both report, in suites where every OTHER retained
+/// allocation is a real defect.
+struct ForgottenPayload;
 
 /// A payload that panics as it is dropped, carrying ANOTHER such payload — so a disposal that
 /// answered a recursive `Drop` by recursing would never bottom out.
@@ -34,15 +45,7 @@ fn an_ordinary_payload_is_dropped() {
 ///
 /// FAIL-ON-REVERT: `drop(payload)` in place of the contained disposal and this cell unwinds
 /// at the call, never reaching an assertion.
-///
-/// not(miri): [`Forgotten`](PayloadDisposal::Forgotten) IS a leak — the documented price of
-/// cutting the recursion with an operation that runs no destructor — and the second panic
-/// here carries a heap payload, so Miri's whole-process leak check reports it. The check
-/// has no way to say "this allocation is deliberately unreachable", and silencing it for
-/// the shard would hide every unintended leak beside it. The disposal path itself stays
-/// under Miri through the recursive cell below, whose payload is a ZST and so leaks nothing.
 #[test]
-#[cfg_attr(miri, ignore = "asserts a deliberate leak Miri cannot whitelist")]
 fn a_payload_whose_drop_panics_is_forgotten_rather_than_propagated() {
   let payload =
     std::panic::catch_unwind(|| std::panic::panic_any(PanicsOnDrop)).expect_err("the body unwound");
@@ -65,11 +68,7 @@ fn an_endlessly_recursive_payload_still_terminates_at_depth_one() {
 
 /// [`contain`] is the same boundary reduced to the bit a call site acts on: a returned value,
 /// or a report that the body unwound and its payload has already been retired.
-///
-/// not(miri): reaches [`Forgotten`](PayloadDisposal::Forgotten) over a heap payload, which is
-/// the deliberate leak Miri's whole-process check reports — see the cell above.
 #[test]
-#[cfg_attr(miri, ignore = "asserts a deliberate leak Miri cannot whitelist")]
 fn contain_reports_both_outcomes_without_unwinding() {
   assert_eq!(contain(|| 7), Ok(7));
   assert_eq!(

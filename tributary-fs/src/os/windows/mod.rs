@@ -252,7 +252,6 @@ pub(crate) fn lower_rdcw_buffer(
 mod tests {
   use std::{
     cell::Cell,
-    rc::Rc,
     sync::atomic::{AtomicUsize, Ordering},
   };
 
@@ -408,11 +407,17 @@ mod tests {
 
   /// One I/O state, with a `Drop` that records whether it ran — the whole
   /// instrument for the panic-forget arm.
-  struct PinnedState {
-    dropped: Rc<Cell<bool>>,
+  ///
+  /// The flag is BORROWED from the cell's own frame rather than shared through a
+  /// refcount, because the arm under test FORGETS this state by contract: a state
+  /// that owned an `Rc` would retain that allocation for the life of the process, and
+  /// a whole-process leak check has no way to tell it apart from the unintended leaks
+  /// it exists to catch. A borrow retains nothing and records the same fact.
+  struct PinnedState<'a> {
+    dropped: &'a Cell<bool>,
   }
 
-  impl Drop for PinnedState {
+  impl Drop for PinnedState<'_> {
     fn drop(&mut self) {
       self.dropped.set(true);
     }
@@ -425,12 +430,10 @@ mod tests {
   #[test]
   fn a_returning_pump_reports_its_own_verdict_and_releases_its_state() {
     for reported in [Quiesce::Proven, Quiesce::Unproven] {
-      let dropped = Rc::new(Cell::new(false));
+      let dropped = Cell::new(false);
       let fatals = AtomicUsize::new(0);
       let verdict = contained_pump(
-        PinnedState {
-          dropped: Rc::clone(&dropped),
-        },
+        PinnedState { dropped: &dropped },
         |_| reported,
         || {
           fatals.fetch_add(1, Ordering::SeqCst);
@@ -462,20 +465,12 @@ mod tests {
   /// and the verdict assertion fails while the leak assertion still passes —
   /// which is exactly the defect: the leak was never the bug, reporting it as
   /// success was.
-  ///
-  /// not(miri): the retention this cell ASSERTS is a leak, so Miri's
-  /// whole-process leak check reports the forgotten state as an error. The check
-  /// cannot be told an allocation is deliberately unreachable, and disabling it
-  /// for the shard would hide every unintended leak beside this one.
   #[test]
-  #[cfg_attr(miri, ignore = "asserts a deliberate leak Miri cannot whitelist")]
   fn a_panicking_pump_retains_its_state_and_reports_the_pin_unproven() {
-    let dropped = Rc::new(Cell::new(false));
+    let dropped = Cell::new(false);
     let fatals = AtomicUsize::new(0);
     let verdict = contained_pump(
-      PinnedState {
-        dropped: Rc::clone(&dropped),
-      },
+      PinnedState { dropped: &dropped },
       |_| panic!("the pump unwinds mid-loop, with a read outstanding"),
       || {
         fatals.fetch_add(1, Ordering::SeqCst);
@@ -499,27 +494,25 @@ mod tests {
 
   /// A panic payload whose own disposal unwinds must not carry the pump past
   /// the leak: the retention and the in-band terminal both still happen.
-  ///
-  /// not(miri): asserts the same deliberate retention as the cell above, and
-  /// additionally reaches the payload `forget` — two leaks Miri's whole-process
-  /// check reports and has no way to whitelist.
   #[test]
-  #[cfg_attr(miri, ignore = "asserts a deliberate leak Miri cannot whitelist")]
   fn a_pump_payload_whose_drop_panics_still_retains_and_reports() {
     struct PanicsOnDrop;
 
     impl Drop for PanicsOnDrop {
       fn drop(&mut self) {
-        panic!("a pump's panic payload panics as it is disposed of");
+        std::panic::panic_any(ForgottenPayload);
       }
     }
 
-    let dropped = Rc::new(Cell::new(false));
+    /// The payload [`PanicsOnDrop`]'s own disposal unwinds with — a ZST, so the
+    /// [forget](std::mem::forget) that retires it retains nothing. A `panic!("…")`
+    /// message makes it a `Box<&'static str>` the process can never reclaim.
+    struct ForgottenPayload;
+
+    let dropped = Cell::new(false);
     let fatals = AtomicUsize::new(0);
     let verdict = contained_pump(
-      PinnedState {
-        dropped: Rc::clone(&dropped),
-      },
+      PinnedState { dropped: &dropped },
       |_| std::panic::panic_any(PanicsOnDrop),
       || {
         fatals.fetch_add(1, Ordering::SeqCst);
