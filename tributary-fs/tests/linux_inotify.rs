@@ -30,8 +30,8 @@ use std::{
 };
 
 use tributary_fs::{
-  Backend, CoverOutcome, Event, Interest, ProbeStage, SourceError, TokioWatcher, WatchRootError,
-  WatcherOptions,
+  Backend, CoverOutcome, Event, Interest, ProbeStage, ReplaceRootError, SourceError, TokioWatcher,
+  WatchRootError, WatcherOptions,
 };
 
 mod common;
@@ -1494,13 +1494,18 @@ async fn a_disjoint_replace_stays_rescan_bridged() {
 /// docs/2026-07-19-d2-golden-root-binding.md, end to end: an ext4 loopback is
 /// unmounted and remounted on the SAME loop device (identity-preserving —
 /// `(dev, ino)` of the root survive the cycle while every inotify watch on the
-/// superblock is destroyed) RACING a widening `replace_root` onto it. Whatever
-/// the interleaving, the witnessed-window commit gate (INV-ROOT) forbids the
-/// one dishonest ending — a certified-live widen whose root binding died
-/// silently — so a post-cycle write under the old subtree must ALWAYS become
-/// observable: delivered by live coverage, or covered by a `Rescan`
-/// (domination / the death funnel / the tainted-window fallback bridge).
-/// Silence within the deadline is the false-certification class and fails.
+/// superblock is destroyed) RACING a widening `replace_root` onto it. However
+/// the widen and the cycle interleave, the witnessed-window commit gate
+/// (INV-ROOT) forbids the one dishonest ending — a certified-live widen whose
+/// root binding died silently — so once the widen has COMMITTED, a post-cycle
+/// write under the old subtree must ALWAYS become observable: delivered by live
+/// coverage, or covered by a `Rescan` (domination / the death funnel / the
+/// tainted-window fallback bridge). Silence within the deadline is the
+/// false-certification class and fails.
+///
+/// A widen the cycle beat to its own target is refused rather than certified,
+/// which is the honest ending and not a sample of this one; such a round says so
+/// and takes no further part (see the refusal guard in the loop).
 ///
 /// The race is swept across jittered offsets: each iteration is one
 /// interleaving sample, and EVERY sample must end honest.
@@ -1577,6 +1582,39 @@ async fn widen_over_unmount_rebind_is_never_silently_certified() {
     };
     let widened = widen.await;
     let remounted = cycle.await.expect("mount cycle task");
+
+    // A widen the cycle beat to its own target was REFUSED, and a refusal is the
+    // opposite of the ending this cell hunts. The subject here is a widen that
+    // REPORTED SUCCESS over a root binding that had already died — so when the
+    // unmount removed the replacement root before the widen could resolve it,
+    // nothing was certified and there is no certification to hold to account.
+    //
+    // What such a round is left holding is a DIFFERENT claim: the OLD root's own
+    // coverage across an unmount of the filesystem it sits on. That claim rests
+    // on a loss signal reaching the Monitor at all, which is exactly what
+    // `overflow_swallowed_unmount_rebinds_or_dies_loudly` stages deliberately —
+    // and demanding it here, off a cycle this round did not stage it for, would
+    // report that scenario's silence as this cell's false certification.
+    //
+    // Only a target that VANISHED is absorbed. Every other refusal is unexplained
+    // by the race this cell runs and still travels to the assertion below.
+    let target_vanished = match &widened {
+      Err(ReplaceRootError::NotFound { .. }) => true,
+      Err(ReplaceRootError::Source(SourceError::RootUnavailable { source, .. })) => {
+        source.kind() == std::io::ErrorKind::NotFound
+      }
+      _ => false,
+    };
+    if target_vanished {
+      common::skip_notice(format_args!(
+        "widen_over_unmount_rebind_is_never_silently_certified: round {round}: the cycle unmounted \
+         the image before the widen could resolve {}, so the widen was refused ({widened:?}) and \
+         this round certified nothing to hold to account",
+        root.display()
+      ));
+      let _ = w.close().await;
+      continue;
+    }
 
     // The demand below is only honest over staging that actually happened, and
     // the re-mount's exit status does not establish that in either direction: a
