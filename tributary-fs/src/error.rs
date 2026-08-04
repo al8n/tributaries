@@ -7,29 +7,32 @@
 
 use std::path::PathBuf;
 
-use crate::os::SourceError;
+use crate::{options::OptionsError, os::SourceError};
 
 /// Why a [`Watcher`](crate::Watcher) could not be built.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BuildError {
-  /// More exclusion paths than the OS honors were configured (the FSEvents
-  /// limit is [`WatcherOptions::MAX_EXCLUSIONS`](crate::WatcherOptions::MAX_EXCLUSIONS)).
-  #[error(
-    "{supplied} exclusion paths exceed the OS limit of {}",
-    crate::os::MAX_EXCLUSIONS
-  )]
-  TooManyExclusions {
-    /// How many exclusion paths the options carried.
-    supplied: usize,
-  },
+  /// A configured option lies outside its documented range. The whole
+  /// range-checking vocabulary lives with the options
+  /// ([`WatcherOptions::validate`](crate::WatcherOptions::validate)), so the
+  /// verdict a configuration layer computes and the one the watcher computes
+  /// are the same value.
+  #[error(transparent)]
+  InvalidOptions(#[from] OptionsError),
 }
 
 impl BuildError {
-  /// Whether this is [`TooManyExclusions`](Self::TooManyExclusions).
+  /// Whether this is [`InvalidOptions`](Self::InvalidOptions).
+  #[inline]
+  pub const fn is_invalid_options(&self) -> bool {
+    matches!(self, Self::InvalidOptions(_))
+  }
+
+  /// Whether the options carried more exclusion paths than the OS honors.
   #[inline]
   pub const fn is_too_many_exclusions(&self) -> bool {
-    matches!(self, Self::TooManyExclusions { .. })
+    matches!(self, Self::InvalidOptions(err) if err.is_too_many_exclusions())
   }
 }
 
@@ -61,6 +64,16 @@ pub enum WatchRootError {
   /// The platform source could not start.
   #[error("the platform source could not start")]
   Source(#[source] SourceError),
+  /// Too many native streams are still winding down. Every stream this watcher
+  /// retires is handed to a dedicated teardown executor whose `shutdown` call is
+  /// UNBOUNDED — a reader parked in a syscall against a wedged mount returns when
+  /// the kernel says so — so a watcher that kept admitting new streams while old
+  /// ones cannot quiesce would grow retained OS handles, reader threads and
+  /// buffers with total churn rather than with live coverage. Admission stops at
+  /// the backlog bound instead. Retryable: it clears as the wedged teardowns
+  /// return, with no operator action.
+  #[error("too many native streams are still winding down; retry later")]
+  CleanupBacklog,
   /// The watcher's driver has already stopped.
   #[error("the watcher is closed")]
   Closed,
@@ -106,6 +119,38 @@ pub enum UnwatchError {
   /// already unwatched, or torn down by a root-death event).
   #[error("the root handle is not watched")]
   UnknownRoot,
+  /// This root already has the maximum number of awaited unwatches parked on a
+  /// teardown that has not quiesced. An awaited unwatch resolves only once the
+  /// root's native stream is gone, and that wait is unbounded against a wedged
+  /// filesystem — so every duplicate call is retained by the driver until it
+  /// ends. The bounded command mailbox limits only requests waiting to be
+  /// received, not the ones already admitted, so admission stops here instead of
+  /// growing driver state with total calls. The teardown itself was already
+  /// triggered by the first call; retry to observe it, or drop the handle.
+  #[error("the root's teardown already has the maximum awaited unwatches parked; retry later")]
+  Backlogged,
+  /// The root stopped being watched, but its native stream was never PROVEN
+  /// quiescent: one of the scope's teardowns unwound part-way through the
+  /// backend's `shutdown` (a panicking invariant check, a poisoned lock), so
+  /// nothing observed the stream stop.
+  ///
+  /// A successful [`unwatch`](crate::Watcher::unwatch) means the native source
+  /// has reached quiescence — that is what makes it safe to release whatever the
+  /// stream could still reach (a callback's captured state, a buffer the reader
+  /// writes into, the root directory itself). This error withholds exactly that
+  /// guarantee: the reader thread, registered callbacks and open descriptors of
+  /// the affected stream may still be live, and no later call can prove
+  /// otherwise — the driver latches the root's scope, so every subsequent
+  /// awaited unwatch of it reports this too, and
+  /// [`close`](crate::Watcher::close) counts it among the operations that
+  /// refuse a quiescent verdict.
+  ///
+  /// NOT retryable, and not a request failure: the teardown itself ran and the
+  /// root is no longer watched. Treat it as a permanently degraded reclamation —
+  /// keep whatever the stream might touch alive for the process's lifetime, or
+  /// end the process to reclaim it.
+  #[error("the root's native stream was never proven quiescent: its teardown unwound")]
+  NotQuiesced,
   /// The watcher's driver has already stopped.
   #[error("the watcher is closed")]
   Closed,
@@ -116,6 +161,18 @@ impl UnwatchError {
   #[inline]
   pub const fn is_unknown_root(&self) -> bool {
     matches!(self, Self::UnknownRoot)
+  }
+
+  /// Whether this is [`Backlogged`](Self::Backlogged).
+  #[inline]
+  pub const fn is_backlogged(&self) -> bool {
+    matches!(self, Self::Backlogged)
+  }
+
+  /// Whether this is [`NotQuiesced`](Self::NotQuiesced).
+  #[inline]
+  pub const fn is_not_quiesced(&self) -> bool {
+    matches!(self, Self::NotQuiesced)
   }
 
   /// Whether this is [`Closed`](Self::Closed).
@@ -196,6 +253,27 @@ pub enum SyncRootError {
     /// The root it must be inside.
     root: PathBuf,
   },
+  /// The cookie directory lies inside the root but under one of the configured
+  /// [exclusions](crate::WatcherOptions::with_exclusions) —
+  /// so the write would succeed and its event would then be suppressed by the
+  /// very option that asked for the suppression, leaving the barrier waiting on
+  /// an event that cannot exist. Refused before any write; pick a cookie
+  /// directory outside every exclusion.
+  ///
+  /// Exclusions apply to every root on every platform, so the refusal is the
+  /// same everywhere — it does not depend on which backend resolved, and it is
+  /// made before the write rather than discovered by waiting.
+  #[error(
+    "cookie directory {} is under excluded directory {}",
+    dir.display(),
+    exclusion.display()
+  )]
+  DirExcluded {
+    /// The requested cookie directory.
+    dir: PathBuf,
+    /// The exclusion covering it, as supplied in the options.
+    exclusion: PathBuf,
+  },
   /// The cookie name is not a single normal filename component — it holds a
   /// path separator, a `.`/`..`, or is absolute or empty. A name like this
   /// would escape the directory the barrier was validated for, so it is refused
@@ -212,7 +290,11 @@ pub enum SyncRootError {
   /// barrier at all.
   #[error("could not write sync cookie {}: {source}", path.display())]
   Write {
-    /// The cookie path the write was attempted at.
+    /// Where the write was aimed — `dir` joined with the cookie name. It is a
+    /// DESCRIPTION of the request, not a landing: a cookie that succeeds lands
+    /// one level deeper, in the watcher's own reserved-namespace directory, and
+    /// only [`Watcher::sync_root`](crate::Watcher::sync_root)'s return value ever
+    /// says where.
     path: PathBuf,
     /// The underlying failure.
     #[source]
@@ -309,6 +391,15 @@ pub enum ReplaceRootError {
   /// stream was torn down; retry against a fresh `watch`.
   #[error("the root died while the replacement was starting")]
   Retired,
+  /// Too many native streams are still winding down; see
+  /// [`WatchRootError::CleanupBacklog`]. A make-before-break replacement RETIRES
+  /// the old stream, so a supervisor retargeting a watch against a dead mount is
+  /// the shortest path to an unbounded pile of handles no teardown can reclaim:
+  /// the replaced handle's `shutdown` never returns, yet the replacement reports
+  /// success and admits the next one. Admission stops at the backlog bound
+  /// instead, leaving the current root's coverage untouched. Retryable.
+  #[error("too many native streams are still winding down; retry later")]
+  CleanupBacklog,
   /// The watcher is closed.
   #[error("the watcher is closed")]
   Closed,
