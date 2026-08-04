@@ -32,6 +32,10 @@ use std::{
 
 use tributary_fs::{Backend, BackendKind, Event, Interest, TokioWatcher, WatcherOptions};
 
+mod common;
+
+use common::{covers, delivered};
+
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -129,7 +133,15 @@ fn scratch_under(mount: &Path, tag: &str) -> PathBuf {
 
 /// A fanotify-forced watcher, or `None` when the backend cannot start here
 /// (unprivileged / filesystem unsupported — the caller skips loudly).
-async fn fanotify_watcher(root: &Path) -> Option<(TokioWatcher, tributary_fs::RootHandle)> {
+///
+/// `cell` is the calling test's own name, threaded through purely so the
+/// fallback skip (below) names it: `ci.yml`'s per-cell gate greps for
+/// `SKIP $cell`, and a shared helper's skip cannot satisfy that unless the
+/// caller's identity rides along in the message.
+async fn fanotify_watcher(
+  cell: &str,
+  root: &Path,
+) -> Option<(TokioWatcher, tributary_fs::RootHandle)> {
   let options = WatcherOptions::new().with_backend(Backend::Fanotify);
   let watcher = TokioWatcher::new(options).expect("build watcher");
   // `watch` is where the superblock mark is armed; a refusal (EPERM without
@@ -138,7 +150,9 @@ async fn fanotify_watcher(root: &Path) -> Option<(TokioWatcher, tributary_fs::Ro
   match watcher.watch(root, Interest::all()).await {
     Ok(handle) => Some((watcher, handle)),
     Err(err) => {
-      eprintln!("SKIP: fanotify unavailable ({err}) — run via linux-verify.sh fanotify");
+      common::skip_notice(format_args!(
+        "{cell}: fanotify unavailable ({err}) — run via linux-verify.sh fanotify"
+      ));
       None
     }
   }
@@ -162,15 +176,6 @@ async fn wait_for(
   .flatten()
 }
 
-/// An event "covers" a path when it names it directly or is a `Rescan` at the
-/// path or one of its ancestors.
-fn covers(event: &Event, path: &Path) -> bool {
-  if event.path() == path {
-    return true;
-  }
-  event.is_rescan() && path.starts_with(event.path())
-}
-
 /// Guard that unmounts the shared loopback if THIS test mounted it, so a
 /// `--test-threads=1` run leaves nothing mounted after the last test.
 struct LoopbackGuard {
@@ -186,19 +191,28 @@ impl Drop for LoopbackGuard {
 }
 
 /// Suite 8 (§6.3): FID decode + identity cross-check. A create surfaces with
-/// its path, and repeated writes to the same object keep converging — the
-/// one-mint-scheme invariant, exercised end to end against real FID decoding.
+/// its path, and a follow-up write to the same object surfaces again under the
+/// same identity — the one-mint-scheme invariant, exercised end to end against
+/// real FID decoding.
+///
+/// Both observations must be DELIVERIES. The subject here is the decode itself:
+/// the kernel handed over a file handle and a parent handle, and the reader
+/// resolved them to this path under this root. A covering `Rescan` is what the
+/// reader emits when it could NOT resolve them, so a cell that accepted one
+/// would report a total FID-decode failure as a pass.
 #[tokio::test]
 async fn fid_decode_and_identity_roundtrip() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP fid_decode_and_identity_roundtrip: no ext4 loopback (needs --privileged)");
+    common::skip_notice(format_args!(
+      "fid_decode_and_identity_roundtrip: no ext4 loopback (needs --privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
     mount: mount.clone(),
   };
   let root = scratch_under(&mount, "fid");
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) = fanotify_watcher("fid_decode_and_identity_roundtrip", &root).await else {
     return;
   };
 
@@ -207,16 +221,16 @@ async fn fid_decode_and_identity_roundtrip() {
 
   let deep = root.join("a/b/one.txt");
   assert!(
-    wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
-    "a deep create is observed through the kernel-recursive mark"
+    wait_for(&mut w, |e| delivered(e, &deep)).await.is_some(),
+    "a deep create is decoded to its path through the kernel-recursive mark"
   );
 
   // A metadata change on the same object surfaces too (its FID admits under the
   // learned directory).
   std::fs::write(root.join("a/b/one.txt"), b"22").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
-    "a follow-up write to the same object keeps flowing"
+    wait_for(&mut w, |e| delivered(e, &deep)).await.is_some(),
+    "a follow-up write to the same object decodes to the same path"
   );
 }
 
@@ -225,7 +239,9 @@ async fn fid_decode_and_identity_roundtrip() {
 #[tokio::test]
 async fn rename_pairs_into_one_moved() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP rename_pairs_into_one_moved: no ext4 loopback (needs --privileged)");
+    common::skip_notice(format_args!(
+      "rename_pairs_into_one_moved: no ext4 loopback (needs --privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -233,7 +249,7 @@ async fn rename_pairs_into_one_moved() {
   };
   let root = scratch_under(&mount, "rename");
   std::fs::write(root.join("old.txt"), b"x").unwrap();
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) = fanotify_watcher("rename_pairs_into_one_moved", &root).await else {
     return;
   };
 
@@ -258,10 +274,17 @@ async fn rename_pairs_into_one_moved() {
 /// must arrive under the NEW directory path. This exercises the parent-relative
 /// FID map end to end: the descendant's admission resolves through the moved
 /// parent's updated link, never a stale absolute path.
+///
+/// Which makes both observations DELIVERIES: the subject is the path the map
+/// resolved to, and a `Rescan` carries no resolved path to judge. It is what the
+/// reader emits when the map could not answer at all — the failure this cell
+/// exists to detect.
 #[tokio::test]
 async fn dir_rename_reparents_descendant_paths() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP dir_rename_reparents_descendant_paths: no ext4 loopback (needs --privileged)");
+    common::skip_notice(format_args!(
+      "dir_rename_reparents_descendant_paths: no ext4 loopback (needs --privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -272,7 +295,8 @@ async fn dir_rename_reparents_descendant_paths() {
   // seeded (not learned): root/a/child/, holding a file.
   std::fs::create_dir_all(root.join("a/child")).unwrap();
   std::fs::write(root.join("a/child/leaf.txt"), b"seed").unwrap();
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) = fanotify_watcher("dir_rename_reparents_descendant_paths", &root).await
+  else {
     return;
   };
 
@@ -285,16 +309,18 @@ async fn dir_rename_reparents_descendant_paths() {
   let new_leaf = root.join("b/child/leaf.txt");
   std::fs::write(&new_leaf, b"after-rename").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &new_leaf)).await.is_some(),
+    wait_for(&mut w, |e| delivered(e, &new_leaf))
+      .await
+      .is_some(),
     "a pre-existing descendant resolves under the renamed directory's new path"
   );
 
-  // The consumer converges: a create of a brand-new file under the moved
-  // directory also lands at the new path (self-maintenance and seeding agree).
+  // A create of a brand-new file under the moved directory also lands at the
+  // new path (self-maintenance and seeding agree).
   let fresh = root.join("b/child/fresh.txt");
   std::fs::write(&fresh, b"new").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &fresh)).await.is_some(),
+    wait_for(&mut w, |e| delivered(e, &fresh)).await.is_some(),
     "a fresh create under the renamed directory also resolves at the new path"
   );
 }
@@ -309,9 +335,9 @@ async fn dir_rename_reparents_descendant_paths() {
 #[tokio::test]
 async fn move_in_populated_dir_delivers_descendant_events() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!(
-      "SKIP move_in_populated_dir_delivers_descendant_events: no ext4 loopback (--privileged)"
-    );
+    common::skip_notice(format_args!(
+      "move_in_populated_dir_delivers_descendant_events: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -326,7 +352,9 @@ async fn move_in_populated_dir_delivers_descendant_events() {
   std::fs::create_dir_all(src.join("nested")).unwrap();
   std::fs::write(src.join("nested/deep.txt"), b"seed").unwrap();
 
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) =
+    fanotify_watcher("move_in_populated_dir_delivers_descendant_events", &root).await
+  else {
     return;
   };
   // Prove the mark is live before the boundary move.
@@ -348,8 +376,8 @@ async fn move_in_populated_dir_delivers_descendant_events() {
   let deep = root.join("incoming/nested/deep.txt");
   std::fs::write(&deep, b"after-move-in").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &deep)).await.is_some(),
-    "a pre-existing nested descendant of a moved-in directory is observed under its new path"
+    wait_for(&mut w, |e| delivered(e, &deep)).await.is_some(),
+    "a pre-existing nested descendant of a moved-in directory is delivered under its new path"
   );
   let _ = w.close().await;
 }
@@ -371,9 +399,9 @@ async fn move_in_populated_dir_delivers_descendant_events() {
 #[tokio::test]
 async fn burst_move_in_then_reparent_is_coverage_honest() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!(
-      "SKIP burst_move_in_then_reparent_is_coverage_honest: no ext4 loopback (--privileged)"
-    );
+    common::skip_notice(format_args!(
+      "burst_move_in_then_reparent_is_coverage_honest: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -386,7 +414,9 @@ async fn burst_move_in_then_reparent_is_coverage_honest() {
   std::fs::create_dir_all(src.join("nested")).unwrap();
   std::fs::write(src.join("nested/deep.txt"), b"seed").unwrap();
 
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) =
+    fanotify_watcher("burst_move_in_then_reparent_is_coverage_honest", &root).await
+  else {
     return;
   };
   std::fs::write(root.join("alive.txt"), b"a").unwrap();
@@ -422,9 +452,9 @@ async fn burst_move_in_then_reparent_is_coverage_honest() {
 #[tokio::test]
 async fn move_out_populated_dir_stops_descendant_events() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!(
-      "SKIP move_out_populated_dir_stops_descendant_events: no ext4 loopback (--privileged)"
-    );
+    common::skip_notice(format_args!(
+      "move_out_populated_dir_stops_descendant_events: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -438,7 +468,9 @@ async fn move_out_populated_dir_stops_descendant_events() {
   std::fs::create_dir_all(inside.join("nested")).unwrap();
   std::fs::write(inside.join("nested/deep.txt"), b"seed").unwrap();
 
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) =
+    fanotify_watcher("move_out_populated_dir_stops_descendant_events", &root).await
+  else {
     return;
   };
   // Prove the seeded descendant is live IN-ROOT before the move-out.
@@ -449,6 +481,20 @@ async fn move_out_populated_dir_stops_descendant_events() {
       .await
       .is_some(),
     "the seeded descendant is observed while still in-root"
+  );
+  // OPEN the absence window at a known stream position. The liveness probe above
+  // names the very path a leak would name, and one `std::fs::write` records a
+  // modification for its truncate AND for its write — reaching the consumer as one
+  // delivery only when the reader did not drain between them. So waiting for the
+  // probe's event leaves an unknown number of further in-root deliveries of
+  // `nested/deep.txt` queued, all of them CORRECT (the subtree was in-root when
+  // they were recorded) and all of them indistinguishable from a leak once the
+  // window has opened over them. The barrier consumes them by ORDER — it is not a
+  // pause and makes no timing assumption — so everything the window sees from here
+  // is provably caused by the move-out or later.
+  assert!(
+    common::barrier(&mut w, &root, "moveout-open", scaled(DEADLINE), |_| {}).await,
+    "the pre-move-out traffic drains before the absence window opens"
   );
 
   // Move the populated directory OUT of the root, then mutate its old descendant
@@ -465,23 +511,30 @@ async fn move_out_populated_dir_stops_descendant_events() {
   // stops admitting, so mutating `nested/deep.txt` at either the stale old path or
   // the new out-of-root path delivers nothing. The breach is a path reaching into
   // the `nested` descendant (strictly deeper than the moved directory).
+  //
+  // The window CLOSES on a proof rather than a timeout: the barrier's sentinel is
+  // mutated AFTER the descendant write, so a leak — at the stale in-root path or
+  // the new out-of-root one — is ordered before it and has already been inspected
+  // by the time the sentinel arrives. A quiet window would only ever have said that
+  // nothing turned up in three seconds.
   let old_nested = inside.join("nested");
   let new_nested = moved.join("nested");
-  let breach = tokio::time::timeout(Duration::from_secs(3), async {
-    while let Some(event) = w.next().await {
-      let path = event.path().to_path_buf();
-      if path.starts_with(&old_nested) || path.starts_with(&new_nested) {
-        return Some(path);
-      }
+  let mut breach = None;
+  let settled = common::barrier(&mut w, &root, "moveout-close", scaled(DEADLINE), |event| {
+    let path = event.path();
+    if breach.is_none() && (path.starts_with(&old_nested) || path.starts_with(&new_nested)) {
+      breach = Some(path.to_path_buf());
     }
-    None
   })
-  .await
-  .ok()
-  .flatten();
+  .await;
   assert!(
     breach.is_none(),
     "a moved-out directory's descendant leaked an event: {breach:?}"
+  );
+  assert!(
+    settled,
+    "the post-move-out stream reaches the closing barrier, so the absence window \
+     covered the descendant write rather than expiring short of it"
   );
   let _ = w.close().await;
 }
@@ -492,7 +545,9 @@ async fn move_out_populated_dir_stops_descendant_events() {
 #[tokio::test]
 async fn superblock_firehose_is_filtered() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP superblock_firehose_is_filtered: no ext4 loopback (needs --privileged)");
+    common::skip_notice(format_args!(
+      "superblock_firehose_is_filtered: no ext4 loopback (needs --privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -501,7 +556,8 @@ async fn superblock_firehose_is_filtered() {
   // Two sibling roots on the SAME ext4 superblock: one watched, one churned.
   let watched = scratch_under(&mount, "watched");
   let elsewhere = scratch_under(&mount, "elsewhere");
-  let Some((mut w, _h)) = fanotify_watcher(&watched).await else {
+  let Some((mut w, _h)) = fanotify_watcher("superblock_firehose_is_filtered", &watched).await
+  else {
     return;
   };
 
@@ -557,9 +613,9 @@ async fn superblock_firehose_is_filtered() {
 #[tokio::test]
 async fn in_root_symlink_to_outside_dir_is_never_admitted() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!(
-      "SKIP in_root_symlink_to_outside_dir_is_never_admitted: no ext4 loopback (--privileged)"
-    );
+    common::skip_notice(format_args!(
+      "in_root_symlink_to_outside_dir_is_never_admitted: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -575,7 +631,9 @@ async fn in_root_symlink_to_outside_dir_is_never_admitted() {
   let link = root.join("into-outside");
   std::os::unix::fs::symlink(&outside, &link).unwrap();
 
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) =
+    fanotify_watcher("in_root_symlink_to_outside_dir_is_never_admitted", &root).await
+  else {
     return;
   };
   // Prove the mark is live before the churn.
@@ -648,9 +706,9 @@ async fn in_root_symlink_to_outside_dir_is_never_admitted() {
 #[tokio::test]
 async fn racing_swap_to_outside_dir_never_admits_foreign_subtree() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!(
-      "SKIP racing_swap_to_outside_dir_never_admits_foreign_subtree: no ext4 loopback (--privileged)"
-    );
+    common::skip_notice(format_args!(
+      "racing_swap_to_outside_dir_never_admits_foreign_subtree: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -692,7 +750,11 @@ async fn racing_swap_to_outside_dir_never_admits_foreign_subtree() {
     });
 
     // Start the watch DURING the swap churn (its seed walk races the loop).
-    let watcher = fanotify_watcher(&root).await;
+    let watcher = fanotify_watcher(
+      "racing_swap_to_outside_dir_never_admits_foreign_subtree",
+      &root,
+    )
+    .await;
     let _ = swap_thread.join();
     let Some((mut w, _h)) = watcher else {
       // fanotify unavailable — the whole cell can only run privileged.
@@ -756,17 +818,17 @@ async fn racing_swap_to_outside_dir_never_admits_foreign_subtree() {
 #[tokio::test]
 async fn racing_root_path_swap_never_goes_live_listening_elsewhere() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!(
-      "SKIP racing_root_path_swap_never_goes_live_listening_elsewhere: no ext4 loopback (--privileged)"
-    );
+    common::skip_notice(format_args!(
+      "racing_root_path_swap_never_goes_live_listening_elsewhere: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   if !has_sys_admin() {
     // Without CAP_SYS_ADMIN Auto never reaches the fanotify mark (it falls back
     // to inotify), so the mark-on-wrong-sb window this cell targets cannot arise.
-    eprintln!(
-      "SKIP racing_root_path_swap_never_goes_live_listening_elsewhere: no CAP_SYS_ADMIN (Auto would pick inotify)"
-    );
+    common::skip_notice(format_args!(
+      "racing_root_path_swap_never_goes_live_listening_elsewhere: no CAP_SYS_ADMIN (Auto would pick inotify)"
+    ));
     return;
   }
   let _guard = LoopbackGuard {
@@ -889,9 +951,9 @@ async fn racing_root_path_swap_never_goes_live_listening_elsewhere() {
 #[tokio::test]
 async fn racing_root_replacement_never_reseeds_onto_the_replacement() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!(
-      "SKIP racing_root_replacement_never_reseeds_onto_the_replacement: no ext4 loopback (--privileged)"
-    );
+    common::skip_notice(format_args!(
+      "racing_root_replacement_never_reseeds_onto_the_replacement: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -913,9 +975,9 @@ async fn racing_root_replacement_never_reseeds_onto_the_replacement() {
       .with_root_liveness_interval(Duration::from_millis(300));
     let w = TokioWatcher::new(options).expect("build watcher");
     let Ok(handle) = w.watch(&root, Interest::all()).await else {
-      eprintln!(
-        "SKIP racing_root_replacement_never_reseeds_onto_the_replacement: fanotify unavailable"
-      );
+      common::skip_notice(format_args!(
+        "racing_root_replacement_never_reseeds_onto_the_replacement: fanotify unavailable"
+      ));
       return;
     };
     let mut w = w;
@@ -1009,9 +1071,9 @@ async fn racing_root_replacement_never_reseeds_onto_the_replacement() {
 #[tokio::test]
 async fn racing_moved_in_replacement_is_coverage_honest() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!(
-      "SKIP racing_moved_in_replacement_is_coverage_honest: no ext4 loopback (--privileged)"
-    );
+    common::skip_notice(format_args!(
+      "racing_moved_in_replacement_is_coverage_honest: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -1029,7 +1091,9 @@ async fn racing_moved_in_replacement_is_coverage_honest() {
     std::fs::create_dir_all(src.join("nested")).unwrap();
     std::fs::write(src.join("nested/deep.txt"), b"seed").unwrap();
 
-    let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+    let Some((mut w, _h)) =
+      fanotify_watcher("racing_moved_in_replacement_is_coverage_honest", &root).await
+    else {
       // fanotify unavailable — the whole cell can only run privileged.
       return;
     };
@@ -1118,13 +1182,17 @@ async fn racing_moved_in_replacement_is_coverage_honest() {
 #[tokio::test]
 async fn unmount_under_watch_quiesces_without_panic() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP unmount_under_watch_quiesces_without_panic: no ext4 loopback (--privileged)");
+    common::skip_notice(format_args!(
+      "unmount_under_watch_quiesces_without_panic: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   // This test unmounts the shared loopback itself, so no LoopbackGuard — it
   // owns the teardown (single-threaded ordering guarantees exclusivity).
   let root = scratch_under(&mount, "unmount");
-  let Some((mut w, h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, h)) =
+    fanotify_watcher("unmount_under_watch_quiesces_without_panic", &root).await
+  else {
     let _ = Command::new("umount").arg(&mount).status();
     return;
   };
@@ -1154,7 +1222,9 @@ async fn unmount_under_watch_quiesces_without_panic() {
     .map(|s| s.success())
     .unwrap_or(false);
   if !unmounted {
-    eprintln!("SKIP unmount_under_watch_quiesces_without_panic: unmount refused");
+    common::skip_notice(format_args!(
+      "unmount_under_watch_quiesces_without_panic: unmount refused"
+    ));
     return;
   }
 
@@ -1210,7 +1280,9 @@ async fn selection_matrix_auto_self_probes() {
     Err(err) => {
       // Auto never fails for privilege (it falls back); a failure here is the
       // environment refusing even inotify — skip loudly.
-      eprintln!("SKIP selection_matrix_auto_self_probes: Auto watch refused ({err})");
+      common::skip_notice(format_args!(
+        "selection_matrix_auto_self_probes: Auto watch refused ({err})"
+      ));
       return;
     }
   };
@@ -1258,7 +1330,9 @@ async fn selection_matrix_auto_self_probes() {
 #[tokio::test]
 async fn forced_fanotify_without_privilege_is_typed_error() {
   if has_sys_admin() {
-    eprintln!("SKIP forced_fanotify_without_privilege_is_typed_error: has CAP_SYS_ADMIN");
+    common::skip_notice(format_args!(
+      "forced_fanotify_without_privilege_is_typed_error: has CAP_SYS_ADMIN"
+    ));
     return;
   }
   let root = tmpfs_scratch("forced");
@@ -1301,7 +1375,9 @@ async fn forced_fanotify_without_privilege_is_typed_error() {
 #[tokio::test]
 async fn unmount_under_live_watch_dies_via_refresh() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP unmount_under_live_watch_dies_via_refresh: no ext4 loopback (--privileged)");
+    common::skip_notice(format_args!(
+      "unmount_under_live_watch_dies_via_refresh: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let root = scratch_under(&mount, "refresh-death");
@@ -1313,7 +1389,9 @@ async fn unmount_under_live_watch_dies_via_refresh() {
     .with_root_liveness_interval(Duration::from_millis(500));
   let w = TokioWatcher::new(options).expect("build watcher");
   let Ok(handle) = w.watch(&root, Interest::all()).await else {
-    eprintln!("SKIP unmount_under_live_watch_dies_via_refresh: fanotify unavailable");
+    common::skip_notice(format_args!(
+      "unmount_under_live_watch_dies_via_refresh: fanotify unavailable"
+    ));
     let _ = Command::new("umount").arg(&mount).status();
     return;
   };
@@ -1339,7 +1417,9 @@ async fn unmount_under_live_watch_dies_via_refresh() {
     .map(|s| s.success())
     .unwrap_or(false);
   if !detached {
-    eprintln!("SKIP unmount_under_live_watch_dies_via_refresh: lazy umount refused");
+    common::skip_notice(format_args!(
+      "unmount_under_live_watch_dies_via_refresh: lazy umount refused"
+    ));
     let _ = w.unwatch(handle).await;
     let _ = Command::new("umount").arg(&mount).status();
     return;
@@ -1406,17 +1486,19 @@ async fn auto_falls_back_to_inotify_on_unwalkable_subtree() {
   std::fs::create_dir_all(readable.join("inner")).unwrap();
   std::fs::create_dir_all(&blocked).unwrap();
   if !chmod(&blocked, 0o000) {
-    eprintln!("SKIP auto_falls_back_to_inotify_on_unwalkable_subtree: chmod refused");
+    common::skip_notice(format_args!(
+      "auto_falls_back_to_inotify_on_unwalkable_subtree: chmod refused"
+    ));
     return;
   }
   if !dir_is_unreadable(&blocked) {
     // Root with DAC_OVERRIDE reads it anyway — the walk would complete, so the
     // fallback cannot be exercised here.
     let _ = chmod(&blocked, 0o755);
-    eprintln!(
-      "SKIP auto_falls_back_to_inotify_on_unwalkable_subtree: the 000 subdir is readable \
+    common::skip_notice(format_args!(
+      "auto_falls_back_to_inotify_on_unwalkable_subtree: the 000 subdir is readable \
        (root/CAP_DAC_OVERRIDE) — run the default-caps/unprivileged leg to exercise the fallback"
-    );
+    ));
     return;
   }
 
@@ -1462,7 +1544,9 @@ async fn auto_falls_back_to_inotify_on_unwalkable_subtree() {
 #[tokio::test]
 async fn forced_fanotify_typed_error_on_unwalkable_subtree() {
   if !has_sys_admin() {
-    eprintln!("SKIP forced_fanotify_typed_error_on_unwalkable_subtree: no CAP_SYS_ADMIN");
+    common::skip_notice(format_args!(
+      "forced_fanotify_typed_error_on_unwalkable_subtree: no CAP_SYS_ADMIN"
+    ));
     return;
   }
   let root = tmpfs_scratch("walk-forced");
@@ -1470,10 +1554,10 @@ async fn forced_fanotify_typed_error_on_unwalkable_subtree() {
   std::fs::create_dir_all(&blocked).unwrap();
   if !chmod(&blocked, 0o000) || !dir_is_unreadable(&blocked) {
     let _ = chmod(&blocked, 0o755);
-    eprintln!(
-      "SKIP forced_fanotify_typed_error_on_unwalkable_subtree: the 000 subdir is readable \
+    common::skip_notice(format_args!(
+      "forced_fanotify_typed_error_on_unwalkable_subtree: the 000 subdir is readable \
        (CAP_SYS_ADMIN implies DAC_OVERRIDE) — the walk stage cannot be forced to fail here"
-    );
+    ));
     return;
   }
 
@@ -1546,7 +1630,9 @@ async fn auto_falls_back_to_inotify_under_a_zero_directory_cap() {
 #[tokio::test]
 async fn forced_fanotify_typed_error_under_a_zero_directory_cap() {
   if !has_sys_admin() {
-    eprintln!("SKIP forced_fanotify_typed_error_under_a_zero_directory_cap: no CAP_SYS_ADMIN");
+    common::skip_notice(format_args!(
+      "forced_fanotify_typed_error_under_a_zero_directory_cap: no CAP_SYS_ADMIN"
+    ));
     return;
   }
   let root = tmpfs_scratch("zero-cap-forced");
@@ -1586,7 +1672,9 @@ async fn file_churn_keeps_a_bounded_map() {
   let w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Auto))
     .expect("build Auto watcher");
   let Ok(handle) = w.watch(&root, Interest::all()).await else {
-    eprintln!("SKIP file_churn_keeps_a_bounded_map: watch refused");
+    common::skip_notice(format_args!(
+      "file_churn_keeps_a_bounded_map: watch refused"
+    ));
     return;
   };
   let selected = w.backend_of(handle).expect("live backend");
@@ -1669,7 +1757,9 @@ impl Drop for BindGuard {
 #[tokio::test]
 async fn bind_mount_of_outside_dir_is_a_boundary() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP bind_mount_of_outside_dir_is_a_boundary: no ext4 loopback (--privileged)");
+    common::skip_notice(format_args!(
+      "bind_mount_of_outside_dir_is_a_boundary: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -1684,11 +1774,14 @@ async fn bind_mount_of_outside_dir_is_a_boundary() {
   let bind_point = root.join("bound");
   std::fs::create_dir_all(&bind_point).unwrap();
   let Some(_bind) = bind_mount(&origin, &bind_point) else {
-    eprintln!("SKIP bind_mount_of_outside_dir_is_a_boundary: bind mount refused (--privileged)");
+    common::skip_notice(format_args!(
+      "bind_mount_of_outside_dir_is_a_boundary: bind mount refused (--privileged)"
+    ));
     return;
   };
 
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) = fanotify_watcher("bind_mount_of_outside_dir_is_a_boundary", &root).await
+  else {
     return;
   };
   // The mark is live before the churn (an in-root sibling create flows).
@@ -1757,7 +1850,9 @@ async fn bind_mount_of_outside_dir_is_a_boundary() {
 #[tokio::test]
 async fn ancestor_self_bind_cycle_terminates() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP ancestor_self_bind_cycle_terminates: no ext4 loopback (--privileged)");
+    common::skip_notice(format_args!(
+      "ancestor_self_bind_cycle_terminates: no ext4 loopback (--privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -1770,7 +1865,9 @@ async fn ancestor_self_bind_cycle_terminates() {
   // the whole root (including `sub/loop` again — an unbounded descent without the
   // visited-handle guard).
   let Some(_bind) = bind_mount(&root, &loop_point) else {
-    eprintln!("SKIP ancestor_self_bind_cycle_terminates: bind mount refused (--privileged)");
+    common::skip_notice(format_args!(
+      "ancestor_self_bind_cycle_terminates: bind mount refused (--privileged)"
+    ));
     return;
   };
 
@@ -1847,14 +1944,17 @@ fn has_sys_admin() -> bool {
 #[tokio::test]
 async fn close_quiesces_under_sustained_traffic() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP close_quiesces_under_sustained_traffic: no ext4 loopback (needs --privileged)");
+    common::skip_notice(format_args!(
+      "close_quiesces_under_sustained_traffic: no ext4 loopback (needs --privileged)"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
     mount: mount.clone(),
   };
   let root = scratch_under(&mount, "close-load");
-  let Some((mut w, _h)) = fanotify_watcher(&root).await else {
+  let Some((mut w, _h)) = fanotify_watcher("close_quiesces_under_sustained_traffic", &root).await
+  else {
     return;
   };
 
@@ -1899,7 +1999,9 @@ async fn close_quiesces_under_sustained_traffic() {
 #[tokio::test]
 async fn replace_root_swaps_the_mark_and_repoints_stats() {
   let Some(mount) = ext4_loopback() else {
-    eprintln!("SKIP replace_root_swaps_the_mark_and_repoints_stats: no ext4 loopback");
+    common::skip_notice(format_args!(
+      "replace_root_swaps_the_mark_and_repoints_stats: no ext4 loopback"
+    ));
     return;
   };
   let _guard = LoopbackGuard {
@@ -1908,7 +2010,9 @@ async fn replace_root_swaps_the_mark_and_repoints_stats() {
   let root = scratch_under(&mount, "replace");
   let sub = root.join("y");
   std::fs::create_dir_all(&sub).unwrap();
-  let Some((mut w, handle)) = fanotify_watcher(&sub).await else {
+  let Some((mut w, handle)) =
+    fanotify_watcher("replace_root_swaps_the_mark_and_repoints_stats", &sub).await
+  else {
     return;
   };
   assert!(w.backend_stats(handle).is_some(), "stats before the swap");
@@ -1935,4 +2039,564 @@ async fn replace_root_swaps_the_mark_and_repoints_stats() {
     wait_for(&mut w, |e| covers(e, &outside)).await.is_some(),
     "newly covered ground is live under the new mark"
   );
+}
+
+/// Builds a fanotify-forced watcher over `root` under `exclusions` and an optional
+/// directory cap, or `None` when the backend cannot start here (the caller skips
+/// loudly). Mirrors [`fanotify_watcher`] with the two knobs the exclusion-fence cells
+/// need; `cell` serves the same purpose there — see its doc comment.
+async fn fanotify_watcher_with(
+  cell: &str,
+  root: &Path,
+  exclusions: Vec<PathBuf>,
+  cap: Option<usize>,
+) -> Option<(TokioWatcher, tributary_fs::RootHandle)> {
+  let options = WatcherOptions::new()
+    .with_backend(Backend::Fanotify)
+    .with_exclusions(exclusions)
+    .with_max_map_directories(cap);
+  let watcher = TokioWatcher::new(options).expect("build watcher");
+  match watcher.watch(root, Interest::all()).await {
+    Ok(handle) => Some((watcher, handle)),
+    Err(err) => {
+      common::skip_notice(format_args!(
+        "{cell}: fanotify unavailable ({err}) — run via linux-verify.sh fanotify"
+      ));
+      None
+    }
+  }
+}
+
+/// Whether `event` NAMES a path at or under `dir` — either end of a move included, so a
+/// pair that merely mentions the excluded destination cannot slip past as "the path is
+/// the other end".
+///
+/// The subtree form is deliberate: a located `Rescan` ON the excluded directory is
+/// exactly the leak shape (a rescan is an obligation to go re-enumerate the path it
+/// names), and a delivery beneath it is the other. A root-level `Rescan` is NOT counted —
+/// the root does not lie under an exclusion, and a scope-wide loss signal is a different
+/// fact from naming ground the caller excluded.
+fn names_under(event: &Event, dir: &Path) -> bool {
+  event.path().starts_with(dir)
+    || event
+      .kind()
+      .moved()
+      .is_some_and(|moved| moved.from().starts_with(dir))
+}
+
+/// Suite 12 — the exclusion fence against a LIVE kernel, on BOTH of the things it owes:
+/// the admission map must not grow, and nothing may be delivered from the excluded tree.
+///
+/// An exclusion is a load-shedding instruction: activity under an excluded path must
+/// cost the source nothing. The map is what "nothing" is measured in, because the map
+/// is what grows — a `FAN_CREATE|ONDIR` learns a node and a populated `FAN_RENAME` into
+/// the root learns a node AND walks the whole arriving subtree in. Neither may happen
+/// for a destination the caller excluded, which is why this cell reads
+/// `backend_stats().directories()`.
+///
+/// But the map is only half the obligation, and a map-only cell is how a delivery leak
+/// hides: the move-in below has its SOURCE outside the watched root, so admission saw one
+/// unresolvable end and one excluded end, and a fence asking "are both ends excluded"
+/// answered no — the pair was forwarded and lowered to a located rescan naming the
+/// excluded destination, while the map stayed exactly at its seeded size and this cell
+/// stayed green. So the stream is now read as well: every event drained on the way to the
+/// marker must name nothing at or under the exclusion.
+///
+/// The exercise is the two live shapes the seed walk can never see, because both happen
+/// AFTER it: a populated directory moved onto the excluded path from elsewhere on the
+/// superblock, and a run of directory creates beneath it. The map must sit at its
+/// seeded size throughout. A marker file under the reported half is waited on first, so
+/// the reader has provably drained the excluded churn before either fact is read — the
+/// kernel queue is ordered, so the marker's own delivery proves the excluded traffic
+/// ahead of it was already consumed and judged.
+#[tokio::test]
+async fn live_excluded_activity_never_grows_the_admission_map() {
+  let Some(mount) = ext4_loopback() else {
+    common::skip_notice(format_args!(
+      "live_excluded_activity_never_grows_the_admission_map: no ext4 loopback \
+       (needs --privileged)"
+    ));
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "excluded-map");
+  let reported = root.join("reported");
+  std::fs::create_dir_all(&reported).unwrap();
+  // The excluded directory does NOT exist at watch time: everything about it below is
+  // live, which is the whole point — the seed walk's fence cannot cover any of it.
+  let cache = root.join("cache");
+
+  let Some((mut w, handle)) = fanotify_watcher_with(
+    "live_excluded_activity_never_grows_the_admission_map",
+    &root,
+    vec![cache.clone()],
+    None,
+  )
+  .await
+  else {
+    return;
+  };
+  let seeded = w
+    .backend_stats(handle)
+    .expect("a live fanotify root reports stats")
+    .directories();
+  assert_eq!(
+    seeded, 2,
+    "the seed mapped exactly the root and its one reported child"
+  );
+
+  // A POPULATED directory moved onto the excluded path from elsewhere on the same
+  // superblock. Its destination parent (the root) IS mapped, so without a fence ahead
+  // of the map maintenance this learns the top and walks three descendants in.
+  let staged = scratch_under(&mount, "excluded-staging");
+  std::fs::create_dir_all(staged.join("a/b/c")).unwrap();
+  std::fs::rename(&staged, &cache).expect("move the populated tree onto the excluded path");
+
+  // Sustained create traffic beneath it — the churn a build cache produces.
+  for i in 0..20 {
+    std::fs::create_dir_all(cache.join(format!("d{i}"))).unwrap();
+  }
+
+  // A marker in the REPORTED half: waiting for its delivery proves the reader consumed
+  // the queue past the excluded churn, so the readings below are not merely early. Every
+  // event drained on the way is inspected — the excluded traffic is all ordered ahead of
+  // the marker, so anything it leaked has already gone past by the time this returns.
+  let marker = reported.join("marker.txt");
+  std::fs::write(&marker, b"x").unwrap();
+  let mut leaked: Vec<PathBuf> = Vec::new();
+  let seen = wait_for(&mut w, |e| {
+    if names_under(e, &cache) {
+      leaked.push(e.path().to_path_buf());
+    }
+    delivered(e, &marker)
+  })
+  .await;
+  assert!(
+    seen.is_some(),
+    "the reported half stays live while the excluded half churns"
+  );
+  assert!(
+    leaked.is_empty(),
+    "nothing from the excluded tree may reach a consumer — neither a record nor the \
+     located rescan a half-reportable rename lowers to: {leaked:?}"
+  );
+
+  assert_eq!(
+    w.backend_stats(handle)
+      .expect("stats stay available")
+      .directories(),
+    seeded,
+    "the admission map is exactly its seeded size: an excluded move-in was neither \
+     learned nor walked, and twenty excluded creates learned nothing"
+  );
+  w.close().await.expect("the watcher closes cleanly");
+}
+
+/// One directory of headroom above the two-directory seed the excluded-churn cell
+/// watches, so any leaked learn from inside the exclusion is over-cap immediately.
+const EXCLUDED_CAP: usize = 3;
+
+/// Suite 12 — the severity the fence exists to prevent, against a LIVE kernel: excluded
+/// churn must not be able to consume the directory cap and KILL the source.
+///
+/// The map is capped one directory above its seed, so a single leaked learn from the
+/// excluded subtree runs it over — and an over-cap map is the terminal `Fatal`, which
+/// takes the whole scope down and with it every subscription that had nothing to do
+/// with the exclusion. The cell creates the excluded directory live and then twenty
+/// children under it, then requires the REPORTED half to still deliver. A source killed
+/// by excluded churn cannot, so the liveness assertion is the cap assertion.
+#[tokio::test]
+async fn live_excluded_churn_cannot_consume_the_directory_cap() {
+  let Some(mount) = ext4_loopback() else {
+    common::skip_notice(format_args!(
+      "live_excluded_churn_cannot_consume_the_directory_cap: no ext4 loopback \
+       (needs --privileged)"
+    ));
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "excluded-cap");
+  let reported = root.join("reported");
+  std::fs::create_dir_all(&reported).unwrap();
+  let cache = root.join("cache");
+
+  // Seed is two directories (the root and `reported`); the cap leaves room for exactly
+  // one more, so the excluded directory's own learn would already be the last one the
+  // map can hold and its first child would be the terminal.
+  let Some((mut w, handle)) = fanotify_watcher_with(
+    "live_excluded_churn_cannot_consume_the_directory_cap",
+    &root,
+    vec![cache.clone()],
+    Some(EXCLUDED_CAP),
+  )
+  .await
+  else {
+    return;
+  };
+
+  std::fs::create_dir_all(&cache).unwrap();
+  for i in 0..20 {
+    std::fs::create_dir_all(cache.join(format!("d{i}"))).unwrap();
+  }
+
+  let marker = reported.join("marker.txt");
+  std::fs::write(&marker, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| delivered(e, &marker)).await.is_some(),
+    "the source survived the excluded churn: a cap consumed from inside an exclusion \
+     would have signaled the terminal Fatal and silenced this delivery"
+  );
+  assert_eq!(
+    w.backend_stats(handle)
+      .expect("stats stay available")
+      .directories(),
+    2,
+    "and the map never moved off its seed"
+  );
+  w.close().await.expect("the watcher closes cleanly");
+}
+
+/// Suite 12 — a rename with NO end in the reported tree, against a LIVE kernel, in both
+/// directions it can be assembled from. The assertion is on DELIVERY: nothing may reach a
+/// consumer naming ground it excluded.
+///
+/// The reported tree is the root MINUS the exclusions, and a rename end fails to be in it
+/// two different ways: the path is excluded, or the end resolves no path at all because
+/// it lies off the watched root. A fence that asks whether BOTH ends are EXCLUDED reads
+/// the second as reportable — an unresolvable end degrades to a bare filename, which no
+/// exclusion prefix matches — so a rename with neither end reportable survives admission,
+/// and the lowering (one end outside the root, one inside it) covers the "in-root" end
+/// with a located rescan. That end is the excluded one. The common-layer exclusion fence
+/// deliberately stands down for this backend, so the rescan goes straight out.
+///
+/// Both orderings are driven against the same live exclusion:
+///
+/// - a populated directory arriving from off the root ONTO the excluded name;
+/// - that same excluded name renamed back OFF the root.
+///
+/// Neither may produce a record or a rescan, and the map must not move off its seed
+/// either — an admission that never classifies cannot mutate one.
+#[tokio::test]
+async fn live_a_rename_with_no_reported_end_is_never_delivered() {
+  let Some(mount) = ext4_loopback() else {
+    common::skip_notice(format_args!(
+      "live_a_rename_with_no_reported_end_is_never_delivered: no ext4 loopback \
+       (needs --privileged)"
+    ));
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "excluded-unreported");
+  let reported = root.join("reported");
+  std::fs::create_dir_all(&reported).unwrap();
+  // Nothing occupies the excluded name at watch time: both renames below are live, so
+  // the seed walk's fence covers none of this.
+  let cache = root.join("cache");
+
+  let Some((mut w, handle)) = fanotify_watcher_with(
+    "live_a_rename_with_no_reported_end_is_never_delivered",
+    &root,
+    vec![cache.clone()],
+    None,
+  )
+  .await
+  else {
+    return;
+  };
+  let seeded = w
+    .backend_stats(handle)
+    .expect("a live fanotify root reports stats")
+    .directories();
+  assert_eq!(
+    seeded, 2,
+    "the seed mapped the root and its one reported child"
+  );
+
+  // OFF THE ROOT → EXCLUDED. The source parent is the loopback mount, which is not in
+  // the map; the destination parent is the root, which is.
+  let staged = scratch_under(&mount, "unreported-staging");
+  std::fs::create_dir_all(staged.join("a/b")).unwrap();
+  std::fs::rename(&staged, &cache).expect("move a populated tree onto the excluded path");
+
+  // EXCLUDED → OFF THE ROOT: the mirror image, the excluded name renamed away entirely.
+  let stashed = mount.join(format!("unreported-stash-{}", std::process::id()));
+  std::fs::rename(&cache, &stashed).expect("move the excluded path back off the root");
+
+  let marker = reported.join("marker.txt");
+  std::fs::write(&marker, b"x").unwrap();
+  let mut leaked: Vec<PathBuf> = Vec::new();
+  let seen = wait_for(&mut w, |e| {
+    if names_under(e, &cache) {
+      leaked.push(e.path().to_path_buf());
+    }
+    delivered(e, &marker)
+  })
+  .await;
+  assert!(
+    seen.is_some(),
+    "the reported half stays live across both unreportable renames"
+  );
+  assert!(
+    leaked.is_empty(),
+    "a rename with neither end in the reported tree must deliver nothing — a located \
+     rescan naming the excluded path is exactly the leak: {leaked:?}"
+  );
+  assert_eq!(
+    w.backend_stats(handle)
+      .expect("stats stay available")
+      .directories(),
+    seeded,
+    "and neither rename touched the admission map"
+  );
+  std::fs::remove_dir_all(&stashed).ok();
+  w.close().await.expect("the watcher closes cleanly");
+}
+
+/// Suite 12 — the boundary crossing that MUST survive the fence, against a LIVE kernel,
+/// in both directions. Its reported half is a real change to the tree the caller
+/// subscribed to, and suppressing the pair would make an object simply vanish (leaving)
+/// or never exist (arriving).
+///
+/// This is the guard beside the suppression cell above: "neither end reported" and "some
+/// end unresolvable" are different questions, and a fence that confused them in the safe
+/// direction would silence every move across the exclusion boundary. So each direction is
+/// asserted on the half the consumer CAN see:
+///
+/// - leaving, the pair carries the reported source as the move's `from`;
+/// - arriving, the pair names the reported destination — and the subtree is walked in, so
+///   a pre-existing descendant that no event ever announced is live afterwards. That last
+///   fact is what separates a delivered pair from a genuinely learned one.
+#[tokio::test]
+async fn live_a_rename_across_the_exclusion_boundary_keeps_its_reported_half() {
+  let Some(mount) = ext4_loopback() else {
+    common::skip_notice(format_args!(
+      "live_a_rename_across_the_exclusion_boundary_keeps_its_reported_half: no ext4 \
+       loopback (needs --privileged)"
+    ));
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "exclusion-crossing");
+  // A populated directory in the REPORTED tree before the watch, so the seed maps it and
+  // its descendant — the descendant is what proves the return trip re-walked the subtree.
+  let thing = root.join("thing");
+  std::fs::create_dir_all(thing.join("leaf")).unwrap();
+  let cache = root.join("cache");
+
+  let Some((mut w, _h)) = fanotify_watcher_with(
+    "live_a_rename_across_the_exclusion_boundary_keeps_its_reported_half",
+    &root,
+    vec![cache.clone()],
+    None,
+  )
+  .await
+  else {
+    return;
+  };
+
+  // REPORTED → EXCLUDED: the object leaves the reported tree. The consumer needs the
+  // source half to know what disappeared.
+  std::fs::rename(&thing, &cache).expect("move the reported subtree onto the excluded path");
+  assert!(
+    wait_for(&mut w, |e| e
+      .kind()
+      .moved()
+      .is_some_and(|moved| moved.from() == thing))
+    .await
+    .is_some(),
+    "a departure across the exclusion boundary keeps its reported half"
+  );
+
+  // EXCLUDED → REPORTED: the object arrives. Nothing ever announced its descendants, so
+  // the arriving half must be both delivered AND walked into the map.
+  let back = root.join("back");
+  std::fs::rename(&cache, &back).expect("move it back into the reported tree");
+  assert!(
+    wait_for(&mut w, |e| delivered(e, &back)).await.is_some(),
+    "an arrival across the exclusion boundary is delivered at its reported end"
+  );
+
+  let leaf_file = back.join("leaf/new.txt");
+  std::fs::write(&leaf_file, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| delivered(e, &leaf_file))
+      .await
+      .is_some(),
+    "and its pre-existing descendants were walked in: without the walk this directory is \
+     absent from the admission map and every event under it drops as out-of-root"
+  );
+  w.close().await.expect("the watcher closes cleanly");
+}
+
+/// Suite 12 — the exclusion boundary moved by a rename of the exclusion's ANCESTOR,
+/// against a LIVE kernel, in the direction that UNCOVERS ground.
+///
+/// Exclusions are matched on path prefixes, so which descendants of a subtree lie under
+/// one is a function of the subtree's own path. `<root>/a/cache` is excluded, so the seed
+/// walk never mapped it; renaming `<root>/a` to `<root>/b` makes the same directory
+/// reportable at `<root>/b/cache` — yet no event ever names its descendants, and a
+/// rename that merely re-parents the known node adds nothing to the map. The subtree
+/// then stays absent forever, and since admission is pure membership its events are
+/// dropped as OUT OF ROOT with no loss signal: permanent, silent blindness over ground
+/// the caller is now watching.
+///
+/// The witness is therefore a concrete delivery from inside the uncovered subtree, plus
+/// the admission map's own size — the map is where the repair happens, and a
+/// delivery-only assertion cannot distinguish a walked-in subtree from a lucky one.
+#[tokio::test]
+async fn live_renaming_an_exclusions_ancestor_uncovers_the_subtree() {
+  let Some(mount) = ext4_loopback() else {
+    common::skip_notice(format_args!(
+      "live_renaming_an_exclusions_ancestor_uncovers_the_subtree: no ext4 loopback \
+       (needs --privileged)"
+    ));
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "exclusion-uncover");
+  let source = root.join("a");
+  // Everything below `a/cache` exists BEFORE the watch, so the seed walk sees it and
+  // fences it out — the state the rename then makes reportable with no create event to
+  // announce any of it.
+  std::fs::create_dir_all(source.join("cache/deep")).unwrap();
+  std::fs::create_dir_all(source.join("keep")).unwrap();
+
+  let excluded = source.join("cache");
+  let Some((mut w, handle)) = fanotify_watcher_with(
+    "live_renaming_an_exclusions_ancestor_uncovers_the_subtree",
+    &root,
+    vec![excluded],
+    None,
+  )
+  .await
+  else {
+    return;
+  };
+  assert_eq!(
+    w.backend_stats(handle)
+      .expect("a live fanotify root reports stats")
+      .directories(),
+    3,
+    "the seed mapped the root, `a`, and `a/keep` — the walk fence kept `a/cache` and \
+     everything under it out"
+  );
+
+  std::fs::rename(&source, root.join("b")).expect("rename the exclusion's ancestor");
+
+  // The discriminator: a file created inside the newly-reportable subtree. Its parent
+  // directory is one the seed walk deliberately never mapped, so it is delivered only if
+  // the rename re-walked the moved subtree under the destination's geometry.
+  let uncovered = root.join("b/cache/deep/new.txt");
+  std::fs::write(&uncovered, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| delivered(e, &uncovered))
+      .await
+      .is_some(),
+    "the uncovered subtree is live: without a re-walk it stays absent from the admission \
+     map and every event under it is dropped as out-of-root, permanently"
+  );
+  assert_eq!(
+    w.backend_stats(handle)
+      .expect("stats stay available")
+      .directories(),
+    5,
+    "and the map holds the whole moved tree at its new path — root, b, b/keep, b/cache, \
+     b/cache/deep"
+  );
+  w.close().await.expect("the watcher closes cleanly");
+}
+
+/// Suite 12 — the same boundary crossed the other way, against a LIVE kernel: the rename
+/// carries a MAPPED subtree UNDER an exclusion.
+///
+/// `<root>/b/cache` is excluded but `<root>/a/cache` is not, so the seed maps it.
+/// Renaming `<root>/a` to `<root>/b` puts those directories inside the exclusion, and a
+/// re-parent would leave every one of them in the admission map — nodes the fence says
+/// are not in the reported tree, resolving paths and holding the capacity the exclusion
+/// exists to shed. So the map, not the delivery stream, is what this reads: deliveries
+/// from under an exclusion are suppressed either way.
+#[tokio::test]
+async fn live_renaming_a_subtree_under_an_exclusion_sheds_it_from_the_map() {
+  let Some(mount) = ext4_loopback() else {
+    common::skip_notice(format_args!(
+      "live_renaming_a_subtree_under_an_exclusion_sheds_it_from_the_map: no ext4 \
+       loopback (needs --privileged)"
+    ));
+    return;
+  };
+  let _guard = LoopbackGuard {
+    mount: mount.clone(),
+  };
+  let root = scratch_under(&mount, "exclusion-shed");
+  let source = root.join("a");
+  std::fs::create_dir_all(source.join("cache/deep")).unwrap();
+  std::fs::create_dir_all(source.join("keep")).unwrap();
+
+  // The exclusion names the DESTINATION's cache, which nothing occupies yet.
+  let excluded = root.join("b/cache");
+  let Some((mut w, handle)) = fanotify_watcher_with(
+    "live_renaming_a_subtree_under_an_exclusion_sheds_it_from_the_map",
+    &root,
+    vec![excluded],
+    None,
+  )
+  .await
+  else {
+    return;
+  };
+  assert_eq!(
+    w.backend_stats(handle)
+      .expect("a live fanotify root reports stats")
+      .directories(),
+    5,
+    "the seed mapped the whole tree: nothing under `a` is excluded"
+  );
+
+  std::fs::rename(&source, root.join("b")).expect("rename the subtree under the exclusion");
+
+  // A marker in the still-reported half, waited on so the reader has provably applied
+  // the rename before the map is read.
+  let marker = root.join("b/keep/marker.txt");
+  std::fs::write(&marker, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| delivered(e, &marker)).await.is_some(),
+    "the reported half of the moved subtree stays live"
+  );
+  assert_eq!(
+    w.backend_stats(handle)
+      .expect("stats stay available")
+      .directories(),
+    3,
+    "the newly-excluded directories were shed, not carried across: root, b, b/keep"
+  );
+
+  // And the shedding holds: churn inside the now-excluded subtree costs the map nothing,
+  // exactly as it would have had the exclusion been occupied from the start.
+  for i in 0..10 {
+    std::fs::create_dir_all(root.join(format!("b/cache/d{i}"))).unwrap();
+  }
+  let second = root.join("b/keep/second.txt");
+  std::fs::write(&second, b"x").unwrap();
+  assert!(
+    wait_for(&mut w, |e| delivered(e, &second)).await.is_some(),
+    "the source is still live after the excluded churn"
+  );
+  assert_eq!(
+    w.backend_stats(handle)
+      .expect("stats stay available")
+      .directories(),
+    3,
+    "ten creates under the newly-excluded path learned nothing"
+  );
+  w.close().await.expect("the watcher closes cleanly");
 }
