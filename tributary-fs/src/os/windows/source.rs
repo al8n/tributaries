@@ -13,6 +13,14 @@
 //!   OVERLAPPED — both are boxed and never touched in between, and a drain
 //!   that cannot prove the pin's end LEAKS them rather than freeing under a
 //!   pending write.
+//! - **A retained pin is REPORTED**: every exit answers
+//!   [`Quiesce`](super::super::Quiesce), and the paths that retain — the
+//!   panic-forget and a drain that never dequeued the read's completion —
+//!   answer `Unproven`, so the driver retires the stream as `TeardownFailed`
+//!   rather than counting a leak as a clean teardown. A spawn that fails AFTER
+//!   the pump is live never performs that teardown itself: it hands the running
+//!   stream back inside [`SpawnFailed`](super::super::SpawnFailed) so the same
+//!   counted submission reads the verdict.
 //! - **Single outstanding read, reissue-before-parse**: exactly one read is
 //!   pending per handle; the alternate buffer's read is issued before the
 //!   completed buffer is decoded, so the lost window between completion and
@@ -42,11 +50,12 @@ use windows_sys::Win32::{Foundation::ERROR_NOTIFY_ENUM_DIR, System::IO::OVERLAPP
 
 use super::{
   super::{
-    EventReceiver, MAX_EXCLUSIONS, ResumeToken, RootMeta, ScopePort, SourceConfig, SourceError,
-    SourceEvent, SourceMessage,
+    EventReceiver, MAX_EXCLUSIONS, Quiesce, ResumeToken, RootMeta, ScopePort, SourceConfig,
+    SourceError, SourceEvent, SourceMessage, SpawnFailed,
     transport::{self, TransportState},
   },
-  RdcwPairer, ffi, is_unc_remote, lower_rdcw_buffer,
+  DRAIN_LIMIT_MS, DRAIN_PACKET_BUDGET, DrainStep, RdcwPairer, contained_pump, drain_to_pin_end,
+  ffi, is_unc_remote, joined_verdict, lower_rdcw_buffer,
 };
 
 /// The completion key of the one directory (or volume) read.
@@ -59,10 +68,6 @@ pub(super) const KEY_CONTROL: usize = 2;
 /// delivery shape, so a cross-buffer partner arrives with the very next
 /// completion or not at all.
 const PAIRING_WINDOW_MS: u32 = 20;
-
-/// How long the teardown drain waits for the cancelled read's final
-/// completion before declaring the pin unprovable and leaking the buffers.
-const DRAIN_LIMIT_MS: u32 = 5_000;
 
 /// What the pump thread owns: the pinned I/O state of one directory stream.
 struct PumpIo {
@@ -115,6 +120,11 @@ pub(super) struct PumpShared {
   /// The stop belt: raised by `shutdown` before the control post, so a pump
   /// that dequeues ANY packet after it knows the source is closing.
   pub(super) stopped: AtomicBool,
+  /// The resume point the driver has ACKNOWLEDGED. The RDCW pump stages
+  /// nothing into it (its notifications have no durable position), so an RDCW
+  /// source reports `None` by construction rather than by a special case; the
+  /// journal pump stages a cursor with every batch.
+  pub(super) resume: Arc<transport::ResumeShared>,
 }
 
 impl PumpShared {
@@ -141,14 +151,17 @@ impl Source {
   /// probe) → pump → post-live re-proof.
   pub(crate) fn spawn(
     config: SourceConfig,
-  ) -> Result<(SourceHandle, EventReceiver, RootMeta), SourceError> {
+  ) -> Result<(SourceHandle, EventReceiver, RootMeta), SpawnFailed<SourceHandle>> {
     if config.roots.is_empty() {
-      return Err(SourceError::NoRoots);
+      return Err(SourceError::NoRoots.into());
     }
     if config.exclusions.len() > MAX_EXCLUSIONS {
-      return Err(SourceError::TooManyExclusions {
-        supplied: config.exclusions.len(),
-      });
+      return Err(
+        SourceError::TooManyExclusions {
+          supplied: config.exclusions.len(),
+        }
+        .into(),
+      );
     }
 
     let supplied = config.roots[0].clone();
@@ -161,13 +174,16 @@ impl Source {
     // remote root at the barrier, never degrade into a stream that cannot
     // keep its delivery contract.
     if is_unc_remote(&canonical) {
-      return Err(SourceError::RootUnavailable {
-        root: canonical,
-        source: io::Error::new(
-          io::ErrorKind::Unsupported,
-          "network filesystems deliver no reliable events",
-        ),
-      });
+      return Err(
+        SourceError::RootUnavailable {
+          root: canonical,
+          source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "network filesystems deliver no reliable events",
+          ),
+        }
+        .into(),
+      );
     }
 
     let handle =
@@ -176,24 +192,30 @@ impl Source {
         source,
       })?;
     if !ffi::is_disk_object(handle.as_handle()) {
-      return Err(SourceError::RootUnavailable {
-        root: canonical,
-        source: io::Error::new(
-          io::ErrorKind::Unsupported,
-          "the root is not a disk-backed object",
-        ),
-      });
+      return Err(
+        SourceError::RootUnavailable {
+          root: canonical,
+          source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the root is not a disk-backed object",
+          ),
+        }
+        .into(),
+      );
     }
     match ffi::is_directory(handle.as_handle()) {
       Ok(true) => {}
       Ok(false) => {
-        return Err(SourceError::NotADirectory { root: canonical });
+        return Err(SourceError::NotADirectory { root: canonical }.into());
       }
       Err(source) => {
-        return Err(SourceError::RootUnavailable {
-          root: canonical,
-          source,
-        });
+        return Err(
+          SourceError::RootUnavailable {
+            root: canonical,
+            source,
+          }
+          .into(),
+        );
       }
     }
     let identity =
@@ -208,7 +230,7 @@ impl Source {
     match config.backend {
       super::super::Backend::UsnJournal => {
         return super::usn_source::spawn(&config, canonical, &handle, identity)
-          .map_err(|stage| SourceError::BackendProbeFailed { stage })?;
+          .map_err(|stage| SpawnFailed::refused(SourceError::BackendProbeFailed { stage }))?;
       }
       super::super::Backend::Auto => {
         if let Ok(spawned) = super::usn_source::spawn(&config, canonical.clone(), &handle, identity)
@@ -223,8 +245,10 @@ impl Source {
     ffi::iocp_associate(port.as_handle(), handle.as_handle(), KEY_READ)
       .map_err(|_| SourceError::CreateFailed)?;
 
-    let buffer_len = config.channel_capacity.get().max(1) * 1024;
-    let buffer_len = buffer_len.clamp(4 * 1024, 64 * 1024);
+    // The native buffer is its OWN option, in bytes: deriving it from the batch
+    // budget multiplied a caller-supplied count into a length, which wraps (or
+    // panics) on a 32-bit `usize` long before it means anything.
+    let buffer_len = config.os_buffer_bytes.get() as usize;
     let io_state = PumpIo {
       handle,
       port,
@@ -245,6 +269,7 @@ impl Source {
       queue: queue_tx,
       transport: TransportState::new(config.channel_capacity.get()),
       stopped: AtomicBool::new(false),
+      resume: Arc::default(),
     });
     let control = ControlPost {
       port: io_state
@@ -258,12 +283,34 @@ impl Source {
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<bool>(1);
     let pump = spawn_pump(io_state, Arc::clone(&shared), started_tx)?;
     if !started_rx.recv().unwrap_or(false) {
-      let _ = pump.join();
-      return Err(SourceError::StartFailed);
+      // A join hands back the pump's panic payload exactly as `catch_unwind`
+      // does, and discarding it with `let _ =` DROPS it — running the
+      // panicking code's own destructor here rather than inside a boundary.
+      if let Err(payload) = pump.join() {
+        let _ = tributary_proto::unwind::dispose_panic_payload(payload);
+      }
+      return Err(SourceError::StartFailed.into());
     }
 
-    // From here the stream is live; failures tear it down through the one
-    // proven teardown path (the handle) before rejecting.
+    // From here the stream is LIVE, and every failure below hands it back
+    // running rather than tearing it down here.
+    //
+    // Rolling back inline was the earlier shape, and it discarded the
+    // `shutdown`'s verdict on the reasoning that a failing spawn owns no scope
+    // and owes no counted obligation. But this pump's reads are overlapped: a
+    // cancellation drain that cannot prove the read's completion was dequeued
+    // RETAINS the pinned buffer, its `OVERLAPPED` and this handle rather than
+    // freeing memory the kernel may still write through — the memory-safe
+    // choice — and answers `Unproven`. Discarded here, that retention was
+    // reported as nothing at all: no `TeardownFailed` reached the driver, so
+    // the backlog never bounded admission over it and `close` still claimed
+    // quiescence. The scope not existing never made the retained state stop
+    // existing.
+    //
+    // So the rollback rides out with the error (see
+    // [`SpawnFailed`](super::super::SpawnFailed)) and the driver retires it
+    // through the same counted submission a committed stream uses, where the
+    // verdict chooses the terminal.
     let source_handle = SourceHandle {
       pump: Some(pump),
       control,
@@ -277,25 +324,31 @@ impl Source {
     let live = match ffi::open_directory(&canonical) {
       Ok(live) => live,
       Err(source) => {
-        source_handle.shutdown();
-        return Err(SourceError::RootUnavailable {
-          root: canonical,
-          source,
-        });
+        return Err(SpawnFailed::rolled_back(
+          SourceError::RootUnavailable {
+            root: canonical,
+            source,
+          },
+          source_handle,
+        ));
       }
     };
     match ffi::identity_of(live.as_handle()) {
       Ok(live_identity) if live_identity == identity => {}
       Ok(_) => {
-        source_handle.shutdown();
-        return Err(SourceError::RootReplaced { root: canonical });
+        return Err(SpawnFailed::rolled_back(
+          SourceError::RootReplaced { root: canonical },
+          source_handle,
+        ));
       }
       Err(source) => {
-        source_handle.shutdown();
-        return Err(SourceError::RootUnavailable {
-          root: canonical,
-          source,
-        });
+        return Err(SpawnFailed::rolled_back(
+          SourceError::RootUnavailable {
+            root: canonical,
+            source,
+          },
+          source_handle,
+        ));
       }
     }
     drop(live);
@@ -311,11 +364,13 @@ impl Source {
       let opened = match ffi::open_directory(ancestor) {
         Ok(opened) => opened,
         Err(source) => {
-          source_handle.shutdown();
-          return Err(SourceError::RootUnavailable {
-            root: ancestor.to_path_buf(),
-            source,
-          });
+          return Err(SpawnFailed::rolled_back(
+            SourceError::RootUnavailable {
+              root: ancestor.to_path_buf(),
+              source,
+            },
+            source_handle,
+          ));
         }
       };
       match ffi::identity_of(opened.as_handle()) {
@@ -324,11 +379,13 @@ impl Source {
           ancestor_identity.file_id,
         )),
         Err(source) => {
-          source_handle.shutdown();
-          return Err(SourceError::RootUnavailable {
-            root: ancestor.to_path_buf(),
-            source,
-          });
+          return Err(SpawnFailed::rolled_back(
+            SourceError::RootUnavailable {
+              root: ancestor.to_path_buf(),
+              source,
+            },
+            source_handle,
+          ));
         }
       }
     }
@@ -360,8 +417,10 @@ struct ControlPost {
 /// A live RDCW stream. Dropping it tears the stream down; prefer
 /// [`shutdown`](Self::shutdown) at an orderly exit.
 pub(crate) struct SourceHandle {
-  /// `None` once torn down — teardown runs exactly once.
-  pump: Option<JoinHandle<()>>,
+  /// `None` once torn down — teardown runs exactly once. The thread's value
+  /// IS its quiescence verdict: a pump that had to retain kernel-owned state
+  /// reports it here rather than exiting silently.
+  pump: Option<JoinHandle<Quiesce>>,
   control: ControlPost,
   shared: Arc<PumpShared>,
 }
@@ -370,7 +429,7 @@ impl SourceHandle {
   /// Assembles a handle around a running pump — the journal arm builds the
   /// same teardown shape over its own thread and port.
   pub(super) fn assemble(
-    pump: JoinHandle<()>,
+    pump: JoinHandle<Quiesce>,
     control_port: OwnedHandle,
     shared: Arc<PumpShared>,
   ) -> Self {
@@ -381,11 +440,11 @@ impl SourceHandle {
     }
   }
 
-  /// The resume point minted so far. RDCW has no journal to resume from.
-  // Journal resume is deferred surface, mirrored across every backend.
-  #[allow(dead_code)]
+  /// The resume point the driver has ACKNOWLEDGED — a journal cursor on the USN
+  /// arm, and `None` on RDCW, which stages none because a change notification
+  /// names no durable position to come back to.
   pub(crate) fn resume_token(&self) -> Option<ResumeToken> {
-    None
+    self.shared.resume.published()
   }
 
   /// The clonable arm/disarm port: kernel-recursive, so no arm traffic.
@@ -398,33 +457,58 @@ impl SourceHandle {
 
   /// Quiesces and destroys the stream. Blocks for at most one in-flight
   /// completion plus the bounded teardown drain.
-  pub(crate) fn shutdown(mut self) {
-    self.teardown();
+  ///
+  /// The answer is the PUMP'S — this handle only posts the control packet and
+  /// joins. A pump that had to retain its pinned buffers (it panicked, or its
+  /// cancellation drain never dequeued the read's completion) reports
+  /// [`Quiesce::Unproven`], and the driver turns that into a failed teardown
+  /// rather than a clean one.
+  pub(crate) fn shutdown(mut self) -> Quiesce {
+    self.teardown()
   }
 
-  fn teardown(&mut self) {
+  fn teardown(&mut self) -> Quiesce {
     let Some(pump) = self.pump.take() else {
-      return;
+      // Teardown already ran and already reported its own verdict; answering
+      // again here would count one stream twice.
+      return Quiesce::Proven;
     };
     self.shared.stopped.store(true, Ordering::Release);
     // A failed post means the port is gone — the pump is already exiting.
     let _ = ffi::iocp_post(self.control.port.as_handle(), KEY_CONTROL);
-    let _ = pump.join();
+    // The join carries the pump's own verdict, and a thread that unwound
+    // carries none — including the payload discipline, which the shared reader
+    // owns so no site can reintroduce a bare drop of it.
+    joined_verdict(pump.join())
   }
 }
 
 impl Drop for SourceHandle {
+  /// The backstop for a handle released without an orderly `shutdown`.
+  ///
+  /// The verdict is discarded, and this is the one place where that stays
+  /// right. A `Drop` reached here is a handle no driver frame is accounting for
+  /// any more: the driver's escrow and reservoir guards hand every stream they
+  /// still hold to the reaper sink, and they run precisely on the exits — an
+  /// unwind, a cancelled task, a shut-down runtime — where the frame that owns
+  /// the backlog counter, the unproven latch and the close reply is itself
+  /// gone. There is no admission left to slow and no close reply left to make
+  /// honest, so a verdict here has no reader rather than a reader being denied
+  /// one. A spawn rollback is a different case entirely and is NOT this one: a
+  /// live driver is still there to hear it, which is why the barrier hands its
+  /// stream back rather than dropping it here.
   fn drop(&mut self) {
-    self.teardown();
+    let _ = self.teardown();
   }
 }
 
-/// Starts the pump thread.
+/// Starts the pump thread. The thread's value is its quiescence verdict, which
+/// [`SourceHandle::teardown`] reads out of the join.
 fn spawn_pump(
   io_state: PumpIo,
   shared: Arc<PumpShared>,
   started: std::sync::mpsc::SyncSender<bool>,
-) -> Result<JoinHandle<()>, SourceError> {
+) -> Result<JoinHandle<Quiesce>, SourceError> {
   std::thread::Builder::new()
     .name("tributary-fs.rdcw".into())
     .spawn(move || {
@@ -439,26 +523,29 @@ fn spawn_pump(
         io_state.extended = false;
         if io_state.issue().is_err() {
           let _ = started.send(false);
-          return;
+          // A refused issue queues no I/O, so no pin was ever taken and this
+          // drop frees nothing the kernel holds.
+          return Quiesce::Proven;
         }
       }
       let _ = started.send(true);
-      let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run(&mut io_state, &shared);
-      }));
-      if outcome.is_err() {
-        // A panicked pump cannot prove its read's pin ended: leak the I/O
-        // state rather than drop memory the kernel may still write.
-        std::mem::forget(io_state);
-        shared.fatal(SourceError::CallbackPanic);
-      }
+      contained_pump(
+        io_state,
+        |io_state| run(io_state, &shared),
+        || shared.fatal(SourceError::CallbackPanic),
+      )
     })
     .map_err(|_| SourceError::StartFailed)
 }
 
 /// The pump loop. One read outstanding at all times; completions, control
 /// posts, and the pairing-window timeout are the only wakeups.
-fn run(io_state: &mut PumpIo, shared: &PumpShared) {
+///
+/// Returns whether the exit PROVED the outstanding read's pin ended. Every
+/// arm but the two drains reaches its `return` having just dequeued that
+/// read's own completion with no reissue behind it, so the pin is provably
+/// closed and the I/O state may drop; the drains answer for themselves.
+fn run(io_state: &mut PumpIo, shared: &PumpShared) -> Quiesce {
   let mut pairer = RdcwPairer::new();
   loop {
     // A held rename OLD bounds the wait: its partner arrives with the next
@@ -475,8 +562,7 @@ fn run(io_state: &mut PumpIo, shared: &PumpShared) {
         // unproven, so the teardown drain (cancel → drain-to-exact →
         // leak-on-failure) must run before the I/O state can drop.
         shared.fatal(SourceError::ReadFailed { source: err });
-        teardown_drain(io_state);
-        return;
+        return teardown_drain(io_state);
       }
     };
     match completion {
@@ -493,8 +579,7 @@ fn run(io_state: &mut PumpIo, shared: &PumpShared) {
       ffi::Completion::Packet {
         key: KEY_CONTROL, ..
       } => {
-        teardown_drain(io_state);
-        return;
+        return teardown_drain(io_state);
       }
       ffi::Completion::Packet {
         bytes,
@@ -520,20 +605,24 @@ fn run(io_state: &mut PumpIo, shared: &PumpShared) {
               .collect::<Vec<_>>();
             transport::forward_batch(&shared.transport, events, true, |msg| shared.send(msg));
             if io_state.issue().is_err() {
+              // The completion was dequeued and the reissue queued nothing:
+              // no read is outstanding.
               shared.fatal(SourceError::StartFailed);
-              return;
+              return Quiesce::Proven;
             }
             continue;
           }
           if shared.stopped.load(Ordering::Acquire) {
             // A cancellation packet raced the control post: consume it and
-            // exit on the control packet still in the queue — or now.
-            return;
+            // exit on the control packet still in the queue — or now. This IS
+            // the outstanding read's own failed completion, so dequeuing it is
+            // the same proof the drain goes looking for.
+            return Quiesce::Proven;
           }
           shared.fatal(SourceError::ReadFailed {
             source: io::Error::from_raw_os_error(code),
           });
-          return;
+          return Quiesce::Proven;
         }
 
         // Success for the active buffer: swap and reissue BEFORE parsing.
@@ -548,8 +637,10 @@ fn run(io_state: &mut PumpIo, shared: &PumpShared) {
             io_state.extended,
           );
           transport::forward_batch(&shared.transport, events, lossy, |msg| shared.send(msg));
+          // The completed read's packet was dequeued and its successor was
+          // refused, so nothing is pinned.
           shared.fatal(SourceError::StartFailed);
-          return;
+          return Quiesce::Proven;
         }
 
         if bytes == 0 {
@@ -578,22 +669,39 @@ fn run(io_state: &mut PumpIo, shared: &PumpShared) {
 /// completion so the buffer pin provably ends before the handles close. A
 /// drain that cannot prove the end within its bound LEAKS the pinned boxes —
 /// the kernel may still write through them, so freeing would be the bug.
-fn teardown_drain(io_state: &mut PumpIo) {
+///
+/// The leak is granular on purpose: only the buffer and the `OVERLAPPED` are
+/// retained, while the directory handle and the port still close with the I/O
+/// state. Closing a handle with a pending overlapped operation cancels it and
+/// lets the kernel complete it into the retained `OVERLAPPED`, which is
+/// exactly what the retention is for.
+///
+/// `Unproven` is the verdict on every path that reaches that leak — a
+/// cancellation whose completion never arrived within the bound, a wait that
+/// failed, and a budget spent on strays are indistinguishable from outside,
+/// and all three end with kernel-owned memory retained. Reporting them as a
+/// completed teardown is what let repeated failures leak without ever being
+/// counted.
+fn teardown_drain(io_state: &mut PumpIo) -> Quiesce {
   ffi::cancel_io(io_state.handle.as_handle());
-  let deadline_packets = 16;
-  for _ in 0..deadline_packets {
-    match ffi::iocp_wait(io_state.port.as_handle(), DRAIN_LIMIT_MS) {
-      Ok(ffi::Completion::Packet { overlapped, .. })
-        if overlapped == (&raw mut *io_state.overlapped[io_state.active]).cast() =>
-      {
-        // The pin ended: the read's completion (aborted or success) was
-        // dequeued. Handles and buffers now close through Drop.
-        return;
+  // Bound the pin's identity BEFORE the drain borrows the port: the active
+  // OVERLAPPED cannot move (it is boxed) and the pump issues nothing more.
+  let pinned: *mut OVERLAPPED = &raw mut *io_state.overlapped[io_state.active];
+  let port = io_state.port.as_handle();
+  let verdict = drain_to_pin_end(DRAIN_PACKET_BUDGET, || {
+    match ffi::iocp_wait(port, DRAIN_LIMIT_MS) {
+      // The pin ended: the read's completion (aborted or success) was
+      // dequeued. Handles and buffers now close through Drop.
+      Ok(ffi::Completion::Packet { overlapped, .. }) if overlapped == pinned.cast() => {
+        DrainStep::PinEnded
       }
       // Stray control posts or older packets: keep draining.
-      Ok(ffi::Completion::Packet { .. }) => {}
-      Ok(ffi::Completion::TimedOut) | Err(_) => break,
+      Ok(ffi::Completion::Packet { .. }) => DrainStep::Stray,
+      Ok(ffi::Completion::TimedOut) | Err(_) => DrainStep::Exhausted,
     }
+  });
+  if verdict == Quiesce::Proven {
+    return verdict;
   }
   // The pin's end was not observed: leak the I/O state rather than free
   // memory the kernel may still write.
@@ -614,4 +722,5 @@ fn teardown_drain(io_state: &mut PumpIo) {
   let [a, b] = overlapped;
   Box::leak(a);
   Box::leak(b);
+  verdict
 }
