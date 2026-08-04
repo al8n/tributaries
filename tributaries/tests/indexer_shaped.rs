@@ -727,8 +727,9 @@ async fn debounce_coalesces_a_burst() {
 }
 
 /// (e) No silent loss across a widen (design §8): a re-pointed subscription — one whose
-/// stream already advanced — is delivered a **dominating** `Rescan` naming the widened root,
-/// whose epoch strictly dominates every event delivered to it before the widen.
+/// stream already advanced — is delivered a **dominating** `Rescan` obliging re-enumeration
+/// of its own key, whose epoch strictly dominates every event delivered to it before the
+/// widen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn widen_delivers_dominating_rescan_no_silent_loss() {
   let outer = rig("widen", 5, TributariesOptions::new());
@@ -768,12 +769,17 @@ async fn widen_delivers_dominating_rescan_no_silent_loss() {
     e.subscription() == child_sub && e.is_rescan() && e.reaches(&child_key)
   })
   .await
-  .expect("the widen delivers the child a Rescan naming an ancestor of its key");
+  .expect("the widen delivers the child a Rescan obliging re-enumeration of its key");
 
+  // A located rescan at a STRICT ancestor is clamped to the receiving subscription's
+  // own key: the loss covers everything that subscription owns and nothing above it
+  // is the subscription's to re-read, so the clamped key is the widest honest
+  // instruction. Naming the widened root would order this subscriber to re-enumerate
+  // a root it never subscribed to.
   assert_eq!(
     rescan.key(),
-    anc_key.as_slice(),
-    "the Rescan names the widened root to re-enumerate"
+    child_key.as_slice(),
+    "the Rescan is clamped to the subscription's own key, never the wider root it never watched"
   );
   assert!(
     rescan.epoch() > seed.epoch(),
