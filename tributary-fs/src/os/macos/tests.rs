@@ -31,8 +31,14 @@ fn unique_dir(tag: &str) -> PathBuf {
 }
 
 /// Drains the queue until `done` says the log suffices or the deadline
-/// passes; returns every event seen plus whether an Overflow arrived (its
-/// ack drops here, re-arming the dedup as the driver would).
+/// passes; returns every event seen plus whether an Overflow arrived.
+///
+/// This stands in for the driver at its ingest boundary, so it owes the
+/// producer both acknowledgements the driver makes there: the batch's staged
+/// resume point publishes here, and an `Overflow`'s ack drops here to re-arm
+/// the dedup. The producer stages a resume candidate onto the batch and
+/// nothing else, so a harness that skipped the acknowledgement would observe a
+/// point that can never advance however many batches it consumed.
 fn recv_until(
   rx: &EventReceiver,
   deadline: Duration,
@@ -43,7 +49,8 @@ fn recv_until(
   let mut overflow = false;
   while !done(&seen) && Instant::now() < end {
     match rx.try_recv() {
-      Ok(SourceMessage::Batch(payload)) => {
+      Ok(SourceMessage::Batch(mut payload)) => {
+        payload.acknowledge_resume();
         seen.extend(payload.events.into_iter().map(|ev| match ev {
           crate::os::SourceEvent::FsEvents(ev) => ev,
           other => panic!("a mac source only emits FSEvents records: {other:?}"),
@@ -601,7 +608,10 @@ fn smoke_stream_reports_create_modify_rename_remove() {
     has(log, &b, FsEventFlags::item_removed)
   });
 
-  assert!(handle.resume_token().is_some(), "in-sync ids were tracked");
+  assert!(
+    handle.resume_token().is_some(),
+    "the ingested batches published their staged point over in-sync ids"
+  );
   let _ = handle.shutdown();
   // Once the stream deallocates, its strong count on the shared state drops
   // and the channel disconnects.
