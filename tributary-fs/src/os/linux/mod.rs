@@ -19,8 +19,8 @@
 //! - **rustix (io-safe, owned/borrowed fds)** for everything it covers — the
 //!   inotify instance and watches ([`rustix::fs::inotify`]), the `poll` and
 //!   `eventfd` wakeup ([`rustix::event`]), the transient `O_PATH` anchor opens
-//!   ([`rustix::fs::openat`]), and the `statfs` filesystem-type gate that refuses
-//!   remote/virtual roots (reads the public `f_type`), plus the reads on the
+//!   ([`rustix::fs::openat`]), and the `statfs` filesystem-type gate that admits
+//!   only known-local roots (reads the public `f_type`), plus the reads on the
 //!   source fds ([`rustix::io::read`]). Errors surface as [`rustix::io::Errno`],
 //!   mapped to the crate's [`WatchError`](tributary_proto::WatchError)/
 //!   [`SourceError`] taxonomy exactly as the raw errnos were.
@@ -49,10 +49,11 @@
 //!   (RHEL 8 4.18, Ubuntu 18.04 4.15, Debian 10 4.19, SLES 15 4.12); a kernel below
 //!   it — and a `statx`-blocking seccomp policy — is explicitly unsupported for the
 //!   Linux backends. Above the floor, `openat2` (5.6) is only a FAST PATH: the root
-//!   pin ([`pin_root`]) and the post-live ancestor identities
-//!   ([`ancestor_identities`]) degrade on `ENOSYS` to the shared hand-rolled
-//!   [`open_no_symlinks`] component walk, so a 4.11–5.5 kernel still pins, starts
-//!   the reader, AND reads the ancestor chain without ever hitting an unhandled
+//!   pin ([`pin_root`]) degrades on `ENOSYS` to the shared hand-rolled
+//!   [`open_no_symlinks`] component walk, and the post-live containment snapshot
+//!   ([`ancestor_identities`]) is a per-hop `openat` walk with no `openat2` in it at
+//!   all, so a 4.11–5.5 kernel still pins, starts the reader, AND reads the ancestor
+//!   chain without ever hitting an unhandled
 //!   `ENOSYS`. `statx`'s mount id (`STATX_MNT_ID`, 5.8) is a masked read
 //!   ([`root_mount_id`] here, and the driver's `stat_sample`) that yields `Ok(None)`
 //!   — the device-belt fence — on a 4.11–5.7 kernel rather than failing. The scope
@@ -84,9 +85,14 @@ pub(crate) mod wake;
 #[cfg(test)]
 mod tests;
 
-// `Path`/`PathBuf` back the mountinfo parser and `mounts_under`, both gated to
-// unix-or-test; a non-unix lib target (wasm) compiles neither, so the import
-// rides the same gate to stay warning-clean on the cross legs.
+// `Path`/`PathBuf` back the locality refusal and the mountinfo parser
+// (`locality_refusal`, `parse_mountinfo`), gated `unix-or-test` so the pure
+// parser stays unit-testable off a non-unix host, plus `mounts_under` and the
+// rest of the Linux-only spawn machinery (`pin_root`, `ancestor_identities`,
+// the `statx`/`impl Source` gate), which is `target_os = "linux"` and so a
+// strict subset (Linux is unix). The import rides the broader of the two, and
+// on a non-unix, non-test lib target (wasm, or Windows outside its unittest
+// binary) neither group compiles, so the import correctly drops out too.
 #[cfg(any(unix, test))]
 use std::path::{Path, PathBuf};
 
@@ -217,10 +223,69 @@ pub(crate) fn attribute_events(
   AttributedBatch { events, lost }
 }
 
-/// Filesystem magic numbers (`statfs.f_type`) of network / virtual
-/// filesystems a watch root must refuse: inotify on them reports only local
-/// VFS activity (other hosts' writes are invisible), the exact silent-gap
-/// class the macOS `!MNT_LOCAL` refusal exists for.
+/// Filesystem magic numbers (`statfs.f_type`) of the LOCAL filesystems a watch
+/// root is ALLOWED to live on.
+///
+/// # Why an allowlist, not a denylist
+///
+/// The gate answers one question: does this filesystem's VFS see every mutation
+/// of the objects under the root? A filesystem served from another host does
+/// not — a remote write produces no local VFS activity, so no inotify record and
+/// no fanotify event exists to be dropped, and there is no loss signal to
+/// degrade through either. The coverage claim would be silently false rather
+/// than coarsely true, which is exactly why the macOS sibling refuses `!MNT_LOCAL`
+/// instead of degrading.
+///
+/// A denylist answers that question with "not one of the ten distributed
+/// filesystems I happen to know about", which is the wrong default in both
+/// directions of the unknown: a filesystem nobody enumerated here is exactly the
+/// one whose coverage nobody has reasoned about, and `statfs` magics are minted
+/// by out-of-tree and future in-tree filesystems faster than any list is
+/// maintained. So the unknown is REFUSED, and the list that has to stay current
+/// is the one whose entries were each individually argued to be local. macOS asks
+/// the kernel the question directly (`MNT_LOCAL`); Linux has no such flag on
+/// `statfs`, so the enumeration IS the answer, and it must be the safe-by-default
+/// one.
+///
+/// Every entry is a filesystem whose entire backing store is attached to this
+/// host — block devices, memory, and the stacking/compressed images over them.
+/// Cluster filesystems (GFS2, OCFS2) are deliberately absent even though their
+/// block device is local: a peer node's write reaches the shared device without
+/// passing through this host's VFS, which is the same silent gap as NFS.
+const LOCAL_FS_MAGICS: &[i64] = &[
+  0xEF53,      // ext2 / ext3 / ext4
+  0x9123_683E, // btrfs
+  0x5846_5342, // xfs
+  0x0102_1994, // tmpfs / shmem / devtmpfs
+  0x8584_58F6, // ramfs
+  0x794C_7630, // overlayfs (container images; a probe concern, not a locality one)
+  0xF2F5_2010, // f2fs
+  0x2FC1_2FC1, // zfs
+  0x3153_464A, // jfs
+  0x5265_4973, // reiserfs
+  0x3434,      // nilfs2
+  0xCA45_1A4E, // bcachefs
+  0x2011_BAB0, // exfat
+  0x4D44,      // msdos / vfat
+  0x5346_544E, // ntfs (in-kernel ntfs3)
+  0x9660,      // iso9660
+  0x1501_3346, // udf
+  0x7371_7368, // squashfs
+  0xE0F5_E1E2, // erofs
+  0x4244,      // hfs
+  0x482B,      // hfsplus
+  0x2405_1905, // ubifs
+  0x72B6,      // jffs2
+];
+
+/// Filesystem magic numbers of network / distributed filesystems that are KNOWN
+/// to be remote.
+///
+/// This list never decides the verdict — [`fs_type_is_local`] does, and an
+/// unknown magic is refused whether or not it appears here. It only selects the
+/// refusal MESSAGE, the same split [`statx_unavailable`] makes for the `statx`
+/// floor: naming the filesystem is a better diagnostic than "unrecognized" for
+/// the cases an operator is most likely to hit.
 const REMOTE_FS_MAGICS: &[i64] = &[
   0x6969,      // NFS
   0x517B,      // SMB
@@ -232,9 +297,26 @@ const REMOTE_FS_MAGICS: &[i64] = &[
   0x7375_7245, // CODA
   0x00C3_6400, // CEPH
   0x564C,      // NCP
+  0x0116_1970, // GFS2 (cluster: a peer node writes past this host's VFS)
+  0x7461_636F, // OCFS2 (cluster, same reason)
 ];
 
-/// Whether `f_type` names a filesystem the spawn barrier refuses.
+/// Whether `f_type` names a filesystem a watch root may live on — the gate's
+/// VERDICT (PURE, row-tested). Fail-closed: only [`LOCAL_FS_MAGICS`] passes.
+pub(crate) const fn fs_type_is_local(f_type: i64) -> bool {
+  let mut i = 0;
+  while i < LOCAL_FS_MAGICS.len() {
+    if LOCAL_FS_MAGICS[i] == f_type {
+      return true;
+    }
+    i += 1;
+  }
+  false
+}
+
+/// Whether `f_type` names a filesystem KNOWN to be remote — the pure MESSAGE
+/// selector (row-tested). It never chooses Ok: a magic absent from BOTH lists is
+/// refused too, it just carries the unrecognized-filesystem text.
 pub(crate) const fn fs_type_is_remote(f_type: i64) -> bool {
   let mut i = 0;
   while i < REMOTE_FS_MAGICS.len() {
@@ -245,6 +327,40 @@ pub(crate) const fn fs_type_is_remote(f_type: i64) -> bool {
   }
   false
 }
+
+/// The spawn barrier's locality verdict for a root whose superblock reported
+/// `f_type` (PURE — row-tested). `Some` refuses the spawn.
+///
+/// The refusal is [`Unsupported`](std::io::ErrorKind::Unsupported) rather than a
+/// degraded guarantee for the reason the allowlist exists: there is nothing to
+/// degrade THROUGH. It mirrors the macOS `!MNT_LOCAL` refusal byte for byte in
+/// shape — same error variant, same [`ErrorKind`](std::io::ErrorKind), read off
+/// the same opened description that proves the root's kind and identity — so a
+/// caller cannot tell the two platforms' refusals apart by anything but the
+/// message.
+#[cfg(any(unix, test))]
+fn locality_refusal(f_type: i64, root: &Path) -> Option<super::SourceError> {
+  if fs_type_is_local(f_type) {
+    return None;
+  }
+  let message = if fs_type_is_remote(f_type) {
+    "network and virtual filesystems deliver no reliable events"
+  } else {
+    "the filesystem type is not a known-local one; the Linux backends cannot \
+     prove it reports every mutation"
+  };
+  Some(super::SourceError::RootUnavailable {
+    root: root.to_path_buf(),
+    source: std::io::Error::new(std::io::ErrorKind::Unsupported, message),
+  })
+}
+
+/// The exclusion predicate, re-exported at the name the Linux backends have
+/// always called it by. Its definition now lives beside the rule it defers to
+/// ([`crate::driver::excluded`]) because the cross-platform core enforces off the
+/// same function — one definition, so the backend fence and the common-layer
+/// fence cannot drift apart.
+pub(crate) use crate::driver::excluded;
 
 /// Unescapes one `/proc/self/mountinfo` field: the kernel encodes space, tab,
 /// newline, and backslash as `\ooo` octal triples.
@@ -385,10 +501,12 @@ impl Source {
   /// canonicalize). Every decision that commits live kernel state then grounds on
   /// that fd, never on the pathname again:
   ///
-  /// - the locality/remote gate (design §5 row 1) is [`fstatfs`](rustix::fs::fstatfs)
-  ///   on the pin — a network/virtual filesystem reports only local VFS activity,
-  ///   so every backend refuses it identically, and a transient mount/symlink swap
-  ///   can no longer smuggle a remote fs past the gate;
+  /// - the locality gate (design §5 row 1) is [`fstatfs`](rustix::fs::fstatfs)
+  ///   on the pin, decided by the ALLOWLIST [`fs_type_is_local`] — a filesystem
+  ///   served from elsewhere reports only local VFS activity, so every backend
+  ///   refuses it identically, an unrecognized filesystem is refused too rather
+  ///   than assumed local, and a transient mount/symlink swap can no longer
+  ///   smuggle either past the gate;
   /// - the fanotify `FAN_MARK_FILESYSTEM` mark is installed fd-relative on the pin
   ///   (`fanotify_mark(ffd, …, pin_fd, NULL)`), so it marks the superblock of the
   ///   object the pin refers to — a path swap for THIS one call can no longer mark
@@ -425,14 +543,8 @@ impl Source {
     // would surface a confusing `NOSYS` on 32-bit — and refuse a pre-4.11 kernel
     // outright. fanotify's 5.17 floor never trips this.
     require_statx(root_fd.as_fd(), &canonical)?;
-    if root_is_remote(&root_fd, &canonical)? {
-      return Err(super::SourceError::RootUnavailable {
-        root: canonical,
-        source: std::io::Error::new(
-          std::io::ErrorKind::Unsupported,
-          "network and virtual filesystems deliver no reliable events",
-        ),
-      });
+    if let Some(refusal) = locality_refusal(root_fs_type(&root_fd, &canonical)?, &canonical) {
+      return Err(refusal);
     }
 
     match config.backend {
@@ -462,14 +574,8 @@ impl Source {
       })?;
     let root_fd = pin_root(&canonical)?;
     require_statx(root_fd.as_fd(), &canonical)?;
-    if root_is_remote(&root_fd, &canonical)? {
-      return Err(super::SourceError::RootUnavailable {
-        root: canonical,
-        source: std::io::Error::new(
-          std::io::ErrorKind::Unsupported,
-          "network and virtual filesystems deliver no reliable events",
-        ),
-      });
+    if let Some(refusal) = locality_refusal(root_fs_type(&root_fd, &canonical)?, &canonical) {
+      return Err(refusal);
     }
     let stat = rustix::fs::fstat(&root_fd).map_err(|err| super::SourceError::RootUnavailable {
       root: canonical.clone(),
@@ -482,7 +588,7 @@ impl Source {
       })?;
     let identity = super::RootIdentity::new(stat.st_dev, stat.st_ino.into());
     let mounts = mounts_under(&canonical).unwrap_or_default();
-    let ancestors = ancestor_identities(&canonical)?;
+    let ancestors = ancestor_identities(&canonical, identity)?;
     Ok(super::RootMeta {
       root: canonical,
       root_dev: stat.st_dev,
@@ -691,12 +797,15 @@ fn open_no_symlinks(path: &Path, final_flags: OFlags) -> Result<OwnedFd, rustix:
   Ok(current)
 }
 
-/// Whether the pinned root lives on a refused remote/virtual filesystem — the
-/// shared locality gate every backend passes through the dispatcher (design §5
-/// row 1), read from the PINNED fd so a mount/symlink swap cannot smuggle a
-/// remote fs past it (a path `statfs` here would race the same window the mark
-/// once did). `StatFs.f_type` is the same `__fsword_t` field the denylist keys on
-/// (`REMOTE_FS_MAGICS`), so the magic-number comparison is unchanged.
+/// The superblock type of the PINNED root — the input to the shared locality
+/// gate every backend passes through the dispatcher (design §5 row 1), read from
+/// the pin so a mount/symlink swap cannot smuggle another filesystem past it (a
+/// path `statfs` here would race the same window the mark once did).
+/// `StatFs.f_type` is the `__fsword_t` field [`fs_type_is_local`] keys on.
+///
+/// Reading the type and deciding on it are separate so the DECISION
+/// ([`locality_refusal`]) is a pure, row-testable function while the syscall
+/// stays the only fd-touching part — the same split the `statx` floor gate makes.
 ///
 /// The seed fsid the fanotify FID map needs is a SEPARATE `fstatfs` on the same
 /// pin (rustix hides `StatFs::f_fsid` behind a private field, so the fsid must be
@@ -704,12 +813,12 @@ fn open_no_symlinks(path: &Path, final_flags: OFlags) -> Result<OwnedFd, rustix:
 /// disagree about which object they saw: both name the pin, and no path is
 /// resolved in either, so no swap can land between them.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn root_is_remote(root_fd: &OwnedFd, canonical: &Path) -> Result<bool, super::SourceError> {
+fn root_fs_type(root_fd: &OwnedFd, canonical: &Path) -> Result<i64, super::SourceError> {
   let stat = rustix::fs::fstatfs(root_fd).map_err(|err| super::SourceError::RootUnavailable {
     root: canonical.to_path_buf(),
     source: err.into(),
   })?;
-  Ok(fs_type_is_remote(stat.f_type as i64))
+  Ok(stat.f_type as i64)
 }
 
 /// The inotify floor gate: refuses a kernel that cannot RUN `statx` (Linux 4.11,
@@ -792,66 +901,118 @@ fn statx_unavailable(errno: rustix::io::Errno) -> bool {
   )
 }
 
-/// The identities of every strict ancestor of the canonical root — the
-/// containment evidence `final_root_conflict` decides root disjointness on
-/// (is this root inside a live one, or a live one inside it, under ANY spelling).
-/// Shared by both Linux backends' post-live bracket.
+/// The COHERENT post-live containment snapshot of `canonical`: the identities of
+/// every strict ancestor, taken from one retained fd chain that ends on the root
+/// itself and is REQUIRED to still be `expected`.
 ///
-/// Each ancestor is PINNED before its identity is read: `openat2` with
-/// `RESOLVE_NO_SYMLINKS` and `O_PATH | O_NOFOLLOW | O_DIRECTORY` (the same
-/// object-grounding the arm anchors use), then `fstat` on that fd — never a bare
-/// path stat. `canonicalize` left the ancestor chain symlink-free, so the
-/// no-symlink open succeeds on the honest chain and fails (`ELOOP`) only if a
-/// symlink was swapped in for an ancestor after canonicalization, which is
-/// surfaced as [`RootUnavailable`](super::SourceError::RootUnavailable) rather than
-/// silently recording a swapped-in object's identity as an ancestor. `O_PATH`
-/// needs only search permission (like the previous `metadata`), so a normal
-/// search-but-not-read ancestor still resolves.
+/// The ancestors are the containment evidence `final_root_conflict` decides root
+/// disjointness on (is this root inside a live one, or a live one inside it,
+/// under ANY spelling). Shared by both Linux backends' post-live bracket.
 ///
-/// This runs in the inotify spawn's post-live bracket AFTER the reader is live, so
-/// it shares [`pin_root`]'s kernel floor: `openat2` is pre-5.6, but inotify's floor
-/// is Linux 4.11, so on `ENOSYS` each ancestor falls back to the SAME component walk
-/// [`open_no_symlinks`] the pin uses (final flags `O_PATH | O_DIRECTORY`, search
-/// permission). Without this fallback a 4.11–5.5 kernel would pin the root by the
-/// walk, start the reader, then die `RootUnavailable` one call later — the floor
-/// broken end to end rather than per-call-site.
+/// # One walk, or the tuple is a forgery
 ///
-/// Grounding this matters because the identities gate a TRUST decision (admitting
-/// or refusing a second overlapping watch); a corrupted ancestor could only ever
-/// mis-decide THAT — never redirect the live source, whose object is the pin — but
-/// the objects-not-paths discipline still leaves no path-stat feeding a trust
-/// decision unpinned.
+/// The root identity, the reported root pathname and the ancestor chain are one
+/// claim — "object `R` is reachable at this pathname, inside these directories" —
+/// so they have to come out of ONE resolution. Sampling ancestors independently
+/// after a separate root check does not: between the two, an adversary with
+/// rename rights can atomically EXCHANGE two real parent directories
+/// (`renameat2(RENAME_EXCHANGE)`, no symlink involved, so every no-symlink fence
+/// passes), leaving the checked root `R` reachable only at the OTHER pathname
+/// while the sampled chain describes the replacement's parents. The published
+/// tuple then anchors a live source's events on a pathname that denotes a
+/// different object, and its ancestor identities can make a genuinely overlapping
+/// second root look disjoint.
+///
+/// So this walks the chain ONCE, top down, opening each component RELATIVE to the
+/// fd of the one above it (`openat`, `O_NOFOLLOW` per hop — the same no-symlink
+/// guarantee `RESOLVE_NO_SYMLINKS` gives, per component) and reading each
+/// identity by `fstat` on the fd it just opened, never by a bare path stat. The
+/// LAST hop opens the root itself from its parent's retained fd, and its identity
+/// must equal `expected` — the identity the pin, the mark and the seed all
+/// grounded on. That single equality is what makes the chain evidence rather than
+/// a coincidence:
+///
+/// - an exchange landing BEFORE the walk reaches the parent resolves the last hop
+///   to the replacement object, which is not `expected`, and the spawn is refused
+///   [`RootReplaced`](super::SourceError::RootReplaced);
+/// - an exchange landing AFTER it cannot affect the walk at all — an fd names an
+///   object, not a name, so the retained parent still opens the true root, and the
+///   recorded chain is exactly the chain that contained `expected` at walk time.
+///
+/// There is no third case, which is the point: a mixed tuple is unreachable by
+/// construction instead of unlikely.
+///
+/// `canonicalize` left the chain symlink-free, so the per-hop `O_NOFOLLOW`
+/// succeeds on the honest chain and fails (`ELOOP`) only if a symlink was swapped
+/// in after canonicalization — surfaced as
+/// [`RootUnavailable`](super::SourceError::RootUnavailable) rather than silently
+/// recording a swapped-in object as an ancestor. `O_PATH` needs only search
+/// permission, so a normal search-but-not-read ancestor still resolves.
+///
+/// The component walk needs no `openat2`, so unlike the pin there is no kernel
+/// floor to degrade across here: the one path runs from Linux 4.11 up.
+///
+/// Ancestors come back DEEPEST FIRST (`Path::ancestors().skip(1)` order): the
+/// walk collects top down and reverses, so callers see the order they always did.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn ancestor_identities(canonical: &Path) -> Result<Vec<super::RootIdentity>, super::SourceError> {
-  let final_flags = OFlags::PATH
+fn ancestor_identities(
+  canonical: &Path,
+  expected: super::RootIdentity,
+) -> Result<Vec<super::RootIdentity>, super::SourceError> {
+  use std::path::Component;
+
+  let flags = OFlags::PATH
     .union(OFlags::NOFOLLOW)
     .union(OFlags::DIRECTORY)
     .union(OFlags::CLOEXEC);
-  let mut ancestors = Vec::new();
-  for ancestor in canonical.ancestors().skip(1) {
-    let unavailable = |err: rustix::io::Errno| super::SourceError::RootUnavailable {
-      root: ancestor.to_path_buf(),
+  let unavailable = |at: &Path| {
+    let at = at.to_path_buf();
+    move |err: rustix::io::Errno| super::SourceError::RootUnavailable {
+      root: at.clone(),
       source: err.into(),
+    }
+  };
+
+  // The anchor: the filesystem root for an absolute path (canonicalize always
+  // yields one), else the cwd. "/" is never a symlink, so opening it NOFOLLOW is
+  // safe.
+  let has_root = canonical.has_root();
+  let anchor = if has_root { c"/" } else { c"." };
+  let mut current = rustix::fs::openat(rustix::fs::CWD, anchor, flags, rustix::fs::Mode::empty())
+    .map_err(unavailable(canonical))?;
+
+  // Every hop's identity, top down, INCLUDING the anchor and the root itself; the
+  // strict ancestors are everything but the last, reversed at the end.
+  let mut chain = Vec::new();
+  let stat = rustix::fs::fstat(&current).map_err(unavailable(canonical))?;
+  chain.push(super::RootIdentity::new(stat.st_dev, stat.st_ino.into()));
+
+  let mut walked = std::path::PathBuf::from(if has_root { "/" } else { "." });
+  for component in canonical.components() {
+    let Component::Normal(name) = component else {
+      // RootDir / CurDir are the anchor, already opened; a canonical path carries
+      // no `.` or `..`, and a Prefix is Windows-only.
+      continue;
     };
-    let fd = match rustix::fs::openat2(
-      rustix::fs::CWD,
-      ancestor,
-      final_flags,
-      rustix::fs::Mode::empty(),
-      rustix::fs::ResolveFlags::NO_SYMLINKS,
-    ) {
-      Ok(fd) => fd,
-      // Pre-5.6 kernel with no `openat2`: pin the ancestor by the shared component
-      // walk, same no-symlink guarantee, same `O_PATH` final flags.
-      Err(rustix::io::Errno::NOSYS) => {
-        open_no_symlinks(ancestor, final_flags).map_err(unavailable)?
-      }
-      Err(err) => return Err(unavailable(err)),
-    };
-    let stat = rustix::fs::fstat(&fd).map_err(unavailable)?;
-    ancestors.push(super::RootIdentity::new(stat.st_dev, stat.st_ino.into()));
+    walked.push(name);
+    current = rustix::fs::openat(&current, name, flags, rustix::fs::Mode::empty())
+      .map_err(unavailable(&walked))?;
+    let stat = rustix::fs::fstat(&current).map_err(unavailable(&walked))?;
+    chain.push(super::RootIdentity::new(stat.st_dev, stat.st_ino.into()));
   }
-  Ok(ancestors)
+
+  // The closing equality: the object this ONE walk reached at `canonical` is the
+  // object the pin, the mark and the seed vouched for. Anything else means the
+  // pathname stopped denoting the watched root while the chain was being read, so
+  // the chain describes someone else's parents and the tuple must not publish.
+  let reached = chain.pop().expect("the anchor is always pushed");
+  if reached != expected {
+    return Err(super::SourceError::RootReplaced {
+      root: canonical.to_path_buf(),
+    });
+  }
+  chain.reverse();
+  Ok(chain)
 }
 
 /// The MOUNT id of the pinned root, read fd-relative via
@@ -907,8 +1068,10 @@ pub(crate) enum SourceHandle {
 
 #[cfg(all(target_os = "linux", not(miri)))]
 impl SourceHandle {
-  /// Stops the reader and closes the instance.
-  pub(crate) fn shutdown(self) {
+  /// Stops the reader and closes the instance, answering whether the teardown
+  /// PROVED the stream quiesced. Both Linux readers join, and a joined thread
+  /// is a proven one.
+  pub(crate) fn shutdown(self) -> super::Quiesce {
     match self {
       Self::Inotify(handle) => handle.shutdown(),
       Self::Fanotify(handle) => handle.shutdown(),
@@ -1043,6 +1206,23 @@ mod inotify_source {
       canonical: std::path::PathBuf,
       root_fd: BorrowedFd<'_>,
     ) -> Result<(SourceHandle, super::super::EventReceiver, RootMeta), SourceError> {
+      // The count is validated here; the SET is enforced one layer up, and that
+      // split is structural rather than an omission.
+      //
+      // A descending backend has no subtree-wide admission decision to hang an
+      // exclusion on: coverage is per directory, and the only way this source could
+      // decline to cover one is to refuse its arm. The Monitor reads every refused
+      // arm as coverage LOSS — it drops the node and emits a `Rescan` for exactly
+      // that location — so refusing the arms of an excluded subtree would answer
+      // "do not tell me about this" with a rescan naming it, which is worse than
+      // ignoring the option. fanotify has the decision (its FID map), and applies
+      // it; see `fanotify::source::descend`.
+      //
+      // So the enforcement sits where the ABSOLUTE path is known and the Monitor
+      // never learns of the entry at all — the cold enumerate's listing and the
+      // lowering of a live create, both in the common layer (`DriverCore`'s
+      // exclusion fence), off the SAME predicate this file's `excluded` re-exports.
+      // Nothing is left for this source to do but refuse an over-long set.
       if config.exclusions.len() > MAX_EXCLUSIONS {
         return Err(SourceError::TooManyExclusions {
           supplied: config.exclusions.len(),
@@ -1075,6 +1255,7 @@ mod inotify_source {
       let shared = Arc::new(ReaderShared {
         queue: queue_tx,
         transport: transport::TransportState::new(config.channel_capacity.get()),
+        buffer_bytes: config.os_buffer_bytes.get() as usize,
       });
 
       let fd = reader::create_instance()?;
@@ -1100,7 +1281,7 @@ mod inotify_source {
       let pinned = match rustix::fs::fstat(root_fd) {
         Ok(pinned) => pinned,
         Err(err) => {
-          handle.shutdown();
+          let _ = handle.shutdown();
           return Err(SourceError::RootUnavailable {
             root: canonical,
             source: err.into(),
@@ -1108,13 +1289,13 @@ mod inotify_source {
         }
       };
       if RootIdentity::new(pinned.st_dev, pinned.st_ino.into()) != identity {
-        handle.shutdown();
+        let _ = handle.shutdown();
         return Err(SourceError::RootReplaced { root: canonical });
       }
       let live = match fs::metadata(&canonical) {
         Ok(live) => live,
         Err(source) => {
-          handle.shutdown();
+          let _ = handle.shutdown();
           return Err(SourceError::RootUnavailable {
             root: canonical,
             source,
@@ -1122,17 +1303,17 @@ mod inotify_source {
         }
       };
       if !live.is_dir() {
-        handle.shutdown();
+        let _ = handle.shutdown();
         return Err(SourceError::NotADirectory { root: canonical });
       }
       if RootIdentity::new(live.dev(), live.ino().into()) != identity {
-        handle.shutdown();
+        let _ = handle.shutdown();
         return Err(SourceError::RootReplaced { root: canonical });
       }
-      let ancestors = match ancestor_identities(&canonical) {
+      let ancestors = match ancestor_identities(&canonical, identity) {
         Ok(ancestors) => ancestors,
         Err(err) => {
-          handle.shutdown();
+          let _ = handle.shutdown();
           return Err(err);
         }
       };
@@ -1394,8 +1575,16 @@ mod inotify_source {
     /// already admitted into an arm's `inotify_add_watch` against a wedged mount
     /// returns when the kernel says so and this waits exactly that long. The
     /// driver therefore never performs this join on its blocking pool.
-    pub(crate) fn shutdown(mut self) {
+    ///
+    /// Always [`Quiesce::Proven`], and the JOIN is what makes it so — including
+    /// when the reader unwound. The kernel owns nothing of this source's memory:
+    /// its reads are ordinary blocking reads into buffers the reader's own stack
+    /// holds, so a thread that has ended, however it ended, has ended the only
+    /// lifetime there was to observe. That is precisely what the Windows pumps
+    /// cannot say, and why they answer for themselves.
+    pub(crate) fn shutdown(mut self) -> super::super::Quiesce {
       self.teardown();
+      super::super::Quiesce::Proven
     }
 
     fn teardown(&mut self) {
@@ -1410,7 +1599,13 @@ mod inotify_source {
       self.port.wake.request_shutdown();
       let _ = self.port.control.send(Control::Shutdown);
       self.port.wake.wake();
-      let _ = thread.join();
+      // A join hands back the reader's panic payload exactly as `catch_unwind`
+      // does, and discarding it with `let _ =` DROPS it — running the panicking
+      // code's own destructor here, on the teardown worker, or in this handle's
+      // `Drop` on whatever thread released it. Retired inside a boundary instead.
+      if let Err(payload) = thread.join() {
+        let _ = tributary_proto::unwind::dispose_panic_payload(payload);
+      }
     }
   }
 

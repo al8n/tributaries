@@ -254,6 +254,7 @@ impl Source {
       root_mnt_id,
       root_fid,
       max_directories: config.max_map_directories,
+      exclusions: Arc::from(config.exclusions.clone()),
     };
     let mut map = FidMap::with_capacity(config.max_map_directories);
     // The SPAWN seed roots at the pin (a dup of it, consumed by the descent), so
@@ -278,6 +279,7 @@ impl Source {
     let shared = Arc::new(ReaderShared {
       queue: queue_tx,
       transport: transport::TransportState::new(config.channel_capacity.get()),
+      buffer_bytes: config.os_buffer_bytes.get() as usize,
       stats: Arc::clone(&stats),
     });
 
@@ -316,7 +318,7 @@ impl Source {
     let pinned = match fstat(root_fd) {
       Ok(pinned) => pinned,
       Err(err) => {
-        handle.shutdown();
+        let _ = handle.shutdown();
         return Err(SpawnFailure::Error(SourceError::RootUnavailable {
           root: canonical,
           source: err.into(),
@@ -324,7 +326,7 @@ impl Source {
       }
     };
     if RootIdentity::new(pinned.st_dev, pinned.st_ino.into()) != identity {
-      handle.shutdown();
+      let _ = handle.shutdown();
       return Err(SpawnFailure::Error(SourceError::RootReplaced {
         root: canonical,
       }));
@@ -332,7 +334,7 @@ impl Source {
     let live = match fs::metadata(&canonical) {
       Ok(live) => live,
       Err(source) => {
-        handle.shutdown();
+        let _ = handle.shutdown();
         return Err(SpawnFailure::Error(SourceError::RootUnavailable {
           root: canonical,
           source,
@@ -340,21 +342,29 @@ impl Source {
       }
     };
     if !live.is_dir() {
-      handle.shutdown();
+      let _ = handle.shutdown();
       return Err(SpawnFailure::Error(SourceError::NotADirectory {
         root: canonical,
       }));
     }
     if RootIdentity::new(live.dev(), live.ino().into()) != identity {
-      handle.shutdown();
+      let _ = handle.shutdown();
       return Err(SpawnFailure::Error(SourceError::RootReplaced {
         root: canonical,
       }));
     }
-    let ancestors = match super::super::ancestor_identities(&canonical) {
+    // The containment snapshot, taken LAST and taken COHERENTLY: one fd-relative
+    // walk that both records the ancestor identities and re-proves the pathname
+    // still reaches `identity`. This is the closing check of the post-live
+    // bracket, and it has to be, because the mark is already live: a pathname
+    // exchange landing after the two re-stats above would otherwise leave a
+    // public source whose seeded map anchors events on a name that now denotes a
+    // different object. A refusal here tears the live reader down before any
+    // receiver escapes this function.
+    let ancestors = match super::super::ancestor_identities(&canonical, identity) {
       Ok(ancestors) => ancestors,
       Err(err) => {
-        handle.shutdown();
+        let _ = handle.shutdown();
         return Err(SpawnFailure::Error(err));
       }
     };
@@ -460,6 +470,12 @@ pub(crate) struct ReseedContext {
   /// reseed folds to the terminal `Fatal` — never a multi-gigabyte map built
   /// blind.
   max_directories: Option<usize>,
+  /// The caller's exclusion directories, as supplied. Every walk this context
+  /// drives — the spawn seed, a post-loss reseed, a moved-in subtree — refuses to
+  /// map anything at or under one of them, which is how a kernel-recursive mark
+  /// honors an option the kernel itself has no notion of. Shared rather than
+  /// cloned because the reader keeps this context for the source's whole life.
+  exclusions: Arc<[std::path::PathBuf]>,
 }
 
 impl ReseedContext {
@@ -490,6 +506,7 @@ impl ReseedContext {
       self.fsid,
       self.root_dev,
       &self.root_fid,
+      &self.exclusions,
       self.max_directories,
     )
     .map_err(WalkError::into_io)
@@ -519,6 +536,7 @@ impl ReseedContext {
       self.fsid,
       self.root_dev,
       self.root_mnt_id,
+      &self.exclusions,
       self.max_directories,
     )
   }
@@ -553,7 +571,25 @@ impl ReseedContext {
     subtree_fid: &Fid,
     budget: Option<usize>,
   ) -> io::Result<Vec<SeedEntry>> {
-    subtree_walk(subtree, subtree_fid, self.fsid, self.root_dev, budget).map_err(WalkError::into_io)
+    subtree_walk(
+      subtree,
+      subtree_fid,
+      self.fsid,
+      self.root_dev,
+      &self.exclusions,
+      budget,
+    )
+    .map_err(WalkError::into_io)
+  }
+
+  /// The caller's exclusion directories — what every walk this context drives refuses
+  /// to map, and what the reader hands the admission classifier so the SAME set fences
+  /// the two boundary shapes no walk can reach: an event about the excluded directory
+  /// itself (its parent is mapped, so it would resolve) and a rename with an end inside
+  /// it. One list, one rule, applied both where the map is built and where it is
+  /// maintained.
+  pub(crate) fn exclusions(&self) -> &[std::path::PathBuf] {
+    &self.exclusions
   }
 }
 
@@ -570,6 +606,7 @@ impl ReseedContext {
       root_mnt_id: None,
       root_fid: Fid::new([0u8; 8], Box::from(&[0u8][..])),
       max_directories: None,
+      exclusions: Arc::from(Vec::new()),
     }
   }
 }
@@ -700,6 +737,7 @@ fn seed_walk(
   fsid: [u8; 8],
   root_dev: u64,
   expected: &Fid,
+  exclusions: &[std::path::PathBuf],
   max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
@@ -731,7 +769,15 @@ fn seed_walk(
   // held.
   let fence_mnt_id =
     root_mount_id(root_fd.as_fd()).map_err(|err| WalkError::Incomplete(err.into()))?;
-  seed_from_fd(root_fd, root, fsid, root_dev, fence_mnt_id, max_directories)
+  seed_from_fd(
+    root_fd,
+    root,
+    fsid,
+    root_dev,
+    fence_mnt_id,
+    exclusions,
+    max_directories,
+  )
 }
 
 /// Seeds the map from an ALREADY-PINNED root fd, producing a [`SeedEntry`] per
@@ -795,6 +841,7 @@ fn seed_from_fd(
   fsid: [u8; 8],
   root_dev: u64,
   fence_mnt_id: Option<u64>,
+  exclusions: &[std::path::PathBuf],
   max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The root anchor is load-bearing: without its handle the map has no base to
@@ -824,9 +871,11 @@ fn seed_from_fd(
   descend(
     root_fd,
     root_fid,
+    root,
     fsid,
     root_dev,
     fence_mnt_id,
+    exclusions,
     max_directories,
     &mut seed,
   )?;
@@ -866,6 +915,7 @@ fn subtree_walk(
   subtree_fid: &Fid,
   fsid: [u8; 8],
   root_dev: u64,
+  exclusions: &[std::path::PathBuf],
   budget: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The moved directory is still in-map and pending its walk, so pinning it must
@@ -899,9 +949,11 @@ fn subtree_walk(
   descend(
     subtree_fd,
     subtree_fid.clone(),
+    subtree,
     fsid,
     root_dev,
     fence_mnt_id,
+    exclusions,
     budget,
     &mut seed,
   )?;
@@ -919,6 +971,11 @@ struct WalkDir {
   reader: Dir,
   /// This directory's FID, the parent link for every child discovered here.
   fid: Fid,
+  /// This directory's absolute path, carried so the exclusion fence can name each
+  /// child. Built by joining names onto the walk root, which is exactly how the
+  /// map itself resolves a node — so a path the fence tests is the same path a
+  /// delivered event would report.
+  path: std::path::PathBuf,
 }
 
 /// The shared iterative descent: reads `root_fd` (an already-pinned, already-FID'd
@@ -988,9 +1045,11 @@ struct WalkDir {
 fn descend(
   root_fd: OwnedFd,
   root_fid: Fid,
+  root_path: &Path,
   fsid: [u8; 8],
   root_dev: u64,
   fence_mnt_id: Option<u64>,
+  exclusions: &[std::path::PathBuf],
   budget: Option<usize>,
   seed: &mut Vec<SeedEntry>,
 ) -> Result<(), WalkError> {
@@ -1003,6 +1062,7 @@ fn descend(
   let mut stack = vec![WalkDir {
     reader: root_reader,
     fid: root_fid,
+    path: root_path.to_path_buf(),
   }];
 
   while let Some(level) = stack.last_mut() {
@@ -1027,6 +1087,18 @@ fn descend(
     // and must be dropped: `openat(parent_fd, "..")` would climb OUT of the pinned
     // subtree, and `openat(parent_fd, ".")` would re-open the parent and loop.
     if name == c"." || name == c".." {
+      continue;
+    }
+    // The EXCLUSION fence. An exclusion is the caller's instruction not to report a
+    // subtree, and on a kernel-recursive mark the only way to honor it is to keep
+    // the subtree OUT OF THE ADMISSION MAP: the mark covers the whole superblock, so
+    // an excluded directory that is mapped admits every event under it forever.
+    // Skipped here means never seeded and never descended, so no event under it can
+    // resolve — and nothing below it can ever be learned live either, because a
+    // later create's parent FID is not in the map. That is the load-shedding the
+    // option promises, not just a filter at the exit.
+    let child_path = level.path.join(os_name(name));
+    if super::super::excluded(exclusions, &child_path) {
       continue;
     }
     // `d_type` is ADVISORY: a filesystem may report `DT_UNKNOWN`, and a stale
@@ -1161,7 +1233,11 @@ fn descend(
     // it — one open per directory, not two). A failure to build the reader hides
     // the child's own children, so it is Incomplete like any in-root read failure.
     let reader = Dir::new(child_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
-    stack.push(WalkDir { reader, fid });
+    stack.push(WalkDir {
+      reader,
+      fid,
+      path: child_path,
+    });
   }
   Ok(())
 }
@@ -1245,8 +1321,16 @@ impl SourceHandle {
 
   /// Stops the reader and closes the instance. The reader exits at its next
   /// wake, so this blocks for at most one in-flight read + decode.
-  pub(crate) fn shutdown(mut self) {
+  ///
+  /// Always [`Quiesce`](crate::os::Quiesce)`::Proven`, and the JOIN inside
+  /// [`teardown`](Self::teardown) is what makes it so — including when the
+  /// reader unwound. The kernel owns nothing of this source's memory: its reads
+  /// are ordinary blocking reads into buffers the reader's own stack holds, so
+  /// a thread that has ended, however it ended, has ended the only lifetime
+  /// there was to observe.
+  pub(crate) fn shutdown(mut self) -> crate::os::Quiesce {
     self.teardown();
+    crate::os::Quiesce::Proven
   }
 
   fn teardown(&mut self) {
@@ -1255,7 +1339,13 @@ impl SourceHandle {
     };
     let _ = self.control.send(Control::Shutdown);
     self.wake.wake();
-    let _ = thread.join();
+    // A join hands back the reader's panic payload exactly as `catch_unwind` does,
+    // and discarding it with `let _ =` DROPS it — running the panicking code's own
+    // destructor here, on the teardown worker, or in this handle's `Drop` on
+    // whatever thread released it. Retired inside a boundary instead.
+    if let Err(payload) = thread.join() {
+      let _ = tributary_proto::unwind::dispose_panic_payload(payload);
+    }
   }
 }
 

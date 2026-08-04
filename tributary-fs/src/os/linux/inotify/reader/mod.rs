@@ -70,6 +70,9 @@ pub(crate) struct ReaderShared {
   pub(crate) queue: async_channel::Sender<crate::os::SourceMessage>,
   /// The batch budget and signal dedups.
   pub(crate) transport: transport::TransportState,
+  /// How many bytes one `read` of the instance may take, from the configured
+  /// native buffer size.
+  pub(crate) buffer_bytes: usize,
 }
 
 /// One arm or disarm inside a control batch. Emission order is preserved: a
@@ -328,7 +331,7 @@ fn rebuild_instance_with(
 /// read error stops the drain rather than killing the stream: the fd is
 /// being replaced, and the loss covers whatever the error hid.
 fn drain_before_swap(instance: &mut Instance, shared: &ReaderShared) {
-  let mut buf = vec![0u8; 64 * 1024];
+  let mut buf = vec![0u8; shared.buffer_bytes];
   for _ in 0..MAX_SWAP_DRAIN_READS {
     let n = match rustix::io::read(&instance.fd, &mut *buf) {
       Ok(0) | Err(Errno::AGAIN) => break,
@@ -642,7 +645,13 @@ pub(crate) fn start(
       let outcome = catch_unwind(AssertUnwindSafe(|| {
         run(fd, &wake, &control, &shared);
       }));
-      if outcome.is_err() {
+      // The payload is retired inside its own boundary. Dropped as this closure
+      // returns, one whose own `Drop` panics would unwind the thread body after the
+      // terminal below was already sent — and `shutdown` then JOINS this thread, so
+      // that payload would land on the teardown worker, which is the executor the
+      // whole teardown contract is built to keep unbounded and unguarded work off.
+      if let Err(payload) = outcome {
+        let _ = tributary_proto::unwind::dispose_panic_payload(payload);
         signal_fatal(&shared, SourceError::CallbackPanic);
       }
     })
@@ -688,8 +697,9 @@ fn signal_fatal(shared: &ReaderShared, err: SourceError) {
 fn run(fd: OwnedFd, wake: &WakeState, control: &mpsc::Receiver<Control>, shared: &ReaderShared) {
   let mut instance = Instance::new(fd);
   // Sized for a dense read: watchman's batch scale (16k events of header
-  // size) is far past what one wake needs; 64 KiB covers the deepest names.
-  let mut buf = vec![0u8; 64 * 1024];
+  // size) is far past what one wake needs, and the 64 KiB default covers the
+  // deepest names.
+  let mut buf = vec![0u8; shared.buffer_bytes];
   loop {
     // Announce the intent to block, then re-drain control BEFORE polling: a
     // sender that enqueued before our fence is guaranteed visible here (the

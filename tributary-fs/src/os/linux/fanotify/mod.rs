@@ -42,7 +42,10 @@ pub(crate) mod map;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+  collections::BTreeMap,
+  path::{Path, PathBuf},
+};
 
 pub(crate) use fid::{FanMask, RawFanotifyEvent};
 use fid::{Fid, RenameInfo};
@@ -157,6 +160,12 @@ pub(crate) enum Admission {
   /// admitted FID), or a directory's own name-less `MOVE_SELF` (a self-move rescan;
   /// the moved node is re-parented by its rename/dirent, not here). Forward the
   /// resolved path. REQUIRES an admitted addressing FID and — for a dirent — a name.
+  ///
+  /// This also carries the ONE merged mask the universal gate exempts (a plain file's
+  /// create+delete, [`map_neutral_merge`]): map-neutral like every other member, but
+  /// verb-ambiguous, which compile resolves by lowering it to a located `Rescan`
+  /// rather than a record. Admission asks only whether the map is safe; the record
+  /// vocabulary is the lowering's question.
   Forward(AdmittedEvent),
   /// A new in-root child directory `learn`ed into the map (ALREADY applied), then
   /// forwarded — an `ONDIR` create. REQUIRES dir_fid (admitted) + name + the
@@ -171,9 +180,11 @@ pub(crate) enum Admission {
   ForgetDir(AdmittedEvent),
   /// A `FAN_RENAME` resolved and its map self-maintenance applied (in-root
   /// re-parent / move-out `forget` / move-in `learn`). `seed` is the moved
-  /// directory's FID when it arrived from OUTSIDE the root and the reader must walk
-  /// its pre-existing descendants in before forwarding (`None` for an in-root
-  /// re-parent, a move-out, or a file/boundary rename). REQUIRES both halves (+
+  /// directory's FID when the reader must walk its descendants in before forwarding —
+  /// it arrived from OUTSIDE the root, or it was re-parented across a change in
+  /// exclusion geometry ([`exclusion_geometry_changed`]) that makes the map's picture
+  /// of the subtree disagree with the fence's. `None` for a geometry-preserving
+  /// in-root re-parent, a move-out, or a file/boundary rename. REQUIRES both halves (+
   /// `target_fid` when `ONDIR`, else → [`Lossy`](Self::Lossy)).
   ///
   /// The move-in `seed` carries the moved FID, NOT a captured path: the reader
@@ -204,15 +215,41 @@ pub(crate) enum Admission {
   /// superblock-firehose filter — a clean drop, never a loss, so the sb's constant
   /// foreign self/attrib traffic never reseeds.
   ForeignDrop,
+  /// Outside the REPORTED tree — the root MINUS the caller's exclusions: NO path
+  /// the event names lies in that tree (each is either at or under an exclusion,
+  /// or off the watched root entirely), NO object it acts on is one the map holds
+  /// inside that tree, and the event cannot be the root's own death. Decided by
+  /// [`fence`] at the
+  /// TOP of [`classify`] — ahead of the multi-structural gate and ahead of every
+  /// shape dispatch — so the action never runs and the map is provably untouched:
+  /// no `learn`, no `learn_moved_in`, no re-parent, no `forget`, no move-in
+  /// subtree walk, and no orphan eviction. That ordering is the whole point. An
+  /// exclusion is a load-shedding instruction, so an excluded subtree must cost
+  /// the source NOTHING; classifying first and suppressing afterwards let live
+  /// creates and populated move-ins under an excluded path grow the admission map
+  /// until it hit [`FidMap::over_capacity`](map::FidMap::over_capacity) and killed
+  /// the source, dropping coverage for every subscription that had nothing to do
+  /// with the exclusion.
+  ///
+  /// A clean drop like [`ForeignDrop`](Self::ForeignDrop), never a loss: the
+  /// event mutated nothing, so no co-batched neighbour can misresolve because of
+  /// it and there is nothing for a reseed to repair. That last clause is a
+  /// PROPERTY OF THE OBJECT, not of the paths — which is why the fence proves it
+  /// separately ([`affects_reported_object`]) instead of inferring it from the
+  /// paths being unreported.
+  ExcludedDrop,
   /// The buffer must take the ordered `Overflow` barrier (reseed + covering rescan),
   /// for one of two reasons, both decided AT the action rather than by a separate
   /// decode matrix:
   ///
   /// - an ADMITTED event whose merged mask names two or more structural verbs (the
   ///   kernel merges consecutive events for one object — a directory renamed AND
-  ///   deleted, a create+delete of one name, a delete_self+move_self of one object) is
-  ///   AMBIGUOUS: no single tree mutation is correct, and the universal gate in
-  ///   [`classify`] routes it here before any shape can apply a one-sided mutation; OR
+  ///   deleted, a delete_self+move_self of one object) is AMBIGUOUS: no single tree
+  ///   mutation is correct, and the universal gate in [`classify`] routes it here
+  ///   before any shape can apply a one-sided mutation. The ONE exception is the
+  ///   MAP-NEUTRAL merge ([`map_neutral_merge`]) — a plain file's create+delete under
+  ///   an admitted parent, which mutates no node at all and so is [`Forward`](Self::Forward)ed
+  ///   for compile to cover with a located `Rescan`; OR
   /// - the single action the mask names needs a field the event does not carry (a
   ///   named dirent with no/empty name; a directory create/delete/move/rename with no
   ///   child `target_fid`) — a missing field would silently mishandle the map.
@@ -264,11 +301,38 @@ pub(crate) enum Admission {
 /// FID-only shape) to every mask: the root death is now just the name-less shape whose
 /// resolved self-object is the map's root anchor, and the same uniform admittance that
 /// saves it saves every other admitted-FID event too.
+///
+/// The EXCLUSION fence runs FIRST, ahead of even the multi-structural gate
+/// ([`fence`]): an event that names NO path in the reported tree AND acts on no object
+/// the map holds inside it is [`Admission::ExcludedDrop`] before any shape can learn,
+/// re-parent, forget, or hand the reader a subtree to walk. Deciding it here — rather
+/// than suppressing the forwarded event at the seam — is what keeps excluded churn from
+/// growing the admission map at all, and it is safe to place ahead of the ambiguity gate
+/// precisely because the drop mutates nothing: the barrier exists to stop an ambiguous
+/// event from staling the map its buffer-mates resolve through, and an event the fence
+/// never classifies cannot stale anything.
+///
+/// The fence's OTHER verdict is why that placement stays honest. An event whose paths are
+/// all unreported may still be about an object the map holds AT A REPORTED PATH, and
+/// dropping THAT strands the map's picture of a subtree the event destroyed or moved. So
+/// the fence answers [`Admission::Lossy`] for it — the same barrier the multi-structural
+/// gate and every shape's missing-field arm take — rather than a clean drop it has not
+/// earned. The fence stays FIRST and READ-ONLY either way: the barrier is a verdict, not
+/// a mutation, and taking it here instead of after the gate keeps the "a fenced event
+/// never classifies" property that makes the whole ordering sound.
 pub(crate) fn classify(
   map: &mut FidMap,
   event: &RawFanotifyEvent,
   memo: &mut MemoBatch,
+  exclusions: &[PathBuf],
 ) -> Admission {
+  // THE EXCLUSION fence, ahead of every mutation site in this function. Read-only
+  // (`resolve_path`, never `admit`), so the decision is made against the map state the
+  // shapes will act on and nothing is mutated to reach it.
+  if let Some(fenced) = fence(map, event, exclusions) {
+    return fenced;
+  }
+
   // THE UNIVERSAL multi-structural gate — the ONE place the ambiguity guard lives, and
   // EVERY event shape passes through it before the rename-vs-dirent-vs-nameless
   // dispatch below. A merged bitmask naming two or more structural verbs (man 7
@@ -289,12 +353,23 @@ pub(crate) fn classify(
   // check. A fully-foreign multi-structural event (no carried FID in-root) flows to the
   // dispatch and `ForeignDrop`s through its shape's own membership gate, so the superblock
   // firehose's constant foreign multi-structural traffic never reseeds.
-  if event.mask.multi_structural() && addresses_in_root(map, event) {
+  //
+  // The ONE merge exempted is the provably MAP-NEUTRAL one
+  // ([`map_neutral_merge`]) — a plain file's create+delete under an admitted
+  // parent, which no verb in the mask can mutate the map from. The barrier's
+  // whole rationale is that a map staled by the ambiguous event misresolves its
+  // CO-BATCHED neighbours, so where nothing can be staled it buys nothing and
+  // costs every unrelated event in the same read. Its residual ambiguity is one
+  // NAME's verb, and compile covers exactly that name with a located `Rescan`.
+  if event.mask.multi_structural()
+    && addresses_in_root(map, event)
+    && !map_neutral_merge(map, event)
+  {
     return Admission::Lossy;
   }
 
   if let Some(rename) = &event.rename {
-    return classify_rename(map, event, rename, memo);
+    return classify_rename(map, event, rename, memo, exclusions);
   }
 
   // A named event addresses a CHILD under its parent directory (`dir_fid`); a
@@ -306,6 +381,328 @@ pub(crate) fn classify(
     Some(name) => classify_dirent(map, event, name, memo),
     None => classify_nameless(map, event, memo),
   }
+}
+
+/// The EXCLUSION fence: the verdict for an event the caller asked to hear nothing about,
+/// or `None` when the event belongs to the reported tree and must classify normally. Made
+/// READ-ONLY and BEFORE any map mutation, at the top of [`classify`].
+///
+/// Suppression is TWO questions, not one, and conflating them is what let an unrelated
+/// exclusion silence a required barrier:
+///
+/// 1. does the event name any path in the reported tree ([`names_no_reported_path`])? and
+/// 2. does it act on any OBJECT the map holds in the reported tree
+///    ([`affects_reported_object`])?
+///
+/// A path an event names and the object it acts on are different things, and a fanotify
+/// event routinely reports one without reporting the other: a dirent names
+/// `<parent>/<name>` but acts on the child its `target_fid` identifies, and a
+/// `FAN_RENAME` names its two endpoint paths but acts on the moved object its
+/// `target_fid` identifies. When the endpoints resolve nothing — the parents are off the
+/// watched root — the FIRST question answers "no path is reported" while the object the
+/// event destroys or relocates is an admitted directory sitting at a perfectly reportable
+/// path. Answering only the first question dropped that event as excluded churn, and the
+/// map kept resolving the departed subtree at its stale path: later events under it were
+/// misdelivered under names that no longer exist, and the nodes went on consuming the
+/// admission cap the exclusion exists to protect. Worse, the outcome DEPENDED on an
+/// exclusion that had nothing to do with the event — with no exclusions at all the same
+/// event correctly took the loss barrier through the action-aware multi-structural gate
+/// or [`classify_foreign_parent`].
+///
+/// So the fence suppresses only what it can suppress for FREE. With no reported path and
+/// no reported object, the drop is free exactly as [`Admission::ForeignDrop`] is: nothing
+/// was mutated, nothing is stale, nothing is owed. With no reported path but a REPORTED
+/// OBJECT, the drop is not free — the map's picture of that object is now unproven — and
+/// the fence answers [`Admission::Lossy`]. It cannot answer anything else: forwarding
+/// would hand the lowering only unreported paths to name, and mutating the map here would
+/// break the read-only ordering the fence's placement depends on. The barrier drops the
+/// buffer, reseeds the map through the WALK fence (which re-applies the exclusions), and
+/// covers the scope with one `Overflow` — coverage-honest, and never a terminal.
+///
+/// The cap guarantee survives because excluded CHURN acts on objects the map does not
+/// hold: a create's child is new, and a subtree moved in from outside the root is
+/// unmapped by construction. Those stop at [`FidMap::contains`](map::FidMap::contains) —
+/// one hash lookup, no path built — and still drop clean, so an excluded subtree still
+/// costs the source nothing. What newly takes the barrier is only the case where the map
+/// itself says an admitted, reportable object was destroyed.
+fn fence(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[PathBuf]) -> Option<Admission> {
+  // Exclusions are rare and this runs per decoded event: answer the empty set without
+  // resolving anything. With no exclusions the fence has no opinion at all, so the
+  // action is bit-for-bit what it was before exclusions existed.
+  if exclusions.is_empty() {
+    return None;
+  }
+  // The root's own death outranks every exclusion, including one covering the watched
+  // root itself.
+  if reports_root_death(map, event) {
+    return None;
+  }
+  if !names_no_reported_path(map, event, exclusions) {
+    return None;
+  }
+  // Every path the event NAMES is outside the reported tree. That is not yet a licence to
+  // drop it: the object it ACTS ON is a separate question, and an admitted one at a
+  // reported path makes this event destructive to state the map holds rather than merely
+  // unreported. Take the barrier for it and let the reseed rebuild the truth.
+  if affects_reported_object(map, event, exclusions) {
+    return Some(Admission::Lossy);
+  }
+  Some(Admission::ExcludedDrop)
+}
+
+/// Whether any FID `event` carries for the OBJECT it acts on — as opposed to the
+/// directories it merely addresses THROUGH — resolves to a path inside the reported tree.
+///
+/// This is the fence's second question, and the one that keeps an exclusion from changing
+/// the outcome of an event it does not describe. "The map holds this object at a reported
+/// path" is decided by the map, not by the paths the event happened to name: the event's
+/// endpoints can be entirely off the watched root while `target_fid` names a directory the
+/// seed walk mapped under the root.
+///
+/// Ordered so the hot path is one hash lookup: [`FidMap::contains`](map::FidMap::contains)
+/// answers membership WITHOUT building a path, and every shape of ordinary excluded churn
+/// — a create under an excluded name, a populated move-in from outside the root landing on
+/// one — acts on an object the map does not hold, so it stops there. Only a hit pays the
+/// [`FidMap::resolve_path`](map::FidMap::resolve_path) walk and the exclusion match, which
+/// together decide "reported" by the SAME [`super::excluded`] predicate everything else
+/// uses. An object the map holds at an EXCLUDED path (a state the walk fence makes
+/// unreachable) is correctly not reported, so a self-event on it still drops clean.
+fn affects_reported_object(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[PathBuf]) -> bool {
+  affected_object_fids(event).any(|fid| {
+    map.contains(fid)
+      && map
+        .resolve_path(fid)
+        .is_some_and(|path| !super::excluded(exclusions, &path))
+  })
+}
+
+/// The FIDs naming the OBJECT(s) an event acts on, in every shape it can arrive in.
+///
+/// `target_fid` is the affected object in all three shapes — a dirent's child, a
+/// `FAN_RENAME`'s moved object, a `FID`-only self-event's own object — so it always
+/// counts. `dir_fid` is the affected object ONLY in the NAME-LESS shape, where it is the
+/// self-FID [`classify_nameless`] resolves (and where a rename merged with a self-event
+/// carries the dying object). With a name it is the addressing PARENT, whose own
+/// admittance says nothing about the child the event is about; counting it there would
+/// make every ordinary dirent under an excluded name — the load-shedding case — take a
+/// barrier.
+///
+/// Deliberately a SUPERSET of what each shape's classifier would consult: a name-less
+/// event carrying both a self `dir_fid` and a `target_fid` yields both, so an
+/// inconsistent event still errs toward the barrier rather than a silent drop.
+fn affected_object_fids(event: &RawFanotifyEvent) -> impl Iterator<Item = &Fid> {
+  let self_fid = event
+    .name
+    .is_none()
+    .then_some(event.dir_fid.as_ref())
+    .flatten();
+  [event.target_fid.as_ref(), self_fid].into_iter().flatten()
+}
+
+/// Whether NO path this event names lies in the reported tree — the fence's first
+/// question, made READ-ONLY and BEFORE any map mutation.
+///
+/// The walk fence (`descend`) keeps excluded subtrees out of the map, so a directory at
+/// or under an exclusion is never seeded and its own events never resolve. Two shapes
+/// still reach an in-root resolution and are exactly the boundary cases:
+///
+/// - an event about the excluded directory ITSELF — its PARENT is mapped, so a create,
+///   delete, modify, or move-in of that one name resolves and would act;
+/// - a rename with one or both ends inside the excluded subtree.
+///
+/// The predicate resolves the same path(s) the shape dispatch would build — a dirent's
+/// `<parent>/<name>`, a name-less event's own path, a rename's two ends — through
+/// [`FidMap::resolve_path`](map::FidMap::resolve_path), which answers `Some` exactly
+/// when `admit` would but evicts nothing.
+///
+/// A SINGLE-OBJECT event names one path, so "does it resolve, and is it excluded" is
+/// the whole question HERE: an addressing FID that does not resolve names no path at
+/// all, and the shape dispatch has nothing to DELIVER for it either (it falls to
+/// [`classify_foreign_parent`], which can only reach a root death, the loss barrier, or
+/// the firehose drop). Whether it still owes the map something is the fence's other
+/// question, which [`affects_reported_object`] answers from the FIDs rather than from
+/// the paths — this predicate is deliberately about paths alone. A RENAME is different,
+/// and that difference is this predicate's one sharp edge: it names TWO paths, so an end
+/// that resolves nothing does not end the question — the OTHER end can still carry a
+/// delivery.
+///
+/// So a rename's ends are classified THREE ways ([`RenameEnd`]) and the rename is
+/// suppressed when NEITHER end is [`RenameEnd::Reported`]. That is deliberately not the
+/// same test as "both ends are excluded": an end fails to be excluded either because it
+/// is genuinely in the reported tree OR because it resolves nothing, and treating the
+/// second as "not excluded" let a rename with NO reportable end through admission. An
+/// outside-root source degraded to a bare filename, which no exclusion prefix matches,
+/// so the conjunction failed and the pair was forwarded — and the lowering, seeing one
+/// end outside the root and one end inside it, emitted a located rescan naming the
+/// EXCLUDED destination. The common-layer fence stands down for this backend
+/// (`backend_enforces_exclusions`), so that rescan reached consumers with neither of
+/// its endpoints in the tree they subscribed to. Asking whether an end is REPORTED
+/// collapses the two ways of not being reported into one answer and closes it.
+///
+/// A move ACROSS the boundary — one end reported, the other not — is a real change to
+/// the reported tree: an object leaving the excluded subtree appears, one entering it
+/// disappears, and the consumer needs the half it can see; reporting the pair is how it
+/// learns which. The MAP side of a crossing move is handled where the mutation is, in
+/// [`classify_rename`]: a destination outside the reported tree is a departure, so the
+/// moved directory is forgotten rather than re-parented or walked in. The same is true
+/// of a move that merely STRADDLES an exclusion — both endpoints reportable, but an
+/// exclusion beneath one of them, so the moved subtree's own descendants change sides
+/// ([`exclusion_geometry_changed`]) — which is a map question, not a suppression one:
+/// the pair is reported either way, and the subtree is relearned and re-walked there.
+///
+/// The ROOT'S OWN DEATH is exempted by the caller ([`fence`] consults
+/// [`reports_root_death`] before ever asking this): an exclusion covering the watched
+/// root — a caller excluding the very tree it asked to watch — would otherwise silence
+/// the one record that says the watch is over.
+fn names_no_reported_path(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[PathBuf]) -> bool {
+  let excluded = |path: &Path| super::excluded(exclusions, path);
+  if let Some(rename) = &event.rename {
+    let reported = |dir: &Fid, name: &[u8]| {
+      rename_end(map.resolve_path(dir).as_deref(), name, exclusions).is_reported()
+    };
+    return !reported(&rename.old_dir, &rename.old_name)
+      && !reported(&rename.new_dir, &rename.new_name);
+  }
+  match event.name.as_ref() {
+    // A dirent addresses `<parent>/<name>`; an unresolvable parent is out-of-root.
+    Some(name) => event
+      .dir_fid
+      .as_ref()
+      .and_then(|dir| map.resolve_path(dir))
+      .is_some_and(|dir| excluded(&join_name(&dir, name))),
+    // A name-less event addresses its OWN object, `dir_fid` first — the same self-FID
+    // [`classify_nameless`] resolves.
+    None => event
+      .dir_fid
+      .as_ref()
+      .or(event.target_fid.as_ref())
+      .and_then(|fid| map.resolve_path(fid))
+      .is_some_and(|path| excluded(&path)),
+  }
+}
+
+/// Which of the THREE trees one end of a `FAN_RENAME` lies in, once its parent directory
+/// has been resolved against the map: the reported tree, the excluded remainder of the
+/// watched root, or neither.
+///
+/// The third state is the one a boolean cannot hold, and holding it is the entire point.
+/// "Excluded" and "reported" are not complements: an end can fail the exclusion test
+/// simply because there is no path to test — its parent directory resolves nothing, so
+/// the end lies off the watched root, or under an exclusion whose subtree the walk fence
+/// deliberately never mapped (the map cannot tell those two apart, and does not need
+/// to — neither is in the reported tree). Every rule the fence and
+/// [`classify_rename`] need is phrased on [`Reported`](Self::Reported), never on its
+/// negation-of-a-negation.
+enum RenameEnd {
+  /// The parent resolves in-root AND no exclusion covers the joined path: this end is
+  /// in the tree the caller subscribed to, and carries that path.
+  Reported(PathBuf),
+  /// The parent resolves in-root but the joined path lies at or under an exclusion —
+  /// inside the watched root, outside the reported tree. Reachable for exactly the
+  /// exclusion's own top name, whose parent IS mapped; anything deeper resolves nothing
+  /// and arrives as [`Outside`](Self::Outside) instead.
+  Excluded,
+  /// The parent resolves nothing, so this end names no path in the map's tree at all.
+  Outside,
+}
+
+impl RenameEnd {
+  /// Whether this end lies in the REPORTED tree — the one question every rule about a
+  /// rename end is phrased on.
+  fn is_reported(&self) -> bool {
+    matches!(self, Self::Reported(_))
+  }
+}
+
+/// Classifies one rename end from its ALREADY-RESOLVED parent directory (`None` when the
+/// parent resolved nothing) and the child name the event carries.
+///
+/// Both call sites resolve the parent themselves and for their own reasons — the fence
+/// through the read-only [`FidMap::resolve_path`](map::FidMap::resolve_path) because it
+/// must not mutate, [`classify_rename`] through the batch memo because it is about to
+/// act — so the resolution is the caller's and only the CLASSIFICATION lives here. That
+/// keeps one rule for what "reported" means across both, and it is the shared
+/// [`super::excluded`] predicate doing the matching, never a second one.
+fn rename_end(dir: Option<&Path>, name: &[u8], exclusions: &[PathBuf]) -> RenameEnd {
+  let Some(dir) = dir else {
+    return RenameEnd::Outside;
+  };
+  let path = join_name(dir, name);
+  if super::excluded(exclusions, &path) {
+    RenameEnd::Excluded
+  } else {
+    RenameEnd::Reported(path)
+  }
+}
+
+/// Whether `event` could classify as the watched root's own death — the ONE outcome the
+/// exclusion fence must never suppress, whatever the caller excluded.
+///
+/// Enumerates the two shapes [`Admission::RootDeath`] is reachable from, so the guard is
+/// a superset of them by construction rather than by coincidence:
+///
+/// - the NAME-LESS self shape ([`classify_nameless`]): a `DELETE_SELF`/`MOVE_SELF` whose
+///   self-FID (`dir_fid`, else the `FID`-only shape's `target_fid`) is the map's root
+///   anchor;
+/// - the FOREIGN-PARENT shape ([`classify_foreign_parent`]): any structural-death mask
+///   ([`root_death_mask`]) whose `target_fid` is the root anchor — the root deleted or
+///   moved as reported from its own out-of-root parent.
+///
+/// Deliberately NOT narrowed by whether the shape's own addressing FID resolves: the
+/// guard costs one `is_root` on a mask that names a structural death, and erring toward
+/// delivering a root death is the only safe direction.
+fn reports_root_death(map: &FidMap, event: &RawFanotifyEvent) -> bool {
+  let is_root = |fid: &Fid| map.is_root(fid);
+  if event.rename.is_none()
+    && event.name.is_none()
+    && (event.mask.delete_self() || event.mask.move_self())
+    && event
+      .dir_fid
+      .as_ref()
+      .or(event.target_fid.as_ref())
+      .is_some_and(is_root)
+  {
+    return true;
+  }
+  root_death_mask(event.mask).is_some() && event.target_fid.as_ref().is_some_and(is_root)
+}
+
+/// Whether a multi-structural `event` is provably MAP-NEUTRAL: no verb its merged
+/// mask carries can mutate the admission map, so the ambiguity it leaves is confined
+/// to ONE name and owes no reseed barrier.
+///
+/// The map mutates on exactly three shapes, and this predicate excludes all of them:
+/// an `ONDIR` create (`learn`), an `ONDIR` delete/move-out (`forget`), and a
+/// `FAN_RENAME` (re-parent / move-in walk / move-out forget). What is left is a
+/// NAMED, non-`ONDIR` dirent whose structural verbs are confined to
+/// `FAN_CREATE`/`FAN_DELETE` under a parent already resolved in-root — for which
+/// [`classify_dirent`] reaches ONLY its mutation-free [`Admission::Forward`] arm,
+/// whatever order the kernel merged the verbs in. Requiring the parent to resolve is
+/// what keeps the exemption from diverting a foreign-parent event away from
+/// [`classify_foreign_parent`], where an in-map `target_fid` still owes the barrier
+/// (or a root death) rather than a forward.
+///
+/// So this is NOT a relaxation of the no-one-sided-mutation rule: the rule guards map
+/// mutations, and the exempted shape performs none. It is the recognition that the
+/// barrier's cost — dropping the whole read buffer, reseeding the map, and covering
+/// the entire scope with one `Overflow` — is charged for a hazard that cannot arise
+/// here, while a create+delete of one file is ordinary churn. What genuinely stays
+/// unknowable is that one name's ending state: create-then-delete and
+/// delete-then-create carry identical bits. That is a LOCATED question, and
+/// `plan_fanotify` answers it locally with a located `Rescan` over the name, which
+/// covers either ending while every other event in the same read is still delivered.
+fn map_neutral_merge(map: &FidMap, event: &RawFanotifyEvent) -> bool {
+  let mask = event.mask;
+  event.rename.is_none()
+    && event.name.is_some()
+    && !mask.ondir()
+    && !mask.rename()
+    && !mask.delete_self()
+    && !mask.move_self()
+    && event
+      .dir_fid
+      .as_ref()
+      .is_some_and(|dir| map.resolve_path(dir).is_some())
 }
 
 /// Whether `event` REACHES an in-root object by ANY structural-verb FID it carries — the
@@ -581,26 +978,53 @@ fn root_death_mask(mask: FanMask) -> Option<FanMask> {
 /// whether the MOVED OBJECT was already a known directory (its descendants already
 /// mapped):
 ///
-/// - **in-root rename** (moved dir known, destination in-root): re-parent the one
-///   node in place; every descendant follows via the updated parent link — complete
-///   by construction, no walk (`seed = None`).
+/// - **in-root rename** (moved dir known, destination in-root, exclusion geometry
+///   unchanged): re-parent the one node in place; every descendant follows via the
+///   updated parent link — complete by construction, no walk (`seed = None`).
 /// - **move-in from outside** (moved dir unknown, destination in-root): the moved
 ///   directory carries pre-existing descendants the seed walk never saw, so after
 ///   learning the moved dir itself as a `pending_walk` top this returns `seed =
 ///   Some(moved)` — the reader resolves the dir's current path through the map and
 ///   walks the subtree in before forwarding, keeping the completeness invariant even
 ///   if a later in-root rename in the same batch re-parents the node first.
+/// - **re-parent across a change in exclusion geometry** (moved dir known,
+///   destination in-root, an exclusion beneath EITHER endpoint —
+///   [`exclusion_geometry_changed`]): the carried-across descendants are no longer the
+///   set the fence describes, so the node is `forget`-ten and relearned as a move-in
+///   top and the subtree is walked in afresh under the destination's geometry. This is
+///   the ONE re-parent that owes a walk; see the helper for why both directions of the
+///   crossing need it.
 /// - **move-out** (moved dir known, destination outside): forget the moved dir; its
 ///   descendants' parent links now point at an absent handle, so their walks break
 ///   and they evict lazily — the map stops admitting the departed subtree naturally.
 /// - **move-out of an already-unknown subtree** (moved dir unknown, destination
 ///   outside): nothing to maintain; only the in-root SOURCE end resolves, and the
 ///   move forwards as a boundary crossing.
+///
+/// An EXCLUDED destination is a move-out too. The reported tree is the root MINUS the
+/// caller's exclusions, so a directory renamed to a path at or under an exclusion has
+/// left it exactly as surely as one renamed off the root — and the map must follow it
+/// out. Re-parenting the node instead would park a live subtree (and its already-mapped
+/// descendants) inside the exclusion, where every later create under it grows the
+/// admission map toward the cap for a subtree the caller asked not to hear about. So a
+/// destination that is not [`RenameEnd::Reported`] takes the move-out arm: `forget` the
+/// moved directory, walk nothing, and still FORWARD the pair — the crossing is precisely
+/// what tells the consumer the object is gone.
+///
+/// Forwarding is sound BECAUSE of what the fence proved: a rename reaches here only with
+/// at least one end in the reported tree, so a move-out always has a visible source and
+/// a move-in always has a visible destination. A rename with NEITHER end reported —
+/// including one arriving from off the root and landing inside an exclusion — never
+/// reaches this function at all; [`fence`] answered it before any resolution here could
+/// hand the lowering a pair to describe, dropping it clean when it moved nothing the map
+/// holds and taking the loss barrier when it moved something the map holds at a reported
+/// path (whose departure this function would otherwise never be told about).
 fn classify_rename(
   map: &mut FidMap,
   event: &RawFanotifyEvent,
   rename: &RenameInfo,
   memo: &mut MemoBatch,
+  exclusions: &[PathBuf],
 ) -> Admission {
   let old_dir = memo.admit(map, &rename.old_dir);
   let new_dir = memo.admit(map, &rename.new_dir);
@@ -611,6 +1035,14 @@ fn classify_rename(
     return classify_foreign_parent(map, event);
   }
 
+  // The DELIVERED pair. An end whose parent resolved nothing degrades to the bare child
+  // name, which is a RELATIVE path and therefore cannot strip the canonical root's
+  // prefix: the lowering reads it as `Lowered::Outside` and covers the in-root end with
+  // a located rescan instead of pairing a half that has no partner under the root. That
+  // fallback is delivery-only and must stay out of any admission decision — a bare name
+  // matches no exclusion prefix, so testing one against the exclusion set answers
+  // "reported" for a path that is nothing of the sort. `rename_end` is where that
+  // question is asked, and it never sees this form.
   let old_path = old_dir
     .as_ref()
     .map(|dir| join_name(dir, &rename.old_name))
@@ -634,29 +1066,50 @@ fn classify_rename(
     let Some(moved) = event.target_fid.as_ref() else {
       return Admission::Lossy;
     };
-    if new_dir.is_some() {
-      // Destination in-root. Whether the moved object was ALREADY a known in-root
-      // directory (its descendants already mapped) splits the two flavors — read it
+    // The destination is classified by the SAME three-way rule the fence used
+    // ([`rename_end`]), so "the map may follow the subtree here" and "the fence would
+    // report this path" cannot drift apart. Only a REPORTED destination is followed;
+    // both other states — inside an exclusion, or off the watched root — take the
+    // move-out arm below rather than learning or re-parenting the node into a subtree
+    // the caller asked not to hear about (and whose later creates would then grow the
+    // map against the cap). The reported arm carries the destination PATH, which is what
+    // lets the geometry test below name the tree the subtree is landing in.
+    let destination = match rename_end(new_dir.as_deref(), &rename.new_name, exclusions) {
+      RenameEnd::Reported(destination) => Some(destination),
+      RenameEnd::Excluded | RenameEnd::Outside => None,
+    };
+    if let Some(destination) = destination {
+      // Destination in-root and reported. Whether the moved object was ALREADY a known
+      // in-root directory (its descendants already mapped) splits the flavors — read it
       // BEFORE `learn` overwrites the node.
-      if map.contains(moved) {
+      if map.contains(moved) && !exclusion_geometry_changed(map, moved, &destination, exclusions) {
         // In-root re-parent: `learn` overwrites the node in place, and its
-        // already-mapped descendants follow via the updated parent link — no walk.
+        // already-mapped descendants follow via the updated parent link — no walk. Sound
+        // ONLY because the descendants the map holds are still exactly the descendants
+        // the fence reports; the guard above is what proves that.
         map.learn(&rename.new_dir, &rename.new_name, Some(moved));
         return Admission::Rename {
           event: admitted,
           seed: None,
         };
       }
-      // Moved IN from outside: learn the top as a `pending_walk` node, then hand the
-      // reader its FID to walk the pre-existing descendants in (no per-descendant
-      // creates arrive for a rename, so the map is complete only once the walk runs).
+      // Moved IN from outside — or re-parented across a change in exclusion geometry,
+      // where what the map holds for this subtree is no longer what the fence reports.
+      // Either way the mapped subtree is discarded (`forget`, a no-op for a moved-in dir
+      // the map never knew) and the top is relearned as a `pending_walk` node, then the
+      // reader is handed its FID to walk the descendants in — the walk applies the SAME
+      // exclusion fence to the destination's paths, so what it maps is exactly what the
+      // reported tree now contains. Discarding first is what keeps a subtree that moved
+      // INTO an exclusion from being left behind in the map.
+      map.forget(moved);
       map.learn_moved_in(&rename.new_dir, &rename.new_name, moved);
       return Admission::Rename {
         event: admitted,
         seed: Some(moved.clone()),
       };
     }
-    // Moved OUT of the root: forget the departed subtree. A later move back is a
+    // Moved OUT of the reported tree — off the root, or into an excluded subtree the
+    // map must not follow it into: forget the departed subtree. A later move back is a
     // fresh move-in — walked in — the conservative direction.
     map.forget(moved);
     return Admission::Rename {
@@ -670,6 +1123,64 @@ fn classify_rename(
     event: admitted,
     seed: None,
   }
+}
+
+/// Whether moving the already-mapped directory `moved` to `destination` CHANGES which
+/// of its descendants the exclusion fence covers — the ONE condition under which an
+/// in-root re-parent is not complete without a walk.
+///
+/// Exclusions match on PATH PREFIXES, so which descendants of a subtree lie under one is
+/// a function of the subtree's OWN path. A re-parent rewrites exactly that path while
+/// carrying every mapped descendant across untouched (that is the whole point of the
+/// parent-relative representation), so a move whose endpoints sit on different sides of
+/// an exclusion leaves the map describing a tree the fence no longer agrees with — in
+/// BOTH directions, and permanently, because nothing later re-walks it:
+///
+/// - **out of an exclusion.** With `/root/a/cache` excluded, the seed walk never mapped
+///   it. Renaming `/root/a` to `/root/b` makes `cache` reportable, yet a bare re-parent
+///   adds nothing: the directory stays absent from the map, so every event beneath it
+///   resolves no addressing FID and is dropped as foreign — a newly visible subtree that
+///   is blind forever.
+/// - **into an exclusion.** With `/root/b/cache` excluded, `/root/a/cache` IS mapped.
+///   Renaming `/root/a` to `/root/b` leaves those nodes in the map, so the map retains —
+///   and resolves paths through — directories the fence says are not in the reported
+///   tree, holding admission-map capacity the exclusion exists to shed.
+///
+/// The test is the fence's own prefix containment run the other way round: an exclusion
+/// is relevant exactly when it lies at or under one of the two endpoint paths, which is
+/// [`super::excluded`] with the endpoints as the exclusion set and the exclusion as the
+/// path. Reusing that one predicate is deliberate — a second matching rule here could
+/// drift out of step with the fence and re-open the hole from the other side.
+///
+/// Deliberately CONSERVATIVE: an exclusion sitting under BOTH endpoints at the same
+/// relative offset (`/root/a/cache` and `/root/b/cache`, renaming `a` to `b`) leaves the
+/// geometry genuinely unchanged yet answers `true` here, costing one subtree walk.
+/// Comparing the two sides exactly would buy nothing on a path this rare — exclusions
+/// are rare, and a rename with one beneath either end rarer still — while adding the
+/// second rule this deliberately avoids.
+///
+/// The empty-exclusion fast path keeps the common case at zero cost: with no exclusions
+/// there is no geometry, so no rename ever pays a resolution for this.
+///
+/// A `moved` whose ancestry no longer reaches the root has no old path to compare
+/// against and answers `true`: relearning it as a move-in top rebuilds the subtree from
+/// the destination rather than re-parenting an orphan.
+fn exclusion_geometry_changed(
+  map: &FidMap,
+  moved: &Fid,
+  destination: &Path,
+  exclusions: &[PathBuf],
+) -> bool {
+  if exclusions.is_empty() {
+    return false;
+  }
+  let Some(source) = map.resolve_path(moved) else {
+    return true;
+  };
+  let endpoints = [source, destination.to_path_buf()];
+  exclusions
+    .iter()
+    .any(|exclusion| super::excluded(&endpoints, exclusion))
 }
 
 /// Joins a raw fanotify child name onto its resolved directory path. A

@@ -3,12 +3,12 @@ use std::path::Path;
 use tributary_proto::WatchId;
 
 use super::{
-  attribute_events, fs_type_is_remote,
+  attribute_events, excluded, fs_type_is_local, fs_type_is_remote,
   inotify::{
     decode::{IN_CREATE, IN_IGNORED, IN_ISDIR, IN_Q_OVERFLOW, InotifyMask, RawInotifyEvent},
     table::WdTable,
   },
-  parse_mountinfo,
+  locality_refusal, parse_mountinfo,
 };
 
 fn watch(n: u64) -> WatchId {
@@ -118,15 +118,54 @@ fn mountinfo_unescapes_octal_fields() {
   assert_eq!(mounts, vec![std::path::PathBuf::from("/mnt/with space")]);
 }
 
+/// The exclusion predicate both Linux backends' fences read.
+///
+/// It is deliberately the SAME predicate the sync-cookie birth refusal uses, so a
+/// directory `sync_root` refuses to write into is exactly a directory the backend
+/// refuses to report from. These rows pin the properties that matter at a walk
+/// fence: component-wise containment (not a byte prefix), the exclusion directory
+/// itself counted as excluded, and the empty set excluding nothing.
+#[test]
+fn the_exclusion_predicate_matches_the_subtree_and_nothing_beside_it() {
+  let exclusions = vec![std::path::PathBuf::from("/root/cache")];
+
+  assert!(
+    excluded(&exclusions, Path::new("/root/cache")),
+    "the exclusion directory itself is excluded"
+  );
+  assert!(
+    excluded(&exclusions, Path::new("/root/cache/deep/leaf")),
+    "everything under the exclusion is excluded"
+  );
+  assert!(
+    !excluded(&exclusions, Path::new("/root/cachex")),
+    "a SIBLING sharing a byte prefix is not under the exclusion — containment is \
+     component-wise, or `/root/cachex` would silently vanish"
+  );
+  assert!(
+    !excluded(&exclusions, Path::new("/root/other")),
+    "an unrelated sibling is reported"
+  );
+  assert!(
+    !excluded(&exclusions, Path::new("/root")),
+    "the ancestor of an exclusion is not excluded"
+  );
+  assert!(
+    !excluded(&[], Path::new("/root/cache")),
+    "no exclusions excludes nothing"
+  );
+}
+
 /// The shared locality gate's decision function — the pure kernel the linux
 /// spawn dispatcher runs ONCE before backend selection (so Auto, forced
-/// Fanotify, and forced Inotify all refuse a denied magic identically, and no
-/// denied root ever reaches the fanotify probe or its spawn). Every denylisted
-/// magic must refuse; representative local filesystems must pass.
+/// Fanotify, and forced Inotify all refuse identically, and no refused root ever
+/// reaches the fanotify probe or its spawn). Every known-remote magic must
+/// refuse; the local filesystems the suites and shipped hosts actually run on
+/// must pass.
 #[test]
 fn remote_fs_magics_are_refused_and_local_ones_pass() {
-  // The whole denylist (each `REMOTE_FS_MAGICS` entry) must be refused — a gap
-  // here is a filesystem that would go live blind to other hosts' writes.
+  // Each `REMOTE_FS_MAGICS` entry must be refused — one going live is a source
+  // blind to other hosts' (or peer nodes') writes.
   for (magic, name) in [
     (0x6969_i64, "NFS"),
     (0x517B, "SMB"),
@@ -138,17 +177,78 @@ fn remote_fs_magics_are_refused_and_local_ones_pass() {
     (0x7375_7245, "CODA"),
     (0x00C3_6400, "CEPH"),
     (0x564C, "NCP"),
+    (0x0116_1970, "GFS2"),
+    (0x7461_636F, "OCFS2"),
   ] {
-    assert!(fs_type_is_remote(magic), "{name} must be refused");
+    assert!(
+      locality_refusal(magic, Path::new("/root")).is_some(),
+      "{name} must be refused"
+    );
+    assert!(!fs_type_is_local(magic), "{name} is not local");
   }
   // Representative local/native filesystems must pass unchanged.
-  assert!(!fs_type_is_remote(0xEF53), "ext4 is local");
-  assert!(!fs_type_is_remote(0x0102_1994), "tmpfs is local");
-  assert!(!fs_type_is_remote(0x9123_683E), "btrfs is local");
+  for (magic, name) in [
+    (0xEF53_i64, "ext4"),
+    (0x0102_1994, "tmpfs"),
+    (0x9123_683E, "btrfs"),
+    (0x5846_5342, "xfs"),
+    (
+      0x794C_7630,
+      "overlayfs (a probe refusal, not a locality one)",
+    ),
+  ] {
+    assert!(
+      locality_refusal(magic, Path::new("/root")).is_none(),
+      "{name} must pass the locality gate"
+    );
+  }
+}
+
+/// The gate FAILS CLOSED: a filesystem on neither list is refused, not admitted.
+///
+/// This is the whole point of the allowlist shape. A denylist answers "is this
+/// one of the ten distributed filesystems someone enumerated", so every
+/// filesystem nobody thought about — an out-of-tree module, a magic minted after
+/// this list was written, a stacking filesystem over a remote backing store —
+/// goes live claiming coverage it cannot prove. The unknown magic below is
+/// deliberately not in either list.
+#[test]
+fn an_unknown_filesystem_magic_is_refused_rather_than_admitted() {
+  const UNKNOWN: i64 = 0x1234_5678;
+  assert!(!fs_type_is_local(UNKNOWN), "the magic is not allowlisted");
   assert!(
-    !fs_type_is_remote(0x794C_7630),
-    "overlayfs is local (a probe refusal, not a locality one)"
+    !fs_type_is_remote(UNKNOWN),
+    "nor is it on the known-remote list — this is the fail-open case"
   );
+  let refusal = locality_refusal(UNKNOWN, Path::new("/root"))
+    .expect("an unrecognized filesystem is refused, never admitted");
+  match refusal {
+    crate::os::SourceError::RootUnavailable { root, source } => {
+      assert_eq!(root, Path::new("/root"));
+      assert_eq!(
+        source.kind(),
+        std::io::ErrorKind::Unsupported,
+        "the refusal matches the macOS `!MNT_LOCAL` shape: RootUnavailable + Unsupported"
+      );
+    }
+    other => panic!("an unrecognized filesystem must refuse RootUnavailable: {other:?}"),
+  }
+}
+
+/// The message selector is a message selector only: a known-remote magic and an
+/// unrecognized one both refuse, and both refuse the SAME way — only the text
+/// differs. A reader who mistakes `fs_type_is_remote` for the verdict would
+/// reintroduce the fail-open default.
+#[test]
+fn the_remote_list_only_names_the_refusal_it_never_grants_one() {
+  let named = locality_refusal(0x6969, Path::new("/root")).expect("NFS refuses");
+  let unknown = locality_refusal(0x1234_5678, Path::new("/root")).expect("an unknown fs refuses");
+  for refusal in [named, unknown] {
+    let crate::os::SourceError::RootUnavailable { source, .. } = refusal else {
+      panic!("both refusals are RootUnavailable");
+    };
+    assert_eq!(source.kind(), std::io::ErrorKind::Unsupported);
+  }
 }
 
 /// The spawn dispatcher's root pin and the object-grounded identity reads it
@@ -162,8 +262,8 @@ mod pin {
   use rustix::fs::OFlags;
 
   use super::super::{
-    ancestor_identities, mnt_id_from_mask, open_no_symlinks, pin_root, require_statx,
-    root_is_remote, root_mount_id, statx_gate_error, statx_unavailable,
+    ancestor_identities, locality_refusal, mnt_id_from_mask, open_no_symlinks, pin_root,
+    require_statx, root_fs_type, root_mount_id, statx_gate_error, statx_unavailable,
   };
   use crate::os::{RootIdentity, SourceError};
 
@@ -183,6 +283,13 @@ mod pin {
       .union(OFlags::NOFOLLOW)
       .union(OFlags::DIRECTORY)
       .union(OFlags::CLOEXEC)
+  }
+
+  /// The `(dev, ino)` a path currently resolves to — what a caller's pin would
+  /// have captured.
+  fn identity_of(path: &std::path::Path) -> RootIdentity {
+    let meta = std::fs::metadata(path).expect("stat the path");
+    RootIdentity::new(meta.dev(), meta.ino().into())
   }
 
   /// A fresh empty scratch directory under `TMPDIR`, canonicalized so the pin's
@@ -265,16 +372,19 @@ mod pin {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  /// The locality gate reads the PINNED fd: a local temp filesystem is not
-  /// refused. (The denylist itself is row-tested pure above; this asserts the
-  /// fd-relative read path wires through to the same decision.)
+  /// The locality gate reads the PINNED fd: the suites' own temp filesystem is
+  /// not refused. (The allowlist itself is row-tested pure above; this asserts
+  /// the fd-relative read path wires through to the same decision, and that the
+  /// filesystem the container suites actually run on is allowlisted.)
   #[test]
-  fn root_is_remote_reads_the_pin_and_passes_local() {
+  fn the_locality_gate_reads_the_pin_and_passes_the_suites_own_filesystem() {
     let dir = scratch("local");
     let fd = pin_root(&dir).expect("pin the local dir");
+    let f_type = root_fs_type(&fd, &dir).expect("fstatfs the pin");
     assert!(
-      !root_is_remote(&fd, &dir).expect("fstatfs the pin"),
-      "a local temp filesystem passes the fd-relative locality gate"
+      locality_refusal(f_type, &dir).is_none(),
+      "the suites' temp filesystem (magic {f_type:#x}) must be allowlisted, or every \
+       Linux spawn in this repository refuses"
     );
     let _ = std::fs::remove_dir_all(&dir);
   }
@@ -287,7 +397,8 @@ mod pin {
     let base = scratch("anc");
     let nested = base.join("a/b");
     std::fs::create_dir_all(&nested).expect("create a nested dir");
-    let ancestors = ancestor_identities(&nested).expect("pin and stat the ancestor chain");
+    let ancestors =
+      ancestor_identities(&nested, identity_of(&nested)).expect("pin and stat the ancestor chain");
     // Each strict ancestor's identity matches a path stat of that ancestor.
     for (ancestor, identity) in nested.ancestors().skip(1).zip(&ancestors) {
       let meta = std::fs::metadata(ancestor).expect("stat the ancestor path");
@@ -321,7 +432,10 @@ mod pin {
     // (`link`). The pin over `leaf` would succeed via canonicalize, but walking
     // the ancestors of this UN-canonicalized path must refuse the symlink hop.
     let via_link = link.join("leaf");
-    let err = ancestor_identities(&via_link)
+    // The expected identity is the object the path DOES reach when symlinks are
+    // followed, so the refusal below is provably the no-symlink hop firing and not
+    // the closing identity equality.
+    let err = ancestor_identities(&via_link, identity_of(&via_link))
       .expect_err("a symlinked ancestor must be refused, not silently identified");
     assert!(
       matches!(err, SourceError::RootUnavailable { .. }),
@@ -469,20 +583,18 @@ mod pin {
     assert_eq!(stat.st_ino, meta.ino(), "the root pin's inode is /'s");
   }
 
-  /// The `ancestor_identities` `ENOSYS` fallback row: pinning each strict ancestor
-  /// by the shared component walk (`O_PATH` final flags) and `fstat`ing it yields
-  /// the SAME identities the `openat2` fast path records — so a pre-5.6 kernel that
-  /// pins + starts the reader also reads the ancestor chain, and the floor holds one
-  /// call past the pin instead of dying `RootUnavailable` there. The `ENOSYS` routing
-  /// itself needs a pre-5.6 kernel; this exercises the fallback body on a real chain
-  /// and proves it agrees with `ancestor_identities`.
+  /// On an UNRACED tree the one coherent walk records exactly what independently
+  /// pinning each strict ancestor records. Coherence is a guarantee about what
+  /// happens under a concurrent exchange; it must not change the honest answer,
+  /// and this is the cell that says so.
   #[test]
-  fn ancestor_walk_fallback_matches_openat2() {
+  fn the_coherent_walk_agrees_with_independent_ancestor_pins() {
     let base = scratch("anc-walk");
     let nested = base.join("a/b");
     std::fs::create_dir_all(&nested).expect("create a nested dir");
 
-    let fast = ancestor_identities(&nested).expect("the openat2 ancestor pass");
+    let coherent =
+      ancestor_identities(&nested, identity_of(&nested)).expect("the coherent ancestor walk");
     let walked: Vec<_> = nested
       .ancestors()
       .skip(1)
@@ -494,9 +606,89 @@ mod pin {
       })
       .collect();
     assert_eq!(
-      fast, walked,
-      "the ENOSYS ancestor walk reproduces the openat2 ancestor identities exactly"
+      coherent, walked,
+      "the coherent walk reproduces the per-ancestor pins exactly on an honest chain"
     );
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// The closing equality: the chain is only evidence if the walk that produced it
+  /// ENDED on the object the pin, the mark and the seed vouched for. Here the
+  /// pathname is honest and every ancestor resolves, but it reaches a DIFFERENT
+  /// object than the caller pinned — the exact residue a pathname exchange leaves
+  /// behind — and the snapshot must refuse rather than hand back a chain that
+  /// describes someone else's parents.
+  #[test]
+  fn the_containment_snapshot_refuses_a_chain_that_does_not_end_on_the_pinned_root() {
+    let base = scratch("anc-mixed");
+    let live = base.join("live/root");
+    let replacement = base.join("replacement/root");
+    std::fs::create_dir_all(&live).expect("create base/live/root");
+    std::fs::create_dir_all(&replacement).expect("create base/replacement/root");
+
+    // Control: the walk succeeds when it lands on the object it was told to expect.
+    ancestor_identities(&live, identity_of(&live))
+      .expect("an honest chain ending on the pinned root is accepted");
+
+    let err = ancestor_identities(&live, identity_of(&replacement))
+      .expect_err("a chain that does not end on the pinned root must be refused");
+    assert!(
+      matches!(err, SourceError::RootReplaced { .. }),
+      "reaching a different object at the root pathname is RootReplaced: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// The reported trace, made deterministic: two REAL parent directories are
+  /// atomically exchanged (`renameat2(RENAME_EXCHANGE)` — no symlink anywhere, so
+  /// every no-symlink fence passes) after the root was pinned. The pinned object is
+  /// now reachable only under the OTHER pathname, so a snapshot taken for the
+  /// original pathname must refuse instead of publishing the replacement's ancestor
+  /// chain beside the original root identity.
+  #[test]
+  fn the_containment_snapshot_refuses_an_exchanged_parent_chain() {
+    let base = scratch("anc-exchange");
+    let live = base.join("live");
+    let replacement = base.join("replacement");
+    std::fs::create_dir_all(live.join("root")).expect("create base/live/root");
+    std::fs::create_dir_all(replacement.join("root")).expect("create base/replacement/root");
+    let live_root = live.join("root");
+    let replacement_root = replacement.join("root");
+
+    // What the pin, the mark and the seed grounded on, captured BEFORE the exchange.
+    let pinned = identity_of(&live_root);
+
+    if let Err(errno) = rustix::fs::renameat_with(
+      rustix::fs::CWD,
+      &live,
+      rustix::fs::CWD,
+      &replacement,
+      rustix::fs::RenameFlags::EXCHANGE,
+    ) {
+      // RENAME_EXCHANGE needs a filesystem that implements it; skip loudly rather
+      // than pass vacuously where it does not.
+      eprintln!("SKIP: RENAME_EXCHANGE unavailable on this filesystem ({errno:?})");
+      let _ = std::fs::remove_dir_all(&base);
+      return;
+    }
+
+    // The pathname the spawn would report now denotes the OTHER object.
+    let err = ancestor_identities(&live_root, pinned)
+      .expect_err("after the exchange the original pathname no longer reaches the pinned root");
+    assert!(
+      matches!(err, SourceError::RootReplaced { .. }),
+      "an exchanged parent chain is refused, never published beside the old identity: {err:?}"
+    );
+
+    // And the pinned object is exactly where the exchange put it, so the refusal is
+    // about coherence and not about the object having vanished.
+    assert_eq!(
+      identity_of(&replacement_root),
+      pinned,
+      "the pinned object moved with its parent"
+    );
+    ancestor_identities(&replacement_root, pinned)
+      .expect("the pathname that now reaches the pinned root snapshots cleanly");
     let _ = std::fs::remove_dir_all(&base);
   }
 
