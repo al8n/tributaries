@@ -451,7 +451,7 @@ mod smoke {
   use tributary_proto::WatchId;
 
   use crate::os::{
-    SourceConfig,
+    Quiesce, SourceConfig,
     linux::{AnchorRequest, ExpectedObject, RawLinuxEvent, Source, WatchOutcome},
     transport::SourceMessage,
   };
@@ -529,7 +529,13 @@ mod smoke {
     assert_eq!(anchors, &[watch(1)]);
     assert_eq!(raw.name.as_deref(), Some(b"a.txt".as_slice()));
 
-    handle.shutdown();
+    // The reader is JOINED by this teardown, and a joined thread is the whole
+    // observation: an inotify source can therefore never answer `Unproven`.
+    assert_eq!(
+      handle.shutdown(),
+      Quiesce::Proven,
+      "the join proves the stop"
+    );
     let _ = fs::remove_dir_all(&dir);
   }
 
@@ -555,7 +561,13 @@ mod smoke {
     });
     assert_eq!(second.outcome, WatchOutcome::Aliased(wd));
 
-    handle.shutdown();
+    // The reader is JOINED by this teardown, and a joined thread is the whole
+    // observation: an inotify source can therefore never answer `Unproven`.
+    assert_eq!(
+      handle.shutdown(),
+      Quiesce::Proven,
+      "the join proves the stop"
+    );
     let _ = fs::remove_dir_all(&dir);
   }
 
@@ -576,7 +588,13 @@ mod smoke {
       "a matching identity arms: {:?}",
       reply.outcome
     );
-    handle.shutdown();
+    // The reader is JOINED by this teardown, and a joined thread is the whole
+    // observation: an inotify source can therefore never answer `Unproven`.
+    assert_eq!(
+      handle.shutdown(),
+      Quiesce::Proven,
+      "the join proves the stop"
+    );
     let _ = fs::remove_dir_all(&dir);
   }
 
@@ -608,7 +626,13 @@ mod smoke {
       reply.anchor.is_none(),
       "a refused arm returns no transient anchor"
     );
-    handle.shutdown();
+    // The reader is JOINED by this teardown, and a joined thread is the whole
+    // observation: an inotify source can therefore never answer `Unproven`.
+    assert_eq!(
+      handle.shutdown(),
+      Quiesce::Proven,
+      "the join proves the stop"
+    );
     let _ = fs::remove_dir_all(&dir);
   }
 
@@ -626,7 +650,13 @@ mod smoke {
       reply.outcome,
       WatchOutcome::Failed(tributary_proto::WatchError::NotFound)
     );
-    handle.shutdown();
+    // The reader is JOINED by this teardown, and a joined thread is the whole
+    // observation: an inotify source can therefore never answer `Unproven`.
+    assert_eq!(
+      handle.shutdown(),
+      Quiesce::Proven,
+      "the join proves the stop"
+    );
     let _ = fs::remove_dir_all(&dir);
   }
 
@@ -656,7 +686,13 @@ mod smoke {
         );
       }
     }
-    handle.shutdown();
+    // The reader is JOINED by this teardown, and a joined thread is the whole
+    // observation: an inotify source can therefore never answer `Unproven`.
+    assert_eq!(
+      handle.shutdown(),
+      Quiesce::Proven,
+      "the join proves the stop"
+    );
     let _ = fs::remove_dir_all(&dir);
   }
 }
