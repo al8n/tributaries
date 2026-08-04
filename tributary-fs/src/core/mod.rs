@@ -63,6 +63,8 @@
 //! | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` event | `IN_DELETE_SELF` / `IN_MOVE_SELF` event |
 //! | FSEvents (macOS) | `RootChanged` flag → root-alive probe | `RootChanged` flag → root-alive probe |
 //! | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** — no event, no hangup (the mark holds the sb alive; L4.1) → the **periodic liveness tick** re-stats the root | `FAN_DELETE_SELF` / `FAN_MOVE_SELF` event |
+//! | RDCW (Windows) | any terminal read completion → fatal source error → self-event | same signal; RDCW draws no in-band distinction from unmount |
+//! | USN journal (Windows) | a failed journal read → fatal source error → self-event | the root's own FRN named in a delete/rename record → `RootDeath` |
 //!
 //! Only fanotify's unmount emits nothing in-band, so only fanotify arms the
 //! tick (gated by [`liveness_ticked`](DriverCore::liveness_ticked)). Its in-tree
@@ -80,9 +82,10 @@ use std::{
 };
 
 use tributary_proto::{
-  Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, FileKind, Identity, Instant,
-  Interest, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope, ScopeId,
-  Segment, SubtreeScope, WatchError, WatchId, monitor::CoverageWorkEpoch,
+  ArmAttempt, Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, Evidence, FileKind,
+  Identity, Instant, Interest, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId,
+  Scope, ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
+  monitor::{CoverageWorkEpoch, RecordOutcome},
 };
 
 use crate::{
@@ -213,6 +216,11 @@ pub(crate) enum Effect {
     scope: ScopeId,
     /// The Monitor watch being armed.
     watch: WatchId,
+    /// The arm ATTEMPT this effect executes, echoed back with its outcome. A
+    /// `WatchId` outlives its bindings — a root keeps it across a rebind — so
+    /// only the attempt distinguishes this arm's verdict from that of one a
+    /// later arm has already superseded.
+    attempt: ArmAttempt,
     /// The already-armed parent watch (its anchor roots the open).
     parent: WatchId,
     /// The child's name under the parent.
@@ -872,6 +880,11 @@ struct Item {
 /// probe has answered, so per-root input order is preserved. `trailing`
 /// inputs (a covering rescan for an ambiguous rename group) apply after every
 /// item, so whatever the items degraded to is dominated.
+///
+/// A profile that answers [`feeds_at_classify`] has no probes to wait on and
+/// hands its items over during the fence, so what reaches `settle` here is the
+/// `trailing` tail alone; the ordering statement above is unchanged, since the
+/// items went first either way.
 #[derive(Debug)]
 struct PendingBatch {
   items: Vec<Item>,
@@ -937,6 +950,12 @@ enum ProbePurpose {
   },
   /// A `RootChanged` needed the root's existence to pick the death signal.
   RootAlive { item: usize },
+  /// An [`Action::Stat`](tributary_proto::Action::Stat) — the kind of a slot a
+  /// listing could not classify. It belongs to no batch: the Monitor asked for
+  /// it directly, and its answer goes straight back through
+  /// [`Monitor::on_stat_result`], so it never parks an item or grounds a
+  /// record.
+  SlotKind { req: ReqId },
 }
 
 #[derive(Debug)]
@@ -1010,6 +1029,12 @@ struct DyingDelivery {
 #[derive(Debug)]
 struct ScopeState {
   watch: WatchId,
+  /// The [`ArmAttempt`] of the root's BOOTSTRAP arm — the one
+  /// `Action::Watch(Root)` a registration ever queues, captured when the
+  /// action is consumed because the spawn path answers it out of band (a
+  /// kernel-recursive stream inline, a descending root through its own
+  /// `AddWatch`). `None` until the action is drained.
+  root_attempt: Option<ArmAttempt>,
   /// The backend lowering profile registration intended; the spawned
   /// source's [`RootMeta`] must agree.
   profile: BackendKind,
@@ -1139,6 +1164,24 @@ struct ScopeState {
   pending_widen: Option<PendingWiden>,
 }
 
+/// What one record owes the exclusion geometry, decided from the Monitor's own
+/// report of what that record did to the watch tree.
+///
+/// Read entirely on the far side of the record's hand-off to the Monitor
+/// ([`reparent_geometry`](DriverCore::reparent_geometry)): nothing about a rename's
+/// consequences is knowable before the Monitor has decided them, so there is no
+/// pre-feed half and no verdict a pre-feed half could return.
+#[derive(Debug)]
+enum Geometry {
+  /// The record carries no geometry, or its rename left the geometry unchanged,
+  /// or the Monitor relocated nothing.
+  Nothing,
+  /// A repair to queue directly BEHIND the record: the Monitor's own located
+  /// loss signal at the rename's destination, so the re-enumeration is lowered
+  /// against the path the subtree actually landed at.
+  Repair(Planned),
+}
+
 /// The witnessed window of one pending same-transport widen (INV-ROOT): the
 /// reserved root's binding is provably live at the commit iff the window saw
 /// neither a reserved death record nor a scope loss signal. Created by
@@ -1192,8 +1235,11 @@ pub(crate) struct WidenTaint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub(crate) enum WidenCommit {
-  /// The splice applied; the widen is live on the same transport.
-  Committed,
+  /// The splice applied; the widen is live on the same transport. Carries the
+  /// [`ArmAttempt`] the pre-armed root's replayed outcome must be reported
+  /// under — the splice mints it, so an outcome naming any other attempt is a
+  /// superseded arm's and is discarded.
+  Committed(ArmAttempt),
   /// The witnessed window tainted (INV-ROOT): a reserved death record or a
   /// scope loss signal landed between the reservation and this commit, so
   /// the binding cannot be proven live. Core and Monitor are untouched
@@ -1238,12 +1284,20 @@ pub(crate) struct DriverCore {
   monitor: Monitor,
   scopes: BTreeMap<ScopeId, ScopeState>,
   watch_scopes: BTreeMap<WatchId, ScopeId>,
-  /// Every live watch's absolute path (the root's canonical path; a child's
-  /// = its parent's joined with its name) — how descending effects address
-  /// objects. Same order of growth as the Monitor's own tree.
-  watch_paths: BTreeMap<WatchId, Arc<PathBuf>>,
   /// Outstanding enumerate requests: the scope whose state mints entry
-  /// identities when the raw listing returns, plus the read directory.
+  /// identities when the raw listing returns, plus the directory the read was
+  /// ISSUED against.
+  ///
+  /// That path is a HISTORICAL fact — where the directory was when this core
+  /// asked for its listing — and is deliberately not re-derived on completion.
+  /// It is not a second addressing map: nothing arms or opens by it (the
+  /// executor lists through the directory's own anchor, which follows the inode
+  /// across a rename), and its one live consumer is the cold half of the
+  /// exclusion fence. A rename that moves the read directory across an exclusion
+  /// boundary is answered by the geometry pass's located repair
+  /// ([`reparent_geometry`](Self::reparent_geometry)), whose re-arm issues a
+  /// FRESH read against the destination; this in-flight one was compiled against
+  /// the pre-move world and is superseded rather than patched.
   enum_reqs: BTreeMap<ReqId, (ScopeId, Arc<PathBuf>)>,
   probes: BTreeMap<ProbeId, ProbeCtx>,
   effects: VecDeque<Effect>,
@@ -1285,6 +1339,31 @@ pub(crate) struct DriverCore {
   /// module docs). `Duration::ZERO` disables the tick — only the loss-triggered
   /// refresh then detects a quiet unmount. Every non-fanotify scope ignores it.
   root_liveness_interval: Duration,
+  /// The caller's exclusion directories, applied to every scope this core owns
+  /// (they are a watcher-wide option, not a per-root one). Empty is the common
+  /// case and short-circuits both fences below.
+  ///
+  /// THE COMMON-LAYER EXCLUSION FENCE, in two halves — the enforcement for every
+  /// backend that carries none of its own:
+  ///
+  /// - [`on_enumerated`](Self::on_enumerated) drops an excluded entry from a cold
+  ///   or re-arm listing, so an excluded directory is never staged, never armed
+  ///   and never descended;
+  /// - [`fence_exclusions`](Self::fence_exclusions) drops a compiled record — or a
+  ///   located rescan — whose absolute path is at or under an exclusion, so a
+  ///   directory created or moved live under one never enters coverage either,
+  ///   and no event from inside one is delivered.
+  ///
+  /// Placing it HERE rather than in the backends is forced, not stylistic. A
+  /// descending backend's only way to decline a directory is to refuse its arm,
+  /// and the Monitor reads a refused arm as coverage LOSS: it drops the node and
+  /// emits a `Rescan` naming exactly that location. Answering "do not tell me
+  /// about this path" with a rescan that names the path is worse than ignoring
+  /// the option, so the suppression has to happen BEFORE the Monitor ever learns
+  /// the directory exists — which is the enumerate listing and the compiled
+  /// record, the two places a directory can enter coverage from. Nothing here
+  /// refuses an arm, so nothing here can produce that rescan.
+  exclusions: Vec<PathBuf>,
 }
 
 impl DriverCore {
@@ -1298,7 +1377,6 @@ impl DriverCore {
       monitor,
       scopes: BTreeMap::new(),
       watch_scopes: BTreeMap::new(),
-      watch_paths: BTreeMap::new(),
       enum_reqs: BTreeMap::new(),
       probes: BTreeMap::new(),
       effects: VecDeque::new(),
@@ -1310,7 +1388,124 @@ impl DriverCore {
       fence_seq: 0,
       cookie_seq: 0,
       root_liveness_interval,
+      exclusions: Vec::new(),
     }
+  }
+
+  /// Returns this core enforcing `exclusions` on every scope it registers — the
+  /// watcher-wide load-shedding set, applied through the two fences documented on
+  /// [`exclusions`](Self::exclusions).
+  #[must_use]
+  pub(crate) fn with_exclusions(mut self, exclusions: Vec<PathBuf>) -> Self {
+    self.exclusions = exclusions;
+    self
+  }
+
+  /// Whether `path` is at or under one of this core's exclusions — the ONE
+  /// matching rule, shared with the sync-cookie birth refusal and with the
+  /// fanotify backend's own fence.
+  fn excluded(&self, path: &Path) -> bool {
+    crate::driver::excluded(&self.exclusions, path)
+  }
+
+  /// Where one watch of `state`'s scope IS: the scope root's canonical path
+  /// joined with the Monitor's own placement of that watch in its node tree.
+  ///
+  /// # Derived, never mirrored
+  ///
+  /// This core keeps no map of watch paths. It kept one once, and the map was a
+  /// second description of a tree the Monitor already owns: a rename is answered
+  /// by rewriting ONE parent link, which relocates a whole subtree in O(1) and
+  /// leaves every absolute path a mirror had stored naming ground the subtree has
+  /// left. Repairing that costs a subtree walk per rename, has to be invoked from
+  /// wherever renames are noticed, and — being an invocation rather than a
+  /// property — is exactly the kind of repair that gets missed on a path nobody
+  /// tested. It WAS missed: the repair sat behind the exclusion fence, so the
+  /// default configuration (no exclusions) never ran it at all, and every arm and
+  /// every enumerate the core dispatched under a moved subtree addressed the old
+  /// path while the delivery beside it named the new one.
+  ///
+  /// Deriving makes the question unaskable. There is one description of where a
+  /// watch is, the Monitor's, and reading it cannot be stale because there is
+  /// nothing to go stale.
+  ///
+  /// The cost is real and stated plainly: one parent-chain walk (a map lookup per
+  /// level) and one fresh `PathBuf`, against a mirror's single lookup and clone.
+  /// It is paid only where a path is actually wanted — dispatching an effect, or
+  /// answering the exclusion fence, both of which already allocate a path — and a
+  /// scope with no exclusions configured never asks per record at all.
+  ///
+  /// # Why the root is answered without a walk
+  ///
+  /// A scope root has no location of its own — it IS the origin — and
+  /// [`Monitor::location_of_checked`] correctly answers it with the empty
+  /// location. Joining an empty location would yield a trailing separator, and
+  /// more importantly the root's path is a fact this core holds directly
+  /// (`state.root`, installed by the spawn barrier and by every root swap), so
+  /// there is nothing to derive. A watched root never moves inside its own tree.
+  ///
+  /// # Why the state is passed in
+  ///
+  /// [`on_batch`](Self::on_batch) DETACHES a scope's [`ScopeState`] from `scopes`
+  /// for the duration of one read, so a derivation that looked the scope up
+  /// itself would answer `None` for every record of every batch — the fence's
+  /// fail-open, silently, on the hot path. Callers that hold a scope id instead
+  /// go through [`scoped_path`](Self::scoped_path).
+  ///
+  /// # Do not store the answer
+  ///
+  /// See [`Monitor::location_of_checked`]'s own warning. A stored copy is the
+  /// mirror this derivation exists to have deleted.
+  ///
+  /// `None` when the scope has no root yet (registered, not spawned) or when the
+  /// Monitor cannot place the watch — a dropped node, a severed ancestry. Never a
+  /// SHORT path: `location_of_checked` reports those conditions as `None` rather
+  /// than as a truncated location, which is what makes an unresolvable watch
+  /// distinguishable from one sitting at the root.
+  fn path_of(&self, state: &ScopeState, watch: WatchId) -> Option<PathBuf> {
+    let root = state.root.as_deref()?;
+    if watch == state.watch {
+      return Some(root.clone());
+    }
+    let mut path = root.clone();
+    for segment in self.monitor.location_of_checked(watch)?.segments() {
+      path.push(segment.as_str());
+    }
+    Some(path)
+  }
+
+  /// [`path_of`](Self::path_of) for a caller holding a scope ID rather than the
+  /// state itself — the drain's route, which looks a scope up per action.
+  fn scoped_path(&self, scope: ScopeId, watch: WatchId) -> Option<PathBuf> {
+    self.path_of(self.scopes.get(&scope)?, watch)
+  }
+
+  /// The absolute path a watch-anchored input addresses: the anchor's own path
+  /// joined with the record's root-relative descent.
+  ///
+  /// One resolution for both lowering profiles, which is what lets ONE fence
+  /// cover them: a descending record anchors at the affected directory's own
+  /// watch and carries a one-segment name, a kernel-recursive record anchors at
+  /// the root watch and carries the whole root-relative location.
+  ///
+  /// `None` when the anchor cannot be placed ([`path_of`](Self::path_of) — a
+  /// superseded or already-dropped watch, or a scope not yet spawned). The fence
+  /// then FAILS OPEN — it suppresses nothing. That direction is deliberate:
+  /// exclusions are documented as an optimization that correctness never depends
+  /// on, so the only cost of not suppressing is a delivery the caller did not
+  /// want, whereas suppressing on an unresolved path would drop one it may have
+  /// needed.
+  fn anchored_path(
+    &self,
+    state: &ScopeState,
+    watch: WatchId,
+    descent: Option<&Location>,
+  ) -> Option<PathBuf> {
+    let mut path = self.path_of(state, watch)?;
+    for segment in descent.into_iter().flat_map(Location::segments) {
+      path.push(segment.as_str());
+    }
+    Some(path)
   }
 
   /// Whether `profile` is a backend that emits NO in-band signal when its root
@@ -1323,6 +1518,8 @@ impl DriverCore {
   /// | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` | `IN_DELETE_SELF`/`IN_MOVE_SELF` | no |
   /// | FSEvents (macOS) | `RootChanged` | `RootChanged` | no |
   /// | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** (fd goes quiet, mark holds the sb alive — L4.1) | `FAN_DELETE_SELF`/`FAN_MOVE_SELF` | **yes** |
+  /// | RDCW (Windows) | fatal source error on any terminal read completion | same signal | no |
+  /// | USN journal (Windows) | fatal source error on a failed journal read | `RootDeath` (the root's own FRN in a delete/rename record) | no |
   ///
   /// Only fanotify's unmount is signal-silent, so only fanotify arms the tick;
   /// its in-tree self-events and every other backend's death signal already
@@ -1355,6 +1552,7 @@ impl DriverCore {
       scope,
       ScopeState {
         watch,
+        root_attempt: None,
         profile,
         requested: root,
         root: None,
@@ -1451,8 +1649,8 @@ impl DriverCore {
   /// Otherwise [`Reconciling`](CoverReconcile::Reconciling): the walk ran, and each pruned
   /// watch's [`RemoveWatch`](Effect::RemoveWatch) and each grown watch's
   /// [`AddWatch`](Effect::AddWatch) / [`Enumerate`](Effect::Enumerate) flow through the ordinary
-  /// descending paths, keeping the reader's `wd` table and the core's addressing maps consistent
-  /// exactly as delete-driven and create-driven transitions do. A `Reconciling` return also
+  /// descending paths, keeping the reader's `wd` table and the core's watch-to-scope map
+  /// consistent exactly as delete-driven and create-driven transitions do. A `Reconciling` return also
   /// updates the fence bookkeeping: the scope's [`CoverFence`] entry is (re)ensured so the next
   /// settle observation sees this window, any `Coalesced` grow kickoff records the born-lossy
   /// memory (see [`CoverFence`]), and `applied_cover` / `settle_floor` are recorded
@@ -1528,7 +1726,7 @@ impl DriverCore {
       .iter()
       .filter(|(watch, watch_scope)| **watch_scope == scope && **watch != root_watch)
       .filter_map(|(watch, _)| {
-        let path = self.watch_paths.get(watch)?;
+        let path = self.path_of(state, *watch)?;
         let strictly_outside = retained
           .iter()
           .all(|r| !path.starts_with(r) && !r.starts_with(path.as_path()));
@@ -1569,8 +1767,8 @@ impl DriverCore {
         .iter()
         .filter(|(_, watch_scope)| **watch_scope == scope)
         .filter_map(|(watch, _)| {
-          let path = self.watch_paths.get(watch)?;
-          r.starts_with(path.as_path())
+          let path = self.path_of(state, *watch)?;
+          r.starts_with(&path)
             .then(|| (path.components().count(), *watch))
         })
         .max_by_key(|(depth, _)| *depth);
@@ -1593,8 +1791,8 @@ impl DriverCore {
         !to_rearm.iter().any(|other| {
           other != *watch
             && matches!(
-              (self.watch_paths.get(watch), self.watch_paths.get(other)),
-              (Some(path), Some(ancestor)) if path.starts_with(ancestor.as_path())
+              (self.path_of(state, **watch), self.path_of(state, *other)),
+              (Some(path), Some(ancestor)) if path.starts_with(&ancestor)
             )
         })
       })
@@ -1642,8 +1840,8 @@ impl DriverCore {
 
     // Turn the queued `Action::Unwatch`es (prune) into `RemoveWatch` effects and the queued
     // `Action::Watch`/`Enumerate`s (grow) into `AddWatch`/`Enumerate` effects, and reconcile
-    // the addressing maps, exactly as Monitor-driven drops and descents do. A no-op when both
-    // halves queued nothing.
+    // the watch-to-scope map, exactly as Monitor-driven drops and descents do. A no-op when
+    // both halves queued nothing.
     self.drain_monitor();
 
     // Record the cover just applied: the NEXT set-cover computes its broadening delta against it
@@ -1680,6 +1878,19 @@ impl DriverCore {
     let fence = FenceId(self.fence_seq);
     self.cover_fences.entry(scope).or_default().open(fence);
     fence
+  }
+
+  /// How many acknowledged reconciles `scope` currently holds pending on its
+  /// coverage fence — the core's half of one admitted `set_cover`, minted by
+  /// [`open_cover_fence`](Self::open_cover_fence) together with the driver's
+  /// parked reply sender and released together with it. The driver reads this as
+  /// the admission bound for awaited reconciles, so neither half can grow past
+  /// the cap while a scope's proof round trip is stalled.
+  pub(crate) fn pending_cover_fences(&self, scope: ScopeId) -> usize {
+    self
+      .cover_fences
+      .get(&scope)
+      .map_or(0, |entry| entry.pending.len())
   }
 
   /// Drops the pending records of `abandoned` fences — callers that cancelled their
@@ -2065,7 +2276,6 @@ impl DriverCore {
           self.monitor.reprofile_root(scope, caps_for(backend));
         }
         let root = Arc::new(meta.root);
-        self.watch_paths.insert(watch, Arc::clone(&root));
         state.root = Some(Arc::clone(&root));
         state.root_dev = Some(meta.root_dev);
         state.root_mnt_id = meta.root_mnt_id;
@@ -2089,9 +2299,16 @@ impl DriverCore {
           | BackendKind::Rdcw
           | BackendKind::UsnJournal => {
             state.publicly_live = true;
-            self
-              .monitor
-              .on_watch_result(watch, Ok(tributary_proto::WatchAck::Installed));
+            let attempt = state.root_attempt;
+            if let Some(attempt) = attempt {
+              self.monitor.on_watch_result(
+                watch,
+                attempt,
+                Ok(tributary_proto::WatchAck::Installed),
+              );
+            } else {
+              debug_assert!(false, "a spawned scope drained its root's bootstrap arm");
+            }
           }
           // Descending: the source starts with NO watches (nothing may be
           // delivered before the Monitor's own watch flow runs), so the
@@ -2114,9 +2331,14 @@ impl DriverCore {
                 dev: meta.identity.dev(),
                 ino,
               });
+            let Some(attempt) = state.root_attempt else {
+              debug_assert!(false, "a spawned scope drained its root's bootstrap arm");
+              return;
+            };
             self.effects.push_back(Effect::AddWatch {
               scope,
               watch,
+              attempt,
               parent: watch,
               name: Segment::new(name),
               path: root,
@@ -2126,7 +2348,11 @@ impl DriverCore {
         }
       }
       Err(err) => {
-        self.monitor.on_watch_result(watch, Err(watch_error(&err)));
+        if let Some(attempt) = state.root_attempt {
+          self
+            .monitor
+            .on_watch_result(watch, attempt, Err(watch_error(&err)));
+        }
       }
     }
     self.drain_monitor();
@@ -2141,7 +2367,11 @@ impl DriverCore {
       return;
     };
     let watch = state.watch;
-    self.monitor.on_watch_result(watch, Err(WatchError::Gone));
+    if let Some(attempt) = state.root_attempt {
+      self
+        .monitor
+        .on_watch_result(watch, attempt, Err(WatchError::Gone));
+    }
     self.drain_monitor();
   }
 
@@ -2157,7 +2387,24 @@ impl DriverCore {
     self.watch_scopes.get(&watch).copied()
   }
 
-  pub(crate) fn on_watch_installed(&mut self, watch: WatchId, outcome: WatchOutcome) {
+  /// The attempt `watch`'s current arm carries — what the driver captures off
+  /// the [`Effect::AddWatch`] it dispatches. Recovered here for tests that are
+  /// not about supersession; one that IS captures the token from the effect and
+  /// replays it after a later arm has taken over.
+  #[cfg(test)]
+  pub(crate) fn arm_attempt(&self, watch: WatchId) -> ArmAttempt {
+    self
+      .monitor
+      .arm_attempt(watch)
+      .unwrap_or_else(|| ArmAttempt::new(NonZeroU64::MIN))
+  }
+
+  pub(crate) fn on_watch_installed(
+    &mut self,
+    watch: WatchId,
+    attempt: ArmAttempt,
+    outcome: WatchOutcome,
+  ) {
     // The fresh-vs-aliased bit is carried through, not collapsed: a binding
     // re-proof keys its dark-window verdict on it (`Installed` = the old
     // binding was dead or rebound, so the settle edge owes the closing
@@ -2182,7 +2429,7 @@ impl DriverCore {
     {
       state.publicly_live = true;
     }
-    self.monitor.on_watch_result(watch, res);
+    self.monitor.on_watch_result(watch, attempt, res);
     self.drain_monitor();
   }
 
@@ -2198,6 +2445,17 @@ impl DriverCore {
   /// alone would descend across (the same breach the fanotify walk closes with the
   /// same fence); the device belt still governs when either mount id is unknown
   /// (the honest below-5.8 degrade).
+  ///
+  /// An entry the caller EXCLUDED is dropped from the listing outright — the cold
+  /// half of the common-layer fence (see [`exclusions`](Self::exclusions)). An
+  /// excluded directory is therefore never staged, so the Monitor never emits its
+  /// `Created`, never reconciles a slot for it, never arms it and never descends
+  /// it. The drop deliberately does NOT set `lossy`: a `Partial` listing means the
+  /// read could not report everything, which forces a covering `Rescan` and a
+  /// bounded retry, whereas this omission is exactly what the caller asked for and
+  /// has nothing to recover. This fence needs no backend gate — an enumerate only
+  /// ever happens on a descending profile, and a descending backend by
+  /// construction has no admission-time enforcement of its own.
   pub(crate) fn on_enumerated(&mut self, req: ReqId, raw: RawEnumerate) {
     let Some((scope, dir)) = self.enum_reqs.remove(&req) else {
       return;
@@ -2220,6 +2478,9 @@ impl DriverCore {
             continue;
           };
           let path = dir.join(name);
+          if self.excluded(&path) {
+            continue;
+          }
           let node = mint(state, &path, NonZeroU64::new(entry.ino), Some(entry.dev));
           let kind = if entry.kind.is_dir() && crosses_mount_boundary(state, &entry) {
             FileKind::Other
@@ -2256,8 +2517,8 @@ impl DriverCore {
       self.scopes.insert(scope, state);
       return;
     }
-    let BatchPayload { events, permit } = payload;
-    let mut batch = self.compile(&mut state, scope, events);
+    let BatchPayload { events, permit, .. } = payload;
+    let mut batch = self.compile(&mut state, scope, events, now);
     batch.permit = Some(permit);
     let fed = Self::settle_if_ready(&mut self.monitor, &mut state, scope, batch, now);
     self.scopes.insert(scope, state);
@@ -2292,6 +2553,13 @@ impl DriverCore {
     let Some(ctx) = self.probes.remove(&probe) else {
       return;
     };
+    // A slot stat answers the Monitor directly: it grounds no batch item, so it
+    // resolves ahead of the park machinery and never touches a scope's park.
+    if let ProbePurpose::SlotKind { req } = ctx.purpose {
+      self.monitor.on_stat_result(req, stat_result(outcome));
+      self.drain_monitor();
+      return;
+    }
     let Some(mut state) = self.scopes.remove(&ctx.scope) else {
       return;
     };
@@ -2340,16 +2608,24 @@ impl DriverCore {
   /// [`on_watch_installed`](Self::on_watch_installed) immediately after this
   /// input — the re-arm-flavored rebuild it kicks off restores coverage
   /// without re-announcing content the commit `Rescan` already covers.
-  pub(crate) fn on_root_replaced(&mut self, scope: ScopeId, meta: RootMeta, now: Instant) {
-    let Some(state) = self.scopes.get_mut(&scope) else {
-      return;
-    };
+  ///
+  /// Returns the [`ArmAttempt`] that replay must be reported under (`None` for
+  /// a kernel-recursive scope, which replays nothing): the rebind supersedes
+  /// every arm the retired transport still owes, so an outcome from one of
+  /// those names an older attempt and is discarded rather than judging the
+  /// binding that replaced it.
+  pub(crate) fn on_root_replaced(
+    &mut self,
+    scope: ScopeId,
+    meta: RootMeta,
+    now: Instant,
+  ) -> Option<ArmAttempt> {
+    let state = self.scopes.get_mut(&scope)?;
     debug_assert_eq!(
       state.profile.is_kernel_recursive(),
       meta.backend.is_kernel_recursive(),
       "replace never crosses lowering profiles; the driver refuses BackendDiverged"
     );
-    let watch = state.watch;
     let backend = meta.backend;
     if backend != state.profile {
       state.profile = backend;
@@ -2358,7 +2634,6 @@ impl DriverCore {
 
     // The world swap — the on_stream_spawned adoption, on a live scope.
     let root = Arc::new(meta.root);
-    self.watch_paths.insert(watch, Arc::clone(&root));
     state.root = Some(root);
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
@@ -2383,6 +2658,13 @@ impl DriverCore {
     // Monitor turns the swap into the epoch-bumped covering Rescan.
     state.park.active = None;
     state.park.queued.clear();
+    // The geometry pass needs no cut of its own here. It holds no state across
+    // records: a rename's source end is read from the Monitor's own reparent
+    // report at the instant the destination is fed, so the halves the rebind
+    // below purges ([`Monitor::rebind_root`]) take every geometry consequence
+    // with them. A destination arriving in the NEW world under a wrapped kernel
+    // cookie finds no half, is reported as the fresh directory it is, and
+    // repairs nothing.
     Self::trust_lost(&mut self.effects, scope, state);
     self.probes.retain(|_, ctx| ctx.scope != scope);
     // Old-world enumerate contexts are dominated too: a descending replace's
@@ -2396,11 +2678,14 @@ impl DriverCore {
     // transport — rebind it (children dropped, root reset to a counted
     // re-arm) BEFORE the overflow cut, whose re-arm kickoff then folds into
     // the reset root instead of re-reading the old tree.
-    if !backend.is_kernel_recursive() {
-      self.monitor.rebind_root(scope);
-    }
+    let replay = if backend.is_kernel_recursive() {
+      None
+    } else {
+      self.monitor.rebind_root(scope).map(|(_, attempt)| attempt)
+    };
     self.monitor.on_overflow(Scope::Root(scope), now);
     self.drain_monitor();
+    replay
   }
 
   /// The root `WatchId` of a live scope — the anchor the driver pre-arms on
@@ -2595,20 +2880,20 @@ impl DriverCore {
       .and_then(|id| u64::try_from(id.ino()).ok())
       .and_then(NonZeroU64::new)
       .map(Identity::new);
-    if self
+    let Some((_, attempt)) = self
       .monitor
       .widen_root(scope, reserved, chain, old_identity)
-      .is_none()
-    {
+    else {
       debug_assert!(false, "a live descending scope accepts its widen splice");
       return WidenCommit::Refused;
-    }
+    };
 
-    // Watch bookkeeping: the new root joins the maps, the old subtree's
-    // entries stay — `watch_paths` are absolute, so nothing is rewritten.
+    // Watch bookkeeping: the new root joins the scope map, and the old
+    // subtree's addressing needs no rewrite — paths are DERIVED, and the splice
+    // above already re-rooted the old root under the adopted chain, so every
+    // watch beneath it composes the same absolute path off the new origin.
     let root = Arc::new(meta.root);
     self.watch_scopes.insert(reserved, scope);
-    self.watch_paths.insert(reserved, Arc::clone(&root));
     state.watch = reserved;
 
     // The world swap — the same adoption `on_root_replaced` performs, minus
@@ -2663,7 +2948,7 @@ impl DriverCore {
     // ordinary drain — the live port is the attached port, so no transport
     // work exists here at all.
     self.drain_monitor();
-    WidenCommit::Committed
+    WidenCommit::Committed(attempt)
   }
 
   /// Feeds a transport-level loss signal for `scope` (a dropped batch, the
@@ -3039,6 +3324,35 @@ impl DriverCore {
   /// The earliest instant [`on_timeout`](Self::on_timeout) has work to do: the
   /// Monitor's pairing deadline, a parked delivery's retry, or a scope's next
   /// root-liveness re-stat, whichever comes first.
+  ///
+  /// # Every table with its own lifetime is represented here
+  ///
+  /// The rule worth stating as one: a per-scope table whose entries expire on
+  /// their own schedule must be REPRESENTED in the scheduler, or swept where it
+  /// is consulted, or both. Retiring it as a side effect of some other timer
+  /// happening to be armed is not a rule, it is a coincidence, and it survives
+  /// only until the mechanism supplying the coincidence changes.
+  ///
+  /// The corollary is the cheaper defence, and the one the rename geometry now
+  /// takes: a derived table with its own lifetime is a lifetime to schedule, so
+  /// deriving nothing — reading the fact off the store that already owns it —
+  /// removes the obligation rather than discharging it. The geometry's source end
+  /// comes from the Monitor's own reparent report, which expires with the
+  /// Monitor's own half, so there is no second expiry for this census to carry.
+  ///
+  /// The rule is checkable because the census is small. Every deadline stored
+  /// anywhere under the run loop is one of three, and all three reach the loop's
+  /// single `min_instant(core.poll_timeout(), cookies.min_retry_at())`:
+  ///
+  /// - the Monitor's pending-move deadline, via [`Monitor::poll_timeout`];
+  /// - [`Attempt::Spent`]'s retry, for a scope's parked delivery and for a dying
+  ///   scope's terminal `Rescan`;
+  /// - [`liveness_deadline`](ScopeState::liveness_deadline), the signal-silent
+  ///   root re-stat.
+  ///
+  /// (The driver's own sync-cookie remove-retry is the other term of that
+  /// `min_instant`, outside this core.) A fourth stored deadline introduced
+  /// anywhere without a leg here reopens the same class of wedge.
   pub(crate) fn poll_timeout(&self) -> Option<Instant> {
     let retry = self
       .scopes
@@ -3087,10 +3401,33 @@ impl DriverCore {
     self.dying.contains_key(&scope)
   }
 
-  /// Settles a fully-resolved batch: grants evidenced vanished-half cookies,
-  /// feeds the Monitor in item order, then applies the deferred unmount
-  /// trust-removals (the monotone rule's late edge). Parks instead when
-  /// probes are still outstanding.
+  /// Every path this core currently holds — or is trying to hold — a kernel
+  /// watch for, sorted: the descending COVERAGE set itself, as opposed to what
+  /// happened to be delivered.
+  ///
+  /// An entry appears the moment the arm is queued and disappears when the node
+  /// drops, so a directory that entered coverage shows up here even if its arm
+  /// never completed and even if nothing was ever emitted for it. That is the
+  /// distinction a delivery-only assertion cannot make, and exclusions are
+  /// precisely a coverage question.
+  ///
+  /// Each entry names where its watch IS, not where it was armed: the set is
+  /// derived per call ([`path_of`](Self::path_of)), so a rename the Monitor
+  /// answered by re-parenting a subtree is reflected here with no repair pass and
+  /// no exclusion configured. A watch the Monitor can no longer place is absent
+  /// rather than reported at a stale path — this is a coverage statement, and a
+  /// watch nothing can address covers nothing.
+  #[cfg(test)]
+  pub(crate) fn covered_paths(&self) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = self
+      .watch_scopes
+      .iter()
+      .filter_map(|(watch, scope)| self.scoped_path(*scope, *watch))
+      .collect();
+    paths.sort();
+    paths
+  }
+
   /// Lowers one raw batch per the scope's backend profile. The FSEvents path
   /// probe-grounds ambiguity; the inotify path is direct. A payload variant
   /// that disagrees with the profile is a seam bug — its events degrade to a
@@ -3100,8 +3437,9 @@ impl DriverCore {
     state: &mut ScopeState,
     scope: ScopeId,
     events: Vec<SourceEvent>,
+    now: Instant,
   ) -> PendingBatch {
-    match state.profile {
+    let mut batch = match state.profile {
       BackendKind::FsEvents => {
         let mut fsevents = Vec::with_capacity(events.len());
         let mut mismatched = false;
@@ -3184,6 +3522,425 @@ impl DriverCore {
         }
         batch
       }
+    };
+    self.fence_exclusions(state, scope, &mut batch, now);
+    batch
+  }
+
+  /// Drops every compiled input the caller's exclusions cover — the live half of
+  /// the common-layer fence (see [`exclusions`](Self::exclusions)).
+  ///
+  /// This is where a descending backend's coverage is actually declined: the
+  /// Monitor arms a directory it learns about from a `Created`/`MovedTo` record,
+  /// so a record the fence removes is a directory the Monitor never learns about,
+  /// never arms and never descends. It is also where the two kernel-recursive
+  /// Windows backends get their enforcement, off exactly the same rule — one
+  /// fence, three backends, and a future descending backend inherits it by
+  /// existing.
+  ///
+  /// Three things are never suppressed, and each is load-bearing:
+  ///
+  /// - a SELF-EVENT (`Ignored`/`MoveSelf`/`DeleteSelf`). Its watch's own death is
+  ///   the one record that says the coverage is over, and a caller who excluded
+  ///   the very tree it asked to watch must still be told the watch ended — the
+  ///   same carve-out the fanotify fence makes for the root's death;
+  /// - a ROOT-scoped or backend-wide overflow. Those cover the reported tree as
+  ///   well as the exclusion, so dropping one would be silent loss over ground
+  ///   the caller IS watching. The scope-wide cover in located clothing (the root
+  ///   watch, no descent) is the same signal and is spared with them;
+  /// - anything whose anchor path cannot be resolved ([`anchored_path`] is `None`)
+  ///   — the fence fails OPEN, never closed.
+  ///
+  /// A located rescan strictly INSIDE an exclusion is dropped, and that is not
+  /// silent loss: nothing under an exclusion is covered, so there is no coverage
+  /// for it to be lost from — while keeping it would hand the caller a rescan
+  /// naming the very path it asked never to hear about, which is the failure mode
+  /// this whole fence exists to avoid.
+  ///
+  /// Runs in STREAM ORDER, and each record's classification and its hand-off to
+  /// the Monitor are ONE step — the record is judged, then fed, before the NEXT
+  /// record is judged. Two passes over the buffer cannot express that, and the
+  /// split is not a tidiness question but the hole itself: one read can carry a
+  /// directory's rename into an exclusion followed by a record from a descendant
+  /// watch that rode across with it. Classify-then-feed judges that suffix against
+  /// a Monitor that has not yet performed the re-parent — so the descendant still
+  /// resolves outside the exclusion, is kept, and the re-parent then delivers it
+  /// under the excluded destination. A record already retained is past recall: the
+  /// located repair queued after the pair covers what comes next, it does not
+  /// unsay what was kept ahead of it. Feeding first moves the Monitor's tree,
+  /// which IS this core's addressing ([`path_of`]), so the suffix resolves where
+  /// the rename actually put it and the ordinary fence suppresses it as ordinary
+  /// excluded ground.
+  ///
+  /// `trailing` is fenced after every item for the same reason it is FED after
+  /// every item: it is later in the stream, so it must be judged against the
+  /// addressing the items left behind.
+  ///
+  /// # Feeding
+  ///
+  /// A profile that answers [`feeds_at_classify`] hands each kept record to the
+  /// Monitor HERE, as it is judged, rather than leaving the read for
+  /// [`settle`](Self::settle) to replay. That closes the phase lag the stream-order
+  /// walk above is otherwise blind to: this core derives every watch path from the
+  /// Monitor's tree, so a read that judges all of its records before telling the
+  /// Monitor about any of them judges the whole read against the world as it stood
+  /// before the read began.
+  ///
+  /// It is also what lets the geometry decision be driven by the Monitor's own
+  /// [`RecordOutcome`] rather than by a prediction: the hand-off happens between
+  /// this record and the next one to be judged, so the report of what it did to the
+  /// tree is available in time. The geometry pass therefore sits wholly on the FAR
+  /// side of the hand-off ([`reparent_geometry`](Self::reparent_geometry)) — it
+  /// acts on the re-parent that happened, and nothing precedes the feed to predict
+  /// one.
+  ///
+  /// The discipline is chosen by the PROFILE, above both of this function's
+  /// early-outs. A scope that configured no exclusions still feeds record by
+  /// record, so the suppressing path and the default path are one path — the
+  /// alternative is a default configuration whose feeding no exclusion cell ever
+  /// covers.
+  ///
+  /// Order is unchanged either way: items in stream order, then `trailing`, which
+  /// under feed-at-classify is simply the part `settle` still has to feed.
+  ///
+  /// # The geometry pass has no bound of its own, and must not grow one back
+  ///
+  /// This pass once mirrored each parked rename SOURCE in a per-scope table so a
+  /// later destination could look one up. A mirror is retained state, retention
+  /// wants a ceiling, and the ceiling was a refusal: at a full table a rename
+  /// source was not parked, classification stopped at that record, and its whole
+  /// read suffix was dropped behind one scope-wide `Rescan`. Reading the source off
+  /// the Monitor's own reparent report retains nothing here, so the ceiling and its
+  /// refusal are gone with the table.
+  ///
+  /// A reader who notices that a burst of unpaired renames is now retained without
+  /// any limit visible from here will be tempted to put the ceiling back. It was
+  /// never a ceiling on the burst. Every source this pass could park is a source the
+  /// Monitor parks too — the same record, one step later in the same walk, keyed by
+  /// `(scope, cookie)` against the mirror's `cookie` — so the mirror's population
+  /// was a per-scope subset of `Monitor::pending_moves`, retired on the same
+  /// deadline. That store is UNCAPPED: `park_pending_move` is its single insert
+  /// funnel and inserts unconditionally, and each `PendingMove` carries a
+  /// `Location`, an `Evidence` and six further fields against the mirror's one
+  /// optional path. So the adversarial stream that filled the mirror already grows
+  /// the primary store past any number the mirror would have refused at, and always
+  /// did. Capping the shadow moved no memory ceiling; it only bought a dropped read
+  /// suffix and a scope-wide re-read per over-cap read.
+  ///
+  /// A bound on rename retention is therefore a question for `pending_moves`, where
+  /// the retention actually is, and it has to be answered there — with the Monitor's
+  /// own pairing semantics in hand — rather than re-imposed on a derived table whose
+  /// refusal costs coverage and defends nothing.
+  ///
+  /// [`anchored_path`]: Self::anchored_path
+  /// [`path_of`]: Self::path_of
+  fn fence_exclusions(
+    &mut self,
+    state: &mut ScopeState,
+    scope: ScopeId,
+    batch: &mut PendingBatch,
+    now: Instant,
+  ) {
+    // INV-FEED. The feeding discipline is read off the PROFILE, before either
+    // early-out, so a scope with no exclusions configured reaches the Monitor by
+    // exactly the same route as one with them (see [`feeds_at_classify`]).
+    let at_classify = feeds_at_classify(state.profile);
+    debug_assert!(
+      !runs_rename_geometry(state.profile) || at_classify,
+      "INV-FEED: geometry => feed-at-classify — a profile that resolves paths \
+       mid-read must not classify its records over the phase lag"
+    );
+    debug_assert!(
+      !at_classify || batch.awaiting == 0,
+      "INV-FEED: feed-at-classify => awaiting == 0 — a probe-parked batch's items \
+       are placeholders and must not reach the Monitor before their probes answer"
+    );
+    // The fence itself stands down where the backend decides exclusions at
+    // admission, and where the caller configured none.
+    let fence = !self.exclusions.is_empty() && !backend_enforces_exclusions(state.profile);
+    // The geometry half additionally stands down for a kernel-recursive profile
+    // (see [`reparent_geometry`](Self::reparent_geometry)); the fence itself does
+    // not.
+    let geometry = fence && runs_rename_geometry(state.profile);
+    if !fence && !at_classify {
+      return;
+    }
+    for item in &mut batch.items {
+      let planned = core::mem::take(&mut item.planned);
+      // Nothing is retained under feed-at-classify — each kept record leaves for
+      // the Monitor as it is judged — so the buffer that would hold them is not
+      // allocated.
+      let mut kept = if at_classify {
+        Vec::new()
+      } else {
+        Vec::with_capacity(planned.len())
+      };
+      for planned in planned {
+        if fence && self.fenced(state, &planned) {
+          continue;
+        }
+        // Only a KEPT record carries geometry: a rename half the fence just
+        // suppressed has an unreported endpoint, which means no watched subtree
+        // to carry across — the destination reconciles a fresh directory and
+        // cold-walks it, and that walk is fenced entry by entry.
+        //
+        // The destination slot a repair would name, taken while the record is
+        // still in hand: the feed consumes it, and the verdict that decides
+        // whether a repair is owed does not exist until the feed has happened.
+        let landing = if geometry {
+          Self::landing(&planned)
+        } else {
+          None
+        };
+        let outcome = Self::accept(&mut self.monitor, state, &mut kept, planned, now);
+        // The repair is by construction anchored at a reported destination, so
+        // it needs no fencing of its own. It follows the record it repairs, in
+        // this order, on both disciplines.
+        if let Some((watch, target)) = landing
+          && let Geometry::Repair(repair) =
+            self.reparent_geometry(state, scope, watch, target.as_ref(), &outcome)
+        {
+          Self::accept(&mut self.monitor, state, &mut kept, repair, now);
+        }
+      }
+      item.planned = kept;
+    }
+    if fence {
+      batch
+        .trailing
+        .retain(|planned| !self.fenced(state, planned));
+    }
+  }
+
+  /// Takes one record the fence kept: handed to the Monitor AT ONCE under a
+  /// feed-at-classify profile, buffered into `kept` for
+  /// [`settle`](Self::settle) otherwise.
+  ///
+  /// The two disciplines differ only in WHEN a record leaves, never in which
+  /// records leave or in what order: the fence walks one read in stream order and
+  /// `settle` replays the buffer in that same order, so the sequence the Monitor
+  /// observes is identical. `trailing` is not accepted here — it is judged and fed
+  /// after every item on both disciplines, which under feed-at-classify means it
+  /// is simply left for `settle` to feed once the items are already gone.
+  ///
+  /// Returns what the hand-off did to the watch tree's shape. A BUFFERED record has
+  /// not reached the Monitor, so it truthfully reports [`RecordOutcome::Nothing`]:
+  /// nothing has been done to the tree yet. That cannot mislead the one caller that
+  /// reads the value, because [`runs_rename_geometry`] implies
+  /// [`feeds_at_classify`] (INV-FEED's first leg, asserted at compile time) — a
+  /// profile whose geometry consumes the outcome never takes the buffering branch
+  /// at all.
+  fn accept(
+    monitor: &mut Monitor,
+    state: &ScopeState,
+    kept: &mut Vec<Planned>,
+    planned: Planned,
+    now: Instant,
+  ) -> RecordOutcome {
+    if !feeds_at_classify(state.profile) {
+      kept.push(planned);
+      return RecordOutcome::Nothing;
+    }
+    Self::feed(monitor, planned, now)
+  }
+
+  /// Whether an exclusion lies AT OR UNDER `path` — the fence's own containment
+  /// predicate run the other way round, with `path` as the exclusion set and each
+  /// exclusion as the candidate.
+  ///
+  /// [`excluded`](Self::excluded) answers "is this path inside an exclusion", which
+  /// is what suppression needs. Re-parenting needs the mirror question — "does this
+  /// subtree CONTAIN an exclusion" — because that is what decides whether rewriting
+  /// the subtree's path changes which of its descendants are reported.
+  ///
+  /// Deliberately expressed through [`crate::driver::excluded`] rather than a fresh
+  /// prefix walk: that is the ONE matching rule the cold fence, the live fence, the
+  /// sync-cookie birth refusal and the fanotify backend all share, and a second rule
+  /// here could drift out of step with it and re-open the hole from the other side.
+  fn exclusion_under(&self, path: &Path) -> bool {
+    let containing = [path.to_path_buf()];
+    self
+      .exclusions
+      .iter()
+      .any(|exclusion| crate::driver::excluded(&containing, exclusion))
+  }
+
+  /// The destination slot a rename's repair would be lowered against, taken from a
+  /// record BEFORE it is fed.
+  ///
+  /// The two inputs of the post-feed decision sit on opposite sides of the hand-off:
+  /// the feed consumes the record, and the outcome that decides whether a repair is
+  /// owed at all does not exist until the feed has happened. So the record's own
+  /// half is captured here, and joined with the Monitor's report afterwards.
+  ///
+  /// Gated on the KIND alone. Only a `MovedTo` can report a reparent, and gating any
+  /// tighter — on a directory flag the destination half is free to omit — would let
+  /// a real reparent go unrepaired because its record under-described itself.
+  fn landing(planned: &Planned) -> Option<(WatchId, Option<Location>)> {
+    match planned {
+      Planned::Rec(rec) if matches!(rec.kind(), RecordKind::MovedTo) => {
+        Some((rec.watch(), rec.target().cloned()))
+      }
+      _ => None,
+    }
+  }
+
+  /// Re-enumerates a moved directory subtree whose RENAME changed the exclusion
+  /// geometry over it — the one thing the record-by-record fence structurally
+  /// cannot see.
+  ///
+  /// [`fenced`](Self::fenced) judges each record by its own anchored endpoint, so a
+  /// rename whose two endpoints are BOTH reported is preserved whole, as it must be.
+  /// But the Monitor answers such a rename by re-parenting the already-known watch
+  /// subtree in place — an O(1) carry-over that rewrites the subtree's path while
+  /// carrying every descendant across untouched. Exclusions match on path prefixes,
+  /// so which descendants are reported is a function of that very path, and a move
+  /// whose endpoints sit on different sides of an exclusion leaves the coverage
+  /// describing a tree the fence no longer agrees with — in BOTH directions, and
+  /// permanently, because nothing else ever re-walks it:
+  ///
+  /// - **out of an exclusion.** With root `/r` and `/r/a/cache` excluded, the cold
+  ///   walk of `/r/a` skipped `cache` and armed nothing there. Renaming `/r/a` to
+  ///   `/r/b` makes `cache` reportable, yet the bare re-parent adds nothing: no watch
+  ///   exists at `/r/b/cache`, no record can be attributed to it, and a newly visible
+  ///   subtree is blind forever. This is silent, permanent loss.
+  /// - **into an exclusion.** With `/r/a/cache` excluded, `/r/b/cache` IS covered.
+  ///   Renaming `/r/b` to `/r/a` leaves those watches installed, so the scope keeps
+  ///   spending kernel watches — and delivering — on ground the caller excluded to
+  ///   shed exactly that cost.
+  ///
+  /// The rule is [`exclusion_under`](Self::exclusion_under) at EITHER endpoint, which
+  /// is how the fanotify admission map and the USN journal decide the same question:
+  /// one predicate, asked of both ends, never a second matching rule. Deliberately
+  /// CONSERVATIVE in the same way — an exclusion sitting under both endpoints at the
+  /// same relative offset leaves the geometry genuinely unchanged yet answers `true`,
+  /// costing one re-enumeration on a path this rare.
+  ///
+  /// Where it DIFFERS is the repair, because inotify's coverage is not a private
+  /// admission map it can forget and relearn locally: it is the Monitor's node tree
+  /// plus real kernel watches. So the repair is stated as the Monitor's own located
+  /// loss signal at the destination, queued immediately AFTER the pairing record so
+  /// the re-parent has already landed. The Monitor answers that signal by emitting a
+  /// covering `Rescan` there and re-arming from the destination's parent — a complete
+  /// re-arm read prunes vanished names, arms new ones and cascades into survivors, so
+  /// it descends into the just-reparented directory and reconciles it against a fresh
+  /// listing. That listing is produced by [`on_enumerated`](Self::on_enumerated),
+  /// which applies the SAME exclusion rule: a newly reportable child is listed and
+  /// armed, a newly excluded one is absent and pruned. Both directions, one existing
+  /// mechanism, no parallel bookkeeping.
+  ///
+  /// Runs only where the common fence runs AND coverage is per-directory. A backend
+  /// that enforces exclusions itself already handles its own geometry, and a
+  /// kernel-recursive one has no per-directory watches to re-arm — its single stream
+  /// covers the destination the moment the re-parent lands — so escalating there
+  /// would be a bare `Rescan` repairing nothing.
+  ///
+  /// Loss is never silent: when the escalation cannot be placed (the destination
+  /// anchor resolves no path) it degrades to the scope-wide cover, whose recovery
+  /// re-arms everything. That cover replaces a REPAIR, never an ordering — it
+  /// re-reads what comes next and cannot unsay a record the same read already
+  /// retained under the pre-move addressing.
+  ///
+  /// Called per RECORD from the fence's own stream-ordered walk rather than as a
+  /// second pass, and the ORDER of the repair is the reason: it must be queued
+  /// directly behind the record that provoked it, so the Monitor answers it with
+  /// the re-parent already landed and the located `Rescan` names the destination.
+  ///
+  /// # What this pass is NOT
+  ///
+  /// It does not re-address anything. Watch paths are DERIVED from the Monitor's
+  /// own tree ([`path_of`](Self::path_of)), so the O(1) re-parent that carried the
+  /// subtree across has already moved every path under it — for every scope,
+  /// whether or not exclusions are configured, and with no walk. This pass owes
+  /// only the question derivation cannot answer: a moved subtree's watches are
+  /// correctly NAMED at their new home, but which directories under that home
+  /// should be watched AT ALL is a function of the exclusion set, and that
+  /// membership did not move with them. A subtree carried out of an exclusion has
+  /// correct names for the watches it holds and no watches at all for the children
+  /// the cold walk skipped; a subtree carried into one keeps watches on ground the
+  /// caller excluded. Only a re-enumeration settles membership, and only a scope
+  /// with exclusions can have any membership to settle — which is why the pass is
+  /// gated on the fence, while addressing is not gated on anything.
+  ///
+  /// # It acts on the reparent that HAPPENED
+  ///
+  /// The trigger is the Monitor's own [`RecordOutcome`] for the record just fed,
+  /// not a source this pass parked and predicted a pairing for. A prediction and a
+  /// performance are two implementations of one rule, and two implementations skew:
+  /// the Monitor pairs only inside the window, only over a held subtree, and only
+  /// when the O(1) reparent it then attempts actually succeeds. Every case that
+  /// fails one of those tests reports [`RecordOutcome::Nothing`] and is answered
+  /// here by repairing nothing — which is correct by construction, because a
+  /// subtree nothing relocated has crossed no exclusion boundary.
+  ///
+  /// # Composing the source
+  ///
+  /// [`RecordOutcome::Reparented`] reports a `(from_parent, from)` SLOT rather than
+  /// an absolute path, and `from` is the SCOPE-relative location the Monitor
+  /// reconstructed from its live tree at report time — `from_parent`'s own location
+  /// already joined with the half's name. So the absolute source is the scope
+  /// ROOT's path joined with it, and `from_parent` names the anchor the
+  /// reconstruction ran against rather than a second anchor to join onto (joining
+  /// against `from_parent`'s own path would count that parent's location twice).
+  ///
+  /// The root is also the one anchor a post-feed composition cannot get wrong: a
+  /// watched root never moves inside its own tree, so it is the fixed point every
+  /// other path is derived from. The source is then the Monitor's live description
+  /// of where the subtree was, plus that fixed point — which is exactly what an
+  /// absolute path pinned at `MovedFrom` could not be, since an ancestor renamed
+  /// mid-window moves the ground under it and leaves the pin naming nothing.
+  ///
+  /// Composed AFTER the record has been fed, which is safe for the same reason: the
+  /// reparent this outcome reports rewrote a child edge inside the tree, and the
+  /// root path it is joined onto is not something any reparent can touch.
+  fn reparent_geometry(
+    &self,
+    state: &ScopeState,
+    scope: ScopeId,
+    watch: WatchId,
+    target: Option<&Location>,
+    outcome: &RecordOutcome,
+  ) -> Geometry {
+    let Some((_, from)) = outcome.reparented() else {
+      return Geometry::Nothing;
+    };
+    let from = self.anchored_path(state, state.watch, Some(from));
+    let to = self.anchored_path(state, watch, target);
+    // One predicate, asked of both ends. An endpoint that resolved no
+    // path answers "changed" for the same reason the fanotify map does
+    // for a moved node whose ancestry no longer reaches the root: with
+    // no path to compare, the safe direction is the one that costs a
+    // re-enumeration, not the one that costs coverage.
+    let changed = |end: Option<&Path>| end.is_none_or(|path| self.exclusion_under(path));
+    if !changed(from.as_deref()) && !changed(to.as_deref()) {
+      return Geometry::Nothing;
+    }
+    // The located repair needs a destination to name. Without one the
+    // scope-wide cover is the honest degrade — never a quiet drop, and
+    // never a `Rescan` naming a path that could not be resolved.
+    Geometry::Repair(match (to, target) {
+      (Some(_), Some(target)) => Planned::Over(located(watch, Some(target.clone()))),
+      _ => Planned::Over(Scope::Root(scope)),
+    })
+  }
+
+  /// Whether one planned Monitor input addresses only excluded ground.
+  fn fenced(&self, state: &ScopeState, planned: &Planned) -> bool {
+    match planned {
+      Planned::Rec(rec) => {
+        !rec.kind().is_self_event()
+          && self
+            .anchored_path(state, rec.watch(), rec.target())
+            .is_some_and(|path| self.excluded(&path))
+      }
+      Planned::Over(Scope::Subtree(sub)) => {
+        let scope_wide = sub.watch() == state.watch && sub.descent().is_empty();
+        !scope_wide
+          && self
+            .anchored_path(state, sub.watch(), Some(sub.descent()))
+            .is_some_and(|path| self.excluded(&path))
+      }
+      Planned::Over(_) => false,
     }
   }
 
@@ -3203,6 +3960,17 @@ impl DriverCore {
     }
   }
 
+  /// Settles a fully-resolved batch: grants evidenced vanished-half cookies,
+  /// feeds the Monitor in item order, then applies the deferred unmount
+  /// trust-removals (the monotone rule's late edge).
+  ///
+  /// A feed-at-classify profile ([`feeds_at_classify`]) arrives here with its
+  /// items already emptied by the fence, so what it settles is `trailing` alone —
+  /// which is where `trailing` belongs on both disciplines, after every item. The
+  /// other two duties are the reason the split is safe to make per profile: a
+  /// cookie grant needs a `cookie_candidate` and `evidenced` partners, and a
+  /// deferred unmount needs `deferred_unmounts`, and all three are filled only by
+  /// the FSEvents path — which does not feed at classify time.
   fn settle(
     monitor: &mut Monitor,
     state: &mut ScopeState,
@@ -3293,10 +4061,22 @@ impl DriverCore {
     batch.trailing.extend(covers);
   }
 
-  fn feed(monitor: &mut Monitor, planned: Planned, now: Instant) {
+  /// Hands one planned input to the Monitor and reports what it did to the watch
+  /// tree's SHAPE.
+  ///
+  /// The [`RecordOutcome`] is the Monitor's own account of the reparent it just
+  /// performed — never a prediction re-derived from the same record by a second
+  /// implementation of the same rule. That is what the geometry pass decides on
+  /// ([`reparent_geometry`](Self::reparent_geometry)).
+  ///
+  /// An overflow instruction moves no subtree, so it reports nothing.
+  fn feed(monitor: &mut Monitor, planned: Planned, now: Instant) -> RecordOutcome {
     match planned {
       Planned::Rec(rec) => monitor.on_os_record(rec, now),
-      Planned::Over(scope) => monitor.on_overflow(scope, now),
+      Planned::Over(scope) => {
+        monitor.on_overflow(scope, now);
+        RecordOutcome::Nothing
+      }
     }
   }
 
@@ -3306,11 +4086,11 @@ impl DriverCore {
       let Some(mut state) = self.scopes.remove(&scope) else {
         return;
       };
-      let Some(BatchPayload { events, permit }) = state.park.queued.pop_front() else {
+      let Some(BatchPayload { events, permit, .. }) = state.park.queued.pop_front() else {
         self.scopes.insert(scope, state);
         return;
       };
-      let mut batch = self.compile(&mut state, scope, events);
+      let mut batch = self.compile(&mut state, scope, events, now);
       batch.permit = Some(permit);
       let fed = Self::settle_if_ready(&mut self.monitor, &mut state, scope, batch, now);
       self.scopes.insert(scope, state);
@@ -3361,6 +4141,12 @@ impl DriverCore {
   /// Resolves one probe's plan.
   fn resolve(state: &mut ScopeState, purpose: ProbePurpose, outcome: ProbeOutcome) -> Resolved {
     match purpose {
+      // A slot stat grounds no batch item; `on_probe_result` answers it before
+      // this table is ever reached.
+      ProbePurpose::SlotKind { .. } => {
+        debug_assert!(false, "a slot stat is answered ahead of the batch table");
+        Resolved::plain(usize::MAX, Vec::new())
+      }
       ProbePurpose::RootAlive { item } => {
         let kind = match outcome {
           ProbeOutcome::Missing => RecordKind::DeleteSelf,
@@ -3376,23 +4162,37 @@ impl DriverCore {
         target,
         path,
       } => {
+        // The word's content and metadata bits are facts existence cannot judge:
+        // an lstat says what is THERE, never whether the bytes or the mode moved
+        // while it was. They therefore ride through both arms below, and only the
+        // STRUCTURAL half is grounded — which is exactly what the probe is for.
+        let content = Evidence::new()
+          .maybe_modified(flags.item_modified())
+          .maybe_attrib(
+            flags.item_inode_meta_mod()
+              || flags.item_change_owner()
+              || flags.item_xattr_mod()
+              || flags.item_finder_info_mod(),
+          );
         let planned = match outcome {
           ProbeOutcome::Missing => {
-            let rec = record_with(state, RecordKind::Removed, target, dir_hint(flags), None);
-            vec![Planned::Rec(rec)]
+            let proven = content.with_removed();
+            match record_proved(state, proven, target.clone(), dir_hint(flags), None) {
+              Some(rec) => vec![Planned::Rec(rec)],
+              None => vec![Planned::Over(located(state.watch, target))],
+            }
           }
           ProbeOutcome::Present { kind, file_id, dev } => {
             learn_device(state, &path, dev);
-            let verb = if flags.item_created() {
-              RecordKind::Created
-            } else if flags.item_modified() {
-              RecordKind::Modified
-            } else {
-              RecordKind::Attrib
-            };
+            let proven = content.maybe_created(flags.item_created());
             let node = mint(state, &path, file_id, Some(dev));
-            let rec = record_with(state, verb, target, Some(kind.is_dir()), node);
-            vec![Planned::Rec(rec)]
+            match record_proved(state, proven, target.clone(), Some(kind.is_dir()), node) {
+              Some(rec) => vec![Planned::Rec(rec)],
+              // The word's ONLY grounded verb was a removal existence just
+              // disproved: nothing is left to name, so the located rescan grounds
+              // whatever occupies the path now.
+              None => vec![Planned::Over(located(state.watch, target))],
+            }
           }
           ProbeOutcome::Failed => vec![Planned::Over(located(state.watch, target))],
         };
@@ -3589,11 +4389,17 @@ impl DriverCore {
       match action {
         tributary_proto::Action::Watch(cmd) => {
           if let Some(scope) = cmd.target().root() {
-            let root = self
-              .scopes
-              .get(&scope)
-              .map(|state| state.requested.clone())
-              .unwrap_or_default();
+            // The bootstrap arm is answered out of band — by the spawn itself on a
+            // kernel-recursive backend, by the root's own `AddWatch` on a descending
+            // one — so its attempt is captured HERE, where the action is consumed,
+            // and echoed at whichever of those answers it.
+            let root = match self.scopes.get_mut(&scope) {
+              Some(state) => {
+                state.root_attempt = Some(cmd.attempt());
+                state.requested.clone()
+              }
+              None => PathBuf::new(),
+            };
             self.effects.push_back(Effect::SpawnStream { scope, root });
           } else if let Some(scope) = cmd.target().rearm_root() {
             // A root binding re-proof: re-add the EXISTING root's kernel watch
@@ -3632,6 +4438,7 @@ impl DriverCore {
             self.effects.push_back(Effect::AddWatch {
               scope,
               watch: cmd.id(),
+              attempt: cmd.attempt(),
               parent: cmd.id(),
               name: Segment::new(name),
               path: root,
@@ -3639,17 +4446,20 @@ impl DriverCore {
             });
           } else if let Some(child) = cmd.target().as_child() {
             let parent = child.parent();
-            let (Some(&scope), Some(parent_path)) = (
-              self.watch_scopes.get(&parent),
-              self.watch_paths.get(&parent),
-            ) else {
+            let Some(&scope) = self.watch_scopes.get(&parent) else {
               debug_assert!(false, "a child watch descends from a known parent");
+              continue;
+            };
+            // Addressed off the parent's CURRENT placement, so a child armed
+            // under a subtree an earlier record in this same read relocated
+            // opens at the path the delivery beside it names.
+            let Some(parent_path) = self.scoped_path(scope, parent) else {
+              debug_assert!(false, "a child watch descends from a placeable parent");
               continue;
             };
             let name = child.name().clone();
             let path = Arc::new(parent_path.join(name.as_str()));
             self.watch_scopes.insert(cmd.id(), scope);
-            self.watch_paths.insert(cmd.id(), Arc::clone(&path));
             // The object the enumerate discovered, so the arm can confirm the
             // open lands on it: the Monitor node carries the entry's identity
             // (its inode), and single-device descent means a descended child is
@@ -3666,6 +4476,7 @@ impl DriverCore {
             self.effects.push_back(Effect::AddWatch {
               scope,
               watch: cmd.id(),
+              attempt: cmd.attempt(),
               parent,
               name,
               path,
@@ -3681,10 +4492,9 @@ impl DriverCore {
             .is_some_and(|state| state.watch == watch);
           if !is_root {
             // A per-directory child watch the Monitor dropped: disarm it and
-            // forget its addressing. Fire-and-forget — the unwatch carries no
-            // result contract, and an unreached wd dies with the stream.
+            // forget which scope owned it. Fire-and-forget — the unwatch carries
+            // no result contract, and an unreached wd dies with the stream.
             let scope = self.watch_scopes.remove(&watch);
-            self.watch_paths.remove(&watch);
             if let Some(scope) = scope {
               self.effects.push_back(Effect::RemoveWatch { scope, watch });
             }
@@ -3771,27 +4581,51 @@ impl DriverCore {
               .collect();
             for watch in dead {
               self.watch_scopes.remove(&watch);
-              self.watch_paths.remove(&watch);
             }
-            self.watch_paths.remove(&watch);
             self.enum_reqs.retain(|_, (s, _)| *s != scope);
             self.effects.push_back(Effect::TeardownStream { scope });
           }
         }
         tributary_proto::Action::Enumerate(cmd) => {
           let watch = cmd.dir();
-          let (Some(&scope), Some(path)) =
-            (self.watch_scopes.get(&watch), self.watch_paths.get(&watch))
-          else {
+          let Some(&scope) = self.watch_scopes.get(&watch) else {
             debug_assert!(false, "an enumerate reads a known directory");
             continue;
           };
-          self.enum_reqs.insert(cmd.req(), (scope, Arc::clone(path)));
+          let Some(path) = self.scoped_path(scope, watch) else {
+            debug_assert!(false, "an enumerate reads a placeable directory");
+            continue;
+          };
+          let path = Arc::new(path);
+          self.enum_reqs.insert(cmd.req(), (scope, Arc::clone(&path)));
           self.effects.push_back(Effect::Enumerate {
             req: cmd.req(),
             watch,
-            path: Arc::clone(path),
+            path,
           });
+        }
+        tributary_proto::Action::Stat(cmd) => {
+          // The Monitor asks only for a slot a listing left unclassifiable. This
+          // driver's own listing lowers every `FileType` it can name and falls back
+          // to `Other`, so the request is unreachable through it — but a stat is a
+          // protocol obligation, and dropping one would leave the Monitor's slot
+          // dark forever rather than merely until the answer lands. It is served on
+          // the blocking pool by the same `lstat` the FSEvents grounding uses.
+          let Some(child) = cmd.of().as_child() else {
+            debug_assert!(false, "the Monitor stats a named child slot");
+            continue;
+          };
+          let Some(&scope) = self.watch_scopes.get(&child.parent()) else {
+            debug_assert!(false, "a stat names a slot under a known directory");
+            continue;
+          };
+          let Some(parent_path) = self.scoped_path(scope, child.parent()) else {
+            debug_assert!(false, "a stat names a slot under a placeable directory");
+            continue;
+          };
+          let path = parent_path.join(child.name().as_str());
+          let probe = self.mint_probe(scope, ProbePurpose::SlotKind { req: cmd.req() });
+          self.effects.push_back(Effect::Probe { probe, path });
         }
         other => {
           debug_assert!(false, "the Monitor requests no other work: {other:?}");
@@ -3931,6 +4765,27 @@ impl Resolved {
   }
 }
 
+/// Lowers one executed `lstat` into the Monitor's stat vocabulary. A vanished
+/// path is the benign race the Monitor settles as an empty slot; an unreadable
+/// one settles nothing and leaves the slot's deficit standing.
+fn stat_result(outcome: ProbeOutcome) -> StatResult {
+  match outcome {
+    // Identity is minted as the enumerate mints it — the bare inode, for an object
+    // the probe could name. The probed DEVICE is deliberately not consulted: this
+    // answer settles a kind, and the mount/device descent gate the enumerate applies
+    // still governs whether the Monitor may go below the slot at all.
+    ProbeOutcome::Present { kind, file_id, .. } => {
+      let entry = StatEntry::new(kind);
+      StatResult::Ok(match file_id.map(Identity::new) {
+        Some(node) => entry.with_node(node),
+        None => entry,
+      })
+    }
+    ProbeOutcome::Missing => StatResult::Failed(IoClass::NotFound),
+    ProbeOutcome::Failed => StatResult::Failed(IoClass::Io),
+  }
+}
+
 /// Builds a record with identity minted from the event-side fileID.
 fn record_from_event(
   state: &ScopeState,
@@ -3963,6 +4818,29 @@ fn record_with(
     rec = rec.with_node(node);
   }
   rec
+}
+
+/// Builds a record for the whole fact set `proven`, addressing `target` under the
+/// scope's root watch. `None` when the set names no dirent verb — the caller then
+/// owes a located rescan rather than a fabricated record.
+fn record_proved(
+  state: &ScopeState,
+  proven: Evidence,
+  target: Option<Location>,
+  is_dir: Option<bool>,
+  node: Option<Identity>,
+) -> Option<OsRecord> {
+  let mut rec = OsRecord::proved(state.watch, proven)?;
+  if let Some(target) = target {
+    rec = rec.with_target(target);
+  }
+  if let Some(is_dir) = is_dir {
+    rec = rec.with_is_dir(is_dir);
+  }
+  if let Some(node) = node {
+    rec = rec.with_node(node);
+  }
+  Some(rec)
 }
 
 /// A located subtree overflow at `target` under `watch` (the watch itself
@@ -4237,7 +5115,7 @@ fn path_bytes(path: &Path) -> &[u8] {
 }
 
 /// The Monitor capability profile a backend registers with.
-fn caps_for(backend: BackendKind) -> Capabilities {
+const fn caps_for(backend: BackendKind) -> Capabilities {
   let caps = Capabilities::new().with_supports_push().with_native_move();
   match backend {
     // Every kernel-recursive backend registers the KR profile: one native
@@ -4252,6 +5130,144 @@ fn caps_for(backend: BackendKind) -> Capabilities {
     BackendKind::Inotify => caps.with_lossy_watch_teardown(),
   }
 }
+
+/// Whether `backend` decides exclusions ITSELF, at admission, before an event
+/// ever reaches the common layer — the composition gate for the live half of the
+/// common-layer fence ([`DriverCore::fence_exclusions`]).
+///
+/// The fence supplies enforcement exactly where a backend has none. Where a
+/// backend already has one, re-deciding here could only DIFFER from it, because
+/// the backend decides with strictly more context:
+///
+/// - **FSEvents** hands the set to the OS, which drops the events before the
+///   process sees them (a rejected set fails the spawn outright, so enforcement
+///   is proven, never partial). Its records are also minted at probe resolution,
+///   AFTER compile, so a fence here would cover only some of them — partial
+///   suppression is worse than none.
+/// - **fanotify** fences at admission, where it holds the atomic rename pair. It
+///   deliberately forwards a rename that CROSSES the boundary — the crossing is
+///   what tells the consumer the object left the reported tree — and suppresses
+///   only a rename with NO end in the reported tree (an end fails to be
+///   reported either because it is excluded or because it lies outside the
+///   watched root — the two are not the same test). A second, half-by-half
+///   decision here would silently rewrite that pair into a bare removal.
+///
+/// Every other backend answers `false` and is enforced by the fence, INCLUDING a
+/// future descending one: a descending backend cannot enforce at admission (its
+/// only refusal is an arm, which the Monitor reads as loss), so the default is
+/// the correct answer for the whole class rather than a per-backend opinion.
+const fn backend_enforces_exclusions(backend: BackendKind) -> bool {
+  matches!(backend, BackendKind::FsEvents | BackendKind::Fanotify)
+}
+
+/// Whether `backend` runs the GEOMETRY half of the common-layer fence — the half
+/// that re-enumerates a moved subtree whose rename crossed an exclusion boundary
+/// ([`DriverCore::reparent_geometry`]), read off the Monitor's own report on the
+/// far side of each record's hand-off.
+///
+/// A pure function of the profile, deliberately: the caller's exclusion set
+/// decides whether the geometry pass has anything to do on a given read, but not
+/// whether the profile is one that resolves per-directory paths mid-read at all.
+/// That distinction is what [`feeds_at_classify`] is coupled to — a discipline
+/// that flipped with the configuration would make the exclusion path a different
+/// code path from the default one.
+const fn runs_rename_geometry(backend: BackendKind) -> bool {
+  !backend_enforces_exclusions(backend) && !caps_for(backend).kernel_recursive()
+}
+
+/// Whether `backend` hands each kept record to the Monitor AS THE FENCE
+/// CLASSIFIES IT, instead of buffering the whole read for
+/// [`settle`](DriverCore::settle).
+///
+/// # Why the discipline exists
+///
+/// Batch-then-settle puts a PHASE LAG between the two halves of one read: the
+/// fence classifies every record before the Monitor is told about any of them.
+/// This core derives every watch path from the Monitor's own tree
+/// ([`DriverCore::path_of`]), so under the lag a descending profile's addressing
+/// question — "where does this record's watch live NOW" — is answered by a
+/// Monitor that has not yet heard a single record of the read it is being asked
+/// about, and one rename early in the read makes every later answer wrong. The
+/// geometry decision has the same shape: it reads the Monitor's report of a
+/// reparent that, under the lag, has not happened. Feeding at classify time
+/// closes both: by the time a record is judged, every record ahead of it in the
+/// same read has already landed, and the report of what each one did to the tree
+/// exists.
+///
+/// # Why it is per-PROFILE and not per-configuration
+///
+/// The answer is read off the backend alone, so a scope with no exclusions
+/// configured feeds exactly the way a scope with them does. The fence's
+/// early-outs (no exclusions, or a backend that enforces its own) decide whether
+/// there is anything to SUPPRESS; they must not decide how records reach the
+/// Monitor, or the default configuration would exercise a feeding path the
+/// exclusion tests never cover.
+///
+/// # Why only inotify
+///
+/// [`settle`](DriverCore::settle) has three duties, and inotify is the profile
+/// for which the other two are vacuous:
+///
+/// - **granting evidenced cookies.** A `cookie_candidate` is minted only at probe
+///   resolution and `evidenced` is filled only there, so both are empty for every
+///   lowering that mints no probe — which is every lowering but FSEvents.
+/// - **applying deferred unmount trust-removals.** `deferred_unmounts` is filled
+///   only by the FSEvents lowering; every other lowering builds it empty.
+///
+/// What remains is feeding, and feeding early is safe only where the batch is
+/// complete when the fence runs: FSEvents is the one profile that compiles a
+/// batch with `awaiting > 0`, parking it until its probes answer, and a parked
+/// batch's items are still placeholders. It also stands the fence down entirely
+/// ([`backend_enforces_exclusions`]), so it neither needs nor may have this.
+/// fanotify likewise stands the fence down. RDCW and USN are fence-active but
+/// kernel-recursive, so they run no geometry, and every record of theirs anchors
+/// at the scope ROOT — the one watch no rename inside the tree can move — so
+/// their addressing is a fixed point and batch-then-settle costs them nothing.
+///
+/// The batch's transport permit is unaffected: a feed-at-classify profile never
+/// parks, so its permit is attached and dropped inside the same call either way.
+///
+/// Written as an exhaustive match so a new backend cannot be added without
+/// answering this question, and checked against [`runs_rename_geometry`] below.
+const fn feeds_at_classify(backend: BackendKind) -> bool {
+  match backend {
+    // Descending and fence-active: the only profile whose fence resolves
+    // per-directory paths mid-read, and the only one that compiles no
+    // probe-parked batch AND runs the geometry pass.
+    BackendKind::Inotify => true,
+    // Parks for probes (`awaiting > 0`), so a batch is not complete when the
+    // fence runs — and stands the fence down anyway.
+    BackendKind::FsEvents => false,
+    // Enforces exclusions at admission; the fence stands down.
+    BackendKind::Fanotify => false,
+    // Fence-active but kernel-recursive: no per-directory watches, so no
+    // geometry and no mid-read addressing dependency.
+    BackendKind::Rdcw | BackendKind::UsnJournal => false,
+  }
+}
+
+/// INV-FEED, first leg: geometry ⇒ feed-at-classify.
+///
+/// Both sides are pure functions of the profile, so the implication is settled at
+/// COMPILE time rather than left to agree by coincidence — a future descending
+/// backend that answered [`feeds_at_classify`] with `false` would run the
+/// geometry pass over the phase lag, classifying each record against addressing
+/// its own read is still rewriting, and would fail to build here instead.
+///
+/// The second leg (feed-at-classify ⇒ `awaiting == 0`) is a property of the
+/// compiled batch rather than of the profile, so it is asserted where the batch
+/// exists, in [`DriverCore::fence_exclusions`]. That assertion is stated over the
+/// profile in hand rather than variant by variant, so it reaches every backend
+/// including one added after this list.
+const _: () = {
+  assert!(!runs_rename_geometry(BackendKind::Inotify) || feeds_at_classify(BackendKind::Inotify));
+  assert!(!runs_rename_geometry(BackendKind::FsEvents) || feeds_at_classify(BackendKind::FsEvents));
+  assert!(!runs_rename_geometry(BackendKind::Fanotify) || feeds_at_classify(BackendKind::Fanotify));
+  assert!(!runs_rename_geometry(BackendKind::Rdcw) || feeds_at_classify(BackendKind::Rdcw));
+  assert!(
+    !runs_rename_geometry(BackendKind::UsnJournal) || feeds_at_classify(BackendKind::UsnJournal)
+  );
+};
 
 /// The `(dev, ino)` an arm must confirm the opened object still has before
 /// installing its kernel watch — the object-correctness check that closes the

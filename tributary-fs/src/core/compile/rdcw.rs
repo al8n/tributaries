@@ -10,13 +10,18 @@
 //! unpairable TO a `Created` — the window parks only cookied halves). Records carry NO node identity: under the kernel-recursive
 //! profile record identity is inert (design §4.9) — extended-record file ids
 //! ground pump-side pairing, never registry identity. A name component the
-//! [`Segment`](tributary_proto::Segment) vocabulary cannot carry (WTF-16 with
-//! no Unicode spelling) escalates to a located rescan at its deepest
-//! decodable ancestor, never a lossy transliteration.
+//! decoder cannot publish as authoritative — WTF-16 the
+//! [`Segment`](tributary_proto::Segment) vocabulary has no spelling for, or a
+//! generated 8.3 short-name alias whose canonical form only the filesystem
+//! knows — escalates to a located rescan at its deepest usable ancestor, never
+//! a lossy transliteration and never an alias published as a stable location.
+//!
+//! Named-stream actions arrive with their `owner:stream` suffix already cut by
+//! the decode, so they lower like any other record, at the OWNER's location.
 
 use std::{collections::BTreeMap, vec::Vec};
 
-use tributary_proto::{Location, OsRecord, RecordKind, Scope, Segment};
+use tributary_proto::{Evidence, Location, OsRecord, RecordKind, Scope, Segment};
 
 use crate::os::windows::{RdcwAction, RdcwEvent, RdcwName, RdcwRecord};
 
@@ -86,21 +91,51 @@ impl DriverCore {
       // half, which the Monitor resolves immediately (an unpairable FROM is
       // the Removed degrade, an unpairable TO the Created one) — exactly
       // what a real rename torn across the pairing window earns.
-      RdcwEvent::WidowOld(record) => plan_single(state, scope, &record, RecordKind::MovedFrom),
-      RdcwEvent::WidowNew(record) => plan_single(state, scope, &record, RecordKind::MovedTo),
+      RdcwEvent::WidowOld(record) => plan_half(state, scope, &record, RecordKind::MovedFrom),
+      RdcwEvent::WidowNew(record) => plan_half(state, scope, &record, RecordKind::MovedTo),
       RdcwEvent::Single(record) => match record.action {
-        RdcwAction::Added => plan_single(state, scope, &record, RecordKind::Created),
-        RdcwAction::Removed => plan_single(state, scope, &record, RecordKind::Removed),
-        RdcwAction::Modified => plan_single(state, scope, &record, RecordKind::Modified),
+        RdcwAction::Added => plan_single(state, scope, &record, Evidence::of(RecordKind::Created)),
+        RdcwAction::Removed => {
+          plan_single(state, scope, &record, Evidence::of(RecordKind::Removed))
+        }
+        // `FILE_ACTION_MODIFIED` is ONE word for two facts: RDCW reports "contents
+        // or attributes changed" and never says which. Asserting only the content
+        // half would silently drop every attribute change this backend can observe,
+        // so the record proves both — the subscriber decides which it wanted.
+        RdcwAction::Modified => plan_single(
+          state,
+          scope,
+          &record,
+          Evidence::new().with_modified().with_attrib(),
+        ),
+        // A named-stream action names a stream OF the record's subject; the
+        // decoder already cut the `owner:stream` suffix, so the location here
+        // is the owner. Both facts are proven and both are asserted: creating,
+        // writing, resizing or deleting an alternate data stream changes bytes
+        // reachable through the owner (content) and changes the owner's
+        // stream/size surface (metadata — which is where the USN vocabulary
+        // files `NAMED_DATA_*` and `STREAM_CHANGE`). Naming only one of the two
+        // would make the ADS story differ by backend, and drop it entirely for
+        // half the subscribers. `Created`/`Removed` are deliberately NOT proven:
+        // no dirent appeared or vanished, and claiming one would tell a
+        // consumer to add or drop an index entry that does not exist.
+        RdcwAction::StreamAdded | RdcwAction::StreamRemoved | RdcwAction::StreamModified => {
+          plan_single(
+            state,
+            scope,
+            &record,
+            Evidence::new().with_modified().with_attrib(),
+          )
+        }
         // The pairer never emits a rename half as Single; treat a leak like
         // its widow rather than drop it.
         RdcwAction::RenamedOld => {
           debug_assert!(false, "an unpaired OLD half escaped the pairer as Single");
-          plan_single(state, scope, &record, RecordKind::MovedFrom)
+          plan_half(state, scope, &record, RecordKind::MovedFrom)
         }
         RdcwAction::RenamedNew => {
           debug_assert!(false, "an unpaired NEW half escaped the pairer as Single");
-          plan_single(state, scope, &record, RecordKind::MovedTo)
+          plan_half(state, scope, &record, RecordKind::MovedTo)
         }
         // An action word outside the vocabulary: the object is named, the
         // verb is not — a located rescan is the honest cover.
@@ -158,18 +193,46 @@ impl DriverCore {
   }
 }
 
-/// Plans a single-object record as `kind` at its resolved target. Extended
+/// Plans a single-object record proving `proven` at its resolved target — the
+/// verb is the protocol's choice among the facts, never the lowering's. Extended
 /// records carry directory-ness; basic records leave it unknown, exactly the
 /// FSEvents no-hint default.
 fn plan_single(
   state: &ScopeState,
   scope: ScopeId,
   record: &RdcwRecord,
+  proven: Evidence,
+) -> Vec<Planned> {
+  match (resolve(&record.name), OsRecord::proved(state.watch, proven)) {
+    // RDCW dirent names are never empty; an empty one is a seam surprise —
+    // cover the root rather than fabricate a self-event.
+    (Resolved::Root, _) => vec![Planned::Over(Scope::Root(scope))],
+    (Resolved::Target(location), Some(rec)) => {
+      let mut rec = rec.with_target(location);
+      if let Some(is_dir) = record.is_dir() {
+        rec = rec.with_is_dir(is_dir);
+      }
+      vec![Planned::Rec(rec)]
+    }
+    // A fact set naming no dirent verb reaches here from no caller above; the
+    // located rescan is the honest cover rather than a fabricated record.
+    (Resolved::Target(location), None) => {
+      vec![Planned::Over(located(state.watch, Some(location)))]
+    }
+    (Resolved::Escalate(location), _) => vec![Planned::Over(located(state.watch, location))],
+  }
+}
+
+/// Plans one half of a rename the pairer could not pair — a cookie-less move
+/// half the Monitor resolves immediately. It proves the MOVE, which is what
+/// admits a rename subscriber to the `Removed`/`Created` the degrade reports.
+fn plan_half(
+  state: &ScopeState,
+  scope: ScopeId,
+  record: &RdcwRecord,
   kind: RecordKind,
 ) -> Vec<Planned> {
   match resolve(&record.name) {
-    // RDCW dirent names are never empty; an empty one is a seam surprise —
-    // cover the root rather than fabricate a self-event.
     Resolved::Root => vec![Planned::Over(Scope::Root(scope))],
     Resolved::Target(location) => {
       let mut rec = OsRecord::new(state.watch, kind).with_target(location);

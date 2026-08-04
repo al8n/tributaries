@@ -1158,6 +1158,7 @@ fn delivered_epochs_are_always_announced_by_a_delivered_rescan() {
 fn identity_minting_respects_devices_and_mounts() {
   let state = ScopeState {
     watch: WatchId::new(NonZeroU64::new(1).unwrap()),
+    root_attempt: None,
     profile: BackendKind::FsEvents,
     requested: PathBuf::from("/r"),
     root: Some(Arc::new(PathBuf::from("/r"))),
@@ -1196,6 +1197,7 @@ fn identity_minting_respects_devices_and_mounts() {
 fn blind_mount_table_refuses_event_side_trust() {
   let state = ScopeState {
     watch: WatchId::new(NonZeroU64::new(1).unwrap()),
+    root_attempt: None,
     profile: BackendKind::FsEvents,
     requested: PathBuf::from("/r"),
     root: Some(Arc::new(PathBuf::from("/r"))),
@@ -2847,6 +2849,7 @@ mod lowering {
   fn state_with_root(root: &str) -> ScopeState {
     ScopeState {
       watch: WatchId::new(NonZeroU64::new(99).unwrap()),
+      root_attempt: None,
       profile: BackendKind::FsEvents,
       requested: PathBuf::from(root),
       root: Some(Arc::new(PathBuf::from(root))),
@@ -3321,7 +3324,11 @@ mod descending {
         _ => None,
       })
       .expect("the spawned descending root arms through the effect path");
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Installed(1),
+    );
     let effects = drain(&mut core);
     let (req, watch) = effects
       .iter()
@@ -3366,7 +3373,11 @@ mod descending {
       })
       .expect("the discovered directory is armed");
     // The arm's success continues the descent: the child cold-enumerates.
-    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let effects = drain(&mut core);
     assert!(
       effects.iter().any(|e| matches!(
@@ -3388,7 +3399,11 @@ mod descending {
         _ => None,
       })
       .expect("arm queued");
-    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Aliased(7));
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Aliased(7),
+    );
     let effects = drain(&mut core);
     assert!(
       effects
@@ -3411,6 +3426,7 @@ mod descending {
       .expect("arm queued");
     core.on_watch_installed(
       add,
+      core.arm_attempt(add),
       crate::os::linux::WatchOutcome::Failed(WatchError::NoSpace),
     );
     let effects = drain(&mut core);
@@ -3470,7 +3486,11 @@ mod descending {
       "the re-add carries the barrier identity, so a different-object rebind fails Gone"
     );
 
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Aliased(1));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Aliased(1),
+    );
     let read = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -3501,7 +3521,11 @@ mod descending {
       "the un-acknowledged re-add holds the fence"
     );
 
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Aliased(1));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Aliased(1),
+    );
     assert_eq!(
       core.poll_cover_settlements(DRAINED),
       Vec::new(),
@@ -3540,7 +3564,11 @@ mod descending {
         _ => None,
       })
       .expect("the discovered directory is armed");
-    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      sub,
+      core.arm_attempt(sub),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let read = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -3555,7 +3583,11 @@ mod descending {
     // re-add re-reads the tree and re-adds the kept survivor.
     core.on_root_overflow(scope, at(2));
     let _ = drain(&mut core);
-    core.on_watch_installed(root, crate::os::linux::WatchOutcome::Aliased(1));
+    core.on_watch_installed(
+      root,
+      core.arm_attempt(root),
+      crate::os::linux::WatchOutcome::Aliased(1),
+    );
     let read = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -3610,7 +3642,11 @@ mod descending {
   #[test]
   fn an_acknowledged_survivor_readd_settles_the_recovery() {
     let (mut core, scope, sub, _root) = reproving_child();
-    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Aliased(2));
+    core.on_watch_installed(
+      sub,
+      core.arm_attempt(sub),
+      crate::os::linux::WatchOutcome::Aliased(2),
+    );
     let effects = drain(&mut core);
     settle_reproved_child(&mut core, scope, sub, &effects);
   }
@@ -3625,7 +3661,11 @@ mod descending {
   #[test]
   fn a_refused_survivor_readd_stands_a_located_rescan_and_a_persistent_deficit() {
     let (mut core, scope, sub, _root) = reproving_child();
-    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Failed(WatchError::Io));
+    core.on_watch_installed(
+      sub,
+      core.arm_attempt(sub),
+      crate::os::linux::WatchOutcome::Failed(WatchError::Io),
+    );
     let effects = drain(&mut core);
     assert!(
       emits(&effects)
@@ -3660,7 +3700,11 @@ mod descending {
   #[test]
   fn a_refused_readd_heals_through_the_deficit_retry() {
     let (mut core, scope, sub, root) = reproving_child();
-    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Failed(WatchError::Io));
+    core.on_watch_installed(
+      sub,
+      core.arm_attempt(sub),
+      crate::os::linux::WatchOutcome::Failed(WatchError::Io),
+    );
     let _ = drain(&mut core);
 
     assert!(core.resignal_coverage_deficits(scope));
@@ -3671,7 +3715,11 @@ mod descending {
       )),
       "the heal kick re-proves the healing anchor's binding"
     );
-    core.on_watch_installed(root, crate::os::linux::WatchOutcome::Aliased(1));
+    core.on_watch_installed(
+      root,
+      core.arm_attempt(root),
+      crate::os::linux::WatchOutcome::Aliased(1),
+    );
     let read = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -3689,7 +3737,11 @@ mod descending {
         _ => None,
       })
       .expect("the heal re-arms the slot");
-    core.on_watch_installed(retry, crate::os::linux::WatchOutcome::Installed(3));
+    core.on_watch_installed(
+      retry,
+      core.arm_attempt(retry),
+      crate::os::linux::WatchOutcome::Installed(3),
+    );
     let read = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -3719,7 +3771,11 @@ mod descending {
       Vec::new(),
       "the un-answered re-add holds the fence"
     );
-    core.on_watch_installed(sub, crate::os::linux::WatchOutcome::Failed(WatchError::Io));
+    core.on_watch_installed(
+      sub,
+      core.arm_attempt(sub),
+      crate::os::linux::WatchOutcome::Failed(WatchError::Io),
+    );
     let _ = drain(&mut core);
     core.mark_cut_inflight(scope, 1);
     core.prove_cut(scope, 1);
@@ -3768,7 +3824,11 @@ mod descending {
   /// watch (the anchor a live record attributes to).
   fn live_descending_at(core: &mut DriverCore, root: &str) -> (ScopeId, WatchId) {
     let (scope, root_watch) = spawned_with_pending_root_arm_at(core, root);
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Installed(1),
+    );
     // Consume the cold enumerate the successful root arm queues.
     let req = drain(core).iter().find_map(|e| match e {
       Effect::Enumerate { req, watch, .. } if *watch == root_watch => Some(*req),
@@ -3795,6 +3855,7 @@ mod descending {
     let (scope, root_watch) = spawned_with_pending_root_arm_at(&mut core, "/r");
     core.on_watch_installed(
       root_watch,
+      core.arm_attempt(root_watch),
       crate::os::linux::WatchOutcome::Failed(WatchError::NotFound),
     );
     let effects = drain(&mut core);
@@ -3830,6 +3891,7 @@ mod descending {
     let (failed, failed_root) = spawned_with_pending_root_arm_at(&mut core, "/r");
     core.on_watch_installed(
       failed_root,
+      core.arm_attempt(failed_root),
       crate::os::linux::WatchOutcome::Failed(WatchError::NotFound),
     );
     let _ = drain(&mut core);
@@ -4025,7 +4087,11 @@ mod descending {
     // entries against the scope's NOW-updated frame (77). The enumerated directory
     // is `/r/sub`, but `crosses_mount_boundary` always fences on the SCOPE root's
     // frame, so this reads the refreshed value.
-    core.on_watch_installed(sub_arm, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      sub_arm,
+      core.arm_attempt(sub_arm),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let req2 = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -4097,7 +4163,11 @@ mod descending {
 
     // The next enumerate still fences on the captured frame (42): a mount-77 child is
     // still a boundary (the fence did not degrade to device-only).
-    core.on_watch_installed(sub_arm, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      sub_arm,
+      core.arm_attempt(sub_arm),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let req2 = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -4151,7 +4221,11 @@ mod descending {
         _ => None,
       })
       .expect("the same-frame child is descended and armed");
-    core.on_watch_installed(sub_arm, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      sub_arm,
+      core.arm_attempt(sub_arm),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let _ = drain(&mut core);
 
     // The refresh's ONE sample is a REPLACED object (ino 999, was ino 1) on a new
@@ -4345,7 +4419,11 @@ mod descending {
         _ => None,
       })
       .expect("the frame-change reconcile re-proves the root binding");
-    core.on_watch_installed(readd, crate::os::linux::WatchOutcome::Aliased(1));
+    core.on_watch_installed(
+      readd,
+      core.arm_attempt(readd),
+      crate::os::linux::WatchOutcome::Aliased(1),
+    );
     let req2 = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -4438,7 +4516,11 @@ mod descending {
         _ => None,
       })
       .expect("arm queued");
-    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let _ = drain(&mut core);
     // One kernel record attributed to BOTH anchors: each gets its own copy.
     core.on_inotify_events(
@@ -4489,7 +4571,11 @@ mod descending {
         _ => None,
       })
       .expect("arm queued");
-    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let _ = drain(&mut core);
     core.on_inotify_events(scope, vec![inotify(&[add], IN_IGNORED, 0, None)], at(3));
     let effects = drain(&mut core);
@@ -4557,7 +4643,11 @@ mod descending {
         match effect {
           Effect::AddWatch { watch, .. } => {
             wd += 1;
-            core.on_watch_installed(*watch, crate::os::linux::WatchOutcome::Installed(wd));
+            core.on_watch_installed(
+              *watch,
+              core.arm_attempt(*watch),
+              crate::os::linux::WatchOutcome::Installed(wd),
+            );
             progressed = true;
           }
           Effect::Enumerate { req, path, .. } => {
@@ -4621,7 +4711,11 @@ mod descending {
     );
 
     // The driver replays the pre-armed outcome; the rebuild quiesces.
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(99));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Installed(99),
+    );
     run_cascade(&mut core, &BTreeMap::from([("/r2", Vec::new())]));
     assert!(core.monitor.rearm_settled(scope));
     core.mark_cut_inflight(scope, 1);
@@ -5652,7 +5746,11 @@ mod descending {
 
     // The grant commits: the root arms, cold-enumerates, and the inventory's
     // `Created`s flow — cold discovery was not converted into a re-arm.
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Installed(1),
+    );
     let req = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -6149,6 +6247,7 @@ mod descending {
       .expect("the re-arm re-installs the pruned directory");
     core.on_watch_installed(
       add,
+      core.arm_attempt(add),
       crate::os::linux::WatchOutcome::Failed(WatchError::NoSpace),
     );
     let effects = drain(&mut core);
@@ -6223,7 +6322,11 @@ mod descending {
         _ => None,
       })
       .expect("cold discovery arms the re-created directory");
-    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(9));
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Installed(9),
+    );
     let cold = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -6327,7 +6430,11 @@ mod descending {
         _ => None,
       })
       .expect("cold discovery arms the re-created directory");
-    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(9));
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Installed(9),
+    );
     let cold = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -6453,7 +6560,11 @@ mod descending {
     // stale under the stamp rule and one re-add re-proves the binding on the
     // NEW transport before the re-arm read runs. Its read then lists a fresh
     // directory `a` — the bridge. The fence pends until `a`'s own read lands.
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(99));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Installed(99),
+    );
     let readd = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -6468,7 +6579,11 @@ mod descending {
       .expect("the rebound root's binding is re-proven post-commit");
     assert_eq!(readd, root_watch, "the re-add names the surviving root");
     assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Aliased(99));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Aliased(99),
+    );
     let rearm = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -6492,7 +6607,11 @@ mod descending {
       Vec::new(),
       "the fresh install keeps the fence parked"
     );
-    core.on_watch_installed(a_watch, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      a_watch,
+      core.arm_attempt(a_watch),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let a_read = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -6546,6 +6665,7 @@ mod descending {
       .expect("the discovered directory arms");
     core.on_watch_installed(
       add,
+      core.arm_attempt(add),
       crate::os::linux::WatchOutcome::Failed(WatchError::NoSpace),
     );
     let effects = drain(&mut core);
@@ -6606,6 +6726,7 @@ mod descending {
       .expect("the discovered directory arms");
     core.on_watch_installed(
       add,
+      core.arm_attempt(add),
       crate::os::linux::WatchOutcome::Failed(WatchError::NoSpace),
     );
     let edge_epoch = emits(&drain(&mut core))
@@ -6666,7 +6787,11 @@ mod descending {
         _ => None,
       })
       .expect("the discovered directory arms");
-    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let cold = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -6724,7 +6849,11 @@ mod descending {
         _ => None,
       })
       .expect("the discovered directory arms");
-    core.on_watch_installed(add, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let cold = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -6863,7 +6992,11 @@ mod descending {
     for effect in effects {
       match effect {
         Effect::AddWatch { watch, .. } => {
-          core.on_watch_installed(*watch, crate::os::linux::WatchOutcome::Aliased(900));
+          core.on_watch_installed(
+            *watch,
+            core.arm_attempt(*watch),
+            crate::os::linux::WatchOutcome::Aliased(900),
+          );
         }
         Effect::Enumerate { req, path, .. } => {
           let listing = if path.as_path() == Path::new("/r") {
@@ -7045,6 +7178,459 @@ mod descending {
     assert!(
       core.cover_fences.is_empty(),
       "the observation clears the entry — nothing leaks"
+    );
+  }
+
+  /// Brings up `/r/{a/b}` and stops with `b`'s arm dispatched but unanswered, so
+  /// the caller owns whichever round trip it wants to catch mid-flight. Every
+  /// cell below needs the same three levels, because the hazard is an ANCESTOR
+  /// move — two levels are not enough to have one.
+  fn descending_a_b() -> (DriverCore, ScopeId, WatchId, WatchId, WatchId) {
+    let (mut core, scope, req, root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir, 1, 11)]));
+    let effects = drain(&mut core);
+    let w_a = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/a") => Some(*watch),
+        _ => None,
+      })
+      .expect("a arms");
+    core.on_watch_installed(
+      w_a,
+      core.arm_attempt(w_a),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
+    let a_req = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/a") => Some(*req),
+        _ => None,
+      })
+      .expect("a cold-reads");
+    core.on_enumerated(a_req, listed(vec![entry("b", FileKind::Dir, 1, 12)]));
+    let w_b = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/a/b") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("b arms");
+    (core, scope, root, w_a, w_b)
+  }
+
+  /// `mv /r/a /r/c`, then a replacement directory at the vacated `/r/a`. Both
+  /// halves pair inside the window, so the hold is over by the time the caller's
+  /// in-flight result lands — which is precisely when nothing else is left to
+  /// catch it.
+  fn move_a_to_c_and_replace(core: &mut DriverCore, scope: ScopeId, root: WatchId) {
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root], IN_MOVED_FROM | IN_ISDIR, 7, Some(b"a"))],
+      at(5),
+    );
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root], IN_MOVED_TO | IN_ISDIR, 7, Some(b"c"))],
+      at(6),
+    );
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root], IN_CREATE | IN_ISDIR, 0, Some(b"a"))],
+      at(7),
+    );
+    let _ = drain(core);
+  }
+
+  /// A DESCENDANT's arm is lowered to `/r/a/b`, its ancestor `a` is renamed to
+  /// `c`, a replacement directory takes the vacated `/r/a` — and only then does
+  /// the arm acknowledge. Nothing that watches the node's own slot can see this:
+  /// `b` never left `(a, "b")`, so its arm attempt is never superseded and the
+  /// hold is over by the time the answer lands.
+  ///
+  /// Accepting it would certify a binding opened under the REPLACEMENT as the
+  /// coverage of `/r/c/b`, attributing every record the replacement's subtree
+  /// produces to a directory somewhere else while the real one stays unwatched.
+  /// The placement fence answers it as the non-proof it is — and a binding
+  /// nothing may certify is not kept either: the watch is RETIRED, so the
+  /// executor disarms the kernel binding the driver actually opened, and the slot
+  /// is rebuilt on a fresh handle addressed at the destination.
+  #[test]
+  fn a_descendant_arm_acknowledging_past_its_ancestors_move_is_not_a_binding() {
+    let (mut core, scope, root, _w_a, w_b) = descending_a_b();
+    let stale_attempt = core.arm_attempt(w_b);
+    move_a_to_c_and_replace(&mut core, scope, root);
+
+    core.on_watch_installed(
+      w_b,
+      stale_attempt,
+      crate::os::linux::WatchOutcome::Installed(9),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { watch, .. } if *watch == w_b
+      )),
+      "the stale acknowledgement does not carry b to Live and start its read: {effects:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::RemoveWatch { watch, .. } if *watch == w_b
+      )),
+      "the binding it reported is disarmed rather than kept doubtful: {effects:?}"
+    );
+    let rebuilt = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/c/b") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the slot is rebuilt at the destination b actually occupies");
+    assert_ne!(rebuilt, w_b, "on a fresh handle, never the retired one");
+
+    // And the rebuild is a real obligation, not a formality: answering IT is
+    // what finally covers the destination.
+    core.on_watch_installed(
+      rebuilt,
+      core.arm_attempt(rebuilt),
+      crate::os::linux::WatchOutcome::Installed(10),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/c/b")
+      )),
+      "the acknowledgement of the LIVE path descends into the real destination: {effects:?}"
+    );
+  }
+
+  /// The same descendant arm, acknowledging INSIDE the pairing window rather
+  /// than past it — the half the detach edge owns, and the one the hold cannot
+  /// answer on its own. The hold suppresses DELIVERY under a moved subtree and
+  /// makes a read there coverage-only, but it has no verdict on a BINDING: the
+  /// acknowledgement would carry `b` to `Live` on a watch opened at a path the
+  /// subtree had already left, and the pairing's O(1) reparent re-arms nothing
+  /// unless something dirtied the hold — so `b` would keep a kernel binding on
+  /// the replacement's child for the rest of its life, delivering its records at
+  /// `/r/c/b`.
+  ///
+  /// The fence answers it at the detach edge instead: the binding is retired
+  /// rather than certified, and the hold is dirtied, which obliges the pairing to
+  /// `Rescan` and re-arm the real destination. What is NOT re-issued in place is
+  /// the arm — a replacement armed under the hold would lower the same vacated
+  /// path and be retired again — so the REBUILD is what the pairing owes, and the
+  /// pairing's crawl is what addresses it through the destination.
+  #[test]
+  fn a_descendant_arm_acknowledging_inside_the_hold_is_not_a_binding_either() {
+    let (mut core, scope, root, _w_a, w_b) = descending_a_b();
+    let stale_attempt = core.arm_attempt(w_b);
+    // Only the source half: the hold is open when the acknowledgement lands.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root], IN_MOVED_FROM | IN_ISDIR, 7, Some(b"a"))],
+      at(5),
+    );
+    let _ = drain(&mut core);
+
+    core.on_watch_installed(
+      w_b,
+      stale_attempt,
+      crate::os::linux::WatchOutcome::Installed(9),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { watch, .. } if *watch == w_b
+      )),
+      "a binding opened under the vacated path does not carry b to Live: {effects:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::RemoveWatch { watch, .. } if *watch == w_b
+      )),
+      "it is disarmed instead: {effects:?}"
+    );
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { watch, .. } if *watch == w_b
+      )),
+      "and nothing is re-armed in place — under the hold that arm would open the \
+       vacated path all over again: {effects:?}"
+    );
+
+    // Pairing: the dirtied hold is what makes the destination re-covered rather
+    // than silently carried over by the O(1) reparent.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[root], IN_MOVED_TO | IN_ISDIR, 7, Some(b"c"))],
+      at(6),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["c"])),
+      "the pairing covers the destination it had to re-arm: {effects:?}"
+    );
+
+    // And its crawl rebuilds the retired slot, addressed through the destination.
+    let req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/c") => Some(*req),
+        _ => None,
+      })
+      .expect("the pairing re-reads the destination");
+    core.on_enumerated(req, listed(vec![entry("b", FileKind::Dir, 1, 12)]));
+    let effects = drain(&mut core);
+    let rebuilt = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/c/b") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the crawl rebuilds the retired slot at the live path");
+    assert_ne!(rebuilt, w_b, "on a fresh handle, never the retired one");
+    core.on_watch_installed(
+      rebuilt,
+      core.arm_attempt(rebuilt),
+      crate::os::linux::WatchOutcome::Installed(11),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/c/b")
+      )),
+      "and the arm addressed at the live path finally converges: {effects:?}"
+    );
+  }
+
+  /// The other side of the same fence: an arm whose lowering is CORRECT, and
+  /// which the fence must therefore not refuse.
+  ///
+  /// One inotify batch, in order: a record under `a` discovers `b` and queues its
+  /// arm; the next two rename `a` onto `c`. The core derives an action's absolute
+  /// path when it DRAINS the action — after the whole batch has been fed — so the
+  /// arm opens at `/r/c/b`, the destination the pairing left the node at. The
+  /// acknowledgement is then a proof about the node's CURRENT binding, and a
+  /// placement stamped back at enqueue would read it as stale and RETIRE it: a
+  /// live binding torn down, its subtree re-crawled, and every record the gap
+  /// swallows carried only by whatever the rebuild's own read happens to see.
+  #[test]
+  fn an_arm_lowered_after_its_ancestors_pairing_is_a_binding() {
+    let (mut core, scope, req, root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir, 1, 11)]));
+    let effects = drain(&mut core);
+    let w_a = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/a") => Some(*watch),
+        _ => None,
+      })
+      .expect("a arms");
+    core.on_watch_installed(
+      w_a,
+      core.arm_attempt(w_a),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
+    let a_req = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/a") => Some(*req),
+        _ => None,
+      })
+      .expect("a cold-reads");
+    core.on_enumerated(a_req, listed(vec![]));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(&[w_a], IN_CREATE | IN_ISDIR, 0, Some(b"b")),
+        inotify(&[root], IN_MOVED_FROM | IN_ISDIR, 7, Some(b"a")),
+        inotify(&[root], IN_MOVED_TO | IN_ISDIR, 7, Some(b"c")),
+      ],
+      at(5),
+    );
+    let effects = drain(&mut core);
+    let (w_b, attempt) = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          attempt,
+          path,
+          ..
+        } if path.as_path() == Path::new("/r/c/b") => Some((*watch, *attempt)),
+        _ => None,
+      })
+      .expect("the descendant's arm lowers at the destination the pairing left it at");
+
+    core.on_watch_installed(w_b, attempt, crate::os::linux::WatchOutcome::Installed(9));
+    let effects = drain(&mut core);
+    // INSIDE the window a false retirement would open: its teardown and rebuild
+    // are issued in this very drain.
+    assert!(
+      !effects
+        .iter()
+        .any(|e| matches!(e, Effect::RemoveWatch { watch, .. } if *watch == w_b)),
+      "an arm the drain already addressed at the destination is a binding: {effects:?}"
+    );
+    let b_req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/c/b") => Some(*req),
+        _ => None,
+      })
+      .expect("the acknowledgement carries b to Live and descends into it");
+    core.on_enumerated(b_req, listed(vec![]));
+    let _ = drain(&mut core);
+
+    // And the binding delivers: a retirement would have taken exactly this handle.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(&[w_b], IN_CREATE, 0, Some(b"x"))],
+      at(6),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_created() && c.location() == &loc(&["c", "b", "x"])),
+      "records off the proven binding stay deliverable: {effects:?}"
+    );
+    assert!(
+      core.monitor.coverage_settled(scope),
+      "and nothing is left holding the scope's barrier: {effects:?}"
+    );
+  }
+
+  /// A slot stat is lowered to `/r/a/u`, the probed slot's parent `a` is renamed
+  /// to `c`, a replacement takes `/r/a` — and the probe then answers for the
+  /// vacated path. The Monitor keys the request by `(parent, name)`, which the
+  /// rename carries intact, so without the fence the answer settles `/r/c/u`
+  /// with what was found at `/r/a/u`: a `NotFound` there would discharge the
+  /// slot's recorded darkness while the destination really holds an
+  /// unclassified object.
+  ///
+  /// The degrade is covered AND counted — the deficit stands, so every later
+  /// sync re-signals it — rather than a one-shot `Rescan` that leaves nothing
+  /// behind.
+  #[test]
+  fn a_slot_stat_answering_past_its_parents_move_does_not_discharge_the_deficit() {
+    let (mut core, scope, req, root) = live_descending();
+    core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir, 1, 11)]));
+    let effects = drain(&mut core);
+    let w_a = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/a") => Some(*watch),
+        _ => None,
+      })
+      .expect("a arms");
+    core.on_watch_installed(
+      w_a,
+      core.arm_attempt(w_a),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
+    let a_req = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/a") => Some(*req),
+        _ => None,
+      })
+      .expect("a cold-reads");
+    // An unclassifiable entry is the one thing that asks for a stat.
+    core.on_enumerated(a_req, listed(vec![entry("u", FileKind::Unknown, 1, 12)]));
+    let effects = drain(&mut core);
+    let probe = probes(&effects)
+      .into_iter()
+      .find(|(_, path)| path.as_path() == Path::new("/r/a/u"))
+      .map(|(probe, _)| probe)
+      .expect("the unclassified slot is probed at its lowered path");
+    assert!(
+      core.monitor.has_coverage_deficit(scope),
+      "an unwatched unclassified slot books its darkness while the answer is owed"
+    );
+
+    move_a_to_c_and_replace(&mut core, scope, root);
+    core.on_probe_result(probe, ProbeOutcome::Missing, at(8));
+    let _ = drain(&mut core);
+    assert!(
+      core.monitor.has_coverage_deficit(scope),
+      "an answer for the vacated path cannot report the destination's slot empty"
+    );
+  }
+
+  /// A DESCENDANT's read is lowered to `/r/a/b`, its ancestor `a` is renamed to
+  /// `c`, a replacement takes `/r/a` — and the read then returns the
+  /// REPLACEMENT's listing. The hold that fences a read at a stale path is over
+  /// by then, and `b` itself was never detached, so the read presents as a clean
+  /// cold discovery of `/r/c/b`.
+  ///
+  /// Reconciling it would announce the replacement's children as created at the
+  /// destination and arm watches for names that are not there, while the real
+  /// destination's own children stay undiscovered. The placement fence answers
+  /// it as a read that told us nothing: no entry is reconciled, and the
+  /// destination keeps a watch AND a re-read rather than a bare `Rescan`.
+  #[test]
+  fn a_descendant_read_completing_past_its_ancestors_move_reconciles_nothing() {
+    let (mut core, scope, root, _w_a, w_b) = descending_a_b();
+    core.on_watch_installed(
+      w_b,
+      core.arm_attempt(w_b),
+      crate::os::linux::WatchOutcome::Installed(3),
+    );
+    let b_req = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/a/b") => Some(*req),
+        _ => None,
+      })
+      .expect("b cold-reads at its lowered path");
+
+    move_a_to_c_and_replace(&mut core, scope, root);
+    core.on_enumerated(b_req, listed(vec![entry("ghost", FileKind::Dir, 1, 99)]));
+    let effects = drain(&mut core);
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/c/b/ghost")
+      )),
+      "the replacement's child is not armed under the destination: {effects:?}"
+    );
+    assert!(
+      !emits(&effects)
+        .iter()
+        .any(|c| c.location() == &loc(&["c", "b", "ghost"])),
+      "and it is not announced there either: {effects:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { watch, path, .. }
+          if *watch == w_b && path.as_path() == Path::new("/r/c/b")
+      )),
+      "the destination is re-read where it actually is: {effects:?}"
+    );
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["c", "b"])),
+      "under a covering Rescan for the content the read could not report: {effects:?}"
     );
   }
 }
@@ -7349,7 +7935,11 @@ mod kernel_recursive_fanotify {
         _ => None,
       })
       .expect("the descending root arms through the effect path");
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Installed(1),
+    );
     let _ = drain(&mut core);
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
     let _ = drain(&mut core);
@@ -7591,7 +8181,8 @@ mod kernel_recursive_fanotify {
       name: Some(b"r".to_vec()),
       rename: None,
     };
-    let Admission::RootDeath(admitted) = classify(&mut map, &raw, &mut MemoBatch::new()) else {
+    let Admission::RootDeath(admitted) = classify(&mut map, &raw, &mut MemoBatch::new(), &[])
+    else {
       panic!("the root delete-from-parent must classify as RootDeath, not a firehose drop");
     };
 
@@ -8013,7 +8604,13 @@ mod rdcw_lowering {
   /// A live RDCW scope: registered, spawned (the KR spawn doubles as the
   /// watch-result), birth refresh fed.
   fn live_scope(core: &mut DriverCore) -> ScopeId {
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Rdcw);
+    live_scope_with(core, Interest::all())
+  }
+
+  /// The same, under a narrowed subscription — the shape an admission claim
+  /// needs, since `Interest::all()` admits on any fact at all.
+  fn live_scope_with(core: &mut DriverCore, interest: Interest) -> ScopeId {
+    let scope = core.on_watch(PathBuf::from("/r"), interest, BackendKind::Rdcw);
     let _ = drain(core);
     core.on_stream_spawned(
       scope,
@@ -8165,6 +8762,100 @@ mod rdcw_lowering {
       "a widow never fabricates a Moved: {emitted:?}"
     );
   }
+
+  /// A named-stream action reports its OWNER, not the stream. The decoder cut
+  /// the `owner:stream` suffix, so the location here is an ordinary path, and
+  /// the record proves content AND metadata: creating, writing, resizing or
+  /// deleting an alternate data stream changes bytes reachable through the
+  /// owner and changes the owner's stream surface. Neither `Created` nor
+  /// `Removed` may be proven — no dirent appeared or vanished.
+  #[test]
+  fn stream_actions_modify_their_owner() {
+    for action in [
+      RdcwAction::StreamAdded,
+      RdcwAction::StreamRemoved,
+      RdcwAction::StreamModified,
+    ] {
+      let mut core = DriverCore::new(WINDOW, LIVENESS);
+      let scope = live_scope(&mut core);
+      core.on_batch(
+        scope,
+        payload(vec![RdcwEvent::Single(rdcw(
+          action,
+          &["deep", "owner.txt"],
+        ))]),
+        at(1),
+      );
+      let effects = drain(&mut core);
+      let emitted = emits(&effects);
+      assert_eq!(emitted.len(), 1, "{action:?}: {emitted:?}");
+      assert!(emitted[0].kind().is_modified(), "{action:?}: {emitted:?}");
+      assert_eq!(emitted[0].location(), &loc(&["deep", "owner.txt"]));
+      assert!(
+        !emitted[0].kind().is_created() && !emitted[0].kind().is_removed(),
+        "{action:?}: a stream mutation is not a dirent lifecycle: {emitted:?}"
+      );
+    }
+  }
+
+  /// The same stream mutation reaches an ATTRIB-only subscription. The USN arm
+  /// files named-stream reasons under metadata, so an RDCW arm that proved only
+  /// content would make the backend choice decide whether the subscriber hears
+  /// about it at all.
+  #[test]
+  fn a_stream_action_admits_an_attrib_only_subscription() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_attrib());
+    core.on_batch(
+      scope,
+      payload(vec![RdcwEvent::Single(rdcw(
+        RdcwAction::StreamModified,
+        &["owner.txt"],
+      ))]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0].location(), &loc(&["owner.txt"]));
+    // A `Rescan` reaches every subscription regardless of what it asked for,
+    // so accepting one here would make the cell true for a lowering that
+    // decodes no stream action at all.
+    assert!(
+      !emitted[0].kind().is_rescan(),
+      "the fact must be DELIVERED, not covered: {emitted:?}"
+    );
+  }
+
+  /// A name the decoder refused — a WTF-16 component or a generated 8.3 alias —
+  /// covers its deepest usable ancestor instead of publishing a location the
+  /// consumer's index does not use.
+  #[test]
+  fn a_refused_name_covers_its_parent_rather_than_naming_the_object() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(
+      scope,
+      payload(vec![RdcwEvent::Single(RdcwRecord {
+        action: RdcwAction::Removed,
+        name: RdcwName::Escalate {
+          prefix: vec!["deep".to_owned()],
+        },
+        file_id: None,
+        parent_id: None,
+        attributes: None,
+        reparse_tag: None,
+      })]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&["deep"]),
+      "{emitted:?}"
+    );
+  }
 }
 
 /// The USN lowering: admitted journal events on a kernel-recursive Windows
@@ -8174,7 +8865,12 @@ mod usn_lowering {
   use super::*;
   use crate::os::windows::{
     RawWindowsEvent,
-    usn::{UsnAdmitted, UsnTarget, reason},
+    usn::{
+      UsnAdmission, UsnAdmitted, UsnFence, UsnTarget,
+      decode::{UsnName, UsnRecord},
+      map::FrnMap,
+      reason,
+    },
   };
 
   fn payload(events: Vec<UsnAdmitted>) -> BatchPayload {
@@ -8187,11 +8883,11 @@ mod usn_lowering {
   }
 
   fn live_scope(core: &mut DriverCore) -> ScopeId {
-    let scope = core.on_watch(
-      PathBuf::from("/r"),
-      Interest::all(),
-      BackendKind::UsnJournal,
-    );
+    live_scope_with(core, Interest::all())
+  }
+
+  fn live_scope_with(core: &mut DriverCore, interest: Interest) -> ScopeId {
+    let scope = core.on_watch(PathBuf::from("/r"), interest, BackendKind::UsnJournal);
     let _ = drain(core);
     core.on_stream_spawned(
       scope,
@@ -8213,6 +8909,48 @@ mod usn_lowering {
 
   fn resolved(components: &[&str]) -> UsnTarget {
     UsnTarget::Resolved(components.iter().map(|c| (*c).to_owned()).collect())
+  }
+
+  const USN_ROOT: u128 = 1;
+
+  /// A live admission over the same `/r` the lowering scopes watch, with one
+  /// mapped directory `a`. Driving the REAL admission (rather than hand-built
+  /// `UsnAdmitted`) is what makes these cells witnesses for the source's own
+  /// delta and batch decisions.
+  fn seeded_admission() -> UsnAdmission {
+    let mut map = FrnMap::new(USN_ROOT, None);
+    map.seed([(10, USN_ROOT, "a".into())]);
+    UsnAdmission::new(map, 64)
+  }
+
+  fn usn_record(frn: u128, parent: u128, reason_mask: u32, attrs: u32, name: &str) -> UsnRecord {
+    UsnRecord {
+      frn,
+      parent,
+      usn: 0,
+      reason: reason_mask,
+      source_info: 0,
+      attributes: attrs,
+      name: UsnName::Utf8(name.into()),
+    }
+  }
+
+  /// Admits `records` as one read's worth of journal traffic and returns what a
+  /// subscriber actually received for it — the cells about session bounds need
+  /// each step's DELIVERY separately, because what they are about is which
+  /// moment a repair arrives at, not whether one ever does.
+  fn step(
+    core: &mut DriverCore,
+    scope: ScopeId,
+    admission: &mut UsnAdmission,
+    records: Vec<UsnRecord>,
+  ) -> Vec<Change> {
+    let mut admitted = Vec::new();
+    for record in records {
+      admission.admit(record, &mut admitted);
+    }
+    core.on_batch(scope, payload(admitted), at(1));
+    emits(&drain(core)).into_iter().cloned().collect()
   }
 
   #[test]
@@ -8252,6 +8990,44 @@ mod usn_lowering {
     );
   }
 
+  /// One journal delta unions everything that happened to a file in the session,
+  /// so a `FILE_CREATE | BASIC_INFO_CHANGE` proves a create AND an attribute
+  /// change. Naming the record by the structural verb must not un-prove the
+  /// other: an attrib-only subscription is admitted on the fact it asked about.
+  #[test]
+  fn a_merged_delta_admits_every_interest_it_proves() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_attrib());
+    core.on_batch(
+      scope,
+      payload(vec![UsnAdmitted::Single {
+        delta: reason::FILE_CREATE | reason::SECURITY_CHANGE,
+        target: resolved(&["a", "new.txt"]),
+        is_dir: false,
+      }]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0].location(), &loc(&["a", "new.txt"]));
+
+    // And the narrowing is still exact where nothing else was proven.
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_attrib());
+    core.on_batch(
+      scope,
+      payload(vec![UsnAdmitted::Single {
+        delta: reason::FILE_CREATE,
+        target: resolved(&["a", "new.txt"]),
+        is_dir: false,
+      }]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(emits(&effects).is_empty(), "{effects:?}");
+  }
+
   #[test]
   fn an_admitted_rename_becomes_one_moved() {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
@@ -8260,7 +9036,9 @@ mod usn_lowering {
       scope,
       payload(vec![UsnAdmitted::Renamed {
         old: resolved(&["a", "old.txt"]),
+        old_content: 0,
         new: resolved(&["b", "new.txt"]),
+        new_content: 0,
         is_dir: false,
       }]),
       at(1),
@@ -8273,6 +9051,99 @@ mod usn_lowering {
       Some(&loc(&["a", "old.txt"]))
     );
     assert_eq!(emitted[0].location(), &loc(&["b", "new.txt"]));
+  }
+
+  /// A rename record's fresh content bits are evidence, and the choice to NAME
+  /// the record a move must not consume them: a `RENAME_OLD_NAME |
+  /// DATA_OVERWRITE` record proves a move AND a write, and NTFS coalescing can
+  /// make it the only record the content class ever gets before the close.
+  ///
+  /// Driven through the REAL admission and asserted from a modified-only
+  /// subscription, which no `Moved` verb admits on its own — so the cell is a
+  /// witness for the evidence surviving the paired path, not for the pairing.
+  #[test]
+  fn a_paired_rename_admits_the_content_it_proves() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_modified());
+    let mut adm = seeded_admission();
+    let mut admitted = Vec::new();
+    adm.admit(
+      usn_record(
+        50,
+        10,
+        reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE,
+        0x20,
+        "old.txt",
+      ),
+      &mut admitted,
+    );
+    adm.admit(
+      usn_record(
+        50,
+        USN_ROOT,
+        reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE | reason::RENAME_NEW_NAME,
+        0x20,
+        "new.txt",
+      ),
+      &mut admitted,
+    );
+    assert!(
+      matches!(&admitted[..], [UsnAdmitted::Renamed { old_content, .. }]
+        if old_content & reason::DATA_OVERWRITE != 0),
+      "the pair carries the departing record's content bits: {admitted:?}"
+    );
+
+    core.on_batch(scope, payload(admitted), at(1));
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(
+      emitted.len(),
+      1,
+      "the content evidence widens the pairing's ONE change, never adds a \
+       second delivery: {emitted:?}"
+    );
+    assert_eq!(
+      emitted[0].kind().moved_from(),
+      Some(&loc(&["a", "old.txt"]))
+    );
+    assert_eq!(emitted[0].location(), &loc(&["new.txt"]));
+  }
+
+  /// The same fact through the boundary degrade: a rename whose other end is
+  /// outside the root lowers to the in-root end's membership verb, and that
+  /// naming choice must not consume the content evidence either.
+  #[test]
+  fn a_boundary_rename_admits_the_content_it_proves() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_modified());
+    let mut adm = seeded_admission();
+    let mut admitted = Vec::new();
+    adm.admit(
+      usn_record(
+        50,
+        10,
+        reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE,
+        0x20,
+        "old.txt",
+      ),
+      &mut admitted,
+    );
+    // The arriving half lands under an unmapped parent: out of root.
+    adm.admit(
+      usn_record(
+        50,
+        999,
+        reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE | reason::RENAME_NEW_NAME,
+        0x20,
+        "gone.txt",
+      ),
+      &mut admitted,
+    );
+    core.on_batch(scope, payload(admitted), at(1));
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0].location(), &loc(&["a", "old.txt"]));
   }
 
   #[test]
@@ -8344,6 +9215,1065 @@ mod usn_lowering {
     assert!(
       emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&[]),
       "{emitted:?}"
+    );
+  }
+
+  /// A map that contradicts itself covers the root exactly like an overflow
+  /// does; the difference is what the SOURCE does behind the cover — reseed
+  /// rather than die — which the cover is agnostic to.
+  #[test]
+  fn a_map_inconsistency_covers_the_root() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(scope, payload(vec![UsnAdmitted::MapInconsistent]), at(1));
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&[]),
+      "{emitted:?}"
+    );
+  }
+
+  /// A rename half the admission could not pair, or could not keep in-root, is
+  /// NAMED by its membership verb and still ADMITS a move-only subscription:
+  /// the degrade chooses a verb, and a verb choice must not narrow admission.
+  /// Without the move fact the subscriber receives neither half and no rescan.
+  #[test]
+  fn a_degraded_rename_half_reaches_a_move_only_subscription() {
+    for delta in [
+      reason::FILE_DELETE | reason::RENAME_OLD_NAME,
+      reason::FILE_CREATE | reason::RENAME_NEW_NAME,
+    ] {
+      let mut core = DriverCore::new(WINDOW, LIVENESS);
+      let scope = live_scope_with(&mut core, Interest::new().with_moved());
+      core.on_batch(
+        scope,
+        payload(vec![UsnAdmitted::Single {
+          delta,
+          target: resolved(&["a", "half.txt"]),
+          is_dir: false,
+        }]),
+        at(1),
+      );
+      let effects = drain(&mut core);
+      let emitted = emits(&effects);
+      assert_eq!(emitted.len(), 1, "delta {delta:#x}: {emitted:?}");
+      assert_eq!(emitted[0].location(), &loc(&["a", "half.txt"]));
+    }
+  }
+
+  /// And the degrade still NAMES the membership verb for everyone else: the
+  /// move fact widens admission, it does not rewrite the report.
+  #[test]
+  fn a_degraded_rename_half_still_names_its_membership_verb() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(
+      scope,
+      payload(vec![
+        UsnAdmitted::Single {
+          delta: reason::FILE_DELETE | reason::RENAME_OLD_NAME,
+          target: resolved(&["gone.txt"]),
+          is_dir: false,
+        },
+        UsnAdmitted::Single {
+          delta: reason::FILE_CREATE | reason::RENAME_NEW_NAME,
+          target: resolved(&["here.txt"]),
+          is_dir: false,
+        },
+      ]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 2, "{emitted:?}");
+    assert!(emitted[0].kind().is_removed(), "{emitted:?}");
+    assert!(emitted[1].kind().is_created(), "{emitted:?}");
+    assert!(
+      emitted.iter().all(|c| c.kind().moved_from().is_none()),
+      "a degraded half never fabricates a paired Moved: {emitted:?}"
+    );
+  }
+
+  /// What the consumer actually saw. A contradiction's root `Rescan` used to be
+  /// followed, in the SAME delivery, by records whose paths the very same
+  /// verdict had disowned: a subscriber re-read at the Rescan, believed itself
+  /// consistent again, and diverged on the next record — and the source's own
+  /// loss signal arrived only afterwards, too late to dominate any of it.
+  #[test]
+  fn a_contradicted_buffer_delivers_nothing_after_its_root_cover() {
+    let mut map = FrnMap::new(USN_ROOT, None);
+    map.seed([(10, USN_ROOT, "a".into()), (20, 10, "p".into())]);
+    let mut admission = UsnAdmission::new(map, 64);
+    let mut admitted = Vec::new();
+    admission.admit_batch(
+      vec![
+        usn_record(50, 20, reason::FILE_CREATE, 0x20, "before.txt"),
+        // History replayed out of order: "a was created under p", against a
+        // map where p already sits inside a.
+        usn_record(10, 20, reason::FILE_CREATE, 0x10, "a"),
+        usn_record(60, 20, reason::FILE_CREATE, 0x20, "after.txt"),
+      ],
+      &mut admitted,
+    );
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(scope, payload(admitted), at(1));
+    let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
+    assert!(
+      !emitted
+        .iter()
+        .any(|c| c.location() == &loc(&["a", "p", "after.txt"])),
+      "nothing resolved through the disowned topology is delivered: {emitted:?}"
+    );
+    let last = emitted.last().expect("the cover is delivered");
+    assert!(
+      last.kind().is_rescan() && last.location() == &loc(&[]),
+      "the root cover is the delivery's last word: {emitted:?}"
+    );
+  }
+
+  /// The convergence a modified-only subscription depends on, over the exact
+  /// stream NTFS produces for two writes and a close: `DATA_OVERWRITE`, then —
+  /// because a repeat of an already-recorded kind writes no record — NOTHING,
+  /// then `DATA_OVERWRITE | CLOSE`. Three changes, two records.
+  ///
+  /// A close repair armed by observing a wholly-repeated record cannot fire
+  /// here, because the middle record does not exist. The subscriber heard one
+  /// `Modified`, read the file at it, and held its half-written contents with
+  /// nothing left in the stream to correct them.
+  #[test]
+  fn two_writes_then_a_close_deliver_twice_to_a_modified_only_subscription() {
+    let mut admission = seeded_admission();
+    let mut admitted = Vec::new();
+    for mask in [
+      reason::DATA_OVERWRITE,
+      // The second write records nothing; the close is the next record.
+      reason::DATA_OVERWRITE | reason::CLOSE,
+    ] {
+      admission.admit(usn_record(50, 10, mask, 0x20, "f.txt"), &mut admitted);
+    }
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_modified());
+    for event in admitted {
+      core.on_batch(scope, payload(vec![event]), at(1));
+    }
+    let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
+    assert_eq!(
+      emitted.len(),
+      2,
+      "the close must re-report content the journal never recorded a second time: {emitted:?}"
+    );
+    assert!(
+      emitted.iter().all(|c| c.kind().is_modified()),
+      "{emitted:?}"
+    );
+    assert!(
+      emitted
+        .iter()
+        .all(|c| c.location() == &loc(&["a", "f.txt"])),
+      "{emitted:?}"
+    );
+  }
+
+  /// The same convergence across a class boundary. Write, an unrecorded second
+  /// write, then a time stamp set: the touch is METADATA and no `Modified`
+  /// subscription ever hears it, so only the close can repair the content.
+  /// When a fresh bit of any class was treated as compensation, the close said
+  /// nothing about content and the subscriber's newest delivery described a
+  /// half-written file forever.
+  #[test]
+  fn a_modified_only_subscription_converges_across_a_metadata_touch() {
+    let mut admission = seeded_admission();
+    let mut admitted = Vec::new();
+    for mask in [
+      reason::DATA_EXTEND,
+      // The second write records nothing; the time stamp set is a new kind
+      // and records the accumulated mask.
+      reason::DATA_EXTEND | reason::BASIC_INFO_CHANGE,
+      reason::DATA_EXTEND | reason::BASIC_INFO_CHANGE | reason::CLOSE,
+    ] {
+      admission.admit(usn_record(50, 10, mask, 0x20, "f.txt"), &mut admitted);
+    }
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_modified());
+    for event in admitted {
+      core.on_batch(scope, payload(vec![event]), at(1));
+    }
+    let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
+    assert_eq!(
+      emitted.len(),
+      2,
+      "the close re-reports the write no record ever named: {emitted:?}"
+    );
+    assert!(
+      emitted.iter().all(|c| c.kind().is_modified()),
+      "{emitted:?}"
+    );
+    assert!(
+      emitted
+        .iter()
+        .all(|c| c.location() == &loc(&["a", "f.txt"])),
+      "{emitted:?}"
+    );
+  }
+
+  /// The same convergence when the object has TWO names and only one of them
+  /// is watched. A journal record names the link its handle was opened
+  /// through, so a file linked as `a/in.txt` inside the tree and as `out.txt`
+  /// outside it can be written through the watched name, suppress its repeat,
+  /// and produce its close — the only convergence the journal offers — under
+  /// the outside name.
+  ///
+  /// Routed there the replay was dropped as out-of-root and the modified-only
+  /// subscriber, which had already read the file at the first write, was left
+  /// holding half-written contents indefinitely. The repair is owed to the
+  /// link the notice went to, and arrives as a cover: the summary proves the
+  /// class changed and can prove nothing about when or through which handle.
+  #[test]
+  fn a_close_through_an_unwatched_hard_link_still_converges_the_watched_one() {
+    let mut admission = seeded_admission();
+    let mut admitted = Vec::new();
+    admission.admit(
+      usn_record(50, 10, reason::DATA_OVERWRITE, 0x20, "in.txt"),
+      &mut admitted,
+    );
+    // The second write records nothing; the close names the OUTSIDE link,
+    // whose parent the map does not know.
+    admission.admit(
+      usn_record(
+        50,
+        999,
+        reason::DATA_OVERWRITE | reason::CLOSE,
+        0x20,
+        "out.txt",
+      ),
+      &mut admitted,
+    );
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_modified());
+    for event in admitted {
+      core.on_batch(scope, payload(vec![event]), at(1));
+    }
+    let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
+    assert!(
+      emitted
+        .first()
+        .is_some_and(|c| c.kind().is_modified() && c.location() == &loc(&["a", "in.txt"])),
+      "the first write delivers at the watched link: {emitted:?}"
+    );
+    assert!(
+      emitted
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["a", "in.txt"])),
+      "and the close still repairs it: {emitted:?}"
+    );
+  }
+
+  /// The same convergence when the delivery that needs repairing was a RENAME.
+  ///
+  /// A `RENAME_OLD_NAME | DATA_OVERWRITE` record proves a move AND a write, and
+  /// the pair lowers to ONE `Moved` located at the destination whose fact set
+  /// carries that write — which is why a modified-only subscription, admitted on
+  /// nothing a `Moved` verb proves by itself, hears it at all. The repeat that
+  /// follows writes no record (the class is already in the session's cumulative
+  /// mask) and the close lands on an out-of-root hard link, so the rename is the
+  /// LAST thing this subscription is ever told about the file.
+  ///
+  /// Registering nothing for the rename left the session owing nothing, the
+  /// close's own routing was dropped as out-of-root, and the subscriber that
+  /// read at the `Moved` held half-written contents indefinitely.
+  #[test]
+  fn a_paired_rename_that_proves_content_still_converges_at_its_close() {
+    let mut admission = seeded_admission();
+    let mut admitted = Vec::new();
+    admission.admit(
+      usn_record(
+        50,
+        10,
+        reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE,
+        0x20,
+        "old.txt",
+      ),
+      &mut admitted,
+    );
+    admission.admit(
+      usn_record(
+        50,
+        10,
+        reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE | reason::RENAME_NEW_NAME,
+        0x20,
+        "new.txt",
+      ),
+      &mut admitted,
+    );
+    // The second write records nothing; the close names the OUTSIDE link.
+    admission.admit(
+      usn_record(
+        50,
+        999,
+        reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE | reason::RENAME_NEW_NAME | reason::CLOSE,
+        0x20,
+        "out.txt",
+      ),
+      &mut admitted,
+    );
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope_with(&mut core, Interest::new().with_modified());
+    core.on_batch(scope, payload(admitted), at(1));
+    let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
+    assert!(
+      emitted
+        .first()
+        .is_some_and(|c| c.kind().moved_from() == Some(&loc(&["a", "old.txt"]))
+          && c.location() == &loc(&["a", "new.txt"])),
+      "the premise: the rename's own write reaches a modified-only \
+       subscription, at the destination: {emitted:?}"
+    );
+    assert!(
+      emitted
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["a", "new.txt"])),
+      "and the close repairs the link that delivery reached: {emitted:?}"
+    );
+  }
+
+  /// What a subscriber actually receives while a build cache churns under an
+  /// exclusion — asserted through a core carrying NO exclusions of its own, so
+  /// the common layer's delivery-side fence is inert and everything here is the
+  /// USN admission's own doing.
+  ///
+  /// The common fence could never have covered this anyway. It drops COMPILED
+  /// records, and by then the map has already learned each incarnation of the
+  /// excluded directory: with a cap in force the third create answers
+  /// `MapOverflow`, which lowers to a root-wide `Rescan` and kills the source —
+  /// so an exclusion the caller added to shed load ended the watch on ground it
+  /// was still watching.
+  #[test]
+  fn excluded_churn_reaches_no_subscriber_and_never_ends_the_scope() {
+    let mut map = FrnMap::new(USN_ROOT, Some(2));
+    map.seed([(10, USN_ROOT, "keep".into())]);
+    let mut admission = UsnAdmission::new(map, 64).with_fence(UsnFence::new(
+      PathBuf::from("/r"),
+      vec![PathBuf::from("/r/cache")],
+    ));
+    let mut admitted = Vec::new();
+    for round in 0..200u128 {
+      let frn = 1000 + round;
+      for mask in [
+        reason::FILE_CREATE,
+        reason::FILE_CREATE | reason::DATA_EXTEND,
+        reason::FILE_CREATE | reason::DATA_EXTEND | reason::FILE_DELETE,
+      ] {
+        admission.admit(
+          usn_record(frn, USN_ROOT, mask, 0x10, "cache"),
+          &mut admitted,
+        );
+      }
+    }
+    // One ordinary change in the reported tree, after all of it.
+    admission.admit(
+      usn_record(50, 10, reason::DATA_OVERWRITE, 0x20, "f.txt"),
+      &mut admitted,
+    );
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+    core.on_batch(scope, payload(admitted), at(1));
+    let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
+    assert_eq!(
+      emitted.len(),
+      1,
+      "six hundred excluded records deliver nothing: {emitted:?}"
+    );
+    assert!(
+      emitted[0].kind().is_modified() && emitted[0].location() == &loc(&["keep", "f.txt"]),
+      "and the reported tree's own change still arrives: {emitted:?}"
+    );
+  }
+
+  /// What a subscriber receives when a WATCHED hard link is renamed after an
+  /// UNWATCHED one — the shape the latent rename debt existed for.
+  ///
+  /// `a/in.txt` and an out-of-root `out.txt` are two links of one file, and the
+  /// subscriber holds `a/in.txt` from the create it was delivered. Then:
+  ///
+  /// 1. the OUTSIDE link is renamed. Neither endpoint is a link this scope
+  ///    reports, so nothing is delivered;
+  /// 2. `a/in.txt` is renamed;
+  /// 3. the last handle closes, through the OUTSIDE link.
+  ///
+  /// Step 2 was believed to write NO RECORD, because the rename bits already
+  /// stood for the file reference — so the subscriber had to be sent back to the
+  /// whole root at step 3, and, the journal being volume-wide, so did every
+  /// other file rename on the disk. The journal writes both halves of every
+  /// move: step 2 arrives as an ordinary `Moved`, and step 3 has nothing to say.
+  #[test]
+  fn a_renamed_watched_hard_link_reaches_the_subscriber_as_a_move() {
+    let mut adm = seeded_admission();
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    let created = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(50, 10, reason::FILE_CREATE, 0x20, "in.txt")],
+    );
+    assert!(
+      created
+        .iter()
+        .any(|c| c.kind().is_created() && c.location() == &loc(&["a", "in.txt"])),
+      "the premise: the subscriber's state holds a/in.txt: {created:?}"
+    );
+
+    let outside = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![
+        usn_record(50, 999, reason::RENAME_OLD_NAME, 0x20, "out.txt"),
+        usn_record(50, 999, reason::RENAME_NEW_NAME, 0x20, "out2.txt"),
+      ],
+    );
+    assert!(
+      outside.is_empty(),
+      "the premise: the outside link's move is not this scope's business and \
+       delivers nothing: {outside:?}"
+    );
+
+    // `a/in.txt` is renamed, and the journal writes both of its halves.
+    let moved = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![
+        usn_record(50, 10, reason::RENAME_OLD_NAME, 0x20, "in.txt"),
+        usn_record(50, 10, reason::RENAME_NEW_NAME, 0x20, "in2.txt"),
+      ],
+    );
+    assert!(
+      moved
+        .iter()
+        .any(|c| c.kind().moved_from() == Some(&loc(&["a", "in.txt"]))
+          && c.location() == &loc(&["a", "in2.txt"])),
+      "the subscriber is told where the watched link went, by name: {moved:?}"
+    );
+
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        50,
+        999,
+        reason::RENAME_NEW_NAME | reason::CLOSE,
+        0x20,
+        "out2.txt",
+      )],
+    );
+    assert!(
+      closed.is_empty(),
+      "and the close sends it nowhere: a file rename anywhere on the volume no \
+       longer rescans the watched root: {closed:?}"
+    );
+  }
+
+  /// And the same silence on a DIRECTORY costs the watched tree nothing, because
+  /// there the source can PROVE the sequence above is unreachable: NTFS forbids
+  /// hard links to directories, so the link its records name is its only one and
+  /// an unreported endpoint is the whole truth about where it is.
+  ///
+  /// Asserted on DELIVERY rather than on the flag, because this is where the
+  /// cost lives: the journal is volume-wide, and a directory rename in an
+  /// unwatched corner of the disk must not answer with a rescan — still less
+  /// with the reseed a mapped directory's stale location buys.
+  #[test]
+  fn a_directory_renamed_outside_the_tree_sends_the_subscriber_nowhere() {
+    let mut adm = seeded_admission();
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    let churn = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![
+        usn_record(70, 999, reason::RENAME_OLD_NAME, 0x10, "d"),
+        usn_record(
+          70,
+          999,
+          reason::RENAME_OLD_NAME | reason::RENAME_NEW_NAME,
+          0x10,
+          "d2",
+        ),
+        usn_record(
+          70,
+          999,
+          reason::RENAME_OLD_NAME | reason::RENAME_NEW_NAME | reason::CLOSE,
+          0x10,
+          "d2",
+        ),
+      ],
+    );
+    assert!(
+      churn.is_empty(),
+      "unwatched directory churn reaches no subscriber: {churn:?}"
+    );
+  }
+
+  /// What a subscriber receives when the session cap takes a FILE whose rename
+  /// it had already admitted, and the file then moves AGAIN.
+  ///
+  /// A pure in-root rename delivers a `Moved` and nothing replayable with it, so
+  /// the session retains no link and the eviction has nothing to surrender. What
+  /// the eviction used to also take was the FACT that a rename had been
+  /// admitted, because the second move on the same open handle was believed to
+  /// write no record — so the close on an out-of-root hard link had to send the
+  /// subscriber back to the whole root.
+  ///
+  /// The second move writes its own two records, so the eviction has nothing to
+  /// remember: the subscriber is told the file's new name by name, and the close
+  /// adds nothing. A cap that bites now costs a repeated WRITE's repair and
+  /// never a move's.
+  #[test]
+  fn an_evicted_files_second_move_still_reaches_the_subscriber_by_name() {
+    let mut map = FrnMap::new(USN_ROOT, None);
+    map.seed([(10, USN_ROOT, "a".into())]);
+    // One live session slot: the next subject's first record evicts this one.
+    let mut adm = UsnAdmission::new(map, 1);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    let moved = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![
+        usn_record(50, 10, reason::RENAME_OLD_NAME, 0x20, "old.txt"),
+        usn_record(
+          50,
+          10,
+          reason::RENAME_OLD_NAME | reason::RENAME_NEW_NAME,
+          0x20,
+          "new.txt",
+        ),
+      ],
+    );
+    assert!(
+      moved
+        .iter()
+        .any(|c| c.kind().moved_from() == Some(&loc(&["a", "old.txt"]))
+          && c.location() == &loc(&["a", "new.txt"])),
+      "the premise: the first move is delivered, and the consumer's state for \
+       the file moves with it: {moved:?}"
+    );
+
+    let evicting = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        60,
+        10,
+        reason::DATA_OVERWRITE,
+        0x20,
+        "other.txt",
+      )],
+    );
+    assert!(
+      !evicting.iter().any(|c| c.kind().is_rescan()),
+      "the premise: an unrelated subject takes the slot, saying nothing about \
+       the renamed file: {evicting:?}"
+    );
+
+    // The second move, on a session the cap has already forgotten.
+    let again = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![
+        usn_record(50, 10, reason::RENAME_OLD_NAME, 0x20, "new.txt"),
+        usn_record(50, 10, reason::RENAME_NEW_NAME, 0x20, "third.txt"),
+      ],
+    );
+    assert!(
+      again
+        .iter()
+        .any(|c| c.kind().moved_from() == Some(&loc(&["a", "new.txt"]))
+          && c.location() == &loc(&["a", "third.txt"])),
+      "the second move is delivered by its own records, whatever the cap did to \
+       the entry: {again:?}"
+    );
+
+    // And the close, on an out-of-root hard link, has nothing left to repair.
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        50,
+        999,
+        reason::RENAME_NEW_NAME | reason::CLOSE,
+        0x20,
+        "elsewhere.txt",
+      )],
+    );
+    assert!(
+      !closed.iter().any(|c| c.kind().is_rescan()),
+      "the close covers nothing: {closed:?}"
+    );
+  }
+
+  /// A COVER IS THE LAST WORD OF THE RECORD THAT PAID IT, asserted on what the
+  /// subscriber receives AND in what order.
+  ///
+  /// The verdict that reaches this is the orphan ledger's anonymous residue: its
+  /// bound took a debt's NAME, so some session this source stopped tracking is
+  /// still owed a repair and no close proves whose. It is paid with the reseed
+  /// spine, which says the MAP is untrustworthy — and the record paying it would
+  /// resolve its own name through that same map. Lowering it anyway sends the
+  /// subscriber back to the filesystem and then immediately hands it an event at
+  /// a name the source has just disowned, re-diverging it on the spot.
+  #[test]
+  fn a_paid_cover_reaches_the_subscriber_with_nothing_behind_it() {
+    let mut map = FrnMap::new(USN_ROOT, None);
+    map.seed([(10, USN_ROOT, "a".into())]);
+    // One live session slot, and — the ledger takes the same bound — one named
+    // orphan debt.
+    let mut adm = UsnAdmission::new(map, 1);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    // Three writers in turn: each evicts its predecessor, which owes a repair to
+    // the link it just delivered at. The second eviction has no name left to
+    // record and falls into the residue.
+    for (frn, name) in [(50u128, "one.txt"), (60, "two.txt"), (70, "three.txt")] {
+      let delivered = step(
+        &mut core,
+        scope,
+        &mut adm,
+        vec![usn_record(frn, 10, reason::DATA_OVERWRITE, 0x20, name)],
+      );
+      assert!(
+        delivered
+          .iter()
+          .any(|c| c.kind().is_modified() && c.location() == &loc(&["a", name])),
+        "the premise: each writer's own change is delivered: {delivered:?}"
+      );
+    }
+
+    // An unrelated subject's close. The residue rides along, because it names
+    // nobody and this close may be the debtor's.
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        80,
+        10,
+        reason::FILE_CREATE | reason::CLOSE,
+        0x20,
+        "fresh.txt",
+      )],
+    );
+    assert!(
+      closed
+        .first()
+        .is_some_and(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "the cover comes first: {closed:?}"
+    );
+    assert!(
+      closed
+        .iter()
+        .all(|c| c.location() != &loc(&["a", "fresh.txt"])),
+      "and nothing follows it at a name resolved through the map it disowned: \
+       {closed:?}"
+    );
+  }
+
+  /// What a subscriber receives when the cap takes a session whose rename half
+  /// is still PARKED in the pairer.
+  ///
+  /// A parked half is a record already observed and not yet lowered, so nothing
+  /// it owes has been registered: an unrelated record observed in that window
+  /// took the entry at its emptiest, the ledger recorded no debt because none
+  /// existed yet, and the half then widowed into registrations with no entry
+  /// left to reach. The close on an out-of-root hard link delivered nothing at
+  /// all, and a subscriber that had read the file at the parked half's own write
+  /// held half-written contents for good.
+  ///
+  /// The carried half proves a WRITE besides its move, which is what makes it
+  /// owe a registration: a repeated write is still silent, and its repair still
+  /// has to reach the link the notice went to.
+  #[test]
+  fn a_parked_half_is_lowered_before_the_cap_can_take_its_session() {
+    let mut map = FrnMap::new(USN_ROOT, None);
+    map.seed([(10, USN_ROOT, "a".into())]);
+    let mut adm = UsnAdmission::new(map, 1);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    // One read's worth: a pure OLD half, then an unrelated subject's write.
+    let widowed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![
+        usn_record(
+          50,
+          10,
+          reason::RENAME_OLD_NAME | reason::DATA_OVERWRITE,
+          0x20,
+          "old.txt",
+        ),
+        usn_record(60, 10, reason::DATA_OVERWRITE, 0x20, "other.txt"),
+      ],
+    );
+    assert!(
+      widowed
+        .first()
+        .is_some_and(|c| c.location() == &loc(&["a", "old.txt"])),
+      "the premise: the parked half is delivered first, in journal order: \
+       {widowed:?}"
+    );
+
+    // A further write records nothing; the close lands on an out-of-root hard
+    // link, so its own routing reaches no subscriber.
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        50,
+        999,
+        reason::DATA_OVERWRITE | reason::CLOSE,
+        0x20,
+        "elsewhere.txt",
+      )],
+    );
+    assert!(
+      closed
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "the close still covers the repair the cap could no longer name: {closed:?}"
+    );
+  }
+
+  /// What a subscriber receives when the ORPHAN LEDGER reaches its own bound.
+  ///
+  /// Three writers and one session slot: each new subject evicts the previous
+  /// one, and the third eviction pushes the ledger past what it can NAME. A
+  /// bound that answered that by dropping the oldest debt and paying its cover
+  /// on the spot covered everything up to that instant and nothing after it —
+  /// and the session behind that debt was still OPEN, so its next write was
+  /// recorded as nothing at all and its close, landing on an out-of-root hard
+  /// link, delivered nothing either.
+  #[test]
+  fn a_ledger_at_its_bound_still_covers_what_the_forgotten_sessions_do_next() {
+    let mut map = FrnMap::new(USN_ROOT, None);
+    map.seed([(10, USN_ROOT, "a".into())]);
+    let mut adm = UsnAdmission::new(map, 1);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    for (frn, name) in [(50u128, "first.txt"), (60, "second.txt"), (70, "third.txt")] {
+      let delivered = step(
+        &mut core,
+        scope,
+        &mut adm,
+        vec![usn_record(frn, 10, reason::DATA_OVERWRITE, 0x20, name)],
+      );
+      assert!(
+        delivered
+          .iter()
+          .any(|c| c.kind().is_modified() && c.location() == &loc(&["a", name])),
+        "the premise: each writer's own change is delivered at its link: \
+         {delivered:?}"
+      );
+    }
+
+    // The first writer goes on writing. Its class already stands in the
+    // session's mask, so NTFS records nothing, and it closes on an out-of-root
+    // hard link.
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        50,
+        999,
+        reason::DATA_OVERWRITE | reason::CLOSE,
+        0x20,
+        "outside.txt",
+      )],
+    );
+    assert!(
+      closed
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "the close of a session the ledger stopped naming still covers it: \
+       {closed:?}"
+    );
+
+    // And a subject the ledger never held is covered by the same residue: it
+    // cannot tell whose close this is, so while it stands it is owed at each.
+    let stranger = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        80,
+        999,
+        reason::DATA_OVERWRITE | reason::CLOSE,
+        0x20,
+        "stranger.txt",
+      )],
+    );
+    assert!(
+      stranger
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "an unnameable debt is covered conservatively, never settled early: \
+       {stranger:?}"
+    );
+  }
+
+  /// What a subscriber receives when the record that ends a session is also the
+  /// record that completes its parked rename half.
+  ///
+  /// NTFS ends a session with a summary of everything it accumulated plus
+  /// `CLOSE`, so the arriving half and the retirement can be ONE record. The
+  /// retirement runs first, and it is what reads out the obligations the parked
+  /// departing half had not registered yet — so the half is widowed ahead of it,
+  /// and BOTH ends reach the subscriber as their own membership verbs.
+  ///
+  /// This shape used to answer with a root `Rescan` and then refuse to name the
+  /// destination at all, because the cover disowned the record carrying it: the
+  /// subscriber was sent back to the filesystem instead of being told where the
+  /// directory went. The move writes both of its records, so both are delivered.
+  #[test]
+  fn a_close_merged_with_its_rename_half_names_both_ends() {
+    let mut adm = seeded_admission();
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    let parked = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(10, USN_ROOT, reason::RENAME_OLD_NAME, 0x10, "a")],
+    );
+    assert!(
+      parked.is_empty(),
+      "the premise: the departing half is parked, so nothing it owes is booked \
+       and nothing is delivered: {parked:?}"
+    );
+
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        10,
+        USN_ROOT,
+        reason::RENAME_NEW_NAME | reason::CLOSE,
+        0x10,
+        "a2",
+      )],
+    );
+    assert!(
+      closed
+        .iter()
+        .any(|c| c.kind().is_removed() && c.location() == &loc(&["a"])),
+      "the departure reaches the subscriber: {closed:?}"
+    );
+    assert!(
+      closed.iter().any(|c| c.location() == &loc(&["a2"])),
+      "and so does the destination the cover used to refuse to name: {closed:?}"
+    );
+    assert!(
+      !closed
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "and the subscriber is not sent back to the whole root for it: {closed:?}"
+    );
+  }
+
+  /// The same window, entered by a rename that CROSSES the reported tree's
+  /// boundary — a departing endpoint OUTSIDE the root, an arriving one inside —
+  /// asserted on what the subscriber receives and in what order.
+  ///
+  /// The departing half is drained ahead of the close exactly as it must be, and
+  /// registers nothing: its endpoint is not one this scope reports, so its
+  /// lowering is discarded there. The arriving endpoint rides the closing record
+  /// itself, and it is DELIVERED — the subject arrived at a name this scope
+  /// reports, and its own record says so. This used to be answered with a root
+  /// `Rescan` that then disowned the very record carrying the arrival, so the
+  /// subscriber was never told the name at all.
+  #[test]
+  fn a_crossing_into_the_root_reports_the_arrival_its_close_carries() {
+    let mut adm = seeded_admission();
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    let parked = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        50,
+        999,
+        reason::RENAME_OLD_NAME,
+        0x20,
+        "outside.txt",
+      )],
+    );
+    assert!(
+      parked.is_empty(),
+      "the premise: the departing half names a parent outside the root, so it \
+       is parked and reports nothing: {parked:?}"
+    );
+
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        50,
+        10,
+        reason::RENAME_NEW_NAME | reason::CLOSE,
+        0x20,
+        "in.txt",
+      )],
+    );
+    assert!(
+      closed
+        .iter()
+        .any(|c| c.kind().is_created() && c.location() == &loc(&["a", "in.txt"])),
+      "the crossing's reported end reaches the subscriber by name: {closed:?}"
+    );
+    assert!(
+      !closed
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "and nothing sends it back to the whole root: {closed:?}"
+    );
+  }
+
+  /// The other crossing form, at the same window: a departing endpoint the
+  /// caller EXCLUDED, an arriving one inside the reported tree.
+  ///
+  /// An excluded endpoint resolves through the map and an out-of-root one does
+  /// not, which is why the suppression rule keeps three answers apart rather
+  /// than two. The excluded half reports nothing and the reported one — merged
+  /// into the record that retires the session — is delivered, where a root
+  /// `Rescan` used to stand in its place and then disown it.
+  ///
+  /// Asserted through a core carrying NO exclusions of its own, so the common
+  /// layer's delivery-side fence is inert and everything here is the USN
+  /// admission's own doing.
+  #[test]
+  fn an_excluded_to_reported_crossing_reports_the_arrival_its_close_carries() {
+    let mut map = FrnMap::new(USN_ROOT, None);
+    map.seed([(10, USN_ROOT, "a".into())]);
+    let mut adm = UsnAdmission::new(map, 64).with_fence(UsnFence::new(
+      PathBuf::from("/r"),
+      vec![PathBuf::from("/r/a/cache")],
+    ));
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    let parked = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(50, 10, reason::RENAME_OLD_NAME, 0x20, "cache")],
+    );
+    assert!(
+      parked.is_empty(),
+      "the premise: the departing endpoint resolves and is fenced off, so it \
+       is parked and reports nothing: {parked:?}"
+    );
+
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        50,
+        10,
+        reason::RENAME_NEW_NAME | reason::CLOSE,
+        0x20,
+        "kept.txt",
+      )],
+    );
+    assert!(
+      closed
+        .iter()
+        .any(|c| c.kind().is_created() && c.location() == &loc(&["a", "kept.txt"])),
+      "the reported end reaches the subscriber by name: {closed:?}"
+    );
+    assert!(
+      !closed
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&[])),
+      "and nothing sends it back to the whole root: {closed:?}"
+    );
+  }
+
+  /// The same window, closed by a record that completes NOTHING.
+  ///
+  /// This one was silent twice over. The close's delta was empty, so admission
+  /// returned before the pairer was reached: the departing half stayed parked
+  /// past the record that retired its own session, and the close delivered
+  /// nothing whatsoever. The departure surfaced only at whatever later record
+  /// or boundary flush drained the carry — and a departure is no discharge
+  /// here, because a standing `RENAME_OLD_NAME` at a close whose summary never
+  /// carried the arriving half means the destination was never observed and may
+  /// be in-root. So the half is drained while its entry is still there to book
+  /// against, and it is the record that ended the session that delivers it.
+  #[test]
+  fn a_close_that_completes_nothing_still_delivers_its_parked_half() {
+    let mut adm = seeded_admission();
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    let parked = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(10, USN_ROOT, reason::RENAME_OLD_NAME, 0x10, "a")],
+    );
+    assert!(
+      parked.is_empty(),
+      "the premise: parked, unbooked: {parked:?}"
+    );
+
+    let closed = step(
+      &mut core,
+      scope,
+      &mut adm,
+      vec![usn_record(
+        10,
+        USN_ROOT,
+        reason::RENAME_OLD_NAME | reason::CLOSE,
+        0x10,
+        "a",
+      )],
+    );
+    assert!(
+      closed
+        .iter()
+        .any(|c| c.kind().is_removed() && c.location() == &loc(&["a"])),
+      "the departure reaches the subscriber at the record that ended the \
+       session, not at some later one: {closed:?}"
     );
   }
 }
@@ -8582,7 +10512,11 @@ mod root_replaced {
         _ => None,
       })
       .expect("the descending root arms through the effect path");
-    core.on_watch_installed(root_watch, WatchOutcome::Installed(1));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      WatchOutcome::Installed(1),
+    );
     let effects = drain(&mut core);
     let req = effects
       .iter()
@@ -8603,7 +10537,7 @@ mod root_replaced {
         _ => None,
       })
       .expect("the discovered child arms");
-    core.on_watch_installed(child, WatchOutcome::Installed(2));
+    core.on_watch_installed(child, core.arm_attempt(child), WatchOutcome::Installed(2));
     let effects = drain(&mut core);
     let child_req = effects
       .iter()
@@ -8645,7 +10579,11 @@ mod root_replaced {
     // inotify profile, so its ACK is stale under the stamp rule — one re-add
     // re-proves the binding on the new transport, and only its own ACK
     // unlocks the re-arm-flavored rebuild.
-    core.on_watch_installed(root_watch, WatchOutcome::Installed(9));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      WatchOutcome::Installed(9),
+    );
     let readd = drain(&mut core)
       .iter()
       .find_map(|e| match e {
@@ -8659,7 +10597,11 @@ mod root_replaced {
       })
       .expect("the rebound root's binding is re-proven post-commit");
     assert_eq!(readd, root_watch, "the re-add names the surviving root");
-    core.on_watch_installed(root_watch, WatchOutcome::Aliased(9));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      WatchOutcome::Aliased(9),
+    );
     let effects = drain(&mut core);
     let rebuild = effects
       .iter()
@@ -8737,10 +10679,10 @@ mod root_widened {
   fn widen(core: &mut DriverCore, scope: ScopeId, meta: RootMeta, now: Instant) -> WatchId {
     let reserved = core.reserve_watch_id();
     core.begin_widen_watch(scope, reserved);
-    assert_eq!(
+    assert!(matches!(
       core.on_root_widened(scope, meta, reserved, now),
-      WidenCommit::Committed
-    );
+      WidenCommit::Committed(_)
+    ));
     reserved
   }
 
@@ -8760,7 +10702,11 @@ mod root_widened {
         _ => None,
       })
       .expect("the descending root arms through the effect path");
-    core.on_watch_installed(root_watch, crate::os::linux::WatchOutcome::Installed(1));
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Installed(1),
+    );
     let effects = drain(&mut core);
     let req = effects
       .iter()
@@ -8807,7 +10753,11 @@ mod root_widened {
     assert!(pre.kind().is_created());
 
     let reserved = widen(&mut core, scope, meta("/r", 9), at(2));
-    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      reserved,
+      core.arm_attempt(reserved),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let effects = drain(&mut core);
     assert!(
       emits(&effects).iter().all(|c| !c.kind().is_rescan()),
@@ -9021,7 +10971,11 @@ mod root_widened {
           _ => None,
         })
         .unwrap_or_else(|| panic!("{child} arms: {effects:?}"));
-      core.on_watch_installed(watch, crate::os::linux::WatchOutcome::Installed(9));
+      core.on_watch_installed(
+        watch,
+        core.arm_attempt(watch),
+        crate::os::linux::WatchOutcome::Installed(9),
+      );
     }
     let reads: Vec<ReqId> = drain(&mut core)
       .iter()
@@ -9059,7 +11013,11 @@ mod root_widened {
     // ground, and the re-cover below would compute an EMPTY broadening delta
     // — leaving the hole dark behind a clean claim.
     let reserved = widen(&mut core, scope, meta("/r", 9), at(2));
-    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      reserved,
+      core.arm_attempt(reserved),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let _ = drain(&mut core);
 
     // Re-covering the pruned ground computes a REAL delta against the
@@ -9090,7 +11048,11 @@ mod root_widened {
   fn barrier_is_coverage_settled() {
     let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
     let reserved = widen(&mut core, scope, meta("/r", 1), at(2));
-    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      reserved,
+      core.arm_attempt(reserved),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let effects = drain(&mut core);
     let req = effects
       .iter()
@@ -9153,7 +11115,11 @@ mod root_widened {
   fn a_stale_root_binding_dies_before_the_barrier_clears() {
     let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
     let reserved = widen(&mut core, scope, meta("/r", 1), at(2));
-    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      reserved,
+      core.arm_attempt(reserved),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let effects = drain(&mut core);
     let req = effects
       .iter()
@@ -9441,13 +11407,19 @@ mod root_widened {
       emits(&effects).is_empty(),
       "window churn is consumed, never delivered: {effects:?}"
     );
-    assert_eq!(
-      core.on_root_widened(scope, meta("/r", 1), reserved, at(2)),
-      WidenCommit::Committed,
+    assert!(
+      matches!(
+        core.on_root_widened(scope, meta("/r", 1), reserved, at(2)),
+        WidenCommit::Committed(_)
+      ),
       "benign churn never taints"
     );
     // The replayed arm's cold read converges the new ground as Created.
-    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      reserved,
+      core.arm_attempt(reserved),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let effects = drain(&mut core);
     assert!(
       effects
@@ -9487,7 +11459,11 @@ mod root_widened {
   fn widen_death_after_commit_invalidates() {
     let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
     let reserved = widen(&mut core, scope, meta("/r", 1), at(1));
-    core.on_watch_installed(reserved, crate::os::linux::WatchOutcome::Installed(2));
+    core.on_watch_installed(
+      reserved,
+      core.arm_attempt(reserved),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
     let _ = drain(&mut core);
 
     // The same record that TAINTS pre-commit INVALIDATES post-commit.
@@ -9540,5 +11516,2010 @@ mod root_widened {
       WatchId::new(core::num::NonZeroU64::new(9_990).unwrap()),
     );
     core.abort_widen_watch(ghost);
+  }
+}
+
+mod exclusions {
+  //! The common-layer exclusion fence: the enforcement every backend that has
+  //! no admission-time decision of its own runs on.
+  //!
+  //! A cell whose claim is that ground was never ARMED asserts on COVERAGE —
+  //! `covered_paths()`, the arms the core holds or is trying to hold — and not
+  //! only on what happened to be delivered. A delivery-only assertion cannot tell
+  //! a directory that was never armed from one that was armed and simply had
+  //! nothing to report yet, and "never armed" is the whole content of the option.
+  //!
+  //! The converse is just as load-bearing and the two are not interchangeable: a
+  //! cell whose claim is that nothing EMERGED from an exclusion asserts on
+  //! delivery, because a leak can happen over coverage that is legitimately still
+  //! held at the instant the record is classified.
+
+  use super::*;
+  use crate::{
+    core::{RawDirEntry, RawEnumerate},
+    os::{
+      linux::{
+        RawInotifyEvent, RawLinuxEvent, WatchOutcome,
+        fanotify::{
+          AdmittedEvent,
+          fid::{FAN_CREATE, FAN_ONDIR, FanMask},
+        },
+        inotify::decode::InotifyMask,
+      },
+      windows::{RawWindowsEvent, RdcwAction, RdcwEvent, RdcwName, RdcwRecord},
+    },
+  };
+
+  const IN_CREATE: u32 = 0x0000_0100;
+  const IN_DELETE: u32 = 0x0000_0200;
+  const IN_MOVED_FROM: u32 = 0x0000_0040;
+  const IN_MOVED_TO: u32 = 0x0000_0080;
+  const IN_MODIFY: u32 = 0x0000_0002;
+  const IN_DELETE_SELF: u32 = 0x0000_0400;
+  const IN_ISDIR: u32 = 0x4000_0000;
+
+  /// A core enforcing `paths`, exactly as the driver builds one from the
+  /// watcher's options.
+  fn excluding(paths: &[&str]) -> DriverCore {
+    DriverCore::new(WINDOW, LIVENESS).with_exclusions(paths.iter().map(PathBuf::from).collect())
+  }
+
+  fn entry(name: &str, kind: FileKind) -> RawDirEntry {
+    RawDirEntry {
+      name: name.as_bytes().to_vec(),
+      kind,
+      dev: 1,
+      ino: 10 + u64::from(name.as_bytes()[0]),
+      mnt_id: None,
+    }
+  }
+
+  fn listed(entries: Vec<RawDirEntry>) -> RawEnumerate {
+    RawEnumerate::Listed {
+      entries,
+      complete: true,
+    }
+  }
+
+  fn inotify(anchor: WatchId, mask: u32, cookie: u32, name: Option<&str>) -> RawLinuxEvent {
+    RawLinuxEvent::Inotify {
+      anchors: vec![anchor],
+      event: RawInotifyEvent {
+        wd: 1,
+        mask: InotifyMask(mask),
+        cookie,
+        name: name.map(|n| n.as_bytes().to_vec()),
+      },
+    }
+  }
+
+  /// Registers, spawns and arms a descending root at `/r` on `core`, returning
+  /// its scope, the root's cold-enumerate request and the root watch.
+  fn live_descending(core: &mut DriverCore) -> (ScopeId, ReqId, WatchId) {
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let root_watch = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if path.as_path() == Path::new("/r") && watch == parent => Some(*watch),
+        _ => None,
+      })
+      .expect("the descending root arms through the effect path");
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      WatchOutcome::Installed(1),
+    );
+    let req = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed root cold-enumerates");
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    (scope, req, root_watch)
+  }
+
+  /// A live RDCW (kernel-recursive) scope at `/r` on `core`.
+  fn live_rdcw(core: &mut DriverCore) -> ScopeId {
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Rdcw);
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Rdcw,
+      }),
+    );
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    scope
+  }
+
+  fn rdcw(action: RdcwAction, components: &[&str], is_dir: bool) -> RdcwRecord {
+    RdcwRecord {
+      action,
+      name: RdcwName::Utf8(components.iter().map(|c| (*c).to_owned()).collect()),
+      file_id: None,
+      parent_id: None,
+      attributes: is_dir.then_some(0x10),
+      reparse_tag: None,
+    }
+  }
+
+  fn rdcw_payload(events: Vec<RdcwEvent>) -> BatchPayload {
+    BatchPayload::detached(
+      events
+        .into_iter()
+        .map(|event| SourceEvent::Windows(RawWindowsEvent::Rdcw(event)))
+        .collect(),
+    )
+  }
+
+  /// Whether any delivered change names `first` as its leading segment, on
+  /// either end of a move — "did the caller hear the excluded path at all".
+  fn mentions(changes: &[&Change], first: &str) -> bool {
+    let heads = |location: &Location| {
+      location
+        .segments()
+        .first()
+        .is_some_and(|segment| segment.as_str() == first)
+    };
+    changes
+      .iter()
+      .any(|change| heads(change.location()) || change.kind().moved_from().is_some_and(heads))
+  }
+
+  /// The cold half of the fence: an excluded entry never leaves the listing, so
+  /// the Monitor never stages it, never announces it and never arms it — while
+  /// `cached` proves the rule is a SUBTREE test, not a name-prefix one.
+  ///
+  /// Revert witness: drop the `self.excluded(&path)` skip in `on_enumerated` and
+  /// `/r/cache` joins the coverage set and the inventory.
+  #[test]
+  fn a_cold_listing_never_stages_an_excluded_directory() {
+    let mut core = excluding(&["/r/cache"]);
+    let (_scope, req, _root) = live_descending(&mut core);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry("cache", FileKind::Dir),
+        entry("cached", FileKind::Dir),
+        entry("keep.txt", FileKind::File),
+      ]),
+    );
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r"), PathBuf::from("/r/cached")],
+      "the excluded directory never entered coverage, and the name-prefix \
+       neighbour did: {effects:?}"
+    );
+    let changes = emits(&effects);
+    assert!(
+      !mentions(&changes, "cache"),
+      "nothing about the excluded directory is announced: {changes:?}"
+    );
+    assert_eq!(
+      changes.len(),
+      2,
+      "the reported inventory is exactly `cached` and `keep.txt`: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(|change| change.kind().is_rescan()),
+      "a filtered listing is not a partial one — no covering rescan is owed, and \
+       above all none naming the excluded path: {changes:?}"
+    );
+  }
+
+  /// The live half, in its create shape: a directory created under an exclusion
+  /// after the cold read is fenced by the same rule the listing was.
+  ///
+  /// Revert witness: drop the `Planned::Rec` arm of `fenced` and the create
+  /// installs `/r/cache` and queues its arm.
+  #[test]
+  fn a_live_create_of_an_excluded_directory_never_enters_coverage() {
+    let mut core = excluding(&["/r/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_CREATE | IN_ISDIR, 0, Some("cache")),
+        inotify(root, IN_CREATE | IN_ISDIR, 0, Some("cached")),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r"), PathBuf::from("/r/cached")],
+      "the live create under the exclusion armed nothing: {effects:?}"
+    );
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/cache")
+      )),
+      "no arm is even attempted for the excluded directory: {effects:?}"
+    );
+    let changes = emits(&effects);
+    assert!(
+      !mentions(&changes, "cache"),
+      "and nothing about it is delivered: {changes:?}"
+    );
+  }
+
+  /// The live half, in its move-in shape — the path a create-only fence would
+  /// miss. A directory RENAMED onto an excluded path arms exactly as a created
+  /// one does, so it has to be fenced by the same rule.
+  ///
+  /// The rename's reported half still reports: `other` left the reported tree,
+  /// which is a real change to it, and the caller learns so as the removal the
+  /// crossing amounts to from inside.
+  #[test]
+  fn a_move_onto_an_excluded_path_never_enters_coverage() {
+    let mut core = excluding(&["/r/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("other", FileKind::Dir)]));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r"), PathBuf::from("/r/other")],
+      "staging: the reported directory is covered"
+    );
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM | IN_ISDIR, 7, Some("other")),
+        inotify(root, IN_MOVED_TO | IN_ISDIR, 7, Some("cache")),
+      ],
+      at(1),
+    );
+    core.on_timeout(at(1_000));
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r")],
+      "the moved directory left the reported tree — it is uncovered, and the \
+       excluded destination never took its place: {effects:?}"
+    );
+    let changes = emits(&effects);
+    assert!(
+      !mentions(&changes, "cache"),
+      "the excluded destination is never named: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_removed() && change.location() == &loc(&["other"])),
+      "the crossing is still reported, as the half inside the reported tree: {changes:?}"
+    );
+  }
+
+  /// The exclusion fences the whole SUBTREE, not just its top: a directory the
+  /// fence declined is never enumerated, so nothing beneath it can be
+  /// discovered, armed or retained. This is the coverage-budget property — an
+  /// exclusion cannot consume the coverage the rest of the tree competes for,
+  /// however much churns inside it.
+  ///
+  /// Revert witness: with either half of the fence reverted `/r/cache` is armed,
+  /// its cold read is dispatched, and the two hundred directories below it enter
+  /// coverage on the back of it.
+  #[test]
+  fn excluded_churn_cannot_consume_the_coverage_budget() {
+    let mut core = excluding(&["/r/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry("cache", FileKind::Dir),
+        entry("keep", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/cache")
+      )),
+      "the excluded directory is never read, so its subtree is unreachable: {effects:?}"
+    );
+
+    // Sustained live churn on the excluded name, the shape a build cache makes.
+    for round in 0..200 {
+      core.on_inotify_events(
+        scope,
+        vec![
+          inotify(root, IN_CREATE | IN_ISDIR, 0, Some("cache")),
+          inotify(root, IN_MODIFY, 0, Some("cache")),
+          inotify(root, IN_DELETE | IN_ISDIR, 0, Some("cache")),
+        ],
+        at(2 + round),
+      );
+    }
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r"), PathBuf::from("/r/keep")],
+      "six hundred excluded records later the coverage set is unchanged: {effects:?}"
+    );
+    assert!(
+      emits(&effects).is_empty(),
+      "and nothing was delivered from inside the exclusion: {effects:?}"
+    );
+  }
+
+  /// A suppressed directory must not turn into a rescan naming it — the defect
+  /// that made the backend-local fix unavailable. The fence never refuses an arm
+  /// (the one route that produces such a rescan), and it also drops a located
+  /// rescan whose whole subtree is excluded, while leaving the root-wide cover
+  /// standing: loss over ground the caller IS watching is never silent.
+  #[test]
+  fn suppression_never_produces_a_rescan_naming_the_excluded_path() {
+    let mut core = excluding(&["/r/cache"]);
+    let scope = live_rdcw(&mut core);
+
+    core.on_batch(
+      scope,
+      rdcw_payload(vec![
+        // An undecodable name under the exclusion: the lowering covers it with a
+        // located rescan at its deepest decodable ancestor, which is inside.
+        RdcwEvent::Single(RdcwRecord {
+          action: RdcwAction::Modified,
+          name: RdcwName::Escalate {
+            prefix: vec!["cache".to_owned(), "deep".to_owned()],
+          },
+          file_id: None,
+          parent_id: None,
+          attributes: None,
+          reparse_tag: None,
+        }),
+        // A verb outside the vocabulary, likewise inside.
+        RdcwEvent::Single(rdcw(RdcwAction::Unknown(99), &["cache", "odd"], false)),
+        // The same escalation OUTSIDE the exclusion still covers.
+        RdcwEvent::Single(RdcwRecord {
+          action: RdcwAction::Modified,
+          name: RdcwName::Escalate {
+            prefix: vec!["keep".to_owned()],
+          },
+          file_id: None,
+          parent_id: None,
+          attributes: None,
+          reparse_tag: None,
+        }),
+      ]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      !mentions(&changes, "cache"),
+      "no rescan names the path the caller asked never to hear about: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["keep"])),
+      "a located rescan outside the exclusion still covers its subtree: {changes:?}"
+    );
+
+    // A scope-wide loss is never suppressed, whatever the exclusions cover.
+    core.on_root_overflow(scope, at(2));
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location().is_empty()),
+      "the root-wide cover stands: it covers reported ground too: {changes:?}"
+    );
+  }
+
+  /// An exclusion covering the watched root silences everything below it — and
+  /// still may not silence the one record that says the watch is over.
+  ///
+  /// Revert witness: drop the `is_self_event` guard in `fenced` and the scope's
+  /// death is swallowed, leaving the caller holding a handle to a dead root with
+  /// nothing to tell it so.
+  #[test]
+  fn a_root_death_survives_an_exclusion_covering_the_root() {
+    let mut core = excluding(&["/r"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r")],
+      "an exclusion over the root subtracts everything under it: {effects:?}"
+    );
+
+    core.on_inotify_events(scope, vec![inotify(root, IN_DELETE_SELF, 0, None)], at(1));
+    let effects = drain(&mut core);
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the root's own death is never suppressed: {effects:?}"
+    );
+  }
+
+  /// The Windows kernel-recursive profile gets the same enforcement off the same
+  /// rule: records are addressed by root-relative location rather than by a
+  /// per-directory anchor, and one fence covers both shapes.
+  #[test]
+  fn a_kernel_recursive_scope_delivers_nothing_from_inside_an_exclusion() {
+    let mut core = excluding(&["/r/cache"]);
+    let scope = live_rdcw(&mut core);
+
+    core.on_batch(
+      scope,
+      rdcw_payload(vec![
+        RdcwEvent::Single(rdcw(RdcwAction::Added, &["cache", "deep", "o.tmp"], false)),
+        RdcwEvent::Single(rdcw(RdcwAction::Modified, &["cache"], true)),
+        RdcwEvent::Single(rdcw(RdcwAction::Added, &["cached", "kept.txt"], false)),
+      ]),
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert!(
+      !mentions(&changes, "cache"),
+      "the excluded subtree and its own directory are both silent: {changes:?}"
+    );
+    assert_eq!(
+      changes.len(),
+      1,
+      "only the name-prefix neighbour survives — a subtree test, not a prefix \
+       one: {changes:?}"
+    );
+    assert_eq!(changes[0].location(), &loc(&["cached", "kept.txt"]));
+  }
+
+  /// A rename crossing the boundary on a kernel-recursive scope reports the half
+  /// that lies in the reported tree, and only that half: the object left, which
+  /// the caller needs, without naming where it went, which the caller refused.
+  #[test]
+  fn a_kernel_recursive_crossing_rename_reports_its_reported_half() {
+    let mut core = excluding(&["/r/cache"]);
+    let scope = live_rdcw(&mut core);
+
+    core.on_batch(
+      scope,
+      rdcw_payload(vec![RdcwEvent::Renamed {
+        old: rdcw(RdcwAction::RenamedOld, &["keep", "f.txt"], false),
+        new: rdcw(RdcwAction::RenamedNew, &["cache", "f.txt"], false),
+      }]),
+      at(1),
+    );
+    core.on_timeout(at(1_000));
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert!(
+      !mentions(&changes, "cache"),
+      "the excluded destination is never named: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_removed() && change.location() == &loc(&["keep", "f.txt"])),
+      "the crossing is reported as what it is from inside — a departure: {changes:?}"
+    );
+  }
+
+  /// The composition with a backend that enforces exclusions ITSELF: fanotify
+  /// decides at admission, where it holds the atomic rename pair, and the common
+  /// fence stands down for it rather than re-deciding half a pair at a time.
+  ///
+  /// The witness is a record whose target is inside the exclusion arriving from
+  /// the fanotify source: only the source can put one there (its own fence drops
+  /// the rest), and it does so deliberately, for the crossing shapes. Delivering
+  /// it is the proof the core did not double-suppress; the same record on a
+  /// non-enforcing profile is dropped by the cell above.
+  #[test]
+  fn the_fence_stands_down_for_a_backend_that_enforces_exclusions_itself() {
+    let mut core = excluding(&["/r/cache"]);
+    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(RawLinuxEvent::Fanotify(
+        AdmittedEvent {
+          mask: FanMask::new(FAN_CREATE | FAN_ONDIR),
+          path: Some(PathBuf::from("/r/cache/kid")),
+          rename: None,
+        },
+      ))]),
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert_eq!(
+      changes.len(),
+      1,
+      "the admission fence already decided; the core does not re-decide: {changes:?}"
+    );
+    assert_eq!(changes[0].location(), &loc(&["cache", "kid"]));
+  }
+
+  /// The RE-ARM read after a scope loss goes through the same fence as the cold
+  /// one: a loss re-proves every retained binding and re-reads every interior,
+  /// so a listing that arrives on THAT path must not be the way an excluded
+  /// directory finally gets in. Same entry point, same rule, both enumerate
+  /// flavours — which is also the rescan-driven re-enumeration path.
+  ///
+  /// Revert witness: drop the `on_enumerated` skip and `/r/cache` enters coverage
+  /// here even though the cold read declined it.
+  #[test]
+  fn a_post_loss_rearm_read_fences_the_same_entry_the_cold_read_did() {
+    let mut core = excluding(&["/r/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("keep", FileKind::Dir)]));
+    let _ = drain(&mut core);
+
+    core.on_root_overflow(scope, at(2));
+    let effects = drain(&mut core);
+    let readd = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, attempt, .. } if *watch == root => Some(*attempt),
+        _ => None,
+      })
+      .expect("a scope loss re-proves the root binding");
+    core.on_watch_installed(root, readd, WatchOutcome::Installed(2));
+    let rearm = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the re-proved root re-reads its interior");
+    core.on_enumerated(
+      rearm,
+      listed(vec![
+        entry("keep", FileKind::Dir),
+        entry("cache", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r"), PathBuf::from("/r/keep")],
+      "the re-arm listing is fenced exactly like the cold one: {effects:?}"
+    );
+  }
+
+  /// An empty exclusion set changes nothing anywhere — the fast path, and the
+  /// guard that keeps every existing profile's lowering untouched.
+  #[test]
+  fn no_exclusions_leaves_every_lowering_untouched() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("cache", FileKind::Dir)]));
+    let _ = drain(&mut core);
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_CREATE | IN_ISDIR, 0, Some("build"))],
+      at(1),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        PathBuf::from("/r"),
+        PathBuf::from("/r/build"),
+        PathBuf::from("/r/cache"),
+      ],
+      "with no exclusions configured every directory is covered as before"
+    );
+  }
+
+  /// An entry with an explicit inode, so a re-arm listing can present the SAME
+  /// object under a new name — which is what makes the Monitor treat a renamed
+  /// directory as a survivor to cascade into rather than a replacement to rebuild.
+  fn entry_ino(name: &str, kind: FileKind, ino: u64) -> RawDirEntry {
+    RawDirEntry {
+      name: name.as_bytes().to_vec(),
+      kind,
+      dev: 1,
+      ino,
+      mnt_id: None,
+    }
+  }
+
+  /// The inode [`entry`] mints for `name`, so a rename can restate it.
+  fn ino_of(name: &str) -> u64 {
+    10 + u64::from(name.as_bytes()[0])
+  }
+
+  /// Installs the queued arm for `path` and returns its watch together with the
+  /// cold-enumerate request the install dispatches.
+  fn arm(core: &mut DriverCore, effects: &[Effect], path: &str) -> (WatchId, ReqId) {
+    let watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path: p, .. } if p.as_path() == Path::new(path) => Some(*watch),
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("{path} is armed: {effects:?}"));
+    core.on_watch_installed(watch, core.arm_attempt(watch), WatchOutcome::Installed(1));
+    let req = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path: p, .. } if p.as_path() == Path::new(path) => Some(*req),
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("{path} enumerates once armed"));
+    (watch, req)
+  }
+
+  /// The enumerate request outstanding for `path`, if the drain dispatched one.
+  fn enumerate_of(effects: &[Effect], path: &str) -> Option<ReqId> {
+    effects.iter().find_map(|e| match e {
+      Effect::Enumerate { req, path: p, .. } if p.as_path() == Path::new(path) => Some(*req),
+      _ => None,
+    })
+  }
+
+  /// A directory rename inside the watched root, as inotify reports it: two
+  /// cookied halves on the parent watch.
+  fn rename_dir(root: WatchId, cookie: u32, from: &str, to: &str) -> Vec<RawLinuxEvent> {
+    vec![
+      inotify(root, IN_MOVED_FROM | IN_ISDIR, cookie, Some(from)),
+      inotify(root, IN_MOVED_TO | IN_ISDIR, cookie, Some(to)),
+    ]
+  }
+
+  /// `count` directories moved clean OUT of the watched root, numbered from
+  /// `first`. Each half is reported (so the fence keeps it) and each cookie is
+  /// unique, so none of them ever pairs: the Monitor parks a half per source and
+  /// holds it for the whole pairing window — the residue a burst leaves behind.
+  ///
+  /// Cookies are numbered from `first + 1`, so a cell that needs a cookie of its
+  /// own picks one outside `first..first + count`.
+  fn move_outs(root: WatchId, first: usize, count: usize) -> Vec<RawLinuxEvent> {
+    (first..first + count)
+      .map(|i| {
+        let cookie = u32::try_from(i).expect("the burst fits a cookie") + 1;
+        inotify(
+          root,
+          IN_MOVED_FROM | IN_ISDIR,
+          cookie,
+          Some(&format!("gone{i}")),
+        )
+      })
+      .collect()
+  }
+
+  /// How many unpaired rename sources the burst cells stage.
+  ///
+  /// Any number the geometry pass would once have refused at would do; a burst
+  /// is now just a burst, so this is sized for a legible failure message rather
+  /// than against a threshold. What every burst cell asserts is that the number
+  /// does not matter — the classification of a later rename is the same as it
+  /// would be with no burst at all.
+  const BURST: usize = 32;
+
+  /// Whether a change names ground under the `/r/a/cache` exclusion the rename
+  /// cells stage — at its own location or at a move's source end, since a move
+  /// out of the exclusion would report it there.
+  fn names_the_exclusion(change: &&Change) -> bool {
+    let inside = |location: &Location| {
+      location
+        .segments()
+        .iter()
+        .map(Segment::as_str)
+        .take(2)
+        .eq(["a", "cache"])
+    };
+    inside(change.location()) || change.kind().moved_from().is_some_and(inside)
+  }
+
+  /// A directory rename can move a subtree ACROSS the exclusion boundary without
+  /// either of its own endpoints being excluded, and the record-by-record fence
+  /// cannot see it: both endpoints are reported, so the pair is preserved and the
+  /// Monitor answers it by re-parenting the known watch subtree in place. That
+  /// carry-over is only complete while the exclusion geometry over the subtree is
+  /// unchanged.
+  ///
+  /// Out of the exclusion: `/r/a/cache` is excluded, so the cold walk of `/r/a`
+  /// armed nothing there. Renaming `/r/a` to `/r/b` makes that directory reportable
+  /// at `/r/b/cache`, and a bare re-parent would leave it unwatched forever —
+  /// silent, permanent loss under a path the caller is watching.
+  ///
+  /// Asserted on COVERAGE and then on DELIVERY: the defect is a subtree left
+  /// unarmed, which a delivery-only assertion cannot distinguish from a subtree
+  /// that simply had nothing to say.
+  ///
+  /// Revert witness: drop the `reparent_geometry` call in `fence_exclusions` and no
+  /// re-enumeration of `/r` is dispatched at all, so `/r/b/cache` never enters
+  /// `covered_paths` and the modification under it is delivered to no one.
+  #[test]
+  fn a_rename_out_of_an_exclusion_arms_the_newly_reportable_subtree() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_a, a_req) = arm(&mut core, &effects, "/r/a");
+    core.on_enumerated(
+      a_req,
+      listed(vec![
+        entry("cache", FileKind::Dir),
+        entry("keep", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        PathBuf::from("/r"),
+        PathBuf::from("/r/a"),
+        PathBuf::from("/r/a/keep"),
+      ],
+      "staging: the exclusion kept `/r/a/cache` out of coverage: {effects:?}"
+    );
+
+    // `/r/a` -> `/r/b`. Both endpoints are reported, so the fence preserves the
+    // pair and the Monitor re-parents; the geometry escalation rides after it.
+    core.on_inotify_events(scope, rename_dir(root, 7, "a", "b"), at(1));
+    let effects = drain(&mut core);
+    let root_reread =
+      enumerate_of(&effects, "/r").expect("the geometry change re-enumerates from the destination");
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["b"])),
+      "the repair covers the destination it is about to re-read: {changes:?}"
+    );
+    assert!(
+      !mentions(&changes, "a") || changes.iter().any(|change| change.kind().is_moved()),
+      "the rename itself is still reported: {changes:?}"
+    );
+
+    // The re-arm read of `/r` finds the same object under its new name, so the
+    // Monitor keeps the node and cascades the re-arm into it.
+    core.on_enumerated(
+      root_reread,
+      listed(vec![entry_ino("b", FileKind::Dir, ino_of("a"))]),
+    );
+    let effects = drain(&mut core);
+    let moved_reread = enumerate_of(&effects, "/r/b")
+      .expect("the cascade re-reads the moved directory at its NEW path");
+
+    // Lowered against `/r/b`, so `cache` no longer matches the exclusion.
+    core.on_enumerated(
+      moved_reread,
+      listed(vec![
+        entry("cache", FileKind::Dir),
+        entry_ino("keep", FileKind::Dir, ino_of("keep")),
+      ]),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/b/cache")),
+      "the newly reportable directory entered coverage: {:?} / {effects:?}",
+      core.covered_paths()
+    );
+
+    // Coverage is only half the claim: prove a change under it now reaches the
+    // caller, which is exactly what the defect lost.
+    let (cache, cache_req) = arm(&mut core, &effects, "/r/b/cache");
+    core.on_enumerated(cache_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    core.on_inotify_events(
+      scope,
+      vec![inotify(cache, IN_CREATE, 0, Some("fresh.o"))],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["b", "cache", "fresh.o"])),
+      "and a change under it is delivered: {changes:?}"
+    );
+  }
+
+  /// The other direction of the same geometry change, where the cost is a budget
+  /// one rather than a loss one: `/r/b/cache` is covered, and renaming `/r/b` to
+  /// `/r/a` moves it under the `/r/a/cache` exclusion. A bare re-parent would keep
+  /// spending kernel watches — and delivering — on exactly the ground the caller
+  /// excluded to shed.
+  ///
+  /// The repair is the same one mechanism: the re-enumeration is lowered against
+  /// the destination, the excluded child never reaches the listing, and the
+  /// Monitor's re-arm read prunes the name it no longer sees.
+  ///
+  /// Revert witness: drop the `reparent_geometry` call in `fence_exclusions` and
+  /// `/r/a/cache` stays in `covered_paths` for the rest of the scope's life.
+  #[test]
+  fn a_rename_into_an_exclusion_sheds_the_subtree_it_no_longer_reports() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("b", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_b, b_req) = arm(&mut core, &effects, "/r/b");
+    core.on_enumerated(
+      b_req,
+      listed(vec![
+        entry("cache", FileKind::Dir),
+        entry("keep", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+    let (_cache, cache_req) = arm(&mut core, &effects, "/r/b/cache");
+    core.on_enumerated(cache_req, listed(Vec::new()));
+    let effects = drain(&mut core);
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/b/cache")),
+      "staging: nothing excludes `/r/b/cache`, so it is covered: {effects:?}"
+    );
+
+    core.on_inotify_events(scope, rename_dir(root, 9, "b", "a"), at(1));
+    let effects = drain(&mut core);
+    let root_reread =
+      enumerate_of(&effects, "/r").expect("the geometry change re-enumerates from the destination");
+    core.on_enumerated(
+      root_reread,
+      listed(vec![entry_ino("a", FileKind::Dir, ino_of("b"))]),
+    );
+    let effects = drain(&mut core);
+    let moved_reread = enumerate_of(&effects, "/r/a")
+      .expect("the cascade re-reads the moved directory at its NEW path");
+
+    // The listing is lowered against `/r/a`, so `cache` is now excluded and never
+    // reaches the Monitor: a complete re-arm read prunes the name it cannot see.
+    core.on_enumerated(
+      moved_reread,
+      listed(vec![
+        entry("cache", FileKind::Dir),
+        entry_ino("keep", FileKind::Dir, ino_of("keep")),
+      ]),
+    );
+    let effects = drain(&mut core);
+
+    assert!(
+      !core
+        .covered_paths()
+        .iter()
+        .any(|path| path.ends_with("cache")),
+      "the now-excluded subtree stopped consuming coverage: {:?} / {effects:?}",
+      core.covered_paths()
+    );
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/a")),
+      "while the reported directory that carried it is still covered: {:?}",
+      core.covered_paths()
+    );
+  }
+
+  /// The same geometry change, asserted on DELIVERY and inside ONE read: a
+  /// rename into an exclusion followed — in the same buffer — by an event from a
+  /// descendant watch that rode across with it.
+  ///
+  /// This is where classifying the whole batch before FEEDING any of it leaks.
+  /// The suffix record is anchored at the descendant's OWN watch, and the core
+  /// derives that watch's path from the Monitor's tree — which, until the pair
+  /// ahead of it is fed, still places the descendant at `/r/b/cache`. So a fence
+  /// that runs over the whole buffer first judges the record reportable and keeps
+  /// it. The re-parent then lands, the record resolves at `/r/a/cache/fresh.o` —
+  /// inside the exclusion — and is delivered there. The escalation riding after
+  /// the pair cannot take it back: a `Rescan` covers what comes NEXT, it does not
+  /// unsay a record already retained ahead of it.
+  ///
+  /// A coverage assertion cannot see this: coverage is legitimately still held at
+  /// the moment the record is classified, and the re-arm sheds it afterwards
+  /// ([`a_rename_into_an_exclusion_sheds_the_subtree_it_no_longer_reports`] is
+  /// that half). The leak is a delivery, so the witness reads deliveries.
+  ///
+  /// Revert witness: classify the batch before feeding it — hoist the fence back
+  /// into a pass of its own ahead of the hand-off — and `fresh.o` is delivered at
+  /// `a/cache/fresh.o`.
+  #[test]
+  fn a_rename_into_an_exclusion_fences_the_rest_of_its_own_read() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("b", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_b, b_req) = arm(&mut core, &effects, "/r/b");
+    core.on_enumerated(b_req, listed(vec![entry("cache", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (cache, cache_req) = arm(&mut core, &effects, "/r/b/cache");
+    core.on_enumerated(cache_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/b/cache")),
+      "staging: nothing excludes `/r/b/cache`, so it is covered and armed: {:?}",
+      core.covered_paths()
+    );
+
+    // ONE read: the pair that moves the subtree under the exclusion, then the
+    // descendant watch's own record behind it. Deterministic by construction —
+    // the three records are one `on_inotify_events` call, which is one buffer.
+    let mut read = rename_dir(root, 9, "b", "a");
+    read.push(inotify(cache, IN_CREATE, 0, Some("fresh.o")));
+    core.on_inotify_events(scope, read, at(1));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      !changes.iter().any(names_the_exclusion),
+      "the descendant record behind the rename is classified against the path the \
+       rename gave it, so nothing under the exclusion is delivered: {changes:?}"
+    );
+    // Non-vacuity: the batch really was processed, the re-parent really landed,
+    // and the repair really rode after it — the suppression above is the fence
+    // deciding, not the whole read going missing.
+    assert!(
+      changes.iter().any(|change| change.kind().is_moved()),
+      "the rename itself is still reported: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["a"])),
+      "and the geometry repair still covers the destination: {changes:?}"
+    );
+  }
+
+  /// The geometry rule is asked of BOTH endpoints and of nothing else: a rename
+  /// with no exclusion at or under either end leaves the O(1) re-parent alone.
+  /// Without this the fix would be "re-enumerate on every directory rename in an
+  /// excluded scope", which is a different and much more expensive rule.
+  #[test]
+  fn a_geometry_neutral_rename_still_reparents_without_a_re_read() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("x", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_x, x_req) = arm(&mut core, &effects, "/r/x");
+    core.on_enumerated(x_req, listed(vec![entry("deep", FileKind::Dir)]));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(scope, rename_dir(root, 11, "x", "y"), at(1));
+    let effects = drain(&mut core);
+
+    assert!(
+      enumerate_of(&effects, "/r").is_none(),
+      "no exclusion lies under either endpoint, so nothing is re-read: {effects:?}"
+    );
+    let changes = emits(&effects);
+    assert!(
+      changes.iter().any(|change| change.kind().is_moved()),
+      "and the rename is reported as the move it is: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(|change| change.kind().is_rescan()),
+      "with no covering rescan standing over it: {changes:?}"
+    );
+  }
+
+  /// A directory moved clean OUT of the watched root pairs with nothing — no
+  /// destination half ever arrives — and that has to degrade HONESTLY: the
+  /// source is a transition already consumed from the kernel, so dropping it
+  /// quietly would be silent loss.
+  ///
+  /// Asserted as a COUNT, not an existence: one removal standing in for a burst
+  /// of them is exactly the failure this is about, so an under-count must fail.
+  ///
+  /// The other half is what the degrade must NOT cost. A burst of unpaired
+  /// sources is ordinary filesystem churn — a build tree emptied, a directory of
+  /// scratch directories moved away — and it must not convert into scope-wide
+  /// `Rescan`s that re-prove the whole tree. The geometry pass retains nothing of
+  /// its own for such a burst to fill, so there is no bound for it to reach and
+  /// no refusal for it to trip.
+  #[test]
+  fn an_unpaired_rename_source_degrades_to_a_removal_at_its_window() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir)]));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(scope, move_outs(root, 0, BURST), at(1));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      !changes.iter().any(|change| change.kind().is_removed()),
+      "staging: nothing resolves while every half is still pairable: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(|change| change.kind().is_rescan()),
+      "and the burst costs no covering rescan on the way in: {changes:?}"
+    );
+
+    // Past every parked half's pairing window.
+    core.on_timeout(at(1) + WINDOW);
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert_eq!(
+      changes
+        .iter()
+        .filter(|change| change.kind().is_removed())
+        .count(),
+      BURST,
+      "every unpaired source resolves as the removal it turned out to be: \
+       {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(|change| change.kind().is_rescan()),
+      "and none of them needed covering: {changes:?}"
+    );
+  }
+
+  /// Arms `/r/b/cache` under a core excluding `/r/a/cache`, so renaming `/r/b`
+  /// to `/r/a` is the geometry change that carries a covered subtree UNDER the
+  /// exclusion. Returns the scope, the root watch and the `cache` watch — the
+  /// descendant whose own records ride behind the pair.
+  fn crossing_rename_tree(core: &mut DriverCore) -> (ScopeId, WatchId, WatchId) {
+    let (scope, req, root) = live_descending(core);
+    core.on_enumerated(req, listed(vec![entry("b", FileKind::Dir)]));
+    let effects = drain(core);
+    let (_b, b_req) = arm(core, &effects, "/r/b");
+    core.on_enumerated(b_req, listed(vec![entry("cache", FileKind::Dir)]));
+    let effects = drain(core);
+    let (cache, cache_req) = arm(core, &effects, "/r/b/cache");
+    core.on_enumerated(cache_req, listed(Vec::new()));
+    let _ = drain(core);
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/b/cache")),
+      "staging: nothing excludes `/r/b/cache`, so it is covered and armed: {:?}",
+      core.covered_paths()
+    );
+    (scope, root, cache)
+  }
+
+  /// What ONE read carrying the destination of the `/r/b` -> `/r/a` rename, with
+  /// the descendant watch's own record behind it, must produce: the pair
+  /// resolves, the re-parent lands before the record behind it is classified, the
+  /// located repair lands at the destination, and no scope-wide cover stands over
+  /// the read.
+  ///
+  /// Stated once, because the burst cells below exist to show that the answer is
+  /// the SAME one this read gets with no burst at all — restating it per cell
+  /// invites the three to drift into asserting three different things.
+  fn assert_the_crossing_pair_is_addressed(changes: &[&Change]) {
+    assert!(
+      changes.iter().any(|change| change.kind().is_moved()),
+      "non-vacuity: the pair really resolves in this read: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(names_the_exclusion),
+      "the destination moved the subtree before the record behind it was \
+       classified, so nothing under the exclusion is delivered: {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.location().segments().last().map(Segment::as_str) == Some("fresh.o")),
+      "the descendant record is fenced at the path the rename gave it rather \
+       than delivered at the one it left: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["a"])),
+      "and the geometry repair covers the destination: {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location().segments().is_empty()),
+      "with no scope-wide cover standing over the read: {changes:?}"
+    );
+  }
+
+  /// A burst of unpaired rename sources already parked in the scope must not
+  /// change how the NEXT rename is classified.
+  ///
+  /// The three cells here are the same scenario under the three orderings a
+  /// burst can take against the source it must not disturb, because the phase at
+  /// which a source is parked is exactly what used to decide whether it survived:
+  /// this one parks the burst FIRST and renames afterwards, the next parks the
+  /// surviving source BEFORE the burst, and the third co-batches the two in one
+  /// read.
+  ///
+  /// Asserted on DELIVERY, because that is where every failure surfaces: a
+  /// rename the pass declines to classify loses its `Moved`, a subtree whose move
+  /// the Monitor never performs delivers the record riding behind it under the
+  /// excluded destination, and a pass that gives up on the read replaces both
+  /// with a scope-wide cover.
+  #[test]
+  fn a_burst_of_parked_sources_never_disturbs_a_later_rename() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, root, cache) = crossing_rename_tree(&mut core);
+
+    core.on_inotify_events(scope, move_outs(root, 0, BURST), at(1));
+    let _ = drain(&mut core);
+
+    // ONE read: the pair that carries the subtree under the exclusion, then the
+    // descendant watch's own record behind it.
+    let mut read = rename_dir(root, 900, "b", "a");
+    read.push(inotify(cache, IN_CREATE, 0, Some("fresh.o")));
+    core.on_inotify_events(scope, read, at(2));
+    let effects = drain(&mut core);
+
+    assert_the_crossing_pair_is_addressed(&emits(&effects));
+  }
+
+  /// The same guarantee for a source parked BEFORE the burst: its destination
+  /// arrives two reads later, and the burst in between must have forgotten
+  /// nothing about it.
+  ///
+  /// This is the ordering that used to be dangerous. A source displaced to make
+  /// room for a later one loses nothing the Monitor knows — the Monitor keeps its
+  /// half and pairs it regardless — so the two stores disagree about whether the
+  /// destination relocated a watched subtree, and the record riding behind the
+  /// destination is then judged at ground the rename has already vacated.
+  #[test]
+  fn a_source_parked_before_a_burst_still_pairs_and_re_anchors() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, root, cache) = crossing_rename_tree(&mut core);
+
+    // Read one: the source half of `/r/b`, whose destination is still to come.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_FROM | IN_ISDIR, 900, Some("b"))],
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // Read two: the burst lands behind it.
+    core.on_inotify_events(scope, move_outs(root, 0, BURST), at(2));
+    let _ = drain(&mut core);
+
+    // Read three, ONE read: the destination lands `/r/b` at `/r/a`, then the
+    // descendant watch's own record behind it.
+    let mut read = vec![inotify(root, IN_MOVED_TO | IN_ISDIR, 900, Some("a"))];
+    read.push(inotify(cache, IN_CREATE, 0, Some("fresh.o")));
+    core.on_inotify_events(scope, read, at(3));
+    let effects = drain(&mut core);
+
+    assert_the_crossing_pair_is_addressed(&emits(&effects));
+  }
+
+  /// And the same guarantee when the burst is CO-BATCHED with the source it must
+  /// not disturb — one read carrying both.
+  ///
+  /// The distinction from the cell above is the phase lag, which is why the
+  /// ordering is worth its own cell rather than being folded in. Under
+  /// batch-then-settle the whole read is classified before the Monitor hears any
+  /// of it, so at the moment the burst is walked the surviving source has no half
+  /// at the Monitor at all and anything asked about the Monitor mid-read reads a
+  /// not-yet as a never-was. This profile feeds at classify time, so by the time
+  /// the burst is walked the source ahead of it has physically landed.
+  #[test]
+  fn a_source_co_batched_with_a_burst_still_pairs_and_re_anchors() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, root, cache) = crossing_rename_tree(&mut core);
+    assert_eq!(
+      core.monitor.poll_timeout(),
+      None,
+      "staging: the Monitor holds no pending half before this read"
+    );
+
+    // ONE read: the source half of `/r/b` and the whole burst behind it.
+    let mut read = vec![inotify(root, IN_MOVED_FROM | IN_ISDIR, 900, Some("b"))];
+    read.extend(move_outs(root, 0, BURST));
+    core.on_inotify_events(scope, read, at(1));
+    let _ = drain(&mut core);
+
+    // ONE read: the destination, then the descendant watch's own record.
+    let mut read = vec![inotify(root, IN_MOVED_TO | IN_ISDIR, 900, Some("a"))];
+    read.push(inotify(cache, IN_CREATE, 0, Some("fresh.o")));
+    core.on_inotify_events(scope, read, at(2));
+    let effects = drain(&mut core);
+
+    assert_the_crossing_pair_is_addressed(&emits(&effects));
+  }
+
+  /// A kernel move cookie is a small recycled integer, so one cookie can name a
+  /// SECOND rename while the first is still parked — and the destination that
+  /// eventually arrives must move the subtree that really moved.
+  ///
+  /// The Monitor resolves this by displacement: a same-key half replaces the one
+  /// it finds and the displaced half resolves on its own (it can no longer pair,
+  /// so it degrades to the removal it turned out to be). Whatever the geometry
+  /// pass believes about which source a cookie names must agree with that,
+  /// exactly, or the destination pairs at the Monitor against one rename while
+  /// this pass judges the other — repairing an exclusion crossing that did not
+  /// happen and missing the one that did. There is no second belief to keep in
+  /// step: the source end IS the Monitor's own report of the reparent it
+  /// performed, and the addressing IS the tree that reparent rewrote.
+  ///
+  /// Asserted on DELIVERY at both ends — the reported move names the replacement
+  /// as its source, and the descendant of the subtree that really moved is fenced
+  /// at its new home.
+  #[test]
+  fn a_reused_cookie_addresses_the_subtree_that_really_moved() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(
+      req,
+      listed(vec![entry("b", FileKind::Dir), entry("x", FileKind::Dir)]),
+    );
+    let effects = drain(&mut core);
+    let (_b, b_req) = arm(&mut core, &effects, "/r/b");
+    core.on_enumerated(b_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    let (_x, x_req) = arm(&mut core, &effects, "/r/x");
+    core.on_enumerated(x_req, listed(vec![entry("cache", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (cache, cache_req) = arm(&mut core, &effects, "/r/x/cache");
+    core.on_enumerated(cache_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/x/cache")),
+      "staging: nothing excludes `/r/x/cache`, so it is covered and armed: {:?}",
+      core.covered_paths()
+    );
+
+    // Read one: cookie 900 names a rename of `/r/b`, whose destination never
+    // arrives.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_FROM | IN_ISDIR, 900, Some("b"))],
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // Read two: the kernel reuses cookie 900 for a rename of `/r/x`.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_FROM | IN_ISDIR, 900, Some("x"))],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_removed() && change.location() == &loc(&["b"])),
+      "staging: the reuse displaced `/r/b`'s half, which resolves as the removal \
+       it turned out to be: {changes:?}"
+    );
+
+    // Read three: the destination lands `/r/x` at `/r/a`, which puts `cache`
+    // under the exclusion — then the descendant watch's own record behind it, in
+    // the SAME read.
+    let mut read = vec![inotify(root, IN_MOVED_TO | IN_ISDIR, 900, Some("a"))];
+    read.push(inotify(cache, IN_CREATE, 0, Some("fresh.o")));
+    core.on_inotify_events(scope, read, at(3));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().moved_from() == Some(&loc(&["x"]))
+          && change.location() == &loc(&["a"])),
+      "the destination pairs with the REPLACEMENT, so the reported move names \
+       `x` as its source rather than the `b` it displaced: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(names_the_exclusion),
+      "and nothing under the exclusion is delivered: {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.location().segments().last().map(Segment::as_str) == Some("fresh.o")),
+      "the subtree that really moved is the one that moved, so its descendant \
+       record is fenced rather than delivered at the path it left: {changes:?}"
+    );
+  }
+
+  /// The [`RootMeta`] a stream REPLACE commits over `/r` — the same canonical
+  /// root and the same object, which is what a transport respawn under a live
+  /// path looks like from here (the identity is the one [`alive_refresh`]
+  /// vouches for, so the commit is a replace and not a disguised root death).
+  fn replaced_meta() -> RootMeta {
+    RootMeta {
+      root: PathBuf::from("/r"),
+      root_dev: 1,
+      root_mnt_id: None,
+      mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(1, 1),
+      ancestors: Vec::new(),
+      backend: BackendKind::Inotify,
+    }
+  }
+
+  /// Replays the pre-armed root binding a descending replace commits against and
+  /// answers the re-arm-flavored rebuild read, so the scope is live in the new
+  /// world rather than parked mid-rebind.
+  fn finish_replace(core: &mut DriverCore, scope: ScopeId, root: WatchId, kids: Vec<RawDirEntry>) {
+    core.on_watch_installed(root, core.arm_attempt(root), WatchOutcome::Installed(9));
+    let _ = drain(core);
+    core.on_watch_installed(root, core.arm_attempt(root), WatchOutcome::Aliased(9));
+    let effects = drain(core);
+    let rebuild = enumerate_of(&effects, "/r").expect("the rebound root re-reads its world");
+    core.on_enumerated(rebuild, listed(kids));
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(3));
+    let _ = drain(core);
+  }
+
+  /// Parks a burst of unpaired rename sources on `/r` — every cookie unique, so
+  /// none of them ever pairs and the Monitor holds every half for the whole
+  /// pairing window.
+  fn park_a_burst(core: &mut DriverCore, scope: ScopeId, root: WatchId, now: Instant) {
+    core.on_inotify_events(scope, move_outs(root, 0, BURST), now);
+    let _ = drain(core);
+    assert_eq!(
+      core.monitor.poll_timeout(),
+      Some(now + WINDOW),
+      "staging: the burst's halves are parked and waiting on their window"
+    );
+  }
+
+  /// A root replacement committed while rename halves are parked must leave the
+  /// scope classifying LATER renames exactly as it would have classified them
+  /// with nothing parked at all.
+  ///
+  /// The rebind the commit performs purges the Monitor's own pending halves for
+  /// the scope ([`Monitor::rebind_root`]), so from that instant no destination
+  /// can pair anywhere. That cut is only safe if nothing else in the scope was
+  /// holding rename state of its own with a lifetime the purge does not reach:
+  /// such state would be orphaned at the commit, alive until a deadline the purge
+  /// has just taken off the Monitor's timer, and shaping the classification of
+  /// every rename until something happened to arm a timer and drain it.
+  ///
+  /// So: park a burst, replace the root BEFORE the pairing window elapses,
+  /// advance long past that window with NO timer of any kind fired, and require
+  /// the next directory rename to be classified healthily — reported as the move
+  /// it is, with its located repair, and no scope-wide cover standing over it.
+  ///
+  /// The scheduler assertion after the commit is the mechanism half: the purge is
+  /// what leaves the core with no work due, and a core that still reported work
+  /// due here would be holding rename state the replace did not reach.
+  ///
+  /// Deterministic by construction: the burst is one `on_inotify_events` call,
+  /// which is one read, and the rename is another.
+  #[test]
+  fn a_replace_with_parked_halves_still_classifies_later_renames() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("b", FileKind::Dir)]));
+    let _ = drain(&mut core);
+
+    park_a_burst(&mut core, scope, root, at(1));
+
+    // The commit, inside the pairing window: the halves the burst parked die
+    // here.
+    core.on_root_replaced(scope, replaced_meta(), at(2));
+    let _ = drain(&mut core);
+    finish_replace(&mut core, scope, root, vec![entry("b", FileKind::Dir)]);
+    assert_eq!(
+      core.poll_timeout(),
+      None,
+      "the cut took every parked half with it, so nothing is left needing a \
+       timer — which is exactly why none fires"
+    );
+
+    // Long past the pairing window, with `on_timeout` never driven: the scope
+    // renames a directory into the exclusion's parent, the shape that owes a
+    // located repair.
+    core.on_inotify_events(scope, rename_dir(root, 900, "b", "a"), at(1_000));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes.iter().any(|change| change.kind().is_moved()),
+      "the rename is classified and reported: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["a"])),
+      "with its located geometry repair: {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location().segments().is_empty()),
+      "and no scope-wide cover standing over it: {changes:?}"
+    );
+  }
+
+  /// The other half of the same cut, at the pairing itself: a source the replace
+  /// orphaned is keyed by a KERNEL cookie, and cookies wrap — so a destination in
+  /// the NEW world can carry a cookie the retired world minted, and must pair with
+  /// nothing.
+  ///
+  /// Held far below any burst on purpose: one parked half, so the property is the
+  /// cut's own and not a side effect of anything the volume of parked state might
+  /// trigger.
+  ///
+  /// A destination that paired here would relocate a subtree the retired world
+  /// named and mint a geometry repair for a rename that never happened.
+  #[test]
+  fn a_replace_orphaned_source_cannot_be_paired_by_a_wrapped_cookie() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("b", FileKind::Dir)]));
+    let _ = drain(&mut core);
+
+    // ONE source parked.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_FROM | IN_ISDIR, 900, Some("b"))],
+      at(1),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.monitor.poll_timeout(),
+      Some(at(1) + WINDOW),
+      "staging: exactly one half is parked, and it is still pairable"
+    );
+
+    core.on_root_replaced(scope, replaced_meta(), at(2));
+    let _ = drain(&mut core);
+    finish_replace(&mut core, scope, root, vec![entry("c", FileKind::Dir)]);
+
+    // The new world reuses cookie 900 for a rename of its own. The Monitor has
+    // no half for it — the rebind purged them — so this destination pairs with
+    // nothing inside the reported tree, and the geometry pass must agree.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_TO | IN_ISDIR, 900, Some("a"))],
+      at(4),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_created() && change.location() == &loc(&["a"])),
+      "non-vacuity: the destination really was classified, and pairing with \
+       nothing it is a fresh directory rather than a move: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(|change| change.kind().is_rescan()),
+      "and it relocated nothing and repaired nothing: {changes:?}"
+    );
+  }
+
+  /// Rename state with its OWN deadline must be represented in the scheduler, or
+  /// nothing ever comes back to resolve it.
+  ///
+  /// `poll_timeout` is the core's whole statement of when it has work to do. A
+  /// deadline absent from it is reached only as a side effect of some OTHER timer
+  /// happening to be armed — which is not a rule, it is a coincidence, and it
+  /// survives only until the mechanism supplying the coincidence changes.
+  ///
+  /// The cheaper form of the rule is to hold the deadline in ONE place, and the
+  /// geometry pass now does: the Monitor's own pairing deadline is the only one a
+  /// parked rename has, so this cell pins the whole census leg rather than one
+  /// derived copy of it.
+  ///
+  /// Revert witness: drop the Monitor's leg from `poll_timeout` and the core
+  /// reports no work due while every half of a burst sits waiting to resolve.
+  #[test]
+  fn the_pairing_deadline_is_one_the_scheduler_knows() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("b", FileKind::Dir)]));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(scope, move_outs(root, 0, BURST), at(1));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.poll_timeout(),
+      Some(at(1) + WINDOW),
+      "the pairing deadline is what keeps the timer armed"
+    );
+
+    // And the wake it asks for is the one that resolves them.
+    core.on_timeout(at(1) + WINDOW);
+    let _ = drain(&mut core);
+    assert_eq!(core.poll_timeout(), None, "and the timer stands down");
+  }
+
+  /// The geometry escalation is for a backend whose coverage is per-directory.
+  /// A kernel-recursive one has no per-directory watches to re-arm — its single
+  /// stream already covers the destination the instant the re-parent lands — so
+  /// escalating there would manufacture a covering `Rescan` that repairs nothing,
+  /// on a backend (USN) that decides its own rename geometry at admission anyway.
+  ///
+  /// USN is the witness because it is the only kernel-recursive lowering that
+  /// mints a cookied move pair carrying `is_dir`, which is exactly the shape the
+  /// geometry pass keys on: every other guard would let this through.
+  ///
+  /// Revert witness: drop `caps_for(..).kernel_recursive()` from the geometry
+  /// gate and this scope grows a covering `Rescan` it never asked for.
+  #[test]
+  fn the_geometry_pass_stands_down_for_a_kernel_recursive_backend() {
+    use crate::os::windows::usn::{UsnAdmitted, UsnTarget};
+
+    let mut core = excluding(&["/r/a/cache"]);
+    let scope = core.on_watch(
+      PathBuf::from("/r"),
+      Interest::all(),
+      BackendKind::UsnJournal,
+    );
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::UsnJournal,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+
+    // `/r/a` -> `/r/b`, with `/r/a/cache` excluded: the exact geometry change a
+    // descending scope escalates on.
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Windows(RawWindowsEvent::Usn(
+        UsnAdmitted::Renamed {
+          old: UsnTarget::Resolved(vec!["a".to_owned()]),
+          old_content: 0,
+          new: UsnTarget::Resolved(vec!["b".to_owned()]),
+          new_content: 0,
+          is_dir: true,
+        },
+      ))]),
+      at(1),
+    );
+    core.on_timeout(at(1_000));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes.iter().any(|change| change.kind().is_moved()),
+      "the rename is forwarded as the move it is: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(|change| change.kind().is_rescan()),
+      "and no geometry escalation is manufactured for it: {changes:?}"
+    );
+  }
+
+  /// Every arm this drain queued, by the absolute path the effect carries — the
+  /// addressing an executor and a fake both open by.
+  fn armed_paths(effects: &[Effect]) -> Vec<PathBuf> {
+    effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::AddWatch { path, .. } => Some(path.as_ref().clone()),
+        _ => None,
+      })
+      .collect()
+  }
+
+  /// Arms `/r/p/q/cache` under a core excluding `/r/a/cache`, so a later rename
+  /// of `q` to `a` is the geometry change that moves a covered subtree under the
+  /// exclusion. Returns the scope, the root watch, the `p` watch and the `cache`
+  /// watch.
+  fn chained_rename_tree(core: &mut DriverCore) -> (ScopeId, WatchId, WatchId, WatchId) {
+    let (scope, req, root) = live_descending(core);
+    core.on_enumerated(req, listed(vec![entry("p", FileKind::Dir)]));
+    let effects = drain(core);
+    let (p, p_req) = arm(core, &effects, "/r/p");
+    core.on_enumerated(p_req, listed(vec![entry("q", FileKind::Dir)]));
+    let effects = drain(core);
+    let (_q, q_req) = arm(core, &effects, "/r/p/q");
+    core.on_enumerated(q_req, listed(vec![entry("cache", FileKind::Dir)]));
+    let effects = drain(core);
+    let (cache, cache_req) = arm(core, &effects, "/r/p/q/cache");
+    core.on_enumerated(cache_req, listed(Vec::new()));
+    let _ = drain(core);
+    assert!(
+      core
+        .covered_paths()
+        .contains(&PathBuf::from("/r/p/q/cache")),
+      "staging: nothing excludes `/r/p/q/cache`, so it is covered and armed: {:?}",
+      core.covered_paths()
+    );
+    (scope, root, p, cache)
+  }
+
+  /// A directory renamed TWICE — once by an ANCESTOR's rename, then on its own —
+  /// must still be addressed at the ground it landed on.
+  ///
+  /// The hazard is a source end pinned as an ABSOLUTE path while `q` still lived
+  /// at `/r/p/q`. Renaming `/r/p` to `/r/s` moves `q` with it, but a pinned path
+  /// keeps naming `/r/p/q`, ground nothing occupies any more. A geometry decision
+  /// taken over `/r/p/q` -> `/r/a` then judges a rename between two paths, one of
+  /// which no longer exists — while the subtree that really moved landed at
+  /// `/r/a`, whose child `cache` the caller excluded.
+  ///
+  /// What makes it right is that the source is not pinned anywhere. The Monitor
+  /// reports it as a `(WatchId, Location)` slot reconstructed from the live tree,
+  /// so an ancestor's re-parent updates it for free — and the `Moved` says so: its
+  /// source end reads `s/q`.
+  ///
+  /// Asserted on DELIVERY and on COVERAGE, the two halves this module keeps
+  /// apart: the record riding behind the pair is classified against the vacated
+  /// ground, so it is kept and delivered INSIDE the exclusion, and the coverage
+  /// set keeps naming a path the rename left.
+  ///
+  /// Coverage over `/r/a/cache` is legitimately still held at this instant — the
+  /// repair's re-arm is what sheds it, which
+  /// [`a_rename_into_an_exclusion_sheds_the_subtree_it_no_longer_reports`] pins.
+  /// What is asserted here is the addressing itself: the moved subtree must be
+  /// named where it landed.
+  #[test]
+  fn a_chained_rename_addresses_the_subtree_where_it_landed() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, root, p, cache) = chained_rename_tree(&mut core);
+
+    // Read one: `q`'s source half, captured at `/r/p/q`. Its destination is
+    // still to come.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(p, IN_MOVED_FROM | IN_ISDIR, 100, Some("q"))],
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // Read two: the ANCESTOR moves. `/r/p` -> `/r/s` carries `q` to `/r/s/q`,
+    // and neither endpoint has an exclusion under it, so this rename owes no
+    // repair of its own — it only moves the ground the parked source names.
+    core.on_inotify_events(scope, rename_dir(root, 101, "p", "s"), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      !emits(&effects)
+        .iter()
+        .any(|change| change.kind().is_rescan()),
+      "staging: the ancestor's rename changes no exclusion geometry: {effects:?}"
+    );
+
+    // Read three, ONE read: `q`'s destination lands it at `/r/a`, which puts
+    // `cache` under the exclusion — then the descendant watch's own record
+    // behind it.
+    let mut read = vec![inotify(root, IN_MOVED_TO | IN_ISDIR, 100, Some("a"))];
+    read.push(inotify(cache, IN_CREATE, 0, Some("fresh.o")));
+    core.on_inotify_events(scope, read, at(3));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      changes.iter().any(
+        |change| change.kind().moved_from() == Some(&loc(&["s", "q"]))
+          && change.location() == &loc(&["a"])
+      ),
+      "non-vacuity: the pair resolves in this read, and the Monitor's own slot \
+       reports the source at the path the ancestor's rename moved it to: \
+       {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["a"])),
+      "and the repair is placed at the destination the subtree really landed on: \
+       {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(names_the_exclusion),
+      "the destination moved the subtree before the record behind it was \
+       classified, so nothing under the exclusion is delivered: {changes:?}"
+    );
+    assert!(
+      !core
+        .covered_paths()
+        .iter()
+        .any(|path| path.starts_with("/r/s/q")),
+      "and no coverage still names the ground the rename vacated: {:?}",
+      core.covered_paths()
+    );
+  }
+
+  /// The same chain inside ONE read, where the ancestor's rename and the
+  /// dependent one are classified by a single pass over a single buffer.
+  ///
+  /// The staleness this guards against is not a cross-read effect: the hand-off
+  /// happens per RECORD as the fence walks the buffer, so a source pinned by this
+  /// buffer's first record would be invalidated by its third and consumed already
+  /// stale by its fourth. Delivery is asserted for the same reason as in the
+  /// cross-read twin: a `Rescan` covers what comes next and cannot unsay a
+  /// record already retained ahead of it.
+  #[test]
+  fn a_chained_rename_within_one_read_addresses_the_subtree_where_it_landed() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, root, p, cache) = chained_rename_tree(&mut core);
+
+    // ONE read: `q`'s source, the ancestor's whole rename, `q`'s destination,
+    // then the descendant watch's own record behind all of it.
+    let mut read = vec![inotify(p, IN_MOVED_FROM | IN_ISDIR, 100, Some("q"))];
+    read.extend(rename_dir(root, 101, "p", "s"));
+    read.push(inotify(root, IN_MOVED_TO | IN_ISDIR, 100, Some("a")));
+    read.push(inotify(cache, IN_CREATE, 0, Some("fresh.o")));
+    core.on_inotify_events(scope, read, at(1));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      changes.iter().any(
+        |change| change.kind().moved_from() == Some(&loc(&["s", "q"]))
+          && change.location() == &loc(&["a"])
+      ),
+      "non-vacuity: both pairs resolve in this one read, and the Monitor's slot \
+       reports the dependent source where the ancestor's rename left it: \
+       {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(names_the_exclusion),
+      "nothing under the exclusion is delivered: {changes:?}"
+    );
+    assert!(
+      !core
+        .covered_paths()
+        .iter()
+        .any(|path| path.starts_with("/r/s/q")),
+      "and no coverage still names the ground the rename vacated: {:?}",
+      core.covered_paths()
+    );
+  }
+
+  /// A destination that arrives PAST the pairing window relocates nothing, and
+  /// the two sides must agree about that.
+  ///
+  /// The Monitor consumes a parked half only while it is still pairable
+  /// (`!now.reached(deadline)`); past that edge the source already stranded, so
+  /// it resolves the half as a `Removed`, tears the held subtree down and rebuilds
+  /// the arrival at its own slot. That rebuild's walk is fenced entry by entry,
+  /// which is exactly why a destination that pairs with nothing owes no repair.
+  ///
+  /// A destination arm deciding for itself — consuming a parked source whenever it
+  /// finds one — would mint the located repair for a crossing that never happened:
+  /// a re-enumeration of the scope root on the strength of a relocation the
+  /// Monitor never performed. The arm asks the Monitor instead, and a past-window
+  /// arrival relocates nothing, so it repairs nothing.
+  ///
+  /// The REPAIR's own artefact is what the assertion reads, because it is what
+  /// would outlive the read — the whole of what the core would have done on the
+  /// strength of a relocation that did not happen. It is read as that
+  /// re-enumeration rather than as the destination's covering `Rescan`, because
+  /// the Monitor mints one of those for a reason of its own here: the strand tore
+  /// down a watched subtree the arriving record proves is alive, and every other
+  /// signal that teardown emits is interest- and filter-subject. A `Rescan` at the
+  /// destination is therefore no longer evidence that the core repaired anything.
+  ///
+  /// No timer of any kind is driven here: the strand must not depend on
+  /// `on_timeout` happening to have run first.
+  #[test]
+  fn a_late_destination_repairs_nothing_the_monitor_did_not_relocate() {
+    let mut core = excluding(&["/r/a/cache"]);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("b", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_b, b_req) = arm(&mut core, &effects, "/r/b");
+    core.on_enumerated(b_req, listed(vec![entry("cache", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_cache, cache_req) = arm(&mut core, &effects, "/r/b/cache");
+    core.on_enumerated(cache_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/b/cache")),
+      "staging: nothing excludes `/r/b/cache`, so it is covered and armed: {:?}",
+      core.covered_paths()
+    );
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_FROM | IN_ISDIR, 900, Some("b"))],
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // Long past `at(1) + WINDOW`, with the Monitor's timeout never driven: the
+    // half is still parked and no longer pairable.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_TO | IN_ISDIR, 900, Some("a"))],
+      at(1_000),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      !changes.iter().any(|change| change.kind().is_moved()),
+      "non-vacuity: the Monitor refuses the past-window half, so the arrival is \
+       not a move: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_created() && change.location() == &loc(&["a"])),
+      "and it really was classified, as the fresh object it pairs with nothing \
+       to be: {changes:?}"
+    );
+    assert!(
+      enumerate_of(&effects, "/r").is_none(),
+      "and the core repaired nothing on the strength of it: a located repair \
+       re-enumerates the scope root, and nothing was relocated: {effects:?}"
+    );
+    // The one `Rescan` present is the Monitor's own: the strand's teardown of a
+    // still-live watched subtree, which no interest filters. Its rebuilt
+    // destination is counted behind it, and the exclusion still fences that
+    // rebuild's walk entry by entry.
+    assert!(
+      changes
+        .iter()
+        .filter(|change| change.kind().is_rescan())
+        .map(|change| change.location())
+        .eq([&loc(&["a"])]),
+      "exactly the strand teardown's own cover, at the destination: {changes:?}"
+    );
+    let (_a, a_req) = arm(&mut core, &effects, "/r/a");
+    core.on_enumerated(a_req, listed(vec![entry("cache", FileKind::Dir)]));
+    let _ = drain(&mut core);
+    assert!(
+      !core
+        .covered_paths()
+        .iter()
+        .any(|path| path.starts_with("/r/a/cache")),
+      "the rebuild's walk is fenced entry by entry: {:?}",
+      core.covered_paths()
+    );
+  }
+
+  /// Addressing is not an exclusions-only concern, and no repair pass gates it.
+  ///
+  /// `covered_paths` is the core's statement of what it holds a kernel watch for,
+  /// and every arm and every enumerate the core dispatches is addressed by joining
+  /// onto the same derivation. A rename the Monitor answered with an O(1)
+  /// re-parent moves the whole subtree with it — in the configuration the caller
+  /// gets by default, with no exclusion set to bring a fence into play.
+  ///
+  /// The cell is stated in the DEFAULT configuration deliberately: a repaired
+  /// mirror would have satisfied it only where the repair was invoked from, and
+  /// the repair used to be invoked from the exclusion fence alone.
+  ///
+  /// Asserted as an EQUALITY: an under-count would let a silently-shrinking set
+  /// pass, and the point is that the set names the tree that exists.
+  #[test]
+  fn a_rename_with_no_exclusions_still_addresses_the_tree_that_exists() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_a, a_req) = arm(&mut core, &effects, "/r/a");
+    core.on_enumerated(a_req, listed(vec![entry("deep", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_deep, deep_req) = arm(&mut core, &effects, "/r/a/deep");
+    core.on_enumerated(deep_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        PathBuf::from("/r"),
+        PathBuf::from("/r/a"),
+        PathBuf::from("/r/a/deep"),
+      ],
+      "staging: with nothing excluded the whole tree is covered"
+    );
+
+    core.on_inotify_events(scope, rename_dir(root, 7, "a", "b"), at(1));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().moved_from() == Some(&loc(&["a"]))
+          && change.location() == &loc(&["b"])),
+      "non-vacuity: the Monitor re-parented the subtree in place: {changes:?}"
+    );
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        PathBuf::from("/r"),
+        PathBuf::from("/r/b"),
+        PathBuf::from("/r/b/deep"),
+      ],
+      "and the coverage set names the tree that exists, not the one the rename \
+       replaced"
+    );
+  }
+
+  /// The same question where it addresses I/O: a directory created UNDER a moved
+  /// subtree is armed at the path the core joins onto its parent's, and the arm is
+  /// the one an executor opens by.
+  ///
+  /// The Monitor names the new directory from the node tree the re-parent updated,
+  /// so a core that addressed by any OTHER description of that tree would emit an
+  /// arm and a delivery that disagree about which object they mean. Both are
+  /// derived from the one tree, so they cannot.
+  #[test]
+  fn a_watch_armed_under_a_moved_subtree_is_addressed_at_its_new_path() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core);
+    core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_a, a_req) = arm(&mut core, &effects, "/r/a");
+    core.on_enumerated(a_req, listed(vec![entry("deep", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (deep, deep_req) = arm(&mut core, &effects, "/r/a/deep");
+    core.on_enumerated(deep_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(scope, rename_dir(root, 7, "a", "b"), at(1));
+    let _ = drain(&mut core);
+
+    // A directory created under the moved subtree, reported on the descendant's
+    // own watch — the one the rename carried across.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(deep, IN_CREATE | IN_ISDIR, 0, Some("newdir"))],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["b", "deep", "newdir"])),
+      "non-vacuity: the Monitor reports the new directory under the subtree's \
+       new name: {changes:?}"
+    );
+
+    assert_eq!(
+      armed_paths(&effects),
+      vec![PathBuf::from("/r/b/deep/newdir")],
+      "and the arm addresses the same object the delivery named: {effects:?}"
+    );
   }
 }

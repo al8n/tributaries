@@ -169,6 +169,8 @@ impl DriverCore {
       || flags.item_change_owner()
       || flags.item_xattr_mod()
       || flags.item_finder_info_mod();
+    let created = flags.item_created();
+    let removed = flags.item_removed();
 
     if flags.item_renamed() {
       let probe = self.mint_probe(
@@ -188,8 +190,6 @@ impl DriverCore {
       };
     }
 
-    let created = flags.item_created();
-    let removed = flags.item_removed();
     match u8::from(created) + u8::from(removed) + u8::from(modified) + u8::from(attrib) {
       0 => {
         // A flag-less event means "something changed at this directory" with

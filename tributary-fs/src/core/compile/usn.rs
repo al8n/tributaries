@@ -11,7 +11,7 @@
 
 use std::{collections::BTreeMap, vec::Vec};
 
-use tributary_proto::{Location, OsRecord, RecordKind, Scope, Segment};
+use tributary_proto::{Evidence, Location, OsRecord, RecordKind, Scope, Segment};
 
 use crate::os::windows::usn::{UsnAdmitted, UsnTarget, reason};
 
@@ -19,6 +19,20 @@ use super::super::{DriverCore, Item, PendingBatch, Planned, ScopeId, ScopeState,
 
 fn location_of(components: &[String]) -> Location {
   Location::from_segments(components.iter().map(Segment::new))
+}
+
+/// What a rename record proved BESIDES the move, as protocol facts.
+///
+/// A move half is minted from its VERB (the direction no fact set carries), so
+/// the content classes riding the same record are unioned onto it rather than
+/// resolved against it — a naming choice must never consume evidence. Without
+/// this a `RENAME_OLD_NAME | DATA_OVERWRITE` record delivered a `Moved` that a
+/// modified-only subscription is not admitted on, and NTFS coalescing can make
+/// that record the only one the content class ever gets.
+fn rename_content(content: u32) -> Evidence {
+  Evidence::new()
+    .maybe_modified(content & reason::MODIFY != 0)
+    .maybe_attrib(content & reason::ATTRIB != 0)
 }
 
 impl DriverCore {
@@ -64,6 +78,10 @@ impl DriverCore {
       // acceptable, so the whole root degrades to the covering rescan (the
       // source dies alongside; this record is the in-band cover).
       UsnAdmitted::MapOverflow => vec![Planned::Over(Scope::Root(scope))],
+      // The map contradicts itself, so nothing it resolved after this point
+      // can be trusted: the same root-wide cover, but the source RESEEDS
+      // behind it rather than dying — the map is stale, not overfull.
+      UsnAdmitted::MapInconsistent => vec![Planned::Over(Scope::Root(scope))],
       // A moved-in directory's subtree is unmapped until the source's walk
       // completes: the located rescan owns that window (and re-enumerates
       // whatever the walk could not see happen).
@@ -73,7 +91,13 @@ impl DriverCore {
           Some(location_of(&target)),
         ))]
       }
-      UsnAdmitted::Renamed { old, new, is_dir } => {
+      UsnAdmitted::Renamed {
+        old,
+        old_content,
+        new,
+        new_content,
+        is_dir,
+      } => {
         match (old, new) {
           (UsnTarget::Resolved(old_c), UsnTarget::Resolved(new_c)) => {
             // Both ends are in-root, already root-relative: mint the
@@ -82,21 +106,34 @@ impl DriverCore {
             // moved IN from outside arrives as a pre-degraded Single
             // (never here); the reparent carried the subtree, and the
             // Monitor's own class handling threads `is_dir` through.
+            //
+            // Each half also carries what ITS record proved besides the move.
+            // The pairing unions the two sets into the one `Moved` it becomes,
+            // so this is a widening of that single change and never a second
+            // delivery; a half that ends up stranded instead resolves on its
+            // own evidence, which is exactly the widowed shape's.
             let cookie = self.next_cookie();
             let from_rec = OsRecord::new(state.watch, RecordKind::MovedFrom)
               .with_target(location_of(&old_c))
               .with_cookie(cookie)
-              .with_is_dir(is_dir);
+              .with_is_dir(is_dir)
+              .also_proved(rename_content(old_content));
             let to_rec = OsRecord::new(state.watch, RecordKind::MovedTo)
               .with_target(location_of(&new_c))
               .with_cookie(cookie)
-              .with_is_dir(is_dir);
+              .with_is_dir(is_dir)
+              .also_proved(rename_content(new_content));
             vec![Planned::Rec(from_rec), Planned::Rec(to_rec)]
           }
           // An escalated end covers its deepest named location; the other
           // end still plans as its half's membership verb through the
           // located cover (the admission pre-degrades true boundary cases,
           // so both ends here are in-root but one is unnameable).
+          //
+          // The content evidence is spent rather than carried here: a
+          // `Rescan` is delivered to every subscription regardless of
+          // interest and sends the consumer back to the filesystem, so it
+          // already dominates every fact a fact set could have admitted on.
           (old, new) => {
             let mut planned = Vec::with_capacity(2);
             for end in [old, new] {
@@ -137,28 +174,37 @@ impl DriverCore {
           }
         };
 
-        // The verb partition, structural first: a delta carrying both a
-        // structural verb and content/metadata bits reports the structural
-        // one (the others are its side effects within one session).
-        let kind = if delta & reason::FILE_CREATE != 0 {
-          RecordKind::Created
-        } else if delta & reason::FILE_DELETE != 0 {
-          RecordKind::Removed
-        } else if delta & reason::HARD_LINK_CHANGE != 0 {
-          // A link count change at a resolved path: whether this names the
-          // appearing or the vanishing link is unknowable from the record
-          // alone — the located rescan grounds it.
+        // A link count change at a resolved path: whether this names the
+        // appearing or the vanishing link is unknowable from the record alone
+        // — the located rescan grounds it, and it dominates whatever else the
+        // delta carried.
+        if delta & reason::HARD_LINK_CHANGE != 0 {
           return vec![Planned::Over(located(state.watch, location))];
-        } else if delta & reason::MODIFY != 0 {
-          RecordKind::Modified
-        } else if delta & (reason::ATTRIB | reason::REPARSE_POINT_CHANGE) != 0 {
-          RecordKind::Attrib
-        } else {
+        }
+
+        // One journal delta is a UNION of everything that happened to the file
+        // in the session, so its bits are mapped one by one rather than raced:
+        // a `FILE_CREATE | MODIFY | BASIC_INFO_CHANGE` delta proves all three,
+        // and the structural verb it reports (`Evidence::primary`) subsumes the
+        // others only for NAMING, never for admission.
+        // A rename bit surviving into a SINGLE is the admission's honest
+        // degrade of a half it could not pair or could not keep in-root. The
+        // membership verb it was degraded to is the right NAME for it, and the
+        // move it also proves is the right ADMISSION for it: a subscription
+        // asking only about renames would otherwise be handed neither half nor
+        // a rescan.
+        let proven = Evidence::new()
+          .maybe_created(delta & reason::FILE_CREATE != 0)
+          .maybe_removed(delta & reason::FILE_DELETE != 0)
+          .maybe_modified(delta & reason::MODIFY != 0)
+          .maybe_attrib(delta & (reason::ATTRIB | reason::REPARSE_POINT_CHANGE) != 0)
+          .maybe_moved(delta & (reason::RENAME_OLD_NAME | reason::RENAME_NEW_NAME) != 0);
+        let Some(rec) = OsRecord::proved(state.watch, proven) else {
           // Only CLOSE/filtered residue: nothing to report.
           return Vec::new();
         };
 
-        let mut rec = OsRecord::new(state.watch, kind).with_is_dir(is_dir);
+        let mut rec = rec.with_is_dir(is_dir);
         if let Some(location) = location {
           rec = rec.with_target(location);
         }
