@@ -16,7 +16,12 @@
 //! unbounded capacity, and a `Closed` signal once the receiver is gone — all
 //! of which `async_channel::unbounded` provides.
 
-use std::{io, num::NonZeroUsize, path::PathBuf, time::Duration};
+use std::{
+  io,
+  num::{NonZeroU32, NonZeroUsize},
+  path::PathBuf,
+  time::Duration,
+};
 
 pub(crate) mod fsevent;
 pub(crate) mod linux;
@@ -46,6 +51,168 @@ mod unsupported;
 pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
 
 pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
+
+/// Whether a teardown PROVED the stream it destroyed had quiesced.
+///
+/// Every backend's `shutdown` answers this, and the driver's one submission
+/// path turns the answer into the terminal it reports: `Proven` becomes
+/// `TornDown`, `Unproven` becomes `TeardownFailed`. Both retire the
+/// obligation — nothing is still running to wait on either way — but only
+/// `Proven` licenses a caller to release everything the stream could still
+/// reach, and only `Unproven` is counted against close's backlog and latched
+/// against the scope so its awaited unwatches answer `NotQuiesced`.
+///
+/// # Why a teardown can END without OBSERVING its end
+///
+/// A reader thread that is JOINED is provably gone, so the Unix backends
+/// always answer `Proven`: joining is the observation. The Windows pumps are
+/// the shape that forced this vocabulary. Their reads are overlapped, so
+/// between a successful issue and the dequeue of that issue's completion the
+/// KERNEL owns the buffer and the `OVERLAPPED` — and a pump that panicked, or
+/// whose cancellation drain never dequeued the read's final completion, cannot
+/// prove that window closed. Such a pump deliberately RETAINS the pinned
+/// memory instead of dropping it: freeing a buffer the kernel may still write
+/// through would be a use-after-free, so leaking is the correct memory-safety
+/// choice and stays.
+///
+/// What is NOT correct is letting that retention be read as a completed
+/// teardown. Without this answer the pump's thread simply returned, its join
+/// succeeded, and the driver classified a leak of handles and buffers as
+/// `TornDown` — so repeated failures grew unbounded native state while close
+/// and unwatch went on claiming quiescence over it. The leak is the honest
+/// choice; this type is what makes REPORTING it honest too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an unproven teardown must reach the driver's terminal, never be dropped as if it were success"]
+pub(crate) enum Quiesce {
+  /// The teardown observed its own end: nothing of the stream is still
+  /// running, and nothing the OS could still write to was retained.
+  Proven,
+  /// The teardown ended without observing that end. Nothing is still owed to
+  /// it — no thread to join, no completion to wait for — but native state may
+  /// have been retained precisely because its lifetime could not be proven
+  /// over, and no later teardown can prove it in retrospect.
+  Unproven,
+}
+
+/// A spawn that failed, carrying the live stream — if one had already started —
+/// that its failure could not honestly destroy on its own.
+///
+/// # Why a failing spawn does not tear its own stream down
+///
+/// Every barrier has a POST-LIVE half. The native stream is already running —
+/// its reader started, its kernel-owned buffers pinned — while the barrier is
+/// still re-proving the root's identity and reading the ancestor chain. A
+/// failure there has to unwind a stream that exists.
+///
+/// Doing that unwinding inside the spawn looked obviously right, and it hid a
+/// leak. The rollback's own `shutdown` answers [`Quiesce`], and a backend that
+/// cannot prove its pinned I/O ended answers [`Quiesce::Unproven`] and RETAINS
+/// the buffer and the handle — which stays the correct memory-safety choice,
+/// because freeing memory the kernel may still write through is a
+/// use-after-free. Discarding that answer (`let _ = handle.shutdown()`) reduced
+/// a retained buffer and handle to an ordinary spawn error: no
+/// `TeardownFailed` terminal reached the driver, so the retained state was
+/// counted nowhere, the teardown backlog never slowed admission over it, and
+/// `close` went on reporting quiescence. Repeated post-live failures then
+/// accumulated native state in silence.
+///
+/// The reasoning that licensed the discard — "the spawn is failing, so no scope
+/// exists and no obligation was ever counted" — is what was wrong. The scope not
+/// existing does not make the retained state stop existing.
+///
+/// So a post-live failure performs NO teardown. It hands the running stream back
+/// with the error, and the driver retires it through the same counted submission
+/// every committed stream uses, where `Unproven` becomes `TeardownFailed`: counted
+/// against the backlog, latched against the scope, and refused over by `close`.
+/// The leak is still the honest choice; this type is what makes its REPORTING
+/// honest too.
+pub(crate) struct SpawnFailed<H> {
+  error: SourceError,
+  rollback: Option<H>,
+}
+
+impl<H> SpawnFailed<H> {
+  /// A barrier that failed BEFORE anything went live: no stream exists, so
+  /// there is nothing to retire and no quiescence for anyone to claim.
+  pub(crate) fn refused(error: SourceError) -> Self {
+    Self {
+      error,
+      rollback: None,
+    }
+  }
+
+  /// A barrier that failed AFTER its stream went live. The stream rides back
+  /// RUNNING and untouched — deliberately, because a teardown performed here
+  /// could only produce its verdict where no accounting can hear it.
+  // Only a barrier that can fail after going live with a teardown able to answer
+  // `Unproven` builds one — today exactly the two Windows barriers. Every other
+  // host still needs the constructor to exist: it is part of the seam type.
+  #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+  pub(crate) fn rolled_back(error: SourceError, live: H) -> Self {
+    Self {
+      error,
+      rollback: Some(live),
+    }
+  }
+
+  /// Splits into the failure and the live stream it left behind.
+  ///
+  /// The ONE way the handle comes back out, so every caller can be read against
+  /// the same rule: it moves the stream into a teardown guard in this very
+  /// expression, and never binds it to a plain local.
+  pub(crate) fn into_parts(self) -> (SourceError, Option<H>) {
+    (self.error, self.rollback)
+  }
+}
+
+impl<H> From<SourceError> for SpawnFailed<H> {
+  /// Every PRE-live refusal converts through here, which is what lets a barrier
+  /// keep using `?` on the fallible steps that run before its stream exists.
+  fn from(error: SourceError) -> Self {
+    Self::refused(error)
+  }
+}
+
+impl<H> core::fmt::Debug for SpawnFailed<H> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SpawnFailed")
+      .field("error", &self.error)
+      .field("rollback", &self.rollback.is_some())
+      .finish()
+  }
+}
+
+/// Starts one native stream — the seam's single spawn entry, and the only
+/// caller of a platform `Source::spawn`.
+///
+/// The Windows barriers answer with [`SpawnFailed`] themselves: their pumps own
+/// overlapped reads, so a rollback teardown can end without proving the kernel
+/// released the buffer, and that verdict has to reach the driver's counted
+/// teardown path rather than being discarded here.
+#[cfg(all(target_os = "windows", not(miri)))]
+pub(crate) fn spawn_source(
+  config: SourceConfig,
+) -> Result<(SourceHandle, EventReceiver, RootMeta), SpawnFailed<SourceHandle>> {
+  Source::spawn(config)
+}
+
+/// Starts one native stream — the seam's single spawn entry, and the only
+/// caller of a platform `Source::spawn`.
+///
+/// These backends refuse with no rollback stream, and that is honest rather
+/// than merely convenient: every one of their teardowns is structurally
+/// [`Quiesce::Proven`] — a joined reader thread (both Linux primitives), a
+/// drained serial queue (FSEvents), or an uninhabited handle (the stub). A
+/// thread that has ended has ended the only lifetime there was to observe, so a
+/// rollback inside those barriers retains nothing for anyone to count. A
+/// backend that ever gains a teardown able to answer `Unproven` must hand its
+/// rollback back through [`SpawnFailed::rolled_back`] instead.
+#[cfg(not(all(target_os = "windows", not(miri))))]
+pub(crate) fn spawn_source(
+  config: SourceConfig,
+) -> Result<(SourceHandle, EventReceiver, RootMeta), SpawnFailed<SourceHandle>> {
+  Source::spawn(config).map_err(SpawnFailed::refused)
+}
 
 /// Which watch primitive a spawned source is backed by — the capability
 /// report [`Watcher::backend_of`](crate::Watcher::backend_of) surfaces for a
@@ -499,25 +666,39 @@ pub(crate) struct SourceConfig {
   /// correctness never depends on them.
   pub(crate) exclusions: Vec<PathBuf>,
   /// Resume point from a previous stream generation; `None` = live-only.
-  // Only the FSEvents backend consumes resume points today (inotify has no
-  // journal to resume from), so every other build sees the field as dead.
-  #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
+  // Only the journal-bearing backends (FSEvents, the USN journal) consume a
+  // resume point — the Linux primitives have no journal to resume from — so a
+  // Linux or stub build sees the field as dead.
+  #[cfg_attr(
+    not(all(any(target_os = "macos", target_os = "windows"), not(miri))),
+    allow(dead_code)
+  )]
   pub(crate) since: Option<ResumeToken>,
   /// The OS event-coalescing latency.
   pub(crate) latency: Duration,
   /// Capacity of the callback→driver channel, in callback batches.
   pub(crate) channel_capacity: NonZeroUsize,
+  /// The native read buffer one source reads kernel records into, in bytes.
+  /// Deliberately independent of [`channel_capacity`](Self::channel_capacity):
+  /// a count of batches and a count of bytes answer to different limits.
+  /// FSEvents owns its own buffering and ignores this.
+  #[cfg_attr(
+    not(all(any(target_os = "linux", target_os = "windows"), not(miri))),
+    allow(dead_code)
+  )]
+  pub(crate) os_buffer_bytes: NonZeroU32,
   /// The per-root backend selection the spawn barrier honors. The real spawn
   /// seam rejects a selection foreign to the host
   /// ([`SourceError::ForeignBackend`]) before any platform code reads it; on
   /// Linux [`Backend::Auto`] probes for fanotify and falls back to inotify,
   /// while the explicit variants pin the choice.
   pub(crate) backend: Backend,
-  /// The fanotify admission-map directory cap (design §4.9); `None` = uncapped.
-  /// A seed/reseed walk that would exceed it makes fanotify unviable (fall back
-  /// under `Backend::Auto`, typed error when forced); a live create/move-in
-  /// growing the map past it kills the scope (never OOM). Only the fanotify
-  /// backend reads it.
+  /// The admission-map directory cap (design §4.9); `None` = uncapped. A
+  /// seed/reseed walk that would exceed it makes the backend unviable (fall
+  /// back under `Backend::Auto`, typed error when forced); a live create/move-in
+  /// growing the map past it kills the scope (never OOM). Read by fanotify and
+  /// the USN journal — the two backends that keep their own admission map;
+  /// every other backend ignores it.
   #[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
   pub(crate) max_map_directories: Option<usize>,
 }
@@ -532,6 +713,7 @@ impl SourceConfig {
       since: None,
       latency: Duration::from_millis(10),
       channel_capacity: NonZeroUsize::new(64).expect("64 is nonzero"),
+      os_buffer_bytes: NonZeroU32::new(64 * 1024).expect("64 KiB is nonzero"),
       backend: Backend::Auto,
       max_map_directories: None,
     }
@@ -690,51 +872,264 @@ pub enum SourceError {
   CallbackPanic,
 }
 
-/// Where a dead stream's successor can resume from: the last in-sync journal
-/// event id plus the device UUID that scopes its validity.
+/// Where a dead stream's successor can resume from — ONE variant per backend
+/// that keeps a journal, each carrying its own cursor together with the scope
+/// that makes the cursor mean anything.
 ///
-/// A root replacement consumes one: the driver takes the retiring stream's
-/// token at command time and hands it to the replacement's spawn, so the
-/// backend replays the swap window from the journal instead of leaving it to
-/// the commit `Rescan` alone. The replay is best-effort by construction — a
-/// wrapped id space mints no token, a purged journal replays nothing, and a
-/// token is only ever honored against its own device — so the `Rescan` still
-/// stands and the consumer contract is unchanged: delivery only gets denser.
+/// A cursor alone is never a resume point: a journal id space is scoped (to a
+/// device on macOS, to a journal instance on a volume on Windows), and replaying
+/// an id under a different scope names unrelated history. Carrying the scope IN
+/// the token is what lets the honoring side answer with one call
+/// ([`fsevents_since`](Self::fsevents_since),
+/// [`usn_cursor`](Self::usn_cursor)) instead of re-deriving the rule per
+/// backend — including the rule that a token minted by ANOTHER backend is not a
+/// resume point at all, just a miss.
+///
+/// # A token advances only over acknowledged ingest
+///
+/// A root replacement consumes one: the driver takes the retiring stream's token
+/// at command time and hands it to the replacement's spawn, so the backend
+/// replays the swap window from the journal instead of leaving it to the commit
+/// `Rescan` alone. What makes that sound is that the producer never PUBLISHES a
+/// cursor — it stages a candidate with the batch that reaches the cursor, and
+/// only the driver's ingest of that batch publishes it
+/// (`transport::ResumeAck`). So a batch dropped over budget, refused by a gone
+/// receiver, or still sitting in the queue leaves the token where it was, and
+/// the successor re-reads that span rather than skipping it.
+///
+/// The replay stays best-effort in the other direction — a wrapped id space
+/// mints no token, a purged journal replays nothing, a foreign scope is not
+/// honored — so the `Rescan` still stands and the consumer contract is
+/// unchanged: delivery only gets denser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResumeToken {
-  last_good: u64,
-  device_uuid: Option<[u8; 16]>,
+pub(crate) enum ResumeToken {
+  /// The macOS FSEvents journal: the highest event id observed in sync, scoped
+  /// by the device UUID whose journal minted it (`None` when the OS could not
+  /// supply one, which no honoring side accepts).
+  #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
+  FsEvents {
+    /// The highest in-sync journal event id.
+    last_good: u64,
+    /// The device whose journal the id belongs to.
+    device_uuid: Option<[u8; 16]>,
+  },
+  /// The Windows USN change journal: the next USN to read, scoped by the
+  /// journal instance and the volume it lives on. A journal deleted and
+  /// recreated gets a fresh id, which is exactly what makes an old cursor
+  /// unhonorable.
+  #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+  Usn {
+    /// The journal instance the cursor indexes into.
+    journal_id: u64,
+    /// The USN the next read should start at.
+    next_usn: i64,
+    /// The volume serial the journal belongs to.
+    volume_serial: u64,
+  },
 }
 
-// The journal-replay token is consumed by the macOS FSEvents backend (and, for
-// `new`, the cross-platform driver resume tests); on every other target the type
-// is interface scaffolding — `SourceControl::resume_token` returns `Option<Self>`
-// uniformly — so its accessors are legitimately unused there.
-#[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
+// Which half of this vocabulary is live is per-target: macOS mints and honors
+// the FSEvents variant, Windows the USN one, and a Linux or stub build carries
+// the type only because `SourceControl::resume_token` returns `Option<Self>`
+// uniformly. The seam deliberately does not fork per platform, so the other
+// backend's constructor and accessor are dead on any single one.
 impl ResumeToken {
-  /// Builds a token from a last-good event id and its device UUID.
-  pub(crate) const fn new(last_good: u64, device_uuid: Option<[u8; 16]>) -> Self {
-    Self {
+  /// An FSEvents resume point.
+  #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
+  pub(crate) const fn fsevents(last_good: u64, device_uuid: Option<[u8; 16]>) -> Self {
+    Self::FsEvents {
       last_good,
       device_uuid,
     }
   }
 
-  /// The highest journal event id observed while the stream was in sync.
-  pub(crate) const fn last_good(&self) -> u64 {
-    self.last_good
+  /// A USN journal resume point.
+  #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+  pub(crate) const fn usn(journal_id: u64, next_usn: i64, volume_serial: u64) -> Self {
+    Self::Usn {
+      journal_id,
+      next_usn,
+      volume_serial,
+    }
   }
 
-  /// The UUID of the device the id belongs to, if the OS could supply one.
-  /// A token is only valid for resuming against the identical UUID.
-  pub(crate) const fn device_uuid(&self) -> Option<[u8; 16]> {
-    self.device_uuid
+  /// The FSEvents event id to start from on the device currently under
+  /// `device_uuid`, or `None` when this token cannot speak for it — another
+  /// backend's token, another device's journal, or a device with no UUID at
+  /// either end.
+  #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
+  pub(crate) fn fsevents_since(&self, device_uuid: Option<[u8; 16]>) -> Option<u64> {
+    match (self, device_uuid) {
+      (
+        Self::FsEvents {
+          last_good,
+          device_uuid: Some(minted),
+        },
+        Some(current),
+      ) if *minted == current => Some(*last_good),
+      _ => None,
+    }
+  }
+
+  /// The USN to start reading at on the named journal and volume, or `None`
+  /// when this token cannot speak for them.
+  #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+  pub(crate) fn usn_cursor(&self, journal_id: u64, volume_serial: u64) -> Option<i64> {
+    match self {
+      Self::Usn {
+        journal_id: minted_journal,
+        next_usn,
+        volume_serial: minted_volume,
+      } if *minted_journal == journal_id && *minted_volume == volume_serial => Some(*next_usn),
+      _ => None,
+    }
+  }
+
+  /// Whether `self` and `other` were minted under the SAME journal scope, so
+  /// their cursors are comparable. Two tokens of different backends, devices, or
+  /// journal instances never are: the later one REPLACES the earlier rather than
+  /// racing it for a maximum.
+  pub(crate) fn same_scope(&self, other: &Self) -> bool {
+    match (self, other) {
+      (
+        Self::FsEvents {
+          device_uuid: left, ..
+        },
+        Self::FsEvents {
+          device_uuid: right, ..
+        },
+      ) => left == right,
+      (
+        Self::Usn {
+          journal_id: left_journal,
+          volume_serial: left_volume,
+          ..
+        },
+        Self::Usn {
+          journal_id: right_journal,
+          volume_serial: right_volume,
+          ..
+        },
+      ) => left_journal == right_journal && left_volume == right_volume,
+      _ => false,
+    }
+  }
+
+  /// Whether `self` names a point at or beyond `other` WITHIN one scope. Only
+  /// meaningful for same-scope tokens; the publish path checks that first.
+  pub(crate) fn reaches(&self, other: &Self) -> bool {
+    match (self, other) {
+      (Self::FsEvents { last_good: new, .. }, Self::FsEvents { last_good: old, .. }) => new >= old,
+      (Self::Usn { next_usn: new, .. }, Self::Usn { next_usn: old, .. }) => new >= old,
+      _ => false,
+    }
   }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{Backend, BackendKind};
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+
+  use super::{Backend, BackendKind, Quiesce, SourceError, SpawnFailed};
+
+  /// A stand-in for a live stream handle that records every way it could be
+  /// reclaimed. The Windows barriers cannot run on this host, but the DECISION a
+  /// failing post-live barrier makes about its stream is host-testable: whether
+  /// the stream is destroyed inside the failing spawn or handed back running.
+  struct LiveStream {
+    reclaims: Arc<AtomicUsize>,
+    verdict: Quiesce,
+    shut: bool,
+  }
+
+  impl LiveStream {
+    fn new(reclaims: &Arc<AtomicUsize>, verdict: Quiesce) -> Self {
+      Self {
+        reclaims: Arc::clone(reclaims),
+        verdict,
+        shut: false,
+      }
+    }
+
+    fn shutdown(mut self) -> Quiesce {
+      self.shut = true;
+      self.reclaims.fetch_add(1, Ordering::SeqCst);
+      self.verdict
+    }
+  }
+
+  impl Drop for LiveStream {
+    /// The real handles' `Drop` backstop: a stream nobody shut down is still
+    /// reclaimed, which is exactly why "just drop it" is not a way to avoid the
+    /// question.
+    fn drop(&mut self) {
+      if !self.shut {
+        self.reclaims.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+  }
+
+  /// A barrier that fails after its stream is live surrenders the RUNNING
+  /// stream, and its verdict survives the trip out.
+  ///
+  /// This is the decision the finding turned on. The failing spawn used to call
+  /// `shutdown` itself and discard the answer, so a rollback that had to retain
+  /// kernel-owned buffers reported nothing: the retention was counted nowhere
+  /// and `close` still claimed quiescence over it. Nothing about the spawn
+  /// failing made that state stop existing — only the reporting was missing.
+  ///
+  /// FAIL-ON-REVERT: implement `rolled_back` the way the barriers used to behave
+  /// — `let _ = live.shutdown(); Self::refused(error)` — and the reclaim count
+  /// below is 1 before anyone was told, and `into_parts` yields `None`, so the
+  /// verdict has no route to a terminal.
+  #[test]
+  fn a_post_live_failure_surrenders_its_stream_rather_than_reclaiming_it() {
+    let reclaims = Arc::new(AtomicUsize::new(0));
+    let failure = SpawnFailed::rolled_back(
+      SourceError::RootReplaced {
+        root: std::path::PathBuf::from("/r"),
+      },
+      LiveStream::new(&reclaims, Quiesce::Unproven),
+    );
+    assert_eq!(
+      reclaims.load(Ordering::SeqCst),
+      0,
+      "the failing barrier neither tears the stream down nor drops it"
+    );
+
+    let (error, rollback) = failure.into_parts();
+    assert!(matches!(error, SourceError::RootReplaced { .. }));
+    let rollback = rollback.expect("the live stream rides out with the error");
+    assert_eq!(
+      reclaims.load(Ordering::SeqCst),
+      0,
+      "and it is still live in the caller's hands"
+    );
+
+    // The caller — the driver's counted submission — is the one that reclaims
+    // it, and the verdict it reads is the stream's own.
+    assert_eq!(
+      rollback.shutdown(),
+      Quiesce::Unproven,
+      "an unproven rollback stays unproven all the way to the accounting"
+    );
+    assert_eq!(reclaims.load(Ordering::SeqCst), 1, "reclaimed exactly once");
+  }
+
+  /// A barrier that fails BEFORE anything went live carries no stream, so there
+  /// is nothing to retire and no quiescence anyone could be claiming.
+  #[test]
+  fn a_pre_live_refusal_carries_no_stream() {
+    let (error, rollback) = SpawnFailed::<LiveStream>::from(SourceError::NoRoots).into_parts();
+    assert!(matches!(error, SourceError::NoRoots));
+    assert!(
+      rollback.is_none(),
+      "a refusal before start owns no stream to hand back"
+    );
+  }
 
   #[test]
   fn backend_tags_are_stable() {

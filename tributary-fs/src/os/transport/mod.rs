@@ -41,7 +41,72 @@ use std::sync::{
 ))]
 use std::sync::atomic::AtomicBool;
 
-use super::SourceError;
+use super::{ResumeToken, SourceError};
+
+/// The PUBLISHED half of one source's resume point: the journal position the
+/// driver has provably ingested, and nothing beyond it.
+///
+/// The producer never writes here. It stages a candidate with the batch that
+/// reaches that position ([`ResumeAck`]) and the driver publishes it at ingest,
+/// so the three ways a batch can fail to arrive — dropped over budget, refused
+/// by a gone receiver, still queued when the stream is retired — all leave the
+/// point exactly where the last ingested batch left it.
+///
+/// A gap between two published points is always covered: a batch that did not
+/// land degrades to an in-band `Overflow` at its own queue position, which is
+/// AHEAD of any later batch on the source's one ordered queue — so a later
+/// publish can only happen after the driver already turned that loss into a
+/// rescan.
+#[derive(Debug, Default)]
+pub(crate) struct ResumeShared {
+  published: std::sync::Mutex<Option<ResumeToken>>,
+}
+
+// Only a journal-bearing backend stages resume points; a Linux or stub build
+// carries the type because the transport is shared, and never mints one.
+#[cfg_attr(
+  not(any(all(any(target_os = "macos", target_os = "windows"), not(miri)), test)),
+  allow(dead_code)
+)]
+impl ResumeShared {
+  /// The last acknowledged point, or `None` before any batch was ingested.
+  pub(crate) fn published(&self) -> Option<ResumeToken> {
+    *self.published.lock().unwrap_or_else(|err| err.into_inner())
+  }
+
+  /// Publishes `token` unless it would move the point BACKWARD within its own
+  /// scope. A token from a DIFFERENT scope replaces outright: a re-anchored
+  /// journal (a wrap, a purge, a recreated journal id) mints a cursor that is
+  /// numerically smaller and semantically newer, and keeping the stale one would
+  /// hand the successor a cursor its journal never had.
+  fn publish(&self, token: ResumeToken) {
+    let mut slot = self.published.lock().unwrap_or_else(|err| err.into_inner());
+    match slot.as_ref() {
+      Some(current) if current.same_scope(&token) && !token.reaches(current) => {}
+      _ => *slot = Some(token),
+    }
+  }
+}
+
+/// The resume candidate one enqueued batch carries: the point a successor may
+/// resume from ONCE this batch has been ingested.
+///
+/// Publishing is explicit ([`acknowledge`](Self::acknowledge)) and dropping
+/// publishes nothing, which is the whole mechanism: a payload discarded anywhere
+/// on its way to the core silently takes its candidate with it.
+#[derive(Debug)]
+pub(crate) struct ResumeAck {
+  shared: Arc<ResumeShared>,
+  candidate: ResumeToken,
+}
+
+impl ResumeAck {
+  /// Publishes this batch's candidate — called only where the batch is handed
+  /// to the core.
+  fn acknowledge(self) {
+    self.shared.publish(self.candidate);
+  }
+}
 
 /// The transport-side state one source's producer owns: the batch budget and
 /// the two signal dedups.
@@ -187,6 +252,9 @@ pub(crate) struct BatchPayload<E> {
   pub(crate) events: Vec<E>,
   /// The budget slot; released when the payload drops.
   pub(crate) permit: BudgetPermit,
+  /// The journal position this batch reaches, for a backend that keeps one.
+  /// Unpublished until [`acknowledge_resume`](Self::acknowledge_resume).
+  resume: Option<ResumeAck>,
 }
 
 impl<E> BatchPayload<E> {
@@ -196,6 +264,19 @@ impl<E> BatchPayload<E> {
     Self {
       events,
       permit: BudgetPermit::detached(),
+      resume: None,
+    }
+  }
+
+  /// Publishes this batch's resume candidate, if it carries one.
+  ///
+  /// Called at the ONE place the driver hands a batch to the core, so the
+  /// source's resume point advances over exactly the batches the core was given
+  /// — never over one the transport dropped, and never over one still waiting in
+  /// the queue when the stream is retired.
+  pub(crate) fn acknowledge_resume(&mut self) {
+    if let Some(ack) = self.resume.take() {
+      ack.acknowledge();
     }
   }
 }
@@ -280,6 +361,13 @@ pub(crate) type EventReceiver<E> = async_channel::Receiver<SourceMessage<E>>;
 /// BEHIND it (the batch's own staleness is not covered by the prior signal,
 /// which rescanned as of its earlier queue position). A batch refused over
 /// budget degrades to a loss instead and does not advance the position.
+// Every producer with no journal position to stage forwards through this. The
+// one macOS backend always has one, so a macOS lib build reaches it only from
+// the suites.
+#[cfg_attr(
+  not(any(all(any(target_os = "linux", target_os = "windows"), not(miri)), test)),
+  allow(dead_code)
+)]
 #[cfg(any(
   all(
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
@@ -287,10 +375,38 @@ pub(crate) type EventReceiver<E> = async_channel::Receiver<SourceMessage<E>>;
   ),
   test
 ))]
-pub(crate) fn forward_batch<E, S>(
+pub(crate) fn forward_batch<E, S>(transport: &TransportState, events: Vec<E>, lossy: bool, send: S)
+where
+  S: FnMut(SourceMessage<E>) -> bool,
+{
+  forward_batch_resuming(transport, events, lossy, None, send);
+}
+
+/// [`forward_batch`] for a journal-bearing producer, staging the position this
+/// batch reaches so the driver's ingest can publish it.
+///
+/// The candidate rides the batch and NOTHING else, so every way the batch fails
+/// to reach the core takes the candidate with it: refused for budget (the events
+/// never leave the producer), refused by a gone receiver, or ingested never
+/// because the stream was retired first.
+///
+/// A LOSSY batch stages nothing whatever its candidate. `lossy` means records in
+/// this very read could not be decoded, and no cursor distinguishes the decoded
+/// ones from the lost ones — so the position stays behind them and the successor
+/// re-reads the span. Replaying is always legal (duplicates are); skipping is
+/// not.
+#[cfg(any(
+  all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(miri)
+  ),
+  test
+))]
+pub(crate) fn forward_batch_resuming<E, S>(
   transport: &TransportState,
   events: Vec<E>,
   lossy: bool,
+  resume: Option<(&Arc<ResumeShared>, ResumeToken)>,
   mut send: S,
 ) where
   S: FnMut(SourceMessage<E>) -> bool,
@@ -299,7 +415,18 @@ pub(crate) fn forward_batch<E, S>(
   if !events.is_empty() {
     match BudgetPermit::acquire(transport) {
       Some(permit) => {
-        if !send(SourceMessage::Batch(BatchPayload { events, permit })) {
+        let resume = (!lossy)
+          .then_some(resume)
+          .flatten()
+          .map(|(shared, candidate)| ResumeAck {
+            shared: Arc::clone(shared),
+            candidate,
+          });
+        if !send(SourceMessage::Batch(BatchPayload {
+          events,
+          permit,
+          resume,
+        })) {
           return;
         }
         // The batch is now the tail: a pending `Overflow` no longer covers a
