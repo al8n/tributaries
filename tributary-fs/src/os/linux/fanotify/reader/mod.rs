@@ -236,9 +236,11 @@ fn drain_events(
     if !process_decoded(
       decoded,
       map,
-      &shared.stats,
-      &shared.transport,
-      reseed.exclusions(),
+      &BufferContext {
+        stats: &shared.stats,
+        transport: &shared.transport,
+        exclusions: reseed.exclusions(),
+      },
       || reseed.walk(),
       |subtree, subtree_fid, budget| reseed.walk_subtree(subtree, subtree_fid, budget),
       |msg| shared.queue.try_send(msg).is_ok(),
@@ -246,6 +248,21 @@ fn drain_events(
       return DrainExit::Died;
     }
   }
+}
+
+/// The source-wide state one buffer is processed against — everything
+/// [`process_decoded`] only READS, as opposed to the [`FidMap`] it mutates and the
+/// effect closures it calls. Grouped so the borrowed context travels as one value:
+/// it is identical for every buffer of a source's life, while the map and the
+/// closures are what each call actually varies.
+struct BufferContext<'a> {
+  /// Where the per-buffer counters (memo hits/misses, map size, walk time) land.
+  stats: &'a BackendStatsShared,
+  /// The transport state the loss/fatal signalling is routed through.
+  transport: &'a transport::TransportState,
+  /// The caller's exclusion fence, consulted by [`classify`] before any map
+  /// self-maintenance runs.
+  exclusions: &'a [std::path::PathBuf],
 }
 
 /// Processes one decoded buffer: [`classify`]s each event into its admission
@@ -270,7 +287,7 @@ fn drain_events(
 /// maps one moved-in directory's descendants (its resolved current path, its FID,
 /// and the remaining directory budget). Both mirror `ReseedContext`'s methods.
 ///
-/// `exclusions` is handed straight to [`classify`], which decides the fence BEFORE
+/// `cx.exclusions` is handed straight to [`classify`], which decides the fence BEFORE
 /// any map self-maintenance runs. Nothing is filtered here afterwards: an excluded
 /// event arrives as [`Admission::ExcludedDrop`] having mutated nothing, so this loop
 /// never sees a forwarded event the caller asked not to hear about, and — the
@@ -278,9 +295,7 @@ fn drain_events(
 fn process_decoded<R, S, Q>(
   decoded: super::fid::DecodeOutcome,
   map: &mut FidMap,
-  stats: &BackendStatsShared,
-  transport: &transport::TransportState,
-  exclusions: &[std::path::PathBuf],
+  cx: &BufferContext<'_>,
   reseed_walk: R,
   mut subtree_walk: S,
   mut send: Q,
@@ -290,6 +305,11 @@ where
   S: FnMut(&std::path::Path, &super::fid::Fid, Option<usize>) -> std::io::Result<Vec<SeedEntry>>,
   Q: FnMut(crate::os::SourceMessage) -> bool,
 {
+  let &BufferContext {
+    stats,
+    transport,
+    exclusions,
+  } = cx;
   // The batch memo (design §4.9) caches admitted directory resolutions FOR THIS
   // buffer only: the reader is single-threaded and the map is queue-ordered, so a
   // cached path is sound until the next map mutation, which bumps the map's
