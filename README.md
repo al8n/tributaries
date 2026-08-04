@@ -92,6 +92,48 @@ Every unsafe platform call is confined to an internal, cfg-gated module behind a
 platform-neutral seam. On a platform with no backend the crate still compiles and
 watching reports `Unsupported`.
 
+## Comparison with `notify`
+
+[`notify`] is the ecosystem's general-purpose watcher and the right default for most
+consumers. `tributaries` targets a stricter contract — coverage never ends without a
+covering instruction, and the barrier never settles over a loss — which rules out
+shortcuts a general-purpose watcher can reasonably take.
+
+A **directory rename** shows the difference most sharply. Measured against
+[`notify`] 8.2.0 on its inotify backend:
+
+| | [`notify`] 8.2.0 | `tributaries` |
+|---|---|---|
+| Directory rename | tears the subtree's watches down and re-adds them by walking the destination | re-anchors the subtree in place; its watches ride the move |
+| Rename cost | a prefix scan across every watch in the process, plus a `readdir` per moved directory | one re-key, no syscalls |
+| Object identity | discarded — the moved tree becomes a fresh set of descriptors | preserved, so a move is distinguishable from a delete-and-recreate |
+| Path storage | absolute paths mirrored per watch | derived from the watch tree at the point of use |
+| The rename window | the subtree is unwatched between teardown and re-add, and the re-walk sees the tree as it is *then* | coverage never ends without an opening `Rescan` and a counted replacement |
+| Loss signalling | `Flag::Rescan`, on kernel-reported loss (queue overflow, `MustScanSubDirs`) | every coverage end owes a `Rescan`, which bypasses both interest and filter |
+| Settle semantics | none | `sync` cannot resolve over an unacknowledged loss |
+| Exclusions | filtered downstream, after the watch is armed | fenced in the watcher; excluded ground is never armed or walked |
+| Linux backend | inotify | inotify and fanotify |
+
+[`notify`] covers considerably more ground, and several gaps are ones a given
+project may simply need:
+
+| | [`notify`] 8.2.0 | `tributaries` |
+|---|---|---|
+| Platforms | Linux, Android, macOS, Windows, iOS, FreeBSD, OpenBSD, NetBSD, DragonFly | Linux, macOS, Windows |
+| Fallback when no kernel API fits | `PollWatcher`, which works anywhere — network mounts, exotic filesystems | none; watching reports `Unsupported` |
+| Content comparison | `compare_contents`, catching modifications an mtime check misses | not offered |
+| Watching a single file | supported | rejected — a root must be a directory |
+| macOS backend choice | FSEvents or kqueue, by feature | FSEvents |
+| Serializable events | `serde` feature | not offered |
+
+It is also far more widely deployed and battle-tested, and its surface is a watcher
+plus a callback rather than epochs, scopes and settle fences. If a brief gap across a
+rename is acceptable and you re-enumerate on `Event::need_rescan`, [`notify`] is the
+simpler choice and the one to reach for.
+
+These are contract differences rather than benchmarks: the cost row describes the
+work each code path performs, not measured throughput.
+
 ## Installation
 
 ```toml
@@ -174,6 +216,7 @@ Copyright (c) 2026 Al Liu.
 
 [`quinn-proto`]: https://crates.io/crates/quinn-proto
 [`agnostic-lite`]: https://crates.io/crates/agnostic-lite
+[`notify`]: https://crates.io/crates/notify
 [`tributaries`]: https://crates.io/crates/tributaries
 [`tributary-fs`]: https://crates.io/crates/tributary-fs
 [`tributary-proto`]: https://crates.io/crates/tributary-proto
