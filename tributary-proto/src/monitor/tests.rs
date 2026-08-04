@@ -13282,62 +13282,58 @@ fn reproving_storm_settles_only_over_postdating_acks() {
         // Acknowledge an outstanding arm — the dominant fuel. An arm drained
         // before a later loss acknowledges STALE here, exercising the
         // re-issue rule.
-        0..=2 => {
-          if !pending_arms.is_empty() {
-            let w = pending_arms.swap_remove((rng() as usize) % pending_arms.len());
-            if rng() % 10 == 0 {
-              m.ack_watch(w, Err(WatchError::NotFound));
-            } else {
-              if let Some(&issued) = last_arm_gen.get(&w) {
-                proven_gen.insert(w, issued);
-              }
-              let ack = if rng() % 3 == 0 {
-                WatchAck::Installed
-              } else {
-                WatchAck::Aliased
-              };
-              m.ack_watch(w, Ok(ack));
+        0..=2 if !pending_arms.is_empty() => {
+          let w = pending_arms.swap_remove((rng() as usize) % pending_arms.len());
+          if rng() % 10 == 0 {
+            m.ack_watch(w, Err(WatchError::NotFound));
+          } else {
+            if let Some(&issued) = last_arm_gen.get(&w) {
+              proven_gen.insert(w, issued);
             }
+            let ack = if rng() % 3 == 0 {
+              WatchAck::Installed
+            } else {
+              WatchAck::Aliased
+            };
+            m.ack_watch(w, Ok(ack));
           }
         }
         // Complete a read: a faithful listing of the live tree (survivors
         // arise and follow moves), sometimes perturbed (vanish/replace one)
         // or degraded (`Partial`/`Failed`).
-        3..=5 => {
-          if !reads.is_empty() {
-            let (req, dir) = reads.swap_remove((rng() as usize) % reads.len());
-            let mut entries: Vec<DirEntry> = m
-              .slot_children(dir)
-              .into_iter()
-              .map(|(name, id)| {
-                let entry = DirEntry::new(name, FileKind::Dir);
-                match id {
-                  Some(id) => entry.with_node(id),
-                  None => entry,
-                }
-              })
-              .collect();
-            match rng() % 8 {
-              0 if !entries.is_empty() => {
-                let victim = (rng() as usize) % entries.len();
-                entries.swap_remove(victim);
+        3..=5 if !reads.is_empty() => {
+          let (req, dir) = reads.swap_remove((rng() as usize) % reads.len());
+          let mut entries: Vec<DirEntry> = m
+            .slot_children(dir)
+            .into_iter()
+            .map(|(name, id)| {
+              let entry = DirEntry::new(name, FileKind::Dir);
+              match id {
+                Some(id) => entry.with_node(id),
+                None => entry,
               }
-              1 => {
-                fresh_ident += 1;
-                entries.push(
-                  DirEntry::new(names[(rng() as usize) % names.len()].clone(), FileKind::Dir)
-                    .with_node(ident(fresh_ident)),
-                );
-              }
-              _ => {}
+            })
+            .collect();
+          match rng() % 8 {
+            0 if !entries.is_empty() => {
+              let victim = (rng() as usize) % entries.len();
+              entries.swap_remove(victim);
             }
-            let res = match rng() % 6 {
-              0 => EnumerateResult::Partial(entries),
-              1 => EnumerateResult::Failed(IoClass::Io),
-              _ => EnumerateResult::Ok(entries),
-            };
-            m.on_enumerate(req, res);
+            1 => {
+              fresh_ident += 1;
+              entries.push(
+                DirEntry::new(names[(rng() as usize) % names.len()].clone(), FileKind::Dir)
+                  .with_node(ident(fresh_ident)),
+              );
+            }
+            _ => {}
           }
+          let res = match rng() % 6 {
+            0 => EnumerateResult::Partial(entries),
+            1 => EnumerateResult::Failed(IoClass::Io),
+            _ => EnumerateResult::Ok(entries),
+          };
+          m.on_enumerate(req, res);
         }
         // A scope-level loss — the binding-re-proving trigger the mirror
         // counts with the Monitor. Damped, so recoveries regularly COMPLETE
