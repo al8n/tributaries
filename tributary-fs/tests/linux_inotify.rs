@@ -34,6 +34,10 @@ use tributary_fs::{
   WatcherOptions,
 };
 
+mod common;
+
+use common::{Inventory, covers, delivered, drive};
+
 /// Generous ceiling for one expected observation; CI runners are slow.
 const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -105,15 +109,6 @@ async fn wait_for(
   .flatten()
 }
 
-/// An event "covers" a path when it names it directly or is a `Rescan` at the
-/// path or one of its ancestors (a rescan obliges re-enumeration below it).
-fn covers(event: &Event, path: &Path) -> bool {
-  if event.path() == path {
-    return true;
-  }
-  event.is_rescan() && path.starts_with(event.path())
-}
-
 /// Converges on live coverage of `dir`: creates a fresh file there and waits
 /// briefly for its delivery, retrying until one lands. A descending re-arm
 /// (a `replace_root` widen rebuilds the tree on a new inotify instance)
@@ -145,35 +140,32 @@ async fn coverage_becomes_live(watcher: &mut TokioWatcher, dir: &Path, tag: &str
 }
 
 /// Converges on the CHILD'S OWN kernel watch DELIVERING for `dir`: creates a
-/// fresh probe file there and waits for that file's EXACT, non-`Rescan` event,
+/// fresh probe file there and waits for that file's exact [`delivered`] event,
 /// retrying with a new probe until one lands. `false` means no such delivery ever
 /// came.
 ///
 /// # Why this is not [`coverage_becomes_live`], and why nothing may substitute it
 ///
-/// The two answer different questions and are not interchangeable in the
-/// direction that matters. `coverage_becomes_live` stands on [`covers`], which
-/// accepts an ancestor `Rescan` — correct for what it is for, "the caller now owes
-/// a re-enumeration below here", which is all a re-arm handshake needs to see.
+/// The two ask the two questions [`covers`] and [`delivered`] exist to keep
+/// apart, and they are not interchangeable in the direction that matters.
+/// `coverage_becomes_live` asks only that the caller now owes a re-enumeration
+/// below here — all a re-arm handshake needs to see.
 ///
-/// But a located `Rescan` at or above `dir` is PRECISELY what the Monitor emits
-/// when it could not arm `dir` and dropped the subtree. So for any claim that
-/// `dir` itself is watched, an ancestor `Rescan` is not weak evidence in favour —
-/// it is evidence AGAINST, and accepting it inverts the test. Only the exact path
-/// can settle it: inotify attributes a create inside a directory to THAT
-/// directory's own watch descriptor, so an event naming the probe file itself is a
-/// positive observation that `dir`'s own kernel watch exists and is delivering.
-/// Nothing weaker entails it, which is why this predicate refuses `Rescan`s
-/// outright instead of ranking them.
+/// This asks that `dir` ITSELF is watched, and only the exact path can settle
+/// that. inotify attributes a create inside a directory to THAT directory's own
+/// watch descriptor, so an event naming the probe file is a positive observation
+/// that `dir`'s own kernel watch exists and is delivering, while an ancestor
+/// `Rescan` is precisely what the Monitor emits when it could NOT arm `dir` and
+/// dropped the subtree.
 async fn child_watch_delivers(watcher: &mut TokioWatcher, dir: &Path, tag: &str) -> bool {
   for attempt in 0..40 {
     let probe = dir.join(format!("{tag}-{attempt}.txt"));
     if std::fs::write(&probe, b"x").is_err() {
       return false;
     }
-    let delivered = tokio::time::timeout(scaled(Duration::from_millis(500)), async {
+    let arrived = tokio::time::timeout(scaled(Duration::from_millis(500)), async {
       while let Some(event) = watcher.next().await {
-        if !event.is_rescan() && event.path() == probe {
+        if delivered(&event, &probe) {
           return true;
         }
       }
@@ -181,7 +173,7 @@ async fn child_watch_delivers(watcher: &mut TokioWatcher, dir: &Path, tag: &str)
     })
     .await
     .unwrap_or(false);
-    if delivered {
+    if arrived {
       return true;
     }
   }
@@ -208,7 +200,9 @@ fn privileged_or_skip(cell: &str) -> bool {
       true
     }
     None => {
-      eprintln!("SKIP {cell}: needs CAP_SYS_ADMIN (run via linux-verify.sh inotify-priv)");
+      common::skip_notice(format_args!(
+        "{cell}: needs CAP_SYS_ADMIN (run via linux-verify.sh inotify-priv)"
+      ));
       false
     }
   }
@@ -325,15 +319,30 @@ impl Drop for SysctlGuard {
   }
 }
 
-/// Suite 1 (§6.3): create/modify/remove churn converges through the
-/// descending profile — every mutated path ends covered. Both facts are
-/// collected in ONE pass over the stream (waiting twice would discard the
-/// events the second wait needs).
+/// Suite 1 (§6.3): create/modify/remove churn converges through the descending
+/// profile.
+///
+/// Convergence is asserted as what it MEANS — a consumer that obeyed the stream
+/// ends holding the real tree, the top-level file's creation and removal both
+/// accounted for — rather than as "something covering each mutated path
+/// arrived", which one root `Rescan` supplies for the entire subtree without
+/// decoding anything. That first claim is one a rescan-only backend legitimately
+/// satisfies, by re-reading its way to the same tree.
+///
+/// The deep create carries a second, stronger claim beside it: the descent
+/// reached `a/b` and the create was DELIVERED at that exact path — as the
+/// kernel's own `IN_CREATE`, or as the cold enumerate's `Created` when the arm
+/// landed after the write. A backend whose descent had stopped arming would
+/// converge and fail this.
+///
+/// Both facts are collected in ONE pass over the stream; a second wait would be
+/// looking for events the first already consumed.
 #[tokio::test]
 async fn churn_converges() {
   let root = scratch_root("churn");
   let mut w = watcher();
   let _h = w.watch(&root, Interest::all()).await.expect("watch");
+  let mut inventory = Inventory::seeded(&root);
 
   std::fs::create_dir_all(root.join("a/b")).unwrap();
   std::fs::write(root.join("a/b/one.txt"), b"1").unwrap();
@@ -341,21 +350,22 @@ async fn churn_converges() {
   std::fs::remove_file(root.join("top.txt")).unwrap();
 
   let deep = root.join("a/b/one.txt");
-  let top = root.join("top.txt");
-  let mut saw_deep = false;
-  let mut saw_top = false;
-  let _ = tokio::time::timeout(scaled(DEADLINE), async {
-    while let Some(event) = w.next().await {
-      saw_deep |= covers(&event, &deep);
-      saw_top |= covers(&event, &top);
-      if saw_deep && saw_top {
-        break;
-      }
-    }
+  let _ = drive(&mut w, &mut inventory, scaled(DEADLINE), |model| {
+    model.delivered_at(&deep) && model.disagreement().is_empty()
   })
   .await;
-  assert!(saw_deep, "the deep create is observed after descent");
-  assert!(saw_top, "the top-level churn is observed");
+
+  assert!(
+    inventory.disagreement().is_empty(),
+    "the consumer's view converged on the churned tree: {:?}",
+    inventory.disagreement()
+  );
+  assert!(
+    inventory.delivered_at(&deep),
+    "the deep create was delivered at {} rather than only covered ({} rescans discharged)",
+    deep.display(),
+    inventory.rescans()
+  );
 }
 
 /// Suite 2: native cookie pairing — a same-directory rename surfaces as one
@@ -832,10 +842,10 @@ async fn watch_limit_exhaustion_is_honest() {
   // different failure this cell must not absorb. Whenever exhaustion WAS
   // triggered the honesty assertion stands unweakened: a silent NoSpace fails.
   if !enforced && watched.is_ok() && !honest {
-    eprintln!(
-      "SKIP watch_limit_exhaustion_is_honest: this kernel does not enforce the \
+    common::skip_notice(format_args!(
+      "watch_limit_exhaustion_is_honest: this kernel does not enforce the \
        max_user_watches shrink; exhaustion never triggered"
-    );
+    ));
     return;
   }
   assert!(
@@ -871,7 +881,9 @@ async fn bind_mount_inside_root_is_a_boundary() {
     .status()
     .expect("run mount");
   if !status.success() {
-    eprintln!("SKIP bind_mount_inside_root_is_a_boundary: bind mount refused");
+    common::skip_notice(format_args!(
+      "bind_mount_inside_root_is_a_boundary: bind mount refused"
+    ));
     return;
   }
 
@@ -1582,19 +1594,21 @@ async fn widen_over_unmount_rebind_is_never_silently_certified() {
     // silence, which is indistinguishable from the defect this cell hunts.
     let probe = sub.join(format!("probe-{round}.txt"));
     if mount_state(&mount) != Some(true) {
-      eprintln!(
-        "SKIP round {round}: the cycle left nothing mounted at {} (the re-mount reported success: \
-         {remounted}), so the round has no filesystem to assert the widen's ending over",
+      common::skip_notice(format_args!(
+        "widen_over_unmount_rebind_is_never_silently_certified: round {round}: the cycle left \
+         nothing mounted at {} (the re-mount reported success: {remounted}), so the round has no \
+         filesystem to assert the widen's ending over",
         mount.display()
-      );
+      ));
       let _ = w.close().await;
       continue;
     }
     if let Err(err) = std::fs::write(&probe, b"w1") {
-      eprintln!(
-        "SKIP round {round}: the probe under the re-mounted subtree could not be created ({err}), \
-         so nothing was staged for the stream to surface"
-      );
+      common::skip_notice(format_args!(
+        "widen_over_unmount_rebind_is_never_silently_certified: round {round}: the probe under \
+         the re-mounted subtree could not be created ({err}), so nothing was staged for the \
+         stream to surface"
+      ));
       let _ = w.close().await;
       continue;
     }
@@ -2419,7 +2433,7 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
   static SEQ: AtomicU32 = AtomicU32::new(0);
 
   let Ok(parent) = std::env::temp_dir().canonicalize() else {
-    eprintln!("SKIP {tag}: TMPDIR could not be canonicalized");
+    common::skip_notice(format_args!("{tag}: TMPDIR could not be canonicalized"));
     return None;
   };
   // Opened once, and held: the precondition is decided on THIS descriptor and the
@@ -2428,19 +2442,19 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
   let parent_dir = match open_dir(&parent) {
     Ok(dir) => dir,
     Err(err) => {
-      eprintln!(
-        "SKIP {tag}: TMPDIR {} could not be opened as a directory ({err})",
+      common::skip_notice(format_args!(
+        "{tag}: TMPDIR {} could not be opened as a directory ({err})",
         parent.display()
-      );
+      ));
       return None;
     }
   };
   if let Some(why) = hijackable_path(&parent_dir) {
-    eprintln!(
-      "SKIP {tag}: REFUSING to build the fixture — a root-run mkfs, losetup and mount must not be \
+    common::skip_notice(format_args!(
+      "{tag}: REFUSING to build the fixture — a root-run mkfs, losetup and mount must not be \
        named anywhere an untrusted user can rename entries, and {why}. Point TMPDIR at a directory \
        that is either not writable beyond its owner or STICKY, as /tmp is."
-    );
+    ));
     return None;
   }
   let entry = format!(
@@ -2453,23 +2467,23 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
   // SAFETY: live descriptor, live NUL-terminated name.
   if unsafe { libc::mkdirat(parent_dir.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
     let err = std::io::Error::last_os_error();
-    eprintln!(
-      "SKIP {tag}: REFUSING to build the fixture — the private image directory {} could not be \
+    common::skip_notice(format_args!(
+      "{tag}: REFUSING to build the fixture — the private image directory {} could not be \
        created exclusively ({err}), so something this process did not create already holds that \
        name and a root-run image write must not proceed through it",
       home.display()
-    );
+    ));
     return None;
   }
   let home_dir = match open_dir_at(&parent_dir, &name) {
     Ok(dir) => dir,
     Err(err) => {
-      eprintln!(
-        "SKIP {tag}: REFUSING to build the fixture — the private image directory {} could not be \
+      common::skip_notice(format_args!(
+        "{tag}: REFUSING to build the fixture — the private image directory {} could not be \
          re-opened as a descriptor ({err}), and a fixture that cannot hold its own directory open \
          would have to reach everything inside it by name",
         home.display()
-      );
+      ));
       unlink_at(&parent_dir, &name, libc::AT_REMOVEDIR);
       return None;
     }
@@ -2499,11 +2513,11 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
   };
   if fd < 0 {
     let err = std::io::Error::last_os_error();
-    eprintln!(
-      "SKIP {tag}: REFUSING to build the fixture — the backing image {} could not be created \
+    common::skip_notice(format_args!(
+      "{tag}: REFUSING to build the fixture — the backing image {} could not be created \
        exclusively ({err})",
       image.display()
-    );
+    ));
     discard_home();
     return None;
   }
@@ -2514,7 +2528,9 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
   // closed — and the create is worth nothing if the very next step reopens by
   // name.
   if let Err(err) = file.set_len(u64::from(mb) * 1024 * 1024) {
-    eprintln!("SKIP {tag}: the backing image could not be sized to {mb} MiB: {err}");
+    common::skip_notice(format_args!(
+      "{tag}: the backing image could not be sized to {mb} MiB: {err}"
+    ));
     drop(file);
     discard_home();
     return None;
@@ -2532,7 +2548,7 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
     .map(|s| s.success())
     .unwrap_or(false)
   {
-    eprintln!("SKIP {tag}: mkfs.ext4 unavailable");
+    common::skip_notice(format_args!("{tag}: mkfs.ext4 unavailable"));
     drop(file);
     discard_home();
     return None;
@@ -2544,7 +2560,7 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
   {
     Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
     _ => {
-      eprintln!("SKIP {tag}: losetup unavailable");
+      common::skip_notice(format_args!("{tag}: losetup unavailable"));
       drop(file);
       discard_home();
       return None;
@@ -2582,10 +2598,10 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
   // the device and removes the image and its directory, where a panic here would
   // have left all three behind.
   if let Err(err) = fixture.make_mountpoint() {
-    eprintln!(
-      "SKIP {tag}: the mountpoint {} could not be created exclusively: {err}",
+    common::skip_notice(format_args!(
+      "{tag}: the mountpoint {} could not be created exclusively: {err}",
       mount.display()
-    );
+    ));
     drop(fixture);
     return None;
   }
@@ -2618,7 +2634,7 @@ fn loop_image(tag: &str, mb: u32) -> Option<LoopFixture> {
     .map(|s| s.success())
     .unwrap_or(false);
   if !mounted {
-    eprintln!("SKIP {tag}: loop mount refused");
+    common::skip_notice(format_args!("{tag}: loop mount refused"));
     // Dropped, not `close`d: this is a skip path, and the release reports its own
     // residue loudly (`CLEANUP FAILED`) rather than converting a refused mount
     // into this cell's panic.
@@ -3820,7 +3836,9 @@ fn with_reader_stopped_within(
   {
     Ok(helper) => helper,
     Err(err) => {
-      eprintln!("SKIP {cell}: the bracket helper would not spawn: {err}");
+      common::skip_notice(format_args!(
+        "{cell}: the bracket helper would not spawn: {err}"
+      ));
       return StoppedBracket::refused();
     }
   };
@@ -3834,11 +3852,11 @@ fn with_reader_stopped_within(
     .is_some_and(|pipe| read_token(pipe, READY, budget.ready));
   let ready_at = Instant::now();
   if !ready {
-    eprintln!(
-      "SKIP {cell}: the bracket helper never signalled readiness within {:?}, so the reader was \
+    common::skip_notice(format_args!(
+      "{cell}: the bracket helper never signalled readiness within {:?}, so the reader was \
        NOT stopped",
       budget.ready
-    );
+    ));
     // Killed, not waited on: a helper that is alive but silent would otherwise
     // hold the reap for as long as it lives. Safe precisely because this process
     // did NOT stop, so no resume is owed.
@@ -3851,9 +3869,9 @@ fn with_reader_stopped_within(
   let resume = match SelfResume::arm(budget.guard, budget.tick) {
     Some(resume) => resume,
     None => {
-      eprintln!(
-        "SKIP {cell}: no self-resume timer could be armed, so this process must not stop itself"
-      );
+      common::skip_notice(format_args!(
+        "{cell}: no self-resume timer could be armed, so this process must not stop itself"
+      ));
       terminate_group(&helper);
       reap_bracket(cell, &mut helper, &budget);
       return StoppedBracket::refused();
@@ -3869,12 +3887,12 @@ fn with_reader_stopped_within(
   let helper_live = matches!(helper.try_wait(), Ok(None));
   let slack = ready_at.elapsed();
   if !armed || !helper_live || slack >= budget.handshake / 2 {
-    eprintln!(
-      "SKIP {cell}: refusing to stop — self-resume armed: {armed}, helper still running: \
+    common::skip_notice(format_args!(
+      "{cell}: refusing to stop — self-resume armed: {armed}, helper still running: \
        {helper_live}, handshake budget left: {:?} of {:?}",
       budget.handshake.saturating_sub(slack),
       budget.handshake
-    );
+    ));
     terminate_group(&helper);
     reap_bracket(cell, &mut helper, &budget);
     return StoppedBracket::refused();
@@ -3902,7 +3920,9 @@ fn with_reader_stopped_within(
   let resumed = resume.resumed_the_stop();
   drop(resume);
   if sent != 0 {
-    eprintln!("SKIP {cell}: the self-stop was refused, so the reader stayed on the fd");
+    common::skip_notice(format_args!(
+      "{cell}: the self-stop was refused, so the reader stayed on the fd"
+    ));
     terminate_group(&helper);
     reap_bracket(cell, &mut helper, &budget);
     return StoppedBracket::refused();
@@ -4298,10 +4318,10 @@ async fn overflow_swallowed_unmount_rebinds_or_dies_loudly() {
   let loopdev = fixture.loopdev().to_owned();
   let mount = fixture.mount().to_path_buf();
   let Some(tail) = wide_tree(&mount, UNMOUNT_STORM_DIRS) else {
-    eprintln!(
-      "SKIP overflow_swallowed_unmount_rebinds_or_dies_loudly: the loopback could not hold \
+    common::skip_notice(format_args!(
+      "overflow_swallowed_unmount_rebinds_or_dies_loudly: the loopback could not hold \
        {UNMOUNT_STORM_DIRS} directories"
-    );
+    ));
     fixture.close();
     return;
   };
@@ -4331,12 +4351,16 @@ async fn overflow_swallowed_unmount_rebinds_or_dies_loudly() {
     let handle = match w.watch(&mount, Interest::all()).await {
       Ok(handle) => handle,
       Err(err) => {
-        eprintln!("SKIP round {round}: watch refused: {err:?}");
+        common::skip_notice(format_args!(
+          "overflow_swallowed_unmount_rebinds_or_dies_loudly: round {round}: watch refused: {err:?}"
+        ));
         continue;
       }
     };
     if !coverage_becomes_live(&mut w, &mount, &format!("birth-{round}")).await {
-      eprintln!("SKIP round {round}: coverage never became live");
+      common::skip_notice(format_args!(
+        "overflow_swallowed_unmount_rebinds_or_dies_loudly: round {round}: coverage never became live"
+      ));
       let _ = w.close().await;
       continue;
     }
@@ -4344,19 +4368,28 @@ async fn overflow_swallowed_unmount_rebinds_or_dies_loudly() {
     // the cycle: an arm still in flight holds an `O_PATH` anchor on the
     // superblock, which makes `umount(2)` EBUSY and costs the round its bracket.
     if !coverage_becomes_live(&mut w, &tail, &format!("tail-{round}")).await {
-      eprintln!("SKIP round {round}: the descent never reached the tree's tail");
+      common::skip_notice(format_args!(
+        "overflow_swallowed_unmount_rebinds_or_dies_loudly: round {round}: the descent never \
+         reached the tree's tail"
+      ));
       let _ = w.close().await;
       continue;
     }
     if !descent_releases_its_anchors(&mount).await {
-      eprintln!("SKIP round {round}: the descent still holds anchors on the superblock");
+      common::skip_notice(format_args!(
+        "overflow_swallowed_unmount_rebinds_or_dies_loudly: round {round}: the descent still \
+         holds anchors on the superblock"
+      ));
       let _ = w.close().await;
       continue;
     }
     // Everything classified below must be the BRACKET's traffic, not the liveness
     // handshakes' residue.
     if !stream_goes_quiet(&mut w).await {
-      eprintln!("SKIP round {round}: the stream never went quiet before the bracket");
+      common::skip_notice(format_args!(
+        "overflow_swallowed_unmount_rebinds_or_dies_loudly: round {round}: the stream never went \
+         quiet before the bracket"
+      ));
       let _ = w.close().await;
       continue;
     }
@@ -4373,7 +4406,7 @@ async fn overflow_swallowed_unmount_rebinds_or_dies_loudly() {
     // the unwind is about to run — and fails at once naming the cause, rather than
     // retrying until the rounds are spent and blaming the empty sample count.
     let bracket = with_reader_stopped(
-      &format!("round {round} mount cycle"),
+      &format!("overflow_swallowed_unmount_rebinds_or_dies_loudly: round {round} mount cycle"),
       CYCLE_MOUNT_STEPS,
       &[mount.as_os_str(), OsStr::new(&loopdev)],
     );
@@ -4399,7 +4432,9 @@ async fn overflow_swallowed_unmount_rebinds_or_dies_loudly() {
     // ordinary traffic is not teardown evidence.
     let mut signals = LossSignals::default();
     if !observe_loss_at(&mut w, &mount, Duration::from_secs(3), &mut signals).await {
-      eprintln!("SKIP round {round}: no overflow observed");
+      common::skip_notice(format_args!(
+        "overflow_swallowed_unmount_rebinds_or_dies_loudly: round {round}: no overflow observed"
+      ));
       let _ = w.close().await;
       continue;
     }
@@ -4659,7 +4694,10 @@ async fn overflow_swallowed_recreate_rebinds_the_midtree_watch() {
     let handle = match w.watch(&mount, Interest::all()).await {
       Ok(handle) => handle,
       Err(err) => {
-        eprintln!("SKIP round {round}: watch refused: {err:?}");
+        common::skip_notice(format_args!(
+          "overflow_swallowed_recreate_rebinds_the_midtree_watch: round {round}: watch refused: \
+           {err:?}"
+        ));
         continue;
       }
     };
@@ -4669,10 +4707,10 @@ async fn overflow_swallowed_recreate_rebinds_the_midtree_watch() {
     // A binding that never armed would be trivially "retained", and the round
     // would witness nothing.
     if !child_watch_delivers(&mut w, &mid, &format!("birth-{round}")).await {
-      eprintln!(
-        "SKIP round {round}: the directory's own watch never delivered an exact event, so it has \
-         no binding for this round to retain"
-      );
+      common::skip_notice(format_args!(
+        "overflow_swallowed_recreate_rebinds_the_midtree_watch: round {round}: the directory's \
+         own watch never delivered an exact event, so it has no binding for this round to retain"
+      ));
       let _ = w.close().await;
       continue;
     }
@@ -4681,14 +4719,20 @@ async fn overflow_swallowed_recreate_rebinds_the_midtree_watch() {
     // the recreate is handed a DIFFERENT inode and the round samples the
     // identity-diff arm instead of the keep this cell is about.
     if !descent_releases_its_anchors(&mount).await {
-      eprintln!("SKIP round {round}: the descent still holds anchors on the superblock");
+      common::skip_notice(format_args!(
+        "overflow_swallowed_recreate_rebinds_the_midtree_watch: round {round}: the descent still \
+         holds anchors on the superblock"
+      ));
       let _ = w.close().await;
       continue;
     }
     // The falsifier below reads deliveries from the subject's OWN watch as teardown
     // evidence, so the birth handshake's residue must be off the stream first.
     if !stream_goes_quiet(&mut w).await {
-      eprintln!("SKIP round {round}: the stream never went quiet before the bracket");
+      common::skip_notice(format_args!(
+        "overflow_swallowed_recreate_rebinds_the_midtree_watch: round {round}: the stream never \
+         went quiet before the bracket"
+      ));
       let _ = w.close().await;
       continue;
     }
@@ -4705,7 +4749,9 @@ async fn overflow_swallowed_recreate_rebinds_the_midtree_watch() {
     // Those probes are incidental — freeing the directory's inode is the point.
     let ino_before = inode_of(&mid);
     let bracket = with_reader_stopped(
-      &format!("round {round} storm-and-swap"),
+      &format!(
+        "overflow_swallowed_recreate_rebinds_the_midtree_watch: round {round} storm-and-swap"
+      ),
       RECREATE_MIDTREE_STEPS,
       &[mount.as_os_str(), mid.as_os_str()],
     );
@@ -4735,7 +4781,9 @@ async fn overflow_swallowed_recreate_rebinds_the_midtree_watch() {
     let verdict_tag = format!("verdict-{round}");
     let mut signals = LossSignals::for_child_subject(&verdict_tag);
     if !observe_loss_at(&mut w, &mid, Duration::from_secs(3), &mut signals).await {
-      eprintln!("SKIP round {round}: no overflow observed");
+      common::skip_notice(format_args!(
+        "overflow_swallowed_recreate_rebinds_the_midtree_watch: round {round}: no overflow observed"
+      ));
       let _ = w.close().await;
       continue;
     }
@@ -4979,7 +5027,7 @@ async fn armed_or_renewed(w: &mut TokioWatcher, root: &Path, dir: &Path) -> Opti
         if event.is_rescan() && event.path() == root {
           return Some(true);
         }
-        if !event.is_rescan() && event.path() == probe {
+        if delivered(&event, &probe) {
           return Some(false);
         }
       }
@@ -5088,4 +5136,435 @@ async fn descriptor_renewal_keeps_the_tree_watched() {
   .expect("the barrier resolves once the renewal's re-proof settles")
   .expect("the sync admits and writes its cookie");
   let _ = std::fs::remove_file(&cookie);
+}
+
+/// Collects every event as it arrives until one satisfies `pred` (or the
+/// deadline lapses), so a cell can assert on the WHOLE stream rather than on
+/// whichever event a wait happened to stop at.
+///
+/// The distinction matters for a negative claim: "nothing under the exclusion
+/// arrived" is only checkable against events that were never discarded, and a
+/// plain `wait_for` throws away everything it did not match.
+async fn collect_until(
+  watcher: &mut TokioWatcher,
+  seen: &mut Vec<Event>,
+  mut pred: impl FnMut(&Event) -> bool,
+) -> bool {
+  tokio::time::timeout(scaled(DEADLINE), async {
+    while let Some(event) = watcher.next().await {
+      let hit = pred(&event);
+      seen.push(event);
+      if hit {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false)
+}
+
+/// Suite 22: exclusions against a LIVE kernel on the DESCENDING backend,
+/// measured as coverage rather than as a delivery preference.
+///
+/// A per-directory backend gives the assertion its teeth. inotify attributes a
+/// create to the affected directory's OWN watch descriptor and never re-delivers
+/// anything for a directory it never armed, so on this backend "no event from
+/// inside an exclusion, after a marker in the reported half has drained" IS the
+/// statement that the subtree carries no kernel watch — the same fact
+/// `backend_stats().directories()` reads for fanotify, read through the only
+/// instrument a descending backend exposes. On a kernel-recursive backend the
+/// same silence would prove only suppression; here it proves the coverage was
+/// never established, which is what the option promises.
+///
+/// TWO exclusions, because the two ways a directory enters coverage are two
+/// different fences and only one shape reaches each:
+///
+/// - `<root>/pre` EXISTS when the watch is taken, so it can only be declined by
+///   the cold enumerate's listing — nothing is ever created under a covered
+///   parent for it;
+/// - `<root>/post` does NOT exist yet, so its creation is announced by the ROOT's
+///   own watch (which IS covered) and can only be declined by the lowering of
+///   that live create. Reversed, this cell would pass with the live fence gone.
+///
+/// `<root>/pred` is the boundary neighbour — an exclusion covers a subtree, not a
+/// name prefix — and doubles as the ordering marker, so the reads below are never
+/// merely early.
+#[tokio::test]
+async fn live_exclusions_are_enforced_on_the_descending_backend() {
+  let root = scratch_root("exclusions");
+  let cold = root.join("pre");
+  let live = root.join("post");
+  let neighbour = root.join("pred");
+  std::fs::create_dir_all(cold.join("deep")).unwrap();
+  std::fs::create_dir_all(&neighbour).unwrap();
+
+  let mut w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::Inotify)
+      .with_exclusions(vec![cold.clone(), live.clone()]),
+  )
+  .expect("build watcher");
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  // Staging, and the boundary claim in one: the NEIGHBOUR's own kernel watch must
+  // be proven to deliver before a missing delivery from inside an exclusion can
+  // be read as a missing watch rather than as a cold read still in flight. Only
+  // the probe's exact, non-`Rescan` event settles that — see
+  // [`child_watch_delivers`].
+  assert!(
+    child_watch_delivers(&mut w, &neighbour, "arm").await,
+    "`pred` is not under the exclusion of `pre` — an exclusion covers a subtree, not \
+     a name prefix — so its own watch must be live and delivering"
+  );
+
+  let mut seen: Vec<Event> = Vec::new();
+
+  // The cold enumerate's half: a directory that existed when the watch was taken.
+  std::fs::write(cold.join("deep/cold.txt"), b"x").unwrap();
+  let first = neighbour.join("marker-cold.txt");
+  std::fs::write(&first, b"x").unwrap();
+  assert!(
+    collect_until(&mut w, &mut seen, |e| delivered(e, &first)).await,
+    "the reported half keeps flowing while the excluded half churns"
+  );
+
+  // The live create's half: an excluded directory that does not exist yet, so its
+  // own creation is reported by the covered root and its arm is the core's to
+  // decline. Everything below it follows only if that arm was made.
+  std::fs::create_dir_all(live.join("deeper")).unwrap();
+  std::fs::write(live.join("deeper/live.txt"), b"x").unwrap();
+  let second = neighbour.join("marker-live.txt");
+  std::fs::write(&second, b"x").unwrap();
+  assert!(
+    collect_until(&mut w, &mut seen, |e| delivered(e, &second)).await,
+    "the reported half still flows after the live churn under the exclusion"
+  );
+
+  // A short tail so a straggler from an excluded half is caught rather than
+  // outrunning the assertion.
+  let _ = tokio::time::timeout(scaled(Duration::from_millis(500)), async {
+    while let Some(event) = w.next().await {
+      seen.push(event);
+    }
+  })
+  .await;
+
+  // `Path::starts_with` is component-wise, so `<root>/pred` is not caught here —
+  // the same subtree-not-prefix rule the fence itself matches on.
+  let leaked: Vec<String> = seen
+    .iter()
+    .filter(|e| e.path().starts_with(&cold) || e.path().starts_with(&live))
+    .map(|e| format!("{:?} at {}", e.kind(), e.path().display()))
+    .collect();
+  assert!(
+    leaked.is_empty(),
+    "an excluded subtree was armed after all — nothing from inside one can be \
+     delivered unless its own directories carry kernel watches: {leaked:?}"
+  );
+  assert!(
+    seen.iter().any(|e| delivered(e, &first)),
+    "staging check: the reported half's marker really was delivered"
+  );
+}
+
+/// Converges on `dir` NO LONGER carrying its own kernel watch: churns a probe
+/// there, writes a marker in the still-reported `witness` directory, and waits
+/// for the marker; the round passes when the marker arrives and the probe never
+/// did. Retries until a round passes, so a shed that is merely still in flight
+/// does not read as one that never happened.
+///
+/// The paired marker is what makes the negative sound. A bare timeout would pass
+/// on any slow round; requiring a delivery from a watch that IS live in the same
+/// window says the stream was flowing while `dir` stayed silent — the same shape
+/// [`live_exclusions_are_enforced_on_the_descending_backend`] uses, tightened
+/// into a convergence loop because a shed is eventual where a decline is not.
+async fn child_watch_goes_quiet(
+  watcher: &mut TokioWatcher,
+  dir: &Path,
+  witness: &Path,
+  tag: &str,
+) -> bool {
+  for attempt in 0..40 {
+    let probe = dir.join(format!("{tag}-{attempt}.txt"));
+    let marker = witness.join(format!("{tag}-marker-{attempt}.txt"));
+    if std::fs::write(&probe, b"x").is_err() {
+      return false;
+    }
+    if std::fs::write(&marker, b"x").is_err() {
+      return false;
+    }
+    let mut leaked = false;
+    let marked = tokio::time::timeout(scaled(Duration::from_millis(500)), async {
+      while let Some(event) = watcher.next().await {
+        if delivered(&event, &probe) {
+          leaked = true;
+        }
+        if delivered(&event, &marker) {
+          return true;
+        }
+      }
+      false
+    })
+    .await
+    .unwrap_or(false);
+    if marked && !leaked {
+      return true;
+    }
+  }
+  false
+}
+
+/// Suite 22, the geometry half, OUT of the exclusion — the direction that loses
+/// data.
+///
+/// `<root>/a/cache` is excluded, so the cold walk of `<root>/a` armed nothing
+/// there. Renaming `<root>/a` to `<root>/b` moves that directory to the
+/// perfectly reportable `<root>/b/cache`, and BOTH endpoints of the rename are
+/// themselves reported — so the record-by-record fence preserves the pair and the
+/// Monitor answers it by re-parenting the known watch subtree in place. Without
+/// the geometry escalation that carry-over installs no watch for the newly
+/// visible directory, and every change under it is lost for the life of the
+/// watch.
+///
+/// The claim is COVERAGE, read through the only instrument a descending backend
+/// exposes: inotify attributes a create to the affected directory's OWN watch
+/// descriptor, so [`child_watch_delivers`] naming a file inside `<root>/b/cache`
+/// is a positive observation that the directory carries a kernel watch — not
+/// merely that something was announced. It is asserted at the moved subtree's TOP
+/// and one level DEEPER, because the repair has to cascade rather than stop at
+/// the first newly reportable name.
+#[tokio::test]
+async fn a_rename_out_of_an_exclusion_arms_the_newly_reportable_subtree() {
+  let root = scratch_root("geometry-out");
+  let excluded = root.join("a/cache");
+  std::fs::create_dir_all(excluded.join("deep")).unwrap();
+  std::fs::create_dir_all(root.join("a/keep")).unwrap();
+
+  let mut w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::Inotify)
+      .with_exclusions(vec![excluded.clone()]),
+  )
+  .expect("build watcher");
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  // Staging: the reported sibling's own watch is live, so the cold walk has run
+  // and a later silence from inside the exclusion is a missing watch rather than
+  // a read still in flight.
+  assert!(
+    child_watch_delivers(&mut w, &root.join("a/keep"), "arm").await,
+    "the reported sibling carries its own watch once the cold walk lands"
+  );
+  assert!(
+    child_watch_goes_quiet(&mut w, &excluded, &root.join("a/keep"), "pre").await,
+    "staging: while it is excluded, `a/cache` carries no watch of its own"
+  );
+
+  // The geometry change: both endpoints reported, an exclusion under the source.
+  std::fs::rename(root.join("a"), root.join("b")).unwrap();
+
+  assert!(
+    child_watch_delivers(&mut w, &root.join("b/cache"), "post").await,
+    "the directory the rename made reportable must now carry its OWN kernel \
+     watch — a re-parent that skipped it leaves this subtree blind forever"
+  );
+  assert!(
+    child_watch_delivers(&mut w, &root.join("b/cache/deep"), "deep").await,
+    "and the repair cascades: the whole moved subtree is re-enumerated, not \
+     just its first newly reportable name"
+  );
+}
+
+/// Suite 22, the geometry half, INTO the exclusion — the direction that spends
+/// what the option exists to save.
+///
+/// `<root>/a/cache` is excluded but `<root>/b/cache` is not, so it is covered.
+/// Renaming `<root>/b` to `<root>/a` moves that whole subtree under the
+/// exclusion; a bare re-parent would keep its kernel watches installed and keep
+/// delivering from inside ground the caller asked never to hear about — holding
+/// exactly the per-watch budget the exclusion was set to shed.
+///
+/// The reported sibling is the witness in every round, so the negative is read
+/// against a stream that was demonstrably flowing.
+#[tokio::test]
+async fn a_rename_into_an_exclusion_sheds_the_subtree_it_no_longer_reports() {
+  let root = scratch_root("geometry-in");
+  std::fs::create_dir_all(root.join("b/cache/deep")).unwrap();
+  std::fs::create_dir_all(root.join("b/keep")).unwrap();
+
+  let mut w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::Inotify)
+      .with_exclusions(vec![root.join("a/cache")]),
+  )
+  .expect("build watcher");
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  // Staging: nothing excludes `<root>/b/cache`, so it is covered and delivering.
+  assert!(
+    child_watch_delivers(&mut w, &root.join("b/cache"), "arm").await,
+    "before the rename the subtree is reported, so it carries its own watch"
+  );
+
+  std::fs::rename(root.join("b"), root.join("a")).unwrap();
+
+  assert!(
+    child_watch_goes_quiet(&mut w, &root.join("a/cache"), &root.join("a/keep"), "post").await,
+    "the subtree the rename moved under the exclusion must stop being covered — \
+     while the reported sibling in the same directory keeps delivering"
+  );
+}
+
+/// Suite 22, the geometry half, INTO the exclusion, read as DELIVERY inside the
+/// rename's OWN kernel read rather than as coverage after it settles.
+///
+/// [`a_rename_into_an_exclusion_sheds_the_subtree_it_no_longer_reports`] converges:
+/// it retries until a round comes back quiet, which is the right shape for a shed
+/// (eventual by nature) and precisely the wrong one for the leak here, which is a
+/// FIRST-round event. The window is one read buffer. inotify queues the rename
+/// pair and the descendant watch's own record in FIFO order, so a compile that
+/// classifies the whole buffer before re-anchoring any of it judges the descendant
+/// record at the path its watch was ARMED at — outside the exclusion — keeps it,
+/// and delivers it after the re-parent under `<root>/a/cache`. Everything the
+/// repair does afterwards is too late for a record already retained.
+///
+/// The three writes are adjacent syscalls with no await between them, which is how
+/// the one-read shape is obtained without depending on a sleep: the kernel has all
+/// three queued long before a woken reader copies any of them out. The marker in
+/// the still-reported sibling is written LAST, so it is the stream-order fence for
+/// the negative — receiving it proves the driver read past the leak's position,
+/// and `collect_until` keeps every event it passed on the way rather than
+/// discarding the ones it did not match.
+///
+/// Live coalescing is likely, not certain: measured against the defect this cell
+/// caught it on four runs in five, the fifth having split the buffer. That is the
+/// right split of duty — the claim is stated deterministically by the core cell of
+/// the same name, which feeds one buffer by construction, and this cell is the
+/// end-to-end proof that the whole watcher, real kernel included, honours it. Its
+/// assertion is a NEGATIVE, so a split buffer can only cost it teeth, never turn
+/// it flaky-red.
+#[tokio::test]
+async fn a_rename_into_an_exclusion_fences_the_rest_of_its_own_read() {
+  let root = scratch_root("geometry-in-batch");
+  std::fs::create_dir_all(root.join("b/cache")).unwrap();
+  std::fs::create_dir_all(root.join("b/keep")).unwrap();
+
+  let mut w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::Inotify)
+      .with_exclusions(vec![root.join("a/cache")]),
+  )
+  .expect("build watcher");
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  // Staging: the subtree about to move under the exclusion carries its OWN kernel
+  // watch right now, which is what lets a record from inside it ride behind the
+  // rename in the same read. Without this the cell could pass on a watch that was
+  // never armed in the first place.
+  assert!(
+    child_watch_delivers(&mut w, &root.join("b/cache"), "arm").await,
+    "before the rename the subtree is reported, so it carries its own watch"
+  );
+
+  let leak = root.join("a/cache/leak.txt");
+  let marker = root.join("a/keep/marker.txt");
+  std::fs::rename(root.join("b"), root.join("a")).unwrap();
+  std::fs::write(&leak, b"x").unwrap();
+  std::fs::write(&marker, b"x").unwrap();
+
+  let mut seen: Vec<Event> = Vec::new();
+  assert!(
+    collect_until(&mut w, &mut seen, |e| delivered(e, &marker)).await,
+    "the reported sibling's marker still arrives, so the stream was flowing \
+     across the rename: {seen:?}"
+  );
+  // A short tail so a straggler cannot outrun the assertion.
+  let _ = tokio::time::timeout(scaled(Duration::from_millis(500)), async {
+    while let Some(event) = w.next().await {
+      seen.push(event);
+    }
+  })
+  .await;
+
+  let excluded = root.join("a/cache");
+  let leaked: Vec<String> = seen
+    .iter()
+    .filter(|e| e.path().starts_with(&excluded))
+    .map(|e| format!("{:?} at {}", e.kind(), e.path().display()))
+    .collect();
+  assert!(
+    leaked.is_empty(),
+    "a record queued behind the rename must be classified against the path the \
+     rename gave it, so nothing under the exclusion is delivered: {leaked:?}"
+  );
+}
+
+/// Suite 22, the geometry half, driven PAST the parked-source bound.
+///
+/// The geometry pass defers each directory rename's source endpoint until its
+/// destination half can use it, and a directory moved clean OUT of the watched
+/// root never sends that second half — so the deferred set is bounded. At the
+/// bound it refuses the source and stops classifying the read, dropping the
+/// remainder behind a scope-wide rescan rather than evicting sources that can
+/// still pair.
+///
+/// This cell drives a real kernel across that bound and then asks the same
+/// question the unbounded cells ask: a burst of move-outs comfortably larger than
+/// the bound, and only THEN the geometry-changing rename. Whichever side of the
+/// bound that rename lands on, the answer must be the same — the moved subtree
+/// stops being covered and nothing under the exclusion is ever delivered. The
+/// two paths that can produce it are the located repair (the ordinary case) and
+/// the barrier's scope-wide recovery (the over-bound case), and the point of the
+/// cell is that the caller cannot tell them apart.
+///
+/// Asserted convergently, like the shed cell it mirrors: a shed is eventual by
+/// nature, and after a scope-wide recovery it is eventual by an extra re-arm.
+/// The reported sibling is the witness in every round, so the negative is read
+/// against a stream that was demonstrably still flowing — which is also the
+/// liveness half of the claim, since a barrier that wedged the scope would take
+/// the marker with it.
+#[tokio::test]
+async fn a_rename_burst_past_the_geometry_bound_still_fences_the_exclusion() {
+  let root = scratch_root("geometry-bound");
+  // OUTSIDE the watched root: a rename into it reports a source half and no
+  // destination half, which is exactly the residue the bound exists for.
+  let away = scratch_root("geometry-bound-away");
+  std::fs::create_dir_all(root.join("b/cache")).unwrap();
+  std::fs::create_dir_all(root.join("b/keep")).unwrap();
+  // Comfortably more than the deferred set's bound, so the burst spends it and
+  // keeps spending it.
+  const MOVE_OUTS: u32 = 96;
+  for i in 0..MOVE_OUTS {
+    std::fs::create_dir_all(root.join(format!("gone{i}"))).unwrap();
+  }
+
+  let mut w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::Inotify)
+      .with_exclusions(vec![root.join("a/cache")]),
+  )
+  .expect("build watcher");
+  let _h = w.watch(&root, Interest::all()).await.expect("watch");
+
+  // Staging: nothing excludes `<root>/b/cache` yet, so it is covered and
+  // delivering — the subtree the rename is about to move under the exclusion
+  // really does carry its own kernel watch.
+  assert!(
+    child_watch_delivers(&mut w, &root.join("b/cache"), "arm").await,
+    "before the burst the subtree is reported, so it carries its own watch"
+  );
+
+  for i in 0..MOVE_OUTS {
+    std::fs::rename(root.join(format!("gone{i}")), away.join(format!("gone{i}"))).unwrap();
+  }
+  std::fs::rename(root.join("b"), root.join("a")).unwrap();
+
+  assert!(
+    child_watch_goes_quiet(&mut w, &root.join("a/cache"), &root.join("a/keep"), "post").await,
+    "past the bound the subtree the rename moved under the exclusion must still \
+     stop being covered — while the reported sibling in the same directory keeps \
+     delivering, so the barrier covered the read it dropped instead of wedging \
+     the scope"
+  );
 }
