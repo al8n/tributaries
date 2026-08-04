@@ -8,10 +8,10 @@ use crate::{
   capabilities::Capabilities,
   change::{Change, ChangeKind},
   error::WatchError,
-  id::{ChangeId, Epoch, Identity, MoveCookie, ReqId, ScopeId, Sequence, WatchId},
+  id::{ArmAttempt, ChangeId, Epoch, Identity, MoveCookie, ReqId, ScopeId, Sequence, WatchId},
   interest::Interest,
   path::{Location, Segment},
-  record::{EnumerateResult, OsRecord, RecordKind},
+  record::{DirEntry, EnumerateResult, Evidence, FileKind, OsRecord, RecordKind, StatResult},
   scope::Scope,
   time::Instant,
 };
@@ -101,6 +101,97 @@ impl NodeState {
           ..
         }
     )
+  }
+}
+
+/// What a [`Monitor::reparent`] re-key does to the ABSOLUTE paths under it —
+/// the one question the placement clock
+/// ([`Monitor::placement_now`](Monitor::placement_now)) turns on, and one the
+/// re-key itself cannot answer: both flavors re-key exactly the same links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reparent {
+  /// A rename landed: the subtree occupies a different path than it did, so
+  /// every coordinate lowered against it is now addressed at a location it has
+  /// left.
+  Moved,
+  /// A widen splice re-described the same objects from a higher root. The new
+  /// chain exactly compensates the new root, so no absolute path changed and no
+  /// lowered coordinate went stale — recording a move here would re-issue every
+  /// round trip in flight under the old root, for a splice whose whole contract
+  /// is that it disturbs nothing.
+  Rerooted,
+}
+
+/// What a completing round trip's LOWERED path is worth — the single statement
+/// of the trust test every arm, read and stat completion applies, answered by
+/// [`Monitor::fence_lowering`](Monitor::fence_lowering).
+///
+/// # One invariant
+///
+/// Every round trip is issued as an identity-relative coordinate the driver
+/// LOWERS to an absolute path before the I/O, and its result describes that
+/// path. The path is the node's only when BOTH clauses hold:
+///
+/// - the anchor's chain has not moved since the round trip was stamped, and
+/// - the path was not ALREADY knowingly stale when it was stamped.
+///
+/// The placement clock answers the first. The second is the hold: a
+/// detached-and-held move source reconstructs at its pre-move path for the whole
+/// pairing window BY DESIGN, so a coordinate lowered anywhere in its subtree is
+/// born addressed at a slot the object has left — and no move happens after such
+/// an issue, which is exactly why the clock alone can never see it.
+///
+/// # Why two fields and not one verdict
+///
+/// Both clauses can fail at once (a stat issued before a `MovedFrom` completing
+/// during the hold fails both), and they are separately actionable: the clock
+/// says the RESULT is not evidence, the hold says the PATH may not be addressed.
+/// Collapsing them into one prioritized answer loses whichever the winner does
+/// not imply — a held-and-moved read would keep reconciling a listing taken
+/// somewhere else. They are asked together, once, so a site cannot answer half
+/// the invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Lowering {
+  /// The detached-and-held move source whose subtree this coordinate lowers
+  /// inside, if any. Its recovery belongs to the hold's pairing — which
+  /// [`fence_lowering`](Monitor::fence_lowering) books by dirtying it — so
+  /// nothing here may be ADDRESSED at the reconstruction. The coverage the round
+  /// trip carries is still performed, best-effort, exactly as every other
+  /// held-subtree activity is: the design deliberately arms, reads and
+  /// reconciles under a hold so the subtree is complete when it reparents.
+  held: Option<WatchId>,
+  /// Whether a node on the anchor's CURRENT chain changed placement after the
+  /// stamp. The driver then read somebody else's path, so the payload is not
+  /// evidence about this node at all and is discarded; the recovery is
+  /// re-addressed at wherever the node has landed. A round trip that INSTALLED
+  /// something at that path owes more than the discard — see
+  /// [`Monitor::ingest_watch_result`], which retires the binding a stale arm
+  /// reports and rebuilds the slot counted behind a cover.
+  moved: bool,
+}
+
+impl Lowering {
+  /// Whether this result may be ADDRESSED at the reconstruction — a located
+  /// `Rescan`, a `Created`, a delivered cover. False under a hold, where the
+  /// reconstruction names the vacated pre-move path and the pairing owes the
+  /// destination's `Rescan` and re-arm instead.
+  const fn locatable(&self) -> bool {
+    self.held.is_none()
+  }
+
+  /// Whether the result's payload is evidence about the node it names — a
+  /// listing that may be reconciled as an inventory, an acknowledgement that may
+  /// certify a binding.
+  ///
+  /// BOTH clauses must be clean. A moved chain means the driver read somebody
+  /// else's path; a hold means the path was ALREADY the vacated pre-move one
+  /// when the round trip was stamped, so the payload describes whatever occupies
+  /// the slot the subtree has left. Detecting a stale lowering is not the same
+  /// as making its payload safe to act on: booking the hold's debt says the
+  /// pairing owes a recovery, it does not say this listing may prune, this
+  /// answer may retire, or this acknowledgement may certify.
+  const fn is_evidence(&self) -> bool {
+    !self.moved && self.held.is_none()
   }
 }
 
@@ -198,6 +289,9 @@ enum DeficitDischarge {
   /// The crawl's own re-install heals it through the
   /// [`install_child`](Monitor::install_child) interlock, or it stays booked
   /// for the dispatch re-signal until the vanish's `Removed` converges it.
+  /// This discharges the ERASED DEFICIT only; retiring the coverage itself is
+  /// covered separately by the crawl's own opening `Rescan`, which a
+  /// deficit-free drop still owes.
   Reanchor,
   /// Terminal teardown of the scope (unregister, root invalidation, rebind):
   /// the caller's unconditional terminal/commit `Rescan` and whole-book wipe
@@ -210,6 +304,142 @@ enum DeficitDischarge {
   UnsubscribedPrune,
 }
 
+/// Declares a fieldless enum together with its `ALL` slice from ONE
+/// written-out variant list, so the enum and `ALL` cannot drift apart: both
+/// are expansions of the same input tokens rather than two hand-synced
+/// lists, so a variant is either in both or in neither — never in one alone.
+macro_rules! enum_with_all {
+  (
+    $(#[$enum_meta:meta])*
+    enum $name:ident {
+      $(
+        $(#[$variant_meta:meta])*
+        $variant:ident,
+      )+
+    }
+  ) => {
+    $(#[$enum_meta])*
+    #[derive(Debug, Clone, Copy)]
+    enum $name {
+      $(
+        $(#[$variant_meta])*
+        $variant,
+      )+
+    }
+
+    impl $name {
+      /// Every variant, generated together with the enum above from the same
+      /// written-out list (`enum_with_all!`): there is no second list a
+      /// variant could be added to (or left out of) on its own.
+      const ALL: &[Self] = &[
+        $(Self::$variant,)+
+      ];
+    }
+  };
+}
+
+enum_with_all! {
+  /// Every per-node marker [`drop_subtree`](Monitor::drop_subtree)'s walk
+  /// reclaims — the side-table entries a dying watch takes with it.
+  ///
+  /// The walk is the SINGLE destruction point all of them pass through, and each
+  /// erasure is a coverage question with its own answer ([`ErasedCover`]).
+  /// Enumerating the markers here, instead of open-coding one removal per marker
+  /// inside the walk, is what keeps that answer from being forgotten:
+  /// [`reclaim_node_marker`](Monitor::reclaim_node_marker)'s match is exhaustive,
+  /// so a marker cannot join the walk without STATING what erasing it owes, and
+  /// [`ALL`](Self::ALL) is what the walk iterates, so a stated answer cannot then
+  /// go unasked.
+  ///
+  /// This is a rule about a class, not about one marker: a marker whose erasure
+  /// silently discharged nothing has twice reached the walk by way of a
+  /// booking-site argument that did not survive the node dying under it, and a
+  /// per-marker rule cannot fail loudly for the marker nobody has added yet.
+  enum NodeMarker {
+    /// The node's outstanding [`Action::Enumerate`](crate::Action::Enumerate),
+    /// with any coalesced re-arm obligation riding on it
+    /// ([`latent_cold`](Monitor::latent_cold)).
+    Enumerate,
+    /// Every outstanding [`Action::Stat`](crate::Action::Stat) addressed to one
+    /// of the node's slots, and the dedup index mirroring them.
+    StatSlots,
+    /// The node's detached-and-held move-source membership
+    /// ([`held_sources`](Monitor::held_sources)) and its per-scope mirror.
+    HeldSource,
+    /// The debt a hold accrued from activity suppressed at its stale pre-move
+    /// path ([`dirtied_holds`](Monitor::dirtied_holds)).
+    DirtiedHold,
+    /// A descent a read deferred to a slot's stat and booked against this node
+    /// ([`owed_descents`](Monitor::owed_descents)).
+    OwedDescent,
+    /// The ACK-postdates-loss stamp of an outstanding reprove arm
+    /// ([`reprove_stamps`](Monitor::reprove_stamps)).
+    ReproveStamp,
+    /// An unverified same-transport adoption edge awaiting this node's read
+    /// ([`pending_adoptions`](Monitor::pending_adoptions)).
+    Adoption,
+    /// The coverage deficits anchored at this node (see [`DeficitBook`]).
+    Deficits,
+  }
+}
+
+/// What erasing one [`NodeMarker`] owes the scope — the whole vocabulary
+/// [`drop_subtree`](Monitor::drop_subtree)'s walk understands.
+///
+/// A marker records coverage the monitor took responsibility for, so its
+/// destruction is a loss unless something else already covers the same
+/// interval. The answer belongs to the marker rather than to the consumer:
+/// the walk destroys every variant wholesale, and a consumer that reasoned
+/// about only the markers it knew of is exactly how an erased one goes
+/// uncovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErasedCover {
+  /// Nothing: the marker carries no coverage of its own, so erasing it is not
+  /// a loss and a drop that erased only these stays silent.
+  Nothing,
+  /// The caller's [`DeficitDischarge`] reason — the covering `Rescan`'s two
+  /// bridge bits, or the re-anchored slot deficit at the surviving parent.
+  Discharge,
+  /// A COUNTED covering re-read
+  /// ([`stand_counted_cover`](Monitor::stand_counted_cover)), owed
+  /// independently of the deficit condition `Discharge` rides: the object
+  /// provably SURVIVES, so "erased nothing, so owes nothing" does not reach
+  /// it and its dead handles keep carrying a live object's records.
+  Counted,
+}
+
+/// What one walk of [`drop_subtree`](Monitor::drop_subtree) erased, folded
+/// across its nodes and its markers.
+#[derive(Debug, Clone, Copy, Default)]
+struct ErasedCovers {
+  /// Some marker owed the caller's discharge reason.
+  discharge: bool,
+  /// Some marker owed a counted covering re-read.
+  counted: bool,
+}
+
+impl ErasedCovers {
+  /// Folds one marker's answer in — the ONE place an [`ErasedCover`] is
+  /// consumed, so no answer can be computed and then dropped.
+  fn absorb(&mut self, cover: ErasedCover) {
+    match cover {
+      ErasedCover::Nothing => {}
+      ErasedCover::Discharge => self.discharge = true,
+      ErasedCover::Counted => self.counted = true,
+    }
+  }
+}
+
+/// The [`WatchNode::moved_at`] reading of a node whose own placement has never
+/// changed.
+///
+/// The clock is advanced BEFORE a change is recorded against it
+/// ([`Monitor::moved_placement`]), so the least reading any real move can carry
+/// is 1 — which is what lets "never moved" be a reading rather than a second
+/// field, and what makes it compare correctly against every stamp: `0` is
+/// greater than no stamp, so a node that has not moved can never make one stale.
+const NEVER_MOVED: u64 = 0;
+
 /// One node in the parent-relative watch tree.
 ///
 /// Paths are reconstructed by walking `parent` links to a root, so a node stores
@@ -221,6 +451,51 @@ struct WatchNode {
   name: Option<Segment>,
   scope: ScopeId,
   is_dir: bool,
+  /// The arm attempt this handle is currently bound to — the most recent one
+  /// issued for it. A [`Monitor::on_watch_result`] naming any other attempt
+  /// answers for an arm some later one superseded and is discarded, so a stale
+  /// outcome (above all a `Err` from a retired transport) can never invalidate
+  /// the binding that replaced it. Written only by
+  /// [`Monitor::queue_watch`](Monitor::queue_watch) and by the out-of-band
+  /// re-arm funnel ([`Monitor::adopt_arm`](Monitor::adopt_arm)); a node is born
+  /// with the attempt its first arm carries.
+  attempt: ArmAttempt,
+  /// The PLACEMENT clock reading ([`Monitor::placement_now`]) at which this
+  /// node's outstanding round trip was issued — its pending arm, or its
+  /// in-flight enumerate. [`NodeState`] makes those mutually exclusive, so one
+  /// stamp serves both.
+  ///
+  /// The driver LOWERS an identity-relative coordinate to an absolute path
+  /// before the I/O, and that path is a fact about where the node was, not a
+  /// name for the node. Read back against
+  /// [`placement_moved_since`](Monitor::placement_moved_since) it says whether
+  /// the path the driver used still describes this node. Written wherever a
+  /// round trip is ISSUED — [`Monitor::queue_watch`](Monitor::queue_watch),
+  /// [`Monitor::adopt_arm`](Monitor::adopt_arm),
+  /// [`Monitor::queue_enumerate`](Monitor::queue_enumerate) — and at birth, like
+  /// `attempt`.
+  placement: u64,
+  /// The PLACEMENT clock reading at which THIS node's own placement last
+  /// changed: its slot was vacated ([`Monitor::detach_child`]) or re-keyed by a
+  /// rename ([`Monitor::reparent`]), or — for a root — the driver's root bytes
+  /// were replaced under it ([`Monitor::rebind_root`]). Born [`NEVER_MOVED`],
+  /// and written ONLY by [`Monitor::moved_placement`].
+  ///
+  /// A lowered path is `root_bytes ⊕ names along the parent chain`, so it stops
+  /// describing its node exactly when one link OF THAT CHAIN changes. Recording
+  /// the change on the node it happened to — rather than on the whole scope — is
+  /// what keeps an unrelated rename from invalidating in-flight work elsewhere,
+  /// at the cost of an ancestor walk when a result lands (see
+  /// [`Monitor::placement_moved_since`]).
+  ///
+  /// A birth is not a placement change, so it must not read as one. Stamping a
+  /// newborn with the clock's CURRENT value would make it postdate any older
+  /// outstanding request — and a splice that puts a newborn on such a request's
+  /// chain while preserving every absolute path
+  /// ([`Reparent::Rerooted`](Reparent::Rerooted), the widen) would then reject a
+  /// result nothing invalidated, once for every request in flight, whenever some
+  /// unrelated scope happened to rename in between.
+  moved_at: u64,
   /// The object identity this watch was installed for, if the driver supplied one.
   /// Compared against a fresh enumerate's entry identities during a re-arm to keep a
   /// surviving watch versus rebuild a same-name replacement (see [`Identity`]).
@@ -267,6 +542,12 @@ struct PendingMove {
   /// A held source is definitionally a watched directory; otherwise this is whatever
   /// the source record reported.
   is_dir: Option<bool>,
+  /// The facts the source record proved, carried so a resolution that outlives
+  /// the record — a timeout's stranded `Removed`, an unanchored pair's
+  /// `Created` — is still admitted on the move the half witnessed. Without it a
+  /// `moved`-only subscriber would receive neither half of an unpairable
+  /// rename nor anything covering it.
+  evidence: Evidence,
   /// Whether subtree activity interleaved with this half's pairing window: a record or
   /// located overflow whose location mutual-prefixes the pending source landed while
   /// the half was parked. Such activity described a REPLACEMENT at the source, which
@@ -286,6 +567,69 @@ struct PendingMove {
   dirty: bool,
 }
 
+impl PendingMove {
+  /// Whether this half may still pair at `now` — the ONE definition of the
+  /// pairing window, shared by the destination that consumes a half
+  /// ([`Monitor::on_moved_to`]), the timeout that strands one
+  /// ([`Monitor::handle_timeout`]), and the reparenting precondition
+  /// ([`Monitor::reparenting_source`]). A second spelling of the same comparison
+  /// is how a half becomes pairable to one of them and expired to another.
+  fn in_window(&self, now: Instant) -> bool {
+    !now.reached(self.deadline)
+  }
+}
+
+/// The downward re-arm a read that deferred to a slot stat owes the slot's
+/// INCUMBENT watch — the descent that read could not perform, because it could
+/// not tell whether the incumbent's object was still the one at that name.
+///
+/// Owed to the WATCH, not to the slot: it is booked in
+/// [`owed_descents`](Monitor::owed_descents) under the incumbent's
+/// [`WatchId`], which a reparent preserves, rather than under the
+/// `(parent, name)` the stat is addressed to, which a rename empties while the
+/// object it named lives on.
+///
+/// Ordered by strength (`Rearm` < `Reprove`), and compared as an `Option` whose
+/// `None` is weaker than either: a stat already outstanding for a slot is
+/// re-encountered by later reads, so its obligation is UPGRADED with `max` and
+/// can never be downgraded to the flavor of whichever read happened to queue it
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StatDescent {
+  /// Re-arm the survivor downward, so a directory created under it during the
+  /// deferral is armed rather than left blind.
+  Rearm,
+  /// As [`Rearm`](Self::Rearm), and the survivor's own binding must be
+  /// RE-PROVEN by an acknowledged re-add first — the flavor of a reprove
+  /// crawl, whose retained descendants may be identity-matched yet unbound.
+  Reprove,
+}
+
+/// The slot one outstanding [`Action::Stat`](crate::Action::Stat) must settle:
+/// a name under a watched parent whose listed kind was
+/// [`FileKind::Unknown`](crate::FileKind::Unknown).
+///
+/// The request carries the slot and nothing else. The descent a deferring read
+/// owes lives in [`owed_descents`](Monitor::owed_descents) keyed by the
+/// incumbent watch (see [`StatDescent`]) — a request that carried it would tie
+/// the obligation to this coordinate, and the object that owes it can leave the
+/// coordinate before the answer lands. The COVER a retirement owes is likewise
+/// not carried here — it is decided from what the answer actually did to the
+/// slot ([`Monitor::settle_stat_slot`]), so an absent or unrecognized obligation
+/// still ends in a cover rather than silence.
+#[derive(Debug, Clone)]
+struct StatSlot {
+  parent: WatchId,
+  name: Segment,
+  scope: ScopeId,
+  /// The PLACEMENT clock reading ([`Monitor::placement_now`]) this request was
+  /// issued at. The slot key survives a rename of the parent — that is the whole
+  /// point of keying by `(parent, name)` — but the PATH the driver lowered it to
+  /// does not, so an answer whose parent chain moved since is describing the
+  /// vacated path and must not settle the slot the parent now occupies.
+  placement: u64,
+}
+
 /// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
 /// backend instance, and disjoint roots may live on separate instances whose
 /// cookies collide, so the cookie is namespaced by its [`ScopeId`]: a destination
@@ -299,6 +643,39 @@ type PendingKey = (ScopeId, MoveCookie);
 /// contiguous range of [`PendingKey`]s.
 const FIRST_COOKIE: MoveCookie = MoveCookie::new(NonZeroU64::MIN);
 
+/// How many half-resolved renames ONE scope may park in
+/// [`pending_moves`](Monitor::pending_moves) at once.
+///
+/// A parked half retires when its destination arrives, when its pairing window
+/// elapses ([`Monitor::handle_timeout`]), or with the scope itself — so the store
+/// holds only renames still inside one window, which real workloads keep orders of
+/// magnitude below this. Without a bound, though, a scope that mints unique
+/// unpairable cookies faster than the window retires them retains a `PendingMove`
+/// and a detached watched subtree per cookie for as long as it keeps that up: an
+/// adversarial stream buys unbounded retention, and every per-record pass over the
+/// scope's halves degrades with it.
+///
+/// The bound is per-SCOPE, not global, so one scope's burst cannot starve the
+/// halves of an unrelated root; the driver bounds how many scopes are live, so
+/// bounded-scopes × this is bounded overall.
+///
+/// # Behaviour at the bound
+///
+/// It REFUSES, never evicts: a source arriving at a full scope is not parked, and
+/// is therefore a source that can never pair — it takes the same unpairable path a
+/// cookieless source takes ([`Monitor::on_moved_from`]), tearing its held subtree
+/// down under a covering discharge and degrading to the `Removed` that path owes.
+/// Evicting instead would forget a half whose destination is still coming and
+/// silently drop the rename.
+///
+/// It is asked only of a source that would GROW the store. A cookie already parked
+/// is a REPLACEMENT: it rewrites one key in place, so the high-water mark is
+/// exactly where it was and there is nothing for the bound to defend. Refusing one
+/// would be worse than admitting it, not safer — the store would keep the half the
+/// replacement should have displaced, and pair that half's destination against a
+/// source rename never had.
+const PENDING_MOVE_CAP: usize = 64;
+
 /// A delivery-dedup key: a change is suppressed only if an identical one is still
 /// queued. Two changes are "identical" when they share a scope, location, kind
 /// discriminant, and — for a [`ChangeKind::Moved`] — the same source location.
@@ -308,7 +685,8 @@ type DedupKey = (ScopeId, Location, u8, Option<Location>);
 
 /// What now occupies a child slot, as reported by a slot-changing record. `Dir`
 /// is the only kind the core descends into (and thus watches per-directory);
-/// `File` and `Gone` both mean the slot must hold no watch. Consumed by
+/// `File` and `Gone` both mean the slot must hold no watch; `Unknown` is
+/// unsettled and must be resolved before either can be decided. Consumed by
 /// [`Monitor::reconcile_slot`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SlotOccupant {
@@ -318,6 +696,12 @@ enum SlotOccupant {
   File,
   /// The slot's object was removed: drop any watch it had.
   Gone,
+  /// The occupant's kind could not be told from what the driver reported. It is
+  /// NOT a non-directory: reading it as one would leave a real directory
+  /// unwatched with no watch, no deficit and no `Rescan` — a subtree blind for
+  /// as long as the process lives. The slot is booked as darkness and settled
+  /// by an [`Action::Stat`](crate::Action::Stat) instead.
+  Unknown,
 }
 
 /// How [`Monitor::rearm_watch_subtree`] (or an internal re-arm trigger) recorded a
@@ -356,6 +740,72 @@ impl RearmKickoff {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_coalesced(&self) -> bool {
     matches!(self, Self::Coalesced)
+  }
+}
+
+/// What feeding one [`OsRecord`] to [`Monitor::on_os_record`] did to the watch
+/// tree's SHAPE — the geometry a consumer that keeps its own per-scope bookkeeping
+/// keyed by path must follow.
+///
+/// A consumer learns this from the call that performed it rather than by
+/// re-deciding it from the same inputs. That is the whole point of the type: a
+/// predicted reparent and a performed one are two implementations of one rule, and
+/// two implementations drift. An outcome returned by the operation cannot — it is
+/// the operation's own report. It also covers the case no read-only accessor could
+/// see: a reparent the Monitor set out to perform and then *failed* leaves no trace
+/// in the resulting tree, yet a consumer that predicted it would already have moved
+/// its own anchor.
+///
+/// Deliberately NOT `#[must_use]`. `Nothing` is the outcome of essentially every
+/// record and carries no obligation whatever, so a blanket must-use would put a
+/// `let _ =` on nearly every feed — and a codebase trained to write `let _ =` on
+/// this call is exactly how a real [`Reparented`](Self::Reparented) gets dropped.
+/// The crate reserves `#[must_use]` for values that always carry an obligation
+/// (see [`RearmKickoff`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordOutcome {
+  /// The record moved no watched subtree between parents. Every record kind
+  /// reports this except the one below — including a `MovedTo` that paired past
+  /// its window, one whose source held no watched subtree, one with no cookie,
+  /// and one whose reparent was *attempted and rejected* (a cyclic destination,
+  /// or an endpoint the attempt's own teardown removed). A consumer re-anchors
+  /// exactly when the Monitor reparented, and never when it did not.
+  Nothing,
+  /// A paired, in-window [`RecordKind::MovedTo`] over a held watched directory
+  /// whose O(1) reparent SUCCEEDED, reporting the source slot as it stood
+  /// immediately BEFORE that reparent.
+  ///
+  /// The slot is a `(from_parent, from)` pair, not an absolute path pinned when
+  /// the source's `MovedFrom` arrived: `from` is reconstructed from the live tree
+  /// at report time, so a source whose own ancestor was reparented mid-window is
+  /// described by where it actually was, not where it started. Capturing it
+  /// pre-reparent is what makes it the path the consumer's own bookkeeping is
+  /// still keyed by; it is stable across the reparent that follows because a
+  /// `from_parent` is never inside the subtree its child is moving.
+  Reparented {
+    /// The watch the source half's [`RecordKind::MovedFrom`] arrived on — the
+    /// anchor `from` was reconstructed against, still watched at report time.
+    from_parent: WatchId,
+    /// The moved subtree's scope-relative location immediately before the
+    /// reparent.
+    from: Location,
+  },
+}
+
+impl RecordOutcome {
+  /// Whether this is [`Nothing`](Self::Nothing).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_nothing(&self) -> bool {
+    matches!(self, Self::Nothing)
+  }
+
+  /// The pre-reparent source slot, or `None` for [`Nothing`](Self::Nothing).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn reparented(&self) -> Option<(WatchId, &Location)> {
+    match self {
+      Self::Nothing => None,
+      Self::Reparented { from_parent, from } => Some((*from_parent, from)),
+    }
   }
 }
 
@@ -435,6 +885,7 @@ pub struct Monitor {
   watch_ids: Sequence,
   req_ids: Sequence,
   change_ids: Sequence,
+  arm_attempts: Sequence,
 
   nodes: BTreeMap<WatchId, WatchNode>,
   /// `(parent, name) -> child watch`, kept in lockstep with `nodes`, so descent
@@ -473,6 +924,41 @@ pub struct Monitor {
   /// the whole re-arm coalescing/retry state that used to live in four side-tables is
   /// now the node's [`NodeState`].
   pending_enumerate: BTreeMap<ReqId, WatchId>,
+  /// Maps an outstanding [`Action::Stat`](crate::Action::Stat) to the slot
+  /// whose kind it must settle. An entry exists only while the answer is owed,
+  /// and an UNWATCHED such slot carries a recorded coverage deficit for exactly
+  /// as long — so a driver that never answers leaves standing darkness the
+  /// dispatch re-signal keeps covering, never silence. Deliberately NOT a
+  /// conjunct of [`coverage_settled`](Self::coverage_settled): an unanswered
+  /// stat must degrade to a re-signalled `Rescan`, not wedge every barrier of
+  /// the scope.
+  pending_stat: BTreeMap<ReqId, StatSlot>,
+  /// The slots [`pending_stat`](Self::pending_stat) currently owes an answer
+  /// for, mapped to the request that owes it, so asking twice for one is an
+  /// O(log n) decision rather than a scan of every outstanding request. Mirrors
+  /// that map's slots exactly (asserted by the test invariant checker).
+  stat_slots: BTreeMap<(WatchId, Segment), ReqId>,
+  /// The downward descent each watch is OWED by a read that deferred to its
+  /// slot's stat ([`StatDescent`]), keyed by the watch itself.
+  ///
+  /// Keyed by identity, deliberately, and this is the whole point: a stat is
+  /// addressed to a `(parent, name)` coordinate, and a rename empties that
+  /// coordinate while the object that owes the descent lives on — detached,
+  /// held, and about to be reparented with its subtree and its unproven
+  /// bindings intact. An obligation keyed to the slot is settled against
+  /// nothing by such an answer; one keyed to the watch rides the reparent and
+  /// is discharged there ([`on_moved_to`](Self::on_moved_to)).
+  ///
+  /// An entry is UPGRADED, never downgraded
+  /// ([`defer_stat_descent`](Self::defer_stat_descent)), and leaves the book
+  /// exactly three ways: the stat's answer settles it against the incumbent it
+  /// still finds ([`ingest_stat_result`](Self::ingest_stat_result)); a reparent
+  /// discharges it against the identity it carried; or the owing watch is
+  /// destroyed, which stands a counted cover
+  /// ([`drop_subtree`](Self::drop_subtree)) rather than resolving toward
+  /// silence. Bounded by the live node count, since the third exit is the one
+  /// every death passes through.
+  owed_descents: BTreeMap<WatchId, StatDescent>,
   /// Half-resolved renames awaiting their destination, keyed by `(scope, cookie)`.
   ///
   /// A parked half is a transition already consumed from the backend whose normalized
@@ -494,6 +980,12 @@ pub struct Monitor {
   /// went dead resolves fresh — the prior half was consumed, expired, or
   /// guard-discarded; (d) cross-scope identical cookies are isolated by the
   /// composite key (`on_moved_from` / `on_moved_to`).
+  ///
+  /// Each scope's population is bounded by [`PENDING_MOVE_CAP`]: a source that
+  /// would take a scope past it is refused before it is parked
+  /// ([`admits_pending_move`](Self::admits_pending_move)), which is what keeps a
+  /// stream of unpairable renames from retaining halves — and their detached
+  /// subtrees — without limit.
   pending_moves: BTreeMap<PendingKey, PendingMove>,
   /// Watched-directory move sources currently detached-and-held for their pairing window
   /// (the `held` of some [`PendingMove`]). A record arriving on such a source — or any
@@ -504,8 +996,14 @@ pub struct Monitor {
   /// Held sources (a subset of [`held_sources`](Self::held_sources)) that had a record
   /// suppressed during the hold, so the O(1) reparent alone would lose it: on pairing,
   /// such a source's destination gets a `Rescan` and a re-arm rather than a silent move.
+  ///
+  /// Membership is the whole answer. What the hold suppressed is content — a
+  /// record, a delivery, a listing that could not be reconciled — and a re-read of
+  /// the destination recovers all of it. A BINDING doubt never lands here: an
+  /// acknowledgement that could not certify retires its binding at the seam
+  /// ([`ingest_watch_result`](Self::ingest_watch_result)) instead of leaving one
+  /// for the pairing to re-prove.
   dirtied_holds: BTreeSet<WatchId>,
-
   /// Per-scope bridge-window flags (see [`BridgeFlags`]), flushed into a
   /// closing `Rescan` at the scope's settle edge by
   /// [`settle_bridges`](Self::settle_bridges).
@@ -570,6 +1068,19 @@ pub struct Monitor {
   /// (see [`reprove_stamps`](Self::reprove_stamps)). Entries die with the
   /// scope (unregister / root invalidation).
   loss_gens: BTreeMap<ScopeId, u64>,
+  /// The PLACEMENT clock: a monotone reading stamped on every round trip when
+  /// it is issued, and on every node whose own placement changes. It is the
+  /// invalidation machinery for every coordinate the driver has LOWERED to an
+  /// absolute path and still holds across an I/O — see
+  /// [`placement_now`](Self::placement_now) and
+  /// [`placement_moved_since`](Self::placement_moved_since).
+  ///
+  /// Deliberately ONE clock rather than one per scope: it is never compared
+  /// across nodes, only against the readings recorded on a single node's own
+  /// ancestor chain, so a shared ticker costs nothing and has no per-scope
+  /// lifecycle to keep in step (a per-scope counter reclaimed at scope death
+  /// would reset under any stamp that outlived it).
+  placement_clock: u64,
   /// The loss generation each outstanding reprove arm was issued under —
   /// keyed by the arming node, mirroring `Arming { reprove: true }`
   /// membership exactly (asserted by the test invariant checker). A stamp
@@ -593,6 +1104,7 @@ impl Monitor {
       watch_ids: Sequence::new(),
       req_ids: Sequence::new(),
       change_ids: Sequence::new(),
+      arm_attempts: Sequence::new(),
       nodes: BTreeMap::new(),
       child_index: BTreeMap::new(),
       roots: BTreeMap::new(),
@@ -601,6 +1113,9 @@ impl Monitor {
       scope_profiles: BTreeMap::new(),
       rearm_pending: BTreeMap::new(),
       pending_enumerate: BTreeMap::new(),
+      pending_stat: BTreeMap::new(),
+      stat_slots: BTreeMap::new(),
+      owed_descents: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
       held_sources: BTreeSet::new(),
       dirtied_holds: BTreeSet::new(),
@@ -612,6 +1127,7 @@ impl Monitor {
       adopting_by_scope: BTreeMap::new(),
       coverage_work_epochs: BTreeMap::new(),
       loss_gens: BTreeMap::new(),
+      placement_clock: 0,
       reprove_stamps: BTreeMap::new(),
       actions: VecDeque::new(),
       events: VecDeque::new(),
@@ -695,11 +1211,21 @@ impl Monitor {
   /// the darkness a deficit records may have absorbed the very loss that
   /// killed the anchor's retained subtree, and the healing crawl must then
   /// re-add what it keeps, not merely re-list it.
+  ///
+  /// [`inherit_rearm`](Self::inherit_rearm), never
+  /// [`start_rearm`](Self::start_rearm): the re-signal CLEARS the entry it kicks
+  /// for, so a kick a bare re-arm REFUSES — which is what it answers for an
+  /// `Arming` anchor, the state a widen's freshly-spliced root sits in until its
+  /// pre-arm outcome is replayed — would retire the recorded darkness with
+  /// nothing counted standing in for it, and the scope would read settled and
+  /// deficit-free over an interior no crawl ever revisited. The `Arming` arm
+  /// marks the post-arm read instead, so the heal is counted in every state
+  /// (`start_reinstall` already is).
   fn heal_kick(&mut self, scope: ScopeId, dir: WatchId) {
     if self.scope_needs_reproof(scope) {
       self.start_reinstall(dir);
     } else {
-      let _ = self.start_rearm(dir);
+      let _ = self.inherit_rearm(dir);
     }
   }
 
@@ -709,6 +1235,141 @@ impl Monitor {
   /// this loss) while the recovery's own arms stamp current.
   fn bump_loss_gen(&mut self, scope: ScopeId) {
     *self.loss_gens.entry(scope).or_insert(0) += 1;
+  }
+
+  /// The current reading of the placement clock — what a round trip is STAMPED
+  /// with when it is issued ([`WatchNode::placement`], [`StatSlot::placement`]).
+  ///
+  /// # What the stamp is for
+  ///
+  /// Every round trip the Monitor asks a driver for — an arm, an enumerate, a
+  /// stat — is issued as an identity-relative coordinate (`(parent, name)`, or a
+  /// handle) that the driver LOWERS to an absolute path before the I/O. The
+  /// coordinate survives a rename; the lowered path does not. A result is
+  /// evidence about the node it names only if the tree still denotes the path
+  /// the driver read, and the stamp read back through
+  /// [`placement_moved_since`](Self::placement_moved_since) is what decides that.
+  /// A result that fails the test proves nothing and is never accepted as clean.
+  fn placement_now(&self) -> u64 {
+    self.placement_clock
+  }
+
+  /// Records that `watch`'s own placement just changed, advancing the clock so
+  /// every round trip already in flight against it — or against anything below
+  /// it — can be told apart from one issued afterwards.
+  ///
+  /// # The three funnels, and why that set is complete
+  ///
+  /// The path a coordinate lowers to is `driver_root(scope) ⊕ location_of(w)`,
+  /// where `location_of` walks the node's `(parent, name)` links to the root.
+  /// A lowered path therefore stops describing its node exactly when one of
+  /// three things happens, and each has one funnel:
+  ///
+  /// - the OBJECT leaves its slot while the tree still reconstructs the old path
+  ///   — [`detach_child`](Self::detach_child), the one detach funnel every
+  ///   watched-directory move source passes through. The reconstruction is
+  ///   knowingly stale for the whole hold, so this is the edge at which every
+  ///   coordinate under the source went bad, descendants included;
+  /// - a LINK is re-keyed — [`reparent`](Self::reparent) under
+  ///   [`Reparent::Moved`], which is what makes a coordinate issued DURING the
+  ///   hold (a cascade into a held subtree lowers at the pre-move path) stale
+  ///   once the destination is known. A widen splice re-keys under
+  ///   [`Reparent::Rerooted`] and deliberately records nothing: the new chain
+  ///   exactly compensates the new root, so every absolute path is preserved and
+  ///   no lowered coordinate went stale;
+  /// - the scope's ROOT is replaced — [`rebind_root`](Self::rebind_root), where
+  ///   the driver's root bytes change under every node at once. The rebind
+  ///   settles its own tree (children dropped, root arm adopted, root read
+  ///   dropped), but an outstanding stat for a root slot outlives all of that
+  ///   and would otherwise settle the new world with the old world's answer.
+  ///
+  /// Node BIRTH and node DEATH move no surviving node's path, so neither
+  /// records anything: a newborn is born [`NEVER_MOVED`] (a birth reading taken
+  /// off the clock would postdate every older request and invalidate the ones a
+  /// path-preserving splice later routes through it), and a corpse's results are
+  /// already dropped by the "does this node still name this request" checks.
+  ///
+  /// This is the ONE writer of [`WatchNode::moved_at`], which is what makes the
+  /// funnel list above exhaustive rather than aspirational.
+  fn moved_placement(&mut self, watch: WatchId) {
+    self.placement_clock += 1;
+    let now = self.placement_clock;
+    if let Some(node) = self.nodes.get_mut(&watch) {
+      node.moved_at = now;
+    }
+  }
+
+  /// Whether the absolute path a coordinate anchored at `watch` was lowered to
+  /// at clock reading `stamp` may since have stopped describing it: true iff any
+  /// node on `watch`'s CURRENT ancestor chain (itself included) has moved since.
+  ///
+  /// # Why the chain, and not one counter per scope
+  ///
+  /// A per-scope generation would answer this in O(1), and it was the obvious
+  /// shape — but it says "something in this scope moved", not "this path moved",
+  /// so one rename would invalidate every round trip in flight anywhere in the
+  /// scope. That is not a rounding error: during a crawl, dozens to hundreds of
+  /// reads are outstanding at once, each would take a spurious `Rescan` and burn
+  /// one of its [`REARM_MAX_RETRIES`] retries, and a third concurrent rename
+  /// would escalate the whole crawl into interior deficits. Walking the chain
+  /// instead is exact — a rename invalidates precisely the coordinates whose
+  /// path it changed — and it keeps the cost where it belongs: recording a move
+  /// stays O(1) (no subtree is ever walked), and the O(depth) walk is paid once
+  /// per completed round trip, on the same order as the `location_of` this
+  /// result is about to reconstruct anyway.
+  ///
+  /// A detached-and-held node keeps its `parent` link, so the walk still reaches
+  /// the source that moved and the root above it.
+  fn placement_moved_since(&self, watch: WatchId, stamp: u64) -> bool {
+    let mut cursor = Some(watch);
+    // Bounded exactly as [`location_of`](Self::location_of) is, and for the same
+    // reason: this walks the very chain that reconstruction walks, so a tree the
+    // reparent guards could not keep acyclic must not spin here either. Falling
+    // out of the bound answers "not moved" — a re-issue loop over a corrupt tree
+    // would be a worse failure than trusting one result in it, and the invariant
+    // checker fails loudly on such a tree long before this could matter.
+    for _ in 0..self.nodes.len() {
+      let Some(id) = cursor else {
+        return false;
+      };
+      let Some(node) = self.nodes.get(&id) else {
+        return false;
+      };
+      if node.moved_at > stamp {
+        return true;
+      }
+      cursor = node.parent;
+    }
+    debug_assert!(cursor.is_none(), "a placement walk reaches a root");
+    false
+  }
+
+  /// Asks BOTH clauses of the lowered-path trust test for a round trip anchored
+  /// at `watch` and stamped at `stamp` (see [`Lowering`]), and books whatever
+  /// the answer obliges.
+  ///
+  /// Taking `&mut self` is the point: a coordinate that lowers inside a hold
+  /// owes that hold's pairing a re-scan and a re-arm of the destination, and
+  /// that debt is part of learning the answer rather than a second step a site
+  /// can forget. Every completion that learns it was held has, by construction,
+  /// recorded it — which is what makes "held activity defers its recovery to the
+  /// pairing" an invariant instead of a convention repeated per round trip.
+  fn fence_lowering(&mut self, watch: WatchId, stamp: u64) -> Lowering {
+    let held = self.in_held_subtree(watch);
+    if let Some(source) = held {
+      self.book_hold(source);
+    }
+    Lowering {
+      held,
+      moved: self.placement_moved_since(watch, stamp),
+    }
+  }
+
+  /// Records that this hold suppressed something at its vacated pre-move path, so
+  /// its pairing owes the destination a `Rescan` and a re-arm rather than the
+  /// silent O(1) carry-over.
+  fn book_hold(&mut self, source: WatchId) {
+    self.dirtied_holds.insert(source);
   }
 
   /// Whether a watch handle is currently registered (live or pending).
@@ -757,6 +1418,8 @@ impl Monitor {
     caps: Capabilities,
   ) -> WatchId {
     let id = WatchId::new(self.watch_ids.mint());
+    let attempt = self.next_arm_attempt();
+    let placement = self.placement_now();
     self.insert_node(
       id,
       WatchNode {
@@ -764,6 +1427,9 @@ impl Monitor {
         name: None,
         scope,
         is_dir: true,
+        attempt,
+        placement,
+        moved_at: NEVER_MOVED,
         identity: None,
         state: NodeState::Arming {
           rearm: false,
@@ -775,11 +1441,11 @@ impl Monitor {
     self.roots.insert(scope, id);
     self.scope_interests.insert(scope, mask);
     self.scope_profiles.insert(scope, caps);
-    self.actions.push_back(Action::watch(
+    self.queue_watch(
       id,
       crate::action::WatchTarget::Root(scope),
       Self::coverage_mask(mask),
-    ));
+    );
     id
   }
 
@@ -971,14 +1637,24 @@ impl Monitor {
   ///   rebuilds coverage re-arm-flavored — no `Created` spam, the caller's
   ///   covering `Rescan` already stands for the world change.
   ///
-  /// Returns the surviving root `WatchId`, or `None` for an unknown scope or
+  /// Returns the surviving root `WatchId` together with the [`ArmAttempt`] its
+  /// replayed outcome must be reported under, or `None` for an unknown scope or
   /// a [`kernel_recursive`](Capabilities::kernel_recursive) one (a KR swap
   /// replaces the stream whole; there is no per-directory book to rebind).
-  pub fn rebind_root(&mut self, scope: ScopeId) -> Option<WatchId> {
+  pub fn rebind_root(&mut self, scope: ScopeId) -> Option<(WatchId, ArmAttempt)> {
     let root = *self.roots.get(&scope)?;
     if !self.scope_descends(scope) {
       return None;
     }
+    // The driver's root BYTES change under every node of the scope at once, so
+    // every coordinate lowered against the old world is addressed at a path this
+    // world does not have. Ahead of everything below, so the root arm this
+    // method adopts stamps the new world rather than the one it replaced. The
+    // tree's own settlement (children dropped, root read dropped, root arm
+    // superseded) leaves exactly one survivor this reaches instead: an
+    // outstanding stat for a ROOT slot, whose answer would otherwise settle the
+    // new root's slot with the old root's path.
+    self.moved_placement(root);
     let children: std::vec::Vec<WatchId> = self
       .nodes
       .get(&root)
@@ -1025,7 +1701,13 @@ impl Monitor {
     // The rebind's own commit `Rescan` (the caller emits it) owns coverage.
     let _ = self.take_adoption_marker(root, scope);
     self.settle_bridges();
-    Some(root)
+    // The reset arm is the driver's already-executed new-transport arm: rebind
+    // it to a fresh attempt and hand the token back, so the replayed outcome
+    // names THIS arm. Every outcome still in flight from the retired transport
+    // names an older one and is discarded — the fence that keeps a dead world's
+    // synthesized failure from invalidating the live root it never touched.
+    let attempt = self.adopt_arm(root);
+    Some((root, attempt))
   }
 
   /// Mints a fresh [`WatchId`] with NO node behind it — the handle a driver
@@ -1055,7 +1737,8 @@ impl Monitor {
   /// What changes, exhaustively: the new root and chain nodes are inserted
   /// (each chain node an ordinary cold pending-arm child with its
   /// `Action::Watch` queued; the new root queues NOTHING — the caller
-  /// replays its pre-arm outcome via [`on_watch_result`](Self::on_watch_result),
+  /// replays its pre-arm outcome under the returned attempt via
+  /// [`on_watch_result`](Self::on_watch_result),
   /// whose post-arm COLD enumerate discovers the newly covered ground as
   /// `Created`s), the old root's `parent`/`name` re-key under the tail, its
   /// node identity becomes `old_identity` (the replaced world's root identity —
@@ -1072,7 +1755,9 @@ impl Monitor {
   /// escalate loudly on any mismatch (`resolve_adoption`) rather than trust a
   /// silently stale reconstruction.
   ///
-  /// Returns the new root's id (`reserved`), or `None` for an unknown scope, a
+  /// Returns the new root's id (`reserved`) together with the [`ArmAttempt`]
+  /// its replayed pre-arm outcome must be reported under, or `None` for an
+  /// unknown scope, a
   /// [`kernel_recursive`](Capabilities::kernel_recursive) one (a KR widen has
   /// no per-directory book — the stream swap owns it), an empty `chain`, or a
   /// `reserved` id that already names a node (all driver bugs, refused rather
@@ -1087,7 +1772,7 @@ impl Monitor {
     reserved: WatchId,
     chain: std::vec::Vec<Segment>,
     old_identity: Option<Identity>,
-  ) -> Option<WatchId> {
+  ) -> Option<(WatchId, ArmAttempt)> {
     let old_root = *self.roots.get(&scope)?;
     if !self.scope_descends(scope) {
       return None;
@@ -1101,6 +1786,8 @@ impl Monitor {
     // The new root: a plain parentless directory node, cold-arming. Born
     // through the standard funnel (non-re-arm: no counter, no bridge bit) and
     // WITHOUT a queued watch action — the driver already holds its arm outcome.
+    let attempt = self.next_arm_attempt();
+    let placement = self.placement_now();
     self.insert_node(
       reserved,
       WatchNode {
@@ -1108,6 +1795,9 @@ impl Monitor {
         name: None,
         scope,
         is_dir: true,
+        attempt,
+        placement,
+        moved_at: NEVER_MOVED,
         identity: None,
         state: NodeState::Arming {
           rearm: false,
@@ -1145,7 +1835,7 @@ impl Monitor {
     debug_assert!(self.can_reparent(old_root, tail));
     debug_assert!(!self.child_index.contains_key(&(tail, last.clone())));
     assert!(
-      self.reparent(old_root, tail, last.clone()),
+      self.reparent(old_root, tail, last.clone(), Reparent::Rerooted),
       "both splice endpoints are live by construction"
     );
     if let Some(node) = self.nodes.get_mut(&old_root) {
@@ -1160,7 +1850,7 @@ impl Monitor {
     // otherwise leave the barrier nothing to wait on.
     self.record_adoption_marker(tail, last.clone(), scope);
     self.settle_bridges();
-    Some(reserved)
+    Some((reserved, attempt))
   }
 
   /// Whether `scope` has no outstanding re-arm work: no node of the scope is
@@ -1186,7 +1876,7 @@ impl Monitor {
 
   /// Whether `scope` is settled for BARRIER purposes: whether the monitor
   /// still holds any transition of `scope` it has not put on the wire. There
-  /// are five ways to hold one, and this is their conjunction — no counted
+  /// are six ways to hold one, and this is their conjunction — no counted
   /// re-arm work ([`rearm_settled`](Self::rearm_settled)); no
   /// detached-and-held move source (whose suppressed records' covering
   /// `Rescan` has not been emitted yet — it is owed only at the hold's pairing
@@ -1198,13 +1888,16 @@ impl Monitor {
   /// until the tail's first complete read verifies the adopted edge, a chain
   /// mutation from the commit's dark window may still be both unrecorded and
   /// unsignalled; the marker releases only at positive verification or
-  /// together with the mismatch's covering `Rescan`/re-arm/deficit); and no
-  /// half-resolved rename still parked for its pairing window — a `MovedFrom`
-  /// the monitor has consumed and cannot normalize until its destination
-  /// arrives or the window elapses, which for an ordinary file takes no hold
-  /// and so is counted by nothing else.
+  /// together with the mismatch's covering `Rescan`/re-arm/deficit); no
+  /// QUARANTINED binding — a node whose kernel watch is installed at a path
+  /// the subtree has left, so changes under the path it now occupies are
+  /// recorded by nobody until its re-add is acknowledged; and no half-resolved
+  /// rename still parked for its pairing window — a `MovedFrom` the monitor
+  /// has consumed and cannot normalize until its destination arrives or the
+  /// window elapses, which for an ordinary file takes no hold and so is
+  /// counted by nothing else.
   ///
-  /// The first four are coverage the monitor cannot yet vouch for; the fifth
+  /// The first five are coverage the monitor cannot yet vouch for; the sixth
   /// is a change it has already taken off the backend and not yet delivered.
   /// One predicate carries both because they falsify the same claim: a fence
   /// built on the bare re-arm predicate would settle inside any of these
@@ -1213,7 +1906,7 @@ impl Monitor {
   /// that cookie, so a change landing behind it arrives after the state it
   /// belongs to.
   ///
-  /// A kernel-recursive scope reaches none of the first four states, so its
+  /// A kernel-recursive scope reaches none of the first five states, so its
   /// barrier rests on the parked-rename conjunct alone; an unknown or
   /// torn-down scope is trivially settled.
   #[cfg_attr(not(tarpaulin), inline)]
@@ -1359,6 +2052,32 @@ impl Monitor {
       .is_none_or(|((half_scope, _), _)| *half_scope != scope)
   }
 
+  /// Whether a source under `(scope, cookie)` may be parked — the admission rule
+  /// of [`park_pending_move`](Self::park_pending_move), and the ONE spelling of
+  /// [`PENDING_MOVE_CAP`]'s question.
+  ///
+  /// Asked of a source that would GROW the store, which is why a cookie already
+  /// parked short-circuits to admitted: it displaces rather than adds, so no
+  /// insert can take a scope past the cap.
+  ///
+  /// The count is DERIVED from membership, never mirrored in a per-scope counter,
+  /// for the reason [`moves_settled`](Self::moves_settled) states: a half leaves
+  /// the store four different ways, and a mirror that missed one would refuse a
+  /// scope's renames forever on a phantom population. The store is keyed
+  /// scope-major, so the scope's halves are one contiguous range and the count
+  /// stops at the cap — O(cap), independent of how many halves the other scopes
+  /// hold.
+  fn admits_pending_move(&self, scope: ScopeId, cookie: MoveCookie) -> bool {
+    self.pending_moves.contains_key(&(scope, cookie))
+      || self
+        .pending_moves
+        .range((scope, FIRST_COOKIE)..)
+        .take_while(|((half_scope, _), _)| *half_scope == scope)
+        .take(PENDING_MOVE_CAP)
+        .count()
+        < PENDING_MOVE_CAP
+  }
+
   /// Parks a half-resolved rename under `(scope, cookie)` — the ONE insert
   /// funnel for [`pending_moves`](Self::pending_moves) — returning the
   /// same-key half it displaced, for the caller to resolve.
@@ -1366,12 +2085,17 @@ impl Monitor {
   /// Only a genuine membership gain counts as acquired coverage work: a
   /// displacement leaves the range non-empty on both sides of the insert, so
   /// the scope was already unsettled and no proof can have been taken over it.
+  ///
+  /// Admission is the caller's precondition, not this call's: a refusal must
+  /// degrade into the unpairable-source path, which the caller reaches BEFORE it
+  /// has mutated anything on the source's behalf.
   fn park_pending_move(
     &mut self,
     scope: ScopeId,
     cookie: MoveCookie,
     pending: PendingMove,
   ) -> Option<PendingMove> {
+    debug_assert!(self.admits_pending_move(scope, cookie));
     let displaced = self.pending_moves.insert((scope, cookie), pending);
     if displaced.is_none() {
       self.acquired_coverage_work(scope);
@@ -1411,7 +2135,7 @@ impl Monitor {
     let mut signaled = false;
     for dir in interiors {
       if let Some(hold) = self.in_held_subtree(dir) {
-        self.dirtied_holds.insert(hold);
+        self.book_hold(hold);
         continue;
       }
       self.emit_rescan(scope, self.location_of(dir));
@@ -1423,7 +2147,7 @@ impl Monitor {
     }
     for (parent, name) in slots {
       if let Some(hold) = self.in_held_subtree(parent) {
-        self.dirtied_holds.insert(hold);
+        self.book_hold(hold);
         continue;
       }
       self.emit_rescan(scope, self.location_of(parent).child(name.clone()));
@@ -1442,19 +2166,32 @@ impl Monitor {
     signaled
   }
 
-  /// Ingests one normalized event.
+  /// Ingests one normalized event, reporting what it did to the watch tree's
+  /// shape.
+  ///
+  /// The [`RecordOutcome`] exists so a consumer holding its own path-keyed
+  /// bookkeeping never has to re-derive the Monitor's reparenting decision from
+  /// the same record: it is told, by the call that made the decision. Everything
+  /// but a successful held-directory reparent reports
+  /// [`RecordOutcome::Nothing`]; ignoring the value is a supported way to drive
+  /// the loop.
+  ///
+  /// The return value is a semver-relevant addition to this method — the crates
+  /// in this workspace ship together and none is published, so it lands as an
+  /// ordinary change rather than a deprecation.
   #[cfg_attr(not(tarpaulin), inline)]
-  pub fn on_os_record(&mut self, rec: OsRecord, now: Instant) {
-    self.ingest_record(rec, now);
+  pub fn on_os_record(&mut self, rec: OsRecord, now: Instant) -> RecordOutcome {
+    let outcome = self.ingest_record(rec, now);
     self.settle_bridges();
+    outcome
   }
 
   /// [`on_os_record`](Self::on_os_record) minus the public entry point's
   /// bridge flush, which must run after ALL of a record's cascading —
   /// including the fenced early returns.
-  fn ingest_record(&mut self, rec: OsRecord, now: Instant) {
+  fn ingest_record(&mut self, rec: OsRecord, now: Instant) -> RecordOutcome {
     let Some(scope) = self.scope_of(rec.watch()) else {
-      return;
+      return RecordOutcome::Nothing;
     };
 
     // Addressing-contract enforcement, never silent: a descending monitor ingests
@@ -1467,12 +2204,12 @@ impl Monitor {
     let depth = rec.depth();
     if (depth > 1 && self.scope_descends(scope)) || (depth > 0 && rec.kind().is_self_event()) {
       if let Some(source) = self.in_held_subtree(rec.watch()) {
-        self.dirtied_holds.insert(source);
+        self.book_hold(source);
         self.mark_enumerate_dirty(rec.watch());
       } else {
         self.rescan_and_rearm(scope, rec.watch());
       }
-      return;
+      return RecordOutcome::Nothing;
     }
 
     // A record on a detached-and-held move source (or anything in its still-attached
@@ -1502,9 +2239,9 @@ impl Monitor {
         RecordKind::Ignored | RecordKind::MoveSelf | RecordKind::DeleteSelf => false,
       };
       if fence {
-        self.dirtied_holds.insert(source);
+        self.book_hold(source);
         self.mark_enumerate_dirty(rec.watch());
-        return;
+        return RecordOutcome::Nothing;
       }
     }
 
@@ -1536,7 +2273,16 @@ impl Monitor {
         RecordKind::MovedTo => rec.cookie(),
         _ => None,
       };
-      let carried = if rec.kind().is_moved_from() && rec.cookie().is_some() {
+      // Only a source the bound ADMITS carries its subtree; a refused one drops it
+      // (`on_moved_from`), so the halves under it travel nowhere and are interleaved
+      // facts to mark, exactly as under a cookieless source. Both sites read the same
+      // store, and nothing between them inserts or removes a half, so they cannot
+      // disagree about which it is.
+      let carried = if rec.kind().is_moved_from()
+        && rec
+          .cookie()
+          .is_some_and(|cookie| self.admits_pending_move(scope, cookie))
+      {
         rec
           .name()
           .and_then(|name| self.child_watch(rec.watch(), name))
@@ -1556,28 +2302,343 @@ impl Monitor {
       self.mark_enumerate_dirty(rec.watch());
     }
 
+    // `on_moved_to` is the ONE handler whose work can move a watched subtree
+    // between parents, so it is the only one with an outcome to report.
     match rec.kind() {
-      RecordKind::Created => self.on_created(scope, &rec),
-      RecordKind::Removed => self.on_removed(scope, &rec),
-      // Content and metadata records both surface as `Modified` changes, so the exact
-      // per-kind gate lives here where the record kind is still known; the `ondir`
-      // target-class modifier applies too. Neither kind affects coverage — suppressing
-      // delivery suppresses everything.
-      RecordKind::Modified => {
-        if self.scope_interest(scope).modified() && self.ondir_allows(scope, rec.is_dir()) {
-          self.emit_child(scope, &rec, ChangeKind::Modified);
-        }
-      }
-      RecordKind::Attrib => {
-        if self.scope_interest(scope).attrib() && self.ondir_allows(scope, rec.is_dir()) {
-          self.emit_child(scope, &rec, ChangeKind::Modified);
-        }
-      }
-      RecordKind::MovedFrom => self.on_moved_from(scope, &rec, now),
       RecordKind::MovedTo => self.on_moved_to(scope, &rec, now),
-      RecordKind::MoveSelf => self.on_move_self(scope, &rec),
-      RecordKind::DeleteSelf => self.on_delete_self(scope, &rec),
-      RecordKind::Ignored => self.on_ignored(&rec),
+      RecordKind::Created => {
+        self.on_created(scope, &rec);
+        RecordOutcome::Nothing
+      }
+      RecordKind::Removed => {
+        self.on_removed(scope, &rec);
+        RecordOutcome::Nothing
+      }
+      // Content and metadata records both surface as `Modified` changes, which the
+      // change-level filter cannot tell apart (it admits either flag), so the exact
+      // gate lives here where the record's own facts are still known: an `Attrib`
+      // record reaches a `modified`-only subscription only if it ALSO proved a content
+      // change, and vice versa. The `ondir` target-class modifier applies too. Neither
+      // kind affects coverage — suppressing delivery suppresses everything.
+      RecordKind::Modified | RecordKind::Attrib => {
+        if rec.evidence().admits(self.scope_interest(scope))
+          && self.ondir_allows(scope, rec.is_dir())
+        {
+          self.emit_child(scope, &rec, ChangeKind::Modified);
+        }
+        RecordOutcome::Nothing
+      }
+      RecordKind::MovedFrom => {
+        self.on_moved_from(scope, &rec, now);
+        RecordOutcome::Nothing
+      }
+      RecordKind::MoveSelf => {
+        self.on_move_self(scope, &rec);
+        RecordOutcome::Nothing
+      }
+      RecordKind::DeleteSelf => {
+        self.on_delete_self(scope, &rec);
+        RecordOutcome::Nothing
+      }
+      RecordKind::Ignored => {
+        self.on_ignored(&rec);
+        RecordOutcome::Nothing
+      }
+    }
+  }
+
+  /// Handles the result of an [`Action::Stat`].
+  ///
+  /// The core stats exactly one thing: a child slot a listing left
+  /// [`FileKind::Unknown`]. A resolved answer settles the slot through the
+  /// ordinary reconcile — a directory is armed and descended into, anything else
+  /// drops whatever stale watch stood there — which also discharges any deficit
+  /// the unknown booked. An answer that settles nothing (a failure, or a kind
+  /// that is `Unknown` again) re-books that deficit and emits a covering
+  /// [`Rescan`](ChangeKind::Rescan): the monitor never re-asks on its own, so
+  /// the slot cannot spin the driver, and the darkness keeps re-signalling until
+  /// an enumerate or a record settles it.
+  ///
+  /// A [`NotFound`](crate::IoClass::NotFound) failure is the benign race — the
+  /// entry was gone before the stat ran — and settles the slot as empty.
+  ///
+  /// Whatever the answer, it also settles the INCUMBENT watch the read that
+  /// deferred to this stat left standing: a kept incumbent receives the descent
+  /// that read owed it, and a retired one earns a covering
+  /// [`Rescan`](ChangeKind::Rescan) — plus, where the answer rebuilds the slot,
+  /// coverage counted by [`coverage_settled`](Self::coverage_settled) so no
+  /// barrier settles before the rebuild acknowledges.
+  ///
+  /// A result for an unknown or superseded request is dropped.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn on_stat_result(&mut self, req: ReqId, res: StatResult) {
+    self.ingest_stat_result(req, res);
+    self.settle_bridges();
+  }
+
+  /// [`on_stat_result`](Self::on_stat_result) minus the public entry point's
+  /// bridge flush, which must run after ALL of a result's cascading.
+  fn ingest_stat_result(&mut self, req: ReqId, res: StatResult) {
+    let Some(slot) = self.pending_stat.remove(&req) else {
+      return;
+    };
+    let StatSlot {
+      parent,
+      name,
+      scope,
+      placement,
+    } = slot;
+    self.stat_slots.remove(&(parent, name.clone()));
+    // The slot's parent can have died while the stat ran; there is then no slot
+    // left to settle, and its deficit died with the node.
+    if !self.is_watched(parent) {
+      return;
+    }
+    // The request is keyed by `(parent, name)`, which a rename carries intact —
+    // but the driver probed a PATH, and a rename of the parent or of any ancestor
+    // leaves that path describing a coordinate this slot no longer occupies.
+    // Applying such an answer would settle the slot the parent holds NOW with
+    // what was found where it used to be: a stale `NotFound` or `File` would
+    // retire a destination watch, or clear a slot's deficit, over a directory
+    // that is really there. A held parent is the same reconstruction failure one
+    // clause over (see [`Lowering`]): its slot's path is the vacated pre-move one
+    // for the whole pairing window, so the answer describes whatever occupies the
+    // slot the subtree has LEFT. It is not evidence about this slot either — a
+    // replacement's `File`, or a `NotFound` for a name only the vacated path
+    // lacked, would retire an incumbent covering a directory that is really
+    // there, and the destination's own recovery cannot rebuild it (an incomplete
+    // destination read reconstructs no omitted name). It degrades instead: the
+    // incumbent is KEPT with its coverage and its descent, and the pairing —
+    // whose debt the fence booked — owns the destination's reconciliation.
+    let lowering = self.fence_lowering(parent, placement);
+    let stale = !lowering.is_evidence();
+    // The watch this answer decides the fate of, captured BEFORE the settle: it
+    // is the difference between the two settlements below that says whether
+    // coverage ended here, and it cannot be read back afterwards.
+    let incumbent = self.child_watch(parent, &name);
+    // And the descent it is owed, taken BEFORE the reconcile can retire it: a
+    // retirement's own cover ([`settle_stat_slot`](Self::settle_stat_slot))
+    // discharges the obligation, so leaving the entry standing would make the
+    // drop read it as an obligation that ESCAPED and stand a second, redundant
+    // counted cover. An obligation left in the book past this point is one this
+    // answer could not settle at all — its owner had already left the slot —
+    // and that is exactly the case the reparent (or the drop) must honor.
+    let descent = incumbent.and_then(|kept| self.owed_descents.remove(&kept));
+    match res {
+      StatResult::Ok(entry) if !stale && !entry.kind().is_unknown() => {
+        self.reconcile_slot(
+          parent,
+          scope,
+          &name,
+          Self::entry_occupant(entry.kind()),
+          false,
+          entry.node(),
+        );
+      }
+      // The object vanished before the stat: the slot is empty, which the
+      // ordinary `Gone` reconcile settles (dropping any stale watch and
+      // discharging the deficit).
+      StatResult::Failed(class) if !stale && class.is_not_found() => {
+        self.reconcile_slot(parent, scope, &name, SlotOccupant::Gone, false, None);
+      }
+      // Unresolvable: the kind is still unknown, the stat itself failed, or the
+      // answer describes a path the placement moved out from under it (`stale`).
+      // This is the slot's own failure edge, so it re-books the darkness — a
+      // dispatch re-signal clears entries optimistically, and a site that is still
+      // broken is required to re-record through exactly this path — and stands a
+      // fresh `Rescan` over the interval the darkness has already spanned.
+      // Deliberately no re-stat: a slot that cannot be classified would otherwise
+      // loop forever, and a re-stat chasing a moving placement would loop for as
+      // long as the renames last. The degrade is covered-and-counted rather than
+      // lossy — the incumbent (if any) is KEPT with its coverage and its descent,
+      // and an EMPTY slot re-books the deficit every later sync re-signals, so
+      // nothing is left dark and silent.
+      _ => {
+        if self.child_watch(parent, &name).is_none() {
+          self.record_slot_deficit(scope, parent, name.clone());
+        }
+        // The darkness is re-booked either way; what differs is WHERE the
+        // covering re-read may be addressed. Under a hold this slot's
+        // reconstruction is the pre-move path, so a `Rescan` here would send the
+        // consumer to the slot the subtree has LEFT while the real destination
+        // kept no re-arm obligation at all — uncovered until a later deficit
+        // re-signal. The fence above dirtied the hold instead, which obliges the
+        // pairing to `Rescan` and re-arm the destination.
+        if lowering.locatable() {
+          self.emit_rescan(scope, self.child_location(parent, &name));
+        }
+      }
+    }
+    self.settle_stat_slot(
+      scope,
+      parent,
+      &name,
+      incumbent,
+      descent,
+      lowering.locatable(),
+    );
+  }
+
+  /// Settles the coverage half of a resolved stat: what the answer did to the
+  /// slot's INCUMBENT watch, which the deferring read deliberately left
+  /// standing rather than deciding blind.
+  ///
+  /// Written as "what happened to the incumbent", never as an enumeration of the
+  /// answers that owe something, so an answer no branch anticipated still lands
+  /// in the covering case rather than in silence. Three outcomes:
+  ///
+  /// - **kept** (the successor IS the incumbent, or there was never a watch
+  ///   here): no coverage ended, so nothing is covered. A kept incumbent
+  ///   receives the descent the deferring read owed it and could not perform —
+  ///   the whole reason [`owed_descents`](Self::owed_descents) exists. Without
+  ///   it a crawl that skipped this name would leave the survivor's subtree
+  ///   un-re-armed while its scope read settled, and a directory created under
+  ///   it during the deferral would stay unwatched with nothing booked to say
+  ///   so. `descent` is the caller's, taken against this same incumbent before
+  ///   the answer could retire it; an obligation owed to a watch that had
+  ///   already LEFT the slot is none of this settlement's business and is not
+  ///   passed here.
+  /// - **replaced** (a fresh watch stands where the incumbent did): the
+  ///   retirement ends coverage of an object that was there, so it owes the
+  ///   opening cover — and the rebuild is made COUNTED
+  ///   ([`inherit_rearm`](Self::inherit_rearm)), which is what lets the cover be
+  ///   suppressed inside an already-lossy window exactly as
+  ///   [`rearm_enumerate`](Self::rearm_enumerate)'s rebuilt flavor is: the
+  ///   window's closing `Rescan` cannot now precede the recovery. A fresh
+  ///   install proves its own binding, so the reprove flavor does not reach it.
+  /// - **retired with nothing in its place** (a `File`, or a vanish): no
+  ///   successor exists, so no counted work will make this window close — the
+  ///   suppression is unavailable rather than merely conservative, and the cover
+  ///   is unconditional.
+  ///
+  /// The cover is located off the PARENT, which is still watched; the retired
+  /// child's own node is gone by the time this runs.
+  ///
+  /// `deliver` is false when the parent's own reconstruction is the vacated
+  /// pre-move path of an enclosing hold: the cover would then name a slot the
+  /// subtree has left, so it is suppressed exactly as a held read's is and the
+  /// pairing's destination `Rescan` carries it. The COUNTED rebuild below is
+  /// coverage, not delivery, and runs regardless.
+  fn settle_stat_slot(
+    &mut self,
+    scope: ScopeId,
+    parent: WatchId,
+    name: &Segment,
+    incumbent: Option<WatchId>,
+    descent: Option<StatDescent>,
+    deliver: bool,
+  ) {
+    let successor = self.child_watch(parent, name);
+    if successor == incumbent {
+      if let (Some(kept), Some(descent)) = (incumbent, descent) {
+        self.apply_descent(kept, descent);
+      }
+      return;
+    }
+    // Nothing was retired: the slot was uncovered and this answer occupied (or
+    // left) it, which is the deficit book's own story — `install_child` heals a
+    // booked hole and stands both bridge bits through `remove_slot_deficit`.
+    if incumbent.is_none() {
+      return;
+    }
+    let cover = self.child_location(parent, name);
+    match successor {
+      Some(fresh) => {
+        if deliver && !self.bridge_is_lossy(scope) {
+          self.emit_rescan(scope, cover);
+        }
+        let _ = self.inherit_rearm(fresh);
+      }
+      None => {
+        if deliver {
+          self.emit_rescan(scope, cover);
+        }
+      }
+    }
+  }
+
+  /// Queues the [`Action::Stat`](crate::Action::Stat) that settles an
+  /// unclassifiable slot, unless one is already outstanding for it — a slot
+  /// re-listed as unknown on every retry of an unreadable directory must not
+  /// stack a request per read.
+  ///
+  /// The request is born owing nothing; a read that DEFERS a descent to it
+  /// books that separately against the slot's incumbent
+  /// ([`defer_stat_descent`](Self::defer_stat_descent)), which is also what lets
+  /// a later read's stronger obligation reach a stat this dedup already
+  /// coalesced onto.
+  fn queue_stat(&mut self, parent: WatchId, scope: ScopeId, name: Segment) {
+    if self.stat_slots.contains_key(&(parent, name.clone())) {
+      return;
+    }
+    let req = self.next_req_id();
+    self.stat_slots.insert((parent, name.clone()), req);
+    self.pending_stat.insert(
+      req,
+      StatSlot {
+        parent,
+        name: name.clone(),
+        scope,
+        placement: self.placement_now(),
+      },
+    );
+    self.actions.push_back(Action::stat(
+      req,
+      crate::action::StatTarget::child(parent, name),
+    ));
+  }
+
+  /// Books the descent obligation the calling read owed `(parent, name)`'s
+  /// incumbent and could not perform, against that INCUMBENT — the identity a
+  /// later rename carries out of the slot intact, never the slot the rename
+  /// empties (see [`owed_descents`](Self::owed_descents)).
+  ///
+  /// It UPGRADES, never downgrades ([`StatDescent`] is ordered by strength): the
+  /// stat for a slot is coalesced across every read that re-encounters the name,
+  /// so the obligation the answer honors must be the strongest any of them
+  /// carried — a reproof deferred onto a stat an earlier plain re-arm queued is
+  /// still a reproof.
+  ///
+  /// Two no-ops, for the same reason: nothing would ever discharge the booking.
+  /// A slot with no outstanding stat has no answer coming (the caller asked for
+  /// one through the same reconcile, and a non-descending scope asks for none),
+  /// and an EMPTY slot has no incumbent — the deferring read owed the name's
+  /// coverage to nobody, and whatever the answer installs there proves its own
+  /// binding by its install acknowledgement.
+  ///
+  /// The booking is deliberately UNCOUNTED, and an outstanding stat is
+  /// deliberately no conjunct of [`coverage_settled`](Self::coverage_settled)
+  /// ([`pending_stat`](Self::pending_stat)): a driver that never answers must
+  /// degrade to a re-signalled `Rescan`, never wedge the scope's every barrier.
+  /// Nothing rests on the answer ALONE — the incumbent keeps its watch and its
+  /// coverage meanwhile, and the crawl that deferred stood its own `Rescan` — so
+  /// an answer that never comes costs a degraded cover rather than a wedge.
+  fn defer_stat_descent(&mut self, parent: WatchId, name: &Segment, descent: StatDescent) {
+    if !self.stat_slots.contains_key(&(parent, name.clone())) {
+      return;
+    }
+    let Some(incumbent) = self.child_watch(parent, name) else {
+      return;
+    };
+    self
+      .owed_descents
+      .entry(incumbent)
+      .and_modify(|owed| *owed = (*owed).max(descent))
+      .or_insert(descent);
+  }
+
+  /// Performs a booked descent against the watch that owes it — the ONE
+  /// definition of what each flavor means, shared by the answer that settles it
+  /// in place ([`settle_stat_slot`](Self::settle_stat_slot)) and the reparent
+  /// that discharges it after the slot it was deferred at emptied
+  /// ([`on_moved_to`](Self::on_moved_to)). Two spellings could disagree about
+  /// what a reproof is owed, which is the whole hazard here.
+  fn apply_descent(&mut self, watch: WatchId, descent: StatDescent) {
+    match descent {
+      StatDescent::Reprove => self.start_reinstall(watch),
+      StatDescent::Rearm => {
+        let _ = self.inherit_rearm(watch);
+      }
     }
   }
 
@@ -1601,7 +2662,7 @@ impl Monitor {
     // or whose read was superseded (re-armed, its slot rebuilt) has moved on — a stale
     // result must not reconcile against it. This is the gap the old `pending_enumerate`
     // + liveness pair could not close: the request identity now lives on the node.
-    let (kind, attempts, dirty, scope) = match self.nodes.get(&dir) {
+    let (kind, attempts, dirty, scope, placement) = match self.nodes.get(&dir) {
       Some(WatchNode {
         state:
           NodeState::Enumerating {
@@ -1611,35 +2672,75 @@ impl Monitor {
             dirty,
           },
         scope,
+        placement,
         ..
-      }) if *r == req => (*kind, *attempts, *dirty, *scope),
+      }) if *r == req => (*kind, *attempts, *dirty, *scope, *placement),
       _ => return,
     };
+    // The request names this node, but the LISTING came from a path — and
+    // [`fence_lowering`](Self::fence_lowering) is what says what that path is
+    // worth. A read the clock invalidated is not a snapshot of this directory at
+    // all (a rename of any ancestor re-points it at whatever now stands at the
+    // vacated path), so it is handled like a read that FAILED: nothing of its
+    // listing is reconciled, the coverage cascade and the bounded retry run, and
+    // the retry re-reads wherever the node has landed. Reconciling its entries
+    // instead would install a replacement's children under this node — the very
+    // misattribution the fence exists to stop.
+    //
+    // A held (limbo) directory's read is the other clause. It fences DELIVERY —
+    // it must not `Rescan` or `Created` at the stale pre-move path (the third
+    // fence entry point, beside records and subtree overflow) — but it also
+    // fences the listing's AUTHORITY: the names it reports are whatever occupies
+    // the slot the subtree has left, so they may not be treated as this
+    // directory's inventory. The read is still performed and its coverage still
+    // taken, because the design deliberately reads under a hold so the subtree is
+    // complete when it reparents; what it may no longer do is PRUNE. It therefore
+    // routes through the never-prunes path with an ADDITIVE listing, and the
+    // pairing reparent — whose debt the fence booked — owns the reconciliation
+    // against the real destination.
+    let lowering = self.fence_lowering(dir, placement);
+    let held = lowering.held;
     // The read resolved: the node leaves `Enumerating`.
     self.set_state(dir, NodeState::Live);
 
-    // A held (limbo) directory's read must not DELIVER at the stale pre-move path (the
-    // third fence entry point, beside records and subtree overflow), but it must still
-    // reconcile COVERAGE so the subtree is complete when it reparents. Dirty the hold,
-    // then treat the read as coverage-only: no `Created` (a cold read is routed as a
-    // re-arm) and no stale `Rescan` (an incomplete read reconciles + retries silently).
-    // The pairing reparent emits the real destination `Rescan`.
-    let held = self.in_held_subtree(dir);
-    if let Some(source) = held {
-      self.dirtied_holds.insert(source);
-    }
-
-    if res.forces_rescan() || dirty {
-      // An incomplete read (`Partial` / `Failed`), OR a complete read a slot-changing
-      // record raced (`dirty`) so its listing is a possibly-stale snapshot: reconcile what
-      // is visible, cascade the re-arm into every child, bounded-retry to complete the
-      // watch set, and — unless the dir is held — emit a `Rescan` for the unreadable
-      // content (a held dir's `Rescan` would point at the stale path). The retry
-      // keeps a reprove flavor: the survivors' re-adds ride the eventual
-      // complete read, so dropping the flavor here would silently downgrade
+    if res.forces_rescan() || dirty || !lowering.is_evidence() {
+      // An incomplete read (`Partial` / `Failed`), a complete read a slot-changing
+      // record raced (`dirty`) so its listing is a possibly-stale snapshot, or one the
+      // placement moved under or a hold had already vacated (no longer evidence):
+      // reconcile what may be reconciled, cascade the re-arm into every child,
+      // bounded-retry to complete the watch set, and — unless the dir is held — emit a
+      // `Rescan` for the unreadable content (a held dir's `Rescan` would point at the
+      // stale path). The retry keeps a reprove flavor: the survivors' re-adds ride the
+      // eventual complete read, so dropping the flavor here would silently downgrade
       // the binding proof to an enumerate.
       let reprove = matches!(kind, EnumKind::Rearm { reprove: true });
-      self.handle_incomplete_enumerate(dir, scope, &res, attempts, held.is_none(), reprove);
+      let additive;
+      let entries = if lowering.is_evidence() {
+        res.entries()
+      } else if lowering.moved {
+        // Read at a path a rename re-pointed at somebody else's object: the
+        // listing describes a directory this node is not, and none of it may
+        // reach this node's slots. The retry re-reads wherever the node landed.
+        &[][..]
+      } else {
+        // Held: the listing is the vacated path's, so it may only ADD coverage
+        // for a name nothing here covers — the gap-created descendant the hold's
+        // best-effort read exists to arm. It may not touch a covered slot: a
+        // replacement's `File` at a name this subtree still watches would retire
+        // a live directory over evidence about a path the object has left, and
+        // the destination's own recovery cannot rebuild it (an incomplete
+        // destination read reconstructs no omitted name).
+        additive = self.additive_entries(dir, res.entries());
+        &additive
+      };
+      self.handle_incomplete_enumerate(
+        dir,
+        scope,
+        entries,
+        attempts,
+        lowering.locatable(),
+        reprove,
+      );
       return;
     }
 
@@ -1672,34 +2773,70 @@ impl Monitor {
           // coverage install below runs regardless.
           if self.ondir_allows(scope, Some(entry.is_dir())) {
             let location = self.child_location(dir, entry.name());
-            self.emit(scope, location, ChangeKind::Created);
+            self.emit(
+              scope,
+              location,
+              ChangeKind::Created,
+              Evidence::of(RecordKind::Created),
+            );
           }
-          // Only a known directory is descended into (an `Unknown`-kind entry is a
-          // non-directory, never watched). A cold enumerate is discovery, not a replace,
-          // so an already-watched slot is reused (`replaced = false`).
-          let occupant = if entry.is_dir() {
-            SlotOccupant::Dir
-          } else {
-            SlotOccupant::File
-          };
+          // A cold enumerate is discovery, not a replace, so an already-watched slot
+          // is reused (`replaced = false`).
+          let occupant = Self::entry_occupant(entry.kind());
           self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
         }
       }
     }
   }
 
-  /// Handles an incomplete enumerate (`Partial` or `Failed`) of `dir`, in either the
-  /// discovery or re-arm mode. It never prunes (the listing is incomplete): it arms any
-  /// newly-visible directory, cascades the re-arm into EVERY currently-known child
-  /// directory (a partial listing may omit a still-present one whose subtree gained a
-  /// gap-created descendant), emits a `Rescan` so the consumer refreshes the content
-  /// the read could not report, and retries a bounded number of times before letting
-  /// the `Rescan` stand — so a permanently-unreadable directory cannot spin the driver.
+  /// The part of a listing that can only ADD coverage at `dir`: a name `dir` does
+  /// not already watch reported as a directory, or one the read could not
+  /// classify at all.
+  ///
+  /// This is all a HELD read may reconcile. Its listing came from the vacated
+  /// pre-move path, so anything else is a DECISION ABOUT a slot rather than an
+  /// addition to it: a positively-reported non-directory retires the name's
+  /// incumbent and discharges its darkness, and a directory whose identity
+  /// differs from the incumbent's rebuilds the slot — each spending evidence
+  /// about a path the object has LEFT on coverage the destination's own recovery
+  /// is not guaranteed to reconstruct (an incomplete destination read omits names
+  /// and deliberately rebuilds none of them). What survives the filter cannot
+  /// retire anything: an unclassifiable name settles no slot by construction (it
+  /// books darkness and asks for a kind), and installing a watch where nothing
+  /// stood is the one direction that cannot lose coverage — at worst it arms a
+  /// replacement's child, which the pairing's own recovery discards.
+  fn additive_entries(&self, dir: WatchId, entries: &[DirEntry]) -> std::vec::Vec<DirEntry> {
+    entries
+      .iter()
+      .filter(|entry| {
+        entry.kind().is_unknown()
+          || (entry.is_dir() && self.child_watch(dir, entry.name()).is_none())
+      })
+      .cloned()
+      .collect()
+  }
+
+  /// Handles a read of `dir` that cannot be trusted as a complete inventory — an
+  /// incomplete one (`Partial` or `Failed`), or a complete one raced by a slot change
+  /// or a placement change — in either the discovery or re-arm mode. It never prunes
+  /// (the listing is not known to be exhaustive): it arms any newly-visible directory,
+  /// cascades the re-arm into EVERY currently-known child directory (a partial listing
+  /// may omit a still-present one whose subtree gained a gap-created descendant), emits
+  /// a `Rescan` so the consumer refreshes the content the read could not report, and
+  /// retries a bounded number of times before letting the `Rescan` stand — so a
+  /// permanently-unreadable directory cannot spin the driver.
+  ///
+  /// `entries` is what the caller vouches for as having been read AT THIS NODE, which
+  /// is why it is passed rather than taken off the result: a listing the placement
+  /// clock invalidated was read somewhere else, and none of it may be reconciled here
+  /// even though the result itself is `Ok`; a held directory's listing came from the
+  /// vacated pre-move path, and only its additive part
+  /// ([`additive_entries`](Self::additive_entries)) may be.
   fn handle_incomplete_enumerate(
     &mut self,
     dir: WatchId,
     scope: ScopeId,
-    res: &EnumerateResult,
+    entries: &[DirEntry],
     attempts: u8,
     deliver: bool,
     reprove: bool,
@@ -1710,12 +2847,8 @@ impl Monitor {
     // directory there. Never prune OMITTED names (the listing is incomplete). No
     // `Created` — the `Rescan` below refreshes consumer content. A freshly-installed
     // child is picked up by the cascade that follows (it is now in the adjacency set).
-    for entry in res.entries() {
-      let occupant = if entry.is_dir() {
-        SlotOccupant::Dir
-      } else {
-        SlotOccupant::File
-      };
+    for entry in entries {
+      let occupant = Self::entry_occupant(entry.kind());
       self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
     }
     // Cascade the re-arm into EVERY child of `dir` — those in a name-slot AND any
@@ -1786,9 +2919,35 @@ impl Monitor {
   /// Queues an [`Action::Enumerate`] for `dir` and moves it to
   /// [`NodeState::Enumerating`] under the fresh request, recording `kind` (discovery vs
   /// re-arm) and the carried retry `attempts`.
+  ///
+  /// A node awaits at most ONE read — [`NodeState::Enumerating`] names exactly
+  /// one request — so a read queued over an outstanding one SUPERSEDES it, and
+  /// the superseded request must leave the reverse map with it or it is
+  /// stranded there for the node's whole life (the drop walk reclaims only the
+  /// request the node still names). Superseding is reached where a reconcile
+  /// re-enters the very directory it is reconciling: a retirement inside
+  /// [`handle_incomplete_enumerate`](Self::handle_incomplete_enumerate)'s pass
+  /// can stand a counted cover, whose root re-arm reads the node this call is
+  /// about to queue the bounded retry for. The retry wins, deliberately — it
+  /// carries the retry budget, and the cover's re-arm would reset it and let a
+  /// permanently unreadable directory spin.
   fn queue_enumerate(&mut self, dir: WatchId, kind: EnumKind, attempts: u8) {
+    let Some(state) = self.nodes.get(&dir).map(|node| node.state) else {
+      return;
+    };
+    if let NodeState::Enumerating { req: prior, .. } = state {
+      self.pending_enumerate.remove(&prior);
+      self.latent_cold.remove(&prior);
+    }
     let req = self.next_req_id();
     self.pending_enumerate.insert(req, dir);
+    // The read is addressed by handle but lowered to a path; stamp the placement
+    // it is issued at, so a listing of the vacated path cannot reconcile this
+    // directory's slots (see [`placement_now`](Self::placement_now)).
+    let placement = self.placement_now();
+    if let Some(node) = self.nodes.get_mut(&dir) {
+      node.placement = placement;
+    }
     self.set_state(
       dir,
       NodeState::Enumerating {
@@ -1900,6 +3059,22 @@ impl Monitor {
   /// confirmed is dropped and its slot rebuilt. Absent any identity this degrades to
   /// rebuilding every affected child — the safe default.
   ///
+  /// Retiring a watch ends coverage a record may already be queued against, so a crawl
+  /// that retires ANY slot stands ONE opening `Rescan` at the crawled directory —
+  /// coalesced across the whole listing, never per child. The obligation is stated
+  /// so that SILENCE is the case that must be earned: every retirement owes the
+  /// cover, and only a retirement whose successor this crawl PROVES it rebuilds
+  /// (counted) may defer to the window's closing `Rescan` instead. A crawl that
+  /// retires nothing emits nothing.
+  ///
+  /// A name the listing leaves unclassifiable retires nothing here: its incumbent
+  /// keeps its watch and its coverage, and the decision passes to the slot's stat
+  /// ([`settle_stat_slot`](Self::settle_stat_slot)). The descent this crawl owes
+  /// that incumbent is booked against the INCUMBENT
+  /// ([`owed_descents`](Self::owed_descents)), so a rename that empties the slot
+  /// before the answer lands carries the obligation with the subtree instead of
+  /// stranding it at a coordinate nothing occupies.
+  ///
   /// A `reprove`-flavored read tightens the survivor rule: an identity match
   /// proves only that the NAME still holds the same object, never that OUR
   /// watch is still its live binding (an unmount+same-fs-remount matches every
@@ -1921,6 +3096,16 @@ impl Monitor {
       .filter(|entry| entry.is_dir())
       .map(|entry| (entry.name().clone(), entry.node()))
       .collect();
+    // Names the listing could not classify. They are absent from `present`, but that
+    // absence is ignorance, not a vanish: pruning an incumbent watch on it would
+    // silently un-cover a live directory, and leaving the name unwatched would blind a
+    // new one. Both are settled out of band by the slot's stat.
+    let unsettled: BTreeSet<Segment> = res
+      .entries()
+      .iter()
+      .filter(|entry| entry.kind().is_unknown())
+      .map(|entry| entry.name().clone())
+      .collect();
     // Diff the retained watch set against it. An in-slot child whose object identity is
     // confirmed still present SURVIVES — its watch is kept and only re-armed downward to
     // catch new grandchildren. One whose name vanished, whose identity changed (a
@@ -1931,6 +3116,15 @@ impl Monitor {
       .get(&dir)
       .map(|node| node.children.iter().copied().collect())
       .unwrap_or_default();
+    // The crawl's cover obligation, in the shape that makes SILENCE the case that
+    // must be earned (see the emit below). `retired` is the bare fact that this
+    // crawl ended coverage of SOMETHING; `rebuilt_every_retirement` starts true and
+    // is cleared by any retirement whose counted successor the crawl cannot prove.
+    // Stated the other way round — as a list of the retirement flavors that do owe
+    // a cover — an entry kind nobody enumerated would set no flag and default to
+    // silence, which is exactly how a coverage loss hides.
+    let mut retired = false;
+    let mut rebuilt_every_retirement = true;
     for child in existing {
       // A detached-and-held move source is not in its name-slot; leave it to be
       // reparented by its pending MovedTo rather than rebuilt.
@@ -1938,6 +3132,11 @@ impl Monitor {
         continue;
       }
       let name = self.nodes.get(&child).and_then(|node| node.name.clone());
+      // An unsettled name keeps its watch and its coverage until the stat answers;
+      // the reconcile pass below asks for its kind.
+      if name.as_ref().is_some_and(|name| unsettled.contains(name)) {
+        continue;
+      }
       let survives = name
         .as_ref()
         .and_then(|name| present.get(name).copied())
@@ -1949,8 +3148,54 @@ impl Monitor {
           let _ = self.inherit_rearm(child);
         }
       } else {
+        retired = true;
+        // The ONE positive proof of a counted successor: the fresh listing still
+        // shows this name as a DIRECTORY, so the install loop below rebuilds it and
+        // `inherit_rearm`s the rebuild into `Arming { rearm: true }`. Anything else
+        // — a name the listing omits, one it reports as a non-directory, one of a
+        // kind this crawl has no branch for, or a nameless child no listing can be
+        // matched against — leaves the flag cleared and so keeps the cover
+        // unconditional. (`is_slot_child` above already proves the name is present;
+        // the nameless fallback is the safe direction.)
+        rebuilt_every_retirement &= name.as_ref().is_some_and(|name| present.contains_key(name));
         self.drop_subtree_for_crawl_rebuild(child);
       }
+    }
+    // Cover the coverage this crawl RETIRED. EVERY retirement owes it: the drop tears
+    // down every `WatchId` in the dropped subtree while records naming them may already
+    // sit queued on the backend — `ingest_record` discards those as an unrecognized
+    // watch — and every structural signal that could stand in for them is interest- and
+    // filter-subject (the vanish's `Removed`, which may itself be one of the discarded
+    // records, and the rebuild's suppressed `Created`), so a `Modified`-only
+    // subscription would be instructed to re-read nothing at all. The re-anchor above
+    // carries only an ERASED deficit; a deficit-free subtree carries nothing.
+    //
+    // The ONE excuse for silence is a COUNTED SUCCESSOR inside an already-lossy window,
+    // and it must be proven for every retirement this crawl made, not for some:
+    //
+    // - a retirement the crawl rebuilds is counted (every install is `inherit_rearm`ed
+    //   into `Arming { rearm: true }`, so the window's `fresh_rearm` half is this
+    //   crawl's own), which leaves only the loss half to supply. Every entry into this
+    //   crawl but one arrives with it already set — an overflow recovery, a loss or
+    //   incomplete-read re-arm, a rebind commit each stand their `Rescan` before the
+    //   read they trigger — so the gap is exactly the PURE grow
+    //   (`rearm_watch_subtree`), which stands none. A window already marked lossy
+    //   closes with a root `Rescan` that postdates this retirement by construction, so
+    //   a second one there adds no instruction.
+    //
+    // - a retirement the crawl does NOT prove it rebuilds arms no fresh coverage for
+    //   the slot, so the window's `fresh_rearm` half is not its to supply. That makes
+    //   the `bridge_is_lossy` shortcut unavailable rather than merely conservative — a
+    //   site that does not also make the window counted must emit, because the
+    //   conjunction it would defer to may never fire (see `bridge_is_lossy`). One such
+    //   retirement in the crawl is enough to owe the whole crawl's cover.
+    //
+    // ONE opening `Rescan` per crawl, at the crawled directory, NOT one per child and
+    // not one per flavor: an identity-less backend can confirm NO child, so a per-child
+    // emit would storm one `Rescan` per entry of every re-armed listing. A crawl that
+    // retires nothing owes nothing, so an ordinary prune-free grow stays silent.
+    if retired && !(rebuilt_every_retirement && self.bridge_is_lossy(scope)) {
+      self.emit_rescan(scope, self.location_of(dir));
     }
     // Install a fresh watch for every present directory now lacking one (a survivor keeps
     // its own; this covers vanished-then-new, replaced, and genuinely new names), marked
@@ -1964,6 +3209,34 @@ impl Monitor {
         if let Some(fresh) = self.child_watch(dir, entry.name()) {
           let _ = self.inherit_rearm(fresh);
         }
+      }
+    }
+    // Book every unclassifiable name as darkness and ask for its kind — and hand that
+    // stat the descent this crawl OWED the name's incumbent and skipped above. The
+    // skip is the only branch that leaves a retained subtree un-re-armed: without the
+    // hand-off the crawl would settle with the survivor's descendants never revisited,
+    // and a directory created under one during the gap would stay unwatched with
+    // nothing booked to say so. The reprove flavor rides along, since a survivor the
+    // stat confirms is a retained node whose binding this read cannot vouch for.
+    for entry in res.entries() {
+      if entry.kind().is_unknown() {
+        self.reconcile_slot(
+          dir,
+          scope,
+          entry.name(),
+          SlotOccupant::Unknown,
+          false,
+          entry.node(),
+        );
+        self.defer_stat_descent(
+          dir,
+          entry.name(),
+          if reprove {
+            StatDescent::Reprove
+          } else {
+            StatDescent::Rearm
+          },
+        );
       }
     }
   }
@@ -1983,7 +3256,15 @@ impl Monitor {
   ///   descendants would keep delivering at reconstructed-stale paths), so
   ///   escalate the scope root: one epoch-bumped covering `Rescan` plus a
   ///   counted re-arm, whose identity-diffing rebuild replaces the stale edge.
-  ///   Loud, D1-equivalent, never silent.
+  ///   Loud, D1-equivalent, never silent. It runs through
+  ///   [`stand_counted_cover`](Self::stand_counted_cover) rather than the bare
+  ///   rescan-and-rearm because THIS read is what released the adoption
+  ///   conjunct that was holding
+  ///   [`coverage_settled`](Self::coverage_settled) down: a re-arm the root's
+  ///   own state can refuse — a widen's spliced root is `Arming` until its
+  ///   pre-arm outcome is replayed, and a chain tail can complete its first
+  ///   read before that — would leave the released barrier resting on nothing
+  ///   while the stale edge still stands.
   /// - **recorded death** — the adopted node is GONE (its own self-events tore
   ///   it down mid-window) with no parent watch armed to mint the parent-side
   ///   `Removed`: stand a located `Rescan` at the vacated slot so the
@@ -2016,9 +3297,7 @@ impl Monitor {
         if confirmed {
           return;
         }
-        if let Some(&root) = self.roots.get(&scope) {
-          self.rescan_and_rearm(scope, root);
-        }
+        self.stand_counted_cover(scope);
       }
       None => {
         self.emit_rescan(scope, self.location_of(dir).child(name));
@@ -2050,27 +3329,112 @@ impl Monitor {
   /// refused the watch. This covers all [`WatchError`] variants uniformly — a
   /// watch-limit refusal, a permission denial, a vanished target, or any other
   /// I/O failure — none may leave a node registered-but-not-live and silent.
+  ///
+  /// `attempt` is the [`ArmAttempt`] the answered arm carried — read off its
+  /// [`WatchCommand`](crate::WatchCommand), or returned by the out-of-band
+  /// re-arm that replaced it ([`rebind_root`](Self::rebind_root),
+  /// [`widen_root`](Self::widen_root)). A result for any OTHER attempt answers
+  /// an arm some later one superseded and is DISCARDED: a `WatchId` outlives
+  /// its bindings, so without the fence a late `Err` from a retired transport
+  /// would tear down the live rebound root that arm never touched. Because the
+  /// token is minted per arm and captured at issue time, a driver gets the
+  /// fence by echoing what it was handed — there is nothing left for it to
+  /// reinvent.
   #[cfg_attr(not(tarpaulin), inline)]
-  pub fn on_watch_result(&mut self, id: WatchId, res: Result<crate::WatchAck, WatchError>) {
-    self.ingest_watch_result(id, res);
+  pub fn on_watch_result(
+    &mut self,
+    id: WatchId,
+    attempt: ArmAttempt,
+    res: Result<crate::WatchAck, WatchError>,
+  ) {
+    self.ingest_watch_result(id, attempt, res);
     self.settle_bridges();
   }
 
   /// [`on_watch_result`](Self::on_watch_result) minus the public entry
   /// point's bridge flush — a failed arm's drop can be the settle edge.
-  fn ingest_watch_result(&mut self, id: WatchId, res: Result<crate::WatchAck, WatchError>) {
-    let Some(node) = self.nodes.get_mut(&id) else {
+  fn ingest_watch_result(
+    &mut self,
+    id: WatchId,
+    attempt: ArmAttempt,
+    res: Result<crate::WatchAck, WatchError>,
+  ) {
+    let Some(node) = self.nodes.get(&id) else {
       return;
     };
+    // The supersession fence, ahead of every effect: an outcome that does not
+    // name the arm this handle is currently bound to is old-world — its target
+    // binding was replaced by the arm that superseded it, and applying either
+    // verdict would judge a binding the attempt never observed.
+    if node.attempt != attempt {
+      return;
+    }
     let scope = node.scope;
     let is_dir = node.is_dir;
+    let placement = node.placement;
+    let state = node.state;
+    // The LOWERED-PATH fence, which the supersession fence above cannot subsume:
+    // supersession catches a rename of THIS node's own slot (the Monitor can
+    // compute where the arm should have gone, and re-issues it there), while a
+    // rename of an ANCESTOR leaves this node's `(parent, name)` — and so its
+    // attempt — untouched even though the path the driver opened is now
+    // somebody else's. The hold is the second clause the clock can never see: a
+    // detached-and-held move source reconstructs at its pre-move path for the
+    // whole pairing window BY DESIGN, so a coordinate lowered anywhere in its
+    // subtree was born addressed at a slot the object has already left, with no
+    // later move for the clock to catch. [`Lowering::is_evidence`] asks both
+    // clauses, once, here.
+    let lowering = self.fence_lowering(id, placement);
+    // CERTIFY OR RETIRE — the whole rule this seam applies to a success, and the
+    // reason there is no third state between "proven" and "gone".
+    //
+    // An `Ok` reports that a kernel binding was installed at the path the driver
+    // LOWERED; `is_evidence` says whether that path is this node's. When it is
+    // not, the acknowledgement certifies nothing — it is proof about whatever
+    // occupies a slot this node has left. A binding nothing may certify may not
+    // be KEPT either: every record it produces would be attributed to the node's
+    // current path, as a false change there or as a retirement of coverage the
+    // real object carries, and no later `Rescan` retracts a delivered change. So
+    // the binding is RETIRED, and the retirement pays the cover and the counted
+    // replacement it owes
+    // ([`retire_unprovable_binding`](Self::retire_unprovable_binding)).
+    //
+    // Retiring the BINDING is not refusing to ARM. Arming inside a held subtree
+    // is the design's own best-effort coverage — it is what keeps a gap-created
+    // descendant of a mid-move source watched — so the arm is still issued and
+    // still answered here; what this declines is to call the answer proof.
+    //
+    // A non-`Arming` node is left alone: its arm already resolved, so this is a
+    // duplicate or late outcome that established nothing to retire.
+    if res.is_ok() && !lowering.is_evidence() && matches!(state, NodeState::Arming { .. }) {
+      self.retire_unprovable_binding(id, scope, &lowering);
+      return;
+    }
+    if lowering.moved {
+      // A FAILURE is the case where discarding the verdict IS the whole
+      // recovery: a refused arm created no binding, so nothing is left behind
+      // it — and the `Err` may not stand either, since it would retire a node
+      // whose object is alive and armable at its new location. The obligation is
+      // re-issued at wherever the node sits now
+      // ([`readdress_outstanding_arm`](Self::readdress_outstanding_arm), the
+      // same funnel a re-slotted arm uses, so a reprove arm keeps its loss
+      // stamp).
+      //
+      // Re-issuing rather than retiring is what keeps the node LIVE-bound: an
+      // `Arming` node with no arm outstanding is counted work nothing would ever
+      // release, and no re-arm cascade re-issues an arm (they only flavor one).
+      // It terminates because each re-issue is stamped with the current reading,
+      // and only a further move ON ITS OWN CHAIN can invalidate it again.
+      self.readdress_outstanding_arm(id);
+      return;
+    }
 
     match res {
       Ok(ack) => {
         // Only a pending (Arming) watch transitions to live. A duplicate or late `Ok` on
         // an already-armed node is ignored, not replayed: resetting it to `Live` would
         // clobber an outstanding `Enumerating` read and orphan its request.
-        let NodeState::Arming { rearm, reprove } = node.state else {
+        let NodeState::Arming { rearm, reprove } = state else {
           return;
         };
         if reprove {
@@ -2095,19 +3459,28 @@ impl Monitor {
           }
           self.reprove_stamps.remove(&id);
         }
+        // Every `Ok` that certifies a binding lowered at the node's own path,
+        // by construction: an unprovable one was retired above and returned, so
+        // there is no third state here to reason about. Stated rather than
+        // assumed — the whole class this seam exists for is an acknowledgement
+        // taken as proof of a path it never described.
+        debug_assert!(
+          lowering.is_evidence(),
+          "a certifying acknowledgement lowered at the node's own path"
+        );
         self.set_state(id, NodeState::Live);
         if is_dir && self.scope_descends(scope) {
-          // Continue a rescan re-arm into this freshly-armed directory if it was installed
-          // as part of one — OR if it arms while in a held subtree: a held-origin read must
-          // stay coverage-only (Created-suppressed) even if the move pairs and clears the
-          // hold before the result returns, so tag it as a re-arm now (the intent persists
-          // on `Enumerating.kind`). A cold discovery would else emit false `Created` for
-          // pre-existing destination children after the move.
+          // Continue a rescan re-arm into this freshly-armed directory if it was
+          // installed as part of one. A HELD node needs no clause of its own: an
+          // acknowledgement taken under a hold never certifies (it is retired
+          // above), so no node reaches here inside one, and the cold read this
+          // queues therefore cannot be a held-origin read whose flavor a later
+          // pairing would strand.
           if reprove {
             // A re-proved binding's read carries the flavor on: its kept
             // survivors are re-added in turn, so the proof reaches the leaves.
             self.queue_enumerate(id, EnumKind::Rearm { reprove: true }, 0);
-          } else if rearm || self.in_held_subtree(id).is_some() {
+          } else if rearm {
             let _ = self.start_rearm(id);
           } else {
             self.queue_enumerate(id, EnumKind::Cold, 0);
@@ -2117,12 +3490,11 @@ impl Monitor {
       // A failed install must not leave a silent blind spot: reconstruct the location
       // while the node still exists, emit a `Rescan`, then drop it. But a node that is
       // held (a pending source or descendant detached mid-move) has a STALE pre-move
-      // location — fence it like every other held-subtree activity: dirty the enclosing
-      // hold (so the pairing reparent re-scans the destination) instead of Rescanning the
-      // old path, then drop the failed node.
+      // location, so it may not be Rescanned there — the fence already dirtied the
+      // enclosing hold, and the pairing reparent re-scans the destination. Drop the
+      // failed node either way.
       Err(_) => {
-        if let Some(source) = self.in_held_subtree(id) {
-          self.dirtied_holds.insert(source);
+        if !lowering.locatable() {
           self.drop_subtree(id, DeficitDischarge::CoveringRescan);
         } else if self.is_root_watch(id) {
           // A refused ROOT install is a root invalidation like any other: Rescan, then
@@ -2145,6 +3517,79 @@ impl Monitor {
           }
           self.drop_subtree(id, DeficitDischarge::CoveringRescan);
         }
+      }
+    }
+  }
+
+  /// Retires the binding an unprovable acknowledgement reported, and rebuilds
+  /// the coverage that retirement ends — the entire discharge of the
+  /// certify-or-retire rule ([`ingest_watch_result`](Self::ingest_watch_result)).
+  ///
+  /// # Why the binding dies rather than waits
+  ///
+  /// The alternative is to keep the node live and suppress everything riding its
+  /// binding until a later acknowledgement re-proves it. That needs a marker with
+  /// its own lifetime, a bounded release for every path that marker can survive
+  /// on, and a barrier conjunct so no sync certifies over the suppressed window —
+  /// three things that must agree, at every site that can move, drop or re-arm the
+  /// node. Death needs none of them: the queued [`Action::Unwatch`] ends the
+  /// kernel binding, records already in flight against the handle are discarded by
+  /// [`ingest_record`](Self::ingest_record)'s opening `scope_of` (an unknown
+  /// watch), and there is no interval between the unprovable `Ok` and the
+  /// retirement for a barrier to observe — they are the same call.
+  ///
+  /// # What it costs, and what it deliberately does not
+  ///
+  /// The teardown reaches only the individually doubtful FRONTIER binding — a node
+  /// whose own arm was in flight when the path moved under it, typically a leaf
+  /// with no children yet. The subtree a rename CARRIES is untouched: the O(1)
+  /// reparent re-keys one link, and nothing here walks it.
+  fn retire_unprovable_binding(&mut self, id: WatchId, scope: ScopeId, lowering: &Lowering) {
+    // A ROOT has no slot to rebuild and no parent to cover at — its lowered path
+    // IS the scope's ground — so an acknowledgement that does not describe it is
+    // a root invalidation like a refused root install: `Rescan` first, so the
+    // loss is never silent, then drop the tree and the scope's pending halves.
+    let Some((parent, name, is_dir, identity)) = self.nodes.get(&id).and_then(|node| {
+      node
+        .parent
+        .zip(node.name.clone())
+        .map(|(parent, name)| (parent, name, node.is_dir, node.identity))
+    }) else {
+      self.emit_rescan(scope, self.location_of(id));
+      self.invalidate_root(scope, id);
+      return;
+    };
+    self.drop_subtree(id, DeficitDischarge::CoveringRescan);
+    // Under a hold there is no location this call may address: the tree
+    // reconstructs the vacated PRE-move path for the whole pairing window, so a
+    // `Rescan` emitted here would send the consumer to re-read a slot the object
+    // has left, and a replacement armed here would lower to that same slot and be
+    // retired again on its own acknowledgement. Defer the REBUILD, not the ISSUE:
+    // [`fence_lowering`](Self::fence_lowering) has already dirtied the enclosing
+    // hold, and the pairing's cover plus counted crawl re-install the emptied slot
+    // through the destination — or the move window expires and the whole held
+    // subtree is torn down behind its `Removed`.
+    if !lowering.locatable() {
+      return;
+    }
+    // Ending coverage of an object that provably still exists owes BOTH halves.
+    //
+    // The cover is UNCONDITIONAL. Every structural signal that could stand in for
+    // it is interest- and filter-subject — a `Modified`-only subscription receives
+    // no instruction at all — and the replacement's own read is a re-arm, so its
+    // content is `Created`-suppressed. Only a `Rescan` bypasses both.
+    self.emit_rescan(scope, self.child_location(parent, &name));
+    // The counted replacement, always re-arm-flavored whatever the retiree's was:
+    // this window is lossy by construction (the `Rescan` above), so the coverage
+    // being rebuilt is carried-over content rather than a discovery, and a cold
+    // install would announce every pre-existing entry as `Created` while leaving
+    // the window's counted half unsupplied — `coverage_settled` would then read
+    // true with the slot still unread. Entering `Arming { rearm: true }` is what
+    // marks the bridge window and holds the barrier until the rebuilt read lands.
+    if self.child_watch(parent, &name).is_none() {
+      self.install_child(parent, scope, name.clone(), is_dir, identity);
+      if let Some(fresh) = self.child_watch(parent, &name) {
+        let _ = self.inherit_rearm(fresh);
       }
     }
   }
@@ -2202,7 +3647,7 @@ impl Monitor {
         // destination. Only a non-held subtree rescans-and-rearms in place.
         let watch = sub.watch();
         if let Some(source) = self.in_held_subtree(watch) {
-          self.dirtied_holds.insert(source);
+          self.book_hold(source);
           self.mark_enumerate_dirty(watch);
         } else if let Some(scope_id) = self.scope_of(watch) {
           // The Rescan lands at the located directory (the watch's own location plus
@@ -2236,7 +3681,9 @@ impl Monitor {
         Some(scope) => self.scope_of(source) == Some(scope),
       })
       .collect();
-    self.dirtied_holds.extend(held);
+    for source in held {
+      self.book_hold(source);
+    }
   }
 
   /// Marks dirty every pending move half of `scope` — held or unheld — whose
@@ -2251,6 +3698,10 @@ impl Monitor {
   /// `MovedTo`'s own cookie); `carried` names a watch whose subtree the caller's own
   /// machinery is detaching-and-holding — halves anchored at or under it follow that
   /// move through the tree and are not marked.
+  ///
+  /// This runs once per ingested record, so it walks the scope's contiguous key
+  /// range rather than every scope's halves under a filter: the work is bounded by
+  /// [`PENDING_MOVE_CAP`], not by what unrelated roots happen to have in flight.
   fn dirty_pending_sources_touching(
     &mut self,
     scope: ScopeId,
@@ -2260,10 +3711,10 @@ impl Monitor {
   ) {
     let keys: std::vec::Vec<PendingKey> = self
       .pending_moves
-      .iter()
-      .filter(|((half_scope, cookie), pending)| {
-        *half_scope == scope
-          && Some(*cookie) != exclude
+      .range((scope, FIRST_COOKIE)..)
+      .take_while(|((half_scope, _), _)| *half_scope == scope)
+      .filter(|((_, cookie), pending)| {
+        Some(*cookie) != exclude
           && !pending.dirty
           && self.is_watched(pending.from_parent)
           && !carried.is_some_and(|held| {
@@ -2291,8 +3742,7 @@ impl Monitor {
     if !pending.dirty {
       return;
     }
-    if self.is_watched(pending.from_parent) {
-      let from = self.pending_from(pending);
+    if let Some(from) = self.live_pending_from(pending) {
       self.emit_rescan(scope, from);
     }
     self.emit_rescan(scope, to.clone());
@@ -2327,13 +3777,17 @@ impl Monitor {
   /// cross-directory per-directory replacement); it keeps the stale suffix and the
   /// flag alone covers — its resolution rescans the source it emits at, and the
   /// resolved pair's own dirty covers handle the relocated side.
+  ///
+  /// This runs once per resolved pairing `MovedTo`, so it walks the scope's
+  /// contiguous key range rather than every scope's halves under a filter: the
+  /// work is bounded by [`PENDING_MOVE_CAP`], not by what unrelated roots happen
+  /// to have in flight.
   fn reanchor_pending_sources(&mut self, scope: ScopeId, from: &Location, to: &Location) {
     let matched: std::vec::Vec<(PendingKey, Option<Location>)> = self
       .pending_moves
-      .iter()
-      .filter(|((half_scope, _), pending)| {
-        *half_scope == scope && self.is_watched(pending.from_parent)
-      })
+      .range((scope, FIRST_COOKIE)..)
+      .take_while(|((half_scope, _), _)| *half_scope == scope)
+      .filter(|(_, pending)| self.is_watched(pending.from_parent))
       .filter_map(|(key, pending)| {
         let source = self.pending_from(pending);
         if !source.starts_with(from) {
@@ -2412,9 +3866,23 @@ impl Monitor {
   ///   its `Ok` ACK re-issues under the current generation instead of
   ///   counting. The node is marked reprove so the stamp rule applies.
   ///
-  /// Dead nodes have nothing to re-prove. Held (mid-move) subtrees are never
-  /// targeted: the scope entry point re-adds only the root (never held), and
-  /// the crawl re-adds only in-slot survivors.
+  /// One trigger reaches here: a recorded LOSS on a binding-re-proving profile.
+  /// An arm whose lowering was not the node's own is no longer re-proved at all
+  /// — it certifies nothing, so the binding it reports is retired
+  /// ([`ingest_watch_result`](Self::ingest_watch_result)) rather than kept and
+  /// re-addressed.
+  ///
+  /// Dead nodes have nothing to re-prove. A held move SOURCE is never targeted:
+  /// the loss entry point re-adds only the root (never held), the crawl re-adds
+  /// only in-slot survivors, the pairing re-adds its source only after the hold
+  /// has ended and the re-key has landed, and a detached source has no
+  /// outstanding arm for a late outcome to answer — its arm
+  /// was retired at the detach ([`retire_arm`](Self::retire_arm)) and nothing
+  /// re-issues one at a slot it no longer occupies. A DESCENDANT of a held
+  /// source may be targeted, and soundly: it keeps its own `(parent, name)`, so
+  /// the re-add is addressed through a live in-subtree parent handle rather
+  /// than any absolute path the move invalidated — which is exactly the
+  /// best-effort arming under a hold the design already performs.
   fn start_reinstall(&mut self, watch: WatchId) {
     let Some(scope) = self.scope_of(watch) else {
       return;
@@ -2456,16 +3924,14 @@ impl Monitor {
             reprove: true,
           },
         );
-        // Every reproof trigger runs with a loss on record ([`scope_needs_reproof`]
-        // gates the heal and pairing funnels; the scope-loss entry bumps first),
-        // so the one-behind stamp is genuinely BEHIND — a saturated 0 == 0
-        // would let the in-flight ACK count without a postdating proof.
-        //
-        // [`scope_needs_reproof`]: Self::scope_needs_reproof
-        debug_assert!(
-          self.loss_gen(scope) > 0,
-          "a binding reproof is only ever triggered past a recorded loss"
-        );
+        // The one-behind stamp is what makes the in-flight arm's `Ok` re-issue
+        // under the current generation instead of counting, so wherever a LOSS
+        // raised the doubt it must be genuinely behind — and it is: the
+        // scope-loss entry bumps the generation before any loss-driven funnel
+        // runs, and it is the only trigger left: an arm whose lowering was not
+        // the node's own is retired rather than re-proved, so no caller reaches
+        // here at generation 0. The saturating subtraction is what makes that
+        // reading total rather than a panic if one ever does.
         let stale = self.loss_gen(scope).saturating_sub(1);
         self.reprove_stamps.entry(watch).or_insert(stale);
       }
@@ -2473,22 +3939,95 @@ impl Monitor {
     }
   }
 
-  /// Issues the re-add [`Action::Watch`] for a reprove-arming node — the
-  /// root's own re-add as [`WatchTarget::RearmRoot`](crate::action::WatchTarget::RearmRoot)
-  /// (never the stream-spawning root bootstrap), a child's through its
-  /// existing `(parent, name)` addressing — and stamps it with the scope's
-  /// current loss generation.
+  /// Issues the re-add [`Action::Watch`] for a reprove-arming node — through
+  /// [`queue_slot_arm`](Self::queue_slot_arm), so the re-add is addressed to
+  /// wherever the node sits NOW — and stamps it with the scope's current loss
+  /// generation.
   fn queue_reinstall(&mut self, watch: WatchId, scope: ScopeId) {
-    let Some(node) = self.nodes.get(&watch) else {
+    if !self.queue_slot_arm(watch, scope) {
       return;
+    }
+    self.reprove_stamps.insert(watch, self.loss_gen(scope));
+  }
+
+  /// Issues the [`Action::Watch`] arming `watch` at the slot it occupies NOW —
+  /// the root's own re-add as
+  /// [`WatchTarget::RearmRoot`](crate::action::WatchTarget::RearmRoot) (never
+  /// the stream-spawning root bootstrap), a child's through its current
+  /// `(parent, name)` addressing. Reports whether an arm was issued (`false`
+  /// only for a dead handle).
+  ///
+  /// A `Child` target is a COORDINATE handed across the driver round trip, and
+  /// a rename that re-slots the node between the issue and the install leaves
+  /// it aimed at a name the object has left. The handle in the same command is
+  /// the identity that survives that rename, so the pairing of "issue off the
+  /// current slot" with "re-issue at every re-slot"
+  /// ([`readdress_outstanding_arm`](Self::readdress_outstanding_arm)) and
+  /// "never dispatch a superseded arm" ([`poll_action`](Self::poll_action)) is
+  /// what keeps *the outstanding arm names where the node is* an invariant
+  /// rather than a fact that was true when it was queued.
+  fn queue_slot_arm(&mut self, watch: WatchId, scope: ScopeId) -> bool {
+    let Some(node) = self.nodes.get(&watch) else {
+      return false;
     };
     let target = match node.parent.zip(node.name.clone()) {
       Some((parent, name)) => crate::action::WatchTarget::child(parent, name),
       None => crate::action::WatchTarget::RearmRoot(scope),
     };
     let mask = Self::coverage_mask(self.scope_interest(scope));
-    self.actions.push_back(Action::watch(watch, target, mask));
-    self.reprove_stamps.insert(watch, self.loss_gen(scope));
+    self.queue_watch(watch, target, mask);
+    true
+  }
+
+  /// Re-addresses the arm outstanding for a node whose SLOT just changed, so
+  /// the install lands where the node now is.
+  ///
+  /// A pending arm is addressed to a `(parent, name)` coordinate that a rename
+  /// can empty while the node it named lives on — detached, reparented, and
+  /// still awaiting the very acknowledgement that would return it to `Live`.
+  /// Neither half of the existing machinery closes that on its own: the queued
+  /// action cannot be rewritten once the driver holds it, and
+  /// [`start_reinstall`](Self::start_reinstall) deliberately issues nothing for
+  /// a node already `Arming` (one arm per node is outstanding by construction),
+  /// so the stale addressing would simply stand. Issuing a fresh arm here
+  /// supersedes the old attempt — a still-in-flight outcome for it is then
+  /// discarded by [`ingest_watch_result`](Self::ingest_watch_result), and a
+  /// still-queued one by [`poll_action`](Self::poll_action) — and the node
+  /// stays counted until an acknowledgement for the FINAL slot lands.
+  ///
+  /// A reprove arm re-issues through [`queue_reinstall`](Self::queue_reinstall)
+  /// so its loss-generation stamp travels with it; without the re-stamp the
+  /// fresh arm would answer under whatever the superseded one carried.
+  ///
+  /// A node whose state is no longer `Arming` has no outstanding arm to
+  /// re-address — its arm already resolved — and correctly takes nothing from
+  /// this.
+  fn readdress_outstanding_arm(&mut self, watch: WatchId) {
+    let Some(node) = self.nodes.get(&watch) else {
+      return;
+    };
+    let NodeState::Arming { reprove, .. } = node.state else {
+      return;
+    };
+    let scope = node.scope;
+    if reprove {
+      self.queue_reinstall(watch, scope);
+    } else {
+      self.queue_slot_arm(watch, scope);
+    }
+  }
+
+  /// Retires the arm outstanding for `watch` WITHOUT issuing a replacement —
+  /// the supersession half of a slot change that leaves the node with no slot
+  /// to be addressed at ([`detach_child`](Self::detach_child)).
+  ///
+  /// A detached source occupies no `(parent, name)`, so there is no coordinate
+  /// an arm could name: installing at the one it just vacated would bind this
+  /// handle to whatever replacement took the path. The node stays `Arming` and
+  /// uncertified for the hold's duration, which is exactly right — it is either
+  /// reparented, and re-addressed there, or torn down with its half.
+  fn retire_arm(&mut self, watch: WatchId) {
+    let _ = self.adopt_arm(watch);
   }
 
   /// Advances time, resolving move halves whose pairing window has elapsed: an
@@ -2499,7 +4038,7 @@ impl Monitor {
     let expired: std::vec::Vec<PendingKey> = self
       .pending_moves
       .iter()
-      .filter(|(_, pending)| now.reached(pending.deadline))
+      .filter(|(_, pending)| !pending.in_window(now))
       .map(|(key, _)| *key)
       .collect();
 
@@ -2512,9 +4051,92 @@ impl Monitor {
   }
 
   /// Dequeues the next [`Action`] for the driver to execute, if any.
-  #[cfg_attr(not(tarpaulin), inline(always))]
+  ///
+  /// A queued [`Action::Watch`] whose [`ArmAttempt`] its handle no longer names
+  /// is DISCARDED rather than handed out: a later arm superseded it before it
+  /// was ever dispatched, so its `(parent, name)` addressing describes a slot
+  /// the node has since left. This is the dispatch-side half of the
+  /// supersession fence [`on_watch_result`](Self::on_watch_result) applies on
+  /// the reply side — and it must be a fence at the point of USE rather than a
+  /// removal at the point of supersession, because a queued action cannot be
+  /// found by handle without a scan of the queue. Executing one anyway is not
+  /// merely wasted work: on a backend that keys its raw handle by [`WatchId`]
+  /// it binds this watch to whatever object took the vacated path, and every
+  /// record that object produces is then attributed to a subtree that lives
+  /// somewhere else. Nothing is lost by discarding — an arm is superseded only
+  /// where a replacement is queued in its place, where the driver has already
+  /// executed it out of band ([`rebind_root`](Self::rebind_root)), or where the
+  /// node has been detached mid-move and so has no slot left to arm at all.
+  ///
+  /// An arm handed out here is also RE-STAMPED with the placement clock: this —
+  /// not the enqueue — is the seam the driver lowers its coordinate at, so this
+  /// is the reading against which its acknowledgement is judged.
+  #[cfg_attr(not(tarpaulin), inline)]
   pub fn poll_action(&mut self) -> Option<Action> {
-    self.actions.pop_front()
+    while let Some(action) = self.actions.pop_front() {
+      if !self.is_superseded_arm(&action) {
+        self.stamp_dispatch(&action);
+        return Some(action);
+      }
+    }
+    None
+  }
+
+  /// Re-stamps the placement of the arm `action` carries, at the moment it is
+  /// HANDED OUT.
+  ///
+  /// The stamp exists to answer "does the absolute path the driver lowered this
+  /// coordinate to still describe the node" ([`placement_now`](Self::placement_now)),
+  /// so it is only sound if it postdates nothing the lowering saw and predates
+  /// nothing it did not. A driver cannot lower an action it has not been given,
+  /// and it derives the path from the tree AS OF the poll — so the dispatch is
+  /// the earliest reading that is still a fact about the lowering, and the
+  /// enqueue is strictly too early.
+  ///
+  /// The difference is a whole batch wide, and it is not academic. A backend
+  /// feeds one kernel batch record by record and drains the resulting actions
+  /// only once the batch is spent: a record can discover a descendant and queue
+  /// its arm, a later record of the SAME batch rename that descendant's
+  /// ancestor, and the drain then correctly open the descendant at its new
+  /// destination. Judged against the enqueue reading the acknowledgement reads
+  /// stale and the binding is RETIRED — a FALSE staleness, since the arm was
+  /// lowered at the right path all along — and a retirement is not free: a live
+  /// kernel binding is torn down and its subtree re-crawled, so every record the
+  /// gap swallows is carried only by whatever the rebuild's own read sees.
+  ///
+  /// This does not launder an arm queued before a DETACH into a clean one. That
+  /// hazard is the `held` clause's, not the clock's: a detached-and-held source
+  /// reconstructs at its pre-move path for the whole pairing window BY DESIGN, so
+  /// the path a coordinate under it lowers to is knowingly stale no matter when
+  /// the reading is taken, and [`Lowering`] answers both clauses separately for
+  /// exactly this reason. The clock's question is narrower — "did the derived
+  /// path change after it was derived" — and the derivation happens here.
+  ///
+  /// Only the dispatched action is stamped. One already handed to the driver
+  /// keeps the reading it was given, since its lowering is already in the past;
+  /// and a superseded arm is discarded above without stamping, so it cannot
+  /// advance the reading its replacement will answer under.
+  fn stamp_dispatch(&mut self, action: &Action) {
+    let Some(id) = action.as_watch().map(|cmd| cmd.id()) else {
+      return;
+    };
+    let now = self.placement_now();
+    if let Some(node) = self.nodes.get_mut(&id) {
+      node.placement = now;
+    }
+  }
+
+  /// Whether `action` installs a watch under an [`ArmAttempt`] some later arm
+  /// for the same handle has already superseded. An action for a handle with no
+  /// node is NOT superseded: its trailing [`Action::Unwatch`] is what reclaims
+  /// it, and the driver's contract already makes that pair a no-op.
+  fn is_superseded_arm(&self, action: &Action) -> bool {
+    action.as_watch().is_some_and(|cmd| {
+      self
+        .nodes
+        .get(&cmd.id())
+        .is_some_and(|node| node.attempt != cmd.attempt())
+    })
   }
 
   /// Dequeues the next normalized [`Change`] for the consumer, if any.
@@ -2540,8 +4162,7 @@ impl Monitor {
     // coverage reconciliation below runs regardless — the record may exist only because
     // of the coverage-augmented subscription.
     if self.ondir_allows(scope, rec.is_dir()) {
-      let location = self.record_location(rec);
-      self.emit(scope, location, ChangeKind::Created);
+      self.emit_child(scope, rec, ChangeKind::Created);
     }
     if let Some(name) = rec.name() {
       // A create is discovery, not a replace: an occupied slot is a duplicate
@@ -2559,8 +4180,7 @@ impl Monitor {
 
   fn on_removed(&mut self, scope: ScopeId, rec: &OsRecord) {
     if self.ondir_allows(scope, rec.is_dir()) {
-      let location = self.record_location(rec);
-      self.emit(scope, location, ChangeKind::Removed);
+      self.emit_child(scope, rec, ChangeKind::Removed);
     }
     if let Some(name) = rec.name() {
       // The slot's object is gone: drop any watch that covered it, so a later
@@ -2583,8 +4203,13 @@ impl Monitor {
     let src = rec
       .name()
       .and_then(|name| self.child_watch(rec.watch(), name));
+    // The bound is asked HERE, in the pattern's guard, because everything the
+    // cookied arm does before it parks — the detach, the hold, the born-dirty
+    // mark — is bookkeeping owed to a half that is about to exist. Testing
+    // capacity after any of it would leave a refused record half-applied, with
+    // a detached source no parked half will ever resolve.
     match (rec.cookie(), rec.target()) {
-      (Some(cookie), Some(target)) => {
+      (Some(cookie), Some(target)) if self.admits_pending_move(scope, cookie) => {
         // Detach a watched-directory source from its old `(parent, name)` slot the
         // moment it moves away, but KEEP its subtree: a paired `MovedTo` reparents it
         // in O(1) (descendants follow for free), and until then detaching has already
@@ -2611,7 +4236,7 @@ impl Monitor {
           // already-flavored or already-proven source costs its pairing one
           // bounded re-add; a settled scope pays nothing.
           if self.scope_needs_reproof(scope) && !self.rearm_settled(scope) {
-            self.dirtied_holds.insert(src);
+            self.book_hold(src);
           }
         }
         let pending = PendingMove {
@@ -2627,6 +4252,7 @@ impl Monitor {
           } else {
             rec.is_dir()
           },
+          evidence: rec.evidence(),
           dirty: false,
         };
         // Invariant (d): the cookie is namespaced by scope, so only a *same-scope*
@@ -2637,25 +4263,78 @@ impl Monitor {
           self.resolve_stored_half(displaced);
         }
       }
-      // A no-cookie (or degenerate nameless) source can never pair: tear its subtree
-      // down now and emit the `Removed`. `from_parent` is `rec.watch()`, live by
-      // construction (`scope_of` succeeded), so no liveness guard is needed.
-      _ => {
+      // A source that can never pair: no cookie (or a degenerate nameless record),
+      // or one the scope's bound refused — declining to remember a half is what
+      // makes it unpairable, so the two are the same fact and share this one
+      // teardown. Tear the subtree down now and emit the `Removed`. `from_parent`
+      // is `rec.watch()`, live by construction (`scope_of` succeeded), so no
+      // liveness guard is needed.
+      unpairable => {
         let is_dir = if src.is_some() {
           Some(true)
         } else {
           rec.is_dir()
         };
         if let Some(src) = src {
+          // Where the two part company is what the teardown OWES. A cookied, NAMED
+          // source reaches this arm only because the guard above refused it — that
+          // guard is the arm's sole discriminator, so the shape re-reads the refusal
+          // without re-deciding it — and a refusal is the one case here in which the
+          // object provably survives: the cookie is a rename still in flight, so the
+          // directory exists and its destination is still coming. A cookieless or
+          // nameless source carries no such evidence; for it, "moved away" is
+          // terminal knowledge, indistinguishable from the removal whose teardown
+          // the erasure argument was written for.
+          if matches!(unpairable, (Some(_), Some(_))) {
+            self.stand_counted_cover(scope);
+          }
           self.drop_subtree(src, DeficitDischarge::CoveringRescan);
         }
         let from = self.record_location(rec);
-        self.resolve_lost_source(scope, from, is_dir);
+        self.resolve_lost_source(scope, from, is_dir, rec.evidence());
       }
     }
   }
 
-  fn on_moved_to(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) {
+  /// The pre-reparent source slot of a parked half that takes
+  /// [`on_moved_to`](Self::on_moved_to)'s held-directory reparenting arm — the ONE
+  /// definition of that arm's precondition.
+  ///
+  /// `Some((from_parent, from))` exactly when the half is still in its pairing
+  /// window, the destination record names a direct child slot to reparent onto, the
+  /// half holds a watched subtree to reparent, and the half's own `from_parent` is
+  /// still watched. (Pairing itself — a same-scope cookie hit in `pending_moves` —
+  /// is the caller's lookup: it is what produced the `pending` argument.)
+  ///
+  /// `on_moved_to` consults this once, pre-reparent, and consults nothing else:
+  /// the arm re-anchors the halves parked under `from` against this value, and a
+  /// reparent that then SUCCEEDS reports this same value as the record's
+  /// [`RecordOutcome::Reparented`]. Deciding it twice — once to act, once to
+  /// report — is precisely the skew this indirection exists to make impossible.
+  ///
+  /// The last conjunct is belt-and-braces rather than a discriminating one on the
+  /// success path: a teardown of `from_parent` walks its `children`, which still
+  /// contains a detached-and-held source, so a dead `from_parent` implies a dead
+  /// `held` and a reparent that cannot succeed anyway. It is stated because it is
+  /// what makes `from` a location at all — a half whose anchor died reconstructs
+  /// nothing, which is the same reason [`emit_pair`](Self::emit_pair) degrades its
+  /// delivery to a `Created`.
+  fn reparenting_source(
+    &self,
+    pending: &PendingMove,
+    name: Option<&Segment>,
+    now: Instant,
+  ) -> Option<(WatchId, Location)> {
+    if !pending.in_window(now) || name.is_none() || pending.held.is_none() {
+      return None;
+    }
+    self
+      .live_pending_from(pending)
+      .map(|from| (pending.from_parent, from))
+  }
+
+  fn on_moved_to(&mut self, scope: ScopeId, rec: &OsRecord, now: Instant) -> RecordOutcome {
+    let mut outcome = RecordOutcome::Nothing;
     let to = self.record_location(rec);
     match rec
       .cookie()
@@ -2665,7 +4344,7 @@ impl Monitor {
       // half, so a cross-scope cookie collision never matches here (it resolves as
       // a fresh `Created` via the `None` arm). A matched half pairs only before its
       // window elapses; past it the source already stranded (a late destination).
-      Some(pending) if !now.reached(pending.deadline) => {
+      Some(pending) if pending.in_window(now) => {
         // ONE class per resolution, consumed by BOTH delivery and reconciliation:
         // the arriving record is the NEWEST observation of the object, so its positive
         // flag wins; the pending half's class only fills an OMITTED flag. The reverse
@@ -2673,15 +4352,20 @@ impl Monitor {
         // narrowly torn down, paired by a reused cookie) demote a real directory
         // destination to an unwatched file slot — silent coverage loss.
         let class = rec.is_dir().or(pending.is_dir);
+        // ONE fact set per resolution too: the pairing is the two halves' single
+        // event, so whatever either half proved admits the change it becomes.
+        let paired = pending.evidence.union(rec.evidence());
         // The source path this pairing relocates, captured while the half is intact:
         // other halves parked under it must re-anchor once the `Moved` is emitted.
         // `from_parent` is the source's (old) parent — never inside the moved subtree —
         // so this reconstruction is stable across the reparent below. An unanchored
         // half emits `Created`, not `Moved` (see `emit_pair`): nothing relocates, so
         // there is nothing to re-anchor under.
-        let resolved_from = self
-          .is_watched(pending.from_parent)
-          .then(|| self.pending_from(&pending));
+        let resolved_from = self.live_pending_from(&pending);
+        // The same capture for the held-directory arm, taken through the arm's own
+        // single-definition precondition so the value that steers the re-anchor and
+        // the value this record reports are one evaluation, not two agreeing ones.
+        let reparenting = self.reparenting_source(&pending, rec.name(), now);
         match (rec.name(), pending.held) {
           // Held directory: attempt the O(1) reparent and emit the pairing only once
           // it succeeds — a `Moved` must never precede a rejected/aborted reparent.
@@ -2694,12 +4378,22 @@ impl Monitor {
               self.held_by_scope_dec(scope);
             }
             let dirtied = self.dirtied_holds.remove(&src);
-            if self.can_reparent(src, rec.watch()) && self.reparent(src, rec.watch(), name.clone())
+            if self.can_reparent(src, rec.watch())
+              && self.reparent(src, rec.watch(), name.clone(), Reparent::Moved)
             {
-              self.emit_pair(scope, to.clone(), &pending, class);
-              if let Some(from) = resolved_from.as_ref() {
+              self.emit_pair(scope, to.clone(), &pending, class, paired);
+              if let Some((_, from)) = reparenting.as_ref() {
                 self.reanchor_pending_sources(scope, from, &to);
               }
+              // The reparent LANDED, and this is the only branch in which one does:
+              // report the slot the tree just left. It is the SAME value the
+              // re-anchor above ran on — captured before the re-key, so it names
+              // where the subtree was (the key a consumer's own bookkeeping still
+              // holds), not where it now is.
+              outcome = match reparenting {
+                Some((from_parent, from)) => RecordOutcome::Reparented { from_parent, from },
+                None => RecordOutcome::Nothing,
+              };
               // A source-slot touch during the hold (a delivered replacement at the
               // vacated path) covers through the half's own flag — source AND
               // destination — independent of the under-hold suppression below.
@@ -2707,20 +4401,39 @@ impl Monitor {
               if dirtied {
                 // Records under the moved subtree were suppressed at the stale path:
                 // re-scan the destination and re-arm the subtree to recover them.
+                // A re-READ suffices for all of it — what a hold suppresses is
+                // content, and the retired name a retirement left empty is one the
+                // crawl re-installs like any other.
+                //
                 // A scope-level loss during the hold also DIRTIES it (the
-                // recovery deliberately skips a held subtree), so on a
-                // binding-re-proving scope with a loss on record the re-arm
-                // must be the re-add: the reparented source is in-slot at the
-                // destination now, and its acknowledged re-add — resolved
-                // through the live path — is what re-proves the subtree the
-                // recovery could not reach (a plain read would keep every
-                // identity-matched descendant on possibly-dead bindings).
+                // recovery deliberately skips a held subtree), and THAT one a
+                // re-read cannot answer: on a binding-re-proving scope with a
+                // loss on record the re-arm must be the re-add, because the
+                // reparented source is in-slot at the destination now and its
+                // acknowledged re-add — resolved through the live path — is what
+                // re-proves the subtree the recovery could not reach (a plain
+                // read would keep every identity-matched descendant on
+                // possibly-dead bindings).
                 self.emit_rescan(scope, to);
                 if self.scope_needs_reproof(scope) {
                   self.start_reinstall(src);
                 } else {
                   let _ = self.inherit_rearm(src);
                 }
+              }
+              // A descent booked against this subtree before it moved: the stat
+              // it was deferred at is addressed to the slot the source has now
+              // LEFT, so that answer finds no incumbent and settles the
+              // obligation against nothing. It travelled on the identity
+              // instead, which the reparent preserved — discharge it here,
+              // after the re-key, so the re-add it may issue resolves through
+              // the destination path rather than the stale pre-move one. Not
+              // implied by the dirtied branch above: a hold is born dirty only
+              // where the scope's reproof was still UNSETTLED, and the deferral
+              // is deliberately uncounted, so the common case is a settled
+              // scope whose hold carries no marker at all.
+              if let Some(descent) = self.owed_descents.remove(&src) {
+                self.apply_descent(src, descent);
               }
             } else {
               // Not reparentable: a dead or cyclic held source, or a reparent that
@@ -2732,8 +4445,13 @@ impl Monitor {
                 self.drop_subtree(src, DeficitDischarge::CoveringRescan);
               }
               if self.is_watched(rec.watch()) {
-                self.emit_pair(scope, to.clone(), &pending, class);
-                if let Some(from) = resolved_from.as_ref() {
+                self.emit_pair(scope, to.clone(), &pending, class, paired);
+                // The arm's own capture again — the reparent failing changes where the
+                // pair relocates halves FROM not at all. The `outcome` stays `Nothing`:
+                // the tree did not carry the subtree, so a consumer must NOT re-anchor
+                // as if it had. That sliver is why the record reports what it did
+                // rather than exposing what it decided.
+                if let Some((_, from)) = reparenting.as_ref() {
                   self.reanchor_pending_sources(scope, from, &to);
                 }
                 // A source-slot touch during the hold still owes its source-side
@@ -2757,6 +4475,15 @@ impl Monitor {
                   true,
                   rec.node(),
                 );
+                // That rebuild is over CARRIED-OVER content, not a discovery, and the
+                // `Rescan` above is this window's opening loss edge — so the fresh
+                // destination watch must be COUNTED behind it. A cold install would
+                // leave the window nothing to wait on: the bridge conjunction would
+                // never complete, and `coverage_settled` would read true while the
+                // destination subtree was still unread.
+                if let Some(fresh) = self.child_watch(rec.watch(), name) {
+                  let _ = self.inherit_rearm(fresh);
+                }
               } else {
                 // The destination parent died with the held subtree (it sat inside it),
                 // so the precomputed `to` reconstructed through the detached source and
@@ -2767,13 +4494,20 @@ impl Monitor {
                 // or its stale facts would land post-rescan uninstructed.
                 self.dirty_pending_sources_touching(scope, &Location::new(), None, None);
                 self.dirty_held_sources(Some(scope));
-                self.emit_rescan(scope, Location::new());
+                // The record in hand proves the moved object is alive somewhere in the
+                // scope, and this arm just ended the whole subtree's coverage without
+                // rebuilding any of it — so the root escalation owes the SAME counted
+                // crawl a nameless destination's teardown owes, not a bare edge
+                // `Rescan` the barrier can certify over on the very next poll. (A
+                // kernel-recursive scope never reaches here: the arm needs a held
+                // source, which only a per-directory child watch can be.)
+                self.stand_counted_cover(scope);
               }
             }
           }
           // Non-directory (or unwatched) source: emit the pairing and reconcile the slot.
           (Some(name), None) => {
-            self.emit_pair(scope, to.clone(), &pending, class);
+            self.emit_pair(scope, to.clone(), &pending, class, paired);
             if let Some(from) = resolved_from.as_ref() {
               self.reanchor_pending_sources(scope, from, &to);
             }
@@ -2789,9 +4523,16 @@ impl Monitor {
           }
           (None, held) => {
             if let Some(src) = held {
+              // The destination record in hand proves the object is alive inside the
+              // scope, and a nameless one leaves the tree no slot to re-cover it at —
+              // so unlike every sibling arm this drop ends the subtree's coverage for
+              // good, with only the interest- and filter-subject `Moved` to say so.
+              // The erasure argument is about a vanished subtree and does not reach
+              // this one.
+              self.stand_counted_cover(scope);
               self.drop_subtree(src, DeficitDischarge::CoveringRescan);
             }
-            self.emit_pair(scope, to.clone(), &pending, class);
+            self.emit_pair(scope, to.clone(), &pending, class, paired);
             if let Some(from) = resolved_from.as_ref() {
               self.reanchor_pending_sources(scope, from, &to);
             }
@@ -2812,14 +4553,32 @@ impl Monitor {
         // unknown-class over-delivery only remains where the class is genuinely
         // unknown on both sides, and a stale half cannot override a live signal.
         let class = rec.is_dir().or(pending.is_dir);
+        // Whether resolving the half ENDS the coverage of a watched subtree this very
+        // record proves is still alive. The strand's own teardown may not go silent
+        // here the way a timed-out or displaced half's may: those resolve on the
+        // absence of a destination, so nothing left can describe the object, whereas
+        // this arm holds the destination record. Every signal the resolution does
+        // emit — the stranded `Removed`, the arrival's `Created` — is interest- and
+        // filter-subject and reaches a `Modified`-only subscription with nothing,
+        // while a later record in the same batch naming one of the dropped
+        // descendant handles is discarded by the unknown-watch guard (and cannot even
+        // dirty the hold, whose node is already gone). Only a `Rescan` reaches that
+        // subscription.
+        let carried = pending.held.is_some_and(|src| self.is_watched(src));
         self.resolve_stored_half(pending);
         if self.is_watched(rec.watch()) {
           // Delivery honors `ondir`; the slot reconciliation below is coverage and
           // runs regardless.
           if self.ondir_allows(scope, class) {
-            self.emit(scope, to, ChangeKind::Created);
+            self.emit(scope, to.clone(), ChangeKind::Created, rec.evidence());
           }
           if let Some(name) = rec.name() {
+            if carried {
+              // The opening loss edge for the interval between the teardown above and
+              // the destination watch arming below — the failed-carry-over arm's
+              // `Rescan`, owed for the same reason past the window as within it.
+              self.emit_rescan(scope, to.clone());
+            }
             self.reconcile_slot(
               rec.watch(),
               scope,
@@ -2828,6 +4587,21 @@ impl Monitor {
               true,
               rec.node(),
             );
+            // And the rebuild is COUNTED behind that edge: it re-covers CARRIED-OVER
+            // content, not a discovery, so a cold install would leave the window
+            // nothing to wait on — the bridge conjunction would never complete, and
+            // `coverage_settled` would read true while the destination subtree was
+            // still unread. Counted without the edge `Rescan` is no better: the read
+            // flips re-arm-flavored, its `Created`s are suppressed, and with
+            // `saw_rescan` unset no closing `Rescan` is ever minted.
+            if carried && let Some(fresh) = self.child_watch(rec.watch(), name) {
+              let _ = self.inherit_rearm(fresh);
+            }
+          } else if carried {
+            // A nameless destination leaves the tree no slot to re-cover the subtree
+            // at, so the recovery anchors at the root — the in-window nameless twin's
+            // argument, applied past the window.
+            self.stand_counted_cover(scope);
           }
         } else {
           // Resolving the stranded source dropped the destination parent (a cyclic late
@@ -2836,12 +4610,14 @@ impl Monitor {
           // parked stores as for any scope-wide transition (see the in-window twin).
           self.dirty_pending_sources_touching(scope, &Location::new(), None, None);
           self.dirty_held_sources(Some(scope));
-          self.emit_rescan(scope, Location::new());
+          // Counted, for the in-window twin's reason: the record proves the object
+          // survives, and this arm rebuilt none of the coverage it just ended.
+          self.stand_counted_cover(scope);
         }
       }
       None => {
         if self.ondir_allows(scope, rec.is_dir()) {
-          self.emit(scope, to, ChangeKind::Created);
+          self.emit(scope, to, ChangeKind::Created, rec.evidence());
         }
         if let Some(name) = rec.name() {
           self.reconcile_slot(
@@ -2855,6 +4631,7 @@ impl Monitor {
         }
       }
     }
+    outcome
   }
 
   /// Resolves a *stored* pending half (one taken from `pending_moves` — at timeout,
@@ -2874,9 +4651,13 @@ impl Monitor {
     if let Some(src) = pending.held {
       self.drop_subtree(src, DeficitDischarge::CoveringRescan);
     }
-    if self.is_watched(pending.from_parent) {
-      let from = self.pending_from(&pending);
-      self.resolve_lost_source(pending.scope, from.clone(), pending.is_dir);
+    if let Some(from) = self.live_pending_from(&pending) {
+      self.resolve_lost_source(
+        pending.scope,
+        from.clone(),
+        pending.is_dir,
+        pending.evidence,
+      );
       // A dirty half's window saw interleaved subtree activity whose facts the
       // stranded-source `Removed` above contradicts: cover the source with a re-read
       // instruction, under the same liveness guard (a dead `from_parent` has no live
@@ -2899,6 +4680,22 @@ impl Monitor {
     self.location_of(pending.from_parent).join(&pending.from)
   }
 
+  /// [`pending_from`](Self::pending_from) under the anchor-liveness guard — the ONE
+  /// definition of "this half still has a source path at all".
+  ///
+  /// A narrow subtree drop leaves a half pairable after its `from_parent` died
+  /// (invariants b/c), and such a half reconstructs nothing: `location_of` a dead
+  /// watch is not the path the source occupied. Every site that must not speak of a
+  /// dead source — the stranded-half `Removed` and its covering `Rescan`, the pair's
+  /// `Moved`-versus-`Created` degrade, a dirty pair's source-side cover, and the
+  /// reparenting slot this record reports — asks here rather than re-spelling the
+  /// guard, so none of them can disagree about whether a source exists.
+  fn live_pending_from(&self, pending: &PendingMove) -> Option<Location> {
+    self
+      .is_watched(pending.from_parent)
+      .then(|| self.pending_from(pending))
+  }
+
   /// Emits the outcome of a paired `MovedTo`: a `Moved` when the source is still
   /// anchored, otherwise a fresh `Created`. Liveness is checked *now*, not snapshotted
   /// earlier — a reparent can have dropped `from_parent` (its destination slot may be
@@ -2912,15 +4709,17 @@ impl Monitor {
     to: Location,
     pending: &PendingMove,
     class: Option<bool>,
+    evidence: Evidence,
   ) {
     if !self.ondir_allows(scope, class) {
       return;
     }
-    if self.is_watched(pending.from_parent) {
-      let from = self.pending_from(pending);
-      self.emit(scope, to, ChangeKind::Moved(from));
+    if let Some(from) = self.live_pending_from(pending) {
+      self.emit(scope, to, ChangeKind::Moved(from), evidence);
     } else {
-      self.emit(scope, to, ChangeKind::Created);
+      // A rename whose source anchor died reports as a `Created`; the pair's own
+      // evidence rides along so a `moved`-only subscription still learns of it.
+      self.emit(scope, to, ChangeKind::Created, evidence);
     }
   }
 
@@ -2928,11 +4727,35 @@ impl Monitor {
   /// subtree. The node stays in `nodes` (still attributing records, at its pre-move
   /// path) so a paired [`MovedTo`](Self::on_moved_to) can [`reparent`](Self::reparent)
   /// it; freeing the slot lets a replacement at the old path install its own watch.
+  ///
+  /// The object has left the path the tree still reconstructs for it, so this is
+  /// also where every coordinate lowered under this subtree — the node's own and
+  /// its descendants' alike — stops describing what it names. That is settled in
+  /// two complementary ways, and both are needed:
+  ///
+  /// - the node's own placement change is recorded
+  ///   ([`moved_placement`](Self::moved_placement)), which is the completion-side
+  ///   net: a result for any round trip already dispatched under this subtree no
+  ///   longer counts as clean. It reaches descendants — which no supersession
+  ///   can, since their own slots did not change — without walking the subtree,
+  ///   because the walk happens on the far side, once, per completed request;
+  /// - a pending ARM is retired ([`retire_arm`](Self::retire_arm)), which the
+  ///   clock cannot stand in for: retiring is DISPATCH-side prevention. The
+  ///   arm's `(parent, name)` addressing now names the vacated path, so an arm
+  ///   still queued would install a binding on whatever replacement stands
+  ///   there, and rejecting its acknowledgement afterwards does not un-bind it.
   fn detach_child(&mut self, child: WatchId) {
     if let Some(node) = self.nodes.get(&child)
       && let (Some(parent), Some(name)) = (node.parent, node.name.clone())
     {
       self.child_index.remove(&(parent, name));
+    }
+    self.moved_placement(child);
+    if matches!(
+      self.nodes.get(&child).map(|node| node.state),
+      Some(NodeState::Arming { .. })
+    ) {
+      self.retire_arm(child);
     }
   }
 
@@ -2949,8 +4772,18 @@ impl Monitor {
   /// inside the destination slot — leaving nothing to re-key; the caller escalates.
   /// The caller is responsible for the acyclic precondition ([`can_reparent`]).
   ///
+  /// `flavor` is the caller's answer to "did any absolute path change?", and it
+  /// is asked rather than inferred because the two callers genuinely differ (see
+  /// [`Reparent`]).
+  ///
   /// [`can_reparent`]: Self::can_reparent
-  fn reparent(&mut self, child: WatchId, new_parent: WatchId, new_name: Segment) -> bool {
+  fn reparent(
+    &mut self,
+    child: WatchId,
+    new_parent: WatchId,
+    new_name: Segment,
+    flavor: Reparent,
+  ) -> bool {
     let mut inherit_rearm = false;
     if let Some(stale) = self.child_watch(new_parent, &new_name)
       && stale != child
@@ -2981,9 +4814,21 @@ impl Monitor {
       parent_node.children.insert(child);
     }
     self.child_index.insert((new_parent, new_name), child);
+    // Ahead of every round trip this re-key goes on to issue, so each is stamped
+    // against the placement it is actually addressed at: a `Moved` re-key means
+    // every coordinate lowered under this subtree before now — including one
+    // issued DURING the hold, which lowered at the pre-move path by design —
+    // describes a location the subtree has left.
+    if matches!(flavor, Reparent::Moved) {
+      self.moved_placement(child);
+    }
     if inherit_rearm {
       let _ = self.inherit_rearm(child);
     }
+    // The node now answers to a different `(parent, name)`, so an arm still
+    // outstanding for it is addressed to the slot it just left — re-address it
+    // here, at the one funnel every re-key passes through.
+    self.readdress_outstanding_arm(child);
     true
   }
 
@@ -3015,11 +4860,22 @@ impl Monitor {
   /// location, so emit a [`ChangeKind::Removed`]. A watched-directory source had
   /// its now-stale watch subtree dropped already at `on_moved_from` (eager-drop),
   /// so there is nothing more to tear down here.
-  fn resolve_lost_source(&mut self, scope: ScopeId, from: Location, is_dir: Option<bool>) {
+  fn resolve_lost_source(
+    &mut self,
+    scope: ScopeId,
+    from: Location,
+    is_dir: Option<bool>,
+    evidence: Evidence,
+  ) {
     if !self.ondir_allows(scope, is_dir) {
       return;
     }
-    self.emit(scope, from, ChangeKind::Removed);
+    // The `Removed` is the DEGRADE of a rename the monitor could not pair, not a
+    // removal anyone observed. Its evidence still names the move, so the
+    // subscriber who asked about renames — and would otherwise receive neither
+    // half of one, nor a `Rescan` — is admitted on the fact that actually
+    // happened.
+    self.emit(scope, from, ChangeKind::Removed, evidence);
   }
 
   /// The single point of truth for "the watch at `(parent, name)` matches the
@@ -3039,12 +4895,15 @@ impl Monitor {
   ///   frees the slot first), so the existing watch is reused — [`install_child`]
   ///   is idempotent.
   ///
-  /// A `File`/`Gone` occupant always drops any stale watch. Only [`SlotOccupant::Dir`]
-  /// is watched: a descending backend must report directory-ness for a directory
-  /// appearance (inotify does, via `IN_ISDIR`), so an unknown kind maps to `File`
-  /// and is not watched (Rescanning every unknown would fire on every file). A
-  /// no-op when the core does not descend (kernel-recursive: no per-directory
-  /// watches to manage).
+  /// A `File`/`Gone` occupant always drops any stale watch, and only
+  /// [`SlotOccupant::Dir`] is watched. An occupant the driver could not classify
+  /// ([`SlotOccupant::Unknown`]) settles NEITHER: an
+  /// [`Action::Stat`](crate::Action::Stat) is asked for the kind, and — where
+  /// nothing already covers the slot — it is booked as a standing deficit, so the
+  /// darkness re-signals at every dispatch instead of passing for a proven
+  /// non-directory. Any incumbent watch stays live meanwhile: it may be covering
+  /// the very directory the listing failed to name. A no-op when the core does not
+  /// descend (kernel-recursive: no per-directory watches to manage).
   ///
   /// [`install_child`]: Self::install_child
   fn reconcile_slot(
@@ -3081,6 +4940,22 @@ impl Monitor {
           let _ = self.inherit_rearm(fresh);
         }
       }
+      SlotOccupant::Unknown => {
+        // Neither branch above may run on ignorance: watching would arm on every
+        // unclassifiable file, and dropping (or never installing) would leave a real
+        // directory blind for the process's lifetime with no watch, no deficit and no
+        // `Rescan` to say so.
+        //
+        // The slot is DARK only where nothing already covers it. An incumbent watch is
+        // live coverage whatever the listing failed to name, so booking a deficit over
+        // it would signal darkness that does not exist — and the heal interlock could
+        // not clear it, since re-occupying an occupied slot is a no-op. Either way the
+        // stat is asked: it decides whether to install, to keep, or to drop.
+        if self.child_watch(parent, name).is_none() {
+          self.record_slot_deficit(scope, parent, name.clone());
+        }
+        self.queue_stat(parent, scope, name.clone());
+      }
       SlotOccupant::File | SlotOccupant::Gone => {
         if let Some(stale) = self.child_watch(parent, name) {
           self.drop_subtree(stale, DeficitDischarge::CoveringRescan);
@@ -3096,6 +4971,20 @@ impl Monitor {
         let _ = self.remove_slot_deficit(scope, parent, name);
       }
     }
+  }
+
+  /// The [`ArmAttempt`] `id` is currently arming under — the most recent one
+  /// issued for it — or `None` for a handle with no node.
+  ///
+  /// This is BOOKKEEPING, not the reply path. An outcome must be reported under
+  /// the attempt CAPTURED when the arm was dispatched (off its
+  /// [`WatchCommand`](crate::WatchCommand), or returned by
+  /// [`rebind_root`](Self::rebind_root) / [`widen_root`](Self::widen_root));
+  /// reading the current attempt at reply time would answer for whichever arm is
+  /// current and reintroduce exactly the misattribution the token prevents.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn arm_attempt(&self, id: WatchId) -> Option<ArmAttempt> {
+    self.nodes.get(&id).map(|node| node.attempt)
   }
 
   /// The object identity a watch was installed for, if the driver supplied one.
@@ -3135,9 +5024,28 @@ impl Monitor {
   /// directory (`is_dir() == Some(true)`) is a `Dir`; `Some(false)` and `None` are
   /// both `File` (the descending-backend `is_dir` contract — see [`reconcile_slot`]).
   ///
+  /// A record's flag is deliberately NOT routed through
+  /// [`SlotOccupant::Unknown`]: `is_dir` is absent on the vast majority of records
+  /// from backends that never report it, so treating absence as unsettled would
+  /// stat every file the tree ever sees. A listing's
+  /// [`FileKind`](crate::FileKind) is a different claim — it is the driver's
+  /// answer to "what IS this", and `Unknown` there means it tried and could not
+  /// tell.
+  ///
   /// [`reconcile_slot`]: Self::reconcile_slot
   fn record_occupant(rec: &OsRecord) -> SlotOccupant {
     Self::class_occupant(rec.is_dir())
+  }
+
+  /// Maps a listed entry's [`FileKind`](crate::FileKind) to a [`SlotOccupant`]:
+  /// a directory is watched, an unclassifiable kind is unsettled, and every
+  /// other kind is a proven non-directory.
+  fn entry_occupant(kind: FileKind) -> SlotOccupant {
+    match kind {
+      FileKind::Dir => SlotOccupant::Dir,
+      FileKind::Unknown => SlotOccupant::Unknown,
+      FileKind::File | FileKind::Symlink | FileKind::Other => SlotOccupant::File,
+    }
   }
 
   /// Maps a target class to a [`SlotOccupant`] — the [`record_occupant`] rule applied
@@ -3205,7 +5113,7 @@ impl Monitor {
     if self.is_root_watch(rec.watch()) {
       if self.ondir_allows(scope, Some(true)) {
         let location = self.location_of(rec.watch());
-        self.emit(scope, location, ChangeKind::Removed);
+        self.emit(scope, location, ChangeKind::Removed, rec.evidence());
       }
       self.emit_rescan(scope, Location::new());
       self.invalidate_root(scope, rec.watch());
@@ -3243,7 +5151,7 @@ impl Monitor {
 
   fn emit_child(&mut self, scope: ScopeId, rec: &OsRecord, kind: ChangeKind) {
     let location = self.record_location(rec);
-    self.emit(scope, location, kind);
+    self.emit(scope, location, kind, rec.evidence());
   }
 
   /// The scope's current reconciliation generation ([`Epoch::START`] if never bumped).
@@ -3284,10 +5192,12 @@ impl Monitor {
       return;
     }
     self.bump_epoch(scope);
-    self.emit(scope, location, ChangeKind::Rescan);
+    // A `Rescan` bypasses the filter on its own kind, so it needs no evidence
+    // to be admitted.
+    self.emit(scope, location, ChangeKind::Rescan, Evidence::new());
   }
 
-  fn emit(&mut self, scope: ScopeId, location: Location, kind: ChangeKind) {
+  fn emit(&mut self, scope: ScopeId, location: Location, kind: ChangeKind, evidence: Evidence) {
     // The delivery filter: narrow to the kinds the consumer registered for. The backend
     // was subscribed to a coverage superset (see `coverage_mask`), so unrequested kinds
     // are expected here and dropped — EXCEPT `Rescan`, the no-silent-loss escape, which
@@ -3301,7 +5211,15 @@ impl Monitor {
       ChangeKind::Moved(_) => interest.moved(),
       ChangeKind::Modified => interest.modified() || interest.attrib(),
     };
-    if !wanted {
+    // A change reports ONE kind, but the event behind it may have proven several
+    // facts — a mask carrying create AND attrib, a rename half that degrades to a
+    // removal. Narrowing on the reported kind alone drops the change entirely for a
+    // subscriber who asked about one of the OTHER proven facts, with no `Rescan`
+    // covering the silence. So `evidence` admits too: whatever the change is called,
+    // it reaches everyone who subscribed to something it proved. Widening only ever
+    // turns drop into deliver, and over-delivery is the direction the `Interest`
+    // contract already allows.
+    if !wanted && !evidence.admits(interest) {
       return;
     }
     if self.would_coalesce(scope, &location, &kind) {
@@ -3368,14 +5286,21 @@ impl Monitor {
     if let Some(source) = key.3.as_ref() {
       touched.push(source);
     }
-    let pending_blocks = self.pending_moves.iter().any(|((half_scope, _), pending)| {
-      *half_scope == scope && self.is_watched(pending.from_parent) && {
-        let source = self.pending_from(pending);
-        touched
-          .iter()
-          .any(|&loc| Self::locations_touch(&source, loc))
-      }
-    });
+    // Runs once per emitted change, so it walks the scope's contiguous key range
+    // rather than every scope's halves under a filter: bounded by
+    // `PENDING_MOVE_CAP`, not by what unrelated roots happen to have parked.
+    let pending_blocks = self
+      .pending_moves
+      .range((scope, FIRST_COOKIE)..)
+      .take_while(|((half_scope, _), _)| *half_scope == scope)
+      .any(|(_, pending)| {
+        self.is_watched(pending.from_parent) && {
+          let source = self.pending_from(pending);
+          touched
+            .iter()
+            .any(|&loc| Self::locations_touch(&source, loc))
+        }
+      });
     if pending_blocks {
       return false;
     }
@@ -3455,6 +5380,8 @@ impl Monitor {
     // redundant-but-legal for it and honest for a filtered one.)
     let _ = self.remove_slot_deficit(scope, parent, &name);
     let id = WatchId::new(self.watch_ids.mint());
+    let attempt = self.next_arm_attempt();
+    let placement = self.placement_now();
     self.insert_node(
       id,
       WatchNode {
@@ -3462,6 +5389,9 @@ impl Monitor {
         name: Some(name.clone()),
         scope,
         is_dir,
+        attempt,
+        placement,
+        moved_at: NEVER_MOVED,
         identity,
         state: NodeState::Arming {
           rearm: false,
@@ -3478,11 +5408,7 @@ impl Monitor {
     // the scope's requested kinds plus the structural set the tree needs. Delivery is
     // narrowed to the requested interest at emission, not here.
     let mask = Self::coverage_mask(self.scope_interest(scope));
-    self.actions.push_back(Action::watch(
-      id,
-      crate::action::WatchTarget::child(parent, name),
-      mask,
-    ));
+    self.queue_watch(id, crate::action::WatchTarget::child(parent, name), mask);
   }
 
   /// Drops the watch subtree rooted at `root`, queuing an
@@ -3495,6 +5421,17 @@ impl Monitor {
   /// (no barrier left to lie to). The covering `Rescan` and the re-anchor
   /// fire ONLY when the walk erased a real entry, so a deficit-free drop
   /// stays silent (the A2 overreach guard).
+  ///
+  /// Some markers are discharged separately and on their own condition: they
+  /// are not deficit anchors, so a subtree that booked no deficit still owes
+  /// them, and their objects provably survive (see
+  /// [`stand_counted_cover`](Self::stand_counted_cover)).
+  ///
+  /// Which is which is not decided here. EVERY per-node marker the walk
+  /// reclaims goes through [`reclaim_node_marker`](Self::reclaim_node_marker),
+  /// whose exhaustive match makes stating the cover a condition of being
+  /// reclaimed at all — see [`NodeMarker`] for why that is structural rather
+  /// than a convention.
   fn drop_subtree(&mut self, root: WatchId, discharge: DeficitDischarge) {
     // The dropped subtree's scope, and — for a re-anchor — the dropped
     // child's surviving-parent slot: both captured BEFORE the walk erases
@@ -3511,7 +5448,11 @@ impl Monitor {
         })
       })
       .flatten();
-    let mut erased = false;
+    // What the walk erased, folded across nodes and markers. Every marker
+    // removal goes through the one funnel that produces this
+    // ([`reclaim_node_marker`](Self::reclaim_node_marker)), so no marker can be
+    // reclaimed without its answer reaching the discharge below.
+    let mut erased = ErasedCovers::default();
     let mut stack = std::vec::Vec::new();
     stack.push(root);
     while let Some(id) = stack.pop() {
@@ -3544,43 +5485,19 @@ impl Monitor {
         // Clear the slot only if it still points to THIS node: a detached-and-held move
         // source keeps its old `(parent, name)`, and a replacement may have taken that
         // slot since — dropping the stale source must not orphan it.
-        if let (Some(parent), Some(name)) = (node.parent, node.name)
+        if let (Some(parent), Some(name)) = (node.parent, node.name.clone())
           && self.child_index.get(&(parent, name.clone())) == Some(&id)
         {
           self.child_index.remove(&(parent, name));
         }
       }
-      // Clear an outstanding enumerate request: a dropped directory's read may never be
-      // reported by the driver, so `on_enumerate` would never remove it — leaving the
-      // reverse map to grow without bound under repeated drop-while-enumerating.
-      if let NodeState::Enumerating { req, .. } = node.state {
-        self.pending_enumerate.remove(&req);
-        self.latent_cold.remove(&req);
+      // Reclaim every per-node marker through the one funnel, and fold each
+      // answer in. Iterating `NodeMarker::ALL` rather than open-coding the
+      // removals is the point: a marker added to the funnel is asked about
+      // here for free, and one added ONLY here would not compile.
+      for &marker in NodeMarker::ALL {
+        erased.absorb(self.reclaim_node_marker(marker, id, &node));
       }
-      // A dropped watch is no longer a held move source.
-      if self.held_sources.remove(&id) {
-        self.held_by_scope_dec(node.scope);
-      }
-      self.dirtied_holds.remove(&id);
-      // A dropped reprove arm's outstanding stamp dies with the node.
-      self.reprove_stamps.remove(&id);
-      // An adoption edge awaiting this node's read dies with it — and an
-      // UNVERIFIED adoption is erased COVERAGE, exactly like an erased
-      // deficit: the adopted subtree's watches are being disarmed while its
-      // edge was never positively confirmed, so the disappearance may be
-      // wholly unrecorded (the dark window's mutation had no armed parent to
-      // record it, and the drop's driving signal — a cold listing's slot
-      // reconcile — delivers no re-read instruction of its own). Fold it into
-      // `erased` so the discharge switch below stands the covering signal:
-      // a record/reconcile-driven drop sets both bridge bits (the settle
-      // flush's closing root `Rescan`), a crawl rebuild re-anchors a slot
-      // deficit at the surviving parent, and a terminal teardown or
-      // proven-unsubscribed prune stays silent by its own ownership argument.
-      erased |= self.take_adoption_marker(id, node.scope).is_some();
-      // Its deficit anchors die with it; report a real erasure so the one
-      // caller with no coverage story of its own can carry the loss (see
-      // `drop_node_deficits` / `drop_subtree_for_crawl_rebuild`).
-      erased |= self.drop_node_deficits(node.scope, id);
       self.actions.push_back(Action::Unwatch(id));
     }
     // NOTE: a narrow subtree drop deliberately does NOT purge pending move halves.
@@ -3594,7 +5511,7 @@ impl Monitor {
     // Discharge the erased darkness per the named reason. A drop that erased
     // nothing owes nothing, so a clean prune/regrow of deficit-free coverage
     // stays silent (A2).
-    if erased {
+    if erased.discharge {
       match discharge {
         // A structural record a filtered subscription would not see cannot
         // stand in for the darkness the deficit tracked: set both bridge bits
@@ -3620,6 +5537,123 @@ impl Monitor {
         DeficitDischarge::Teardown | DeficitDischarge::UnsubscribedPrune => {}
       }
     }
+    // The counted debts are discharged INDEPENDENTLY of the deficit condition
+    // above: none of them is a deficit anchor, so a subtree that booked no
+    // deficit still owes them, and none of them is a vanish either — their
+    // objects are provably still there. So the covering re-read must be
+    // counted (see `stand_counted_cover`). `Teardown` and `UnsubscribedPrune`
+    // keep their own ownership arguments: no barrier remains to lie to.
+    if erased.counted
+      && matches!(
+        discharge,
+        DeficitDischarge::CoveringRescan | DeficitDischarge::Reanchor
+      )
+      && let Some(scope) = root_scope
+    {
+      self.stand_counted_cover(scope);
+    }
+  }
+
+  /// Reclaims one [`NodeMarker`] for the dying node `id`, reporting what
+  /// erasing it owes — the ONE removal funnel for every per-node marker
+  /// [`drop_subtree`](Self::drop_subtree)'s walk destroys.
+  ///
+  /// `node` is the entry already taken out of the map, so this reads the dying
+  /// node's own state rather than a lookup that would find nothing.
+  fn reclaim_node_marker(
+    &mut self,
+    marker: NodeMarker,
+    id: WatchId,
+    node: &WatchNode,
+  ) -> ErasedCover {
+    match marker {
+      // A dropped directory's read may never be reported by the driver, so
+      // `on_enumerate` would never remove it — leaving the reverse map to grow
+      // without bound under repeated drop-while-enumerating. Nothing is owed:
+      // the coalesced obligation such a read can carry (`latent_cold`) is to
+      // re-arm the very subtree this walk is destroying, and the loss that
+      // dirtied it stood its own `Rescan` when it landed.
+      NodeMarker::Enumerate => {
+        if let NodeState::Enumerating { req, .. } = node.state {
+          self.pending_enumerate.remove(&req);
+          self.latent_cold.remove(&req);
+        }
+        ErasedCover::Nothing
+      }
+      // A dropped directory's outstanding slot stats can never be settled
+      // against it — the slots died with it — so their requests are reclaimed
+      // exactly as an outstanding enumerate is. Nothing is owed here either:
+      // the darkness such a slot stands for is booked as a DEFICIT, which the
+      // `Deficits` marker erases and discharges per the caller's reason.
+      NodeMarker::StatSlots => {
+        self.pending_stat.retain(|_, slot| slot.parent != id);
+        self.stat_slots.retain(|(parent, _), _| *parent != id);
+        ErasedCover::Nothing
+      }
+      // A dropped watch is no longer a held move source. The hold itself owes
+      // nothing: what a hold can accrue is the suppressed-activity debt below,
+      // and a hold that suppressed nothing hid nothing.
+      NodeMarker::HeldSource => {
+        if self.held_sources.remove(&id) {
+          self.held_by_scope_dec(node.scope);
+        }
+        ErasedCover::Nothing
+      }
+      // A dirtied-hold marker is the ONLY record that activity under a held
+      // subtree was suppressed at its stale pre-move path, and it is owed a
+      // covering re-read at the hold's resolution. This walk is the single
+      // destruction point EVERY variant of that hold passes through —
+      // including an ANCESTOR teardown that reclaims a detached-and-held
+      // source through the parent link, after which `pending.held` names a
+      // dead node and no resolution site could still see the marker — so the
+      // debt must be carried here rather than at any consumer. A hold exists
+      // because the object was proven to be MOVING, so the cover is COUNTED.
+      NodeMarker::DirtiedHold => {
+        if self.dirtied_holds.remove(&id) {
+          ErasedCover::Counted
+        } else {
+          ErasedCover::Nothing
+        }
+      }
+      // The same argument for a descent still booked against a node this walk
+      // is about to destroy. Reaching here at all means the obligation ESCAPED
+      // its stat: an answer settles the descent against the incumbent it finds
+      // and takes the entry with it, so anything left is owed to a watch that
+      // had already left its slot — a detached move source whose reparent
+      // never came. Its subtree dies with its coverage never re-proven and its
+      // handles still carrying the object's records, which is the one thing an
+      // obligation that cannot be transferred must not do silently.
+      NodeMarker::OwedDescent => match self.owed_descents.remove(&id) {
+        Some(_) => ErasedCover::Counted,
+        None => ErasedCover::Nothing,
+      },
+      // A dropped reprove arm's outstanding stamp dies with the node. It
+      // records WHEN an arm was issued, not coverage: the arm it stamps dies
+      // in the same breath, and the counted obligation that arm carried is
+      // released through the re-arm counter edge above.
+      NodeMarker::ReproveStamp => {
+        self.reprove_stamps.remove(&id);
+        ErasedCover::Nothing
+      }
+      // An adoption edge awaiting this node's read dies with it — and an
+      // UNVERIFIED adoption is erased COVERAGE, exactly like an erased
+      // deficit: the adopted subtree's watches are being disarmed while its
+      // edge was never positively confirmed, so the disappearance may be
+      // wholly unrecorded (the dark window's mutation had no armed parent to
+      // record it, and the drop's driving signal — a cold listing's slot
+      // reconcile — delivers no re-read instruction of its own).
+      NodeMarker::Adoption => match self.take_adoption_marker(id, node.scope) {
+        Some(_) => ErasedCover::Discharge,
+        None => ErasedCover::Nothing,
+      },
+      // Its deficit anchors die with it; report a real erasure so the one
+      // caller with no coverage story of its own can carry the loss (see
+      // `drop_node_deficits` / `drop_subtree_for_crawl_rebuild`).
+      NodeMarker::Deficits => match self.drop_node_deficits(node.scope, id) {
+        true => ErasedCover::Discharge,
+        false => ErasedCover::Nothing,
+      },
+    }
   }
 
   /// [`drop_subtree`](Self::drop_subtree) for `rearm_enumerate`'s
@@ -3637,13 +5671,22 @@ impl Monitor {
   /// [`install_child`](Self::install_child) interlock (both bridge bits →
   /// the window's closing `Rescan` covers the whole dark interval), and a
   /// slot the crawl does not rebuild (the name vanished) stays booked for
-  /// the dispatch re-signal until the in-flight `Removed` converges it. A
-  /// drop that erased nothing carries nothing, so a clean rebuild of
-  /// deficit-free coverage stays silent and pure prune/regrow flows are
-  /// unaffected. Every other `drop_subtree` context (record-delivered
-  /// churn, held-subtree resolution, umbrella prune, teardown, root
-  /// invalidation) keeps the bare call: those erasures are converged,
-  /// covered at the hold's resolution, out of contract, or terminal.
+  /// the dispatch re-signal until the in-flight `Removed` converges it.
+  ///
+  /// The carry is only HALF the coverage story, and only the half that is
+  /// conditional on a recorded deficit. Retiring the subtree also invalidates
+  /// every `WatchId` in it while records naming them may already be queued on
+  /// the backend — [`ingest_record`](Self::ingest_record) discards those as an
+  /// unrecognized watch — and that is owed whether or not a deficit was
+  /// erased. The crawl therefore stands its own opening `Rescan` on top of this
+  /// carry for EVERY retirement (see [`rearm_enumerate`](Self::rearm_enumerate)),
+  /// including one whose name the listing no longer shows as a directory: the
+  /// vanish's own `Removed` is interest- and filter-subject and may itself be
+  /// among the records this retirement just orphaned, so it cannot stand in.
+  /// Every other `drop_subtree` context (record-delivered churn,
+  /// held-subtree resolution, umbrella prune, teardown, root invalidation)
+  /// keeps the bare call: those erasures are converged, covered at the hold's
+  /// resolution, out of contract, or terminal.
   fn drop_subtree_for_crawl_rebuild(&mut self, child: WatchId) {
     self.drop_subtree(child, DeficitDischarge::Reanchor);
   }
@@ -3848,6 +5891,21 @@ impl Monitor {
     }
   }
 
+  /// Whether `scope`'s bridge window is ALREADY marked lossy — a `Rescan` has
+  /// passed since the window's last settle edge. Read by a site that would
+  /// otherwise stand its own opening `Rescan` purely to supply the window's
+  /// loss half: the window's closing `Rescan` postdates everything inside it,
+  /// so once the bit is set a second opening `Rescan` instructs the consumer
+  /// to do nothing it is not already going to do. Never a substitute for the
+  /// loss half itself — a site that does not also make the window COUNTED must
+  /// emit, since the conjunction would otherwise never fire.
+  fn bridge_is_lossy(&self, scope: ScopeId) -> bool {
+    self
+      .bridge
+      .get(&scope)
+      .is_some_and(|flags| flags.saw_rescan)
+  }
+
   /// Marks `scope`'s bridge window as having armed suppressed coverage — a
   /// node entered `Arming { rearm: true }`. Fed by the two state funnels
   /// ([`set_state`](Self::set_state) / [`insert_node`](Self::insert_node));
@@ -3856,6 +5914,67 @@ impl Monitor {
     if self.scope_descends(scope) {
       self.bridge.entry(scope).or_default().fresh_rearm = true;
     }
+  }
+
+  /// Counted covering recovery for a teardown that drops a subtree whose object
+  /// provably SURVIVES at an unknown in-scope location — a teardown that cannot
+  /// borrow [`drop_subtree`](Self::drop_subtree)'s erasure argument.
+  ///
+  /// That argument ("erased nothing, so owes nothing") is about a subtree whose
+  /// object VANISHED: once it is gone no later record can describe it, so the
+  /// dead handles carry nothing to lose and a fully-proven subtree may go
+  /// silently. It does not reach a teardown the monitor performs while HOLDING a
+  /// record that proves the object survives inside the scope. There the dead
+  /// handles keep carrying the live object's records until the `Unwatch` lands,
+  /// and [`ingest_record`](Self::ingest_record) discards those as an unrecognized
+  /// watch — while every signal such a teardown does emit (`Removed`, `Created`,
+  /// `Moved`) is interest- and filter-subject, so a `Modified`-only subscription
+  /// receives no instruction at all. The window's closing `Rescan` bypasses both,
+  /// which is precisely what that subscription needs.
+  ///
+  /// The recovery is COUNTED, and that is the whole point. Standing the two bridge
+  /// bits alone would leave the window with nothing to wait on — [`settle_bridges`]
+  /// gates on [`rearm_settled`](Self::rearm_settled) — so the window would flush
+  /// inside this very call: the closing `Rescan` would PRECEDE the recovery instead
+  /// of closing it, and [`coverage_settled`](Self::coverage_settled) could read true
+  /// while the surviving subtree was still blind.
+  ///
+  /// The re-arm is anchored at the scope ROOT because every caller reaches here
+  /// holding exactly the same gap: the object's current home is not a location this
+  /// call can name. A refused source's contents live at a destination the refusal
+  /// deliberately forgot and can never pair; a nameless destination gives the tree
+  /// no slot to re-cover at; a late or cyclic arrival whose destination parent died
+  /// with the held subtree reconstructs only a stale pre-move path; and a stale
+  /// adoption edge means the adopted subtree's true path is unknowable. The only
+  /// node guaranteed to be an ancestor — if the object is in scope at all — is the
+  /// root. An object OUTSIDE the scope leaves the root crawl nothing fresh to arm,
+  /// `fresh_rearm` never sets, and the bridge conjunction suppresses the closing
+  /// `Rescan` on its own: honest rather than faked.
+  ///
+  /// [`inherit_rearm`](Self::inherit_rearm), never
+  /// [`start_rearm`](Self::start_rearm): a root that is still `Arming` (a widen
+  /// leaves a live tree processing records under one) REFUSES a bare re-arm, which
+  /// would reproduce the exact uncounted opening `Rescan` this exists to prevent.
+  /// The `Arming` arm marks the post-arm read instead, so the obligation is counted
+  /// and bridge-marked either way.
+  ///
+  /// No loss-generation bump, no binding re-proof, no marking of parked halves: a
+  /// refusal carries no kernel-loss evidence — the record stream is intact and every
+  /// retained binding is as alive as before — and bumping the generation mid-ingest
+  /// would re-stale in-flight reprove arms and shift
+  /// [`scope_needs_reproof`](Self::scope_needs_reproof) for every later record of the
+  /// same batch.
+  ///
+  /// [`settle_bridges`]: Self::settle_bridges
+  fn stand_counted_cover(&mut self, scope: ScopeId) {
+    if !self.scope_descends(scope) {
+      return;
+    }
+    let Some(&root) = self.roots.get(&scope) else {
+      return;
+    };
+    self.emit_rescan(scope, self.location_of(root));
+    let _ = self.inherit_rearm(root);
   }
 
   /// Records a slot hole `(parent, name)` in `scope`'s deficit book (see
@@ -4008,6 +6127,20 @@ impl Monitor {
         Some((child.name.clone()?, child.identity))
       })
       .collect()
+  }
+
+  /// Answers `id`'s CURRENT arm attempt — what a driver that captured the token
+  /// off the `Action::Watch` it is replying to would echo. The default for every
+  /// test not ABOUT supersession, which drives
+  /// [`on_watch_result`](Self::on_watch_result) directly with the two attempts it
+  /// must tell apart. An unknown handle answers under an arbitrary attempt, so
+  /// the unknown-node guard is still the thing under test.
+  #[cfg(test)]
+  fn ack_watch(&mut self, id: WatchId, res: Result<crate::WatchAck, WatchError>) {
+    let attempt = self
+      .arm_attempt(id)
+      .unwrap_or_else(|| ArmAttempt::new(NonZeroU64::MIN));
+    self.on_watch_result(id, attempt, res);
   }
 
   /// Whether `dir` has a rescan re-arm read outstanding — the successor to the old
@@ -4266,6 +6399,67 @@ impl Monitor {
         "no stamp postdates its scope's loss generation"
       );
     }
+    // No placement reading may postdate the clock: every one is taken FROM it
+    // and the clock only advances, so a greater reading would mean a stamp
+    // survived a rewind — and a stamp that postdates a move reads as fresh
+    // exactly where it must not.
+    for node in self.nodes.values() {
+      assert!(
+        node.placement <= self.placement_clock && node.moved_at <= self.placement_clock,
+        "no node's placement readings postdate the placement clock"
+      );
+    }
+    for slot in self.pending_stat.values() {
+      assert!(
+        slot.placement <= self.placement_clock,
+        "no stat's placement reading postdates the placement clock"
+      );
+    }
+    // The stat dedup index mirrors the outstanding requests' slots exactly, and
+    // every such slot names a live parent — a dead parent's stats are reclaimed
+    // with its node.
+    assert_eq!(
+      self
+        .pending_stat
+        .values()
+        .map(|slot| (slot.parent, slot.name.clone()))
+        .collect::<BTreeSet<_>>(),
+      self.stat_slots.keys().cloned().collect::<BTreeSet<_>>(),
+      "the stat dedup index mirrors the outstanding stat slots exactly"
+    );
+    // And each index entry names the very request that owes that slot — the
+    // lookup a deferral rides on, so a stale mapping would silently book an
+    // obligation against a slot whose answer is not coming.
+    for (slot, req) in &self.stat_slots {
+      let pending = self
+        .pending_stat
+        .get(req)
+        .expect("the stat dedup index names an outstanding request");
+      assert_eq!(
+        (pending.parent, pending.name.clone()),
+        *slot,
+        "the stat dedup index maps a slot to the request holding it"
+      );
+    }
+    for slot in self.pending_stat.values() {
+      let node = self
+        .nodes
+        .get(&slot.parent)
+        .expect("an outstanding stat names a live parent");
+      assert_eq!(
+        node.scope, slot.scope,
+        "an outstanding stat belongs to its parent's scope"
+      );
+    }
+    // Every booked descent names a LIVE watch — the drop walk is the funnel
+    // that discharges one whose owner dies, so a key with no node would be an
+    // obligation nothing can ever perform and nothing ever covered.
+    for owed in self.owed_descents.keys() {
+      assert!(
+        self.nodes.contains_key(owed),
+        "a booked descent is owed to a live watch"
+      );
+    }
     // Every latent cold read is an outstanding request whose node still names
     // it, reads COLD, was dirtied by the coalesced trigger, and belongs to the
     // recorded scope — the exact mirror of the insert edge.
@@ -4297,6 +6491,109 @@ impl Monitor {
     }
   }
 
+  /// Where `id` sits relative to the root of its own scope — `Some` only when
+  /// the parent walk PROVES it, and `None` otherwise.
+  ///
+  /// The scope root itself is `Some(Location::new())`: the empty location, which
+  /// is [`Location`]'s own convention for "the watched root". A watch one level
+  /// down is `Some` of a one-segment location, and so on; the segments are
+  /// root-first and already canonical for their volume (see [`Segment`]).
+  ///
+  /// This is the derivation the layer above should use instead of keeping its own
+  /// map of where each watch sits. The monitor addresses coverage by [`WatchId`]
+  /// plus parent links, and a rename repairs those links in O(1) at the splice —
+  /// so a location read back through here is correct after a move by
+  /// construction, with nothing to re-anchor by hand.
+  ///
+  /// # `None` does not mean "at the root"
+  ///
+  /// `None` means the walk from `id` did not terminate at the [`WatchId`]
+  /// registered as its scope's root, so this monitor cannot say where `id` is.
+  /// Concretely: `id` names no live node; its scope has no registered root; a
+  /// parent link points at a node that is gone (an ancestor was removed out from
+  /// under it); a non-root node carries no name; or the walk exceeded the live
+  /// node count, which a chain can only do by cycling.
+  ///
+  /// The root answers `Some(Location::new())` — an EMPTY location, not `None`. A
+  /// caller that treats `None` as "empty, therefore the root" turns "unknown"
+  /// into "the root path", and every path it then derives lands at the top of the
+  /// watched tree instead of where the watch actually is. That is the specific
+  /// wrong answer this accessor exists to make unrepresentable, and it is why
+  /// this is not a wrapper over the internal lenient walk: that walk stops early
+  /// on a missing node or an exhausted bound and returns whatever prefix it had
+  /// collected, which composes into a plausible path near the root. A
+  /// short-but-plausible location is worse than no location, because a caller
+  /// joining it onto a root path cannot tell the two apart.
+  ///
+  /// # Do not cache the result
+  ///
+  /// Re-derive per use. A location is a fact about the tree at the instant it is
+  /// read, and the tree moves: a rename relocates a whole subtree by rewriting
+  /// one parent link, and every location under it changes with no notification to
+  /// a holder of an earlier answer. A stored copy is a mirror of the tree that
+  /// something must now repair on every move — which is exactly the hand-repaired
+  /// mirror that deriving from here is meant to delete. Nothing in the type
+  /// prevents caching, so the discipline lives here.
+  ///
+  /// The one legitimate keep is a location captured deliberately as a HISTORICAL
+  /// fact — where something was when an event was observed. Such a value must not
+  /// be read back later as where the watch is now.
+  ///
+  /// # Stability
+  ///
+  /// The `None` contract above is the semver-relevant part of this signature: a
+  /// later relaxation that answered with a short location where this answers
+  /// `None` would still compile at every call site, and would put back the exact
+  /// wrong answer the `Option` was introduced to exclude. Widening it is a
+  /// breaking change even though the type does not change.
+  ///
+  /// ```
+  /// use core::num::NonZeroU64;
+  /// use tributary_proto::{Capabilities, Interest, Location, Monitor, ScopeId};
+  ///
+  /// let mut monitor = Monitor::new(Capabilities::new());
+  /// let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+  /// let root = monitor.register_root(scope, Interest::all());
+  ///
+  /// // The scope root IS a location: the empty one.
+  /// assert_eq!(monitor.location_of_checked(root), Some(Location::new()));
+  ///
+  /// // A handle with no node is not placeable — and that is a different answer
+  /// // from the root's, which is the whole point of the `Option`.
+  /// let unplaced = monitor.reserve_watch_id();
+  /// assert_eq!(monitor.location_of_checked(unplaced), None);
+  /// ```
+  pub fn location_of_checked(&self, id: WatchId) -> Option<Location> {
+    let root = *self.roots.get(&self.nodes.get(&id)?.scope)?;
+    let mut segments = std::vec::Vec::new();
+    let mut cursor = id;
+    // A simple path in a tree of `n` nodes visits at most `n` of them, so a walk
+    // still running after `n` steps is revisiting one: a cycle, which answers
+    // `None` rather than the prefix collected so far.
+    for _ in 0..self.nodes.len() {
+      if cursor == root {
+        segments.reverse();
+        return Some(Location::from_segments(segments));
+      }
+      let node = self.nodes.get(&cursor)?;
+      // A non-root node names its slot in its parent; one that does not cannot be
+      // placed, and skipping it would silently shorten the answer by a level.
+      segments.push(node.name.clone()?);
+      cursor = node.parent?;
+    }
+    None
+  }
+
+  /// The lenient walk: reconstructs as much of `id`'s location as the tree can
+  /// still supply, and TRUNCATES silently when it cannot supply all of it (a
+  /// missing node, an exhausted bound). Its callers reconstruct locations for
+  /// changes they are emitting under a `WatchId` a live record just arrived on,
+  /// or under an anchor they have already liveness-guarded
+  /// ([`live_pending_from`](Self::live_pending_from)), so the truncating branches
+  /// are unreachable for them. Anything outside those guarantees — above all a
+  /// location handed across the public boundary to be joined onto a root path —
+  /// wants [`location_of_checked`](Self::location_of_checked), which reports the
+  /// same conditions as `None` instead of as a short location.
   fn location_of(&self, id: WatchId) -> Location {
     let mut segments = std::vec::Vec::new();
     let mut cursor = Some(id);
@@ -4325,6 +6622,63 @@ impl Monitor {
       .get(&id)
       .map(|node| node.parent.is_none())
       .unwrap_or(false)
+  }
+
+  /// Mints the token for one arm attempt. Attempts, like every proto handle,
+  /// are never reused — a reused one could not tell a superseded outcome from
+  /// the current arm's.
+  fn next_arm_attempt(&mut self) -> ArmAttempt {
+    ArmAttempt::new(self.arm_attempts.mint())
+  }
+
+  /// Issues the [`Action::Watch`] arming `id`, under a FRESH attempt token
+  /// recorded on the node. The single funnel every queued arm passes through,
+  /// which is what makes "the node names the one attempt whose outcome counts"
+  /// an invariant rather than a convention: an arm issued here supersedes every
+  /// earlier one for the handle at the instant it is queued, so a result still
+  /// in flight for one of those is discarded by
+  /// [`ingest_watch_result`](Self::ingest_watch_result) instead of being
+  /// applied to the binding that replaced it.
+  fn queue_watch(&mut self, id: WatchId, target: crate::action::WatchTarget, mask: Interest) {
+    let attempt = self.next_arm_attempt();
+    let placement = self.placement_now();
+    if let Some(node) = self.nodes.get_mut(&id) {
+      node.attempt = attempt;
+      // The arm's addressing is a coordinate the driver lowers, and the reading
+      // that judges its acknowledgement is taken where the lowering happens —
+      // at the dispatch ([`stamp_dispatch`](Self::stamp_dispatch)). This is the
+      // conservative FLOOR for the interval before that: an arm never handed
+      // out was never lowered, so nothing about it may read fresher than the
+      // node's own last round trip, and answering "moved" for one costs a
+      // re-address rather than a false certification.
+      node.placement = placement;
+    }
+    self
+      .actions
+      .push_back(Action::watch(id, attempt, target, mask));
+  }
+
+  /// Rebinds an EXISTING node to a fresh attempt with NO action queued,
+  /// returning the token — the one supersession that issues nothing.
+  ///
+  /// Two callers, one shape: a rebind's new-transport root, whose arm the
+  /// driver already executed out of band and whose replayed outcome must carry
+  /// this token, and [`retire_arm`](Self::retire_arm), where the node has no
+  /// slot left for an arm to name at all. Either way the arms that came before
+  /// are superseded from this instant. (A widen's pre-armed root is born with
+  /// its attempt instead, having had no node to rebind.)
+  fn adopt_arm(&mut self, id: WatchId) -> ArmAttempt {
+    let attempt = self.next_arm_attempt();
+    let placement = self.placement_now();
+    if let Some(node) = self.nodes.get_mut(&id) {
+      node.attempt = attempt;
+      // An out-of-band arm was executed by the driver against the placement in
+      // effect NOW, so its replayed outcome is stamped current — the rebind that
+      // reaches here has already recorded the root swap it is committing, and
+      // this arm is the one issued after it.
+      node.placement = placement;
+    }
+    attempt
   }
 
   fn next_change_id(&mut self) -> ChangeId {
