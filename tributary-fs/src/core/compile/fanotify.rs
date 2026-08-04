@@ -16,7 +16,7 @@
 
 use std::{collections::BTreeMap, path::Path, vec::Vec};
 
-use tributary_proto::{OsRecord, RecordKind, Scope};
+use tributary_proto::{Evidence, OsRecord, RecordKind, Scope};
 
 use crate::os::linux::fanotify::AdmittedEvent;
 
@@ -64,21 +64,6 @@ impl DriverCore {
       return self.plan_rename(state, scope, &rename.old_path, &rename.new_path);
     }
 
-    // classify's universal multi-structural gate routes an ambiguous merged mask (two
-    // or more structural verbs, rename now counted among them) to the loss barrier
-    // upstream, so a non-rename event that admitted this far names AT MOST ONE
-    // structural verb (renames are lowered by `plan_rename` above, and a merged
-    // rename+verb never escapes the gate to reach either path). The verb selectors
-    // below (the self-event branch and `verb`) therefore treat the mask as naming ONE
-    // action; a multi-structural mask reaching here is a classify/reader bug. In
-    // release the selectors still degrade safely — they pick the highest-priority verb,
-    // never panic — but assert the invariant in debug so a future admission regression
-    // trips a test, not the field.
-    debug_assert!(
-      !mask.multi_structural(),
-      "a multi-structural fanotify mask reached lowering; classify must route it to Lossy"
-    );
-
     let Some(path) = &event.path else {
       // An admitted event with no resolved path carries no addressable target;
       // the admission layer never produces one, so this is a seam bug —
@@ -86,6 +71,33 @@ impl DriverCore {
       debug_assert!(false, "an admitted fanotify event has no path");
       return vec![Planned::Over(Scope::Root(scope))];
     };
+
+    // The ONE merged mask classify forwards: a plain file's kernel-MERGED
+    // create+delete of one name (man 7 fanotify merges consecutive events for one
+    // object). It admitted because it is MAP-NEUTRAL — a non-`ONDIR` dirent mutates
+    // no admission node, so it can stale nothing its buffer-mates resolve through —
+    // but its verb is genuinely unknowable: create-then-delete and delete-then-create
+    // carry identical bits, so the name may end present or absent. Asserting either
+    // verb would be a guess, and the alternative the loss barrier offers is a
+    // scope-wide `Overflow` that discards the batch's unrelated, unambiguous
+    // deliveries. A located `Rescan` over the merged NAME is the honest answer: it
+    // covers whichever ending holds, and nothing wider.
+    //
+    // Every OTHER merge — an `ONDIR` structural pair, a `*_SELF` pair, anything
+    // carrying `FAN_RENAME` — is still routed to the loss barrier upstream, so the
+    // verb selectors below (the self-event branch and `proven`) keep reading a mask
+    // that names AT MOST ONE structural verb, and this branch runs before either.
+    if mask.multi_structural() {
+      debug_assert!(
+        mask.created() && mask.removed() && !mask.ondir(),
+        "classify forwards only the map-neutral file create+delete merge"
+      );
+      return match lower(state, path) {
+        Lowered::Root => vec![Planned::Over(Scope::Root(scope))],
+        Lowered::Target(location) => vec![Planned::Over(located(state.watch, Some(location)))],
+        Lowered::Outside => vec![Planned::Over(Scope::Root(scope))],
+      };
+    }
 
     // A self-event on the root object is the scope's death — the same death
     // lifecycle the FSEvents unmount uses, but PRESERVING the verb: a `DELETE_SELF`
@@ -119,13 +131,13 @@ impl DriverCore {
       Lowered::Outside => return vec![Planned::Over(Scope::Root(scope))],
     };
 
-    let Some(kind) = verb(event) else {
+    let Some(rec) = OsRecord::proved(state.watch, proven(event)) else {
       // A mask carrying none of the subscribed dirent verbs is kernel noise
       // for this vocabulary; skip it rather than fabricate a record.
       return Vec::new();
     };
 
-    let mut rec = OsRecord::new(state.watch, kind).with_is_dir(mask.ondir());
+    let mut rec = rec.with_is_dir(mask.ondir());
     if let Some(location) = target {
       rec = rec.with_target(location);
     }
@@ -177,22 +189,21 @@ impl DriverCore {
   }
 }
 
-/// The record verb an admitted event's mask names, if any. fanotify masks are
-/// bitmasks, but classify routes an ambiguous multi-structural mask to the loss
-/// barrier upstream, so at most ONE structural verb (create or delete) reaches here;
-/// a coexisting metadata bit (modify/attrib) is subsumed by the structural verb via
-/// the priority order below, and a pure metadata mask picks its single metadata verb.
-fn verb(event: &AdmittedEvent) -> Option<RecordKind> {
+/// Everything an admitted event's mask PROVES. fanotify masks are bitmasks and
+/// one word routinely carries a structural bit alongside a content or metadata
+/// one (`FAN_CREATE | FAN_ATTRIB`); classify routes an ambiguous
+/// multi-structural mask to the loss barrier upstream, so at most one structural
+/// verb reaches here, but the coexisting bits are facts in their own right.
+///
+/// Each is mapped on its own, so the set is a total function of the bits tested
+/// — the record's verb is then the protocol's choice among them
+/// ([`Evidence::primary`]), and a fact that does not win the verb still admits
+/// the subscriber who asked for it.
+fn proven(event: &AdmittedEvent) -> Evidence {
   let mask = event.mask;
-  if mask.created() {
-    Some(RecordKind::Created)
-  } else if mask.removed() {
-    Some(RecordKind::Removed)
-  } else if mask.modified() {
-    Some(RecordKind::Modified)
-  } else if mask.attrib() {
-    Some(RecordKind::Attrib)
-  } else {
-    None
-  }
+  Evidence::new()
+    .maybe_created(mask.created())
+    .maybe_removed(mask.removed())
+    .maybe_modified(mask.modified())
+    .maybe_attrib(mask.attrib())
 }
