@@ -1,6 +1,8 @@
 use std::{cell::Cell, io, path::Path};
 
-use super::{ReseedOutcome, SeedOutcome, process_decoded, reseed_map, seed_moved_in_subtree};
+use super::{
+  BufferContext, ReseedOutcome, SeedOutcome, process_decoded, reseed_map, seed_moved_in_subtree,
+};
 use crate::os::{
   BackendStatsShared, SourceMessage,
   linux::fanotify::{
@@ -97,9 +99,11 @@ fn run_process(
   let alive = process_decoded(
     decoded,
     map,
-    &stats,
-    &transport,
-    &[],
+    &BufferContext {
+      stats: &stats,
+      transport: &transport,
+      exclusions: &[],
+    },
     || {
       reseeds.set(reseeds.get() + 1);
       match &reseed {
@@ -135,9 +139,11 @@ fn run_process_with_exclusions(
   let alive = process_decoded(
     decoded,
     map,
-    &stats,
-    &transport,
-    exclusions,
+    &BufferContext {
+      stats: &stats,
+      transport: &transport,
+      exclusions,
+    },
     || Ok(one_entry_walk()),
     |_, _, _| Ok(Vec::new()),
     |msg| {
@@ -175,9 +181,11 @@ fn run_process_with_subtree(
   let alive = process_decoded(
     decoded,
     map,
-    &stats,
-    &transport,
-    &[],
+    &BufferContext {
+      stats: &stats,
+      transport: &transport,
+      exclusions: &[],
+    },
     || {
       reseeds.set(reseeds.get() + 1);
       match &reseed {
@@ -998,9 +1006,11 @@ fn dfid_name_dot_root_delete_reaches_root_death_at_the_reader() {
   let alive = process_decoded(
     decoded,
     &mut map,
-    &stats,
-    &transport,
-    &[],
+    &BufferContext {
+      stats: &stats,
+      transport: &transport,
+      exclusions: &[],
+    },
     || Ok(one_entry_walk()),
     |_, _, _| Ok(Vec::new()),
     |msg| {
@@ -1061,9 +1071,11 @@ mod exclusion_fence {
     let alive = process_decoded(
       decoded,
       map,
-      &stats,
-      &transport,
-      exclusions,
+      &BufferContext {
+        stats: &stats,
+        transport: &transport,
+        exclusions,
+      },
       || Ok(one_entry_walk()),
       |_, subtree_fid, _| {
         walks.set(walks.get() + 1);

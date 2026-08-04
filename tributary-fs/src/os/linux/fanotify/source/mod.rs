@@ -872,11 +872,13 @@ fn seed_from_fd(
     root_fd,
     root_fid,
     root,
-    fsid,
-    root_dev,
-    fence_mnt_id,
-    exclusions,
-    max_directories,
+    &WalkFrame {
+      fsid,
+      root_dev,
+      fence_mnt_id,
+      exclusions,
+      budget: max_directories,
+    },
     &mut seed,
   )?;
   Ok(seed)
@@ -950,11 +952,13 @@ fn subtree_walk(
     subtree_fd,
     subtree_fid.clone(),
     subtree,
-    fsid,
-    root_dev,
-    fence_mnt_id,
-    exclusions,
-    budget,
+    &WalkFrame {
+      fsid,
+      root_dev,
+      fence_mnt_id,
+      exclusions,
+      budget,
+    },
     &mut seed,
   )?;
   Ok(seed)
@@ -976,6 +980,29 @@ struct WalkDir {
   /// map itself resolves a node — so a path the fence tests is the same path a
   /// delivered event would report.
   path: std::path::PathBuf,
+}
+
+/// Everything one descent is bounded and encoded against, invariant for its whole
+/// run: the superblock identity every discovered handle is stamped with, the mount
+/// frame and device belt a child must stay inside, the caller's exclusion fence and
+/// the directory budget. Grouped because the walk root (`fd`/`fid`/`path`) is what
+/// varies between the seed and the moved-in-subtree entry points while all five of
+/// these are simply carried through — and because they are the whole of what makes a
+/// descent's coverage decision, so naming them together keeps that decision in one
+/// place instead of spread across a positional argument list.
+struct WalkFrame<'a> {
+  /// The superblock id every discovered directory's handle is encoded with.
+  fsid: [u8; 8],
+  /// The walk root's device: a child on another one is a different superblock the
+  /// mark never reports on (the cheap belt behind the mount fence).
+  root_dev: u64,
+  /// The walk root's OWN mount id, or `None` when the kernel did not report one —
+  /// in which case the device belt alone governs.
+  fence_mnt_id: Option<u64>,
+  /// The caller's exclusion fence, applied before a child is opened.
+  exclusions: &'a [std::path::PathBuf],
+  /// The ceiling on entries this descent may push; `None` is uncapped.
+  budget: Option<usize>,
 }
 
 /// The shared iterative descent: reads `root_fd` (an already-pinned, already-FID'd
@@ -1046,13 +1073,16 @@ fn descend(
   root_fd: OwnedFd,
   root_fid: Fid,
   root_path: &Path,
-  fsid: [u8; 8],
-  root_dev: u64,
-  fence_mnt_id: Option<u64>,
-  exclusions: &[std::path::PathBuf],
-  budget: Option<usize>,
+  frame: &WalkFrame<'_>,
   seed: &mut Vec<SeedEntry>,
 ) -> Result<(), WalkError> {
+  let &WalkFrame {
+    fsid,
+    root_dev,
+    fence_mnt_id,
+    exclusions,
+    budget,
+  } = frame;
   let root_reader = Dir::new(root_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
   // The handles walked THIS run — the cycle/diamond guard. Seeded with the root so
   // a bind pointing back at the root is caught. Transient: dropped on return, never
