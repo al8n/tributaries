@@ -14,36 +14,60 @@ fn key(path: &str) -> Vec<OsString> {
     .collect()
 }
 
-/// Which projection a subscriber received for one raw event — the four move
-/// decompositions (design §5) plus the whole delivery for a non-move / Rescan. Carried
-/// on the fake `Delivered` so a test can assert *which* projection each covering
-/// subscriber got, not merely that it was covered.
+/// Which projection a subscriber received for one raw event — the move decompositions
+/// (design §5) and the clamped recovery projection, plus the whole delivery. Carried on
+/// the fake `Delivered` so a test can assert *which* projection each covering subscriber
+/// got, not merely that it was covered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Projection {
-  /// The event as-is: a non-move change, a Rescan, or a both-covering Moved.
+  /// The event as-is: a non-move change, a located Rescan, or a both-covering Moved.
   Whole,
   /// The synthesized move-out `Removed(from)` (source-only coverage).
   MoveOut,
   /// The synthesized move-in `Created(to)` (destination-only coverage).
   MoveIn,
+  /// A Rescan that CONTAINED the subscriber, re-keyed to the subscriber's own key.
+  RescanClamped,
 }
 
-/// A fake delivery: the subscriber it was routed to and the projection it received.
+/// What fan-out did to a delivery's coordinate for its receiving subscriber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebased {
+  /// Stripped this many leading location segments — the subscriber's depth below the
+  /// root the event was captured against.
+  Strip(usize),
+  /// Degraded to the root-anchored empty location: the subscriber sits ABOVE that root,
+  /// so its coordinate is not expressible from what the delivery carries.
+  AtRoot,
+}
+
+/// A fake delivery: the subscriber it was routed to, the projection it received, the key
+/// that projection names, and how fan-out re-expressed its coordinate for this
+/// subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Delivered {
   sub: Subscription,
   projection: Projection,
+  key: Vec<OsString>,
+  rebased: Rebased,
 }
 
-/// A minimal stand-in for a raw event: routing reads its endpoint keys and whether it
-/// is a `Rescan`. Its delivery records the subscriber and which projection it got, so a
-/// test asserts the covered set **and** each move decomposition without touching any
-/// real source's private event constructor. A `Some(from)` makes it a move whose
-/// destination is `key`.
+/// A minimal stand-in for a raw event: routing reads its endpoint keys, whether it
+/// is a `Rescan`, and the depth of the root it was captured against. Its delivery
+/// records the subscriber and which projection it got, so a test asserts the covered set
+/// **and** each move decomposition without touching any real source's private event
+/// constructor. A `Some(from)` makes it a move whose destination is `key`.
+#[derive(Clone)]
 struct FakeEvent {
   key: Vec<OsString>,
   from: Option<Vec<OsString>>,
   rescan: bool,
+  /// The root depth this event's location is measured from — a property of the EVENT,
+  /// which a queued change carries unchanged across a widen of the root it rides.
+  /// `None` is "captured against whatever root the fixture is routing on", filled in at
+  /// route time; [`captured_under`](Self::captured_under) pins it instead, modelling the
+  /// change that queued before a widen and drained after it.
+  captured_root_depth: Option<usize>,
 }
 
 impl FakeEvent {
@@ -52,6 +76,7 @@ impl FakeEvent {
       key: key(path),
       from: None,
       rescan: false,
+      captured_root_depth: None,
     }
   }
 
@@ -60,6 +85,7 @@ impl FakeEvent {
       key: key(path),
       from: None,
       rescan: true,
+      captured_root_depth: None,
     }
   }
 
@@ -69,7 +95,15 @@ impl FakeEvent {
       key: key(to),
       from: Some(key(from)),
       rescan: false,
+      captured_root_depth: None,
     }
+  }
+
+  /// Pins the root this event's location was captured against, independently of the root
+  /// the fixture is routing on now — the pre-widen queued change.
+  fn captured_under(mut self, root_path: &str) -> Self {
+    self.captured_root_depth = Some(key(root_path).len());
+    self
   }
 }
 
@@ -92,6 +126,8 @@ impl RoutableEvent<OsString> for FakeEvent {
     Delivered {
       sub,
       projection: Projection::Whole,
+      key: self.key.clone(),
+      rebased: Rebased::Strip(0),
     }
   }
 
@@ -99,6 +135,11 @@ impl RoutableEvent<OsString> for FakeEvent {
     Delivered {
       sub,
       projection: Projection::MoveOut,
+      key: self
+        .from
+        .clone()
+        .expect("move-out is only minted for a move"),
+      rebased: Rebased::Strip(0),
     }
   }
 
@@ -106,22 +147,48 @@ impl RoutableEvent<OsString> for FakeEvent {
     Delivered {
       sub,
       projection: Projection::MoveIn,
+      key: self.key.clone(),
+      rebased: Rebased::Strip(0),
     }
+  }
+
+  fn deliver_rescan_clamped(&self, sub: Subscription, key: &[OsString]) -> Delivered {
+    Delivered {
+      sub,
+      projection: Projection::RescanClamped,
+      key: key.to_vec(),
+      rebased: Rebased::Strip(0),
+    }
+  }
+
+  fn captured_root_depth(&self) -> usize {
+    self
+      .captured_root_depth
+      .expect("the fixture anchors every routed event")
+  }
+
+  fn rebase(&self, delivered: &mut Delivered, strip: usize) {
+    delivered.rebased = Rebased::Strip(strip);
+  }
+
+  fn anchor_at_root(&self, delivered: &mut Delivered) {
+    delivered.rebased = Rebased::AtRoot;
   }
 }
 
-/// A test root's subscriber list plus a side table of each subscriber's key — the two
-/// inputs `fan_out` needs (the matched root's subscribers and the key resolver).
+/// A test root's subscriber list plus a side table of each subscriber's key — the
+/// inputs `fan_out` needs (the matched root's key and subscribers, and the key resolver).
 struct Fixture {
+  root_depth: usize,
   subscribers: Vec<Subscription>,
   keys: HashMap<Subscription, Vec<OsString>>,
 }
 
 impl Fixture {
-  /// A root whose subscribers are the given `(id, key path)` pairs, in that
-  /// (registration) order. The root path itself is immaterial to `fan_out` (it keys on
-  /// the subscribers and their own keys), so only the subscribers are recorded.
-  fn new(_root_path: &str, subscribers: &[(u64, &str)]) -> Self {
+  /// A root at `root_path` whose subscribers are the given `(id, key path)` pairs, in
+  /// that (registration) order. The root path fixes the coordinate the raw event's
+  /// location is in, which fan-out rebases each delivery out of.
+  fn new(root_path: &str, subscribers: &[(u64, &str)]) -> Self {
     let mut subs = Vec::new();
     let mut keys = HashMap::new();
     for &(id, path) in subscribers {
@@ -130,6 +197,7 @@ impl Fixture {
       keys.insert(sub, key(path));
     }
     Self {
+      root_depth: key(root_path).len(),
       subscribers: subs,
       keys,
     }
@@ -139,11 +207,19 @@ impl Fixture {
     Subscription::for_test(ScopeId::new(NonZeroU64::new(id).expect("nonzero id")))
   }
 
+  /// `event` as this fixture routes it: an event that did not pin its own capture root
+  /// was captured against the root being routed on.
+  fn anchored(&self, event: &FakeEvent) -> FakeEvent {
+    let mut event = event.clone();
+    event.captured_root_depth = Some(event.captured_root_depth.unwrap_or(self.root_depth));
+    event
+  }
+
   /// The full deliveries `event` fans out to (subscriber + projection), every
   /// subscriber's gate admitting — the move-decomposition assertions read this.
   fn route_full(&self, event: &FakeEvent) -> Vec<Delivered> {
     fan_out(
-      event,
+      &self.anchored(event),
       &self.subscribers,
       |sub| self.keys.get(&sub).map(Vec::as_slice),
       |_sub, _delivered| true,
@@ -165,7 +241,7 @@ impl Fixture {
     admits: impl Fn(Subscription, &Delivered) -> bool,
   ) -> Vec<Subscription> {
     fan_out(
-      event,
+      &self.anchored(event),
       &self.subscribers,
       |sub| self.keys.get(&sub).map(Vec::as_slice),
       admits,
@@ -225,24 +301,169 @@ fn coverage_is_component_wise_not_prefix() {
   );
 }
 
+/// A rescan naming the WHOLE root still reaches every subscriber — the property the
+/// unconditional fan-out was protecting — but each narrow subscriber's instruction is
+/// clamped to its own key, so none is handed a path outside its watch.
 #[test]
-fn rescan_reaches_all_subscribers() {
-  // Root /a carries /a and the narrower /a/b/deep.
+fn whole_root_rescan_reaches_every_subscriber_clamped_to_its_own_key() {
   let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/b/deep")]);
-
-  // A non-Rescan at /a/x reaches only /a (coverage narrows out /a/b/deep).
+  let out = fx.route_full(&FakeEvent::rescan("/a"));
   assert_eq!(
-    fx.route(&FakeEvent::change("/a/x")),
-    vec![fx.sub(1)],
-    "a plain event honors coverage narrowing"
+    out.iter().map(|d| d.sub).collect::<Vec<_>>(),
+    vec![fx.sub(1), fx.sub(2)],
+    "a root-wide loss still reaches every subscriber"
   );
+  assert_eq!(
+    (out[0].projection, out[0].key.as_slice()),
+    (Projection::Whole, key("/a").as_slice()),
+    "the root-key subscriber's own key IS the rescan key — delivered verbatim"
+  );
+  assert_eq!(
+    (out[1].projection, out[1].key.as_slice()),
+    (Projection::RescanClamped, key("/a/b/deep").as_slice()),
+    "the narrow subscriber is told to re-enumerate ITS OWN subtree, not /a"
+  );
+}
 
-  // A Rescan — even one located at /a/x, which /a/b/deep does not cover — reaches
-  // EVERY subscriber of the root: coverage loss is never narrowed away.
+/// A rescan located at or below a subscription is delivered verbatim: the located key is
+/// already inside the subscription's boundary, and narrowing it further would lose
+/// precision the source paid for.
+#[test]
+fn rescan_below_a_subscription_is_delivered_located() {
+  let fx = Fixture::new("/a", &[(1, "/a")]);
+  let out = fx.route_full(&FakeEvent::rescan("/a/x/y"));
+  assert_eq!(out.len(), 1);
+  assert_eq!(
+    (out[0].projection, out[0].key.as_slice()),
+    (Projection::Whole, key("/a/x/y").as_slice()),
+    "a located rescan keeps its key for an ancestor subscription"
+  );
+}
+
+/// The finding: a rescan DISJOINT from a subscription must not be delivered to it. It
+/// names a subtree the subscription owns none of, so re-enumerating it recovers nothing —
+/// and, delivered, it becomes parked debt that suppresses that subscription's real deltas.
+#[test]
+fn a_disjoint_rescan_is_not_delivered() {
+  // Root /a carries /a/b/deep, which shares the physical root with the loss at /a/x but
+  // covers none of it.
+  let fx = Fixture::new("/a", &[(1, "/a/b/deep")]);
   assert_eq!(
     fx.route(&FakeEvent::rescan("/a/x")),
-    vec![fx.sub(1), fx.sub(2)],
-    "a Rescan bypasses coverage and reaches all subscribers"
+    Vec::<Subscription>::new(),
+    "a rescan whose subtree is disjoint from the subscription reaches it not at all"
+  );
+  // A sibling sharing the same root but covering the loss still receives it, so the
+  // narrowing above is geometry, not a blanket suppression.
+  let fx = Fixture::new("/a", &[(1, "/a/b/deep"), (2, "/a/x")]);
+  assert_eq!(
+    fx.route(&FakeEvent::rescan("/a/x")),
+    vec![fx.sub(2)],
+    "only the intersecting subscriber is served"
+  );
+}
+
+/// The component-wise ancestor test governs the rescan geometry too: `/a/b` neither
+/// contains nor is contained by `/a/bc`.
+#[test]
+fn rescan_geometry_is_component_wise() {
+  let fx = Fixture::new("/a", &[(1, "/a/bc")]);
+  assert_eq!(
+    fx.route(&FakeEvent::rescan("/a/b")),
+    Vec::<Subscription>::new(),
+    "/a/b does not contain the sibling /a/bc"
+  );
+  assert_eq!(
+    fx.route(&FakeEvent::rescan("/a/bc")),
+    vec![fx.sub(1)],
+    "an exact-key rescan reaches its subscription"
+  );
+}
+
+/// Every delivery is rebased out of the physical armed root's coordinate and into the
+/// receiving subscriber's own: the strip count is the subscriber's depth below the root,
+/// independent of where the event landed. A subscriber AT the root strips nothing.
+#[test]
+fn deliveries_are_rebased_into_each_subscribers_coordinate() {
+  let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/b"), (3, "/a/b/c")]);
+  let out = fx.route_full(&FakeEvent::change("/a/b/c/file"));
+  assert_eq!(
+    out
+      .iter()
+      .map(|d| (d.sub.id().as_u64(), d.rebased))
+      .collect::<Vec<_>>(),
+    vec![
+      (1, Rebased::Strip(0)),
+      (2, Rebased::Strip(1)),
+      (3, Rebased::Strip(2)),
+    ],
+    "each subscriber strips exactly its own depth below the armed root"
+  );
+}
+
+/// The rebase is applied to a rescan too — including the clamped projection, whose key
+/// IS the subscription root and whose location must therefore end up empty.
+#[test]
+fn rescan_projections_are_rebased_too() {
+  // /a/b is an ancestor of the loss (located delivery); /a/b/x/deep is contained by it
+  // (clamped delivery). Both are rebased by their own depth below the armed root /a.
+  let fx = Fixture::new("/a", &[(1, "/a/b"), (2, "/a/b/x/deep")]);
+  let out = fx.route_full(&FakeEvent::rescan("/a/b/x"));
+  assert_eq!(
+    out
+      .iter()
+      .map(|d| (d.sub.id().as_u64(), d.projection, d.rebased))
+      .collect::<Vec<_>>(),
+    vec![
+      (1, Projection::Whole, Rebased::Strip(1)),
+      (2, Projection::RescanClamped, Rebased::Strip(3)),
+    ],
+    "the located rescan and the clamped projection are both rebased by the subscriber's depth"
+  );
+}
+
+/// The coordinate anchor belongs to the EVENT, not to the call. A change captured while
+/// the root was `/a/b` and delivered after an in-place widen moved that root to `/a`
+/// still rebases by its own capture depth — so the subscription whose key never moved
+/// (`/a/b`) strips nothing, exactly as it did before the widen.
+///
+/// FAIL-ON-REVERT: anchor the rebase on the root fan-out is called with (`/a` here, depth
+/// 2) instead of `captured_root_depth`, and `/a/b` strips 1 — the queued change is
+/// re-coordinated one level up and `/a/b/c`'s two-level filter starts silently rejecting.
+#[test]
+fn a_queued_pre_widen_change_rebases_by_its_capture_depth() {
+  // The root has already widened to /a; the event still carries its /a/b coordinate.
+  let fx = Fixture::new("/a", &[(2, "/a/b"), (3, "/a/b/c")]);
+  let out = fx.route_full(&FakeEvent::change("/a/b/c/file").captured_under("/a/b"));
+  assert_eq!(
+    out
+      .iter()
+      .map(|d| (d.sub.id().as_u64(), d.rebased))
+      .collect::<Vec<_>>(),
+    vec![(2, Rebased::Strip(0)), (3, Rebased::Strip(1))],
+    "each subscriber strips its depth below the root the CHANGE was captured against"
+  );
+}
+
+/// The one coordinate that cannot be stated: the widener itself, handed a change queued
+/// from before its own widen. Its location would need leading segments the delivery never
+/// recorded, so the delivery degrades to root-anchored — with its key, which is absolute,
+/// left as the authoritative signal — rather than reporting a capture-relative location
+/// that names a path the subscription does not contain.
+///
+/// FAIL-ON-REVERT: `saturating_sub` in place of the `checked_sub` split silently strips
+/// nothing and hands `/a` the location `[file]` for a change at `/a/b/c/file`.
+#[test]
+fn a_subscriber_above_the_capture_root_is_anchored_not_mis_stated() {
+  let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/b")]);
+  let out = fx.route_full(&FakeEvent::change("/a/b/file").captured_under("/a/b"));
+  assert_eq!(
+    out
+      .iter()
+      .map(|d| (d.sub.id().as_u64(), d.rebased))
+      .collect::<Vec<_>>(),
+    vec![(1, Rebased::AtRoot), (2, Rebased::Strip(0))],
+    "the widener is anchored at its root; the subscription at the capture root is exact"
   );
 }
 
@@ -289,17 +510,18 @@ fn filter_only_sees_covered_deliveries() {
 
 #[test]
 fn rescan_bypasses_the_filter() {
-  // Root /a carries /a and /a/b. A Rescan must reach BOTH even when every filter
-  // rejects — coverage loss is never filtered away (§7/§8). A filter that would reject
-  // everything (and must never even be consulted for a Rescan) proves the bypass.
+  // Root /a carries /a and /a/b, and the loss at /a covers both. A Rescan must reach
+  // BOTH even when every filter rejects — coverage loss is never filtered away (§7/§8).
+  // A filter that would reject everything (and must never even be consulted for a
+  // Rescan) proves the bypass.
   let fx = Fixture::new("/a", &[(1, "/a"), (2, "/a/b")]);
-  let admitted = fx.route_filtered(&FakeEvent::rescan("/a/x"), |_, _| {
+  let admitted = fx.route_filtered(&FakeEvent::rescan("/a"), |_, _| {
     panic!("the filter must not be consulted for a Rescan");
   });
   assert_eq!(
     admitted,
     vec![fx.sub(1), fx.sub(2)],
-    "a Rescan bypasses the filter and reaches every subscriber"
+    "a Rescan bypasses the filter and reaches every intersecting subscriber"
   );
 }
 

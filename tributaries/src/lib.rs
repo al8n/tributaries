@@ -20,7 +20,8 @@ mod view;
 pub use demux::{Demux, Lane};
 pub use driver::Tributaries;
 pub use error::{
-  BuildError, CloseError, FaultKind, SourceFault, SyncError, UnwatchError, WatchError,
+  BuildError, CloseError, FaultKind, SourceCloseError, SourceFault, SyncError, UnwatchError,
+  WatchError,
 };
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};

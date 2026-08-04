@@ -39,7 +39,7 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use futures_util::FutureExt;
-use tributary_proto::Epoch;
+use tributary_proto::{Epoch, unwind::dispose_panic_payload};
 
 #[cfg(feature = "fs")]
 use tributary_fs::{RootHandle, WatcherOptions};
@@ -557,6 +557,7 @@ where
       subsumer,
       epochs: EpochLedger::new(),
       filters: HashMap::new(),
+      filter_payload_forgotten: false,
       needs_rescan: BTreeMap::new(),
       suppressed_rescan: BTreeMap::new(),
       unclaimed: std::collections::HashSet::new(),
@@ -940,6 +941,52 @@ impl<R: RuntimeLite> Tributaries<OsString, (), R, RootHandle> {
   }
 }
 
+/// One subscription's admission gate as the owner holds it: the caller-facing
+/// [`Filter`] and this owner's own verdict on whether that filter is still allowed to
+/// run for **this** subscription.
+///
+/// # Why quarantine is driver state and not a swap through the filter
+///
+/// A [`Filter`] is a handle onto a **shared** predicate slot: cloning one — which
+/// [`WatchOptions`](crate::WatchOptions) does, and which a caller does deliberately to
+/// re-scope a live subscription — hands out another handle onto the *same*
+/// [`ArcSwap`](arc_swap::ArcSwap). That sharing is a feature for a caller-initiated
+/// [`swap`](Filter::swap): every holder should see a re-scope.
+///
+/// It is a blast radius for a quarantine. Retiring a panicking predicate by swapping
+/// admit-everything into that slot retires it for **every** subscription registered with
+/// a clone of the same filter, while only the one whose invocation unwound is recorded as
+/// having lost coverage. Two tenants configured from one shared `Filter` value would then
+/// have one tenant's panic silently disable the other's admission gate: no `Rescan`, no
+/// loss marker, and a filtering or tenant boundary crossed with nothing on the stream to
+/// say so. The isolation the containment promises ("every other subscription is
+/// unaffected" — see [`Filter::new`]) is only true if the verdict is per-subscription.
+///
+/// So the flag lives here, in the owner's own per-subscription map, and the caller's
+/// slot is never written. It is born with the subscription's entry and reclaimed with it
+/// ([`retire_sub_state`](Owner::retire_sub_state)), so it can neither leak nor be missed
+/// by a cleanup path — and the subscriptions sharing that `Filter` keep filtering
+/// exactly as they were configured to.
+struct SubscriptionFilter<C> {
+  filter: Filter<C>,
+  /// Set once this subscription's predicate has unwound: its gate is retired
+  /// **fail-open** (every later change is admitted without entering caller code) and it
+  /// has been owed a dominating [`Rescan`](crate::EventKind::Rescan). Never cleared — a
+  /// predicate that panicked once is not trustworthy, and re-entering it would cost an
+  /// unwind per event on top of leaving the verdict undefined.
+  quarantined: bool,
+}
+
+impl<C> SubscriptionFilter<C> {
+  /// A freshly registered gate: the caller's filter, not quarantined.
+  fn new(filter: Filter<C>) -> Self {
+    Self {
+      filter,
+      quarantined: false,
+    }
+  }
+}
+
 /// The owned-task actor: the sole writer of every authoritative state, driving the
 /// source and the sans-I/O engines from one [`run`] `select!` loop. Bounded on
 /// [`LocalSource`] — the base seam — so ONE owner body serves both construction paths:
@@ -963,7 +1010,42 @@ where
   source: S,
   subsumer: Subsumer<C, V, S::Handle>,
   epochs: EpochLedger,
-  filters: HashMap<Subscription, Filter<C>>,
+  /// Each live subscription's admission gate, as the driver holds it: the caller's
+  /// [`Filter`] plus this owner's own quarantine verdict on it
+  /// ([`SubscriptionFilter`]). One entry per subscription, born and reclaimed with the
+  /// subscription itself.
+  filters: HashMap<Subscription, SubscriptionFilter<C>>,
+  /// Set once this owner has had to **forget** a filter panic payload, which permanently
+  /// retires its whole filter plane.
+  ///
+  /// # What this bounds, and why per-subscription was not enough
+  ///
+  /// Containing a filter panic means disposing of the payload it carried, and a payload
+  /// whose own destructor panics can only be
+  /// [forgotten](tributary_proto::unwind::PayloadDisposal::Forgotten) — dropping it would
+  /// start a second unwind through the owner, which is the blast radius the containment
+  /// exists to prevent. Forgetting leaks that one payload, and the payload is caller data
+  /// of any size.
+  ///
+  /// Quarantining the SUBSCRIPTION bounds that leak to one per subscription, and a
+  /// subscription is a caller-churnable object: create one with a panicking filter, feed it
+  /// one change, drop it, repeat — each cycle retains another arbitrary allocation, forever,
+  /// until the process is out of memory. Quarantine per subscription is a bound in the shape
+  /// of the state it protects, not in the shape of the resource.
+  ///
+  /// So the latch is the OWNER's. Once set, no predicate is ever entered again here — every
+  /// still-unquarantined subscription is quarantined on its next touch, through the same
+  /// path a panicking predicate takes, so each keeps the established terms: it FAILS OPEN,
+  /// stays live and covered, and is owed a dominating [`Rescan`](crate::EventKind::Rescan) so
+  /// its consumer learns in-band that its admission gate is gone. The bound is then exactly
+  /// **one forgotten payload per watcher, ever**, independent of how many subscriptions the
+  /// caller creates, destroys, or hot-swaps predicates into.
+  ///
+  /// A caller that asks for a NEW filtered subscription past this point is refused with
+  /// [`WatchError::FilterRetired`] rather than silently handed an unfiltered one — the leak
+  /// is bounded either way (its predicate would never be entered), but a filter that is not
+  /// applied and not reported is the silent behaviour change this codebase does not ship.
+  filter_payload_forgotten: bool,
   /// The per-subscription overflow dirty-set (design backpressure doc): a subscription
   /// whose delivery hit a full event channel parks a durable **dominating**
   /// [`Rescan`](crate::EventKind::Rescan) here — a [`ParkedRescan`] holding its covered
@@ -1026,10 +1108,15 @@ where
   /// is `Some`, lazily by the first committed [`Custom`](Debounce::Custom) override, and
   /// **never** otherwise — the zero-cost claim for consumers who never opt in anywhere.
   coalescer: Option<Coalescer<C, V>>,
-  /// Sync barriers awaiting their cookie's event (or a dominating `Rescan`).
-  /// Bounded by concurrent syncs, which the command mailbox bounds; a caller
-  /// that drops its future (or times out) has its entry reaped at the next
-  /// funnel pass by the cancelled-reply check.
+  /// Sync barriers awaiting their cookie's event (or a dominating `Rescan`),
+  /// capped at [`MAX_PENDING_SYNCS`] live entries. A caller that drops its future
+  /// (or times out) has its entry reaped at the next funnel pass by the
+  /// cancelled-reply check.
+  ///
+  /// The cap is the reason this can stay a vector. Every owner iteration scans it
+  /// for abandoned callers and every observed cookie searches it by key, so an
+  /// unbounded population would make the owner's own bookkeeping grow with the
+  /// barriers it is trying to finish; bounded, both scans are a small constant.
   pending_syncs: Vec<PendingSync<C, S::Handle>>,
   /// The per-owner monotonic cookie sequence — the `seq` of every `SyncToken`.
   sync_seq: u64,
@@ -1137,15 +1224,38 @@ where
   /// be drained mid-unwind and are necessarily lost on a panic; emptying the plane is the achievable
   /// guarantee.
   fn drop(&mut self) {
+    // The state-safety operation comes FIRST, before any fallible or caller-defined work.
+    // `publish_empty` is a single synchronous `arc_swap` store that runs no caller code, so it
+    // always succeeds; the reap below calls `LocalSource::end_sync`, which is a PUBLIC extension
+    // point whose contract requires synchronous fire-and-forget behavior but cannot require
+    // panic-freedom. Reaping first meant one panicking `end_sync` implementation left the read plane
+    // published: on an ordinary cancellation a retained `WatchView` kept advertising subscriptions
+    // whose owner was gone, and during an unwind the second panic aborted the process before the
+    // plane was ever cleared. Ordering it first makes the guarantee this destructor exists for
+    // unconditional.
+    self.subsumer.publish_empty();
     // Best-effort reap of any cookie still pending — a panic from a caller
     // callback (a `Filter`) unwinds through here, bypassing the normal-exit
-    // `reap_all_pending_syncs`, and the marker files must not survive. Each
-    // `end_sync` is fire-and-forget (a non-panicking `try_send`), so it cannot
-    // double-panic while unwinding.
+    // `reap_all_pending_syncs`, and the marker files must not survive.
+    //
+    // Each reap is contained on its own, so ONE panicking `end_sync` cannot both abort a process
+    // that is already unwinding and skip every remaining cookie behind it. Containment here is not
+    // an alternative to the ordering above: it bounds the blast radius of a misbehaving source,
+    // while the ordering is what makes the read plane safe regardless.
+    //
+    // The containment runs through [`contain`](tributary_proto::unwind::contain) — which retires
+    // the caught PAYLOAD inside a boundary too — because this destructor's own frame is the worst
+    // possible place to drop one. Payload disposal is the panicking source's `Drop`, so a payload
+    // whose destructor panics would unwind out of here; and this destructor runs on the owner's
+    // panic path as well as its normal one, where a second unwind is not a contained failure but
+    // an immediate process ABORT — before the remaining cookies are reaped, and with nothing
+    // reported about any of it.
     for pending in std::mem::take(&mut self.pending_syncs) {
-      self.source.end_sync(pending.root, &pending.cookie_key);
+      let source = &mut self.source;
+      let _ = tributary_proto::unwind::contain(move || {
+        source.end_sync(pending.root, &pending.cookie_key);
+      });
     }
-    self.subsumer.publish_empty();
   }
 }
 
@@ -1242,14 +1352,27 @@ enum ReplaceStep<C, H> {
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
 /// fan out a raw source event, or drain the coalescer's due entries — whichever is ready, each to
 /// completion. The only source calls it awaits are [`next`](LocalSource::next) (one cancel-safe
-/// `select!` arm) and, inside a caller-bounded `Watch` reconcile, [`arm`](LocalSource::arm); releasing a
-/// root is the **synchronous** [`disarm`](LocalSource::disarm) request, so **no** loop path awaits it and
-/// Close-responsiveness (invariant II) holds *by construction*.
+/// `select!` arm) and, inside a caller-bounded `Watch` reconcile, [`arm`](LocalSource::arm),
+/// [`grow`](LocalSource::grow) and [`replace`](LocalSource::replace); releasing a root is the
+/// **synchronous** [`disarm`](LocalSource::disarm) request, so **no** loop path awaits it.
 ///
 /// Shutdown rides a **dedicated** [`closes`](Owner::closes) channel checked at the TOP priority — the
 /// first `select!` arm AND a non-blocking `try_recv` at the very top of each iteration (before the
 /// flush/valve) — so a requested close is serviced within a bounded window no matter how deep the
-/// unbounded command backlog is. Grant resolution rides the dedicated
+/// unbounded command backlog is.
+///
+/// A queued close being at the top of the `select!` is necessary but NOT sufficient, and that gap is
+/// the reason every awaited source call above is itself a biased race against the same close
+/// receiver. The loop selects a command and then awaits the entire reconcile INSIDE that branch, so
+/// while a `Source::arm` or `grow` against a hung mount is pending the loop never returns to its
+/// `select!` at all — the dedicated lane exists but nothing polls it, and `close()` stays pending for
+/// as long as the mount does. Racing each awaited call means a close arriving mid-reconcile abandons
+/// the reconcile (its `watch()` caller's dropped reply reads as `Closed`) and drives teardown, which
+/// drops the source. Close-responsiveness therefore holds against a source that violates its own
+/// bounded-progress requirement — but only for the AWAITED surface: a source's synchronous
+/// callbacks ([`canonicalize_key`](LocalSource::canonicalize_key)) and a subscription's
+/// [`Filter`](crate::Filter) predicate run on this thread with nothing to race against, and the
+/// [`LocalSource`] contract says so plainly rather than promising what an actor cannot do. Grant resolution rides the dedicated
 /// [`cleanup_rx`](Owner::cleanup_rx) channel at the **second** priority (below close, above the
 /// mailbox): a top-of-iteration full [`drain_pending_cleanup`](Owner::drain_pending_cleanup)
 /// AND a `select!` arm between close and commands. The command mailbox is otherwise biased above the
@@ -1320,6 +1443,12 @@ where
     // `Err(Empty)` alike fall through, driving neither teardown (the COMMAND channel closing remains
     // the dropped-handles signal) nor a spin.
     if let Ok(req) = owner.sync_commands.try_recv() {
+      // Counted against the data-plane fairness valve like the `select!`'s own sync arm. A barrier is
+      // completed BY a source event, so admitting one is control-plane work that CREATES data-plane
+      // work — leaving this drain uncounted let two cookies be initiated per iteration while only one
+      // counted toward the budget that forces a source poll, so initiation outran the observation it
+      // depends on and every admitted barrier waited longer for it.
+      command_streak += 1;
       // A close can win the race inside `on_sync`'s in-flight cookie write: thread its reply back and
       // break to teardown exactly as the top-of-iteration close check above does.
       if let SyncAdmit::CloseRequested(reply) = owner
@@ -1592,9 +1721,23 @@ where
   // (design §5). It is a synchronous `arc_swap` store — the owner still never awaits the event
   // sender, so no-deadlock (III) holds.
   owner.subsumer.publish_empty();
+  // The source lifecycle split. `begin_close` is the synchronous, non-blocking initiation — it
+  // starts the source winding down at the instant the owner decides to stop, and can block nothing
+  // — and `join_close` is the bounded wait that produces an HONEST quiescence result.
+  //
+  // Awaiting it before the acknowledgement is the whole point. Publishing empty and replying `Ok`
+  // while the source is merely DROPPED afterwards means the caller's `close()` resolves over a
+  // teardown nobody waited for: the caller may resume on another thread and terminate the runtime
+  // before the source's own driver has finished, abandoning native threads, OS handles and any
+  // marker files it wrote — and the source's `NotQuiesced` evidence, the strongest lifecycle fact
+  // the lower layer produces, is discarded unread. So the reply now carries the source's verdict.
+  //
+  // The default seam is immediately `Ok(())`, so a source with no native resources pays nothing.
+  owner.source.begin_close();
+  let quiesced = owner.source.join_close().await;
   // Dropping `owner` (and its source) performs the orderly source teardown.
   if let Some(reply) = ack {
-    let _ = reply.send(Ok(()));
+    let _ = reply.send(quiesced.map_err(CloseError::Source));
   }
 }
 
@@ -1613,6 +1756,31 @@ const RETRY: Duration = Duration::from_millis(25);
 /// events and the coalescer its hold bounds for the flood's whole duration. Small enough to bound
 /// data-plane staleness tightly under load, large enough to amortize the extra poll.
 const COMMAND_FAIRNESS_BUDGET: u32 = 32;
+
+/// The most sync barriers one owner may hold in flight at once.
+///
+/// The sync mailbox is bounded, and that bound was mistaken for a bound on live
+/// barriers. It is not: the owner drains the mailbox, releasing each slot, and
+/// then RETAINS the request — a [`PendingSync`] plus a real cookie FILE on the
+/// watched filesystem — until its cookie is observed, dominated, cancelled or
+/// retired. The caller chooses its own timeout, so a stream of callers with long
+/// deadlines can be admitted far faster than their cookies come back, and the
+/// growth is in both owner memory and filesystem entries. The topology makes it
+/// worse rather than self-correcting: barriers are completed BY source events,
+/// and a sync-heavy control plane is precisely what delays the source service
+/// those events need.
+///
+/// So admission is bounded over the retained obligation. Past this many live
+/// barriers a request is refused with the typed, retryable
+/// [`SyncError::Busy`] BEFORE any cookie is written — a refusal that leaves
+/// nothing on disk — rather than admitted into an unbounded park.
+///
+/// Chosen well above any plausible legitimate concurrency (a barrier is a
+/// coarse-grained, whole-subscription operation) and independent of the
+/// configured mailbox capacity, because the two bound different things: the
+/// mailbox bounds requests waiting to be RECEIVED, this bounds requests already
+/// admitted and not yet finished.
+const MAX_PENDING_SYNCS: usize = 256;
 
 /// The earlier of two optional deadlines, treating [`None`] as infinitely far — the sleep
 /// target combining the coalescer's settle deadline with the parked-Rescan retry.
@@ -1850,6 +2018,18 @@ where
     options: WatchOptions<C>,
   ) -> Result<Subscription, ReconcileStop> {
     let (interest, filter, debounce) = options.into_parts();
+    // FILTER-PLANE GATE, before anything is canonicalized, planned, armed or committed. This
+    // owner has forgotten a filter panic payload, so it enters no predicate again
+    // ([`Owner::filter_payload_forgotten`]) — and a subscription registered here would
+    // therefore be created with an admission gate that never runs. The leak is bounded either
+    // way; what the refusal buys is that the caller is TOLD, instead of receiving a
+    // subscription that quietly delivers everything its filter was written to exclude.
+    //
+    // Only a watch that asks for filtering is refused: a `Filter::all` default filters nothing,
+    // so admitting it changes no behaviour and denies the caller nothing.
+    if filter.is_custom() && self.filter_payload_forgotten {
+      return Err(WatchError::FilterRetired.into());
+    }
     // RETIRED-DEBT ADMISSION GATE. The invariant this enforces, stated
     // honestly: retirement CONVERTS a live subscription's state into one retired parked
     // entry 1:1 (`force_remove_root` frees the subsumer/filter/epoch state as the entry
@@ -1974,9 +2154,9 @@ where
         let record_cover = if outside_cover {
           match self.subsumer.retained_cover_for(fs_root, Some(key)) {
             Some(cover) => {
-              if let Err(err) = self.source.grow(fs_root, &cover).await {
+              if let Err(stop) = self.grow(fs_root, &cover).await {
                 self.subsumer.abort_watch(&outcome);
-                return Err(err.into());
+                return Err(stop);
               }
               Some(Some(cover))
             }
@@ -1990,9 +2170,9 @@ where
                 .map(|record| record.key.clone())
               {
                 Some(root_key) => {
-                  if let Err(err) = self.source.grow(fs_root, &[root_key]).await {
+                  if let Err(stop) = self.grow(fs_root, &[root_key]).await {
                     self.subsumer.abort_watch(&outcome);
-                    return Err(err.into());
+                    return Err(stop);
                   }
                   Some(None)
                 }
@@ -2008,7 +2188,7 @@ where
           None
         };
         self.subsumer.commit_watch(&outcome, fs_root, key);
-        self.filters.insert(sub, filter);
+        self.filters.insert(sub, SubscriptionFilter::new(filter));
         self.register_debounce(sub, debounce);
         if let Some(cover) = record_cover {
           self.subsumer.set_retained_cover(fs_root, cover);
@@ -2019,9 +2199,9 @@ where
         let sub = *sub;
         let armed = match self.arm(key).await {
           Ok(armed) => armed,
-          Err(err) => {
+          Err(stop) => {
             self.subsumer.abort_watch(&outcome);
-            return Err(err.into());
+            return Err(stop);
           }
         };
         // Re-key onto the source's authoritative canonical key (invariant I2). A
@@ -2038,7 +2218,7 @@ where
         // A contract-violating source is caught by the arm choke point's exhaustive observed-handle
         // tripwire, which fires on ANY reuse before this commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
-        self.filters.insert(sub, filter);
+        self.filters.insert(sub, SubscriptionFilter::new(filter));
         self.register_debounce(sub, debounce);
         Ok(sub)
       }
@@ -2187,9 +2367,12 @@ where
             // line with a `disarm` — the owner's await surface (only `arm`/`next` are awaited; every
             // `disarm` is now synchronous) stays greppable. Then abort the newcomer's plan.
             let restore = self.restore_disarmed_roots(unwatch);
-            restore.await;
+            let closed = restore.await;
             self.subsumer.abort_watch(&outcome);
-            return Err(err.into());
+            // A close consumed during the restore outranks the arm's own error:
+            // dropping its reply would leave `close()` pending forever, while the
+            // caller's dropped `watch()` reply already reads as `Closed`.
+            return Err(closed.map_or(err, ReconcileStop::CloseRequested));
           }
         };
         let (handle, fs_key) = armed;
@@ -2202,9 +2385,11 @@ where
           // `.await` line).
           self.source.disarm(handle);
           let restore = self.restore_disarmed_roots(unwatch);
-          restore.await;
+          let closed = restore.await;
           self.subsumer.abort_watch(&outcome);
-          return Err(canonical_race().into());
+          return Err(
+            closed.map_or_else(|| canonical_race().into(), ReconcileStop::CloseRequested),
+          );
         }
         // The wider arm's handle is generation-unique (see `Source::Handle`): it aliases none of the
         // still-recorded subsumed roots `commit_watch` is about to drop, nor any other live root, so
@@ -2304,7 +2489,7 @@ where
     repointed: &[Subscription],
   ) {
     self.subsumer.commit_watch(outcome, handle, fs_key);
-    self.filters.insert(sub, filter);
+    self.filters.insert(sub, SubscriptionFilter::new(filter));
     self.register_debounce(sub, debounce);
     let mut rescans = Vec::with_capacity(repointed.len());
     for &moved in repointed {
@@ -2320,7 +2505,12 @@ where
         coalescer.drop_subscription(moved);
       }
       let rescan = self.epochs.repoint(moved);
-      let mut event = Event::rescan(moved, fs_key.to_vec(), rescan);
+      // Keyed at the SUBSCRIPTION, not at the new wider root: the gap this Rescan closes is
+      // the disarm/re-arm window, and within this subscription that window made exactly its
+      // own subtree uncertain. Naming the wider root would hand a per-subscription consumer
+      // a path outside its watch (see `route`'s rescan geometry).
+      let key = self.rescan_key_for(moved, fs_key);
+      let mut event = Event::rescan(moved, key, rescan);
       // The specific re-pointed subscription owns this Rescan (its key is invariant under the
       // widen, so its own value is still recorded); bake it so attribution is the sub's own
       // value, not the widening root's (design §3).
@@ -2410,12 +2600,91 @@ where
   /// with no flushing of its own. Should a contract-violating source return `Overlaps` anyway, it
   /// surfaces as the [`WatchError`] it maps to — a documented source-contract violation, never
   /// silently retried.
-  async fn arm(&mut self, key: &[C]) -> Result<(S::Handle, Vec<C>), WatchError> {
-    let armed = self.source.arm(key).await?;
+  /// Grows a covering root's source coverage back up to `cover`, RACED against the dedicated close
+  /// receiver for the same reason [`arm`](Self::arm) is: this call is awaited inside the run loop's
+  /// selected command branch, so an unraced grow against a hung mount leaves the already-queued
+  /// close receiver unpolled and `close()` pending forever. The stock binding's `grow` waits on the
+  /// lower cover-settle fence, so this is not a hypothetical hostile source.
+  ///
+  /// Dropping a pending grow abandons only a COVERAGE WIDENING, never a commitment: the caller's
+  /// reconcile unwinds through `abort_watch`, the retained-cover record is not broadened (so the
+  /// next newcomer under the pruned region re-issues the grow), and the close this lost to tears
+  /// the source down immediately.
+  async fn grow(&mut self, root: S::Handle, cover: &[Vec<C>]) -> Result<(), ReconcileStop> {
+    let closes = &self.closes;
+    let source = &mut self.source;
+    futures_util::select_biased! {
+      close = closes.recv().fuse() => match close {
+        Ok(close_reply) => Err(ReconcileStop::CloseRequested(close_reply)),
+        // Every handle is gone: an abandon, not a threaded close (see `arm`). The
+        // grow is left to the caller's next attempt; the command channel drives
+        // teardown.
+        Err(_) => Err(WatchError::Closed.into()),
+      },
+      res = source.grow(root, cover).fuse() => res.map_err(Into::into),
+    }
+  }
+
+  /// The arm itself is RACED against the dedicated close receiver, exactly as
+  /// [`replace`](Self::replace_racing_close) and `on_sync`'s cookie write are.
+  /// Without that race the owner's advertised close lane is not a lane at all:
+  /// the run loop selects a command, awaits the whole reconcile inside that
+  /// branch, and the reconcile awaits this arm — so a `Source::arm` against a
+  /// hung mount (the stock binding waits on lower registration, and possibly on
+  /// lower unwatch acknowledgements) means the already-queued close receiver is
+  /// never polled again and `close()` stays pending forever, with the read plane
+  /// and every source resource still live. Racing it makes close bounded against
+  /// a source that violates its own bounded-progress requirement, which is what
+  /// the run loop and the [`Source`] contract both promise.
+  ///
+  /// Dropping a pending `arm` is safe for the same reason dropping a pending
+  /// `replace` is: only a close can drop it, and a close tears down at once —
+  /// the source's own `Drop` reclamation covers an in-flight arm, and an
+  /// already-created stream the abandoned future would have reported is
+  /// reclaimed by the lower driver's close sweep.
+  async fn arm(&mut self, key: &[C]) -> Result<(S::Handle, Vec<C>), ReconcileStop> {
+    let armed = {
+      // Split-borrow so the two arms stay disjoint: the close arm reads
+      // `&self.closes` while `arm` reborrows `&mut self.source`.
+      let closes = &self.closes;
+      let source = &mut self.source;
+      futures_util::select_biased! {
+        // Close is polled FIRST — a requested shutdown wins over everything, so an
+        // arm not yet started is never issued at all. Every handle being gone is an
+        // ABANDON rather than a threaded close (`None`): the command channel remains
+        // the dropped-handles teardown signal, so the arm is left to finish rather
+        // than inventing a reply nobody is waiting for.
+        close = closes.recv().fuse() => close.ok(),
+        res = source.arm(key).fuse() => return match res {
+          Ok(armed) => self.adopt_armed(armed),
+          Err(err) => Err(err.into()),
+        },
+      }
+    };
+    match armed {
+      Some(close_reply) => Err(ReconcileStop::CloseRequested(close_reply)),
+      // The close channel closed mid-arm. Re-issue against the source: this is
+      // the abandon case above, and the reconcile still owes its caller a
+      // verdict.
+      None => match self.source.arm(key).await {
+        Ok(armed) => self.adopt_armed(armed),
+        Err(err) => Err(err.into()),
+      },
+    }
+  }
+
+  /// The post-arm half of the choke point: liveness validation, the
+  /// generation-unique handle tripwire, and adoption of the source's canonical
+  /// key. Shared by both of [`arm`](Self::arm)'s issue paths so the choke point
+  /// stays single even though the arm is raced.
+  fn adopt_armed(
+    &mut self,
+    armed: crate::source::Armed<C, S::Handle>,
+  ) -> Result<(S::Handle, Vec<C>), ReconcileStop> {
     let handle = armed.handle();
     if self.source.root_key(handle).is_none() {
       self.source.disarm(handle);
-      return Err(WatchError::DeadOnArrival);
+      return Err(WatchError::DeadOnArrival.into());
     }
     // The single exhaustive tripwire for the generation-unique `Source::Handle` contract (
     // ): a freshly-armed, live handle must NEVER have been observed by this owner before. This
@@ -2600,14 +2869,23 @@ where
   ///   from the view.
   ///
   /// Either way no subscription is left recorded-live-but-disarmed-and-published-watched.
-  async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) {
+  ///
+  /// Returns the [`CloseReply`] a close won from a re-arm, if one did. The re-arms run through the
+  /// close-raced [`arm`](Self::arm) choke point, so a close during this restore consumes the
+  /// dedicated close signal — and a consumed reply that were merely dropped here would leave
+  /// `close()` pending forever, the exact wedge the race exists to remove. The restore stops at
+  /// that point: the remaining subsumed roots are retired with their terminal `Rescan`s (no
+  /// subscription is left bound to a released handle) and the reply is handed back to drive
+  /// teardown, which drops the source and reclaims everything the abandoned re-arms would have
+  /// restored.
+  async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) -> Option<CloseReply> {
     for &old in unwatch {
       // The subsumed root is still recorded (the widen never committed); recover its key
       // and subscribers before any re-arm/retire mutates the subsumer.
       let Some((root_key, subscribers)) = self
         .subsumer
-        .entry(old)
-        .map(|record| (record.key.clone(), record.subscribers.clone()))
+        .root_view(old)
+        .map(|(key, cohort)| (key.to_vec(), cohort.to_vec()))
       else {
         continue;
       };
@@ -2642,7 +2920,10 @@ where
               coalescer.drop_subscription(sub);
             }
             let rescan = self.epochs.repoint(sub);
-            let mut event = Event::rescan(sub, root_key.clone(), rescan);
+            // Scoped to the subscription's own key, like every other per-subscription
+            // recovery instruction (see `rescan_key_for`).
+            let key = self.rescan_key_for(sub, &root_key);
+            let mut event = Event::rescan(sub, key, rescan);
             // The re-armed root kept each subscriber's key (rebind touches only the handle), so
             // bake the subscriber's own recorded value onto its restore Rescan (design §3).
             event.set_value(self.subsumer.subscription_value(sub).cloned());
@@ -2664,9 +2945,22 @@ where
           self.source.disarm(new_handle);
           self.retire_root_with_terminal_rescan(old);
         }
-        Err(_) => self.retire_root_with_terminal_rescan(old),
+        Err(ReconcileStop::Failed(_)) => self.retire_root_with_terminal_rescan(old),
+        Err(ReconcileStop::CloseRequested(close_reply)) => {
+          // Close won this re-arm. Retire every root still awaiting restoration —
+          // this one included — so none is left recorded live on a released
+          // handle, then hand the reply back rather than dropping it.
+          self.retire_root_with_terminal_rescan(old);
+          for &pending in unwatch {
+            if pending != old {
+              self.retire_root_with_terminal_rescan(pending);
+            }
+          }
+          return Some(close_reply);
+        }
       }
     }
+    None
   }
 
   /// The single **park-terminal-Rescan-then-retire** primitive (invariant I4, no silent loss):
@@ -2733,8 +3027,8 @@ where
   fn rescan_live_root(&mut self, root: S::Handle) {
     let Some((root_key, subscribers)) = self
       .subsumer
-      .entry(root)
-      .map(|record| (record.key.clone(), record.subscribers.clone()))
+      .root_view(root)
+      .map(|(key, cohort)| (key.to_vec(), cohort.to_vec()))
     else {
       return;
     };
@@ -2749,12 +3043,16 @@ where
       self.note_loss(sub);
       let value = self.subsumer.subscription_value(sub).cloned();
       let epoch = self.epochs.shed_rescan(sub);
+      // Scoped to the subscription's own key: the root died or its stream was silently
+      // retargeted, which makes everything this subscriber owns uncertain — and nothing
+      // above it, which is not its to re-enumerate (see `rescan_key_for`).
+      let key = self.rescan_key_for(sub, &root_key);
       let target = if self.unclaimed.contains(&sub) {
         &mut self.suppressed_rescan
       } else {
         &mut self.needs_rescan
       };
-      merge_max(target, sub, root_key.clone(), epoch, value);
+      merge_max(target, sub, key, epoch, value);
       // DROP (not forget) the buffered deltas: the sub stays live here, so its registered debounce
       // policy must keep governing later events. A retiring caller forgets the policy afterward.
       if let Some(coalescer) = self.coalescer.as_mut() {
@@ -2766,9 +3064,40 @@ where
 
   /// Fans one raw source event out to its covering, admitting subscribers and pushes the
   /// results (through the coalescer, if enabled) to the event stream.
+  ///
+  /// # The delivery that a panicking filter admitted goes through the debt gate, not the
+  /// coalescer
+  ///
+  /// A subscription whose predicate unwound during this fan-out is quarantined *here*,
+  /// between the fan-out and the push — which means the delivery its panic fail-opened
+  /// was **stamped before** [`quarantine_filters`](Self::quarantine_filters) minted that
+  /// subscription's dominating `Rescan`, and is therefore strictly dominated by it.
+  ///
+  /// Routing it through [`push_all`](Self::push_all) would admit it to the
+  /// [`Coalescer`](crate::coalesce::Coalescer) (which buffers *before*
+  /// [`try_emit`](Self::try_emit) suppresses), where it would sit behind a settle window
+  /// while the parked `Rescan` is flushed and cleared — and then be released *after* it,
+  /// at a lower epoch. A high-water consumer discards the older delivery it needed; a
+  /// naive one re-applies a change the enumeration already superseded and re-diverges.
+  /// So a just-quarantined subscription's deliveries take `try_emit` directly: the
+  /// standing debt suppresses each one and
+  /// [`widen_parked_debt`](Self::widen_parked_debt) grows the `Rescan` to cover it —
+  /// the same treatment every other event suppressed behind standing debt gets, and no
+  /// silent loss, because the `Rescan` re-enumerates exactly what was suppressed.
   fn fan_out_and_push(&mut self, raw: &SourceEvent<C, S::Handle>) {
-    let fanned = self.fan_out_raw(raw);
-    self.push_all(fanned);
+    let (fanned, poisoned) = self.fan_out_raw(raw);
+    if poisoned.is_empty() {
+      self.push_all(fanned);
+      return;
+    }
+    self.quarantine_filters(&poisoned);
+    let (behind_new_debt, rest): (Vec<_>, Vec<_>) = fanned
+      .into_iter()
+      .partition(|event| poisoned.contains(&event.subscription()));
+    for event in behind_new_debt {
+      self.try_emit(event);
+    }
+    self.push_all(rest);
   }
 
   /// The single event-emit funnel (design backpressure doc): the owner **never awaits** the
@@ -2776,10 +3105,20 @@ where
   /// inspection* — this is the only place an ordinary delivery reaches the channel, and it
   /// is a non-blocking [`try_send`](async_channel::Sender::try_send).
   ///
+  /// # The parked-debt invariant
+  ///
+  /// For every event suppressed behind standing debt, the `Rescan` eventually delivered for
+  /// that subscription must **spatially cover** the suppressed event's affected key(s) **and**
+  /// carry an epoch that **strictly dominates** it. Suppression is only sound while that holds,
+  /// and it does not hold for free: a parked debt may be a *located* `Rescan` (source-emitted,
+  /// terminal, restore, or re-point) whose key names a narrower subtree, and whose epoch was
+  /// calibrated before the suppressed event existed. Every suppression therefore repairs the
+  /// debt through [`widen_parked_debt`](Self::widen_parked_debt) rather than assuming it.
+  ///
   /// Three outcomes:
   /// - the subscription already carries a parked overflow `Rescan` (`needs_rescan`) → for an
-  ///   **ordinary delta**, **suppress** the emit: it is dominated by that pending `Rescan`, and
-  ///   delivering it would put an ordinary event ahead of the `Rescan` that covers the drop (the
+  ///   **ordinary delta**, **suppress** the emit and widen the debt to cover it: delivering it
+  ///   would put an ordinary event ahead of the `Rescan` that covers the drop (the
   ///   fan-out atomicity guarantee — Lens 2 — holds across iterations through this check). A
   ///   source-emitted `Rescan` arriving while parked is instead **merged** into the debt
   ///   ([`park_rescan_event`](Self::park_rescan_event)): it is an independent coverage-loss signal
@@ -2811,7 +3150,9 @@ where
         // loss serial (the rescan-merge path already does so, inside `park_rescan_event`). A
         // barrier installed BEFORE this suppression then observes the advance and resolves
         // `Dominated`, never a false `Delivered` for a change it hid behind the parked `Rescan`.
-        self.note_loss(sub);
+        // And the parked debt must be made to actually COVER what was just dropped, both
+        // spatially and temporally — see `widen_parked_debt`.
+        self.widen_parked_debt(&ev);
       }
       return;
     }
@@ -2910,6 +3251,75 @@ where
     merge_max(target, sub, key, epoch, value);
     if let Some(coalescer) = self.coalescer.as_mut() {
       coalescer.drop_subscription(sub);
+    }
+  }
+
+  /// The key a per-subscription recovery [`Rescan`](crate::EventKind::Rescan) for `sub` must
+  /// name: `sub`'s **own registered key**, falling back to `root_key` only for a subscription
+  /// the side table can no longer resolve (a raced retirement, where the wider key is the
+  /// only honest thing left to say and nobody is left to act on it anyway).
+  ///
+  /// Every subscription's key is at-or-under the armed root it rides, so this only ever
+  /// **narrows** — and narrowing is what keeps a recovery instruction inside the boundary the
+  /// caller actually subscribed to. A root-wide loss (a death, a rollback, a widen's
+  /// disarm/re-arm gap) makes everything each subscriber owns uncertain and nothing more:
+  /// naming the shared physical root instead would tell a consumer watching `/a/b/deep` to
+  /// re-enumerate `/a`, which is neither its data nor its business, and would make one
+  /// subscriber's localized recovery cost every sibling a full re-crawl.
+  fn rescan_key_for(&self, sub: Subscription, root_key: &[C]) -> Vec<C> {
+    self
+      .subsumer
+      .subscription_key(sub)
+      .map_or_else(|| root_key.to_vec(), <[C]>::to_vec)
+  }
+
+  /// Repairs the parked debt of `ev`'s subscription so it genuinely covers `ev`, which
+  /// [`try_emit`](Self::try_emit) is about to discard behind that debt: widens the parked key
+  /// to the common ancestor of itself and **every** affected endpoint of `ev`, and lifts the
+  /// parked epoch to a freshly-minted strictly-dominating
+  /// [`shed_rescan`](epoch::EpochLedger::shed_rescan). Also moves both loss clocks, exactly as
+  /// every other coverage loss does ([`note_loss`](Self::note_loss)).
+  ///
+  /// Neither half is optional, and neither was safe to assume:
+  ///
+  /// - **Spatially** — a parked debt is not always the whole subscription. A source-emitted,
+  ///   terminal, restore or re-point `Rescan` is parked *unchanged* at its own located key
+  ///   ([`park_rescan_event`](Self::park_rescan_event)), and a later delta in a disjoint
+  ///   sibling subtree is not covered by it. Suppressing that delta against `Rescan(a/x)`
+  ///   loses `a/y/file` outright: no event, and no recovery instruction that reaches it.
+  /// - **Temporally** — the parked epoch was minted *before* this event. A consumer applying
+  ///   dominance would sort the recovery signal **below** the change it is supposed to
+  ///   replace, and could legitimately ignore it. Only a post-loss mint restores strict
+  ///   domination.
+  ///
+  /// The fresh mint is taken here, at the moment a later event is actually suppressed —
+  /// **not** when the `Rescan` was parked. Re-minting at park time is precisely what
+  /// [`park_rescan_event`](Self::park_rescan_event) must not do: a re-point `Rescan`'s epoch
+  /// is the rebased floor its new root's raw-0 events tie, and inflating it would dominate
+  /// and silently drop them. That calibration is valid right up until a later event is lost
+  /// behind it, which is here. By then the lost event has already been stamped, so
+  /// `high_water.next()` strictly exceeds it while later same-generation deliveries — clamped
+  /// up to high-water by [`stamp`](epoch::EpochLedger::stamp) — still tie rather than sort
+  /// under it.
+  ///
+  /// A subscription with no parked entry in either map cannot reach here (`try_emit` gates on
+  /// exactly that), but the lookup is fallible anyway: both maps are checked, so a debt that
+  /// moved between them on a claim is still repaired.
+  fn widen_parked_debt(&mut self, ev: &Event<C, V>) {
+    let sub = ev.subscription();
+    self.note_loss(sub);
+    let epoch = self.epochs.shed_rescan(sub);
+    for target in [&mut self.needs_rescan, &mut self.suppressed_rescan] {
+      let Some(parked) = target.get_mut(&sub) else {
+        continue;
+      };
+      widen_to_cover(&mut parked.key, ev.key());
+      // A whole `Moved` has two affected endpoints, and the debt must cover both — the
+      // subscription that lost it saw the object leave one key and arrive at another.
+      if let Some(from) = ev.move_from() {
+        widen_to_cover(&mut parked.key, from);
+      }
+      parked.epoch = parked.epoch.max(epoch);
     }
   }
 
@@ -3072,19 +3482,39 @@ where
   /// [`fan_out`](crate::route::fan_out) (both endpoints → the whole move; source only → a
   /// synthesized `Removed`; destination only → a synthesized `Created`), and the filter +
   /// interest gate below runs against that already-projected delivery.
-  fn fan_out_raw(&mut self, raw: &SourceEvent<C, S::Handle>) -> Vec<Event<C, V>> {
+  ///
+  /// Returns the stamped deliveries **and** the subscriptions whose filter predicate
+  /// unwound while producing them. The caller applies the quarantine and decides where
+  /// each delivery goes, because a delivery a panic fail-opened must not follow the
+  /// ordinary buffered path (see [`fan_out_and_push`](Self::fan_out_and_push)).
+  fn fan_out_raw(
+    &mut self,
+    raw: &SourceEvent<C, S::Handle>,
+  ) -> (Vec<Event<C, V>>, Vec<Subscription>) {
     // Disjoint field borrows: `subsumer` resolves the root/coverage/interest, `filters`
     // the per-subscription filter, `epochs` owns the per-subscription stamp state.
     let (subsumer, filters, epochs) = (&self.subsumer, &self.filters, &mut self.epochs);
-    let Some(record) = subsumer.entry(raw.handle()) else {
-      return Vec::new();
+    let Some((_root_key, subscribers)) = subsumer.root_view(raw.handle()) else {
+      return (Vec::new(), Vec::new());
     };
-    let subscribers = record.subscribers.as_slice();
+    // The coordinate this raw event's location is expressed in rides on the EVENT
+    // (`RoutableEvent::captured_root_depth`), not on the root the handle resolves to
+    // here: an in-place widen keeps the handle — and its queue — so a change captured
+    // under the older, deeper root is still drained on this path afterwards.
     let routable = SourceRoutable::<C, V, S::Handle>::new(raw);
+    // Subscriptions whose filter predicate UNWOUND during this fan-out. The gate
+    // below borrows `filters` immutably, so the quarantine is applied by the caller,
+    // after the fan-out returns (see [`quarantine_filters`](Self::quarantine_filters)).
+    let poisoned: core::cell::RefCell<Vec<Subscription>> = core::cell::RefCell::new(Vec::new());
+    // This owner's filter-plane latch, carried through the gate's immutable borrows and
+    // written back to `self` once they end. Seeded from the standing latch so a batch
+    // fanned out after one was set enters no predicate at all, and set by a disposal that
+    // had to forget its payload (see [`Owner::filter_payload_forgotten`]).
+    let forgotten = core::cell::Cell::new(self.filter_payload_forgotten);
     // `raw.epoch()` is the raw source epoch on the event's current root; `set_epoch` binds
     // the umbrella stamp, rebasing away the raw epoch (which restarts per kernel arm).
     let raw_epoch = raw.epoch();
-    epochs.stamp_and_fan_out(
+    let events = epochs.stamp_and_fan_out(
       &routable,
       raw_epoch,
       subscribers,
@@ -3103,12 +3533,64 @@ where
         subsumer
           .subscription_interest(sub)
           .is_some_and(|interest| interest.admits(event.kind()))
-          && filters.get(&sub).is_some_and(|filter| {
-            filter.admits(&FilterInput::new(
-              event.key(),
-              event.kind(),
-              event.location(),
-            ))
+          && filters.get(&sub).is_some_and(|gate| {
+            // This subscription's gate was already retired by an earlier unwind: admit
+            // without entering the predicate again. The check is per-SUBSCRIPTION, so a
+            // sibling registered with a clone of the same `Filter` still runs it — see
+            // [`SubscriptionFilter`].
+            if gate.quarantined {
+              return true;
+            }
+            // This OWNER has already had to forget a filter payload, so no predicate is
+            // entered here again — see [`Owner::filter_payload_forgotten`]. The
+            // subscription joins the quarantine list, which gives it exactly the terms a
+            // predicate of its own would have earned: fail open, stay live and covered,
+            // and be owed a dominating `Rescan` that tells its consumer in-band that its
+            // admission gate is gone. Read live rather than captured, so a subscription
+            // fanned out later in THIS batch is covered by a latch this batch set.
+            if forgotten.get() {
+              poisoned.borrow_mut().push(sub);
+              return true;
+            }
+            // The predicate is ARBITRARY caller code running inline in the one
+            // owner task, so its unwind is contained here rather than allowed to
+            // propagate. Uncontained it takes the whole owner with it: the shared
+            // event stream closes, every UNRELATED subscription stops, and later
+            // `watch` calls answer `Closed` — one tenant's filter denying service
+            // to every other, reported as an ordinary end of stream.
+            //
+            // A panicking predicate FAILS OPEN. It admits this delivery and, at
+            // `quarantine_filters` below, has THIS SUBSCRIPTION's gate marked retired
+            // so it never runs again for it. Over-delivery is a
+            // subscription receiving changes it would have filtered out; the
+            // alternative — treating the panic as a rejection — silently drops
+            // changes the subscription is covered for, which is exactly the loss
+            // this codebase never allows to be silent. The quarantined
+            // subscription is also owed a dominating `Rescan`, so its consumer
+            // learns in-band that its admission gate is gone and re-enumerates.
+            //
+            // The caught PAYLOAD is caller data too, and disposing of it runs caller
+            // code: a `panic_any` payload's `Drop` is as arbitrary as the predicate
+            // was. Dropping it here — outside the boundary that just caught it —
+            // would let a panicking destructor start a SECOND unwind straight through
+            // the owner, defeating the containment for every unrelated subscription.
+            // It is retired in its own contained domain instead — and a payload that
+            // had to be FORGOTTEN there latches the owner's whole filter plane, which
+            // is what turns "one leak per subscription" into "one leak per watcher"
+            // (see [`Owner::filter_payload_forgotten`]).
+            let input = FilterInput::new(event.key(), event.kind(), event.location());
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+              gate.filter.admits(&input)
+            })) {
+              Ok(verdict) => verdict,
+              Err(payload) => {
+                poisoned.borrow_mut().push(sub);
+                if dispose_panic_payload(payload).is_forgotten() {
+                  forgotten.set(true);
+                }
+                true
+              }
+            }
           })
       },
       |event: &Event<C, V>| event.subscription(),
@@ -3122,7 +3604,63 @@ where
         event.set_value(subsumer.subscription_value(event.subscription()).cloned());
         event
       },
-    )
+    );
+    self.filter_payload_forgotten = forgotten.get();
+    (events, poisoned.into_inner())
+  }
+
+  /// Retires the admission gate of every subscription whose filter predicate
+  /// unwound during a fan-out, and owes each one a dominating
+  /// [`Rescan`](crate::EventKind::Rescan).
+  ///
+  /// The gate is marked retired rather than left in place: a filter that panicked once is
+  /// not trustworthy, and re-entering it for every later change would cost the owner an
+  /// unwind per event on top of leaving the verdict undefined. The mark is written to
+  /// **this owner's per-subscription entry** and never to the caller's `Filter` slot,
+  /// which is shared by every clone of that filter — see [`SubscriptionFilter`] for why
+  /// retiring through the shared slot would take unrelated subscriptions' filtering down
+  /// with it, unrecorded.
+  ///
+  /// The subscription STAYS LIVE and stays covered. Retiring it instead would
+  /// convert a caller's programming error into a coverage loss with no way to
+  /// deliver the notice, whereas an over-delivering subscription loses nothing;
+  /// the parked `Rescan` — routed through the same loss choke point every other
+  /// coverage-loss uses, so both loss clocks move and any barrier riding this
+  /// subscription resolves `Dominated` rather than falsely `Delivered` — is what
+  /// makes the change of behavior observable in-band.
+  ///
+  /// The subscription's buffered coalescer entries are **dropped** before that `Rescan` is
+  /// parked, exactly as every other path that owes a subscription a dominating `Rescan`
+  /// does ([`commit_widen`](Self::commit_widen),
+  /// [`rescan_live_root`](Self::rescan_live_root),
+  /// [`park_rescan`](Self::park_rescan)). They are older than the debt and re-enumerating
+  /// its key covers every one of them; left buffered, the settle timer releases them after
+  /// the `Rescan` has been published and cleared, sorting a lower epoch behind a signal
+  /// that claims to dominate it. DROP, not forget: the subscription stays live, so its
+  /// registered debounce policy must keep governing its later events.
+  fn quarantine_filters(&mut self, poisoned: &[Subscription]) {
+    for &sub in poisoned {
+      let Some(gate) = self.filters.get_mut(&sub) else {
+        continue;
+      };
+      gate.quarantined = true;
+      let Some(key) = self.subsumer.subscription_key(sub).map(<[C]>::to_vec) else {
+        continue;
+      };
+      if let Some(coalescer) = self.coalescer.as_mut() {
+        coalescer.drop_subscription(sub);
+      }
+      self.note_loss(sub);
+      let value = self.subsumer.subscription_value(sub).cloned();
+      let epoch = self.epochs.shed_rescan(sub);
+      let target = if self.unclaimed.contains(&sub) {
+        &mut self.suppressed_rescan
+      } else {
+        &mut self.needs_rescan
+      };
+      merge_max(target, sub, key, epoch, value);
+      self.dominate_syncs_of_subscription(sub);
+    }
   }
 
   /// Reconciles a raw source event whose root the [`Source`] has already forgotten
@@ -3210,6 +3748,19 @@ where
   /// Returns `None` — use the event unchanged — for a non-`Rescan`, a handle with no live root, or a
   /// `Rescan` already at/under the current root or an ancestor of it (either already covers the live
   /// root's subtree correctly and safely).
+  ///
+  /// # The clamp restates the coordinate, it does not just re-key
+  ///
+  /// The stale event's `location` was minted against the TRANSIENT root, and the capture anchor every
+  /// delivery is rebased by is the `key`/`location` pair
+  /// ([`captured_root_depth`](crate::route::RoutableEvent::captured_root_depth)). Rewriting the key to
+  /// the live root while carrying that location forward would hand fan-out a pair describing no root at
+  /// all — for a live `/a` and a stale `Rescan(/z/d1/d2/d3)` located `[d1, d2, d3]`, the inferred anchor
+  /// underflows to zero and the subscription at `/a` is told to re-enumerate `/a` at `[d2, d3]`: a
+  /// subtree of its own watch that the loss never touched, and one whose stale state it would then
+  /// keep. The re-key therefore goes through [`SourceEvent::rekeyed_at_root`], which root-anchors the
+  /// location as part of the same step — the clamped key IS the live root, so the empty location is
+  /// exactly what it means, and the pair stays the coordinate it claims to be.
   fn clamp_disjoint_live_root_rescan(
     &self,
     event: &SourceEvent<C, S::Handle>,
@@ -3225,14 +3776,7 @@ where
     if key.starts_with(root_key.as_slice()) || root_key.starts_with(key) {
       return None;
     }
-    Some(SourceEvent::new(
-      event.handle(),
-      root_key,
-      event.kind().clone(),
-      event.location().clone(),
-      event.epoch(),
-      event.change_id(),
-    ))
+    Some(event.rekeyed_at_root(root_key))
   }
 
   /// Initiates one sync barrier: place the cookie (awaited, caller-bounded,
@@ -3258,6 +3802,16 @@ where
     // parking a PendingSync for a reply nobody will read is wasted cookie work and a strand the
     // loop-top prune must later reap. A canceled reply owes nothing: skip it before any cookie work.
     if reply.is_canceled() {
+      return SyncAdmit::Done;
+    }
+    // The in-flight bound, read BEFORE any cookie work: a refused barrier must
+    // leave no marker on the filesystem, so it has to be refused ahead of
+    // `begin_sync`, not after it (see [`MAX_PENDING_SYNCS`]). Reaping the
+    // callers who already went away first means a caller is only ever refused
+    // against barriers that are genuinely still live.
+    self.prune_abandoned_syncs();
+    if self.pending_syncs.len() >= MAX_PENDING_SYNCS {
+      let _ = reply.send(Err(SyncError::Busy));
       return SyncAdmit::Done;
     }
     let (Some(root), Some(dir_key)) = (
@@ -3458,18 +4012,22 @@ where
     // Reached only for a `Rescan` (the caller gates on it), so this is the delivered-`Rescan`
     // choke point: a barrier already CALLED but not yet installed must be dominated by it too.
     self.note_domination();
-    // Dominate by the AFFECTED SUBSCRIPTION, not by cookie-path ancestry. A raw source `Rescan` is
-    // fanned out to EVERY subscriber of its root, bypassing coverage and filter (`route::fan_out`),
-    // so it re-enumerates every one of that root's subscribers regardless of where each cookie sits.
-    // Domination must match that delivery exactly: a pending sync riding this root (`root` == the
-    // event's handle) owes a re-enumeration the `Rescan` stands in for. The old cookie-prefix rule
-    // (`cookie_key.starts_with(event.key())`) under-killed — a barrier for `/r` (cookie `/r/.cookie`)
-    // is NOT dominated by a descendant loss `Rescan(/r/x)`, because `/r/.cookie` does not start with
-    // `/r/x` — so the barrier falsely resolved `Delivered` though the subscriber owes a re-scan.
+    // Dominate by the AFFECTED SUBSCRIPTION, not by cookie-path ancestry — and the affected
+    // set is exactly the one `route::fan_out` delivers this `Rescan` to: the subscribers of
+    // this root whose own subtree INTERSECTS the rescan's. Cookie-path ancestry
+    // (`cookie_key.starts_with(event.key())`) under-killed — a barrier for `/r` (cookie
+    // `/r/.cookie`) is not dominated by a descendant loss `Rescan(/r/x)`, so it falsely
+    // resolved `Delivered` though its subscriber owes a re-scan. Whole-root equality
+    // over-killed the other way: a located `Rescan(/r/x)` is not delivered to a disjoint
+    // sibling subscription at `/r/y`, so resolving that sibling's barrier `Dominated` would
+    // report a re-enumeration it will never be handed. Matching the delivery set exactly is
+    // what keeps both halves honest.
     let handle = event.handle();
+    let at = event.key();
     let mut i = 0;
     while i < self.pending_syncs.len() {
-      if self.pending_syncs[i].root == handle {
+      if self.pending_syncs[i].root == handle && self.rescan_affects(self.pending_syncs[i].sub, at)
+      {
         let pending = self.pending_syncs.swap_remove(i);
         // Reap BEFORE the (unwinding-capable) flush: once swap-removed, `Owner::drop` no longer reaps
         // this entry, so a flush panic must not precede the reap or the marker leaks.
@@ -3480,6 +4038,24 @@ where
         i += 1;
       }
     }
+  }
+
+  /// Whether a [`Rescan`](crate::EventKind::Rescan) located at `at` is delivered to `sub` —
+  /// the router's intersection test ([`route::fan_out`](crate::route::fan_out)), read back
+  /// so every consequence of a rescan (domination, debt) applies to exactly the set that
+  /// receives it, and never to a disjoint sibling.
+  ///
+  /// A subscription whose key can no longer be resolved (raced retirement) answers `true`:
+  /// over-domination costs its caller a re-enumeration it can still perform, whereas
+  /// under-domination would resolve a barrier `Delivered` for a stream that is gone.
+  fn rescan_affects(&self, sub: Subscription, at: &[C]) -> bool
+  where
+    C: PartialEq,
+  {
+    self
+      .subsumer
+      .subscription_key(sub)
+      .is_none_or(|key| at.starts_with(key) || key.starts_with(at))
   }
 
   /// Resolves every barrier riding `root` as `Dominated` — the root died, and
@@ -3952,19 +4528,9 @@ fn merge_max<C: PartialEq, V>(
   match needs_rescan.entry(sub) {
     Entry::Occupied(mut occupied) => {
       let parked = occupied.get_mut();
-      // Widen the parked key to the longest common prefix of the two keys, so the single
-      // parked `Rescan` covers BOTH re-enumeration debts. Overwriting with `key` is correct
-      // only when it is an ancestor of the parked key; two independent source `Rescan`s under
-      // one root (say /a/x then /a/y) are siblings, and dropping either's coverage is silent
-      // loss. Their common prefix (/a) re-enumerates a superset of both, and where
-      // `key` *is* an ancestor of the parked key the prefix is exactly `key` (unchanged
-      // behavior for the re-point/terminal/ordinary-shed paths).
-      let common = key
-        .iter()
-        .zip(parked.key.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-      parked.key.truncate(common);
+      // Widen the parked key so the single parked `Rescan` covers BOTH re-enumeration debts
+      // (see [`widen_to_cover`]).
+      widen_to_cover(&mut parked.key, &key);
       parked.epoch = parked.epoch.max(epoch);
       parked.value = value;
     }
@@ -3972,6 +4538,24 @@ fn merge_max<C: PartialEq, V>(
       vacant.insert(ParkedRescan { key, epoch, value });
     }
   }
+}
+
+/// Widens `parked` — a parked [`Rescan`](crate::EventKind::Rescan)'s key — in place until it
+/// also covers `key`: truncates it to the two keys' longest common prefix.
+///
+/// Overwriting with `key` would be correct only when `key` is an ancestor of `parked`. Two
+/// independent losses under one subscription (say `/a/x` then `/a/y`) are siblings, and
+/// dropping either's coverage is silent loss; their common prefix (`/a`) re-enumerates a
+/// superset of both. Where `key` *is* an ancestor of `parked` the common prefix is exactly
+/// `key`, so the ancestor case is unchanged. The result is always an ancestor-or-equal of the
+/// previous `parked` key, so coverage only ever grows — the "keys only ever widen" invariant.
+fn widen_to_cover<C: PartialEq>(parked: &mut Vec<C>, key: &[C]) {
+  let common = key
+    .iter()
+    .zip(parked.iter())
+    .take_while(|(a, b)| a == b)
+    .count();
+  parked.truncate(common);
 }
 
 /// The pure `RoutableEvent<C>` adapter over one raw [`SourceEvent`] (design §5): it
@@ -4028,6 +4612,48 @@ where
   #[inline]
   fn deliver_move_in(&self, sub: Subscription) -> Event<C, V> {
     Event::source_move_in(sub, self.event)
+  }
+
+  #[inline]
+  fn deliver_rescan_clamped(&self, sub: Subscription, key: &[C]) -> Event<C, V> {
+    Event::source_rescan_clamped(sub, self.event, key)
+  }
+
+  /// The depth of the root this change's `location` was measured against, recovered from
+  /// the change itself: its location names the components of its key below that root, so
+  /// the root accounts for exactly the rest.
+  ///
+  /// This is why the anchor survives a widen. Both halves were fixed when the source
+  /// recorded the change — the absolute key and the root-relative location — so their
+  /// difference is the depth that was true *then*, whatever root the handle covers by
+  /// the time the umbrella drains it. `saturating_sub` keeps a source that reports a
+  /// location longer than its key from underflowing; such an event degrades to a
+  /// root-anchored delivery rather than panicking.
+  ///
+  /// Reading the anchor off the pair is sound because the pair is what
+  /// [`SourceEvent::new`]'s contract binds together, and because nothing between that mint
+  /// and this read may rewrite one half alone: the only re-key of a raw [`SourceEvent`],
+  /// [`SourceEvent::rekeyed_at_root`], restates the location in the same step. A future
+  /// transformation that rewrites a key while carrying a foreign location forward does not
+  /// merely mis-derive this number — it makes the delivered location itself name a path that
+  /// is not under the delivered key, which no representation of the anchor could repair.
+  #[inline]
+  fn captured_root_depth(&self) -> usize {
+    self
+      .event
+      .key()
+      .len()
+      .saturating_sub(self.event.location().len())
+  }
+
+  #[inline]
+  fn rebase(&self, delivered: &mut Event<C, V>, strip: usize) {
+    delivered.rebase_location(strip);
+  }
+
+  #[inline]
+  fn anchor_at_root(&self, delivered: &mut Event<C, V>) {
+    delivered.anchor_location_at_root();
   }
 }
 

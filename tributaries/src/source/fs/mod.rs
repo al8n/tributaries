@@ -16,15 +16,16 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
-  CoverOutcome, Event as FsEvent, EventKind as FsEventKind, ReplaceRootError, RequestOutcome,
-  RootHandle, SkipReason, SourceError, SyncRootDenied, SyncRootError, SyncTicket,
-  UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
+  CloseError as FsCloseError, CoverOutcome, Event as FsEvent, EventKind as FsEventKind,
+  ReplaceRootError, RequestOutcome, RootHandle, SkipReason, SourceError, SyncRootDenied,
+  SyncRootError, SyncTicket, UnwatchError as FsUnwatchError, WatchRootError, Watcher,
+  WatcherOptions,
 };
 use tributary_proto::Interest;
 
 use super::{Armed, Source, SourceEvent, SyncToken};
 use crate::{
-  error::{BuildError, FaultKind, SourceFault, SyncError, WatchError},
+  error::{BuildError, FaultKind, SourceCloseError, SourceFault, SyncError, WatchError},
   event::{EventKind, path_components},
 };
 
@@ -731,6 +732,11 @@ impl<R> Source<OsString> for FsSource<R> {
     // The reserved namespace, matched on the LEAF component only (never a
     // substring of an interior directory): every cookie of every instance,
     // ours and foreign, live and crash-leftover — always suppressed, always.
+    //
+    // The fs layer keeps its cookies in a DIRECTORY of this same namespace (it
+    // needs one nobody else may write). The leaf rule covers both ends of that:
+    // the directory's own create carries a leaf in the namespace, and so does
+    // every cookie inside it — so neither surfaces as a user change.
     key
       .last()
       .and_then(|leaf| leaf.to_str())
@@ -751,6 +757,39 @@ impl<R> Source<OsString> for FsSource<R> {
       .watcher
       .root_path(handle)
       .map(|path| path_components(&path))
+  }
+
+  /// Nothing to initiate ahead of the wait: the lower watcher's close is ONE command, and
+  /// [`join_close`](Self::join_close) issues it. There is no cheaper, non-blocking half to split off
+  /// — sending the command is itself the initiation, and it already awaits only mailbox room.
+  fn begin_close(&mut self) {}
+
+  /// Forwards the LOWER watcher's close — the strongest lifecycle fact this stack produces — as this
+  /// source's quiescence result.
+  ///
+  /// `tributary_fs::Watcher::close`'s `Ok` proves every native stream torn down AND every sync
+  /// cookie this watcher ever wrote confirmed removed from disk, and its `NotQuiesced` names how
+  /// much was still outstanding when its own grace expired. Dropping the watcher instead — the only
+  /// teardown available before this seam existed — starts the identical work but can neither await
+  /// it nor report it, so an upper `close()` acknowledged over a live reader thread and an unlinked
+  /// cookie still in flight, and a caller that shut its runtime down on that acknowledgement
+  /// abandoned both.
+  ///
+  /// It is bounded by the lower close's own ~1 s grace, so a wedged mount produces a
+  /// [`NotQuiesced`](SourceCloseError::NotQuiesced) report rather than an unbounded wait.
+  ///
+  /// The lower watcher is borrowed rather than consumed (`close_in_place`) because this source
+  /// outlives the call by exactly as long as it takes the owner to drop it; a second call — there is
+  /// none on the owner's path — would honestly report `Stopped`, since that call proves nothing.
+  async fn join_close(&mut self) -> Result<(), SourceCloseError> {
+    match self.watcher.close_in_place().await {
+      Ok(()) => Ok(()),
+      Err(FsCloseError::Stopped) => Err(SourceCloseError::Stopped),
+      Err(FsCloseError::NotQuiesced { pending }) => Err(SourceCloseError::NotQuiesced { pending }),
+      // The lower error type is `#[non_exhaustive]`: a variant added there is, by construction, a
+      // close that did not prove quiescence.
+      Err(_) => Err(SourceCloseError::NotQuiesced { pending: 1 }),
+    }
   }
 }
 

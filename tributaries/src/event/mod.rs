@@ -293,6 +293,81 @@ impl<C, V> Event<C, V> {
     }
   }
 
+  /// Mints the **clamped recovery projection** of a source
+  /// [`Rescan`](EventKind::Rescan) for a subscription the loss strictly contains: the
+  /// same coverage-loss signal, re-keyed to `key` — that subscription's own registered
+  /// key (design §5).
+  ///
+  /// A rescan above a subscription makes *everything the subscription owns* uncertain,
+  /// and nothing more; naming the wider key would instruct a per-subscription consumer
+  /// to inspect paths outside its own watch, which no consumer can act on and which
+  /// breaks the isolation a per-subscription lane exists to provide. The clamped key
+  /// **is** the subscription root, so the location is the empty (root-anchored) one. The
+  /// change id rides along: the clamp narrows which subtree is named, not which source
+  /// record proved the loss. The epoch is provisional (rebased by the driver, design §8).
+  pub(crate) fn source_rescan_clamped<H>(
+    subscription: Subscription,
+    event: &SourceEvent<C, H>,
+    key: &[C],
+  ) -> Self
+  where
+    C: Clone,
+  {
+    Self {
+      subscription,
+      epoch: event.epoch(),
+      key: key.to_vec(),
+      kind: EventKind::Rescan,
+      location: Location::new(),
+      change_id: event.change_id(),
+      value: None,
+    }
+  }
+
+  /// Rebases this delivery's [`location`](Self::location) out of the coordinate the
+  /// source **captured** it in and into the receiving subscription's, dropping the first
+  /// `strip` segments — where `strip` is the subscription's depth below the root that
+  /// capture was anchored at.
+  ///
+  /// The raw source location is relative to whatever root was armed when the change was
+  /// recorded, and that root moves: an unrelated caller watching an ancestor widens it,
+  /// and a survivor can keep it wide long after the widener departs. A subscription's own
+  /// key never moves, so it is the only coordinate a caller can hold a stable predicate
+  /// against. Fan-out rebases every delivery here, before the filter gate, so a
+  /// depth/location filter written once keeps meaning what it meant — instead of silently
+  /// starting to reject when somebody else's `watch` re-coordinates it underneath.
+  ///
+  /// `strip` is derived per event from the anchor the event itself carries
+  /// ([`RoutableEvent::captured_root_depth`](crate::route::RoutableEvent::captured_root_depth)),
+  /// never from the root armed at delivery time: an in-place widen preserves the handle
+  /// and the queue behind it, so a pre-widen change can be delivered after the root it
+  /// was captured under has already widened, and only its own anchor rebases it right.
+  ///
+  /// A `strip` of zero (the subscription is at or above the captured root) and an
+  /// already-empty location are both no-ops; a `strip` past the end yields the empty
+  /// location rather than panicking, so a source that supplies a shallower location than
+  /// its key implies degrades to root-anchored instead of failing.
+  #[inline]
+  pub(crate) fn rebase_location(&mut self, strip: usize) {
+    if strip == 0 || self.location.is_empty() {
+      return;
+    }
+    self.location = Location::from_segments(self.location.segments().iter().skip(strip).cloned());
+  }
+
+  /// Drops this delivery's [`location`](Self::location) to the root-anchored empty one,
+  /// for a receiving subscription whose coordinate the delivery cannot express — it sits
+  /// *above* the root the change was captured against, so the leading segments are simply
+  /// not in the event (see
+  /// [`RoutableEvent::anchor_at_root`](crate::route::RoutableEvent::anchor_at_root)).
+  ///
+  /// [`key`](Self::key) is untouched and remains the authoritative signal, as it already
+  /// is for the move-out projection and the clamped rescan, which are born this way.
+  #[inline]
+  pub(crate) fn anchor_location_at_root(&mut self) {
+    self.location = Location::new();
+  }
+
   /// Rebases this event's epoch onto the umbrella-relative stamp the driver computed
   /// in the subscription's monotone space (design §8), replacing the provisional raw
   /// fs epoch it was seeded with.
@@ -324,10 +399,22 @@ impl<C, V> Event<C, V> {
     &self.key
   }
 
-  /// The change's location relative to its watched root.
+  /// The change's location relative to **the key this delivery's
+  /// [`subscription`](Self::subscription) watches** — never relative to the physical
+  /// root the umbrella happens to have armed underneath it.
   ///
-  /// A synthetic widen [`Rescan`](EventKind::Rescan) reports the empty
-  /// (root-anchored) location, since its [`key`](Self::key) *is* the root.
+  /// The two differ whenever a subscription is covered by a broader armed root, which
+  /// unrelated callers can create and destroy at any time (a `watch` of an ancestor
+  /// widens the shared root; a survivor can keep it wide after the widener leaves). The
+  /// driver rebases this coordinate per subscriber at fan-out, so watching `/a/b` always
+  /// reports `x` for a change at `/a/b/x` — whether or not somebody else is watching
+  /// `/a`. A caller may therefore hold a stable depth/location predicate against it.
+  ///
+  /// A synthetic widen [`Rescan`](EventKind::Rescan), and the clamped recovery
+  /// projection of a rescan that contained this subscription, report the empty
+  /// (root-anchored) location, since their [`key`](Self::key) *is* the subscription's own
+  /// key. So does a move-out projection, whose [`key`](Self::key) is the authoritative
+  /// signal (the generic source seam carries no second location).
   #[inline]
   pub fn location(&self) -> &Location {
     &self.location
@@ -391,16 +478,36 @@ impl<C, V> Event<C, V> {
     self.kind.is_rescan()
   }
 
-  /// Whether this event bears on `key`: it names `key` exactly, or it is a
-  /// [`Rescan`](EventKind::Rescan) at `key` or an ancestor of it (a rescan obliges
-  /// re-enumeration of everything below its key). The dispatch idiom every
-  /// re-enumeration-class consumer needs.
+  /// Whether this event bears on `key` — true iff `key` is one of the event's
+  /// **affected endpoints**, or the event obliges re-enumeration of `key`:
+  ///
+  /// - it names `key` exactly ([`key`](Self::key), the destination for a move);
+  /// - it is a whole [`Moved`](EventKind::Moved) whose **source**
+  ///   ([`move_from`](Self::move_from)) is `key` — a rename has two affected endpoints
+  ///   and the object left that one, which is a fact about `key` as much as the arrival
+  ///   is a fact about the destination;
+  /// - it is a [`Rescan`](EventKind::Rescan) at `key` or an ancestor of it (a rescan
+  ///   obliges re-enumeration of everything below its key).
+  ///
+  /// The dispatch idiom every re-enumeration-class consumer needs: a consumer tracking
+  /// one object asks `reaches(that_object)` and re-reads it whenever the answer is true.
+  /// Omitting the move source would let a tracked file be renamed **away** without its
+  /// tracker ever being told — the whole move is delivered (the subscription covers both
+  /// endpoints), the tracker asks about the only key it knows, and gets `false`. That is
+  /// exactly the silent staleness this predicate exists to prevent.
+  ///
+  /// This is an **endpoint** test, not a subtree test: an ordinary delta below `key` does
+  /// not reach `key` (only a `Rescan` propagates downward). A consumer that wants "did
+  /// anything happen inside my subtree" tests `event.key().starts_with(root)` — or, for a
+  /// per-subscription lane, already knows the answer is yes.
   #[inline]
   pub fn reaches(&self, key: &[C]) -> bool
   where
     C: PartialEq,
   {
-    self.key() == key || (self.kind().is_rescan() && key.starts_with(self.key()))
+    self.key() == key
+      || self.move_from() == Some(key)
+      || (self.kind().is_rescan() && key.starts_with(self.key()))
   }
 
   /// The move's source key, if this is a whole [`Moved`](EventKind::Moved) delivery —
