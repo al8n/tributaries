@@ -58,8 +58,28 @@ fn scaled(d: Duration) -> Duration {
 
 /// The container-native mount point of the shared ext4 loopback. Under the
 /// tmpfs `TMPDIR` so nothing leaks onto the host filesystem.
+///
+/// Scoped by EFFECTIVE UID, because this binary is run twice against one
+/// `TMPDIR` — unprivileged, then under `sudo -E` — and `TMPDIR` is normally the
+/// sticky, world-writable `/tmp`. The unprivileged leg reaches `dd` and `mkfs`
+/// and only fails at `mount` (the step that needs `CAP_SYS_ADMIN`), so it leaves
+/// a finished image behind owned by the unprivileged user. Under one shared name
+/// the root leg's `dd` then reopens THAT file, which `fs.protected_regular`
+/// refuses in a sticky directory owned by neither the file's owner nor the
+/// caller — and every loopback cell self-skips while the leg still reports green.
+/// One fixture per uid keeps the reuse a re-run wants without either leg being
+/// able to poison the other's.
 fn loopback_mount() -> PathBuf {
-  std::env::temp_dir().join("tributary-fs-fanotify-ext4")
+  // `geteuid` cannot fail and has no safety precondition.
+  let uid = unsafe { libc::geteuid() };
+  std::env::temp_dir().join(format!("tributary-fs-fanotify-ext4-uid{uid}"))
+}
+
+/// The backing image for [`loopback_mount`], beside it under the same uid scope.
+fn loopback_image() -> PathBuf {
+  let mut image = loopback_mount().into_os_string();
+  image.push(".img");
+  PathBuf::from(image)
 }
 
 /// Builds (once) and mounts an ext4 loopback for authoritative FID/superblock
@@ -73,7 +93,7 @@ fn ext4_loopback() -> Option<PathBuf> {
   if is_mountpoint(&mount) {
     return Some(mount);
   }
-  let image = std::env::temp_dir().join("tributary-fs-fanotify-ext4.img");
+  let image = loopback_image();
 
   // 64 MiB backing image; mkfs.ext4 with a small inode count is plenty for the
   // churn these tests drive.
