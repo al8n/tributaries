@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-  action::{WatchAck, WatchTarget},
+  action::{StatTarget, WatchAck, WatchTarget},
   path::Segment,
-  record::{DirEntry, FileKind, IoClass},
+  record::{DirEntry, FileKind, IoClass, StatEntry},
   scope::SubtreeScope,
 };
 use core::num::NonZeroU64;
@@ -72,7 +72,7 @@ fn live_root(m: &mut Monitor, s: ScopeId) -> WatchId {
       .iter()
       .any(|a| a.as_watch().map(|c| c.id()) == Some(root))
   );
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   root
 }
 
@@ -121,7 +121,7 @@ fn per_dir_watch_success_triggers_enumerate_after_arming() {
   let mut m = per_dir();
   let root = m.register_root(scope(1), Interest::all());
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
 
   let actions = drain_actions(&mut m);
   assert_eq!(actions.len(), 1, "per-dir root should enumerate once armed");
@@ -134,7 +134,7 @@ fn kernel_recursive_watch_success_does_not_enumerate() {
   let mut m = kernel_recursive();
   let root = m.register_root(scope(1), Interest::all());
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   assert!(
     drain_actions(&mut m).is_empty(),
     "kernel-recursive backend must not descend"
@@ -390,7 +390,7 @@ fn no_space_watch_result_emits_rescan() {
   let mut m = per_dir();
   let root = m.register_root(scope(1), Interest::all());
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Err(WatchError::NoSpace));
+  m.ack_watch(root, Err(WatchError::NoSpace));
 
   let events = drain_events(&mut m);
   assert_eq!(events.len(), 1);
@@ -411,7 +411,7 @@ fn gone_watch_result_drops_node_and_unwatches() {
   let child_id = child_watch[0].as_watch().unwrap().id();
   let _ = drain_events(&mut m);
 
-  m.on_watch_result(child_id, Err(WatchError::Gone));
+  m.ack_watch(child_id, Err(WatchError::Gone));
   assert!(!m.is_watched(child_id));
   let actions = drain_actions(&mut m);
   assert_eq!(actions, vec![Action::Unwatch(child_id)]);
@@ -477,7 +477,7 @@ fn root_with_live_child(m: &mut Monitor, s: ScopeId, name: &str) -> (WatchId, Wa
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("child watch armed");
-  m.on_watch_result(child, Ok(WatchAck::Installed));
+  m.ack_watch(child, Ok(WatchAck::Installed));
   let child_boot = drain_actions(m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -588,7 +588,7 @@ fn overflow_rearm_rebuilds_and_cascades_into_child() {
   assert_ne!(w_a2, w_a, "it is a new watch, not the reused original");
 
   // Arming the fresh child cascades the re-arm into it; "a" gained a grandchild "g".
-  m.on_watch_result(w_a2, Ok(WatchAck::Installed));
+  m.ack_watch(w_a2, Ok(WatchAck::Installed));
   let a_rearm = drain_actions(&mut m)
     .iter()
     .find_map(|a| {
@@ -689,7 +689,7 @@ fn path_reconstruction_walks_to_root() {
   );
   let a_id = drain_actions(&mut m)[0].as_watch().unwrap().id();
   let _ = drain_events(&mut m);
-  m.on_watch_result(a_id, Ok(WatchAck::Installed));
+  m.ack_watch(a_id, Ok(WatchAck::Installed));
   let enumerate_a = drain_actions(&mut m);
   let req_a = enumerate_a[0].as_enumerate().unwrap().req();
 
@@ -1028,7 +1028,7 @@ fn watched_dir_rename_reparents_subtree_in_place() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(w_d, RecordKind::Created)
@@ -1037,7 +1037,7 @@ fn watched_dir_rename_reparents_subtree_in_place() {
     at(2),
   );
   let w_g = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_g, Ok(WatchAck::Installed));
+  m.ack_watch(w_g, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
   assert!(m.is_watched(w_d) && m.is_watched(w_g));
@@ -1119,7 +1119,7 @@ fn paired_moved_to_into_freed_slot_reparents_source() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(root, RecordKind::Created)
@@ -1128,7 +1128,7 @@ fn paired_moved_to_into_freed_slot_reparents_source() {
     at(2),
   );
   let w_x = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_x, Ok(WatchAck::Installed));
+  m.ack_watch(w_x, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1204,7 +1204,7 @@ fn paired_moved_to_over_watched_dir_replaces_watch() {
     at(1),
   );
   let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(root, RecordKind::Created)
@@ -1213,7 +1213,7 @@ fn paired_moved_to_over_watched_dir_replaces_watch() {
     at(2),
   );
   let w_b = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_b, Ok(WatchAck::Installed));
+  m.ack_watch(w_b, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1278,7 +1278,7 @@ fn moved_to_file_over_watched_dir_drops_stale_watch() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1363,7 +1363,7 @@ fn record_under_renamed_watched_dir_never_uses_stale_path() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1426,7 +1426,7 @@ fn watched_dir_moved_out_held_then_removed_on_timeout() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1456,6 +1456,1102 @@ fn watched_dir_moved_out_held_then_removed_on_timeout() {
   assert!(actions.iter().any(|a| a.as_unwatch() == Some(w_d)));
 }
 
+// ── The per-scope bound on parked rename halves ──
+
+/// Reads the parked population of `s` the way the bound does — from membership,
+/// so the assertion cannot agree with a counter that drifted from the store.
+fn parked_halves(m: &Monitor, s: ScopeId) -> usize {
+  m.pending_moves
+    .range((s, FIRST_COOKIE)..)
+    .take_while(|((half_scope, _), _)| *half_scope == s)
+    .count()
+}
+
+/// Moves watched directories `d{i}` out of `parent` under cookie `i + 1`, one per
+/// index in `range`, returning the watch each source held. Every half is parked
+/// under one `now`, so all of them are inside their pairing window together — and
+/// the bound is re-read after each one, so the claim is that it held throughout
+/// rather than only where the burst happened to stop.
+fn burst_moved_from(
+  m: &mut Monitor,
+  parent: WatchId,
+  range: core::ops::Range<u64>,
+) -> Vec<(WatchId, Location)> {
+  let scope = m.scope_of(parent).expect("a live burst parent");
+  range
+    .map(|i| {
+      let name = std::format!("d{i}");
+      let w = live_child_dir(m, parent, &name);
+      m.on_os_record(
+        OsRecord::new(parent, RecordKind::MovedFrom)
+          .with_name(seg(&name))
+          .with_cookie(cookie(i + 1))
+          .with_is_dir(true),
+        at(10),
+      );
+      assert!(
+        parked_halves(m, scope) <= PENDING_MOVE_CAP,
+        "the bound holds at every step of the burst"
+      );
+      (w, loc(&[&name]))
+    })
+    .collect()
+}
+
+/// A scope's parked halves are BOUNDED. Each unpaired cookied source retains a
+/// `PendingMove` and the detached subtree it holds until its window elapses, so an
+/// unbounded burst would retain both without limit; at the cap a further source is
+/// refused, and refusal is exactly unpairability — it tears the held subtree down
+/// and degrades to the `Removed` the unpairable path owes.
+#[test]
+fn burst_of_rename_sources_is_bounded_per_scope() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  let admitted = burst_moved_from(&mut m, root, 0..PENDING_MOVE_CAP as u64);
+  assert_eq!(parked_halves(&m, scope(1)), PENDING_MOVE_CAP);
+  for (w, _) in &admitted {
+    assert!(
+      m.is_watched(*w),
+      "an admitted source is held for its window"
+    );
+  }
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  // One more unique cookie, with the scope full.
+  let refused = live_child_dir(&mut m, root, "over");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("over"))
+      .with_cookie(cookie(PENDING_MOVE_CAP as u64 + 1))
+      .with_is_dir(true),
+    at(10),
+  );
+
+  assert_eq!(
+    parked_halves(&m, scope(1)),
+    PENDING_MOVE_CAP,
+    "the refused source is not parked, so the bound holds"
+  );
+  assert!(
+    !m.is_watched(refused),
+    "a source that will never pair does not keep holding its subtree"
+  );
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions.iter().any(|a| a.as_unwatch() == Some(refused)),
+    "the torn-down subtree gives its watch back"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_removed() && e.location() == &loc(&["over"])),
+    "the refusal degrades to the unpairable source's `Removed`: {events:?}"
+  );
+
+  // The refusal is a decision about ONE record, taken before anything was mutated
+  // on its behalf: the halves already parked are untouched and still pair.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("moved"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().moved_from() == Some(&admitted[0].1)),
+    "an admitted half still pairs after the refusal: {events:?}"
+  );
+}
+
+/// A cookie already parked is a REPLACEMENT, so the bound is not asked of it: it
+/// rewrites one key rather than adding one, leaving the high-water mark where it
+/// was. Refusing it would keep the half the replacement should displace, and pair
+/// that half's destination against a source the rename never had.
+#[test]
+fn same_cookie_source_is_admitted_at_the_bound() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  let admitted = burst_moved_from(&mut m, root, 0..PENDING_MOVE_CAP as u64);
+  assert_eq!(parked_halves(&m, scope(1)), PENDING_MOVE_CAP);
+  let (displaced_watch, displaced_from) = admitted[0].clone();
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  // The full scope's own first cookie, re-used at a different name.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("again"))
+      .with_cookie(cookie(1)),
+    at(11),
+  );
+  assert_eq!(
+    parked_halves(&m, scope(1)),
+    PENDING_MOVE_CAP,
+    "a replacement neither grows the store nor is refused by the bound"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_removed() && e.location() == &displaced_from),
+    "the displaced half resolves rather than being silently overwritten: {events:?}"
+  );
+  assert!(
+    !m.is_watched(displaced_watch),
+    "the displaced half's held subtree is torn down with it"
+  );
+
+  // The destination pairs with the REPLACEMENT's source, not the one it displaced.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("arrived"))
+      .with_cookie(cookie(1)),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1);
+  assert_eq!(events[0].kind().moved_from(), Some(&loc(&["again"])));
+  assert_eq!(events[0].location(), &loc(&["arrived"]));
+}
+
+/// The bound is per-SCOPE: one root's burst must not refuse another root's
+/// renames, since the two share nothing but the store they are keyed in.
+#[test]
+fn the_bound_does_not_leak_between_scopes() {
+  let mut m = per_dir();
+  let root_a = live_root_idle(&mut m, scope(1));
+  let root_b = live_root_idle(&mut m, scope(2));
+
+  let _ = burst_moved_from(&mut m, root_a, 0..PENDING_MOVE_CAP as u64);
+  let admitted_b = burst_moved_from(&mut m, root_b, 0..PENDING_MOVE_CAP as u64);
+  assert_eq!(parked_halves(&m, scope(1)), PENDING_MOVE_CAP);
+  assert_eq!(
+    parked_halves(&m, scope(2)),
+    PENDING_MOVE_CAP,
+    "a full scope does not consume another scope's capacity"
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  // Overfilling scope 1 refuses scope 1's source and nothing of scope 2's.
+  let refused = live_child_dir(&mut m, root_a, "over");
+  m.on_os_record(
+    OsRecord::new(root_a, RecordKind::MovedFrom)
+      .with_name(seg("over"))
+      .with_cookie(cookie(PENDING_MOVE_CAP as u64 + 1))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert!(!m.is_watched(refused));
+  assert_eq!(parked_halves(&m, scope(1)), PENDING_MOVE_CAP);
+  assert_eq!(parked_halves(&m, scope(2)), PENDING_MOVE_CAP);
+  for (w, _) in &admitted_b {
+    assert!(m.is_watched(*w), "scope 2's halves are untouched");
+  }
+}
+
+// ── A teardown of a subtree that still EXISTS owes its cover unconditionally ──
+
+/// A capacity refusal tears the source's subtree down while the directory still
+/// exists and is mid-rename, so the dead handles keep carrying its records: a
+/// same-batch `Modified` under the old subtree is discarded as an unrecognized
+/// watch, and the destination — deliberately forgotten — arrives as a fresh
+/// directory. Every signal the refusal does produce (the degraded `Removed`, the
+/// destination's `Created`) is interest-subject, so a `Modified`-only subscription
+/// learns of the loss only through the covering `Rescan`, which cannot wait on the
+/// dropped subtree having erased a deficit: a fully-proven one erases nothing.
+#[test]
+fn a_refused_rename_source_covers_a_modified_only_subscriber() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+
+  // Fill the scope so the next unique cookie is refused.
+  let _ = burst_moved_from(&mut m, root, 0..PENDING_MOVE_CAP as u64);
+  assert_eq!(parked_halves(&m, scope(1)), PENDING_MOVE_CAP);
+
+  // The directory the bound will refuse, with a watched descendant of its own.
+  let refused = live_child_dir(&mut m, root, "over");
+  let inner = live_child_dir(&mut m, refused, "inner");
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("over"))
+      .with_cookie(cookie(PENDING_MOVE_CAP as u64 + 1))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert_eq!(
+    parked_halves(&m, scope(1)),
+    PENDING_MOVE_CAP,
+    "the source is refused, not parked"
+  );
+  assert!(
+    !m.is_watched(refused) && !m.is_watched(inner),
+    "the refusal tore the whole source subtree down"
+  );
+  // The cover is COUNTED, so the window it opens cannot also close inside the call
+  // that opened it: the `Rescan` standing now is the OPENING edge, and
+  // `settle_bridges` gates on `rearm_settled`, which the root's own recovery holds
+  // down. A barrier reading settled here would be certifying over a subtree that is
+  // still blind.
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "the refusal's recovery is counted, not merely latched"
+  );
+  assert!(!m.coverage_settled(scope(1)));
+  assert!(
+    m.bridge.contains_key(&scope(1)),
+    "so the bridge window stays open across the recovery"
+  );
+  assert!(
+    m.events.iter().any(|e| e.kind().is_rescan()),
+    "with its opening Rescan already standing at the scope root"
+  );
+
+  // The rename's other half and a modification under the old subtree, in ONE batch:
+  // the destination pairs with nothing, and the modification lands on a watch the
+  // refusal already dropped.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("moved"))
+      .with_cookie(cookie(PENDING_MOVE_CAP as u64 + 1))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(inner, RecordKind::Modified).with_name(seg("f")),
+    at(10),
+  );
+
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().all(|e| !e.kind().is_modified()),
+    "the modification itself is lost with the watch that would have carried it: \
+     {events:?}"
+  );
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "so the refusal owes a covering instruction, and it must bypass the interest \
+     that hides its Removed and the destination's Created: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// A pairing whose destination names nothing can neither reparent the held subtree
+/// nor reconcile a slot to re-cover it at, so — alone among the pairing arms — its
+/// teardown ends the subtree's coverage for good while the object stays alive inside
+/// the scope. The `Moved` that reports it is interest- and filter-subject, so the
+/// cover cannot wait on the drop having erased a deficit either.
+#[test]
+fn a_nameless_destination_covers_the_held_subtree_it_drops() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let w_d = live_child_dir(&mut m, root, "d");
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert!(
+    m.is_watched(w_d),
+    "the source is held for its pairing window"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+  assert!(
+    !m.is_watched(w_d),
+    "an unreparentable held subtree is torn down"
+  );
+  let opening = drain_events(&mut m);
+  assert!(
+    opening.iter().any(|e| e.kind().is_rescan()),
+    "the dropped coverage is signalled to the subscription the Moved never reaches: \
+     {opening:?}"
+  );
+  // That `Rescan` OPENS the recovery — it does not stand in for it. The pairing
+  // consumed the half and released the hold, so `coverage_settled` here rests on
+  // the re-arm conjunct alone, and the root crawl holds it down until the object's
+  // new home is re-found and armed.
+  assert!(
+    !m.coverage_settled(scope(1)),
+    "the barrier may not certify over a subtree whose new location is still unknown"
+  );
+  assert!(m.bridge.contains_key(&scope(1)), "the window is still open");
+
+  // The crawl finds the object under its new name; only its acknowledged install
+  // and read close the window.
+  let root_read = read_of(&mut m, root);
+  m.on_enumerate(
+    root_read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("elsewhere"), FileKind::Dir)]),
+  );
+  assert!(!m.coverage_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_rescan()),
+    "no closing Rescan while the re-found destination is still arming"
+  );
+  let found = arm_named_child(&mut m, root, "elsewhere");
+  assert!(m.is_watched(found));
+  let closing = drain_events(&mut m);
+  assert!(
+    closing.iter().any(|e| e.kind().is_rescan()),
+    "the closing Rescan lands only after the recovery it closes: {closing:?}"
+  );
+  assert!(m.coverage_settled(scope(1)));
+  m.assert_invariants();
+}
+
+// ── The counted cover: its window closes AFTER the recovery, never before ──
+
+/// Answers every queued arm (as installed) and read (as `listing(dir)`) until the
+/// driver has nothing outstanding, so a cell can observe what a bridge window emits
+/// at its TRUE settle edge rather than mid-recovery.
+fn answer_pending_work(m: &mut Monitor, listing: impl Fn(WatchId) -> Vec<DirEntry>) {
+  for _ in 0..32 {
+    let actions = drain_actions(m);
+    if actions.is_empty() {
+      return;
+    }
+    for action in actions {
+      if let Some(watch) = action.as_watch() {
+        m.ack_watch(watch.id(), Ok(WatchAck::Installed));
+      } else if let Some(read) = action.as_enumerate() {
+        let entries = listing(read.dir());
+        m.on_enumerate(read.req(), EnumerateResult::Ok(entries));
+      }
+    }
+  }
+  panic!("the recovery never quiesced");
+}
+
+/// Fills `scope(1)`'s parked population to the bound under a live idle root, then
+/// stages one further watched directory for the next unique cookie to be refused at.
+fn staged_at_the_bound(m: &mut Monitor, root: WatchId, name: &str) -> WatchId {
+  let _ = burst_moved_from(m, root, 0..PENDING_MOVE_CAP as u64);
+  assert_eq!(parked_halves(m, scope(1)), PENDING_MOVE_CAP);
+  let staged = live_child_dir(m, root, name);
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+  staged
+}
+
+/// The `MovedFrom` the bound refuses.
+fn refuse_source(m: &mut Monitor, root: WatchId, name: &str, n: u64) {
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg(name))
+      .with_cookie(cookie(PENDING_MOVE_CAP as u64 + n))
+      .with_is_dir(true),
+    at(10),
+  );
+}
+
+/// The refused source's object survives at a destination the refusal deliberately
+/// forgot, so the recovery is the ROOT crawl — the only node guaranteed to be its
+/// ancestor. In scope, that crawl re-finds it: the refusal's `Rescan` opens the
+/// window, the re-found install is counted behind it, and the closing `Rescan` lands
+/// strictly AFTER that install is acknowledged and read. Standing the two bridge
+/// bits alone would flush the window inside the refusing call, putting the closing
+/// `Rescan` BEFORE the recovery it exists to close.
+#[test]
+fn a_refusal_closes_its_window_only_after_the_crawl_reinstalls_the_destination() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let refused = staged_at_the_bound(&mut m, root, "over");
+
+  refuse_source(&mut m, root, "over", 1);
+  assert!(
+    !m.is_watched(refused),
+    "the refusal tore the source subtree down"
+  );
+
+  // The OPENING edge: exactly one `Rescan`, at the scope root.
+  let opening = drain_events(&mut m);
+  let rescans: Vec<_> = opening.iter().filter(|e| e.kind().is_rescan()).collect();
+  assert_eq!(rescans.len(), 1, "{opening:?}");
+  assert!(rescans[0].location().is_empty(), "{opening:?}");
+  // Its recovery is COUNTED — the load-bearing conjunct here, since the parked
+  // population holds the others down on its own.
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "the root crawl stands behind the opening Rescan"
+  );
+  assert!(!m.coverage_settled(scope(1)));
+
+  // The crawl re-finds the object under its new name.
+  let root_read = read_of(&mut m, root);
+  m.on_enumerate(
+    root_read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("moved"), FileKind::Dir)]),
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "the fresh destination install is counted in turn"
+  );
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_rescan()),
+    "no closing Rescan while that install is still arming"
+  );
+
+  let dest = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(root, seg("moved")))
+        .map(|w| w.id())
+    })
+    .expect("the re-found destination arms");
+  m.ack_watch(dest, Ok(WatchAck::Installed));
+  assert!(!m.rearm_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_rescan()),
+    "nor while its own read is outstanding"
+  );
+
+  let dest_read = read_of(&mut m, dest);
+  m.on_enumerate(dest_read, EnumerateResult::Ok(Vec::new()));
+  let closing = drain_events(&mut m);
+  assert!(
+    closing.iter().any(|e| e.kind().is_rescan()),
+    "the closing Rescan lands only once the destination is armed AND read: {closing:?}"
+  );
+  assert!(m.rearm_settled(scope(1)));
+  m.assert_invariants();
+}
+
+/// The same refusal whose object left the scope entirely: the root crawl freshly
+/// arms nothing, so `fresh_rearm` never sets and the bridge conjunction suppresses
+/// the closing `Rescan` on its own. The barrier settles at crawl end — the
+/// conjunction is honest rather than faked.
+#[test]
+fn a_refusal_whose_destination_left_the_scope_closes_with_no_second_rescan() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let refused = staged_at_the_bound(&mut m, root, "over");
+
+  refuse_source(&mut m, root, "over", 1);
+  assert!(!m.is_watched(refused));
+  assert_eq!(
+    drain_events(&mut m)
+      .iter()
+      .filter(|e| e.kind().is_rescan())
+      .count(),
+    1,
+    "the opening Rescan"
+  );
+  assert!(!m.rearm_settled(scope(1)));
+
+  // Nothing new under the root: the object is outside the scope.
+  let root_read = read_of(&mut m, root);
+  m.on_enumerate(root_read, EnumerateResult::Ok(Vec::new()));
+  assert!(
+    m.rearm_settled(scope(1)),
+    "the barrier settles at crawl end"
+  );
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_rescan()),
+    "and no closing Rescan is owed — the window armed nothing fresh"
+  );
+  assert!(
+    !m.bridge.contains_key(&scope(1)),
+    "the window is over either way"
+  );
+  m.assert_invariants();
+}
+
+/// A refusal landing while the ROOT's own cold read is still in flight cannot start
+/// a second read: the obligation coalesces onto that read instead. `rearm_settled`
+/// deliberately does not count a dirtied cold read, so the LATENT conjunct is what
+/// holds the barrier — and the read's completion escalates into the covering
+/// `Rescan` plus a counted retry.
+#[test]
+fn a_refusal_during_a_root_cold_read_holds_the_barrier_latently() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the root's bootstrap cold read");
+  let _ = drain_events(&mut m);
+  let refused = staged_at_the_bound(&mut m, root, "over");
+  assert!(m.latent_settled(scope(1)), "nothing is latent yet");
+
+  refuse_source(&mut m, root, "over", 1);
+  assert!(!m.is_watched(refused));
+  assert!(
+    m.rearm_settled(scope(1)),
+    "a dirtied COLD read is not counted by the re-arm predicate"
+  );
+  assert!(
+    !m.latent_settled(scope(1)),
+    "so the latent conjunct is what keeps the barrier shut"
+  );
+  assert!(!m.coverage_settled(scope(1)));
+  let _ = drain_events(&mut m);
+
+  // The cold read returns; being dirtied it escalates rather than being trusted.
+  m.on_enumerate(boot, EnumerateResult::Ok(Vec::new()));
+  assert!(m.latent_settled(scope(1)), "the latent read resolved");
+  let escalation = drain_events(&mut m);
+  assert!(
+    escalation.iter().any(|e| e.kind().is_rescan()),
+    "the escalation Rescan: {escalation:?}"
+  );
+  assert!(!m.rearm_settled(scope(1)), "with a counted retry behind it");
+  m.assert_invariants();
+}
+
+/// A refusal under a root that is STILL ARMING — the shape a widen leaves behind,
+/// a live tree processing records beneath a freshly-minted root. A bare re-arm
+/// refuses such a root outright, which would reproduce the very defect this cover
+/// exists to prevent: an opening `Rescan` with nothing counted behind it. Inheriting
+/// marks the post-arm read instead, so the obligation is counted either way.
+#[test]
+fn a_refusal_under_a_still_arming_widen_root_is_counted_by_the_arming_mark() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle_with(&mut m, s, Interest::new().with_modified());
+  let refused = staged_at_the_bound(&mut m, root, "over");
+
+  let reserved = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+      .map(|(id, _)| id),
+    Some(reserved),
+    "the scope's root is now a node whose arm has not answered"
+  );
+  assert!(m.rearm_settled(s), "the splice itself counts nothing");
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  refuse_source(&mut m, root, "over", 1);
+  assert!(!m.is_watched(refused));
+  assert!(
+    matches!(
+      m.nodes.get(&reserved).map(|node| node.state),
+      Some(NodeState::Arming { rearm: true, .. })
+    ),
+    "the still-arming root carries the obligation on its post-arm read"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "which is a counted obligation, unlike a refused re-arm"
+  );
+  assert!(
+    m.bridge.contains_key(&s),
+    "so the window cannot flush inside the refusing call"
+  );
+  let opening = drain_events(&mut m);
+  assert!(
+    opening.iter().any(|e| e.kind().is_rescan()),
+    "behind the opening Rescan: {opening:?}"
+  );
+
+  // The arm answers: its read is re-arm-flavored, so the recovery continues.
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  assert!(
+    m.is_rearm_enumerating(reserved),
+    "the post-arm read reads as a re-arm, not a cold discovery"
+  );
+  assert!(!m.rearm_settled(s));
+  m.assert_invariants();
+}
+
+/// An ANCESTOR teardown reclaims a detached-and-held source through the parent link
+/// and destroys its dirty marker — the one record that activity under the hold was
+/// suppressed at a stale path. After that walk `pending.held` names a dead node, so
+/// a capture taken at the half's own resolution reads false; only the walk itself
+/// still knows. The funnel therefore owes the cover, and the later timeout finds
+/// nothing left to speak for the suppression.
+#[test]
+fn an_ancestor_teardown_covers_the_under_hold_activity_it_erases() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let w_a = live_child_dir(&mut m, root, "a");
+  let w_d = live_child_dir(&mut m, w_a, "d");
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(w_a, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert!(
+    m.is_watched(w_d) && m.held_sources.contains(&w_d),
+    "the source is detached and held for its pairing window"
+  );
+
+  // Activity under the hold is suppressed at the stale pre-move path; the marker is
+  // its only trace.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Modified).with_name(seg("f")),
+    at(11),
+  );
+  assert!(
+    m.dirtied_holds.contains(&w_d),
+    "the suppression left its marker"
+  );
+  let suppressed = drain_events(&mut m);
+  assert!(
+    suppressed.is_empty(),
+    "and delivered nothing: {suppressed:?}"
+  );
+  let _ = drain_actions(&mut m);
+
+  // The ancestor dies. Its walk takes the held source with it — and the marker.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed).with_name(seg("a")),
+    at(12),
+  );
+  assert!(!m.is_watched(w_a) && !m.is_watched(w_d));
+  assert!(
+    !m.dirtied_holds.contains(&w_d),
+    "the marker died with the node it keyed on"
+  );
+  let cover = drain_events(&mut m);
+  assert!(
+    cover
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "so the walk itself covers the suppressed Modified — nothing later can: {cover:?}"
+  );
+  assert!(!m.rearm_settled(scope(1)), "and the cover is counted");
+
+  // The half then times out with its source already dead: no `Removed`, no
+  // `Rescan`, nothing that could have stood in for the cover above.
+  answer_pending_work(&mut m, |_| Vec::new());
+  let _ = drain_events(&mut m);
+  m.handle_timeout(at(10_000));
+  let expiry = drain_events(&mut m);
+  assert!(
+    expiry.is_empty(),
+    "a half whose anchor died speaks for nothing: {expiry:?}"
+  );
+  m.assert_invariants();
+}
+
+/// A storm of refusals at the bound stacks no unbounded work: every cover after the
+/// first coalesces onto the root recovery already in flight, so at most one read is
+/// ever outstanding for the root and each refusal adds only its own teardown. The
+/// population is released wholesale when the move window elapses, and capacity is
+/// restored — the next source parks and is held rather than refused.
+#[test]
+fn a_refusal_storm_stacks_no_unbounded_work_and_restores_capacity() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let _ = burst_moved_from(&mut m, root, 0..PENDING_MOVE_CAP as u64);
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  for i in 0..16u64 {
+    let name = std::format!("over{i}");
+    let refused = live_child_dir(&mut m, root, &name);
+    let _ = drain_events(&mut m);
+    let _ = drain_actions(&mut m);
+
+    refuse_source(&mut m, root, &name, i + 1);
+    assert!(!m.is_watched(refused));
+    assert_eq!(
+      parked_halves(&m, scope(1)),
+      PENDING_MOVE_CAP,
+      "the bound holds through the storm"
+    );
+    assert!(
+      m.pending_enumerate
+        .values()
+        .filter(|dir| **dir == root)
+        .count()
+        <= 1,
+      "the root's recovery read is re-armed in place, never stacked"
+    );
+    assert!(
+      m.actions.len() <= 2,
+      "one teardown and at most one read per refusal, however long the storm runs"
+    );
+  }
+
+  // The window elapses: the whole parked population resolves and capacity returns.
+  m.handle_timeout(at(10_000));
+  assert_eq!(
+    parked_halves(&m, scope(1)),
+    0,
+    "the window's end releases every half"
+  );
+  let _ = drain_events(&mut m);
+  answer_pending_work(&mut m, |_| Vec::new());
+  let _ = drain_events(&mut m);
+
+  let again = live_child_dir(&mut m, root, "after");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("after"))
+      .with_cookie(cookie(9999))
+      .with_is_dir(true),
+    at(10_001),
+  );
+  assert_eq!(
+    parked_halves(&m, scope(1)),
+    1,
+    "the next source parks instead of being refused"
+  );
+  assert!(m.is_watched(again), "and is HELD, not torn down");
+  m.assert_invariants();
+}
+
+/// A pairing whose O(1) carry-over failed rebuilds a KNOWN destination over
+/// carried-over content, and does so behind an unconditional edge `Rescan` — the
+/// admission that the interval between the source dying and the fresh watch arming
+/// was seen by no one. That rebuild must be COUNTED behind its own `Rescan` for the
+/// same reason the refusal's is: a cold install leaves the window nothing to wait
+/// on, so the conjunction never completes and the barrier settles while the
+/// destination is still unread.
+#[test]
+fn a_failed_carry_over_counts_the_destination_it_rebuilds() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+
+  // "d" is created; its watch is queued but NOT yet acknowledged.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  let _ = drain_events(&mut m);
+
+  // It moves away while still pending → held; then its delayed arm FAILS, so no
+  // subtree survives to carry over.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.ack_watch(w_d, Err(WatchError::Gone));
+  answer_pending_work(&mut m, |_| Vec::new());
+  let _ = drain_events(&mut m);
+  assert!(m.rearm_settled(scope(1)), "a clean slate for the pairing");
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let opening = drain_events(&mut m);
+  assert!(
+    opening
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
+    "the destination's edge Rescan: {opening:?}"
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "and the rebuild stands counted behind it"
+  );
+  assert!(!m.coverage_settled(scope(1)));
+
+  let dest = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(root, seg("e")))
+        .map(|w| w.id())
+    })
+    .expect("the destination arms");
+  m.ack_watch(dest, Ok(WatchAck::Installed));
+  let read = read_of(&mut m, dest);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("kept"), FileKind::Dir)]),
+  );
+  // The carried-over child is `Created`-suppressed, which is exactly why the window
+  // owes its closing `Rescan` — and why it may not fire until the subtree is armed.
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_rescan()),
+    "no closing Rescan while the carried-over child is still arming"
+  );
+  assert!(!m.rearm_settled(scope(1)));
+
+  let kept = arm_named_child(&mut m, dest, "kept");
+  assert!(m.is_watched(kept));
+  let closing = drain_events(&mut m);
+  assert!(
+    closing.iter().any(|e| e.kind().is_rescan()),
+    "the closing Rescan covers the content the rebuild suppressed: {closing:?}"
+  );
+  assert!(m.coverage_settled(scope(1)));
+  m.assert_invariants();
+}
+
+/// The same debt PAST the pairing window. A late `MovedTo` resolves the stranded
+/// half — tearing down the held subtree and every descendant `WatchId` with it —
+/// and then rebuilds the object at the destination slot. Unlike a timed-out or
+/// displaced half, this one holds the destination record: the object provably
+/// survives, so the teardown may not borrow the vanish argument.
+///
+/// A `Modified`-only subscription is what makes the debt visible. It receives
+/// neither the strand's `Removed` nor the arrival's `Created`, and a `Modified`
+/// arriving LATER IN THE SAME BATCH on one of the dropped descendant handles is
+/// discarded by the unknown-watch guard — it cannot even dirty the hold, whose node
+/// is already gone. Without the edge `Rescan` plus the counted rebuild behind it,
+/// that subscription is told nothing and the barrier certifies over the silence.
+#[test]
+fn a_late_destination_covers_and_counts_the_subtree_it_rebuilds() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+
+  // root → d (watched, live) → sub (watched, live).
+  let w_d = live_child_dir(&mut m, root, "d");
+  let w_sub = live_child_dir(&mut m, w_d, "sub");
+  let _ = drain_events(&mut m);
+  assert!(m.coverage_settled(scope(1)), "a clean slate for the strand");
+
+  // "d" moves away (held), and its destination arrives PAST the window.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10) + DEFAULT_MOVE_WINDOW + DEFAULT_MOVE_WINDOW,
+  );
+  assert!(!m.is_watched(w_d), "the stranded source is torn down");
+  assert!(!m.is_watched(w_sub), "and so is every descendant handle");
+
+  let opening = drain_events(&mut m);
+  assert!(
+    opening
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
+    "the rebuilt destination's edge Rescan: {opening:?}"
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "and the rebuild stands counted behind it"
+  );
+  assert!(!m.coverage_settled(scope(1)));
+
+  // The rest of the batch: a `Modified` on one of the dropped descendant watches.
+  // Nothing in the monitor can attribute it any more — which is precisely why the
+  // cover above had to be minted when the subtree was dropped.
+  m.on_os_record(
+    OsRecord::new(w_sub, RecordKind::Modified).with_name(seg("f.txt")),
+    at(10) + DEFAULT_MOVE_WINDOW + DEFAULT_MOVE_WINDOW,
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a record on a dropped handle is discarded, not delivered"
+  );
+
+  // Only the destination's own install AND read close the window.
+  let dest = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(root, seg("e")))
+        .map(|w| w.id())
+    })
+    .expect("the destination arms");
+  m.ack_watch(dest, Ok(WatchAck::Installed));
+  assert!(!m.rearm_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_rescan()),
+    "no closing Rescan while the destination is still arming"
+  );
+
+  let read = read_of(&mut m, dest);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "the carried-over child is counted in turn"
+  );
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_rescan()),
+    "nor while that child is still arming"
+  );
+
+  let sub = arm_named_child(&mut m, dest, "sub");
+  assert!(m.is_watched(sub));
+  let closing = drain_events(&mut m);
+  assert!(
+    closing.iter().any(|e| e.kind().is_rescan()),
+    "the closing Rescan lands only once the rebuilt subtree is armed AND read: \
+     {closing:?}"
+  );
+  assert!(m.coverage_settled(scope(1)));
+  m.assert_invariants();
+}
+
+/// The nameless variant: a late destination that names no slot leaves the tree
+/// nowhere to re-cover the dropped subtree, so its recovery anchors at the ROOT —
+/// the in-window nameless twin's argument, applied past the window.
+#[test]
+fn a_nameless_late_destination_covers_the_held_subtree_it_drops() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let w_d = live_child_dir(&mut m, root, "d");
+  let _ = drain_events(&mut m);
+  assert!(m.rearm_settled(scope(1)), "a clean slate for the strand");
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  // The destination record carries the cookie but no name.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo).with_cookie(cookie(1)),
+    at(10) + DEFAULT_MOVE_WINDOW + DEFAULT_MOVE_WINDOW,
+  );
+  assert!(!m.is_watched(w_d));
+
+  let opening = drain_events(&mut m);
+  assert!(
+    opening
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "the recovery anchors at the root, the one location still known live: {opening:?}"
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "and the root crawl stands counted behind it"
+  );
+  m.assert_invariants();
+}
+
+/// The late destination whose parent died WITH the held subtree (a cyclic arrival):
+/// nothing is rebuilt anywhere, so the root escalation carries the whole recovery
+/// and must be counted — a bare edge `Rescan` would let the barrier certify on the
+/// very next poll over a subtree the monitor no longer covers at all.
+#[test]
+fn a_late_destination_under_a_dead_parent_counts_its_root_escalation() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let w_d = live_child_dir(&mut m, root, "d");
+  let w_sub = live_child_dir(&mut m, w_d, "sub");
+  let _ = drain_events(&mut m);
+  assert!(m.rearm_settled(scope(1)), "a clean slate for the strand");
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(5))
+      .with_is_dir(true),
+    at(10),
+  );
+  // The destination lands INSIDE the held subtree, past the window: resolving the
+  // strand drops the destination parent too.
+  m.on_os_record(
+    OsRecord::new(w_sub, RecordKind::MovedTo)
+      .with_name(seg("d"))
+      .with_cookie(cookie(5))
+      .with_is_dir(true),
+    at(10) + DEFAULT_MOVE_WINDOW + DEFAULT_MOVE_WINDOW,
+  );
+  assert!(!m.is_watched(w_d));
+  assert!(!m.is_watched(w_sub));
+
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "the escalation Rescan targets the scope root: {events:?}"
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "and the root crawl stands counted behind it"
+  );
+  assert!(!m.coverage_settled(scope(1)));
+  m.assert_invariants();
+}
+
+/// The in-window twin of the cell above: a pairing whose O(1) carry-over cannot even
+/// be attempted because the destination sits inside the held source. The teardown
+/// removes both endpoints, so — unlike the failed carry-over with a live parent —
+/// there is no destination slot to rebuild and count. The root escalation is the
+/// entire recovery, and it owes the same counted crawl.
+#[test]
+fn a_failed_carry_over_under_a_dead_parent_counts_its_root_escalation() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let w_d = live_child_dir(&mut m, root, "d");
+  let w_sub = live_child_dir(&mut m, w_d, "sub");
+  let _ = drain_events(&mut m);
+  assert!(m.rearm_settled(scope(1)), "a clean slate for the pairing");
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(5))
+      .with_is_dir(true),
+    at(10),
+  );
+  // In-window, but cyclic: `can_reparent` rejects it and the held subtree is dropped,
+  // taking the destination parent with it.
+  let outcome = m.on_os_record(
+    OsRecord::new(w_sub, RecordKind::MovedTo)
+      .with_name(seg("d"))
+      .with_cookie(cookie(5))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert_eq!(outcome, RecordOutcome::Nothing, "no subtree was carried");
+  assert!(!m.is_watched(w_d));
+  assert!(!m.is_watched(w_sub));
+
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "the escalation Rescan targets the scope root: {events:?}"
+  );
+  assert!(
+    !m.rearm_settled(scope(1)),
+    "and the root crawl stands counted behind it"
+  );
+  assert!(!m.coverage_settled(scope(1)));
+  m.assert_invariants();
+}
+
 // ── Every non-success watch result is coverage loss ──
 
 fn watch_failure_is_coverage_loss(err: WatchError) {
@@ -1470,7 +2566,7 @@ fn watch_failure_is_coverage_loss(err: WatchError) {
   let child_id = drain_actions(&mut m)[0].as_watch().unwrap().id();
   let _ = drain_events(&mut m);
 
-  m.on_watch_result(child_id, Err(err));
+  m.ack_watch(child_id, Err(err));
   assert!(
     !m.is_watched(child_id),
     "a refused watch is not believed-watched"
@@ -1500,7 +2596,7 @@ fn no_space_watch_result_drops_node() {
   let mut m = per_dir();
   let root = m.register_root(scope(1), Interest::all());
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Err(WatchError::NoSpace));
+  m.ack_watch(root, Err(WatchError::NoSpace));
   assert!(
     !m.is_watched(root),
     "a refused root is dropped, not left registered"
@@ -1523,7 +2619,7 @@ fn not_found_watch_result_drops_and_rescans() {
   let child_id = drain_actions(&mut m)[0].as_watch().unwrap().id();
   let _ = drain_events(&mut m);
 
-  m.on_watch_result(child_id, Err(WatchError::NotFound));
+  m.ack_watch(child_id, Err(WatchError::NotFound));
   assert!(!m.is_watched(child_id));
   let events = drain_events(&mut m);
   assert_eq!(events.len(), 1);
@@ -1828,7 +2924,7 @@ fn dead_source_half_emits_no_removed_after_teardown() {
     at(1),
   );
   let w_p = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_p, Ok(WatchAck::Installed));
+  m.ack_watch(w_p, Ok(WatchAck::Installed));
   let p_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_p).map(|e| e.req()))
@@ -1888,7 +2984,7 @@ fn watched_dir_moved_out_then_replaced_installs_new_watch() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1919,7 +3015,7 @@ fn watched_dir_moved_out_then_replaced_installs_new_watch() {
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("a watch is installed for the replacement directory");
   assert_ne!(w_d2, w_d, "the replacement gets its own fresh watch");
-  m.on_watch_result(w_d2, Ok(WatchAck::Installed));
+  m.ack_watch(w_d2, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1954,7 +3050,7 @@ fn watched_dir_replacement_survives_pairing() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -1976,7 +3072,7 @@ fn watched_dir_replacement_survives_pairing() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("replacement watched");
-  m.on_watch_result(w_d2, Ok(WatchAck::Installed));
+  m.ack_watch(w_d2, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2035,7 +3131,7 @@ fn watched_dir_replacement_survives_timeout() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2057,7 +3153,7 @@ fn watched_dir_replacement_survives_timeout() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("replacement watched");
-  m.on_watch_result(w_d2, Ok(WatchAck::Installed));
+  m.ack_watch(w_d2, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2089,7 +3185,7 @@ fn inner_move_half_follows_reparented_source() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2190,7 +3286,7 @@ fn reused_cookie_after_teardown_pairs_fresh() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2252,7 +3348,7 @@ fn removed_then_created_at_same_slot_rewatches_replacement() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2278,7 +3374,7 @@ fn removed_then_created_at_same_slot_rewatches_replacement() {
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the replacement directory is freshly watched, not skipped as a duplicate");
   assert_ne!(w_d2, w_d, "a new watch, not the dropped original");
-  m.on_watch_result(w_d2, Ok(WatchAck::Installed));
+  m.ack_watch(w_d2, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2296,10 +3392,12 @@ fn removed_then_created_at_same_slot_rewatches_replacement() {
   );
 }
 
-/// An `Ok` enumerate entry of unknown kind is emitted but never watched (the
-/// descending-backend `is_dir` contract), while a `Dir` entry in the same result is.
+/// An `Ok` enumerate entry of unknown kind is emitted, and — since a kind nobody
+/// could read is not evidence of a non-directory — booked as darkness and stat'd,
+/// rather than passed over as a file. A `Dir` entry in the same result is watched
+/// outright.
 #[test]
-fn enumerate_unknown_kind_entry_is_not_watched() {
+fn enumerate_unknown_kind_entry_is_stat_resolved_not_assumed_a_file() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -2318,13 +3416,19 @@ fn enumerate_unknown_kind_entry_is_not_watched() {
   assert_eq!(events.len(), 2);
   assert!(events.iter().all(|e| e.kind().is_created()));
 
-  // Only the known directory is watched; the unknown-kind entry is not.
+  // The known directory is watched; the unclassifiable slot is not (it may hold a
+  // file) but is asked about, and stands as a coverage deficit until answered.
   let actions = drain_actions(&mut m);
-  assert_eq!(actions.len(), 1, "exactly one watch — for the known dir");
+  assert_eq!(actions.len(), 2, "{actions:?}");
   assert_eq!(
     actions[0].as_watch().unwrap().target(),
     &WatchTarget::child(root, seg("known"))
   );
+  assert_eq!(
+    actions[1].as_stat().unwrap().of(),
+    &StatTarget::child(root, seg("mystery"))
+  );
+  assert!(m.has_coverage_deficit(scope(1)));
 }
 
 /// A child move-half pending under a parent dir survives a NARROW teardown of the
@@ -2347,7 +3451,7 @@ fn child_move_half_survives_parent_teardown_and_resolves_created() {
     at(1),
   );
   let w_p = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_p, Ok(WatchAck::Installed));
+  m.ack_watch(w_p, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2408,7 +3512,7 @@ fn held_dir_source_with_torn_down_parent_resolves_created() {
     at(1),
   );
   let w_p = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_p, Ok(WatchAck::Installed));
+  m.ack_watch(w_p, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(w_p, RecordKind::Created)
@@ -2417,7 +3521,7 @@ fn held_dir_source_with_torn_down_parent_resolves_created() {
     at(2),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2469,7 +3573,7 @@ fn held_dir_source_with_torn_down_parent_resolves_created() {
     .expect("g re-armed with a fresh watch");
   assert_ne!(w_g, w_d, "not the dropped original");
   // The fresh coverage is real: a child under g resolves correctly.
-  m.on_watch_result(w_g, Ok(WatchAck::Installed));
+  m.ack_watch(w_g, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(w_g, RecordKind::Created).with_name(seg("c")),
@@ -2501,7 +3605,7 @@ fn cyclic_reparent_pair_is_rejected_without_corruption() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(w_d, RecordKind::Created)
@@ -2510,7 +3614,7 @@ fn cyclic_reparent_pair_is_rejected_without_corruption() {
     at(2),
   );
   let w_sub = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_sub, Ok(WatchAck::Installed));
+  m.ack_watch(w_sub, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2641,7 +3745,7 @@ fn stale_ancestor_reparent_installs_fresh_coverage() {
     at(1),
   );
   let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(w_a, RecordKind::Created)
@@ -2650,7 +3754,7 @@ fn stale_ancestor_reparent_installs_fresh_coverage() {
     at(2),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2688,7 +3792,7 @@ fn stale_ancestor_reparent_installs_fresh_coverage() {
   assert_ne!(w_a2, w_a);
   assert_ne!(w_a2, w_d, "not the removed held node");
   // The fresh coverage is real.
-  m.on_watch_result(w_a2, Ok(WatchAck::Installed));
+  m.ack_watch(w_a2, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(w_a2, RecordKind::Created).with_name(seg("c")),
@@ -2750,7 +3854,7 @@ fn overflow_rearm_obligation_transfers_across_reparent() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -2830,7 +3934,7 @@ fn late_cyclic_moved_to_does_not_reconcile_under_dead_parent() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(w_d, RecordKind::Created)
@@ -2839,7 +3943,7 @@ fn late_cyclic_moved_to_does_not_reconcile_under_dead_parent() {
     at(2),
   );
   let w_sub = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_sub, Ok(WatchAck::Installed));
+  m.ack_watch(w_sub, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -2944,7 +4048,7 @@ fn inherited_rearm_survives_a_pending_reparented_source() {
 
   // Now "d" arms: its post-arm enumerate must be a RE-ARM (Created-suppressed), proving
   // the obligation survived the pending window.
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let post_arm = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -3144,7 +4248,7 @@ fn failed_rearm_reaches_detached_held_move_source() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -3329,7 +4433,7 @@ fn root_with_identified_child(m: &mut Monitor, id: Identity) -> (WatchId, WatchI
         .map(|w| w.id())
     })
     .expect("watch for a");
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let a_boot = drain_actions(m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_a).map(|e| e.req()))
@@ -3441,7 +4545,7 @@ fn record_racing_an_enumerate_forces_a_rescan() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("watch d");
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_req = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -3532,7 +4636,7 @@ fn random_op_storm_holds_invariants_and_terminates() {
           } else {
             Ok(WatchAck::Aliased)
           };
-          m.on_watch_result(w, res);
+          m.ack_watch(w, res);
         }
         1 => {
           if !reqs.is_empty() {
@@ -3612,7 +4716,7 @@ fn held_source_suppresses_stale_path_events() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -3702,7 +4806,7 @@ fn move_in_to_a_held_source_is_fenced() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -3764,7 +4868,7 @@ fn held_source_recovers_coverage_on_pairing() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_req = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -3871,11 +4975,21 @@ fn held_pending_source_watch_failure_is_fenced() {
   );
   let _ = drain_events(&mut m);
 
-  // The delayed watch result for the held pending source errors: no stale-path Rescan.
-  m.on_watch_result(w_d, Err(WatchError::Gone));
+  // The delayed watch result for the held pending source errors: no stale-path
+  // Rescan. The failure dirties the hold — and then DESTROYS the node that marker
+  // lives on, so the teardown funnel discharges the debt where it dies, at the one
+  // location this drop still knows to be live.
+  m.ack_watch(w_d, Err(WatchError::Gone));
+  let events = drain_events(&mut m);
   assert!(
-    drain_events(&mut m).is_empty(),
-    "a held pending source's watch failure emits no stale-path Rescan"
+    events
+      .iter()
+      .all(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "a held pending source's watch failure emits no stale-path Rescan: {events:?}"
+  );
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "and the dirty marker it erased is covered, not dropped: {events:?}"
   );
 }
 
@@ -3894,7 +5008,7 @@ fn root_overflow_during_hold_rearms_the_paired_source() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -3948,7 +5062,7 @@ fn subtree_overflow_on_a_held_source_is_fenced() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -3988,15 +5102,95 @@ fn subtree_overflow_on_a_held_source_is_fenced() {
   );
 }
 
-/// A watch that arms WHILE held enumerates coverage-only even if the move pairs (clearing
-/// the hold) before the read returns: a pre-existing destination child must not surface as
-/// a false Created after the move.
-#[test]
-fn held_origin_enumerate_stays_coverage_only_across_pairing() {
-  let mut m = per_dir();
-  let root = live_root_idle(&mut m, scope(1));
+// ── The lowered path's second clause: knowingly stale at the stamp ──
+//
+// A round trip is trusted only when neither the anchor's chain moved since its
+// stamp NOR the path was already stale when stamped. The four cells below drive
+// the second clause through each round trip, at both edges of a hold: an answer
+// issued BEFORE the source detached (the clock catches it, but its recovery was
+// still addressed at the vacated slot) and answers issued DURING the hold (the
+// clock cannot catch them at all — no move happens after the issue).
 
-  // "d" is created; its watch is queued but NOT yet acknowledged (pending).
+/// Brings `name` live under `root` and then moves it away, returning its watch
+/// held and detached for the pairing window with every bootstrap action and
+/// event drained — the precondition every held-lowering cell starts from.
+fn held_move_source(m: &mut Monitor, root: WatchId, name: &str) -> WatchId {
+  let child = live_child_dir(m, root, name);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg(name))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+  child
+}
+
+/// A held move source that already covers one live child directory — the coverage
+/// a listing, an answer or an acknowledgement taken at the vacated path could end.
+fn held_move_source_covering(
+  m: &mut Monitor,
+  root: WatchId,
+  name: &str,
+  child: &str,
+) -> (WatchId, WatchId) {
+  let src = live_child_dir(m, root, name);
+  let kid = live_child_dir(m, src, child);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg(name))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+  (src, kid)
+}
+
+/// Spends the bounded retries a held read leaves outstanding, answering each with
+/// the same replacement listing, so the node is idle again and the pairing's own
+/// recovery read is the next one it issues.
+fn spend_held_retries(m: &mut Monitor, dir: WatchId, entries: &[DirEntry]) {
+  while let Some(req) = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == dir).map(|e| e.req()))
+  {
+    m.on_enumerate(req, EnumerateResult::Ok(entries.to_vec()));
+  }
+  let _ = drain_events(m);
+}
+
+/// Queues a re-arm read of the held source by failing its parent's read: the
+/// parent's cascade reaches a detached-and-held child (`failed_rearm_reaches_
+/// detached_held_move_source`), and — unlike an overflow — it leaves the parked
+/// half's own dirty flag alone, so what the pairing covers is the hold's debt and
+/// nothing else. Returns the request reading the held directory, events drained.
+fn read_queued_under_a_hold(m: &mut Monitor, root: WatchId, held: WatchId) -> ReqId {
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let root_read = read_of(m, root);
+  m.on_enumerate(root_read, EnumerateResult::Failed(IoClass::Permission));
+  let req = read_of(m, held);
+  let _ = drain_events(m);
+  req
+}
+
+/// A stat issued BEFORE a `MovedFrom` can answer after the source is detached and
+/// before its `MovedTo`. The placement clock refuses the answer — but the refusal
+/// then reconstructed the held parent's DELIBERATELY stale pre-move location and
+/// stood its covering `Rescan` there, sending the consumer to re-read the slot the
+/// subtree has left while the real destination kept no re-arm obligation at all.
+/// The recovery belongs to the pairing.
+#[test]
+fn a_stat_answering_mid_rename_recovers_only_at_the_destination() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+
+  // root → d, whose listing leaves one slot unclassifiable: that is what asks for
+  // a stat, issued while d is still in its slot.
   m.on_os_record(
     OsRecord::new(root, RecordKind::Created)
       .with_name(seg("d"))
@@ -4004,9 +5198,20 @@ fn held_origin_enumerate_stays_coverage_only_across_pairing() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
+  let d_boot = read_of(&mut m, w_d);
+  m.on_enumerate(
+    d_boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("u"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot is stat'd");
   let _ = drain_events(&mut m);
 
-  // "d" moves away while still pending → held.
+  // "d" moves away: detached and held, so d/u now reconstructs at a path the
+  // subtree has left.
   m.on_os_record(
     OsRecord::new(root, RecordKind::MovedFrom)
       .with_name(seg("d"))
@@ -4015,13 +5220,988 @@ fn held_origin_enumerate_stays_coverage_only_across_pairing() {
     at(10),
   );
   let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
 
-  // d's watch NOW arms while held: its post-arm enumerate is queued coverage-only.
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
-  let d_req = drain_actions(&mut m)
+  // The answer lands mid-hold: refused by the clock, and addressed nowhere.
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  let events = drain_events(&mut m);
+  assert!(
+    events.is_empty(),
+    "a refused stat under a hold stands nothing at the pre-move path: {events:?}"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "and its darkness stays booked for the recovery to discharge"
+  );
+
+  // The pairing carries the recovery, and it lands at the destination only.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  let rescans: Vec<_> = events.iter().filter(|e| e.kind().is_rescan()).collect();
+  assert!(
+    rescans
+      .iter()
+      .all(|e| e.location() != &loc(&["d", "u"]) && e.location() != &loc(&["d"])),
+    "nothing points the consumer at the vacated source: {events:?}"
+  );
+  assert!(
+    rescans.iter().any(|e| e.location() == &loc(&["e"])),
+    "the dirtied hold re-scans the destination instead: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The other edge of the same clause: a stat ISSUED while its parent is already
+/// held. No move happens after the issue, so the clock reads current while the
+/// path was stale before the request was even queued — and the answer's covering
+/// `Rescan` would name the vacated slot.
+#[test]
+fn a_stat_issued_under_a_hold_recovers_only_at_the_destination() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = held_move_source(&mut m, root, "d");
+
+  // A re-arm read of the held source lists an unclassifiable slot: the stat is
+  // issued here, at a path the hold already made stale.
+  let read = read_queued_under_a_hold(&mut m, root, w_d);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("u"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot under the held source is stat'd");
+  let _ = drain_events(&mut m);
+
+  // An unresolvable answer: the slot's own failure edge. The clock cannot refuse
+  // it — nothing moved since it was issued — so only the hold stands between its
+  // cover and the vacated path.
+  m.on_stat_result(stat, StatResult::Failed(IoClass::Permission));
+  let events = drain_events(&mut m);
+  assert!(
+    events.is_empty(),
+    "a stat issued under a hold stands nothing at the pre-move path: {events:?}"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "and re-books the darkness it could not settle"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  let rescans: Vec<_> = events.iter().filter(|e| e.kind().is_rescan()).collect();
+  assert!(
+    rescans
+      .iter()
+      .all(|e| e.location() != &loc(&["d", "u"]) && e.location() != &loc(&["d"])),
+    "nothing points the consumer at the vacated source: {events:?}"
+  );
+  assert!(
+    rescans.iter().any(|e| e.location() == &loc(&["e"])),
+    "the recovery lands at the destination: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The stat's other edge: an answer that would RETIRE the slot's incumbent. Under
+/// a hold the driver probed the slot the subtree has LEFT, so a `NotFound` there
+/// says the replacement lacks that name — never that this subtree's child stopped
+/// existing. The incumbent keeps its watch and its coverage, and the recovery
+/// belongs to the pairing.
+#[test]
+fn a_stat_under_a_hold_keeps_its_incumbent_and_recovers_at_the_destination() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  // The incumbent is live BEFORE the move: what this cell drives is the STAT
+  // clause, and a slot's incumbent is the same precondition however it arrived.
+  let (w_d, w_g) = held_move_source_covering(&mut m, root, "d", "g");
+
+  // A read under the hold can no longer classify the name, which defers the slot
+  // to a stat while KEEPING the incumbent standing.
+  let read = read_queued_under_a_hold(&mut m, root, w_d);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot is stat'd");
+  let _ = drain_events(&mut m);
+
+  // The answer would settle the slot empty — at the pre-move path. It settles
+  // nothing here, and stands nothing there.
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  assert!(
+    m.is_watched(w_g),
+    "a NotFound at the vacated path is no evidence that this slot emptied"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.is_empty(),
+    "and it stands nothing at the pre-move path: {events:?}"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  let rescans: Vec<_> = events.iter().filter(|e| e.kind().is_rescan()).collect();
+  assert!(
+    rescans
+      .iter()
+      .all(|e| e.location() != &loc(&["d"]) && e.location() != &loc(&["d", "g"])),
+    "nothing points the consumer at the vacated source: {events:?}"
+  );
+  assert!(
+    rescans.iter().any(|e| e.location() == &loc(&["e"])),
+    "the recovery lands at the destination: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The read arm of the same clause: a re-arm read ISSUED inside the hold and
+/// answering inside it. Its unreadable content owes a `Rescan`, which at the held
+/// source's reconstruction would name the vacated path — so it is suppressed, the
+/// bounded retry still runs (coverage is never dropped), and the pairing covers.
+#[test]
+fn a_read_issued_under_a_hold_recovers_only_at_the_destination() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = held_move_source(&mut m, root, "d");
+
+  let read = read_queued_under_a_hold(&mut m, root, w_d);
+  m.on_enumerate(read, EnumerateResult::Failed(IoClass::Permission));
+  let events = drain_events(&mut m);
+  assert!(
+    events.is_empty(),
+    "an unreadable read under a hold stands no Rescan at the pre-move path: {events:?}"
+  );
+  assert!(
+    m.is_rearm_enumerating(w_d),
+    "and the bounded retry still runs, so coverage is not dropped"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  let rescans: Vec<_> = events.iter().filter(|e| e.kind().is_rescan()).collect();
+  assert!(
+    rescans.iter().all(|e| e.location() != &loc(&["d"])),
+    "nothing points the consumer at the vacated source: {events:?}"
+  );
+  assert!(
+    rescans.iter().any(|e| e.location() == &loc(&["e"])),
+    "the recovery lands at the destination: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The arm arm of the same clause, and the boundary it must NOT cross: an arm
+/// issued inside a hold is deliberate best-effort coverage — it is what keeps a
+/// gap-created descendant of a mid-move source watched — so the ISSUE stands and
+/// its outcome is still answered here. What the acknowledgement may not do is
+/// CERTIFY: it installed against the vacated pre-move path, so it is proof about
+/// whatever occupies the slot the subtree has left, and a binding nothing may
+/// certify may not be kept either. It is retired, and the pairing — dirtied by
+/// the same fence that refused the proof — covers the destination and rebuilds
+/// the emptied slot through it.
+#[test]
+fn an_arm_acknowledged_under_a_hold_is_retired_and_rebuilt_by_the_pairing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = held_move_source(&mut m, root, "d");
+
+  // A re-arm read of the held source finds a gap-created grandchild: the arm is
+  // issued here, inside the hold. That much is invariant — refusing to issue
+  // would leave the held subtree unarmed for the whole pairing window.
+  let read = read_queued_under_a_hold(&mut m, root, w_d);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Dir)]),
+  );
+  let actions = drain_actions(&mut m);
+  let w_g = actions
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("g")))
+        .map(|w| w.id())
+    })
+    .expect("the grandchild under the held move-source is armed");
+  let retry = actions
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()));
+  let _ = drain_events(&mut m);
+
+  // The acknowledgement lands while still held: answered, and refused as proof.
+  m.ack_watch(w_g, Ok(WatchAck::Installed));
+  assert!(
+    !m.is_watched(w_g),
+    "an acknowledgement taken at the vacated path certifies nothing, so the \
+     binding it reports is retired rather than kept doubtful"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.is_empty(),
+    "with nothing announced at the pre-move path: {events:?}"
+  );
+  if let Some(retry) = retry {
+    m.on_enumerate(retry, EnumerateResult::Ok(std::vec::Vec::new()));
+  }
+  spend_held_retries(&mut m, w_d, &[]);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  let rescans: Vec<_> = events.iter().filter(|e| e.kind().is_rescan()).collect();
+  assert!(
+    rescans
+      .iter()
+      .all(|e| e.location() != &loc(&["d"]) && e.location() != &loc(&["d", "g"])),
+    "nothing points the consumer at the vacated source: {events:?}"
+  );
+  assert!(
+    rescans.iter().any(|e| e.location() == &loc(&["e"])),
+    "the recovery lands at the destination: {events:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and no barrier certifies before the counted rebuild that cover owes"
+  );
+
+  // The pairing's crawl rebuilds the retired slot, addressed through the
+  // destination this time — on a fresh handle, so nothing the dead one may still
+  // be carrying can reach the tree.
+  let crawl = read_of(&mut m, w_d);
+  m.on_enumerate(
+    crawl,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Dir)]),
+  );
+  let rebuilt = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("g")))
+        .map(|w| w.id())
+    })
+    .expect("the pairing's crawl rebuilds the retired slot");
+  assert_ne!(rebuilt, w_g, "on a fresh handle, never the retired one");
+  m.ack_watch(rebuilt, Ok(WatchAck::Installed));
+  settle_reads(&mut m);
+  assert!(m.coverage_settled(s), "and the scope settles behind it");
+  m.assert_invariants();
+}
+
+/// The degraded-recovery edge of the read clause. A COMPLETE read of a held
+/// directory lists whatever replaced it at the vacated pre-move path, so a name
+/// that listing omits vanished from a slot this subtree has LEFT. Pruning on it
+/// retires live coverage of a child that rides the move — and the pairing cannot
+/// be relied on to give it back: an incomplete destination read reconstructs no
+/// omitted name, so the retired child would stay unwatched with its subtree dark.
+#[test]
+fn a_held_read_prunes_nothing_over_a_degraded_destination_recovery() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let (w_d, w_k) = held_move_source_covering(&mut m, root, "d", "k");
+
+  // A replacement directory now occupies the vacated path. Its listing OMITS the
+  // covered name under one flavor of replacement and positively reports it as a
+  // non-directory under the other — the two shapes that retire a watch.
+  let replacement = [
+    DirEntry::new(seg("k"), FileKind::File),
+    DirEntry::new(seg("other"), FileKind::Dir),
+  ];
+  let read = read_queued_under_a_hold(&mut m, root, w_d);
+  m.on_enumerate(read, EnumerateResult::Ok(replacement.to_vec()));
+  assert!(
+    m.is_watched(w_k),
+    "a replacement's complete listing prunes nothing from the subtree it replaced"
+  );
+  spend_held_retries(&mut m, w_d, &replacement);
+
+  // The move pairs, and the destination's own recovery read comes back INCOMPLETE —
+  // the case that reconstructs no omitted name.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let recovery = read_of(&mut m, w_d);
+  m.on_enumerate(recovery, EnumerateResult::Partial(std::vec::Vec::new()));
+  assert!(
+    m.is_watched(w_k),
+    "so the child is still covered once the degraded recovery has run"
+  );
+  m.assert_invariants();
+}
+
+/// The same edge for the stat clause: an answer taken at the vacated path may not
+/// retire the slot's incumbent. The replacement lacks the name, the stat reports
+/// `NotFound`, and the destination's recovery read then FAILS — which rebuilds
+/// nothing, so a retirement here would be permanent darkness under a live child.
+#[test]
+fn a_held_stat_retires_nothing_over_a_degraded_destination_recovery() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let (w_d, w_k) = held_move_source_covering(&mut m, root, "d", "k");
+
+  // The replacement holds a "k" the driver could not classify: that is what defers
+  // the covered slot to a stat.
+  let read = read_queued_under_a_hold(&mut m, root, w_d);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("k"), FileKind::Unknown)]),
+  );
+  let actions = drain_actions(&mut m);
+  let stat = actions
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot is stat'd");
+  let retry = actions
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()));
+  let _ = drain_events(&mut m);
+
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  assert!(
+    m.is_watched(w_k),
+    "a NotFound at the vacated path retires no incumbent"
+  );
+  if let Some(retry) = retry {
+    m.on_enumerate(retry, EnumerateResult::Ok(std::vec::Vec::new()));
+  }
+  spend_held_retries(&mut m, w_d, &[]);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let recovery = read_of(&mut m, w_d);
+  m.on_enumerate(recovery, EnumerateResult::Failed(IoClass::Permission));
+  assert!(
+    m.is_watched(w_k),
+    "so the child is still covered once the degraded recovery has run"
+  );
+  m.assert_invariants();
+}
+
+/// The honest cost of a held retirement, pinned. The rebuild the retirement owes
+/// belongs to the pairing's crawl, and that crawl can DEGRADE: a destination read
+/// that never completes reconstructs no omitted name, so the retired slot stays
+/// dark past the pairing's own cover.
+///
+/// That darkness must be BOOKED, never silent. The exhausted read records its
+/// interior deficit, level-persistent behind the standing `Rescan`, and every sync
+/// cookie dispatched over it is preceded by a fresh covering `Rescan` and a heal
+/// kick — so the scope may settle, but never quietly.
+#[test]
+fn a_retirement_under_a_degraded_recovery_is_booked_and_re_signaled() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = held_move_source(&mut m, root, "d");
+
+  // The replacement's child is armed and ACKNOWLEDGED while the hold stands, so
+  // the acknowledgement retires it and the pairing owes the rebuild.
+  let read = read_queued_under_a_hold(&mut m, root, w_d);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("n"), FileKind::Dir)]),
+  );
+  let actions = drain_actions(&mut m);
+  let w_n = actions
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("n")))
+        .map(|w| w.id())
+    })
+    .expect("the newly-listed name is armed under the hold");
+  let retry = actions
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()));
+  m.ack_watch(w_n, Ok(WatchAck::Installed));
+  assert!(!m.is_watched(w_n), "the under-hold acknowledgement retires");
+  if let Some(retry) = retry {
+    m.on_enumerate(retry, EnumerateResult::Ok(std::vec::Vec::new()));
+  }
+  spend_held_retries(&mut m, w_d, &[]);
+  // The parent read this setup failed to queue the held read left its own bounded
+  // retry outstanding; answer it, so the only work the pairing leaves standing is
+  // the crawl under test.
+  settle_reads(&mut m);
+
+  // The move pairs: the destination is covered and its crawl starts.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let _ = drain_events(&mut m);
+
+  // That crawl never completes: every read comes back incomplete and reports
+  // nothing, so the retired name is reconstructed by no listing at all.
+  for _ in 0..=REARM_MAX_RETRIES {
+    let recovery = read_of(&mut m, w_d);
+    m.on_enumerate(recovery, EnumerateResult::Partial(std::vec::Vec::new()));
+  }
+  let standing = drain_events(&mut m);
+  assert!(
+    standing
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
+    "the exhausted crawl leaves its standing Rescan at the destination: {standing:?}"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "and the scope settles: an unreadable directory degrades, it does not wedge"
+  );
+
+  // Settled is not silent. A sync cookie dispatched over the booked interior is
+  // preceded by a fresh cover and a heal kick, so the darkness is re-signaled for
+  // as long as it stands.
+  assert!(
+    m.resignal_coverage_deficits(s),
+    "the exhausted interior is booked, and the dispatch seam re-signals it"
+  );
+  let resignaled = drain_events(&mut m);
+  assert!(
+    resignaled
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
+    "with a covering Rescan ahead of the cookie: {resignaled:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the heal kick it stands is counted, so no barrier certifies over it"
+  );
+  m.assert_invariants();
+}
+
+/// The id armed for `(parent, name)` by the actions queued so far.
+fn armed_child(m: &mut Monitor, parent: WatchId, name: &str) -> WatchId {
+  drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(parent, seg(name)))
+        .map(|w| w.id())
+    })
+    .expect("the name is armed")
+}
+
+/// Arms one child of a held move source INSIDE the hold and acknowledges it, so
+/// the acknowledgement — taken at the vacated pre-move path — certifies nothing
+/// and retires the binding it reports. Returns the now-dead handle, with the tree
+/// quiescent and the rebuild owed to the hold's pairing.
+fn retired_under_a_hold(m: &mut Monitor, root: WatchId, src: WatchId) -> WatchId {
+  let read = read_queued_under_a_hold(m, root, src);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("n"), FileKind::Dir)]),
+  );
+  let child = armed_child(m, src, "n");
+  m.ack_watch(child, Ok(WatchAck::Installed));
+  assert!(
+    !m.is_watched(child),
+    "an acknowledgement taken under the hold retires the binding it reports"
+  );
+  settle_reads(m);
+  child
+}
+
+/// Pairs the held move source at "e" and clears everything the pairing itself
+/// emits, leaving the subtree re-keyed at the destination with its re-add queued
+/// but NOT yet acknowledged.
+fn pair_held_source_at(m: &mut Monitor, root: WatchId) {
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let _ = drain_events(m);
+}
+
+/// The window the hold's own fence cannot close, closed by DEATH. Pairing removes
+/// the hold one step before any recovery has run, and `ingest_record` fences only
+/// what is still INSIDE a hold — so a record from a binding installed at the
+/// vacated path used to land at a node whose path the reparent had just made
+/// current: a change at the destination no later `Rescan` un-emits, or a
+/// retirement of coverage the destination genuinely carries.
+///
+/// The retirement removes the handle before the acknowledgement's own ingest
+/// returns, so there is no such window to fence: every later record naming it is
+/// discarded as an unrecognized watch, whole — delivery, slot effects, and the
+/// discovery that would install off it.
+#[test]
+fn a_retired_binding_neither_delivers_nor_retires_nor_installs_off_its_dead_handle() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let (w_d, w_k) = held_move_source_covering(&mut m, root, "d", "k");
+  let dead = retired_under_a_hold(&mut m, root, w_d);
+  pair_held_source_at(&mut m, root);
+
+  // The replacement at the vacated path keeps producing records on the binding it
+  // owns — one that would surface a name only IT has, one that would retire a
+  // covered sibling the destination carries.
+  m.on_os_record(
+    OsRecord::new(dead, RecordKind::Created)
+      .with_name(seg("x"))
+      .with_is_dir(true),
+    at(13),
+  );
+  m.on_os_record(
+    OsRecord::new(dead, RecordKind::Removed)
+      .with_name(seg("k"))
+      .with_is_dir(true),
+    at(14),
+  );
+  let delivered = drain_events(&mut m);
+  assert!(
+    !delivered
+      .iter()
+      .any(|e| e.location() == &loc(&["e", "n", "x"]) || e.location() == &loc(&["e", "k"])),
+    "no record off the dead binding is delivered at the destination: {delivered:?}"
+  );
+  assert!(
+    m.is_watched(w_k),
+    "and none of them retires the coverage the destination genuinely carries"
+  );
+  let queued = drain_actions(&mut m);
+  assert!(
+    !queued
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(dead, seg("x")))),
+    "nor installs coverage for a name only the dead binding reported: {queued:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the counted rebuild the pairing owes still holds the barrier"
+  );
+  m.assert_invariants();
+
+  // The destination's own recovery then comes back INCOMPLETE — the case that
+  // reconstructs no omitted name — and changes neither answer.
+  let recovery = queued
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
-    .expect("d post-arm enumerate");
+    .expect("the pairing's crawl of the destination");
+  m.on_enumerate(recovery, EnumerateResult::Partial(std::vec::Vec::new()));
+  let after = drain_events(&mut m);
+  assert!(
+    !after
+      .iter()
+      .any(|e| e.location() == &loc(&["e", "n", "x"]) || e.location() == &loc(&["e", "k"])),
+    "the degraded recovery delivers none of the dead binding's records either: {after:?}"
+  );
+  assert!(
+    m.is_watched(w_k),
+    "and retires none of the coverage the destination carries"
+  );
+  m.assert_invariants();
+}
+
+/// BOTH clauses at once, and the flavour that used to make the cover vanish. An
+/// arm still in flight when its ancestor moves away is `moved` (the clock saw the
+/// chain change) AND `held` (its lowering names the vacated path for the whole
+/// pairing window) — and the acknowledgement that answers it is `Aliased`, which
+/// proves only that the binding was live, never at which path.
+///
+/// One predicate, asked once, decides all of that: the answer certifies nothing,
+/// so the binding dies. What must then hold is the whole chain — nothing delivered,
+/// retired or installed off the dead handle, no barrier certifying over the window
+/// the retirement opened, and a closing `Rescan` that postdates the rebuilt read
+/// even though not one acknowledgement in the sequence was `Installed`.
+#[test]
+fn a_binding_both_moved_and_held_is_retired_and_covered_all_aliased() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = live_child_dir(&mut m, root, "d");
+
+  // `c` is discovered from a record and armed; its acknowledgement is still in
+  // flight when `d` moves away.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created)
+      .with_name(seg("c"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let (w_c, stale) = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("c")))
+        .map(|w| (w.id(), w.attempt()))
+    })
+    .expect("the discovered directory arms");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_watch_result(w_c, stale, Ok(WatchAck::Aliased));
+  assert!(
+    !m.is_watched(w_c),
+    "an Aliased answer to a lowering that failed both clauses certifies nothing"
+  );
+  let at_retire = drain_events(&mut m);
+  assert!(
+    at_retire.is_empty(),
+    "and the held branch stands no located cover — the reconstruction would name \
+     the path the subtree has left: {at_retire:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "the hold this retirement dirtied holds the barrier"
+  );
+  m.assert_invariants();
+
+  // The replacement at the vacated path keeps producing records on the binding
+  // that `Ok` reported. None of them may reach the tree.
+  m.on_os_record(
+    OsRecord::new(w_c, RecordKind::Created)
+      .with_name(seg("x"))
+      .with_is_dir(true),
+    at(4),
+  );
+  let stray = drain_events(&mut m);
+  assert!(
+    stray.is_empty(),
+    "nothing off the retired handle is delivered: {stray:?}"
+  );
+  let stray_actions = drain_actions(&mut m);
+  assert!(
+    !stray_actions
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(w_c, seg("x")))),
+    "nor installed off it: {stray_actions:?}"
+  );
+
+  // The pairing covers the destination and starts the crawl that owes the rebuild.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(5),
+  );
+  let paired = drain_events(&mut m);
+  assert!(
+    paired
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
+    "the pairing covers the destination: {paired:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the rebuild it owes is counted, so nothing certifies over the window yet"
+  );
+  m.assert_invariants();
+
+  // The crawl rebuilds the retired slot on a fresh handle, counted.
+  let crawl = read_of(&mut m, w_d);
+  m.on_enumerate(
+    crawl,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("c"), FileKind::Dir)]),
+  );
+  let rebuilt = armed_child(&mut m, w_d, "c");
+  assert_ne!(rebuilt, w_c, "on a fresh handle, never the retired one");
+  assert!(
+    !m.coverage_settled(s),
+    "the rebuild is not proof until it acknowledges"
+  );
+  m.assert_invariants();
+  m.ack_watch(rebuilt, Ok(WatchAck::Aliased));
+  let rebuilt_read = read_of(&mut m, rebuilt);
+  m.on_enumerate(rebuilt_read, EnumerateResult::Ok(Vec::new()));
+  let closing = drain_events(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "the scope settles once the rebuilt read completes"
+  );
+  assert!(
+    closing.iter().any(|e| e.kind().is_rescan()),
+    "and it settles behind a closing Rescan, though no acknowledgement in the \
+     sequence was Installed: {closing:?}"
+  );
+  m.assert_invariants();
+}
+
+/// Answers every enumerate still OUTSTANDING — including one whose queued action
+/// an earlier drain already consumed — until the tree is at rest. The cells below
+/// read `coverage_settled`, so a residual read left counted by a setup would make
+/// the predicate true for a reason that is not the one under test.
+fn settle_reads(m: &mut Monitor) {
+  for _ in 0..64 {
+    let reqs: Vec<ReqId> = m.pending_enumerate.keys().copied().collect();
+    if reqs.is_empty() {
+      break;
+    }
+    for req in reqs {
+      m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+    }
+  }
+  assert!(m.pending_enumerate.is_empty(), "the reads settle");
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+}
+
+/// A SECOND sequential move, before the first pairing's crawl has descended.
+///
+/// The first pairing owes the retired slot its rebuild, and pays it by re-arming
+/// the move SOURCE and letting the crawl re-install what the listing shows. A
+/// second `MovedFrom` that detaches that source again lands the crawl right back
+/// inside a hold — where an arm it issues lowers the vacated path once more, so
+/// its acknowledgement retires once more.
+///
+/// That is the shape the objection to retire-and-rebuild was about, and it does
+/// not spin: each hold window costs at most one retirement, the next pairing
+/// carries the same rebuild forward, and no barrier certifies at any point in
+/// between. This cell pins both — the convergence and the ordering.
+#[test]
+fn a_second_sequential_move_converges_the_rebuild_it_carries() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = held_move_source(&mut m, root, "d");
+  let dead = retired_under_a_hold(&mut m, root, w_d);
+
+  // First pairing: d → e. It covers the destination and starts the crawl that
+  // owes the rebuild; nothing has descended yet.
+  pair_held_source_at(&mut m, root);
+  let first_crawl = read_of(&mut m, w_d);
+  assert!(
+    !m.coverage_settled(s),
+    "the crawl the first pairing owes is counted"
+  );
+
+  // The second move detaches the source again, BEFORE that crawl answers.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("e"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(20),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  // The crawl answers inside the new hold, at a path the detach re-pointed: the
+  // listing describes a directory this node is not, so none of it reaches its
+  // slots and the bounded retry re-reads from where the node now is.
+  m.on_enumerate(
+    first_crawl,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("n"), FileKind::Dir)]),
+  );
+  // That retry is issued from inside the hold, so its listing may only ADD — which
+  // is how the retired name is re-installed, on an arm that lowers the newly
+  // vacated path once more and is retired on its own acknowledgement in turn.
+  let retry = read_of(&mut m, w_d);
+  m.on_enumerate(
+    retry,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("n"), FileKind::Dir)]),
+  );
+  let second = armed_child(&mut m, w_d, "n");
+  assert_ne!(second, dead, "the rebuild is a fresh handle");
+  m.ack_watch(second, Ok(WatchAck::Installed));
+  assert!(
+    !m.is_watched(second),
+    "and its under-hold acknowledgement certifies nothing either"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "with the second hold carrying the same rebuild forward"
+  );
+  m.assert_invariants();
+  settle_reads(&mut m);
+  assert!(
+    !m.coverage_settled(s),
+    "quiescing the reads does not settle it: the hold is the conjunct"
+  );
+
+  // The second move pairs elsewhere. THIS crawl is outside every hold, so the
+  // name it re-installs finally acknowledges at a path that is its own.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("f"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(21),
+  );
+  let paired = drain_events(&mut m);
+  assert!(
+    paired
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["f"])),
+    "the second pairing covers ITS destination: {paired:?}"
+  );
+  let second_crawl = read_of(&mut m, w_d);
+  m.on_enumerate(
+    second_crawl,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("n"), FileKind::Dir)]),
+  );
+  let third = armed_child(&mut m, w_d, "n");
+  m.ack_watch(third, Ok(WatchAck::Installed));
+  assert!(
+    m.is_watched(third),
+    "an acknowledgement at the node's own path certifies"
+  );
+  settle_reads(&mut m);
+  assert!(m.coverage_settled(s), "and the scope converges");
+
+  // And the converged binding delivers, at the path the second move gave it.
+  m.on_os_record(
+    OsRecord::new(third, RecordKind::Created).with_name(seg("x")),
+    at(30),
+  );
+  assert!(
+    drain_events(&mut m)
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["f", "n", "x"])),
+    "the rebuilt binding delivers at the destination"
+  );
+  m.assert_invariants();
+}
+
+/// Drop-mid-everything, with a JUST-RETIRED slot inside the torn-down subtree.
+/// The retirement empties a slot under a node that is itself inside a hold, and
+/// that node is then deleted out from under it — the shape whose earlier
+/// incarnations stranded a marker, a request or a coverage obligation at the drop.
+///
+/// Nothing is left to strand: the retirement took its handle with it at the
+/// acknowledgement, so the walk finds an ordinary subtree. The interval the
+/// retirement opened and the one the deletion opens are both carried by the hold's
+/// pairing, which covers the destination whole. The subscriber here filters
+/// removals — the one that would notice a structural signal standing in for a
+/// `Rescan`.
+#[test]
+fn a_torn_down_subtree_containing_a_just_retired_slot_strands_nothing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle_with(&mut m, s, Interest::new().with_modified());
+  // "k" is armed BEFORE the move, so it is a plain live child; only what arms
+  // under the hold takes an unprovable acknowledgement.
+  let (w_d, w_k) = held_move_source_covering(&mut m, root, "d", "k");
+
+  // A read under the hold descends to "k" and installs "c" there; that arm's
+  // acknowledgement is taken at the vacated pre-move path, so it retires.
+  let read = read_queued_under_a_hold(&mut m, root, w_d);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("k"), FileKind::Dir)]),
+  );
+  let k_read = read_of(&mut m, w_k);
+  m.on_enumerate(
+    k_read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("c"), FileKind::Dir)]),
+  );
+  let w_c = armed_child(&mut m, w_k, "c");
+  m.ack_watch(w_c, Ok(WatchAck::Installed));
+  assert!(
+    !m.is_watched(w_c),
+    "the acknowledgement taken under the hold retires the binding"
+  );
+  m.assert_invariants();
+  settle_reads(&mut m);
+  assert!(
+    m.bridge.is_empty(),
+    "and the window that carried the setup has closed, so nothing is left to \
+     close over what follows"
+  );
+
+  // "k" is deleted out from under the hold. A self-event resolves the node rather
+  // than being fenced, so the subtree carrying the emptied slot dies here.
+  m.on_os_record(OsRecord::new(w_k, RecordKind::DeleteSelf), at(20));
+  assert!(!m.is_watched(w_k), "the deleted node is gone");
+  assert!(
+    m.pending_enumerate.is_empty(),
+    "with no read of the torn-down subtree left stranded"
+  );
+  m.assert_invariants();
+
+  // The hold's pairing carries both intervals — the retirement's and the
+  // deletion's — in one cover at the destination, which is the only signal a
+  // removal-filtering subscription can receive at all.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let covering = drain_events(&mut m);
+  assert!(
+    covering
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
+    "the pairing covers the destination whole: {covering:?}"
+  );
+  settle_reads(&mut m);
+  assert!(m.coverage_settled(s), "the scope settles behind the cover");
+  m.assert_invariants();
+}
+
+/// A read ISSUED while held enumerates coverage-only even if the move pairs
+/// (clearing the hold) before the read returns: a pre-existing destination child
+/// must not surface as a false Created after the move.
+#[test]
+fn held_origin_enumerate_stays_coverage_only_across_pairing() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let w_d = held_move_source(&mut m, root, "d");
+
+  // d's read is queued INSIDE the hold, so it is coverage-only from birth.
+  let d_req = read_queued_under_a_hold(&mut m, root, w_d);
 
   // The move pairs (d → e), clearing the hold, BEFORE d's enumerate returns.
   m.on_os_record(
@@ -4063,7 +6243,7 @@ fn modified_only_interest_keeps_coverage_and_filters_delivery() {
     "the backend mask is coverage-augmented with the structural kinds"
   );
   assert!(installed.modified(), "the requested kind is kept");
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -4087,7 +6267,7 @@ fn modified_only_interest_keeps_coverage_and_filters_delivery() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the new directory is still armed — coverage is delivery-independent");
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -4123,7 +6303,7 @@ fn modified_only_interest_keeps_coverage_and_filters_delivery() {
 fn rescan_bypasses_the_delivery_filter() {
   let mut m = per_dir();
   let root = m.register_root(scope(1), Interest::new());
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -4149,7 +6329,7 @@ fn directory_move_deliveries_honor_ondir() {
   // Everything except dir-targeted delivery.
   let mask = Interest::all().maybe_ondir(false);
   let root = m.register_root(scope(1), mask);
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -4169,7 +6349,7 @@ fn directory_move_deliveries_honor_ondir() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("dir armed despite suppressed delivery");
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -4244,7 +6424,7 @@ fn late_destination_uses_the_pending_halfs_class_for_ondir() {
   let mut m = per_dir();
   let mask = Interest::all().maybe_ondir(false);
   let root = m.register_root(scope(1), mask);
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -4264,7 +6444,7 @@ fn late_destination_uses_the_pending_halfs_class_for_ondir() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("dir armed");
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -4288,9 +6468,20 @@ fn late_destination_uses_the_pending_halfs_class_for_ondir() {
       .with_cookie(cookie(1)),
     at(400),
   );
-  assert!(
-    drain_events(&mut m).is_empty(),
-    "the pending half proves the class: neither Removed nor Created delivers without ondir"
+  // The strand's `Removed` and the arrival's `Created` are both suppressed by the
+  // proven class — and the one delivery left is the teardown's own cover, which no
+  // interest filters. An empty drain here would encode the defect: this subscription
+  // would learn nothing at all about a watched subtree whose coverage just ended and
+  // was rebuilt at another slot.
+  let events = drain_events(&mut m);
+  let shape: Vec<(bool, Location)> = events
+    .iter()
+    .map(|e| (e.kind().is_rescan(), e.location().clone()))
+    .collect();
+  assert_eq!(
+    shape,
+    vec![(true, loc(&["e"]))],
+    "the pending half proves the class: only the covering Rescan is delivered"
   );
   // …and COVERAGE also uses the proven class: the late destination is a directory, so
   // it is watched despite the record's omitted flag (delivery and reconciliation must
@@ -4312,7 +6503,7 @@ fn paired_move_uses_one_class_for_delivery_and_coverage() {
   let mut m = per_dir();
   let mask = Interest::all().maybe_ondir(false);
   let root = m.register_root(scope(1), mask);
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -4364,7 +6555,7 @@ fn delete_self_frees_the_slot_for_a_replacement() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -4417,7 +6608,7 @@ fn root_delete_self_rescans_despite_a_filtered_interest() {
   // Modified-only, and no dir-target delivery at all.
   let mask = Interest::new().with_modified();
   let root = m.register_root(scope(1), mask);
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -4478,7 +6669,7 @@ fn root_invalidation_purges_pending_moves_across_generations() {
   m.on_os_record(OsRecord::new(root, RecordKind::Ignored), at(2));
   let _ = drain_events(&mut m);
   let root2 = m.register_root(scope(1), Interest::all());
-  m.on_watch_result(root2, Ok(WatchAck::Installed));
+  m.ack_watch(root2, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| {
@@ -4531,7 +6722,7 @@ fn stale_file_half_does_not_demote_a_directory_destination() {
     at(1),
   );
   let w_p = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_p, Ok(WatchAck::Installed));
+  m.ack_watch(w_p, Ok(WatchAck::Installed));
   let p_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_p).map(|e| e.req()))
@@ -4602,9 +6793,17 @@ fn pairing_after_held_source_watch_failure_rescans_the_destination() {
   );
   let _ = drain_events(&mut m);
 
-  // …and its delayed watch install FAILS (fenced: no stale-path Rescan), dropping it.
-  m.on_watch_result(w_d, Err(WatchError::Gone));
-  assert!(drain_events(&mut m).is_empty());
+  // …and its delayed watch install FAILS (fenced: no stale-path Rescan), dropping it
+  // — and with it the dirty marker the failure had just set, whose debt the teardown
+  // funnel discharges at the scope root.
+  m.ack_watch(w_d, Err(WatchError::Gone));
+  let fenced = drain_events(&mut m);
+  assert!(
+    fenced
+      .iter()
+      .all(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "nothing reconstructs through the stale pre-move path: {fenced:?}"
+  );
 
   // The same-cookie destination arrives in-window under the live root: the pairing
   // delivers, the destination is rewatched, AND re-scanned — the failed-arm interval
@@ -4644,7 +6843,7 @@ fn trailing_move_self_does_not_disturb_a_reparented_subtree() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -4704,7 +6903,7 @@ fn move_self_mid_hold_preserves_the_pending_reparent() {
     at(1),
   );
   let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
@@ -5262,8 +7461,8 @@ fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
       m.register_root(scope(2), Interest::all()),
     ];
     while m.poll_action().is_some() {}
-    m.on_watch_result(roots[0], Ok(WatchAck::Installed));
-    m.on_watch_result(roots[1], Ok(WatchAck::Installed));
+    m.ack_watch(roots[0], Ok(WatchAck::Installed));
+    m.ack_watch(roots[1], Ok(WatchAck::Installed));
 
     let names = [seg("a"), seg("b"), seg("c")];
     let kinds = [
@@ -6362,7 +8561,7 @@ fn held_source_replacement_covers_the_vacated_path() {
     at(1),
   );
   let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
 
   // The original watched dir moves out: its half parks held.
@@ -6381,7 +8580,7 @@ fn held_source_replacement_covers_the_vacated_path() {
     at(11),
   );
   let w_a2 = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_a2, Ok(WatchAck::Installed));
+  m.ack_watch(w_a2, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(root, RecordKind::MovedFrom)
@@ -6454,7 +8653,7 @@ fn held_source_replacement_strand_covers_the_vacated_path() {
     at(1),
   );
   let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(root, RecordKind::MovedFrom)
@@ -6470,7 +8669,7 @@ fn held_source_replacement_strand_covers_the_vacated_path() {
     at(11),
   );
   let w_a2 = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_a2, Ok(WatchAck::Installed));
+  m.ack_watch(w_a2, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_os_record(
     OsRecord::new(root, RecordKind::MovedFrom)
@@ -6520,7 +8719,7 @@ fn under_hold_suppression_alone_stays_destination_only() {
     at(1),
   );
   let w_a = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -6572,8 +8771,8 @@ fn mixed_profiles_descend_independently() {
   let desc = Capabilities::new().with_supports_push().with_native_move();
   let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
   let r2 = m.register_root(scope(2), Interest::all());
-  m.on_watch_result(r1, Ok(WatchAck::Installed));
-  m.on_watch_result(r2, Ok(WatchAck::Installed));
+  m.ack_watch(r1, Ok(WatchAck::Installed));
+  m.ack_watch(r2, Ok(WatchAck::Installed));
   let actions = drain_actions(&mut m);
   assert!(
     actions
@@ -6597,8 +8796,8 @@ fn per_scope_profile_gates_descent_on_records() {
   let desc = Capabilities::new().with_supports_push().with_native_move();
   let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
   let r2 = m.register_root(scope(2), Interest::all());
-  m.on_watch_result(r1, Ok(WatchAck::Installed));
-  m.on_watch_result(r2, Ok(WatchAck::Installed));
+  m.ack_watch(r1, Ok(WatchAck::Installed));
+  m.ack_watch(r2, Ok(WatchAck::Installed));
   // Settle the descending root's bootstrap read so the record below is post-discovery.
   let boot = drain_actions(&mut m)
     .iter()
@@ -6647,8 +8846,8 @@ fn overflow_rearm_respects_scope_profile() {
   let desc = Capabilities::new().with_supports_push().with_native_move();
   let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
   let r2 = m.register_root(scope(2), Interest::all());
-  m.on_watch_result(r1, Ok(WatchAck::Installed));
-  m.on_watch_result(r2, Ok(WatchAck::Installed));
+  m.ack_watch(r1, Ok(WatchAck::Installed));
+  m.ack_watch(r2, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == r1).map(|e| e.req()))
@@ -6706,8 +8905,8 @@ fn mixed_profile_storm_holds_invariants_and_terminates() {
     let mut desc_watches = std::vec![desc_root];
     let mut reqs: std::vec::Vec<ReqId> = std::vec::Vec::new();
     while m.poll_action().is_some() {}
-    m.on_watch_result(desc_root, Ok(WatchAck::Installed));
-    m.on_watch_result(kr_root, Ok(WatchAck::Installed));
+    m.ack_watch(desc_root, Ok(WatchAck::Installed));
+    m.ack_watch(kr_root, Ok(WatchAck::Installed));
 
     let names = [seg("a"), seg("b"), seg("c")];
     let kinds = [
@@ -6772,7 +8971,7 @@ fn mixed_profile_storm_holds_invariants_and_terminates() {
           } else {
             Ok(WatchAck::Aliased)
           };
-          m.on_watch_result(w, res);
+          m.ack_watch(w, res);
         }
         1 => {
           if !reqs.is_empty() {
@@ -6885,7 +9084,7 @@ fn cold_discovery_never_unsettles_rearm() {
 
   let root = m.register_root(s, Interest::all());
   assert!(m.rearm_settled(s), "a pending root arm is not re-arm work");
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   assert!(
     m.rearm_settled(s),
     "a cold bootstrap read is not re-arm work"
@@ -6906,7 +9105,7 @@ fn cold_discovery_never_unsettles_rearm() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("child watch armed");
-  m.on_watch_result(child, Ok(WatchAck::Installed));
+  m.ack_watch(child, Ok(WatchAck::Installed));
   assert!(m.rearm_settled(s), "a child's cold read is not re-arm work");
   m.on_os_record(
     OsRecord::new(root, RecordKind::Created)
@@ -6961,7 +9160,7 @@ fn grow_rearm_unsettles_until_results_land() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("re-installed child watch");
-  m.on_watch_result(fresh, Ok(WatchAck::Installed));
+  m.ack_watch(fresh, Ok(WatchAck::Installed));
   assert!(
     !m.rearm_settled(s),
     "the child's own re-arm read is outstanding"
@@ -6994,7 +9193,7 @@ fn coalesced_grow_rides_the_inflight_cold_read() {
 
   // A fresh root whose bootstrap COLD read is still outstanding.
   let root = m.register_root(s, Interest::all());
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -7044,7 +9243,7 @@ fn rearm_kickoff_refusal_cases() {
   let mut kr = kernel_recursive();
   let s = scope(7);
   let root = kr.register_root(s, Interest::all());
-  kr.on_watch_result(root, Ok(WatchAck::Installed));
+  kr.ack_watch(root, Ok(WatchAck::Installed));
   assert!(kr.rearm_watch_subtree(root).is_refused());
   assert!(kr.rearm_settled(s));
   kr.assert_invariants();
@@ -7142,7 +9341,11 @@ fn rebind_root_resets_the_root_and_drops_the_book() {
   let mut m = per_dir();
   let (root, w_a) = root_with_live_child(&mut m, scope(1), "a");
 
-  assert_eq!(m.rebind_root(scope(1)), Some(root), "the WatchId survives");
+  assert_eq!(
+    m.rebind_root(scope(1)).map(|(id, _)| id),
+    Some(root),
+    "the WatchId survives"
+  );
   assert!(m.is_watched(root));
   assert!(!m.is_watched(w_a), "children die with the old transport");
   let actions = drain_actions(&mut m);
@@ -7158,7 +9361,7 @@ fn rebind_root_resets_the_root_and_drops_the_book() {
   );
 
   // The replayed arm outcome starts the re-arm-flavored rebuild.
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let req = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -7177,7 +9380,7 @@ fn rebind_root_resets_the_root_and_drops_the_book() {
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the child re-arms on the new transport");
   assert_ne!(child, w_a, "a fresh watch id");
-  m.on_watch_result(child, Ok(WatchAck::Installed));
+  m.ack_watch(child, Ok(WatchAck::Installed));
   let child_req = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -7202,7 +9405,7 @@ fn rebind_root_purges_pending_move_halves() {
       .with_cookie(cookie(9)),
     at(10),
   );
-  assert_eq!(m.rebind_root(scope(1)), Some(root));
+  assert_eq!(m.rebind_root(scope(1)).map(|(id, _)| id), Some(root));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
@@ -7221,10 +9424,10 @@ fn rebind_root_purges_pending_move_halves() {
 fn rebind_root_refuses_kernel_recursive_and_unknown_scopes() {
   let mut kr = kernel_recursive();
   let _root = live_root(&mut kr, scope(1));
-  assert_eq!(kr.rebind_root(scope(1)), None);
+  assert_eq!(kr.rebind_root(scope(1)).map(|(id, _)| id), None);
 
   let mut m = per_dir();
-  assert_eq!(m.rebind_root(scope(9)), None);
+  assert_eq!(m.rebind_root(scope(9)).map(|(id, _)| id), None);
 }
 
 /// A rebind lands while the root's own read is in flight: the request slot
@@ -7239,7 +9442,7 @@ fn rebind_root_disowns_an_in_flight_root_read() {
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
     .expect("root bootstrap enumerate");
 
-  assert_eq!(m.rebind_root(scope(1)), Some(root));
+  assert_eq!(m.rebind_root(scope(1)).map(|(id, _)| id), Some(root));
   m.on_enumerate(
     boot,
     EnumerateResult::Ok(vec![DirEntry::new(seg("stale"), FileKind::Dir)]),
@@ -7253,6 +9456,51 @@ fn rebind_root_disowns_an_in_flight_root_read() {
   assert!(
     events.iter().all(|c| !c.kind().is_created()),
     "and announces nothing: {events:?}"
+  );
+}
+
+/// A rebind lands while a ROOT-SLOT stat is outstanding — the one coordinate
+/// the rebind's own settlement does not reach. Children are dropped, the root's
+/// read is disowned and its arm superseded, but `pending_stat` is keyed by
+/// `(root, name)` and the root survives the rebind, so an answer for the OLD
+/// root's path would settle the NEW root's slot. Here it would report the slot
+/// empty and discharge its recorded darkness, over a world where nothing has
+/// been looked at yet.
+///
+/// The placement clock is what separates the worlds: the rebind records that
+/// the root's own placement changed, so the answer is refused as the non-proof
+/// it is and the darkness stands for the new world's own crawl to clear.
+#[test]
+fn a_root_slot_stat_crossing_a_rebind_does_not_settle_the_new_world() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root(&mut m, s);
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  // An unclassifiable slot is what asks for a stat; unwatched, it books its
+  // darkness for exactly as long as the answer is owed.
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("u"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassified slot is stat'd");
+  assert!(
+    m.has_coverage_deficit(s),
+    "and books its darkness meanwhile"
+  );
+
+  assert_eq!(m.rebind_root(s).map(|(id, _)| id), Some(root));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  assert!(
+    m.has_coverage_deficit(s),
+    "the old world's answer cannot report the new world's slot empty"
   );
 }
 
@@ -7277,11 +9525,11 @@ fn a_late_arm_result_for_a_rebound_child_is_ignored() {
     .expect("the child arm is in flight");
   let _ = drain_events(&mut m);
 
-  assert_eq!(m.rebind_root(scope(1)), Some(root));
+  assert_eq!(m.rebind_root(scope(1)).map(|(id, _)| id), Some(root));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
-  m.on_watch_result(child, Ok(WatchAck::Installed));
+  m.ack_watch(child, Ok(WatchAck::Installed));
   assert!(
     drain_actions(&mut m).is_empty(),
     "a dead arm starts nothing"
@@ -7312,7 +9560,7 @@ fn live_child_dir(m: &mut Monitor, parent: WatchId, name: &str) -> WatchId {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the discovered directory arms");
-  m.on_watch_result(child, Ok(WatchAck::Installed));
+  m.ack_watch(child, Ok(WatchAck::Installed));
   let boot = drain_actions(m)
     .iter()
     .find_map(|a| {
@@ -7339,7 +9587,7 @@ fn a_replace_rebuild_settle_emits_a_closing_rescan() {
 
   // The descending replace, as the core drives it: rebind, then the commit
   // overflow (whose re-arm kickoff folds into the reset root's pending arm).
-  assert_eq!(m.rebind_root(scope(1)), Some(root));
+  assert_eq!(m.rebind_root(scope(1)).map(|(id, _)| id), Some(root));
   m.on_overflow(Scope::Root(scope(1)), at(1));
   let events = drain_events(&mut m);
   assert_eq!(events.len(), 1, "exactly the commit Rescan: {events:?}");
@@ -7351,7 +9599,7 @@ fn a_replace_rebuild_settle_emits_a_closing_rescan() {
   // The driver replays the pre-armed root; its re-arm read lists a fresh
   // directory `a` — the bridge: `a`'s content changes are dark until its
   // watch arms, and the re-arm read suppresses `Created`.
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let rearm = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -7372,7 +9620,7 @@ fn a_replace_rebuild_settle_emits_a_closing_rescan() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the rebuilt directory arms");
-  m.on_watch_result(a_watch, Ok(WatchAck::Installed));
+  m.ack_watch(a_watch, Ok(WatchAck::Installed));
   assert!(drain_events(&mut m).is_empty());
   let a_read = drain_actions(&mut m)
     .iter()
@@ -7424,7 +9672,7 @@ fn a_clean_regrow_window_emits_nothing() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the pruned directory re-installs");
-  m.on_watch_result(fresh, Ok(WatchAck::Installed));
+  m.ack_watch(fresh, Ok(WatchAck::Installed));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -7462,7 +9710,7 @@ fn an_arm_refused_slot_is_recorded_resignaled_and_healed() {
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the discovered directory arms");
   let _ = drain_events(&mut m);
-  m.on_watch_result(a1, Err(WatchError::NoSpace));
+  m.ack_watch(a1, Err(WatchError::NoSpace));
   let events = drain_events(&mut m);
   assert_eq!(events.len(), 1, "the edge Rescan: {events:?}");
   assert!(events[0].kind().is_rescan());
@@ -7513,7 +9761,7 @@ fn an_arm_refused_slot_is_recorded_resignaled_and_healed() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the heal re-installs the slot");
-  m.on_watch_result(a2, Err(WatchError::NoSpace));
+  m.ack_watch(a2, Err(WatchError::NoSpace));
   assert!(m.has_coverage_deficit(scope(1)), "the re-fail re-records");
   assert!(m.rearm_settled(scope(1)));
   let events = drain_events(&mut m);
@@ -7542,7 +9790,7 @@ fn an_arm_refused_slot_is_recorded_resignaled_and_healed() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the heal re-installs the slot again");
-  m.on_watch_result(a3, Ok(WatchAck::Installed));
+  m.ack_watch(a3, Ok(WatchAck::Installed));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -7588,7 +9836,7 @@ fn an_exhausted_read_interior_is_recorded_resignaled_and_healed() {
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the discovered directory arms");
   let _ = drain_events(&mut m);
-  m.on_watch_result(a, Ok(WatchAck::Installed));
+  m.ack_watch(a, Ok(WatchAck::Installed));
   for round in 0..=REARM_MAX_RETRIES {
     let req = drain_actions(&mut m)
       .iter()
@@ -7631,7 +9879,7 @@ fn an_exhausted_read_interior_is_recorded_resignaled_and_healed() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the gap-created directory installs");
-  m.on_watch_result(b, Ok(WatchAck::Installed));
+  m.ack_watch(b, Ok(WatchAck::Installed));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -7674,7 +9922,7 @@ fn a_removed_record_over_a_slot_hole_stands_a_covering_rescan() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the discovered directory arms");
-  m.on_watch_result(a, Err(WatchError::NoSpace));
+  m.ack_watch(a, Err(WatchError::NoSpace));
   assert!(m.has_coverage_deficit(scope(1)));
   let _ = drain_events(&mut m);
 
@@ -7730,7 +9978,7 @@ fn a_removed_over_a_hole_reaches_a_modified_only_subscription() {
   let mut m = per_dir();
   let mask = Interest::new().with_modified();
   let root = m.register_root(scope(1), mask);
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -7757,7 +10005,7 @@ fn a_removed_over_a_hole_reaches_a_modified_only_subscription() {
 
   // The arm fails: the opening Rescan IS delivered (Rescans bypass the filter),
   // covering everything up to now — but not the change still to come.
-  m.on_watch_result(a, Err(WatchError::NoSpace));
+  m.ack_watch(a, Err(WatchError::NoSpace));
   let opening = drain_events(&mut m);
   assert_eq!(
     opening.len(),
@@ -7865,7 +10113,7 @@ fn a_mass_failure_collapses_the_book_to_one_root_resignal() {
       .iter()
       .find_map(|a| a.as_watch().map(|w| w.id()))
       .expect("each discovered directory arms");
-    m.on_watch_result(w, Err(WatchError::NoSpace));
+    m.ack_watch(w, Err(WatchError::NoSpace));
     let _ = drain_events(&mut m);
   }
   assert!(m.has_coverage_deficit(scope(1)));
@@ -7896,7 +10144,7 @@ fn a_mass_failure_collapses_the_book_to_one_root_resignal() {
     .collect();
   assert_eq!(arms.len(), 1 + DEFICIT_CAP, "every hole re-attempts");
   for w in arms {
-    m.on_watch_result(w, Err(WatchError::NoSpace));
+    m.ack_watch(w, Err(WatchError::NoSpace));
   }
   assert!(m.has_coverage_deficit(scope(1)), "re-failures re-record");
   let events = drain_events(&mut m);
@@ -7908,6 +10156,54 @@ fn a_mass_failure_collapses_the_book_to_one_root_resignal() {
     events.last().map(|e| e.location()),
     Some(&Location::new()),
     "the lossy, fresh-armed window closes at the root: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The re-signal RETIRES the entry it kicks for, so its kick must land in every
+/// state the anchor can be in. A widen splices a fresh root that stays `Arming`
+/// until the driver replays its pre-arm outcome, while the old world's collapsed
+/// book rides across untouched — and a bare re-arm answers `Refused` for `Arming`.
+/// Retiring the whole-scope marker behind a refused kick leaves the scope reading
+/// settled AND deficit-free over interiors no crawl ever revisits.
+#[test]
+fn a_collapsed_book_resignal_counts_its_heal_under_an_arming_root() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root(&mut m, s);
+
+  // Collapse the book: `DEFICIT_CAP` + 1 unclassifiable names in one listing, each
+  // booking an uncovered slot.
+  let boot = read_of(&mut m, root);
+  let unknown: Vec<DirEntry> = (0..=DEFICIT_CAP)
+    .map(|i| DirEntry::new(seg(&std::format!("u{i:02}")), FileKind::Unknown))
+    .collect();
+  m.on_enumerate(boot, EnumerateResult::Ok(unknown));
+  assert!(m.has_coverage_deficit(s));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // The widen splices a new root ABOVE this one and discharges nothing: the old
+  // world did not end, so its darkness rides across — under a root whose pre-arm
+  // outcome the driver has not replayed yet.
+  let reserved = m.reserve_watch_id();
+  assert!(m.widen_root(s, reserved, vec![seg("b")], None).is_some());
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  assert!(
+    m.has_coverage_deficit(s),
+    "the widen does not discharge the old world's darkness"
+  );
+  assert!(m.rearm_settled(s), "and nothing is counted yet");
+
+  assert!(m.resignal_coverage_deficits(s));
+  assert!(
+    !m.has_coverage_deficit(s),
+    "the collapsed marker is retired optimistically"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "so a counted heal must stand in its place"
   );
   m.assert_invariants();
 }
@@ -7944,7 +10240,7 @@ fn a_grow_hijacking_a_cold_arming_node_stands_covering_rescans() {
 
   // The post-arm read is re-arm-flavored: content is reconciled, never
   // announced — the file emits nothing, the directory installs suppressed.
-  m.on_watch_result(a, Ok(WatchAck::Installed));
+  m.ack_watch(a, Ok(WatchAck::Installed));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|x| x.as_enumerate().filter(|e| e.dir() == a).map(|e| e.req()))
@@ -7964,7 +10260,7 @@ fn a_grow_hijacking_a_cold_arming_node_stands_covering_rescans() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the suppressed child directory is reconciled");
-  m.on_watch_result(b, Ok(WatchAck::Installed));
+  m.ack_watch(b, Ok(WatchAck::Installed));
   let b_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -8043,7 +10339,7 @@ fn coverage_settled_gates_holds_and_latent_cold_reads() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the discovered directory arms");
-  m.on_watch_result(d, Ok(WatchAck::Installed));
+  m.ack_watch(d, Ok(WatchAck::Installed));
   let cold = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -8094,7 +10390,7 @@ fn teardown_reclaims_all_barrier_bookkeeping() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("a arms");
-  m.on_watch_result(a, Err(WatchError::NoSpace));
+  m.ack_watch(a, Err(WatchError::NoSpace));
   let _d = live_child_dir(&mut m, root, "d");
   m.on_os_record(
     OsRecord::new(root, RecordKind::MovedFrom)
@@ -8113,7 +10409,7 @@ fn teardown_reclaims_all_barrier_bookkeeping() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("c arms");
-  m.on_watch_result(c, Ok(WatchAck::Installed));
+  m.ack_watch(c, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   m.on_overflow(SubtreeScope::new(c).into(), at(4));
   assert!(m.has_coverage_deficit(scope(1)));
@@ -8165,7 +10461,7 @@ fn an_organic_grow_healing_a_hole_emits_the_closing_rescan() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the discovered directory arms");
-  m.on_watch_result(a1, Err(WatchError::NoSpace));
+  m.ack_watch(a1, Err(WatchError::NoSpace));
   let _ = drain_events(&mut m);
   assert!(m.has_coverage_deficit(scope(1)));
 
@@ -8184,7 +10480,7 @@ fn an_organic_grow_healing_a_hole_emits_the_closing_rescan() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the hole's slot re-installs");
-  m.on_watch_result(a2, Ok(WatchAck::Installed));
+  m.ack_watch(a2, Ok(WatchAck::Installed));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -8288,7 +10584,7 @@ fn a_crawl_drop_of_a_deficit_anchor_carries_the_loss() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the dropped slot re-installs");
-  m.on_watch_result(p2, Ok(WatchAck::Installed));
+  m.ack_watch(p2, Ok(WatchAck::Installed));
   // The healed interior reads clean, listing the gap directory the dark
   // interval hid; its install is `Created`-suppressed like the rest.
   let read = drain_actions(&mut m)
@@ -8303,7 +10599,7 @@ fn a_crawl_drop_of_a_deficit_anchor_carries_the_loss() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the gap directory installs");
-  m.on_watch_result(g, Ok(WatchAck::Installed));
+  m.ack_watch(g, Ok(WatchAck::Installed));
   let g_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == g).map(|e| e.req()))
@@ -8330,13 +10626,16 @@ fn a_crawl_drop_of_a_deficit_anchor_carries_the_loss() {
   m.assert_invariants();
 }
 
-/// The carry's overreach guard (the A2 companion): a crawl that drops and
-/// rebuilds an identity-unconfirmable child with NO recorded deficit under
-/// it owes nothing. The carry fires only on an ACTUAL erasure, so a pure
-/// grow over healthy record-installed coverage still emits NOTHING and no
-/// phantom deficit appears.
+/// The carry's overreach guard (the A2 companion), and the split between the
+/// crawl's TWO obligations. A crawl that drops and rebuilds an
+/// identity-unconfirmable child with NO recorded deficit under it books
+/// nothing: the carry fires only on an ACTUAL erasure, so no phantom hole
+/// appears. It is not silent, though — retiring a watch over a name the
+/// listing PROVES is occupied ends live coverage, which the cover below owes
+/// independently of any deficit. The `Rescan` is the ONLY instruction the
+/// rebuild produces; the suppressed re-install still emits no `Created`.
 #[test]
-fn a_crawl_rebuild_of_a_deficit_free_child_emits_nothing() {
+fn a_deficit_free_crawl_rebuild_covers_but_books_nothing() {
   let mut m = per_dir();
   let root = live_root_idle(&mut m, scope(1));
   let _p = live_child_dir(&mut m, root, "p");
@@ -8356,7 +10655,7 @@ fn a_crawl_rebuild_of_a_deficit_free_child_emits_nothing() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the dropped slot re-installs");
-  m.on_watch_result(p2, Ok(WatchAck::Installed));
+  m.ack_watch(p2, Ok(WatchAck::Installed));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p2).map(|e| e.req()))
@@ -8364,9 +10663,14 @@ fn a_crawl_rebuild_of_a_deficit_free_child_emits_nothing() {
   m.on_enumerate(read, EnumerateResult::Ok(vec![]));
 
   assert!(m.rearm_settled(scope(1)));
+  let events = drain_events(&mut m);
   assert!(
-    drain_events(&mut m).is_empty(),
-    "a deficit-free rebuild owes nothing — no Rescan, no Created"
+    events.iter().all(|e| e.kind().is_rescan()),
+    "a re-arm rebuild announces no Created: {events:?}"
+  );
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "but retiring coverage of a listed-live slot owes its cover: {events:?}"
   );
   assert!(
     !m.has_coverage_deficit(scope(1)),
@@ -8375,14 +10679,543 @@ fn a_crawl_rebuild_of_a_deficit_free_child_emits_nothing() {
   m.assert_invariants();
 }
 
+/// The pure-grow cover (fail-on-old). [`Monitor::rearm_watch_subtree`] is the
+/// ONE entry into the crawl-rebuild path that stands no `Rescan` of its own,
+/// and a record-installed child carries no identity, so the crawl retires a
+/// child the listing PROVES is occupied — together with every descendant
+/// `WatchId`. A record the backend had already queued on one of those ids is
+/// then discarded as an unrecognized watch, while the rebuilt slot is
+/// `Created`-suppressed: on old, the window closed with nothing on the wire
+/// and the next sync resolved a false `Delivered` over the discarded record.
+/// The barrier must also stay shut for the whole dark interval, so no cookie
+/// can be dispatched ahead of the cover.
+#[test]
+fn a_pure_grow_crawl_covers_the_live_slot_it_retires() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let p = live_child_dir(&mut m, root, "p");
+  let g = live_child_dir(&mut m, p, "g");
+  assert!(
+    m.coverage_settled(scope(1)),
+    "the grow starts from quiescence"
+  );
+
+  // A PURE grow: no overflow, no loss, no incomplete read — nothing has stood
+  // a `Rescan` for this scope, so the window opens clean.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("p"), FileKind::Dir).with_node(ident(7)),
+    ]),
+  );
+  assert!(!m.is_watched(p), "the unconfirmable child is retired");
+  assert!(!m.is_watched(g), "and so is its descendant");
+  assert!(
+    !m.coverage_settled(scope(1)),
+    "the counted rebuild holds the barrier shut across the dark window"
+  );
+
+  // The record the backend had already queued on the retired descendant
+  // arrives and is discarded — the darkness this cover exists for.
+  m.on_os_record(
+    OsRecord::new(g, RecordKind::Modified).with_name(seg("f")),
+    at(4),
+  );
+  assert!(!m.coverage_settled(scope(1)));
+
+  let p2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the retired slot re-installs");
+  m.ack_watch(p2, Ok(WatchAck::Installed));
+  let p2_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p2).map(|e| e.req()))
+    .expect("the rebuilt directory re-arm-enumerates");
+  m.on_enumerate(
+    p2_read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Dir)]),
+  );
+  let g2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the descendant re-installs");
+  m.ack_watch(g2, Ok(WatchAck::Installed));
+  let g2_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == g2).map(|e| e.req()))
+    .expect("the rebuilt descendant re-arm-enumerates");
+  m.on_enumerate(g2_read, EnumerateResult::Ok(vec![]));
+
+  // The barrier reopens only now — and only over a delivered instruction.
+  assert!(m.coverage_settled(scope(1)));
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "the retired live slot must leave a covering Rescan: {events:?}"
+  );
+  assert!(
+    events.iter().all(|e| e.kind().is_rescan()),
+    "the discarded record's darkness is covered by the Rescan alone — the \
+     rebuild announces no Created: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The cover is COALESCED per crawl, not per child: an identity-less backend
+/// can confirm no child at all, so one `Rescan` per rebuilt entry would storm
+/// a `Rescan` per listing. One crawl retiring three live slots stands exactly
+/// ONE opening `Rescan` at the crawled directory, and the window still closes
+/// with its own single root `Rescan` once the rebuild quiesces.
+#[test]
+fn one_crawl_stands_one_cover_not_one_per_child() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  for name in ["a", "b", "c"] {
+    let _ = live_child_dir(&mut m, root, name);
+  }
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("a"), FileKind::Dir).with_node(ident(7)),
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(8)),
+      DirEntry::new(seg("c"), FileKind::Dir).with_node(ident(9)),
+    ]),
+  );
+  let opening = drain_events(&mut m);
+  assert_eq!(
+    opening.len(),
+    1,
+    "three retired slots, ONE cover for the crawl: {opening:?}"
+  );
+  assert!(opening[0].kind().is_rescan());
+  assert_eq!(
+    opening[0].location(),
+    &Location::new(),
+    "located at the crawled directory"
+  );
+
+  // Drive all three rebuilds to quiescence.
+  let installs: Vec<WatchId> = drain_actions(&mut m)
+    .iter()
+    .filter_map(|a| a.as_watch().map(|w| w.id()))
+    .collect();
+  assert_eq!(installs.len(), 3, "every retired slot re-installs");
+  for id in &installs {
+    m.ack_watch(*id, Ok(WatchAck::Installed));
+  }
+  let reads: Vec<ReqId> = drain_actions(&mut m)
+    .iter()
+    .filter_map(|a| a.as_enumerate().map(|e| e.req()))
+    .collect();
+  assert_eq!(reads.len(), 3);
+  for req in reads {
+    m.on_enumerate(req, EnumerateResult::Ok(vec![]));
+  }
+
+  assert!(m.rearm_settled(scope(1)));
+  let closing = drain_events(&mut m);
+  assert_eq!(
+    closing.len(),
+    1,
+    "and one closing Rescan for the arm gap: {closing:?}"
+  );
+  assert!(closing[0].kind().is_rescan());
+  assert!(closing[0].epoch() > opening[0].epoch());
+  m.assert_invariants();
+}
+
+/// A live, idle child directory whose object identity the monitor KNOWS, so a
+/// listing carrying the same identity confirms it as a survivor and the crawl
+/// retires nothing.
+fn live_child_dir_ident(m: &mut Monitor, parent: WatchId, name: &str, id: Identity) -> WatchId {
+  m.on_os_record(
+    OsRecord::new(parent, RecordKind::Created)
+      .with_name(seg(name))
+      .with_is_dir(true)
+      .with_node(id),
+    at(1),
+  );
+  let child = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  m.ack_watch(child, Ok(WatchAck::Installed));
+  let boot = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == child)
+        .map(|e| e.req())
+    })
+    .expect("the armed child cold-enumerates");
+  m.on_enumerate(boot, EnumerateResult::Ok(vec![]));
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+  child
+}
+
+/// The cover's overreach guard — the gate that keeps the fix bounded. The
+/// obligation is RETIREMENT, not churn: a crawl whose every incumbent is
+/// identity-confirmed retires no watch at all, so no `WatchId` is invalidated
+/// and no queued record is orphaned. A fresh name appearing beside the
+/// survivors is an ordinary set-cover grow. Neither may put a `Rescan` on the
+/// wire, or every prune-free grow would degrade.
+#[test]
+fn a_crawl_that_retires_nothing_emits_nothing() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let p = live_child_dir_ident(&mut m, root, "p", ident(7));
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the grow re-arm-enumerates the root");
+  // `p` is confirmed unchanged; `q` is new.
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("p"), FileKind::Dir).with_node(ident(7)),
+      DirEntry::new(seg("q"), FileKind::Dir),
+    ]),
+  );
+  assert!(m.is_watched(p), "the confirmed survivor keeps its watch");
+  let actions = drain_actions(&mut m);
+  let q = actions
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the new name installs");
+  let p_read = actions
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p).map(|e| e.req()))
+    .expect("the survivor re-arms downward");
+  m.on_enumerate(p_read, EnumerateResult::Ok(vec![]));
+  m.ack_watch(q, Ok(WatchAck::Installed));
+  let q_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == q).map(|e| e.req()))
+    .expect("the new directory re-arm-enumerates");
+  m.on_enumerate(q_read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a crawl that retires nothing owes no cover"
+  );
+  assert!(
+    !m.has_coverage_deficit(scope(1)),
+    "and books no phantom hole"
+  );
+  m.assert_invariants();
+}
+
+/// The absent-slot cover (fail-on-old). A crawl retires a child the fresh
+/// listing OMITS, and rebuilds NOTHING in its place — the install loop only
+/// descends into listed directories — so unlike the listed-directory
+/// retirement there is no counted successor whose closing `Rescan` could
+/// stand for the window. A `Modified` the backend had already queued on a
+/// descendant of the retired subtree then arrives and is discarded as an
+/// unrecognized watch, while the vanish's `Removed` is interest-subject: a
+/// `Modified`-only subscription receives nothing at all. On old the crawl was
+/// silent here — the cover gate read the directories-only `present` index, so
+/// an omitted name never set it — and the next sync resolved a clean verdict
+/// over the discarded record.
+#[test]
+fn a_crawl_covers_the_slot_an_absent_name_retires() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let p = live_child_dir(&mut m, root, "p");
+  let g = live_child_dir(&mut m, p, "g");
+  assert!(
+    m.coverage_settled(scope(1)),
+    "the grow starts from quiescence"
+  );
+
+  // A PURE grow: no overflow, no loss, no incomplete read — nothing has stood
+  // a `Rescan` for this scope, so the window opens clean.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(rearm, EnumerateResult::Ok(vec![]));
+  assert!(!m.is_watched(p), "the omitted name is retired");
+  assert!(!m.is_watched(g), "and so is its descendant");
+
+  // Nothing was rebuilt, so the barrier reads settled the instant the crawl
+  // returns — which is sound ONLY because the cover is already on the wire at
+  // that same instant: a fence resolving on this observation is ordered behind
+  // it, and cannot certify a clean window.
+  assert!(
+    m.coverage_settled(scope(1)),
+    "an unrebuilt slot leaves nothing counted to wait on"
+  );
+  let cover = drain_events(&mut m);
+  assert_eq!(
+    cover.len(),
+    1,
+    "so the cover must already be on the wire: {cover:?}"
+  );
+  assert!(cover[0].kind().is_rescan());
+  assert_eq!(
+    cover[0].location(),
+    &Location::new(),
+    "located at the crawled directory"
+  );
+
+  // The record the backend had already queued on the retired descendant
+  // arrives and is discarded — the darkness the cover exists for. It describes
+  // a moment when the object still existed, so the cover's delivery-time
+  // re-read is what stands in for it.
+  m.on_os_record(
+    OsRecord::new(g, RecordKind::Modified).with_name(seg("f")),
+    at(4),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the orphaned record delivers nothing of its own"
+  );
+  m.assert_invariants();
+}
+
+/// The same loss through the other door: the listing does not omit the name,
+/// it reports it as a FILE. That is equally unrebuilt — `present` indexes
+/// directories only, and the install loop skips a non-directory — so the
+/// retirement again has no counted successor, and the `Rescan` is again the
+/// whole cover. Fails on old for the same reason: a `File` entry is absent
+/// from the directories-only index, so the old gate could not see it either.
+#[test]
+fn a_crawl_covers_the_slot_a_file_entry_retires() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let p = live_child_dir(&mut m, root, "p");
+  let g = live_child_dir(&mut m, p, "g");
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  // The name is still there — as a file. The directory it named is gone.
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("p"), FileKind::File)]),
+  );
+  assert!(!m.is_watched(p), "the replaced name is retired");
+  assert!(!m.is_watched(g), "and so is its descendant");
+  assert!(
+    drain_actions(&mut m).iter().all(|a| a.as_watch().is_none()),
+    "and nothing re-installs over a proven non-directory"
+  );
+
+  assert!(
+    m.coverage_settled(scope(1)),
+    "an unrebuilt slot leaves nothing counted to wait on"
+  );
+  let cover = drain_events(&mut m);
+  assert_eq!(
+    cover.len(),
+    1,
+    "so the cover must already be on the wire: {cover:?}"
+  );
+  assert!(cover[0].kind().is_rescan());
+  assert_eq!(cover[0].location(), &Location::new());
+
+  m.on_os_record(
+    OsRecord::new(g, RecordKind::Modified).with_name(seg("f")),
+    at(4),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the orphaned record delivers nothing of its own"
+  );
+  m.assert_invariants();
+}
+
+/// The unrebuilt cover coalesces exactly like the listed one: one crawl
+/// retiring THREE slots no successor rebuilds — two omitted names and one now
+/// listed as a file — stands ONE opening `Rescan` at the crawled directory,
+/// not one per child. Nothing is armed fresh, so that cover is also the
+/// window's only signal: no rebuild follows to close it.
+#[test]
+fn one_crawl_stands_one_cover_for_many_unrebuilt_slots() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  for name in ["a", "b", "c"] {
+    let _ = live_child_dir(&mut m, root, name);
+  }
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  // `a` and `c` are omitted, `b` is now a file. None is rebuilt.
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::File)]),
+  );
+  let opening = drain_events(&mut m);
+  assert_eq!(
+    opening.len(),
+    1,
+    "three unrebuilt retirements, ONE cover: {opening:?}"
+  );
+  assert!(opening[0].kind().is_rescan());
+  assert_eq!(
+    opening[0].location(),
+    &Location::new(),
+    "located at the crawled directory"
+  );
+  assert!(
+    drain_actions(&mut m).iter().all(|a| a.as_watch().is_none()),
+    "and nothing re-installs"
+  );
+
+  assert!(m.rearm_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the opening cover is the whole of it — nothing armed fresh to close"
+  );
+  m.assert_invariants();
+}
+
+/// Why the unrebuilt cover must NOT borrow the listed one's `bridge_is_lossy`
+/// suppression, and the cross-flavor coalesce in one cell. An overflow
+/// recovery stands its own `Rescan` first, so the window is already lossy when
+/// its crawl runs; that crawl retires an omitted name (unrebuilt) alongside an
+/// identity-unconfirmable directory (rebuilt, and suppressed here precisely
+/// because its rebuild is counted). The suppression is sound only for a site
+/// that also makes the window counted — and the unrebuilt slot arms nothing,
+/// so deferring to the conjunction would defer to a closing `Rescan` this
+/// window may never mint. Exactly ONE opening `Rescan` is owed: not zero (the
+/// old gate, and a wrongly-suppressed fix, both emit none) and not two.
+#[test]
+fn an_unrebuilt_retirement_covers_inside_an_already_lossy_window() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let p = live_child_dir(&mut m, root, "p");
+  let d = live_child_dir(&mut m, root, "d");
+
+  // The overflow stands the window's opening loss and kicks the crawl.
+  m.on_overflow(Scope::Root(scope(1)), at(2));
+  let overflowed = drain_events(&mut m);
+  assert!(
+    overflowed.iter().any(|e| e.kind().is_rescan()),
+    "the overflow marks the window lossy: {overflowed:?}"
+  );
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the recovery re-arm-enumerates the root");
+  // `p` is omitted (unrebuilt); `d` is listed, so it is retired and rebuilt.
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("d"), FileKind::Dir).with_node(ident(9)),
+    ]),
+  );
+  assert!(!m.is_watched(p), "the omitted name is retired");
+  assert!(!m.is_watched(d), "and so is the unconfirmable one");
+
+  let opening = drain_events(&mut m);
+  assert_eq!(
+    opening.len(),
+    1,
+    "the unrebuilt slot still owes a cover inside a lossy window, and both \
+     flavors share it: {opening:?}"
+  );
+  assert!(opening[0].kind().is_rescan());
+  assert_eq!(opening[0].location(), &Location::new());
+  m.assert_invariants();
+}
+
+/// The cover must reach the subscription that no structural signal reaches. A
+/// `Modified`-only subscriber sees neither the retired subtree's `Removed` nor
+/// the rebuild's (suppressed) `Created`, so the covering `Rescan` — the one
+/// signal that bypasses both interest and filter — is its ONLY instruction to
+/// re-read what the retired `WatchId`s stopped covering.
+#[test]
+fn the_crawl_cover_reaches_a_modified_only_subscription() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  let _p = live_child_dir(&mut m, root, "p");
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("p"), FileKind::Dir).with_node(ident(7)),
+    ]),
+  );
+  let p2 = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the retired slot re-installs");
+  m.ack_watch(p2, Ok(WatchAck::Installed));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p2).map(|e| e.req()))
+    .expect("the rebuilt directory re-arm-enumerates");
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_rescan()),
+    "a Rescan is delivered regardless of the registered interest: {events:?}"
+  );
+  m.assert_invariants();
+}
+
 /// The carry when the crawl does NOT rebuild the slot (the name vanished
-/// from the listing): the loss fact stays booked at the surviving parent —
-/// a sync dispatched before the in-flight `Removed` lands re-signals it —
-/// and the `Removed`'s arrival clears the re-anchored carry AND stands a
-/// covering `Rescan` (the removal is filter-subject, so a `Modified`-only sub
-/// that never saw it still learns the darkness ended). Fails on old: the
-/// clear was silent, so that filtered sub's next sync resolved a false
-/// `Delivered`.
+/// from the listing): the retirement's own opening `Rescan` stands, the loss
+/// fact stays booked at the surviving parent — a sync dispatched before the
+/// in-flight `Removed` lands re-signals it — and the `Removed`'s arrival
+/// clears the re-anchored carry AND stands a covering `Rescan` (the removal is
+/// filter-subject, so a `Modified`-only sub that never saw it still learns the
+/// darkness ended). Fails on old: the clear was silent, so that filtered sub's
+/// next sync resolved a false `Delivered`.
 #[test]
 fn a_crawl_drop_without_rebuild_keeps_the_loss_booked() {
   let mut m = per_dir();
@@ -8398,10 +11231,14 @@ fn a_crawl_drop_without_rebuild_keeps_the_loss_booked() {
     .expect("the grow re-arm-enumerates the parent");
   m.on_enumerate(rearm, EnumerateResult::Ok(vec![]));
   assert!(m.rearm_settled(scope(1)));
-  assert!(
-    drain_events(&mut m).is_empty(),
-    "the vanished subtree owes no Rescan of its own"
+  let cover = drain_events(&mut m);
+  assert_eq!(
+    cover.len(),
+    1,
+    "the retirement stands its own opening Rescan, unrebuilt: {cover:?}"
   );
+  assert!(cover[0].kind().is_rescan());
+  assert_eq!(cover[0].location(), &Location::new());
   assert!(
     m.has_coverage_deficit(scope(1)),
     "the erased interior re-anchored at the parent slot"
@@ -8463,7 +11300,7 @@ fn arm_named_child(m: &mut Monitor, parent: WatchId, name: &str) -> WatchId {
     })
     .map(|c| c.id())
     .expect("the child watch was queued");
-  m.on_watch_result(id, Ok(WatchAck::Installed));
+  m.ack_watch(id, Ok(WatchAck::Installed));
   let boot = drain_actions(m)
     .iter()
     .find_map(|a| a.as_enumerate().filter(|e| e.dir() == id).map(|e| e.req()))
@@ -8497,7 +11334,8 @@ fn widen_root_depth_one_splices_without_touching_the_old_subtree() {
 
   let reserved = m.reserve_watch_id();
   assert_eq!(
-    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1))),
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+      .map(|(id, _)| id),
     Some(reserved)
   );
   m.assert_invariants();
@@ -8541,7 +11379,7 @@ fn widen_root_depth_one_splices_without_touching_the_old_subtree() {
 
   // The replayed pre-arm brings the new root live and starts its COLD read;
   // its confirming completion releases the barrier.
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
   m.on_enumerate(
     req,
@@ -8553,6 +11391,96 @@ fn widen_root_depth_one_splices_without_touching_the_old_subtree() {
     m.coverage_settled(s),
     "positive verification releases the barrier"
   );
+  m.assert_invariants();
+}
+
+/// A widen preserves every absolute path — that is exactly what
+/// [`Reparent::Rerooted`] asserts — so a read already in flight over the old
+/// root still describes the directory it was issued for, and its result must be
+/// reconciled.
+///
+/// The spliced-in root is a NEWBORN, though, and a newborn stamped with the
+/// clock's current reading postdates every older outstanding request. One rename
+/// in an UNRELATED scope between the read's issue and the widen is enough to
+/// lift that reading above the read's stamp, and the splice then puts the
+/// newborn on the read's ancestor chain — so the chain walk reports a move that
+/// touched no path of this scope at all, and the crawl burns a retry (or, past
+/// the bound, records a persistent deficit) because somebody else renamed.
+///
+/// Birth is not a placement change: a newborn is born `NEVER_MOVED` and makes
+/// nothing stale.
+#[test]
+fn a_widen_keeps_an_in_flight_read_valid_across_an_unrelated_scopes_rename() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+
+  // The read whose result must survive all of this, issued FIRST so every clock
+  // reading below postdates its stamp.
+  assert!(m.rearm_watch_subtree(old_root).is_started());
+  let req = read_of(&mut m, old_root);
+
+  // An unrelated scope renames a watched directory: two placement funnels (the
+  // detach that vacates the slot, the pairing that re-keys it), neither of them
+  // on scope 1's chain.
+  let other = scope(2);
+  let other_root = live_root_idle(&mut m, other);
+  let moved = live_child_dir(&mut m, other_root, "elsewhere");
+  m.on_os_record(
+    OsRecord::new(other_root, RecordKind::MovedFrom)
+      .with_name(seg("elsewhere"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(other_root, RecordKind::MovedTo)
+      .with_name(seg("arrived"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  assert!(m.is_watched(moved), "the unrelated rename paired");
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  // The widen: `b` becomes the new root's name for the old one, and every
+  // absolute path under it is unchanged.
+  let reserved = m.reserve_watch_id();
+  assert!(
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+      .is_some()
+  );
+
+  // The in-flight read answers with the world it was issued over, plus one
+  // genuinely new directory.
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("kid"), FileKind::Dir).with_node(ident(70)),
+      DirEntry::new(seg("fresh"), FileKind::Dir).with_node(ident(71)),
+    ]),
+  );
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions.iter().filter_map(|a| a.as_watch()).any(|c| c
+      .target()
+      .as_child()
+      .is_some_and(|ch| ch.parent() == old_root && ch.name().as_str() == "fresh")),
+    "the listing is reconciled — the newly-visible directory is armed: {actions:?}"
+  );
+  assert!(
+    !actions
+      .iter()
+      .any(|a| a.as_enumerate().is_some_and(|e| e.dir() == old_root)),
+    "and no bounded retry is spent re-reading what this result already read: {actions:?}"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.is_empty(),
+    "a complete crawl that retires nothing owes no Rescan: {events:?}"
+  );
+  assert!(m.is_watched(kid), "the identity-confirmed survivor is kept");
   m.assert_invariants();
 }
 
@@ -8569,7 +11497,8 @@ fn widen_root_deep_chain_arms_top_down_and_adopts_at_the_tail() {
       reserved,
       vec![seg("b"), seg("c"), seg("d")],
       Some(ident(1))
-    ),
+    )
+    .map(|(id, _)| id),
     Some(reserved)
   );
   m.assert_invariants();
@@ -8609,8 +11538,8 @@ fn adoption_confirmed_by_a_matching_listing_stays_silent() {
   let s = scope(1);
   let (old_root, kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
 
   m.on_enumerate(
@@ -8647,8 +11576,8 @@ fn adoption_name_vanished_escalates_the_scope_root() {
   let s = scope(1);
   let (_old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
 
   // The adopted name is absent from a COMPLETE listing: the subtree's true
@@ -8671,8 +11600,8 @@ fn adoption_identity_mismatch_escalates_the_scope_root() {
   let s = scope(1);
   let (_old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
 
   m.on_enumerate(
@@ -8691,13 +11620,63 @@ fn adoption_identity_mismatch_escalates_the_scope_root() {
   m.assert_invariants();
 }
 
+/// The stale-edge escalation under a root whose pre-arm outcome has NOT been
+/// replayed. A widen's spliced root sits in `Arming` until it is, and a chain
+/// deeper than one segment puts the marker on a CONNECTOR whose own arm and read
+/// do not wait for it — so the tail can resolve the edge first. This read is what
+/// RELEASED the adoption conjunct that had been holding the barrier down, and a
+/// re-arm the root's state refuses leaves that release resting on nothing while
+/// the stale edge still stands.
+#[test]
+fn a_stale_adoption_edge_counts_its_escalation_under_an_arming_root() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  assert!(
+    m.widen_root(s, reserved, vec![seg("mid"), seg("b")], Some(ident(1)))
+      .is_some()
+  );
+  // Only the CONNECTOR is armed and read; `reserved` stays pending.
+  let mid = drain_actions(&mut m)
+    .iter()
+    .filter_map(|a| a.as_watch())
+    .find(|c| {
+      c.target()
+        .as_child()
+        .is_some_and(|ch| ch.parent() == reserved && ch.name().as_str() == "mid")
+    })
+    .map(|c| c.id())
+    .expect("the connecting chain arms");
+  m.ack_watch(mid, Ok(WatchAck::Installed));
+  let req = read_of(&mut m, mid);
+  let _ = drain_events(&mut m);
+  assert!(m.rearm_settled(s), "nothing is counted before the verdict");
+
+  // The adopted name is absent from the tail's COMPLETE listing: a stale edge.
+  m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "the escalation Rescan targets the scope root: {events:?}"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "and the escalation is counted even though the root is still arming"
+  );
+  assert!(!m.coverage_settled(s));
+  m.assert_invariants();
+}
+
 #[test]
 fn adoption_after_a_recorded_death_stands_a_located_rescan() {
   let mut m = per_dir();
   let s = scope(1);
   let (old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
 
   // The adopted subtree dies through its own records mid-window — with no
   // armed parent to mint the parent-side Removed.
@@ -8706,7 +11685,7 @@ fn adoption_after_a_recorded_death_stands_a_located_rescan() {
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
 
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
   m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
   let events = drain_events(&mut m);
@@ -8725,12 +11704,12 @@ fn adoption_slot_reoccupied_rescans_and_installs_the_new_object() {
   let s = scope(1);
   let (old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
   m.on_os_record(OsRecord::new(old_root, RecordKind::DeleteSelf), at(2));
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
 
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
   m.on_enumerate(
     req,
@@ -8769,8 +11748,8 @@ fn a_partial_first_read_keeps_the_adoption_pending() {
   let s = scope(1);
   let (old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
 
   // An incomplete first read must not silently confirm the edge: the bounded
@@ -8803,7 +11782,8 @@ fn widen_preserves_a_pending_move_across_the_commit() {
   );
   let reserved = m.reserve_watch_id();
   assert_eq!(
-    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1))),
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+      .map(|(id, _)| id),
     Some(reserved)
   );
   assert!(m.is_watched(kid), "the held source rides across the widen");
@@ -8850,12 +11830,12 @@ fn widen_preserves_the_deficit_book_and_its_resignal_addressing() {
     })
     .map(|c| c.id())
     .expect("the dark slot's arm was queued");
-  m.on_watch_result(dark, Err(WatchError::NoSpace));
+  m.ack_watch(dark, Err(WatchError::NoSpace));
   let _ = drain_events(&mut m);
   assert!(m.has_coverage_deficit(s));
 
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
   assert!(
     m.has_coverage_deficit(s),
     "the old world's standing darkness survives — nothing of it was discharged"
@@ -8876,19 +11856,31 @@ fn widen_refuses_kr_unknown_and_empty_chains() {
   let mut m = kernel_recursive();
   let s = scope(1);
   let root = m.register_root(s, Interest::all());
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let reserved = m.reserve_watch_id();
-  assert_eq!(m.widen_root(s, reserved, vec![seg("b")], None), None);
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("b")], None)
+      .map(|(id, _)| id),
+    None
+  );
 
   let mut m = per_dir();
   let reserved = m.reserve_watch_id();
-  assert_eq!(m.widen_root(scope(9), reserved, vec![seg("b")], None), None);
+  assert_eq!(
+    m.widen_root(scope(9), reserved, vec![seg("b")], None)
+      .map(|(id, _)| id),
+    None
+  );
 
   let s = scope(1);
   let _root = live_root_idle(&mut m, s);
   let reserved = m.reserve_watch_id();
-  assert_eq!(m.widen_root(s, reserved, Vec::new(), None), None);
+  assert_eq!(
+    m.widen_root(s, reserved, Vec::new(), None)
+      .map(|(id, _)| id),
+    None
+  );
   let other = m.reserve_watch_id();
   assert_ne!(reserved, other, "reservations are never reused");
 }
@@ -8899,14 +11891,14 @@ fn rebind_after_a_depth_one_widen_purges_the_marker() {
   let s = scope(1);
   let (_old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
 
   // A D1 rebind of the widened scope keeps the (new) root node; the adoption
   // marker keyed on it must die with the old world, and the rebound root's
   // re-arm-flavored rebuild proceeds without an adoption escalation.
-  assert_eq!(m.rebind_root(s), Some(reserved));
+  assert_eq!(m.rebind_root(s).map(|(id, _)| id), Some(reserved));
   let _ = drain_events(&mut m);
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
   m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
   let events = drain_events(&mut m);
@@ -8926,7 +11918,8 @@ fn widen_while_the_old_root_is_enumerating_reconciles_the_late_read() {
 
   let reserved = m.reserve_watch_id();
   assert_eq!(
-    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1))),
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+      .map(|(id, _)| id),
     Some(reserved)
   );
 
@@ -8958,12 +11951,14 @@ fn back_to_back_widens_keep_independent_adoption_markers() {
   // carries TWO live adoption markers (on distinct, freshly-minted tails).
   let first = m.reserve_watch_id();
   assert_eq!(
-    m.widen_root(s, first, vec![seg("b")], Some(ident(1))),
+    m.widen_root(s, first, vec![seg("b")], Some(ident(1)))
+      .map(|(id, _)| id),
     Some(first)
   );
   let second = m.reserve_watch_id();
   assert_eq!(
-    m.widen_root(s, second, vec![seg("mid")], Some(ident(1))),
+    m.widen_root(s, second, vec![seg("mid")], Some(ident(1)))
+      .map(|(id, _)| id),
     Some(second)
   );
   m.assert_invariants();
@@ -8978,7 +11973,7 @@ fn back_to_back_widens_keep_independent_adoption_markers() {
 
   // Each marker resolves independently and silently on its own confirming
   // read — inner first, then outer.
-  m.on_watch_result(second, Ok(WatchAck::Installed));
+  m.ack_watch(second, Ok(WatchAck::Installed));
   let outer = read_of(&mut m, second);
   m.on_enumerate(
     outer,
@@ -8986,7 +11981,7 @@ fn back_to_back_widens_keep_independent_adoption_markers() {
       DirEntry::new(seg("mid"), FileKind::Dir).with_node(ident(1)),
     ]),
   );
-  m.on_watch_result(first, Ok(WatchAck::Installed));
+  m.ack_watch(first, Ok(WatchAck::Installed));
   let inner = read_of(&mut m, first);
   m.on_enumerate(
     inner,
@@ -9009,12 +12004,12 @@ fn an_unverified_adoption_holds_the_barrier_through_retries() {
   let s = scope(1);
   let (old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
   assert!(!m.coverage_settled(s), "unverified from the commit instant");
 
   // An INCOMPLETE first read must not release the barrier: the marker stays
   // (the retry re-checks) and the bounded retry is itself counted work.
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
   m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
   let _ = drain_events(&mut m);
@@ -9072,8 +12067,8 @@ fn a_mismatch_releases_the_barrier_only_with_its_escalation_standing() {
   let s = scope(1);
   let (_old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
 
   // The adopted name vanished: the marker resolves WITH the root Rescan
@@ -9102,11 +12097,12 @@ fn a_connector_reconciled_away_stands_the_closing_rescan() {
   let (old_root, kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
   assert_eq!(
-    m.widen_root(s, reserved, vec![seg("a"), seg("b")], Some(ident(1))),
+    m.widen_root(s, reserved, vec![seg("a"), seg("b")], Some(ident(1)))
+      .map(|(id, _)| id),
     Some(reserved)
   );
   let _ = drain_actions(&mut m);
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
 
   // The dark window replaced the connector with a FILE: the widened root's
@@ -9140,8 +12136,8 @@ fn an_exhausted_tail_read_hands_the_marker_to_the_deficit() {
   let s = scope(1);
   let (_old_root, _kid) = widen_base(&mut m, s);
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
-  m.on_watch_result(reserved, Ok(WatchAck::Installed));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
 
   // A permanently unreadable widened root: the bounded retries exhaust. The
   // marker must hand off to the standing `Rescan` + interior deficit — the
@@ -9255,7 +12251,7 @@ fn a_flagged_scope_loss_reissues_the_root_watch_and_holds_the_barrier() {
     "the barrier holds through the reproof"
   );
 
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9291,7 +12287,7 @@ fn a_reproving_recovery_readds_identity_matched_survivors_to_depth() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("a arms");
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let a_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9306,7 +12302,7 @@ fn a_reproving_recovery_readds_identity_matched_survivors_to_depth() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("b arms");
-  m.on_watch_result(w_b, Ok(WatchAck::Installed));
+  m.ack_watch(w_b, Ok(WatchAck::Installed));
   let b_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9319,7 +12315,7 @@ fn a_reproving_recovery_readds_identity_matched_survivors_to_depth() {
   m.on_overflow(Scope::Root(s), at(2));
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let root_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9350,7 +12346,7 @@ fn a_reproving_recovery_readds_identity_matched_survivors_to_depth() {
   assert!(!m.rearm_settled(s));
 
   // Depth: a's acknowledged reproof carries the flavor to b.
-  m.on_watch_result(w_a, Ok(WatchAck::Aliased));
+  m.ack_watch(w_a, Ok(WatchAck::Aliased));
   let a_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9367,7 +12363,7 @@ fn a_reproving_recovery_readds_identity_matched_survivors_to_depth() {
     Some(WatchTarget::child(w_a, seg("b"))),
     "the flavor reaches depth 3: {actions:?}"
   );
-  m.on_watch_result(w_b, Ok(WatchAck::Aliased));
+  m.ack_watch(w_b, Ok(WatchAck::Aliased));
   let b_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9380,7 +12376,7 @@ fn a_reproving_recovery_readds_identity_matched_survivors_to_depth() {
 
   // The fresh node needs no reproof below it: its own install ACK + cold-free
   // rearm read complete the recovery.
-  m.on_watch_result(w_fresh, Ok(WatchAck::Installed));
+  m.ack_watch(w_fresh, Ok(WatchAck::Installed));
   let fresh_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9402,7 +12398,7 @@ fn a_reproved_root_ack_err_runs_the_invalidation_funnel() {
 
   // The re-add resolved against a DIFFERENT object (or nothing): the honest
   // root death the identity-sampling gate cannot see.
-  m.on_watch_result(root, Err(WatchError::Gone));
+  m.ack_watch(root, Err(WatchError::Gone));
   let events = drain_events(&mut m);
   assert!(
     events
@@ -9438,7 +12434,7 @@ fn a_reproved_child_ack_err_records_the_slot_deficit() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("a arms");
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let a_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9449,7 +12445,7 @@ fn a_reproved_child_ack_err_records_the_slot_deficit() {
   m.on_overflow(Scope::Root(s), at(2));
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let root_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9461,7 +12457,7 @@ fn a_reproved_child_ack_err_records_the_slot_deficit() {
     ]),
   );
   let _ = drain_actions(&mut m);
-  m.on_watch_result(w_a, Err(WatchError::NotFound));
+  m.ack_watch(w_a, Err(WatchError::NotFound));
   let events = drain_events(&mut m);
   assert!(
     events
@@ -9501,7 +12497,7 @@ fn a_second_loss_invalidates_the_first_binding_ack() {
   // …and the FIRST acknowledgement no longer counts: the binding it certifies
   // may have died with the second loss, its teardown swallowed. The watch is
   // re-issued; nothing reads; the barrier stays down.
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let reissued = drain_actions(&mut m);
   assert_eq!(
     readd_of(&reissued, root),
@@ -9516,7 +12512,7 @@ fn a_second_loss_invalidates_the_first_binding_ack() {
   assert!(!m.coverage_settled(s));
 
   // The postdating acknowledgement is the proof.
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9540,7 +12536,7 @@ fn an_installed_readd_ack_stands_exactly_one_closing_rescan() {
 
   // Installed: the old binding was dead — the window between the loss and
   // this acknowledgement was recorded by nothing.
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9608,7 +12604,7 @@ fn a_rebind_supersedes_an_inflight_recovery_coherently() {
   // …superseded by a stream replace, as the core drives it: rebind, then the
   // commit's synthetic scope loss (which coalesces into the reset root — the
   // caller's replay owns the next acknowledgement, so nothing new issues).
-  assert_eq!(m.rebind_root(s), Some(root));
+  assert_eq!(m.rebind_root(s).map(|(id, _)| id), Some(root));
   m.on_overflow(Scope::Root(s), at(2));
   let _ = drain_events(&mut m);
   let actions = drain_actions(&mut m);
@@ -9621,14 +12617,14 @@ fn a_rebind_supersedes_an_inflight_recovery_coherently() {
   // The replayed pre-arm outcome predates the commit's loss, so the stamp
   // rule spends one re-add re-proving the binding on the NEW transport —
   // strictly more honest than trusting a pre-commit install across the cut.
-  m.on_watch_result(root, Ok(WatchAck::Installed));
+  m.ack_watch(root, Ok(WatchAck::Installed));
   let reissued = drain_actions(&mut m);
   assert_eq!(
     readd_of(&reissued, root),
     Some(WatchTarget::RearmRoot(s)),
     "the replay is stale under the commit's loss: {reissued:?}"
   );
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9655,7 +12651,7 @@ fn a_widen_splice_carries_an_inflight_recovery() {
   // The same-transport widen splices the new root ABOVE the recovery.
   let reserved = m.reserve_watch_id();
   let widened = m.widen_root(s, reserved, vec![seg("r")], Some(ident(1)));
-  assert_eq!(widened, Some(reserved));
+  assert_eq!(widened.map(|(id, _)| id), Some(reserved));
   assert!(
     !m.rearm_settled(s),
     "the in-flight reproof rides the splice, counter intact"
@@ -9664,7 +12660,7 @@ fn a_widen_splice_carries_an_inflight_recovery() {
 
   // The old root's acknowledgement lands post-splice and completes against
   // the ADOPTED node — same id, same obligation, new place in the tree.
-  m.on_watch_result(old_root, Ok(WatchAck::Aliased));
+  m.ack_watch(old_root, Ok(WatchAck::Aliased));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| {
@@ -9700,7 +12696,7 @@ fn an_exhausted_reprove_read_still_readds_every_kept_child() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("a arms");
-  m.on_watch_result(w_a, Ok(WatchAck::Installed));
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
   let a_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9712,7 +12708,7 @@ fn an_exhausted_reprove_read_still_readds_every_kept_child() {
   m.on_overflow(Scope::Root(s), at(1));
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9785,7 +12781,7 @@ fn an_exhausted_reprove_read_still_readds_every_kept_child() {
   );
   assert!(!m.coverage_settled(s));
 
-  m.on_watch_result(w_a, Ok(WatchAck::Aliased));
+  m.ack_watch(w_a, Ok(WatchAck::Aliased));
   let a_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9807,7 +12803,7 @@ fn a_deficit_heal_on_a_lossy_scope_reproves_the_anchor() {
   m.on_overflow(Scope::Root(s), at(1));
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9822,7 +12818,7 @@ fn a_deficit_heal_on_a_lossy_scope_reproves_the_anchor() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the fresh name installs");
-  m.on_watch_result(w_a, Err(WatchError::NoSpace));
+  m.ack_watch(w_a, Err(WatchError::NoSpace));
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
   assert!(m.has_coverage_deficit(s), "the refused slot is booked");
@@ -9849,7 +12845,7 @@ fn a_deficit_heal_on_a_lossy_scope_reproves_the_anchor() {
   );
   assert!(!m.rearm_settled(s));
 
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let heal_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9880,7 +12876,7 @@ fn a_dirtied_hold_pairing_reproves_the_reparented_source() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("s0 arms");
-  m.on_watch_result(w_s, Ok(WatchAck::Installed));
+  m.ack_watch(w_s, Ok(WatchAck::Installed));
   let s_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9895,7 +12891,7 @@ fn a_dirtied_hold_pairing_reproves_the_reparented_source() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("d arms");
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9917,7 +12913,7 @@ fn a_dirtied_hold_pairing_reproves_the_reparented_source() {
   m.on_overflow(Scope::Root(s), at(3));
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9955,7 +12951,7 @@ fn a_dirtied_hold_pairing_reproves_the_reparented_source() {
   );
 
   // The reproof carries into the held-over descendant.
-  m.on_watch_result(w_s, Ok(WatchAck::Aliased));
+  m.ack_watch(w_s, Ok(WatchAck::Aliased));
   let s_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -9972,7 +12968,7 @@ fn a_dirtied_hold_pairing_reproves_the_reparented_source() {
     Some(WatchTarget::child(w_s, seg("d"))),
     "the reproof reaches the descendant the loss recovery could not: {deeper:?}"
   );
-  m.on_watch_result(w_d, Ok(WatchAck::Aliased));
+  m.ack_watch(w_d, Ok(WatchAck::Aliased));
   let d_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10024,13 +13020,13 @@ fn a_hold_born_during_an_unsettled_recovery_pairs_with_the_reproof() {
         .map(|w| w.id())
     })
     .expect("p arms");
-  m.on_watch_result(w_d, Ok(WatchAck::Installed));
+  m.ack_watch(w_d, Ok(WatchAck::Installed));
   let d_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
     .expect("d's cold read");
   m.on_enumerate(d_boot, EnumerateResult::Ok(vec![]));
-  m.on_watch_result(w_p, Ok(WatchAck::Installed));
+  m.ack_watch(w_p, Ok(WatchAck::Installed));
   let p_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10045,7 +13041,7 @@ fn a_hold_born_during_an_unsettled_recovery_pairs_with_the_reproof() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("x arms");
-  m.on_watch_result(w_x, Ok(WatchAck::Installed));
+  m.ack_watch(w_x, Ok(WatchAck::Installed));
   let x_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10060,7 +13056,7 @@ fn a_hold_born_during_an_unsettled_recovery_pairs_with_the_reproof() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("g arms");
-  m.on_watch_result(w_g, Ok(WatchAck::Installed));
+  m.ack_watch(w_g, Ok(WatchAck::Installed));
   let g_boot = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10073,7 +13069,7 @@ fn a_hold_born_during_an_unsettled_recovery_pairs_with_the_reproof() {
   m.on_overflow(Scope::Root(s), at(2));
   let _ = drain_events(&mut m);
   let _ = drain_actions(&mut m);
-  m.on_watch_result(root, Ok(WatchAck::Aliased));
+  m.ack_watch(root, Ok(WatchAck::Aliased));
   let root_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10087,7 +13083,7 @@ fn a_hold_born_during_an_unsettled_recovery_pairs_with_the_reproof() {
   );
   let _ = drain_actions(&mut m);
   // d completes its reproof; p's re-add is still unacknowledged.
-  m.on_watch_result(w_d, Ok(WatchAck::Aliased));
+  m.ack_watch(w_d, Ok(WatchAck::Aliased));
   let d_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10123,7 +13119,7 @@ fn a_hold_born_during_an_unsettled_recovery_pairs_with_the_reproof() {
   // p's reproof completes without x (it moved away); the barrier must still
   // hold for x's chain — the moved subtree's bindings are exactly the ones
   // the crawl can no longer reach.
-  m.on_watch_result(w_p, Ok(WatchAck::Aliased));
+  m.ack_watch(w_p, Ok(WatchAck::Aliased));
   let p_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10138,7 +13134,7 @@ fn a_hold_born_during_an_unsettled_recovery_pairs_with_the_reproof() {
   assert!(!m.coverage_settled(s));
 
   // x acknowledges; its reproof read carries the flavor to g.
-  m.on_watch_result(w_x, Ok(WatchAck::Aliased));
+  m.ack_watch(w_x, Ok(WatchAck::Aliased));
   let x_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10155,7 +13151,7 @@ fn a_hold_born_during_an_unsettled_recovery_pairs_with_the_reproof() {
     Some(WatchTarget::child(w_x, seg("g"))),
     "the reproof reaches the held-over descendant: {deeper:?}"
   );
-  m.on_watch_result(w_g, Ok(WatchAck::Aliased));
+  m.ack_watch(w_g, Ok(WatchAck::Aliased));
   let g_read = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_enumerate().map(|e| e.req()))
@@ -10290,7 +13286,7 @@ fn reproving_storm_settles_only_over_postdating_acks() {
           if !pending_arms.is_empty() {
             let w = pending_arms.swap_remove((rng() as usize) % pending_arms.len());
             if rng() % 10 == 0 {
-              m.on_watch_result(w, Err(WatchError::NotFound));
+              m.ack_watch(w, Err(WatchError::NotFound));
             } else {
               if let Some(&issued) = last_arm_gen.get(&w) {
                 proven_gen.insert(w, issued);
@@ -10300,7 +13296,7 @@ fn reproving_storm_settles_only_over_postdating_acks() {
               } else {
                 WatchAck::Aliased
               };
-              m.on_watch_result(w, Ok(ack));
+              m.ack_watch(w, Ok(ack));
             }
           }
         }
@@ -10571,7 +13567,7 @@ fn a_latent_cold_read_advances_the_coverage_work_epoch() {
     .iter()
     .find_map(|a| a.as_watch().map(|w| w.id()))
     .expect("the discovered directory arms");
-  m.on_watch_result(d, Ok(WatchAck::Installed));
+  m.ack_watch(d, Ok(WatchAck::Installed));
   let _cold = read_of(&mut m, d);
   let _ = drain_events(&mut m);
   assert!(m.coverage_settled(s), "cold discovery holds nothing down");
@@ -10601,7 +13597,7 @@ fn an_unverified_adoption_advances_the_coverage_work_epoch() {
   let before = m.coverage_work_epoch(s);
 
   let reserved = m.reserve_watch_id();
-  m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
   assert!(
     m.adopting_by_scope.contains_key(&s),
     "the commit records the unverified edge"
@@ -10669,5 +13665,2833 @@ fn a_parked_rename_half_advances_the_coverage_work_epoch() {
     held,
     "and a release is not an acquisition"
   );
+  m.assert_invariants();
+}
+
+/// A root registered with a narrow delivery interest, brought live and past its
+/// bootstrap read — the precondition for every admission witness.
+fn live_root_idle_with(m: &mut Monitor, s: ScopeId, mask: Interest) -> WatchId {
+  let _ = drain_actions(m);
+  let root = m.register_root(s, mask);
+  let _ = drain_actions(m);
+  m.ack_watch(root, Ok(WatchAck::Installed));
+  let boot = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(Vec::new()));
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+  root
+}
+
+/// One native mask that proves a create AND an attribute change admits BOTH
+/// subscriptions. Collapsing the mask to its winning verb would deliver only to
+/// the create subscriber and leave the attrib one with nothing — no change and
+/// no covering `Rescan`.
+#[test]
+fn a_mask_proving_two_facts_admits_both_interests() {
+  let proof = Evidence::new().with_created().with_attrib();
+
+  let mut attrib_only = per_dir();
+  let root = live_root_idle_with(&mut attrib_only, scope(1), Interest::new().with_attrib());
+  attrib_only.on_os_record(
+    OsRecord::proved(root, proof)
+      .expect("a create fact names a verb")
+      .with_name(seg("f")),
+    at(1),
+  );
+  let events = drain_events(&mut attrib_only);
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert_eq!(events[0].location(), &loc(&["f"]));
+
+  let mut created_only = per_dir();
+  let root = live_root_idle_with(&mut created_only, scope(1), Interest::new().with_created());
+  created_only.on_os_record(
+    OsRecord::proved(root, proof)
+      .expect("a create fact names a verb")
+      .with_name(seg("f")),
+    at(1),
+  );
+  let events = drain_events(&mut created_only);
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert!(events[0].kind().is_created());
+
+  // The narrowing is still exact where nothing was proven: a create-only mask
+  // reaches no attrib subscriber.
+  let mut attrib_only = per_dir();
+  let root = live_root_idle_with(&mut attrib_only, scope(1), Interest::new().with_attrib());
+  attrib_only.on_os_record(
+    OsRecord::new(root, RecordKind::Created).with_name(seg("g")),
+    at(1),
+  );
+  assert!(drain_events(&mut attrib_only).is_empty());
+}
+
+/// The same admission, for the two records whose consumer kinds already
+/// coincide: an `Attrib` record must not reach a `modified`-only subscription
+/// unless it ALSO proved a content change, and vice versa.
+#[test]
+fn modified_and_attrib_records_admit_on_what_they_proved() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Attrib).with_name(seg("a")),
+    at(1),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a pure metadata record is not a content change"
+  );
+
+  m.on_os_record(
+    OsRecord::proved(root, Evidence::new().with_modified().with_attrib())
+      .expect("a content fact names a verb")
+      .with_name(seg("b")),
+    at(2),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert!(events[0].kind().is_modified());
+}
+
+/// An unpairable rename half reaches a `moved`-only subscriber. Every degrade
+/// path is covered: an immediate cookie-less source and destination, and a
+/// cookied source whose pairing window elapses.
+#[test]
+fn an_unpairable_rename_half_reaches_a_moved_only_subscriber() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_moved());
+
+  // A cookie-less source degrades to a `Removed` — admitted on the move it is.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom).with_name(seg("gone")),
+    at(1),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert_eq!(events[0].location(), &loc(&["gone"]));
+
+  // A cookie-less destination degrades to a `Created`.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo).with_name(seg("arrived")),
+    at(2),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert_eq!(events[0].location(), &loc(&["arrived"]));
+
+  // A cookied source whose window elapses strands into a `Removed`, resolved
+  // long after the record itself is gone — so the half must carry its own facts.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("stranded"))
+      .with_cookie(cookie(1)),
+    at(3),
+  );
+  assert!(drain_events(&mut m).is_empty(), "the half is still parked");
+  m.handle_timeout(at(3) + DEFAULT_MOVE_WINDOW + Duration::from_millis(1));
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert_eq!(events[0].location(), &loc(&["stranded"]));
+}
+
+/// A listing that cannot classify a real directory does not blind its subtree:
+/// the slot is booked dark and stat'd, and the answer arms the watch and
+/// descends. Reading `Unknown` as a non-directory would leave the subtree
+/// permanently unwatched, with no deficit and no `Rescan` to say so.
+#[test]
+fn an_unknown_kind_directory_is_resolved_by_its_stat() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root(&mut m, s);
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("d"), FileKind::Unknown)]),
+  );
+  let _ = drain_events(&mut m);
+
+  let req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("an unclassifiable slot is asked about");
+  assert!(
+    m.has_coverage_deficit(s),
+    "and stands as darkness until it answers"
+  );
+
+  m.on_stat_result(
+    req,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(1))),
+  );
+  let actions = drain_actions(&mut m);
+  let armed = actions
+    .iter()
+    .find_map(|a| a.as_watch())
+    .expect("the resolved directory is watched");
+  assert_eq!(armed.target(), &WatchTarget::child(root, seg("d")));
+  assert!(!m.has_coverage_deficit(s), "the darkness is discharged");
+
+  // And the watch really descends: its arm is answered by a read of the subtree.
+  let child = armed.id();
+  m.ack_watch(child, Ok(WatchAck::Installed));
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(child)),
+    "the subtree is enumerated, not blind"
+  );
+}
+
+/// A stat that settles nothing — a failure, or a kind that is `Unknown` again —
+/// leaves the deficit standing behind a covering `Rescan`, and never re-asks: an
+/// unclassifiable slot must degrade to loud darkness, not to a loop.
+#[test]
+fn an_unresolvable_stat_stands_the_deficit_and_does_not_re_ask() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root(&mut m, s);
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("d"), FileKind::Unknown)]),
+  );
+  let _ = drain_events(&mut m);
+  let req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("an unclassifiable slot is asked about");
+
+  m.on_stat_result(req, StatResult::Failed(IoClass::Permission));
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["d"])),
+    "{events:?}"
+  );
+  assert!(m.has_coverage_deficit(s), "the darkness still stands");
+  let actions = drain_actions(&mut m);
+  assert!(
+    !actions.iter().any(Action::is_stat),
+    "no re-ask: {actions:?}"
+  );
+  let _ = root;
+}
+
+/// A slot the stat cannot find is the benign race — the entry vanished between
+/// the listing and the stat — so it settles as empty rather than standing dark.
+#[test]
+fn a_vanished_unknown_slot_settles_empty() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let _ = live_root(&mut m, s);
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("d"), FileKind::Unknown)]),
+  );
+  let _ = drain_events(&mut m);
+  let req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("an unclassifiable slot is asked about");
+  assert!(m.has_coverage_deficit(s));
+
+  m.on_stat_result(req, StatResult::Failed(IoClass::NotFound));
+  assert!(!m.has_coverage_deficit(s), "a vanished slot settles empty");
+}
+
+/// A late `Err` from a SUPERSEDED arm attempt does not invalidate the current
+/// owner of that `WatchId`. Without the attempt token the outcome names only the
+/// handle, and a dead transport's synthesized failure tears down the live
+/// rebound root it never touched.
+#[test]
+fn a_superseded_arm_failure_does_not_invalidate_the_current_binding() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let _ = drain_actions(&mut m);
+  let root = m.register_root(s, Interest::all());
+  let stale = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().filter(|c| c.id() == root).map(|c| c.attempt()))
+    .expect("the root's bootstrap arm");
+  m.ack_watch(root, Ok(WatchAck::Installed));
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(boot, EnumerateResult::Ok(Vec::new()));
+  let _ = drain_events(&mut m);
+
+  // The root rebinds onto a new transport, keeping its handle.
+  let (rebound, fresh) = m.rebind_root(s).expect("a descending root rebinds");
+  assert_eq!(rebound, root);
+  assert_ne!(fresh, stale);
+  let _ = drain_events(&mut m);
+
+  // The retired transport's failure lands late, naming the arm it answered.
+  m.on_watch_result(root, stale, Err(WatchError::Gone));
+  assert!(
+    m.is_watched(root),
+    "the rebound root survives its predecessor"
+  );
+  assert_eq!(m.scope_of(root), Some(s));
+  let events = drain_events(&mut m);
+  assert!(events.is_empty(), "and nothing is signalled: {events:?}");
+
+  // The arm that actually owns the handle still completes.
+  m.on_watch_result(root, fresh, Ok(WatchAck::Installed));
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_enumerate().map(|e| e.dir()) == Some(root)),
+    "the current attempt drives the rebuild"
+  );
+}
+
+/// A re-arm read that cannot classify an ALREADY-WATCHED name must neither
+/// prune it (absence from the directory index is ignorance, not a vanish) nor
+/// book darkness over it (the incumbent watch is live coverage). It stats, and
+/// a confirming answer leaves the subtree exactly as it was.
+#[test]
+fn an_unclassifiable_name_over_a_live_watch_keeps_it_and_books_nothing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root(&mut m, s);
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("d"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  let child = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|c| c.id()))
+    .expect("the directory is armed");
+  m.ack_watch(child, Ok(WatchAck::Installed));
+  let cold = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the armed child cold-enumerates");
+  m.on_enumerate(cold, EnumerateResult::Ok(Vec::new()));
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  // A re-arm whose listing cannot name the watched directory.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let req = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the re-arm reads the root");
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("d"), FileKind::Unknown)]),
+  );
+
+  assert!(m.is_watched(child), "the incumbent watch is not pruned");
+  assert!(
+    !m.has_coverage_deficit(s),
+    "and a covered slot is not booked dark"
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable name is still asked about");
+
+  // Confirming it changes nothing: same identity, same watch, no rebuild.
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(1))),
+  );
+  assert!(m.is_watched(child));
+  assert!(!m.has_coverage_deficit(s));
+  m.assert_invariants();
+}
+
+// ---------------------------------------------------------------------------
+// The retirement flavor a crawl DEFERS: a name whose listed kind is unknown.
+// The crawl may neither prune such a name (ignorance is not a vanish) nor
+// decide it, so it skips the entry — which leaves BOTH halves of what it owes
+// the incumbent riding on the slot's stat: the survivor's downward descent, and
+// the cover a retirement of proven-live coverage owes. These cells pin each
+// answer's half.
+// ---------------------------------------------------------------------------
+
+/// Builds the deferral every cell below turns on: a settled `root/p/g` under a
+/// `Modified`-only subscription, then a PURE grow (no overflow, no loss, no
+/// incomplete read — nothing has stood a `Rescan`, so the window opens clean)
+/// whose COMPLETE listing cannot classify `p`. Returns the outstanding stat.
+fn deferred_unknown_slot(m: &mut Monitor, s: ScopeId) -> (WatchId, WatchId, WatchId, ReqId) {
+  let root = live_root_idle_with(m, s, Interest::new().with_modified());
+  let p = live_child_dir_ident(m, root, "p", ident(7));
+  let g = live_child_dir_ident(m, p, "g", ident(8));
+  assert!(m.coverage_settled(s), "the grow starts from quiescence");
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("p"), FileKind::Unknown)]),
+  );
+
+  assert!(m.is_watched(p), "the unclassifiable name keeps its watch");
+  assert!(
+    !m.has_coverage_deficit(s),
+    "and a covered slot is not booked dark"
+  );
+  assert!(
+    drain_events(m).is_empty(),
+    "the crawl retires nothing here, so it covers nothing"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "and the deferral leaves NOTHING counted — what the answer does to `p` is \
+     all that stands between the retirement and a clean verdict"
+  );
+  let stat = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_stat()
+        .filter(|c| c.of() == &StatTarget::child(root, seg("p")))
+        .map(|c| c.req())
+    })
+    .expect("the unclassifiable name is asked about");
+  (root, p, g, stat)
+}
+
+/// The descent a confirmed survivor is owed (fail-on-old). The crawl skipped
+/// `p` before either re-arm branch could run, so the recursive re-arm it owed
+/// that subtree exists only if the stat's confirmation performs it. On old the
+/// confirmation reused the incumbent and returned: no read of `p` was ever
+/// issued, the scope read settled, and a directory created under `p` while the
+/// slot was deferred stayed unwatched with nothing booked to say so.
+#[test]
+fn a_confirmed_survivor_receives_the_descent_the_crawl_deferred() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, p, g, stat) = deferred_unknown_slot(&mut m, s);
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+  assert!(m.is_watched(p), "the confirmed survivor keeps its watch");
+  assert!(
+    !m.rearm_settled(s),
+    "and the deferred descent is counted work the barrier must now wait on"
+  );
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p).map(|e| e.req()))
+    .expect("the survivor is re-armed downward");
+
+  // The descent reaches the subtree: the directory created under `p` while the
+  // slot was deferred is armed off this very read.
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("g"), FileKind::Dir).with_node(ident(8)),
+      DirEntry::new(seg("n"), FileKind::Dir),
+    ]),
+  );
+  let actions = drain_actions(&mut m);
+  let n = actions
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("a directory created during the deferral is armed");
+  let g_read = actions
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == g).map(|e| e.req()))
+    .expect("and the confirmed grandchild re-arms downward too");
+  m.on_enumerate(g_read, EnumerateResult::Ok(vec![]));
+  assert!(m.is_watched(g), "the grandchild keeps its watch");
+
+  // The record the backend had queued on that descendant still delivers: this
+  // answer ended no coverage, so nothing was orphaned and nothing is covered.
+  m.on_os_record(
+    OsRecord::new(g, RecordKind::Modified).with_name(seg("f")),
+    at(4),
+  );
+  let delivered = drain_events(&mut m);
+  assert_eq!(delivered.len(), 1, "{delivered:?}");
+  assert!(delivered[0].kind().is_modified());
+  assert_eq!(delivered[0].location(), &loc(&["p", "g", "f"]));
+
+  m.ack_watch(n, Ok(WatchAck::Installed));
+  let n_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == n).map(|e| e.req()))
+    .expect("the fresh directory reads");
+  m.on_enumerate(n_read, EnumerateResult::Ok(vec![]));
+  assert!(m.coverage_settled(s), "and the descent quiesces");
+  m.assert_invariants();
+}
+
+/// A replacement answer (fail-on-old): the name holds a DIFFERENT directory, so
+/// the incumbent's subtree is retired and its slot rebuilt. The retirement ends
+/// coverage of an object that was there — every `WatchId` under `p` dies while
+/// records naming them may already sit queued — so it owes the opening cover,
+/// and the rebuild is made COUNTED so no barrier settles before the
+/// acknowledgement chain closes the window. On old the replace ran through
+/// `reconcile_slot` alone: the drop erased no deficit so it stood no bridge
+/// bits, the fresh watch was born uncounted, and the whole retirement was
+/// silent.
+#[test]
+fn a_stat_replacement_covers_and_counts_the_slot_it_rebuilds() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, p, g, stat) = deferred_unknown_slot(&mut m, s);
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(9))),
+  );
+  assert!(!m.is_watched(p), "the replaced incumbent is retired");
+  assert!(!m.is_watched(g), "and so is its descendant");
+  assert!(
+    !m.coverage_settled(s),
+    "the rebuild is counted, so no barrier settles over the retirement"
+  );
+  let cover = drain_events(&mut m);
+  assert_eq!(
+    cover.len(),
+    1,
+    "the retirement stands its opening cover: {cover:?}"
+  );
+  assert!(cover[0].kind().is_rescan());
+  assert_eq!(
+    cover[0].location(),
+    &loc(&["p"]),
+    "located off the surviving parent"
+  );
+
+  // The record the backend had already queued on the retired descendant now
+  // arrives and is discarded — the darkness the cover exists for.
+  m.on_os_record(
+    OsRecord::new(g, RecordKind::Modified).with_name(seg("f")),
+    at(4),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the orphaned record delivers nothing of its own"
+  );
+
+  let fresh = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the successor arms");
+  assert_ne!(fresh, p, "a rebuilt slot is a new watch");
+  m.ack_watch(fresh, Ok(WatchAck::Installed));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == fresh)
+        .map(|e| e.req())
+    })
+    .expect("the successor reads");
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+  assert!(m.coverage_settled(s));
+  let closing = drain_events(&mut m);
+  assert!(
+    closing
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "and the counted rebuild closes the window it opened: {closing:?}"
+  );
+  m.assert_invariants();
+}
+
+/// A `File` answer (fail-on-old): the name is a proven non-directory, so the
+/// incumbent is retired and NOTHING rebuilds its slot. There is no counted
+/// successor to close a window, which makes the cover unconditional rather than
+/// deferrable — and the barrier reads settled the instant the answer returns,
+/// so the cover must already be on the wire at that same instant. On old this
+/// path emitted nothing at all: `drop_subtree` covers only what it ERASED, and
+/// a clean subtree erases nothing.
+#[test]
+fn a_stat_that_reports_a_file_covers_the_watch_it_retires() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, p, g, stat) = deferred_unknown_slot(&mut m, s);
+
+  m.on_stat_result(stat, StatResult::Ok(StatEntry::new(FileKind::File)));
+  assert!(
+    !m.is_watched(p),
+    "a proven non-directory retires the incumbent"
+  );
+  assert!(!m.is_watched(g), "and so is its descendant");
+  assert!(
+    drain_actions(&mut m).iter().all(|a| a.as_watch().is_none()),
+    "and nothing re-installs over a proven non-directory"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "an unrebuilt retirement leaves nothing counted to wait on"
+  );
+  let cover = drain_events(&mut m);
+  assert_eq!(
+    cover.len(),
+    1,
+    "so the cover must already be on the wire: {cover:?}"
+  );
+  assert!(cover[0].kind().is_rescan());
+  assert_eq!(
+    cover[0].location(),
+    &loc(&["p"]),
+    "located off the surviving parent"
+  );
+
+  m.on_os_record(
+    OsRecord::new(g, RecordKind::Modified).with_name(seg("f")),
+    at(4),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the orphaned record delivers nothing of its own"
+  );
+  m.assert_invariants();
+}
+
+/// A `NotFound` answer (fail-on-old): the benign race — the entry was gone
+/// before the stat ran. The slot settles empty, and the retirement is still a
+/// retirement: the object existed when the listing named it, records describing
+/// it may already be queued against the `WatchId`s this drop invalidates, and
+/// the vanish's own `Removed` is interest-subject (and may itself be one of the
+/// orphaned records). No successor exists, so the cover is unconditional. On
+/// old the vanish settled the slot in silence.
+#[test]
+fn a_vanished_stat_slot_covers_the_watch_it_retires() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, p, g, stat) = deferred_unknown_slot(&mut m, s);
+
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  assert!(!m.is_watched(p), "the vanished slot retires the incumbent");
+  assert!(!m.is_watched(g), "and so is its descendant");
+  assert!(
+    !m.has_coverage_deficit(s),
+    "a vanished slot settles empty rather than dark"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "an unrebuilt retirement leaves nothing counted to wait on"
+  );
+  let cover = drain_events(&mut m);
+  assert_eq!(
+    cover.len(),
+    1,
+    "so the cover must already be on the wire: {cover:?}"
+  );
+  assert!(cover[0].kind().is_rescan());
+  assert_eq!(
+    cover[0].location(),
+    &loc(&["p"]),
+    "located off the surviving parent"
+  );
+
+  m.on_os_record(
+    OsRecord::new(g, RecordKind::Modified).with_name(seg("f")),
+    at(4),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the orphaned record delivers nothing of its own"
+  );
+  m.assert_invariants();
+}
+
+/// The obligation is carried in the REQUEST, and a coalesced ask upgrades it.
+/// One stat serves every read that re-encounters the name, so the answer must
+/// honor the strongest deferral any of them made: a plain grow queues the stat,
+/// a later loss recovery re-encounters the same unclassifiable name under a
+/// REPROVE crawl, and the survivor must then be RE-ADDED — an identity match
+/// proves only that the name still holds the object, never that our watch is
+/// still its live binding. Fails on old (no descent at all is performed); fails
+/// too if the obligation is written once and kept rather than raised.
+#[test]
+fn a_deferred_descent_upgrades_to_the_strongest_deferral() {
+  let mut m = reproving();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let p = live_child_dir_ident(&mut m, root, "p", ident(7));
+
+  // A plain grow defers first: the stat is queued owing a bare re-arm.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let grow = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    grow,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("p"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable name is asked about");
+
+  // Then a loss recovery re-reads the same listing under a reproof. Its crawl
+  // skips the name exactly as the first one did — and coalesces onto the stat
+  // already outstanding, which must inherit the stronger obligation.
+  m.on_overflow(Scope::Root(s), at(2));
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+  m.ack_watch(root, Ok(WatchAck::Aliased));
+  let recovery = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the acknowledged root re-arm-reads");
+  m.on_enumerate(
+    recovery,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("p"), FileKind::Unknown)]),
+  );
+  assert!(
+    drain_actions(&mut m).iter().all(|a| !a.is_stat()),
+    "one slot, one outstanding stat"
+  );
+  assert!(
+    m.rearm_settled(s),
+    "and the deferral itself leaves nothing counted"
+  );
+
+  // The answer confirms the same object — and the reproof, not the plain
+  // re-arm, is what it owes: a re-add, not a bare read.
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+  assert!(m.is_watched(p), "the confirmed survivor keeps its watch");
+  let actions = drain_actions(&mut m);
+  assert_eq!(
+    readd_of(&actions, p),
+    Some(WatchTarget::child(root, seg("p"))),
+    "the survivor's binding is re-proven, not merely re-read: {actions:?}"
+  );
+  assert!(
+    !actions.iter().any(|a| a.is_enumerate()),
+    "no read runs before the binding acknowledges: {actions:?}"
+  );
+  assert!(!m.rearm_settled(s), "the re-add is a counted obligation");
+  m.assert_invariants();
+}
+
+/// The settlement is fenced to its own scope: a retirement in scope 1 puts
+/// nothing on scope 2's wire, acquires no work scope 2's barrier must wait on,
+/// and books no darkness there. The cover is located off the retired slot's own
+/// parent, which belongs to exactly one disjoint root.
+#[test]
+fn a_stat_retirement_is_fenced_to_its_own_scope() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, _p, _g, stat) = deferred_unknown_slot(&mut m, s);
+  let other = live_root_idle_with(&mut m, scope(2), Interest::new().with_modified());
+  let q = live_child_dir_ident(&mut m, other, "q", ident(3));
+  let epoch = m.coverage_work_epoch(scope(2));
+
+  m.on_stat_result(stat, StatResult::Ok(StatEntry::new(FileKind::File)));
+
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().all(|e| e.scope() == s),
+    "the cover belongs to the retiring scope alone: {events:?}"
+  );
+  assert!(m.is_watched(q), "the other scope keeps its coverage");
+  assert!(
+    m.coverage_settled(scope(2)),
+    "and its barrier is untouched by scope 1's retirement"
+  );
+  assert_eq!(
+    m.coverage_work_epoch(scope(2)),
+    epoch,
+    "no coverage work was acquired for it"
+  );
+  assert!(!m.has_coverage_deficit(scope(2)));
+  m.assert_invariants();
+}
+
+/// The cover condition's SHAPE, pinned. Written as a list of the retirement
+/// flavors that owe a cover, an entry kind nobody enumerated sets no flag and
+/// defaults to SILENCE — which is precisely how each successive flavor escaped.
+/// It is written the other way round: every retirement owes the cover, and only
+/// one whose counted successor the crawl PROVES may defer to the window's
+/// closing `Rescan`. Here a name is retired under a kind the crawl names
+/// nowhere (neither the directory index nor any branch mentions it) inside an
+/// already-lossy window — the one place a default-silent gate would suppress
+/// the cover outright.
+#[test]
+fn a_retirement_under_an_unenumerated_kind_still_covers() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle_with(&mut m, s, Interest::new().with_modified());
+  let p = live_child_dir(&mut m, root, "p");
+  let g = live_child_dir(&mut m, p, "g");
+
+  // The overflow stands the window's opening loss and kicks the crawl, so the
+  // window is ALREADY lossy when the retirement lands.
+  m.on_overflow(Scope::Root(s), at(2));
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "the overflow marks the window lossy"
+  );
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the recovery re-arm-enumerates the root");
+
+  // The name is still listed — as neither a directory, nor a file, nor an
+  // unclassifiable kind. Nothing rebuilds it, so nothing counted will ever
+  // close this window on its behalf.
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("p"), FileKind::Other)]),
+  );
+  assert!(!m.is_watched(p), "the retirement happens whatever the kind");
+  assert!(!m.is_watched(g), "and so does its descendant's");
+  assert!(
+    drain_actions(&mut m).iter().all(|a| a.as_watch().is_none()),
+    "and nothing re-installs"
+  );
+  let cover = drain_events(&mut m);
+  assert_eq!(
+    cover.len(),
+    1,
+    "an unenumerated kind defaults to covering, never to silence: {cover:?}"
+  );
+  assert!(cover[0].kind().is_rescan());
+  assert_eq!(
+    cover[0].location(),
+    &Location::new(),
+    "located at the crawled directory"
+  );
+
+  m.on_os_record(
+    OsRecord::new(g, RecordKind::Modified).with_name(seg("f")),
+    at(4),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the orphaned record delivers nothing of its own"
+  );
+  m.assert_invariants();
+}
+
+// ---------------------------------------------------------------------------
+// WHO the deferred descent belongs to. A stat is addressed to a SLOT — a
+// `(parent, name)` coordinate — and a rename invalidates that coordinate while
+// the object it named lives on: the source leaves the slot with its subtree
+// intact, so the answer finds no incumbent and settles the obligation against
+// nothing. The obligation belongs to the WATCH, which a reparent preserves, not
+// to the slot, which a reparent empties. These cells pin that it survives the
+// rename in either completion order and in either flavor, and that a hold which
+// never pairs covers rather than forgets.
+// ---------------------------------------------------------------------------
+
+/// A reproof deferral primed to be raced by a rename: a settled `root/p/g` on a
+/// lossy-watch-teardown profile with a scope loss on record, whose recovery
+/// crawl could not classify `p` — so `p` keeps its (unproven) binding, the
+/// reproof it is owed rides on the slot's outstanding stat, and the scope is
+/// quiescent again.
+fn deferred_reprove_of_a_survivor(
+  m: &mut Monitor,
+  s: ScopeId,
+) -> (WatchId, WatchId, WatchId, ReqId) {
+  let root = live_root_idle(m, s);
+  let p = live_child_dir_ident(m, root, "p", ident(7));
+  let g = live_child_dir_ident(m, p, "g", ident(8));
+
+  m.on_overflow(Scope::Root(s), at(1));
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+  m.ack_watch(root, Ok(WatchAck::Aliased));
+  let recovery = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the acknowledged root re-arm-reads");
+  m.on_enumerate(
+    recovery,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("p"), FileKind::Unknown)]),
+  );
+
+  let stat = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_stat()
+        .filter(|c| c.of() == &StatTarget::child(root, seg("p")))
+        .map(|c| c.req())
+    })
+    .expect("the unclassifiable name is asked about");
+  let _ = drain_events(m);
+  assert!(m.is_watched(p), "the unclassifiable name keeps its watch");
+  assert!(
+    readd_of(&drain_actions(m), p).is_none(),
+    "and the crawl skipped it, so its binding is still unproven"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "the deferral itself leaves NOTHING counted — which is exactly why the \
+     rename below is not born dirty"
+  );
+  (root, p, g, stat)
+}
+
+/// The rename that empties the slot the stat is addressed to, with the answer
+/// landing FIRST (fail-on-old). The source leaves `(root, p)` while its stat is
+/// still outstanding, so the `NotFound` reply finds no incumbent and — keyed to
+/// the coordinate — settles the deferred reproof against nothing. The pairing
+/// destination then carries the subtree over in O(1) with the hold undirtied,
+/// so on old NOTHING re-added it: a kernel-dead binding reached `Live` under a
+/// scope whose every barrier read settled.
+#[test]
+fn a_deferred_reprove_follows_the_source_out_of_the_slot_it_was_keyed_to() {
+  let mut m = reproving();
+  let s = scope(1);
+  let (root, p, g, stat) = deferred_reprove_of_a_survivor(&mut m, s);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("p"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  assert!(m.is_watched(p), "the source is detached, not torn down");
+
+  // The answer for a slot the source has left: it decides the empty slot, and
+  // the obligation it carried is not the empty slot's to settle.
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  assert!(
+    m.is_watched(p),
+    "the held subtree is untouched by the answer"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("q"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  let actions = drain_actions(&mut m);
+  assert_eq!(
+    readd_of(&actions, p),
+    Some(WatchTarget::child(root, seg("q"))),
+    "the reparented source's binding is re-proven at its NEW slot: {actions:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the barrier holds until that re-add completes"
+  );
+
+  // The reproof descends through the carried subtree exactly as it would have
+  // from the slot: the acknowledged re-add reads, and the retained grandchild
+  // is re-added rather than merely re-listed.
+  m.ack_watch(p, Ok(WatchAck::Aliased));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p).map(|e| e.req()))
+    .expect("the re-proven source reads");
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("g"), FileKind::Dir).with_node(ident(8)),
+    ]),
+  );
+  let actions = drain_actions(&mut m);
+  assert_eq!(
+    readd_of(&actions, g),
+    Some(WatchTarget::child(p, seg("g"))),
+    "the retained grandchild's binding is re-proven too: {actions:?}"
+  );
+  assert!(!m.coverage_settled(s), "the chain is still counted");
+
+  m.ack_watch(g, Ok(WatchAck::Aliased));
+  let g_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == g).map(|e| e.req()))
+    .expect("the re-proven grandchild reads");
+  m.on_enumerate(g_read, EnumerateResult::Ok(vec![]));
+  assert!(
+    m.coverage_settled(s),
+    "and only a completed proof chain settles the barrier"
+  );
+  m.assert_invariants();
+}
+
+/// The same race with the PAIR completing first (fail-on-old). Here the
+/// reparent has already happened when the answer lands, so no site downstream of
+/// it could still consult the stat: the obligation must already be riding on the
+/// identity the reparent carried, or it is gone. Pins that the fix is not a
+/// special case of one interleaving.
+#[test]
+fn a_deferred_reprove_survives_a_rename_that_completes_before_the_answer() {
+  let mut m = reproving();
+  let s = scope(1);
+  let (root, p, _g, stat) = deferred_reprove_of_a_survivor(&mut m, s);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("p"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("q"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  let actions = drain_actions(&mut m);
+  assert_eq!(
+    readd_of(&actions, p),
+    Some(WatchTarget::child(root, seg("q"))),
+    "the reparent discharges the obligation the moved watch carried: {actions:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the barrier holds until that re-add completes"
+  );
+
+  // The late answer decides only the vacated slot. It must not re-arm, re-add
+  // or otherwise speak for the subtree that left it.
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  let late = drain_actions(&mut m);
+  assert!(
+    readd_of(&late, p).is_none(),
+    "the vacated slot's answer owes the departed subtree nothing: {late:?}"
+  );
+  assert!(m.is_watched(p), "and retires nothing it does not hold");
+  m.assert_invariants();
+}
+
+/// The plain re-arm flavor. A pure grow on a profile that re-proves nothing
+/// defers a bare downward re-arm, and it is owed to the survivor just as much:
+/// without it a directory created under the moved subtree during the deferral
+/// stays unwatched with nothing booked to say so. On old the rename dropped it
+/// exactly as it dropped the reproof.
+#[test]
+fn a_deferred_rearm_follows_the_source_a_rename_moved_out_of_its_slot() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let p = live_child_dir_ident(&mut m, root, "p", ident(7));
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let grow = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    grow,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("p"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable name is asked about");
+  assert!(m.coverage_settled(s), "the deferral leaves nothing counted");
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("p"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("q"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(3),
+  );
+
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == p).map(|e| e.req()))
+    .expect("the reparented source is re-armed downward");
+  assert!(
+    !m.rearm_settled(s),
+    "and that descent is counted work the barrier must wait on"
+  );
+
+  // The descent reaches the subtree: a directory created under the source while
+  // the slot was deferred is armed off this very read.
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("n"), FileKind::Dir)]),
+  );
+  let n = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("a directory created during the deferral is armed");
+  m.ack_watch(n, Ok(WatchAck::Installed));
+  let n_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == n).map(|e| e.req()))
+    .expect("the fresh directory reads");
+  m.on_enumerate(n_read, EnumerateResult::Ok(vec![]));
+  assert!(m.coverage_settled(s), "and the descent quiesces");
+  m.assert_invariants();
+}
+
+/// The hold that never pairs, so the obligation has nowhere to go (fail-on-old).
+/// The timeout tears the held subtree down, which discharges the descent by
+/// destroying what owed it — but the only signal it stands on its own is the
+/// stranded source's `Removed`, which is interest- and filter-subject, and the
+/// scope reads settled the instant the half leaves the store. An obligation that
+/// cannot be transferred resolves toward a COUNTED cover, never toward silence.
+#[test]
+fn a_deferred_descent_a_hold_cannot_carry_stands_a_counted_cover() {
+  let mut m = reproving();
+  let s = scope(1);
+  let (root, p, _g, stat) = deferred_reprove_of_a_survivor(&mut m, s);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("p"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+  let _ = drain_events(&mut m);
+
+  m.handle_timeout(at(2) + DEFAULT_MOVE_WINDOW);
+  assert!(!m.is_watched(p), "the unpaired hold tears its subtree down");
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "the undischarged obligation stands its cover: {events:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and it is COUNTED — a bare edge `Rescan` the next poll certifies over \
+     would leave the window nothing to wait on"
+  );
+
+  let recover = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the counted cover re-crawls the root");
+  m.on_enumerate(recover, EnumerateResult::Ok(vec![]));
+  assert!(m.coverage_settled(s), "and the recovery settles it");
+  m.assert_invariants();
+}
+
+/// Creates and arms a watched child directory under `parent`, returning its watch.
+fn armed_child_dir(m: &mut Monitor, parent: WatchId, name: &str, when: Instant) -> WatchId {
+  m.on_os_record(
+    OsRecord::new(parent, RecordKind::Created)
+      .with_name(seg(name))
+      .with_is_dir(true),
+    when,
+  );
+  let w = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|c| c.id()))
+    .expect("the created directory is armed");
+  m.ack_watch(w, Ok(WatchAck::Installed));
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+  w
+}
+
+/// The reported slot names where the subtree WAS: the capture happens before the
+/// re-key, so it is still the key a consumer's own path-anchored bookkeeping holds
+/// when the report reaches it.
+#[test]
+fn record_outcome_reports_a_landed_directory_reparent() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_d = armed_child_dir(&mut m, root, "d", at(1));
+
+  let parked = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert_eq!(
+    parked,
+    RecordOutcome::Nothing,
+    "parking a half moves no subtree"
+  );
+
+  let outcome = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+
+  assert_eq!(
+    outcome,
+    RecordOutcome::Reparented {
+      from_parent: root,
+      from: loc(&["d"]),
+    },
+    "the destination reports the pre-reparent slot"
+  );
+  assert!(!outcome.is_nothing());
+  assert_eq!(outcome.reparented(), Some((root, &loc(&["d"]))));
+  // The report is of a reparent that genuinely happened: the same watch covers the
+  // destination, and it reconstructs the NEW path.
+  assert!(m.is_watched(w_d), "the subtree was carried, not rebuilt");
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created).with_name(seg("f")),
+    at(12),
+  );
+  assert!(
+    drain_events(&mut m)
+      .iter()
+      .any(|e| e.location() == &loc(&["e", "f"]))
+  );
+  m.assert_invariants();
+}
+
+/// The slot is a `(from_parent, from)` pair reconstructed at report time, not a path
+/// pinned when the source half was parked: a half whose own anchor was reparented
+/// mid-window reports where the source ACTUALLY was. This is the skew a mirror kept
+/// beside the Monitor cannot avoid and a reported outcome cannot have.
+#[test]
+fn record_outcome_reparent_slot_follows_a_reparented_anchor() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_d = armed_child_dir(&mut m, root, "d", at(1));
+  let w_g = armed_child_dir(&mut m, w_d, "g", at(2));
+
+  // An inner half parks under w_d, anchored at d/g.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::MovedFrom)
+      .with_name(seg("g"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(10),
+  );
+  // Its anchor is then itself renamed d → e, carried by the tree.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+  let outer = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert_eq!(
+    outer,
+    RecordOutcome::Reparented {
+      from_parent: root,
+      from: loc(&["d"]),
+    }
+  );
+  let _ = drain_events(&mut m);
+
+  // The inner half now pairs. Its source is e/g — reconstructed through the anchor
+  // that moved — never the stale d/g the parking record described.
+  let inner = m.on_os_record(
+    OsRecord::new(w_d, RecordKind::MovedTo)
+      .with_name(seg("g2"))
+      .with_cookie(cookie(2))
+      .with_is_dir(true),
+    at(13),
+  );
+  assert_eq!(
+    inner,
+    RecordOutcome::Reparented {
+      from_parent: w_d,
+      from: loc(&["e", "g"]),
+    },
+    "the reported source follows the anchor's own reparent"
+  );
+  assert!(m.is_watched(w_g));
+  // And the delivered change agrees with the report.
+  assert!(drain_events(&mut m).iter().any(
+    |e| e.kind().moved_from() == Some(&loc(&["e", "g"])) && e.location() == &loc(&["e", "g2"])
+  ));
+  m.assert_invariants();
+}
+
+/// Past its pairing window the half strands and the arrival is a fresh object: no
+/// subtree is carried anywhere, so nothing is reported.
+#[test]
+fn record_outcome_is_nothing_past_the_pairing_window() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_d = armed_child_dir(&mut m, root, "d", at(1));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  // Exactly at the deadline the half is already expired (the window is half-open).
+  let outcome = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10) + DEFAULT_MOVE_WINDOW,
+  );
+
+  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(!m.is_watched(w_d), "the stranded source was torn down");
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_moved()),
+    "a late destination is a Created, not a Moved"
+  );
+  m.assert_invariants();
+}
+
+/// A paired, in-window rename of a NON-directory emits a `Moved` and reparents
+/// nothing. The delivered change and the reported outcome are different questions,
+/// and only the second one answers "did a watched subtree change parents".
+#[test]
+fn record_outcome_is_nothing_for_an_unheld_file_source() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("old"))
+      .with_cookie(cookie(7)),
+    at(10),
+  );
+  let outcome = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("new"))
+      .with_cookie(cookie(7)),
+    at(11),
+  );
+
+  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(outcome.is_nothing() && outcome.reparented().is_none());
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_moved()),
+    "the rename is still delivered"
+  );
+  m.assert_invariants();
+}
+
+/// A directory whose watch was REFUSED holds no subtree to carry: the pair still
+/// delivers a `Moved` and arms fresh coverage at the destination, but the Monitor
+/// reparented nothing and says so.
+#[test]
+fn record_outcome_is_nothing_for_an_unarmed_directory_source() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_d = drain_actions(&mut m)[0].as_watch().unwrap().id();
+  m.ack_watch(w_d, Err(WatchError::Gone));
+  assert!(!m.is_watched(w_d), "the arm was refused");
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  let outcome = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+
+  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("e")))),
+    "the destination is armed fresh, not carried"
+  );
+  m.assert_invariants();
+}
+
+/// A cookieless move half can never pair, so neither half can reparent anything.
+#[test]
+fn record_outcome_is_nothing_for_a_cookieless_move() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_d = armed_child_dir(&mut m, root, "d", at(1));
+
+  let from = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_is_dir(true),
+    at(10),
+  );
+  assert_eq!(from, RecordOutcome::Nothing);
+  assert!(
+    !m.is_watched(w_d),
+    "an unpairable source is torn down at once"
+  );
+
+  let to = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_is_dir(true),
+    at(11),
+  );
+  assert_eq!(to, RecordOutcome::Nothing);
+  m.assert_invariants();
+}
+
+/// A half displaced off its key by a same-cookie successor is resolved, not parked:
+/// its own destination arrives to find nothing to pair with, reparents nothing, and
+/// reports nothing — while the successor that DID pair reports its own slot.
+#[test]
+fn record_outcome_is_nothing_for_a_displaced_pending_half() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_d1 = armed_child_dir(&mut m, root, "d1", at(1));
+  let _w_d2 = armed_child_dir(&mut m, root, "d2", at(2));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d1"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(10),
+  );
+  // A second source on the SAME (scope, cookie) displaces the first, which resolves.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d2"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(11),
+  );
+  assert!(!m.is_watched(w_d1), "the displaced half resolved");
+  let _ = drain_events(&mut m);
+
+  let paired = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  assert_eq!(
+    paired,
+    RecordOutcome::Reparented {
+      from_parent: root,
+      from: loc(&["d2"]),
+    },
+    "the surviving half reports its own slot, never the displaced one's"
+  );
+
+  // The displaced half's own destination: the key is empty, so this is a fresh
+  // arrival that carries no subtree.
+  let orphan = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("f"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(13),
+  );
+  assert_eq!(orphan, RecordOutcome::Nothing);
+  m.assert_invariants();
+}
+
+/// A half whose `from_parent` was torn down mid-window has no source path left to
+/// report: the pair degrades to a `Created` and the outcome to `Nothing`, so a
+/// consumer never re-anchors off a path that no longer names anything.
+#[test]
+fn record_outcome_is_nothing_when_the_source_parent_died() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_p = armed_child_dir(&mut m, root, "p", at(1));
+  let w_d = armed_child_dir(&mut m, w_p, "d", at(2));
+
+  m.on_os_record(
+    OsRecord::new(w_p, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(8))
+      .with_is_dir(true),
+    at(10),
+  );
+  // The anchor is torn down before the destination arrives; the held source goes
+  // with it through the parent link.
+  m.on_os_record(OsRecord::new(w_p, RecordKind::Ignored), at(11));
+  assert!(!m.is_watched(w_d));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  let outcome = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("g"))
+      .with_cookie(cookie(8))
+      .with_is_dir(true),
+    at(12),
+  );
+
+  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(
+    drain_events(&mut m).iter().all(|e| !e.kind().is_moved()),
+    "a rename off a dead anchor is a Created"
+  );
+  m.assert_invariants();
+}
+
+/// A destination inside the source's own subtree is a cycle: `can_reparent` refuses,
+/// the held subtree is torn down, and the record reports `Nothing` — the Monitor
+/// intended a reparent and performed none.
+#[test]
+fn record_outcome_is_nothing_when_a_cyclic_reparent_is_rejected() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_d = armed_child_dir(&mut m, root, "d", at(1));
+  let w_sub = armed_child_dir(&mut m, w_d, "sub", at(2));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(9))
+      .with_is_dir(true),
+    at(10),
+  );
+  let outcome = m.on_os_record(
+    OsRecord::new(w_sub, RecordKind::MovedTo)
+      .with_name(seg("d"))
+      .with_cookie(cookie(9))
+      .with_is_dir(true),
+    at(11),
+  );
+
+  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(!m.is_watched(w_d) && !m.is_watched(w_sub));
+  m.assert_invariants();
+}
+
+/// The sliver a read-only accessor cannot see. Every conjunct of the reparenting
+/// precondition holds — the half is paired, in-window, held, and its `from_parent`
+/// is still watched — and `can_reparent` agrees; the re-key still ABORTS, because
+/// dropping the stale object at the destination (the source's own parent) takes the
+/// held source with it. A consumer that re-anchored on the precondition alone would
+/// move its bookkeeping to a destination the Monitor covers with a FRESH watch. The
+/// outcome is `Nothing`, so it does not.
+#[test]
+fn record_outcome_is_nothing_when_the_reparent_aborts_on_a_dead_endpoint() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_a = armed_child_dir(&mut m, root, "a", at(1));
+  let w_d = armed_child_dir(&mut m, w_a, "d", at(2));
+
+  // a/d moves onto "a" itself: the destination parent (root) survives, so the
+  // precondition is fully satisfied when it is evaluated.
+  m.on_os_record(
+    OsRecord::new(w_a, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(3))
+      .with_is_dir(true),
+    at(10),
+  );
+  let outcome = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("a"))
+      .with_cookie(cookie(3))
+      .with_is_dir(true),
+    at(11),
+  );
+
+  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(!m.is_watched(w_a), "the replaced ancestor is dropped");
+  assert!(!m.is_watched(w_d), "and the held source went with it");
+  assert!(
+    drain_actions(&mut m)
+      .iter()
+      .any(|a| { a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("a"))) }),
+    "root/a is covered by a FRESH watch, not the carried one"
+  );
+  m.assert_invariants();
+}
+
+/// Only a `MovedTo` can carry a subtree between parents, so it is the only kind with
+/// an outcome to report; everything else is `Nothing` by construction.
+#[test]
+fn record_outcome_is_nothing_for_every_non_moved_to_record() {
+  let mut m = per_dir();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  let w_c1 = armed_child_dir(&mut m, root, "c1", at(1));
+  let w_c2 = armed_child_dir(&mut m, root, "c2", at(2));
+  let w_c3 = armed_child_dir(&mut m, root, "c3", at(3));
+
+  for kind in [
+    RecordKind::Created,
+    RecordKind::Modified,
+    RecordKind::Attrib,
+    RecordKind::Removed,
+  ] {
+    assert_eq!(
+      m.on_os_record(OsRecord::new(root, kind).with_name(seg("f")), at(10)),
+      RecordOutcome::Nothing,
+      "{kind:?} reparents nothing"
+    );
+  }
+  assert_eq!(
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::MovedFrom)
+        .with_name(seg("c1"))
+        .with_cookie(cookie(4))
+        .with_is_dir(true),
+      at(11),
+    ),
+    RecordOutcome::Nothing,
+    "parking a source half reparents nothing"
+  );
+  for (watch, kind) in [
+    (w_c1, RecordKind::MoveSelf),
+    (w_c2, RecordKind::DeleteSelf),
+    (w_c3, RecordKind::Ignored),
+  ] {
+    assert_eq!(
+      m.on_os_record(OsRecord::new(watch, kind), at(12)),
+      RecordOutcome::Nothing,
+      "{kind:?} reparents nothing"
+    );
+  }
+  // An unpaired destination (a cookie with no parked half) is a fresh Created too.
+  assert_eq!(
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::MovedTo)
+        .with_name(seg("z"))
+        .with_cookie(cookie(99))
+        .with_is_dir(true),
+      at(13),
+    ),
+    RecordOutcome::Nothing,
+    "an unpaired destination reparents nothing"
+  );
+  m.assert_invariants();
+}
+
+// ── The checked location accessor: total, or absent — never a short answer ──
+
+/// An armed, live, IDLE child directory `name` under `parent`: its bootstrap
+/// enumerate is answered empty, so it accepts records of its own and a deeper
+/// child can be nested beneath it.
+fn idle_child_dir(m: &mut Monitor, parent: WatchId, name: &str, when: Instant) -> WatchId {
+  m.on_os_record(
+    OsRecord::new(parent, RecordKind::Created)
+      .with_name(seg(name))
+      .with_is_dir(true),
+    when,
+  );
+  let w = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|c| c.id()))
+    .expect("the created directory is armed");
+  m.ack_watch(w, Ok(WatchAck::Installed));
+  let boot = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the armed child bootstrap-enumerates");
+  m.on_enumerate(boot, EnumerateResult::Ok(vec![]));
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+  w
+}
+
+/// A healthy tree resolves to the FULL location at every depth — the checked walk
+/// agrees with the lenient one exactly where the lenient one is entitled to answer.
+#[test]
+fn location_of_checked_resolves_a_nested_watch() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let w_a = idle_child_dir(&mut m, root, "a", at(1));
+  let w_b = idle_child_dir(&mut m, w_a, "b", at(2));
+
+  assert_eq!(m.location_of_checked(w_a), Some(loc(&["a"])));
+  assert_eq!(
+    m.location_of_checked(w_b),
+    Some(loc(&["a", "b"])),
+    "the full two-segment location, not a prefix of it"
+  );
+  assert_eq!(m.location_of_checked(w_b).unwrap(), m.location_of(w_b));
+  m.assert_invariants();
+}
+
+/// The scope root is a location — the EMPTY one — and a handle with no node is
+/// `None`. The two must not collapse: `None` is "cannot be placed", not "at the
+/// root", and a caller joining onto a root path distinguishes them here or nowhere.
+#[test]
+fn location_of_checked_places_the_scope_root_at_the_empty_location() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+
+  assert_eq!(m.location_of_checked(root), Some(Location::new()));
+  assert!(
+    m.location_of_checked(root).is_some_and(|at| at.is_empty()),
+    "the root resolves, and resolves to zero segments"
+  );
+
+  let unplaced = m.reserve_watch_id();
+  assert_eq!(
+    m.location_of_checked(unplaced),
+    None,
+    "a handle with no node is unplaceable, not at the root"
+  );
+  assert_ne!(m.location_of_checked(unplaced), m.location_of_checked(root));
+  m.assert_invariants();
+}
+
+/// The cell this accessor exists for. With an ancestor gone from under it, the
+/// lenient walk stops where the tree stops and hands back the SUFFIX it had
+/// collected — a location that composes into a real-looking path one level under
+/// the root. The checked walk refuses instead.
+///
+/// The severed link is written directly into the node map: no public input
+/// produces one (a subtree drop takes the whole subtree, so a survivor never
+/// outlives its parent), and the tree is left structurally inconsistent
+/// afterwards — hence no `assert_invariants` here.
+#[test]
+fn location_of_checked_refuses_a_node_whose_ancestor_is_gone() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let w_a = idle_child_dir(&mut m, root, "a", at(1));
+  let w_b = idle_child_dir(&mut m, w_a, "b", at(2));
+  assert_eq!(m.location_of_checked(w_b), Some(loc(&["a", "b"])));
+
+  m.nodes.remove(&w_a);
+
+  assert_eq!(
+    m.location_of(w_b),
+    loc(&["b"]),
+    "the lenient walk truncates to a plausible-but-wrong near-root location"
+  );
+  assert_eq!(
+    m.location_of_checked(w_b),
+    None,
+    "the checked walk reports the same tree as unanswerable"
+  );
+}
+
+/// A cycle is unreachable through the public API — `can_reparent` refuses a splice
+/// into the moving subtree, and `assert_invariants` asserts acyclicity on every
+/// property-test step — so the back-edge is written straight into the node map to
+/// exercise the bound. The lenient walk spends its whole budget fabricating
+/// segments; the checked walk spends the same budget and then answers `None`.
+#[test]
+fn location_of_checked_refuses_a_cycle() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let w_a = idle_child_dir(&mut m, root, "a", at(1));
+  let w_b = idle_child_dir(&mut m, w_a, "b", at(2));
+
+  m.nodes
+    .get_mut(&w_a)
+    .expect("the middle node is live")
+    .parent = Some(w_b);
+
+  assert!(
+    m.location_of(w_b).len() > 2,
+    "the lenient walk invents segments the tree does not have: {:?}",
+    m.location_of(w_b),
+  );
+  assert_eq!(
+    m.location_of_checked(w_b),
+    None,
+    "an exhausted bound is absence, never the segments collected on the way"
+  );
+  assert_eq!(m.location_of_checked(w_a), None);
+  assert_eq!(
+    m.location_of_checked(root),
+    Some(Location::new()),
+    "a node ABOVE the cycle still resolves — refusal is per-walk, not per-tree"
+  );
+}
+
+/// The lenient walk keeps the contract its internal callers were written against:
+/// it always answers, it never panics, an unknown handle reads as the empty
+/// location, and a severed chain truncates. Those are the branches the checked twin
+/// converts to `None`, so pinning them here also pins that the two are genuinely
+/// different functions rather than one wrapping the other.
+#[test]
+fn lenient_location_of_keeps_its_truncating_contract() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let w_a = idle_child_dir(&mut m, root, "a", at(1));
+  let w_b = idle_child_dir(&mut m, w_a, "b", at(2));
+
+  assert_eq!(m.location_of(root), Location::new());
+  assert_eq!(m.location_of(w_b), loc(&["a", "b"]));
+
+  let unplaced = m.reserve_watch_id();
+  assert_eq!(
+    m.location_of(unplaced),
+    Location::new(),
+    "an unknown handle reads as the root — indistinguishable from the root itself"
+  );
+  assert_ne!(
+    m.location_of_checked(unplaced),
+    Some(m.location_of(unplaced)),
+    "the checked form is not the lenient form wrapped in Some"
+  );
+
+  m.nodes.remove(&w_a);
+  assert_eq!(m.location_of(w_b), loc(&["b"]), "truncation, as before");
+  assert_ne!(
+    m.location_of_checked(w_b),
+    Some(m.location_of(w_b)),
+    "and the checked form does not agree with that truncation either"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// An outstanding arm is addressed to a `(parent, name)` slot, and a rename
+// empties that slot while the node it named lives on. The arm must follow the
+// node — re-addressed at every re-key, retired where the node has no slot at
+// all, and never dispatched once superseded — so a scope's barrier settles only
+// over an acknowledgement that proves the binding at the node's FINAL slot.
+// ---------------------------------------------------------------------------
+
+/// A reproving scope holding `root/s0` (identity-carried, settled), with `s0`
+/// detached mid-move and a scope loss on record — so the recovery skipped the
+/// held subtree and the pairing owes the source its re-add.
+fn reproof_hold_at_s0(m: &mut Monitor, s: ScopeId) -> (WatchId, WatchId) {
+  let root = live_root(m, s);
+  let boot = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("bootstrap read");
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("s0"), FileKind::Dir).with_node(ident(10)),
+    ]),
+  );
+  let w_s = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("s0 arms");
+  m.ack_watch(w_s, Ok(WatchAck::Installed));
+  let s_boot = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("s0's cold read");
+  m.on_enumerate(s_boot, EnumerateResult::Ok(vec![]));
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("s0"))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_overflow(Scope::Root(s), at(3));
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+  m.ack_watch(root, Ok(WatchAck::Aliased));
+  let read = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("the root's reproof read");
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+  let _ = drain_events(m);
+  let _ = drain_actions(m);
+  (root, w_s)
+}
+
+/// Two complete rename pairs inside one batch: the first pairing issues the
+/// source's re-add at `s1`, and the second moves the source to `s2` before the
+/// driver has polled anything. `start_reinstall` deliberately issues nothing
+/// for a node already `Arming`, so without the re-addressing the queued re-add
+/// would stay aimed at the slot the source left — and its failure, still
+/// naming the current attempt, would retire the live `s2` subtree.
+#[test]
+fn a_rename_before_polling_re_addresses_the_queued_readd() {
+  let mut m = reproving();
+  let s = scope(1);
+  let (root, w_s) = reproof_hold_at_s0(&mut m, s);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("s1"))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(4),
+  );
+  // No poll between the pairs: the re-add for `s1` is still queued when the
+  // source moves again.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("s1"))
+      .with_cookie(cookie(8))
+      .with_is_dir(true),
+    at(5),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("s2"))
+      .with_cookie(cookie(8))
+      .with_is_dir(true),
+    at(6),
+  );
+
+  let actions = drain_actions(&mut m);
+  assert_eq!(
+    readd_of(&actions, w_s),
+    Some(WatchTarget::child(root, seg("s2"))),
+    "the re-add follows the source to its final slot: {actions:?}"
+  );
+  assert_eq!(
+    actions
+      .iter()
+      .filter_map(|a| a.as_watch())
+      .filter(|w| w.id() == w_s)
+      .count(),
+    1,
+    "and the superseded one never reaches the driver: {actions:?}"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "the re-add is still a counted obligation"
+  );
+  assert!(!m.coverage_settled(s), "so the barrier holds");
+
+  // Only the acknowledgement of the FINAL slot's arm releases it.
+  m.ack_watch(w_s, Ok(WatchAck::Aliased));
+  let s_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_s).map(|e| e.req()))
+    .expect("the re-proven source reads");
+  m.on_enumerate(s_read, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(s));
+  assert!(m.coverage_settled(s));
+  assert!(m.is_watched(w_s), "the live subtree is retired by nothing");
+  m.assert_invariants();
+}
+
+/// The same rename, one step later: the driver has already TAKEN the re-add
+/// for `s1` when the source moves to `s2`. Nothing can retarget an arm the
+/// driver holds, so the fix is supersession — the in-flight acknowledgement
+/// answers for a slot the source has left and must certify no binding, while a
+/// fresh arm addresses the destination.
+#[test]
+fn a_rename_after_polling_supersedes_the_inflight_readd() {
+  let mut m = reproving();
+  let s = scope(1);
+  let (root, w_s) = reproof_hold_at_s0(&mut m, s);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("s1"))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(4),
+  );
+  let dispatched = drain_actions(&mut m);
+  let inflight = dispatched
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.id() == w_s)
+        .map(|w| (w.attempt(), w.target().clone()))
+    })
+    .expect("the pairing re-adds the source");
+  assert_eq!(inflight.1, WatchTarget::child(root, seg("s1")));
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("s1"))
+      .with_cookie(cookie(8))
+      .with_is_dir(true),
+    at(5),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("s2"))
+      .with_cookie(cookie(8))
+      .with_is_dir(true),
+    at(6),
+  );
+  // The in-flight arm answers for the vacated slot — and it FAILS, because
+  // nothing stands at `s1` any more. Applied to the source it no longer
+  // addresses, that failure retires the live `s2` subtree and leaves a slot
+  // deficit in its place; discarded, it decides nothing at all.
+  m.on_watch_result(w_s, inflight.0, Err(WatchError::NotFound));
+  assert!(
+    m.is_watched(w_s),
+    "a failure at the vacated slot retires the subtree that left it: nothing"
+  );
+  assert!(
+    !m.has_coverage_deficit(s),
+    "and books no darkness for a slot that is covered"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "an outcome for a slot the source left certifies no binding either way"
+  );
+  assert!(!m.coverage_settled(s), "so the barrier still holds");
+
+  let reissued = drain_actions(&mut m);
+  assert_eq!(
+    readd_of(&reissued, w_s),
+    Some(WatchTarget::child(root, seg("s2"))),
+    "a fresh arm addresses the destination: {reissued:?}"
+  );
+  assert!(
+    !reissued
+      .iter()
+      .any(|a| a.as_enumerate().is_some_and(|e| e.dir() == w_s)),
+    "and no read runs before that arm acknowledges: {reissued:?}"
+  );
+
+  let final_attempt = reissued
+    .iter()
+    .find_map(|a| a.as_watch().filter(|w| w.id() == w_s).map(|w| w.attempt()))
+    .expect("the destination's arm");
+  m.on_watch_result(w_s, final_attempt, Ok(WatchAck::Aliased));
+  let s_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_s).map(|e| e.req()))
+    .expect("the re-proven source reads");
+  m.on_enumerate(s_read, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(s));
+  assert!(m.coverage_settled(s));
+  m.assert_invariants();
+}
+
+/// A detached move source occupies no slot at all, so its pending arm has no
+/// coordinate to name: dispatching it would bind this handle to whatever
+/// replacement took the vacated path, and the pairing would then carry that
+/// binding to the destination. The arm is retired at the detach and
+/// re-addressed only once the reparent gives the node a slot again.
+#[test]
+fn a_pending_arm_is_never_dispatched_at_the_slot_its_move_vacated() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+
+  // A directory is discovered and its arm queued but not yet polled…
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  // …when the same batch renames it away.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  let vacated = drain_actions(&mut m);
+  assert!(
+    !vacated
+      .iter()
+      .filter_map(|a| a.as_watch())
+      .any(|w| w.target().as_child().is_some_and(|c| *c.name() == seg("a"))),
+    "no arm reaches the driver naming the vacated slot: {vacated:?}"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  let paired = drain_actions(&mut m);
+  let arms: Vec<_> = paired.iter().filter_map(|a| a.as_watch()).collect();
+  assert_eq!(arms.len(), 1, "exactly one arm survives: {paired:?}");
+  assert_eq!(
+    arms[0].target(),
+    &WatchTarget::child(root, seg("b")),
+    "and it names where the source landed: {paired:?}"
+  );
+  m.assert_invariants();
+}
+
+/// A read is dispatched against the reader's `(parent, name)` slot too. One
+/// taken while the directory moves away describes this object only if the
+/// driver read before the rename; otherwise it lists whatever replaced it. A
+/// cold snapshot trusted at the destination would announce a stranger's
+/// entries as `Created` there, so the detach dirties the read: no discoveries,
+/// one covering `Rescan`, and a retry against wherever the node has landed.
+#[test]
+fn a_read_dispatched_at_a_vacated_slot_is_not_trusted_at_the_destination() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
+  );
+  let w_a = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("a arms");
+  m.ack_watch(w_a, Ok(WatchAck::Installed));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_a).map(|e| e.req()))
+    .expect("a's cold read");
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("a"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(2),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("b"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("ghost"), FileKind::Dir).with_node(ident(77)),
+    ]),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_created()),
+    "a snapshot of the vacated slot announces no discoveries: {events:?}"
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["b"])),
+    "it stands a covering Rescan at the destination instead: {events:?}"
+  );
+  assert!(
+    m.is_rearm_enumerating(w_a),
+    "and re-reads wherever the node has landed"
+  );
+  m.assert_invariants();
+}
+
+/// A widen re-keys the OLD root under the chain's tail, which changes what the
+/// scope-addressed targets resolve to: an outstanding
+/// [`WatchTarget::RearmRoot`] would re-add the NEW root's path under the
+/// adopted node's handle. The splice re-addresses it down the chain, and the
+/// scope-addressed one never reaches the driver.
+#[test]
+fn a_widen_re_addresses_the_adopted_roots_outstanding_readd() {
+  let mut m = reproving();
+  let s = scope(1);
+  let old_root = live_root_idle(&mut m, s);
+
+  // A recovery in flight whose re-add is still QUEUED.
+  m.on_overflow(Scope::Root(s), at(1));
+  let _ = drain_events(&mut m);
+
+  let reserved = m.reserve_watch_id();
+  assert!(
+    m.widen_root(s, reserved, vec![seg("r")], Some(ident(1)))
+      .is_some()
+  );
+  let actions = drain_actions(&mut m);
+  assert!(
+    !actions
+      .iter()
+      .filter_map(|a| a.as_watch())
+      .any(|w| w.target().is_rearm_root()),
+    "no arm still claims the adopted node IS the scope's root: {actions:?}"
+  );
+  assert_eq!(
+    readd_of(&actions, old_root),
+    Some(WatchTarget::child(reserved, seg("r"))),
+    "the re-add follows the adopted node down the chain: {actions:?}"
+  );
+
+  m.ack_watch(old_root, Ok(WatchAck::Aliased));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == old_root)
+        .map(|e| e.req())
+    })
+    .expect("the adopted node's reproof read");
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+  assert!(
+    m.rearm_settled(s),
+    "the recovery completes across the splice"
+  );
+  m.assert_invariants();
+}
+
+/// The moved clause ALONE at the acknowledgement seam — no hold anywhere — where
+/// discarding the verdict is not enough. An ancestor's rename leaves this node's
+/// own `(parent, name)`, and so its attempt, untouched, so an outcome for an arm
+/// issued before the rename arrives past the supersession fence naming a path that
+/// is now somebody else's. For a FAILURE that is the whole story; for a SUCCESS the
+/// driver has already installed and attributed a kernel binding at that path.
+///
+/// A cold discovery's arm is counted by nothing (`Arming { rearm: false }` is not a
+/// re-arm state), so before the retirement this window was not merely unfenced but
+/// SETTLED: a sync cookie could certify over a subtree whose binding sits somewhere
+/// else entirely. The retirement closes it on both halves at once — the binding
+/// dies, and the slot is rebuilt COUNTED behind a located cover.
+#[test]
+fn a_stale_install_at_a_moved_chain_is_retired_and_the_slot_rebuilt_counted() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = live_child_dir(&mut m, root, "d");
+
+  // A child discovered from a record — identity-less, armed, and NOT yet
+  // acknowledged when the rename lands.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created)
+      .with_name(seg("c"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let (w_c, stale_attempt) = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("c")))
+        .map(|w| (w.id(), w.attempt()))
+    })
+    .expect("the discovered directory arms");
+
+  // The ANCESTOR moves, and its pairing completes: `c` keeps its slot under
+  // `d`, so nothing supersedes its in-flight arm and no hold is left standing.
+  // Only the placement clock knows the path that arm was issued against moved.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(4),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  // The arm succeeds — at the vacated path.
+  m.on_watch_result(w_c, stale_attempt, Ok(WatchAck::Installed));
+  assert!(
+    !m.is_watched(w_c),
+    "a binding installed at a path the chain has left certifies nothing, so it \
+     is retired"
+  );
+  let cover = drain_events(&mut m);
+  assert!(
+    cover
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e", "c"])),
+    "and the retirement covers the slot it ended, located at the node's CURRENT \
+     path: {cover:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "with the counted rebuild holding the barrier over the window it opened"
+  );
+  // INSIDE the window, where the rebuild is still outstanding.
+  m.assert_invariants();
+  let replacement = drain_actions(&mut m);
+  let rebuilt = replacement
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("c")))
+        .map(|w| w.id())
+    })
+    .expect("the slot is rebuilt where the node now sits");
+  assert_ne!(
+    rebuilt, w_c,
+    "on a fresh handle: the retired one is what may not be trusted"
+  );
+
+  // The replacement at the vacated path keeps producing records on the binding
+  // the retired handle opened. None of them may reach the tree.
+  m.on_os_record(
+    OsRecord::new(w_c, RecordKind::Created)
+      .with_name(seg("x"))
+      .with_is_dir(true),
+    at(5),
+  );
+  let delivered = drain_events(&mut m);
+  assert!(
+    !delivered
+      .iter()
+      .any(|e| e.location() == &loc(&["e", "c", "x"])),
+    "no record off the retired binding is delivered at the destination: {delivered:?}"
+  );
+  let queued = drain_actions(&mut m);
+  assert!(
+    !queued
+      .iter()
+      .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(w_c, seg("x")))),
+    "nor installs coverage for a name only the retired binding reported: {queued:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the barrier is still held by the rebuild"
+  );
+
+  // The rebuild acknowledges — proof at a path that IS this node's — and its own
+  // read completes.
+  m.ack_watch(rebuilt, Ok(WatchAck::Installed));
+  let c_read = read_of(&mut m, rebuilt);
+  m.on_enumerate(c_read, EnumerateResult::Ok(vec![]));
+  assert!(
+    m.coverage_settled(s),
+    "the scope settles once the rebuilt read completes"
+  );
+
+  m.on_os_record(
+    OsRecord::new(rebuilt, RecordKind::Created).with_name(seg("y")),
+    at(6),
+  );
+  assert!(
+    drain_events(&mut m)
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["e", "c", "y"])),
+    "and the rebuilt binding delivers at the node's own path"
+  );
+  m.assert_invariants();
+}
+
+/// The moved-success retirement's COVER — the half its counted rebuild is not.
+///
+/// The binding this `Ok` reported sits at the path the subtree left, so a
+/// modification of a file that ALREADY existed at the destination is recorded by
+/// nobody: not by the retired binding, and not yet by the rebuild. Neither edge of
+/// the rebuild announces it afterwards — the replacement's read is a re-arm, so
+/// every pre-existing entry it lists is `Created`-suppressed, and an `Aliased`
+/// acknowledgement proves the binding was live all along and so marks no dark
+/// window at all.
+///
+/// So the cover is emitted AT THE RETIREMENT, unconditionally on flavour, and the
+/// rebuild is what keeps the barrier shut until the consumer's re-read has
+/// something to read. `Aliased` throughout, which is where the flavour-conditional
+/// rule used to lose the cover entirely.
+#[test]
+fn a_moved_success_retire_covers_the_destination_it_blinded() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = live_child_dir(&mut m, root, "d");
+
+  // `c` is discovered from a record and armed; its acknowledgement is still in
+  // flight when the ANCESTOR is renamed, so the install lands at `d/c` — a path
+  // the subtree has left for `e/c`.
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created)
+      .with_name(seg("c"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let (w_c, stale_attempt) = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("c")))
+        .map(|w| (w.id(), w.attempt()))
+    })
+    .expect("the discovered directory arms");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(4),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_watch_result(w_c, stale_attempt, Ok(WatchAck::Aliased));
+  let cover = drain_events(&mut m);
+  assert!(
+    cover
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e", "c"])),
+    "the retirement stands its cover for the destination it blinded, whatever \
+     the acknowledgement's flavour: {cover:?}"
+  );
+  let replacement = drain_actions(&mut m);
+  let rebuilt = replacement
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("c")))
+        .map(|w| w.id())
+    })
+    .expect("the counted rebuild addresses the node where it now sits");
+
+  // INSIDE the window, which is where the darkness is. `e/c/f` already existed at
+  // the destination and changes now: the real destination carries no binding yet,
+  // and the retired one is gone, so nothing about the modification reaches the
+  // consumer as a change.
+  m.on_os_record(
+    OsRecord::new(w_c, RecordKind::Modified).with_name(seg("f")),
+    at(5),
+  );
+  let blind = drain_events(&mut m);
+  assert!(
+    blind.iter().all(|e| !e.kind().is_modified()),
+    "the destination's modification is delivered by nobody: {blind:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the rebuild holds the barrier over the blind subtree"
+  );
+  m.assert_invariants();
+
+  // The rebuild acknowledges at its WEAKEST flavour: `Aliased` witnesses no dark
+  // window of its own and marks none. The cover the retirement already stood is
+  // what carries the interval, so nothing here depends on the flavour.
+  m.ack_watch(rebuilt, Ok(WatchAck::Aliased));
+  let c_read = read_of(&mut m, rebuilt);
+  m.on_enumerate(
+    c_read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("f"), FileKind::File)]),
+  );
+  let closing = drain_events(&mut m);
+  assert!(
+    !closing
+      .iter()
+      .any(|e| e.location() == &loc(&["e", "c", "f"])),
+    "the rebuilt read is Created-suppressed, so the pre-existing entry is never \
+     announced either: {closing:?}"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "the scope settles once the rebuilt read completes"
+  );
+  m.assert_invariants();
+}
+
+/// The `Err` half of the same clause, and the one the retirement must NOT reach.
+/// A refused arm created no binding, so there is nothing installed at the vacated
+/// path to retire — and retiring anyway would tear down a node whose object is
+/// alive and armable at its new location. The verdict is discarded, the handle
+/// lives on, and its obligation is re-issued at wherever the node sits now.
+#[test]
+fn a_stale_failure_at_a_moved_chain_readdresses_rather_than_retires() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = live_child_dir(&mut m, root, "d");
+
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created)
+      .with_name(seg("c"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let (w_c, stale_attempt) = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("c")))
+        .map(|w| (w.id(), w.attempt()))
+    })
+    .expect("the discovered directory arms");
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(4),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_watch_result(w_c, stale_attempt, Err(WatchError::Permission));
+  assert!(
+    m.is_watched(w_c),
+    "a verdict about somebody else's path may not retire this node"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events.is_empty(),
+    "and it ends no coverage, so it owes no cover: {events:?}"
+  );
+  let actions = drain_actions(&mut m);
+  assert_eq!(
+    readd_of(&actions, w_c),
+    Some(WatchTarget::child(w_d, seg("c"))),
+    "the same handle is re-addressed where the node now sits: {actions:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The rebuild's FLAVOUR, cold half. The retiree here was a cold discovery — its
+/// `Created` record already announced the directory to the consumer — so a
+/// replacement that read as a discovery would announce its contents a second time.
+/// The rebuild is re-arm-flavoured whatever the retiree was, so its read is
+/// `Created`-suppressed and the located cover the retirement stood is what
+/// instructs the re-read.
+#[test]
+fn a_cold_retiree_rebuilds_counted_and_announces_nothing_twice() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = live_child_dir(&mut m, root, "d");
+
+  m.on_os_record(
+    OsRecord::new(w_d, RecordKind::Created)
+      .with_name(seg("c"))
+      .with_is_dir(true),
+    at(2),
+  );
+  let (w_c, stale_attempt) = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("c")))
+        .map(|w| (w.id(), w.attempt()))
+    })
+    .expect("the discovered directory arms");
+  assert!(
+    !m.has_rearm_obligation(w_c),
+    "staging: the retiree's own arm is a cold discovery, counted by nothing"
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(4),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_watch_result(w_c, stale_attempt, Ok(WatchAck::Installed));
+  let rebuilt = armed_child(&mut m, w_d, "c");
+  assert!(
+    m.has_rearm_obligation(rebuilt),
+    "the rebuild is COUNTED, though the retiree's own arm was not"
+  );
+  let _ = drain_events(&mut m);
+
+  m.ack_watch(rebuilt, Ok(WatchAck::Installed));
+  let read = read_of(&mut m, rebuilt);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("y"), FileKind::Dir)]),
+  );
+  let announced = drain_events(&mut m);
+  assert!(
+    !announced
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["e", "c", "y"])),
+    "and its read is Created-suppressed, so nothing is announced twice: {announced:?}"
+  );
+  let grandchild = armed_child(&mut m, rebuilt, "y");
+  m.ack_watch(grandchild, Ok(WatchAck::Installed));
+  settle_reads(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "the scope settles behind the rebuild"
+  );
+  m.assert_invariants();
+}
+
+/// The rebuild's FLAVOUR, re-arm half — and the ordering the whole cover rests on.
+/// A retiree that was itself part of a crawl is rebuilt counted like any other, and
+/// the window's closing `Rescan` may only be minted once that rebuild's own READ
+/// has completed: minting it at the acknowledgement would send the consumer to
+/// re-read a subtree still being walked, and the change that lands in between would
+/// then be behind the last `Rescan` the consumer ever saw.
+#[test]
+fn a_rearm_retirees_closing_rescan_postdates_the_rebuilt_read() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = live_child_dir(&mut m, root, "d");
+
+  // A crawl of `d` installs `c` counted: this retiree's arm is re-arm-flavoured.
+  assert!(m.rearm_watch_subtree(w_d).is_started());
+  let crawl = read_of(&mut m, w_d);
+  m.on_enumerate(
+    crawl,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("c"), FileKind::Dir)]),
+  );
+  let (w_c, stale_attempt) = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_watch()
+        .filter(|w| w.target() == &WatchTarget::child(w_d, seg("c")))
+        .map(|w| (w.id(), w.attempt()))
+    })
+    .expect("the crawl arms the listed directory");
+  assert!(
+    m.has_rearm_obligation(w_c),
+    "staging: the retiree's own arm is counted"
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(4),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  m.on_watch_result(w_c, stale_attempt, Ok(WatchAck::Installed));
+  let rebuilt = armed_child(&mut m, w_d, "c");
+  let at_retire = drain_events(&mut m);
+  assert!(
+    !at_retire
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&[])),
+    "no closing Rescan at the retirement — the rebuild has not even armed: \
+     {at_retire:?}"
+  );
+
+  m.ack_watch(rebuilt, Ok(WatchAck::Installed));
+  let acked = drain_events(&mut m);
+  assert!(
+    !acked
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&[])),
+    "nor at its acknowledgement — its read is still walking the subtree: {acked:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "which is what holds the window open"
+  );
+
+  let read = read_of(&mut m, rebuilt);
+  m.on_enumerate(read, EnumerateResult::Ok(Vec::new()));
+  let closing = drain_events(&mut m);
+  assert!(
+    closing
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&[])),
+    "the closing Rescan is minted at the settle edge the rebuilt read reaches: \
+     {closing:?}"
+  );
+  assert!(m.coverage_settled(s));
+  m.assert_invariants();
+}
+
+/// The retirement's ROOT branch. A root has no slot to rebuild and no parent to
+/// cover at — its lowered path IS the scope's ground — so an acknowledgement that
+/// does not describe it can only be a root invalidation, exactly as a refused root
+/// install is.
+///
+/// Every ordinary route here is closed by the arm funnels themselves: a rebind
+/// records the root's placement change and only then adopts the arm whose outcome
+/// it hands back, so the replay is stamped current. What reaches the clause is a
+/// further root swap recorded between that adopt and the replay — the one
+/// interleaving that would otherwise certify the scope's root against the world the
+/// swap replaced.
+#[test]
+fn an_unprovable_root_acknowledgement_invalidates_the_root() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let (rebound, attempt) = m.rebind_root(s).expect("a descending scope rebinds");
+  assert_eq!(rebound, root, "the rebind keeps the root handle");
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A second root swap is recorded before the first one's outcome is replayed.
+  m.moved_placement(root);
+  m.on_watch_result(root, attempt, Ok(WatchAck::Installed));
+  assert!(
+    !m.is_watched(root),
+    "an acknowledgement that describes a world the root has left certifies nothing"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&[])),
+    "and the invalidation is never silent: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// A retirement inside an incomplete read's reconcile can stand a counted
+/// cover, and that re-arm lands on the very directory being reconciled — which
+/// then queues its own bounded retry on top. Two reads for one node is the one
+/// thing `NodeState::Enumerating` cannot express, so the earlier request must
+/// be reclaimed rather than stranded in `pending_enumerate`.
+#[test]
+fn a_counted_cover_inside_an_incomplete_read_strands_no_request() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_b = idle_child_dir(&mut m, root, "B", at(1));
+  let w_c = idle_child_dir(&mut m, w_b, "C", at(2));
+
+  // C detaches mid-move and its hold is dirtied by suppressed activity.
+  m.on_os_record(
+    OsRecord::new(w_b, RecordKind::MovedFrom)
+      .with_name(seg("C"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_os_record(
+    OsRecord::new(w_c, RecordKind::Created)
+      .with_name(seg("x"))
+      .with_is_dir(true),
+    at(4),
+  );
+  let _ = drain_events(&mut m);
+  let _ = drain_actions(&mut m);
+
+  // The root re-reads incompletely, and the listing retires B — whose subtree
+  // carries the dirtied hold, so the drop stands a counted cover at the root.
+  m.on_overflow(Scope::Subtree(SubtreeScope::new(root)), at(5));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the root re-arm read");
+  m.on_enumerate(
+    read,
+    EnumerateResult::Partial(vec![DirEntry::new(seg("B"), FileKind::File)]),
+  );
+  assert!(!m.is_watched(w_b), "the listing retired B");
+  assert!(m.is_rearm_enumerating(root), "and the root re-reads");
   m.assert_invariants();
 }
