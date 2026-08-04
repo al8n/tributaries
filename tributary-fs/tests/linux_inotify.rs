@@ -330,13 +330,32 @@ impl Drop for SysctlGuard {
 /// satisfies, by re-reading its way to the same tree.
 ///
 /// The deep create carries a second, stronger claim beside it: the descent
-/// reached `a/b` and the create was DELIVERED at that exact path — as the
+/// reached `a/b` and a create was DELIVERED at that exact path — as the
 /// kernel's own `IN_CREATE`, or as the cold enumerate's `Created` when the arm
 /// landed after the write. A backend whose descent had stopped arming would
-/// converge and fail this.
+/// converge and fail this, however many times it is asked.
 ///
 /// Both facts are collected in ONE pass over the stream; a second wait would be
 /// looking for events the first already consumed.
+///
+/// # Why the delivery claim RE-STAGES rather than pinning `one.txt`
+///
+/// A `Rescan` covering `a/b` is the backend saying it LOST that ground, and
+/// inotify never re-delivers a create it lost — so once a loss signal stands over
+/// the deep path, no amount of waiting can make the ORIGINAL create's delivery
+/// arrive, and the wait can only run to its deadline. That is not a hypothetical:
+/// an instrumented, heavily-contended runner (the sanitizer legs run this binary
+/// alongside 25 other cells) is where a real-kernel race the native legs win
+/// every time gets lost, and the cell then burned its whole budget on a fact that
+/// had already been ruled out. Waiting LONGER is not the answer, and neither is
+/// accepting the `Rescan`: a covering `Rescan` is exactly what a backend that had
+/// stopped arming would emit, so admitting one here would retire the claim.
+///
+/// So the claim is held on ground the loss has not already swallowed: after a
+/// discharged loss, a FRESH create under `a/b` must be delivered at its own exact
+/// path. The oracle is untouched — [`Inventory::delivered_at`] still refuses a
+/// bare `Rescan` — and a descent that is genuinely not arming `a/b` fails every
+/// attempt, so the defect class the cell exists for is caught exactly as before.
 #[tokio::test]
 async fn churn_converges() {
   let root = scratch_root("churn");
@@ -360,10 +379,36 @@ async fn churn_converges() {
     "the consumer's view converged on the churned tree: {:?}",
     inventory.disagreement()
   );
+
+  // Re-staged only when the churn's own create was never delivered — a run that
+  // won its race asserts on exactly the event it always did, and stages nothing
+  // extra. Each attempt is a create the loss signals so far cannot have covered,
+  // because it does not exist until after they were discharged.
+  const DEEP_ATTEMPTS: usize = 8;
+  let mut delivered_deep = inventory.delivered_at(&deep);
+  let mut staged = deep.clone();
+  for attempt in 0..DEEP_ATTEMPTS {
+    if delivered_deep {
+      break;
+    }
+    staged = root.join(format!("a/b/one-{attempt}.txt"));
+    std::fs::write(&staged, b"1").unwrap();
+    let probe = staged.clone();
+    let _ = drive(
+      &mut w,
+      &mut inventory,
+      scaled(Duration::from_secs(2)),
+      move |model| model.delivered_at(&probe),
+    )
+    .await;
+    delivered_deep = inventory.delivered_at(&staged);
+  }
+
   assert!(
-    inventory.delivered_at(&deep),
-    "the deep create was delivered at {} rather than only covered ({} rescans discharged)",
-    deep.display(),
+    delivered_deep,
+    "a create under a/b was delivered at its own path — last asked for {} — rather than only \
+     covered ({} rescans discharged over {DEEP_ATTEMPTS} re-stagings)",
+    staged.display(),
     inventory.rescans()
   );
 }
