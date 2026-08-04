@@ -2620,7 +2620,11 @@ pub(crate) enum UnwatchAck {
   Backlogged,
 }
 
-#[cfg(test)]
+// Gated exactly like the `tests` module below, which is these predicates' only
+// consumer: a plain `cfg(test)` leaves them defined but unreachable in every
+// build that has no `tokio` (the featureless and Smol-only test builds, and
+// Miri's default-feature one), where they are dead code.
+#[cfg(all(test, feature = "tokio"))]
 impl UnwatchAck {
   /// Whether this is [`Torn`](Self::Torn).
   pub(crate) const fn is_torn(self) -> bool {
