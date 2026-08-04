@@ -9,6 +9,10 @@ fn req(n: u64) -> ReqId {
   ReqId::new(NonZeroU64::new(n).unwrap())
 }
 
+fn attempt(n: u64) -> ArmAttempt {
+  ArmAttempt::new(NonZeroU64::new(n).unwrap())
+}
+
 fn scope(n: u64) -> ScopeId {
   ScopeId::new(NonZeroU64::new(n).unwrap())
 }
@@ -34,7 +38,12 @@ fn watch_target_child() {
 
 #[test]
 fn watch_action_round_trips() {
-  let a = Action::watch(watch(3), WatchTarget::Root(scope(1)), Interest::all());
+  let a = Action::watch(
+    watch(3),
+    attempt(7),
+    WatchTarget::Root(scope(1)),
+    Interest::all(),
+  );
   assert!(a.is_watch());
   let cmd = a.as_watch().unwrap();
   assert_eq!(cmd.id(), watch(3));
@@ -83,7 +92,12 @@ fn stat_action_round_trips() {
 #[test]
 fn predicates_are_mutually_exclusive() {
   let actions = [
-    Action::watch(watch(1), WatchTarget::Root(scope(1)), Interest::new()),
+    Action::watch(
+      watch(1),
+      attempt(1),
+      WatchTarget::Root(scope(1)),
+      Interest::new(),
+    ),
     Action::Unwatch(watch(1)),
     Action::enumerate(req(1), watch(1)),
     Action::stat(req(1), StatTarget::Watch(watch(1))),

@@ -71,6 +71,26 @@ proto_id! {
 }
 
 proto_id! {
+  /// An opaque, proto-minted token naming ONE attempt to arm a [`WatchId`].
+  ///
+  /// A `WatchId` outlives its bindings: a root survives a transport rebind, a
+  /// binding re-proof re-adds an existing watch, and a refused install can be
+  /// retried — so several arm attempts can be in flight for one handle over
+  /// time. Without a token the only thing an outcome names is the handle, and
+  /// a LATE result from an attempt some later arm superseded is applied to
+  /// whoever owns the handle now: a stale `Err` then tears down a live
+  /// rebound root the failing attempt never touched.
+  ///
+  /// Every [`Action::Watch`](crate::Action::Watch) therefore carries the
+  /// attempt it is, the driver echoes it back through
+  /// [`on_watch_result`](crate::Monitor::on_watch_result), and the monitor
+  /// accepts an outcome only for the attempt the handle is currently arming.
+  /// The fence lives in the protocol precisely so a driver does not have to
+  /// reinvent one to stay correct.
+  ArmAttempt
+}
+
+proto_id! {
   /// The dedup / identity key stamped on every emitted [`Change`](crate::Change).
   ///
   /// The core dedups deliveries by this key; it is also the seam for a future

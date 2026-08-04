@@ -23,6 +23,10 @@ pub mod path;
 pub mod record;
 pub mod scope;
 pub mod time;
+// Needs `std`: the containment it is built on is `catch_unwind`.
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub mod unwind;
 
 pub mod fanotify;
 pub mod fsevents;
@@ -35,10 +39,13 @@ pub use action::{
 pub use capabilities::Capabilities;
 pub use change::{Change, ChangeKind};
 pub use error::WatchError;
-pub use id::{ChangeId, Epoch, Identity, MoveCookie, ReqId, ScopeId, WatchId};
+pub use id::{ArmAttempt, ChangeId, Epoch, Identity, MoveCookie, ReqId, ScopeId, WatchId};
 pub use interest::Interest;
 pub use monitor::Monitor;
 pub use path::{Location, Segment};
-pub use record::{DirEntry, EnumerateResult, FileKind, IoClass, OsRecord, RecordKind};
+pub use record::{
+  DirEntry, EnumerateResult, Evidence, FileKind, IoClass, OsRecord, RecordKind, StatEntry,
+  StatResult,
+};
 pub use scope::{Scope, SubtreeScope};
 pub use time::Instant;
