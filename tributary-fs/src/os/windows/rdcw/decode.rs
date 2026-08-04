@@ -21,6 +21,13 @@ pub(crate) enum RdcwAction {
   RenamedOld,
   /// `FILE_ACTION_RENAMED_NEW_NAME` — the arriving half of a rename pair.
   RenamedNew,
+  /// `FILE_ACTION_ADDED_STREAM` — a named stream (an NTFS alternate data
+  /// stream) was created on the object the name's owner half denotes.
+  StreamAdded,
+  /// `FILE_ACTION_REMOVED_STREAM` — a named stream was deleted.
+  StreamRemoved,
+  /// `FILE_ACTION_MODIFIED_STREAM` — a named stream was written or resized.
+  StreamModified,
   /// An action word this vocabulary does not know; the lowering degrades it
   /// to a located rescan rather than guessing a verb.
   Unknown(u32),
@@ -34,8 +41,27 @@ impl RdcwAction {
       3 => Self::Modified,
       4 => Self::RenamedOld,
       5 => Self::RenamedNew,
+      6 => Self::StreamAdded,
+      7 => Self::StreamRemoved,
+      8 => Self::StreamModified,
+      // 9..=11 (`REMOVED_BY_DELETE`, `ID_NOT_TUNNELLED`,
+      // `TUNNELLED_ID_COLLISION`) are reported only for subscriptions this
+      // backend never issues, and two of them carry an id rather than a name
+      // in the name field. Decoding them by their MS-FSCC meaning would be
+      // guessing at a payload shape no read here can produce; the located
+      // rescan stays the honest cover.
       other => Self::Unknown(other),
     }
+  }
+
+  /// Whether the action describes a NAMED STREAM of its subject rather than
+  /// the subject itself — the records whose name carries an `owner:stream`
+  /// suffix the decoder folds away.
+  pub(crate) const fn is_stream(self) -> bool {
+    matches!(
+      self,
+      Self::StreamAdded | Self::StreamRemoved | Self::StreamModified
+    )
   }
 }
 
@@ -46,18 +72,76 @@ impl RdcwAction {
 /// so an undecodable component still leaves every ancestor above it named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RdcwName {
-  /// Every component decoded to strict UTF-8. Components are never empty and
-  /// never carry a separator.
+  /// Every component decoded to strict UTF-8 AND spelled a name a consumer's
+  /// own enumeration would produce. Components are never empty and never
+  /// carry a separator or a stream suffix.
   Utf8(Vec<String>),
-  /// A component cannot become UTF-8 (an unpaired surrogate — WTF-16 that has
-  /// no Unicode spelling): `prefix` is the decodable ancestor chain above it
-  /// (empty = the undecodable component sits directly under the root), and
-  /// the lowering escalates to a located rescan THERE — never a lossy
-  /// transliteration.
+  /// A component cannot be published as authoritative: `prefix` is the usable
+  /// ancestor chain above it (empty = the refused component sits directly
+  /// under the root), and the lowering escalates to a located rescan THERE.
+  ///
+  /// Two independent causes reach this, and both are "the decoder does not
+  /// possess the name the consumer indexes by":
+  ///
+  /// * the component has no Unicode spelling (an unpaired surrogate — WTF-16),
+  ///   so no `Segment` can carry it and a lossy transliteration would name a
+  ///   different object;
+  /// * the component is a generated 8.3 SHORT-NAME ALIAS
+  ///   ([`is_short_name_alias`]). Both notify layouts are documented to return
+  ///   either spelling when an object has both, and which one arrives is
+  ///   unspecified — it follows the spelling the mutating process happened to
+  ///   open by. Publishing `LONGFI~1.TXT` as the event's stable location
+  ///   silently diverges from the `Long File Name.txt` a crawl indexed, and no
+  ///   later event repairs it. Expansion is not available to a PURE decode
+  ///   (and is impossible in principle for a removal or a rename's departing
+  ///   half, whose name no longer resolves), so the alias escalates to a
+  ///   rescan at its parent instead: the consumer re-enumerates and learns the
+  ///   canonical name from the filesystem, which is the only authority for it.
   Escalate {
-    /// The decoded components above the first undecodable one.
+    /// The usable components above the first refused one.
     prefix: Vec<String>,
   },
+}
+
+/// Whether `component` may be an NTFS-GENERATED 8.3 short-name alias — a
+/// spelling that denotes an object whose canonical name is something else.
+///
+/// A generated alias always carries a `~` followed by the disambiguating
+/// decimal run (`LONGFI~1.TXT`, `PROGRA~2`, `A1B2C3~1.DLL`), fits 8.3, and is
+/// upper-cased, so the test is: at most one `.`, a base of 1..=8 and an
+/// extension of at most 3 characters, no lowercase ASCII letter anywhere, and
+/// a base whose final `~` is neither first nor last and is followed only by
+/// ASCII digits.
+///
+/// It is deliberately a SYNTACTIC over-approximation. A file a user really
+/// named `PROGRA~1` matches and earns a parent rescan it did not need, which
+/// costs one re-enumeration; the reverse error — accepting an alias as the
+/// canonical location — is a permanent divergence between the consumer's index
+/// and the tree, with no event that ever repairs it. Names an object shares
+/// with its own short form (`README.TXT` is its own alias) carry no `~` and so
+/// never match: there is nothing to diverge from.
+pub(crate) fn is_short_name_alias(component: &str) -> bool {
+  if component.chars().any(|c| c.is_ascii_lowercase()) {
+    return false;
+  }
+  let mut halves = component.split('.');
+  let (Some(base), extension) = (halves.next(), halves.next()) else {
+    return false;
+  };
+  // A third `.` puts the name outside 8.3 entirely.
+  if halves.next().is_some() {
+    return false;
+  }
+  if !(1..=8).contains(&base.chars().count()) {
+    return false;
+  }
+  if extension.is_some_and(|ext| ext.chars().count() > 3) {
+    return false;
+  }
+  let Some((head, tail)) = base.rsplit_once('~') else {
+    return false;
+  };
+  !head.is_empty() && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// One decoded record.
@@ -109,19 +193,51 @@ const EXTENDED_HEADER: usize = 84;
 
 /// Decodes a watch-relative UTF-16LE name into components: separator split at
 /// the code-unit level first, then strict per-component decode, so the
-/// escalation point of a WTF-16 component keeps its decodable ancestors.
-fn decode_name(units: &[u16]) -> RdcwName {
-  let mut components = Vec::new();
-  for component in units.split(|&unit| unit == u16::from(b'\\')) {
+/// escalation point of a refused component keeps its usable ancestors.
+///
+/// `stream` marks the named-stream actions, whose name is spelled
+/// `owner\path:stream:$DATA`. The suffix is cut at the code-unit level (`:` is
+/// `0x003A`, never half of a surrogate pair) BEFORE decoding, so the fold
+/// works on a name whose stream part is undecodable, and so a `:` can never
+/// enter a `Segment` — the proto path vocabulary has no spelling for one.
+/// Cutting the suffix leaves the OWNER, which is the object whose bytes
+/// changed and the only one a consumer holds; the stream itself is not a
+/// dirent and has no location of its own.
+///
+/// An owner half that cuts away to nothing (`:stream:$DATA` — a stream on the
+/// watched directory itself) yields the empty component list, which the
+/// lowering reads as the root and covers there.
+fn decode_name(units: &[u16], stream: bool) -> RdcwName {
+  const SEPARATOR: u16 = b'\\' as u16;
+  const COLON: u16 = b':' as u16;
+
+  let raw: Vec<&[u16]> = units
+    .split(|&unit| unit == SEPARATOR)
+    .filter(|component| !component.is_empty())
+    .collect();
+  let last = raw.len().wrapping_sub(1);
+  let mut components = Vec::with_capacity(raw.len());
+  for (index, component) in raw.into_iter().enumerate() {
+    let component = match (stream && index == last)
+      .then(|| component.iter().position(|&unit| unit == COLON))
+      .flatten()
+    {
+      Some(at) => &component[..at],
+      None => component,
+    };
     if component.is_empty() {
       continue;
     }
-    match char::decode_utf16(component.iter().copied()).collect::<Result<String, _>>() {
-      Ok(decoded) => components.push(decoded),
-      Err(_) => {
-        return RdcwName::Escalate { prefix: components };
-      }
+    let Ok(decoded) = char::decode_utf16(component.iter().copied()).collect::<Result<String, _>>()
+    else {
+      return RdcwName::Escalate { prefix: components };
+    };
+    // A spelling the kernel is free to substitute is not a location: it names
+    // the object for an opener, not for an index.
+    if is_short_name_alias(&decoded) {
+      return RdcwName::Escalate { prefix: components };
     }
+    components.push(decoded);
   }
   RdcwName::Utf8(components)
 }
@@ -201,7 +317,7 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
       .iter()
       .map(|pair| u16::from_le_bytes(*pair))
       .collect();
-    let name = decode_name(&units);
+    let name = decode_name(&units, action.is_stream());
 
     records.push(RdcwRecord {
       action,
@@ -419,6 +535,169 @@ mod tests {
     assert_eq!(
       decoded.records[0].name,
       RdcwName::Utf8(vec!["a".into(), "b".into()])
+    );
+  }
+
+  /// The three named-stream actions decode as themselves. Left as
+  /// `Unknown`, each one's only lowering was a rescan of a colon-bearing
+  /// location — and with the filter bits now subscribed, they arrive.
+  #[test]
+  fn stream_actions_decode() {
+    for (word, expected) in [
+      (6u32, RdcwAction::StreamAdded),
+      (7, RdcwAction::StreamRemoved),
+      (8, RdcwAction::StreamModified),
+    ] {
+      let mut buf = Vec::new();
+      push_record(&mut buf, false, 0, word, &utf16("dir\\file.txt:ads:$DATA"));
+      let decoded = decode_records(&buf, false);
+      assert_eq!(decoded.records[0].action, expected);
+      assert!(expected.is_stream());
+      assert_eq!(
+        decoded.records[0].name,
+        RdcwName::Utf8(vec!["dir".into(), "file.txt".into()]),
+        "the stream suffix folds onto its owner"
+      );
+    }
+  }
+
+  /// The fold is scoped to the stream actions and to the LAST component: an
+  /// ordinary action's name is never cut, and an ancestor is never cut.
+  #[test]
+  fn the_stream_fold_touches_only_a_stream_records_leaf() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 3, &utf16("file.txt:ads:$DATA"));
+    let decoded = decode_records(&buf, false);
+    assert_eq!(
+      decoded.records[0].name,
+      RdcwName::Utf8(vec!["file.txt:ads:$DATA".into()]),
+      "a non-stream action's name is delivered verbatim"
+    );
+
+    // A `:` can only ever appear in the leaf of a real notify name, so a
+    // planted one above it must survive: cutting it would rewrite an
+    // ancestor the record never named.
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 8, &utf16("od:d\\file.txt:ads"));
+    let decoded = decode_records(&buf, false);
+    assert_eq!(
+      decoded.records[0].name,
+      RdcwName::Utf8(vec!["od:d".into(), "file.txt".into()])
+    );
+  }
+
+  /// A stream on the watched directory itself folds to the empty name, which
+  /// the lowering reads as the root and covers there — never a location whose
+  /// leaf is a stream suffix.
+  #[test]
+  fn a_stream_on_the_root_folds_to_the_root() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 7, &utf16(":ads:$DATA"));
+    let decoded = decode_records(&buf, false);
+    assert_eq!(decoded.records[0].name, RdcwName::Utf8(vec![]));
+  }
+
+  /// No fold, on any action, may leave a `:` inside a component: the proto
+  /// path vocabulary has no spelling for one.
+  #[test]
+  fn a_stream_action_never_publishes_a_colon() {
+    for word in [6u32, 7, 8] {
+      for name in ["f:s", "f:s:$DATA", ":s", "a\\b\\f:s:$DATA", "f:", "f::x"] {
+        let mut buf = Vec::new();
+        push_record(&mut buf, false, 0, word, &utf16(name));
+        let decoded = decode_records(&buf, false);
+        let (RdcwName::Utf8(components) | RdcwName::Escalate { prefix: components }) =
+          &decoded.records[0].name;
+        assert!(
+          components.iter().all(|c| !c.contains(':')),
+          "action {word} on {name:?} published {components:?}"
+        );
+      }
+    }
+  }
+
+  /// The 8.3 classifier: generated aliases are recognized, and names that
+  /// merely resemble them are not.
+  #[test]
+  fn short_name_aliases_classify() {
+    for alias in [
+      "LONGFI~1.TXT",
+      "PROGRA~1",
+      "PROGRA~2",
+      "A~1",
+      "AB12CD~1.DLL",
+      "LONGF~12",
+      "X~9.C",
+    ] {
+      assert!(is_short_name_alias(alias), "{alias} is a generated alias");
+    }
+    for plain in [
+      "",
+      "README.TXT",         // its own short form: nothing to diverge from
+      "Long File Name.txt", // the canonical spelling
+      "longfi~1.txt",       // aliases are upper-cased
+      "~1.TXT",             // a generated alias always keeps a base
+      "LONGFI~",            // no disambiguating run
+      "LONGFI~1A",          // the run is not decimal
+      "MY~FILE.TXT",        // ditto
+      "ABCDEFGHI~1.TXT",    // the base is past 8
+      "LONGFI~1.TEXT",      // the extension is past 3
+      "LONG~1.A.B",         // two dots is not 8.3
+    ] {
+      assert!(!is_short_name_alias(plain), "{plain} is not an alias");
+    }
+  }
+
+  /// The whole point: a record delivered under the short spelling must not
+  /// publish it as the event's location. It escalates at the alias, keeping
+  /// every canonical ancestor above it, so the lowering covers the parent and
+  /// the consumer re-reads the canonical name from the filesystem.
+  #[test]
+  fn a_short_name_alias_escalates_instead_of_publishing() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 3, &utf16("deep\\LONGFI~1.TXT"));
+    let decoded = decode_records(&buf, false);
+    assert!(!decoded.lossy, "an alias is a well-formed record");
+    assert_eq!(
+      decoded.records[0].name,
+      RdcwName::Escalate {
+        prefix: vec!["deep".into()],
+      }
+    );
+
+    // An aliased DIRECTORY escalates there, not at its leaf: everything below
+    // an unresolvable ancestor is unresolvable too.
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 2, &utf16("PROGRA~1\\sub\\gone.txt"));
+    let decoded = decode_records(&buf, false);
+    assert_eq!(
+      decoded.records[0].name,
+      RdcwName::Escalate { prefix: vec![] }
+    );
+
+    // And a canonical name in the same position still delivers.
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 3, &utf16("deep\\Long File Name.txt"));
+    let decoded = decode_records(&buf, false);
+    assert_eq!(
+      decoded.records[0].name,
+      RdcwName::Utf8(vec!["deep".into(), "Long File Name.txt".into()])
+    );
+  }
+
+  /// The fold runs BEFORE the alias test, so a stream on a short-named owner
+  /// is judged on the owner rather than on `OWNER~1.TXT:ads:$DATA`, which no
+  /// 8.3 shape would ever match.
+  #[test]
+  fn the_stream_fold_precedes_the_alias_test() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 8, &utf16("d\\LONGFI~1.TXT:ads:$DATA"));
+    let decoded = decode_records(&buf, false);
+    assert_eq!(
+      decoded.records[0].name,
+      RdcwName::Escalate {
+        prefix: vec!["d".into()],
+      }
     );
   }
 }
