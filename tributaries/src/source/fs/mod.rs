@@ -953,8 +953,9 @@ fn cookie_name(token: SyncToken) -> String {
 
 /// Whether `leaf` is a sync cookie's file name as SOME release of this binding minted
 /// it directly in the sync directory: the reserved prefix, then `instance-pid-seq`
-/// rendered decimal, then — for the shape [`cookie_name`] mints today — a `nonce` of
-/// sixteen lowercase hex digits.
+/// rendered decimal — each inside the range its own minter can produce, never merely
+/// well-formed — then, for the shape [`cookie_name`] mints today, a `nonce` of sixteen
+/// lowercase hex digits.
 ///
 /// # Why both shapes
 ///
@@ -983,9 +984,35 @@ fn is_cookie_name(leaf: &str) -> bool {
   let (Some(instance), Some(pid), Some(seq)) = (fields.next(), fields.next(), fields.next()) else {
     return false;
   };
-  if !(is_minted_decimal(instance, u64::MAX)
-    && is_minted_decimal(pid, u64::from(u32::MAX))
-    && is_minted_decimal(seq, u64::MAX))
+  // Every decimal field is bounded to EXACTLY what its minter can render, and each
+  // bound must hold for the three-field release as well as for today's, since both
+  // shapes are accepted here. Too wide swallows a user file — silently, with no
+  // `Rescan`; too narrow surfaces a GENUINE cookie as a user create, which is the
+  // worse direction, so no bound below is a guess about a field's range.
+  //
+  // * `instance` — `Owner::on_sync` renders `sub.instance().get()`, and an
+  //   [`InstanceId`](crate::subscription::InstanceId) is a `NonZeroU64` minted as
+  //   `fetch_add(1) + 1`: the first owner in a process brands 1, and 0 is not
+  //   representable at all. The three-field release rendered this field from the
+  //   same type, so the floor holds for both shapes.
+  // * `pid` — `std::process::id()`, a `u32`, which is where the ceiling comes from.
+  //   Its FLOOR is the one bound here resting on OS semantics rather than on this
+  //   workspace's own source: pid 0 is the scheduler on Unix and the System Idle
+  //   pseudo-process on Windows, never a process that can execute this code. It is
+  //   therefore the first bound to drop should that evidence ever be questioned.
+  // * `seq` — `Owner::sync_seq`, which starts at 0 and is PRE-incremented before the
+  //   token is minted, so the first sync of every owner renders 1 and no sync ever
+  //   renders 0; the three-field release pre-incremented identically. (The lower
+  //   crate's `sync_tickets` does start at 0, but that sequence brands a
+  //   [`SyncTicket`](tributary_fs::SyncTicket) — an in-memory cancel address — and
+  //   never reaches a file name.)
+  //
+  // The `nonce` deliberately gets NO value bound: it is a hash output, so every
+  // `u64` including 0 is mintable, and its sixteen-lowercase-hex shape is the whole
+  // of what can be checked.
+  if !(is_minted_decimal(instance, 1, u64::MAX)
+    && is_minted_decimal(pid, 1, u64::from(u32::MAX))
+    && is_minted_decimal(seq, 1, u64::MAX))
   {
     return false;
   }
@@ -1003,12 +1030,18 @@ fn is_cookie_name(leaf: &str) -> bool {
   }
 }
 
-/// Whether `field` is exactly what `format!("{n}")` renders for some `n <= max`: decimal
-/// digits, no sign, and no redundant leading zero (`0` itself is the one-digit case).
-fn is_minted_decimal(field: &str, max: u64) -> bool {
+/// Whether `field` is exactly what `format!("{n}")` renders for some `n` in `min..=max`:
+/// decimal digits, no sign, and no redundant leading zero (`0` itself is the one-digit
+/// case).
+///
+/// The range is the caller's to justify from the field's minter — see the per-field
+/// derivation in [`is_cookie_name`], the only caller.
+fn is_minted_decimal(field: &str, min: u64, max: u64) -> bool {
   field.bytes().all(|b| b.is_ascii_digit())
     && (field.len() == 1 || !field.starts_with('0'))
-    && field.parse::<u64>().is_ok_and(|value| value <= max)
+    && field
+      .parse::<u64>()
+      .is_ok_and(|value| (min..=max).contains(&value))
 }
 
 /// Rebuilds a filesystem path from key components — the reverse of
