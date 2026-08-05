@@ -34,6 +34,7 @@ impl Event {
       ChangeKind::Removed => EventKind::Removed,
       ChangeKind::Moved(from) => EventKind::Moved(MovedEvent {
         from: absolute(root_path, from),
+        location: from.clone(),
       }),
       ChangeKind::Rescan => EventKind::Rescan,
       // The proto vocabulary is non-exhaustive; an unknown future kind is
@@ -112,6 +113,7 @@ impl Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MovedEvent {
   from: PathBuf,
+  location: Location,
 }
 
 impl MovedEvent {
@@ -119,6 +121,20 @@ impl MovedEvent {
   #[inline]
   pub fn from(&self) -> &Path {
     self.from.as_path()
+  }
+
+  /// The source endpoint's location relative to the watched root — the second
+  /// coordinate of the rename, measured against the same root as
+  /// [`Event::location`].
+  ///
+  /// A rename is reported as [`Moved`](EventKind::Moved) only when **both**
+  /// endpoints lie under the watched root (a move across the boundary degrades
+  /// to a [`Created`](EventKind::Created) or [`Removed`](EventKind::Removed)),
+  /// so this is always a real location under that root rather than a
+  /// placeholder.
+  #[inline]
+  pub const fn location(&self) -> &Location {
+    &self.location
   }
 }
 

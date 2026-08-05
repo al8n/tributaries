@@ -52,6 +52,11 @@ fn moved_carries_the_absolute_source_path() {
   let moved = e.kind().moved().expect("a moved payload");
   assert_eq!(moved.from(), Path::new("/watch/root/old/name"));
   assert_eq!(e.path(), Path::new("/watch/root/new/name"));
+  // A rename has two endpoints, and `Event::location` can only carry one: the source
+  // endpoint keeps its own root-relative coordinate, so a consumer indexing by location
+  // can retire the old entry rather than only learning an absolute path.
+  assert_eq!(moved.location(), &loc(&["old", "name"]));
+  assert_eq!(e.location(), &loc(&["new", "name"]));
 }
 
 #[test]
