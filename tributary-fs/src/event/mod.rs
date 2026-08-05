@@ -52,6 +52,27 @@ impl Event {
     }
   }
 
+  /// Assembles a consumer event exactly as [`Watcher`](crate::Watcher)'s own delivery path
+  /// does — `Event::from_change` under a [`RootHandle`] branded with `instance` and the
+  /// change's own scope.
+  ///
+  /// **Internal, not public API** (hence `#[doc(hidden)]`; it is exempt from this crate's
+  /// semver surface and may change or vanish in a patch release). It exists because the
+  /// `tributaries` umbrella binds this vocabulary to its own
+  /// (`SourceEvent::from_fs`) and that binding had no cell of its own: an `Event` is minted
+  /// only by a live watcher draining a real kernel stream, so every test of the binding was
+  /// forced to hand-build the *output* and assert against itself, leaving the conversion —
+  /// including which of a rename's two locations reaches the umbrella — unwitnessed. A
+  /// cross-crate seam that mints a REAL lower-layer event from a real [`Change`] is what lets
+  /// that conversion be tested as the conversion it is.
+  ///
+  /// It is deliberately not `#[cfg(test)]`: `cfg(test)` does not apply to a crate compiled as
+  /// a dependency, which is exactly how the umbrella's unit tests see this one.
+  #[doc(hidden)]
+  pub fn from_change_under_instance(instance: u64, root_path: &Path, change: &Change) -> Self {
+    Self::from_change(RootHandle::new(instance, change.scope()), root_path, change)
+  }
+
   /// The watched root this event belongs to.
   #[inline]
   pub const fn root(&self) -> RootHandle {

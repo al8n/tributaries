@@ -9788,6 +9788,148 @@ mod reserved_namespace {
   }
 
   // ---------------------------------------------------------------------------
+  // …and on a cookie observed as a move's SOURCE endpoint.
+  // ---------------------------------------------------------------------------
+
+  /// A cookie renamed OUT of the reserved namespace is observed at the move's **source**
+  /// endpoint, which [`SourceEvent::key`](crate::SourceEvent::key) — the destination — does
+  /// not name. The owner saw the ordered post-cookie proof either way: the queue reached the
+  /// cookie, which is the whole content of the barrier. Matching the pending key against the
+  /// destination alone therefore left this barrier parked on an event that can never arrive,
+  /// until its caller's own timeout fired over a source that had done nothing wrong.
+  ///
+  /// Both halves are asserted, as in the destination row: the barrier resolves AND the user
+  /// endpoint — here the move's destination, an ordinary name the artifact was adopted into
+  /// — is still delivered as its own projection.
+  async fn assert_a_cookie_leaving_the_reserved_namespace_resolves_its_barrier(
+    cookie: &str,
+    cookie_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key(cookie),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    // The artifact leaves the namespace: source = the cookie, destination = a user name.
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      cookie,
+      cookie_location,
+      "/a/adopted",
+      "adopted",
+      1,
+    ));
+
+    let delivered = h.drain();
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == sub)
+      .expect("the user endpoint is delivered, barrier or no barrier");
+    assert!(
+      projected.kind().is_created(),
+      "the covered endpoint is the destination, so the move projects to a Created: \
+       {projected:?}"
+    );
+    assert_eq!(
+      projected.path(),
+      Path::new("/a/adopted"),
+      "keyed on the user endpoint, never on the reserved source"
+    );
+    assert_eq!(
+      projected.move_from(),
+      None,
+      "a Created names no other endpoint, so the cookie path cannot leak through it"
+    );
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "the cookie was observed as the move's SOURCE endpoint, which resolves the barrier"
+    );
+  }
+
+  /// FAIL-ON-REVERT: match the pending key against `event.key()` alone in
+  /// `resolve_matching_pending_sync` (dropping the `masks_source` arm) and the reply stays
+  /// pending — `now_or_never()` answers `None` — while the caller waits out its deadline.
+  #[tokio::test]
+  async fn a_cookie_leaving_the_reserved_namespace_resolves_its_barrier_by_leaf_grammar() {
+    assert_a_cookie_leaving_the_reserved_namespace_resolves_its_barrier("/a/cookie-7", "cookie-7")
+      .await;
+  }
+
+  /// The same, on the parent-directory ground.
+  #[tokio::test]
+  async fn a_cookie_leaving_the_reserved_namespace_resolves_its_barrier_by_parent_directory() {
+    let (cookie, location) = inside_the_cookie_directory("anything");
+    assert_a_cookie_leaving_the_reserved_namespace_resolves_its_barrier(&cookie, &location).await;
+  }
+
+  /// A rename BETWEEN two reserved names classifies `All` — nothing about it may reach any
+  /// subscriber — and the pending cookie can sit at EITHER end of it. This cell pins the end
+  /// a destination-only match misses: the barrier's cookie is the move's **source**, renamed
+  /// away to another reserved name.
+  ///
+  /// The suppression is asserted alongside the resolution: a both-reserved change reaching a
+  /// subscriber would be the namespace leak the masking exists to prevent, and a barrier
+  /// certificate is no licence for it.
+  ///
+  /// FAIL-ON-REVERT: as above — restore the `event.key()`-only match and the reply stays
+  /// pending, because the key names the reserved DESTINATION and the cookie is at the source.
+  #[tokio::test]
+  async fn a_cookie_renamed_between_two_reserved_names_resolves_at_its_source_endpoint() {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key("/a/cookie-7"),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    // Both endpoints are reserved, and the pending cookie is the SOURCE one. The destination
+    // uses the parent-directory ground, so the two ends are reserved on DIFFERENT grounds and
+    // neither verdict could have been inferred from the other.
+    let (destination, destination_location) = inside_the_cookie_directory("renamed");
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/cookie-7",
+      "cookie-7",
+      &destination,
+      &destination_location,
+      1,
+    ));
+
+    assert!(
+      h.drain().is_empty(),
+      "a change reserved at every endpoint reaches nobody, barrier or no barrier"
+    );
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "the cookie was observed at the move's source endpoint, which resolves the barrier"
+    );
+  }
+
+  // ---------------------------------------------------------------------------
   // The resolution is strictly AFTER the change's own publication.
   // ---------------------------------------------------------------------------
 
@@ -10117,6 +10259,197 @@ mod reserved_namespace {
       Some(SourceEvent::new(
         1,
         key(&format!("/a/{COOKIE_DIR}/{}", self.minted)),
+        EventKind::Created,
+        Location::new(),
+        Epoch::new(self.minted),
+        Some(ChangeId::new(NonZeroU64::MIN)),
+      ))
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.live.get(&handle).cloned()
+    }
+  }
+
+  /// The same flood against a **current-thread** executor — the mode where "the loop keeps
+  /// spinning" stops being a latency question and becomes a liveness one.
+  ///
+  /// A [`Source`] may legally return `Some` on every poll, the biased `select!` puts that arm
+  /// above the timer, and consuming a record awaits nothing — a wholly reserved one does not
+  /// even reach the channel. So the owner task can complete iteration after iteration without
+  /// one await that returns `Pending`. On tokio's `new_current_thread` (and single-threaded
+  /// smol, both supported) that task then owns the thread outright: the subscriber draining
+  /// the stream, the `close()` caller and every unrelated task stop being polled for as long
+  /// as the source stays ready — which, for another process syncing against the same tree, is
+  /// indefinitely.
+  ///
+  /// The multi-threaded flood cell above cannot see this: a second worker keeps the consumer
+  /// running whatever the owner does. That runtime flavour was in fact chosen to get around
+  /// this very behaviour while the cell was being written, so the workaround was the defect.
+  ///
+  /// Both halves are proven ON that executor, and the user record is released MID-flood (the
+  /// source mints it between cookies, never ahead of them), so the delivery is evidence that
+  /// source servicing kept reaching a consumer while the flood ran:
+  ///   1. `w.next()` hands over the user's change;
+  ///   2. `w.close()` — which rides its own channel, but only reaches it if the CALLER is
+  ///      polled — completes.
+  ///
+  /// # Why the worker thread
+  ///
+  /// A livelocked owner cannot be shut down and `block_on` never returns, so an in-runtime
+  /// timeout is worthless: its own task is not polled either, and a failing run would HANG
+  /// rather than fail. So the runtime is built on a worker thread and this thread waits on a
+  /// channel with a deadline. On expiry it sets the flood's stop flag — the source then drains
+  /// (`next` answers `None`) and the worker unwinds to completion — and fails loudly with the
+  /// livelock named. A cell that can only hang is a cell that proves nothing under mutation.
+  ///
+  /// FAIL-ON-REVERT: drop the `SOURCE_FAIRNESS_BUDGET` yield at the foot of `run`'s loop and
+  /// this cell fails on the deadline — "the current-thread runtime never reported: the owner
+  /// task monopolized the executor" — instead of on an assertion, which is exactly what the
+  /// livelock is.
+  #[test]
+  fn a_current_thread_executor_survives_an_endlessly_ready_source() {
+    let stop = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    // Belt and braces with the explicit store below: the flood must stop on EVERY way out of
+    // this frame, or a leaked worker thread spins for the rest of the test binary's life.
+    let _stop_on_exit = StopFloodOnDrop(stop.clone());
+    let (release_tx, release_rx) = async_channel::unbounded::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+    let worker_stop = stop.clone();
+    let worker = std::thread::spawn(move || {
+      let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the current-thread runtime builds");
+      runtime.block_on(async move {
+        let source = EndlessReservedFloodSource {
+          next_handle: 0,
+          live: HashMap::new(),
+          release: release_rx,
+          minted: 0,
+          stop: worker_stop,
+        };
+        let mut w: super::super::Tributaries<OsString, (), TokioRuntime, u32> =
+          super::super::Tributaries::with_source(source, TributariesOptions::new());
+        let sub = w
+          .watch(key("/a"), (), WatchOptions::new())
+          .await
+          .expect("watch /a"); // handle 1
+
+        // From here the source is ready on every poll, forever. Release one user record
+        // into the middle of that stream.
+        release_tx.try_send(()).expect("release the user change");
+
+        let event = w
+          .next()
+          .await
+          .expect("the stream is open while the flood runs");
+        assert_eq!(event.subscription(), sub, "routed to the covering sub");
+        assert_eq!(
+          event.path(),
+          Path::new("/a/f"),
+          "…and it is the user's change, not a cookie"
+        );
+
+        w.close().await.expect("close is acknowledged");
+        // Only reached when both halves completed; a panic above disconnects the channel
+        // instead, which this thread's waiter reports as a failure rather than a livelock.
+        let _ = done_tx.send(());
+      });
+    });
+
+    let verdict = done_rx.recv_timeout(Duration::from_secs(20));
+    // Whatever happened, let the worker finish: a still-spinning source keeps the thread hot.
+    stop.store(true, core::sync::atomic::Ordering::SeqCst);
+    match verdict {
+      Ok(()) => worker.join().expect("the worker thread completed cleanly"),
+      // The worker panicked (an assertion failed): surface its own message.
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        let panic = worker
+          .join()
+          .expect_err("a disconnect means the worker unwound");
+        std::panic::resume_unwind(panic);
+      }
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        let _ = worker.join();
+        panic!(
+          "the current-thread runtime never reported: the owner task monopolized the \
+           executor under an endlessly ready source, so neither the consumer nor the \
+           close caller was ever polled"
+        );
+      }
+    }
+  }
+
+  /// A source with an unbounded supply of reserved records and no `Pending` in it: past the
+  /// first arm, every poll returns `Some` immediately. One user record can be spliced into the
+  /// middle of that stream by the test, so a delivery proves servicing continued DURING the
+  /// flood rather than merely before it.
+  ///
+  /// Distinct from [`ArtifactFloodSource`] on purpose: that one holds its user record back
+  /// behind an awaited trigger and emits it FIRST, which is what its own cell needs.
+  struct EndlessReservedFloodSource {
+    next_handle: u32,
+    live: HashMap<u32, Vec<OsString>>,
+    /// Probed non-blockingly on each poll: a token here mints the user record in place of
+    /// that poll's cookie, so it arrives BETWEEN flood records.
+    release: async_channel::Receiver<()>,
+    minted: u64,
+    stop: std::sync::Arc<core::sync::atomic::AtomicBool>,
+  }
+
+  impl Source<OsString> for EndlessReservedFloodSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      self.next_handle += 1;
+      let handle = self.next_handle;
+      self.live.insert(handle, key.to_vec());
+      Ok(Armed::new(handle, key.to_vec()))
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.live.remove(&handle);
+    }
+
+    /// The parent-directory ground — a cookie whose leaf name follows no grammar this crate
+    /// knows, which is the shape another `Watcher` over the same tree actually produces.
+    fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+      key
+        .len()
+        .checked_sub(2)
+        .and_then(|parent| key[parent].to_str())
+        .is_some_and(|parent| parent == COOKIE_DIR)
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      // Nothing is minted before a root is armed: a record naming a handle this source has
+      // not issued reads as a DEAD-root record and takes the retirement path, not the flood
+      // path. The `watch` command that arms is what wakes this select, so parking here costs
+      // no wakeup of its own.
+      if self.live.is_empty() {
+        core::future::pending::<()>().await;
+      }
+      // The escape hatch the waiting thread uses to end a livelocked run: draining the source
+      // is the one thing that stops the flood without the owner having to be polled by anyone.
+      if self.stop.load(core::sync::atomic::Ordering::SeqCst) {
+        return None;
+      }
+      self.minted += 1;
+      // Cancellation-safe: the token and the record it mints are taken on the same poll that
+      // returns `Ready`, so a losing `select!` arm dropping this future loses neither.
+      let key = match self.release.try_recv() {
+        Ok(()) => key("/a/f"),
+        Err(_) => key(&format!("/a/{COOKIE_DIR}/{}", self.minted)),
+      };
+      Some(SourceEvent::new(
+        1,
+        key,
         EventKind::Created,
         Location::new(),
         Epoch::new(self.minted),

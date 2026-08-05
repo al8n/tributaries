@@ -1384,7 +1384,12 @@ enum ReplaceStep<C, H> {
 /// mailboxes get FAIR service, because the biased `select!` alone would let a continuously-ready
 /// command mailbox starve the sync arm forever: at most one queued sync is taken non-blockingly at
 /// the top of each iteration and dispatched inline, against the at-most-one command the `select!`
-/// below dispatches, so the two are served 1:1 under any flood. On a close request, a
+/// below dispatches, so the two are served 1:1 under any flood. Priority decides only who is served
+/// FIRST, never who gets the thread: every arm can complete without an await that returns
+/// `Pending`, so the loop also hands the thread back once per [`EXECUTOR_FAIRNESS_BUDGET`]
+/// iterations — the executor-fairness valve, without which a source that is ready on every poll
+/// runs this task forever and starves the consumer, the timer and `close()`'s own caller on any
+/// current-thread executor. On a close request, a
 /// dropped last handle (the command channel closed), or the source draining (`next` yields `None`), it
 /// breaks, flushes the coalesced tail (no-silent-loss), and tears down — dropping the [`Owner`] (and
 /// its source, whose own `Drop` performs the orderly source teardown). Nothing is owed to `Drop`.
@@ -1398,6 +1403,9 @@ where
   // Command-fairness valve state: consecutive command-arm wins since the data plane
   // was last serviced. See [`COMMAND_FAIRNESS_BUDGET`].
   let mut command_streak: u32 = 0;
+  // Executor-fairness valve state: loop iterations dispatched since this task last handed the
+  // thread back. See [`EXECUTOR_FAIRNESS_BUDGET`].
+  let mut executor_streak: u32 = 0;
   // Whether the dedicated close channel is still open. It closes when every [`Tributaries`] handle is
   // dropped — but that is NOT itself a teardown signal (the command channel closing remains the
   // dropped-handles teardown signal). So on a closed close channel the arm just disables itself
@@ -1658,6 +1666,53 @@ where
         drain_owed,
       } => break (closing, drain_owed),
     }
+
+    // The EXECUTOR-fairness valve. Nothing above it is required to yield: a
+    // [`Source::next`] that returns `Some` on every poll wins the biased `select!` every
+    // iteration, `consume_source_event` is synchronous throughout, and the iteration closes
+    // without a single await that must return `Pending`. On a multi-threaded executor other
+    // tasks merely run elsewhere; on a **current-thread** one — tokio's `new_current_thread`,
+    // single-threaded smol, both supported — this task then owns the thread forever, and the
+    // subscriber draining the event channel, the `close()` caller, the settle timer and every
+    // unrelated task on that executor never run again. The command-fairness valve above cannot
+    // stand in for this: the source arm zeroes `command_streak`, so under a source flood it
+    // never fires, and even when it does it awaits nothing.
+    //
+    // So after [`EXECUTOR_FAIRNESS_BUDGET`] iterations, hand the thread back once. A source
+    // that is ready on every poll produces exactly one iteration per record, so this bounds
+    // consecutive ready source records by the same number.
+    //
+    // Counted per ITERATION rather than per source record so no arm is left a sibling. The
+    // source arm is the one reachable with no help at all — a conforming source supplies
+    // records forever by itself — but the sync arm is reachable from a caller thread OUTSIDE
+    // this executor: past [`MAX_PENDING_SYNCS`] every request is refused with `Busy` and
+    // `on_sync` then awaits nothing, so another thread enqueueing faster than this loop drains
+    // keeps that arm ready with no yield in it, and the command arm behaves the same way for a
+    // source whose `arm`/`disarm` complete synchronously. The CLEANUP arm is the one that
+    // genuinely cannot: a [`Cleanup`] is minted only by a [`WatchGrant`], each grant sends
+    // exactly one, and the top-of-loop `drain_pending_cleanup` empties the channel every
+    // iteration — its supply is bounded by grants in flight, so it necessarily runs dry.
+    // Counting iterations covers all four with one mechanism and one constant.
+    //
+    // Placed HERE, after the whole iteration has been dispatched, for the ordering: a record's
+    // publication, its settle-clock tick and its barrier resolution all happen inside the one
+    // synchronous `consume_source_event` call, so this await cannot land between them. It
+    // cannot reorder a delivery against a `Rescan` (both are already in the channel or in
+    // `needs_rescan` when it runs) and it cannot split the publish-before-resolve barrier (a
+    // reply that leaves does so from inside the same completed call). What it re-orders is only
+    // what the loop does NEXT, which is exactly the point. It is also below the `Flow::Break`
+    // arms, so a teardown never pays it.
+    //
+    // The counter is reset by the yield ALONE, not by another arm winning (which is where it
+    // differs from `command_streak`). That valve exists to guarantee the data plane is
+    // SERVICED, so servicing it discharges the debt; this one exists to guarantee the executor
+    // gets its thread back, and only actually giving it back discharges that. An interleaved
+    // flood must not be able to clear the streak without a single yield ever happening.
+    executor_streak += 1;
+    if executor_streak >= EXECUTOR_FAIRNESS_BUDGET {
+      executor_streak = 0;
+      R::yield_now().await;
+    }
   };
 
   // Reap every cookie still riding a pending sync: their callers will see the
@@ -1763,6 +1818,40 @@ const RETRY: Duration = Duration::from_millis(25);
 /// events and the coalescer its hold bounds for the flood's whole duration. Small enough to bound
 /// data-plane staleness tightly under load, large enough to amortize the extra poll.
 const COMMAND_FAIRNESS_BUDGET: u32 = 32;
+
+/// How many iterations the [`run`] loop dispatches before handing the thread back with one
+/// [`yield_now`](agnostic_lite::RuntimeLite::yield_now) — the executor-fairness valve.
+///
+/// No arm of the loop is obliged to yield. [`Source::next`] may legally return `Some` on every
+/// poll for as long as it has records, and the biased `select!` puts that arm above the settle
+/// timer, so a source with a standing backlog wins every iteration; consuming a record awaits
+/// nothing — `consume_source_event` is synchronous end to end, and a wholly reserved record
+/// does not even reach the channel. On a multi-threaded executor that only monopolizes one
+/// worker; on a **current-thread** executor it monopolizes the whole runtime, and the consumer
+/// draining the event stream, the `close()` caller and every unrelated task stop running for as
+/// long as the source stays ready. A conforming source is enough to cause it — another process
+/// syncing against the same tree produces exactly such a stream — which is why the bound is not
+/// something a `Source` contract clause could be asked to provide instead.
+///
+/// The control-plane arms reach the same state from a caller thread outside this executor: past
+/// [`MAX_PENDING_SYNCS`] a sync request is refused with [`SyncError::Busy`] and nothing is
+/// awaited on the way out, and a command whose `Source` reconciles synchronously is no
+/// different. Counting ITERATIONS rather than source records covers every arm with one
+/// mechanism; it also bounds consecutive ready source records by this same number, since such a
+/// source produces exactly one iteration per record.
+///
+/// What it buys: an upper bound of this many iterations on how long any other task on a
+/// current-thread executor can be kept off the thread by this one, which is what makes
+/// `close()`, the subscriber and the timer reachable at all in that mode.
+///
+/// What it costs: one reschedule per this many iterations. `yield_now` performs no syscall and
+/// wakes immediately, and an idle loop parks in its `select!` rather than iterating, so the
+/// steady-state cost is a fraction of one wakeup per record. Chosen larger than
+/// [`COMMAND_FAIRNESS_BUDGET`] because the two bound different things — that one bounds
+/// staleness (small is better), this one bounds monopolization (large enough to amortize the
+/// reschedule across a burst, small enough that a starved task waits on a bounded, tiny amount
+/// of work).
+const EXECUTOR_FAIRNESS_BUDGET: u32 = 64;
 
 /// The most sync barriers one owner may hold in flight at once.
 ///
@@ -3946,14 +4035,16 @@ where
     if event.kind().is_rescan() {
       self.dominate_pending_syncs(event);
     } else if reserved.any() {
-      // The cookie's own event, however it arrived: created in place, unlinked, or
-      // RENAMED into the reserved namespace, which is a cookie observation on the same
-      // terms as any other. Resolved under the identical discipline the `Rescan` above
-      // obeys — strictly after this change's own publication, so a caller waking on
-      // another thread cannot drain past a delivery this barrier's resolution implies it
-      // will find. A `Rescan` is never classified, so the two arms are disjoint by
-      // construction rather than by ordering luck.
-      self.resolve_matching_pending_sync(event);
+      // The cookie's own event, however it arrived: created in place, unlinked, RENAMED
+      // INTO the reserved namespace, or renamed OUT of it — each is a cookie observation on
+      // the same terms as any other, so the classification travels with the event and the
+      // resolver matches the pending key against every endpoint it names as reserved.
+      // Resolved under the identical discipline the `Rescan` above obeys — strictly after
+      // this change's own publication, so a caller waking on another thread cannot drain
+      // past a delivery this barrier's resolution implies it will find. A `Rescan` is never
+      // classified, so the two arms are disjoint by construction rather than by ordering
+      // luck.
+      self.resolve_matching_pending_sync(event, reserved);
     }
   }
 
@@ -4191,12 +4282,34 @@ where
   /// owes a `Rescan` instead (an earlier loss, or a delta shed to a parked
   /// `Rescan` by a full channel during the flush): the caller must re-read,
   /// not replay, so telling it `Delivered` would risk stale state.
-  fn resolve_matching_pending_sync(&mut self, event: &SourceEvent<C, S::Handle>) {
-    let Some(idx) = self
-      .pending_syncs
-      .iter()
-      .position(|pending| pending.cookie_key.as_slice() == event.key())
-    else {
+  ///
+  /// # The cookie is whichever endpoint the classification reserved
+  ///
+  /// `reserved` is this change's own [`ReservedEndpoints`] verdict, computed once at the
+  /// [`Source`] seam ([`reserved_endpoints`](Self::reserved_endpoints)) and threaded here rather
+  /// than re-derived, and the pending key is matched against **every** endpoint it names.
+  /// [`SourceEvent::key`] is a move's DESTINATION, so matching it alone answers only half the
+  /// question: a cookie renamed OUT of the reserved namespace
+  /// ([`Source`](ReservedEndpoints::Source)) is the move's `move_from`, and a rename BETWEEN two
+  /// reserved names ([`All`](ReservedEndpoints::All)) can carry the pending cookie at either
+  /// end. Observing the cookie as a move's source endpoint is proof the queue reached it on
+  /// exactly the same terms as observing it as a destination — the owner saw the ordered
+  /// post-cookie state — so a key-only match left those barriers unresolved until their caller's
+  /// own timeout fired, over a source that had done nothing wrong.
+  ///
+  /// The two arms cannot both fire for one pending entry: the first match wins and the entry is
+  /// removed, and a move whose two endpoints are the same key is not a move.
+  fn resolve_matching_pending_sync(
+    &mut self,
+    event: &SourceEvent<C, S::Handle>,
+    reserved: ReservedEndpoints,
+  ) {
+    let move_from = event.move_from();
+    let Some(idx) = self.pending_syncs.iter().position(|pending| {
+      let cookie = pending.cookie_key.as_slice();
+      (reserved.masks_destination() && cookie == event.key())
+        || (reserved.masks_source() && move_from.is_some_and(|from| cookie == from))
+    }) else {
       return;
     };
     let pending = self.pending_syncs.swap_remove(idx);
@@ -4781,7 +4894,11 @@ fn widen_to_cover<C: PartialEq>(parked: &mut Vec<C>, key: &[C]) {
 /// per-subscriber delivery as a flat owned [`Event`]. The router thus stays key-generic
 /// and I/O-free while the source-specific key extraction already happened at the
 /// [`Source`] binding.
-struct SourceRoutable<'a, C, V, H> {
+///
+/// Crate-visible so a binding's own tests can route a real converted event through the REAL
+/// router rather than restating its rebase arithmetic in a fixture — a second copy of that
+/// arithmetic in a test proves only that the copy agrees with itself.
+pub(crate) struct SourceRoutable<'a, C, V, H> {
   event: &'a SourceEvent<C, H>,
   /// This change's reserved-namespace classification, decided ONCE at the
   /// [`Source`] seam ([`Owner::reserved_endpoints`]) and carried here. The router
@@ -4793,7 +4910,7 @@ struct SourceRoutable<'a, C, V, H> {
 
 impl<'a, C, V, H> SourceRoutable<'a, C, V, H> {
   #[inline]
-  fn new(event: &'a SourceEvent<C, H>, reserved: ReservedEndpoints) -> Self {
+  pub(crate) fn new(event: &'a SourceEvent<C, H>, reserved: ReservedEndpoints) -> Self {
     Self {
       event,
       reserved,

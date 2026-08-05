@@ -67,6 +67,110 @@ fn watch_error_from_fs_classifies_honestly() {
   );
 }
 
+/// The fs-to-neutral EVENT binding ([`SourceEvent::from_fs`](super::SourceEvent::from_fs)),
+/// driven from a real lower-layer [`tributary_fs::Event`] all the way to the delivery a
+/// source-only subscriber receives — the propagation of a rename's SOURCE coordinate across
+/// the seam.
+///
+/// A rename carries two root-relative coordinates and the neutral `SourceEvent` keys on the
+/// destination, so the source endpoint's own location travels in the separate
+/// `move_from_location` slot. Everything downstream of that slot already had cells: the
+/// projection tests hand-build a `SourceEvent` that *already* carries the field, and the fs
+/// crate's own event tests stop one layer below the binding. The binding itself — the single
+/// `Moved::location()` → `with_move_from_location` attachment — had none, so deleting it left
+/// the whole suite green while every real filesystem move-out projection silently went back to
+/// being root-anchored, which a location-aware [`Filter`](crate::Filter) reads as a change at
+/// the watched root and can reject outright.
+///
+/// The event is minted through `tributary_fs`'s own assembly (`Event::from_change_under_instance`,
+/// the seam that mints exactly what `Watcher` delivers) rather than hand-built here, and the
+/// projection runs through the production [`SourceRoutable`] adapter and the real
+/// [`route::fan_out`], so the rebase is the shipped arithmetic and not a restatement of it.
+///
+/// FAIL-ON-REVERT: drop the `with_move_from_location` attachment at the end of
+/// `SourceEvent::from_fs` (return `source_event` unconditionally) and the move-out projection
+/// comes back root-anchored — the location assertion fails while the key assertion still
+/// passes, which is precisely the silence this cell exists to break.
+#[test]
+fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
+  use core::num::NonZeroU64;
+  use std::{ffi::OsString, path::Path};
+
+  use tributary_fs::Event as FsEvent;
+  use tributary_proto::{Change, ChangeId, ChangeKind, Epoch, Location, ScopeId, Segment};
+
+  use crate::{
+    driver::SourceRoutable,
+    event::{Event, path_components},
+    route::{ReservedEndpoints, fan_out},
+    source::SourceEvent,
+    subscription::Subscription,
+  };
+
+  fn loc(parts: &[&str]) -> Location {
+    Location::from_segments(parts.iter().map(|p| Segment::new(*p)))
+  }
+
+  // A real rename INSIDE the watched root `/watch/root`: `old/name` → `new/name`. Both
+  // endpoints are under the root, which is exactly when the fs layer reports a `Moved`.
+  let change = Change::new(
+    ChangeId::new(NonZeroU64::new(7).expect("nonzero")),
+    ScopeId::new(NonZeroU64::new(1).expect("nonzero")),
+    loc(&["new", "name"]),
+    ChangeKind::Moved(loc(&["old", "name"])),
+    Epoch::new(3),
+  );
+  let fs_event = FsEvent::from_change_under_instance(1, Path::new("/watch/root"), &change);
+  let moved = fs_event
+    .kind()
+    .moved()
+    .expect("the lower layer reports a paired rename");
+  assert_eq!(
+    moved.location(),
+    &loc(&["old", "name"]),
+    "the lower layer states the source endpoint's own root-relative coordinate"
+  );
+
+  // THE BINDING under test.
+  let source_event = SourceEvent::from_fs(&fs_event);
+  assert_eq!(
+    source_event.move_from_location(),
+    Some(&loc(&["old", "name"])),
+    "…and the conversion carries it across the seam rather than dropping it"
+  );
+
+  // A subscriber covering ONLY the source endpoint, one level below the watched root: it
+  // receives the synthesized move-out `Removed`, and its coordinate must be the SOURCE
+  // endpoint's, rebased into this subscription's own key.
+  let sub = Subscription::for_test(ScopeId::new(NonZeroU64::new(9).expect("nonzero")));
+  let canonical = path_components(Path::new("/watch/root/old"));
+  let routable = SourceRoutable::<'_, OsString, (), _>::new(&source_event, ReservedEndpoints::None);
+  let delivered: Vec<Event<OsString, ()>> = fan_out(
+    &routable,
+    &[sub],
+    |_| Some(canonical.as_slice()),
+    |_, _| true,
+  );
+
+  assert_eq!(delivered.len(), 1, "the source-only subscriber is served");
+  let projected = &delivered[0];
+  assert!(
+    projected.kind().is_removed(),
+    "source-only coverage projects the move to a Removed: {projected:?}"
+  );
+  assert_eq!(
+    projected.key(),
+    path_components(Path::new("/watch/root/old/name")).as_slice(),
+    "keyed on the move's source endpoint"
+  );
+  assert_eq!(
+    projected.location(),
+    &loc(&["name"]),
+    "and located at that same endpoint, rebased into the subscription's coordinate — \
+     never root-anchored, which would name the watched root itself"
+  );
+}
+
 // The integration suite drives a real kernel watch on a tokio runtime — so it is gated
 // on the runtime feature, off miri (which cannot execute the syscalls), and onto the
 // platforms with a real backend (elsewhere `tributary-fs` compiles but arms fail at
