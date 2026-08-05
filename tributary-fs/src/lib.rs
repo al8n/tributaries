@@ -12,6 +12,7 @@ mod os;
 mod stamped;
 mod watcher;
 
+pub use driver::is_sync_cookie_dir_name;
 pub use error::{
   BuildError, CloseError, ReplaceRootError, SyncRootError, UnwatchError, WatchRootError,
 };

@@ -405,24 +405,36 @@ impl LedgerInner {
   }
 }
 
-/// The reserved-namespace stem of the cookie directory. The umbrella suppresses
-/// every event whose LEAF component starts with this same stem, so the directory's
-/// own create and the cookies inside it are both invisible to consumers — which is
-/// required, since the directory is this driver's artifact and not a user change.
-///
-/// Only a platform that HAS an anchor primitive ever names a cookie directory (see
-/// [`CookieDir`]); where none exists the stem is inert rather than unused, so the
-/// lint is turned off exactly there and stays live everywhere it can still catch
-/// something.
-#[cfg_attr(
-  not(any(
-    target_os = "linux",
-    target_os = "macos",
-    all(target_os = "windows", not(miri))
-  )),
-  allow(dead_code)
-)]
+/// The reserved-namespace stem of the cookie directory. A consumer of this crate
+/// suppresses the directory's own create and the cookies inside it, since both are
+/// this driver's artifacts and not user changes; [`is_sync_cookie_dir_name`] is the
+/// classifier that decides which leaves those are.
 const COOKIE_DIR_PREFIX: &str = ".tributaries-sync-cookies";
+
+/// Whether `name` is the leaf of a cookie directory **this crate creates** —
+/// `.tributaries-sync-cookies`, optionally suffixed with the creating user's effective
+/// uid.
+///
+/// The uid suffix is matched for ANY uid, not just the caller's: two users may
+/// legitimately watch one tree, and neither one's cookie directory is a user change on
+/// the other's stream. Nothing else in the namespace matches, so a user file that merely
+/// begins with the stem stays a user file.
+///
+/// Exported because the layer that decides what reaches a consumer sits above this one,
+/// while the name is minted here — a caller-side prefix test would suppress every
+/// user leaf sharing the stem, and would drift the moment this crate changes the shape.
+#[must_use]
+pub fn is_sync_cookie_dir_name(name: &str) -> bool {
+  match name.strip_prefix(COOKIE_DIR_PREFIX) {
+    // The bare stem: the name on a platform with no uid to qualify it.
+    Some("") => true,
+    // `-<euid>`: decimal digits exactly as `format!` renders a `uid_t`, never empty.
+    Some(suffix) => suffix
+      .strip_prefix('-')
+      .is_some_and(|euid| !euid.is_empty() && euid.bytes().all(|b| b.is_ascii_digit())),
+    None => false,
+  }
+}
 
 /// The directory a cookie is created inside, held OPEN for as long as any cookie
 /// created through it is outstanding.
