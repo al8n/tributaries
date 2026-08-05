@@ -430,18 +430,21 @@ impl Source<OsString> for FakeSource {
     //
     // GROUND 2 — the leaf's IMMEDIATE parent is exactly the cookie directory, whatever the
     // leaf: the shape the real source uses for cookies whose names it cannot predict. Like
-    // the real one, neither ground reads any deeper component.
-    let Some(leaf) = key.last().and_then(|leaf| leaf.to_str()) else {
-      return false;
-    };
-    if leaf.starts_with("cookie-") || leaf == COOKIE_DIR {
-      return true;
-    }
-    key
+    // the real one, neither ground reads any deeper component, and — also like the real one —
+    // the parent ground is decided FIRST, from the components, so "whatever the leaf" keeps
+    // covering a leaf that is not UTF-8 at all.
+    if key
       .len()
       .checked_sub(2)
       .and_then(|parent| key[parent].to_str())
       .is_some_and(|parent| parent == COOKIE_DIR)
+    {
+      return true;
+    }
+    key
+      .last()
+      .and_then(|leaf| leaf.to_str())
+      .is_some_and(|leaf| leaf.starts_with("cookie-") || leaf == COOKIE_DIR)
   }
 
   fn end_sync(&mut self, _handle: u32, cookie_key: &[OsString]) {
@@ -9926,6 +9929,104 @@ mod reserved_namespace {
         Some(Ok(Ok(SyncOutcome::Delivered)))
       ),
       "the cookie was observed at the move's source endpoint, which resolves the barrier"
+    );
+  }
+
+  /// ONE move can name TWO pending cookies. Barriers coexist routinely — a `RootHandle` is
+  /// `Copy` and one subscription may hold several — so two completed sync writes `K1` and `K2`
+  /// can both be outstanding when a single `All` move relates them (`K1` renamed onto `K2`).
+  /// That observation is ordered after BOTH writes and therefore proves both: each caller's
+  /// cookie is on disk and the queue has reached past it.
+  ///
+  /// Resolving only the first is a silent stall, not a slower answer. Overwriting `K2` need
+  /// not produce any further record of it — the move IS its last event — so the unresolved
+  /// caller waits out its own deadline over a source that did exactly what it was asked.
+  ///
+  /// The third, unrelated barrier is here for the removal mechanics rather than the
+  /// arithmetic: `swap_remove` moves the vector's TAIL into the vacated slot, so a scan that
+  /// advanced its cursor past a removal would step over whatever landed there. It sits last,
+  /// which is precisely the entry that gets moved, and it must come through untouched.
+  ///
+  /// FAIL-ON-REVERT: put back the single `position()` + `swap_remove()` in
+  /// `resolve_matching_pending_sync` (resolve the first match and return) and the DESTINATION
+  /// barrier never completes — `now_or_never()` answers `None` — while its entry stays in
+  /// `pending_syncs` with nothing left to match it.
+  #[tokio::test]
+  async fn one_move_naming_two_pending_cookies_resolves_both_barriers() {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    // The move's two endpoints, reserved on DIFFERENT grounds (leaf grammar / cookie
+    // directory), so neither barrier's match could have been inferred from the other's.
+    let (destination, destination_location) = inside_the_cookie_directory("renamed");
+
+    let mut install = |cookie: &str| {
+      let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+      h.owner.pending_syncs.push(crate::driver::PendingSync {
+        cookie_key: key(cookie),
+        sub,
+        root: handle,
+        loss_serial_at_install: 0,
+        dominated_at_install: false,
+        reply: reply_tx,
+      });
+      reply_rx
+    };
+    let mut at_source = install("/a/cookie-7");
+    let mut at_destination = install(&destination);
+    // Not named by this move at all: it must still be waiting afterwards.
+    let mut unrelated = install("/a/cookie-99");
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/cookie-7",
+      "cookie-7",
+      &destination,
+      &destination_location,
+      1,
+    ));
+
+    assert!(
+      h.drain().is_empty(),
+      "a change reserved at every endpoint reaches nobody, barriers or no barriers"
+    );
+    assert!(
+      matches!(
+        (&mut at_source).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "the barrier whose cookie is the move's source resolves"
+    );
+    assert!(
+      matches!(
+        (&mut at_destination).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "and so does the barrier whose cookie is the move's destination — one observation \
+       proves both writes, so it must answer both callers"
+    );
+    assert!(
+      (&mut unrelated).now_or_never().is_none(),
+      "the barrier this move never named is left waiting for its own cookie"
+    );
+
+    // Each resolved entry kept the full per-entry sequence, reap included: its marker is
+    // released, and it is gone from the pending set rather than left for `Owner::drop`.
+    assert_eq!(
+      h.owner.source.ended_syncs,
+      vec![key("/a/cookie-7"), key(&destination)],
+      "both cookies are reaped, each before its own outcome is sent"
+    );
+    assert_eq!(
+      h.owner
+        .pending_syncs
+        .iter()
+        .map(|pending| pending.cookie_key.clone())
+        .collect::<Vec<_>>(),
+      vec![key("/a/cookie-99")],
+      "exactly the unmatched barrier survives the scan"
     );
   }
 

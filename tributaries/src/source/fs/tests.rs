@@ -82,21 +82,29 @@ fn watch_error_from_fs_classifies_honestly() {
 /// being root-anchored, which a location-aware [`Filter`](crate::Filter) reads as a change at
 /// the watched root and can reject outright.
 ///
-/// The event is minted through `tributary_fs`'s own assembly (`Event::from_change_under_instance`,
+/// The event is minted through `tributary_fs`'s own assembly (`Event::from_change_under_root`,
 /// the seam that mints exactly what `Watcher` delivers) rather than hand-built here, and the
 /// projection runs through the production [`SourceRoutable`] adapter and the real
 /// [`route::fan_out`], so the rebase is the shipped arithmetic and not a restatement of it.
+///
+/// The seam takes a `RootHandle` because a handle is a CAPABILITY the fs watcher's mutators
+/// trust, so it must never be constructible from a caller-chosen instance — see the seam's own
+/// docs. This cell therefore watches a real scratch root and re-expresses the handle
+/// `tributary_fs::Watcher::watch` issued it, which is also why it needs a runtime and a real
+/// backend (hence the platform gate, matching the `integration` module's).
 ///
 /// FAIL-ON-REVERT: drop the `with_move_from_location` attachment at the end of
 /// `SourceEvent::from_fs` (return `source_event` unconditionally) and the move-out projection
 /// comes back root-anchored — the location assertion fails while the key assertion still
 /// passes, which is precisely the silence this cell exists to break.
-#[test]
-fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
+#[cfg(all(not(miri), any(target_os = "macos", target_os = "linux")))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
   use core::num::NonZeroU64;
-  use std::{ffi::OsString, path::Path};
+  use std::ffi::OsString;
 
-  use tributary_fs::Event as FsEvent;
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::{Event as FsEvent, Interest as FsInterest, Watcher, WatcherOptions};
   use tributary_proto::{Change, ChangeId, ChangeKind, Epoch, Location, ScopeId, Segment};
 
   use crate::{
@@ -111,8 +119,26 @@ fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
     Location::from_segments(parts.iter().map(|p| Segment::new(*p)))
   }
 
-  // A real rename INSIDE the watched root `/watch/root`: `old/name` → `new/name`. Both
-  // endpoints are under the root, which is exactly when the fs layer reports a `Moved`.
+  // The root the rename happens under, and the handle that OWNS it. The handle is the one
+  // `watch` issued — the seam re-expresses it and cannot invent one — so the scratch root has
+  // to be real. `/var` is a symlink on macOS and both the watcher and the key coordinate are
+  // canonical, so compare against the canonicalized path.
+  let dir = tempfile::Builder::new()
+    .prefix("tributaries-move-coordinate-")
+    .tempdir()
+    .expect("create temp dir");
+  let root = dir
+    .path()
+    .canonicalize()
+    .expect("canonicalize scratch root");
+  let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("build watcher");
+  let handle = watcher
+    .watch(root.clone(), FsInterest::all())
+    .await
+    .expect("watch the scratch root");
+
+  // A real rename INSIDE the watched root: `old/name` → `new/name`. Both endpoints are under
+  // the root, which is exactly when the fs layer reports a `Moved`.
   let change = Change::new(
     ChangeId::new(NonZeroU64::new(7).expect("nonzero")),
     ScopeId::new(NonZeroU64::new(1).expect("nonzero")),
@@ -120,7 +146,12 @@ fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
     ChangeKind::Moved(loc(&["old", "name"])),
     Epoch::new(3),
   );
-  let fs_event = FsEvent::from_change_under_instance(1, Path::new("/watch/root"), &change);
+  let fs_event = FsEvent::from_change_under_root(handle, &root, &change);
+  assert_eq!(
+    fs_event.root(),
+    handle,
+    "the event belongs to the root whose handle was presented, never to one the seam chose"
+  );
   let moved = fs_event
     .kind()
     .moved()
@@ -143,7 +174,7 @@ fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
   // receives the synthesized move-out `Removed`, and its coordinate must be the SOURCE
   // endpoint's, rebased into this subscription's own key.
   let sub = Subscription::for_test(ScopeId::new(NonZeroU64::new(9).expect("nonzero")));
-  let canonical = path_components(Path::new("/watch/root/old"));
+  let canonical = path_components(&root.join("old"));
   let routable = SourceRoutable::<'_, OsString, (), _>::new(&source_event, ReservedEndpoints::None);
   let delivered: Vec<Event<OsString, ()>> = fan_out(
     &routable,
@@ -160,7 +191,7 @@ fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
   );
   assert_eq!(
     projected.key(),
-    path_components(Path::new("/watch/root/old/name")).as_slice(),
+    path_components(&root.join("old").join("name")).as_slice(),
     "keyed on the move's source endpoint"
   );
   assert_eq!(
@@ -169,6 +200,13 @@ fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
     "and located at that same endpoint, rebased into the subscription's coordinate — \
      never root-anchored, which would name the watched root itself"
   );
+
+  // Tear the native stream down BEFORE `dir` unlinks the tree it is watching, so this cell
+  // leaves no background reader reacting to a root death while the rest of the suite runs.
+  // The verdict is not this cell's subject — `close` has its own cells — so a `NotQuiesced`
+  // report is not turned into a failure here.
+  let _ = watcher.close().await;
+  drop(dir);
 }
 
 // The integration suite drives a real kernel watch on a tokio runtime — so it is gated
@@ -1452,4 +1490,86 @@ async fn a_foreign_watchers_cookie_is_an_artifact_by_the_directory_it_lands_in()
     ".tributaries-sync-cookies-mine",
     "notes.txt"
   ])));
+}
+
+/// The parent-directory ground applies **whatever the leaf** — and on Unix a leaf need not be
+/// text at all. A path component is bytes there, so an active cookie can be renamed to an
+/// undecodable name while never leaving the `0o700` directory that reserves it.
+///
+/// The move that does it is the whole point: source = an ASCII cookie this crate minted,
+/// destination = a non-UTF-8 name inside the reserved directory. Both endpoints are the fs
+/// driver's own artifact, so the classification the driver derives from the two
+/// (`Owner::reserved_endpoints`: `(true, true)` → `ReservedEndpoints::All`) is `is_total()` —
+/// the change is settled without routing and nothing about it may reach any subscriber.
+/// Classify only the source and the verdict drops to `ReservedEndpoints::Source`, which masks
+/// the cookie end and DELIVERS the other: the internal destination surfaces on every consumer
+/// stream as a user-visible `Created`, naming a path inside a directory they never wrote to.
+///
+/// FAIL-ON-REVERT: hoist the UTF-8 conversion back above the parent ground in
+/// `FsSource::is_sync_artifact` (`let Some(leaf) = key.last().and_then(OsStr::to_str) else {
+/// return false }`) and the destination assertion below reads `false` — the classifier
+/// answering "user change" for a name it created itself.
+///
+/// Unix-only because it is the byte-oriented path namespace that admits the leaf: Windows
+/// components are UTF-16 and `OsStrExt::from_bytes` does not exist there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_non_utf8_leaf_inside_the_cookie_directory_is_still_an_artifact() {
+  use std::{
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
+  };
+
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::WatcherOptions;
+
+  use crate::{Source, source::FsSource};
+
+  let source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
+
+  // A lone 0xFF byte is not valid UTF-8 in any position, so this name has no `to_str()` —
+  // exactly what a rename can produce and what the reserved directory must still cover.
+  let undecodable = OsString::from(OsStr::from_bytes(b"\xffnot-text\xff"));
+  assert!(
+    undecodable.to_str().is_none(),
+    "the destination leaf must genuinely fail UTF-8 conversion, or this cell proves nothing"
+  );
+
+  let cookie_dir = OsString::from(".tributaries-sync-cookies-501");
+  let root = [OsString::from("/"), OsString::from("r")];
+
+  // The move's SOURCE: an ASCII cookie this crate mints, reserved on the leaf grammar.
+  let mut moved_from = root.to_vec();
+  moved_from.push(cookie_dir.clone());
+  moved_from.push(OsString::from(".tributaries-sync-7-42-3-00000000deadbeef"));
+  // The move's DESTINATION: the same directory, a leaf with no text at all.
+  let mut moved_to = root.to_vec();
+  moved_to.push(cookie_dir);
+  moved_to.push(undecodable);
+
+  // Both endpoints reserved is what `Owner::reserved_endpoints` reads as
+  // `ReservedEndpoints::All`, whose `is_total()` settles the change before any routing runs —
+  // so asserting both here is asserting total suppression. (That mapping and its
+  // suppress-without-routing consequence are the driver's own, and carry their own cells; the
+  // only thing this cell can get wrong, and the thing the defect got wrong, is the
+  // destination's verdict.)
+  assert!(
+    source.is_sync_artifact(&moved_from),
+    "the ASCII cookie endpoint is reserved on the leaf grammar"
+  );
+  assert!(
+    source.is_sync_artifact(&moved_to),
+    "and the undecodable endpoint is reserved on the directory it never left — the parent \
+     ground reads components, not text"
+  );
+
+  // The ground is the IMMEDIATE parent, not the encoding: an undecodable leaf elsewhere is
+  // still a user change, so the fix widens nothing it should not.
+  let mut elsewhere = root.to_vec();
+  elsewhere.push(OsString::from("docs"));
+  elsewhere.push(OsString::from(OsStr::from_bytes(b"\xffnot-text\xff")));
+  assert!(
+    !source.is_sync_artifact(&elsewhere),
+    "an undecodable leaf outside the reserved directory is an ordinary user change"
+  );
 }
