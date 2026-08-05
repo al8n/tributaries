@@ -1723,6 +1723,148 @@ async fn widen_over_unmount_rebind_is_never_silently_certified() {
   );
 }
 
+/// A tmpfs mounted for the duration of one cell, unmounted on EVERY exit path —
+/// including the unwind out of a failing assertion, which is exactly the path a
+/// cell takes the moment it finds a real defect. A leaked mount shadows its
+/// directory for every later cell in the binary, and after a local `sudo` run it
+/// outlives the process entirely.
+struct TmpfsMount {
+  at: PathBuf,
+}
+
+impl TmpfsMount {
+  /// Mounts a fresh, private tmpfs at `dir` — a NEW superblock, which is what
+  /// makes its unmount a real `IN_UNMOUNT`/`IN_IGNORED` teardown rather than a
+  /// namespace detach. `None` if the environment refused it.
+  fn at(dir: &Path) -> Option<Self> {
+    std::fs::create_dir_all(dir).ok()?;
+    let mounted = std::process::Command::new("mount")
+      .args(["-t", "tmpfs", "-o", "size=4m", "tributary-submount"])
+      .arg(dir)
+      .status()
+      .map(|s| s.success())
+      .unwrap_or(false);
+    (mounted && mount_state(dir) == Some(true)).then(|| Self {
+      at: dir.to_path_buf(),
+    })
+  }
+
+  /// Unmounts and reports whether the kernel's own table agrees. Retried
+  /// briefly: an arm-time `O_PATH` anchor still in flight is exactly `umount`'s
+  /// `EBUSY`, and it is transient.
+  fn unmount(&self) -> bool {
+    for _ in 0..50 {
+      if mount_state(&self.at) == Some(false) {
+        return true;
+      }
+      let _ = std::process::Command::new("umount").arg(&self.at).status();
+      std::thread::sleep(Duration::from_millis(20));
+    }
+    mount_state(&self.at) == Some(false)
+  }
+}
+
+impl Drop for TmpfsMount {
+  fn drop(&mut self) {
+    // Reports, never panics: a panic in `drop` during an unwind aborts the
+    // process and destroys the failing cell's own diagnosis.
+    if !self.unmount() {
+      eprintln!(
+        "CLEANUP FAILED: tmpfs still mounted at {}",
+        self.at.display()
+      );
+    }
+  }
+}
+
+/// Suite 8 (privileged, CI: `linux-verify.sh inotify-priv`) — the SCOPE FENCE
+/// that decides which teardowns the Monitor's live non-root `Ignored` branch can
+/// ever see on this backend.
+///
+/// A scope is one mount. `core::crosses_mount_boundary` lowers any enumerated
+/// directory sitting across the root's mount frame to `FileKind::Other`, so the
+/// descent never arms a submount — which is why an unmount BELOW the watched root
+/// raises no teardown record at all: there was never a binding on that superblock
+/// to destroy. The live non-root `Ignored` the Monitor covers therefore arrives
+/// from the traces that survive this fence (a whole-superblock unmount, whose
+/// records include the root's own; an `IN_IGNORED` whose self-record the queue
+/// dropped), never from a submount.
+///
+/// This cell exists because that fence is an ASSUMPTION the Monitor-side cover is
+/// costed against. Relaxing it would put real, arm-able mountpoints inside a
+/// scope and make submount teardown reachable — so it must not be relaxed
+/// silently, and this fails loudly if it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_submount_is_outside_the_scope_and_raises_no_teardown() {
+  const CELL: &str = "a_submount_is_outside_the_scope_and_raises_no_teardown";
+  if !privileged_or_skip(CELL) {
+    return;
+  }
+
+  let root = scratch_root("submount-fence");
+  let plain = root.join("plain");
+  let mount = root.join("mnt");
+  std::fs::create_dir_all(&plain).expect("plain subdirectory");
+  let Some(tmpfs) = TmpfsMount::at(&mount) else {
+    common::skip_notice(format_args!(
+      "{CELL}: a private tmpfs could not be mounted at {}, so there is no mount \
+       boundary inside the root to fence",
+      mount.display()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+
+  let mut w = inotify_watcher();
+  let _handle = w.watch(&root, Interest::all()).await.expect("watch");
+  assert!(
+    coverage_becomes_live(&mut w, &root, "birth").await,
+    "the birth crawl settles"
+  );
+  // The control: an ordinary same-mount directory IS armed and DOES deliver at
+  // its own path. Without it the fence assertion below would also pass on a
+  // descent that armed nothing at all.
+  assert!(
+    child_watch_delivers(&mut w, &plain, "plain").await,
+    "the descent arms an ordinary subdirectory"
+  );
+  // The fence: a create inside the submount is never delivered at its own path,
+  // because nothing ever armed it.
+  assert!(
+    !child_watch_delivers(&mut w, &mount, "submount").await,
+    "a submount is outside the scope: {} must not be descended into",
+    mount.display()
+  );
+
+  // And so its unmount destroys no binding and raises no located teardown. A
+  // `Rescan` addressed at the mountpoint is precisely what the Monitor emits when
+  // it DOES lose a live non-root binding, so its absence here is the fence's
+  // observable consequence rather than a bare timeout.
+  assert!(
+    tmpfs.unmount(),
+    "the submount unmounts while the root is watched"
+  );
+  let located = tokio::time::timeout(scaled(Duration::from_secs(2)), async {
+    while let Some(event) = w.next().await {
+      if event.is_rescan() && event.path() == mount {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    !located,
+    "no binding existed under {}, so its unmount owes no located cover",
+    mount.display()
+  );
+
+  drop(tmpfs);
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Whether `path` is a mount point right now, read from the kernel's own table
 /// rather than inferred from a command's exit status: a cell whose bracket died
 /// mid-cycle leaves nothing mounted, so a failing `umount` there is correct

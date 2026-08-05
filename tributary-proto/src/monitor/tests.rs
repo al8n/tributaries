@@ -2666,10 +2666,19 @@ fn racing_descent_installs_one_child_watch() {
   assert_eq!(events[0].location(), &loc(&["sub"]));
 }
 
-/// Dropping a child watch removes it from the child index in lockstep, so a later
-/// descent for the same `(parent, name)` re-arms with a fresh watch.
+/// Dropping a child watch removes it from the child index in lockstep: the slot is
+/// re-keyed to the replacement watch rather than left pointing at the dead handle,
+/// so a later same-name descent reuses that replacement instead of minting a second
+/// watch for one path.
+///
+/// The drop is driven by a LIVE non-root `Ignored` — the unmount trace — which now
+/// rebuilds the slot itself. The cell's earlier form asserted the opposite of that:
+/// that the teardown queued nothing and that a subsequent `Created` was what re-armed
+/// the path. That assertion encoded the defect (a subtree dropped with no cover and
+/// no replacement, while `coverage_settled` kept reading true), so the lockstep
+/// property is restated here against the rebuild rather than against the silence.
 #[test]
-fn dropped_child_watch_can_be_reinstalled() {
+fn an_ignored_child_slot_is_rekeyed_to_its_replacement() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -2684,8 +2693,11 @@ fn dropped_child_watch_can_be_reinstalled() {
   let w1 = drain_actions(&mut m)[0].as_watch().unwrap().id();
 
   m.on_os_record(OsRecord::new(w1, RecordKind::Ignored), at(2));
-  assert!(!m.is_watched(w1));
-  let _ = drain_actions(&mut m);
+  assert!(!m.is_watched(w1), "the torn-down handle leaves the index");
+  let w2 = armed_child(&mut m, root, "sub");
+  assert_ne!(w1, w2, "and the slot is re-keyed to a fresh one");
+  assert!(m.is_watched(w2));
+  let _ = drain_events(&mut m);
 
   m.on_os_record(
     OsRecord::new(root, RecordKind::Created)
@@ -2694,10 +2706,16 @@ fn dropped_child_watch_can_be_reinstalled() {
     at(3),
   );
   let acts = drain_actions(&mut m);
-  assert_eq!(acts.len(), 1, "re-descent re-arms the path");
-  let w2 = acts[0].as_watch().unwrap().id();
-  assert_ne!(w1, w2);
-  assert!(m.is_watched(w2));
+  assert!(
+    acts.iter().all(|a| a.as_watch().is_none()),
+    "one watch per path: the re-descent reuses the replacement, {acts:?}"
+  );
+  assert_eq!(
+    m.child_watch(root, &seg("sub")),
+    Some(w2),
+    "which is still the slot's occupant"
+  );
+  m.assert_invariants();
 }
 
 // ── Move dedup must distinguish distinct sources ──
@@ -6646,6 +6664,359 @@ fn root_ignored_rescans_before_invalidation() {
     "a kernel-side root teardown signals with a Rescan"
   );
   assert!(!m.is_watched(root), "the scope's tree is invalidated");
+}
+
+// ---------------------------------------------------------------------------
+// A LIVE non-root `Ignored` — a teardown no other record speaks for.
+//
+// A deletion reaches this handler NEVER: `IN_DELETE_SELF` is subscribed and the
+// kernel orders it ahead of the trailing `IN_IGNORED`, and the parent-side
+// `Removed` reconciles the slot, so either way the node is torn down first and
+// the trailing record dies at `ingest_record`'s opening `scope_of`. What
+// survives is a teardown whose slot is occupied still — an `IN_IGNORED` whose
+// self-record the queue dropped, or the unmount of the filesystem the scope
+// itself sits on, whose per-`wd` teardowns are not ordered against the root's —
+// and it owes the same two halves a retired binding owes: an unconditional
+// located cover, and a counted replacement. These cells pin both, and the delete
+// trace's zero cost.
+//
+// (A submount BELOW the root reaches none of this: the fs layer's enumerate
+// lowering fences descent at the scope's mount frame, so no binding is ever
+// installed across one. That fence is guarded end to end by
+// `a_submount_is_outside_the_scope_and_raises_no_teardown` in the inotify suite.)
+// ---------------------------------------------------------------------------
+
+/// A live non-root teardown ends coverage of a subtree whose slot is occupied
+/// still, so it stands a LOCATED epoch-bumping `Rescan` at that slot and a
+/// COUNTED replacement in it — and the scope reads unsettled from that instant
+/// until the replacement arms and its re-arm read lands.
+///
+/// Fails on old at the barrier assertion with an empty event stream: the drop was
+/// deficit-free, so it discharged nothing, queued nothing and emitted nothing
+/// while `coverage_settled` never stopped reading true — permanent coverage loss
+/// under a certifying barrier.
+#[test]
+fn an_unmounted_subtree_is_covered_and_recounted() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  // Identified, so the replacement's own identity is a choice this cell can see.
+  let mnt = live_child_dir_ident(&mut m, root, "mnt", ident(11));
+  let deep = live_child_dir(&mut m, mnt, "deep");
+  settle_reads(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "a settled scope to lose coverage from"
+  );
+  let before = m.epoch_of(s);
+
+  m.on_os_record(OsRecord::new(mnt, RecordKind::Ignored), at(20));
+
+  // Read INSIDE the window the record opens: the obligation is counted from here
+  // until the rebuilt read lands, so a sync barrier cannot dispatch across it.
+  assert!(
+    !m.coverage_settled(s),
+    "the rebuilt slot is counted work no barrier may certify over"
+  );
+  assert!(!m.is_watched(mnt), "the torn-down binding is gone");
+  assert!(!m.is_watched(deep), "and its subtree with it");
+
+  let covering = drain_events(&mut m);
+  let rescan = covering
+    .iter()
+    .find(|e| e.kind().is_rescan())
+    .unwrap_or_else(|| panic!("the coverage loss is signalled: {covering:?}"));
+  assert_eq!(
+    rescan.location(),
+    &loc(&["mnt"]),
+    "located at the lost slot, not the scope root"
+  );
+  assert!(
+    rescan.epoch() > before,
+    "and its generation dominates whatever the consumer acted on before"
+  );
+
+  let fresh = armed_child(&mut m, root, "mnt");
+  assert_ne!(fresh, mnt, "the slot is rebuilt under a new handle");
+  assert_eq!(
+    m.node_identity(fresh),
+    None,
+    "and with NO identity: nothing here proves the slot still holds the object the \
+     dead binding named, so carrying it forward would certify an unproven sameness"
+  );
+  m.ack_watch(fresh, Ok(WatchAck::Installed));
+  assert!(
+    !m.coverage_settled(s),
+    "the acknowledgement alone does not settle it — the read is still owed"
+  );
+
+  let read = read_of(&mut m, fresh);
+  m.on_enumerate(read, EnumerateResult::Ok(Vec::new()));
+  assert!(m.coverage_settled(s), "and it settles once that read lands");
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "with the window's closing Rescan delivered"
+  );
+  m.assert_invariants();
+}
+
+/// The zero-cost guard. An ordinary directory deletion never reaches the live
+/// non-root branch, so covering every teardown that DOES reach it costs a deletion
+/// nothing: both kernel orderings — the subscribed `DeleteSelf` ahead of its
+/// trailing `Ignored`, and the parent-side `Removed` ahead of both — produce
+/// exactly one `Removed`, no `Rescan`, and no replacement watch.
+///
+/// This is the assumption the uniform rule rests on. If it ever fails, the cover
+/// is being paid on every deletion and the rule's cost analysis is wrong.
+#[test]
+fn a_deleted_directory_pays_for_no_cover() {
+  for parent_first in [false, true] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let root = live_root_idle(&mut m, s);
+    let sub = live_child_dir(&mut m, root, "sub");
+    settle_reads(&mut m);
+
+    let removed = OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("sub"))
+      .with_is_dir(true);
+    if parent_first {
+      m.on_os_record(removed, at(30));
+      m.on_os_record(OsRecord::new(sub, RecordKind::Ignored), at(31));
+    } else {
+      m.on_os_record(OsRecord::new(sub, RecordKind::DeleteSelf), at(30));
+      m.on_os_record(OsRecord::new(sub, RecordKind::Ignored), at(31));
+      m.on_os_record(removed, at(32));
+    }
+
+    let events = drain_events(&mut m);
+    assert_eq!(
+      events.iter().filter(|e| e.kind().is_removed()).count(),
+      1,
+      "parent_first={parent_first}: the deletion is reported once: {events:?}"
+    );
+    assert!(
+      events.iter().all(|e| !e.kind().is_rescan()),
+      "parent_first={parent_first}: and nothing re-enumerates over it: {events:?}"
+    );
+    let acts = drain_actions(&mut m);
+    assert!(
+      acts.iter().all(|a| a.as_watch().is_none()),
+      "parent_first={parent_first}: no slot is rebuilt for an object that is gone: {acts:?}"
+    );
+    assert!(
+      m.coverage_settled(s),
+      "parent_first={parent_first}: and the scope never leaves settled"
+    );
+    m.assert_invariants();
+  }
+}
+
+/// An unmount INSIDE a detached-and-held subtree has no location the handler may
+/// address: the tree still reconstructs the vacated pre-move path, so a `Rescan`
+/// emitted here would send the consumer to re-read a slot the object has left.
+/// The debt rides the hold instead, and the pairing pays it at the destination.
+#[test]
+fn an_unmount_under_a_hold_defers_its_cover_to_the_pairing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let (src, kid) = held_move_source_covering(&mut m, root, "d", "k");
+  assert!(
+    !m.dirtied_holds.contains(&src),
+    "a clean hold, so the debt below is this record's"
+  );
+
+  m.on_os_record(OsRecord::new(kid, RecordKind::Ignored), at(20));
+  let during = drain_events(&mut m);
+  assert!(
+    during.iter().all(|e| !e.kind().is_rescan()),
+    "no Rescan names the stale pre-move path: {during:?}"
+  );
+  assert!(
+    m.dirtied_holds.contains(&src),
+    "the hold carries the suppressed loss to its resolution"
+  );
+  assert!(!m.coverage_settled(s), "and the barrier stays shut over it");
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(21),
+  );
+  let covering = drain_events(&mut m);
+  assert!(
+    covering
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["e"])),
+    "the pairing covers the destination the subtree actually occupies: {covering:?}"
+  );
+  settle_reads(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "and the scope settles behind the cover"
+  );
+  m.assert_invariants();
+}
+
+/// The same debt, resolved the other way: no destination ever comes, so the move
+/// window expires and the teardown reclaims the dirtied hold — whose cover is
+/// COUNTED, because the object it stands for was proven to be moving rather than
+/// vanishing.
+#[test]
+fn an_unmount_under_a_hold_is_covered_when_the_move_window_expires() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let (_src, kid) = held_move_source_covering(&mut m, root, "d", "k");
+
+  m.on_os_record(OsRecord::new(kid, RecordKind::Ignored), at(20));
+  let during = drain_events(&mut m);
+  assert!(
+    during.iter().all(|e| !e.kind().is_rescan()),
+    "nothing is emitted at the stale path: {during:?}"
+  );
+
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  let covering = drain_events(&mut m);
+  assert!(
+    covering.iter().any(|e| e.kind().is_rescan()),
+    "the expiry pays the hold's debt rather than dropping it: {covering:?}"
+  );
+  settle_reads(&mut m);
+  assert!(m.coverage_settled(s), "and the scope converges");
+  m.assert_invariants();
+}
+
+/// The held source is ITSELF unmounted. Its destination is unknowable — the
+/// pairing that would have named it is exactly what this teardown destroys — so
+/// the cover falls back to the one location that cannot be wrong, the scope root,
+/// and it is counted: the drop reclaims the hold this handler just dirtied.
+#[test]
+fn an_ignored_held_source_stands_the_counted_root_cover() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let (src, _kid) = held_move_source_covering(&mut m, root, "d", "k");
+
+  m.on_os_record(OsRecord::new(src, RecordKind::Ignored), at(20));
+  let covering = drain_events(&mut m);
+  assert!(
+    covering
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "the cover anchors at the root: {covering:?}"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "and it is COUNTED — a bare signal would let a barrier through behind it"
+  );
+
+  settle_reads(&mut m);
+  assert!(
+    m.rearm_settled(s),
+    "the count is bounded: one root re-read discharges it"
+  );
+  // The unpaired half is the only conjunct left; expiring it leaves the scope
+  // settled, so nothing this record touched wedges the barrier open.
+  m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
+  settle_reads(&mut m);
+  assert!(m.coverage_settled(s), "and the scope settles whole");
+  m.assert_invariants();
+}
+
+/// The replacement's own arm is refused — the re-exposed directory is not there.
+/// The terminal is the arm-failure funnel's, unchanged and bounded: a located
+/// `Rescan`, a standing slot hole every later sync cookie re-signals, and the
+/// counted obligation RELEASED rather than stranded on a node that will never arm.
+#[test]
+fn a_refused_replacement_for_an_unmounted_slot_ends_in_a_deficit() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let mnt = live_child_dir(&mut m, root, "mnt");
+  settle_reads(&mut m);
+
+  m.on_os_record(OsRecord::new(mnt, RecordKind::Ignored), at(20));
+  let fresh = armed_child(&mut m, root, "mnt");
+  let _ = drain_events(&mut m);
+  assert!(
+    !m.rearm_settled(s),
+    "the replacement is counted while it arms"
+  );
+
+  m.ack_watch(fresh, Err(WatchError::NotFound));
+  let terminal = drain_events(&mut m);
+  assert!(
+    terminal
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mnt"])),
+    "the refusal stands its own located cover: {terminal:?}"
+  );
+  assert!(!m.is_watched(fresh), "and the refused node is dropped");
+  assert!(
+    m.rearm_settled(s),
+    "the counted obligation is released, never left on a node nothing can arm"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the slot stays dark, so a cookie dispatched over it must re-signal first"
+  );
+  assert!(m.resignal_coverage_deficits(s), "which it does");
+  m.assert_invariants();
+}
+
+/// A cascade: a child's unmount and its parent's, in both orders. The parent's
+/// drop sweeps whatever replacement the child's record installed, taking that
+/// replacement's count with it, so exactly ONE obligation stands either way — the
+/// parent's own — the outer cover names the outer loss, and nothing wedges.
+#[test]
+fn a_cascading_unmount_sweeps_its_replacement_and_wedges_nothing() {
+  for child_first in [true, false] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let root = live_root_idle(&mut m, s);
+    let p = live_child_dir(&mut m, root, "p");
+    let c = live_child_dir(&mut m, p, "c");
+    settle_reads(&mut m);
+    assert!(m.rearm_pending.is_empty(), "a settled tree to cascade from");
+
+    if child_first {
+      m.on_os_record(OsRecord::new(c, RecordKind::Ignored), at(20));
+      m.on_os_record(OsRecord::new(p, RecordKind::Ignored), at(21));
+    } else {
+      m.on_os_record(OsRecord::new(p, RecordKind::Ignored), at(20));
+      m.on_os_record(OsRecord::new(c, RecordKind::Ignored), at(21));
+    }
+
+    assert_eq!(
+      m.rearm_pending.get(&s).copied(),
+      Some(1),
+      "child_first={child_first}: one standing obligation, not a stranded pair"
+    );
+    let covering = drain_events(&mut m);
+    assert!(
+      covering
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location() == &loc(&["p"])),
+      "child_first={child_first}: the surviving cover names the outer loss: {covering:?}"
+    );
+
+    let fresh = armed_child(&mut m, root, "p");
+    m.ack_watch(fresh, Ok(WatchAck::Installed));
+    settle_reads(&mut m);
+    assert!(
+      m.rearm_pending.is_empty(),
+      "child_first={child_first}: the count returns to zero"
+    );
+    assert!(
+      m.coverage_settled(s),
+      "child_first={child_first}: and the scope converges"
+    );
+    m.assert_invariants();
+  }
 }
 
 /// Root invalidation purges the scope's pending move halves: a stale FILE half from the

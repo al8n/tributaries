@@ -2341,7 +2341,7 @@ impl Monitor {
         RecordOutcome::Nothing
       }
       RecordKind::Ignored => {
-        self.on_ignored(&rec);
+        self.on_ignored(scope, &rec);
         RecordOutcome::Nothing
       }
     }
@@ -3573,19 +3573,48 @@ impl Monitor {
       return;
     }
     // Ending coverage of an object that provably still exists owes BOTH halves.
-    //
-    // The cover is UNCONDITIONAL. Every structural signal that could stand in for
-    // it is interest- and filter-subject — a `Modified`-only subscription receives
-    // no instruction at all — and the replacement's own read is a re-arm, so its
-    // content is `Created`-suppressed. Only a `Rescan` bypasses both.
+    // The retiree's own identity carries forward: the object occupying the slot
+    // is the same one whose arm went unprovable — only the acknowledgement was
+    // untrustworthy, never the object's sameness.
+    self.cover_and_rebuild_slot(scope, parent, name, is_dir, identity);
+  }
+
+  /// Covers and rebuilds the slot a dying binding leaves behind — the one
+  /// composition every "the object provably survives, its binding does not" site
+  /// owes, kept in a single place so a second copy cannot drift from it.
+  ///
+  /// The cover is UNCONDITIONAL. Every structural signal that could stand in for
+  /// it is interest- and filter-subject — a `Modified`-only subscription receives
+  /// no instruction at all — and the replacement's own read is a re-arm, so its
+  /// content is `Created`-suppressed. Only a `Rescan` bypasses both.
+  ///
+  /// The replacement is always re-arm-flavored whatever the retiree's state was:
+  /// this window is lossy by construction (the `Rescan` above), so the coverage
+  /// being rebuilt is carried-over content rather than a discovery, and a cold
+  /// install would announce every pre-existing entry as `Created` while leaving
+  /// the window's counted half unsupplied — `coverage_settled` would then read
+  /// true with the slot still unread. Entering `Arming { rearm: true }` is what
+  /// marks the bridge window and holds the barrier until the rebuilt read lands.
+  ///
+  /// `identity` is the caller's claim about the slot's NEW occupant rather than
+  /// the retiree's history: a caller that knows the object is unchanged carries
+  /// it forward, and one that cannot passes `None`, so a later survivor-diff
+  /// degrades honestly to a rebuild instead of asserting a sameness nothing
+  /// proved.
+  fn cover_and_rebuild_slot(
+    &mut self,
+    scope: ScopeId,
+    parent: WatchId,
+    name: Segment,
+    is_dir: bool,
+    identity: Option<Identity>,
+  ) {
     self.emit_rescan(scope, self.child_location(parent, &name));
-    // The counted replacement, always re-arm-flavored whatever the retiree's was:
-    // this window is lossy by construction (the `Rescan` above), so the coverage
-    // being rebuilt is carried-over content rather than a discovery, and a cold
-    // install would announce every pre-existing entry as `Created` while leaving
-    // the window's counted half unsupplied — `coverage_settled` would then read
-    // true with the slot still unread. Entering `Arming { rearm: true }` is what
-    // marks the bridge window and holds the barrier until the rebuilt read lands.
+    // A kernel-recursive scope keeps no per-directory slot to rebuild: its single
+    // root binding already covers the ground the `Rescan` above re-instructed.
+    if !self.scope_descends(scope) {
+      return;
+    }
     if self.child_watch(parent, &name).is_none() {
       self.install_child(parent, scope, name.clone(), is_dir, identity);
       if let Some(fresh) = self.child_watch(parent, &name) {
@@ -5131,22 +5160,66 @@ impl Monitor {
     self.drop_subtree(rec.watch(), DeficitDischarge::CoveringRescan);
   }
 
-  fn on_ignored(&mut self, rec: &OsRecord) {
+  fn on_ignored(&mut self, scope: ScopeId, rec: &OsRecord) {
+    let watch = rec.watch();
     // A root's kernel-side teardown with no preceding record (an unmount, an external
     // watch removal) ends the scope's coverage with NO parent watch left to report it:
     // signal with the unconditional `Rescan` before invalidating, as for a deleted or
-    // moved root. A non-root's removal is its live parent watch's job to report.
-    if self.is_root_watch(rec.watch())
-      && let Some(scope) = self.scope_of(rec.watch())
-    {
+    // moved root.
+    if self.is_root_watch(watch) {
       self.emit_rescan(scope, Location::new());
-      self.invalidate_root(scope, rec.watch());
+      self.invalidate_root(scope, watch);
       return;
     }
-    // A non-root ignore is reported to the consumer by the live parent watch's
-    // `Removed` — interest- and filter-subject — so a deficit dying with the
-    // ignored subtree carries a covering `Rescan` rather than clearing silently.
-    self.drop_subtree(rec.watch(), DeficitDischarge::CoveringRescan);
+    // A LIVE non-root ignore is not a deletion. A deleted directory reaches this
+    // handler never: its `DeleteSelf` is subscribed and the kernel orders it before
+    // the trailing `IN_IGNORED`, and the parent-side `Removed` reconciles the slot —
+    // either tears the node down first, so the trailing record names an unregistered
+    // watch and dies at `ingest_record`'s opening `scope_of`. What survives to here
+    // is a teardown of an object no other record speaks for, and whose slot is
+    // occupied still: an `IN_IGNORED` whose self-record the queue dropped, or the
+    // unmount of the filesystem the scope ITSELF sits on — the kernel destroys every
+    // watch on that superblock and orders the descendants' teardowns against the
+    // root's not at all, so a descendant's may be ingested first. (A submount BELOW
+    // the root raises nothing here: the enumerate lowering fences descent at the
+    // scope's mount frame, so no binding is ever installed across one.) Ending that
+    // coverage owes the same two halves a retired binding owes — an unconditional
+    // located cover and a counted replacement — rather than the silence a parent-side
+    // `Removed` used to be credited with.
+    //
+    // Under a hold there is no location this call may address: the tree reconstructs
+    // the vacated PRE-move path, so a `Rescan` here would send the consumer to re-read
+    // a slot the object has left. Defer the REBUILD, not the ISSUE — dirty the hold and
+    // let the pairing (or the move window's timeout teardown) carry it, as every other
+    // held activity does. When the ignored watch IS the held source, the drop's own
+    // `DirtiedHold` reclaim answers `Counted` and stands the root-anchored counted
+    // cover: a mid-rename subtree's destination is unknowable, so the root is the
+    // only location that cannot be wrong.
+    if let Some(source) = self.in_held_subtree(watch) {
+      self.book_hold(source);
+      self.drop_subtree(watch, DeficitDischarge::CoveringRescan);
+      return;
+    }
+    // Captured before the walk erases the links it reads.
+    let slot = self.nodes.get(&watch).and_then(|node| {
+      node
+        .parent
+        .zip(node.name.clone())
+        .map(|(parent, name)| (parent, name, node.is_dir))
+    });
+    self.drop_subtree(watch, DeficitDischarge::CoveringRescan);
+    let Some((parent, name, is_dir)) = slot else {
+      // A non-root carries both links by construction; without them no slot can be
+      // addressed, so the cover falls back to the scope's root.
+      self.stand_counted_cover(scope);
+      return;
+    };
+    // Identity is deliberately NOT the retiree's. Nothing here proves the slot still
+    // holds the object the dead binding named — an unmount replaces it outright, and
+    // an overflow-orphaned teardown leaves what happened unknown — so `None` degrades
+    // a later survivor-diff to a rebuild instead of certifying a sameness the record
+    // never established.
+    self.cover_and_rebuild_slot(scope, parent, name, is_dir, None);
   }
 
   fn emit_child(&mut self, scope: ScopeId, rec: &OsRecord, kind: ChangeKind) {
