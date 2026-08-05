@@ -10710,12 +10710,18 @@ mod sync_cookie {
   use super::*;
 
   /// The exported cookie-directory classifier recognizes exactly the names this crate
-  /// mints for that directory — the bare stem, and the stem qualified by any uid — and
-  /// nothing else in the reserved namespace.
+  /// mints for that directory — the bare stem, and the stem qualified by any uid
+  /// [`cookie_dir_name`] can actually render — and nothing else in the reserved
+  /// namespace.
   ///
   /// It exists so the layer that decides what reaches a consumer does not have to
   /// re-implement the shape with a prefix test: a prefix test suppresses every user leaf
-  /// that shares the stem, silently and with no recovery signal.
+  /// that shares the stem, silently and with no recovery signal. A suffix test looser
+  /// than the minter keeps a narrower slice of that same defect — `cookie_dir_name`
+  /// formats a `uid_t` with `{}`, so a redundant leading zero or a number past the uid
+  /// space names a directory this crate could not have created, and a consumer that
+  /// suppresses what lands inside the cookie directory would erase the user's directory
+  /// and everything reported within it.
   #[test]
   fn the_cookie_directory_classifier_admits_only_names_this_crate_mints() {
     // What this crate actually names the directory, on this platform.
@@ -10738,6 +10744,14 @@ mod sync_cookie {
       ".tributaries-sync-cookie",
       ".tributaries-sync-7-42-3-00000000deadbeef",
       "cookies",
+      // Numeric, but not what `format!("{euid}")` renders: a redundant leading zero, and
+      // a suffix past the uid space. `cookie_dir_name` can emit neither, so neither
+      // directory is this crate's.
+      ".tributaries-sync-cookies-0001",
+      ".tributaries-sync-cookies-00",
+      ".tributaries-sync-cookies-4294967296",
+      ".tributaries-sync-cookies-99999999999999999999",
+      ".tributaries-sync-cookies-+1",
     ] {
       assert!(
         !crate::is_sync_cookie_dir_name(user_leaf),

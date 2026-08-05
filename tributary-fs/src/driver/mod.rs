@@ -417,8 +417,10 @@ const COOKIE_DIR_PREFIX: &str = ".tributaries-sync-cookies";
 ///
 /// The uid suffix is matched for ANY uid, not just the caller's: two users may
 /// legitimately watch one tree, and neither one's cookie directory is a user change on
-/// the other's stream. Nothing else in the namespace matches, so a user file that merely
-/// begins with the stem stays a user file.
+/// the other's stream. It is matched only in the shape this crate can actually render —
+/// canonical decimal, inside the uid space — so a user directory that merely begins with
+/// the stem stays a user directory, together with everything a consumer reports inside
+/// it.
 ///
 /// Exported because the layer that decides what reaches a consumer sits above this one,
 /// while the name is minted here — a caller-side prefix test would suppress every
@@ -428,12 +430,26 @@ pub fn is_sync_cookie_dir_name(name: &str) -> bool {
   match name.strip_prefix(COOKIE_DIR_PREFIX) {
     // The bare stem: the name on a platform with no uid to qualify it.
     Some("") => true,
-    // `-<euid>`: decimal digits exactly as `format!` renders a `uid_t`, never empty.
-    Some(suffix) => suffix
-      .strip_prefix('-')
-      .is_some_and(|euid| !euid.is_empty() && euid.bytes().all(|b| b.is_ascii_digit())),
+    // `-<euid>`, exactly as `format!` renders a `uid_t`.
+    Some(suffix) => suffix.strip_prefix('-').is_some_and(is_minted_uid),
     None => false,
   }
+}
+
+/// Whether `field` is exactly what `format!("{euid}")` renders for some `libc::uid_t`:
+/// decimal digits, no sign, no redundant leading zero (`0` itself is the one-digit case),
+/// and inside the 32-bit uid space every platform that opens a cookie directory uses.
+///
+/// A suffix outside that is one [`cookie_dir_name`] could never have produced, so the
+/// directory wearing it was created by somebody else. Admitting it would classify a user
+/// directory — and, for a consumer that suppresses what lands inside the cookie
+/// directory, everything reported within it — as this driver's artifact, and silently.
+fn is_minted_uid(field: &str) -> bool {
+  field.bytes().all(|b| b.is_ascii_digit())
+    && (field.len() == 1 || !field.starts_with('0'))
+    // `parse` is what rejects the empty suffix and the overflowing one; the digit test
+    // above is what rejects the leading sign `from_str` would otherwise accept.
+    && field.parse::<u32>().is_ok()
 }
 
 /// The directory a cookie is created inside, held OPEN for as long as any cookie
