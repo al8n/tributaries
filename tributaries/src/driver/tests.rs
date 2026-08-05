@@ -7851,6 +7851,53 @@ async fn on_sync_skips_an_already_canceled_barrier() {
   );
 }
 
+/// The FIRST sync an owner admits mints `seq = 1`. [`Owner::sync_seq`] starts at 0 and
+/// `on_sync` PRE-increments it before minting the token, so 0 is a value no cookie name has
+/// ever carried — which is what entitles the fs binding's classifier to refuse a `seq` of 0
+/// as a user file rather than suppressing it.
+///
+/// The seq is taken from the token the real admission path handed to `begin_sync`, not
+/// asserted as a constant: if a later release switches the counter to a post-increment (or
+/// seeds it elsewhere), the first cookie of every owner starts carrying a `seq` the
+/// classifier refuses — a genuine cookie republished on every consumer stream as a user
+/// create — and that change fails HERE, at the minter, instead of leaking in production.
+/// `source::fs::tests::the_classifier_accepts_the_name_the_first_sync_of_an_owner_mints`
+/// pins the accepting side of the same seam.
+///
+/// FAIL-ON-REVERT: take the counter's OLD value (`let seq = self.sync_seq; self.sync_seq +=
+/// 1;` and mint from `seq`) and the first token carries 0.
+#[tokio::test]
+async fn the_first_sync_an_owner_admits_mints_seq_one() {
+  use core::sync::atomic::Ordering;
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  // The caller's receiver stays alive: an already-canceled reply is skipped before any token
+  // is minted, which would leave `begun_token` empty and make this cell vacuous.
+  let loss_gen = h.owner.loss_gen.load(Ordering::SeqCst);
+  let (reply_tx, _reply_rx) = futures_channel::oneshot::channel();
+  h.owner.on_sync(sub, loss_gen, reply_tx).await;
+
+  let token = h
+    .owner
+    .source
+    .begun_token
+    .expect("the first admitted sync minted a token");
+  assert_eq!(
+    token.seq(),
+    1,
+    "the first cookie of an owner carries seq 1 — the counter is pre-incremented, so no sync \
+     ever renders 0"
+  );
+  assert_ne!(
+    token.instance(),
+    0,
+    "the instance brand is a NonZeroU64, so no cookie name carries instance 0 either"
+  );
+}
+
 /// Finding 1, the inter-arm race forced deterministically: the fs write COMPLETES (delivers its
 /// cookie) between the `select_biased!` pass that polls `begin_sync` and that same pass's
 /// cancellation arm. A scripted `begin_sync` future side-effect-delivers the cookie key yet still

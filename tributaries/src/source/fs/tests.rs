@@ -1366,6 +1366,19 @@ mod integration {
 /// binding has minted as an artifact — ours, another instance's, or a crashed
 /// process's leftover from an earlier release — while an ordinary file (or a
 /// name merely containing the prefix deeper in the path) is never one.
+///
+/// # A disclosed correction
+///
+/// This cell used to assert `.tributaries-sync-0-1-0-0000000000000000`,
+/// `.tributaries-sync-0-1-0` and the round-trip of `SyncToken::new(0, 0, 0, 0)` as
+/// ARTIFACTS. No release of this binding can mint an `instance` of 0 (the field comes
+/// from a `NonZeroU64` [`InstanceId`](crate::subscription::InstanceId)) or a `seq` of 0
+/// (`Owner::sync_seq` is pre-incremented before the mint), so those three inputs pinned
+/// the very over-acceptance the classifier's bounds now close: names the minter cannot
+/// produce, suppressed off every consumer stream as though it could. The two literals
+/// moved to the negative list below and the round-trip token became
+/// `SyncToken::new(1, 1, 1, 0)` — the minimum of each bounded field, and a `nonce` of 0,
+/// which unlike the others IS genuinely mintable and must stay covered here.
 #[tokio::test]
 async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   use std::ffi::OsString;
@@ -1403,7 +1416,7 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   assert!(source.is_sync_artifact(&key(&[
     "/",
     "r",
-    ".tributaries-sync-0-1-0-0000000000000000"
+    ".tributaries-sync-3-77-2-0123456789abcdef"
   ])));
 
   // The THREE-field shape this binding minted before the name carried a nonce.
@@ -1412,7 +1425,7 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   // first watch after an upgrade report every stale cookie as a user create.
   for legacy_leftover in [
     ".tributaries-sync-9-999-1",
-    ".tributaries-sync-0-1-0",
+    ".tributaries-sync-3-77-2",
     ".tributaries-sync-18446744073709551615-4294967295-18446744073709551615",
   ] {
     assert!(
@@ -1422,9 +1435,11 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   }
 
   // The whole minted range round-trips: the extremes of every field are still
-  // recognized by the classifier that has to suppress them.
+  // recognized by the classifier that has to suppress them. The low end is each
+  // field's true minimum — 1 for the bounded decimals, 0 for the nonce, whose
+  // minter is a hasher and can genuinely render it.
   for token in [
-    SyncToken::new(0, 0, 0, 0),
+    SyncToken::new(1, 1, 1, 0),
     SyncToken::new(u64::MAX, u32::MAX, u64::MAX, u64::MAX),
     SyncToken::new(1, 1, 1, 1),
   ] {
@@ -1473,6 +1488,12 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
     ".tributaries-sync--42-3-00000000deadbeef",
     ".tributaries-sync-7-42-3-4-00000000deadbeef",
     ".tributaries-sync-07-42-3",
+    // Right shape, and every field well-formed — but an `instance` of 0, which a
+    // `NonZeroU64` brand cannot render and no release ever did. Both of these were
+    // asserted as ARTIFACTS here before the fields carried their minters' floors;
+    // see this cell's disclosed correction.
+    ".tributaries-sync-0-1-0-0000000000000000",
+    ".tributaries-sync-0-1-0",
     // The cookie directory's stem with a non-numeric qualifier.
     ".tributaries-sync-cookies-mine",
   ] {
@@ -1481,6 +1502,130 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
       "{user_leaf} is not a minted artifact — suppressing it would erase a user file"
     );
   }
+}
+
+/// A leaf whose `instance` field is 0 is a USER file, not a cookie. `Owner::on_sync`
+/// renders that field from `sub.instance().get()`, and an
+/// [`InstanceId`](crate::subscription::InstanceId) is a `NonZeroU64` minted as
+/// `fetch_add(1) + 1`: the first owner in a process brands 1, and 0 is not representable at
+/// all — in today's four-field shape and in the three-field shape the pre-nonce release
+/// minted alike, since both render the field from that same type.
+///
+/// Suppression removes a change from every consumer stream with no `Rescan` and no
+/// diagnostic, so a name no release can mint has to stay a user change:
+/// `.tributaries-sync-0-123-1` is a name a caller may legitimately choose, and accepting it
+/// erased that file from every stream for the life of the watch.
+///
+/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(instance, 0, ..)` — and
+/// both assertions read `true`.
+#[test]
+fn an_instance_field_of_zero_is_a_user_file_not_a_cookie() {
+  for user_leaf in [
+    // The three-field shape, then the same coordinates under today's four-field one.
+    ".tributaries-sync-0-123-1",
+    ".tributaries-sync-0-123-1-00000000deadbeef",
+  ] {
+    assert!(
+      !super::is_cookie_name(user_leaf),
+      "{user_leaf} carries an instance no InstanceId brand can render — suppressing it \
+       erases a user file"
+    );
+  }
+}
+
+/// A leaf whose `pid` field is 0 is a USER file, not a cookie. `Owner::on_sync` renders that
+/// field from `std::process::id()`, and pid 0 is the scheduler on Unix and the System Idle
+/// pseudo-process on Windows — never a process that can execute this code, on any target
+/// this workspace supports, and equally so for the three-field release, which called the
+/// same function.
+///
+/// This is the one field bound whose floor rests on OS semantics rather than on this
+/// workspace's own source, which is why it is the first to drop if that evidence is ever
+/// questioned — see the derivation beside `is_cookie_name`.
+///
+/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(pid, 0, ..)` — and both
+/// assertions read `true`.
+#[test]
+fn a_pid_field_of_zero_is_a_user_file_not_a_cookie() {
+  for user_leaf in [
+    ".tributaries-sync-1-0-1",
+    ".tributaries-sync-1-0-1-00000000deadbeef",
+  ] {
+    assert!(
+      !super::is_cookie_name(user_leaf),
+      "{user_leaf} carries a pid no live process can have — suppressing it erases a user file"
+    );
+  }
+}
+
+/// A leaf whose `seq` field is 0 is a USER file, not a cookie. `Owner::sync_seq` starts at 0
+/// and `on_sync` PRE-increments it before minting the token, so the first sync of every
+/// owner renders 1 and no sync has ever rendered 0 — in today's shape and in the three-field
+/// release, which pre-incremented identically.
+///
+/// The lower crate's `sync_tickets` genuinely does start at 0, but that sequence brands a
+/// [`SyncTicket`](tributary_fs::SyncTicket) — an in-memory cancel address — and never
+/// reaches a file name, so it constrains nothing here.
+///
+/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(seq, 0, ..)` — and both
+/// assertions read `true`.
+#[test]
+fn a_seq_field_of_zero_is_a_user_file_not_a_cookie() {
+  for user_leaf in [
+    ".tributaries-sync-1-123-0",
+    ".tributaries-sync-1-123-0-00000000deadbeef",
+  ] {
+    assert!(
+      !super::is_cookie_name(user_leaf),
+      "{user_leaf} carries a seq the pre-incremented counter never renders — suppressing it \
+       erases a user file"
+    );
+  }
+}
+
+/// The classifier accepts what the minter ACTUALLY produces for an owner's first sync — the
+/// over-tightening guard, covering the failure direction that LEAKS rather than swallows: a
+/// floor narrower than its minter's true minimum republishes a genuine cookie's create (and
+/// its unlink) on every consumer stream as user changes, which is strictly worse than the
+/// over-acceptance the floors exist to close.
+///
+/// Every coordinate here is derived from its own minter rather than chosen: `instance` 1 is
+/// the first `InstanceId::mint` (`fetch_add(1) + 1`); `seq` 1 is `Owner::sync_seq` after the
+/// pre-increment that runs before the mint, so 1 — never 0 — is the first value any cookie
+/// name has carried, in this shape and in the three-field one; the `pid` is this very
+/// process's, so the pid floor is proven against a live pid rather than a constant; and the
+/// `nonce` is 0, a hasher's genuine minimum, which is exactly why that field carries no value
+/// bound at all.
+///
+/// `driver::tests::the_first_sync_an_owner_admits_mints_seq_one` is this cell's other half:
+/// it drives a real `on_sync` and pins the seq the minter hands over, so a release that
+/// changes the counter's discipline fails at that seam instead of leaking silently here.
+///
+/// FAIL-ON-REVERT: tighten the seq floor past its minter — `is_minted_decimal(seq, 2, ..)` —
+/// and the first cookie of every owner stops being recognized.
+#[test]
+fn the_classifier_accepts_the_name_the_first_sync_of_an_owner_mints() {
+  use crate::SyncToken;
+
+  let pid = std::process::id();
+  let minted = super::cookie_name(SyncToken::new(1, pid, 1, 0));
+  assert_eq!(
+    minted,
+    format!(".tributaries-sync-1-{pid}-1-0000000000000000"),
+    "the first sync's rendered name"
+  );
+  assert!(
+    super::is_cookie_name(&minted),
+    "{minted} is the name this binding mints for an owner's first sync — refusing it would \
+     republish a genuine cookie as a user create"
+  );
+  // The same first-sync coordinates under the three-field shape the pre-nonce release
+  // rendered, so a crash leftover from that release is still suppressed after an upgrade.
+  let legacy = format!(".tributaries-sync-1-{pid}-1");
+  assert!(
+    super::is_cookie_name(&legacy),
+    "{legacy} is the first-sync name the three-field release minted"
+  );
 }
 
 /// The cookie leaf that reaches this classifier is NOT always one this crate minted:
