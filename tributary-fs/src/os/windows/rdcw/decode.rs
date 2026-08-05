@@ -16,6 +16,23 @@
 //! `lower_rdcw_buffer` turns it into in-order loss and the pump into a rescan.
 //! Accepting a chain that skipped records is the unsafe direction, because
 //! nothing downstream can tell that it did.
+//!
+//! WHAT THIS CANNOT DETECT, stated plainly. Every extent test above is derived
+//! from fields inside the SAME untrusted header, so their ceiling is internal
+//! consistency and nothing higher. A record that lies COHERENTLY — inflating
+//! `FileNameLength` and `NextEntryOffset` by the same amount — satisfies all of
+//! them at once: its claimed end is exactly where its link points, so the gap
+//! is zero, the name fits, and the walk resumes past the records the name has
+//! quietly swallowed. No further arithmetic on those fields raises that
+//! ceiling; only evidence from a different source can. That is why the decode
+//! also tests the PAYLOAD against something no header field can forge: a
+//! counted Windows name may not contain U+0000, and the header bytes such a lie
+//! swallows are small integers that mostly are. It is EVIDENCE, not proof — a
+//! producer that lies coherently and whose swallowed bytes happen to hold no
+//! impossible code unit is still accepted, and nothing inside a single
+//! completion can refute it. The claim this module makes is bounded
+//! accordingly: it detects every INTERNALLY INCONSISTENT chain, and the
+//! coherent lies whose payload betrays them.
 
 /// The typed `FILE_ACTION_*` word of one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +217,62 @@ const BASIC_HEADER: usize = 12;
 /// The fixed prefix of a `FILE_NOTIFY_EXTENDED_INFORMATION` record.
 const EXTENDED_HEADER: usize = 84;
 
+/// The one UTF-16 code unit that a counted Windows name can never contain, and
+/// so the one whose presence is evidence the counted range is not a name.
+const NUL_UNIT: u16 = 0;
+
+/// Whether `units` can be the counted name of a real object.
+///
+/// This is the decode's only test that is INDEPENDENT of the record header —
+/// see the module header for why one is needed. Every extent test is derived
+/// from `FileNameLength` and `NextEntryOffset`, so a header that inflates both
+/// together satisfies all of them and the name it claims swallows whatever the
+/// link stepped over. Those swallowed bytes are another record's HEADER: an
+/// action word in `1..=11`, a `FileNameLength` of a few dozen, a
+/// `NextEntryOffset` of a few dozen or zero — little-endian `u32`s whose high
+/// halves are zero, which is a NUL code unit at every even offset they land on.
+/// So the payload betrays the shape the header cannot.
+///
+/// U+0000 is rejected because no Windows name of any kind contains one: NTFS
+/// forbids it in every one of its name namespaces (the POSIX namespace, the
+/// most permissive, excludes only `\0` and `/`), FAT and ReFS forbid it, and
+/// the NT object manager's names are counted rather than terminated so nothing
+/// appends one either. `FileNameLength` counts the NAME; MS-FSCC 2.7.1's
+/// padding squares off the STRUCTURE after the array, so a well-formed record
+/// never counts a padding unit into its own name. Independently of the framing
+/// question, a component carrying an embedded NUL is a hazard for every
+/// consumer that turns it back into a path.
+///
+/// NOTHING ELSE IS REJECTED, deliberately, and the exclusions are as
+/// load-bearing as the inclusion — a name that is merely unusual must still
+/// decode, because the alternative to decoding it is a rescan storm:
+///
+/// * `<`, `>`, `"`, `|`, `?`, `*` and U+0001..=U+001F are refused by the Win32
+///   PATH layer, not by the volume. They are legal in an NTFS name and
+///   reachable through the native API, so a real object can carry them and a
+///   real event can name it.
+/// * `:` is deliberately accepted above the leaf already — the stream fold cuts
+///   it only from a stream record's last component, and a cell pins that an
+///   ancestor keeps it verbatim.
+/// * `/` is rejected by NTFS itself, which makes it the closest call here. It
+///   is still accepted, because this field is a relative PATH rather than one
+///   component, and its separator convention binds Microsoft's producers rather
+///   than every redirector that can complete one of these reads. Rejecting it
+///   would buy detection the NUL already provides, at the price of making the
+///   backend's liveness depend on an inference.
+///
+/// One interaction is worth naming rather than leaving to be discovered.
+/// `ID_NOT_TUNNELLED` and `TUNNELLED_ID_COLLISION` put a FILE ID in the name
+/// field instead of a name, and a raw id is mostly zero bytes, so this test
+/// refuses them. They are reported only for subscriptions this backend never
+/// issues, so they do not arrive — and if one ever did, refusing it moves it
+/// from an `Unknown` action lowered to a located rescan onto in-order loss and
+/// a rescan. A BROADER cover, not a lost one, which is the safe direction here.
+#[inline]
+fn name_is_possible(units: &[u16]) -> bool {
+  !units.contains(&NUL_UNIT)
+}
+
 /// Decodes a watch-relative UTF-16LE name into components: separator split at
 /// the code-unit level first, then strict per-component decode, so the
 /// escalation point of a refused component keeps its usable ancestors.
@@ -353,13 +426,46 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
       // TRAIL it is its own padding and nothing else: a run long enough to BE
       // a record is an end marker the buffer itself contradicts, and walking
       // away from it would strand every record behind it under a clean decode.
-      // The allowance is deliberately the padding and not an exact end — a
-      // completion may be reported at the terminal record's unpadded length or
-      // at its padded one, and both are well-formed.
+      //
+      // HOW MUCH padding is legitimate is a per-layout question, and the two
+      // layouts get different answers for the same reason their strides do:
+      // only one of them has a specification.
+      //
+      // BASIC is fixed exactly. MS-FSCC 2.7.1 ends the structure at the
+      // 4-byte-rounded end of its name counted from the structure's start, and
+      // every record here starts 4-aligned (`at` is 0, or the sum of strides
+      // each proven a multiple of 4), so `at + padded_end` IS the end. Enumerate
+      // the legitimate completion lengths and there are only two: the padded
+      // end, and the record's UNPADDED length when the kernel reports the
+      // transfer that way — and `saturating_sub` already folds the second into
+      // the first, since the unpadded length is never past the padded one. Both
+      // give `stranded == 0`, and there is no third. One byte past the
+      // 4-rounded end is therefore corruption or the head of a truncated record
+      // the walk would never visit, never padding. The rule this replaces
+      // (`stranded >= header`) accepted 1..=11 such bytes as slack.
+      //
+      // EXTENDED has no MS-FSCC section, so it has no published padding rule
+      // and there is no end to hold it to; picking one would be exactly the
+      // guess the stride below refuses to make, in a smaller font. What is left
+      // is the property the loss barrier actually needs and nothing beyond it:
+      // the trailing run must be too small to have BEEN a record, and no record
+      // is shorter than its own fixed prefix. That is the WEAKEST bound that
+      // still closes the barrier, which is precisely why it is the one used —
+      // any tighter bound would have to be inferred rather than cited, and an
+      // inferred alignment that a real producer disagrees with turns every
+      // completion into a rescan. RESIDUAL, accepted knowingly: up to
+      // `header - 1` trailing bytes pass as padding, so a trailing extended
+      // record TRUNCATED inside its own fixed prefix is dropped in silence. A
+      // whole record cannot hide there.
       let stranded = at
         .checked_add(padded_end)
         .map_or(0, |end_of_record| buf.len().saturating_sub(end_of_record));
-      if stranded >= header {
+      let trailing_is_only_padding = if extended {
+        stranded < header
+      } else {
+        stranded == 0
+      };
+      if !trailing_is_only_padding {
         return DecodedBuffer {
           records,
           lossy: true,
@@ -436,6 +542,22 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
       .iter()
       .map(|pair| u16::from_le_bytes(*pair))
       .collect();
+
+    // The RAW payload is tested before the stream fold and before the record is
+    // published, because this is the one test that does not come from the
+    // header — and by the time the fold has run, the evidence may be on the
+    // side of the `:` that was cut away. A name that cannot exist means the
+    // range is not a name, which means this record's extent is a lie, so the
+    // chain takes the module's existing malformed path: the records already
+    // decoded stand, this one is never published, and the pump covers the rest
+    // with a rescan.
+    if !name_is_possible(&units) {
+      return DecodedBuffer {
+        records,
+        lossy: true,
+      };
+    }
+
     let name = decode_name(&units, action.is_stream());
 
     records.push(RdcwRecord {
@@ -761,17 +883,35 @@ mod tests {
   /// record's own padding is not a stranded record, and neither is a
   /// completion reported at the record's UNPADDED length — MS-FSCC 2.7.1 pads
   /// `FileName` to the next 4-byte boundary, but the completion's transferred
-  /// count is the kernel's to report and both spellings are well-formed. The
-  /// allowance is therefore a ceiling and not an exact end: anything too small
-  /// to have BEEN a record is slack.
+  /// count is the kernel's to report and both spellings are well-formed.
   ///
-  /// If this refusal were ever tightened into an exact end, every real
-  /// completion whose reported length disagreed by a byte would go lossy and
-  /// the backend would rescan forever. This cell is what fails first.
+  /// If this allowance were ever tightened past what a layout's specification
+  /// fixes, every real completion whose reported length disagreed would go
+  /// lossy and the backend would rescan forever. This cell is what fails first,
+  /// and its two legs disagree on purpose:
   ///
-  /// MUTATION WITNESS: replace `stranded >= header` with `stranded != 0` and
-  /// both legs FAIL at `3 trailing bytes are slack, not loss` — the first
-  /// count past the padded end, which an exact end would have refused.
+  /// * BASIC is held to `stranded == 0`. MS-FSCC 2.7.1 fixes the structure's
+  ///   end at the 4-rounded end of its name, and the unpadded spelling is
+  ///   BELOW that end rather than past it, so both legitimate lengths land on
+  ///   zero and nothing legitimate lands anywhere else.
+  /// * EXTENDED has no such section, so its padding granularity is unknown and
+  ///   the allowance stays the weakest bound that still closes the loss barrier
+  ///   — too small to have been a record.
+  ///
+  /// CORRECTION. This cell previously asserted the BASIC leg accepted trailing
+  /// runs up to `header - 1`, and named `stranded != 0` as the mutation that
+  /// would break it. That was the loose rule written into the suite as a
+  /// contract: for the one layout whose end IS specified, 1..=11 bytes past the
+  /// 4-rounded end are not padding, they are corruption or the head of a
+  /// truncated record, and accepting them dropped whatever sat behind them
+  /// under a clean decode. The extended half of the old assertion stands
+  /// unchanged; the basic half is now strictly stronger.
+  ///
+  /// MUTATION WITNESS: give both layouts the extended allowance
+  /// (`stranded < header` for both) and the BASIC leg FAILS at `3 trailing
+  /// bytes past a specified end are loss`. Give both layouts the basic one
+  /// (`stranded == 0` for both) and the EXTENDED leg FAILS at `3 trailing bytes
+  /// are slack, not loss`.
   #[test]
   fn a_zero_links_own_padding_is_not_a_record() {
     for extended in [false, true] {
@@ -786,10 +926,17 @@ mod tests {
       let padded = body.next_multiple_of(4);
       assert_eq!(padded - body, 2, "extended={extended}: the padding is real");
 
-      // Every trailing count too small to have been a record is slack. This
-      // spans the unpadded end (0), the padded end, and every byte between the
-      // padding and a whole record's worth of bytes.
-      for trailing in 0..(padded - body + header) {
+      // The first trailing count that is refused. Basic: one byte past the
+      // specified end. Extended: a whole record's worth past it.
+      let first_refused = if extended {
+        padded - body + header
+      } else {
+        padded - body + 1
+      };
+
+      // Below it every count is slack: the unpadded end (0), the padded end,
+      // and — on extended only — everything between the padding and a record.
+      for trailing in 0..first_refused {
         let mut buf = Vec::new();
         push_record(&mut buf, extended, 0, 3, &utf16("odd"));
         buf.resize(body + trailing, 0);
@@ -803,16 +950,52 @@ mod tests {
         assert_eq!(decoded.records[0].name, RdcwName::Utf8(vec!["odd".into()]));
       }
 
-      // One byte more and a whole record could be sitting there unvisited.
+      // At it, something is there that the record's own extent cannot explain.
       let mut buf = Vec::new();
       push_record(&mut buf, extended, 0, 3, &utf16("odd"));
-      buf.resize(body + (padded - body + header), 0);
+      buf.resize(body + first_refused, 0);
       let decoded = decode_records(&buf, extended);
       assert!(
         decoded.lossy,
-        "extended={extended}: a whole record's worth of trailing bytes is loss"
+        "extended={extended}: {first_refused} trailing bytes past a specified \
+         end are loss"
+      );
+      assert!(
+        decoded.records.is_empty(),
+        "extended={extended}: a contradicted extent publishes nothing"
       );
     }
+  }
+
+  /// Finding B's own example, pinned on its own. A basic record whose name is
+  /// one UTF-16 unit runs to 14 bytes and pads to 16; a completion reporting 24
+  /// is carrying eight bytes that MS-FSCC 2.7.1 says are not part of this
+  /// record. Eight bytes is two thirds of a basic header — far too few to be
+  /// walked as a record, and far too many to be the two bytes of padding the
+  /// only specified end allows. Under the old `stranded >= header` rule they
+  /// were slack, the decode was clean, and whatever the kernel had begun
+  /// writing there was gone with no covering signal.
+  ///
+  /// MUTATION WITNESS: restore `stranded >= header` for the basic layout and
+  /// this FAILS at `eight bytes past a specified end are not padding`.
+  #[test]
+  fn a_basic_terminal_refuses_a_partial_trailing_record() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 1, &utf16("a"));
+    assert_eq!(buf.len(), 14, "12 + one UTF-16 unit");
+    pad4(&mut buf);
+    assert_eq!(buf.len(), 16, "the record's specified end");
+    // The first eight bytes of a record whose remaining four never arrived.
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    assert_eq!(buf.len(), 24);
+
+    let decoded = decode_records(&buf, false);
+    assert!(
+      decoded.lossy,
+      "eight bytes past a specified end are not padding"
+    );
+    assert!(decoded.records.is_empty());
   }
 
   /// A link that does not clear the record's own fixed prefix cannot be a
@@ -877,6 +1060,176 @@ mod tests {
       assert!(
         decoded.records.is_empty(),
         "extended={extended}: an untrustworthy stride publishes nothing"
+      );
+    }
+  }
+
+  /// The ceiling of every header-derived test, and the reason the decode also
+  /// looks at the payload.
+  ///
+  /// [`an_inflated_stride_that_skips_a_record_refuses_lossy`] is caught because
+  /// the inflated link disagrees with the record's claimed end. Make the header
+  /// lie COHERENTLY — grow `FileNameLength` by exactly what `NextEntryOffset`
+  /// was grown by — and the disagreement vanishes: the claimed end lands on the
+  /// link to the byte, so basic sees the exact equality it demands and extended
+  /// sees a zero gap. Every extent test passes, because every extent test is
+  /// computed from the two fields that were inflated together.
+  ///
+  /// What is left is worse than a skipped record. The middle record's bytes do
+  /// not merely vanish — its header, its name and its padding become part of
+  /// the FIRST record's name, so a location no enumeration could ever produce
+  /// is published as authority, a real change is lost, and the decode returns
+  /// `lossy: false` so nothing rescans. The payload is what refutes it: those
+  /// swallowed bytes are little-endian `u32`s whose high halves are zero.
+  ///
+  /// MUTATION WITNESS: drop the `name_is_possible` refusal and both legs FAIL
+  /// at `must refuse` — the decode returns `lossy: false` with the FIRST and
+  /// THIRD records, the first named out of the second's bytes.
+  #[test]
+  fn a_coherently_inflated_name_may_not_swallow_the_record_its_link_skips() {
+    for extended in [false, true] {
+      let header = if extended {
+        EXTENDED_HEADER
+      } else {
+        BASIC_HEADER
+      };
+      let name_len_at = header - 4;
+      let mut buf = Vec::new();
+      let first = push_record(&mut buf, extended, 0, 1, &utf16("first"));
+      pad4(&mut buf);
+      push_record(&mut buf, extended, 0, 2, &utf16("swallowed"));
+      pad4(&mut buf);
+      let third = buf.len();
+      push_record(&mut buf, extended, 0, 3, &utf16("third"));
+
+      // Link over the middle record, then grow the name to cover exactly the
+      // bytes the link steps over.
+      let stride = third - first;
+      link(&mut buf, first, stride);
+      let inflated = (stride - header) as u32;
+      buf[name_len_at..name_len_at + 4].copy_from_slice(&inflated.to_le_bytes());
+      // The lie is coherent by construction: the record's claimed end IS its
+      // link, so no test derived from the header can tell them apart.
+      assert_eq!(
+        padded_extent(header, inflated as usize),
+        Some(stride),
+        "extended={extended}: the claimed end is the link"
+      );
+
+      let decoded = decode_records(&buf, extended);
+      assert!(decoded.lossy, "extended={extended} must refuse");
+      assert!(
+        decoded.records.is_empty(),
+        "extended={extended}: a swallowing record is never published"
+      );
+      for record in &decoded.records {
+        let (RdcwName::Utf8(components) | RdcwName::Escalate { prefix: components }) = &record.name;
+        assert!(
+          components.iter().all(|c| !c.contains('\0')),
+          "extended={extended}: published {components:?} out of swallowed bytes"
+        );
+      }
+    }
+  }
+
+  /// The same coherent lie aimed at the terminal record instead of at a link.
+  ///
+  /// A zero `NextEntryOffset` has no stride to disagree with, so the only
+  /// header-derived test left is the trailing-run allowance — and inflating
+  /// `FileNameLength` until the record's claimed end reaches the end of the
+  /// completion drives `stranded` to zero, which every layout accepts. The
+  /// records behind the marker are swallowed into the terminal record's name
+  /// rather than stranded behind it, so [`a_zero_link_may_not_strand_a_record_behind_it`]
+  /// never sees them. The payload is again the only witness.
+  ///
+  /// MUTATION WITNESS: drop the `name_is_possible` refusal and both legs FAIL
+  /// at `must refuse` — one record is published, named out of the two behind it.
+  #[test]
+  fn a_coherently_inflated_terminal_name_may_not_swallow_the_records_behind_it() {
+    for extended in [false, true] {
+      let header = if extended {
+        EXTENDED_HEADER
+      } else {
+        BASIC_HEADER
+      };
+      let name_len_at = header - 4;
+      let mut buf = Vec::new();
+      push_record(&mut buf, extended, 0, 1, &utf16("first"));
+      pad4(&mut buf);
+      push_record(&mut buf, extended, 0, 2, &utf16("swallowed"));
+      pad4(&mut buf);
+      push_record(&mut buf, extended, 0, 3, &utf16("also swallowed"));
+      pad4(&mut buf);
+
+      // The link is already the end marker; grow the name to the whole
+      // completion so the trailing run is empty too.
+      let inflated = (buf.len() - header) as u32;
+      buf[name_len_at..name_len_at + 4].copy_from_slice(&inflated.to_le_bytes());
+      assert_eq!(
+        padded_extent(header, inflated as usize),
+        Some(buf.len()),
+        "extended={extended}: nothing trails the claimed end"
+      );
+
+      let decoded = decode_records(&buf, extended);
+      assert!(decoded.lossy, "extended={extended} must refuse");
+      assert!(
+        decoded.records.is_empty(),
+        "extended={extended}: a swallowing record is never published"
+      );
+      for record in &decoded.records {
+        let (RdcwName::Utf8(components) | RdcwName::Escalate { prefix: components }) = &record.name;
+        assert!(
+          components.iter().all(|c| !c.contains('\0')),
+          "extended={extended}: published {components:?} out of swallowed bytes"
+        );
+      }
+    }
+  }
+
+  /// The over-tightening guard for the payload test. The name check exists to
+  /// refuse a range that cannot BE a name, and its whole value depends on not
+  /// refusing names that merely look unusual: a refusal is a rescan, and a
+  /// refusal on a name a user really chose is a rescan that repeats forever.
+  ///
+  /// Everything here is legal on an NTFS volume even where the Win32 path layer
+  /// would refuse to create it — the reserved punctuation is reachable through
+  /// the native API, and `/` is refused by NTFS itself but this field is a
+  /// relative path whose separator convention binds Microsoft's producers
+  /// rather than every redirector that can complete one of these reads.
+  ///
+  /// MUTATION WITNESS: widen `name_is_possible` to reject the Win32-reserved
+  /// set as well and this FAILS at `quo"ted.txt must still decode`.
+  #[test]
+  fn an_unusual_but_possible_name_still_decodes() {
+    for name in [
+      "ordinary.txt",
+      "a\\b\\c.txt",
+      "spaced out.txt",
+      "punct'uated-name_(1).txt",
+      "wide \u{1f4a1} name.txt", // outside the BMP: a real surrogate pair
+      "quo\"ted.txt",
+      "ang<le>d.txt",
+      "pipe|d.txt",
+      "quer?y.txt",
+      "star*red.txt",
+      "slash/ed.txt",
+      "trailing.",
+      "\u{00e9}\u{4e2d}\u{6587}.txt",
+    ] {
+      let mut buf = Vec::new();
+      push_record(&mut buf, false, 0, 3, &utf16(name));
+      let decoded = decode_records(&buf, false);
+      assert!(!decoded.lossy, "{name} must still decode");
+      let expected: Vec<String> = name
+        .split('\\')
+        .filter(|component| !component.is_empty())
+        .map(String::from)
+        .collect();
+      assert_eq!(
+        decoded.records[0].name,
+        RdcwName::Utf8(expected),
+        "{name} must decode verbatim"
       );
     }
   }
@@ -976,9 +1329,17 @@ mod tests {
   /// only to the property the loss barrier needs: the gap must be too small to
   /// have been a record.
   ///
+  /// The same reasoning reaches the TERMINAL record: a completion reported at
+  /// the 8-rounded end of the last record trails its 4-rounded one by six
+  /// bytes, which is that layout's padding for exactly the same unspecified
+  /// reason, so both halves of one 8-aligned chain are covered here rather than
+  /// in a second cell.
+  ///
   /// MUTATION WITNESS: hold the extended stride to the same exact end as the
   /// basic one (`gap == Some(0)` for both layouts) and this FAILS at
-  /// `an 8-aligned stride is well-formed`.
+  /// `an 8-aligned stride is well-formed`. Hold the extended TRAILING run to
+  /// the basic rule (`stranded == 0` for both) and it FAILS at `an 8-aligned
+  /// terminal is well-formed`.
   #[test]
   fn an_eight_aligned_extended_chain_is_not_loss() {
     let mut buf = Vec::new();
@@ -997,6 +1358,17 @@ mod tests {
 
     let decoded = decode_records(&buf, true);
     assert!(!decoded.lossy, "an 8-aligned stride is well-formed");
+    assert_eq!(decoded.records.len(), 2);
+    assert_eq!(decoded.records[1].name, RdcwName::Utf8(vec!["two".into()]));
+
+    // And the same chain reported at the terminal record's 8-rounded end.
+    assert_eq!(buf.len(), 186, "the terminal record's 4-rounded end");
+    while !buf.len().is_multiple_of(8) {
+      buf.push(0);
+    }
+    assert_eq!(buf.len(), 192);
+    let decoded = decode_records(&buf, true);
+    assert!(!decoded.lossy, "an 8-aligned terminal is well-formed");
     assert_eq!(decoded.records.len(), 2);
     assert_eq!(decoded.records[1].name, RdcwName::Utf8(vec!["two".into()]));
   }
