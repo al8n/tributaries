@@ -1504,6 +1504,9 @@ where
         Some(None) => break (None, true),
         None => {}
       }
+      // Stays even though `consume_source_event` now drains on every path out of itself: the
+      // no-event arm above consumed nothing, and that is precisely the case this valve exists for
+      // (a command flood with an idle source), so this is the only drain that arm gets.
       owner.drain_coalescer_due();
     }
 
@@ -3878,43 +3881,79 @@ where
   /// the command-fairness valve's forced poll: dead-root retirement, retained-cover
   /// degradation on a live-root `Rescan`, then fan-out, in that one order. A coverage-loss
   /// signal can never reach subscribers with the stale claim left standing on either path.
+  ///
+  /// # Consuming a record always ticks the settle clock
+  ///
+  /// Every path out of this funnel drains the coalescer's DUE output
+  /// ([`drain_coalescer_due`](Self::drain_coalescer_due)), because consuming a record is the one
+  /// thing the run loop does that costs the timer arm its turn. The `select!` is biased with
+  /// `source.next()` **above** the settle timer, so a source that is ready on every poll wins every
+  /// iteration and the timer never fires; the source arm also resets `command_streak`, so the
+  /// command-fairness valve's own due-drain never fires either. A record whose handling returns
+  /// before [`push_all`](Self::push_all) — the sole normal-path `drain_ready` caller — therefore
+  /// buys the loop nothing and holds a debounced user change past its
+  /// [`max_hold`](crate::DebounceConfig::max_hold) for as long as the flood lasts. Two such paths
+  /// exist and both are covered here: a dead-root record (retired above, fanned out never) and a
+  /// **totally reserved** change (returned before routing inside `fan_out_and_push`). Since a
+  /// reserved change is exactly what another `Watcher`'s sync loop emits at whatever rate it syncs,
+  /// the flood is reachable from outside this process.
+  ///
+  /// Draining is not admitting: this releases entries the coalescer ALREADY holds and whose
+  /// deadline has passed. The reserved record itself never enters the coalescer — the suppression in
+  /// `fan_out_and_push` still returns ahead of every route, so nothing about which events are
+  /// deliverable changes, only when the deliverable ones are handed over.
   fn consume_source_event(&mut self, event: &SourceEvent<C, S::Handle>) {
-    if !self.retire_if_dead(event) {
-      // A make-before-break `replace` commits an epoch-bumped full-root `Rescan` on the PRESERVED
-      // handle for each leg, so a diverging-then-rolled-back widen leaves a stale `Rescan` whose key
-      // names the transient divergent root the handle no longer watches. `retire_if_dead` saw the
-      // handle LIVE (rolled back to its current root), so this reaches here as a live-root `Rescan`;
-      // fanning or parking it at its stale, DISJOINT key would merge into the rollback's parked debt
-      // and widen the owed re-enumeration to their common ancestor (up to `/`). The handle's CURRENT
-      // `root_key` is authoritative: clamp such a disjoint live-root `Rescan` to it (a current-root
-      // `Rescan` correctly and safely dominates everything under the live root), so BOTH the fan-out
-      // and the domination below use the safe current-root key.
-      let clamped = self.clamp_disjoint_live_root_rescan(event);
-      let event = clamped.as_ref().unwrap_or(event);
-      self.degrade_retained_cover_on_rescan(event);
-      // Every reserved-namespace change is consumed inside this call — wholly, or down to
-      // the user endpoint of a rename that touched the namespace at one end — and the
-      // classification comes back so a pending barrier can be resolved on it below.
-      let reserved = self.fan_out_and_push(event);
-      // A `Rescan` can DOMINATE a pending cookie — a loss that ate the
-      // cookie's own event elects a covering signal at that position, and
-      // re-enumeration meets the barrier just as delivery would. It is
-      // resolved ONLY NOW, strictly AFTER `fan_out_and_push` has published or
-      // durably parked the `Rescan`: a barrier that resolved first would let
-      // a caller waking on another thread drain past a `Rescan` that is not
-      // yet in the channel or `needs_rescan` — the prohibited half-barrier.
-      if event.kind().is_rescan() {
-        self.dominate_pending_syncs(event);
-      } else if reserved.any() {
-        // The cookie's own event, however it arrived: created in place, unlinked, or
-        // RENAMED into the reserved namespace, which is a cookie observation on the same
-        // terms as any other. Resolved under the identical discipline the `Rescan` above
-        // obeys — strictly after this change's own publication, so a caller waking on
-        // another thread cannot drain past a delivery this barrier's resolution implies it
-        // will find. A `Rescan` is never classified, so the two arms are disjoint by
-        // construction rather than by ordering luck.
-        self.resolve_matching_pending_sync(event);
-      }
+    if self.retire_if_dead(event) {
+      // The dead-root record was consumed whole: its subscribers' coverage loss is owed as the
+      // parked terminal `Rescan` and their buffered deltas were dropped with them. Every OTHER
+      // subscription's settle clock still ran, so release what came due — the drain is what a
+      // repeated terminal event on an already-retired handle (retirement is idempotent, so it
+      // does no further work) would otherwise consume the loop's iteration without.
+      self.drain_coalescer_due();
+      return;
+    }
+    // A make-before-break `replace` commits an epoch-bumped full-root `Rescan` on the PRESERVED
+    // handle for each leg, so a diverging-then-rolled-back widen leaves a stale `Rescan` whose key
+    // names the transient divergent root the handle no longer watches. `retire_if_dead` saw the
+    // handle LIVE (rolled back to its current root), so this reaches here as a live-root `Rescan`;
+    // fanning or parking it at its stale, DISJOINT key would merge into the rollback's parked debt
+    // and widen the owed re-enumeration to their common ancestor (up to `/`). The handle's CURRENT
+    // `root_key` is authoritative: clamp such a disjoint live-root `Rescan` to it (a current-root
+    // `Rescan` correctly and safely dominates everything under the live root), so BOTH the fan-out
+    // and the domination below use the safe current-root key.
+    let clamped = self.clamp_disjoint_live_root_rescan(event);
+    let event = clamped.as_ref().unwrap_or(event);
+    self.degrade_retained_cover_on_rescan(event);
+    // Every reserved-namespace change is consumed inside this call — wholly, or down to
+    // the user endpoint of a rename that touched the namespace at one end — and the
+    // classification comes back so a pending barrier can be resolved on it below.
+    let reserved = self.fan_out_and_push(event);
+    // The settle-clock tick this record owes, placed BETWEEN publication and barrier resolution so
+    // it can only strengthen the ordering below: a totally-reserved change returns from
+    // `fan_out_and_push` before `push_all`, which is the only normal-path `drain_ready`, so without
+    // this a flood of them holds every subscription's due output for as long as it lasts. Running it
+    // AHEAD of the two resolution arms means everything published in this iteration is published
+    // before any barrier reply leaves — never after, which is the direction the half-barrier
+    // prohibition names.
+    self.drain_coalescer_due();
+    // A `Rescan` can DOMINATE a pending cookie — a loss that ate the
+    // cookie's own event elects a covering signal at that position, and
+    // re-enumeration meets the barrier just as delivery would. It is
+    // resolved ONLY NOW, strictly AFTER `fan_out_and_push` has published or
+    // durably parked the `Rescan`: a barrier that resolved first would let
+    // a caller waking on another thread drain past a `Rescan` that is not
+    // yet in the channel or `needs_rescan` — the prohibited half-barrier.
+    if event.kind().is_rescan() {
+      self.dominate_pending_syncs(event);
+    } else if reserved.any() {
+      // The cookie's own event, however it arrived: created in place, unlinked, or
+      // RENAMED into the reserved namespace, which is a cookie observation on the same
+      // terms as any other. Resolved under the identical discipline the `Rescan` above
+      // obeys — strictly after this change's own publication, so a caller waking on
+      // another thread cannot drain past a delivery this barrier's resolution implies it
+      // will find. A `Rescan` is never classified, so the two arms are disjoint by
+      // construction rather than by ordering luck.
+      self.resolve_matching_pending_sync(event);
     }
   }
 

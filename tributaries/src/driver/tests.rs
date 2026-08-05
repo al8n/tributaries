@@ -9846,6 +9846,288 @@ mod reserved_namespace {
       "the resolution read the debt this change's own publication created, so it ran after it"
     );
   }
+
+  // ---------------------------------------------------------------------------
+  // A consumed record always ticks the settle clock — suppressing a change is not
+  // a reason to stop paying the debounce its bound.
+  // ---------------------------------------------------------------------------
+
+  /// A debounce policy whose windows are short enough to expire on a paused clock but long
+  /// enough that nothing settles by accident while a cell is setting up.
+  fn settle_in_20ms_hold_100ms() -> DebounceConfig {
+    DebounceConfig::new()
+      .with_quiet_window(Duration::from_millis(20))
+      .with_max_hold(Duration::from_millis(100))
+  }
+
+  /// A user change buffered under debounce must be released once its hold expires, even
+  /// though every record the source hands over in the meantime is a **totally reserved** one
+  /// that is suppressed before it is routed anywhere.
+  ///
+  /// `fan_out_and_push` returns on `is_total()` **above** [`push_all`](super::Owner::push_all),
+  /// which owns the only normal-path `drain_ready` — so the suppressed record used to consume the
+  /// loop's iteration and pay the debounce nothing. `consume_source_event` now drains the due
+  /// output itself, on every path out of the funnel.
+  ///
+  /// The clock is paused, so "its hold expired" is a fact of the test rather than a race: the
+  /// entry is due before the reserved record is fed, and the reserved record is the only thing
+  /// that runs afterwards.
+  ///
+  /// FAIL-ON-REVERT: drop the `self.drain_coalescer_due()` between `fan_out_and_push` and the
+  /// barrier arms in `consume_source_event` and nothing is delivered — the buffered change is
+  /// still sitting in the coalescer, past its bound, exactly as the finding describes.
+  #[tokio::test(start_paused = true)]
+  async fn a_totally_reserved_record_still_releases_the_due_change_it_holds_up() {
+    let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(settle_in_20ms_hold_100ms()))));
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+    // The user's change buffers under debounce — nothing is owed to the consumer yet.
+    h.owner.consume_source_event(&source_created(1, "/a/f", 1));
+    assert!(
+      h.drain().is_empty(),
+      "the user change is still settling, so nothing is delivered on admission"
+    );
+
+    // Its hold expires while the source has nothing but another `Watcher`'s cookies to hand over.
+    tokio::time::advance(Duration::from_millis(150)).await;
+    let (reserved, _) = inside_the_cookie_directory("anything");
+    h.owner
+      .consume_source_event(&source_created(1, &reserved, 2));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      1,
+      "consuming the reserved record released the due change, and released only it: {delivered:?}"
+    );
+    assert_eq!(delivered[0].subscription(), sub);
+    assert_eq!(
+      delivered[0].path(),
+      Path::new("/a/f"),
+      "…the user's change, never the cookie that unblocked it"
+    );
+  }
+
+  /// The drain is not an admission: a flood of totally reserved records is still delivered to
+  /// nobody AND still buffered nowhere. The suppression `fan_out_and_push` performs is untouched —
+  /// what changed is only that consuming one of these records now pays the settle clock.
+  ///
+  /// Proven on both halves: the consumer stream stays empty across a clock advance past the whole
+  /// hold, and a `flush_all` — which force-emits *everything* the coalescer holds regardless of
+  /// deadline — comes back empty, so no reserved record was buffered to be released later either.
+  ///
+  /// FAIL-ON-REVERT: route the `is_total()` arm of `fan_out_and_push` through `fan_out_raw` +
+  /// `push_all` — "draining" by ADMITTING the reserved change rather than suppressing it — and the
+  /// cookies surface on the consumer's stream. The post-advance half is what fails first (under a
+  /// 20ms quiet window nothing is due at admission, so the admitted cookies come out on the drain
+  /// after it); `flush_all` catches whatever a longer window would still be holding.
+  #[tokio::test(start_paused = true)]
+  async fn a_reserved_flood_is_neither_delivered_nor_coalesced() {
+    let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(settle_in_20ms_hold_100ms()))));
+    h.watch("/a", Interest::all()).await.expect("watch /a");
+
+    // Both classification grounds, and a distinct leaf per record so nothing could collapse.
+    for seq in 0..16u64 {
+      let by_grammar = format!("/a/cookie-{seq}");
+      let (by_parent, _) = inside_the_cookie_directory(&format!("leaf-{seq}"));
+      h.owner
+        .consume_source_event(&source_created(1, &by_grammar, seq * 2));
+      h.owner
+        .consume_source_event(&source_created(1, &by_parent, seq * 2 + 1));
+    }
+
+    assert!(
+      h.drain().is_empty(),
+      "no reserved record reaches the consumer"
+    );
+    tokio::time::advance(Duration::from_millis(150)).await;
+    h.owner.drain_coalescer_due();
+    assert!(
+      h.drain().is_empty(),
+      "…and none is released by a later drain either"
+    );
+
+    let mut held = Vec::new();
+    h.owner
+      .coalescer
+      .as_mut()
+      .expect("debounce is enabled")
+      .flush_all(&mut held);
+    assert!(
+      held.is_empty(),
+      "no reserved record was ever admitted to the coalescer: {held:?}"
+    );
+  }
+
+  /// The same sweep on the funnel's OTHER early return: a record whose root the source has
+  /// already forgotten is consumed by `retire_if_dead` and never fanned out. Retirement is
+  /// idempotent, so a repeat terminal event on an already-retired handle does no work at all —
+  /// it is a consumed record that pays an unrelated subscription's settle clock nothing.
+  ///
+  /// The buffered change belongs to a **different, live** root, so the retirement neither
+  /// drops nor forgets it — the only thing that can release it is the drain.
+  ///
+  /// FAIL-ON-REVERT: drop the `self.drain_coalescer_due()` on the `retire_if_dead` arm of
+  /// `consume_source_event` and the live root's due change is not delivered.
+  #[tokio::test(start_paused = true)]
+  async fn a_dead_root_record_still_releases_another_roots_due_change() {
+    let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(settle_in_20ms_hold_100ms()))));
+    let live = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+    h.watch("/b", Interest::all()).await.expect("watch /b"); // handle 2
+    h.drain();
+
+    h.owner.consume_source_event(&source_created(1, "/a/f", 1));
+    assert!(h.drain().is_empty(), "the live root's change is settling");
+
+    tokio::time::advance(Duration::from_millis(150)).await;
+    // The OTHER root dies out of band and its terminal event arrives.
+    h.owner.source.kill_root(2);
+    h.owner.consume_source_event(&source_removed(2, "/b", 2));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      1,
+      "the dead-root record released the live root's due change: {delivered:?}"
+    );
+    assert_eq!(delivered[0].subscription(), live);
+    assert_eq!(delivered[0].path(), Path::new("/a/f"));
+  }
+
+  /// The flood, end to end, against the REAL run loop — the shape the finding names.
+  ///
+  /// The run loop's `select!` is biased with `source.next()` **above** the settle timer, and this
+  /// source is ready on every poll, so the timer arm is never even reached; the source arm also
+  /// zeroes `command_streak`, so the command-fairness valve's due-drain never fires either. The
+  /// only thing left that can honor the debounce's bound is the funnel's own drain.
+  ///
+  /// Every flood record is reserved by its PARENT DIRECTORY alone — the classification ground that
+  /// makes this reachable from outside the process: a second `Watcher` over the same tree writes
+  /// cookies whose leaf names follow no grammar this crate knows, so its ordinary sync loop is the
+  /// flood.
+  ///
+  /// FAIL-ON-REVERT: drop the `self.drain_coalescer_due()` between `fan_out_and_push` and the
+  /// barrier arms in `consume_source_event` and `w.next()` waits out its whole timeout
+  /// (`Elapsed(())`) — the user's change is held for as long as the other watcher keeps syncing.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_sustained_reserved_flood_cannot_starve_a_due_change_in_the_run_loop() {
+    let (trigger_tx, trigger_rx) = async_channel::unbounded::<()>();
+    let stop = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    // Stops the flood on the way out — on the assertion's success AND on its panic. A task that
+    // never yields cannot be shut down, so the runtime's own drop would hang behind it.
+    let _stop_on_exit = StopFloodOnDrop(stop.clone());
+    let source = ArtifactFloodSource {
+      next_handle: 0,
+      live: HashMap::new(),
+      user_event: Some(source_created(1, "/a/f", 1)),
+      trigger: trigger_rx,
+      minted: 0,
+      stop: stop.clone(),
+    };
+    let mut w: super::super::Tributaries<OsString, (), TokioRuntime, u32> =
+      super::super::Tributaries::with_source(
+        source,
+        TributariesOptions::new().debounce(settle_in_20ms_hold_100ms()),
+      );
+    let sub = w
+      .watch(key("/a"), (), WatchOptions::new())
+      .await
+      .expect("watch /a"); // handle 1
+
+    // Release the user's change; from here the source hands over nothing but cookies, forever.
+    trigger_tx.try_send(()).expect("release the user change");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), w.next())
+      .await
+      .expect("the debounced user change drains despite the sustained reserved flood")
+      .expect("the stream is open");
+    assert_eq!(event.subscription(), sub, "routed to the covering sub");
+    assert_eq!(
+      event.path(),
+      Path::new("/a/f"),
+      "…and it is the user's change, not a cookie"
+    );
+  }
+
+  /// Sets [`ArtifactFloodSource`]'s stop flag as the test frame unwinds or returns.
+  struct StopFloodOnDrop(std::sync::Arc<core::sync::atomic::AtomicBool>);
+
+  impl Drop for StopFloodOnDrop {
+    fn drop(&mut self) {
+      self.0.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+  }
+
+  /// A source that hands over one user change and then floods with records another `Watcher`'s
+  /// sync loop produces: leaves inside the cookie directory, classified reserved by their parent
+  /// alone. Once the flood starts `next` **never awaits**, so the biased `select!` takes the source
+  /// arm on every poll — the starvation shape, reproduced exactly.
+  struct ArtifactFloodSource {
+    next_handle: u32,
+    live: HashMap<u32, Vec<OsString>>,
+    /// Held back until the test releases it, so it cannot be consumed before its subscriber
+    /// exists.
+    user_event: Option<SourceEvent<OsString, u32>>,
+    trigger: async_channel::Receiver<()>,
+    /// A fresh reserved leaf per record: nothing can collapse, so a regression that admitted
+    /// these to the coalescer could not hide behind a merge.
+    minted: u64,
+    stop: std::sync::Arc<core::sync::atomic::AtomicBool>,
+  }
+
+  impl Source<OsString> for ArtifactFloodSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      self.next_handle += 1;
+      let handle = self.next_handle;
+      self.live.insert(handle, key.to_vec());
+      Ok(Armed::new(handle, key.to_vec()))
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.live.remove(&handle);
+    }
+
+    /// The PARENT-DIRECTORY ground only — the one a cookie whose name this crate cannot predict
+    /// is classified by, and the one this branch newly reaches.
+    fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+      key
+        .len()
+        .checked_sub(2)
+        .and_then(|parent| key[parent].to_str())
+        .is_some_and(|parent| parent == COOKIE_DIR)
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      if self.user_event.is_some() {
+        // Cancellation-safe: the trigger message and the event are taken on the same poll that
+        // returns `Ready`, so a losing `select!` arm dropping this future loses neither.
+        self.trigger.recv().await.ok()?;
+        return self.user_event.take();
+      }
+      if self.stop.load(core::sync::atomic::Ordering::SeqCst) {
+        return None;
+      }
+      self.minted += 1;
+      Some(SourceEvent::new(
+        1,
+        key(&format!("/a/{COOKIE_DIR}/{}", self.minted)),
+        EventKind::Created,
+        Location::new(),
+        Epoch::new(self.minted),
+        Some(ChangeId::new(NonZeroU64::MIN)),
+      ))
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.live.get(&handle).cloned()
+    }
+  }
 }
 
 /// The owner is both the semantic core AND the host for arbitrary caller code —
