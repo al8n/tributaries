@@ -281,9 +281,17 @@ pub trait LocalSource<C> {
   ///
   /// # Cancellation
   ///
-  /// Dropping the returned future MUST strand nothing. This is a read-only **probe**: unlike
-  /// [`arm`](Self::arm) it acquires no external resource for `Drop` to reclaim, so the umbrella
-  /// is free to abandon it and to re-issue it for the same `key`.
+  /// Dropping the returned future MUST strand nothing the umbrella can see. This is a read-only
+  /// **probe**: unlike [`arm`](Self::arm) it acquires no watch, no stream and no handle for
+  /// `Drop` to reclaim, so the umbrella is free to abandon it and to re-issue it for the same
+  /// `key`.
+  ///
+  /// An implementation that offloaded the resolution to a blocking pool still owes that pool the
+  /// cancellation it CAN make: **abort** the job on drop rather than detach it, so an abandoned
+  /// probe leaves no queued work behind a mount that is already not answering, and repeated
+  /// probe-then-abandon cycles cannot accumulate. A job the pool has already STARTED is past any
+  /// such cancellation — an in-progress blocking syscall cannot be interrupted — and that
+  /// residual is bounded by the pool's own ceiling, not by the umbrella.
   ///
   /// # Idempotence (hard contract)
   ///
