@@ -1164,10 +1164,10 @@ mod integration {
 }
 
 /// The reserved namespace is the binding's business: it renders a cookie's
-/// name from the owner's token and classifies EVERY leaf that matches the
-/// minted grammar as an artifact — ours, another instance's, or a crashed
-/// process's leftover — while an ordinary file (or a name merely containing the
-/// prefix deeper in the path) is never one.
+/// name from the owner's token and classifies EVERY leaf matching a shape this
+/// binding has minted as an artifact — ours, another instance's, or a crashed
+/// process's leftover from an earlier release — while an ordinary file (or a
+/// name merely containing the prefix deeper in the path) is never one.
 #[tokio::test]
 async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   use std::ffi::OsString;
@@ -1208,6 +1208,21 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
     ".tributaries-sync-0-1-0-0000000000000000"
   ])));
 
+  // The THREE-field shape this binding minted before the name carried a nonce.
+  // A cookie outlives the process that wrote it, so a leftover on disk was named
+  // by whichever release was running then: dropping this shape would make the
+  // first watch after an upgrade report every stale cookie as a user create.
+  for legacy_leftover in [
+    ".tributaries-sync-9-999-1",
+    ".tributaries-sync-0-1-0",
+    ".tributaries-sync-18446744073709551615-4294967295-18446744073709551615",
+  ] {
+    assert!(
+      source.is_sync_artifact(&key(&["/", "r", legacy_leftover])),
+      "{legacy_leftover} is a cookie an earlier release of this binding minted"
+    );
+  }
+
   // The whole minted range round-trips: the extremes of every field are still
   // recognized by the classifier that has to suppress them.
   for token in [
@@ -1227,8 +1242,9 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-cookies"])));
   assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-cookies-501"])));
 
-  // Ordinary files are not artifacts — including one whose PARENT directory
-  // carries the prefix (the match is on the leaf, never an interior component).
+  // Ordinary files are not artifacts — including one whose PARENT carries a
+  // COOKIE's name rather than the cookie directory's: only the directory this
+  // driver actually creates makes its children artifacts.
   assert!(!source.is_sync_artifact(&key(&["/", "r", "a.txt"])));
   assert!(!source.is_sync_artifact(&key(&[
     "/",
@@ -1243,11 +1259,11 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   // these is a real name a caller could choose, and a bare prefix test would
   // erase every one of them from the stream with no Rescan and no diagnostic.
   for user_leaf in [
-    // No nonce field at all — the pre-grammar shape.
-    ".tributaries-sync-9-999-1",
     // Prose, not fields.
     ".tributaries-sync-notes.txt",
     ".tributaries-sync-",
+    // Too few fields for either minted shape.
+    ".tributaries-sync-7-42",
     // The right field count, but a nonce that is not sixteen lowercase hex.
     ".tributaries-sync-7-42-3-DEADBEEFDEADBEEF",
     ".tributaries-sync-7-42-3-00000000deadbee",
@@ -1258,6 +1274,7 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
     ".tributaries-sync-7-4294967296-3-00000000deadbeef",
     ".tributaries-sync--42-3-00000000deadbeef",
     ".tributaries-sync-7-42-3-4-00000000deadbeef",
+    ".tributaries-sync-07-42-3",
     // The cookie directory's stem with a non-numeric qualifier.
     ".tributaries-sync-cookies-mine",
   ] {
@@ -1266,4 +1283,69 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
       "{user_leaf} is not a minted artifact — suppressing it would erase a user file"
     );
   }
+}
+
+/// The cookie leaf that reaches this classifier is NOT always one this crate minted:
+/// [`tributary_fs::Watcher::sync_root`] takes the cookie's name from its own caller and
+/// accepts any normal component, so a second consumer of `tributary-fs` watching the same
+/// tree writes cookies whose names this crate cannot predict at all. What identifies
+/// those is the directory they land in — the fs driver's own `0o700` cookie directory —
+/// so an immediate child of one is an artifact whatever its leaf.
+///
+/// Getting this wrong is worse than the over-broad prefix test it replaced: a leaf
+/// grammar alone republishes another watcher's GENUINE cookie create and unlink as user
+/// changes on every consumer stream, which is precisely the leak the reserved namespace
+/// exists to close.
+///
+/// Fail-on-old: with a leaf-only grammar, every name below except the last is a normal
+/// filename with no reserved shape, so each assertion reads `false` and the cell fails on
+/// its first cookie.
+#[tokio::test]
+async fn a_foreign_watchers_cookie_is_an_artifact_by_the_directory_it_lands_in() {
+  use std::ffi::OsString;
+
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::WatcherOptions;
+
+  use crate::{Source, source::FsSource};
+
+  let source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
+  let key =
+    |parts: &[&str]| -> Vec<OsString> { parts.iter().map(|p| OsString::from(*p)).collect() };
+
+  for cookie_dir in [".tributaries-sync-cookies", ".tributaries-sync-cookies-501"] {
+    for leaf in [
+      // A real lower-layer cookie name from this workspace's own fs-watcher cells.
+      ".tributaries-sync-admission-retry",
+      // A caller that never adopted the reserved stem at all: still a cookie, because
+      // `sync_root` let it choose the name and the directory is the driver's.
+      "barrier-cookie",
+      // The shapes this crate mints are children of that directory too.
+      ".tributaries-sync-7-42-3-00000000deadbeef",
+      ".tributaries-sync-9-999-1",
+    ] {
+      assert!(
+        source.is_sync_artifact(&key(&["/", "r", cookie_dir, leaf])),
+        "{leaf} inside {cookie_dir} is a cookie some watcher wrote, not a user change"
+      );
+    }
+  }
+
+  // Only the IMMEDIATE parent counts. Nothing this driver writes is nested deeper, so a
+  // deeper descendant is read as a user change rather than silently erased.
+  assert!(!source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-cookies-501",
+    "sub",
+    "notes.txt"
+  ])));
+  // A directory whose name only resembles the cookie directory's is not one, so its
+  // children stay user changes.
+  assert!(!source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-cookies-mine",
+    "notes.txt"
+  ])));
 }

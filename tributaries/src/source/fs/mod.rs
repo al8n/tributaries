@@ -729,22 +729,39 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
-    // Matched on the LEAF component only (never a substring of an interior
-    // directory), and against the two GRAMMARS this workspace mints rather than
-    // against the shared stem: every cookie of every instance — ours and foreign,
-    // live and crash-leftover — is suppressed, because every one of them comes
-    // from the same minter, while a user file that merely begins with the stem is
-    // a user change and stays one.
+    // Two independent grounds, because the sync namespace has two shapes and only
+    // one of them carries a name this crate can predict.
     //
-    // The fs layer keeps its cookies in a DIRECTORY of the same namespace (it
-    // needs one nobody else may write), so the leaf rule has two shapes to cover:
-    // the directory's own create carries the directory's name, and every cookie
-    // inside it carries a cookie name. The directory's shape is classified by the
-    // layer that mints it, so the two cannot drift apart.
+    // GROUND 1 — the LEAF is a name this workspace mints: the fs layer's cookie
+    // DIRECTORY (whose own create is that driver's artifact, never a user change),
+    // or a cookie sitting directly in the sync directory, which is where every
+    // version of this binding put its cookies before the cookie directory existed.
+    // Matching the older shape too is what keeps a crash leftover suppressed across
+    // an upgrade instead of resurfacing as a user create — see `is_cookie_name`.
+    //
+    // GROUND 2 — the leaf's IMMEDIATE parent is exactly a cookie directory, whatever
+    // the leaf. `tributary_fs::Watcher::sync_root` takes the cookie's name from ITS
+    // caller and accepts any normal component, so a second consumer of the lower
+    // crate watching this same tree mints cookie names with no grammar this crate
+    // could know; the directory they land in is the only thing that identifies them.
+    // Suppressing on the directory costs at most a file someone created inside a
+    // `0o700` directory this driver owns — while a leaf grammar alone would surface
+    // another watcher's GENUINE cookies as user changes, which is the failure this
+    // classifier exists to prevent and strictly worse than the cost.
+    //
+    // Neither ground reads any deeper component, so a user file merely living under
+    // some ancestor whose name shares the stem stays a user change.
+    let Some(leaf) = key.last().and_then(|leaf| leaf.to_str()) else {
+      return false;
+    };
+    if is_cookie_name(leaf) || tributary_fs::is_sync_cookie_dir_name(leaf) {
+      return true;
+    }
     key
-      .last()
-      .and_then(|leaf| leaf.to_str())
-      .is_some_and(|leaf| is_cookie_name(leaf) || tributary_fs::is_sync_cookie_dir_name(leaf))
+      .len()
+      .checked_sub(2)
+      .and_then(|parent| key[parent].to_str())
+      .is_some_and(tributary_fs::is_sync_cookie_dir_name)
   }
 
   fn root_key(&self, handle: RootHandle) -> Option<Vec<OsString>> {
@@ -918,41 +935,56 @@ fn cookie_name(token: SyncToken) -> String {
   )
 }
 
-/// Whether `leaf` is a sync cookie's file name — the reserved prefix followed by the
-/// **exact** four-field shape [`cookie_name`] mints: `instance-pid-seq-nonce`, the
-/// first three rendered decimal and the last as sixteen lowercase hex digits.
+/// Whether `leaf` is a sync cookie's file name as SOME release of this binding minted
+/// it directly in the sync directory: the reserved prefix, then `instance-pid-seq`
+/// rendered decimal, then — for the shape [`cookie_name`] mints today — a `nonce` of
+/// sixteen lowercase hex digits.
+///
+/// # Why both shapes
+///
+/// The three-field form is what this binding minted before the cookie name carried a
+/// nonce, and a cookie's whole point is that it may outlive the process that wrote it:
+/// a crash leftover on disk was named by whichever release was running then, not by the
+/// one that later watches the tree. Dropping the older shape would make the first watch
+/// after an upgrade report every stale cookie as a user create.
 ///
 /// # Why the grammar is checked rather than the prefix alone
 ///
 /// Suppression removes a change from every consumer stream, so whatever it matches
 /// vanishes. A bare prefix test therefore swallows any user file whose name happens to
 /// begin with the reserved stem — silently, with no `Rescan` and no diagnostic, for the
-/// life of the watch. The names are minted **by this crate**, so their shape is knowable
-/// exactly; checking it keeps the reserved namespace total over real cookies (ours,
-/// another live instance's, and a crashed process's leftovers all satisfy the same
-/// grammar, since they all come from this minter) while leaving every other name a user
-/// change.
+/// life of the watch. These names are minted **by this crate**, so their shapes are
+/// knowable exactly; checking them keeps the reserved namespace total over the cookies
+/// this binding itself writes at the sync directory, while leaving every other name
+/// there a user change. Cookies written by a DIFFERENT consumer of `tributary-fs` carry
+/// no shape this crate can know — those are identified by the directory they land in
+/// instead (see `is_sync_artifact`).
 fn is_cookie_name(leaf: &str) -> bool {
   let Some(rest) = leaf.strip_prefix(COOKIE_PREFIX) else {
     return false;
   };
   let mut fields = rest.split('-');
-  let (Some(instance), Some(pid), Some(seq), Some(nonce), None) = (
-    fields.next(),
-    fields.next(),
-    fields.next(),
-    fields.next(),
-    fields.next(),
-  ) else {
+  let (Some(instance), Some(pid), Some(seq)) = (fields.next(), fields.next(), fields.next()) else {
     return false;
   };
-  is_minted_decimal(instance, u64::MAX)
+  if !(is_minted_decimal(instance, u64::MAX)
     && is_minted_decimal(pid, u64::from(u32::MAX))
-    && is_minted_decimal(seq, u64::MAX)
-    && nonce.len() == COOKIE_NONCE_DIGITS
-    && nonce
-      .bytes()
-      .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() && b <= b'f')
+    && is_minted_decimal(seq, u64::MAX))
+  {
+    return false;
+  }
+  match fields.next() {
+    // The historical three-field shape, exhausted.
+    None => true,
+    // Today's shape: the nonce, and nothing after it.
+    Some(nonce) => {
+      fields.next().is_none()
+        && nonce.len() == COOKIE_NONCE_DIGITS
+        && nonce
+          .bytes()
+          .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() && b <= b'f')
+    }
+  }
 }
 
 /// Whether `field` is exactly what `format!("{n}")` renders for some `n <= max`: decimal
