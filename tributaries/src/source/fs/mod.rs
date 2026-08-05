@@ -164,9 +164,9 @@ impl<R: RuntimeLite> FsSource<R> {
   }
 }
 
-// The deferral queue and the Source seam below are channel and registry work:
-// no method names an `R` item (the runtime bound lives on `new`, the one
-// place the watcher driver is spawned).
+// The deferral queue below is pure channel and registry work: no method names an `R` item, so it
+// carries no runtime bound. (The `Source` seam does — `canonicalize_key` hands its blocking
+// resolution to `R`'s blocking pool — as does `new`, where the watcher driver is spawned.)
 impl<R> FsSource<R> {
   /// Queues a prune the control channel refused (momentarily full), **latest-wins per handle**
   /// ([`Source::set_cover`] contract clause 6): a newer request for the same handle replaces the
@@ -222,10 +222,13 @@ impl<R> FsSource<R> {
 /// (later arms, the conflict-triggered path, or `Drop` take the rest).
 const OPPORTUNISTIC_RELEASE_HANDOFFS: usize = 2;
 
-impl<R> Source<OsString> for FsSource<R> {
+impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
 
-  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+  fn canonicalize_key(
+    &self,
+    key: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
     // Resolve the path with the SAME canonicalization `arm` applies (via
     // `tributary_fs::Watcher::watch`, which `std::fs::canonicalize`s its root before spawning the
     // stream), so the umbrella classifies and commits on the coordinate events arrive under. A
@@ -233,23 +236,39 @@ impl<R> Source<OsString> for FsSource<R> {
     // no real location, rather than accepting it silently and then never delivering an event.
     // Idempotent on an already-canonical path (`canonicalize` is a fixed point there), as the
     // trait's idempotence contract requires.
+    //
+    // `std::fs::canonicalize` BLOCKS, and against a stalled FUSE/NFS export it blocks without
+    // bound — so it runs on the runtime's BLOCKING POOL, never on the thread polling this future.
+    // Two things depend on that: the owner's biased close race can only win against a future that
+    // returns `Pending` (nothing preempts a plain call on its own thread), and an executor worker
+    // shared with unrelated tasks must not be parked on one mount. The future owns everything it
+    // needs and borrows neither `self` nor `key`, so a close that abandons it strands nothing: the
+    // pool thread finishes its read-only syscall and its result is dropped.
     let supplied = key_to_path(key);
-    let canonical = std::fs::canonicalize(&supplied).map_err(|source| {
-      // Classify by the io error's kind — the two cases a caller can act on distinctly
-      // (a missing path vs a permission wall) — and fold the rest to `Other`; the whole
-      // io error is preserved in the box either way. The key's display form is this
-      // binding's own rendering (the neutral error is not path-typed).
-      let kind = match source.kind() {
-        std::io::ErrorKind::NotFound => FaultKind::NotFound,
-        std::io::ErrorKind::PermissionDenied => FaultKind::PermissionDenied,
-        _ => FaultKind::Other,
+    async move {
+      // The key's display form is this binding's own rendering (the neutral error is not
+      // path-typed); it is captured before `supplied` moves onto the pool.
+      let displayed = supplied.display().to_string();
+      let resolved = match R::spawn_blocking(move || std::fs::canonicalize(supplied)).await {
+        Ok(resolved) => resolved,
+        // The blocking call could not be joined — it panicked, or the pool is shutting down. No
+        // coordinate was resolved, so this is a canonicalization failure like any other; folding
+        // it into the io path keeps one classification site and preserves the cause in the box.
+        Err(join) => Err(Into::<std::io::Error>::into(join)),
       };
-      WatchError::canonicalize(
-        supplied.display().to_string(),
-        SourceFault::new(kind).with_source(source),
-      )
-    })?;
-    Ok(path_components(&canonical))
+      let canonical = resolved.map_err(|source| {
+        // Classify by the io error's kind — the two cases a caller can act on distinctly
+        // (a missing path vs a permission wall) — and fold the rest to `Other`; the whole
+        // io error is preserved in the box either way.
+        let kind = match source.kind() {
+          std::io::ErrorKind::NotFound => FaultKind::NotFound,
+          std::io::ErrorKind::PermissionDenied => FaultKind::PermissionDenied,
+          _ => FaultKind::Other,
+        };
+        WatchError::canonicalize(displayed, SourceFault::new(kind).with_source(source))
+      })?;
+      Ok(path_components(&canonical))
+    }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, RootHandle>, WatchError> {

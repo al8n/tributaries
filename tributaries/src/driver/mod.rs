@@ -1306,24 +1306,26 @@ enum SyncStep<C> {
   Began(Result<Vec<C>, SyncError>),
 }
 
-/// [`Owner::reconcile_watch`]'s early exit. The in-place widen's retarget
-/// ([`Source::replace`]) and its rollback are awaited under a race against the owner's close signal —
-/// exactly as the cookie write is in [`Owner::on_sync`] — so a backend retarget that never returns (a
-/// hung FUSE/NFS mount) can no longer wedge the loop: a close during a held replace tears down at once
-/// instead of waiting the retarget out.
+/// [`Owner::reconcile_watch`]'s early exit. Every source call the reconcile awaits — the key
+/// canonicalization ([`Source::canonicalize_key`]), the arm, the covered-outside grow, and the
+/// in-place widen's retarget ([`Source::replace`]) with its rollback — is awaited under a race
+/// against the owner's close signal, exactly as the cookie write is in [`Owner::on_sync`]. So a
+/// backend call that never returns (a hung FUSE/NFS mount) cannot wedge the loop: a close arriving
+/// while one is held tears down at once instead of waiting it out.
 ///
 /// It rides the `Err` channel because every variant ABANDONS the reconcile, leaving the committing
 /// paths (`Ok(sub)`) untouched: [`Failed`](Self::Failed) is the ordinary [`WatchError`] each
-/// pre-existing exit already returned — a [`From`] impl keeps those sites, and `canonicalize_key`'s
-/// `?`, verbatim — and [`CloseRequested`](Self::CloseRequested) diverts to teardown.
+/// pre-existing exit already returned — a [`From`] impl keeps those sites verbatim — and
+/// [`CloseRequested`](Self::CloseRequested) diverts to teardown.
 #[derive(Debug)]
 enum ReconcileStop {
   /// The reconcile failed: the error for the `watch()` caller.
   Failed(WatchError),
-  /// A close won the race while an in-place widen `replace` was in flight: its consumed
+  /// A close won the race against one of the reconcile's awaited source calls: its consumed
   /// [`CloseReply`] rides back so [`Owner::dispatch_command`] hands the [`run`] loop the same
-  /// [`Flow::Break`] its own close arm produces. The widen is abandoned and the `watch()` caller's
-  /// dropped reply surfaces `Closed`.
+  /// [`Flow::Break`] its own close arm produces. The reconcile is abandoned — whatever it had
+  /// reserved is unwound at the losing site — and the `watch()` caller's dropped reply surfaces
+  /// `Closed`.
   CloseRequested(CloseReply),
 }
 
@@ -1352,7 +1354,8 @@ enum ReplaceStep<C, H> {
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
 /// fan out a raw source event, or drain the coalescer's due entries — whichever is ready, each to
 /// completion. The only source calls it awaits are [`next`](LocalSource::next) (one cancel-safe
-/// `select!` arm) and, inside a caller-bounded `Watch` reconcile, [`arm`](LocalSource::arm),
+/// `select!` arm) and, inside a caller-bounded `Watch` reconcile,
+/// [`canonicalize_key`](LocalSource::canonicalize_key), [`arm`](LocalSource::arm),
 /// [`grow`](LocalSource::grow) and [`replace`](LocalSource::replace); releasing a root is the
 /// **synchronous** [`disarm`](LocalSource::disarm) request, so **no** loop path awaits it.
 ///
@@ -1364,15 +1367,17 @@ enum ReplaceStep<C, H> {
 /// A queued close being at the top of the `select!` is necessary but NOT sufficient, and that gap is
 /// the reason every awaited source call above is itself a biased race against the same close
 /// receiver. The loop selects a command and then awaits the entire reconcile INSIDE that branch, so
-/// while a `Source::arm` or `grow` against a hung mount is pending the loop never returns to its
-/// `select!` at all — the dedicated lane exists but nothing polls it, and `close()` stays pending for
-/// as long as the mount does. Racing each awaited call means a close arriving mid-reconcile abandons
+/// while a `Source::canonicalize_key`, `arm` or `grow` against a hung mount is pending the loop
+/// never returns to its `select!` at all — the dedicated lane exists but nothing polls it, and
+/// `close()` stays pending for as long as the mount does. Racing each awaited call means a close
+/// arriving mid-reconcile abandons
 /// the reconcile (its `watch()` caller's dropped reply reads as `Closed`) and drives teardown, which
 /// drops the source. Close-responsiveness therefore holds against a source that violates its own
-/// bounded-progress requirement — but only for the AWAITED surface: a source's synchronous
-/// callbacks ([`canonicalize_key`](LocalSource::canonicalize_key)) and a subscription's
-/// [`Filter`](crate::Filter) predicate run on this thread with nothing to race against, and the
-/// [`LocalSource`] contract says so plainly rather than promising what an actor cannot do. Grant resolution rides the dedicated
+/// bounded-progress requirement — but only against code that YIELDS: a subscription's
+/// [`Filter`](crate::Filter) predicate, and any source future that blocks its poll instead of
+/// returning `Pending`, run on this thread with nothing to race against. The [`LocalSource`]
+/// contract says so plainly, and requires a source with blocking work to hand it to a blocking pool,
+/// rather than promising what an actor cannot do. Grant resolution rides the dedicated
 /// [`cleanup_rx`](Owner::cleanup_rx) channel at the **second** priority (below close, above the
 /// mailbox): a top-of-iteration full [`drain_pending_cleanup`](Owner::drain_pending_cleanup)
 /// AND a `select!` arm between close and commands. The command mailbox is otherwise biased above the
@@ -2064,7 +2069,11 @@ where
     // (a generic component key) canonicalizes as the identity. The arm path still re-keys onto
     // `Armed::canonical_key` and guards it with `fs_path_preserves_plan`, closing the residual
     // TOCTOU where the coordinate changes between this canonicalization and the arm.
-    let canonical_key = self.source.canonicalize_key(key)?;
+    //
+    // Awaited through the close-raced choke point ([`Owner::canonicalize_key`]): the stock binding
+    // resolves a real path here, so a stalled mount must not hold the dedicated close lane
+    // unpolled. Nothing is committed yet, so a close that wins simply abandons the reconcile.
+    let canonical_key = self.canonicalize_key(key).await?;
     let key = canonical_key.as_slice();
     // Plan the watch, **re-planning past any dead covering root** so no subscription ever binds a
     // source-forgotten handle (the structural close of the dead-root-coverage class).
@@ -2622,6 +2631,49 @@ where
         Err(_) => Err(WatchError::Closed.into()),
       },
       res = source.grow(root, cover).fuse() => res.map_err(Into::into),
+    }
+  }
+
+  /// Canonicalizes the caller's key at the top of the reconcile, RACED against the dedicated close
+  /// receiver for the same reason [`arm`](Self::arm) and [`grow`](Self::grow) are: the run loop
+  /// selects a command and awaits the whole reconcile inside that branch, so an unraced
+  /// canonicalization against a hung mount leaves the already-queued close receiver unpolled and
+  /// `close()` pending forever. The stock binding resolves a real path here, so a stalled
+  /// FUSE/NFS root reaches this with no hostile source involved.
+  ///
+  /// A close that wins here wins at the CHEAPEST abort point the reconcile has. Nothing is
+  /// committed yet and nothing needs unwinding: this runs before `plan_watch`, so no subsumer
+  /// reservation exists to [`abort_watch`](crate::subsume::Subsumer::abort_watch) (the abort that
+  /// [`arm`](Self::arm)'s and [`grow`](Self::grow)'s losers each owe), no handle has been adopted,
+  /// no filter or debounce is registered, and no [`WatchGrant`] has been minted. Only the caller's
+  /// reply sender is live, and dropping it is exactly what `watch()` reads as `Closed`. So the
+  /// early exit is the bare [`ReconcileStop::CloseRequested`] the later abort points reach by a
+  /// longer road, and it reaches teardown through the identical [`on_watch`](Self::on_watch) arm.
+  ///
+  /// Dropping a pending canonicalization is safe for a STRICTLY WEAKER reason than dropping a
+  /// pending `arm`: this is a read-only probe that acquires nothing, so there is not even a `Drop`
+  /// reclamation to rely on (the trait's cancellation clause).
+  async fn canonicalize_key(&mut self, key: &[C]) -> Result<Vec<C>, ReconcileStop> {
+    let canonical = {
+      // Split-borrow so the two arms stay disjoint: the close arm reads `&self.closes` while
+      // `canonicalize_key` reborrows `&self.source`.
+      let closes = &self.closes;
+      let source = &self.source;
+      futures_util::select_biased! {
+        // Close is polled FIRST — a requested shutdown wins over everything, so a resolution not
+        // yet started is never issued at all. Every handle being gone is an ABANDON rather than a
+        // threaded close (`None`): the command channel remains the dropped-handles teardown
+        // signal, so the probe is re-issued below rather than inventing a reply nobody awaits.
+        close = closes.recv().fuse() => close.ok(),
+        res = source.canonicalize_key(key).fuse() => return res.map_err(Into::into),
+      }
+    };
+    match canonical {
+      Some(close_reply) => Err(ReconcileStop::CloseRequested(close_reply)),
+      // The close channel closed mid-probe. Re-issue against the source: this is the abandon case
+      // above, the reconcile still owes its caller a verdict, and re-issuing costs nothing because
+      // the probe acquires nothing and is idempotent by contract.
+      None => self.source.canonicalize_key(key).await.map_err(Into::into),
     }
   }
 
@@ -4690,7 +4742,7 @@ fn assert_fs_owner_send() {
 
 /// Compile-time proof that the owner future is `Send` for **any** `Send` source (not just
 /// [`FsSource`]) — the guarantee that a generic `S: Source<C>` owner is structurally
-/// spawnable, since [`Source`]'s three futures are all `Send`. Never invoked.
+/// spawnable, since [`Source`]'s futures are all `Send`. Never invoked.
 #[allow(dead_code)]
 fn assert_generic_owner_send<C, V, R, S>(owner: Owner<C, V, R, S>)
 where
@@ -4722,8 +4774,12 @@ fn assert_rc_local_source_constructs<R: RuntimeLite>() {
   impl LocalSource<OsString> for RcSource {
     type Handle = u32;
 
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
 
     fn arm(

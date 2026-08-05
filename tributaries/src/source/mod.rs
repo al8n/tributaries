@@ -99,23 +99,24 @@ mod tests;
 ///   or not-yet-emitted event still carries it (the hard contract on [`Handle`](Self::Handle)). Makes handle ABA impossible; the umbrella routes strictly by handle rather than defending
 ///   against reuse.
 /// - **Bounded [`arm`](Self::arm) / [`grow`](Self::grow) / [`canonicalize_key`](Self::canonicalize_key)**
-///   — the umbrella awaits [`arm`](Self::arm) and [`grow`](Self::grow) and calls the synchronous
-///   [`canonicalize_key`](Self::canonicalize_key), running each **to completion**, so all MUST make
-///   progress and resolve in **bounded time**. Both awaited methods run **only inside a
+///   — the umbrella awaits all three, running each **to completion**, so all MUST make
+///   progress and resolve in **bounded time**. All three run **only inside a
 ///   caller-initiated** `watch` reconcile, to completion (invariant I1); a wedged one blocks that one
 ///   reconcile until the source honors the contract (the caller may drop its own `watch` wait, but the
 ///   umbrella still owns the in-flight reconcile) — never any unrelated backlog. A source that makes
 ///   any **hang indefinitely** violates the contract; that is the source's responsibility, not a bug
 ///   the umbrella can `await`-around.
 ///
-///   The two AWAITED ones are additionally raced against the dedicated close signal, so violating
-///   their bound costs a wedged reconcile and nothing more — see the close-responsiveness guarantee
-///   below. [`canonicalize_key`](Self::canonicalize_key) is **synchronous**, and that difference is
-///   load-bearing rather than incidental: an actor cannot preempt a plain function call running on
-///   its own thread, so there is no race to arrange and the bound on it is a genuine REQUIREMENT with
-///   no umbrella-side backstop. Implement it as a pure, non-I/O transform wherever possible; a source
-///   that must touch the filesystem to canonicalize (as the stock filesystem binding does) is asking
-///   its callers to accept that a wedged mount can hold the owner inside that one call.
+///   Each is additionally raced against the dedicated close signal, so violating the bound costs a
+///   wedged reconcile and nothing more — see the close-responsiveness guarantee below. What the
+///   race cannot cover is a future that BLOCKS ITS POLL rather than returning `Pending`: an actor
+///   cannot preempt a plain call running on its own thread. So a source whose canonicalization or
+///   arm must touch a filesystem or a network MUST hand that blocking work to a blocking pool and
+///   await its completion (as the stock filesystem binding does), never perform it inline — inline
+///   blocking defeats the race and, on a shared executor, wedges a worker unrelated tasks need.
+/// - **Non-blocking synchronous probes** — [`root_key`](Self::root_key) and
+///   [`is_sync_artifact`](Self::is_sync_artifact) are plain calls on the owner's thread with
+///   nothing to race against, so they MUST be pure in-memory lookups.
 /// - **Synchronous, non-blocking [`disarm`](Self::disarm)** — release is a fire-and-forget
 ///   **request** the umbrella never awaits (see its docs): it returns at once, queuing any async
 ///   teardown inside the source, and applies the release no later than the next [`arm`](Self::arm) or
@@ -143,14 +144,14 @@ mod tests;
 ///   source, whose own `Drop` applies any still-pending releases.
 ///
 ///   A caller-awaited `watch` reconcile is the one place the owner DOES await the source, and every
-///   await on that path — [`arm`](Self::arm), [`grow`](Self::grow), [`replace`](Self::replace) and
-///   [`begin_sync`](Self::begin_sync) — is a biased `select!` against that same dedicated close
-///   signal, close polled first. So a source that hangs one of them abandons its own reconcile when
-///   a close arrives and the owner proceeds straight to teardown; it cannot hold `close()` pending.
-///   The residual, stated plainly rather than papered over: a source's SYNCHRONOUS callbacks —
-///   [`canonicalize_key`](Self::canonicalize_key) above all, and a subscription's
-///   [`Filter`](crate::Filter) predicate — run on the owner's own thread with nothing to race
-///   against, so a call that never returns holds the owner and its close with it.
+///   await on that path — [`canonicalize_key`](Self::canonicalize_key), [`arm`](Self::arm),
+///   [`grow`](Self::grow), [`replace`](Self::replace) and [`begin_sync`](Self::begin_sync) — is a
+///   biased `select!` against that same dedicated close signal, close polled first. So a source
+///   that hangs one of them abandons its own reconcile when a close arrives and the owner proceeds
+///   straight to teardown; it cannot hold `close()` pending. The residual, stated plainly rather
+///   than papered over: code that runs INLINE on the owner's thread has nothing to race against, so
+///   a subscription's [`Filter`](crate::Filter) predicate that never returns — or a source future
+///   that blocks its poll instead of yielding `Pending` — holds the owner and its close with it.
 /// - **No stranded or corrupt state.** A committed-but-unclaimed subscription is always reconciled
 ///   away (the `WatchGrant`, invariant I1); a subscription terminal-retired while unclaimed leaves no
 ///   lingering parked `Rescan` behind; and a released-then-re-`watch`ed key never
@@ -260,9 +261,29 @@ pub trait LocalSource<C> {
   ///
   /// A source that canonicalizes (the filesystem resolves symlinks and `.`/`..`) returns the
   /// resolved key; a source whose key space is already canonical (a generic component key)
-  /// returns `key` unchanged. This is a **synchronous** transform, mirroring
-  /// [`root_key`](Self::root_key): `FsSource` resolves the path with the same canonicalization
+  /// returns `key` unchanged, for which `async { Ok(key.to_vec()) }` is the whole
+  /// implementation. `FsSource` resolves the path with the same canonicalization
   /// [`arm`](Self::arm) applies, so classification and the later arm agree on the coordinate.
+  ///
+  /// # Awaited, and raced against close
+  ///
+  /// Resolving a coordinate can be I/O — the filesystem binding's resolution is a blocking
+  /// syscall against a mount that may be a stalled FUSE/NFS export — so this is a **future**, and
+  /// the umbrella awaits it under the same biased race against its dedicated close signal that
+  /// [`arm`](Self::arm) and [`grow`](Self::grow) run under. A resolution that never returns
+  /// therefore costs the one reconcile it belongs to and cannot hold a queued `close()` pending.
+  ///
+  /// The race is a backstop, not a licence: the bounded-progress requirement on the [trait](Self)
+  /// still applies, and a source that must block to canonicalize MUST NOT block the thread
+  /// polling it — move the blocking call onto a blocking pool and await its completion, as
+  /// `FsSource` does. Blocking the poll defeats the race (nothing can preempt a plain call on
+  /// its own thread) and, on a shared executor, wedges a worker that unrelated tasks need.
+  ///
+  /// # Cancellation
+  ///
+  /// Dropping the returned future MUST strand nothing. This is a read-only **probe**: unlike
+  /// [`arm`](Self::arm) it acquires no external resource for `Drop` to reclaim, so the umbrella
+  /// is free to abandon it and to re-issue it for the same `key`.
   ///
   /// # Idempotence (hard contract)
   ///
@@ -276,7 +297,10 @@ pub trait LocalSource<C> {
   /// [`WatchError::Canonicalize`] when the path does not exist or its metadata cannot be read.
   /// The umbrella surfaces it from `watch` rather than committing a key that would receive no
   /// events.
-  fn canonicalize_key(&self, key: &[C]) -> Result<Vec<C>, WatchError>;
+  ///
+  /// The returned future carries no `Send` requirement; [`Source::canonicalize_key`] is the
+  /// `Send`-promising twin.
+  fn canonicalize_key(&self, key: &[C]) -> impl Future<Output = Result<Vec<C>, WatchError>>;
 
   /// Arms a concrete watch for `key`, returning the armed-root token plus the
   /// **canonical** key the source actually armed.
@@ -692,15 +716,15 @@ pub trait LocalSource<C> {
 ///
 /// # `Send` bounds
 ///
-/// **All three async methods return `Send` futures.** The stock hosting path spawns the driver as
+/// **Every async method returns a `Send` future.** The stock hosting path spawns the driver as
 /// a single owned task on a multi-threaded tokio or smol executor
 /// ([`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach)) that drives arming and the event
 /// pump inline in one `select!` loop — so *every* future the owner awaits must be able to cross
-/// threads for `run(owner)` itself to be `Send`. The three awaited methods are [`arm`](Self::arm),
-/// [`grow`](Self::grow), and [`next`](Self::next); [`disarm`](Self::disarm) and
-/// [`set_cover`](Self::set_cover) are synchronous (they return no future), and
-/// [`canonicalize_key`](Self::canonicalize_key) / [`root_key`](Self::root_key) are synchronous
-/// probes. The bounds are written explicitly on each return type (rather than left implicit by
+/// threads for `run(owner)` itself to be `Send`. The awaited methods are
+/// [`canonicalize_key`](Self::canonicalize_key), [`arm`](Self::arm), [`grow`](Self::grow), and
+/// [`next`](Self::next); [`disarm`](Self::disarm) and [`set_cover`](Self::set_cover) are
+/// synchronous (they return no future), and [`root_key`](Self::root_key) is a synchronous
+/// probe. The bounds are written explicitly on each return type (rather than left implicit by
 /// `async fn`, whose futures carry no such bound), so a generic `S: Source<C>` owner is
 /// structurally spawnable — every implementor's futures must satisfy them. This is
 /// unconditionally satisfiable for the fs source because the `tributary-fs` watcher is
@@ -732,15 +756,16 @@ pub trait Source<C> {
 
   /// Canonicalizes the caller-supplied `key` into the source's own **canonical
   /// coordinate**, or reports why it cannot. Contract-identical to
-  /// [`LocalSource::canonicalize_key`] — the single-choke-point rationale and the
-  /// idempotence hard contract there apply verbatim (the method is synchronous, so the two
-  /// traits' signatures coincide exactly).
+  /// [`LocalSource::canonicalize_key`] — the single-choke-point rationale, the
+  /// close-raced await, the must-not-block-its-poll requirement and the idempotence hard
+  /// contract there all apply verbatim; the future here additionally promises `Send` (see
+  /// the `Send` bounds note on the [trait](Self)).
   ///
   /// # Errors
   ///
   /// A [`WatchError`] when `key` cannot be canonicalized (see
   /// [`LocalSource::canonicalize_key`]).
-  fn canonicalize_key(&self, key: &[C]) -> Result<Vec<C>, WatchError>;
+  fn canonicalize_key(&self, key: &[C]) -> impl Future<Output = Result<Vec<C>, WatchError>> + Send;
 
   /// Arms a concrete watch for `key`, returning the armed-root token plus the
   /// **canonical** key the source actually armed. Contract-identical to
@@ -956,7 +981,7 @@ pub trait Source<C> {
 impl<C, T: Source<C>> LocalSource<C> for T {
   type Handle = <T as Source<C>>::Handle;
 
-  fn canonicalize_key(&self, key: &[C]) -> Result<Vec<C>, WatchError> {
+  fn canonicalize_key(&self, key: &[C]) -> impl Future<Output = Result<Vec<C>, WatchError>> {
     <T as Source<C>>::canonicalize_key(self, key)
   }
 

@@ -338,8 +338,14 @@ impl FakeSource {
 impl Source<OsString> for FakeSource {
   type Handle = u32;
 
-  fn canonicalize_key(&self, k: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-    match self.canonicalize.get(k) {
+  fn canonicalize_key(
+    &self,
+    k: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+    // The script is resolved eagerly, so the returned future owns its verdict and borrows
+    // neither `self` nor `k` — the shape a real source reaches by handing its blocking
+    // resolution to a pool.
+    let outcome = match self.canonicalize.get(k) {
       // Re-key onto the modelled canonical coordinate.
       Some(Some(canonical)) => Ok(canonical.clone()),
       // A key the source cannot canonicalize (non-existent path): reject, don't commit-eventless.
@@ -350,7 +356,8 @@ impl Source<OsString> for FakeSource {
       )),
       // Absent → already canonical (identity), the common case.
       None => Ok(k.to_vec()),
-    }
+    };
+    async move { outcome }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -2352,7 +2359,10 @@ async fn watch_admission_backpressures_when_the_mailbox_is_full() {
   impl Source<OsString> for GatedArmSource {
     type Handle = u32;
 
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
       self.inner.canonicalize_key(key)
     }
 
@@ -2430,7 +2440,10 @@ async fn parts_future_drives_the_watcher_when_caller_spawned() {
   struct AliveSource(FakeSource);
   impl Source<OsString> for AliveSource {
     type Handle = u32;
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
       self.0.canonicalize_key(key)
     }
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -2516,7 +2529,10 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
   }
   impl Source<OsString> for InstrumentedSource {
     type Handle = u32;
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
       self.inner.canonicalize_key(key)
     }
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -2607,7 +2623,10 @@ async fn dropping_the_parts_future_mid_grow_drops_the_source_for_reclamation() {
   }
   impl Source<OsString> for GrowGatedSource {
     type Handle = u32;
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
       self.inner.canonicalize_key(key)
     }
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -2724,8 +2743,12 @@ async fn parts_local_drives_a_thread_local_source_end_to_end() {
   impl LocalSource<OsString> for RcSource {
     type Handle = u32;
 
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
 
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -4605,8 +4628,12 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
   }
   impl Source<OsString> for CancelSafe {
     type Handle = u32;
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
       Ok(Armed::new(1, key.to_vec()))
@@ -4630,8 +4657,12 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
   }
   impl Source<OsString> for CancelUnsafe {
     type Handle = u32;
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
       Ok(Armed::new(1, key.to_vec()))
@@ -5226,8 +5257,12 @@ struct DrainableSource {
 impl Source<OsString> for DrainableSource {
   type Handle = u32;
 
-  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-    Ok(key.to_vec())
+  fn canonicalize_key(
+    &self,
+    key: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+    let canonical = key.to_vec();
+    async move { Ok(canonical) }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -5869,8 +5904,12 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
   impl Source<OsString> for PendingReleaseSource {
     type Handle = u32;
 
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
 
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -6025,8 +6064,12 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
   impl Source<OsString> for TerminalRetireSource {
     type Handle = u32;
 
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
 
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -6534,8 +6577,12 @@ struct TriggeredSource {
 impl Source<OsString> for TriggeredSource {
   type Handle = u32;
 
-  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-    Ok(key.to_vec())
+  fn canonicalize_key(
+    &self,
+    key: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+    let canonical = key.to_vec();
+    async move { Ok(canonical) }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -7948,8 +7995,12 @@ struct SyncSource {
 impl Source<OsString> for SyncSource {
   type Handle = u32;
 
-  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-    Ok(key.to_vec())
+  fn canonicalize_key(
+    &self,
+    key: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+    let canonical = key.to_vec();
+    async move { Ok(canonical) }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -8183,8 +8234,12 @@ struct HeldBeginSyncSource {
 impl Source<OsString> for HeldBeginSyncSource {
   type Handle = u32;
 
-  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-    Ok(key.to_vec())
+  fn canonicalize_key(
+    &self,
+    key: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+    let canonical = key.to_vec();
+    async move { Ok(canonical) }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -8357,8 +8412,12 @@ struct HeldReplaceSource {
 impl Source<OsString> for HeldReplaceSource {
   type Handle = u32;
 
-  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-    Ok(key.to_vec())
+  fn canonicalize_key(
+    &self,
+    key: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+    let canonical = key.to_vec();
+    async move { Ok(canonical) }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
@@ -9060,6 +9119,108 @@ mod ownership {
   use super::*;
   use crate::driver::{MAX_PENDING_SYNCS, ReconcileStop};
 
+  /// The same seam one step EARLIER than
+  /// [`a_permanently_pending_arm_cannot_wedge_close`]: the reconcile canonicalizes the
+  /// caller's key at its very top — before the key is planned, armed or committed — and
+  /// the stock binding resolves a real path there, so a stalled FUSE/NFS root parks the
+  /// owner in `canonicalize_key` with the identical run-loop shape. The command branch
+  /// awaits the whole reconcile, so an unraced resolution leaves the dedicated close lane
+  /// queued and unpolled for as long as the mount hangs.
+  ///
+  /// It also pins the ABORT POINT: a close that wins here wins before `plan_watch`, so
+  /// the source is never asked to arm anything and there is no reservation to unwind.
+  ///
+  /// FAIL-ON-REVERT: call `self.source.canonicalize_key(key).await?` directly in
+  /// `reconcile_watch` instead of the close-raced `Owner::canonicalize_key`, and `close()`
+  /// never resolves — the timeout below fires, which is exactly the reproduction #49 filed.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_permanently_pending_canonicalize_cannot_wedge_close() {
+    struct WedgedCanonicalizeSource {
+      inner: FakeSource,
+      entered: std::sync::Arc<core::sync::atomic::AtomicBool>,
+      arms: std::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl Source<OsString> for WedgedCanonicalizeSource {
+      type Handle = u32;
+
+      fn canonicalize_key(
+        &self,
+        _key: &[OsString],
+      ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+        let entered = std::sync::Arc::clone(&self.entered);
+        async move {
+          entered.store(true, core::sync::atomic::Ordering::SeqCst);
+          // Never resolves: the mount that answers no `realpath`. It YIELDS rather than
+          // blocking the poll, which is exactly what the contract requires of a source
+          // whose resolution is slow — and what makes the owner's race winnable.
+          core::future::pending().await
+        }
+      }
+
+      async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+        self.arms.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        self.inner.arm(key).await
+      }
+
+      fn disarm(&mut self, handle: u32) {
+        self.inner.disarm(handle);
+      }
+
+      async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+        core::future::pending().await
+      }
+
+      fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+        self.inner.root_key(handle)
+      }
+    }
+
+    let entered = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let arms = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let w: crate::Tributaries<OsString, (), TokioRuntime, u32> = crate::Tributaries::with_source(
+      WedgedCanonicalizeSource {
+        inner: FakeSource::new(),
+        entered: std::sync::Arc::clone(&entered),
+        arms: std::sync::Arc::clone(&arms),
+      },
+      TributariesOptions::new(),
+    );
+
+    let watching = {
+      let w = w.clone();
+      tokio::spawn(async move { w.watch(key("/a"), (), WatchOptions::new()).await })
+    };
+    // Settle on the owner being parked INSIDE the canonicalization — the only state in
+    // which this proves anything.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !entered.load(core::sync::atomic::Ordering::SeqCst)
+      && std::time::Instant::now() < deadline
+    {
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+      entered.load(core::sync::atomic::Ordering::SeqCst),
+      "staging: the owner is parked inside Source::canonicalize_key"
+    );
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), w.close())
+      .await
+      .expect("close resolves against a source that never returns from canonicalize_key");
+    assert!(
+      closed.is_ok(),
+      "the close lane is honoured while a canonicalization is wedged: {closed:?}"
+    );
+    assert_eq!(
+      arms.load(core::sync::atomic::Ordering::SeqCst),
+      0,
+      "the close won BEFORE classification, so the reconcile armed nothing and had no \
+       subsumer reservation to unwind"
+    );
+    // The abandoned reconcile's caller sees the watcher closed rather than hanging.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), watching).await;
+  }
+
   /// The run loop selects a command and then awaits the whole reconcile
   /// INSIDE that branch, so while `Source::arm` is pending the loop never returns
   /// to its `select!` — the dedicated close lane exists but nothing polls it.
@@ -9079,7 +9240,10 @@ mod ownership {
     impl Source<OsString> for WedgedArmSource {
       type Handle = u32;
 
-      fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      fn canonicalize_key(
+        &self,
+        key: &[OsString],
+      ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
         self.inner.canonicalize_key(key)
       }
 
@@ -9808,7 +9972,10 @@ mod ownership {
     impl Source<OsString> for NotQuiescentSource {
       type Handle = u32;
 
-      fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      fn canonicalize_key(
+        &self,
+        key: &[OsString],
+      ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
         self.inner.canonicalize_key(key)
       }
 

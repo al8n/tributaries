@@ -57,8 +57,12 @@ struct StreamSource {
 impl Source<OsString> for StreamSource {
   type Handle = u32;
 
-  fn canonicalize_key(&self, k: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-    Ok(k.to_vec())
+  fn canonicalize_key(
+    &self,
+    k: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+    let canonical = k.to_vec();
+    async move { Ok(canonical) }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {

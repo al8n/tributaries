@@ -1163,6 +1163,83 @@ mod integration {
   }
 }
 
+/// `FsSource` resolves a coordinate with the BLOCKING `std::fs::canonicalize`, which against a
+/// stalled FUSE/NFS export returns no sooner than the mount does. Running it inline on the thread
+/// polling the future parks an executor worker unrelated tasks share — and defeats the owner's
+/// close race outright, since nothing can preempt a plain call on its own thread. So the
+/// resolution must reach the runtime's BLOCKING POOL.
+///
+/// Proved WITHOUT a hung mount, and without timing: the probe runtime's blocking pool is capped at
+/// one thread and that thread is held, so an offloaded resolution provably cannot have run — the
+/// first poll is `Pending`, and the coordinate only arrives once the occupant releases the pool.
+/// An inline `std::fs::canonicalize` is immune to that saturation and answers `Ready` on the very
+/// first poll, having already burned the polling thread on the syscall.
+///
+/// The source is built on a SEPARATE runtime so the watcher's own detached blocking work never
+/// competes for the capped pool this cell reasons about.
+///
+/// FAIL-ON-REVERT: restore the synchronous body (`std::fs::canonicalize(&supplied)` inline, no
+/// `R::spawn_blocking`) and the `is_pending` assertion below fires.
+#[cfg(all(feature = "tokio", not(miri)))]
+#[test]
+fn fs_canonicalization_never_resolves_on_the_polling_thread() {
+  use agnostic_lite::tokio::TokioRuntime;
+  use futures_util::poll;
+  use tributary_fs::WatcherOptions;
+
+  use crate::{Source, event::path_components, source::FsSource};
+
+  let host = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    .build()
+    .expect("the host runtime builds");
+  let source = host.block_on(async {
+    FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource")
+  });
+
+  // A real path with real resolution work to do (the temp root is a symlink on macOS).
+  let supplied = std::env::temp_dir();
+  let expected =
+    path_components(&std::fs::canonicalize(&supplied).expect("the temp root canonicalizes"));
+  let key = path_components(&supplied);
+
+  let probe = tokio::runtime::Builder::new_current_thread()
+    .max_blocking_threads(1)
+    .enable_all()
+    .build()
+    .expect("the probe runtime builds");
+  probe.block_on(async {
+    // Hold the pool's only thread until this cell releases it.
+    let (occupied_tx, occupied_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+      occupied_tx
+        .send(())
+        .expect("the occupancy signal is received");
+      let _ = release_rx.recv();
+    });
+    occupied_rx.recv().expect("the blocking pool is saturated");
+
+    let mut resolving = core::pin::pin!(source.canonicalize_key(&key));
+    assert!(
+      poll!(resolving.as_mut()).is_pending(),
+      "the resolution is queued behind the saturated blocking pool — it did not run on this thread"
+    );
+
+    release_tx.send(()).expect("the occupant is released");
+    let resolved = resolving
+      .await
+      .expect("the temp root canonicalizes once the pool is free");
+    assert_eq!(
+      resolved, expected,
+      "the offloaded resolution still answers the fs-canonical coordinate"
+    );
+  });
+
+  // Tear the watcher down on the runtime that spawned it.
+  host.block_on(async move { drop(source) });
+}
+
 /// The reserved namespace is the binding's business: it renders a cookie's
 /// name from the owner's token and classifies EVERY leaf in that namespace as
 /// an artifact — ours, another instance's, or a crashed process's leftover —
