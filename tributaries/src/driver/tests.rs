@@ -145,6 +145,10 @@ struct FakeSource {
   /// When set, `grow` never resolves — a coverage widening against a hung mount,
   /// the state the close race exists for.
   grow_pending: bool,
+  /// When set, `arm` records its call and then never resolves — the same hung mount one step
+  /// later, which is where the reconcile HOLDS a subsumer reservation. Lets a cell park the owner
+  /// inside `Owner::arm`'s race, change the close channel underneath it, and then poll again.
+  arm_pending: bool,
   /// Cookie writes this source actually performed, so a cell can prove a REFUSED
   /// barrier left no marker behind.
   begun_syncs: usize,
@@ -219,6 +223,7 @@ impl FakeSource {
       supports_replace: false,
       supports_sync: false,
       grow_pending: false,
+      arm_pending: false,
       begun_syncs: 0,
       ended_syncs: Vec::new(),
       cancelled_syncs: Vec::new(),
@@ -372,6 +377,11 @@ impl Source<OsString> for FakeSource {
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
     let path: PathBuf = key.iter().collect();
     self.calls.push(Call::Arm(path.clone()));
+    // The hung mount, parked AFTER the call is recorded so a cell can prove the arm was entered
+    // (hence that the plan reserved) even though it never returns.
+    if self.arm_pending {
+      core::future::pending::<()>().await;
+    }
     if self.fail_arms > 0 {
       self.fail_arms -= 1;
       return Err(WatchError::source(
@@ -817,6 +827,13 @@ impl Harness {
         // the in-place widen's close race cannot fire here.
         super::ReconcileStop::CloseRequested(_) => {
           unreachable!("no close is sent to a directly-driven harness owner")
+        }
+        // Nor can the dropped-handles abandon fire: the harness holds its close SENDER alive for
+        // the owner's whole life, so the receiver never reports the channel closed. The one cell
+        // that deliberately drops that sender drives `reconcile_watch` directly and reads the stop
+        // itself, so it never routes through here.
+        super::ReconcileStop::HandlesGone => {
+          unreachable!("the harness keeps its close sender alive, so the channel never closes")
         }
       })
   }
@@ -10693,6 +10710,16 @@ mod ownership {
   use super::*;
   use crate::driver::{MAX_PENDING_SYNCS, ReconcileStop};
 
+  /// Waits for a cross-task flag to be set, BOUNDED: a cell that would otherwise hang the whole
+  /// suite fails instead, and the wait costs nothing once the flag lands. Returns whether it did.
+  async fn settles(flag: &std::sync::Arc<core::sync::atomic::AtomicBool>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !flag.load(core::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    flag.load(core::sync::atomic::Ordering::SeqCst)
+  }
+
   /// The same seam one step EARLIER than
   /// [`a_permanently_pending_arm_cannot_wedge_close`]: the reconcile canonicalizes the
   /// caller's key at its very top — before the key is planned, armed or committed — and
@@ -10795,6 +10822,102 @@ mod ownership {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), watching).await;
   }
 
+  /// The OTHER way that race resolves: the close channel CLOSED rather than delivering a reply —
+  /// every public handle is gone. That is a terminal, not a retry. The `None` arm used to drop the
+  /// raced probe and await a fresh, UNRACED one, so against a source that never returns the
+  /// reconcile never handed control back to the run loop: the already-closed COMMAND channel (the
+  /// dropped-handles teardown signal) was never observed, and the owner, the source, every live
+  /// watch and the read-plane state were retained forever.
+  ///
+  /// The trigger needs nothing hostile beyond the wedge itself — the task owning the last handle is
+  /// cancelled after its `watch` was admitted — and the leak is observed at its root: the source's
+  /// own `Drop`, which runs only if the owner future actually finishes.
+  ///
+  /// FAIL-ON-REVERT: restore `None => self.source.canonicalize_key(key).await.map_err(Into::into)`
+  /// in `Owner::canonicalize_key` and the owner never returns — the source is never dropped and the
+  /// bounded wait below fails.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn losing_every_handle_mid_canonicalize_drops_the_owner_and_its_source() {
+    struct WedgedCanonicalizeSource {
+      inner: FakeSource,
+      entered: std::sync::Arc<core::sync::atomic::AtomicBool>,
+      dropped: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for WedgedCanonicalizeSource {
+      fn drop(&mut self) {
+        self
+          .dropped
+          .store(true, core::sync::atomic::Ordering::SeqCst);
+      }
+    }
+
+    impl Source<OsString> for WedgedCanonicalizeSource {
+      type Handle = u32;
+
+      fn canonicalize_key(
+        &self,
+        _key: &[OsString],
+      ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+        let entered = std::sync::Arc::clone(&self.entered);
+        async move {
+          entered.store(true, core::sync::atomic::Ordering::SeqCst);
+          // The mount that answers no `realpath`, ever — including to a re-issued probe.
+          core::future::pending().await
+        }
+      }
+
+      async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+        self.inner.arm(key).await
+      }
+
+      fn disarm(&mut self, handle: u32) {
+        self.inner.disarm(handle);
+      }
+
+      async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+        core::future::pending().await
+      }
+
+      fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+        self.inner.root_key(handle)
+      }
+    }
+
+    let entered = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let dropped = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let w: crate::Tributaries<OsString, (), TokioRuntime, u32> = crate::Tributaries::with_source(
+      WedgedCanonicalizeSource {
+        inner: FakeSource::new(),
+        entered: std::sync::Arc::clone(&entered),
+        dropped: std::sync::Arc::clone(&dropped),
+      },
+      TributariesOptions::new(),
+    );
+
+    let watching = {
+      let w = w.clone();
+      tokio::spawn(async move { w.watch(key("/a"), (), WatchOptions::new()).await })
+    };
+    assert!(
+      settles(&entered).await,
+      "staging: the owner is parked inside Source::canonicalize_key"
+    );
+
+    // Every public handle goes away, and NONE of them asked for a close: the watching task is
+    // cancelled (taking its clone with it) and the last clone is dropped. Both the close signal and
+    // the command mailbox lose their senders in lockstep.
+    watching.abort();
+    let _ = watching.await;
+    drop(w);
+
+    assert!(
+      settles(&dropped).await,
+      "the owner observes the handle loss as a TERMINAL and tears down — dropping its source — \
+       instead of re-issuing the probe against a mount that never answers"
+    );
+  }
+
   /// The run loop selects a command and then awaits the whole reconcile
   /// INSIDE that branch, so while `Source::arm` is pending the loop never returns
   /// to its `select!` — the dedicated close lane exists but nothing polls it.
@@ -10876,6 +10999,157 @@ mod ownership {
     );
     // The abandoned reconcile's caller sees the watcher closed rather than hanging.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), watching).await;
+  }
+
+  /// The handle-loss terminal at the ARM site — byte-identical in shape to the canonicalize one it
+  /// shipped alongside, and broken the same way: the `None` arm dropped the raced arm and awaited a
+  /// fresh, UNRACED one, so a source that never returns kept control out of the run loop forever
+  /// and the already-closed command channel was never observed.
+  ///
+  /// FAIL-ON-REVERT: restore `None => match self.source.arm(key).await { .. }` in `Owner::arm` and
+  /// the owner never returns — the source is never dropped and the bounded wait below fails.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn losing_every_handle_mid_arm_drops_the_owner_and_its_source() {
+    struct WedgedArmSource {
+      inner: FakeSource,
+      entered: std::sync::Arc<core::sync::atomic::AtomicBool>,
+      dropped: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for WedgedArmSource {
+      fn drop(&mut self) {
+        self
+          .dropped
+          .store(true, core::sync::atomic::Ordering::SeqCst);
+      }
+    }
+
+    impl Source<OsString> for WedgedArmSource {
+      type Handle = u32;
+
+      fn canonicalize_key(
+        &self,
+        key: &[OsString],
+      ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+        self.inner.canonicalize_key(key)
+      }
+
+      async fn arm(&mut self, _key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+        self
+          .entered
+          .store(true, core::sync::atomic::Ordering::SeqCst);
+        // The mount that never registers a watch, ever — including for a re-issued arm.
+        core::future::pending().await
+      }
+
+      fn disarm(&mut self, handle: u32) {
+        self.inner.disarm(handle);
+      }
+
+      async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+        core::future::pending().await
+      }
+
+      fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+        self.inner.root_key(handle)
+      }
+    }
+
+    let entered = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let dropped = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let w: crate::Tributaries<OsString, (), TokioRuntime, u32> = crate::Tributaries::with_source(
+      WedgedArmSource {
+        inner: FakeSource::new(),
+        entered: std::sync::Arc::clone(&entered),
+        dropped: std::sync::Arc::clone(&dropped),
+      },
+      TributariesOptions::new(),
+    );
+
+    let watching = {
+      let w = w.clone();
+      tokio::spawn(async move { w.watch(key("/a"), (), WatchOptions::new()).await })
+    };
+    assert!(
+      settles(&entered).await,
+      "staging: the owner is parked inside Source::arm, holding its plan's reservation"
+    );
+
+    watching.abort();
+    let _ = watching.await;
+    drop(w);
+
+    assert!(
+      settles(&dropped).await,
+      "the owner observes the handle loss as a TERMINAL and tears down — dropping its source — \
+       instead of re-issuing the arm against a mount that never answers"
+    );
+  }
+
+  /// What the arm site's handle-loss terminal OWES, which the canonicalize site does not: by the
+  /// time `Owner::arm` runs, `plan_watch` has minted the subscription and RESERVED its pending
+  /// entry. [`ReconcileStop::HandlesGone`] must unwind exactly what
+  /// [`ReconcileStop::CloseRequested`] unwinds there — and it does structurally, because both ride
+  /// the one `Err` channel that `reconcile_watch`'s arm sites answer with a single
+  /// `abort_watch`-then-return. This pins that: no reservation survives, and no second arm is ever
+  /// issued.
+  ///
+  /// The close channel has to die BETWEEN the canonicalization and the arm — the biased race polls
+  /// close first, so a channel already closed at the top would terminate at the canonicalize site
+  /// with nothing yet reserved. Hand-polling gets exactly there: one poll parks the reconcile
+  /// inside the arm (its plan reserved), the sender is dropped, and the next poll resolves it.
+  ///
+  /// FAIL-ON-REVERT: restore `None => match self.source.arm(key).await { .. }` in `Owner::arm` and
+  /// the second poll re-issues the arm into the same permanent park — the reconcile never resolves,
+  /// so the `else` below fires and the reservation is still held.
+  #[tokio::test]
+  async fn handle_loss_mid_arm_unwinds_the_plan_it_reserved() {
+    let mut h = Harness::new();
+    h.owner.source.arm_pending = true;
+
+    let watched = key("/a");
+    let stop = {
+      let mut reconcile = core::pin::pin!(h.owner.reconcile_watch(
+        &watched,
+        (),
+        WatchOptions::new().with_interest(Interest::all()),
+      ));
+      assert!(
+        futures_util::poll!(reconcile.as_mut()).is_pending(),
+        "staging: the reconcile canonicalized, RESERVED its plan, and parked inside the arm"
+      );
+      // Every public handle goes away now: the harness holds the owner's only close sender, and
+      // dropping it is exactly what dropping the last `Tributaries` clone does.
+      drop(h.closes);
+      let std::task::Poll::Ready(stop) = futures_util::poll!(reconcile.as_mut()) else {
+        panic!(
+          "the reconcile ABANDONS on a closed close channel; re-issuing an unraced arm instead \
+           parks it forever and never returns control to the run loop"
+        )
+      };
+      stop
+    };
+
+    let stop = stop.expect_err("handle loss abandons the reconcile rather than committing it");
+    assert!(
+      matches!(stop, ReconcileStop::HandlesGone),
+      "the terminal is the dropped-handles abandon, which owes no CloseReply: {stop:?}"
+    );
+    assert_eq!(
+      h.owner.subsumer.pending_len(),
+      0,
+      "HandlesGone unwinds the plan through the SAME abort_watch a won close unwinds it with — no \
+       pending reservation leaks"
+    );
+    assert_eq!(
+      h.owner.source.calls(),
+      vec![Call::Arm(PathBuf::from("/a"))],
+      "the arm is issued ONCE and never re-issued against the closed channel"
+    );
+    assert!(
+      !h.owner.subsumer.view().is_watched(&key("/a")),
+      "nothing is committed: no root is published for the abandoned plan"
+    );
   }
 
   /// The `grow` half of the same seam. `grow` is awaited on the Covered-outside
