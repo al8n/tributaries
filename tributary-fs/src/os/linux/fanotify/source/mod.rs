@@ -595,9 +595,11 @@ impl ReseedContext {
 
 #[cfg(test)]
 impl ReseedContext {
-  /// A placeholder context for the reader's hermetic drain tests, which observe a
-  /// pending shutdown before the first read and so never drive the walk. The
-  /// anchor identity is arbitrary because no walk runs against it.
+  /// A placeholder context for the reader's hermetic drain tests, which never
+  /// reach the walk: they either observe a pending shutdown before the first
+  /// read, or abandon the fd on its event-metadata ABI version before any
+  /// recovery could start. The anchor identity is arbitrary because no walk runs
+  /// against it — one cell asserts exactly that, off this context's reseed count.
   pub(crate) fn for_test(root: std::path::PathBuf) -> Self {
     Self {
       root,
