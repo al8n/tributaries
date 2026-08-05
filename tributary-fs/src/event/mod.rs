@@ -55,10 +55,11 @@ impl Event {
   /// Assembles a consumer event exactly as [`Watcher`](crate::Watcher)'s own delivery path
   /// does — `Event::from_change` under a [`RootHandle`] the caller **already holds**.
   ///
-  /// **Internal, not public API.** `#[doc(hidden)]` keeps it out of rustdoc; it does not make
-  /// it semver-exempt. The item is unconditionally `pub`, so it is part of what this crate
-  /// compiles into every dependent and removing it is a breaking change like any other — the
-  /// hiding is a discoverability measure, not a compatibility escape hatch. It exists because
+  /// **Internal, not public API,** and gated so it says so in the type system rather than only
+  /// in prose: it exists under `cfg(test)` or the crate's internal `_integration` feature, the
+  /// same gate the crate's other test-only exports carry, so an ordinary dependent's build of
+  /// this crate does not compile it at all and it is not part of the semver surface they can
+  /// reach. `#[doc(hidden)]` additionally keeps it out of rustdoc. It exists because
   /// the `tributaries` umbrella binds this vocabulary to its own (`SourceEvent::from_fs`) and
   /// that binding had no cell of its own: an `Event` is minted only by a live watcher draining
   /// a real kernel stream, so every test of the binding was forced to hand-build the *output*
@@ -81,8 +82,16 @@ impl Event {
   /// [`scope`](Change::scope) is deliberately ignored — `root` alone says which root the
   /// resulting event belongs to, exactly as in the delivery path.
   ///
-  /// It is deliberately not `#[cfg(test)]`: `cfg(test)` does not apply to a crate compiled as
-  /// a dependency, which is exactly how the umbrella's unit tests see this one.
+  /// # Why the gate is `any(test, feature = "_integration")` rather than `test` alone
+  ///
+  /// `cfg(test)` does not apply to a crate compiled as a *dependency*, which is exactly how the
+  /// umbrella's unit tests see this one — so `cfg(test)` alone would hide the seam from its only
+  /// consumer. The `_integration` feature is the crate's existing internal escape hatch for
+  /// precisely that (see its `[features]` note); the umbrella turns it on through its own
+  /// **dev-dependency** on this crate, so the feature reaches this compilation only when the
+  /// umbrella is building tests and never when it is building a library for a dependent.
+  /// `not(miri)` matches the consumer cell, which needs a real kernel backend miri cannot drive.
+  #[cfg(all(not(miri), any(test, feature = "_integration")))]
   #[doc(hidden)]
   pub fn from_change_under_root(root: RootHandle, root_path: &Path, change: &Change) -> Self {
     Self::from_change(root, root_path, change)

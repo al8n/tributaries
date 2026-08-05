@@ -88,15 +88,37 @@ fn watch_error_from_fs_classifies_honestly() {
 /// [`route::fan_out`], so the rebase is the shipped arithmetic and not a restatement of it.
 ///
 /// The seam takes a `RootHandle` because a handle is a CAPABILITY the fs watcher's mutators
-/// trust, so it must never be constructible from a caller-chosen instance — see the seam's own
-/// docs. This cell therefore watches a real scratch root and re-expresses the handle
-/// `tributary_fs::Watcher::watch` issued it, which is also why it needs a runtime and a real
-/// backend (hence the platform gate, matching the `integration` module's).
+/// trust, so it must never be assembled from a caller-chosen instance OR a caller-chosen scope
+/// — see the seam's own docs. This cell therefore watches real scratch roots and re-expresses
+/// the handle `tributary_fs::Watcher::watch` issued it, which is also why it needs a runtime and
+/// a real backend (hence the platform gate, matching the `integration` module's).
 ///
-/// FAIL-ON-REVERT: drop the `with_move_from_location` attachment at the end of
-/// `SourceEvent::from_fs` (return `source_event` unconditionally) and the move-out projection
-/// comes back root-anchored — the location assertion fails while the key assertion still
-/// passes, which is precisely the silence this cell exists to break.
+/// # Why two roots are watched
+///
+/// A handle is an `(instance, scope)` pair, and pinning "the seam re-expresses the presented
+/// handle" needs BOTH halves to be distinguishable from anything else in reach. The instance is
+/// pinned by the handle being genuinely issued. The scope is pinned only if the presented
+/// handle's scope DIFFERS from `change.scope()` — otherwise a seam that kept the presented
+/// instance but took the change's scope (exactly the caller-selected scope authority the seam
+/// forbids) would rebuild an identical handle and this cell would stay green while granting a
+/// forged capability. So a first, decoy root is watched purely to consume a scope id; the root
+/// under test is the SECOND, and the change is stamped with the decoy's scope — a real scope of
+/// this very watcher, naming a root the caller must not be able to address through this seam.
+/// The inequality is asserted before it is relied on, so the cell fails loudly rather than
+/// silently reverting to vacuity if scope issuance ever changes.
+///
+/// FAIL-ON-REVERT — three distinct mutations, all caught here:
+/// * drop the `with_move_from_location` attachment at the end of `SourceEvent::from_fs` (return
+///   `source_event` unconditionally) and the move-out projection comes back root-anchored — the
+///   location assertion fails while the key assertion still passes, which is precisely the
+///   silence this cell exists to break;
+/// * have `Event::from_change_under_root` rebuild the handle from a hardcoded instance
+///   (`RootHandle::new(1, change.scope())`) and the presented-handle assertion fails on the
+///   instance;
+/// * have it rebuild the handle from the PRESENTED instance and the change's own scope
+///   (`RootHandle::new(root.instance(), change.scope())`) — the forgery whose instance half is
+///   indistinguishable — and the same assertion fails on the scope, because the change carries
+///   the decoy root's.
 #[cfg(all(not(miri), any(target_os = "macos", target_os = "linux")))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
@@ -123,6 +145,18 @@ async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projecti
   // `watch` issued — the seam re-expresses it and cannot invent one — so the scratch root has
   // to be real. `/var` is a symlink on macOS and both the watcher and the key coordinate are
   // canonical, so compare against the canonicalized path.
+  //
+  // The DECOY root is watched first and never touched again: it exists to take the watcher's
+  // first scope id, so the root under test owns a different one and the change below can name
+  // a real scope that is NOT the presented handle's.
+  let decoy_dir = tempfile::Builder::new()
+    .prefix("tributaries-move-coordinate-decoy-")
+    .tempdir()
+    .expect("create decoy temp dir");
+  let decoy_root = decoy_dir
+    .path()
+    .canonicalize()
+    .expect("canonicalize decoy root");
   let dir = tempfile::Builder::new()
     .prefix("tributaries-move-coordinate-")
     .tempdir()
@@ -132,25 +166,46 @@ async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projecti
     .canonicalize()
     .expect("canonicalize scratch root");
   let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("build watcher");
+  let decoy = watcher
+    .watch(decoy_root, FsInterest::all())
+    .await
+    .expect("watch the decoy root");
   let handle = watcher
     .watch(root.clone(), FsInterest::all())
     .await
     .expect("watch the scratch root");
 
   // A real rename INSIDE the watched root: `old/name` → `new/name`. Both endpoints are under
-  // the root, which is exactly when the fs layer reports a `Moved`.
+  // the root, which is exactly when the fs layer reports a `Moved`. The change is stamped with
+  // the DECOY root's scope, so the change's scope and the presented handle's scope disagree.
   let change = Change::new(
     ChangeId::new(NonZeroU64::new(7).expect("nonzero")),
-    ScopeId::new(NonZeroU64::new(1).expect("nonzero")),
+    decoy.scope(),
     loc(&["new", "name"]),
     ChangeKind::Moved(loc(&["old", "name"])),
     Epoch::new(3),
   );
+
+  // NON-VACUITY PRECONDITION, asserted before anything below leans on it: the presented
+  // handle's scope must differ from the change's. If they were equal, a seam that rebuilt the
+  // handle out of the presented INSTANCE plus the change's own scope — the caller-selected
+  // scope authority this seam exists to refuse — would produce a handle equal to the presented
+  // one, and the assertion that follows would pass over a forged capability. Equal scopes make
+  // this cell worthless, not merely weaker.
+  assert_ne!(
+    handle.scope(),
+    change.scope(),
+    "the presented handle and the change must name DIFFERENT scopes, or the seam could take \
+     either one and this cell could not tell them apart"
+  );
+
   let fs_event = FsEvent::from_change_under_root(handle, &root, &change);
   assert_eq!(
     fs_event.root(),
     handle,
-    "the event belongs to the root whose handle was presented, never to one the seam chose"
+    "the event belongs to the root whose handle was presented — exactly it, both halves: never \
+     a handle the seam rebuilt from the change's own (caller-supplied) scope, which here names \
+     the decoy root the caller was never issued a handle for"
   );
   let moved = fs_event
     .kind()
@@ -207,6 +262,7 @@ async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projecti
   // report is not turned into a failure here.
   let _ = watcher.close().await;
   drop(dir);
+  drop(decoy_dir);
 }
 
 // The integration suite drives a real kernel watch on a tokio runtime — so it is gated
