@@ -8567,6 +8567,37 @@ fn rescan_event_at(
   )
 }
 
+/// A raw whole-`Moved` [`SourceEvent`] carrying BOTH endpoints' real root-relative
+/// locations, each given as `/`-joined segments relative to the one armed root the move was
+/// captured against — the pair a source reports for a rename inside its root.
+fn source_moved_at(
+  handle: u32,
+  from: &str,
+  from_location: &str,
+  to: &str,
+  to_location: &str,
+  epoch: u64,
+) -> SourceEvent<OsString, u32> {
+  let segments = |location: &str| {
+    Location::from_segments(
+      location
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(tributary_proto::Segment::new)
+        .collect::<Vec<_>>(),
+    )
+  };
+  SourceEvent::new(
+    handle,
+    key(to),
+    EventKind::Moved { from: key(from) },
+    segments(to_location),
+    Epoch::new(epoch),
+    Some(ChangeId::new(NonZeroU64::MIN)),
+  )
+  .with_move_from_location(segments(from_location))
+}
+
 /// A rescan is a LOCATED statement — "coverage became uncertain at and below this key" —
 /// and routing it by geometry rather than by shared physical root is what keeps a
 /// per-subscription consumer inside its own boundary. These cells pin the three cases and
@@ -9089,6 +9120,74 @@ mod location_coordinate {
       "the clamped key IS the subscription's root, so the coordinate is the empty one — \
        not a leftover measured against /z: {:?}",
       clamped.location()
+    );
+  }
+
+  /// A move has TWO endpoints and the raw event's location describes only the destination.
+  /// The source-only projection re-keys the delivery onto the move's SOURCE, so it must
+  /// carry the source's coordinate with it: a subscriber covering only the source is the
+  /// one that needs to learn the file left its tree, and its filter reads the location.
+  ///
+  /// FAIL-ON-REVERT: root-anchor the projection (`location: Location::new()` in
+  /// `Event::source_move_out`), and a location-aware filter is handed the WATCHED ROOT's
+  /// coordinate for a change one level below it — so the one-level filter here rejects the
+  /// removal outright, and even an admitting subscriber is told the change is at its root.
+  #[tokio::test]
+  async fn a_source_only_move_projection_carries_the_source_endpoints_coordinate() {
+    let mut h = Harness::new();
+    // The armed root is /a; /a/src is merely covered by it, so both endpoints of the move
+    // below are measured against /a.
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let source_only = h
+      .watch_with(
+        "/a/src",
+        WatchOptions::new().with_filter(Filter::new(|input: &crate::FilterInput<'_, OsString>| {
+          input.location().len() == 1
+        })),
+      )
+      .await
+      .expect("watch /a/src with a one-level filter");
+    h.drain();
+
+    // /a/src/f → /a/dst/f: the destination is outside /a/src, so that subscriber gets the
+    // source-only projection (a synthesized Removed at the source endpoint).
+    h.owner.fan_out_and_push(&source_moved_at(
+      1, "/a/src/f", "src/f", "/a/dst/f", "dst/f", 1,
+    ));
+    let delivered = h.drain();
+
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == source_only)
+      .expect("the one-level filter admits the removal — it is one level below /a/src");
+    assert!(projected.kind().is_removed());
+    assert_eq!(
+      projected.path(),
+      Path::new("/a/src/f"),
+      "the projection is keyed on the source endpoint"
+    );
+    assert_eq!(
+      projected.location(),
+      &Location::from_segments([tributary_proto::Segment::new("f")]),
+      "and located there too, rebased into /a/src's own coordinate"
+    );
+
+    // The both-endpoints subscriber is unaffected: it receives the whole move, located at
+    // the destination as before.
+    let whole = delivered
+      .iter()
+      .find(|e| e.subscription() == wide)
+      .expect("the covering subscription receives the whole move");
+    assert_eq!(whole.move_from(), Some(key("/a/src/f").as_slice()));
+    assert_eq!(
+      whole.location(),
+      &Location::from_segments(
+        ["dst", "f"]
+          .into_iter()
+          .map(tributary_proto::Segment::new)
+          .collect::<Vec<_>>()
+      ),
+      "a whole move stays located at its destination"
     );
   }
 }

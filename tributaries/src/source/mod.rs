@@ -1187,6 +1187,10 @@ pub struct SourceEvent<C, H> {
   key: Vec<C>,
   kind: EventKind<C>,
   location: Location,
+  /// The move **source** endpoint's location, when the source can state it — the second
+  /// coordinate a [`Moved`](EventKind::Moved) has and [`location`](Self::location) does
+  /// not. `None` means "not stated", which the umbrella reads as root-anchored.
+  move_from_location: Option<Location>,
   epoch: Epoch,
   change_id: Option<ChangeId>,
 }
@@ -1218,6 +1222,10 @@ impl<C, H> SourceEvent<C, H> {
   /// [`FilterInput::location`](crate::FilterInput::location) a caller's predicate reads.
   /// A source that cannot express a location supplies the empty one, which is honest
   /// (root-anchored, with `key` as the authoritative signal) rather than wrong.
+  ///
+  /// A [`Moved`](EventKind::Moved) has a **second** endpoint, and `location` describes only
+  /// the destination; a source that can also state the source endpoint's coordinate adds it
+  /// with [`with_move_from_location`](Self::with_move_from_location).
   pub fn new(
     handle: H,
     key: Vec<C>,
@@ -1231,9 +1239,44 @@ impl<C, H> SourceEvent<C, H> {
       key,
       kind,
       location,
+      move_from_location: None,
       epoch,
       change_id,
     }
+  }
+
+  /// States the move **source** endpoint's location — the coordinate of
+  /// [`move_from`](Self::move_from), measured against the **same** root
+  /// [`location`](Self::location) is (builder form).
+  ///
+  /// # Why it exists
+  ///
+  /// A rename has two endpoints and [`location`](Self::location) can only describe one of
+  /// them. A subscriber covering the source but not the destination is delivered the
+  /// move's **source-only projection** — a synthesized [`Removed`](EventKind::Removed) at
+  /// [`move_from`](Self::move_from) — and without this the umbrella has no coordinate to
+  /// put on it: it must root-anchor the projection, so a caller's location-aware
+  /// [`Filter`](crate::Filter) is handed the *watched root's* coordinate for a change that
+  /// is not at the root at all, and can reject the very removal that subscriber exists to
+  /// see. The key stays authoritative either way; this is what lets the located coordinate
+  /// be authoritative too.
+  ///
+  /// # It must agree with `move_from`, against the same root
+  ///
+  /// `location` names the trailing components of [`move_from`](Self::move_from) below the
+  /// root this change was captured against — the identical rule
+  /// [`new`](Self::new) states for the destination pair, and the identical failure if it is
+  /// broken: the umbrella rebases the projection by the depth the destination pair implies,
+  /// so a source location measured against some *other* root silently mis-places the
+  /// delivered [`Event::location`](crate::Event::location). A source that cannot state it
+  /// omits it, and the projection root-anchors as before — honest rather than wrong.
+  ///
+  /// Ignored for every kind but [`Moved`](EventKind::Moved), which is the only one with a
+  /// second endpoint.
+  #[must_use]
+  pub fn with_move_from_location(mut self, location: Location) -> Self {
+    self.move_from_location = Some(location);
+    self
   }
 
   /// This change re-keyed onto `root_key`, **root-anchored**: the key becomes `root_key`
@@ -1272,6 +1315,9 @@ impl<C, H> SourceEvent<C, H> {
       key: root_key,
       kind: self.kind.clone(),
       location: Location::new(),
+      // Restated, not carried, for the same reason `location` is: a second coordinate
+      // minted against the old root describes nothing under the new one.
+      move_from_location: None,
       epoch: self.epoch,
       change_id: self.change_id,
     }
@@ -1315,11 +1361,26 @@ impl<C, H> SourceEvent<C, H> {
   }
 
   /// The change's location relative to its armed root — the metadata the umbrella carries
-  /// onto the delivered event.
+  /// onto the delivered event. For a [`Moved`](EventKind::Moved) this is the **destination**
+  /// endpoint; the source endpoint's is
+  /// [`move_from_location`](Self::move_from_location).
   #[inline]
   #[must_use]
   pub fn location(&self) -> &Location {
     &self.location
+  }
+
+  /// The move **source** endpoint's location relative to the same armed root
+  /// [`location`](Self::location) is measured against, when the source stated it
+  /// ([`with_move_from_location`](Self::with_move_from_location)).
+  ///
+  /// `None` for every single-endpoint kind, and for a move whose source could not express
+  /// it — the umbrella then root-anchors the source-only projection, leaving
+  /// [`move_from`](Self::move_from) as its authoritative signal.
+  #[inline]
+  #[must_use]
+  pub const fn move_from_location(&self) -> Option<&Location> {
+    self.move_from_location.as_ref()
   }
 
   /// The raw source epoch this change was emitted under. The umbrella rebases it into

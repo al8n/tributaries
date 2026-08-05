@@ -801,6 +801,10 @@ impl SourceEvent<OsString, RootHandle> {
   /// source key). The one place the fs vocabulary and a raw filesystem event's key are
   /// converted at this binding.
   fn from_fs(event: &FsEvent) -> Self {
+    // The move's SOURCE coordinate, measured against the same root as the destination's:
+    // the fs layer reports a `Moved` only when both endpoints lie under the watched root,
+    // so this is a real location whenever the kind is a move.
+    let move_from_location = event.kind().moved().map(|moved| moved.location().clone());
     let kind = match event.kind() {
       FsEventKind::Created => EventKind::Created,
       FsEventKind::Modified => EventKind::Modified,
@@ -814,14 +818,18 @@ impl SourceEvent<OsString, RootHandle> {
       // unknown proto kinds (the source-honesty contract).
       _ => EventKind::Rescan,
     };
-    Self::new(
+    let source_event = Self::new(
       event.root(),
       path_components(event.path()),
       kind,
       event.location().clone(),
       event.epoch(),
       Some(event.change_id()),
-    )
+    );
+    match move_from_location {
+      Some(location) => source_event.with_move_from_location(location),
+      None => source_event,
+    }
   }
 }
 
