@@ -250,9 +250,19 @@ impl<C, V> Event<C, V> {
   ///
   /// A subscriber covering only the source of a rename must learn the file **left** its
   /// tree; it cannot see the destination, so the move is projected to a plain
-  /// `Removed(from)`. The generic source seam carries no second (source) location, so the
-  /// projection is root-anchored; its key is the authoritative signal. The epoch is
-  /// provisional (rebased by the driver, design §8).
+  /// `Removed(from)`.
+  ///
+  /// The projection carries the move's **source** location
+  /// ([`SourceEvent::move_from_location`]), not the destination's: the delivered key is the
+  /// source endpoint, so pairing it with the destination's coordinate would name a path this
+  /// delivery is not about — and root-anchoring it (the only option before the seam carried a
+  /// second location) hands a caller's location-aware [`Filter`](crate::Filter) the watched
+  /// root's coordinate for a change that is not at the root, which can reject the very
+  /// removal this subscriber exists to see. The pair is coherent by the same rule the
+  /// destination pair obeys, so fan-out's rebase strips the right depth from it. A source
+  /// that did not state one leaves the projection root-anchored, with the key as the
+  /// authoritative signal, exactly as before. The epoch is provisional (rebased by the
+  /// driver, design §8).
   pub(crate) fn source_move_out<H>(subscription: Subscription, event: &SourceEvent<C, H>) -> Self
   where
     C: Clone,
@@ -265,7 +275,7 @@ impl<C, V> Event<C, V> {
         .expect("move-out is only minted for a move")
         .to_vec(),
       kind: EventKind::Removed,
-      location: Location::new(),
+      location: event.move_from_location().cloned().unwrap_or_default(),
       change_id: None,
       value: None,
     }
@@ -413,8 +423,10 @@ impl<C, V> Event<C, V> {
   /// A synthetic widen [`Rescan`](EventKind::Rescan), and the clamped recovery
   /// projection of a rescan that contained this subscription, report the empty
   /// (root-anchored) location, since their [`key`](Self::key) *is* the subscription's own
-  /// key. So does a move-out projection, whose [`key`](Self::key) is the authoritative
-  /// signal (the generic source seam carries no second location).
+  /// key. A move-out projection reports the move's **source** endpoint — the coordinate of
+  /// its own [`key`](Self::key) — when the source stated it
+  /// ([`SourceEvent::move_from_location`](crate::SourceEvent::move_from_location)), and the
+  /// empty location when it did not.
   #[inline]
   pub fn location(&self) -> &Location {
     &self.location

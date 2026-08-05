@@ -3,7 +3,7 @@ use std::{collections::HashMap, ffi::OsString, path::Path};
 
 use tributary_proto::ScopeId;
 
-use super::{RoutableEvent, Subscription, fan_out};
+use super::{ReservedEndpoints, RoutableEvent, Subscription, fan_out};
 
 /// A path's `OsString` components — the located-key form the fs source keys on, and
 /// the coordinate `fan_out` covers over.
@@ -62,6 +62,9 @@ struct FakeEvent {
   key: Vec<OsString>,
   from: Option<Vec<OsString>>,
   rescan: bool,
+  /// Which endpoints the source reserves — the classification the driver decides at its
+  /// [`Source`](crate::Source) seam and this seam only carries.
+  reserved: ReservedEndpoints,
   /// The root depth this event's location is measured from — a property of the EVENT,
   /// which a queued change carries unchanged across a widen of the root it rides.
   /// `None` is "captured against whatever root the fixture is routing on", filled in at
@@ -76,6 +79,7 @@ impl FakeEvent {
       key: key(path),
       from: None,
       rescan: false,
+      reserved: ReservedEndpoints::None,
       captured_root_depth: None,
     }
   }
@@ -85,6 +89,7 @@ impl FakeEvent {
       key: key(path),
       from: None,
       rescan: true,
+      reserved: ReservedEndpoints::None,
       captured_root_depth: None,
     }
   }
@@ -95,8 +100,16 @@ impl FakeEvent {
       key: key(to),
       from: Some(key(from)),
       rescan: false,
+      reserved: ReservedEndpoints::None,
       captured_root_depth: None,
     }
+  }
+
+  /// Declares which of this event's endpoints lie in the source's reserved namespace —
+  /// the sync-artifact classification fan-out masks out of every subscriber's coverage.
+  fn reserving(mut self, reserved: ReservedEndpoints) -> Self {
+    self.reserved = reserved;
+    self
   }
 
   /// Pins the root this event's location was captured against, independently of the root
@@ -120,6 +133,10 @@ impl RoutableEvent<OsString> for FakeEvent {
 
   fn is_rescan(&self) -> bool {
     self.rescan
+  }
+
+  fn reserved(&self) -> ReservedEndpoints {
+    self.reserved
   }
 
   fn deliver(&self, sub: Subscription) -> Delivered {
@@ -642,5 +659,120 @@ fn move_projection_is_gated_by_the_projected_kind() {
     admitted,
     vec![fx.sub(2)],
     "the gate drops the move-out projection; the move-in still reaches the dest-sub"
+  );
+}
+
+// -------------------------------------------------------------------------------
+// The reserved namespace masks an ENDPOINT, never the whole change: a rename can put a
+// source's own sync artifact at one end and a user object at the other, and the user end
+// is exactly what its subscribers are watching for.
+// -------------------------------------------------------------------------------
+
+/// A user object renamed INTO the reserved namespace. The destination is masked out of
+/// every subscriber's coverage, so a subscriber covering the source is left covering one
+/// endpoint — and receives the move-out `Removed(from)` that says the object left its
+/// tree, which is the whole truth it is allowed to be told.
+///
+/// FAIL-ON-REVERT: drop the destination mask from `project` (`covers_to` back to a bare
+/// `to.starts_with(canonical)`) and this delivers a whole `Moved` naming the reserved
+/// destination — leaking the artifact path the namespace exists to hide. That revert
+/// unmasks `All` too, so it also fails the two total-suppression cells below; the mutation
+/// isolating THIS cell is the narrower `masks_destination` → `matches!(self, Self::All)`.
+#[test]
+fn a_move_into_the_reserved_namespace_still_delivers_its_source_endpoint() {
+  let fx = Fixture::new("/r", &[(1, "/r")]);
+  let out = projections(
+    &fx,
+    &FakeEvent::moved("/r/important/file", "/r/.cookies/x")
+      .reserving(ReservedEndpoints::Destination),
+  );
+  assert_eq!(
+    out,
+    vec![(1, Projection::MoveOut)],
+    "the covering subscriber learns the file left, and learns nothing of where it went"
+  );
+}
+
+/// The mirror: an artifact renamed OUT to an ordinary name. The source is masked, so a
+/// subscriber covering the destination receives the move-in `Created(to)` — a user object
+/// appeared in its tree, from somewhere it may not be told about.
+///
+/// FAIL-ON-REVERT: drop the source mask (`covers_from` back to a bare
+/// `from.starts_with(canonical)`) and this delivers a whole `Moved` whose `from` is the
+/// artifact's own path. That revert unmasks `All` too, so it also fails the
+/// rename-between-two-artifacts cell below; the mutation isolating THIS cell is the
+/// narrower `masks_source` → `matches!(self, Self::All)`.
+#[test]
+fn a_move_out_of_the_reserved_namespace_still_delivers_its_destination_endpoint() {
+  let fx = Fixture::new("/r", &[(1, "/r")]);
+  let out = projections(
+    &fx,
+    &FakeEvent::moved("/r/.cookies/x", "/r/adopted").reserving(ReservedEndpoints::Source),
+  );
+  assert_eq!(
+    out,
+    vec![(1, Projection::MoveIn)],
+    "the covering subscriber learns an object arrived, and nothing of the artifact it was"
+  );
+}
+
+/// Both endpoints reserved — a rename BETWEEN two artifact names. Nobody covers either
+/// end, so the four-case decomposition lands on its own `(false, false)` arm and no
+/// subscriber is told anything.
+///
+/// This is the router's own answer, independent of the driver's `is_total` short-circuit
+/// (which settles such a change before it is ever routed): the two layers suppress it
+/// separately, and this cell pins the lower one.
+///
+/// FAIL-ON-REVERT: drop `Self::All` from `masks_source` (→ `matches!(self, Self::Source)`)
+/// and the suppression degrades to a move-out `Removed` naming one artifact's own path.
+#[test]
+fn a_move_within_the_reserved_namespace_reaches_nobody() {
+  let fx = Fixture::new("/r", &[(1, "/r")]);
+  let out = projections(
+    &fx,
+    &FakeEvent::moved("/r/.cookies/x", "/r/.cookies/y").reserving(ReservedEndpoints::All),
+  );
+  assert!(
+    out.is_empty(),
+    "a change reserved at every endpoint it has reaches no consumer: {out:?}"
+  );
+}
+
+/// A single-endpoint change at a reserved key reaches nobody either — the same mask, read
+/// on the one endpoint such a change has.
+///
+/// FAIL-ON-REVERT: drop the mask from `project`'s single-endpoint arm (`return
+/// to.starts_with(canonical).then(|| event.deliver(sub))`) and the cookie's own create is
+/// delivered whole to every covering subscriber.
+#[test]
+fn a_single_endpoint_change_at_a_reserved_key_reaches_nobody() {
+  let fx = Fixture::new("/r", &[(1, "/r")]);
+  let out = projections(
+    &fx,
+    &FakeEvent::change("/r/.cookies/x").reserving(ReservedEndpoints::All),
+  );
+  assert!(
+    out.is_empty(),
+    "the cookie's own create/unlink is covered by nobody: {out:?}"
+  );
+}
+
+/// The over-suppression guard: with nothing reserved, the identical geometry delivers the
+/// whole move. The mask is what changes the projection — not the shape of the rename.
+///
+/// FAIL-ON-REVERT: extend `masks_source` with `Self::None` and this degrades to a move-in.
+/// It states the contrast at this seam rather than adding an independent kill: any mutation
+/// that reaches it necessarily also fails the unreserved move cells above, which assert the
+/// same contract without going near the namespace. The cells that DO isolate over-reach are
+/// the driver's, where the classifier's own two grounds can be widened one at a time.
+#[test]
+fn an_unreserved_move_is_not_masked() {
+  let fx = Fixture::new("/r", &[(1, "/r")]);
+  let out = projections(&fx, &FakeEvent::moved("/r/important/file", "/r/plain/x"));
+  assert_eq!(
+    out,
+    vec![(1, Projection::Whole)],
+    "an ordinary rename keeps its whole-move delivery"
   );
 }

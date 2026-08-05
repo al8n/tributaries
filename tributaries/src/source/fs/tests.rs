@@ -67,6 +67,204 @@ fn watch_error_from_fs_classifies_honestly() {
   );
 }
 
+/// The fs-to-neutral EVENT binding ([`SourceEvent::from_fs`](super::SourceEvent::from_fs)),
+/// driven from a real lower-layer [`tributary_fs::Event`] all the way to the delivery a
+/// source-only subscriber receives — the propagation of a rename's SOURCE coordinate across
+/// the seam.
+///
+/// A rename carries two root-relative coordinates and the neutral `SourceEvent` keys on the
+/// destination, so the source endpoint's own location travels in the separate
+/// `move_from_location` slot. Everything downstream of that slot already had cells: the
+/// projection tests hand-build a `SourceEvent` that *already* carries the field, and the fs
+/// crate's own event tests stop one layer below the binding. The binding itself — the single
+/// `Moved::location()` → `with_move_from_location` attachment — had none, so deleting it left
+/// the whole suite green while every real filesystem move-out projection silently went back to
+/// being root-anchored, which a location-aware [`Filter`](crate::Filter) reads as a change at
+/// the watched root and can reject outright.
+///
+/// The event is minted through `tributary_fs`'s own assembly (`Event::from_change_under_root`,
+/// the seam that mints exactly what `Watcher` delivers) rather than hand-built here, and the
+/// projection runs through the production [`SourceRoutable`] adapter and the real
+/// [`route::fan_out`], so the rebase is the shipped arithmetic and not a restatement of it.
+///
+/// The seam takes a `RootHandle` because a handle is a CAPABILITY the fs watcher's mutators
+/// trust, so it must never be assembled from a caller-chosen instance OR a caller-chosen scope
+/// — see the seam's own docs. This cell therefore watches real scratch roots and re-expresses
+/// the handle `tributary_fs::Watcher::watch` issued it, which is also why it needs a runtime and
+/// a real backend (hence the platform gate, matching the `integration` module's).
+///
+/// # Why two roots are watched
+///
+/// A handle is an `(instance, scope)` pair, and pinning "the seam re-expresses the presented
+/// handle" needs BOTH halves to be distinguishable from anything else in reach. The instance is
+/// pinned by the handle being genuinely issued. The scope is pinned only if the presented
+/// handle's scope DIFFERS from `change.scope()` — otherwise a seam that kept the presented
+/// instance but took the change's scope (exactly the caller-selected scope authority the seam
+/// forbids) would rebuild an identical handle and this cell would stay green while granting a
+/// forged capability. So a first, decoy root is watched purely to consume a scope id; the root
+/// under test is the SECOND, and the change is stamped with the decoy's scope — a real scope of
+/// this very watcher, naming a root the caller must not be able to address through this seam.
+/// The inequality is asserted before it is relied on, so the cell fails loudly rather than
+/// silently reverting to vacuity if scope issuance ever changes.
+///
+/// FAIL-ON-REVERT — three distinct mutations, all caught here:
+/// * drop the `with_move_from_location` attachment at the end of `SourceEvent::from_fs` (return
+///   `source_event` unconditionally) and the move-out projection comes back root-anchored — the
+///   location assertion fails while the key assertion still passes, which is precisely the
+///   silence this cell exists to break;
+/// * have `Event::from_change_under_root` rebuild the handle from a hardcoded instance
+///   (`RootHandle::new(1, change.scope())`) and the presented-handle assertion fails on the
+///   instance;
+/// * have it rebuild the handle from the PRESENTED instance and the change's own scope
+///   (`RootHandle::new(root.instance(), change.scope())`) — the forgery whose instance half is
+///   indistinguishable — and the same assertion fails on the scope, because the change carries
+///   the decoy root's.
+#[cfg(all(not(miri), any(target_os = "macos", target_os = "linux")))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
+  use core::num::NonZeroU64;
+  use std::ffi::OsString;
+
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::{Event as FsEvent, Interest as FsInterest, Watcher, WatcherOptions};
+  use tributary_proto::{Change, ChangeId, ChangeKind, Epoch, Location, ScopeId, Segment};
+
+  use crate::{
+    driver::SourceRoutable,
+    event::{Event, path_components},
+    route::{ReservedEndpoints, fan_out},
+    source::SourceEvent,
+    subscription::Subscription,
+  };
+
+  fn loc(parts: &[&str]) -> Location {
+    Location::from_segments(parts.iter().map(|p| Segment::new(*p)))
+  }
+
+  // The root the rename happens under, and the handle that OWNS it. The handle is the one
+  // `watch` issued — the seam re-expresses it and cannot invent one — so the scratch root has
+  // to be real. `/var` is a symlink on macOS and both the watcher and the key coordinate are
+  // canonical, so compare against the canonicalized path.
+  //
+  // The DECOY root is watched first and never touched again: it exists to take the watcher's
+  // first scope id, so the root under test owns a different one and the change below can name
+  // a real scope that is NOT the presented handle's.
+  let decoy_dir = tempfile::Builder::new()
+    .prefix("tributaries-move-coordinate-decoy-")
+    .tempdir()
+    .expect("create decoy temp dir");
+  let decoy_root = decoy_dir
+    .path()
+    .canonicalize()
+    .expect("canonicalize decoy root");
+  let dir = tempfile::Builder::new()
+    .prefix("tributaries-move-coordinate-")
+    .tempdir()
+    .expect("create temp dir");
+  let root = dir
+    .path()
+    .canonicalize()
+    .expect("canonicalize scratch root");
+  let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("build watcher");
+  let decoy = watcher
+    .watch(decoy_root, FsInterest::all())
+    .await
+    .expect("watch the decoy root");
+  let handle = watcher
+    .watch(root.clone(), FsInterest::all())
+    .await
+    .expect("watch the scratch root");
+
+  // A real rename INSIDE the watched root: `old/name` → `new/name`. Both endpoints are under
+  // the root, which is exactly when the fs layer reports a `Moved`. The change is stamped with
+  // the DECOY root's scope, so the change's scope and the presented handle's scope disagree.
+  let change = Change::new(
+    ChangeId::new(NonZeroU64::new(7).expect("nonzero")),
+    decoy.scope(),
+    loc(&["new", "name"]),
+    ChangeKind::Moved(loc(&["old", "name"])),
+    Epoch::new(3),
+  );
+
+  // NON-VACUITY PRECONDITION, asserted before anything below leans on it: the presented
+  // handle's scope must differ from the change's. If they were equal, a seam that rebuilt the
+  // handle out of the presented INSTANCE plus the change's own scope — the caller-selected
+  // scope authority this seam exists to refuse — would produce a handle equal to the presented
+  // one, and the assertion that follows would pass over a forged capability. Equal scopes make
+  // this cell worthless, not merely weaker.
+  assert_ne!(
+    handle.scope(),
+    change.scope(),
+    "the presented handle and the change must name DIFFERENT scopes, or the seam could take \
+     either one and this cell could not tell them apart"
+  );
+
+  let fs_event = FsEvent::from_change_under_root(handle, &root, &change);
+  assert_eq!(
+    fs_event.root(),
+    handle,
+    "the event belongs to the root whose handle was presented — exactly it, both halves: never \
+     a handle the seam rebuilt from the change's own (caller-supplied) scope, which here names \
+     the decoy root the caller was never issued a handle for"
+  );
+  let moved = fs_event
+    .kind()
+    .moved()
+    .expect("the lower layer reports a paired rename");
+  assert_eq!(
+    moved.location(),
+    &loc(&["old", "name"]),
+    "the lower layer states the source endpoint's own root-relative coordinate"
+  );
+
+  // THE BINDING under test.
+  let source_event = SourceEvent::from_fs(&fs_event);
+  assert_eq!(
+    source_event.move_from_location(),
+    Some(&loc(&["old", "name"])),
+    "…and the conversion carries it across the seam rather than dropping it"
+  );
+
+  // A subscriber covering ONLY the source endpoint, one level below the watched root: it
+  // receives the synthesized move-out `Removed`, and its coordinate must be the SOURCE
+  // endpoint's, rebased into this subscription's own key.
+  let sub = Subscription::for_test(ScopeId::new(NonZeroU64::new(9).expect("nonzero")));
+  let canonical = path_components(&root.join("old"));
+  let routable = SourceRoutable::<'_, OsString, (), _>::new(&source_event, ReservedEndpoints::None);
+  let delivered: Vec<Event<OsString, ()>> = fan_out(
+    &routable,
+    &[sub],
+    |_| Some(canonical.as_slice()),
+    |_, _| true,
+  );
+
+  assert_eq!(delivered.len(), 1, "the source-only subscriber is served");
+  let projected = &delivered[0];
+  assert!(
+    projected.kind().is_removed(),
+    "source-only coverage projects the move to a Removed: {projected:?}"
+  );
+  assert_eq!(
+    projected.key(),
+    path_components(&root.join("old").join("name")).as_slice(),
+    "keyed on the move's source endpoint"
+  );
+  assert_eq!(
+    projected.location(),
+    &loc(&["name"]),
+    "and located at that same endpoint, rebased into the subscription's coordinate — \
+     never root-anchored, which would name the watched root itself"
+  );
+
+  // Tear the native stream down BEFORE `dir` unlinks the tree it is watching, so this cell
+  // leaves no background reader reacting to a root death while the rest of the suite runs.
+  // The verdict is not this cell's subject — `close` has its own cells — so a `NotQuiesced`
+  // report is not turned into a failure here.
+  let _ = watcher.close().await;
+  drop(dir);
+  drop(decoy_dir);
+}
+
 // The integration suite drives a real kernel watch on a tokio runtime — so it is gated
 // on the runtime feature, off miri (which cannot execute the syscalls), and onto the
 // platforms with a real backend (elsewhere `tributary-fs` compiles but arms fail at
@@ -1164,10 +1362,23 @@ mod integration {
 }
 
 /// The reserved namespace is the binding's business: it renders a cookie's
-/// name from the owner's token and classifies EVERY leaf in that namespace as
-/// an artifact — ours, another instance's, or a crashed process's leftover —
-/// while an ordinary file (or a name merely containing the prefix deeper in
-/// the path) is never one.
+/// name from the owner's token and classifies EVERY leaf matching a shape this
+/// binding has minted as an artifact — ours, another instance's, or a crashed
+/// process's leftover from an earlier release — while an ordinary file (or a
+/// name merely containing the prefix deeper in the path) is never one.
+///
+/// # A disclosed correction
+///
+/// This cell used to assert `.tributaries-sync-0-1-0-0000000000000000`,
+/// `.tributaries-sync-0-1-0` and the round-trip of `SyncToken::new(0, 0, 0, 0)` as
+/// ARTIFACTS. No release of this binding can mint an `instance` of 0 (the field comes
+/// from a `NonZeroU64` [`InstanceId`](crate::subscription::InstanceId)) or a `seq` of 0
+/// (`Owner::sync_seq` is pre-incremented before the mint), so those three inputs pinned
+/// the very over-acceptance the classifier's bounds now close: names the minter cannot
+/// produce, suppressed off every consumer stream as though it could. The two literals
+/// moved to the negative list below and the round-trip token became
+/// `SyncToken::new(1, 1, 1, 0)` — the minimum of each bounded field, and a `nonce` of 0,
+/// which unlike the others IS genuinely mintable and must stay covered here.
 #[tokio::test]
 async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   use std::ffi::OsString;
@@ -1185,7 +1396,7 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   let name = super::cookie_name(SyncToken::new(7, 42, 3, 0xdead_beef));
   assert_eq!(name, ".tributaries-sync-7-42-3-00000000deadbeef");
   // The trailing nonce is what an external writer cannot predict — but
-  // classification keys on the reserved PREFIX alone, so a cookie is a cookie
+  // classification keys on the SHAPE, not on the value, so a cookie is a cookie
   // whatever its nonce.
   assert!(source.is_sync_artifact(&key(&[
     "/",
@@ -1195,13 +1406,371 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   assert!(source.is_sync_artifact(&key(&["/", "r", &name])));
 
   // A FOREIGN instance's cookie, and a crashed process's leftover: both are
-  // suppressed too — the namespace is total, never own-pending-only.
-  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-9-999-1"])));
-  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-0-1-0"])));
+  // suppressed too — the namespace is total over the grammar, never
+  // own-pending-only. Every writer of a real cookie is this same minter.
+  assert!(source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-9-999-1-ffffffffffffffff"
+  ])));
+  assert!(source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-3-77-2-0123456789abcdef"
+  ])));
 
-  // Ordinary files are not artifacts — including one whose PARENT directory
-  // carries the prefix (the match is on the leaf, never an interior component).
+  // The THREE-field shape this binding minted before the name carried a nonce.
+  // A cookie outlives the process that wrote it, so a leftover on disk was named
+  // by whichever release was running then: dropping this shape would make the
+  // first watch after an upgrade report every stale cookie as a user create.
+  for legacy_leftover in [
+    ".tributaries-sync-9-999-1",
+    ".tributaries-sync-3-77-2",
+    ".tributaries-sync-18446744073709551615-4294967295-18446744073709551615",
+  ] {
+    assert!(
+      source.is_sync_artifact(&key(&["/", "r", legacy_leftover])),
+      "{legacy_leftover} is a cookie an earlier release of this binding minted"
+    );
+  }
+
+  // The whole minted range round-trips: the extremes of every field are still
+  // recognized by the classifier that has to suppress them. The low end is each
+  // field's true minimum — 1 for the bounded decimals, 0 for the nonce, whose
+  // minter is a hasher and can genuinely render it.
+  for token in [
+    SyncToken::new(1, 1, 1, 0),
+    SyncToken::new(u64::MAX, u32::MAX, u64::MAX, u64::MAX),
+    SyncToken::new(1, 1, 1, 1),
+  ] {
+    let minted = super::cookie_name(token);
+    assert!(
+      source.is_sync_artifact(&key(&["/", "r", &minted])),
+      "the minter and the classifier must agree on {minted}"
+    );
+  }
+
+  // The fs layer's cookie DIRECTORY is in the same namespace and is likewise not
+  // a user change — for any uid, since two users may watch one tree.
+  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-cookies"])));
+  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-cookies-501"])));
+
+  // Ordinary files are not artifacts — including one whose PARENT carries a
+  // COOKIE's name rather than the cookie directory's: only the directory this
+  // driver actually creates makes its children artifacts.
   assert!(!source.is_sync_artifact(&key(&["/", "r", "a.txt"])));
-  assert!(!source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-7-42-3", "inner.txt"])));
+  assert!(!source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-7-42-3-00000000deadbeef",
+    "inner.txt"
+  ])));
   assert!(!source.is_sync_artifact(&key(&["/", "r", "not-a-.tributaries-sync-1"])));
+
+  // A USER file that merely opens with the reserved stem is a user change: the
+  // namespace is reserved, but only its minted grammar is suppressed. Each of
+  // these is a real name a caller could choose, and a bare prefix test would
+  // erase every one of them from the stream with no Rescan and no diagnostic.
+  for user_leaf in [
+    // Prose, not fields.
+    ".tributaries-sync-notes.txt",
+    ".tributaries-sync-",
+    // Too few fields for either minted shape.
+    ".tributaries-sync-7-42",
+    // The right field count, but a nonce that is not sixteen lowercase hex.
+    ".tributaries-sync-7-42-3-DEADBEEFDEADBEEF",
+    ".tributaries-sync-7-42-3-00000000deadbee",
+    ".tributaries-sync-7-42-3-00000000deadbeeff",
+    ".tributaries-sync-7-42-3-zzzzzzzzzzzzzzzz",
+    // Right shape, but a decimal field the minter cannot render.
+    ".tributaries-sync-07-42-3-00000000deadbeef",
+    ".tributaries-sync-7-4294967296-3-00000000deadbeef",
+    ".tributaries-sync--42-3-00000000deadbeef",
+    ".tributaries-sync-7-42-3-4-00000000deadbeef",
+    ".tributaries-sync-07-42-3",
+    // Right shape, and every field well-formed — but an `instance` of 0, which a
+    // `NonZeroU64` brand cannot render and no release ever did. Both of these were
+    // asserted as ARTIFACTS here before the fields carried their minters' floors;
+    // see this cell's disclosed correction.
+    ".tributaries-sync-0-1-0-0000000000000000",
+    ".tributaries-sync-0-1-0",
+    // The cookie directory's stem with a non-numeric qualifier.
+    ".tributaries-sync-cookies-mine",
+  ] {
+    assert!(
+      !source.is_sync_artifact(&key(&["/", "r", user_leaf])),
+      "{user_leaf} is not a minted artifact — suppressing it would erase a user file"
+    );
+  }
+}
+
+/// A leaf whose `instance` field is 0 is a USER file, not a cookie. `Owner::on_sync`
+/// renders that field from `sub.instance().get()`, and an
+/// [`InstanceId`](crate::subscription::InstanceId) is a `NonZeroU64` minted as
+/// `fetch_add(1) + 1`: the first owner in a process brands 1, and 0 is not representable at
+/// all — in today's four-field shape and in the three-field shape the pre-nonce release
+/// minted alike, since both render the field from that same type.
+///
+/// Suppression removes a change from every consumer stream with no `Rescan` and no
+/// diagnostic, so a name no release can mint has to stay a user change:
+/// `.tributaries-sync-0-123-1` is a name a caller may legitimately choose, and accepting it
+/// erased that file from every stream for the life of the watch.
+///
+/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(instance, 0, ..)` — and
+/// both assertions read `true`.
+#[test]
+fn an_instance_field_of_zero_is_a_user_file_not_a_cookie() {
+  for user_leaf in [
+    // The three-field shape, then the same coordinates under today's four-field one.
+    ".tributaries-sync-0-123-1",
+    ".tributaries-sync-0-123-1-00000000deadbeef",
+  ] {
+    assert!(
+      !super::is_cookie_name(user_leaf),
+      "{user_leaf} carries an instance no InstanceId brand can render — suppressing it \
+       erases a user file"
+    );
+  }
+}
+
+/// A leaf whose `pid` field is 0 is a USER file, not a cookie. `Owner::on_sync` renders that
+/// field from `std::process::id()`, and pid 0 is the scheduler on Unix and the System Idle
+/// pseudo-process on Windows — never a process that can execute this code, on any target
+/// this workspace supports, and equally so for the three-field release, which called the
+/// same function.
+///
+/// This is the one field bound whose floor rests on OS semantics rather than on this
+/// workspace's own source, which is why it is the first to drop if that evidence is ever
+/// questioned — see the derivation beside `is_cookie_name`.
+///
+/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(pid, 0, ..)` — and both
+/// assertions read `true`.
+#[test]
+fn a_pid_field_of_zero_is_a_user_file_not_a_cookie() {
+  for user_leaf in [
+    ".tributaries-sync-1-0-1",
+    ".tributaries-sync-1-0-1-00000000deadbeef",
+  ] {
+    assert!(
+      !super::is_cookie_name(user_leaf),
+      "{user_leaf} carries a pid no live process can have — suppressing it erases a user file"
+    );
+  }
+}
+
+/// A leaf whose `seq` field is 0 is a USER file, not a cookie. `Owner::sync_seq` starts at 0
+/// and `on_sync` PRE-increments it before minting the token, so the first sync of every
+/// owner renders 1 and no sync has ever rendered 0 — in today's shape and in the three-field
+/// release, which pre-incremented identically.
+///
+/// The lower crate's `sync_tickets` genuinely does start at 0, but that sequence brands a
+/// [`SyncTicket`](tributary_fs::SyncTicket) — an in-memory cancel address — and never
+/// reaches a file name, so it constrains nothing here.
+///
+/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(seq, 0, ..)` — and both
+/// assertions read `true`.
+#[test]
+fn a_seq_field_of_zero_is_a_user_file_not_a_cookie() {
+  for user_leaf in [
+    ".tributaries-sync-1-123-0",
+    ".tributaries-sync-1-123-0-00000000deadbeef",
+  ] {
+    assert!(
+      !super::is_cookie_name(user_leaf),
+      "{user_leaf} carries a seq the pre-incremented counter never renders — suppressing it \
+       erases a user file"
+    );
+  }
+}
+
+/// The classifier accepts what the minter ACTUALLY produces for an owner's first sync — the
+/// over-tightening guard, covering the failure direction that LEAKS rather than swallows: a
+/// floor narrower than its minter's true minimum republishes a genuine cookie's create (and
+/// its unlink) on every consumer stream as user changes, which is strictly worse than the
+/// over-acceptance the floors exist to close.
+///
+/// Every coordinate here is derived from its own minter rather than chosen: `instance` 1 is
+/// the first `InstanceId::mint` (`fetch_add(1) + 1`); `seq` 1 is `Owner::sync_seq` after the
+/// pre-increment that runs before the mint, so 1 — never 0 — is the first value any cookie
+/// name has carried, in this shape and in the three-field one; the `pid` is this very
+/// process's, so the pid floor is proven against a live pid rather than a constant; and the
+/// `nonce` is 0, a hasher's genuine minimum, which is exactly why that field carries no value
+/// bound at all.
+///
+/// `driver::tests::the_first_sync_an_owner_admits_mints_seq_one` is this cell's other half:
+/// it drives a real `on_sync` and pins the seq the minter hands over, so a release that
+/// changes the counter's discipline fails at that seam instead of leaking silently here.
+///
+/// FAIL-ON-REVERT: tighten the seq floor past its minter — `is_minted_decimal(seq, 2, ..)` —
+/// and the first cookie of every owner stops being recognized.
+#[test]
+fn the_classifier_accepts_the_name_the_first_sync_of_an_owner_mints() {
+  use crate::SyncToken;
+
+  let pid = std::process::id();
+  let minted = super::cookie_name(SyncToken::new(1, pid, 1, 0));
+  assert_eq!(
+    minted,
+    format!(".tributaries-sync-1-{pid}-1-0000000000000000"),
+    "the first sync's rendered name"
+  );
+  assert!(
+    super::is_cookie_name(&minted),
+    "{minted} is the name this binding mints for an owner's first sync — refusing it would \
+     republish a genuine cookie as a user create"
+  );
+  // The same first-sync coordinates under the three-field shape the pre-nonce release
+  // rendered, so a crash leftover from that release is still suppressed after an upgrade.
+  let legacy = format!(".tributaries-sync-1-{pid}-1");
+  assert!(
+    super::is_cookie_name(&legacy),
+    "{legacy} is the first-sync name the three-field release minted"
+  );
+}
+
+/// The cookie leaf that reaches this classifier is NOT always one this crate minted:
+/// [`tributary_fs::Watcher::sync_root`] takes the cookie's name from its own caller and
+/// accepts any normal component, so a second consumer of `tributary-fs` watching the same
+/// tree writes cookies whose names this crate cannot predict at all. What identifies
+/// those is the directory they land in — the fs driver's own `0o700` cookie directory —
+/// so an immediate child of one is an artifact whatever its leaf.
+///
+/// Getting this wrong is worse than the over-broad prefix test it replaced: a leaf
+/// grammar alone republishes another watcher's GENUINE cookie create and unlink as user
+/// changes on every consumer stream, which is precisely the leak the reserved namespace
+/// exists to close.
+///
+/// Fail-on-old: with a leaf-only grammar, every name below except the last is a normal
+/// filename with no reserved shape, so each assertion reads `false` and the cell fails on
+/// its first cookie.
+#[tokio::test]
+async fn a_foreign_watchers_cookie_is_an_artifact_by_the_directory_it_lands_in() {
+  use std::ffi::OsString;
+
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::WatcherOptions;
+
+  use crate::{Source, source::FsSource};
+
+  let source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
+  let key =
+    |parts: &[&str]| -> Vec<OsString> { parts.iter().map(|p| OsString::from(*p)).collect() };
+
+  for cookie_dir in [".tributaries-sync-cookies", ".tributaries-sync-cookies-501"] {
+    for leaf in [
+      // A real lower-layer cookie name from this workspace's own fs-watcher cells.
+      ".tributaries-sync-admission-retry",
+      // A caller that never adopted the reserved stem at all: still a cookie, because
+      // `sync_root` let it choose the name and the directory is the driver's.
+      "barrier-cookie",
+      // The shapes this crate mints are children of that directory too.
+      ".tributaries-sync-7-42-3-00000000deadbeef",
+      ".tributaries-sync-9-999-1",
+    ] {
+      assert!(
+        source.is_sync_artifact(&key(&["/", "r", cookie_dir, leaf])),
+        "{leaf} inside {cookie_dir} is a cookie some watcher wrote, not a user change"
+      );
+    }
+  }
+
+  // Only the IMMEDIATE parent counts. Nothing this driver writes is nested deeper, so a
+  // deeper descendant is read as a user change rather than silently erased.
+  assert!(!source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-cookies-501",
+    "sub",
+    "notes.txt"
+  ])));
+  // A directory whose name only resembles the cookie directory's is not one, so its
+  // children stay user changes.
+  assert!(!source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-cookies-mine",
+    "notes.txt"
+  ])));
+}
+
+/// The parent-directory ground applies **whatever the leaf** — and on Unix a leaf need not be
+/// text at all. A path component is bytes there, so an active cookie can be renamed to an
+/// undecodable name while never leaving the `0o700` directory that reserves it.
+///
+/// The move that does it is the whole point: source = an ASCII cookie this crate minted,
+/// destination = a non-UTF-8 name inside the reserved directory. Both endpoints are the fs
+/// driver's own artifact, so the classification the driver derives from the two
+/// (`Owner::reserved_endpoints`: `(true, true)` → `ReservedEndpoints::All`) is `is_total()` —
+/// the change is settled without routing and nothing about it may reach any subscriber.
+/// Classify only the source and the verdict drops to `ReservedEndpoints::Source`, which masks
+/// the cookie end and DELIVERS the other: the internal destination surfaces on every consumer
+/// stream as a user-visible `Created`, naming a path inside a directory they never wrote to.
+///
+/// FAIL-ON-REVERT: hoist the UTF-8 conversion back above the parent ground in
+/// `FsSource::is_sync_artifact` (`let Some(leaf) = key.last().and_then(OsStr::to_str) else {
+/// return false }`) and the destination assertion below reads `false` — the classifier
+/// answering "user change" for a name it created itself.
+///
+/// Unix-only because it is the byte-oriented path namespace that admits the leaf: Windows
+/// components are UTF-16 and `OsStrExt::from_bytes` does not exist there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_non_utf8_leaf_inside_the_cookie_directory_is_still_an_artifact() {
+  use std::{
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
+  };
+
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::WatcherOptions;
+
+  use crate::{Source, source::FsSource};
+
+  let source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
+
+  // A lone 0xFF byte is not valid UTF-8 in any position, so this name has no `to_str()` —
+  // exactly what a rename can produce and what the reserved directory must still cover.
+  let undecodable = OsString::from(OsStr::from_bytes(b"\xffnot-text\xff"));
+  assert!(
+    undecodable.to_str().is_none(),
+    "the destination leaf must genuinely fail UTF-8 conversion, or this cell proves nothing"
+  );
+
+  let cookie_dir = OsString::from(".tributaries-sync-cookies-501");
+  let root = [OsString::from("/"), OsString::from("r")];
+
+  // The move's SOURCE: an ASCII cookie this crate mints, reserved on the leaf grammar.
+  let mut moved_from = root.to_vec();
+  moved_from.push(cookie_dir.clone());
+  moved_from.push(OsString::from(".tributaries-sync-7-42-3-00000000deadbeef"));
+  // The move's DESTINATION: the same directory, a leaf with no text at all.
+  let mut moved_to = root.to_vec();
+  moved_to.push(cookie_dir);
+  moved_to.push(undecodable);
+
+  // Both endpoints reserved is what `Owner::reserved_endpoints` reads as
+  // `ReservedEndpoints::All`, whose `is_total()` settles the change before any routing runs —
+  // so asserting both here is asserting total suppression. (That mapping and its
+  // suppress-without-routing consequence are the driver's own, and carry their own cells; the
+  // only thing this cell can get wrong, and the thing the defect got wrong, is the
+  // destination's verdict.)
+  assert!(
+    source.is_sync_artifact(&moved_from),
+    "the ASCII cookie endpoint is reserved on the leaf grammar"
+  );
+  assert!(
+    source.is_sync_artifact(&moved_to),
+    "and the undecodable endpoint is reserved on the directory it never left — the parent \
+     ground reads components, not text"
+  );
+
+  // The ground is the IMMEDIATE parent, not the encoding: an undecodable leaf elsewhere is
+  // still a user change, so the fix widens nothing it should not.
+  let mut elsewhere = root.to_vec();
+  elsewhere.push(OsString::from("docs"));
+  elsewhere.push(OsString::from(OsStr::from_bytes(b"\xffnot-text\xff")));
+  assert!(
+    !source.is_sync_artifact(&elsewhere),
+    "an undecodable leaf outside the reserved directory is an ordinary user change"
+  );
 }

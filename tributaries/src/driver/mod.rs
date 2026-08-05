@@ -50,7 +50,7 @@ use crate::{
   event::Event,
   filter::{Filter, FilterInput},
   options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
-  route::RoutableEvent,
+  route::{ReservedEndpoints, RoutableEvent},
   source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
   subscription::Subscription,
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
@@ -582,7 +582,7 @@ where
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
-      observed_handles: std::collections::HashSet::new(),
+      observed_handles: ObservedHandles::new(),
       _rt: PhantomData::<R>,
     };
     (
@@ -1196,15 +1196,19 @@ where
   /// ) — is bounded and never awaits.
   cleanup_rx: async_channel::Receiver<Cleanup>,
   events: async_channel::Sender<Event<C, V>>,
-  /// A **debug-only** exhaustive tripwire for the generation-unique [`Source::Handle`] contract:
-  /// every handle this owner has ever observed from a successful live [`arm`](Self::arm). The arm
-  /// choke point asserts each freshly-armed handle was **never** seen before, catching ANY reuse —
-  /// a still-recorded sibling, or one already removed from the live index by unwatch or terminal
-  /// retirement (the post-retirement reuse the per-site live-index checks missed). It is
-  /// only ever inserted into, never pruned, so a retired-then-reused handle is still caught;
-  /// `#[cfg(debug_assertions)]` so the field, its init, and its assert add zero release-build cost.
+  /// The **debug-only** RETIREMENT half of the generation-unique [`Source::Handle`] tripwire: the
+  /// most recent [`OBSERVED_HANDLE_HISTORY`] handles this owner observed from a successful live
+  /// [`arm`](Self::arm). It exists for the case no live structure can testify to — reuse of a
+  /// handle already removed from the live index by unwatch or terminal retirement, which the old
+  /// per-site live-index checks missed. Reuse of a handle that is STILL live is decided at the
+  /// same choke point against [`subsumer`](Self::subsumer)'s own index instead, exhaustively,
+  /// because observations leave this window by eviction and eviction is keyed on arm history
+  /// rather than on live population. The window is what bounds the debug build's memory by itself
+  /// rather than by the owner's lifetime arm count — see [`OBSERVED_HANDLE_HISTORY`].
+  /// `#[cfg(debug_assertions)]` so the field, its init, and its assert add zero release-build
+  /// cost.
   #[cfg(debug_assertions)]
-  observed_handles: std::collections::HashSet<S::Handle>,
+  observed_handles: ObservedHandles<S::Handle>,
   _rt: PhantomData<R>,
 }
 
@@ -1380,7 +1384,12 @@ enum ReplaceStep<C, H> {
 /// mailboxes get FAIR service, because the biased `select!` alone would let a continuously-ready
 /// command mailbox starve the sync arm forever: at most one queued sync is taken non-blockingly at
 /// the top of each iteration and dispatched inline, against the at-most-one command the `select!`
-/// below dispatches, so the two are served 1:1 under any flood. On a close request, a
+/// below dispatches, so the two are served 1:1 under any flood. Priority decides only who is served
+/// FIRST, never who gets the thread: every arm can complete without an await that returns
+/// `Pending`, so the loop also hands the thread back once per [`EXECUTOR_FAIRNESS_BUDGET`]
+/// iterations — the executor-fairness valve, without which a source that is ready on every poll
+/// runs this task forever and starves the consumer, the timer and `close()`'s own caller on any
+/// current-thread executor. On a close request, a
 /// dropped last handle (the command channel closed), or the source draining (`next` yields `None`), it
 /// breaks, flushes the coalesced tail (no-silent-loss), and tears down — dropping the [`Owner`] (and
 /// its source, whose own `Drop` performs the orderly source teardown). Nothing is owed to `Drop`.
@@ -1394,6 +1403,9 @@ where
   // Command-fairness valve state: consecutive command-arm wins since the data plane
   // was last serviced. See [`COMMAND_FAIRNESS_BUDGET`].
   let mut command_streak: u32 = 0;
+  // Executor-fairness valve state: loop iterations dispatched since this task last handed the
+  // thread back. See [`EXECUTOR_FAIRNESS_BUDGET`].
+  let mut executor_streak: u32 = 0;
   // Whether the dedicated close channel is still open. It closes when every [`Tributaries`] handle is
   // dropped — but that is NOT itself a teardown signal (the command channel closing remains the
   // dropped-handles teardown signal). So on a closed close channel the arm just disables itself
@@ -1500,6 +1512,9 @@ where
         Some(None) => break (None, true),
         None => {}
       }
+      // Stays even though `consume_source_event` now drains on every path out of itself: the
+      // no-event arm above consumed nothing, and that is precisely the case this valve exists for
+      // (a command flood with an idle source), so this is the only drain that arm gets.
       owner.drain_coalescer_due();
     }
 
@@ -1651,6 +1666,53 @@ where
         drain_owed,
       } => break (closing, drain_owed),
     }
+
+    // The EXECUTOR-fairness valve. Nothing above it is required to yield: a
+    // [`Source::next`] that returns `Some` on every poll wins the biased `select!` every
+    // iteration, `consume_source_event` is synchronous throughout, and the iteration closes
+    // without a single await that must return `Pending`. On a multi-threaded executor other
+    // tasks merely run elsewhere; on a **current-thread** one — tokio's `new_current_thread`,
+    // single-threaded smol, both supported — this task then owns the thread forever, and the
+    // subscriber draining the event channel, the `close()` caller, the settle timer and every
+    // unrelated task on that executor never run again. The command-fairness valve above cannot
+    // stand in for this: the source arm zeroes `command_streak`, so under a source flood it
+    // never fires, and even when it does it awaits nothing.
+    //
+    // So after [`EXECUTOR_FAIRNESS_BUDGET`] iterations, hand the thread back once. A source
+    // that is ready on every poll produces exactly one iteration per record, so this bounds
+    // consecutive ready source records by the same number.
+    //
+    // Counted per ITERATION rather than per source record so no arm is left a sibling. The
+    // source arm is the one reachable with no help at all — a conforming source supplies
+    // records forever by itself — but the sync arm is reachable from a caller thread OUTSIDE
+    // this executor: past [`MAX_PENDING_SYNCS`] every request is refused with `Busy` and
+    // `on_sync` then awaits nothing, so another thread enqueueing faster than this loop drains
+    // keeps that arm ready with no yield in it, and the command arm behaves the same way for a
+    // source whose `arm`/`disarm` complete synchronously. The CLEANUP arm is the one that
+    // genuinely cannot: a [`Cleanup`] is minted only by a [`WatchGrant`], each grant sends
+    // exactly one, and the top-of-loop `drain_pending_cleanup` empties the channel every
+    // iteration — its supply is bounded by grants in flight, so it necessarily runs dry.
+    // Counting iterations covers all four with one mechanism and one constant.
+    //
+    // Placed HERE, after the whole iteration has been dispatched, for the ordering: a record's
+    // publication, its settle-clock tick and its barrier resolution all happen inside the one
+    // synchronous `consume_source_event` call, so this await cannot land between them. It
+    // cannot reorder a delivery against a `Rescan` (both are already in the channel or in
+    // `needs_rescan` when it runs) and it cannot split the publish-before-resolve barrier (a
+    // reply that leaves does so from inside the same completed call). What it re-orders is only
+    // what the loop does NEXT, which is exactly the point. It is also below the `Flow::Break`
+    // arms, so a teardown never pays it.
+    //
+    // The counter is reset by the yield ALONE, not by another arm winning (which is where it
+    // differs from `command_streak`). That valve exists to guarantee the data plane is
+    // SERVICED, so servicing it discharges the debt; this one exists to guarantee the executor
+    // gets its thread back, and only actually giving it back discharges that. An interleaved
+    // flood must not be able to clear the streak without a single yield ever happening.
+    executor_streak += 1;
+    if executor_streak >= EXECUTOR_FAIRNESS_BUDGET {
+      executor_streak = 0;
+      R::yield_now().await;
+    }
   };
 
   // Reap every cookie still riding a pending sync: their callers will see the
@@ -1757,6 +1819,40 @@ const RETRY: Duration = Duration::from_millis(25);
 /// data-plane staleness tightly under load, large enough to amortize the extra poll.
 const COMMAND_FAIRNESS_BUDGET: u32 = 32;
 
+/// How many iterations the [`run`] loop dispatches before handing the thread back with one
+/// [`yield_now`](agnostic_lite::RuntimeLite::yield_now) — the executor-fairness valve.
+///
+/// No arm of the loop is obliged to yield. [`Source::next`] may legally return `Some` on every
+/// poll for as long as it has records, and the biased `select!` puts that arm above the settle
+/// timer, so a source with a standing backlog wins every iteration; consuming a record awaits
+/// nothing — `consume_source_event` is synchronous end to end, and a wholly reserved record
+/// does not even reach the channel. On a multi-threaded executor that only monopolizes one
+/// worker; on a **current-thread** executor it monopolizes the whole runtime, and the consumer
+/// draining the event stream, the `close()` caller and every unrelated task stop running for as
+/// long as the source stays ready. A conforming source is enough to cause it — another process
+/// syncing against the same tree produces exactly such a stream — which is why the bound is not
+/// something a `Source` contract clause could be asked to provide instead.
+///
+/// The control-plane arms reach the same state from a caller thread outside this executor: past
+/// [`MAX_PENDING_SYNCS`] a sync request is refused with [`SyncError::Busy`] and nothing is
+/// awaited on the way out, and a command whose `Source` reconciles synchronously is no
+/// different. Counting ITERATIONS rather than source records covers every arm with one
+/// mechanism; it also bounds consecutive ready source records by this same number, since such a
+/// source produces exactly one iteration per record.
+///
+/// What it buys: an upper bound of this many iterations on how long any other task on a
+/// current-thread executor can be kept off the thread by this one, which is what makes
+/// `close()`, the subscriber and the timer reachable at all in that mode.
+///
+/// What it costs: one reschedule per this many iterations. `yield_now` performs no syscall and
+/// wakes immediately, and an idle loop parks in its `select!` rather than iterating, so the
+/// steady-state cost is a fraction of one wakeup per record. Chosen larger than
+/// [`COMMAND_FAIRNESS_BUDGET`] because the two bound different things — that one bounds
+/// staleness (small is better), this one bounds monopolization (large enough to amortize the
+/// reschedule across a burst, small enough that a starved task waits on a bounded, tiny amount
+/// of work).
+const EXECUTOR_FAIRNESS_BUDGET: u32 = 64;
+
 /// The most sync barriers one owner may hold in flight at once.
 ///
 /// The sync mailbox is bounded, and that bound was mistaken for a bound on live
@@ -1781,6 +1877,87 @@ const COMMAND_FAIRNESS_BUDGET: u32 = 32;
 /// mailbox bounds requests waiting to be RECEIVED, this bounds requests already
 /// admitted and not yet finished.
 const MAX_PENDING_SYNCS: usize = 256;
+
+/// How many recently-armed [`Source::Handle`]s the debug-only generation-uniqueness
+/// tripwire remembers ([`ObservedHandles`]) **beyond** what the subsumer's live index
+/// already answers.
+///
+/// An all-time history changes the debug build's resource model from "peak live roots
+/// plus bounded debt" to "every arm since the owner was constructed": a long-running
+/// debug or staging watcher that churns disjoint roots grows without bound even when
+/// every live root and delivery obligation is reclaimed correctly — a soak meant to
+/// expose leaks then contains a growth source of its own.
+///
+/// So the history is a bounded most-recent window, and it is deliberately NOT what
+/// answers the live-alias question: eviction here is keyed on arm history, not on live
+/// population, so a root held live across more than this many intervening arms would
+/// fall out of the window while it is still recorded. That case — the alias that can
+/// overwrite the reverse handle mapping and strand a live root — is answered
+/// exhaustively by the subsumer's own live index, at the arm choke point, whatever this
+/// window holds. What is left for the window is reuse **after** retirement, which no
+/// live structure can testify to; that is caught within this many intervening arms, the
+/// shape a handle-recycling source actually has. Beyond it the retirement check is
+/// silent; it is a debug tripwire for a contract violation, never a correctness
+/// mechanism.
+#[cfg(debug_assertions)]
+const OBSERVED_HANDLE_HISTORY: usize = 4096;
+
+/// The debug-only history behind the generation-unique [`Source::Handle`] tripwire: the
+/// most recent [`OBSERVED_HANDLE_HISTORY`] handles a successful live arm returned, in
+/// arrival order, with membership in O(1).
+///
+/// Bounded by construction — the oldest observation is evicted to make room — so the
+/// debug build's memory stays proportional to the window rather than to the number of
+/// arms the owner has ever performed. That eviction is exactly why the window does not
+/// decide the live-alias case; see [`OBSERVED_HANDLE_HISTORY`].
+#[cfg(debug_assertions)]
+struct ObservedHandles<H> {
+  seen: std::collections::HashSet<H>,
+  order: std::collections::VecDeque<H>,
+}
+
+#[cfg(debug_assertions)]
+impl<H> ObservedHandles<H>
+where
+  H: Copy + Eq + core::hash::Hash,
+{
+  fn new() -> Self {
+    Self {
+      seen: std::collections::HashSet::new(),
+      order: std::collections::VecDeque::new(),
+    }
+  }
+
+  /// Records `handle` as observed, reporting `false` if it is **still in the window** —
+  /// half the tripwire's verdict, the half no live structure could give. Evicting the
+  /// oldest observation keeps the window bounded; eviction is the only way an
+  /// observation ever leaves.
+  fn observe(&mut self, handle: H) -> bool {
+    if !self.seen.insert(handle) {
+      return false;
+    }
+    self.order.push_back(handle);
+    if self.order.len() > OBSERVED_HANDLE_HISTORY
+      && let Some(evicted) = self.order.pop_front()
+    {
+      self.seen.remove(&evicted);
+    }
+    true
+  }
+
+  /// How many observations the window currently holds — never more than
+  /// [`OBSERVED_HANDLE_HISTORY`].
+  ///
+  /// Gated on the SAME condition as `mod tests`, which holds its one consumer. A bare
+  /// `cfg(test)` here is wider than that module, so a `--features default` test build
+  /// (no `tokio`, so no `mod tests`) compiles the method with nothing calling it — and
+  /// under CI's `-Dwarnings` `dead_code` is a hard error, not a lint. Stating the
+  /// consumer's own condition is what keeps the two from drifting apart again.
+  #[cfg(all(test, feature = "tokio"))]
+  fn len(&self) -> usize {
+    self.seen.len()
+  }
+}
 
 /// The earlier of two optional deadlines, treating [`None`] as infinitely far — the sleep
 /// target combining the coalescer's settle deadline with the parked-Rescan retry.
@@ -2215,8 +2392,8 @@ where
         }
         // A fresh arm's handle is generation-unique (see `Source::Handle`), so it is absent from the
         // reverse index and `commit_watch`'s `by_handle` insert cannot clobber a live root's entry.
-        // A contract-violating source is caught by the arm choke point's exhaustive observed-handle
-        // tripwire, which fires on ANY reuse before this commit is ever reached.
+        // A contract-violating source is caught by the arm choke point's handle tripwire, whose
+        // live-index half fires on ANY still-live alias before this commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, SubscriptionFilter::new(filter));
         self.register_debounce(sub, debounce);
@@ -2394,8 +2571,8 @@ where
         // The wider arm's handle is generation-unique (see `Source::Handle`): it aliases none of the
         // still-recorded subsumed roots `commit_watch` is about to drop, nor any other live root, so
         // its `by_handle` insert cannot clobber a live entry. A contract-violating source is caught
-        // by the arm choke point's exhaustive observed-handle tripwire before this
-        // commit is ever reached.
+        // by the arm choke point's handle tripwire — its live-index half covers exactly these
+        // still-recorded roots — before this commit is ever reached.
         self.commit_widen(&outcome, handle, &fs_key, sub, filter, debounce, &repointed);
         Ok(sub)
       }
@@ -2583,11 +2760,12 @@ where
   /// Arm-time + reuse-time + terminal-time liveness together close the
   /// handle-liveness class.
   ///
-  /// Because every arming path funnels through here, this is also where the **exhaustive**
-  /// generation-unique [`Source::Handle`] tripwire lives: a debug-only assert that the
-  /// freshly-armed, live handle was NEVER observed by this owner before. It subsumes the old
-  /// per-site live-index checks AND additionally catches reuse of a handle already removed from the
-  /// live index by unwatch or terminal retirement (see `observed_handles`).
+  /// Because every arming path funnels through here, this is also where the generation-unique
+  /// [`Source::Handle`] tripwire lives: a debug-only assert that the freshly-armed, live handle
+  /// was never observed by this owner before. It reads the subsumer's live index — **exhaustively**
+  /// subsuming the old per-site live-index checks, with no window a still-live root can age out of
+  /// — AND a bounded history of recent arms, which additionally catches reuse of a handle already
+  /// removed from that index by unwatch or terminal retirement (see `observed_handles`).
   ///
   /// An overlap rejection (the fs binding's `Overlaps`) from a conforming source is now
   /// **unreachable**, so there is no overlap-retry here. [`Source::disarm`]'s
@@ -2686,21 +2864,37 @@ where
       self.source.disarm(handle);
       return Err(WatchError::DeadOnArrival.into());
     }
-    // The single exhaustive tripwire for the generation-unique `Source::Handle` contract (
-    // ): a freshly-armed, live handle must NEVER have been observed by this owner before. This
-    // one choke-point check subsumes the old per-site live-index `entry(handle).is_none()` asserts
-    // (Disjoint/Widen commit, restore rebind) AND additionally catches reuse of a handle already
-    // removed from the live index by unwatch or terminal retirement — which those per-site checks
-    // missed, because a stale event still carrying it could then route through the re-armed root.
-    // `HashSet::insert` returns `false` on any prior value, and the set is only added to (never
-    // pruned), so a retired-then-reused handle still trips. Debug-only: the field, this assert, and
-    // its cost all vanish in release builds.
+    // The single tripwire for the generation-unique `Source::Handle` contract: a freshly-armed,
+    // live handle must be one this owner has never seen. It reads TWO structures, because each
+    // answers a case the other cannot.
+    //
+    // The subsumer's live index is EXHAUSTIVE and is what covers the case that matters most: a
+    // handle still naming a live root. That is the alias `commit_watch` / `rebind_root` would let
+    // overwrite the reverse handle mapping, stranding the original root and misrouting its events
+    // into the new one. It subsumes the old per-site `entry(handle).is_none()` asserts
+    // (Disjoint/Widen commit, restore rebind) with no window to fall out of — a root may stay live
+    // across arbitrarily many arms of other roots, so a bounded most-recent history CANNOT decide
+    // this and must not be asked to.
+    //
+    // The bounded observed-handle window covers what no live structure remembers: a handle already
+    // removed from the live index by unwatch or terminal retirement, whose reuse is equally a
+    // violation because a stale event still carrying it would route through the re-armed root.
+    // `observe` reports `false` while the handle is still in the window
+    // (`OBSERVED_HANDLE_HISTORY` states the bound and what it costs).
+    //
+    // Both are evaluated before the assert so the window records this arm either way.
+    // Debug-only: the field, this assert, and its cost all vanish in release builds.
     #[cfg(debug_assertions)]
-    debug_assert!(
-      self.observed_handles.insert(handle),
-      "Source::arm returned a handle already observed by this owner (a reused handle, even after \
-       retirement) — a generation-unique Source::Handle contract violation; see Source::Handle"
-    );
+    {
+      let aliases_a_live_root = self.subsumer.entry(handle).is_some();
+      let unseen_recently = self.observed_handles.observe(handle);
+      debug_assert!(
+        !aliases_a_live_root && unseen_recently,
+        "Source::arm returned a handle already observed by this owner (a reused handle, even \
+         after retirement) — a generation-unique Source::Handle contract violation; see \
+         Source::Handle"
+      );
+    }
     Ok((handle, armed.canonical_key().to_vec()))
   }
 
@@ -2859,9 +3053,9 @@ where
   ///   **generation-unique** handle by contract (see [`Source::Handle`]), so it can alias neither
   ///   `old` nor a not-yet-restored sibling still recorded here; the earlier defensive
   ///   alias-detection is gone (it was incomplete, and disarming an aliased handle
-  ///   stranded an *unrelated live* root), replaced by the arm choke point's exhaustive
-  ///   observed-handle `debug_assert` tripwire that fires loudly on a contract-violating
-  ///   source without corrupting release builds.
+  ///   stranded an *unrelated live* root), replaced by the arm choke point's `debug_assert`
+  ///   tripwire — whose live-index half covers every still-recorded root exhaustively — which
+  ///   fires loudly on a contract-violating source without corrupting release builds.
   /// - if the re-arm **fails** (the root is genuinely dead) or its committed key **diverged** (a
   ///   canonicalization race we cannot cleanly rebind), **retire** the root through the shared
   ///   [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan): a durable
@@ -2903,8 +3097,8 @@ where
           // re-armed root and be stamped in the new generation past the restore Rescan — so `old`
           // must fall to the dead-root drain path, and reusing `old` is NOT exempt. Any reuse —
           // a sibling, `old`, or a handle already removed from the live index by a prior retirement —
-          // is caught by the arm choke point's exhaustive observed-handle tripwire
-          // before this rebind is ever reached.
+          // is caught by the arm choke point's handle tripwire (the live index for the first two,
+          // the observed-handle window for the third) before this rebind is ever reached.
           //
           // Re-armed at the same coordinate with a fresh handle: rebind onto it and re-point each
           // subscriber (raw epochs restarted at zero) with a dominating Rescan.
@@ -3084,11 +3278,33 @@ where
   /// [`widen_parked_debt`](Self::widen_parked_debt) grows the `Rescan` to cover it —
   /// the same treatment every other event suppressed behind standing debt gets, and no
   /// silent loss, because the `Rescan` re-enumerates exactly what was suppressed.
-  fn fan_out_and_push(&mut self, raw: &SourceEvent<C, S::Handle>) {
-    let (fanned, poisoned) = self.fan_out_raw(raw);
+  ///
+  /// # The reserved namespace is masked here, at the one delivery seam
+  ///
+  /// This is where a change is classified against the source's sync-artifact namespace
+  /// ([`reserved_endpoints`](Self::reserved_endpoints)) and where that classification is
+  /// enforced, because this is the ONE place a raw change becomes deliveries: a cookie
+  /// (ours, another instance's, or a crashed process's leftover — and the unlink events of
+  /// all of them) can then reach no consumer by construction rather than by every caller
+  /// remembering to check. A change reserved at **every** endpoint it has returns here
+  /// before any routing at all — never fanned out, never coalesced, never delivered, and
+  /// never admitted to the coalescer whose drain would otherwise tick on it. One reserved
+  /// endpoint of a rename is instead masked out of coverage inside the fan-out, which
+  /// delivers the move's *other*, user endpoint to the subscribers watching it.
+  ///
+  /// The classification is RETURNED because it decides one thing this seam cannot: whether
+  /// a pending sync barrier may resolve on this change. The caller resolves it strictly
+  /// after this call, never before — see
+  /// [`consume_source_event`](Self::consume_source_event).
+  fn fan_out_and_push(&mut self, raw: &SourceEvent<C, S::Handle>) -> ReservedEndpoints {
+    let reserved = self.reserved_endpoints(raw);
+    if reserved.is_total() {
+      return reserved;
+    }
+    let (fanned, poisoned) = self.fan_out_raw(raw, reserved);
     if poisoned.is_empty() {
       self.push_all(fanned);
-      return;
+      return reserved;
     }
     self.quarantine_filters(&poisoned);
     let (behind_new_debt, rest): (Vec<_>, Vec<_>) = fanned
@@ -3098,6 +3314,54 @@ where
       self.try_emit(event);
     }
     self.push_all(rest);
+    reserved
+  }
+
+  /// Classifies both of `raw`'s endpoints against the source's reserved sync namespace
+  /// ([`Source::is_sync_artifact`]) — the ONE classification each change gets, whose result
+  /// then decides suppression, coverage masking and barrier resolution alike.
+  ///
+  /// # Why per endpoint, and not per event
+  ///
+  /// A rename has TWO endpoints and [`SourceEvent::key`] is only its destination, so a
+  /// single-key test answers the wrong question for exactly the change that matters: a user
+  /// file renamed INTO the reserved namespace matches on its destination while its source is
+  /// an ordinary path subscribers are watching. Discarding the whole change there deletes
+  /// that removal from every one of their streams — with no `Rescan` owed for it, so nothing
+  /// ever tells those consumers their picture of that name went stale. Classifying each
+  /// endpoint on its own lets the fan-out mask the reserved end and still deliver the user
+  /// end (see [`fan_out_and_push`](Self::fan_out_and_push)).
+  ///
+  /// # Cost
+  ///
+  /// One call for a single-endpoint change — the shape of nearly every event — because
+  /// [`move_from`](SourceEvent::move_from) is `None` and short-circuits the second. A move
+  /// costs two, which is the minimum: neither endpoint's answer implies the other's, and
+  /// both are needed to tell a wholly-reserved change from a half-reserved one.
+  ///
+  /// A [`Rescan`](crate::EventKind::Rescan) is never classified. It names no object — it is
+  /// the statement that coverage below a key became uncertain — so it has no endpoint to
+  /// reserve, and masking one would hide a coverage loss behind the very namespace whose
+  /// events it may have eaten.
+  fn reserved_endpoints(&self, raw: &SourceEvent<C, S::Handle>) -> ReservedEndpoints {
+    if raw.kind().is_rescan() {
+      return ReservedEndpoints::None;
+    }
+    let destination = self.source.is_sync_artifact(raw.key());
+    let Some(from) = raw.move_from() else {
+      // One endpoint, so its verdict is the whole change's.
+      return if destination {
+        ReservedEndpoints::All
+      } else {
+        ReservedEndpoints::None
+      };
+    };
+    match (self.source.is_sync_artifact(from), destination) {
+      (true, true) => ReservedEndpoints::All,
+      (true, false) => ReservedEndpoints::Source,
+      (false, true) => ReservedEndpoints::Destination,
+      (false, false) => ReservedEndpoints::None,
+    }
   }
 
   /// The single event-emit funnel (design backpressure doc): the owner **never awaits** the
@@ -3481,7 +3745,11 @@ where
   /// A [`Moved`](crate::EventKind::Moved) is decomposed per subscriber inside
   /// [`fan_out`](crate::route::fan_out) (both endpoints → the whole move; source only → a
   /// synthesized `Removed`; destination only → a synthesized `Created`), and the filter +
-  /// interest gate below runs against that already-projected delivery.
+  /// interest gate below runs against that already-projected delivery. `reserved` — this
+  /// change's [`Source`] namespace classification, decided once by the caller
+  /// ([`reserved_endpoints`](Self::reserved_endpoints)) — masks a reserved endpoint out of
+  /// every subscriber's coverage, so the same decomposition projects the *user* endpoint of
+  /// a rename that touches the reserved namespace at one end.
   ///
   /// Returns the stamped deliveries **and** the subscriptions whose filter predicate
   /// unwound while producing them. The caller applies the quarantine and decides where
@@ -3490,6 +3758,7 @@ where
   fn fan_out_raw(
     &mut self,
     raw: &SourceEvent<C, S::Handle>,
+    reserved: ReservedEndpoints,
   ) -> (Vec<Event<C, V>>, Vec<Subscription>) {
     // Disjoint field borrows: `subsumer` resolves the root/coverage/interest, `filters`
     // the per-subscription filter, `epochs` owns the per-subscription stamp state.
@@ -3501,7 +3770,7 @@ where
     // (`RoutableEvent::captured_root_depth`), not on the root the handle resolves to
     // here: an in-place widen keeps the handle — and its queue — so a change captured
     // under the older, deeper root is still drained on this path afterwards.
-    let routable = SourceRoutable::<C, V, S::Handle>::new(raw);
+    let routable = SourceRoutable::<C, V, S::Handle>::new(raw, reserved);
     // Subscriptions whose filter predicate UNWOUND during this fan-out. The gate
     // below borrows `filters` immutably, so the quarantine is applied by the caller,
     // after the fan-out returns (see [`quarantine_filters`](Self::quarantine_filters)).
@@ -3701,41 +3970,81 @@ where
   /// the command-fairness valve's forced poll: dead-root retirement, retained-cover
   /// degradation on a live-root `Rescan`, then fan-out, in that one order. A coverage-loss
   /// signal can never reach subscribers with the stale claim left standing on either path.
+  ///
+  /// # Consuming a record always ticks the settle clock
+  ///
+  /// Every path out of this funnel drains the coalescer's DUE output
+  /// ([`drain_coalescer_due`](Self::drain_coalescer_due)), because consuming a record is the one
+  /// thing the run loop does that costs the timer arm its turn. The `select!` is biased with
+  /// `source.next()` **above** the settle timer, so a source that is ready on every poll wins every
+  /// iteration and the timer never fires; the source arm also resets `command_streak`, so the
+  /// command-fairness valve's own due-drain never fires either. A record whose handling returns
+  /// before [`push_all`](Self::push_all) — the sole normal-path `drain_ready` caller — therefore
+  /// buys the loop nothing and holds a debounced user change past its
+  /// [`max_hold`](crate::DebounceConfig::max_hold) for as long as the flood lasts. Two such paths
+  /// exist and both are covered here: a dead-root record (retired above, fanned out never) and a
+  /// **totally reserved** change (returned before routing inside `fan_out_and_push`). Since a
+  /// reserved change is exactly what another `Watcher`'s sync loop emits at whatever rate it syncs,
+  /// the flood is reachable from outside this process.
+  ///
+  /// Draining is not admitting: this releases entries the coalescer ALREADY holds and whose
+  /// deadline has passed. The reserved record itself never enters the coalescer — the suppression in
+  /// `fan_out_and_push` still returns ahead of every route, so nothing about which events are
+  /// deliverable changes, only when the deliverable ones are handed over.
   fn consume_source_event(&mut self, event: &SourceEvent<C, S::Handle>) {
-    if !self.retire_if_dead(event) {
-      // A cookie (ours, another instance's, or a crashed process's leftover —
-      // and the unlink events of all of them) is CONSUMED here: never fanned
-      // out, never coalesced, never delivered. Suppression is namespace-total,
-      // so it can never depend on the pending map. A `Rescan` is never a
-      // cookie (checked first), because it is coverage information and is
-      // structurally unmaskable.
-      if !event.kind().is_rescan() && self.source.is_sync_artifact(event.key()) {
-        self.resolve_matching_pending_sync(event);
-        return;
-      }
-      // A make-before-break `replace` commits an epoch-bumped full-root `Rescan` on the PRESERVED
-      // handle for each leg, so a diverging-then-rolled-back widen leaves a stale `Rescan` whose key
-      // names the transient divergent root the handle no longer watches. `retire_if_dead` saw the
-      // handle LIVE (rolled back to its current root), so this reaches here as a live-root `Rescan`;
-      // fanning or parking it at its stale, DISJOINT key would merge into the rollback's parked debt
-      // and widen the owed re-enumeration to their common ancestor (up to `/`). The handle's CURRENT
-      // `root_key` is authoritative: clamp such a disjoint live-root `Rescan` to it (a current-root
-      // `Rescan` correctly and safely dominates everything under the live root), so BOTH the fan-out
-      // and the domination below use the safe current-root key.
-      let clamped = self.clamp_disjoint_live_root_rescan(event);
-      let event = clamped.as_ref().unwrap_or(event);
-      self.degrade_retained_cover_on_rescan(event);
-      self.fan_out_and_push(event);
-      // A `Rescan` can DOMINATE a pending cookie — a loss that ate the
-      // cookie's own event elects a covering signal at that position, and
-      // re-enumeration meets the barrier just as delivery would. It is
-      // resolved ONLY NOW, strictly AFTER `fan_out_and_push` has published or
-      // durably parked the `Rescan`: a barrier that resolved first would let
-      // a caller waking on another thread drain past a `Rescan` that is not
-      // yet in the channel or `needs_rescan` — the prohibited half-barrier.
-      if event.kind().is_rescan() {
-        self.dominate_pending_syncs(event);
-      }
+    if self.retire_if_dead(event) {
+      // The dead-root record was consumed whole: its subscribers' coverage loss is owed as the
+      // parked terminal `Rescan` and their buffered deltas were dropped with them. Every OTHER
+      // subscription's settle clock still ran, so release what came due — the drain is what a
+      // repeated terminal event on an already-retired handle (retirement is idempotent, so it
+      // does no further work) would otherwise consume the loop's iteration without.
+      self.drain_coalescer_due();
+      return;
+    }
+    // A make-before-break `replace` commits an epoch-bumped full-root `Rescan` on the PRESERVED
+    // handle for each leg, so a diverging-then-rolled-back widen leaves a stale `Rescan` whose key
+    // names the transient divergent root the handle no longer watches. `retire_if_dead` saw the
+    // handle LIVE (rolled back to its current root), so this reaches here as a live-root `Rescan`;
+    // fanning or parking it at its stale, DISJOINT key would merge into the rollback's parked debt
+    // and widen the owed re-enumeration to their common ancestor (up to `/`). The handle's CURRENT
+    // `root_key` is authoritative: clamp such a disjoint live-root `Rescan` to it (a current-root
+    // `Rescan` correctly and safely dominates everything under the live root), so BOTH the fan-out
+    // and the domination below use the safe current-root key.
+    let clamped = self.clamp_disjoint_live_root_rescan(event);
+    let event = clamped.as_ref().unwrap_or(event);
+    self.degrade_retained_cover_on_rescan(event);
+    // Every reserved-namespace change is consumed inside this call — wholly, or down to
+    // the user endpoint of a rename that touched the namespace at one end — and the
+    // classification comes back so a pending barrier can be resolved on it below.
+    let reserved = self.fan_out_and_push(event);
+    // The settle-clock tick this record owes, placed BETWEEN publication and barrier resolution so
+    // it can only strengthen the ordering below: a totally-reserved change returns from
+    // `fan_out_and_push` before `push_all`, which is the only normal-path `drain_ready`, so without
+    // this a flood of them holds every subscription's due output for as long as it lasts. Running it
+    // AHEAD of the two resolution arms means everything published in this iteration is published
+    // before any barrier reply leaves — never after, which is the direction the half-barrier
+    // prohibition names.
+    self.drain_coalescer_due();
+    // A `Rescan` can DOMINATE a pending cookie — a loss that ate the
+    // cookie's own event elects a covering signal at that position, and
+    // re-enumeration meets the barrier just as delivery would. It is
+    // resolved ONLY NOW, strictly AFTER `fan_out_and_push` has published or
+    // durably parked the `Rescan`: a barrier that resolved first would let
+    // a caller waking on another thread drain past a `Rescan` that is not
+    // yet in the channel or `needs_rescan` — the prohibited half-barrier.
+    if event.kind().is_rescan() {
+      self.dominate_pending_syncs(event);
+    } else if reserved.any() {
+      // The cookie's own event, however it arrived: created in place, unlinked, RENAMED
+      // INTO the reserved namespace, or renamed OUT of it — each is a cookie observation on
+      // the same terms as any other, so the classification travels with the event and the
+      // resolver matches the pending key against every endpoint it names as reserved.
+      // Resolved under the identical discipline the `Rescan` above obeys — strictly after
+      // this change's own publication, so a caller waking on another thread cannot drain
+      // past a delivery this barrier's resolution implies it will find. A `Rescan` is never
+      // classified, so the two arms are disjoint by construction rather than by ordering
+      // luck.
+      self.resolve_matching_pending_sync(event, reserved);
     }
   }
 
@@ -3973,35 +4282,77 @@ where
   /// owes a `Rescan` instead (an earlier loss, or a delta shed to a parked
   /// `Rescan` by a full channel during the flush): the caller must re-read,
   /// not replay, so telling it `Delivered` would risk stale state.
-  fn resolve_matching_pending_sync(&mut self, event: &SourceEvent<C, S::Handle>) {
-    let Some(idx) = self
-      .pending_syncs
-      .iter()
-      .position(|pending| pending.cookie_key.as_slice() == event.key())
-    else {
-      return;
-    };
-    let pending = self.pending_syncs.swap_remove(idx);
-    // A loss touched the sub DURING the barrier (serial advanced) — even if its parked Rescan has
-    // since been published and cleared — OR debt already stood at install (a pre-call loss the cookie
-    // cannot un-owe): either way re-enumeration stands in for delivery.
-    let lost_during_window =
-      self.loss_serial.get(&pending.sub).copied().unwrap_or(0) != pending.loss_serial_at_install;
-    let dominated_at_install = pending.dominated_at_install;
-    // Reap the cookie BEFORE the flush. Its observation already happened (its own event is what
-    // matched here), and `flush_subscription_now` can UNWIND — it runs `R::now` and clones/orders
-    // caller key/value types in the coalescer. Reaping first keeps a flush panic from leaking the
-    // marker: once swap-removed, this entry is out of `pending_syncs`, so `Owner::drop` (which reaps
-    // only entries still in the vector) would never reap it. The outcome still uses the flush result.
-    self.reap_cookie(pending.root, &pending.cookie_key);
-    let clean =
-      self.flush_subscription_now(pending.sub) && !lost_during_window && !dominated_at_install;
-    let outcome = if clean {
-      SyncOutcome::Delivered
-    } else {
-      SyncOutcome::Dominated
-    };
-    let _ = pending.reply.send(Ok(outcome));
+  ///
+  /// # The cookie is whichever endpoint the classification reserved
+  ///
+  /// `reserved` is this change's own [`ReservedEndpoints`] verdict, computed once at the
+  /// [`Source`] seam ([`reserved_endpoints`](Self::reserved_endpoints)) and threaded here rather
+  /// than re-derived, and the pending key is matched against **every** endpoint it names.
+  /// [`SourceEvent::key`] is a move's DESTINATION, so matching it alone answers only half the
+  /// question: a cookie renamed OUT of the reserved namespace
+  /// ([`Source`](ReservedEndpoints::Source)) is the move's `move_from`, and a rename BETWEEN two
+  /// reserved names ([`All`](ReservedEndpoints::All)) can carry the pending cookie at either
+  /// end. Observing the cookie as a move's source endpoint is proof the queue reached it on
+  /// exactly the same terms as observing it as a destination — the owner saw the ordered
+  /// post-cookie state — so a key-only match left those barriers unresolved until their caller's
+  /// own timeout fired, over a source that had done nothing wrong.
+  ///
+  /// The two arms cannot both fire for one pending entry: a move whose two endpoints are the
+  /// same key is not a move, so at most one of them names any given cookie.
+  ///
+  /// # Every matching barrier resolves, not just the first
+  ///
+  /// Two completed sync writes coexist routinely (a `RootHandle` is `Copy`, and one
+  /// subscription may hold several barriers), and ONE [`All`](ReservedEndpoints::All) move can
+  /// name both of their cookies — cookie `K1` renamed onto cookie `K2`. That single observation
+  /// is ordered after both writes and therefore proves both barriers, so both must be answered
+  /// here: overwriting `K2` need not produce any further record of it, and a barrier left
+  /// behind would wait out its caller's deadline over a source that did nothing wrong. The scan
+  /// therefore drains every match, and each one keeps the reap → flush → outcome ordering
+  /// below in full.
+  ///
+  /// [`swap_remove`](Vec::swap_remove) reorders the tail, so the cursor deliberately does NOT
+  /// advance on a removal: the entry moved down into the vacated slot is examined on the next
+  /// turn instead of being skipped. Same idiom as
+  /// [`dominate_pending_syncs`](Self::dominate_pending_syncs).
+  fn resolve_matching_pending_sync(
+    &mut self,
+    event: &SourceEvent<C, S::Handle>,
+    reserved: ReservedEndpoints,
+  ) {
+    let move_from = event.move_from();
+    let key = event.key();
+    let mut i = 0;
+    while i < self.pending_syncs.len() {
+      let cookie = self.pending_syncs[i].cookie_key.as_slice();
+      let matched = (reserved.masks_destination() && cookie == key)
+        || (reserved.masks_source() && move_from.is_some_and(|from| cookie == from));
+      if !matched {
+        i += 1;
+        continue;
+      }
+      let pending = self.pending_syncs.swap_remove(i);
+      // A loss touched the sub DURING the barrier (serial advanced) — even if its parked Rescan has
+      // since been published and cleared — OR debt already stood at install (a pre-call loss the cookie
+      // cannot un-owe): either way re-enumeration stands in for delivery.
+      let lost_during_window =
+        self.loss_serial.get(&pending.sub).copied().unwrap_or(0) != pending.loss_serial_at_install;
+      let dominated_at_install = pending.dominated_at_install;
+      // Reap the cookie BEFORE the flush. Its observation already happened (its own event is what
+      // matched here), and `flush_subscription_now` can UNWIND — it runs `R::now` and clones/orders
+      // caller key/value types in the coalescer. Reaping first keeps a flush panic from leaking the
+      // marker: once swap-removed, this entry is out of `pending_syncs`, so `Owner::drop` (which reaps
+      // only entries still in the vector) would never reap it. The outcome still uses the flush result.
+      self.reap_cookie(pending.root, &pending.cookie_key);
+      let clean =
+        self.flush_subscription_now(pending.sub) && !lost_during_window && !dominated_at_install;
+      let outcome = if clean {
+        SyncOutcome::Delivered
+      } else {
+        SyncOutcome::Dominated
+      };
+      let _ = pending.reply.send(Ok(outcome));
+    }
   }
 
   /// A live-root `Rescan` at or above a pending cookie's key stands in for it:
@@ -4563,16 +4914,26 @@ fn widen_to_cover<C: PartialEq>(parked: &mut Vec<C>, key: &[C]) {
 /// per-subscriber delivery as a flat owned [`Event`]. The router thus stays key-generic
 /// and I/O-free while the source-specific key extraction already happened at the
 /// [`Source`] binding.
-struct SourceRoutable<'a, C, V, H> {
+///
+/// Crate-visible so a binding's own tests can route a real converted event through the REAL
+/// router rather than restating its rebase arithmetic in a fixture — a second copy of that
+/// arithmetic in a test proves only that the copy agrees with itself.
+pub(crate) struct SourceRoutable<'a, C, V, H> {
   event: &'a SourceEvent<C, H>,
+  /// This change's reserved-namespace classification, decided ONCE at the
+  /// [`Source`] seam ([`Owner::reserved_endpoints`]) and carried here. The router
+  /// re-reads it per event, never per subscriber, and cannot recompute it — the
+  /// namespace belongs to the source, not to the key space.
+  reserved: ReservedEndpoints,
   _value: PhantomData<V>,
 }
 
 impl<'a, C, V, H> SourceRoutable<'a, C, V, H> {
   #[inline]
-  fn new(event: &'a SourceEvent<C, H>) -> Self {
+  pub(crate) fn new(event: &'a SourceEvent<C, H>, reserved: ReservedEndpoints) -> Self {
     Self {
       event,
+      reserved,
       _value: PhantomData,
     }
   }
@@ -4597,6 +4958,11 @@ where
   #[inline]
   fn is_rescan(&self) -> bool {
     self.event.is_rescan()
+  }
+
+  #[inline]
+  fn reserved(&self) -> ReservedEndpoints {
+    self.reserved
   }
 
   #[inline]

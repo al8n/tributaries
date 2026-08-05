@@ -34,6 +34,7 @@ impl Event {
       ChangeKind::Removed => EventKind::Removed,
       ChangeKind::Moved(from) => EventKind::Moved(MovedEvent {
         from: absolute(root_path, from),
+        location: from.clone(),
       }),
       ChangeKind::Rescan => EventKind::Rescan,
       // The proto vocabulary is non-exhaustive; an unknown future kind is
@@ -49,6 +50,51 @@ impl Event {
       epoch: change.epoch(),
       id: change.id(),
     }
+  }
+
+  /// Assembles a consumer event exactly as [`Watcher`](crate::Watcher)'s own delivery path
+  /// does — `Event::from_change` under a [`RootHandle`] the caller **already holds**.
+  ///
+  /// **Internal, not public API,** and gated so it says so in the type system rather than only
+  /// in prose: it exists under `cfg(test)` or the crate's internal `_integration` feature, the
+  /// same gate the crate's other test-only exports carry, so an ordinary dependent's build of
+  /// this crate does not compile it at all and it is not part of the semver surface they can
+  /// reach. `#[doc(hidden)]` additionally keeps it out of rustdoc. It exists because
+  /// the `tributaries` umbrella binds this vocabulary to its own (`SourceEvent::from_fs`) and
+  /// that binding had no cell of its own: an `Event` is minted only by a live watcher draining
+  /// a real kernel stream, so every test of the binding was forced to hand-build the *output*
+  /// and assert against itself, leaving the conversion — including which of a rename's two
+  /// locations reaches the umbrella — unwitnessed. A cross-crate seam that mints a REAL
+  /// lower-layer event from a real [`Change`] is what lets that conversion be tested as the
+  /// conversion it is.
+  ///
+  /// # Why it takes the handle instead of an instance
+  ///
+  /// A [`RootHandle`] is a **capability**, not a name: this crate's mutators trust the
+  /// instance/scope pair one carries, and [`root`](Self::root) hands the pair back out of any
+  /// `Event`. A seam taking a caller-chosen instance plus the change's own scope would
+  /// therefore MINT authority — instances and scopes are drawn from short predictable
+  /// sequences and [`root_path`](crate::Watcher::root_path) confirms a guess, so a caller
+  /// holding a [`Watcher`](crate::Watcher) but not some root's handle could forge one and
+  /// silently drop that root's coverage. Taking the handle removes the choice: the seam can
+  /// only RE-EXPRESS a capability [`watch`](crate::Watcher::watch) already issued to this
+  /// caller, never manufacture one for a root it cannot already address. `change`'s own
+  /// [`scope`](Change::scope) is deliberately ignored — `root` alone says which root the
+  /// resulting event belongs to, exactly as in the delivery path.
+  ///
+  /// # Why the gate is `any(test, feature = "_integration")` rather than `test` alone
+  ///
+  /// `cfg(test)` does not apply to a crate compiled as a *dependency*, which is exactly how the
+  /// umbrella's unit tests see this one — so `cfg(test)` alone would hide the seam from its only
+  /// consumer. The `_integration` feature is the crate's existing internal escape hatch for
+  /// precisely that (see its `[features]` note); the umbrella turns it on through its own
+  /// **dev-dependency** on this crate, so the feature reaches this compilation only when the
+  /// umbrella is building tests and never when it is building a library for a dependent.
+  /// `not(miri)` matches the consumer cell, which needs a real kernel backend miri cannot drive.
+  #[cfg(all(not(miri), any(test, feature = "_integration")))]
+  #[doc(hidden)]
+  pub fn from_change_under_root(root: RootHandle, root_path: &Path, change: &Change) -> Self {
+    Self::from_change(root, root_path, change)
   }
 
   /// The watched root this event belongs to.
@@ -112,6 +158,7 @@ impl Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MovedEvent {
   from: PathBuf,
+  location: Location,
 }
 
 impl MovedEvent {
@@ -119,6 +166,20 @@ impl MovedEvent {
   #[inline]
   pub fn from(&self) -> &Path {
     self.from.as_path()
+  }
+
+  /// The source endpoint's location relative to the watched root — the second
+  /// coordinate of the rename, measured against the same root as
+  /// [`Event::location`].
+  ///
+  /// A rename is reported as [`Moved`](EventKind::Moved) only when **both**
+  /// endpoints lie under the watched root (a move across the boundary degrades
+  /// to a [`Created`](EventKind::Created) or [`Removed`](EventKind::Removed)),
+  /// so this is always a real location under that root rather than a
+  /// placeholder.
+  #[inline]
+  pub const fn location(&self) -> &Location {
+    &self.location
   }
 }
 

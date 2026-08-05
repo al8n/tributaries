@@ -405,24 +405,52 @@ impl LedgerInner {
   }
 }
 
-/// The reserved-namespace stem of the cookie directory. The umbrella suppresses
-/// every event whose LEAF component starts with this same stem, so the directory's
-/// own create and the cookies inside it are both invisible to consumers — which is
-/// required, since the directory is this driver's artifact and not a user change.
-///
-/// Only a platform that HAS an anchor primitive ever names a cookie directory (see
-/// [`CookieDir`]); where none exists the stem is inert rather than unused, so the
-/// lint is turned off exactly there and stays live everywhere it can still catch
-/// something.
-#[cfg_attr(
-  not(any(
-    target_os = "linux",
-    target_os = "macos",
-    all(target_os = "windows", not(miri))
-  )),
-  allow(dead_code)
-)]
+/// The reserved-namespace stem of the cookie directory. A consumer of this crate
+/// suppresses the directory's own create and the cookies inside it, since both are
+/// this driver's artifacts and not user changes; [`is_sync_cookie_dir_name`] is the
+/// classifier that decides which leaves those are.
 const COOKIE_DIR_PREFIX: &str = ".tributaries-sync-cookies";
+
+/// Whether `name` is the leaf of a cookie directory **this crate creates** —
+/// `.tributaries-sync-cookies`, optionally suffixed with the creating user's effective
+/// uid.
+///
+/// The uid suffix is matched for ANY uid, not just the caller's: two users may
+/// legitimately watch one tree, and neither one's cookie directory is a user change on
+/// the other's stream. It is matched only in the shape this crate can actually render —
+/// canonical decimal, inside the uid space — so a user directory that merely begins with
+/// the stem stays a user directory, together with everything a consumer reports inside
+/// it.
+///
+/// Exported because the layer that decides what reaches a consumer sits above this one,
+/// while the name is minted here — a caller-side prefix test would suppress every
+/// user leaf sharing the stem, and would drift the moment this crate changes the shape.
+#[must_use]
+pub fn is_sync_cookie_dir_name(name: &str) -> bool {
+  match name.strip_prefix(COOKIE_DIR_PREFIX) {
+    // The bare stem: the name on a platform with no uid to qualify it.
+    Some("") => true,
+    // `-<euid>`, exactly as `format!` renders a `uid_t`.
+    Some(suffix) => suffix.strip_prefix('-').is_some_and(is_minted_uid),
+    None => false,
+  }
+}
+
+/// Whether `field` is exactly what `format!("{euid}")` renders for some `libc::uid_t`:
+/// decimal digits, no sign, no redundant leading zero (`0` itself is the one-digit case),
+/// and inside the 32-bit uid space every platform that opens a cookie directory uses.
+///
+/// A suffix outside that is one [`cookie_dir_name`] could never have produced, so the
+/// directory wearing it was created by somebody else. Admitting it would classify a user
+/// directory — and, for a consumer that suppresses what lands inside the cookie
+/// directory, everything reported within it — as this driver's artifact, and silently.
+fn is_minted_uid(field: &str) -> bool {
+  field.bytes().all(|b| b.is_ascii_digit())
+    && (field.len() == 1 || !field.starts_with('0'))
+    // `parse` is what rejects the empty suffix and the overflowing one; the digit test
+    // above is what rejects the leading sign `from_str` would otherwise accept.
+    && field.parse::<u32>().is_ok()
+}
 
 /// The directory a cookie is created inside, held OPEN for as long as any cookie
 /// created through it is outstanding.

@@ -10709,6 +10709,57 @@ mod replace {
 mod sync_cookie {
   use super::*;
 
+  /// The exported cookie-directory classifier recognizes exactly the names this crate
+  /// mints for that directory — the bare stem, and the stem qualified by any uid
+  /// [`cookie_dir_name`] can actually render — and nothing else in the reserved
+  /// namespace.
+  ///
+  /// It exists so the layer that decides what reaches a consumer does not have to
+  /// re-implement the shape with a prefix test: a prefix test suppresses every user leaf
+  /// that shares the stem, silently and with no recovery signal. A suffix test looser
+  /// than the minter keeps a narrower slice of that same defect — `cookie_dir_name`
+  /// formats a `uid_t` with `{}`, so a redundant leading zero or a number past the uid
+  /// space names a directory this crate could not have created, and a consumer that
+  /// suppresses what lands inside the cookie directory would erase the user's directory
+  /// and everything reported within it.
+  #[test]
+  fn the_cookie_directory_classifier_admits_only_names_this_crate_mints() {
+    // What this crate actually names the directory, on this platform.
+    assert!(crate::is_sync_cookie_dir_name(&cookie_dir_name()));
+    // The bare stem (no uid to qualify it) and any uid's directory: two users may
+    // legitimately watch one tree, and neither one's is a user change on the other's
+    // stream.
+    assert!(crate::is_sync_cookie_dir_name(COOKIE_DIR_PREFIX));
+    assert!(crate::is_sync_cookie_dir_name(
+      ".tributaries-sync-cookies-0"
+    ));
+    assert!(crate::is_sync_cookie_dir_name(
+      ".tributaries-sync-cookies-4294967295"
+    ));
+
+    for user_leaf in [
+      ".tributaries-sync-cookies-mine",
+      ".tributaries-sync-cookies-",
+      ".tributaries-sync-cookies.bak",
+      ".tributaries-sync-cookie",
+      ".tributaries-sync-7-42-3-00000000deadbeef",
+      "cookies",
+      // Numeric, but not what `format!("{euid}")` renders: a redundant leading zero, and
+      // a suffix past the uid space. `cookie_dir_name` can emit neither, so neither
+      // directory is this crate's.
+      ".tributaries-sync-cookies-0001",
+      ".tributaries-sync-cookies-00",
+      ".tributaries-sync-cookies-4294967296",
+      ".tributaries-sync-cookies-99999999999999999999",
+      ".tributaries-sync-cookies-+1",
+    ] {
+      assert!(
+        !crate::is_sync_cookie_dir_name(user_leaf),
+        "{user_leaf} is not a name this crate mints — classifying it would erase a user file"
+      );
+    }
+  }
+
   /// Admits a sync under a fresh, unique ticket — the common form for a cell that
   /// does not later cancel by ticket. A cell that DOES cancel binds its own ticket
   /// and calls [`sync_root_keyed`].
@@ -15784,9 +15835,11 @@ mod sync_cookie {
           && holder
             .file_name()
             .and_then(|leaf| leaf.to_str())
-            .is_some_and(|leaf| leaf.starts_with(COOKIE_DIR_PREFIX)),
+            .is_some_and(crate::is_sync_cookie_dir_name),
         "the cookie lands in the driver's own directory, and that directory is inside \
-         the watched root — outside it, no event of the cookie could ever reach the stream"
+         the watched root — outside it, no event of the cookie could ever reach the stream. \
+         The exported classifier must recognize the name this driver actually created: it is \
+         what keeps the directory's own create off a consumer's stream"
       );
 
       let verdict = fs

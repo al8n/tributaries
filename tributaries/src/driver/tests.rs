@@ -37,6 +37,15 @@ fn components(path: &Path) -> Vec<OsString> {
     .collect()
 }
 
+/// The directory the fake's SECOND classification ground names — one concrete rendering of
+/// the cookie directory `FsSource::is_sync_artifact` matches through
+/// `tributary_fs::is_sync_cookie_dir_name`, uid suffix and all.
+///
+/// No pre-existing key anywhere in this file carries a component of this name (the only
+/// dotted leaves in it are `.cookie`, under ordinary parents), so admitting the ground
+/// reclassifies nothing the cells sharing [`FakeSource`] already rest on.
+const COOKIE_DIR: &str = ".tributaries-sync-cookies-501";
+
 /// One recorded call against the fake source, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
@@ -410,11 +419,32 @@ impl Source<OsString> for FakeSource {
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
-    // The fake's reserved namespace: a leaf starting with `cookie-`.
+    // The fake's reserved namespace carries BOTH of the grounds `FsSource::is_sync_artifact`
+    // does, because an endpoint classifier proven against one of them has been proven
+    // against neither: the grounds read different components of the key, so a suppression
+    // that discards a whole change can survive under the leaf ground while the parent
+    // ground never exercises it.
+    //
+    // GROUND 1 — the LEAF is a name this fake mints (`cookie-…`, standing in for the
+    // binding's cookie grammar), or the leaf IS the cookie directory.
+    //
+    // GROUND 2 — the leaf's IMMEDIATE parent is exactly the cookie directory, whatever the
+    // leaf: the shape the real source uses for cookies whose names it cannot predict. Like
+    // the real one, neither ground reads any deeper component, and — also like the real one —
+    // the parent ground is decided FIRST, from the components, so "whatever the leaf" keeps
+    // covering a leaf that is not UTF-8 at all.
+    if key
+      .len()
+      .checked_sub(2)
+      .and_then(|parent| key[parent].to_str())
+      .is_some_and(|parent| parent == COOKIE_DIR)
+    {
+      return true;
+    }
     key
       .last()
       .and_then(|leaf| leaf.to_str())
-      .is_some_and(|leaf| leaf.starts_with("cookie-"))
+      .is_some_and(|leaf| leaf.starts_with("cookie-") || leaf == COOKIE_DIR)
   }
 
   fn end_sync(&mut self, _handle: u32, cookie_key: &[OsString]) {
@@ -745,7 +775,7 @@ impl Harness {
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
-      observed_handles: std::collections::HashSet::new(),
+      observed_handles: super::ObservedHandles::new(),
       _rt: PhantomData::<TokioRuntime>,
     };
     Self {
@@ -2160,14 +2190,14 @@ async fn failed_widen_restore_reusing_old_handle_trips_the_tripwire() {
   let _ = h.watch("/a", Interest::all()).await;
 }
 
-/// Regression (the exhaustive observed-handle tripwire — the POST-RETIREMENT reuse the
+/// Regression (the observed-handle tripwire — the POST-RETIREMENT reuse the
 /// per-site live-index checks MISSED): a handle removed from the live index by an `unwatch` (or a
 /// terminal retirement) that a later arm REUSES is still a generation-unique `Source::Handle`
 /// violation — a stale event still carrying it would route through the re-armed root in its new
 /// generation. The retired per-site checks only asserted `entry(handle).is_none()` against the
 /// CURRENT index, so a reused post-retirement handle (absent from the index) passed them silently;
-/// the owner-level observed-handle set catches it, because the handle was observed at its first arm
-/// and the set is never pruned.
+/// the owner-level observed-handle window catches it, because the handle was observed at its first
+/// arm and observations leave the window only by eviction — never by retirement.
 ///
 /// Fail-on-old: after the `unwatch`, handle 1 is gone from `by_handle` (`plan_unwatch` removes it on
 /// `RootEmptied`), so the reused-handle re-watch takes the `Disjoint` commit path whose retired
@@ -2184,7 +2214,7 @@ async fn rearm_reusing_a_retired_handle_trips_the_tripwire() {
 
   // Watch /a (handle 1), then unwatch it: the root is emptied, so `plan_unwatch` disarms handle 1
   // AND removes it from the live index (`by_handle`). Handle 1 is now retired — gone from every live
-  // structure, but permanently recorded in the owner's observed-handle set.
+  // structure, but still recorded in the owner's observed-handle window.
   let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
   h.unwatch(sa).expect("unwatch /a");
 
@@ -2193,6 +2223,91 @@ async fn rearm_reusing_a_retired_handle_trips_the_tripwire() {
   // index after the unwatch), but the arm choke point's observed-handle debug_assert panics.
   h.owner.source.reuse_next_arm_handle(1);
   let _ = h.watch("/b", Interest::all()).await;
+}
+
+/// Regression (the LIVE-alias guarantee must not ride on the bounded window): the window evicts by
+/// ARM HISTORY, not by live-root population, so a root held live across more than
+/// [`super::OBSERVED_HANDLE_HISTORY`] intervening arms ages out of it while it is still recorded.
+/// A later arm reusing THAT handle is the violation this tripwire most exists to catch — the live
+/// alias `commit_watch` would let overwrite the reverse handle mapping, stranding `/live` and
+/// misrouting its events into the new root. Peak live roots here is TWO; only the arm count is
+/// large, so nothing about this owner's resource use excuses the miss.
+///
+/// Fail-on-old: with the window as the tripwire's only input, the churn has evicted handle 1, so
+/// `observe` reports it unseen, the assert passes, and the reuse commits silently — no panic, and
+/// `#[should_panic]` fails the cell.
+#[tokio::test]
+#[should_panic(expected = "already observed by this owner")]
+#[cfg_attr(
+  not(debug_assertions),
+  ignore = "the debug_assert tripwire is compiled out in release builds"
+)]
+#[cfg(debug_assertions)]
+async fn rearm_reusing_a_live_handle_aged_out_of_the_window_trips_the_tripwire() {
+  let mut h = Harness::new();
+
+  // Handle 1, and it stays live for the whole cell — never unwatched, never retired.
+  let _live = h
+    .watch("/live", Interest::all())
+    .await
+    .expect("watch the root that stays live");
+
+  // Churn disjoint roots past the window's capacity. Each cycle arms a fresh handle and retires it
+  // again, so live roots never exceed two — but the arm history alone evicts handle 1.
+  for i in 0..=super::OBSERVED_HANDLE_HISTORY {
+    let sub = h
+      .watch(&format!("/churn{i}"), Interest::all())
+      .await
+      .expect("watch a disjoint root");
+    h.unwatch(sub).expect("unwatch it again");
+  }
+
+  // A disjoint newcomer whose arm REUSES the still-live handle 1 — a generation-unique
+  // `Source::Handle` violation. The subsumer still records `/live` under handle 1, so the arm choke
+  // point's live-index check trips regardless of what the window has evicted.
+  h.owner.source.reuse_next_arm_handle(1);
+  let _ = h.watch("/newcomer", Interest::all()).await;
+}
+
+/// The observed-handle tripwire is a bounded WINDOW, not a lifetime ledger: ordinary
+/// watch/unwatch churn of disjoint roots must leave the debug build's history bounded by
+/// [`super::OBSERVED_HANDLE_HISTORY`], not by the number of arms the owner has ever performed.
+/// A debug or staging soak run to expose production leaks must not carry a historical-growth
+/// source of its own.
+///
+/// The second half is what keeps the bound from being free: the window still holds its capacity
+/// after the churn, so the most recent arms — where a handle-recycling source shows up — are all
+/// still covered.
+#[tokio::test]
+#[cfg_attr(
+  not(debug_assertions),
+  ignore = "the observed-handle window is compiled out in release builds"
+)]
+#[cfg(debug_assertions)]
+async fn observed_handle_history_is_bounded_by_its_window_not_by_lifetime_arms() {
+  let mut h = Harness::new();
+
+  // Churn disjoint roots: each watch arms a fresh handle, each unwatch empties its root and
+  // retires it. Every live root and delivery obligation is reclaimed correctly throughout — the
+  // only thing that could grow is the history itself.
+  let churn = super::OBSERVED_HANDLE_HISTORY + 64;
+  for i in 0..churn {
+    let sub = h
+      .watch(&format!("/r{i}"), Interest::all())
+      .await
+      .expect("watch a disjoint root");
+    h.unwatch(sub).expect("unwatch it again");
+  }
+  assert_eq!(
+    h.owner.source.arm_count(),
+    churn,
+    "every cycle armed a fresh handle, so the history saw every one of them"
+  );
+  assert_eq!(
+    h.owner.observed_handles.len(),
+    super::OBSERVED_HANDLE_HISTORY,
+    "the history is capped at its window — never the {churn} arms this owner performed"
+  );
 }
 
 /// The ARM-choke-point liveness close, widen path: a `Widen` whose **wider** arm is
@@ -5361,7 +5476,7 @@ impl OwnerU64 {
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
-      observed_handles: std::collections::HashSet::new(),
+      observed_handles: super::ObservedHandles::new(),
       _rt: PhantomData::<TokioRuntime>,
     };
     Self {
@@ -5947,7 +6062,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     closes: close_rx,
     events: event_tx,
     #[cfg(debug_assertions)]
-    observed_handles: std::collections::HashSet::new(),
+    observed_handles: super::ObservedHandles::new(),
     _rt: PhantomData::<TokioRuntime>,
   };
   let _commands = command_tx; // keep the command channel open (the dropped-handles teardown signal)
@@ -6114,7 +6229,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     closes: close_rx,
     events: event_tx,
     #[cfg(debug_assertions)]
-    observed_handles: std::collections::HashSet::new(),
+    observed_handles: super::ObservedHandles::new(),
     _rt: PhantomData::<TokioRuntime>,
   };
   let run = tokio::spawn(super::run(owner));
@@ -7736,6 +7851,53 @@ async fn on_sync_skips_an_already_canceled_barrier() {
   );
 }
 
+/// The FIRST sync an owner admits mints `seq = 1`. [`Owner::sync_seq`] starts at 0 and
+/// `on_sync` PRE-increments it before minting the token, so 0 is a value no cookie name has
+/// ever carried — which is what entitles the fs binding's classifier to refuse a `seq` of 0
+/// as a user file rather than suppressing it.
+///
+/// The seq is taken from the token the real admission path handed to `begin_sync`, not
+/// asserted as a constant: if a later release switches the counter to a post-increment (or
+/// seeds it elsewhere), the first cookie of every owner starts carrying a `seq` the
+/// classifier refuses — a genuine cookie republished on every consumer stream as a user
+/// create — and that change fails HERE, at the minter, instead of leaking in production.
+/// `source::fs::tests::the_classifier_accepts_the_name_the_first_sync_of_an_owner_mints`
+/// pins the accepting side of the same seam.
+///
+/// FAIL-ON-REVERT: take the counter's OLD value (`let seq = self.sync_seq; self.sync_seq +=
+/// 1;` and mint from `seq`) and the first token carries 0.
+#[tokio::test]
+async fn the_first_sync_an_owner_admits_mints_seq_one() {
+  use core::sync::atomic::Ordering;
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  // The caller's receiver stays alive: an already-canceled reply is skipped before any token
+  // is minted, which would leave `begun_token` empty and make this cell vacuous.
+  let loss_gen = h.owner.loss_gen.load(Ordering::SeqCst);
+  let (reply_tx, _reply_rx) = futures_channel::oneshot::channel();
+  h.owner.on_sync(sub, loss_gen, reply_tx).await;
+
+  let token = h
+    .owner
+    .source
+    .begun_token
+    .expect("the first admitted sync minted a token");
+  assert_eq!(
+    token.seq(),
+    1,
+    "the first cookie of an owner carries seq 1 — the counter is pre-incremented, so no sync \
+     ever renders 0"
+  );
+  assert_ne!(
+    token.instance(),
+    0,
+    "the instance brand is a NonZeroU64, so no cookie name carries instance 0 either"
+  );
+}
+
 /// Finding 1, the inter-arm race forced deterministically: the fs write COMPLETES (delivers its
 /// cookie) between the `select_biased!` pass that polls `begin_sync` and that same pass's
 /// cancellation arm. A scripted `begin_sync` future side-effect-delivers the cookie key yet still
@@ -8526,6 +8688,37 @@ fn rescan_event_at(
   )
 }
 
+/// A raw whole-`Moved` [`SourceEvent`] carrying BOTH endpoints' real root-relative
+/// locations, each given as `/`-joined segments relative to the one armed root the move was
+/// captured against — the pair a source reports for a rename inside its root.
+fn source_moved_at(
+  handle: u32,
+  from: &str,
+  from_location: &str,
+  to: &str,
+  to_location: &str,
+  epoch: u64,
+) -> SourceEvent<OsString, u32> {
+  let segments = |location: &str| {
+    Location::from_segments(
+      location
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(tributary_proto::Segment::new)
+        .collect::<Vec<_>>(),
+    )
+  };
+  SourceEvent::new(
+    handle,
+    key(to),
+    EventKind::Moved { from: key(from) },
+    segments(to_location),
+    Epoch::new(epoch),
+    Some(ChangeId::new(NonZeroU64::MIN)),
+  )
+  .with_move_from_location(segments(from_location))
+}
+
 /// A rescan is a LOCATED statement — "coverage became uncertain at and below this key" —
 /// and routing it by geometry rather than by shared physical root is what keeps a
 /// per-subscription consumer inside its own boundary. These cells pin the three cases and
@@ -9049,6 +9242,1387 @@ mod location_coordinate {
        not a leftover measured against /z: {:?}",
       clamped.location()
     );
+  }
+
+  /// A move has TWO endpoints and the raw event's location describes only the destination.
+  /// The source-only projection re-keys the delivery onto the move's SOURCE, so it must
+  /// carry the source's coordinate with it: a subscriber covering only the source is the
+  /// one that needs to learn the file left its tree, and its filter reads the location.
+  ///
+  /// FAIL-ON-REVERT: root-anchor the projection (`location: Location::new()` in
+  /// `Event::source_move_out`), and a location-aware filter is handed the WATCHED ROOT's
+  /// coordinate for a change one level below it — so the one-level filter here rejects the
+  /// removal outright, and even an admitting subscriber is told the change is at its root.
+  #[tokio::test]
+  async fn a_source_only_move_projection_carries_the_source_endpoints_coordinate() {
+    let mut h = Harness::new();
+    // The armed root is /a; /a/src is merely covered by it, so both endpoints of the move
+    // below are measured against /a.
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let source_only = h
+      .watch_with(
+        "/a/src",
+        WatchOptions::new().with_filter(Filter::new(|input: &crate::FilterInput<'_, OsString>| {
+          input.location().len() == 1
+        })),
+      )
+      .await
+      .expect("watch /a/src with a one-level filter");
+    h.drain();
+
+    // /a/src/f → /a/dst/f: the destination is outside /a/src, so that subscriber gets the
+    // source-only projection (a synthesized Removed at the source endpoint).
+    h.owner.fan_out_and_push(&source_moved_at(
+      1, "/a/src/f", "src/f", "/a/dst/f", "dst/f", 1,
+    ));
+    let delivered = h.drain();
+
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == source_only)
+      .expect("the one-level filter admits the removal — it is one level below /a/src");
+    assert!(projected.kind().is_removed());
+    assert_eq!(
+      projected.path(),
+      Path::new("/a/src/f"),
+      "the projection is keyed on the source endpoint"
+    );
+    assert_eq!(
+      projected.location(),
+      &Location::from_segments([tributary_proto::Segment::new("f")]),
+      "and located there too, rebased into /a/src's own coordinate"
+    );
+
+    // The both-endpoints subscriber is unaffected: it receives the whole move, located at
+    // the destination as before.
+    let whole = delivered
+      .iter()
+      .find(|e| e.subscription() == wide)
+      .expect("the covering subscription receives the whole move");
+    assert_eq!(whole.move_from(), Some(key("/a/src/f").as_slice()));
+    assert_eq!(
+      whole.location(),
+      &Location::from_segments(
+        ["dst", "f"]
+          .into_iter()
+          .map(tributary_proto::Segment::new)
+          .collect::<Vec<_>>()
+      ),
+      "a whole move stays located at its destination"
+    );
+  }
+}
+
+/// A [`Source`] mints its own sync-barrier artifacts inside the tree it watches, and no
+/// consumer may ever be told about one. A rename, though, has TWO endpoints and can put an
+/// artifact at one of them and an ordinary user object at the other — so the reservation is
+/// a property of an ENDPOINT, and testing it against the event's key alone answers the
+/// wrong question.
+///
+/// # The loss these cells stand over
+///
+/// `consume_source_event` used to test `is_sync_artifact(event.key())` and `return` on a
+/// match. `SourceEvent::key` is a move's DESTINATION, so a user file renamed INTO the
+/// reserved namespace matched — and the whole change was discarded before it ever reached
+/// the fan-out. The subscriber watching the source endpoint was told nothing: no `Moved`,
+/// no projected `Removed`, and no [`Rescan`](crate::EventKind::Rescan), because nothing
+/// classified this as a coverage loss. Its picture of that name stayed stale for the life
+/// of the watch, under a barrier that certifies delivery.
+///
+/// # Why every row runs twice
+///
+/// `FakeSource::is_sync_artifact` carries both of the grounds the real
+/// `FsSource::is_sync_artifact` does — a leaf grammar and the leaf's immediate parent
+/// directory — and they read different components of the key. A single-key suppression can
+/// therefore survive under one ground while never being exercised by the other, which is
+/// how this class of defect stays alive. Each row below is pinned against BOTH.
+///
+/// # The matrix
+///
+/// | source endpoint | destination endpoint | what a covering subscriber receives |
+/// |---|---|---|
+/// | artifact | artifact | nothing at all |
+/// | user     | artifact | `Removed`, keyed and located at the SOURCE |
+/// | artifact | user     | `Created`, keyed and located at the DESTINATION |
+/// | user     | user     | the whole `Moved`, unchanged |
+mod reserved_namespace {
+  use futures_util::FutureExt;
+
+  use super::*;
+  use crate::source::SyncOutcome;
+
+  /// A root-relative [`Location`] from `/`-joined segments — the coordinate form every
+  /// assertion here compares against, built exactly as the source-event helpers build the
+  /// coordinates they feed in.
+  fn located(location: &str) -> Location {
+    Location::from_segments(
+      location
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(tributary_proto::Segment::new)
+        .collect::<Vec<_>>(),
+    )
+  }
+
+  /// GROUND 2's reserved path and its root-relative location under `/a`: a leaf no grammar
+  /// could predict, classified only by the cookie DIRECTORY holding it.
+  fn inside_the_cookie_directory(leaf: &str) -> (String, String) {
+    (
+      format!("/a/{COOKIE_DIR}/{leaf}"),
+      format!("{COOKIE_DIR}/{leaf}"),
+    )
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row: user → artifact. A `Removed` at the SOURCE endpoint.
+  // ---------------------------------------------------------------------------
+
+  /// The rename the whole-event discard swallowed. Two geometries are watched at once:
+  /// `wide` covers BOTH endpoints (so an unmasked destination hands it the whole `Moved`,
+  /// artifact path and all), and `source_only` covers ONLY the source — the subscription
+  /// that used to receive nothing whatsoever.
+  ///
+  /// The location assertions are the point of using the two-location move helper: the
+  /// move-out projection is re-keyed onto the source endpoint, so it must carry the
+  /// SOURCE's coordinate, rebased into each subscriber's own.
+  async fn assert_a_move_into_the_reserved_namespace_delivers_its_source_endpoint(
+    artifact: &str,
+    artifact_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let source_only = h
+      .watch("/a/important", Interest::all())
+      .await
+      .expect("watch /a/important");
+    h.drain();
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/important/file",
+      "important/file",
+      artifact,
+      artifact_location,
+      1,
+    ));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      2,
+      "both covering subscriptions learn the file left: {delivered:?}"
+    );
+    for (sub, coordinate) in [(wide, "important/file"), (source_only, "file")] {
+      let projected = delivered
+        .iter()
+        .find(|e| e.subscription() == sub)
+        .expect("a subscriber covering the source endpoint is served");
+      assert!(
+        projected.kind().is_removed(),
+        "the covered endpoint is the source, so the move projects to a Removed: {projected:?}"
+      );
+      assert_eq!(
+        projected.path(),
+        Path::new("/a/important/file"),
+        "keyed on the source endpoint, never on the reserved destination"
+      );
+      assert_eq!(
+        projected.location(),
+        &located(coordinate),
+        "and located there too, rebased into this subscriber's own coordinate"
+      );
+      assert_eq!(
+        projected.move_from(),
+        None,
+        "a Removed names no other endpoint, so the artifact path cannot leak through it"
+      );
+    }
+  }
+
+  /// FAIL-ON-REVERT: restore the whole-event discard (`if !event.kind().is_rescan() &&
+  /// self.source.is_sync_artifact(event.key()) { .. return; }` at the head of
+  /// `consume_source_event`) and NOTHING is delivered — the silent loss this class is.
+  /// Dropping only the destination mask (`covers_to` back to a bare
+  /// `to.starts_with(canonical)` in `route::project`) fails it the other way: `wide` gets a
+  /// whole `Moved` naming the reserved destination.
+  #[tokio::test]
+  async fn a_move_into_the_reserved_namespace_delivers_its_source_endpoint_by_leaf_grammar() {
+    assert_a_move_into_the_reserved_namespace_delivers_its_source_endpoint(
+      "/a/cookie-7",
+      "cookie-7",
+    )
+    .await;
+  }
+
+  /// The same row on the OTHER ground: the destination is reserved by the directory holding
+  /// it, not by any name this crate could predict.
+  ///
+  /// FAIL-ON-REVERT: as above; additionally, drop the parent-directory ground from
+  /// `FakeSource::is_sync_artifact` and this cell stops testing anything — the move becomes
+  /// an ordinary one and the `Removed` assertion fails against a whole `Moved`.
+  #[tokio::test]
+  async fn a_move_into_the_reserved_namespace_delivers_its_source_endpoint_by_parent_directory() {
+    let (artifact, location) = inside_the_cookie_directory("anything");
+    assert_a_move_into_the_reserved_namespace_delivers_its_source_endpoint(&artifact, &location)
+      .await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row: artifact → user. A `Created` at the DESTINATION endpoint.
+  // ---------------------------------------------------------------------------
+
+  /// The mirror: an artifact renamed OUT to an ordinary name. A subscriber covering the
+  /// destination must learn an object ARRIVED in its tree — and must not learn that what
+  /// arrived was the source's own barrier marker, so the projection names no `from`.
+  async fn assert_a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint(
+    artifact: &str,
+    artifact_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let dest_only = h
+      .watch("/a/adopted", Interest::all())
+      .await
+      .expect("watch /a/adopted");
+    h.drain();
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      artifact,
+      artifact_location,
+      "/a/adopted/file",
+      "adopted/file",
+      1,
+    ));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      2,
+      "both covering subscriptions learn the object arrived: {delivered:?}"
+    );
+    for (sub, coordinate) in [(wide, "adopted/file"), (dest_only, "file")] {
+      let projected = delivered
+        .iter()
+        .find(|e| e.subscription() == sub)
+        .expect("a subscriber covering the destination endpoint is served");
+      assert!(
+        projected.kind().is_created(),
+        "the covered endpoint is the destination, so the move projects to a Created: \
+         {projected:?}"
+      );
+      assert_eq!(
+        projected.path(),
+        Path::new("/a/adopted/file"),
+        "keyed on the destination endpoint: {projected:?}"
+      );
+      assert_eq!(
+        projected.location(),
+        &located(coordinate),
+        "located at the destination, rebased into this subscriber's own coordinate"
+      );
+      assert_eq!(
+        projected.move_from(),
+        None,
+        "a Created names no source, so the artifact it was cannot leak through it"
+      );
+    }
+  }
+
+  /// FAIL-ON-REVERT: drop the source mask (`covers_from` back to a bare
+  /// `from.starts_with(canonical)` in `route::project`) and `wide` receives a whole `Moved`
+  /// whose `from` is the artifact's own path.
+  #[tokio::test]
+  async fn a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint_by_leaf_grammar()
+  {
+    assert_a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint(
+      "/a/cookie-7",
+      "cookie-7",
+    )
+    .await;
+  }
+
+  /// The same row on the parent-directory ground.
+  #[tokio::test]
+  async fn a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint_by_parent_directory()
+   {
+    let (artifact, location) = inside_the_cookie_directory("anything");
+    assert_a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint(
+      &artifact, &location,
+    )
+    .await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row: artifact → artifact. Nothing at all.
+  // ---------------------------------------------------------------------------
+
+  /// A rename BETWEEN two reserved names is reserved at every endpoint it has, so it is
+  /// settled without routing: never fanned out, never coalesced, never delivered.
+  async fn assert_a_move_within_the_reserved_namespace_reaches_nobody(
+    from: &str,
+    from_location: &str,
+    to: &str,
+    to_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let _wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner
+      .consume_source_event(&source_moved_at(1, from, from_location, to, to_location, 1));
+
+    let delivered = h.drain();
+    assert!(
+      delivered.is_empty(),
+      "a change reserved at every endpoint it has reaches no consumer: {delivered:?}"
+    );
+  }
+
+  /// FAIL-ON-REVERT: narrow `ReservedEndpoints::is_total` to `matches!(self,
+  /// Self::Destination | Self::All)`'s complement — or, minimally, drop `Self::All` from
+  /// `masks_source` — and the whole-move suppression degrades to a `Removed` naming one
+  /// artifact path.
+  #[tokio::test]
+  async fn a_move_within_the_reserved_namespace_reaches_nobody_by_leaf_grammar() {
+    assert_a_move_within_the_reserved_namespace_reaches_nobody(
+      "/a/cookie-7",
+      "cookie-7",
+      "/a/cookie-8",
+      "cookie-8",
+    )
+    .await;
+  }
+
+  /// The same row on the parent-directory ground: two unpredictable leaves inside the one
+  /// cookie directory.
+  #[tokio::test]
+  async fn a_move_within_the_reserved_namespace_reaches_nobody_by_parent_directory() {
+    let (from, from_location) = inside_the_cookie_directory("one");
+    let (to, to_location) = inside_the_cookie_directory("two");
+    assert_a_move_within_the_reserved_namespace_reaches_nobody(
+      &from,
+      &from_location,
+      &to,
+      &to_location,
+    )
+    .await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row: user → user. The move, unchanged — the over-suppression guard.
+  // ---------------------------------------------------------------------------
+
+  /// Suppression removes a change from every stream, so a ground that over-reaches is the
+  /// same silent loss with the endpoints swapped. Each of these destinations sits one step
+  /// outside its ground — a leaf the grammar does not mint, and a leaf whose cookie
+  /// directory is its GRANDparent rather than its parent (neither ground reads deeper than
+  /// the immediate parent) — and the move must survive whole.
+  async fn assert_a_move_near_but_outside_the_reserved_namespace_is_not_masked(
+    to: &str,
+    to_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/important/file",
+      "important/file",
+      to,
+      to_location,
+      1,
+    ));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      1,
+      "one covering subscriber, one whole move: {delivered:?}"
+    );
+    let whole = &delivered[0];
+    assert_eq!(whole.subscription(), wide);
+    assert_eq!(
+      whole.move_from(),
+      Some(key("/a/important/file").as_slice()),
+      "an unreserved move keeps BOTH endpoints"
+    );
+    assert_eq!(whole.path(), Path::new(to));
+    assert_eq!(
+      whole.location(),
+      &located(to_location),
+      "a whole move stays located at its destination"
+    );
+  }
+
+  /// FAIL-ON-REVERT: widen the fake's leaf ground to a bare `starts_with("cookie")` and the
+  /// destination becomes reserved — the delivery degrades to a source-only `Removed`.
+  #[tokio::test]
+  async fn a_move_to_a_leaf_the_grammar_does_not_mint_is_not_masked() {
+    assert_a_move_near_but_outside_the_reserved_namespace_is_not_masked(
+      "/a/cookies-7",
+      "cookies-7",
+    )
+    .await;
+  }
+
+  /// FAIL-ON-REVERT: let the parent ground scan every component instead of only `key[len -
+  /// 2]` and this deeper descendant is reserved — a user file erased from every stream.
+  #[tokio::test]
+  async fn a_move_below_the_cookie_directorys_own_children_is_not_masked() {
+    let (to, to_location) = inside_the_cookie_directory("sub/leaf");
+    assert_a_move_near_but_outside_the_reserved_namespace_is_not_masked(&to, &to_location).await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Single-endpoint kinds keep today's single-key answer.
+  // ---------------------------------------------------------------------------
+
+  /// A change with ONE endpoint has one verdict, and a reserved key makes it total: the
+  /// cookie's own create (and its unlink) reaches nobody. Endpoint-awareness must not have
+  /// loosened this — it is the suppression the namespace exists for.
+  async fn assert_a_single_endpoint_change_at_a_reserved_key_reaches_nobody(artifact: &str) {
+    let mut h = Harness::new();
+    let _wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner
+      .consume_source_event(&source_created(1, artifact, 1));
+
+    let delivered = h.drain();
+    assert!(
+      delivered.is_empty(),
+      "the artifact's own single-endpoint change is covered by nobody: {delivered:?}"
+    );
+  }
+
+  /// FAIL-ON-REVERT: drop the mask from `route::project`'s single-endpoint arm (`return
+  /// to.starts_with(canonical).then(|| event.deliver(sub))`) and the cookie's create is
+  /// delivered to every covering subscriber.
+  #[tokio::test]
+  async fn a_single_endpoint_change_at_a_reserved_key_reaches_nobody_by_leaf_grammar() {
+    assert_a_single_endpoint_change_at_a_reserved_key_reaches_nobody("/a/cookie-7").await;
+  }
+
+  /// The same, on the parent-directory ground.
+  #[tokio::test]
+  async fn a_single_endpoint_change_at_a_reserved_key_reaches_nobody_by_parent_directory() {
+    let (artifact, _location) = inside_the_cookie_directory("anything");
+    assert_a_single_endpoint_change_at_a_reserved_key_reaches_nobody(&artifact).await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // A `Rescan` is never classified, so it is never suppressed.
+  // ---------------------------------------------------------------------------
+
+  /// A [`Rescan`](crate::EventKind::Rescan) names no object — it is the statement that
+  /// coverage below a key became uncertain — so it has no endpoint to reserve. Classifying
+  /// one would hide a coverage loss behind the very namespace whose events it may have
+  /// eaten, and the loss would be unrecoverable: nothing else is owed for it.
+  async fn assert_a_rescan_inside_the_reserved_namespace_is_still_delivered(
+    at: &str,
+    location: &str,
+  ) {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner
+      .consume_source_event(&rescan_event_at(1, at, location, 1));
+
+    let delivered = h.drain();
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == sub)
+      .expect("a coverage-loss signal is never suppressed, wherever it is located");
+    assert!(
+      projected.kind().is_rescan(),
+      "a Rescan is delivered as itself, never reshaped by the namespace: {projected:?}"
+    );
+    assert_eq!(
+      projected.path(),
+      Path::new(at),
+      "the re-enumeration keeps the located key the loss names"
+    );
+  }
+
+  /// FAIL-ON-REVERT: drop the `is_rescan` early return from `Owner::reserved_endpoints` and
+  /// this `Rescan` classifies `All`, so `fan_out_and_push` settles it without routing —
+  /// coverage loss, silently swallowed.
+  #[tokio::test]
+  async fn a_rescan_at_a_reserved_key_is_still_delivered_by_leaf_grammar() {
+    assert_a_rescan_inside_the_reserved_namespace_is_still_delivered("/a/cookie-7", "cookie-7")
+      .await;
+  }
+
+  /// The same, on the parent-directory ground.
+  #[tokio::test]
+  async fn a_rescan_at_a_reserved_key_is_still_delivered_by_parent_directory() {
+    let (at, location) = inside_the_cookie_directory("anything");
+    assert_a_rescan_inside_the_reserved_namespace_is_still_delivered(&at, &location).await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // A barrier still resolves on a cookie that arrives by RENAME.
+  // ---------------------------------------------------------------------------
+
+  /// A cookie is an observation however it arrives, and a rename is one of the ways it can.
+  /// The pre-fix code resolved the barrier on exactly this event and then discarded the
+  /// whole change; the fix keeps the resolution AND delivers the user endpoint, so this
+  /// cell asserts both halves — a resolution that came at the price of the `Removed` would
+  /// be the same loss with a certificate on top.
+  async fn assert_a_cookie_arriving_by_rename_resolves_its_barrier(
+    cookie: &str,
+    cookie_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key(cookie),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/important/file",
+      "important/file",
+      cookie,
+      cookie_location,
+      1,
+    ));
+
+    let delivered = h.drain();
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == sub)
+      .expect("the user endpoint is delivered, barrier or no barrier");
+    assert!(
+      projected.kind().is_removed(),
+      "the user endpoint arrives as the source-only projection, not as a whole move naming \
+       the cookie: {projected:?}"
+    );
+    assert_eq!(projected.path(), Path::new("/a/important/file"));
+    assert_eq!(projected.location(), &located("important/file"));
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "a cookie that arrived by rename resolves its barrier Delivered"
+    );
+  }
+
+  /// FAIL-ON-REVERT: gate the resolution back on `reserved.is_total()` instead of
+  /// `reserved.any()` in `consume_source_event` and the barrier never resolves — the reply
+  /// stays pending and the caller waits out its whole timeout.
+  #[tokio::test]
+  async fn a_cookie_arriving_by_rename_resolves_its_barrier_by_leaf_grammar() {
+    assert_a_cookie_arriving_by_rename_resolves_its_barrier("/a/cookie-7", "cookie-7").await;
+  }
+
+  /// The same, on the parent-directory ground — the shape a second consumer of the lower
+  /// crate actually produces, since its cookie names follow no grammar this crate knows.
+  #[tokio::test]
+  async fn a_cookie_arriving_by_rename_resolves_its_barrier_by_parent_directory() {
+    let (cookie, location) = inside_the_cookie_directory("anything");
+    assert_a_cookie_arriving_by_rename_resolves_its_barrier(&cookie, &location).await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // …and on a cookie observed as a move's SOURCE endpoint.
+  // ---------------------------------------------------------------------------
+
+  /// A cookie renamed OUT of the reserved namespace is observed at the move's **source**
+  /// endpoint, which [`SourceEvent::key`](crate::SourceEvent::key) — the destination — does
+  /// not name. The owner saw the ordered post-cookie proof either way: the queue reached the
+  /// cookie, which is the whole content of the barrier. Matching the pending key against the
+  /// destination alone therefore left this barrier parked on an event that can never arrive,
+  /// until its caller's own timeout fired over a source that had done nothing wrong.
+  ///
+  /// Both halves are asserted, as in the destination row: the barrier resolves AND the user
+  /// endpoint — here the move's destination, an ordinary name the artifact was adopted into
+  /// — is still delivered as its own projection.
+  async fn assert_a_cookie_leaving_the_reserved_namespace_resolves_its_barrier(
+    cookie: &str,
+    cookie_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key(cookie),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    // The artifact leaves the namespace: source = the cookie, destination = a user name.
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      cookie,
+      cookie_location,
+      "/a/adopted",
+      "adopted",
+      1,
+    ));
+
+    let delivered = h.drain();
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == sub)
+      .expect("the user endpoint is delivered, barrier or no barrier");
+    assert!(
+      projected.kind().is_created(),
+      "the covered endpoint is the destination, so the move projects to a Created: \
+       {projected:?}"
+    );
+    assert_eq!(
+      projected.path(),
+      Path::new("/a/adopted"),
+      "keyed on the user endpoint, never on the reserved source"
+    );
+    assert_eq!(
+      projected.move_from(),
+      None,
+      "a Created names no other endpoint, so the cookie path cannot leak through it"
+    );
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "the cookie was observed as the move's SOURCE endpoint, which resolves the barrier"
+    );
+  }
+
+  /// FAIL-ON-REVERT: match the pending key against `event.key()` alone in
+  /// `resolve_matching_pending_sync` (dropping the `masks_source` arm) and the reply stays
+  /// pending — `now_or_never()` answers `None` — while the caller waits out its deadline.
+  #[tokio::test]
+  async fn a_cookie_leaving_the_reserved_namespace_resolves_its_barrier_by_leaf_grammar() {
+    assert_a_cookie_leaving_the_reserved_namespace_resolves_its_barrier("/a/cookie-7", "cookie-7")
+      .await;
+  }
+
+  /// The same, on the parent-directory ground.
+  #[tokio::test]
+  async fn a_cookie_leaving_the_reserved_namespace_resolves_its_barrier_by_parent_directory() {
+    let (cookie, location) = inside_the_cookie_directory("anything");
+    assert_a_cookie_leaving_the_reserved_namespace_resolves_its_barrier(&cookie, &location).await;
+  }
+
+  /// A rename BETWEEN two reserved names classifies `All` — nothing about it may reach any
+  /// subscriber — and the pending cookie can sit at EITHER end of it. This cell pins the end
+  /// a destination-only match misses: the barrier's cookie is the move's **source**, renamed
+  /// away to another reserved name.
+  ///
+  /// The suppression is asserted alongside the resolution: a both-reserved change reaching a
+  /// subscriber would be the namespace leak the masking exists to prevent, and a barrier
+  /// certificate is no licence for it.
+  ///
+  /// FAIL-ON-REVERT: as above — restore the `event.key()`-only match and the reply stays
+  /// pending, because the key names the reserved DESTINATION and the cookie is at the source.
+  #[tokio::test]
+  async fn a_cookie_renamed_between_two_reserved_names_resolves_at_its_source_endpoint() {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key("/a/cookie-7"),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    // Both endpoints are reserved, and the pending cookie is the SOURCE one. The destination
+    // uses the parent-directory ground, so the two ends are reserved on DIFFERENT grounds and
+    // neither verdict could have been inferred from the other.
+    let (destination, destination_location) = inside_the_cookie_directory("renamed");
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/cookie-7",
+      "cookie-7",
+      &destination,
+      &destination_location,
+      1,
+    ));
+
+    assert!(
+      h.drain().is_empty(),
+      "a change reserved at every endpoint reaches nobody, barrier or no barrier"
+    );
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "the cookie was observed at the move's source endpoint, which resolves the barrier"
+    );
+  }
+
+  /// ONE move can name TWO pending cookies. Barriers coexist routinely — a `RootHandle` is
+  /// `Copy` and one subscription may hold several — so two completed sync writes `K1` and `K2`
+  /// can both be outstanding when a single `All` move relates them (`K1` renamed onto `K2`).
+  /// That observation is ordered after BOTH writes and therefore proves both: each caller's
+  /// cookie is on disk and the queue has reached past it.
+  ///
+  /// Resolving only the first is a silent stall, not a slower answer. Overwriting `K2` need
+  /// not produce any further record of it — the move IS its last event — so the unresolved
+  /// caller waits out its own deadline over a source that did exactly what it was asked.
+  ///
+  /// The third, unrelated barrier is here for the removal mechanics rather than the
+  /// arithmetic, and its POSITION is the point: it sits in the MIDDLE, so the vector's tail is
+  /// a MATCH. `swap_remove` moves the tail into the vacated slot, so resolving the source
+  /// barrier at index 0 relocates the DESTINATION barrier down into index 0 — and a scan that
+  /// advanced its cursor past a removal would step over exactly that relocated match and leave
+  /// its caller waiting forever. Had the unrelated entry been last instead, the skipped element
+  /// would have been the one nothing is waiting on, the destination barrier would still resolve
+  /// from its original slot, and every assertion below would stay green under the mutation the
+  /// stationary cursor exists to prevent.
+  ///
+  /// FAIL-ON-REVERT — two distinct mutations, and this cell must catch BOTH:
+  /// * put back the single `position()` + `swap_remove()` in `resolve_matching_pending_sync`
+  ///   (resolve the first match and return) and the DESTINATION barrier never completes —
+  ///   `now_or_never()` answers `None` — while its entry stays in `pending_syncs` with nothing
+  ///   left to match it;
+  /// * advance the cursor on a removal (`i += 1` after the `swap_remove`, instead of leaving it
+  ///   stationary) and that same destination barrier is skipped — `swap_remove` had just moved
+  ///   it down into the slot the cursor abandoned — so it is never reaped, never answered, and
+  ///   is still sitting in `pending_syncs` at the end.
+  #[tokio::test]
+  async fn one_move_naming_two_pending_cookies_resolves_both_barriers() {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    // The move's two endpoints, reserved on DIFFERENT grounds (leaf grammar / cookie
+    // directory), so neither barrier's match could have been inferred from the other's.
+    let (destination, destination_location) = inside_the_cookie_directory("renamed");
+
+    let mut install = |cookie: &str| {
+      let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+      h.owner.pending_syncs.push(crate::driver::PendingSync {
+        cookie_key: key(cookie),
+        sub,
+        root: handle,
+        loss_serial_at_install: 0,
+        dominated_at_install: false,
+        reply: reply_tx,
+      });
+      reply_rx
+    };
+    // Order matters: a MATCH is at the tail, with the unrelated entry between the two matches.
+    // The first `swap_remove` therefore relocates the destination barrier into the cursor's own
+    // slot, which is the only arrangement under which a cursor that advanced on a removal skips
+    // an entry anyone is waiting on.
+    let mut at_source = install("/a/cookie-7");
+    // Not named by this move at all: it must still be waiting afterwards.
+    let mut unrelated = install("/a/cookie-99");
+    let mut at_destination = install(&destination);
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/cookie-7",
+      "cookie-7",
+      &destination,
+      &destination_location,
+      1,
+    ));
+
+    assert!(
+      h.drain().is_empty(),
+      "a change reserved at every endpoint reaches nobody, barriers or no barriers"
+    );
+    assert!(
+      matches!(
+        (&mut at_source).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "the barrier whose cookie is the move's source resolves"
+    );
+    assert!(
+      matches!(
+        (&mut at_destination).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "and so does the barrier whose cookie is the move's destination — one observation \
+       proves both writes, so it must answer both callers, and this is the entry `swap_remove` \
+       relocated into the slot the cursor deliberately does not advance past"
+    );
+    assert!(
+      (&mut unrelated).now_or_never().is_none(),
+      "the barrier this move never named is left waiting for its own cookie"
+    );
+
+    // Each resolved entry kept the full per-entry sequence, reap included: its marker is
+    // released, and it is gone from the pending set rather than left for `Owner::drop`.
+    assert_eq!(
+      h.owner.source.ended_syncs,
+      vec![key("/a/cookie-7"), key(&destination)],
+      "both cookies are reaped, each before its own outcome is sent"
+    );
+    assert_eq!(
+      h.owner
+        .pending_syncs
+        .iter()
+        .map(|pending| pending.cookie_key.clone())
+        .collect::<Vec<_>>(),
+      vec![key("/a/cookie-99")],
+      "exactly the unmatched barrier survives the scan"
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // The resolution is strictly AFTER the change's own publication.
+  // ---------------------------------------------------------------------------
+
+  /// `consume_source_event` resolves a barrier only once `fan_out_and_push` has published
+  /// this change or durably parked it. A barrier resolved first would let a caller waking
+  /// on another thread drain past a delivery the resolution implies it will find — the
+  /// prohibited half-barrier.
+  ///
+  /// The order is made OBSERVABLE by making this change's own publication the thing that
+  /// creates the debt: the one-slot channel is already full, so the projected `Removed`
+  /// sheds the subscription to a parked `Rescan` and advances its loss serial. The
+  /// resolution reads both. Resolving BEFORE the fan-out would find an empty debt map and
+  /// an unmoved serial, and would answer `Delivered`; resolving after finds the debt this
+  /// very change created, and answers `Dominated`.
+  ///
+  /// FAIL-ON-REVERT: hoist the `resolve_matching_pending_sync` call above
+  /// `self.fan_out_and_push(event)` and the outcome flips to `Delivered` — a clean-delivery
+  /// certificate handed out over a subscription that owes a re-enumeration.
+  #[tokio::test]
+  async fn a_barrier_resolves_only_after_its_own_change_is_durably_parked() {
+    let mut h = Harness::bounded(1);
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+    // Fill the one slot, so THIS change's own publication is what sheds.
+    h.owner.try_emit(modified_event(sub, "/a/x", 1));
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key("/a/cookie-7"),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/important/file",
+      "important/file",
+      "/a/cookie-7",
+      "cookie-7",
+      2,
+    ));
+
+    assert!(
+      h.owner.needs_rescan.contains_key(&sub),
+      "the user endpoint could not be published, so it parked as durable Rescan debt"
+    );
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Dominated)))
+      ),
+      "the resolution read the debt this change's own publication created, so it ran after it"
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // A consumed record always ticks the settle clock — suppressing a change is not
+  // a reason to stop paying the debounce its bound.
+  // ---------------------------------------------------------------------------
+
+  /// A debounce policy whose windows are short enough to expire on a paused clock but long
+  /// enough that nothing settles by accident while a cell is setting up.
+  fn settle_in_20ms_hold_100ms() -> DebounceConfig {
+    DebounceConfig::new()
+      .with_quiet_window(Duration::from_millis(20))
+      .with_max_hold(Duration::from_millis(100))
+  }
+
+  /// A user change buffered under debounce must be released once its hold expires, even
+  /// though every record the source hands over in the meantime is a **totally reserved** one
+  /// that is suppressed before it is routed anywhere.
+  ///
+  /// `fan_out_and_push` returns on `is_total()` **above** [`push_all`](super::Owner::push_all),
+  /// which owns the only normal-path `drain_ready` — so the suppressed record used to consume the
+  /// loop's iteration and pay the debounce nothing. `consume_source_event` now drains the due
+  /// output itself, on every path out of the funnel.
+  ///
+  /// The clock is paused, so "its hold expired" is a fact of the test rather than a race: the
+  /// entry is due before the reserved record is fed, and the reserved record is the only thing
+  /// that runs afterwards.
+  ///
+  /// FAIL-ON-REVERT: drop the `self.drain_coalescer_due()` between `fan_out_and_push` and the
+  /// barrier arms in `consume_source_event` and nothing is delivered — the buffered change is
+  /// still sitting in the coalescer, past its bound, exactly as the finding describes.
+  #[tokio::test(start_paused = true)]
+  async fn a_totally_reserved_record_still_releases_the_due_change_it_holds_up() {
+    let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(settle_in_20ms_hold_100ms()))));
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+    // The user's change buffers under debounce — nothing is owed to the consumer yet.
+    h.owner.consume_source_event(&source_created(1, "/a/f", 1));
+    assert!(
+      h.drain().is_empty(),
+      "the user change is still settling, so nothing is delivered on admission"
+    );
+
+    // Its hold expires while the source has nothing but another `Watcher`'s cookies to hand over.
+    tokio::time::advance(Duration::from_millis(150)).await;
+    let (reserved, _) = inside_the_cookie_directory("anything");
+    h.owner
+      .consume_source_event(&source_created(1, &reserved, 2));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      1,
+      "consuming the reserved record released the due change, and released only it: {delivered:?}"
+    );
+    assert_eq!(delivered[0].subscription(), sub);
+    assert_eq!(
+      delivered[0].path(),
+      Path::new("/a/f"),
+      "…the user's change, never the cookie that unblocked it"
+    );
+  }
+
+  /// The drain is not an admission: a flood of totally reserved records is still delivered to
+  /// nobody AND still buffered nowhere. The suppression `fan_out_and_push` performs is untouched —
+  /// what changed is only that consuming one of these records now pays the settle clock.
+  ///
+  /// Proven on both halves: the consumer stream stays empty across a clock advance past the whole
+  /// hold, and a `flush_all` — which force-emits *everything* the coalescer holds regardless of
+  /// deadline — comes back empty, so no reserved record was buffered to be released later either.
+  ///
+  /// FAIL-ON-REVERT: route the `is_total()` arm of `fan_out_and_push` through `fan_out_raw` +
+  /// `push_all` — "draining" by ADMITTING the reserved change rather than suppressing it — and the
+  /// cookies surface on the consumer's stream. The post-advance half is what fails first (under a
+  /// 20ms quiet window nothing is due at admission, so the admitted cookies come out on the drain
+  /// after it); `flush_all` catches whatever a longer window would still be holding.
+  #[tokio::test(start_paused = true)]
+  async fn a_reserved_flood_is_neither_delivered_nor_coalesced() {
+    let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(settle_in_20ms_hold_100ms()))));
+    h.watch("/a", Interest::all()).await.expect("watch /a");
+
+    // Both classification grounds, and a distinct leaf per record so nothing could collapse.
+    for seq in 0..16u64 {
+      let by_grammar = format!("/a/cookie-{seq}");
+      let (by_parent, _) = inside_the_cookie_directory(&format!("leaf-{seq}"));
+      h.owner
+        .consume_source_event(&source_created(1, &by_grammar, seq * 2));
+      h.owner
+        .consume_source_event(&source_created(1, &by_parent, seq * 2 + 1));
+    }
+
+    assert!(
+      h.drain().is_empty(),
+      "no reserved record reaches the consumer"
+    );
+    tokio::time::advance(Duration::from_millis(150)).await;
+    h.owner.drain_coalescer_due();
+    assert!(
+      h.drain().is_empty(),
+      "…and none is released by a later drain either"
+    );
+
+    let mut held = Vec::new();
+    h.owner
+      .coalescer
+      .as_mut()
+      .expect("debounce is enabled")
+      .flush_all(&mut held);
+    assert!(
+      held.is_empty(),
+      "no reserved record was ever admitted to the coalescer: {held:?}"
+    );
+  }
+
+  /// The same sweep on the funnel's OTHER early return: a record whose root the source has
+  /// already forgotten is consumed by `retire_if_dead` and never fanned out. Retirement is
+  /// idempotent, so a repeat terminal event on an already-retired handle does no work at all —
+  /// it is a consumed record that pays an unrelated subscription's settle clock nothing.
+  ///
+  /// The buffered change belongs to a **different, live** root, so the retirement neither
+  /// drops nor forgets it — the only thing that can release it is the drain.
+  ///
+  /// FAIL-ON-REVERT: drop the `self.drain_coalescer_due()` on the `retire_if_dead` arm of
+  /// `consume_source_event` and the live root's due change is not delivered.
+  #[tokio::test(start_paused = true)]
+  async fn a_dead_root_record_still_releases_another_roots_due_change() {
+    let mut h = Harness::with_coalescer(Some(Coalescer::new(Some(settle_in_20ms_hold_100ms()))));
+    let live = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+    h.watch("/b", Interest::all()).await.expect("watch /b"); // handle 2
+    h.drain();
+
+    h.owner.consume_source_event(&source_created(1, "/a/f", 1));
+    assert!(h.drain().is_empty(), "the live root's change is settling");
+
+    tokio::time::advance(Duration::from_millis(150)).await;
+    // The OTHER root dies out of band and its terminal event arrives.
+    h.owner.source.kill_root(2);
+    h.owner.consume_source_event(&source_removed(2, "/b", 2));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      1,
+      "the dead-root record released the live root's due change: {delivered:?}"
+    );
+    assert_eq!(delivered[0].subscription(), live);
+    assert_eq!(delivered[0].path(), Path::new("/a/f"));
+  }
+
+  /// The flood, end to end, against the REAL run loop — the shape the finding names.
+  ///
+  /// The run loop's `select!` is biased with `source.next()` **above** the settle timer, and this
+  /// source is ready on every poll, so the timer arm is never even reached; the source arm also
+  /// zeroes `command_streak`, so the command-fairness valve's due-drain never fires either. The
+  /// only thing left that can honor the debounce's bound is the funnel's own drain.
+  ///
+  /// Every flood record is reserved by its PARENT DIRECTORY alone — the classification ground that
+  /// makes this reachable from outside the process: a second `Watcher` over the same tree writes
+  /// cookies whose leaf names follow no grammar this crate knows, so its ordinary sync loop is the
+  /// flood.
+  ///
+  /// FAIL-ON-REVERT: drop the `self.drain_coalescer_due()` between `fan_out_and_push` and the
+  /// barrier arms in `consume_source_event` and `w.next()` waits out its whole timeout
+  /// (`Elapsed(())`) — the user's change is held for as long as the other watcher keeps syncing.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_sustained_reserved_flood_cannot_starve_a_due_change_in_the_run_loop() {
+    let (trigger_tx, trigger_rx) = async_channel::unbounded::<()>();
+    let stop = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    // Stops the flood on the way out — on the assertion's success AND on its panic. A task that
+    // never yields cannot be shut down, so the runtime's own drop would hang behind it.
+    let _stop_on_exit = StopFloodOnDrop(stop.clone());
+    let source = ArtifactFloodSource {
+      next_handle: 0,
+      live: HashMap::new(),
+      user_event: Some(source_created(1, "/a/f", 1)),
+      trigger: trigger_rx,
+      minted: 0,
+      stop: stop.clone(),
+    };
+    let mut w: super::super::Tributaries<OsString, (), TokioRuntime, u32> =
+      super::super::Tributaries::with_source(
+        source,
+        TributariesOptions::new().debounce(settle_in_20ms_hold_100ms()),
+      );
+    let sub = w
+      .watch(key("/a"), (), WatchOptions::new())
+      .await
+      .expect("watch /a"); // handle 1
+
+    // Release the user's change; from here the source hands over nothing but cookies, forever.
+    trigger_tx.try_send(()).expect("release the user change");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), w.next())
+      .await
+      .expect("the debounced user change drains despite the sustained reserved flood")
+      .expect("the stream is open");
+    assert_eq!(event.subscription(), sub, "routed to the covering sub");
+    assert_eq!(
+      event.path(),
+      Path::new("/a/f"),
+      "…and it is the user's change, not a cookie"
+    );
+  }
+
+  /// Sets [`ArtifactFloodSource`]'s stop flag as the test frame unwinds or returns.
+  struct StopFloodOnDrop(std::sync::Arc<core::sync::atomic::AtomicBool>);
+
+  impl Drop for StopFloodOnDrop {
+    fn drop(&mut self) {
+      self.0.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+  }
+
+  /// A source that hands over one user change and then floods with records another `Watcher`'s
+  /// sync loop produces: leaves inside the cookie directory, classified reserved by their parent
+  /// alone. Once the flood starts `next` **never awaits**, so the biased `select!` takes the source
+  /// arm on every poll — the starvation shape, reproduced exactly.
+  struct ArtifactFloodSource {
+    next_handle: u32,
+    live: HashMap<u32, Vec<OsString>>,
+    /// Held back until the test releases it, so it cannot be consumed before its subscriber
+    /// exists.
+    user_event: Option<SourceEvent<OsString, u32>>,
+    trigger: async_channel::Receiver<()>,
+    /// A fresh reserved leaf per record: nothing can collapse, so a regression that admitted
+    /// these to the coalescer could not hide behind a merge.
+    minted: u64,
+    stop: std::sync::Arc<core::sync::atomic::AtomicBool>,
+  }
+
+  impl Source<OsString> for ArtifactFloodSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      self.next_handle += 1;
+      let handle = self.next_handle;
+      self.live.insert(handle, key.to_vec());
+      Ok(Armed::new(handle, key.to_vec()))
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.live.remove(&handle);
+    }
+
+    /// The PARENT-DIRECTORY ground only — the one a cookie whose name this crate cannot predict
+    /// is classified by, and the one this branch newly reaches.
+    fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+      key
+        .len()
+        .checked_sub(2)
+        .and_then(|parent| key[parent].to_str())
+        .is_some_and(|parent| parent == COOKIE_DIR)
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      if self.user_event.is_some() {
+        // Cancellation-safe: the trigger message and the event are taken on the same poll that
+        // returns `Ready`, so a losing `select!` arm dropping this future loses neither.
+        self.trigger.recv().await.ok()?;
+        return self.user_event.take();
+      }
+      if self.stop.load(core::sync::atomic::Ordering::SeqCst) {
+        return None;
+      }
+      self.minted += 1;
+      Some(SourceEvent::new(
+        1,
+        key(&format!("/a/{COOKIE_DIR}/{}", self.minted)),
+        EventKind::Created,
+        Location::new(),
+        Epoch::new(self.minted),
+        Some(ChangeId::new(NonZeroU64::MIN)),
+      ))
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.live.get(&handle).cloned()
+    }
+  }
+
+  /// The same flood against a **current-thread** executor — the mode where "the loop keeps
+  /// spinning" stops being a latency question and becomes a liveness one.
+  ///
+  /// A [`Source`] may legally return `Some` on every poll, the biased `select!` puts that arm
+  /// above the timer, and consuming a record awaits nothing — a wholly reserved one does not
+  /// even reach the channel. So the owner task can complete iteration after iteration without
+  /// one await that returns `Pending`. On tokio's `new_current_thread` (and single-threaded
+  /// smol, both supported) that task then owns the thread outright: the subscriber draining
+  /// the stream, the `close()` caller and every unrelated task stop being polled for as long
+  /// as the source stays ready — which, for another process syncing against the same tree, is
+  /// indefinitely.
+  ///
+  /// The multi-threaded flood cell above cannot see this: a second worker keeps the consumer
+  /// running whatever the owner does. That runtime flavour was in fact chosen to get around
+  /// this very behaviour while the cell was being written, so the workaround was the defect.
+  ///
+  /// Both halves are proven ON that executor, and the user record is released MID-flood (the
+  /// source mints it between cookies, never ahead of them), so the delivery is evidence that
+  /// source servicing kept reaching a consumer while the flood ran:
+  ///   1. `w.next()` hands over the user's change;
+  ///   2. `w.close()` — which rides its own channel, but only reaches it if the CALLER is
+  ///      polled — completes.
+  ///
+  /// # Why the worker thread
+  ///
+  /// A livelocked owner cannot be shut down and `block_on` never returns, so an in-runtime
+  /// timeout is worthless: its own task is not polled either, and a failing run would HANG
+  /// rather than fail. So the runtime is built on a worker thread and this thread waits on a
+  /// channel with a deadline. On expiry it sets the flood's stop flag — the source then drains
+  /// (`next` answers `None`) and the worker unwinds to completion — and fails loudly with the
+  /// livelock named. A cell that can only hang is a cell that proves nothing under mutation.
+  ///
+  /// FAIL-ON-REVERT: drop the `SOURCE_FAIRNESS_BUDGET` yield at the foot of `run`'s loop and
+  /// this cell fails on the deadline — "the current-thread runtime never reported: the owner
+  /// task monopolized the executor" — instead of on an assertion, which is exactly what the
+  /// livelock is.
+  #[test]
+  fn a_current_thread_executor_survives_an_endlessly_ready_source() {
+    let stop = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    // Belt and braces with the explicit store below: the flood must stop on EVERY way out of
+    // this frame, or a leaked worker thread spins for the rest of the test binary's life.
+    let _stop_on_exit = StopFloodOnDrop(stop.clone());
+    let (release_tx, release_rx) = async_channel::unbounded::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+    let worker_stop = stop.clone();
+    let worker = std::thread::spawn(move || {
+      let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the current-thread runtime builds");
+      runtime.block_on(async move {
+        let source = EndlessReservedFloodSource {
+          next_handle: 0,
+          live: HashMap::new(),
+          release: release_rx,
+          minted: 0,
+          stop: worker_stop,
+        };
+        let mut w: super::super::Tributaries<OsString, (), TokioRuntime, u32> =
+          super::super::Tributaries::with_source(source, TributariesOptions::new());
+        let sub = w
+          .watch(key("/a"), (), WatchOptions::new())
+          .await
+          .expect("watch /a"); // handle 1
+
+        // From here the source is ready on every poll, forever. Release one user record
+        // into the middle of that stream.
+        release_tx.try_send(()).expect("release the user change");
+
+        let event = w
+          .next()
+          .await
+          .expect("the stream is open while the flood runs");
+        assert_eq!(event.subscription(), sub, "routed to the covering sub");
+        assert_eq!(
+          event.path(),
+          Path::new("/a/f"),
+          "…and it is the user's change, not a cookie"
+        );
+
+        w.close().await.expect("close is acknowledged");
+        // Only reached when both halves completed; a panic above disconnects the channel
+        // instead, which this thread's waiter reports as a failure rather than a livelock.
+        let _ = done_tx.send(());
+      });
+    });
+
+    let verdict = done_rx.recv_timeout(Duration::from_secs(20));
+    // Whatever happened, let the worker finish: a still-spinning source keeps the thread hot.
+    stop.store(true, core::sync::atomic::Ordering::SeqCst);
+    match verdict {
+      Ok(()) => worker.join().expect("the worker thread completed cleanly"),
+      // The worker panicked (an assertion failed): surface its own message.
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        let panic = worker
+          .join()
+          .expect_err("a disconnect means the worker unwound");
+        std::panic::resume_unwind(panic);
+      }
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        let _ = worker.join();
+        panic!(
+          "the current-thread runtime never reported: the owner task monopolized the \
+           executor under an endlessly ready source, so neither the consumer nor the \
+           close caller was ever polled"
+        );
+      }
+    }
+  }
+
+  /// A source with an unbounded supply of reserved records and no `Pending` in it: past the
+  /// first arm, every poll returns `Some` immediately. One user record can be spliced into the
+  /// middle of that stream by the test, so a delivery proves servicing continued DURING the
+  /// flood rather than merely before it.
+  ///
+  /// Distinct from [`ArtifactFloodSource`] on purpose: that one holds its user record back
+  /// behind an awaited trigger and emits it FIRST, which is what its own cell needs.
+  struct EndlessReservedFloodSource {
+    next_handle: u32,
+    live: HashMap<u32, Vec<OsString>>,
+    /// Probed non-blockingly on each poll: a token here mints the user record in place of
+    /// that poll's cookie, so it arrives BETWEEN flood records.
+    release: async_channel::Receiver<()>,
+    minted: u64,
+    stop: std::sync::Arc<core::sync::atomic::AtomicBool>,
+  }
+
+  impl Source<OsString> for EndlessReservedFloodSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      self.next_handle += 1;
+      let handle = self.next_handle;
+      self.live.insert(handle, key.to_vec());
+      Ok(Armed::new(handle, key.to_vec()))
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.live.remove(&handle);
+    }
+
+    /// The parent-directory ground — a cookie whose leaf name follows no grammar this crate
+    /// knows, which is the shape another `Watcher` over the same tree actually produces.
+    fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+      key
+        .len()
+        .checked_sub(2)
+        .and_then(|parent| key[parent].to_str())
+        .is_some_and(|parent| parent == COOKIE_DIR)
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      // Nothing is minted before a root is armed: a record naming a handle this source has
+      // not issued reads as a DEAD-root record and takes the retirement path, not the flood
+      // path. The `watch` command that arms is what wakes this select, so parking here costs
+      // no wakeup of its own.
+      if self.live.is_empty() {
+        core::future::pending::<()>().await;
+      }
+      // The escape hatch the waiting thread uses to end a livelocked run: draining the source
+      // is the one thing that stops the flood without the owner having to be polled by anyone.
+      if self.stop.load(core::sync::atomic::Ordering::SeqCst) {
+        return None;
+      }
+      self.minted += 1;
+      // Cancellation-safe: the token and the record it mints are taken on the same poll that
+      // returns `Ready`, so a losing `select!` arm dropping this future loses neither.
+      let key = match self.release.try_recv() {
+        Ok(()) => key("/a/f"),
+        Err(_) => key(&format!("/a/{COOKIE_DIR}/{}", self.minted)),
+      };
+      Some(SourceEvent::new(
+        1,
+        key,
+        EventKind::Created,
+        Location::new(),
+        Epoch::new(self.minted),
+        Some(ChangeId::new(NonZeroU64::MIN)),
+      ))
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.live.get(&handle).cloned()
+    }
   }
 }
 
